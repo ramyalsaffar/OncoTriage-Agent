@@ -90,6 +90,16 @@ Not-eligible trials achieve 100% score reproducibility by design -- scores are h
 
 Output tokens dominate cost because GPT-4o output tokens are priced 4x higher than input tokens and carry the full criterion-level eligibility assessments for all evaluated trials.
 
+### Latency and Throughput (1,100 Inferences)
+
+| Metric | Value |
+|---|---|
+| Median end-to-end latency | 281.6s (~4.7 minutes) |
+| 95th percentile latency | 361.3s |
+| Max latency | 1,512.9s |
+| GPT-4o evaluation latency (median) | 74.2s |
+| Throughput | 13 patients/hour |
+
 ### Comparison with Published Systems
 
 | System | Criterion Accuracy | Verdict Accuracy | Evidence Faithfulness | Absent-Data Rate |
