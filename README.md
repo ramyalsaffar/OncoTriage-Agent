@@ -21,7 +21,7 @@ OncoTriage Agent is a production-ready AI pipeline that automatically identifies
 
 The system is designed for real-world clinical deployment. Every component accounts for real EHR variability -- multi-coding systems, incomplete data, Cerner and Epic export patterns, mCODE-structured staging and genomic variants -- not just the synthetic data used for development and validation.
 
-> **Status:** This project is under active development. A manuscript is in preparation. The repository is private pending publication.
+> **Status:** This project development is complete and a manuscript is in preparation. The repository is private pending publication.
 
 ---
 
