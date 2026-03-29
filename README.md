@@ -161,7 +161,7 @@ The pipeline is built for real EHR deployment, not just synthetic data. Design a
 - Multi-coding system resolution (SNOMED, ICD-10-CM, RxNorm, LOINC, CPT, HCPCS) with both canonical URI and OID-based URI forms -- covering Epic, Cerner, and other major EHR vendors
 - MedicationStatement support for Cerner/Oracle Health
 - Active and historical medication retention for washout period and prior treatment criteria
-- Free-text uncertainty detection in condition display names (16 confirmed qualifiers)
+- Free-text clinical diagnosis uncertainty detection in condition display names (16 confirmed qualifiers)
 - mCODE STU4 structured staging (TNM stage group Observations, LOINC 21908-9/21902-2/21914-7)
 - mCODE genomic variant Observations (LOINC 69548-6) with HGVS notation parsing
 - All 8 FHIR observation value types
