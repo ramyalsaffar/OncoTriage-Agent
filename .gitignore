@@ -1,0 +1,7 @@
+.env
+*.db
+*.jar
+__pycache__/
+.DS_Store
+.ipynb_checkpoints/
+*.log

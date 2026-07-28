@@ -1,0 +1,124 @@
+# ============================================================================
+# Docker Build Context Exclusions
+# ============================================================================
+# Reduces build time and image size by excluding unnecessary files
+
+# Python Runtime and Cache
+# ----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.pyc
+build/
+dist/
+*.egg-info/
+
+# Virtual Environments
+# ----------------------------------------------------------------------------
+env/
+venv/
+ENV/
+.venv/
+venv.bak/
+
+# Secrets and API Keys (CRITICAL - never bake into image)
+# ----------------------------------------------------------------------------
+.env
+.env.*
+*Keys/
+05- Keys/
+Keys.txt
+*.pem
+*.key
+
+# Data Directories (use volumes instead)
+# ----------------------------------------------------------------------------
+# Exact folder names from your project structure
+02- Data/
+03- Code/__pycache__/
+04- Results/
+06- Airflow/
+
+# Database Files (will be created at runtime)
+# ----------------------------------------------------------------------------
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+inferences.db
+
+# Airflow Runtime Files
+# ----------------------------------------------------------------------------
+airflow.cfg
+airflow.db
+airflow-webserver.pid
+webserver_config.py
+logs/
+dags/__pycache__/
+
+# IDE Files
+# ----------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.spyproject/
+*.code-workspace
+
+# OS Files
+# ----------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+
+# Git
+# ----------------------------------------------------------------------------
+.git/
+.gitignore
+.gitattributes
+
+# Docker Files (don't need these inside the image)
+# ----------------------------------------------------------------------------
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Documentation
+# ----------------------------------------------------------------------------
+README.md
+README-Docker.md
+
+# Logs and Temporary Files
+# ----------------------------------------------------------------------------
+*.log
+tmp/
+temp/
+*.tmp
+
+# Test Files
+# ----------------------------------------------------------------------------
+test_*.py
+*_test.py
+.pytest_cache/
+
+# Large Model Files (download at runtime if needed)
+# ----------------------------------------------------------------------------
+*.pt
+*.pth
+*.bin
+*.onnx
+*.safetensors
+
+# ============================================================================
+# ALLOW these files explicitly
+# ============================================================================
+# These are needed in the Docker image
+
+# Python source code (*.py files are included by default)
+# Configuration files

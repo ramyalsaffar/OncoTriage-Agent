@@ -1,0 +1,228 @@
+# ============================================================================
+# Docker Compose Configuration
+# ============================================================================
+# Production-ready multi-service orchestration
+# 
+# Quick Start:
+#   docker-compose up -d              # Start all services
+#   docker-compose logs -f fastapi    # View logs
+#   docker-compose down               # Stop all services
+#
+# Access:
+#   - API Docs: http://localhost:8000/docs
+#   - Dashboard: http://localhost:8501
+#   - Airflow: http://localhost:8080 (admin/check api-server logs for password)
+#   - Qdrant: http://localhost:6333/dashboard
+# ============================================================================
+
+version: v5.0.2
+
+services:
+
+  # ==========================================================================
+  # QDRANT - Vector Database
+  # ==========================================================================
+  qdrant:
+    image: qdrant/qdrant:v1.12.5
+    container_name: Clinical-Trial-Patient-Match-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"  # REST API
+      - "6334:6334"  # gRPC (optional)
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    environment:
+      - QDRANT__SERVICE__GRPC_PORT=6334
+      - QDRANT__LOG_LEVEL=INFO
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:6333/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - Clinical-Trial-Patient-Match
+
+
+  # ==========================================================================
+  # FASTAPI - Clinical Trial Matching API
+  # ==========================================================================
+  fastapi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: trialbridge:latest
+    container_name: Clinical-Trial-Patient-Match-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount entire codebase for development
+      - .:/app
+      # Mount .env file (read-only for security)
+      - ../04- Keys/.env:/app/.env:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+      - QDRANT_URL=http://qdrant:6333
+      - DOCKER_CONTAINER=true
+    working_dir: /app
+    # Use bash with single quotes to handle filename with spaces
+    command: >
+      bash -c 'exec uvicorn "17- FastAPI Server:app" --host 0.0.0.0 --port 8000 --reload'
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - Clinical-Trial-Patient-Match
+
+
+  # ==========================================================================
+  # STREAMLIT - Monitoring Dashboard
+  # ==========================================================================
+  streamlit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: Clinical-Trial-Patient-Match:latest
+    container_name: Clinical-Trial-Patient-Match-dashboard
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    volumes:
+      - .:/app
+      - ../05- Keys/.env:/app/.env:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DOCKER_CONTAINER=true
+    working_dir: /app
+    # Use quotes around filename with spaces
+    command: >
+      bash -c 'exec streamlit run "21- Streamlit Dashboard.py"
+      --server.port=8501
+      --server.address=0.0.0.0
+      --server.headless=true
+      --browser.gatherUsageStats=false'
+    depends_on:
+      - qdrant
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - trialbridge
+
+
+  # ==========================================================================
+  # AIRFLOW WEBSERVER - Trial Refresh UI
+  # ==========================================================================
+  airflow-webserver:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: Clinical-Trial-Patient-Match:latest
+    container_name: Clinical-Trial-Patient-Match-airflow-web
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - .:/app
+      - ../04- Keys/.env:/app/.env:ro
+      # Airflow needs persistent database and logs
+      - airflow_db:/app/airflow_home
+    environment:
+      # Use /app/airflow_home for Airflow home directory
+      - AIRFLOW_HOME=/app/airflow_home
+      - AIRFLOW__CORE__EXECUTOR=SequentialExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=sqlite:////app/airflow_home/airflow.db
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__CORE__DAGS_FOLDER=/app/airflow_home/dags
+      - AIRFLOW__WEBSERVER__SECRET_KEY=Clinical-Trial-Patient-Match_secret_change_in_production
+      - AIRFLOW__CORE__FERNET_KEY=
+      - AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS=admin:admin
+      - DOCKER_CONTAINER=true
+      - PYTHONUNBUFFERED=1
+    working_dir: /app
+    command: >
+      bash -c "
+      mkdir -p /app/airflow_home/dags &&
+      airflow db migrate && exec airflow api-server --port 8080
+      "
+    depends_on:
+      - qdrant
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - Clinical-Trial-Patient-Match
+
+
+  # ==========================================================================
+  # AIRFLOW SCHEDULER - Background Task Execution
+  # ==========================================================================
+  airflow-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: Clinical-Trial-Patient-Match:latest
+    container_name: Clinical-Trial-Patient-Match-airflow-scheduler
+    restart: unless-stopped
+    volumes:
+      - .:/app
+      - ../05- Keys/.env:/app/.env:ro
+      # Share same Airflow DB with webserver
+      - airflow_db:/app/airflow_home
+    environment:
+      - AIRFLOW_HOME=/app/airflow_home
+      - AIRFLOW__CORE__EXECUTOR=SequentialExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=sqlite:////app/airflow_home/airflow.db
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__CORE__DAGS_FOLDER=/app/airflow_home/dags
+      - DOCKER_CONTAINER=true
+      - PYTHONUNBUFFERED=1
+    working_dir: /app
+    command: >
+      bash -c "
+      sleep 30 &&
+      exec airflow scheduler
+      "
+    depends_on:
+      airflow-webserver:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'airflow scheduler' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - Clinical-Trial-Patient-Match
+
+
+# ============================================================================
+# NETWORKS
+# ============================================================================
+networks:
+  Clinical-Trial-Patient-Match:
+    driver: bridge
+    name: Clinical-Trial-Patient-Match-network
+
+
+# ============================================================================
+# VOLUMES - Persistent Data Storage
+# ============================================================================
+volumes:
+  qdrant_storage:
+    name: Clinical-Trial-Patient-Match-qdrant-data
+  airflow_db:
+    name: Clinical-Trial-Patient-Match-airflow-db

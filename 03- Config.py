@@ -1,0 +1,172 @@
+# The Project Main Configuration Values
+#######################################
+
+
+#------------------------------------------------------------------------------
+
+
+# Project Name: OncoTriage Agent
+#-------------------------------
+Project_Name = "OncoTriage Agent"
+
+
+# Configuration
+#--------------
+
+# Qdrant collection name
+COLLECTION_NAME = "trial_criteria"
+
+# OpenAI embedding model
+EMBEDDING_MODEL = "text-embedding-3-small"
+
+# Embedding dimensionality
+EMBEDDING_DIM = 1536
+
+# LLM models
+MATCHING_MODEL = "gpt-4o-2024-08-06"  # For criterion-level evaluation
+
+# Matching parameters
+TOP_K_CANDIDATES = 40  # Top N of trials to evaluate initially with cross encoder
+BM25_RETRIEVAL_SIZE = 75  # Trials from BM25 search
+VECTOR_RETRIEVAL_SIZE = 100  # Trials from vector search
+RRF_POOL_SIZE = 100 # Maximum candidates passed from RRF fusion to cross-encoder input
+
+# Temperature settings
+MATCHING_TEMPERATURE = 0  # Deterministic matching
+EXPANSION_TEMPERATURE = 0  # Deterministic query expansion
+
+
+# Clinical trials main characteristics for scraping
+# Used at the RAG Trial Indexer
+#--------------------------------------------------
+trial_dict = {"condition": "neoplasms",
+              "status": "RECRUITING",
+              "study_type": "INTERVENTIONAL",
+              "age": "ADULT",
+              "max_trials": 25000}
+
+# Trials re-rank score
+# dropping below threshold because they have weak relevance 
+# High End ~+10, Neutral (0.0), Low End ~-25.0
+RERANK_SCORE_THRESHOLD = -10
+
+
+# Limiting the number of trials sent to GPT
+MAX_TRIALS_FOR_EVALUATION = 15
+
+
+# API Rate Limiting Configuration
+#---------------------------------
+ENABLE_RATE_LIMITING = False  # Toggle: True for production, False for batch evaluation
+RATE_LIMIT = "60/minute"     # Requests allowed per time window, Time window: "minute", "hour", "day"
+
+
+#------------------------------------------------------------------------------
+
+
+# Initialize clients
+keys = load_env_keys()
+openai_api_key = keys['openai']
+qdrant_url = keys['qdrant_url']
+qdrant_api_key = keys['qdrant_key']
+
+
+openai_client = OpenAI(api_key=openai_api_key)
+qdrant_client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key, timeout=120)
+
+
+#------------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Configuration Constants (retry behavior) for LangGraph Agent
+# ---------------------------------------------------------------------------
+
+MAX_GPT4O_RETRIES = 3
+RETRY_BASE_DELAY = 1  # seconds, doubles each retry
+
+
+#------------------------------------------------------------------------------
+
+
+# OpenAI Pricing Configuration
+#------------------------------
+# Last verified: 2026-02-16
+# Update quarterly from: https://openai.com/api/pricing/
+# Prices are per 1M tokens (USD)
+
+PRICING_CONFIG = {
+    "last_updated": "2026-02-16",
+    "models": {
+        "gpt-4o-2024-08-06": {
+            "input": 2.50,
+            "output": 10.00
+        },
+        "text-embedding-3-small": {
+            "input": 0.02,
+            "output": 0.0  # Embeddings only charge input tokens
+        }
+    }
+}
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
+# Drift Detection CONFIGURATION
+# ===========================================================================
+
+# Baseline and comparison windows
+BASELINE_WINDOW_DAYS = 30       # First 30 days as baseline
+COMPARISON_WINDOW_DAYS = 7      # Compare last 7 days to baseline
+MIN_SAMPLES_BASELINE = 20       # Minimum inferences for valid baseline
+MIN_SAMPLES_COMPARISON = 5      # Minimum inferences for valid comparison
+
+# Alert thresholds
+KS_TEST_THRESHOLD = 0.05        # p-value < 0.05 = significant drift
+PSI_THRESHOLD = 0.2             # PSI > 0.2 = moderate drift (industry standard)
+Z_SCORE_THRESHOLD = 2.0         # |z| > 2.0 = alert (2 standard deviations)
+
+# PSI bins for continuous variables
+PSI_BINS = 10
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
+# BATCH RUNNER CONFIGURATION
+# ===========================================================================
+
+# Patients per progress-reporting batch (does NOT limit total patients)
+BATCH_SIZE = 200
+
+# Number of already-processed patients to re-run after the main pass
+RESAMPLE_COUNT = 100
+
+# Random seed for reproducible resampling
+RESAMPLE_SEED = 42
+
+# Checkpoint file: tracks completed filename stems for crash recovery
+# Stored alongside the batch runner file for easy access
+CHECKPOINT_FILENAME = "batch_runner_checkpoint.json"
+
+# Results output file: per-patient summary written after each patient
+# (separate from SQLite DB -- lightweight JSON for quick inspection)
+RESULTS_FILENAME = "batch_runner_results.json"
+
+# API workers count
+MAX_WORKERS = 12
+
+
+#------------------------------------------------------------------------------
+
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Feb  9 21:47:10 2026
+
+@author: ramyalsaffar
+"""
