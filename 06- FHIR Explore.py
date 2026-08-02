@@ -5,7 +5,37 @@
 Descriptive analysis of the 1000 cancer patient dataset
 Generates statistics, distributions, and visualizations
 Uses CSV files from Synthea export + our filtered JSON patient IDs
+
+Cancer detection and cancer-stage extraction are NOT implemented in this file.
+They are delegated to CancerCodeRegistry (File 08) and extract_patient_stage()
+(File 10) — the same code paths File 05 uses to decide which patients stay on
+disk and File 13 uses at query time. A dataset table produced here therefore
+describes the same cohort the results tables describe.
 """
+
+
+#------------------------------------------------------------------------------
+
+
+# Run needed files
+#-----------------
+_code_dir = "/Users/ramyalsaffar/Ramy/C.V..V/07- LLM Projects/03- Clinical Trial Patient Match/03- Code/"
+
+for _bootstrap in ("01- Imports.py", "02- Utility Functions.py"):
+    with open(_code_dir + _bootstrap) as _fh:
+        exec(_fh.read(), globals())
+
+exec_chain(
+    ["03- Config.py",
+     "08- Cancer Code Registry.py",
+     "10- Structured Eligibility Extractor.py"],
+    caller_file=_code_dir + "06- FHIR Explore.py",
+    caller_globals=globals(),
+    chain_label="01 → 02 → 03 → 08 → 10",
+)
+
+
+#------------------------------------------------------------------------------
 
 
 # Configuration
@@ -24,9 +54,79 @@ sns.set_style("whitegrid")
 plt.rcParams['figure.figsize'] = (12, 6)
 plt.rcParams['font.size'] = 10
 
+# Same registry instance File 05 filters the fhir/ directory with.
+_CANCER_REGISTRY = load_registry()
+
+# Names for the stage ordinals File 10 produces. AJCC stage groups run 0
+# (in situ) through IV (distant), so these are facts about the staging
+# system, not tunables — only the wording of the bucket labels is local.
+STAGE_LABELS = {
+    0: 'Stage 0/In Situ',
+    1: 'Stage I',
+    2: 'Stage II',
+    3: 'Stage III',
+    4: 'Stage IV/Metastatic',
+}
+STAGE_UNSPECIFIED = 'Unspecified'
+
 
 # Helper Functions
 #------------------
+def flag_primary_cancer(df_conditions):
+    """
+    Add an IS_CANCER column marking each condition row as a primary cancer.
+
+    Detection is delegated to CancerCodeRegistry.is_primary_cancer() (File 08),
+    which is what File 05 uses to decide which patient bundles survive on disk
+    and what File 13 uses to pick the primary diagnosis. This file previously
+    matched a keyword list against DESCRIPTION, and the two disagreed in both
+    directions on this very dataset — "Suspected lung cancer (situation)" and
+    "Metastatic malignant neoplasm to colon" are keyword hits that the registry
+    rejects — so the exploratory cohort was not the cohort the pipeline runs on.
+
+    Two recorded differences from File 05, both properties of the CSV export
+    rather than of the detection logic:
+      - Synthea's CSV carries no verificationStatus column, so refuted /
+        entered-in-error rows cannot be skipped here. Synthea does not emit
+        those statuses, so the cohorts still agree on this dataset.
+      - The CSV carries one SNOMED code per row, so the registry runs on its
+        single-code path rather than its multi-coding path.
+
+    Args:
+        df_conditions: conditions.csv DataFrame (must be a copy, not a slice)
+
+    Returns:
+        The same DataFrame, with IS_CANCER added.
+    """
+    if 'CODE' not in df_conditions.columns:
+        # No code column: every row falls to the registry's display-term
+        # fallback. Say so — a run classified this way is weaker evidence.
+        print("  Note: conditions.csv has no CODE column — cancer detection "
+              "falls back to display-term matching inside the registry")
+        codes = [''] * len(df_conditions)
+    else:
+        codes = df_conditions['CODE']
+
+    df_conditions['IS_CANCER'] = [
+        _CANCER_REGISTRY.is_primary_cancer({
+            'code': '' if pd.isna(code) else str(code).strip(),
+            'display': '' if pd.isna(desc) else str(desc),
+        })
+        for code, desc in zip(codes, df_conditions['DESCRIPTION'])
+    ]
+
+    return df_conditions
+
+
+def print_cancer_classification_stats():
+    """Report which registry layer decided each condition (File 08 counters)."""
+    stats = get_cancer_classification_stats()
+    print("\nCancer classification paths (CancerCodeRegistry):")
+    for path, count in stats.items():
+        if count:
+            print(f"  {path}: {count}")
+
+
 def get_filtered_patient_ids():
     """
     Get the list of patient IDs from our filtered JSON files
@@ -80,28 +180,32 @@ def load_and_filter_csv(filename, patient_ids):
     """
     Load a Synthea CSV file and filter to our 1000 patients
     
+    Boolean-mask selection returns a view, and every caller here goes on to
+    add a column (AGE, IS_CANCER, ...). Copying once at the source is what
+    makes those assignments land on a real frame instead of a slice.
+
     Args:
         filename: CSV filename (e.g., 'patients.csv')
         patient_ids: Set of patient IDs to keep
-        
+
     Returns:
-        DataFrame filtered to our patients
+        DataFrame filtered to our patients (an independent copy)
     """
     csv_path = Path(CSV_DIR) / filename
-    
+
     if not csv_path.exists():
         print(f"Warning: {filename} not found at {csv_path}")
         return None
-    
+
     df = pd.read_csv(csv_path)
-    
+
     # Filter to our patient IDs
     if 'PATIENT' in df.columns:
-        df_filtered = df[df['PATIENT'].isin(patient_ids)]
+        df_filtered = df[df['PATIENT'].isin(patient_ids)].copy()
         print(f"Loaded {filename}: {len(df)} total → {len(df_filtered)} filtered")
         return df_filtered
     elif 'Id' in df.columns:
-        df_filtered = df[df['Id'].isin(patient_ids)]
+        df_filtered = df[df['Id'].isin(patient_ids)].copy()
         print(f"Loaded {filename}: {len(df)} total → {len(df_filtered)} filtered")
         return df_filtered
     else:
@@ -289,16 +393,14 @@ Action if abnormal: Check cancer categorization logic, verify Synthea modules lo
     print("CANCER DIAGNOSES ANALYSIS")
     print("="*80 + "\n")
     
-    # Filter to cancer conditions only
-    cancer_keywords = ['cancer', 'carcinoma', 'neoplasm', 'malignancy', 'leukemia', 'lymphoma', 'melanoma', 'sarcoma', 'myeloma']
-    
-    df_cancer = df_conditions[
-        df_conditions['DESCRIPTION'].str.lower().str.contains('|'.join(cancer_keywords), na=False)
-    ]
-    
+    # Filter to primary cancer conditions only. IS_CANCER is set once in
+    # main() by flag_primary_cancer(), which routes through File 08's registry.
+    # .copy() because CATEGORY is added below.
+    df_cancer = df_conditions[df_conditions['IS_CANCER']].copy()
+
     print(f"Total condition records: {len(df_conditions)}")
-    print(f"Cancer condition records: {len(df_cancer)}")
-    print(f"Unique patients with cancer: {df_cancer['PATIENT'].nunique()}")
+    print(f"Primary cancer condition records: {len(df_cancer)}")
+    print(f"Unique patients with primary cancer: {df_cancer['PATIENT'].nunique()}")
     
     # Top cancer types
     print(f"\nTop 10 cancer diagnoses:")
@@ -459,8 +561,9 @@ def generate_summary_report(df_patients, df_cancer, patient_ids, data_source: st
         # Cancer types
         f.write("CANCER DIAGNOSES\n")
         f.write("-" * 80 + "\n")
-        f.write(f"Unique patients with cancer: {df_cancer['PATIENT'].nunique()}\n")
-        f.write(f"Total cancer condition records: {len(df_cancer)}\n\n")
+        f.write("Detection: CancerCodeRegistry (File 08), SNOMED/ICD-10-CM codes\n")
+        f.write(f"Unique patients with primary cancer: {df_cancer['PATIENT'].nunique()}\n")
+        f.write(f"Total primary cancer condition records: {len(df_cancer)}\n\n")
         
         f.write("Top 5 cancer types:\n")
         for idx, (cancer, count) in enumerate(df_cancer['DESCRIPTION'].value_counts().head(5).items(), 1):
@@ -471,9 +574,9 @@ def generate_summary_report(df_patients, df_cancer, patient_ids, data_source: st
     print(f"\n✓ Saved summary report: {report_path}")
     
     
-def analyze_cancer_stages(df_cancer):
+def analyze_cancer_stages(df_cancer, df_conditions):
     """Extract and visualize cancer staging
-    
+
 ✅ Normal/Expected Behavior
 Stage I: 25-35% (early detection)
 Stage II: 20-30%
@@ -490,52 +593,56 @@ All same stage → Data generation bug
 
 Action if abnormal: Regenerate, check if Synthea cancer modules include staging
 
+    Args:
+        df_cancer:     primary cancer condition rows (defines the cohort)
+        df_conditions: all condition rows (the text stage is read from)
     """
-    
+
     print("\n" + "="*80)
     print("CANCER STAGE ANALYSIS")
     print("="*80 + "\n")
-    
-    # Extract stage from description
-    def extract_stage(description):
-        desc_lower = description.lower()
-        if 'stage 1' in desc_lower or 'stage i' in desc_lower or 'tnm stage 1' in desc_lower:
-            return 'Stage I'
-        elif 'stage 2' in desc_lower or 'stage ii' in desc_lower or 'tnm stage 2' in desc_lower:
-            return 'Stage II'
-        elif 'stage 3' in desc_lower or 'stage iii' in desc_lower or 'tnm stage 3' in desc_lower:
-            return 'Stage III'
-        elif 'stage 4' in desc_lower or 'stage iv' in desc_lower or 'tnm stage 4' in desc_lower or 'metastatic' in desc_lower:
-            return 'Stage IV/Metastatic'
-        else:
-            return 'Unspecified'
-    
-    df_cancer['STAGE'] = df_cancer['DESCRIPTION'].apply(extract_stage)
-    
+
+    # Stage comes from File 10's extract_patient_stage() — the same function
+    # Stage 4 of the pipeline calls. The local extract_stage() this replaces
+    # tested 'stage i' before 'stage iii' and 'stage iv', and 'stage i' is a
+    # prefix of both, so every stage above I was reported as Stage I and none
+    # of the abnormality thresholds above could ever fire.
+    #
+    # Read over ALL conditions of the cancer patients, not only the rows the
+    # registry marked primary: the pipeline also sees the whole condition
+    # list, so "Metastatic malignant neoplasm to colon" still contributes its
+    # Stage IV through extract_patient_stage()'s metastatic tier even though
+    # the registry keeps that row out of the primary-cancer cohort.
+    cancer_patients = set(df_cancer['PATIENT'])
+    df_staged = df_conditions[df_conditions['PATIENT'].isin(cancer_patients)].copy()
+
+    df_staged['STAGE_ORDINAL'] = pd.array(
+        [
+            extract_patient_stage([{'display': '' if pd.isna(d) else str(d)}])
+            for d in df_staged['DESCRIPTION']
+        ],
+        dtype='Int64',   # nullable: <NA> is "no stage in this row", not 0
+    )
+
     # Count UNIQUE PATIENTS per stage (not condition records)
-    # Strategy: For each patient, take their WORST stage (highest stage)
-    stage_hierarchy = {'Stage I': 1, 'Stage II': 2, 'Stage III': 3, 'Stage IV/Metastatic': 4, 'Unspecified': 0}
-    
-    def get_worst_stage(stages):
-        """Get the most advanced stage for a patient"""
-        stage_nums = [stage_hierarchy.get(s, 0) for s in stages]
-        worst_num = max(stage_nums)
-        
-        # Return the stage name
-        for stage_name, num in stage_hierarchy.items():
-            if num == worst_num:
-                return stage_name
-        return 'Unspecified'
-    
-    # Group by patient and get worst stage
-    patient_stages = df_cancer.groupby('PATIENT')['STAGE'].apply(get_worst_stage)
-    stage_counts = patient_stages.value_counts()
-    
+    # Strategy: For each patient, take their WORST stage (highest ordinal).
+    # max() skips <NA>; a patient with no staged row at all stays <NA>.
+    worst_ordinal = df_staged.groupby('PATIENT')['STAGE_ORDINAL'].max()
+    patient_stages = worst_ordinal.map(
+        lambda o: STAGE_UNSPECIFIED if pd.isna(o) else STAGE_LABELS[int(o)]
+    )
+
+    # Fixed bucket order, zeros kept: "zero Stage I or II" is one of the
+    # abnormalities this plot exists to show, and a dropped bar hides it.
+    stage_order = [STAGE_LABELS[o] for o in sorted(STAGE_LABELS)] + [STAGE_UNSPECIFIED]
+    stage_counts = patient_stages.value_counts().reindex(stage_order, fill_value=0)
+
     # Calculate percentages
     stage_percentages = (stage_counts / stage_counts.sum()) * 100
-    
+
     print(f"Total cancer patients: {len(patient_stages)}")
-    print(f"Total cancer condition records: {len(df_cancer)}")
+    print(f"Primary cancer condition records: {len(df_cancer)}")
+    print(f"Condition records searched for stage text: {len(df_staged)}")
     print()
     print("Patient distribution by stage:")
     for stage, count in stage_counts.items():
@@ -721,22 +828,20 @@ Young patients (age 20-30) have 10+ conditions → Age mismatch
     print("COMORBIDITIES ANALYSIS")
     print("="*80 + "\n")
     
-    # Separate cancer vs non-cancer conditions
-    cancer_keywords = ['cancer', 'carcinoma', 'neoplasm', 'malignancy', 'leukemia', 'lymphoma', 'melanoma', 'sarcoma', 'myeloma']
-    
-    df_conditions['IS_CANCER'] = df_conditions['DESCRIPTION'].str.lower().str.contains('|'.join(cancer_keywords), na=False)
-    
+    # Separate cancer vs non-cancer conditions using the same IS_CANCER column
+    # the diagnosis analysis used — one registry decision per row, not a second
+    # keyword pass that would split the rows differently.
     df_cancer_cond = df_conditions[df_conditions['IS_CANCER']]
     df_other_cond = df_conditions[~df_conditions['IS_CANCER']]
-    
+
     # Conditions per patient
     cancer_per_patient = df_cancer_cond.groupby('PATIENT').size()
     other_per_patient = df_other_cond.groupby('PATIENT').size()
     total_per_patient = df_conditions.groupby('PATIENT').size()
-    
+
     print(f"Total condition records: {len(df_conditions)}")
-    print(f"Cancer conditions: {len(df_cancer_cond)}")
-    print(f"Non-cancer conditions: {len(df_other_cond)}")
+    print(f"Primary cancer conditions: {len(df_cancer_cond)}")
+    print(f"Non-cancer conditions (incl. secondary/metastatic): {len(df_other_cond)}")
     print()
     
     print("Conditions per patient (including cancer):")
@@ -868,7 +973,14 @@ def main():
     if df_patients is None:
         print("ERROR: Could not load patients.csv. Make sure CSV export was enabled during generation!")
         return
-    
+
+    # Classify conditions once, with the pipeline's registry, so every
+    # downstream analysis splits the rows the same way.
+    if df_conditions is not None:
+        reset_cancer_classification_stats()
+        df_conditions = flag_primary_cancer(df_conditions)
+        print_cancer_classification_stats()
+
     # Step 3: Run analyses
     print("\n" + "="*80)
     print("STEP 3: RUNNING ANALYSES")
@@ -879,7 +991,7 @@ def main():
     if df_conditions is not None:
         df_cancer = analyze_conditions(df_conditions)
         
-        analyze_cancer_stages(df_cancer)
+        analyze_cancer_stages(df_cancer, df_conditions)
         analyze_patients_per_cancer_type(df_cancer)
         analyze_age_by_cancer(df_patients, df_cancer)
     
