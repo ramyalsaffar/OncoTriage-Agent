@@ -258,6 +258,10 @@ def scrape_clinicaltrials_gov(condition=None, status=None, study_type=None, age=
     if any(_histology_stats.values()):
         print(f"Histology negation/contradiction counters: {_histology_stats}")
 
+    _stage_stats = get_stage_extraction_stats()
+    if any(_stage_stats.values()):
+        print(f"Stage negation/span/exclusion-bound counters: {_stage_stats}")
+
     if scrape_complete and checkpoint_file.exists():
         checkpoint_file.unlink()
         print("Scrape checkpoint cleared.")

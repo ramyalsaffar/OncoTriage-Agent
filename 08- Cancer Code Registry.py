@@ -17,18 +17,22 @@ cancer. This module finds the real primary cancer reliably.
 How it works — three detection layers in priority order:
   1. SNOMED CT exact match  : 52 curated codes covering all Synthea cancer modules
                               + mCODE STU4 root codes
-  2. ICD-10-CM exact match  : Complete 2024 release (1,609 primary cancer codes)
-                              loaded at startup from the icd10-cm package.
-                              Handles both dot-formatted (C34.10) and
-                              dot-free (C3410) codes in O(1) lookup.
+  2. ICD-10-CM exact match  : Complete 2024 release, loaded at startup from
+                              the icd10-cm package. Handles both
+                              dot-formatted (C34.10) and dot-free (C3410)
+                              codes in O(1) lookup.
   3. Display term fallback  : Only fires when code is missing/unknown.
                               Matches on definitional morphology terms
                               (carcinoma, lymphoma, leukemia, etc.).
-                              Rejects secondary/metastatic display terms.
+                              Rejects secondary/metastatic display terms and
+                              non-invasive ones (benign, in-situ, uncertain
+                              behaviour).
 
-Secondary cancers (metastases) are excluded at every layer before matching.
-Diagnoses marked refuted or entered-in-error are filtered out upstream
-in the LangGraph agent before this module is called.
+Secondary cancers (metastases) and non-invasive disease (ICD-10 D00-D49:
+in-situ, benign, uncertain/unspecified behaviour) are excluded at every layer
+before matching — see the per-block decision record in
+_build_icd10_cancer_sets(). Diagnoses marked refuted or entered-in-error are
+filtered out upstream in the LangGraph agent before this module is called.
 
 When multiple cancer conditions exist, a tiebreaker sorts by:
   confirmed > unconfirmed → active > remission → most recent onset date
@@ -53,10 +57,11 @@ Contains two registries:
 
      Three-layer detection:
        Layer 1 — SNOMED CT exact match   (52 codes, Synthea + mCODE roots)
-       Layer 2 — ICD-10-CM exact match   (1,670 codes, full 2024 release, O(1))
+       Layer 2 — ICD-10-CM exact match   (full 2024 release, O(1))
        Layer 3 — Display term fallback   (only when code is absent/unknown)
 
-     Secondary cancers (metastases) are excluded at every layer.
+     Secondary cancers (metastases) and non-invasive disease (in-situ,
+     benign, uncertain behaviour) are excluded at every layer.
      When multiple cancer conditions exist, tiebreaker sorts by:
        confirmed > unconfirmed → active > remission → most recent onset date
 
@@ -199,6 +204,66 @@ _CANCER_DISPLAY_TERMS: Tuple[str, ...] = (
     "blastoma",
 )
 
+# Display terms that mean SECONDARY (metastatic) disease. Rejected before
+# _CANCER_DISPLAY_TERMS is consulted — "metastatic carcinoma" contains
+# "carcinoma" and would otherwise read as a primary.
+_SECONDARY_DISPLAY_TERMS: Tuple[str, ...] = (
+    "metastatic", "metastasis", "metastases", "secondary",
+)
+
+# Display terms that mean NON-INVASIVE disease — benign, in-situ
+# (pre-invasive) or of uncertain/borderline behaviour.
+#
+# Rejected before _CANCER_DISPLAY_TERMS for the same structural reason as
+# the secondary terms: "benign neoplasm of colon" contains "neoplasm" and
+# "carcinoma in situ of breast" contains "carcinoma", so both used to be
+# classified as primary cancer by the fallback layer. Neither is an
+# invasive malignancy, and interventional oncology trials overwhelmingly
+# require invasive disease, so admitting them produces a patient whose
+# "primary cancer" cannot enrol on anything the pipeline retrieves for it.
+#
+# This is the display-side twin of the D00-D49 ICD-10 decision recorded in
+# _build_icd10_cancer_sets(); the two layers must agree or the same disease
+# would classify differently depending on whether it arrived coded.
+_NON_INVASIVE_DISPLAY_TERMS: Tuple[str, ...] = (
+    "benign", "in situ", "in-situ", "insitu",
+    "noninvasive", "non-invasive", "non invasive",
+    "uncertain behavior", "uncertain behaviour",
+    "unspecified behavior", "unspecified behaviour",
+    "borderline malignancy", "low malignant potential",
+    "premalignant", "pre-malignant",
+)
+
+# Which classification path decided a condition. Nothing is silently
+# recovered or silently dropped: every terminal decision in
+# is_primary_cancer() increments exactly one counter, readable after a run
+# via get_cancer_classification_stats().
+#
+# Not lock-protected. Increments are advisory instrumentation, and the
+# registry itself stays immutable and thread-safe; a lost increment under
+# concurrent FastAPI requests costs a count, never a classification.
+_CANCER_CLASSIFICATION_COUNTS: Dict[str, int] = {
+    "snomed_primary":                 0,  # layer 1 hit
+    "icd10_primary":                  0,  # layer 2 hit
+    "display_fallback":               0,  # layer 3 hit (no code recognized)
+    "rejected_secondary_code":        0,  # SNOMED/ICD-10 metastasis code
+    "rejected_non_invasive_code":     0,  # ICD-10 D00-D49
+    "rejected_secondary_display":     0,  # layer 3 — metastatic wording
+    "rejected_non_invasive_display":  0,  # layer 3 — benign/in-situ wording
+    "unclassified":                   0,  # coded, but no layer matched
+}
+
+
+def get_cancer_classification_stats() -> Dict[str, int]:
+    """Copy of the is_primary_cancer() decision counters."""
+    return dict(_CANCER_CLASSIFICATION_COUNTS)
+
+
+def reset_cancer_classification_stats() -> None:
+    """Zero the classification counters (per-run reporting, tests)."""
+    for key in _CANCER_CLASSIFICATION_COUNTS:
+        _CANCER_CLASSIFICATION_COUNTS[key] = 0
+
 # verificationStatus values that mean the diagnosis is retracted or erroneous.
 _EXCLUDE_VERIFICATION: FrozenSet[str] = frozenset({"refuted", "entered-in-error"})
 
@@ -215,23 +280,79 @@ _CLINICAL_STATUS_PRIORITY: Dict[str, int] = {
 _ICD10_ALPHA_PRIMARY: FrozenSet[str] = frozenset({"C4A", "C7A"})
 _ICD10_ALPHA_SECONDARY: FrozenSet[str] = frozenset({"C7B"})
 
+# D3A — Benign neuroendocrine tumors → NON-INVASIVE, same decision as the
+# rest of D00-D49. Alpha-suffixed, so int(c[1:3]) cannot classify it; before
+# this it was counted as unparsed and dropped.
+_ICD10_ALPHA_NON_INVASIVE: FrozenSet[str] = frozenset({"D3A"})
 
-def _build_icd10_cancer_sets() -> Tuple[Set[str], Set[str]]:
+# Codes that ICD-10-CM 2024 defines but the icd10-cm package's table omits.
+# C97 (malignant neoplasms of independent multiple primary sites) is absent
+# from icd10.codes entirely — verified against the installed release — so
+# widening the block range is not enough to admit it and it is seeded here.
+# Seeding is logged in _build_icd10_cancer_sets(); if a later package
+# release adds C97, the seed becomes a no-op and the log says so.
+_ICD10_SEED_PRIMARY: FrozenSet[str] = frozenset({"C97"})
+
+# ICD-10-CM chapter 2 block boundaries (CMS FY2024). External-standard
+# facts, so they stay here as named constants rather than moving to config.
+_ICD10_C_BLOCK_MAX          = 97   # C00-C97 is the whole malignant range
+_ICD10_C_SECONDARY_LO       = 77   # C77-C79 secondary / metastatic sites
+_ICD10_C_SECONDARY_HI       = 79
+_ICD10_D_NEOPLASM_BLOCK_MAX = 49   # D00-D49 is the rest of chapter 2;
+                                   # D50+ is chapter 3 (blood/immune)
+
+
+def _build_icd10_cancer_sets() -> Tuple[Set[str], Set[str], Set[str]]:
     """
-    Build ICD-10-CM primary and secondary cancer code sets from the
+    Build ICD-10-CM primary, secondary and non-invasive code sets from the
     full icd10-cm 2024 release (95,622 codes, no external API).
 
-    Primary (per mCODE STU4):
-        C00-C76  malignant neoplasms of primary sites
-        C80-C96  malignant neoplasms without site / hematologic
-        C4A      Merkel cell carcinoma  (alpha-suffix)
-        C7A      Malignant carcinoid tumors  (alpha-suffix)
-        D00-D09  in-situ neoplasms
-        D37-D48  neoplasms of uncertain behavior
+    Every chapter-2 block is assigned to exactly one of the three sets, and
+    anything that lands in none of them is counted and logged. No block is
+    dropped by falling off the end of a range test.
 
-    Secondary (excluded from primary selection):
-        C77-C79  secondary malignant neoplasms of lymph nodes / distant sites
-        C7B      secondary neuroendocrine tumors  (alpha-suffix)
+    PRIMARY — invasive malignancy (per mCODE STU4):
+        C00-C76   malignant neoplasms of primary / ill-defined sites
+        C4A       Merkel cell carcinoma            (alpha-suffix)
+        C7A       malignant carcinoid tumors       (alpha-suffix)
+        C80-C96   malignant neoplasms without site / hematologic
+        C97       malignant neoplasms of independent multiple primary sites.
+                  DECISION: INCLUDED. Previously dropped in silence by a
+                  `0 <= num <= 96` bound — C97 codes a patient with several
+                  independent PRIMARY tumours, not a metastasis, so dropping
+                  it made exactly the multi-primary patients invisible to
+                  the ICD-10 layer. The block range now reaches C97, and
+                  because the icd10-cm package's table omits the code
+                  outright it is additionally seeded from
+                  _ICD10_SEED_PRIMARY.
+
+    SECONDARY — metastatic, hard-excluded from primary selection:
+        C77-C79   secondary malignant neoplasms of lymph nodes / distant sites
+        C7B       secondary neuroendocrine tumors  (alpha-suffix)
+
+    NON-INVASIVE — not primary cancer, hard-excluded. Recorded explicitly
+    because two of these blocks used to be in the PRIMARY set:
+        D00-D09   carcinoma in situ.
+                  DECISION: EXCLUDED (was: primary). In-situ disease is
+                  pre-invasive; interventional oncology trials overwhelmingly
+                  require invasive disease, so treating DCIS/CIS as the
+                  patient's primary cancer matches them against trials they
+                  cannot enrol on.
+        D10-D36   benign neoplasms.
+                  DECISION: EXCLUDED (was: in no set at all — the same
+                  outcome, but unrecorded). Now explicit and counted.
+        D37-D48   neoplasms of uncertain behavior.
+                  DECISION: EXCLUDED (was: primary). "Uncertain behavior"
+                  means invasion has not been established; asserting an
+                  invasive malignancy on that basis is a guess.
+        D3A       benign neuroendocrine tumors     (alpha-suffix).
+                  DECISION: EXCLUDED with the rest of D10-D36.
+        D49       neoplasms of unspecified behavior.
+                  DECISION: EXCLUDED, same reasoning as D37-D48.
+
+    Returns:
+        (primary, secondary, non_invasive) — raw, dot-formatted code strings.
+        All three are empty when the icd10-cm package is missing.
     """
     try:
         import icd10
@@ -240,10 +361,19 @@ def _build_icd10_cancer_sets() -> Tuple[Set[str], Set[str]]:
             "icd10-cm package not installed. Run: pip install icd10-cm\n"
             "ICD-10 layer will be empty; only SNOMED and display fallback active."
         )
-        return set(), set()
+        return set(), set(), set()
 
     primary: Set[str] = set()
     secondary: Set[str] = set()
+    non_invasive: Set[str] = set()
+
+    # Codes that reach neither set. Counted, never silently discarded.
+    skipped: Dict[str, int] = {
+        "c_block_unparsed":   0,   # C-code whose block digits are not numeric
+        "c_block_out_of_range": 0, # C-code above C97 (none exist in FY2024)
+        "d_block_unparsed":   0,   # D-code whose block digits are not numeric
+        "d_outside_chapter2": 0,   # D50+ — blood/immune, not a neoplasm
+    }
 
     for code_str in icd10.codes:
         c = code_str.upper().replace(".", "")
@@ -256,30 +386,71 @@ def _build_icd10_cancer_sets() -> Tuple[Set[str], Set[str]]:
             if prefix3 in _ICD10_ALPHA_SECONDARY:
                 secondary.add(code_str)
                 continue
+
             try:
                 num = int(c[1:3])
-                if 0 <= num <= 96:
-                    if 77 <= num <= 79:
-                        secondary.add(code_str)
-                    else:
-                        primary.add(code_str)
             except ValueError:
-                logger.debug(f"Skipping unrecognized ICD-10 C-code: {code_str!r}")
+                skipped["c_block_unparsed"] += 1
+                logger.debug(f"ICD-10 C-code with non-numeric block, skipped: {code_str!r}")
+                continue
+
+            if _ICD10_C_SECONDARY_LO <= num <= _ICD10_C_SECONDARY_HI:
+                secondary.add(code_str)
+            elif 0 <= num <= _ICD10_C_BLOCK_MAX:
+                primary.add(code_str)
+            else:
+                skipped["c_block_out_of_range"] += 1
+                logger.debug(
+                    f"ICD-10 C-code above C{_ICD10_C_BLOCK_MAX}, skipped: {code_str!r}"
+                )
 
         elif c and c[0] == "D" and len(c) >= 3:
+            if c[:3] in _ICD10_ALPHA_NON_INVASIVE:
+                non_invasive.add(code_str)
+                continue
+
             try:
                 num = int(c[1:3])
-                if 0 <= num <= 9:
-                    primary.add(code_str)
-                elif 37 <= num <= 48:
-                    primary.add(code_str)
             except ValueError:
-                logger.debug(f"Skipping unrecognized ICD-10 D-code: {code_str!r}")
+                skipped["d_block_unparsed"] += 1
+                logger.debug(f"ICD-10 D-code with non-numeric block, skipped: {code_str!r}")
+                continue
+
+            if 0 <= num <= _ICD10_D_NEOPLASM_BLOCK_MAX:
+                # D00-D49: in-situ, benign, uncertain and unspecified
+                # behavior. See the block decisions in the docstring.
+                non_invasive.add(code_str)
+            else:
+                skipped["d_outside_chapter2"] += 1
+
+    # Seed codes the package's table omits. Logged either way so a future
+    # package release that adds them is visible rather than silently absorbed.
+    seeded = {s for s in _ICD10_SEED_PRIMARY
+              if s.upper().replace(".", "") not in
+              {p.upper().replace(".", "") for p in primary}}
+    if seeded:
+        primary |= seeded
+        logger.info(
+            f"ICD-10-CM: seeded {sorted(seeded)} into the primary set — absent "
+            f"from the installed icd10-cm table, valid in ICD-10-CM 2024."
+        )
+    else:
+        logger.debug(
+            f"ICD-10-CM: seed set {sorted(_ICD10_SEED_PRIMARY)} already present "
+            f"in the package table; no seeding needed."
+        )
 
     logger.info(
-        f"ICD-10-CM loaded: {len(primary)} primary, {len(secondary)} secondary codes."
+        f"ICD-10-CM loaded: {len(primary)} primary, {len(secondary)} secondary, "
+        f"{len(non_invasive)} non-invasive (in-situ/benign/uncertain) codes."
     )
-    return primary, secondary
+
+    unexpected = {k: v for k, v in skipped.items() if v and k != "d_outside_chapter2"}
+    if unexpected:
+        logger.warning(f"ICD-10-CM codes assigned to no set: {unexpected}")
+    logger.debug(f"ICD-10-CM non-neoplasm D-codes ignored: {skipped['d_outside_chapter2']}")
+
+    return primary, secondary, non_invasive
 
 
 class CancerCodeRegistry:
@@ -292,11 +463,15 @@ class CancerCodeRegistry:
     """
 
     def __init__(self):
-        icd10_primary_raw, icd10_secondary_raw = _build_icd10_cancer_sets()
+        (icd10_primary_raw,
+         icd10_secondary_raw,
+         icd10_non_invasive_raw) = _build_icd10_cancer_sets()
 
         self.snomed_primary: FrozenSet[str] = _SNOMED_PRIMARY
         self.snomed_secondary: FrozenSet[str] = _SNOMED_SECONDARY
         self.display_terms: Tuple[str, ...] = _CANCER_DISPLAY_TERMS
+        self.secondary_display_terms: Tuple[str, ...] = _SECONDARY_DISPLAY_TERMS
+        self.non_invasive_display_terms: Tuple[str, ...] = _NON_INVASIVE_DISPLAY_TERMS
         self.exclude_verification: FrozenSet[str] = _EXCLUDE_VERIFICATION
         self.clinical_status_priority: Dict[str, int] = _CLINICAL_STATUS_PRIORITY
 
@@ -308,10 +483,14 @@ class CancerCodeRegistry:
         self._icd10_secondary_norm: FrozenSet[str] = frozenset(
             c.upper().replace(".", "") for c in icd10_secondary_raw
         )
+        self._icd10_non_invasive_norm: FrozenSet[str] = frozenset(
+            c.upper().replace(".", "") for c in icd10_non_invasive_raw
+        )
 
         logger.info(
             f"CancerCodeRegistry ready: {len(self.snomed_primary)} SNOMED + "
-            f"{len(self._icd10_primary_norm)} ICD-10-CM primary codes indexed."
+            f"{len(self._icd10_primary_norm)} ICD-10-CM primary codes indexed "
+            f"({len(self._icd10_non_invasive_norm)} non-invasive codes rejected)."
         )
 
 
@@ -330,8 +509,21 @@ class CancerCodeRegistry:
         Display fallback (Layer 3): fires only when ALL codings are absent,
         unknown, or unrecognized. Uses morphology terms in display text.
 
-        Secondary/metastatic codes are hard-excluded: if ANY coding matches a
-        secondary set, the condition is rejected regardless of other codings.
+        Hard exclusions, applied to ALL codings before any primary match:
+          - secondary/metastatic codes (a metastasis, not a primary)
+          - non-invasive codes: ICD-10 D00-D49, i.e. in-situ, benign,
+            uncertain and unspecified behavior. See _build_icd10_cancer_sets()
+            for the per-block decision record.
+        Either one rejects the condition regardless of its other codings.
+
+        Layer 3 applies the same two exclusions in wording form
+        (_SECONDARY_DISPLAY_TERMS, _NON_INVASIVE_DISPLAY_TERMS) before it
+        consults the morphology terms, so an uncoded "benign neoplasm of
+        colon" or "carcinoma in situ of breast" is rejected for the same
+        reason its coded twin is.
+
+        Every return path increments a counter in
+        _CANCER_CLASSIFICATION_COUNTS — see get_cancer_classification_stats().
 
         Backward compatible: if "codings" key is absent (older parsed data),
         falls back to single "code" field with original behavior.
@@ -344,15 +536,22 @@ class CancerCodeRegistry:
             code = (condition.get("code") or "").strip()
             codings = [{"system_key": "unknown", "code": code, "display": display}]
 
-        # Pass 1: Hard exclude if ANY coding is secondary/metastatic.
-        # A single secondary code means the condition is a metastasis,
-        # even if another coding maps to a primary site.
+        # Pass 1: Hard exclude if ANY coding is secondary/metastatic or
+        # non-invasive. A single such code decides the condition, even if
+        # another coding maps to a primary site.
         for c in codings:
             c_code = (c.get("code") or "").strip()
             c_norm = c_code.upper().replace(".", "")
-            if c_norm in self._icd10_secondary_norm:
+            if c_norm in self._icd10_secondary_norm or c_code in self.snomed_secondary:
+                _CANCER_CLASSIFICATION_COUNTS["rejected_secondary_code"] += 1
+                logger.debug(f"Not primary — secondary/metastatic code {c_code!r}")
                 return False
-            if c_code in self.snomed_secondary:
+            if c_norm in self._icd10_non_invasive_norm:
+                _CANCER_CLASSIFICATION_COUNTS["rejected_non_invasive_code"] += 1
+                logger.debug(
+                    f"Not primary — non-invasive (in-situ/benign/uncertain) "
+                    f"code {c_code!r}"
+                )
                 return False
 
         # Pass 2: Check if ANY coding matches a primary cancer set.
@@ -368,22 +567,34 @@ class CancerCodeRegistry:
 
             # Layer 1: SNOMED exact match
             if c_code in self.snomed_primary:
+                _CANCER_CLASSIFICATION_COUNTS["snomed_primary"] += 1
                 return True
 
             # Layer 2: ICD-10-CM normalized match
             if c_norm in self._icd10_primary_norm:
+                _CANCER_CLASSIFICATION_COUNTS["icd10_primary"] += 1
                 return True
 
         # Pass 3: Display fallback -- only when no coding was recognized
         if not has_recognized_code:
-            _secondary_terms = ("metastatic", "metastasis", "secondary")
-            if any(sec in display for sec in _secondary_terms):
+            if any(sec in display for sec in self.secondary_display_terms):
+                _CANCER_CLASSIFICATION_COUNTS["rejected_secondary_display"] += 1
+                logger.debug(f"Not primary — secondary wording in display {display!r}")
+                return False
+            if any(nb in display for nb in self.non_invasive_display_terms):
+                _CANCER_CLASSIFICATION_COUNTS["rejected_non_invasive_display"] += 1
+                logger.debug(
+                    f"Not primary — non-invasive wording in display {display!r}"
+                )
                 return False
             if any(term in display for term in self.display_terms):
+                _CANCER_CLASSIFICATION_COUNTS["display_fallback"] += 1
+                logger.debug(f"Primary via display fallback (no usable code): {display!r}")
                 return True
 
+        _CANCER_CLASSIFICATION_COUNTS["unclassified"] += 1
         return False
-    
+
 
     def sort_key(self, condition: Dict) -> Tuple:
         """

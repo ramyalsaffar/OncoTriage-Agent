@@ -54,6 +54,25 @@ _STAGE_ALT = (
     r"[0-4]"
 )
 
+# Ends of the ordinal scale. AJCC stage groups run 0 (in situ) to IV
+# (distant), so these are facts about the staging system, not tunables.
+_STAGE_MIN_ORDINAL: int = 0
+_STAGE_MAX_ORDINAL: int = 4
+
+# A collected span is treated as UNRESOLVED, not as a permissive range,
+# when its lower bound is at or below this and its upper bound reaches
+# _STAGE_MAX_ORDINAL.
+#
+# Why: _extract_stage_from_text collects every non-negated stage mention in
+# a block and returns the global min/max. One stray "Stage I" in a
+# prior-therapy sentence alongside a genuine "Stage IV" widens the span to
+# I-IV, which admits every stage a staged patient can carry — the filter is
+# off, but the payload claims a resolved requirement. Recording None instead
+# says the same thing honestly: the block did not yield a usable bound. The
+# only behavioural difference at query time is that stage-0 patients are now
+# kept rather than dropped, which is the conservative direction.
+_STAGE_FULL_RANGE_MIN_CEILING: int = 1
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # TRIAL-SIDE EXTRACTION (index time)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -112,94 +131,290 @@ _NEGATION_PREFIXES = re.compile(
 )
 
 
+# How far back to look for a negation cue governing a match.
+_NEGATION_LOOKBACK = 80
+
+# A clause boundary between the negation cue and the match means the cue
+# governs some earlier clause, not this match.
+_CLAUSE_BOUNDARIES = re.compile(
+    r"[.;]|\.\s|\bin\s+(?:patients?|participants?|subjects?)\b",
+    re.IGNORECASE,
+)
+
+
 def _is_negated(text: str, match_start: int) -> bool:
     """
     Check if a regex match position is preceded by a negation phrase
     within the SAME clause/sentence.
 
     Uses a two-layer approach:
-      1. Look back max 80 chars for a negation keyword.
-      2. If found, verify there is no sentence/clause boundary
-         (period, semicolon, comma-space, "in Participants") between
-         the negation and the match — prevents false positives from
-         distant unrelated clauses like "With or Without MK-2870 in
-         Participants With Resectable Stage II..."
+      1. Look back max _NEGATION_LOOKBACK chars for a negation keyword and
+         take the NEAREST one — the last match in the window, not the first.
+      2. Verify there is no sentence/clause boundary (period, semicolon,
+         "in Participants") between that keyword and the match — prevents
+         false positives from distant unrelated clauses like "With or
+         Without MK-2870 in Participants With Resectable Stage II..."
+
+    Why nearest rather than first: the cue that governs a phrase is the one
+    closest to it. re.search() returns the LEFTMOST negation in the window,
+    which is the one most likely to have a clause boundary after it — so
+    layer 2 discards it and the function reports "not negated" even when a
+    nearer cue sits in the same clause as the match. Picking the furthest
+    candidate systematically under-detects negation, which is the wrong
+    direction: a missed negation writes a requirement the trial never
+    stated. Scanning to the last match fixes the selection.
     """
-    window_start = max(0, match_start - 80)
+    window_start = max(0, match_start - _NEGATION_LOOKBACK)
     prefix = text[window_start:match_start]
 
-    neg_match = _NEGATION_PREFIXES.search(prefix)
-    if not neg_match:
+    # Nearest preceding negation cue = last match in the look-back window.
+    neg_match = None
+    for m in _NEGATION_PREFIXES.finditer(prefix):
+        neg_match = m
+    if neg_match is None:
         return False
 
-    # Text between negation keyword and the stage mention
+    # Text between the negation keyword and the match
     between = prefix[neg_match.end():]
 
-    # If there's a clause boundary between negation and stage, not negated
-    clause_boundaries = re.compile(r"[.;]|\.\s|\bin\s+(?:patients?|participants?|subjects?)\b", re.IGNORECASE)
-    if clause_boundaries.search(between):
+    # If there's a clause boundary between negation and match, not negated
+    if _CLAUSE_BOUNDARIES.search(between):
         return False
 
     return True
+
+
+# Which stage-extraction path fired. Nothing here recovers silently: a
+# skipped mention, a discarded span and a tightened bound each land in a
+# counter, readable after an index build via get_stage_extraction_stats().
+_STAGE_EXTRACTION_COUNTS: Dict[str, int] = {
+    "negated_skipped":            0,  # mention sat in a negative context
+    "non_oncology_stage_skipped": 0,  # "stage 4" of CKD/GVHD/Child-Pugh etc.
+    "full_range_unresolved":      0,  # collected span covered the whole scale
+    "exclusion_upper_bound":      0,  # exclusion text lowered max_stage
+    "exclusion_not_suffix":       0,  # exclusion stages did not reach stage IV
+    "exclusion_scale_swept":      0,  # exclusion run covered stage I upward
+    "exclusion_contradictory":    0,  # exclusion bound fell below the min bound
+}
+
+
+def get_stage_extraction_stats() -> Dict[str, int]:
+    """Copy of the stage negation / span / exclusion-bound counters."""
+    return dict(_STAGE_EXTRACTION_COUNTS)
+
+
+def reset_stage_extraction_stats() -> None:
+    """Zero the stage counters (per-run reporting, tests)."""
+    for key in _STAGE_EXTRACTION_COUNTS:
+        _STAGE_EXTRACTION_COUNTS[key] = 0
+
+
+# Staging systems that are NOT cancer staging. "Stage 4" in criteria text
+# just as often means chronic kidney disease, graft-versus-host disease or
+# Child-Pugh class as it means AJCC stage IV, and _SINGLE_RE cannot tell the
+# difference — it only sees the word "stage" and a numeral.
+#
+# Each entry is a disease-specific phrase, never a bare organ word: "renal"
+# or "kidney" alone would suppress "Stage IV renal cell carcinoma", which is
+# a cancer stage. External clinical-terminology facts, so they live here as
+# a named constant rather than in config.
+_NON_ONCOLOGY_STAGE_CONTEXT_RE = re.compile(
+    r"\bckd\b|chronic\s+kidney\s+disease|kidney\s+disease|"
+    r"renal\s+(?:insufficiency|failure|impairment|disease|dysfunction)|"
+    r"nephropathy|end[\s-]stage\s+renal|"
+    r"\bgvhd\b|graft[\s-]versus[\s-]host|"
+    r"\bnyha\b|heart\s+failure|"
+    r"child[\s-]pugh|cirrhosis|(?:hepatic|liver)\s+fibrosis|encephalopathy|"
+    r"\bcopd\b|american\s+society\s+of\s+anesthesiologist|"
+    r"pressure\s+(?:ulcer|injury)|decubitus|"
+    r"retinopathy|sleep\s+apn(?:o)?ea|hypertension|"
+    r"endometriosis|sarcoidosis|fibrosis",
+    re.IGNORECASE,
+)
+
+# How far either side of a stage mention to look for such a qualifier.
+# Tight on purpose: these qualifiers sit adjacent to the numeral
+# ("CKD >=Stage 4", "Stage 4 skin GVHD", "stage IV-V chronic kidney
+# disease"), and a wide window would start suppressing genuine cancer
+# stages that merely share a criteria bullet with a comorbidity.
+_NON_ONCOLOGY_CONTEXT_WINDOW = 30
+
+
+def _stage_negated(text: str, match_start: int) -> bool:
+    """_is_negated with the stage-side counter attached."""
+    if _is_negated(text, match_start):
+        _STAGE_EXTRACTION_COUNTS["negated_skipped"] += 1
+        return True
+    return False
+
+
+def _is_non_oncology_stage(text: str, match_start: int, match_end: int) -> bool:
+    """
+    True if a "stage N" mention is qualified by a non-cancer staging system
+    within _NON_ONCOLOGY_CONTEXT_WINDOW chars either side.
+
+    Skipping such a mention is the conservative direction on both blocks: in
+    the inclusion block it would invent a requirement, and in the exclusion
+    block it would cap the trial below the stages it actually accepts, which
+    hides it from patients it wants.
+    """
+    lo = max(0, match_start - _NON_ONCOLOGY_CONTEXT_WINDOW)
+    hi = match_end + _NON_ONCOLOGY_CONTEXT_WINDOW
+    if _NON_ONCOLOGY_STAGE_CONTEXT_RE.search(text[lo:hi]):
+        _STAGE_EXTRACTION_COUNTS["non_oncology_stage_skipped"] += 1
+        return True
+    return False
+
+
+def _is_full_range_span(lo: int, hi: int) -> bool:
+    """
+    True if (lo, hi) covers the whole discriminable stage scale and
+    therefore constrains nothing. See _STAGE_FULL_RANGE_MIN_CEILING.
+    """
+    return lo <= _STAGE_FULL_RANGE_MIN_CEILING and hi >= _STAGE_MAX_ORDINAL
+
+
+def _collect_stage_ordinals(text: str) -> List[int]:
+    """
+    Every non-negated stage ordinal mentioned in `text`, in match order.
+
+    Shared by the inclusion-side extractor and the exclusion-side upper
+    bound so both read stage mentions — and negation — identically.
+    """
+    ordinals: List[int] = []
+
+    for m in _RANGE_RE.finditer(text):
+        if _stage_negated(text, m.start()):
+            continue
+        if _is_non_oncology_stage(text, m.start(), m.end()):
+            continue
+        lo = _STAGE_ORDINAL.get(m.group(1).lower())
+        hi = _STAGE_ORDINAL.get(m.group(2).lower())
+        if lo is not None:
+            ordinals.append(lo)
+        if hi is not None:
+            ordinals.append(hi)
+
+    # Also check single-stage mentions that may follow the range pattern
+    # (e.g., the "IV" in "stage II, III, or IV" that the range regex missed)
+    for m in _SINGLE_RE.finditer(text):
+        if _stage_negated(text, m.start()):
+            continue
+        if _is_non_oncology_stage(text, m.start(), m.end()):
+            continue
+        val = _STAGE_ORDINAL.get(m.group(1).lower())
+        if val is not None:
+            ordinals.append(val)
+
+    return ordinals
+
+
+def _extract_stage_upper_bound_from_exclusion(exclusion: str) -> Optional[int]:
+    """
+    Read the EXCLUSION block for an upper stage bound.
+
+    "Stage IV disease will be excluded" is a hard cap on the population that
+    the inclusion block never states, and until now nothing read it — the
+    trial ended up either unresolved or, worse, carrying an inclusion-derived
+    max that admitted the very stage the trial rejects.
+
+    Semantics are inverted relative to the inclusion block: an affirmative
+    (non-negated) stage mention here names who is kept OUT. Negated mentions
+    are skipped exactly as elsewhere, so "except stage I" — "except for" is
+    already a _NEGATION_PREFIXES cue — contributes nothing.
+
+    Only a bound is derivable, and only from a CONTIGUOUS SUFFIX of the
+    scale: the excluded stages must reach _STAGE_MAX_ORDINAL, and the bound
+    is one below the lowest stage in that unbroken run down from the top.
+      "Stage IV excluded"        → {4}       → max_stage 3
+      "Stage III or IV excluded" → {3, 4}    → max_stage 2
+      "prior stage I malignancy" → {1}       → no bound (does not reach IV)
+      "stage I ... stage IV"     → {1, 4}    → max_stage 3 (the stray 1 is
+                                               not part of the run)
+    An excluded set that does not reach the top ("stage II excluded") is not
+    expressible as an upper bound at all; it is counted and ignored rather
+    than approximated, because approximating it would drop patients the
+    trial accepts. A run that reaches all the way down to stage I is
+    likewise refused — see the _STAGE_MIN_ORDINAL check below.
+
+    Non-cancer staging systems ("stage 4 chronic kidney disease") are
+    skipped by _is_non_oncology_stage() before any of this.
+
+    Returns:
+        The upper bound ordinal, or None when no bound is derivable.
+    """
+    if not exclusion or not exclusion.strip():
+        return None
+
+    excluded = set(_collect_stage_ordinals(exclusion))
+    if not excluded:
+        return None
+
+    if _STAGE_MAX_ORDINAL not in excluded:
+        _STAGE_EXTRACTION_COUNTS["exclusion_not_suffix"] += 1
+        return None
+
+    # Walk down from the top while the run is unbroken.
+    lowest_excluded = _STAGE_MAX_ORDINAL
+    while (lowest_excluded - 1) in excluded:
+        lowest_excluded -= 1
+
+    bound = lowest_excluded - 1
+    if bound <= _STAGE_MIN_ORDINAL:
+        # The run swallowed the whole scale: stage I upward all "excluded",
+        # leaving only stage 0. No interventional trial enrols in-situ
+        # disease exclusively, so this is never an eligibility statement —
+        # it is a sentence that merely enumerates stages, e.g. "For Murphy
+        # stage III/IV patients, or stage I/II patients with steroid
+        # pretreatment, the following applies". Emitting max_stage=0 there
+        # would hide the trial from every staged patient it wants. Leave
+        # the axis unfiltered instead.
+        _STAGE_EXTRACTION_COUNTS["exclusion_scale_swept"] += 1
+        return None
+
+    return bound
 
 
 def _extract_stage_from_text(text: str) -> Optional[Tuple[int, int]]:
     """
     Extract (min_stage, max_stage) from a block of text.
     Returns None if nothing found.  Skips negated mentions.
+
+    A collected span that covers the whole scale is returned as None rather
+    than as a permissive range — see _STAGE_FULL_RANGE_MIN_CEILING.
     """
     if not text or not text.strip():
         return None
 
     # --- Pass 1: Stage range / list ---
     # Collect ALL non-negated stage mentions, then take min/max
-    all_ordinals = []
-    for m in _RANGE_RE.finditer(text):
-        if _is_negated(text, m.start()):
-            continue
-        lo = _STAGE_ORDINAL.get(m.group(1).lower())
-        hi = _STAGE_ORDINAL.get(m.group(2).lower())
-        if lo is not None:
-            all_ordinals.append(lo)
-        if hi is not None:
-            all_ordinals.append(hi)
-
-    # Also check single-stage mentions that may follow the range pattern
-    # (e.g., the "IV" in "stage II, III, or IV" that the range regex missed)
-    for m in _SINGLE_RE.finditer(text):
-        if _is_negated(text, m.start()):
-            continue
-        val = _STAGE_ORDINAL.get(m.group(1).lower())
-        if val is not None:
-            all_ordinals.append(val)
+    all_ordinals = _collect_stage_ordinals(text)
 
     if all_ordinals:
-        return (min(all_ordinals), max(all_ordinals))
+        lo, hi = min(all_ordinals), max(all_ordinals)
+        if _is_full_range_span(lo, hi):
+            # The block mentioned stages, but the span they imply admits
+            # everything. Report unresolved instead of a fake requirement;
+            # the exclusion block may still supply a real upper bound.
+            _STAGE_EXTRACTION_COUNTS["full_range_unresolved"] += 1
+            return None
+        return (lo, hi)
 
-    # --- Pass 2: Single stage (only if no ordinals found in Pass 1) ---
-    if not all_ordinals:
-        for m in _SINGLE_RE.finditer(text):
-            if _is_negated(text, m.start()):
-                continue
-            stage = _STAGE_ORDINAL.get(m.group(1).lower())
-            if stage is not None:
-                return (stage, stage)
-
-    # --- Pass 3: Metastatic keyword (not non-metastatic) ---
+    # --- Pass 2: Metastatic keyword (not non-metastatic) ---
     if _NON_METASTATIC_RE.search(text):
         # "Non-metastatic" → don't set stage=4 even if "metastatic" also matches
         pass
     else:
         for m in _METASTATIC_RE.finditer(text):
-            if _is_negated(text, m.start()):
+            if _stage_negated(text, m.start()):
                 continue
-            return (4, 4)
+            return (_STAGE_MAX_ORDINAL, _STAGE_MAX_ORDINAL)
 
-    # --- Pass 4: Locally advanced ---
+    # --- Pass 3: Locally advanced ---
     for m in _LOCALLY_ADVANCED_RE.finditer(text):
-        if _is_negated(text, m.start()):
+        if _stage_negated(text, m.start()):
             continue
-        return (3, 4)
+        return (3, _STAGE_MAX_ORDINAL)
 
     return None
 
@@ -249,6 +464,11 @@ def enrich_structured_eligibility(trial: Dict) -> Dict:
     structured_eligibility is set to all-None values.
     The query-time filter will keep the trial (conservative).
 
+    The EXCLUSION block is then read separately, for an upper bound only —
+    "Stage IV will be excluded" is a cap the inclusion block never states.
+    It can only tighten max_stage, never loosen it or move min_stage. See
+    _extract_stage_upper_bound_from_exclusion().
+
     Args:
         trial: Trial dict from parse_trial_metadata(). Modified in-place.
 
@@ -266,6 +486,23 @@ def enrich_structured_eligibility(trial: Dict) -> Dict:
 
     min_stage = stage_result[0] if stage_result else None
     max_stage = stage_result[1] if stage_result else None
+
+    # --- Upper bound from the exclusion block ---
+    # Applies whether or not the inclusion side resolved: an unresolved
+    # trial gains a cap it never had, and a resolved one is tightened.
+    exclusion_upper = _extract_stage_upper_bound_from_exclusion(exclusion)
+    if exclusion_upper is not None:
+        if max_stage is None or exclusion_upper < max_stage:
+            _STAGE_EXTRACTION_COUNTS["exclusion_upper_bound"] += 1
+            max_stage = exclusion_upper
+
+        if min_stage is not None and min_stage > max_stage:
+            # Inclusion floor sits above the exclusion cap — the two blocks
+            # disagree and the trial would accept nobody. Drop back to
+            # unresolved rather than index an unsatisfiable range.
+            _STAGE_EXTRACTION_COUNTS["exclusion_contradictory"] += 1
+            min_stage = None
+            max_stage = None
 
     # --- Metastatic acceptance ---
     accepts_metastatic = _extract_accepts_metastatic(title, inclusion, exclusion)
