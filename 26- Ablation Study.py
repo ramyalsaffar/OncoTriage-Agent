@@ -659,6 +659,7 @@ def match_patient_ablation(patient_data, bm25_index, nct_ids, graph, ablation_fl
         "stage_timings":                    {},
         "patient_trees":                    set(),
         "patient_histology":                set(),
+        "mesh_resolution":                  "",
         "ablation_flags":                   ablation_flags,
     }
 

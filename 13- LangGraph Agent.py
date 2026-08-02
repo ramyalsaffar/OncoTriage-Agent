@@ -126,6 +126,13 @@ class TrialMatchState(TypedDict):
     # Short queries for cross-encoder (MedCPT-native format)
     rerank_queries: List[str]
 
+    # How the patient's MeSH C04 identity resolved: the layer name(s), or the
+    # reason none applied ("pan_cancer_only", "unmapped", ...). Written once
+    # in Stage 1; Stage 3 re-resolves the same way. Logged to
+    # inferences.mesh_resolution so an unresolved patient is a queryable fact
+    # rather than an inference from an empty tree list.
+    mesh_resolution: str
+
     # --- Stage 2: Hybrid Retrieval ---
     hybrid_results: List[Dict]                  # Trials from BM25 + Vector + RRF
 
@@ -292,6 +299,76 @@ def compute_patient_hash(patient_data: Dict) -> str:
 # ===========================================================================
 
 
+# Resolution outcomes that never reach the MeSH filter itself, so they are
+# named here rather than on MeSHCancerFilter. Everything else in the
+# mesh_resolution column comes from resolve_patient_trees().
+MESH_RESOLUTION_NO_FILTER = "no_mesh_filter"       # MeSH data files not loaded
+MESH_RESOLUTION_NO_CONDITIONS = "no_valid_condition"  # nothing left to resolve
+
+
+def _empty_mesh_resolution(reason: str) -> dict:
+    """Same shape resolve_patient_trees() returns, for the pre-resolution exits."""
+    return {
+        "trees":               set(),
+        "resolution":          reason,
+        "layers":              [],
+        "pan_only_layers":     [],
+        "conditions_total":    0,
+        "conditions_resolved": 0,
+        "conditions_pan_only": 0,
+        "conditions_unmapped": 0,
+    }
+
+
+def resolve_patient_mesh(conditions: list, cancer_registry, mesh_filter) -> dict:
+    """
+    The pipeline's single entry point for resolving a patient's MeSH identity.
+
+    Stage 1 (query expansion) and Stage 3 (relevance boost, which feeds
+    Stage 4's hard drop via state["patient_trees"]) both call this, so the
+    patient's cancer identity — and the layer that produced it — is the same
+    number in the expanded query, the boost, the filter and the log.
+
+    Conditions marked refuted or entered-in-error are excluded. There is no
+    fallback to the unfiltered list: a diagnosis the record retracted is not
+    evidence of the patient's cancer, and 07- FHIR Parser.py already drops
+    both statuses before the pipeline sees the bundle, so the only way this
+    filter empties a non-empty list is a hand-built condition dict.
+
+    Returns the resolve_patient_trees() dict (see 09- MeSH Cancer Site
+    Relevance Filter.py), with "resolution" set to MESH_RESOLUTION_NO_FILTER
+    or MESH_RESOLUTION_NO_CONDITIONS on the pre-resolution exits.
+    """
+    if mesh_filter is None:
+        return _empty_mesh_resolution(MESH_RESOLUTION_NO_FILTER)
+
+    valid_conditions = [
+        c for c in conditions
+        if (c.get("verification_status") or "unknown")
+        not in cancer_registry.exclude_verification
+    ]
+
+    if not valid_conditions:
+        return _empty_mesh_resolution(MESH_RESOLUTION_NO_CONDITIONS)
+
+    return mesh_filter.resolve_patient_trees(valid_conditions, cancer_registry)
+
+
+def format_mesh_resolution(diag: dict) -> str:
+    """One-line summary of a resolve_patient_mesh() result, for stage logs."""
+    parts = [
+        f"{diag['conditions_resolved']}/{diag['conditions_total']} cancer conditions",
+        f"{len(diag['trees'])} trees",
+    ]
+    if diag["pan_only_layers"]:
+        parts.append(f"escalated past {'+'.join(diag['pan_only_layers'])}")
+    if diag["conditions_pan_only"]:
+        parts.append(f"{diag['conditions_pan_only']} pan-cancer-only")
+    if diag["conditions_unmapped"]:
+        parts.append(f"{diag['conditions_unmapped']} unmapped")
+    return f"[{diag['resolution']}] " + ", ".join(parts)
+
+
 def expand_query_from_mesh(conditions: list, cancer_registry, mesh_filter) -> dict:
     """
     Deterministic query expansion using MeSH C04 hierarchy.
@@ -333,19 +410,28 @@ def expand_query_from_mesh(conditions: list, cancer_registry, mesh_filter) -> di
                              Empty list if resolution fails.
           "primary_mesh"   : str|None   — single best MeSH descriptor (for R1 rerank query)
           "parent_mesh"    : str|None   — parent MeSH descriptor (for R3 rerank query)
-          "patient_trees"  : list[str]  — resolved C04 tree numbers, sorted for determinism
-          "resolution"     : str        — "snomed" | "fuzzy" | "failed"
+          "patient_trees"  : list[str]  — resolved C04 tree numbers, sorted for determinism.
+                             Pan-cancer nodes are never among them.
+          "resolution"     : str        — the layer(s) that resolved the patient
+                             ("snomed", "icd10+fuzzy_synonym", ...), or one of
+                             "no_mesh_filter" | "no_valid_condition" |
+                             "no_cancer_condition" | "unmapped" | "pan_cancer_only".
+                             Recorded in inferences.mesh_resolution.
 
     Edge cases handled:
-      - mesh_filter is None (MeSH data files not loaded)     → returns failed
-      - No cancer conditions in patient record                → returns failed
-      - SNOMED code not in crosswalk (real EHR with ICD-10)  → falls to fuzzy
+      - mesh_filter is None (MeSH data files not loaded)     → no_mesh_filter
+      - No cancer conditions in patient record                → no_cancer_condition
+      - SNOMED code not in crosswalk (real EHR with ICD-10)  → falls to icd10, then fuzzy
+      - Every layer resolves only to C04 / a depth-2 node    → pan_cancer_only,
+        no terms, no query expansion (see the Stage 1 guard below)
       - Tree number resolves but not in tree_to_name          → skipped, uses what's available
       - Patient maps to multiple tree numbers                 → all trees walked
       - Self descriptor appears at multiple tree levels       → deduplicated
       - Broad parent node with 15+ siblings                  → capped at 10
-      - Root-level tree (e.g., "C04" with no parent)         → no parent/sibling scan
-      - conditions list contains refuted/entered-in-error     → filtered out
+      - Root-level tree (e.g., "C04" with no parent)         → cannot occur: a
+        pan-cancer node is never accepted as the patient's identity
+      - conditions list contains refuted/entered-in-error     → filtered out,
+        with no fallback to the unfiltered list
     """
     MAX_SIBLINGS = 10
 
@@ -354,56 +440,47 @@ def expand_query_from_mesh(conditions: list, cancer_registry, mesh_filter) -> di
         "primary_mesh": None,
         "parent_mesh": None,
         "patient_trees": [],
-        "resolution": "failed",
+        # Overwritten by resolve_patient_mesh() on every path below; this is
+        # only the value a caller would see if the filter were never consulted.
+        "resolution": MESH_RESOLUTION_NO_FILTER,
     }
 
-    # ── Guard: MeSH filter not loaded ─────────────────────────────────────
-    if mesh_filter is None:
-        return result
-
-    # ── Filter out refuted/entered-in-error conditions ────────────────────
-    # Same filter applied in node_query_expansion (file 13, lines 265-267)
-    valid_conditions = [
-        c for c in conditions
-        if (c.get("verification_status") or "unknown")
-        not in cancer_registry.exclude_verification
-    ]
-    if not valid_conditions:
-        valid_conditions = conditions   # fallback: use all if filter empties list
-
     # ── Resolve patient → MeSH tree numbers ───────────────────────────────
-    # Delegates to patient_mesh_trees() — the same function used by the
-    # MeSH cancer site filter in Stage 4. This guarantees the patient's
-    # cancer identity is resolved identically in both stages.
+    # Delegates to resolve_patient_mesh() — the same call Stage 3 makes for
+    # the relevance boost and for the trees Stage 4 filters on. This
+    # guarantees the patient's cancer identity is resolved identically in
+    # every stage, and that the layer that produced it is the one logged.
     #
-    # patient_mesh_trees() internally:
-    #   1. Filters to primary cancer conditions via cancer_registry
-    #   2. Layer 1: SNOMED code → UMLS crosswalk → MeSH tree numbers
-    #   3. Layer 2: Display text → fuzzy match → MeSH tree numbers (fallback)
-    #   4. Iterates ALL cancer conditions (not just the primary one)
-    patient_trees = mesh_filter.patient_mesh_trees(valid_conditions, cancer_registry)
+    # It handles: mesh_filter=None, the refuted/entered-in-error filter,
+    # the primary-cancer filter, the four resolution layers, and the
+    # pan-cancer depth test applied to each of them.
+    mesh_resolution = resolve_patient_mesh(conditions, cancer_registry, mesh_filter)
+    result["resolution"] = mesh_resolution["resolution"]
+
+    # ── Stage 1 guard: pan-cancer node is not an identity ─────────────────
+    # A patient whose trees are only C04 / a depth-2 node builds
+    # child_prefixes = {"C04."}, which matches every descriptor in the tree:
+    # the expanded query would name every cancer type in MeSH and feed two of
+    # the four fusion channels. resolve_patient_trees() already drops those,
+    # so this is the second gate — it exists so a change there cannot silently
+    # reopen the path, and it says so in the log when it fires.
+    resolved_trees = mesh_resolution["trees"]
+    patient_trees = specific_cancer_trees(resolved_trees)
+
+    if patient_trees != resolved_trees:
+        print(f"  Stage 1 MeSH guard: dropped "
+              f"{len(resolved_trees) - len(patient_trees)} pan-cancer tree(s) "
+              f"from the patient resolution")
+        if not patient_trees:
+            result["resolution"] = MeSHCancerFilter.RESOLUTION_PAN_ONLY
 
     if not patient_trees:
         return result
-
-    # Determine resolution method for diagnostics
-    # Check if any cancer condition's SNOMED code is in the crosswalk
-    cancer_conditions = [
-        c for c in valid_conditions
-        if cancer_registry.is_primary_cancer(c)
-    ]
-    resolution = "fuzzy"   # default assumption
-    for cond in cancer_conditions:
-        code = (cond.get("code") or "").strip()
-        if code and code in mesh_filter.snomed_to_trees:
-            resolution = "snomed"
-            break
 
     # Sort for deterministic output (sets have arbitrary iteration order)
     patient_trees_sorted = sorted(patient_trees)
 
     result["patient_trees"] = patient_trees_sorted
-    result["resolution"] = resolution
 
     # ── Walk the C04 tree ─────────────────────────────────────────────────
     # Collect descriptor names at four proximity levels.
@@ -565,7 +642,7 @@ def node_query_expansion(state: dict) -> dict:
       - 100% deterministic: same patient record → same output, every time
       - Zero API cost: no LLM call, no tokens consumed
       - Near-zero latency: pure dictionary lookups + one O(T) tree scan
-      - Consistent with Stage 4: uses the same patient_mesh_trees() function
+      - Consistent with Stages 3 and 4: same resolve_patient_mesh() call
 
     Outputs (unchanged contract from previous LLM-based version):
       - expanded_query:  str  — base_query + comma-separated MeSH terms
@@ -728,6 +805,10 @@ def node_query_expansion(state: dict) -> dict:
         "expansion_prompt": expansion_info,
         "expansion_input_tokens": 0,
         "expansion_output_tokens": 0,
+        # Which layer resolved the patient's MeSH identity, or why none did.
+        # Stage 3 re-resolves from the same conditions with the same helper,
+        # so this one string describes the trees Stage 4 filters on too.
+        "mesh_resolution": mesh_result["resolution"],
         "stage_timings": {
             **state.get("stage_timings", {}),
             "query_expansion": round(elapsed, 3),
@@ -1056,6 +1137,21 @@ def apply_mesh_relevance_boost(top_trials: List[Dict],
         stats["unboosted"] = len(top_trials)
         return stats
 
+    # Stage 3 guard: a pan-cancer node is not a cancer identity.
+    # C04 is a prefix of every descriptor in the tree, so a patient carrying
+    # only C04 / a depth-2 node shares "ancestry" with every mapped trial:
+    # specific trials would take the full direct boost while the genuine
+    # basket trials take only the smaller pan boost — the ranking signal
+    # inverted. resolve_patient_trees() already drops those trees; this is the
+    # second gate, and it reports its own path so the run is distinguishable
+    # from an unmappable patient.
+    specific_patient_trees = specific_cancer_trees(patient_trees)
+    if not specific_patient_trees:
+        stats["path"] = "pan_cancer_only_patient_trees"
+        stats["unboosted"] = len(top_trials)
+        return stats
+    patient_trees = specific_patient_trees
+
     # Calibrate boost from the batch's own RRF score distribution
     rr_scores = [t.get("rerank_score_raw", t.get("rerank_score", 0.0))
                  for t in top_trials]
@@ -1352,10 +1448,17 @@ def node_cross_encoder_rerank(state: dict) -> dict:
     elif _MESH_FILTER is None:
         print("  MeSH relevance boost [no_mesh_filter]: filter unavailable")
     elif top_trials:
-        # Resolve patient MeSH trees (same call as Stage 4 uses)
+        # Resolve patient MeSH trees. Same helper, same conditions and same
+        # verification filter as Stage 1, so the trees handed to Stage 4 match
+        # the identity the expanded query was built from — and the layer that
+        # produced them is the one already recorded in mesh_resolution.
         patient_data = state["patient_data"]
         conditions = patient_data.get("conditions", [])
-        patient_trees = _MESH_FILTER.patient_mesh_trees(conditions, _CANCER_REGISTRY)
+        mesh_resolution = resolve_patient_mesh(
+            conditions, _CANCER_REGISTRY, _MESH_FILTER
+        )
+        patient_trees = mesh_resolution["trees"]
+        print(f"  MeSH patient resolution {format_mesh_resolution(mesh_resolution)}")
 
         boost_stats = apply_mesh_relevance_boost(
             top_trials, patient_trees, _MESH_FILTER
@@ -1443,7 +1546,11 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
             if patient_trees:
                 print(f"  MeSH patient trees: {patient_trees}")
             else:
-                print("  MeSH: no patient cancer trees resolved — cancer site filter skipped")
+                # Say which outcome this is. "pan_cancer_only" is a resolution
+                # that was deliberately rejected, not a lookup that missed.
+                print(f"  MeSH: no patient cancer trees resolved "
+                      f"[{state.get('mesh_resolution') or 'unrecorded'}] — "
+                      f"cancer site filter skipped")
 
     # --- Extract patient cancer stage ---
     patient_stage = extract_patient_stage(
@@ -2424,6 +2531,7 @@ def node_finalize(state: TrialMatchState) -> dict:
         "candidates_after_quality_filter": state.get("candidates_after_quality_filter", 0),
         "candidates_filtered": len(state.get("filtered_trials", [])),
         "mesh_dropped": state.get("mesh_dropped", 0),
+        "mesh_resolution": state.get("mesh_resolution", ""),
         "stage_dropped": state.get("stage_dropped", 0),
         "histology_dropped": state.get("histology_dropped", 0),
         "candidates_evaluated": len(evaluations),
@@ -2479,6 +2587,7 @@ def node_no_candidates(state: TrialMatchState) -> dict:
         "candidates_after_quality_filter": state.get("candidates_after_quality_filter", 0),
         "candidates_filtered": len(state.get("filtered_trials", [])),
         "mesh_dropped": state.get("mesh_dropped", 0),
+        "mesh_resolution": state.get("mesh_resolution", ""),
         "stage_dropped": state.get("stage_dropped", 0),
         "histology_dropped": state.get("histology_dropped", 0),
         "candidates_evaluated": 0,
@@ -2530,6 +2639,7 @@ def node_error_handler(state: TrialMatchState) -> dict:
         "candidates_after_quality_filter": state.get("candidates_after_quality_filter", 0),
         "candidates_filtered": len(state.get("filtered_trials", [])),
         "mesh_dropped": state.get("mesh_dropped", 0),
+        "mesh_resolution": state.get("mesh_resolution", ""),
         "stage_dropped": state.get("stage_dropped", 0),
         "histology_dropped": state.get("histology_dropped", 0),
         "candidates_evaluated": 0,
@@ -3529,6 +3639,7 @@ def match_patient_to_trials(
         "ablation_flags":     {},
         "patient_trees":      set(),
         "patient_histology":  set(),
+        "mesh_resolution":    "",
     }
 
     # Invoke the LangGraph pipeline

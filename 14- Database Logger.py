@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS inferences (
     candidates_after_quality_filter INTEGER,
     candidates_filtered INTEGER,
     mesh_dropped INTEGER,
+    mesh_resolution TEXT,
     stage_dropped INTEGER,
     histology_dropped INTEGER,
     candidates_evaluated INTEGER,
@@ -83,6 +84,13 @@ CREATE TABLE IF NOT EXISTS inferences (
 INFERENCE_COLUMN_ADDITIONS = {
     "not_evaluable_trials": "INTEGER",   # trials the model could not assess at all
     "cross_vocab_remaps":   "INTEGER",   # criterion labels resolved to not_evaluable
+    # Which layer resolved the patient's MeSH C04 identity ("snomed",
+    # "icd10+fuzzy_synonym", ...), or why none did ("pan_cancer_only",
+    # "unmapped", "no_cancer_condition", "no_valid_condition",
+    # "no_mesh_filter"). mesh_dropped = 0 is ambiguous on its own: it means
+    # both "the filter found nothing to drop" and "the patient was never
+    # resolved, so the filter never ran". This column separates the two.
+    "mesh_resolution":      "TEXT",
 }
 
 _existing_inference_columns = {
@@ -262,7 +270,8 @@ def log_inference(result: Dict, patient_data: Dict):
                 bm25_retrieved, vector_retrieved, 
                 candidates_after_rule_filter,
                 candidates_after_quality_filter,
-                candidates_filtered, mesh_dropped, stage_dropped, histology_dropped,
+                candidates_filtered, mesh_dropped, mesh_resolution,
+                stage_dropped, histology_dropped,
                 candidates_evaluated,
                 eligible_matches, near_misses,
                 not_evaluable_trials, cross_vocab_remaps,
@@ -273,7 +282,7 @@ def log_inference(result: Dict, patient_data: Dict):
                 pricing_version, estimated_cost_usd, qdrant_collection, error,
                 patient_data_hash, expansion_prompt,
                 gpt4o_retries, ablation_flags
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             result["patient_id"],
             result["timestamp"],
@@ -294,6 +303,7 @@ def log_inference(result: Dict, patient_data: Dict):
             result.get("candidates_after_quality_filter", 0),
             result.get("candidates_filtered", 0),
             result.get("mesh_dropped", 0),
+            result.get("mesh_resolution", ""),
             result.get("stage_dropped", 0),
             result.get("histology_dropped", 0),
             result.get("candidates_evaluated", 0),

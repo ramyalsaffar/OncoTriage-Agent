@@ -680,6 +680,35 @@ def build_all_lookups(mesh_xml_path: str, mrconso_path: str, output_dir: str):
     
 
 # ===========================================================================
+# PAN-CANCER DEPTH TEST (shared by the filter and by the pipeline stages)
+# ===========================================================================
+
+
+# Depth of a C04 tree number = number of dot-separated segments.
+#   C04             -> 1  (Neoplasms, the root of the whole branch)
+#   C04.588         -> 2  (Neoplasms by Site — every solid tumour lives under it)
+#   C04.588.274     -> 3  (Breast Neoplasms — an actual site)
+# A tree number at depth <= 2 names no cancer site. On the trial side that
+# means "basket trial, any cancer" (see _is_pan_cancer). On the PATIENT side it
+# means the opposite: the patient's site is unknown, because C04 is a prefix of
+# every descriptor in the tree and therefore matches everything.
+#
+# This is a structural fact about the MeSH C04 hierarchy, not a tunable.
+PAN_CANCER_TREE_MAX_DEPTH = 2
+
+
+def specific_cancer_trees(trees) -> Set[str]:
+    """Keep only tree numbers that name an actual cancer site or type.
+
+    Drops C04 and C04.* depth-2 nodes. Used on the patient side wherever a
+    tree number is about to be treated as the patient's cancer identity:
+    a pan-cancer node there is an unresolved patient, not a pan-cancer
+    patient, and letting it through makes every ancestry test succeed.
+    """
+    return {t for t in trees if len(t.split(".")) > PAN_CANCER_TREE_MAX_DEPTH}
+
+
+# ===========================================================================
 # FILTER CLASS: Loaded at runtime, used by node_rule_based_filter
 # ===========================================================================
 
@@ -692,9 +721,13 @@ class MeSHCancerFilter:
     Called per-trial in node_rule_based_filter to check whether a trial's
     target cancer type is related to the patient's cancer diagnosis.
 
-    Patient mapping (two layers):
-      Layer 1: SNOMED code → MeSH via UMLS crosswalk (gold standard)
-      Layer 2: Display string → MeSH via fuzzy matching (fallback)
+    Patient mapping (resolve_patient_trees, layers tried in order):
+      snomed  : SNOMED code → MeSH via UMLS crosswalk (gold standard)
+      icd10   : ICD-10-CM code → MeSH via UMLS crosswalk (real EHR path)
+      fuzzy_* : Display string → MeSH via exact / synonym / substring / stem
+      Every layer must clear the pan-cancer depth test; a layer resolving
+      only to C04 or a depth-2 node is walked past, and a patient no layer
+      resolves is reported unresolved (⇒ conservative KEEP, as before).
 
     Trial mapping:
       Direct: trial["conditions"] are MeSH terms from ClinicalTrials.gov
@@ -713,7 +746,21 @@ class MeSHCancerFilter:
     # Pan-cancer / basket trial indicators.
     # Trials whose ONLY C04 tree numbers are at depth ≤ 2 (e.g., C04, C04.588)
     # are considered cancer-agnostic and always pass the filter.
-    PAN_CANCER_MAX_DEPTH = 2
+    PAN_CANCER_MAX_DEPTH = PAN_CANCER_TREE_MAX_DEPTH
+
+    # Resolution outcomes reported by resolve_patient_trees(). Any other value
+    # is a "+"-joined list of the layers that produced the patient's trees
+    # (e.g. "snomed", "icd10+fuzzy_synonym").
+    RESOLUTION_NO_CANCER = "no_cancer_condition"
+    RESOLUTION_UNMAPPED  = "unmapped"
+    RESOLUTION_PAN_ONLY  = "pan_cancer_only"
+
+    # Words that appear in most medical display strings and carry no
+    # site signal. Removed before fuzzy matching.
+    _DISPLAY_STOPWORDS = frozenset({
+        "of", "the", "a", "an", "in", "and", "or", "with",
+        "to", "for", "by", "on", "at", "as", "is", "not",
+    })
 
     def __init__(self, name_to_trees: dict, tree_to_name: dict,
                  snomed_to_trees: dict, icd10_to_trees: dict = None,
@@ -759,17 +806,43 @@ class MeSHCancerFilter:
         """
         Extract MeSH C04 tree numbers for a patient's cancer diagnoses.
 
+        Thin wrapper over resolve_patient_trees() for callers that only need
+        the trees. Use resolve_patient_trees() when the resolution layer
+        matters (logging, the mesh_resolution column, diagnostics).
+
+        Returns:
+            Set of C04 tree number strings at depth > PAN_CANCER_MAX_DEPTH,
+            or empty set if the patient is unresolved.
+        """
+        return self.resolve_patient_trees(conditions, cancer_registry)["trees"]
+
+    def resolve_patient_trees(self, conditions: list,
+                              cancer_registry) -> dict:
+        """
+        Resolve a patient's cancer diagnoses to specific MeSH C04 tree numbers.
+
         Multi-coding aware: for each cancer condition, tries code-based
         crosswalk lookups before falling back to fuzzy string matching.
 
-        Resolution layers (per condition, first hit wins):
-          Layer 1 -- SNOMED crosswalk: extract SNOMED code from codings,
-                     look up in snomed_to_trees (built from MRCONSO).
-          Layer 2 -- ICD-10 crosswalk: extract ICD-10-CM code from codings,
-                     look up in icd10_to_trees (built from MRCONSO, Item 2.1).
-                     Skipped if icd10_to_trees is empty (not yet built).
-          Layer 3 -- Fuzzy string match: display text against MeSH descriptor
-                     names. Only fires when both crosswalks miss.
+        Resolution layers, per condition, in order:
+          snomed          -- SNOMED code from codings -> snomed_to_trees
+          icd10           -- ICD-10-CM code from codings -> icd10_to_trees
+          fuzzy_exact     -- display IS a MeSH descriptor name
+          fuzzy_synonym   -- display in the UMLS synonym crosswalk
+          fuzzy_substring -- display contains / is contained by a descriptor
+          fuzzy_stem      -- stemmed word overlap against the descriptor index
+
+        The pan-cancer depth test is applied to EVERY layer, not just the
+        first hit. A layer that resolves only to C04 or a depth-2 node
+        (mCODE's SNOMED root 363346000 -> ["C04"] is the common case, and 35
+        SNOMED / 6 ICD-10 / 302 UMLS-synonym keys behave the same way) has not
+        identified the patient's cancer: C04 is a prefix of every descriptor
+        in the tree, so accepting it would name every cancer type in the
+        Stage 1 expanded query and hand every trial the Stage 3 direct-match
+        boost. Such a hit is recorded and the remaining layers are tried. If
+        no layer produces a tree below the pan-cancer ceiling, the patient is
+        reported unresolved — which downstream means "keep everything",
+        the same conservative stance an unmappable patient already gets.
 
         Args:
             conditions:      Patient's condition list from FHIR
@@ -777,9 +850,31 @@ class MeSHCancerFilter:
                              for identifying primary cancer conditions
 
         Returns:
-            Set of C04 tree number strings, or empty set if unmappable
+            dict:
+              "trees"               : set[str]  — specific C04 trees (may be empty)
+              "resolution"          : str       — "+"-joined layer names that
+                                      produced the trees, or one of
+                                      RESOLUTION_NO_CANCER / RESOLUTION_UNMAPPED /
+                                      RESOLUTION_PAN_ONLY
+              "layers"              : list[str] — layers that produced trees
+              "pan_only_layers"     : list[str] — layers that produced only
+                                      pan-cancer nodes and were walked past,
+                                      whether or not a later layer answered
+              "conditions_total"    : int
+              "conditions_resolved" : int
+              "conditions_pan_only" : int
+              "conditions_unmapped" : int
         """
-        tree_numbers = set()
+        diagnostics = {
+            "trees":               set(),
+            "resolution":          self.RESOLUTION_NO_CANCER,
+            "layers":              [],
+            "pan_only_layers":     [],
+            "conditions_total":    0,
+            "conditions_resolved": 0,
+            "conditions_pan_only": 0,
+            "conditions_unmapped": 0,
+        }
 
         # Identify cancer conditions using existing registry
         cancer_conditions = [
@@ -787,35 +882,86 @@ class MeSHCancerFilter:
             if cancer_registry.is_primary_cancer(c)
         ]
 
+        diagnostics["conditions_total"] = len(cancer_conditions)
+
         if not cancer_conditions:
-            return tree_numbers  # empty — will trigger conservative pass
+            return diagnostics  # empty — will trigger conservative pass
+
+        trees            = set()
+        layers           = set()
+        pan_only_layers  = set()
 
         for condition in cancer_conditions:
-            condition_mapped = False
+            resolved_layer       = None
+            condition_pan_layers = set()
 
-            # --- Layer 1: SNOMED crosswalk (gold standard) ---
-            snomed_code = self._extract_code_by_system(condition, "snomed")
-            if snomed_code and snomed_code in self.snomed_to_trees:
-                tree_numbers.update(self.snomed_to_trees[snomed_code])
-                condition_mapped = True
+            for layer_name, layer_trees in self._resolution_layers(condition):
+                if not layer_trees:
+                    continue
 
-            # --- Layer 2: ICD-10-CM crosswalk (real EHR primary path) ---
-            # icd10_to_trees is populated by Item 2.1 (build_icd10_to_mesh_crosswalk).
-            # Until then it is empty, and this block is a no-op.
-            if not condition_mapped:
-                icd10_code = self._extract_code_by_system(condition, "icd10cm")
-                if icd10_code and icd10_code in self.icd10_to_trees:
-                    tree_numbers.update(self.icd10_to_trees[icd10_code])
-                    condition_mapped = True
+                specific = specific_cancer_trees(layer_trees)
+                if specific:
+                    trees.update(specific)
+                    resolved_layer = layer_name
+                    break
 
-            # --- Layer 3: Fuzzy string match (fallback for THIS condition) ---
-            if not condition_mapped:
-                display = (condition.get("display") or "").strip()
-                if display:
-                    matched_trees = self._fuzzy_match_display(display)
-                    tree_numbers.update(matched_trees)
+                # Pan-cancer-only hit: this layer named no site. Record it and
+                # keep walking instead of accepting C04 as the patient's identity.
+                condition_pan_layers.add(layer_name)
 
-        return tree_numbers
+            # Every layer walked past is recorded, whether or not a later one
+            # resolved the condition: the escalation is the thing worth seeing
+            # in the log, and a condition that escalated to an answer is not a
+            # pan-cancer condition.
+            pan_only_layers.update(condition_pan_layers)
+
+            if resolved_layer is not None:
+                layers.add(resolved_layer)
+                diagnostics["conditions_resolved"] += 1
+            elif condition_pan_layers:
+                diagnostics["conditions_pan_only"] += 1
+            else:
+                diagnostics["conditions_unmapped"] += 1
+
+        diagnostics["trees"]           = trees
+        diagnostics["layers"]          = sorted(layers)
+        diagnostics["pan_only_layers"] = sorted(pan_only_layers)
+
+        if trees:
+            diagnostics["resolution"] = "+".join(sorted(layers))
+        elif diagnostics["conditions_pan_only"]:
+            diagnostics["resolution"] = self.RESOLUTION_PAN_ONLY
+        else:
+            diagnostics["resolution"] = self.RESOLUTION_UNMAPPED
+
+        return diagnostics
+
+    def _resolution_layers(self, condition: dict):
+        """
+        Yield (layer_name, tree_numbers) for one condition, in priority order.
+
+        A generator rather than a chain of if-blocks so the caller can apply
+        the pan-cancer depth test to each layer independently and continue
+        past a layer that resolved only to C04 / a depth-2 node.
+
+        Layers with no code / no data yield nothing at all, so a missing
+        crosswalk is indistinguishable from a crosswalk miss to the caller
+        (both simply advance to the next layer).
+        """
+        # --- Layer 1: SNOMED crosswalk (gold standard) ---
+        snomed_code = self._extract_code_by_system(condition, "snomed")
+        if snomed_code:
+            yield "snomed", set(self.snomed_to_trees.get(snomed_code, []))
+
+        # --- Layer 2: ICD-10-CM crosswalk (real EHR primary path) ---
+        icd10_code = self._extract_code_by_system(condition, "icd10cm")
+        if icd10_code:
+            yield "icd10", set(self.icd10_to_trees.get(icd10_code, []))
+
+        # --- Layer 3: Fuzzy string match, one entry per strategy ---
+        display = (condition.get("display") or "").strip()
+        if display:
+            yield from self._fuzzy_layers(display)
 
     def _extract_code_by_system(self, condition: dict, target_system: str) -> Optional[str]:
         """
@@ -887,77 +1033,89 @@ class MeSHCancerFilter:
         return word
 
 
-    def _fuzzy_match_display(self, display: str) -> Set[str]:
+    def _fuzzy_layers(self, display: str):
         """
-        Match a condition display string against MeSH descriptor names.
+        Yield (strategy_name, tree_numbers) for a condition display string.
 
-        Strategy (first hit wins):
-          0. UMLS synonym crosswalk: O(1) dict lookup of cleaned display
-             against comprehensive UMLS synonym map (all vocabularies).
-             Resolves "prostate cancer" -> Prostatic Neoplasms trees.
-          1. Clean display: strip parenthetical suffixes like "(disorder)"
-          2. Exact substring match (unchanged from original)
-          3. Stemmed word overlap: normalize word forms with _stem(),
-             find MeSH descriptors sharing the most stemmed words.
-             Require ≥2 matching stems, or ≥1 if any stem has ≥6 chars.
+        Strategies, in priority order:
+          fuzzy_exact     -- display IS a MeSH descriptor name
+          fuzzy_synonym   -- UMLS synonym crosswalk, O(1) dict lookup
+          fuzzy_substring -- descriptor contained in display, or vice versa
+          fuzzy_stem      -- stemmed word overlap against the descriptor index
 
-        This is Layer 2 — only fires when SNOMED crosswalk misses.
+        The two heuristic strategies are skipped when the display carries no
+        site or histology token at all (_SITELESS_DISPLAY_STEMS).
 
-        Returns:
-            Set of C04 tree numbers from best matching descriptor(s)
+        Yielding instead of returning the first hit lets the caller apply the
+        pan-cancer depth test per strategy: a display of "malignant neoplastic
+        disease" hits fuzzy_synonym with C04 alone, and the caller can walk on
+        to the substring and stem strategies rather than accept it. Consumers
+        that want the old first-hit-wins behaviour take the first non-empty
+        yield (see _fuzzy_match_display).
         """
         # Clean: strip parenthetical suffixes like "(disorder)", "(finding)"
         display_clean = re.sub(r"\([^)]*\)", "", display).strip()
         display_lower = display_clean.lower()
 
         if not display_lower:
-            return set()
+            return
 
-        display_words = set(display_lower.split())
-
-        # Remove stopwords that appear in most medical terms
-        stopwords = {"of", "the", "a", "an", "in", "and", "or", "with",
-                     "to", "for", "by", "on", "at", "as", "is", "not"}
-        display_words -= stopwords
+        display_words = set(display_lower.split()) - self._DISPLAY_STOPWORDS
 
         if not display_words:
-            return set()
-        
-        # --- Exact match: display IS a MeSH descriptor name ---
-        # Must check before substring iteration. Without this,
+            return
+
+        # Does the display name a site or histology at all? Punctuation is
+        # stripped first so "neoplasm," stems to "neoplasm" and is recognised
+        # as generic. The two exact strategies below run regardless — they
+        # either match a real descriptor or they do not. The two heuristic
+        # strategies are gated on this, for the reason on
+        # _SITELESS_DISPLAY_STEMS.
+        _tokens = re.sub(r"[^\w\s-]", " ", display_lower).split()
+        _site_stems = {
+            self._stem(w) for w in _tokens
+            if len(w) >= 3 and w not in self._DISPLAY_STOPWORDS
+        } - self._SITELESS_DISPLAY_STEMS
+        has_site_token = bool(_site_stems)
+
+        # --- Strategy fuzzy_exact: display IS a MeSH descriptor name ---
+        # Must be tried before substring matching. Without it,
         # "melanoma" matches "non-melanoma skin neoplasms" via substring,
         # and "cholangiocarcinoma" matches "carcinoma" via substring,
         # because Python set iteration order is non-deterministic.
         if display_lower in self._all_names:
-            return set(self.name_to_trees.get(display_lower, []))
-        
-        # --- Strategy 0: UMLS synonym crosswalk (O(1) dictionary lookup) ---
+            yield "fuzzy_exact", set(self.name_to_trees.get(display_lower, []))
+
+        # --- Strategy fuzzy_synonym: UMLS crosswalk (O(1) dictionary lookup) ---
         # Resolves common clinical names ("prostate cancer", "gastric cancer",
         # "NSCLC") to correct MeSH C04 trees via UMLS Metathesaurus synonyms.
         # This fixes the critical failure where fuzzy matching mapped
         # "prostate cancer" to "Hereditary Breast and Ovarian Cancer Syndrome".
-        # Fires before substring/stemmed matching because it is exact, fast,
+        # Runs before substring/stemmed matching because it is exact, fast,
         # and authoritative (backed by UMLS CUI-level identity).
         if self.synonym_to_trees:
             trees = self.synonym_to_trees.get(display_lower)
             if trees:
-                return set(trees)
+                yield "fuzzy_synonym", set(trees)
 
-        # --- Strategy 1: Exact substring match (unchanged) ---
-        # "malignant neoplasm of colon" would match if a MeSH name
+        if not has_site_token:
+            return
+
+        # --- Strategy fuzzy_substring ---
+        # "malignant neoplasm of colon" matches if a MeSH name
         # is contained within it or vice versa
         matched_trees = set()
         for name in self._all_names:
             if name in display_lower or display_lower in name:
                 matched_trees.update(self.name_to_trees.get(name, []))
         if matched_trees:
-            return matched_trees
+            yield "fuzzy_substring", matched_trees
 
-        # --- Strategy 2: Stemmed word overlap scoring ---
+        # --- Strategy fuzzy_stem: stemmed word overlap scoring ---
         display_stems = {self._stem(w) for w in display_words if len(w) >= 3}
 
         if not display_stems:
-            return set()
+            return
 
         candidates = {}  # {mesh_name: overlap_count}
 
@@ -967,22 +1125,43 @@ class MeSHCancerFilter:
                     candidates[name] = candidates.get(name, 0) + 1
 
         if not candidates:
-            return set()
+            return
 
         # Require at least 2 matching stems (or 1 if stem ≥ 6 chars)
         min_overlap = 1 if any(len(s) >= 6 for s in display_stems) else 2
         best_score = max(candidates.values())
 
         if best_score < min_overlap:
-            return set()
+            return
 
-        # Return trees from all descriptors with the best score
+        # Trees from all descriptors with the best score
         tree_numbers = set()
         for name, score in candidates.items():
             if score == best_score:
                 tree_numbers.update(self.name_to_trees.get(name, []))
 
-        return tree_numbers
+        if tree_numbers:
+            yield "fuzzy_stem", tree_numbers
+
+    def _fuzzy_match_display(self, display: str) -> Set[str]:
+        """
+        Match a condition display string against MeSH descriptor names.
+
+        Returns the first strategy result that names an actual cancer site
+        (depth > PAN_CANCER_MAX_DEPTH). Strategies resolving only to C04 or a
+        depth-2 node are skipped, for the reason given in resolve_patient_trees.
+
+        Kept as a named entry point for diagnostics and ad-hoc lookups;
+        the pipeline goes through resolve_patient_trees().
+
+        Returns:
+            Set of specific C04 tree numbers, empty if nothing resolved
+        """
+        for _strategy, trees in self._fuzzy_layers(display):
+            specific = specific_cancer_trees(trees)
+            if specific:
+                return specific
+        return set()
 
 
     # -----------------------------------------------------------------
@@ -1045,6 +1224,26 @@ class MeSHCancerFilter:
     # ≥5 captures colon (5), renal (5), liver (5).
     # Lung (4) is captured via "non-small" (9) in NSCLC titles.
     _TITLE_STEM_MIN_LEN = 5
+
+    # Stems that name no anatomical site or histology on the PATIENT side.
+    # The generic oncology stems above, plus the words a coder writes when the
+    # record does not say where the cancer is.
+    #
+    # A display built only from these ("Malignant neoplastic disease",
+    # "Malignant neoplasm, unspecified", "Cancer") identifies no site, so the
+    # two heuristic strategies must not answer for it: stem overlap on
+    # "malignant"/"neoplast"/"disease" returns 27 unrelated descriptors
+    # (Bowen's Disease, Hodgkin Disease, Carcinoid Heart Disease...), and
+    # substring on "cancer" returns Hereditary Breast and Ovarian Cancer
+    # Syndrome — the same class of false identity the UMLS synonym crosswalk
+    # was built to stop. A false site is worse than no site: no site means
+    # KEEP everything, a false site means Stage 4 drops the right trials.
+    _SITELESS_DISPLAY_STEMS = _GENERIC_ONCOLOGY_STEMS | frozenset({
+        "neoplast",                        # _stem("neoplastic")
+        "disease", "disorder", "lesion", "mass", "growth",
+        "primary", "secondary", "unspecified", "site", "nos",
+        "invasive", "situ", "overlapping", "stage", "grade",
+    })
 
     def _resolve_trees_from_title(self, title: str) -> Set[str]:
         """
