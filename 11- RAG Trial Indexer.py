@@ -124,6 +124,12 @@ def scrape_clinicaltrials_gov(condition=None, status=None, study_type=None, age=
     scrape_start    = time.time()
     page_num        = 0
 
+    # Trials refused by enrich_histology_tags() for having a self-contradictory
+    # histology tag set, then recovered by dropping the contradictory pair.
+    # Still indexed — never silently — counted here and reported with the
+    # scrape summary below.
+    histology_conflict_softened = 0
+
     with tqdm(
         total=max_trials,
         initial=len(trials),
@@ -172,8 +178,18 @@ def scrape_clinicaltrials_gov(condition=None, status=None, study_type=None, age=
                         except (IndexError, ValueError):
                             pass
 
-                    trial = parse_trial_metadata(protocol)
-                    
+                    try:
+                        trial = parse_trial_metadata(protocol)
+                    except HistologyTagConflictError as e:
+                        # A trial tagged with a mutually exclusive pair PERMITS
+                        # either histology, it does not require both. Refusing
+                        # it would hide it from every patient — the same
+                        # false-ineligible direction the histology filter
+                        # exists to prevent. Drop the pair and index the trial
+                        # unfiltered on the histology axis.
+                        histology_conflict_softened += 1
+                        trial = soften_histology_conflict(e, log=tqdm.write)
+
                     # Post-scrape oncology validation:
                     # Drop trials whose registered conditions contain no
                     # cancer/neoplasm signal. ClinicalTrials.gov returns
@@ -233,6 +249,14 @@ def scrape_clinicaltrials_gov(condition=None, status=None, study_type=None, age=
     elapsed_str = f"{hrs:02d}:{mins:02d}:{secs:02d}" if hrs > 0 else f"{mins:02d}:{secs:02d}"
 
     print(f"\nTotal trials scraped: {len(trials)}  |  Scrape time: {elapsed_str}")
+
+    if histology_conflict_softened:
+        print(f"Trials indexed with a contradictory histology pair dropped: "
+              f"{histology_conflict_softened}  (permit either histology — "
+              f"left unfiltered on that axis)")
+    _histology_stats = get_histology_extraction_stats()
+    if any(_histology_stats.values()):
+        print(f"Histology negation/contradiction counters: {_histology_stats}")
 
     if scrape_complete and checkpoint_file.exists():
         checkpoint_file.unlink()

@@ -518,6 +518,125 @@ _LUNG_CONTEXT_RE = re.compile(
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# HISTOLOGY NEGATION HANDLING
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Trial text negates a histology mention in three structurally different
+# ways, and each one, if read literally, writes a tag the trial does not
+# actually require:
+#
+#   1. CLAUSE PREFIX  "patients without squamous histology"
+#                     → _is_negated(), the same look-back used by stage
+#                       extraction, over the phrases in _NEGATION_PREFIXES.
+#   2. MORPHOLOGICAL  "non-squamous", "non‑adenocarcinoma"
+#                     → _NON_MORPH_PREFIX_RE. Not a phrase, so the
+#                       look-back cannot see it; "non-small cell" already
+#                       has its own dedicated pattern pair.
+#   3. CLAUSE SUFFIX  "adenocarcinoma is excluded"
+#                     → _NEGATION_SUFFIXES. The cue FOLLOWS the term, so
+#                       a look-back is structurally blind to it.
+#
+# Direction of error matters. A missed negation invents a required
+# histology, which then conflicts with a patient who does qualify and
+# hides the trial from them — the defect this whole module exists to
+# avoid. An over-eager negation merely drops a tag, leaving the trial
+# unfiltered, which is the conservative default of the module. So every
+# rule here is allowed to over-fire.
+#
+# Known over-fire: "…without prior therapy for non-small cell lung cancer"
+# negates the nsclc tag, because _is_negated cannot tell that the negation
+# scopes over "prior therapy" rather than the histology. The trial then
+# carries no histology tag and is filtered by nobody. Counted under
+# clause_prefix in get_histology_extraction_stats().
+
+# "non-" / "non " immediately before the term (unicode hyphens included).
+# Anchored at end-of-string because it is matched against the look-back window.
+_NON_MORPH_PREFIX_RE = re.compile(
+    r"\bnon[\s\-‐‑‒–]?$",
+    re.IGNORECASE,
+)
+
+# Exclusion cue appearing AFTER the histology term, within the same clause.
+# "ruled out" appears in _NEGATION_PREFIXES too, but in real criteria text it
+# almost always trails its term ("adenocarcinoma must be ruled out"), where a
+# look-back cannot reach it.
+_NEGATION_SUFFIXES = re.compile(
+    r"\b(?:excluded|excluded\s+from|ineligible|disallowed|ruled\s+out|"
+    r"not\s+(?:eligible|allowed|permitted|included|enrolled))\b",
+    re.IGNORECASE,
+)
+
+# How far past the term to look for a trailing exclusion cue, before the
+# first clause boundary. Same boundary set ([.;]) as _is_negated.
+_HISTOLOGY_SUFFIX_WINDOW = 60
+
+# Chars of look-back needed to see a "non-" prefix ("non-" / "non ").
+_NON_MORPH_LOOKBACK = 6
+
+# Which rule suppressed a mention / rejected a tag set. Never silently
+# recovered: every skip lands in one of these counters and is readable via
+# get_histology_extraction_stats() after an index build.
+_HISTOLOGY_EXTRACTION_COUNTS: Dict[str, int] = {
+    "clause_prefix":           0,   # rule 1 — _is_negated look-back
+    "morphological":           0,   # rule 2 — "non-<term>"
+    "clause_suffix":           0,   # rule 3 — "<term> … is excluded"
+    "contradiction_rejected":  0,   # enrich_histology_tags refused a tag set
+    "contradiction_softened":  0,   # a contradictory pair was dropped
+                                    # (patient conditions, or a refused trial
+                                    #  recovered via soften_histology_conflict)
+}
+
+
+def get_histology_extraction_stats() -> Dict[str, int]:
+    """Copy of the histology negation / contradiction counters."""
+    return dict(_HISTOLOGY_EXTRACTION_COUNTS)
+
+
+def reset_histology_extraction_stats() -> None:
+    """Zero the histology counters (per-run reporting, tests)."""
+    for key in _HISTOLOGY_EXTRACTION_COUNTS:
+        _HISTOLOGY_EXTRACTION_COUNTS[key] = 0
+
+
+def _is_histology_negated(text: str, match_start: int, match_end: int) -> bool:
+    """
+    True if a histology term match sits in a negative context.
+
+    Applies the three rules above in order and records which one fired.
+    """
+    if _is_negated(text, match_start):
+        _HISTOLOGY_EXTRACTION_COUNTS["clause_prefix"] += 1
+        return True
+
+    lookback = text[max(0, match_start - _NON_MORPH_LOOKBACK):match_start]
+    if _NON_MORPH_PREFIX_RE.search(lookback):
+        _HISTOLOGY_EXTRACTION_COUNTS["morphological"] += 1
+        return True
+
+    tail = text[match_end:match_end + _HISTOLOGY_SUFFIX_WINDOW]
+    tail = re.split(r"[.;]", tail, maxsplit=1)[0]
+    if _NEGATION_SUFFIXES.search(tail):
+        _HISTOLOGY_EXTRACTION_COUNTS["clause_suffix"] += 1
+        return True
+
+    return False
+
+
+def _has_affirmative_match(pattern, text: str) -> bool:
+    """
+    True if `pattern` matches `text` at least once in a NON-negated context.
+
+    Replaces the bare pattern.search() the tag extractor used to do — a
+    search only proves the words are present, not that the trial wants them.
+    """
+    for m in pattern.finditer(text):
+        if _is_histology_negated(text, m.start(), m.end()):
+            continue
+        return True
+    return False
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # TAG EXTRACTION
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -530,16 +649,27 @@ def _extract_histology_tags(text: str) -> Set[str]:
 
     Multiple tags can co-occur: "squamous non-small cell lung cancer"
     → {"nsclc", "squamous"}
+
+    NEGATION-AWARE: a mention in a negative context ("non-squamous",
+    "without adenocarcinoma", "adenocarcinoma is excluded") describes who
+    is kept OUT, not what the trial requires, and produces no tag. See
+    _is_histology_negated().
     """
     if not text or not text.strip():
         return set()
 
     tags = set()
+
+    # Lung context is a topic gate, not a claim about the patient — a
+    # negated lung mention still means the text is about lung. Left as a
+    # plain search deliberately.
     has_lung = bool(_LUNG_CONTEXT_RE.search(text))
 
     # --- Non-small cell vs small cell (lung-specific) ---
-    has_nsc = bool(_NON_SMALL_CELL_RE.search(text)) or bool(_NSCLC_ABBREV_RE.search(text))
-    has_sc = bool(_SMALL_CELL_RE.search(text)) or bool(_SCLC_ABBREV_RE.search(text))
+    has_nsc = (_has_affirmative_match(_NON_SMALL_CELL_RE, text)
+               or _has_affirmative_match(_NSCLC_ABBREV_RE, text))
+    has_sc = (_has_affirmative_match(_SMALL_CELL_RE, text)
+              or _has_affirmative_match(_SCLC_ABBREV_RE, text))
 
     if has_nsc:
         tags.add("nsclc")
@@ -556,18 +686,18 @@ def _extract_histology_tags(text: str) -> Set[str]:
         pass
 
     # --- Neuroendocrine ---
-    if _NEUROENDOCRINE_RE.search(text):
+    if _has_affirmative_match(_NEUROENDOCRINE_RE, text):
         tags.add("neuroendocrine")
 
     # --- Squamous vs Adenocarcinoma ---
-    if _SQUAMOUS_RE.search(text):
+    if _has_affirmative_match(_SQUAMOUS_RE, text):
         tags.add("squamous")
 
-    if _ADENOCARCINOMA_RE.search(text):
+    if _has_affirmative_match(_ADENOCARCINOMA_RE, text):
         tags.add("adenocarcinoma")
 
     # --- Tracheal ---
-    if _TRACHEAL_RE.search(text):
+    if _has_affirmative_match(_TRACHEAL_RE, text):
         tags.add("tracheal")
 
     return tags
@@ -597,6 +727,119 @@ _EXCLUSIVE_PAIRS = {
     frozenset({"nsclc", "sclc"}),
     frozenset({"squamous", "adenocarcinoma"}),
 }
+
+
+class HistologyTagConflictError(ValueError):
+    """
+    Raised when ONE side (a single trial, or a single text) yields a tag set
+    that contains a mutually exclusive pair.
+
+    A trial cannot REQUIRE both squamous and adenocarcinoma histology, so
+    such a set is never a fact about the trial. Written to the payload as-is
+    it would conflict with a squamous patient AND with an adenocarcinoma
+    patient, hiding the trial from both — so extraction refuses to produce
+    it rather than quietly poisoning the index.
+
+    The refusal is deliberately loud but recoverable: the error carries the
+    trial that produced it, so a caller that knows the pair means "permits
+    either" can call soften_histology_conflict() and still index the trial.
+
+    Attributes:
+        trial: the trial dict that produced the set (None if not trial-side).
+        tags:  the full extracted tag set, contradiction included.
+        pair:  the mutually exclusive pair found, as a sorted tuple.
+    """
+
+    def __init__(self, message: str, trial: Optional[Dict] = None,
+                 tags: Optional[Set[str]] = None,
+                 pair: Optional[Tuple[str, str]] = None):
+        super().__init__(message)
+        self.trial = trial
+        self.tags = set(tags or ())
+        self.pair = pair
+
+
+def _find_exclusive_pair(tags: Set[str]) -> Optional[Tuple[str, str]]:
+    """
+    Return the first mutually exclusive pair present in `tags`, or None.
+
+    Same _EXCLUSIVE_PAIRS table used for the cross-side conflict check, so
+    self-contradiction and patient/trial conflict can never disagree.
+    """
+    tag_set = set(tags)
+    for pair in _EXCLUSIVE_PAIRS:
+        if pair.issubset(tag_set):
+            return tuple(sorted(pair))
+    return None
+
+
+def _drop_contradictory_tags(tags: Set[str], context_label: str, log=print) -> Set[str]:
+    """
+    Remove every mutually exclusive pair from `tags` and log each removal.
+
+    Both sides use this, for the same reason from opposite directions:
+      - PATIENT: a contradictory set can be legitimate (two primaries —
+        squamous cervical + lung adenocarcinoma). Keeping both would
+        conflict with, and drop, trials for either one.
+      - TRIAL: a contradictory set means the trial PERMITS either histology
+        ("adenocarcinoma or squamous cell carcinoma of the esophagus"), and
+        the pair is dropped by soften_histology_conflict() after the raise.
+
+    Either way the pair goes, that axis is left unfiltered, and the trial
+    stays reachable. Conservative: unknown → keep.
+
+    Args:
+        tags:          extracted tag set.
+        context_label: what produced the set, for the log line.
+        log:           sink for the per-drop message (pass tqdm.write to
+                       keep a progress bar intact).
+    """
+    tags = set(tags)
+    pair = _find_exclusive_pair(tags)
+    while pair:
+        _HISTOLOGY_EXTRACTION_COUNTS["contradiction_softened"] += 1
+        log(f"  [Histology] {context_label}: mutually exclusive tags "
+            f"'{pair[0]}' + '{pair[1]}' both extracted — dropping both, "
+            f"that axis is left unfiltered")
+        tags -= set(pair)
+        pair = _find_exclusive_pair(tags)
+    return tags
+
+
+def soften_histology_conflict(error: HistologyTagConflictError, log=print) -> Dict:
+    """
+    Recover an indexable trial from a HistologyTagConflictError.
+
+    A trial tagged {squamous, adenocarcinoma} in practice PERMITS either
+    histology rather than requiring both — "adenocarcinoma or squamous cell
+    carcinoma of the esophagus" is ordinary eligibility language. Refusing
+    such a trial removes it from the index for EVERY patient, including
+    patients with no histology tag at all, which is the same false-ineligible
+    direction the histology filter exists to prevent. Dropping the pair keeps
+    the trial indexed and unfiltered on the histology axis.
+
+    Call this from the index-time handler (File 11); enrich_histology_tags
+    still raises, so the refusal is never silent and always counted.
+
+    Args:
+        error: the HistologyTagConflictError raised by enrich_histology_tags.
+        log:   sink for the per-drop message (pass tqdm.write under a bar).
+
+    Returns:
+        The trial dict, with "histology_tags" set to the softened list.
+
+    Raises:
+        HistologyTagConflictError: re-raised unchanged when the error carries
+            no trial — there is nothing to recover and the caller must skip it.
+    """
+    if error.trial is None:
+        raise error
+
+    label = f"trial {error.trial.get('nct_id') or '<unknown>'}"
+    error.trial["histology_tags"] = sorted(
+        _drop_contradictory_tags(error.tags, label, log=log)
+    )
+    return error.trial
 
 
 def _has_conflict(patient_tags: Set[str], trial_tags: Set[str]) -> bool:
@@ -645,6 +888,11 @@ def enrich_histology_tags(trial: Dict) -> Dict:
 
     Returns:
         The same trial dict with "histology_tags" key added (set of strings).
+
+    Raises:
+        HistologyTagConflictError: if the resulting set is self-contradictory
+            (contains a mutually exclusive pair). The caller must skip the
+            trial rather than index a payload no patient can ever satisfy.
     """
     title = trial.get("title") or ""
     inclusion = trial.get("eligibility", {}).get("inclusion_criteria") or ""
@@ -652,6 +900,22 @@ def enrich_histology_tags(trial: Dict) -> Dict:
     # Union tags from title + inclusion (both may contain useful signals)
     tags = _extract_histology_tags(title)
     tags |= _extract_histology_tags(inclusion)
+
+    # A single trial cannot require two mutually exclusive histologies.
+    # Refuse to emit a set that would conflict with both patient populations
+    # at once. The error carries the trial, so an index-time caller can call
+    # soften_histology_conflict() and index it unfiltered on this axis.
+    pair = _find_exclusive_pair(tags)
+    if pair:
+        _HISTOLOGY_EXTRACTION_COUNTS["contradiction_rejected"] += 1
+        raise HistologyTagConflictError(
+            f"Trial {trial.get('nct_id') or '<unknown>'}: self-contradictory "
+            f"histology tags {sorted(tags)} — '{pair[0]}' and '{pair[1]}' are "
+            f"mutually exclusive, so no patient can satisfy both.",
+            trial=trial,
+            tags=tags,
+            pair=pair,
+        )
 
     # Store as sorted list for JSON serialization (Qdrant payload)
     trial["histology_tags"] = sorted(tags)
@@ -672,12 +936,17 @@ def extract_patient_histology(conditions: List[Dict]) -> Set[str]:
     and real EHRs ("Adenocarcinoma of lung", "Squamous cell carcinoma of cervix").
 
     Returns set of tags or empty set.  Empty → filter keeps all trials.
+
+    A patient CAN legitimately carry two mutually exclusive tags (two
+    primaries), unlike a trial. Rather than raise at query time, the
+    contradictory pair is dropped and logged — see _drop_contradictory_tags.
     """
     tags = set()
     for cond in conditions:
         display = cond.get("display") or ""
         tags |= _extract_histology_tags(display)
-    return tags
+
+    return _drop_contradictory_tags(tags, "patient conditions")
 
 
 # ══════════════════════════════════════════════════════════════════════════
