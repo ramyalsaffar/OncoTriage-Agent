@@ -194,6 +194,25 @@ MAX_WORKERS = 12
 #------------------------------------------------------------------------------
 
 
+# ===========================================================================
+# COHORT FILTER CONFIGURATION (File 05)
+# ===========================================================================
+
+# Deletion manifest: written to checkpoint_path BEFORE File 05 unlinks any
+# patient bundle and rewritten as the deletions land, so an IO error or a kill
+# mid-loop leaves a durable record of what was targeted, what was removed and
+# what was not. File 05's deletion is in-place and irreversible; this file is
+# the only account of it.
+COHORT_MANIFEST_FILENAME = "cohort_deletion_manifest.json"
+
+# Manifest is flushed to disk every N deletions while a phase runs, bounding
+# how far the on-disk record can lag reality if the process is killed.
+COHORT_MANIFEST_FLUSH_EVERY = 100
+
+
+#------------------------------------------------------------------------------
+
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
