@@ -433,6 +433,9 @@ def init_ablation_db():
             not_eligible_count              INTEGER DEFAULT 0,
             not_evaluable_count             INTEGER DEFAULT 0,
             avg_match_score                 REAL,
+            avg_match_score_all             REAL DEFAULT 0,
+            has_match                       INTEGER DEFAULT 0,
+            criteria_not_applicable         INTEGER DEFAULT 0,
             eligible_nct_ids                TEXT DEFAULT '',
             near_miss_nct_ids               TEXT DEFAULT '',
             mesh_dropped                    INTEGER DEFAULT 0,
@@ -456,10 +459,39 @@ def init_ablation_db():
     # EXISTS is a no-op on an existing ablation_results.db, so the INSERT below
     # would fail against a database built before the column was introduced.
     _existing = {row[1] for row in c.execute("PRAGMA table_info(ablation_results)")}
-    for _column, _sql_type in {"not_evaluable_count": "INTEGER DEFAULT 0"}.items():
+    for _column, _sql_type in {
+        "not_evaluable_count":     "INTEGER DEFAULT 0",
+        "avg_match_score_all":     "REAL DEFAULT 0",
+        "has_match":               "INTEGER DEFAULT 0",
+        "criteria_not_applicable": "INTEGER DEFAULT 0",
+    }.items():
         if _column not in _existing:
             c.execute(f"ALTER TABLE ablation_results ADD COLUMN {_column} {_sql_type}")
             print(f"Schema migration: added ablation_results.{_column}")
+
+            # ADD COLUMN fills existing rows with the DEFAULT, which for these
+            # two is the wrong value on any row that DID have matches. Backfill
+            # them from the columns the historical rows already carry, using the
+            # same convention log_ablation_result() applies to new rows.
+            if _column == "avg_match_score_all":
+                c.execute(
+                    "UPDATE ablation_results "
+                    "SET avg_match_score_all = COALESCE(avg_match_score, 0.0)"
+                )
+                print(f"  Backfilled avg_match_score_all for {c.rowcount} row(s) "
+                      f"(null match score -> 0.0)")
+            elif _column == "has_match":
+                c.execute(
+                    "UPDATE ablation_results "
+                    "SET has_match = CASE WHEN eligible_count > 0 THEN 1 ELSE 0 END"
+                )
+                print(f"  Backfilled has_match for {c.rowcount} row(s)")
+            elif _column == "criteria_not_applicable":
+                # No historical source: pre-migration runs never recorded it.
+                # Left at 0 and called out so a zero is not read as "none were
+                # excluded" when it means "not measured".
+                print("  criteria_not_applicable left at 0 for pre-migration "
+                      "rows (not measured, not zero)")
 
     conn.commit()
     conn.close()
@@ -517,13 +549,31 @@ def log_ablation_result(run_id, config_name, patient_data, result, ablation_flag
             near_misses = result.get("near_misses", [])
             not_evaluable = result.get("not_evaluable", [])
 
-            # Average match score (eligible only; None if no matches)
+            # ── Match score: two metrics, not one ────────────────────────────
+            #
+            # avg_match_score is CONDITIONAL on the patient having at least one
+            # eligible trial: it is None when there are no matches, and every
+            # consumer (SQL AVG, pandas mean) skips nulls. That makes it a mean
+            # over a subpopulation whose membership is chosen by the very
+            # configuration under test — an ablation that destroys recall keeps
+            # only its most confident matches and scores HIGHER on it.
+            #
+            # avg_match_score_all is unconditional: a patient with no eligible
+            # trial received no match quality, which is 0.0, not missing data.
+            # It is defined for every sampled patient, so a mean over it is a
+            # mean over the same population in every configuration.
+            #
+            # has_match makes the split itself a first-class metric, so the
+            # recall a configuration gives up is reported next to the quality
+            # it appears to gain.
             avg_score = None
             if matches:
                 avg_score = round(
                     sum(m.get("match_score", 0) for m in matches) / len(matches), 4
                 )
-    
+            avg_score_all = avg_score if avg_score is not None else 0.0
+            has_match = 1 if matches else 0
+
             # Cost via same pricing function as File 14
             input_tok = result.get("gpt4o_input_tokens", 0)
             output_tok = result.get("gpt4o_output_tokens", 0)
@@ -557,6 +607,7 @@ def log_ablation_result(run_id, config_name, patient_data, result, ablation_flag
                     candidates_after_rule_filter, candidates_after_quality_filter,
                     candidates_evaluated,
                     eligible_count, not_eligible_count, not_evaluable_count, avg_match_score,
+                    avg_match_score_all, has_match, criteria_not_applicable,
                     eligible_nct_ids, near_miss_nct_ids,
                     mesh_dropped, stage_dropped, histology_dropped,
                     query_expansion_time, hybrid_retrieval_time, cross_encoder_time,
@@ -568,6 +619,7 @@ def log_ablation_result(run_id, config_name, patient_data, result, ablation_flag
                     ?, ?,
                     ?, ?, ?, ?, ?,
                     ?, ?, ?, ?,
+                    ?, ?, ?,
                     ?, ?,
                     ?, ?, ?,
                     ?, ?, ?, ?, ?, ?,
@@ -590,6 +642,9 @@ def log_ablation_result(run_id, config_name, patient_data, result, ablation_flag
                 len(near_misses),
                 len(not_evaluable),
                 avg_score,
+                avg_score_all,
+                has_match,
+                result.get("criteria_not_applicable", 0),
                 eligible_nct_ids,
                 near_miss_nct_ids,
                 result.get("mesh_dropped", 0),
@@ -697,13 +752,30 @@ def generate_summary():
                 ROUND(AVG(r.candidates_evaluated), 1)               AS avg_evaluated,
                 ROUND(AVG(r.eligible_count), 2)                     AS avg_eligible,
                 ROUND(AVG(r.not_eligible_count), 2)                 AS avg_not_eligible,
-                ROUND(AVG(r.avg_match_score), 3)                    AS avg_score,
+                -- Unconditional: every sampled patient contributes, zero-match
+                -- patients at 0.0. This is the headline quality metric.
+                ROUND(AVG(r.avg_match_score_all), 3)                AS avg_score_all,
+                -- Proportion of sampled patients with >= 1 eligible trial. The
+                -- recall a configuration gives up must be read alongside any
+                -- apparent quality gain, not separately from it.
+                ROUND(AVG(CASE WHEN r.eligible_count > 0
+                               THEN 1.0 ELSE 0.0 END), 3)           AS match_rate,
+                -- Conditional on having >= 1 match. Reported with its own n
+                -- because that n differs by configuration.
+                ROUND(AVG(r.avg_match_score), 3)                    AS avg_score_cond,
+                SUM(CASE WHEN r.eligible_count > 0 THEN 1 ELSE 0 END) AS n_scored,
                 ROUND(AVG(r.mesh_dropped), 1)                       AS avg_mesh_drop,
                 ROUND(AVG(r.stage_dropped), 1)                      AS avg_stage_drop,
                 ROUND(AVG(r.histology_dropped), 1)                  AS avg_hist_drop,
                 ROUND(AVG(r.total_time), 2)                         AS avg_time_s,
                 ROUND(AVG(r.estimated_cost_usd), 4)                 AS avg_cost,
                 ROUND(SUM(r.estimated_cost_usd), 4)                 AS total_cost,
+                -- Pooled, not a per-patient mean: total spend over total
+                -- matches found. A zero-match patient's cost stays in the
+                -- numerator, so a configuration cannot look cheap per match by
+                -- dropping the patients it failed. NULL when nothing matched.
+                ROUND(SUM(r.estimated_cost_usd)
+                      / NULLIF(SUM(r.eligible_count), 0), 5)        AS cost_per_eligible,
                 SUM(CASE WHEN r.error != '' THEN 1 ELSE 0 END)      AS errors
             FROM ablation_results r
             INNER JOIN (
@@ -735,6 +807,15 @@ def generate_summary():
     print("  ABLATION STUDY RESULTS")
     print("=" * 130 + "\n")
     print(df.to_string(index=False))
+    print(
+        "\n  avg_score_all  = mean match score over ALL n sampled patients "
+        "(no eligible trial counts as 0.0)."
+        "\n  match_rate     = proportion of sampled patients with >= 1 eligible trial."
+        "\n  avg_score_cond = CONDITIONAL mean over the n_scored patients that had "
+        "a match; n_scored varies by config,"
+        "\n                   so this column is NOT comparable across configs on "
+        "its own."
+    )
 
     # --- Deltas vs baseline ---
     bl_rows = df[df["config_name"] == "full_pipeline"]
@@ -745,9 +826,9 @@ def generate_summary():
         print("  DELTAS vs FULL PIPELINE (baseline)")
         print("-" * 130)
         print(f"  {'Config':25s} | {'Δevaluated':>11s} | {'Δeligible':>10s} | "
-              f"{'Δscore':>8s} | {'Δcost/pt':>10s} | {'Δtime/pt':>9s} | "
-              f"{'Δmesh_drop':>11s} | {'Δstage_drop':>12s}")
-        print("  " + "-" * 107)
+              f"{'Δscore_all':>10s} | {'Δmatch_rate':>12s} | {'Δcost/pt':>10s} | "
+              f"{'Δtime/pt':>9s} | {'Δmesh_drop':>11s} | {'Δstage_drop':>12s}")
+        print("  " + "-" * 122)
 
         for _, row in df.iterrows():
             if row["config_name"] == "full_pipeline":
@@ -756,11 +837,26 @@ def generate_summary():
                 f"  {row['config_name']:25s} | "
                 f"{row['avg_evaluated']  - bl['avg_evaluated']:+11.1f} | "
                 f"{row['avg_eligible']   - bl['avg_eligible']:+10.2f} | "
-                f"{row['avg_score']      - bl['avg_score']:+8.3f} | "
+                f"{row['avg_score_all']  - bl['avg_score_all']:+10.3f} | "
+                f"{row['match_rate']     - bl['match_rate']:+12.3f} | "
                 f"${row['avg_cost']      - bl['avg_cost']:+9.4f} | "
                 f"{row['avg_time_s']     - bl['avg_time_s']:+9.2f} | "
                 f"{row['avg_mesh_drop']  - bl['avg_mesh_drop']:+11.1f} | "
                 f"{row['avg_stage_drop'] - bl['avg_stage_drop']:+12.1f}"
+            )
+
+        # The conditional mean is shown only against its own n, never as a
+        # bare delta: the two configs being differenced averaged over different
+        # patient sets, so the difference is not attributable to the ablation.
+        print("\n  CONDITIONAL SCORE (mean over matched patients only -- read with n)")
+        print(f"  {'Config':25s} | {'score_cond':>10s} | {'n_scored':>8s} | {'n':>5s}")
+        print("  " + "-" * 56)
+        for _, row in df.iterrows():
+            _cond = row["avg_score_cond"]
+            _cond_s = "N/A" if pd.isna(_cond) else f"{_cond:.3f}"
+            print(
+                f"  {row['config_name']:25s} | {_cond_s:>10s} | "
+                f"{int(row['n_scored']):>8d} | {int(row['n']):>5d}"
             )
 
     # --- JSON export ---
@@ -806,7 +902,12 @@ def main():
     print()
 
     # --- Summary-only mode ---
+    # init_ablation_db() runs first even though nothing is written: the summary
+    # query selects avg_match_score_all, which a database built before that
+    # column existed does not have. init is idempotent and performs the
+    # migration, so --summary-only works against an old database.
     if args.summary_only:
+        init_ablation_db()
         generate_summary()
         return
 

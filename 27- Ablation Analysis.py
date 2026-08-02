@@ -126,7 +126,43 @@ def load_ablation_data() -> pd.DataFrame:
     if len(df) < before:
         print(f"  WARNING: Dropped {before - len(df)} duplicate rows (kept most recent run)")
 
-    # Derived metrics
+    # ── Match rate: the metric every conditional mean is conditioned on ─────
+    df["has_match"] = (df["eligible_count"] > 0).astype(int)
+
+    # ── Unconditional match score ───────────────────────────────────────────
+    #
+    # avg_match_score is NULL for a patient with no eligible trial, and both
+    # SQL AVG() and pandas .mean() skip nulls. Averaging it therefore averages
+    # over "patients this configuration managed to match" — a subpopulation the
+    # configuration itself selects. A configuration that destroys recall keeps
+    # only its most confident matches and scores HIGHER on that mean.
+    #
+    # avg_match_score_all fixes the population: a patient who received no
+    # eligible trial received no match quality, which is 0.0, not missing.
+    # File 26 writes the column; databases built before it did not, so it is
+    # derived here with the same convention.
+    if "avg_match_score_all" in df.columns:
+        _missing_all = df["avg_match_score_all"].isna()
+        if _missing_all.any():
+            df.loc[_missing_all, "avg_match_score_all"] = (
+                df.loc[_missing_all, "avg_match_score"].fillna(0.0)
+            )
+            print(f"  Backfilled avg_match_score_all for {int(_missing_all.sum())} "
+                  f"pre-migration row(s) from avg_match_score (null -> 0.0)")
+    else:
+        df["avg_match_score_all"] = df["avg_match_score"].fillna(0.0)
+        print("  avg_match_score_all absent from database (pre-migration): "
+              "derived from avg_match_score with null -> 0.0")
+
+    # ── Efficiency ratios ───────────────────────────────────────────────────
+    #
+    # These per-patient ratios are UNDEFINED when eligible_count == 0, so they
+    # carry the same conditioning defect as the raw score: dropping the
+    # zero-match patients drops exactly the patients whose spend bought
+    # nothing. They are retained only for the distribution plots and are always
+    # reported with their own n. The headline figure is the POOLED ratio
+    # computed in build_comparison_table (total spend / total matches), which
+    # keeps a failed patient's cost in the numerator.
     df["cost_per_eligible"] = df.apply(
         lambda row: row["estimated_cost_usd"] / row["eligible_count"]
         if row["eligible_count"] > 0 else None, axis=1
@@ -172,8 +208,17 @@ def build_comparison_table(df: pd.DataFrame) -> pd.DataFrame:
     table = df.groupby("config_name", observed=True).agg(
         eligible_mean       =("eligible_count", "mean"),
         eligible_std        =("eligible_count", "std"),
-        score_mean          =("avg_match_score", "mean"),
-        score_std           =("avg_match_score", "std"),
+        # Headline quality metric: unconditional, over all sampled patients.
+        score_mean          =("avg_match_score_all", "mean"),
+        score_std           =("avg_match_score_all", "std"),
+        # Recall, reported as a first-class metric rather than left implicit in
+        # the null pattern of the conditional score.
+        match_rate          =("has_match", "mean"),
+        n_scored            =("has_match", "sum"),
+        # Conditional twin, kept for reference and never reported without
+        # n_scored beside it.
+        score_cond_mean     =("avg_match_score", "mean"),
+        score_cond_std      =("avg_match_score", "std"),
         cost_mean           =("estimated_cost_usd", "mean"),
         cost_std            =("estimated_cost_usd", "std"),
         time_mean           =("total_time", "mean"),
@@ -185,29 +230,59 @@ def build_comparison_table(df: pd.DataFrame) -> pd.DataFrame:
         stage_dropped_mean  =("stage_dropped", "mean"),
         histo_dropped_mean  =("histology_dropped", "mean"),
         input_tokens_mean   =("gpt4o_input_tokens", "mean"),
+        # Conditional per-patient ratios. Reported only with n_scored.
         cost_per_elig_mean  =("cost_per_eligible", "mean"),
         tokens_per_elig_mean=("tokens_per_eligible", "mean"),
         n_patients          =("patient_id", "count"),
+        _total_cost         =("estimated_cost_usd", "sum"),
+        _total_tokens       =("total_tokens", "sum"),
+        _total_eligible     =("eligible_count", "sum"),
     ).reset_index()
 
-    
+    # ── Pooled efficiency: the reportable cost/token per eligible match ─────
+    #
+    # total spend over total matches, across ALL sampled patients. A patient
+    # the configuration failed to match still contributes their tokens and
+    # dollars to the numerator and a zero to the denominator, so a
+    # recall-destroying configuration cannot appear efficient by having its
+    # failures dropped as nulls. NaN only when the config matched nothing at all.
+    table["cost_per_elig_pooled"] = (
+        table["_total_cost"] / table["_total_eligible"].replace(0, np.nan)
+    )
+    table["tokens_per_elig_pooled"] = (
+        table["_total_tokens"] / table["_total_eligible"].replace(0, np.nan)
+    )
+    table = table.drop(columns=["_total_cost", "_total_tokens", "_total_eligible"])
+
     # Bootstrapped 95% CIs (TrialGPT standard: Nature Communications)
+    #
+    # The generator is seeded ONCE PER CONFIGURATION, outside the column loop.
+    # Reseeding inside it made every metric of every configuration resample the
+    # same index sequence: reproducible, but the intervals were not independent
+    # draws and correlated errors across metrics were invisible.
+    #
+    # avg_match_score_all and has_match are the CI'd quality metrics; the
+    # conditional avg_match_score is deliberately absent, because its
+    # resampling population differs by configuration and the resulting
+    # intervals would not be comparable.
     N_BOOT = 1000
-    ci_cols = ["eligible_count", "avg_match_score", "estimated_cost_usd", "total_time"]
+    BOOT_SEED = 42
+    ci_cols = ["eligible_count", "avg_match_score_all", "has_match",
+               "estimated_cost_usd", "total_time"]
     for config in CONFIG_ORDER:
         config_data = df[df["config_name"] == config]
         idx_rows = table[table["config_name"] == config].index
         if len(idx_rows) == 0:
             continue
         idx = idx_rows[0]
-        
+
+        rng = np.random.default_rng(BOOT_SEED)
         for col in ci_cols:
             vals = config_data[col].dropna().values
             if len(vals) < 2:
                 table.loc[idx, f"{col}_ci_lo"] = np.nan
                 table.loc[idx, f"{col}_ci_hi"] = np.nan
                 continue
-            rng = np.random.default_rng(42)
             boot_means = [
                 rng.choice(vals, size=len(vals), replace=True).mean()
                 for _ in range(N_BOOT)
@@ -215,7 +290,7 @@ def build_comparison_table(df: pd.DataFrame) -> pd.DataFrame:
             table.loc[idx, f"{col}_ci_lo"] = np.percentile(boot_means, 2.5)
             table.loc[idx, f"{col}_ci_hi"] = np.percentile(boot_means, 97.5)
 
-    
+
     # Compute deltas vs baseline
     bl_rows = table[table["config_name"] == BASELINE]
     if bl_rows.empty:
@@ -225,8 +300,11 @@ def build_comparison_table(df: pd.DataFrame) -> pd.DataFrame:
 
     baseline = bl_rows.iloc[0]
 
-    for col in ["eligible_mean", "score_mean", "cost_mean", "time_mean",
-                "evaluated_mean", "cost_per_elig_mean", "input_tokens_mean"]:
+    # cost_per_elig_mean is excluded: it is a conditional mean whose population
+    # differs between the two configs being differenced, so its delta is not
+    # attributable to the ablation. The pooled ratio is differenced instead.
+    for col in ["eligible_mean", "score_mean", "match_rate", "cost_mean", "time_mean",
+                "evaluated_mean", "cost_per_elig_pooled", "input_tokens_mean"]:
         delta_col = f"Δ_{col}"
         table[delta_col] = table[col] - baseline[col]
 
@@ -270,8 +348,14 @@ def run_statistical_tests(df: pd.DataFrame) -> pd.DataFrame:
     baseline_df = df[df["config_name"] == BASELINE].set_index("patient_id")
     results = []
 
-    test_cols = ["eligible_count", "avg_match_score", "estimated_cost_usd", "total_time",
-                 "candidates_evaluated"]
+    # avg_match_score_all, not avg_match_score. The conditional column is NULL
+    # for every zero-match patient, and the null pattern differs between the two
+    # configs being paired, so the paired difference would be NaN for exactly
+    # the patients whose loss the ablation caused -- silently testing only the
+    # patients where nothing went wrong. has_match tests the recall change
+    # itself, which is what the conditional column was hiding.
+    test_cols = ["eligible_count", "avg_match_score_all", "has_match",
+                 "estimated_cost_usd", "total_time", "candidates_evaluated"]
 
     for config in CONFIG_ORDER:
         if config == BASELINE:
@@ -402,27 +486,42 @@ def plot_delta_chart(table: pd.DataFrame) -> None:
 
 
 def plot_cost_efficiency(df: pd.DataFrame) -> None:
-    """Cost-per-eligible-match by config (the key rule filter argument)."""
-    # Only patients with at least 1 eligible match
-    has_match = df[df["eligible_count"] > 0].copy()
+    """
+    Pooled cost-per-eligible-match by config (the key rule filter argument).
 
-    means = has_match.groupby("config_name", observed=True)["cost_per_eligible"].agg(
-        ["mean", "std"]).loc[CONFIG_ORDER]
-    means.index = [CONFIG_LABELS[c] for c in means.index]
+    Pooled (total spend / total matches) over ALL sampled patients, not a mean
+    of the per-patient ratio over the subset that matched. The per-patient
+    ratio is undefined at zero matches, so averaging it discards precisely the
+    patients whose spend returned nothing and flatters whichever configuration
+    failed most often. There is no error bar because a pooled ratio is a single
+    quantity, not a distribution over patients.
+    """
+    grouped = df.groupby("config_name", observed=True).agg(
+        total_cost=("estimated_cost_usd", "sum"),
+        total_eligible=("eligible_count", "sum"),
+        n_patients=("patient_id", "count"),
+    ).reindex(CONFIG_ORDER)
+
+    pooled = grouped["total_cost"] / grouped["total_eligible"].replace(0, np.nan)
+    labels = [CONFIG_LABELS[c] for c in grouped.index]
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    bars = ax.bar(range(len(means)), means["mean"], yerr=means["std"],
-                  capsize=4, color=["#3498db"] + ["#95a5a6"] * (len(means) - 1))
+    bars = ax.bar(range(len(pooled)), pooled.values,
+                  color=["#3498db"] + ["#95a5a6"] * (len(pooled) - 1))
     bars[0].set_color("#2ecc71")  # Highlight baseline
 
-    ax.set_xticks(range(len(means)))
-    ax.set_xticklabels(means.index, rotation=30, ha="right")
-    ax.set_ylabel("Cost per Eligible Match (USD)")
-    ax.set_title("Cost Efficiency: Cost per Eligible Match by Configuration")
+    ax.set_xticks(range(len(pooled)))
+    ax.set_xticklabels(labels, rotation=30, ha="right")
+    ax.set_ylabel("Cost per Eligible Match (USD, pooled)")
+    ax.set_title("Cost Efficiency: Pooled Cost per Eligible Match by Configuration")
 
-    for i, (m, s) in enumerate(zip(means["mean"], means["std"])):
+    for i, (m, n) in enumerate(zip(pooled.values, grouped["n_patients"].values)):
         if not np.isnan(m):
-            ax.text(i, m + s + 0.0002, f"${m:.4f}", ha="center", fontsize=8)
+            ax.text(i, m, f"${m:.4f}\n(n={int(n)})", ha="center",
+                    va="bottom", fontsize=8)
+
+    ax.set_xlabel("Pooled over all sampled patients; zero-match patients keep "
+                  "their cost in the numerator", fontsize=8)
 
     plt.tight_layout()
     path = OUTPUT_DIR / "ablation_cost_efficiency.png"
@@ -432,14 +531,25 @@ def plot_cost_efficiency(df: pd.DataFrame) -> None:
 
 
 def plot_score_distribution(df: pd.DataFrame) -> None:
-    """Box plot of avg_match_score distributions per config."""
-    has_score = df[df["avg_match_score"].notna()].copy()
+    """
+    Box plot of match score distributions per config, over ALL sampled patients.
 
+    Every box covers the same patients. Dropping the zero-match patients (the
+    old behaviour) made each box cover a different, configuration-selected
+    subpopulation, so the boxes were not comparable to each other. The match
+    rate is annotated under each box: a high box over a low match rate is a
+    configuration that scores well on the few patients it did not lose.
+    """
     fig, ax = plt.subplots(figsize=(12, 6))
 
-    data = [has_score[has_score["config_name"] == c]["avg_match_score"].values
+    data = [df[df["config_name"] == c]["avg_match_score_all"].dropna().values
             for c in CONFIG_ORDER]
-    labels = [CONFIG_LABELS[c] for c in CONFIG_ORDER]
+    rates = [df[df["config_name"] == c]["has_match"].mean() for c in CONFIG_ORDER]
+    counts = [len(d) for d in data]
+    labels = [
+        f"{CONFIG_LABELS[c]}\nn={n}, matched {r:.0%}"
+        for c, n, r in zip(CONFIG_ORDER, counts, rates)
+    ]
 
     bp = ax.boxplot(data, labels=labels, patch_artist=True, showmeans=True,
                     meanprops={"marker": "D", "markerfacecolor": "red", "markersize": 5})
@@ -448,8 +558,8 @@ def plot_score_distribution(df: pd.DataFrame) -> None:
     for patch, color in zip(bp["boxes"], colors):
         patch.set_facecolor(color)
 
-    ax.set_xticklabels(labels, rotation=30, ha="right")
-    ax.set_ylabel("Average Match Score")
+    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
+    ax.set_ylabel("Average Match Score (all patients, no match = 0.0)")
     ax.set_title("Match Quality Distribution by Configuration")
     plt.tight_layout()
     path = OUTPUT_DIR / "ablation_score_distribution.png"
@@ -825,10 +935,15 @@ def generate_report(df: pd.DataFrame, table: pd.DataFrame,
 
     # Main comparison table with 95% CIs
     lines.append("-" * 70)
-    lines.append("COMPARISON TABLE (mean [95% CI])")
+    lines.append("COMPARISON TABLE (mean [95% CI], all sampled patients)")
     lines.append("-" * 70)
+    lines.append("Score = mean match score over ALL sampled patients; a patient")
+    lines.append("        with no eligible trial contributes 0.0.")
+    lines.append("Match% = proportion of sampled patients with >= 1 eligible trial.")
+    lines.append("")
 
-    header = f"{'Config':<28} {'Eligible':>18} {'Score':>18} {'Cost (USD)':>18}"
+    header = (f"{'Config':<28} {'Eligible':>18} {'Score':>18} {'Match%':>16} "
+              f"{'Cost (USD)':>18}")
     lines.append(header)
     lines.append("-" * len(header))
 
@@ -842,14 +957,22 @@ def generate_report(df: pd.DataFrame, table: pd.DataFrame,
             elig = f"{row['eligible_mean']:.2f} [{e_lo:.2f},{e_hi:.2f}]"
         else:
             elig = f"{row['eligible_mean']:.2f}"
-        # Score with CI
-        s_lo = row.get("avg_match_score_ci_lo", np.nan)
-        s_hi = row.get("avg_match_score_ci_hi", np.nan)
+        # Score with CI (unconditional: avg_match_score_all)
+        s_lo = row.get("avg_match_score_all_ci_lo", np.nan)
+        s_hi = row.get("avg_match_score_all_ci_hi", np.nan)
         s_lo = np.nan if s_lo is None else float(s_lo)
         if not np.isnan(s_lo):
             score = f"{row['score_mean']:.3f} [{s_lo:.3f},{s_hi:.3f}]"
         else:
             score = f"{row['score_mean']:.3f}" if not np.isnan(row['score_mean']) else "N/A"
+        # Match rate with CI
+        m_lo = row.get("has_match_ci_lo", np.nan)
+        m_hi = row.get("has_match_ci_hi", np.nan)
+        m_lo = np.nan if m_lo is None else float(m_lo)
+        if not np.isnan(m_lo):
+            mrate = f"{row['match_rate']:.2f} [{m_lo:.2f},{m_hi:.2f}]"
+        else:
+            mrate = f"{row['match_rate']:.2f}"
         # Cost with CI
         c_lo = row.get("estimated_cost_usd_ci_lo", np.nan)
         c_hi = row.get("estimated_cost_usd_ci_hi", np.nan)
@@ -858,8 +981,28 @@ def generate_report(df: pd.DataFrame, table: pd.DataFrame,
             cost = f"${row['cost_mean']:.4f} [{c_lo:.4f},{c_hi:.4f}]"
         else:
             cost = f"${row['cost_mean']:.4f}"
-        lines.append(f"{name:<28} {elig:>18} {score:>18} {cost:>18}")
+        lines.append(f"{name:<28} {elig:>18} {score:>18} {mrate:>16} {cost:>18}")
 
+    lines.append("")
+
+    # Conditional score, always with its own n. Kept separate from the table
+    # above so it can never be read as a like-for-like comparison: each row
+    # averages over a different set of patients, chosen by the configuration.
+    lines.append("-" * 70)
+    lines.append("CONDITIONAL MATCH SCORE (matched patients only -- NOT comparable")
+    lines.append("across configs; each row averages a different patient set)")
+    lines.append("-" * 70)
+    cond_header = f"{'Config':<28} {'Score|matched':>14} {'n_scored':>10} {'n_total':>9}"
+    lines.append(cond_header)
+    lines.append("-" * len(cond_header))
+    for _, row in table.iterrows():
+        name = CONFIG_LABELS.get(row["config_name"], row["config_name"])
+        cond = row.get("score_cond_mean", np.nan)
+        cond_s = "N/A" if pd.isna(cond) else f"{cond:.3f}"
+        lines.append(
+            f"{name:<28} {cond_s:>14} {int(row['n_scored']):>10} "
+            f"{int(row['n_patients']):>9}"
+        )
     lines.append("")
 
     # Deltas
@@ -867,18 +1010,22 @@ def generate_report(df: pd.DataFrame, table: pd.DataFrame,
     lines.append("DELTAS vs BASELINE (full_pipeline)")
     lines.append("-" * 70)
 
-    header2 = f"{'Config':<28} {'Δ Elig':>8} {'Δ Cost':>8} {'Δ Time':>8} {'Δ% Elig':>8} {'Δ% Cost':>8}"
+    header2 = (f"{'Config':<28} {'Δ Elig':>8} {'Δ Score':>8} {'Δ Match%':>9} "
+               f"{'Δ Cost':>8} {'Δ Time':>8} {'Δ% Elig':>8} {'Δ% Cost':>8}")
     lines.append(header2)
     lines.append("-" * len(header2))
 
     for _, row in table[table["config_name"] != BASELINE].iterrows():
         name = CONFIG_LABELS.get(row["config_name"], row["config_name"])
         d_elig = f"{row['Δ_eligible_mean']:+.2f}"
+        d_score = f"{row['Δ_score_mean']:+.3f}"
+        d_rate = f"{row['Δ_match_rate']:+.3f}"
         d_cost = f"{row['Δ_cost_mean']:+.4f}"
         d_time = f"{row['Δ_time_mean']:+.1f}s"
         dp_elig = f"{row.get('Δ%_eligible_mean', 0):+.1f}%"
         dp_cost = f"{row.get('Δ%_cost_mean', 0):+.1f}%"
-        lines.append(f"{name:<28} {d_elig:>8} {d_cost:>8} {d_time:>8} {dp_elig:>8} {dp_cost:>8}")
+        lines.append(f"{name:<28} {d_elig:>8} {d_score:>8} {d_rate:>9} "
+                     f"{d_cost:>8} {d_time:>8} {dp_elig:>8} {dp_cost:>8}")
 
     lines.append("")
 
@@ -891,7 +1038,8 @@ def generate_report(df: pd.DataFrame, table: pd.DataFrame,
         for _, row in stats.iterrows():
             name = row["config_label"]
             lines.append(f"\n  {name} (n={row['n_paired']} paired patients):")
-            for col in ["eligible_count", "avg_match_score", "estimated_cost_usd", "total_time"]:
+            for col in ["eligible_count", "avg_match_score_all", "has_match",
+                        "estimated_cost_usd", "total_time"]:
                 p = row.get(f"{col}_p")
                 sig = row.get(f"{col}_sig", "")
                 r = row.get(f"{col}_effect_r")
@@ -919,31 +1067,57 @@ def generate_report(df: pd.DataFrame, table: pd.DataFrame,
             )
         lines.append("")
 
-    # Token efficiency
+    # ── Efficiency: pooled headline, conditional mean beside it with its n ──
+    #
+    # Pooled = total over all sampled patients / total matches. Conditional =
+    # mean of the per-patient ratio over only the patients that matched, which
+    # is undefined for the rest; it is printed with n_scored so it can never be
+    # mistaken for a like-for-like comparison across configurations.
+    table_idx = table.set_index("config_name")
+
     lines.append("-" * 70)
     lines.append("TOKEN EFFICIENCY (tokens per eligible match)")
     lines.append("-" * 70)
-
-    has_match = df[df["eligible_count"] > 0]
-    tpe = has_match.groupby("config_name", observed=True)["tokens_per_eligible"].mean()
+    eff_header = (f"  {'Config':<28} {'pooled (all n)':>16} "
+                  f"{'cond. mean':>12} {'n_scored':>9}")
+    lines.append(eff_header)
     for config in CONFIG_ORDER:
-        if config in tpe.index and not np.isnan(tpe[config]):
-            name = CONFIG_LABELS[config]
-            lines.append(f"  {name:<28} {tpe[config]:,.0f} tokens/match")
+        if config not in table_idx.index:
+            continue
+        r = table_idx.loc[config]
+        pooled = r["tokens_per_elig_pooled"]
+        cond = r["tokens_per_elig_mean"]
+        lines.append(
+            f"  {CONFIG_LABELS[config]:<28} "
+            f"{('N/A' if pd.isna(pooled) else f'{pooled:,.0f}'):>16} "
+            f"{('N/A' if pd.isna(cond) else f'{cond:,.0f}'):>12} "
+            f"{int(r['n_scored']):>9}"
+        )
 
     lines.append("")
 
-    # Cost efficiency
     lines.append("-" * 70)
-    lines.append("COST EFFICIENCY (cost per eligible match)")
+    lines.append("COST EFFICIENCY (cost per eligible match, USD)")
     lines.append("-" * 70)
-
-    cpe = has_match.groupby("config_name", observed=True)["cost_per_eligible"].mean()
+    lines.append(eff_header)
     for config in CONFIG_ORDER:
-        if config in cpe.index:
-            name = CONFIG_LABELS[config]
-            lines.append(f"  {name:<28} ${cpe[config]:.4f}")
+        if config not in table_idx.index:
+            continue
+        r = table_idx.loc[config]
+        pooled = r["cost_per_elig_pooled"]
+        cond = r["cost_per_elig_mean"]
+        lines.append(
+            f"  {CONFIG_LABELS[config]:<28} "
+            f"{('N/A' if pd.isna(pooled) else f'${pooled:.4f}'):>16} "
+            f"{('N/A' if pd.isna(cond) else f'${cond:.4f}'):>12} "
+            f"{int(r['n_scored']):>9}"
+        )
 
+    lines.append("")
+    lines.append("  pooled     = sum(cost) / sum(eligible) over ALL sampled patients;")
+    lines.append("               a zero-match patient's spend stays in the numerator.")
+    lines.append("  cond. mean = mean of the per-patient ratio over the n_scored")
+    lines.append("               patients that matched. Population differs by config.")
     lines.append("")
 
     # Cancer group breakdown

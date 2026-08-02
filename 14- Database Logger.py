@@ -132,10 +132,20 @@ CREATE TABLE IF NOT EXISTS trial_matches (
 # rerank_score stays the BOOSTED ranking score, so historical rows keep their
 # meaning. The unboosted score and the MeSH boost are recorded separately so
 # the boost's effect on ranking can be measured rather than inferred.
+#
+# match_score is confirmed/denominator over APPLICABLE criteria only (File 13
+# excludes criteria the model marked "Not applicable -- ..." from both). Storing
+# the three inputs makes the ratio auditable: a 0.0 score on a denominator of 8
+# (nothing confirmable) is a different finding from 0.0 on a denominator of 0
+# (no criterion applied to this patient), and neither is visible from the
+# rounded score alone.
 TRIAL_MATCH_COLUMN_ADDITIONS = {
     "rerank_score_raw": "REAL",   # fused rerank score before the MeSH boost
     "mesh_boost":       "REAL",   # additive boost, 0.0 when no tier matched
     "mesh_boost_tier":  "TEXT",   # "direct" | "pan_cancer" | "none"
+    "score_confirmed":         "INTEGER",  # match_score numerator
+    "score_denominator":       "INTEGER",  # match_score denominator (applicable only)
+    "criteria_not_applicable": "INTEGER",  # criteria excluded from both
 }
 
 _existing_trial_match_columns = {
@@ -360,8 +370,9 @@ def log_inference(result: Dict, patient_data: Dict):
                 INSERT INTO trial_matches (
                     inference_id, nct_id, trial_title, trial_phase,
                     trial_number, rerank_score, rerank_score_raw, mesh_boost, mesh_boost_tier,
-                    match_score, eligible, explanation, criterion_details
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    match_score, eligible, explanation, criterion_details,
+                    score_confirmed, score_denominator, criteria_not_applicable
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 inference_id,
                 match.get("nct_id", ""),
@@ -375,7 +386,10 @@ def log_inference(result: Dict, patient_data: Dict):
                 match.get("match_score", 0.0),
                 match.get("eligible", "not_eligible"),
                 match.get("explanation", ""),
-                criterion_json
+                criterion_json,
+                match.get("score_confirmed"),
+                match.get("score_denominator"),
+                match.get("criteria_not_applicable"),
             ))
         
         conn.commit()

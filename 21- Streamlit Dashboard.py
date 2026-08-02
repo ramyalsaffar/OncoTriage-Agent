@@ -299,16 +299,17 @@ def render_overview_tab(df):
     """, unsafe_allow_html=True)
     
     # Top-level KPIs
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
-    
+    col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
+
     total_inferences = len(df)
     unique_patients = df['patient_id'].nunique()
     avg_cost = df['estimated_cost_usd'].mean()
-    
+
     full_rate = (df['match_tier'] == 'Full Match').sum() / len(df) * 100 if len(df) > 0 else 0
     partial_rate = (df['match_tier'] == 'Partial Match').sum() / len(df) * 100 if len(df) > 0 else 0
+    unconfirmed_rate = (df['match_tier'] == 'Unconfirmed Match').sum() / len(df) * 100 if len(df) > 0 else 0
     no_match_rate = (df['match_tier'] == 'No Match').sum() / len(df) * 100 if len(df) > 0 else 0
-    
+
     with col1:
         st.metric(
             "Total Inferences",
@@ -337,10 +338,23 @@ def render_overview_tab(df):
             "🟡 Partial Match",
             f"{partial_rate:.1f}%",
             delta=f"{(df['match_tier'] == 'Partial Match').sum()} patients",
-            help="Patients matched to trials but with some criteria not evaluable due to missing data (score < 100%)"
+            help="Patients whose best trial had SOME criteria confirmed but not all (0% < score < 100%)"
         )
-    
+
     with col5:
+        st.metric(
+            "🔶 Unconfirmed",
+            f"{unconfirmed_rate:.1f}%",
+            delta=f"{(df['match_tier'] == 'Unconfirmed Match').sum()} patients",
+            delta_color="inverse",
+            help=(
+                "Patients whose only eligible trials scored 0% — no disqualifier "
+                "was found, but not a single criterion could be confirmed. "
+                "Eligible on paper, nothing established."
+            )
+        )
+
+    with col6:
         st.metric(
             "❌ No Match",
             f"{no_match_rate:.1f}%",
@@ -348,17 +362,24 @@ def render_overview_tab(df):
             delta_color="inverse",
             help="Patients with no eligible trial matches"
         )
-    
-    with col6:
-        any_match_rate = full_rate + partial_rate
-        any_match_count = (df['match_tier'] == 'Full Match').sum() + (df['match_tier'] == 'Partial Match').sum()
+
+    with col7:
+        # "Any Match" counts every eligible trial including the unconfirmable
+        # ones, so it is deliberately shown next to the tier split rather than
+        # in place of it.
+        any_match_rate = full_rate + partial_rate + unconfirmed_rate
+        any_match_count = (
+            (df['match_tier'] == 'Full Match').sum()
+            + (df['match_tier'] == 'Partial Match').sum()
+            + (df['match_tier'] == 'Unconfirmed Match').sum()
+        )
         st.metric(
             "Any Match",
             f"{any_match_rate:.1f}%",
             delta=f"{any_match_count} patients",
-            help="Patients with at least 1 eligible trial (full or partial)"
+            help="Patients with at least 1 eligible trial (full, partial, or unconfirmed)"
         )
-    
+
     st.markdown("---")
     
     # Charts row
@@ -440,7 +461,8 @@ def render_overview_tab(df):
             'Evaluated',
             'Eligible (Any)',
             '  └ Full Match',
-            '  └ Partial Match'
+            '  └ Partial Match',
+            '  └ Unconfirmed'
         ],
         'Avg Count': [
             df['candidates_retrieved'].mean(),
@@ -451,7 +473,8 @@ def render_overview_tab(df):
             df['candidates_evaluated'].mean(),
             df['eligible_matches'].mean(),
             df['full_match_count'].mean(),
-            df['partial_match_count'].mean()
+            df['partial_match_count'].mean(),
+            df['unconfirmed_match_count'].mean()
         ]
     }
     
@@ -465,7 +488,11 @@ def render_overview_tab(df):
         x=avg_counts,
         text=funnel_text,
         textinfo="text",
-        marker=dict(color=['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#2ca02c', '#ffbb33'])
+        marker=dict(color=['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+                           '#8c564b', '#e377c2',
+                           MATCH_TIER_COLORS['Full Match'],
+                           MATCH_TIER_COLORS['Partial Match'],
+                           MATCH_TIER_COLORS['Unconfirmed Match']])
     ))
     
     fig_funnel.update_layout(
@@ -1090,22 +1117,24 @@ def render_performance_tab(df):
 
         if not tm_perf.empty and 'rerank_score' in tm_perf.columns:
 
-            # Classify match status
+            # Classify match status. An eligible trial scoring exactly 0.0 gets
+            # its own bucket: nothing about it was confirmable, so grouping it
+            # with a 90%-confirmed trial would put two different findings on the
+            # same point of the rerank-score axis.
             def classify_match(row):
-                if row['eligible'] == 'eligible' and row['match_score'] >= 1.0:
-                    return 'Eligible'
-                elif row['eligible'] == 'eligible' and row['match_score'] < 1.0:
-                    return 'Partial Match'
-                else:
+                if row['eligible'] != 'eligible':
                     return 'Not Eligible'
+                tier = classify_trial_score(row['match_score'])
+                return 'Eligible' if tier == 'Full Match' else tier
 
             tm_perf['match_status'] = tm_perf.apply(classify_match, axis=1)
             tm_perf = tm_perf.dropna(subset=['rerank_score'])
 
             color_map = {
-                'Eligible':     '#2ca02c',
-                'Partial Match':'#ff7f0e',
-                'Not Eligible': '#d62728'
+                'Eligible':          '#2ca02c',
+                'Partial Match':     '#ff7f0e',
+                'Unconfirmed Match': MATCH_TIER_COLORS['Unconfirmed Match'],
+                'Not Eligible':      '#d62728'
             }
 
             # ── Row 1: Recall vs Cost Tradeoff (full width) ──────────────────
@@ -1376,7 +1405,8 @@ def render_performance_tab(df):
             with col1:
                 
                 
-                category_order = ['Eligible', 'Partial Match', 'Not Eligible']
+                category_order = ['Eligible', 'Partial Match',
+                                  'Unconfirmed Match', 'Not Eligible']
                 fig_strip = go.Figure()
 
                 for status in category_order:
@@ -1636,8 +1666,8 @@ def render_cost_tokens_tab(df):
         df_tpt['input_per_trial'] = df_tpt['gpt4o_input_tokens'] / df_tpt['candidates_evaluated']
         df_tpt['output_per_trial'] = df_tpt['gpt4o_output_tokens'] / df_tpt['candidates_evaluated']
         
-        tier_order = ['Full Match', 'Partial Match', 'No Match']
-        tier_colors = {'Full Match': '#2ca02c', 'Partial Match': '#ffbb33', 'No Match': '#d62728'}
+        tier_order = list(MATCH_TIERS)
+        tier_colors = MATCH_TIER_COLORS
         
         tpt_stats = df_tpt.groupby('match_tier').agg(
             avg_input=('input_per_trial', 'mean'),
@@ -1706,8 +1736,8 @@ def render_cost_tokens_tab(df):
 
     with col1:
         # --- Dumbbell Chart: Cost per Patient vs Cost per Match ---
-        tier_order = ['Full Match', 'Partial Match', 'No Match']
-        tier_colors = {'Full Match': '#2ca02c', 'Partial Match': '#ffbb33', 'No Match': '#d62728'}
+        tier_order = list(MATCH_TIERS)
+        tier_colors = MATCH_TIER_COLORS
 
         tier_stats = df.groupby('match_tier').agg(
             avg_cost=('estimated_cost_usd', 'mean'),
@@ -1842,12 +1872,13 @@ def render_patient_demographics_tab(df):
     st.header("👥 Patient Demographics & Equity Analysis")
     
     # --- Summary Metrics ---
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
-    
+    col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
+
     overall_match_rate = (df['eligible_matches'] > 0).mean() * 100
     full_match_rate_demo = (df['match_tier'] == 'Full Match').mean() * 100
     partial_match_rate_demo = (df['match_tier'] == 'Partial Match').mean() * 100
-    
+    unconfirmed_match_rate_demo = (df['match_tier'] == 'Unconfirmed Match').mean() * 100
+
     with col1:
         st.metric("Total Patients", df['patient_id'].nunique(),
                   help="Unique patients in current filter")
@@ -1862,10 +1893,15 @@ def render_patient_demographics_tab(df):
                   help="Patients with at least 1 trial where ALL criteria confirmed (100% score)")
     with col5:
         st.metric("🟡 Partial Match", f"{partial_match_rate_demo:.1f}%",
-                  help="Patients matched but with some criteria not evaluable (score < 100%)")
+                  help="Patients whose best trial had SOME criteria confirmed (0% < score < 100%)")
     with col6:
+        st.metric("🔶 Unconfirmed", f"{unconfirmed_match_rate_demo:.1f}%",
+                  help="Patients whose only eligible trials scored 0% — no disqualifier "
+                       "found, but no criterion confirmed either")
+    with col7:
         st.metric("Any Match", f"{overall_match_rate:.1f}%",
-                  help="Patients with at least 1 eligible trial (full or partial). Used as baseline in charts below")
+                  help="Patients with at least 1 eligible trial (full, partial, or "
+                       "unconfirmed). Used as baseline in charts below")
     
     st.markdown("---")
     
@@ -2290,8 +2326,9 @@ def render_patient_explorer_tab(df):
     with col3:
         st.markdown("**Match Results**")
         st.metric("✅ Full Matches", int(patient_df['full_match_count']), help="Trials where ALL criteria were confirmed met (100% score)")
-        st.metric("🟡 Partial Matches", int(patient_df['partial_match_count']), help="Trials eligible but with some criteria not evaluable due to missing data")
-        st.metric("Match Tier", patient_df['match_tier'], help="Overall patient classification: Full Match > Partial Match > No Match")
+        st.metric("🟡 Partial Matches", int(patient_df['partial_match_count']), help="Trials eligible with SOME criteria confirmed but not all (0% < score < 100%)")
+        st.metric("🔶 Unconfirmed", int(patient_df['unconfirmed_match_count']), help="Trials eligible but scoring 0% — no disqualifier found and no criterion confirmed either")
+        st.metric("Match Tier", patient_df['match_tier'], help="Overall patient classification: Full Match > Partial Match > Unconfirmed Match > No Match")
     
     st.markdown("---")
     
@@ -2321,6 +2358,7 @@ def render_patient_explorer_tab(df):
         'Medications':      int(patient_df['medication_count']),
         'Full Matches':     int(patient_df['full_match_count']),
         'Partial Matches':  int(patient_df['partial_match_count']),
+        'Unconfirmed Matches': int(patient_df['unconfirmed_match_count']),
         'Match Tier':       patient_df['match_tier'],
         'Total Time (s)':   round(patient_df['total_time'], 2),
         'Cost (USD)':       round(patient_df['estimated_cost_usd'], 4),
@@ -2331,7 +2369,7 @@ def render_patient_explorer_tab(df):
     if not patient_trials_export.empty:
         for _, t in patient_trials_export.iterrows():
             if t['eligible'] == 'eligible':
-                status = 'Full Match' if t['match_score'] >= 1.0 else 'Partial Match'
+                status = classify_trial_score(t['match_score'])
             else:
                 status = 'Not Eligible'
             export_rows.append({
@@ -2370,7 +2408,8 @@ def render_patient_explorer_tab(df):
         'Evaluated':           int(patient_df['candidates_evaluated']),
         'Eligible (Any)':      int(patient_df['eligible_matches']),
         '  Full Match':        int(patient_df['full_match_count']),
-        '  Partial':           int(patient_df['partial_match_count'])
+        '  Partial':           int(patient_df['partial_match_count']),
+        '  Unconfirmed':       int(patient_df['unconfirmed_match_count'])
     }
     
     # Population averages
@@ -2383,7 +2422,8 @@ def render_patient_explorer_tab(df):
         'Evaluated':           df['candidates_evaluated'].mean(),
         'Eligible (Any)':      df['eligible_matches'].mean(),
         '  Full Match':        df['full_match_count'].mean(),
-        '  Partial':           df['partial_match_count'].mean()
+        '  Partial':           df['partial_match_count'].mean(),
+        '  Unconfirmed':       df['unconfirmed_match_count'].mean()
     }
         
     stage_names = list(patient_stages.keys())
@@ -2483,13 +2523,15 @@ def render_patient_explorer_tab(df):
             # Build display table
             
             def classify_status(row):
-                if row['eligible'] == 'eligible':
-                    if row['match_score'] >= 1.0:
-                        return '✅ Eligible'
-                    else:
-                        return '🟡 Partial Match'
-                return '❌ Not Eligible'
-                                    
+                if row['eligible'] != 'eligible':
+                    return TRIAL_STATUS_REJECTED
+                tier = classify_trial_score(row['match_score'])
+                if tier == 'Full Match':
+                    return '✅ Eligible'
+                if tier == 'Partial Match':
+                    return TRIAL_STATUS_PARTIAL
+                return TRIAL_STATUS_UNCONFIRMED
+
             patient_matches['Status'] = patient_matches.apply(classify_status, axis=1)
             
             # Extract diagnostic fields from criterion_details JSON
@@ -2517,7 +2559,8 @@ def render_patient_explorer_tab(df):
             display_df['Match Score'] = (display_df['Match Score'] * 100).round(0).astype(int)
             
             # Default sort: eligible first, then by match score descending
-            status_order = {'✅ Eligible': 0, '🟡 Partial Match': 1, '❌ Not Eligible': 2}
+            status_order = {'✅ Eligible': 0, TRIAL_STATUS_PARTIAL: 1,
+                            TRIAL_STATUS_UNCONFIRMED: 2, TRIAL_STATUS_REJECTED: 3}
             display_df['_sort'] = display_df['Status'].map(status_order)
             
             display_df = display_df.sort_values(
@@ -2540,12 +2583,14 @@ def render_patient_explorer_tab(df):
             )
             
             eligible_count = (patient_matches['Status'] == '✅ Eligible').sum()
-            partial_count = (patient_matches['Status'] == '🟡 Partial Match').sum()
-            not_eligible_count = (patient_matches['Status'] == '❌ Not Eligible').sum()
-            
+            partial_count = (patient_matches['Status'] == TRIAL_STATUS_PARTIAL).sum()
+            unconfirmed_count = (patient_matches['Status'] == TRIAL_STATUS_UNCONFIRMED).sum()
+            not_eligible_count = (patient_matches['Status'] == TRIAL_STATUS_REJECTED).sum()
+
             st.caption(
                 f"{eligible_count} eligible · "
                 f"{partial_count} partial matches · "
+                f"{unconfirmed_count} unconfirmed (eligible, 0% of criteria confirmed) · "
                 f"{not_eligible_count} not eligible · "
                 f"{len(patient_matches)} total"
             )
@@ -2700,8 +2745,8 @@ def render_match_quality_tab(df):
     
     st.subheader("Patient Complexity vs Match Success")
     
-    tier_order = ['Full Match', 'Partial Match', 'No Match']
-    tier_colors = {'Full Match': '#2ca02c', 'Partial Match': '#ffbb33', 'No Match': '#d62728'}
+    tier_order = list(MATCH_TIERS)
+    tier_colors = MATCH_TIER_COLORS
     
     col1, col2 = st.columns(2)
     
@@ -2873,9 +2918,18 @@ def render_match_quality_tab(df):
             )
             
             st.markdown("**Top Partial Match Examples:**")
-            # Partial matches: eligible trials with score < 1.0 (missing data on some criteria)
-            partial_misses = filtered_matches[
-                (filtered_matches['eligible'] == 'eligible') & (filtered_matches['match_score'] < 1.0)
+            # Partial matches: eligible trials with 0 < score < 1.0 (some criteria
+            # confirmed, others not evaluable). Trials scoring exactly 0.0 are
+            # excluded and counted separately below — nothing was confirmed on
+            # them, so they are not "close to full eligibility" in any sense and
+            # listing them here would misrepresent what the pipeline established.
+            eligible_matches_only = filtered_matches[filtered_matches['eligible'] == 'eligible']
+            partial_misses = eligible_matches_only[
+                (eligible_matches_only['match_score'] > 0.0)
+                & (eligible_matches_only['match_score'] < 1.0)
+            ]
+            unconfirmed_misses = eligible_matches_only[
+                eligible_matches_only['match_score'] <= 0.0
             ]
             if not partial_misses.empty:
                 top = partial_misses.nlargest(5, 'match_score')[['nct_id', 'trial_title', 'match_score', 'explanation']].copy()
@@ -2894,7 +2948,21 @@ def render_match_quality_tab(df):
                 )
                 
             else:
-                st.info("No partial matches found — all eligible trials have 100% score.")
+                st.info("No partial matches found — no eligible trial scored between 0% and 100%.")
+
+            if not unconfirmed_misses.empty:
+                st.markdown("**Unconfirmed Eligible Trials (0% of criteria confirmed):**")
+                unc = unconfirmed_misses[['nct_id', 'trial_title', 'explanation']].head(5).copy()
+                unc.columns = ['NCT ID', 'Trial', 'Reason']
+                unc['Trial'] = unc['Trial'].str[:80]
+                unc['Reason'] = unc['Reason'].str[:120]
+                st.dataframe(unc, use_container_width=True, hide_index=True)
+                st.caption(
+                    f"{len(unconfirmed_misses)} eligible trial(s) scored 0%: no disqualifying "
+                    "criterion was found, but not a single criterion could be confirmed either. "
+                    "These are the weakest possible eligible result and are reported apart from "
+                    "partial matches so they are not read as near-misses."
+                )
         else:
             st.success("✓ No near-misses!")
     else:
@@ -2904,21 +2972,24 @@ def render_match_quality_tab(df):
     st.subheader("Quality Monitoring")
     
     col1, col2, col3, col4, col5 = st.columns(5)
-    
+
     err_cnt = (df['error'].fillna('') != '').sum()
     err_rate = err_cnt / len(df) * 100 if len(df) > 0 else 0
-    
+
     full_cnt = (df['match_tier'] == 'Full Match').sum()
     partial_cnt = (df['match_tier'] == 'Partial Match').sum()
+    unconfirmed_cnt = (df['match_tier'] == 'Unconfirmed Match').sum()
     no_match_cnt = (df['match_tier'] == 'No Match').sum()
-    
+
     with col1:
         st.metric("Error Rate", f"{err_rate:.1f}%", delta=f"{err_cnt} errors" if err_cnt > 0 else None, delta_color="inverse", help="Percentage of inferences that encountered pipeline errors")
     with col2:
         st.metric("✅ Full Match", f"{full_cnt}", delta=f"{full_cnt / len(df) * 100:.1f}%" if len(df) > 0 else "0%", help="Patients with at least 1 trial where ALL criteria confirmed (100% score)")
     with col3:
-        st.metric("🟡 Partial Match", f"{partial_cnt}", delta=f"{partial_cnt / len(df) * 100:.1f}%" if len(df) > 0 else "0%", help="Patients matched but with missing data — some criteria not evaluable (score < 100%)")
+        st.metric("🟡 Partial Match", f"{partial_cnt}", delta=f"{partial_cnt / len(df) * 100:.1f}%" if len(df) > 0 else "0%", help="Patients whose best trial had SOME criteria confirmed (0% < score < 100%)")
     with col4:
+        st.metric("🔶 Unconfirmed", f"{unconfirmed_cnt}", delta=f"{unconfirmed_cnt / len(df) * 100:.1f}%" if len(df) > 0 else "0%", delta_color="inverse", help="Patients whose only eligible trials scored 0% — no disqualifier found, no criterion confirmed")
+    with col5:
         st.metric("❌ No Match", f"{no_match_cnt}", delta=f"{no_match_cnt / len(df) * 100:.1f}%" if len(df) > 0 else "0%", delta_color="inverse", help="Patients with no eligible trial matches")
 # =============================================================================
 #     with col5:
@@ -2935,14 +3006,15 @@ def render_match_quality_tab(df):
     with col1:
         avg_full = df['full_match_count'].mean()
         avg_partial = df['partial_match_count'].mean()
+        avg_unconfirmed = df['unconfirmed_match_count'].mean()
         mq = pd.DataFrame({
-            'Category': ['Full Match', 'Partial Match'],
-            'Avg Count': [avg_full, avg_partial]
+            'Category': ['Full Match', 'Partial Match', 'Unconfirmed Match'],
+            'Avg Count': [avg_full, avg_partial, avg_unconfirmed]
         })
-        
+
         fig_q = px.bar(mq, x='Category', y='Avg Count', text='Avg Count', template='plotly_white',
-                       title='Avg Full vs Partial Matches per Patient', color='Category',
-                       color_discrete_map={'Full Match': '#2ca02c', 'Partial Match': '#ffbb33'})
+                       title='Avg Eligible Trials per Patient by Confirmation Level',
+                       color='Category', color_discrete_map=MATCH_TIER_COLORS)
         fig_q.update_traces(texttemplate='%{text:.2f}', textposition='outside')
         fig_q.update_layout(height=350, margin=dict(l=20, r=20, t=40, b=20), showlegend=False)
         fig_q.update_yaxes(range=[0, max(mq['Avg Count'].max() * 1.3, 0.5)])
@@ -2950,13 +3022,18 @@ def render_match_quality_tab(df):
     
     with col2:
         sd = pd.DataFrame({
-            'Outcome': ['✅ Full Match', '🟡 Partial Match', '❌ No Match'],
-            'Count': [full_cnt, partial_cnt, no_match_cnt]
+            'Outcome': ['✅ Full Match', TRIAL_STATUS_PARTIAL, '🔶 Unconfirmed Match', '❌ No Match'],
+            'Count': [full_cnt, partial_cnt, unconfirmed_cnt, no_match_cnt]
         })
-        
+
         fig_s = px.pie(sd, values='Count', names='Outcome', template='plotly_white',
                        title='Patient Match Distribution', color='Outcome',
-                       color_discrete_map={'✅ Full Match': '#2ca02c', '🟡 Partial Match': '#ffbb33', '❌ No Match': '#d62728'})
+                       color_discrete_map={
+                           '✅ Full Match':        MATCH_TIER_COLORS['Full Match'],
+                           TRIAL_STATUS_PARTIAL:   MATCH_TIER_COLORS['Partial Match'],
+                           '🔶 Unconfirmed Match': MATCH_TIER_COLORS['Unconfirmed Match'],
+                           '❌ No Match':          MATCH_TIER_COLORS['No Match'],
+                       })
         fig_s.update_traces(
             textposition='inside',
             textinfo='percent+label',
@@ -3005,17 +3082,21 @@ def render_match_quality_tab(df):
             elig = filt[filt['eligible'] == 'eligible']
             
             if not elig.empty:
-                # Exclude rows with match_score=0.0 from average (legacy data or logging artifacts)
-                elig_scored = elig[elig['match_score'] > 0].copy()
-                if elig_scored.empty:
-                    elig_scored = elig.copy()
-                top = elig_scored.groupby(['nct_id', 'trial_title']).agg(
+                # Avg Score covers EVERY eligible inference for the trial,
+                # including the ones scoring 0.0. Dropping those made the
+                # average conditional on something having been confirmable,
+                # so a trial nobody could confirm anything about showed the
+                # same score as one confirmed on every criterion. The count of
+                # zero-score inferences is reported beside it instead.
+                elig = elig.copy()
+                top = elig.groupby(['nct_id', 'trial_title']).agg(
                     match_count=('inference_id', 'count'),
-                    avg_score=('match_score', 'mean')
+                    avg_score=('match_score', 'mean'),
+                    unconfirmed=('match_score', lambda s: int((s <= 0).sum())),
                 ).reset_index()
-                top.columns = ['NCT ID', 'Trial', 'Match Count', 'Avg Score']
+                top.columns = ['NCT ID', 'Trial', 'Match Count', 'Avg Score', 'Unconfirmed']
                 top = top.sort_values('Match Count', ascending=False).head(10)
-                
+
                 top['Avg Score'] = (top['Avg Score'] * 100).round(0).astype(int)
                 top = top.reset_index(drop=True)
                 top.index = top.index + 1
@@ -3024,12 +3105,17 @@ def render_match_quality_tab(df):
                              column_config={
                                  'Avg Score': st.column_config.NumberColumn(format='%d%%'),
                                  'Trial': st.column_config.TextColumn(width='large'),
+                                 'Unconfirmed': st.column_config.NumberColumn(
+                                     help='Eligible inferences scoring 0% — no criterion confirmable'),
                              })
-                
+
                 st.caption(
                     "Trials ranked by how many patients they matched (eligible). "
-                    "Avg Score reflects the mean match score across all eligible inferences for that trial. "
-                    "High match count with <100% score indicates trials where patients commonly have missing data."
+                    "Avg Score is the mean match score across ALL eligible inferences for that "
+                    "trial, including those scoring 0%. Unconfirmed counts how many of those "
+                    "inferences confirmed nothing at all: a high Unconfirmed count next to a "
+                    "high Match Count means the trial passes patients through without the "
+                    "pipeline establishing anything about their fit."
                 )
                 
             else:
@@ -3110,17 +3196,25 @@ def render_trial_explorer_tab(df):
         .drop(columns='_elig_rank')
     )
     
-    eligible_patients = (trial_dedup['eligible'] == 'eligible').sum()
-    partial_patients = ((trial_dedup['eligible'] == 'eligible') & (trial_dedup['match_score'] < 1.0)).sum()
-    full_eligible = eligible_patients - partial_patients
+    _elig_mask = trial_dedup['eligible'] == 'eligible'
+    eligible_patients = _elig_mask.sum()
+    # Split eligible by what was actually confirmed. A patient scoring 0.0 on
+    # this trial is eligible only in the sense that no disqualifier was found;
+    # counting them as a partial match asserts partial confirmation that never
+    # happened.
+    partial_patients = (_elig_mask
+                        & (trial_dedup['match_score'] > 0.0)
+                        & (trial_dedup['match_score'] < 1.0)).sum()
+    unconfirmed_patients = (_elig_mask & (trial_dedup['match_score'] <= 0.0)).sum()
+    full_eligible = eligible_patients - partial_patients - unconfirmed_patients
     not_eligible_patients = (trial_dedup['eligible'] == 'not_eligible').sum()
     total_patients = eligible_patients + not_eligible_patients
-    
+
     st.subheader(f"{selected_trial['trial_title']}")
     st.caption(f"NCT ID: {selected_nct}  |  Phase: {trial_data['trial_phase'].iloc[0]}")
-    
-    col1, col2, col3, col4 = st.columns(4)
-    
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+
     with col1:
         st.metric(
             "Total Patients Evaluated",
@@ -3137,10 +3231,17 @@ def render_trial_explorer_tab(df):
         st.metric(
             "Partial Match",
             partial_patients,
-            help="Patients eligible but with some criteria not evaluable (missing data)"
+            help="Patients eligible with SOME criteria confirmed but not all (0% < score < 100%)"
         )
-    
+
     with col4:
+        st.metric(
+            "Unconfirmed",
+            unconfirmed_patients,
+            help="Patients eligible at 0% — no disqualifier found, but no criterion confirmed either"
+        )
+
+    with col5:
         st.metric(
             "Not Eligible",
             not_eligible_patients,
@@ -3161,19 +3262,22 @@ def render_trial_explorer_tab(df):
     )
     
     def classify_trial_status(row):
-        if row['eligible'] == 'eligible':
-            if row['match_score'] >= 1.0:
-                return '✅ Eligible'
-            else:
-                return '🟡 Partial Match'
-        return '❌ Not Eligible'
-    
+        if row['eligible'] != 'eligible':
+            return TRIAL_STATUS_REJECTED
+        tier = classify_trial_score(row['match_score'])
+        if tier == 'Full Match':
+            return '✅ Eligible'
+        if tier == 'Partial Match':
+            return TRIAL_STATUS_PARTIAL
+        return TRIAL_STATUS_UNCONFIRMED
+
     patient_details['Status'] = patient_details.apply(classify_trial_status, axis=1)
     patient_details['Match Score'] = (patient_details['match_score'] * 100).round(0).astype(int)
-    
+
     status_filter = st.selectbox(
         "Filter by Status",
-        ["All", "✅ Eligible", "🟡 Partial Match", "❌ Not Eligible"],
+        ["All", "✅ Eligible", TRIAL_STATUS_PARTIAL, TRIAL_STATUS_UNCONFIRMED,
+         TRIAL_STATUS_REJECTED],
         key="trial_explorer_status_filter"
     )
     
@@ -3184,7 +3288,8 @@ def render_trial_explorer_tab(df):
         st.info("No patients match the selected status filter.")
         return
     
-    status_order = {'✅ Eligible': 0, '🟡 Partial Match': 1, '❌ Not Eligible': 2}
+    status_order = {'✅ Eligible': 0, TRIAL_STATUS_PARTIAL: 1,
+                    TRIAL_STATUS_UNCONFIRMED: 2, TRIAL_STATUS_REJECTED: 3}
     patient_details['_sort'] = patient_details['Status'].map(status_order)
     patient_details = patient_details.sort_values(
         by=['_sort', 'Match Score'],
@@ -3214,8 +3319,9 @@ def render_trial_explorer_tab(df):
     
     st.caption(
         f"{(patient_details['Status'] == '✅ Eligible').sum()} eligible · "
-        f"{(patient_details['Status'] == '🟡 Partial Match').sum()} partial · "
-        f"{(patient_details['Status'] == '❌ Not Eligible').sum()} not eligible · "
+        f"{(patient_details['Status'] == TRIAL_STATUS_PARTIAL).sum()} partial · "
+        f"{(patient_details['Status'] == TRIAL_STATUS_UNCONFIRMED).sum()} unconfirmed · "
+        f"{(patient_details['Status'] == TRIAL_STATUS_REJECTED).sum()} not eligible · "
         f"{len(patient_details)} total"
     )
     
@@ -3608,43 +3714,94 @@ def render_drift_detection_tab(df):
 # MAIN
 # ===========================================================================
 
+# Match tier vocabulary. Ordered best -> worst; every tier_order / tier_colors
+# list in this file is built from these two so a tier can never be defined in
+# one chart and dropped from another.
+MATCH_TIERS = ['Full Match', 'Partial Match', 'Unconfirmed Match', 'No Match']
+
+MATCH_TIER_COLORS = {
+    'Full Match':        '#2ca02c',
+    'Partial Match':     '#ffbb33',
+    'Unconfirmed Match': '#e67e22',
+    'No Match':          '#d62728',
+}
+
+# Per-trial status labels, same partition applied to a single trial row.
+TRIAL_STATUS_FULL        = '✅ Full Match'
+TRIAL_STATUS_PARTIAL     = '🟡 Partial Match'
+TRIAL_STATUS_UNCONFIRMED = '🔶 Unconfirmed'
+TRIAL_STATUS_REJECTED    = '❌ Not Eligible'
+
+
+def classify_trial_score(match_score) -> str:
+    """
+    Bucket one ELIGIBLE trial's match_score into its tier.
+
+    match_score is confirmed criteria / applicable criteria (File 13). A score
+    of exactly 0.0 on an eligible trial means the model confirmed NOTHING: it
+    found no disqualifier, but it also could not affirm a single criterion.
+    That is a materially different finding from a trial where 9 of 10 criteria
+    were confirmed, and lumping the two together as "Partial" hid it behind the
+    strongest example in the bucket.
+    """
+    if match_score >= 1.0:
+        return 'Full Match'
+    if match_score > 0.0:
+        return 'Partial Match'
+    return 'Unconfirmed Match'
+
+
 def enrich_match_tiers(df, trial_matches):
     """
     Enrich inferences df with per-patient match tier columns derived from trial_matches.
-    
+
     Adds columns:
-        full_match_count:    trials with eligible=True AND match_score=1.0
-        partial_match_count: trials with eligible=True AND match_score<1.0
-        match_tier:          'Full Match' | 'Partial Match' | 'No Match'
+        full_match_count:        eligible trials with match_score == 1.0
+        partial_match_count:     eligible trials with 0.0 < match_score < 1.0
+        unconfirmed_match_count: eligible trials with match_score == 0.0
+        match_tier:              'Full Match' | 'Partial Match' |
+                                 'Unconfirmed Match' | 'No Match'
+
+    'Unconfirmed Match' is its own tier, not a corner of 'Partial Match'. An
+    eligible trial scoring 0.0 cleared the disqualifier check with nothing
+    confirmable behind it; presenting it beside a 90%-confirmed trial overstates
+    what the pipeline established about the patient.
     """
     if trial_matches is None or trial_matches.empty:
         df['full_match_count'] = 0
         df['partial_match_count'] = 0
+        df['unconfirmed_match_count'] = 0
         df['match_tier'] = 'No Match'
         return df
-    
+
     eligible = trial_matches[trial_matches['eligible'] == 'eligible'].copy()
-    
-    # Count full matches (score == 1.0) and partial (score < 1.0) per inference
+
     full = eligible[eligible['match_score'] >= 1.0].groupby('inference_id').size().reset_index(name='full_match_count')
-    partial = eligible[eligible['match_score'] < 1.0].groupby('inference_id').size().reset_index(name='partial_match_count')
-    
+    partial = eligible[
+        (eligible['match_score'] > 0.0) & (eligible['match_score'] < 1.0)
+    ].groupby('inference_id').size().reset_index(name='partial_match_count')
+    unconfirmed = eligible[eligible['match_score'] <= 0.0].groupby('inference_id').size().reset_index(name='unconfirmed_match_count')
+
     df = df.merge(full, left_on='id', right_on='inference_id', how='left').drop(columns='inference_id', errors='ignore')
     df = df.merge(partial, left_on='id', right_on='inference_id', how='left').drop(columns='inference_id', errors='ignore')
-    
+    df = df.merge(unconfirmed, left_on='id', right_on='inference_id', how='left').drop(columns='inference_id', errors='ignore')
+
     df['full_match_count'] = df['full_match_count'].fillna(0).astype(int)
     df['partial_match_count'] = df['partial_match_count'].fillna(0).astype(int)
-    
-    # Tier: Full > Partial > No Match
+    df['unconfirmed_match_count'] = df['unconfirmed_match_count'].fillna(0).astype(int)
+
+    # Tier: Full > Partial > Unconfirmed > No Match
     def assign_tier(row):
         if row['full_match_count'] > 0:
             return 'Full Match'
         elif row['partial_match_count'] > 0:
             return 'Partial Match'
+        elif row['unconfirmed_match_count'] > 0:
+            return 'Unconfirmed Match'
         return 'No Match'
-    
+
     df['match_tier'] = df.apply(assign_tier, axis=1)
-    
+
     return df
 
 

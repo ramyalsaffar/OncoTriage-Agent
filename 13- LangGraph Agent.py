@@ -2126,6 +2126,99 @@ CLINICAL TRIALS:
     label_remaps = []       # audit log: criterion labels outside their vocabulary
     unevaluable_trials = []  # audit log: trials that could not be evaluated
 
+    # ── Not-applicable criteria are scored by neither party ──────────────────
+    #
+    # Section 3 of the system prompt maps a criterion whose subject matter is
+    # biologically impossible for this patient onto "not_violated" (exclusion)
+    # or "met" (inclusion). Those are the same labels a genuinely confirmed
+    # criterion carries, so a naive confirmed/total ratio counts them as
+    # evidence of fit.
+    #
+    # In oncology, inapplicable exclusions are near-universal and sex-linked:
+    # pregnancy, lactation, and contraception criteria appear on most trials
+    # and resolve to "not_violated" for every male patient. Counting them
+    # inflates match_score for male patients over female patients on the SAME
+    # trial, from criteria neither patient was actually evaluated against.
+    #
+    # A criterion that cannot apply is evidence of nothing. It is removed from
+    # the numerator AND the denominator, so the score reports the fraction of
+    # applicable criteria that were confirmed.
+    _NOT_APPLICABLE_PREFIX = "not applicable"
+
+    def _is_not_applicable_patient_value(pv) -> bool:
+        """True if patient_value marks the criterion as inapplicable to this patient."""
+        if not isinstance(pv, str):
+            return False
+        return pv.strip().lower().startswith(_NOT_APPLICABLE_PREFIX)
+
+    not_applicable_excluded = []  # audit log: criteria dropped from scoring
+
+    def _compute_match_score(inc, exc, nct_id):
+        """
+        Recompute match_score over APPLICABLE criteria only.
+
+        Returns (score, confirmed, denominator, n_not_applicable). A trial whose
+        every criterion is inapplicable has denominator 0 and scores 0.0: no
+        applicable criterion was confirmed, so nothing supports a positive score.
+        Every excluded criterion is appended to `not_applicable_excluded`.
+        """
+        confirmed = 0
+        denominator = 0
+        n_na = 0
+
+        for arm, criteria, confirming_status in (
+            ("inclusion", inc, "met"),
+            ("exclusion", exc, "not_violated"),
+        ):
+            for c in criteria:
+                pv = c.get("patient_value", "")
+                if _is_not_applicable_patient_value(pv):
+                    n_na += 1
+                    not_applicable_excluded.append({
+                        "nct_id": nct_id,
+                        "arm": arm,
+                        "criterion": str(c.get("criterion", ""))[:200],
+                        "patient_value": pv,
+                        "status": c.get("status", ""),
+                    })
+                    continue
+                denominator += 1
+                if c.get("status") == confirming_status:
+                    confirmed += 1
+
+        score = round(confirmed / denominator, 2) if denominator > 0 else 0.0
+        return score, confirmed, denominator, n_na
+
+    def _record_score(eval_result, inc, exc, nct_id):
+        """Write match_score and its provenance fields onto one evaluation."""
+        score, confirmed, denominator, n_na = _compute_match_score(inc, exc, nct_id)
+        eval_result["match_score"] = score
+        eval_result["score_confirmed"] = confirmed
+        eval_result["score_denominator"] = denominator
+        eval_result["criteria_not_applicable"] = n_na
+        if denominator == 0:
+            print(
+                f"  [Validator] {nct_id or '(no NCT ID)'}: all "
+                f"{n_na} criterion(s) inapplicable to this patient -- "
+                f"match_score 0.0 over an empty denominator."
+            )
+        return score
+
+    def _record_zero_score(eval_result, inc, exc):
+        """
+        Score fields for a trial whose score is 0.0 by verdict, not by ratio
+        (rejected, or not evaluated). Denominator/confirmed are still recorded
+        so a zero score is distinguishable from an unscored one downstream.
+        """
+        eval_result["match_score"] = 0.0
+        eval_result["score_confirmed"] = 0
+        eval_result["score_denominator"] = 0
+        eval_result["criteria_not_applicable"] = sum(
+            1 for c in list(inc) + list(exc)
+            if isinstance(c, dict)
+            and _is_not_applicable_patient_value(c.get("patient_value", ""))
+        )
+
     def _normalize_arm(criteria, allowed, arm, nct_id):
         """
         Coerce every criterion in one arm into that arm's vocabulary.
@@ -2205,7 +2298,7 @@ CLINICAL TRIALS:
                     "reason": "model returned no criteria",
                 })
             eval_result["eligible"] = "not_evaluable"
-            eval_result["match_score"] = 0.0
+            _record_zero_score(eval_result, inc, exc)
             continue
 
         # ── Step 3: disqualification check, on normalized labels ────────────
@@ -2214,13 +2307,11 @@ CLINICAL TRIALS:
 
         if has_not_met or has_violated:
             eval_result["eligible"] = "not_eligible"
-            eval_result["match_score"] = 0.0
+            _record_zero_score(eval_result, inc, exc)
 
         elif eval_result["eligible"] == "eligible":
-            # Legitimate eligible: recompute match_score
-            confirmed = sum(1 for c in inc if c.get("status") == "met") + \
-                        sum(1 for c in exc if c.get("status") == "not_violated")
-            eval_result["match_score"] = round(confirmed / total, 2)
+            # Legitimate eligible: recompute match_score over applicable criteria
+            _record_score(eval_result, inc, exc, nct_id)
 
         elif eval_result["eligible"] == "not_eligible" and remapped_here:
             # The model rejected this trial, but every disqualifying label it
@@ -2235,13 +2326,13 @@ CLINICAL TRIALS:
                 "reason": "sole disqualifier was an out-of-vocabulary label",
             })
             eval_result["eligible"] = "not_evaluable"
-            eval_result["match_score"] = 0.0
+            _record_zero_score(eval_result, inc, exc)
 
         else:
             # Model-declared "not_eligible" with no surviving disqualifier and
             # no remap, or model-declared "not_evaluable" with criteria present.
             # Verdict left as the model wrote it.
-            eval_result["match_score"] = 0.0
+            _record_zero_score(eval_result, inc, exc)
 
     if label_remaps:
         print(
@@ -2381,16 +2472,9 @@ CLINICAL TRIALS:
                 # No remaining disqualifiers: flip to eligible
                 eval_result["eligible"] = "eligible"
  
-                # Recompute match_score
-                total_criteria = len(inc) + len(exc)
-                if total_criteria > 0:
-                    confirmed = (
-                        sum(1 for c in inc if c.get("status") == "met")
-                        + sum(1 for c in exc if c.get("status") == "not_violated")
-                    )
-                    eval_result["match_score"] = round(confirmed / total_criteria, 2)
-                else:
-                    eval_result["match_score"] = 0.0
+                # Recompute match_score over applicable criteria only, by the
+                # same rule as the inline validator above.
+                _record_score(eval_result, inc, exc, eval_result.get("nct_id", ""))
  
                 # Update explanation prefix
                 original_explanation = eval_result.get("explanation", "")
@@ -2413,8 +2497,28 @@ CLINICAL TRIALS:
             f"  [Validator] Corrected {len(absent_data_corrections)} absent-data "
             f"criterion(s) across {len(set(c['nct_id'] for c in absent_data_corrections))} "
             f"trial(s). Flipped {flipped_trials} trial(s) to eligible."
-        )    
-        
+        )
+
+    # ── Report not-applicable exclusions ────────────────────────────────────
+    #
+    # Counted off the evaluations themselves rather than off
+    # `not_applicable_excluded`, because a trial rescored by the absent-data
+    # validator passes through _record_score twice and would be double-counted
+    # in that append-only audit list.
+    _na_total = sum(e.get("criteria_not_applicable", 0) for e in evaluations)
+    if _na_total:
+        _na_trials = sum(1 for e in evaluations if e.get("criteria_not_applicable", 0))
+        _na_empty = sum(
+            1 for e in evaluations
+            if e.get("criteria_not_applicable", 0) and e.get("score_denominator", 0) == 0
+        )
+        print(
+            f"  [Validator] Excluded {_na_total} not-applicable criterion(s) from "
+            f"match_score across {_na_trials} trial(s)"
+            + (f"; {_na_empty} trial(s) had no applicable criterion left."
+               if _na_empty else ".")
+        )
+
     # Sort by match score descending
     evaluations.sort(
          key=lambda x: (x.get("match_score", 0), x.get("nct_id", "")),
@@ -2535,6 +2639,13 @@ def node_finalize(state: TrialMatchState) -> dict:
         "stage_dropped": state.get("stage_dropped", 0),
         "histology_dropped": state.get("histology_dropped", 0),
         "candidates_evaluated": len(evaluations),
+        # Criteria dropped from match_score because they cannot apply to this
+        # patient (Section 3 "Not applicable"). Reported so a score computed
+        # over a shrunken denominator is never mistaken for one computed over
+        # the full criteria set.
+        "criteria_not_applicable": sum(
+            e.get("criteria_not_applicable", 0) for e in evaluations
+        ),
         "matches": matches,
         "near_misses": near_misses,
         "not_evaluable": not_evaluable,
