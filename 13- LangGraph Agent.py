@@ -164,7 +164,8 @@ class TrialMatchState(TypedDict):
     # --- Ablation Study (optional, defaults to {} = all stages active) ---
     # Controls which pipeline stages are disabled during ablation runs.
     # Keys (all default False / "hybrid" when absent):
-    #   skip_mesh_filter:      bool — skip MeSH cancer site relevance filter
+    #   skip_mesh_filter:      bool — skip BOTH MeSH uses: the Stage 3
+    #                                 relevance boost and the Stage 4 drop
     #   skip_stage_filter:     bool — skip cancer stage mismatch filter
     #   skip_histology_filter: bool — skip histology mismatch filter
     #   skip_cross_encoder:    bool — skip MedCPT cross-encoder reranking
@@ -1002,6 +1003,163 @@ def node_hybrid_retrieval(state: TrialMatchState) -> dict:
 RERANK_RRF_K = 60
 
 
+# Shape of the boost report when no boost pass ran at all. 'path' names which
+# branch was taken so the ablation and the production runs are distinguishable
+# in the logs.
+_EMPTY_BOOST_STATS = {
+    "path":            "not_run",
+    "direct_boosted":  0,
+    "pan_boosted":     0,
+    "unboosted":       0,
+    "boost_direct":    0.0,
+    "boost_pan":       0.0,
+    "rrf_spread":      0.0,
+}
+
+
+def apply_mesh_relevance_boost(top_trials: List[Dict],
+                               patient_trees: set,
+                               mesh_filter) -> Dict:
+    """Add the MeSH relevance boost to each trial's rerank_score, in place.
+
+    The cross-encoder ranks by text similarity, which treats a trial
+    explicitly targeting "Prostatic Neoplasms" the same as a generic trial
+    that mentions prostate in passing. MeSH ancestry is an authoritative
+    clinical signal that identifies disease-specific trials.
+
+    Applied at the end of Stage 3 so the boosted order propagates to the
+    Stage 4 rule filter, benchmark Tier 3 ranking, and Streamlit display.
+
+    Boost tiers (a FRACTION of the RRF spread, from 03- Config.py):
+        DIRECT MATCH:  shares MeSH C04 ancestry with the patient
+        PAN-CANCER:    targets a broad neoplasm category (depth <= 2)
+        UNMAPPABLE:    no MeSH C04 trees -> boost 0 (neutral)
+
+    Each trial keeps three fields, so ranking and gating stay separable:
+        rerank_score_raw  unboosted fused RRF score (Stage 4 gates on this)
+        mesh_boost        the additive boost, 0.0 when none applied
+        mesh_boost_tier   "direct" | "pan_cancer" | "none"
+
+    Returns a report dict (same keys as _EMPTY_BOOST_STATS). Mutates
+    top_trials and re-sorts it by boosted score.
+    """
+    stats = dict(_EMPTY_BOOST_STATS)
+
+    if not top_trials:
+        stats["path"] = "no_trials"
+        return stats
+
+    if not patient_trees:
+        # Patient side unmappable — the same conservative stance the MeSH
+        # filter takes. Every trial keeps its raw score.
+        stats["path"] = "no_patient_trees"
+        stats["unboosted"] = len(top_trials)
+        return stats
+
+    # Calibrate boost from the batch's own RRF score distribution
+    rr_scores = [t.get("rerank_score_raw", t.get("rerank_score", 0.0))
+                 for t in top_trials]
+    rr_spread = max(rr_scores) - min(rr_scores)
+
+    if rr_spread > 1e-6:
+        stats["path"] = "spread"
+        boost_direct = rr_spread * MESH_BOOST_DIRECT_FRACTION
+        boost_pan    = rr_spread * MESH_BOOST_PAN_FRACTION
+    else:
+        # Degenerate distribution (every trial tied): a fraction of the
+        # spread would be exactly 0, so fall back to absolute floors.
+        stats["path"] = "degenerate_spread_floor"
+        boost_direct = MESH_BOOST_DIRECT_FLOOR
+        boost_pan    = MESH_BOOST_PAN_FLOOR
+
+    for trial_obj in top_trials:
+        trial = trial_obj["trial"]
+        trial_trees = mesh_filter.trial_mesh_trees(trial)
+
+        if not trial_trees:
+            stats["unboosted"] += 1
+            continue
+
+        if mesh_filter._is_pan_cancer(trial_trees):
+            trial_obj["rerank_score"] += boost_pan
+            trial_obj["mesh_boost"] = boost_pan
+            trial_obj["mesh_boost_tier"] = "pan_cancer"
+            stats["pan_boosted"] += 1
+            continue
+
+        has_ancestry = False
+        for pt in patient_trees:
+            for tt in trial_trees:
+                if pt.startswith(tt) or tt.startswith(pt):
+                    has_ancestry = True
+                    break
+            if has_ancestry:
+                break
+
+        if has_ancestry:
+            trial_obj["rerank_score"] += boost_direct
+            trial_obj["mesh_boost"] = boost_direct
+            trial_obj["mesh_boost_tier"] = "direct"
+            stats["direct_boosted"] += 1
+        else:
+            stats["unboosted"] += 1
+
+    # Re-sort after boost to update ranking order
+    top_trials.sort(
+        key=lambda x: (x.get("rerank_score", 0), x["trial"]["nct_id"]),
+        reverse=True,
+    )
+
+    stats["boost_direct"] = float(boost_direct)
+    stats["boost_pan"]    = float(boost_pan)
+    stats["rrf_spread"]   = float(rr_spread)
+    return stats
+
+
+def unboosted_score(trial_obj: Dict, default: float = -999.0) -> float:
+    """Rerank score with the MeSH boost excluded.
+
+    rerank_score_raw is written by Stage 3 for every trial. The fallback to
+    rerank_score covers trial dicts built elsewhere (older rows replayed
+    through the filter, hand-built fixtures) — in those the two are equal
+    because no boost was ever added.
+    """
+    raw = trial_obj.get("rerank_score_raw")
+    if raw is None:
+        raw = trial_obj.get("rerank_score", default)
+    return raw
+
+
+def apply_quality_gate(trials: List[Dict],
+                       percentile: float = None,
+                       floor: float = None) -> tuple:
+    """Drop weak trials using a percentile of the UNBOOSTED rerank score.
+
+    Gating on the boosted score would measure whether a trial received a
+    MeSH boost rather than whether it is any good: with a boost of 0.25 of
+    the spread the whole boosted cohort sits above the 25th percentile by
+    construction, so the survivors are the boosted set and the trials the
+    MeSH filter deliberately KEPT as unmappable get cut here instead. That
+    would be a second, uncounted MeSH filter. Gating on rerank_score_raw
+    keeps the boost a ranking signal only.
+
+    Returns (kept, threshold). Input order is preserved; callers sort by the
+    boosted score before calling.
+    """
+    if percentile is None:
+        percentile = QUALITY_THRESHOLD_PERCENTILE
+    if floor is None:
+        floor = RERANK_SCORE_THRESHOLD
+
+    if not trials:
+        return [], floor
+
+    raw_scores = [unboosted_score(t) for t in trials]
+    threshold = max(float(np.percentile(raw_scores, percentile)), floor)
+    kept = [t for t in trials if unboosted_score(t) >= threshold]
+    return kept, threshold
+
+
 def node_cross_encoder_rerank(state: dict) -> dict:
     """
     Stage 3: Multi-query cross-encoder reranking with RRF fusion.
@@ -1037,8 +1195,14 @@ def node_cross_encoder_rerank(state: dict) -> dict:
             },
         }
     
-    # --- Ablation: skip cross-encoder ---
+    # --- Ablation flags (read once) ---
     _ablation = state.get("ablation_flags") or {}
+    # skip_mesh_filter removes BOTH MeSH uses: the Stage 3 boost here and the
+    # Stage 4 hard drop. Disabling only the drop would leave the ablation row
+    # confounded, since the boost still reorders (and re-gates) the pool.
+    _skip_mesh_boost = _ablation.get("skip_mesh_filter", False)
+
+    # --- Ablation: skip cross-encoder ---
     if _ablation.get("skip_cross_encoder", False):
         # Pass hybrid results through to rule filter without reranking.
         # Uses fusion_score (from Stage 2 RRF) as stand-in for rerank_score.
@@ -1058,8 +1222,16 @@ def node_cross_encoder_rerank(state: dict) -> dict:
             key=lambda t: t.get("fusion_score", 0.0),
             reverse=True,
         )
+        # No boost is applied on this path, so raw == boosted and the Stage 4
+        # quality gate reads the same number it always did.
         passthrough = [
-            {"trial": t["trial"], "rerank_score": t.get("fusion_score", 0.0)}
+            {
+                "trial":            t["trial"],
+                "rerank_score":     t.get("fusion_score", 0.0),
+                "rerank_score_raw": t.get("fusion_score", 0.0),
+                "mesh_boost":       0.0,
+                "mesh_boost_tier":  "none",
+            }
             for t in sorted_trials[:TOP_K_CANDIDATES]
         ]
         return {
@@ -1154,95 +1326,46 @@ def node_cross_encoder_rerank(state: dict) -> dict:
          reverse=True
      )
 
+    # rerank_score is the ranking score and may be boosted below.
+    # rerank_score_raw is the untouched fused score the Stage 4 quality gate
+    # is computed on; mesh_boost carries the difference between the two.
     top_trials = [
         {
-            "trial": trials[trial_idx]["trial"],
-            "rerank_score": float(rrf_score),
+            "trial":            trials[trial_idx]["trial"],
+            "rerank_score":     float(rrf_score),
+            "rerank_score_raw": float(rrf_score),
+            "mesh_boost":       0.0,
+            "mesh_boost_tier":  "none",
         }
         for trial_idx, rrf_score in sorted_by_rrf[:TOP_K_CANDIDATES]
     ]
 
     # -----------------------------------------------------------------
-    # MeSH Relevance Boost: reward trials with confirmed cancer-site match
-    # -----------------------------------------------------------------
-    # The cross-encoder ranks by text similarity, which treats a trial
-    # explicitly targeting "Prostatic Neoplasms" the same as a generic
-    # trial that mentions prostate in passing. MeSH ancestry is an
-    # authoritative clinical signal that identifies disease-specific trials.
-    #
-    # Applied here (end of Stage 3) rather than Stage 4 so the boosted
-    # scores propagate to BOTH:
-    #   - Stage 4 rule filter (affects which trials reach GPT-4o)
-    #   - Benchmark Tier 3 ranking (affects trec_eval metrics)
-    #   - Production ranking (affects display order in Streamlit)
-    #
-    # Boost tiers (additive to rerank_score):
-    #   DIRECT MATCH:  Trial shares MeSH C04 ancestry with patient.
-    #                  Boost = 75% of RRF score spread.
-    #   PAN-CANCER:    Trial targets broad neoplasm category (depth <= 2).
-    #                  Boost = 25% of RRF score spread.
-    #   UNMAPPABLE:    Trial has no MeSH C04 trees. Boost = 0 (neutral).
-    #
-    # Boost magnitude is calibrated to the actual RRF score range so it
-    # reshuffles within the distribution rather than overwhelming the
-    # cross-encoder signal. A trial with strong text match AND MeSH
-    # ancestry ranks highest.
+    # MeSH Relevance Boost (see apply_mesh_relevance_boost)
     # -----------------------------------------------------------------
     patient_trees = set()
-    
-    mesh_boosted = 0
-    pan_boosted = 0
-    boost_direct = 0.0
-    boost_pan = 0.0
 
-    if _MESH_FILTER is not None and top_trials:
+    if _skip_mesh_boost:
+        # The MeSH ablation must remove BOTH uses of MeSH, otherwise the
+        # no_mesh_filter row still carries the boost's effect on ranking.
+        print("  MeSH relevance boost [ablation_skipped]: skip_mesh_filter set")
+    elif _MESH_FILTER is None:
+        print("  MeSH relevance boost [no_mesh_filter]: filter unavailable")
+    elif top_trials:
         # Resolve patient MeSH trees (same call as Stage 4 uses)
         patient_data = state["patient_data"]
         conditions = patient_data.get("conditions", [])
         patient_trees = _MESH_FILTER.patient_mesh_trees(conditions, _CANCER_REGISTRY)
 
-        if patient_trees:
-            # Calibrate boost from actual RRF score distribution
-            rr_scores = [t.get("rerank_score", 0.0) for t in top_trials]
-            rr_spread = max(rr_scores) - min(rr_scores)
-
-            if rr_spread > 1e-6:
-                boost_direct = rr_spread * 0.75
-                boost_pan = rr_spread * 0.25
-            else:
-                boost_direct = 0.005
-                boost_pan = 0.002
-
-            for trial_obj in top_trials:
-                trial = trial_obj["trial"]
-                trial_trees = _MESH_FILTER.trial_mesh_trees(trial)
-
-                if not trial_trees:
-                    continue
-
-                if _MESH_FILTER._is_pan_cancer(trial_trees):
-                    trial_obj["rerank_score"] += boost_pan
-                    pan_boosted += 1
-                    continue
-
-                has_ancestry = False
-                for pt in patient_trees:
-                    for tt in trial_trees:
-                        if pt.startswith(tt) or tt.startswith(pt):
-                            has_ancestry = True
-                            break
-                    if has_ancestry:
-                        break
-
-                if has_ancestry:
-                    trial_obj["rerank_score"] += boost_direct
-                    mesh_boosted += 1
-
-            # Re-sort after boost to update ranking order
-            top_trials.sort(
-                key=lambda x: (x.get("rerank_score", 0), x["trial"]["nct_id"]),
-                reverse=True,
-            )
+        boost_stats = apply_mesh_relevance_boost(
+            top_trials, patient_trees, _MESH_FILTER
+        )
+        print(f"  MeSH relevance boost [{boost_stats['path']}]: "
+              f"direct={boost_stats['direct_boosted']} "
+              f"(+{boost_stats['boost_direct']:.5f}) "
+              f"pan={boost_stats['pan_boosted']} "
+              f"(+{boost_stats['boost_pan']:.5f}) "
+              f"unboosted={boost_stats['unboosted']}")
 
     # -----------------------------------------------------------------
     # Logging
@@ -1280,7 +1403,10 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
         - Cancer site: patient cancer type must match trial cancer type (MeSH)  # NEW
         - Age: patient age must fall within trial's min/max age
         - Sex: patient sex must match trial's sex requirement
-        - Quality threshold: drop trials with rerank_score <= RERANK_SCORE_THRESHOLD
+        - Quality threshold: drop trials whose UNBOOSTED rerank score falls
+          below the QUALITY_THRESHOLD_PERCENTILE of the surviving pool
+          (hard floor RERANK_SCORE_THRESHOLD). Computed on rerank_score_raw
+          so the gate measures trial quality, not MeSH boost membership.
         - Cost cap: limit to MAX_TRIALS_FOR_EVALUATION candidates
     """
     start = time.time()
@@ -1294,21 +1420,31 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
     patient_age = demographics.get("age")
     patient_sex = demographics.get("sex", "unknown").lower()
 
+    # --- Ablation flags (read once, not per-trial) ---
+    _ablation = state.get("ablation_flags") or {}
+    _skip_mesh      = _ablation.get("skip_mesh_filter", False)
+    _skip_stage     = _ablation.get("skip_stage_filter", False)
+    _skip_histology = _ablation.get("skip_histology_filter", False)
+
     # --- Get patient's MeSH cancer site tree numbers ---
     mesh_dropped = 0
     histology_dropped = 0
     patient_trees = set()
     patient_histology = set()
     if _MESH_FILTER is not None:
-        
+
         patient_trees   = state.get("patient_trees") or set()
         patient_histology = extract_patient_histology(conditions)
-        
-        if patient_trees:
-            print(f"  MeSH patient trees: {patient_trees}")
-        else:
-            print("  MeSH: no patient cancer trees resolved — cancer site filter skipped")
-    
+
+        # Under the ablation Stage 3 never resolves the trees, so an empty set
+        # here means "ablated", not "unmappable" — the ablation line below
+        # says which, so do not also claim the trees were unresolvable.
+        if not _skip_mesh:
+            if patient_trees:
+                print(f"  MeSH patient trees: {patient_trees}")
+            else:
+                print("  MeSH: no patient cancer trees resolved — cancer site filter skipped")
+
     # --- Extract patient cancer stage ---
     patient_stage = extract_patient_stage(
         conditions,
@@ -1322,14 +1458,9 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
     else:
         print("  Patient cancer stage: unknown — stage filter skipped")
     
-    # --- Ablation flags (read once, not per-trial) ---
-    _ablation = state.get("ablation_flags") or {}
-    _skip_mesh      = _ablation.get("skip_mesh_filter", False)
-    _skip_stage     = _ablation.get("skip_stage_filter", False)
-    _skip_histology = _ablation.get("skip_histology_filter", False)
-
     if _skip_mesh:
-        print("  [Ablation] MeSH cancer site filter SKIPPED")
+        print("  [Ablation] MeSH cancer site filter SKIPPED "
+              "(Stage 3 relevance boost was skipped too)")
     if _skip_stage:
         print("  [Ablation] Cancer stage filter SKIPPED")
     if _skip_histology:
@@ -1381,22 +1512,16 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
 
         filtered.append(trial_obj)
 
-    # Sort by rerank_score (highest first)
+    # Sort by rerank_score (highest first) — this IS the boosted score, since
+    # ranking order is what the MeSH boost exists to influence.
     filtered.sort(
          key=lambda x: (x.get("rerank_score", 0), x["trial"]["nct_id"]),
          reverse=True
      )
 
-    # Dynamic quality threshold: percentile-based with hard floor
-    if filtered:
-        rerank_scores = [t.get("rerank_score", -999) for t in filtered]
-        dynamic_threshold = max(np.percentile(rerank_scores, 25), RERANK_SCORE_THRESHOLD)
-        quality_filtered = [
-            t for t in filtered
-            if t.get("rerank_score", -999) >= dynamic_threshold
-        ]
-    else:
-        quality_filtered = []
+    # Dynamic quality threshold: percentile of the UNBOOSTED score, hard floor.
+    quality_filtered, dynamic_threshold = apply_quality_gate(filtered)
+    quality_dropped = len(filtered) - len(quality_filtered)
 
     candidates_after_quality = len(quality_filtered)
 
@@ -1412,6 +1537,7 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
         f"{f' (MeSH dropped {mesh_dropped})' if mesh_dropped else ''}"
         f"{f' (stage dropped {stage_dropped})' if stage_dropped else ''}"
         f"{f' (histology dropped {histology_dropped})' if histology_dropped else ''}"
+        f"{f' (quality dropped {quality_dropped} @ raw >= {dynamic_threshold:.5f})' if quality_dropped else ''}"
     )
 
     return {
@@ -2247,17 +2373,29 @@ def node_finalize(state: TrialMatchState) -> dict:
     _ACTIONABLE = frozenset({"eligible"})
     _UNEVALUABLE = frozenset({"not_evaluable"})
 
-    # Build rerank_score lookup from filtered_trials by nct_id
+    # Build score lookup from filtered_trials by nct_id.
+    # The boosted score, the unboosted score and the boost itself are all
+    # carried through so the boost's effect on ranking stays measurable
+    # downstream (trial_matches.mesh_boost) instead of being folded away.
     _rerank_lookup = {
-        t["trial"]["nct_id"]: t.get("rerank_score", None)
+        t["trial"]["nct_id"]: (
+            t.get("rerank_score", None),
+            t.get("rerank_score_raw", None),
+            t.get("mesh_boost", 0.0),
+            t.get("mesh_boost_tier", "none"),
+        )
         for t in state.get("filtered_trials", [])
         if "trial" in t and "nct_id" in t["trial"]
     }
 
-    # Merge rerank_score and trial_number into each evaluation
+    # Merge scores and trial_number into each evaluation
     for rank_pos, e in enumerate(evaluations, start=1):
         nct_id = e.get("nct_id", "")
-        e["rerank_score"] = _rerank_lookup.get(nct_id)
+        _scores = _rerank_lookup.get(nct_id, (None, None, None, None))
+        e["rerank_score"]     = _scores[0]
+        e["rerank_score_raw"] = _scores[1]
+        e["mesh_boost"]       = _scores[2]
+        e["mesh_boost_tier"]  = _scores[3]
         e["trial_number"] = rank_pos
 
     matches = [e for e in evaluations if e.get("eligible") in _ACTIONABLE]

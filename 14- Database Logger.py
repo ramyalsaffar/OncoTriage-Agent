@@ -107,6 +107,9 @@ CREATE TABLE IF NOT EXISTS trial_matches (
     trial_phase TEXT,
     trial_number INTEGER,
     rerank_score REAL,
+    rerank_score_raw REAL,
+    mesh_boost REAL,
+    mesh_boost_tier TEXT,
     match_score REAL,
     eligible TEXT,
     explanation TEXT,
@@ -114,6 +117,26 @@ CREATE TABLE IF NOT EXISTS trial_matches (
     FOREIGN KEY (inference_id) REFERENCES inferences(id)
 )
 ''')
+
+
+# Schema migration for the trial_matches table (same reasoning as above).
+#
+# rerank_score stays the BOOSTED ranking score, so historical rows keep their
+# meaning. The unboosted score and the MeSH boost are recorded separately so
+# the boost's effect on ranking can be measured rather than inferred.
+TRIAL_MATCH_COLUMN_ADDITIONS = {
+    "rerank_score_raw": "REAL",   # fused rerank score before the MeSH boost
+    "mesh_boost":       "REAL",   # additive boost, 0.0 when no tier matched
+    "mesh_boost_tier":  "TEXT",   # "direct" | "pan_cancer" | "none"
+}
+
+_existing_trial_match_columns = {
+    row[1] for row in cursor.execute("PRAGMA table_info(trial_matches)")
+}
+for _column, _sql_type in TRIAL_MATCH_COLUMN_ADDITIONS.items():
+    if _column not in _existing_trial_match_columns:
+        cursor.execute(f"ALTER TABLE trial_matches ADD COLUMN {_column} {_sql_type}")
+        print(f"Schema migration: added trial_matches.{_column}")
 
 
 #------------------------------------------------------------------------------
@@ -326,8 +349,9 @@ def log_inference(result: Dict, patient_data: Dict):
             cursor.execute('''
                 INSERT INTO trial_matches (
                     inference_id, nct_id, trial_title, trial_phase,
-                    trial_number, rerank_score, match_score, eligible, explanation, criterion_details
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    trial_number, rerank_score, rerank_score_raw, mesh_boost, mesh_boost_tier,
+                    match_score, eligible, explanation, criterion_details
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 inference_id,
                 match.get("nct_id", ""),
@@ -335,6 +359,9 @@ def log_inference(result: Dict, patient_data: Dict):
                 match.get("phase", ""),
                 match.get("trial_number"),
                 match.get("rerank_score"),
+                match.get("rerank_score_raw"),
+                match.get("mesh_boost"),
+                match.get("mesh_boost_tier"),
                 match.get("match_score", 0.0),
                 match.get("eligible", "not_eligible"),
                 match.get("explanation", ""),

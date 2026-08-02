@@ -218,7 +218,10 @@ ABLATION_CONFIGS = [
     },
     {
         "name": "no_mesh_filter",
-        "description": "MeSH cancer site filter disabled",
+        # skip_mesh_filter removes BOTH MeSH uses: the Stage 3 relevance boost
+        # and the Stage 4 hard drop. Disabling only the drop left this row
+        # confounded, because the boost still reordered the pool.
+        "description": "MeSH cancer site filter disabled (Stage 3 boost + Stage 4 drop)",
         "flags": {
             "skip_mesh_filter": True,
             "skip_stage_filter": False,

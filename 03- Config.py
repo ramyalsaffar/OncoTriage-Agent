@@ -46,9 +46,40 @@ trial_dict = {"condition": "neoplasms",
               "max_trials": 25000}
 
 # Trials re-rank score
-# dropping below threshold because they have weak relevance 
+# dropping below threshold because they have weak relevance
 # High End ~+10, Neutral (0.0), Low End ~-25.0
 RERANK_SCORE_THRESHOLD = -10
+
+
+# MeSH relevance boost (end of Stage 3, cross-encoder rerank)
+#------------------------------------------------------------
+# Expressed as a FRACTION of the RRF score spread (max - min) inside the
+# reranked batch, so the boost scales with the batch's own distribution.
+#
+# Both tiers are equal: one graded relevance signal instead of a 3-to-1 split.
+# The previous direct-match value of 0.75 moved a trial three quarters of the
+# whole range, so a bottom-ranked same-site trial landed level with the
+# top-ranked trial from another site and the cross-encoder stopped affecting
+# order at all. At 0.25 a boost moves a trial about a quarter of the range.
+#
+# HOLDING VALUE: chosen to keep the boost inside the distribution, not tuned
+# against a labelled benchmark. The boost is recorded per trial
+# (trial_matches.mesh_boost) so its effect on ranking can be measured.
+MESH_BOOST_DIRECT_FRACTION = 0.25   # trial shares MeSH C04 ancestry with the patient
+MESH_BOOST_PAN_FRACTION    = 0.25   # trial targets a broad neoplasm category (depth <= 2)
+
+# Absolute fallbacks used only when the RRF spread is degenerate (every trial
+# tied), where a fraction of the spread would be exactly 0.
+MESH_BOOST_DIRECT_FLOOR = 0.005
+MESH_BOOST_PAN_FLOOR    = 0.005
+
+
+# Stage 4 dynamic quality gate
+#-----------------------------
+# Percentile of the UNBOOSTED rerank score below which a trial is dropped.
+# Computed on rerank_score_raw, never on the MeSH-boosted score: gating on the
+# boosted score would make the gate a second, uncounted MeSH filter.
+QUALITY_THRESHOLD_PERCENTILE = 25
 
 
 # Limiting the number of trials sent to GPT
