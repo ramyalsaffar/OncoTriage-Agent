@@ -10,7 +10,7 @@ Stage 2: Hybrid Retrieval: BM25 + Vector with RRF fusion. Vector retry with fall
 Stage 3: Cross-Encoder: Multi-query MedCPT cross-encoder with RRF fusion across queries. Stable argsort for determinism. 
 Stage 4: Rule-Based Filter: Rule filters (MeSH site, stage, histology, age, sex) + dynamic quality threshold + cost cap.
 Stage 5: GPT-4o Evaluation: GPT-4o single-call criterion-level evaluation. JSON parse retry loop. Inline normalization and score recomputation.
-Stage 6: Final Ranking: Split eligible/not_eligible, normalize labels, assemble output.
+Stage 6: Final Ranking: Split eligible/not_eligible/not_evaluable, normalize labels, assemble output.
 
 Graph topology: conditional edges for empty results, retry loop, error handler.
 
@@ -150,6 +150,9 @@ class TrialMatchState(TypedDict):
     gpt4o_prompt: str                           # Prompt sent to matching model
     gpt4o_input_tokens: int
     gpt4o_output_tokens: int
+    cross_vocab_remaps: int                     # Criterion labels resolved to not_evaluable
+                                                # because the model used the other arm's
+                                                # vocabulary (or returned a non-object entry)
 
     # --- Stage 6: Final Output ---
     result: Dict                                # Complete pipeline output
@@ -1549,10 +1552,20 @@ EXCLUSION CRITERIA use exactly one status:
 "violated"        Explicit patient data confirms the patient HAS the excluded condition. Requires quotable evidence.
 "not_evaluable"   The patient record does not contain sufficient information. Never disqualifying.
 
+THE TWO VOCABULARIES ARE DISJOINT AND NON-INTERCHANGEABLE.
+
+An inclusion criterion may ONLY be "met", "not_met", or "not_evaluable". It may NEVER be "violated" or "not_violated".
+An exclusion criterion may ONLY be "not_violated", "violated", or "not_evaluable". It may NEVER be "met" or "not_met".
+
+A status drawn from the wrong vocabulary is not a stronger or weaker form of the correct one. It carries no meaning and will be discarded as "not_evaluable". If you are tempted to write "violated" on an inclusion criterion, the criterion you mean is "not_met"; write that instead.
+
 TRIAL-LEVEL CLASSIFICATION:
 
 "eligible"        No disqualifying evidence was found.
 "not_eligible"    At least one inclusion criterion is "not_met" OR at least one exclusion criterion is "violated".
+"not_evaluable"   The trial's eligibility criteria text is empty, contains no parseable criteria, or is otherwise impossible to evaluate. Return empty inclusion_criteria and exclusion_criteria arrays. THIS IS NOT A REJECTION -- it records that the trial could not be assessed, which is different from assessing it and finding a disqualifier.
+
+Empty inclusion_criteria and exclusion_criteria arrays are permitted ONLY with "not_evaluable". An "eligible" or "not_eligible" trial MUST list every criterion it evaluated. Never return empty arrays to signal a rejection.
 
 NOT APPLICABLE CRITERIA:
 A criterion is "Not applicable" ONLY when its subject matter is biologically or logically impossible for this patient — the criterion cannot ever apply regardless of any test, treatment, or future event. Examples: reproductive criteria for the opposite sex, pediatric criteria for adults, menopausal criteria for males.
@@ -1695,12 +1708,15 @@ match_score: always 0.0
 
 inclusion_criteria and exclusion_criteria:
     For ALL trials (both "eligible" and "not_eligible"): list ALL evaluated criteria with criterion, patient_value, status.
+    For "not_evaluable" trials only: both arrays are empty.
+    Every status MUST come from that criterion's own vocabulary (Section 1).
 
 patient_value: exact data point/s from patient record, OR "Not in patient record", OR "Not applicable -- [reason]". No interpretive statements.
 
 explanation MUST be written BEFORE eligible and determines it:
     For "eligible" trials: begin with "No known disqualifiers."
     For "not_eligible" trials: begin with "Known disqualifier:" then quote the specific patient data.
+    For "not_evaluable" trials: begin with "Not evaluable:" then state what was missing from the trial's criteria text.
 
 JSON template:
 [
@@ -1853,50 +1869,161 @@ CLINICAL TRIALS:
                 break
     
     # ── Inline parsing: normalize labels, consistency check, recompute score ──
+    #
+    # ORDER IS LOAD-BEARING. Criterion-label normalization runs FIRST, on every
+    # trial, on every trial-level branch. Only then is the disqualification
+    # check applied.
+    #
+    # The disqualification check scans one vocabulary per arm: "not_met" on
+    # inclusions, "violated" on exclusions. A cross-vocabulary label -- e.g.
+    # "violated" written on an INCLUSION criterion -- is matched by neither
+    # scan. Running the check first therefore let such a trial pass as
+    # "eligible" while the criterion was stored with a disqualifying label:
+    # a record that is internally contradictory and a clinical false positive.
+    # Normalizing first removes that state entirely.
+
+    # Per-arm vocabularies (Section 1 of the system prompt). Disjoint by
+    # construction, so a status from the wrong list is not a disguised
+    # disqualifier -- it is uninterpretable output.
+    _INCLUSION_STATUSES = frozenset({"met", "not_met", "not_evaluable"})
+    _EXCLUSION_STATUSES = frozenset({"not_violated", "violated", "not_evaluable"})
+
+    _TRIAL_LEVEL_LABELS = ("eligible", "not_eligible", "not_evaluable")
+
+    label_remaps = []       # audit log: criterion labels outside their vocabulary
+    unevaluable_trials = []  # audit log: trials that could not be evaluated
+
+    def _normalize_arm(criteria, allowed, arm, nct_id):
+        """
+        Coerce every criterion in one arm into that arm's vocabulary.
+
+        A status outside `allowed` resolves to "not_evaluable" rather than to
+        the nearest same-meaning label in the correct vocabulary. Guessing the
+        model's intent would let an unparseable label disqualify a patient with
+        no quotable evidence behind it, which constraint C5 forbids.
+
+        Non-dict entries are dropped: nothing downstream can read them.
+
+        Returns the cleaned list. Every change is appended to `label_remaps`.
+        """
+        cleaned = []
+        for c in criteria:
+            if not isinstance(c, dict):
+                label_remaps.append({
+                    "nct_id": nct_id,
+                    "arm": arm,
+                    "criterion": str(c)[:200],
+                    "original_status": None,
+                    "corrected_status": None,
+                    "reason": "criterion entry is not an object -- dropped",
+                })
+                continue
+
+            status = c.get("status", "")
+            if status not in allowed:
+                label_remaps.append({
+                    "nct_id": nct_id,
+                    "arm": arm,
+                    "criterion": str(c.get("criterion", ""))[:200],
+                    "original_status": status,
+                    "corrected_status": "not_evaluable",
+                    "reason": f"status not in {arm} vocabulary",
+                })
+                c["status"] = "not_evaluable"
+
+            cleaned.append(c)
+        return cleaned
+
     for eval_result in evaluations:
-        
+        nct_id = eval_result.get("nct_id", "")
+
         # Normalize unexpected trial-level labels
-        if eval_result.get("eligible") not in ("eligible", "not_eligible"):
+        if eval_result.get("eligible") not in _TRIAL_LEVEL_LABELS:
             eval_result["eligible"] = "not_eligible"
 
         inc = eval_result.get("inclusion_criteria", [])
         exc = eval_result.get("exclusion_criteria", [])
+        inc = inc if isinstance(inc, list) else []
+        exc = exc if isinstance(exc, list) else []
+
+        # ── Step 1: label normalization ─────────────────────────────────────
+        # Unconditional. Runs before the verdict logic and on all three
+        # trial-level branches, so no branch can store an out-of-vocabulary
+        # criterion status.
+        remaps_before = len(label_remaps)
+        inc = _normalize_arm(inc, _INCLUSION_STATUSES, "inclusion", nct_id)
+        exc = _normalize_arm(exc, _EXCLUSION_STATUSES, "exclusion", nct_id)
+        eval_result["inclusion_criteria"] = inc
+        eval_result["exclusion_criteria"] = exc
+        remapped_here = len(label_remaps) > remaps_before
+
         total = len(inc) + len(exc)
 
-        if eval_result["eligible"] == "eligible":
-            if total == 0:
-                # Mode A: empty arrays = not_eligible format, wrong label
-                eval_result["eligible"] = "not_eligible"
-                eval_result["match_score"] = 0.0
-            else:
-                # Mode B: check criteria for disqualifying statuses
-                has_not_met = any(c.get("status") == "not_met" for c in inc)
-                has_violated = any(c.get("status") == "violated" for c in exc)
-                if has_not_met or has_violated:
-                    eval_result["eligible"] = "not_eligible"
-                    eval_result["match_score"] = 0.0
-                else:
-                    # Enforce: "Not in patient record" cannot be "met" or "not_violated"
-                    for c in inc:
-                        if c.get("status") == "violated":
-                            c["status"] = "not_met"
-                        elif c.get("status") == "not_violated":
-                            c["status"] = "not_evaluable"
-                    for c in exc:
-                        if c.get("status") == "met":
-                            c["status"] = "not_violated"
-                        elif c.get("status") == "not_met":
-                            c["status"] = "violated"
-
-                    # Legitimate eligible: recompute match_score
-                    confirmed = sum(1 for c in inc if c.get("status") == "met") + \
-                                sum(1 for c in exc if c.get("status") == "not_violated")
-                    eval_result["match_score"] = round(confirmed / total, 2)
-
-        elif eval_result["eligible"] == "not_eligible":
+        # ── Step 2: no criteria returned ────────────────────────────────────
+        # A trial the model returned with no criteria at all was not evaluated.
+        # That is NOT a rejection: recording it as "not_eligible" reports a
+        # verdict the model never reached. It gets its own trial-level outcome
+        # so non-evaluation is counted instead of masquerading as a rejection.
+        if total == 0:
+            if eval_result["eligible"] != "not_evaluable":
+                unevaluable_trials.append({
+                    "nct_id": nct_id,
+                    "original_label": eval_result["eligible"],
+                    "reason": "model returned no criteria",
+                })
+            eval_result["eligible"] = "not_evaluable"
             eval_result["match_score"] = 0.0
-    
-    
+            continue
+
+        # ── Step 3: disqualification check, on normalized labels ────────────
+        has_not_met = any(c.get("status") == "not_met" for c in inc)
+        has_violated = any(c.get("status") == "violated" for c in exc)
+
+        if has_not_met or has_violated:
+            eval_result["eligible"] = "not_eligible"
+            eval_result["match_score"] = 0.0
+
+        elif eval_result["eligible"] == "eligible":
+            # Legitimate eligible: recompute match_score
+            confirmed = sum(1 for c in inc if c.get("status") == "met") + \
+                        sum(1 for c in exc if c.get("status") == "not_violated")
+            eval_result["match_score"] = round(confirmed / total, 2)
+
+        elif eval_result["eligible"] == "not_eligible" and remapped_here:
+            # The model rejected this trial, but every disqualifying label it
+            # wrote was out of vocabulary and Step 1 resolved them all away.
+            # Keeping "not_eligible" would store a rejection with nothing left
+            # to justify it; promoting to "eligible" would assert a match the
+            # model never made. Neither verdict is supported, so the trial is
+            # recorded as not evaluated.
+            unevaluable_trials.append({
+                "nct_id": nct_id,
+                "original_label": "not_eligible",
+                "reason": "sole disqualifier was an out-of-vocabulary label",
+            })
+            eval_result["eligible"] = "not_evaluable"
+            eval_result["match_score"] = 0.0
+
+        else:
+            # Model-declared "not_eligible" with no surviving disqualifier and
+            # no remap, or model-declared "not_evaluable" with criteria present.
+            # Verdict left as the model wrote it.
+            eval_result["match_score"] = 0.0
+
+    if label_remaps:
+        print(
+            f"  [Validator] Remapped {len(label_remaps)} out-of-vocabulary criterion "
+            f"label(s) to not_evaluable across "
+            f"{len(set(r['nct_id'] for r in label_remaps))} trial(s)."
+        )
+    if unevaluable_trials:
+        print(
+            f"  [Validator] {len(unevaluable_trials)} trial(s) recorded as "
+            f"not_evaluable (not rejections): "
+            f"{', '.join(sorted(set(t['reason'] for t in unevaluable_trials)))}."
+        )
+
+
     # ── Absent-data validator: catch GPT-4o absent-data disqualifications ──
     #
     # GPT-4o sometimes classifies criteria as "not_met" or "violated" when
@@ -2067,10 +2194,11 @@ CLINICAL TRIALS:
     return {
         "evaluations": evaluations,
         "gpt4o_retries": retry_count,
-        "gpt4o_raw_response": response_text,    
+        "gpt4o_raw_response": response_text,
         "gpt4o_prompt": prompt,
         "gpt4o_input_tokens": input_tokens,
         "gpt4o_output_tokens": output_tokens,
+        "cross_vocab_remaps": len(label_remaps),
         "error": "",  # Clear error on success
         "stage_timings": {**state.get("stage_timings", {}), "gpt4o_evaluation": round(prior_gpt4o_time + elapsed, 3)}
     }
@@ -2080,19 +2208,23 @@ def node_finalize(state: TrialMatchState) -> dict:
     """
     Stage 6: Assemble final output with pipeline metadata.
 
-    Splits evaluations into two groups based on GPT-4o binary classification:
+    Splits evaluations into three groups based on the trial-level classification:
 
-      matches:      "eligible"     — no known disqualifiers, pre-screening candidate
-      near_misses:  "not_eligible" — explicit disqualifying evidence found
+      matches:        "eligible"      — no known disqualifiers, pre-screening candidate
+      near_misses:    "not_eligible"  — explicit disqualifying evidence found
+      not_evaluable:  "not_evaluable" — the trial could not be assessed at all
+
+    A "not_evaluable" trial is deliberately kept out of near_misses: it is a
+    non-evaluation to be counted, not a rejection to be reported.
 
     Matches are sorted by match_score descending.
     """
-    
+
     patient_data = state["patient_data"]
     evaluations = state.get("evaluations", [])
 
     # ── Normalize eligible field ─────────────────────────────────────────
-    # GPT-4o returns "eligible" / "not_eligible". Handle edge cases.
+    # GPT-4o returns "eligible" / "not_eligible" / "not_evaluable". Handle edge cases.
     _ELIGIBLE_NORM = {
         True:  "eligible",
         False: "not_eligible",
@@ -2111,8 +2243,9 @@ def node_finalize(state: TrialMatchState) -> dict:
             e["eligible"] = _ELIGIBLE_NORM.get(normalized, normalized)
         # else: leave as-is (will fall through to near_misses)
 
-    # ── Split into matches vs. near-misses ───────────────────────────────
+    # ── Split into matches vs. near-misses vs. non-evaluations ───────────
     _ACTIONABLE = frozenset({"eligible"})
+    _UNEVALUABLE = frozenset({"not_evaluable"})
 
     # Build rerank_score lookup from filtered_trials by nct_id
     _rerank_lookup = {
@@ -2128,7 +2261,11 @@ def node_finalize(state: TrialMatchState) -> dict:
         e["trial_number"] = rank_pos
 
     matches = [e for e in evaluations if e.get("eligible") in _ACTIONABLE]
-    near_misses = [e for e in evaluations if e.get("eligible") not in _ACTIONABLE]
+    not_evaluable = [e for e in evaluations if e.get("eligible") in _UNEVALUABLE]
+    near_misses = [
+        e for e in evaluations
+        if e.get("eligible") not in _ACTIONABLE and e.get("eligible") not in _UNEVALUABLE
+    ]
 
     # Sort matches by match_score descending
     matches.sort(key=lambda e: -e.get("match_score", 0))
@@ -2154,6 +2291,9 @@ def node_finalize(state: TrialMatchState) -> dict:
         "candidates_evaluated": len(evaluations),
         "matches": matches,
         "near_misses": near_misses,
+        "not_evaluable": not_evaluable,
+        "not_evaluable_trials": len(not_evaluable),
+        "cross_vocab_remaps": state.get("cross_vocab_remaps", 0),
         "stage_timings": state.get("stage_timings", {}),
         "expansion_prompt": state.get("expansion_prompt", ""),
         "expansion_input_tokens": state.get("expansion_input_tokens", 0),
@@ -2169,7 +2309,8 @@ def node_finalize(state: TrialMatchState) -> dict:
     eligible_count = len(matches)
     print(
         f"[Stage 6] Finalized: {eligible_count} eligible, "
-        f"{len(near_misses)} not_eligible "
+        f"{len(near_misses)} not_eligible, "
+        f"{len(not_evaluable)} not_evaluable "
         f"for patient {patient_data['patient_id']}"
     )
     
@@ -2205,6 +2346,9 @@ def node_no_candidates(state: TrialMatchState) -> dict:
         "candidates_evaluated": 0,
         "matches": [],
         "near_misses": [],
+        "not_evaluable": [],
+        "not_evaluable_trials": 0,
+        "cross_vocab_remaps": 0,
         "expansion_prompt": state.get("expansion_prompt", ""),
         "expansion_input_tokens": state.get("expansion_input_tokens", 0),
         "expansion_output_tokens": state.get("expansion_output_tokens", 0),
@@ -2253,6 +2397,9 @@ def node_error_handler(state: TrialMatchState) -> dict:
         "candidates_evaluated": 0,
         "matches": [],
         "near_misses": [],
+        "not_evaluable": [],
+        "not_evaluable_trials": 0,
+        "cross_vocab_remaps": state.get("cross_vocab_remaps", 0),
         "expansion_prompt": state.get("expansion_prompt", ""),
         "expansion_input_tokens": state.get("expansion_input_tokens", 0),
         "expansion_output_tokens": state.get("expansion_output_tokens", 0),
@@ -3237,6 +3384,7 @@ def match_patient_to_trials(
         "evaluations":        [],
         "gpt4o_retries":      0,
         "gpt4o_raw_response": "",
+        "cross_vocab_remaps": 0,
         "result":             {},
         "error":              "",
         "stage_timings":      {},
@@ -3265,9 +3413,10 @@ def display_match_results(result: Dict):
     """
     Pretty-print match results for a single patient.
 
-    Displays two tiers aligned with the GPT-4o binary classification:
-      ELIGIBLE:     "eligible"     — no known disqualifiers, pre-screening candidate
-      NOT ELIGIBLE: "not_eligible" — explicit disqualifying evidence found
+    Displays the trial-level classification tiers:
+      ELIGIBLE:      "eligible"      — no known disqualifiers, pre-screening candidate
+      NOT ELIGIBLE:  "not_eligible"  — explicit disqualifying evidence found
+      NOT EVALUABLE: "not_evaluable" — the trial could not be assessed; counted, not reported as a rejection
 
     For each eligible match, lists criteria that could not be evaluated
     from the patient record so the coordinator knows what to verify.
@@ -3288,6 +3437,7 @@ def display_match_results(result: Dict):
     # Pipeline summary
     matches = result.get("matches", [])
     near_misses = result.get("near_misses", [])
+    not_evaluable = result.get("not_evaluable", [])
 
     print(f"Pipeline Summary:")
     print(f"  Candidates Retrieved:  {result.get('candidates_retrieved', 0)}")
@@ -3299,6 +3449,8 @@ def display_match_results(result: Dict):
     print(f"  Candidates Evaluated:  {result.get('candidates_evaluated', 0)}")
     print(f"  Matches:               {len(matches)}")
     print(f"  Not Eligible:          {len(near_misses)}")
+    print(f"  Not Evaluable:         {len(not_evaluable)}")
+    print(f"  Label Remaps:          {result.get('cross_vocab_remaps', 0)}")
 
     timings = result.get("stage_timings", {})
     if timings:
@@ -3329,6 +3481,14 @@ def display_match_results(result: Dict):
     elif near_misses:
         # Matches exist, but also show count of rejected trials
         print(f"({len(near_misses)} additional trials evaluated but not eligible.)\n")
+
+    # ── NOT EVALUABLE ────────────────────────────────────────────────────
+    # Reported separately from rejections: these trials were never assessed.
+    if not_evaluable:
+        print(f"NOT EVALUABLE — could not be assessed ({len(not_evaluable)}):\n")
+        for trial in not_evaluable:
+            print(f"  - {trial.get('nct_id', 'N/A')} | {trial.get('explanation', 'No criteria returned.')}")
+        print()
 
 
 def _print_match_detail(idx: int, match: Dict):

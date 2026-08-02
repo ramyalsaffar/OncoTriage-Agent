@@ -84,6 +84,7 @@ if fhir_files:
     print(f"  Evaluated:  {res.get('candidates_evaluated', 'N/A')}")
     print(f"  Eligible:   {len(res.get('matches', []))}")
     print(f"  Near-misses: {len(res.get('near_misses', []))}")
+    print(f"  Not evaluable: {len(res.get('not_evaluable', []))}")
 
     # Show matches
     matches = res.get('matches', [])

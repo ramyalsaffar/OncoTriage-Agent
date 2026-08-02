@@ -428,6 +428,7 @@ def init_ablation_db():
             candidates_evaluated            INTEGER DEFAULT 0,
             eligible_count                  INTEGER DEFAULT 0,
             not_eligible_count              INTEGER DEFAULT 0,
+            not_evaluable_count             INTEGER DEFAULT 0,
             avg_match_score                 REAL,
             eligible_nct_ids                TEXT DEFAULT '',
             near_miss_nct_ids               TEXT DEFAULT '',
@@ -447,6 +448,15 @@ def init_ablation_db():
             FOREIGN KEY (run_id) REFERENCES ablation_runs(id)
         )
     """)
+
+    # Columns added after the table was first created. CREATE TABLE IF NOT
+    # EXISTS is a no-op on an existing ablation_results.db, so the INSERT below
+    # would fail against a database built before the column was introduced.
+    _existing = {row[1] for row in c.execute("PRAGMA table_info(ablation_results)")}
+    for _column, _sql_type in {"not_evaluable_count": "INTEGER DEFAULT 0"}.items():
+        if _column not in _existing:
+            c.execute(f"ALTER TABLE ablation_results ADD COLUMN {_column} {_sql_type}")
+            print(f"Schema migration: added ablation_results.{_column}")
 
     conn.commit()
     conn.close()
@@ -497,10 +507,13 @@ def log_ablation_result(run_id, config_name, patient_data, result, ablation_flag
     with _ablation_db_lock:
         
         try:
-            # Counts
+            # Counts. Tracked separately so the three buckets still sum to
+            # candidates_evaluated: a trial that could not be evaluated is
+            # neither a match nor a rejection.
             matches = result.get("matches", [])
             near_misses = result.get("near_misses", [])
-    
+            not_evaluable = result.get("not_evaluable", [])
+
             # Average match score (eligible only; None if no matches)
             avg_score = None
             if matches:
@@ -540,7 +553,7 @@ def log_ablation_result(run_id, config_name, patient_data, result, ablation_flag
                     candidates_retrieved, candidates_reranked,
                     candidates_after_rule_filter, candidates_after_quality_filter,
                     candidates_evaluated,
-                    eligible_count, not_eligible_count, avg_match_score,
+                    eligible_count, not_eligible_count, not_evaluable_count, avg_match_score,
                     eligible_nct_ids, near_miss_nct_ids,
                     mesh_dropped, stage_dropped, histology_dropped,
                     query_expansion_time, hybrid_retrieval_time, cross_encoder_time,
@@ -551,7 +564,7 @@ def log_ablation_result(run_id, config_name, patient_data, result, ablation_flag
                     ?, ?, ?, ?, ?,
                     ?, ?,
                     ?, ?, ?, ?, ?,
-                    ?, ?, ?,
+                    ?, ?, ?, ?,
                     ?, ?,
                     ?, ?, ?,
                     ?, ?, ?, ?, ?, ?,
@@ -572,6 +585,7 @@ def log_ablation_result(run_id, config_name, patient_data, result, ablation_flag
                 result.get("candidates_evaluated", 0),
                 len(matches),
                 len(near_misses),
+                len(not_evaluable),
                 avg_score,
                 eligible_nct_ids,
                 near_miss_nct_ids,
@@ -884,6 +898,7 @@ def main():
                     "error": str(e),
                     "matches": [],
                     "near_misses": [],
+                    "not_evaluable": [],
                     "stage_timings": {},
                     "primary_condition": "",
                     "candidates_retrieved": 0,

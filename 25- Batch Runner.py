@@ -237,7 +237,7 @@ def process_patient(
 
     Returns:
         Dict with keys: patient_id, status, eligible_matches, near_misses,
-        total_time, error, is_resample.
+        not_evaluable, total_time, error, is_resample.
         Never raises -- all exceptions are caught and returned as error entries.
     """
     patient_file = Path(fhir_path)
@@ -259,6 +259,7 @@ def process_patient(
                 "status": "error",
                 "eligible_matches": 0,
                 "near_misses": 0,
+                "not_evaluable": 0,
                 "total_time": round(time.time() - start, 3),
                 "timestamp": timestamp,
                 "error": "parse_fhir_bundle returned no patient_id",
@@ -278,13 +279,17 @@ def process_patient(
 
         eligible_count = len(result.get("matches", []))
         near_miss_count = len(result.get("near_misses", []))
+        # Reported separately: a trial that could not be evaluated is not a
+        # rejection, so it must not be folded into the near-miss count.
+        not_evaluable_count = len(result.get("not_evaluable", []))
         error_msg = result.get("error", "")
 
         status = "error" if error_msg else "success"
 
         print(
             f"  {run_label} {patient_id} | "
-            f"eligible={eligible_count} near_miss={near_miss_count} | "
+            f"eligible={eligible_count} near_miss={near_miss_count} "
+            f"not_evaluable={not_evaluable_count} | "
             f"{elapsed:.1f}s | {status}"
         )
 
@@ -293,6 +298,7 @@ def process_patient(
             "status": status,
             "eligible_matches": eligible_count,
             "near_misses": near_miss_count,
+            "not_evaluable": not_evaluable_count,
             "total_time": elapsed,
             "timestamp": timestamp,
             "error": error_msg,
@@ -307,6 +313,7 @@ def process_patient(
             "status": "exception",
             "eligible_matches": 0,
             "near_misses": 0,
+            "not_evaluable": 0,
             "total_time": round(time.time() - start, 3),
             "timestamp": timestamp,
             "error": error_msg,
@@ -578,6 +585,10 @@ def print_summary(results_list: list, total_wall_time: float) -> None:
         times   = [r["total_time"] for r in records if r.get("total_time", 0) > 0]
         # Eligible match counts are only meaningful for successful runs
         eligible = [r["eligible_matches"] for r in success]
+        # Trials the model could not assess, surfaced so a run that quietly
+        # stops evaluating is visible instead of looking like a run with fewer
+        # matches. Older checkpoint records predate the key.
+        unevaluable = [r.get("not_evaluable", 0) for r in success]
         return {
             "total":               len(records),
             "success":             len(success),
@@ -589,6 +600,7 @@ def print_summary(results_list: list, total_wall_time: float) -> None:
             "total_time":          f"{sum(times)/60:.1f} min"      if times else "N/A",
             "avg_eligible":        f"{sum(eligible)/len(eligible):.2f}" if eligible else "N/A",
             "patients_with_match": sum(1 for e in eligible if e > 0),
+            "not_evaluable":       sum(unevaluable),
         }
 
     main_stats = _stats(main_results)

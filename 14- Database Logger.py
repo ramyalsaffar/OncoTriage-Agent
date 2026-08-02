@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS inferences (
     candidates_evaluated INTEGER,
     eligible_matches INTEGER,
     near_misses INTEGER,
+    not_evaluable_trials INTEGER,
+    cross_vocab_remaps INTEGER,
     query_expansion_time REAL,
     hybrid_retrieval_time REAL,
     cross_encoder_time REAL,
@@ -67,6 +69,29 @@ CREATE TABLE IF NOT EXISTS inferences (
     ablation_flags TEXT
 )
 ''')
+
+
+#------------------------------------------------------------------------------
+
+
+# Schema migration for the inferences table.
+#
+# CREATE TABLE IF NOT EXISTS is a no-op once the table exists, so columns added
+# after the first run must be applied explicitly. Rows written before a column
+# existed keep NULL, which is the honest value: the counter was not recorded,
+# as opposed to having been recorded as zero.
+INFERENCE_COLUMN_ADDITIONS = {
+    "not_evaluable_trials": "INTEGER",   # trials the model could not assess at all
+    "cross_vocab_remaps":   "INTEGER",   # criterion labels resolved to not_evaluable
+}
+
+_existing_inference_columns = {
+    row[1] for row in cursor.execute("PRAGMA table_info(inferences)")
+}
+for _column, _sql_type in INFERENCE_COLUMN_ADDITIONS.items():
+    if _column not in _existing_inference_columns:
+        cursor.execute(f"ALTER TABLE inferences ADD COLUMN {_column} {_sql_type}")
+        print(f"Schema migration: added inferences.{_column}")
 
 
 #------------------------------------------------------------------------------
@@ -217,6 +242,7 @@ def log_inference(result: Dict, patient_data: Dict):
                 candidates_filtered, mesh_dropped, stage_dropped, histology_dropped,
                 candidates_evaluated,
                 eligible_matches, near_misses,
+                not_evaluable_trials, cross_vocab_remaps,
                 query_expansion_time, hybrid_retrieval_time, cross_encoder_time,
                 rule_filter_time, gpt4o_evaluation_time, total_time,
                 gpt4o_prompt, gpt4o_input_tokens, gpt4o_output_tokens,
@@ -224,7 +250,7 @@ def log_inference(result: Dict, patient_data: Dict):
                 pricing_version, estimated_cost_usd, qdrant_collection, error,
                 patient_data_hash, expansion_prompt,
                 gpt4o_retries, ablation_flags
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             result["patient_id"],
             result["timestamp"],
@@ -250,6 +276,10 @@ def log_inference(result: Dict, patient_data: Dict):
             result.get("candidates_evaluated", 0),
             len(result.get("matches", [])),
             len(result.get("near_misses", [])),
+            # Non-evaluations are counted here, never folded into near_misses:
+            # a trial that could not be assessed is not a rejection.
+            result.get("not_evaluable_trials", len(result.get("not_evaluable", []))),
+            result.get("cross_vocab_remaps", 0),
             timings.get("query_expansion", 0),
             timings.get("hybrid_retrieval", 0),
             timings.get("cross_encoder", 0),
@@ -273,7 +303,16 @@ def log_inference(result: Dict, patient_data: Dict):
         
         inference_id = cursor.lastrowid
         
-        for match in result.get("matches", []) + result.get("near_misses", []):
+        # not_evaluable trials are written too, with eligible = "not_evaluable",
+        # so the criterion-level record exists for anything that reads back the
+        # non-evaluations rather than only their count.
+        all_trials = (
+            result.get("matches", [])
+            + result.get("near_misses", [])
+            + result.get("not_evaluable", [])
+        )
+
+        for match in all_trials:
             # Build criterion details JSON from inclusion/exclusion arrays
             inclusion = match.get("inclusion_criteria", [])
             exclusion = match.get("exclusion_criteria", [])
