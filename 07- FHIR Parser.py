@@ -362,33 +362,134 @@ def parse_fhir_bundle(bundle_path: str) -> Dict:
     return patient_data
 
 
+# ---------------------------------------------------------------------------
+# US Core race / ethnicity extension (HL7 US Core profile)
+# ---------------------------------------------------------------------------
+# The race and ethnicity extensions are complex extensions whose sub-extensions
+# are an UNORDERED set identified by url, not by position:
+#   ombCategory  0..5 for race, 0..1 for ethnicity, a valueCoding
+#   detailed     0..*, a finer-grained valueCoding
+#   text         1..1, a valueString -- the only mandatory one
+#
+# Reading extension[0].get('valueCoding') took whichever sub-extension the
+# exporter happened to serialize first, so a bundle leading with `text` (which
+# carries valueString, not valueCoding) produced {} and the field silently
+# became "unknown" for every patient in that export.
+_US_CORE_OMB_CATEGORY = "ombCategory"
+_US_CORE_DETAILED     = "detailed"
+_US_CORE_TEXT         = "text"
+
+# Which sub-extension each parsed value came from, corpus-wide. A run whose
+# race values all resolved from `text` rather than `ombCategory` is holding
+# free text where downstream code expects OMB categories, and that is only
+# visible if the source is counted.
+DEMOGRAPHIC_SOURCE_COUNTS = Counter()
+
+# Shape of every birthDate seen, corpus-wide. "day" is exact; "month" and
+# "year" mean the age is imputed from an anchor (File 02); the rest mean no
+# age was produced at all. Reported by load_all_patients().
+BIRTH_DATE_PRECISION_COUNTS = Counter()
+
+
+def _read_us_core_category(extension: Dict) -> Tuple[str, str]:
+    """Read a US Core race/ethnicity extension by sub-extension url.
+
+    Preference order, most standardised first: ombCategory -> detailed -> text.
+
+    Multiple ombCategory sub-extensions are legal (US Core allows up to five
+    for race) and are joined rather than truncated to the first: dropping one
+    would silently re-label a multi-race patient as single-race.
+
+    Returns:
+        (value, source) where source is the sub-extension url the value came
+        from, or "empty" when the extension carried nothing readable. The
+        source is returned rather than logged here so the caller can both store
+        it per patient and count it corpus-wide.
+    """
+
+    sub_extensions = extension.get('extension') or []
+
+    for url in (_US_CORE_OMB_CATEGORY, _US_CORE_DETAILED):
+        displays = [
+            ((sub.get('valueCoding') or {}).get('display') or '').strip()
+            for sub in sub_extensions
+            if isinstance(sub, dict) and sub.get('url') == url
+        ]
+        displays = [d for d in displays if d]
+        if displays:
+            return "; ".join(displays), url
+
+    for sub in sub_extensions:
+        if isinstance(sub, dict) and sub.get('url') == _US_CORE_TEXT:
+            text = (sub.get('valueString') or '').strip()
+            if text:
+                return text, _US_CORE_TEXT
+
+    return 'unknown', 'empty'
+
+
 def _parse_demographics(patient_resource: Dict) -> Dict:
-    """Extract demographics from Patient resource"""
-    birth_date = patient_resource.get('birthDate', '')
-    age = _calculate_age(birth_date) if birth_date else None
+    """Extract demographics from Patient resource.
+
+    Output fields beyond the obvious ones:
+      birth_date_precision: How much of the birth date the record actually
+                            carried -- "day" (exact), "month"/"year" (age
+                            imputed from an anchor, see File 02), "missing",
+                            "unparseable", or "after_reference". An imputed or
+                            absent age must never be mistaken for an exact one.
+      age_reference_date:   ISO date the age was computed against, so the age
+                            in a stored row can be recomputed exactly.
+      race_source /
+      ethnicity_source:     Which US Core sub-extension supplied the value.
+    """
+
+    birth_date_raw = patient_resource.get('birthDate', '')
+    reference_date = get_age_reference_date()
+
+    birth, precision = parse_partial_date(birth_date_raw)
+    age = _calculate_age(birth, reference_date) if birth is not None else None
+
+    if birth is not None and age is None:
+        # Parsed cleanly but sits after the snapshot the corpus is anchored to:
+        # the data outran DATA_SNAPSHOT_DATE, or the record is wrong. Either
+        # way there is no age to state, and the reason has to survive in the row.
+        precision = "after_reference"
+        print(f"  WARNING: birthDate {birth_date_raw!r} is after the age reference "
+              f"date {reference_date.isoformat()} — age not computed")
+    elif precision == "unparseable":
+        print(f"  WARNING: unparseable birthDate {birth_date_raw!r} — age not computed")
+
+    BIRTH_DATE_PRECISION_COUNTS[precision] += 1
 
     # Extract sex
     sex = patient_resource.get('gender', 'unknown')
 
-    # Extract race and ethnicity from extensions
-    race      = 'unknown'
-    ethnicity = 'unknown'
-    for ext in patient_resource.get('extension', []):
-        if 'us-core-race' in ext.get('url', ''):
-            race_exts = ext.get('extension', [])
-            if race_exts:
-                race = race_exts[0].get('valueCoding', {}).get('display', 'unknown')
-        if 'us-core-ethnicity' in ext.get('url', ''):
-            eth_exts = ext.get('extension', [])
-            if eth_exts:
-                ethnicity = eth_exts[0].get('valueCoding', {}).get('display', 'unknown')
+    # Extract race and ethnicity from the US Core extensions, by url.
+    race,      race_source      = 'unknown', 'absent'
+    ethnicity, ethnicity_source = 'unknown', 'absent'
+
+    for ext in patient_resource.get('extension') or []:
+        if not isinstance(ext, dict):
+            continue
+        url = ext.get('url', '')
+        if 'us-core-race' in url:
+            race, race_source = _read_us_core_category(ext)
+        elif 'us-core-ethnicity' in url:
+            ethnicity, ethnicity_source = _read_us_core_category(ext)
+
+    DEMOGRAPHIC_SOURCE_COUNTS[f"race:{race_source}"] += 1
+    DEMOGRAPHIC_SOURCE_COUNTS[f"ethnicity:{ethnicity_source}"] += 1
 
     return {
-        'age':        age,
-        'sex':        sex,
-        'race':       race,
-        'ethnicity':  ethnicity,
-        'birth_date': birth_date
+        'age':                  age,
+        'sex':                  sex,
+        'race':                 race,
+        'ethnicity':            ethnicity,
+        'birth_date':           birth_date_raw,
+        'birth_date_precision': precision,
+        'age_reference_date':   reference_date.isoformat(),
+        'race_source':          race_source,
+        'ethnicity_source':     ethnicity_source,
     }
 
 
@@ -949,11 +1050,40 @@ def _parse_allergy(allergy_resource: Dict) -> Dict:
     }
 
 
-def _calculate_age(birth_date: str) -> int:
-    """Calculate age from birth date string (YYYY-MM-DD)"""
-    birth = datetime.strptime(birth_date, '%Y-%m-%d')
-    age   = relativedelta(datetime.now(), birth).years
-    return age
+def _calculate_age(birth_date, reference_date=None) -> Optional[int]:
+    """Age in completed years at the run's age reference date.
+
+    Args:
+        birth_date:     Raw FHIR birthDate (any shape parse_partial_date accepts,
+                        File 02), or an already-parsed date/datetime.
+        reference_date: Date to age against. Defaults to get_age_reference_date()
+                        -- the data snapshot date, never the current clock.
+
+    Returns:
+        Age in whole years, or None when no age can be stated. None is returned
+        rather than raising for two cases, and both are recorded by the caller
+        as a precision label rather than swallowed:
+          - the birth date is missing or unparseable
+          - the birth date falls after the reference date, which is not an age
+            but a sign that the corpus outran DATA_SNAPSHOT_DATE
+
+    Never raises. The previous implementation used a fixed '%Y-%m-%d' strptime
+    and datetime.now(): it raised on the year-only, year-month and ISO-datetime
+    shapes that FHIR permits, and its result moved with the clock.
+    """
+
+    birth, _precision = parse_partial_date(birth_date)
+    if birth is None:
+        return None
+
+    reference = reference_date if reference_date is not None else get_age_reference_date()
+    if isinstance(reference, datetime):
+        reference = reference.date()
+
+    if birth > reference:
+        return None
+
+    return relativedelta(reference, birth).years
 
 
 def load_all_patients(patients_dir: str) -> List[Dict]:
@@ -972,6 +1102,11 @@ def load_all_patients(patients_dir: str) -> List[Dict]:
     patients = []
     errors   = []
 
+    # Corpus-wide tallies are reported for THIS load, not accumulated across
+    # calls, so the printed numbers always match the directory just parsed.
+    BIRTH_DATE_PRECISION_COUNTS.clear()
+    DEMOGRAPHIC_SOURCE_COUNTS.clear()
+
     for idx, fhir_file in enumerate(patient_files, 1):
         if idx % 100 == 0 or idx == len(patient_files):
             print(f"  Parsing {idx}/{len(patient_files)} patients...")
@@ -988,6 +1123,14 @@ def load_all_patients(patients_dir: str) -> List[Dict]:
     print(f"Successfully parsed {len(patients)} patients")
     if errors:
         print(f"Failed to parse {len(errors)} patients")
+
+    # Which parsing path each field took. Printed unconditionally: "every
+    # birthDate was a full date" is itself a result worth stating, and a
+    # corpus that drifts toward imputed ages or free-text race should be
+    # visible at the point of load rather than inferred later from the rows.
+    print(f"  Birth date precision: {dict(sorted(BIRTH_DATE_PRECISION_COUNTS.items()))}")
+    print(f"  Age reference date:   {get_age_reference_date().isoformat()}")
+    print(f"  Demographic sources:  {dict(sorted(DEMOGRAPHIC_SOURCE_COUNTS.items()))}")
 
     return patients
 

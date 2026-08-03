@@ -209,6 +209,136 @@ def resolve_qdrant_collection() -> str:
 #------------------------------------------------------------------------------
 
 
+# Partial-date parsing and the run's age reference date
+#------------------------------------------------------
+# FHIR types Patient.birthDate as `date`, whose value is legally YYYY, YYYY-MM
+# or YYYY-MM-DD, and real EHR exports also ship a full ISO dateTime in the
+# field. HIPAA Safe Harbor de-identification produces the year-only form by
+# design. A fixed datetime.strptime(value, '%Y-%m-%d') raises on three of those
+# four shapes, and in this codebase that exception aborts the whole bundle.
+#
+# Missing components are filled with the midpoint of the range the record still
+# allows, so the imputation error is centred instead of biased: an unknown
+# month becomes July, an unknown day becomes the 15th. Worst case is ~6 months
+# for a year-only date and ~15 days for a year-month date. The caller is told
+# which shape it got (the returned precision) and is expected to record it --
+# an imputed age must stay distinguishable from an exact one.
+PARTIAL_DATE_ANCHOR_MONTH = 7    # mid-year,  used when the record has no month
+PARTIAL_DATE_ANCHOR_DAY   = 15   # mid-month, used when the record has no day
+
+# Out-of-range components ("1965-13-01", "1965-02-30") counted by the precision
+# the parse was attempting when the component was rejected. A date that is
+# well-formed but impossible is a data-quality signal in its own right, and the
+# degradation that keeps the record usable must not be the only trace of it.
+PARTIAL_DATE_DEGRADATIONS = Counter()
+
+# Anchored at both ends. The day pattern also accepts the date portion of a
+# full ISO datetime ("1965-04-12T00:00:00Z", "1965-04-12T00:00:00.000-07:00",
+# "1965-04-12 00:00:00"), which is why its time part is an optional group.
+_PARTIAL_DATE_PATTERNS = (
+    ("day",   re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?:[T ].*)?$")),
+    ("month", re.compile(r"^(\d{4})-(\d{2})$")),
+    ("year",  re.compile(r"^(\d{4})$")),
+)
+
+
+def parse_partial_date(value) -> Tuple[Optional[date], str]:
+    """Parse a FHIR partial date into a concrete date plus its precision.
+
+    Args:
+        value: Raw field value. A str in any of the shapes above; a date or
+               datetime is passed through; anything else is unparseable.
+
+    Returns:
+        (date_or_None, precision) where precision is one of:
+          "day"         -- full date, nothing imputed
+          "month"       -- YYYY-MM, day imputed to PARTIAL_DATE_ANCHOR_DAY
+          "year"        -- YYYY, month/day imputed to the anchors
+          "missing"     -- empty / absent field
+          "unparseable" -- present but not a date in any accepted shape
+
+        Never raises. A returned date is always usable; a returned None always
+        comes with a precision label saying why there is none, so no caller can
+        mistake "no date" for "date at the epoch".
+    """
+
+    # datetime first: datetime is a subclass of date, so the order matters.
+    if isinstance(value, datetime):
+        return value.date(), "day"
+    if isinstance(value, date):
+        return value, "day"
+
+    # An absent field is "missing"; a field carrying something that is not a
+    # date string is "unparseable". Collapsing the two would report a corrupt
+    # value as an empty one.
+    if value is None:
+        return None, "missing"
+    if not isinstance(value, str):
+        return None, "unparseable"
+
+    raw = value.strip()
+    if not raw:
+        return None, "missing"
+
+    for precision, pattern in _PARTIAL_DATE_PATTERNS:
+        match = pattern.match(raw)
+        if match is None:
+            continue
+
+        year  = int(match.group(1))
+        month = int(match.group(2)) if precision in ("day", "month") else PARTIAL_DATE_ANCHOR_MONTH
+        day   = int(match.group(3)) if precision == "day"             else PARTIAL_DATE_ANCHOR_DAY
+
+        # Shape matched but a component may still be out of range ("1965-13-01",
+        # "1965-02-30"). Degrade one step at a time rather than discarding the
+        # record: the coarser components are still usable, and the precision
+        # that comes back says exactly how much was kept.
+        for fallback_precision, fallback_month, fallback_day in (
+            (precision, month,                     day),
+            ("month",   month,                     PARTIAL_DATE_ANCHOR_DAY),
+            ("year",    PARTIAL_DATE_ANCHOR_MONTH, PARTIAL_DATE_ANCHOR_DAY),
+        ):
+            try:
+                return date(year, fallback_month, fallback_day), fallback_precision
+            except ValueError:
+                PARTIAL_DATE_DEGRADATIONS[f"out_of_range:{fallback_precision}"] += 1
+                continue
+
+        return None, "unparseable"
+
+    return None, "unparseable"
+
+
+def get_age_reference_date() -> date:
+    """The fixed date this run computes patient ages against.
+
+    Resolves DATA_SNAPSHOT_DATE from File 03 -- see the comment there for why
+    the current clock cannot be used.
+
+    Raises ValueError when the constant is missing or is not a full date.
+    Falling back to today() here would restore the exact defect the constant
+    exists to remove, and would do it silently; an unset snapshot date is a
+    configuration error, not a runtime condition to recover from.
+    """
+
+    raw = globals().get("DATA_SNAPSHOT_DATE", "")
+    reference, precision = parse_partial_date(raw)
+
+    if reference is None or precision != "day":
+        raise ValueError(
+            f"DATA_SNAPSHOT_DATE must be a full YYYY-MM-DD date in "
+            f"'03- Config.py'; got {raw!r} (parsed precision: {precision}). "
+            f"Patient ages are computed against it, so it cannot be defaulted "
+            f"to the current date without reintroducing clock drift into the "
+            f"Stage 5 prompt."
+        )
+
+    return reference
+
+
+#------------------------------------------------------------------------------
+
+
 class CaffeinateSession:
     """Context manager to prevent macOS sleep during long-running pipelines.
     

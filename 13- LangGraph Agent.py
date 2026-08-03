@@ -360,9 +360,12 @@ def compute_patient_hash(patient_data: Dict) -> str:
     parts = []
     
     # Demographics (fixed order)
-    # birth_date instead of age — age is derived from birth_date + datetime.now()
-    # at parse time, so it changes if patients are re-parsed after a birthday.
-    # birth_date is immutable from the FHIR source, making the hash time-invariant.
+    # birth_date instead of age: birth_date is what the FHIR source actually
+    # carries, so it is immutable across re-parses. age is derived from it
+    # against DATA_SNAPSHOT_DATE (File 03) and is therefore also stable, but it
+    # is a derived value — hashing the source keeps the hash independent of how
+    # the derivation is configured. The reference date the age was computed
+    # against is recorded separately, as age_reference_date.
     parts.append(f"birth_date={demographics.get('birth_date', '')}")
     parts.append(f"sex={demographics.get('sex', '')}")
     parts.append(f"race={demographics.get('race', '')}")
@@ -2052,6 +2055,12 @@ Your job is to evaluate the eligibility criteria text (inclusion and exclusion) 
 # SYSTEM MESSAGE
 # ================================================================
 
+    # RULE 4's "Reference date" is the data snapshot date, not date.today().
+    # It is the same anchor the patient's age was computed against (File 07),
+    # so the prompt's temporal reasoning and its stated age agree, and neither
+    # moves between two runs of the same patient. Under date.today() every
+    # washout window ("no platinum within 6 months") silently widened as the
+    # clock advanced, while patient_data_hash stayed identical.
     system_prompt = f"""
 You are a clinical trial pre-screening classifier.
 
@@ -2207,7 +2216,7 @@ Categorically different diseases:
 
 RULE 4 -- TEMPORAL REASONING
 
-Reference date: {date.today().isoformat()}
+Reference date: {get_age_reference_date().isoformat()}
 
 If the criterion contains a time window:
     If event end date is known: calculate elapsed time.
@@ -2907,6 +2916,24 @@ def _pipeline_provenance(state) -> Dict:
         # the true count of what that channel retrieved.
         "bm25_retrieved": state.get("bm25_retrieved", 0),
         "vector_retrieved": state.get("vector_retrieved", 0),
+
+        # The date this run's patient ages and the Stage 5 prompt's temporal
+        # reasoning were anchored to. Not read from state: it is a property of
+        # the run's configuration, identical on every path including the error
+        # path, and it is recorded per run precisely so a stored row can be
+        # reproduced without knowing when it was produced. Taken from
+        # DATA_SNAPSHOT_DATE (File 03) rather than from the patient dict so it
+        # is present even when demographics never parsed.
+        "age_reference_date": get_age_reference_date().isoformat(),
+
+        # How much of the patient's birthDate the record carried ("day" =
+        # exact age, "month"/"year" = imputed from an anchor, "missing" /
+        # "unparseable" / "after_reference" = no age at all). Written by File
+        # 07 into demographics; None when the caller built the patient dict by
+        # hand, which is not the same as "the date was exact".
+        "birth_date_precision": ((state.get("patient_data") or {})
+                                 .get("demographics") or {})
+                                .get("birth_date_precision"),
 
         # --- Degradation record (see the vocabularies at the top of this file) ---
         #
@@ -4330,7 +4357,10 @@ if __name__ == "__main__" and RUN_TEST_ON_EXECUTE:
         # Filter to adult patients (age >= 18) for cancer trial matching
         adult_patients = [
             p for p in all_patients
-            if p["demographics"].get("age", 0) >= 18
+            # age is None, not absent, when the bundle's birthDate was partial
+            # beyond use or unparseable (File 07), so the key's default never
+            # fires and the comparison would raise on None.
+            if (p["demographics"].get("age") or 0) >= 18
         ]
 
         if not adult_patients:

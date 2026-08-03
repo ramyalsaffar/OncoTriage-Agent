@@ -137,6 +137,24 @@ INFERENCE_COLUMN_ADDITIONS = {
     # belongs in the record of the inference it shaped.
     "mesh_filter_applied":          "INTEGER",
     "mesh_filter_skip_reason":      "TEXT",
+    # --- Age provenance (item 12) -------------------------------------------
+    # The date this run computed patient ages against (DATA_SNAPSHOT_DATE,
+    # File 03), and how much of the patient's birthDate the record carried.
+    #
+    # age was previously derived from datetime.now(), so the stored age — and
+    # the Stage 5 prompt built from it — moved with the clock while
+    # patient_data_hash, which keys on birth_date, stayed identical. Rows
+    # written before this column existed keep NULL, which is honest: their
+    # reference date was whatever day they happened to run and is not
+    # recoverable from the row.
+    #
+    # birth_date_precision is "day" for an exact age; "month"/"year" mean the
+    # age was imputed from a mid-range anchor (File 02) because the record was
+    # partial, which HIPAA Safe Harbor de-identification produces by design;
+    # "missing"/"unparseable"/"after_reference" mean age is NULL and say why.
+    # NULL here means the parser did not report — not that the date was exact.
+    "age_reference_date":           "TEXT",
+    "birth_date_precision":         "TEXT",
 }
 
 _existing_inference_columns = {
@@ -346,8 +364,9 @@ def log_inference(result: Dict, patient_data: Dict):
                 retrieval_channels, retrieval_channels_expected,
                 retrieval_channels_ok, retrieval_degraded,
                 retrieval_trials_lost, query_expansion_path,
-                mesh_filter_applied, mesh_filter_skip_reason
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                mesh_filter_applied, mesh_filter_skip_reason,
+                age_reference_date, birth_date_precision
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             result["patient_id"],
             result["timestamp"],
@@ -428,6 +447,16 @@ def log_inference(result: Dict, patient_data: Dict):
             (None if result.get("mesh_filter_applied") is None
              else int(bool(result["mesh_filter_applied"]))),
             result.get("mesh_filter_skip_reason"),
+            # Age provenance. The reference date comes from the result, written
+            # by _pipeline_provenance() (File 13) on all three terminal paths;
+            # it falls back to the patient dict only for a caller that logs a
+            # result it did not get from the graph. Both stay NULL when neither
+            # reported: the age in this row is then not reproducible, and that
+            # must not read as "computed against today".
+            (result.get("age_reference_date")
+             or demographics.get("age_reference_date")),
+            (result.get("birth_date_precision")
+             or demographics.get("birth_date_precision")),
         ))
         
         inference_id = cursor.lastrowid

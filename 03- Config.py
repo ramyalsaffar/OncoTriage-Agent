@@ -36,6 +36,28 @@ MATCHING_TEMPERATURE = 0  # Deterministic matching
 EXPANSION_TEMPERATURE = 0  # Deterministic query expansion
 
 
+# Patient data snapshot date
+#---------------------------
+# The date the Synthea FHIR corpus under data_fhir_path was generated. Patient
+# ages are computed against THIS date, never against the current clock.
+#
+# Age was derived from datetime.now() at parse time, so the same bundle parsed
+# on two different days could yield two different ages, and age is printed into
+# the Stage 5 system prompt. compute_patient_hash() (File 13) keys on
+# birth_date and cannot observe the clock, so two runs could carry the same
+# patient_data_hash -- this project's "identical input" guarantee -- while
+# sending GPT-4o different prompt text. That is invisible in exactly the
+# comparison the ablation study makes, where the claim is that only the model
+# varied.
+#
+# It is the snapshot date rather than an arbitrary frozen date so the ages stay
+# true to the records: every event in a bundle predates generation. Update it
+# whenever "04- FHIR Generate Data.py" regenerates the corpus -- ages shift by
+# the gap, which is the honest consequence of new data, and every affected run
+# is identifiable by the age_reference_date column in inferences.db.
+DATA_SNAPSHOT_DATE = "2026-03-11"
+
+
 # Clinical trials main characteristics for scraping
 # Used at the RAG Trial Indexer
 #--------------------------------------------------
