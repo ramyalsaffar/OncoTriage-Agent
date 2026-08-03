@@ -67,7 +67,8 @@ CREATE TABLE IF NOT EXISTS inferences (
     patient_data_hash TEXT,
     expansion_prompt TEXT,
     gpt4o_retries INTEGER,
-    ablation_flags TEXT
+    ablation_flags TEXT,
+    hallucinated_trials INTEGER
 )
 ''')
 
@@ -91,6 +92,14 @@ INFERENCE_COLUMN_ADDITIONS = {
     # both "the filter found nothing to drop" and "the patient was never
     # resolved, so the filter never ran". This column separates the two.
     "mesh_resolution":      "TEXT",
+    # Count of trials GPT-4o returned an evaluation for that were never in the
+    # candidate set sent to it. The detector (item 33) writes
+    # result["hallucinated_trials"]; until it does, no terminal node emits the
+    # key and the column stays NULL on every row. NULL is the correct value:
+    # inserting 0 would assert that the check ran and found nothing, which is
+    # the exact confusion this project treats as a defect. The column exists
+    # now so the detector has somewhere to write without a second migration.
+    "hallucinated_trials":  "INTEGER",
 }
 
 _existing_inference_columns = {
@@ -122,6 +131,7 @@ CREATE TABLE IF NOT EXISTS trial_matches (
     eligible TEXT,
     explanation TEXT,
     criterion_details TEXT,
+    hallucinated INTEGER,
     FOREIGN KEY (inference_id) REFERENCES inferences(id)
 )
 ''')
@@ -146,6 +156,10 @@ TRIAL_MATCH_COLUMN_ADDITIONS = {
     "score_confirmed":         "INTEGER",  # match_score numerator
     "score_denominator":       "INTEGER",  # match_score denominator (applicable only)
     "criteria_not_applicable": "INTEGER",  # criteria excluded from both
+    # Per-trial marker for the same detection as inferences.hallucinated_trials:
+    # 1 = this NCT ID was not in the candidate set sent to the model, 0 = it was,
+    # NULL = the check did not run for this row. Written from match["hallucinated"].
+    "hallucinated":            "INTEGER",
 }
 
 _existing_trial_match_columns = {
@@ -291,8 +305,8 @@ def log_inference(result: Dict, patient_data: Dict):
                 matching_model, cross_encoder_model,
                 pricing_version, estimated_cost_usd, qdrant_collection, error,
                 patient_data_hash, expansion_prompt,
-                gpt4o_retries, ablation_flags
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                gpt4o_retries, ablation_flags, hallucinated_trials
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             result["patient_id"],
             result["timestamp"],
@@ -307,8 +321,15 @@ def log_inference(result: Dict, patient_data: Dict):
             result.get("expanded_query", ""),
             result.get("candidates_retrieved", 0),
             result.get("candidates_reranked", 0),
-            BM25_RETRIEVAL_SIZE,
-            VECTOR_RETRIEVAL_SIZE,
+            # Observed per-channel counts from Stage 2, not the configured
+            # request sizes. Inserting BM25_RETRIEVAL_SIZE / VECTOR_RETRIEVAL_SIZE
+            # here made both columns constant across every row, so any ratio
+            # built on them (File 16's fusion_efficiency) described the config
+            # rather than the run, and a single-channel ablation still logged
+            # both channels as full. NULL when the key is absent, which means a
+            # result dict that did not come from a pipeline terminal node.
+            result.get("bm25_retrieved"),
+            result.get("vector_retrieved"),
             result.get("candidates_after_rule_filter", 0),
             result.get("candidates_after_quality_filter", 0),
             result.get("candidates_filtered", 0),
@@ -340,8 +361,15 @@ def log_inference(result: Dict, patient_data: Dict):
             result.get("error", ""),
             result.get("patient_data_hash", ""),
             result.get("expansion_prompt", ""),
-            result.get("gpt4o_retries_exhausted", 0),        # gpt4o_retries
+            # Written by all three terminal nodes via _pipeline_provenance()
+            # (File 13). Reading "gpt4o_retries_exhausted" here logged 0 for
+            # every run that did not end in node_error_handler, because that
+            # node was the only writer of the old key.
+            result.get("gpt4o_retries", 0),                  # gpt4o_retries
             json.dumps(result.get("ablation_flags") or {}),  # ablation_flags
+            # NULL until item 33's detector writes the key: see the migration
+            # note above for why this is not defaulted to 0.
+            result.get("hallucinated_trials"),               # hallucinated_trials
         ))
         
         inference_id = cursor.lastrowid
@@ -371,8 +399,9 @@ def log_inference(result: Dict, patient_data: Dict):
                     inference_id, nct_id, trial_title, trial_phase,
                     trial_number, rerank_score, rerank_score_raw, mesh_boost, mesh_boost_tier,
                     match_score, eligible, explanation, criterion_details,
-                    score_confirmed, score_denominator, criteria_not_applicable
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    score_confirmed, score_denominator, criteria_not_applicable,
+                    hallucinated
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 inference_id,
                 match.get("nct_id", ""),
@@ -390,6 +419,7 @@ def log_inference(result: Dict, patient_data: Dict):
                 match.get("score_confirmed"),
                 match.get("score_denominator"),
                 match.get("criteria_not_applicable"),
+                match.get("hallucinated"),   # NULL until item 33's detector runs
             ))
         
         conn.commit()

@@ -541,9 +541,9 @@ def log_ablation_result(run_id, config_name, patient_data, result, ablation_flag
     Log one patient's ablation result.
 
     Uses get_model_cost() from File 02/03 for cost consistency with
-    File 14's production logging. Derives bm25_retrieved/vector_retrieved
-    from ablation_flags retrieval_mode. Non-critical: errors are printed
-    but do not crash the study.
+    File 14's production logging. bm25_retrieved/vector_retrieved are the
+    observed counts Stage 2 reports, not values derived from the config.
+    Non-critical: errors are printed but do not crash the study.
     """
     
     conn = None
@@ -594,10 +594,29 @@ def log_ablation_result(run_id, config_name, patient_data, result, ablation_flag
             # Cancer group
             cancer_group = _get_patient_group(patient_data, _CANCER_REGISTRY)
             
-            # BM25 / vector retrieval counts (derived from retrieval_mode)
+            # BM25 / vector retrieval counts, as OBSERVED by Stage 2 and carried
+            # out through the terminal result (File 13, _pipeline_provenance).
+            #
+            # These were previously derived from retrieval_mode: the disabled
+            # channel got 0 and the active one got its configured request size.
+            # That is a restatement of the config — every hybrid row read
+            # 75/100 — so a retrieval chart built from it plots the settings,
+            # not what the ablation did to recall. The disabled channel still
+            # reads 0 because the channel genuinely returned nothing, and the
+            # active one now varies with the query.
+            bm25_retrieved = result.get("bm25_retrieved", 0)
+            vector_retrieved = result.get("vector_retrieved", 0)
+
+            # The mode still has to agree with the counts. A disabled channel
+            # returning trials means the flag did not reach Stage 2, which
+            # would silently invalidate the configuration under test.
             _mode = ablation_flags.get("retrieval_mode", "hybrid")
-            bm25_retrieved = 0 if _mode == "vector_only" else BM25_RETRIEVAL_SIZE
-            vector_retrieved = 0 if _mode == "bm25_only" else VECTOR_RETRIEVAL_SIZE
+            if _mode == "vector_only" and bm25_retrieved:
+                print(f"  WARNING: vector_only run returned {bm25_retrieved} "
+                      f"BM25 trials — retrieval_mode did not reach Stage 2")
+            if _mode == "bm25_only" and vector_retrieved:
+                print(f"  WARNING: bm25_only run returned {vector_retrieved} "
+                      f"vector trials — retrieval_mode did not reach Stage 2")
     
             # Eligible / near-miss NCT IDs for trial-level overlap analysis
             eligible_nct_ids = ",".join(
@@ -711,6 +730,8 @@ def match_patient_ablation(patient_data, bm25_index, nct_ids, graph, ablation_fl
         "nct_ids":                          nct_ids,
         "expanded_query":                   "",
         "hybrid_results":                   [],
+        "bm25_retrieved":                   0,
+        "vector_retrieved":                 0,
         "reranked_trials":                  [],
         "filtered_trials":                  [],
         "candidates_after_rule_filter":     0,

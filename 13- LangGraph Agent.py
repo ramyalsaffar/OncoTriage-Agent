@@ -136,6 +136,16 @@ class TrialMatchState(TypedDict):
     # --- Stage 2: Hybrid Retrieval ---
     hybrid_results: List[Dict]                  # Trials from BM25 + Vector + RRF
 
+    # Observed per-channel retrieval counts, written by Stage 2 and logged to
+    # inferences.bm25_retrieved / inferences.vector_retrieved. These are counts
+    # of what the channel actually returned, NOT the configured request sizes
+    # (BM25_RETRIEVAL_SIZE / VECTOR_RETRIEVAL_SIZE): a channel that failed, was
+    # ablated away, or hit a collection smaller than its limit returns fewer.
+    # Logging the constants instead would make the columns a record of the
+    # configuration rather than of the run.
+    bm25_retrieved: int                         # unique NCT IDs across the 3 sparse fields
+    vector_retrieved: int                       # unique NCT IDs from the dense channel
+
     # --- Stage 3: Cross-Encoder Re-Ranking ---
     reranked_trials: List[Dict]                 # Top-K after cross-encoder scoring
 
@@ -1057,6 +1067,23 @@ def node_hybrid_retrieval(state: TrialMatchState) -> dict:
     }
     active_channels = [f"{k}={v}" for k, v in channel_counts.items() if v > 0]
 
+    # ── Observed per-channel counts (logged to inferences) ────────────────
+    #
+    # BM25 runs as THREE field queries of BM25_RETRIEVAL_SIZE each, so summing
+    # them would triple-count any trial that matched on more than one field.
+    # The union of the per-channel rank dicts is the number of distinct trials
+    # the sparse side actually contributed to fusion, which is the quantity a
+    # fusion-efficiency ratio needs as its denominator.
+    #
+    # Both counts are observations, not configuration: under retrieval_mode
+    # "bm25_only" the dense count is 0 and under "vector_only" the sparse count
+    # is 0, and a channel whose query raised above (caught per channel, logged
+    # as a WARNING) lands here as 0 as well.
+    bm25_retrieved = len(
+        set(title_ranks) | set(conditions_ranks) | set(criteria_ranks)
+    )
+    vector_retrieved = len(vector_ranks)
+
     if _retrieval_mode != "hybrid":
         mode_label = f"{_retrieval_mode} (ablation)"
     elif vector_results and title_results:
@@ -1070,9 +1097,16 @@ def node_hybrid_retrieval(state: TrialMatchState) -> dict:
     print(f"  Channels: {', '.join(active_channels)}")
     print(f"  Disease query: \"{disease_query}\"")
     print(f"  Fusion pool: {len(all_nct_ids)} unique NCTs -> top {len(ranked_nct_ids)}")
+    print(
+        f"  Observed: bm25={bm25_retrieved} unique (of "
+        f"{3 * BM25_RETRIEVAL_SIZE} requested), vector={vector_retrieved} "
+        f"(of {VECTOR_RETRIEVAL_SIZE} requested)"
+    )
 
     return {
         "hybrid_results": trials,
+        "bm25_retrieved": bm25_retrieved,
+        "vector_retrieved": vector_retrieved,
         "stage_timings": {
             **state.get("stage_timings", {}),
             "hybrid_retrieval": round(elapsed, 3),
@@ -2566,6 +2600,43 @@ CLINICAL TRIALS:
     }
 
 
+# ---------------------------------------------------------------------------
+# Provenance block shared by the three terminal nodes
+# ---------------------------------------------------------------------------
+#
+# node_finalize, node_no_candidates and node_error_handler each end a run, and
+# File 14 logs whichever one produced the result. A key written on only one of
+# the three is a column that is populated for a minority of rows and constant
+# for the rest — which reads downstream as a signal that never varies.
+#
+# That was the defect: gpt4o_retries existed only on the error path (so every
+# successful inference logged 0 retries no matter how many were spent, and
+# File 20's retry drift monitored a constant), ablation_flags was written by no
+# terminal node at all (so the production column was '{}' on every row), and
+# the per-channel retrieval counts were written nowhere, so File 14 inserted
+# BM25_RETRIEVAL_SIZE / VECTOR_RETRIEVAL_SIZE in their place.
+#
+# Every value is read from state, so a stage that never ran contributes its
+# initialized value rather than a fabricated one.
+
+def _pipeline_provenance(state) -> Dict:
+    """Run-level provenance keys that all three terminal results must carry."""
+    return {
+        # Retries actually spent in Stage 5. Stage 5 writes the count back into
+        # state on its success return and on every failure return, so this is
+        # the observed number of API / JSON-parse retries, not a ceiling.
+        "gpt4o_retries": state.get("gpt4o_retries", 0),
+        # Which stages were disabled for this run; {} = full pipeline. Copied
+        # rather than aliased so the logged record cannot be mutated later.
+        "ablation_flags": dict(state.get("ablation_flags") or {}),
+        # Observed Stage 2 channel counts (see TrialMatchState). Absent from
+        # state only when the run ended before Stage 2 returned, and 0 is then
+        # the true count of what that channel retrieved.
+        "bm25_retrieved": state.get("bm25_retrieved", 0),
+        "vector_retrieved": state.get("vector_retrieved", 0),
+    }
+
+
 def node_finalize(state: TrialMatchState) -> dict:
     """
     Stage 6: Assemble final output with pipeline metadata.
@@ -2686,6 +2757,7 @@ def node_finalize(state: TrialMatchState) -> dict:
         "timestamp": datetime.now().isoformat(),
         "error": "",
         "patient_data_hash": "",
+        **_pipeline_provenance(state),
     }
 
     eligible_count = len(matches)
@@ -2716,6 +2788,7 @@ def node_no_candidates(state: TrialMatchState) -> dict:
         "primary_condition": _resolve_primary_cancer(conditions),
         "condition_count": len(deduplicate_by_display(conditions)),
         "medication_count": len(deduplicate_by_display(medications)),
+        "allergy_count": len(patient_data.get("allergies", [])),
         "expanded_query": state.get("expanded_query", ""),
         "candidates_retrieved": len(state.get("hybrid_results", [])),
         "candidates_reranked": len(state.get("reranked_trials", [])),
@@ -2727,6 +2800,10 @@ def node_no_candidates(state: TrialMatchState) -> dict:
         "stage_dropped": state.get("stage_dropped", 0),
         "histology_dropped": state.get("histology_dropped", 0),
         "candidates_evaluated": 0,
+        # No evaluation ran, so no criterion was excluded from a score. Written
+        # anyway: the three terminal results declare the same keys, so a
+        # consumer never has to know which one produced the row it is reading.
+        "criteria_not_applicable": 0,
         "matches": [],
         "near_misses": [],
         "not_evaluable": [],
@@ -2742,7 +2819,8 @@ def node_no_candidates(state: TrialMatchState) -> dict:
         "error": "",
         "patient_data_hash": "",
         "stage_timings": state.get("stage_timings", {}),
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now().isoformat(),
+        **_pipeline_provenance(state),
     }
 
     print(f"[No Candidates] No matching trials for patient {patient_data['patient_id']}")
@@ -2768,6 +2846,7 @@ def node_error_handler(state: TrialMatchState) -> dict:
         "primary_condition": _resolve_primary_cancer(conditions),
         "condition_count": len(deduplicate_by_display(conditions)),
         "medication_count": len(deduplicate_by_display(medications)),
+        "allergy_count": len(patient_data.get("allergies", [])),
         "expanded_query": state.get("expanded_query", ""),
         "candidates_retrieved": len(state.get("hybrid_results", [])),
         "candidates_reranked": len(state.get("reranked_trials", [])),
@@ -2779,6 +2858,7 @@ def node_error_handler(state: TrialMatchState) -> dict:
         "stage_dropped": state.get("stage_dropped", 0),
         "histology_dropped": state.get("histology_dropped", 0),
         "candidates_evaluated": 0,
+        "criteria_not_applicable": 0,
         "matches": [],
         "near_misses": [],
         "not_evaluable": [],
@@ -2792,9 +2872,15 @@ def node_error_handler(state: TrialMatchState) -> dict:
         "gpt4o_output_tokens": state.get("gpt4o_output_tokens", 0),
         "error": error_msg,
         "patient_data_hash": "",
+        # Retired key. It said the same thing as gpt4o_retries but existed only
+        # on this path, which is how the count came to be logged as 0 for every
+        # run that did not end here. Kept as an alias for one release so an
+        # external consumer of the API response is not broken by the rename;
+        # nothing inside this repo reads it.
         "gpt4o_retries_exhausted": state.get("gpt4o_retries", 0),
         "stage_timings": state.get("stage_timings", {}),
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now().isoformat(),
+        **_pipeline_provenance(state),
     }
 
     print(f"[ERROR] Pipeline failed for patient {patient_data['patient_id']}: {error_msg}")
@@ -3761,6 +3847,8 @@ def match_patient_to_trials(
         "patient_data":       patient_data,
         "expanded_query":     "",
         "hybrid_results":     [],
+        "bm25_retrieved":     0,
+        "vector_retrieved":   0,
         "reranked_trials":    [],
         "filtered_trials":    [],
         "candidates_after_rule_filter": 0,
@@ -3814,7 +3902,7 @@ def display_match_results(result: Dict):
     # Check for pipeline error
     if result.get("error"):
         print(f"PIPELINE ERROR: {result['error']}")
-        retries = result.get("gpt4o_retries_exhausted", 0)
+        retries = result.get("gpt4o_retries", 0)
         if retries:
             print(f"GPT-4o retries exhausted: {retries}/{MAX_GPT4O_RETRIES}")
         print()
@@ -3825,8 +3913,10 @@ def display_match_results(result: Dict):
     not_evaluable = result.get("not_evaluable", [])
 
     print(f"Pipeline Summary:")
+    print(f"  BM25 Retrieved:        {result.get('bm25_retrieved', 0)}")
+    print(f"  Vector Retrieved:      {result.get('vector_retrieved', 0)}")
     print(f"  Candidates Retrieved:  {result.get('candidates_retrieved', 0)}")
-    
+
     print(f"  Candidates Re-Ranked:  {result.get('candidates_reranked', 0)}")
     print(f"  After Rule Filters:    {result.get('candidates_after_rule_filter', 0)}")
     print(f"  After Quality Filter:  {result.get('candidates_after_quality_filter', 0)}")
@@ -3836,6 +3926,10 @@ def display_match_results(result: Dict):
     print(f"  Not Eligible:          {len(near_misses)}")
     print(f"  Not Evaluable:         {len(not_evaluable)}")
     print(f"  Label Remaps:          {result.get('cross_vocab_remaps', 0)}")
+    if result.get("gpt4o_retries", 0):
+        print(f"  GPT-4o Retries:        {result['gpt4o_retries']}/{MAX_GPT4O_RETRIES}")
+    if result.get("ablation_flags"):
+        print(f"  Ablation Flags:        {result['ablation_flags']}")
 
     timings = result.get("stage_timings", {})
     if timings:

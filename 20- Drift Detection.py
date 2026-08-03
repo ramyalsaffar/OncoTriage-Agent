@@ -365,7 +365,13 @@ def detect_performance_drift(baseline_df: pd.DataFrame, current_df: pd.DataFrame
     quality_result = z_score_drift(baseline_quality, current_quality)
     results['match_quality_z_score'] = quality_result
 
-    # GPT-4o retry rate — early signal of JSON output instability
+    # GPT-4o retry rate — early signal of JSON output instability.
+    #
+    # Only meaningful for rows written after the logging-contract fix. Before
+    # it, node_finalize never emitted the retry count and File 14 read a key
+    # only node_error_handler wrote, so every successful inference logged 0 and
+    # this z-score was computed over a column that could not vary. A baseline
+    # window that straddles the fix understates the baseline mean.
     retry_result = z_score_drift(
         baseline_df['gpt4o_retries'].fillna(0).values.astype(float),
         current_df['gpt4o_retries'].fillna(0).values.astype(float)

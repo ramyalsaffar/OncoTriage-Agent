@@ -282,14 +282,28 @@ print("\n")
 
 
 # Query 12: Retrieval method comparison (BM25 vs Vector)
+#
+# bm25_retrieved is the count of DISTINCT trials returned across the three
+# sparse field queries (title / conditions / criteria), not their sum, so the
+# denominator below is the size of the pre-fusion candidate union and
+# fusion_efficiency is the share of it that survived into the RRF pool.
+#
+# Rows written before the logging-contract fix hold BM25_RETRIEVAL_SIZE and
+# VECTOR_RETRIEVAL_SIZE instead of observed counts. They are indistinguishable
+# from a genuine run of that size, so a stddev of ~0 over a long window means
+# the window predates the fix, not that retrieval is perfectly stable.
 df_retrieval = pd.read_sql_query("""
-    SELECT 
+    SELECT
+        COUNT(*) as n_rows,
         AVG(bm25_retrieved) as avg_bm25,
         AVG(vector_retrieved) as avg_vector,
         AVG(candidates_retrieved) as avg_total_after_fusion,
-        AVG(CAST(candidates_retrieved AS FLOAT) / (bm25_retrieved + vector_retrieved)) as fusion_efficiency
+        AVG(CAST(candidates_retrieved AS FLOAT)
+            / NULLIF(bm25_retrieved + vector_retrieved, 0)) as fusion_efficiency
     FROM inferences
-    WHERE bm25_retrieved > 0 AND vector_retrieved > 0
+    WHERE bm25_retrieved IS NOT NULL
+      AND vector_retrieved IS NOT NULL
+      AND (bm25_retrieved + vector_retrieved) > 0
 """, conn)
 print("=== RETRIEVAL METHOD PERFORMANCE ===")
 print(df_retrieval.T)
