@@ -267,6 +267,74 @@ COHORT_MANIFEST_FLUSH_EVERY = 100
 
 
 # ===========================================================================
+# ECOG PERFORMANCE STATUS SYNTHESIS (File 04, Synthea module)
+# ===========================================================================
+#
+# Synthea ships no performance-status module, so no bundle in the corpus
+# carries one. Nearly every interventional oncology trial gates on ECOG
+# (typically 0-1 or 0-2), which means that whole class of criterion is
+# unevaluable for every patient: Stage 5 can only answer "not stated", and a
+# criterion that is always "not stated" contributes nothing to the verdict.
+# File 04 writes a custom Generic Module Framework module that supplies one.
+#
+# BOTH VALUES BELOW ARE UNCALIBRATED HOLDING VALUES. Neither was fitted to a
+# registry, a trial screening log, or any published cohort. They are stated
+# here, restated in the module's own remarks block, and copied verbatim into
+# the run manifest so that any corpus generated from them carries the numbers
+# it was built with. Replace them with fitted values before any claim is made
+# about eligibility rates -- the eligible/not-eligible split the pipeline
+# reports moves directly with these two numbers.
+
+
+# Score distribution over ECOG 0-4, applied to every cancer patient that
+# receives a documented score.
+#
+# Grade 5 is "dead" and is deliberately absent: it is a valid ECOG value but a
+# dead patient is not a trial candidate, so emitting it would create rows that
+# can only ever be excluded. Absence here is what keeps 5 out of the corpus --
+# there is no separate suppression step.
+#
+# Skewed toward 0 and 1 rather than flat across 0-4 because the modelled
+# population is patients reaching trial screening, who are selected for
+# function: a flat 0-4 would put 60% of the cohort at ECOG >= 2 and make the
+# corpus look far less eligible than any real screening population. The exact
+# split (0.35 / 0.40 / 0.15 / 0.07 / 0.03) is a plausible shape, not a
+# measurement.
+#
+# Keys are the integer scores. Values must sum to 1.0; File 04 asserts this
+# before writing the module, because Synthea's distributed_transition
+# normalises silently and a set of weights that does not sum to 1 would
+# produce a distribution nobody chose.
+ECOG_SCORE_DISTRIBUTION = {
+    0: 0.35,   # Fully active, no restriction
+    1: 0.40,   # Restricted in strenuous activity, ambulatory
+    2: 0.15,   # Ambulatory, up >50% of waking hours, no work
+    3: 0.07,   # Limited self-care, confined to bed/chair >50% of waking hours
+    4: 0.03,   # Completely disabled, totally confined
+}
+
+# Fraction of cancer patients who carry NO ECOG observation at all.
+#
+# Real oncology records frequently lack a documented performance status, and a
+# corpus where every patient has one would let the pipeline evaluate an ECOG
+# criterion for 100% of patients -- an accuracy the source data does not have.
+# Modelling the gap keeps "criterion not evaluable" on the table as an outcome.
+# These patients carry no observation rather than a default score, because a
+# defaulted 0 is indistinguishable from a measured 0 downstream.
+#
+# This is the fraction drawn *deliberately*. The observed missingness in a
+# generated corpus is always HIGHER, because a patient who dies or reaches the
+# end of the simulation before the next encounter after diagnosis also ends up
+# with no observation. Both numbers are written to the run manifest
+# (ecog.missingness_fraction_configured vs ecog.missingness_fraction_observed)
+# so the gap is visible rather than inferred.
+ECOG_MISSINGNESS_FRACTION = 0.25
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
 # ABLATION ANALYSIS CONFIGURATION (File 27)
 # ===========================================================================
 

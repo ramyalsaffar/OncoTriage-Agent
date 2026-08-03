@@ -31,6 +31,8 @@ python "25- Batch Runner.py"                         # full-corpus run, no HTTP,
 
 # Data + index build (one-time / weekly)
 python "04- FHIR Generate Data.py"                   # Synthea JAR -> ~22k patients
+python "04- FHIR Generate Data.py" --population 3000 --seed 1 --output-dir <scratch>
+python "04- FHIR Generate Data.py" --module-only     # rewrite the ECOG module, no generation
 python "05- FHIR Clean Data.py"                      # in-place DELETE of non-cancer patients
 python "11- RAG Trial Indexer.py" --mode staging     # staging + atomic alias swap (default)
 python "11- RAG Trial Indexer.py" --mode direct      # rebuilds in place, causes downtime
@@ -80,6 +82,44 @@ Only `03- Code/` is version-controlled. Sibling directories under the project ro
 Conditional edges route to `node_no_candidates` when a stage empties the pool, and any exception lands in `node_error_handler`, which still emits a well-formed result. `match_patient_to_trials(patient_data, graph)` is the public entry point; it stamps `qdrant_collection` and `patient_data_hash` onto the result.
 
 **Ablation flags** ride in the state dict (`state["ablation_flags"]`) and are read at three points (nodes 2, 3, 4). `26- Ablation Study.py` toggles one stage per config; nothing else forks the pipeline.
+
+### Synthea generation and the ECOG module (File 04)
+
+File 04 no longer just shells out to the JAR. It writes a custom Generic Module
+Framework module (`SYNTHEA_MODULES_DIR`, resolved from `data_patient_path`) that
+records an ECOG performance status, hands it to Synthea with `-d`, then
+post-processes and documents the run:
+
+- **`-m` must name the ECOG module explicitly.** `MODULE_FILTER = "*cancer*"`
+  does not match it, and a module the filter misses is dropped **silently** —
+  Synthea exits 0 with no warning. `build_module_filter_argument()` joins the
+  two patterns; `generate_synthea_patients()` then greps the captured Synthea
+  log for the module's "Loading module …" line and fails the run if it is
+  absent. Never widen the filter without keeping that check.
+- **`valueQuantity` → `valueInteger` is a post-export rewrite, not the module.**
+  Synthea's `FhirR4.mapValueToFHIRType()` maps *every* numeric observation value
+  to a Quantity — there is no integer path — and its Observation validator
+  refuses to load a module whose numeric value has a blank unit. So the module
+  is forced to emit `valueQuantity` with the UCUM annotation unit `{score}`, and
+  `normalize_ecog_observations()` rewrites the exported bundles into the
+  `valueInteger` mCODE requires. It is idempotent and it raises on any score
+  that is non-integral or outside 0–4.
+- **The guard is `Active Condition` over SNOMED codes, not `Attribute`.** Synthea's
+  oncology modules set no common cancer flag (breast and colorectal set only
+  downstream attributes), so there is nothing to key on. `ECOG_GUARD_CANCER_CODES`
+  in File 04 is the code set, with its inclusions and exclusions argued inline.
+- **`ECOG_SCORE_DISTRIBUTION` and `ECOG_MISSINGNESS_FRACTION` (03) are
+  uncalibrated holding values.** Observed missingness always exceeds the
+  configured fraction, because a patient who dies before the next encounter
+  after diagnosis is also never scored. Both numbers land in the run manifest.
+- **Every run writes `generation_run_manifest.json`** next to the data: command,
+  seed, JAR sha256, module filename + sha256, the configured distribution and
+  missingness, and what was actually observed. That manifest is what a
+  regeneration needs; the stats dict File 04 used to print and drop was not.
+- `generate_synthea_patients()` **refuses** to write into an output directory
+  whose `fhir/` already holds bundles unless `--force` — Synthea appends rather
+  than replaces, so the default target being the live corpus made that a
+  one-keystroke way to interleave two populations.
 
 ### Supporting modules
 
