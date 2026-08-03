@@ -35,12 +35,14 @@ dag_dir.mkdir(parents=True, exist_ok=True)
 dag_content = '''"""
 Weekly Trial Refresh DAG
 
-Scrapes clinical trials weekly, rebuilds Qdrant index.
-Schedule: Sundays at 2:00 AM
+Scrapes clinical trials, rebuilds Qdrant index.
+Schedule: read from AIRFLOW_DAG_SCHEDULE in 03- Config.py (None = no automatic
+runs; the DAG stays registered and manually triggerable).
 
 Airflow 3.1.7 | TaskFlow API | Pure Python (no BashOperator)
 """
 
+import ast
 import sys
 import json
 import time
@@ -72,6 +74,30 @@ DATA_TRIAL_PATH = "/Users/ramyalsaffar/Ramy/C.V..V/07- LLM Projects/03- Clinical
 # =============================================================================
 # Config (loaded dynamically from 03- Config.py inside each task)
 # =============================================================================
+def _config_literal(name):
+    """Read one module-level literal out of 03- Config.py without running it.
+
+    Used for values needed at DAG PARSE time, in the scheduler's own process.
+    _load_config() below cannot serve that: it execs file 03, which calls
+    load_env_keys() (defined in file 02) and constructs the OpenAI and Qdrant
+    clients, so parsing a DAG would need keys and a network. Reading the
+    assignment out of the AST needs neither.
+
+    Raises if the name is absent. A schedule that cannot be read is a config
+    defect, and defaulting to some other schedule here would silently restore
+    automatic runs that were deliberately turned off.
+    """
+    config_path = PROJECT_CODE_PATH + "03- Config.py"
+    with open(config_path, "r") as f:
+        tree = ast.parse(f.read(), filename=config_path)
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == name:
+                    return ast.literal_eval(node.value)
+    raise RuntimeError(f"{name} is not assigned at module level in {config_path}")
+
+
 def _load_config() -> dict:
     """Exec file 03 into an isolated namespace and extract config values."""
     ns = {}
@@ -224,10 +250,16 @@ def _create_trial_embedding_text(trial: Dict) -> str:
 # =============================================================================
 # DAG Definition
 # =============================================================================
+# Resolved once per scheduler parse. None means no timetable: the DAG is still
+# registered and can be triggered by hand, it just never fires on its own.
+# See the AIRFLOW_DAG_SCHEDULE block in 03- Config.py for why it is off.
+DAG_SCHEDULE = _config_literal("AIRFLOW_DAG_SCHEDULE")
+
+
 @dag(
     dag_id="trial_refresh_weekly",
     description="Weekly clinical trial index rebuild",
-    schedule="0 2 * * 0",
+    schedule=DAG_SCHEDULE,
     start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
     catchup=False,
     default_args={
@@ -476,7 +508,14 @@ dag_file = dag_dir / 'trial_refresh_weekly.py'
 
 # If it exists
 if dag_file.exists():
-    print(f"✓ Will not create a new file because a DAG file already exists: {dag_file}")
+    if dag_file.read_text() == dag_content:
+        print(f"✓ DAG file already exists and matches this generator: {dag_file}")
+    else:
+        print(f"! DAG file already exists and DIFFERS from this generator: {dag_file}")
+        print("  Not overwriting, in case it was edited in place.")
+        print("  The scheduler parses that file, not the string in this one, so every")
+        print("  edit made here -- including the schedule -- is inert until it is replaced.")
+        print("  Delete it and re-run this file to regenerate.")
 else:
     dag_file.write_text(dag_content)
     print(f"✓ New DAG file created: {dag_file}")

@@ -218,7 +218,33 @@ def check_dag_status():
         dag_info = response.json()
         print(f"  ✓ DAG '{DAG_ID}' is registered!")
         print(f"  Active: {not dag_info.get('is_paused', True)}")
-        print(f"  Schedule: {dag_info.get('schedule_interval', 'N/A')}")
+
+        # Airflow 3's API v2 does not return 'schedule_interval' -- that field
+        # was Airflow 2's, and reading it here printed "N/A" on every run,
+        # whatever the DAG was actually set to. The schedule surfaces as
+        # 'timetable_summary' (a NullTimetable, i.e. schedule=None, summarises
+        # as "Never, external triggers only"); 'schedule' and
+        # 'timetable_description' are read as alternates in case the build
+        # returns one of those instead.
+        #
+        # Which key the value came from is printed, so "no schedule field in
+        # the response" stays distinguishable from "this DAG has no schedule".
+        schedule_field = None
+        for candidate in ("schedule", "timetable_summary", "timetable_description"):
+            if candidate in dag_info:
+                schedule_field = candidate
+                break
+
+        if schedule_field is None:
+            print("  Schedule: UNKNOWN - no schedule field in the API response")
+            print(f"            (keys returned: {sorted(dag_info.keys())})")
+        else:
+            schedule_value = dag_info[schedule_field]
+            if schedule_value in (None, "", "None"):
+                print(f"  Schedule: DISABLED - no automatic runs  [{schedule_field}]")
+            else:
+                print(f"  Schedule: {schedule_value}  [{schedule_field}]")
+
         print(f"  Tags: {[t.get('name', '') for t in dag_info.get('tags', [])]}")
     elif response.status_code == 404:
         print(f"  ✗ DAG '{DAG_ID}' NOT FOUND")

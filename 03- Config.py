@@ -114,6 +114,37 @@ ENABLE_RATE_LIMITING = False  # Toggle: True for production, False for batch eva
 RATE_LIMIT = "60/minute"     # Requests allowed per time window, Time window: "minute", "hour", "day"
 
 
+# Airflow trial_refresh_weekly schedule
+#--------------------------------------
+# Cron expression for the weekly index rebuild DAG written by
+# "23- Airflow DAG.py", or None for no automatic runs. The DAG stays registered
+# and manually triggerable either way -- None removes the timetable, it does not
+# remove the DAG.
+#
+# Currently None. The DAG's rebuild_index task creates its staging collection
+# with vectors_config only and no sparse_vectors_config, so the collection it
+# swaps the "trial_criteria" alias onto carries zero sparse vectors; it also
+# skips create_payload_indexes, enrich_structured_eligibility and
+# enrich_histology_tags, and it performs the alias swap inside rebuild_index
+# BEFORE verify_index runs, which is swap-then-check rather than the
+# check-then-swap that "11- RAG Trial Indexer.py" does. An unattended Sunday run
+# would therefore point live traffic at a half-built index and only afterwards
+# discover it was half-built. Cleanup keeps timestamped[2:], so the current
+# collection plus one prior survive and a rollback target exists, but rollback
+# is manual.
+#
+# The cost of None is staleness: the index holds ACTIVELY RECRUITING trials, so
+# it drifts toward closed studies for as long as this stays off. Trigger
+# "11- RAG Trial Indexer.py" manually rather than restoring the schedule as a
+# way of refreshing.
+#
+# Restore to "0 2 * * 0" (Sundays 02:00 UTC) once the DAG's rebuild task builds
+# the collection the way file 11 does and verifies before swapping. Changing it
+# here is not enough on its own: the scheduler parses the generated file under
+# {airflow_path}/dags/, and file 23 will not overwrite an existing one.
+AIRFLOW_DAG_SCHEDULE = None
+
+
 #------------------------------------------------------------------------------
 
 
