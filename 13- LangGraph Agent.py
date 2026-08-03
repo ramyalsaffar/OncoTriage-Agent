@@ -108,6 +108,47 @@ def tokenize_for_bm25(text: str) -> List[str]:
 # State Schema
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Degradation vocabularies
+# ---------------------------------------------------------------------------
+# Fixed label sets for the three places where the pipeline can quietly run on
+# less than it was built to run on. They are names for pipeline states, not
+# tunables, so they live here rather than in 03- Config.py. Every one of them
+# reaches a column in inferences.db.
+
+# --- Stage 2, per retrieval channel ---
+CHANNEL_OK = "ok"                        # query returned a (possibly empty) result list
+CHANNEL_FAILED = "failed"                # query raised; the channel contributed nothing
+CHANNEL_ABLATED = "ablated"              # retrieval_mode deliberately excluded it
+CHANNEL_EMPTY_QUERY = "empty_query"      # query text tokenized to zero BM25 terms
+                                         # (see the guard in _sparse_query below)
+
+# Channels that must be present in retrieval_channels on every run, so a
+# missing key is a bug rather than a channel that "did not happen".
+RETRIEVAL_CHANNELS = ("title", "conditions", "criteria", "dense")
+
+# --- Stage 1, which query the run actually searched with ---
+EXPANSION_PATH_MESH = "mesh_expanded"          # MeSH walk produced descriptors
+EXPANSION_PATH_FALLBACK = "base_query_fallback"  # degraded to demographics + display
+
+# --- Stage 4, whether the cancer site filter ran ---
+MESH_FILTER_APPLIED = "applied"
+MESH_FILTER_SKIP_ABLATED = "ablation_skipped"    # skip_mesh_filter flag set
+MESH_FILTER_SKIP_NO_FILTER = "no_mesh_filter"    # MeSH data files never loaded
+MESH_FILTER_SKIP_NO_TREES = "no_patient_trees"   # patient never resolved to C04 trees
+
+
+class _EmptySparseQuery(Exception):
+    """A BM25 query text tokenized to zero terms, so there is nothing to search.
+
+    Raised by node_hybrid_retrieval's _sparse_query and caught by its own
+    channel collector, which records CHANNEL_EMPTY_QUERY. Kept distinct from a
+    Qdrant failure because the two need different responses: a failed channel
+    means the index or the network is unwell, an empty query means the patient
+    record produced no searchable disease text.
+    """
+
+
 class TrialMatchState(TypedDict):
     """Shared state that flows through every node in the pipeline.
 
@@ -133,6 +174,15 @@ class TrialMatchState(TypedDict):
     # rather than an inference from an empty tree list.
     mesh_resolution: str
 
+    # Which branch Stage 1 took: EXPANSION_PATH_MESH when the MeSH walk
+    # produced terms, EXPANSION_PATH_FALLBACK when it produced none and the
+    # query degraded to demographics + diagnosis display. mesh_resolution says
+    # WHY resolution failed; this says WHAT the run then searched with, and the
+    # two are not the same fact — a resolution can name a layer and still yield
+    # no descriptors. Logged to inferences.query_expansion_path so the
+    # fallback rate is a query rather than an unread WARNING line.
+    query_expansion_path: str
+
     # --- Stage 2: Hybrid Retrieval ---
     hybrid_results: List[Dict]                  # Trials from BM25 + Vector + RRF
 
@@ -145,6 +195,36 @@ class TrialMatchState(TypedDict):
     # configuration rather than of the run.
     bm25_retrieved: int                         # unique NCT IDs across the 3 sparse fields
     vector_retrieved: int                       # unique NCT IDs from the dense channel
+
+    # Per-channel outcome for the four retrieval channels (title, conditions,
+    # criteria, dense). Shape:
+    #     {"title": {"status": CHANNEL_OK, "count": 75, "error": ""}, ...}
+    # status is one of the CHANNEL_* constants below. Written by Stage 2 and
+    # logged to inferences.retrieval_channels as JSON.
+    #
+    # bm25_retrieved / vector_retrieved cannot carry this: a dense outage and a
+    # dense channel that legitimately matched nothing both report 0, and three
+    # sparse channels collapse into one union count in which a single failed
+    # field is invisible. Fusion continues on whatever channels returned, so
+    # without this field a run on two channels is indistinguishable from a
+    # clean run in every stored record.
+    retrieval_channels: Dict
+
+    # Derived scalars over retrieval_channels, so degradation is queryable
+    # without parsing JSON in SQL:
+    #   expected — channels the retrieval mode called for (4 hybrid, 3
+    #              bm25_only, 1 vector_only); ablated channels are not expected
+    #              and never count as degradation
+    #   ok       — expected channels that returned a result list
+    #   degraded — 1 when ok < expected, else 0
+    retrieval_channels_expected: int
+    retrieval_channels_ok: int
+    retrieval_degraded: int
+
+    # Trials that won a place in the fusion pool but whose payload could not be
+    # recovered from Qdrant, so they never reached Stage 3. The batch-scroll
+    # fallback that loses them printed a line and nothing else.
+    retrieval_trials_lost: int
 
     # --- Stage 3: Cross-Encoder Re-Ranking ---
     reranked_trials: List[Dict]                 # Top-K after cross-encoder scoring
@@ -159,6 +239,17 @@ class TrialMatchState(TypedDict):
     
     patient_trees: set                           # Resolved MeSH C04 tree numbers (Stage 3 → Stage 4)
     patient_histology: set                       # Histology tags (Stage 3 → Stage 4)
+
+    # Whether Stage 4's cancer site filter actually ran against the candidate
+    # pool, and why not when it did not (one of the MESH_FILTER_SKIP_*
+    # constants). The filter is conditional on _MESH_FILTER being loaded AND
+    # the patient resolving to specific C04 trees, so "mesh_dropped == 0" has
+    # always meant either "checked, nothing to drop" or "never checked".
+    #
+    # Stage 5 reads mesh_filter_applied to decide whether its system prompt may
+    # assert that disease relevance was confirmed. Both are logged.
+    mesh_filter_applied: bool
+    mesh_filter_skip_reason: str
 
     # --- Stage 5: GPT-4o Evaluation ---
     evaluations: List[Dict]                     # Criterion-level match results
@@ -731,6 +822,7 @@ def node_query_expansion(state: dict) -> dict:
 
     if mesh_result["mesh_terms"]:
         # ── SUCCESS: Build expanded_query from MeSH terms ─────────────────
+        expansion_path = EXPANSION_PATH_MESH
         expanded_terms = ", ".join(mesh_result["mesh_terms"])
         expanded_query = f"{base_query}, {expanded_terms}"
 
@@ -783,6 +875,11 @@ def node_query_expansion(state: dict) -> dict:
         # ── FALLBACK: MeSH resolution failed ──────────────────────────────
         # Same behavior as the previous GPT-4o-mini API-failure fallback.
         # Uses base_query only (demographics + primary diagnosis display).
+        #
+        # Recorded, not only printed: this WARNING was the sole trace of a
+        # degraded query, so the rate at which the pipeline searched without
+        # any MeSH expansion was unknowable from the stored records.
+        expansion_path = EXPANSION_PATH_FALLBACK
         print(f"  WARNING: MeSH expansion failed (resolution={mesh_result['resolution']}). "
               f"Falling back to base query (degraded).")
         expanded_query = base_query
@@ -804,6 +901,7 @@ def node_query_expansion(state: dict) -> dict:
     print(f"  Rerank queries ({len(rerank_queries)}):")
     for i, rq in enumerate(rerank_queries, 1):
         print(f"    R{i}: {rq}")
+    print(f"  Expansion path: {expansion_path}")
     if mesh_result["mesh_terms"]:
         print(f"  MeSH resolution: {mesh_result['resolution']} | "
               f"trees: {len(mesh_result['patient_trees'])} | "
@@ -815,6 +913,9 @@ def node_query_expansion(state: dict) -> dict:
         "expansion_prompt": expansion_info,
         "expansion_input_tokens": 0,
         "expansion_output_tokens": 0,
+        # Which branch above ran. Paired with mesh_resolution: that says why
+        # the MeSH walk produced nothing, this says the query was degraded.
+        "query_expansion_path": expansion_path,
         # Which layer resolved the patient's MeSH identity, or why none did.
         # Stage 3 re-resolves from the same conditions with the same helper,
         # so this one string describes the trees Stage 4 filters on too.
@@ -889,12 +990,37 @@ def node_hybrid_retrieval(state: TrialMatchState) -> dict:
     # Helper: run a single Qdrant sparse BM25 query
     # ------------------------------------------------------------------
     def _sparse_query(sparse_vector_name: str, query_text: str, limit: int):
-        """Generate sparse query vector and search Qdrant."""
+        """Generate sparse query vector and search Qdrant.
+
+        Raises _EmptySparseQuery when the text carries no BM25 terms. Measured
+        behaviour, not a defensive guess (see 37- Retrieval Observability
+        Test.py, which reproduces both halves against real components):
+
+          - FastEmbed Qdrant/bm25 returns zero indices for an empty string,
+            whitespace, punctuation-only text and stopword-only text. It
+            lowercases, strips punctuation and drops stopwords, so a query is
+            not required to be empty to tokenize to nothing.
+          - Qdrant does NOT reject an empty SparseVector. A real server
+            (v1.18.3, three IDF sparse fields) accepts the query and returns
+            zero points, exactly as a well-formed query matching nothing does.
+
+        So the failure mode is not a crash; it is a channel that returns an
+        empty list for a reason no stored record could distinguish from "this
+        query legitimately matched no trial". The raise exists to give that
+        outcome its own status, and it fires before the network call because
+        there is nothing to ask Qdrant.
+        """
         sparse_emb = next(_bm25_query_model.query_embed(query_text))
+        indices = sparse_emb.indices.tolist()
+        if not indices:
+            raise _EmptySparseQuery(
+                f"{sparse_vector_name}: query text {query_text!r} carries no "
+                f"BM25 terms after tokenization"
+            )
         return qdrant_client.query_points(
             collection_name=COLLECTION_NAME,
             query=SparseVector(
-                indices=sparse_emb.indices.tolist(),
+                indices=indices,
                 values=sparse_emb.values.tolist(),
             ),
             using=sparse_vector_name,
@@ -909,6 +1035,15 @@ def node_hybrid_retrieval(state: TrialMatchState) -> dict:
     conditions_results = []
     criteria_results = []
     vector_results = []
+
+    # Per-channel outcome record. Every channel is present on every run: the
+    # ones this retrieval mode does not call for keep CHANNEL_ABLATED, the ones
+    # it submits are overwritten below with what actually happened. A channel
+    # is never silently absent from the record.
+    retrieval_channels = {
+        name: {"status": CHANNEL_ABLATED, "count": 0, "error": ""}
+        for name in RETRIEVAL_CHANNELS
+    }
 
     futures = {}
 
@@ -941,7 +1076,17 @@ def node_hybrid_retrieval(state: TrialMatchState) -> dict:
         else:
             print("  [Ablation] Dense vector search SKIPPED (bm25_only mode)")
 
-    # Collect results (with error handling per channel)
+    # Collect results, recording the outcome of every channel this mode ran.
+    #
+    # Fusion below proceeds on whatever came back, which is the right behaviour
+    # — a dense outage should still return BM25 results rather than nothing —
+    # but it is only defensible if the run says it happened. The status written
+    # here is what reaches inferences.retrieval_channels.
+    #
+    # Error text is truncated: this column is a signal that a channel dropped
+    # out and which one, not a place to store a stack trace.
+    _CHANNEL_ERROR_MAX_CHARS = 200
+
     for channel_name, future in futures.items():
         try:
             results = future.result(timeout=30)
@@ -953,7 +1098,28 @@ def node_hybrid_retrieval(state: TrialMatchState) -> dict:
                 criteria_results = results
             elif channel_name == "dense":
                 vector_results = results
+            retrieval_channels[channel_name] = {
+                "status": CHANNEL_OK,
+                "count": len(results),
+                "error": "",
+            }
+        except _EmptySparseQuery as e:
+            # The channel ran on a query with no BM25 terms. Qdrant would have
+            # accepted it and returned nothing (verified against a real server
+            # — see _sparse_query), so without this branch the channel would
+            # report a clean zero.
+            retrieval_channels[channel_name] = {
+                "status": CHANNEL_EMPTY_QUERY,
+                "count": 0,
+                "error": str(e)[:_CHANNEL_ERROR_MAX_CHARS],
+            }
+            print(f"  WARNING: {channel_name} search skipped — {e}")
         except Exception as e:
+            retrieval_channels[channel_name] = {
+                "status": CHANNEL_FAILED,
+                "count": 0,
+                "error": f"{type(e).__name__}: {e}"[:_CHANNEL_ERROR_MAX_CHARS],
+            }
             print(f"  WARNING: {channel_name} search failed: {e}")
 
     # ------------------------------------------------------------------
@@ -1012,6 +1178,10 @@ def node_hybrid_retrieval(state: TrialMatchState) -> dict:
 
     trials = []
     missing_nct_ids = []
+    # Trials that were ranked into the fusion pool but whose payload could not
+    # be recovered, so they never reached Stage 3. Counted rather than only
+    # printed: this is a second way the pool silently shrinks.
+    trials_lost = 0
 
     for nct_id, fusion_score in ranked_nct_ids:
         trial_data = payload_map.get(nct_id)
@@ -1052,7 +1222,11 @@ def node_hybrid_retrieval(state: TrialMatchState) -> dict:
                         "trial": trial_data,
                         "fusion_score": fusion_scores[nct_id],
                     })
+                else:
+                    # Ranked in, but the backfill did not return it either.
+                    trials_lost += 1
         except Exception as e:
+            trials_lost += len(missing_nct_ids)
             print(f"  WARNING: Batch scroll failed: {e}")
             print(f"  Lost {len(missing_nct_ids)} trials from retrieval pool")
 
@@ -1084,6 +1258,19 @@ def node_hybrid_retrieval(state: TrialMatchState) -> dict:
     )
     vector_retrieved = len(vector_ranks)
 
+    # ── Channel-level degradation, as counts rather than as printed lines ──
+    #
+    # "Expected" is the number of channels this retrieval mode called for, so
+    # an ablated channel is never counted as a loss: under bm25_only the run is
+    # not degraded for having no dense results, it is configured that way.
+    # Anything else that did not return — a raise, or a query with no BM25
+    # terms — is the real thing, and degraded=1 makes it a WHERE clause.
+    channels_expected = len(futures)
+    channels_ok = sum(
+        1 for c in retrieval_channels.values() if c["status"] == CHANNEL_OK
+    )
+    retrieval_degraded = int(channels_ok < channels_expected)
+
     if _retrieval_mode != "hybrid":
         mode_label = f"{_retrieval_mode} (ablation)"
     elif vector_results and title_results:
@@ -1095,6 +1282,15 @@ def node_hybrid_retrieval(state: TrialMatchState) -> dict:
 
     print(f"[Stage 2] {mode_label} retrieval: {elapsed:.2f}s | {len(trials)} trials")
     print(f"  Channels: {', '.join(active_channels)}")
+    print(
+        "  Channel status: "
+        + ", ".join(
+            f"{name}={retrieval_channels[name]['status']}"
+            for name in RETRIEVAL_CHANNELS
+        )
+        + f" | {channels_ok}/{channels_expected} expected channels returned"
+        + (" [DEGRADED]" if retrieval_degraded else "")
+    )
     print(f"  Disease query: \"{disease_query}\"")
     print(f"  Fusion pool: {len(all_nct_ids)} unique NCTs -> top {len(ranked_nct_ids)}")
     print(
@@ -1102,11 +1298,20 @@ def node_hybrid_retrieval(state: TrialMatchState) -> dict:
         f"{3 * BM25_RETRIEVAL_SIZE} requested), vector={vector_retrieved} "
         f"(of {VECTOR_RETRIEVAL_SIZE} requested)"
     )
+    if trials_lost:
+        print(f"  Payload backfill lost {trials_lost} ranked trial(s)")
 
     return {
         "hybrid_results": trials,
         "bm25_retrieved": bm25_retrieved,
         "vector_retrieved": vector_retrieved,
+        # Per-channel outcome + the three scalars derived from it. These are
+        # the record that the run used the retrieval it was configured for.
+        "retrieval_channels": retrieval_channels,
+        "retrieval_channels_expected": channels_expected,
+        "retrieval_channels_ok": channels_ok,
+        "retrieval_degraded": retrieval_degraded,
+        "retrieval_trials_lost": trials_lost,
         "stage_timings": {
             **state.get("stage_timings", {}),
             "hybrid_retrieval": round(elapsed, 3),
@@ -1611,6 +1816,26 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
                       f"[{state.get('mesh_resolution') or 'unrecorded'}] — "
                       f"cancer site filter skipped")
 
+    # --- Did the cancer site filter actually run? ---
+    #
+    # The per-trial condition below is loop-invariant, so it is decided once
+    # here and recorded. Stage 5's system prompt asserts to the model that
+    # disease relevance "has already been confirmed"; that sentence is only
+    # true when this is MESH_FILTER_APPLIED. In the other three cases the model
+    # was told a check passed that never ran, and no stored record said so.
+    if _skip_mesh:
+        mesh_filter_skip_reason = MESH_FILTER_SKIP_ABLATED
+    elif _MESH_FILTER is None:
+        mesh_filter_skip_reason = MESH_FILTER_SKIP_NO_FILTER
+    elif not patient_trees:
+        # Covers both "unmapped" and "pan_cancer_only": state["mesh_resolution"]
+        # carries which one, this carries the consequence.
+        mesh_filter_skip_reason = MESH_FILTER_SKIP_NO_TREES
+    else:
+        mesh_filter_skip_reason = MESH_FILTER_APPLIED
+
+    mesh_filter_applied = mesh_filter_skip_reason == MESH_FILTER_APPLIED
+
     # --- Extract patient cancer stage ---
     patient_stage = extract_patient_stage(
         conditions,
@@ -1639,11 +1864,10 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
         eligibility = trial["eligibility"]
 
         # --- Cancer site filter ---
-        if not _skip_mesh:
-            if _MESH_FILTER is not None and patient_trees:
-                if not _MESH_FILTER.is_cancer_relevant(patient_trees, trial):
-                    mesh_dropped += 1
-                    continue
+        if mesh_filter_applied:
+            if not _MESH_FILTER.is_cancer_relevant(patient_trees, trial):
+                mesh_dropped += 1
+                continue
 
         # --- Cancer stage filter ---
         if not _skip_stage:
@@ -1697,6 +1921,10 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
 
     elapsed = time.time() - start
     
+    if not mesh_filter_applied:
+        print(f"  Cancer site filter DID NOT RUN [{mesh_filter_skip_reason}] — "
+              f"Stage 5 will not assert that disease relevance was confirmed")
+
     print(
         f"[Stage 4] Rule-based filter: {elapsed:.2f}s | "
         f"{len(trials)} -> {len(quality_filtered)} trials"
@@ -1713,6 +1941,10 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
         "mesh_dropped": mesh_dropped,
         "histology_dropped": histology_dropped,
         "stage_dropped": stage_dropped,
+        # Read by Stage 5 to decide what its system prompt may assert, and
+        # logged so a stored inference says whether the check ran.
+        "mesh_filter_applied": mesh_filter_applied,
+        "mesh_filter_skip_reason": mesh_filter_skip_reason,
         "stage_timings": {**state.get("stage_timings", {}), "rule_filter": round(elapsed, 3)}
     }
 
@@ -1753,8 +1985,9 @@ def node_gpt4o_evaluation(state: TrialMatchState) -> dict:
     # Build trials text for prompt
     # Only eligibility criteria sent to GPT-4o. Title, conditions, brief
     # summary, interventions stripped to prevent GPT-4o from performing
-    # its own disease relevance check. Disease relevance enforced upstream
-    # by MeSH filter, hybrid retrieval, and cross-encoder reranking.
+    # its own disease relevance check. Disease relevance enforced upstream by
+    # hybrid retrieval, cross-encoder reranking and — when it ran — the MeSH
+    # site filter. Whether it ran is what Section 2 below is conditional on.
     trials_text = ""
     for idx, trial_obj in enumerate(trials):
         trial = trial_obj["trial"]
@@ -1765,6 +1998,45 @@ def node_gpt4o_evaluation(state: TrialMatchState) -> dict:
 
 ---
 """
+
+
+    # ------------------------------------------------------------------
+    # Section 2 of the system prompt is an assertion about THIS run
+    # ------------------------------------------------------------------
+    # It told the model that disease relevance "has already been confirmed"
+    # and then forbade it from assessing relevance at all. That pair of
+    # sentences is only sound when Stage 4's cancer site filter ran, and it is
+    # conditional on three things (the MeSH data files being loaded, the
+    # patient resolving to specific C04 trees, and the ablation flag being
+    # off). When any of them fails the model was handed a false premise
+    # together with a rule preventing it from noticing.
+    #
+    # What limits the damage, and is recorded here rather than assumed:
+    #   - The indexed corpus is oncology-only, so "every trial is a cancer
+    #     trial" holds regardless. The claim that fails is the narrower one,
+    #     that the trial matches THIS patient's cancer site.
+    #   - Only eligibility criteria text is sent (see the trials_text build
+    #     above), and RULE 3's categorically-different-diseases branch already
+    #     turns an off-site trial into a criterion-level "not_met" whenever the
+    #     criteria name the disease, which most oncology criteria do.
+    # The residual exposure is a trial whose criteria never state the disease,
+    # evaluated for a patient whose site was never checked. The unconfirmed
+    # variant below lifts the prohibition for exactly that case.
+    #
+    # False when Stage 4 did not record the flag at all (the state key is
+    # absent only if Stage 4 never ran), which is the conservative direction:
+    # never assert a check that cannot be shown to have happened.
+    _mesh_filter_applied = bool(state.get("mesh_filter_applied", False))
+    _mesh_filter_reason = state.get("mesh_filter_skip_reason") or "unrecorded"
+
+    if _mesh_filter_applied:
+        scope_limitation = """Disease relevance has already been confirmed. An upstream filter compared this patient's cancer site against every trial below. Every trial you receive is disease-relevant.
+
+Your ONLY job is to evaluate the eligibility criteria text (inclusion and exclusion) against the patient record. Do not assess disease relevance. Do not disqualify a trial for any reason other than a criterion-level "not_met" or "violated" classification."""
+    else:
+        scope_limitation = f"""Disease relevance has NOT been confirmed for this patient. The upstream cancer site filter did not run ({_mesh_filter_reason}), so the trials below were selected by text retrieval and re-ranking alone. They come from an oncology-only corpus, so each one is a cancer trial, but none has been checked against this patient's cancer site.
+
+Your job is to evaluate the eligibility criteria text (inclusion and exclusion) against the patient record. Where a criterion names a disease categorically different from the patient's documented cancer, classify it under RULE 3 in the normal way (inclusion -> "not_met", exclusion -> "not_violated"). That is the only form in which disease relevance may enter your output: judge criteria, never the trial as a whole, and reason only from the criteria text you were given. Do not disqualify a trial for any reason other than a criterion-level "not_met" or "violated" classification."""
 
 
 # The prompt engineering for the system prompt was:
@@ -1870,9 +2142,7 @@ If patient data EXISTS and CONTRADICTS a criterion, that is "not_met" (inclusion
 SECTION 2 -- SCOPE LIMITATION
 =====================================================================
 
-Disease relevance has already been confirmed. Every trial you receive is disease-relevant.
-
-Your ONLY job is to evaluate the eligibility criteria text (inclusion and exclusion) against the patient record. Do not assess disease relevance. Do not disqualify a trial for any reason other than a criterion-level "not_met" or "violated" classification.
+{scope_limitation}
 
 =====================================================================
 SECTION 3 -- CRITERION EVALUATION ORDER
@@ -2586,6 +2856,9 @@ CLINICAL TRIALS:
 
     elapsed = time.time() - start
     print(f"[Stage 5] GPT-4o evaluation: {elapsed:.2f}s | {len(evaluations)} trials evaluated")
+    print(f"  Scope limitation: relevance "
+          f"{'confirmed upstream' if _mesh_filter_applied else 'NOT confirmed'} "
+          f"[{_mesh_filter_reason}]")
 
     return {
         "evaluations": evaluations,
@@ -2634,6 +2907,28 @@ def _pipeline_provenance(state) -> Dict:
         # the true count of what that channel retrieved.
         "bm25_retrieved": state.get("bm25_retrieved", 0),
         "vector_retrieved": state.get("vector_retrieved", 0),
+
+        # --- Degradation record (see the vocabularies at the top of this file) ---
+        #
+        # These four default to None, not to a clean value, and File 14 writes
+        # NULL for None. The distinction matters more here than anywhere else
+        # in this dict: a run that ended before Stage 2 has no channel outcomes
+        # to report, and writing "0 failures" for it would assert the opposite
+        # of what happened. A caller reading these must treat NULL as "the
+        # stage did not report", never as "nothing went wrong".
+        "retrieval_channels": dict(state["retrieval_channels"])
+                              if state.get("retrieval_channels") else None,
+        "retrieval_channels_expected": state.get("retrieval_channels_expected"),
+        "retrieval_channels_ok": state.get("retrieval_channels_ok"),
+        "retrieval_degraded": state.get("retrieval_degraded"),
+        "retrieval_trials_lost": state.get("retrieval_trials_lost"),
+
+        # Which query Stage 1 handed to retrieval, and whether Stage 4's cancer
+        # site filter ran. Both None when the stage that writes them did not
+        # complete. mesh_filter_applied is stored as 0/1 by File 14.
+        "query_expansion_path": state.get("query_expansion_path"),
+        "mesh_filter_applied": state.get("mesh_filter_applied"),
+        "mesh_filter_skip_reason": state.get("mesh_filter_skip_reason"),
     }
 
 
@@ -3864,6 +4159,10 @@ def match_patient_to_trials(
         "patient_trees":      set(),
         "patient_histology":  set(),
         "mesh_resolution":    "",
+        # Degradation keys are deliberately NOT pre-seeded with clean values.
+        # The stage that owns each one writes it; until then it is absent, and
+        # _pipeline_provenance() turns absence into NULL rather than into a
+        # claim that the stage ran and found nothing wrong.
     }
 
     # Invoke the LangGraph pipeline

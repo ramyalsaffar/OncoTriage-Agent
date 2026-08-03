@@ -100,6 +100,43 @@ INFERENCE_COLUMN_ADDITIONS = {
     # the exact confusion this project treats as a defect. The column exists
     # now so the detector has somewhere to write without a second migration.
     "hallucinated_trials":  "INTEGER",
+    # --- Retrieval and expansion degradation (item 11b) ---------------------
+    # Stage 2 runs four retrieval channels behind one try/except each. Before
+    # these columns existed, a channel that raised was printed and dropped, and
+    # fusion continued on the survivors: a dense-search outage produced the
+    # same stored row as a clean run. bm25_retrieved / vector_retrieved cannot
+    # substitute — 0 means both "returned nothing" and "never returned".
+    #
+    # retrieval_channels holds the per-channel record as JSON:
+    #   {"title": {"status": "ok", "count": 75, "error": ""},
+    #    "dense": {"status": "failed", "count": 0, "error": "..."}}
+    # status is one of File 13's CHANNEL_* constants: ok | failed | ablated |
+    # empty_query. The scalars beside it are the same fact in queryable form,
+    # with ablated channels excluded from "expected" so a bm25_only ablation is
+    # not reported as a degraded run.
+    #
+    # NULL on every one of them means Stage 2 did not report, which is not the
+    # same as a clean run — see _pipeline_provenance() in File 13.
+    "retrieval_channels":           "TEXT",
+    "retrieval_channels_expected":  "INTEGER",
+    "retrieval_channels_ok":        "INTEGER",
+    "retrieval_degraded":           "INTEGER",  # 1 = an expected channel did not return
+    # Trials ranked into the fusion pool whose payload could not be recovered,
+    # so they never reached Stage 3. The batch-scroll fallback that loses them
+    # used to print a line and keep going.
+    "retrieval_trials_lost":        "INTEGER",
+    # Which query Stage 1 searched with: "mesh_expanded" or
+    # "base_query_fallback". The fallback printed a WARNING and nothing else,
+    # so the rate at which the pipeline ran without any MeSH expansion was not
+    # recoverable from the database. Distinct from mesh_resolution, which says
+    # why resolution failed rather than what the run then did.
+    "query_expansion_path":         "TEXT",
+    # Whether Stage 4's cancer site filter actually ran (1/0), and why not.
+    # Stage 5's system prompt asserts to the model that disease relevance was
+    # confirmed; that assertion is now conditional on this flag, so the flag
+    # belongs in the record of the inference it shaped.
+    "mesh_filter_applied":          "INTEGER",
+    "mesh_filter_skip_reason":      "TEXT",
 }
 
 _existing_inference_columns = {
@@ -305,8 +342,12 @@ def log_inference(result: Dict, patient_data: Dict):
                 matching_model, cross_encoder_model,
                 pricing_version, estimated_cost_usd, qdrant_collection, error,
                 patient_data_hash, expansion_prompt,
-                gpt4o_retries, ablation_flags, hallucinated_trials
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                gpt4o_retries, ablation_flags, hallucinated_trials,
+                retrieval_channels, retrieval_channels_expected,
+                retrieval_channels_ok, retrieval_degraded,
+                retrieval_trials_lost, query_expansion_path,
+                mesh_filter_applied, mesh_filter_skip_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             result["patient_id"],
             result["timestamp"],
@@ -370,6 +411,23 @@ def log_inference(result: Dict, patient_data: Dict):
             # NULL until item 33's detector writes the key: see the migration
             # note above for why this is not defaulted to 0.
             result.get("hallucinated_trials"),               # hallucinated_trials
+            # Degradation record. Every one of these is .get() with no default,
+            # so a result dict that never reached the stage in question writes
+            # NULL rather than a value that would read as "checked, all clean".
+            # retrieval_channels is serialized only when present: json.dumps(None)
+            # would store the string 'null', which is not the same as SQL NULL.
+            (json.dumps(result["retrieval_channels"])
+             if result.get("retrieval_channels") else None),
+            result.get("retrieval_channels_expected"),
+            result.get("retrieval_channels_ok"),
+            result.get("retrieval_degraded"),
+            result.get("retrieval_trials_lost"),
+            result.get("query_expansion_path"),
+            # bool -> 0/1 for SQLite, but None stays None: "the filter did not
+            # report" is a third state and must not collapse into "did not run".
+            (None if result.get("mesh_filter_applied") is None
+             else int(bool(result["mesh_filter_applied"]))),
+            result.get("mesh_filter_skip_reason"),
         ))
         
         inference_id = cursor.lastrowid

@@ -673,6 +673,98 @@ print("\n")
 #------------------------------------------------------------------------------
 
 
+# Degradation queries (item 11b)
+#
+# Everything below reads the columns that make a partly-degraded run visible.
+# The convention across all of them: NULL means the stage never reported, and
+# is counted separately from 0. A query that folds NULL into 0 re-creates the
+# defect these columns exist to remove.
+
+
+# Query: how often did the pipeline run on fewer retrieval channels than
+# configured? retrieval_degraded already excludes channels the ablation
+# switched off, so a 1 here is a real loss.
+df_retrieval_degraded = pd.read_sql_query("""
+    SELECT
+        COUNT(*)                                                   AS rows_total,
+        SUM(CASE WHEN retrieval_degraded IS NULL THEN 1 ELSE 0 END) AS not_reported,
+        SUM(CASE WHEN retrieval_degraded = 1 THEN 1 ELSE 0 END)     AS degraded,
+        ROUND(100.0 * SUM(CASE WHEN retrieval_degraded = 1 THEN 1 ELSE 0 END)
+              / NULLIF(SUM(CASE WHEN retrieval_degraded IS NOT NULL
+                                THEN 1 ELSE 0 END), 0), 2)         AS degraded_pct_of_reported,
+        SUM(COALESCE(retrieval_trials_lost, 0))                    AS trials_lost_total
+    FROM inferences
+""", conn)
+print("=== RETRIEVAL DEGRADATION ===")
+print(df_retrieval_degraded.to_string(index=False))
+print("\n")
+
+
+# Query: which channels dropped out, and how. retrieval_channels is JSON, so
+# the status is matched as a substring per channel name rather than parsed.
+df_channel_status = pd.read_sql_query("""
+    SELECT
+        timestamp, patient_id,
+        retrieval_channels_ok || '/' || retrieval_channels_expected AS channels_ok,
+        retrieval_trials_lost,
+        retrieval_channels
+    FROM inferences
+    WHERE retrieval_degraded = 1
+    ORDER BY timestamp DESC
+    LIMIT 25
+""", conn)
+print("=== MOST RECENT DEGRADED RETRIEVALS ===")
+print(df_channel_status.to_string(index=False))
+print("\n")
+
+
+# Query: MeSH expansion fallback rate. The fallback searches on demographics
+# plus the raw diagnosis display, with no MeSH vocabulary at all, and used to
+# leave nothing behind but a printed WARNING.
+df_expansion_path = pd.read_sql_query("""
+    SELECT
+        COALESCE(query_expansion_path, '(not reported)') AS query_expansion_path,
+        COALESCE(mesh_resolution, '(none)')              AS mesh_resolution,
+        COUNT(*)                                         AS n,
+        ROUND(AVG(candidates_retrieved), 1)              AS avg_retrieved,
+        ROUND(AVG(eligible_matches), 2)                  AS avg_eligible
+    FROM inferences
+    GROUP BY query_expansion_path, mesh_resolution
+    ORDER BY n DESC
+""", conn)
+print("=== QUERY EXPANSION PATH x MESH RESOLUTION ===")
+print(df_expansion_path.to_string(index=False))
+print("\n")
+
+
+# Query: how often was the judge told relevance was confirmed, and how often
+# did the cancer site filter actually run? mesh_dropped = 0 cannot answer this
+# on its own — it is the same value whether the filter checked and dropped
+# nothing or never ran.
+df_relevance_assertion = pd.read_sql_query("""
+    SELECT
+        CASE mesh_filter_applied
+             WHEN 1 THEN 'filter ran (prompt asserts confirmed)'
+             WHEN 0 THEN 'filter skipped (prompt says unconfirmed)'
+             ELSE '(not reported)'
+        END                                          AS relevance_assertion,
+        COALESCE(mesh_filter_skip_reason, '(none)')  AS skip_reason,
+        COUNT(*)                                     AS n,
+        ROUND(AVG(mesh_dropped), 2)                  AS avg_mesh_dropped,
+        ROUND(AVG(candidates_evaluated), 2)          AS avg_evaluated,
+        ROUND(AVG(eligible_matches), 2)              AS avg_eligible
+    FROM inferences
+    GROUP BY mesh_filter_applied, mesh_filter_skip_reason
+    ORDER BY n DESC
+""", conn)
+print("=== CANCER SITE FILTER: RAN vs ASSERTED ===")
+print(df_relevance_assertion.to_string(index=False))
+print("\n")
+
+
+#------------------------------------------------------------------------------
+
+
 # Close connection
 conn.close()
 

@@ -102,6 +102,8 @@ Conditional edges route to `node_no_candidates` when a stage empties the pool, a
 
 Costs come from `get_model_cost()` against `PRICING_CONFIG` in `03- Config.py`, dated `last_updated` — an unknown model logs a warning and returns 0.0 rather than raising.
 
+**Degradation record.** A run that lost a retrieval channel, fell back to the un-expanded query, or skipped the cancer site filter must be identifiable from its stored row alone. The relevant state keys are written by the stage that owns them, carried to all three terminal nodes by `_pipeline_provenance()` (file 13), and logged to `inferences.retrieval_channels` / `retrieval_degraded` / `retrieval_trials_lost` / `query_expansion_path` / `mesh_filter_applied` / `mesh_filter_skip_reason`. **NULL in these columns means the stage never reported and is not the same as a clean value** — never default them to 0 in a new writer or fold NULL into 0 in a reader. Stage 5's Section 2 is conditional on `mesh_filter_applied`: it only asserts to the model that disease relevance was confirmed when the filter actually ran. `Exception and Fallback Audit.md` inventories every `except` and fallback in the codebase with a verdict and the open items.
+
 ## Conventions
 
 - **All tunables live in `03- Config.py`.** Retrieval sizes, thresholds, temperatures (both 0 for determinism), rate limiting, drift windows, batch runner settings. Don't scatter magic numbers into node bodies.

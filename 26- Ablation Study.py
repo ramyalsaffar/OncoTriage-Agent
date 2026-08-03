@@ -473,6 +473,22 @@ def init_ablation_db():
         "avg_match_score_all":     "REAL DEFAULT 0",
         "has_match":               "INTEGER DEFAULT 0",
         "criteria_not_applicable": "INTEGER DEFAULT 0",
+        # Degradation record (item 11b), same fields File 14 writes for
+        # production inferences. No DEFAULT: a NULL means the stage did not
+        # report, and an ablation comparison must be able to tell a run that
+        # lost a retrieval channel from one that was configured without it.
+        # This matters more here than in production — a config's numbers are
+        # only interpretable if the run behind them was not degraded.
+        "retrieval_channels":       "TEXT",
+        "retrieval_degraded":       "INTEGER",
+        "retrieval_trials_lost":    "INTEGER",
+        "query_expansion_path":     "TEXT",
+        # skip_mesh_filter now changes the Stage 5 prompt as well as the
+        # filter, because the prompt's relevance assertion is conditional on
+        # the filter having run (File 13, Section 2). Recorded per row so the
+        # config's effect is not inferred from the config name.
+        "mesh_filter_applied":      "INTEGER",
+        "mesh_filter_skip_reason":  "TEXT",
     }.items():
         if _column not in _existing:
             c.execute(f"ALTER TABLE ablation_results ADD COLUMN {_column} {_sql_type}")
@@ -617,6 +633,20 @@ def log_ablation_result(run_id, config_name, patient_data, result, ablation_flag
             if _mode == "bm25_only" and vector_retrieved:
                 print(f"  WARNING: bm25_only run returned {vector_retrieved} "
                       f"vector trials — retrieval_mode did not reach Stage 2")
+
+            # A channel that dropped out mid-run contaminates the configuration
+            # it is attributed to: this patient's numbers describe less
+            # retrieval than the config specifies. Said out loud at log time,
+            # and stored, so a config mean can be recomputed without these rows.
+            if result.get("retrieval_degraded"):
+                _lost = [
+                    f"{name}={c['status']}"
+                    for name, c in (result.get("retrieval_channels") or {}).items()
+                    if c["status"] not in (CHANNEL_OK, CHANNEL_ABLATED)
+                ]
+                print(f"  WARNING: degraded retrieval for "
+                      f"{patient_data['patient_id']} — {', '.join(_lost)}. "
+                      f"This row does not describe the '{config_name}' config.")
     
             # Eligible / near-miss NCT IDs for trial-level overlap analysis
             eligible_nct_ids = ",".join(
@@ -641,7 +671,9 @@ def log_ablation_result(run_id, config_name, patient_data, result, ablation_flag
                     query_expansion_time, hybrid_retrieval_time, cross_encoder_time,
                     rule_filter_time, gpt4o_evaluation_time, total_time,
                     gpt4o_input_tokens, gpt4o_output_tokens,
-                    estimated_cost_usd, error
+                    estimated_cost_usd, error,
+                    retrieval_channels, retrieval_degraded, retrieval_trials_lost,
+                    query_expansion_path, mesh_filter_applied, mesh_filter_skip_reason
                 ) VALUES (
                     ?, ?, ?, ?, ?,
                     ?, ?,
@@ -651,7 +683,8 @@ def log_ablation_result(run_id, config_name, patient_data, result, ablation_flag
                     ?, ?,
                     ?, ?, ?,
                     ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?
+                    ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?
                 )
             """, (
                 run_id,
@@ -688,6 +721,17 @@ def log_ablation_result(run_id, config_name, patient_data, result, ablation_flag
                 output_tok,
                 round(cost, 6),
                 result.get("error", ""),
+                # Degradation record, carried out of the pipeline by
+                # _pipeline_provenance() (File 13). NULL where the stage did
+                # not report — never a substituted clean value.
+                (json.dumps(result["retrieval_channels"])
+                 if result.get("retrieval_channels") else None),
+                result.get("retrieval_degraded"),
+                result.get("retrieval_trials_lost"),
+                result.get("query_expansion_path"),
+                (None if result.get("mesh_filter_applied") is None
+                 else int(bool(result["mesh_filter_applied"]))),
+                result.get("mesh_filter_skip_reason"),
             ))
             conn.commit()
     
