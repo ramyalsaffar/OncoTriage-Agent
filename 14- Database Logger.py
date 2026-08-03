@@ -317,29 +317,37 @@ def _resolve_primary_cancer(conditions: List[Dict]) -> Optional[str]:
 def log_inference(result: Dict, patient_data: Dict):
     """
     Log inference result to SQLite database.
-    
+
     Non-critical operation: Errors are logged but not raised to avoid
     breaking the main pipeline if database logging fails.
+
+    The one exception is UnknownModelPricingError. Cost is computed BEFORE the
+    try block below precisely so it cannot be caught by it: an unpriced model
+    is a configuration defect, not a database failure, and swallowing it would
+    either drop the row entirely (with a message blaming logging) or, before
+    get_model_cost() learned to raise, write a row asserting the run was free.
+    Either way the operator is not told that the cost column has stopped
+    meaning anything. It propagates to the caller instead.
     """
-    
+
+    # Calculate cost using pricing config. Outside the try — see the docstring.
+    total_cost = get_model_cost(
+        MATCHING_MODEL,
+        result.get("gpt4o_input_tokens", 0),
+        result.get("gpt4o_output_tokens", 0)
+    )
+
     conn = None
     try:
         conn = sqlite3.connect(inferences_path)
         cursor = conn.cursor()
-        
+
         demographics = patient_data.get("demographics", {})
         conditions = patient_data.get("conditions", [])
         timings = result.get("stage_timings", {})
-        
+
         # Sum of stage durations only — excludes LangGraph routing overhead (~50-200ms)
         total_time = sum(timings.values())
-        
-        # Calculate cost using pricing config
-        total_cost = get_model_cost(
-            MATCHING_MODEL,
-            result.get("gpt4o_input_tokens", 0),
-            result.get("gpt4o_output_tokens", 0)
-        )
 
         cursor.execute('''
             INSERT INTO inferences (

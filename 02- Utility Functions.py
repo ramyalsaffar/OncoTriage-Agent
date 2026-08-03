@@ -89,30 +89,61 @@ def deduplicate_by_display(items: List[Dict], key: str = 'display') -> List[Dict
 #------------------------------------------------------------------------------
 
 
+class UnknownModelPricingError(RuntimeError):
+    """Raised when get_model_cost() is handed a model absent from PRICING_CONFIG.
+
+    Deliberately not a KeyError: a stray `except KeyError` around a dict lookup
+    would swallow it and put the pipeline back where it started. Callers that
+    recover from their own failures must let this one through — a missing price
+    is a configuration defect, not a runtime hiccup.
+    """
+
+
 def get_model_cost(model_name: str, input_tokens: int, output_tokens: int) -> float:
     """
     Calculate USD cost from token counts using current pricing.
-    
+
     Args:
         model_name: Model identifier (e.g., 'gpt-4o-2024-08-06')
         input_tokens: Input token count from response.usage
         output_tokens: Output token count from response.usage
-    
+
     Returns:
         Total cost in USD
-    
+
+    Raises:
+        UnknownModelPricingError: model_name is not in PRICING_CONFIG["models"].
+            This used to warn and return 0.0, which put a row in the database
+            claiming the run was free. A zero there is indistinguishable from a
+            genuinely free run, and every aggregate built on the column — the
+            dashboard's cost panel, the ablation study's cost-per-config, any
+            projection to 1000 patients — silently understates by however much
+            of the corpus ran on the unpriced model. Refusing to produce a
+            number is the only honest answer: the caller must add the model to
+            PRICING_CONFIG (File 03) or stop billing against it.
+
     Example:
         cost = get_model_cost('gpt-4o-2024-08-06', 1000, 500)
         # Returns: 0.0025 + 0.0050 = 0.0075 USD
     """
     pricing = PRICING_CONFIG["models"].get(model_name)
     if not pricing:
-        logging.warning(f"get_model_cost: unknown model '{model_name}', cost not tracked.")
-        return 0.0
-    
+        known = ", ".join(sorted(PRICING_CONFIG["models"])) or "(none)"
+        logging.error(
+            f"get_model_cost: unknown model '{model_name}'; "
+            f"priced models are: {known}"
+        )
+        raise UnknownModelPricingError(
+            f"No pricing for model '{model_name}' in PRICING_CONFIG "
+            f"(last_updated {PRICING_CONFIG['last_updated']}). "
+            f"Priced models: {known}. Add it to PRICING_CONFIG in "
+            f"'03- Config.py' — cost cannot be reported as 0.0 for a run that "
+            f"consumed {input_tokens} input / {output_tokens} output tokens."
+        )
+
     input_cost = (input_tokens / 1_000_000) * pricing["input"]
     output_cost = (output_tokens / 1_000_000) * pricing["output"]
-    
+
     return input_cost + output_cost
 
 

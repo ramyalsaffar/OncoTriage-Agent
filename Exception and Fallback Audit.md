@@ -204,7 +204,7 @@ than catching an error.
 | `09-` MeSH filter, `is_cancer_relevant` | unmappable on either side → KEEP | by design, documented | no per-inference count of how many KEEPs were unmappable rather than matched |
 | `08-` `is_primary_cancer` | no coding recognized → display-term morphology layer | `logger.debug` | yes — `_CANCER_CLASSIFICATION_COUNTS["display_fallback"]` |
 | `02-` `resolve_qdrant_collection` | alias lookup fails after retries → uses `COLLECTION_NAME` as-is | yes | yes — the resolved name is stored in `inferences.qdrant_collection` |
-| `03-` `get_model_cost` | unknown model → warns and returns `0.0` | yes | no — a 0.0 cost row is indistinguishable from a free run |
+| `02-` `get_model_cost` | unknown model → **raises `UnknownModelPricingError`** (was: warned and returned `0.0`) | yes, `logging.error` naming the model and the priced set | **n/a as of item 13 — there is no longer a fallback path to record.** The cost is computed before `log_inference`'s / `log_ablation_result`'s `try`, so the raise reaches the caller instead of being reported as a database failure |
 | `10-` structured eligibility extractor | requirement not recognized → `None` → trial passes the stage check | no | no — by design (unknown ⇒ pass), but the unknown rate is not counted |
 | `02-` `parse_partial_date` | `birthDate` shorter than a full date → missing components filled from a mid-range anchor | no per-call print (it would fire once per patient) | **yes, as of item 12** — the precision is returned to the caller, tallied in `BIRTH_DATE_PRECISION_COUNTS`, printed once per load by `load_all_patients`, and stored per row in `inferences.birth_date_precision` |
 | `07-` `_calculate_age` | unparseable birth date, or one after the reference date → `age = None` | yes, one WARNING per patient | **yes, as of item 12** (`birth_date_precision` = `unparseable` / `after_reference`, so a NULL age is never bare) |
@@ -217,12 +217,10 @@ than catching an error.
 2. Stage 4's stage and histology filters — `stage_dropped` / `histology_dropped`
    of 0 conflate "checked, nothing dropped" with "never checked", exactly the
    ambiguity `mesh_filter_applied` just removed for the site filter.
-3. `03-` `get_model_cost` returning `0.0` for an unknown model — a cost total
-   that silently under-reports.
-4. `13-:3585` lab-unit normalization `pass`, `11-:172` index-time age parse,
+3. `13-:3585` lab-unit normalization `pass`, `11-:172` index-time age parse,
    and the `21-` dashboard JSON parses — all low, all uncounted.
-5. `25-:184` a corrupt results file reading as an empty one.
-6. Nothing yet consumes the new degradation columns as an alert.
+4. `25-:184` a corrupt results file reading as an empty one.
+5. Nothing yet consumes the new degradation columns as an alert.
    `20- Drift Detection.py` is the natural home for a
    `retrieval_degraded_rate` and a `query_expansion_fallback_rate` metric.
 

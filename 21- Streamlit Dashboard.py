@@ -1565,11 +1565,25 @@ def render_cost_tokens_tab(df):
     st.markdown("---")
     st.subheader("Cost Breakdown by Model")
     
-    gpt4o_pricing         = PRICING_CONFIG["models"].get(MATCHING_MODEL,        {"input": 0.0, "output": 0.0})
-    
-    gpt4o_input_cost      = (df['gpt4o_input_tokens']      * gpt4o_pricing["input"]      / 1_000_000).sum()
-    gpt4o_output_cost     = (df['gpt4o_output_tokens']     * gpt4o_pricing["output"]     / 1_000_000).sum()
-    
+    # This recomputes cost from raw tokens rather than reading
+    # estimated_cost_usd, so it needs the same pricing table the writer used.
+    # It used to default an unpriced model to {"input": 0.0, "output": 0.0},
+    # which rendered a $0.00 breakdown and a pie chart of nothing — a reader
+    # cannot tell that from a genuinely cheap run. get_model_cost() now raises
+    # instead, and the tab says so rather than drawing an empty chart.
+    try:
+        gpt4o_input_cost  = get_model_cost(
+            MATCHING_MODEL, int(df['gpt4o_input_tokens'].sum()), 0
+        )
+        gpt4o_output_cost = get_model_cost(
+            MATCHING_MODEL, 0, int(df['gpt4o_output_tokens'].sum())
+        )
+    except UnknownModelPricingError as e:
+        st.error(
+            f"Cost breakdown unavailable: {e}"
+        )
+        return
+
     recalc_total = gpt4o_input_cost + gpt4o_output_cost
     
     df_cost = pd.DataFrame({

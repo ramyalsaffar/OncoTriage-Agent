@@ -560,10 +560,21 @@ def log_ablation_result(run_id, config_name, patient_data, result, ablation_flag
     File 14's production logging. bm25_retrieved/vector_retrieved are the
     observed counts Stage 2 reports, not values derived from the config.
     Non-critical: errors are printed but do not crash the study.
+
+    UnknownModelPricingError is the exception to that: cost is computed before
+    the try block so an unpriced model raises out of here instead of being
+    printed as "Failed to log result". A cost-per-config comparison built from
+    rows that could not be priced is not a comparison, and the study should
+    stop rather than produce one. Same reasoning as File 14's log_inference().
     """
-    
+
+    # Cost via same pricing function as File 14 — outside the try, see docstring.
+    input_tok = result.get("gpt4o_input_tokens", 0)
+    output_tok = result.get("gpt4o_output_tokens", 0)
+    cost = get_model_cost(MATCHING_MODEL, input_tok, output_tok)
+
     conn = None
-    
+
     with _ablation_db_lock:
         
         try:
@@ -599,11 +610,6 @@ def log_ablation_result(run_id, config_name, patient_data, result, ablation_flag
             avg_score_all = avg_score if avg_score is not None else 0.0
             has_match = 1 if matches else 0
 
-            # Cost via same pricing function as File 14
-            input_tok = result.get("gpt4o_input_tokens", 0)
-            output_tok = result.get("gpt4o_output_tokens", 0)
-            cost = get_model_cost(MATCHING_MODEL, input_tok, output_tok)
-    
             # Timings
             timings = result.get("stage_timings", {})
     
@@ -1065,7 +1071,15 @@ def main():
         builtins.print = _tqdm_print
 
         def _process_one(patient_data, config_name, ablation_flags, run_id):
-            """Run pipeline + log for one patient-config pair. Never raises."""
+            """Run pipeline + log for one patient-config pair.
+
+            A pipeline failure is caught and turned into an error result, so
+            one bad patient does not stop the study. The single exception is
+            UnknownModelPricingError out of log_ablation_result(): it is not a
+            per-patient failure but a missing entry in PRICING_CONFIG, so it
+            propagates through future.result() and stops the run. The
+            checkpoint means resuming after fixing File 03 costs nothing.
+            """
             pid = patient_data["patient_id"]
             try:
                 result = match_patient_ablation(
