@@ -254,6 +254,10 @@ ABLATION_CONFIGS = [
     },
     {
         "name": "no_cross_encoder",
+        # Removes ONLY the reranking. Stage 3 still resolves the patient's
+        # MeSH trees before this flag's early return, so Stage 4's cancer site
+        # filter stays active — otherwise this row measured cross-encoder
+        # removal and MeSH-filter removal together.
         "description": "Cross-encoder reranking disabled (fusion score passthrough)",
         "flags": {
             "skip_mesh_filter": False,
@@ -354,7 +358,10 @@ def stratified_sample(patients, sample_size, seed):
         print(f"  Population ({len(patients)}) <= sample ({sample_size}). Using all.")
         return sorted(patients, key=lambda p: p["patient_id"])
 
-    random.seed(seed)
+    # Local Random instance rather than random.seed(): seeding the
+    # process-wide state would shift the draw of every other consumer of
+    # `random` in the same session.
+    rng = random.Random(seed)
     registry = _CANCER_REGISTRY
 
     # Group by cancer type
@@ -370,12 +377,14 @@ def stratified_sample(patients, sample_size, seed):
         group = cancer_groups[group_name]
         share = max(1, round(len(group) / total * sample_size))
         share = min(share, len(group))
-        sampled.extend(random.sample(group, share))
+        sampled.extend(rng.sample(group, share))
 
-    # Trim if rounding + min-1 caused oversampling
+    # Trim if rounding + min-1 caused oversampling. Fresh Random(seed) here,
+    # not the rng above: the original code re-seeded at this point, so the
+    # shuffle must start from the seed state to reproduce the same trim.
     if len(sampled) > sample_size:
-        random.seed(seed)
-        random.shuffle(sampled)
+        trim_rng = random.Random(seed)
+        trim_rng.shuffle(sampled)
         sampled = sampled[:sample_size]
 
     # Deterministic processing order

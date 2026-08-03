@@ -1285,6 +1285,10 @@ def node_cross_encoder_rerank(state: dict) -> dict:
         print("[Stage 3] Cross-encoder rerank: 0 trials — nothing to rerank")
         return {
             "reranked_trials": [],
+            # Declared on every Stage 3 exit so no downstream reader has to
+            # distinguish "not resolved" from "key never written". Empty here
+            # is correct: there is no pool for Stage 4 to filter.
+            "patient_trees": set(),
             "stage_timings": {
                 **state.get("stage_timings", {}),
                 "cross_encoder": 0.0,
@@ -1297,6 +1301,37 @@ def node_cross_encoder_rerank(state: dict) -> dict:
     # Stage 4 hard drop. Disabling only the drop would leave the ablation row
     # confounded, since the boost still reorders (and re-gates) the pool.
     _skip_mesh_boost = _ablation.get("skip_mesh_filter", False)
+
+    # -----------------------------------------------------------------
+    # Patient MeSH resolution (must precede the skip_cross_encoder guard)
+    # -----------------------------------------------------------------
+    # Stage 3 is the only producer of state["patient_trees"], and Stage 4's
+    # cancer site filter is its only consumer. Resolving inside the reranking
+    # body meant the skip_cross_encoder early return handed Stage 4 an empty
+    # set, silently disabling the MeSH filter as well and confounding the
+    # no_cross_encoder ablation row with no_mesh_filter.
+    #
+    # skip_mesh_filter is the one flag that must leave the trees empty: that
+    # ablation removes BOTH MeSH uses (this boost and the Stage 4 hard drop),
+    # so it deliberately does not resolve. Every other path resolves.
+    patient_trees = set()
+
+    if _skip_mesh_boost:
+        print("  MeSH patient resolution [ablation_skipped]: skip_mesh_filter set")
+    elif _MESH_FILTER is None:
+        print("  MeSH patient resolution [no_mesh_filter]: filter unavailable")
+    else:
+        # Same helper, same conditions and same verification filter as Stage 1,
+        # so the trees handed to Stage 4 match the identity the expanded query
+        # was built from — and the layer that produced them is the one already
+        # recorded in mesh_resolution.
+        mesh_resolution = resolve_patient_mesh(
+            state["patient_data"].get("conditions", []),
+            _CANCER_REGISTRY,
+            _MESH_FILTER,
+        )
+        patient_trees = mesh_resolution["trees"]
+        print(f"  MeSH patient resolution {format_mesh_resolution(mesh_resolution)}")
 
     # --- Ablation: skip cross-encoder ---
     if _ablation.get("skip_cross_encoder", False):
@@ -1332,6 +1367,8 @@ def node_cross_encoder_rerank(state: dict) -> dict:
         ]
         return {
             "reranked_trials": passthrough,
+            # Carried through: Stage 4 reads this and nothing else writes it.
+            "patient_trees": patient_trees,
             "stage_timings": {
                 **state.get("stage_timings", {}),
                 "cross_encoder": 0.0,
@@ -1439,8 +1476,7 @@ def node_cross_encoder_rerank(state: dict) -> dict:
     # -----------------------------------------------------------------
     # MeSH Relevance Boost (see apply_mesh_relevance_boost)
     # -----------------------------------------------------------------
-    patient_trees = set()
-
+    # patient_trees was resolved above, before the skip_cross_encoder guard.
     if _skip_mesh_boost:
         # The MeSH ablation must remove BOTH uses of MeSH, otherwise the
         # no_mesh_filter row still carries the boost's effect on ranking.
@@ -1448,18 +1484,6 @@ def node_cross_encoder_rerank(state: dict) -> dict:
     elif _MESH_FILTER is None:
         print("  MeSH relevance boost [no_mesh_filter]: filter unavailable")
     elif top_trials:
-        # Resolve patient MeSH trees. Same helper, same conditions and same
-        # verification filter as Stage 1, so the trees handed to Stage 4 match
-        # the identity the expanded query was built from — and the layer that
-        # produced them is the one already recorded in mesh_resolution.
-        patient_data = state["patient_data"]
-        conditions = patient_data.get("conditions", [])
-        mesh_resolution = resolve_patient_mesh(
-            conditions, _CANCER_REGISTRY, _MESH_FILTER
-        )
-        patient_trees = mesh_resolution["trees"]
-        print(f"  MeSH patient resolution {format_mesh_resolution(mesh_resolution)}")
-
         boost_stats = apply_mesh_relevance_boost(
             top_trials, patient_trees, _MESH_FILTER
         )
@@ -1490,7 +1514,8 @@ def node_cross_encoder_rerank(state: dict) -> dict:
 
     return {
         "reranked_trials": top_trials,
-        "patient_trees": patient_trees if _MESH_FILTER is not None else set(),
+        # Already empty when _MESH_FILTER is None or skip_mesh_filter is set.
+        "patient_trees": patient_trees,
         "stage_timings": {
             **state.get("stage_timings", {}),
             "cross_encoder": round(elapsed, 3),

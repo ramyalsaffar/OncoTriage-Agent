@@ -93,12 +93,16 @@ for cancer_type, pids in by_type.items():
     if len(pids) < PATIENTS_PER_CANCER:
         raise ValueError(f"Not enough {cancer_type} patients: need {PATIENTS_PER_CANCER}, found {len(pids)}")
 
-# Sample with seed 42
-random.seed(SEED)
+# Sample with seed 42. Local Random instance rather than random.seed():
+# seeding the process-wide state would shift the draw of every other consumer
+# of `random` in the same session. One rng shared across all three draws --
+# the loop below consumes a single continuing stream, as it did when the
+# global state was seeded once above it.
+rng = random.Random(SEED)
 
 sampled_pids = []
 for cancer_type in ["breast", "colon", "lung"]:
-    selected = random.sample(by_type[cancer_type], PATIENTS_PER_CANCER)
+    selected = rng.sample(by_type[cancer_type], PATIENTS_PER_CANCER)
     sampled_pids.extend(selected)
     print(f"  Sampled {cancer_type}: {len(selected)} patients")
 

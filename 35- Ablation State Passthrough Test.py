@@ -32,7 +32,7 @@ stubs, and every flag exercised here takes a branch that never reaches MedCPT
 or Qdrant. The cross-encoder is loaded by file 13 at import but never run.
 
 Run from terminal (or F5 in Spyder):
-    python "32- Ablation State Passthrough Test.py"
+    python "35- Ablation State Passthrough Test.py"
 
 Exit codes:
     0 -- all assertions passed
@@ -51,7 +51,7 @@ for _bootstrap in ("01- Imports.py", "02- Utility Functions.py"):
 # 13 chains 03, 08, 09, 10 itself — do not list them again here.
 exec_chain(
     ["13- LangGraph Agent.py"],
-    caller_file=_code_dir + "32- Ablation State Passthrough Test.py",
+    caller_file=_code_dir + "35- Ablation State Passthrough Test.py",
     caller_globals=globals(),
     chain_label="01 → 02 → 13 (→ 03, 08, 09, 10)",
 )

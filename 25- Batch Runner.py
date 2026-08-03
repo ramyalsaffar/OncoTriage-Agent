@@ -489,8 +489,11 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
 
     actual_resample = min(RESAMPLE_COUNT, len(completed_files))
 
-    random.seed(RESAMPLE_SEED)
-    resample_files = random.sample(completed_files, actual_resample)
+    # Local Random instance rather than random.seed(): seeding the
+    # process-wide state would shift the draw of every other consumer of
+    # `random` in the same session.
+    rng = random.Random(RESAMPLE_SEED)
+    resample_files = rng.sample(completed_files, actual_resample)
 
     print(f"Resampling {actual_resample} patients (seed={RESAMPLE_SEED}).")
     print(f"Concurrent workers: {MAX_WORKERS}")

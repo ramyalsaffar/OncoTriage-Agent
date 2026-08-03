@@ -431,11 +431,13 @@ def filter_cancer_patients_inplace():
         print(f"Need to remove: {len(remaining_files) - CAP} patients")
         print()
 
-        # Reproducible random sampling
-        random.seed(RANDOM_SEED)
+        # Reproducible random sampling. Local Random instance rather than
+        # random.seed(): seeding the process-wide state would shift the draw
+        # of every other consumer of `random` in the same session.
+        rng = random.Random(RANDOM_SEED)
 
         # Randomly select CAP to KEEP
-        patients_to_keep = random.sample(remaining_files, CAP)
+        patients_to_keep = rng.sample(remaining_files, CAP)
         patients_to_keep_set = set(patients_to_keep)
 
         # Delete the rest
