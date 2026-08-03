@@ -2,10 +2,14 @@
 #####################################
 
 """
-Monitors data drift, retrieval drift, and performance drift in the clinical trial 
-matching pipeline. Uses statistical tests (KS, PSI, z-score) to detect distribution 
+Monitors data drift, retrieval drift, and performance drift in the clinical trial
+matching pipeline. Uses statistical tests (KS, PSI, z-score) to detect distribution
 shifts and performance degradation.
 
+Alongside those, one THRESHOLD alert that deliberately does not compare against
+a baseline: ecog_unavailable_rate. A baseline comparison answers "has this
+moved", which is the wrong question when the baseline window may itself have
+been captured after the thing went wrong. See that function for the reasoning.
 """
 
 
@@ -226,9 +230,164 @@ def z_score_drift(baseline: np.ndarray, current: np.ndarray) -> Dict:
         }
 
 
+# ---------------------------------------------------------------------------
+# Threshold alerts (no baseline comparison)
+# ---------------------------------------------------------------------------
+
+# Text carried in `notes` when the rate alerts. It reaches
+# drift_metrics.notes, so the diagnosis is stored with the alert rather than
+# only printed: whoever reads the row later needs to know what to check, and
+# the number on its own does not say.
+ECOG_UNAVAILABLE_DIAGNOSIS = (
+    "Patients had an ECOG observation on file that could not be used. A rate "
+    "near 1.0 means DATA_SNAPSHOT_DATE (03- Config.py) and the patient corpus "
+    "disagree -- the corpus was regenerated with observations dated after the "
+    "snapshot, so every one resolves to 'all_after_reference_date' and every "
+    "ECOG criterion becomes not_evaluable. Check DATA_SNAPSHOT_DATE against the "
+    "generated_at/observation dates in the corpus run manifest, then re-run "
+    "the affected inferences."
+)
+
+
+def ecog_unavailable_rate(df: pd.DataFrame) -> Dict:
+    """
+    Fraction of reporting rows whose ECOG observation existed but was unusable.
+
+        numerator   ecog_selection NOT NULL
+                    AND ecog_selection <> 'none_recorded'
+                    AND ecog_value IS NULL
+        denominator ecog_selection NOT NULL
+
+    A THRESHOLD alert, not a baseline comparison, and deliberately so. The
+    failure this catches is a corpus regenerated with a DATA_SNAPSHOT_DATE older
+    than its own observations: every patient resolves to
+    'all_after_reference_date', every ECOG criterion becomes not_evaluable, and
+    eligible-match counts fall across the board. A z-score against baseline
+    would read ~0 if the baseline window were itself captured after that
+    regeneration -- the metric would go silent in exactly the case it exists
+    for. A proportion is alarming at 1.0 whatever the baseline was.
+
+    Two exclusions, and they are not the same exclusion:
+
+      - Rows with ecog_selection NULL leave the DENOMINATOR. They predate the
+        ecog_* columns (or were logged by a caller outside the graph); nothing
+        is known about their ECOG, and counting them as "fine" would dilute the
+        rate toward zero exactly when the corpus is oldest.
+      - Rows with ecog_selection = 'none_recorded' stay in the denominator but
+        leave the NUMERATOR. Those patients genuinely carried no observation,
+        which is a property of the source data, not a failure of this pipeline.
+        A corpus where nobody has an ECOG scores 0.0 here, correctly: there is
+        no reference-date mismatch to report.
+
+    Args:
+        df: Inference rows for the window being assessed.
+
+    Returns:
+        Dict with keys: metric_value, threshold, alert, notes, plus the
+        descriptive counts (numerator, denominator, rows_pre_migration,
+        rows_no_observation). Shape matches the baseline-comparison metrics
+        above so log_drift_metrics() and print_drift_details() need no special
+        case; the extra keys are read by neither.
+
+        metric_value is None with alert 0 when the denominator is too small.
+        A zero rate and no data are different claims and must not collapse:
+        every row currently in inferences predates these columns, so the first
+        run after this change reports insufficient data, not 0.0.
+    """
+    # Base for every early return. `notes` is present and None so the key set
+    # never varies between an insufficient result and a computed one -- callers
+    # that read the shape must not have to know which branch produced it. Every
+    # return below overrides it with a reason.
+    insufficient = {
+        "metric_value": None,
+        "threshold": ECOG_UNAVAILABLE_RATE_THRESHOLD,
+        "alert": 0,
+        "notes": None,
+        "numerator": None,
+        "denominator": 0,
+        "rows_pre_migration": None,
+        "rows_no_observation": None,
+    }
+
+    try:
+        # A database that never ran File 14's migration has no such columns.
+        # File 20 does not load File 14, so it cannot assume they exist.
+        missing = [c for c in ("ecog_selection", "ecog_value")
+                   if c not in df.columns]
+        if missing:
+            return {**insufficient,
+                    "rows_pre_migration": len(df),
+                    "notes": f"Column(s) {missing} absent — database predates "
+                             f"the ecog_* migration in 14- Database Logger.py"}
+
+        reported = df["ecog_selection"].notna()
+        denominator = int(reported.sum())
+        rows_pre_migration = int((~reported).sum())
+
+        if denominator == 0:
+            return {**insufficient,
+                    "rows_pre_migration": rows_pre_migration,
+                    "notes": f"No rows report an ECOG selection path; all "
+                             f"{rows_pre_migration} predate the ecog_* columns"}
+
+        # Same floor the comparison window itself uses. A denominator of 1 that
+        # happens to be unusable is a rate of 1.0 on one patient, which is noise
+        # wearing the costume of the exact alarm this metric raises.
+        if denominator < MIN_SAMPLES_COMPARISON:
+            return {**insufficient,
+                    "denominator": denominator,
+                    "rows_pre_migration": rows_pre_migration,
+                    "notes": f"Only {denominator} row(s) report an ECOG selection "
+                             f"path (need >= {MIN_SAMPLES_COMPARISON})"}
+
+        no_observation = reported & (df["ecog_selection"] == "none_recorded")
+        unusable = reported & ~no_observation & df["ecog_value"].isna()
+
+        numerator = int(unusable.sum())
+        rate = numerator / denominator
+        alert = 1 if rate > ECOG_UNAVAILABLE_RATE_THRESHOLD else 0
+
+        return {
+            "metric_value": float(rate),
+            "threshold": ECOG_UNAVAILABLE_RATE_THRESHOLD,
+            "alert": alert,
+            "numerator": numerator,
+            "denominator": denominator,
+            "rows_pre_migration": rows_pre_migration,
+            "rows_no_observation": int(no_observation.sum()),
+            "notes": (f"{numerator}/{denominator} reporting rows had an unusable "
+                      f"ECOG observation. {ECOG_UNAVAILABLE_DIAGNOSIS}")
+                     if alert else None,
+        }
+
+    except Exception as e:
+        return {**insufficient,
+                "notes": f"ECOG availability calculation error: {str(e)}"}
+
+
 # ===========================================================================
 # DRIFT DETECTION FUNCTIONS
 # ===========================================================================
+
+def detect_data_availability(current_df: pd.DataFrame) -> Dict:
+    """
+    Assess whether the inputs the pipeline reasoned over were actually usable.
+
+    Unlike the three detect_*_drift functions, this takes only the CURRENT
+    window: it asks "is the data usable now", not "has it moved". Passing a
+    baseline here would invite the comparison the metric is built to avoid.
+
+    Args:
+        current_df: Current window inferences DataFrame
+
+    Returns:
+        Dict with one entry per availability metric, same shape as the drift
+        detectors.
+    """
+    return {
+        "ecog_unavailable_rate": ecog_unavailable_rate(current_df),
+    }
+
 
 def detect_data_drift(baseline_df: pd.DataFrame, current_df: pd.DataFrame) -> Dict:
     """
@@ -619,8 +778,9 @@ def run_drift_detection(
         2. Detect data drift (age, conditions, medications)
         3. Detect retrieval drift (candidates at each stage)
         4. Detect performance drift (eligible matches, timing, errors)
-        5. Log results to drift_metrics table
-    
+        5. Assess data availability (threshold alerts, current window only)
+        6. Log results to drift_metrics table
+
     Args:
         baseline_days: Number of days for baseline window (default: 30)
         comparison_days: Number of days for comparison window (default: 7)
@@ -632,6 +792,7 @@ def run_drift_detection(
             "data_drift": {...},
             "retrieval_drift": {...},
             "performance_drift": {...},
+            "data_availability": {...},
             "summary": {
                 "total_alerts": int,
                 "baseline_samples": int,
@@ -704,7 +865,7 @@ def run_drift_detection(
     print()
     
     # Step 4: Detect performance drift
-    print("[4/5] Detecting performance drift...")
+    print("[4/6] Detecting performance drift...")
     try:
         performance_drift = detect_performance_drift(baseline_df, current_df)
         performance_alerts = sum(1 for m in performance_drift.values() if m.get("alert") == 1)
@@ -713,14 +874,27 @@ def run_drift_detection(
         print(f"✗ Performance drift detection failed: {e}")
         raise
     print()
-    
+
+    # Step 5: Assess input availability (threshold alerts, current window only)
+    print("[5/6] Assessing data availability...")
+    try:
+        data_availability = detect_data_availability(current_df)
+        availability_alerts = sum(1 for m in data_availability.values() if m.get("alert") == 1)
+        print(f"✓ Data availability: {availability_alerts} alert(s)")
+    except Exception as e:
+        print(f"✗ Data availability assessment failed: {e}")
+        raise
+    print()
+
     # Compile results
     results = {
         "data_drift": data_drift,
         "retrieval_drift": retrieval_drift,
         "performance_drift": performance_drift,
+        "data_availability": data_availability,
         "summary": {
-            "total_alerts": data_alerts + retrieval_alerts + performance_alerts,
+            "total_alerts": (data_alerts + retrieval_alerts + performance_alerts
+                             + availability_alerts),
             "baseline_samples": len(baseline_df),
             "comparison_samples": len(current_df),
             "baseline_period": f"{baseline_df['timestamp'].min().date()} to {baseline_df['timestamp'].max().date()}",
@@ -728,9 +902,9 @@ def run_drift_detection(
         }
     }
     
-    # Step 5: Log to database
+    # Step 6: Log to database
     if log_to_db:
-        print("[5/5] Logging results to database...")
+        print("[6/6] Logging results to database...")
         try:
             log_drift_metrics(
                 {k: v for k, v in results.items() if k != "summary"},
@@ -741,7 +915,7 @@ def run_drift_detection(
             print(f"⚠ Database logging failed (non-critical): {e}")
             # Don't raise - logging failure should not break drift detection
     else:
-        print("[5/5] Skipping database logging (log_to_db=False)")
+        print("[6/6] Skipping database logging (log_to_db=False)")
     print()
     
     # Print summary
@@ -752,6 +926,7 @@ def run_drift_detection(
     print(f"  - Data drift: {data_alerts}")
     print(f"  - Retrieval drift: {retrieval_alerts}")
     print(f"  - Performance drift: {performance_alerts}")
+    print(f"  - Data availability: {availability_alerts}")
     print()
     print(f"Baseline: {results['summary']['baseline_samples']} samples ({results['summary']['baseline_period']})")
     print(f"Current: {results['summary']['comparison_samples']} samples ({results['summary']['comparison_period']})")
@@ -772,7 +947,8 @@ def print_drift_details(results: Dict[str, Dict]) -> None:
     print("DETAILED DRIFT ANALYSIS")
     print("=" * 70)
     
-    for category in ["data_drift", "retrieval_drift", "performance_drift"]:
+    for category in ["data_drift", "retrieval_drift", "performance_drift",
+                     "data_availability"]:
         if category not in results:
             continue
             
@@ -799,7 +975,15 @@ def print_drift_details(results: Dict[str, Dict]) -> None:
                 print(f"   Value: {value:.4f} | Threshold: {threshold}")
             elif notes:
                 print(f"   Status: {notes}")
-            
+
+            # An alerting metric prints its notes even when it has a value.
+            # Previously notes were shown only on the no-value branch, so a
+            # threshold alert that carries its diagnosis in notes -- which is
+            # the whole reason it carries one -- printed the number and
+            # swallowed the explanation.
+            if value is not None and notes:
+                print(f"   Note: {notes}")
+
             # Additional details
             p_value = metric_data.get("p_value")
             if p_value is not None:

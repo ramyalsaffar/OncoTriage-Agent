@@ -216,6 +216,32 @@ Z_SCORE_THRESHOLD = 2.0         # |z| > 2.0 = alert (2 standard deviations)
 PSI_BINS = 10
 
 
+# ECOG availability alert (File 20)
+#----------------------------------
+# Fraction of reporting rows whose patient HAD an ECOG observation on file that
+# could not be used -- inferences.ecog_selection is not NULL and is not
+# 'none_recorded', while inferences.ecog_value IS NULL. Above this fraction,
+# ecog_unavailable_rate alerts.
+#
+# This is a THRESHOLD alert, not a comparison against the baseline window, and
+# the difference is the whole point. The failure it exists to catch is a corpus
+# regenerated with a DATA_SNAPSHOT_DATE older than its own observations: every
+# patient then resolves to 'all_after_reference_date', every ECOG criterion
+# becomes not_evaluable, and eligible-match counts fall across the board. A
+# z-score against baseline would read ~0 if the baseline window were itself
+# captured after that regeneration -- the metric would go quiet in exactly the
+# case it was added for. A rate is alarming at 1.0 whatever the baseline was.
+#
+# HOLDING VALUE, NOT CALIBRATED. The only corpus measured so far (the 3,000-
+# patient scratch run) sits at 1/141 = 0.007, so 0.20 is roughly thirty times
+# the observed rate: high enough not to fire on a handful of genuinely late
+# observations in a short window, low enough that a systematic mismatch cannot
+# hide under it. It is not fitted to anything, and no false-positive or
+# false-negative rate has been measured for it. Same status as
+# MESH_BOOST_DIRECT_FRACTION and ECOG_SCORE_DISTRIBUTION.
+ECOG_UNAVAILABLE_RATE_THRESHOLD = 0.20
+
+
 #------------------------------------------------------------------------------
 
 
