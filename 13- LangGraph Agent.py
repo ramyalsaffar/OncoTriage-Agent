@@ -2946,6 +2946,21 @@ CLINICAL TRIALS:
 
 def _pipeline_provenance(state) -> Dict:
     """Run-level provenance keys that all three terminal results must carry."""
+
+    # ECOG is read off state["patient_data"], the same route birth_date_precision
+    # takes below, rather than being copied onto state by a node. It is a
+    # property of the parsed patient, not something any stage computes, so a
+    # second copy on state could only ever disagree with the first. All three
+    # terminal nodes already bind state["patient_data"], so the value is
+    # reachable on every path including the error path.
+    #
+    # {} when the key is absent, which is what a hand-built patient dict or a
+    # bundle parsed before File 07 grew the field produces. That is deliberately
+    # NOT the same as a parsed patient with no observation: the former leaves
+    # ecog_selection None, the latter sets it to "none_recorded". File 14's
+    # schema comment records the convention.
+    _ecog = ((state.get("patient_data") or {}).get("ecog_performance_status") or {})
+
     return {
         # Retries actually spent in Stage 5. Stage 5 writes the count back into
         # state on its success return and on every failure return, so this is
@@ -2999,6 +3014,23 @@ def _pipeline_provenance(state) -> Dict:
         "query_expansion_path": state.get("query_expansion_path"),
         "mesh_filter_applied": state.get("mesh_filter_applied"),
         "mesh_filter_skip_reason": state.get("mesh_filter_skip_reason"),
+
+        # --- ECOG performance status (see File 07) -------------------------
+        #
+        # The score printed into the Stage 5 prompt, the path that produced it,
+        # and how many observations the bundle carried. All three belong in the
+        # record of the inference they shaped: ECOG 0-1 or 0-2 gates nearly every
+        # interventional oncology trial, so a corpus that resolved entirely to
+        # "all_after_reference_date" would match systematically worse with
+        # nothing in the row to say why.
+        #
+        # ecog_value is None both for a patient with no observation and for one
+        # whose only observation postdates the snapshot. ecog_selection is what
+        # separates them, and ecog_observations_found is what makes the second
+        # case countable. Never read absence off ecog_value alone.
+        "ecog_value": _ecog.get("value"),
+        "ecog_selection": _ecog.get("selection"),
+        "ecog_observations_found": _ecog.get("observations_found"),
     }
 
 

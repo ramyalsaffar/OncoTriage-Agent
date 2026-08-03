@@ -68,7 +68,10 @@ CREATE TABLE IF NOT EXISTS inferences (
     expansion_prompt TEXT,
     gpt4o_retries INTEGER,
     ablation_flags TEXT,
-    hallucinated_trials INTEGER
+    hallucinated_trials INTEGER,
+    ecog_value INTEGER,
+    ecog_selection TEXT,
+    ecog_observations_found INTEGER
 )
 ''')
 
@@ -155,6 +158,36 @@ INFERENCE_COLUMN_ADDITIONS = {
     # NULL here means the parser did not report — not that the date was exact.
     "age_reference_date":           "TEXT",
     "birth_date_precision":         "TEXT",
+    # --- ECOG performance status (File 07 parses it, File 13 carries it) -----
+    # The score that reached the Stage 5 prompt, and how it was arrived at.
+    # ECOG 0-1 or 0-2 gates nearly every interventional oncology trial, so these
+    # move the verdict directly; without them a corpus whose observations all
+    # postdate DATA_SNAPSHOT_DATE would match systematically worse with nothing
+    # in the row explaining it.
+    #
+    # READ THE CONVENTION BEFORE QUERYING THESE. ecog_value is NULL in three
+    # different situations and cannot separate them on its own:
+    #
+    #   ecog_selection IS NULL          the row predates this migration, or the
+    #                                   caller logged a result that never came
+    #                                   from a pipeline terminal node. Nothing
+    #                                   is known about this patient's ECOG.
+    #   ecog_selection = 'none_recorded'  the patient genuinely carried no ECOG
+    #                                   observation. ecog_observations_found = 0.
+    #   ecog_selection = 'all_after_reference_date'
+    #                   or 'undated_ambiguous'
+    #                                   observations exist but none was usable.
+    #                                   ecog_observations_found >= 1 says how many.
+    #
+    # So: absence is `ecog_selection = 'none_recorded'`, NEVER
+    # `ecog_value IS NULL`. And a score of 0 is a real, fully-active patient --
+    # the most eligible there is -- so ecog_value = 0 must never be treated as
+    # missing either. Both confusions are the ones this column set exists to
+    # prevent, which is why the selection path is stored beside the value rather
+    # than being derivable from it.
+    "ecog_value":                   "INTEGER",
+    "ecog_selection":               "TEXT",
+    "ecog_observations_found":      "INTEGER",
 }
 
 _existing_inference_columns = {
@@ -346,6 +379,33 @@ def log_inference(result: Dict, patient_data: Dict):
         conditions = patient_data.get("conditions", [])
         timings = result.get("stage_timings", {})
 
+        # ECOG performance status. Preferred source is the result dict, where
+        # _pipeline_provenance() (File 13) puts it on all three terminal paths;
+        # the patient dict is the fallback for a caller logging a result that
+        # did not come from the graph.
+        #
+        # The source is chosen ONCE for all three columns rather than per field.
+        # Per-field fallback could take the value from one patient and the
+        # selection path from another, producing a row that describes no patient
+        # at all -- and the three columns are only interpretable together.
+        #
+        # ecog_selection is the marker for "did this report", the same role it
+        # plays in the schema comment above: a terminal node sets it to a string
+        # whenever the parsed field was present and leaves it None when it was
+        # not. It is used instead of ecog_value because ecog_value is
+        # legitimately None for a patient with no observation, and legitimately
+        # 0 -- falsy, and the most eligible score there is -- for a fully active
+        # one. Neither can mark presence.
+        _patient_ecog = patient_data.get("ecog_performance_status") or {}
+        if result.get("ecog_selection") is not None:
+            ecog_value              = result.get("ecog_value")
+            ecog_selection          = result.get("ecog_selection")
+            ecog_observations_found = result.get("ecog_observations_found")
+        else:
+            ecog_value              = _patient_ecog.get("value")
+            ecog_selection          = _patient_ecog.get("selection")
+            ecog_observations_found = _patient_ecog.get("observations_found")
+
         # Sum of stage durations only — excludes LangGraph routing overhead (~50-200ms)
         total_time = sum(timings.values())
 
@@ -373,8 +433,9 @@ def log_inference(result: Dict, patient_data: Dict):
                 retrieval_channels_ok, retrieval_degraded,
                 retrieval_trials_lost, query_expansion_path,
                 mesh_filter_applied, mesh_filter_skip_reason,
-                age_reference_date, birth_date_precision
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                age_reference_date, birth_date_precision,
+                ecog_value, ecog_selection, ecog_observations_found
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             result["patient_id"],
             result["timestamp"],
@@ -465,6 +526,13 @@ def log_inference(result: Dict, patient_data: Dict):
              or demographics.get("age_reference_date")),
             (result.get("birth_date_precision")
              or demographics.get("birth_date_precision")),
+            # ECOG. Resolved above, outside the tuple, because the value needs an
+            # `is None` test rather than the `or` chain used for the age columns:
+            # `or` would treat a legitimate ECOG 0 -- fully active, the most
+            # eligible a patient can be -- as absent.
+            ecog_value,
+            ecog_selection,
+            ecog_observations_found,
         ))
         
         inference_id = cursor.lastrowid
