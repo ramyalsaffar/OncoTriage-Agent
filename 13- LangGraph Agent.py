@@ -348,13 +348,16 @@ def compute_patient_hash(patient_data: Dict) -> str:
       - medications: sorted by display
       - observations: sorted by (display, date)
       - procedures: sorted by (display, date)
+      - ecog: value, date, shape and count — emitted ONLY when the bundle
+        carried at least one ECOG observation (see below)
     """
-    
+
     demographics = patient_data.get("demographics", {})
     conditions = patient_data.get("conditions", [])
     medications = patient_data.get("medications", [])
     observations = patient_data.get("observations", [])
     procedures = patient_data.get("procedures", [])
+    ecog = patient_data.get("ecog_performance_status") or {}
     
     # Build deterministic string representation
     parts = []
@@ -390,7 +393,47 @@ def compute_patient_hash(patient_data: Dict) -> str:
     sorted_procs = sorted(procedures, key=lambda p: (p.get('display', ''), p.get('date', '')))
     for p in sorted_procs:
         parts.append(f"proc={p.get('display', '')}|{p.get('date', '')}")
-    
+
+    # ECOG performance status.
+    #
+    # It has to be in here or the docstring's promise stops holding: File 07
+    # routes LOINC 89247-1 OUT of `observations` into its own field, so once
+    # patients carry a score the ECOG contributes nothing to the hash above and
+    # two patients differing only in performance status -- the single most
+    # common gate in interventional oncology -- would hash identically.
+    #
+    # Emitted only when the bundle actually carried an ECOG observation. That is
+    # deliberate, and it is not the same as defaulting absence to a value:
+    #
+    #   - A bundle with no ECOG produces no line, so its hash is byte-identical
+    #     to what this function returned before ECOG existed. Every hash already
+    #     logged against the current corpus -- which has no ECOG anywhere --
+    #     stays comparable. An unconditional line would have invalidated all of
+    #     them to record "still nothing".
+    #   - observations_found, not value, is the switch. A patient whose only
+    #     ECOG postdates the reference date has value None but found >= 1, and
+    #     their input data genuinely differs from a patient with no observation
+    #     at all, so they get a line and a different hash. Keying on value would
+    #     have collapsed those two into one hash and broken the promise in the
+    #     other direction.
+    #
+    # value_shape is deliberately NOT hashed. It records whether the source
+    # bundle carried valueQuantity or valueInteger, which is a fact about
+    # serialisation, not about the patient: the same score on the same date
+    # produces byte-identical prompt text either way. Hashing it would make
+    # running File 04's normalizer over a corpus change every ECOG patient's
+    # hash while every prompt stayed the same, and the ablation study --
+    # which reads a hash change as an input change -- would report a
+    # difference that does not exist. Every other field here reaches the
+    # prompt, so hash equality tracks prompt equality.
+    if ecog.get("observations_found"):
+        parts.append(
+            f"ecog={ecog.get('value')}"
+            f"|{ecog.get('date')}"
+            f"|{ecog.get('observations_found')}"
+            f"|{ecog.get('selection')}"
+        )
+
     hash_input = "\n".join(parts)
     return hashlib.sha256(hash_input.encode('utf-8')).hexdigest()[:16]
 
@@ -3593,6 +3636,8 @@ def _create_patient_summary(patient_data: Dict) -> str:
 
     Sections:
       Demographics      : age, sex, race, ethnicity
+      Performance Status: ECOG (LOINC 89247-1), or an explicit statement that
+                          none is recorded. Never defaults to 0.
       Conditions        : relevance-filtered into three tiers:
                           Tier A (cancer): full detail with [neoplasm] tag
                           Tier B (relevant): full detail with [comorbidity] tag
@@ -3619,6 +3664,7 @@ def _create_patient_summary(patient_data: Dict) -> str:
     observations = patient_data.get("observations") or []
     procedures   = patient_data.get("procedures") or []
     allergies    = patient_data.get("allergies") or []
+    ecog         = patient_data.get("ecog_performance_status") or {}
 
     # ── Demographics ──────────────────────────────────────────────────────
     summary = (
@@ -3627,6 +3673,50 @@ def _create_patient_summary(patient_data: Dict) -> str:
         f"Race: {demographics.get('race', 'unknown')} | "
         f"Ethnicity: {demographics.get('ethnicity', 'unknown')}"
     )
+
+    # ── Performance Status ────────────────────────────────────────────────
+    # Its own named line, directly under demographics, because "ECOG 0-1" is
+    # the most common single gate in interventional oncology and the model has
+    # to be able to find it without inferring it from a lab list.
+    #
+    # `is None` is the test, never truthiness: ECOG 0 means fully active -- the
+    # most eligible a patient can be -- and `if value:` would silently report
+    # the best possible performance status as no performance status.
+    #
+    # When observations exist but none is usable, the count and the reason are
+    # stated rather than collapsed into "not recorded". "No ECOG on file" and
+    # "an ECOG exists but postdates this data snapshot" are different facts, and
+    # a criterion evaluated against the wrong one is wrong in a way nothing
+    # downstream can detect.
+    summary += "\n\nPerformance Status:\n"
+    ecog_value = ecog.get("value")
+    if ecog_value is not None:
+        ecog_date = ecog.get("date") or ""
+        date_str  = ecog_date[:10] if ecog_date and ecog_date != "unknown" else "date unknown"
+
+        # Counted against the pool the winner was actually drawn from, not
+        # against every observation on the bundle. "most recent of 3" is false
+        # when one of the three postdates the snapshot and is therefore later
+        # than the one being reported.
+        eligible = ecog.get("observations_on_or_before_reference") or 0
+        excluded = ((ecog.get("observations_after_reference") or 0)
+                    + (ecog.get("observations_undated") or 0))
+
+        detail = [date_str]
+        if eligible > 1:
+            detail.append(f"most recent of {eligible}")
+        if excluded:
+            detail.append(f"{excluded} further observation(s) outside the "
+                          f"{ecog.get('reference_date')} snapshot")
+        summary += f"- ECOG performance status: {ecog_value} ({'; '.join(detail)})\n"
+    elif ecog.get("observations_found"):
+        summary += (
+            f"- ECOG performance status: not available "
+            f"({ecog.get('observations_found')} observation(s) on file, none usable: "
+            f"{ecog.get('selection')}; reference date {ecog.get('reference_date')})\n"
+        )
+    else:
+        summary += "- ECOG performance status: not recorded\n"
 
     # ── Conditions (relevance-filtered) ───────────────────────────────────
     # Tier A (cancer) and Tier B (relevant comorbidities) get full detail.

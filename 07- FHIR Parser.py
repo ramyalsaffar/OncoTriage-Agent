@@ -216,8 +216,18 @@ def parse_fhir_bundle(bundle_path: str) -> Dict:
         'procedures':                [],
         'allergies':                 [],
         'cancer_stage_observations': [],  # mCODE TNM stage group Observations (LOINC 21908-9/21902-2/21914-7)
-        'cancer_genomic_variants':   []   # mCODE genomic variant Observations (LOINC 69548-6)
+        'cancer_genomic_variants':   [],  # mCODE genomic variant Observations (LOINC 69548-6)
+
+        # ECOG performance status (LOINC 89247-1), reduced to one score.
+        # Populated unconditionally at the end of this function, including for
+        # patients with no observation -- see _select_ecog_performance_status()
+        # for the shape and for why value is None rather than 0 when absent.
+        'ecog_performance_status':   None,
     }
+
+    # Collected during the resource sweep, reduced once afterwards: the winner
+    # depends on the whole set, not on arrival order.
+    ecog_observations = []
 
     # Build Medication resource lookup table first.
     # Synthea bundles use medicationReference (a pointer to a separate
@@ -295,6 +305,16 @@ def parse_fhir_bundle(bundle_path: str) -> Dict:
                     patient_data['cancer_genomic_variants'].append(
                         _parse_mcode_genomic_variant(resource)
                     )
+                elif obs_loinc == _ECOG_LOINC_CODE:
+                    # Routed out of the general pool deliberately. Pooled in
+                    # observations it was unreachable: OncologyLabRegistry does
+                    # not carry 89247-1, so the lab section never showed it, and
+                    # "ECOG Performance Status score" matches no biomarker
+                    # keyword, so that section never showed it either. The score
+                    # was parsed and then silently dropped before the prompt --
+                    # while nearly every interventional oncology trial gates on
+                    # it. It gets a field of its own instead.
+                    ecog_observations.append(_parse_ecog_observation(resource))
                 else:
                     patient_data['observations'].append(_parse_observation(resource))
 
@@ -358,6 +378,12 @@ def parse_fhir_bundle(bundle_path: str) -> Dict:
         if a.get('clinical_status', 'unknown') in _ACTIVE_ALLERGY_STATUSES
         and a.get('verification_status', 'unknown') not in _EXCLUDE_ALLERGY_VERIFICATION
     ])
+
+    # Set for every patient, not only for the ones that have a score, so the
+    # field's absence never has to be distinguished from a value of None.
+    patient_data['ecog_performance_status'] = _select_ecog_performance_status(
+        ecog_observations
+    )
 
     return patient_data
 
@@ -764,6 +790,219 @@ def _parse_mcode_stage_observation(obs_resource: Dict) -> Dict:
         'loinc':         loinc,
     }
 
+# ---------------------------------------------------------------------------
+# ECOG performance status Observation (mCODE ECOGPerformanceStatus)
+# ---------------------------------------------------------------------------
+# 89247-1 is the SCORE. Its LOINC siblings are named here so nobody "corrects"
+# the routing to one of them: 89246-3 is the PANEL and 89262-0 is the
+# INTERPRETATION (the text label, a CodeableConcept). Only the score carries the
+# integer grade that trial criteria compare against.
+_ECOG_LOINC_CODE: str = "89247-1"
+_ECOG_LOINC_PANEL_CODE: str = "89246-3"
+_ECOG_LOINC_INTERPRETATION_CODE: str = "89262-0"
+
+# The ECOG scale runs 0-5, where 5 means dead. The parser accepts the full
+# scale and rejects anything outside it. It does NOT reject 5: 5 is a valid
+# grade in a real record, and deciding that a patient is not a trial candidate
+# is Stage 5's job, not the parser's. '04- FHIR Generate Data.py' never
+# GENERATES 5, which is a separate guarantee made at a separate layer.
+_ECOG_MIN_GRADE: int = 0
+_ECOG_MAX_GRADE: int = 5
+
+# Which value[x] shape each ECOG observation arrived in, corpus-wide, and which
+# selection path each patient took. A corpus whose ECOGs are still
+# valueQuantity has not been through normalize_ecog_observations() (File 04) and
+# is not mCODE-conformant; a corpus where most patients resolve to
+# "all_after_reference_date" has a DATA_SNAPSHOT_DATE that no longer describes
+# it. Neither is visible from the parsed patient dicts alone.
+ECOG_VALUE_SHAPE_COUNTS = Counter()
+ECOG_SELECTION_COUNTS = Counter()
+
+
+def _parse_ecog_observation(obs_resource: Dict) -> Dict:
+    """
+    Parse one ECOG performance status Observation (LOINC 89247-1).
+
+    Two value shapes are accepted, because a bundle can legitimately arrive in
+    either depending on whether File 04's post-export normalizer has run:
+
+      valueInteger   the mCODE-conformant shape, written by
+                     normalize_ecog_observations() in '04- FHIR Generate Data.py'
+      valueQuantity  what Synthea's FHIR R4 exporter actually emits, carrying
+                     the UCUM annotation unit "{score}". Synthea has no integer
+                     path -- FhirR4.mapValueToFHIRType() sends every number to
+                     Quantity -- so this is the raw pre-normalization form.
+
+    Which one was found is returned as value_shape and counted in
+    ECOG_VALUE_SHAPE_COUNTS, because "this corpus is still un-normalized" is a
+    fact about the data that is otherwise invisible once the value is an int.
+
+    Raises:
+        ValueError: on a value that is non-integral, outside 0-5, absent, or in
+                    any other value[x] shape. Rounding 1.5 to 2 would invent a
+                    grade the record does not contain, and defaulting a missing
+                    or unreadable value to 0 would make an unscored patient
+                    indistinguishable from a fully active one -- which is the
+                    single distinction this field exists to preserve.
+    """
+    date = (
+        obs_resource.get('effectiveDateTime')
+        or obs_resource.get('effectivePeriod', {}).get('start')
+        or 'unknown'
+    )
+
+    if 'valueInteger' in obs_resource:
+        raw = obs_resource['valueInteger']
+        shape = 'valueInteger'
+        unit = None
+    elif 'valueQuantity' in obs_resource:
+        raw = obs_resource['valueQuantity'].get('value')
+        shape = 'valueQuantity'
+        unit = obs_resource['valueQuantity'].get('unit')
+    else:
+        present = sorted(k for k in obs_resource if k.startswith('value'))
+        raise ValueError(
+            f"ECOG observation (LOINC {_ECOG_LOINC_CODE}) carries no readable "
+            f"value[x]: expected valueInteger or valueQuantity, found "
+            f"{present or 'nothing'}. mCODE fixes value[x] to integer for this "
+            f"profile, so any other shape is non-conformant data, not a shape "
+            f"to guess at."
+        )
+
+    if raw is None:
+        raise ValueError(
+            f"ECOG observation (LOINC {_ECOG_LOINC_CODE}) has {shape} with no value"
+        )
+
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ValueError(
+            f"ECOG observation (LOINC {_ECOG_LOINC_CODE}) value {raw!r} is not "
+            f"numeric (shape: {shape})"
+        )
+
+    value = int(raw)
+    if value != raw:
+        raise ValueError(
+            f"ECOG observation (LOINC {_ECOG_LOINC_CODE}) value {raw!r} is not "
+            f"an integer grade (shape: {shape}). The ECOG scale has no "
+            f"fractional grades; rounding would invent one."
+        )
+
+    if not _ECOG_MIN_GRADE <= value <= _ECOG_MAX_GRADE:
+        raise ValueError(
+            f"ECOG observation (LOINC {_ECOG_LOINC_CODE}) value {value} is "
+            f"outside the ECOG scale {_ECOG_MIN_GRADE}-{_ECOG_MAX_GRADE} "
+            f"(shape: {shape})"
+        )
+
+    ECOG_VALUE_SHAPE_COUNTS[shape] += 1
+
+    return {
+        'value':       value,
+        'value_shape': shape,
+        'unit':        unit,
+        'date':        date,
+        'loinc':       _ECOG_LOINC_CODE,
+    }
+
+
+def _select_ecog_performance_status(ecog_observations: List[Dict]) -> Dict:
+    """
+    Reduce a patient's ECOG observations to the one score the pipeline uses.
+
+    The most recent observation dated ON OR BEFORE the run's age reference date
+    wins. The reference date is get_age_reference_date() (File 02, resolving
+    DATA_SNAPSHOT_DATE from File 03), never datetime.now(): patient age is
+    already computed against it, and a clock-derived cutoff here would let the
+    same bundle yield a different ECOG on two different days while
+    compute_patient_hash() -- which cannot see the clock -- reported the two
+    runs as identical input.
+
+    Observations dated after the reference date are counted, not used: they are
+    events the snapshot has not reached. Undated observations cannot be ordered,
+    so a lone one is used and several are refused rather than picked between.
+
+    Returns:
+        dict, ALWAYS present on the patient even when nothing was found:
+
+          value        int | None -- None means NOT RECORDED. It is never 0 by
+                       default. A patient with no score and a patient scored 0
+                       (fully active) are clinically opposite and every consumer
+                       must test `is None`, not truthiness.
+          date         str | None -- effective date of the observation used
+          value_shape  str | None -- 'valueInteger' | 'valueQuantity'
+          unit         str | None -- UCUM unit when the source was a Quantity
+          observations_found                   int -- total on the bundle
+          observations_on_or_before_reference  int
+          observations_after_reference         int
+          observations_undated                 int
+          selection    str -- which path produced (or failed to produce) value
+          reference_date str -- the cutoff actually applied, ISO
+    """
+    reference_date = get_age_reference_date()
+
+    status = {
+        'value':       None,
+        'date':        None,
+        'value_shape': None,
+        'unit':        None,
+        'observations_found':                  len(ecog_observations),
+        'observations_on_or_before_reference': 0,
+        'observations_after_reference':        0,
+        'observations_undated':                0,
+        'selection':      'none_recorded',
+        'reference_date': reference_date.isoformat(),
+    }
+
+    if not ecog_observations:
+        ECOG_SELECTION_COUNTS[status['selection']] += 1
+        return status
+
+    # Partition. index is carried so ordering stays deterministic when two
+    # observations share a date: sorted() is stable, so equal keys keep bundle
+    # order and the last one in the bundle wins. Deterministic for a given
+    # bundle, which is what the reproducibility promise needs.
+    on_or_before = []
+    undated = []
+    for index, obs in enumerate(ecog_observations):
+        # Parsed once per observation. parse_partial_date() also increments
+        # PARTIAL_DATE_DEGRADATIONS on an out-of-range component, so calling it
+        # twice on the same field would double-count a real data-quality signal.
+        obs_date, _precision = parse_partial_date(obs.get('date'))
+        if obs_date is None:
+            undated.append(obs)
+            continue
+        if obs_date > reference_date:
+            status['observations_after_reference'] += 1
+            continue
+        status['observations_on_or_before_reference'] += 1
+        on_or_before.append(((obs_date, str(obs.get('date') or ''), index), obs))
+
+    status['observations_undated'] = len(undated)
+
+    if on_or_before:
+        chosen = sorted(on_or_before, key=lambda pair: pair[0])[-1][1]
+        status['selection'] = 'most_recent_on_or_before_reference_date'
+    elif len(undated) == 1 and not status['observations_after_reference']:
+        chosen = undated[0]
+        status['selection'] = 'undated_single'
+    elif undated:
+        chosen = None
+        status['selection'] = 'undated_ambiguous'
+    else:
+        chosen = None
+        status['selection'] = 'all_after_reference_date'
+
+    if chosen is not None:
+        status['value']       = chosen['value']
+        status['date']        = chosen['date']
+        status['value_shape'] = chosen['value_shape']
+        status['unit']        = chosen['unit']
+
+    ECOG_SELECTION_COUNTS[status['selection']] += 1
+    return status
+
+
 # mCODE genomic variant Observation LOINC code
 _MCODE_GENOMIC_VARIANT_LOINC: str = "69548-6"
 
@@ -1106,6 +1345,8 @@ def load_all_patients(patients_dir: str) -> List[Dict]:
     # calls, so the printed numbers always match the directory just parsed.
     BIRTH_DATE_PRECISION_COUNTS.clear()
     DEMOGRAPHIC_SOURCE_COUNTS.clear()
+    ECOG_VALUE_SHAPE_COUNTS.clear()
+    ECOG_SELECTION_COUNTS.clear()
 
     for idx, fhir_file in enumerate(patient_files, 1):
         if idx % 100 == 0 or idx == len(patient_files):
@@ -1131,6 +1372,20 @@ def load_all_patients(patients_dir: str) -> List[Dict]:
     print(f"  Birth date precision: {dict(sorted(BIRTH_DATE_PRECISION_COUNTS.items()))}")
     print(f"  Age reference date:   {get_age_reference_date().isoformat()}")
     print(f"  Demographic sources:  {dict(sorted(DEMOGRAPHIC_SOURCE_COUNTS.items()))}")
+
+    # ECOG coverage. Printed unconditionally for the same reason as the two
+    # above: "no patient in this corpus carries a performance status" is a
+    # result, and it is the state every corpus generated before
+    # '04- FHIR Generate Data.py' grew its ECOG module is in. A value_shape
+    # tally still showing valueQuantity means the corpus never went through
+    # normalize_ecog_observations() and is not mCODE-conformant.
+    scored = sum(
+        1 for p in patients
+        if (p.get('ecog_performance_status') or {}).get('value') is not None
+    )
+    print(f"  ECOG scored patients: {scored}/{len(patients)}")
+    print(f"  ECOG value shapes:    {dict(sorted(ECOG_VALUE_SHAPE_COUNTS.items()))}")
+    print(f"  ECOG selection paths: {dict(sorted(ECOG_SELECTION_COUNTS.items()))}")
 
     return patients
 
