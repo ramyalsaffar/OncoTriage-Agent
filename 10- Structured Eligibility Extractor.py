@@ -810,17 +810,17 @@ _HISTOLOGY_SUFFIX_WINDOW = 60
 # Chars of look-back needed to see a "non-" prefix ("non-" / "non ").
 _NON_MORPH_LOOKBACK = 6
 
-# Which rule suppressed a mention / rejected a tag set. Never silently
-# recovered: every skip lands in one of these counters and is readable via
-# get_histology_extraction_stats() after an index build.
+# Which rule suppressed a mention, plus how many trials came out permissive
+# on the histology axis. Never silent: every skip lands in one of these
+# counters and is readable via get_histology_extraction_stats() after a build.
 _HISTOLOGY_EXTRACTION_COUNTS: Dict[str, int] = {
     "clause_prefix":           0,   # rule 1 — _is_negated look-back
     "morphological":           0,   # rule 2 — "non-<term>"
     "clause_suffix":           0,   # rule 3 — "<term> … is excluded"
-    "contradiction_rejected":  0,   # enrich_histology_tags refused a tag set
-    "contradiction_softened":  0,   # a contradictory pair was dropped
-                                    # (patient conditions, or a refused trial
-                                    #  recovered via soften_histology_conflict)
+    "exclusive_pair_kept":     0,   # a trial carried both members of an
+                                    # exclusive pair ("adenocarcinoma OR
+                                    # squamous") — both tags are indexed, the
+                                    # trial permits either. Counted, not dropped.
 }
 
 
@@ -944,7 +944,11 @@ def _extract_histology_tags(text: str) -> Set[str]:
 # CONFLICT DETECTION
 # ══════════════════════════════════════════════════════════════════════════
 #
-# Two tag sets CONFLICT if they contain a MUTUALLY EXCLUSIVE pair.
+# A patient and a trial CONFLICT only when the two tag sets DO NOT OVERLAP
+# and a mutually exclusive pair spans them. Overlap wins: if the patient's
+# own histology is among the trial's tags, the trial names that patient's
+# disease and is kept, whatever else it also names.
+#
 # Mutual exclusivity is SYMMETRIC and defined by the biology:
 #
 #   nsclc ↔ sclc           (fundamentally different diseases)
@@ -958,42 +962,22 @@ def _extract_histology_tags(text: str) -> Set[str]:
 # A "squamous NSCLC" trial is valid for an NSCLC patient.
 #
 # Similarly, adenocarcinoma and nsclc are NOT mutually exclusive.
+#
+# sclc ↔ neuroendocrine is deliberately ABSENT: SCLC *is* a neuroendocrine
+# carcinoma of the lung, so a neuroendocrine trial is a trial for the SCLC
+# patient's own disease. Listing it would drop exactly the trials that fit.
+# tracheal ↔ squamous is likewise absent — tracheal squamous cell carcinoma
+# is the commonest tracheal histology, not a contradiction.
 
-# Define mutually exclusive pairs as frozensets for O(1) lookup
+# Define mutually exclusive pairs as frozensets for O(1) lookup.
+# This set must match the table above, pair for pair.
 _EXCLUSIVE_PAIRS = {
     frozenset({"nsclc", "sclc"}),
+    frozenset({"nsclc", "neuroendocrine"}),
+    frozenset({"nsclc", "tracheal"}),
+    frozenset({"sclc", "tracheal"}),
     frozenset({"squamous", "adenocarcinoma"}),
 }
-
-
-class HistologyTagConflictError(ValueError):
-    """
-    Raised when ONE side (a single trial, or a single text) yields a tag set
-    that contains a mutually exclusive pair.
-
-    A trial cannot REQUIRE both squamous and adenocarcinoma histology, so
-    such a set is never a fact about the trial. Written to the payload as-is
-    it would conflict with a squamous patient AND with an adenocarcinoma
-    patient, hiding the trial from both — so extraction refuses to produce
-    it rather than quietly poisoning the index.
-
-    The refusal is deliberately loud but recoverable: the error carries the
-    trial that produced it, so a caller that knows the pair means "permits
-    either" can call soften_histology_conflict() and still index the trial.
-
-    Attributes:
-        trial: the trial dict that produced the set (None if not trial-side).
-        tags:  the full extracted tag set, contradiction included.
-        pair:  the mutually exclusive pair found, as a sorted tuple.
-    """
-
-    def __init__(self, message: str, trial: Optional[Dict] = None,
-                 tags: Optional[Set[str]] = None,
-                 pair: Optional[Tuple[str, str]] = None):
-        super().__init__(message)
-        self.trial = trial
-        self.tags = set(tags or ())
-        self.pair = pair
 
 
 def _find_exclusive_pair(tags: Set[str]) -> Optional[Tuple[str, str]]:
@@ -1001,7 +985,8 @@ def _find_exclusive_pair(tags: Set[str]) -> Optional[Tuple[str, str]]:
     Return the first mutually exclusive pair present in `tags`, or None.
 
     Same _EXCLUSIVE_PAIRS table used for the cross-side conflict check, so
-    self-contradiction and patient/trial conflict can never disagree.
+    the "permits either" count and the patient/trial conflict test can never
+    disagree about what the pairs are.
     """
     tag_set = set(tags)
     for pair in _EXCLUSIVE_PAIRS:
@@ -1010,92 +995,35 @@ def _find_exclusive_pair(tags: Set[str]) -> Optional[Tuple[str, str]]:
     return None
 
 
-def _drop_contradictory_tags(tags: Set[str], context_label: str, log=print) -> Set[str]:
-    """
-    Remove every mutually exclusive pair from `tags` and log each removal.
-
-    Both sides use this, for the same reason from opposite directions:
-      - PATIENT: a contradictory set can be legitimate (two primaries —
-        squamous cervical + lung adenocarcinoma). Keeping both would
-        conflict with, and drop, trials for either one.
-      - TRIAL: a contradictory set means the trial PERMITS either histology
-        ("adenocarcinoma or squamous cell carcinoma of the esophagus"), and
-        the pair is dropped by soften_histology_conflict() after the raise.
-
-    Either way the pair goes, that axis is left unfiltered, and the trial
-    stays reachable. Conservative: unknown → keep.
-
-    Args:
-        tags:          extracted tag set.
-        context_label: what produced the set, for the log line.
-        log:           sink for the per-drop message (pass tqdm.write to
-                       keep a progress bar intact).
-    """
-    tags = set(tags)
-    pair = _find_exclusive_pair(tags)
-    while pair:
-        _HISTOLOGY_EXTRACTION_COUNTS["contradiction_softened"] += 1
-        log(f"  [Histology] {context_label}: mutually exclusive tags "
-            f"'{pair[0]}' + '{pair[1]}' both extracted — dropping both, "
-            f"that axis is left unfiltered")
-        tags -= set(pair)
-        pair = _find_exclusive_pair(tags)
-    return tags
-
-
-def soften_histology_conflict(error: HistologyTagConflictError, log=print) -> Dict:
-    """
-    Recover an indexable trial from a HistologyTagConflictError.
-
-    A trial tagged {squamous, adenocarcinoma} in practice PERMITS either
-    histology rather than requiring both — "adenocarcinoma or squamous cell
-    carcinoma of the esophagus" is ordinary eligibility language. Refusing
-    such a trial removes it from the index for EVERY patient, including
-    patients with no histology tag at all, which is the same false-ineligible
-    direction the histology filter exists to prevent. Dropping the pair keeps
-    the trial indexed and unfiltered on the histology axis.
-
-    Call this from the index-time handler (File 11); enrich_histology_tags
-    still raises, so the refusal is never silent and always counted.
-
-    Args:
-        error: the HistologyTagConflictError raised by enrich_histology_tags.
-        log:   sink for the per-drop message (pass tqdm.write under a bar).
-
-    Returns:
-        The trial dict, with "histology_tags" set to the softened list.
-
-    Raises:
-        HistologyTagConflictError: re-raised unchanged when the error carries
-            no trial — there is nothing to recover and the caller must skip it.
-    """
-    if error.trial is None:
-        raise error
-
-    label = f"trial {error.trial.get('nct_id') or '<unknown>'}"
-    error.trial["histology_tags"] = sorted(
-        _drop_contradictory_tags(error.tags, label, log=log)
-    )
-    return error.trial
-
-
 def _has_conflict(patient_tags: Set[str], trial_tags: Set[str]) -> bool:
     """
-    Check if patient and trial histology tags have a mutually exclusive conflict.
+    True when the trial must be DROPPED for this patient's histology.
 
-    Returns True if ANY pair (one from patient, one from trial) is exclusive.
-    Returns False if no conflict detected.
+    The rule is INTERSECTION FIRST:
+      1. Either set empty                     → False (unknown → keep)
+      2. Sets intersect                       → False (the trial names the
+         patient's own histology; it is a trial for this disease, whatever
+         else it also names)
+      3. No intersection, but a mutually exclusive pair spans the two sets
+                                              → True  (drop)
+      4. Otherwise                            → False
 
-    Conservative: if either set is empty, no conflict possible → False.
+    Rule 2 is what makes "adenocarcinoma OR squamous cell carcinoma of the
+    esophagus" work: an adenocarcinoma patient intersects that trial and is
+    kept, instead of being dropped by the adeno↔squamous pair the trial also
+    carries. It is also correct for a patient with two primaries, whose tag
+    set can itself contain both members of a pair — such a patient matches
+    trials naming either type.
     """
     if not patient_tags or not trial_tags:
         return False
 
+    # The patient's own histology is named by the trial → keep, full stop.
+    if patient_tags & trial_tags:
+        return False
+
     for p_tag in patient_tags:
         for t_tag in trial_tags:
-            if p_tag == t_tag:
-                # Same tag = compatible, skip
-                continue
             if frozenset({p_tag, t_tag}) in _EXCLUSIVE_PAIRS:
                 return True
 
@@ -1120,16 +1048,19 @@ def enrich_histology_tags(trial: Dict) -> Dict:
     Conservative: if no histology extracted → empty set → no conflict possible
     → trial passes through at query time.
 
+    A trial carrying BOTH members of a mutually exclusive pair is not
+    self-contradictory — it PERMITS either histology ("adenocarcinoma or
+    squamous cell carcinoma of the esophagus", common in esophageal, cervical
+    and urothelial disease). Both tags are kept: _has_conflict() intersects
+    before it looks for an exclusive pair, so each population still matches.
+    The occurrence is counted (exclusive_pair_kept) so index builds report how
+    much of the corpus is permissive on this axis.
+
     Args:
         trial: Trial dict from parse_trial_metadata(). Modified in-place.
 
     Returns:
-        The same trial dict with "histology_tags" key added (set of strings).
-
-    Raises:
-        HistologyTagConflictError: if the resulting set is self-contradictory
-            (contains a mutually exclusive pair). The caller must skip the
-            trial rather than index a payload no patient can ever satisfy.
+        The same trial dict with "histology_tags" key added (sorted list).
     """
     title = trial.get("title") or ""
     inclusion = trial.get("eligibility", {}).get("inclusion_criteria") or ""
@@ -1138,21 +1069,8 @@ def enrich_histology_tags(trial: Dict) -> Dict:
     tags = _extract_histology_tags(title)
     tags |= _extract_histology_tags(inclusion)
 
-    # A single trial cannot require two mutually exclusive histologies.
-    # Refuse to emit a set that would conflict with both patient populations
-    # at once. The error carries the trial, so an index-time caller can call
-    # soften_histology_conflict() and index it unfiltered on this axis.
-    pair = _find_exclusive_pair(tags)
-    if pair:
-        _HISTOLOGY_EXTRACTION_COUNTS["contradiction_rejected"] += 1
-        raise HistologyTagConflictError(
-            f"Trial {trial.get('nct_id') or '<unknown>'}: self-contradictory "
-            f"histology tags {sorted(tags)} — '{pair[0]}' and '{pair[1]}' are "
-            f"mutually exclusive, so no patient can satisfy both.",
-            trial=trial,
-            tags=tags,
-            pair=pair,
-        )
+    if _find_exclusive_pair(tags):
+        _HISTOLOGY_EXTRACTION_COUNTS["exclusive_pair_kept"] += 1
 
     # Store as sorted list for JSON serialization (Qdrant payload)
     trial["histology_tags"] = sorted(tags)
@@ -1175,15 +1093,16 @@ def extract_patient_histology(conditions: List[Dict]) -> Set[str]:
     Returns set of tags or empty set.  Empty → filter keeps all trials.
 
     A patient CAN legitimately carry two mutually exclusive tags (two
-    primaries), unlike a trial. Rather than raise at query time, the
-    contradictory pair is dropped and logged — see _drop_contradictory_tags.
+    primaries — squamous cervical + lung adenocarcinoma). Both are kept:
+    under the intersection-first rule in _has_conflict() such a patient
+    matches trials naming EITHER type, which is what two primaries means.
     """
     tags = set()
     for cond in conditions:
         display = cond.get("display") or ""
         tags |= _extract_histology_tags(display)
 
-    return _drop_contradictory_tags(tags, "patient conditions")
+    return tags
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1198,8 +1117,10 @@ def is_histology_mismatch(patient_tags: Set[str], trial: Dict) -> bool:
       - patient_tags is empty               → False (unknown → keep all)
       - trial has no histology_tags key     → False (backward compatible)
       - trial histology_tags is empty       → False (unknown → keep)
-      - conflict detected between sets      → True  (mismatch → drop)
-      - no conflict                         → False (compatible → keep)
+      - the two sets intersect              → False (trial names the
+                                                     patient's histology → keep)
+      - no overlap, exclusive pair spans    → True  (mismatch → drop)
+      - no overlap, no exclusive pair       → False (compatible → keep)
 
     Args:
         patient_tags: Set from extract_patient_histology()

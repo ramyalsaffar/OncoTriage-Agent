@@ -23,7 +23,9 @@ services:
   # QDRANT - Vector Database
   # ==========================================================================
   qdrant:
-    image: qdrant/qdrant:v1.12.5
+    # Must match the server holding the index (v1.18.3). A different tag here
+    # would start a different server than the one the collection was built on.
+    image: qdrant/qdrant:v1.18.3
     container_name: Clinical-Trial-Patient-Match-qdrant
     restart: unless-stopped
     ports:

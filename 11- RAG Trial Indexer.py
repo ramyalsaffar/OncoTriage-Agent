@@ -124,12 +124,6 @@ def scrape_clinicaltrials_gov(condition=None, status=None, study_type=None, age=
     scrape_start    = time.time()
     page_num        = 0
 
-    # Trials refused by enrich_histology_tags() for having a self-contradictory
-    # histology tag set, then recovered by dropping the contradictory pair.
-    # Still indexed — never silently — counted here and reported with the
-    # scrape summary below.
-    histology_conflict_softened = 0
-
     with tqdm(
         total=max_trials,
         initial=len(trials),
@@ -178,17 +172,12 @@ def scrape_clinicaltrials_gov(condition=None, status=None, study_type=None, age=
                         except (IndexError, ValueError):
                             pass
 
-                    try:
-                        trial = parse_trial_metadata(protocol)
-                    except HistologyTagConflictError as e:
-                        # A trial tagged with a mutually exclusive pair PERMITS
-                        # either histology, it does not require both. Refusing
-                        # it would hide it from every patient — the same
-                        # false-ineligible direction the histology filter
-                        # exists to prevent. Drop the pair and index the trial
-                        # unfiltered on the histology axis.
-                        histology_conflict_softened += 1
-                        trial = soften_histology_conflict(e, log=tqdm.write)
+                    # A trial tagged with a mutually exclusive pair PERMITS
+                    # either histology, it does not require both. Both tags are
+                    # indexed and the query-time filter intersects before it
+                    # looks for an exclusive pair, so each population still
+                    # matches. Counted as exclusive_pair_kept, reported below.
+                    trial = parse_trial_metadata(protocol)
 
                     # Post-scrape oncology validation:
                     # Drop trials whose registered conditions contain no
@@ -250,13 +239,13 @@ def scrape_clinicaltrials_gov(condition=None, status=None, study_type=None, age=
 
     print(f"\nTotal trials scraped: {len(trials)}  |  Scrape time: {elapsed_str}")
 
-    if histology_conflict_softened:
-        print(f"Trials indexed with a contradictory histology pair dropped: "
-              f"{histology_conflict_softened}  (permit either histology — "
-              f"left unfiltered on that axis)")
     _histology_stats = get_histology_extraction_stats()
+    if _histology_stats.get("exclusive_pair_kept"):
+        print(f"Trials carrying a mutually exclusive histology pair: "
+              f"{_histology_stats['exclusive_pair_kept']}  (permit either "
+              f"histology — both tags indexed, both populations match)")
     if any(_histology_stats.values()):
-        print(f"Histology negation/contradiction counters: {_histology_stats}")
+        print(f"Histology negation/exclusive-pair counters: {_histology_stats}")
 
     _stage_stats = get_stage_extraction_stats()
     if any(_stage_stats.values()):

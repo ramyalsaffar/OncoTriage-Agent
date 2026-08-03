@@ -13,12 +13,12 @@ Covers:
     3. Clause-suffix negation — "<histology> is excluded"
     4. Negation scoping — clause boundaries must STOP a negation
     5. Affirmative regressions — real histologies still tagged
-    6. Self-contradiction — a trial with a mutually exclusive pair raises
-       HistologyTagConflictError, carrying the trial so the index-time
-       handler can recover it
-    6b. Softening — the raise is recoverable: the pair is dropped and the
-       trial is indexed unfiltered on the histology axis (File 11 handler)
-    7. Patient side — a contradictory pair is dropped, not raised
+    6. Permissive trials — a trial carrying both members of a mutually
+       exclusive pair ("adenocarcinoma OR squamous") keeps BOTH tags at
+       index time; it permits either histology
+    6b. The matching rule — intersection first: a trial is dropped only when
+       the tag sets do not overlap AND an exclusive pair spans them
+    7. Patient side — two primaries keep both tags and match either type
 
 No network, no LLM, no Qdrant. Pure function tests.
 
@@ -69,23 +69,6 @@ def check(label: str, actual, expected) -> None:
         print(f"  FAIL  {label}")
         print(f"          expected: {expected}")
         print(f"          actual:   {actual}")
-
-
-def check_raises(label: str, exc_type, fn, *args, **kwargs) -> None:
-    """Assert that fn(*args) raises exc_type."""
-    try:
-        result = fn(*args, **kwargs)
-    except exc_type:
-        _RESULTS["passed"] += 1
-        print(f"  PASS  {label}")
-    except Exception as e:                                    # noqa: BLE001
-        _RESULTS["failed"] += 1
-        _FAILURES.append(f"{label}\n          expected {exc_type.__name__}, got {type(e).__name__}: {e}")
-        print(f"  FAIL  {label} — expected {exc_type.__name__}, got {type(e).__name__}: {e}")
-    else:
-        _RESULTS["failed"] += 1
-        _FAILURES.append(f"{label}\n          expected {exc_type.__name__}, returned {result}")
-        print(f"  FAIL  {label} — expected {exc_type.__name__}, returned normally")
 
 
 def tags(text: str) -> set:
@@ -253,43 +236,55 @@ check("'small cell' without lung context → no sclc tag (conservative)",
 
 
 # ===========================================================================
-# TEST 6: SELF-CONTRADICTORY TRIAL TAG SET RAISES
+# TEST 6: A TRIAL CARRYING AN EXCLUSIVE PAIR KEEPS BOTH TAGS
 # ===========================================================================
-# A trial cannot REQUIRE both squamous and adenocarcinoma. Such a set would
-# conflict with both patient populations, so enrich_histology_tags refuses to
-# produce it — the refusal is never silent. Test 6b covers the recovery.
+# "Adenocarcinoma or squamous cell carcinoma of the esophagus" is ordinary
+# eligibility language: the trial PERMITS either histology. Dropping the pair
+# at index time would discard real information — the trial would end up saying
+# nothing about histology at all. Both tags are kept and counted; test 6b
+# shows why that is safe for both populations.
 
 print()
 print("=" * 70)
-print("Test 6: Self-contradictory trial tag set raises")
+print("Test 6: Trial with a mutually exclusive pair keeps both tags")
 print("=" * 70)
 
-check_raises("squamous + adenocarcinoma in title raises",
-             HistologyTagConflictError,
-             enrich_histology_tags,
-             make_trial("Adenocarcinoma and Squamous Cell Carcinoma of the Lung"))
+reset_histology_extraction_stats()
 
-# nsclc/sclc can only contradict ACROSS fields: within one text the extractor
+_permissive = make_trial("Adenocarcinoma and Squamous Cell Carcinoma of the Lung")
+enrich_histology_tags(_permissive)
+check("squamous + adenocarcinoma in title → both tags indexed",
+      _permissive["histology_tags"], ["adenocarcinoma", "squamous"])
+
+# nsclc/sclc can only co-occur ACROSS fields: within one text the extractor
 # uses an if/elif, so "non-small cell" always wins over "small cell".
 check("within one text, nsclc precedence prevents an nsclc+sclc pair",
       tags("Small Cell and Non-Small Cell Lung Cancer Cohort"), {"nsclc"})
 
-check_raises("nsclc (inclusion) + sclc (title) raises",
-             HistologyTagConflictError,
-             enrich_histology_tags,
-             make_trial("Chemotherapy for Small Cell Lung Cancer",
-                        "Inclusion Criteria: confirmed non-small cell lung cancer"))
+_both_lung = make_trial("Chemotherapy for Small Cell Lung Cancer",
+                        "Inclusion Criteria: confirmed non-small cell lung cancer")
+enrich_histology_tags(_both_lung)
+check("nsclc (inclusion) + sclc (title) → both tags indexed",
+      _both_lung["histology_tags"], ["nsclc", "sclc"])
 
-check_raises("contradiction split across title and inclusion raises",
-             HistologyTagConflictError,
-             enrich_histology_tags,
-             make_trial("Squamous Cell Carcinoma of the Lung",
-                        "Inclusion Criteria: confirmed adenocarcinoma of the lung"))
+_split = make_trial("Squamous Cell Carcinoma of the Lung",
+                    "Inclusion Criteria: confirmed adenocarcinoma of the lung")
+enrich_histology_tags(_split)
+check("pair split across title and inclusion → both tags indexed",
+      _split["histology_tags"], ["adenocarcinoma", "squamous"])
 
-check("HistologyTagConflictError is a ValueError",
-      issubclass(HistologyTagConflictError, ValueError), True)
+check("each permissive trial counted once as exclusive_pair_kept",
+      get_histology_extraction_stats()["exclusive_pair_kept"], 3)
 
-# The contradiction is NOT raised once negation removes one side —
+# A trial with an exclusive pair AND an extra tag keeps all three — nothing
+# is dropped, so the extra tag goes on filtering.
+_mixed = make_trial("Non-Small Cell Lung Cancer: Adenocarcinoma or "
+                    "Squamous Cell Carcinoma", nct="NCT99999998")
+enrich_histology_tags(_mixed)
+check("exclusive pair alongside another tag → all tags survive",
+      _mixed["histology_tags"], ["adenocarcinoma", "nsclc", "squamous"])
+
+# The pair does NOT appear once negation removes one side —
 # this is exactly the reported string, and it must index cleanly.
 _ok_trial = make_trial("Study in NSCLC", _REPORTED)
 enrich_histology_tags(_ok_trial)
@@ -308,105 +303,189 @@ check("trial with no histology signal → empty list (no filtering)",
 
 
 # ===========================================================================
-# TEST 6b: THE RAISE IS RECOVERABLE — soften, do not refuse
+# TEST 6b: THE MATCHING RULE — INTERSECTION FIRST
 # ===========================================================================
-# A trial tagged {squamous, adenocarcinoma} PERMITS either histology, it does
-# not require both. Refusing it would hide it from every patient, including
-# patients with no histology tag — the same false-ineligible direction this
-# filter exists to prevent. File 11's handler calls soften_histology_conflict.
+# Drop only when the two tag sets do NOT overlap and a mutually exclusive
+# pair spans them. If the patient's own histology is among the trial's tags,
+# the trial names that patient's disease and is kept, whatever else it also
+# names. This is the defect the old rule had: it walked every cross pair and
+# dropped on the first exclusive one, so an adenocarcinoma patient lost a
+# trial that listed adenocarcinoma alongside squamous.
 
 print()
 print("=" * 70)
-print("Test 6b: Contradictory trial is softened and indexed, not refused")
+print("Test 6b: Matching rule — intersection first, then exclusive pair")
 print("=" * 70)
 
-# --- The error carries what the handler needs to recover ---
 _both = make_trial("Adenocarcinoma or Squamous Cell Carcinoma of the Esophagus",
                    nct="NCT99999999")
-try:
-    enrich_histology_tags(_both)
-    _err = None
-except HistologyTagConflictError as _e:
-    _err = _e
+enrich_histology_tags(_both)
 
-check("raise still fires", _err is not None, True)
-check("error carries the trial", _err.trial is _both, True)
-check("error carries the full tag set", _err.tags, {"adenocarcinoma", "squamous"})
-check("error carries the offending pair", _err.pair, ("adenocarcinoma", "squamous"))
-check("no histology_tags written by the refused call",
-      "histology_tags" in _both, False)
+check("permissive trial keeps both tags",
+      _both["histology_tags"], ["adenocarcinoma", "squamous"])
 
-# --- Softening indexes the trial with the pair dropped ---
-reset_histology_extraction_stats()
-_recovered = soften_histology_conflict(_err, log=lambda _m: None)
+# --- The reported defect: the patient's histology IS in the trial's set ---
+check("adenocarcinoma patient KEPT against adeno-or-squamous trial",
+      is_histology_mismatch({"adenocarcinoma"}, _both), False)
+check("squamous patient KEPT against adeno-or-squamous trial",
+      is_histology_mismatch({"squamous"}, _both), False)
+check("untagged patient KEPT against adeno-or-squamous trial",
+      is_histology_mismatch(set(), _both), False)
 
-check("softened trial is the same dict (indexable)", _recovered is _both, True)
-check("contradictory pair dropped → unfiltered on histology axis",
-      _recovered["histology_tags"], [])
-check("softening increments contradiction_softened",
-      get_histology_extraction_stats()["contradiction_softened"], 1)
+# --- No overlap + an exclusive pair spanning the sets → still dropped ---
+check("squamous patient DROPPED against adenocarcinoma-only trial",
+      is_histology_mismatch({"squamous"}, {"histology_tags": ["adenocarcinoma"]}), True)
+check("adenocarcinoma patient DROPPED against squamous-only trial",
+      is_histology_mismatch({"adenocarcinoma"}, {"histology_tags": ["squamous"]}), True)
+check("nsclc patient DROPPED against sclc-only trial",
+      is_histology_mismatch({"nsclc"}, {"histology_tags": ["sclc"]}), True)
 
-# --- And the softened trial is now reachable by BOTH populations ---
-check("squamous patient can still see the softened trial",
-      is_histology_mismatch({"squamous"}, _recovered), False)
-check("adenocarcinoma patient can still see the softened trial",
-      is_histology_mismatch({"adenocarcinoma"}, _recovered), False)
-check("untagged patient can still see the softened trial",
-      is_histology_mismatch(set(), _recovered), False)
+# --- No overlap, no exclusive pair → keep (conservative) ---
+# squamous/tracheal is not in the table: tracheal squamous cell carcinoma is
+# the commonest tracheal histology, so the two are not a contradiction.
+check("squamous patient vs tracheal trial → no exclusive pair → keep",
+      is_histology_mismatch({"squamous"}, {"histology_tags": ["tracheal"]}), False)
 
-# --- Softening drops ONLY the exclusive pair; other tags keep filtering ---
-_mixed = make_trial("Non-Small Cell Lung Cancer: Adenocarcinoma or "
-                    "Squamous Cell Carcinoma", nct="NCT99999998")
-try:
-    enrich_histology_tags(_mixed)
-except HistologyTagConflictError as _e2:
-    soften_histology_conflict(_e2, log=lambda _m: None)
-
-check("only the exclusive pair is dropped, other tags survive",
-      _mixed["histology_tags"], ["nsclc"])
-check("surviving nsclc tag still filters out an sclc patient",
+# --- A permissive trial's OTHER tags still filter ---
+check("sclc patient DROPPED by the nsclc tag on the permissive trial",
       is_histology_mismatch({"sclc"}, _mixed), True)
-check("squamous patient still sees the softened NSCLC trial",
+check("squamous patient KEPT by the permissive trial's squamous tag",
       is_histology_mismatch({"squamous"}, _mixed), False)
-
-# --- Unrecoverable error re-raises rather than inventing a trial ---
-check_raises("error with no trial attached re-raises",
-             HistologyTagConflictError,
-             soften_histology_conflict,
-             HistologyTagConflictError("no trial attached"))
+check("adenocarcinoma patient KEPT by the permissive trial's adeno tag",
+      is_histology_mismatch({"adenocarcinoma"}, _mixed), False)
 
 
 # ===========================================================================
-# TEST 7: PATIENT SIDE — contradiction dropped, not raised
+# TEST 7: PATIENT SIDE — two primaries keep both tags
 # ===========================================================================
-# A patient CAN have two primaries. Raising at query time would break the
-# request; dropping the pair leaves that axis unfiltered (conservative).
+# A patient CAN have two primaries. Under the intersection rule keeping both
+# tags is correct: the patient matches trials naming EITHER type, which is
+# what two primaries means. Nothing is dropped on the patient side.
 
 print()
 print("=" * 70)
-print("Test 7: Patient side — contradictory pair dropped, not raised")
+print("Test 7: Patient side — two primaries keep both tags")
 print("=" * 70)
 
-check("two primaries → contradictory pair dropped",
-      extract_patient_histology([
-          {"display": "Squamous cell carcinoma of cervix"},
-          {"display": "Adenocarcinoma of lung"},
-      ]), set())
+_two_primaries = extract_patient_histology([
+    {"display": "Squamous cell carcinoma of cervix"},
+    {"display": "Adenocarcinoma of lung"},
+])
+check("two primaries → both tags kept",
+      _two_primaries, {"adenocarcinoma", "squamous"})
 
 check("single primary unaffected",
       extract_patient_histology([
           {"display": "Non-small cell carcinoma of lung, TNM stage 1"},
       ]), {"nsclc"})
 
-check("dropped pair leaves other tags intact",
+check("a third histology is kept alongside the pair",
       extract_patient_histology([
           {"display": "Squamous cell carcinoma of lung"},
           {"display": "Adenocarcinoma of lung"},
           {"display": "Neuroendocrine carcinoma of pancreas"},
-      ]), {"neuroendocrine"})
+      ]), {"adenocarcinoma", "neuroendocrine", "squamous"})
 
 check("empty conditions → empty set",
       extract_patient_histology([]), set())
+
+# --- A patient carrying both members of a pair matches trials of either type ---
+check("two-primary patient matches a squamous-only trial",
+      is_histology_mismatch(_two_primaries, {"histology_tags": ["squamous"]}), False)
+check("two-primary patient matches an adenocarcinoma-only trial",
+      is_histology_mismatch(_two_primaries, {"histology_tags": ["adenocarcinoma"]}), False)
+check("two-primary patient matches the permissive adeno-or-squamous trial",
+      is_histology_mismatch(_two_primaries, _both), False)
+check("two-primary patient still dropped by an unrelated exclusive pair",
+      is_histology_mismatch(_two_primaries | {"nsclc"},
+                            {"histology_tags": ["sclc"]}), True)
+
+
+# ===========================================================================
+# TEST 7b: _EXCLUSIVE_PAIRS MATCHES ITS OWN DOCUMENTATION
+# ===========================================================================
+# The comment above _EXCLUSIVE_PAIRS lists five pairs. The set must contain
+# those five and nothing else: a tag the table never names (neuroendocrine,
+# tracheal) is a tag that filters nothing, and the extractor emits both.
+#
+# The two deliberate ABSENCES are asserted too, because they are the ones a
+# future edit is most likely to "complete" by mistake:
+#   - sclc/neuroendocrine — SCLC *is* a neuroendocrine carcinoma of the lung,
+#     so a neuroendocrine trial is a trial for that patient's own disease.
+#   - nsclc/squamous, nsclc/adenocarcinoma — NSCLC includes both subtypes.
+
+print()
+print("=" * 70)
+print("Test 7b: Exclusive pair table matches the documented biology")
+print("=" * 70)
+
+check("the pair set is exactly the five documented pairs",
+      {tuple(sorted(p)) for p in _EXCLUSIVE_PAIRS},
+      {("nsclc", "sclc"),
+       ("neuroendocrine", "nsclc"),
+       ("nsclc", "tracheal"),
+       ("sclc", "tracheal"),
+       ("adenocarcinoma", "squamous")})
+
+# --- nsclc ↔ neuroendocrine (NSCLC is epithelial, NE is neuroendocrine) ---
+check("nsclc patient DROPPED by a neuroendocrine trial",
+      is_histology_mismatch({"nsclc"}, {"histology_tags": ["neuroendocrine"]}), True)
+check("neuroendocrine patient DROPPED by an NSCLC trial",
+      is_histology_mismatch({"neuroendocrine"}, {"histology_tags": ["nsclc"]}), True)
+
+# --- nsclc ↔ tracheal (different anatomical origin) ---
+check("nsclc patient DROPPED by a tracheal trial",
+      is_histology_mismatch({"nsclc"}, {"histology_tags": ["tracheal"]}), True)
+check("tracheal patient DROPPED by an NSCLC trial",
+      is_histology_mismatch({"tracheal"}, {"histology_tags": ["nsclc"]}), True)
+
+# --- sclc ↔ tracheal (different anatomical origin) ---
+check("sclc patient DROPPED by a tracheal trial",
+      is_histology_mismatch({"sclc"}, {"histology_tags": ["tracheal"]}), True)
+check("tracheal patient DROPPED by an SCLC trial",
+      is_histology_mismatch({"tracheal"}, {"histology_tags": ["sclc"]}), True)
+
+# --- Each added pair goes through the real extractor, not hand-built tags ---
+_ne_trial = make_trial("Neuroendocrine Carcinoma of the Lung")
+enrich_histology_tags(_ne_trial)
+check("extracted neuroendocrine trial drops an NSCLC patient",
+      is_histology_mismatch({"nsclc"}, _ne_trial), True)
+
+_tracheal_trial = make_trial("Tracheal Carcinoma Study")
+enrich_histology_tags(_tracheal_trial)
+check("extracted tracheal trial drops an NSCLC patient",
+      is_histology_mismatch({"nsclc"}, _tracheal_trial), True)
+check("extracted tracheal trial drops an SCLC patient",
+      is_histology_mismatch({"sclc"}, _tracheal_trial), True)
+
+# --- ABSENT ON PURPOSE: sclc ↔ neuroendocrine ---
+check("sclc/neuroendocrine is NOT an exclusive pair",
+      frozenset({"sclc", "neuroendocrine"}) in _EXCLUSIVE_PAIRS, False)
+check("SCLC patient KEEPS a neuroendocrine trial (SCLC is neuroendocrine)",
+      is_histology_mismatch({"sclc"}, _ne_trial), False)
+check("neuroendocrine patient KEEPS an SCLC trial",
+      is_histology_mismatch({"neuroendocrine"}, {"histology_tags": ["sclc"]}), False)
+
+# --- ABSENT ON PURPOSE: nsclc ↔ its own subtypes ---
+check("nsclc/squamous is NOT an exclusive pair",
+      frozenset({"nsclc", "squamous"}) in _EXCLUSIVE_PAIRS, False)
+check("nsclc/adenocarcinoma is NOT an exclusive pair",
+      frozenset({"nsclc", "adenocarcinoma"}) in _EXCLUSIVE_PAIRS, False)
+check("squamous patient KEEPS an NSCLC-only trial",
+      is_histology_mismatch({"squamous"}, {"histology_tags": ["nsclc"]}), False)
+check("adenocarcinoma patient KEEPS an NSCLC-only trial",
+      is_histology_mismatch({"adenocarcinoma"}, {"histology_tags": ["nsclc"]}), False)
+
+# --- A trial naming both members of a NEW pair still permits either ---
+_ne_or_nsclc = make_trial("Non-Small Cell Lung Cancer or Neuroendocrine "
+                          "Carcinoma", nct="NCT99999997")
+enrich_histology_tags(_ne_or_nsclc)
+check("nsclc + neuroendocrine trial keeps both tags",
+      _ne_or_nsclc["histology_tags"], ["neuroendocrine", "nsclc"])
+check("nsclc patient KEPT by the nsclc-or-neuroendocrine trial",
+      is_histology_mismatch({"nsclc"}, _ne_or_nsclc), False)
+check("neuroendocrine patient KEPT by the nsclc-or-neuroendocrine trial",
+      is_histology_mismatch({"neuroendocrine"}, _ne_or_nsclc), False)
 
 # --- Downstream mismatch behaviour is unchanged ---
 check("nsclc patient vs sclc trial → mismatch",
@@ -438,6 +517,13 @@ _stats = get_histology_extraction_stats()
 check("clause_prefix counted",  _stats["clause_prefix"] >= 1, True)
 check("morphological counted",  _stats["morphological"] >= 1, True)
 check("clause_suffix counted",  _stats["clause_suffix"] >= 1, True)
+
+# Nothing is softened any more, but permissive trials are still counted.
+check("exclusive_pair_kept not incremented by extraction alone",
+      _stats["exclusive_pair_kept"], 0)
+enrich_histology_tags(make_trial("Adenocarcinoma or Squamous Cell Carcinoma"))
+check("exclusive_pair_kept incremented by a permissive trial",
+      get_histology_extraction_stats()["exclusive_pair_kept"], 1)
 
 reset_histology_extraction_stats()
 check("reset zeroes the counters",
