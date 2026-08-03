@@ -10,7 +10,15 @@ publication-ready tables, figures, and statistical tests for the paper.
 Outputs (saved to result_ablation_path):
     Tables:
     - ablation_comparison_table.csv     Main comparison table with 95% CIs
-    - ablation_statistical_tests.csv    Wilcoxon tests + effect sizes
+                                        (each CI carries the n it was drawn on)
+    - ablation_statistical_tests.csv    Wilcoxon tests, BH-FDR corrected, one
+                                        row per (config, outcome metric), with
+                                        raw p, adjusted p, signed effect size
+                                        and a status for untested comparisons
+    - ablation_descriptive_metrics.csv  Cost / latency / candidate deltas,
+                                        reported without p-values by design
+    - ablation_pairing_report.csv       Per-config paired and DROPPED patient
+                                        sets with a reason for each drop
     - ablation_win_loss_table.csv       Per-patient pairwise wins/ties/losses
 
     Figures:
@@ -27,6 +35,16 @@ Outputs (saved to result_ablation_path):
     Reports:
     - ablation_full_report.txt          Plain-text report for quick review
     - ablation_analysis.json            Machine-readable summary
+
+Statistics:
+    The test family is (non-baseline configs) x ABLATION_OUTCOME_METRICS and is
+    corrected with Benjamini-Hochberg FDR. Cost and latency are excluded from
+    the family as deterministic consequences of the ablation, not hypotheses.
+    Comparisons that could not be tested (identical values, scipy failure, too
+    few pairs) are recorded with a status and excluded from the correction
+    rather than entered as p=1.0. Effect sizes are SIGNED. The minimum
+    detectable effect for the design is computed once and printed in the
+    report's methods block. See the block comment above run_statistical_tests().
 
 Architecture:
     - Exec chain: 01 -> 02 -> 03 (for paths, config constants)
@@ -265,6 +283,12 @@ def build_comparison_table(df: pd.DataFrame) -> pd.DataFrame:
     # conditional avg_match_score is deliberately absent, because its
     # resampling population differs by configuration and the resulting
     # intervals would not be comparable.
+    #
+    # Each interval resamples col.dropna(), so the population it is drawn from
+    # is not necessarily the population the mean beside it was computed over,
+    # and its size varies by configuration. {col}_ci_n records the number of
+    # values actually resampled and is printed with every interval; an interval
+    # whose n differs from n_patients is decorating a mean it does not describe.
     N_BOOT = 1000
     BOOT_SEED = 42
     ci_cols = ["eligible_count", "avg_match_score_all", "has_match",
@@ -279,10 +303,17 @@ def build_comparison_table(df: pd.DataFrame) -> pd.DataFrame:
         rng = np.random.default_rng(BOOT_SEED)
         for col in ci_cols:
             vals = config_data[col].dropna().values
+            table.loc[idx, f"{col}_ci_n"] = len(vals)
             if len(vals) < 2:
                 table.loc[idx, f"{col}_ci_lo"] = np.nan
                 table.loc[idx, f"{col}_ci_hi"] = np.nan
+                print(f"  WARNING: {config}/{col}: {len(vals)} non-null value(s), "
+                      f"CI not computed")
                 continue
+            if len(vals) < len(config_data):
+                print(f"  NOTE: {config}/{col}: CI bootstrapped on {len(vals)} of "
+                      f"{len(config_data)} patients ({len(config_data) - len(vals)} "
+                      f"null); interval and mean cover different populations")
             boot_means = [
                 rng.choice(vals, size=len(vals), replace=True).mean()
                 for _ in range(N_BOOT)
@@ -327,93 +358,507 @@ def build_comparison_table(df: pd.DataFrame) -> pd.DataFrame:
 # ===========================================================================
 # 2. STATISTICAL TESTS (paired per-patient comparisons)
 # ===========================================================================
+#
+# Design of the test family, stated here because it is the thing a reader has
+# to trust:
+#
+#   - Family    = (every non-baseline config) x (ABLATION_OUTCOME_METRICS).
+#                 With 6 configs and 3 metrics that is 18 tests.
+#   - Excluded  = cost, latency and candidate counts. Removing the
+#                 cross-encoder makes the pipeline cheaper by construction;
+#                 that is an accounting identity, not a hypothesis, and
+#                 carrying it in the family only spends error budget. These
+#                 are reported descriptively by build_descriptive_deltas().
+#   - Excluded  = any (config, metric) where the two configurations produced
+#                 identical values for every patient. No test is possible, so
+#                 none is recorded. Writing p = 1.0 there would insert a
+#                 fabricated observation into the family and, because BH ranks
+#                 p-values, a fabricated p = 1.0 inflates the denominator and
+#                 makes the surviving tests harder to reject.
+#   - Excluded  = any config with fewer than ABLATION_MIN_PAIRED paired
+#                 patients, reported as an exclusion rather than dropped.
+#   - Correction= Benjamini-Hochberg FDR at ABLATION_FDR_ALPHA over whatever
+#                 tests actually ran. Both raw and adjusted p are reported;
+#                 significance stars are assigned on the adjusted p only.
+#
+# Wilcoxon-adjacent facts (not tunable, hence inline):
 
-def run_statistical_tests(df: pd.DataFrame) -> pd.DataFrame:
+# Asymptotic relative efficiency of the Wilcoxon signed-rank test against the
+# paired t-test under normality. Used only to convert a t-test power
+# calculation into a Wilcoxon-appropriate minimum detectable effect.
+WILCOXON_ARE_VS_T = 0.955
+
+# Rank-biserial magnitude bands (Cohen's conventional cutoffs).
+EFFECT_BANDS = ((0.5, "large"), (0.3, "medium"), (0.1, "small"))
+
+
+def benjamini_hochberg(pvals: list) -> tuple:
     """
-    Paired Wilcoxon signed-rank tests + effect sizes: each config vs baseline.
+    Benjamini-Hochberg step-up FDR control.
 
-    Uses per-patient paired differences (same patient, different config).
-    Wilcoxon is appropriate because:
-        - Paired data (same patients across configs)
-        - No normality assumption needed
-        - Small-to-medium sample sizes
+    Returns (adjusted_pvals, rejected) in the caller's original order.
+    Adjusted p is the BH q-value: the smallest FDR level at which that test
+    would be declared significant, enforced monotone non-decreasing in p and
+    capped at 1.0. `rejected` uses the standard step-up rule, which is
+    equivalent to adjusted_p <= alpha.
 
-    Effect size: rank-biserial correlation r = 1 - (2W / (n*(n+1)/2))
-    where W is the Wilcoxon statistic and n is the number of non-zero
-    differences. Interpretation: |r| < 0.1 negligible, < 0.3 small,
-    < 0.5 medium, >= 0.5 large.
+    An empty family returns empty lists rather than raising: a family can
+    legitimately be empty when every comparison was identical or excluded.
+    """
+    m = len(pvals)
+    if m == 0:
+        return [], []
+
+    order = sorted(range(m), key=lambda i: pvals[i])
+    adjusted = [0.0] * m
+
+    # Step up from the largest p, carrying the running minimum so the adjusted
+    # values are monotone in p.
+    running_min = 1.0
+    for rank_from_one, idx in reversed(list(enumerate(order, start=1))):
+        q = pvals[idx] * m / rank_from_one
+        running_min = min(running_min, q)
+        adjusted[idx] = min(1.0, running_min)
+
+    rejected = [adjusted[i] <= ABLATION_FDR_ALPHA for i in range(m)]
+    return adjusted, rejected
+
+
+def signed_rank_biserial(diff: np.ndarray) -> tuple:
+    """
+    Signed matched-pairs rank-biserial correlation for a paired sample.
+
+    r = (R+ - R-) / (R+ + R-), where R+ and R- are the summed ranks of the
+    absolute non-zero differences that were positive and negative. r is bounded
+    by [-1, +1] and carries direction: with diff = ablated - baseline, r > 0
+    means the ablated configuration scored HIGHER than baseline.
+
+    This replaces r = 1 - 2W / (n(n+1)/2). scipy's two-sided Wilcoxon statistic
+    is min(R+, R-), so that formula is a function of the smaller rank sum only
+    and is non-negative by construction: a configuration that is uniformly
+    worse and one that is uniformly better both returned r = +1.000, which
+    reports that something moved without reporting which way.
+
+    Returns (r, n_nonzero). r is None when every difference is zero.
+    """
+    from scipy.stats import rankdata
+
+    nonzero = diff[diff != 0]
+    if len(nonzero) == 0:
+        return None, 0
+
+    ranks = rankdata(np.abs(nonzero))
+    r_plus = float(ranks[nonzero > 0].sum())
+    r_minus = float(ranks[nonzero < 0].sum())
+    total = r_plus + r_minus
+    if total == 0:
+        return None, len(nonzero)
+
+    return (r_plus - r_minus) / total, len(nonzero)
+
+
+def _effect_band(r) -> str:
+    """Magnitude label for a signed effect size; direction stays in the sign."""
+    if r is None:
+        return ""
+    a = abs(r)
+    for cutoff, label in EFFECT_BANDS:
+        if a >= cutoff:
+            return label
+    return "negligible"
+
+
+def build_pairing_report(df: pd.DataFrame, errors: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per-configuration account of which patients were paired against the
+    baseline and which were dropped, with a reason for each drop.
+
+    n_paired alone says how many patients survived; it does not say that the
+    surviving set is the SAME set across configurations. load_ablation_data
+    filters errored rows per configuration, so each configuration can silently
+    lose a different subset, and every cross-configuration comparison is then
+    made over a slightly different population. This function names the dropped
+    patients so that stops being invisible.
+
+    Drop reasons:
+        errored          - the run raised; excluded by load_ablation_data
+        missing_from_run - never present in the database for this config
+        baseline_missing - present here but the baseline lacks this patient,
+                           so no pair exists
+    """
+    baseline_ids = set(df[df["config_name"] == BASELINE]["patient_id"])
+
+    # Universe = every patient the study attempted anywhere, successful or not.
+    universe = set(df["patient_id"])
+    if len(errors):
+        universe |= set(errors["patient_id"])
+
+    err_by_config = {}
+    if len(errors):
+        for cfg, grp in errors.groupby("config_name"):
+            err_by_config[cfg] = dict(zip(grp["patient_id"], grp["error"]))
+
+    rows = []
+    for config in CONFIG_ORDER:
+        present = set(df[df["config_name"] == config]["patient_id"])
+        cfg_errors = err_by_config.get(config, {})
+
+        dropped = {}
+        for pid in sorted(universe - present):
+            if pid in cfg_errors:
+                dropped[pid] = f"errored: {str(cfg_errors[pid])[:80]}"
+            else:
+                dropped[pid] = "missing_from_run"
+
+        if config == BASELINE:
+            shared = present
+            baseline_missing = set()
+        else:
+            shared = present & baseline_ids
+            baseline_missing = present - baseline_ids
+            for pid in sorted(baseline_missing):
+                dropped[pid] = "baseline_missing"
+
+        rows.append({
+            "config_name": config,
+            "config_label": CONFIG_LABELS[config],
+            "n_universe": len(universe),
+            "n_present": len(present),
+            "n_paired": len(shared),
+            "n_dropped": len(dropped),
+            "n_errored": len(cfg_errors),
+            "dropped_patient_ids": ";".join(sorted(dropped)),
+            "dropped_reasons": ";".join(f"{p}={r}" for p, r in sorted(dropped.items())),
+            "in_test_family": (config != BASELINE
+                               and len(shared) >= ABLATION_MIN_PAIRED),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def run_statistical_tests(df: pd.DataFrame, pairing: pd.DataFrame) -> pd.DataFrame:
+    """
+    Paired Wilcoxon signed-rank tests, one row per (config, outcome metric),
+    Benjamini-Hochberg corrected across the whole family.
+
+    Long format, not one wide row per config, because the correction is a
+    property of the family and not of any single configuration.
+
+    Columns:
+        status       tested | not_tested_identical | not_tested_error
+        p_raw        uncorrected two-sided p (None unless status == tested)
+        p_adj        BH-adjusted q-value across the family
+        sig          stars from p_adj, never from p_raw
+        effect_r     SIGNED rank-biserial; > 0 means ablated > baseline
+        in_family    whether this row contributed to the correction
+
+    Rows with status != tested carry no p at all. They are recorded so the
+    reader can see the comparison was attempted, and excluded from `in_family`
+    so they cannot dilute the correction.
+
+    Only ABLATION_OUTCOME_METRICS are tested. avg_match_score_all is used
+    rather than avg_match_score: the conditional column is NULL for every
+    zero-match patient and the null pattern differs between the two configs
+    being paired, so the paired difference would be NaN for exactly the
+    patients whose loss the ablation caused. has_match tests the recall change
+    itself, which is what the conditional column was hiding.
     """
     from scipy.stats import wilcoxon
 
     baseline_df = df[df["config_name"] == BASELINE].set_index("patient_id")
+    pairing_idx = pairing.set_index("config_name")
     results = []
-
-    # avg_match_score_all, not avg_match_score. The conditional column is NULL
-    # for every zero-match patient, and the null pattern differs between the two
-    # configs being paired, so the paired difference would be NaN for exactly
-    # the patients whose loss the ablation caused -- silently testing only the
-    # patients where nothing went wrong. has_match tests the recall change
-    # itself, which is what the conditional column was hiding.
-    test_cols = ["eligible_count", "avg_match_score_all", "has_match",
-                 "estimated_cost_usd", "total_time", "candidates_evaluated"]
+    n_scipy_failures = 0
 
     for config in CONFIG_ORDER:
         if config == BASELINE:
             continue
 
         config_df = df[df["config_name"] == config].set_index("patient_id")
-
-        # Align on shared patients
         shared = baseline_df.index.intersection(config_df.index)
-        if len(shared) < 10:
+
+        n_dropped = int(pairing_idx.loc[config, "n_dropped"]) \
+            if config in pairing_idx.index else 0
+
+        if len(shared) < ABLATION_MIN_PAIRED:
+            # Previously a bare `continue`: the configuration vanished from the
+            # output with no row and no warning, and a reader counting rows had
+            # no way to tell an excluded configuration from one never run.
+            print(f"  EXCLUDED from test family: {config} has {len(shared)} "
+                  f"paired patient(s), below ABLATION_MIN_PAIRED="
+                  f"{ABLATION_MIN_PAIRED}")
+            for col in ABLATION_OUTCOME_METRICS:
+                results.append({
+                    "config_name": config, "config_label": CONFIG_LABELS[config],
+                    "metric": col, "n_paired": len(shared), "n_dropped": n_dropped,
+                    "n_nonzero": None, "stat": None, "p_raw": None,
+                    "effect_r": None, "effect_size": "",
+                    "status": "not_tested_insufficient_pairs",
+                    "detail": f"n_paired={len(shared)} < {ABLATION_MIN_PAIRED}",
+                    "in_family": False,
+                })
             continue
 
-        row = {"config_name": config, "config_label": CONFIG_LABELS[config],
-               "n_paired": len(shared)}
-
-        for col in test_cols:
-            bl_vals = baseline_df.loc[shared, col].values
-            cf_vals = config_df.loc[shared, col].values
+        for col in ABLATION_OUTCOME_METRICS:
+            bl_vals = baseline_df.loc[shared, col].values.astype(float)
+            cf_vals = config_df.loc[shared, col].values.astype(float)
             diff = cf_vals - bl_vals
 
-            # Skip if all differences are zero
+            row = {
+                "config_name": config, "config_label": CONFIG_LABELS[config],
+                "metric": col, "n_paired": len(shared), "n_dropped": n_dropped,
+            }
+
             if np.all(diff == 0):
-                row[f"{col}_stat"] = None
-                row[f"{col}_p"] = 1.0
-                row[f"{col}_sig"] = ""
-                row[f"{col}_effect_r"] = 0.0
-                row[f"{col}_effect_size"] = "zero"
+                # No test is possible and none is recorded. The old code wrote
+                # p = 1.0 / effect 0.0 here, which is an observation that was
+                # never made.
+                row.update({
+                    "n_nonzero": 0, "stat": None, "p_raw": None,
+                    "effect_r": None, "effect_size": "",
+                    "status": "not_tested_identical",
+                    "detail": "all paired differences zero; no test performed",
+                    "in_family": False,
+                })
+                results.append(row)
                 continue
 
             try:
                 stat, p = wilcoxon(diff, alternative="two-sided")
-                sig = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else ""
+            except Exception as exc:
+                # Recorded as a distinct status with the exception text, so a
+                # scipy failure can never be read as a genuine null.
+                n_scipy_failures += 1
+                print(f"  WARNING: wilcoxon failed for {config}/{col}: "
+                      f"{type(exc).__name__}: {exc}")
+                row.update({
+                    "n_nonzero": int(np.count_nonzero(diff)), "stat": None,
+                    "p_raw": None, "effect_r": None, "effect_size": "",
+                    "status": "not_tested_error",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                    "in_family": False,
+                })
+                results.append(row)
+                continue
 
-                # Rank-biserial effect size
-                n_nonzero = np.count_nonzero(diff)
-                if n_nonzero > 0:
-                    r = 1 - (2 * stat) / (n_nonzero * (n_nonzero + 1) / 2)
-                else:
-                    r = 0.0
-                abs_r = abs(r)
-                size_label = ("large" if abs_r >= 0.5 else "medium" if abs_r >= 0.3
-                              else "small" if abs_r >= 0.1 else "negligible")
+            r, n_nonzero = signed_rank_biserial(diff)
+            row.update({
+                "n_nonzero": n_nonzero,
+                "stat": round(float(stat), 2),
+                "p_raw": float(p),
+                "effect_r": None if r is None else round(r, 3),
+                "effect_size": _effect_band(r),
+                "status": "tested",
+                "detail": "",
+                "in_family": True,
+            })
+            results.append(row)
 
-                row[f"{col}_stat"] = round(stat, 2)
-                row[f"{col}_p"] = round(p, 4)
-                row[f"{col}_sig"] = sig
-                row[f"{col}_effect_r"] = round(r, 3)
-                row[f"{col}_effect_size"] = size_label
-            except Exception:
-                row[f"{col}_stat"] = None
-                row[f"{col}_p"] = None
-                row[f"{col}_sig"] = ""
-                row[f"{col}_effect_r"] = None
-                row[f"{col}_effect_size"] = ""
+    stats = pd.DataFrame(results)
+    if stats.empty:
+        print("  WARNING: no comparisons produced; test family is empty")
+        return stats
 
-        results.append(row)
+    # ── Benjamini-Hochberg over the family that actually ran ────────────────
+    family_mask = stats["in_family"].fillna(False).astype(bool)
+    family_p = stats.loc[family_mask, "p_raw"].tolist()
+    adjusted, rejected = benjamini_hochberg(family_p)
 
-    return pd.DataFrame(results)
+    stats["p_adj"] = None
+    stats["sig"] = ""
+    stats["rejected_fdr"] = False
+    stats.loc[family_mask, "p_adj"] = [round(a, 4) for a in adjusted]
+    stats.loc[family_mask, "rejected_fdr"] = rejected
+
+    # Stars come from the ADJUSTED p. Applying them to raw p is what made 18
+    # tests look like 18 independent chances to be right.
+    stats.loc[family_mask, "sig"] = [
+        "***" if a < 0.001 else "**" if a < 0.01 else "*" if a < 0.05 else ""
+        for a in adjusted
+    ]
+    stats["p_raw"] = stats["p_raw"].apply(
+        lambda v: None if pd.isna(v) else round(float(v), 4)
+    )
+
+    n_family = int(family_mask.sum())
+    n_excluded = len(stats) - n_family
+    print(f"  Test family: {n_family} test(s) corrected (BH FDR, "
+          f"alpha={ABLATION_FDR_ALPHA}); {n_excluded} comparison(s) recorded "
+          f"but not tested; {n_scipy_failures} scipy failure(s)")
+    print(f"  Rejected after correction: {int(stats['rejected_fdr'].sum())} "
+          f"of {n_family}")
+
+    return stats
+
+
+def build_descriptive_deltas(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Paired per-patient deltas for the metrics deliberately kept OUT of the test
+    family: cost, latency, candidates evaluated.
+
+    These move because the configuration changed what the pipeline does, not
+    because of anything sampling could have produced. They get means, medians
+    and a paired IQR -- everything except a p-value.
+    """
+    baseline_df = df[df["config_name"] == BASELINE].set_index("patient_id")
+    rows = []
+
+    for config in CONFIG_ORDER:
+        if config == BASELINE:
+            continue
+        config_df = df[df["config_name"] == config].set_index("patient_id")
+        shared = baseline_df.index.intersection(config_df.index)
+        if len(shared) == 0:
+            continue
+
+        for col in ABLATION_DESCRIPTIVE_METRICS:
+            bl_vals = baseline_df.loc[shared, col].values.astype(float)
+            cf_vals = config_df.loc[shared, col].values.astype(float)
+            diff = cf_vals - bl_vals
+            rows.append({
+                "config_name": config,
+                "config_label": CONFIG_LABELS[config],
+                "metric": col,
+                "n_paired": len(shared),
+                "baseline_mean": round(float(np.mean(bl_vals)), 6),
+                "config_mean": round(float(np.mean(cf_vals)), 6),
+                "mean_delta": round(float(np.mean(diff)), 6),
+                "median_delta": round(float(np.median(diff)), 6),
+                "delta_q25": round(float(np.percentile(diff, 25)), 6),
+                "delta_q75": round(float(np.percentile(diff, 75)), 6),
+                "pct_change": (round(float(np.mean(diff) / np.mean(bl_vals) * 100), 1)
+                               if np.mean(bl_vals) != 0 else None),
+                "tested": False,
+            })
+
+    return pd.DataFrame(rows)
+
+
+def compute_minimum_detectable_effect(df: pd.DataFrame,
+                                      stats: pd.DataFrame) -> dict:
+    """
+    Minimum detectable effect for the corrected family, reported once.
+
+    Without this, a non-significant result is ambiguous between "the ablation
+    had no effect" and "this design could not have seen an effect of that
+    size". The calculation solves the exact paired t-test power equation for
+    the standardized effect dz, using the noncentral t distribution:
+
+        power = P(|T| > t_crit | ncp = dz*sqrt(n)),  df = n - 1
+
+    then divides by sqrt(ARE) to convert it to a Wilcoxon-appropriate figure.
+
+    The closed-form normal approximation dz = (z_{1-a/2} + z_power)/sqrt(n) is
+    used only if the root-find fails, and is ANTI-conservative: it understates
+    the MDE by ~0.004 at n=75 but ~0.056 at n=15. Understating is the wrong
+    direction for a number whose job is to defend a null, so the exact solve is
+    the primary path and which path ran is recorded in `method`.
+
+    Reported at two alpha values that bracket what BH actually enforces:
+        - alpha = ABLATION_FDR_ALPHA          the most significant test in the
+                                              family, BH's loosest threshold
+        - alpha = ABLATION_FDR_ALPHA / m      the least significant test, BH's
+                                              strictest threshold (the
+                                              Bonferroni bound)
+
+    A real study's power sits between these; the pessimistic figure is the one
+    to quote when defending a null. dz is standardized, so it is also converted
+    into each metric's own units using the observed SD of that metric's paired
+    differences.
+    """
+    from scipy.stats import norm, nct, t as t_dist
+    from scipy.optimize import brentq
+
+    tested = stats[stats["status"] == "tested"] if len(stats) else stats
+    m = len(tested)
+    if m == 0:
+        return {"error": "no tests in family; MDE undefined"}
+
+    # Conservative: the smallest paired n any tested configuration had.
+    n = int(tested["n_paired"].min())
+    n_max = int(tested["n_paired"].max())
+
+    z_power = norm.ppf(ABLATION_POWER_TARGET)
+    scale = np.sqrt(WILCOXON_ARE_VS_T)
+    methods_used = set()
+
+    def _dz(alpha):
+        """Exact noncentral-t solve, with a logged normal-approximation fallback."""
+        approx = float((norm.ppf(1 - alpha / 2) + z_power) / np.sqrt(n))
+        df = n - 1
+        if df < 1:
+            methods_used.add("normal_approx (df<1)")
+            return approx / scale
+        t_crit = t_dist.ppf(1 - alpha / 2, df)
+
+        def shortfall(dz):
+            ncp = dz * np.sqrt(n)
+            power = (1 - nct.cdf(t_crit, df, ncp)) + nct.cdf(-t_crit, df, ncp)
+            if not np.isfinite(power):
+                # scipy's noncentral t loses numerical support at large ncp
+                # (NaN from ~ncp>34 at df=74). That region is far above the
+                # root -- power has already saturated at 1.0 well before it --
+                # so clamping to 1.0 keeps the bracket valid and monotone
+                # instead of aborting the solve on a NaN.
+                power = 1.0
+            return power - ABLATION_POWER_TARGET
+
+        try:
+            exact = brentq(shortfall, 1e-6, 20.0, xtol=1e-8)
+            methods_used.add("exact_noncentral_t")
+            return float(exact) / scale
+        except Exception as exc:
+            methods_used.add("normal_approx")
+            print(f"  WARNING: exact MDE solve failed at alpha={alpha:.6g} "
+                  f"({type(exc).__name__}: {exc}); fell back to normal "
+                  f"approximation, which UNDERSTATES the MDE")
+            return approx / scale
+
+    alpha_loose = ABLATION_FDR_ALPHA
+    alpha_strict = ABLATION_FDR_ALPHA / m
+
+    dz_loose = _dz(alpha_loose)
+    dz_strict = _dz(alpha_strict)
+
+    out = {
+        "n_paired_min": n,
+        "n_paired_max": n_max,
+        "n_tests_in_family": m,
+        "power_target": ABLATION_POWER_TARGET,
+        "are_wilcoxon_vs_t": WILCOXON_ARE_VS_T,
+        "alpha_loose": alpha_loose,
+        "alpha_strict": round(alpha_strict, 6),
+        "dz_loose": round(dz_loose, 3),
+        "dz_strict": round(dz_strict, 3),
+        "method": "+".join(sorted(methods_used)),
+        "per_metric": {},
+    }
+
+    # Translate the standardized effect into each metric's units, using the SD
+    # of the paired differences pooled across the tested configurations.
+    baseline_df = df[df["config_name"] == BASELINE].set_index("patient_id")
+    for col in ABLATION_OUTCOME_METRICS:
+        diffs = []
+        for config in tested[tested["metric"] == col]["config_name"].unique():
+            config_df = df[df["config_name"] == config].set_index("patient_id")
+            shared = baseline_df.index.intersection(config_df.index)
+            diffs.append(config_df.loc[shared, col].values.astype(float)
+                         - baseline_df.loc[shared, col].values.astype(float))
+        if not diffs:
+            continue
+        sd = float(np.std(np.concatenate(diffs), ddof=1))
+        out["per_metric"][col] = {
+            "sd_paired_diff": round(sd, 4),
+            "mde_units_loose": round(out["dz_loose"] * sd, 4),
+            "mde_units_strict": round(out["dz_strict"] * sd, 4),
+        }
+
+    print(f"  MDE at n={n}, {m} tests, power={ABLATION_POWER_TARGET}: "
+          f"dz={out['dz_loose']} (alpha={alpha_loose}) to "
+          f"dz={out['dz_strict']} (alpha={out['alpha_strict']}) "
+          f"[{out['method']}]")
+
+    return out
 
 
 # ===========================================================================
@@ -917,7 +1362,8 @@ def plot_patient_scatter(df: pd.DataFrame) -> None:
 
 def generate_report(df: pd.DataFrame, table: pd.DataFrame,
                     stats: pd.DataFrame, wl_table: pd.DataFrame,
-                    errors: pd.DataFrame) -> None:
+                    errors: pd.DataFrame, pairing: pd.DataFrame,
+                    descriptive: pd.DataFrame, mde: dict) -> None:
     """Generate a plain-text report for quick review."""
     lines = []
     lines.append("=" * 70)
@@ -931,6 +1377,76 @@ def generate_report(df: pd.DataFrame, table: pd.DataFrame,
     lines.append(f"Total runs:     {len(df)}")
     if len(errors):
         lines.append(f"Errors:         {len(errors)} (excluded from analysis)")
+    lines.append("")
+
+    # ── METHODS ────────────────────────────────────────────────────────────
+    #
+    # Stated in the report itself, not only in the code, because every number
+    # below is conditional on it.
+    lines.append("-" * 70)
+    lines.append("STATISTICAL METHODS")
+    lines.append("-" * 70)
+    n_family = int((stats["status"] == "tested").sum()) if len(stats) else 0
+    n_not_tested = len(stats) - n_family if len(stats) else 0
+    lines.append(
+        "Test:        Two-sided Wilcoxon signed-rank on per-patient paired\n"
+        "             differences (ablated - baseline), zeros dropped."
+    )
+    lines.append(
+        f"Family:      {n_family} test(s) = (non-baseline configs) x\n"
+        f"             {ABLATION_OUTCOME_METRICS}."
+    )
+    lines.append(
+        "Correction:  Benjamini-Hochberg FDR at alpha="
+        f"{ABLATION_FDR_ALPHA} across the whole\n"
+        "             family. Both raw and adjusted p are reported; the\n"
+        "             significance stars come from the ADJUSTED p only."
+    )
+    lines.append(
+        "Excluded:    Cost, latency and candidate counts are near-deterministic\n"
+        "             consequences of the configuration, not hypotheses. They\n"
+        "             are reported descriptively and carry no p-value, which\n"
+        "             keeps the family at 18 tests rather than 30."
+    )
+    if n_not_tested:
+        lines.append(
+            f"Not tested:  {n_not_tested} comparison(s) recorded with a status and\n"
+            "             no p-value (identical values, scipy failure, or too\n"
+            "             few pairs). They are excluded from the correction\n"
+            "             rather than entered as p=1.0."
+        )
+    lines.append(
+        "Effect size: Signed matched-pairs rank-biserial correlation,\n"
+        "             r = (R+ - R-)/(R+ + R-), range [-1,+1]. r > 0 means the\n"
+        "             ABLATED config scored higher than baseline."
+    )
+
+    # Minimum detectable effect
+    if "error" in mde:
+        lines.append(f"Power:       not computable ({mde['error']})")
+    else:
+        lines.append(
+            f"Power:       At n={mde['n_paired_min']} paired patients, "
+            f"{mde['n_tests_in_family']} tests and\n"
+            f"             power={mde['power_target']:.0%}, the smallest effect this\n"
+            f"             design resolves is dz={mde['dz_loose']} at the loosest BH\n"
+            f"             threshold (alpha={mde['alpha_loose']}) and dz="
+            f"{mde['dz_strict']} at the\n"
+            f"             strictest (alpha={mde['alpha_strict']:.5f}, the Bonferroni\n"
+            "             bound). Wilcoxon ARE vs paired t = "
+            f"{mde['are_wilcoxon_vs_t']}, solved by\n"
+            f"             {mde['method']}.\n"
+            "             A null below these thresholds is an absence of power,\n"
+            "             not evidence of an absence of effect."
+        )
+        if mde.get("per_metric"):
+            lines.append("             In each metric's own units:")
+            for col, d in mde["per_metric"].items():
+                lines.append(
+                    f"               {col:<22} SD(paired diff)="
+                    f"{d['sd_paired_diff']:.4f} -> MDE "
+                    f"{d['mde_units_loose']:.4f} to {d['mde_units_strict']:.4f}"
+                )
     lines.append("")
 
     # Main comparison table with 95% CIs
@@ -985,6 +1501,27 @@ def generate_report(df: pd.DataFrame, table: pd.DataFrame,
 
     lines.append("")
 
+    # ── n behind each bootstrap interval ───────────────────────────────────
+    #
+    # An interval is resampled from that column's non-null values, which is not
+    # always the population its mean was computed over. Printing the n makes a
+    # narrowed or shifted resampling population visible instead of implied.
+    ci_report_cols = ["eligible_count", "avg_match_score_all", "has_match",
+                      "estimated_cost_usd", "total_time"]
+    lines.append("  Bootstrap CI sample sizes (n resampled / n patients):")
+    ci_hdr = "  " + f"{'Config':<26}" + "".join(f"{c[:18]:>20}" for c in ci_report_cols)
+    lines.append(ci_hdr)
+    for _, row in table.iterrows():
+        name = CONFIG_LABELS.get(row["config_name"], row["config_name"])
+        cells = []
+        for c in ci_report_cols:
+            n_ci = row.get(f"{c}_ci_n", np.nan)
+            n_ci = "?" if pd.isna(n_ci) else str(int(n_ci))
+            cells.append(f"{n_ci}/{int(row['n_patients'])}")
+        lines.append("  " + f"{name:<26}" + "".join(f"{c:>20}" for c in cells))
+    lines.append("  (1000 bootstrap resamples, percentile method, seed 42)")
+    lines.append("")
+
     # Conditional score, always with its own n. Kept separate from the table
     # above so it can never be read as a like-for-like comparison: each row
     # averages over a different set of patients, chosen by the configuration.
@@ -1029,26 +1566,110 @@ def generate_report(df: pd.DataFrame, table: pd.DataFrame,
 
     lines.append("")
 
+    # ── PATIENT PAIRING / DROPPED SET ──────────────────────────────────────
+    lines.append("-" * 70)
+    lines.append("PATIENT PAIRING (which patients each config was tested on)")
+    lines.append("-" * 70)
+    lines.append("n_paired counts the patients shared with the baseline. Dropped")
+    lines.append("patients are named below: the retained SETS can differ across")
+    lines.append("configs even when the counts match.")
+    lines.append("")
+    pr_header = (f"{'Config':<28} {'paired':>7} {'present':>8} {'dropped':>8} "
+                 f"{'errored':>8} {'in family':>10}")
+    lines.append(pr_header)
+    lines.append("-" * len(pr_header))
+    for _, row in pairing.iterrows():
+        lines.append(
+            f"{row['config_label']:<28} {row['n_paired']:>7} {row['n_present']:>8} "
+            f"{row['n_dropped']:>8} {row['n_errored']:>8} "
+            f"{('yes' if row['in_test_family'] else 'no'):>10}"
+        )
+    any_dropped = pairing[pairing["n_dropped"] > 0]
+    if len(any_dropped):
+        lines.append("")
+        lines.append("  Dropped patients by config:")
+        for _, row in any_dropped.iterrows():
+            lines.append(f"    {row['config_label']}:")
+            for entry in row["dropped_reasons"].split(";"):
+                lines.append(f"      {entry}")
+    else:
+        lines.append("")
+        lines.append("  No patients dropped: every config covers the full sample.")
+    lines.append("")
+
     # Statistical significance with effect sizes
     if len(stats) > 0:
         lines.append("-" * 70)
-        lines.append("STATISTICAL SIGNIFICANCE (Wilcoxon + rank-biserial effect size)")
+        lines.append("STATISTICAL SIGNIFICANCE (Wilcoxon, BH-FDR corrected)")
         lines.append("-" * 70)
+        lines.append(f"p_adj = Benjamini-Hochberg q over the {n_family}-test family.")
+        lines.append("Stars reflect p_adj. r is signed: r>0 = ablated ABOVE baseline.")
+        lines.append("")
 
-        for _, row in stats.iterrows():
-            name = row["config_label"]
-            lines.append(f"\n  {name} (n={row['n_paired']} paired patients):")
-            for col in ["eligible_count", "avg_match_score_all", "has_match",
-                        "estimated_cost_usd", "total_time"]:
-                p = row.get(f"{col}_p")
-                sig = row.get(f"{col}_sig", "")
-                r = row.get(f"{col}_effect_r")
-                size = row.get(f"{col}_effect_size", "")
-                if p is not None:
-                    col_label = col.replace("_", " ").title()
-                    r_str = f"r={r:.3f} ({size})" if r is not None else ""
-                    lines.append(f"    {col_label:<30} p={p:.4f} {sig:<4} {r_str}")
+        st_header = (f"  {'Metric':<24} {'p_raw':>8} {'p_adj':>8} {'sig':<4} "
+                     f"{'r':>7} {'magnitude':<11} {'status'}")
+        for config in CONFIG_ORDER:
+            if config == BASELINE:
+                continue
+            sub = stats[stats["config_name"] == config]
+            if sub.empty:
+                continue
+            n_paired = sub.iloc[0]["n_paired"]
+            n_dropped = sub.iloc[0]["n_dropped"]
+            lines.append(f"\n  {CONFIG_LABELS[config]} "
+                         f"(n_paired={n_paired}, n_dropped={n_dropped}):")
+            lines.append(st_header)
+            for _, row in sub.iterrows():
+                metric = row["metric"]
+                if row["status"] != "tested":
+                    lines.append(
+                        f"  {metric:<24} {'--':>8} {'--':>8} {'':<4} {'--':>7} "
+                        f"{'':<11} {row['status']}: {row['detail']}"
+                    )
+                    continue
+                p_raw = row["p_raw"]
+                p_adj = row["p_adj"]
+                r = row["effect_r"]
+                lines.append(
+                    f"  {metric:<24} {p_raw:>8.4f} {p_adj:>8.4f} "
+                    f"{row['sig']:<4} {r:>+7.3f} {row['effect_size']:<11} "
+                    f"{'rejected' if row['rejected_fdr'] else 'not rejected'}"
+                )
 
+        # What survives correction, spelled out.
+        tested = stats[stats["status"] == "tested"]
+        n_raw_sig = int((tested["p_raw"] < ABLATION_FDR_ALPHA).sum())
+        n_adj_sig = int(tested["rejected_fdr"].sum())
+        lines.append("")
+        lines.append(f"  Significant at raw p<{ABLATION_FDR_ALPHA}:      {n_raw_sig}"
+                     f" of {n_family}")
+        lines.append(f"  Surviving BH-FDR at q<{ABLATION_FDR_ALPHA}:     {n_adj_sig}"
+                     f" of {n_family}")
+        if n_raw_sig > n_adj_sig:
+            lines.append(f"  ({n_raw_sig - n_adj_sig} result(s) did not survive "
+                         f"correction and must not be reported as significant.)")
+        lines.append("")
+
+    # ── DESCRIPTIVE (deliberately untested) ────────────────────────────────
+    if len(descriptive) > 0:
+        lines.append("-" * 70)
+        lines.append("COST / LATENCY / CANDIDATES (descriptive -- NOT tested)")
+        lines.append("-" * 70)
+        lines.append("Paired per-patient deltas vs baseline. No p-values: these move")
+        lines.append("because the configuration changed what the pipeline does.")
+        lines.append("")
+        d_header = (f"  {'Config':<26} {'Metric':<22} {'mean Δ':>12} "
+                    f"{'median Δ':>12} {'IQR of Δ':>22} {'Δ%':>8}")
+        lines.append(d_header)
+        lines.append("  " + "-" * (len(d_header) - 2))
+        for _, row in descriptive.iterrows():
+            pct = "N/A" if row["pct_change"] is None else f"{row['pct_change']:+.1f}%"
+            iqr = f"[{row['delta_q25']:+.4g}, {row['delta_q75']:+.4g}]"
+            lines.append(
+                f"  {row['config_label']:<26} {row['metric']:<22} "
+                f"{row['mean_delta']:>+12.4g} {row['median_delta']:>+12.4g} "
+                f"{iqr:>22} {pct:>8}"
+            )
         lines.append("")
 
     # Win/Tie/Loss table
@@ -1170,7 +1791,7 @@ def main():
     print()
 
     # --- Load data ---
-    print("[1/8] Loading data...")
+    print("[1/9] Loading data...")
     df = load_ablation_data()
     errors = load_error_data()
 
@@ -1179,28 +1800,42 @@ def main():
         sys.exit(1)
 
     # --- Build comparison table (with bootstrapped 95% CIs) ---
-    print("[2/8] Building comparison table with 95% CIs...")
+    print("[2/9] Building comparison table with 95% CIs...")
     table = build_comparison_table(df)
     csv_path = OUTPUT_DIR / "ablation_comparison_table.csv"
     table.to_csv(csv_path, index=False)
     print(f"  Saved: {csv_path}")
 
-    # --- Statistical tests (with effect sizes) ---
-    print("[3/8] Running statistical tests + effect sizes...")
-    stats = run_statistical_tests(df)
+    # --- Pairing / dropped-patient accounting (feeds the tests) ---
+    print("[3/9] Auditing patient pairing and dropped set...")
+    pairing = build_pairing_report(df, errors)
+    pairing_path = OUTPUT_DIR / "ablation_pairing_report.csv"
+    pairing.to_csv(pairing_path, index=False)
+    print(f"  Saved: {pairing_path}")
+
+    # --- Statistical tests (BH-FDR corrected, signed effect sizes) ---
+    print("[4/9] Running statistical tests (BH-FDR corrected)...")
+    stats = run_statistical_tests(df, pairing)
     stats_path = OUTPUT_DIR / "ablation_statistical_tests.csv"
     stats.to_csv(stats_path, index=False)
     print(f"  Saved: {stats_path}")
 
+    mde = compute_minimum_detectable_effect(df, stats)
+
+    descriptive = build_descriptive_deltas(df)
+    desc_path = OUTPUT_DIR / "ablation_descriptive_metrics.csv"
+    descriptive.to_csv(desc_path, index=False)
+    print(f"  Saved: {desc_path}")
+
     # --- Win/Tie/Loss pairwise analysis ---
-    print("[4/8] Building win/tie/loss table...")
+    print("[5/9] Building win/tie/loss table...")
     wl_table = build_win_loss_table(df)
     wl_path = OUTPUT_DIR / "ablation_win_loss_table.csv"
     wl_table.to_csv(wl_path, index=False)
     print(f"  Saved: {wl_path}")
 
     # --- Visualizations (original + new) ---
-    print("[5/8] Generating visualizations...")
+    print("[6/9] Generating visualizations...")
     plot_funnel_chart(df)
     plot_delta_chart(table)
     plot_cost_efficiency(df)
@@ -1212,15 +1847,31 @@ def main():
     plot_patient_scatter(df)
 
     # --- Full report ---
-    print("[6/8] Generating report...")
-    generate_report(df, table, stats, wl_table, errors)
+    print("[7/9] Generating report...")
+    generate_report(df, table, stats, wl_table, errors, pairing, descriptive, mde)
 
     # --- Summary JSON (for programmatic use) ---
-    print("[7/8] Exporting summary JSON...")
+    print("[8/9] Exporting summary JSON...")
+    _tested = stats[stats["status"] == "tested"] if len(stats) else stats
     summary = {
         "comparison_table": table.to_dict(orient="records"),
         "statistical_tests": stats.to_dict(orient="records"),
+        "descriptive_metrics": descriptive.to_dict(orient="records"),
+        "pairing_report": pairing.to_dict(orient="records"),
         "win_loss_table": wl_table.to_dict(orient="records"),
+        "minimum_detectable_effect": mde,
+        "test_family": {
+            "correction": "benjamini_hochberg_fdr",
+            "alpha": ABLATION_FDR_ALPHA,
+            "outcome_metrics_tested": ABLATION_OUTCOME_METRICS,
+            "descriptive_metrics_not_tested": ABLATION_DESCRIPTIVE_METRICS,
+            "n_tests_in_family": int(len(_tested)),
+            "n_comparisons_recorded_not_tested": int(len(stats) - len(_tested)),
+            "n_significant_raw": (int((_tested["p_raw"] < ABLATION_FDR_ALPHA).sum())
+                                  if len(_tested) else 0),
+            "n_significant_adjusted": (int(_tested["rejected_fdr"].sum())
+                                       if len(_tested) else 0),
+        },
         "metadata": {
             "n_patients": int(df["patient_id"].nunique()),
             "n_configs": int(df["config_name"].nunique()),
@@ -1235,7 +1886,7 @@ def main():
     print(f"  Saved: {json_path}")
 
     # --- Worst-degradation patients (flagged for manual review) ---
-    print("[8/8] Flagging worst-degradation patients...")
+    print("[9/9] Flagging worst-degradation patients...")
     baseline_df = df[df["config_name"] == BASELINE].set_index("patient_id")
     worst = []
     for config in CONFIG_ORDER:

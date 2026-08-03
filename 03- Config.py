@@ -213,6 +213,43 @@ COHORT_MANIFEST_FLUSH_EVERY = 100
 #------------------------------------------------------------------------------
 
 
+# ===========================================================================
+# ABLATION ANALYSIS CONFIGURATION (File 27)
+# ===========================================================================
+
+# The ablation study tests every non-baseline configuration against the
+# baseline on every outcome metric, so the test family is (n_configs - 1) x
+# (n_outcome_metrics) and grows multiplicatively. Uncorrected, a 18-test
+# family has a 60% chance of producing at least one spurious result at
+# alpha = 0.05. Benjamini-Hochberg controls the false discovery rate across
+# the whole family instead.
+ABLATION_FDR_ALPHA = 0.05
+
+# Only these metrics are hypotheses and therefore only these enter the
+# corrected family. Cost, latency and candidate counts are near-deterministic
+# consequences of removing a pipeline stage -- testing them asks whether
+# switching off the cross-encoder makes the cross-encoder cheaper. They are
+# reported descriptively instead (see ABLATION_DESCRIPTIVE_METRICS).
+ABLATION_OUTCOME_METRICS = ["eligible_count", "avg_match_score_all", "has_match"]
+
+# Reported with means and paired deltas, never with a p-value.
+ABLATION_DESCRIPTIVE_METRICS = ["estimated_cost_usd", "total_time",
+                                "candidates_evaluated"]
+
+# Target power for the minimum-detectable-effect calculation reported in the
+# methods block. Without it a null result is ambiguous between "no effect"
+# and "no power".
+ABLATION_POWER_TARGET = 0.80
+
+# A configuration with fewer than this many patients paired against the
+# baseline is excluded from the test family. Exclusions are reported, never
+# silent.
+ABLATION_MIN_PAIRED = 10
+
+
+#------------------------------------------------------------------------------
+
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
