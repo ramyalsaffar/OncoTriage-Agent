@@ -23,7 +23,15 @@ EMBEDDING_MODEL = "text-embedding-3-small"
 EMBEDDING_DIM = 1536
 
 # LLM models
-MATCHING_MODEL = "gpt-4o-2024-08-06"  # For criterion-level evaluation
+#
+# MATCHING_MODEL is the string SENT to the API and the key looked up in
+# PRICING_CONFIG below. It is NOT what gets written to inferences.matching_model
+# any more: File 13 reads response.model off the Stage 5 response and File 14
+# logs THAT, so a row records the model that answered rather than the model that
+# was asked for. For this model the two are the same string -- probed live on
+# 2026-08-04, the API echoes back "gpt-5.6-terra" with no dated snapshot, unlike
+# gpt-4o-2024-08-06 -- but the pipeline no longer assumes it.
+MATCHING_MODEL = "gpt-5.6-terra"  # For criterion-level evaluation
 
 # Matching parameters
 TOP_K_CANDIDATES = 40  # Top N of trials to evaluate initially with cross encoder
@@ -32,8 +40,26 @@ VECTOR_RETRIEVAL_SIZE = 100  # Trials from vector search
 RRF_POOL_SIZE = 100 # Maximum candidates passed from RRF fusion to cross-encoder input
 
 # Temperature settings
-MATCHING_TEMPERATURE = 0  # Deterministic matching
-EXPANSION_TEMPERATURE = 0  # Deterministic query expansion
+#
+# MATCHING_TEMPERATURE is None because gpt-5.6-terra REJECTS the parameter.
+# Probed live 2026-08-04:
+#
+#   temperature=0 -> 400 unsupported_value: "'temperature' does not support 0
+#   with this model. Only the default (1) value is supported."
+#
+# None means "not sent", and File 13 does not send it. It is kept as a named
+# constant rather than deleted because File 45 records it into every fixture's
+# environment block, where None is the honest record of a parameter the run did
+# not set. Do not set it to 1: that would claim the pipeline chose a sampling
+# temperature, when in fact it has no say in the matter.
+#
+# CONSEQUENCE FOR DETERMINISM. Determinism is a deliberate property of this
+# pipeline (see CLAUDE.md). Stages 1-4 are unaffected -- they are rule-based,
+# stable-argsorted, and seeded. Stage 5 is no longer temperature-pinned, so
+# identical input can now produce different verdicts across runs. MATCHING_SEED
+# below is the only remaining lever and it is best-effort.
+MATCHING_TEMPERATURE = None  # gpt-5.6-terra rejects any value but its default
+EXPANSION_TEMPERATURE = 0  # Deterministic query expansion (Stage 1 uses no LLM)
 
 
 # Patient data snapshot date
@@ -190,46 +216,147 @@ RETRY_BASE_DELAY = 1  # seconds, doubles each retry
 # Stage 5 request shape and truncation control
 # ---------------------------------------------------------------------------
 #
-# MODEL MIGRATION WARNING. MATCHING_MAX_TOKENS is GPT-4o's own output ceiling,
-# not a number anyone chose. Every threshold below is calibrated against it and
-# every one of them must be re-derived when the model changes — a model with a
-# larger ceiling makes the splitter dead weight, and one with a smaller ceiling
-# makes it fire on every run. The calibration procedure is in File 13's
-# estimate_output_tokens docstring; it reads gpt4o_output_tokens and
-# candidates_evaluated straight out of inferences.db, so it can be re-run
-# against whatever history the new model produces.
+# MODEL MIGRATION NOTE. MATCHING_MAX_TOKENS used to be 16,000 — GPT-4o's own
+# output ceiling, not a number anyone chose — and every threshold below was
+# calibrated against it. gpt-5.6-terra allows 128,000, so the ceiling is now a
+# CHOSEN budget rather than a hardware limit, and the thresholds below were
+# re-derived against it (see MATCHING_OUTPUT_TOKENS_PER_TRIAL).
 
-MATCHING_MAX_TOKENS = 16000  # GPT-4o's ceiling. NOT a chosen value.
-MATCHING_SEED = 42           # best-effort determinism, alongside temperature 0
+# Reasoning effort for the Stage 5 judge.
+#
+# gpt-5.6-terra is a reasoning model. Probed live 2026-08-04, the values IT
+# accepts are 'none', 'low', 'medium', 'high', 'xhigh' -- note that the general
+# reasoning guide also lists 'minimal' and 'max', which this model rejects:
+#
+#   reasoning_effort='banana' -> 400 unsupported_value: "Supported values are:
+#   'none', 'low', 'medium', 'high', and 'xhigh'."
+#
+# CHOSEN BY MEASUREMENT, not by taste. 'none', 'low' and 'medium' were run on
+# 2026-08-04 against a FIXED candidate set: 30 patients (11 characterization
+# fixtures, whose Stage 5 requests and GPT-4o answers are recorded verbatim,
+# plus 19 corpus patients whose Stages 1-4 were executed ONCE and whose
+# filtered trial list was then sent to each judge unchanged). 376 trial
+# verdicts per arm. The only variable was the judge.
+#
+#   level    agreement with GPT-4o   $/patient   s/patient   reasoning tok/pt
+#   none              69.1%            0.1882       68.0            0
+#   low               64.9%            0.1679       64.2        1,066 (median)
+#   medium            61.2%            0.1896       79.7        1,580 (median)
+#   (gpt-4o)             --            0.1551      156.6           --
+#
+# 'none' WINS, and the ordering is not noise: exact McNemar on the paired
+# per-trial agreement indicator gives none > low p = 0.017, none > medium
+# p < 0.0001, low > medium p = 0.024. Reasoning moves this judge AWAY from the
+# incumbent monotonically; it does not refine it.
+#
+# The direction of the drift is what settles it. Every disagreement class is
+# dominated by not_eligible -> eligible (75 / 96 / 108 flips at none / low /
+# medium), and the eligible rate over the same 376 trials rises from GPT-4o's
+# 25.5% to 43.9% / 51.1% / 54.0%. This is a PRE-SCREENING tool: a false
+# "eligible" is a trial a clinician has to read and reject. Reasoning buys more
+# of them. The disagreements cluster on lab/organ-function, prior-therapy,
+# staging and histology criteria -- the ones needing a judgement about whether
+# absent data may be inferred -- not on the mechanical ones (performance status
+# and demographics barely move).
+#
+# 'none' also spends exactly 0 reasoning tokens on all 30 cases, which is why
+# MATCHING_MAX_TOKENS below has to cover visible output only.
+#
+# READ THIS BEFORE TREATING 69.1% AS A QUALITY SCORE. Agreement is against
+# GPT-4o, which is the incumbent, NOT ground truth: this corpus carries no
+# adjudicated eligibility labels. It is entirely possible that Terra is right
+# and GPT-4o was over-rejecting. 'none' is the choice that minimises
+# behavioural change across the migration, which is the defensible conservative
+# position with no labels -- it is not evidence that 'none' is the most
+# accurate. Settling that needs a labelled set, and it is the single largest
+# open risk in this migration.
+MATCHING_REASONING_EFFORT = "none"
+
+# Output ceiling for one Stage 5 call, sent as max_completion_tokens.
+#
+# NOT the model's limit. gpt-5.6-terra's limit is 128,000; this is a CHOSEN
+# budget, unlike the 16,000 it replaces, which was GPT-4o's own hard ceiling.
+#
+# DERIVED FROM THE STEP 7 RUNS at reasoning_effort='none'. The largest single
+# call across the 30-patient set produced 17,077 output tokens (a full 15-trial
+# batch), and the worst per-trial figure was 1,138. 32,000 is:
+#   - 1.9x the largest single response actually observed;
+#   - 15 trials x 2,133 tokens/trial, i.e. ~1.9x the worst per-trial rate, so a
+#     batch of unusually verbose trials still fits;
+#   - a quarter of the model's limit, so the number is a budget rather than the
+#     model's edge;
+#   - a bound of 32,000 x $12/1M = $0.38 on what one runaway call can cost.
+#
+# IT COUNTS REASONING TOKENS. On a reasoning model max_completion_tokens caps
+# reasoning + visible output together, and a call can burn the entire ceiling
+# on reasoning and return finish_reason='length' with EMPTY content. Verified
+# live: at max_completion_tokens=64 with reasoning_effort='high' the response
+# came back completion_tokens=64, reasoning_tokens=64, content=''. At the
+# chosen effort of 'none' the reasoning term is 0 on every one of the 30
+# measured runs, so this ceiling currently covers visible output alone -- but
+# it stops being true the moment MATCHING_REASONING_EFFORT changes, and at
+# 'medium' the reasoning share was already 12.9% of output.
+MATCHING_MAX_TOKENS = 32000
+
+# Best-effort determinism. gpt-5.6-terra ACCEPTS seed (probed live 2026-08-04:
+# no error), which is why it is still sent -- but it returns no
+# system_fingerprint, so there is no attestation that the same backend served
+# two calls, and temperature is pinned at the provider's default (see
+# MATCHING_TEMPERATURE). Stage 5 is therefore best-effort reproducible and no
+# longer exactly reproducible. Stages 1-4 are unchanged and still exact.
+MATCHING_SEED = 42
 
 # Expected output tokens per trial evaluated, used to decide whether a batch
 # should be split BEFORE it is sent.
 #
-# Calibrated over 1,094 historical inferences in inferences.db. At the current
-# batch cap of MAX_TRIALS_FOR_EVALUATION = 15 (555 rows) the measured output
-# per trial was: median 712, p90 784, p95 861, p99 1,028, max 1,062.
+# RE-DERIVED 2026-08-04 for gpt-5.6-terra at reasoning_effort='none'. The
+# previous value of 900 was calibrated on 1,094 GPT-4o rows (median 712, p95
+# 861 per trial) and no longer describes this model, which is ~35% more verbose
+# per verdict.
 #
-# 900 sits between p90 and p95, deliberately:
+# The new figure comes from the step 7 runs: 27 of the 30 cases issued exactly
+# ONE call, so output_tokens / trials_evaluated is the per-trial cost exactly,
+# with no split double-counting. Over those 27 runs:
+#
+#     mean 959   median 974   p75 1,032   p90 1,048   p95 1,073   max 1,138
+#     sd 92      (15 of the 27 were at the full 15-trial cap)
+#
+# Reasoning tokens are INCLUDED in these figures by construction --
+# usage.completion_tokens already contains them -- and at 'none' they are 0 on
+# every run, so the count is visible output. At a higher effort this constant
+# must be re-derived, not scaled.
+#
+# 1,100 sits between p95 and the max, deliberately:
 #   - above the median, because a guard that uses the average case is not a
 #     guard;
-#   - below p99, because calibrating to the tail would split every full batch
-#     to prevent a ~1% event that the reactive finish_reason check already
-#     catches for free, and splitting duplicates the system prompt and patient
-#     summary on every run. Measured, that trade is net negative: the extra
-#     input costs more per run than the rare wasted call it would avoid.
+#   - not at the max, because calibrating to the single worst run makes the
+#     estimate a description of one patient.
+#   As a predictor of the whole response it errs high, which is what a guard
+#   should do: over the 27 runs the count term alone is >= the actual output in
+#   26 of them, the one under-estimate is 577 tokens, and the residual sd is
+#   1,398 tokens.
 #
-# Where the threshold actually bites, measured rather than predicted. At 15
-# trials the count term alone is 13,500, under the 14,400 threshold — so the
-# splitter fires only when the criteria-length term below pushes it over, which
-# happens for trials with long eligibility text. Observed over a 12-fixture
-# capture: one run pre-split at an estimate of 14,462, and two more were split
-# reactively after a real truncation. Both paths are live at this configuration;
-# neither fires on a typical batch.
-MATCHING_OUTPUT_TOKENS_PER_TRIAL = 900
+# WHERE THE THRESHOLD BITES — AND IT NO LONGER DOES. The pre-split threshold is
+# 0.90 x 32,000 = 28,800. The largest estimate this function can produce at
+# MAX_TRIALS_FOR_EVALUATION = 15 is the count term plus the capped criteria
+# term, 1.25 x 1,100 x 15 = 20,625, which is under it by 8,175. So the PROACTIVE
+# splitter cannot fire at the current batch cap: it is dead code until either
+# MAX_TRIALS_FOR_EVALUATION rises above 20 or the ceiling comes down. That is a
+# consequence of moving from a model whose 16,000-token ceiling the batch nearly
+# filled to one with 128,000, and it is stated here rather than discovered later
+# from a splitter whose counter never moves.
+#
+# The REACTIVE path and the single-trial floor stay, and are still the only
+# thing standing between a runaway response and a lost patient. Neither fired in
+# the 30-run measurement either: the worst single call reached 17,077 of 32,000.
+# Both are exercised by the truncation_split fixture, which injects a truncation
+# rather than waiting for one (see File 45).
+MATCHING_OUTPUT_TOKENS_PER_TRIAL = 1100
 
 # Fraction of MATCHING_MAX_TOKENS the estimate may reach before a batch is
-# split pre-emptively. 0.90 leaves 1,600 tokens of headroom for the estimate's
-# own error, which is ~1,935 tokens (1 sd) over the calibration set.
+# split pre-emptively. 0.90 leaves 3,200 tokens of headroom for the estimate's
+# own error, which is ~1,398 tokens (1 sd) over the 27-run calibration set —
+# 2.3 sd of margin, against 0.8 sd under the previous model and ceiling.
 MATCHING_OUTPUT_SPLIT_FRACTION = 0.90
 
 # How many times a batch may be HALVED because of truncation. This is depth,
@@ -262,13 +389,42 @@ MAX_VARIANT_TERMS = 8
 
 # OpenAI Pricing Configuration
 #------------------------------
-# Last verified: 2026-02-16
+# Last verified: 2026-08-04
 # Update quarterly from: https://openai.com/api/pricing/
 # Prices are per 1M tokens (USD)
+#
+# KEYED ON WHAT THE API RETURNS, not on what was requested. File 13 reads
+# response.model off the Stage 5 response and File 14 prices against that
+# string, so an alias that resolves to a dated snapshot must have the SNAPSHOT
+# in this table or every row it produces raises UnknownModelPricingError.
+# gpt-5.6-terra was probed live on 2026-08-04 and echoes back "gpt-5.6-terra"
+# verbatim -- one string, one entry. gpt-4o-2024-08-06 is already a snapshot.
+#
+# The GPT-4o entry stays. It is not the judge any more, but 1,000+ historical
+# rows in inferences.db carry it in matching_model, and File 16 / File 21 now
+# price each row against its OWN model; removing it would make every one of
+# those rows unpriceable.
 
 PRICING_CONFIG = {
-    "last_updated": "2026-02-16",
+    "last_updated": "2026-08-04",
     "models": {
+        # Stage 5 judge as of 2026-08-04. Priced from OpenAI's model page
+        # (developers.openai.com/api/docs/models/gpt-5.6-terra), read
+        # 2026-08-04. Reasoning tokens bill at the OUTPUT rate and are already
+        # inside usage.completion_tokens, so they are priced by this row with
+        # no separate term -- see File 13's note at the token accumulator.
+        #
+        # NOT MODELLED HERE: cached input is $0.20/1M, and a request over
+        # 272,000 input tokens is billed at 2x input / 1.5x output for the
+        # whole request. Neither applies to this pipeline as configured -- a
+        # 15-trial Stage 5 prompt runs ~20k input tokens, two orders of
+        # magnitude under the threshold, and get_model_cost() has no cached-
+        # token input. Both would need adding if MAX_TRIALS_FOR_EVALUATION grew
+        # by ~15x or prompt caching were turned on.
+        "gpt-5.6-terra": {
+            "input": 2.00,
+            "output": 12.00
+        },
         "gpt-4o-2024-08-06": {
             "input": 2.50,
             "output": 10.00

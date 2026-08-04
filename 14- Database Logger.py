@@ -218,6 +218,30 @@ INFERENCE_COLUMN_ADDITIONS = {
     "gpt4o_output_tokens_estimated": "INTEGER",
     "not_evaluable_truncated":      "INTEGER",
     "gpt4o_calls":                  "INTEGER",
+
+    # --- Reasoning-model accounting (item 29a, gpt-5.6-terra migration) ------
+    #
+    # The reasoning share OF gpt4o_output_tokens. NOT an additional charge.
+    # OpenAI's reasoning guide and a live probe on 2026-08-04 both put
+    # usage.completion_tokens_details.reasoning_tokens INSIDE
+    # usage.completion_tokens, billed at the output rate. So:
+    #
+    #     estimated_cost_usd already includes these tokens.
+    #     gpt4o_output_tokens already includes these tokens.
+    #
+    # Anyone adding this column into a cost calculation is double-billing.
+    # It is stored because it is the only way to see what fraction of the
+    # output spend bought reasoning rather than verdicts, and because it is
+    # what MATCHING_OUTPUT_TOKENS_PER_TRIAL (File 03) must be calibrated
+    # against now that reasoning tokens consume the same ceiling.
+    #
+    # NULL means the response carried no breakdown -- every row written while
+    # GPT-4o was the judge, a replayed pre-migration fixture, or a run that
+    # never reached Stage 5. That is NOT 0. A non-reasoning model that
+    # genuinely reports reasoning_tokens=0 stores 0, and the two must stay
+    # distinguishable: a query averaging this column has to exclude NULL, not
+    # coalesce it.
+    "gpt4o_reasoning_tokens":       "INTEGER",
 }
 
 _existing_inference_columns = {
@@ -393,9 +417,45 @@ def log_inference(result: Dict, patient_data: Dict):
     meaning anything. It propagates to the caller instead.
     """
 
+    # The model that ACTUALLY answered, read off response.model by Stage 5 and
+    # carried to all three terminal nodes by _pipeline_provenance() (File 13).
+    # Not MATCHING_MODEL: that is what was asked for, and an alias can resolve
+    # to a dated snapshot, so pricing and logging against it would attribute a
+    # row to a model that may never have served it. It is also read at log time,
+    # which means a config edit between the run and the log would relabel the
+    # row -- exactly the class of drift this project treats as a defect.
+    #
+    # None when no Stage 5 response was obtained: node_no_candidates, or a
+    # failure before the first call returned. The column then stores NULL,
+    # which says "no model produced this row" rather than naming one that did
+    # not run.
+    matching_model_used = result.get("matching_model")
+
     # Calculate cost using pricing config. Outside the try — see the docstring.
+    #
+    # MATCHING_MODEL is the pricing key ONLY in the None case above, where
+    # there are no Stage 5 tokens to price and the arithmetic is 0 x rate = 0
+    # whichever priced model is named. This is not a recovery path around
+    # get_model_cost(): the lookup still happens, still raises
+    # UnknownModelPricingError for an unpriced model, and still sits outside
+    # the try block so an unpriced model aborts the whole log rather than
+    # writing a row that claims the run was free. What it is not allowed to do
+    # is raise on a no-candidates run purely because that run has no model name
+    # to look up.
+    #
+    # WHICH PATH WAS TAKEN IS RECORDED, as this project requires of any
+    # fallback: matching_model is written NULL on exactly the rows where the
+    # fallback key was used, so "priced against the model that answered" and
+    # "priced against the configured model because nothing answered" are
+    # separable in the table without a second column. A NULL matching_model row
+    # carrying non-zero gpt4o tokens would be the one case where they are not,
+    # and File 16's Query 10 and File 21's cost tab both call that out.
+    #
+    # Reasoning tokens are NOT added to the output figure here. They are
+    # already inside gpt4o_output_tokens (see the schema note on
+    # gpt4o_reasoning_tokens); adding them would bill every one of them twice.
     total_cost = get_model_cost(
-        MATCHING_MODEL,
+        matching_model_used or MATCHING_MODEL,
         result.get("gpt4o_input_tokens", 0),
         result.get("gpt4o_output_tokens", 0)
     )
@@ -466,8 +526,9 @@ def log_inference(result: Dict, patient_data: Dict):
                 age_reference_date, birth_date_precision,
                 ecog_value, ecog_selection, ecog_observations_found,
                 gpt4o_truncation_splits, gpt4o_output_tokens_estimated,
-                not_evaluable_truncated, gpt4o_calls
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                not_evaluable_truncated, gpt4o_calls,
+                gpt4o_reasoning_tokens
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             result["patient_id"],
             result["timestamp"],
@@ -514,7 +575,10 @@ def log_inference(result: Dict, patient_data: Dict):
             result.get("gpt4o_prompt", ""),
             result.get("gpt4o_input_tokens", 0),
             result.get("gpt4o_output_tokens", 0),
-            MATCHING_MODEL,
+            # Resolved above, outside the tuple, because the same value is what
+            # get_model_cost() was called with. Reading it twice could price a
+            # row against one model and label it with another.
+            matching_model_used,
             "ncbi/MedCPT-Cross-Encoder",
             PRICING_CONFIG["last_updated"],
             total_cost,
@@ -573,6 +637,12 @@ def log_inference(result: Dict, patient_data: Dict):
             result.get("gpt4o_output_tokens_estimated"),
             result.get("not_evaluable_truncated", 0),
             result.get("gpt4o_calls", 0),
+            # No default. A response that carried no reasoning breakdown, and a
+            # response that spent zero reasoning tokens, are different facts;
+            # .get() with no default stores NULL for the first and 0 for the
+            # second. Defaulting to 0 here would make every GPT-4o-era row and
+            # every stubbed run look like a reasoning run that did no thinking.
+            result.get("gpt4o_reasoning_tokens"),
         ))
         
         inference_id = cursor.lastrowid

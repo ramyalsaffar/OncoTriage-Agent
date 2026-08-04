@@ -128,6 +128,15 @@ def _embedding_response(vector):
 
 
 def _chat_response(recorded):
+    # completion_tokens_details mirrors the reasoning-model usage shape, and it
+    # is set to None — not to a details object carrying 0 — when the recording
+    # has no reasoning_tokens. Two recordings need that: one made before the
+    # field existed (every GPT-4o-era fixture), and one made against a
+    # non-reasoning model. File 13 reads the attribute defensively and logs
+    # NULL for both, which is the honest answer; synthesising a 0 here would
+    # make a replayed pre-migration fixture claim it spent no reasoning tokens
+    # rather than that it never reported any.
+    _reasoning = recorded["usage"].get("reasoning_tokens")
     return SimpleNamespace(
         choices=[SimpleNamespace(
             message=SimpleNamespace(content=recorded["content"]),
@@ -136,7 +145,13 @@ def _chat_response(recorded):
         model=recorded.get("model"),
         usage=SimpleNamespace(
             prompt_tokens=recorded["usage"]["prompt_tokens"],
+            # Includes the reasoning tokens below, exactly as the API reports
+            # it. Not a sum the replay computes.
             completion_tokens=recorded["usage"]["completion_tokens"],
+            completion_tokens_details=(
+                None if _reasoning is None
+                else SimpleNamespace(reasoning_tokens=_reasoning)
+            ),
         ),
     )
 
@@ -212,12 +227,17 @@ def _replay_chat(state: _ReplayState):
         # The request is diffed rather than enforced: serving the recorded
         # response for a request that changed is exactly what makes the change
         # visible downstream, in the verdicts and in stage5.request_sha256_by_call.
+        # Same key set as the recorder in File 45, in the same order, because
+        # the two are diffed against each other. A key present on one side only
+        # would read as a request change on every fixture.
         state.sink.add("chat_completions", {
             "request": {
                 "model": kwargs.get("model"),
                 "messages": copy.deepcopy(kwargs.get("messages")),
                 "temperature": kwargs.get("temperature"),
                 "max_tokens": kwargs.get("max_tokens"),
+                "max_completion_tokens": kwargs.get("max_completion_tokens"),
+                "reasoning_effort": kwargs.get("reasoning_effort"),
                 "seed": kwargs.get("seed"),
             },
             "response": copy.deepcopy(recorded["response"]),

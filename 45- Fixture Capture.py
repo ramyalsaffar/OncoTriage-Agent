@@ -115,9 +115,17 @@ environment
     age_reference_date    str    — get_age_reference_date(), the date ages and
                                    the Stage 5 prompt were anchored to.
     embedding_model       str
-    matching_model        str
-    matching_temperature  num
-    matching_max_tokens   int
+    matching_model        str  — the model REQUESTED (MATCHING_MODEL). The
+                                 model that ANSWERED is recorded per call, in
+                                 recordings.chat_completions[*].response.model.
+    matching_temperature  num  — None once the judge is a model that rejects
+                                 the parameter (gpt-5.6-terra does). "Not
+                                 sent", not "sent as zero".
+    matching_max_tokens   int  — sent as max_completion_tokens, which on a
+                                 reasoning model caps reasoning AND visible
+                                 output together.
+    matching_reasoning_effort str — none|low|medium|high|xhigh, or None for a
+                                 non-reasoning judge.
     matching_seed         int
     cross_encoder_model   str
     sparse_model          str
@@ -205,8 +213,14 @@ network call to OpenAI and loads NO local model.
     chat_completions    [ {call_index, request, response} ]
                         The Stage 5 request and response VERBATIM. request is
                         the literal kwargs sent to the client (model, both
-                        messages, temperature, max_tokens, seed). response
-                        carries content, finish_reason, model and usage.
+                        messages, temperature, max_tokens,
+                        max_completion_tokens, reasoning_effort, seed — each
+                        read from the kwargs, so one the pipeline no longer
+                        sends records as None). response carries content,
+                        finish_reason, model and usage; usage carries
+                        prompt_tokens, completion_tokens and reasoning_tokens,
+                        the last being a SUBSET of completion_tokens and None
+                        when the model reported no breakdown.
                         Served BY CALL INDEX, not by key, because the retry
                         loop deliberately issues the same request twice and
                         must receive different answers.
@@ -560,6 +574,18 @@ def _recording_embedding(sink: RecordingSink):
     return handler
 
 
+def _reasoning_tokens_of(usage):
+    """The reasoning subtotal of a Chat Completions usage block, or None.
+
+    Read through getattr rather than indexed, because a non-reasoning model
+    omits completion_tokens_details entirely and an older client object may not
+    define the attribute at all. None means "this response reported no
+    breakdown", which is not the same as 0 and is stored as NULL downstream.
+    """
+    details = getattr(usage, "completion_tokens_details", None)
+    return getattr(details, "reasoning_tokens", None) if details else None
+
+
 def _relabelled_response(response, finish_reason: str):
     """The same response, reporting a different finish_reason.
 
@@ -601,11 +627,21 @@ def _recording_chat(sink: RecordingSink, truncate_first_call: bool = False):
             # Verbatim: both messages in full, and every generation parameter
             # that can change the answer. Anything omitted here is a change a
             # replay cannot see.
+            # Every generation parameter is read out of kwargs rather than
+            # listed from config, so a parameter the pipeline STOPS sending
+            # records as None and the change is visible in the fixture diff.
+            # temperature and max_tokens are still recorded for exactly that
+            # reason: gpt-5.6-terra rejects both (max_tokens outright,
+            # temperature for any value but its default), so they are expected
+            # to be None from 2026-08-04 onward, and a fixture where they
+            # reappear is a fixture whose call shape regressed.
             "request": {
                 "model": kwargs.get("model"),
                 "messages": copy.deepcopy(kwargs.get("messages")),
                 "temperature": kwargs.get("temperature"),
                 "max_tokens": kwargs.get("max_tokens"),
+                "max_completion_tokens": kwargs.get("max_completion_tokens"),
+                "reasoning_effort": kwargs.get("reasoning_effort"),
                 "seed": kwargs.get("seed"),
             },
             "response": {
@@ -614,7 +650,14 @@ def _recording_chat(sink: RecordingSink, truncate_first_call: bool = False):
                 "model": response.model,
                 "usage": {
                     "prompt_tokens": response.usage.prompt_tokens,
+                    # Already includes reasoning_tokens below; the two are one
+                    # billed total, not two. Recorded separately so a replay
+                    # can reproduce the breakdown File 13 logs.
                     "completion_tokens": response.usage.completion_tokens,
+                    # None when the response carried no breakdown at all (a
+                    # non-reasoning model). Distinct from 0, and File 46
+                    # reproduces the distinction.
+                    "reasoning_tokens": _reasoning_tokens_of(response.usage),
                 },
             },
         })
@@ -1192,9 +1235,19 @@ def build_environment_block() -> Dict:
         "data_snapshot_date": DATA_SNAPSHOT_DATE,
         "age_reference_date": get_age_reference_date().isoformat(),
         "embedding_model": EMBEDDING_MODEL,
+        # The model REQUESTED. What the API answered with is recorded per call
+        # in recordings.chat_completions[*].response.model; for gpt-5.6-terra
+        # the two are the same string, for an alias that resolves to a dated
+        # snapshot they are not, and the fixture keeps both.
         "matching_model": MATCHING_MODEL,
+        # None from the 2026-08-04 migration onward: gpt-5.6-terra rejects
+        # temperature for any value but its default, so the pipeline does not
+        # send it. Kept in the environment block because a fixture recorded
+        # before that date carries 0 here, and the difference between the two
+        # is precisely what a cross-era fixture diff should show.
         "matching_temperature": MATCHING_TEMPERATURE,
         "matching_max_tokens": MATCHING_MAX_TOKENS,
+        "matching_reasoning_effort": MATCHING_REASONING_EFFORT,
         "matching_seed": MATCHING_SEED,
         "cross_encoder_model": "ncbi/MedCPT-Cross-Encoder",
         "sparse_model": "Qdrant/bm25",
@@ -1217,6 +1270,14 @@ def build_environment_block() -> Dict:
             "MAX_TRUNCATION_SPLITS": MAX_TRUNCATION_SPLITS,
             "MATCHING_OUTPUT_TOKENS_PER_TRIAL": MATCHING_OUTPUT_TOKENS_PER_TRIAL,
             "MATCHING_OUTPUT_SPLIT_FRACTION": MATCHING_OUTPUT_SPLIT_FRACTION,
+            # Both shape the Stage 5 request and therefore the verdicts. They
+            # are duplicated from the environment block above ON PURPOSE: only
+            # what is in "tunables" is compared by File 46's diff_tunables(),
+            # so a reasoning-effort change would otherwise be recorded and
+            # never reported, and a reader would hunt a refactor for a verdict
+            # difference that a one-line config edit caused.
+            "MATCHING_REASONING_EFFORT": MATCHING_REASONING_EFFORT,
+            "MATCHING_MAX_TOKENS": MATCHING_MAX_TOKENS,
             "MAX_VARIANT_TERMS": MAX_VARIANT_TERMS,
             "CHARS_PER_TOKEN": CHARS_PER_TOKEN,
         },

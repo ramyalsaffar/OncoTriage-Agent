@@ -227,38 +227,135 @@ print("\n")
 
 
 # Query 9: Expansion model performance
+# Query 9: Stage 1 expansion stats
+#
+# THE TOKEN COLUMNS DO NOT EXIST. This query used to select
+# expansion_input_tokens / expansion_output_tokens, which are not in
+# inferences.db: File 13's terminal nodes emit the keys (always 0 — Stage 1 is
+# deterministic and calls no LLM), but File 14 has never had columns for them
+# and never inserted them. So the query raised OperationalError "no such
+# column" on every run and took the whole of File 16 down with it before
+# reaching anything below, including the cost breakdown.
+#
+# Rewritten to report what the table actually holds. If Stage 1 ever grows an
+# LLM, the columns have to be added to File 14 first; there is nothing to
+# select until then, and inventing a rate for them is what Query 10 below was
+# doing.
 df_expansion = pd.read_sql_query("""
-    SELECT 
-        AVG(expansion_input_tokens) as avg_expansion_input,
-        AVG(expansion_output_tokens) as avg_expansion_output,
-        MAX(expansion_input_tokens) as max_expansion_input,
-        MAX(expansion_output_tokens) as max_expansion_output,
-        AVG(query_expansion_time) as avg_expansion_time,
-        MAX(query_expansion_time) as max_expansion_time
+    SELECT
+        COUNT(*)                    as rows_n,
+        AVG(query_expansion_time)   as avg_expansion_time,
+        MAX(query_expansion_time)   as max_expansion_time,
+        SUM(query_expansion_path = 'base_query_fallback') as fallback_runs,
+        SUM(query_expansion_path IS NULL)                 as path_not_reported
     FROM inferences
-    WHERE expansion_input_tokens > 0
 """, conn)
-print("=== EXPANSION MODEL STATS ===")
+print("=== EXPANSION (STAGE 1) STATS ===")
+print("Stage 1 is rule-based and calls no LLM, so there are no expansion "
+      "token columns to report.")
 print(df_expansion.T)
 print("\n")
 
 
 # Query 10: Cost breakdown by model
-# Warning: These must be manually updated when pricing changes
-df_cost = pd.read_sql_query("""
-    SELECT 
-        SUM(expansion_input_tokens * 0.15 / 1000000) as total_expansion_input_cost,
-        SUM(expansion_output_tokens * 0.60 / 1000000) as total_expansion_output_cost,
-        SUM(gpt4o_input_tokens * 2.50 / 1000000) as total_gpt4o_input_cost,
-        SUM(gpt4o_output_tokens * 10.00 / 1000000) as total_gpt4o_output_cost,
-        SUM(estimated_cost_usd) as total_cost,
-        AVG(estimated_cost_usd) as avg_cost_per_patient,
-        COUNT(*) as total_patients
+#
+# PRICED PER MODEL, NOT AT ONE RATE. This query used to have 2.50 and 10.00
+# written into the SQL and summed the whole table against them. That was
+# already a duplicate of PRICING_CONFIG that nothing kept in sync, and it
+# became actively wrong on 2026-08-04 when the judge moved from
+# gpt-4o-2024-08-06 to gpt-5.6-terra: inferences.db now holds rows from both,
+# at different input AND output rates, and one blended rate misstates every row
+# of at least one of them. The grouping key is matching_model, which File 14
+# writes from the model that ANSWERED the call, so each group is priced by the
+# model that actually produced its tokens.
+#
+# Rates come from get_model_cost() / PRICING_CONFIG (File 03), never from a
+# literal here, so there is exactly one pricing table in the project and this
+# query raises UnknownModelPricingError rather than quietly under-reporting
+# when a model is missing from it.
+#
+# The expansion terms are gone rather than repriced. The old 0.15 / 0.60
+# literals priced a model this project has never called, against two columns
+# that do not exist in inferences.db at all (see Query 9 above) — so those two
+# SUMs would have raised "no such column" if the query had ever run.
+df_cost_by_model = pd.read_sql_query("""
+    SELECT
+        matching_model,
+        COUNT(*)                     as rows_n,
+        SUM(gpt4o_input_tokens)      as input_tokens,
+        SUM(gpt4o_output_tokens)     as output_tokens,
+        SUM(gpt4o_reasoning_tokens)  as reasoning_tokens,
+        SUM(estimated_cost_usd)      as stored_cost
     FROM inferences
+    GROUP BY matching_model
+    ORDER BY rows_n DESC
 """, conn)
-print("=== COST BREAKDOWN ===")
-print(df_cost.T)
-print(f"\nProjected cost for 1000 patients: ${df_cost.iloc[0]['avg_cost_per_patient'] * 1000:.2f}")
+
+_cost_rows = []
+for _row in df_cost_by_model.itertuples(index=False):
+    _in = int(_row.input_tokens or 0)
+    _out = int(_row.output_tokens or 0)
+
+    # matching_model IS NULL means no Stage 5 response was obtained for those
+    # rows (node_no_candidates, or a failure before the first call returned),
+    # so there is nothing to price and nothing to price it against. Reported
+    # as a group rather than dropped: a NULL group carrying non-zero tokens
+    # would be a logging defect, and silently excluding it is how that stays
+    # invisible.
+    if _row.matching_model is None:
+        _in_cost = _out_cost = 0.0
+        _note = ("no model recorded"
+                 if (_in == 0 and _out == 0)
+                 else "NO MODEL RECORDED BUT TOKENS PRESENT — logging defect")
+    else:
+        # Split into two calls purely to get the input and output halves
+        # separately; get_model_cost returns their sum.
+        _in_cost = get_model_cost(_row.matching_model, _in, 0)
+        _out_cost = get_model_cost(_row.matching_model, 0, _out)
+        _note = ""
+
+    _cost_rows.append({
+        "matching_model": _row.matching_model or "(none)",
+        "rows": int(_row.rows_n),
+        "input_tokens": _in,
+        "output_tokens": _out,
+        # NULL-safe: SUM() over a column that is NULL on every GPT-4o-era row
+        # returns NULL for those groups. Printed as "n/a" rather than 0 —
+        # GPT-4o reported no reasoning breakdown at all, which is not the same
+        # as a reasoning model that did no thinking.
+        "reasoning_tokens": ("n/a" if _row.reasoning_tokens is None
+                             else int(_row.reasoning_tokens)),
+        "input_cost": _in_cost,
+        "output_cost": _out_cost,
+        "recomputed_cost": _in_cost + _out_cost,
+        "stored_cost": float(_row.stored_cost or 0.0),
+        "note": _note,
+    })
+
+df_cost = pd.DataFrame(_cost_rows)
+print("=== COST BREAKDOWN BY MODEL ===")
+print(f"(priced from PRICING_CONFIG, last_updated {PRICING_CONFIG['last_updated']})")
+print(df_cost.to_string(index=False))
+
+_total_rows = int(df_cost["rows"].sum()) if len(df_cost) else 0
+_recomputed_total = float(df_cost["recomputed_cost"].sum()) if len(df_cost) else 0.0
+_stored_total = float(df_cost["stored_cost"].sum()) if len(df_cost) else 0.0
+print(f"\nRows: {_total_rows}")
+print(f"Recomputed total: ${_recomputed_total:.4f}")
+print(f"Stored total (estimated_cost_usd): ${_stored_total:.4f}")
+
+# The two totals should agree. They diverge when PRICING_CONFIG changed after
+# rows were written — which is legitimate and is exactly why pricing_version is
+# stored per row — so this is reported, not asserted.
+if _stored_total:
+    print(f"Divergence: {(_recomputed_total - _stored_total) / _stored_total * 100:+.2f}% "
+          f"(non-zero means PRICING_CONFIG changed since some rows were written; "
+          f"see the pricing_version column)")
+
+if _total_rows:
+    print(f"Projected cost for 1000 patients, at the current mix: "
+          f"${_recomputed_total / _total_rows * 1000:.2f}")
+
 print("\n")
 
 

@@ -316,6 +316,14 @@ class TrialMatchState(TypedDict):
     gpt4o_prompt: str                           # Prompt sent to matching model
     gpt4o_input_tokens: int
     gpt4o_output_tokens: int
+    # The reasoning share OF gpt4o_output_tokens on a reasoning model, not an
+    # amount on top of it. None when no response reported the breakdown; see
+    # _pipeline_provenance() for why that is not 0.
+    gpt4o_reasoning_tokens: Optional[int]
+    # The model string the API answered with (response.model), which is not
+    # necessarily MATCHING_MODEL: an alias can resolve to a dated snapshot.
+    # This is what File 14 logs and prices against.
+    matching_model: Optional[str]
     cross_vocab_remaps: int                     # Criterion labels resolved to not_evaluable
                                                 # because the model used the other arm's
                                                 # vocabulary (or returned a non-object entry)
@@ -2285,6 +2293,35 @@ def call_matching_model(system_prompt: str, user_prompt: str):
 
     The caller owns error handling: this raises whatever the client raises, and
     node_gpt4o_evaluation's except block turns that into a retry.
+
+    REQUEST SHAPE, AND WHY EACH PARAMETER IS OR IS NOT HERE. Every one of these
+    was probed live against gpt-5.6-terra on 2026-08-04 rather than inferred
+    from documentation; the model page does not enumerate its own parameter
+    restrictions.
+
+      max_completion_tokens   REQUIRED. `max_tokens` is rejected outright:
+                              400 unsupported_parameter, "Use
+                              'max_completion_tokens' instead." Note this caps
+                              reasoning AND visible output together.
+      reasoning_effort        Accepted values for THIS model are none / low /
+                              medium / high / xhigh. Set from File 03.
+      seed                    Accepted (no error). Best-effort only; the model
+                              returns no system_fingerprint.
+      temperature             NOT SENT. Rejected for every value but the
+                              provider default of 1, so there is nothing to
+                              send. MATCHING_TEMPERATURE is None.
+      response_format         NOT SENT, deliberately. The model does support
+                              it -- a json_object probe failed only on the
+                              unrelated "messages must contain the word json"
+                              rule, not on the parameter -- and Stage 5 would
+                              be a good candidate for Structured Outputs. It is
+                              held back so the model migration can be measured
+                              on its own; adding it here would change the
+                              parsing contract and the verdict distribution in
+                              the same commit.
+
+    Anything added to this call must also be added to the request block File 45
+    records and File 46 replays, or a fixture stops being able to see it.
     """
     return openai_client.chat.completions.create(
         model=MATCHING_MODEL,
@@ -2292,8 +2329,8 @@ def call_matching_model(system_prompt: str, user_prompt: str):
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        temperature=MATCHING_TEMPERATURE,
-        max_tokens=MATCHING_MAX_TOKENS,
+        max_completion_tokens=MATCHING_MAX_TOKENS,
+        reasoning_effort=MATCHING_REASONING_EFFORT,
         seed=MATCHING_SEED,
     )
 
@@ -2332,12 +2369,32 @@ def estimate_output_tokens(trials: List[Dict]) -> int:
 
     HOW THIS WAS CALIBRATED, so it can be re-derived when the model changes:
 
-        SELECT candidates_evaluated, gpt4o_output_tokens FROM inferences
+        SELECT candidates_evaluated, gpt4o_output_tokens, gpt4o_calls,
+               gpt4o_reasoning_tokens, matching_model
+        FROM inferences
         WHERE candidates_evaluated > 0 AND gpt4o_output_tokens > 0
+          AND gpt4o_calls = 1            -- see below
+        GROUP BY matching_model
 
-    1,094 rows. Output per trial: mean 714, median 744, p95 1,029, max 1,165.
-    Restricted to the 555 rows at the current batch cap of 15 trials: median
-    712, p90 784, p95 861, p99 1,028, max 1,062.
+    RESTRICT TO gpt4o_calls = 1 AND GROUP BY matching_model. Both matter now.
+    A split run sums its tokens across chunks and, when the split was reactive,
+    includes the wasted truncated call, so output/trials over those rows
+    over-states the per-trial cost. And inferences.db holds rows from two
+    judges since 2026-08-04; pooling them calibrates against neither.
+
+    gpt4o_output_tokens ALREADY INCLUDES reasoning tokens (they are a subset of
+    usage.completion_tokens, not an addition to it), so no term is added for
+    them. gpt4o_reasoning_tokens is selected above only to see how much of the
+    figure is invisible: at the configured effort of 'none' it is 0.
+
+    2026-08-04, gpt-5.6-terra at reasoning_effort='none', over the 27
+    single-call runs of the step 7 measurement: mean 959, median 974, p90
+    1,048, p95 1,073, max 1,138, sd 92.
+
+    HISTORICAL, gpt-4o-2024-08-06 over 1,094 rows in inferences.db: output per
+    trial mean 714, median 744, p95 1,029, max 1,165; restricted to the 555
+    rows at the 15-trial cap, median 712, p90 784, p95 861, p99 1,028, max
+    1,062. Kept because those rows are still in the table and still priced.
 
     WHAT DID NOT PREDICT ANYTHING. Fitting output against both trial count and
     criteria length — the criteria text measured with File 11's characters/4
@@ -2892,6 +2949,24 @@ CLINICAL TRIALS:
     truncations_observed = 0
     input_tokens = 0
     output_tokens = 0
+    # Reasoning tokens are a SUBSET of output_tokens, never an addition to it.
+    # Verified live 2026-08-04: usage.completion_tokens minus
+    # usage.completion_tokens_details.reasoning_tokens tracks the visible
+    # content length across effort levels (52/0, 133/72, 147/98, 123/68 for
+    # none/low/medium/high on the same prompt). OpenAI's reasoning guide states
+    # the same. So this is recorded as a BREAKDOWN of output_tokens and must
+    # never be added to it for costing -- doing so would bill every reasoning
+    # token twice.
+    reasoning_tokens = 0
+    reasoning_tokens_reported = False   # any response carried the breakdown
+    # The model string the API ANSWERED with, as opposed to MATCHING_MODEL,
+    # which is what was asked for. They differ whenever an alias resolves to a
+    # dated snapshot (gpt-4o-2024-08-06 is one). Last writer wins across a split
+    # batch, which is correct: every chunk of one Stage 5 goes to the same
+    # model, and if a provider ever routed them differently the last value is
+    # still a model that genuinely served this run rather than a config string
+    # that may have served none of it.
+    model_answered = None
     response_text = ""
     calls_made = 0
     _finish_reason_warned = False
@@ -2923,6 +2998,20 @@ CLINICAL TRIALS:
         input_tokens += response.usage.prompt_tokens
         output_tokens += response.usage.completion_tokens
         response_text = chunk_text
+
+        # Read defensively for the same reason finish_reason is below: File 37
+        # drives this node with a stub response and File 46 serves recordings
+        # made before the field existed. Absent is reported as NULL, never as
+        # 0 -- "this response carried no reasoning breakdown" is not "this
+        # response spent no reasoning tokens", and a non-reasoning model
+        # legitimately reports 0.
+        _usage_details = getattr(response.usage, "completion_tokens_details", None)
+        _reasoning = getattr(_usage_details, "reasoning_tokens", None)
+        if _reasoning is not None:
+            reasoning_tokens += _reasoning
+            reasoning_tokens_reported = True
+
+        model_answered = getattr(response, "model", None) or model_answered
 
         # finish_reason is read defensively because not every client object
         # that reaches here carries one: the retrieval-observability test
@@ -3006,6 +3095,15 @@ CLINICAL TRIALS:
                 "gpt4o_truncation_splits": truncation_splits,
                 "gpt4o_output_tokens_estimated": estimated_output,
                 "gpt4o_raw_response": chunk_text,
+                # A model DID answer here -- badly, but it answered -- so the
+                # run is not anonymous. Carried so that a patient whose retries
+                # all end in malformed JSON still logs which model produced
+                # them instead of a NULL that reads as "Stage 5 never ran".
+                # The token counters are deliberately not carried: they are not
+                # accumulated on this path at all (a pre-existing gap), and
+                # reporting a reasoning subtotal against a zero output total
+                # would be arithmetically incoherent.
+                "matching_model": model_answered,
                 "error": error_msg,
                 "stage_timings": {**state.get("stage_timings", {}), "gpt4o_evaluation": round(prior_gpt4o_time + elapsed, 3)}
             }
@@ -3021,6 +3119,15 @@ CLINICAL TRIALS:
                 "gpt4o_truncation_splits": truncation_splits,
                 "gpt4o_output_tokens_estimated": estimated_output,
                 "gpt4o_raw_response": chunk_text,
+                # A model DID answer here -- badly, but it answered -- so the
+                # run is not anonymous. Carried so that a patient whose retries
+                # all end in malformed JSON still logs which model produced
+                # them instead of a NULL that reads as "Stage 5 never ran".
+                # The token counters are deliberately not carried: they are not
+                # accumulated on this path at all (a pre-existing gap), and
+                # reporting a reasoning subtotal against a zero output total
+                # would be arithmetically incoherent.
+                "matching_model": model_answered,
                 "error": error_msg,
                 "stage_timings": {**state.get("stage_timings", {}), "gpt4o_evaluation": round(prior_gpt4o_time + elapsed, 3)}
             }
@@ -3036,11 +3143,19 @@ CLINICAL TRIALS:
     # Logged every run, not only when it matters. The constants in File 03 were
     # derived from this column pair on 1,094 historical rows; recording the
     # estimate beside the outcome is what lets the next derivation be better.
+    # The reasoning share is printed beside the total rather than added to it,
+    # so the line reads the way the billing does: one output figure, with the
+    # invisible part of it named.
+    _reasoning_note = (
+        f", of which {reasoning_tokens} reasoning"
+        if reasoning_tokens_reported else
+        ", reasoning share not reported"
+    )
     print(f"  [Output tokens] estimated {estimated_output}, actual "
-          f"{output_tokens} across {calls_made} call(s) "
+          f"{output_tokens}{_reasoning_note} across {calls_made} call(s) "
           f"(ratio {output_tokens / estimated_output:.2f})"
           if estimated_output else
-          f"  [Output tokens] actual {output_tokens}")
+          f"  [Output tokens] actual {output_tokens}{_reasoning_note}")
 
     # SUCCESS: enrich evaluations with trial metadata (title, phase)
     for eval_result in evaluations:
@@ -3524,6 +3639,16 @@ CLINICAL TRIALS:
         "gpt4o_prompt": prompt,
         "gpt4o_input_tokens": input_tokens,
         "gpt4o_output_tokens": output_tokens,
+        # The reasoning share of gpt4o_output_tokens, NOT an extra charge on top
+        # of it. None when no response carried the breakdown -- see the
+        # accumulator above.
+        "gpt4o_reasoning_tokens": (reasoning_tokens if reasoning_tokens_reported
+                                   else None),
+        # The model that actually answered. File 14 logs this into
+        # inferences.matching_model and prices against it, so the stored cost is
+        # computed from the model that produced the tokens rather than from
+        # whatever MATCHING_MODEL happens to say at read time.
+        "matching_model": model_answered,
         "cross_vocab_remaps": len(label_remaps),
         "error": "",  # Clear error on success
         "stage_timings": {**state.get("stage_timings", {}), "gpt4o_evaluation": round(prior_gpt4o_time + elapsed, 3)}
@@ -3602,6 +3727,31 @@ def _pipeline_provenance(state) -> Dict:
         "gpt4o_output_tokens_estimated": state.get("gpt4o_output_tokens_estimated"),
         "not_evaluable_truncated": state.get("not_evaluable_truncated", 0),
         "gpt4o_calls": state.get("gpt4o_calls", 0),
+
+        # --- Which model answered, and what it spent thinking ---------------
+        #
+        # BOTH BELONG HERE RATHER THAN ON node_finalize. File 14 reads them on
+        # every row it writes; a key declared by one terminal node only makes
+        # the column populated for a minority of rows and constant for the
+        # rest, which is the exact defect this block exists to prevent, and
+        # File 36's Test 1 fails for it.
+        #
+        # matching_model is the string the API ANSWERED with, read off
+        # response.model by Stage 5. None means no Stage 5 response was ever
+        # obtained -- the run ended at node_no_candidates, or died before the
+        # first call returned. That is NOT the same as "it ran on the
+        # configured model", which is what logging MATCHING_MODEL here would
+        # assert on a run that never made a request. File 14 prices against
+        # this value.
+        #
+        # gpt4o_reasoning_tokens is the reasoning SUBSET of
+        # gpt4o_output_tokens, not an addition to it, so it is a breakdown
+        # column and never a costing term. None -- not 0 -- when no response
+        # carried the breakdown: a stub, a replayed pre-migration fixture, or a
+        # run that never reached Stage 5. A non-reasoning model reporting a
+        # genuine 0 is a different fact and stays 0.
+        "matching_model": state.get("matching_model"),
+        "gpt4o_reasoning_tokens": state.get("gpt4o_reasoning_tokens"),
         # Which stages were disabled for this run; {} = full pipeline. Copied
         # rather than aliased so the logged record cannot be mutated later.
         "ablation_flags": dict(state.get("ablation_flags") or {}),

@@ -1571,30 +1571,86 @@ def render_cost_tokens_tab(df):
     # which rendered a $0.00 breakdown and a pie chart of nothing — a reader
     # cannot tell that from a genuinely cheap run. get_model_cost() now raises
     # instead, and the tab says so rather than drawing an empty chart.
+    #
+    # PRICED PER ROW'S OWN MODEL. It used to price the whole table against
+    # MATCHING_MODEL — the model configured at the moment the dashboard was
+    # opened — and label the chart "GPT-4o". Both were wrong from the moment
+    # inferences.db held rows from two judges: after the 2026-08-04 migration
+    # to gpt-5.6-terra ($2.00/$12.00 per 1M) the GPT-4o rows ($2.50/$10.00)
+    # would have been repriced at the new rate, understating their input spend
+    # and overstating their output spend, while the chart went on calling both
+    # "GPT-4o". The grouping key is matching_model, which File 14 writes from
+    # the model that ANSWERED, so a row is priced and labelled by the model
+    # that produced it.
+    #
+    # dropna=False keeps the NULL-model group. Those are rows where Stage 5
+    # never produced a response (node_no_candidates, or a pre-response
+    # failure); they carry no Stage 5 tokens and so contribute no cost, but
+    # dropping them silently would hide a logging defect if they ever did.
     try:
-        gpt4o_input_cost  = get_model_cost(
-            MATCHING_MODEL, int(df['gpt4o_input_tokens'].sum()), 0
-        )
-        gpt4o_output_cost = get_model_cost(
-            MATCHING_MODEL, 0, int(df['gpt4o_output_tokens'].sum())
-        )
+        _by_model = df.groupby('matching_model', dropna=False)[
+            ['gpt4o_input_tokens', 'gpt4o_output_tokens']
+        ].sum()
+
+        cost_components = []      # one row per (model, input|output)
+        gpt4o_input_cost = 0.0
+        gpt4o_output_cost = 0.0
+        unpriceable_tokens = 0
+
+        for _model, _row in _by_model.iterrows():
+            _in = int(_row['gpt4o_input_tokens'] or 0)
+            _out = int(_row['gpt4o_output_tokens'] or 0)
+
+            if pd.isna(_model):
+                # Nothing to price against. Surfaced only if it carries
+                # tokens, because a no-candidates run legitimately has none.
+                unpriceable_tokens += _in + _out
+                continue
+
+            _in_cost = get_model_cost(_model, _in, 0)
+            _out_cost = get_model_cost(_model, 0, _out)
+            gpt4o_input_cost += _in_cost
+            gpt4o_output_cost += _out_cost
+            cost_components.append((f"{_model} Output", _out_cost))
+            cost_components.append((f"{_model} Input", _in_cost))
     except UnknownModelPricingError as e:
         st.error(
             f"Cost breakdown unavailable: {e}"
         )
         return
 
+    if unpriceable_tokens:
+        st.warning(
+            f"{unpriceable_tokens:,} Stage 5 tokens are on rows with no "
+            f"matching_model recorded and are excluded from this breakdown. "
+            f"A row with tokens but no model is a logging defect — the model "
+            f"that produced them was not carried out of Stage 5."
+        )
+
+    if not cost_components:
+        # Every row has a NULL matching_model, so there is nothing to price
+        # and nothing to name. Said out loud rather than drawn as an empty
+        # pie chart, which is the failure mode this whole block was rewritten
+        # to remove.
+        st.info(
+            "No row in this selection records which model produced it "
+            "(matching_model is NULL on all of them), so no cost breakdown "
+            "can be computed. Rows written by a pipeline terminal node always "
+            "carry the model that answered."
+        )
+        return
+
     recalc_total = gpt4o_input_cost + gpt4o_output_cost
-    
+
     df_cost = pd.DataFrame({
-        'Component': ['GPT-4o Output', 'GPT-4o Input'],
-        'Cost': [gpt4o_output_cost, gpt4o_input_cost],
+        'Component': [c for c, _ in cost_components],
+        'Cost': [v for _, v in cost_components],
         'Percentage': [
-            gpt4o_output_cost / recalc_total * 100 if recalc_total > 0 else 0,
-            gpt4o_input_cost / recalc_total * 100 if recalc_total > 0 else 0
+            v / recalc_total * 100 if recalc_total > 0 else 0
+            for _, v in cost_components
         ]
     })
-    
+
     col1, col2 = st.columns(2)
     
     with col1:
@@ -1604,7 +1660,11 @@ def render_cost_tokens_tab(df):
         st.plotly_chart(fig_pie, use_container_width=True)
     
     with col2:
-        # Stacked bars: token volume vs cost share — exposes the 4× pricing asymmetry
+        # Stacked bars: token volume vs cost share — exposes the pricing
+        # asymmetry. The multiplier used to be written into the legend as "4×",
+        # which was gpt-4o's ratio ($10.00 / $2.50). It is now derived from the
+        # observed spend so it stays true across a mixed-model table: with two
+        # judges at different ratios there is no single literal that is right.
         total_input_tokens = df['gpt4o_input_tokens'].sum()
         total_output_tokens = df['gpt4o_output_tokens'].sum()
 
@@ -1614,6 +1674,14 @@ def render_cost_tokens_tab(df):
 
         input_cost_pct = gpt4o_input_cost / recalc_total * 100 if recalc_total > 0 else 0
         output_cost_pct = gpt4o_output_cost / recalc_total * 100 if recalc_total > 0 else 0
+
+        # Effective blended output:input price ratio over whatever models this
+        # table actually contains. Guarded on both denominators: a table with
+        # no input tokens has no ratio to state, and the legend then says so.
+        _in_rate = (gpt4o_input_cost / total_input_tokens) if total_input_tokens else 0
+        _out_rate = (gpt4o_output_cost / total_output_tokens) if total_output_tokens else 0
+        _ratio_label = (f"Output ({_out_rate / _in_rate:.1f}x price/tok)"
+                        if _in_rate > 0 and _out_rate > 0 else "Output")
 
         fig_asym = go.Figure()
 
@@ -1636,7 +1704,7 @@ def render_cost_tokens_tab(df):
         fig_asym.add_trace(go.Bar(
             x=['Token Volume', 'Cost Share'],
             y=[output_tok_pct, output_cost_pct],
-            name='Output (4× price/tok)',
+            name=_ratio_label,
             marker_color='#ff7f0e',
             text=[
                 f"{output_tok_pct:.0f}%<br>({total_output_tokens:,.0f} tok)",
@@ -1665,9 +1733,19 @@ def render_cost_tokens_tab(df):
     df_cost['Percentage'] = df_cost['Percentage'].apply(lambda x: f"{x:.1f}%")
     st.dataframe(df_cost, use_container_width=True, hide_index=True)
     
+    # Model names come from the data, not from a literal and not from
+    # MATCHING_MODEL: this table can hold rows from more than one judge, and
+    # naming the configured one would relabel history every time the config
+    # changes.
+    _models_present = sorted(
+        str(m) for m in df['matching_model'].dropna().unique()
+    ) or ["(none recorded)"]
     st.caption(
-        "GPT-4o input tokens carry the prompt and patient/trial data; output tokens carry the eligibility assessments. "
-        "Output tokens cost 4x more per token than input tokens."
+        f"Stage 5 judge(s) in this table: {', '.join(_models_present)}. "
+        "Input tokens carry the prompt and patient/trial data; output tokens "
+        "carry the eligibility assessments — and, on a reasoning model, the "
+        "reasoning tokens that are billed at the output rate but never shown. "
+        "Each model's tokens are priced at that model's own rates."
     )
     
     st.markdown("---")
@@ -2737,13 +2815,34 @@ def render_patient_explorer_tab(df):
     with col4:
         st.metric("Cost", f"${patient_df['estimated_cost_usd']:.4f}", help="Estimated API cost for this patient")
     
-    col1, col2 = st.columns(2)
-    
+    # Labelled with the model THIS row was judged by, read from the row rather
+    # than from MATCHING_MODEL. A patient evaluated by GPT-4o must not be
+    # relabelled as the current judge just because the config moved on.
+    _row_model = patient_df.get('matching_model')
+    _judge = str(_row_model) if pd.notna(_row_model) else "Stage 5"
+
+    col1, col2, col3 = st.columns(3)
+
     with col1:
-        st.metric("GPT-4o Input Tokens", f"{int(patient_df['gpt4o_input_tokens']):,}", help="Tokens sent to GPT-4o (prompt + trial criteria + patient data)")
+        st.metric(f"{_judge} Input Tokens", f"{int(patient_df['gpt4o_input_tokens']):,}",
+                  help=f"Tokens sent to {_judge} (prompt + trial criteria + patient data)")
     with col2:
-        st.metric("GPT-4o Output Tokens", f"{int(patient_df['gpt4o_output_tokens']):,}", help="Tokens generated by GPT-4o (eligibility assessments)")
-    
+        st.metric(f"{_judge} Output Tokens", f"{int(patient_df['gpt4o_output_tokens']):,}",
+                  help=f"Tokens generated by {_judge}, INCLUDING any reasoning "
+                       f"tokens — the two are one billed total, not two.")
+    with col3:
+        # NULL is rendered as "n/a", never as 0: GPT-4o-era rows carry no
+        # reasoning breakdown at all, which is a different fact from a
+        # reasoning model that spent nothing thinking.
+        _reasoning = patient_df.get('gpt4o_reasoning_tokens')
+        st.metric(
+            "…of which reasoning",
+            "n/a" if pd.isna(_reasoning) else f"{int(_reasoning):,}",
+            help="Reasoning tokens are a SUBSET of the output tokens above, "
+                 "billed at the output rate and never shown to the reader. "
+                 "'n/a' means this response reported no reasoning breakdown.",
+        )
+
     if pd.notna(patient_df['error']) and patient_df['error'] != '':
         st.error(f"Error: {patient_df['error']}")
 
