@@ -41,27 +41,105 @@ for _bootstrap in ("01- Imports.py", "02- Utility Functions.py", "03- Config.py"
 # Configuration
 #--------------
 
-# Population size to generate
-# The generated population will mostly have healthy people and about 5~10% people with cancer
-# Later, I will drop the datapoints of the healthy people and only keep the cancer patients.
-POPULATION_SIZE = 22000
+# Population size to generate.
+#
+# Sized MEASURED, not guessed, against the predicate that actually decides who
+# survives File 05: primary cancer AND alive. A 2,000-patient run under the
+# current settings (no -m, ages 18-100, seed 20260805 / clinician seed
+# 20260806) was scanned with File 05's has_cancer_diagnosis() and
+# patient_death_status():
+#
+#     -p 2000  ->  2,924 exported bundles (2,922 patients + 2 provider bundles)
+#                    444 primary-cancer patients
+#                    185 of them ALIVE          <- the cohort-eligible count
+#                    259 deceased (58.3% of the cancer patients)
+#                      0 with unreadable vital status
+#
+#     alive-cancer yield y = 185 / 2000 = 0.0925 per LIVING patient
+#
+#     1000 / 0.0925 = 10,811 bare requirement
+#     POPULATION_SIZE = 12,500  (+15.6%),  expected alive cancer ~1,156
+#
+# -p counts LIVING patients in both readings, so the yield carries over
+# unchanged now that ONLY_ALIVE_PATIENTS is on: the sizing run's -p 2000
+# produced exactly 2,000 living patients (plus 922 deceased that this run would
+# not have exported), and 185 of those 2,000 living patients had a primary
+# cancer. What changes is only the bytes written per -p unit, not the yield.
+#
+# Why the margin is that size. Two independent errors stack. The binomial spread
+# of the draw itself at n=12,500 is about +/-32 patients (1 sd). The bigger term
+# is the uncertainty in y: its own standard error at n=2000 is 0.0065, i.e. 7.0%
+# relative, which is +/-81 patients at this population. Combined 1 sd is ~87, so
+# 12,500 puts the 1,000 target about 1.8 sd below the expectation -- roughly a
+# 4% chance of falling short. Going higher is disk-bound, not statistics-bound
+# (see the CSV note below).
+#
+# The overshoot is deliberate and asymmetric: File 05 caps at CAP=1000 and
+# deletes the surplus, so generating too many costs disk and minutes, while
+# generating too few leaves a cohort under 1,000 that cannot be topped up --
+# Synthea appends rather than replaces, so a second run would interleave two
+# populations (see generate_synthea_patients()).
+#
+# WHY THIS IS 2.6x THE PREVIOUS VALUE. It was 4,800, sized on an all-cancer
+# yield of 0.239 that was wrong in both directions:
+#   - it counted the dead. 58.3% of cancer patients are deceased, and a dead
+#     patient cannot enrol on a trial, so they are now deleted by File 05's
+#     'deceased' phase before the cap.
+#   - it counted obese non-cancer patients. File 08 admitted SNOMED 408512008
+#     ("Body mass index 40+ - severely obese") as a primary lung cancer; that
+#     is fixed, and the type distribution above no longer contains it.
+# Both corrections shrink the eligible pool, so the population has to grow.
+#
+# Re-measure whenever MIN_AGE/MAX_AGE, the module set, or File 08's registry
+# changes. All three move it.
+POPULATION_SIZE = 12500
 
 # Age range (adults only for cancer trials)
+#
+# Synthea's -a is the age at the END of the simulation, so it is the age the
+# corpus records, not an age at diagnosis. The upper bound was 80, which
+# truncated the population exactly where cancer incidence is highest: median age
+# at cancer diagnosis is around 66 and a large share of patients are over 80.
+# Capping there also made every "age <= 75" trial criterion trivially passable
+# and left no patients for whom an upper age limit could exclude. 100 lets the
+# tail exist. MIN_AGE stays 18: the indexed trials are filtered to ADULT
+# (trial_dict, 03- Config.py), so paediatric patients would have no trials to
+# match against.
 MIN_AGE = 18
-MAX_AGE = 80
+MAX_AGE = 100
 
-# Module filter (only cancer modules)
+# Module filter -- NO LONGER PASSED TO SYNTHEA. Retained, unused, on purpose.
+#
+# The -m flag was dropped from the Synthea command: with "*cancer*" the only
+# modules that ran were the oncology ones, so every generated patient carried a
+# cancer history and nothing else -- no diabetes, no hypertension, no COPD, no
+# concurrent medications. Trial eligibility criteria are largely about
+# COMORBIDITY and CONCOMITANT MEDICATION ("no uncontrolled diabetes", "no active
+# second malignancy", "adequate renal function"), and a corpus with no
+# comorbidity makes that whole class of criterion unevaluable in the same way a
+# corpus with no ECOG did. Running Synthea's full module set is what produces a
+# patient record a trial criterion can actually be tested against. The cost is
+# generation time and a lower cancer yield per generated patient, which
+# POPULATION_SIZE now absorbs.
+#
+# MODULE_FILTER and build_module_filter_argument() are kept rather than deleted
+# because the reasoning below is the expensive part and would have to be
+# rediscovered by anyone who reinstates -m:
 #
 # Synthea's -m flag takes a File.pathSeparator-delimited list of glob patterns,
 # matched case-insensitively against each module's key. Built-in modules are
 # keyed by their path inside the JAR ("modules/lung_cancer.json"); modules
 # supplied through -d are keyed by their ABSOLUTE path on disk. A pattern that
 # matches nothing silently drops the module -- there is no error -- so the ECOG
-# module needs a pattern of its own here. Verified empirically: with "*cancer*"
+# module needed a pattern of its own. Verified empirically: with "*cancer*"
 # alone, Synthea logs "Scanned 1 local modules" and then never lists the ECOG
 # module among the "Loading module ..." lines, and no bundle carries an
-# observation. build_module_filter_argument() joins the two, and
-# generate_synthea_patients() fails the run if the load line does not appear.
+# observation.
+#
+# With -m gone, every module the JAR ships plus every module under -d is loaded,
+# so the ECOG module loads unconditionally. The "Loading module ..." grep in
+# generate_synthea_patients() stays and is now the ONLY proof the module was
+# loaded -- there is no filter left to inspect if it goes missing.
 MODULE_FILTER = "*cancer*"
 
 # State for demographics
@@ -97,13 +175,55 @@ SYNTHEA_LOG_FILENAME = "synthea_run.log"
 OUTPUT_DIR_FULL = data_patient_path
 
 # FHIR export settings
+#
+# EXPORT_CSV is OFF. It is not a preference -- it is what makes the run fit on
+# disk. At POPULATION_SIZE = 12,500 the FHIR bundles alone come to ~371 GB
+# (measured: 0.0297 GB per -p unit, from the 2,000-patient sizing run), and the
+# CSV export runs about 15% of that again -- the 4,800-patient run wrote 22 GB
+# of CSV. Both together do not fit in the ~418 GB available, and Synthea gives
+# no warning when it runs out; it fails part-way through and leaves a corpus
+# nothing downstream can tell from a complete one.
+#
+# Nothing in the pipeline reads the CSVs: parse_fhir_bundle() (File 07) takes a
+# FHIR bundle path, and normalize_ecog_observations() explicitly does NOT
+# normalise observations.csv, so the CSV ECOG values were never mCODE-shaped
+# anyway. They were a convenience for ad-hoc inspection.
+#
+# Turn it back on for a small run if you want the tables; it costs nothing at
+# -p 2000. At -p 12500 it costs the run.
 EXPORT_FHIR = "true"
 EXPORT_CCDA = "false"
-EXPORT_CSV  = "true"
+EXPORT_CSV  = "false"
 
 # Limits patient history to last X years
 # 0 years mean lifetime records
 YEARS = 0
+
+# Synthea generate.only_alive_patients.
+#
+# When true, Synthea re-rolls any patient who dies before the simulation end
+# and exports only patients alive at the end. Synthea's default is false, which
+# exports the dead as overflow: the -p 2000 sizing run produced 2,922 patient
+# bundles, 922 of them deceased.
+#
+# On by default here because File 05 DELETES every deceased patient anyway (a
+# dead patient cannot enrol on a trial), so generating and exporting them is
+# pure waste. It is not a small waste: 58.3% of the primary-cancer patients in
+# the sizing run were deceased, and the dead bundles were roughly 31% of the
+# corpus on disk. At the population size needed for a 1,000-patient alive
+# cohort that is well over 100 GB written and then deleted.
+#
+# IT DOES NOT BIAS THE COHORT. Re-rolling until alive is rejection sampling on
+# "alive at the end date", which is the same conditional distribution File 05's
+# deceased phase produces by deleting afterwards. The two routes give the same
+# cohort; this one just does not write it to disk first.
+#
+# File 05's deceased phase STAYS regardless, and is expected to delete zero.
+# It is the guarantee, not the mechanism: this flag is a Synthea setting that a
+# future edit could flip, real EHR input never passes through Synthea at all,
+# and "alive" here means alive at the simulation end, which is a claim about the
+# generator rather than about the bundle. The phase checks the bundle.
+ONLY_ALIVE_PATIENTS = "true"
 
 
 # ECOG performance status -- external standard facts
@@ -152,9 +272,9 @@ MCODE_ECOG_PROFILE_URL = (
 # Extracted from the module JSONs inside the Synthea JAR (lung_cancer,
 # veteran_lung_cancer, breast_cancer, colorectal_cancer, veteran_prostate_cancer,
 # acute_myeloid_leukemia), so the set is exactly what this JAR can produce, not
-# a general oncology vocabulary. acute_myeloid_leukemia is included even though
-# MODULE_FILTER does not currently load it, so that widening the filter does not
-# silently leave AML patients without a performance status.
+# a general oncology vocabulary. Those six are the only modules in the JAR's 242
+# that diagnose a malignancy, and with -m dropped all six now run, so the set is
+# complete for the module set actually loaded rather than for a filtered subset.
 #
 # Deliberately EXCLUDED, and the exclusions matter:
 #   162573006 Suspected lung cancer (situation)    -- suspicion, not diagnosis
@@ -542,6 +662,12 @@ def write_ecog_module(modules_dir=None):
 def build_module_filter_argument():
     """Join MODULE_FILTER with a pattern that matches the ECOG module.
 
+    UNUSED. Nothing calls this: generate_synthea_patients() no longer passes -m,
+    so Synthea loads every module in the JAR plus every module under -d. Kept,
+    with MODULE_FILTER, so that reinstating a filter does not have to
+    rediscover the two facts encoded here -- see the MODULE_FILTER comment for
+    why the filter was dropped and why a local module needs its own pattern.
+
     Synthea splits -m on File.pathSeparator, which is os.pathsep on the same
     platform. The ECOG pattern is derived from ECOG_MODULE_FILENAME so that
     renaming the module cannot leave the filter pointing at nothing.
@@ -556,13 +682,17 @@ def build_module_filter_argument():
 # Main Generation Function
 #--------------------------
 def generate_synthea_patients(population_size=None, output_dir=None,
-                              modules_dir=None, seed=None, force=False):
+                              modules_dir=None, seed=None, clinician_seed=None,
+                              force=False):
     """
     Generate synthetic patients using Synthea via subprocess
 
-    This generates a full population with cancer modules plus the local ECOG
-    performance status module.
-    About 7-10% will have actual cancer diagnoses.
+    No -m module filter is passed, so Synthea runs its ENTIRE module set plus
+    the local ECOG performance status module: patients carry comorbidities and
+    concomitant medications alongside any cancer, which is what makes the
+    non-oncology half of a trial's eligibility criteria evaluable. The cancer
+    yield per generated patient is correspondingly lower than under "*cancer*";
+    POPULATION_SIZE is sized against the unfiltered yield.
 
     The full population is saved to a temporary directory for filtering.
 
@@ -574,6 +704,13 @@ def generate_synthea_patients(population_size=None, output_dir=None,
         modules_dir:     Local module directory for -d. Defaults to
                          SYNTHEA_MODULES_DIR.
         seed:            Synthea -s population seed, or None for Synthea's own.
+        clinician_seed:  Synthea -cs clinician seed, or None for Synthea's own.
+                         Separate from -s: Synthea seeds the clinician/provider
+                         population from its own generator, so pinning -s alone
+                         still leaves the practitioners a run is assigned to
+                         varying between runs. Both are needed for a
+                         reproducible corpus and both are recorded in the
+                         manifest.
         force:           Generate even when output_dir/fhir already holds
                          bundles. Off by default -- see below.
 
@@ -594,7 +731,16 @@ def generate_synthea_patients(population_size=None, output_dir=None,
     outcome = {
         "success": False,
         "command": None,
+        # Stays None for the whole run: no -m is passed. Recorded explicitly
+        # rather than dropped so a manifest can be told apart from one written
+        # by a filtered run, where it holds the pattern string.
         "module_filter": None,
+        # The seeds this run actually used, so the result stands on its own and
+        # write_run_manifest() can read them off the run instead of trusting a
+        # separately-passed argument. Both are checked against the caller's
+        # arguments there.
+        "seed": seed,
+        "clinician_seed": clinician_seed,
         "returncode": None,
         "elapsed_seconds": None,
         "log_path": None,
@@ -651,29 +797,41 @@ def generate_synthea_patients(population_size=None, output_dir=None,
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     print(f"✓ Output directory: {output_dir}")
 
-    module_filter_arg = build_module_filter_argument()
+    # Seeds go in as their own argument pairs. -s seeds the population draw,
+    # -cs seeds the clinician/provider population; they are independent
+    # generators inside Synthea and setting one does not pin the other, so each
+    # takes its own value and either can be left to Synthea's default.
+    seed_args = []
+    if seed is not None:
+        seed_args += ["-s", str(seed)]
+    if clinician_seed is not None:
+        seed_args += ["-cs", str(clinician_seed)]
 
-    # Build Synthea command
+    # Build Synthea command.
+    #
+    # NO -m. Synthea loads every module in the JAR plus every module under -d.
+    # See the MODULE_FILTER comment at the top of this file for why the filter
+    # was removed and what it cost. Because there is no filter to inspect, the
+    # "Loading module ...ecog_performance_status.json" grep below is the only
+    # evidence the ECOG module was loaded, and the run fails without it.
     command = [
         "java",
         "-jar",
         SYNTHEA_JAR_PATH,
+        *seed_args,
         "-p", str(population_size),
         "-a", f"{MIN_AGE}-{MAX_AGE}",
-        "-m", module_filter_arg,
         "-d", modules_dir,
         f"--exporter.fhir.export={EXPORT_FHIR}",
         f"--exporter.ccda.export={EXPORT_CCDA}",
         f"--exporter.csv.export={EXPORT_CSV}",
         f"--exporter.baseDirectory={output_dir}",
         f"--exporter.years_of_history={YEARS}",
+        f"--generate.only_alive_patients={ONLY_ALIVE_PATIENTS}",
         STATE
     ]
-    if seed is not None:
-        command[3:3] = ["-s", str(seed)]
 
     outcome["command"] = list(command)
-    outcome["module_filter"] = module_filter_arg
 
     print()
     print("="*80)
@@ -687,9 +845,10 @@ def generate_synthea_patients(population_size=None, output_dir=None,
     print()
     print(f"Population size: {population_size}")
     print(f"Age range: {MIN_AGE}-{MAX_AGE} years")
-    print(f"Module filter: {module_filter_arg}")
+    print("Module filter: (none -- -m not passed, all modules load)")
     print(f"Local modules: {modules_dir}")
-    print(f"Seed: {seed if seed is not None else '(Synthea default)'}")
+    print(f"Population seed (-s):  {seed if seed is not None else '(Synthea default)'}")
+    print(f"Clinician seed (-cs):  {clinician_seed if clinician_seed is not None else '(Synthea default)'}")
     print(f"State: {STATE}")
     print()
     print("This will take few moments depending on population size...")
@@ -764,24 +923,26 @@ def generate_synthea_patients(population_size=None, output_dir=None,
             outcome["failure_reason"] = f"synthea_returncode_{result.returncode}"
             return outcome
 
-        # A module that does not match the -m filter is dropped SILENTLY -- no
-        # warning, no non-zero exit, just a corpus with no ECOG in it. Fail here
-        # instead of discovering it three steps downstream.
+        # A module Synthea does not load is dropped SILENTLY -- no warning, no
+        # non-zero exit, just a corpus with no ECOG in it. With -m gone there is
+        # no filter left to inspect, so this grep over the captured log is the
+        # ONLY proof the module loaded. Fail here instead of discovering it
+        # three steps downstream.
         if not outcome["ecog_module_loaded"]:
             print()
             print("="*80)
             print("ERROR: The ECOG module was not loaded by Synthea")
             print("="*80)
             print(f"Expected a 'Loading module ...{ECOG_MODULE_FILENAME}' line; none present.")
-            print(f"Module filter passed to -m: {module_filter_arg}")
+            print("No -m filter is passed, so this is NOT a filter miss: Synthea")
+            print("did not see the module at all.")
             print(f"Local module directory passed to -d: {modules_dir}")
-            print("Modules Synthea reported loading:")
+            print(f"Modules Synthea reported loading: {len(outcome['loaded_modules'])}")
             for module in outcome["loaded_modules"]:
                 print(f"  {module}")
             print()
-            print("Synthea matches -m patterns against each module's key, and a")
-            print("local module's key is its ABSOLUTE path. Check that the ECOG")
-            print("pattern in build_module_filter_argument() matches that path.")
+            print("Check that the directory above exists, is readable, and holds")
+            print(f"{ECOG_MODULE_FILENAME} -- write_ecog_module() puts it there.")
             outcome["failure_reason"] = "ecog_module_not_loaded"
             return outcome
 
@@ -1250,7 +1411,7 @@ def _sha256_file(path):
 
 def write_run_manifest(output_dir, generation, module_info, verification,
                        normalization, ecog_summary, population_size, seed,
-                       label=None):
+                       clinician_seed=None, label=None):
     """Write the JSON run manifest that makes this generation reproducible.
 
     File 04 used to build a stats dict, print it, return it, and drop it. That
@@ -1259,9 +1420,34 @@ def write_run_manifest(output_dir, generation, module_info, verification,
     distribution and missingness fraction the scores were drawn from. Two corpora
     generated from different holding values are indistinguishable by inspection.
 
+    Raises:
+        ValueError: if the seeds recorded by the run disagree with the seeds
+                    passed here. The manifest is the artifact a regeneration is
+                    driven from, so a manifest that names a seed the command did
+                    not carry is worse than no manifest -- it would send someone
+                    to reproduce a corpus that never existed. There is no
+                    recovery path: fix the caller.
+
     Returns:
         dict: the manifest, as written.
     """
+    for name, argument in (("seed", seed), ("clinician_seed", clinician_seed)):
+        # .get with a sentinel, not .get(name): a generation dict that never
+        # reported the key is a different fault from one that reported None,
+        # and None is a legitimate value here (Synthea picked the seed).
+        reported = generation.get(name, "__absent__")
+        if reported == "__absent__":
+            raise ValueError(
+                f"generation result carries no {name!r}; write_run_manifest "
+                "cannot certify which seed the command ran with"
+            )
+        if reported != argument:
+            raise ValueError(
+                f"{name} mismatch: the Synthea command ran with {reported!r} but "
+                f"write_run_manifest was passed {argument!r}. The manifest would "
+                "name a seed that does not reproduce this corpus."
+            )
+
     manifest = {
         "manifest_version": 1,
         "label": label,
@@ -1273,11 +1459,30 @@ def write_run_manifest(output_dir, generation, module_info, verification,
             "min_age": MIN_AGE,
             "max_age": MAX_AGE,
             "state": STATE,
-            "seed": seed,
+            # "true" means the corpus contains no deceased patients by
+            # construction. A corpus generated with "false" has ~31% more
+            # bundles and ~58% of its cancer patients dead, so this is not a
+            # cosmetic difference between two manifests.
+            "only_alive_patients": ONLY_ALIVE_PATIENTS,
+            # Both Synthea seeds, read off the run rather than off this
+            # function's arguments (they are checked equal above). -s pins the
+            # population draw, -cs pins the clinician/provider population; they
+            # are independent generators, so a corpus is only reproducible with
+            # both. null means the run let Synthea pick that one and the corpus
+            # cannot be regenerated byte-for-byte.
+            "seed": generation["seed"],
+            "clinician_seed": generation["clinician_seed"],
             "years_of_history": YEARS,
             # Read off the run, not recomputed: the manifest must record the
-            # filter the command actually carried.
+            # filter the command actually carried. null means no -m was passed
+            # and Synthea's whole module set ran -- that is the current default,
+            # and it is NOT the same as "the filter was not recorded".
             "module_filter": generation.get("module_filter"),
+            "module_filter_note": (
+                "null = no -m argument. Every module in the JAR plus every "
+                "module under -d was loaded, so the corpus carries comorbidities "
+                "and concomitant medications, not oncology history alone."
+            ),
             "modules_dir": _relative_to_project(SYNTHEA_MODULES_DIR),
             "output_dir": _relative_to_project(output_dir),
             "export_fhir": EXPORT_FHIR,
@@ -1344,15 +1549,17 @@ def write_run_manifest(output_dir, generation, module_info, verification,
 #------------------------------------------------------------------------------
 
 
-def run_generation(population_size=None, output_dir=None, seed=None, label=None,
-                   force=False):
+def run_generation(population_size=None, output_dir=None, seed=None,
+                   clinician_seed=None, label=None, force=False):
     """Full pipeline: write module -> generate -> normalize -> verify -> manifest.
 
     Args:
         population_size: Defaults to POPULATION_SIZE.
         output_dir:      Defaults to OUTPUT_DIR_FULL (the LIVE corpus directory).
                          Pass a scratch directory to generate without touching it.
-        seed:            Synthea -s seed, or None.
+        seed:            Synthea -s population seed, or None.
+        clinician_seed:  Synthea -cs clinician seed, or None. Independent of
+                         -s; both are needed for a reproducible corpus.
         label:           Free-text label recorded in the manifest.
         force:           Generate into an output directory that already holds
                          bundles. See generate_synthea_patients().
@@ -1369,6 +1576,7 @@ def run_generation(population_size=None, output_dir=None, seed=None, label=None,
         population_size=population_size,
         output_dir=output_dir,
         seed=seed,
+        clinician_seed=clinician_seed,
         force=force,
     )
     if not generation["success"]:
@@ -1387,6 +1595,7 @@ def run_generation(population_size=None, output_dir=None, seed=None, label=None,
         ecog_summary=ecog_summary,
         population_size=population_size,
         seed=seed,
+        clinician_seed=clinician_seed,
         label=label,
     )
 
@@ -1408,6 +1617,11 @@ if __name__ == "__main__":
                              "corpus directory; pass a scratch path to leave it alone.")
     parser.add_argument("--seed", type=int, default=None,
                         help="Synthea -s population seed (default: Synthea's own)")
+    parser.add_argument("--clinician-seed", type=int, default=None,
+                        help="Synthea -cs clinician seed (default: Synthea's own). "
+                             "Independent of --seed: Synthea draws its clinician / "
+                             "provider population from a separate generator, so a "
+                             "corpus is only reproducible when both are pinned.")
     parser.add_argument("--label", default=None,
                         help="Free-text label recorded in the run manifest")
     parser.add_argument("--module-only", action="store_true",
@@ -1434,6 +1648,7 @@ if __name__ == "__main__":
                 population_size=args.population,
                 output_dir=args.output_dir,
                 seed=args.seed,
+                clinician_seed=args.clinician_seed,
                 label=args.label,
                 force=args.force,
             )

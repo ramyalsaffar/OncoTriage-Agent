@@ -184,7 +184,72 @@ with open(_code_dir + "14- Database Logger.py") as _fh:
 # ===========================================================================
 
 # A date far enough from every birthDate below that a one-day error is visible.
+#
+# REF IS PINNED ON PURPOSE and must not be derived. Section 4 passes it
+# explicitly to _calculate_age() to test the birthday boundary exactly, which
+# only works against a date that never moves. Sections that do NOT pass a
+# reference get theirs from DATA_SNAPSHOT_DATE instead, and their expectations
+# have to move with it -- see _expected_age_for() below.
 REF = date(2026, 3, 11)
+
+
+# ---------------------------------------------------------------------------
+# THE RULE THIS FILE FOLLOWS
+# ---------------------------------------------------------------------------
+# Any assertion whose age or precision comes out of _parse_demographics() or
+# parse_fhir_bundle() is computed against DATA_SNAPSHOT_DATE (03- Config.py),
+# so it MOVES when the corpus is regenerated. Those expectations are derived
+# from get_age_reference_date().
+#
+# Any assertion that passes REF explicitly is pinned deliberately and stays a
+# literal.
+#
+# This distinction was not made until item 18e. Sections 5, 7 and 9 hardcoded
+# ages of 59 and 60 that were correct against DATA_SNAPSHOT_DATE = 2026-03-11;
+# when item 18b regenerated the corpus and moved the constant to 2026-08-03,
+# four assertions began failing on data that was entirely correct. A test that
+# goes red every time the corpus is legitimately regenerated trains people to
+# ignore it.
+
+
+def _expected_age_for(year: int, month: int = None, day: int = None) -> int:
+    """
+    Age the parser must report, at the CURRENT reference date, for a birth date
+    with the given components.
+
+    Missing components are imputed from the same anchors parse_partial_date()
+    applies (PARTIAL_DATE_ANCHOR_MONTH / _DAY, 02- Utility Functions.py), so a
+    year-only birthDate is anchored mid-year exactly as the parser anchors it.
+
+    Deliberately computed with plain arithmetic rather than by calling
+    parse_partial_date() or _calculate_age(): an expected value produced by the
+    function under test agrees with that function by construction and proves
+    nothing. The anchors are read from the config, but the age is not.
+    """
+    reference = get_age_reference_date()
+    birth_month = PARTIAL_DATE_ANCHOR_MONTH if month is None else month
+    birth_day   = PARTIAL_DATE_ANCHOR_DAY   if day   is None else day
+
+    age = reference.year - year
+    if (reference.month, reference.day) < (birth_month, birth_day):
+        age -= 1          # birthday has not happened yet this year
+    return age
+
+
+def _birth_date_after_reference() -> str:
+    """
+    A birthDate guaranteed to sit AFTER the reference date, whatever the
+    reference date is.
+
+    Was the literal "2030-01-01", which was only "after" for as long as
+    DATA_SNAPSHOT_DATE stayed below it -- a silent expiry date on the test.
+    One day past the reference is the minimal such date and exercises the
+    boundary rather than a value far away from it.
+
+    date.fromordinal(...+1) rather than timedelta: 01- Imports.py imports
+    `date` but not `timedelta`.
+    """
+    return date.fromordinal(get_age_reference_date().toordinal() + 1).isoformat()
 
 
 def patient_resource(birth_date, extensions=None) -> dict:
@@ -389,15 +454,20 @@ print("\n" + "=" * 70)
 print("5. _parse_demographics records precision and reference date")
 print("=" * 70)
 
+# RULE: DERIVED. _parse_demographics() takes no reference argument -- it uses
+# get_age_reference_date(), i.e. DATA_SNAPSHOT_DATE -- so every expected age
+# here follows the config and comes from _expected_age_for(). The precisions
+# are properties of the birthDate string alone and stay literal.
+
 _DEMOGRAPHIC_CASES = [
     # (birthDate, expected age, expected precision)
-    ("1966-03-11",             60,   "day"),
-    ("1966-03",                59,   "month"),
-    ("1966",                   59,   "year"),
-    ("1966-03-11T00:00:00Z",   60,   "day"),
+    ("1966-03-11",             _expected_age_for(1966, 3, 11), "day"),
+    ("1966-03",                _expected_age_for(1966, 3),     "month"),
+    ("1966",                   _expected_age_for(1966),        "year"),
+    ("1966-03-11T00:00:00Z",   _expected_age_for(1966, 3, 11), "day"),
     ("",                       None, "missing"),
     ("unknown",                None, "unparseable"),
-    ("2030-01-01",             None, "after_reference"),
+    (_birth_date_after_reference(), None, "after_reference"),
 ]
 
 for _bd, _expected_age, _expected_precision in _DEMOGRAPHIC_CASES:
@@ -507,6 +577,9 @@ print("\n" + "=" * 70)
 print("7. parse_fhir_bundle survives a Safe Harbor year-only birthDate")
 print("=" * 70)
 
+# RULE: DERIVED. parse_fhir_bundle() reaches _parse_demographics(), which
+# anchors on DATA_SNAPSHOT_DATE, so the expected age below follows the config.
+
 _BUNDLE_PATH = os.path.join(_TMP_DIR, "year_only_bundle.json")
 with open(_BUNDLE_PATH, "w") as _fh:
     json.dump({
@@ -533,7 +606,7 @@ _parsed_bundle = check_no_raise("year-only bundle parses instead of raising",
                                 lambda: parse_fhir_bundle(_BUNDLE_PATH))
 if _parsed_bundle is not None:
     _d = _parsed_bundle["demographics"]
-    check("  bundle age is usable", _d["age"], 59)
+    check("  bundle age is usable", _d["age"], _expected_age_for(1966))
     check("  bundle precision is 'year'", _d["birth_date_precision"], "year")
     check("  bundle reference date recorded", _d["age_reference_date"], DATA_SNAPSHOT_DATE)
     check("  bundle race read past the leading text sub-extension", _d["race"], "White")
@@ -594,6 +667,12 @@ print("\n" + "=" * 70)
 print("9. log_inference writes the age provenance columns")
 print("=" * 70)
 
+# RULE: DERIVED. The row under test is built from _parse_demographics() on a
+# year-only birthDate, so inferences.age is anchored on DATA_SNAPSHOT_DATE and
+# the expectation follows the config. age_reference_date and
+# birth_date_precision are already asserted against DATA_SNAPSHOT_DATE and a
+# literal precision respectively, which is correct and unchanged.
+
 _LOGGED_PATIENT = {
     "patient_id":   "birthdate-test-patient",
     "demographics": _parse_demographics(patient_resource("1966", [
@@ -636,7 +715,8 @@ if _row is not None:
           _row["age_reference_date"], DATA_SNAPSHOT_DATE)
     check("inferences.birth_date_precision recorded",
           _row["birth_date_precision"], "year")
-    check("the logged age is the snapshot-anchored age", _row["age"], 59)
+    check("the logged age is the snapshot-anchored age",
+          _row["age"], _expected_age_for(1966))
     check("the logged race came from the OMB category", _row["race"], "White")
 
 # A result dict that never reported keeps NULL: "not recorded" must not read as

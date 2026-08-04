@@ -55,7 +55,23 @@ EXPANSION_TEMPERATURE = 0  # Deterministic query expansion
 # whenever "04- FHIR Generate Data.py" regenerates the corpus -- ages shift by
 # the gap, which is the honest consequence of new data, and every affected run
 # is identifiable by the age_reference_date column in inferences.db.
-DATA_SNAPSHOT_DATE = "2026-03-11"
+#
+# 2026-08-03: the corpus was regenerated on this date by
+# "04- FHIR Generate Data.py" -- seed 20260805, clinician seed 20260806,
+# -p 12500, no -m, ages 18-100, generate.only_alive_patients=true. This is the
+# SECOND regeneration on this date; the first (seeds 20260803 / 20260804) was
+# discarded because File 08 classified SNOMED 408512008 "Body mass index 40+"
+# as a primary lung cancer and File 05 did not yet drop deceased patients, so
+# that cohort held 48 obese non-cancer patients and was 57.7% dead. Runs against
+# the two are NOT separable by this date -- they share it. They are separable by
+# inferences.qdrant_collection / patient_data_hash and by the run manifest's
+# seeds, and any run logged before 2026-08-03 20:49 PDT is against the discarded
+# corpus.
+#
+# Synthea simulates up to the moment of the run, so the newest observation is
+# dated on this day and nothing in the corpus postdates the reference; verified
+# empirically -- 0 patients resolve to 'all_after_reference_date'.
+DATA_SNAPSHOT_DATE = "2026-08-03"
 
 
 # Clinical trials main characteristics for scraping

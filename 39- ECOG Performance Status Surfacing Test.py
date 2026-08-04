@@ -276,8 +276,20 @@ _before_2 = {"value": 2, "value_shape": "valueInteger", "unit": None,
              "date": "2024-06-15", "loinc": "89247-1"}
 _before_3 = {"value": 1, "value_shape": "valueInteger", "unit": None,
              "date": "2021-03-03", "loinc": "89247-1"}
+# DERIVED, not literal. This fixture's whole job is to sit AFTER the reference
+# date, and the reference date is DATA_SNAPSHOT_DATE (03- Config.py), which
+# moves every time the corpus is regenerated. It was "2026-05-14", chosen when
+# DATA_SNAPSHOT_DATE was 2026-03-11; item 18b moved the constant to 2026-08-03
+# and the fixture silently became a BEFORE observation, failing eight
+# assertions in this section on behaviour that was entirely correct.
+#
+# One day past the reference is the minimal "after" and exercises the boundary
+# rather than a date far from it. date.fromordinal(...+1) rather than
+# timedelta: 01- Imports.py imports `date` but not `timedelta`.
+_AFTER_REFERENCE_DATE = date.fromordinal(_ref.toordinal() + 1).isoformat()
+
 _after = {"value": 4, "value_shape": "valueInteger", "unit": None,
-          "date": "2026-05-14", "loinc": "89247-1"}
+          "date": _AFTER_REFERENCE_DATE, "loinc": "89247-1"}
 _undated = {"value": 3, "value_shape": "valueInteger", "unit": None,
             "date": "unknown", "loinc": "89247-1"}
 
@@ -517,9 +529,19 @@ else:
           all(f"- ECOG performance status: {s['value']} (" in _create_patient_summary(p)
               for _, p, s in _scored[:25]), True)
 
-    # This corpus was generated on 2026-08-03 while DATA_SNAPSHOT_DATE is
-    # 2026-03-11, so a small number of observations legitimately postdate the
-    # snapshot. That is the real-data exercise of the after-reference path.
+    # Whether any real observation postdates the reference depends on the gap
+    # between the corpus's generation date and DATA_SNAPSHOT_DATE, so this
+    # block is CONDITIONAL and neither outcome is a failure.
+    #
+    # It stated "this corpus was generated on 2026-08-03 while
+    # DATA_SNAPSHOT_DATE is 2026-03-11" -- true when written, false as soon as
+    # item 18b set the constant to the generation date. Naming the current
+    # value of a constant in a comment is the same defect this file's _after
+    # fixture had: a literal that expires silently.
+    #
+    # When the corpus is generated ON the snapshot date -- the normal case
+    # after a regeneration -- nothing postdates it, _unusable_real is empty,
+    # and the else branch reports that rather than asserting on nothing.
     if _unusable_real:
         _uname, _upatient, _ustatus = _unusable_real[0]
         check("real present-but-unusable patient names the reason",

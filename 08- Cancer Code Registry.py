@@ -109,90 +109,150 @@ logger = logging.getLogger(__name__)
 #
 # Full SNOMED hierarchy traversal requires a live terminology server with a
 # UMLS license. Without it, we use a curated set covering all Synthea cancer
-# module codes (verified from Synthea GitHub + Google Cloud FHIR lab) plus
-# mCODE root codes and common real-EHR SNOMED codes.
+# module codes plus mCODE root codes and real-EHR SNOMED codes.
 # The ICD-10-CM layer covers real EHR data exhaustively (1,609 codes).
+#
+# EVERY CODE BELOW HAS BEEN VERIFIED, and the display after each "#" is the
+# SNOMED CT FULLY SPECIFIED NAME, copied from the source, not paraphrased.
+#
+# Two independent sources, because either alone misses a class of defect:
+#
+#   UMLS Metathesaurus 2025AB, MRCONSO.RRF, SAB=SNOMEDCT_US -- 532,287 distinct
+#   codes including retired concepts (SUPPRESS=O). This answers "is this a real
+#   SNOMED concept and what does it actually mean". It is the file already on
+#   disk for File 09's SNOMED->CUI->MeSH crosswalk, so the check is repeatable
+#   without a terminology server.
+#
+#   The Synthea JAR's own module JSONs. This answers "can this corpus ever emit
+#   the code", which UMLS cannot, and it is what caught the defect below that a
+#   name check alone would have missed.
+#
+# WHAT THE AUDIT FOUND, and why the verification standard is now this strict:
+#
+#   408512008 was listed as "Small cell carcinoma of lung, limited stage". It is
+#   "Body mass index 40+ - severely obese (finding)", and Synthea's
+#   wellness_encounters module emits it as a Condition. Every severely obese
+#   patient in the corpus was therefore classified as having a primary lung
+#   cancer. In the 2026-08-03 regeneration this put 48 non-cancer patients into
+#   a 1,000-patient cancer cohort (4.8%) -- they retrieved oncology trials and
+#   were scored against them. A transcription error in a comment, invisible to
+#   every test, for as long as the corpus contained no obese patients (the old
+#   "*cancer*" module filter excluded the modules that emit it).
+#
+#   408513003 was listed as "Small cell carcinoma of lung, extensive stage". It
+#   is "Main spoken language Brawa (finding)".
+#
+#   22 further codes are absent from SNOMEDCT_US entirely -- not retired,
+#   ABSENT -- so they are not SNOMED identifiers at all. They matched nothing
+#   and could only ever have been dead weight, but they are removed rather than
+#   left, because a set that contains 22 invented identifiers cannot be audited
+#   by inspection. Example: "Diffuse non-Hodgkin's lymphoma" was listed as
+#   20312006; SNOMED's code for it is 109962001.
+#
+#   Six codes Synthea emits on EVERY stage 2/3/4 lung cancer patient were
+#   missing, so a stage IV NSCLC condition classified as 'unclassified' -> not
+#   cancer. Those patients only stayed in the cohort because Synthea's lung
+#   module also records 254637007 / 254632001 alongside the stage code. That is
+#   luck, not design, and it is fixed here.
+#
+# To re-run this audit: for each code, grep MRCONSO for
+# SAB=SNOMEDCT_US and TTY=FN, and grep the JAR's modules/ for the code string.
+# A code whose FN disagrees with its comment is a defect, not a wording choice.
 
 _SNOMED_PRIMARY: FrozenSet[str] = frozenset({
-    # ── Lung (Synthea lung_cancer.json)
-    "254637007",   # Non-small cell carcinoma of lung  ← Synthea canonical
-    "424132000",   # Non-small cell lung cancer, NOS
-    "413448000",   # Adenocarcinoma of lung
-    "363358000",   # Malignant tumor of lung
-    "254632001",   # Small cell carcinoma of lung  ← Synthea canonical (confirmed MalaCards/Orphanet)
-    "1285369004",  # Small cell carcinoma of lung  ← SNOMED CT newer code
-    "67811000119102",  # Primary small cell malignant neoplasm of lung, TNM stage 1
-    "408512008",   # Small cell carcinoma of lung, limited stage
-    "408513003",   # Small cell carcinoma of lung, extensive stage
-    # ── Breast
-    "254837009",   # Malignant neoplasm of breast
-    "372064008",   # Malignant neoplasm of female breast
-    "408643008",   # Infiltrating duct carcinoma of breast
-    "372098003",   # Malignant neoplasm of male breast
-    "109375007",   # Carcinoma of breast, Stage 1
-    "109376008",   # Carcinoma of breast, Stage 2
-    "109377004",   # Carcinoma of breast, Stage 3
-    "109378009",   # Carcinoma of breast, Stage 4
-    # ── Colorectal (Synthea colorectal_cancer.json)
-    "363406005",   # Malignant neoplasm of colon
-    "363414004",   # Malignant neoplasm of rectum
-    "109841005",   # Carcinoma of colon
-    "109838007",   # Overlapping malignant neoplasm of colon
-    "363415003",   # Malignant neoplasm of rectosigmoid junction
-    # ── Prostate
-    "399068003",   # Malignant tumor of prostate
-    "126906006",   # Neoplasm of prostate
-    # ── Pancreas
-    "363418001",   # Malignant neoplasm of pancreas
-    "372003004",   # Malignant tumor of pancreas
-    # ── Ovarian / gynecologic
-    "363443007",   # Malignant tumor of ovary
-    "254907004",   # Serous cystadenocarcinoma of ovary
-    "363458008",   # Malignant tumor of uterus
-    "372016000",   # Malignant tumor of cervix
-    # ── Hematologic
-    "91861009",    # Acute myeloid leukemia
-    "413522009",   # Acute lymphoblastic leukemia
-    "92814006",    # Chronic lymphocytic leukemia
-    "92818009",    # Chronic myeloid leukemia
-    "109989006",   # Multiple myeloma
-    "118600007",   # Malignant lymphoma
-    "82591004",    # Hodgkins disease
-    "20312006",    # Diffuse non-Hodgkins lymphoma
-    # ── Skin / melanoma
-    "372244006",   # Malignant melanoma
-    "254654002",   # Malignant melanoma of skin
-    # ── Liver
-    "109840006",   # Carcinoma of liver
-    # ── Kidney / urinary
-    "363516000",   # Malignant tumor of kidney
-    "363518004",   # Malignant tumor of bladder
-    # ── Thyroid
-    "363478007",   # Malignant neoplasm of thyroid
-    # ── CNS
-    "393563007",   # Malignant neoplasm of brain
-    "41656004",    # Glioblastoma multiforme
-    "126952004",   # Neoplasm of brain
-    # ── Head and neck
-    "363400000",   # Malignant neoplasm of oropharynx
-    "363399004",   # Malignant neoplasm of oral cavity
-    # ── Testicular
-    "363512001",   # Malignant neoplasm of testis
-    # ── mCODE root codes
-    "363346000",   # Malignant neoplastic disease  ← mCODE SNOMED root
-    "93761005",    # Primary malignant neoplasm
-    "415068001",   # Primary malignant neoplasm of body
+    # ── Lung — CONFIRMED, emitted as Conditions by Synthea lung_cancer.json /
+    #    veteran_lung_cancer.json. The stage 2/3/4 codes were absent before this
+    #    audit; without them a stage IV lung cancer is not a cancer.
+    "254637007",       # Non-small cell lung cancer (disorder)
+    "424132000",       # Non-small cell carcinoma of lung, TNM stage 1 (disorder)
+    "425048006",       # Non-small cell carcinoma of lung, TNM stage 2 (disorder)
+    "422968005",       # Non-small cell carcinoma of lung, TNM stage 3 (disorder)
+    "423121009",       # Non-small cell carcinoma of lung, TNM stage 4 (disorder)
+    "254632001",       # Small cell carcinoma of lung (disorder)
+    "67811000119102",  # Primary small cell malignant neoplasm of lung, TNM stage 1 (disorder)
+    "67821000119109",  # Primary small cell malignant neoplasm of lung, TNM stage 2 (disorder)
+    "67831000119107",  # Primary small cell malignant neoplasm of lung, TNM stage 3 (disorder)
+    "67841000119103",  # Primary small cell malignant neoplasm of lung, TNM stage 4 (disorder)
+    # NOT FOUND in Synthea, kept as REAL-EHR codes (valid SNOMED FN verified):
+    "363358000",       # Malignant neoplasm of lung (disorder)
+
+    # ── Breast — 254837009 CONFIRMED in Synthea breast_cancer.json.
+    "254837009",       # Malignant neoplasm of breast (disorder)
+    # NOT FOUND in Synthea, kept as REAL-EHR codes:
+    "408643008",       # Infiltrating duct carcinoma of breast (disorder)
+    "372064008",       # Malignant neoplasm of female breast (disorder)
+                       #   RETIRED concept (UMLS TTY=OAF, no active FN). Kept
+                       #   deliberately: legacy real-EHR records still carry it,
+                       #   and admitting a retired code costs nothing here.
+
+    # ── Colorectal — CONFIRMED in Synthea colorectal_cancer.json.
+    "363406005",       # Malignant neoplasm of colon (disorder)
+    "109838007",       # Overlapping malignant neoplasm of colon (disorder)
+    "93761005",        # Primary malignant neoplasm of colon (disorder)
+                       #   NOTE: colon-specific. It was commented "Primary
+                       #   malignant neoplasm" and grouped under "mCODE root
+                       #   codes", which read as a site-agnostic root. It is not.
+    # NOT FOUND in Synthea, kept as REAL-EHR codes:
+    "363414004",       # Malignant neoplasm of rectosigmoid junction (disorder)
+                       #   (was commented "rectum" — wrong site, right axis)
+    "363415003",       # Malignant neoplasm of biliary tract (disorder)
+                       #   (was commented "rectosigmoid junction" — wrong site)
+
+    # ── Prostate — 126906006 CONFIRMED in Synthea veteran_prostate_cancer.json.
+    "126906006",       # Neoplasm of prostate (disorder)
+    # NOT FOUND in Synthea, kept as a REAL-EHR code:
+    "399068003",       # Malignant neoplasm of prostate (disorder)
+
+    # ── Haematologic — 91861009 CONFIRMED in acute_myeloid_leukemia.json,
+    #    109989006 CONFIRMED in trigger_bone_marrow_transplant.json (a
+    #    non-oncology-named module that nonetheless diagnoses a malignancy).
+    "91861009",        # Acute myeloid leukemia (disorder)
+    "109989006",       # Multiple myeloma (disorder)
+    # NOT FOUND in Synthea, kept as REAL-EHR codes:
+    "92814006",        # Chronic lymphoid leukemia, disease (disorder)
+    "92818009",        # Chronic myeloid leukemia (disorder)
+    "118600007",       # Malignant lymphoma (disorder)
+
+    # ── Other solid tumours. NONE are emitted by Synthea — this JAR only
+    #    produces lung, breast, colorectal, prostate, AML and myeloma. All are
+    #    kept as REAL-EHR codes, each verified against SNOMEDCT_US FN.
+    "363418001",       # Malignant neoplasm of pancreas (disorder)
+    "372003004",       # Primary malignant neoplasm of pancreas (disorder)
+    "363443007",       # Malignant neoplasm of ovary (disorder)
+    "363478007",       # Malignant neoplasm of thyroid gland (disorder)
+    "372244006",       # Malignant melanoma (disorder)
+    "393563007",       # Glioblastoma multiforme (disorder)
+                       #   (was commented "Malignant neoplasm of brain" — the
+                       #   code is a primary brain malignancy either way)
+    "126952004",       # Neoplasm of brain (disorder)
+
+    # ── mCODE root codes. NOT FOUND in Synthea by construction: Synthea codes
+    #    the specific disease, never the root. Kept because mCODE-conformant
+    #    real records use them and because the ICD-10 layer has no equivalent.
+    "363346000",       # Malignant neoplastic disease (disorder)  ← mCODE root
 })
 
 # SNOMED secondary/metastatic — excluded from primary selection.
 # Per mCODE: exclude all descendants of 128462008.
+#
+# Same verification standard as _SNOMED_PRIMARY: displays are SNOMEDCT_US fully
+# specified names. Three of these carried the wrong SITE in their comment
+# (liver/lung/brain against bone/brain/bronchus); the site was wrong but the
+# axis was right, so all three stay and only the comments changed. One entry,
+# 315006, was not a SNOMED code at all and is removed.
 _SNOMED_SECONDARY: FrozenSet[str] = frozenset({
-    "128462008",   # Secondary malignant neoplastic disease (mCODE exclusion root)
-    "94260004",    # Secondary malignant neoplasm of colon
-    "94222008",    # Secondary malignant neoplasm of liver
-    "94225005",    # Secondary malignant neoplasm of lung
-    "94229004",    # Secondary malignant neoplasm of brain
-    "315006",      # Secondary malignant neoplasm of bone
+    "128462008",   # Metastatic malignant neoplasm (disorder)  ← mCODE exclusion root
+    # CONFIRMED in Synthea:
+    "94260004",    # Metastatic malignant neoplasm to colon (disorder)
+                   #   colorectal_cancer.json, stage IV
+    "94503003",    # Metastatic malignant neoplasm to prostate (disorder)
+                   #   veteran_prostate_cancer.json. ADDED by this audit: Synthea
+                   #   emits it and it was in neither set, so it fell through to
+                   #   'unclassified' instead of being counted as a rejection.
+    # NOT FOUND in Synthea, kept as REAL-EHR codes:
+    "94222008",    # Metastatic malignant neoplasm to bone (disorder)
+    "94225005",    # Metastatic malignant neoplasm to brain (disorder)
+    "94229004",    # Metastatic malignant neoplasm to bronchus of left upper lobe (disorder)
 })
 
 # Display-term fallback — fires ONLY when code is missing/unknown.
@@ -234,6 +294,37 @@ _NON_INVASIVE_DISPLAY_TERMS: Tuple[str, ...] = (
     "premalignant", "pre-malignant",
 )
 
+# Which system_key values may be looked up in which code sets.
+#
+# These are facts about the system_key vocabulary, not tunables, so they live
+# here as named constants. The two non-system values themselves come from
+# '01- Imports.py' (SYSTEM_KEY_ABSENT / SYSTEM_KEY_UNRECOGNIZED) rather than
+# being spelled again here: File 07 produces them, this file branches on them,
+# and one literal in two files is two literals the day one of them is renamed.
+#
+# SYSTEM_KEY_ABSENT (Coding.system absent) is in BOTH sets, deliberately. It is not
+# laxity: is_primary_cancer()'s own backward-compatible path manufactures
+# {"system_key": "unknown", "code": <bare code>} when a caller hands it a
+# condition with no "codings" key at all, and File 06 and File 13 both rely on
+# that path. Refusing to look "unknown" up would silently stop classifying
+# every caller that passes a bare code.
+#
+# SYSTEM_KEY_UNRECOGNIZED (Coding.system present but not a URI File 07 knows)
+# is in NEITHER. The system field is a positive statement that the code belongs
+# to some other vocabulary, so matching it against SNOMED or ICD-10 is comparing
+# digits, not concepts. That comparison is how MEDCIN 315006 --
+# "antiphospholipid antibody syndrome with hemorrhagic disorder" -- sat in
+# _SNOMED_SECONDARY as "Secondary malignant neoplasm of bone" without anything
+# failing.
+#
+# The recognised-but-irrelevant keys (loinc, rxnorm, cpt, hcpcs) are in neither
+# set either, and are counted separately from the unrecognised ones: a LOINC
+# code reaching a cancer lookup is a routing mistake, a proprietary code
+# reaching one is ordinary real-EHR input.
+_SNOMED_CONSULT_KEYS: FrozenSet[str] = frozenset({"snomed", SYSTEM_KEY_ABSENT})
+_ICD10_CONSULT_KEYS:  FrozenSet[str] = frozenset({"icd10cm", "icd10", SYSTEM_KEY_ABSENT})
+
+
 # Which classification path decided a condition. Nothing is silently
 # recovered or silently dropped: every terminal decision in
 # is_primary_cancer() increments exactly one counter, readable after a run
@@ -251,6 +342,27 @@ _CANCER_CLASSIFICATION_COUNTS: Dict[str, int] = {
     "rejected_secondary_display":     0,  # layer 3 — metastatic wording
     "rejected_non_invasive_display":  0,  # layer 3 — benign/in-situ wording
     "unclassified":                   0,  # coded, but no layer matched
+
+    # --- system-awareness instrumentation -------------------------------
+    # Counted PER CONDITION, at the moment a code match decides the verdict,
+    # when the deciding coding carried no system at all (system_key
+    # "unknown"). Such a match is a digits-only match: nothing asserted which
+    # vocabulary the code came from. A corpus where this is large is a corpus
+    # whose classifications rest on the permissive path.
+    "decided_on_unknown_system":      0,
+
+    # Counted PER CODING, once, for a coding that was consulted against NO set
+    # because its system is present and unrecognised (SYSTEM_KEY_UNRECOGNIZED).
+    # Before the
+    # system_key gate these codings WERE looked up in the SNOMED and ICD-10
+    # sets, purely on their digits.
+    "skipped_unmapped_coding":        0,
+
+    # Counted PER CODING, once, for a coding whose system IS recognised but is
+    # not a cancer-code system (loinc, rxnorm, cpt, hcpcs). Kept separate from
+    # skipped_unmapped_coding because this one means a non-Condition code
+    # reached a Condition classifier -- a routing bug, not ordinary input.
+    "skipped_other_system_coding":    0,
 }
 
 
@@ -273,28 +385,65 @@ _CLINICAL_STATUS_PRIORITY: Dict[str, int] = {
     "inactive": 4, "resolved": 5, "unknown": 6,
 }
 
-# ICD-10-CM alpha-suffix codes that cannot be parsed by int(c[1:3]).
-# C4A — Merkel cell carcinoma        → PRIMARY   (33 codes)
-# C7A — Malignant carcinoid tumors   → PRIMARY   (28 codes)
-# C7B — Secondary neuroendocrine     → SECONDARY (10 codes)
+# ---------------------------------------------------------------------------
+# ICD-10-CM hand-curated inputs
+# ---------------------------------------------------------------------------
+# Five category prefixes and four block boundaries. They are the ONLY ICD-10
+# facts in this file a human typed -- everything else is derived from the
+# icd10-cm release at import time by _build_icd10_cancer_sets(). They therefore
+# carry exactly the gap _SNOMED_PRIMARY carried before it was audited: a
+# category assigned to the wrong set, or a boundary off by one, is a comment
+# nothing checks.
+#
+# '42- Cancer Code Registry Audit Test.py' now checks all nine, so the CATEGORY
+# LINES BELOW ARE PARSED BY THAT TEST and their format is fixed:
+#
+#       #   <CATEGORY> = <official title> -> <SET>
+#
+# with SET one of PRIMARY / SECONDARY / NON_INVASIVE. The title is compared
+# against the installed icd10-cm release and against UMLS, and the SET against
+# the constant the category actually appears in. Edit the title or the set and
+# the test fails; add a category without a line and the test fails.
+#
+# Alpha-suffix categories. int(c[1:3]) cannot parse these, so the block-range
+# logic in _build_icd10_cancer_sets() never sees them and each has to be
+# assigned by hand:
+#
+#   C4A = Merkel cell carcinoma -> PRIMARY
+#   C7A = Malignant neuroendocrine tumors -> PRIMARY
+#   C7B = Secondary neuroendocrine tumors -> SECONDARY
+#   D3A = Benign neuroendocrine tumors -> NON_INVASIVE
+#
+# C7A was commented "Malignant carcinoid tumors" until this audit. That is the
+# ICD-9 wording; ICD-10-CM titles the category "Malignant neuroendocrine
+# tumors". The set assignment was right and the classification never changed,
+# but the comment was describing a different revision of the standard.
+#
+# D3A takes the same NON_INVASIVE decision as the rest of D00-D49. Before it was
+# listed it fell through as unparsed and was dropped entirely.
 _ICD10_ALPHA_PRIMARY: FrozenSet[str] = frozenset({"C4A", "C7A"})
 _ICD10_ALPHA_SECONDARY: FrozenSet[str] = frozenset({"C7B"})
-
-# D3A — Benign neuroendocrine tumors → NON-INVASIVE, same decision as the
-# rest of D00-D49. Alpha-suffixed, so int(c[1:3]) cannot classify it; before
-# this it was counted as unparsed and dropped.
 _ICD10_ALPHA_NON_INVASIVE: FrozenSet[str] = frozenset({"D3A"})
 
-# Codes that ICD-10-CM 2024 defines but the icd10-cm package's table omits.
-# C97 (malignant neoplasms of independent multiple primary sites) is absent
-# from icd10.codes entirely — verified against the installed release — so
-# widening the block range is not enough to admit it and it is seeded here.
-# Seeding is logged in _build_icd10_cancer_sets(); if a later package
-# release adds C97, the seed becomes a no-op and the log says so.
+# Codes ICD-10-CM defines that the icd10-cm package's table omits:
+#
+#   C97 = Malignant neoplasms of independent (primary) multiple sites -> PRIMARY
+#
+# C97 is absent from icd10.codes entirely -- the installed release's C
+# categories stop at C96 -- so widening the block range cannot admit it and it
+# is seeded. Seeding is logged in _build_icd10_cancer_sets(); if a later package
+# release adds C97 the seed becomes a no-op and the log says so.
+#
+# It is a PRIMARY code, not a secondary one: a patient with several independent
+# primary tumours, not a metastasis. Note for anyone re-verifying it -- C97 is
+# also absent from UMLS under SAB=ICD10CM (that subset stops at C96 too), and is
+# confirmed instead under SAB=ICD10, the WHO edition. File 42 records which
+# source confirmed each category for exactly this reason.
 _ICD10_SEED_PRIMARY: FrozenSet[str] = frozenset({"C97"})
 
-# ICD-10-CM chapter 2 block boundaries (CMS FY2024). External-standard
-# facts, so they stay here as named constants rather than moving to config.
+# ICD-10-CM chapter 2 block boundaries (CMS FY2024). External-standard facts,
+# so they stay here as named constants rather than moving to config. All four
+# are asserted against the installed release by File 42.
 _ICD10_C_BLOCK_MAX          = 97   # C00-C97 is the whole malignant range
 _ICD10_C_SECONDARY_LO       = 77   # C77-C79 secondary / metastatic sites
 _ICD10_C_SECONDARY_HI       = 79
@@ -502,12 +651,38 @@ class CancerCodeRegistry:
         the best-selected code. A condition is primary cancer if ANY coding matches
         a primary cancer set and NONE of its codings match a secondary set.
 
-        Detection layers (applied per coding):
+        SYSTEM-AWARE. Every code lookup is gated on the coding's system_key, so
+        a code is only ever compared against the code system it came from:
+
+            system_key            SNOMED sets    ICD-10 sets
+            ------------------    -----------    -----------
+            "snomed"              consulted      no
+            "icd10cm" / "icd10"   no             consulted
+            ABSENT                consulted      consulted    (system absent)
+            UNRECOGNIZED          no             no           (system present,
+                                                                not recognised)
+            loinc/rxnorm/cpt/...  no             no
+
+        Layers 1 and 2 used to compare c_code against both sets without ever
+        reading system_key, so any code that happened to share digits with a
+        SNOMED concept id matched it. That is a digits-only match across
+        unrelated vocabularies, and it is how MEDCIN 315006 lived in the SNOMED
+        secondary set undetected. "unknown" stays permissive because this
+        method's own backward-compatible path (below) manufactures it for a
+        bare code with no system, and File 06 and File 13 both depend on that.
+
+        Detection layers (applied per coding, subject to the gate above):
           Layer 1 -- SNOMED exact match   : Synthea + SNOMED-coded real EHRs
           Layer 2 -- ICD-10-CM match      : real EHRs (handles with/without dots)
 
         Display fallback (Layer 3): fires only when ALL codings are absent,
         unknown, or unrecognized. Uses morphology terms in display text.
+
+        has_recognized_code is set by ANY non-empty code, INCLUDING one the
+        system gate skipped. A condition carrying a proprietary code is not an
+        uncoded condition, so it must not fall through to the display-term
+        fallback; keeping the flag system-blind keeps Layer 3 as conservative
+        as it was.
 
         Hard exclusions, applied to ALL codings before any primary match:
           - secondary/metastatic codes (a metastasis, not a primary)
@@ -534,45 +709,93 @@ class CancerCodeRegistry:
         # If no multi-coding data, fall back to single code field (backward compat)
         if not codings:
             code = (condition.get("code") or "").strip()
-            codings = [{"system_key": "unknown", "code": code, "display": display}]
+            codings = [{"system_key": SYSTEM_KEY_ABSENT, "code": code, "display": display}]
+
+        # Pass 0: resolve each coding's system ONCE, and count the codings the
+        # system gate will refuse to look up.
+        #
+        # Done here rather than inside Pass 1 and Pass 2 for two reasons: the
+        # two passes would otherwise resolve and count the same coding twice,
+        # and Pass 1 can return early, which would leave the skip counters
+        # dependent on which verdict was reached. Every coding is accounted for
+        # before any decision is made.
+        prepared = []
+        for c in codings:
+            c_code = (c.get("code") or "").strip()
+            c_key = (c.get("system_key") or SYSTEM_KEY_ABSENT).strip().lower()
+            consult_snomed = c_key in _SNOMED_CONSULT_KEYS
+            consult_icd10 = c_key in _ICD10_CONSULT_KEYS
+
+            if c_code and not (consult_snomed or consult_icd10):
+                if c_key == SYSTEM_KEY_UNRECOGNIZED:
+                    _CANCER_CLASSIFICATION_COUNTS["skipped_unmapped_coding"] += 1
+                else:
+                    _CANCER_CLASSIFICATION_COUNTS["skipped_other_system_coding"] += 1
+                logger.debug(
+                    f"Code {c_code!r} not consulted: system_key {c_key!r} is "
+                    f"neither a SNOMED nor an ICD-10 system"
+                )
+
+            prepared.append({
+                "code":           c_code,
+                "norm":           c_code.upper().replace(".", ""),
+                "key":            c_key,
+                "consult_snomed": consult_snomed,
+                "consult_icd10":  consult_icd10,
+            })
+
+        def _note_unknown(entry):
+            """Record that this verdict rested on a coding with no system."""
+            if entry["key"] == SYSTEM_KEY_ABSENT:
+                _CANCER_CLASSIFICATION_COUNTS["decided_on_unknown_system"] += 1
 
         # Pass 1: Hard exclude if ANY coding is secondary/metastatic or
         # non-invasive. A single such code decides the condition, even if
         # another coding maps to a primary site.
-        for c in codings:
-            c_code = (c.get("code") or "").strip()
-            c_norm = c_code.upper().replace(".", "")
-            if c_norm in self._icd10_secondary_norm or c_code in self.snomed_secondary:
+        for c in prepared:
+            if c["consult_snomed"] and c["code"] in self.snomed_secondary:
                 _CANCER_CLASSIFICATION_COUNTS["rejected_secondary_code"] += 1
-                logger.debug(f"Not primary — secondary/metastatic code {c_code!r}")
+                _note_unknown(c)
+                logger.debug(f"Not primary — secondary/metastatic code {c['code']!r}")
                 return False
-            if c_norm in self._icd10_non_invasive_norm:
+            if c["consult_icd10"] and c["norm"] in self._icd10_secondary_norm:
+                _CANCER_CLASSIFICATION_COUNTS["rejected_secondary_code"] += 1
+                _note_unknown(c)
+                logger.debug(f"Not primary — secondary/metastatic code {c['code']!r}")
+                return False
+            if c["consult_icd10"] and c["norm"] in self._icd10_non_invasive_norm:
                 _CANCER_CLASSIFICATION_COUNTS["rejected_non_invasive_code"] += 1
+                _note_unknown(c)
                 logger.debug(
                     f"Not primary — non-invasive (in-situ/benign/uncertain) "
-                    f"code {c_code!r}"
+                    f"code {c['code']!r}"
                 )
                 return False
 
         # Pass 2: Check if ANY coding matches a primary cancer set.
         has_recognized_code = False
-        for c in codings:
-            c_code = (c.get("code") or "").strip()
-            c_norm = c_code.upper().replace(".", "")
+        for c in prepared:
+            c_code = c["code"]
 
             if not c_code or c_code.lower() in ("unknown", "none"):
                 continue
 
+            # Set BEFORE the system gate, on purpose. A coding skipped for
+            # system mismatch is still a coded condition, and letting it reach
+            # the display-term fallback would make Layer 3 fire on input it was
+            # never meant to see.
             has_recognized_code = True
 
             # Layer 1: SNOMED exact match
-            if c_code in self.snomed_primary:
+            if c["consult_snomed"] and c_code in self.snomed_primary:
                 _CANCER_CLASSIFICATION_COUNTS["snomed_primary"] += 1
+                _note_unknown(c)
                 return True
 
             # Layer 2: ICD-10-CM normalized match
-            if c_norm in self._icd10_primary_norm:
+            if c["consult_icd10"] and c["norm"] in self._icd10_primary_norm:
                 _CANCER_CLASSIFICATION_COUNTS["icd10_primary"] += 1
+                _note_unknown(c)
                 return True
 
         # Pass 3: Display fallback -- only when no coding was recognized

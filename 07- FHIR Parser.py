@@ -113,6 +113,17 @@ _SYSTEM_URI_TO_KEY: Dict[str, str] = {
     "urn:oid:2.16.840.1.113883.6.285":              "hcpcs",
 }
 
+# The two system_key values that are NOT in the table above -- SYSTEM_KEY_ABSENT
+# (Coding.system missing) and SYSTEM_KEY_UNRECOGNIZED (Coding.system present
+# but not a URI in the table) -- are defined in
+# '01- Imports.py', not here.
+#
+# They are not parser-private: File 08 branches on them to decide which code
+# sets a coding may be looked up in, and File 33 asserts on them while chaining
+# 01 -> 02 -> 08 -> 10 with no File 07 loaded. File 01 is the only file every
+# bootstrap loads first, so it is the only place all three can share one
+# spelling. See File 01 for why the two values must stay distinct.
+
 # Per-resource-type system preference order.
 # First match wins. Systems not in the list fall to the end.
 _SYSTEM_PREFERENCE: Dict[str, Tuple[str, ...]] = {
@@ -155,8 +166,19 @@ def _select_best_coding(
 
         best_coding_dict: {"code": str, "display": str, "system_key": str}
             The selected coding's code, display, and resolved system key.
-            system_key is the canonical short key (e.g., "snomed", "loinc")
-            or "unknown" if the system URI was not recognized.
+            system_key is the canonical short key (e.g., "snomed", "loinc"),
+            or SYSTEM_KEY_ABSENT when Coding.system was absent/empty, or
+            SYSTEM_KEY_UNRECOGNIZED when Coding.system was present but is not
+            a URI in _SYSTEM_URI_TO_KEY. Both constants live in
+            01- Imports.py. Consumers that look a code up in a
+            system-specific table MUST distinguish those last two: ABSENT
+            means "no idea, try anything", UNRECOGNIZED means "definitely some
+            other system, try nothing".
+
+            Neither value appears in _SYSTEM_PREFERENCE, so a coding carrying
+            either is never *selected* as best on system grounds; it is only
+            returned as best via the positional fallback below, exactly as
+            before this split.
 
         all_codings_list: [{"system_key": str, "code": str, "display": str}, ...]
             Every coding in the input list, each annotated with its resolved
@@ -170,11 +192,19 @@ def _select_best_coding(
             [],
         )
 
-    # Annotate every coding with its resolved system key
+    # Annotate every coding with its resolved system key.
+    #
+    # An ABSENT system and an UNRECOGNIZED system are different facts and get
+    # different keys -- see SYSTEM_KEY_ABSENT / SYSTEM_KEY_UNRECOGNIZED above.
+    # They used to collapse to "unknown", which let a proprietary code be
+    # looked up in the SNOMED set on the strength of its digits alone.
     annotated: List[Dict] = []
     for c in coding_list:
         system_uri = (c.get("system") or "").strip()
-        system_key = _SYSTEM_URI_TO_KEY.get(system_uri, "unknown")
+        if not system_uri:
+            system_key = SYSTEM_KEY_ABSENT
+        else:
+            system_key = _SYSTEM_URI_TO_KEY.get(system_uri, SYSTEM_KEY_UNRECOGNIZED)
         annotated.append({
             "system_key": system_key,
             "code":       (c.get("code") or "unknown").strip(),

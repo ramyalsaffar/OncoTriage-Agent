@@ -7,6 +7,25 @@ Deletes non-cancer patients directly from fhir/ directory
 """
 
 
+# Run needed files
+#-----------------
+# Bootstrap comes FIRST because the configuration block below resolves
+# PATIENTS_DIR from data_fhir_path, which 01- Imports.py defines, and
+# _MANIFEST_PATH from checkpoint_path / COHORT_MANIFEST_FILENAME, which come
+# from 01 and 03. The configuration block used to sit above this and this file
+# could not be run as a script at all -- `python "05- FHIR Clean Data.py"`
+# raised NameError on line 1 of the config. It only ever worked when some other
+# file had already exec'd 01 into the same namespace.
+_code_dir = "/Users/ramyalsaffar/Ramy/C.V..V/07- LLM Projects/03- Clinical Trial Patient Match/03- Code/"
+
+for _bootstrap in ("01- Imports.py", "02- Utility Functions.py", "03- Config.py"):
+    with open(_code_dir + _bootstrap) as _fh:
+        exec(_fh.read(), globals())
+
+
+#------------------------------------------------------------------------------
+
+
 # Configuration
 #--------------
 
@@ -18,18 +37,6 @@ RANDOM_SEED = 42
 
 # Directory with all patients (will delete non-cancer ones in-place)
 PATIENTS_DIR = data_fhir_path
-
-
-#------------------------------------------------------------------------------
-
-
-# Run needed files
-#-----------------
-_code_dir = "/Users/ramyalsaffar/Ramy/C.V..V/07- LLM Projects/03- Clinical Trial Patient Match/03- Code/"
-
-for _bootstrap in ("01- Imports.py", "02- Utility Functions.py", "03- Config.py"):
-    with open(_code_dir + _bootstrap) as _fh:
-        exec(_fh.read(), globals())
 
 # File 07 is chained for _select_best_coding(): the cohort filter must read a
 # condition's codings exactly the way the pipeline's parser does, or the set of
@@ -257,11 +264,72 @@ def has_cancer_diagnosis(bundle_data):
     return len(cancer_types) > 0, cancer_types
 
 
+def patient_death_status(bundle_data):
+    """
+    Read vital status off the Patient resource already in memory.
+
+    Called from the same pass as has_cancer_diagnosis() so the bundle is parsed
+    once. A second pass over the cohort would mean re-reading and re-parsing
+    tens of gigabytes of JSON to learn one boolean.
+
+    FHIR R4 types Patient.deceased[x] as a choice of deceasedBoolean or
+    deceasedDateTime, and BOTH have to be read: Synthea writes
+    deceasedDateTime, real exports frequently write deceasedBoolean, and a
+    consumer that checks only one silently reads every patient as alive.
+    Absence of the element means alive -- that is the FHIR default, not a
+    guess.
+
+    Returns:
+        tuple: (deceased, evidence)
+            deceased  True / False, or None when the bundle carries no Patient
+                      resource at all and vital status is therefore UNKNOWN.
+                      None is NOT False: the caller must not delete on it.
+            evidence  the element and value the verdict came from, for the
+                      manifest.
+    """
+    if not bundle_data or not isinstance(bundle_data, dict):
+        return None, 'bundle is not a dict'
+
+    for entry in bundle_data.get('entry', []):
+        resource = entry.get('resource', {})
+        if not isinstance(resource, dict) or resource.get('resourceType') != 'Patient':
+            continue
+
+        # deceasedDateTime first: when a record carries both, a date is the
+        # more specific statement and the one Synthea emits.
+        deceased_datetime = resource.get('deceasedDateTime')
+        if deceased_datetime:
+            return True, f'deceasedDateTime={deceased_datetime}'
+
+        deceased_boolean = resource.get('deceasedBoolean')
+        if deceased_boolean is True:
+            return True, 'deceasedBoolean=true'
+        if deceased_boolean is False:
+            return False, 'deceasedBoolean=false'
+
+        return False, 'no deceased[x] element (FHIR default: alive)'
+
+    return None, 'no Patient resource in bundle'
+
+
 def filter_cancer_patients_inplace():
     """
-    Delete non-cancer patients AND cap at CAP patients (in-place filtering)
+    Delete non-cancer patients, then deceased cancer patients, then cap at CAP
+    (in-place filtering).
 
-    Both deletion phases go through _delete_manifested(), so the target list is
+    Three phases in that order, and the order is load-bearing:
+
+        non_cancer  no primary cancer condition (has_cancer_diagnosis)
+        deceased    has cancer, but Patient.deceased[x] says they are dead
+        over_cap    alive cancer patients beyond CAP, seeded sample
+
+    The deceased phase runs BEFORE the cap so the cap samples from alive
+    patients only; capping first would spend cohort slots on the dead and then
+    delete them, leaving well under CAP. Vital status is read in the same scan
+    pass as the cancer check, from the same parsed bundle -- see
+    patient_death_status().
+
+    All three deletion phases go through _delete_manifested(), so the target list is
     on disk before anything is unlinked and every outcome is written back. A
     phase that hits IO errors finishes its sweep, marks itself "partial", and
     the run returns a non-zero deletion_failures count instead of exiting as if
@@ -302,35 +370,62 @@ def filter_cancer_patients_inplace():
     print("="*80)
     print()
     
-    cancer_patients = []
+    cancer_patients = []          # every primary-cancer patient, alive or not
+    alive_cancer_patients = []    # the cap sampling pool
+    deceased_cancer_patients = []
+    unknown_vital_status = []     # cancer, but no Patient resource to read
     non_cancer_patients = []
     cancer_counts = {}
     error_patients = []
-    
-    # Check each patient
+    death_evidence = {}           # filename -> which element decided it
+
+    # Check each patient.
+    #
+    # ONE pass, TWO questions. Vital status is read from the same parsed bundle
+    # as the cancer check: the corpus is tens of gigabytes and a second sweep to
+    # learn one boolean per patient would cost as much as the whole scan.
+    #
+    # A patient with no primary cancer goes to non_cancer regardless of vital
+    # status, so the deceased phase only ever targets cancer patients and the
+    # two counts never overlap.
     for idx, patient_file in enumerate(patient_files, 1):
         if idx % 500 == 0:
             print(f"  Processed {idx}/{len(patient_files)} patients...")
-        
+
         try:
             with open(patient_file, 'r') as f:
                 bundle = json.load(f)
-            
+
             has_cancer, cancer_types = has_cancer_diagnosis(bundle)
-            
-            if has_cancer:
-                cancer_patients.append(patient_file)
-                
-                # Count cancer types
-                for cancer in cancer_types:
-                    cancer_counts[cancer] = cancer_counts.get(cancer, 0) + 1
-            else:
+            deceased, evidence = patient_death_status(bundle)
+
+            if not has_cancer:
                 non_cancer_patients.append(patient_file)
-                
+                continue
+
+            cancer_patients.append(patient_file)
+
+            # Count cancer types
+            for cancer in cancer_types:
+                cancer_counts[cancer] = cancer_counts.get(cancer, 0) + 1
+
+            death_evidence[patient_file.name] = evidence
+            if deceased is True:
+                deceased_cancer_patients.append(patient_file)
+            elif deceased is None:
+                # Vital status could not be read. NOT treated as deceased: the
+                # deletion is irreversible and there is no evidence to delete
+                # on. Kept in the cap pool, counted, and named in the manifest
+                # so a non-zero count is visible rather than inferred.
+                unknown_vital_status.append(patient_file)
+                alive_cancer_patients.append(patient_file)
+            else:
+                alive_cancer_patients.append(patient_file)
+
         except Exception as e:
             print(f"  ERROR processing {patient_file.name}: {e}")
             error_patients.append(patient_file)
-    
+
     print(f"  Processed {len(patient_files)}/{len(patient_files)} patients... \nDONE")
     print()
     
@@ -341,9 +436,14 @@ def filter_cancer_patients_inplace():
     print()
     print(f"Total patients scanned: {len(patient_files)}")
     print(f"Cancer patients found: {len(cancer_patients)}")
+    print(f"  ... alive:    {len(alive_cancer_patients)}")
+    print(f"  ... deceased: {len(deceased_cancer_patients)}")
     print(f"Non-cancer patients: {len(non_cancer_patients)}")
     cancer_pct = len(cancer_patients) / len(patient_files) * 100 if patient_files else 0.0
-    print(f"Cancer percentage: {cancer_pct:.1f}%")
+    alive_pct = len(alive_cancer_patients) / len(patient_files) * 100 if patient_files else 0.0
+    print(f"Cancer percentage: {cancer_pct:.1f}%  (alive cancer: {alive_pct:.1f}%)")
+    if unknown_vital_status:
+        print(f"Cancer patients with UNREADABLE vital status (kept): {len(unknown_vital_status)}")
     if error_patients:
         print(f"Files with parse errors (skipped): {len(error_patients)}")
     print()
@@ -369,7 +469,15 @@ def filter_cancer_patients_inplace():
                                 'CancerCodeRegistry.is_primary_cancer(codings=...)',
         'scanned':              len(patient_files),
         'cancer_found':         len(cancer_patients),
+        'alive_cancer_found':   len(alive_cancer_patients),
+        'deceased_cancer_found': len(deceased_cancer_patients),
         'non_cancer_found':     len(non_cancer_patients),
+        'vital_status_source':  'Patient.deceasedDateTime, then Patient.deceasedBoolean; '
+                                'absent = alive (FHIR default)',
+        # Cancer patients whose vital status could not be read. Kept in the
+        # cohort -- there is no evidence to delete on -- and named here so a
+        # non-zero count cannot pass as zero.
+        'unknown_vital_status_retained': sorted(f.name for f in unknown_vital_status),
         'unparseable_retained': sorted(f.name for f in error_patients),
         'status':               'planned',
         'phases':               {},
@@ -407,13 +515,84 @@ def filter_cancer_patients_inplace():
         print("="*80)
         print()
 
-    # STEP 2: Cap at CAP patients (if needed)
+    # STEP 2: Delete DECEASED cancer patients
     #
-    # The sampling pool is the confirmed-cancer list, not a re-glob of the
+    # A dead patient cannot enrol on a trial. Leaving them in produced a cohort
+    # that was 57.7% deceased in the 2026-08-03 regeneration, so every
+    # eligibility rate the pipeline reported was diluted by patients who could
+    # never have been eligible for anything.
+    #
+    # Its own phase, its own phase key, its own count. Folding these into the
+    # non-cancer phase would say "no primary cancer condition found" about a
+    # patient who had one, and would make the two reasons for deletion
+    # indistinguishable in the only record of the deletion.
+    #
+    # BEFORE the cap, so the cap samples from alive patients only. Capping
+    # first would spend cohort slots on the dead and then delete them, leaving
+    # far fewer than CAP.
+    deceased_deleted = 0
+
+    if deceased_cancer_patients:
+        print("="*80)
+        print(f"STEP 2: DELETE {len(deceased_cancer_patients)} DECEASED CANCER PATIENTS")
+        print("="*80)
+        print()
+
+        phase = _delete_manifested(
+            manifest,
+            phase_key='deceased',
+            files=deceased_cancer_patients,
+            reason='Patient.deceased[x] indicates the patient is dead; a deceased '
+                   'patient is not a trial candidate',
+            progress_every=500,
+        )
+        deceased_deleted = len(phase['deleted'])
+
+        # The element each verdict came from, so the manifest can be audited
+        # without the bundles -- which this run is about to delete.
+        phase['evidence'] = {f.name: death_evidence[f.name]
+                             for f in deceased_cancer_patients}
+        _write_manifest(manifest)
+
+        print(f"  Deleted {deceased_deleted}/{len(deceased_cancer_patients)} deceased patients... \nDONE")
+        if phase['failed'] or phase['already_absent']:
+            print(f"  NOT deleted: {len(phase['failed'])} failed, "
+                  f"{len(phase['already_absent'])} already absent (see manifest)")
+        print()
+    else:
+        # Record the phase even with nothing to delete. An ABSENT phase key and
+        # a phase key with planned_count 0 are different claims: the first is
+        # what a File 05 that has no deceased phase at all leaves behind, and
+        # that is exactly what the previous version of this file wrote. "Zero
+        # deceased patients in the cohort" is an acceptance criterion, and the
+        # manifest is the only record of it, so it says so explicitly.
+        manifest['phases']['deceased'] = {
+            'reason':         'Patient.deceased[x] indicates the patient is dead; a '
+                              'deceased patient is not a trial candidate',
+            'status':         'complete',
+            'planned_count':  0,
+            'planned':        [],
+            'deleted':        [],
+            'already_absent': [],
+            'failed':         [],
+            'note':           'the vital-status check RAN and found no deceased '
+                              'cancer patients; it was not skipped',
+        }
+        _write_manifest(manifest)
+        print("="*80)
+        print("STEP 2: NO DECEASED CANCER PATIENTS TO DELETE")
+        print("="*80)
+        print("  (checked; recorded in the manifest as a zero-count phase)")
+        print()
+
+    # STEP 3: Cap at CAP patients (if needed)
+    #
+    # The sampling pool is the ALIVE confirmed-cancer list, not a re-glob of the
     # directory: a re-glob also picks up the bundles that failed to parse and
-    # can hand one of them a slot in the cohort. Sorted for deterministic input
-    # ordering before the seeded random.sample.
-    remaining_files = sorted(cancer_patients)
+    # the deceased bundles whose deletion may have failed, and can hand either
+    # a slot in the cohort. Sorted for deterministic input ordering before the
+    # seeded random.sample.
+    remaining_files = sorted(alive_cancer_patients)
     extra_deleted = 0
 
     if error_patients:
@@ -423,10 +602,10 @@ def filter_cancer_patients_inplace():
 
     if len(remaining_files) > CAP:
         print("="*80)
-        print(f"STEP 2: CAP DATASET AT {CAP} PATIENTS")
+        print(f"STEP 3: CAP DATASET AT {CAP} PATIENTS")
         print("="*80)
         print()
-        print(f"Current cancer patients: {len(remaining_files)}")
+        print(f"Current alive cancer patients: {len(remaining_files)}")
         print(f"Target: {CAP} patients")
         print(f"Need to remove: {len(remaining_files) - CAP} patients")
         print()
@@ -451,7 +630,7 @@ def filter_cancer_patients_inplace():
             manifest,
             phase_key='over_cap',
             files=patients_to_remove,
-            reason=f'cancer patient beyond CAP={CAP} (seed={RANDOM_SEED})',
+            reason=f'alive cancer patient beyond CAP={CAP} (seed={RANDOM_SEED})',
             progress_every=100,
         )
         extra_deleted = len(phase['deleted'])
@@ -462,10 +641,19 @@ def filter_cancer_patients_inplace():
                   f"{len(phase['already_absent'])} already absent (see manifest)")
         print()
     else:
+        # Under-cap is a REPORTED outcome, not a quiet one: it means
+        # POPULATION_SIZE (04- FHIR Generate Data.py) was sized too low for the
+        # alive-cancer yield, and the corpus is smaller than CAP asked for.
         print("="*80)
-        print(f"STEP 2: ALREADY AT OR BELOW {CAP} PATIENTS")
+        print(f"STEP 3: ALREADY AT OR BELOW {CAP} PATIENTS")
         print("="*80)
         print()
+        if len(remaining_files) < CAP:
+            print(f"! Only {len(remaining_files)} alive cancer patients available, "
+                  f"CAP is {CAP}. The cohort is {CAP - len(remaining_files)} short.")
+            print("  Raise POPULATION_SIZE in '04- FHIR Generate Data.py' and "
+                  "regenerate; this run cannot be topped up (Synthea appends).")
+            print()
 
     # FINAL STATS
     final_files = list(patients_path.glob("*.json"))
@@ -482,7 +670,8 @@ def filter_cancer_patients_inplace():
     print("="*80)
     print()
     print(f"✓ Non-cancer patients deleted: {non_cancer_deleted}")
-    print(f"✓ Extra cancer patients deleted (for cap): {extra_deleted}")
+    print(f"✓ Deceased cancer patients deleted: {deceased_deleted}")
+    print(f"✓ Extra alive cancer patients deleted (for cap): {extra_deleted}")
     print(f"✓ Files remaining in directory: {len(final_files)}")
     print(f"✓ Directory: {patients_path}")
     print(f"✓ Manifest: {_MANIFEST_PATH} (status: {manifest['status']})")
@@ -498,11 +687,16 @@ def filter_cancer_patients_inplace():
     stats = {
         'total_scanned': len(patient_files),
         'cancer_patients_found': len(cancer_patients),
+        'alive_cancer_patients_found': len(alive_cancer_patients),
+        'deceased_cancer_patients_found': len(deceased_cancer_patients),
+        'unknown_vital_status': len(unknown_vital_status),
         'final_cancer_patients': len(final_files) - len(error_patients),
         'files_remaining': len(final_files),
         'non_cancer_deleted': non_cancer_deleted,
+        'deceased_deleted': deceased_deleted,
         'extra_deleted': extra_deleted,
         'percentage': len(cancer_patients)/len(patient_files)*100 if patient_files else 0,
+        'alive_percentage': len(alive_cancer_patients)/len(patient_files)*100 if patient_files else 0,
         'cancer_types': cancer_counts,
         'directory': str(patients_path),
         'parse_errors': len(error_patients),
@@ -535,9 +729,13 @@ if __name__ == "__main__":
         print()
         print(f"Summary:")
         print(f"  - Total scanned: {stats['total_scanned']}")
-        print(f"  - Cancer patients found: {stats['cancer_patients_found']}")
+        print(f"  - Cancer patients found: {stats['cancer_patients_found']} "
+              f"({stats['alive_cancer_patients_found']} alive, "
+              f"{stats['deceased_cancer_patients_found']} deceased)")
         print(f"  - Non-cancer deleted: {stats['non_cancer_deleted']}")
+        print(f"  - Deceased deleted: {stats['deceased_deleted']}")
         print(f"  - Extra deleted (cap): {stats['extra_deleted']}")
+        print(f"  - Unknown vital status (kept): {stats['unknown_vital_status']}")
         print(f"  - Parse errors (left on disk): {stats['parse_errors']}")
         print(f"  - Final dataset: {stats['final_cancer_patients']} patients")
         print(f"  - Manifest: {stats['manifest_path']}")
