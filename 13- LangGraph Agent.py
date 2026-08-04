@@ -131,6 +131,30 @@ RETRIEVAL_CHANNELS = ("title", "conditions", "criteria", "dense")
 EXPANSION_PATH_MESH = "mesh_expanded"          # MeSH walk produced descriptors
 EXPANSION_PATH_FALLBACK = "base_query_fallback"  # degraded to demographics + display
 
+# --- Genomic variant detection (Stages 1 and 5) ---
+#
+# LOINC 69548-6 is the mCODE genomic variant observation. It is a fact about an
+# external standard, so it is a named constant here rather than a tunable.
+# 07- FHIR Parser.py routes observations carrying it OUT of patient_data
+# ["observations"] and into patient_data["cancer_genomic_variants"], the same
+# way it routes ECOG — which is why a scan of ["observations"] alone can never
+# find one.
+GENOMIC_VARIANT_LOINC = "69548-6"
+
+# Free-text fallback for observations that carry no structured variant fields.
+# Anchored on both sides so a keyword only matches a whole word: the previous
+# `"gene" in display.lower()` matched "gene" inside "Generalized anxiety
+# disorder 7 item (GAD-7)" on 45,186 observations across the 1,000-patient
+# cohort and inside "General activity scale [PEG]" on a further 656, against
+# 295 genuine matches. Every patient in the cohort had a polluted query.
+#
+# The boundary is "not a letter or digit" rather than \b so that punctuation
+# and hyphens still delimit: "c-MET", "MSI-H" and "PD-L1 expression" all match,
+# "Generalized" does not.
+_VARIANT_TEXT_PATTERN = re.compile(
+    r"(?<![a-z0-9])(?:genetic|variant|mutation|gene)(?![a-z0-9])"
+)
+
 # --- Stage 4, whether the cancer site filter ran ---
 MESH_FILTER_APPLIED = "applied"
 MESH_FILTER_SKIP_ABLATED = "ablation_skipped"    # skip_mesh_filter flag set
@@ -236,7 +260,22 @@ class TrialMatchState(TypedDict):
     mesh_dropped: int                           # Trials dropped by MeSH cancer site filter
     stage_dropped: int                          # Trials dropped by cancer stage filter
     histology_dropped: int                      # Trials dropped by histology filter
-    
+
+    # The remaining two per-trial drops in Stage 4, and the two pool-level cuts
+    # that follow them. Every other reason the pool shrinks was already a named
+    # counter; these four were not, so "reranked 40 -> filtered 9" left 31
+    # trials removed for reasons that could only be guessed at, and the age and
+    # sex drops in particular were bare `continue`s with nothing recorded.
+    #
+    # quality_threshold is the score the gate actually used, not the configured
+    # floor: it is max(percentile of the surviving pool, RERANK_SCORE_THRESHOLD),
+    # so the configured constant alone does not say where the cut fell.
+    age_dropped: int                            # Trials dropped by the age window
+    sex_dropped: int                            # Trials dropped by the sex requirement
+    quality_dropped: int                        # Trials dropped by the dynamic quality gate
+    quality_threshold: float                    # Unboosted score the gate cut at
+
+
     patient_trees: set                           # Resolved MeSH C04 tree numbers (Stage 3 → Stage 4)
     patient_histology: set                       # Histology tags (Stage 3 → Stage 4)
 
@@ -254,6 +293,25 @@ class TrialMatchState(TypedDict):
     # --- Stage 5: GPT-4o Evaluation ---
     evaluations: List[Dict]                     # Criterion-level match results
     gpt4o_retries: int                          # Current retry count for GPT-4o
+
+    # Truncation control (Stage 5). A SEPARATE budget from gpt4o_retries: that
+    # one counts whole-node retries for a malformed or failed response, this
+    # counts levels of halving spent because a response was cut off at
+    # MATCHING_MAX_TOKENS. A patient that hits one parse failure and then needs
+    # two splits must not be failed for exhausting a shared counter.
+    gpt4o_truncation_splits: int
+    # The pre-call estimate, logged beside the actual so the calibration in
+    # 03- Config.py can be re-derived from measured data rather than re-guessed.
+    gpt4o_output_tokens_estimated: int
+    # Trials that entered Stage 5 and left it with no verdict because of
+    # truncation (the floor, or the split budget). Distinct from
+    # not_evaluable_trials, which counts trials the model assessed and could
+    # not conclude on.
+    not_evaluable_truncated: int
+    # How many model calls this stage actually made. 1 unsplit; more when a
+    # batch was split. Without it a chunked run is indistinguishable from an
+    # unsplit one in the token columns.
+    gpt4o_calls: int
     gpt4o_raw_response: str                     # Raw GPT-4o text (for retry debugging)
     gpt4o_prompt: str                           # Prompt sent to matching model
     gpt4o_input_tokens: int
@@ -290,23 +348,105 @@ class TrialMatchState(TypedDict):
 # (2) the CrossEncoder wrapper applies a default sigmoid that squashes MedCPT's
 # raw values range -25 to 25.
 
-print("Loading MedCPT cross-encoder re-ranker...")
-medcpt_tokenizer = AutoTokenizer.from_pretrained("ncbi/MedCPT-Cross-Encoder")
-medcpt_model = AutoModelForSequenceClassification.from_pretrained("ncbi/MedCPT-Cross-Encoder")
-medcpt_model.eval()
-print("MedCPT re-ranker loaded!\n")
+# The two local models below are loaded at exec() time and cost tens of
+# seconds plus a few hundred MB. A replay harness that serves every model
+# output from a recording (46- Fixture Replay.py) needs neither, and "loads no
+# model" is part of what makes a replay a replay rather than a second run.
+#
+# Opt-in only, and never in production: the variable is read once, here, and
+# the default is to load. When it is set, both names are bound to a sentinel
+# that RAISES on any use rather than to None, so a caller that forgot to
+# install its own stand-in fails with a sentence explaining why instead of an
+# AttributeError on None thirty frames down.
+#
+# Environment rather than 03- Config.py deliberately. It is not a tunable —
+# it selects between two ways of running the process, has to be decided before
+# this file is exec'd, and a value accidentally left in the config file would
+# silently disarm the pipeline for every caller.
+DEFER_LOCAL_MODELS_ENV = "ONCOTRIAGE_DEFER_LOCAL_MODELS"
+_DEFER_LOCAL_MODELS = os.environ.get(DEFER_LOCAL_MODELS_ENV, "0") == "1"
+
+
+class _DeferredLocalModel:
+    """Stand-in for a local model that was deliberately not loaded.
+
+    Raises on attribute access and on call, naming the model and the switch
+    that skipped it, so the failure is one line to diagnose.
+    """
+
+    def __init__(self, name: str):
+        object.__setattr__(self, "_name", name)
+
+    def _explode(self, how: str):
+        raise RuntimeError(
+            f"{self._name} was not loaded: {DEFER_LOCAL_MODELS_ENV}=1 was set "
+            f"when 13- LangGraph Agent.py was exec'd, and nothing replaced the "
+            f"placeholder before {how}. A replay harness must bind its own "
+            f"stand-in; a production run must not set that variable."
+        )
+
+    def __getattr__(self, attr):
+        self._explode(f"attribute {attr!r} was read")
+
+    def __call__(self, *args, **kwargs):
+        self._explode("it was called")
+
+
+if _DEFER_LOCAL_MODELS:
+    print(f"{DEFER_LOCAL_MODELS_ENV}=1 — skipping MedCPT and FastEmbed loads.")
+    medcpt_tokenizer = _DeferredLocalModel("MedCPT tokenizer")
+    medcpt_model = _DeferredLocalModel("MedCPT cross-encoder")
+    _bm25_query_model = _DeferredLocalModel("FastEmbed BM25 query model")
+else:
+    print("Loading MedCPT cross-encoder re-ranker...")
+    medcpt_tokenizer = AutoTokenizer.from_pretrained("ncbi/MedCPT-Cross-Encoder")
+    medcpt_model = AutoModelForSequenceClassification.from_pretrained("ncbi/MedCPT-Cross-Encoder")
+    medcpt_model.eval()
+    print("MedCPT re-ranker loaded!\n")
+
+    # -----------------------------------------------------------------------
+    # Load BM25 Sparse Embedding Model (FastEmbed, local, no API cost)
+    # -----------------------------------------------------------------------
+    # Used at query time to generate sparse query vectors for Qdrant BM25
+    # search. Same model used at index time (File 11) to generate document
+    # sparse vectors. Loaded once, reused for every patient.
+    print("Loading BM25 sparse query model (FastEmbed)...")
+    _bm25_query_model = SparseTextEmbedding(model_name="Qdrant/bm25")
+    print("BM25 sparse query model loaded.\n")
 
 
 # ---------------------------------------------------------------------------
-# Load BM25 Sparse Embedding Model (FastEmbed, local, no API cost)
+# Cross-encoder scoring seam
 # ---------------------------------------------------------------------------
-# Used at query time to generate sparse query vectors for Qdrant BM25 search.
-# Same model used at index time (File 11) to generate document sparse vectors.
-# Loaded once, reused for every patient.
 
-print("Loading BM25 sparse query model (FastEmbed)...")
-_bm25_query_model = SparseTextEmbedding(model_name="Qdrant/bm25")
-print("BM25 sparse query model loaded.\n")
+def medcpt_score_pairs(query: str, trial_texts: List[str]) -> "np.ndarray":
+    """Score one query against every trial text with the MedCPT cross-encoder.
+
+    Lifted out of node_cross_encoder_rerank unchanged so the model call is a
+    named function rather than a block inside a loop. Two callers need it to
+    be one: the reranking loop, and a recording harness that has to capture
+    every (query, trial_texts) -> scores pair and serve them back without a
+    model (45-/46- Fixture Capture/Replay).
+
+    Returns a 1-D float array, one score per trial text, in input order.
+    """
+    pairs = [[query, trial_text] for trial_text in trial_texts]
+
+    with torch.no_grad():
+        encoded = medcpt_tokenizer(
+            pairs,
+            truncation=True,
+            padding=True,
+            return_tensors="pt",
+            max_length=512,
+        )
+        return (
+            medcpt_model(**encoded)
+            .logits.squeeze(dim=1)
+            .detach()
+            .cpu()
+            .numpy()
+        )
 
 # ---------------------------------------------------------------------------
 # Embedding Helper (self-contained, no dependency on RAG Indexer)
@@ -333,6 +473,115 @@ def get_embedding(text: str) -> List[float]:
 
 
 #------------------------------------------------------------------------------
+
+
+# MAX_VARIANT_TERMS is in 03- Config.py with the other tunables.
+
+
+def extract_genomic_variant_terms(patient_data: Dict) -> Dict:
+    """Collect the patient's genomic variant terms for retrieval.
+
+    Detection is STRUCTURAL first and textual only as a fallback, because the
+    text was doing all the work and doing it badly in both directions:
+
+      - It matched too much. `"gene" in display.lower()` fired on 45,842
+        non-genomic observations across the cohort ("Generalized anxiety
+        disorder 7 item (GAD-7)", "General activity scale [PEG]") against 295
+        genuine ones, so essentially every expanded_query and every R4 rerank
+        query carried a list of GAD-7 scores and bare integers.
+      - It matched too little. Not one of the four keywords appears in a mCODE
+        variant display — _parse_mcode_genomic_variant (File 07) emits
+        "EGFR p.Leu858Arg: Present | Somatic" — and those observations are not
+        in patient_data["observations"] at all, having been routed into
+        patient_data["cancer_genomic_variants"]. The structured, highest
+        fidelity variant record was the one source this could never see.
+
+    Three paths, in descending fidelity. Each is counted and returned, so a
+    query built from the free-text path alone is a queryable fact rather than
+    an inference:
+
+      mcode        patient_data["cancer_genomic_variants"], every entry of
+                   which carries LOINC 69548-6 by construction.
+      structured   an entry in ["observations"] whose code is
+                   GENOMIC_VARIANT_LOINC or which carries a non-empty
+                   gene_symbol. Covers a caller that pools variants into the
+                   observation list rather than using File 07's routing.
+      free_text    an observation whose display matches _VARIANT_TEXT_PATTERN
+                   on a word boundary.
+
+    Returns:
+        {"terms": [str, ...],           # de-duplicated, order-stable, capped
+         "counts": {"mcode": int, "structured": int, "free_text": int},
+         "truncated": int}              # terms dropped by MAX_VARIANT_TERMS
+    """
+    counts = {"mcode": 0, "structured": 0, "free_text": 0}
+    terms = []
+    seen = set()
+
+    def _add(term: str, path: str) -> None:
+        term = (term or "").strip()
+        if not term:
+            return
+        counts[path] += 1
+        key = term.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        terms.append(term)
+
+    def _structured_term(record: Dict) -> str:
+        """Gene symbol plus HGVS notation, or the display when neither exists.
+
+        Preferred over the display because the display carries result text
+        ("Present | Somatic") that is noise in a retrieval query, while the
+        gene symbol and the protein-level change are the tokens trials are
+        indexed by.
+        """
+        gene = (record.get("gene_symbol") or "").strip()
+        if not gene:
+            return (record.get("display") or "").strip()
+        hgvs = (record.get("hgvs_protein") or record.get("hgvs_cdna") or "").strip()
+        return f"{gene} {hgvs}".strip()
+
+    # --- Path 1: mCODE variants, already separated by File 07 ---------------
+    for record in (patient_data.get("cancer_genomic_variants") or []):
+        _add(_structured_term(record), "mcode")
+
+    # --- Paths 2 and 3: the general observation pool ------------------------
+    for obs in (patient_data.get("observations") or []):
+        display = (obs.get("display") or "").strip()
+
+        if obs.get("code") == GENOMIC_VARIANT_LOINC or (obs.get("gene_symbol") or "").strip():
+            _add(_structured_term(obs), "structured")
+            continue
+
+        if not _VARIANT_TEXT_PATTERN.search(display.lower()):
+            continue
+
+        # Free-text shapes differ, and the old rule — prefer value, else
+        # display — was right for one of them and wrong for the other:
+        #
+        #   "Genetic variant: BRAF (V600E)" / value "BRAF (V600E)"
+        #       the display is a label and the VALUE carries the finding.
+        #   "ERBB2 gene duplication [Presence] in ... by FISH" / value "Positive"
+        #       the display carries the gene and the value is a result word.
+        #       Preferring the value put the literal string "Positive" into the
+        #       retrieval query and left ERBB2 out of it — the one genuine
+        #       match in this corpus contributed nothing usable.
+        #
+        # A colon in the display is what separates them: it marks the label
+        # form. Without one, the display is the finding.
+        value = obs.get("value")
+        value_str = str(value).strip() if value is not None else ""
+        if ":" in display and value_str:
+            cleaned = display.split(":", 1)[-1].strip()
+            _add(value_str or cleaned, "free_text")
+        else:
+            _add(display, "free_text")
+
+    truncated = max(0, len(terms) - MAX_VARIANT_TERMS)
+    return {"terms": terms[:MAX_VARIANT_TERMS], "counts": counts,
+            "truncated": truncated}
 
 
 def compute_patient_hash(patient_data: Dict) -> str:
@@ -432,6 +681,27 @@ def compute_patient_hash(patient_data: Dict) -> str:
             f"|{ecog.get('date')}"
             f"|{ecog.get('observations_found')}"
             f"|{ecog.get('selection')}"
+        )
+
+    # Metastasis and nodal observations, for the same reason ECOG is here.
+    # File 07 routes these out of `observations` into their own list, so
+    # without this line the 701 observations that describe how far the disease
+    # has spread would contribute nothing to the hash, and two patients
+    # differing only in cM0 versus cM1 would hash identically.
+    #
+    # Emitted only when the list is non-empty, so a patient with no metastasis
+    # observation hashes exactly as before the routing existed. Patients WITH
+    # them do get a new hash: their observations moved between fields, which is
+    # a real change to the parsed record and to the prompt built from it.
+    metastasis = patient_data.get("cancer_metastasis_observations") or []
+    for m in sorted(metastasis, key=lambda o: (o.get("display", ""),
+                                               o.get("date", ""))):
+        parts.append(
+            f"met={m.get('display', '')}"
+            f"|{m.get('value', '')}"
+            f"|{m.get('unit', '')}"
+            f"|{m.get('date', '')}"
+            f"|{m.get('metastasis_category', '')}"
         )
 
     hash_input = "\n".join(parts)
@@ -834,22 +1104,12 @@ def node_query_expansion(state: dict) -> dict:
     # Precision oncology trials are indexed by gene/variant names (EGFR, BRAF,
     # IDH1, KIT, PIK3CA, etc.). Including the gene in the retrieval query is
     # critical for matching gene-specific trials via BM25 and vector search.
+    # Structural detection, with a word-bounded text path as fallback — see
+    # extract_genomic_variant_terms for what each path is and why the previous
+    # substring test both over- and under-matched.
     observations = patient_data.get("observations") or []
-    gene_parts = []
-    for obs in observations:
-        display = (obs.get("display") or "").strip()
-        value = obs.get("value")
-        # Match observations that contain genetic variant info
-        # Handles both Synthea-style (LOINC-coded) and TREC PM-style
-        # ("Genetic variant: BRAF (V600E)") observations.
-        if any(kw in display.lower() for kw in ("genetic", "variant", "mutation", "gene")):
-            if value and str(value).strip():
-                gene_parts.append(str(value).strip())
-            elif display:
-                # Strip prefix if present (e.g., "Genetic variant: BRAF (V600E)" -> "BRAF (V600E)")
-                cleaned = display.split(":", 1)[-1].strip() if ":" in display else display
-                gene_parts.append(cleaned)
-
+    variant_result = extract_genomic_variant_terms(patient_data)
+    gene_parts = variant_result["terms"]
     gene_string = ", ".join(gene_parts) if gene_parts else ""
 
     if gene_string:
@@ -948,6 +1208,18 @@ def node_query_expansion(state: dict) -> dict:
     for i, rq in enumerate(rerank_queries, 1):
         print(f"    R{i}: {rq}")
     print(f"  Expansion path: {expansion_path}")
+    # Which detector found the variants, not just how many there were. A run
+    # whose only variants came from the free-text path is searching on weaker
+    # evidence than one backed by mCODE records, and the counts are the only
+    # thing that distinguishes them.
+    _vc = variant_result["counts"]
+    if gene_parts or any(_vc.values()):
+        print(f"  Genomic variants: {len(gene_parts)} term(s) "
+              f"[mcode={_vc['mcode']} structured={_vc['structured']} "
+              f"free_text={_vc['free_text']}]"
+              + (f" — {variant_result['truncated']} dropped by "
+                 f"MAX_VARIANT_TERMS={MAX_VARIANT_TERMS}"
+                 if variant_result["truncated"] else ""))
     if mesh_result["mesh_terms"]:
         print(f"  MeSH resolution: {mesh_result['resolution']} | "
               f"trees: {len(mesh_result['patient_trees'])} | "
@@ -1690,23 +1962,7 @@ def node_cross_encoder_rerank(state: dict) -> dict:
     per_query_stats = []  # for logging
 
     for q_idx, query in enumerate(rerank_queries):
-        pairs = [[query, trial_text] for trial_text in trial_texts]
-
-        with torch.no_grad():
-            encoded = medcpt_tokenizer(
-                pairs,
-                truncation=True,
-                padding=True,
-                return_tensors="pt",
-                max_length=512,
-            )
-            scores = (
-                medcpt_model(**encoded)
-                .logits.squeeze(dim=1)
-                .detach()
-                .cpu()
-                .numpy()
-            )
+        scores = medcpt_score_pairs(query, trial_texts)
 
         # Log per-query score distribution
         per_query_stats.append({
@@ -1905,6 +2161,12 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
 
     filtered = []
 
+    # The age and sex cuts below used to be bare `continue`s. Every other drop
+    # in this loop already had a counter, so the two that did not were the only
+    # ones a stored funnel could not account for.
+    age_dropped = 0
+    sex_dropped = 0
+
     for trial_obj in trials:
         trial = trial_obj["trial"]
         eligibility = trial["eligibility"]
@@ -1937,6 +2199,7 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
             max_age = int(re.findall(r'\d+', max_age_str)[0]) if max_age_str else 999
 
             if patient_age is not None and not (min_age <= patient_age <= max_age):
+                age_dropped += 1
                 continue
         except (IndexError, ValueError):
             pass  # Keep trial if age parsing fails
@@ -1944,6 +2207,7 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
         # --- Sex filter ---
         trial_sex = eligibility.get("sex", "ALL").upper()
         if trial_sex not in ["ALL", patient_sex.upper()]:
+            sex_dropped += 1
             continue
 
         filtered.append(trial_obj)
@@ -1977,6 +2241,8 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
         f"{f' (MeSH dropped {mesh_dropped})' if mesh_dropped else ''}"
         f"{f' (stage dropped {stage_dropped})' if stage_dropped else ''}"
         f"{f' (histology dropped {histology_dropped})' if histology_dropped else ''}"
+        f"{f' (age dropped {age_dropped})' if age_dropped else ''}"
+        f"{f' (sex dropped {sex_dropped})' if sex_dropped else ''}"
         f"{f' (quality dropped {quality_dropped} @ raw >= {dynamic_threshold:.5f})' if quality_dropped else ''}"
     )
 
@@ -1987,11 +2253,190 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
         "mesh_dropped": mesh_dropped,
         "histology_dropped": histology_dropped,
         "stage_dropped": stage_dropped,
+        # The two per-trial drops that had no counter, plus the pool-level cut
+        # and the score it was made at. Together with the three above they
+        # account for every trial that entered this stage and did not leave it.
+        "age_dropped": age_dropped,
+        "sex_dropped": sex_dropped,
+        "quality_dropped": quality_dropped,
+        "quality_threshold": float(dynamic_threshold),
         # Read by Stage 5 to decide what its system prompt may assert, and
         # logged so a stored inference says whether the check ran.
         "mesh_filter_applied": mesh_filter_applied,
         "mesh_filter_skip_reason": mesh_filter_skip_reason,
         "stage_timings": {**state.get("stage_timings", {}), "rule_filter": round(elapsed, 3)}
+    }
+
+
+# ---------------------------------------------------------------------------
+# Stage 5 model-call seam
+# ---------------------------------------------------------------------------
+# MATCHING_MAX_TOKENS and MATCHING_SEED are in 03- Config.py, together with
+# the truncation thresholds calibrated against the first of them.
+
+
+def call_matching_model(system_prompt: str, user_prompt: str):
+    """Issue the Stage 5 evaluation request and return the raw API response.
+
+    Lifted out of node_gpt4o_evaluation unchanged. It is the single point where
+    the pipeline talks to the matching model, which is what lets a recording
+    harness capture the request and response verbatim and a replay harness
+    serve them back without a network call (45-/46- Fixture Capture/Replay).
+
+    The caller owns error handling: this raises whatever the client raises, and
+    node_gpt4o_evaluation's except block turns that into a retry.
+    """
+    return openai_client.chat.completions.create(
+        model=MATCHING_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=MATCHING_TEMPERATURE,
+        max_tokens=MATCHING_MAX_TOKENS,
+        seed=MATCHING_SEED,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stage 5 output-size estimation and batch splitting
+# ---------------------------------------------------------------------------
+
+# Why a trial can end up with no evaluation. Recorded per trial so a missing
+# verdict is never inferred from an absence — every trial that entered Stage 5
+# leaves it either evaluated or carrying one of these.
+NOT_EVALUABLE_TRUNCATION_FLOOR = "truncation_floor"
+# ^ this trial was sent alone and the response still hit the token ceiling.
+#   There is nothing left to split; the model cannot answer it within the
+#   ceiling. Distinct from a parse failure, which is a malformed answer.
+NOT_EVALUABLE_SPLIT_BUDGET = "truncation_split_budget_exhausted"
+# ^ the batch containing it truncated at MAX_TRUNCATION_SPLITS levels of
+#   halving and could not be split further under the budget.
+NOT_EVALUABLE_MODEL_OMITTED = "omitted_from_model_response"
+# ^ the call succeeded and parsed, but the model returned no entry for this
+#   trial. Not a truncation and not a parse failure; the reconciliation below
+#   is the only thing that would ever have noticed.
+
+_NOT_EVALUABLE_REASONS = (
+    NOT_EVALUABLE_TRUNCATION_FLOOR,
+    NOT_EVALUABLE_SPLIT_BUDGET,
+    NOT_EVALUABLE_MODEL_OMITTED,
+)
+
+# Finish reason the API returns when it stopped because it hit max_tokens.
+FINISH_REASON_LENGTH = "length"
+
+
+def estimate_output_tokens(trials: List[Dict]) -> int:
+    """Estimate the evaluation response size for a batch, before sending it.
+
+    HOW THIS WAS CALIBRATED, so it can be re-derived when the model changes:
+
+        SELECT candidates_evaluated, gpt4o_output_tokens FROM inferences
+        WHERE candidates_evaluated > 0 AND gpt4o_output_tokens > 0
+
+    1,094 rows. Output per trial: mean 714, median 744, p95 1,029, max 1,165.
+    Restricted to the 555 rows at the current batch cap of 15 trials: median
+    712, p90 784, p95 861, p99 1,028, max 1,062.
+
+    WHAT DID NOT PREDICT ANYTHING. Fitting output against both trial count and
+    criteria length — the criteria text measured with File 11's characters/4
+    proxy, taken from the gpt4o_prompt column — gives
+
+        output ~= 708 * trials + (-0.0107) * criteria_tokens
+
+    with a residual standard deviation of 1,935 tokens, identical to the
+    trial-count-only model. The criteria-length term is negative, negligible,
+    and carries no signal. That is not what one would assume: the response is
+    one verdict block per trial with a bounded number of criteria in it, so a
+    trial with 4,000 characters of criteria costs about the same to answer as
+    one with 800. The estimate is therefore linear in trial count alone, and
+    the CHARS_PER_TOKEN proxy is applied to the criteria only as a tie-breaker
+    for pathological inputs, not as a driver.
+
+    Returns the estimated output tokens for this batch.
+    """
+    if not trials:
+        return 0
+
+    base = MATCHING_OUTPUT_TOKENS_PER_TRIAL * len(trials)
+
+    # The measured relationship is flat in criteria length, so this contributes
+    # nothing on ordinary input. It exists for the case the calibration set
+    # contains none of: a trial whose criteria text is so long that the model
+    # must quote more of it. Bounded to a quarter of the per-trial allowance so
+    # it can never dominate a figure the data says is driven by count.
+    criteria_chars = 0
+    for trial_obj in trials:
+        eligibility = trial_obj.get("trial", {}).get("eligibility", {})
+        criteria_chars += len(eligibility.get("inclusion_criteria") or "")
+        criteria_chars += len(eligibility.get("exclusion_criteria") or "")
+    criteria_tokens = criteria_chars / CHARS_PER_TOKEN
+    criteria_component = min(
+        criteria_tokens * 0.05,
+        0.25 * MATCHING_OUTPUT_TOKENS_PER_TRIAL * len(trials),
+    )
+
+    return int(base + criteria_component)
+
+
+def _split_in_half(trials: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """Halve a batch, keeping order. The larger half goes first on odd counts."""
+    midpoint = (len(trials) + 1) // 2
+    return trials[:midpoint], trials[midpoint:]
+
+
+def _build_trials_text(trials: List[Dict]) -> str:
+    """Render one batch of trials for the user prompt.
+
+    Numbering restarts at 1 within each chunk. The model is told to key its
+    output on nct_id, and every merge downstream matches on nct_id, so the
+    ordinal is presentation only — but it is worth saying out loud, because a
+    chunked run makes "Trial 1" appear more than once in a single inference.
+    """
+    trials_text = ""
+    for idx, trial_obj in enumerate(trials):
+        trial = trial_obj["trial"]
+        trials_text += f"""Trial {idx + 1} ({trial['nct_id']}, {trial['phase']}):
+{trial['eligibility']['inclusion_criteria']}
+{trial['eligibility']['exclusion_criteria']}
+
+---
+"""
+    return trials_text
+
+
+def _unevaluable_entry(trial_obj: Dict, reason: str) -> Dict:
+    """A verdict-shaped record for a trial that could not be evaluated.
+
+    Carries the same keys node_finalize and File 14 read off a real evaluation,
+    so it flows through the rest of the pipeline without special-casing, and it
+    states its reason rather than being an absence someone has to explain.
+    """
+    trial = trial_obj["trial"]
+    return {
+        "nct_id": trial["nct_id"],
+        "title": trial.get("title", "No title"),
+        "phase": trial.get("phase", "N/A"),
+        "eligible": "not_evaluable",
+        "match_score": 0.0,
+        "score_confirmed": 0,
+        "score_denominator": 0,
+        "criteria_not_applicable": 0,
+        "criteria": [],
+        "not_evaluable_reason": reason,
+        "explanation": {
+            NOT_EVALUABLE_TRUNCATION_FLOOR:
+                "The model's response exceeded its output ceiling with this "
+                "trial sent on its own, so there was no smaller batch to fall "
+                "back to. Not assessed.",
+            NOT_EVALUABLE_SPLIT_BUDGET:
+                "The batch containing this trial kept exceeding the model's "
+                "output ceiling and reached the split limit. Not assessed.",
+            NOT_EVALUABLE_MODEL_OMITTED:
+                "The model returned a well-formed response that contained no "
+                "entry for this trial. Not assessed.",
+        }[reason],
     }
 
 
@@ -2390,88 +2835,212 @@ A trial can ONLY be classified "not_eligible" if you can quote explicit patient 
 # USER MESSAGE
 # ================================================================
 
-    user_prompt = f"""
+    def _user_prompt_for(chunk: List[Dict]) -> str:
+        return f"""
 PATIENT RECORD:
 {patient_summary}
 
 CLINICAL TRIALS:
-{trials_text}
+{_build_trials_text(chunk)}
 """
 
     # ── Store full prompt for DB logging (system + user combined) ──────────
-    prompt = f"[SYSTEM]\n{system_prompt}\n\n[USER]\n{user_prompt}"
+    # The WHOLE batch, not the chunk that happened to be sent last. When a run
+    # splits, the stored prompt is the one the run would have sent unsplit,
+    # which is the thing that is comparable across runs; the split itself is
+    # recorded in gpt4o_truncation_splits, not by mutating this.
+    prompt = f"[SYSTEM]\n{system_prompt}\n\n[USER]\n{_user_prompt_for(trials)}"
 
-    # Call GPT-4o
-    try:
-        response = openai_client.chat.completions.create(
-            model=MATCHING_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=MATCHING_TEMPERATURE,
-            max_tokens=16000,
-            seed=42,
-        )
-        response_text = response.choices[0].message.content.strip()
+    # ------------------------------------------------------------------
+    # Proactive: split before sending if the batch is expected to overflow
+    # ------------------------------------------------------------------
+    estimated_output = estimate_output_tokens(trials)
+    split_threshold = int(MATCHING_MAX_TOKENS * MATCHING_OUTPUT_SPLIT_FRACTION)
 
-    except Exception as e:
-        # API-level failure (timeout, rate limit, network error)
-        elapsed = time.time() - start
-        error_msg = f"GPT-4o API error (attempt {retry_count + 1}): {str(e)}"
-        print(f"  ERROR: {error_msg}")
-        return {
-            "evaluations": [],
-            "gpt4o_retries": retry_count + 1,
-            "gpt4o_raw_response": "",
-            "error": error_msg,
-            "stage_timings": {**state.get("stage_timings", {}), "gpt4o_evaluation": round(prior_gpt4o_time + elapsed, 3)}
-        }
+    pending = []          # LIFO of (chunk, split_depth), so a split is depth-first
+    proactive_splits = 0
+    initial_chunks = [trials]
+    if estimated_output > split_threshold:
+        depth = 0
+        while depth < MAX_TRUNCATION_SPLITS and any(
+            estimate_output_tokens(c) > split_threshold and len(c) > 1
+            for c in initial_chunks
+        ):
+            halved = []
+            for chunk in initial_chunks:
+                if estimate_output_tokens(chunk) > split_threshold and len(chunk) > 1:
+                    left, right = _split_in_half(chunk)
+                    halved.extend([left, right])
+                    proactive_splits += 1
+                else:
+                    halved.append(chunk)
+            initial_chunks = halved
+            depth += 1
+        print(f"  [Pre-split] estimate {estimated_output} tokens > threshold "
+              f"{split_threshold} — sending {len(initial_chunks)} chunk(s) "
+              f"instead of 1")
+        pending = [(c, depth) for c in reversed(initial_chunks)]
+    else:
+        pending = [(trials, 0)]
 
-    input_tokens = response.usage.prompt_tokens
-    output_tokens = response.usage.completion_tokens
-    
-    pre_defined_tokens_threshold = 12000
-    if output_tokens > pre_defined_tokens_threshold:
-        print(f"  \n\nWARNING: GPT-4o output used {output_tokens} tokens (>{pre_defined_tokens_threshold} threshold)\n")
-        print(f"  This increases cost. Consider reviewing trial complexity or prompt verbosity.\n\n")
+    # ------------------------------------------------------------------
+    # Evaluate, splitting reactively on finish_reason == "length"
+    # ------------------------------------------------------------------
+    evaluations = []
+    unevaluable = []              # trials accounted for without a verdict
+    truncation_splits = proactive_splits
+    truncations_observed = 0
+    input_tokens = 0
+    output_tokens = 0
+    response_text = ""
+    calls_made = 0
+    _finish_reason_warned = False
 
-    # Clean markdown fences if present
-    if response_text.startswith("```"):
-        response_text = response_text.split("```")[1]
-        if response_text.startswith("json"):
-            response_text = response_text[4:]
-        response_text = response_text.strip()
+    while pending:
+        chunk, depth = pending.pop()
 
-    # Parse JSON response
-    try:
-        evaluations = json.loads(response_text)
-    except json.JSONDecodeError as e:
-        # JSON parse failure: set error for retry router
-        elapsed = time.time() - start
-        error_msg = f"GPT-4o JSON parse error (attempt {retry_count + 1}): {str(e)}"
-        print(f"  ERROR: {error_msg}")
-        print(f"  Response preview: {response_text[:300]}")
-        return {
-            "evaluations": [],
-            "gpt4o_retries": retry_count + 1,
-            "gpt4o_raw_response": response_text,
-            "error": error_msg,
-            "stage_timings": {**state.get("stage_timings", {}), "gpt4o_evaluation": round(prior_gpt4o_time + elapsed, 3)}
-        }
+        try:
+            response = call_matching_model(system_prompt, _user_prompt_for(chunk))
+            choice = response.choices[0]
+            chunk_text = (choice.message.content or "").strip()
+        except Exception as e:
+            # API-level failure (timeout, rate limit, network error). This is
+            # the parse/API budget, not the split budget.
+            elapsed = time.time() - start
+            error_msg = f"GPT-4o API error (attempt {retry_count + 1}): {str(e)}"
+            print(f"  ERROR: {error_msg}")
+            return {
+                "evaluations": [],
+                "gpt4o_retries": retry_count + 1,
+                "gpt4o_truncation_splits": truncation_splits,
+                "gpt4o_output_tokens_estimated": estimated_output,
+                "gpt4o_raw_response": "",
+                "error": error_msg,
+                "stage_timings": {**state.get("stage_timings", {}), "gpt4o_evaluation": round(prior_gpt4o_time + elapsed, 3)}
+            }
 
-    if not isinstance(evaluations, list):
-        elapsed = time.time() - start
-        error_msg = f"GPT-4o returned non-list JSON (type={type(evaluations).__name__})"
-        print(f"  ERROR: {error_msg}")
-        print(f"  Response preview: {response_text[:300]}")
-        return {
-            "evaluations": [],
-            "gpt4o_retries": retry_count + 1,
-            "gpt4o_raw_response": response_text,
-            "error": error_msg,
-            "stage_timings": {**state.get("stage_timings", {}), "gpt4o_evaluation": round(prior_gpt4o_time + elapsed, 3)}
-        }
+        calls_made += 1
+        input_tokens += response.usage.prompt_tokens
+        output_tokens += response.usage.completion_tokens
+        response_text = chunk_text
+
+        # finish_reason is read defensively because not every client object
+        # that reaches here carries one: the retrieval-observability test
+        # (File 37) drives this node with a stub response, and a stub is
+        # exactly the case where silently assuming "truncated" would be wrong.
+        #
+        # Absent is treated as "not truncated", which is the behaviour this
+        # node had before truncation was detected at all — so a client that
+        # does not report it degrades to the old path rather than to a new
+        # one. It is announced rather than assumed: without the field there is
+        # no truncation detection on this run, and that is worth a line.
+        finish_reason = getattr(choice, "finish_reason", None)
+        if finish_reason is None and not _finish_reason_warned:
+            print("  WARNING: the response object carries no finish_reason; "
+                  "truncation cannot be detected on this run. Falling back to "
+                  "JSON-parse failure as the only signal.")
+            _finish_reason_warned = True
+
+        # ── Reactive: the response was cut off, not malformed ──────────────
+        #
+        # Read from finish_reason rather than inferred from a token count. The
+        # previous guard compared output_tokens against 12000, printed a cost
+        # warning, and let the truncated text fall through to json.loads, which
+        # failed and retried an IDENTICAL request that truncated again — three
+        # times, then an error result. finish_reason is the API stating the
+        # fact directly.
+        if finish_reason == FINISH_REASON_LENGTH:
+            truncations_observed += 1
+
+            if len(chunk) == 1:
+                # THE FLOOR. One trial, still over the ceiling; there is
+                # nothing left to halve. Recorded, not retried and not dropped.
+                print(f"  TRUNCATION FLOOR: {chunk[0]['trial']['nct_id']} alone "
+                      f"exceeds the output ceiling. Recording as not evaluable.")
+                unevaluable.append(
+                    _unevaluable_entry(chunk[0], NOT_EVALUABLE_TRUNCATION_FLOOR)
+                )
+                continue
+
+            if depth >= MAX_TRUNCATION_SPLITS:
+                print(f"  TRUNCATION: split budget exhausted at depth {depth}; "
+                      f"recording {len(chunk)} trial(s) as not evaluable.")
+                unevaluable.extend(
+                    _unevaluable_entry(t, NOT_EVALUABLE_SPLIT_BUDGET)
+                    for t in chunk
+                )
+                continue
+
+            left, right = _split_in_half(chunk)
+            truncation_splits += 1
+            print(f"  TRUNCATION at depth {depth}: {len(chunk)} trial(s) -> "
+                  f"{len(left)} + {len(right)}, retrying as two calls "
+                  f"(split {truncation_splits})")
+            # Pushed right-then-left so the LIFO pops left first and the
+            # evaluation order stays the batch's original order.
+            pending.append((right, depth + 1))
+            pending.append((left, depth + 1))
+            continue
+
+        # Clean markdown fences if present
+        if chunk_text.startswith("```"):
+            chunk_text = chunk_text.split("```")[1]
+            if chunk_text.startswith("json"):
+                chunk_text = chunk_text[4:]
+            chunk_text = chunk_text.strip()
+
+        # Parse JSON response
+        try:
+            parsed = json.loads(chunk_text)
+        except json.JSONDecodeError as e:
+            # JSON parse failure: set error for the retry router. Separate
+            # budget from the splits above -- a malformed answer is not a long
+            # one, and re-sending is the right response to it.
+            elapsed = time.time() - start
+            error_msg = f"GPT-4o JSON parse error (attempt {retry_count + 1}): {str(e)}"
+            print(f"  ERROR: {error_msg}")
+            print(f"  Response preview: {chunk_text[:300]}")
+            return {
+                "evaluations": [],
+                "gpt4o_retries": retry_count + 1,
+                "gpt4o_truncation_splits": truncation_splits,
+                "gpt4o_output_tokens_estimated": estimated_output,
+                "gpt4o_raw_response": chunk_text,
+                "error": error_msg,
+                "stage_timings": {**state.get("stage_timings", {}), "gpt4o_evaluation": round(prior_gpt4o_time + elapsed, 3)}
+            }
+
+        if not isinstance(parsed, list):
+            elapsed = time.time() - start
+            error_msg = f"GPT-4o returned non-list JSON (type={type(parsed).__name__})"
+            print(f"  ERROR: {error_msg}")
+            print(f"  Response preview: {chunk_text[:300]}")
+            return {
+                "evaluations": [],
+                "gpt4o_retries": retry_count + 1,
+                "gpt4o_truncation_splits": truncation_splits,
+                "gpt4o_output_tokens_estimated": estimated_output,
+                "gpt4o_raw_response": chunk_text,
+                "error": error_msg,
+                "stage_timings": {**state.get("stage_timings", {}), "gpt4o_evaluation": round(prior_gpt4o_time + elapsed, 3)}
+            }
+
+        evaluations.extend(parsed)
+
+    if truncations_observed:
+        print(f"  [Truncation] {truncations_observed} response(s) hit the "
+              f"{MATCHING_MAX_TOKENS}-token ceiling; {truncation_splits} split(s) "
+              f"performed across {calls_made} call(s)")
+
+    # ── Estimate against actual, so the calibration can be tightened ───────
+    # Logged every run, not only when it matters. The constants in File 03 were
+    # derived from this column pair on 1,094 historical rows; recording the
+    # estimate beside the outcome is what lets the next derivation be better.
+    print(f"  [Output tokens] estimated {estimated_output}, actual "
+          f"{output_tokens} across {calls_made} call(s) "
+          f"(ratio {output_tokens / estimated_output:.2f})"
+          if estimated_output else
+          f"  [Output tokens] actual {output_tokens}")
 
     # SUCCESS: enrich evaluations with trial metadata (title, phase)
     for eval_result in evaluations:
@@ -2900,6 +3469,34 @@ CLINICAL TRIALS:
                if _na_empty else ".")
         )
 
+    # ── Reconciliation: every trial that entered Stage 5 must be accounted for ──
+    #
+    # Three ways a trial can leave this stage without a verdict, and until now
+    # none of them was visible: a truncation floor, an exhausted split budget,
+    # or the model simply not mentioning it in an otherwise valid response.
+    # The first two are collected above; the third is only detectable here, by
+    # comparing what came back against what was sent.
+    #
+    # The invariant this enforces is countable, not vague: after this block,
+    # every nct_id in filtered_trials appears exactly once in evaluations.
+    evaluations.extend(unevaluable)
+
+    _evaluated_ids = {e.get("nct_id") for e in evaluations}
+    _omitted = [t for t in trials if t["trial"]["nct_id"] not in _evaluated_ids]
+    if _omitted:
+        print(f"  [Reconciliation] {len(_omitted)} trial(s) sent to the model "
+              f"came back with no entry; recording as not evaluable: "
+              f"{[t['trial']['nct_id'] for t in _omitted]}")
+        evaluations.extend(
+            _unevaluable_entry(t, NOT_EVALUABLE_MODEL_OMITTED) for t in _omitted
+        )
+
+    not_evaluable_truncated = sum(
+        1 for e in evaluations
+        if e.get("not_evaluable_reason") in (NOT_EVALUABLE_TRUNCATION_FLOOR,
+                                             NOT_EVALUABLE_SPLIT_BUDGET)
+    )
+
     # Sort by match score descending
     evaluations.sort(
          key=lambda x: (x.get("match_score", 0), x.get("nct_id", "")),
@@ -2915,6 +3512,14 @@ CLINICAL TRIALS:
     return {
         "evaluations": evaluations,
         "gpt4o_retries": retry_count,
+        # Two budgets, two counters. gpt4o_retries counts whole-node retries
+        # for malformed or failed responses; this counts levels of halving
+        # spent because a response was cut off. Sharing one would have failed a
+        # patient that hit a single parse error and then needed two splits.
+        "gpt4o_truncation_splits": truncation_splits,
+        "gpt4o_output_tokens_estimated": estimated_output,
+        "not_evaluable_truncated": not_evaluable_truncated,
+        "gpt4o_calls": calls_made,
         "gpt4o_raw_response": response_text,
         "gpt4o_prompt": prompt,
         "gpt4o_input_tokens": input_tokens,
@@ -2923,6 +3528,24 @@ CLINICAL TRIALS:
         "error": "",  # Clear error on success
         "stage_timings": {**state.get("stage_timings", {}), "gpt4o_evaluation": round(prior_gpt4o_time + elapsed, 3)}
     }
+
+
+# ---------------------------------------------------------------------------
+# Terminal node identity
+# ---------------------------------------------------------------------------
+#
+# Each terminal node stamps its own name into the result. A reader used to have
+# to INFER which one ran from the keys that happened to be present -- a
+# non-empty "error" meant the error handler, a "message" key meant no
+# candidates -- which is a rule about incidental structure, not about identity.
+# Adding a "message" key to node_finalize would have silently made every
+# successful run report itself as a no-candidate run.
+#
+# Values are the function names so the string points at the code that produced
+# it. 45-/46- Fixture Capture/Replay read this field; nothing infers it.
+TERMINAL_NODE_FINALIZE = "node_finalize"
+TERMINAL_NODE_NO_CANDIDATES = "node_no_candidates"
+TERMINAL_NODE_ERROR = "node_error_handler"
 
 
 # ---------------------------------------------------------------------------
@@ -2966,6 +3589,19 @@ def _pipeline_provenance(state) -> Dict:
         # state on its success return and on every failure return, so this is
         # the observed number of API / JSON-parse retries, not a ceiling.
         "gpt4o_retries": state.get("gpt4o_retries", 0),
+
+        # --- Stage 5 truncation record ------------------------------------
+        # Defaulted to 0 rather than None, unlike the degradation keys below,
+        # and the difference is deliberate: those describe a stage that may
+        # never have reported, while these describe work that either happened
+        # or did not. A run that ended before Stage 5 genuinely performed zero
+        # splits. The estimate is the exception -- it is None when Stage 5
+        # never ran, because "we estimated nothing" and "we estimated 0 tokens"
+        # are different claims.
+        "gpt4o_truncation_splits": state.get("gpt4o_truncation_splits", 0),
+        "gpt4o_output_tokens_estimated": state.get("gpt4o_output_tokens_estimated"),
+        "not_evaluable_truncated": state.get("not_evaluable_truncated", 0),
+        "gpt4o_calls": state.get("gpt4o_calls", 0),
         # Which stages were disabled for this run; {} = full pipeline. Copied
         # rather than aliased so the logged record cannot be mutated later.
         "ablation_flags": dict(state.get("ablation_flags") or {}),
@@ -3154,6 +3790,8 @@ def node_finalize(state: TrialMatchState) -> dict:
         "timestamp": datetime.now().isoformat(),
         "error": "",
         "patient_data_hash": "",
+        # Which node produced this result, stated rather than inferred.
+        "terminal_node": TERMINAL_NODE_FINALIZE,
         **_pipeline_provenance(state),
     }
 
@@ -3215,6 +3853,7 @@ def node_no_candidates(state: TrialMatchState) -> dict:
         "message": "No trials passed retrieval or filtering for this patient.",
         "error": "",
         "patient_data_hash": "",
+        "terminal_node": TERMINAL_NODE_NO_CANDIDATES,
         "stage_timings": state.get("stage_timings", {}),
         "timestamp": datetime.now().isoformat(),
         **_pipeline_provenance(state),
@@ -3269,6 +3908,7 @@ def node_error_handler(state: TrialMatchState) -> dict:
         "gpt4o_output_tokens": state.get("gpt4o_output_tokens", 0),
         "error": error_msg,
         "patient_data_hash": "",
+        "terminal_node": TERMINAL_NODE_ERROR,
         # Retired key. It said the same thing as gpt4o_retries but existed only
         # on this path, which is how the count came to be logged as 0 for every
         # run that did not end here. Kept as an alias for one release so an
@@ -3965,11 +4605,35 @@ def _create_patient_summary(patient_data: Dict) -> str:
     #
     # Detection uses keyword matching on observation display text, which
     # handles both Synthea (free-text genetic variant strings) and real EHRs
-    # (LOINC-coded molecular panels). Reuses the same keyword set already
-    # proven in the retrieval query builder (lines ~617).
+    # (LOINC-coded molecular panels).
     #
-    # Value normalization: strips common verbose prefixes so GPT-4o sees
-    # clean signal ("EGFR exon 19 deletion: Detected") rather than raw noise.
+    # MATCHED ON WORD BOUNDARIES, not as substrings. Five of these keywords are
+    # three-letter gene symbols and two of them fired constantly as substrings
+    # of ordinary clinical English. Measured over the 1,000-patient cohort,
+    # AFTER the lab-registry skip below:
+    #
+    #   "ret"  20,127 false matches — "Diabetic retinopathy severity level"
+    #                                 (12,560), "Study observation Left/Right
+    #                                 retina by OCT" (6,844), "Natriuretic
+    #                                 peptide.B prohormone N-Terminal" (323)
+    #   "met"   1,908 false matches — "...by High sensitivity method" (739),
+    #                                 "Drugs of abuse 5 panel - Urine by Screen
+    #                                 method" (408), the four metastasis
+    #                                 displays below (701), "Human
+    #                                 metapneumovirus RNA" (60)
+    #   "alk"       0 — no display in the corpus contains the substring
+    #   "msi"       0
+    #   "tmb"       0
+    #
+    # alk, msi and tmb are kept: they never fired here, and deleting a keyword
+    # that is genuinely a biomarker because this particular corpus happens not
+    # to trip it would trade a false positive for a false negative on the next
+    # corpus. The fix belongs at the matching layer, where it protects all five
+    # at once, not in the vocabulary. Nothing is removed from this set.
+    #
+    # The one genuine biomarker match in the corpus, "ERBB2 gene duplication
+    # [Presence] in Breast cancer specimen by FISH" (295), is word-bounded and
+    # survives unchanged.
     _BIOMARKER_KEYWORDS = frozenset({
         "egfr", "kras", "alk", "ros1", "braf", "her2", "erbb2",
         "met", "ret", "ntrk", "pd-l1", "pdl1", "msi", "tmb",
@@ -3978,6 +4642,23 @@ def _create_patient_summary(patient_data: Dict) -> str:
         "deletion", "expression", "microsatellite", "tumor mutational",
         "genetic", "genomic", "molecular",
     })
+
+    # One alternation over the keyword set. Boundary is "not a letter or digit"
+    # so punctuation and hyphens still delimit: "PD-L1", "MSI-H" and "c-MET"
+    # all match; "Generalized", "retinopathy" and "method" do not.
+    #
+    # This used to carry a _METASTASIS_KEYWORDS carve-out, because 701
+    # metastasis observations reached the model only via "met" matching inside
+    # "metastases" and word-bounding would have deleted them silently. They now
+    # have their own routed list (File 07's _METASTASIS_LOINCS) and their own
+    # prompt section, so the carve-out is gone and this set is gene and marker
+    # vocabulary again.
+    _BIOMARKER_PATTERN = re.compile(
+        r"(?<![a-z0-9])(?:"
+        + "|".join(sorted((re.escape(k) for k in _BIOMARKER_KEYWORDS),
+                          key=len, reverse=True))
+        + r")(?![a-z0-9])"
+    )
 
     _BIOMARKER_STRIP_PREFIXES = (
         "genetic variant: ",
@@ -3999,7 +4680,7 @@ def _create_patient_summary(patient_data: Dict) -> str:
         date    = obs.get("date") or ""
 
         display_lower = display.lower()
-        if not any(kw in display_lower for kw in _BIOMARKER_KEYWORDS):
+        if not _BIOMARKER_PATTERN.search(display_lower):
             continue
 
         # Normalize display: strip verbose prefixes
@@ -4029,6 +4710,38 @@ def _create_patient_summary(patient_data: Dict) -> str:
         date     = v.get('date') or ''
         date_str = date[:10] if date and date != 'unknown' else 'date unknown'
         mcode_lines.append(f"- {display} ({date_str})")
+
+    # ── Metastasis & Nodal Status ─────────────────────────────────────────
+    #
+    # Its own section, named for what it is. These observations reached the
+    # model only because "met" matched inside "metastases" in the biomarker
+    # keyword set, which filed disease spread under "Genomic & Molecular
+    # Biomarkers" — a section the model is told contains mutation and
+    # expression findings. 701 observations across the cohort, on four LOINCs
+    # (File 07's _METASTASIS_LOINCS), and nothing else carried them: they are
+    # not in OncologyLabRegistry and not in _MCODE_STAGE_LOINCS.
+    #
+    # The M/N category is printed because it is the distinction that matters to
+    # an eligibility criterion: "no distant metastases" is an M question and
+    # "N0-N1 only" is an N question, and the display text alone
+    # ("Lymph nodes with micrometastases [#] ...") does not say which axis it
+    # is on unless the reader already knows the LOINC.
+    metastasis_obs = patient_data.get("cancer_metastasis_observations") or []
+    summary += "\nMetastasis & Nodal Status:\n"
+    if metastasis_obs:
+        for obs in metastasis_obs:
+            display  = obs.get("display") or "Unknown observation"
+            value    = obs.get("value")
+            unit     = obs.get("unit") or ""
+            category = obs.get("metastasis_category") or "?"
+            date     = obs.get("date") or ""
+            date_str = date[:10] if date and date != "unknown" else "date unknown"
+            unit_str = f" {unit}" if unit else ""
+            value_str = (f": {value}{unit_str}"
+                         if value is not None and str(value).strip() else "")
+            summary += f"- [{category}] {display}{value_str} ({date_str})\n"
+    else:
+        summary += "- None on record\n"
 
     summary += "\nGenomic & Molecular Biomarkers:\n"
     if mcode_lines or biomarker_obs:
@@ -4286,8 +4999,34 @@ def match_patient_to_trials(
     print(f"{Project_Name}: Matching Patient {patient_data['patient_id']}")
     print(f"{'='*80}\n")
 
-    # Build initial state
-    initial_state = {
+    initial_state = build_initial_state(patient_data)
+
+    # Invoke the LangGraph pipeline
+    final_state = graph.invoke(initial_state)
+
+    result = final_state["result"]
+
+    result["qdrant_collection"] = resolve_qdrant_collection()
+
+    result["patient_data_hash"] = compute_patient_hash(patient_data)
+
+    return result
+
+
+def build_initial_state(patient_data: Dict, ablation_flags: Dict = None) -> Dict:
+    """The state every run starts from, in one place.
+
+    Extracted from match_patient_to_trials() because it is no longer that
+    function's private business: 45- Fixture Capture.py and 46- Fixture
+    Replay.py invoke the graph directly (they need the whole final state, not
+    just state["result"]), and a second hand-written copy of this dict would
+    drift from the real one exactly when it mattered — a key seeded here but
+    not there is a run that starts from different ground.
+
+    ablation_flags defaults to {} = full pipeline, which is what every
+    production caller passes.
+    """
+    return {
         "patient_data":       patient_data,
         "expanded_query":     "",
         "hybrid_results":     [],
@@ -4304,7 +5043,7 @@ def match_patient_to_trials(
         "result":             {},
         "error":              "",
         "stage_timings":      {},
-        "ablation_flags":     {},
+        "ablation_flags":     dict(ablation_flags or {}),
         "patient_trees":      set(),
         "patient_histology":  set(),
         "mesh_resolution":    "",
@@ -4313,17 +5052,6 @@ def match_patient_to_trials(
         # _pipeline_provenance() turns absence into NULL rather than into a
         # claim that the stage ran and found nothing wrong.
     }
-
-    # Invoke the LangGraph pipeline
-    final_state = graph.invoke(initial_state)
-
-    result = final_state["result"]
-    
-    result["qdrant_collection"] = resolve_qdrant_collection()
-    
-    result["patient_data_hash"] = compute_patient_hash(patient_data)
-    
-    return result
 
 
 # ===========================================================================

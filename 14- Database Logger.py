@@ -188,6 +188,36 @@ INFERENCE_COLUMN_ADDITIONS = {
     "ecog_value":                   "INTEGER",
     "ecog_selection":               "TEXT",
     "ecog_observations_found":      "INTEGER",
+
+    # --- Stage 5 truncation control (item 19c) -----------------------------
+    #
+    # Two counters because there are two budgets. gpt4o_retries counts whole-
+    # node retries for a malformed or failed response; gpt4o_truncation_splits
+    # counts levels of halving spent because a response was CUT OFF at the
+    # model's output ceiling. Before this, a truncated response fell through to
+    # the JSON parser, failed there, and was retried as an identical request
+    # that truncated again -- so a truncation was logged as three parse
+    # retries, and the two causes were indistinguishable in the record.
+    #
+    # gpt4o_output_tokens_estimated is the pre-call estimate, stored beside the
+    # actual in gpt4o_output_tokens. That column pair is what the constants in
+    # 03- Config.py were derived from over 1,094 historical rows, and storing
+    # the estimate is what lets the next derivation be measured rather than
+    # guessed. NULL when Stage 5 never ran: "estimated nothing" is not "0".
+    #
+    # not_evaluable_truncated counts trials that entered Stage 5 and left with
+    # no verdict because of truncation. It is a SUBSET of not_evaluable_trials
+    # in the sense that both end up not evaluable, but the cause is different
+    # and only this column separates "the model assessed it and could not
+    # conclude" from "the model never got to answer".
+    #
+    # gpt4o_calls is how many requests the stage actually issued. Without it a
+    # split run and an unsplit one are indistinguishable in the token columns,
+    # because the tokens are summed across chunks.
+    "gpt4o_truncation_splits":      "INTEGER",
+    "gpt4o_output_tokens_estimated": "INTEGER",
+    "not_evaluable_truncated":      "INTEGER",
+    "gpt4o_calls":                  "INTEGER",
 }
 
 _existing_inference_columns = {
@@ -434,8 +464,10 @@ def log_inference(result: Dict, patient_data: Dict):
                 retrieval_trials_lost, query_expansion_path,
                 mesh_filter_applied, mesh_filter_skip_reason,
                 age_reference_date, birth_date_precision,
-                ecog_value, ecog_selection, ecog_observations_found
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ecog_value, ecog_selection, ecog_observations_found,
+                gpt4o_truncation_splits, gpt4o_output_tokens_estimated,
+                not_evaluable_truncated, gpt4o_calls
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             result["patient_id"],
             result["timestamp"],
@@ -533,6 +565,14 @@ def log_inference(result: Dict, patient_data: Dict):
             ecog_value,
             ecog_selection,
             ecog_observations_found,
+            # Stage 5 truncation record. The three counts default to 0 because
+            # a run that ended before Stage 5 genuinely performed zero splits
+            # and lost zero trials to truncation; the ESTIMATE has no default,
+            # because a run that never estimated anything did not estimate 0.
+            result.get("gpt4o_truncation_splits", 0),
+            result.get("gpt4o_output_tokens_estimated"),
+            result.get("not_evaluable_truncated", 0),
+            result.get("gpt4o_calls", 0),
         ))
         
         inference_id = cursor.lastrowid

@@ -186,6 +186,77 @@ MAX_GPT4O_RETRIES = 3
 RETRY_BASE_DELAY = 1  # seconds, doubles each retry
 
 
+# ---------------------------------------------------------------------------
+# Stage 5 request shape and truncation control
+# ---------------------------------------------------------------------------
+#
+# MODEL MIGRATION WARNING. MATCHING_MAX_TOKENS is GPT-4o's own output ceiling,
+# not a number anyone chose. Every threshold below is calibrated against it and
+# every one of them must be re-derived when the model changes — a model with a
+# larger ceiling makes the splitter dead weight, and one with a smaller ceiling
+# makes it fire on every run. The calibration procedure is in File 13's
+# estimate_output_tokens docstring; it reads gpt4o_output_tokens and
+# candidates_evaluated straight out of inferences.db, so it can be re-run
+# against whatever history the new model produces.
+
+MATCHING_MAX_TOKENS = 16000  # GPT-4o's ceiling. NOT a chosen value.
+MATCHING_SEED = 42           # best-effort determinism, alongside temperature 0
+
+# Expected output tokens per trial evaluated, used to decide whether a batch
+# should be split BEFORE it is sent.
+#
+# Calibrated over 1,094 historical inferences in inferences.db. At the current
+# batch cap of MAX_TRIALS_FOR_EVALUATION = 15 (555 rows) the measured output
+# per trial was: median 712, p90 784, p95 861, p99 1,028, max 1,062.
+#
+# 900 sits between p90 and p95, deliberately:
+#   - above the median, because a guard that uses the average case is not a
+#     guard;
+#   - below p99, because calibrating to the tail would split every full batch
+#     to prevent a ~1% event that the reactive finish_reason check already
+#     catches for free, and splitting duplicates the system prompt and patient
+#     summary on every run. Measured, that trade is net negative: the extra
+#     input costs more per run than the rare wasted call it would avoid.
+#
+# Where the threshold actually bites, measured rather than predicted. At 15
+# trials the count term alone is 13,500, under the 14,400 threshold — so the
+# splitter fires only when the criteria-length term below pushes it over, which
+# happens for trials with long eligibility text. Observed over a 12-fixture
+# capture: one run pre-split at an estimate of 14,462, and two more were split
+# reactively after a real truncation. Both paths are live at this configuration;
+# neither fires on a typical batch.
+MATCHING_OUTPUT_TOKENS_PER_TRIAL = 900
+
+# Fraction of MATCHING_MAX_TOKENS the estimate may reach before a batch is
+# split pre-emptively. 0.90 leaves 1,600 tokens of headroom for the estimate's
+# own error, which is ~1,935 tokens (1 sd) over the calibration set.
+MATCHING_OUTPUT_SPLIT_FRACTION = 0.90
+
+# How many times a batch may be HALVED because of truncation. This is depth,
+# not repetition, and it is deliberately a separate budget from
+# MAX_GPT4O_RETRIES: a patient that hits one malformed response and then needs
+# two splits must not be failed for exhausting a shared counter. Three levels
+# takes a 15-trial batch to 2 trials.
+MAX_TRUNCATION_SPLITS = 3
+
+# Characters per token. The same crude proxy File 11 uses for its embedding
+# batch sizing; kept identical so the two agree, and kept crude on purpose —
+# tiktoken would be a dependency and an import cost for an estimate whose job
+# is to be roughly right before a call that is about to measure it exactly.
+CHARS_PER_TOKEN = 4
+
+
+# ---------------------------------------------------------------------------
+# Stage 1 query expansion
+# ---------------------------------------------------------------------------
+
+# Ceiling on distinct genomic variant terms that reach the expanded query and
+# the R4 rerank query. R4 is scored by MedCPT, which was trained on 2-10 word
+# PubMed queries, so an unbounded list of variants is a worse query, not a
+# better one.
+MAX_VARIANT_TERMS = 8
+
+
 #------------------------------------------------------------------------------
 
 

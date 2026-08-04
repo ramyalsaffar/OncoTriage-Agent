@@ -248,6 +248,17 @@ def parse_fhir_bundle(bundle_path: str) -> Dict:
         'cancer_stage_observations': [],  # mCODE TNM stage group Observations (LOINC 21908-9/21902-2/21914-7)
         'cancer_genomic_variants':   [],  # mCODE genomic variant Observations (LOINC 69548-6)
 
+        # Metastasis and nodal-burden Observations (see _METASTASIS_LOINCS).
+        # Routed out of 'observations' for the same reason ECOG and the stage
+        # groups are: pooled there they were unreachable except by accident.
+        # OncologyLabRegistry does not carry these codes, so the lab section
+        # never showed them, and the only thing that ever put them in front of
+        # the model was the substring "met" matching inside "metastases" in
+        # File 13's biomarker keyword set -- which filed disease spread under
+        # "Genomic & Molecular Biomarkers" and would have deleted it silently
+        # the moment that matching was corrected.
+        'cancer_metastasis_observations': [],
+
         # ECOG performance status (LOINC 89247-1), reduced to one score.
         # Populated unconditionally at the end of this function, including for
         # patients with no observation -- see _select_ecog_performance_status()
@@ -335,6 +346,10 @@ def parse_fhir_bundle(bundle_path: str) -> Dict:
                     patient_data['cancer_genomic_variants'].append(
                         _parse_mcode_genomic_variant(resource)
                     )
+                elif obs_loinc in _METASTASIS_LOINCS:
+                    _met = _parse_observation(resource)
+                    _met['metastasis_category'] = _METASTASIS_LOINCS[obs_loinc]
+                    patient_data['cancer_metastasis_observations'].append(_met)
                 elif obs_loinc == _ECOG_LOINC_CODE:
                     # Routed out of the general pool deliberately. Pooled in
                     # observations it was unreachable: OncologyLabRegistry does
@@ -1035,6 +1050,35 @@ def _select_ecog_performance_status(ecog_observations: List[Dict]) -> Dict:
 
 # mCODE genomic variant Observation LOINC code
 _MCODE_GENOMIC_VARIANT_LOINC: str = "69548-6"
+
+# Observations describing how far the disease has spread, mapped to the TNM
+# axis each one belongs to. Facts about an external standard, so they are named
+# constants here rather than configuration.
+#
+# Enumerated by measurement over the 1,000-patient corpus rather than assumed:
+#   21907-1  Distant metastases.clinical [Class] Cancer            295 obs / 295 patients
+#            values: AJCC cM0 (290), cM1 (5)
+#   44667-4  Site of distant metastasis in Breast tumor            290 obs / 290 patients
+#            values: "None (qualifier value)" (290)
+#   85344-0  Lymph nodes with micrometastases [#] ...               77 obs /  77 patients
+#   85343-2  Lymph nodes with macrometastases [#] ...               39 obs /  39 patients
+#
+# The category is recorded per code because M and N are different clinical
+# facts: cM1 is distant spread, a positive node count is regional burden, and a
+# trial's exclusion criteria treat them differently. Callers that need one and
+# not the other can filter without re-deriving the mapping from the display.
+#
+# DELIBERATELY NOT ADDED to _MCODE_STAGE_LOINCS. That list feeds
+# extract_patient_stage (File 10), whose regex expects stage GROUP values --
+# "Stage IIB", "IIIA". It does not read "cM1" as Stage IV, and teaching it to
+# is a matching change with its own consequences for the Stage 4 stage filter.
+# That belongs in its own item, after the refactor.
+_METASTASIS_LOINCS: Dict[str, str] = {
+    "21907-1": "M",   # AJCC clinical M category
+    "44667-4": "M",   # site of distant metastasis
+    "85344-0": "N",   # nodal micrometastases, count
+    "85343-2": "N",   # nodal macrometastases, count
+}
 
 # Component LOINC codes inside a genomic variant Observation
 _COMPONENT_GENE_STUDIED:      str = "48018-6"   # Gene studied [ID] — display = gene symbol e.g. "EGFR"
