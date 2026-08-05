@@ -341,6 +341,14 @@ import gzip
 import tempfile
 from types import SimpleNamespace
 
+# The dependency seam, and the module that owns the raw MedCPT scorer.
+# `deps` is already in this namespace via File 13's shim; imported explicitly
+# anyway, because a hook installer that reached its own seam through a name
+# some other file happened to bind is exactly the class of thing this pass
+# exists to remove.
+from oncotriage.agent import deps
+from oncotriage.agent import models as _agent_models
+
 
 # ===========================================================================
 # WHERE FIXTURES LIVE
@@ -806,11 +814,35 @@ def _recording_medcpt(inner, sink: RecordingSink):
 # HOOK INSTALLATION
 # ===========================================================================
 #
-# Every project file is exec'd into THIS module's globals(), so File 13's
-# functions resolve `openai_client`, `qdrant_client`, `_bm25_query_model` and
-# `medcpt_score_pairs` out of this dict at call time. Rebinding a name here is
-# therefore all it takes to redirect the pipeline, and restoring it puts things
-# back exactly.
+# THIS USED TO REBIND FOUR NAMES IN THIS MODULE'S globals(), AND THAT STOPPED
+# WORKING IN PASS 20c-2c. The old comment read:
+#
+#   Every project file is exec'd into THIS module's globals(), so File 13's
+#   functions resolve `openai_client`, `qdrant_client`, `_bm25_query_model` and
+#   `medcpt_score_pairs` out of this dict at call time. Rebinding a name here is
+#   therefore all it takes to redirect the pipeline, and restoring it puts
+#   things back exactly.
+#
+# Every sentence of that was true and every sentence of it is now false. File 13
+# is a shim over oncotriage/agent/; its functions resolve their globals in their
+# own modules, and a rebinding here reaches none of them.
+#
+# THE CONSEQUENCE, IF NOTHING HAD CHANGED HERE, is the worst shape a regression
+# can have. Capture would have issued real OpenAI calls and recorded NOTHING
+# into the fixture, and 46- Fixture Replay.py -- whose entire claim is that it
+# makes no model call -- would have sent every Stage 5 prompt to the real
+# endpoint and paid for it, while still reporting that all twelve fixtures
+# replayed clean. Nothing would have raised.
+#
+# oncotriage/agent/deps.py is the replacement: a real seam with named override
+# keys, which every call site inside the agent goes through. The four hooks are
+# the same four objects; only the installation changed.
+#
+# MEDCPT_SCORER, not MEDCPT_MODEL. The fixture records SCORES -- one float per
+# trial text, keyed by the query and a sha256 of the texts -- so the whole
+# (query, trial_texts) -> scores function is the seam. Replaying at the model
+# level would mean fabricating a logits tensor and a tokenizer output shape to
+# go with it, which is a second implementation of the thing under test.
 
 _HOOKED_NAMES = (
     "openai_client",
@@ -818,28 +850,98 @@ _HOOKED_NAMES = (
     "_bm25_query_model",
     "medcpt_score_pairs",
 )
+"""The four seams, under their pre-2c names. Kept because 46- Fixture Replay.py
+imports it and because the fixture schema and every diagnostic message in both
+files speak in these terms. _HOOK_KEYS below is the mapping to the deps keys
+that actually install them."""
+
+_HOOK_KEYS = {
+    "openai_client":      deps.OPENAI_CLIENT,
+    "qdrant_client":      deps.QDRANT_CLIENT,
+    "_bm25_query_model":  deps.BM25_QUERY_MODEL,
+    "medcpt_score_pairs": deps.MEDCPT_SCORER,
+}
+
+
+def current_hook_targets() -> dict:
+    """What the agent would reach RIGHT NOW for each of the four seams.
+
+    Asked of deps, not of this namespace, because deps is what the agent asks.
+    That is the whole point: a check that reads this module's globals would
+    still pass with the hooks installed nowhere.
+
+    MEDCPT_SCORER has no default inside deps -- oncotriage.agent.models owns it
+    -- so an un-installed scorer reads back as deps.UNSET rather than as the
+    real function. That asymmetry is deliberate and is what the assertions
+    below compare against.
+    """
+    return {
+        "openai_client":      deps.get_openai_client(),
+        "qdrant_client":      deps.get_qdrant_client(),
+        "_bm25_query_model":  deps.get_bm25_query_model(),
+        "medcpt_score_pairs": deps.get_override(deps.MEDCPT_SCORER),
+    }
+
+
+def assert_hooks_reach_the_agent(expected: dict, what: str) -> None:
+    """Refuse to run unless the agent reaches EXACTLY these four objects.
+
+    Identity, not equality: a proxy forwards __eq__ to the object it wraps, so
+    an equality test would happily accept the real client.
+
+    This is the assertion that replaces "the rebinding worked because it always
+    worked". It is called before every capture and before every replay, and
+    46- Fixture Replay.py demonstrates it FAILING when the overrides are not
+    installed -- otherwise it would be one more thing that has only ever passed.
+    """
+    reached = current_hook_targets()
+    wrong = sorted(
+        name for name in _HOOKED_NAMES if reached[name] is not expected[name]
+    )
+    if wrong:
+        raise RuntimeError(
+            f"{what}: the agent does NOT reach the installed hook(s) for "
+            f"{wrong}. oncotriage.agent.deps is the seam; rebinding a name in "
+            f"this namespace redirects nothing, and the pipeline would run "
+            f"against the real client while this file reported otherwise.\n"
+            f"  installed via: deps.set_override(deps.<KEY>, proxy)\n"
+            f"  active override keys: {deps.active_overrides()}"
+        )
 
 
 def install_recording_hooks(sink: RecordingSink,
                             truncate_first_call: bool = False) -> dict:
-    """Redirect all four seams to recorders. Returns the saved originals."""
-    saved = {name: globals()[name] for name in _HOOKED_NAMES}
+    """Redirect all four seams to recorders. Returns the saved override state.
 
-    globals()["openai_client"] = OpenAIProxy(
-        saved["openai_client"],
-        _recording_embedding(sink),
-        _recording_chat(sink, truncate_first_call),
+    The return value goes to restore_hooks(), which is deps.restore_overrides()
+    -- so a seam that had no override before is CLEARED rather than pinned to
+    whatever it happened to resolve to.
+    """
+    proxies = {
+        deps.OPENAI_CLIENT: OpenAIProxy(
+            deps.get_openai_client(),
+            _recording_embedding(sink),
+            _recording_chat(sink, truncate_first_call),
+        ),
+        deps.QDRANT_CLIENT: QdrantProxy(deps.get_qdrant_client(), sink),
+        deps.BM25_QUERY_MODEL: SparseModelProxy(deps.get_bm25_query_model(), sink),
+        # Wraps the RAW function, not models.score_pairs, or the override would
+        # dispatch back into itself on every call.
+        deps.MEDCPT_SCORER: _recording_medcpt(
+            _agent_models.medcpt_score_pairs, sink),
+    }
+    saved = deps.set_overrides(proxies)
+
+    assert_hooks_reach_the_agent(
+        {name: proxies[key] for name, key in _HOOK_KEYS.items()},
+        "install_recording_hooks",
     )
-    globals()["qdrant_client"] = QdrantProxy(saved["qdrant_client"], sink)
-    globals()["_bm25_query_model"] = SparseModelProxy(saved["_bm25_query_model"], sink)
-    globals()["medcpt_score_pairs"] = _recording_medcpt(saved["medcpt_score_pairs"], sink)
-
     return saved
 
 
 def restore_hooks(saved: dict) -> None:
-    for name, value in saved.items():
-        globals()[name] = value
+    """Undo install_recording_hooks / install_replay_hooks."""
+    deps.restore_overrides(saved)
 
 
 #------------------------------------------------------------------------------

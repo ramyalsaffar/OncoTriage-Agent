@@ -49,4 +49,5 @@ packages = [
     "oncotriage.extraction",
     "oncotriage.fhir",
     "oncotriage.storage",
+    "oncotriage.agent",
 ]

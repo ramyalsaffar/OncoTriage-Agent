@@ -363,7 +363,24 @@ class StubOpenAI:
 
 @contextlib.contextmanager
 def swap_globals(**overrides):
-    """Temporarily rebind module-level names in the shared exec namespace."""
+    """Temporarily rebind module-level names in the shared exec namespace.
+
+    KEPT, BUT IT NO LONGER REDIRECTS THE PIPELINE (pass 20c-2c). Every use of it
+    in this file used to redirect one of File 13's dependencies -- qdrant_client,
+    get_embedding, _MESH_FILTER, openai_client -- and that worked only because
+    every project file was exec'd into this one namespace. File 13 is a shim
+    over oncotriage/agent/ now: its functions resolve their globals in their own
+    modules, so a rebinding here reaches nothing. Stage 2 would have queried the
+    REAL Qdrant collection and called the REAL OpenAI embedding endpoint, and
+    Stage 5 would have sent the real Stage 5 prompt to the real model, while
+    every assertion in this file went on describing stubs nobody was calling.
+    None of it would have raised.
+
+    swap_deps() below is the replacement. This one survives only because it is
+    the honest name for what it does, and because nothing in this file needs it
+    any more -- if a future case does need to rebind a name that is genuinely a
+    shared global rather than an agent dependency, this is still the tool.
+    """
     _sentinel = object()
     previous = {k: globals().get(k, _sentinel) for k in overrides}
     globals().update(overrides)
@@ -377,15 +394,59 @@ def swap_globals(**overrides):
                 globals()[k] = v
 
 
+@contextlib.contextmanager
+def swap_deps(**overrides):
+    """Temporarily install agent dependency overrides, by deps key name.
+
+        with swap_deps(qdrant_client=stub, mesh_filter=None):
+            ...
+
+    Keyword names are the deps key constants (deps.QDRANT_CLIENT is
+    "qdrant_client", deps.MESH_FILTER is "mesh_filter", ...), so a misspelling
+    raises KeyError out of deps.set_override rather than being ignored -- which
+    is the specific failure this whole seam exists to make impossible.
+    """
+    saved = deps.set_overrides(overrides)
+    try:
+        yield
+    finally:
+        deps.restore_overrides(saved)
+
+
+class StubEmbeddingOpenAI:
+    """The .embeddings.create shape Stage 2's dense channel uses.
+
+    Stubbing the CLIENT rather than the get_embedding FUNCTION is deliberate:
+    the client is the seam production goes through, and it is the same one
+    Stage 5 and Files 45/46 use. A second override key for the function would
+    have been a bypass built for the test.
+    """
+
+    def __init__(self, vector=None):
+        self.vector = vector if vector is not None else [0.1] * 8
+        self.calls = 0
+        self.embeddings = self
+
+    def create(self, model=None, input=None, timeout=None, **kwargs):
+        self.calls += 1
+        return type("R", (), {
+            "data": [type("D", (), {"embedding": self.vector})()]
+        })()
+
+
 def sparse_token_count(text: str) -> int:
-    """Number of BM25 terms the real query model produces for text."""
-    return len(next(_bm25_query_model.query_embed(text)).indices)
+    """Number of BM25 terms the real query model produces for text.
+
+    Through the seam, so this measures the object Stage 2 would actually use.
+    The shim's _bm25_query_model resolves to the same thing, but asking deps is
+    the honest way to say "whatever the agent has".
+    """
+    return len(next(deps.get_bm25_query_model().query_embed(text)).indices)
 
 
 def run_retrieval(expanded_query, rerank_queries, qdrant, ablation_flags=None):
     """Invoke Stage 2 against a stubbed Qdrant and a stubbed embedding call."""
-    with swap_globals(qdrant_client=qdrant,
-                      get_embedding=lambda text: [0.1] * 8):
+    with swap_deps(qdrant_client=qdrant, openai_client=StubEmbeddingOpenAI()):
         return node_hybrid_retrieval({
             "patient_data": PATIENT_DATA,
             "expanded_query": expanded_query,
@@ -404,6 +465,20 @@ def run_retrieval(expanded_query, rerank_queries, qdrant, ablation_flags=None):
 print("\n" + "=" * 75)
 print("SECTION A -- BM25 tokenization of degenerate query text")
 print("=" * 75)
+
+# --- THE OVERRIDE SEAM IS SHOWN TO WORK, BEFORE ANYTHING RELIES ON IT -------
+# Every stub in this file is installed through deps now. If set_override were
+# ignored, every Stage 2 assertion below would be describing the real Qdrant
+# collection and the real OpenAI endpoint instead of the stubs -- silently.
+# Identity is asserted, and the negative control underneath is what makes the
+# identity check discriminating.
+_seam_probe = StubEmbeddingOpenAI()
+with swap_deps(openai_client=_seam_probe):
+    check("deps hands the agent the overridden OpenAI client",
+          deps.get_openai_client() is _seam_probe, True)
+check("...and the override is gone once the block exits, so the check above "
+      "can fail (negative control)",
+      deps.get_openai_client() is _seam_probe, False)
 
 check("empty string yields no BM25 terms", sparse_token_count(""), 0)
 check("whitespace-only yields no BM25 terms", sparse_token_count("   \t  "), 0)
@@ -431,7 +506,7 @@ print("\n" + "=" * 75)
 print("SECTION B -- Stage 1 fallback produces an empty disease query")
 print("=" * 75)
 
-with swap_globals(_MESH_FILTER=None):
+with swap_deps(mesh_filter=None):
     expansion_ok = node_query_expansion({"patient_data": PATIENT_DATA,
                                          "stage_timings": {}})
     expansion_empty = node_query_expansion({"patient_data": PATIENT_NO_DISPLAY,
@@ -595,7 +670,7 @@ _probe_collection = os.environ.get("ONCOTRIAGE_QDRANT_PROBE_COLLECTION",
 
 try:
     _probe_client = (QdrantClient(url=_probe_url, timeout=15)
-                     if _probe_url else qdrant_client)
+                     if _probe_url else deps.get_qdrant_client())
     _probe_points = _probe_client.query_points(
         collection_name=_probe_collection,
         query=SparseVector(indices=[], values=[]),
@@ -642,13 +717,13 @@ def run_rule_filter(patient_trees, ablation_flags=None, mesh_filter=...):
     }
     if mesh_filter is ...:
         return node_rule_based_filter(state)
-    with swap_globals(_MESH_FILTER=mesh_filter):
+    with swap_deps(mesh_filter=mesh_filter):
         return node_rule_based_filter(state)
 
 
 # The real filter object, when the MeSH data files loaded. Skipped rather than
 # faked when they did not: the point of this case is that the real filter ran.
-if _MESH_FILTER is not None:
+if deps.get_mesh_filter() is not None:
     applied = run_rule_filter({"C04.588.894.797.520"})
     check("filter loaded + trees resolved: applied",
           applied["mesh_filter_applied"], True)
@@ -711,7 +786,7 @@ def run_evaluation(mesh_filter_applied, skip_reason):
         "mesh_filter_skip_reason": skip_reason,
         "stage_timings": {},
     }
-    with swap_globals(openai_client=stub_openai):
+    with swap_deps(openai_client=stub_openai):
         result = node_gpt4o_evaluation(state)
     system_message = stub_openai.captured_messages[0]["content"]
     return result, system_message

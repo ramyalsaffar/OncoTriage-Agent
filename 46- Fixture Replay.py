@@ -308,23 +308,118 @@ def _replay_medcpt(state: _ReplayState):
     return wrapper
 
 
+class _TripwireEndpoint:
+    """A stand-in for one OpenAI sub-object. Raises the moment it is used.
+
+    OpenAIProxy READS inner.embeddings and inner.chat.completions in its
+    __init__, to build the two shims that serve them from the recording. Those
+    two reads are structural and must succeed; what must never happen is a CALL
+    reaching the network. So the tripwire hands back these placeholders for the
+    two known paths, and they raise on any attribute access or call underneath.
+    """
+
+    def __init__(self, path):
+        object.__setattr__(self, "_path", path)
+
+    def _explode(self, what):
+        raise FixtureReplayMiss(
+            f"replay reached the real OpenAI client at {self._path}.{what}. "
+            f"A replay must make no request to OpenAI; this would have been a "
+            f"real, billed call. Either the pipeline now uses an OpenAI surface "
+            f"the recording does not cover, or a hook is missing from "
+            f"install_replay_hooks()."
+        )
+
+    def __getattr__(self, attr):
+        if attr == "completions":
+            return _TripwireEndpoint(f"{self._path}.completions")
+        self._explode(attr)
+
+    def __call__(self, *args, **kwargs):
+        self._explode("()")
+
+
+class _OpenAITripwire:
+    """Stands where the real OpenAI client would be, and raises on any use.
+
+    THIS IS THE MONEY GUARD, and it is the reason replay can claim "no request
+    reaches OpenAI" rather than merely intending it.
+
+    OpenAIProxy forwards UNKNOWN attributes to the object it wraps. In capture
+    that object is the real client, which is correct -- capture is supposed to
+    call OpenAI. In replay it must not be, because any surface the proxy does
+    not intercept would go straight through to the endpoint and be billed while
+    the replay reported clean. So replay wraps THIS instead: the two paths the
+    proxy does intercept (embeddings, chat.completions) are handed inert
+    placeholders that the proxy immediately shadows with its recording shims,
+    and every other attribute raises by name.
+
+    It is not a substitute for the identity assertion in
+    install_replay_hooks() -- that one catches a hook that was never installed,
+    this one catches a hook that was installed but incomplete. Different
+    failures, both silent without a guard.
+    """
+
+    _STRUCTURAL = ("embeddings", "chat")
+
+    def __init__(self):
+        object.__setattr__(self, "touched", [])
+
+    def __getattr__(self, attr):
+        self.touched.append(attr)
+        if attr in _OpenAITripwire._STRUCTURAL:
+            # Read by OpenAIProxy.__init__ and then SHADOWED by its shim. The
+            # placeholder is what makes an un-shadowed use raise instead of
+            # reaching the network.
+            return _TripwireEndpoint(f"openai_client.{attr}")
+        raise FixtureReplayMiss(
+            f"replay reached the OpenAI client for {attr!r}, which the fixture "
+            f"does not serve. A replay must make no request to OpenAI; this "
+            f"would have been a real, billed call. Either the pipeline now uses "
+            f"an OpenAI surface the recording does not cover, or a hook is "
+            f"missing from install_replay_hooks()."
+        )
+
+
 def install_replay_hooks(fixture: Dict, sink) -> tuple:
     """Point all four seams at the recording. Returns (saved, replay_state).
 
+    INSTALLED THROUGH oncotriage.agent.deps SINCE PASS 20c-2c. This used to
+    rebind four names in this module's globals(), which worked only because
+    every project file was exec'd into one dict. File 13 is a shim over
+    oncotriage/agent/ now, its functions resolve their globals in their own
+    modules, and a rebinding here would have redirected NOTHING: every Stage 5
+    prompt in every fixture would have gone to the real OpenAI endpoint, been
+    billed, and the run would still have printed that all twelve replayed
+    clean. Nothing would have raised. That is the defect the seam exists for.
+
     Qdrant alone still talks to the network: the corpus is the fixed input, not
-    a recorded output.
+    a recorded output. That is why this file cannot be run with all egress
+    blocked, and why the OpenAI side gets a tripwire instead -- see
+    _OpenAITripwire.
     """
     state = _ReplayState(fixture, sink)
-    saved = {name: globals()[name] for name in _HOOKED_NAMES}
 
-    globals()["openai_client"] = OpenAIProxy(
-        saved["openai_client"],
-        _replay_embedding(state),
-        _replay_chat(state),
+    proxies = {
+        deps.OPENAI_CLIENT: OpenAIProxy(
+            # NOT the real client. See _OpenAITripwire.
+            _OpenAITripwire(),
+            _replay_embedding(state),
+            _replay_chat(state),
+        ),
+        deps.QDRANT_CLIENT: QdrantProxy(deps.get_qdrant_client(), sink),
+        deps.BM25_QUERY_MODEL: ReplaySparseModel(state),
+        deps.MEDCPT_SCORER: _replay_medcpt(state),
+    }
+    saved = deps.set_overrides(proxies)
+
+    # THE ASSERTION THAT REPLACES "IT ALWAYS WORKED". Identity, against what
+    # deps hands the agent -- not against this namespace, which would pass with
+    # the hooks installed nowhere.
+    assert_hooks_reach_the_agent(
+        {name: proxies[key] for name, key in _HOOK_KEYS.items()},
+        "install_replay_hooks",
     )
-    globals()["qdrant_client"] = QdrantProxy(saved["qdrant_client"], sink)
-    globals()["_bm25_query_model"] = ReplaySparseModel(state)
-    globals()["medcpt_score_pairs"] = _replay_medcpt(state)
 
     return saved, state
 
@@ -640,6 +735,103 @@ def main() -> int:
 
     if not fixtures:
         print("[FATAL] No fixture could be loaded.")
+        return 1
+
+    # --- THE SEAM, CHECKED BEFORE ANYTHING IS REPLAYED ----------------------
+    #
+    # This block exists because of the defect pass 20c-2c fixed, and it is
+    # deliberately the first thing main() does.
+    #
+    # Until pass 2c, install_replay_hooks() redirected the pipeline by rebinding
+    # four names in this module's globals(). That worked only because every
+    # project file was exec'd into one dict. File 13 is now a shim over
+    # oncotriage/agent/, whose functions resolve their globals in their own
+    # modules -- so a rebinding here reaches nothing, every Stage 5 prompt in
+    # every fixture goes to the REAL OpenAI endpoint and is BILLED, and this
+    # file still prints that all twelve replayed clean. Nothing raises.
+    #
+    # assert_hooks_reach_the_agent() (File 45) is what makes that impossible: it
+    # asks deps what the AGENT would reach and requires it to be the proxy, by
+    # identity. Two things are checked here, in this order:
+    #
+    #   1. NEGATIVE CONTROL FIRST. With no overrides installed, the assertion
+    #      must RAISE. An assertion that has only ever passed is not evidence it
+    #      can catch anything -- and this one guards the only thing in this
+    #      repository that costs money to get wrong.
+    #   2. Then the real thing, installed and torn down, must pass.
+    #
+    # No fixture is loaded and no model is called by either step.
+    print("\n  Dependency seam (oncotriage.agent.deps):")
+
+    _probe_sink = RecordingSink()
+    # An EMPTY fixture, of the shape _ReplayState indexes. Nothing is served
+    # from it -- the probe never invokes the pipeline, it only checks which
+    # objects deps hands out -- so every recording list is empty on purpose.
+    _probe_state = _ReplayState(
+        {
+            "fixture_id": "_seam_probe",
+            "recordings": {
+                "openai_embeddings": [],
+                "sparse_embeddings": [],
+                "cross_encoder": [],
+                "chat_completions": [],
+            },
+        },
+        _probe_sink,
+    )
+    _probe_proxies = {
+        deps.OPENAI_CLIENT: OpenAIProxy(_OpenAITripwire(),
+                                        _replay_embedding(_probe_state),
+                                        _replay_chat(_probe_state)),
+        deps.QDRANT_CLIENT: QdrantProxy(deps.get_qdrant_client(), _probe_sink),
+        deps.BM25_QUERY_MODEL: ReplaySparseModel(_probe_state),
+        deps.MEDCPT_SCORER: _replay_medcpt(_probe_state),
+    }
+    _probe_expected = {name: _probe_proxies[key] for name, key in _HOOK_KEYS.items()}
+
+    try:
+        assert_hooks_reach_the_agent(_probe_expected, "negative control")
+    except RuntimeError as _exc:
+        print(f"    negative control: the assertion FAILS with no override "
+              f"installed, as it must")
+        print(f"      {str(_exc).splitlines()[0]}")
+    else:
+        print("\n[FATAL] THE SEAM CHECK PROVES NOTHING.")
+        print("        assert_hooks_reach_the_agent() passed with NO override "
+              "installed, so it would also pass if install_replay_hooks() "
+              "redirected nothing -- and every Stage 5 call below would be a "
+              "real, billed request to OpenAI.")
+        return 1
+
+    _probe_saved = deps.set_overrides(_probe_proxies)
+    try:
+        assert_hooks_reach_the_agent(_probe_expected, "positive control")
+        print("    positive control: with the overrides installed, the agent "
+              "reaches all four proxies")
+    finally:
+        deps.restore_overrides(_probe_saved)
+
+    # And the OpenAI tripwire itself: the replay client wraps a stand-in that
+    # raises, not the real client, so a model surface the recording does not
+    # cover fails loudly instead of being forwarded and billed.
+    # Both halves: an unknown surface must raise by name, and the two the proxy
+    # shadows must raise as soon as anything actually CALLS them.
+    _tripwire_armed = 0
+    try:
+        _OpenAITripwire().responses          # a surface the recording never covers
+    except FixtureReplayMiss:
+        _tripwire_armed += 1
+    try:
+        _OpenAITripwire().chat.completions.create(model="x")   # the shadowed path
+    except FixtureReplayMiss:
+        _tripwire_armed += 1
+    if _tripwire_armed == 2:
+        print("    OpenAI tripwire armed: an unrecorded surface AND an "
+              "unshadowed chat.completions.create both raise instead of "
+              "reaching the network")
+    else:
+        print(f"\n[FATAL] the OpenAI tripwire raised on {_tripwire_armed}/2 "
+              f"probes; refusing to replay.")
         return 1
 
     # --- The pinned collection, checked before anything is replayed ---------

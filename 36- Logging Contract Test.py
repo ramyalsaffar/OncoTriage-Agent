@@ -336,6 +336,37 @@ def stub_get_embedding(text):
     return [0.1] * 8
 
 
+class _StubEmbeddingResponse:
+    def __init__(self, vector):
+        self.data = [type("Datum", (), {"embedding": vector})()]
+
+
+class StubOpenAIClient:
+    """The shape get_embedding() actually uses: .embeddings.create(...).
+
+    PASS 20c-2c REPLACED A REBINDING OF get_embedding WITH THIS. Test 4 used to
+    do `get_embedding = stub_get_embedding` in this namespace, which reached
+    File 13's Stage 2 because every file shared one dict. The agent is a package
+    now and resolves get_embedding in its own module, so that rebinding would
+    have redirected nothing and the dense channel would have called the REAL
+    OpenAI embedding endpoint -- billed, on a test that reports it made no
+    network call.
+
+    Stubbing the CLIENT rather than adding a second override key for the
+    function is deliberate: it is the same seam Stage 5 and Files 45/46 use, so
+    this test exercises the path production takes instead of a bypass built for
+    it.
+    """
+
+    def __init__(self):
+        self.embedding_calls = 0
+        self.embeddings = self
+
+    def create(self, model=None, input=None, timeout=None, **kwargs):
+        self.embedding_calls += 1
+        return _StubEmbeddingResponse(stub_get_embedding(input))
+
+
 def make_stage2_state(ablation_flags=None) -> dict:
     """Input state for node_hybrid_retrieval."""
     return {
@@ -443,7 +474,18 @@ print("\n" + "=" * 70)
 print("Test 2: every node_gpt4o_evaluation return carries gpt4o_retries")
 print("=" * 70)
 
-with open(_code_dir + "13- LangGraph Agent.py") as _fh:
+# RETARGETED IN PASS 20c-2c, and this one COULD have gone silently green.
+# node_gpt4o_evaluation moved to oncotriage/agent/evaluation.py, and
+# "13- LangGraph Agent.py" is now a re-export shim with no function definitions
+# in it. The walk below would have found nothing, left _gpt4o_returns EMPTY, and
+# then:
+#     len([]) >= 2                                  -> False -> that check FAILS
+#     sorted(ln for ln, keys in [] if ...) == []    -> True  -> this one PASSES
+# So one of the two would have gone quietly green on a file it had not read.
+# That is the same shape as the File 36/14 defect pass 2b found, and it is why
+# the non-degeneracy check below is not optional.
+_EVALUATION_SOURCE = os.path.join(_code_dir, "oncotriage", "agent", "evaluation.py")
+with open(_EVALUATION_SOURCE, encoding="utf-8") as _fh:
     _tree = ast.parse(_fh.read())
 
 _gpt4o_returns = []
@@ -457,6 +499,11 @@ for _fn in ast.walk(_tree):
                      if isinstance(k, ast.Constant) and isinstance(k.value, str)},
                 ))
 
+# NON-DEGENERATE FIRST. "no return omits gpt4o_retries" is vacuously true for a
+# function that was never found, which is exactly what a stale filename gives.
+check("the parsed source actually defines node_gpt4o_evaluation",
+      any(isinstance(n, ast.FunctionDef) and n.name == "node_gpt4o_evaluation"
+          for n in ast.walk(_tree)), True)
 check("found node_gpt4o_evaluation's dict returns", len(_gpt4o_returns) >= 2, True)
 check("every return declares gpt4o_retries",
       sorted(ln for ln, keys in _gpt4o_returns if "gpt4o_retries" not in keys),
@@ -507,15 +554,40 @@ check("...and an ATTRIBUTE name it certainly reads (paths.inferences_path), so "
 for _const in ("BM25_RETRIEVAL_SIZE", "VECTOR_RETRIEVAL_SIZE"):
     check(f"the logger no longer reads {_const}", _const in _logger_names, False)
 
-# The registry call that replaced File 13's _CANCER_REGISTRY global (pass 2b).
-# Asserted here because it is a name this file's scan now sees, and because a
-# revert to the global would be a silent layering regression: the global is
-# UNBOUND in any chain that loads 14 without 13, and _resolve_primary_cancer
-# would raise NameError rather than resolve a diagnosis.
-check("the logger resolves the cancer registry through load_registry()",
-      "load_registry" in _logger_names, True)
+# The registry resolution that replaced File 13's _CANCER_REGISTRY global.
+#
+# Pass 2b made _resolve_primary_cancer call load_registry() INSIDE the logger.
+# Pass 2c moved the whole function to oncotriage/registries/primary_cancer.py,
+# because it is a domain question that opens no database and because the agent's
+# terminal nodes call it too -- which had the AGENT depending on the STORAGE
+# layer for a registry lookup. So the assertion moves with it: the logger must
+# IMPORT the function, and the module that now owns it must be the one calling
+# load_registry().
+#
+# A revert to the global would be a silent layering regression either way: the
+# global is UNBOUND in any chain that loads 14 without 13, and the function
+# would raise NameError rather than resolve a diagnosis. File 38 section 9b is
+# the behavioural half of this check, in the one chain where that happens.
+check("the logger imports _resolve_primary_cancer rather than defining it",
+      "_resolve_primary_cancer" in _logger_names, True)
 check("...and no longer reads File 13's _CANCER_REGISTRY global",
       "_CANCER_REGISTRY" in _logger_names, False)
+
+_PRIMARY_CANCER_SOURCE = os.path.join(_code_dir, "oncotriage", "registries",
+                                      "primary_cancer.py")
+with open(_PRIMARY_CANCER_SOURCE, encoding="utf-8") as _fh:
+    _primary_tree = ast.parse(_fh.read())
+_primary_names = (
+    {_n.id for _n in ast.walk(_primary_tree) if isinstance(_n, ast.Name)}
+    | {_n.attr for _n in ast.walk(_primary_tree) if isinstance(_n, ast.Attribute)}
+)
+check("the module that now owns it defines _resolve_primary_cancer",
+      any(isinstance(_n, ast.FunctionDef) and _n.name == "_resolve_primary_cancer"
+          for _n in ast.walk(_primary_tree)), True)
+check("...and resolves the registry through load_registry()",
+      "load_registry" in _primary_names, True)
+check("...and reads no _CANCER_REGISTRY global either",
+      "_CANCER_REGISTRY" in _primary_names, False)
 
 
 # ===========================================================================
@@ -561,13 +633,47 @@ print("\n" + "=" * 70)
 print("Test 4: bm25_retrieved / vector_retrieved are observations")
 print("=" * 70)
 
-_real_qdrant = qdrant_client
-_real_bm25_model = _bm25_query_model
-_real_get_embedding = get_embedding
+# INSTALLED THROUGH THE DEPENDENCY SEAM (pass 20c-2c), not by rebinding.
+#
+# These three lines used to be
+#
+#     qdrant_client = StubQdrantClient()
+#     _bm25_query_model = StubBM25QueryModel()
+#     get_embedding = stub_get_embedding
+#
+# and they worked because every project file was exec'd into this namespace.
+# File 13 is a shim over oncotriage/agent/ now, so its Stage 2 resolves all
+# three in its own modules and a rebinding here reaches none of them: the test
+# would have run against the REAL Qdrant collection and the REAL OpenAI
+# embedding endpoint while asserting on stub call counts that stayed at zero.
+_stub_qdrant = StubQdrantClient()
+_stub_bm25 = StubBM25QueryModel()
+_stub_openai = StubOpenAIClient()
 
-qdrant_client = StubQdrantClient()
-_bm25_query_model = StubBM25QueryModel()
-get_embedding = stub_get_embedding
+_saved_deps = deps.set_overrides({
+    deps.QDRANT_CLIENT:    _stub_qdrant,
+    deps.BM25_QUERY_MODEL: _stub_bm25,
+    deps.OPENAI_CLIENT:    _stub_openai,
+})
+
+# --- THE OVERRIDE IS SHOWN TO BE WHAT THE AGENT REACHES ---------------------
+# Identity, not "set_overrides returned" -- the failure this replaces was a
+# rebinding that also did not raise. The negative control underneath is what
+# makes the identity check discriminating.
+check("deps hands Stage 2 THIS stub Qdrant client",
+      deps.get_qdrant_client() is _stub_qdrant, True)
+check("deps hands Stage 2 THIS stub BM25 query model",
+      deps.get_bm25_query_model() is _stub_bm25, True)
+check("deps hands Stage 2 THIS stub OpenAI client",
+      deps.get_openai_client() is _stub_openai, True)
+
+_probe = deps.clear_override(deps.QDRANT_CLIENT)
+check("...and with the override REMOVED the agent reaches something else, so "
+      "the checks above can fail (negative control)",
+      deps.get_qdrant_client() is _stub_qdrant, False)
+deps.set_override(deps.QDRANT_CLIENT, _probe)
+check("...and reinstalling it restores the stub",
+      deps.get_qdrant_client() is _stub_qdrant, True)
 
 try:
     # --- Hybrid: all four channels run --------------------------------------
@@ -586,43 +692,46 @@ try:
     check("hybrid: dense count is not the configured request size",
           _hybrid["vector_retrieved"] == VECTOR_RETRIEVAL_SIZE, False)
     check("hybrid: all three sparse fields were queried",
-          sorted(qdrant_client.sparse_calls),
+          sorted(_stub_qdrant.sparse_calls),
           ["conditions-bm25", "criteria-bm25", "title-bm25"])
+    check("hybrid: the dense channel went through the stub OpenAI client",
+          _stub_openai.embedding_calls, 1)
 
     # --- bm25_only: the dense channel never runs ----------------------------
-    qdrant_client = StubQdrantClient()
+    _stub_qdrant = StubQdrantClient()
+    deps.set_override(deps.QDRANT_CLIENT, _stub_qdrant)
     _bm25_only = node_hybrid_retrieval(
         make_stage2_state({"retrieval_mode": "bm25_only"})
     )
-    check("bm25_only: dense channel was never called", qdrant_client.dense_calls, 0)
+    check("bm25_only: dense channel was never called", _stub_qdrant.dense_calls, 0)
     check("bm25_only: dense count is 0, not the request size",
           _bm25_only["vector_retrieved"], 0)
     check("bm25_only: sparse count still observed",
           _bm25_only["bm25_retrieved"], EXPECTED_BM25_UNIQUE)
 
     # --- vector_only: the sparse channels never run -------------------------
-    qdrant_client = StubQdrantClient()
+    _stub_qdrant = StubQdrantClient()
+    deps.set_override(deps.QDRANT_CLIENT, _stub_qdrant)
     _vector_only = node_hybrid_retrieval(
         make_stage2_state({"retrieval_mode": "vector_only"})
     )
     check("vector_only: sparse channels were never called",
-          qdrant_client.sparse_calls, [])
+          _stub_qdrant.sparse_calls, [])
     check("vector_only: sparse count is 0, not the request size",
           _vector_only["bm25_retrieved"], 0)
     check("vector_only: dense count still observed",
           _vector_only["vector_retrieved"], EXPECTED_VECTOR)
 
     # --- Dense channel fails: the fallback is visible in the counts ---------
-    qdrant_client = StubQdrantClient(fail_dense=True)
+    _stub_qdrant = StubQdrantClient(fail_dense=True)
+    deps.set_override(deps.QDRANT_CLIENT, _stub_qdrant)
     _fallback = node_hybrid_retrieval(make_stage2_state())
     check("dense failure: dense count is 0", _fallback["vector_retrieved"], 0)
     check("dense failure: sparse count is unaffected",
           _fallback["bm25_retrieved"], EXPECTED_BM25_UNIQUE)
 
 finally:
-    qdrant_client = _real_qdrant
-    _bm25_query_model = _real_bm25_model
-    get_embedding = _real_get_embedding
+    deps.restore_overrides(_saved_deps)
 
 # The counts survive Stage 2 -> Stage 6.
 _result_counts = node_finalize(make_terminal_state(

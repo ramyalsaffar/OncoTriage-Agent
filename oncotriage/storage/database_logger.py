@@ -27,23 +27,28 @@ TWO DELIBERATE CHANGES, and they are the reason this pass was not a straight mov
    now ALSO pass the path explicitly, so their isolation no longer depends on
    that seam. See ``resolve_inference_db_path``.
 
-2. ``_resolve_primary_cancer`` CALLS ``load_registry()``.
+2. ``_resolve_primary_cancer`` LEFT ALTOGETHER (pass 20c-2c).
 
-   It used to read ``_CANCER_REGISTRY``, which "13- LangGraph Agent.py" assigns
-   at its own line 64. That was a layering violation — File 14 reaching up into
-   File 13's namespace — and it was UNBOUND in any chain that loaded 14 without
-   13, where the function raised NameError instead of resolving a diagnosis.
-   ``load_registry()`` returns the same thread-safe cached singleton File 13
-   itself calls, so a chain that loads both is unaffected and a chain that loads
-   only 14 now works.
+   Pass 2b changed it from reading ``_CANCER_REGISTRY`` — which
+   "13- LangGraph Agent.py" assigned at its own line 64, a layering violation
+   that left the function raising NameError in any chain loading 14 without 13 —
+   to calling ``load_registry()``. Pass 2c finished the job: it is a domain
+   question about SNOMED and ICD-10 codes and it opens no database, so it now
+   lives in ``oncotriage/registries/primary_cancer.py`` and is IMPORTED here.
+
+   That direction is the point. The agent's three terminal nodes call it too, and
+   while it lived here the agent depended on the storage layer for a registry
+   lookup. Both callers now import it from the registries package and neither
+   imports the other. It is still re-exported by ``14- Database Logger.py``,
+   because nine files read the name out of the shared exec namespace.
 
 WHAT IMPORTING THIS MODULE DOES
 -------------------------------
 Nothing observable. Item 20b turned schema creation into a function precisely so
 that loading this file would stop opening the production database, and that
 holds here: no connection, no CREATE, no path resolution, no registry
-construction. ``load_registry()`` builds on first CALL and imports the ICD-10-CM
-release inside its own body.
+construction. ``load_registry()`` — reached through ``primary_cancer`` — builds
+on first CALL and imports the ICD-10-CM release inside its own body.
 
 COST ACCOUNTING FAILS LOUDLY, and the ordering that makes it do so is
 load-bearing: ``get_model_cost()`` is called BEFORE ``log_inference``'s try
@@ -60,7 +65,7 @@ from typing import Dict, List, Optional
 
 from oncotriage import paths
 from oncotriage.config import MATCHING_MODEL, PRICING_CONFIG
-from oncotriage.registries.cancer_code_registry import load_registry
+from oncotriage.registries.primary_cancer import _resolve_primary_cancer
 from oncotriage.utils import deduplicate_by_display, get_model_cost
 
 
@@ -510,61 +515,22 @@ def _ensure_database(db_path):
 #------------------------------------------------------------------------------
 
 
-def _resolve_primary_cancer(conditions: List[Dict]) -> Optional[str]:
-    """
-    Identify the primary cancer condition from a patient's condition list.
-
-    Mirrors the exact logic used by node_query_expansion (13- LangGraph Agent.py,
-    lines 460-471) so the database always records the same primary diagnosis
-    that drove the pipeline's query expansion and trial matching.
-
-    Resolution order:
-      1. Filter out refuted/entered-in-error conditions (verification_status)
-      2. Filter to primary cancer conditions via CancerCodeRegistry (3-layer detection)
-      3. Tiebreak: confirmed > unconfirmed, active > remission, most recent onset
-      4. Return display text of the winning condition
-
-    Fallback: if no cancer condition is found (edge case for non-cancer patients
-    that somehow entered the pipeline), returns the first condition's display.
-    If the condition list is empty, returns None.
-
-    The registry comes from load_registry(), the module's own thread-safe cached
-    accessor. It used to be read as a bare _CANCER_REGISTRY out of the shared
-    exec namespace, where "13- LangGraph Agent.py" assigns it at line 64 -- a
-    layering violation that also meant this function raised NameError in any
-    chain that loaded 14 without 13. load_registry() returns the same singleton
-    File 13's own assignment gets, so a chain loading both is unaffected.
-    """
-    if not conditions:
-        return None
-
-    # Resolved once per call, not per condition: load_registry() takes a lock on
-    # the first construction and the loops below would otherwise take it for
-    # every element.
-    cancer_registry = load_registry()
-
-    # Step 1: Exclude refuted/entered-in-error
-    valid = [
-        c for c in conditions
-        if (c.get("verification_status") or "unknown")
-        not in cancer_registry.exclude_verification
-    ]
-    if not valid:
-        valid = conditions  # fallback: use all if filter empties list
-
-    # Step 2: Filter to primary cancer conditions
-    cancer_conditions = [
-        c for c in valid
-        if cancer_registry.is_primary_cancer(c)
-    ]
-
-    # Step 3: Tiebreak and return
-    if cancer_conditions:
-        primary = sorted(cancer_conditions, key=cancer_registry.sort_key)[0]
-        return primary.get("display")
-
-    # Fallback: no cancer found, return first valid condition
-    return valid[0].get("display") if valid else None
+# _resolve_primary_cancer MOVED OUT in pass 20c-2c.
+#
+# It lives in oncotriage/registries/primary_cancer.py now and is imported at the
+# top of this module. It is a domain question about SNOMED and ICD-10 codes, it
+# opens no database, and it sat here only because this is where the answer was
+# first needed. The consequence was an import edge pointing the wrong way:
+# File 13's three terminal nodes called it, so the AGENT depended on the STORAGE
+# layer for a registry lookup.
+#
+# Both callers -- oncotriage/agent/terminal.py and log_inference below -- now
+# import it from the registries package, and neither imports the other. The
+# function itself is byte-identical to the one pass 2b left here, which
+# 47- Package Split Test.py re-derives with ast.unparse against git HEAD.
+#
+# It is still re-exported by "14- Database Logger.py", because Files 17, 25, 26,
+# 32, 36, 37, 38, 40 and 45 read the name out of the shared exec namespace.
 
 
 #------------------------------------------------------------------------------

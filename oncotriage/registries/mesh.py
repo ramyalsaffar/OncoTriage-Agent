@@ -19,6 +19,20 @@ not import that one.
 WHAT THIS MODULE NEEDS FROM THE PROJECT: data_MeSH_path, and nothing else. It
 reads no config constant. Importing it reads NO JSON — load_mesh_filter() is a
 function, and every file read happens inside it.
+
+AND IT NO LONGER RESOLVES THAT PATH AT IMPORT (pass 20c-2c). Pass 2a wrote
+``from oncotriage.paths import data_MeSH_path`` at module scope. Pass 2b then
+made every path in ``oncotriage.paths`` lazy — but a ``from X import name`` is
+an attribute READ, so it fires the resolver, and this one line kept the whole
+sibling directory tree being globbed the moment anything imported this module.
+That is not academic: ``oncotriage.agent.deps`` imports this module for
+``load_mesh_filter``, so importing the AGENT resolved the tree and raised on any
+machine without it — the exact defect pass 2b existed to remove, surviving one
+module over. Pass 2b's check only covered ``oncotriage.config``, which is how it
+went unnoticed.
+
+The module object is imported instead and the attribute is read inside
+``load_mesh_filter()``, where the JSON files are read anyway.
 """
 
 import json
@@ -27,7 +41,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Optional, Set
 
-from oncotriage.paths import data_MeSH_path
+from oncotriage import paths
 
     
 
@@ -813,7 +827,10 @@ def load_mesh_filter() -> MeSHCancerFilter:
     If required files are missing -> returns None (filter disabled).
     If crosswalk files are missing -> loads without them (fuzzy matching only).
     """
-    mesh_dir = Path(data_MeSH_path)
+    # Read HERE, not at import: oncotriage.paths resolves lazily and a
+    # module-scope `from ... import data_MeSH_path` would resolve the whole
+    # sibling tree for anything that imported this module. See the docstring.
+    mesh_dir = Path(paths.data_MeSH_path)
 
     lookup_path        = mesh_dir / "mesh_c04_lookup.json"
     tree_path          = mesh_dir / "mesh_tree_to_name.json"

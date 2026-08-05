@@ -704,8 +704,55 @@ print("=" * 70)
 
 # File 13 is read, not executed: executing it would load the cross-encoder and
 # build a Qdrant client, neither of which this test needs.
-_AGENT_SRC  = open(_code_dir + "13- LangGraph Agent.py").read()
+# RETARGETED IN PASS 20c-2c, AND THREE OF THE FOUR CHECKS BELOW COULD HAVE GONE
+# SILENTLY GREEN. "13- LangGraph Agent.py" is a re-export shim now; the whole
+# agent moved to oncotriage/agent/. Against the shim:
+#
+#   _returned_keys("_pipeline_provenance", tree)   -> no such function -> the
+#       "carries age_reference_date" checks would have compared against an empty
+#       key set and FAILED, which is the one honest outcome of the four.
+#   _AGENT_SRC.count("**_pipeline_provenance(state)")  -> 0, expected 3 -> FAILS.
+#   [n for n in walk(tree) if ... attr == "today"]     -> [] -> PASSES. Green on
+#       a file containing no code.
+#   "Reference date: {get_age_reference_date()...}" in _AGENT_SRC -> False,
+#       expected True -> FAILS.
+#
+# So the clock check -- the one this section is named for -- is precisely the one
+# that would have gone quiet. The non-degeneracy block below is what stops that
+# state being reachable again.
+#
+# The three subjects live in three modules: _pipeline_provenance and its three
+# call sites in terminal.py, the Stage 5 prompt's reference-date line in
+# evaluation.py, and the age path itself across both. All the agent sources are
+# concatenated so a definition moving between modules does not silently empty
+# this check a second time.
+import glob as _glob_agent
+
+_AGENT_SOURCES = sorted(
+    _glob_agent.glob(os.path.join(_code_dir, "oncotriage", "agent", "*.py"))
+)
+_AGENT_SRC  = "\n".join(
+    open(_f, encoding="utf-8").read() for _f in _AGENT_SOURCES
+)
 _AGENT_TREE = ast.parse(_AGENT_SRC)
+
+# NON-DEGENERATE FIRST.
+check("the agent sources were found and concatenated",
+      len(_AGENT_SOURCES) >= 12, True)
+check("...into a substantial body of source", len(_AGENT_SRC) > 200_000, True)
+check("...that parses and defines _pipeline_provenance and the three terminal "
+      "nodes",
+      {"_pipeline_provenance", "node_finalize", "node_no_candidates",
+       "node_error_handler"}
+      <= {n.name for n in ast.walk(_AGENT_TREE)
+          if isinstance(n, ast.FunctionDef)}, True)
+# ...and the clock detector is not vacuous: it must find a today() call when one
+# is present. Parsed from a string, so nothing on disk is touched.
+check("...and the today()/now() detector reports one when it is there "
+      "(negative control)",
+      len([n for n in ast.walk(ast.parse("x = date.today()"))
+           if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+           and n.func.attr == "today"]), 1)
 
 
 def _returned_keys(function_name: str, tree) -> set:
@@ -770,8 +817,9 @@ _LOGGED_PATIENT = {
 _LOGGED_RESULT = {
     "patient_id":           "birthdate-test-patient",
     "timestamp":            "2026-03-11T00:00:00",
-    # Supplied so File 14 does not fall back to _resolve_primary_cancer(),
-    # which needs the cancer registry from File 08 — not chained by this test.
+    # Supplied so the row under test does not depend on _resolve_primary_cancer.
+    # That deliberate avoidance is why section 9b below exercises the function
+    # DIRECTLY — see the comment there.
     "primary_condition":    "Non-small cell lung cancer",
     "matches":              [],
     "near_misses":          [],
@@ -824,6 +872,89 @@ check("unreported run stores NULL reference date",
 check("unreported run stores NULL precision",
       _unreported["birth_date_precision"], None)
 _conn.close()
+
+
+# ===========================================================================
+# 9b. _resolve_primary_cancer RESOLVES A DIAGNOSIS WITHOUT FILE 13
+# ===========================================================================
+
+print("\n" + "=" * 70)
+print("9b. _resolve_primary_cancer works in a chain that never loads File 13")
+print("=" * 70)
+
+# WHY THIS CHECK EXISTS, AND WHY IT HAS TO BE IN THIS FILE.
+#
+# Pass 20c-2b changed _resolve_primary_cancer from reading File 13's
+# _CANCER_REGISTRY global to calling load_registry(). That fixed a path which
+# raised NameError in any chain that loaded File 14 without File 13 -- and then
+# NOTHING EXERCISED IT. This file is the only chain in the repository that loads
+# 14 without 13, and section 9 above deliberately supplies primary_condition so
+# the fallback never runs. Files 32, 36 and 37 all chain 13 first, so the global
+# is bound for them and none of them witnesses the fix either.
+#
+# A fix nothing exercises is a claim, not a fix. So the function is called
+# directly, here, in the one process where the old code would have raised.
+#
+# The registry is built on this call -- load_registry() imports the ICD-10-CM
+# release on first construction -- which is the point: nothing in this chain
+# built it beforehand.
+
+_PRIMARY_CANCER_CONDITIONS = [
+    # A comorbidity that must NOT win, listed first so "returns the first
+    # condition" would be visibly wrong rather than accidentally right.
+    {"code": "38341003", "display": "Hypertension",
+     "system_key": "snomed", "verification_status": "confirmed",
+     "clinical_status": "active", "onset_date": "2019-04-02"},
+    # SNOMED 254637007, the primary NSCLC code File 42 audits by name.
+    {"code": "254637007", "display": "Non-small cell lung cancer",
+     "system_key": "snomed", "verification_status": "confirmed",
+     "clinical_status": "active", "onset_date": "2025-01-15"},
+    # A METASTASIS. The registry rejects secondary neoplasms at every layer, so
+    # this one must lose to the primary above.
+    {"code": "94381002", "display": "Secondary malignant neoplasm of bone",
+     "system_key": "snomed", "verification_status": "confirmed",
+     "clinical_status": "active", "onset_date": "2026-02-01"},
+]
+
+_resolved_primary = None
+
+
+def _call_resolve_primary_cancer():
+    global _resolved_primary
+    _resolved_primary = _resolve_primary_cancer(_PRIMARY_CANCER_CONDITIONS)
+
+
+# The old code raised NameError here. check_no_raise records the exception text
+# rather than aborting, so a regression reports the reason instead of killing
+# the run at line 1.
+check_no_raise("_resolve_primary_cancer does not raise without File 13 loaded",
+               _call_resolve_primary_cancer)
+
+# NON-DEGENERACY FIRST, and it is the whole point of this block. None is what
+# this function returns for an EMPTY condition list, and it is also what a
+# silently-empty registry filter would produce after falling through to
+# `valid[0].get("display")` on a list whose entries had no display. Asserting
+# the identity below without ruling None out would pass on a registry that
+# matched nothing.
+check("...and returns something at all (not None, which an empty filter also "
+      "returns)", _resolved_primary is not None, True)
+check("...and it is a non-empty string", bool(_resolved_primary), True)
+
+# The identity. It must be the PRIMARY cancer -- not the first condition in the
+# list, not the metastasis, not the comorbidity.
+check("...and it is the primary cancer, not the first condition in the list",
+      _resolved_primary, "Non-small cell lung cancer")
+
+# The registry really was consulted. If load_registry() had returned something
+# inert, the function's own fallback would have handed back valid[0], which is
+# the hypertension row -- so this is the assertion that separates "the registry
+# ran" from "the fallback ran and happened to look plausible".
+check("...so the fallback to the first valid condition did NOT fire",
+      _resolved_primary == _PRIMARY_CANCER_CONDITIONS[0]["display"], False)
+
+# And the empty-list contract, which is the one case where None is correct.
+check("an empty condition list still returns None",
+      _resolve_primary_cancer([]), None)
 
 
 # ===========================================================================

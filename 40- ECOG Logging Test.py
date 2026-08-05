@@ -357,11 +357,28 @@ check("never-reported is distinguishable from none_recorded",
 
 # Reading state["patient_data"] rather than a copied-onto-state value is what
 # makes the error path work: no node has to remember to propagate it.
+# RETARGETED IN PASS 20c-2c. _pipeline_provenance moved to
+# oncotriage/agent/terminal.py; "13- LangGraph Agent.py" is a re-export shim.
+#
+# THIS ONE WOULD NOT HAVE GONE SILENTLY GREEN, and it is worth saying which way
+# it fails: `next(... if n.name == "_pipeline_provenance")` raises StopIteration
+# against a file that does not define it, which ABORTS the run at this line.
+# Loud, but it takes the remaining sections down with it. The other check in
+# this pair -- `'state.get("ecog_value")' in _prov_body` expecting False -- is
+# the one that would have passed on an empty body, which is why the
+# non-degeneracy check below is here anyway.
 _prov_src = inspect_source = None
-_prov_text = Path(_code_dir + "13- LangGraph Agent.py").read_text(encoding="utf-8")
-_prov_node = next(n for n in ast.parse(_prov_text).body
-                  if isinstance(n, ast.FunctionDef) and n.name == "_pipeline_provenance")
-_prov_body = ast.get_source_segment(_prov_text, _prov_node)
+_PROVENANCE_SOURCE = os.path.join(_code_dir, "oncotriage", "agent", "terminal.py")
+_prov_text = Path(_PROVENANCE_SOURCE).read_text(encoding="utf-8")
+_prov_node = next((n for n in ast.parse(_prov_text).body
+                   if isinstance(n, ast.FunctionDef)
+                   and n.name == "_pipeline_provenance"), None)
+check("the parsed agent source defines _pipeline_provenance", _prov_node is not None, True)
+_prov_body = ast.get_source_segment(_prov_text, _prov_node) if _prov_node else ""
+# NON-DEGENERATE: the "does not contain" check below is satisfied by an empty
+# string, which is exactly what a stale filename would leave here.
+check("...and its source body is substantial (non-degeneracy)",
+      len(_prov_body) > 2000, True)
 check("provenance reads ecog off patient_data, not off state directly",
       'state.get("ecog_value")' in _prov_body, False)
 check("and it does read patient_data",

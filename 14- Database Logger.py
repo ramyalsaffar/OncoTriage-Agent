@@ -27,6 +27,15 @@
 #                                         violation AND unbound in any chain
 #                                         that loaded 14 without 13.
 #
+# AND ONE IN PASS 2c: _resolve_primary_cancer is no longer DEFINED in the
+# storage module at all. It moved to oncotriage/registries/primary_cancer.py,
+# because it is a domain question about SNOMED and ICD-10 codes that opens no
+# database, and because File 13's terminal nodes call it too -- which made the
+# agent depend on the storage layer for a registry lookup. Both import it from
+# the registries package now. This shim still re-exports it, from the storage
+# module, which re-exports it in turn: the name reaches the shared exec
+# namespace exactly as it always did.
+#
 # Item 20b's property is unchanged and still the important one: loading this
 # file opens no database. It used to run every CREATE TABLE and every additive
 # migration against the production inferences.db as a side effect of the exec

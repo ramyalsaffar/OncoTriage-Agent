@@ -8,11 +8,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## The exec() chain and the `oncotriage` package — read this before touching any file
 
-Files 04 to 46 are numbered, space-containing filenames (`13- LangGraph Agent.py`) that are `exec()`'d into the caller's `globals()`, replicating a Spyder shared-namespace workflow. **Those 43 files are still not importable** — spaces and leading digits — and nothing in this pass changed that.
+Files 04 to 46 are numbered, space-containing filenames (`25- Batch Runner.py`) that are `exec()`'d into the caller's `globals()`, replicating a Spyder shared-namespace workflow. **Those 43 files are still not importable** — spaces and leading digits — and nothing in this pass changed that.
 
 Files 01, 02 and 03 are different as of item 20c. They are now **re-export shims over a real package**:
 
-Files 01, 02, 03 (pass 20c-1), 08, 09, 10 (pass 20c-2a) and 07, 14 (pass 20c-2b) are shims:
+Files 01, 02, 03 (pass 20c-1), 08, 09, 10 (pass 20c-2a), 07, 14 (pass 20c-2b) and 13 (pass 20c-2c) are shims:
 
 | Module | Holds | Imports |
 |---|---|---|
@@ -28,7 +28,71 @@ Files 01, 02, 03 (pass 20c-1), 08, 09, 10 (pass 20c-2a) and 07, 14 (pass 20c-2b)
 | `oncotriage/extraction/stage.py` | File 10 to line 698 — stage requirements | `extraction.negation` |
 | `oncotriage/extraction/histology.py` | File 10 from line 699 — histology tags | `extraction.negation` |
 | `oncotriage/fhir/parser.py` | File 07 whole — `parse_fhir_bundle`, `load_all_patients`, the four corpus Counters | `constants`, `utils` |
-| `oncotriage/storage/database_logger.py` | File 14 whole — the three-table schema, `initialize_database`, `log_inference` | `paths`, `config`, `utils`, `registries.cancer_code_registry` |
+| `oncotriage/storage/database_logger.py` | File 14 whole — the three-table schema, `initialize_database`, `log_inference` | `paths`, `config`, `utils`, `registries.primary_cancer` |
+| `oncotriage/registries/primary_cancer.py` | `_resolve_primary_cancer` — which condition is THE cancer | `registries.cancer_code_registry` |
+| `oncotriage/agent/deps.py` | **the seam**: every client, model and registry, lazily resolved and overridable | `config`, `registries.*` |
+| `oncotriage/agent/state.py` | `TrialMatchState`, the channel / expansion-path / MeSH-filter vocabularies | nothing from the project |
+| `oncotriage/agent/text.py` | `tokenize_for_bm25` | nothing from the project |
+| `oncotriage/agent/models.py` | `medcpt_score_pairs`, `score_pairs`, `get_embedding` | `config`, `agent.deps` |
+| `oncotriage/agent/patient.py` | `compute_patient_hash`, `_create_patient_summary`, the relevance classifiers | `agent.deps`, `agent.state`, `config`, `utils` |
+| `oncotriage/agent/mesh_expansion.py` | Stage 1's MeSH walk | `registries.mesh` |
+| `oncotriage/agent/retrieval.py` | Stages 1–3 + `build_bm25_index_from_qdrant` | `agent.{deps,models,mesh_expansion,patient,state,text}`, `config`, `registries.mesh`, `utils` |
+| `oncotriage/agent/filtering.py` | Stage 4 | `agent.{deps,retrieval,state}`, `config`, `extraction.*` |
+| `oncotriage/agent/evaluation.py` | Stage 5 | `agent.{deps,patient,state}`, `config`, `utils` |
+| `oncotriage/agent/terminal.py` | the three terminal nodes + `_pipeline_provenance` | `agent.state`, `registries.primary_cancer`, `utils` |
+| `oncotriage/agent/graph.py` | `build_matching_graph`, `match_patient_to_trials` | every stage module |
+| `oncotriage/agent/display.py` | console rendering | `config` |
+
+**The dependency seam — `oncotriage/agent/deps.py` (pass 20c-2c).** Every client,
+model and registry the agent uses is reached through an accessor there:
+`get_openai_client`, `get_qdrant_client`, `get_bm25_query_model`,
+`get_medcpt_tokenizer`, `get_medcpt_model`, `get_cancer_registry`,
+`get_lab_registry`, `get_mesh_filter`. Each answers **override → cached → build
+once**, so a test harness installs `deps.set_override(deps.QDRANT_CLIENT, stub)`
+and every call site inside the agent sees it. `deps.OVERRIDE_KEYS` is closed —
+an unknown key raises `KeyError` rather than being silently ignored, because a
+dropped override is the failure this module exists to prevent.
+
+*Why it exists.* Files 45 and 46 used to redirect the pipeline by rebinding four
+names — `openai_client`, `qdrant_client`, `_bm25_query_model`,
+`medcpt_score_pairs` — in the shared exec namespace, and Files 35, 36 and 37 did
+the same for the registries, the MeSH filter and `get_embedding`. That worked
+only because every file was `exec()`'d into one dict. A module function resolves
+its globals in its own module, so once File 13 became a package **every one of
+those rebindings would have reached nothing** — and `46- Fixture Replay.py`
+would have sent all twelve fixtures' Stage 5 prompts to the real OpenAI endpoint,
+been billed, and still printed that they replayed clean. Nothing would have
+raised. All five files now install overrides and **assert by identity** that the
+object `deps` hands the agent is theirs; File 46 runs that assertion as a
+negative control first, with no override installed, and refuses to replay unless
+it fails.
+
+**`MEDCPT_SCORER` is the fourth override key and its default lives in
+`models`, not `deps`.** The fixtures record *scores*, not tensors, so the whole
+`(query, trial_texts) -> scores` function is the seam; `models.score_pairs()` is
+the dispatcher, because `models` imports `deps` and the reverse edge would be a
+cycle. Every caller inside the agent uses `score_pairs`, never
+`medcpt_score_pairs` directly.
+
+**Importing the agent loads no model.** File 13 built MedCPT (~110 MB) and
+FastEmbed at `exec()` time, so all twelve files that chain it paid for both just
+by being read. Both are lazy now; `ONCOTRIAGE_DEFER_LOCAL_MODELS` survives as the
+second line of defence (a forgotten stand-in becomes a named `RuntimeError`
+instead of a real load) but decides nothing at import. File 47 check 2d imports
+the agent with that variable **unset** and requires `torch` and `transformers` to
+be absent from `sys.modules`.
+
+**The File 13 shim cannot bridge a rebinding, so it detects one.** The File 14
+pattern — a wrapper reading `globals().get(...)` — works only because
+`log_inference` is called *by* the caller, so the shim sits in the call path.
+`qdrant_client` is used *inside* the agent and never called by the caller, so no
+wrapper is ever in the path. Instead the shim records the identity of all nine
+redirectable names at load and `match_patient_to_trials` refuses to run if any
+was rebound, naming the `deps` key to use instead. `medcpt_tokenizer`,
+`medcpt_model` and `_bm25_query_model` are bound to lazy proxies (File 12 calls
+the first two directly); `_CANCER_REGISTRY`, `_LAB_REGISTRY` and `_MESH_FILTER`
+are bound **eagerly to the real values** because `_MESH_FILTER is None` is a real
+branch that a proxy would break.
 
 **Path resolution is lazy (pass 20c-2b).** `oncotriage/paths.py` used to resolve
 the whole sibling tree at import, so `import oncotriage.config` — which imports
@@ -51,7 +115,8 @@ The real rule, replacing "nothing is importable":
 - **New shared code goes in `oncotriage/`, and is `import`ed.** Only put something in a numbered file if it needs the shared exec namespace. `import` of files 04-46 is still impossible; `from oncotriage.config import MAX_WORKERS` is now the normal way to reach a tunable from anything that is not in the chain.
 - **`oncotriage.config` must never import `oncotriage.utils`.** That was the cycle: File 02 read `PRICING_CONFIG` / `COLLECTION_NAME` / `qdrant_client` / `DATA_SNAPSHOT_DATE` out of File 03, while File 03 called `load_env_keys()` out of File 02. Under `exec()` both resolved at runtime; as modules it is an `ImportError`. `load_env_keys` moving out of the pair is what broke it — into `settings` in pass 20c-1, into `paths` in pass 20c-2a — and `47- Package Split Test.py` fails if the edge comes back. Note the reintroduced cycle is **order-dependent**: `import oncotriage.config` against it still succeeds, so the AST check is the guard, not the import test.
 - **No `oncotriage` module may import another `oncotriage` module from inside a function body.** A deferred import is a dependency that no scan of an import block can see, and it never fails at import in any order, so nothing but a static scan finds it. File 47 scans for it and carries a negative control. **Third-party imports in function bodies are exempt and must stay** — `import icd10` inside `_build_icd10_cancer_sets()` is deliberate: hoisting it would make importing the cancer registry load the whole ICD-10-CM release.
-- **Importing a package module opens no client, loads no model, touches no database, reads no file and resolves no directory.** `get_openai_client()` / `get_qdrant_client()` build once, on first call, and cache; `load_mesh_filter()` reads its four JSON lookups on call, never at import; `_build_icd10_cancer_sets()` imports `icd10` on first registry construction; every path in `oncotriage/paths.py` resolves on first read. `03- Config.py` calls the client factories at shim load and binds the eager `openai_client` / `qdrant_client` names the chain expects — same objects, no second client. File 47 proves this by trapping `builtins.open`, `io.open`, `socket.socket`, `socket.create_connection` and `sqlite3.connect` **before** importing all thirteen modules and firing each trap afterwards to show it was armed. The `glob` in `paths` was the one exception until pass 20c-2b and it is gone; note the traps could never have caught it anyway, because `glob.glob` uses `os.scandir` and not `open` — check 2b is what covers it.
+- **Importing a package module opens no client, loads no model, touches no database, reads no file and resolves no directory.** `get_openai_client()` / `get_qdrant_client()` build once, on first call, and cache; `load_mesh_filter()` reads its four JSON lookups on call, never at import; `_build_icd10_cancer_sets()` imports `icd10` on first registry construction; every path in `oncotriage/paths.py` resolves on first read; MedCPT and FastEmbed load on first use through `oncotriage/agent/deps.py`. `03- Config.py` calls the client factories at shim load and binds the eager `openai_client` / `qdrant_client` names the chain expects — same objects, no second client. File 47 proves this by trapping `builtins.open`, `io.open`, `socket.socket`, `socket.create_connection` and `sqlite3.connect` **before** importing all twenty-seven modules and firing each trap afterwards to show it was armed.
+  The `glob` in `paths` was the one exception until pass 20c-2b, and pass 20c-2c found that the fix had a hole: `oncotriage/registries/mesh.py` still wrote `from oncotriage.paths import data_MeSH_path` at module scope, and a `from X import name` is an **attribute read**, so it fired the lazy resolver — meaning importing the *agent* (which imports `deps`, which imports `mesh`) globbed the whole sibling tree and raised on any machine without it. Check 2b only covered `config`, which is how it survived a whole pass. Check 2c now imports **every** package module in its own subprocess with the root pointed at a directory that does not exist. Note that no `open` trap could ever have caught this: `glob.glob` uses `os.scandir`.
 - The three functions that read a value out of the shared namespace at call time — `get_model_cost`, `resolve_qdrant_collection`, `get_age_reference_date` — take that value as an **optional argument** in the package, and `02- Utility Functions.py` wraps each one to pass `globals().get(...)`. That seam is load-bearing: Files 36, 37, 45 and 46 rebind `qdrant_client`, and File 38 rebinds `DATA_SNAPSHOT_DATE` and requires a raise.
 - `pip install -e .` from `03- Code/` makes the package importable from anywhere. Without it, `01- Imports.py` puts the code directory on `sys.path` itself and prints that it did.
 
@@ -104,7 +169,7 @@ pip install -e .                                         # makes `oncotriage` im
 
 **Tests** are not pytest — `18-` and `19-` are procedural scripts hitting a *live* server on `localhost:8000`; start `17-` in another terminal first. `19-` slices `fhir_files[410:412]` for a smoke run; widen that slice to go broader.
 
-To exercise the graph directly without the API, set `RUN_TEST_ON_EXECUTE = True` near the bottom of `13- LangGraph Agent.py` and run it as `__main__`.
+To exercise the graph directly without the API, set `RUN_TEST_ON_EXECUTE = True` near the bottom of `13- LangGraph Agent.py` and run it as `__main__`. The block survived the pass-20c-2c split and still lives in the shim.
 
 ## Layout outside this repo
 
@@ -123,7 +188,7 @@ Only `03- Code/` is version-controlled. Sibling directories under the project ro
 
 ## Pipeline architecture
 
-`13- LangGraph Agent.py` (~3.4k lines) is the core. `build_matching_graph()` wires a `StateGraph` over `TrialMatchState` (TypedDict, ~line 111):
+`oncotriage/agent/` is the core (shim: `13- LangGraph Agent.py`, 5,565 lines before pass 20c-2c split it twelve ways). `build_matching_graph()` in `agent/graph.py` wires a `StateGraph` over `TrialMatchState` (`agent/state.py`):
 
 1. **`node_query_expansion`** — deterministic, no LLM. Uses the cancer registry (08) + MeSH filter (09) to expand the patient's primary diagnosis into query terms.
 2. **`node_hybrid_retrieval`** — Qdrant-native BM25 (FastEmbed sparse, `BM25_RETRIEVAL_SIZE=75`) + dense `text-embedding-3-small` (`VECTOR_RETRIEVAL_SIZE=100`), fused by RRF into `RRF_POOL_SIZE`. Falls back to BM25-only if vector search fails.
@@ -132,7 +197,9 @@ Only `03- Code/` is version-controlled. Sibling directories under the project ro
 5. **`node_gpt4o_evaluation`** — one GPT-4o call producing per-criterion verdicts; JSON-parse failures loop back up to `MAX_GPT4O_RETRIES = 3`.
 6. **`node_finalize`** — splits eligible/not_eligible, normalizes labels.
 
-Conditional edges route to `node_no_candidates` when a stage empties the pool, and any exception lands in `node_error_handler`, which still emits a well-formed result. `match_patient_to_trials(patient_data, graph)` is the public entry point; it stamps `qdrant_collection` and `patient_data_hash` onto the result.
+Nodes 1–3 are in `agent/retrieval.py`, node 4 in `agent/filtering.py`, node 5 in `agent/evaluation.py`, node 6 and the other two terminal nodes in `agent/terminal.py`.
+
+Conditional edges route to `node_no_candidates` when a stage empties the pool, and any exception lands in `node_error_handler`, which still emits a well-formed result. `match_patient_to_trials(patient_data, graph)` is the public entry point; it stamps `qdrant_collection` and `patient_data_hash` onto the result. **The shim wraps it** with the legacy-rebinding guard described above — that wrapper is the only thing in the shim that is not a re-export.
 
 **Ablation flags** ride in the state dict (`state["ablation_flags"]`) and are read at three points (nodes 2, 3, 4). `26- Ablation Study.py` toggles one stage per config; nothing else forks the pipeline.
 
@@ -199,7 +266,7 @@ These three moved into the package in pass 20c-2a. The numbered files survive as
 
 **`log_inference(result, patient_data, db_path=None)` takes the database as an argument, and the five isolation tests pass it.** `db_path=None` means `oncotriage.paths.inferences_path` — `resolve_inference_db_path()` is the resolver, and it deliberately does *not* consult the exec namespace. The **shim's** `log_inference` is a wrapper that supplies `globals().get("inferences_path")`, the same late-binding seam File 02 uses for `get_model_cost` / `resolve_qdrant_collection` / `get_age_reference_date`. That seam is what keeps the redirect working for Files 36, 37, 38, 40 and 45, all of which rebind `inferences_path` at a temporary database *before* loading File 14: a module function cannot see a caller's globals, so without the wrapper all five would have written real rows into the real `inferences.db` while still printing the name of the temporary file each thought it was using. All five now **also** pass `db_path` explicitly and assert on the path `log_inference` returns, so neither mechanism is a single point of failure. Each one first checks that `resolve_inference_db_path(None)` is the production database and is *not* its own scratch path, which is what makes the assertion discriminating rather than vacuous. **File 41 is the one file that still rebinds `inferences_path` without passing a path** — it does so for `log_drift_metrics` in File 20, never loads File 14, and stays as it is until File 20 converts in pass 20c-3.
 
-`_resolve_primary_cancer` calls **`load_registry()`**, not File 13's `_CANCER_REGISTRY` global. That global was a layering violation and was *unbound* in any chain that loaded 14 without 13, where the function raised `NameError` instead of resolving a diagnosis; `load_registry()` returns the same cached singleton File 13's own assignment gets.
+`_resolve_primary_cancer` lives in **`oncotriage/registries/primary_cancer.py`** as of pass 20c-2c, and both the agent's three terminal nodes and the storage logger import it from there. Pass 2b had already stopped it reading File 13's `_CANCER_REGISTRY` global — a layering violation that left it raising `NameError` in any chain loading 14 without 13 — in favour of `load_registry()`. Pass 2c finished the job: while the function lived in the storage module, the *agent* depended on the *storage* layer for a registry lookup. **`38- Birth Date and Demographics Parser Test.py` section 9b is the only place that exercises it**, because File 38 is the only chain in the repository that loads 14 without 13; it calls the function directly on a stub condition list and asserts a real diagnosis comes back, having first asserted the result is not `None` (which an empty registry filter also returns).
 
 `21- Streamlit Dashboard.py` (~5.2k lines) reads only from `inferences.db` via `@st.cache_data(ttl=60)`.
 

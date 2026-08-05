@@ -397,6 +397,105 @@ _PASS_2B_DROPPED = {
     '10- Structured Eligibility Extractor.py': set(),
     '07- FHIR Parser.py': set(),
     '14- Database Logger.py': set(),
+    '13- LangGraph Agent.py': set(),
+}
+
+
+# ===========================================================================
+# THE NAMES FILE 13 DEFINED BEFORE PASS 2c
+# ===========================================================================
+# Same method, and for File 13 it is the only method that could work at all.
+#
+# File 13 CHAINS 03, 08, 09 and 10 in its own bootstrap, so exec'ing it into a
+# throwaway namespace produces 402 bindings, 315 of which belong to the chained
+# files. The list below is the DIFFERENCE: the same base chain was exec'd into
+# one namespace, File 13 into another, and the names File 13 added recorded.
+# An ast walk over File 13 alone would have missed that entirely and reported
+# names the chain provides as File 13's own.
+#
+# Six are ANNOTATED assignments (_ICD10_RELEVANT_BLOCKS,
+# _SNOMED_RELEVANT_COMORBIDITIES, _IRRELEVANT_CONDITION_KEYWORDS,
+# _IRRELEVANT_MEDICATION_KEYWORDS, _LAB_UNIT_CONVERSIONS and _EMPTY_BOOST_STATS
+# -- the last is a plain Assign, the other five are AnnAssign), which
+# ast.Assign alone does not see and `grep "NAME ="` misses.
+#
+# Three are BOOTSTRAP LEFTOVERS rather than definitions: _bootstrap and _fh from
+# the two-file exec loop, and _code_dir from the __file__ derivation. They are
+# in the list because they were bound, and the shim keeps the same bootstrap
+# block so it still binds them.
+#
+# Recorded with ONCOTRIAGE_DEFER_LOCAL_MODELS=1 so the extraction did not load
+# MedCPT. That changes no binding: medcpt_tokenizer, medcpt_model and
+# _bm25_query_model are bound on both branches of File 13's line 414 `if`.
+_PRE_2C_RUNTIME_NAMES = {
+    '13- LangGraph Agent.py': [
+        'CHANNEL_ABLATED', 'CHANNEL_EMPTY_QUERY', 'CHANNEL_FAILED',
+        'CHANNEL_OK', 'DEFER_LOCAL_MODELS_ENV', 'EXPANSION_PATH_FALLBACK',
+        'EXPANSION_PATH_MESH', 'FINISH_REASON_LENGTH',
+        'GENOMIC_VARIANT_LOINC', 'MESH_FILTER_APPLIED',
+        'MESH_FILTER_SKIP_ABLATED', 'MESH_FILTER_SKIP_NO_FILTER',
+        'MESH_FILTER_SKIP_NO_TREES', 'MESH_RESOLUTION_NO_CONDITIONS',
+        'MESH_RESOLUTION_NO_FILTER', 'MatchingModelMismatchError',
+        'NOT_EVALUABLE_MODEL_OMITTED', 'NOT_EVALUABLE_SPLIT_BUDGET',
+        'NOT_EVALUABLE_TRUNCATION_FLOOR', 'RERANK_RRF_K',
+        'RETRIEVAL_CHANNELS', 'RUN_TEST_ON_EXECUTE',
+        'TERMINAL_NODE_ERROR', 'TERMINAL_NODE_FINALIZE',
+        'TERMINAL_NODE_NO_CANDIDATES', 'TrialMatchState',
+        '_BM25_PUNCT_PATTERN', '_CANCER_REGISTRY', '_DEFER_LOCAL_MODELS',
+        '_DeferredLocalModel', '_EMPTY_BOOST_STATS', '_EmptySparseQuery',
+        '_ICD10_RELEVANT_BLOCKS', '_IRRELEVANT_CONDITION_KEYWORDS',
+        '_IRRELEVANT_MEDICATION_KEYWORDS', '_LAB_REGISTRY',
+        '_LAB_UNIT_CONVERSIONS', '_MESH_FILTER', '_NOT_EVALUABLE_REASONS',
+        '_SNOMED_RELEVANT_COMORBIDITIES', '_VARIANT_TEXT_PATTERN',
+        '_bm25_query_model', '_bootstrap', '_build_trials_text',
+        '_classify_condition_relevance', '_classify_medication_relevance',
+        '_code_dir', '_create_patient_summary', '_empty_mesh_resolution',
+        '_fh', '_is_icd10_relevant', '_normalize_lab_unit',
+        '_pipeline_provenance', '_print_match_detail', '_split_in_half',
+        '_unevaluable_entry', 'apply_mesh_relevance_boost',
+        'apply_quality_gate', 'build_bm25_index_from_qdrant',
+        'build_initial_state', 'build_matching_graph',
+        'call_matching_model', 'compute_patient_hash',
+        'display_match_results', 'estimate_output_tokens',
+        'expand_query_from_mesh', 'extract_genomic_variant_terms',
+        'format_mesh_resolution', 'get_embedding',
+        'match_patient_to_trials', 'medcpt_model', 'medcpt_score_pairs',
+        'medcpt_tokenizer', 'node_cross_encoder_rerank',
+        'node_error_handler', 'node_finalize', 'node_gpt4o_evaluation',
+        'node_hybrid_retrieval', 'node_no_candidates',
+        'node_query_expansion', 'node_rule_based_filter',
+        'resolve_patient_mesh', 'route_after_filter', 'route_after_gpt4o',
+        'route_after_retrieval', 'tokenize_for_bm25', 'unboosted_score'
+    ],
+}
+
+_PRE_2C_COUNTS = {'13- LangGraph Agent.py': 87}
+
+
+# NAMES PASS 2c ADDED to File 13's shim surface. Declared, because the inventory
+# check runs in both directions and an undeclared addition is a name some later
+# file could pick up without asking.
+#
+#   deps                        THE SEAM. Files 35, 36, 37 and 45 install their
+#                               overrides through it, so it has to be reachable
+#                               from the shared namespace.
+#   score_pairs                 the MEDCPT_SCORER dispatcher. medcpt_score_pairs
+#                               keeps its old meaning -- the raw function -- so
+#                               a caller that wants the dispatch asks for this.
+#   _match_patient_to_trials_pkg  the package function the shim's wrapper calls.
+#   _LazyAgentDependency        the proxy class behind medcpt_tokenizer,
+#                               medcpt_model and _bm25_query_model, which are
+#                               lazy now instead of loaded at exec time.
+#   _LEGACY_REDIRECTABLE        the legacy-rebinding guard: the name -> deps-key
+#   _LEGACY_BOUND_AT_LOAD       map, the identities recorded at load, and the
+#   _detect_legacy_rebinding    two functions that turn a silent redirect-to-
+#   _assert_no_legacy_rebinding nowhere into a named RuntimeError.
+_PASS_2C_ADDED = {
+    '13- LangGraph Agent.py': {
+        'deps', 'score_pairs', '_match_patient_to_trials_pkg',
+        '_LazyAgentDependency', '_LEGACY_REDIRECTABLE', '_LEGACY_BOUND_AT_LOAD',
+        '_detect_legacy_rebinding', '_assert_no_legacy_rebinding',
+    },
 }
 
 
@@ -723,12 +822,13 @@ _PKG_FILES = sorted(
     if name.endswith(".py") and "__pycache__" not in root
 )
 
-check("the package file list is non-empty and covers all four subpackages",
-      len(_PKG_FILES) >= 13
+check("the package file list is non-empty and covers all five subpackages",
+      len(_PKG_FILES) >= 27
       and any(f.endswith("registries/mesh.py") for f in _PKG_FILES)
       and any(f.endswith("extraction/negation.py") for f in _PKG_FILES)
       and any(f.endswith("fhir/parser.py") for f in _PKG_FILES)
-      and any(f.endswith("storage/database_logger.py") for f in _PKG_FILES),
+      and any(f.endswith("storage/database_logger.py") for f in _PKG_FILES)
+      and any(f.endswith("agent/deps.py") for f in _PKG_FILES),
       True)
 
 # EVERY SUBPACKAGE MUST BE DECLARED IN pyproject.toml. setuptools does not
@@ -746,8 +846,8 @@ _SUBPACKAGE_DIRS = sorted(
 )
 check("the tree has the subpackages this pass expects (non-degeneracy)",
       _SUBPACKAGE_DIRS,
-      ["oncotriage.extraction", "oncotriage.fhir", "oncotriage.registries",
-       "oncotriage.storage"])
+      ["oncotriage.agent", "oncotriage.extraction", "oncotriage.fhir",
+       "oncotriage.registries", "oncotriage.storage"])
 check("every subpackage on disk is declared in pyproject.toml, so a built "
       "wheel carries it",
       sorted(p for p in _SUBPACKAGE_DIRS if f'"{p}"' not in _PYPROJECT), [])
@@ -904,6 +1004,11 @@ import builtins, io, json, socket, sqlite3, sys
 import caffeine, dotenv, httpx, openai, qdrant_client, tenacity           # noqa: F401
 import collections, glob, logging, os, pathlib, re, threading, typing     # noqa: F401
 import xml.etree.ElementTree                                              # noqa: F401
+# Pre-imported for the same reason as the block above: the agent imports these
+# at module scope, and their own import chains touch files that are not this
+# package's doing. numpy and rank_bm25 read nothing; langgraph is listed here
+# rather than in `heavy` because it is a graph library, not a model.
+import numpy, rank_bm25, langgraph.graph                                  # noqa: F401
 
 
 class Blocked(RuntimeError):
@@ -941,9 +1046,28 @@ import oncotriage.extraction.stage
 import oncotriage.extraction.histology
 import oncotriage.fhir.parser
 import oncotriage.storage.database_logger
+import oncotriage.registries.primary_cancer
+import oncotriage.agent
+import oncotriage.agent.deps
+import oncotriage.agent.state
+import oncotriage.agent.text
+import oncotriage.agent.models
+import oncotriage.agent.patient
+import oncotriage.agent.mesh_expansion
+import oncotriage.agent.retrieval
+import oncotriage.agent.filtering
+import oncotriage.agent.evaluation
+import oncotriage.agent.terminal
+import oncotriage.agent.graph
+import oncotriage.agent.display
 
+# langgraph LEFT THE LIST in pass 20c-2c. oncotriage.agent.graph imports
+# StateGraph at module scope, which it must -- build_matching_graph is the
+# module's whole subject. It loads no weights. torch and transformers stay, and
+# they are the ones that matter: pass 2c made the MedCPT load lazy, so an agent
+# import that pulled either in would mean the laziness had been undone.
 heavy = [m for m in ("torch", "transformers", "sentence_transformers",
-                     "streamlit", "langgraph", "icd10") if m in sys.modules]
+                     "streamlit", "icd10") if m in sys.modules]
 
 armed = {}
 for _name, _fn, _args in (("socket", socket.socket, (socket.AF_INET, socket.SOCK_STREAM)),
@@ -963,13 +1087,19 @@ for _name, _fn, _args in (("socket", socket.socket, (socket.AF_INET, socket.SOCK
 print(json.dumps({"heavy": heavy, "armed": armed}))
 """
 
-# 13 as of pass 20c-2b: oncotriage.fhir.parser and
-# oncotriage.storage.database_logger joined the list. The logger is the one that
-# matters most here -- its whole subject is a SQLite database, and item 20b's
-# claim that loading it opens nothing is exactly what the sqlite3.connect trap
-# tests. Before 20b this import would have created three tables in the
-# production inferences.db.
-_MODULES_UNDER_TRAP = 13
+# 27 as of pass 20c-2c: the twelve agent modules, oncotriage.agent itself, and
+# oncotriage.registries.primary_cancer joined the fourteen from earlier passes.
+#
+# THE AGENT IS THE HARDEST CASE IN THIS FILE. "13- LangGraph Agent.py" loaded
+# MedCPT (~110 MB) and FastEmbed at exec() time, so importing it was the single
+# most expensive thing in the project, and twelve files chained it. The traps
+# below say it now loads NOTHING -- and the `heavy` list is what says the models
+# specifically did not arrive, which no open/socket trap could tell you.
+#
+# oncotriage.storage.database_logger stays the case that matters most for the
+# sqlite3 trap: its whole subject is a SQLite database, and before item 20b this
+# import created three tables in the production inferences.db.
+_MODULES_UNDER_TRAP = 27
 
 _rc, _out, _err = _run(_PURITY, cwd=_ELSEWHERE, extra_path=_FALLBACK_PATH)
 check(f"all {_MODULES_UNDER_TRAP} package modules import with open, io.open, "
@@ -1122,6 +1252,240 @@ else:
           os.path.isdir(_payload.get("read_value") or ""), True)
     check("...and importing was STILL lazy on the machine that has the tree",
           _payload.get("nothing_resolved_at_import"), [])
+
+
+# ===========================================================================
+# 2c. NO PACKAGE MODULE RESOLVES A PATH AT IMPORT — checked one by one
+# ===========================================================================
+
+print("\n" + "=" * 78)
+print("2c. every package module imports without resolving a single path")
+print("=" * 78)
+
+# WHY THIS IS PER-MODULE AND NOT ONE IMPORT OF EVERYTHING.
+#
+# Check 2b (pass 20c-2b) proved oncotriage.config imports without resolving the
+# tree. It checked ONE module, and pass 20c-2c found the hole that left:
+# oncotriage/registries/mesh.py carried
+#
+#     from oncotriage.paths import data_MeSH_path
+#
+# at module scope. A `from X import name` is an ATTRIBUTE READ, so it fires the
+# lazy resolver — that one line globbed the whole sibling directory tree for
+# anything that imported the MeSH filter, and oncotriage.agent.deps imports it.
+# So importing the AGENT raised on a machine without the data tree, which is the
+# exact defect pass 2b existed to remove, surviving one module over for a whole
+# pass because nothing checked the other modules.
+#
+# Every module is now imported in ITS OWN subprocess, with ONCOTRIAGE_MAIN_PATH
+# pointed at a directory that does not exist. Its own subprocess matters: import
+# order would otherwise hide a second offender behind the first, and a module
+# that resolved a path would be indistinguishable from one that merely imported
+# a module that did.
+
+_ALL_PKG_MODULES = sorted(
+    os.path.relpath(f, _code_dir)[:-3].replace(os.sep, ".")
+    for f in _PKG_FILES
+    if not f.endswith("__init__.py")
+)
+
+check("the module list is the size the tree says it is (non-degeneracy)",
+      len(_ALL_PKG_MODULES) >= 26, True)
+check("...and includes the one that used to resolve a path at import",
+      "oncotriage.registries.mesh" in _ALL_PKG_MODULES, True)
+
+_PER_MODULE_PROBE = (
+    "import json, sys\n"
+    "import oncotriage.paths as _p\n"
+    "import %s\n"
+    "print(json.dumps({'resolved': sorted(_p._RESOLVED)}))\n"
+)
+
+_eager = {}
+for _module in _ALL_PKG_MODULES:
+    _rc, _out, _err = _run_with_env(
+        _PER_MODULE_PROBE % _module, cwd=_ELSEWHERE,
+        extra_env={"ONCOTRIAGE_MAIN_PATH": _UNREACHABLE_ROOT},
+        extra_path=_FALLBACK_PATH)
+    if _rc != 0:
+        _eager[_module] = f"import FAILED: {(_err.strip().splitlines() or ['?'])[-1][:90]}"
+        continue
+    _payload = _last_json(_out) or {}
+    if _payload.get("resolved"):
+        _eager[_module] = f"resolved {_payload['resolved']}"
+
+check("no package module resolves a path (or fails) when imported with the "
+      "project root unreachable",
+      sorted(f"{m}: {why}" for m, why in _eager.items()), [])
+
+
+# ===========================================================================
+# 2d. IMPORTING THE AGENT LOADS NO MODEL, WITH THE DEFERRAL SWITCH UNSET
+# ===========================================================================
+
+print("\n" + "=" * 78)
+print("2d. the agent imports with ONCOTRIAGE_DEFER_LOCAL_MODELS unset")
+print("=" * 78)
+
+# "13- LangGraph Agent.py" loaded MedCPT and FastEmbed at exec() time, lines
+# 414-434, unless ONCOTRIAGE_DEFER_LOCAL_MODELS=1 was set BEFORE the exec. That
+# switch existed for one caller — 46- Fixture Replay.py — and every other file
+# that chained File 13 paid ~110 MB and tens of seconds just by being read.
+#
+# Pass 20c-2c made the loads lazy, so the switch must no longer matter AT IMPORT.
+# Section 2 above already imports the agent under traps, but it inherits this
+# process's environment; this probe DELETES the variable, so a regression that
+# moved the load back to import time cannot hide behind a value someone else set.
+#
+# The switch itself is not gone and is checked to still exist: it is the second
+# line of defence, turning a forgotten stand-in into a named RuntimeError rather
+# than a silent real model call.
+
+_NO_DEFER = r'''
+import json, sys
+import oncotriage.agent.deps as d
+import oncotriage.agent.graph          # the module that imports every stage
+print(json.dumps({
+    "defer_flag_seen": d._DEFER_LOCAL_MODELS,
+    "switch_name": d.DEFER_LOCAL_MODELS_ENV,
+    "heavy": [m for m in ("torch", "transformers", "sentence_transformers")
+              if m in sys.modules],
+    "nothing_cached": sorted(d._CACHE),
+}))
+'''
+
+_rc, _out, _err = _run_with_env(_NO_DEFER, cwd=_ELSEWHERE,
+                                extra_env={"ONCOTRIAGE_DEFER_LOCAL_MODELS": None},
+                                extra_path=_FALLBACK_PATH)
+check("the agent imports with the deferral switch unset", _rc, 0)
+if _rc != 0:
+    fail("agent import without the deferral switch",
+         f"exit {_rc}; stderr tail: {_err.strip().splitlines()[-4:]}")
+else:
+    _payload = _last_json(_out) or {}
+    # NON-DEGENERATE: the switch really was unset, so "no model loaded" is not
+    # the deferral placeholder path being taken.
+    check("...with the switch genuinely OFF, so this is not the placeholder path",
+          _payload.get("defer_flag_seen"), False)
+    check("...and the switch still exists, as the second line of defence",
+          _payload.get("switch_name"), "ONCOTRIAGE_DEFER_LOCAL_MODELS")
+    check("...and NO model-bearing library was imported",
+          _payload.get("heavy"), [])
+    check("...and deps built and cached nothing at all",
+          _payload.get("nothing_cached"), [])
+
+
+# ===========================================================================
+# 2e. THE DEPENDENCY SEAM
+# ===========================================================================
+
+print("\n" + "=" * 78)
+print("2e. deps overrides are what the agent reaches, and they are checkable")
+print("=" * 78)
+
+# THE DEFECT THIS SEAM REPLACES, and it is the reason pass 20c-2c happened.
+#
+# Files 45 and 46 redirected the pipeline by rebinding four names --
+# openai_client, qdrant_client, _bm25_query_model, medcpt_score_pairs -- in the
+# shared exec namespace. That worked only because every project file was exec'd
+# into one dict. A module function resolves its globals in its own module, so
+# those rebindings would have reached NOTHING: 46- Fixture Replay.py would have
+# sent every Stage 5 prompt to the real OpenAI endpoint, been billed for it, and
+# still reported that all twelve fixtures replayed clean. Nothing would raise.
+#
+# Everything below runs in a subprocess with no credentials required: the
+# accessors are exercised with overrides installed, so no real client is ever
+# built.
+
+_SEAM = r'''
+import json
+from oncotriage.agent import deps, models
+
+sentinels = {k: object() for k in deps.OVERRIDE_KEYS}
+result = {}
+
+# 1. Nothing installed -> get_override is UNSET for every key.
+result["unset_before"] = [k for k in deps.OVERRIDE_KEYS
+                          if deps.get_override(k) is not deps.UNSET]
+
+# 2. An unknown key is REFUSED, not ignored. A silently-dropped override is the
+#    failure this whole module exists to make impossible.
+try:
+    deps.set_override("openai_clientt", object())
+    result["typo_refused"] = False
+except KeyError:
+    result["typo_refused"] = True
+
+# 3. Every typed accessor returns the override, by identity.
+saved = deps.set_overrides(sentinels)
+accessors = {
+    "openai_client":    deps.get_openai_client,
+    "qdrant_client":    deps.get_qdrant_client,
+    "bm25_query_model": deps.get_bm25_query_model,
+    "medcpt_tokenizer": deps.get_medcpt_tokenizer,
+    "medcpt_model":     deps.get_medcpt_model,
+    "cancer_registry":  deps.get_cancer_registry,
+    "lab_registry":     deps.get_lab_registry,
+    "mesh_filter":      deps.get_mesh_filter,
+}
+result["accessor_identity"] = sorted(
+    k for k, fn in accessors.items() if fn() is not sentinels[k]
+)
+
+# 4. MEDCPT_SCORER has no accessor here on purpose: its default lives in
+#    models, because deps must not import models. models.score_pairs dispatches.
+calls = []
+deps.set_override(deps.MEDCPT_SCORER, lambda q, t: calls.append((q, tuple(t))) or "scored")
+result["scorer_dispatched"] = models.score_pairs("q", ["a", "b"]) == "scored"
+result["scorer_saw_the_args"] = calls == [("q", ("a", "b"))]
+
+# 5. restore_overrides puts everything back, and CLEARS what had no previous
+#    value rather than pinning it to whatever it resolved to.
+deps.restore_overrides(saved)
+deps.clear_override(deps.MEDCPT_SCORER)
+result["unset_after"] = [k for k in deps.OVERRIDE_KEYS
+                         if deps.get_override(k) is not deps.UNSET]
+result["active_after"] = deps.active_overrides()
+
+# 6. The context manager restores on the way out, including on an exception.
+probe = object()
+try:
+    with deps.override(deps.QDRANT_CLIENT, probe):
+        result["ctx_inside"] = deps.get_qdrant_client() is probe
+        raise ValueError("boom")
+except ValueError:
+    pass
+result["ctx_cleared_after_raise"] = deps.get_override(deps.QDRANT_CLIENT) is deps.UNSET
+
+print(json.dumps(result))
+'''
+
+_rc, _out, _err = _run(_SEAM, cwd=_ELSEWHERE, extra_path=_FALLBACK_PATH)
+check("the seam probe ran", _rc, 0)
+if _rc != 0:
+    fail("dependency seam", f"exit {_rc}; stderr tail: {_err.strip().splitlines()[-4:]}")
+else:
+    _payload = _last_json(_out) or {}
+    check("no override is installed on a fresh import", _payload.get("unset_before"), [])
+    check("an unknown override key raises rather than being ignored",
+          _payload.get("typo_refused"), True)
+    check("every typed accessor returns the installed override, by identity",
+          _payload.get("accessor_identity"), [])
+    check("models.score_pairs dispatches to the MEDCPT_SCORER override",
+          _payload.get("scorer_dispatched"), True)
+    check("...and hands it (query, trial_texts) unchanged",
+          _payload.get("scorer_saw_the_args"), True)
+    # NON-DEGENERATE, and this is the half that matters: an accessor that
+    # ALWAYS returned the sentinel would pass check 3 and would also leave the
+    # overrides installed forever. restore must actually restore.
+    check("restore_overrides clears every override that had no previous value",
+          _payload.get("unset_after"), [])
+    check("...and active_overrides() then reports none",
+          _payload.get("active_after"), [])
+    check("the override context manager installs inside the block",
+          _payload.get("ctx_inside"), True)
+    check("...and restores even when the block raises",
+          _payload.get("ctx_cleared_after_raise"), True)
 
 
 # ===========================================================================
@@ -1306,15 +1670,36 @@ for _filename, _expected in _PRE_20C_NAMES.items():
 # The AST says the shim binds the name; it does not say the package actually
 # exposes it. An import of a name the package lost fails at run time, so every
 # `from oncotriage.X import ...` in the three shims is resolved for real.
+# WHY THIS DOES NOT USE hasattr FOR EVERY NAME (corrected in pass 20c-2c).
+#
+# oncotriage.paths grew a PEP 562 __getattr__ in pass 2b, and a path name routed
+# through it RESOLVES when it is read. On a healthy tree hasattr returns True.
+# On a checkout without the sibling directories the resolver raises
+# RuntimeError, and Python does not convert that to AttributeError -- so
+# hasattr PROPAGATES it and this probe would abort with a traceback instead of
+# reporting which names are missing. It would fail on exactly the machine this
+# whole pass exists to make the package work on.
+#
+# The question being asked is "does the package expose this name", not "can this
+# name be resolved right now", and PATH_NAMES answers the first without
+# attempting the second. Membership is checked FIRST so a path name never
+# reaches hasattr; every other module is unaffected and still uses hasattr,
+# which is the right test for a function or a constant.
 _IMPORT_PROBE = r'''
 import importlib, json, sys
 missing = []
+checked_via_path_names = []
 for module_name, names in json.loads(sys.argv[1] if len(sys.argv) > 1 else "{}").items():
     module = importlib.import_module(module_name)
+    lazy = set(getattr(module, "PATH_NAMES", ()))
     for name in names:
+        if name in lazy:
+            checked_via_path_names.append(module_name + "." + name)
+            continue
         if not hasattr(module, name):
             missing.append(module_name + "." + name)
-print(json.dumps({"missing": missing}))
+print(json.dumps({"missing": missing,
+                  "checked_via_path_names": sorted(checked_via_path_names)}))
 '''
 
 _wanted = {}
@@ -1337,6 +1722,16 @@ if _rc == 0:
     _payload = _last_json(_out) or {}
     check("every name the shims import actually exists on its package module",
           _payload.get("missing"), [])
+    # NON-DEGENERATE. "missing == []" is also what a probe that checked nothing
+    # returns. The lazy-path branch must have been taken for the sixteen names
+    # File 01 imports out of oncotriage.paths -- if PATH_NAMES ever stopped
+    # being exported, every one of them would silently fall through to hasattr
+    # and this file would be back to aborting on a broken tree.
+    _via_paths = [n for n in (_payload.get("checked_via_path_names") or [])
+                  if n.startswith("oncotriage.paths.")]
+    check("...and the sixteen lazy path names were checked by membership, not "
+          "by hasattr, so a broken tree cannot abort this probe",
+          len(_via_paths), 16)
 else:
     fail("package surface probe",
          f"exit {_rc}; stderr tail: {_err.strip().splitlines()[-4:]}")
@@ -1355,14 +1750,45 @@ else:
 # import statements. If any of them still reached for a free name, the exec
 # would raise NameError and this check would go red.
 
+# FILE 13 NEEDS A BASE CHAIN SUBTRACTED, and the other five do not.
+#
+# Files 07, 08, 09, 10 and 14's shims are import statements: exec'd into a bare
+# namespace they bind their own names and nothing else. File 13's shim keeps its
+# BOOTSTRAP -- it exec's 01 and 02 and then chains 03, 08, 09 and 10, exactly as
+# File 13 always did, because twelve callers rely on chaining 13 to get all of
+# them. So exec'ing it bare yields 402 names, 315 of which belong to those
+# files. The probe therefore runs the same base chain into the same namespace
+# FIRST, records what is there, and reports only what the shim itself added.
+#
+# The base list is passed per file, so nothing about this is special-cased in
+# the loop below: it is empty for the five import shims and is the real chain
+# for File 13.
 _SHIM_PROBE = r"""
-import json, sys
+import json, os, sys
 path = sys.argv[1]
+base_files = json.loads(sys.argv[2]) if len(sys.argv) > 2 else []
+code_dir = os.path.dirname(path) + os.sep
+
 ns = {"__name__": "_exec_chain_", "__file__": path}
+for name in base_files:
+    with open(code_dir + name, encoding="utf-8") as fh:
+        exec(fh.read(), ns)
+if base_files:
+    ns["exec_chain"](["03- Config.py", "08- Cancer Code Registry.py",
+                      "09- MeSH Cancer Site Relevance Filter.py",
+                      "10- Structured Eligibility Extractor.py"],
+                     caller_file=path, caller_globals=ns, chain_label="base")
+before = set(ns)
+
 with open(path, encoding="utf-8") as fh:
     exec(fh.read(), ns)
-print(json.dumps(sorted(k for k in ns if not k.startswith("__"))))
+print(json.dumps(sorted(k for k in ns
+                        if k not in before and not k.startswith("__"))))
 """
+
+_SHIM_BASE_CHAIN = {
+    "13- LangGraph Agent.py": ["01- Imports.py", "02- Utility Functions.py"],
+}
 
 # Files 08, 09 and 10 (pass 2a) and Files 07 and 14 (pass 2b) are checked by the
 # same loop against the same rules. The two inventories stay in separate dicts
@@ -1370,14 +1796,17 @@ print(json.dumps(sorted(k for k in ns if not k.startswith("__"))))
 # what its file bound at that commit; merging them here is just iteration.
 _RUNTIME_INVENTORY = dict(_PRE_2A_RUNTIME_NAMES)
 _RUNTIME_INVENTORY.update(_PRE_2B_RUNTIME_NAMES)
+_RUNTIME_INVENTORY.update(_PRE_2C_RUNTIME_NAMES)
 
 _RUNTIME_COUNTS = dict(_PRE_2A_COUNTS)
 _RUNTIME_COUNTS.update(_PRE_2B_COUNTS)
+_RUNTIME_COUNTS.update(_PRE_2C_COUNTS)
 
 _RUNTIME_ADDED = {name: set() for name in _PRE_2A_RUNTIME_NAMES}
 _RUNTIME_ADDED.update(_PASS_2B_ADDED)
+_RUNTIME_ADDED.update(_PASS_2C_ADDED)
 
-check("the inventory covers all five converted files",
+check("the inventory covers all six converted files",
       sorted(_RUNTIME_INVENTORY), sorted(_PASS_2B_DROPPED))
 
 for _filename, _expected in _RUNTIME_INVENTORY.items():
@@ -1385,10 +1814,14 @@ for _filename, _expected in _RUNTIME_INVENTORY.items():
           f"was extracted at", len(_expected), _RUNTIME_COUNTS[_filename])
 
     _proc = subprocess.run(
-        [sys.executable, "-c", _SHIM_PROBE, os.path.join(_code_dir, _filename)],
+        [sys.executable, "-c", _SHIM_PROBE, os.path.join(_code_dir, _filename),
+         json.dumps(_SHIM_BASE_CHAIN.get(_filename, []))],
         cwd=_ELSEWHERE, capture_output=True, text=True,
         env={**{k: v for k, v in os.environ.items() if k != "PYTHONPATH"},
-             **({"PYTHONPATH": _FALLBACK_PATH} if _FALLBACK_PATH else {})},
+             **({"PYTHONPATH": _FALLBACK_PATH} if _FALLBACK_PATH else {}),
+             # File 13's shim loads no model, but the base chain it runs would
+             # have. Set so this probe cannot be the thing that pulls MedCPT in.
+             "ONCOTRIAGE_DEFER_LOCAL_MODELS": "1"},
     )
     if _proc.returncode != 0:
         fail(f"{_filename[:2]}: the shim exec'd into a bare namespace",

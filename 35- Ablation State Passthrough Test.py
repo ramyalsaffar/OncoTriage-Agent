@@ -225,9 +225,56 @@ def make_stage4_state(stage3_out: dict, ablation_flags=None) -> dict:
     return state
 
 
-# Install the stubs into file 13's globals for the whole run.
+# Install the stubs THROUGH THE DEPENDENCY SEAM for the whole run.
+#
+# WHAT CHANGED IN PASS 20c-2c, AND WHY IT HAD TO. These two lines used to be
+#
+#     _MESH_FILTER = StubMeshFilter()
+#     _CANCER_REGISTRY = StubCancerRegistry()
+#
+# which worked because every project file was exec'd into THIS namespace, so
+# File 13's node functions resolved both names out of this dict at call time.
+# File 13 is a shim over oncotriage/agent/ now: its functions resolve their
+# globals in their own modules, and a rebinding here reaches none of them. The
+# nodes would have run against the REAL MeSH filter and the REAL cancer
+# registry -- which load 703 descriptors and the whole ICD-10-CM release -- and
+# every assertion below about resolve_calls would have failed on a stub nobody
+# was calling.
+#
+# deps.set_override is the seam. The agent asks deps for both, so the stub is
+# what it gets.
 _MESH_FILTER = StubMeshFilter()
 _CANCER_REGISTRY = StubCancerRegistry()
+
+deps.set_override(deps.MESH_FILTER, _MESH_FILTER)
+deps.set_override(deps.CANCER_REGISTRY, _CANCER_REGISTRY)
+
+
+# --- THE OVERRIDE IS SHOWN TO BE THE OBJECT THE AGENT ACTUALLY REACHES ------
+# CLAUDE.md: an assertion that has only ever passed is not evidence. Asserting
+# that set_override returned without raising proves nothing at all -- the
+# failure this replaces was a rebinding that also did not raise. So what is
+# asserted is IDENTITY: the object deps hands the agent must BE these stubs.
+#
+# The negative control is directly below it and is what makes the identity
+# check discriminating: with the override cleared, deps hands back something
+# else (the real filter, or None if the MeSH files are absent), and the same
+# comparison is False.
+print("\n" + "=" * 70)
+print("Test 0: the stubs are what the agent reaches, and that is checkable")
+print("=" * 70)
+check("deps hands the agent THIS stub MeSH filter",
+      deps.get_mesh_filter() is _MESH_FILTER, True)
+check("deps hands the agent THIS stub cancer registry",
+      deps.get_cancer_registry() is _CANCER_REGISTRY, True)
+
+_saved_mesh = deps.clear_override(deps.MESH_FILTER)
+check("...and with the override REMOVED it is something else, so the check "
+      "above can fail (negative control)",
+      deps.get_mesh_filter() is _MESH_FILTER, False)
+deps.set_override(deps.MESH_FILTER, _saved_mesh)
+check("...and reinstalling it restores the stub",
+      deps.get_mesh_filter() is _MESH_FILTER, True)
 
 
 print("\n" + "=" * 70)
@@ -247,8 +294,23 @@ print("\n" + "=" * 70)
 print("Test 1: no node returns a smaller key set on any path")
 print("=" * 70)
 
-with open(_code_dir + "13- LangGraph Agent.py") as _fh:
-    _tree = ast.parse(_fh.read())
+# RETARGETED IN PASS 20c-2c. This used to parse "13- LangGraph Agent.py", which
+# is now a re-export shim carrying no node definitions at all. The walk below
+# would have found none of the four functions, built an EMPTY _returns_by_node,
+# and reported PASS on every check -- a structural guard that had gone
+# permanently green while inspecting a file of import statements. The
+# non-degeneracy block after the walk is what makes that state impossible now.
+#
+# The four nodes live in two modules, so both are parsed and their trees merged.
+_AGENT_NODE_SOURCES = (
+    os.path.join(_code_dir, "oncotriage", "agent", "retrieval.py"),
+    os.path.join(_code_dir, "oncotriage", "agent", "filtering.py"),
+)
+
+_tree = ast.Module(body=[], type_ignores=[])
+for _agent_src in _AGENT_NODE_SOURCES:
+    with open(_agent_src, encoding="utf-8") as _fh:
+        _tree.body.extend(ast.parse(_fh.read()).body)
 
 _NODE_NAMES = [
     "node_query_expansion",
@@ -269,6 +331,24 @@ for _fn in ast.walk(_tree):
                 )
                 key_sets.append((_node.lineno, keys))
         _returns_by_node[_fn.name] = key_sets
+
+# NON-DEGENERATE FIRST, and it is the check that the retarget made necessary.
+# Every assertion below is of the form "no return omits a key another declares",
+# which is vacuously true for a node that was never found and trivially true for
+# a node with one return. A stale filename produces exactly that state, silently.
+check("the parsed agent sources define all four node functions",
+      sorted(_returns_by_node), sorted(_NODE_NAMES))
+check("...and every one of them yields at least one dict return",
+      sorted(n for n, v in _returns_by_node.items() if not v), [])
+# The node this whole file exists for. node_cross_encoder_rerank is the only one
+# with an ablation early return, so it is the only one where "no return omits a
+# key another return declares" can be violated at all -- MEASURED at 3 dict
+# returns, and the check is >= 2 because 1 would make the comparison vacuous.
+# The other three have exactly one return each; that is a fact about them, not a
+# threshold, so nothing here pretends otherwise.
+check("...and node_cross_encoder_rerank has more than one, so the key-set "
+      "comparison is a claim about something",
+      len(_returns_by_node.get("node_cross_encoder_rerank", [])) >= 2, True)
 
 for _name in _NODE_NAMES:
     _key_sets = _returns_by_node.get(_name, [])

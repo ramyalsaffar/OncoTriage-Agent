@@ -680,15 +680,31 @@ def _function_source(filename: str, function_name: str) -> str:
 # would produce here anyway and this string is only ever concatenated.
 _PARSER_MODULE = os.path.join("oncotriage", "fhir", "parser.py")
 
+# RETARGETED AGAIN IN PASS 20c-2c. Both File 13 entries moved: the agent is
+# oncotriage/agent/ now, and both of these functions live in patient.py.
+#
+# THIS ONE FAILS LOUDLY RATHER THAN GREEN, and that is a property of
+# _function_source(), not luck: it RAISES AssertionError when the function is
+# not at top level of the file it was given. Against the shim the loop below
+# would have aborted on its first item and taken the rest of this section with
+# it. The non-degeneracy check under the loop is added anyway, because the
+# checks themselves are all "this string is ABSENT", which an empty body
+# satisfies.
+_PATIENT_MODULE = os.path.join("oncotriage", "agent", "patient.py")
+
 _PROVEN_PATH = (
-    ("13- LangGraph Agent.py", "_create_patient_summary"),
-    ("13- LangGraph Agent.py", "compute_patient_hash"),
-    (_PARSER_MODULE,           "_parse_ecog_observation"),
-    (_PARSER_MODULE,           "_select_ecog_performance_status"),
+    (_PATIENT_MODULE, "_create_patient_summary"),
+    (_PATIENT_MODULE, "compute_patient_hash"),
+    (_PARSER_MODULE,  "_parse_ecog_observation"),
+    (_PARSER_MODULE,  "_select_ecog_performance_status"),
 )
 
 for _file, _fn_name in _PROVEN_PATH:
     _src = _function_source(_file, _fn_name)
+    # NON-DEGENERATE FIRST: both checks below are "this string is absent", and
+    # an empty body satisfies both.
+    check(f"{_fn_name}: the sliced source is substantial (non-degeneracy)",
+          len(_src) > 400, True)
     check(f"{_fn_name} does not touch the OpenAI client",
           "openai_client" in _src, False)
     check(f"{_fn_name} does not touch the Qdrant client",

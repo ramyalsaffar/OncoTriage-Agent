@@ -51,6 +51,29 @@ What is NOT lazy, and must not be:
     ``load_env_keys`` triggers no resolution at all; CALLING it with no argument
     resolves ``keys_path`` and nothing else.
 
+WHAT ``__getattr__`` DOES TO ``hasattr``, and it is not the usual thing
+-----------------------------------------------------------------------
+``hasattr(paths, name)`` is defined as "``getattr`` did not raise
+``AttributeError``". Two of the three outcomes here behave normally; the third
+does not, and callers have to know which:
+
+  * a name this module binds eagerly (``IS_DOCKER``, ``load_env_keys``) ->
+    ``True``, no resolution;
+  * a name it does not know at all -> ``__getattr__`` raises ``AttributeError``
+    -> ``False``, no resolution;
+  * a name in ``PATH_NAMES`` -> the resolver RUNS. On a healthy tree that is
+    ``True``. On a broken one the resolver raises ``RuntimeError``, and Python
+    does NOT convert that to ``AttributeError``, so ``hasattr`` PROPAGATES it
+    instead of returning ``False``.
+
+That last case is deliberate: a wrong project root must fail where it is read,
+loudly, naming the variable to set. But it means ``hasattr`` is the wrong tool
+for asking "does this module expose this name" — the question has an answer even
+when the tree is missing, and ``hasattr`` cannot give it. Ask ``name in
+PATH_NAMES or hasattr(...)`` instead, which is what ``47- Package Split Test.py``
+does; it used to call ``hasattr`` on all sixteen and would have aborted rather
+than reported on any checkout without the sibling directories.
+
 IMPORT-TIME SIDE EFFECTS, stated because they are what is left. Importing this
 module now:
 
@@ -65,6 +88,7 @@ import to succeed and the first path READ to raise.
 
 import glob
 import os
+import threading
 
 from dotenv import load_dotenv
 
@@ -113,12 +137,40 @@ print(f"[Paths] Settings module loaded from {path_settings.__file__} "
 # read rather than remembered as failed. That matters for the one recoverable
 # case: ONCOTRIAGE_MAIN_PATH set wrongly, corrected, and the read repeated in
 # the same interactive session.
+#
+# THE LOCK, added in pass 20c-2c. Pass 2b shipped this cache unguarded on the
+# argument that "01- Imports.py" imports all sixteen names at bootstrap, before
+# any worker thread exists, so the first-read race is unreachable. That argument
+# has an expiry date and pass 20c-3 is it: the twelve-worker batch runner and
+# the FastAPI server are the next two files to convert, and the moment either
+# resolves a path from a worker rather than from the exec chain, two threads can
+# enter the same resolver together.
+#
+# What the race would actually cost is small and entirely avoidable: the globs
+# are idempotent, so the worst outcome is duplicated work and a SECOND
+# "[Paths] Project root" banner in the log, which reads as the process having
+# resolved the tree twice. That is exactly the kind of quietly-wrong log line
+# this project treats as a defect, and a lock is three lines.
+#
+# RLock, not Lock: _resolve() is re-entrant by construction. Reading
+# `inferences_path` calls its resolver, which calls _resolve("data_path"), which
+# calls _resolve("main_path"). A plain Lock would deadlock the first read of any
+# derived path on a single thread.
+#
+# Double-checked: the fast path reads the dict WITHOUT taking the lock. A dict
+# read is atomic under the GIL and a name that is present was written by a
+# thread that had already finished resolving it, so a hit needs no
+# synchronisation. Only a miss pays for the lock, and only once per name.
 
 _RESOLVED = {}
+_RESOLVE_LOCK = threading.RLock()
 
 
 def _resolve(name):
-    """Resolve one path name, caching it. Raises AttributeError for unknowns."""
+    """Resolve one path name, caching it. Raises AttributeError for unknowns.
+
+    Thread-safe: concurrent first reads of the same name resolve it once.
+    """
     if name in _RESOLVED:
         return _RESOLVED[name]
 
@@ -128,9 +180,17 @@ def _resolve(name):
             f"module {__name__!r} has no attribute {name!r}"
         )
 
-    value = resolver()
-    _RESOLVED[name] = value
-    return value
+    with _RESOLVE_LOCK:
+        # Re-checked inside the lock. Between the miss above and acquiring it,
+        # another thread may have resolved this very name; without this line
+        # both would run the resolver and both would print the banner, which is
+        # the observable half of the race the lock exists to remove.
+        if name in _RESOLVED:
+            return _RESOLVED[name]
+
+        value = resolver()
+        _RESOLVED[name] = value
+        return value
 
 
 # glob.glob(pattern)[0] on its own raises IndexError, and an IndexError names
