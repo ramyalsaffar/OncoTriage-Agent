@@ -353,8 +353,26 @@ print("\n" + "=" * 70)
 print("Test 7: mesh_resolution is recorded")
 print("=" * 70)
 
-# The column has to exist for the value to be queryable. Loading file 14 runs
-# the additive migration; it is idempotent.
+# The column has to exist for the value to be queryable, so this section builds
+# a database and looks at its schema.
+#
+# WHAT WAS WRONG HERE, corrected in pass 20c-2b. The comment used to say
+# "loading file 14 runs the additive migration; it is idempotent", and the
+# PRAGMA below ran against the PRODUCTION inferences.db. Both halves stopped
+# being true at item 20b, which turned schema creation into a function: loading
+# File 14 has run no migration since. The check kept passing only because the
+# production database already carried the column from an earlier run — so it was
+# reporting on a file's history rather than on File 14's schema, and it would
+# have gone on passing after the column was deleted from the schema entirely.
+#
+# It now does what Files 36, 37, 38 and 40 do: a temporary database, built by an
+# explicit initialize_database() call, thrown away afterwards. Nothing in this
+# file opens the production database any more, and this was the only place that
+# did.
+#
+# The chain still loads File 14 — initialize_database has to come from
+# somewhere — but it is now loaded for the function rather than for a side
+# effect it no longer has.
 exec_chain(
     ["14- Database Logger.py"],
     caller_file=_code_dir + "32- Pan-Cancer Resolution Test.py",
@@ -362,13 +380,40 @@ exec_chain(
     chain_label="14",
 )
 
-_conn = sqlite3.connect(inferences_path)
+import shutil as _shutil
+import tempfile as _tempfile
+
+_SCHEMA_TMP_DIR = _tempfile.mkdtemp(prefix="oncotriage_pan_cancer_schema_")
+_SCHEMA_DB = os.path.join(_SCHEMA_TMP_DIR, "inferences_test.db")
+
+# NON-DEGENERATE FIRST. The membership check below is satisfied by any database
+# that happens to carry the column, including one built by some earlier run —
+# which is exactly the defect this block replaces. The file must not exist
+# before initialize_database() creates it, so the schema under test is the one
+# File 14 just produced and nothing else.
+check("the schema database does not exist before it is built",
+      os.path.exists(_SCHEMA_DB), False)
+check("...and it is not the production database",
+      os.path.abspath(_SCHEMA_DB) == os.path.abspath(inferences_path), False)
+
+initialize_database(_SCHEMA_DB)
+
+_conn = sqlite3.connect(_SCHEMA_DB)
 try:
     _cols = {row[1] for row in _conn.execute("PRAGMA table_info(inferences)")}
 finally:
     _conn.close()
 
+# ...and the column set actually came back. An empty set makes every "column X
+# exists" check fail rather than pass, but it fails for the wrong reason, and
+# three empty-set failures is precisely what item 20b's removal of the load-time
+# side effect produced in File 40 before its explicit call was added.
+check("the freshly built schema reports a substantial column set",
+      len(_cols) >= 40, True)
+
 check("inferences.mesh_resolution exists", "mesh_resolution" in _cols, True)
+
+_shutil.rmtree(_SCHEMA_TMP_DIR, ignore_errors=True)
 
 # The finalize nodes carry it from state into the logged result.
 _state = {

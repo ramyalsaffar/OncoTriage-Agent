@@ -25,6 +25,18 @@ re-export shims over a real Python package:
     oncotriage/extraction/stage.py                  File 10 to line 698
     oncotriage/extraction/histology.py              File 10 from line 699
 
+Pass 20c-2b added two more, and corrected one thing pass 2a shipped:
+
+    oncotriage/fhir/parser.py               File 07, whole
+    oncotriage/storage/database_logger.py   File 14, whole -- with log_inference
+                                            taking db_path and
+                                            _resolve_primary_cancer calling
+                                            load_registry()
+
+    oncotriage/paths.py   resolution is LAZY now. It used to run at import, so
+                          `import oncotriage.config` raised on any machine
+                          without the sibling directory tree. See check 2b.
+
 THE CYCLE THAT MADE THIS NON-TRIVIAL
 ------------------------------------
     '02- Utility Functions.py' read PRICING_CONFIG, COLLECTION_NAME,
@@ -63,11 +75,21 @@ WHAT THIS FILE CHECKS, and how each check could fail
   2. IMPORTING TOUCHES NOTHING LIVE. A subprocess replaces socket.socket with a
      class that raises on construction, and socket.create_connection,
      sqlite3.connect, builtins.open and io.open with functions that raise, then
-     imports all eleven package modules. Proved by patching, not by reading the
+     imports all thirteen package modules. Proved by patching, not by reading the
      source. Every trap is fired afterwards and must raise, so a run where the
      patches silently did nothing fails instead of passing vacuously. The `open`
      traps arrived with oncotriage.registries.mesh, whose load_mesh_filter()
      reads four JSON lookups and must do it in a function.
+
+  2b. PATH RESOLUTION IS LAZY. A subprocess with ONCOTRIAGE_MAIN_PATH pointed at
+     a directory that does not exist must still `import oncotriage.config` and
+     read MAX_WORKERS out of it, and must resolve NO path at import — the fix
+     for a defect pass 20c-2a shipped, where importing config globbed the whole
+     sibling tree and raised on any machine that did not have it. Section 2
+     could not see this: glob.glob() uses os.scandir, not open(). NON-DEGENERATE
+     BOTH WAYS: reading a path against the unreachable root must still raise
+     with a message naming the variable, and the same read against the real root
+     must return a directory that exists.
 
   3. THE CLIENT FACTORIES ARE LAZY AND CACHED. Counting fakes are installed over
      oncotriage.config.OpenAI and .QdrantClient before any call. Construction
@@ -285,8 +307,11 @@ _PRE_20C_COUNTS = {"01- Imports.py": 120, "02- Utility Functions.py": 14, "03- C
 #             have invented a name that never existed at runtime.
 #
 # The same loop leaves `_var` itself bound to the string '_seen_canonical'.
-# That leak is real, it is in the list below, and the shim re-exports it. See
-# the note in "08- Cancer Code Registry.py".
+# That leak is real and it is in the list below, because the list is a record of
+# what File 08 BOUND before pass 2a and that is what it bound. Pass 2b removed
+# the leak; the removal is recorded in _PASS_2B_DROPPED under the list rather
+# than by editing the list, because a pinned historical inventory that gets
+# rewritten every time the code changes is not pinned to anything.
 _PRE_2A_RUNTIME_NAMES = {
     '08- Cancer Code Registry.py': [
         'CancerCodeRegistry', 'OncologyLabRegistry',
@@ -343,6 +368,117 @@ _PRE_2A_COUNTS = {
     '08- Cancer Code Registry.py': 33,
     '09- MeSH Cancer Site Relevance Filter.py': 9,
     '10- Structured Eligibility Extractor.py': 56,
+}
+
+
+# THE ONLY NAMES PASS 2b IS ALLOWED TO REMOVE FROM THE LIST ABOVE.
+#
+# Pass 2a's contract was "nothing File 08 defined disappears", which is why the
+# shim re-exported three names nothing wants. Pass 2b removes them, and states
+# the removal here instead of quietly shortening the inventory:
+#
+#   _REGISTRY, _LAB_REGISTRY   the module's private singleton slots. Re-exported
+#                              they are SNAPSHOTS taken at shim load — None,
+#                              permanently, whatever load_registry() later
+#                              builds — so they read as "no registry yet" and
+#                              can never read as anything else. Nothing consumes
+#                              them; File 13's only mention is an assignment
+#                              that shadows the name.
+#   _var                       a leaked loop variable. The module's cleanup loop
+#                              now names it, so it does not exist to re-export.
+#
+# Checked in BOTH directions below: each of these must be genuinely absent from
+# the shim's namespace (so the exception is exercised rather than declared), and
+# every other pre-2a name must still be present. A fourth name going missing is
+# still a failure.
+_PASS_2B_DROPPED = {
+    '08- Cancer Code Registry.py': {'_REGISTRY', '_LAB_REGISTRY', '_var'},
+    '09- MeSH Cancer Site Relevance Filter.py': set(),
+    '10- Structured Eligibility Extractor.py': set(),
+    '07- FHIR Parser.py': set(),
+    '14- Database Logger.py': set(),
+}
+
+
+# ===========================================================================
+# THE NAMES FILES 07 AND 14 DEFINED BEFORE PASS 2b
+# ===========================================================================
+# Same method as the block above, for the same reasons: each file was exec'd at
+# commit aa2438b into a throwaway namespace, with only the free names it reads
+# out of the shared exec namespace pre-seeded, and every resulting binding
+# recorded.
+#
+# AST WOULD HAVE BEEN WRONG FOR FILE 07 IN THE "TOO FEW" DIRECTION. Eleven of
+# its names are ANNOTATED assignments -- _SYSTEM_URI_TO_KEY, _SYSTEM_PREFERENCE,
+# _MCODE_STAGE_LOINCS, _ECOG_LOINC_CODE, _ECOG_LOINC_PANEL_CODE,
+# _ECOG_LOINC_INTERPRETATION_CODE, _ECOG_MIN_GRADE, _ECOG_MAX_GRADE,
+# _MCODE_GENOMIC_VARIANT_LOINC, _METASTASIS_LOINCS and the four _COMPONENT_*
+# codes -- which a `grep "NAME ="` misses and which ast.Assign does not see
+# either, because they are ast.AnnAssign.
+#
+# AND IN THE "TOO MANY" DIRECTION FOR BOTH. _EXCLUDE_CONDITION_VERIFICATION is
+# assigned inside parse_fhir_bundle, not at module level, so an ast walk that
+# did not restrict itself to tree.body would have invented a twelfth constant
+# for the shim to re-export. all_patients is bound by File 07's __main__ block,
+# which exec_chain never fires.
+#
+# Neither file has a cleanup loop, so unlike File 08 there is no name here that
+# is bound and then deleted.
+_PRE_2B_RUNTIME_NAMES = {
+    '07- FHIR Parser.py': [
+        'BIRTH_DATE_PRECISION_COUNTS', 'DEMOGRAPHIC_SOURCE_COUNTS',
+        'ECOG_SELECTION_COUNTS', 'ECOG_VALUE_SHAPE_COUNTS',
+        '_ACTIVE_ALLERGY_STATUSES', '_ACTIVE_MED_STATUSES',
+        '_COMPONENT_GENE_STUDIED', '_COMPONENT_GENOMIC_SOURCE',
+        '_COMPONENT_HGVS_CDNA', '_COMPONENT_HGVS_PROTEIN',
+        '_CONDITION_STATUS_PRIORITY', '_ECOG_LOINC_CODE',
+        '_ECOG_LOINC_INTERPRETATION_CODE', '_ECOG_LOINC_PANEL_CODE',
+        '_ECOG_MAX_GRADE', '_ECOG_MIN_GRADE',
+        '_EXCLUDE_ALLERGY_VERIFICATION', '_EXCLUDE_OBS_STATUSES',
+        '_EXCLUDE_PROC_STATUSES', '_HISTORICAL_MED_STATUSES',
+        '_MCODE_GENOMIC_VARIANT_LOINC', '_MCODE_STAGE_LOINCS',
+        '_METASTASIS_LOINCS', '_SYSTEM_PREFERENCE', '_SYSTEM_URI_TO_KEY',
+        '_US_CORE_DETAILED', '_US_CORE_OMB_CATEGORY', '_US_CORE_TEXT',
+        '_calculate_age', '_condition_sort_key', '_parse_allergy',
+        '_parse_condition', '_parse_demographics', '_parse_ecog_observation',
+        '_parse_mcode_genomic_variant', '_parse_mcode_stage_observation',
+        '_parse_medication', '_parse_medication_statement',
+        '_parse_observation', '_parse_procedure', '_read_us_core_category',
+        '_select_best_coding', '_select_ecog_performance_status',
+        'load_all_patients', 'parse_fhir_bundle',
+    ],
+    '14- Database Logger.py': [
+        'INFERENCE_COLUMN_ADDITIONS', 'TRIAL_MATCH_COLUMN_ADDITIONS',
+        '_INITIALIZED_DATABASES', '_ensure_database', '_resolve_primary_cancer',
+        'initialize_database', 'log_inference',
+    ],
+}
+
+_PRE_2B_COUNTS = {'07- FHIR Parser.py': 45, '14- Database Logger.py': 7}
+
+
+# NAMES PASS 2b ADDED to a shim's surface, and why each one is not an accident.
+#
+# The inventory check runs in BOTH directions -- nothing missing, nothing extra
+# -- because a shim that quietly puts an unexpected name into the shared exec
+# namespace is how the next file to use that name silently picks this one up.
+# So an addition has to be declared here to be allowed.
+#
+#   resolve_inference_db_path   NEW PUBLIC FUNCTION. It answers "which database
+#                               will log_inference write to", which nothing
+#                               could ask before, and it is what Files 36, 37,
+#                               38, 40 and 45 use to show that passing db_path
+#                               is doing work rather than agreeing with a
+#                               default.
+#   _package_log_inference      SHIM PLUMBING. File 14's shim cannot re-export
+#                               log_inference directly: it wraps it to supply
+#                               globals().get("inferences_path"), so it needs a
+#                               name for the thing it is wrapping. Underscored
+#                               and named for what it is.
+_PASS_2B_ADDED = {
+    '07- FHIR Parser.py': set(),
+    '14- Database Logger.py': {'resolve_inference_db_path',
+                               '_package_log_inference'},
 }
 
 
@@ -587,11 +723,34 @@ _PKG_FILES = sorted(
     if name.endswith(".py") and "__pycache__" not in root
 )
 
-check("the package file list is non-empty and covers both new subpackages",
-      len(_PKG_FILES) >= 11
+check("the package file list is non-empty and covers all four subpackages",
+      len(_PKG_FILES) >= 13
       and any(f.endswith("registries/mesh.py") for f in _PKG_FILES)
-      and any(f.endswith("extraction/negation.py") for f in _PKG_FILES),
+      and any(f.endswith("extraction/negation.py") for f in _PKG_FILES)
+      and any(f.endswith("fhir/parser.py") for f in _PKG_FILES)
+      and any(f.endswith("storage/database_logger.py") for f in _PKG_FILES),
       True)
+
+# EVERY SUBPACKAGE MUST BE DECLARED IN pyproject.toml. setuptools does not
+# recurse into a listed package, so a subpackage present in the tree and absent
+# from the `packages` list is importable from an EDITABLE install (which maps
+# the source tree) and MISSING from a built wheel. That difference does not
+# surface until someone builds one. Read as text rather than with a TOML parser
+# because tomllib would only tell us the list parses, not that it matches the
+# directory tree.
+_PYPROJECT = open(os.path.join(_code_dir, "pyproject.toml"), encoding="utf-8").read()
+_SUBPACKAGE_DIRS = sorted(
+    "oncotriage." + name
+    for name in os.listdir(_PKG_DIR)
+    if os.path.isfile(os.path.join(_PKG_DIR, name, "__init__.py"))
+)
+check("the tree has the subpackages this pass expects (non-degeneracy)",
+      _SUBPACKAGE_DIRS,
+      ["oncotriage.extraction", "oncotriage.fhir", "oncotriage.registries",
+       "oncotriage.storage"])
+check("every subpackage on disk is declared in pyproject.toml, so a built "
+      "wheel carries it",
+      sorted(p for p in _SUBPACKAGE_DIRS if f'"{p}"' not in _PYPROJECT), [])
 
 
 def _function_body_imports(path: str):
@@ -780,6 +939,8 @@ import oncotriage.registries.mesh_crosswalk_build
 import oncotriage.extraction.negation
 import oncotriage.extraction.stage
 import oncotriage.extraction.histology
+import oncotriage.fhir.parser
+import oncotriage.storage.database_logger
 
 heavy = [m for m in ("torch", "transformers", "sentence_transformers",
                      "streamlit", "langgraph", "icd10") if m in sys.modules]
@@ -802,7 +963,13 @@ for _name, _fn, _args in (("socket", socket.socket, (socket.AF_INET, socket.SOCK
 print(json.dumps({"heavy": heavy, "armed": armed}))
 """
 
-_MODULES_UNDER_TRAP = 11
+# 13 as of pass 20c-2b: oncotriage.fhir.parser and
+# oncotriage.storage.database_logger joined the list. The logger is the one that
+# matters most here -- its whole subject is a SQLite database, and item 20b's
+# claim that loading it opens nothing is exactly what the sqlite3.connect trap
+# tests. Before 20b this import would have created three tables in the
+# production inferences.db.
+_MODULES_UNDER_TRAP = 13
 
 _rc, _out, _err = _run(_PURITY, cwd=_ELSEWHERE, extra_path=_FALLBACK_PATH)
 check(f"all {_MODULES_UNDER_TRAP} package modules import with open, io.open, "
@@ -825,6 +992,136 @@ else:
     check("no model-bearing library was imported (torch / transformers / "
           "sentence_transformers / streamlit / langgraph / icd10)",
           _payload.get("heavy"), [])
+
+
+# ===========================================================================
+# 2b. PATH RESOLUTION IS LAZY: IMPORTING config NEEDS NO SIBLING TREE
+# ===========================================================================
+
+print("\n" + "=" * 78)
+print("2b. oncotriage.config imports with the project root made unreachable")
+print("=" * 78)
+
+# THE DEFECT THIS CHECKS FOR, which shipped in pass 20c-2a and is fixed in 2b.
+#
+# oncotriage/paths.py resolved every sibling directory as a module-level
+# assignment, so importing it globbed the whole tree and RAISED if any pattern
+# matched nothing. oncotriage/config.py imports paths for load_env_keys, so
+# `import oncotriage.config` inherited that: on any machine without the sibling
+# tree — a wheel installed into a fresh environment, a CI checkout of "03- Code"
+# on its own, a container built before its data volume is mounted — importing
+# the config module to read MAX_WORKERS died with a RuntimeError about a glob.
+#
+# Section 2 above could not catch it. glob.glob() uses os.scandir, not open(),
+# so the resolution slipped through every trap in that probe while still being
+# the single largest import-time dependency in the package.
+#
+# The probe below points ONCOTRIAGE_MAIN_PATH at a directory that does not
+# exist, which is the loudest possible version of "the tree is not there":
+# settings.require_existing_directory() rejects it before any glob runs. Then it
+# imports config and reads a tunable, and only afterwards touches a path.
+
+_UNREACHABLE_ROOT = os.path.join(tempfile.gettempdir(),
+                                 "oncotriage-root-that-does-not-exist")
+
+
+def _run_with_env(code: str, cwd: str, extra_env: dict, extra_path: str = None):
+    """_run(), plus environment overrides. A None value deletes the variable."""
+    env = dict(os.environ)
+    if extra_path:
+        env["PYTHONPATH"] = extra_path + os.pathsep + env.get("PYTHONPATH", "")
+    else:
+        env.pop("PYTHONPATH", None)
+    for key, value in extra_env.items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
+    proc = subprocess.run([sys.executable, "-c", code], cwd=cwd, env=env,
+                          capture_output=True, text=True)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+# The order inside the probe is the whole point: import, read a tunable, and
+# only THEN read a path. Reporting all three in one payload means a failure
+# says which of the three steps was the one that broke.
+_LAZY_PATHS = r'''
+import json
+result = {}
+
+import oncotriage.config as cfg
+result["imported"] = True
+result["tunable"] = cfg.MAX_WORKERS
+
+import oncotriage.paths as paths
+result["nothing_resolved_at_import"] = sorted(paths._RESOLVED)
+
+# Importing the FUNCTION must not resolve anything either -- its default
+# argument is keys_path, and a default evaluated at import would defeat this.
+from oncotriage.paths import load_env_keys           # noqa: F401
+result["nothing_resolved_by_importing_load_env_keys"] = sorted(paths._RESOLVED)
+
+try:
+    value = paths.data_fhir_path
+    result["read_raised"] = None
+    result["read_value"] = value
+except Exception as exc:
+    result["read_raised"] = type(exc).__name__
+    result["read_message"] = str(exc)
+
+print(json.dumps(result))
+'''
+
+_rc, _out, _err = _run_with_env(
+    _LAZY_PATHS, cwd=_ELSEWHERE,
+    extra_env={"ONCOTRIAGE_MAIN_PATH": _UNREACHABLE_ROOT},
+    extra_path=_FALLBACK_PATH)
+
+check("the lazy-paths probe ran", _rc, 0)
+if _rc != 0:
+    fail("importing oncotriage.config with the project root unreachable",
+         f"exit {_rc}; stderr tail: {_err.strip().splitlines()[-4:]}")
+else:
+    _payload = _last_json(_out) or {}
+    check("oncotriage.config imports with the project root unreachable",
+          _payload.get("imported"), True)
+    check("...and a tunable is readable out of it (12 = MAX_WORKERS)",
+          _payload.get("tunable"), 12)
+    check("...and importing oncotriage.paths resolved NO path",
+          _payload.get("nothing_resolved_at_import"), [])
+    check("...and importing load_env_keys resolved no path either",
+          _payload.get("nothing_resolved_by_importing_load_env_keys"), [])
+    # NON-DEGENERATE. Everything above would also hold for a paths module that
+    # had simply stopped resolving anything, ever. The read must still fail, and
+    # fail with the message that names the variable to set.
+    check("...while actually READING a path still raises",
+          _payload.get("read_raised"), "RuntimeError")
+    # The variable name is on the SECOND line of require_existing_directory's
+    # message ("Set ONCOTRIAGE_MAIN_PATH to the correct location"), so the whole
+    # message is carried across, not just its first line.
+    check("...and the message names ONCOTRIAGE_MAIN_PATH, so the fix is findable",
+          "ONCOTRIAGE_MAIN_PATH" in (_payload.get("read_message") or ""), True)
+    check("...and it did NOT quietly return a path",
+          "read_value" in _payload, False)
+
+# The other half of the non-degeneracy: with the root restored, the same read
+# must SUCCEED and produce a real directory. Without this, a paths module that
+# raised unconditionally would pass every check above.
+_rc, _out, _err = _run_with_env(
+    _LAZY_PATHS, cwd=_ELSEWHERE,
+    extra_env={"ONCOTRIAGE_MAIN_PATH": None},
+    extra_path=_FALLBACK_PATH)
+if _rc != 0:
+    fail("the same probe against the real tree",
+         f"exit {_rc}; stderr tail: {_err.strip().splitlines()[-4:]}")
+else:
+    _payload = _last_json(_out) or {}
+    check("with the root reachable again, the same read succeeds",
+          _payload.get("read_raised"), None)
+    check("...and returns a directory that exists",
+          os.path.isdir(_payload.get("read_value") or ""), True)
+    check("...and importing was STILL lazy on the machine that has the tree",
+          _payload.get("nothing_resolved_at_import"), [])
 
 
 # ===========================================================================
@@ -1067,9 +1364,25 @@ with open(path, encoding="utf-8") as fh:
 print(json.dumps(sorted(k for k in ns if not k.startswith("__"))))
 """
 
-for _filename, _expected in _PRE_2A_RUNTIME_NAMES.items():
+# Files 08, 09 and 10 (pass 2a) and Files 07 and 14 (pass 2b) are checked by the
+# same loop against the same rules. The two inventories stay in separate dicts
+# above because each was extracted at a different commit and each is pinned to
+# what its file bound at that commit; merging them here is just iteration.
+_RUNTIME_INVENTORY = dict(_PRE_2A_RUNTIME_NAMES)
+_RUNTIME_INVENTORY.update(_PRE_2B_RUNTIME_NAMES)
+
+_RUNTIME_COUNTS = dict(_PRE_2A_COUNTS)
+_RUNTIME_COUNTS.update(_PRE_2B_COUNTS)
+
+_RUNTIME_ADDED = {name: set() for name in _PRE_2A_RUNTIME_NAMES}
+_RUNTIME_ADDED.update(_PASS_2B_ADDED)
+
+check("the inventory covers all five converted files",
+      sorted(_RUNTIME_INVENTORY), sorted(_PASS_2B_DROPPED))
+
+for _filename, _expected in _RUNTIME_INVENTORY.items():
     check(f"the recorded runtime name list for {_filename[:2]} is the size it "
-          f"was extracted at", len(_expected), _PRE_2A_COUNTS[_filename])
+          f"was extracted at", len(_expected), _RUNTIME_COUNTS[_filename])
 
     _proc = subprocess.run(
         [sys.executable, "-c", _SHIM_PROBE, os.path.join(_code_dir, _filename)],
@@ -1090,13 +1403,38 @@ for _filename, _expected in _PRE_2A_RUNTIME_NAMES.items():
              f"stdout tail: {_proc.stdout.strip().splitlines()[-3:]}")
         continue
 
-    check(f"{_filename[:2]}: all {len(_expected)} pre-2a runtime names still bound",
-          sorted(set(_expected) - set(_bound)), [])
-    # Both directions. A shim that re-exported something File 08 never defined
+    _dropped = _PASS_2B_DROPPED[_filename]
+    _added = _RUNTIME_ADDED[_filename]
+
+    # NON-DEGENERATE FIRST. An exception list that names something the inventory
+    # never held would silently excuse nothing, and an exception list that grew
+    # to cover the whole inventory would excuse everything.
+    check(f"{_filename[:2]}: every deliberately-dropped name was in the recorded "
+          f"inventory to begin with", sorted(_dropped - set(_expected)), [])
+    check(f"{_filename[:2]}: the exception list is a small minority of the "
+          f"inventory", len(_dropped) < len(_expected) // 4, True)
+
+    check(f"{_filename[:2]}: all {len(_expected) - len(_dropped)} recorded runtime "
+          f"names still bound (minus {len(_dropped)} dropped by pass 2b)",
+          sorted(set(_expected) - _dropped - set(_bound)), [])
+    # The deletions are ASSERTED, not merely tolerated: a shim that quietly kept
+    # re-exporting a permanently-None registry snapshot would pass the check
+    # above and fail this one.
+    check(f"{_filename[:2]}: and every dropped name really is gone",
+          sorted(_dropped & set(_bound)), [])
+    # Both directions. A shim that re-exported something the file never defined
     # would put a name into the shared exec namespace that no caller expects,
-    # and the next file to use that name would silently pick this one up.
-    check(f"{_filename[:2]}: and nothing was ADDED to the shared namespace",
-          sorted(set(_bound) - set(_expected)), [])
+    # and the next file to use that name would silently pick this one up. The
+    # only permitted additions are the ones declared in _PASS_2B_ADDED, and each
+    # of those must actually BE there -- a declaration for a name that is not
+    # bound would quietly widen the allowance for nothing.
+    check(f"{_filename[:2]}: every declared addition is genuinely NEW, i.e. absent "
+          f"from the recorded inventory (non-degeneracy)",
+          sorted(_added & set(_expected)), [])
+    check(f"{_filename[:2]}: and every declared addition really is bound",
+          sorted(_added - set(_bound)), [])
+    check(f"{_filename[:2]}: and nothing UNDECLARED was added to the shared "
+          f"namespace", sorted(set(_bound) - set(_expected) - _added), [])
 
 
 # ===========================================================================

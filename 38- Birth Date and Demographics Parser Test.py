@@ -179,15 +179,57 @@ def check_raises(label: str, fn, expected) -> None:
 # ===========================================================================
 # THROWAWAY DATABASE
 # ===========================================================================
-# inferences_path is rebound BEFORE File 14 is exec'd, because File 14 opens
-# its connection and creates its tables at load time. The real inferences.db is
-# never touched by this test.
+# TWO INDEPENDENT MECHANISMS KEEP THIS TEST OFF THE PRODUCTION DATABASE, and the
+# second arrived in pass 20c-2b because the first stopped being enough on its
+# own.
+#
+#   1. inferences_path is rebound before File 14 is loaded. That worked only
+#      because File 14 was exec'd into this namespace and read the name out of
+#      it. File 14 is now a shim over oncotriage/storage/database_logger.py, and
+#      a MODULE function cannot see a caller's globals; the redirect survives
+#      solely because the shim keeps a wrapper passing
+#      globals().get("inferences_path") down. Had the shim re-exported the
+#      package function directly, section 9 below would have written a real row
+#      into the real inferences.db -- including the INSERT it makes by hand --
+#      while this file printed the name of a temporary one.
+#   2. log_inference is called with db_path EXPLICITLY and the path it reports
+#      back is asserted, which depends on no seam at all.
+#
+# The rebinding stays because section 9 reads back through
+# sqlite3.connect(inferences_path) and the two must name the same file.
+
+_PRODUCTION_INFERENCES_PATH = inferences_path
 
 _TMP_DIR = tempfile.mkdtemp(prefix="oncotriage_birthdate_")
 inferences_path = os.path.join(_TMP_DIR, "inferences_test.db")
 
 with open(_code_dir + "14- Database Logger.py") as _fh:
     exec(_fh.read(), globals())
+
+
+# --- THE DATABASE-ISOLATION ASSERTION IS SHOWN TO DISCRIMINATE --------------
+# CLAUDE.md: an assertion that has only ever passed is not evidence that it can
+# catch anything. resolve_inference_db_path(None) is what a caller that forgot
+# db_path gets. It RESOLVES without connecting, so this control names the hazard
+# without going near the production file.
+_PACKAGE_DEFAULT_DB = resolve_inference_db_path(None)
+
+print("\n" + "=" * 70)
+print("0. the database-isolation assertion can fail")
+print("=" * 70)
+check("the scratch path is non-empty (non-degeneracy)",
+      bool(inferences_path) and inferences_path.endswith(".db"), True)
+check("the production path is non-empty (non-degeneracy)",
+      bool(_PRODUCTION_INFERENCES_PATH), True)
+check("omitting db_path resolves to the PRODUCTION database",
+      os.path.abspath(_PACKAGE_DEFAULT_DB),
+      os.path.abspath(_PRODUCTION_INFERENCES_PATH))
+check("...which is NOT this test's scratch database, so passing db_path is "
+      "doing real work and the check below can fail",
+      os.path.abspath(_PACKAGE_DEFAULT_DB) == os.path.abspath(inferences_path),
+      False)
+check("...and passing db_path resolves to exactly what was passed",
+      resolve_inference_db_path(inferences_path), inferences_path)
 
 
 # ===========================================================================
@@ -435,7 +477,15 @@ for _bd in _SAMPLE_BIRTHS:
 
 # STRUCTURAL guard. The equality above holds by construction today; this fails
 # the moment a now()/today() call is reintroduced anywhere in the age path.
-_PARSER_TREE = ast.parse(open(_code_dir + "07- FHIR Parser.py").read())
+#
+# RETARGETED IN PASS 20c-2b. This used to parse "07- FHIR Parser.py", which is
+# now a re-export shim holding no function definitions at all. _clock_calls()
+# would have found no _calculate_age to walk, returned [] for it, and reported
+# PASS on a file it had not inspected -- the check would have gone permanently
+# green while proving nothing. The definitions live in the package module now,
+# and that is what is parsed.
+_PARSER_SOURCE = os.path.join(_code_dir, "oncotriage", "fhir", "parser.py")
+_PARSER_TREE = ast.parse(open(_PARSER_SOURCE, encoding="utf-8").read())
 
 
 def _clock_calls(function_name: str, tree) -> list:
@@ -450,6 +500,26 @@ def _clock_calls(function_name: str, tree) -> list:
                     found.append(inner.func.attr)
     return found
 
+
+# NON-DEGENERATE FIRST. _clock_calls() returns [] both for "this function makes
+# no clock call" and for "this function is not in the tree I was handed", and
+# the second is exactly what a stale filename produces. Both functions have to
+# be present before their emptiness means anything.
+_PARSER_DEFS = {_n.name for _n in ast.walk(_PARSER_TREE)
+                if isinstance(_n, ast.FunctionDef)}
+check("the parsed parser source actually defines the two functions under test",
+      {"_calculate_age", "_parse_demographics"} <= _PARSER_DEFS, True)
+
+# ...and the detector is not vacuous either: it must find a clock call when one
+# is there. A copy of _calculate_age's tree with `date.today()` spliced in is
+# parsed from a string, so nothing on disk is touched.
+_DETECTOR_CONTROL = ast.parse(
+    "def _calculate_age(birth_date, reference_date=None):\n"
+    "    return date.today()\n"
+)
+check("...and _clock_calls DOES report a clock call when one is present "
+      "(negative control, parsed from a string, nothing on disk touched)",
+      _clock_calls("_calculate_age", _DETECTOR_CONTROL), ["today"])
 
 check("_calculate_age contains no clock call",
       _clock_calls("_calculate_age", _PARSER_TREE), [])
@@ -711,7 +781,17 @@ _LOGGED_RESULT = {
     "birth_date_precision": "year",
 }
 
-check_no_raise("log_inference writes a row", lambda: log_inference(_LOGGED_RESULT, _LOGGED_PATIENT))
+_LOGGED_DB = None
+
+
+def _log_the_row():
+    global _LOGGED_DB
+    _LOGGED_DB = log_inference(_LOGGED_RESULT, _LOGGED_PATIENT,
+                               db_path=inferences_path)
+
+
+check_no_raise("log_inference writes a row", _log_the_row)
+check("...into the scratch database, not production", _LOGGED_DB, inferences_path)
 
 _conn = sqlite3.connect(inferences_path)
 _conn.row_factory = sqlite3.Row

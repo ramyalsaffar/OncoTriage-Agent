@@ -166,15 +166,66 @@ def check_true(label: str, actual) -> None:
 # ===========================================================================
 # THROWAWAY DATABASE
 # ===========================================================================
-# inferences_path is rebound BEFORE File 14 is exec'd, because File 14 opens
-# its connection and creates its tables at load time. The real inferences.db is
-# never touched by this test.
+# TWO INDEPENDENT MECHANISMS KEEP THIS TEST OFF THE PRODUCTION DATABASE, and the
+# second arrived in pass 20c-2b because the first stopped being enough on its
+# own.
+#
+#   1. inferences_path is rebound before File 14 is loaded. That worked only
+#      because File 14 was exec'd into this namespace and read the name out of
+#      it. File 14 is now a shim over oncotriage/storage/database_logger.py, and
+#      a MODULE function cannot see a caller's globals; the redirect survives
+#      solely because the shim keeps a wrapper that passes
+#      globals().get("inferences_path") down. Had the shim re-exported the
+#      package function directly, every log_inference() call below would have
+#      written a real row into the real inferences.db while this file printed
+#      the name of a temporary one.
+#   2. Every log_inference() call passes db_path EXPLICITLY and asserts on the
+#      path the writer reports back, which depends on no seam at all.
+#
+# The rebinding stays because db_rows() reads back through
+# sqlite3.connect(inferences_path) and the two must name the same file.
+
+_PRODUCTION_INFERENCES_PATH = inferences_path
 
 _TMP_DIR = tempfile.mkdtemp(prefix="oncotriage_retrieval_observability_")
 inferences_path = os.path.join(_TMP_DIR, "inferences_test.db")
 
 with open(_code_dir + "14- Database Logger.py") as _fh:
     exec(_fh.read(), globals())
+
+
+def check_wrote_to_scratch(label: str, reported_path) -> None:
+    """Assert log_inference reported the scratch database, not production.
+
+    log_inference returns the path it resolved, so this is the path the writer
+    ACTUALLY used rather than one recomputed beside it.
+    """
+    check(label, reported_path, inferences_path)
+
+
+# --- THE ASSERTION ABOVE IS SHOWN TO DISCRIMINATE ---------------------------
+# CLAUDE.md: an assertion that has only ever passed is not evidence that it can
+# catch anything. resolve_inference_db_path(None) is what a caller that forgot
+# db_path gets. It RESOLVES without connecting, so this control names the hazard
+# without going near the production file.
+_PACKAGE_DEFAULT_DB = resolve_inference_db_path(None)
+
+print("\n" + "=" * 70)
+print("0. the database-isolation assertion can fail")
+print("=" * 70)
+check("the scratch path is non-empty (non-degeneracy)",
+      bool(inferences_path) and inferences_path.endswith(".db"), True)
+check("the production path is non-empty (non-degeneracy)",
+      bool(_PRODUCTION_INFERENCES_PATH), True)
+check("omitting db_path resolves to the PRODUCTION database",
+      os.path.abspath(_PACKAGE_DEFAULT_DB),
+      os.path.abspath(_PRODUCTION_INFERENCES_PATH))
+check("...which is NOT this test's scratch database, so passing db_path is "
+      "doing real work and the check above can fail",
+      os.path.abspath(_PACKAGE_DEFAULT_DB) == os.path.abspath(inferences_path),
+      False)
+check("...and passing db_path resolves to exactly what was passed",
+      resolve_inference_db_path(inferences_path), inferences_path)
 
 
 # ===========================================================================
@@ -799,7 +850,9 @@ def db_rows(where=""):
 
 degraded_result = node_finalize(_degraded_state)["result"]
 degraded_result["patient_id"] = "degraded-run"
-log_inference(degraded_result, PATIENT_DATA)
+check_wrote_to_scratch("degraded run wrote to the scratch database",
+                       log_inference(degraded_result, PATIENT_DATA,
+                                     db_path=inferences_path))
 
 rows = db_rows("WHERE patient_id = 'degraded-run'")
 check("degraded run wrote exactly one row", len(rows), 1)
@@ -830,7 +883,9 @@ if rows:
 _unreported = terminal_state()
 unreported_result = node_error_handler(_unreported)["result"]
 unreported_result["patient_id"] = "unreported-run"
-log_inference(unreported_result, PATIENT_DATA)
+check_wrote_to_scratch("unreported run wrote to the scratch database",
+                       log_inference(unreported_result, PATIENT_DATA,
+                                     db_path=inferences_path))
 
 rows = db_rows("WHERE patient_id = 'unreported-run'")
 check("unreported run wrote exactly one row", len(rows), 1)
@@ -862,7 +917,9 @@ _clean_state = terminal_state(
 )
 clean_result = node_finalize(_clean_state)["result"]
 clean_result["patient_id"] = "clean-run"
-log_inference(clean_result, PATIENT_DATA)
+check_wrote_to_scratch("clean run wrote to the scratch database",
+                       log_inference(clean_result, PATIENT_DATA,
+                                     db_path=inferences_path))
 
 rows = db_rows("WHERE patient_id = 'clean-run'")
 check("clean run wrote exactly one row", len(rows), 1)

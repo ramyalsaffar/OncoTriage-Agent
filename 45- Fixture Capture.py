@@ -269,12 +269,27 @@ surfaced; invoking the graph without 14 raises NameError in node_finalize.
 
 Rather than duplicate the function here — a second copy would drift from the
 one production runs, and the fixtures would then characterize a function nobody
-calls — 14 is chained with `inferences_path` REDIRECTED to a scratch database
-under the fixture directory. 14 opens that path at load time and creates its
-tables in it; the production file is never opened. log_inference is then
-rebound to a function that raises, so even a stray call cannot write a row.
+calls — 14 is chained with `inferences_path` REDIRECTED to a scratch database in
+the system temp directory, and log_inference is rebound to a function that
+raises, so even a stray call cannot write a row.
 
-Both facts are asserted at startup by _assert_database_is_isolated().
+Two earlier statements here are no longer true and are corrected rather than
+deleted, because both were load-bearing when they were written:
+
+  * "14 opens that path at load time and creates its tables in it" — item 20b
+    made schema creation a function, so loading 14 opens nothing at all. The
+    scratch file may never be created, which is the correct outcome for a run
+    that logs nothing.
+  * the redirect is a rebinding of a shared global, and pass 20c-2b turned File
+    14 into a shim over oncotriage/storage/database_logger.py. A module function
+    cannot see this file's globals; the rebinding still works only because the
+    shim keeps a wrapper that passes globals().get("inferences_path") down.
+
+Three facts are asserted at startup by _assert_database_is_isolated(): the
+redirect is in place, the neutralized log_inference still raises, and the
+package's own default — what a caller that passed no db_path would get — is the
+production database and NOT the scratch one, which is what makes the first two
+checks discriminating rather than vacuous.
 
 USAGE
 -----
@@ -392,6 +407,12 @@ exec_chain(
 # 14- is loaded for one pure function. Nothing here logs an inference, and the
 # rebinding makes that structural rather than a promise: a stray call raises
 # instead of writing a row that would look like a production inference.
+#
+# The signature accepts db_path so that a caller written against the pass-2b
+# signature still lands on the raise rather than on a TypeError. A TypeError
+# would also stop the write, but it would report the wrong reason, and
+# _assert_database_is_isolated() below only accepts a RuntimeError as evidence
+# that the neutralization is intact.
 _UNUSED_LOG_INFERENCE = log_inference
 
 
@@ -2418,10 +2439,39 @@ ABLATION_FIXTURES = [
 def _assert_database_is_isolated() -> None:
     """Refuse to run if the production inference database is reachable.
 
-    Two independent checks, because either one alone can be defeated: the path
-    could be restored by a later chain, or the redirect could hold while a
-    caller still reaches the real logger through a saved reference.
+    THREE independent checks, because no one of them is sufficient: the path
+    could be restored by a later chain, the redirect could hold while a caller
+    still reaches the real logger through a saved reference, and — the check
+    added in pass 20c-2b — both of the first two could pass vacuously if the
+    scratch path and the production path were the same string, or if
+    resolve_inference_db_path() had stopped distinguishing them.
+
+    The third check RESOLVES a path and connects to nothing, so asserting about
+    the production database here does not open it.
     """
+    # NON-DEGENERACY, asserted before the two isolation checks that depend on
+    # it. What a caller who passed no db_path would get must be the production
+    # database, and must not be the scratch one. If those two were ever the same
+    # value, every check below would pass while providing no isolation at all.
+    _package_default = resolve_inference_db_path(None)
+    if os.path.abspath(_package_default) != os.path.abspath(PRODUCTION_INFERENCES_PATH):
+        raise RuntimeError(
+            f"resolve_inference_db_path(None) is {_package_default!r}, not the "
+            f"production database {PRODUCTION_INFERENCES_PATH!r}. The isolation "
+            f"checks below compare against the wrong thing; refusing to run."
+        )
+    if os.path.abspath(_package_default) == os.path.abspath(FIXTURE_SCRATCH_DB):
+        raise RuntimeError(
+            f"the production database and the scratch database resolve to the "
+            f"same path ({_package_default!r}). The redirect below would pass "
+            f"while isolating nothing; refusing to run."
+        )
+    if resolve_inference_db_path(FIXTURE_SCRATCH_DB) != FIXTURE_SCRATCH_DB:
+        raise RuntimeError(
+            "resolve_inference_db_path() does not honour an explicit db_path; "
+            "refusing to run."
+        )
+
     if inferences_path != FIXTURE_SCRATCH_DB:
         raise RuntimeError(
             f"inferences_path is {inferences_path!r}, not the scratch database "

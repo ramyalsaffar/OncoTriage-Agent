@@ -61,41 +61,42 @@ from oncotriage.registries.cancer_code_registry import (
 #------------------------------------------------------------------------------
 
 
-# THREE NAMES THAT NEED A WARNING, re-exported anyway
-#---------------------------------------------------
+# THREE NAMES THIS SHIM USED TO RE-EXPORT AND NO LONGER DOES (pass 20c-2b)
+#-------------------------------------------------------------------------
+#
+# Pass 2a re-exported _REGISTRY, _LAB_REGISTRY and _var, on the rule that no
+# name File 08 defined before the move may disappear. All three are gone now,
+# deliberately, and the reasoning is here rather than in a commit message
+# because "the inventory shrank" is exactly the kind of change that has to be
+# argued to be readable.
 #
 # _REGISTRY and _LAB_REGISTRY are the module's private singleton SLOTS. Before
-# this pass they lived in the shared namespace, and load_registry()'s
+# pass 2a they lived in the shared namespace, and load_registry()'s
 # `global _REGISTRY` wrote back into that namespace, so a later reader saw the
-# built registry. Now the write lands on the module and this binding is a
-# SNAPSHOT taken at shim load — it is None and it stays None.
-#
-# That difference is safe today and was checked rather than assumed: grep across
+# built registry. After the move the write lands on the MODULE, and the shim's
+# binding was a SNAPSHOT taken at shim load: None, permanently, whatever
+# load_registry() went on to build. A name that looks like an accessor and is
+# guaranteed to be None is worse than no name at all — it is a trap that reads
+# as "no registry has been built yet". Nothing consumes either one: grep across
 # every file in the repository finds exactly one other mention, File 13 line 65,
 # and it is an ASSIGNMENT (`_LAB_REGISTRY = load_lab_registry()`) that shadows
-# this name rather than reading it. Nothing reads either slot. They are
-# re-exported because the inventory contract for this pass is that no name File
-# 08 defined disappears, not because anything wants them.
+# the name rather than reading it.
 #
 # USE load_registry() / load_lab_registry(). They are the accessors, they are
 # thread-safe, and they see the module's real slot.
 #
-# _var is a LEAKED LOOP VARIABLE. File 08 ends its canonical-order build with
+# _var no longer exists at all. It was a LEAKED LOOP VARIABLE — File 08's
+# canonical-order cleanup loop deleted the four temporaries it named and left
+# the loop variable itself bound to the string '_seen_canonical'. Pass 2a
+# carried the leak into the package verbatim because it was not allowed to
+# change File 08's logic; pass 2b adds '_var' to that tuple, so the module
+# binds it and then removes it and there is nothing left here to re-export.
 #
-#     for _var in ('_idx', '_code', '_name', '_seen_canonical'):
-#         globals().pop(_var, None)
-#
-# which deletes the four temporaries it names and leaves _var itself bound to
-# the string '_seen_canonical'. That leak is in the module now, verbatim,
-# because this pass changes no logic. It is re-exported for the same reason as
-# the two above. Adding '_var' to that tuple is a one-line fix and belongs in a
-# pass that is allowed to touch File 08's logic.
-
-from oncotriage.registries.cancer_code_registry import (
-    _REGISTRY,
-    _LAB_REGISTRY,
-    _var,
-)
+# 47- Package Split Test.py holds the pre-2a runtime inventory and an explicit
+# list of these three names as the ONLY permitted deletions from it, and checks
+# that each one is genuinely absent from the shim's namespace — so the exception
+# is exercised rather than merely declared, and a fourth name going missing
+# still fails.
 
 
 #------------------------------------------------------------------------------

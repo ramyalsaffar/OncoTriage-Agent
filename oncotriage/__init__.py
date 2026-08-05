@@ -10,14 +10,25 @@ Module layout and the ONE allowed import direction
 ::
 
     settings   <-- paths <-- config <-- utils
-        ^                       ^
-        +-----------------------+
+        ^                       ^          ^
+        +-----------------------+          |
+                                           |
+    constants <---------------------- fhir.parser
+    registries.cancer_code_registry <- storage.database_logger
+                       ^                   |
+                       +-------------------+
 
-    settings   env-var names, path resolution, load_env_keys()
-    paths      IS_DOCKER, _glob_one and every path variable
+    settings   env-var names, path resolution
+    paths      IS_DOCKER, _glob_one, load_env_keys() and every path variable,
+               all of them resolved LAZILY (pass 20c-2b)
     constants  the two coding-system sentinels (imports nothing)
     config     every tunable, plus LAZY client/keys accessors
     utils      cost, retry, partial dates, exec_chain, CaffeinateSession
+
+    registries   clinical terminology: cancer codes, MeSH C04 ancestry
+    extraction   rule-based stage and histology extraction from criteria text
+    fhir         parse_fhir_bundle and the per-resource parsers (File 07)
+    storage      the SQLite schema and log_inference (File 14)
 
 Arrows point at what a module may import. There is no arrow back:
 
@@ -29,18 +40,27 @@ Arrows point at what a module may import. There is no arrow back:
   into ``settings`` is what broke it.
 * ``constants`` imports nothing at all, from anywhere.
 
-Importing any module in this package must stay side-effect free in the ways
-that matter: no network client is constructed, no local model is downloaded or
-loaded, and no database is opened. ``paths`` does touch the filesystem — it
-globs the sibling directories — which is the one deliberate exception, and it
-is why the network-free proof imports ``config`` and ``utils`` rather than
-asserting about the whole package.
+Importing any module in this package is side-effect free, with no exception
+left: no network client is constructed, no local model is downloaded or loaded,
+no database is opened, and — since pass 20c-2b — no directory is resolved and no
+file is read.
+
+``paths`` used to be the exception. Every path was a module-level assignment, so
+importing it globbed the whole sibling directory tree and RAISED when the tree
+was not there. ``config`` imports ``paths``, so ``import oncotriage.config``
+inherited that, and a wheel installed into a fresh environment could not read
+``MAX_WORKERS`` without the project's data directories beside it. Resolution is
+lazy now, through a PEP 562 module ``__getattr__``: the first READ of a path
+resolves it and caches it, and importing resolves nothing. ``47- Package Split
+Test.py`` check 2b imports ``config`` with the root pointed at a directory that
+does not exist and requires the import to succeed and the first read to raise.
 
 This ``__init__`` deliberately imports NO submodule. ``import oncotriage`` must
 stay free; the caller names the module it wants.
 """
 
-__all__ = ["settings", "paths", "constants", "config", "utils"]
+__all__ = ["settings", "paths", "constants", "config", "utils",
+           "registries", "extraction", "fhir", "storage"]
 
 
 #------------------------------------------------------------------------------

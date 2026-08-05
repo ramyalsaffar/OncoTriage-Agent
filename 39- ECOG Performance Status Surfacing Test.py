@@ -664,11 +664,27 @@ def _function_source(filename: str, function_name: str) -> str:
     raise AssertionError(f"{function_name} not found at top level of {filename}")
 
 
+# RETARGETED IN PASS 20c-2b. The parser's definitions moved to
+# oncotriage/fhir/parser.py and "07- FHIR Parser.py" is now a re-export shim, so
+# every path below that named the numbered file names the module instead.
+#
+# THIS IS NOT COSMETIC. _function_source() RAISES AssertionError when it cannot
+# find the function, so a stale filename here would have aborted the run rather
+# than passing silently -- but only for the two direct calls further down. The
+# loop below would have hit the same raise on its third item, so the fourth
+# never runs. Either way the checks stop being performed, and the fix is to
+# point at the file the definitions are actually in.
+#
+# _function_source() prefixes _code_dir, so a package-relative path works
+# unchanged; the separator is forward-slash because that is what os.path.join
+# would produce here anyway and this string is only ever concatenated.
+_PARSER_MODULE = os.path.join("oncotriage", "fhir", "parser.py")
+
 _PROVEN_PATH = (
     ("13- LangGraph Agent.py", "_create_patient_summary"),
     ("13- LangGraph Agent.py", "compute_patient_hash"),
-    ("07- FHIR Parser.py",     "_parse_ecog_observation"),
-    ("07- FHIR Parser.py",     "_select_ecog_performance_status"),
+    (_PARSER_MODULE,           "_parse_ecog_observation"),
+    (_PARSER_MODULE,           "_select_ecog_performance_status"),
 )
 
 for _file, _fn_name in _PROVEN_PATH:
@@ -678,7 +694,14 @@ for _file, _fn_name in _PROVEN_PATH:
     check(f"{_fn_name} does not touch the Qdrant client",
           "qdrant_client" in _src, False)
 
-_sel_src = _function_source("07- FHIR Parser.py", "_select_ecog_performance_status")
+_sel_src = _function_source(_PARSER_MODULE, "_select_ecog_performance_status")
+# NON-DEGENERATE. Two of the three checks on this source are "the string is
+# absent", which an empty source satisfies for free -- and an empty source is
+# what _function_source() returns for a function whose body is a docstring and
+# nothing else. It is not, and this says so before anything is inferred from
+# its contents.
+check("the sliced selection source is substantial (non-degeneracy)",
+      len(_sel_src) > 500, True)
 check("selection uses get_age_reference_date, not the clock",
       "get_age_reference_date" in _sel_src, True)
 check("selection contains no now()/today() call",
@@ -686,7 +709,7 @@ check("selection contains no now()/today() call",
 
 # The routing itself: 89247-1 must be matched explicitly in parse_fhir_bundle,
 # not left to fall through to the general observation pool.
-_bundle_src = _function_source("07- FHIR Parser.py", "parse_fhir_bundle")
+_bundle_src = _function_source(_PARSER_MODULE, "parse_fhir_bundle")
 check("parse_fhir_bundle routes the ECOG LOINC explicitly",
       "_ECOG_LOINC_CODE" in _bundle_src, True)
 check("and calls the ECOG parser rather than _parse_observation",

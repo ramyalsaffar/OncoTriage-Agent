@@ -121,15 +121,101 @@ def check(label: str, actual, expected) -> None:
 # ===========================================================================
 # THROWAWAY DATABASE
 # ===========================================================================
-# inferences_path is rebound BEFORE File 14 is exec'd, because File 14 opens
-# its connection and creates its tables at load time. The real inferences.db is
-# never touched by this test.
+# TWO INDEPENDENT MECHANISMS KEEP THIS TEST OFF THE PRODUCTION DATABASE, and
+# the second one arrived in pass 20c-2b because the first stopped being enough.
+#
+#   1. inferences_path is rebound before File 14 is loaded. That is the original
+#      mechanism, and it only ever worked because File 14 was exec'd into this
+#      namespace and read the name out of it. File 14 is now a shim over
+#      oncotriage/storage/database_logger.py; a MODULE function cannot see a
+#      caller's globals, so this redirect survives solely because the shim keeps
+#      a wrapper that passes globals().get("inferences_path") down. Had the shim
+#      simply re-exported the package function, every log_inference() call below
+#      would have written a real row into the real inferences.db while this file
+#      went on printing the name of a temporary one. Silent in both directions.
+#   2. Every log_inference() call passes db_path EXPLICITLY, and asserts on the
+#      path the writer reports back. That does not depend on the seam at all.
+#
+# The rebinding is kept because Test 5 and Test 7 read rows back through
+# sqlite3.connect(inferences_path) and the two must agree on which file is under
+# test.
+#
+# The production path is captured FIRST, before anything shadows it, so the
+# discrimination check below has something real to compare against.
+
+_PRODUCTION_INFERENCES_PATH = inferences_path
 
 _TMP_DIR = tempfile.mkdtemp(prefix="oncotriage_logging_contract_")
 inferences_path = os.path.join(_TMP_DIR, "inferences_test.db")
 
 with open(_code_dir + "14- Database Logger.py") as _fh:
     exec(_fh.read(), globals())
+
+
+def check_wrote_to_scratch(label: str, reported_path) -> None:
+    """Assert log_inference reported the scratch database, not production.
+
+    log_inference returns the path it resolved, so this is the path the writer
+    ACTUALLY used rather than a path recomputed beside it.
+
+    SHOWN TO FAIL, 2026-08-05, as CLAUDE.md requires of any new assertion.
+    The demonstration mutated this file's SOURCE TEXT IN MEMORY -- nothing on
+    disk was edited, and the sha256 was compared before and after to prove it --
+    and redirected a log_inference call to a SECOND temporary database, never to
+    the production one:
+
+      run 1, both calls redirected
+        FAIL  log_inference wrote to the scratch database, not production
+                expected: .../inferences_test.db
+                actual:   .../decoy_not_the_scratch.db
+        the run then aborted at Test 5's readback with
+        "sqlite3.OperationalError: no such table: inferences", because the
+        schema had been created in the decoy. That abort is a second,
+        independent signal that the mutation bit -- and it stopped the Test 7
+        assertion from ever running, which is why there was a second run.
+
+      run 2, only Test 7's call redirected
+        62 passed, 2 failed:
+          - the reasoning-cost row also went to the scratch database
+          - a row was written for the reasoning case   (the consequence)
+        sha256 before == sha256 after: True
+
+    Unmutated, both assertions pass. Test 0 above is the standing guard on the
+    same property: it checks that the value a caller gets by NOT passing
+    db_path is the production database and is not this scratch file, so the
+    comparison here cannot be satisfied by the two paths coinciding.
+    """
+    check(label, reported_path, inferences_path)
+
+
+# --- THE ASSERTION ABOVE IS SHOWN TO DISCRIMINATE ---------------------------
+# CLAUDE.md: an assertion that has only ever passed is not evidence that it can
+# catch anything. check_wrote_to_scratch() would pass vacuously if
+# resolve_inference_db_path() ignored its argument, or if the production path
+# and the scratch path happened to be the same string.
+#
+# resolve_inference_db_path(None) is what a caller that forgot db_path gets --
+# and it RESOLVES without connecting, so this control names the hazard without
+# going anywhere near the production file.
+
+_PACKAGE_DEFAULT_DB = resolve_inference_db_path(None)
+
+print("\n" + "=" * 70)
+print("Test 0: the database-isolation assertion can fail")
+print("=" * 70)
+check("the scratch path is non-empty (non-degeneracy)",
+      bool(inferences_path) and inferences_path.endswith(".db"), True)
+check("the production path is non-empty (non-degeneracy)",
+      bool(_PRODUCTION_INFERENCES_PATH), True)
+check("omitting db_path resolves to the PRODUCTION database",
+      os.path.abspath(_PACKAGE_DEFAULT_DB),
+      os.path.abspath(_PRODUCTION_INFERENCES_PATH))
+check("...which is NOT this test's scratch database, so passing db_path is "
+      "doing real work and the check above can fail",
+      os.path.abspath(_PACKAGE_DEFAULT_DB) == os.path.abspath(inferences_path),
+      False)
+check("...and passing db_path resolves to exactly what was passed",
+      resolve_inference_db_path(inferences_path), inferences_path)
 
 
 # ===========================================================================
@@ -376,17 +462,60 @@ check("every return declares gpt4o_retries",
       sorted(ln for ln, keys in _gpt4o_returns if "gpt4o_retries" not in keys),
       [])
 
-# File 14 must not reach for a retrieval constant: that was the bug. Checked
-# over the parsed tree, not the text, so the comment explaining the defect does
-# not count as a use of it.
-with open(_code_dir + "14- Database Logger.py") as _fh:
+# The logger must not reach for a retrieval constant: that was the bug --
+# bm25_retrieved / vector_retrieved were inserted as the CONFIGURED request
+# sizes, so both columns were constant across every row and any ratio built on
+# them described the config rather than the run. Checked over the parsed tree,
+# not the text, so the comment explaining the defect does not count as a use
+# of it.
+#
+# RETARGETED IN PASS 20c-2b, and the retarget matters. This used to parse
+# "14- Database Logger.py", which is now a re-export shim: forty lines of import
+# statements. The check would still have PASSED against it, and would have
+# proved nothing at all, forever. The definitions are in the package module and
+# that is what is parsed.
+_LOGGER_SOURCE = os.path.join(_code_dir, "oncotriage", "storage", "database_logger.py")
+with open(_LOGGER_SOURCE, encoding="utf-8") as _fh:
     _logger_tree = ast.parse(_fh.read())
 
+# Bare Names AND attribute names. Before the package split a constant could only
+# arrive as a bare Name out of the shared exec namespace, so collecting Name was
+# enough. A package module reaches a tunable as `config.BM25_RETRIEVAL_SIZE`,
+# which is an ast.Attribute and would have walked straight past a Name-only
+# scan. Widening the scan is what keeps this check meaning the same thing after
+# the move as it did before it.
 _logger_names = {
     _n.id for _n in ast.walk(_logger_tree) if isinstance(_n, ast.Name)
+} | {
+    _n.attr for _n in ast.walk(_logger_tree) if isinstance(_n, ast.Attribute)
 }
+
+# NON-DEGENERATE FIRST. Every check below is "this name is absent", and absent
+# is what an empty set says about everything. A scan that read the wrong file,
+# or that collected nothing, would certify the property vacuously. So: the set
+# must be substantial, and it must contain names the logger provably does use --
+# including one reached as an ATTRIBUTE, which is the half of the scan the
+# package split made necessary.
+check("the logger source was found and parsed to a substantial name set",
+      len(_logger_names) >= 50, True)
+check("...and it contains a name the logger certainly reads (PRICING_CONFIG)",
+      "PRICING_CONFIG" in _logger_names, True)
+check("...and an ATTRIBUTE name it certainly reads (paths.inferences_path), so "
+      "the attribute half of the scan is doing work",
+      "inferences_path" in _logger_names, True)
+
 for _const in ("BM25_RETRIEVAL_SIZE", "VECTOR_RETRIEVAL_SIZE"):
-    check(f"File 14 no longer reads {_const}", _const in _logger_names, False)
+    check(f"the logger no longer reads {_const}", _const in _logger_names, False)
+
+# The registry call that replaced File 13's _CANCER_REGISTRY global (pass 2b).
+# Asserted here because it is a name this file's scan now sees, and because a
+# revert to the global would be a silent layering regression: the global is
+# UNBOUND in any chain that loads 14 without 13, and _resolve_primary_cancer
+# would raise NameError rather than resolve a diagnosis.
+check("the logger resolves the cancer registry through load_registry()",
+      "load_registry" in _logger_names, True)
+check("...and no longer reads File 13's _CANCER_REGISTRY global",
+      "_CANCER_REGISTRY" in _logger_names, False)
 
 
 # ===========================================================================
@@ -520,7 +649,9 @@ _logged = node_finalize(make_terminal_state(
     vector_retrieved=EXPECTED_VECTOR,
 ))["result"]
 
-log_inference(_logged, PATIENT_DATA)
+check_wrote_to_scratch(
+    "log_inference wrote to the scratch database, not production",
+    log_inference(_logged, PATIENT_DATA, db_path=inferences_path))
 
 _conn = sqlite3.connect(inferences_path)
 _conn.row_factory = sqlite3.Row
@@ -617,7 +748,9 @@ _reasoning_result["gpt4o_input_tokens"]     = COST_INPUT
 _reasoning_result["gpt4o_output_tokens"]    = COST_OUTPUT
 _reasoning_result["gpt4o_reasoning_tokens"] = COST_REASONING
 
-log_inference(_reasoning_result, PATIENT_DATA)
+check_wrote_to_scratch(
+    "the reasoning-cost row also went to the scratch database",
+    log_inference(_reasoning_result, PATIENT_DATA, db_path=inferences_path))
 
 _conn = sqlite3.connect(inferences_path)
 _conn.row_factory = sqlite3.Row

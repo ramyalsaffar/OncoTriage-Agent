@@ -17,19 +17,50 @@ defaults to, and the deferral is gone. ``config`` imports ``paths`` and
 ``settings`` and still never imports ``utils``, so the original cycle stays
 broken.
 
-IMPORT-TIME SIDE EFFECTS, stated because they are real. Importing this module
-resolves the whole directory tree, which means it:
+RESOLUTION IS LAZY AS OF PASS 20c-2b, and that is a correction, not a polish
+-----------------------------------------------------------------------------
+Until this pass every path was a module-level assignment, so IMPORTING this
+module resolved the whole sibling directory tree and RAISED if any part of it
+was absent. ``oncotriage.config`` imports this module for ``load_env_keys``, so
+``import oncotriage.config`` inherited that: on a machine without the sibling
+tree — a wheel installed into a fresh environment, a CI checkout of ``03- Code``
+alone, a container built before the data volume is mounted — importing the
+config module to read ``MAX_WORKERS`` died with a RuntimeError about a directory
+pattern that matched nothing. A configuration module that cannot be imported
+without the data tree beside it is not importable in any useful sense.
 
-  * reads ONCOTRIAGE_MAIN_PATH (or falls back), and RAISES if the root does not
-    exist;
-  * runs one ``glob.glob`` per sibling directory, and RAISES if any pattern
-    matches nothing;
-  * prints which branch and which root it took.
+Every path below is therefore resolved on FIRST ATTRIBUTE ACCESS and cached,
+through the module-level ``__getattr__`` that PEP 562 added in Python 3.7.
+Consumers change nothing: ``from oncotriage.paths import data_fhir_path`` and
+``paths.inferences_path`` both go through ``__getattr__`` and both still get a
+plain string. ``01- Imports.py`` imports all sixteen names by name, so the exec
+chain resolves the tree exactly as eagerly as it always did — the laziness is
+for everyone who is NOT the exec chain.
 
-It opens no socket, loads no model, touches no database and reads no file — the
-globs stat directories, they do not open them. ``load_env_keys`` is the only
-thing here that opens a file, and it is a function, not a module-level
-statement.
+What is NOT lazy, and must not be:
+
+  * ``IS_DOCKER`` — one ``os.path.exists`` and one environment read, no glob,
+    cannot raise;
+  * ``path_settings`` / ``_load_path_settings`` — an import;
+  * ``_glob_one`` — a function. It reads the root through ``_resolve()`` rather
+    than through a module global, because a module-level ``__getattr__`` is
+    consulted for attribute access on the MODULE and not for a global name
+    lookup inside a function body. ``main_path`` written bare in here would be a
+    NameError, not a lazy read. The message it raises is unchanged;
+  * ``REQUIRED_ENV_KEYS`` / ``load_env_keys`` — data and a function. Importing
+    ``load_env_keys`` triggers no resolution at all; CALLING it with no argument
+    resolves ``keys_path`` and nothing else.
+
+IMPORT-TIME SIDE EFFECTS, stated because they are what is left. Importing this
+module now:
+
+  * imports ``oncotriage.settings`` and ``dotenv``;
+  * prints one line naming the settings module.
+
+It opens no socket, loads no model, touches no database, reads no file and
+resolves no directory. ``47- Package Split Test.py`` section 2b imports it with
+the project root pointed at a directory that does not exist and requires the
+import to succeed and the first path READ to raise.
 """
 
 import glob
@@ -64,6 +95,44 @@ print(f"[Paths] Settings module loaded from {path_settings.__file__} "
       f"(via the oncotriage package)")
 
 
+#------------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Lazy resolution machinery
+# ---------------------------------------------------------------------------
+#
+# _RESOLVED is the cache. A name lands in it exactly once, the first time
+# anything reads the corresponding module attribute, and every later read is a
+# dict hit. Nothing here is resettable: a process that resolved the tree once
+# and then saw a different tree would produce two sets of paths in one run, and
+# every path-derived artefact — the checkpoint, the manifest, the database —
+# would be ambiguous about which one produced it.
+#
+# The cache stores the VALUE, so a resolver that raises is retried on the next
+# read rather than remembered as failed. That matters for the one recoverable
+# case: ONCOTRIAGE_MAIN_PATH set wrongly, corrected, and the read repeated in
+# the same interactive session.
+
+_RESOLVED = {}
+
+
+def _resolve(name):
+    """Resolve one path name, caching it. Raises AttributeError for unknowns."""
+    if name in _RESOLVED:
+        return _RESOLVED[name]
+
+    resolver = _RESOLVERS.get(name)
+    if resolver is None:
+        raise AttributeError(
+            f"module {__name__!r} has no attribute {name!r}"
+        )
+
+    value = resolver()
+    _RESOLVED[name] = value
+    return value
+
+
 # glob.glob(pattern)[0] on its own raises IndexError, and an IndexError names
 # neither the pattern that matched nothing nor the root it was anchored to.
 # Every sibling directory in the local branch is discovered by prefix glob, so
@@ -74,80 +143,178 @@ print(f"[Paths] Settings module loaded from {path_settings.__file__} "
 # leave the same set of names behind. The Docker branch does not call it; a
 # name defined in one branch and not the other is the exact defect item 20a
 # found in code_path.
+#
+# It reads the root through _resolve() rather than as a bare global: see the
+# module docstring. By the time any caller reaches here the root is already
+# cached, because every local resolver below globs off it.
 def _glob_one(pattern, label):
     hits = glob.glob(pattern)
     if not hits:
         raise RuntimeError(
             f"No directory matched the {label} pattern: {pattern!r}\n"
-            f"Project root in use: {main_path!r} (from {_main_path_source})\n"
+            f"Project root in use: {_resolve('main_path')!r} "
+            f"(from {_resolve('_main_path_source')})\n"
             f"Set {path_settings.ENV_MAIN_PATH} if the root is wrong, or check "
             f"that the sibling directory exists and still ends in the expected suffix."
         )
     return hits[0]
 
 
-if IS_DOCKER:
-    # Docker container paths (Linux environment)
-    print("🐳 Running in Docker container")
+def _resolve_root():
+    """Resolve main_path and _main_path_source together, and announce the branch.
 
-    # Provenance of main_path, recorded in both branches so a reader of a log
-    # can tell a container run from a local one without inferring it.
-    _main_path_source = "Docker image layout (fixed)"
+    They are one resolver because they are one decision: the root and the
+    provenance of the root. Splitting them would let a log record a root
+    without saying where it came from, which is the thing item 20a added the
+    source for.
 
-    main_path = "/app/"
-    # The Dockerfile does `COPY . /app/`, so the numbered scripts sit directly
-    # in /app. Added in item 20a: the local branch has always defined
-    # code_path and this branch never did, so any file reaching for it was
-    # container-only broken.
-    code_path = "/app/"
-    data_path = "/app/data/"
-    data_patient_path = "/app/data/patients/"
-    data_fhir_path = "/app/data/patients/fhir/"
-    data_trial_path = "/app/data/trials/"
-    inferences_path = "/app/data/inferences.db"
-    results_path = "/app/results/"
-    result_fhir_explore_path = "/app/results/fhir_exploration/"
-    result_ablation_path = "/app/results/ablation/"
-    keys_path = "/app/"
-    airflow_path = "/app/airflow_home/"
-    requirements_path = "/app/requirements/"
-    data_MeSH_path = "/app/data/mesh/"
-    checkpoint_path = "/app/checkpoint/"
+    The branch banner is printed HERE rather than at import, because that is
+    now where the branch is actually taken. A line saying which environment the
+    paths came from, printed before any path has been resolved, would be
+    describing a decision that had not been made yet.
 
-else:
-    # Local development paths (macOS)
-    print("💻 Running on local machine")
+    Idempotent, and it has to be: _resolve() caches per NAME, so a caller that
+    reads _main_path_source first and main_path second would otherwise take the
+    branch twice and print the banner twice. The guard is on both names
+    together because this resolver writes both.
+    """
+    if "main_path" in _RESOLVED and "_main_path_source" in _RESOLVED:
+        return _RESOLVED
 
-    main_path, _main_path_source = path_settings.resolve_main_path()
-    print(f"[Paths] Project root: {main_path} (from {_main_path_source})")
+    if IS_DOCKER:
+        # Docker container paths (Linux environment)
+        print("🐳 Running in Docker container")
 
-    code_path = _glob_one(main_path + "/*Code/", "code")
+        # Provenance of main_path, recorded in both branches so a reader of a
+        # log can tell a container run from a local one without inferring it.
+        _RESOLVED["_main_path_source"] = "Docker image layout (fixed)"
+        _RESOLVED["main_path"] = "/app/"
+    else:
+        # Local development paths (macOS)
+        print("💻 Running on local machine")
 
-    data_path = _glob_one(main_path + "/*Data/", "data")
+        main, source = path_settings.resolve_main_path()
+        _RESOLVED["main_path"] = main
+        _RESOLVED["_main_path_source"] = source
+        print(f"[Paths] Project root: {main} (from {source})")
 
-    data_patient_path = _glob_one(data_path + "/*Patients/", "patients")
+    return _RESOLVED
 
-    data_fhir_path = _glob_one(data_patient_path, "FHIR bundle") + "fhir/"
 
-    data_trial_path = _glob_one(data_path + "/*Trials/", "trials")
+def _root():
+    """main_path, resolving the root pair if it has not been resolved yet."""
+    return _resolve_root()["main_path"]
 
-    data_MeSH_path = _glob_one(data_path + "/*MeSH/", "MeSH")
 
-    inferences_path = _glob_one(data_path + "/*Inferences Storage/", "inferences") + "inferences.db"
+def _root_source():
+    return _resolve_root()["_main_path_source"]
 
-    results_path = _glob_one(main_path + "/*Results/", "results")
 
-    result_fhir_explore_path = _glob_one(results_path + "/*FHIR Exploration/", "FHIR exploration results")
+# The Dockerfile does `COPY . /app/`, so the numbered scripts sit directly in
+# /app. code_path was added to this branch in item 20a: the local branch has
+# always defined it and this branch never did, so any file reaching for it was
+# container-only broken.
+#
+# Fixed strings, not globs — nothing here can fail, and the branch is kept lazy
+# only so that both branches expose the same names through the same mechanism.
+_DOCKER_PATHS = {
+    "code_path":                "/app/",
+    "data_path":                "/app/data/",
+    "data_patient_path":        "/app/data/patients/",
+    "data_fhir_path":           "/app/data/patients/fhir/",
+    "data_trial_path":          "/app/data/trials/",
+    "inferences_path":          "/app/data/inferences.db",
+    "results_path":             "/app/results/",
+    "result_fhir_explore_path": "/app/results/fhir_exploration/",
+    "result_ablation_path":     "/app/results/ablation/",
+    "keys_path":                "/app/",
+    "airflow_path":             "/app/airflow_home/",
+    "requirements_path":        "/app/requirements/",
+    "data_MeSH_path":           "/app/data/mesh/",
+    "checkpoint_path":          "/app/checkpoint/",
+}
 
-    result_ablation_path = _glob_one(results_path + "/*Ablation/", "ablation results")
 
-    keys_path = _glob_one(main_path + "/*Keys/", "keys")
+# The local branch, one resolver per name, in the same order and with the same
+# patterns and labels the module-level assignments used. Each one names its
+# dependencies through _resolve(), so reading a single leaf path resolves that
+# path's chain and nothing else: reading inferences_path globs the root, the
+# data directory and the inferences directory, and never touches Airflow or
+# Requirements.
+_LOCAL_PATHS = {
+    "code_path":
+        lambda: _glob_one(_root() + "/*Code/", "code"),
+    "data_path":
+        lambda: _glob_one(_root() + "/*Data/", "data"),
+    "data_patient_path":
+        lambda: _glob_one(_resolve("data_path") + "/*Patients/", "patients"),
+    "data_fhir_path":
+        lambda: _glob_one(_resolve("data_patient_path"), "FHIR bundle") + "fhir/",
+    "data_trial_path":
+        lambda: _glob_one(_resolve("data_path") + "/*Trials/", "trials"),
+    "data_MeSH_path":
+        lambda: _glob_one(_resolve("data_path") + "/*MeSH/", "MeSH"),
+    "inferences_path":
+        lambda: _glob_one(_resolve("data_path") + "/*Inferences Storage/",
+                          "inferences") + "inferences.db",
+    "results_path":
+        lambda: _glob_one(_root() + "/*Results/", "results"),
+    "result_fhir_explore_path":
+        lambda: _glob_one(_resolve("results_path") + "/*FHIR Exploration/",
+                          "FHIR exploration results"),
+    "result_ablation_path":
+        lambda: _glob_one(_resolve("results_path") + "/*Ablation/",
+                          "ablation results"),
+    "keys_path":
+        lambda: _glob_one(_root() + "/*Keys/", "keys"),
+    "airflow_path":
+        lambda: _glob_one(_root() + "/*Airflow/", "Airflow"),
+    "requirements_path":
+        lambda: _glob_one(_root() + "/*Requirements/", "requirements"),
+    "checkpoint_path":
+        lambda: _glob_one(_root() + "/*Checkpoint/", "checkpoint"),
+}
 
-    airflow_path = _glob_one(main_path + "/*Airflow/", "Airflow")
 
-    requirements_path = _glob_one(main_path + "/*Requirements/", "requirements")
+_RESOLVERS = {"main_path": _root, "_main_path_source": _root_source}
+_RESOLVERS.update(
+    {name: (lambda value=value: value) for name, value in _DOCKER_PATHS.items()}
+    if IS_DOCKER else _LOCAL_PATHS
+)
 
-    checkpoint_path = _glob_one(main_path + "/*Checkpoint/", "checkpoint")
+# Both branches must expose the SAME fourteen names — that is the defect item
+# 20a found in code_path, restated as a check now that the two branches are two
+# dicts rather than two halves of an if. Checked at import because it costs one
+# set comparison and catches a name added to one table and not the other.
+#
+# A raise rather than an assert: `python -O` strips assert statements, and an
+# invariant that disappears under a common interpreter flag is not an invariant.
+if set(_DOCKER_PATHS) != set(_LOCAL_PATHS):
+    raise RuntimeError(
+        "the Docker and local path tables define different names: "
+        f"{sorted(set(_DOCKER_PATHS) ^ set(_LOCAL_PATHS))}"
+    )
+
+PATH_NAMES = tuple(sorted(_RESOLVERS))
+"""Every name this module resolves lazily. Read by ``47- Package Split Test.py``
+so that a path added to the tables without being added to the shim's import list
+is caught, rather than being a name only one of the two lists knows about."""
+
+
+def __getattr__(name):
+    """PEP 562 hook: resolve a path on first read, then cache it.
+
+    Only consulted for names this module does NOT bind eagerly, so IS_DOCKER,
+    _glob_one, load_env_keys and everything else reach the reader without
+    passing through here.
+    """
+    return _resolve(name)
+
+
+def __dir__():
+    """The eager names plus the lazy ones, so dir() and tab completion agree
+    with what getattr() will actually serve."""
+    return sorted(set(globals()) | set(_RESOLVERS))
 
 
 #------------------------------------------------------------------------------
@@ -158,8 +325,8 @@ else:
 # ---------------------------------------------------------------------------
 #
 # Moved here from oncotriage/settings.py by pass 20c-2a. It defaults to
-# keys_path, resolved a few lines above, so this is the module it belongs in
-# and the module where it needs no deferred import.
+# keys_path, resolved lazily above, so this is the module it belongs in and the
+# module where it needs no deferred import.
 #
 # To create the .env file:
 #   ## create .txt file first, and clean it if it has any text due to fresh
@@ -180,10 +347,12 @@ def load_env_keys(keys_dir=None):
     """Load API keys from the .env file in `keys_dir`.
 
     Args:
-        keys_dir: Directory holding the .env. Defaults to ``keys_path``, the
-            module-level value resolved above. Kept as an override so a caller
-            that already knows its credentials directory — a container, a test
-            fixture — does not have to agree with the glob.
+        keys_dir: Directory holding the .env. Defaults to ``keys_path``, which
+            is RESOLVED HERE, on the call, not at import — see the module
+            docstring. Kept as an override so a caller that already knows its
+            credentials directory — a container, a test fixture — does not have
+            to agree with the glob, and so that such a caller resolves no path
+            at all.
 
     Returns:
         {'openai': ..., 'qdrant_url': ..., 'qdrant_key': ...}
@@ -193,7 +362,7 @@ def load_env_keys(keys_dir=None):
         ValueError: the file loaded but did not define all three keys.
     """
     if keys_dir is None:
-        keys_dir = keys_path
+        keys_dir = _resolve("keys_path")
 
     env_path = path_settings.with_trailing_sep(keys_dir) + '.env'
 

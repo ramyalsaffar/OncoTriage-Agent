@@ -977,7 +977,19 @@ for _idx, (_code, _name) in enumerate(_ONCOLOGY_LOINC.items()):
         _CANONICAL_ORDER[_name] = len(_seen_canonical)
         _seen_canonical.add(_name)
 
-for _var in ('_idx', '_code', '_name', '_seen_canonical'):
+# '_var' IS IN ITS OWN LIST, and it has to be last.
+#
+# Before pass 20c-2b this loop named four temporaries and left the loop variable
+# itself behind, bound to the string '_seen_canonical'. That leak was carried
+# into the package verbatim by pass 2a — which was not allowed to change File
+# 08's logic — and re-exported by the shim purely so the name inventory could
+# show that nothing had been dropped. It is deleted here instead.
+#
+# LAST, not first: the for statement rebinds _var on every iteration, so popping
+# it from any earlier position only deletes a name the next iteration puts
+# straight back. From the final position the pop lands after the last rebinding
+# and the iterator is already exhausted, so nothing restores it.
+for _var in ('_idx', '_code', '_name', '_seen_canonical', '_var'):
     globals().pop(_var, None)
 
 

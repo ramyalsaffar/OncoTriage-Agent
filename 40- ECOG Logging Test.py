@@ -135,19 +135,29 @@ def check(label: str, actual, expected) -> None:
 # ===========================================================================
 # THROWAWAY DATABASE
 # ===========================================================================
-# inferences_path is rebound BEFORE File 14 is exec'd. The real inferences.db is
-# never touched by this test.
+# TWO INDEPENDENT MECHANISMS KEEP THIS TEST OFF THE PRODUCTION DATABASE, and the
+# second arrived in pass 20c-2b because the first stopped being enough on its
+# own.
+#
+#   1. inferences_path is rebound before File 14 is loaded. That worked only
+#      because File 14 was exec'd into this namespace and read the name out of
+#      it. File 14 is now a shim over oncotriage/storage/database_logger.py, and
+#      a MODULE function cannot see a caller's globals; the redirect survives
+#      solely because the shim keeps a wrapper passing
+#      globals().get("inferences_path") down.
+#   2. logged_row() calls log_inference with db_path EXPLICITLY and asserts on
+#      the path the writer reports back, which depends on no seam at all.
 #
 # Item 20b: File 14 no longer creates its tables at load time, so the rebinding
-# is no longer sufficient on its own -- initialize_database() has to be called.
+# was never sufficient on its own -- initialize_database() has to be called.
 # Section 3 below reads PRAGMA table_info(inferences) straight after this block
 # and used to be served by File 14's import side effect; without the explicit
 # call it saw a database with no tables and reported three empty-set failures.
 # That is the reliance item 20b exists to remove, so the call is made here
-# rather than the side effect restored.
-#
-# The rebinding still has to happen first: initialize_database takes the path
-# as an argument, but log_inference() further down reads the global.
+# rather than the side effect restored. initialize_database has always taken the
+# path as an argument, which is why it needed no change in pass 2b.
+
+_PRODUCTION_INFERENCES_PATH = inferences_path
 
 _TMP_DIR = tempfile.mkdtemp(prefix="oncotriage_ecog_logging_")
 inferences_path = os.path.join(_TMP_DIR, "inferences_test.db")
@@ -156,6 +166,31 @@ with open(_code_dir + "14- Database Logger.py") as _fh:
     exec(_fh.read(), globals())
 
 initialize_database(inferences_path)
+
+
+# --- THE DATABASE-ISOLATION ASSERTION IS SHOWN TO DISCRIMINATE --------------
+# CLAUDE.md: an assertion that has only ever passed is not evidence that it can
+# catch anything. resolve_inference_db_path(None) is what a caller that forgot
+# db_path gets. It RESOLVES without connecting, so this control names the hazard
+# without going near the production file.
+_PACKAGE_DEFAULT_DB = resolve_inference_db_path(None)
+
+print("\n" + "=" * 70)
+print("0. the database-isolation assertion can fail")
+print("=" * 70)
+check("the scratch path is non-empty (non-degeneracy)",
+      bool(inferences_path) and inferences_path.endswith(".db"), True)
+check("the production path is non-empty (non-degeneracy)",
+      bool(_PRODUCTION_INFERENCES_PATH), True)
+check("omitting db_path resolves to the PRODUCTION database",
+      os.path.abspath(_PACKAGE_DEFAULT_DB),
+      os.path.abspath(_PRODUCTION_INFERENCES_PATH))
+check("...which is NOT this test's scratch database, so passing db_path is "
+      "doing real work and the checks below can fail",
+      os.path.abspath(_PACKAGE_DEFAULT_DB) == os.path.abspath(inferences_path),
+      False)
+check("...and passing db_path resolves to exactly what was passed",
+      resolve_inference_db_path(inferences_path), inferences_path)
 
 
 # ===========================================================================
@@ -253,11 +288,19 @@ ECOG_KEYS = ("ecog_value", "ecog_selection", "ecog_observations_found")
 
 
 def logged_row(result, patient, patient_id):
-    """log_inference() the pair, then read the row back."""
+    """log_inference() the pair, then read the row back.
+
+    db_path is passed explicitly, and the path log_inference reports back is
+    checked against the scratch database on EVERY call rather than once at
+    startup: this helper is the only writer in the file, so one assertion here
+    covers every row it produces.
+    """
     result = dict(result)
     result["patient_id"] = patient_id
     result.setdefault("timestamp", "2026-03-11T00:00:00")
-    log_inference(result, patient)
+    check(f"{patient_id}: logged into the scratch database, not production",
+          log_inference(result, patient, db_path=inferences_path),
+          inferences_path)
 
     conn = sqlite3.connect(inferences_path)
     conn.row_factory = sqlite3.Row
