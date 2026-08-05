@@ -489,6 +489,21 @@ def init_ablation_db():
         # config's effect is not inferred from the config name.
         "mesh_filter_applied":      "INTEGER",
         "mesh_filter_skip_reason":  "TEXT",
+        # The model that ANSWERED this row's Stage 5 call, and the key its
+        # estimated_cost_usd was priced against. No DEFAULT, and no backfill:
+        # rows written before this column existed were all priced against
+        # whatever MATCHING_MODEL was at the time, which is not recoverable
+        # from the row, so NULL is the only honest value for them. Writing
+        # today's MATCHING_MODEL into them would relabel history as having run
+        # on a model that did not exist when they were produced.
+        #
+        # NULL therefore means two different things depending on when the row
+        # was written -- pre-migration, or a no-candidates run that never
+        # called a model -- and the two are separable by run_id against
+        # ablation_runs.run_timestamp. That ambiguity is the price of not
+        # rebuilding the database, which is the right trade: the alternative
+        # discards every historical ablation comparison.
+        "matching_model":           "TEXT",
     }.items():
         if _column not in _existing:
             c.execute(f"ALTER TABLE ablation_results ADD COLUMN {_column} {_sql_type}")
@@ -571,7 +586,40 @@ def log_ablation_result(run_id, config_name, patient_data, result, ablation_flag
     # Cost via same pricing function as File 14 — outside the try, see docstring.
     input_tok = result.get("gpt4o_input_tokens", 0)
     output_tok = result.get("gpt4o_output_tokens", 0)
-    cost = get_model_cost(MATCHING_MODEL, input_tok, output_tok)
+
+    # The model that ACTUALLY answered, read off response.model by Stage 5 and
+    # carried to all three terminal nodes by _pipeline_provenance() (File 13).
+    # Not MATCHING_MODEL: that is what was asked for, it is read at log time so
+    # a config edit mid-study would relabel earlier rows, and an alias can
+    # resolve to a dated snapshot that never matches it. An ablation study is
+    # the place where that matters most — its whole claim is that only the
+    # named stage varied between configurations, and a judge that changed
+    # underneath the campaign invalidates every comparison in it.
+    #
+    # None when no Stage 5 response was obtained: node_no_candidates, or a
+    # failure before the first call returned.
+    matching_model_used = result.get("matching_model")
+
+    # MATCHING_MODEL is the pricing key ONLY in that None case, where there are
+    # no Stage 5 tokens to price and the arithmetic is 0 x rate = 0 whichever
+    # priced model is named. This is not a recovery path around
+    # get_model_cost(): the lookup still happens, still raises
+    # UnknownModelPricingError for an unpriced model, and still sits outside
+    # the try block so an unpriced model stops the study instead of being
+    # printed as "Failed to log result". What it is not allowed to do is raise
+    # on a no-candidates run purely because that run has no model name to look
+    # up. Mirrors File 14's log_inference() exactly.
+    #
+    # WHICH PATH WAS TAKEN IS RECORDED: matching_model below is written NULL on
+    # exactly the rows where the fallback key was used, so "priced against the
+    # model that answered" and "priced against the configured model because
+    # nothing answered" stay separable without a second column.
+    #
+    # Reasoning tokens are NOT added to output_tok. They are already inside
+    # usage.completion_tokens and therefore inside gpt4o_output_tokens; adding
+    # them would bill every one of them twice.
+    cost = get_model_cost(matching_model_used or MATCHING_MODEL,
+                          input_tok, output_tok)
 
     conn = None
 
@@ -679,7 +727,8 @@ def log_ablation_result(run_id, config_name, patient_data, result, ablation_flag
                     gpt4o_input_tokens, gpt4o_output_tokens,
                     estimated_cost_usd, error,
                     retrieval_channels, retrieval_degraded, retrieval_trials_lost,
-                    query_expansion_path, mesh_filter_applied, mesh_filter_skip_reason
+                    query_expansion_path, mesh_filter_applied, mesh_filter_skip_reason,
+                    matching_model
                 ) VALUES (
                     ?, ?, ?, ?, ?,
                     ?, ?,
@@ -690,7 +739,8 @@ def log_ablation_result(run_id, config_name, patient_data, result, ablation_flag
                     ?, ?, ?,
                     ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?,
+                    ?
                 )
             """, (
                 run_id,
@@ -738,6 +788,11 @@ def log_ablation_result(run_id, config_name, patient_data, result, ablation_flag
                 (None if result.get("mesh_filter_applied") is None
                  else int(bool(result["mesh_filter_applied"]))),
                 result.get("mesh_filter_skip_reason"),
+                # Resolved above, outside the tuple, because it is the same
+                # value get_model_cost() was called with. Reading the result
+                # dict twice could price a row against one model and label it
+                # with another.
+                matching_model_used,
             ))
             conn.commit()
     
@@ -1074,10 +1129,23 @@ def main():
             """Run pipeline + log for one patient-config pair.
 
             A pipeline failure is caught and turned into an error result, so
-            one bad patient does not stop the study. The single exception is
-            UnknownModelPricingError out of log_ablation_result(): it is not a
-            per-patient failure but a missing entry in PRICING_CONFIG, so it
-            propagates through future.result() and stops the run. The
+            one bad patient does not stop the study. There are TWO exceptions
+            to that, and both are conditions of the study rather than of the
+            patient:
+
+              UnknownModelPricingError  out of log_ablation_result(). Not a
+                per-patient failure but a missing entry in PRICING_CONFIG.
+
+              MatchingModelMismatchError  out of Stage 5 (File 13). The judge
+                resolved to a different model mid-campaign. Catching it would
+                turn "every configuration was compared against the same judge"
+                -- the entire premise of an ablation study -- into a claim the
+                results cannot support, one silently-failed patient at a time.
+                An ablation study is the single worst place in this project to
+                absorb this error, which is why it is named explicitly rather
+                than left to the blanket handler below.
+
+            Both propagate through future.result() and stop the run. The
             checkpoint means resuming after fixing File 03 costs nothing.
             """
             pid = patient_data["patient_id"]
@@ -1085,6 +1153,11 @@ def main():
                 result = match_patient_ablation(
                     patient_data, bm25_index, nct_ids, graph, ablation_flags
                 )
+            except MatchingModelMismatchError:
+                # Re-raised before the blanket handler can see it. Deliberately
+                # not wrapped or re-worded: File 13's message already carries
+                # both model strings and what to do about them.
+                raise
             except Exception as e:
                 traceback.print_exc()
                 result = {

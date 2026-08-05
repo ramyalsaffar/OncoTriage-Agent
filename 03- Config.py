@@ -306,6 +306,44 @@ MATCHING_MAX_TOKENS = 32000
 # longer exactly reproducible. Stages 1-4 are unchanged and still exact.
 MATCHING_SEED = 42
 
+# Wall-clock ceiling on ONE Stage 5 request, in seconds.
+#
+# REPLACES AN SDK DEFAULT OF 600s. The OpenAI client in this file is built with
+# no timeout argument, so every call inherits the SDK's 600-second default and
+# its automatic retries (max_retries defaults to 2). One stalled request
+# therefore occupies up to 30 minutes and is indistinguishable, from the
+# outside, from a model taking its time. That is not hypothetical: it happened
+# during the item 29a measurement runs, and the measurement data itself caught
+# a second instance -- one GPT-4o call in the 30-patient bake-off returned
+# after 960.2 seconds, which is the 600s timeout plus a retry, not a slow
+# answer.
+#
+# CHOSEN FROM MEASURED PER-CALL LATENCY, not from taste. Over the 27
+# single-call cases of the item 29a bake-off at the shipped configuration
+# (gpt-5.6-terra, reasoning_effort='none'), one Stage 5 call took:
+#
+#     median 66.5s      max 94.6s
+#
+# Single-call cases are used deliberately: a timeout applies per REQUEST, and a
+# patient whose batch splits makes several requests, so a per-patient figure
+# (median 68.0s, max 193.1s over 3 calls) would overstate what one call needs.
+#
+# 300 seconds is 3.2x the worst single call observed and 4.5x the median, and
+# half the SDK default it replaces. The headroom is deliberately generous: the
+# cost of being too tight is a failed patient, while the cost of being too
+# loose is only that a stall takes longer to surface.
+#
+# THIS DOES NOT BOUND TOTAL WALL TIME BY ITSELF. max_retries is left at the
+# SDK default of 2, so a request that times out three times still occupies
+# 3 x 300 = 15 minutes -- better than 30, not fixed. Bounding that properly
+# means setting max_retries too, which interacts with the pipeline's own
+# MAX_GPT4O_RETRIES budget and is deliberately left for a separate change.
+#
+# RE-DERIVE THIS IF MATCHING_REASONING_EFFORT CHANGES. The worst single call
+# was 94.6s at 'none' and 107.5s at 'medium'; the higher tiers were not
+# measured and could be far slower.
+MATCHING_REQUEST_TIMEOUT_SECONDS = 300
+
 # Expected output tokens per trial evaluated, used to decide whether a batch
 # should be split BEFORE it is sent.
 #

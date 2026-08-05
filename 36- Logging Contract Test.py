@@ -551,6 +551,98 @@ _conn.close()
 
 
 # ===========================================================================
+# TEST 7: reasoning tokens are inside the output figure, never added to it
+# ===========================================================================
+#
+# On a reasoning model, usage.completion_tokens_details.reasoning_tokens is a
+# SUBSET of usage.completion_tokens -- billed at the output rate, already
+# inside the number File 13 stores as gpt4o_output_tokens. Adding the two would
+# bill every reasoning token twice.
+#
+# WHY THIS TEST IS SHAPED THE WAY IT IS. Item 29a's check for the same property
+# passed vacuously: it ran at the shipped configuration, where
+# MATCHING_REASONING_EFFORT is 'none' and reasoning_tokens is therefore 0, so
+# "cost with reasoning added" equalled "cost without" for the wrong reason. An
+# assertion that cannot distinguish the two states is not an assertion.
+#
+# So this test does not run the pipeline. It feeds log_inference a result whose
+# reasoning count is NON-ZERO and whose correct and double-billed costs are
+# arithmetically different, and it asserts that difference is real BEFORE
+# asserting which side of it the stored value landed on. If a later edit sets
+# the reasoning figure to zero, the discrimination check below fails rather
+# than the cost check passing for free.
+
+print("\n" + "=" * 70)
+print("Test 7: reasoning tokens are not added to the output figure for costing")
+print("=" * 70)
+
+# Priced against MATCHING_MODEL rather than a literal, so the test also fails
+# if the configured judge is ever absent from PRICING_CONFIG -- which is the
+# condition get_model_cost() exists to refuse.
+COST_MODEL     = MATCHING_MODEL
+COST_INPUT     = 10_000
+COST_OUTPUT    = 8_000
+COST_REASONING = 3_000     # a SUBSET of COST_OUTPUT, not an addition to it
+
+_cost_correct = get_model_cost(COST_MODEL, COST_INPUT, COST_OUTPUT)
+_cost_double  = get_model_cost(COST_MODEL, COST_INPUT, COST_OUTPUT + COST_REASONING)
+
+# --- anti-vacuity guards, asserted first -----------------------------------
+# Without these two, every assertion below could pass on a run where reasoning
+# was zero and the two costs coincided.
+check("the reasoning figure under test is non-zero", COST_REASONING > 0, True)
+check("correct and double-billed costs are distinguishable",
+      _cost_correct != _cost_double, True)
+check("reasoning tokens are a subset of output tokens, as the API reports them",
+      COST_REASONING < COST_OUTPUT, True)
+
+_reasoning_result = node_finalize(make_terminal_state(
+    gpt4o_input_tokens=COST_INPUT,
+    gpt4o_output_tokens=COST_OUTPUT,
+))["result"]
+_reasoning_result["patient_id"]             = "reasoning-cost-patient"
+_reasoning_result["matching_model"]         = COST_MODEL
+_reasoning_result["gpt4o_input_tokens"]     = COST_INPUT
+_reasoning_result["gpt4o_output_tokens"]    = COST_OUTPUT
+_reasoning_result["gpt4o_reasoning_tokens"] = COST_REASONING
+
+log_inference(_reasoning_result, PATIENT_DATA)
+
+_conn = sqlite3.connect(inferences_path)
+_conn.row_factory = sqlite3.Row
+_row = _conn.execute(
+    "SELECT * FROM inferences WHERE patient_id = ? ORDER BY id DESC LIMIT 1",
+    ("reasoning-cost-patient",),
+).fetchone()
+
+check("a row was written for the reasoning case", _row is not None, True)
+
+if _row is not None:
+    # The reasoning count must survive the round trip, or the cost assertion
+    # below would be testing a value the writer never saw.
+    check("gpt4o_reasoning_tokens round-trips into the row",
+          _row["gpt4o_reasoning_tokens"], COST_REASONING)
+    check("gpt4o_output_tokens is stored as reported, reasoning included in it",
+          _row["gpt4o_output_tokens"], COST_OUTPUT)
+
+    check("estimated_cost_usd is priced on input and output alone",
+          _row["estimated_cost_usd"], _cost_correct)
+    check("estimated_cost_usd is NOT the double-billed figure",
+          _row["estimated_cost_usd"] == _cost_double, False)
+
+    # The same claim stated as money, so a reader sees the size of the error
+    # this test prevents rather than only that two floats differ.
+    print(f"        priced ${_cost_correct:.6f}; double-billing reasoning "
+          f"would have charged ${_cost_double:.6f} "
+          f"(+{(_cost_double / _cost_correct - 1) * 100:.1f}%)")
+
+    check("matching_model on the row is the model that was priced",
+          _row["matching_model"], COST_MODEL)
+
+_conn.close()
+
+
+# ===========================================================================
 # CLEANUP + SUMMARY
 # ===========================================================================
 

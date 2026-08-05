@@ -2279,6 +2279,59 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
 # ---------------------------------------------------------------------------
 # Stage 5 model-call seam
 # ---------------------------------------------------------------------------
+
+
+class MatchingModelMismatchError(RuntimeError):
+    """The API answered as a different model than MATCHING_MODEL requested.
+
+    WHY THIS STOPS THE RUN INSTEAD OF WARNING.
+
+    Model aliases resolve. As of 2026-08-04 gpt-5.6-terra publishes exactly one
+    snapshot and it is the alias string itself, so the requested and returned
+    strings are identical and this never fires. That will not stay true: the
+    moment OpenAI publishes a dated snapshot the alias resolves to it, every
+    verdict in the pipeline shifts, and nothing in the request changes.
+
+    Recording the returned model in inferences.matching_model (which File 13
+    already does) makes the change auditable AFTER the fact. It does not stop a
+    campaign from being run half on one judge and half on another, which is
+    exactly the confound this project exists to remove -- an ablation study or
+    a drift baseline built across that boundary is measuring the model, not the
+    thing it claims to measure. A printed warning is worse than nothing here,
+    because the runs that matter are multi-day batch runs whose console nobody
+    reads.
+
+    So: raise, at the first response that disagrees, before any verdict from it
+    reaches a result dict.
+
+    A None return does NOT raise. That means the response object carried no
+    model field at all -- a stub (File 37) or a pre-migration recording (File
+    46) -- which is a different condition with its own handling: model_answered
+    stays None and File 14 logs NULL.
+
+    Recovery is a human decision, not an automatic one: review what changed,
+    then set MATCHING_MODEL to the returned string and re-baseline. The message
+    carries both strings so that decision can be made from the traceback alone.
+
+    A RuntimeError subclass rather than a ValueError, for the same reason
+    UnknownModelPricingError is: a stray `except ValueError` around a parsing
+    step must not be able to eat it.
+    """
+
+    def __init__(self, requested: str, returned: str):
+        self.requested = requested
+        self.returned = returned
+        super().__init__(
+            f"Stage 5 requested model {requested!r} but the API answered as "
+            f"{returned!r}. The configured model resolved to something other "
+            f"than what was configured -- almost certainly an alias that now "
+            f"points at a dated snapshot. Every verdict from this point on "
+            f"would come from a different judge than the rows already in "
+            f"inferences.db, so the run is stopped rather than continued and "
+            f"logged. After reviewing what changed, set MATCHING_MODEL in "
+            f"'03- Config.py' to {returned!r}, add it to PRICING_CONFIG if it "
+            f"is not there, and re-baseline; do not accept it silently."
+        )
 # MATCHING_MAX_TOKENS and MATCHING_SEED are in 03- Config.py, together with
 # the truncation thresholds calibrated against the first of them.
 
@@ -2307,6 +2360,14 @@ def call_matching_model(system_prompt: str, user_prompt: str):
                               medium / high / xhigh. Set from File 03.
       seed                    Accepted (no error). Best-effort only; the model
                               returns no system_fingerprint.
+      timeout                 CLIENT-SIDE, not a request parameter: it bounds
+                              how long this process waits, and never reaches
+                              the model. Set from File 03, replacing the SDK's
+                              600s default. Because it cannot change the
+                              response, File 45 does not record it and File 46
+                              does not replay it -- unlike everything else in
+                              this call, a change to it is invisible in a
+                              fixture diff, and that is correct.
       temperature             NOT SENT. Rejected for every value but the
                               provider default of 1, so there is nothing to
                               send. MATCHING_TEMPERATURE is None.
@@ -2332,6 +2393,7 @@ def call_matching_model(system_prompt: str, user_prompt: str):
         max_completion_tokens=MATCHING_MAX_TOKENS,
         reasoning_effort=MATCHING_REASONING_EFFORT,
         seed=MATCHING_SEED,
+        timeout=MATCHING_REQUEST_TIMEOUT_SECONDS,
     )
 
 
@@ -3011,7 +3073,20 @@ CLINICAL TRIALS:
             reasoning_tokens += _reasoning
             reasoning_tokens_reported = True
 
-        model_answered = getattr(response, "model", None) or model_answered
+        # The model that ANSWERED, checked against the one requested BEFORE its
+        # verdicts are parsed or accumulated. Placed here rather than at logging
+        # time so it fires on the first call of the first patient: a mismatch
+        # discovered at log time has already spent a whole batch on the wrong
+        # judge. See MatchingModelMismatchError for why this raises.
+        #
+        # None means the response carried no model field (a stub, or a
+        # pre-migration recording). That is a different condition and falls
+        # through to the existing NULL handling untouched.
+        _model_returned = getattr(response, "model", None)
+        if _model_returned is not None and _model_returned != MATCHING_MODEL:
+            raise MatchingModelMismatchError(MATCHING_MODEL, _model_returned)
+
+        model_answered = _model_returned or model_answered
 
         # finish_reason is read defensively because not every client object
         # that reaches here carries one: the retrieval-observability test

@@ -170,6 +170,33 @@ defect this project exists to remove.
 
 If you add a fallback path, log which path was taken.
 
+Every new assertion must be shown to FAIL when the condition it
+checks is broken, and the demonstration recorded. An assertion
+that has only ever passed is not evidence that it can catch
+anything. Break the thing under test, run the assertion, record
+that it failed, restore, record that it passes again.
+
+This is not a style preference. Three defects of exactly this
+class have already shipped: File 42's boundary assertions were
+written from the constants they were meant to check, so they
+agreed with the code by construction; an "is not None" assertion
+sat inside a file whose entire purpose is catching unchecked
+claims; and item 29a's reasoning-token cost check passed through
+a zero, because the shipped reasoning_effort is "none" and
+0 == 0 made "cost with reasoning added" equal "cost without" for
+the wrong reason.
+
+Prefer a demonstration that mutates a COPY of the source and
+execs it (see the proof harness for File 36's Test 7) over one
+that edits a file in place. Where in-place is unavoidable, hash
+the file before and after and assert the restore was
+byte-identical, the way Files 43 and 44 do.
+
+Where an assertion could be satisfied by a degenerate value —
+a zero, an empty set, a None on both sides — assert first that
+the value is non-degenerate, so the test fails rather than
+passing vacuously when someone later changes it.
+
 Data and keys live outside this folder. Never write an
 absolute path.
 
