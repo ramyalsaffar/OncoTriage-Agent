@@ -216,11 +216,10 @@ qdrant_api_key = keys['qdrant_key']
 #      its recording.
 #
 # So it is client-wide, and that means it also governs the embedding call in
-# File 13. That is acceptable and mildly beneficial: get_embedding() already
-# carries a tenacity decorator with 5 attempts, so the SDK's own retries were
-# redundant there, and lowering them from 2 to 1 tightens that call's bound
-# from 5 x 3 x 30s to 5 x 2 x 30s. It is NOT scoped to Stage 5, and the name
-# says OPENAI rather than MATCHING for exactly that reason.
+# File 13. As of item 29d that is not merely tolerable, it is the ONLY retry
+# either call has: get_embedding()'s tenacity decorator was removed and this is
+# what replaced it. See the budget reconciliation below. The name says OPENAI
+# rather than MATCHING for exactly that reason.
 #
 # WHY 1 RATHER THAN THE SDK's DEFAULT OF 2. See the budget reconciliation
 # beside MATCHING_REQUEST_TIMEOUT_SECONDS: anything that fails twice in a row
@@ -229,8 +228,105 @@ qdrant_api_key = keys['qdrant_key']
 # and recovering it in-SDK is far cheaper than re-entering the node.
 OPENAI_SDK_MAX_RETRIES = 1
 
+
+# ---------------------------------------------------------------------------
+# Request timeouts: STRUCTURED, not a bare number
+# ---------------------------------------------------------------------------
+#
+# THE REGRESSION THIS FIXES. Item 29b bounded the Stage 5 call by passing
+# timeout=300 -- a plain float. httpx does not treat that as "the read budget";
+# it expands it into Timeout(connect=300, read=300, write=300, pool=300). The
+# SDK's own default is Timeout(connect=5.0, read=600, write=600, pool=600), so
+# the CONNECT phase went from 5 seconds to 300. An unreachable host took five
+# minutes to fail instead of five seconds, which is worse than the behaviour
+# before item 29b touched anything.
+#
+# It applied to BOTH calls, and to the client itself, because every one of them
+# was handed a bare number. A per-request timeout REPLACES the client's Timeout
+# object rather than merging with it, so fixing only the client would have left
+# both call sites flat.
+#
+# READ FROM THE SDK, NOT TRANSCRIBED. The connect phase below is whatever the
+# installed SDK ships, obtained by constructing a throwaway client and reading
+# its resolved .timeout. Constructing a client opens no socket. Hard-coding 5.0
+# would silently drift the day the SDK changes its default, which is the class
+# of defect this project treats as a bug.
+_sdk_default_timeout = OpenAI(api_key=openai_api_key).timeout
+SDK_DEFAULT_CONNECT_TIMEOUT_SECONDS = _sdk_default_timeout.connect
+
+
+def _structured_timeout(read_seconds: float):
+    """Build a four-phase httpx.Timeout around one measured read budget.
+
+    ALL FOUR PHASES ARE SET EXPLICITLY. httpx refuses a partial spec --
+    Timeout(connect=..., read=...) raises ValueError("must either include a
+    default, or set all four parameters explicitly") -- so there is no way to
+    name two phases and leave the others alone. The choice below is therefore
+    deliberate rather than inherited:
+
+      connect   the SDK's own default (5.0 at the time of writing, read at
+                runtime above). This is the phase item 29b destroyed and the
+                whole reason this function exists. A host that cannot be
+                reached should fail in seconds; nothing about this pipeline
+                justifies waiting longer to learn that.
+
+      read      the measured budget -- the only phase that covers "the model is
+                thinking", and the one every number in this file was derived
+                from.
+
+      write     set EQUAL to read. The request body is the Stage 5 prompt, on
+                the order of 40 KB, which uploads in well under a second on any
+                working link. No measurement of upload time exists, so rather
+                than invent a tighter number, this matches read: it can never
+                be the binding constraint on a request whose read budget is
+                already generous, and it introduces no figure nobody chose.
+
+      pool      set EQUAL to read. This is not a network phase at all -- it is
+                how long to wait for a free connection from the local pool. The
+                SDK ships Limits(max_connections=1000), read at runtime and far
+                above this project's MAX_WORKERS of 12, so pool waits are
+                structurally near zero and this phase should never fire. It is
+                set generously on purpose: a tight pool timeout would convert a
+                future increase in MAX_WORKERS into spurious request failures,
+                which is a worse failure than waiting.
+
+    HONEST NOTE ON WHAT "A 300 SECOND TIMEOUT" MEANS. httpx budgets each phase
+    SEPARATELY, so one attempt's theoretical worst case is the SUM of the
+    phases, not the read value: 5 + 300 + 300 + 300 = 905s here. That was true
+    of the bare number too, and worse (4 x 300 = 1,200s). In practice read
+    dominates and the others are microseconds. The per-patient arithmetic below
+    uses the read budget, which is the honest practical figure; the phase sum is
+    stated here so nobody mistakes it for a hard per-attempt bound.
+    """
+    return httpx.Timeout(
+        connect=SDK_DEFAULT_CONNECT_TIMEOUT_SECONDS,
+        read=read_seconds,
+        write=read_seconds,
+        pool=read_seconds,
+    )
+
+
+# The two measured read budgets. THE VALUES LIVE HERE, ABOVE THE CLIENT,
+# because the client construction below consumes one of them; the DERIVATION of
+# each -- what was measured, over how many runs, and why the number is what it
+# is -- stays in the Stage 5 request-shape section further down, which is where
+# a reader looking for it will go. Same split, for the same reason, as
+# OPENAI_SDK_MAX_RETRIES above.
+MATCHING_REQUEST_TIMEOUT_SECONDS = 300   # derivation: Stage 5 section below
+EMBEDDING_REQUEST_TIMEOUT_SECONDS = 30   # derivation: Stage 5 section below
+
+MATCHING_REQUEST_TIMEOUT = _structured_timeout(MATCHING_REQUEST_TIMEOUT_SECONDS)
+EMBEDDING_REQUEST_TIMEOUT = _structured_timeout(EMBEDDING_REQUEST_TIMEOUT_SECONDS)
+
+# The client's own timeout is the STRUCTURED object, not a bare number, so that
+# a call which does not pass its own timeout still gets a 5-second connect
+# phase rather than a 300-second one. Both of File 13's OpenAI calls do pass
+# their own -- a per-request timeout replaces this one outright rather than
+# merging with it -- so this is the safety net for anything added later that
+# forgets to.
 openai_client = OpenAI(api_key=openai_api_key,
-                       max_retries=OPENAI_SDK_MAX_RETRIES)
+                       max_retries=OPENAI_SDK_MAX_RETRIES,
+                       timeout=MATCHING_REQUEST_TIMEOUT)
 qdrant_client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key, timeout=120)
 
 
@@ -371,39 +467,70 @@ MATCHING_SEED = 42
 # per-patient bound, and OPENAI_SDK_MAX_RETRIES near the top of this file for
 # the retry half of it.
 #
-# ONE SIDE EFFECT WORTH KNOWING. The SDK default is not a flat 600s: it is
-# Timeout(connect=5.0, read=600, write=600, pool=600). Passing a plain number
-# replaces all four, so the CONNECT timeout goes from 5s to 300s. That does not
-# widen the worst case -- one attempt is still bounded by 300s either way --
-# but a dead host now takes 300s to notice instead of 5s. Restoring the tighter
-# connect leg means passing an httpx.Timeout, which is a new import for a
-# failure mode that is already bounded, so it is recorded here rather than done.
+# THIS IS THE READ PHASE ONLY, and it is applied through a structured
+# httpx.Timeout, not as a bare number. Item 29b passed the bare number and so
+# flattened the connect phase from the SDK's 5 seconds to 300; item 29d undid
+# that. The value assignment and the phase choices are at the top of this file,
+# beside the client construction that consumes them (_structured_timeout); this
+# is where the number came FROM.
 #
 # RE-DERIVE THIS IF MATCHING_REASONING_EFFORT CHANGES. The worst single call
 # was 94.6s at 'none' and 107.5s at 'medium'; the higher tiers were not
 # measured and could be far slower.
-MATCHING_REQUEST_TIMEOUT_SECONDS = 300
+#
+# (No assignment here -- see MATCHING_REQUEST_TIMEOUT_SECONDS at the top.)
 
-# THE THREE RETRY BUDGETS, RECONCILED.
+# THE RETRY BUDGETS, RECONCILED.
 #
 # The SDK retry constant itself is OPENAI_SDK_MAX_RETRIES, defined ABOVE the
 # client construction near the top of this file, because it can only be applied
 # at construction -- the reason is written there. It belongs to this block
 # conceptually, so the reconciliation lives here.
 #
-# THESE ARE THREE BUDGETS COVERING DIFFERENT FAILURES. Keeping them separate is
-# the same reasoning item 19c used when it split the truncation budget out of
-# the parse budget: a counter shared between unrelated failures fails a patient
-# for the wrong reason.
+# THESE BUDGETS COVER DIFFERENT FAILURES. Keeping them separate is the same
+# reasoning item 19c used when it split the truncation budget out of the parse
+# budget: a counter shared between unrelated failures fails a patient for the
+# wrong reason. What is NOT allowed is two budgets covering the SAME failure,
+# which is what item 29d removed from the embedding call -- see below.
 #
 #   OPENAI_SDK_MAX_RETRIES (1, set on the client above)
-#       TRANSPORT. The request never produced a usable HTTP response -- a
+#       TRANSPORT, and since item 29d the ONLY transport budget for either
+#       OpenAI call. The request never produced a usable HTTP response -- a
 #       timeout, a connection reset, a 429, a 5xx. Retried inside the SDK, so
 #       it costs one more HTTP attempt and nothing else. Kept at 1 rather than
 #       0 because the common case is a single transient blip and recovering it
 #       in-SDK is far cheaper than re-entering the node; kept at 1 rather than
 #       the SDK's default 2 because anything that fails twice in a row is not
 #       transient and MAX_GPT4O_RETRIES is the budget that should see it.
+#
+#       WHY THIS ONE AND NOT TENACITY, for get_embedding(). That function used
+#       to carry @retry(stop_after_attempt(5), wait_exponential(min=2, max=60),
+#       retry_if_exception_type((RateLimitError, InternalServerError,
+#       APIConnectionError))). APITimeoutError SUBCLASSES APIConnectionError, so
+#       a timeout was retried by tenacity AND by the SDK: up to 5 x 2 = 10
+#       attempts for one embedding, a number nobody chose and nothing justified.
+#       The decorator was removed and the SDK retry kept, for three reasons:
+#
+#         1. IT IS THE ONLY ONE THAT CAN BE SCOPED CORRECTLY. Turning the SDK
+#            retry off for one call needs with_options(), which item 29c proved
+#            silently unwraps File 45's OpenAIProxy and disables fixture
+#            capture. Turning it off globally would strip Stage 5's transport
+#            retry as a side effect of an embedding decision -- exactly the
+#            cross-coupling this change exists to remove.
+#         2. IT HONOURS Retry-After ON A 429. Tenacity's exponential backoff is
+#            blind to the header. With MAX_WORKERS = 12 and
+#            ENABLE_RATE_LIMITING = False, 429 is the most likely transport
+#            failure in a batch run, and the server's own advice beats a guess.
+#         3. IT RETRIES THE HTTP REQUEST, not the Python function, so it cannot
+#            re-run anything the caller already did.
+#
+#       WHAT WAS GIVEN UP: an attempt count visible in the source at the call
+#       site, and a longer backoff ceiling (60s vs the SDK's 8s). Both are
+#       recorded here instead, which is the trade.
+#
+#       Attempts for one embedding call after the change: 1 + 1 = 2.
+#       Attempts for one Stage 5 request: UNCHANGED at 1 + 1 = 2, so the
+#       per-patient arithmetic below is unaffected by the embedding decision.
 #
 #   MAX_GPT4O_RETRIES (line ~211, 3)
 #       THE RESPONSE CAME BACK AND WAS UNUSABLE. Malformed JSON, a non-list
@@ -443,9 +570,22 @@ MATCHING_REQUEST_TIMEOUT_SECONDS = 300
 #       work -- not a failure mode, and not additive with the 30 minutes above:
 #       a call cannot both succeed-and-truncate and die at transport.
 #
+#   the one embedding call each patient makes
+#       (1 + OPENAI_SDK_MAX_RETRIES) x EMBEDDING_REQUEST_TIMEOUT_SECONDS
+#       + SDK backoff <= 2 x 30 + 8 = 68s, against ~5.5 minutes while the
+#       tenacity decorator was still stacked on top of it.
+#
 # So: 30 minutes is the ceiling for a patient stuck against a broken endpoint,
-# and ~17 minutes is the ceiling for one doing an unusual amount of real work.
-# Neither is unbounded, which is the property that did not hold before.
+# ~17 minutes is the ceiling for one doing an unusual amount of real work, and
+# ~1 minute for its embedding. None is unbounded, which is the property that did
+# not hold before.
+#
+# NOT INCLUDED IN ANY OF THESE FIGURES: the httpx phase structure. Each attempt
+# is bounded per PHASE, so its theoretical worst case is connect + read + write
+# + pool, not the read budget alone -- 905s rather than 300s for Stage 5. The
+# figures above use the read budget because read is the only phase that can
+# plausibly stall for its full allowance; see _structured_timeout() at the top
+# of this file for why the others are set where they are.
 #
 # (No constant is assigned here on purpose -- OPENAI_SDK_MAX_RETRIES is defined
 #  above the client construction, where it has to be.)
@@ -474,24 +614,23 @@ MATCHING_REQUEST_TIMEOUT_SECONDS = 300
 #
 # 30s is therefore generous for the shape of the call while still being a real
 # bound. If it proves too tight the symptom is LOUD, not silent: an
-# APITimeoutError, which the tenacity decorator on get_embedding() retries and
-# then re-raises. Replace this with a measured value the first time anyone
-# instruments the call.
+# APITimeoutError, retried once by the SDK and then raised. Replace this with a
+# measured value the first time anyone instruments the call.
 #
-# WORST CASE, INCLUDING THE DECORATOR ALREADY ON THAT FUNCTION. get_embedding()
-# carries @retry(stop=stop_after_attempt(5), wait=wait_exponential(min=2,
-# max=60), retry_if_exception_type((RateLimitError, InternalServerError,
-# APIConnectionError))). APITimeoutError is a SUBCLASS of APIConnectionError,
-# so a timeout is retried there too. With OPENAI_SDK_MAX_RETRIES = 1 now in
-# force on the client, the bound is
+# It is applied as the READ phase of a structured httpx.Timeout, the same way
+# the Stage 5 budget is, so an unreachable host still fails on the SDK's
+# 5-second connect phase rather than waiting 30 seconds for it.
 #
-#     5 tenacity attempts x 2 SDK attempts x 30s + ~30s of backoff = ~5.5 min
+# WORST CASE FOR ONE EMBEDDING CALL, after item 29d removed the tenacity
+# decorator (see the four-budget reconciliation above):
 #
-# against 5 x 3 x 600 = 2.5 HOURS before either constant existed. The 5x2
-# nesting is still redundant -- two retry mechanisms stacked on one call -- and
-# collapsing it is worth doing, but it is a change to the decorator rather than
-# to the timeout and is left out of this item deliberately.
-EMBEDDING_REQUEST_TIMEOUT_SECONDS = 30
+#     (1 + OPENAI_SDK_MAX_RETRIES) x 30s + SDK backoff <= 2 x 30 + 8 = 68s
+#
+# against ~5.5 minutes with the decorator still in place, and 5 x 3 x 600 =
+# 2.5 HOURS before any of these constants existed.
+#
+# (No assignment here -- see EMBEDDING_REQUEST_TIMEOUT_SECONDS at the top,
+#  beside the client construction that consumes the structured object.)
 
 # Expected output tokens per trial evaluated, used to decide whether a batch
 # should be split BEFORE it is sent.

@@ -460,12 +460,6 @@ def medcpt_score_pairs(query: str, trial_texts: List[str]) -> "np.ndarray":
 # Embedding Helper (self-contained, no dependency on RAG Indexer)
 # ---------------------------------------------------------------------------
 
-@retry(
-    reraise=True,
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=1, min=2, max=60),
-    retry=retry_if_exception_type((RateLimitError, InternalServerError, APIConnectionError)),
-)
 def get_embedding(text: str) -> List[float]:
     """Generate embedding for text using OpenAI.
 
@@ -473,28 +467,44 @@ def get_embedding(text: str) -> List[float]:
     The RAG Indexer (08) has its own copy used at indexing time.
     This copy is used at inference time only.
 
-    BOUNDED, on its own budget. This call had been left on the SDK's 600s
-    default after the Stage 5 call was moved off it, which made the file
-    inconsistent with no stated reason -- the next reader would have had to
-    guess whether that was a decision or an oversight. It was an oversight.
+    ONE RETRY MECHANISM, NOT TWO. This function used to carry
 
-    EMBEDDING_REQUEST_TIMEOUT_SECONDS is a separate constant from
-    MATCHING_REQUEST_TIMEOUT_SECONDS on purpose: 300s is sized for a request
-    that generates thousands of tokens and this one generates none. File 03
-    records how the value was arrived at, and states plainly that it comes from
-    the call's SHAPE rather than from a measurement, because no embedding
-    latency has ever been measured here.
+        @retry(reraise=True, stop=stop_after_attempt(5),
+               wait=wait_exponential(multiplier=1, min=2, max=60),
+               retry=retry_if_exception_type((RateLimitError,
+                     InternalServerError, APIConnectionError)))
 
-    The @retry decorator above stays and is NOT the same budget: it re-issues
-    the whole call on RateLimitError / InternalServerError / APIConnectionError
-    (which APITimeoutError subclasses, so a timeout is retried there too). The
-    timeout bounds ONE attempt; the decorator bounds how many attempts there
-    are. File 03 states the product.
+    on top of the SDK's own retries. APITimeoutError SUBCLASSES
+    APIConnectionError, so a timeout was retried by both: up to 5 x 2 = 10
+    attempts for a single embedding, a number nobody chose. The decorator was
+    removed in item 29d and the SDK retry (OPENAI_SDK_MAX_RETRIES, File 03)
+    kept, because it is the only one that can be scoped without breaking the
+    fixture harness, and because it honours Retry-After on a 429 where blind
+    exponential backoff cannot. The full argument and the trade-off are in File
+    03's budget reconciliation.
+
+    Attempts now: 1 + OPENAI_SDK_MAX_RETRIES = 2. Worst case ~68s.
+
+    NOT SILENTLY LESS ROBUST. The SDK retries the same conditions this
+    decorator did -- connection errors, 408/409/429, 5xx -- so what was lost is
+    attempt COUNT and backoff CEILING, not coverage of a failure class. A
+    persistent failure now raises out of this function after 2 attempts instead
+    of 10, which reaches Stage 2's channel accounting sooner and is recorded
+    there rather than absorbed by a five-minute retry storm nobody sees.
+
+    BOUNDED, on its own budget. EMBEDDING_REQUEST_TIMEOUT_SECONDS is a separate
+    constant from MATCHING_REQUEST_TIMEOUT_SECONDS on purpose: 300s is sized
+    for a request that generates thousands of tokens and this one generates
+    none. File 03 records how the value was arrived at, and states plainly that
+    it comes from the call's SHAPE rather than from a measurement, because no
+    embedding latency has ever been measured here.
     """
     response = openai_client.embeddings.create(
         model=EMBEDDING_MODEL,
         input=text,
-        timeout=EMBEDDING_REQUEST_TIMEOUT_SECONDS,
+        # The STRUCTURED Timeout, so an unreachable host still fails on the
+        # SDK's 5s connect phase rather than waiting out the 30s read budget.
+        timeout=EMBEDDING_REQUEST_TIMEOUT,
     )
     return response.data[0].embedding
 
@@ -2446,7 +2456,12 @@ def call_matching_model(system_prompt: str, user_prompt: str):
         max_completion_tokens=MATCHING_MAX_TOKENS,
         reasoning_effort=MATCHING_REASONING_EFFORT,
         seed=MATCHING_SEED,
-        timeout=MATCHING_REQUEST_TIMEOUT_SECONDS,
+        # The STRUCTURED Timeout, not the bare number. A per-request timeout
+        # replaces the client's Timeout object outright rather than merging with
+        # it, so passing the float here would have re-flattened the connect
+        # phase to 300s on this call no matter what the client carries. See
+        # _structured_timeout() in File 03.
+        timeout=MATCHING_REQUEST_TIMEOUT,
     )
 
 

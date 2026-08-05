@@ -354,6 +354,89 @@ def process_patient(
 
 
 # ===========================================================================
+# MID-RUN MODEL CHANGE: ANNOUNCING IT ONCE
+# ===========================================================================
+
+
+class _DriftAnnouncer:
+    """One-shot, thread-safe announcement that the judging model changed.
+
+    WHY THIS EXISTS. Item 29c established that a MatchingModelMismatchError
+    raised inside a worker does NOT stop the batch: every future is submitted
+    up front, and ThreadPoolExecutor.__exit__ calls shutdown(wait=True), which
+    drains all of them before the exception propagates out of run_batch(). So
+    on a full corpus the operator watches a drain that may run for hours. Both
+    done-callbacks used to render that as a stream of generic
+    "[CALLBACK ERROR] MatchingModelMismatchError: ..." lines, one per remaining
+    patient -- which is the same as no message at all, because a line repeated
+    nine hundred times is scrolled past, not read.
+
+    WHY ONCE. Repetition is the failure mode being fixed, so suppressing the
+    repeat is the whole point. The count of affected patients is not lost: they
+    are counted as errors in the pass summary, and no result row is appended for
+    any of them.
+
+    WHY A LOCK. The callback runs on worker threads. A bare `if not flag: flag =
+    True; print(...)` is a read-modify-write across threads, so two workers that
+    hit the mismatch in the same instant can both pass the test and both print.
+    A duplicate warning would be harmless -- this is a message, not a mutation --
+    but the lock costs nothing on a path that fires at most once per run, and it
+    makes the behaviour deterministic, which is what lets it be TESTED. An
+    assertion that "the message appears exactly once" against a racy flag would
+    be a flaky test, and a flaky test is worse than no test.
+
+    WHAT THIS IS NOT. It is not a cancellation mechanism and must not become
+    one. Nothing reads `_announced` to decide whether to do work; it gates
+    printing and nothing else. Stopping the drain needs a cooperative flag that
+    submitted-but-not-started tasks check, and that design belongs to item 44.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._announced = False
+
+    def announce(self, exc) -> bool:
+        """Print the drift banner if it has not been printed. Returns whether
+        this call was the one that printed it."""
+        with self._lock:
+            if self._announced:
+                return False
+            self._announced = True
+
+        # Written through tqdm.write for the same reason every other line in
+        # these passes is: builtins.print is redirected while a progress bar is
+        # live, and a raw print would be overwritten by the bar.
+        #
+        # .requested and .returned are attributes File 13 puts on the exception
+        # (item 29b). Read defensively anyway: this runs on the failure path of
+        # a failure path, and an AttributeError here would replace the message
+        # with a traceback nobody asked for.
+        requested = getattr(exc, "requested", "<not recorded>")
+        returned = getattr(exc, "returned", "<not recorded>")
+        tqdm.write("")
+        tqdm.write("!" * 80)
+        tqdm.write("!!  JUDGING MODEL CHANGED MID-RUN — THIS RUN'S RESULTS MUST NOT BE USED")
+        tqdm.write("!" * 80)
+        tqdm.write(f"!!  requested : {requested}")
+        tqdm.write(f"!!  answered  : {returned}")
+        tqdm.write("!!")
+        tqdm.write("!!  Every patient judged before this point used a different model than")
+        tqdm.write("!!  every patient judged after it, so the corpus is split down the middle")
+        tqdm.write("!!  by a change nothing in the request asked for.")
+        tqdm.write("!!")
+        tqdm.write("!!  The batch is now DRAINING: all remaining patients were queued before")
+        tqdm.write("!!  this was detected and will still run. They will fail the same way and")
+        tqdm.write("!!  write no rows. This banner is printed ONCE; the per-patient failures")
+        tqdm.write("!!  are counted in the pass summary.")
+        tqdm.write("!!")
+        tqdm.write(f"!!  Set MATCHING_MODEL in '03- Config.py' to {returned!r} only after")
+        tqdm.write("!!  reviewing what changed, add it to PRICING_CONFIG, and re-baseline.")
+        tqdm.write("!" * 80)
+        tqdm.write("")
+        return True
+
+
+# ===========================================================================
 # BATCH LOOP
 # ===========================================================================
 
@@ -414,11 +497,24 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
         smoothing= 0.1 # to reduce the eta fluctuation 
     )
 
+    # Local to this pass, so run_batch() and run_resample() each announce once
+    # rather than sharing a flag across two passes. NOT read by any worker --
+    # see the class docstring.
+    _drift = _DriftAnnouncer()
+
     def _on_done(future, fhir_path):
 
         nonlocal batch_success, batch_error
         try:
             entry = future.result()
+        except MatchingModelMismatchError as e:
+            # Counted and progressed exactly like any other failure -- the bar
+            # must not stall during the drain -- but announced once, loudly,
+            # instead of once per patient as a generic callback error.
+            batch_error += 1
+            progress.update(1)
+            _drift.announce(e)
+            return
         except Exception as e:
             batch_error += 1
             progress.update(1)
@@ -580,10 +676,22 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
     builtins.print = _tqdm_print
 
 
+    # This pass gets its OWN announcer. Note the callback below takes (future)
+    # while run_batch()'s takes (future, fhir_path) -- they are two different
+    # functions, not a copy, and the drift branch had to be added to each. The
+    # shared _DriftAnnouncer is what guarantees the two behave identically
+    # despite that, rather than two hand-written messages drifting apart.
+    _drift = _DriftAnnouncer()
+
     def _on_done(future):
         nonlocal resample_success, resample_error
         try:
             entry = future.result()
+        except MatchingModelMismatchError as e:
+            resample_error += 1
+            progress.update(1)
+            _drift.announce(e)
+            return
         except Exception as e:
             resample_error += 1
             progress.update(1)
