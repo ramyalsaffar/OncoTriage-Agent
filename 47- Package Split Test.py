@@ -25,6 +25,25 @@ re-export shims over a real Python package:
     oncotriage/extraction/stage.py                  File 10 to line 698
     oncotriage/extraction/histology.py              File 10 from line 699
 
+Pass 20c-3a added six more and turned four numbered files into thin entry points:
+
+    oncotriage/embedding.py                 THE ONE construction site for the
+                                            FastEmbed BM25 sparse model. It was
+                                            built in three independent places --
+                                            File 11 at index time, deps at query
+                                            time, File 12 inside its own smoke
+                                            test -- for the two halves of one
+                                            job. See check 2f.
+    oncotriage/fhir/clean.py                File 05, whole. File 05 keeps a full
+                                            re-export shim: File 34 chains it.
+    oncotriage/fhir/generate.py             File 04, whole
+    oncotriage/fhir/explore.py              File 06, whole
+    oncotriage/retrieval/indexer.py         File 11, whole
+    oncotriage/retrieval/index_validator.py File 12, whole
+
+    Files 04, 06, 11 and 12 have NO exec bootstrap at all now -- nothing in the
+    repository chains them, so there is no shared namespace to feed.
+
 Pass 20c-2b added two more, and corrected one thing pass 2a shipped:
 
     oncotriage/fhir/parser.py               File 07, whole
@@ -114,10 +133,33 @@ WHAT THIS FILE CHECKS, and how each check could fail
      never existed. Both directions are asserted -- nothing missing, nothing
      added.
 
+  2f. EXACTLY ONE CONSTRUCTION SITE FOR THE BM25 SPARSE MODEL, counted by ast
+     over every package file, with a negative control that plants a second one
+     in a copy and shows the detector finds it. Both sides of the model -- the
+     indexer that writes the document vectors and the agent that encodes the
+     query scored against them -- must reach the same accessor. Two independent
+     loaders of a token-ID vocabulary is a silent retrieval-quality failure: the
+     dot product still computes, nothing raises, no counter moves.
+
+  2g. NO FUNCTION-LOCAL SHADOWS A MODULE-LEVEL IMPORT. An ast scan over every
+     package file. This caught two real defects during pass 3a -- a `config`
+     local in stage1_index_health() and an `embedding` loop variable in
+     _flush_embed_buffer() -- each of which would have turned a module attribute
+     read into UnboundLocalError at RUN time, invisibly to any import test.
+     NEGATIVE CONTROL: a copy with the module-level `import config` put back is
+     shown to be caught.
+
   5b. THE FILE 10 SPLIT HAS EXACTLY ONE SHARED NAME. Re-derived against the
      shipped modules rather than asserted in a comment: stage.py and
      histology.py must reference nothing the other defines, and the one name
      they both reach for must be _is_negated, out of negation.py.
+
+  5c. THE LAZY DEPENDENCY PROXY ANSWERS FOR WHAT IT WRAPS. _LazyAgentDependency
+     forwarded __getattr__ and __call__ only, so bool(), len(), iter(), `in`,
+     `==`, hash() and repr() answered about the WRAPPER. == in particular
+     answered False when the wrapped object WAS the operand, which is the exact
+     question a fixture harness asks of this seam. Demonstrated against a copy
+     of the class with the six delegations stripped, which must get them wrong.
 
   6. THE THREE LATE-BINDING WRAPPERS STILL BIND LATE. File 02's shim is exec'd
      into a throwaway namespace holding a fake PRICING_CONFIG, a stub Qdrant
@@ -149,6 +191,7 @@ Exit codes:
 """
 
 import ast
+import concurrent.futures
 import json
 import os
 import shutil
@@ -398,7 +441,59 @@ _PASS_2B_DROPPED = {
     '07- FHIR Parser.py': set(),
     '14- Database Logger.py': set(),
     '13- LangGraph Agent.py': set(),
+    # Pass 3a drops nothing from File 05. Every one of the fourteen names it
+    # bound is still bound, including the three that are now resolved eagerly
+    # HERE from accessors that are lazy in the package.
+    '05- FHIR Clean Data.py': set(),
 }
+
+
+# ===========================================================================
+# THE NAMES FILE 05 DEFINED BEFORE PASS 3a
+# ===========================================================================
+# Same runtime method as every block above: File 05 was exec'd at commit aa1bddf
+# into a throwaway namespace, after the same base chain its own bootstrap runs
+# (01, 02, 03 raw, then exec_chain of 07 and 08), and every name it added was
+# recorded.
+#
+# FILE 05 IS THE ONLY ONE OF THE FIVE FILES CONVERTED IN PASS 3a THAT KEEPS A
+# SHIM, so it is the only one with an inventory to check. Files 04, 06, 11 and 12
+# have no chain consumer anywhere in the repository -- every top-level name each
+# of them defines was grepped against every .py, .md, .toml and .yml in the tree,
+# and the only hits are prose and unrelated same-named locals other files define
+# for themselves. They became thin entry points, so there is no shared-namespace
+# surface left to pin.
+#
+# Three of the fourteen are BOOTSTRAP LEFTOVERS rather than definitions --
+# _bootstrap and _fh from the three-file exec loop, _code_dir from the __file__
+# derivation. They are here because they were bound, and the shim keeps the same
+# bootstrap block, so it still binds them.
+#
+# PATIENTS_DIR, _MANIFEST_PATH and _CANCER_REGISTRY are in this list and must
+# still be bound, and that is the load-bearing part: in the package they became
+# patients_dir(), manifest_path() and cancer_registry(), lazy and cached, because
+# a package module may not resolve a glob or build the ICD-10-CM registry at
+# import. The shim CALLS all three at load, so a chain caller sees the same
+# strings and the same registry object it always did -- and
+# "34- Cohort Selector Diff.py" reads _CANCER_REGISTRY straight out of this
+# namespace at three separate lines.
+_PRE_3A_RUNTIME_NAMES = {
+    '05- FHIR Clean Data.py': [
+        'CAP', 'PATIENTS_DIR', 'RANDOM_SEED', '_CANCER_REGISTRY',
+        '_DELETION_COUNTS', '_MANIFEST_PATH', '_bootstrap', '_code_dir',
+        '_delete_manifested', '_fh', '_write_manifest',
+        'filter_cancer_patients_inplace', 'has_cancer_diagnosis',
+        'patient_death_status',
+    ],
+}
+
+_PRE_3A_COUNTS = {'05- FHIR Clean Data.py': 14}
+
+# NOTHING is added to File 05's shim surface. The three accessors it needs come
+# in under private aliases, are called once, and are then DELETED -- the same
+# bind-then-remove pattern File 08's cleanup loop uses -- so a name this file
+# adds cannot be silently picked up by the next file in a chain.
+_PASS_3A_ADDED = {'05- FHIR Clean Data.py': set()}
 
 
 # ===========================================================================
@@ -822,13 +917,15 @@ _PKG_FILES = sorted(
     if name.endswith(".py") and "__pycache__" not in root
 )
 
-check("the package file list is non-empty and covers all five subpackages",
-      len(_PKG_FILES) >= 27
+check("the package file list is non-empty and covers all six subpackages",
+      len(_PKG_FILES) >= 34
       and any(f.endswith("registries/mesh.py") for f in _PKG_FILES)
       and any(f.endswith("extraction/negation.py") for f in _PKG_FILES)
       and any(f.endswith("fhir/parser.py") for f in _PKG_FILES)
       and any(f.endswith("storage/database_logger.py") for f in _PKG_FILES)
-      and any(f.endswith("agent/deps.py") for f in _PKG_FILES),
+      and any(f.endswith("agent/deps.py") for f in _PKG_FILES)
+      and any(f.endswith("retrieval/indexer.py") for f in _PKG_FILES)
+      and any(f.endswith("embedding.py") for f in _PKG_FILES),
       True)
 
 # EVERY SUBPACKAGE MUST BE DECLARED IN pyproject.toml. setuptools does not
@@ -847,7 +944,7 @@ _SUBPACKAGE_DIRS = sorted(
 check("the tree has the subpackages this pass expects (non-degeneracy)",
       _SUBPACKAGE_DIRS,
       ["oncotriage.agent", "oncotriage.extraction", "oncotriage.fhir",
-       "oncotriage.registries", "oncotriage.storage"])
+       "oncotriage.registries", "oncotriage.retrieval", "oncotriage.storage"])
 check("every subpackage on disk is declared in pyproject.toml, so a built "
       "wheel carries it",
       sorted(p for p in _SUBPACKAGE_DIRS if f'"{p}"' not in _PYPROJECT), [])
@@ -1009,6 +1106,13 @@ import xml.etree.ElementTree                                              # noqa
 # package's doing. numpy and rank_bm25 read nothing; langgraph is listed here
 # rather than in `heavy` because it is a graph library, not a model.
 import numpy, rank_bm25, langgraph.graph                                  # noqa: F401
+# Pass 20c-3a: oncotriage.fhir.explore imports these THREE AT MODULE SCOPE, and
+# deliberately -- seven of its twelve functions plot, and nothing but
+# "06- FHIR Explore.py" imports it. matplotlib reads matplotlibrc and its font
+# cache at import, and pandas reads its own configuration, so without this
+# pre-import the trap would fire on THEIR file access rather than on anything
+# this package does. Same allowance, for the same reason, as the block above.
+import matplotlib, matplotlib.pyplot, pandas, seaborn                     # noqa: F401
 
 
 class Blocked(RuntimeError):
@@ -1038,6 +1142,7 @@ import oncotriage.settings
 import oncotriage.paths
 import oncotriage.config
 import oncotriage.utils
+import oncotriage.embedding
 import oncotriage.registries.cancer_code_registry
 import oncotriage.registries.mesh
 import oncotriage.registries.mesh_crosswalk_build
@@ -1045,6 +1150,11 @@ import oncotriage.extraction.negation
 import oncotriage.extraction.stage
 import oncotriage.extraction.histology
 import oncotriage.fhir.parser
+import oncotriage.fhir.clean
+import oncotriage.fhir.generate
+import oncotriage.fhir.explore
+import oncotriage.retrieval.indexer
+import oncotriage.retrieval.index_validator
 import oncotriage.storage.database_logger
 import oncotriage.registries.primary_cancer
 import oncotriage.agent
@@ -1087,8 +1197,18 @@ for _name, _fn, _args in (("socket", socket.socket, (socket.AF_INET, socket.SOCK
 print(json.dumps({"heavy": heavy, "armed": armed}))
 """
 
-# 27 as of pass 20c-2c: the twelve agent modules, oncotriage.agent itself, and
-# oncotriage.registries.primary_cancer joined the fourteen from earlier passes.
+# 33 as of pass 20c-3a: oncotriage.embedding, fhir.clean, fhir.generate,
+# fhir.explore, retrieval.indexer and retrieval.index_validator joined the 27
+# from pass 2c (which were the twelve agent modules, oncotriage.agent itself,
+# oncotriage.registries.primary_cancer and the fourteen from earlier passes).
+#
+# THREE OF THE SIX WERE THE WORST OFFENDERS IN THE PROJECT before this pass.
+# "11- RAG Trial Indexer.py" built SparseTextEmbedding at module level, so
+# reading the indexer loaded a model. "06- FHIR Explore.py" resolved three globs,
+# CREATED A DIRECTORY, built the whole ICD-10-CM registry and mutated matplotlib's
+# global style, all at exec time. "05- FHIR Clean Data.py" resolved two globs and
+# built the registry. Every one of those is now behind an accessor, and this
+# probe is what says so.
 #
 # THE AGENT IS THE HARDEST CASE IN THIS FILE. "13- LangGraph Agent.py" loaded
 # MedCPT (~110 MB) and FastEmbed at exec() time, so importing it was the single
@@ -1099,7 +1219,7 @@ print(json.dumps({"heavy": heavy, "armed": armed}))
 # oncotriage.storage.database_logger stays the case that matters most for the
 # sqlite3 trap: its whole subject is a SQLite database, and before item 20b this
 # import created three tables in the production inferences.db.
-_MODULES_UNDER_TRAP = 27
+_MODULES_UNDER_TRAP = 33
 
 _rc, _out, _err = _run(_PURITY, cwd=_ELSEWHERE, extra_path=_FALLBACK_PATH)
 check(f"all {_MODULES_UNDER_TRAP} package modules import with open, io.open, "
@@ -1290,9 +1410,19 @@ _ALL_PKG_MODULES = sorted(
 )
 
 check("the module list is the size the tree says it is (non-degeneracy)",
-      len(_ALL_PKG_MODULES) >= 26, True)
+      len(_ALL_PKG_MODULES) >= 32, True)
 check("...and includes the one that used to resolve a path at import",
       "oncotriage.registries.mesh" in _ALL_PKG_MODULES, True)
+# Pass 20c-3a's three worst offenders, named individually so a module dropped
+# from the tree cannot quietly leave this sweep. fhir.explore is the one that
+# CREATED A DIRECTORY at import; retrieval.indexer is the one that LOADED A
+# MODEL at import.
+for _added in ("oncotriage.embedding", "oncotriage.fhir.clean",
+               "oncotriage.fhir.generate", "oncotriage.fhir.explore",
+               "oncotriage.retrieval.indexer",
+               "oncotriage.retrieval.index_validator"):
+    check(f"...and covers {_added} (new in pass 20c-3a)",
+          _added in _ALL_PKG_MODULES, True)
 
 _PER_MODULE_PROBE = (
     "import json, sys\n"
@@ -1301,18 +1431,42 @@ _PER_MODULE_PROBE = (
     "print(json.dumps({'resolved': sorted(_p._RESOLVED)}))\n"
 )
 
-_eager = {}
-for _module in _ALL_PKG_MODULES:
-    _rc, _out, _err = _run_with_env(
-        _PER_MODULE_PROBE % _module, cwd=_ELSEWHERE,
+
+def _probe_one_module(module: str):
+    """Import ONE module in its own subprocess. Returns (module, complaint|None)."""
+    rc, out, err = _run_with_env(
+        _PER_MODULE_PROBE % module, cwd=_ELSEWHERE,
         extra_env={"ONCOTRIAGE_MAIN_PATH": _UNREACHABLE_ROOT},
         extra_path=_FALLBACK_PATH)
-    if _rc != 0:
-        _eager[_module] = f"import FAILED: {(_err.strip().splitlines() or ['?'])[-1][:90]}"
-        continue
-    _payload = _last_json(_out) or {}
-    if _payload.get("resolved"):
-        _eager[_module] = f"resolved {_payload['resolved']}"
+    if rc != 0:
+        return module, f"import FAILED: {(err.strip().splitlines() or ['?'])[-1][:90]}"
+    payload = _last_json(out) or {}
+    if payload.get("resolved"):
+        return module, f"resolved {payload['resolved']}"
+    return module, None
+
+
+# RUN THEM CONCURRENTLY (pass 20c-3a). Serially, 26 modules took about nine
+# minutes -- every one pays a fresh interpreter start plus openai, qdrant_client
+# and (for the agent modules) langgraph, and pass 3a takes it to 33. A test
+# nobody runs because it is slow is a test that is not protecting anything.
+#
+# A THREAD pool, not a process pool, and that is the right tool rather than a
+# compromise: each unit of work is already its own subprocess, so the parent
+# thread spends its entire life blocked in subprocess.run() with the GIL
+# released. Adding worker PROCESSES would add a second layer of interpreter
+# startup to fork off a process that only waits.
+#
+# The probes are independent BY CONSTRUCTION -- separate processes, no shared
+# state, one read-only source tree -- which is the property that makes this safe
+# and is why the sweep was written per-module in the first place. Results are
+# collected into a dict and sorted before the assertion, so the report is
+# deterministic however the pool happens to schedule them.
+_eager = {}
+with concurrent.futures.ThreadPoolExecutor(max_workers=8) as _pool:
+    for _module, _complaint in _pool.map(_probe_one_module, _ALL_PKG_MODULES):
+        if _complaint:
+            _eager[_module] = _complaint
 
 check("no package module resolves a path (or fails) when imported with the "
       "project root unreachable",
@@ -1486,6 +1640,300 @@ else:
           _payload.get("ctx_inside"), True)
     check("...and restores even when the block raises",
           _payload.get("ctx_cleared_after_raise"), True)
+
+
+# ===========================================================================
+# 2f. EXACTLY ONE CONSTRUCTION SITE FOR THE BM25 SPARSE MODEL
+# ===========================================================================
+
+print("\n" + "=" * 78)
+print("2f. the FastEmbed BM25 sparse model is constructed in exactly one place")
+print("=" * 78)
+
+# THE HAZARD THIS CLOSES, and it is a correctness hazard rather than a tidiness
+# one.
+#
+# Before pass 20c-3a, SparseTextEmbedding("Qdrant/bm25") was constructed THREE
+# times, independently:
+#
+#     "11- RAG Trial Indexer.py" line 53      index time, module level
+#     oncotriage/agent/deps.py                query time, lazily
+#     "12- RAG Trial Indexer Validator.py"    inside stage2_retrieval_tests()
+#
+# The first two are the two halves of ONE job: File 11 writes each trial's three
+# BM25 fields into Qdrant's sparse vectors, and the agent encodes the patient
+# query that is scored against them. BM25 sparse vectors are TOKEN-ID vectors
+# over the model's vocabulary, so if the two sides ever named different models,
+# the query's indices would address different terms than the documents' indices
+# do. Qdrant computes a dot product over whatever indices it is handed: it would
+# go on returning results, nothing would raise, no counter would move, and the
+# only symptom would be that retrieval quality fell.
+#
+# The third one is worse. A VALIDATOR carrying its own encoder cannot detect the
+# drift it exists to detect -- it would report "All 5 queries returned results"
+# against an index built with a vocabulary it does not share.
+#
+# There is now one construction site and both sides reach it. This check is what
+# stops a fourth appearing.
+#
+# COUNTED BY AST, NOT BY GREP. A grep cannot tell a call from a mention in a
+# docstring, and three of this package's docstrings now name the class precisely
+# because they explain why there is only one call.
+
+
+def _sparse_model_constructions(path: str):
+    """Line numbers where SparseTextEmbedding(...) is CALLED in `path`."""
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    return [n.lineno for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id == "SparseTextEmbedding"]
+
+
+_construction_sites = {}
+for _f in _PKG_FILES:
+    _hits = _sparse_model_constructions(_f)
+    if _hits:
+        _construction_sites[os.path.relpath(_f, _code_dir)] = _hits
+
+check("exactly one package file constructs SparseTextEmbedding",
+      sorted(_construction_sites), ["oncotriage/embedding.py"])
+check("...and it constructs it exactly once",
+      len(_construction_sites.get("oncotriage/embedding.py", [])), 1)
+
+# NON-DEGENERATE. Everything above would also hold if the detector simply never
+# matched anything -- a renamed class, a broken walk, a _PKG_FILES list that had
+# gone empty. The detector is shown to FIND a construction in a copy that has a
+# second one planted in it, and to report BOTH.
+_BM25_PLANT_ROOT = tempfile.mkdtemp(prefix="oncotriage_bm25_")
+try:
+    shutil.copytree(_PKG_DIR, os.path.join(_BM25_PLANT_ROOT, "oncotriage"))
+    _PLANTED = os.path.join(_BM25_PLANT_ROOT, "oncotriage", "retrieval", "indexer.py")
+    with open(_PLANTED, "a", encoding="utf-8") as _fh:
+        _fh.write('\n\ndef _planted_second_loader():\n'
+                  '    return SparseTextEmbedding(model_name="Qdrant/bm25")\n')
+    check("the detector CATCHES a second construction site planted in a copy",
+          len(_sparse_model_constructions(_PLANTED)), 1)
+    check("...and the shipped indexer has none, which is what makes the "
+          "planted one the only difference",
+          _sparse_model_constructions(
+              os.path.join(_PKG_DIR, "retrieval", "indexer.py")), [])
+finally:
+    shutil.rmtree(_BM25_PLANT_ROOT, ignore_errors=True)
+
+# The two SIDES must reach the same accessor, which is a different claim from
+# "there is one construction". Asserted structurally: both files must name
+# get_bm25_sparse_model.
+_DEPS_PY = os.path.join(_PKG_DIR, "agent", "deps.py")
+_INDEXER_PY = os.path.join(_PKG_DIR, "retrieval", "indexer.py")
+_VALIDATOR_PY = os.path.join(_PKG_DIR, "retrieval", "index_validator.py")
+
+
+def _calls_name(path: str, name: str) -> bool:
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id == name:
+            return True
+        if isinstance(func, ast.Attribute) and func.attr == name:
+            return True
+    return False
+
+
+check("the agent's query encoder reaches the one accessor",
+      _calls_name(_DEPS_PY, "get_bm25_sparse_model"), True)
+check("...and so does the indexer, which wrote the vectors it is scored against",
+      _calls_name(_INDEXER_PY, "get_bm25_sparse_model"), True)
+check("...and the validator reaches it through the agent's own accessor, so it "
+      "tests the encoder the agent actually uses",
+      _calls_name(_VALIDATOR_PY, "get_bm25_query_model"), True)
+
+
+# ===========================================================================
+# 2g. NO FUNCTION-LOCAL SHADOWS A MODULE-LEVEL IMPORT
+# ===========================================================================
+
+print("\n" + "=" * 78)
+print("2g. no function binds a local with the same name as a module-level import")
+print("=" * 78)
+
+# THE DEFECT THIS CAUGHT, in this very pass, twice.
+#
+# Converting a file that read names out of the shared exec namespace means
+# prefixing those reads with the module they now come from. Two of the five
+# conversions collided with a LOCAL VARIABLE that already had that name:
+#
+#   index_validator.stage1_index_health()   binds `config = info.config.params.vectors`
+#   indexer._flush_embed_buffer()           binds `embedding` as a zip() loop variable
+#
+# In Python a name assigned ANYWHERE in a function is local for the WHOLE of it,
+# so `config.COLLECTION_NAME` three lines above that assignment is not a module
+# attribute read -- it is UnboundLocalError. The validator would have died in its
+# first check on every run, and the indexer would have died the first time it
+# flushed an embedding batch, i.e. partway through a real index build.
+#
+# Neither was caught by importing the module, because both are runtime paths.
+# Both were caught by this scan, which is why it is now permanent.
+#
+# It is a WARNING-LEVEL smell in general and an ERROR here: the package's
+# convention is that a module-level import name (`paths`, `config`, `deps`,
+# `embedding`) is reachable from every function body, and a local that shadows
+# one silently withdraws that.
+
+
+def _own_scope_bindings(func):
+    """Names bound in `func`'s OWN scope. Nested scopes excluded.
+
+    Nested function and class bodies are NOT descended into: a name local to an
+    inner function is not local to the outer one, so counting it would flag
+    index_trials() for a variable that only _flush_embed_buffer() binds -- a
+    false positive that would eventually make this check something people work
+    around rather than fix.
+
+    Comprehension targets are excluded for the same reason: since Python 3 a
+    comprehension has its own scope, so `[x for config in items]` does not bind
+    `config` in the enclosing function and cannot shadow anything there.
+    """
+    scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+    comprehensions = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+    bound = set()
+
+    # Parameters belong to this scope. Defaults and decorators do not -- they are
+    # evaluated in the enclosing one -- so only func.args is walked, not func.
+    for node in ast.walk(func.args):
+        if isinstance(node, ast.arg):
+            bound.add(node.arg)
+
+    def walk(nodes):
+        for node in nodes:
+            if isinstance(node, scopes):
+                # `def inner():` binds `inner` HERE, but nothing inside it does.
+                name = getattr(node, "name", None)
+                if name:
+                    bound.add(name)
+                continue
+            if isinstance(node, comprehensions):
+                continue
+            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                bound.add(node.id)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    bound.add((alias.asname or alias.name).split(".")[0])
+            walk(ast.iter_child_nodes(node))
+
+    walk(func.body)
+    return bound
+
+
+def _shadowed_imports(path: str):
+    """[(function, [shadowed names])] for `path`, every function scope in it."""
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    imported = set()
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                imported.add((alias.asname or alias.name).split(".")[0])
+
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        clash = sorted(_own_scope_bindings(node) & imported)
+        if clash:
+            found.append((node.name, clash))
+    return found
+
+
+_shadows = {}
+for _f in _PKG_FILES:
+    _hits = _shadowed_imports(_f)
+    if _hits:
+        _shadows[os.path.relpath(_f, _code_dir)] = _hits
+
+check("no function in the package shadows one of its module's imports",
+      sorted(f"{f}: {hits}" for f, hits in _shadows.items()), [])
+
+# NON-DEGENERATE, IN BOTH DIRECTIONS. An empty result is also what a broken
+# walker returns, and a walker that flagged everything would be worked around
+# rather than fixed. The scanner is run against a table of six snippets written
+# into a temporary file: the two REAL pass-3a defects reproduced verbatim, and
+# four cases it must NOT report.
+#
+# The two false-positive guards are the reason the scanner is scope-precise
+# rather than a flat ast.walk:
+#
+#   nested_only    a name local to an INNER function is not local to the outer,
+#                  so a flat walk would flag index_trials() for a variable only
+#                  _flush_embed_buffer() binds.
+#   comprehension  since Python 3 a comprehension target has its own scope, so
+#                  `[x for config in items]` shadows nothing.
+_SHADOW_CASES = {
+    # REAL DEFECT 1 -- index_validator.stage1_index_health, reproduced.
+    "the real `config` local in stage1_index_health": (
+        "from oncotriage import config\n"
+        "def stage1_index_health():\n"
+        "    if config.COLLECTION_NAME in x:\n"
+        "        pass\n"
+        "    config = info.config.params.vectors\n",
+        [("stage1_index_health", ["config"])]),
+    # REAL DEFECT 2 -- indexer._flush_embed_buffer: a zip() loop variable in a
+    # NESTED function. The inner function is what must be named, not the outer.
+    "the real `embedding` loop variable in a nested flush function": (
+        "from oncotriage import embedding\n"
+        "def index_trials(trials):\n"
+        "    def _flush(buf):\n"
+        "        m = embedding.get_bm25_sparse_model()\n"
+        "        for item, embedding, t in zip(a, b, c):\n"
+        "            pass\n"
+        "    _flush(1)\n",
+        [("_flush", ["embedding"])]),
+    "a shadowing PARAMETER, which is the same defect by another route": (
+        "from oncotriage import paths\n"
+        "def g(paths):\n"
+        "    return paths\n",
+        [("g", ["paths"])]),
+    "a nested-only local does NOT flag its enclosing function": (
+        "import json\n"
+        "def outer():\n"
+        "    def inner():\n"
+        "        json = 1\n"
+        "        return json\n"
+        "    return inner\n",
+        [("inner", ["json"])]),
+    "a comprehension target shadows nothing (its own scope since Python 3)": (
+        "import json\n"
+        "def f(items):\n"
+        "    return [json for json in items]\n",
+        []),
+    "a clean function is reported clean": (
+        "from oncotriage import paths\n"
+        "def g(directory):\n"
+        "    return paths.data_fhir_path + directory\n",
+        []),
+}
+
+_SHADOW_DIR = tempfile.mkdtemp(prefix="oncotriage_shadow_")
+try:
+    for _label, (_code, _expected) in _SHADOW_CASES.items():
+        _probe_path = os.path.join(_SHADOW_DIR, "probe.py")
+        with open(_probe_path, "w", encoding="utf-8") as _fh:
+            _fh.write(_code)
+        check(f"shadow scan: {_label}", _shadowed_imports(_probe_path), _expected)
+finally:
+    shutil.rmtree(_SHADOW_DIR, ignore_errors=True)
+
+# And the shipped fix itself: the validator must NOT import `config` as a module,
+# because stage1_index_health() genuinely binds a local of that name.
+check("...and the shipped validator imports the config NAMES, not the module, "
+      "which is what makes its `config` local harmless",
+      "from oncotriage import config\n" in open(
+          os.path.join(_PKG_DIR, "retrieval", "index_validator.py"),
+          encoding="utf-8").read(), False)
+check("...while still reading COLLECTION_NAME out of the config module",
+      "COLLECTION_NAME," in open(
+          os.path.join(_PKG_DIR, "retrieval", "index_validator.py"),
+          encoding="utf-8").read(), True)
 
 
 # ===========================================================================
@@ -1767,17 +2215,16 @@ _SHIM_PROBE = r"""
 import json, os, sys
 path = sys.argv[1]
 base_files = json.loads(sys.argv[2]) if len(sys.argv) > 2 else []
+chain_list = json.loads(sys.argv[3]) if len(sys.argv) > 3 else []
 code_dir = os.path.dirname(path) + os.sep
 
 ns = {"__name__": "_exec_chain_", "__file__": path}
 for name in base_files:
     with open(code_dir + name, encoding="utf-8") as fh:
         exec(fh.read(), ns)
-if base_files:
-    ns["exec_chain"](["03- Config.py", "08- Cancer Code Registry.py",
-                      "09- MeSH Cancer Site Relevance Filter.py",
-                      "10- Structured Eligibility Extractor.py"],
-                     caller_file=path, caller_globals=ns, chain_label="base")
+if chain_list:
+    ns["exec_chain"](chain_list, caller_file=path, caller_globals=ns,
+                     chain_label="base")
 before = set(ns)
 
 with open(path, encoding="utf-8") as fh:
@@ -1788,6 +2235,21 @@ print(json.dumps(sorted(k for k in ns
 
 _SHIM_BASE_CHAIN = {
     "13- LangGraph Agent.py": ["01- Imports.py", "02- Utility Functions.py"],
+    # File 05's shim exec's 01, 02 AND 03 raw, then chains 07 and 08 for File 34.
+    # Same treatment as File 13: run the base first, record what is there, and
+    # report only what the shim itself added.
+    "05- FHIR Clean Data.py": ["01- Imports.py", "02- Utility Functions.py",
+                               "03- Config.py"],
+}
+
+# WHICH CHAIN THE PROBE RUNS AFTER THE BASE FILES. File 13 chains 03, 08, 09 and
+# 10; File 05 chains only 07 and 08. Keyed by file so nothing in the loop below
+# is special-cased.
+_SHIM_CHAIN_LIST = {
+    "13- LangGraph Agent.py": ["03- Config.py", "08- Cancer Code Registry.py",
+                               "09- MeSH Cancer Site Relevance Filter.py",
+                               "10- Structured Eligibility Extractor.py"],
+    "05- FHIR Clean Data.py": ["07- FHIR Parser.py", "08- Cancer Code Registry.py"],
 }
 
 # Files 08, 09 and 10 (pass 2a) and Files 07 and 14 (pass 2b) are checked by the
@@ -1797,16 +2259,19 @@ _SHIM_BASE_CHAIN = {
 _RUNTIME_INVENTORY = dict(_PRE_2A_RUNTIME_NAMES)
 _RUNTIME_INVENTORY.update(_PRE_2B_RUNTIME_NAMES)
 _RUNTIME_INVENTORY.update(_PRE_2C_RUNTIME_NAMES)
+_RUNTIME_INVENTORY.update(_PRE_3A_RUNTIME_NAMES)
 
 _RUNTIME_COUNTS = dict(_PRE_2A_COUNTS)
 _RUNTIME_COUNTS.update(_PRE_2B_COUNTS)
 _RUNTIME_COUNTS.update(_PRE_2C_COUNTS)
+_RUNTIME_COUNTS.update(_PRE_3A_COUNTS)
 
 _RUNTIME_ADDED = {name: set() for name in _PRE_2A_RUNTIME_NAMES}
 _RUNTIME_ADDED.update(_PASS_2B_ADDED)
 _RUNTIME_ADDED.update(_PASS_2C_ADDED)
+_RUNTIME_ADDED.update(_PASS_3A_ADDED)
 
-check("the inventory covers all six converted files",
+check("the inventory covers all seven converted files",
       sorted(_RUNTIME_INVENTORY), sorted(_PASS_2B_DROPPED))
 
 for _filename, _expected in _RUNTIME_INVENTORY.items():
@@ -1815,7 +2280,8 @@ for _filename, _expected in _RUNTIME_INVENTORY.items():
 
     _proc = subprocess.run(
         [sys.executable, "-c", _SHIM_PROBE, os.path.join(_code_dir, _filename),
-         json.dumps(_SHIM_BASE_CHAIN.get(_filename, []))],
+         json.dumps(_SHIM_BASE_CHAIN.get(_filename, [])),
+         json.dumps(_SHIM_CHAIN_LIST.get(_filename, []))],
         cwd=_ELSEWHERE, capture_output=True, text=True,
         env={**{k: v for k, v in os.environ.items() if k != "PYTHONPATH"},
              **({"PYTHONPATH": _FALLBACK_PATH} if _FALLBACK_PATH else {}),
@@ -1946,6 +2412,207 @@ check("the one name they DO share is _is_negated, and it lives in negation.py",
       ["_is_negated"])
 check("...and both halves import it rather than redefining it",
       "_is_negated" in _STAGE_DEFS or "_is_negated" in _HIST_DEFS, False)
+
+
+# ===========================================================================
+# 5c. THE LAZY DEPENDENCY PROXY ANSWERS FOR WHAT IT WRAPS, NOT FOR ITSELF
+# ===========================================================================
+
+print("\n" + "=" * 78)
+print("5c. _LazyAgentDependency delegates bool / len / iter / in / == / repr")
+print("=" * 78)
+
+# THE DEFECT, and it is a set of WRONG ANSWERS rather than a missing feature.
+#
+# Pass 2c bound medcpt_tokenizer, medcpt_model and _bm25_query_model in File 13's
+# shim to a proxy that forwarded __getattr__ and __call__ and nothing else, on
+# the stated grounds that "call it or read an attribute off it" is the whole
+# surface any caller uses. That was true of the three callers that existed then;
+# it was not true of Python. CPython looks an IMPLICIT special method up on the
+# TYPE, never through __getattr__, so:
+#
+#   bool(proxy)    -> True, always, whatever the wrapped object says
+#   proxy == other -> False, always, by identity -- even when the wrapped object
+#                     IS `other`. The whole point of a proxy over this seam is
+#                     that a harness can ask "is the thing the agent reaches
+#                     mine?", and == answered no while the answer was yes.
+#   len / iter / in -> TypeError naming _LazyAgentDependency, which sends the
+#                     reader to the wrapper instead of to the model.
+#   repr(proxy)    -> "<lazy ...>" even when an override is installed, i.e. a
+#                     description of the wrapper at the one moment a person is
+#                     looking to find out what they actually got.
+#
+# EAGER BINDING IS NOT THE FIX and was rejected on evidence:
+# ONCOTRIAGE_DEFER_LOCAL_MODELS appears in exactly two files in this repository,
+# File 13 and File 46, so Files 31, 32, 35, 36, 37, 39 and 40 all chain File 13
+# with the switch unset and none of them scores a pair. Binding eagerly would
+# load MedCPT (~110 MB) and FastEmbed for all seven.
+#
+# THE DEMONSTRATION RUNS BOTH CLASSES. The current class is extracted from File
+# 13 by ast and exec'd into a throwaway namespace; a copy of it with the six
+# delegating methods REMOVED stands in for the pass-2c version. Both wrap the
+# same sentinel, whose every protocol answer is unambiguous, and the old one must
+# get them wrong. Nothing is edited in place.
+
+_PROXY_DEMO = r'''
+import ast, json, sys
+
+STRIPPED = {"__bool__", "__len__", "__iter__", "__contains__", "__eq__",
+            "__hash__"}
+
+source = open(sys.argv[1], encoding="utf-8").read()
+node = next(n for n in ast.parse(source).body
+            if isinstance(n, ast.ClassDef) and n.name == "_LazyAgentDependency")
+
+new_ns, old_ns = {}, {}
+exec(ast.unparse(node), new_ns)
+
+# The pass-2c shape: the same class with the six delegating methods removed and
+# __repr__ put back the way it was.
+old_node = ast.parse(ast.unparse(node)).body[0]
+old_node.body = [b for b in old_node.body
+                 if not (isinstance(b, ast.FunctionDef) and b.name in STRIPPED)]
+for b in old_node.body:
+    if isinstance(b, ast.FunctionDef) and b.name == "__repr__":
+        b.body = ast.parse(
+            "return f\"<lazy {object.__getattribute__(self, '_label')} via "
+            "oncotriage.agent.deps>\"").body
+exec(ast.unparse(old_node), old_ns)
+
+
+class Sentinel:
+    marker = "forwarded by __getattr__"
+
+    def __call__(self, *args):
+        return ["called", list(args)]
+
+    def __bool__(self):
+        return False                      # falsy: bool(proxy) must be False
+
+    def __len__(self):
+        return 3
+
+    def __iter__(self):
+        return iter(("a", "b", "c"))
+
+    def __contains__(self, item):
+        return item == "a"
+
+    def __eq__(self, other):
+        return other is self or other == "i am the sentinel"
+
+    def __hash__(self):
+        return 4242
+
+    def __repr__(self):
+        return "<Sentinel: the object the agent actually reaches>"
+
+
+SENTINEL = Sentinel()
+
+TRUTH = {
+    "bool": False,
+    "len": 3,
+    "iter": ["a", "b", "c"],
+    "contains": True,
+    "eq_identity": True,
+    "eq_value": True,
+    "repr": "<Sentinel: the object the agent actually reaches>",
+    "hash": True,
+    "getattr": "forwarded by __getattr__",
+    "call": ["called", [1, 2]],
+}
+
+
+def observe(cls):
+    proxy = cls(lambda: SENTINEL, "sentinel dependency")
+    out = {}
+    for key, thunk in (
+        ("bool", lambda: bool(proxy)),
+        ("len", lambda: len(proxy)),
+        ("iter", lambda: list(proxy)),
+        ("contains", lambda: "a" in proxy),
+        ("eq_identity", lambda: proxy == SENTINEL),
+        ("eq_value", lambda: proxy == "i am the sentinel"),
+        ("repr", lambda: repr(proxy)),
+        ("hash", lambda: hash(proxy) == 4242),
+        ("getattr", lambda: proxy.marker),
+        ("call", lambda: proxy(1, 2)),
+    ):
+        try:
+            out[key] = thunk()
+        except Exception as exc:                                # noqa: BLE001
+            out[key] = "!!" + type(exc).__name__
+    return out
+
+
+old, new = observe(old_ns["_LazyAgentDependency"]), observe(new_ns["_LazyAgentDependency"])
+
+# A __repr__ that RAISES would break every traceback, debugger and log line that
+# formats one of these three names, so a failed resolution is caught, RECORDED
+# and described. Both halves are checked.
+Cls = new_ns["_LazyAgentDependency"]
+
+
+def _boom():
+    raise RuntimeError("model not loaded")
+
+
+exploding = Cls(_boom, "exploding dependency")
+before = len(Cls.repr_failures)
+text = repr(exploding)
+
+print(json.dumps({
+    "old_wrong": sorted(k for k, v in old.items() if v != TRUTH[k]),
+    "new_wrong": sorted(k for k, v in new.items() if v != TRUTH[k]),
+    "repr_did_not_raise": True,
+    "repr_names_the_error": "RuntimeError" in text and "model not loaded" in text,
+    "repr_failure_recorded": len(Cls.repr_failures) == before + 1,
+}))
+'''
+
+_rc, _out, _err = _run(_PROXY_DEMO.replace("sys.argv[1]",
+                                           repr(os.path.join(_code_dir,
+                                                             "13- LangGraph Agent.py"))),
+                       cwd=_ELSEWHERE, extra_path=_FALLBACK_PATH)
+check("the lazy-proxy demonstration ran", _rc, 0)
+if _rc != 0:
+    fail("lazy-proxy demonstration",
+         f"exit {_rc}; stderr tail: {_err.strip().splitlines()[-4:]}")
+else:
+    _payload = _last_json(_out) or {}
+    # NON-DEGENERATE FIRST, and this is the half that makes the rest evidence
+    # rather than assertion: the OLD shape must be shown to get these wrong. A
+    # demonstration where both classes pass proves only that the sentinel was
+    # too weak to tell them apart.
+    check("the pass-2c proxy shape answers bool, len, iter, in, ==, hash and "
+          "repr WRONGLY about the object it wraps",
+          _payload.get("old_wrong"),
+          ["bool", "contains", "eq_identity", "eq_value", "hash", "iter",
+           "len", "repr"])
+    check("...while __getattr__ and __call__ were right even then, so the "
+          "difference is the six protocols and nothing else",
+          sorted(set(_payload.get("old_wrong") or []) & {"getattr", "call"}), [])
+    check("the shipped proxy gets every one of the ten right",
+          _payload.get("new_wrong"), [])
+    check("__repr__ over a failing accessor does NOT raise",
+          _payload.get("repr_did_not_raise"), True)
+    check("...and names the exception instead of hiding it",
+          _payload.get("repr_names_the_error"), True)
+    check("...and RECORDS the failure rather than swallowing it",
+          _payload.get("repr_failure_recorded"), True)
+
+# The forwarded set is CLOSED and documented. Asserted from the class body so
+# that adding a delegation without saying so in the docstring fails here.
+_AGENT_SHIM = os.path.join(_code_dir, "13- LangGraph Agent.py")
+_PROXY_NODE = next(n for n in ast.parse(open(_AGENT_SHIM, encoding="utf-8").read()).body
+                   if isinstance(n, ast.ClassDef) and n.name == "_LazyAgentDependency")
+_PROXY_METHODS = sorted(b.name for b in _PROXY_NODE.body
+                        if isinstance(b, ast.FunctionDef))
+check("the proxy forwards exactly the documented set and nothing more",
+      _PROXY_METHODS,
+      ["__bool__", "__call__", "__contains__", "__eq__", "__getattr__",
+       "__hash__", "__init__", "__iter__", "__len__", "__repr__", "_resolve"])
 
 
 # ===========================================================================

@@ -267,25 +267,128 @@ class _LazyAgentDependency:
     installed after this file was chained must take effect. That is what keeps
     ONCOTRIAGE_DEFER_LOCAL_MODELS=1 plus a replay override working when both
     arrive after the chain has run.
+
+    WHAT IT FORWARDS, and why the list grew in pass 20c-3a
+    ------------------------------------------------------
+    Pass 2c forwarded ``__getattr__`` and ``__call__`` and nothing else, on the
+    stated grounds that "call it or read an attribute off it" is the whole
+    surface any caller uses. That was true of the three callers that existed. It
+    was not true of PYTHON, and the gap is not a missing feature -- it is a set
+    of WRONG ANSWERS, because ``__getattr__`` is not consulted for an implicit
+    special-method lookup. CPython looks those up on the TYPE:
+
+        bool(proxy)     -> True, always, whatever the wrapped object says.
+                           A wrapped object with __bool__ returning False, or
+                           with __len__ returning 0, reads as truthy.
+        proxy == other  -> False, always, by identity -- even when the wrapped
+                           object IS `other`. This is the dangerous one: the
+                           whole point of a proxy over this seam is that a
+                           harness can ask "is the thing the agent reaches
+                           mine?", and `==` answered no while the answer was
+                           yes.
+        len / iter / in -> TypeError naming _LazyAgentDependency, which sends a
+                           reader to this class instead of to the model.
+
+    Every one of those is a confident answer about an object the proxy never
+    consulted. So each is now defined and each RESOLVES and DELEGATES.
+
+    THE SET IS CLOSED, AND THAT IS THE CONTRACT. Anything outside
+
+        __getattr__  __setattr__(no)  __call__  __bool__  __len__  __iter__
+        __contains__  __eq__  __ne__(derived)  __hash__  __repr__
+
+    is NOT forwarded and will answer for the PROXY rather than for the wrapped
+    object -- ``+``, ``[]``, ``with``, ``str()``, ``format()``, ``copy``,
+    ``pickle``, ``isinstance`` and the rest. This is a deliberate stopping point,
+    not an oversight: a full transparent proxy means forwarding some ninety
+    dunders, and every one of them is another place a resolution can fire from
+    somewhere nobody expected. The three names bound below are a tokenizer, a
+    cross-encoder and a sparse encoder; none of them is added, indexed, or
+    entered as a context manager. If a caller ever needs one of those, add it
+    HERE rather than reaching around the proxy.
+
+    WHY EAGER BINDING IS NOT THE ANSWER. The obvious alternative is to drop the
+    proxy and bind the real objects. That reintroduces exactly what pass 2c
+    removed: ONCOTRIAGE_DEFER_LOCAL_MODELS appears in only two files in this
+    repository -- this one and "46- Fixture Replay.py" -- so Files 31, 32, 35,
+    36, 37, 39 and 40 all chain File 13 with the switch unset and none of them
+    scores a pair. Eager binding would load MedCPT (~110 MB) and FastEmbed for
+    all seven.
+
+    __repr__ COSTS A RESOLUTION, and that is stated rather than hidden.
+    Delegating it is what makes `print(medcpt_model)` describe the model instead
+    of describing the wrapper, which is the honest answer once an override is
+    installed -- a proxy that still printed "<lazy MedCPT cross-encoder>" while
+    handing the agent a fixture stub would be lying in the one place a person
+    looks when they are already confused. The cost is real: a repr in a debugger
+    triggers the model load, and transformers' own repr is a multi-thousand-line
+    module tree. A repr that RAISES would be worse than either -- it breaks
+    every debugger, traceback and log line that formats the object -- so a
+    resolution failure is caught, RECORDED in repr_failures (never silently),
+    and reported as a description naming the exception.
     """
 
     __slots__ = ("_accessor", "_label")
+
+    # Not a counter but the failures themselves, because there is exactly one
+    # way to reach this list and a bare count would not say which accessor
+    # failed. Class-level on purpose: a module-level name here would land in the
+    # shared exec namespace that "47- Package Split Test.py" section 5 pins.
+    repr_failures = []
 
     def __init__(self, accessor, label):
         object.__setattr__(self, "_accessor", accessor)
         object.__setattr__(self, "_label", label)
 
     def _resolve(self):
-        return self._accessor()
+        return object.__getattribute__(self, "_accessor")()
 
     def __getattr__(self, attr):
-        return getattr(object.__getattribute__(self, "_accessor")(), attr)
+        return getattr(self._resolve(), attr)
 
     def __call__(self, *args, **kwargs):
-        return object.__getattribute__(self, "_accessor")()(*args, **kwargs)
+        return self._resolve()(*args, **kwargs)
+
+    def __bool__(self):
+        return bool(self._resolve())
+
+    def __len__(self):
+        return len(self._resolve())
+
+    def __iter__(self):
+        return iter(self._resolve())
+
+    def __contains__(self, item):
+        return item in self._resolve()
+
+    def __eq__(self, other):
+        # A proxy on the right-hand side is unwrapped too, so proxy == proxy
+        # compares the two wrapped objects rather than comparing a resolved
+        # object against a wrapper it can never equal.
+        if isinstance(other, _LazyAgentDependency):
+            other = other._resolve()
+        return self._resolve() == other
+
+    def __hash__(self):
+        # Defining __eq__ sets __hash__ to None, which would make these three
+        # names unhashable -- a silent new failure introduced by a fix. It
+        # delegates rather than falling back to id() because a hash that
+        # disagrees with __eq__ is a broken dict key, and __eq__ delegates.
+        return hash(self._resolve())
 
     def __repr__(self):
-        return f"<lazy {object.__getattribute__(self, '_label')} via oncotriage.agent.deps>"
+        label = object.__getattribute__(self, "_label")
+        try:
+            return repr(self._resolve())
+        except Exception as exc:                      # noqa: BLE001
+            # Recorded, not swallowed. Re-raising is not an option: a raising
+            # __repr__ breaks tracebacks, debuggers and logging for everyone,
+            # including whoever is trying to diagnose this very failure.
+            _LazyAgentDependency.repr_failures.append(
+                f"{label}: {type(exc).__name__}: {exc}"
+            )
+            return (f"<unresolved {label} via oncotriage.agent.deps: "
+                    f"{type(exc).__name__}: {exc}>")
 
 
 medcpt_tokenizer  = _LazyAgentDependency(deps.get_medcpt_tokenizer, "MedCPT tokenizer")

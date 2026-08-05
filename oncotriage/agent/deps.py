@@ -56,7 +56,12 @@ WHAT IS OVERRIDABLE, and why each one is on the list
 ----------------------------------------------------
     OPENAI_CLIENT      Stage 2's embedding call and Stage 5's chat call.
     QDRANT_CLIENT      every retrieval query and both scroll paths.
-    BM25_QUERY_MODEL   the FastEmbed sparse query encoder.
+    BM25_QUERY_MODEL   the FastEmbed sparse query encoder. As of pass 3a its
+                       default is NOT built here — it comes from
+                       ``oncotriage.embedding``, the one construction site in
+                       the package, shared with the indexer that produced the
+                       document vectors it is scored against. The deferral
+                       switch is still consulted here, above that delegation.
     MEDCPT_TOKENIZER   the two halves of the cross-encoder. Overridable
     MEDCPT_MODEL       separately from the scorer so a caller can replace the
                        model without replacing the scoring function.
@@ -111,7 +116,7 @@ value that must not change mid-process. An override always wins over it.
 import os
 import threading
 
-from oncotriage import config
+from oncotriage import config, embedding
 from oncotriage.registries.cancer_code_registry import load_lab_registry, load_registry
 from oncotriage.registries.mesh import load_mesh_filter
 
@@ -289,28 +294,39 @@ class override:
 
 
 def _resolve(key, factory):
-    """Override, else cached, else build once and cache.
+    """Override, else cached, else build once and cache. ALL UNDER THE LOCK.
 
-    The override is checked WITHOUT the lock first. That read is atomic under
-    the GIL, and it is the hot path — every Qdrant query in a 22k-patient run
-    goes through it — while an override is installed exactly once by a test
-    harness on one thread.
+    THE UNLOCKED FAST PATH THIS REPLACES (pass 20c-3a).
+    -------------------------------------------------
+    Pass 2c read ``_OVERRIDES`` and then ``_CACHE`` OUTSIDE the lock, and took
+    the lock only to build. The argument written beside it was that the dict
+    read is atomic under the GIL and an override is installed exactly once, by
+    a test harness, on one thread. Both halves of that are true and neither is
+    sufficient:
+
+      * ``_OVERRIDES.get`` being atomic says the reader sees either the old
+        value or the new one. It says nothing about the SEQUENCE. A thread that
+        reads ``_OVERRIDES`` (absent), is descheduled, and resumes after another
+        thread has installed an override goes on to read ``_CACHE`` and returns
+        the REAL client while an override is installed. That is the exact
+        failure this module exists to prevent -- a live OpenAI call inside a
+        harness that reports it made none -- and it is silent.
+      * "one harness, one thread" is a property of today's five callers, not of
+        the seam. ``25- Batch Runner.py`` drives MAX_WORKERS = 12 threads through
+        every accessor here, and pass 20c-3a puts the indexer and the validator
+        on the same seam. A correctness argument that rests on nobody else ever
+        calling this is not a correctness argument.
+
+    So the whole sequence is inside the lock. It is an RLock, so the factory
+    calling back into another accessor still works, and the cost is one
+    uncontended acquire per dependency read -- nanoseconds against a Qdrant
+    round trip.
     """
-    value = _OVERRIDES.get(key, UNSET)
-    if not isinstance(value, _Unset):
-        return value
-
-    cached = _CACHE.get(key, UNSET)
-    if not isinstance(cached, _Unset):
-        return cached
-
     with _LOCK:
-        # Re-checked under the lock. An override installed between the read
-        # above and the acquire must win over anything this thread would build,
-        # and a value another thread finished building must not be built twice.
         value = _OVERRIDES.get(key, UNSET)
         if not isinstance(value, _Unset):
             return value
+
         cached = _CACHE.get(key, UNSET)
         if not isinstance(cached, _Unset):
             return cached
@@ -435,19 +451,30 @@ def _build_medcpt_model():
 
 
 def _build_bm25_query_model():
+    # THE MODEL IS NOT CONSTRUCTED HERE ANY MORE (pass 20c-3a). It comes from
+    # oncotriage.embedding, which is the ONE construction site in the package.
+    #
+    # It used to be built here, and File 11 built a second one at index time
+    # from the same model name -- the two halves of one job, wired up
+    # independently. BM25 sparse vectors are token-ID vectors over the model's
+    # vocabulary, so a change on one side silently scores queries against the
+    # wrong terms: Qdrant returns results, nothing raises, no counter moves, and
+    # only retrieval quality falls. File 13's own comment said the two were the
+    # same model; nothing enforced it. Now one accessor does, and
+    # "47- Package Split Test.py" section 2f asserts the construction count is
+    # exactly 1.
+    #
+    # THE DEFERRAL CHECK STAYS HERE, ABOVE THE DELEGATION, and that is the whole
+    # reason this function survives rather than get_bm25_query_model pointing
+    # straight at embedding. The switch is about the AGENT's replay path. The
+    # indexer has no replay path, and an index built from a placeholder would be
+    # written to Qdrant and swapped onto the live alias looking exactly like a
+    # real one.
     if _DEFER_LOCAL_MODELS:
         print(f"{DEFER_LOCAL_MODELS_ENV}=1 — skipping the FastEmbed BM25 load.")
         return _DeferredLocalModel("FastEmbed BM25 query model")
 
-    from fastembed import SparseTextEmbedding
-
-    # Used at query time to generate sparse query vectors for Qdrant BM25
-    # search. Same model used at index time (File 11) to generate document
-    # sparse vectors. Loaded once, reused for every patient.
-    print("Loading BM25 sparse query model (FastEmbed)...")
-    model = SparseTextEmbedding(model_name="Qdrant/bm25")
-    print("BM25 sparse query model loaded.\n")
-    return model
+    return embedding.get_bm25_sparse_model()
 
 
 #------------------------------------------------------------------------------
