@@ -11,6 +11,36 @@
 # All status checks and DAG triggering use the REST API v2 via requests.
 #
 ###############################################################################
+# ===========================================================================
+# EXEC CHAIN: 01
+# ===========================================================================
+# The functions below read airflow_path, os, Path, subprocess, json,
+# requests and time -- all from 01- Imports.py. A first pass over this
+# file with a plain AST walk also reported 'attempt', 'name' and
+# 'candidate' as free and attributed them to 01/02; they are function
+# locals and comprehension targets. A scope-aware symtable pass, which is
+# what settled this list, does not report them. 02 and 03 are not needed.
+#
+# Item 20a: this file sits in the code directory, so __file__ locates it with
+# no hardcoded path. __file__ is bound when the file is run as a script (every
+# documented entry point for it) and when Spyder runfile()s it. In a bare
+# interactive paste it is not bound, and the working directory is the only
+# remaining candidate -- taken, but announced, never silently.
+import os as _os_boot
+if "__file__" in globals():
+    _code_dir = _os_boot.path.dirname(_os_boot.path.abspath(__file__)) + _os_boot.sep
+else:
+    _code_dir = _os_boot.getcwd() + _os_boot.sep
+    print(f"[Bootstrap] __file__ unbound; using the working directory as the code directory: {_code_dir}")
+del _os_boot
+
+with open(_code_dir + "01- Imports.py") as _fh:
+    exec(_fh.read(), globals())
+
+
+#------------------------------------------------------------------------------
+
+
 
 
 # =============================================================================
@@ -345,18 +375,27 @@ def trigger_dag():
 # =============================================================================
 # USAGE: Uncomment ONE of the following to run
 # =============================================================================
+# Item 20b: start_airflow() was called here unguarded. Loading this file --
+# reading it into any namespace for any reason -- launched two long-lived
+# server processes with subprocess.Popen and left them running. That is the
+# heaviest import-time side effect in the codebase, and it is why item 20b's
+# own instructions say not to run this file.
+#
+# Behind the guard, loading does nothing and
+# `python "24- Airflow Manager.py"` behaves exactly as before.
+if __name__ == "__main__":
 
-# First time: Start services
-start_airflow()
+    # First time: Start services
+    start_airflow()
 
-# After setting AIRFLOW_PASSWORD: Check status
-# check_dag_status()
+    # After setting AIRFLOW_PASSWORD: Check status
+    # check_dag_status()
 
-# Manually trigger a run
-# trigger_dag()
+    # Manually trigger a run
+    # trigger_dag()
 
-# When done: Stop services
-# stop_airflow()
+    # When done: Stop services
+    # stop_airflow()
 
 
 #------------------------------------------------------------------------------

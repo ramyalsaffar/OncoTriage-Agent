@@ -5,75 +5,24 @@
 #------------------------------------------------------------------------------
 
 
-# Connect
-# It will create it if deos not exist, and it won't override if it does.
-conn = sqlite3.connect(inferences_path)
-
-
-# Create cursor
-cursor = conn.cursor()
-
-
-#------------------------------------------------------------------------------
-
-
-# Inferences table
-# candidates_filtered INTEGER is for trials sent to GPT-4o (after quality threshold + cost cap)
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS inferences (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    patient_id TEXT NOT NULL,
-    timestamp TEXT NOT NULL,
-    age INTEGER,
-    sex TEXT,
-    race TEXT, 
-    ethnicity TEXT,
-    primary_condition TEXT,
-    condition_count INTEGER,
-    medication_count INTEGER,
-    allergy_count INTEGER,
-    expanded_query TEXT,
-    candidates_retrieved INTEGER,
-    candidates_reranked INTEGER,
-    bm25_retrieved INTEGER,
-    vector_retrieved INTEGER,
-    candidates_after_rule_filter INTEGER,
-    candidates_after_quality_filter INTEGER,
-    candidates_filtered INTEGER,
-    mesh_dropped INTEGER,
-    mesh_resolution TEXT,
-    stage_dropped INTEGER,
-    histology_dropped INTEGER,
-    candidates_evaluated INTEGER,
-    eligible_matches INTEGER,
-    near_misses INTEGER,
-    not_evaluable_trials INTEGER,
-    cross_vocab_remaps INTEGER,
-    query_expansion_time REAL,
-    hybrid_retrieval_time REAL,
-    cross_encoder_time REAL,
-    rule_filter_time REAL,
-    gpt4o_evaluation_time REAL,
-    total_time REAL,
-    gpt4o_prompt TEXT,
-    gpt4o_input_tokens INTEGER,
-    gpt4o_output_tokens INTEGER,
-    matching_model TEXT,
-    cross_encoder_model TEXT,
-    pricing_version TEXT,
-    estimated_cost_usd REAL,
-    qdrant_collection TEXT,
-    error TEXT,
-    patient_data_hash TEXT,
-    expansion_prompt TEXT,
-    gpt4o_retries INTEGER,
-    ablation_flags TEXT,
-    hallucinated_trials INTEGER,
-    ecog_value INTEGER,
-    ecog_selection TEXT,
-    ecog_observations_found INTEGER
-)
-''')
+# Item 20b: schema creation is a function, not a module body.
+#
+# Loading this file used to open the production database and run every CREATE
+# TABLE and every additive migration as a side effect of the exec chain. Nine
+# other files load 14 or are loaded beside it; each of them was touching
+# inferences.db just by being read. A file must be loadable without writing to
+# anything.
+#
+# What moved: only the executable statements. The two COLUMN_ADDITIONS dicts
+# stay at module level, byte for byte, because they are pure data and because
+# 40- ECOG Logging Test.py reads INFERENCE_COLUMN_ADDITIONS directly. The
+# migration loops are unchanged; they are what adds a column without destroying
+# rows, and items 29b and 20a both depend on that.
+#
+# The SQL is still written flush against column 0 inside its triple-quoted
+# strings even though it now sits inside a function. Indenting those lines
+# would change the CREATE text SQLite stores in sqlite_master.sql, so the
+# schema would no longer be identical to the one this file produced before.
 
 
 #------------------------------------------------------------------------------
@@ -244,39 +193,8 @@ INFERENCE_COLUMN_ADDITIONS = {
     "gpt4o_reasoning_tokens":       "INTEGER",
 }
 
-_existing_inference_columns = {
-    row[1] for row in cursor.execute("PRAGMA table_info(inferences)")
-}
-for _column, _sql_type in INFERENCE_COLUMN_ADDITIONS.items():
-    if _column not in _existing_inference_columns:
-        cursor.execute(f"ALTER TABLE inferences ADD COLUMN {_column} {_sql_type}")
-        print(f"Schema migration: added inferences.{_column}")
-
 
 #------------------------------------------------------------------------------
-
-
-# Trial matches table
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS trial_matches (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    inference_id INTEGER NOT NULL,
-    nct_id TEXT NOT NULL,
-    trial_title TEXT,
-    trial_phase TEXT,
-    trial_number INTEGER,
-    rerank_score REAL,
-    rerank_score_raw REAL,
-    mesh_boost REAL,
-    mesh_boost_tier TEXT,
-    match_score REAL,
-    eligible TEXT,
-    explanation TEXT,
-    criterion_details TEXT,
-    hallucinated INTEGER,
-    FOREIGN KEY (inference_id) REFERENCES inferences(id)
-)
-''')
 
 
 # Schema migration for the trial_matches table (same reasoning as above).
@@ -304,20 +222,159 @@ TRIAL_MATCH_COLUMN_ADDITIONS = {
     "hallucinated":            "INTEGER",
 }
 
-_existing_trial_match_columns = {
-    row[1] for row in cursor.execute("PRAGMA table_info(trial_matches)")
-}
-for _column, _sql_type in TRIAL_MATCH_COLUMN_ADDITIONS.items():
-    if _column not in _existing_trial_match_columns:
-        cursor.execute(f"ALTER TABLE trial_matches ADD COLUMN {_column} {_sql_type}")
-        print(f"Schema migration: added trial_matches.{_column}")
-
 
 #------------------------------------------------------------------------------
 
 
-# Drift metrics table
-cursor.execute('''
+# Who calls initialize_database(), and when.
+#
+# Both, deliberately:
+#
+#   - Any caller may call it explicitly to build or migrate a database at a
+#     path of its choosing. That is what makes it testable without
+#     monkey-patching a global, which is why it takes db_path as an argument.
+#
+#   - log_inference() ensures the schema itself, once per resolved path,
+#     immediately before its first write.
+#
+# The second is not redundancy, it is the answer to "what stops a caller that
+# never called it from writing to a database with no tables". Relying on entry
+# points alone would fail silently here: log_inference deliberately swallows
+# sqlite3.Error so a logging fault cannot kill the pipeline, so a missing table
+# would surface as one "Database logging failed" line per patient and a run
+# that records nothing. Worse, the tests that repoint inferences_path at a
+# temporary file (36, 37, 38, 40, 45) would each need a new explicit call, and
+# any future caller that forgot one would get the same silent hole.
+#
+# Ensuring on first use makes the never-initialized state unreachable rather
+# than merely detectable. The cost is one connection per distinct path per
+# process; _INITIALIZED_DATABASES keys on the resolved absolute path so a test
+# that repoints inferences_path is initialized again, and a batch run of 22k
+# patients pays for it once.
+#
+# The path is recorded only after the work succeeds, so a failed attempt is
+# retried on the next call instead of being remembered as done.
+_INITIALIZED_DATABASES = set()
+
+
+def initialize_database(db_path):
+    """Create the three tables at db_path and apply the additive migrations.
+
+    Idempotent: every CREATE is IF NOT EXISTS and every ALTER is guarded by a
+    PRAGMA table_info check, so calling this on an existing database adds only
+    what is missing and destroys nothing.
+
+    Returns the resolved absolute path, so a caller can log where it wrote.
+    """
+    # Connect
+    # It will create it if deos not exist, and it won't override if it does.
+    conn = sqlite3.connect(db_path)
+
+    # Create cursor
+    cursor = conn.cursor()
+
+    # Inferences table
+    # candidates_filtered INTEGER is for trials sent to GPT-4o (after quality threshold + cost cap)
+    cursor.execute('''
+CREATE TABLE IF NOT EXISTS inferences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    patient_id TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    age INTEGER,
+    sex TEXT,
+    race TEXT, 
+    ethnicity TEXT,
+    primary_condition TEXT,
+    condition_count INTEGER,
+    medication_count INTEGER,
+    allergy_count INTEGER,
+    expanded_query TEXT,
+    candidates_retrieved INTEGER,
+    candidates_reranked INTEGER,
+    bm25_retrieved INTEGER,
+    vector_retrieved INTEGER,
+    candidates_after_rule_filter INTEGER,
+    candidates_after_quality_filter INTEGER,
+    candidates_filtered INTEGER,
+    mesh_dropped INTEGER,
+    mesh_resolution TEXT,
+    stage_dropped INTEGER,
+    histology_dropped INTEGER,
+    candidates_evaluated INTEGER,
+    eligible_matches INTEGER,
+    near_misses INTEGER,
+    not_evaluable_trials INTEGER,
+    cross_vocab_remaps INTEGER,
+    query_expansion_time REAL,
+    hybrid_retrieval_time REAL,
+    cross_encoder_time REAL,
+    rule_filter_time REAL,
+    gpt4o_evaluation_time REAL,
+    total_time REAL,
+    gpt4o_prompt TEXT,
+    gpt4o_input_tokens INTEGER,
+    gpt4o_output_tokens INTEGER,
+    matching_model TEXT,
+    cross_encoder_model TEXT,
+    pricing_version TEXT,
+    estimated_cost_usd REAL,
+    qdrant_collection TEXT,
+    error TEXT,
+    patient_data_hash TEXT,
+    expansion_prompt TEXT,
+    gpt4o_retries INTEGER,
+    ablation_flags TEXT,
+    hallucinated_trials INTEGER,
+    ecog_value INTEGER,
+    ecog_selection TEXT,
+    ecog_observations_found INTEGER
+)
+''')
+
+
+    _existing_inference_columns = {
+        row[1] for row in cursor.execute("PRAGMA table_info(inferences)")
+    }
+    for _column, _sql_type in INFERENCE_COLUMN_ADDITIONS.items():
+        if _column not in _existing_inference_columns:
+            cursor.execute(f"ALTER TABLE inferences ADD COLUMN {_column} {_sql_type}")
+            print(f"Schema migration: added inferences.{_column}")
+
+
+    # Trial matches table
+    cursor.execute('''
+CREATE TABLE IF NOT EXISTS trial_matches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    inference_id INTEGER NOT NULL,
+    nct_id TEXT NOT NULL,
+    trial_title TEXT,
+    trial_phase TEXT,
+    trial_number INTEGER,
+    rerank_score REAL,
+    rerank_score_raw REAL,
+    mesh_boost REAL,
+    mesh_boost_tier TEXT,
+    match_score REAL,
+    eligible TEXT,
+    explanation TEXT,
+    criterion_details TEXT,
+    hallucinated INTEGER,
+    FOREIGN KEY (inference_id) REFERENCES inferences(id)
+)
+''')
+
+
+    _existing_trial_match_columns = {
+        row[1] for row in cursor.execute("PRAGMA table_info(trial_matches)")
+    }
+    for _column, _sql_type in TRIAL_MATCH_COLUMN_ADDITIONS.items():
+        if _column not in _existing_trial_match_columns:
+            cursor.execute(f"ALTER TABLE trial_matches ADD COLUMN {_column} {_sql_type}")
+            print(f"Schema migration: added trial_matches.{_column}")
+
+
+    # Drift metrics table
+    cursor.execute('''
 CREATE TABLE IF NOT EXISTS drift_metrics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TEXT NOT NULL,
@@ -337,12 +394,26 @@ CREATE TABLE IF NOT EXISTS drift_metrics (
 ''')
 
 
-#------------------------------------------------------------------------------
+    conn.commit()
+    conn.close()
+    print(f"Database initialized at: {db_path}")
+
+    _INITIALIZED_DATABASES.add(os.path.abspath(db_path))
+    return os.path.abspath(db_path)
 
 
-conn.commit()
-conn.close()
-print(f"Database initialized at: {inferences_path}")
+def _ensure_database(db_path):
+    """Initialize db_path unless this process already did.
+
+    Called by log_inference before its first write. Kept separate from
+    initialize_database so an explicit caller always gets the real work done
+    (a caller who deleted the file and wants it rebuilt calls that one), while
+    the hot path pays the cost once.
+    """
+    resolved = os.path.abspath(db_path)
+    if resolved in _INITIALIZED_DATABASES:
+        return resolved
+    return initialize_database(db_path)
 
 
 #------------------------------------------------------------------------------
@@ -462,6 +533,15 @@ def log_inference(result: Dict, patient_data: Dict):
 
     conn = None
     try:
+        # Item 20b: the schema is no longer created when this file is loaded,
+        # so it is ensured here, once per resolved path, before the first
+        # write. Inside the try on purpose: a table that cannot be created is
+        # a database failure, and this function's contract is that database
+        # failures are reported and do not kill the pipeline. That is the
+        # opposite of get_model_cost() above, which is outside the try because
+        # an unpriced model is a configuration defect, not a database one.
+        _ensure_database(inferences_path)
+
         conn = sqlite3.connect(inferences_path)
         cursor = conn.cursor()
 

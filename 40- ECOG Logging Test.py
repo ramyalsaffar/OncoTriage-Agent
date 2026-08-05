@@ -135,15 +135,27 @@ def check(label: str, actual, expected) -> None:
 # ===========================================================================
 # THROWAWAY DATABASE
 # ===========================================================================
-# inferences_path is rebound BEFORE File 14 is exec'd, because File 14 opens its
-# connection and creates its tables at load time. The real inferences.db is
+# inferences_path is rebound BEFORE File 14 is exec'd. The real inferences.db is
 # never touched by this test.
+#
+# Item 20b: File 14 no longer creates its tables at load time, so the rebinding
+# is no longer sufficient on its own -- initialize_database() has to be called.
+# Section 3 below reads PRAGMA table_info(inferences) straight after this block
+# and used to be served by File 14's import side effect; without the explicit
+# call it saw a database with no tables and reported three empty-set failures.
+# That is the reliance item 20b exists to remove, so the call is made here
+# rather than the side effect restored.
+#
+# The rebinding still has to happen first: initialize_database takes the path
+# as an argument, but log_inference() further down reads the global.
 
 _TMP_DIR = tempfile.mkdtemp(prefix="oncotriage_ecog_logging_")
 inferences_path = os.path.join(_TMP_DIR, "inferences_test.db")
 
 with open(_code_dir + "14- Database Logger.py") as _fh:
     exec(_fh.read(), globals())
+
+initialize_database(inferences_path)
 
 
 # ===========================================================================
