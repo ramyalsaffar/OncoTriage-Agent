@@ -143,11 +143,87 @@ SYSTEM_KEY_UNRECOGNIZED = "unmapped"
 # Detect if running in Docker container
 IS_DOCKER = os.path.exists('/.dockerenv') or os.getenv('DOCKER_CONTAINER', 'false').lower() == 'true'
 
+
+# --- Locate oncotriage_settings.py -------------------------------------------
+# This file is exec()'d into a caller's globals as often as it is run directly,
+# so it cannot rely on a plain `import oncotriage_settings`: sys.path[0] is the
+# *entry point's* directory, which is this directory today but will not be once
+# passes 20b-20f move things. Three candidate directories, tried in order, and
+# the one that won is printed — a settings module found somewhere unexpected is
+# exactly the kind of thing that must not be silent.
+#
+#   _code_dir   set by the bootstrap block of whichever file exec'd this one
+#   __file__    this file's own directory, when it is run as a script
+#   os.getcwd() bare interactive session with neither of the above
+#
+# Docker takes this path too. The image copies the whole code directory to
+# /app, so the module is present there as well.
+
+def _load_path_settings():
+    """Import oncotriage_settings.py by location. Returns (module, directory)."""
+    candidates = []
+    if isinstance(globals().get("_code_dir"), str):
+        candidates.append((globals()["_code_dir"], "_code_dir from the calling script"))
+    if "__file__" in globals():
+        candidates.append((os.path.dirname(os.path.abspath(__file__)), "__file__ of 01- Imports.py"))
+    candidates.append((os.getcwd(), "working directory"))
+
+    for directory, how in candidates:
+        candidate = os.path.join(directory, "oncotriage_settings.py")
+        if not os.path.isfile(candidate):
+            continue
+        spec = importlib.util.spec_from_file_location("oncotriage_settings", candidate)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        print(f"[Paths] Settings module loaded from {candidate} (via {how})")
+        return module, directory
+
+    raise RuntimeError(
+        "oncotriage_settings.py was not found. Searched:\n  "
+        + "\n  ".join(f"{d} (via {how})" for d, how in candidates)
+        + "\nIt must sit beside 01- Imports.py in the code directory."
+    )
+
+
+path_settings = _load_path_settings()[0]
+
+
+# glob.glob(pattern)[0] on its own raises IndexError, and an IndexError names
+# neither the pattern that matched nothing nor the root it was anchored to.
+# Every sibling directory in the local branch is discovered by prefix glob, so
+# a wrong root produces one IndexError per run and no diagnosis. Same
+# discovery, same unsorted [0] — only the failure message changes.
+#
+# Defined outside the branch, not inside the local one, so that both branches
+# leave the same set of names behind. The Docker branch does not call it; a
+# name defined in one branch and not the other is the exact defect item 20a
+# found in code_path.
+def _glob_one(pattern, label):
+    hits = glob.glob(pattern)
+    if not hits:
+        raise RuntimeError(
+            f"No directory matched the {label} pattern: {pattern!r}\n"
+            f"Project root in use: {main_path!r} (from {_main_path_source})\n"
+            f"Set {path_settings.ENV_MAIN_PATH} if the root is wrong, or check "
+            f"that the sibling directory exists and still ends in the expected suffix."
+        )
+    return hits[0]
+
+
 if IS_DOCKER:
     # Docker container paths (Linux environment)
     print("🐳 Running in Docker container")
-    
+
+    # Provenance of main_path, recorded in both branches so a reader of a log
+    # can tell a container run from a local one without inferring it.
+    _main_path_source = "Docker image layout (fixed)"
+
     main_path = "/app/"
+    # The Dockerfile does `COPY . /app/`, so the numbered scripts sit directly
+    # in /app. Added in item 20a: the local branch has always defined
+    # code_path and this branch never did, so any file reaching for it was
+    # container-only broken.
+    code_path = "/app/"
     data_path = "/app/data/"
     data_patient_path = "/app/data/patients/"
     data_fhir_path = "/app/data/patients/fhir/"
@@ -165,37 +241,38 @@ if IS_DOCKER:
 else:
     # Local development paths (macOS)
     print("💻 Running on local machine")
-    
-    main_path = "/Users/ramyalsaffar/Ramy/C.V..V/07- LLM Projects/03- Clinical Trial Patient Match/"
-    
-    code_path = glob.glob(main_path + "/*Code/")[0]
-    
-    data_path = glob.glob(main_path + "/*Data/")[0]
-    
-    data_patient_path = glob.glob(data_path + "/*Patients/")[0]
-    
-    data_fhir_path = glob.glob(data_patient_path)[0] + "fhir/"
-    
-    data_trial_path = glob.glob(data_path + "/*Trials/")[0]
-    
-    data_MeSH_path = glob.glob(data_path + "/*MeSH/")[0]
-    
-    inferences_path = glob.glob(data_path + "/*Inferences Storage/")[0] + "inferences.db"
-    
-    results_path = glob.glob(main_path + "/*Results/")[0]
-    
-    result_fhir_explore_path = glob.glob(results_path + "/*FHIR Exploration/")[0]
-    
-    result_ablation_path = glob.glob(results_path + "/*Ablation/")[0]
-    
-    keys_path = glob.glob(main_path + "/*Keys/")[0]
-    
-    airflow_path = glob.glob(main_path + "/*Airflow/")[0]
-    
-    requirements_path = glob.glob(main_path + "/*Requirements/")[0]
-    
-    checkpoint_path = glob.glob(main_path + "/*Checkpoint/")[0]
-    
+
+    main_path, _main_path_source = path_settings.resolve_main_path()
+    print(f"[Paths] Project root: {main_path} (from {_main_path_source})")
+
+    code_path = _glob_one(main_path + "/*Code/", "code")
+
+    data_path = _glob_one(main_path + "/*Data/", "data")
+
+    data_patient_path = _glob_one(data_path + "/*Patients/", "patients")
+
+    data_fhir_path = _glob_one(data_patient_path, "FHIR bundle") + "fhir/"
+
+    data_trial_path = _glob_one(data_path + "/*Trials/", "trials")
+
+    data_MeSH_path = _glob_one(data_path + "/*MeSH/", "MeSH")
+
+    inferences_path = _glob_one(data_path + "/*Inferences Storage/", "inferences") + "inferences.db"
+
+    results_path = _glob_one(main_path + "/*Results/", "results")
+
+    result_fhir_explore_path = _glob_one(results_path + "/*FHIR Exploration/", "FHIR exploration results")
+
+    result_ablation_path = _glob_one(results_path + "/*Ablation/", "ablation results")
+
+    keys_path = _glob_one(main_path + "/*Keys/", "keys")
+
+    airflow_path = _glob_one(main_path + "/*Airflow/", "Airflow")
+
+    requirements_path = _glob_one(main_path + "/*Requirements/", "requirements")
+
+    checkpoint_path = _glob_one(main_path + "/*Checkpoint/", "checkpoint")
+
 
 #------------------------------------------------------------------------------
 

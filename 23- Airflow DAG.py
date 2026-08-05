@@ -31,8 +31,8 @@ dag_dir = Path(airflow_path) / 'dags'
 dag_dir.mkdir(parents=True, exist_ok=True)
 
 
-# DAG file content
-dag_content = '''"""
+# DAG file content (head + generated path block + tail — see the path block below)
+dag_content_head = '''"""
 Weekly Trial Refresh DAG
 
 Scrapes clinical trials, rebuilds Qdrant index.
@@ -43,6 +43,7 @@ Airflow 3.1.7 | TaskFlow API | Pure Python (no BashOperator)
 """
 
 import ast
+import os
 import sys
 import json
 import time
@@ -61,15 +62,68 @@ from airflow.sdk import dag, task
 # =============================================================================
 DIGIT_PATTERN = re.compile(chr(92) + "d+")       # matches \\d+ (digits)
 NEWLINE_SEP = chr(10) + chr(10)                    # matches "\\n\\n" (double newline)
+'''
 
 
 # =============================================================================
-# Project Paths (must match 01- Imports.py)
+# Project paths for the generated DAG  (item 20a)
 # =============================================================================
-PROJECT_CODE_PATH = "/Users/ramyalsaffar/Ramy/C.V..V/07- LLM Projects/03- Clinical Trial Patient Match/03- Code/"
-KEYS_PATH = "/Users/ramyalsaffar/Ramy/C.V..V/07- LLM Projects/03- Clinical Trial Patient Match/04- Keys/"
-DATA_TRIAL_PATH = "/Users/ramyalsaffar/Ramy/C.V..V/07- LLM Projects/03- Clinical Trial Patient Match/02- Data/02- Trials/"
+# Airflow parses the generated DAG in the scheduler's own process, from
+# {airflow_path}/dags/. That process has not run exec_chain and has none of
+# 01- Imports.py's names, and the DAG file does not sit in the code directory,
+# so it cannot find itself with __file__ either. Environment variables are the
+# only mechanism that reaches it, and Airflow passes them through.
+#
+# The fallbacks are not literals in this file. They are whatever
+# 01- Imports.py resolved at DAG-generation time, rendered in with repr(), so
+# the generator and the generated file cannot drift.
+#
+# One value changes meaning as a result. KEYS_PATH used to be a literal
+# ".../04- Keys/", a directory that does not exist -- the keys live in
+# "05- Keys/", which is what 01- Imports.py's glob has always found. The
+# generated DAG's _read_key() therefore raised FileNotFoundError on every run.
+# Sourcing the fallback from 01 fixes that as a side effect; it is called out
+# here because it is a behaviour change, not just a path move.
+#
+# dag_content is split in three around this block because it is a plain
+# triple-quoted string, not an f-string: the DAG body contains dict literals
+# and f-strings of its own, so neither .format() nor an f-prefix can be
+# applied to it.
 
+_dag_path_block = '''
+
+# =============================================================================
+# Project Paths (fallbacks resolved by 01- Imports.py when this file was
+# generated; override any of them with the environment variable named beside
+# it, which is how a container or a different checkout retargets this DAG)
+# =============================================================================
+def _path_from_env(var_name, fallback):
+    """Environment variable if set to a non-empty value, else the fallback.
+
+    An empty string counts as unset: `export ONCOTRIAGE_KEYS_PATH=` is a
+    normal way to clear a variable, and taking it literally would turn every
+    absolute path below into a relative one against the scheduler's working
+    directory.
+    """
+    raw = os.environ.get(var_name)
+    if raw is not None and raw.strip() != "":
+        resolved = raw.strip().rstrip("/") + "/"
+        print("[DAG paths] " + var_name + " -> " + resolved)
+        return resolved
+    return fallback
+
+
+PROJECT_CODE_PATH = _path_from_env(%r, %r)
+KEYS_PATH = _path_from_env(%r, %r)
+DATA_TRIAL_PATH = _path_from_env(%r, %r)
+''' % (
+    path_settings.ENV_CODE_PATH,       path_settings.with_trailing_sep(code_path),
+    path_settings.ENV_KEYS_PATH,       path_settings.with_trailing_sep(keys_path),
+    path_settings.ENV_DATA_TRIAL_PATH, path_settings.with_trailing_sep(data_trial_path),
+)
+
+
+dag_content_tail = '''
 
 # =============================================================================
 # Config (loaded dynamically from 03- Config.py inside each task)
@@ -497,6 +551,9 @@ def trial_refresh_weekly():
 # Register DAG
 trial_refresh_weekly()
 '''
+
+
+dag_content = dag_content_head + _dag_path_block + dag_content_tail
 
 
 #------------------------------------------------------------------------------

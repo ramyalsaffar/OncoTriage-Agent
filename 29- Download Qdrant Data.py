@@ -2,7 +2,14 @@
 Download ALL data from Qdrant Cloud before account deletion.
 
 Run from Spyder (after running 01, 02, 03):
-    exec(open(code_path + "download_qdrant.py").read())
+    exec(open(code_path + "29- Download Qdrant Data.py").read())
+
+The docstring here used to name "download_qdrant.py". No file of that name
+exists anywhere in the project -- item 20a checked. The downloader is this
+file; that line named a predecessor that is gone. It was a comment, so it
+never ran and never raised: `code_path` is referenced only inside this
+docstring, so this file has never depended on that name being bound. It is
+now defined in both branches of 01- Imports.py regardless.
 """
 
 

@@ -9,7 +9,6 @@ Visualizes performance metrics, costs, and match quality from SQLite logs.
 
 Run from terminal:
     cd ".../03- Code"
-    cd "/Users/ramyalsaffar/Ramy/C.V..V/07- LLM Projects/03- Clinical Trial Patient Match/03- Code/"
     streamlit run "21- Streamlit Dashboard.py"
 """
 
@@ -17,7 +16,18 @@ Run from terminal:
 # ===========================================================================
 # EXEC CHAIN: Load dependencies from existing scripts
 # ===========================================================================
-_code_dir = "/Users/ramyalsaffar/Ramy/C.V..V/07- LLM Projects/03- Clinical Trial Patient Match/03- Code/"
+# Item 20a: this file sits in the code directory, so __file__ locates it with
+# no hardcoded path. __file__ is bound when the file is run as a script (every
+# documented entry point for it) and when Spyder runfile()s it. In a bare
+# interactive paste it is not bound, and the working directory is the only
+# remaining candidate -- taken, but announced, never silently.
+import os as _os_boot
+if "__file__" in globals():
+    _code_dir = _os_boot.path.dirname(_os_boot.path.abspath(__file__)) + _os_boot.sep
+else:
+    _code_dir = _os_boot.getcwd() + _os_boot.sep
+    print(f"[Bootstrap] __file__ unbound; using the working directory as the code directory: {_code_dir}")
+del _os_boot
 
 for _bootstrap in ("01- Imports.py", "02- Utility Functions.py"):
     with open(_code_dir + _bootstrap) as _fh:

@@ -10,20 +10,51 @@ Sampling:
     - Stratified: 10 breast, 10 colon, 10 lung by primary_condition text
     - Output includes ALL inferences for sampled patients (main + resample)
 
-Run from Spyder console:
-    exec(open("/Users/ramyalsaffar/Ramy/C.V..V/07- LLM Projects/03- Clinical Trial Patient Match/03- Code/sample_30_patients.py").read())
+Run from terminal:
+    cd ".../03- Code"
+    python "28- Select 30 Samples.py"
+
+The docstring here used to say `exec(open(".../sample_30_patients.py").read())`.
+No file of that name exists anywhere in the project — item 20a checked. The
+sampler is this file; that line named a predecessor that is gone. It was a
+comment, so it never ran and never raised.
 """
 
 import sqlite3
 import random
 import os
+import importlib.util
 
 
 # =====================================================================
 # PATHS (from 01- Imports.py)
 # =====================================================================
+# This file is not part of the exec chain -- it deliberately imports only
+# sqlite3 and random rather than pulling in 01's model and client imports for
+# two database queries. So it resolves main_path the way 01 does, by reading
+# oncotriage_settings directly, rather than duplicating 01's literal.
+#
+# The settings module sits beside this file in the code directory, which
+# __file__ locates. In a bare interactive paste __file__ is unbound and the
+# working directory is the only remaining candidate -- taken, but announced.
 
-main_path = "/Users/ramyalsaffar/Ramy/C.V..V/07- LLM Projects/03- Clinical Trial Patient Match/"
+if "__file__" in globals():
+    _code_dir = os.path.dirname(os.path.abspath(__file__))
+else:
+    _code_dir = os.getcwd()
+    print(f"[Paths] __file__ unbound; using the working directory as the code directory: {_code_dir}")
+
+_settings_file = os.path.join(_code_dir, "oncotriage_settings.py")
+if not os.path.isfile(_settings_file):
+    raise RuntimeError(
+        f"oncotriage_settings.py was not found beside this file: {_settings_file!r}"
+    )
+_spec = importlib.util.spec_from_file_location("oncotriage_settings", _settings_file)
+path_settings = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(path_settings)
+
+main_path, _main_path_source = path_settings.resolve_main_path()
+print(f"[Paths] Project root: {main_path} (from {_main_path_source})")
 
 source_db = main_path + "02- Data/03- Inferences Storage/inferences.db"
 output_db = main_path + "04- Results/03- 30 Samples db/inferences_sample_30.db"
