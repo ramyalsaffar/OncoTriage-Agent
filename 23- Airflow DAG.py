@@ -26,6 +26,54 @@
 #------------------------------------------------------------------------------
 
 
+# ===========================================================================
+# EXEC CHAIN: 01
+# ===========================================================================
+# Until this block existed, `python "23- Airflow DAG.py"` died on the next
+# statement with NameError: name 'Path' is not defined. The file had no
+# bootstrap and only ever ran inside a Spyder session where 01 had already
+# been exec'd into the same namespace.
+#
+# 01 alone, and nothing else. The generator -- the code in this file, as
+# opposed to the DAG text it writes out -- reads exactly six names it does not
+# define, and 01 supplies all six:
+#
+#   Path             pathlib, imported by 01
+#   airflow_path     01's path block, used just below for the dags/ directory
+#   path_settings    01's settings-module handle, for the ONCOTRIAGE_* names
+#   code_path        }  the three fallbacks baked into the generated DAG's
+#   keys_path        }  path block further down
+#   data_trial_path  }
+#
+# Every other name in this file is defined here or lives inside dag_content,
+# which is a string: those names are resolved by Airflow when it parses the
+# generated DAG, in a process that has none of this namespace, so they are not
+# dependencies of the generator. 02 is not loaded because nothing here calls
+# exec_chain or any utility function, and 03 is not loaded because the DAG
+# reads its config out of 03 at task time, through PROJECT_CODE_PATH, not from
+# this namespace. Chaining either would be loading a file this one does not use.
+#
+# Item 20a: this file sits in the code directory, so __file__ locates it with
+# no hardcoded path. __file__ is bound when the file is run as a script (every
+# documented entry point for it) and when Spyder runfile()s it. In a bare
+# interactive paste it is not bound, and the working directory is the only
+# remaining candidate -- taken, but announced, never silently.
+import os as _os_boot
+if "__file__" in globals():
+    _code_dir = _os_boot.path.dirname(_os_boot.path.abspath(__file__)) + _os_boot.sep
+else:
+    _code_dir = _os_boot.getcwd() + _os_boot.sep
+    print(f"[Bootstrap] __file__ unbound; using the working directory as the code directory: {_code_dir}")
+del _os_boot
+
+for _bootstrap in ("01- Imports.py",):
+    with open(_code_dir + _bootstrap) as _fh:
+        exec(_fh.read(), globals())
+
+
+#------------------------------------------------------------------------------
+
+
 # Create DAG directory
 dag_dir = Path(airflow_path) / 'dags'
 dag_dir.mkdir(parents=True, exist_ok=True)
