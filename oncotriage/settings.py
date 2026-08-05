@@ -1,5 +1,4 @@
-"""OncoTriage settings — the one place a path environment variable is named,
-and the one place credentials are read off disk.
+"""OncoTriage settings — the one place a path environment variable is named.
 
 Item 20a (pass 1 of 6) created this as ``oncotriage_settings.py`` at the code
 directory, loaded by file location. Item 20c moved the content here, into a
@@ -7,39 +6,29 @@ real package module, and left ``oncotriage_settings.py`` behind as a
 re-exporting shim: ``01- Imports.py`` and ``28- Select 30 Samples.py`` still
 load that filename by location, and neither had to change.
 
-Why load_env_keys() lives HERE and not in utils
------------------------------------------------
-It used to sit in ``02- Utility Functions.py``, and ``03- Config.py`` called it
-at line 194. File 02 in turn read ``PRICING_CONFIG``, ``COLLECTION_NAME``,
-``qdrant_client`` and ``DATA_SNAPSHOT_DATE`` out of File 03. Under ``exec()``
-into a shared namespace that is legal — every name resolves at call time — but
-as modules it is a hard import cycle: ``config`` imports ``utils`` imports
-``config``.
+Why load_env_keys() is NOT here
+-------------------------------
+Pass 20c-1 put it here, because it was the ONLY thing ``config`` needed out of
+``utils`` and moving it broke the ``config`` <-> ``utils`` cycle. But its
+default keys directory is ``keys_path``, which lives in ``oncotriage.paths``,
+and ``paths`` imports this module — so the import had to be DEFERRED into the
+function body to avoid a second cycle in place of the one just removed.
 
-``load_env_keys`` is the ONLY thing config needed from utils, and it needs
-nothing from config: a directory and ``python-dotenv``. Moving it here is what
-breaks the cycle. ``config`` now imports ``settings`` and never imports
-``utils``, and that edge must not be added back.
+Pass 20c-2a moved it to ``oncotriage.paths`` instead, beside the ``keys_path``
+it reads. Same cycle break — ``config`` imports ``paths`` and ``settings``, and
+still never imports ``utils`` — with no deferred import anywhere in the package.
+A deferred import is a dependency that does not appear in the module's import
+block, so no static scan of the import graph can see it; the package now has a
+rule that every ``oncotriage``-to-``oncotriage`` import is at module scope, and
+``47- Package Split Test.py`` enforces it. (Third-party imports inside function
+bodies are untouched by that rule — File 08's ``import icd10`` is deliberate and
+stays.)
 
 Deliberate non-dependencies
 ---------------------------
-This module imports nothing from the project except, at CALL time inside
-``load_env_keys``, ``oncotriage.paths`` for the default keys directory. That
-one import is deferred into the function body on purpose:
-
-* ``paths`` imports ``settings`` at module load to resolve the project root, so
-  a module-level ``from oncotriage.paths import keys_path`` here would be a
-  second cycle in place of the one just removed;
-* the dependency is on a VALUE that only matters when someone actually reads a
-  ``.env``, not on anything needed to define this module;
-* and callers who know their own keys directory can pass ``keys_dir`` and never
-  trigger it at all.
-
-The honest alternative was to put ``load_env_keys`` in ``paths`` beside
-``keys_path``, where no deferral would be needed. It is here instead because
-"where credentials come from" is a settings question, and because ``paths``
-resolving the tree is a heavier import than a caller who only wants keys should
-have to pay for at module load.
+This module imports nothing from the project at all, at module scope or inside
+a function. ``paths`` reads it while resolving the tree, so any dependency in
+the other direction would be a cycle.
 
 Resolution order for every path below: the environment variable if it is set to
 a non-empty value, otherwise the FALLBACK_* constant. There is no third tier —
@@ -48,8 +37,6 @@ over by a guess.
 """
 
 import os
-
-from dotenv import load_dotenv
 
 
 # ---------------------------------------------------------------------------
@@ -177,71 +164,6 @@ def resolve_keys_path(fallback):
 def resolve_data_trial_path(fallback):
     """Resolve the trial-data directory for the generated Airflow DAG."""
     return _from_env(ENV_DATA_TRIAL_PATH, fallback)
-
-
-# ---------------------------------------------------------------------------
-# Credentials
-# ---------------------------------------------------------------------------
-#
-# To create the .env file:
-#   ## create .txt file first, and clean it if it has any text due to fresh
-#   ## creation!
-#   ## add the text you needed!
-#   ## rename it to .env
-#   ## use a terminal with this (get to the targeted folder first):
-#   ## mv .env.txt .env
-#   ## to view the .env in Finder on Mac, hit: command + shift + .
-
-REQUIRED_ENV_KEYS = ("OPENAI_API_KEY", "QDRANT_URL", "QDRANT_API_KEY")
-"""The three variables a .env must define. Named here rather than repeated in
-the two loops below, which is how one of them once came to be cleared but not
-validated."""
-
-
-def load_env_keys(keys_dir=None):
-    """Load API keys from the .env file in `keys_dir`.
-
-    Args:
-        keys_dir: Directory holding the .env. Defaults to ``keys_path`` from
-            ``oncotriage.paths``, imported here rather than at module scope —
-            see this module's docstring for why that import is deferred.
-
-    Returns:
-        {'openai': ..., 'qdrant_url': ..., 'qdrant_key': ...}
-
-    Raises:
-        FileNotFoundError: no .env at that location.
-        ValueError: the file loaded but did not define all three keys.
-    """
-    if keys_dir is None:
-        from oncotriage.paths import keys_path
-        keys_dir = keys_path
-
-    env_path = with_trailing_sep(keys_dir) + '.env'
-
-    # Validate file exists
-    if not os.path.exists(env_path):
-        raise FileNotFoundError(f".env file not found at: {env_path}")
-
-    # Clear previous env vars to avoid stale values
-    for key in REQUIRED_ENV_KEYS:
-        os.environ.pop(key, None)
-
-    # Load from file
-    load_dotenv(dotenv_path=env_path, override=True)
-
-    # Validate all keys loaded
-    keys = {
-        'openai': os.getenv('OPENAI_API_KEY'),
-        'qdrant_url': os.getenv('QDRANT_URL'),
-        'qdrant_key': os.getenv('QDRANT_API_KEY')
-    }
-
-    missing = [k for k, v in keys.items() if v is None]
-    if missing:
-        raise ValueError(f"Missing keys in .env file: {missing}")
-
-    return keys
 
 
 #------------------------------------------------------------------------------

@@ -216,6 +216,36 @@ def passed(label: str) -> None:
 # ===========================================================================
 # FILE 08 COMMENT EXTRACTION
 # ===========================================================================
+#
+# ITEM 20c, PASS 2a RETARGETED THIS AT THE MODULE. The two extractors below do
+# not read the registry's data structures -- they read its SOURCE, because the
+# whole point is that a comment and the code it sits beside can disagree, and
+# only the text has both. That source used to be "08- Cancer Code Registry.py";
+# it is now oncotriage/registries/cancer_code_registry.py, and File 08 is a
+# re-export shim holding nothing but import statements.
+#
+# READING THE SHIM WOULD NOT HAVE RAISED. It returns an EMPTY dict, and what
+# that does to this audit was MEASURED rather than guessed, on a copy of this
+# file pointed back at the shim:
+#
+#   correct target                   197 checks, 0 failed
+#   shim target, guard removed       175 checks, 42 failed
+#
+# So it does go red -- the claim "the audit would pass having checked nothing"
+# would have been an over-claim, and is not made here. What it does instead is
+# worse in a quieter way: 22 assertions DISAPPEAR. The per-category ICD-10 loop
+# is `for _cat in sorted(_ICD10_CLAIMS)`, and an empty dict means its body never
+# runs, so those checks are neither passed nor failed -- they are absent, and
+# absence does not show up in a Failed: count. The other 42 turn into
+# "comment does not match UMLS" failures that name the wrong cause.
+#
+# The guard below converts both into one failure that names the file and the
+# zero. It is a diagnosis, not a safety net.
+#
+# "43- Cancer Code Registry Audit Negative Control.py" plants its defects into
+# this same file and hashes its restore against it.
+
+_REGISTRY_SOURCE = _code_dir + "oncotriage/registries/cancer_code_registry.py"
 
 def extract_file08_claims() -> dict:
     """
@@ -233,7 +263,7 @@ def extract_file08_claims() -> dict:
         dict: code -> claim string (first occurrence wins, which is the set
               definition; later mentions in prose are ignored).
     """
-    source = open(_code_dir + "08- Cancer Code Registry.py", encoding="utf-8").read()
+    source = open(_REGISTRY_SOURCE, encoding="utf-8").read()
     claims = {}
     for match in re.finditer(r'"(\d+)",\s*#\s*(.+)', source):
         code, comment = match.group(1), match.group(2)
@@ -260,7 +290,7 @@ def extract_icd10_category_claims() -> dict:
     Returns:
         dict: category -> {"title": str, "set": str}
     """
-    source = open(_code_dir + "08- Cancer Code Registry.py", encoding="utf-8").read()
+    source = open(_REGISTRY_SOURCE, encoding="utf-8").read()
     claims = {}
     pattern = r'^#\s+([A-Z]\d[A-Z0-9])\s*=\s*(.+?)\s*->\s*(PRIMARY|SECONDARY|NON_INVASIVE)\s*$'
     for match in re.finditer(pattern, source, re.MULTILINE):
@@ -608,6 +638,51 @@ icd10 = require_icd10()
 _REG = load_registry()
 _CLAIMS = extract_file08_claims()
 _ICD10_CLAIMS = extract_icd10_category_claims()
+
+# BOTH CLAIM DICTS MUST BE NON-EMPTY BEFORE ANYTHING IS COMPARED.
+#
+# Every assertion below that checks a comment against the standard is a lookup
+# into one of these two dicts. An empty dict does not fail any of them -- it
+# makes the ones inside a `for ... in _ICD10_CLAIMS` loop stop running
+# altogether, and turns the rest into failures that blame the standard rather
+# than the path.
+#
+# That is not hypothetical. It is precisely what item 20c, pass 2a would have
+# produced if _REGISTRY_SOURCE had been left pointing at "08- Cancer Code
+# Registry.py" after the registry moved into the package: the shim holds import
+# statements and comments, no `"code",  # claim` lines and no
+# `#   C4A = ... -> PRIMARY` lines, so both regexes match nothing and both dicts
+# come back empty. Demonstrated on a copy -- see the measurement in the section
+# header above. The visible damage is 42 misleading failures; the invisible
+# damage is 22 assertions that stop running at all.
+#
+# The floors are deliberately loose. They are here to catch "the file I read had
+# none of this in it", not to pin a count that a legitimate edit would move --
+# the exact-set assertions further down do that job. Observed on 2026-08-05,
+# before and after the move, identically: 40 code claims and 5 category claims.
+# 20 leaves room for codes to be retired (item 18b retired one) while still
+# being a hundred times further from zero than an empty read.
+#
+# The category floor is exact rather than loose because the category set IS
+# exact: _HAND_TYPED_CATEGORIES below asserts it equals five named prefixes, so
+# a sixth would fail there and be seen, not hidden here.
+check("claims were extracted from the registry source at all (non-degeneracy)",
+      len(_CLAIMS) >= 20, True)
+check("ICD-10 category claims were extracted at all (non-degeneracy)",
+      len(_ICD10_CLAIMS) >= 5, True)
+if not _CLAIMS or not _ICD10_CLAIMS:
+    fail("the registry source is readable and has the shape this audit parses",
+         f"{_REGISTRY_SOURCE!r} yielded {len(_CLAIMS)} code claims and "
+         f"{len(_ICD10_CLAIMS)} category claims. Every comparison below is a "
+         f"lookup into those dicts, so an empty one means this audit is about "
+         f"to pass without checking anything. Refusing to continue.")
+    print()
+    print(f"Passed: {_RESULTS['passed']}")
+    print(f"Failed: {_RESULTS['failed']}")
+    for _f in _FAILURES:
+        print(f"  - {_f}")
+    sys.exit(1)
+
 _MRCONSO_PATH = locate_mrconso()
 print(f"  MRCONSO:  {_MRCONSO_PATH}")
 print(f"  SNOMED primary:   {len(_SNOMED_PRIMARY)} codes")

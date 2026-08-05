@@ -4,7 +4,8 @@
 # ITEM 20c: THIS FILE IS A SHIM.
 #
 # Everything below moved into oncotriage/utils.py, except load_env_keys, which
-# moved into oncotriage/settings.py. That split is the point of the pass:
+# moved out of the utils/config pair entirely. That split is the point of the
+# pass:
 #
 #     this file  read PRICING_CONFIG, COLLECTION_NAME, qdrant_client and
 #                DATA_SNAPSHOT_DATE out of File 03
@@ -13,8 +14,10 @@
 # Under exec() into one shared namespace both directions resolve at runtime and
 # nobody notices. As modules it is a hard import cycle. load_env_keys was the
 # ONLY thing config needed from utils and it needs nothing from config, so
-# moving it to oncotriage.settings broke the cycle: oncotriage.config imports
-# oncotriage.settings and never imports oncotriage.utils.
+# moving it out broke the cycle: oncotriage.config imports oncotriage.paths and
+# never imports oncotriage.utils. (Pass 20c-1 put it in oncotriage.settings,
+# which needed a deferred import to reach keys_path; pass 20c-2a moved it to
+# oncotriage.paths, where keys_path already lives and no deferral is needed.)
 #
 # This file is still raw-exec'd by all 31 bootstraps in the codebase, straight
 # after "01- Imports.py" and before any exec_chain call — exec_chain itself is
@@ -39,11 +42,12 @@
     ## mv .env.txt .env
     ## to view the .env in Finder on Mac, hit: command + shift + .
 
-# load_env_keys now lives in oncotriage/settings.py. It is re-exported here
+# load_env_keys now lives in oncotriage/paths.py. It is re-exported here
 # because '03- Config.py' called it (that call is now get_keys()) and because
-# any file in the chain may still call it. Its keys_dir argument defaults to
+# '16- Database Query.py' documents it as one of its five free names and can
+# still call it through the chain. Its keys_dir argument defaults to
 # oncotriage.paths.keys_path, which is the same directory File 01 binds.
-from oncotriage.settings import load_env_keys
+from oncotriage.paths import load_env_keys
 
 
 #------------------------------------------------------------------------------

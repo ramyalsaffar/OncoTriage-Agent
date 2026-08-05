@@ -57,7 +57,7 @@ Run from terminal (or F5 in Spyder):
     python "43- Cancer Code Registry Audit Negative Control.py"
 
 Exit codes:
-    0 -- every planted defect was caught, File 08 restored byte-for-byte
+    0 -- every planted defect was caught, the module restored byte-for-byte
     1 -- a defect went uncaught, the clean run failed, an anchor was not
          found, or File 08 could not be restored
 """
@@ -93,8 +93,37 @@ for _bootstrap in ("01- Imports.py", "02- Utility Functions.py"):
 # EXTERNAL FACTS
 # ===========================================================================
 
-_FILE_08 = _code_dir + "08- Cancer Code Registry.py"
+# THE FILE THE DEFECTS ARE PLANTED IN.
+#
+# ITEM 20c, PASS 2a RETARGETED THIS. It was
+# `_code_dir + "08- Cancer Code Registry.py"`. File 08 is now a re-export shim
+# holding nothing but import statements, so every anchor below would have been
+# missing from it and every case would have reported "anchor not found" --
+# which this control does treat as a FAILURE rather than a skip, so it would
+# have gone red rather than silently certifying nothing. It is retargeted at
+# the module that actually holds the code, where all 14 anchors were confirmed
+# to appear exactly once.
+#
+# The hash-and-restore contract moves with it: this file is copied aside,
+# patched once per case, restored from the backup after each case, and the
+# restore is verified by sha256 both per-case and at the end.
+_FILE_08 = _code_dir + "oncotriage/registries/cancer_code_registry.py"
 _FILE_42 = _code_dir + "42- Cancer Code Registry Audit Test.py"
+
+# Where the interpreter would cache a compiled copy of the file above.
+#
+# THIS IS NEW IN PASS 2a AND IT IS LOAD-BEARING. Before the move, File 08 was
+# exec()'d, never imported, so no .pyc of it ever existed and a planted defect
+# always reached File 42. The module IS imported, so it is byte-compiled, and a
+# .pyc is validated against the source's (mtime-in-SECONDS, size). Two cases
+# planted inside the same clock second whose patched files happen to be the
+# same length would leave the second case running the first case's bytecode --
+# the control would report a pass for a defect it never executed.
+#
+# Rather than reason about how likely that is, the subprocess is run with
+# bytecode writing OFF and any existing cache for this module removed first.
+# Nothing writes a .pyc, so nothing can read a stale one.
+_PYCACHE_DIR = os.path.join(os.path.dirname(_FILE_08), "__pycache__")
 
 
 # ===========================================================================
@@ -247,11 +276,24 @@ def _sha256(path: str) -> str:
     return digest.hexdigest()
 
 
+def _clear_pycache() -> None:
+    """Remove any compiled copy of the registry module.
+
+    Called before every File 42 run. See the _PYCACHE_DIR note above: a stale
+    .pyc would make a planted defect invisible to the subprocess, and a control
+    that cannot deliver its defect is worse than no control.
+    """
+    shutil.rmtree(_PYCACHE_DIR, ignore_errors=True)
+
+
 def _run_file_42():
     """Run File 42 as a subprocess. Returns (returncode, failing_labels)."""
+    _clear_pycache()
+    _env = dict(os.environ)
+    _env["PYTHONDONTWRITEBYTECODE"] = "1"
     proc = subprocess.run(
         [sys.executable, _FILE_42],
-        capture_output=True, text=True, cwd=_code_dir,
+        capture_output=True, text=True, cwd=_code_dir, env=_env,
     )
     out = proc.stdout + proc.stderr
     labels = sorted({
@@ -279,7 +321,7 @@ _BACKUP = os.path.join(tempfile.mkdtemp(prefix="oncotriage_negctrl_"),
                        "08_pristine.py")
 shutil.copy2(_FILE_08, _BACKUP)
 
-print(f"  File 08:  {os.path.basename(_FILE_08)}")
+print(f"  target:   {os.path.relpath(_FILE_08, _code_dir)}")
 print(f"  sha256:   {_PRISTINE_SHA}")
 print(f"  backup:   {_BACKUP}")
 print(f"  cases:    {len(_PLANTED_DEFECTS)}")

@@ -37,5 +37,14 @@ requires-python = ">=3.10"
 
 [tool.setuptools]
 # Explicit, not auto-discovered. Auto-discovery over this directory would trip
-# over the 46 space-containing scripts and over `oncotriage_settings.py`.
-packages = ["oncotriage"]
+# over the 47 space-containing scripts and over `oncotriage_settings.py`.
+#
+# EVERY SUBPACKAGE IS LISTED. setuptools does not recurse into a listed package
+# for you, so a subpackage added to the tree and not added here is present in an
+# editable install (which maps the source tree) and ABSENT from a built wheel.
+# That difference would not show up until someone built one.
+packages = [
+    "oncotriage",
+    "oncotriage.registries",
+    "oncotriage.extraction",
+]

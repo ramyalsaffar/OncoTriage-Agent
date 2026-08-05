@@ -47,7 +47,6 @@ from oncotriage.settings import (  # noqa: E402,F401
     ENV_KEYS_PATH,
     ENV_DATA_TRIAL_PATH,
     FALLBACK_MAIN_PATH,
-    REQUIRED_ENV_KEYS,
     _from_env,
     with_trailing_sep,
     require_existing_directory,
@@ -55,6 +54,19 @@ from oncotriage.settings import (  # noqa: E402,F401
     resolve_code_path,
     resolve_keys_path,
     resolve_data_trial_path,
+)
+
+# load_env_keys and REQUIRED_ENV_KEYS moved to oncotriage.paths in pass 20c-2a,
+# beside the keys_path they default to. Re-exported here anyway: this shim's
+# contract is the set of names the pre-package oncotriage_settings.py exposed,
+# and dropping two of them because the package rearranged itself would break a
+# caller that loaded this file by location and never asked about the package.
+#
+# Imported from oncotriage.paths, not re-declared. Importing this shim therefore
+# resolves the directory tree, which it already did indirectly through every
+# caller that loads it.
+from oncotriage.paths import (  # noqa: E402,F401
+    REQUIRED_ENV_KEYS,
     load_env_keys,
 )
 

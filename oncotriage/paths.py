@@ -4,11 +4,18 @@ Moved out of ``01- Imports.py`` by item 20c. ``01- Imports.py`` keeps its
 third-party import block verbatim — Files 04 to 46 rely on those names being in
 the shared exec namespace — and re-exports everything below.
 
-Imports ``oncotriage.settings`` and nothing else from the project. Nothing in
-this package may import this module at module scope from ``settings``: that
-would be a cycle. (``settings.load_env_keys`` imports ``keys_path`` from here
-INSIDE its body, at call time, which is not a cycle and is argued in that
-module's docstring.)
+Imports ``oncotriage.settings`` and nothing else from the project. ``settings``
+must never import this module in either direction — at module scope OR inside a
+function body — because ``paths`` reads it while resolving the root.
+
+``load_env_keys`` LIVES HERE as of pass 20c-2a. Pass 20c-1 put it in
+``settings`` and reached ``keys_path`` through an import deferred into the
+function body; that worked, but a deferred import is a dependency no static scan
+of the import block can see, and the whole point of the package split is an
+import graph that can be read. It is here instead, beside the ``keys_path`` it
+defaults to, and the deferral is gone. ``config`` imports ``paths`` and
+``settings`` and still never imports ``utils``, so the original cycle stays
+broken.
 
 IMPORT-TIME SIDE EFFECTS, stated because they are real. Importing this module
 resolves the whole directory tree, which means it:
@@ -19,14 +26,16 @@ resolves the whole directory tree, which means it:
     matches nothing;
   * prints which branch and which root it took.
 
-It opens no socket, loads no model and touches no database. That is the
-property the package guarantees, and ``config`` and ``utils`` do not even touch
-the filesystem — which is why a caller that only wants a tunable never pays for
-any of this.
+It opens no socket, loads no model, touches no database and reads no file — the
+globs stat directories, they do not open them. ``load_env_keys`` is the only
+thing here that opens a file, and it is a function, not a module-level
+statement.
 """
 
 import glob
 import os
+
+from dotenv import load_dotenv
 
 from oncotriage import settings as path_settings
 
@@ -139,6 +148,78 @@ else:
     requirements_path = _glob_one(main_path + "/*Requirements/", "requirements")
 
     checkpoint_path = _glob_one(main_path + "/*Checkpoint/", "checkpoint")
+
+
+#------------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Credentials
+# ---------------------------------------------------------------------------
+#
+# Moved here from oncotriage/settings.py by pass 20c-2a. It defaults to
+# keys_path, resolved a few lines above, so this is the module it belongs in
+# and the module where it needs no deferred import.
+#
+# To create the .env file:
+#   ## create .txt file first, and clean it if it has any text due to fresh
+#   ## creation!
+#   ## add the text you needed!
+#   ## rename it to .env
+#   ## use a terminal with this (get to the targeted folder first):
+#   ## mv .env.txt .env
+#   ## to view the .env in Finder on Mac, hit: command + shift + .
+
+REQUIRED_ENV_KEYS = ("OPENAI_API_KEY", "QDRANT_URL", "QDRANT_API_KEY")
+"""The three variables a .env must define. Named here rather than repeated in
+the two loops below, which is how one of them once came to be cleared but not
+validated."""
+
+
+def load_env_keys(keys_dir=None):
+    """Load API keys from the .env file in `keys_dir`.
+
+    Args:
+        keys_dir: Directory holding the .env. Defaults to ``keys_path``, the
+            module-level value resolved above. Kept as an override so a caller
+            that already knows its credentials directory — a container, a test
+            fixture — does not have to agree with the glob.
+
+    Returns:
+        {'openai': ..., 'qdrant_url': ..., 'qdrant_key': ...}
+
+    Raises:
+        FileNotFoundError: no .env at that location.
+        ValueError: the file loaded but did not define all three keys.
+    """
+    if keys_dir is None:
+        keys_dir = keys_path
+
+    env_path = path_settings.with_trailing_sep(keys_dir) + '.env'
+
+    # Validate file exists
+    if not os.path.exists(env_path):
+        raise FileNotFoundError(f".env file not found at: {env_path}")
+
+    # Clear previous env vars to avoid stale values
+    for key in REQUIRED_ENV_KEYS:
+        os.environ.pop(key, None)
+
+    # Load from file
+    load_dotenv(dotenv_path=env_path, override=True)
+
+    # Validate all keys loaded
+    keys = {
+        'openai': os.getenv('OPENAI_API_KEY'),
+        'qdrant_url': os.getenv('QDRANT_URL'),
+        'qdrant_key': os.getenv('QDRANT_API_KEY')
+    }
+
+    missing = [k for k, v in keys.items() if v is None]
+    if missing:
+        raise ValueError(f"Missing keys in .env file: {missing}")
+
+    return keys
 
 
 #------------------------------------------------------------------------------

@@ -6,14 +6,24 @@ Proves the item 20c package split.
 
 WHAT WAS CHANGED
 ----------------
-Files 01, 02 and 03 stopped being the definitions and became re-export shims
-over a real Python package:
+Files 01, 02, 03, 08, 09 and 10 stopped being the definitions and became
+re-export shims over a real Python package:
 
-    oncotriage/settings.py    env-var names, path resolution, load_env_keys()
-    oncotriage/paths.py       IS_DOCKER, _glob_one, every path variable
+    oncotriage/settings.py    env-var names, path resolution
+    oncotriage/paths.py       IS_DOCKER, _glob_one, every path variable,
+                              load_env_keys
     oncotriage/constants.py   SYSTEM_KEY_ABSENT / SYSTEM_KEY_UNRECOGNIZED
     oncotriage/config.py      every tunable + LAZY client/keys accessors
     oncotriage/utils.py       cost, retry, partial dates, exec_chain, caffeinate
+
+    oncotriage/registries/cancer_code_registry.py   File 08, whole
+    oncotriage/registries/mesh.py                   File 09's filter half
+    oncotriage/registries/mesh_crosswalk_build.py   File 09's five offline
+                                                    builders
+    oncotriage/extraction/negation.py               _is_negated, the one name
+                                                    File 10's two halves shared
+    oncotriage/extraction/stage.py                  File 10 to line 698
+    oncotriage/extraction/histology.py              File 10 from line 699
 
 THE CYCLE THAT MADE THIS NON-TRIVIAL
 ------------------------------------
@@ -22,9 +32,10 @@ THE CYCLE THAT MADE THIS NON-TRIVIAL
     '03- Config.py'            called load_env_keys(), from File 02, at line 194
 
 Under exec() into one shared namespace both directions resolve at call time and
-nothing complains. As modules it is an ImportError. load_env_keys moved to
-oncotriage.settings, which config imports and utils does not, and that is the
-edge that broke it.
+nothing complains. As modules it is an ImportError. load_env_keys moved out of
+the pair -- to oncotriage.settings in pass 20c-1, and to oncotriage.paths in
+pass 20c-2a, beside the keys_path it defaults to, which is what let its own
+import stop being deferred into a function body.
 
 WHAT THIS FILE CHECKS, and how each check could fail
 ----------------------------------------------------
@@ -42,12 +53,21 @@ WHAT THIS FILE CHECKS, and how each check could fail
      STRUCTURAL check is the actual guard. Both halves are asserted, including
      the one that is inconvenient.
 
+  1b. NO ONCOTRIAGE MODULE IMPORTS ANOTHER FROM A FUNCTION BODY. An ast walk of
+     every file in the package, ignoring third-party imports -- File 08's
+     `import icd10` inside _build_icd10_cancer_sets() is deliberate and must
+     stay. NEGATIVE CONTROL: a copy with a deferred package import added to
+     settings.resolve_keys_path() is caught, AND is shown to still import
+     cleanly, which is the whole reason a static scan is needed for this one.
+
   2. IMPORTING TOUCHES NOTHING LIVE. A subprocess replaces socket.socket with a
-     class that raises on construction, replaces socket.create_connection and
-     sqlite3.connect with functions that raise, and only then imports all five
-     package modules. Proved by patching, not by reading the source. The trap is
-     shown to be ARMED afterwards, so a run where the patch silently did nothing
-     fails instead of passing vacuously.
+     class that raises on construction, and socket.create_connection,
+     sqlite3.connect, builtins.open and io.open with functions that raise, then
+     imports all eleven package modules. Proved by patching, not by reading the
+     source. Every trap is fired afterwards and must raise, so a run where the
+     patches silently did nothing fails instead of passing vacuously. The `open`
+     traps arrived with oncotriage.registries.mesh, whose load_mesh_filter()
+     reads four JSON lookups and must do it in a function.
 
   3. THE CLIENT FACTORIES ARE LAZY AND CACHED. Counting fakes are installed over
      oncotriage.config.OpenAI and .QdrantClient before any call. Construction
@@ -63,11 +83,19 @@ WHAT THIS FILE CHECKS, and how each check could fail
      constant, never fall back to today(). The copy is then rewritten back and
      shown to return date(2026, 8, 3) again. Nothing is edited in place.
 
-  5. NO NAME WAS DROPPED. The set of names each of Files 01, 02 and 03 defined
-     before item 20c is recorded below, extracted from the files at commit
-     3780ba1. Each shim's AST must still bind every one of them, and every name
-     the shims import from the package must actually exist on that package
-     module.
+  5. NO NAME WAS DROPPED. Two inventories, because the two passes need different
+     evidence. Files 01/02/03 are checked against an ast-derived list from
+     commit 3780ba1. Files 08/09/10 are checked against a RUNTIME-derived list:
+     each was exec'd into a throwaway namespace before the move and every
+     binding recorded, because File 08 assigns _seen_canonical at module level
+     and then deletes it, and an ast list would have re-exported a name that
+     never existed. Both directions are asserted -- nothing missing, nothing
+     added.
+
+  5b. THE FILE 10 SPLIT HAS EXACTLY ONE SHARED NAME. Re-derived against the
+     shipped modules rather than asserted in a comment: stage.py and
+     histology.py must reference nothing the other defines, and the one name
+     they both reach for must be _is_negated, out of negation.py.
 
   6. THE THREE LATE-BINDING WRAPPERS STILL BIND LATE. File 02's shim is exec'd
      into a throwaway namespace holding a fake PRICING_CONFIG, a stub Qdrant
@@ -240,6 +268,84 @@ _PRE_20C_NAMES = {
 _PRE_20C_COUNTS = {"01- Imports.py": 120, "02- Utility Functions.py": 14, "03- Config.py": 72}
 
 
+# ===========================================================================
+# THE NAMES FILES 08, 09 AND 10 DEFINED BEFORE PASS 2a
+# ===========================================================================
+# NOT ast-derived. RUNTIME-derived: each file was exec'd into a throwaway
+# namespace with its handful of free names pre-seeded, and every resulting
+# binding recorded. An ast walk would have been wrong in both directions:
+#
+#   TOO FEW   twenty of File 08's names and six of File 10's are ANNOTATED
+#             assignments (`_SNOMED_PRIMARY: FrozenSet[str] = ...`). A
+#             `grep "NAME ="` misses every one, and ast.Assign alone misses
+#             them too -- they are ast.AnnAssign.
+#   TOO MANY  File 08 assigns _seen_canonical at module level and then DELETES
+#             it, along with _idx / _code / _name, in a globals().pop() cleanup
+#             loop. It is not part of the surface and re-exporting it would
+#             have invented a name that never existed at runtime.
+#
+# The same loop leaves `_var` itself bound to the string '_seen_canonical'.
+# That leak is real, it is in the list below, and the shim re-exports it. See
+# the note in "08- Cancer Code Registry.py".
+_PRE_2A_RUNTIME_NAMES = {
+    '08- Cancer Code Registry.py': [
+        'CancerCodeRegistry', 'OncologyLabRegistry',
+        '_CANCER_CLASSIFICATION_COUNTS', '_CANCER_DISPLAY_TERMS',
+        '_CANONICAL_ORDER', '_CLINICAL_STATUS_PRIORITY',
+        '_EXCLUDE_VERIFICATION', '_ICD10_ALPHA_NON_INVASIVE',
+        '_ICD10_ALPHA_PRIMARY', '_ICD10_ALPHA_SECONDARY',
+        '_ICD10_CONSULT_KEYS', '_ICD10_C_BLOCK_MAX',
+        '_ICD10_C_SECONDARY_HI', '_ICD10_C_SECONDARY_LO',
+        '_ICD10_D_NEOPLASM_BLOCK_MAX', '_ICD10_SEED_PRIMARY',
+        '_LAB_REGISTRY', '_NON_INVASIVE_DISPLAY_TERMS', '_ONCOLOGY_LOINC',
+        '_ONCOLOGY_LOINC_CODES', '_REGISTRY', '_REGISTRY_LOCK',
+        '_SECONDARY_DISPLAY_TERMS', '_SNOMED_CONSULT_KEYS',
+        '_SNOMED_PRIMARY', '_SNOMED_SECONDARY', '_build_icd10_cancer_sets',
+        '_var', 'get_cancer_classification_stats', 'load_lab_registry',
+        'load_registry', 'logger', 'reset_cancer_classification_stats',
+    ],
+    '09- MeSH Cancer Site Relevance Filter.py': [
+        'MeSHCancerFilter', 'PAN_CANCER_TREE_MAX_DEPTH',
+        'build_all_lookups', 'build_icd10_to_mesh_crosswalk',
+        'build_mesh_lookup', 'build_snomed_to_mesh_crosswalk',
+        'build_umls_synonym_crosswalk', 'load_mesh_filter',
+        'specific_cancer_trees',
+    ],
+    '10- Structured Eligibility Extractor.py': [
+        '_ADENOCARCINOMA_RE', '_CLAUSE_BOUNDARIES', '_EXCLUSIVE_PAIRS',
+        '_HISTOLOGY_EXTRACTION_COUNTS', '_HISTOLOGY_SUFFIX_WINDOW',
+        '_LOCALLY_ADVANCED_RE', '_LUNG_CONTEXT_RE', '_METASTATIC_RE',
+        '_NEGATION_LOOKBACK', '_NEGATION_PREFIXES', '_NEGATION_SUFFIXES',
+        '_NEUROENDOCRINE_RE', '_NON_METASTATIC_RE', '_NON_MORPH_LOOKBACK',
+        '_NON_MORPH_PREFIX_RE', '_NON_ONCOLOGY_CONTEXT_WINDOW',
+        '_NON_ONCOLOGY_STAGE_CONTEXT_RE', '_NON_SMALL_CELL_RE',
+        '_NSCLC_ABBREV_RE', '_PATIENT_STAGE_RE', '_RANGE_RE',
+        '_SCLC_ABBREV_RE', '_SINGLE_RE', '_SMALL_CELL_RE',
+        '_SNOMED_DISPLAY_STAGE_RE', '_SQUAMOUS_RE', '_STAGE_ALT',
+        '_STAGE_EXTRACTION_COUNTS', '_STAGE_FULL_RANGE_MIN_CEILING',
+        '_STAGE_MAX_ORDINAL', '_STAGE_MIN_ORDINAL', '_STAGE_ORDINAL',
+        '_TRACHEAL_RE', '_collect_stage_ordinals',
+        '_extract_accepts_metastatic', '_extract_histology_tags',
+        '_extract_stage_from_text',
+        '_extract_stage_upper_bound_from_exclusion', '_find_exclusive_pair',
+        '_has_affirmative_match', '_has_conflict', '_is_full_range_span',
+        '_is_histology_negated', '_is_negated', '_is_non_oncology_stage',
+        '_stage_negated', 'enrich_histology_tags',
+        'enrich_structured_eligibility', 'extract_patient_histology',
+        'extract_patient_stage', 'get_histology_extraction_stats',
+        'get_stage_extraction_stats', 'is_histology_mismatch',
+        'is_stage_mismatch', 'reset_histology_extraction_stats',
+        'reset_stage_extraction_stats',
+    ],
+}
+
+_PRE_2A_COUNTS = {
+    '08- Cancer Code Registry.py': 33,
+    '09- MeSH Cancer Site Relevance Filter.py': 9,
+    '10- Structured Eligibility Extractor.py': 56,
+}
+
+
 def _bound_names(path: str) -> set:
     """Every top-level name a module binds: defs, classes, assignments, imports."""
     tree = ast.parse(open(path, encoding="utf-8").read())
@@ -378,8 +484,8 @@ check("oncotriage/config.py does not import oncotriage.utils, anywhere",
 # NON-DEGENERATE. The check above would also pass on a config.py with no
 # imports at all, or on a detector that never returns True. Both are ruled out
 # here: config must import settings, and utils must import config.
-check("...and the detector is not vacuous: config DOES import oncotriage.settings",
-      _mentions_module(_CONFIG_PY, "oncotriage.settings"), True)
+check("...and the detector is not vacuous: config DOES import oncotriage.paths",
+      _mentions_module(_CONFIG_PY, "oncotriage.paths"), True)
 check("...and utils DOES import oncotriage.config (the surviving direction)",
       _mentions_module(_UTILS_PY, "oncotriage.config"), True)
 
@@ -413,7 +519,7 @@ shutil.copytree(_PKG_DIR, os.path.join(_BROKEN_ROOT, "oncotriage"))
 _BROKEN_CONFIG = os.path.join(_BROKEN_ROOT, "oncotriage", "config.py")
 
 _src = open(_BROKEN_CONFIG, encoding="utf-8").read()
-_needle = "from oncotriage import settings"
+_needle = "from oncotriage import paths"
 if _needle not in _src:
     fail("the negative control can find its insertion point",
          f"{_needle!r} is not in the copied config.py; this control is not "
@@ -450,6 +556,148 @@ shutil.rmtree(_BROKEN_ROOT, ignore_errors=True)
 
 
 # ===========================================================================
+# 1b. NO ONCOTRIAGE MODULE IMPORTS ANOTHER FROM INSIDE A FUNCTION BODY
+# ===========================================================================
+
+print("\n" + "=" * 78)
+print("1b. every oncotriage -> oncotriage import is at module scope")
+print("=" * 78)
+
+# WHY THIS RULE EXISTS. Pass 20c-1 put load_env_keys in oncotriage.settings and
+# reached keys_path through `from oncotriage.paths import keys_path` written
+# INSIDE the function body, because paths imports settings and a module-scope
+# import would have been a cycle. It worked. It was also invisible: check 1
+# above reads config.py's import block, and a dependency that is not in an
+# import block cannot be seen by any scan of import blocks. Pass 20c-2a moved
+# the function to paths, where the value already lives, and made the absence of
+# deferred package imports a checked property rather than a habit.
+#
+# THIRD-PARTY IMPORTS IN FUNCTION BODIES ARE NOT COVERED AND MUST NOT BE.
+# cancer_code_registry._build_icd10_cancer_sets() does `import icd10` in its
+# body on purpose: hoisting it would make importing the registry load the whole
+# ICD-10-CM release, which is exactly the import-time work section 2 proves the
+# package does not do. The rule is about oncotriage-to-oncotriage edges, which
+# are the ones that form cycles and the ones a reader needs the import block to
+# be honest about.
+
+_PKG_FILES = sorted(
+    os.path.join(root, name)
+    for root, _dirs, files in os.walk(_PKG_DIR)
+    for name in files
+    if name.endswith(".py") and "__pycache__" not in root
+)
+
+check("the package file list is non-empty and covers both new subpackages",
+      len(_PKG_FILES) >= 11
+      and any(f.endswith("registries/mesh.py") for f in _PKG_FILES)
+      and any(f.endswith("extraction/negation.py") for f in _PKG_FILES),
+      True)
+
+
+def _function_body_imports(path: str):
+    """Every import statement nested inside a def/class in `path`.
+
+    Returns [(qualified_module, enclosing_name, lineno)]. A relative import
+    (``from . import x``) counts as an oncotriage import: node.level > 0 means
+    it can only resolve inside this package.
+    """
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    found = []
+    for scope in ast.walk(tree):
+        if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for node in ast.walk(scope):
+            if isinstance(node, ast.ImportFrom):
+                module = ("." * node.level) + (node.module or "")
+                found.append((module, scope.name, node.lineno))
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    found.append((alias.name, scope.name, node.lineno))
+    return found
+
+
+def _deferred_package_imports(paths):
+    """Function-body imports that resolve inside the oncotriage package."""
+    out = []
+    for path in paths:
+        for module, scope, lineno in _function_body_imports(path):
+            if module.startswith(".") or module == "oncotriage" or module.startswith("oncotriage."):
+                out.append(f"{os.path.relpath(path, _code_dir)}:{lineno} "
+                           f"in {scope}() -> {module}")
+    return sorted(out)
+
+
+# NON-DEGENERATE FIRST. The check below passes on an empty list, and an empty
+# list is exactly what a broken walker returns. So: the walker must find at
+# least one function-body import somewhere in the package, and it must find the
+# specific one that is supposed to be there.
+_ALL_BODY_IMPORTS = sorted(
+    f"{os.path.relpath(p, _code_dir)}:{ln} in {scope}() -> {mod}"
+    for p in _PKG_FILES for mod, scope, ln in _function_body_imports(p)
+)
+check("the walker finds function-body imports at all (non-degeneracy)",
+      len(_ALL_BODY_IMPORTS) >= 1, True)
+check("...specifically the deliberate third-party one, `import icd10` inside "
+      "_build_icd10_cancer_sets",
+      any("_build_icd10_cancer_sets() -> icd10" in e for e in _ALL_BODY_IMPORTS), True)
+
+check("no oncotriage module imports another oncotriage module from a "
+      "function body", _deferred_package_imports(_PKG_FILES), [])
+
+# --- NEGATIVE CONTROL: put a deferred package import back, in a COPY --------
+# Section 1's control showed that a reintroduced module-scope cycle is
+# order-dependent and can import cleanly. A DEFERRED one is worse: it never
+# fails at import at all, in any order, because it does not run until the
+# function is called. Nothing but this scan would notice it, so this scan has
+# to be shown to notice it.
+
+print("\n  Negative control: reintroducing a deferred package import in a COPY")
+
+_DEFERRED_ROOT = tempfile.mkdtemp(prefix="oncotriage_deferred_")
+shutil.copytree(_PKG_DIR, os.path.join(_DEFERRED_ROOT, "oncotriage"))
+_DEFERRED_SETTINGS = os.path.join(_DEFERRED_ROOT, "oncotriage", "settings.py")
+
+# resolve_keys_path, deliberately: it is NOT called while paths.py is being
+# imported. resolve_main_path IS -- putting the deferred import there makes the
+# copy fail at import with a genuine partially-initialized-module error, which
+# would be a different (and louder) defect than the silent one this control is
+# about.
+_src = open(_DEFERRED_SETTINGS, encoding="utf-8").read()
+_needle = "def resolve_keys_path(fallback):\n"
+if _needle not in _src:
+    fail("the deferred-import control can find its insertion point",
+         f"{_needle!r} is not in the copied settings.py; this control is not "
+         f"testing what it claims to")
+else:
+    open(_DEFERRED_SETTINGS, "w", encoding="utf-8").write(_src.replace(
+        _needle,
+        _needle + '    """Reintroduced deferred import."""\n'
+                  "    from oncotriage.paths import keys_path  # reintroduced\n", 1))
+
+    _copied = sorted(
+        os.path.join(root, name)
+        for root, _dirs, files in os.walk(os.path.join(_DEFERRED_ROOT, "oncotriage"))
+        for name in files
+        if name.endswith(".py") and "__pycache__" not in root
+    )
+    _caught = _deferred_package_imports(_copied)
+    check("the scan CATCHES a reintroduced deferred package import",
+          len(_caught), 1)
+    check("...and names the file, the function and the module it found",
+          bool(_caught) and "settings.py" in _caught[0]
+          and "resolve_keys_path()" in _caught[0]
+          and "oncotriage.paths" in _caught[0], True)
+
+    # And the reason the scan is needed at all: the copy still imports fine.
+    _rc, _out, _err = _run("import oncotriage.settings, oncotriage.paths; print('{}')",
+                           cwd=_ELSEWHERE, extra_path=_DEFERRED_ROOT)
+    check("...while the copy still imports cleanly in both directions, which is "
+          "why a runtime check could never find this", _rc, 0)
+
+shutil.rmtree(_DEFERRED_ROOT, ignore_errors=True)
+
+
+# ===========================================================================
 # 2. IMPORTING TOUCHES NO SOCKET, NO DATABASE, NO MODEL
 # ===========================================================================
 
@@ -457,76 +705,125 @@ print("\n" + "=" * 78)
 print("2. importing every package module under a socket / sqlite trap")
 print("=" * 78)
 
-# socket.socket is replaced by a SUBCLASS that raises in __init__, not by a
-# plain function: `ssl.py` does `class SSLSocket(socket)` at import time, and a
-# function cannot be subclassed. Raising before super().__init__ means no file
-# descriptor is ever allocated.
+# WHAT IS TRAPPED, and why each one.
 #
-# The heavy-module list is torch / transformers / sentence_transformers /
-# streamlit / langgraph. fastembed is deliberately NOT in it: qdrant_client
-# imports it transitively, so its presence in sys.modules says nothing about
-# this package -- and importing fastembed loads no weights, which is what the
-# claim is about. The MedCPT cross-encoder is what "loads a model" means here,
-# and it needs torch and transformers.
-_PURITY = r'''
-import json, socket, sqlite3, sys
+#   socket.socket        replaced by a SUBCLASS that raises in __init__, not by
+#                        a plain function: `ssl.py` does `class SSLSocket(socket)`
+#                        at import time and a function cannot be subclassed.
+#                        Raising before super().__init__ means no file
+#                        descriptor is ever allocated.
+#   socket.create_connection   the other way a client opens a connection.
+#   sqlite3.connect      "touches no database".
+#   builtins.open        "reads no JSON". Added in pass 2a, when
+#   io.open              oncotriage.registries.mesh arrived: load_mesh_filter()
+#                        reads four JSON lookups and MUST do it in a function,
+#                        not at import. Both bindings are patched because they
+#                        are separate references to the same function -- and
+#                        pathlib.Path.open() goes through io.open, so patching
+#                        only builtins.open would leave every Path read open.
+#
+# io.open_code is deliberately NOT patched: that is what the import machinery
+# itself uses to read a .py file, and trapping it would trap the very imports
+# under test.
+#
+# THE THIRD-PARTY IMPORTS HAPPEN BEFORE THE TRAP IS ARMED. openai pulls in
+# sysconfig, which on macOS reads /System/Library/CoreServices to work out the
+# OS version, and that read is not this package's doing. Pre-importing them
+# makes the claim exactly "importing an oncotriage module reads no file",
+# which is the claim worth making. Verified: with the pre-imports removed, the
+# run dies inside _osx_support, which is how this was found.
+#
+# The heavy-module list is what "loads no model" means: torch / transformers /
+# sentence_transformers carry MedCPT, and icd10 is the full ICD-10-CM release
+# that _build_icd10_cancer_sets() imports INSIDE its body. fastembed is
+# deliberately absent from the list -- qdrant_client imports it transitively, so
+# its presence says nothing about this package, and importing it loads no
+# weights.
+_PURITY = r"""
+import builtins, io, json, socket, sqlite3, sys
+
+import caffeine, dotenv, httpx, openai, qdrant_client, tenacity           # noqa: F401
+import collections, glob, logging, os, pathlib, re, threading, typing     # noqa: F401
+import xml.etree.ElementTree                                              # noqa: F401
+
 
 class Blocked(RuntimeError):
     pass
 
+
 _real_socket = socket.socket
+
 
 class BlockedSocket(_real_socket):
     def __init__(self, *args, **kwargs):
         raise Blocked("socket.socket() was constructed")
 
+
 def _blocked(*args, **kwargs):
     raise Blocked("a blocked call was made")
+
 
 socket.socket = BlockedSocket
 socket.create_connection = _blocked
 sqlite3.connect = _blocked
+builtins.open = _blocked
+io.open = _blocked
 
 import oncotriage.constants
 import oncotriage.settings
 import oncotriage.paths
 import oncotriage.config
 import oncotriage.utils
+import oncotriage.registries.cancer_code_registry
+import oncotriage.registries.mesh
+import oncotriage.registries.mesh_crosswalk_build
+import oncotriage.extraction.negation
+import oncotriage.extraction.stage
+import oncotriage.extraction.histology
 
 heavy = [m for m in ("torch", "transformers", "sentence_transformers",
-                     "streamlit", "langgraph") if m in sys.modules]
+                     "streamlit", "langgraph", "icd10") if m in sys.modules]
 
-armed_socket = False
-try:
-    socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-except Blocked:
-    armed_socket = True
+armed = {}
+for _name, _fn, _args in (("socket", socket.socket, (socket.AF_INET, socket.SOCK_STREAM)),
+                          ("sqlite3", sqlite3.connect, (":memory:",)),
+                          # The path never has to exist: the trap raises
+                          # before anything reaches the filesystem, and a path
+                          # that does exist would let a FAILED trap silently
+                          # succeed instead of raising FileNotFoundError.
+                          ("open", builtins.open, ("/oncotriage-trap-probe",)),
+                          ("io.open", io.open, ("/oncotriage-trap-probe",))):
+    try:
+        _fn(*_args)
+        armed[_name] = False
+    except Blocked:
+        armed[_name] = True
 
-armed_db = False
-try:
-    sqlite3.connect(":memory:")
-except Blocked:
-    armed_db = True
+print(json.dumps({"heavy": heavy, "armed": armed}))
+"""
 
-print(json.dumps({"heavy": heavy, "armed_socket": armed_socket, "armed_db": armed_db}))
-'''
+_MODULES_UNDER_TRAP = 11
 
 _rc, _out, _err = _run(_PURITY, cwd=_ELSEWHERE, extra_path=_FALLBACK_PATH)
-check("all five package modules import with socket.socket and sqlite3.connect "
-      "patched to raise", _rc, 0)
+check(f"all {_MODULES_UNDER_TRAP} package modules import with open, io.open, "
+      f"socket.socket, socket.create_connection and sqlite3.connect patched to "
+      f"raise", _rc, 0)
 if _rc != 0:
     fail("import purity",
          f"exit {_rc}; stderr tail: {_err.strip().splitlines()[-4:]}")
 else:
     _payload = _last_json(_out) or {}
-    # NON-DEGENERATE, and this is the important one: a subprocess where the
-    # patch silently did nothing would also exit 0. These two assert the trap
-    # was live at the end of the run.
-    check("the socket trap was ARMED (a socket built after the imports raises)",
-          _payload.get("armed_socket"), True)
-    check("the sqlite trap was ARMED (a connect after the imports raises)",
-          _payload.get("armed_db"), True)
-    check("no model-bearing library was imported",
+    _armed = _payload.get("armed") or {}
+    # NON-DEGENERATE, and this is the important part: a subprocess where the
+    # patches silently did nothing would also exit 0. Each trap is fired after
+    # the imports and must raise, so a run that proved nothing fails instead of
+    # passing. The dict is checked whole, not key by key, so a trap that
+    # disappears from the probe is a failure rather than an unnoticed omission.
+    check("every trap was ARMED after the imports (socket, sqlite3, open, io.open)",
+          _armed,
+          {"socket": True, "sqlite3": True, "open": True, "io.open": True})
+    check("no model-bearing library was imported (torch / transformers / "
+          "sentence_transformers / streamlit / langgraph / icd10)",
           _payload.get("heavy"), [])
 
 
@@ -746,6 +1043,138 @@ if _rc == 0:
 else:
     fail("package surface probe",
          f"exit {_rc}; stderr tail: {_err.strip().splitlines()[-4:]}")
+
+
+# --- Files 08, 09 and 10: exec the shim, compare the whole namespace --------
+# A stronger check than the ast one above, and the right one for these three:
+# their surface includes a name that is assigned and then deleted, so only
+# executing the file can say what it really binds. The shim is exec'd into a
+# bare namespace in a SUBPROCESS -- File 09's shim imports the MeSH filter,
+# which resolves data_MeSH_path, and none of that should land in this process.
+#
+# Nothing is pre-seeded. That is deliberate: before pass 2a these files needed
+# SYSTEM_KEY_ABSENT, data_MeSH_path and a dozen typing names out of the shared
+# exec namespace, and after it they must need nothing at all, because a shim is
+# import statements. If any of them still reached for a free name, the exec
+# would raise NameError and this check would go red.
+
+_SHIM_PROBE = r"""
+import json, sys
+path = sys.argv[1]
+ns = {"__name__": "_exec_chain_", "__file__": path}
+with open(path, encoding="utf-8") as fh:
+    exec(fh.read(), ns)
+print(json.dumps(sorted(k for k in ns if not k.startswith("__"))))
+"""
+
+for _filename, _expected in _PRE_2A_RUNTIME_NAMES.items():
+    check(f"the recorded runtime name list for {_filename[:2]} is the size it "
+          f"was extracted at", len(_expected), _PRE_2A_COUNTS[_filename])
+
+    _proc = subprocess.run(
+        [sys.executable, "-c", _SHIM_PROBE, os.path.join(_code_dir, _filename)],
+        cwd=_ELSEWHERE, capture_output=True, text=True,
+        env={**{k: v for k, v in os.environ.items() if k != "PYTHONPATH"},
+             **({"PYTHONPATH": _FALLBACK_PATH} if _FALLBACK_PATH else {})},
+    )
+    if _proc.returncode != 0:
+        fail(f"{_filename[:2]}: the shim exec'd into a bare namespace",
+             f"exit {_proc.returncode}; stderr tail: "
+             f"{_proc.stderr.strip().splitlines()[-3:]}")
+        continue
+
+    _lines = [ln for ln in _proc.stdout.strip().splitlines() if ln.startswith("[")]
+    _bound = json.loads(_lines[-1]) if _lines else None
+    if _bound is None:
+        fail(f"{_filename[:2]}: the shim probe returned a name list",
+             f"stdout tail: {_proc.stdout.strip().splitlines()[-3:]}")
+        continue
+
+    check(f"{_filename[:2]}: all {len(_expected)} pre-2a runtime names still bound",
+          sorted(set(_expected) - set(_bound)), [])
+    # Both directions. A shim that re-exported something File 08 never defined
+    # would put a name into the shared exec namespace that no caller expects,
+    # and the next file to use that name would silently pick this one up.
+    check(f"{_filename[:2]}: and nothing was ADDED to the shared namespace",
+          sorted(set(_bound) - set(_expected)), [])
+
+
+# ===========================================================================
+# 5b. THE FILE 10 SPLIT HAS EXACTLY ONE SHARED NAME
+# ===========================================================================
+
+print("\n" + "=" * 78)
+print("5b. stage and histology share exactly one name, and it lives in negation")
+print("=" * 78)
+
+# THE EVIDENCE FOR THE SPLIT, re-derived here rather than asserted in a comment.
+#
+# "10- Structured Eligibility Extractor.py" was two extractors in one file, and
+# the claim that it splits cleanly rests on exactly one measurement: how many
+# top-level names in one half are referenced by the other. The answer was 1 --
+# _is_histology_negated() calls _is_negated() -- which is why negation.py
+# exists and why the split is a fact rather than a preference.
+#
+# The measurement is repeated against the SHIPPED modules, so the claim decays
+# into a failure if someone later adds a second edge instead of moving the
+# shared name into negation.py where it belongs.
+#
+# A grep could not have settled this. It cannot tell a call from a mention in
+# a docstring, and File 10's docstrings mention _is_negated by name.
+
+_STAGE_PY = os.path.join(_PKG_DIR, "extraction", "stage.py")
+_HIST_PY = os.path.join(_PKG_DIR, "extraction", "histology.py")
+_NEG_PY = os.path.join(_PKG_DIR, "extraction", "negation.py")
+
+
+def _top_level_names(path: str) -> set:
+    """Names a module binds at top level, imports EXCLUDED.
+
+    Imports are excluded on purpose: stage.py imports _is_negated, and counting
+    that as a definition would make the two halves look like they define the
+    same name rather than share one.
+    """
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    names = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+    return names
+
+
+def _loaded_names(path: str) -> set:
+    """Every Name read anywhere in the module."""
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    return {n.id for n in ast.walk(tree)
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+
+
+_STAGE_DEFS, _HIST_DEFS, _NEG_DEFS = (_top_level_names(f) for f in
+                                      (_STAGE_PY, _HIST_PY, _NEG_PY))
+
+# NON-DEGENERATE FIRST. Every one of the three checks below is an intersection,
+# and an intersection with an empty set is empty. If any of these modules
+# stopped defining anything -- a bad slice, a truncated file -- the edge counts
+# would all read zero and this section would certify a split that no longer
+# exists.
+check("stage.py, histology.py and negation.py all define a plausible number "
+      "of top-level names (non-degeneracy)",
+      len(_STAGE_DEFS) >= 20 and len(_HIST_DEFS) >= 20 and len(_NEG_DEFS) == 4,
+      True)
+
+check("histology.py references nothing that stage.py defines",
+      sorted(_loaded_names(_HIST_PY) & _STAGE_DEFS), [])
+check("stage.py references nothing that histology.py defines",
+      sorted(_loaded_names(_STAGE_PY) & _HIST_DEFS), [])
+check("the one name they DO share is _is_negated, and it lives in negation.py",
+      sorted(_NEG_DEFS & (_loaded_names(_STAGE_PY) | _loaded_names(_HIST_PY))),
+      ["_is_negated"])
+check("...and both halves import it rather than redefining it",
+      "_is_negated" in _STAGE_DEFS or "_is_negated" in _HIST_DEFS, False)
 
 
 # ===========================================================================

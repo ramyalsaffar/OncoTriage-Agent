@@ -30,17 +30,23 @@ proxies, and ``36- Logging Contract Test.py`` swaps in a stub. Those seams work
 because the pipeline resolves the NAME at call time; the factories exist for
 the package's own callers, not to replace the seam.
 
-Imports ``oncotriage.settings`` only. It does NOT import ``oncotriage.paths``
-(nothing here is derived from a path — ``load_env_keys`` resolves its own
-default) and it must never import ``oncotriage.utils``: that is the cycle this
-pass removed.
+Imports ``oncotriage.paths`` and nothing else from the project. It must never
+import ``oncotriage.utils``: that is the cycle item 20c removed.
+
+The one thing it needs is ``load_env_keys``, which lived in ``settings`` for
+pass 20c-1 and moved to ``paths`` in pass 20c-2a, beside the ``keys_path`` it
+defaults to. Importing ``paths`` therefore resolves the directory tree as a side
+effect of importing this module — globs and prints, no file read, no client. It
+did not before, when the import was ``settings``; that is the cost of removing a
+deferred import, and it is stated here rather than discovered from a stray
+"[Paths] Project root" line in a log.
 """
 
 import httpx
 from openai import OpenAI
 from qdrant_client import QdrantClient
 
-from oncotriage import settings
+from oncotriage import paths
 
 
 #------------------------------------------------------------------------------
@@ -284,12 +290,12 @@ def get_keys() -> dict:
     ``{'openai': ..., 'qdrant_url': ..., 'qdrant_key': ...}``.
 
     Raises FileNotFoundError / ValueError from
-    ``oncotriage.settings.load_env_keys`` — an absent or incomplete .env is a
+    ``oncotriage.paths.load_env_keys`` — an absent or incomplete .env is a
     configuration error and is not recovered from here.
     """
     global _KEYS_CACHE
     if _KEYS_CACHE is None:
-        _KEYS_CACHE = settings.load_env_keys()
+        _KEYS_CACHE = paths.load_env_keys()
     return _KEYS_CACHE
 
 
