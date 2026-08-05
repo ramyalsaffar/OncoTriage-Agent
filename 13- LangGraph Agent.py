@@ -472,10 +472,29 @@ def get_embedding(text: str) -> List[float]:
     Defined here so the agent file is fully self-contained.
     The RAG Indexer (08) has its own copy used at indexing time.
     This copy is used at inference time only.
+
+    BOUNDED, on its own budget. This call had been left on the SDK's 600s
+    default after the Stage 5 call was moved off it, which made the file
+    inconsistent with no stated reason -- the next reader would have had to
+    guess whether that was a decision or an oversight. It was an oversight.
+
+    EMBEDDING_REQUEST_TIMEOUT_SECONDS is a separate constant from
+    MATCHING_REQUEST_TIMEOUT_SECONDS on purpose: 300s is sized for a request
+    that generates thousands of tokens and this one generates none. File 03
+    records how the value was arrived at, and states plainly that it comes from
+    the call's SHAPE rather than from a measurement, because no embedding
+    latency has ever been measured here.
+
+    The @retry decorator above stays and is NOT the same budget: it re-issues
+    the whole call on RateLimitError / InternalServerError / APIConnectionError
+    (which APITimeoutError subclasses, so a timeout is retried there too). The
+    timeout bounds ONE attempt; the decorator bounds how many attempts there
+    are. File 03 states the product.
     """
     response = openai_client.embeddings.create(
         model=EMBEDDING_MODEL,
-        input=text
+        input=text,
+        timeout=EMBEDDING_REQUEST_TIMEOUT_SECONDS,
     )
     return response.data[0].embedding
 
@@ -2368,6 +2387,19 @@ def call_matching_model(system_prompt: str, user_prompt: str):
                               does not replay it -- unlike everything else in
                               this call, a change to it is invisible in a
                               fixture diff, and that is correct.
+      max_retries             NOT SET HERE, and that is not an oversight: it
+                              is set on the client itself in File 03
+                              (OPENAI_SDK_MAX_RETRIES) because it cannot be
+                              scoped to one call without breaking the fixture
+                              harness. See the note on the return statement.
+                              It is the other half of the bound -- a timeout
+                              with the SDK's default of 2 retries is still
+                              three attempts -- and it is the TRANSPORT budget,
+                              deliberately distinct from MAX_GPT4O_RETRIES,
+                              which covers a response that arrived and would
+                              not parse. File 03 states both, plus the
+                              truncation-split budget, and the worst-case wall
+                              time the three produce together.
       temperature             NOT SENT. Rejected for every value but the
                               provider default of 1, so there is nothing to
                               send. MATCHING_TEMPERATURE is None.
@@ -2384,6 +2416,27 @@ def call_matching_model(system_prompt: str, user_prompt: str):
     Anything added to this call must also be added to the request block File 45
     records and File 46 replays, or a fixture stops being able to see it.
     """
+    # NOTE THE ASYMMETRY: timeout is set HERE, the retry budget is not.
+    #
+    # OPENAI_SDK_MAX_RETRIES is applied once, on the client constructor in File
+    # 03, and there is no way to scope it to this call that does not break
+    # something else:
+    #
+    #   - create() has no max_retries parameter and no **kwargs, so passing it
+    #     as a kwarg raises TypeError on every call. (timeout IS in create()'s
+    #     signature, alongside extra_headers/extra_query/extra_body, which is
+    #     the whole reason the two look like a pair but are not.)
+    #   - openai_client.with_options(max_retries=...) is the SDK's supported
+    #     way, and it is the trap. It returns a NEW client object, and File
+    #     45's OpenAIProxy -- the shim that records Stage 5 exchanges into a
+    #     fixture -- forwards unknown attributes straight to the real inner
+    #     client via __getattr__. So with_options() here would hand back an
+    #     UNWRAPPED client: capture would issue a real call and record nothing,
+    #     and File 46's replay would go to the network instead of serving the
+    #     recording. A per-call retry override costs the entire fixture
+    #     harness.
+    #
+    # So the retry budget is client-wide by necessity, and File 03 says so.
     return openai_client.chat.completions.create(
         model=MATCHING_MODEL,
         messages=[

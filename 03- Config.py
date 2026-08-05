@@ -197,7 +197,40 @@ qdrant_url = keys['qdrant_url']
 qdrant_api_key = keys['qdrant_key']
 
 
-openai_client = OpenAI(api_key=openai_api_key)
+# How many times the OpenAI SDK may retry ONE request by itself.
+#
+# DEFINED HERE, ABOVE THE CLIENT, because it can only be applied at
+# construction. It is logically part of the Stage 5 request budget documented
+# beside MATCHING_REQUEST_TIMEOUT_SECONDS below, and it is here instead of
+# there for two hard reasons:
+#
+#   1. the SDK has no per-request retry option. create() has no max_retries
+#      parameter and no **kwargs, so passing it as a call kwarg raises
+#      TypeError on every call;
+#   2. openai_client.with_options(max_retries=...) IS the SDK's supported
+#      per-call override, and using it would silently disable the fixture
+#      harness. File 45 wraps this client in an OpenAIProxy whose __getattr__
+#      forwards unknown attributes to the real inner client, so with_options()
+#      returns an UNWRAPPED client: a capture would spend a real call and
+#      record nothing, and a replay would hit the network instead of serving
+#      its recording.
+#
+# So it is client-wide, and that means it also governs the embedding call in
+# File 13. That is acceptable and mildly beneficial: get_embedding() already
+# carries a tenacity decorator with 5 attempts, so the SDK's own retries were
+# redundant there, and lowering them from 2 to 1 tightens that call's bound
+# from 5 x 3 x 30s to 5 x 2 x 30s. It is NOT scoped to Stage 5, and the name
+# says OPENAI rather than MATCHING for exactly that reason.
+#
+# WHY 1 RATHER THAN THE SDK's DEFAULT OF 2. See the budget reconciliation
+# beside MATCHING_REQUEST_TIMEOUT_SECONDS: anything that fails twice in a row
+# is not transient, and MAX_GPT4O_RETRIES is the budget that should see it.
+# Kept at 1 rather than 0 because a single transient blip is the common case
+# and recovering it in-SDK is far cheaper than re-entering the node.
+OPENAI_SDK_MAX_RETRIES = 1
+
+openai_client = OpenAI(api_key=openai_api_key,
+                       max_retries=OPENAI_SDK_MAX_RETRIES)
 qdrant_client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key, timeout=120)
 
 
@@ -333,16 +366,132 @@ MATCHING_SEED = 42
 # cost of being too tight is a failed patient, while the cost of being too
 # loose is only that a stall takes longer to surface.
 #
-# THIS DOES NOT BOUND TOTAL WALL TIME BY ITSELF. max_retries is left at the
-# SDK default of 2, so a request that times out three times still occupies
-# 3 x 300 = 15 minutes -- better than 30, not fixed. Bounding that properly
-# means setting max_retries too, which interacts with the pipeline's own
-# MAX_GPT4O_RETRIES budget and is deliberately left for a separate change.
+# THIS BOUNDS ONE ATTEMPT, NOT ONE PATIENT. See
+# the three-budget reconciliation below for the arithmetic that turns it into a
+# per-patient bound, and OPENAI_SDK_MAX_RETRIES near the top of this file for
+# the retry half of it.
+#
+# ONE SIDE EFFECT WORTH KNOWING. The SDK default is not a flat 600s: it is
+# Timeout(connect=5.0, read=600, write=600, pool=600). Passing a plain number
+# replaces all four, so the CONNECT timeout goes from 5s to 300s. That does not
+# widen the worst case -- one attempt is still bounded by 300s either way --
+# but a dead host now takes 300s to notice instead of 5s. Restoring the tighter
+# connect leg means passing an httpx.Timeout, which is a new import for a
+# failure mode that is already bounded, so it is recorded here rather than done.
 #
 # RE-DERIVE THIS IF MATCHING_REASONING_EFFORT CHANGES. The worst single call
 # was 94.6s at 'none' and 107.5s at 'medium'; the higher tiers were not
 # measured and could be far slower.
 MATCHING_REQUEST_TIMEOUT_SECONDS = 300
+
+# THE THREE RETRY BUDGETS, RECONCILED.
+#
+# The SDK retry constant itself is OPENAI_SDK_MAX_RETRIES, defined ABOVE the
+# client construction near the top of this file, because it can only be applied
+# at construction -- the reason is written there. It belongs to this block
+# conceptually, so the reconciliation lives here.
+#
+# THESE ARE THREE BUDGETS COVERING DIFFERENT FAILURES. Keeping them separate is
+# the same reasoning item 19c used when it split the truncation budget out of
+# the parse budget: a counter shared between unrelated failures fails a patient
+# for the wrong reason.
+#
+#   OPENAI_SDK_MAX_RETRIES (1, set on the client above)
+#       TRANSPORT. The request never produced a usable HTTP response -- a
+#       timeout, a connection reset, a 429, a 5xx. Retried inside the SDK, so
+#       it costs one more HTTP attempt and nothing else. Kept at 1 rather than
+#       0 because the common case is a single transient blip and recovering it
+#       in-SDK is far cheaper than re-entering the node; kept at 1 rather than
+#       the SDK's default 2 because anything that fails twice in a row is not
+#       transient and MAX_GPT4O_RETRIES is the budget that should see it.
+#
+#   MAX_GPT4O_RETRIES (line ~211, 3)
+#       THE RESPONSE CAME BACK AND WAS UNUSABLE. Malformed JSON, a non-list
+#       payload, or an exception that escaped the call. Retried by re-entering
+#       node_gpt4o_evaluation, which rebuilds and re-sends the whole prompt.
+#       Note this budget ALSO absorbs a transport failure that survived the SDK
+#       retry above, which is why the two multiply in the arithmetic below.
+#
+#   MAX_TRUNCATION_SPLITS (3)
+#       THE RESPONSE WAS FINE BUT TOO LONG. Not a retry at all: it is depth of
+#       halving, and it only happens after a call that SUCCEEDED and reported
+#       finish_reason='length'. It multiplies the NUMBER of requests, not the
+#       number of attempts at one request.
+#
+# WORST-CASE WALL TIME PER PATIENT, stated because a bound nobody has computed
+# is not a bound:
+#
+#   one request, all attempts timing out
+#       (1 + OPENAI_SDK_MAX_RETRIES) x MATCHING_REQUEST_TIMEOUT_SECONDS
+#       = 2 x 300 = 600s
+#
+#   one patient, every node attempt dying at transport  <-- THE REAL BOUND
+#       MAX_GPT4O_RETRIES x 600 = 3 x 600 = 1,800s = 30 MINUTES
+#       (3 node attempts, not 4: retry_count is incremented before the router
+#        compares it, so the loop runs 3 times and then routes to the error
+#        handler.)
+#
+#       The same figure at each earlier state of this file, so the direction of
+#       travel is checkable rather than asserted:
+#           before item 29b   no timeout, 2 SDK retries: 3 x 3 x 600 = 90 min
+#           after  item 29b   300s timeout, 2 SDK retries: 3 x 3 x 300 = 45 min
+#           now               300s timeout, 1 SDK retry:  3 x 2 x 300 = 30 min
+#
+#   one patient whose responses all succeed and all truncate
+#       a 15-trial batch split to depth 3 issues at most 1+2+4+8 = 15 requests.
+#       At the MEASURED per-call latency that is ~15 x 67s = 17 minutes of real
+#       work -- not a failure mode, and not additive with the 30 minutes above:
+#       a call cannot both succeed-and-truncate and die at transport.
+#
+# So: 30 minutes is the ceiling for a patient stuck against a broken endpoint,
+# and ~17 minutes is the ceiling for one doing an unusual amount of real work.
+# Neither is unbounded, which is the property that did not hold before.
+#
+# (No constant is assigned here on purpose -- OPENAI_SDK_MAX_RETRIES is defined
+#  above the client construction, where it has to be.)
+
+
+# Wall-clock ceiling on ONE embedding request, in seconds.
+#
+# WHY THIS IS NOT MATCHING_REQUEST_TIMEOUT_SECONDS. get_embedding() (File 13)
+# runs once per patient at inference time and had been left on the same 600s
+# SDK default the Stage 5 call was moved off. Reusing the Stage 5 number would
+# have been the easy thing and the wrong one: 300s is sized for a request that
+# GENERATES thousands of tokens, and an embedding generates none.
+#
+# NOT A MEASUREMENT. No embedding-latency figure exists anywhere in this
+# codebase or in the item 29a data -- the bake-off timed Stage 5 calls only,
+# and the fixtures record embedding VECTORS with no timing beside them. This
+# value is therefore derived from the CALL'S SHAPE, and that basis is stated
+# rather than dressed up as evidence:
+#
+#   - the input is one short string (the expanded query, a few hundred
+#     characters), against Stage 5's ~11,000 input tokens;
+#   - there is no autoregressive generation at all: the response is a single
+#     fixed-size 1,536-float vector, so latency is one forward pass plus
+#     round-trip, not a token-by-token stream;
+#   - Stage 5, which does vastly more work, has a measured median of 66.5s.
+#
+# 30s is therefore generous for the shape of the call while still being a real
+# bound. If it proves too tight the symptom is LOUD, not silent: an
+# APITimeoutError, which the tenacity decorator on get_embedding() retries and
+# then re-raises. Replace this with a measured value the first time anyone
+# instruments the call.
+#
+# WORST CASE, INCLUDING THE DECORATOR ALREADY ON THAT FUNCTION. get_embedding()
+# carries @retry(stop=stop_after_attempt(5), wait=wait_exponential(min=2,
+# max=60), retry_if_exception_type((RateLimitError, InternalServerError,
+# APIConnectionError))). APITimeoutError is a SUBCLASS of APIConnectionError,
+# so a timeout is retried there too. With OPENAI_SDK_MAX_RETRIES = 1 now in
+# force on the client, the bound is
+#
+#     5 tenacity attempts x 2 SDK attempts x 30s + ~30s of backoff = ~5.5 min
+#
+# against 5 x 3 x 600 = 2.5 HOURS before either constant existed. The 5x2
+# nesting is still redundant -- two retry mechanisms stacked on one call -- and
+# collapsing it is worth doing, but it is a change to the decorator rather than
+# to the timeout and is left out of this item deliberately.
+EMBEDDING_REQUEST_TIMEOUT_SECONDS = 30
 
 # Expected output tokens per trial evaluated, used to decide whether a batch
 # should be split BEFORE it is sent.

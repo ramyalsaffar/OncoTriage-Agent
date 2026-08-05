@@ -238,7 +238,15 @@ def process_patient(
     Returns:
         Dict with keys: patient_id, status, eligible_matches, near_misses,
         not_evaluable, total_time, error, is_resample.
-        Never raises -- all exceptions are caught and returned as error entries.
+
+    Raises:
+        MatchingModelMismatchError: and ONLY that. Every other exception is
+            caught and returned as an error entry, which is what lets one bad
+            patient not take the batch with it. This one is a condition of the
+            run rather than of the patient -- the judging model changed
+            underneath it -- so it is allowed through. See the handler for the
+            full reasoning, and the executor block in run_batch() for what
+            "allowed through" actually achieves, which is less than it sounds.
     """
     patient_file = Path(fhir_path)
     patient_id_hint = patient_file.stem  # filename without extension as fallback ID
@@ -304,6 +312,30 @@ def process_patient(
             "error": error_msg,
             "is_resample": is_resample,
         }
+
+    except MatchingModelMismatchError:
+        # NOT a per-patient failure, so not absorbed into a per-patient error
+        # row. Stage 5 raises this when the string the API answers with differs
+        # from MATCHING_MODEL -- an alias that has resolved to a new snapshot
+        # mid-run. Every patient after that point is judged by a different
+        # model than every patient before it, and a corpus split down the
+        # middle by an invisible model change is the confound this project
+        # exists to remove: the rows are individually well-formed and
+        # collectively meaningless.
+        #
+        # Catching it here would produce exactly the failure the guard was
+        # written to prevent -- a batch grinding on, printing one EXCEPTION per
+        # patient, for as long as the run had left. Files 26 and 13 carry the
+        # same carve-out, File 26's alongside the older one for
+        # UnknownModelPricingError, which is not absorbed for the same reason:
+        # it is a condition of the RUN, not of the patient.
+        #
+        # Re-raised bare rather than wrapped: File 13's message already carries
+        # both model strings and what to do about them.
+        #
+        # READ THE COMMENT AT THE EXECUTOR BELOW BEFORE ASSUMING THIS STOPS THE
+        # BATCH. It does not, and where it stops instead is written down there.
+        raise
 
     except Exception as e:
         error_msg = f"{type(e).__name__}: {e}"
@@ -415,6 +447,41 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
     
     builtins.print = _tqdm_print
     
+    # ── WHAT A MatchingModelMismatchError ACTUALLY DOES HERE ────────────────
+    #
+    # MEASURED, not assumed. Driving this exact function with 40 patients, 4
+    # workers, and a mismatch raised by the 4th patient submitted:
+    #
+    #     the exception DOES escape run_batch
+    #     but all 40 of 40 patients ran to completion first
+    #
+    # So process_patient re-raising does NOT stop the batch. Three things
+    # compound to produce that:
+    #
+    #   1. every future is submitted up front, in the loop below, before any
+    #      result is read — so the whole remaining corpus is already queued
+    #      before the first failure is visible (item 44 records the same fact
+    #      about crash recovery);
+    #   2. _on_done is a done-CALLBACK and catches Exception around
+    #      future.result(), so it absorbs the mismatch, prints
+    #      "[CALLBACK ERROR]" and returns. A raise inside a callback would not
+    #      help either: concurrent.futures logs and discards those;
+    #   3. `for future in futures: future.result()` does re-raise — but that
+    #      exception exits the `with` block, and ThreadPoolExecutor.__exit__
+    #      calls shutdown(wait=True), which drains every queued future before
+    #      the exception propagates any further.
+    #
+    # WHAT IS STILL GAINED, and it is not nothing: the failing patients get no
+    # result row and are never checkpointed (status != "success" skips
+    # save_checkpoint), so a resume re-runs them rather than treating them as
+    # done; and the process now ends by RAISING instead of printing a summary
+    # and exiting 0, so a mid-run model change cannot be mistaken for a clean
+    # run. What is not gained is early termination.
+    #
+    # FIXING IT PROPERLY needs a cooperative cancellation flag that submitted-
+    # but-not-started tasks check before doing work. That mechanism belongs to
+    # item 44 and is deliberately NOT built here — a second, competing
+    # shutdown path would be worse than the honest gap.
     try:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = []
@@ -533,6 +600,11 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
         progress.set_postfix(ok=resample_success, err=resample_error)
         progress.update(1)
 
+    # Same submit-everything-then-drain structure as run_batch(), and therefore
+    # the same behaviour on a MatchingModelMismatchError: it escapes eventually
+    # but the pass does not stop early. The reasoning is written out once, at
+    # the executor in run_batch(); this is the second instance of it, not a
+    # different case.
     try:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = []
