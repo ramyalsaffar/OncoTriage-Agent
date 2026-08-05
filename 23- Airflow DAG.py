@@ -50,8 +50,9 @@
 # generated DAG, in a process that has none of this namespace, so they are not
 # dependencies of the generator. 02 is not loaded because nothing here calls
 # exec_chain or any utility function, and 03 is not loaded because the DAG
-# reads its config out of 03 at task time, through PROJECT_CODE_PATH, not from
-# this namespace. Chaining either would be loading a file this one does not use.
+# reads its config out of oncotriage/config.py at parse and task time, through
+# PROJECT_CODE_PATH, not from this namespace. Chaining either would be loading
+# a file this one does not use.
 #
 # Item 20a: this file sits in the code directory, so __file__ locates it with
 # no hardcoded path. __file__ is bound when the file is run as a script (every
@@ -168,22 +169,37 @@ DATA_TRIAL_PATH = _path_from_env(%r, %r)
 dag_content_tail = '''
 
 # =============================================================================
-# Config (loaded dynamically from 03- Config.py inside each task)
+# Config (read out of oncotriage/config.py, at parse time and at task time)
 # =============================================================================
+#
+# ITEM 20c RETARGETED THIS. Both functions used to read "03- Config.py". Every
+# constant moved into oncotriage/config.py and File 03 became a shim whose
+# DATA_SNAPSHOT_DATE, COLLECTION_NAME and the rest arrive by `from
+# oncotriage.config import ...`. That breaks both of the old readers, in
+# different ways and only one of them loudly:
+#
+#   _config_literal  looks for a module-level Assign. An ImportFrom is not an
+#                    Assign, so it would raise "AIRFLOW_DAG_SCHEDULE is not
+#                    assigned at module level" at every DAG parse.
+#   _load_config     exec'd File 03, which now needs the oncotriage package on
+#                    the scheduler's sys.path -- a dependency the scheduler has
+#                    no reason to satisfy, and one that would surface as an
+#                    ImportError inside a task rather than at generation.
+#
+# Both now read oncotriage/config.py, which holds the literals themselves.
 def _config_literal(name):
-    """Read one module-level literal out of 03- Config.py without running it.
+    """Read one module-level literal out of oncotriage/config.py without
+    running it.
 
-    Used for values needed at DAG PARSE time, in the scheduler's own process.
-    _load_config() below cannot serve that: it execs file 03, which calls
-    load_env_keys() (defined in file 02) and constructs the OpenAI and Qdrant
-    clients, so parsing a DAG would need keys and a network. Reading the
-    assignment out of the AST needs neither.
+    Reading the assignment out of the AST needs no keys, no network and no
+    sys.path entry for the package -- which is what makes it usable at DAG
+    PARSE time, in the scheduler's own process.
 
     Raises if the name is absent. A schedule that cannot be read is a config
     defect, and defaulting to some other schedule here would silently restore
     automatic runs that were deliberately turned off.
     """
-    config_path = PROJECT_CODE_PATH + "03- Config.py"
+    config_path = PROJECT_CODE_PATH + "oncotriage/config.py"
     with open(config_path, "r") as f:
         tree = ast.parse(f.read(), filename=config_path)
     for node in tree.body:
@@ -195,20 +211,25 @@ def _config_literal(name):
 
 
 def _load_config() -> dict:
-    """Exec file 03 into an isolated namespace and extract config values."""
-    ns = {}
-    config_path = PROJECT_CODE_PATH + "03- Config.py"
-    with open(config_path, "r") as f:
-        exec(f.read(), ns)
+    """The eight config values the tasks need, read as literals.
+
+    This used to exec File 03 into a throwaway namespace, which built an
+    OpenAI client and a Qdrant client as a side effect and therefore needed
+    credentials inside an Airflow worker that has no other use for them. Every
+    value below is a plain literal in oncotriage/config.py, so _config_literal
+    serves all eight and nothing is constructed. The values are identical; what
+    is gone is the exec.
+    """
+    trial_dict = _config_literal("trial_dict")
     return {
-        "COLLECTION_NAME":    ns["COLLECTION_NAME"],
-        "EMBEDDING_MODEL":    ns["EMBEDDING_MODEL"],
-        "EMBEDDING_DIM":      ns["EMBEDDING_DIM"],
-        "MAX_TRIALS":         ns["trial_dict"]["max_trials"],
-        "TRIAL_CONDITION":    ns["trial_dict"]["condition"],
-        "TRIAL_STATUS":       ns["trial_dict"]["status"],
-        "TRIAL_STUDY_TYPE":   ns["trial_dict"]["study_type"],
-        "RERANK_SCORE_THRESHOLD": ns["RERANK_SCORE_THRESHOLD"],
+        "COLLECTION_NAME":    _config_literal("COLLECTION_NAME"),
+        "EMBEDDING_MODEL":    _config_literal("EMBEDDING_MODEL"),
+        "EMBEDDING_DIM":      _config_literal("EMBEDDING_DIM"),
+        "MAX_TRIALS":         trial_dict["max_trials"],
+        "TRIAL_CONDITION":    trial_dict["condition"],
+        "TRIAL_STATUS":       trial_dict["status"],
+        "TRIAL_STUDY_TYPE":   trial_dict["study_type"],
+        "RERANK_SCORE_THRESHOLD": _config_literal("RERANK_SCORE_THRESHOLD"),
     }
 
 

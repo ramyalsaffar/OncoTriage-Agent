@@ -6,18 +6,38 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **OncoTriage Agent** — matches oncology patients (Synthea FHIR bundles) to recruiting ClinicalTrials.gov trials using a 6-stage LangGraph pipeline over hybrid BM25 + vector RAG on Qdrant, with GPT-4o for criterion-level eligibility evaluation.
 
-## The exec() chain — read this before touching any file
+## The exec() chain and the `oncotriage` package — read this before touching any file
 
-This codebase does **not** use Python imports between its own files. Every script is a numbered, space-containing filename (`13- LangGraph Agent.py`) that is `exec()`'d into the caller's `globals()`, replicating a Spyder shared-namespace workflow. Consequences:
+Files 04 to 46 are numbered, space-containing filenames (`13- LangGraph Agent.py`) that are `exec()`'d into the caller's `globals()`, replicating a Spyder shared-namespace workflow. **Those 43 files are still not importable** — spaces and leading digits — and nothing in this pass changed that.
 
-- **Nothing is importable.** `import` of a project file is impossible (spaces, leading digits). Never add one.
-- A function used in file N may be *defined* in file 1, 2, 3, 8, 9, or 10 with no import statement at its use site. To find a definition, grep across all `*.py` — e.g. `load_env_keys()` is called in `03- Config.py` but defined in `02- Utility Functions.py`; `PRICING_CONFIG` is defined in 03 and consumed in 02.
-- Every entry-point file begins with the same bootstrap: raw `exec()` of `01- Imports.py` and `02- Utility Functions.py` (needed because `exec_chain` itself lives in 02), then `exec_chain([...])` for the rest.
-- `exec_chain` (`02- Utility Functions.py`) sets `__name__ = "_exec_chain_"` while exec'ing, so `if __name__ == "__main__":` blocks in chained files do **not** fire. That is the mechanism that lets a file be both a runnable script and a library.
+Files 01, 02 and 03 are different as of item 20c. They are now **re-export shims over a real package**:
+
+| Module | Holds | Imports |
+|---|---|---|
+| `oncotriage/settings.py` | `ENV_*` names, `resolve_*_path()`, `load_env_keys()` | nothing from the project |
+| `oncotriage/paths.py` | `IS_DOCKER`, `_glob_one`, every path variable | `settings` |
+| `oncotriage/constants.py` | `SYSTEM_KEY_ABSENT` / `SYSTEM_KEY_UNRECOGNIZED` | nothing at all |
+| `oncotriage/config.py` | every tunable, `PRICING_CONFIG`, `DATA_SNAPSHOT_DATE`, lazy client factories | `settings` |
+| `oncotriage/utils.py` | `get_model_cost`, `qdrant_retry`, `resolve_qdrant_collection`, `parse_partial_date`, `get_age_reference_date`, `exec_chain`, `CaffeinateSession` | `config` |
+
+The real rule, replacing "nothing is importable":
+
+- **New shared code goes in `oncotriage/`, and is `import`ed.** Only put something in a numbered file if it needs the shared exec namespace. `import` of files 04-46 is still impossible; `from oncotriage.config import MAX_WORKERS` is now the normal way to reach a tunable from anything that is not in the chain.
+- **`oncotriage.config` must never import `oncotriage.utils`.** That was the cycle: File 02 read `PRICING_CONFIG` / `COLLECTION_NAME` / `qdrant_client` / `DATA_SNAPSHOT_DATE` out of File 03, while File 03 called `load_env_keys()` out of File 02. Under `exec()` both resolved at runtime; as modules it is an `ImportError`. `load_env_keys` moving into `oncotriage.settings` is what broke it, and `47- Package Split Test.py` fails if the edge comes back.
+- **Importing a package module opens no client, loads no model and touches no database.** `get_openai_client()` / `get_qdrant_client()` build once, on first call, and cache. `03- Config.py` calls them at shim load and binds the eager `openai_client` / `qdrant_client` names the chain expects — same objects, no second client. Importing `oncotriage.paths` *does* resolve the directory tree (globs, and raises if a sibling is missing); that is the one deliberate filesystem side effect.
+- The three functions that read a value out of the shared namespace at call time — `get_model_cost`, `resolve_qdrant_collection`, `get_age_reference_date` — take that value as an **optional argument** in the package, and `02- Utility Functions.py` wraps each one to pass `globals().get(...)`. That seam is load-bearing: Files 36, 37, 45 and 46 rebind `qdrant_client`, and File 38 rebinds `DATA_SNAPSHOT_DATE` and requires a raise.
+- `pip install -e .` from `03- Code/` makes the package importable from anywhere. Without it, `01- Imports.py` puts the code directory on `sys.path` itself and prints that it did.
+
+Everything else about the chain is unchanged:
+
+- A function used in file N may be *defined* in file 1, 2, 3, 8, 9, or 10 with no import statement at its use site. To find a definition, grep across all `*.py` **and** `oncotriage/*.py`.
+- Every entry-point file begins with the same bootstrap: raw `exec()` of `01- Imports.py` and `02- Utility Functions.py` (needed because `exec_chain` itself lives in 02), then `exec_chain([...])` for the rest. All 31 bootstraps load 01 first, and they have to — File 02 has always used `os`, `re`, `time`, `httpx` and `logging` out of File 01's import block.
+- `01- Imports.py` keeps its **third-party import block verbatim**. Files 04-46 reach for `np`, `pd`, `Path`, `OpenAI`, `torch` and eighty more with no import of their own, and only an exec'd file can bind those in the caller's globals. Do not move that block into the package.
+- `exec_chain` sets `__name__ = "_exec_chain_"` while exec'ing, so `if __name__ == "__main__":` blocks in chained files do **not** fire. That is the mechanism that lets a file be both a runnable script and a library.
 - **Do not double-load.** `13- LangGraph Agent.py` already chains 08, 09, 10 — callers of 13 (17, 25, 26) must not list them again. See the warning comment in `26- Ablation Study.py`.
-- `_code_dir` is a **hardcoded absolute macOS path** at the top of most entry-point files. Docker mounts the code at `/app`, and `01- Imports.py` switches all data paths on `IS_DOCKER`, but `_code_dir` itself is not switched.
+- `_code_dir` is **derived from `__file__`** at the top of each entry point (item 20a); there is no hardcoded absolute path in any tracked file except `FALLBACK_MAIN_PATH` in `oncotriage/settings.py`, which is the deliberate one-machine fallback for `ONCOTRIAGE_MAIN_PATH`. Docker mounts the code at `/app` and `oncotriage/paths.py` switches all data paths on `IS_DOCKER`.
 
-Adding a new script means: copy the bootstrap block, list its deps in `exec_chain`, and put any new shared library/constant in `01- Imports.py` / `03- Config.py` rather than importing locally.
+Adding a new script means: copy the bootstrap block, list its deps in `exec_chain`, and put any new shared library in `01- Imports.py` / any new constant in `oncotriage/config.py`.
 
 ## Running things
 
@@ -51,6 +71,8 @@ docker compose logs -f fastapi
 
 ```bash
 python "39- ECOG Performance Status Surfacing Test.py"   # needs the scratch corpus from 04-
+python "47- Package Split Test.py"                       # no network, no keys, no corpus
+pip install -e .                                         # makes `oncotriage` importable anywhere
 ```
 
 **Tests** are not pytest — `18-` and `19-` are procedural scripts hitting a *live* server on `localhost:8000`; start `17-` in another terminal first. `19-` slices `fhir_files[410:412]` for a smoke run; widen that slice to go broader.
@@ -59,7 +81,7 @@ To exercise the graph directly without the API, set `RUN_TEST_ON_EXECUTE = True`
 
 ## Layout outside this repo
 
-Only `03- Code/` is version-controlled. Sibling directories under the project root are resolved by **glob prefix** in `01- Imports.py` (`glob.glob(main_path + "/*Data/")[0]`), so directories can be renumbered but not renamed past their suffix:
+Only `03- Code/` is version-controlled. Sibling directories under the project root are resolved by **glob prefix** in `oncotriage/paths.py` (`glob.glob(main_path + "/*Data/")[0]`, via `_glob_one`, which names the pattern and the root when nothing matches), so directories can be renumbered but not renamed past their suffix. The root itself comes from `ONCOTRIAGE_MAIN_PATH` or, unset, from `FALLBACK_MAIN_PATH` in `oncotriage/settings.py`:
 
 | Path var | Sibling dir | Holds |
 |---|---|---|
@@ -112,7 +134,7 @@ post-processes and documents the run:
   oncology modules set no common cancer flag (breast and colorectal set only
   downstream attributes), so there is nothing to key on. `ECOG_GUARD_CANCER_CODES`
   in File 04 is the code set, with its inclusions and exclusions argued inline.
-- **`ECOG_SCORE_DISTRIBUTION` and `ECOG_MISSINGNESS_FRACTION` (03) are
+- **`ECOG_SCORE_DISTRIBUTION` and `ECOG_MISSINGNESS_FRACTION` (`oncotriage/config.py`) are
   uncalibrated holding values.** Observed missingness always exceeds the
   configured fraction, because a patient who dies before the next encounter
   after diagnosis is also never scored. Both numbers land in the run manifest.
@@ -134,30 +156,32 @@ post-processes and documents the run:
 
 ### Index lifecycle (Qdrant)
 
-`COLLECTION_NAME = "trial_criteria"` is an **alias**, never a collection. `11-` builds into a timestamped staging collection (`trial_criteria_20260226_140159`), creates payload indexes, then `swap_alias_atomic()` in a single `update_collection_aliases` call (zero downtime), then `cleanup_old_collections()`. Use `resolve_qdrant_collection()` (file 02) whenever the *real* collection name is needed for logging — it retries and falls back gracefully.
+`COLLECTION_NAME = "trial_criteria"` is an **alias**, never a collection. `11-` builds into a timestamped staging collection (`trial_criteria_20260226_140159`), creates payload indexes, then `swap_alias_atomic()` in a single `update_collection_aliases` call (zero downtime), then `cleanup_old_collections()`. Use `resolve_qdrant_collection()` (`oncotriage/utils.py`, re-exported by file 02) whenever the *real* collection name is needed for logging — it retries and falls back gracefully. File 02's wrapper hands it the shared namespace's `qdrant_client`, so a fixture proxy or a test stub is what it talks to.
 
 `23- Airflow DAG.py` writes the `trial_refresh_weekly` DAG (Sundays 02:00) into `{airflow_path}/dags/`; `22-` initializes the Airflow DB and `24-` starts/stops/triggers via the REST API v2. The DAG file is generated as a string, so DAG logic edits go in `23-`, not in the `dags/` output.
 
+**The generated DAG must be regenerated after item 20c.** Its `_config_literal()` / `_load_config()` read `oncotriage/config.py` now; a DAG file generated before this pass still reads `03- Config.py`, where the constants are no longer *assigned* — `AIRFLOW_DAG_SCHEDULE is not assigned at module level` at every scheduler parse. File 23 **will not overwrite** an existing DAG, so: `rm "{airflow_path}/dags/trial_refresh_weekly.py"` then `python "23- Airflow DAG.py"`.
+
 ## Persistence and observability
 
-`14- Database Logger.py` opens the SQLite connection at load time and creates three tables: `inferences` (per-patient funnel counts, per-stage timings, token counts, cost), `trial_matches` (per-trial verdicts), `drift_metrics`. `log_inference(result, patient_data)` is called by the API and batch runner. `16-` is a scratch query script; `15-` wipes all tables and is guarded by `Flag = False` — leave it False.
+`14- Database Logger.py` **no longer opens the database at load time** — item 20b turned schema creation into a function, because nine other files loaded 14 or were loaded beside it and every one of them was touching `inferences.db` just by being read. `init_database()` creates three tables: `inferences` (per-patient funnel counts, per-stage timings, token counts, cost), `trial_matches` (per-trial verdicts), `drift_metrics`. `log_inference(result, patient_data)` is called by the API and batch runner. `16-` is a scratch query script; `15-` wipes all tables and is guarded by `Flag = False` — leave it False.
 
 `21- Streamlit Dashboard.py` (~5.2k lines) reads only from `inferences.db` via `@st.cache_data(ttl=60)`.
 
-**Cost accounting fails loudly.** Costs come from `get_model_cost()` (file 02) against `PRICING_CONFIG` in `03- Config.py`, dated `last_updated`. A model absent from that table raises `UnknownModelPricingError` (a `RuntimeError` subclass — deliberately *not* a `KeyError`, so a stray `except KeyError` cannot eat it); it does not return 0.0, because a zero cost row is indistinguishable from a genuinely free run and every aggregate over the column silently under-reports. Both writers — `log_inference` (14) and `log_ablation_result` (26) — call it **before** their `try` block for exactly this reason: their broad `except` exists to keep a database failure from killing the pipeline, and an unpriced model is a config defect that must reach the caller instead. If you add a model, add its pricing first; never wrap `get_model_cost()` in a recovery path.
+**Cost accounting fails loudly.** Costs come from `get_model_cost()` (`oncotriage/utils.py`, re-exported by file 02) against `PRICING_CONFIG` in `oncotriage/config.py`, dated `last_updated`. A model absent from that table raises `UnknownModelPricingError` (a `RuntimeError` subclass — deliberately *not* a `KeyError`, so a stray `except KeyError` cannot eat it); it does not return 0.0, because a zero cost row is indistinguishable from a genuinely free run and every aggregate over the column silently under-reports. Both writers — `log_inference` (14) and `log_ablation_result` (26) — call it **before** their `try` block for exactly this reason: their broad `except` exists to keep a database failure from killing the pipeline, and an unpriced model is a config defect that must reach the caller instead. If you add a model, add its pricing first; never wrap `get_model_cost()` in a recovery path.
 
 **Degradation record.** A run that lost a retrieval channel, fell back to the un-expanded query, or skipped the cancer site filter must be identifiable from its stored row alone. The relevant state keys are written by the stage that owns them, carried to all three terminal nodes by `_pipeline_provenance()` (file 13), and logged to `inferences.retrieval_channels` / `retrieval_degraded` / `retrieval_trials_lost` / `query_expansion_path` / `mesh_filter_applied` / `mesh_filter_skip_reason`. **NULL in these columns means the stage never reported and is not the same as a clean value** — never default them to 0 in a new writer or fold NULL into 0 in a reader. Stage 5's Section 2 is conditional on `mesh_filter_applied`: it only asserts to the model that disease relevance was confirmed when the filter actually ran.
 
-**Age reference date.** Patient age is computed against `DATA_SNAPSHOT_DATE` (03), never `datetime.now()`, and so is the Stage 5 prompt's RULE 4 "Reference date" — a clock-derived age changes the prompt while `compute_patient_hash` (which keys on `birth_date`) cannot see it. `parse_partial_date()` / `get_age_reference_date()` live in `02- Utility Functions.py`; `birthDate` may legally be `YYYY`, `YYYY-MM`, `YYYY-MM-DD` or a full ISO datetime, and missing components are filled from a mid-range anchor with the shape recorded as `inferences.birth_date_precision` (same NULL semantics as above). Race and ethnicity are read from the US Core extensions **by sub-extension url** (`ombCategory` → `detailed` → `text`), never by array position. `Exception and Fallback Audit.md` inventories every `except` and fallback in the codebase with a verdict and the open items.
+**Age reference date.** Patient age is computed against `DATA_SNAPSHOT_DATE` (`oncotriage/config.py`, re-exported by 03), never `datetime.now()`, and so is the Stage 5 prompt's RULE 4 "Reference date" — a clock-derived age changes the prompt while `compute_patient_hash` (which keys on `birth_date`) cannot see it. `parse_partial_date()` / `get_age_reference_date()` live in `oncotriage/utils.py`; `get_age_reference_date()` resolves the constant through `oncotriage.config` and **raises** rather than falling back to `today()`, and `44- Snapshot Date Rot Test.py` rewrites that literal in `oncotriage/config.py` — not in File 03, which only re-exports it; `birthDate` may legally be `YYYY`, `YYYY-MM`, `YYYY-MM-DD` or a full ISO datetime, and missing components are filled from a mid-range anchor with the shape recorded as `inferences.birth_date_precision` (same NULL semantics as above). Race and ethnicity are read from the US Core extensions **by sub-extension url** (`ombCategory` → `detailed` → `text`), never by array position. `Exception and Fallback Audit.md` inventories every `except` and fallback in the codebase with a verdict and the open items.
 
 ## Conventions
 
-- **All tunables live in `03- Config.py`.** Retrieval sizes, thresholds, temperatures (both 0 for determinism), rate limiting, drift windows, batch runner settings. Don't scatter magic numbers into node bodies.
+- **All tunables live in `oncotriage/config.py`** (`03- Config.py` re-exports them for the exec chain). Retrieval sizes, thresholds, temperatures (both 0 for determinism), rate limiting, drift windows, batch runner settings. Don't scatter magic numbers into node bodies.
 - `ENABLE_RATE_LIMITING = False` by default so batch evaluation isn't throttled; flip it for production.
 - Long local runs wrap in `with CaffeinateSession("label"):` to stop macOS sleeping.
-- Qdrant calls use the shared `qdrant_retry` tenacity decorator (file 02) for connect/timeout/`UnexpectedResponse`.
+- Qdrant calls use the shared `qdrant_retry` tenacity decorator (`oncotriage/utils.py`) for connect/timeout/`UnexpectedResponse`.
 - Determinism is a deliberate property of the pipeline (temperature 0, stable argsort, seeded sampling with `RESAMPLE_SEED = 42`). Preserve it when editing ranking or sampling code.
-- Files carry a Spyder-generated `#!/usr/bin/env python3` + creation-date docstring footer at the **bottom**; append new code above it.
+- Files carry a Spyder-generated `#!/usr/bin/env python3` + creation-date docstring footer at the **bottom**; append new code above it. The `oncotriage/` modules keep the same footer.
 
 ## Important Rules
 Tunable values go in the config module. Facts about an external
@@ -198,7 +222,8 @@ the value is non-degenerate, so the test fails rather than
 passing vacuously when someone later changes it.
 
 Data and keys live outside this folder. Never write an
-absolute path.
+absolute path. The one exception already exists and is
+argued in place: FALLBACK_MAIN_PATH in oncotriage/settings.py.
 
 When you finish, state which parts you verified by running
 something, and which parts you only read.

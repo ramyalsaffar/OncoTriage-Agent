@@ -1,5 +1,31 @@
 # Supportive functions
 #---------------------
+#
+# ITEM 20c: THIS FILE IS A SHIM.
+#
+# Everything below moved into oncotriage/utils.py, except load_env_keys, which
+# moved into oncotriage/settings.py. That split is the point of the pass:
+#
+#     this file  read PRICING_CONFIG, COLLECTION_NAME, qdrant_client and
+#                DATA_SNAPSHOT_DATE out of File 03
+#     File 03    called load_env_keys() out of this file, at its line 194
+#
+# Under exec() into one shared namespace both directions resolve at runtime and
+# nobody notices. As modules it is a hard import cycle. load_env_keys was the
+# ONLY thing config needed from utils and it needs nothing from config, so
+# moving it to oncotriage.settings broke the cycle: oncotriage.config imports
+# oncotriage.settings and never imports oncotriage.utils.
+#
+# This file is still raw-exec'd by all 31 bootstraps in the codebase, straight
+# after "01- Imports.py" and before any exec_chain call — exec_chain itself is
+# defined here. So every name it used to define is re-exported below, BY NAME.
+# No star import: a shim whose surface is "whatever the module happens to
+# expose" stops being a contract.
+#
+# It carries no sys.path bootstrap of its own. It cannot run without
+# "01- Imports.py" having run first and never could — it has always used `os`,
+# `re`, `time`, `httpx`, `Counter` and `logging` out of File 01's import block
+# without importing them — and File 01 is where the package is put on sys.path.
 
 
 #------------------------------------------------------------------------------
@@ -13,390 +39,87 @@
     ## mv .env.txt .env
     ## to view the .env in Finder on Mac, hit: command + shift + .
 
-
-def load_env_keys():
-    """Load API keys from .env file"""
-    env_path = keys_path + '.env'
-    
-    # Validate file exists
-    if not os.path.exists(env_path):
-        raise FileNotFoundError(f".env file not found at: {env_path}")
-    
-    # Clear previous env vars to avoid stale values
-    for key in ['OPENAI_API_KEY', 'QDRANT_URL', 'QDRANT_API_KEY']:
-        os.environ.pop(key, None)
-    
-    # Load from file
-    load_dotenv(dotenv_path=env_path, override=True)
-    
-    # Validate all keys loaded
-    keys = {
-        'openai': os.getenv('OPENAI_API_KEY'),
-        'qdrant_url': os.getenv('QDRANT_URL'),
-        'qdrant_key': os.getenv('QDRANT_API_KEY')
-    }
-    
-    missing = [k for k, v in keys.items() if v is None]
-    if missing:
-        raise ValueError(f"Missing keys in .env file: {missing}")
-    
-    return keys
+# load_env_keys now lives in oncotriage/settings.py. It is re-exported here
+# because '03- Config.py' called it (that call is now get_keys()) and because
+# any file in the chain may still call it. Its keys_dir argument defaults to
+# oncotriage.paths.keys_path, which is the same directory File 01 binds.
+from oncotriage.settings import load_env_keys
 
 
 #------------------------------------------------------------------------------
 
 
-def deduplicate_by_display(items: List[Dict], key: str = 'display') -> List[Dict]:
-    """
-    Deduplicate list of dicts by case-insensitive display field.
-    
-    Args:
-        items: List of dicts (medications, conditions, etc.)
-        key: Dict key to use for deduplication (default: 'display')
-    
-    Returns:
-        List of dicts with duplicates removed (first occurrence kept)
-    
-    Example:
-        medications = [
-            {'display': 'Aspirin', 'code': '1234'},
-            {'display': 'aspirin', 'code': '5678'},  # duplicate
-            {'display': 'Ibuprofen', 'code': '9999'}
-        ]
-        unique = deduplicate_by_display(medications)
-        # Returns [{'display': 'Aspirin', 'code': '1234'}, {'display': 'Ibuprofen', 'code': '9999'}]
-    """
-    seen = set()
-    unique = []
-    
-    for item in items:
-        
-        display = item.get(key)
-        
-        # Preserve items with no display key, do not discard
-        if display is None:
-            unique.append(item)
-            continue
-        
-        display_lower = display.lower()
-        if display_lower not in seen:
-            seen.add(display_lower)
-            unique.append(item)
-    
-    return unique
+from oncotriage.utils import (
+    deduplicate_by_display,
+    UnknownModelPricingError,
+    exec_chain,
+    qdrant_retry,
+    PARTIAL_DATE_ANCHOR_MONTH,
+    PARTIAL_DATE_ANCHOR_DAY,
+    PARTIAL_DATE_DEGRADATIONS,
+    _PARTIAL_DATE_PATTERNS,
+    parse_partial_date,
+    CaffeinateSession,
+)
+
+# Imported under private aliases and wrapped below. These three read a value
+# out of the shared exec namespace at CALL time, and four files depend on that.
+from oncotriage.utils import get_model_cost as _get_model_cost_pkg
+from oncotriage.utils import resolve_qdrant_collection as _resolve_qdrant_collection_pkg
+from oncotriage.utils import get_age_reference_date as _get_age_reference_date_pkg
 
 
 #------------------------------------------------------------------------------
 
 
-class UnknownModelPricingError(RuntimeError):
-    """Raised when get_model_cost() is handed a model absent from PRICING_CONFIG.
-
-    Deliberately not a KeyError: a stray `except KeyError` around a dict lookup
-    would swallow it and put the pipeline back where it started. Callers that
-    recover from their own failures must let this one through — a missing price
-    is a configuration defect, not a runtime hiccup.
-    """
-
+# THE THREE LATE-BINDING WRAPPERS
+#--------------------------------
+#
+# A module-level function cannot see its caller's globals. These three could,
+# because they were defined inside the text exec'd into the shared namespace,
+# and that is not a detail — it is a seam the test and fixture harnesses use:
+#
+#   '36- Logging Contract Test.py'      rebinds qdrant_client to a stub
+#   '37- Retrieval Observability Test.py'  rebinds it via swap_globals()
+#   '45- Fixture Capture.py'            rebinds qdrant_client to a recording proxy
+#   '46- Fixture Replay.py'             rebinds it to a replaying proxy
+#   '38- Birth Date and Demographics Parser Test.py'
+#                                       rebinds DATA_SNAPSHOT_DATE to "", "2026",
+#                                       "2026-03" and "not a date" and requires
+#                                       get_age_reference_date() to raise at each
+#
+# The package functions take the value as an argument instead. These wrappers
+# are defined HERE, inside the exec'd text, so their __globals__ IS the shared
+# namespace and `globals().get(...)` is still resolved at call time — exactly
+# the behaviour the four files above were written against.
+#
+# Each wrapper keeps the signature its caller uses. `None` means "not supplied"
+# for the first two, because neither PRICING_CONFIG nor a client is ever
+# legitimately None, so a chain that loaded File 02 without File 03 (File 44
+# does exactly that) falls through to the package's own config value rather
+# than crashing.
 
 def get_model_cost(model_name: str, input_tokens: int, output_tokens: int) -> float:
-    """
-    Calculate USD cost from token counts using current pricing.
-
-    Args:
-        model_name: Model identifier (e.g., 'gpt-4o-2024-08-06')
-        input_tokens: Input token count from response.usage
-        output_tokens: Output token count from response.usage
-
-    Returns:
-        Total cost in USD
-
-    Raises:
-        UnknownModelPricingError: model_name is not in PRICING_CONFIG["models"].
-            This used to warn and return 0.0, which put a row in the database
-            claiming the run was free. A zero there is indistinguishable from a
-            genuinely free run, and every aggregate built on the column — the
-            dashboard's cost panel, the ablation study's cost-per-config, any
-            projection to 1000 patients — silently understates by however much
-            of the corpus ran on the unpriced model. Refusing to produce a
-            number is the only honest answer: the caller must add the model to
-            PRICING_CONFIG (File 03) or stop billing against it.
-
-    Example:
-        cost = get_model_cost('gpt-4o-2024-08-06', 1000, 500)
-        # Returns: 0.0025 + 0.0050 = 0.0075 USD
-    """
-    pricing = PRICING_CONFIG["models"].get(model_name)
-    if not pricing:
-        known = ", ".join(sorted(PRICING_CONFIG["models"])) or "(none)"
-        logging.error(
-            f"get_model_cost: unknown model '{model_name}'; "
-            f"priced models are: {known}"
-        )
-        raise UnknownModelPricingError(
-            f"No pricing for model '{model_name}' in PRICING_CONFIG "
-            f"(last_updated {PRICING_CONFIG['last_updated']}). "
-            f"Priced models: {known}. Add it to PRICING_CONFIG in "
-            f"'03- Config.py' — cost cannot be reported as 0.0 for a run that "
-            f"consumed {input_tokens} input / {output_tokens} output tokens."
-        )
-
-    input_cost = (input_tokens / 1_000_000) * pricing["input"]
-    output_cost = (output_tokens / 1_000_000) * pricing["output"]
-
-    return input_cost + output_cost
+    """See oncotriage.utils.get_model_cost. Prices against the shared
+    namespace's PRICING_CONFIG when File 03 is in the chain."""
+    return _get_model_cost_pkg(model_name, input_tokens, output_tokens,
+                               pricing_config=globals().get("PRICING_CONFIG"))
 
 
-#------------------------------------------------------------------------------
-
-
-def exec_chain(files: List[str], caller_file: str, caller_globals: dict, chain_label: str = "") -> None:
-    """Load and exec a list of project scripts into the caller's global scope.
-
-    Args:
-        files:          Ordered list of script names, e.g. ["01- Imports.py", "03- Config.py"].
-        caller_file:    Pass __file__ — resolves the directory to search in.
-        caller_globals: Pass globals() — scripts are exec'd into this namespace.
-        chain_label:    Label for the completion message, e.g. "01 → 02 → 03".
-
-    Raises:
-        FileNotFoundError: If a script can't be found under its spaced or underscore variant.
-    """
-    base_dir = os.path.dirname(os.path.abspath(caller_file)) + os.sep
-    saved_name = caller_globals.get("__name__")
-
-    for name in files:
-        for variant in (name, name.replace(" ", "_")):
-            try:
-                with open(base_dir + variant) as fh:
-                    print(f"[Init] Loading {name}...")
-                    caller_globals["__name__"] = "_exec_chain_"
-                    exec(fh.read(), caller_globals)  # noqa: S102
-                    break
-            except FileNotFoundError:
-                continue
-        else:
-            caller_globals["__name__"] = saved_name
-            raise FileNotFoundError(f"Required script not found: '{name}' (searched in: {base_dir})")
-
-    caller_globals["__name__"] = saved_name
-    print(f"[Init] Chain complete ({chain_label}).\n")
-    
-
-#------------------------------------------------------------------------------
-
-
-# Tenacity retry decorator for Qdrant operations (network hiccups, timeouts)
-qdrant_retry = retry(
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    stop=stop_after_attempt(3),
-    retry=retry_if_exception_type((httpx.ConnectError, httpx.TimeoutException, UnexpectedResponse)),
-)
-
-
-#------------------------------------------------------------------------------
-
-
-# Collecting the clinical trial batch name from the Qdrant
-#---------------------------------------------------------
 def resolve_qdrant_collection() -> str:
-    """Resolve the COLLECTION_NAME alias to the actual backing collection.
-    
-    Qdrant aliases allow COLLECTION_NAME to remain constant ('trial_criteria')
-    while the actual collection rotates weekly ('trial_criteria_20260226_140159').
-    This function resolves the alias to the real collection name for logging.
-    
-    Retries up to 3 times with 1s delay if resolution fails or alias not found.
-    """
-    
-    MAX_RETRIES = 3
-    
-    for attempt in range(1, MAX_RETRIES + 1):
-        
-        try:
-            all_aliases = qdrant_client.get_aliases().aliases
-            for a in all_aliases:
-                if a.alias_name == COLLECTION_NAME:
-                    return a.collection_name
-            print(f"⚠ Alias '{COLLECTION_NAME}' not found in Qdrant (attempt {attempt}/{MAX_RETRIES})")
-        except Exception as e:
-            print(f"⚠ Qdrant alias resolution error (attempt {attempt}/{MAX_RETRIES}): {e}")
-        
-        if attempt < MAX_RETRIES:
-            time.sleep(1)
-    
-    # Final fallback: check if COLLECTION_NAME is itself a real collection (no alias)
-    try:
-        qdrant_client.get_collection(COLLECTION_NAME)
-        print(f"⚠ '{COLLECTION_NAME}' is a real collection, not an alias. Using as-is.")
-        return COLLECTION_NAME
-    except Exception:
-        pass
-    
-    print(f"⚠ FAILED to resolve collection after {MAX_RETRIES} attempts. Using '{COLLECTION_NAME}' as fallback.")
-    return COLLECTION_NAME
+    """See oncotriage.utils.resolve_qdrant_collection. Talks to the shared
+    namespace's qdrant_client, which may be a stub or a fixture proxy."""
+    return _resolve_qdrant_collection_pkg(
+        client=globals().get("qdrant_client"),
+        collection_name=globals().get("COLLECTION_NAME"),
+    )
 
 
-#------------------------------------------------------------------------------
-
-
-# Partial-date parsing and the run's age reference date
-#------------------------------------------------------
-# FHIR types Patient.birthDate as `date`, whose value is legally YYYY, YYYY-MM
-# or YYYY-MM-DD, and real EHR exports also ship a full ISO dateTime in the
-# field. HIPAA Safe Harbor de-identification produces the year-only form by
-# design. A fixed datetime.strptime(value, '%Y-%m-%d') raises on three of those
-# four shapes, and in this codebase that exception aborts the whole bundle.
-#
-# Missing components are filled with the midpoint of the range the record still
-# allows, so the imputation error is centred instead of biased: an unknown
-# month becomes July, an unknown day becomes the 15th. Worst case is ~6 months
-# for a year-only date and ~15 days for a year-month date. The caller is told
-# which shape it got (the returned precision) and is expected to record it --
-# an imputed age must stay distinguishable from an exact one.
-PARTIAL_DATE_ANCHOR_MONTH = 7    # mid-year,  used when the record has no month
-PARTIAL_DATE_ANCHOR_DAY   = 15   # mid-month, used when the record has no day
-
-# Out-of-range components ("1965-13-01", "1965-02-30") counted by the precision
-# the parse was attempting when the component was rejected. A date that is
-# well-formed but impossible is a data-quality signal in its own right, and the
-# degradation that keeps the record usable must not be the only trace of it.
-PARTIAL_DATE_DEGRADATIONS = Counter()
-
-# Anchored at both ends. The day pattern also accepts the date portion of a
-# full ISO datetime ("1965-04-12T00:00:00Z", "1965-04-12T00:00:00.000-07:00",
-# "1965-04-12 00:00:00"), which is why its time part is an optional group.
-_PARTIAL_DATE_PATTERNS = (
-    ("day",   re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?:[T ].*)?$")),
-    ("month", re.compile(r"^(\d{4})-(\d{2})$")),
-    ("year",  re.compile(r"^(\d{4})$")),
-)
-
-
-def parse_partial_date(value) -> Tuple[Optional[date], str]:
-    """Parse a FHIR partial date into a concrete date plus its precision.
-
-    Args:
-        value: Raw field value. A str in any of the shapes above; a date or
-               datetime is passed through; anything else is unparseable.
-
-    Returns:
-        (date_or_None, precision) where precision is one of:
-          "day"         -- full date, nothing imputed
-          "month"       -- YYYY-MM, day imputed to PARTIAL_DATE_ANCHOR_DAY
-          "year"        -- YYYY, month/day imputed to the anchors
-          "missing"     -- empty / absent field
-          "unparseable" -- present but not a date in any accepted shape
-
-        Never raises. A returned date is always usable; a returned None always
-        comes with a precision label saying why there is none, so no caller can
-        mistake "no date" for "date at the epoch".
-    """
-
-    # datetime first: datetime is a subclass of date, so the order matters.
-    if isinstance(value, datetime):
-        return value.date(), "day"
-    if isinstance(value, date):
-        return value, "day"
-
-    # An absent field is "missing"; a field carrying something that is not a
-    # date string is "unparseable". Collapsing the two would report a corrupt
-    # value as an empty one.
-    if value is None:
-        return None, "missing"
-    if not isinstance(value, str):
-        return None, "unparseable"
-
-    raw = value.strip()
-    if not raw:
-        return None, "missing"
-
-    for precision, pattern in _PARTIAL_DATE_PATTERNS:
-        match = pattern.match(raw)
-        if match is None:
-            continue
-
-        year  = int(match.group(1))
-        month = int(match.group(2)) if precision in ("day", "month") else PARTIAL_DATE_ANCHOR_MONTH
-        day   = int(match.group(3)) if precision == "day"             else PARTIAL_DATE_ANCHOR_DAY
-
-        # Shape matched but a component may still be out of range ("1965-13-01",
-        # "1965-02-30"). Degrade one step at a time rather than discarding the
-        # record: the coarser components are still usable, and the precision
-        # that comes back says exactly how much was kept.
-        for fallback_precision, fallback_month, fallback_day in (
-            (precision, month,                     day),
-            ("month",   month,                     PARTIAL_DATE_ANCHOR_DAY),
-            ("year",    PARTIAL_DATE_ANCHOR_MONTH, PARTIAL_DATE_ANCHOR_DAY),
-        ):
-            try:
-                return date(year, fallback_month, fallback_day), fallback_precision
-            except ValueError:
-                PARTIAL_DATE_DEGRADATIONS[f"out_of_range:{fallback_precision}"] += 1
-                continue
-
-        return None, "unparseable"
-
-    return None, "unparseable"
-
-
-def get_age_reference_date() -> date:
-    """The fixed date this run computes patient ages against.
-
-    Resolves DATA_SNAPSHOT_DATE from File 03 -- see the comment there for why
-    the current clock cannot be used.
-
-    Raises ValueError when the constant is missing or is not a full date.
-    Falling back to today() here would restore the exact defect the constant
-    exists to remove, and would do it silently; an unset snapshot date is a
-    configuration error, not a runtime condition to recover from.
-    """
-
-    raw = globals().get("DATA_SNAPSHOT_DATE", "")
-    reference, precision = parse_partial_date(raw)
-
-    if reference is None or precision != "day":
-        raise ValueError(
-            f"DATA_SNAPSHOT_DATE must be a full YYYY-MM-DD date in "
-            f"'03- Config.py'; got {raw!r} (parsed precision: {precision}). "
-            f"Patient ages are computed against it, so it cannot be defaulted "
-            f"to the current date without reintroducing clock drift into the "
-            f"Stage 5 prompt."
-        )
-
-    return reference
-
-
-#------------------------------------------------------------------------------
-
-
-class CaffeinateSession:
-    """Context manager to prevent macOS sleep during long-running pipelines.
-    
-    Uses the 'caffeine' package (macOS only). Silently continues
-    on non-macOS platforms or if the package is unavailable.
-    
-    Usage:
-        with CaffeinateSession("Batch Runner"):
-            # long-running work here
-    """
-    def __init__(self, label=""):
-        self.label = label
-
-    def __enter__(self):
-        try:
-            _caffeine_mod.on(display=False)
-            print(f"Caffeine ON (preventing sleep: {self.label})")
-        except Exception:
-            print(f"Caffeine unavailable (non-macOS?) (continuing: {self.label})")
-        return self
-
-    def __exit__(self, *args):
-        try:
-            _caffeine_mod.off()
-            print(f"Caffeine OFF ({self.label})")
-        except Exception:
-            pass
+def get_age_reference_date():
+    """See oncotriage.utils.get_age_reference_date. Reads the shared
+    namespace's DATA_SNAPSHOT_DATE, always passing it through explicitly — ""
+    is one of the values that must raise, so it cannot double as "unset"."""
+    return _get_age_reference_date_pkg(globals().get("DATA_SNAPSHOT_DATE", ""))
 
 
 #------------------------------------------------------------------------------

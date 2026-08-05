@@ -444,11 +444,17 @@ _avail = next(n for n in ast.parse(_sig_text).body
 check("detect_data_availability takes only the current window",
       [a.arg for a in _avail.args.args], ["current_df"])
 
+# The config module is oncotriage/config.py as of item 20c; "03- Config.py" is
+# a shim that re-exports it and carries no comment of its own, so a grep for
+# the rationale has to look where the rationale is. Both greps target the same
+# file so they cannot disagree about which file "the config module" means.
+_CONFIG_TEXT = Path(_code_dir + "oncotriage/config.py").read_text(encoding="utf-8")
 check("the threshold constant lives in the config module",
-      "ECOG_UNAVAILABLE_RATE_THRESHOLD" in
-      Path(_code_dir + "03- Config.py").read_text(encoding="utf-8"), True)
+      "ECOG_UNAVAILABLE_RATE_THRESHOLD" in _CONFIG_TEXT, True)
 check("and is marked as an uncalibrated holding value",
-      "HOLDING VALUE, NOT CALIBRATED" in
+      "HOLDING VALUE, NOT CALIBRATED" in _CONFIG_TEXT, True)
+check("and the shim re-exports it, so the exec chain still sees the name",
+      "ECOG_UNAVAILABLE_RATE_THRESHOLD" in
       Path(_code_dir + "03- Config.py").read_text(encoding="utf-8"), True)
 
 # The runner and the printer must both know about the new category, or the

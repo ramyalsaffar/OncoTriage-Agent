@@ -6,7 +6,8 @@ Proves that Files 38 and 39 survive a change to DATA_SNAPSHOT_DATE.
 
 WHY THIS EXISTS
 ---------------
-DATA_SNAPSHOT_DATE (03- Config.py) is the date patient ages and ECOG reference
+DATA_SNAPSHOT_DATE (oncotriage/config.py, re-exported by
+'03- Config.py') is the date patient ages and ECOG reference
 windows are computed against, and it MOVES: it is updated to the generation
 date every time the corpus is regenerated. Twice now, a test has pinned a value
 derived from it and gone red on data that was entirely correct:
@@ -38,7 +39,7 @@ a snapshot date earlier than those would legitimately fail.
 
 SAFETY
 ------
-File 03 is edited in place, so:
+oncotriage/config.py is edited in place, so:
   - it is copied aside first and restored in a finally block, so an exception
     cannot leave it edited;
   - the restore is verified by sha256 after every date and again at the end;
@@ -56,17 +57,18 @@ Run from terminal (or F5 in Spyder):
     python "44- Snapshot Date Rot Test.py"
 
 Exit codes:
-    0 -- both suites passed at every date, File 03 restored byte-for-byte
-    1 -- a run failed, the baseline failed, or File 03 could not be restored
+    0 -- both suites passed at every date, config restored byte-for-byte
+    1 -- a run failed, the baseline failed, or config could not be restored
 """
 
 
 # Run needed file
 #----------------
-# 01 and 02 only. This file does not use File 03's values -- it rewrites File 03
-# as TEXT and runs Files 38 and 39 in subprocesses, so each picks up the patched
-# constant from disk. Chaining 03 here would bind DATA_SNAPSHOT_DATE into THIS
-# process, where it has no effect on the subprocesses and would only mislead.
+# 01 and 02 only. This file does not use File 03's values -- it rewrites
+# oncotriage/config.py as TEXT and runs Files 38 and 39 in subprocesses, so each
+# picks up the patched constant from disk. Chaining 03 here would bind
+# DATA_SNAPSHOT_DATE into THIS process, where it has no effect on the
+# subprocesses and would only mislead.
 # Item 20a: this file sits in the code directory, so __file__ locates it with
 # no hardcoded path. __file__ is bound when the file is run as a script (every
 # documented entry point for it) and when Spyder runfile()s it. In a bare
@@ -92,7 +94,23 @@ for _bootstrap in ("01- Imports.py", "02- Utility Functions.py"):
 # CONFIGURATION
 # ===========================================================================
 
-_FILE_03 = _code_dir + "03- Config.py"
+# The file that DEFINES DATA_SNAPSHOT_DATE, which is what this test rewrites.
+#
+# It was "03- Config.py" until item 20c moved every constant into
+# oncotriage/config.py and left File 03 as a re-export shim. A name bound by
+# `from oncotriage.config import DATA_SNAPSHOT_DATE` cannot be patched by
+# editing the file that imports it, so a test still pointed at File 03 would
+# have found no assignment to rewrite -- and it said so, loudly, which is the
+# guard below doing its job:
+#
+#   FAIL File 03 carries a DATA_SNAPSHOT_DATE assignment this test can rewrite
+#        expected: True   actual: False
+#
+# That is the whole change. Everything else -- copy aside, patch, run both
+# suites as subprocesses, restore, verify by sha256 -- is untouched, and still
+# works for the same reason it always did: the suites re-read the constant from
+# disk in a fresh process.
+_CONFIG_FILE = _code_dir + "oncotriage/config.py"
 
 _SUITES = [
     "38- Birth Date and Demographics Parser Test.py",
@@ -157,7 +175,8 @@ def _run_suite(filename: str):
     Run one suite as a subprocess.
 
     A subprocess, not an exec, because the suite must read DATA_SNAPSHOT_DATE
-    from the patched File 03 on disk. Running it in this process would bind
+    from the patched oncotriage/config.py on disk. Running it in this
+    process would bind
     whatever this process already loaded.
 
     Returns:
@@ -190,12 +209,12 @@ print("=" * 78)
 print("SNAPSHOT DATE ROT TEST — Files 38 and 39 must pass at every date")
 print("=" * 78)
 
-_PRISTINE_SHA = _sha256(_FILE_03)
-_BACKUP = os.path.join(tempfile.mkdtemp(prefix="oncotriage_rot_"), "03_pristine.py")
-shutil.copy2(_FILE_03, _BACKUP)
+_PRISTINE_SHA = _sha256(_CONFIG_FILE)
+_BACKUP = os.path.join(tempfile.mkdtemp(prefix="oncotriage_rot_"), "config_pristine.py")
+shutil.copy2(_CONFIG_FILE, _BACKUP)
 
 _COMMITTED_DATE = re.search(_DATE_ASSIGNMENT, open(_BACKUP, encoding="utf-8").read())
-print(f"  File 03:            {os.path.basename(_FILE_03)}")
+print(f"  config file:        {os.path.relpath(_CONFIG_FILE, _code_dir)}")
 print(f"  sha256 before:      {_PRISTINE_SHA}")
 print(f"  committed value:    {_COMMITTED_DATE.group(0) if _COMMITTED_DATE else 'NOT FOUND'}")
 print(f"  dates under test:   {', '.join(_SNAPSHOT_DATES)}")
@@ -206,12 +225,12 @@ _ROWS = []
 
 try:
     # The assignment has to be findable before anything is rewritten.
-    check("File 03 carries a DATA_SNAPSHOT_DATE assignment this test can rewrite",
+    check("the config file carries a DATA_SNAPSHOT_DATE assignment this test can rewrite",
           _COMMITTED_DATE is not None, True)
 
     if _COMMITTED_DATE is None:
         fail("the date assignment is locatable",
-             f"no match for {_DATE_ASSIGNMENT!r} in File 03; the constant has "
+             f"no match for {_DATE_ASSIGNMENT!r} in {_CONFIG_FILE!r}; the constant has "
              f"been renamed or reformatted and this test is no longer able to "
              f"set it")
     else:
@@ -226,7 +245,7 @@ try:
             print(f"    {_suite[:2]}  exit={_rc}  passed={_p}  failed={_f}", flush=True)
             if _rc != 0:
                 fail(f"baseline for {_suite[:2]} is usable",
-                     f"exited {_rc} with File 03 UNMODIFIED, so a non-zero exit "
+                     f"exited {_rc} with the config file UNMODIFIED, so a non-zero exit "
                      f"at any date proves nothing. First failures: {_labels[:3]}")
 
         if not _baseline_ok:
@@ -244,7 +263,7 @@ try:
                     fail(f"DATA_SNAPSHOT_DATE set to {_date}",
                          f"expected exactly 1 substitution, made {_n}")
                     continue
-                with open(_FILE_03, "w", encoding="utf-8") as _fh:
+                with open(_CONFIG_FILE, "w", encoding="utf-8") as _fh:
                     _fh.write(_patched)
 
                 for _suite in _SUITES:
@@ -256,19 +275,19 @@ try:
 
                 # Restore and verify BEFORE the next date, so a failed restore
                 # can never compound into a second edit.
-                shutil.copy2(_BACKUP, _FILE_03)
-                _restored = _sha256(_FILE_03)
+                shutil.copy2(_BACKUP, _CONFIG_FILE)
+                _restored = _sha256(_CONFIG_FILE)
                 if _restored != _PRISTINE_SHA:
-                    fail("File 03 restored after each date",
+                    fail("the config file is restored after each date",
                          f"after {_date} the restore produced {_restored}, "
                          f"expected {_PRISTINE_SHA}. ABORTING before editing more.")
                     break
 
 finally:
-    # Unconditional: an exception anywhere above must not leave File 03 edited.
-    shutil.copy2(_BACKUP, _FILE_03)
-    _FINAL_SHA = _sha256(_FILE_03)
-    _FINAL_DATE = re.search(_DATE_ASSIGNMENT, open(_FILE_03, encoding="utf-8").read())
+    # Unconditional: an exception anywhere above must not leave the config edited.
+    shutil.copy2(_BACKUP, _CONFIG_FILE)
+    _FINAL_SHA = _sha256(_CONFIG_FILE)
+    _FINAL_DATE = re.search(_DATE_ASSIGNMENT, open(_CONFIG_FILE, encoding="utf-8").read())
     shutil.rmtree(os.path.dirname(_BACKUP), ignore_errors=True)
 
 
@@ -287,7 +306,7 @@ if _ROWS:
         for _l in _labels[:5]:
             print(f"        FAIL: {_l}")
 
-check("File 03 is byte-identical to how it started", _FINAL_SHA, _PRISTINE_SHA)
+check("the config file is byte-identical to how it started", _FINAL_SHA, _PRISTINE_SHA)
 
 print()
 print("=" * 78)
@@ -296,8 +315,8 @@ print("=" * 78)
 print(f"Dates tested:  {len(_SNAPSHOT_DATES)}  ({', '.join(_SNAPSHOT_DATES)})")
 print(f"Runs:          {len(_ROWS)}")
 print(f"Runs exit 0:   {sum(1 for r in _ROWS if r[2] == 0)}")
-print(f"File 03 sha256 before: {_PRISTINE_SHA}")
-print(f"File 03 sha256 after:  {_FINAL_SHA}")
+print(f"config sha256 before: {_PRISTINE_SHA}")
+print(f"config sha256 after:  {_FINAL_SHA}")
 print(f"Restored byte-identical: {_FINAL_SHA == _PRISTINE_SHA}")
 print(f"DATA_SNAPSHOT_DATE now: {_FINAL_DATE.group(0) if _FINAL_DATE else 'NOT FOUND'}")
 print(f"Passed: {_RESULTS['passed']}")

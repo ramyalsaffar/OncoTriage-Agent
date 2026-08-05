@@ -1,0 +1,41 @@
+# Packaging for the `oncotriage` package (item 20c, pass 1).
+#
+# WHAT THIS DOES AND DOES NOT DECLARE
+# -----------------------------------
+# It declares ONE package: `oncotriage`. The 46 numbered scripts beside it are
+# not modules and are not listed — their filenames contain spaces and leading
+# digits, so they are not importable under any name, and passes 20d-20f are
+# where that changes. `oncotriage_settings.py` is not listed either: it is a
+# re-export shim that "01- Imports.py" and "28- Select 30 Samples.py" load BY
+# FILE LOCATION, which never consults sys.path, so installing it would create a
+# second importable copy of the same names for no benefit.
+#
+# NO DEPENDENCY PINS IN THIS PASS. Deliberate. The real dependency list lives
+# in {requirements_path}/requirements.txt, which the Dockerfile copies and
+# installs, and it is the list this project has actually been run against.
+# Restating a subset of it here — openai, qdrant-client, httpx, python-dotenv,
+# tenacity, caffeine — would create a second, shorter, unversioned list that
+# `pip install -e .` would happily resolve to different versions than the
+# tested ones. Merging the two is its own task and needs the versions pinned
+# from a working environment, not guessed. Until then this is a packaging
+# declaration only, and `pip install -e .` installs no third-party code.
+#
+# CONSEQUENCE, stated rather than discovered: `pip install -e .` into an empty
+# environment gives you an importable package whose imports all fail. That is
+# the honest state of the split, and it is why the Dockerfile still installs
+# requirements.txt.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oncotriage"
+version = "0.1.0"
+description = "OncoTriage Agent — the importable foundation: settings, paths, config, utils."
+requires-python = ">=3.10"
+
+[tool.setuptools]
+# Explicit, not auto-discovered. Auto-discovery over this directory would trip
+# over the 46 space-containing scripts and over `oncotriage_settings.py`.
+packages = ["oncotriage"]

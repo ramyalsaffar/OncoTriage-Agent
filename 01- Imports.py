@@ -4,6 +4,21 @@
 # This file has most of the libraries needed for the project.
 # Paths to load from or to.
 #
+# ITEM 20c: THIS FILE IS NOW HALF SHIM.
+#
+# The third-party import block below is UNCHANGED and stays here verbatim.
+# Files 04 to 46 are exec'd into one shared namespace and reach for `np`, `pd`,
+# `Path`, `Dict`, `OpenAI`, `QdrantClient`, `st`, `torch` and eighty more with
+# no import statement of their own. Those names have to be bound in the caller's
+# globals, and only an exec'd file can do that. Moving them into a package would
+# break every one of those files at once, which is not what this pass is for.
+#
+# The CODING-SYSTEM SENTINELS and the PATH BLOCK did move, into
+# oncotriage.constants and oncotriage.paths, and are re-exported below. They
+# moved because they are data and resolution logic, not namespace plumbing:
+# nothing about them needs a shared namespace, and oncotriage.paths is now
+# importable by anything, including code that is not part of the exec chain.
+#
 ###############################################################################
 
 
@@ -96,71 +111,46 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 
-# Coding system keys
-#-------------------
-#
-# The two system_key values that are NOT a named code system. They live here,
-# not in the file that produces them, because producer and consumers sit in
-# different exec_chain chains and cannot see each other's module constants:
-# '07- FHIR Parser.py' writes them, '08- Cancer Code Registry.py' branches on
-# them, and '33- Cancer Code and Stage Extraction Test.py' chains
-# 01 -> 02 -> 08 -> 10 with no File 07 in it at all. File 01 is the only file
-# every bootstrap loads first, so it is the only place all three can share one
-# spelling. Everything else about coding systems -- the URI table
-# (_SYSTEM_URI_TO_KEY) and the per-resource preference order -- stays in
-# File 07, because those are facts about FHIR parsing rather than a vocabulary
-# other files must agree with.
-#
-# The distinction between the two is load-bearing:
-#
-#   SYSTEM_KEY_ABSENT ("unknown")
-#       Coding.system is absent or empty. FHIR permits this, and this codebase
-#       MANUFACTURES it: File 08's no-codings fallback and File 13 both build
-#       {"system_key": "unknown", "code": ...} from a bare code with no system.
-#       Nothing is asserted about which vocabulary the code came from, so
-#       lookups treat it PERMISSIVELY and try every set.
-#
-#   SYSTEM_KEY_UNRECOGNIZED ("unmapped")
-#       Coding.system is present but is not a URI File 07 knows: a proprietary
-#       or local system, a registry URI, MEDCIN, an EHR's internal dictionary.
-#       That is a POSITIVE STATEMENT that the code belongs to some other
-#       vocabulary, so looking it up in SNOMED or ICD-10 compares digits, not
-#       concepts, and must not happen.
-#
-# These were one value until they were split. Collapsing them is how MEDCIN
-# 315006 came to sit in File 08's SNOMED secondary set, labelled "Secondary
-# malignant neoplasm of bone", matching on its digits alone.
-#
-# "unknown" keeps its spelling because consumers predating the split compare
-# against that literal.
-SYSTEM_KEY_ABSENT = "unknown"
-SYSTEM_KEY_UNRECOGNIZED = "unmapped"
+#------------------------------------------------------------------------------
 
 
-# Paths
-#------
-
-# Detect if running in Docker container
-IS_DOCKER = os.path.exists('/.dockerenv') or os.getenv('DOCKER_CONTAINER', 'false').lower() == 'true'
-
-
-# --- Locate oncotriage_settings.py -------------------------------------------
-# This file is exec()'d into a caller's globals as often as it is run directly,
-# so it cannot rely on a plain `import oncotriage_settings`: sys.path[0] is the
-# *entry point's* directory, which is this directory today but will not be once
-# passes 20b-20f move things. Three candidate directories, tried in order, and
-# the one that won is printed — a settings module found somewhere unexpected is
-# exactly the kind of thing that must not be silent.
+# --- Make the oncotriage package importable ----------------------------------
+# This file is EXEC'd, not imported, so sys.path[0] is the ENTRY POINT's
+# directory, which is this directory for every documented entry point but is
+# not guaranteed to be. `pip install -e .` also makes the package importable
+# from anywhere, and that is the supported arrangement; this block is what keeps
+# a checkout that has not been installed working exactly as it did before.
+#
+# Three candidate directories, tried in order, and the one that won is printed —
+# a package found somewhere unexpected is exactly the kind of thing that must
+# not be silent. These are the same three candidates, for the same reasons, that
+# _load_path_settings() used to search for oncotriage_settings.py:
 #
 #   _code_dir   set by the bootstrap block of whichever file exec'd this one
 #   __file__    this file's own directory, when it is run as a script
 #   os.getcwd() bare interactive session with neither of the above
 #
 # Docker takes this path too. The image copies the whole code directory to
-# /app, so the module is present there as well.
+# /app, so the package is present there as well.
+#
+# Every later block in this file, and the shims in Files 02 and 03, depend on
+# this having run. Files 02 and 03 carry no copy of it because they are never
+# loaded without this file first — all 31 bootstraps in the codebase exec
+# "01- Imports.py" before "02- Utility Functions.py", and they have to: File 02
+# has always used `os`, `re`, `time`, `httpx`, `Counter` and `logging` out of
+# the block above without importing them.
 
-def _load_path_settings():
-    """Import oncotriage_settings.py by location. Returns (module, directory)."""
+def _ensure_oncotriage_importable():
+    """Import the oncotriage package, extending sys.path only if it is absent.
+
+    Returns the (path, how) that made it work, or (None, "already importable").
+    """
+    try:
+        import oncotriage  # noqa: F401
+        return None, "already importable"
+    except ImportError:
+        pass
+
     candidates = []
     if isinstance(globals().get("_code_dir"), str):
         candidates.append((globals()["_code_dir"], "_code_dir from the calling script"))
@@ -169,109 +159,74 @@ def _load_path_settings():
     candidates.append((os.getcwd(), "working directory"))
 
     for directory, how in candidates:
-        candidate = os.path.join(directory, "oncotriage_settings.py")
-        if not os.path.isfile(candidate):
+        if not os.path.isfile(os.path.join(directory, "oncotriage", "__init__.py")):
             continue
-        spec = importlib.util.spec_from_file_location("oncotriage_settings", candidate)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        print(f"[Paths] Settings module loaded from {candidate} (via {how})")
-        return module, directory
+        if directory not in sys.path:
+            sys.path.insert(0, directory)
+        import oncotriage  # noqa: F401
+        print(f"[Bootstrap] oncotriage package found at {directory} (via {how}); added to sys.path")
+        return directory, how
 
     raise RuntimeError(
-        "oncotriage_settings.py was not found. Searched:\n  "
+        "The 'oncotriage' package was not importable and was not found. Searched:\n  "
         + "\n  ".join(f"{d} (via {how})" for d, how in candidates)
-        + "\nIt must sit beside 01- Imports.py in the code directory."
+        + "\nIt must sit beside 01- Imports.py in the code directory, or be "
+          "installed with `pip install -e .` from that directory."
     )
 
 
-path_settings = _load_path_settings()[0]
+_ensure_oncotriage_importable()
 
 
-# glob.glob(pattern)[0] on its own raises IndexError, and an IndexError names
-# neither the pattern that matched nothing nor the root it was anchored to.
-# Every sibling directory in the local branch is discovered by prefix glob, so
-# a wrong root produces one IndexError per run and no diagnosis. Same
-# discovery, same unsorted [0] — only the failure message changes.
+#------------------------------------------------------------------------------
+
+
+# Coding system keys
+#-------------------
+# Moved to oncotriage/constants.py by item 20c; the argument for why the two
+# values live in one shared place, and why collapsing them is a defect, is there
+# in full. Re-exported here because '07- FHIR Parser.py',
+# '08- Cancer Code Registry.py' and '13- LangGraph Agent.py' read them out of
+# the shared namespace.
+from oncotriage.constants import SYSTEM_KEY_ABSENT, SYSTEM_KEY_UNRECOGNIZED
+
+
+# Paths
+#------
+# Moved to oncotriage/paths.py by item 20c. Importing that module is what
+# resolves the tree — it prints the branch it took and the project root, exactly
+# as this file used to — and every name below is the SAME object the package
+# holds, not a copy.
 #
-# Defined outside the branch, not inside the local one, so that both branches
-# leave the same set of names behind. The Docker branch does not call it; a
-# name defined in one branch and not the other is the exact defect item 20a
-# found in code_path.
-def _glob_one(pattern, label):
-    hits = glob.glob(pattern)
-    if not hits:
-        raise RuntimeError(
-            f"No directory matched the {label} pattern: {pattern!r}\n"
-            f"Project root in use: {main_path!r} (from {_main_path_source})\n"
-            f"Set {path_settings.ENV_MAIN_PATH} if the root is wrong, or check "
-            f"that the sibling directory exists and still ends in the expected suffix."
-        )
-    return hits[0]
-
-
-if IS_DOCKER:
-    # Docker container paths (Linux environment)
-    print("🐳 Running in Docker container")
-
-    # Provenance of main_path, recorded in both branches so a reader of a log
-    # can tell a container run from a local one without inferring it.
-    _main_path_source = "Docker image layout (fixed)"
-
-    main_path = "/app/"
-    # The Dockerfile does `COPY . /app/`, so the numbered scripts sit directly
-    # in /app. Added in item 20a: the local branch has always defined
-    # code_path and this branch never did, so any file reaching for it was
-    # container-only broken.
-    code_path = "/app/"
-    data_path = "/app/data/"
-    data_patient_path = "/app/data/patients/"
-    data_fhir_path = "/app/data/patients/fhir/"
-    data_trial_path = "/app/data/trials/"
-    inferences_path = "/app/data/inferences.db"
-    results_path = "/app/results/"
-    result_fhir_explore_path = "/app/results/fhir_exploration/"
-    result_ablation_path = "/app/results/ablation/"
-    keys_path = "/app/"
-    airflow_path = "/app/airflow_home/"
-    requirements_path = "/app/requirements/"
-    data_MeSH_path = "/app/data/mesh/"
-    checkpoint_path = "/app/checkpoint/"
-    
-else:
-    # Local development paths (macOS)
-    print("💻 Running on local machine")
-
-    main_path, _main_path_source = path_settings.resolve_main_path()
-    print(f"[Paths] Project root: {main_path} (from {_main_path_source})")
-
-    code_path = _glob_one(main_path + "/*Code/", "code")
-
-    data_path = _glob_one(main_path + "/*Data/", "data")
-
-    data_patient_path = _glob_one(data_path + "/*Patients/", "patients")
-
-    data_fhir_path = _glob_one(data_patient_path, "FHIR bundle") + "fhir/"
-
-    data_trial_path = _glob_one(data_path + "/*Trials/", "trials")
-
-    data_MeSH_path = _glob_one(data_path + "/*MeSH/", "MeSH")
-
-    inferences_path = _glob_one(data_path + "/*Inferences Storage/", "inferences") + "inferences.db"
-
-    results_path = _glob_one(main_path + "/*Results/", "results")
-
-    result_fhir_explore_path = _glob_one(results_path + "/*FHIR Exploration/", "FHIR exploration results")
-
-    result_ablation_path = _glob_one(results_path + "/*Ablation/", "ablation results")
-
-    keys_path = _glob_one(main_path + "/*Keys/", "keys")
-
-    airflow_path = _glob_one(main_path + "/*Airflow/", "Airflow")
-
-    requirements_path = _glob_one(main_path + "/*Requirements/", "requirements")
-
-    checkpoint_path = _glob_one(main_path + "/*Checkpoint/", "checkpoint")
+# `path_settings` is oncotriage.settings, which is also what
+# `oncotriage_settings.py` re-exports. '23- Airflow DAG.py' reads
+# path_settings.ENV_CODE_PATH / .with_trailing_sep() off this name.
+#
+# Explicitly, by name. A star import would bind glob, os and every private
+# helper in oncotriage.paths into the shared namespace, where the next file to
+# be added would inherit them without asking.
+from oncotriage.paths import (
+    IS_DOCKER,
+    _load_path_settings,
+    path_settings,
+    _glob_one,
+    _main_path_source,
+    main_path,
+    code_path,
+    data_path,
+    data_patient_path,
+    data_fhir_path,
+    data_trial_path,
+    data_MeSH_path,
+    inferences_path,
+    results_path,
+    result_fhir_explore_path,
+    result_ablation_path,
+    keys_path,
+    airflow_path,
+    requirements_path,
+    checkpoint_path,
+)
 
 
 #------------------------------------------------------------------------------
