@@ -943,7 +943,9 @@ _SUBPACKAGE_DIRS = sorted(
 )
 check("the tree has the subpackages this pass expects (non-degeneracy)",
       _SUBPACKAGE_DIRS,
-      ["oncotriage.agent", "oncotriage.extraction", "oncotriage.fhir",
+      # api, batch and monitoring are new in pass 20c-3b -- the serving layer.
+      ["oncotriage.agent", "oncotriage.api", "oncotriage.batch",
+       "oncotriage.extraction", "oncotriage.fhir", "oncotriage.monitoring",
        "oncotriage.registries", "oncotriage.retrieval", "oncotriage.storage"])
 check("every subpackage on disk is declared in pyproject.toml, so a built "
       "wheel carries it",
@@ -1113,6 +1115,19 @@ import numpy, rank_bm25, langgraph.graph                                  # noqa
 # pre-import the trap would fire on THEIR file access rather than on anything
 # this package does. Same allowance, for the same reason, as the block above.
 import matplotlib, matplotlib.pyplot, pandas, seaborn                     # noqa: F401
+# Pass 20c-3b: the serving layer's three module-scope third-party dependencies.
+# scipy.stats is imported at module scope by oncotriage.monitoring.drift and has
+# to be -- SCIPY_AVAILABLE is that module's answer to "can this run", and a flag
+# that could not be read until after the first call that needed it would be
+# useless. fastapi and slowapi are oncotriage.api.server's whole subject. All
+# three read files of their own at import (scipy loads its config, fastapi pulls
+# in pydantic's compiled core), which is not this package's doing. Same
+# allowance, for the same reason, as the two blocks above.
+import scipy.stats, fastapi, slowapi                                      # noqa: F401
+# tqdm and uvicorn: the batch runner draws a progress bar, and the API entry
+# point serves. Neither loads a model; both are listed so the trap measures this
+# package rather than its dependencies' import machinery.
+import tqdm, uvicorn                                                      # noqa: F401
 
 
 class Blocked(RuntimeError):
@@ -1156,6 +1171,14 @@ import oncotriage.fhir.explore
 import oncotriage.retrieval.indexer
 import oncotriage.retrieval.index_validator
 import oncotriage.storage.database_logger
+import oncotriage.storage.maintenance
+import oncotriage.storage.queries
+import oncotriage.api
+import oncotriage.api.server
+import oncotriage.monitoring
+import oncotriage.monitoring.drift
+import oncotriage.batch
+import oncotriage.batch.runner
 import oncotriage.registries.primary_cancer
 import oncotriage.agent
 import oncotriage.agent.deps
@@ -1219,7 +1242,25 @@ print(json.dumps({"heavy": heavy, "armed": armed}))
 # oncotriage.storage.database_logger stays the case that matters most for the
 # sqlite3 trap: its whole subject is a SQLite database, and before item 20b this
 # import created three tables in the production inferences.db.
-_MODULES_UNDER_TRAP = 33
+#
+# PASS 20c-3b ADDS NINE: storage.maintenance, storage.queries, api, api.server,
+# monitoring, monitoring.drift, batch, batch.runner and the primary_cancer entry
+# that was already counted -- five modules and three package __init__ files.
+# Three of the five are the ones that matter here:
+#
+#   storage.maintenance   is the DELETE loop. "15- Database Empty.py" opened the
+#                         production database at module level until item 20b;
+#                         this import must open nothing at all.
+#   storage.queries       is forty queries that File 16 ran AT LOAD TIME, every
+#                         one of them against the production database. This is
+#                         the single largest behaviour change of the pass and
+#                         the sqlite3 trap is what says it landed.
+#   api.server            builds the FastAPI app at import, which is the one
+#                         deliberate exception to "importing does nothing". The
+#                         traps are what bound that exception: an object is
+#                         constructed, and no socket, database, file or model is
+#                         touched while doing it.
+_MODULES_UNDER_TRAP = 42
 
 _rc, _out, _err = _run(_PURITY, cwd=_ELSEWHERE, extra_path=_FALLBACK_PATH)
 check(f"all {_MODULES_UNDER_TRAP} package modules import with open, io.open, "
@@ -1410,7 +1451,7 @@ _ALL_PKG_MODULES = sorted(
 )
 
 check("the module list is the size the tree says it is (non-degeneracy)",
-      len(_ALL_PKG_MODULES) >= 32, True)
+      len(_ALL_PKG_MODULES) >= 37, True)
 check("...and includes the one that used to resolve a path at import",
       "oncotriage.registries.mesh" in _ALL_PKG_MODULES, True)
 # Pass 20c-3a's three worst offenders, named individually so a module dropped
@@ -1422,6 +1463,14 @@ for _added in ("oncotriage.embedding", "oncotriage.fhir.clean",
                "oncotriage.retrieval.indexer",
                "oncotriage.retrieval.index_validator"):
     check(f"...and covers {_added} (new in pass 20c-3a)",
+          _added in _ALL_PKG_MODULES, True)
+# Pass 20c-3b's five. storage.queries is the one that matters most: File 16 ran
+# forty queries against the production database at load time, so this sweep is
+# what says it does not any more.
+for _added in ("oncotriage.storage.maintenance", "oncotriage.storage.queries",
+               "oncotriage.api.server", "oncotriage.monitoring.drift",
+               "oncotriage.batch.runner"):
+    check(f"...and covers {_added} (new in pass 20c-3b)",
           _added in _ALL_PKG_MODULES, True)
 
 _PER_MODULE_PROBE = (
@@ -1679,14 +1728,45 @@ print("=" * 78)
 # COUNTED BY AST, NOT BY GREP. A grep cannot tell a call from a mention in a
 # docstring, and three of this package's docstrings now name the class precisely
 # because they explain why there is only one call.
+#
+# BOTH CALL SHAPES ARE MATCHED (pass 20c-3b). The pass-3a detector matched
+# ast.Name only, so it saw
+#
+#     from fastembed import SparseTextEmbedding
+#     SparseTextEmbedding(model_name="Qdrant/bm25")        <-- caught
+#
+# and was blind to the attribute form, which needs no import line at all and is
+# what anyone reaching for the class from a module that already imports fastembed
+# would naturally write:
+#
+#     import fastembed
+#     fastembed.SparseTextEmbedding(model_name="Qdrant/bm25")   <-- MISSED
+#
+# A second construction site written that way would have passed this check
+# silently, which is precisely the failure the check exists to prevent: two
+# independently-loaded BM25 vocabularies produce a dot product over mismatched
+# token IDs, so Qdrant keeps returning results, nothing raises, and only
+# retrieval quality falls. Both forms are counted now, and the negative control
+# below plants ONE OF EACH so neither branch of the detector can rot unnoticed.
 
 
 def _sparse_model_constructions(path: str):
-    """Line numbers where SparseTextEmbedding(...) is CALLED in `path`."""
+    """Line numbers where SparseTextEmbedding(...) is CALLED in `path`.
+
+    Matches both `SparseTextEmbedding(...)` (ast.Name) and
+    `something.SparseTextEmbedding(...)` (ast.Attribute).
+    """
     tree = ast.parse(open(path, encoding="utf-8").read())
-    return [n.lineno for n in ast.walk(tree)
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-            and n.func.id == "SparseTextEmbedding"]
+    hits = []
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.Call):
+            continue
+        func = n.func
+        if isinstance(func, ast.Name) and func.id == "SparseTextEmbedding":
+            hits.append(n.lineno)
+        elif isinstance(func, ast.Attribute) and func.attr == "SparseTextEmbedding":
+            hits.append(n.lineno)
+    return sorted(hits)
 
 
 _construction_sites = {}
@@ -1702,19 +1782,33 @@ check("...and it constructs it exactly once",
 
 # NON-DEGENERATE. Everything above would also hold if the detector simply never
 # matched anything -- a renamed class, a broken walk, a _PKG_FILES list that had
-# gone empty. The detector is shown to FIND a construction in a copy that has a
-# second one planted in it, and to report BOTH.
+# gone empty. The detector is shown to FIND constructions in a copy that has
+# them planted in it, ONE OF EACH CALL SHAPE, so a detector that lost either
+# branch fails here rather than going quietly green on the shipped tree.
 _BM25_PLANT_ROOT = tempfile.mkdtemp(prefix="oncotriage_bm25_")
 try:
     shutil.copytree(_PKG_DIR, os.path.join(_BM25_PLANT_ROOT, "oncotriage"))
     _PLANTED = os.path.join(_BM25_PLANT_ROOT, "oncotriage", "retrieval", "indexer.py")
     with open(_PLANTED, "a", encoding="utf-8") as _fh:
+        # The bare-name form the pass-3a detector already caught...
         _fh.write('\n\ndef _planted_second_loader():\n'
                   '    return SparseTextEmbedding(model_name="Qdrant/bm25")\n')
-    check("the detector CATCHES a second construction site planted in a copy",
+    check("the detector CATCHES a bare-name construction planted in a copy",
           len(_sparse_model_constructions(_PLANTED)), 1)
-    check("...and the shipped indexer has none, which is what makes the "
-          "planted one the only difference",
+
+    # ...and the ATTRIBUTE form, which it did NOT catch before pass 20c-3b.
+    # This is the shape that needs no import line, so it is the one someone
+    # writes without noticing they have created a second vocabulary.
+    with open(_PLANTED, "a", encoding="utf-8") as _fh:
+        _fh.write('\n\nimport fastembed\n\n'
+                  'def _planted_third_loader():\n'
+                  '    return fastembed.SparseTextEmbedding(model_name="Qdrant/bm25")\n')
+    check("...and the ATTRIBUTE form, fastembed.SparseTextEmbedding(...), which "
+          "the pass-3a bare-name detector was blind to",
+          len(_sparse_model_constructions(_PLANTED)), 2)
+
+    check("...and the shipped indexer has none of either, which is what makes "
+          "the planted ones the only difference",
           _sparse_model_constructions(
               os.path.join(_PKG_DIR, "retrieval", "indexer.py")), [])
 finally:
@@ -2457,6 +2551,8 @@ print("=" * 78)
 _PROXY_DEMO = r'''
 import ast, json, sys
 
+from oncotriage.agent import deps
+
 STRIPPED = {"__bool__", "__len__", "__iter__", "__contains__", "__eq__",
             "__hash__"}
 
@@ -2464,19 +2560,21 @@ source = open(sys.argv[1], encoding="utf-8").read()
 node = next(n for n in ast.parse(source).body
             if isinstance(n, ast.ClassDef) and n.name == "_LazyAgentDependency")
 
-new_ns, old_ns = {}, {}
+# The class body references `deps` by name, so both copies are exec'd into a
+# namespace that HAS it -- the shipped __repr__ asks deps two questions.
+new_ns, old_ns = {"deps": deps}, {"deps": deps}
 exec(ast.unparse(node), new_ns)
 
-# The pass-2c shape: the same class with the six delegating methods removed and
-# __repr__ put back the way it was.
+# The pass-2c/3a shape: the same class with the six delegating methods removed
+# and __repr__ put back to the DELEGATING form pass 3a shipped -- the one that
+# resolves. That is the defect pass 3b removes, so it is what the control must
+# reproduce.
 old_node = ast.parse(ast.unparse(node)).body[0]
 old_node.body = [b for b in old_node.body
                  if not (isinstance(b, ast.FunctionDef) and b.name in STRIPPED)]
 for b in old_node.body:
     if isinstance(b, ast.FunctionDef) and b.name == "__repr__":
-        b.body = ast.parse(
-            "return f\"<lazy {object.__getattribute__(self, '_label')} via "
-            "oncotriage.agent.deps>\"").body
+        b.body = ast.parse("return repr(self._resolve())").body
 exec(ast.unparse(old_node), old_ns)
 
 
@@ -2510,6 +2608,12 @@ class Sentinel:
 
 SENTINEL = Sentinel()
 
+# `repr` LEFT THIS DICT IN PASS 20c-3b. It used to expect the SENTINEL's own
+# repr, i.e. delegation. Delegation is the defect now: it makes repr() resolve,
+# which downloads and loads MedCPT from a debugger, a log line, or a bare name
+# typed at a prompt -- on the diagnostic path, where the tool used to inspect
+# the state must not be the thing that changes it. repr is measured separately
+# below, by whether the ACCESSOR WAS CALLED.
 TRUTH = {
     "bool": False,
     "len": 3,
@@ -2517,15 +2621,18 @@ TRUTH = {
     "contains": True,
     "eq_identity": True,
     "eq_value": True,
-    "repr": "<Sentinel: the object the agent actually reaches>",
     "hash": True,
     "getattr": "forwarded by __getattr__",
     "call": ["called", [1, 2]],
 }
 
+# A real deps key, because the shipped __repr__ asks deps about it. MEDCPT_MODEL
+# is one of the three this proxy is actually used for.
+KEY = deps.MEDCPT_MODEL
+
 
 def observe(cls):
-    proxy = cls(lambda: SENTINEL, "sentinel dependency")
+    proxy = cls(lambda: SENTINEL, "sentinel dependency", KEY)
     out = {}
     for key, thunk in (
         ("bool", lambda: bool(proxy)),
@@ -2534,7 +2641,6 @@ def observe(cls):
         ("contains", lambda: "a" in proxy),
         ("eq_identity", lambda: proxy == SENTINEL),
         ("eq_value", lambda: proxy == "i am the sentinel"),
-        ("repr", lambda: repr(proxy)),
         ("hash", lambda: hash(proxy) == 4242),
         ("getattr", lambda: proxy.marker),
         ("call", lambda: proxy(1, 2)),
@@ -2548,25 +2654,68 @@ def observe(cls):
 
 old, new = observe(old_ns["_LazyAgentDependency"]), observe(new_ns["_LazyAgentDependency"])
 
+
+# ---------------------------------------------------------------------------
+# __repr__ MUST NOT RESOLVE (pass 20c-3b)
+# ---------------------------------------------------------------------------
+# Measured by COUNTING ACCESSOR CALLS, which is the only thing that can tell the
+# two shapes apart: both return a string, and both strings look reasonable.
+def counting_accessor():
+    calls = []
+
+    def accessor():
+        calls.append(1)
+        return SENTINEL
+
+    return accessor, calls
+
+
+new_acc, new_calls = counting_accessor()
+old_acc, old_calls = counting_accessor()
+
+new_proxy = new_ns["_LazyAgentDependency"](new_acc, "sentinel dependency", KEY)
+old_proxy = old_ns["_LazyAgentDependency"](old_acc, "sentinel dependency", KEY)
+
+new_repr_unresolved = repr(new_proxy)
+old_repr = repr(old_proxy)
+
+# With an override INSTALLED, the shipped repr must say so and must name the
+# object's TYPE -- the discriminating fact, without transformers' module tree.
+with deps.override(KEY, SENTINEL):
+    new_repr_override = repr(new_proxy)
+    state_with_override = deps.resolution_state(KEY)
+    peeked_is_sentinel = deps.peek(KEY) is SENTINEL
+
+state_after = deps.resolution_state(KEY)
+
 # A __repr__ that RAISES would break every traceback, debugger and log line that
-# formats one of these three names, so a failed resolution is caught, RECORDED
-# and described. Both halves are checked.
+# formats one of these three names, so a failure is caught, RECORDED and
+# described. The way to make it fail without resolving anything is a proxy built
+# with a key deps does not know -- a defect in the shim rather than in a model.
 Cls = new_ns["_LazyAgentDependency"]
-
-
-def _boom():
-    raise RuntimeError("model not loaded")
-
-
-exploding = Cls(_boom, "exploding dependency")
 before = len(Cls.repr_failures)
-text = repr(exploding)
+bad = Cls(lambda: SENTINEL, "bogus dependency", "not-a-real-deps-key")
+bad_text = repr(bad)
 
 print(json.dumps({
     "old_wrong": sorted(k for k, v in old.items() if v != TRUTH[k]),
     "new_wrong": sorted(k for k, v in new.items() if v != TRUTH[k]),
+    # THE CONTROL: the pass-3a delegating repr calls the accessor. The shipped
+    # one does not.
+    "old_repr_resolutions": len(old_calls),
+    "new_repr_resolutions": len(new_calls),
+    "old_repr_is_the_wrapped_object": old_repr == repr(SENTINEL),
+    "new_repr_names_the_key": KEY in new_repr_unresolved,
+    "new_repr_says_unresolved": "unresolved" in new_repr_unresolved,
+    "new_repr_says_override": "override" in new_repr_override,
+    "new_repr_names_the_type": "Sentinel" in new_repr_override,
+    "new_repr_avoids_the_object_repr":
+        repr(SENTINEL) not in new_repr_override,
+    "state_with_override": state_with_override,
+    "peeked_is_sentinel": peeked_is_sentinel,
+    "state_after_override_removed": state_after,
     "repr_did_not_raise": True,
-    "repr_names_the_error": "RuntimeError" in text and "model not loaded" in text,
+    "repr_names_the_error": "KeyError" in bad_text,
     "repr_failure_recorded": len(Cls.repr_failures) == before + 1,
 }))
 '''
@@ -2585,17 +2734,62 @@ else:
     # rather than assertion: the OLD shape must be shown to get these wrong. A
     # demonstration where both classes pass proves only that the sentinel was
     # too weak to tell them apart.
-    check("the pass-2c proxy shape answers bool, len, iter, in, ==, hash and "
-          "repr WRONGLY about the object it wraps",
+    check("the pass-2c proxy shape answers bool, len, iter, in, ==, and hash "
+          "WRONGLY about the object it wraps",
           _payload.get("old_wrong"),
-          ["bool", "contains", "eq_identity", "eq_value", "hash", "iter",
-           "len", "repr"])
+          ["bool", "contains", "eq_identity", "eq_value", "hash", "iter", "len"])
     check("...while __getattr__ and __call__ were right even then, so the "
           "difference is the six protocols and nothing else",
           sorted(set(_payload.get("old_wrong") or []) & {"getattr", "call"}), [])
-    check("the shipped proxy gets every one of the ten right",
+    check("the shipped proxy gets every one of the nine right",
           _payload.get("new_wrong"), [])
-    check("__repr__ over a failing accessor does NOT raise",
+
+    # --- __repr__ MUST NOT RESOLVE (pass 20c-3b) ---------------------------
+    #
+    # Pass 3a made __repr__ delegate, on the reasonable-sounding grounds that a
+    # proxy printing "<lazy MedCPT cross-encoder>" while handing the agent a
+    # fixture stub is lying. The goal was right and the mechanism was wrong:
+    # delegation means REPR TRIGGERS A BUILD. A debugger rendering locals, a
+    # logging call formatting the object, or a bare `medcpt_model` typed at a
+    # prompt now downloads and loads ~110 MB and then prints transformers'
+    # multi-thousand-line module tree -- on the DIAGNOSTIC path, so the tool
+    # used to inspect the state is what changes it.
+    #
+    # MEASURED BY COUNTING ACCESSOR CALLS, because that is the only thing that
+    # separates the two shapes: both return a plausible-looking string.
+    check("the pass-3a delegating __repr__ RESOLVES (the defect, demonstrated)",
+          _payload.get("old_repr_resolutions"), 1)
+    check("...and it did so by producing the wrapped object's own repr, which "
+          "is what made the cost invisible",
+          _payload.get("old_repr_is_the_wrapped_object"), True)
+    check("the shipped __repr__ resolves NOTHING",
+          _payload.get("new_repr_resolutions"), 0)
+    check("...and still names the deps key it stands for",
+          _payload.get("new_repr_names_the_key"), True)
+    check("...and says so when nothing is built yet",
+          _payload.get("new_repr_says_unresolved"), True)
+
+    # The honesty pass 3a was after, kept without the cost: with an override
+    # installed the repr must say "override" and name the STUB's type, so a
+    # person looking at it can tell what the agent is actually reaching.
+    check("with an override installed the repr says 'override'",
+          _payload.get("new_repr_says_override"), True)
+    check("...and names the type of the object that is installed",
+          _payload.get("new_repr_names_the_type"), True)
+    check("...without printing the object's own repr, which is the module tree "
+          "nobody asked for",
+          _payload.get("new_repr_avoids_the_object_repr"), True)
+
+    # The two non-building deps queries the repr is built on.
+    check("deps.resolution_state reports an installed override",
+          _payload.get("state_with_override"), "override")
+    check("deps.peek returns the installed object without building",
+          _payload.get("peeked_is_sentinel"), True)
+    check("...and the key goes back to unresolved when the override is removed, "
+          "so the state query is reading live state rather than a constant",
+          _payload.get("state_after_override_removed"), "unresolved")
+
+    check("__repr__ over a proxy deps cannot answer for does NOT raise",
           _payload.get("repr_did_not_raise"), True)
     check("...and names the exception instead of hiding it",
           _payload.get("repr_names_the_error"), True)
@@ -2613,6 +2807,405 @@ check("the proxy forwards exactly the documented set and nothing more",
       _PROXY_METHODS,
       ["__bool__", "__call__", "__contains__", "__eq__", "__getattr__",
        "__hash__", "__init__", "__iter__", "__len__", "__repr__", "_resolve"])
+
+
+# ===========================================================================
+# 5d. THE DEPS SEAM UNDER MAX_WORKERS THREADS
+# ===========================================================================
+
+print("\n" + "=" * 78)
+print("5d. MAX_WORKERS threads through every accessor: one object, one build")
+print("=" * 78)
+
+# WHY THIS EXISTS NOW AND NOT EARLIER.
+#
+# oncotriage/agent/deps.py has only ever RUN single-threaded. Every harness that
+# exercised it -- Files 35, 36, 37, 45, 46 -- drives one patient at a time on
+# one thread. Pass 20c-3a moved the whole override-then-cache sequence inside
+# the lock on the argument that "25- Batch Runner.py" drives MAX_WORKERS = 12
+# threads through it, and that argument was correct and UNTESTED: the batch
+# runner needs a Qdrant index, an OpenAI key and 22,000 bundles, so nothing in
+# the test suite had ever put two threads through an accessor at once.
+#
+# Pass 20c-3b makes the batch runner a package module, so the claim is now
+# checkable without any of that. This drives MAX_WORKERS threads at every
+# accessor simultaneously, with COUNTING FACTORIES installed in place of the
+# real ones, and asserts the two properties the seam exists to provide:
+#
+#   1. every thread gets THE SAME object for a key. Two Qdrant clients is two
+#      connection pools, and the per-patient latency figures in inferences.db
+#      would then describe two different transports with nothing in the row
+#      saying so.
+#   2. the factory ran EXACTLY ONCE per key. "same object" alone would also hold
+#      if the factory ran twelve times and eleven results were discarded -- for
+#      a client that opens a pool, or a model that loads 110 MB, that is a real
+#      cost that identity cannot see.
+#
+# The counting factories are installed by monkeypatching deps' own private
+# builders in the subprocess, which is legitimate here in a way it is not in
+# production code: the object under test IS the caching machinery, so the thing
+# that must be replaced is what it caches.
+#
+# A BARRIER, not just a thread pool. Threads that start staggered would let the
+# first one finish building before the second even asks, and the race under test
+# would never occur. threading.Barrier makes all twelve arrive at the accessor
+# together.
+
+_DEPS_CONCURRENCY = r'''
+import json, threading
+from concurrent.futures import ThreadPoolExecutor
+
+from oncotriage.agent import deps
+from oncotriage.config import MAX_WORKERS
+
+# Counting stand-ins for every real factory. Each records that it ran and
+# returns a distinct object, so "the same object" is a real claim rather than a
+# consequence of everything being None.
+BUILDS = {}
+LOCK = threading.Lock()
+
+
+class Built:
+    def __init__(self, key):
+        self.key = key
+
+    def __repr__(self):
+        return f"<Built {self.key}>"
+
+
+def make_factory(key):
+    def factory():
+        with LOCK:
+            BUILDS[key] = BUILDS.get(key, 0) + 1
+        # A build that is instantaneous cannot lose a race. Yielding the GIL
+        # here is what gives a second thread the chance to enter and get it
+        # wrong, which is the whole point of the exercise.
+        for _ in range(200):
+            pass
+        return Built(key)
+    return factory
+
+
+ACCESSORS = {
+    deps.OPENAI_CLIENT:    ("get_openai_client", "_OPENAI"),
+    deps.QDRANT_CLIENT:    ("get_qdrant_client", "_QDRANT"),
+    deps.BM25_QUERY_MODEL: ("get_bm25_query_model", "_BM25"),
+    deps.MEDCPT_TOKENIZER: ("get_medcpt_tokenizer", "_TOK"),
+    deps.MEDCPT_MODEL:     ("get_medcpt_model", "_MODEL"),
+    deps.CANCER_REGISTRY:  ("get_cancer_registry", "_CANCER"),
+    deps.LAB_REGISTRY:     ("get_lab_registry", "_LAB"),
+    deps.MESH_FILTER:      ("get_mesh_filter", "_MESH"),
+}
+
+# Rebuild each accessor over a counting factory, keeping deps' own _resolve --
+# the machinery under test -- untouched.
+PATCHED = {}
+for key, (accessor_name, _label) in ACCESSORS.items():
+    PATCHED[key] = (lambda k=key, f=make_factory(key): deps._resolve(k, f))
+
+N = MAX_WORKERS
+barrier = threading.Barrier(N)
+results = {key: [] for key in ACCESSORS}
+results_lock = threading.Lock()
+
+
+def worker(_i):
+    barrier.wait()                      # all N arrive together
+    got = {}
+    for key, call in PATCHED.items():
+        got[key] = call()
+    with results_lock:
+        for key, value in got.items():
+            results[key].append(value)
+
+
+with ThreadPoolExecutor(max_workers=N) as pool:
+    list(pool.map(worker, range(N)))
+
+same_object = {key: (len({id(v) for v in vals}) == 1) for key, vals in results.items()}
+counts = {key: len(vals) for key, vals in results.items()}
+
+print(json.dumps({
+    "workers": N,
+    "keys": sorted(ACCESSORS),
+    "observations_per_key": sorted(set(counts.values())),
+    "keys_with_one_object": sorted(k for k, ok in same_object.items() if ok),
+    "keys_with_more_than_one_object": sorted(k for k, ok in same_object.items() if not ok),
+    "builds": {k: BUILDS.get(k, 0) for k in sorted(ACCESSORS)},
+    "cached_keys": deps.cached_keys(),
+}))
+'''
+
+_rc, _out, _err = _run(_DEPS_CONCURRENCY, cwd=_ELSEWHERE, extra_path=_FALLBACK_PATH)
+check("the deps concurrency probe ran", _rc, 0)
+if _rc != 0:
+    fail("deps concurrency", f"exit {_rc}; stderr tail: {_err.strip().splitlines()[-4:]}")
+else:
+    _payload = _last_json(_out) or {}
+    _keys = _payload.get("keys") or []
+
+    # NON-DEGENERATE FIRST. All of this passes trivially with one thread, or
+    # with zero keys, or if every worker silently died.
+    check("it ran with MAX_WORKERS threads, and MAX_WORKERS is more than one",
+          (_payload.get("workers") or 0) > 1, True)
+    check("every accessor key was exercised", len(_keys), 8)
+    check("every key was observed by every worker (no worker died silently)",
+          _payload.get("observations_per_key"), [_payload.get("workers")])
+
+    check("every key handed the same object to all MAX_WORKERS threads",
+          _payload.get("keys_with_more_than_one_object"), [])
+    check("...for every one of the eight keys, not just the ones that happened "
+          "to be fast", sorted(_payload.get("keys_with_one_object") or []),
+          sorted(_keys))
+    check("each factory ran EXACTLY ONCE, so 'same object' is not twelve builds "
+          "with eleven thrown away",
+          sorted(set((_payload.get("builds") or {}).values())), [1])
+    check("...and deps reports exactly those eight keys as cached, through the "
+          "non-building query added in pass 20c-3b",
+          sorted(_payload.get("cached_keys") or []), sorted(_keys))
+
+
+# ===========================================================================
+# 5e. THE INFERENCE WRITE LOCK
+# ===========================================================================
+
+print("\n" + "=" * 78)
+print("5e. concurrent log_inference writes are serialized, and every row lands")
+print("=" * 78)
+
+# WHAT THIS REPLACES.
+#
+# "25- Batch Runner.py" lines 65-73 wrapped log_inference in a lock IN ITS OWN
+# NAMESPACE, by rebinding the name after chaining File 14. That protected the
+# batch runner and NOTHING ELSE, and there is a second concurrent writer:
+# "17- FastAPI Server.py" calls log_inference from loop.run_in_executor(...),
+# once per in-flight request, on the event loop's thread pool. Two overlapping
+# POST /match requests wrote to one SQLite file through two connections with
+# nothing serializing them.
+#
+# Pass 20c-3b moves the lock into oncotriage/storage/database_logger.py, beside
+# the writes it protects. Both callers get it; neither has to know.
+#
+# WHERE THE RACE ACTUALLY IS, MEASURED RATHER THAN ASSUMED.
+#
+# The first version of this check drove N threads at an ALREADY-INITIALIZED
+# database and expected the unlocked control to lose rows. IT DID NOT: both
+# arms landed every row. That result is reported here rather than tuned away,
+# because it says something true. On the steady-state INSERT path, SQLite's own
+# file locking plus the sqlite3 module's 5-second busy timeout already serialize
+# two connections writing to one file, and at this project's contention -- a few
+# milliseconds of writing at the end of a ~70-second per-patient pipeline --
+# nothing waits long enough to time out. The lock is not what saves that path.
+#
+# THE PATH IT DOES SAVE IS THE SCHEMA MIGRATION, and there the loss is real,
+# silent, and reproducible:
+#
+#   _ensure_database -> initialize_database runs CREATE TABLE IF NOT EXISTS and
+#   then, for each entry in INFERENCE_COLUMN_ADDITIONS, a PRAGMA table_info
+#   check followed by an ALTER TABLE ADD COLUMN. ALTER TABLE ADD COLUMN has no
+#   IF NOT EXISTS form -- the PRAGMA check IS the guard. Two threads arriving at
+#   a fresh database both read the PRAGMA (column absent) and both issue the
+#   ALTER; the second gets
+#
+#       sqlite3.OperationalError: duplicate column name: retrieval_degraded
+#
+#   which propagates into log_inference's try block, is caught by its
+#   `except sqlite3.Error` -- the handler that exists so a logging fault cannot
+#   kill the pipeline -- printed as "Database logging failed (non-critical)",
+#   and the row is GONE. A run that lost rows this way reports success.
+#
+# That is exactly the defect class this project exists to remove, and it was
+# reachable from the API path, on every first request against a new or migrated
+# database, for as long as the only lock in the project lived in File 25.
+#
+# BOTH SCENARIOS ARE MEASURED BELOW and both results are asserted, so the honest
+# finding (the lock does not change the steady-state insert path) is recorded
+# rather than quietly dropped.
+#
+# THE CONTROL IS A COPY, never an edit in place: the module source is parsed,
+# every `with _WRITE_LOCK:` is replaced by its own body, and the result is
+# exec'd under a different module name.
+#
+# REPEATED TRIALS, because a race is not deterministic. Measured over 20 trials
+# at 24 threads: the unlocked arm lost rows in 18, the locked arm in 0. Eight
+# trials puts the chance of a false "clean" run at roughly 1e-8, and the locked
+# arm must be clean in ALL of them.
+
+_WRITE_LOCK_DEMO = r'''
+import ast, io, json, os, contextlib, sqlite3, tempfile, threading
+from concurrent.futures import ThreadPoolExecutor
+
+from oncotriage.config import MAX_WORKERS
+from oncotriage.storage import database_logger
+
+
+# Twice MAX_WORKERS, with two rows each rather than many: the race is at the
+# FIRST write against a fresh database, so what matters is how many threads
+# arrive at the migration together, not how much they write afterwards.
+THREADS = max(2 * MAX_WORKERS, 24)
+ROWS_PER_THREAD = 2
+TOTAL = THREADS * ROWS_PER_THREAD
+TRIALS = 8
+
+
+def make_result(i):
+    """The minimum a terminal node emits that log_inference will accept."""
+    return {
+        "patient_id": f"patient-{i:04d}",
+        "timestamp": f"2026-08-05T00:00:{i % 60:02d}",
+        "matching_model": "gpt-5.6-terra",
+        "gpt4o_input_tokens": 10,
+        "gpt4o_output_tokens": 5,
+        "matches": [], "near_misses": [], "not_evaluable": [],
+        "stage_timings": {},
+    }
+
+
+PATIENT = {"demographics": {}, "conditions": [], "medications": [], "allergies": []}
+
+
+def drive(log_fn, db_path):
+    """THREADS threads x ROWS_PER_THREAD writes each, all starting together."""
+    barrier = threading.Barrier(THREADS)
+    errors = []
+
+    def worker(t):
+        barrier.wait()
+        for r in range(ROWS_PER_THREAD):
+            try:
+                log_fn(make_result(t * ROWS_PER_THREAD + r), PATIENT, db_path=db_path)
+            except Exception as exc:                              # noqa: BLE001
+                errors.append(f"{type(exc).__name__}: {exc}")
+
+    # log_inference prints one line per row; silenced so the JSON payload is the
+    # last thing on stdout.
+    with contextlib.redirect_stdout(io.StringIO()):
+        with ThreadPoolExecutor(max_workers=THREADS) as pool:
+            list(pool.map(worker, range(THREADS)))
+
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute("SELECT COUNT(*) FROM inferences").fetchone()[0]
+        distinct = conn.execute(
+            "SELECT COUNT(DISTINCT patient_id) FROM inferences").fetchone()[0]
+    finally:
+        conn.close()
+    return {"rows": rows, "distinct": distinct, "errors": errors[:2],
+            "error_count": len(errors)}
+
+
+# --- the control: a COPY of the module with every `with _WRITE_LOCK:` removed
+source = open(database_logger.__file__, encoding="utf-8").read()
+tree = ast.parse(source)
+
+
+class StripLock(ast.NodeTransformer):
+    removed = 0
+
+    def visit_With(self, node):
+        self.generic_visit(node)
+        names = [i.context_expr.id for i in node.items
+                 if isinstance(i.context_expr, ast.Name)]
+        if "_WRITE_LOCK" in names:
+            StripLock.removed += 1
+            return node.body
+        return node
+
+
+stripped = ast.fix_missing_locations(StripLock().visit(tree))
+unlocked_ns = {"__name__": "database_logger_unlocked",
+               "__file__": database_logger.__file__}
+exec(compile(ast.unparse(stripped), "<database_logger_unlocked>", "exec"), unlocked_ns)
+
+TMP = tempfile.mkdtemp(prefix="oncotriage_writelock_")
+
+# --- SCENARIO A: the schema already exists --------------------------------
+# Reported because it is the honest finding: the lock changes nothing here.
+steady = {}
+for label, log_fn, init_fn in (
+        ("locked", database_logger.log_inference, database_logger.initialize_database),
+        ("unlocked", unlocked_ns["log_inference"], unlocked_ns["initialize_database"])):
+    db = os.path.join(TMP, f"steady-{label}.db")
+    with contextlib.redirect_stdout(io.StringIO()):
+        init_fn(db)
+    steady[label] = drive(log_fn, db)
+
+# --- SCENARIO B: a FRESH database, threads race the migration -------------
+fresh = {"locked": [], "unlocked": []}
+for label, log_fn in (("locked", database_logger.log_inference),
+                      ("unlocked", unlocked_ns["log_inference"])):
+    for trial in range(TRIALS):
+        # A fresh file AND a fresh memo: _INITIALIZED_DATABASES is what stops
+        # the second call re-running the migration, so a stale entry would make
+        # every trial after the first one prove nothing.
+        db = os.path.join(TMP, f"fresh-{label}-{trial}.db")
+        if label == "locked":
+            database_logger._INITIALIZED_DATABASES.clear()
+        else:
+            unlocked_ns["_INITIALIZED_DATABASES"].clear()
+        fresh[label].append(drive(log_fn, db))
+
+print(json.dumps({
+    "threads": THREADS,
+    "trials": TRIALS,
+    "expected_rows": TOTAL,
+    "locks_stripped": StripLock.removed,
+    "steady": steady,
+    "fresh_lossy_trials": {
+        label: sum(1 for r in runs if r["rows"] != TOTAL)
+        for label, runs in fresh.items()
+    },
+    "fresh_worst_loss": {
+        label: TOTAL - min(r["rows"] for r in runs)
+        for label, runs in fresh.items()
+    },
+    "fresh_raised": {
+        label: sum(r["error_count"] for r in runs) for label, runs in fresh.items()
+    },
+}))
+'''
+
+_rc, _out, _err = _run(_WRITE_LOCK_DEMO, cwd=_ELSEWHERE, extra_path=_FALLBACK_PATH)
+check("the write-lock demonstration ran", _rc, 0)
+if _rc != 0:
+    fail("write lock", f"exit {_rc}; stderr tail: {_err.strip().splitlines()[-6:]}")
+else:
+    _payload = _last_json(_out) or {}
+    _expected = _payload.get("expected_rows")
+    _trials = _payload.get("trials")
+    _steady = _payload.get("steady") or {}
+    _lossy = _payload.get("fresh_lossy_trials") or {}
+
+    # NON-DEGENERATE FIRST. Every assertion below passes trivially with one
+    # thread, one trial, or a "control" that is a copy of the same module.
+    check("it ran with more than one thread", (_payload.get("threads") or 0) > 1, True)
+    check("...writing more than one row", (_expected or 0) > 1, True)
+    check("...over more than one trial, because a race is not deterministic",
+          (_trials or 0) > 1, True)
+    check("the control actually removed the lock (all three sites)",
+          _payload.get("locks_stripped"), 3)
+
+    # SCENARIO A, reported honestly: the lock does NOT change this path.
+    check("steady state, WITH the lock: every row lands",
+          (_steady.get("locked") or {}).get("rows"), _expected)
+    check("steady state, WITHOUT the lock: every row ALSO lands -- SQLite's own "
+          "file locking already serializes two connections on one file, so this "
+          "is not what the lock is for",
+          (_steady.get("unlocked") or {}).get("rows"), _expected)
+
+    # SCENARIO B: the migration race, which is what the lock is for.
+    check(f"fresh database, WITH the lock: zero lossy trials out of {_trials}",
+          _lossy.get("locked"), 0)
+    check("...and nothing raised in any of them",
+          (_payload.get("fresh_raised") or {}).get("locked"), 0)
+
+    # THE CONTROL. If this passed, the check above would be measuring nothing.
+    check("fresh database, WITHOUT the lock: rows are LOST (negative control)",
+          (_lossy.get("unlocked") or 0) >= 1, True)
+    print(f"       control: {_lossy.get('unlocked')}/{_trials} trials lost rows, "
+          f"worst loss {(_payload.get('fresh_worst_loss') or {}).get('unlocked')} "
+          f"of {_expected}; locked arm lost nothing in "
+          f"{_trials}/{_trials} trials")
 
 
 # ===========================================================================

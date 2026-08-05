@@ -353,11 +353,32 @@ check("notes carry the counts", f"{_N}/{_N}" in _notes, True)
 check("a clean result carries no diagnosis", _healthy["notes"], None)
 
 # Round-trip through log_drift_metrics into a throwaway database.
+#
+# ITEM 20c, PASS 3b: THIS NO LONGER REBINDS A GLOBAL.
+#
+# It used to do exactly this:
+#
+#     inferences_path = os.path.join(_TMP_DIR, "drift_test.db")
+#
+# and rely on File 20's log_drift_metrics reading that name out of the shared
+# exec namespace at call time. That worked only because every project file was
+# exec'd into one dict. File 20's definitions live in
+# oncotriage/monitoring/drift.py now, and a module function resolves its globals
+# in its OWN module -- so the rebinding above would have reached nothing, and
+# this test would have written drift rows into the REAL inferences.db while
+# printing the name of the temporary file it thought it was using. Silent in
+# both directions.
+#
+# CLAUDE.md named this file as "the one file that still rebinds inferences_path
+# without passing a path", left that way until File 20 converted. It has now,
+# and this is the change: log_drift_metrics takes db_path, and this test passes
+# it. No writer anywhere in the repository still depends on rebinding a shared
+# global.
 _TMP_DIR = tempfile.mkdtemp(prefix="oncotriage_ecog_availability_")
-inferences_path = os.path.join(_TMP_DIR, "drift_test.db")
+_SCRATCH_DB = os.path.join(_TMP_DIR, "drift_test.db")
+_DECOY_DB = os.path.join(_TMP_DIR, "decoy.db")
 
-_conn = sqlite3.connect(inferences_path)
-_conn.execute('''
+_DRIFT_SCHEMA = '''
     CREATE TABLE drift_metrics (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp TEXT NOT NULL, metric_category TEXT NOT NULL,
@@ -366,14 +387,70 @@ _conn.execute('''
         alert INTEGER, baseline_window_days INTEGER,
         comparison_window_days INTEGER, notes TEXT
     )
-''')
-_conn.commit()
-_conn.close()
+'''
 
-log_drift_metrics({"data_availability": detect_data_availability(rows(ALL_AFTER))},
-                  BASELINE_WINDOW_DAYS, COMPARISON_WINDOW_DAYS)
+for _db in (_SCRATCH_DB, _DECOY_DB):
+    _conn = sqlite3.connect(_db)
+    _conn.execute(_DRIFT_SCHEMA)
+    _conn.commit()
+    _conn.close()
 
-_conn = sqlite3.connect(inferences_path)
+
+# DISCRIMINATING FIRST. Asserting "it wrote where I told it to" proves nothing
+# if the default happens to be the same place. So: establish that the default is
+# the PRODUCTION database and is NOT this test's scratch file, which is what
+# makes passing db_path load-bearing rather than decorative. Same shape as the
+# check Files 36, 37, 38, 40 and 45 each make against resolve_inference_db_path.
+#
+# resolve_drift_db_path RESOLVES AND RETURNS; it opens nothing, so asking this
+# question is safe on a machine holding a database this test must not touch.
+_PRODUCTION_DB = resolve_drift_db_path(None)
+check("omitting db_path resolves to the production database",
+      _PRODUCTION_DB.endswith("inferences.db"), True)
+check("...which is NOT this test's scratch file, so passing db_path is doing "
+      "real work", _PRODUCTION_DB == _SCRATCH_DB, False)
+
+# The production row count BEFORE. Read only. Compared again at the end: a run
+# that leaked a write into the real database fails here rather than being
+# discovered months later as an unexplained drift row.
+def _production_drift_rows():
+    """Rows in the production drift_metrics table, or None if unreadable."""
+    try:
+        _c = sqlite3.connect(_PRODUCTION_DB)
+        try:
+            return _c.execute("SELECT COUNT(*) FROM drift_metrics").fetchone()[0]
+        finally:
+            _c.close()
+    except sqlite3.Error:
+        return None
+
+
+_PRODUCTION_ROWS_BEFORE = _production_drift_rows()
+
+_written = log_drift_metrics(
+    {"data_availability": detect_data_availability(rows(ALL_AFTER))},
+    BASELINE_WINDOW_DAYS, COMPARISON_WINDOW_DAYS,
+    db_path=_SCRATCH_DB)
+
+check("log_drift_metrics reports the database it actually wrote to",
+      _written, _SCRATCH_DB)
+
+# NEGATIVE CONTROL for that assertion, and it uses only scratch files -- the
+# honest demonstration ("call it with db_path omitted and watch it hit
+# production") is exactly the thing this check exists to prevent, so it is
+# aimed at a SECOND throwaway database instead. The assertion above must be
+# capable of coming out False, or it is not an assertion.
+_written_decoy = log_drift_metrics(
+    {"data_availability": detect_data_availability(rows(ALL_AFTER))},
+    BASELINE_WINDOW_DAYS, COMPARISON_WINDOW_DAYS,
+    db_path=_DECOY_DB)
+check("the same assertion FAILS when the write goes elsewhere (negative control)",
+      _written_decoy == _SCRATCH_DB, False)
+check("...and the decoy write landed in the decoy, so the control is not "
+      "passing because the call did nothing",
+      _written_decoy, _DECOY_DB)
+
+_conn = sqlite3.connect(_SCRATCH_DB)
 _conn.row_factory = sqlite3.Row
 _row = _conn.execute(
     "SELECT * FROM drift_metrics WHERE metric_name = 'ecog_unavailable_rate'"
@@ -392,6 +469,17 @@ if _row is not None:
     check("it is NOT recorded as a z-score", _row["z_score"], None)
     check("no baseline mean was invented", _row["baseline_mean"], None)
 
+# NOTHING LEAKED. Two writes were made above and both were aimed at throwaway
+# files; the production database must be exactly where it was. This is the check
+# that would have caught the silent regression described at the top of this
+# section, where the rebinding stopped working and every row went to the real
+# database while the printed path said otherwise.
+check("the production database was not written to",
+      _production_drift_rows(), _PRODUCTION_ROWS_BEFORE)
+check("...and that comparison is not vacuous -- the production table was "
+      "readable, so the count is a real number rather than a None on both sides",
+      _PRODUCTION_ROWS_BEFORE is not None, True)
+
 shutil.rmtree(_TMP_DIR, ignore_errors=True)
 
 
@@ -402,6 +490,41 @@ shutil.rmtree(_TMP_DIR, ignore_errors=True)
 print("\n" + "=" * 70)
 print("8. STRUCTURAL -- no baseline, no z-score")
 print("=" * 70)
+
+
+# THE FOUR SOURCE READS BELOW WERE RETARGETED IN PASS 20c-3b.
+#
+# They pointed at "20- Drift Detection.py". Every definition they inspect now
+# lives in oncotriage/monitoring/drift.py; File 20 is a re-export shim whose
+# whole body is one `from ... import (...)`. Left as they were, all four would
+# have failed loudly on the very next run -- _function_body raises
+# AssertionError when the function is absent, and the two `next(...)` lookups
+# raise StopIteration -- so nothing here would have gone SILENTLY green.
+#
+# THAT IS NOT TRUE OF EVERY CHECK THEY FEED, and the pass-20c-2c lesson is to
+# ask which ones could. Answering it honestly:
+#
+#   * The three "does not call X" checks on `_src` are `in` tests asserted
+#     False. They pass on an EMPTY string. _function_body raising covers a
+#     MISSING function, but not a function whose body came back empty -- a
+#     future edit to the extractor, or a definition that is all docstring, and
+#     three checks agree with the code by construction. THESE ARE THE ONES THAT
+#     COULD HAVE ROTTED, so `_src` is now asserted non-degenerate first.
+#   * "reads the threshold from config" and "threshold is not a literal" are one
+#     True and one False on the same string, so the pair cannot both pass
+#     vacuously -- the True half fails on empty. Partially self-protecting, and
+#     still covered by the non-degeneracy check below.
+#   * The `_runner` and `_printer` checks are all asserted True, so an empty
+#     body fails them. Never at risk; the non-degeneracy assertions are added
+#     anyway so the three extractions are treated alike.
+#   * The signature checks compare a list of argument names against an exact
+#     expected list. An empty result is [] != ["df"], which fails. Never at
+#     risk.
+#
+# The shim is checked separately at the end of this section: the names still
+# have to reach the shared exec namespace, because that is how this file gets
+# them.
+_DRIFT_MODULE = "oncotriage/monitoring/drift.py"
 
 
 def _function_body(filename: str, function_name: str) -> str:
@@ -424,7 +547,16 @@ def _function_body(filename: str, function_name: str) -> str:
     raise AssertionError(f"{function_name} not found in {filename}")
 
 
-_src = _function_body("20- Drift Detection.py", "ecog_unavailable_rate")
+_src = _function_body(_DRIFT_MODULE, "ecog_unavailable_rate")
+
+# NON-DEGENERACY, BEFORE THE THREE `in ... == False` CHECKS. Without this, an
+# empty extraction passes all three by construction — which is the defect class
+# this project has already shipped three times.
+check("the extracted body is non-empty", len(_src) > 200, True)
+check("...and is the body of the metric under test, not some other function",
+      all(marker in _src for marker in
+          ("denominator", "none_recorded", "ecog_selection")), True)
+
 check("does not call z_score_drift", "z_score_drift" in _src, False)
 check("does not call ks_test_drift", "ks_test_drift" in _src, False)
 check("does not call calculate_psi", "calculate_psi" in _src, False)
@@ -434,15 +566,57 @@ check("threshold is not a literal in the function body", "0.20" in _src, False)
 
 # Signature: one frame in, so there is no baseline to compare against even by
 # accident.
-_sig_text = Path(_code_dir + "20- Drift Detection.py").read_text(encoding="utf-8")
-_fn = next(n for n in ast.parse(_sig_text).body
-           if isinstance(n, ast.FunctionDef) and n.name == "ecog_unavailable_rate")
+_sig_text = Path(_code_dir + _DRIFT_MODULE).read_text(encoding="utf-8")
+_sig_defs = [n for n in ast.parse(_sig_text).body if isinstance(n, ast.FunctionDef)]
+check("the module parsed to a non-empty set of top-level functions",
+      len(_sig_defs) >= 10, True)
+
+_fn = next(n for n in _sig_defs if n.name == "ecog_unavailable_rate")
 check("takes exactly one argument", [a.arg for a in _fn.args.args], ["df"])
 
-_avail = next(n for n in ast.parse(_sig_text).body
-              if isinstance(n, ast.FunctionDef) and n.name == "detect_data_availability")
+_avail = next(n for n in _sig_defs if n.name == "detect_data_availability")
 check("detect_data_availability takes only the current window",
       [a.arg for a in _avail.args.args], ["current_df"])
+
+# PASS 20c-3b: every database entry point takes db_path. Asserted structurally
+# as well as exercised above, because the exercise proves that ONE call honours
+# it and this proves there is no second door.
+for _name, _expected_tail in (("log_drift_metrics", "db_path"),
+                              ("get_baseline_and_current_data", "db_path"),
+                              ("run_drift_detection", "db_path")):
+    _node = next(n for n in _sig_defs if n.name == _name)
+    _args = [a.arg for a in _node.args.args]
+    check(f"{_name} takes db_path", _args[-1], _expected_tail)
+
+# ...and no function in the module reaches a bare `inferences_path` any more.
+# That name is what File 41 used to rebind; a survivor would be a write this
+# test cannot redirect.
+#
+# BY AST, NOT BY GREP, and the difference is not pedantry: the string
+# "inferences_path" appears half a dozen times in that module's prose --
+# including in resolve_drift_db_path's own docstring, which explains why it does
+# NOT read the exec namespace -- and it appears in `paths.inferences_path`,
+# which is an ATTRIBUTE on an imported module and is the correct way to reach it.
+# What is forbidden is a BARE NAME LOAD, which is the only form a caller could
+# have rebound. A substring check reads all three as the same thing and fails on
+# the documentation of the fix.
+_sig_tree = ast.parse(_sig_text)
+_bare_inferences_path = [
+    n.lineno for n in ast.walk(_sig_tree)
+    if isinstance(n, ast.Name) and n.id == "inferences_path"
+    and isinstance(n.ctx, ast.Load)
+]
+check("no bare `inferences_path` name load survives anywhere in the module",
+      _bare_inferences_path, [])
+# NON-DEGENERATE: the same walk must FIND the attribute form, or the detector is
+# looking at nothing.
+_attr_inferences_path = [
+    n.lineno for n in ast.walk(_sig_tree)
+    if isinstance(n, ast.Attribute) and n.attr == "inferences_path"
+]
+check("...and the detector does see the ATTRIBUTE form it is meant to allow, "
+      "so the empty result above is a finding rather than a broken walk",
+      len(_attr_inferences_path) >= 1, True)
 
 # The config module is oncotriage/config.py as of item 20c; "03- Config.py" is
 # a shim that re-exports it and carries no comment of its own, so a grep for
@@ -459,12 +633,71 @@ check("and the shim re-exports it, so the exec chain still sees the name",
 
 # The runner and the printer must both know about the new category, or the
 # metric is computed and then never shown.
-_runner = _function_body("20- Drift Detection.py", "run_drift_detection")
+_runner = _function_body(_DRIFT_MODULE, "run_drift_detection")
+check("the runner body is non-empty", len(_runner) > 200, True)
 check("run_drift_detection computes it", "detect_data_availability" in _runner, True)
 check("and counts its alerts into the total", "availability_alerts" in _runner, True)
-_printer = _function_body("20- Drift Detection.py", "print_drift_details")
+_printer = _function_body(_DRIFT_MODULE, "print_drift_details")
+check("the printer body is non-empty", len(_printer) > 200, True)
 check("print_drift_details renders the category",
       '"data_availability"' in _printer, True)
+
+
+# ===========================================================================
+# 8b. THE SHIM STILL DELIVERS THE NAMES TO THE EXEC CHAIN
+# ===========================================================================
+#
+# Everything above reads oncotriage/monitoring/drift.py, which is where the
+# definitions are. But THIS FILE reaches them by exec-chaining
+# "20- Drift Detection.py" and picking them out of the shared namespace, so a
+# shim that stopped re-exporting one of them would break this test in a way none
+# of the structural checks above could see -- they read the package and would
+# keep passing.
+#
+# The two are asserted to be the same objects, not merely present, so a shim
+# that shadowed a name with a definition of its own would fail here.
+
+print("\n" + "=" * 70)
+print("8b. the shim re-exports what this file reads out of the namespace")
+print("=" * 70)
+
+import oncotriage.monitoring.drift as _drift_pkg
+
+for _exported in ("ecog_unavailable_rate", "detect_data_availability",
+                  "log_drift_metrics", "print_drift_details",
+                  "run_drift_detection", "z_score_drift", "ks_test_drift",
+                  "calculate_psi", "resolve_drift_db_path"):
+    check(f"{_exported} in the exec namespace is the package's own object",
+          globals().get(_exported) is getattr(_drift_pkg, _exported), True)
+
+check("SCIPY_AVAILABLE reached the namespace too",
+      SCIPY_AVAILABLE is _drift_pkg.SCIPY_AVAILABLE, True)
+
+# The scipy guard is a real ImportError guard now, not a NameError guard on
+# somebody else's namespace. Asserted from the AST, because the flag being True
+# on this machine says nothing about how it was arrived at -- and because the
+# module's docstring QUOTES the old NameError guard verbatim in order to explain
+# what it replaced, so a substring check reports the documentation of the fix as
+# the defect. Same lesson as the inferences_path check above.
+_scipy_guards = [
+    n for n in ast.walk(_sig_tree)
+    if isinstance(n, ast.Try)
+    and any(isinstance(s, ast.ImportFrom) and (s.module or "").startswith("scipy")
+            for s in n.body)
+]
+check("the scipy import is inside exactly one try", len(_scipy_guards), 1)
+if _scipy_guards:
+    _handlers = [
+        h.type.id for h in _scipy_guards[0].handlers
+        if isinstance(h.type, ast.Name)
+    ]
+    check("...and it catches ImportError", "ImportError" in _handlers, True)
+    check("...and NOT NameError, which was a guard on somebody else's namespace",
+          "NameError" in _handlers, False)
+    check("...and it guards a real import of ks_2samp",
+          any(isinstance(s, ast.ImportFrom)
+              and any(a.name == "ks_2samp" for a in s.names)
+              for s in _scipy_guards[0].body), True)
 
 
 # ===========================================================================

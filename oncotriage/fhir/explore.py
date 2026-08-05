@@ -29,10 +29,16 @@ File 06 did five things at module load that a package module must not do:
 
 The three paths and the registry became ``csv_dir()``, ``json_dir()``,
 ``output_dir()`` and ``cancer_registry()``, resolved on first call and cached.
-``output_dir()`` also performs the mkdir, so the directory still exists before
-anything writes into it on EVERY call path rather than only when this module
-happened to be loaded — the side effect moved, it did not disappear, and its new
-home is the accessor every write target already goes through.
+
+PASS 20c-3b SPLIT THE MKDIR OUT OF ``output_dir()``. Pass 3a folded it in, so
+that the directory existed on every call path; the cost was that a function whose
+name asks a question ("where do the outputs go?") answered it by mutating the
+filesystem, and ``print(f"Output directory: {output_dir()}")`` in ``main()``
+created a directory as a side effect of printing. ``output_dir()`` now resolves
+and caches a string and does nothing else; ``ensure_output_dir()`` does the
+mkdir and is called by ``main()`` and by each of the eight functions that write
+— the same arrangement as ``apply_plot_style()``, and for the same reason: a
+caller invoking ``analyze_demographics()`` directly must not lose the directory.
 
 The styling became ``apply_plot_style()``, called at the top of ``main()`` and of
 each of the seven functions that touch ``plt``. That is seven extra call lines
@@ -51,6 +57,7 @@ proves stays exactly "importing an oncotriage module reads no file".
 """
 
 import json
+import threading
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -86,6 +93,14 @@ from datetime import datetime
 
 _RESOLVED = {}
 
+# THE CACHE IS LOCKED (pass 20c-3b), the same way oncotriage.agent.deps,
+# oncotriage.paths and oncotriage.fhir.clean lock theirs. `if k not in d: d[k] =
+# build()` is two atomic operations and one non-atomic sequence; an RLock so a
+# factory reaching another accessor here cannot deadlock. Nothing in this module
+# runs on more than one thread today -- the lock is about the PATTERN being
+# copied when a sixth accessor is added, not about a race that exists now.
+_RESOLVE_LOCK = threading.RLock()
+
 
 def csv_dir():
     """Synthea's CSV export directory. Resolved on first call, cached.
@@ -94,32 +109,65 @@ def csv_dir():
     the CSV export does not fit on disk at POPULATION_SIZE. load_and_filter_csv()
     reports the miss per file rather than failing.
     """
-    if "csv_dir" not in _RESOLVED:
-        _RESOLVED["csv_dir"] = paths.data_patient_path + "csv/"
-    return _RESOLVED["csv_dir"]
+    with _RESOLVE_LOCK:
+        if "csv_dir" not in _RESOLVED:
+            _RESOLVED["csv_dir"] = paths.data_patient_path + "csv/"
+        return _RESOLVED["csv_dir"]
 
 
 def json_dir():
     """The FHIR bundle directory the cohort is read from. Cached."""
-    if "json_dir" not in _RESOLVED:
-        _RESOLVED["json_dir"] = paths.data_fhir_path
-    return _RESOLVED["json_dir"]
+    with _RESOLVE_LOCK:
+        if "json_dir" not in _RESOLVED:
+            _RESOLVED["json_dir"] = paths.data_fhir_path
+        return _RESOLVED["json_dir"]
 
 
 def output_dir():
-    """Where the plots and the summary report are written. Cached.
+    """Where the plots and the summary report are written. RESOLVES ONLY.
 
-    RESOLVES AND CREATES. File 06 ran `Path(OUTPUT_DIR).mkdir(parents=True,
-    exist_ok=True)` at module level, so the directory existed before any caller
-    could write into it. Moving the mkdir here keeps that true on every call
-    path — every write target in this module goes through this function — while
-    keeping the import itself free of filesystem work.
+    PURE as of pass 20c-3b: it resolves a path string and caches it. It creates
+    nothing. Call ``ensure_output_dir()`` before writing.
+
+    WHY THE SPLIT. Pass 3a folded the mkdir into this accessor, on the reasoning
+    that File 06 did it at module level and every write target goes through here,
+    so hiding it inside kept the directory present on every call path. That is
+    true and it is still the wrong shape: it makes a function whose NAME is a
+    question ("where do the outputs go?") answer it by mutating the filesystem.
+    The consequences were real, not stylistic:
+
+      * ``print(f"Output directory: {output_dir()}")`` -- which main() does --
+        created a directory as a side effect of printing;
+      * a caller that only wanted to know the path, to log it or to test it,
+        could not ask without creating it;
+      * and the creation was invisible at every one of the ~20 call sites, so
+        nothing in the source said where the directory comes from.
+
+    The mkdir now has its own name and is called explicitly. See
+    ``ensure_output_dir``.
     """
-    if "output_dir" not in _RESOLVED:
-        resolved = paths.result_fhir_explore_path
-        Path(resolved).mkdir(parents=True, exist_ok=True)
-        _RESOLVED["output_dir"] = resolved
-    return _RESOLVED["output_dir"]
+    with _RESOLVE_LOCK:
+        if "output_dir" not in _RESOLVED:
+            _RESOLVED["output_dir"] = paths.result_fhir_explore_path
+        return _RESOLVED["output_dir"]
+
+
+def ensure_output_dir():
+    """Create the output directory if it is absent, and return it. Idempotent.
+
+    CALLED BY EVERY FUNCTION THAT WRITES, plus ``main()`` -- exactly the same
+    arrangement as ``apply_plot_style()`` and for exactly the same reason. File
+    06 ran the mkdir at module level, so a caller invoking
+    ``analyze_demographics()`` directly got the directory for free; putting the
+    call in ``main()`` alone would have made that caller fail on a fresh
+    checkout, which is a silent behaviour change dressed up as a refactor.
+
+    ``mkdir(parents=True, exist_ok=True)`` is idempotent, so the repetition
+    costs one stat per call and cannot double-create.
+    """
+    resolved = output_dir()
+    Path(resolved).mkdir(parents=True, exist_ok=True)
+    return resolved
 
 
 def cancer_registry():
@@ -129,9 +177,10 @@ def cancer_registry():
     the AGENT reaches, and a stub installed for an agent test must not change
     what an exploratory cohort table reports.
     """
-    if "cancer_registry" not in _RESOLVED:
-        _RESOLVED["cancer_registry"] = load_registry()
-    return _RESOLVED["cancer_registry"]
+    with _RESOLVE_LOCK:
+        if "cancer_registry" not in _RESOLVED:
+            _RESOLVED["cancer_registry"] = load_registry()
+        return _RESOLVED["cancer_registry"]
 
 
 def apply_plot_style():
@@ -356,6 +405,7 @@ Action if abnormal: Check Synthea demographics settings, regenerate if needed
 
     """
     apply_plot_style()
+    ensure_output_dir()
     print("\n" + "="*80)
     print("DEMOGRAPHICS ANALYSIS")
     print("="*80 + "\n")
@@ -484,6 +534,7 @@ Action if abnormal: Check cancer categorization logic, verify Synthea modules lo
     
     """
     apply_plot_style()
+    ensure_output_dir()
     print("\n" + "="*80)
     print("CANCER DIAGNOSES ANALYSIS")
     print("="*80 + "\n")
@@ -579,6 +630,7 @@ Action if abnormal: Check if Synthea cancer modules include treatment protocols,
     
     """
     apply_plot_style()
+    ensure_output_dir()
     print("\n" + "="*80)
     print("MEDICATIONS ANALYSIS")
     print("="*80 + "\n")
@@ -624,6 +676,7 @@ def generate_summary_report(df_patients, df_cancer, patient_ids, data_source: st
     """
     Generate a text summary report
     """
+    ensure_output_dir()
     report_path = output_dir() + 'summary_report.txt'
     
     with open(report_path, 'w') as f:
@@ -694,6 +747,7 @@ Action if abnormal: Regenerate, check if Synthea cancer modules include staging
         df_conditions: all condition rows (the text stage is read from)
     """
     apply_plot_style()
+    ensure_output_dir()
 
     print("\n" + "="*80)
     print("CANCER STAGE ANALYSIS")
@@ -797,6 +851,7 @@ Action if abnormal: Regenerate with wider age range, check if age filters are to
     
     """
     apply_plot_style()
+    ensure_output_dir()
     # Merge patient age with cancer type
     df_cancer_age = df_cancer.merge(
         df_patients[['Id', 'AGE']], 
@@ -868,6 +923,7 @@ Action if abnormal: Check if patients have duplicate/multiple cancer diagnoses, 
 
     """
     apply_plot_style()
+    ensure_output_dir()
     
     # Get unique patients per category
     patients_per_category = df_cancer.groupby('CATEGORY')['PATIENT'].nunique().sort_values(ascending=False)
@@ -924,6 +980,7 @@ Young patients (age 20-30) have 10+ conditions → Age mismatch
 
     """
     apply_plot_style()
+    ensure_output_dir()
     print("\n" + "="*80)
     print("COMORBIDITIES ANALYSIS")
     print("="*80 + "\n")
@@ -1047,6 +1104,7 @@ def main():
     Run complete data exploration
     """
     apply_plot_style()
+    ensure_output_dir()
 
     print("\n" + "╔" + "═"*78 + "╗")
     print("║" + " "*20 + f"{Project_Name}: DATA EXPLORATION" + " "*24 + "║")

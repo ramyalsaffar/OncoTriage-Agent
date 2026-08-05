@@ -1,0 +1,1231 @@
+# Database Query Layer
+######################
+
+"""Every read-only query the project runs against ``inferences.db``.
+
+Moved out of ``16- Database Query.py`` by item 20c, pass 3b. That file is now a
+thin entry point holding a ``__main__`` guard and one call.
+
+WHY THIS IS A CALLABLE SURFACE AND NOT A SCRIPT BODY
+----------------------------------------------------
+File 16 was 915 lines of top-level statements with ZERO ``__main__`` guards, so
+every one of its ~40 queries ran the moment the file was loaded. That made it
+unimportable in the ordinary sense of the word: there was no way to reach one
+query without running all of them, no way to get a DataFrame back instead of a
+printed table, and no way for "21- Streamlit Dashboard.py" -- which asks several
+of these same questions of the same database -- to share a single line of it.
+The dashboard consequently carries its own copies, and the cost-by-model
+arithmetic in particular exists twice (File 16's Query 10 and File 21's cost
+tab), which is exactly the shape of duplication that goes out of sync.
+
+So the queries are DATA now: an ordered registry of ``Query`` records, each with
+a key, the SQL, a heading and a render mode. Three things follow:
+
+    run(conn, key)   -> DataFrame       one query, no printing
+    run_all(conn)    -> {key: result}   every query, no printing
+    report(conn)                        every query, printed exactly as File 16
+                                        printed it
+
+NOT ONE CHARACTER OF SQL WAS ALTERED IN THE MOVE, and that is a constraint of
+this pass rather than an aspiration. The SQL bodies below were extracted from
+"16- Database Query.py" BY AST -- read as string constants and emitted verbatim,
+never retyped -- so trailing whitespace, indentation and the two broken queries
+are all byte-for-byte what they were. See THE TWO BROKEN QUERIES below.
+
+THE TWO BROKEN QUERIES ARE STILL BROKEN, ON PURPOSE
+---------------------------------------------------
+Item 38 owns File 16's SQL defects and has not been done. Both survive here
+unchanged, so that a before/after comparison of this pass is a comparison of the
+MOVE and of nothing else:
+
+    expansion_token_efficiency  (File 16's Query 19) selects
+        expansion_input_tokens / expansion_output_tokens, which are not columns
+        of `inferences`. It raises "no such column" and takes the run with it,
+        so nothing after it has ever executed.
+
+    pipeline_consistency        (File 16's Query 20) has a stray WHEN outside
+        its CASE and is a syntax error. It has never run, because Query 19 kills
+        the process first.
+
+``report()`` therefore still dies at the same query with the same message. That
+is the acceptance criterion for this pass, not a defect in it: the output before
+and after the move is identical up to and including the failure.
+
+WHAT IMPORTING THIS MODULE DOES
+-------------------------------
+Nothing. No connection is opened, no path is resolved, no query is executed. The
+registry is a tuple of strings. ``connect()`` is a function and ``report()``
+needs a connection handed to it.
+"""
+
+import sqlite3
+from typing import Dict, List
+
+import pandas as pd
+
+from oncotriage import paths
+from oncotriage.config import PRICING_CONFIG
+from oncotriage.utils import get_model_cost
+
+
+#------------------------------------------------------------------------------
+
+
+class Query:
+    """One named, read-only query: its SQL and how File 16 rendered it.
+
+    Deliberately a plain class rather than a dataclass or a NamedTuple: this
+    module must import cleanly with nothing else present, and a dataclass would
+    add an import for a record with four fields and no behaviour.
+
+    Attributes:
+        key:         Stable identifier. This is what ``run(conn, key)`` takes and
+                     what a future consumer (File 21) names.
+        sql:         The SQL, VERBATIM from File 16. Never edit it here without
+                     editing it there in the same commit -- item 38 owns the two
+                     that are broken.
+        heading:     The banner File 16 printed above the result, or None where
+                     it printed none.
+        render:      How ``report()`` prints the frame:
+                       'repr'                print(df)
+                       'describe'            print(df.describe())
+                       'transpose'           print(df.T)
+                       'to_string'           print(df.to_string(index=False))
+                       'empty_or_to_string'  a message when empty, else to_string
+                       'custom'              report() calls a named function; the
+                                             frame alone does not describe the
+                                             output (Query 5 prints a prompt,
+                                             Query 10 prices per model in Python)
+        blank_after: Whether File 16 printed a bare "\\n" after this section.
+                     Not cosmetic here -- it is part of what "output identical
+                     before and after" means.
+        notes:       Extra lines printed between the heading and the frame.
+    """
+
+    __slots__ = ("key", "sql", "heading", "render", "blank_after", "notes")
+
+    def __init__(self, key, sql, heading=None, render="to_string",
+                 blank_after=True, notes=()):
+        self.key = key
+        self.sql = sql
+        self.heading = heading
+        self.render = render
+        self.blank_after = blank_after
+        self.notes = tuple(notes)
+
+    def __repr__(self):
+        return f"<Query {self.key!r} render={self.render!r}>"
+
+
+# The message File 16 printed when the consistency query came back empty. A
+# named constant because ``report()`` and any future caller of
+# ``run(conn, 'pipeline_consistency')`` must agree on what "no rows" means, and
+# because an empty result there is a CLEAN result rather than a missing one.
+CONSISTENCY_CLEAN_MESSAGE = "No issues found - pipeline is consistent"
+
+
+# Queries whose output is not a rendering of their own frame. report() dispatches
+# these to the functions below; run() still returns their raw frame, because
+# "give me the rows" is a separate question from "print what File 16 printed".
+_CUSTOM_RENDERERS = {}
+
+
+#------------------------------------------------------------------------------
+
+
+QUERIES = (
+    # File 16 line 74, `df_inferences`
+    Query(
+        key='inferences_all',
+        heading=None,
+        render='repr',
+        blank_after=False,
+        sql='SELECT * FROM inferences',
+    ),
+    # File 16 line 81, `df_timeout`
+    Query(
+        key='timing_columns',
+        heading=None,
+        render='describe',
+        blank_after=False,
+        sql='SELECT total_time, gpt4o_evaluation_time, gpt4o_output_tokens FROM inferences',
+    ),
+    # File 16 line 88, `df_timeout`
+    Query(
+        key='slowest_five',
+        heading=None,
+        render='repr',
+        blank_after=False,
+        sql="""
+    SELECT patient_id, age, condition_count, medication_count, 
+           candidates_evaluated, total_time, gpt4o_evaluation_time, 
+           gpt4o_input_tokens, gpt4o_output_tokens, error
+    FROM inferences 
+    ORDER BY total_time DESC 
+    LIMIT 5
+""",
+    ),
+    # File 16 line 107, `df_performance`
+    Query(
+        key='performance_distribution',
+        heading='=== PERFORMANCE DISTRIBUTION ===',
+        render='describe',
+        blank_after=True,
+        sql="""
+    SELECT 
+        total_time,
+        gpt4o_evaluation_time,
+        gpt4o_input_tokens,
+        gpt4o_output_tokens,
+        candidates_evaluated,
+        estimated_cost_usd,
+        error
+    FROM inferences
+    ORDER BY total_time DESC
+""",
+    ),
+    # File 16 line 126, `df_slowest`
+    Query(
+        key='slowest_ten',
+        heading='=== TOP 10 SLOWEST PATIENTS ===',
+        render='to_string',
+        blank_after=True,
+        sql="""
+    SELECT 
+        patient_id,
+        age,
+        sex,
+        condition_count,
+        medication_count,
+        candidates_evaluated,
+        total_time,
+        gpt4o_evaluation_time,
+        gpt4o_input_tokens,
+        gpt4o_output_tokens,
+        error
+    FROM inferences
+    ORDER BY total_time DESC
+    LIMIT 10
+""",
+    ),
+    # File 16 line 150, `df_verbose`
+    Query(
+        key='verbose_output',
+        heading='=== PATIENTS WITH OUTPUT > 4000 TOKENS ===',
+        render='to_string',
+        blank_after=True,
+        sql="""
+    SELECT 
+        patient_id,
+        candidates_evaluated,
+        gpt4o_output_tokens,
+        gpt4o_output_tokens / NULLIF(candidates_evaluated, 0) as tokens_per_trial,
+        total_time
+    FROM inferences
+    WHERE gpt4o_output_tokens > 4000
+    ORDER BY gpt4o_output_tokens DESC
+""",
+    ),
+    # File 16 line 168, `df_errors`
+    Query(
+        key='error_types',
+        heading='=== ERROR TYPES ===',
+        render='to_string',
+        blank_after=True,
+        sql="""
+    SELECT 
+        error,
+        COUNT(*) as count
+    FROM inferences
+    WHERE error != ''
+    GROUP BY error
+""",
+    ),
+    # File 16 line 184, `df_prompt`
+    Query(
+        key='slowest_prompt',
+        heading=None,
+        render='custom',
+        blank_after=False,
+        sql="""
+    SELECT 
+        patient_id,
+        gpt4o_prompt,
+        gpt4o_output_tokens,
+        total_time
+    FROM inferences
+    ORDER BY total_time DESC
+    LIMIT 1
+""",
+    ),
+    # File 16 line 206, `df_stages`
+    Query(
+        key='stage_bottlenecks',
+        heading='=== STAGE-LEVEL BOTTLENECKS ===',
+        render='transpose',
+        blank_after=True,
+        sql="""
+    SELECT 
+        AVG(query_expansion_time) as avg_expansion,
+        AVG(hybrid_retrieval_time) as avg_retrieval,
+        AVG(cross_encoder_time) as avg_cross_encoder,
+        AVG(rule_filter_time) as avg_filter,
+        AVG(gpt4o_evaluation_time) as avg_gpt4o,
+        MAX(query_expansion_time) as max_expansion,
+        MAX(hybrid_retrieval_time) as max_retrieval,
+        MAX(cross_encoder_time) as max_cross_encoder,
+        MAX(rule_filter_time) as max_filter,
+        MAX(gpt4o_evaluation_time) as max_gpt4o
+    FROM inferences
+""",
+    ),
+    # File 16 line 226, `df_funnel`
+    Query(
+        key='pipeline_funnel',
+        heading='=== PIPELINE FUNNEL ANALYSIS ===',
+        render='transpose',
+        blank_after=True,
+        sql="""
+    SELECT 
+        AVG(candidates_retrieved) as avg_retrieved,
+        AVG(candidates_reranked) as avg_reranked,
+        AVG(candidates_filtered) as avg_filtered,
+        AVG(candidates_evaluated) as avg_evaluated,
+        AVG(eligible_matches) as avg_eligible,
+        AVG(CAST(candidates_filtered AS FLOAT) / NULLIF(candidates_retrieved, 0)) as rerank_retention_rate,
+        AVG(CAST(candidates_evaluated AS FLOAT) / NULLIF(candidates_filtered, 0)) as filter_retention_rate,
+        AVG(CAST(eligible_matches AS FLOAT) / NULLIF(candidates_evaluated, 0)) as eligibility_rate
+    FROM inferences
+    WHERE candidates_retrieved > 0
+""",
+    ),
+    # File 16 line 245, `df_token_efficiency`
+    Query(
+        key='token_efficiency_by_complexity',
+        heading='=== TOKEN EFFICIENCY BY PATIENT COMPLEXITY ===',
+        render='to_string',
+        blank_after=True,
+        sql="""
+    SELECT 
+        condition_count,
+        medication_count,
+        candidates_evaluated,
+        AVG(gpt4o_input_tokens) as avg_input_tokens,
+        AVG(gpt4o_output_tokens) as avg_output_tokens,
+        AVG(gpt4o_output_tokens / NULLIF(candidates_evaluated, 0)) as avg_tokens_per_trial,
+        COUNT(*) as patient_count
+    FROM inferences
+    WHERE candidates_evaluated > 0
+    GROUP BY condition_count, medication_count, candidates_evaluated
+    ORDER BY avg_tokens_per_trial DESC
+    LIMIT 20
+""",
+    ),
+    # File 16 line 280, `df_expansion`
+    Query(
+        key='expansion_stage_stats',
+        heading='=== EXPANSION (STAGE 1) STATS ===',
+        render='transpose',
+        blank_after=True,
+        notes=('Stage 1 is rule-based and calls no LLM, so there are no expansion token columns to report.',),
+        sql="""
+    SELECT
+        COUNT(*)                    as rows_n,
+        AVG(query_expansion_time)   as avg_expansion_time,
+        MAX(query_expansion_time)   as max_expansion_time,
+        SUM(query_expansion_path = 'base_query_fallback') as fallback_runs,
+        SUM(query_expansion_path IS NULL)                 as path_not_reported
+    FROM inferences
+""",
+    ),
+    # File 16 line 317, `df_cost_by_model`
+    Query(
+        key='cost_by_model',
+        heading=None,
+        render='custom',
+        blank_after=False,
+        sql="""
+    SELECT
+        matching_model,
+        COUNT(*)                     as rows_n,
+        SUM(gpt4o_input_tokens)      as input_tokens,
+        SUM(gpt4o_output_tokens)     as output_tokens,
+        SUM(gpt4o_reasoning_tokens)  as reasoning_tokens,
+        SUM(estimated_cost_usd)      as stored_cost
+    FROM inferences
+    GROUP BY matching_model
+    ORDER BY rows_n DESC
+""",
+    ),
+    # File 16 line 399, `df_demographics`
+    Query(
+        key='demographic_matching',
+        heading='=== DEMOGRAPHIC MATCHING PATTERNS ===',
+        render='to_string',
+        blank_after=True,
+        sql="""
+    SELECT 
+        age / 10 * 10 as age_group,
+        sex,
+        COUNT(*) as patient_count,
+        AVG(eligible_matches) as avg_eligible_matches,
+        AVG(near_misses) as avg_near_misses,
+        AVG(total_time) as avg_time
+    FROM inferences
+    WHERE age IS NOT NULL
+    GROUP BY age_group, sex
+    ORDER BY age_group, sex
+""",
+    ),
+    # File 16 line 428, `df_retrieval`
+    Query(
+        key='retrieval_method_performance',
+        heading='=== RETRIEVAL METHOD PERFORMANCE ===',
+        render='transpose',
+        blank_after=True,
+        sql="""
+    SELECT
+        COUNT(*) as n_rows,
+        AVG(bm25_retrieved) as avg_bm25,
+        AVG(vector_retrieved) as avg_vector,
+        AVG(candidates_retrieved) as avg_total_after_fusion,
+        AVG(CAST(candidates_retrieved AS FLOAT)
+            / NULLIF(bm25_retrieved + vector_retrieved, 0)) as fusion_efficiency
+    FROM inferences
+    WHERE bm25_retrieved IS NOT NULL
+      AND vector_retrieved IS NOT NULL
+      AND (bm25_retrieved + vector_retrieved) > 0
+""",
+    ),
+    # File 16 line 447, `df_quality_filter`
+    Query(
+        key='quality_filter_effectiveness',
+        heading='=== QUALITY FILTER EFFECTIVENESS ===',
+        render='transpose',
+        blank_after=True,
+        sql="""
+    SELECT 
+        AVG(candidates_reranked) as avg_before_quality_filter,
+        AVG(candidates_after_quality_filter) as avg_after_quality_filter,
+        AVG(CAST(candidates_after_quality_filter AS FLOAT) / NULLIF(candidates_reranked, 0)) as quality_retention_rate,
+        COUNT(CASE WHEN candidates_after_quality_filter = 0 THEN 1 END) as patients_filtered_out_completely
+    FROM inferences
+""",
+    ),
+    # File 16 line 461, `df_extremes`
+    Query(
+        key='extreme_cases',
+        heading='=== EXTREME CASES / ANOMALIES ===',
+        render='to_string',
+        blank_after=True,
+        sql="""
+    SELECT 
+        patient_id,
+        condition_count,
+        medication_count,
+        candidates_evaluated,
+        gpt4o_output_tokens,
+        total_time,
+        eligible_matches,
+        CASE 
+            WHEN medication_count > 100 THEN 'High Med Count'
+            WHEN gpt4o_output_tokens > 10000 THEN 'Verbose Output'
+            WHEN total_time > 120 THEN 'Slow Processing'
+            WHEN candidates_evaluated = 0 THEN 'No Candidates'
+            ELSE 'Other'
+        END as anomaly_type
+    FROM inferences
+    WHERE medication_count > 100 
+       OR gpt4o_output_tokens > 10000 
+       OR total_time > 120
+       OR (candidates_retrieved > 0 AND candidates_evaluated = 0)
+    ORDER BY total_time DESC
+""",
+    ),
+    # File 16 line 490, `df_success_rate`
+    Query(
+        key='success_rate_by_trial_count',
+        heading='=== SUCCESS RATE BY TRIAL COUNT ===',
+        render='to_string',
+        blank_after=True,
+        sql="""
+    SELECT 
+        candidates_evaluated,
+        COUNT(*) as patient_count,
+        AVG(eligible_matches) as avg_eligible,
+        AVG(CAST(eligible_matches AS FLOAT) / NULLIF(candidates_evaluated, 0)) as eligibility_rate,
+        AVG(total_time) as avg_time
+    FROM inferences
+    WHERE candidates_evaluated > 0
+    GROUP BY candidates_evaluated
+    ORDER BY candidates_evaluated
+""",
+    ),
+    # File 16 line 508, `df_med_duplicates`
+    Query(
+        key='medication_duplication_suspects',
+        heading='=== MEDICATION DUPLICATION SUSPECTS ===',
+        render='to_string',
+        blank_after=True,
+        sql="""
+    SELECT 
+        patient_id,
+        medication_count,
+        gpt4o_input_tokens,
+        gpt4o_input_tokens / NULLIF(candidates_evaluated, 0) as tokens_per_trial,
+        CASE 
+            WHEN medication_count > 100 THEN 'High'
+            WHEN medication_count > 50 THEN 'Medium'
+            ELSE 'Low'
+        END as med_complexity
+    FROM inferences
+    WHERE medication_count > 0
+    ORDER BY medication_count DESC
+    LIMIT 10
+""",
+    ),
+    # File 16 line 530, `df_filter_dropoff`
+    Query(
+        key='rule_filter_dropoff',
+        heading='=== RULE FILTER DROP-OFF ===',
+        render='transpose',
+        blank_after=True,
+        sql="""
+    SELECT 
+        AVG(candidates_reranked - candidates_filtered) as avg_dropped_by_rules,
+        MAX(candidates_reranked - candidates_filtered) as max_dropped_by_rules,
+        AVG(CAST(candidates_filtered AS FLOAT) / NULLIF(candidates_reranked, 0)) as retention_rate,
+        COUNT(CASE WHEN candidates_filtered = 0 THEN 1 END) as patients_with_zero_after_filter
+    FROM inferences
+    WHERE candidates_reranked > 0
+""",
+    ),
+    # File 16 line 545, `df_gpt4o_efficiency`
+    Query(
+        key='gpt4o_efficiency_by_trial_count',
+        heading='=== GPT-4O EFFICIENCY BY TRIAL COUNT ===',
+        render='to_string',
+        blank_after=True,
+        sql="""
+    SELECT 
+        candidates_evaluated as trial_count,
+        COUNT(*) as patient_count,
+        AVG(gpt4o_evaluation_time) as avg_time,
+        AVG(gpt4o_output_tokens) as avg_output_tokens,
+        AVG(gpt4o_output_tokens / NULLIF(candidates_evaluated, 0)) as tokens_per_trial
+    FROM inferences
+    WHERE candidates_evaluated > 0
+    GROUP BY candidates_evaluated
+    HAVING patient_count >= 2
+    ORDER BY trial_count
+""",
+    ),
+    # File 16 line 564, `df_expansion_tokens`
+    Query(
+        key='expansion_token_efficiency',
+        heading='=== EXPANSION TOKEN EFFICIENCY ===',
+        render='transpose',
+        blank_after=True,
+        sql="""
+    SELECT 
+        AVG(expansion_input_tokens) as avg_input,
+        AVG(expansion_output_tokens) as avg_output,
+        AVG(expansion_output_tokens / NULLIF(expansion_input_tokens, 0)) as output_input_ratio,
+        COUNT(CASE WHEN expansion_output_tokens > 200 THEN 1 END) as over_limit_count
+    FROM inferences
+    WHERE expansion_input_tokens > 0
+""",
+    ),
+    # File 16 line 579, `df_consistency`
+    Query(
+        key='pipeline_consistency',
+        heading='=== PIPELINE CONSISTENCY ISSUES ===',
+        render='empty_or_to_string',
+        blank_after=True,
+        sql="""
+    SELECT * FROM (
+    SELECT 
+        patient_id,
+        candidates_retrieved,
+        candidates_reranked,
+        candidates_filtered,
+        candidates_evaluated,
+        WHEN candidates_evaluated != (eligible_matches + near_misses) THEN 'Count mismatch'
+        CASE 
+            WHEN candidates_retrieved != 100 THEN 'Retrieval anomaly'
+            WHEN candidates_reranked != 30 THEN 'Rerank anomaly'
+            WHEN candidates_evaluated != (eligible_matches + near_misses) THEN 'Count mismatch'
+            WHEN candidates_filtered < candidates_evaluated THEN 'Filter < evaluated'
+            ELSE 'OK'
+        END as issue
+    FROM inferences
+) WHERE issue != 'OK'
+LIMIT 20
+""",
+    ),
+    # File 16 line 608, `df_med_issue`
+    Query(
+        key='medication_counts',
+        heading=None,
+        render='repr',
+        blank_after=False,
+        sql="""
+    SELECT 
+        patient_id,
+        medication_count,
+        condition_count
+    FROM inferences
+    ORDER BY medication_count DESC
+    LIMIT 10
+""",
+    ),
+    # File 16 line 637, `df_matches`
+    Query(
+        key='trial_matches_all',
+        heading=None,
+        render='repr',
+        blank_after=False,
+        sql='SELECT * FROM trial_matches',
+    ),
+    # File 16 line 642, `df_top_trials`
+    Query(
+        key='most_matched_trials',
+        heading='=== MOST FREQUENTLY MATCHED TRIALS ===',
+        render='to_string',
+        blank_after=True,
+        sql="""
+    SELECT nct_id, trial_title, trial_phase,
+           COUNT(*)          as total_matched_patients,
+           SUM(CASE WHEN eligible = 'eligible' THEN 1 ELSE 0 END) as eligible_count,
+           SUM(CASE WHEN eligible = 'not_eligible' THEN 1 ELSE 0 END) as not_eligible_count,
+           SUM(CASE WHEN eligible = 'not_evaluable' THEN 1 ELSE 0 END) as not_evaluable_count,
+           ROUND(AVG(match_score), 3) as avg_match_score
+    FROM trial_matches
+    GROUP BY nct_id
+    ORDER BY total_matched_patients DESC
+    LIMIT 20
+""",
+    ),
+    # File 16 line 660, `df_demo_trials`
+    Query(
+        key='demographics_vs_phase',
+        heading='=== DEMOGRAPHICS VS TRIAL PHASE ===',
+        render='to_string',
+        blank_after=True,
+        sql="""
+    SELECT i.age / 10 * 10 as age_group,
+           i.sex,
+           tm.trial_phase,
+           COUNT(*)               as match_count,
+           ROUND(AVG(tm.match_score), 3) as avg_score,
+           SUM(CASE WHEN tm.eligible = 'eligible' THEN 1 ELSE 0 END) as eligible_count
+    FROM trial_matches tm
+    JOIN inferences i ON tm.inference_id = i.id
+    WHERE i.age IS NOT NULL
+    GROUP BY age_group, i.sex, tm.trial_phase
+    ORDER BY age_group, i.sex, tm.trial_phase
+""",
+    ),
+    # File 16 line 690, `df_drift_all`
+    Query(
+        key='drift_metrics_raw',
+        heading='=== DRIFT METRICS RAW ===',
+        render='to_string',
+        blank_after=True,
+        sql="""
+    SELECT * FROM drift_metrics
+    ORDER BY timestamp DESC
+""",
+    ),
+    # File 16 line 700, `df_drift_alerts`
+    Query(
+        key='drift_active_alerts',
+        heading='=== ACTIVE DRIFT ALERTS ===',
+        render='to_string',
+        blank_after=True,
+        sql="""
+    SELECT timestamp, metric_category, metric_name,
+           metric_value, baseline_mean, z_score, p_value, threshold, notes
+    FROM drift_metrics
+    WHERE alert = 1
+    ORDER BY timestamp DESC
+""",
+    ),
+    # File 16 line 713, `df_drift_zscore`
+    Query(
+        key='drift_worst_zscores',
+        heading='=== TOP 10 WORST Z-SCORES ===',
+        render='to_string',
+        blank_after=True,
+        sql="""
+    SELECT metric_category, metric_name,
+           ROUND(metric_value, 4)   as metric_value,
+           ROUND(baseline_mean, 4)  as baseline_mean,
+           ROUND(baseline_std, 4)   as baseline_std,
+           ROUND(z_score, 2)        as z_score,
+           ROUND(p_value, 4)        as p_value,
+           alert
+    FROM drift_metrics
+    ORDER BY ABS(z_score) DESC
+    LIMIT 10
+""",
+    ),
+    # File 16 line 731, `df_alert_rate`
+    Query(
+        key='drift_alert_rate_by_category',
+        heading='=== ALERT RATE BY CATEGORY ===',
+        render='to_string',
+        blank_after=True,
+        sql="""
+    SELECT metric_category,
+           COUNT(*)        as total_checks,
+           SUM(alert)      as total_alerts,
+           ROUND(100.0 * SUM(alert) / COUNT(*), 1) as alert_rate_pct
+    FROM drift_metrics
+    GROUP BY metric_category
+    ORDER BY alert_rate_pct DESC
+""",
+    ),
+    # File 16 line 746, `df_drift_summary`
+    Query(
+        key='drift_summary_per_metric',
+        heading='=== DRIFT SUMMARY PER METRIC ===',
+        render='to_string',
+        blank_after=True,
+        sql="""
+    SELECT metric_category, metric_name,
+           COUNT(*)                      as run_count,
+           ROUND(AVG(metric_value), 4)   as avg_value,
+           ROUND(AVG(baseline_mean), 4)  as avg_baseline,
+           ROUND(AVG(z_score), 2)        as avg_z_score,
+           ROUND(MAX(ABS(z_score)), 2)   as max_abs_z_score,
+           SUM(alert)                    as total_alerts
+    FROM drift_metrics
+    GROUP BY metric_category, metric_name
+    ORDER BY total_alerts DESC, max_abs_z_score DESC
+""",
+    ),
+    # File 16 line 764, `df_latest_drift`
+    Query(
+        key='drift_latest_run',
+        heading='=== LATEST DRIFT RUN ===',
+        render='to_string',
+        blank_after=True,
+        sql="""
+    SELECT metric_category, metric_name,
+           metric_value, baseline_mean, z_score, alert, notes
+    FROM drift_metrics
+    WHERE timestamp = (SELECT MAX(timestamp) FROM drift_metrics)
+    ORDER BY ABS(z_score) DESC
+""",
+    ),
+    # File 16 line 777, `df_drift_trend`
+    Query(
+        key='drift_trend_over_time',
+        heading='=== DRIFT TREND OVER TIME ===',
+        render='to_string',
+        blank_after=True,
+        sql="""
+    SELECT timestamp, metric_category, metric_name,
+           ROUND(metric_value, 4) as metric_value,
+           ROUND(baseline_mean, 4) as baseline_mean,
+           ROUND(z_score, 2) as z_score,
+           alert
+    FROM drift_metrics
+    ORDER BY metric_name, timestamp ASC
+""",
+    ),
+    # File 16 line 792, `df_windows`
+    Query(
+        key='drift_window_configurations',
+        heading='=== WINDOW CONFIGURATIONS ===',
+        render='to_string',
+        blank_after=True,
+        sql="""
+    SELECT baseline_window_days, comparison_window_days,
+           COUNT(*)           as checks,
+           SUM(alert)         as alerts,
+           ROUND(AVG(ABS(z_score)), 2) as avg_abs_z_score
+    FROM drift_metrics
+    GROUP BY baseline_window_days, comparison_window_days
+    ORDER BY baseline_window_days
+""",
+    ),
+    # File 16 line 820, `df_retrieval_degraded`
+    Query(
+        key='retrieval_degradation',
+        heading='=== RETRIEVAL DEGRADATION ===',
+        render='to_string',
+        blank_after=True,
+        sql="""
+    SELECT
+        COUNT(*)                                                   AS rows_total,
+        SUM(CASE WHEN retrieval_degraded IS NULL THEN 1 ELSE 0 END) AS not_reported,
+        SUM(CASE WHEN retrieval_degraded = 1 THEN 1 ELSE 0 END)     AS degraded,
+        ROUND(100.0 * SUM(CASE WHEN retrieval_degraded = 1 THEN 1 ELSE 0 END)
+              / NULLIF(SUM(CASE WHEN retrieval_degraded IS NOT NULL
+                                THEN 1 ELSE 0 END), 0), 2)         AS degraded_pct_of_reported,
+        SUM(COALESCE(retrieval_trials_lost, 0))                    AS trials_lost_total
+    FROM inferences
+""",
+    ),
+    # File 16 line 838, `df_channel_status`
+    Query(
+        key='recent_degraded_retrievals',
+        heading='=== MOST RECENT DEGRADED RETRIEVALS ===',
+        render='to_string',
+        blank_after=True,
+        sql="""
+    SELECT
+        timestamp, patient_id,
+        retrieval_channels_ok || '/' || retrieval_channels_expected AS channels_ok,
+        retrieval_trials_lost,
+        retrieval_channels
+    FROM inferences
+    WHERE retrieval_degraded = 1
+    ORDER BY timestamp DESC
+    LIMIT 25
+""",
+    ),
+    # File 16 line 857, `df_expansion_path`
+    Query(
+        key='expansion_path_x_mesh_resolution',
+        heading='=== QUERY EXPANSION PATH x MESH RESOLUTION ===',
+        render='to_string',
+        blank_after=True,
+        sql="""
+    SELECT
+        COALESCE(query_expansion_path, '(not reported)') AS query_expansion_path,
+        COALESCE(mesh_resolution, '(none)')              AS mesh_resolution,
+        COUNT(*)                                         AS n,
+        ROUND(AVG(candidates_retrieved), 1)              AS avg_retrieved,
+        ROUND(AVG(eligible_matches), 2)                  AS avg_eligible
+    FROM inferences
+    GROUP BY query_expansion_path, mesh_resolution
+    ORDER BY n DESC
+""",
+    ),
+    # File 16 line 877, `df_relevance_assertion`
+    Query(
+        key='mesh_filter_ran_vs_asserted',
+        heading='=== CANCER SITE FILTER: RAN vs ASSERTED ===',
+        render='to_string',
+        blank_after=True,
+        sql="""
+    SELECT
+        CASE mesh_filter_applied
+             WHEN 1 THEN 'filter ran (prompt asserts confirmed)'
+             WHEN 0 THEN 'filter skipped (prompt says unconfirmed)'
+             ELSE '(not reported)'
+        END                                          AS relevance_assertion,
+        COALESCE(mesh_filter_skip_reason, '(none)')  AS skip_reason,
+        COUNT(*)                                     AS n,
+        ROUND(AVG(mesh_dropped), 2)                  AS avg_mesh_dropped,
+        ROUND(AVG(candidates_evaluated), 2)          AS avg_evaluated,
+        ROUND(AVG(eligible_matches), 2)              AS avg_eligible
+    FROM inferences
+    GROUP BY mesh_filter_applied, mesh_filter_skip_reason
+    ORDER BY n DESC
+""",
+    ),
+)
+
+
+QUERIES_BY_KEY = {q.key: q for q in QUERIES}
+"""Index over QUERIES. Built at import: it is a dict comprehension over a tuple
+of strings and touches nothing."""
+
+QUERY_KEYS = tuple(q.key for q in QUERIES)
+"""Every key, in the order File 16 ran them. The order is part of the contract --
+``report()`` reproduces File 16's output, and that output is ordered."""
+
+# NON-DEGENERACY GUARD, at import. A registry that silently lost an entry, or
+# gained a duplicate key that shadowed one, would make run_all() quietly cover
+# less than it claims while every individual call kept working. Both are cheap
+# to rule out here and impossible to notice later.
+if len(QUERIES_BY_KEY) != len(QUERIES):
+    _dupes = sorted({q.key for q in QUERIES if QUERY_KEYS.count(q.key) > 1})
+    raise RuntimeError(
+        f"oncotriage.storage.queries: duplicate query key(s) {_dupes}. Keys are "
+        f"the public surface of this module; a duplicate silently shadows a "
+        f"query in QUERIES_BY_KEY while leaving it in QUERIES."
+    )
+
+
+#------------------------------------------------------------------------------
+
+
+def resolve_query_db_path(db_path=None):
+    """The database these queries read. ``None`` means the configured one.
+
+    The same shape as ``oncotriage.storage.database_logger``'s
+    ``resolve_inference_db_path``, and deliberately a SEPARATE function rather
+    than an import of it: that one answers "where does the logger WRITE", this
+    one answers "where do these queries READ". They resolve to the same file
+    today and there is no reason they must forever -- a read replica or an
+    exported snapshot would change one and not the other.
+
+    It resolves and returns; it opens nothing.
+    """
+    if db_path is not None:
+        return db_path
+    return paths.inferences_path
+
+
+def connect(db_path=None):
+    """Open a read connection to the inference database.
+
+    Returns a plain ``sqlite3.Connection``. The caller closes it -- ``report()``
+    does not, because a caller that wants to ask a follow-up question after the
+    report should not have to reopen.
+    """
+    return sqlite3.connect(resolve_query_db_path(db_path))
+
+
+#------------------------------------------------------------------------------
+
+
+def run(conn, key) -> pd.DataFrame:
+    """Execute one query by key and return its DataFrame. Prints nothing.
+
+    Raises KeyError naming the valid keys for an unknown one, rather than
+    returning an empty frame -- a typo'd key that answered with no rows would be
+    indistinguishable from a database with no matching rows, which is the exact
+    confusion this project treats as a defect.
+    """
+    if key not in QUERIES_BY_KEY:
+        raise KeyError(
+            f"unknown query key {key!r}; valid keys are "
+            f"{', '.join(QUERY_KEYS)}"
+        )
+    return pd.read_sql_query(QUERIES_BY_KEY[key].sql, conn)
+
+
+def run_all(conn, keys=None, stop_on_error=True) -> Dict:
+    """Execute every query (or `keys`) and return {key: DataFrame}. Prints nothing.
+
+    Args:
+        conn:           An open connection.
+        keys:           Which queries, defaulting to all of them in registry
+                        order.
+        stop_on_error:  True reproduces File 16's behaviour -- the first failing
+                        query takes the run down, which is why nothing after
+                        Query 19 has ever executed. False records the exception
+                        under its key and carries on, which is what a caller
+                        surveying a database wants and what item 38 will need.
+
+    With stop_on_error=False the value for a failed key is the EXCEPTION object,
+    not None and not an empty frame: "this query raised" and "this query
+    returned nothing" are different facts and a caller must be able to tell them
+    apart.
+    """
+    out = {}
+    for key in (keys if keys is not None else QUERY_KEYS):
+        try:
+            out[key] = run(conn, key)
+        except Exception as exc:                                # noqa: BLE001
+            if stop_on_error:
+                raise
+            out[key] = exc
+    return out
+
+
+#------------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# The three raw-cursor sections
+# ---------------------------------------------------------------------------
+#
+# File 16 ran these through cursor.execute()/fetchall() rather than pandas and
+# printed the raw tuple list. They are kept that way rather than converted to
+# DataFrames, because converting them would change the output -- and "the output
+# is identical before and after" is what this pass is being judged on.
+
+TABLE_LIST_SQL = "SELECT name FROM sqlite_master WHERE type='table'"
+RAW_INFERENCES_SQL = "SELECT * FROM inferences"
+RAW_TRIAL_MATCHES_SQL = "SELECT * FROM trial_matches"
+
+
+def fetch_raw(conn, sql) -> List:
+    """cursor.execute(sql).fetchall(), as File 16 did it. Returns the tuples."""
+    cursor = conn.cursor()
+    cursor.execute(sql)
+    return cursor.fetchall()
+
+
+def table_names(conn) -> List:
+    """Every table in the database, as raw one-tuples. File 16 line 53."""
+    return fetch_raw(conn, TABLE_LIST_SQL)
+
+
+#------------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# The two sections whose output is not a rendering of their own frame
+# ---------------------------------------------------------------------------
+
+def print_slowest_prompt(conn, out=print) -> pd.DataFrame:
+    """File 16's Query 5: print the slowest patient's Stage 5 prompt in full.
+
+    Returns the one-row frame so a caller can have the prompt without the
+    banners.
+    """
+    df_prompt = run(conn, "slowest_prompt")
+    out("=== PROMPT FOR CHATGPT TESTING ===")
+    out(f"Patient: {df_prompt.iloc[0]['patient_id']}")
+    out(f"Output tokens: {df_prompt.iloc[0]['gpt4o_output_tokens']}")
+    out(f"Total time: {df_prompt.iloc[0]['total_time']:.1f}s")
+    out("\nCopy this prompt to ChatGPT:\n")
+    out("="*80)
+    out(df_prompt.iloc[0]['gpt4o_prompt'])
+    out("="*80)
+    return df_prompt
+
+
+def cost_by_model(conn) -> pd.DataFrame:
+    """File 16's Query 10, the arithmetic half: price each model's rows.
+
+    PRICED PER MODEL, NOT AT ONE RATE. File 16's Query 10 used to have 2.50 and
+    10.00 written into the SQL and summed the whole table against them. That was
+    already a duplicate of PRICING_CONFIG that nothing kept in sync, and it
+    became actively wrong on 2026-08-04 when the judge moved from
+    gpt-4o-2024-08-06 to gpt-5.6-terra: inferences.db now holds rows from both,
+    at different input AND output rates, and one blended rate misstates every row
+    of at least one of them. The grouping key is matching_model, which
+    log_inference writes from the model that ANSWERED the call, so each group is
+    priced by the model that actually produced its tokens.
+
+    Rates come from get_model_cost() / PRICING_CONFIG, never from a literal here,
+    so there is exactly one pricing table in the project and this raises
+    UnknownModelPricingError rather than quietly under-reporting when a model is
+    missing from it.
+
+    Returns a frame with one row per model and a `note` column that is non-empty
+    only where the row set is self-contradictory.
+    """
+    df_cost_by_model = run(conn, "cost_by_model")
+
+    _cost_rows = []
+    for _row in df_cost_by_model.itertuples(index=False):
+        _in = int(_row.input_tokens or 0)
+        _out = int(_row.output_tokens or 0)
+
+        # matching_model IS NULL means no Stage 5 response was obtained for those
+        # rows (node_no_candidates, or a failure before the first call returned),
+        # so there is nothing to price and nothing to price it against. Reported
+        # as a group rather than dropped: a NULL group carrying non-zero tokens
+        # would be a logging defect, and silently excluding it is how that stays
+        # invisible.
+        if _row.matching_model is None:
+            _in_cost = _out_cost = 0.0
+            _note = ("no model recorded"
+                     if (_in == 0 and _out == 0)
+                     else "NO MODEL RECORDED BUT TOKENS PRESENT — logging defect")
+        else:
+            # Split into two calls purely to get the input and output halves
+            # separately; get_model_cost returns their sum.
+            _in_cost = get_model_cost(_row.matching_model, _in, 0)
+            _out_cost = get_model_cost(_row.matching_model, 0, _out)
+            _note = ""
+
+        _cost_rows.append({
+            "matching_model": _row.matching_model or "(none)",
+            "rows": int(_row.rows_n),
+            "input_tokens": _in,
+            "output_tokens": _out,
+            # NULL-safe: SUM() over a column that is NULL on every GPT-4o-era row
+            # returns NULL for those groups. Printed as "n/a" rather than 0 —
+            # GPT-4o reported no reasoning breakdown at all, which is not the same
+            # as a reasoning model that did no thinking.
+            "reasoning_tokens": ("n/a" if _row.reasoning_tokens is None
+                                 else int(_row.reasoning_tokens)),
+            "input_cost": _in_cost,
+            "output_cost": _out_cost,
+            "recomputed_cost": _in_cost + _out_cost,
+            "stored_cost": float(_row.stored_cost or 0.0),
+            "note": _note,
+        })
+
+    return pd.DataFrame(_cost_rows)
+
+
+def print_cost_by_model(conn, out=print) -> pd.DataFrame:
+    """File 16's Query 10, the printing half. Returns the priced frame."""
+    df_cost = cost_by_model(conn)
+    out("=== COST BREAKDOWN BY MODEL ===")
+    out(f"(priced from PRICING_CONFIG, last_updated {PRICING_CONFIG['last_updated']})")
+    out(df_cost.to_string(index=False))
+
+    _total_rows = int(df_cost["rows"].sum()) if len(df_cost) else 0
+    _recomputed_total = float(df_cost["recomputed_cost"].sum()) if len(df_cost) else 0.0
+    _stored_total = float(df_cost["stored_cost"].sum()) if len(df_cost) else 0.0
+    out(f"\nRows: {_total_rows}")
+    out(f"Recomputed total: ${_recomputed_total:.4f}")
+    out(f"Stored total (estimated_cost_usd): ${_stored_total:.4f}")
+
+    # The two totals should agree. They diverge when PRICING_CONFIG changed after
+    # rows were written — which is legitimate and is exactly why pricing_version is
+    # stored per row — so this is reported, not asserted.
+    if _stored_total:
+        out(f"Divergence: {(_recomputed_total - _stored_total) / _stored_total * 100:+.2f}% "
+            f"(non-zero means PRICING_CONFIG changed since some rows were written; "
+            f"see the pricing_version column)")
+
+    if _total_rows:
+        out(f"Projected cost for 1000 patients, at the current mix: "
+            f"${_recomputed_total / _total_rows * 1000:.2f}")
+
+    out("\n")
+    return df_cost
+
+
+_CUSTOM_RENDERERS.update({
+    "slowest_prompt": print_slowest_prompt,
+    "cost_by_model": print_cost_by_model,
+})
+
+
+#------------------------------------------------------------------------------
+
+
+def apply_display_options():
+    """Apply the pandas display settings File 16's output was formatted with.
+
+    THE SAME ARRANGEMENT AS ``apply_plot_style()`` in ``oncotriage/fhir/
+    explore.py``, and it exists for the same reason: these six statements are
+    PROCESS-GLOBAL MUTATIONS and a package module must not run them at import.
+
+    THEY WERE INVISIBLE BEFORE, WHICH IS WHY THIS FUNCTION IS NEEDED. File 16
+    never set them. "01- Imports.py" did, at its lines 237-242, as a side effect
+    of the exec chain -- so File 16's tables printed wide and at five decimal
+    places because of a file it did not know it depended on. Drop the chain and
+    ``print(df_inferences)`` collapses to `id  ...  gpt4o_reasoning_tokens`,
+    which is a different report about the same data. That is not a difference
+    anyone would have predicted from reading either file, and it is exactly the
+    kind of hidden coupling this whole item exists to make explicit.
+
+    Copied verbatim from "01- Imports.py". Called by ``report()``, which is a
+    printing function and whose job this is; ``run()`` and ``run_all()`` return
+    data and deliberately do NOT call it, so a caller asking for a DataFrame
+    does not have its global pandas configuration rewritten underneath it.
+    """
+    pd.set_option('display.max_rows', 500)
+    pd.set_option("display.max_columns", 500)
+    pd.set_option("display.max_colwidth", 250)
+    pd.set_option('display.width', 1000)
+    pd.set_option('display.precision', 5)  # this will help me see big numbers without python converting it to exponential
+    pd.options.display.float_format = '{:.4f}'.format
+
+
+def _render(df, query, out):
+    """Print one query's frame the way File 16 printed it."""
+    if query.heading is not None:
+        out(query.heading)
+    for line in query.notes:
+        out(line)
+
+    if query.render == "repr":
+        out(df)
+    elif query.render == "describe":
+        out(df.describe())
+    elif query.render == "transpose":
+        out(df.T)
+    elif query.render == "to_string":
+        out(df.to_string(index=False))
+    elif query.render == "empty_or_to_string":
+        if df.empty:
+            out(CONSISTENCY_CLEAN_MESSAGE)
+        else:
+            out(df.to_string(index=False))
+    else:
+        # Not reachable through report(), which dispatches 'custom' before
+        # getting here. Raised rather than ignored: a render mode nobody
+        # implemented must not print nothing and look like an empty result.
+        raise ValueError(
+            f"query {query.key!r} has render={query.render!r}, which _render "
+            f"does not implement and report() did not dispatch"
+        )
+
+    if query.blank_after:
+        out("\n")
+
+
+def report(conn, out=print) -> Dict:
+    """Run every query in registry order and print exactly what File 16 printed.
+
+    Args:
+        conn: An open connection. NOT closed here -- see ``connect()``.
+        out:  Where each line goes. Defaults to ``print``. Passing
+              ``lambda *a: None`` runs the whole sweep silently, which is what
+              makes this testable without capturing stdout.
+
+    Returns:
+        {key: DataFrame} for every query that completed before the run ended.
+
+    IT STILL DIES AT expansion_token_efficiency, and that is the point. Item 38
+    owns File 16's two broken queries and has not been done; this function
+    reproduces the failure at the same query with the same message so that a
+    before/after comparison of this pass measures the MOVE. When item 38 fixes
+    the SQL, this function starts completing and nothing here has to change.
+    """
+    results = {}
+
+    # Before anything is printed. File 16's tables were formatted by settings
+    # "01- Imports.py" applied as a side effect of the exec chain; without this
+    # call every wide frame below prints truncated. See apply_display_options.
+    apply_display_options()
+
+    # The three raw-cursor sections and the two frames File 16 printed before its
+    # first numbered query, in the order it printed them.
+    out(table_names(conn))
+    out(fetch_raw(conn, RAW_INFERENCES_SQL))
+
+    for query in QUERIES:
+        if query.render == "custom":
+            renderer = _CUSTOM_RENDERERS.get(query.key)
+            if renderer is None:
+                raise ValueError(
+                    f"query {query.key!r} is marked render='custom' but no "
+                    f"renderer is registered for it"
+                )
+            results[query.key] = renderer(conn, out=out)
+            continue
+
+        df = run(conn, query.key)
+        results[query.key] = df
+        _render(df, query, out)
+
+        # File 16 printed the raw trial_matches tuples between the last
+        # inferences query and the first trial_matches frame. Reproduced at the
+        # same point rather than hoisted, because the position is part of the
+        # output being preserved.
+        if query.key == "medication_counts":
+            out(fetch_raw(conn, RAW_TRIAL_MATCHES_SQL))
+
+    return results
+
+
+def report_to_stdout(db_path=None) -> Dict:
+    """Open the database, print the whole report, close. What File 16 does.
+
+    This is the entire body of "16- Database Query.py"'s __main__ block.
+    """
+    conn = connect(db_path)
+    try:
+        return report(conn)
+    finally:
+        conn.close()
+
+
+#------------------------------------------------------------------------------
+
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Feb 12 20:51:26 2026
+
+@author: ramyalsaffar
+"""

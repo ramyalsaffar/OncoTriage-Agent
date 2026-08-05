@@ -295,7 +295,7 @@ class _LazyAgentDependency:
     THE SET IS CLOSED, AND THAT IS THE CONTRACT. Anything outside
 
         __getattr__  __setattr__(no)  __call__  __bool__  __len__  __iter__
-        __contains__  __eq__  __ne__(derived)  __hash__  __repr__
+        __contains__  __eq__  __ne__(derived)  __hash__  __repr__(no resolve)
 
     is NOT forwarded and will answer for the PROXY rather than for the wrapped
     object -- ``+``, ``[]``, ``with``, ``str()``, ``format()``, ``copy``,
@@ -315,20 +315,38 @@ class _LazyAgentDependency:
     scores a pair. Eager binding would load MedCPT (~110 MB) and FastEmbed for
     all seven.
 
-    __repr__ COSTS A RESOLUTION, and that is stated rather than hidden.
-    Delegating it is what makes `print(medcpt_model)` describe the model instead
-    of describing the wrapper, which is the honest answer once an override is
-    installed -- a proxy that still printed "<lazy MedCPT cross-encoder>" while
-    handing the agent a fixture stub would be lying in the one place a person
-    looks when they are already confused. The cost is real: a repr in a debugger
-    triggers the model load, and transformers' own repr is a multi-thousand-line
-    module tree. A repr that RAISES would be worse than either -- it breaks
-    every debugger, traceback and log line that formats the object -- so a
-    resolution failure is caught, RECORDED in repr_failures (never silently),
-    and reported as a description naming the exception.
+    __repr__ RESOLVES NOTHING, AND THAT IS A CORRECTION TO PASS 3a.
+
+    Pass 3a made __repr__ delegate -- `return repr(self._resolve())` -- on the
+    grounds that a proxy printing "<lazy MedCPT cross-encoder>" while handing
+    the agent a fixture stub is lying at the one moment a person is looking.
+    The goal was right; delegation was the wrong mechanism, because it makes
+    REPR TRIGGER A BUILD:
+
+      * a debugger rendering locals, a logging call formatting the object, or a
+        bare `medcpt_model` typed at a prompt downloads and loads ~110 MB;
+      * having paid for it, it then prints transformers' multi-thousand-line
+        module tree, which is not what anyone typing `medcpt_model` wanted;
+      * and it happens on the DIAGNOSTIC path, so the tool used to inspect the
+        state is the thing that changes it. A repr must be free of side effects.
+
+    So __repr__ asks deps two questions that never call a factory --
+    ``deps.resolution_state(key)`` and ``deps.peek(key)`` (pass 20c-3b) -- and
+    reports the KEY, the STATE (override / cached / unresolved) and, when
+    something is already there, the wrapped object's TYPE and id. That keeps the
+    honesty the delegation was after: with a fixture stub installed the repr
+    names the stub's class, not the model's, and it says "override" outright.
+    What it deliberately does not do is print the object's own repr, which is
+    the module tree nobody asked for.
+
+    A repr that RAISES would still be worse than either -- it breaks every
+    debugger, traceback and log line that formats the object -- so a failure
+    (a proxy built with a key deps does not know) is caught, RECORDED in
+    repr_failures (never silently), and reported as a description naming the
+    exception.
     """
 
-    __slots__ = ("_accessor", "_label")
+    __slots__ = ("_accessor", "_label", "_key")
 
     # Not a counter but the failures themselves, because there is exactly one
     # way to reach this list and a bare count would not say which accessor
@@ -336,9 +354,13 @@ class _LazyAgentDependency:
     # shared exec namespace that "47- Package Split Test.py" section 5 pins.
     repr_failures = []
 
-    def __init__(self, accessor, label):
+    def __init__(self, accessor, label, key):
         object.__setattr__(self, "_accessor", accessor)
         object.__setattr__(self, "_label", label)
+        # The deps key this proxy stands for. Carried so __repr__ can ask deps
+        # about it without calling the accessor -- the accessor is the thing
+        # that builds.
+        object.__setattr__(self, "_key", key)
 
     def _resolve(self):
         return object.__getattribute__(self, "_accessor")()
@@ -377,23 +399,44 @@ class _LazyAgentDependency:
         return hash(self._resolve())
 
     def __repr__(self):
+        # NO RESOLUTION HAPPENS HERE. Both deps calls below read the override
+        # and cache dicts under the lock and return; neither calls a factory.
+        # See the class docstring for why that matters more than delegating.
         label = object.__getattribute__(self, "_label")
+        key = object.__getattribute__(self, "_key")
         try:
-            return repr(self._resolve())
+            state = deps.resolution_state(key)
+            if state == deps.RESOLVED_UNRESOLVED:
+                return (f"<{label} via oncotriage.agent.deps[{key}]: "
+                        f"unresolved — nothing built yet, and this repr did not "
+                        f"build it>")
+            # Already installed or already built, so reading it costs nothing.
+            # The TYPE and id rather than the object's own repr: this is the
+            # discriminating fact (a fixture stub's class is not the model's)
+            # without the multi-thousand-line module tree transformers prints.
+            value = deps.peek(key)
+            return (f"<{label} via oncotriage.agent.deps[{key}]: {state} -> "
+                    f"{type(value).__module__}.{type(value).__qualname__} "
+                    f"at {hex(id(value))}>")
         except Exception as exc:                      # noqa: BLE001
             # Recorded, not swallowed. Re-raising is not an option: a raising
             # __repr__ breaks tracebacks, debuggers and logging for everyone,
-            # including whoever is trying to diagnose this very failure.
+            # including whoever is trying to diagnose this very failure. The one
+            # way to get here is a proxy constructed with a key deps does not
+            # know, which is a defect in this file rather than in the model.
             _LazyAgentDependency.repr_failures.append(
                 f"{label}: {type(exc).__name__}: {exc}"
             )
-            return (f"<unresolved {label} via oncotriage.agent.deps: "
+            return (f"<undescribable {label} via oncotriage.agent.deps: "
                     f"{type(exc).__name__}: {exc}>")
 
 
-medcpt_tokenizer  = _LazyAgentDependency(deps.get_medcpt_tokenizer, "MedCPT tokenizer")
-medcpt_model      = _LazyAgentDependency(deps.get_medcpt_model, "MedCPT cross-encoder")
-_bm25_query_model = _LazyAgentDependency(deps.get_bm25_query_model, "FastEmbed BM25 query model")
+medcpt_tokenizer  = _LazyAgentDependency(deps.get_medcpt_tokenizer, "MedCPT tokenizer",
+                                         deps.MEDCPT_TOKENIZER)
+medcpt_model      = _LazyAgentDependency(deps.get_medcpt_model, "MedCPT cross-encoder",
+                                         deps.MEDCPT_MODEL)
+_bm25_query_model = _LazyAgentDependency(deps.get_bm25_query_model, "FastEmbed BM25 query model",
+                                         deps.BM25_QUERY_MODEL)
 
 
 #------------------------------------------------------------------------------

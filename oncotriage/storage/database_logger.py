@@ -61,6 +61,7 @@ recovery path.
 import json
 import os
 import sqlite3
+import threading
 from typing import Dict, List, Optional
 
 from oncotriage import paths
@@ -353,6 +354,73 @@ TRIAL_MATCH_COLUMN_ADDITIONS = {
 _INITIALIZED_DATABASES = set()
 
 
+#------------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# THE WRITE LOCK (pass 20c-3b)
+# ---------------------------------------------------------------------------
+#
+# WHERE IT USED TO LIVE, AND WHY THAT WAS WRONG.
+#
+# "25- Batch Runner.py" lines 65-73 did this, at module level, after chaining
+# File 14:
+#
+#     _db_lock = threading.Lock()
+#     _original_log_inference = log_inference
+#     def _thread_safe_log_inference(*args, **kwargs):
+#         with _db_lock:
+#             return _original_log_inference(*args, **kwargs)
+#     log_inference = _thread_safe_log_inference
+#
+# It worked -- for File 25. It is a MONKEYPATCH IN ONE CALLER, so every other
+# concurrent caller of log_inference had no lock at all, and there is one:
+#
+#     "17- FastAPI Server.py" line 191 calls log_inference from
+#     loop.run_in_executor(None, _run_matching_pipeline, ...), i.e. from the
+#     default ThreadPoolExecutor, on as many threads as there are in-flight
+#     requests. Two overlapping POST /match requests were writing to the same
+#     SQLite file through two connections with no serialization whatever.
+#
+# WHAT THAT ACTUALLY RISKS, stated rather than gestured at. The write is not one
+# statement: it is _ensure_database (DDL), an INSERT into inferences, a read of
+# cursor.lastrowid, N INSERTs into trial_matches keyed on that id, and a commit.
+# sqlite3's own locking makes each STATEMENT safe; it does not make that
+# SEQUENCE atomic. Two unserialized writers on one file give you, in rising
+# order of nastiness:
+#
+#   1. "database is locked" OperationalError under contention, which
+#      log_inference CATCHES and reports as non-critical -- so the row is simply
+#      lost and the run reports success. Silent data loss, which is the one
+#      failure mode this project exists to remove.
+#   2. a rolled-back inference INSERT whose trial_matches rows were already
+#      committed by the other connection's commit, leaving trial_matches rows
+#      pointing at an inference_id that is not there.
+#
+# So the lock moves HERE, beside the writes it protects, where every caller gets
+# it and no caller has to know it exists. File 25's monkeypatch is deleted.
+#
+# THIS IS A DELIBERATE BEHAVIOUR CHANGE FOR FILE 17, and it is the point of the
+# move: the API's concurrent writers are serialized now and were not before.
+#
+# ONE GLOBAL LOCK, NOT ONE PER PATH. A dict of per-path locks needs its own lock
+# to populate safely, and it would buy nothing measurable: a process writes one
+# database, the critical section is a handful of milliseconds of SQLite work,
+# and it sits inside a per-patient pipeline whose measured median is ~68 seconds
+# of Stage 5 alone. Twelve threads queueing microseconds behind each other at
+# the end of a minute of work is not a bottleneck.
+#
+# AN RLock, NOT A Lock. log_inference takes it and then calls _ensure_database,
+# which calls initialize_database, which takes it again. A plain Lock would
+# deadlock the first time a batch run met an uninitialized database.
+#
+# WHAT IT DOES NOT COVER: get_model_cost(). That is called BEFORE the lock and
+# before the try, for the reason written at log_inference -- it touches no
+# database, and an unpriced model must reach the caller rather than be held up
+# behind, or swallowed by, database machinery.
+_WRITE_LOCK = threading.RLock()
+
+
 def initialize_database(db_path):
     """Create the three tables at db_path and apply the additive migrations.
 
@@ -361,7 +429,21 @@ def initialize_database(db_path):
     what is missing and destroys nothing.
 
     Returns the resolved absolute path, so a caller can log where it wrote.
+
+    HOLDS THE WRITE LOCK (pass 20c-3b). This runs DDL and mutates
+    _INITIALIZED_DATABASES; two threads meeting an uninitialized database would
+    otherwise both run the migration loop and both mutate the set. The body is a
+    separate function purely so the SQL below keeps its exact indentation --
+    those CREATE statements are flush at column 0 inside their triple-quoted
+    strings on purpose, because SQLite stores the CREATE text verbatim in
+    sqlite_master.sql and re-indenting them would change the recorded schema.
     """
+    with _WRITE_LOCK:
+        return _initialize_database_locked(db_path)
+
+
+def _initialize_database_locked(db_path):
+    """initialize_database's body. Callers hold _WRITE_LOCK."""
     # Connect
     # It will create it if deos not exist, and it won't override if it does.
     conn = sqlite3.connect(db_path)
@@ -506,10 +588,11 @@ def _ensure_database(db_path):
     (a caller who deleted the file and wants it rebuilt calls that one), while
     the hot path pays the cost once.
     """
-    resolved = os.path.abspath(db_path)
-    if resolved in _INITIALIZED_DATABASES:
-        return resolved
-    return initialize_database(db_path)
+    with _WRITE_LOCK:
+        resolved = os.path.abspath(db_path)
+        if resolved in _INITIALIZED_DATABASES:
+            return resolved
+        return initialize_database(db_path)
 
 
 #------------------------------------------------------------------------------
@@ -568,6 +651,19 @@ def log_inference(result: Dict, patient_data: Dict, db_path=None):
         temporary file. It is returned even when the write fails, because the
         path is resolved before the try block and "which database did you aim
         at" is answerable whether or not the shot landed.
+
+    THREAD SAFETY (pass 20c-3b). Everything that touches the database runs
+    under ``_WRITE_LOCK``. That lock used to be a monkeypatch inside
+    "25- Batch Runner.py", so the batch runner was serialized and
+    "17- FastAPI Server.py" -- which calls this from the event loop's thread
+    pool, once per in-flight request -- was not. See the block above
+    ``initialize_database`` for what two unserialized writers on one SQLite file
+    actually cost, which is a lost row reported as a success.
+
+    The path resolution and ``get_model_cost()`` deliberately stay OUTSIDE the
+    lock: neither touches the database, and holding a write lock while doing
+    configuration lookups would serialize work that has no reason to be
+    serialized.
     """
 
     # Resolved BEFORE the try, alongside get_model_cost() and for the same
@@ -619,6 +715,35 @@ def log_inference(result: Dict, patient_data: Dict, db_path=None):
         result.get("gpt4o_output_tokens", 0)
     )
 
+    # EVERYTHING BELOW THIS LINE TOUCHES THE DATABASE, so it is serialized.
+    # The body is a separate function rather than an indented `with` block for
+    # one reason: the INSERT statements inside it are triple-quoted strings
+    # whose indentation is part of nothing, but re-indenting 250 lines to add a
+    # `with` would bury the actual change of this pass in a whitespace diff
+    # nobody can review. The guarantee is identical.
+    with _WRITE_LOCK:
+        _write_inference_row(result, patient_data, db_path,
+                             matching_model_used, total_cost)
+
+    # AFTER the finally inside _write_inference_row, not inside it. A return
+    # inside a finally block SWALLOWS any exception propagating out of the try
+    # -- and one exception is meant to propagate from this function:
+    # UnknownModelPricingError is raised above, so it never reaches here, but a
+    # KeyboardInterrupt or a MemoryError raised inside the write would be
+    # discarded by a `return` in the finally and the caller would be told the
+    # write succeeded. It escapes the `with` above instead, releasing the lock
+    # on the way, and this line is never reached.
+    return db_path
+
+
+def _write_inference_row(result: Dict, patient_data: Dict, db_path,
+                         matching_model_used, total_cost):
+    """The database half of log_inference. CALLERS HOLD ``_WRITE_LOCK``.
+
+    Split out of log_inference in pass 20c-3b so the lock could be taken with a
+    `with` statement without re-indenting the whole body. Everything here is
+    byte-for-byte what log_inference did; nothing was reordered.
+    """
     conn = None
     try:
         # Item 20b: the schema is no longer created when this file is loaded,
@@ -882,13 +1007,9 @@ def log_inference(result: Dict, patient_data: Dict, db_path=None):
         if conn:
             conn.close()
 
-    # AFTER the finally, not inside it. A return inside a finally block
-    # SWALLOWS any exception propagating out of the try -- and one exception is
-    # meant to propagate from this function: UnknownModelPricingError is raised
-    # above the try, so it never reaches here, but a KeyboardInterrupt or a
-    # MemoryError raised inside the try would be discarded by a `return` in the
-    # finally and the caller would be told the write succeeded.
-    return db_path
+    # NOTHING IS RETURNED HERE, deliberately. log_inference returns db_path
+    # after this function comes back; see the comment at that return for why a
+    # return inside a finally block would swallow a propagating exception.
 
 
 #------------------------------------------------------------------------------

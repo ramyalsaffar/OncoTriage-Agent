@@ -437,6 +437,54 @@ Per file, handlers / of which silent:
 | `39- ECOG Performance Status Surfacing Test.py` | 2 | 0 |
 | **Total** | **122** | **23** |
 
+### Note on file names and line numbers after item 20c (read before using this table)
+
+**The `File` and `Line` columns below name where each handler was when this
+inventory was generated, and item 20c has been moving handlers into the
+`oncotriage` package ever since.** That drift did not start with pass 3b — it
+started with pass 2b: `14- Database Logger.py` is 121 lines today and the two
+handlers listed against lines 591 and 597 are in
+`oncotriage/storage/database_logger.py`. The same is true of every handler
+attributed to Files 05, 07, 08, 11, 12 and 13.
+
+Pass 20c-3b moved five more files. Where their handlers now live:
+
+| Listed as | Now in |
+|---|---|
+| `15- Database Empty.py` | `oncotriage/storage/maintenance.py` (no handlers) |
+| `16- Database Query.py` | `oncotriage/storage/queries.py` (no handlers) |
+| `17- FastAPI Server.py` | `oncotriage/api/server.py` |
+| `20- Drift Detection.py` | `oncotriage/monitoring/drift.py` |
+| `25- Batch Runner.py` | `oncotriage/batch/runner.py` |
+
+**One VERDICT changed, and it is the only one that did.** The entry below for
+`20- Drift Detection.py` line 24 — `NameError` / **SILENT** — described this:
+
+```python
+try:
+    ks_2samp                      # verify it's in namespace (loaded by exec_chain)
+    SCIPY_AVAILABLE = True
+except NameError:
+    SCIPY_AVAILABLE = False
+```
+
+It was silent, and worse than silent: it tested whether a NAME was present in a
+shared exec namespace, not whether scipy was installed, which is what the
+comment beside it claimed. A namespace that had not loaded `01- Imports.py`
+reported scipy missing on a machine where it was installed, and there was no
+arrangement in which the check could report the failure it was written for.
+Pass 20c-3b made it a real `except ImportError` around a real import, with
+`ks_2samp = None` on failure so a caller reaching past the flag gets a
+`TypeError` at the call site rather than a `NameError` pointing at nothing. It
+is still recorded in `SCIPY_AVAILABLE`, which `ks_test_drift` reads and reports
+through `notes: "scipy not installed"` — so the path taken is logged, and it is
+no longer counted as silent. The silent-handler total for
+`20- Drift Detection.py` is **0**, not 1.
+
+Everything else in this table is a description of code that still exists,
+unchanged, at a different address. Regenerating the line numbers is its own
+task.
+
 ### Full handler list
 
 | File | Line | Catches | Disposition | Handler body (elided) |
@@ -496,7 +544,7 @@ Per file, handlers / of which silent:
 | `17- FastAPI Server.py` | 284 | `Exception` | RE-RAISES | `raise HTTPException(status_code=500, detail=f"Pipeline error: {e}")` |
 | `19- FastAPI Server Batch Test.py` | 48 | `requests.exceptions.Timeout` | RECORDED+LOGGED | `error_count += 1 \| print(f"[{idx}/{len(fhir_files)}] TIMEOUT (>{180}s)")` |
 | `19- FastAPI Server Batch Test.py` | 51 | `Exception` | RECORDED+LOGGED | `error_count += 1 \| print(f"[{idx}/{len(fhir_files)}] ERROR: {e}")` |
-| `20- Drift Detection.py` | 24 | `NameError` | SILENT | `SCIPY_AVAILABLE = False` |
+| ~~`20- Drift Detection.py`~~ `oncotriage/monitoring/drift.py` | 24 | ~~`NameError`~~ `ImportError` | ~~SILENT~~ RECORDED | `ks_2samp = None \| SCIPY_AVAILABLE = False` — pass 20c-3b; see the note above this table |
 | `20- Drift Detection.py` | 99 | `Exception` | RECORDED | `return { "metric_value": None, "threshold": PSI_THRESHOLD, "alert": 0, "notes": f"PSI calculation er...` |
 | `20- Drift Detection.py` | 156 | `Exception` | RECORDED | `return { "metric_value": None, "p_value": None, "threshold": KS_TEST_THRESHOLD, "alert": 0, "notes":...` |
 | `20- Drift Detection.py` | 222 | `Exception` | RECORDED | `return { "metric_value": None, "baseline_mean": None, "baseline_std": None, "threshold": Z_SCORE_THR...` |

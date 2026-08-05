@@ -4,14 +4,29 @@
 """
 FastAPI REST API Server
 
-Zero imports. Zero redundancy. All libraries, config, and pipeline logic
-come from exec()-chaining scripts 01 → 02 → 03 → 07 → 13 → 14 into this
-file's namespace — replicating Spyder's shared namespace exactly.
+THIN ENTRY POINT (item 20c, pass 3b)
+------------------------------------
+The app, the lifespan handler, the models and all four endpoints moved to
+``oncotriage/api/server.py``. What is left here is the ``app`` re-export and the
+``uvicorn.run`` call.
 
-The only code in this file is:
-    - The exec() chain (loads everything)
-    - FastAPI app, models, and endpoints (thin API layer)
-    - Lifespan handler (builds BM25 index + compiles LangGraph pipeline)
+The old header said "Zero imports. Zero redundancy. All libraries, config, and
+pipeline logic come from exec()-chaining scripts 01 → 02 → 03 → 07 → 13 → 14
+into this file's namespace." That is no longer true and is the point of the
+pass: there is no exec chain here at all. Reading this file no longer loads
+torch, transformers, streamlit, matplotlib and langgraph, no longer builds an
+OpenAI and a Qdrant client, and no longer compiles anything.
+
+``app`` IS RE-EXPORTED AT MODULE LEVEL, AND THAT IS LOAD-BEARING.
+``docker-compose.yml`` line 73 runs
+
+    uvicorn "17- FastAPI Server:app" --host 0.0.0.0 --port 8000 --reload
+
+and it works -- ``importlib.import_module`` does not require a valid Python
+identifier, only a file the path finder can locate, so a module name with a
+space and a leading digit imports fine as long as nobody writes an ``import``
+STATEMENT for it. Verified rather than assumed. Removing ``app`` from this
+file's namespace would break the container.
 
 Endpoints:
     POST /match           — FHIR bundle as JSON body → matched trials
@@ -21,278 +36,52 @@ Endpoints:
 
 Run from terminal:
     cd ".../03- Code"
-    python "17- FastAPI Server.py"
+    python "17- FastAPI Server.py"          this file
+    uvicorn oncotriage.api.server:app       the package module, same app
+
+NO RE-EXPORT SHIM BEYOND ``app``. Nothing in the repository reads this file's
+namespace: every top-level name it bound was grepped against every .py, .md,
+.toml and .yml in the tree, and the only hits are ``app`` in docker-compose.yml
+(above) and a prose mention of ``_run_matching_pipeline`` in a comment in
+"25- Batch Runner.py".
 """
 
-
-# ===========================================================================
-# EXEC CHAIN: 01 → 02 → 03 → 07 → 13 → 14
-# ===========================================================================
-# exec() runs each script directly into this module's globals.
-# After this block, every import, path, config constant, client,
-# and function from all 5 scripts is available here.
-# ===========================================================================
-# Item 20a: this file sits in the code directory, so __file__ locates it with
-# no hardcoded path. __file__ is bound when the file is run as a script (every
-# documented entry point for it) and when Spyder runfile()s it. In a bare
-# interactive paste it is not bound, and the working directory is the only
-# remaining candidate -- taken, but announced, never silently.
-import os as _os_boot
-if "__file__" in globals():
-    _code_dir = _os_boot.path.dirname(_os_boot.path.abspath(__file__)) + _os_boot.sep
-else:
-    _code_dir = _os_boot.getcwd() + _os_boot.sep
-    print(f"[Bootstrap] __file__ unbound; using the working directory as the code directory: {_code_dir}")
-del _os_boot
-
-for _bootstrap in ("01- Imports.py", "02- Utility Functions.py"):
-    with open(_code_dir + _bootstrap) as _fh:
-        exec(_fh.read(), globals())
-
-exec_chain(
-    ["03- Config.py", "07- FHIR Parser.py", "13- LangGraph Agent.py", "14- Database Logger.py"],
-    caller_file=_code_dir + "17- FastAPI Server.py",
-    caller_globals=globals(),
-    chain_label="01 → 02 → 03 → 07 → 13 → 14",
-)
-
-# ===========================================================================
-# GLOBAL STATE (built at server startup)
-# ===========================================================================
-
-graph      = None
+import os
+import sys
 
 
-# ===========================================================================
-# LIFESPAN (startup / shutdown)
-# ===========================================================================
-
-@asynccontextmanager
-async def lifespan(_app):
-    """Compile LangGraph pipeline at startup. BM25 is Qdrant-native — no pre-build needed."""
-    global graph
-
-    print("\n" + "="*60)
-    print(f"{Project_Name} — Starting...")
-    print("="*60 + "\n")
-
-    print("[Startup] Compiling LangGraph pipeline...")
-    graph = build_matching_graph()
-
-    print(f"\n[Ready] Pipeline compiled (BM25 is Qdrant-native, no pre-build needed)\n")
-
-    yield
-
-    print("\n[Shutdown] Server stopping...")
-    
-
-# ===========================================================================
-# APP
-# ===========================================================================
-
-app = FastAPI(
-    title=Project_Name,
-    description="Clinical trial patient matching — LangGraph + hybrid RAG",
-    version="2.0.0",
-    lifespan=lifespan
-)
-
-
-# Rate limiting toggle
-limiter = Limiter(key_func=get_remote_address, enabled=ENABLE_RATE_LIMITING)
-
-app.state.limiter = limiter
-
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-
-print(f"[Rate Limiting] {'ENABLED' if ENABLE_RATE_LIMITING else 'DISABLED'} {RATE_LIMIT}")
-
-# ===========================================================================
-# MODELS
-# ===========================================================================
-
-class MatchRequest(BaseModel):
-    fhir_bundle: Dict
-
-
-class PatientSummary(BaseModel):
-    patient_id: str
-    age: Optional[int] = None
-    sex: Optional[str] = None
-    condition_count: int = 0
-    medication_count: int = 0
-    allergy_count: int = 0
-    
-
-class MatchResponse(BaseModel):
-    patient_summary: PatientSummary
-    result: Dict
-    processing_time_seconds: float
-
-
-# ===========================================================================
-# HELPER
-# ===========================================================================
-
-def _run_matching_pipeline(fhir_bundle_dict):
-    """
-    Shared pipeline: FHIR bundle dict → MatchResponse.
-    Used by both /match and /match/file.
-    """
-    
-    start_time = time.time()
-    
-    # ── FHIR structure validation ──────────────────────────────────────
-    if not isinstance(fhir_bundle_dict, dict):
-        raise HTTPException(status_code=422, detail="FHIR bundle must be a JSON object, not a list or primitive.")
-
-    resource_type = fhir_bundle_dict.get("resourceType", "")
-    if resource_type != "Bundle":
-        raise HTTPException(
-            status_code=422,
-            detail=f"Expected resourceType 'Bundle', got '{resource_type or 'missing'}'."
-        )
-
-    entries = fhir_bundle_dict.get("entry", [])
-    if not isinstance(entries, list) or len(entries) == 0:
-        raise HTTPException(status_code=422, detail="FHIR Bundle has no entries.")
-
-    # Check for at least one Patient resource
-    has_patient = any(
-        e.get("resource", {}).get("resourceType") == "Patient"
-        for e in entries
-        if isinstance(e, dict)
-    )
-    if not has_patient:
-        raise HTTPException(status_code=422, detail="FHIR Bundle contains no Patient resource.")
-
-    # ── Parse and run pipeline ─────────────────────────────────────────
-    # parse_fhir_bundle expects a file path, so write to temp file
-    with tempfile.NamedTemporaryFile(
-        mode='w', suffix='.json', delete=False
-    ) as tmp:
-        json.dump(fhir_bundle_dict, tmp)
-        tmp_path = tmp.name
-
-    try:
-        patient_data = parse_fhir_bundle(tmp_path)
-    finally:
-        os.unlink(tmp_path)
-
-    if not patient_data or not patient_data.get('patient_id'):
-        raise HTTPException(status_code=400, detail="Invalid FHIR bundle.")
-
-    result = match_patient_to_trials(
-        patient_data=patient_data,
-        graph=graph
-    )
-    
-    # Log to database
-    log_inference(result, patient_data)
-    
-    elapsed = time.time() - start_time
-    
-    demographics = patient_data.get('demographics', {})
-
-    return MatchResponse(
-        patient_summary=PatientSummary(
-            patient_id=patient_data['patient_id'],
-            age=demographics.get('age'),
-            sex=demographics.get('sex'),
-            condition_count=len(deduplicate_by_display(patient_data.get("conditions", []))),
-            medication_count=len(deduplicate_by_display(patient_data.get("medications", []))),
-            allergy_count=len(patient_data.get("allergies", []))
-        ),
-        result=result,
-        processing_time_seconds=round(elapsed, 3)
-    )
-
-
-# ===========================================================================
-# ENDPOINTS
-# ===========================================================================
-
-@app.get("/health")
-async def health_check():
-    """Health check and pipeline readiness."""
-    return {
-        "status": "healthy",
-        "pipeline_ready": graph is not None,
-        "timestamp": datetime.now().isoformat()
-    }
-
-
-@app.get("/pipeline/info")
-async def pipeline_info():
-    """Pipeline configuration and statistics."""
-    return {
-        "version": "2.0.0",
-        "architecture": "LangGraph StateGraph + exec() chain",
-        "stages": [
-            "1. Query Expansion (Deterministic MeSH C04 hierarchy)",
-            "2. Hybrid Retrieval (BM25 + Vector + RRF)",
-            "3. Cross-Encoder ncbi/MedCPT",
-            "4. Rule-Based Filtering",
-            "5. GPT-4o Criterion-Level Evaluation",
-            "6. Final Ranking"
-        ],
-        "config": {
-            "collection_name": COLLECTION_NAME,
-            "embedding_model": EMBEDDING_MODEL,
-            "matching_model": MATCHING_MODEL,
-            "top_k_candidates": TOP_K_CANDIDATES,
-            "rerank_threshold": RERANK_SCORE_THRESHOLD,
-            "max_trials_for_evaluation": MAX_TRIALS_FOR_EVALUATION,
-            "max_gpt4o_retries": MAX_GPT4O_RETRIES
-        },
-        "trials_indexed": qdrant_client.get_collection(COLLECTION_NAME).points_count if qdrant_client else 0
-    }
-
-
-@app.post("/match", response_model=MatchResponse)
-
-@limiter.limit(RATE_LIMIT)
-
-async def match_patient_endpoint(body: MatchRequest, request: Request):
-    
-    """Match a patient to clinical trials via JSON body."""
-    if graph is None:
-        raise HTTPException(status_code=503, detail="Pipeline not ready.")
-
-    try:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, _run_matching_pipeline, body.fhir_bundle)
-    except HTTPException:
+# Make the oncotriage package importable
+#---------------------------------------
+# See the same block in "04- FHIR Generate Data.py" and "11- RAG Trial
+# Indexer.py". `pip install -e .` makes it a no-op; without it the code
+# directory is added to sys.path and the fact is printed rather than left
+# silent. Docker takes this path too: the image copies the code directory to
+# /app and uvicorn's working directory is /app.
+try:
+    import oncotriage  # noqa: F401
+except ImportError:
+    for _candidate, _how in (
+        (os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals()
+         else None, "__file__"),
+        (os.getcwd(), "cwd"),
+    ):
+        if _candidate and os.path.isdir(os.path.join(_candidate, "oncotriage")):
+            if _candidate not in sys.path:
+                sys.path.insert(0, _candidate)
+            print(f"[Bootstrap] oncotriage package found at {_candidate} "
+                  f"(via {_how}); added to sys.path")
+            break
+    else:
         raise
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Pipeline error: {e}")
-        
+    del _candidate, _how
 
-@app.post("/match/file", response_model=MatchResponse)
+import uvicorn
 
-@limiter.limit(RATE_LIMIT)
-
-async def match_patient_file(request: Request, file: UploadFile = File(...)):
-    
-    """Match a patient to clinical trials via file upload."""
-    if graph is None:
-        raise HTTPException(status_code=503, detail="Pipeline not ready.")
-
-    if not file.filename.endswith('.json'):
-        raise HTTPException(status_code=400, detail="Only .json files accepted.")
-
-    try:
-        content = await file.read()
-        bundle = json.loads(content)
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, _run_matching_pipeline, bundle)
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON file.")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Pipeline error: {e}")
+# The ASGI application. Re-exported, not rebuilt -- `uvicorn "17- FastAPI
+# Server:app"` and `uvicorn oncotriage.api.server:app` must reach the SAME
+# object, or the two documented ways of running the server would be two
+# different servers.
+from oncotriage.api.server import app
 
 
 # ===========================================================================

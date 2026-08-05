@@ -46,6 +46,7 @@ one object and a caller reading it after a run sees the run's numbers.
 import json
 import os
 import random
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -91,6 +92,28 @@ RANDOM_SEED = 42
 
 _RESOLVED = {}
 
+# THE CACHE IS LOCKED (pass 20c-3b), for consistency with oncotriage.agent.deps
+# and oncotriage.paths, both of which guard their caches the same way.
+#
+# Pass 3a wrote `if name not in _RESOLVED: _RESOLVED[name] = build()`. Each of
+# those two dict operations is atomic under the GIL; the SEQUENCE is not. Two
+# threads entering cancer_registry() together can both miss and both call
+# load_registry(), and while load_registry() is itself a cached singleton --
+# so the two would converge on one object -- patients_dir() and manifest_path()
+# have no such backstop and the pattern is what is being copied when someone
+# adds a fourth accessor here.
+#
+# An RLock rather than a Lock, matching deps: an accessor holds it while calling
+# a factory, and a factory that reached another accessor in this module would
+# deadlock on a plain Lock. Nothing does that today; the cost of the RLock is
+# nothing, and the cost of being wrong about it later is a hang.
+#
+# THIS FILE IS NOT MULTI-THREADED TODAY. filter_cancer_patients_inplace() runs
+# on one thread. The lock is here because the accessors are importable and the
+# shim calls all three at load, so "only File 05 calls these" is a property of
+# today's callers rather than of this module.
+_RESOLVE_LOCK = threading.RLock()
+
 
 def patients_dir():
     """The directory this file deletes from. ``paths.data_fhir_path``, cached.
@@ -99,17 +122,19 @@ def patients_dir():
     and every consumer of that assignment paid a glob over the sibling data tree
     just by loading the file.
     """
-    if "patients_dir" not in _RESOLVED:
-        _RESOLVED["patients_dir"] = paths.data_fhir_path
-    return _RESOLVED["patients_dir"]
+    with _RESOLVE_LOCK:
+        if "patients_dir" not in _RESOLVED:
+            _RESOLVED["patients_dir"] = paths.data_fhir_path
+        return _RESOLVED["patients_dir"]
 
 
 def manifest_path():
     """Where the deletion manifest is written. Resolved on first call, cached."""
-    if "manifest_path" not in _RESOLVED:
-        _RESOLVED["manifest_path"] = os.path.join(paths.checkpoint_path,
-                                                  COHORT_MANIFEST_FILENAME)
-    return _RESOLVED["manifest_path"]
+    with _RESOLVE_LOCK:
+        if "manifest_path" not in _RESOLVED:
+            _RESOLVED["manifest_path"] = os.path.join(paths.checkpoint_path,
+                                                      COHORT_MANIFEST_FILENAME)
+        return _RESOLVED["manifest_path"]
 
 
 def cancer_registry():
@@ -125,9 +150,10 @@ def cancer_registry():
     A stub registry installed for an agent test must not silently change which
     patients a deletion pass removes.
     """
-    if "cancer_registry" not in _RESOLVED:
-        _RESOLVED["cancer_registry"] = load_registry()
-    return _RESOLVED["cancer_registry"]
+    with _RESOLVE_LOCK:
+        if "cancer_registry" not in _RESOLVED:
+            _RESOLVED["cancer_registry"] = load_registry()
+        return _RESOLVED["cancer_registry"]
 
 
 #------------------------------------------------------------------------------

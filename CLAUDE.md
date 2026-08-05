@@ -12,9 +12,15 @@ Files 04 to 46 are numbered, space-containing filenames (`25- Batch Runner.py`) 
 
 Files 01, 02 and 03 are different as of item 20c. They are now **re-export shims over a real package**:
 
-Files 01, 02, 03 (pass 20c-1), 08, 09, 10 (pass 20c-2a), 07, 14 (pass 20c-2b), 13 (pass 20c-2c) and 05 (pass 20c-3a) are shims.
+Files 01, 02, 03 (pass 20c-1), 08, 09, 10 (pass 20c-2a), 07, 14 (pass 20c-2b), 13 (pass 20c-2c), 05 (pass 20c-3a) and 20 (pass 20c-3b) are shims.
 
-**Files 04, 06, 11 and 12 are THIN ENTRY POINTS as of pass 20c-3a** — a `__main__` block, the imports it needs, and nothing else. They have **no exec bootstrap at all**: no `exec()` of Files 01/02/03, no `exec_chain`. That is allowed because nothing in the repository chains them, which was verified rather than assumed — every top-level name each of the four defined was grepped against every `.py`, `.md`, `.toml` and `.yml` in the tree, and the only hits are prose in CLAUDE.md / `Exception and Fallback Audit.md`, plus Files 39 and 40 printing `python "04- FHIR Generate Data.py" --population 3000` as a suggested command. File 05 is the exception: `34- Cohort Selector Diff.py` line 68 chains it and calls `has_cancer_diagnosis`, so File 05 keeps a full re-export shim **and** its chain of Files 07 and 08.
+**Files 04, 06, 11, 12 (pass 20c-3a) and 15, 16, 17, 25 (pass 20c-3b) are THIN ENTRY POINTS** — a `__main__` block, the imports it needs, and nothing else. They have **no exec bootstrap at all**: no `exec()` of Files 01/02/03, no `exec_chain`. That is allowed because nothing in the repository chains them, which was verified rather than assumed — every top-level name each of them defined was grepped against every `.py`, `.md`, `.toml` and `.yml` in the tree, and the only hits are prose in CLAUDE.md / `Exception and Fallback Audit.md`, Files 39 and 40 printing `python "04- FHIR Generate Data.py" --population 3000` as a suggested command, a comment in `02- Utility Functions.py` line 46 naming File 16, a comment in File 25 naming File 17's `_run_matching_pipeline`, and coincidental same-named locals elsewhere (`conn`, `cursor`, `_in`, `_out`, `df_cost`, `graph`, `bm25_index`, `print_summary`).
+
+Two of those eight keep one re-exported name each, and both are load-bearing:
+
+- **File 17 keeps `app`.** `docker-compose.yml` line 73 runs `uvicorn "17- FastAPI Server:app"`, and that WORKS — `importlib.import_module` does not require a valid Python identifier, only a file the path finder can locate, so a module name with a space and a leading digit imports fine as long as nobody writes an `import` STATEMENT for it. Verified rather than assumed. It is the same object as `oncotriage.api.server:app`.
+- **File 05 keeps a full shim** and its chain of Files 07 and 08: `34- Cohort Selector Diff.py` line 68 chains it and calls `has_cancer_diagnosis`.
+- **File 20 keeps a full shim** (pass 20c-3b): `41- ECOG Availability Metric Test.py` chains it and reads nine names out of the shared namespace. Its bootstrap is the lightweight six-line package-import block, **not** the 01/02 exec — running drift detection must not import torch, transformers and streamlit to run three statistical tests over a SQLite table.
 
 | Module | Holds | Imports |
 |---|---|---|
@@ -36,7 +42,12 @@ Files 01, 02, 03 (pass 20c-1), 08, 09, 10 (pass 20c-2a), 07, 14 (pass 20c-2b), 1
 | `oncotriage/fhir/explore.py` | File 06 whole — the descriptive analyses and their plots | `paths`, `config`, `extraction.stage`, `registries.cancer_code_registry` |
 | `oncotriage/retrieval/indexer.py` | File 11 whole — scrape, embed, index, alias swap, cleanup | `paths`, `config`, `embedding`, `extraction.*`, `utils` |
 | `oncotriage/retrieval/index_validator.py` | File 12 whole — the nine index-health / retrieval checks | `config`, `agent.deps` |
-| `oncotriage/storage/database_logger.py` | File 14 whole — the three-table schema, `initialize_database`, `log_inference` | `paths`, `config`, `utils`, `registries.primary_cancer` |
+| `oncotriage/storage/database_logger.py` | File 14 whole — the three-table schema, `initialize_database`, `log_inference`, **the write lock** | `paths`, `config`, `utils`, `registries.primary_cancer` |
+| `oncotriage/storage/maintenance.py` | File 15 whole — `empty_database` | nothing from the project |
+| `oncotriage/storage/queries.py` | File 16 whole — the `Query` registry, `run`, `run_all`, `report` | `paths`, `config`, `utils` |
+| `oncotriage/api/server.py` | File 17 whole — `create_app`, `app`, the four endpoints | `agent.{deps,graph}`, `config`, `fhir.parser`, `storage.database_logger`, `utils` |
+| `oncotriage/monitoring/drift.py` | File 20 whole — KS / PSI / z-score, the ECOG threshold alert, `log_drift_metrics` | `paths`, `config` |
+| `oncotriage/batch/runner.py` | File 25 whole — checkpoint, the two thread pools, the summary | `paths`, `config`, `agent.{graph,retrieval,evaluation}`, `fhir.parser`, `storage.database_logger`, `utils` |
 | `oncotriage/registries/primary_cancer.py` | `_resolve_primary_cancer` — which condition is THE cancer | `registries.cancer_code_registry` |
 | `oncotriage/agent/deps.py` | **the seam**: every client, model and registry, lazily resolved and overridable | `config`, `registries.*` |
 | `oncotriage/agent/state.py` | `TrialMatchState`, the channel / expansion-path / MeSH-filter vocabularies | nothing from the project |
@@ -113,6 +124,25 @@ the first two directly); `_CANCER_REGISTRY`, `_LAB_REGISTRY` and `_MESH_FILTER`
 are bound **eagerly to the real values** because `_MESH_FILTER is None` is a real
 branch that a proxy would break.
 
+**Asking `deps` without building (pass 20c-3b).** `peek(key)`, `resolution_state(key)`,
+`is_resolved(key)` and `cached_keys()` answer "what is installed for this key
+right now" **without calling a factory**. They exist because File 13's lazy proxy
+renders its `__repr__` from them; see the next paragraph. `peek` returns `UNSET`
+when nothing is installed or cached, which is what distinguishes it from a
+legitimately-cached `None` (`MESH_FILTER`). They are diagnostic, not an access
+path — every consumer inside the agent calls a typed accessor.
+
+**The seam is proven correct under `MAX_WORKERS` threads (pass 20c-3b).** Pass 3a
+locked the whole override-then-cache sequence on the argument that
+`25- Batch Runner.py` drives twelve threads through it. That argument was right
+and **untested** — every harness that had ever exercised `deps` ran
+single-threaded. File 47 check 5d now drives `MAX_WORKERS` threads through all
+eight accessors simultaneously, behind a `threading.Barrier`, with counting
+factories installed, and asserts **one shared object per key** and **exactly one
+build per key**. Identity alone would not be enough: it also holds if the factory
+ran twelve times and eleven results were discarded, which for a client that opens
+a connection pool is a real cost identity cannot see.
+
 **The lazy proxy answers for what it wraps, not for itself (pass 20c-3a).**
 `_LazyAgentDependency` forwarded `__getattr__` and `__call__` only. CPython looks
 an implicit special method up on the TYPE, never through `__getattr__`, so
@@ -123,12 +153,28 @@ with an override installed. All six now resolve and delegate, plus `__hash__`
 (defining `__eq__` would otherwise make the three names unhashable). **The
 forwarded set is closed and File 47 check 5c asserts its exact membership** —
 `+`, `[]`, `with`, `str()`, `isinstance` and `.__class__` are *not* forwarded and
-answer for the proxy. `__repr__` costs a resolution and is caught rather than
-allowed to raise, because a raising `__repr__` breaks every traceback and
-debugger; a failure is recorded in `_LazyAgentDependency.repr_failures`. Eager
-binding is not the alternative: `ONCOTRIAGE_DEFER_LOCAL_MODELS` appears in only
-two files (13 and 46), so Files 31, 32, 35, 36, 37, 39 and 40 would all load
-MedCPT and FastEmbed for nothing.
+answer for the proxy. Eager binding is not the alternative:
+`ONCOTRIAGE_DEFER_LOCAL_MODELS` appears in only two files (13 and 46), so Files
+31, 32, 35, 36, 37, 39 and 40 would all load MedCPT and FastEmbed for nothing.
+
+**`__repr__` RESOLVES NOTHING — pass 20c-3b corrects pass 20c-3a.** Pass 3a made
+it delegate (`return repr(self._resolve())`) so that a proxy handing the agent a
+fixture stub would not still print `<lazy MedCPT cross-encoder>`. The goal was
+right; delegation was the wrong mechanism, because **repr then triggers a build**:
+a debugger rendering locals, a logging call formatting the object, or a bare
+`medcpt_model` typed at a prompt downloads and loads ~110 MB and then prints
+transformers' multi-thousand-line module tree — on the *diagnostic* path, where
+the tool used to inspect the state must not be the thing that changes it. The
+proxy carries its `deps` key now and `__repr__` reports the key, the state
+(`override` / `cached` / `unresolved`) and, when something is already there, the
+wrapped object's **type and id** — via `deps.resolution_state` and `deps.peek`,
+neither of which calls a factory. That keeps the honesty (with a stub installed
+the repr says `override` and names the stub's class) without the cost. A failure
+— reachable only by constructing a proxy with a key `deps` does not know — is
+caught rather than allowed to raise, because a raising `__repr__` breaks every
+traceback and debugger, and is recorded in `_LazyAgentDependency.repr_failures`.
+File 47 check 5c measures this by **counting accessor calls**, which is the only
+thing that separates the two shapes: both return a plausible string.
 
 **Path resolution is lazy (pass 20c-2b).** `oncotriage/paths.py` used to resolve
 the whole sibling tree at import, so `import oncotriage.config` — which imports
@@ -196,8 +242,11 @@ All commands run from `03- Code/`. Filenames contain spaces — always quote the
 ```bash
 # Pipeline services
 python "17- FastAPI Server.py"                       # API on :8000 (/docs)
+uvicorn oncotriage.api.server:app --port 8000        # the same app, package route
 streamlit run "21- Streamlit Dashboard.py"           # dashboard on :8501
 python "25- Batch Runner.py"                         # full-corpus run, no HTTP, checkpointed
+python "15- Database Empty.py"                       # no-op unless Flag = True at its line 78
+python "16- Database Query.py"                       # ~40 read-only queries (dies at Q19, item 38)
 
 # Data + index build (one-time / weekly)
 python "04- FHIR Generate Data.py"                   # Synthea JAR -> ~22k patients
@@ -225,19 +274,32 @@ python "47- Package Split Test.py"                       # no network, no keys, 
 pip install -e .                                         # makes `oncotriage` importable anywhere
 ```
 
-**Do not run `44-` and `47-` at the same time.** File 44 rewrites the
-`DATA_SNAPSHOT_DATE` literal in `oncotriage/config.py` **in place** (hashing
-before and after, and restoring byte-identically), and File 47 check 4 copies
-that file to build its own rewrite. Concurrently, File 47 copies a config that
-File 44 has patched and fails on `the copied config carries the snapshot-date
-assignment to rewrite` — a real-looking failure with no defect behind it. This
-has always been true; it is written down here because it is not obvious from
-either file. Run the suite serially.
+**Files 42, 43, 44 and 47 cannot run concurrently, and that is now a mechanism
+rather than a warning (pass 20c-3b).**
+
+```bash
+make serial-tests          # runs 42 → 43 → 44 → 47, one at a time, ~8 min
+make serial-tests-list     # prints the order and why, runs nothing
+python run_serial_tests.py # the same thing without make
+```
+
+`run_serial_tests.py` carries the collision matrix pair by pair. In summary: File
+44 rewrites the `DATA_SNAPSHOT_DATE` literal in `oncotriage/config.py` **in
+place** (hashing before and after, restoring byte-identically) and File 47 check
+4 copies that file; File 43 plants defects into
+`oncotriage/registries/cancer_code_registry.py` **in place** and File 42 reads
+that same source text as the claims under audit; File 47 `copytree()`s the whole
+package three times and a copy taken mid-edit carries the edit. Every collision
+produces a real-looking failure with no defect behind it. The order is
+load-bearing: 42 first against a pristine registry, 47 last over a tree every
+earlier file has restored. It runs all four and reports every exit code rather
+than stopping at the first failure — each restores its own tree, so one failure
+does not invalidate the next.
 
 File 47's per-module import sweep (check 2c) runs one subprocess per package
 module through a `ThreadPoolExecutor`. Serially it took about nine minutes and
-pass 3a took the module count from 26 to 33; a test nobody runs because it is
-slow protects nothing. A THREAD pool rather than a process pool is the right
+the module count has gone 26 → 33 (pass 3a) → 42 (pass 3b); a test nobody runs
+because it is slow protects nothing. A THREAD pool rather than a process pool is the right
 tool, not a compromise: each unit of work is already its own subprocess, so the
 parent thread spends its life blocked in `subprocess.run()` with the GIL
 released.
@@ -340,6 +402,22 @@ These three moved into the package in pass 20c-2a. The numbered files survive as
 - **`oncotriage/fhir/explore.py`** (entry point: `06- FHIR Explore.py`) — descriptive analysis. `output_dir()` **resolves and creates**: File 06 ran the `mkdir` at module level, and folding it into the accessor keeps the directory present before any write on every call path while keeping the import free of filesystem work. `apply_plot_style()` holds the `sns.set_style` / `plt.rcParams` statements that used to run at import; it is called by `main()` and by all seven functions that draw, so no call path loses the styling and no importer gains it.
 - **`oncotriage/retrieval/indexer.py`** (entry point: `11- RAG Trial Indexer.py`) — reaches its clients through `oncotriage.config.get_*_client()`, deliberately **not** through `agent.deps`. Gets the BM25 encoder from `oncotriage.embedding`.
 - **`oncotriage/retrieval/index_validator.py`** (entry point: `12- RAG Trial Indexer Validator.py`) — reaches everything through `agent.deps`, including both MedCPT halves, and imports `torch` **inside** `stage2_retrieval_tests()` (the third-party-in-a-function-body exemption; at module scope it would mean importing the validator pulled torch in).
+- **`oncotriage/fhir/explore.py`: `output_dir()` is PURE as of pass 20c-3b.** Pass 3a folded the mkdir into it, so `print(f"Output directory: {output_dir()}")` created a directory as a side effect of printing and a caller who only wanted the path could not ask without creating it. The mkdir has its own name now — `ensure_output_dir()` — called by `main()` and by each of the eight functions that write, exactly the arrangement `apply_plot_style()` already had and for the same reason: a caller invoking `analyze_demographics()` directly must not lose the directory.
+- **The lazy caches in `fhir/clean.py` and `fhir/explore.py` are locked (pass 20c-3b)**, matching `agent/deps.py` and `paths.py`. `if k not in d: d[k] = build()` is two atomic operations and one non-atomic sequence. Neither module runs multi-threaded today; the lock is about the pattern being copied when the next accessor is added.
+
+### The serving layer (pass 20c-3b)
+
+- **`oncotriage/storage/maintenance.py`** (thin entry point: `15- Database Empty.py`) — `empty_database(db_path, flag)`. **Both arguments stay required and neither gets a default.** `db_path=None` meaning "production" would turn `empty_database()` — a plausible thing to type while exploring a module — into a command that wipes the real `inferences.db`, and `flag=False` as a default would make `empty_database(path)` a no-op that looks like it worked. `Flag = False` stays at module level in File 15: it is data, and the one-line edit that arms the script belongs where a reader looks for it.
+- **`oncotriage/storage/queries.py`** (thin entry point: `16- Database Query.py`) — the ~40 queries as an ordered registry of `Query` records. `run(conn, key)` returns one frame, `run_all(conn)` returns them all, `report(conn)` prints exactly what File 16 printed. **The SQL was extracted BY AST and never retyped**, so it is byte-for-byte what it was — including **the two queries item 38 owns and has not fixed**: `expansion_token_efficiency` selects columns that do not exist and `pipeline_consistency` has a stray `WHEN` outside its `CASE`. `report()` still dies at the same query with the same message, and that is the acceptance criterion for the move rather than a defect in it. **File 16 gained a `__main__` guard**, which is a behaviour change: it had none, so loading it ran forty queries against the production database as a side effect. `apply_display_options()` holds the six `pd.set_option` calls File 16 inherited invisibly from `01- Imports.py`; without them every wide frame prints truncated, which is a different report about the same data.
+- **`oncotriage/api/server.py`** (thin entry point: `17- FastAPI Server.py`) — `create_app()` is the factory and `app = create_app()` the single call. **The app object at module level is the one deliberate exception to "importing a package module does nothing"**, and it is forced: ASGI takes a `module:attribute` reference. Building it opens no client, loads no model, touches no database and reads no file — the graph is compiled in the `lifespan` handler, on startup, where File 17 always had it. `/pipeline/info` reaches Qdrant through `agent.deps.get_qdrant_client()`, inside the handler, not at import.
+- **`oncotriage/monitoring/drift.py`** (shim: `20- Drift Detection.py`) — **File 20 contained ZERO import statements.** Not few; zero. It resolved only inside a namespace somebody else had filled, so `python "20- Drift Detection.py"` — the command in its own `__main__` docstring, and in `21- Streamlit Dashboard.py` line 3609 — died on `PSI_BINS` at the first `def`. Both instructions are true for the first time. `SCIPY_AVAILABLE` is a real `except ImportError` around a real import now, not a `NameError` guard on somebody else's namespace, and `ks_2samp` is bound to `None` on failure so a caller reaching past the flag gets a `TypeError` at the call site.
+- **`oncotriage/batch/runner.py`** (thin entry point: `25- Batch Runner.py`) — the checkpoint, the two `ThreadPoolExecutor` passes and the summary. Its `_db_lock` is gone (see below); what remains is `_results_lock`, renamed for what it actually guards — File 25 used one lock for the database *and* for `append_result`'s read-modify-write, so every results-file write queued behind every database write.
+
+**THE INFERENCE WRITE LOCK LIVES IN `oncotriage/storage/database_logger.py` (pass 20c-3b), and moving it there is a deliberate behaviour change that fixes File 17.** It used to be a monkeypatch at `25- Batch Runner.py` lines 65-73, rebinding `log_inference` to a lock-wrapped copy **in that file's namespace**. That protected the batch runner and nothing else, and there is a second concurrent writer: `17- FastAPI Server.py` calls `log_inference` from `loop.run_in_executor(...)`, once per in-flight request, on the event loop's thread pool. Two overlapping `POST /match` requests wrote to one SQLite file through two connections with nothing serializing them.
+
+**Where the race actually is, measured rather than assumed.** On the steady-state INSERT path it is *not* observable at this project's contention: SQLite's own file locking plus sqlite3's 5-second busy timeout already serialize two connections, and File 47 check 5e asserts that both the locked and unlocked arms land every row there. The lock earns its keep on the **schema migration**: `ALTER TABLE ADD COLUMN` has no `IF NOT EXISTS` form, so the `PRAGMA table_info` check *is* the guard, and two threads arriving at a fresh database both read it and both issue the ALTER. The second gets `duplicate column name`, which `log_inference`'s `except sqlite3.Error` — the handler that exists so a logging fault cannot kill the pipeline — catches, prints as non-critical, and **loses the row while the run reports success**. Measured over 20 trials at 24 threads: the unlocked arm lost rows in 18, the locked arm in 0. File 47 check 5e runs 8 trials of each with the control built by stripping the `with` statements out of an ast COPY of the module.
+
+It is an `RLock` because `log_inference` takes it and then calls `_ensure_database` → `initialize_database`, which take it again. `get_model_cost()` and the path resolution stay **outside** it: neither touches the database, and an unpriced model must reach the caller rather than be held behind database machinery.
 
 ### Index lifecycle (Qdrant)
 
@@ -355,7 +433,7 @@ These three moved into the package in pass 20c-2a. The numbered files survive as
 
 **`oncotriage/storage/database_logger.py`** (shim: `14- Database Logger.py`) opens no database at load time and never did since item 20b, which turned schema creation into a function because nine other files load 14 or are loaded beside it and every one of them was touching `inferences.db` just by being read. `initialize_database(db_path)` creates three tables: `inferences` (per-patient funnel counts, per-stage timings, token counts, cost), `trial_matches` (per-trial verdicts), `drift_metrics`. It is idempotent — every `CREATE` is `IF NOT EXISTS`, every `ALTER` is guarded by a `PRAGMA table_info` check — and `log_inference` ensures the schema once per resolved path before its first write. `16-` is a scratch query script; `15-` wipes all tables and is guarded by `Flag = False` — leave it False.
 
-**`log_inference(result, patient_data, db_path=None)` takes the database as an argument, and the five isolation tests pass it.** `db_path=None` means `oncotriage.paths.inferences_path` — `resolve_inference_db_path()` is the resolver, and it deliberately does *not* consult the exec namespace. The **shim's** `log_inference` is a wrapper that supplies `globals().get("inferences_path")`, the same late-binding seam File 02 uses for `get_model_cost` / `resolve_qdrant_collection` / `get_age_reference_date`. That seam is what keeps the redirect working for Files 36, 37, 38, 40 and 45, all of which rebind `inferences_path` at a temporary database *before* loading File 14: a module function cannot see a caller's globals, so without the wrapper all five would have written real rows into the real `inferences.db` while still printing the name of the temporary file each thought it was using. All five now **also** pass `db_path` explicitly and assert on the path `log_inference` returns, so neither mechanism is a single point of failure. Each one first checks that `resolve_inference_db_path(None)` is the production database and is *not* its own scratch path, which is what makes the assertion discriminating rather than vacuous. **File 41 is the one file that still rebinds `inferences_path` without passing a path** — it does so for `log_drift_metrics` in File 20, never loads File 14, and stays as it is until File 20 converts in pass 20c-3.
+**`log_inference(result, patient_data, db_path=None)` takes the database as an argument, and the five isolation tests pass it.** `db_path=None` means `oncotriage.paths.inferences_path` — `resolve_inference_db_path()` is the resolver, and it deliberately does *not* consult the exec namespace. The **shim's** `log_inference` is a wrapper that supplies `globals().get("inferences_path")`, the same late-binding seam File 02 uses for `get_model_cost` / `resolve_qdrant_collection` / `get_age_reference_date`. That seam is what keeps the redirect working for Files 36, 37, 38, 40 and 45, all of which rebind `inferences_path` at a temporary database *before* loading File 14: a module function cannot see a caller's globals, so without the wrapper all five would have written real rows into the real `inferences.db` while still printing the name of the temporary file each thought it was using. All five now **also** pass `db_path` explicitly and assert on the path `log_inference` returns, so neither mechanism is a single point of failure. Each one first checks that `resolve_inference_db_path(None)` is the production database and is *not* its own scratch path, which is what makes the assertion discriminating rather than vacuous. **No writer anywhere in the repository depends on rebinding a shared global any more (pass 20c-3b).** File 41 was the last one — it rebound `inferences_path` for `log_drift_metrics` in File 20. `log_drift_metrics`, `get_baseline_and_current_data` and `run_drift_detection` all take `db_path` now, `log_drift_metrics` **returns the path it wrote to** so a caller can assert on it, and File 41 passes its scratch path, checks the default resolves to production and is *not* that scratch path, demonstrates the assertion failing against a decoy database, and confirms the production `drift_metrics` row count is unchanged at the end.
 
 `_resolve_primary_cancer` lives in **`oncotriage/registries/primary_cancer.py`** as of pass 20c-2c, and both the agent's three terminal nodes and the storage logger import it from there. Pass 2b had already stopped it reading File 13's `_CANCER_REGISTRY` global — a layering violation that left it raising `NameError` in any chain loading 14 without 13 — in favour of `load_registry()`. Pass 2c finished the job: while the function lived in the storage module, the *agent* depended on the *storage* layer for a registry lookup. **`38- Birth Date and Demographics Parser Test.py` section 9b is the only place that exercises it**, because File 38 is the only chain in the repository that loads 14 without 13; it calls the function directly on a stub condition list and asserts a real diagnosis comes back, having first asserted the result is not `None` (which an empty registry filter also returns).
 

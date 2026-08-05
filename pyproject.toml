@@ -51,4 +51,8 @@ packages = [
     "oncotriage.retrieval",
     "oncotriage.storage",
     "oncotriage.agent",
+    # Pass 20c-3b: the serving layer.
+    "oncotriage.api",
+    "oncotriage.monitoring",
+    "oncotriage.batch",
 ]

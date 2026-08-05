@@ -52,6 +52,13 @@ values, which is the shape ``install_recording_hooks`` / ``install_replay_hooks`
 want; ``restore_overrides(saved)`` puts them back, treating ``_UNSET`` as
 "there was no override, so remove the one I installed".
 
+ASKING WITHOUT BUILDING (pass 20c-3b). ``peek``, ``resolution_state``,
+``is_resolved`` and ``cached_keys`` answer "what is installed for this key right
+now" WITHOUT calling a factory. They exist because File 13's lazy proxy renders
+its ``__repr__`` from them: a repr that resolves is a repr that downloads and
+loads MedCPT, on the diagnostic path, at the moment someone is already confused.
+See the block above ``_resolve`` for the full argument.
+
 WHAT IS OVERRIDABLE, and why each one is on the list
 ----------------------------------------------------
     OPENAI_CLIENT      Stage 2's embedding call and Stage 5's chat call.
@@ -291,6 +298,99 @@ class override:
         else:
             set_override(self._key, self._previous)
         return False
+
+
+# ---------------------------------------------------------------------------
+# Asking WITHOUT building
+# ---------------------------------------------------------------------------
+#
+# Every accessor below BUILDS when it has to. These three do not, ever, and
+# that is their whole reason for existing.
+#
+# WHAT THEY FIX (pass 20c-3b). "13- LangGraph Agent.py" binds three names --
+# medcpt_tokenizer, medcpt_model, _bm25_query_model -- to a _LazyAgentDependency
+# proxy, and pass 3a made that proxy's __repr__ delegate to the wrapped object.
+# The argument was honesty: a proxy that printed "<lazy MedCPT cross-encoder>"
+# while handing the agent a fixture stub is lying at the one moment a person is
+# looking. The argument was right about the goal and wrong about the mechanism,
+# because delegating __repr__ means REPR TRIGGERS A BUILD:
+#
+#   * a debugger that renders locals, a logging call that formats the object, or
+#     a bare `medcpt_model` typed at a prompt now downloads and loads ~110 MB;
+#   * and having paid for it, prints transformers' multi-thousand-line module
+#     tree, which is not what anyone typing `medcpt_model` wanted to read;
+#   * worst, it happens on the DIAGNOSTIC path -- the moment someone is already
+#     confused -- so the tool used to inspect the state changes the state.
+#
+# A repr must be free of side effects. So the proxy asks these instead: what key
+# am I, and has anything answered for it yet. Both questions are answerable from
+# the two dicts, under the lock, with no factory call.
+#
+# THEY ARE DIAGNOSTIC, NOT AN ACCESS PATH. `peek()` returns the live object when
+# there is one, which makes it tempting as a "cheap get". It is not one: it
+# returns UNSET when nothing is built, so a caller using it as an accessor gets
+# a sentinel instead of a client and will not find out until it dereferences it.
+# Every real consumer inside the agent calls a typed accessor.
+
+RESOLVED_OVERRIDE = "override"
+RESOLVED_CACHED = "cached"
+RESOLVED_UNRESOLVED = "unresolved"
+
+RESOLUTION_STATES = (RESOLVED_OVERRIDE, RESOLVED_CACHED, RESOLVED_UNRESOLVED)
+"""Every value resolution_state() can return. Closed, so a caller can branch on
+it exhaustively."""
+
+
+def peek(key):
+    """The value `key` would answer with RIGHT NOW, or UNSET. NEVER builds.
+
+    Distinguishes "cached as None" from "nothing built" by returning the UNSET
+    sentinel for the latter -- MESH_FILTER is legitimately None, so a bare
+    ``is None`` test cannot separate the two.
+    """
+    if key not in OVERRIDE_KEYS:
+        raise KeyError(
+            f"unknown dependency override key {key!r}; valid keys are "
+            f"{', '.join(OVERRIDE_KEYS)}"
+        )
+    with _LOCK:
+        value = _OVERRIDES.get(key, UNSET)
+        if not isinstance(value, _Unset):
+            return value
+        return _CACHE.get(key, UNSET)
+
+
+def resolution_state(key):
+    """Whether `key` is answered by an override, by the cache, or not yet.
+
+    One of RESOLUTION_STATES. NEVER builds. This is the question __repr__ asks.
+    """
+    if key not in OVERRIDE_KEYS:
+        raise KeyError(
+            f"unknown dependency override key {key!r}; valid keys are "
+            f"{', '.join(OVERRIDE_KEYS)}"
+        )
+    with _LOCK:
+        if key in _OVERRIDES:
+            return RESOLVED_OVERRIDE
+        if key in _CACHE:
+            return RESOLVED_CACHED
+        return RESOLVED_UNRESOLVED
+
+
+def is_resolved(key):
+    """True when reading `key` would return without building. NEVER builds."""
+    return resolution_state(key) != RESOLVED_UNRESOLVED
+
+
+def cached_keys():
+    """Keys this process has BUILT, sorted. Excludes overrides, which were not
+    built by anyone here. Diagnostic; pairs with active_overrides()."""
+    with _LOCK:
+        return sorted(_CACHE)
+
+
+#------------------------------------------------------------------------------
 
 
 def _resolve(key, factory):
