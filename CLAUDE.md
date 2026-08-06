@@ -14,7 +14,7 @@ Files 01, 02 and 03 are different as of item 20c. They are now **re-export shims
 
 Files 01, 02, 03 (pass 20c-1), 08, 09, 10 (pass 20c-2a), 07, 14 (pass 20c-2b), 13 (pass 20c-2c), 05 (pass 20c-3a) and 20 (pass 20c-3b) are shims.
 
-**Files 04, 06, 11, 12 (pass 20c-3a) and 15, 16, 17, 25 (pass 20c-3b) are THIN ENTRY POINTS** — a `__main__` block, the imports it needs, and nothing else. They have **no exec bootstrap at all**: no `exec()` of Files 01/02/03, no `exec_chain`. That is allowed because nothing in the repository chains them, which was verified rather than assumed — every top-level name each of them defined was grepped against every `.py`, `.md`, `.toml` and `.yml` in the tree, and the only hits are prose in CLAUDE.md / `Exception and Fallback Audit.md`, Files 39 and 40 printing `python "04- FHIR Generate Data.py" --population 3000` as a suggested command, a comment in `02- Utility Functions.py` line 46 naming File 16, a comment in File 25 naming File 17's `_run_matching_pipeline`, and coincidental same-named locals elsewhere (`conn`, `cursor`, `_in`, `_out`, `df_cost`, `graph`, `bm25_index`, `print_summary`).
+**Files 04, 06, 11, 12 (pass 20c-3a), 15, 16, 17, 25 (pass 20c-3b) and 21 (pass 20c-3c-1) are THIN ENTRY POINTS** — a `__main__` block, the imports it needs, and nothing else. They have **no exec bootstrap at all**: no `exec()` of Files 01/02/03, no `exec_chain`. That is allowed because nothing in the repository chains them, which was verified rather than assumed — every top-level name each of them defined was grepped against every `.py`, `.md`, `.toml` and `.yml` in the tree, and the only hits are prose in CLAUDE.md / `Exception and Fallback Audit.md`, Files 39 and 40 printing `python "04- FHIR Generate Data.py" --population 3000` as a suggested command, a comment in `02- Utility Functions.py` line 46 naming File 16, a comment in File 25 naming File 17's `_run_matching_pipeline`, and coincidental same-named locals elsewhere (`conn`, `cursor`, `_in`, `_out`, `df_cost`, `graph`, `bm25_index`, `print_summary`).
 
 Two of those eight keep one re-exported name each, and both are load-bearing:
 
@@ -48,6 +48,11 @@ Two of those eight keep one re-exported name each, and both are load-bearing:
 | `oncotriage/api/server.py` | File 17 whole — `create_app`, `app`, the four endpoints | `agent.{deps,graph}`, `config`, `fhir.parser`, `storage.database_logger`, `utils` |
 | `oncotriage/monitoring/drift.py` | File 20 whole — KS / PSI / z-score, the ECOG threshold alert, `log_drift_metrics` | `paths`, `config` |
 | `oncotriage/batch/runner.py` | File 25 whole — checkpoint, the two thread pools, the summary | `paths`, `config`, `agent.{graph,retrieval,evaluation}`, `fhir.parser`, `storage.database_logger`, `utils` |
+| `oncotriage/dashboard/data.py` | File 21's three `@st.cache_data(ttl=60)` loaders | `paths` |
+| `oncotriage/dashboard/sidebar.py` | File 21's `render_sidebar` — filters, Refresh, CSV export | nothing from the project |
+| `oncotriage/dashboard/tiers.py` | `MATCH_TIERS`, `MATCH_TIER_COLORS`, the four `TRIAL_STATUS_*`, `classify_trial_score`, `enrich_match_tiers` | nothing at all |
+| `oncotriage/dashboard/app.py` | File 21's `main` — page config, sidebar, the nine tabs | `config`, `dashboard.{data,sidebar,tiers}`, `dashboard.tabs.*` |
+| `oncotriage/dashboard/tabs/*.py` | one `render_*_tab` each, nine of them | `dashboard.{data,tiers}`, `config`, `utils` |
 | `oncotriage/registries/primary_cancer.py` | `_resolve_primary_cancer` — which condition is THE cancer | `registries.cancer_code_registry` |
 | `oncotriage/agent/deps.py` | **the seam**: every client, model and registry, lazily resolved and overridable | `config`, `registries.*` |
 | `oncotriage/agent/state.py` | `TrialMatchState`, the channel / expansion-path / MeSH-filter vocabularies | nothing from the project |
@@ -298,7 +303,9 @@ does not invalidate the next.
 
 File 47's per-module import sweep (check 2c) runs one subprocess per package
 module through a `ThreadPoolExecutor`. Serially it took about nine minutes and
-the module count has gone 26 → 33 (pass 3a) → 42 (pass 3b); a test nobody runs
+the module count has gone 26 → 33 (pass 3a) → 42 (pass 3b) → **50** (pass 3c-1,
+which added thirteen dashboard modules, each of which imports streamlit in its
+own subprocess); a test nobody runs
 because it is slow protects nothing. A THREAD pool rather than a process pool is the right
 tool, not a compromise: each unit of work is already its own subprocess, so the
 parent thread spends its life blocked in `subprocess.run()` with the GIL
@@ -419,6 +426,90 @@ These three moved into the package in pass 20c-2a. The numbered files survive as
 
 It is an `RLock` because `log_inference` takes it and then calls `_ensure_database` → `initialize_database`, which take it again. `get_model_cost()` and the path resolution stay **outside** it: neither touches the database, and an unpriced model must reach the caller rather than be held behind database machinery.
 
+### The dashboard (pass 20c-3c-1)
+
+`21- Streamlit Dashboard.py` was 5,481 lines and is now a thin entry point over
+`oncotriage/dashboard/` — fifteen modules: `data`, `sidebar`, `tiers`, `app`,
+and one per tab under `tabs/`. **Nothing in the repository chained it or read a
+name out of it**, verified the same way as pass 3b: all 22 top-level names
+grepped against every `.py`, `.md`, `.toml` and `.yml`, with every hit inside
+File 21 itself, prose in a `.md`, or the `streamlit run` command. So it keeps
+**no re-export shim** — the first converted file that needed neither a shim nor
+a single re-exported name.
+
+**STREAMLIT RE-RUNS THE WHOLE SCRIPT ON EVERY INTERACTION, and that is why the
+exec bootstrap had to go.** `exec_chain` caches nothing — it opens and `exec()`s
+every file on every call — so every button, filter and tab click re-read and
+re-executed Files 01 and 02 and re-chained File 03. Because `03- Config.py`
+calls the client factories at shim load, **every interaction also constructed an
+OpenAI client and a Qdrant client**, for a dashboard that uses neither and never
+did. This was measured, not inferred: exec'ing the old File 21 emits Qdrant's
+version-mismatch warning, and the converted one does not.
+
+**The semantic change that buys is module-level state persisting across reruns
+instead of being rebuilt.** The dashboard has exactly two module-level mutable
+objects, `MATCH_TIERS` (list) and `MATCH_TIER_COLORS` (dict) in
+`dashboard/tiers.py`; everything else it binds at module level is a `str`, and
+everything it reads out of the package (`Project_Name`,
+`MAX_TRIALS_FOR_EVALUATION`, `inferences_path`) is immutable. Neither is
+mutated, the `tier_colors = MATCH_TIER_COLORS` alias in three tabs is never
+written through, and plotly leaves a `color_discrete_map` unchanged — all three
+measured. **Check 6a of File 47 re-derives it and carries a planted-mutation
+control** covering the three shapes it claims to cover (mutating method,
+subscript store, write through an alias), so a future edit that starts mutating
+either object fails rather than leaking into every later rerun for every user of
+that server.
+
+**The 60-second cache TTL is unaffected, and this rests on a fact about
+streamlit rather than about this project.** A cached function's identity in the
+cache is `md5(__module__, __qualname__, source)` — read out of
+`streamlit/runtime/caching/cache_utils.py:_make_function_key` — and **not the
+function object**. So the cache already survived reruns before this pass (had it
+keyed on identity, `ttl=60` would never have had anything to expire), and moving
+the loaders into a module changes only the `__module__` component: a different
+key, still stable, still 60 seconds, with one cold miss on first launch. Check
+6b asserts that against the installed streamlit, because if a future version
+keys on identity the dashboard silently stops caching — three full-table SQLite
+reads per widget interaction — and nothing else here would notice. Verified
+empirically too: stale at 30s and 58s, refreshed at 62s, and
+`st.cache_data.clear()` behind the sidebar's Refresh button empties the loaders
+**even though they now live in a different module than the button**, because it
+is a cache-wide clear.
+
+**`dashboard/data.py` reads `paths.inferences_path` inside each function body,
+never `from oncotriage.paths import inferences_path` at module scope.** A
+`from X import name` is an **attribute read**, so at module scope it fires the
+lazy resolver and globs the whole sibling data tree at import — the exact hole
+pass 20c-2c found in `registries/mesh.py`. **The three loaders were moved as
+they are and their SQL is untouched**; consolidating them into
+`oncotriage/storage/queries.py` is its own item, and mixing a relocation with a
+redesign is what makes an equivalence proof stop meaning anything.
+
+**Equivalence was proven by `ast.unparse` against `git show HEAD:`**, and it
+earned its keep immediately: the first extraction sliced from each function's
+`def` line, and **ast reports a decorated function's `lineno` at the `def`, not
+at the decorator**, so `@st.fragment` was silently dropped from four tabs — a
+real behaviour change, since a fragment re-runs in isolation and without it
+every interaction in those tabs re-runs the whole app. The extractor derives its
+spans from `min(decorator linenos + def lineno)` now and asserts contiguity.
+Final state: **19 of 22 definitions byte-identical after `ast.unparse`, 3
+differing, all three the same one-line `inferences_path` → `paths.inferences_path`
+change.** The rendered output was compared too — the original and the package
+render identical element counts and identical label/value pairs across all 9
+tabs, 118 metrics, 48 subheaders and 18 dataframes, with zero exceptions.
+
+Section 6 of `47- Package Split Test.py` is separate from section 2 **on
+purpose**. Section 2 asserts no model-bearing library arrives and **streamlit is
+on that list** — it is what says importing the agent does not drag the dashboard
+in. The dashboard's modules import streamlit at module scope because every
+render function needs it, so they get their own trap run with streamlit and
+plotly pre-imported (the same allowance section 2 makes for matplotlib and
+seaborn), and with torch / transformers / icd10 still forbidden.
+
+`oncotriage.dashboard.tabs.reproducibility` is ~1,450 lines because it is **one
+function**; the tab boundary is the finest cut available without restructuring
+it, which is a redesign. Breaking it up is its own item.
+
 ### Index lifecycle (Qdrant)
 
 `COLLECTION_NAME = "trial_criteria"` is an **alias**, never a collection. `oncotriage/retrieval/indexer.py` (entry point `11-`) builds into a timestamped staging collection (`trial_criteria_20260226_140159`), creates payload indexes, then `swap_alias_atomic()` in a single `update_collection_aliases` call (zero downtime), then `cleanup_old_collections()`. Use `resolve_qdrant_collection()` (`oncotriage/utils.py`, re-exported by file 02) whenever the *real* collection name is needed for logging — it retries and falls back gracefully. File 02's wrapper hands it the shared namespace's `qdrant_client`, so a fixture proxy or a test stub is what it talks to.
@@ -437,7 +528,7 @@ It is an `RLock` because `log_inference` takes it and then calls `_ensure_databa
 
 `_resolve_primary_cancer` lives in **`oncotriage/registries/primary_cancer.py`** as of pass 20c-2c, and both the agent's three terminal nodes and the storage logger import it from there. Pass 2b had already stopped it reading File 13's `_CANCER_REGISTRY` global — a layering violation that left it raising `NameError` in any chain loading 14 without 13 — in favour of `load_registry()`. Pass 2c finished the job: while the function lived in the storage module, the *agent* depended on the *storage* layer for a registry lookup. **`38- Birth Date and Demographics Parser Test.py` section 9b is the only place that exercises it**, because File 38 is the only chain in the repository that loads 14 without 13; it calls the function directly on a stub condition list and asserts a real diagnosis comes back, having first asserted the result is not `None` (which an empty registry filter also returns).
 
-`21- Streamlit Dashboard.py` (~5.2k lines) reads only from `inferences.db` via `@st.cache_data(ttl=60)`.
+`oncotriage/dashboard/` (thin entry point: `21- Streamlit Dashboard.py`) reads only from `inferences.db`, via the three `@st.cache_data(ttl=60)` loaders in `dashboard/data.py`. See "The dashboard (pass 20c-3c-1)" above.
 
 **Cost accounting fails loudly.** Costs come from `get_model_cost()` (`oncotriage/utils.py`, re-exported by file 02) against `PRICING_CONFIG` in `oncotriage/config.py`, dated `last_updated`. A model absent from that table raises `UnknownModelPricingError` (a `RuntimeError` subclass — deliberately *not* a `KeyError`, so a stray `except KeyError` cannot eat it); it does not return 0.0, because a zero cost row is indistinguishable from a genuinely free run and every aggregate over the column silently under-reports. Both writers — `log_inference` (14) and `log_ablation_result` (26) — call it **before** their `try` block for exactly this reason: their broad `except` exists to keep a database failure from killing the pipeline, and an unpriced model is a config defect that must reach the caller instead. If you add a model, add its pricing first; never wrap `get_model_cost()` in a recovery path.
 

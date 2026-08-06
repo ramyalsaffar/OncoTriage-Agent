@@ -925,7 +925,11 @@ check("the package file list is non-empty and covers all six subpackages",
       and any(f.endswith("storage/database_logger.py") for f in _PKG_FILES)
       and any(f.endswith("agent/deps.py") for f in _PKG_FILES)
       and any(f.endswith("retrieval/indexer.py") for f in _PKG_FILES)
-      and any(f.endswith("embedding.py") for f in _PKG_FILES),
+      and any(f.endswith("embedding.py") for f in _PKG_FILES)
+      # Pass 20c-3c-1: the dashboard. Named here so the two subpackages cannot
+      # vanish from the tree without this scan noticing.
+      and any(f.endswith("dashboard/data.py") for f in _PKG_FILES)
+      and any(f.endswith("dashboard/tabs/reproducibility.py") for f in _PKG_FILES),
       True)
 
 # EVERY SUBPACKAGE MUST BE DECLARED IN pyproject.toml. setuptools does not
@@ -944,9 +948,18 @@ _SUBPACKAGE_DIRS = sorted(
 check("the tree has the subpackages this pass expects (non-degeneracy)",
       _SUBPACKAGE_DIRS,
       # api, batch and monitoring are new in pass 20c-3b -- the serving layer.
+      # dashboard is new in pass 20c-3c-1. NOTE that this listdir is one level
+      # deep, so oncotriage.dashboard.tabs is NOT in it; the pyproject check
+      # below would therefore never look at it, which is why it is asserted
+      # separately -- setuptools does not recurse, so a nested subpackage
+      # missing from pyproject ships a dashboard with no tabs in a built wheel.
       ["oncotriage.agent", "oncotriage.api", "oncotriage.batch",
-       "oncotriage.extraction", "oncotriage.fhir", "oncotriage.monitoring",
-       "oncotriage.registries", "oncotriage.retrieval", "oncotriage.storage"])
+       "oncotriage.dashboard", "oncotriage.extraction", "oncotriage.fhir",
+       "oncotriage.monitoring", "oncotriage.registries", "oncotriage.retrieval",
+       "oncotriage.storage"])
+check("the NESTED subpackage oncotriage.dashboard.tabs is declared too "
+      "(setuptools does not recurse into a listed package)",
+      '"oncotriage.dashboard.tabs"' in _PYPROJECT, True)
 check("every subpackage on disk is declared in pyproject.toml, so a built "
       "wheel carries it",
       sorted(p for p in _SUBPACKAGE_DIRS if f'"{p}"' not in _PYPROJECT), [])
@@ -1472,6 +1485,32 @@ for _added in ("oncotriage.storage.maintenance", "oncotriage.storage.queries",
                "oncotriage.batch.runner"):
     check(f"...and covers {_added} (new in pass 20c-3b)",
           _added in _ALL_PKG_MODULES, True)
+
+# Pass 20c-3c-1's thirteen. dashboard.data is the one that matters most here:
+# it is the module that reads inferences.db, and the whole reason it says
+# `paths.inferences_path` inside each function body rather than importing the
+# name at module scope is so that THIS sweep -- run with the project root
+# pointed at a directory that does not exist -- passes. A `from
+# oncotriage.paths import inferences_path` there is an ATTRIBUTE read, which
+# fires the lazy resolver at import; that is the exact defect pass 20c-2c found
+# one module over in registries/mesh.py.
+_DASHBOARD_MODULES = [
+    "oncotriage.dashboard.app",
+    "oncotriage.dashboard.data",
+    "oncotriage.dashboard.sidebar",
+    "oncotriage.dashboard.tiers",
+    "oncotriage.dashboard.tabs.cost_tokens",
+    "oncotriage.dashboard.tabs.demographics",
+    "oncotriage.dashboard.tabs.drift",
+    "oncotriage.dashboard.tabs.match_quality",
+    "oncotriage.dashboard.tabs.overview",
+    "oncotriage.dashboard.tabs.patient_explorer",
+    "oncotriage.dashboard.tabs.performance",
+    "oncotriage.dashboard.tabs.reproducibility",
+    "oncotriage.dashboard.tabs.trial_explorer",
+]
+check("...and covers all thirteen dashboard modules (new in pass 20c-3c-1)",
+      sorted(m for m in _DASHBOARD_MODULES if m not in _ALL_PKG_MODULES), [])
 
 _PER_MODULE_PROBE = (
     "import json, sys\n"
@@ -3295,6 +3334,499 @@ else:
           _payload.get("real_model_rejected"), True)
     check("resolve_qdrant_collection asks the namespace's client",
           _payload.get("resolved"), "trial_criteria_19700101_000000")
+
+
+# ===========================================================================
+# 6. THE DASHBOARD (pass 20c-3c-1)
+# ===========================================================================
+
+print("\n" + "=" * 78)
+print("6. the dashboard: mutable state, the cache contract, and import purity")
+print("=" * 78)
+
+# WHY THE DASHBOARD NEEDS CHECKS OF ITS OWN.
+#
+# STREAMLIT RE-RUNS THE WHOLE SCRIPT ON EVERY INTERACTION. Before this pass,
+# "21- Streamlit Dashboard.py" exec'd Files 01 and 02 and chained File 03 at the
+# top, and exec_chain caches NOTHING -- it opens and exec()s every file on every
+# call. So every button, every filter and every tab click re-read and
+# re-executed all three, and because "03- Config.py" calls the client factories
+# at shim load, every one of them also constructed an OpenAI client and a Qdrant
+# client for a dashboard that uses neither.
+#
+# Moving the code into modules means each body runs ONCE per process. That is a
+# large improvement and it is also a semantic change: module-level mutable state
+# now persists across reruns instead of being rebuilt from scratch each time.
+# The checks below are the ones that make that change safe rather than merely
+# hoped for.
+
+_DASH_DIR = os.path.join(_PKG_DIR, "dashboard")
+_TIERS_PY = os.path.join(_DASH_DIR, "tiers.py")
+_DATA_PY = os.path.join(_DASH_DIR, "data.py")
+
+
+# --- 6a. the tier vocabulary is never mutated ------------------------------
+#
+# MATCH_TIERS (a list) and MATCH_TIER_COLORS (a dict) are the ONLY module-level
+# mutable objects the dashboard defines or touches. Everything else it binds at
+# module level is a str, and everything it reads out of the package
+# (Project_Name, MAX_TRIALS_FOR_EVALUATION, inferences_path) is immutable.
+#
+# Under the old bootstrap both were rebuilt on every rerun, so a mutation would
+# have been erased before the next click and could not accumulate. As modules
+# they live for the life of the process, and a mutation would leak into every
+# subsequent rerun for every user of that server. Nothing mutates them today.
+# This check is what makes that a property rather than an accident.
+
+_MUTATORS = ("append", "extend", "insert", "remove", "pop", "clear", "update",
+             "setdefault", "sort", "reverse", "popitem")
+
+
+def _mutations_of(paths, targets):
+    """Every write THROUGH one of `targets` in `paths`.
+
+    Catches three shapes: a subscript store (``X[k] = v``), a mutating method
+    call (``X.update(...)``), and a subscript delete. Aliases are followed one
+    hop -- ``tier_colors = MATCH_TIER_COLORS`` appears in three tabs, and a
+    write through the alias is a write through the object.
+    """
+    found = []
+    for path in paths:
+        tree = ast.parse(open(path, encoding="utf-8").read())
+        watched = set(targets)
+        # one alias hop: any local bound DIRECTLY to a watched name
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Name)
+                    and node.value.id in targets):
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Name):
+                        watched.add(tgt.id)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AugAssign, ast.Delete)):
+                tgts = (node.targets if isinstance(node, (ast.Assign, ast.Delete))
+                        else [node.target])
+                for tgt in tgts:
+                    if (isinstance(tgt, ast.Subscript)
+                            and isinstance(tgt.value, ast.Name)
+                            and tgt.value.id in watched):
+                        found.append(f"{os.path.basename(path)}:{node.lineno} "
+                                     f"{ast.unparse(node)[:60]}")
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in _MUTATORS
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in watched):
+                found.append(f"{os.path.basename(path)}:{node.lineno} "
+                             f"{ast.unparse(node)[:60]}")
+    return sorted(found)
+
+
+_DASH_FILES = sorted(
+    os.path.join(root, name)
+    for root, _dirs, files in os.walk(_DASH_DIR)
+    for name in files
+    if name.endswith(".py") and "__pycache__" not in root
+)
+check("the dashboard has the fifteen modules this pass created "
+      "(non-degeneracy: a scan over an empty file list proves nothing)",
+      len(_DASH_FILES), 15)
+
+_TIER_NAMES = ("MATCH_TIERS", "MATCH_TIER_COLORS")
+check("nothing in the dashboard mutates MATCH_TIERS or MATCH_TIER_COLORS, "
+      "directly or through an alias",
+      _mutations_of(_DASH_FILES, _TIER_NAMES), [])
+
+# NON-DEGENERATE, and this is the part that matters: "[] mutations" is also what
+# a scanner that looks at nothing returns. A COPY of the tree gets one write of
+# each shape planted into it, and the same scanner must find all three. Mutating
+# a copy rather than the shipped file is the rule CLAUDE.md sets out, and it
+# means a crash here cannot leave the package edited.
+_MUT_DIR = tempfile.mkdtemp(prefix="oncotriage-tiermut-")
+try:
+    _mut_copy = os.path.join(_MUT_DIR, "dashboard")
+    shutil.copytree(_DASH_DIR, _mut_copy,
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    _planted = os.path.join(_mut_copy, "tiers.py")
+    _src = open(_planted, encoding="utf-8").read()
+    _src += (
+        "\n\ndef _planted_defect():\n"
+        "    MATCH_TIERS.append('Sixth Tier')\n"          # mutating method
+        "    MATCH_TIER_COLORS['Full Match'] = '#000000'\n"  # subscript store
+        "    alias = MATCH_TIER_COLORS\n"
+        "    alias.update({'No Match': '#ffffff'})\n"     # write through alias
+    )
+    open(_planted, "w", encoding="utf-8").write(_src)
+    _caught = _mutations_of([_planted], _TIER_NAMES)
+    check("...and the scanner CATCHES a planted mutation of each of the three "
+          "shapes it claims to cover (method, subscript, alias)",
+          len(_caught), 3)
+finally:
+    shutil.rmtree(_MUT_DIR, ignore_errors=True)
+
+check("the tiers module still holds the tier vocabulary the tabs import "
+      "(non-degeneracy for the scan above)",
+      all(n in open(_TIERS_PY, encoding="utf-8").read()
+          for n in _TIER_NAMES + ("classify_trial_score", "enrich_match_tiers")),
+      True)
+
+
+# --- 6b. the @st.cache_data contract ---------------------------------------
+#
+# @st.cache_data used to be APPLIED AFRESH on every rerun, because the whole
+# script re-executed; it is now applied once, at import. The 60-second TTL is
+# unchanged by that, and the reason is a fact about streamlit rather than about
+# this project: a cached function's identity in the cache is
+#
+#     md5(func.__module__, func.__qualname__, inspect.getsource(func))
+#
+# -- streamlit/runtime/caching/cache_utils.py:_make_function_key -- and NOT the
+# function OBJECT. So the cache already survived reruns before this pass (had it
+# keyed on identity, ttl=60 would never have had anything to expire), and moving
+# the loaders into a module changes only the __module__ component: a different
+# key, still stable, still 60 seconds, with one cold miss on the first launch.
+#
+# This is asserted against the INSTALLED streamlit rather than trusted, because
+# the whole argument for "the TTL still behaves as it did" rests on it. If a
+# future streamlit keys on identity, the dashboard silently stops caching --
+# three SQLite reads of the full inferences table on every widget interaction --
+# and nothing else in this repository would notice.
+_CACHE_KEY_PROBE = r"""
+import inspect, json
+from streamlit.runtime.caching import cache_utils
+src = inspect.getsource(cache_utils._make_function_key)
+print(json.dumps({
+    "keys_on_module":   "__module__" in src,
+    "keys_on_qualname": "__qualname__" in src,
+    "keys_on_source":   "getsource" in src,
+    "keys_on_id":       "id(func)" in src,
+}))
+"""
+_rc, _out, _err = _run(_CACHE_KEY_PROBE, cwd=_ELSEWHERE, extra_path=_FALLBACK_PATH)
+check("the streamlit cache-key probe ran", _rc, 0)
+if _rc == 0:
+    check("streamlit keys a cached function on (module, qualname, source) and "
+          "NOT on the function object's identity, which is what makes the "
+          "60s TTL survive the move into a module",
+          _last_json(_out),
+          {"keys_on_module": True, "keys_on_qualname": True,
+           "keys_on_source": True, "keys_on_id": False})
+else:
+    fail("streamlit cache-key probe",
+         f"exit {_rc}; stderr tail: {_err.strip().splitlines()[-3:]}")
+
+# The three loaders must still CARRY the decorator, with the same TTL. An
+# equivalence proof over ast.unparse would catch a dropped decorator on a
+# function it compares -- and that is exactly how the decorator loss on four
+# @st.fragment tabs was found while this pass was being written -- but this
+# states the TTL itself, which no diff against the original would flag if
+# someone later "tuned" it.
+_data_tree = ast.parse(open(_DATA_PY, encoding="utf-8").read())
+_decorated = {
+    node.name: [ast.unparse(d) for d in node.decorator_list]
+    for node in _data_tree.body if isinstance(node, ast.FunctionDef)
+}
+check("all three loaders carry @st.cache_data(ttl=60), unchanged",
+      _decorated,
+      {"load_inferences_data": ["st.cache_data(ttl=60)"],
+       "load_trial_matches_data": ["st.cache_data(ttl=60)"],
+       "load_drift_metrics_data": ["st.cache_data(ttl=60)"]})
+
+# THE REFRESH BUTTON STILL REACHES THE LOADERS, WHICH NOW LIVE IN ANOTHER
+# MODULE. st.cache_data.clear() is a CACHE-wide clear, not a per-function one --
+# `render_sidebar` is in oncotriage.dashboard.sidebar and the three loaders are
+# in oncotriage.dashboard.data, and before this pass they shared one namespace.
+_sidebar_src = open(os.path.join(_DASH_DIR, "sidebar.py"), encoding="utf-8").read()
+check("the sidebar's Refresh button still calls the cache-wide clear",
+      "st.cache_data.clear()" in _sidebar_src and "st.rerun()" in _sidebar_src,
+      True)
+_CLEAR_PROBE = r"""
+import json, streamlit as st
+print(json.dumps({
+    # A bound method on the cache object, not a per-function attribute: it
+    # empties every @st.cache_data entry in the process whatever module
+    # defined the function.
+    "clear_is_callable": callable(st.cache_data.clear),
+    "per_function_clear_also_exists": callable(
+        getattr(st.cache_data, "clear", None)),
+}))
+"""
+_rc, _out, _err = _run(_CLEAR_PROBE, cwd=_ELSEWHERE, extra_path=_FALLBACK_PATH)
+if _rc == 0:
+    check("st.cache_data.clear() is a cache-wide clear, so it reaches loaders "
+          "defined in a different module than the button",
+          (_last_json(_out) or {}).get("clear_is_callable"), True)
+else:
+    fail("cache clear probe", f"exit {_rc}")
+
+
+# --- 6c. importing the dashboard touches nothing ---------------------------
+#
+# SEPARATE FROM SECTION 2, AND DELIBERATELY SO. Section 2 asserts that no
+# model-bearing library arrives, and STREAMLIT IS ON THAT LIST -- it is there to
+# say that importing the agent does not drag the dashboard in. The dashboard's
+# own modules import streamlit at module scope because every render function
+# needs it, so folding them into section 2 would have meant deleting streamlit
+# from that list and weakening a claim that is worth keeping. They get their own
+# trap run instead, with streamlit and plotly pre-imported for the same reason
+# section 2 pre-imports matplotlib and seaborn for oncotriage.fhir.explore, and
+# with torch / transformers / icd10 still forbidden.
+_DASHBOARD_PURITY = r"""
+import builtins, io, json, socket, sqlite3, sys
+
+import numpy, pandas                                                      # noqa: F401
+import openai, qdrant_client, dotenv, httpx, tenacity, caffeine           # noqa: F401
+# The dashboard's module-scope third-party dependencies. streamlit reads its
+# config file and plotly loads its package data at import; neither is this
+# package's doing, which is the same allowance section 2 makes for matplotlib.
+import streamlit, plotly.express, plotly.graph_objects, plotly.subplots    # noqa: F401
+
+
+class Blocked(RuntimeError):
+    pass
+
+
+_real_socket = socket.socket
+
+
+class BlockedSocket(_real_socket):
+    def __init__(self, *args, **kwargs):
+        raise Blocked("socket.socket() was constructed")
+
+
+def _blocked(*args, **kwargs):
+    raise Blocked("a blocked call was made")
+
+
+socket.socket = BlockedSocket
+socket.create_connection = _blocked
+sqlite3.connect = _blocked
+builtins.open = _blocked
+io.open = _blocked
+
+import oncotriage.paths as _p
+import oncotriage.dashboard
+import oncotriage.dashboard.data
+import oncotriage.dashboard.sidebar
+import oncotriage.dashboard.tiers
+import oncotriage.dashboard.app
+import oncotriage.dashboard.tabs
+import oncotriage.dashboard.tabs.overview
+import oncotriage.dashboard.tabs.performance
+import oncotriage.dashboard.tabs.cost_tokens
+import oncotriage.dashboard.tabs.demographics
+import oncotriage.dashboard.tabs.patient_explorer
+import oncotriage.dashboard.tabs.match_quality
+import oncotriage.dashboard.tabs.trial_explorer
+import oncotriage.dashboard.tabs.drift
+import oncotriage.dashboard.tabs.reproducibility
+
+heavy = [m for m in ("torch", "transformers", "sentence_transformers", "icd10")
+         if m in sys.modules]
+
+armed = {}
+for _name, _fn, _args in (("socket", socket.socket, (socket.AF_INET, socket.SOCK_STREAM)),
+                          ("sqlite3", sqlite3.connect, (":memory:",)),
+                          ("open", builtins.open, ("/oncotriage-trap-probe",)),
+                          ("io.open", io.open, ("/oncotriage-trap-probe",))):
+    try:
+        _fn(*_args)
+        armed[_name] = False
+    except Blocked:
+        armed[_name] = True
+
+print(json.dumps({"heavy": heavy, "armed": armed,
+                  "resolved": sorted(_p._RESOLVED)}))
+"""
+
+_rc, _out, _err = _run(_DASHBOARD_PURITY, cwd=_ELSEWHERE, extra_path=_FALLBACK_PATH)
+check("all fifteen dashboard modules import with open, io.open, socket.socket, "
+      "socket.create_connection and sqlite3.connect patched to raise", _rc, 0)
+if _rc != 0:
+    fail("dashboard import purity",
+         f"exit {_rc}; stderr tail: {_err.strip().splitlines()[-4:]}")
+else:
+    _payload = _last_json(_out) or {}
+    check("every trap was ARMED after the dashboard imports",
+          _payload.get("armed"),
+          {"socket": True, "sqlite3": True, "open": True, "io.open": True})
+    check("importing the dashboard loads no model-bearing library",
+          _payload.get("heavy"), [])
+    # THE ONE THAT MATTERS FOR data.py. Reading inferences_path at module scope
+    # would resolve the sibling data tree at import; reading it inside the
+    # function body resolves it on first call.
+    check("importing the dashboard resolves NO path -- data.py reads "
+          "paths.inferences_path inside the function body, not at module scope",
+          _payload.get("resolved"), [])
+
+
+# --- 6d. the three loaders read the path lazily and their SQL is unchanged --
+#
+# The path is the ONE thing this pass was allowed to change in the loaders, and
+# the SQL is the thing it was specifically not allowed to change. Both are
+# stated here so a later edit that "tidies" either one goes red.
+# READ THE AST, NOT THE TEXT. data.py's docstring EXPLAINS the rule by quoting
+# the very line it must not contain ("from oncotriage.paths import
+# inferences_path"), so a substring scan reports the module as violating the
+# rule its own documentation is stating. That is not a hypothetical: the first
+# version of this check was a substring scan and it went red on a correct
+# module. The same trap caught check 6e below.
+_data_imports = [
+    (node.module, sorted(a.name for a in node.names))
+    for node in _data_tree.body if isinstance(node, ast.ImportFrom)
+]
+check("data.py does NOT import inferences_path by name (that would be an "
+      "attribute read, and would resolve the tree at import)",
+      [m for m, names in _data_imports
+       if m == "oncotriage.paths" or "inferences_path" in names],
+      [])
+check("...it imports the paths MODULE instead",
+      ("oncotriage", ["paths"]) in _data_imports, True)
+_data_src = open(_DATA_PY, encoding="utf-8").read()
+check("...and all three loaders read the attribute at call time",
+      _data_src.count("sqlite3.connect(paths.inferences_path)"), 3)
+
+_SQL = sorted(
+    node.args[0].value
+    for node in ast.walk(_data_tree)
+    if isinstance(node, ast.Call)
+    and isinstance(node.func, ast.Attribute)
+    and node.func.attr == "read_sql_query"
+    and node.args and isinstance(node.args[0], ast.Constant)
+)
+check("the three loaders' SQL is byte-for-byte what File 21 had",
+      _SQL,
+      ["SELECT * FROM drift_metrics ORDER BY timestamp DESC",
+       "SELECT * FROM inferences",
+       "SELECT * FROM trial_matches"])
+
+
+# --- 6e. File 21 is a thin entry point -------------------------------------
+#
+# Nothing in the repository chains it or reads a name out of it: every top-level
+# name it bound was grepped against every .py, .md, .toml and .yml in the tree
+# and every hit is inside File 21 itself, prose in a .md, or the `streamlit run`
+# command in docker-compose.yml. So it keeps NO re-export shim -- unlike File 05
+# (File 34 chains it), File 13 and File 20 (File 41 chains it).
+_F21 = open(os.path.join(_code_dir, "21- Streamlit Dashboard.py"),
+            encoding="utf-8").read()
+_f21_tree = ast.parse(_F21)
+# BY AST, for the same reason as check 6d: File 21's docstring explains at
+# length that the exec bootstrap is gone and why, so it necessarily contains the
+# words "exec()" and "exec_chain". A substring scan calls that a violation. The
+# question is whether the file CALLS either one, which only the AST answers.
+_f21_calls = sorted({
+    node.func.id for node in ast.walk(_f21_tree)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    and node.func.id in ("exec", "exec_chain")
+})
+check("File 21 calls neither exec() nor exec_chain()", _f21_calls, [])
+# ...and reads neither name at all, which also rules out `f = exec` or passing
+# exec_chain somewhere. Names, not text.
+_f21_names = sorted({
+    node.id for node in ast.walk(_f21_tree)
+    if isinstance(node, ast.Name) and node.id in ("exec", "exec_chain")
+})
+check("...and does not reference either name in any other position",
+      _f21_names, [])
+check("File 21 binds no function of its own",
+      sorted(n.name for n in _f21_tree.body if isinstance(n, ast.FunctionDef)), [])
+_f21_imports = sorted(
+    f"{node.module}.{a.name}" for node in ast.walk(_f21_tree)
+    if isinstance(node, ast.ImportFrom) for a in node.names
+)
+check("File 21 imports main from the package",
+      "oncotriage.dashboard.app.main" in _f21_imports, True)
+check("...and guards the call, so reading the file still does nothing",
+      any(isinstance(n, ast.If)
+          and "__name__" in ast.unparse(n.test)
+          and "__main__" in ast.unparse(n.test)
+          for n in _f21_tree.body), True)
+# docker-compose runs `streamlit run "21- Streamlit Dashboard.py"`. That command
+# is unchanged by this pass and must stay that way; the file being a valid
+# script under that exact invocation is what makes the container keep working.
+_COMPOSE = open(os.path.join(_code_dir, "docker-compose.yml"), encoding="utf-8").read()
+check("docker-compose still launches the dashboard by the same command",
+      'streamlit run "21- Streamlit Dashboard.py"' in _COMPOSE, True)
+
+
+# --- 6f. every name File 21 used to bind still exists ----------------------
+#
+# Pinned at the commit before this pass, extracted by exec'ing the original into
+# a throwaway namespace and subtracting the base chain (01 -> 02 -> 03) -- the
+# same method the other inventories in this file use. Written down rather than
+# recomputed from HEAD, because the point is to pin what the surface WAS.
+#
+# The three bootstrap leftovers -- _bootstrap, _code_dir, _fh -- are deliberately
+# absent: they were exec-chain scaffolding, they are private, and nothing read
+# them. Everything else must still be reachable.
+_PRE_3C_F21_NAMES = [
+    "MATCH_TIERS", "MATCH_TIER_COLORS",
+    "TRIAL_STATUS_FULL", "TRIAL_STATUS_PARTIAL", "TRIAL_STATUS_REJECTED",
+    "TRIAL_STATUS_UNCONFIRMED",
+    "classify_trial_score", "enrich_match_tiers",
+    "load_drift_metrics_data", "load_inferences_data", "load_trial_matches_data",
+    "main",
+    "render_cost_tokens_tab", "render_drift_detection_tab",
+    "render_match_quality_tab", "render_overview_tab",
+    "render_patient_demographics_tab", "render_patient_explorer_tab",
+    "render_performance_tab", "render_reproducibility_tab",
+    "render_sidebar", "render_trial_explorer_tab",
+]
+check("the recorded File 21 name list is the size it was extracted at",
+      len(_PRE_3C_F21_NAMES), 22)
+
+_F21_SURFACE_PROBE = r"""
+import importlib, json, sys
+wanted = json.loads(sys.argv[1])
+missing = []
+for name, module_name in wanted.items():
+    module = importlib.import_module(module_name)
+    if not hasattr(module, name):
+        missing.append(module_name + "." + name)
+print(json.dumps({"missing": missing, "checked": len(wanted)}))
+"""
+_F21_HOMES = {
+    "MATCH_TIERS": "oncotriage.dashboard.tiers",
+    "MATCH_TIER_COLORS": "oncotriage.dashboard.tiers",
+    "TRIAL_STATUS_FULL": "oncotriage.dashboard.tiers",
+    "TRIAL_STATUS_PARTIAL": "oncotriage.dashboard.tiers",
+    "TRIAL_STATUS_REJECTED": "oncotriage.dashboard.tiers",
+    "TRIAL_STATUS_UNCONFIRMED": "oncotriage.dashboard.tiers",
+    "classify_trial_score": "oncotriage.dashboard.tiers",
+    "enrich_match_tiers": "oncotriage.dashboard.tiers",
+    "load_drift_metrics_data": "oncotriage.dashboard.data",
+    "load_inferences_data": "oncotriage.dashboard.data",
+    "load_trial_matches_data": "oncotriage.dashboard.data",
+    "main": "oncotriage.dashboard.app",
+    "render_sidebar": "oncotriage.dashboard.sidebar",
+    "render_overview_tab": "oncotriage.dashboard.tabs.overview",
+    "render_performance_tab": "oncotriage.dashboard.tabs.performance",
+    "render_cost_tokens_tab": "oncotriage.dashboard.tabs.cost_tokens",
+    "render_patient_demographics_tab": "oncotriage.dashboard.tabs.demographics",
+    "render_patient_explorer_tab": "oncotriage.dashboard.tabs.patient_explorer",
+    "render_match_quality_tab": "oncotriage.dashboard.tabs.match_quality",
+    "render_trial_explorer_tab": "oncotriage.dashboard.tabs.trial_explorer",
+    "render_drift_detection_tab": "oncotriage.dashboard.tabs.drift",
+    "render_reproducibility_tab": "oncotriage.dashboard.tabs.reproducibility",
+}
+check("...and every one of them has a recorded home in the package",
+      sorted(_F21_HOMES), sorted(_PRE_3C_F21_NAMES))
+
+_rc, _out, _err = _run(
+    _F21_SURFACE_PROBE.replace('sys.argv[1]', repr(json.dumps(_F21_HOMES))),
+    cwd=_ELSEWHERE, extra_path=_FALLBACK_PATH)
+check("the File 21 surface probe ran", _rc, 0)
+if _rc == 0:
+    _payload = _last_json(_out) or {}
+    check("every name File 21 bound before this pass is still exported by the "
+          "module that now owns it", _payload.get("missing"), [])
+    check("...over all 22 names (a probe over an empty set proves nothing)",
+          _payload.get("checked"), 22)
+else:
+    fail("File 21 surface probe",
+         f"exit {_rc}; stderr tail: {_err.strip().splitlines()[-4:]}")
+
+
+#------------------------------------------------------------------------------
 
 
 shutil.rmtree(_ELSEWHERE, ignore_errors=True)

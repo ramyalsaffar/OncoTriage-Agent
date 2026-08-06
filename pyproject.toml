@@ -55,4 +55,9 @@ packages = [
     "oncotriage.api",
     "oncotriage.monitoring",
     "oncotriage.batch",
+    # Pass 20c-3c-1: the Streamlit dashboard. BOTH levels have to be listed --
+    # setuptools does not recurse into a listed package, so declaring only
+    # "oncotriage.dashboard" would ship a wheel whose dashboard has no tabs.
+    "oncotriage.dashboard",
+    "oncotriage.dashboard.tabs",
 ]

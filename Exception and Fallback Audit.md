@@ -276,9 +276,9 @@ inference path; the rest are in tooling, dashboards, or tests.
 
 | Location | Verdict |
 |---|---|
-| `21- Streamlit Dashboard.py:1240, 1388` | **Acceptable.** Optional plot annotations; failing to draw a callout must not take down the chart. |
+| `oncotriage/dashboard/tabs/performance.py:388, 504` | **Acceptable.** Optional plot annotations; failing to draw a callout must not take down the chart. |
 | `39- ECOG Performance Status Surfacing Test.py:126, 130` | **Acceptable.** `check_raises()`'s own harness: both branches increment `_RESULTS` and print, so they are `RECORDED+LOGGED`, not silent. Listed here only because the file is new. |
-| `21- Streamlit Dashboard.py:2556, 2638, 4795, 5022, 5155` | **Open — low.** Malformed `criterion_details` JSON is treated as "no criteria", so a parse failure and a genuinely empty criteria list render identically. A per-page count of unparseable rows would separate them. Read-only display, no effect on stored data. |
+| `oncotriage/dashboard/tabs/patient_explorer.py:281, 363`, `oncotriage/dashboard/tabs/reproducibility.py:973, 1210, 1333` | **Open — low.** Malformed `criterion_details` JSON is treated as "no criteria", so a parse failure and a genuinely empty criteria list render identically. A per-page count of unparseable rows would separate them. Read-only display, no effect on stored data. |
 
 ---
 
@@ -424,7 +424,7 @@ Per file, handlers / of which silent:
 | `17- FastAPI Server.py` | 5 | 0 |
 | `19- FastAPI Server Batch Test.py` | 2 | 0 |
 | `20- Drift Detection.py` | 19 | 1 |
-| `21- Streamlit Dashboard.py` | 11 | 7 |
+| `oncotriage/dashboard/` (was `21- Streamlit Dashboard.py`) | 11 | 7 |
 | `22- Airflow Database.py` | 2 | 0 |
 | `24- Airflow Manager.py` | 4 | 1 |
 | `25- Batch Runner.py` | 13 | 3 |
@@ -563,17 +563,17 @@ task.
 | `20- Drift Detection.py` | 914 | `Exception` | LOGGED | `print(f"⚠ Database logging failed (non-critical): {e}")` |
 | `20- Drift Detection.py` | 1025 | `ValueError` | LOGGED | `print(f"\n✗ Drift detection cannot run: {e}") \| print("\nTo enable drift detection:") \| print("1. Ru...` |
 | `20- Drift Detection.py` | 1032 | `Exception` | LOGGED | `print(f"\n✗ Drift detection failed: {e}") \| traceback.print_exc()` |
-| `21- Streamlit Dashboard.py` | 58 | `Exception` | LOGGED | `st.error(f"Database error: {e}") \| return pd.DataFrame()` |
-| `21- Streamlit Dashboard.py` | 80 | `Exception` | LOGGED | `st.error(f"Database error: {e}") \| return pd.DataFrame()` |
-| `21- Streamlit Dashboard.py` | 105 | `Exception` | LOGGED | `st.error(f"Drift metrics error: {e}") \| return pd.DataFrame()` |
-| `21- Streamlit Dashboard.py` | 1240 | `Exception` | SILENT | `pass` |
-| `21- Streamlit Dashboard.py` | 1388 | `Exception` | SILENT | `pass` |
-| `21- Streamlit Dashboard.py` | 1581 | `UnknownModelPricingError` | LOGGED | `st.error( f"Cost breakdown unavailable: {e}" ) \| return` |
-| `21- Streamlit Dashboard.py` | 2556 | `(json.JSONDecodeError, TypeError)` | SILENT | `pass` |
-| `21- Streamlit Dashboard.py` | 2638 | `(json.JSONDecodeError, TypeError)` | SILENT | `has_criteria = False` |
-| `21- Streamlit Dashboard.py` | 4795 | `(json.JSONDecodeError, TypeError, AttributeError)` | SILENT | `pass` |
-| `21- Streamlit Dashboard.py` | 5022 | `(json.JSONDecodeError, TypeError, AttributeError)` | SILENT | `continue` |
-| `21- Streamlit Dashboard.py` | 5155 | `(json.JSONDecodeError, TypeError, AttributeError)` | SILENT | `pass` |
+| `oncotriage/dashboard/data.py` | 37 | `Exception` | LOGGED | `st.error(f"Database error: {e}") \| return pd.DataFrame()` |
+| `oncotriage/dashboard/data.py` | 62 | `Exception` | LOGGED | `st.error(f"Database error: {e}") \| return pd.DataFrame()` |
+| `oncotriage/dashboard/data.py` | 84 | `Exception` | LOGGED | `st.error(f"Drift metrics error: {e}") \| return pd.DataFrame()` |
+| `oncotriage/dashboard/tabs/performance.py` | 388 | `Exception` | SILENT | `pass` |
+| `oncotriage/dashboard/tabs/performance.py` | 504 | `Exception` | SILENT | `pass` |
+| `oncotriage/dashboard/tabs/cost_tokens.py` | 75 | `UnknownModelPricingError` | LOGGED | `st.error( f"Cost breakdown unavailable: {e}" ) \| return` |
+| `oncotriage/dashboard/tabs/patient_explorer.py` | 281 | `(json.JSONDecodeError, TypeError)` | SILENT | `pass` |
+| `oncotriage/dashboard/tabs/patient_explorer.py` | 363 | `(json.JSONDecodeError, TypeError)` | SILENT | `has_criteria = False` |
+| `oncotriage/dashboard/tabs/reproducibility.py` | 973 | `(json.JSONDecodeError, TypeError, AttributeError)` | SILENT | `pass` |
+| `oncotriage/dashboard/tabs/reproducibility.py` | 1210 | `(json.JSONDecodeError, TypeError, AttributeError)` | SILENT | `continue` |
+| `oncotriage/dashboard/tabs/reproducibility.py` | 1333 | `(json.JSONDecodeError, TypeError, AttributeError)` | SILENT | `pass` |
 | `22- Airflow Database.py` | 39 | `subprocess.CalledProcessError` | LOGGED | `print(f"✗ Database migration failed:") \| print(e.stderr) \| return False` |
 | `22- Airflow Database.py` | 59 | `subprocess.CalledProcessError` | LOGGED | `print(f"✗ Database check failed:") \| print(e.stderr) \| return False` |
 | `24- Airflow Manager.py` | 89 | `requests.exceptions.ConnectionError` | SILENT | `pass` |
