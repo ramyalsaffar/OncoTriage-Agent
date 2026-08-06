@@ -98,6 +98,7 @@ import numpy as np
 import pandas as pd
 
 from oncotriage import paths
+from oncotriage import settings
 from oncotriage.config import (
     BASELINE_WINDOW_DAYS,
     COMPARISON_WINDOW_DAYS,
@@ -151,17 +152,36 @@ except ImportError:
 
 
 def resolve_drift_db_path(db_path=None):
-    """The database the drift functions read and write. ``None`` means the
-    configured production one.
+    """The database the drift functions read and write.
 
-    THE SAME SHAPE AS ``resolve_inference_db_path`` in
-    ``oncotriage/storage/database_logger.py``, and deliberately a separate
-    function rather than an import of it. That one answers "where does the
-    inference logger write"; this one answers "where does drift detection look".
-    They resolve to the same file today, and the reason to keep them apart is
-    that ``oncotriage.monitoring`` must not depend on ``oncotriage.storage`` for
-    a path string -- drift detection reads a database, it does not use the
-    logger.
+    Three tiers, first match wins, IDENTICAL to
+    ``oncotriage/storage/database_logger.py:resolve_inference_db_path``:
+
+        1. ``db_path`` -- an explicit argument, returned unmodified;
+        2. ``ONCOTRIAGE_INFERENCES_DB`` (pass 20c-3i);
+        3. ``oncotriage.paths.inferences_path``.
+
+    STILL A SEPARATE FUNCTION rather than an import of that one, and pass
+    20c-3i deliberately did not consolidate them while adding tier 2 to both.
+    That one answers "where does the inference logger write"; this one answers
+    "where does drift detection look". They resolve to the same file today, and
+    the reason to keep them apart is that ``oncotriage.monitoring`` must not
+    depend on ``oncotriage.storage`` for a path string -- drift detection reads
+    a database, it does not use the logger. Both reach the variable through
+    ``oncotriage.settings``, which is the module both already depend on
+    transitively and the one place the variable is NAMED.
+
+    Tier 2 is honoured HERE as well as there because the two tables live in one
+    file. A run redirected at a scratch database for its inferences and left
+    pointing at production for its drift metrics would write a verdict about
+    data it had not read, into a table nobody asked it to touch -- which is a
+    worse outcome than either half alone.
+
+    THE ARGUMENT STILL WINS OVER THE VARIABLE. "41- ECOG Availability Metric
+    Test.py" passes an explicit scratch path and asserts on what
+    ``log_drift_metrics`` returns; if a stray export outranked that argument the
+    assertion would be reporting the export rather than the isolation it exists
+    to check.
 
     IT DOES NOT CONSULT THE EXEC NAMESPACE, and that asymmetry is the point. The
     shim's wrappers are what read ``globals().get("inferences_path")``; this one
@@ -171,10 +191,16 @@ def resolve_drift_db_path(db_path=None):
     resolved through the namespace too, that test would be comparing a value
     against itself.
 
-    It resolves and returns; it opens nothing.
+    It resolves and returns; it opens nothing. It can RAISE a RuntimeError from
+    ``resolve_inferences_db`` when the variable names a path whose parent
+    directory is absent; that is deliberate, and it is why the call sits before
+    ``log_drift_metrics``'s try block.
     """
     if db_path is not None:
         return db_path
+    override, _source = settings.resolve_inferences_db()
+    if override is not None:
+        return override
     return paths.inferences_path
 
 

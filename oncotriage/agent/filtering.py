@@ -22,7 +22,6 @@ which is the one edge this module has into another stage.
 
 import re
 import time
-from typing import Dict, List
 
 from oncotriage.agent import deps
 from oncotriage.agent.retrieval import apply_quality_gate

@@ -34,7 +34,7 @@ nothing, replay would go to the network instead of serving its recording.
 
 import json
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 from oncotriage import config
 from oncotriage.agent import deps

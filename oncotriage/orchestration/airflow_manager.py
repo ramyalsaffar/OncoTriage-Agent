@@ -314,7 +314,10 @@ def clear_airflow_password():
 def password_source():
     """Which tier supplied the password in use, or None if none has been.
 
-    Diagnostic. Returns one of the four PASSWORD_SOURCE_* constants. It
+    Diagnostic. Returns one of the three PASSWORD_SOURCE_* constants, or None.
+    THREE, not four: tier 1 (the ``password=`` argument) records no source, for
+    the reason argued at the constants themselves -- a one-off argument must not
+    become the process-wide answer. It
     RESOLVES NOTHING and READS NOTHING -- asking where the password came from
     must not be the thing that goes and gets one. (Same rule as
     ``deps.peek``/``resolution_state``, and for the same reason.)
@@ -356,7 +359,19 @@ def _get_password(password=None, airflow_home=None) -> str:
     env_password, env_source = path_settings.resolve_airflow_password()
     if env_password is not None:
         _PASSWORD_STATE["password"] = env_password
-        _PASSWORD_STATE["source"] = env_source
+        # PASSWORD_SOURCE_ENV, not env_source -- pass 20c-3i.
+        #
+        # They are the same string: the constant IS
+        # path_settings.ENV_AIRFLOW_PASSWORD, and that is exactly what
+        # resolve_airflow_password() returns as its source. But storing
+        # env_source left PASSWORD_SOURCE_ENV defined and NEVER READ anywhere
+        # in the repository, which is the shape that shipped
+        # PASSWORD_SOURCE_ARGUMENT in this same module and is why File 47 now
+        # scans for it. A constant declared for callers to assert against, and
+        # never used by the code it describes, is one rename away from being a
+        # value password_source() can no longer return -- with the assertion
+        # still compiling and now unfailable.
+        _PASSWORD_STATE["source"] = PASSWORD_SOURCE_ENV
         print(f"[Airflow] Admin password read from {env_source}")
         return env_password
 

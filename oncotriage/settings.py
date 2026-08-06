@@ -67,6 +67,47 @@ ENV_KEYS_PATH = "ONCOTRIAGE_KEYS_PATH"
 ENV_DATA_TRIAL_PATH = "ONCOTRIAGE_DATA_TRIAL_PATH"
 """Directory the trial scrape writes into. 23- Airflow DAG.py's DAG only."""
 
+ENV_INFERENCES_DB = "ONCOTRIAGE_INFERENCES_DB"
+"""Full path to the SQLite inference log, overriding ``paths.inferences_path``.
+
+NOT A DIRECTORY, which is why it is resolved by its own function below rather
+than by ``_from_env``. That helper runs every value through
+``with_trailing_sep``, so ``/tmp/scratch.db`` would come back as
+``/tmp/scratch.db/`` -- and the consequence is not a visible error. Both
+consumers pass the result to ``sqlite3.connect``, which on a path ending in a
+separator raises ``OperationalError: unable to open database file``;
+``log_inference`` CATCHES ``sqlite3.Error`` by design, so a run redirected with
+a trailing separator would print one "Database logging failed (non-critical)"
+line per patient and record nothing, while reporting success. Silent data loss
+is the exact failure this project exists to remove, and a helper that appends a
+separator is the exact way to cause it here. Same reasoning as
+ENV_AIRFLOW_PASSWORD above, different victim.
+
+ADDED BY PASS 20c-3i, and the defect it answers was measured rather than
+supposed. "17- FastAPI Server.py" calls ``log_inference(result, patient_data)``
+with no path, so it resolves to the production database. "18- FastAPI Server
+Test.py" and "19- FastAPI Server Batch Test.py" POST real bundles to that live
+server, so every run of either wrote real rows into the real ``inferences.db``.
+Six such rows were found on 2026-08-05 (patients repeated across three runs of
+two), and they changed which query "16- Database Query.py" dies at -- which is
+how this surfaced at all. Nothing else reported it.
+
+The server is a SEPARATE PROCESS started by the operator, so neither test file
+can redirect it from inside itself; the variable has to be set on the server:
+
+    ONCOTRIAGE_INFERENCES_DB=/tmp/oncotriage-test.db python "17- FastAPI Server.py"
+
+Both test files detect the case where it was NOT set: they read the production
+row count before and after their run and fail, naming this variable, if it
+moved.
+
+RESOLUTION IS NOT VALIDATED FOR EXISTENCE OF THE FILE -- a database that does
+not exist yet is the normal state, ``sqlite3.connect`` creates it, and
+``initialize_database`` builds the schema. The PARENT DIRECTORY is validated,
+because that is the case sqlite cannot recover from and the one that would
+otherwise be swallowed by ``log_inference``'s broad except.
+"""
+
 ENV_AIRFLOW_PASSWORD = "ONCOTRIAGE_AIRFLOW_PASSWORD"
 """Admin password for the Airflow REST API v2.
 
@@ -196,6 +237,55 @@ def resolve_keys_path(fallback):
 def resolve_data_trial_path(fallback):
     """Resolve the trial-data directory for the generated Airflow DAG."""
     return _from_env(ENV_DATA_TRIAL_PATH, fallback)
+
+
+def resolve_inferences_db():
+    """Resolve the inference database override from the environment.
+
+    DELIBERATELY NOT ``_from_env``, for the reason written at
+    ENV_INFERENCES_DB: that helper appends a trailing separator, which is
+    correct for every directory in the table above and turns a database file
+    path into something ``sqlite3.connect`` refuses -- refuses in the one way
+    ``log_inference`` swallows.
+
+    Returns:
+        (path, source) where source is ENV_INFERENCES_DB when the variable was
+        set to a non-empty value, or (None, None) when it was not. Like the
+        password resolver, this invents no fallback: "not set" means the caller
+        should use its own default, and only the caller knows what that is
+        (``paths.inferences_path`` for both of today's two callers).
+
+    Whitespace is stripped and ``~`` is expanded. Both matter and neither is
+    cosmetic. ``export ONCOTRIAGE_INFERENCES_DB=$(cat somefile)`` carries a
+    trailing newline, and a path ending in "\\n" fails to open; ``~/scratch.db``
+    is a plausible thing to type and, unexpanded, resolves against the working
+    directory into a file inside a directory literally named "~" that does not
+    exist -- again an unopenable path, again swallowed.
+
+    Raises:
+        RuntimeError: the parent directory does not exist. This is the one
+            check worth making eagerly. A database FILE that does not exist is
+            the normal case -- sqlite creates it -- but a missing parent
+            directory makes ``sqlite3.connect`` raise ``OperationalError``, and
+            both consumers resolve the path OUTSIDE their try block precisely so
+            a configuration defect reaches the operator instead of being
+            reported as one non-critical logging failure per patient.
+    """
+    raw = os.environ.get(ENV_INFERENCES_DB)
+    if raw is None or raw.strip() == "":
+        return None, None
+
+    path = os.path.expanduser(raw.strip())
+    parent = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(parent):
+        raise RuntimeError(
+            f"{ENV_INFERENCES_DB} points into a directory that does not "
+            f"exist: {parent!r} (from {path!r})\n"
+            f"Create the directory, or set {ENV_INFERENCES_DB} to a path "
+            f"whose parent exists, e.g.\n"
+            f"    export {ENV_INFERENCES_DB}='/tmp/oncotriage-test.db'"
+        )
+    return path, ENV_INFERENCES_DB
 
 
 def resolve_airflow_password():

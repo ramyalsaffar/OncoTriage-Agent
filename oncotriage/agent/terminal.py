@@ -23,7 +23,7 @@ logger import it from there, and neither imports the other.
 """
 
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict
 
 from oncotriage.agent.state import TrialMatchState
 from oncotriage.registries.primary_cancer import _resolve_primary_cancer

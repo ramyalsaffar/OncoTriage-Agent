@@ -328,6 +328,22 @@ released.
 
 **Tests** are not pytest — `18-` and `19-` are procedural scripts hitting a *live* server on `localhost:8000`; start `17-` in another terminal first. `19-` slices `fhir_files[410:412]` for a smoke run; widen that slice to go broader.
 
+**START THAT SERVER WITH `ONCOTRIAGE_INFERENCES_DB` SET, OR FILES 18 AND 19 WILL FAIL YOU (pass 20c-3i).**
+
+```bash
+ONCOTRIAGE_INFERENCES_DB=/tmp/oncotriage-test.db python "17- FastAPI Server.py"
+```
+
+`oncotriage/api/server.py` calls `log_inference(result, patient_data)` with no path — correctly; it is a server, not a test that knows where its output belongs — so it resolves to the production `inferences.db`. Files 18 and 19 POST **real** bundles to it, so every run of either was writing real inference rows and their `trial_matches` children into the real database. Six such rows are in it, dated 2026-08-05, three runs of two patients each. They surfaced only because they changed **which query File 16 dies at**; nothing reported them.
+
+`ONCOTRIAGE_INFERENCES_DB` is named in `oncotriage/settings.py` and resolved by `resolve_inferences_db()`, which is **deliberately not `_from_env`** — that helper appends a trailing separator, correct for every directory and, for a database file, a path `sqlite3.connect` refuses with an `OperationalError` that `log_inference` *catches by design*. One trailing slash would have produced one "Database logging failed (non-critical)" line per patient and a run that recorded nothing while reporting success. Same reasoning as `resolve_airflow_password`, different victim. It strips whitespace, expands `~`, and **raises** if the parent directory is absent — resolution happens outside both writers' `try` blocks precisely so a configuration defect reaches the operator instead of being swallowed as a logging fault.
+
+**Both** `resolve_inference_db_path` (`storage/database_logger.py`) and `resolve_drift_db_path` (`monitoring/drift.py`) honour it, at tier 2 of three: explicit argument → variable → `paths.inferences_path`. They stay separate functions — `monitoring` must not depend on `storage` for a path string — and both reach the variable through `settings`, the module that names it. **The argument still outranks the variable**, and that ordering is what keeps the six isolation tests meaningful: they pass an explicit scratch path and assert on what comes back, and a stray export that outranked the argument would have those assertions reporting the export as the answer they wanted.
+
+Files 18 and 19 cannot redirect the server — it is a separate process with its own environment — so they **detect** instead, on the `_production_drift_rows()` precedent from File 41: read the production inference row count before the run, read it again after, exit 1 naming the variable if it moved. The comparison is shown to discriminate before it is trusted: each file builds a scratch database carrying the **production `inferences` schema, read out of `sqlite_master` rather than retyped**, seeds two rows, inserts a third, and refuses to run unless the counter reports 2 then 3. The connections are `mode=ro` URIs, because a plain `sqlite3.connect` on an absent path *creates* the file — a guard that brought its own database into existence, counted 0 twice and reported success would be worse than no guard. The block is duplicated verbatim in both files on purpose: item 20d converts them, and a self-contained harness belongs in that pass.
+
+**File 19 runs two patients, not the corpus.** Line 219 overwrites the file list with `fhir_files[410:412]` under a comment reading "For testing purposes", while its title, its `Found N patients` line and its `Batch evaluation complete` summary all describe a full-corpus run. Reported, documented in the file's new docstring, and deliberately left — widening it is a spending decision. Both files also state their cost in their docstrings: every POST is a live billed Stage 5 call, measured at $0.13–$0.17 per patient from the six rows above.
+
 To exercise the graph directly without the API, set `RUN_TEST_ON_EXECUTE = True` near the bottom of `13- LangGraph Agent.py` and run it as `__main__`. The block survived the pass-20c-2c split and still lives in the shim.
 
 ## Layout outside this repo
@@ -342,6 +358,8 @@ Only `03- Code/` is version-controlled. Sibling directories under the project ro
 | `keys_path` | `05- Keys/.env` | `OPENAI_API_KEY`, `QDRANT_URL`, `QDRANT_API_KEY` |
 | `checkpoint_path` | `08- Checkpoint/` | batch runner resume state |
 | `requirements_path` | `07- Requirements/requirements.txt` | pip deps (copied into Dockerfile) |
+
+`ONCOTRIAGE_INFERENCES_DB` overrides `inferences_path` for **both** database writers (`resolve_inference_db_path`, `resolve_drift_db_path`) and is the only way to redirect a running FastAPI server; it is named in `oncotriage/settings.py` and does **not** go through `_from_env`. See the Tests paragraph above for what it is for and why the helper would corrupt it.
 
 `docker-compose.yml` mounts `.env` from a mix of `../04- Keys/` and `../05- Keys/`; only `05- Keys/` exists. Measured per service in pass 20c-3c-2, and it is a **two-two split, not a stray line**: `fastapi` (line 65) and `airflow-webserver` (line 139) mount `../04- Keys/.env`, which **does not exist**, so Docker creates an empty *directory* at that host path and bind-mounts it as `/app/.env` — the container gets a directory where a file should be, and `load_env_keys()` fails with `.env file not found` or an `IsADirectoryError` depending on how it is reached. `streamlit` (line 101) and `airflow-scheduler` (line 184) mount `../05- Keys/.env`, which is correct. Left untouched: it belongs to the Docker item.
 
@@ -515,6 +533,10 @@ change.** The rendered output was compared too — the original and the package
 render identical element counts and identical label/value pairs across all 9
 tabs, 118 metrics, 48 subheaders and 18 dataframes, with zero exceptions.
 
+**THE SAME SLICING APPROACH MOVED FILES 07 THROUGH 25, so pass 20c-3i swept all of it.** The `@st.fragment` loss was caught by one pass's equivalence proof; nothing said the other seven passes had been as lucky. Every `FunctionDef` / `AsyncFunctionDef` / `ClassDef` in the package was compared against the pre-split version of the numbered file it came from, with the origin commit **derived** (`git log --diff-filter=A` for the module, then the numbered files that *lost* definitions in that commit) rather than declared. **404 definitions, 314 matched to an origin, 18 carrying decorators, zero mismatches, and zero decorated origin definitions that failed to reproduce.** Three negative controls — `api/server.py`, `dashboard/tabs/drift.py`, `agent/retrieval.py` — were each stripped in an AST *copy* and each stopped agreeing with its origin.
+
+**The sweep had to run at every nesting depth, and the first attempt did not.** A top-level walk reported `api/server.py`'s four endpoints as having no counterpart at all, because `create_app()` nests them — so the four definitions in the package carrying the **most** decorators were the four it could not see. Those same four separate their decorators from the `def` with **blank lines**, which is invisible to ast (`decorator_list` hangs off the node) and fatal to any check written against adjacency. What survives as a standing check is File 47 section **2i**: the exact decorator list of every decorated definition in the package, keyed by *qualified* name — which is also what distinguishes `CancerCodeRegistry._invert_date` from `OncologyLabRegistry._date_sort_key`, two `@staticmethod`s in one module that a bare-name inventory would confuse. The git comparison stays a one-time audit: it needs history, and a check that re-derives its expectation from whatever HEAD happens to be agrees with the code by construction.
+
 Section 6 of `47- Package Split Test.py` is separate from section 2 **on
 purpose**. Section 2 asserts no model-bearing library arrives and **streamlit is
 on that list** — it is what says importing the agent does not drag the dashboard
@@ -570,7 +592,11 @@ One change in `qdrant_backup` is **not** a path accessor, a client accessor or a
 
 **File 24's `__main__` menu is kept BYTE-VERBATIM**, including its comment `# After setting AIRFLOW_PASSWORD: Check status`, which names the retired route. Replacing the commented menu with a real argparse CLI is the right end state, it is a redesign, and it is a recorded follow-up — not built here. The entry-point docstring carries a loud note immediately above the menu so no reader is misled by that one comment.
 
-**File 47 grew two traps and six modules.** `subprocess.run` and `subprocess.Popen` are patched to raise before the imports, because three of the six new modules are the only ones in the package that spawn processes and **no existing trap could see one** — a subprocess opens no socket, no database and no file *in this process*, and before item 20b loading File 22 ran `airflow db migrate` while loading File 24 launched two long-lived servers. 48 modules now import under all seven traps; the sweep is 244 checks, all passing.
+**File 47 grew two traps and six modules.** `subprocess.run` and `subprocess.Popen` are patched to raise before the imports, because three of the six new modules are the only ones in the package that spawn processes and **no existing trap could see one** — a subprocess opens no socket, no database and no file *in this process*, and before item 20b loading File 22 ran `airflow db migrate` while loading File 24 launched two long-lived servers. 48 modules now import under all traps; the sweep is **278 checks** as of pass 20c-3i, all passing.
+
+**Pass 20c-3i widened those two traps to twelve and added three sections.** The two subprocess patches were measured, not trusted, and the measurement changed the picture. The comment beside them claimed a `from subprocess import Popen` would escape; it does not — `from X import name` is an attribute read performed when the import *runs*, and every package import runs after the trap is armed, so the attribute, module-alias and from-import forms are all caught (each is now **fired**, not argued, as its own control). `subprocess.call` / `check_call` / `check_output` / `getoutput` and `os.popen` all funnel through the patched `Popen`, which is a CPython implementation detail rather than a guarantee, so they are trapped explicitly. What genuinely escaped was **`os.system`, `os.posix_spawn`, `os.execv` and `os.fork`** — not a reference form at all — plus one real pre-bound from-import, `prompt_toolkit.application.application.Popen`, taken before the patch and therefore out of reach of any attribute patch. The probe now sweeps `sys.modules`, **rebinds** every surviving reference to an original, sweeps again and asserts the second sweep is clean, with a planted holder as the control. Nothing in the package imports prompt_toolkit, which is exactly why reporting rather than closing would have been wrong: a trap whose coverage depends on which third-party packages happen to be installed is a coincidence, not a guarantee.
+
+The three new sections: **2h** (nothing is declared and never read — see the method rule below; its exemption list is closed and each entry argued, and this file's own string literals are excluded from the read corpus so the scan cannot read its own exemptions), **2i** (the decorator inventory of the whole package, pinned at every nesting depth), and a **recursive** subpackage scan in section 1 with a negative control planted three deep.
 
 ## Persistence and observability
 
@@ -634,6 +660,66 @@ Where an assertion could be satisfied by a degenerate value —
 a zero, an empty set, a None on both sides — assert first that
 the value is non-degenerate, so the test fails rather than
 passing vacuously when someone later changes it.
+
+**A CHECK THAT NAMES A SYMBOL MUST COVER EVERY REFERENCE FORM,
+each with its own negative control.** Python reaches a name three
+ways — the bare name, the attribute form, and the from-import
+binding — and a check written against one of them silently passes
+over the other two. Three defects of this class have shipped:
+
+- File 36's walk covered `ast.Name` and would have missed the
+  `config.X` attribute form;
+- File 47's BM25 construction-site check matched the bare
+  `SparseTextEmbedding(...)` and `fastembed.SparseTextEmbedding(...)`
+  evaded it;
+- pass 20c-3c-2's subprocess traps patch module attributes, and
+  the comment beside them asserted that a from-import escapes.
+
+The third one is the instructive one, because when pass 20c-3i went
+to fix it the claim turned out to be **false**: `from X import name`
+is an attribute read performed when the import *runs*, and every
+package import runs after the trap is armed, so all three forms were
+already caught. Firing them is what established that; the comment had
+been reasoning. What *did* escape, measured, was `os.system`,
+`os.posix_spawn`, `os.execv` and `os.fork` — not a reference form at
+all — plus one genuine pre-bound from-import
+(`prompt_toolkit.application.application.Popen`, taken before the
+patch). All are closed now, and the closure has a planted-module
+control of its own. **So: fire each form, do not argue it.** A form
+you reasoned about is a form you have not tested, and the reasoning
+is wrong about as often as the code.
+
+**THE EQUIVALENCE PROOF CANNOT SEE A NAME THAT IS NEVER READ.**
+Every pass since 20c-2a has been accepted on an `ast.unparse`
+comparison against `git show`, and that proof has one blind spot it
+cannot close by construction: it only compares what is *there*. A
+name that is declared and never read is equivalent to itself on both
+sides of every diff, forever. That is how `PASSWORD_SOURCE_ARGUMENT`
+shipped — a constant naming a value `password_source()` can never
+return, through a full pass and 244 checks, found by reading. Pass
+20c-3i made the scan standing (File 47 check 2h: unused imports,
+never-read module constants; check 2g already covers shadowed names)
+and it immediately found two more of the same shape —
+`PASSWORD_SOURCE_ENV`, declared for callers to assert against and
+read by nothing, and `deps.RESOLUTION_STATES`, documented as a closed
+set that no caller consulted. Both are load-bearing now. The scan's
+own first version counted assignment *targets* as reads and so passed
+vacuously over the whole package; its negative controls caught that
+before it shipped, which is the argument for controls restated as an
+event rather than a principle.
+
+**A SCAN OVER A DIRECTORY TREE MUST RECURSE.** File 47's subpackage
+check was an `os.listdir` one level deep while `oncotriage.dashboard.tabs`
+had been nested since pass 20c-3c-1 — which noticed, and answered by
+hand-asserting that one nested name, which works for exactly as long
+as someone remembers to add a line per nesting. The cost is not a
+failing test: setuptools does not recurse into a listed package, so an
+undeclared subpackage is present in an editable install and **absent
+from a built wheel**, and nothing surfaces until someone builds one.
+The scan walks to any depth now, and its negative control plants a
+package *three* deep — because a control planted at the top level
+would have fired against the old scan too and proved nothing about
+what changed.
 
 Data and keys live outside this folder. Never write an
 absolute path. The one exception already exists and is

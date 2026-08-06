@@ -194,6 +194,7 @@ import ast
 import concurrent.futures
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -945,10 +946,31 @@ check("the package file list is non-empty and covers all six subpackages",
 # because tomllib would only tell us the list parses, not that it matches the
 # directory tree.
 _PYPROJECT = open(os.path.join(_code_dir, "pyproject.toml"), encoding="utf-8").read()
+
+# RECURSIVE AS OF PASS 20c-3i, and the one-level version had already been
+# outrun by the tree it was scanning.
+#
+# It was an os.listdir of _PKG_DIR, so it could only ever see subpackages one
+# directory deep. oncotriage.dashboard.tabs has been nested since pass 20c-3c-1
+# -- which noticed, and answered by asserting that ONE nested name separately,
+# as a literal string search against pyproject.toml. That works for exactly as
+# long as somebody remembers to add a line per nesting, which is the same bet
+# the pyproject `packages` list itself makes and the reason this check exists to
+# cover it. The second nested subpackage would have been invisible to both
+# halves: absent from the listdir, so absent from the "every subpackage on disk
+# is declared" comparison, and absent from the hand-written string search too.
+#
+# The consequence is not a test failure, it is a shipping defect: setuptools
+# does not recurse into a listed package, so an undeclared subpackage is present
+# in an EDITABLE install (which maps the source tree) and MISSING from a built
+# wheel. That difference does not surface until someone builds one.
+#
+# os.walk instead, keyed on the presence of __init__.py, to any depth.
 _SUBPACKAGE_DIRS = sorted(
-    "oncotriage." + name
-    for name in os.listdir(_PKG_DIR)
-    if os.path.isfile(os.path.join(_PKG_DIR, name, "__init__.py"))
+    "oncotriage." + os.path.relpath(root, _PKG_DIR).replace(os.sep, ".")
+    for root, _dirs, files in os.walk(_PKG_DIR)
+    if "__init__.py" in files and os.path.abspath(root) != os.path.abspath(_PKG_DIR)
+    and "__pycache__" not in root
 )
 check("the tree has the subpackages this pass expects (non-degeneracy)",
       _SUBPACKAGE_DIRS,
@@ -956,22 +978,59 @@ check("the tree has the subpackages this pass expects (non-degeneracy)",
       # dashboard is new in pass 20c-3c-1. orchestration is new in pass
       # 20c-3c-2 -- Files 22, 23 and 24, the Airflow layer. (File 29 landed in
       # oncotriage.retrieval, which was already here, so that pass adds exactly
-      # one name.) NOTE that this listdir is one level
-      # deep, so oncotriage.dashboard.tabs is NOT in it; the pyproject check
-      # below would therefore never look at it, which is why it is asserted
-      # separately -- setuptools does not recurse, so a nested subpackage
-      # missing from pyproject ships a dashboard with no tabs in a built wheel.
+      # one name.) oncotriage.dashboard.tabs is in this list for the first time
+      # in pass 20c-3i: the scan above reaches it now instead of it needing a
+      # hand-written check of its own.
       ["oncotriage.agent", "oncotriage.api", "oncotriage.batch",
-       "oncotriage.dashboard", "oncotriage.extraction", "oncotriage.fhir",
+       "oncotriage.dashboard", "oncotriage.dashboard.tabs",
+       "oncotriage.extraction", "oncotriage.fhir",
        "oncotriage.monitoring", "oncotriage.orchestration",
        "oncotriage.registries", "oncotriage.retrieval",
        "oncotriage.storage"])
-check("the NESTED subpackage oncotriage.dashboard.tabs is declared too "
-      "(setuptools does not recurse into a listed package)",
-      '"oncotriage.dashboard.tabs"' in _PYPROJECT, True)
+check("the scan reaches NESTED subpackages, not just the top level -- "
+      "oncotriage.dashboard.tabs is two deep and setuptools does not recurse "
+      "into a listed package",
+      "oncotriage.dashboard.tabs" in _SUBPACKAGE_DIRS, True)
 check("every subpackage on disk is declared in pyproject.toml, so a built "
       "wheel carries it",
       sorted(p for p in _SUBPACKAGE_DIRS if f'"{p}"' not in _PYPROJECT), [])
+
+# NEGATIVE CONTROL, and the reason it plants at DEPTH TWO: the check above is
+# one that already existed in a one-level form and passed. A control that
+# planted a top-level subpackage would have fired against the OLD scan too and
+# would prove nothing about what this pass changed. This one is invisible to a
+# listdir and visible to the walk.
+_NESTED_CONTROL_ROOT = tempfile.mkdtemp(prefix="oncotriage-nested-")
+try:
+    _control_pkg = os.path.join(_NESTED_CONTROL_ROOT, "oncotriage")
+    shutil.copytree(_PKG_DIR, _control_pkg,
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    _planted = os.path.join(_control_pkg, "dashboard", "tabs", "planted")
+    os.makedirs(_planted)
+    open(os.path.join(_planted, "__init__.py"), "w").close()
+
+    _control_found = sorted(
+        "oncotriage." + os.path.relpath(root, _control_pkg).replace(os.sep, ".")
+        for root, _dirs, files in os.walk(_control_pkg)
+        if "__init__.py" in files
+        and os.path.abspath(root) != os.path.abspath(_control_pkg)
+        and "__pycache__" not in root
+    )
+    check("the recursive scan FINDS a subpackage planted three deep, where a "
+          "one-level os.listdir would see nothing (negative control)",
+          "oncotriage.dashboard.tabs.planted" in _control_found, True)
+    check("...and it is undeclared in pyproject.toml, so the wheel check "
+          "catches it too",
+          sorted(p for p in _control_found if f'"{p}"' not in _PYPROJECT),
+          ["oncotriage.dashboard.tabs.planted"])
+    check("...while the one-level listdir the old scan used misses it entirely, "
+          "which is what makes this control discriminating",
+          "oncotriage.dashboard.tabs.planted" in sorted(
+              "oncotriage." + name for name in os.listdir(_control_pkg)
+              if os.path.isfile(os.path.join(_control_pkg, name, "__init__.py"))),
+          False)
+finally:
+    shutil.rmtree(_NESTED_CONTROL_ROOT, ignore_errors=True)
 
 
 def _function_body_imports(path: str):
@@ -1195,8 +1254,78 @@ io.open = _blocked
 # call, so the patch is in their path. A module that had done `from subprocess
 # import Popen` at import would hold the original and escape this; check 7's AST
 # scan is the backstop for that shape.
+#
+# PASS 20c-3i REWROTE THE TWO LINES BELOW INTO THE BLOCK THAT FOLLOWS, because
+# the paragraph above contains a claim that is FALSE, and it was measured rather
+# than argued about. It says a module doing `from subprocess import Popen` would
+# hold the original and escape. It would not: `from X import name` is an
+# ATTRIBUTE READ performed when the import statement RUNS, and every one of the
+# 48 imports below runs AFTER this patch, so a from-import in any package module
+# binds `_blocked`. Measured directly -- attribute form, module-alias form and
+# from-import form were each fired against a patched subprocess and all three
+# raised. The three controls at the bottom of this probe now assert that instead
+# of the comment claiming it.
+#
+# WHAT DOES ESCAPE, also measured, and it is not a reference form at all:
+#
+#   * os.system, os.posix_spawn, os.posix_spawnp, os.fork and the os.exec*
+#     family spawn a process WITHOUT going through the subprocess module. They
+#     escaped both traps completely.
+#   * subprocess.call / check_call / check_output / getoutput did NOT escape --
+#     each builds a Popen through the subprocess module's own global, which is
+#     patched. Same for os.popen. That is a CPython implementation detail rather
+#     than a documented guarantee, so both are trapped explicitly below; relying
+#     on an internal call graph for a safety property is how a trap goes quiet
+#     across a version bump with nothing to show for it.
+#   * a module imported BEFORE this point that did `from subprocess import run`
+#     holds the ORIGINAL and is genuinely out of reach of an attribute patch.
+#     That is the only true from-import escape, and the sweep at the bottom is
+#     what finds it: it walks sys.modules for any surviving reference to the
+#     originals. Today it finds none.
+_SPAWN_ORIGINALS = {"subprocess.run": subprocess.run,
+                    "subprocess.Popen": subprocess.Popen}
+
 subprocess.Popen = _blocked
 subprocess.run = _blocked
+
+# CLOSE THE PRE-BOUND FROM-IMPORTS, rather than merely reporting them.
+#
+# The sweep at the bottom of this probe found a real one on its first run:
+# prompt_toolkit.application.application.Popen, a `from subprocess import Popen`
+# executed while some earlier import was loading. An attribute patch on the
+# subprocess module cannot reach a binding that was taken before it, so that
+# reference was a live spawn route through the whole trapped section.
+#
+# Nothing in this package imports prompt_toolkit, so no oncotriage module could
+# have reached it -- which is the argument for reporting instead of fixing, and
+# it is the wrong argument. A trap whose coverage depends on which third-party
+# packages happen to be installed is not a trap, it is a coincidence; the next
+# dependency to do the same thing arrives without warning. Every holder is
+# rebound to _blocked here, and the sweep below then asserts none survive.
+_CLOSED_HOLDERS = []
+for _mname, _mod in list(sys.modules.items()):
+    if _mod is None or _mname in ("subprocess", "__main__"):
+        continue
+    _d = getattr(_mod, "__dict__", None)
+    if not isinstance(_d, dict):
+        continue
+    for _attr, _val in list(_d.items()):
+        if any(_val is _orig for _orig in _SPAWN_ORIGINALS.values()):
+            setattr(_mod, _attr, _blocked)
+            _CLOSED_HOLDERS.append(f"{_mname}.{_attr}")
+# The os-level spawn routes, which no subprocess patch can see.
+os.system = _blocked
+os.popen = _blocked
+os.posix_spawn = _blocked
+os.posix_spawnp = _blocked
+os.execv = _blocked
+os.execve = _blocked
+os.execvp = _blocked
+# fork is trapped last and named separately because trapping it would break
+# multiprocessing if anything below used it. Nothing does -- this probe runs one
+# process and imports 48 modules -- and a module that FORKED at import would be
+# the worst offender the project has ever had.
+os.fork = _blocked
 
 import oncotriage.constants
 import oncotriage.settings
@@ -1286,14 +1415,111 @@ for _name, _fn, _args in (("socket", socket.socket, (socket.AF_INET, socket.SOCK
                           ("subprocess.run", subprocess.run,
                            (["oncotriage-trap-probe"],)),
                           ("subprocess.Popen", subprocess.Popen,
-                           (["oncotriage-trap-probe"],))):
+                           (["oncotriage-trap-probe"],)),
+                          # Pass 20c-3i: the os-level spawn routes, which no
+                          # subprocess patch reaches. os.system was measured
+                          # ESCAPING both original traps.
+                          ("os.system", os.system, ("oncotriage-trap-probe",)),
+                          ("os.popen", os.popen, ("oncotriage-trap-probe",)),
+                          ("os.posix_spawn", os.posix_spawn,
+                           ("/oncotriage-trap-probe", ["x"], {})),
+                          ("os.execv", os.execv,
+                           ("/oncotriage-trap-probe", ["x"])),
+                          ("os.fork", os.fork, ())):
     try:
         _fn(*_args)
         armed[_name] = False
     except Blocked:
         armed[_name] = True
 
-print(json.dumps({"heavy": heavy, "armed": armed}))
+# EVERY REFERENCE FORM, ONE CONTROL EACH (pass 20c-3i).
+#
+# A trap that patches a module attribute is only as good as the way callers
+# NAME the thing it patches, and this project has already shipped three defects
+# of exactly that class -- File 36's walk covered ast.Name and would have missed
+# the attribute form, File 47's own BM25 check matched the bare name and
+# fastembed.SparseTextEmbedding evaded it, and the paragraph above this probe
+# asserted a from-import escape that does not exist. So the three forms are
+# fired rather than reasoned about:
+#
+#   attribute     subprocess.run(...)              -- what both orchestration
+#                                                     modules actually write
+#   module alias  import subprocess as sp; sp.run  -- same module object, so
+#                                                     this must be caught too
+#   from-import   from subprocess import run; run  -- reads the attribute when
+#                                                     the import RUNS, which is
+#                                                     after this patch
+#
+# A future edit that swapped the module patch for, say, a sys.modules
+# replacement would keep the first two passing and break the third.
+_forms = {}
+
+
+def _fires(fn, *args):
+    try:
+        fn(*args)
+        return False
+    except Blocked:
+        return True
+
+
+_forms["attribute"] = _fires(subprocess.run, ["oncotriage-trap-probe"])
+
+import subprocess as _sp_alias
+_forms["module_alias"] = _fires(_sp_alias.run, ["oncotriage-trap-probe"])
+
+from subprocess import run as _run_fromimport
+_forms["from_import"] = _fires(_run_fromimport, ["oncotriage-trap-probe"])
+
+from subprocess import Popen as _popen_fromimport
+_forms["from_import_popen"] = _fires(_popen_fromimport,
+                                     ["oncotriage-trap-probe"])
+
+# THE ONE GENUINE FROM-IMPORT ESCAPE, swept again AFTER the closure above and
+# after all 48 imports: a module that bound the original into its own globals
+# before the patch, or one that arrived during the imports and did the same.
+# Nothing may hold either original by the end.
+#
+# __main__ is excluded because _SPAWN_ORIGINALS itself lives there -- this
+# probe's own dict of originals is not an escape hatch, it is the thing doing
+# the looking.
+_holders = sorted(
+    f"{_mname}.{_attr}"
+    for _mname, _mod in list(sys.modules.items())
+    if _mod is not None and _mname not in ("subprocess", "__main__")
+    and isinstance(getattr(_mod, "__dict__", None), dict)
+    for _attr, _val in list(_mod.__dict__.items())
+    if any(_val is _orig for _orig in _SPAWN_ORIGINALS.values())
+)
+
+# THE CLOSURE MECHANISM ITSELF NEEDS A CONTROL. An empty `_holders` is also
+# what a sweep that looks at nothing returns. So plant a module holding the
+# original -- the exact shape prompt_toolkit had -- re-run the closure over it,
+# and require it to be caught and rebound.
+import types as _types
+_planted_mod = _types.ModuleType("oncotriage_planted_holder")
+_planted_mod.Popen = _SPAWN_ORIGINALS["subprocess.Popen"]
+sys.modules["oncotriage_planted_holder"] = _planted_mod
+_planted_seen = []
+for _mname, _mod in list(sys.modules.items()):
+    if _mod is None or _mname in ("subprocess", "__main__"):
+        continue
+    _d = getattr(_mod, "__dict__", None)
+    if not isinstance(_d, dict):
+        continue
+    for _attr, _val in list(_d.items()):
+        if any(_val is _orig for _orig in _SPAWN_ORIGINALS.values()):
+            setattr(_mod, _attr, _blocked)
+            _planted_seen.append(f"{_mname}.{_attr}")
+_planted_now_blocked = _fires(_planted_mod.Popen, ["oncotriage-trap-probe"])
+del sys.modules["oncotriage_planted_holder"]
+
+print(json.dumps({"heavy": heavy, "armed": armed, "forms": _forms,
+                  "prebound_holders": _holders,
+                  "closed_holders": sorted(_CLOSED_HOLDERS),
+                  "control_found_planted":
+                      "oncotriage_planted_holder.Popen" in _planted_seen,
+                  "control_planted_now_blocked": _planted_now_blocked}))
 """
 
 # 33 as of pass 20c-3a: oncotriage.embedding, fhir.clean, fhir.generate,
@@ -1374,13 +1600,61 @@ else:
     # passing. The dict is checked whole, not key by key, so a trap that
     # disappears from the probe is a failure rather than an unnoticed omission.
     check("every trap was ARMED after the imports (socket, sqlite3, open, "
-          "io.open, subprocess.run, subprocess.Popen)",
+          "io.open, subprocess.run/Popen, os.system/popen/posix_spawn/execv/fork)",
           _armed,
           {"socket": True, "sqlite3": True, "open": True, "io.open": True,
-           "subprocess.run": True, "subprocess.Popen": True})
+           "subprocess.run": True, "subprocess.Popen": True,
+           # Pass 20c-3i. os.system was MEASURED escaping the two subprocess
+           # traps: it spawns through the C library and never touches the
+           # subprocess module. So did os.posix_spawn, os.execv and os.fork.
+           "os.system": True, "os.popen": True, "os.posix_spawn": True,
+           "os.execv": True, "os.fork": True})
     check("no model-bearing library was imported (torch / transformers / "
           "sentence_transformers / streamlit / langgraph / icd10)",
           _payload.get("heavy"), [])
+
+    # --- every reference form is covered, with a control each (20c-3i) -----
+    #
+    # THE RULE THIS ENFORCES, and it is in CLAUDE.md because three defects have
+    # already come from breaking it: a check that names a symbol must cover the
+    # bare name, the attribute form AND the from-import binding, each with its
+    # own control. The comment beside the subprocess traps used to CLAIM the
+    # from-import form escaped; it does not, because `from X import name` is an
+    # attribute read performed when the import runs and the traps are armed
+    # first. Measuring it is what replaced the claim.
+    check("the subprocess trap catches all three reference forms -- attribute, "
+          "module alias and from-import -- each fired rather than argued",
+          _payload.get("forms"),
+          {"attribute": True, "module_alias": True,
+           "from_import": True, "from_import_popen": True})
+
+    # THE ONE FORM AN ATTRIBUTE PATCH CANNOT REACH: a module imported BEFORE
+    # the trap that bound the original into its own globals. Firing the three
+    # forms above would never reveal it -- they all resolve through the patched
+    # module. The probe walks sys.modules for surviving references, REBINDS
+    # every one it finds, and then sweeps again; this asserts the second sweep
+    # is clean.
+    #
+    # THE FIRST RUN OF THIS FOUND A REAL ONE. prompt_toolkit's application
+    # module does `from subprocess import Popen`, and it is loaded transitively
+    # before the traps are armed, so it held a live spawn route through the
+    # entire trapped section. Nothing in this package imports prompt_toolkit,
+    # which is why reporting it would have been tempting and wrong: a trap whose
+    # coverage depends on which third-party packages happen to be installed is a
+    # coincidence, not a guarantee.
+    check("no module holds a pre-bound reference to the real subprocess.run or "
+          "subprocess.Popen after the closure pass -- the only from-import form "
+          "an attribute patch cannot reach",
+          _payload.get("prebound_holders"), [])
+    # NON-DEGENERATE. An empty result above is also what a sweep that inspects
+    # nothing produces, so the probe plants a module holding the original --
+    # exactly prompt_toolkit's shape -- and requires the closure to find it and
+    # to leave it raising.
+    check("...and the closure CATCHES a planted holder (negative control)",
+          _payload.get("control_found_planted"), True)
+    check("...and the planted holder's reference RAISES afterwards, so the "
+          "closure rebinds rather than merely listing",
+          _payload.get("control_planted_now_blocked"), True)
 
 
 # ===========================================================================
@@ -2172,6 +2446,544 @@ check("...while still reading COLLECTION_NAME out of the config module",
 
 
 # ===========================================================================
+# 2h. NOTHING IS DECLARED AND NEVER READ  (pass 20c-3i)
+# ===========================================================================
+
+print("\n" + "=" * 78)
+print("2h. no unused import, no module constant that nothing anywhere reads")
+print("=" * 78)
+
+# WHY THIS EXISTS, and it is a limit of the equivalence proofs rather than a
+# style preference.
+#
+# Every conversion pass since 20c-2a has been accepted on an EQUIVALENCE PROOF:
+# ast.unparse the definitions on both sides and require them to match. That
+# proof is powerful and it has one blind spot it cannot close by construction --
+# IT ONLY COMPARES WHAT IS THERE. A name that is DECLARED and never READ is
+# equivalent to itself on both sides of every diff, forever, and no amount of
+# unparsing will ever mention it.
+#
+# Pass 20c-3c-2 shipped one: orchestration/airflow_manager.py declared
+# PASSWORD_SOURCE_ARGUMENT, a constant naming a value password_source() can
+# NEVER return, and it survived a full pass with an equivalence proof and 244
+# checks. It was found by reading, not by testing. Pass 20c-3i found two more of
+# the same shape by running this scan for the first time:
+#
+#   PASSWORD_SOURCE_ENV      declared for callers to assert against, and the one
+#                            place that could have used it stored the resolver's
+#                            own string instead -- so the constant was inert and
+#                            one rename away from naming a value the function
+#                            could no longer return.
+#   deps.RESOLUTION_STATES   documented as "every value resolution_state() can
+#                            return ... so a caller can branch on it
+#                            exhaustively", read by nothing.
+#
+# Both are now load-bearing (see airflow_manager and check 5c respectively), so
+# this scan is what turned a comment into an invariant twice.
+#
+# So the scan runs EVERY TIME, not on suspicion. Three shapes:
+#
+#   (i)   a module-level import bound and never read in its own module;
+#   (ii)  a module-level CONSTANT that no .py file in the repository reads;
+#   (iii) shadowed names -- already covered by 2g above, which is the reason
+#         this section does not repeat it. Named here so a reader looking for
+#         the third shape finds where it lives rather than concluding it is
+#         missing.
+
+_REPO_PY = sorted(
+    _PKG_FILES
+    + [os.path.join(_code_dir, n) for n in os.listdir(_code_dir)
+       if n.endswith(".py")]
+)
+
+
+def _all_reads(paths, blob_exclude=()):
+    """Every identifier read anywhere in `paths`, plus every string literal.
+
+    THIS FILE IS EXCLUDED FROM THE STRING CORPUS, and that exclusion is the
+    difference between a check and a tautology. This file pins several
+    historical name inventories as lists of string literals -- _PRE_20C_NAMES,
+    _PRE_2A_RUNTIME_NAMES, the File 21 surface list -- and it also holds the
+    exemption dict below. Counted as reads, those strings mask any constant they
+    happen to mention, and the exemption list would be READ BY THE SCAN THAT
+    CONSULTS IT: name a constant as exempt and it stops being reported for that
+    reason alone, whether or not the exemption is removed later. That was the
+    first version's behaviour and it reported zero findings; excluding this
+    file's strings takes it to three, two of which are the ones the exemptions
+    were written for and one of which was new.
+
+    Its ast Name/Attribute/import reads still count. Only its string LITERALS
+    are dropped.
+
+    A READ, NOT A BINDING. ``ast.Name`` and ``ast.Attribute`` are only counted
+    when their ctx is NOT Store, and this is the whole check rather than a
+    detail: the first version of this function counted every Name node, so
+    ``PASSWORD_SOURCE_ENV = ...`` counted as a read OF ITSELF, every constant in
+    the package looked read, and the scan below passed VACUOUSLY. It was the two
+    negative controls at the bottom of this section that said so -- they are the
+    reason the defect lasted one run instead of shipping, which is the argument
+    for controls stated as a fact rather than a principle.
+
+    THE STRING LITERALS ARE NOT SLOPPINESS, they are the third reference form.
+    This file reads oncotriage.paths.PATH_NAMES through
+    ``getattr(module, "PATH_NAMES", ())`` and reads several package names inside
+    the source of subprocess probes, which are ordinary Python strings to any
+    AST walk. A scan that counted only ast.Name and ast.Attribute would report
+    PATH_NAMES as dead -- which it did, on its first run, and which is exactly
+    the "a check that names a symbol must cover every reference form" rule this
+    section is an instance of. Substring matching over string constants is
+    deliberately generous: a false NEGATIVE here is a missed defect the reader
+    can still find, while a false POSITIVE is a check people learn to route
+    around.
+
+    A ``from X import NAME`` is a read too, and it is the fourth form -- it is
+    how "03- Config.py" re-exports the tunables and how every shim reaches the
+    package. It is neither a Name nor an Attribute node, so it is collected
+    explicitly.
+    """
+    names, blobs = set(), []
+    for path in paths:
+        try:
+            tree = ast.parse(open(path, encoding="utf-8").read(), path)
+        except SyntaxError:
+            continue
+        collect_strings = os.path.abspath(path) not in blob_exclude
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name):
+                if not isinstance(node.ctx, ast.Store):
+                    names.add(node.id)
+            elif isinstance(node, ast.Attribute):
+                if not isinstance(node.ctx, ast.Store):
+                    names.add(node.attr)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    if alias.name != "*":
+                        names.add(alias.name.split(".")[-1])
+            elif (collect_strings and isinstance(node, ast.Constant)
+                  and isinstance(node.value, str)):
+                blobs.append(node.value)
+    return names, "\n".join(blobs)
+
+
+def _named_in(name, blob):
+    """True if `name` appears in `blob` on WORD BOUNDARIES.
+
+    A plain ``in`` test was the first version and it was too generous in a way
+    that mattered: ``ECOG_LOINC_PANEL_CODE`` is a substring of
+    ``_ECOG_LOINC_PANEL_CODE``, a DIFFERENT constant in a different module, so
+    a bare substring match reported the first as read because the second was
+    named somewhere. Two constants whose names differ by a leading underscore
+    are exactly the pair this project keeps (fhir/generate.py and
+    fhir/parser.py each name the same LOINC codes), so this is the common case
+    rather than a corner.
+    """
+    return re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])",
+                     blob) is not None
+
+
+def _unused_imports(path):
+    """Module-level import bindings never read in their own module.
+
+    ``__init__.py`` files are skipped whole: their entire job is to bind names
+    for somebody else to import, so "unread here" is their normal state. A line
+    carrying ``noqa`` is skipped for the same reason, explicitly declared.
+    """
+    if os.path.basename(path) == "__init__.py":
+        return []
+    src = open(path, encoding="utf-8").read()
+    lines = src.splitlines()
+    tree = ast.parse(src, path)
+    bound = {}
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                local = alias.asname or (
+                    alias.name.split(".")[0] if isinstance(node, ast.Import)
+                    else alias.name)
+                bound.setdefault(local, node.lineno)
+    reads = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            reads.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            reads.add(node.attr)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            reads.add(node.value)
+    return sorted(
+        f"{local} (line {lineno})"
+        for local, lineno in bound.items()
+        if local not in reads and "noqa" not in lines[lineno - 1]
+    )
+
+
+def _module_constants(path):
+    """Module-level ALL_CAPS assignment targets, with their line numbers."""
+    tree = ast.parse(open(path, encoding="utf-8").read(), path)
+    out = []
+    for node in tree.body:
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            targets = [node.target.id]
+        for name in targets:
+            stripped = name.lstrip("_")
+            if stripped and stripped.upper() == stripped and not stripped.isdigit():
+                out.append((name, node.lineno))
+    return out
+
+
+# --- (i) unused imports ----------------------------------------------------
+_unused = {}
+for _f in _PKG_FILES:
+    _hits = _unused_imports(_f)
+    if _hits:
+        _unused[os.path.relpath(_f, _code_dir)] = _hits
+
+check("no package module binds an import it never reads",
+      sorted(f"{f}: {hits}" for f, hits in _unused.items()), [])
+
+# --- (ii) never-read module constants --------------------------------------
+#
+# THE EXEMPTIONS ARE A CLOSED LIST WITH AN ARGUMENT EACH, not a suppression
+# file. A constant earns a place here only by being documentation whose whole
+# purpose is to be visible in the source and never used; anything else is a
+# defect and gets fixed instead. The list being closed is the point -- a new
+# never-read constant fails this check rather than joining the list quietly.
+_UNREAD_CONSTANT_EXEMPTIONS = {
+    # fhir/generate.py names the two LOINC codes ADJACENT to the ECOG score
+    # code, explicitly so that "nobody 'corrects' the score code to one of
+    # them" -- its own comment says so, in the source, above the assignments.
+    # A code whose purpose is to be read by a human and never by the program is
+    # the one legitimate instance of this shape, and both are external-standard
+    # facts, which CLAUDE.md requires be named constants rather than tunables.
+    "oncotriage/fhir/generate.py": ["ECOG_LOINC_PANEL_CODE",
+                                    "ECOG_LOINC_INTERPRETATION_CODE"],
+    # TRIAL_STATUS_FULL IS DEAD, AND IT WAS DEAD BEFORE THE SPLIT.
+    # "21- Streamlit Dashboard.py" bound it at its line 3853 and referenced it
+    # nowhere -- checked against `git show ae3f6c6^` -- while writing the same
+    # string as a literal in three places. The per-trial classifiers in
+    # patient_explorer and trial_explorer return '✅ Eligible' for the top
+    # bucket, so this constant names a value the per-trial vocabulary never
+    # produces: the PASSWORD_SOURCE_ARGUMENT shape exactly.
+    #
+    # It is EXEMPTED RATHER THAN DELETED because section 6 of this file pins
+    # every one of the 22 names File 21 bound and requires each to still be
+    # exported by the module that owns it. Removing the constant would fail that
+    # check correctly -- the pre-split surface really did include it -- so
+    # deleting it is a change to the pinned surface and belongs in a pass that
+    # says so. RECORDED AS A FOLLOW-UP: drop TRIAL_STATUS_FULL, drop its two
+    # entries from the File 21 surface lists below, and replace the three
+    # '✅ Full Match' literals with a per-patient constant that has a home.
+    "oncotriage/dashboard/tiers.py": ["TRIAL_STATUS_FULL"],
+}
+
+_reads, _string_blob = _all_reads(
+    _REPO_PY, blob_exclude={os.path.abspath(__file__)} if "__file__" in globals()
+    else {os.path.abspath(os.path.join(_code_dir, "47- Package Split Test.py"))})
+_never_read = []
+for _f in _PKG_FILES:
+    _rel = os.path.relpath(_f, _code_dir).replace(os.sep, "/")
+    _exempt = _UNREAD_CONSTANT_EXEMPTIONS.get(_rel, [])
+    for _name, _lineno in _module_constants(_f):
+        if _name in _exempt or _name in _reads or _named_in(_name, _string_blob):
+            continue
+        _never_read.append(f"{_rel}:{_lineno} {_name}")
+
+check("every module-level constant in the package is read by something, "
+      "somewhere in the repository (or is exempted with an argument)",
+      sorted(_never_read), [])
+
+# THE EXEMPTIONS ARE NOT A GET-OUT: each one must still be genuinely unread, or
+# it is a stale line hiding the fact that the code moved on. This is the same
+# non-degeneracy discipline the rest of the file applies -- an exemption that
+# suppresses nothing looks identical to one doing real work.
+_dead_exemptions = []
+for _rel, _names in _UNREAD_CONSTANT_EXEMPTIONS.items():
+    for _name in _names:
+        if _name in _reads or _named_in(_name, _string_blob):
+            _dead_exemptions.append(f"{_rel}:{_name}")
+check("...and every exemption is still needed -- an exempted constant that "
+      "something now reads must lose its exemption, not keep it",
+      sorted(_dead_exemptions), [])
+
+# The exemptions must still EXIST. An exemption for a constant that has since
+# been deleted or renamed is a line that silences nothing and hides the fact
+# that the list is stale.
+_missing_exemptions = []
+for _rel, _names in _UNREAD_CONSTANT_EXEMPTIONS.items():
+    _declared = {n for n, _ln in _module_constants(
+        os.path.join(_code_dir, _rel.replace("/", os.sep)))}
+    _missing_exemptions += [f"{_rel}:{n}" for n in _names if n not in _declared]
+check("...and every exempted constant still exists, so the exemption list "
+      "cannot go stale unnoticed",
+      sorted(_missing_exemptions), [])
+
+# --- NEGATIVE CONTROLS -----------------------------------------------------
+#
+# "[] unused" is also what a broken scanner returns. Both scans are fired
+# against planted cases in a temporary file, and BOTH DIRECTIONS are covered:
+# what must be reported, and what must not.
+_UNREAD_DIR = tempfile.mkdtemp(prefix="oncotriage-unread-")
+try:
+    _probe = os.path.join(_UNREAD_DIR, "probe.py")
+
+    # (i) unused-import controls
+    for _label, (_code, _expected) in {
+        "a bound-and-never-read import is REPORTED": (
+            "import os\nimport sys\nprint(os.sep)\n", ["sys (line 2)"]),
+        "an import read only through an attribute is NOT reported": (
+            "import os\nprint(os.sep)\n", []),
+        "an aliased import read under its alias is NOT reported": (
+            "import subprocess as sp\nsp.run([])\n", []),
+        "an aliased import NEVER read is REPORTED under its alias": (
+            "import subprocess as sp\nprint('subprocess')\n", ["sp (line 1)"]),
+        "a from-import read as a bare name is NOT reported": (
+            "from typing import Dict\nx: Dict = {}\n", []),
+        "a noqa line is exempt, as declared": (
+            "import sys  # noqa: F401\n", []),
+    }.items():
+        with open(_probe, "w", encoding="utf-8") as _fh:
+            _fh.write(_code)
+        check(f"unused-import scan: {_label}", _unused_imports(_probe), _expected)
+
+    # (ii) never-read-constant controls, INCLUDING the three reference forms a
+    # constant can be read through. The string-literal form is the one that
+    # produced a false positive on the first run of this scan (PATH_NAMES,
+    # reached through getattr(module, "PATH_NAMES")), so it is controlled here
+    # rather than trusted.
+    _reader = os.path.join(_UNREAD_DIR, "reader.py")
+    for _label, (_decl, _use, _expect_reported) in {
+        "a constant nothing reads is REPORTED":
+            ("PLANTED_DEAD = 1\n", "", True),
+        "...read as a bare name is not":
+            ("PLANTED_DEAD = 1\n", "from probe import PLANTED_DEAD\n"
+                                   "print(PLANTED_DEAD)\n", False),
+        "...read as an attribute is not":
+            ("PLANTED_DEAD = 1\n", "import probe\nprint(probe.PLANTED_DEAD)\n",
+             False),
+        "...read through a string literal is not (getattr, or a name inside "
+        "the source of a subprocess probe)":
+            ("PLANTED_DEAD = 1\n",
+             "import probe\nprint(getattr(probe, 'PLANTED_DEAD'))\n", False),
+        "...named only in a COMMENT is still REPORTED, because a comment is "
+        "not a read":
+            ("PLANTED_DEAD = 1\n", "# PLANTED_DEAD is mentioned here\n", True),
+    }.items():
+        with open(_probe, "w", encoding="utf-8") as _fh:
+            _fh.write(_decl)
+        with open(_reader, "w", encoding="utf-8") as _fh:
+            _fh.write(_use)
+        _r, _b = _all_reads([_probe, _reader])
+        _reported = not ("PLANTED_DEAD" in _r
+                         or _named_in("PLANTED_DEAD", _b))
+        check(f"unread-constant scan: {_label}", _reported, _expect_reported)
+
+    # THE CONTROL THAT ALREADY EARNED ITS KEEP. The first version of
+    # _all_reads() added every ast.Name node without checking ctx, so
+    # `PLANTED_DEAD = 1` counted as a read OF ITSELF and the whole scan passed
+    # vacuously over the real package. These two cases are what said so, on the
+    # first run, before it shipped. Pinned explicitly so the ctx test cannot be
+    # dropped again.
+    with open(_probe, "w", encoding="utf-8") as _fh:
+        _fh.write("PLANTED_DEAD = 1\nPLANTED_DEAD += 1\nfor PLANTED_DEAD in []:\n"
+                  "    pass\n")
+    _r, _b = _all_reads([_probe])
+    check("unread-constant scan: an assignment TARGET is not a read -- the "
+          "defect that made the first version of this scan vacuous",
+          "PLANTED_DEAD" in _r, False)
+    with open(_probe, "w", encoding="utf-8") as _fh:
+        _fh.write("PLANTED_DEAD = 1\nprint(PLANTED_DEAD)\n")
+    _r, _b = _all_reads([_probe])
+    check("...while a genuine load in the same file IS a read, so the ctx test "
+          "did not simply blind the scanner",
+          "PLANTED_DEAD" in _r, True)
+
+    # WORD BOUNDARIES. `ECOG_LOINC_PANEL_CODE` is a substring of
+    # `_ECOG_LOINC_PANEL_CODE`, a different constant in a different module, and
+    # this project keeps exactly that pair. A plain `in` test reported the first
+    # as read because the second was named.
+    check("unread-constant scan: a name is NOT considered read because a "
+          "longer name contains it",
+          _named_in("ECOG_LOINC_PANEL_CODE", "'_ECOG_LOINC_PANEL_CODE',"),
+          False)
+    check("...while the name itself, on a boundary, IS found",
+          _named_in("ECOG_LOINC_PANEL_CODE", "getattr(m, 'ECOG_LOINC_PANEL_CODE')"),
+          True)
+finally:
+    shutil.rmtree(_UNREAD_DIR, ignore_errors=True)
+
+
+# ===========================================================================
+# 2i. NO DEFINITION LOST A DECORATOR IN A CONVERSION PASS  (pass 20c-3i)
+# ===========================================================================
+
+print("\n" + "=" * 78)
+print("2i. the decorator inventory of the whole package, pinned")
+print("=" * 78)
+
+# THE DEFECT THIS PINS, and it was found by an equivalence proof rather than by
+# a check, which is why there is a check now.
+#
+# Pass 20c-3c-1 extracted the dashboard by slicing each definition from the
+# lineno ast reports -- and AST REPORTS A DECORATED FUNCTION'S lineno AT THE
+# `def`, NOT AT THE DECORATOR. So @st.fragment was silently dropped from four
+# tabs. That is a real behaviour change (a fragment re-runs in isolation;
+# without it every interaction in those tabs re-runs the whole app) and nothing
+# but the ast.unparse comparison against git would have caught it. The SAME
+# slicing approach moved Files 07 through 25.
+#
+# Pass 20c-3i swept it properly: every FunctionDef / AsyncFunctionDef /
+# ClassDef in the package, AT EVERY NESTING DEPTH, compared against the
+# pre-split version of the numbered file it came from, with the origin commit
+# derived from `git log --diff-filter=A` rather than declared. 404 definitions,
+# 314 matched to an origin, 18 carrying decorators, ZERO mismatches, and zero
+# decorated origin definitions that failed to reproduce. Three negative controls
+# (api/server.py, dashboard/tabs/drift.py, agent/retrieval.py) were each
+# stripped in an AST copy and each stopped agreeing with its origin.
+#
+# WHY THE SWEEP IS NOT THIS CHECK. It needs git history, so it would fail in a
+# checkout without it and would compare against whatever HEAD happened to be.
+# What survives here is the INVENTORY: the exact decorator list of every
+# decorated definition in the package. A future edit that drops one fails, and
+# a new decorated definition has to be declared rather than merely appearing.
+#
+# DEPTH MATTERS AND IS THE REASON THE FIRST SWEEP WAS INCOMPLETE. A top-level
+# walk reported api/server.py's four endpoints as having no counterpart at all,
+# because create_app() nests them -- so the four definitions in the package
+# carrying the MOST decorators were the four a top-level scan could not see.
+# Those four also separate their decorators from the `def` with BLANK LINES,
+# which is invisible to ast (decorator_list is on the node) and fatal to any
+# check written against adjacency.
+
+_DEF_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def _decorated_definitions(path):
+    """{qualified name: [unparsed decorators]} at EVERY depth, decorated only."""
+    out = {}
+
+    def walk(node, prefix):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, _DEF_TYPES):
+                qual = f"{prefix}.{child.name}" if prefix else child.name
+                if child.decorator_list:
+                    out[qual] = [ast.unparse(d) for d in child.decorator_list]
+                walk(child, qual)
+            else:
+                walk(child, prefix)
+
+    walk(ast.parse(open(path, encoding="utf-8").read(), path), "")
+    return out
+
+
+_DECORATOR_INVENTORY = {
+    # Both qdrant_retry helpers are NESTED inside the node that uses them.
+    "oncotriage/agent/retrieval.py::build_bm25_index_from_qdrant._scroll_page":
+        ["qdrant_retry"],
+    "oncotriage/agent/retrieval.py::node_hybrid_retrieval._batch_scroll":
+        ["qdrant_retry"],
+    # Nested inside create_app(), with BLANK LINES between decorator and def.
+    "oncotriage/api/server.py::lifespan": ["asynccontextmanager"],
+    "oncotriage/api/server.py::create_app.health_check": ["app.get('/health')"],
+    "oncotriage/api/server.py::create_app.pipeline_info":
+        ["app.get('/pipeline/info')"],
+    "oncotriage/api/server.py::create_app.match_patient_endpoint":
+        ["app.post('/match', response_model=MatchResponse)",
+         "limiter.limit(RATE_LIMIT)"],
+    "oncotriage/api/server.py::create_app.match_patient_file":
+        ["app.post('/match/file', response_model=MatchResponse)",
+         "limiter.limit(RATE_LIMIT)"],
+    "oncotriage/dashboard/data.py::load_inferences_data":
+        ["st.cache_data(ttl=60)"],
+    "oncotriage/dashboard/data.py::load_trial_matches_data":
+        ["st.cache_data(ttl=60)"],
+    "oncotriage/dashboard/data.py::load_drift_metrics_data":
+        ["st.cache_data(ttl=60)"],
+    # The four that pass 20c-3c-1 dropped and its equivalence proof recovered.
+    "oncotriage/dashboard/tabs/drift.py::render_drift_detection_tab":
+        ["st.fragment"],
+    "oncotriage/dashboard/tabs/patient_explorer.py::render_patient_explorer_tab":
+        ["st.fragment"],
+    "oncotriage/dashboard/tabs/reproducibility.py::render_reproducibility_tab":
+        ["st.fragment"],
+    "oncotriage/dashboard/tabs/trial_explorer.py::render_trial_explorer_tab":
+        ["st.fragment"],
+    "oncotriage/registries/cancer_code_registry.py::CancerCodeRegistry._invert_date":
+        ["staticmethod"],
+    # _date_sort_key belongs to OncologyLabRegistry, NOT CancerCodeRegistry --
+    # two classes in one module, and the qualified name is what distinguishes
+    # them. A bare-name inventory could not.
+    "oncotriage/registries/cancer_code_registry.py::OncologyLabRegistry._date_sort_key":
+        ["staticmethod"],
+    "oncotriage/registries/mesh.py::MeSHCancerFilter._stem": ["staticmethod"],
+    "oncotriage/retrieval/indexer.py::get_embeddings_batch._call": [
+        "retry(reraise=True, stop=stop_after_attempt(5), "
+        "wait=wait_exponential(multiplier=1, min=2, max=60), "
+        "retry=retry_if_exception_type((RateLimitError, InternalServerError, "
+        "APIConnectionError)))"],
+}
+
+_found_decorators = {}
+for _f in _PKG_FILES:
+    _rel = os.path.relpath(_f, _code_dir).replace(os.sep, "/")
+    for _qual, _decs in _decorated_definitions(_f).items():
+        _found_decorators[f"{_rel}::{_qual}"] = _decs
+
+check("the decorator inventory of the package is exactly what it was after the "
+      "conversion passes -- same definitions, same decorators, at every depth",
+      _found_decorators, _DECORATOR_INVENTORY)
+check("...and it is non-degenerate: the four @st.fragment tabs pass 20c-3c-1 "
+      "silently dropped are in it",
+      sorted(k for k, v in _found_decorators.items() if v == ["st.fragment"]),
+      ["oncotriage/dashboard/tabs/drift.py::render_drift_detection_tab",
+       "oncotriage/dashboard/tabs/patient_explorer.py::render_patient_explorer_tab",
+       "oncotriage/dashboard/tabs/reproducibility.py::render_reproducibility_tab",
+       "oncotriage/dashboard/tabs/trial_explorer.py::render_trial_explorer_tab"])
+check("...and it reaches definitions NESTED inside a function, which a "
+      "top-level walk cannot see -- the four api/server.py endpoints live "
+      "inside create_app() and carry the most decorators in the package",
+      sorted(k for k in _found_decorators if "create_app." in k),
+      ["oncotriage/api/server.py::create_app.health_check",
+       "oncotriage/api/server.py::create_app.match_patient_endpoint",
+       "oncotriage/api/server.py::create_app.match_patient_file",
+       "oncotriage/api/server.py::create_app.pipeline_info"])
+
+# NEGATIVE CONTROL: strip a decorator from an AST COPY of the real file -- never
+# the file itself -- and require the inventory to stop matching. Aimed at
+# api/server.py because its decorators are the ones separated from the def by
+# blank lines, which is the shape any adjacency-based check would miss.
+_DEC_DIR = tempfile.mkdtemp(prefix="oncotriage-decorator-")
+try:
+    _server_src = open(os.path.join(_PKG_DIR, "api", "server.py"),
+                       encoding="utf-8").read()
+    _server_tree = ast.parse(_server_src)
+    _stripped_any = False
+    for _node in ast.walk(_server_tree):
+        if isinstance(_node, _DEF_TYPES) and _node.name == "match_patient_endpoint":
+            _node.decorator_list = []
+            _stripped_any = True
+    check("the control found the definition it strips (non-degeneracy)",
+          _stripped_any, True)
+    _copy = os.path.join(_DEC_DIR, "server_copy.py")
+    with open(_copy, "w", encoding="utf-8") as _fh:
+        _fh.write(ast.unparse(_server_tree))
+    _control = _decorated_definitions(_copy)
+    check("the inventory CATCHES a decorator removed from a copy: the "
+          "definition disappears from the decorated set",
+          "create_app.match_patient_endpoint" in _control, False)
+    check("...while the three other endpoints in the same copy keep theirs, so "
+          "the control removed one thing rather than breaking the parser",
+          sorted(k for k in _control if "create_app." in k),
+          ["create_app.health_check", "create_app.match_patient_file",
+           "create_app.pipeline_info"])
+finally:
+    shutil.rmtree(_DEC_DIR, ignore_errors=True)
+
+
+# ===========================================================================
 # 3. THE CLIENT FACTORIES ARE LAZY AND CACHED
 # ===========================================================================
 
@@ -2855,6 +3667,18 @@ print(json.dumps({
     "state_with_override": state_with_override,
     "peeked_is_sentinel": peeked_is_sentinel,
     "state_after_override_removed": state_after,
+    # RESOLUTION_STATES IS A CLOSED SET AND THIS IS WHAT CLOSES IT (20c-3i).
+    # Its docstring says "every value resolution_state() can return ... so a
+    # caller can branch on it exhaustively", and until this pass no caller
+    # anywhere in the repository read it -- it was a declaration with nothing
+    # holding it to the code it described, the same shape as
+    # PASSWORD_SOURCE_ARGUMENT in orchestration/airflow_manager.py. Both
+    # observed states are checked for membership, so a fourth state added to
+    # resolution_state() without being added to the tuple fails here.
+    "states_are_in_the_closed_set":
+        (state_with_override in deps.RESOLUTION_STATES
+         and state_after in deps.RESOLUTION_STATES),
+    "closed_set_is_non_degenerate": len(deps.RESOLUTION_STATES) == 3,
     "repr_did_not_raise": True,
     "repr_names_the_error": "KeyError" in bad_text,
     "repr_failure_recorded": len(Cls.repr_failures) == before + 1,
@@ -2929,6 +3753,18 @@ else:
     check("...and the key goes back to unresolved when the override is removed, "
           "so the state query is reading live state rather than a constant",
           _payload.get("state_after_override_removed"), "unresolved")
+    # Pass 20c-3i. deps.RESOLUTION_STATES documents itself as the CLOSED set of
+    # values resolution_state() can return, and nothing in the repository read
+    # it -- a declaration with nothing holding it to the code. Both observed
+    # states are now checked against it, so a fourth state added to the function
+    # and not to the tuple fails here rather than silently widening a set
+    # callers were told they could branch on exhaustively.
+    check("both observed states are members of deps.RESOLUTION_STATES, which "
+          "is what makes that tuple a closed set rather than a comment",
+          _payload.get("states_are_in_the_closed_set"), True)
+    check("...and the set is the size it claims (non-degeneracy: membership in "
+          "an empty or one-element tuple would prove nothing)",
+          _payload.get("closed_set_is_non_degenerate"), True)
 
     check("__repr__ over a proxy deps cannot answer for does NOT raise",
           _payload.get("repr_did_not_raise"), True)

@@ -62,9 +62,10 @@ import json
 import os
 import sqlite3
 import threading
-from typing import Dict, List, Optional
+from typing import Dict
 
 from oncotriage import paths
+from oncotriage import settings
 from oncotriage.config import MATCHING_MODEL, PRICING_CONFIG
 from oncotriage.registries.primary_cancer import _resolve_primary_cancer
 from oncotriage.utils import deduplicate_by_display, get_model_cost
@@ -76,13 +77,33 @@ from oncotriage.utils import deduplicate_by_display, get_model_cost
 def resolve_inference_db_path(db_path=None):
     """The database ``log_inference`` will write to for this call.
 
-    Args:
-        db_path: An explicit path, or ``None`` for the configured production
-            database (``oncotriage.paths.inferences_path``, resolved on this
-            call — see that module for why resolution is lazy).
+    Three tiers, first match wins:
+
+        1. ``db_path`` -- an explicit argument, returned unmodified;
+        2. ``ONCOTRIAGE_INFERENCES_DB`` (pass 20c-3i);
+        3. ``oncotriage.paths.inferences_path``, the configured production
+           database, resolved on this call -- see that module for why
+           resolution is lazy.
 
     Returns:
-        The path string, unmodified when one was supplied.
+        The path string.
+
+    WHY TIER 2 EXISTS. "17- FastAPI Server.py" calls ``log_inference(result,
+    patient_data)`` with no path, and it cannot sensibly do otherwise -- it is a
+    server handling requests, not a test that knows where its output belongs. So
+    every run of "18- FastAPI Server Test.py" or "19- FastAPI Server Batch
+    Test.py" against a live server wrote real rows into the real production
+    database. That is not hypothetical: six such rows dated 2026-08-05 are in
+    it, and they changed which query "16- Database Query.py" dies at.
+
+    The server is a separate process, so the redirect has to be settable from
+    OUTSIDE the process that decides to log. An environment variable is the only
+    channel that reaches it:
+
+        ONCOTRIAGE_INFERENCES_DB=/tmp/t.db python "17- FastAPI Server.py"
+
+    ``oncotriage/monitoring/drift.py:resolve_drift_db_path`` honours the same
+    variable, deliberately without importing this function -- see its docstring.
 
     THIS FUNCTION DOES NOT CONSULT THE EXEC NAMESPACE, and that asymmetry is on
     purpose. The shim's ``log_inference`` wrapper is what reads
@@ -92,11 +113,25 @@ def resolve_inference_db_path(db_path=None):
     is doing any work. If this resolved through the namespace too, those tests
     would be comparing a value against itself.
 
+    THE ARGUMENT STILL WINS OVER THE VARIABLE, and that ordering is what keeps
+    those five tests meaningful. They pass an explicit scratch path and assert
+    on the path returned; if the variable outranked the argument, a stray export
+    in the operator's shell would silently redirect a test that had asked for
+    somewhere specific, and the assertion would report the redirect as the
+    answer it wanted.
+
     It resolves and returns; it opens nothing. Calling it is safe on a machine
-    with a database it must not touch.
+    with a database it must not touch. The one thing it can RAISE is a
+    RuntimeError from ``resolve_inferences_db`` when the variable names a path
+    whose parent directory is absent -- deliberately, because both callers
+    resolve outside their try block so a configuration defect reaches the
+    operator rather than being swallowed as a logging fault.
     """
     if db_path is not None:
         return db_path
+    override, _source = settings.resolve_inferences_db()
+    if override is not None:
+        return override
     return paths.inferences_path
 
 #------------------------------------------------------------------------------
