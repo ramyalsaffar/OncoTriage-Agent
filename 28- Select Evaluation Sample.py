@@ -1,12 +1,24 @@
-# Select 30 Samples
-###################
+# Select the Evaluation Sample
+##############################
 
 """
-Sample 30 patients (10 breast, 10 colon, 10 lung) — entry point.
+Draw the stratified evaluation sample — entry point.
 
 Creates a new SQLite database containing ONLY the sampled patients' inferences
 and trial_matches rows. The sampler itself is
 ``oncotriage/evaluation/sampling.py``; item 20c pass 3d moved it there.
+
+RENAMED IN PASS 20e, from "28- Select 30 Samples.py". The old name baked the
+SAMPLE SIZE into a filename, which is the one thing about this file most likely
+to change: the size is 10 per cancer group, three groups, and it is a
+CONSTANT IN THE SAMPLER, not a property of the entry point. Widening the sample
+to 20 per group under a file called "Select 30 Samples" would leave the
+filename asserting something false with nothing to catch it -- a filename is not
+checked by anything. The current size is stated below and in the sampler, where
+it can be kept true. The number stays 28 so that every note and document naming
+File 28 still resolves; see "PIPELINE SEQUENCE.md".
+
+Current size: 10 breast + 10 colon + 10 lung = 30, seed 42.
 
 Sampling
 --------
@@ -41,8 +53,8 @@ locations and create nothing.
 
 Run from terminal:
     cd ".../03- Code"
-    python "28- Select 30 Samples.py"
-    python "28- Select 30 Samples.py" --output-db <scratch>/sample.db
+    python "28- Select Evaluation Sample.py"
+    python "28- Select Evaluation Sample.py" --output-db <scratch>/sample.db
 """
 
 import os

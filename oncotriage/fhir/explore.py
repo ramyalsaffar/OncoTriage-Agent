@@ -13,7 +13,7 @@ delegated to ``oncotriage.registries.cancer_code_registry`` (File 08) and
 agent uses at query time. A dataset table produced here therefore describes the
 same cohort the results tables describe.
 
-Moved out of ``06- FHIR Explore.py`` by item 20c, pass 3a. That file is now a
+Moved out of ``06- FHIR Dataset Characterization.py`` by item 20c, pass 3a. That file is now a
 thin entry point holding only its ``__main__`` block: nothing in the repository
 chains it, so it needs no re-export shim and its exec bootstrap is gone.
 
@@ -49,7 +49,7 @@ have silently changed how a directly-called analysis renders.
 matplotlib, seaborn and pandas ARE imported at module scope, unlike the
 third-party imports deferred into function bodies elsewhere in this package.
 They are this module's whole subject — seven of its twelve functions plot — and
-nothing but ``06- FHIR Explore.py`` imports it, so the cost lands only on the
+nothing but ``06- FHIR Dataset Characterization.py`` imports it, so the cost lands only on the
 one caller that was always going to pay it. ``tests/test_package_invariants.py``
 section 2 pre-imports all three before arming its traps, the same allowance it
 already makes for openai, qdrant_client, numpy and langgraph, so the claim it

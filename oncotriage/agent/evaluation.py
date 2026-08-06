@@ -111,10 +111,10 @@ class MatchingModelMismatchError(RuntimeError):
             f"would come from a different judge than the rows already in "
             f"inferences.db, so the run is stopped rather than continued and "
             f"logged. After reviewing what changed, set MATCHING_MODEL in "
-            f"'03- Config.py' to {returned!r}, add it to PRICING_CONFIG if it "
+            f"'oncotriage/config.py' to {returned!r}, add it to PRICING_CONFIG if it "
             f"is not there, and re-baseline; do not accept it silently."
         )
-# MATCHING_MAX_TOKENS and MATCHING_SEED are in 03- Config.py, together with
+# MATCHING_MAX_TOKENS and MATCHING_SEED are in oncotriage/config.py, together with
 # the truncation thresholds calibrated against the first of them.
 
 

@@ -1,8 +1,23 @@
-# Empty the SQLite Database
-###########################
+# Wipe Every Row From the Inference Database
+############################################
 
 """
-Empty the inference database, preserving the tables.
+DELETE every row from every table in the inference database, preserving the
+tables themselves. Gated by ``Flag`` below, which ships False.
+
+RENAMED IN PASS 20e, from "15- Database Empty.py". "Empty" is a STATE, and a
+file called "Database Empty" reads as a question -- is the database empty? --
+or as a report that it is. What the file does is an ACTION, and a destructive
+one: it opens the production inference log and issues `DELETE FROM` against
+every table `sqlite_master` lists. The number stays 15 so that every note,
+commit message and document naming File 15 still resolves; see
+"PIPELINE SEQUENCE.md" and tests/FILE NUMBER MAPPING.md.
+
+THE NAME STILL DOES NOT SAY IT IS GATED, and that is deliberate rather than an
+oversight. A filename cannot carry a safety property honestly: the gate is one
+line of source that anyone may flip, so a name promising "gated" would be false
+the moment someone armed it, and false in the reassuring direction. The name
+says what happens when it runs; ``Flag`` below says whether it runs.
 
 THIN ENTRY POINT (item 20c, pass 3b)
 ------------------------------------
@@ -32,7 +47,7 @@ any of them:
     the __main__ guard  the function runs from here and nowhere else.
 
 Run from terminal:
-    python "15- Database Empty.py"
+    python "15- Database Wipe All Tables.py"
 """
 
 import os

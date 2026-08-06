@@ -1,9 +1,29 @@
 """The project's main configuration values.
 
-Moved out of ``03- Config.py`` by item 20c. ``03- Config.py`` survives as a
-shim that re-exports every name below and additionally binds the two eager
-client names (``openai_client``, ``qdrant_client``) that Files 04 to 46 expect
-to find in the shared exec namespace.
+Moved out of ``03- Config.py`` by item 20c. ``03- Config.py`` survived as a shim
+that re-exported every name below and additionally bound the eager client names
+(``openai_client``, ``qdrant_client``) that Files 04 to 46 expected to find in
+the shared exec namespace. IT IS DELETED AS OF PASS 20e: the last three files
+that chained it — 05, 09 and 13 — became thin entry points in that pass, and
+nothing else in the repository loaded it.
+
+WHAT THE SHIM'S EAGERNESS WAS FOR, recorded here because the trade-off is about
+this module. The chain's contract was that after ``03- Config.py`` the clients
+EXIST, so the shim called ``get_keys()``, ``get_sdk_default_timeout()``,
+``get_openai_client()`` and ``get_qdrant_client()`` at load and bound their
+results. Loading it therefore required a readable .env with all three keys, and
+that was deliberate: half-loading would have moved the failure to a random later
+line instead of that one. Nothing does that now — every consumer calls a factory
+— so a process that never needs a client never reads the .env, and a missing key
+surfaces at the first call rather than at import. That is strictly better and it
+is a real behavioural difference, stated rather than discovered.
+
+``DATA_SNAPSHOT_DATE`` LIVES HERE AND ONLY HERE.
+``tests/test_config_snapshot_date_rot.py`` rewrites the assignment as TEXT in
+this file and re-runs two tests as subprocesses at several dates. The shim
+re-exported the name, which never gave it back — a name bound by an import
+cannot be patched by editing the file that imported it — and that is why the
+rot test has always targeted this file.
 
 WHAT CHANGED, and why
 ---------------------
@@ -23,17 +43,27 @@ two structured ``httpx.Timeout`` objects — became lazy with it, because a valu
 derived at import from a lazy source is not lazy at all.
 
 Each factory builds at most one object and returns the same one thereafter, so
-the eager names the shim binds are the SAME objects the package hands out. That
-matters: ``fixture_capture.py`` and ``fixture_replay.py`` rebind
-``openai_client`` / ``qdrant_client`` in the shared namespace to recording
-proxies. That seam works because the pipeline resolves the NAME at call time;
-the factories exist for the package's own callers, not to replace it.
+every caller sees one OpenAI client and one Qdrant client per process, however
+many times it asks.
 
-``36- Logging Contract Test.py`` used to be named here as a third consumer. It
-is not one: it stopped rebinding at pass 20c-2c and installs
-``deps.set_override(deps.QDRANT_CLIENT, ...)`` instead, and pass 20d-1 moved it
-to ``tests/test_storage_inference_logging_contract.py`` (see
-``tests/FILE NUMBER MAPPING.md``).
+NOTHING REDIRECTS A CLIENT BY REBINDING A NAME ANY MORE. ``fixture_capture.py``
+and ``fixture_replay.py`` used to rebind ``openai_client`` / ``qdrant_client``
+in the shared exec namespace to recording proxies, which worked only because the
+pipeline resolved the NAME at call time inside one shared dict; both install
+``deps.set_override(...)`` since pass 20c-3d. ``36- Logging Contract Test.py``
+stopped at pass 20c-2c and is now
+``tests/test_storage_inference_logging_contract.py``. The seam is
+``oncotriage/agent/deps.py`` and nothing else — see its docstring for why an
+implicit seam that a caller can reach around is the defect this project exists
+to remove.
+
+WHICH CLIENT SOURCE A MODULE USES IS A DECISION, NOT A HABIT. The agent reaches
+clients through ``oncotriage.agent.deps``; ``oncotriage/retrieval/indexer.py``
+and ``oncotriage/retrieval/qdrant_backup.py`` deliberately use the factories
+HERE instead, because an index build and a backup must not be redirected by a
+stub installed for an agent test. ``oncotriage/retrieval/index_validator.py``
+goes through ``deps``, because the question it answers is "is this index healthy
+for the AGENT to query".
 
 Imports ``oncotriage.paths`` and nothing else from the project. It must never
 import ``oncotriage.utils``: that is the cycle item 20c removed.

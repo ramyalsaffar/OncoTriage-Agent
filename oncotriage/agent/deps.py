@@ -54,10 +54,52 @@ want; ``restore_overrides(saved)`` puts them back, treating ``_UNSET`` as
 
 ASKING WITHOUT BUILDING (pass 20c-3b). ``peek``, ``resolution_state``,
 ``is_resolved`` and ``cached_keys`` answer "what is installed for this key right
-now" WITHOUT calling a factory. They exist because File 13's lazy proxy renders
-its ``__repr__`` from them: a repr that resolves is a repr that downloads and
-loads MedCPT, on the diagnostic path, at the moment someone is already confused.
-See the block above ``_resolve`` for the full argument.
+now" WITHOUT calling a factory. A query that resolves is a query that downloads
+and loads MedCPT, on the DIAGNOSTIC path, at the moment someone is already
+confused — the tool used to inspect the state must not be the thing that changes
+it. See the block above ``_resolve`` for the full argument.
+
+They were built for File 13's shim, whose ``_LazyAgentDependency.__repr__``
+rendered itself from them, and pass 20e deleted that shim. The reason they
+outlive it is the same reason they were right there: any caller asking "what is
+installed for this key" — a debugger, a log line, a harness reporting what it
+redirected — must be able to ask without paying ~110 MB for the answer.
+``RESOLUTION_STATES`` is the closed set of values ``resolution_state`` can
+return, so a caller may branch on it exhaustively;
+``tests/test_package_invariants.py`` section 5c holds it to that.
+
+WHAT DIED WITH FILE 13'S SHIM, AND WHY NONE OF IT NEEDS REBUILDING (pass 20e)
+-----------------------------------------------------------------------------
+The shim carried two mechanisms that existed ONLY because an exec-chain caller
+could reach into its namespace. Both are recorded here rather than deleted with
+the file, because a deleted argument is how a defect returns.
+
+``_LazyAgentDependency`` bound ``medcpt_tokenizer``, ``medcpt_model`` and
+``_bm25_query_model`` in the shim's namespace to proxies that resolved through
+the accessors below on first use. It existed because an exec-chain caller reads
+a NAME out of a namespace and cannot call an accessor, and because binding the
+real objects eagerly would have loaded MedCPT (~110 MB) and FastEmbed for the
+seven files that chained File 13 and never scored a pair. There is no exec-chain
+caller now: ``12- RAG Trial Indexer Validator.py`` and every test call
+``get_medcpt_tokenizer()`` / ``get_medcpt_model()`` / ``get_bm25_query_model()``
+directly, which is lazier than the proxy was and cannot answer wrongly about the
+object it wraps. THE RULE THE PROXY TAUGHT STILL APPLIES ANYWHERE ONE IS
+REINTRODUCED: CPython looks an implicit special method up on the TYPE, never
+through ``__getattr__``, so a proxy forwarding only ``__getattr__`` and
+``__call__`` answers ``bool()``, ``==``, ``len``, ``iter``, ``in`` and ``repr``
+about ITSELF — confidently, and wrongly — about an object it never consulted.
+
+``_assert_no_legacy_rebinding()`` refused to run the pipeline if any of nine
+names in the shim's namespace had been rebound, and named the ``deps`` key to
+use instead. It was the answer to "a caller redirects the agent the old way and
+nothing says so", and it could only ever see rebindings in that one namespace.
+With the namespace gone the failure mode is gone with it: there is nowhere left
+to rebind. The seam below is now the ONLY way to redirect anything the agent
+reaches, ``OVERRIDE_KEYS`` is closed so an unknown key raises rather than being
+silently ignored, and both fixture harnesses assert BY IDENTITY that the object
+``deps`` hands the agent is theirs — ``fixture_replay.py`` running that
+assertion as a negative control first, with no override installed, and refusing
+to replay unless it fails.
 
 WHAT IS OVERRIDABLE, and why each one is on the list
 ----------------------------------------------------
@@ -499,9 +541,10 @@ class _DeferredLocalModel:
     def _explode(self, how: str):
         raise RuntimeError(
             f"{self._name} was not loaded: {DEFER_LOCAL_MODELS_ENV}=1 was set "
-            f"when 13- LangGraph Agent.py was exec'd, and nothing replaced the "
-            f"placeholder before {how}. A replay harness must bind its own "
-            f"stand-in; a production run must not set that variable."
+            f"when oncotriage.agent.deps was first imported, and nothing "
+            f"replaced the placeholder before {how}. A replay harness must "
+            f"install its own stand-in through deps.set_override(); a "
+            f"production run must not set that variable."
         )
 
     def __getattr__(self, attr):

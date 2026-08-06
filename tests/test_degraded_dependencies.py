@@ -1343,43 +1343,53 @@ check("no degradation counter leaked into it",
       sorted(k for k in (_returned or [])
              if "age_parse" in k or "unparsed" in k or "degrad" in k), [])
 
-# --- THE FILE 05 SHIM STILL BINDS FOURTEEN NAMES --------------------------
+# --- FILE 05 IS A THIN ENTRY POINT AND EXPORTS NOTHING (pass 20e) ---------
 #
-# File 47 section 5 is the authoritative check; this is the cheap local one, so
-# that adding dry_run as a helper instead of a parameter fails here immediately
-# rather than at the end of an eight-minute serial run.
-_shim_names = set()
-for _node in ast.parse(open(os.path.join(_CODE_DIR, "05- FHIR Clean Data.py"),
-                             encoding="utf-8").read()).body:
-    if isinstance(_node, ast.ImportFrom) and _node.module == "oncotriage.fhir.clean":
-        _shim_names |= {a.asname or a.name for a in _node.names}
-    elif isinstance(_node, ast.Assign):
-        _shim_names |= {t.id for t in _node.targets if isinstance(t, ast.Name)}
+# WHAT THIS WAS. Until pass 20e it asserted that "05- FHIR Clean Data.py"'s
+# re-export shim bound exactly eleven names statically (fourteen at runtime,
+# the difference being three exec-bootstrap leftovers), so that adding dry_run
+# as a new exported HELPER instead of a parameter would fail here in thirty
+# seconds rather than at the end of an eight-minute serial run.
+#
+# WHY IT CHANGED. Pass 20e deleted that shim. It existed for one consumer --
+# "34- Cohort Selector Diff Read Only.py" chained File 05 and read has_cancer_diagnosis
+# and _CANCER_REGISTRY out of the shared exec namespace -- and pass 20c-3d had
+# already converted File 34 into a thin entry point over
+# oncotriage/evaluation/cohort_diff.py, which imports both from the package.
+# The shim spent two passes serving nobody.
+#
+# THE PROPERTY THIS SECTION GUARDS IS UNCHANGED, and it was never really about
+# the count: it is that item 11a's dry run must be a PARAMETER on the existing
+# function rather than a second exported entry point, because a plan produced
+# by a second implementation is a plan that can disagree with the deletion it
+# previews. So the assertion is now the stronger form of the same thing --
+# File 05 exports NOTHING AT ALL, so there is no surface for a second helper to
+# appear on. A new name in this file fails whatever it is called.
+_entry_tree = ast.parse(open(os.path.join(_CODE_DIR, "05- FHIR Clean Data.py"),
+                             encoding="utf-8").read())
+_entry_pkg_imports = sorted(
+    a.asname or a.name for n in _entry_tree.body
+    if isinstance(n, ast.ImportFrom) and (n.module or "").startswith("oncotriage")
+    for a in n.names)
+check("File 05 imports only what its __main__ block calls",
+      _entry_pkg_imports, ["Project_Name", "filter_cancer_patients_inplace"])
+# NON-DEGENERATE: the scan must be looking at a real file with real imports, or
+# "only two names" is what an empty parse returns too.
+check("...and the scan parsed a real file (non-degeneracy)",
+      len(_entry_tree.body) > 5, True)
+check("no helper is exported alongside them -- require_intact_registry and "
+      "DRY_RUN_MANIFEST_SUFFIX in particular",
+      sorted({"require_intact_registry", "DRY_RUN_MANIFEST_SUFFIX"}
+             & set(_entry_pkg_imports)), [])
+# And nothing is assigned at module level either, which is the other way a name
+# reaches a caller. `Flag`-style module data is legitimate in File 15; here
+# there is none, and a new one would be a surface this file is not supposed to
+# have.
+_entry_assigns = sorted(
+    t.id for n in _entry_tree.body if isinstance(n, ast.Assign)
+    for t in n.targets if isinstance(t, ast.Name))
+check("...and File 05 binds no module-level name of its own", _entry_assigns, [])
 
-# The three accessors come in under private aliases and are `del`'d again by the
-# shim, so they are not part of its surface. Drop them the same way.
-#
-# ELEVEN, NOT FOURTEEN, and the difference is not a discrepancy. File 47's
-# runtime inventory is fourteen because it EXECS the file and records every name
-# bound, which includes the three bootstrap leftovers `_bootstrap`, `_fh` and
-# `_code_dir`. This scan is static and looks only at the top-level ImportFrom
-# and plain Assign statements, which is the surface item 11a could plausibly
-# have widened. File 47 remains the authoritative check; this one exists so that
-# adding `dry_run` as a new exported helper instead of a parameter fails in
-# thirty seconds rather than at the end of an eight-minute serial run.
-_shim_names -= {"_patients_dir_accessor", "_manifest_path_accessor",
-                "_cancer_registry_accessor"}
-check("the File 05 shim's static surface is the eight package names plus the "
-      "three it resolves eagerly",
-      sorted(_shim_names),
-      sorted({"CAP", "RANDOM_SEED", "_DELETION_COUNTS", "_delete_manifested",
-              "_write_manifest", "filter_cancer_patients_inplace",
-              "has_cancer_diagnosis", "patient_death_status",
-              "PATIENTS_DIR", "_MANIFEST_PATH", "_CANCER_REGISTRY"}))
-check_true("require_intact_registry and DRY_RUN_MANIFEST_SUFFIX are NOT in the "
-           "shim's surface",
-           not ({"require_intact_registry", "DRY_RUN_MANIFEST_SUFFIX"}
-                & _shim_names))
 
 # --- dry_run IS A PARAMETER, NOT A SECOND FUNCTION ------------------------
 _sig = inspect.signature(clean.filter_cancer_patients_inplace)

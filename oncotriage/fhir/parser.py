@@ -1,11 +1,30 @@
 """FHIR patient bundle parser.
 
 Moved out of ``07- FHIR Parser.py`` by item 20c, pass 2b, logic byte-for-byte
-unchanged. ``07- FHIR Parser.py`` survives as an explicit re-export shim over
-this module, because Files 05, 17, 25, 26, 38, 39, 40 and 45 exec-chain it and
-read ``parse_fhir_bundle`` and its neighbours out of the shared exec namespace
-with no import statement of their own. The shim also keeps the ``__main__``
-block, which is a script and does not belong in a library.
+unchanged. ``07- FHIR Parser.py`` kept an explicit 45-name re-export shim over
+this module because Files 05, 17, 25, 26, 38, 39, 40 and 45 exec-chained it and
+read ``parse_fhir_bundle`` and its neighbours out of the shared exec namespace.
+
+THAT SHIM IS GONE AS OF PASS 20e, and every one of those eight consumers was
+measured rather than assumed. Files 17, 25 and 26 became thin entry points in
+passes 20c-3b and 20c-3d; Files 38, 39 and 40 became ``tests/`` modules in pass
+20d-1 and import this module directly; File 45 became
+``oncotriage/fixtures/capture.py`` in pass 20c-3d; and File 05 -- the last one --
+became a thin entry point in pass 20e when its own consumer, File 34, turned out
+to have been converted two passes earlier. File 07 is a thin entry point now,
+holding only the ``__main__`` block, which is a script and does not belong in a
+library.
+
+THE FOUR COUNTERS ARE SHARED OBJECTS, NOT COPIES, and that outlives the shim
+that first depended on it. ``BIRTH_DATE_PRECISION_COUNTS``,
+``DEMOGRAPHIC_SOURCE_COUNTS``, ``ECOG_VALUE_SHAPE_COUNTS`` and
+``ECOG_SELECTION_COUNTS`` are ``Counter`` INSTANCES; ``load_all_patients()``
+clears and fills them in place, so a caller that does
+``from oncotriage.fhir.parser import ECOG_SELECTION_COUNTS`` and reads it after
+a run sees that run's numbers. ``tests/test_fhir_ecog_surfacing.py`` depends on
+exactly that. Never rebind one of the four -- ``NAME = Counter()`` inside a
+function, or a shim re-exporting an int or a str, hands out a SNAPSHOT, which is
+the trap File 08's ``_REGISTRY`` was in before pass 20c-2b removed it.
 
 WHAT THIS MODULE IS FOR
 -----------------------

@@ -2,126 +2,73 @@
 ##################################################
 
 """
-Step 2: Filter synthetic patients to keep only those with cancer diagnoses
-Deletes non-cancer patients directly from fhir/ directory
+Step 2: filter synthetic patients to keep only those with cancer diagnoses.
+Deletes non-cancer patients directly from the fhir/ directory.
 
-RE-EXPORT SHIM (item 20c, pass 3a)
-----------------------------------
-The definitions moved to ``oncotriage/fhir/clean.py``. This file re-exports
-every name it used to bind and keeps its ``__main__`` block, so
-``python "05- FHIR Clean Data.py"`` behaves exactly as before.
+THIN ENTRY POINT (item 20c pass 3a moved the logic; pass 20e removed the shim)
+------------------------------------------------------------------------------
+Every definition lives in ``oncotriage/fhir/clean.py``. What is left here is a
+``__main__`` guard, the argparse it needs, and one call.
 
-IT IS THE ONLY ONE OF THE FIVE FILES CONVERTED IN THIS PASS THAT KEEPS A SHIM,
-and the reason is a single call site: ``34- Cohort Selector Diff.py`` line 68
-chains this file and calls ``has_cancer_diagnosis()`` out of the shared exec
-namespace. File 05 is therefore a LIBRARY as well as a script. Files 04, 06, 11
-and 12 have no chain consumer anywhere in the repository -- verified by grepping
-every top-level name each of them defines against every .py, .md, .toml and .yml
-in the tree -- so those four dropped their exec bootstraps entirely and became
-thin entry points.
+WHY THIS STOPPED BEING A SHIM. Pass 3a kept a full re-export shim here for one
+call site: ``34- Cohort Selector Diff Read Only.py`` chained this file and read
+``has_cancer_diagnosis`` and ``_CANCER_REGISTRY`` out of the shared exec
+namespace. Pass 20c-3d converted File 34 into a thin entry point over
+``oncotriage/evaluation/cohort_diff.py``, which imports both from the package by
+name -- so the shim's only consumer stopped existing two passes before the shim
+did. Pass 20e MEASURED that rather than inheriting the claim: all fifteen
+top-level names this file bound, and the string "05- FHIR Clean Data.py"
+itself, were grepped across every .py, .md, .toml and .yml in the tree, and the
+only functional hit left is ``tests/test_degraded_dependencies.py`` ast-parsing
+this file to check the dry-run wiring -- a reader, not a chainer.
 
-THE CHAIN OF 07 AND 08 STAYS. File 34's chain label is "01 → 02 → 03 → 05 (→ 07
-→ 08)" and it reads ``_select_best_coding`` (File 07) and ``_CANCER_REGISTRY``
-(bound below) straight out of the namespace this file leaves behind. The package
-module imports those two for itself; the chain below is what puts them in the
-CALLER's namespace, which is a different job and still this file's.
+NO EXEC BOOTSTRAP. This file used to raw-exec "01- Imports.py",
+"02- Utility Functions.py" and "03- Config.py" and then ``exec_chain`` Files 07
+and 08. All five of those files are deleted by pass 20e; nothing chained them
+either. `python "05- FHIR Clean Data.py"` behaves exactly as before, and it no
+longer imports torch, transformers, streamlit or langgraph, and no longer opens
+an OpenAI or a Qdrant client, in order to delete patient bundles.
 
-THREE NAMES ARE RESOLVED EAGERLY HERE AND LAZILY IN THE PACKAGE.
-``PATIENTS_DIR``, ``_MANIFEST_PATH`` and ``_CANCER_REGISTRY`` were module-level
-statements in File 05, so loading it globbed the sibling data tree and built the
-whole ICD-10-CM code set. A package module may not do any of that at import (see
-CLAUDE.md), so they became ``patients_dir()``, ``manifest_path()`` and
-``cancer_registry()`` -- resolved on first call, cached. This shim calls all
-three and binds the eager names, which is the same thing ``03- Config.py`` does
-for ``openai_client`` / ``qdrant_client``: the chain sees the values it always
-saw, and they are the SAME objects the package hands out, because each accessor
-caches.
+WHAT MOVED WITH THE SHIM'S DOCSTRING is in ``oncotriage/fhir/clean.py``: why
+``patients_dir()`` / ``manifest_path()`` / ``cancer_registry()`` are accessors
+rather than module-level statements, why ``_EXCLUDE_VERIFICATION`` must not be
+redefined here, and why ``dry_run`` is a parameter rather than a second helper.
+
+Run from terminal:
+    python "05- FHIR Clean Data.py"            # DELETES bundles in place
+    python "05- FHIR Clean Data.py" --dry-run  # writes the plan, deletes nothing
 """
 
-
-# Run needed files
-#-----------------
-# Bootstrap comes FIRST because the re-exports below need `oncotriage` to be
-# importable, which 01- Imports.py arranges when the package is not pip-installed.
-# Item 20a: this file sits in the code directory, so __file__ locates it with
-# no hardcoded path. __file__ is bound when the file is run as a script (every
-# documented entry point for it) and when Spyder runfile()s it. In a bare
-# interactive paste it is not bound, and the working directory is the only
-# remaining candidate -- taken, but announced, never silently.
-import os as _os_boot
-if "__file__" in globals():
-    _code_dir = _os_boot.path.dirname(_os_boot.path.abspath(__file__)) + _os_boot.sep
-else:
-    _code_dir = _os_boot.getcwd() + _os_boot.sep
-    print(f"[Bootstrap] __file__ unbound; using the working directory as the code directory: {_code_dir}")
-del _os_boot
-
-for _bootstrap in ("01- Imports.py", "02- Utility Functions.py", "03- Config.py"):
-    with open(_code_dir + _bootstrap) as _fh:
-        exec(_fh.read(), globals())
+import os
+import sys
 
 
-#------------------------------------------------------------------------------
+# Make the oncotriage package importable
+#---------------------------------------
+# See the same block in "04- FHIR Generate Data.py" and "16- Database Query.py".
+# `pip install -e .` from 03- Code/ makes it a no-op; without it the code
+# directory is added to sys.path and the fact is printed rather than left
+# silent. This replaces the sys.path work "01- Imports.py" used to do.
+try:
+    import oncotriage  # noqa: F401
+except ImportError:
+    for _candidate, _how in (
+        (os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals()
+         else None, "__file__"),
+        (os.getcwd(), "cwd"),
+    ):
+        if _candidate and os.path.isdir(os.path.join(_candidate, "oncotriage")):
+            if _candidate not in sys.path:
+                sys.path.insert(0, _candidate)
+            print(f"[Bootstrap] oncotriage package found at {_candidate} "
+                  f"(via {_how}); added to sys.path")
+            break
+    else:
+        raise
+    del _candidate, _how
 
-
-# File 07 is chained for _select_best_coding(): the cohort filter must read a
-# condition's codings exactly the way the pipeline's parser does, or the set of
-# patients on disk stops agreeing with the set of patients the pipeline calls
-# cancer patients. File 08 supplies the registry names File 34 also reads.
-exec_chain(
-    ["07- FHIR Parser.py", "08- Cancer Code Registry.py"],
-    caller_file=_code_dir + "05- FHIR Clean Data.py",
-    caller_globals=globals(),
-    chain_label="07 → 08",
-)
-
-
-#------------------------------------------------------------------------------
-
-
-# The re-exports
-#---------------
-# Explicit, never `import *`. A star import over a module whose surface changes
-# would silently change what this file puts into the shared exec namespace, and
-# the shared namespace is precisely what File 34 reads.
-#
-# The three accessors come in under private aliases, are called once, and are
-# then DELETED. That keeps this file's surface exactly the fourteen names File 05
-# bound before the move -- "tests/test_package_invariants.py" section 5 pins that list
-# and fails on an addition as loudly as on a deletion, because a name this file
-# adds is a name the next file in a chain would silently pick up.
-from oncotriage.fhir.clean import (
-    CAP,
-    RANDOM_SEED,
-    _DELETION_COUNTS,
-    _delete_manifested,
-    _write_manifest,
-    cancer_registry as _cancer_registry_accessor,
-    filter_cancer_patients_inplace,
-    has_cancer_diagnosis,
-    manifest_path as _manifest_path_accessor,
-    patient_death_status,
-    patients_dir as _patients_dir_accessor,
-)
-
-# Directory with all patients (will delete non-cancer ones in-place)
-PATIENTS_DIR = _patients_dir_accessor()
-
-# Deletion manifest path, written before anything is unlinked
-_MANIFEST_PATH = _manifest_path_accessor()
-
-# The same registry instance the pipeline classifies conditions with. File 34
-# reads this name directly (lines 134, 220, 227).
-#
-# _EXCLUDE_VERIFICATION is NOT redefined here. File 08 owns it
-# (08- Cancer Code Registry.py, module level) and the registry exposes it as
-# .exclude_verification. A second frozenset with the same values today is a
-# second frozenset with different values the day one of them is edited, and
-# under the exec() chain the later definition silently wins for every file
-# loaded after this one. Read it off the registry instead.
-_CANCER_REGISTRY = _cancer_registry_accessor()
-
-del _patients_dir_accessor, _manifest_path_accessor, _cancer_registry_accessor
+from oncotriage.config import Project_Name  # noqa: E402
+from oncotriage.fhir.clean import filter_cancer_patients_inplace  # noqa: E402
 
 
 #------------------------------------------------------------------------------

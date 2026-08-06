@@ -67,8 +67,37 @@ Works with: Synthea FHIR bundles (SNOMED) + real EHR data (ICD-10)
 # ICD-10-CM release, which is exactly the import-time work this package refuses
 # to do.
 #
-# "08- Cancer Code Registry.py" survives as an explicit re-export shim; Files
-# 05, 06, 11, 13, 30, 32, 33, 42 and 43 reach these names through it.
+# "08- Cancer Code Registry.py" IS DELETED AS OF PASS 20e. It survived as a
+# 30-name re-export shim because Files 05, 06, 11, 13, 30, 32, 33, 42 and 43
+# reached these names through the shared exec namespace. All nine were measured
+# in pass 20e and not one is a chainer any more: 06 and 11 became thin entry
+# points in pass 20c-3a; 30, 32, 33, 42 and 43 became modules under tests/ in
+# passes 20d-1 and 20d-2 and import THIS module by name; 05 and 13 became thin
+# entry points in pass 20e.
+#
+# THE SHIM'S DOCSTRING CARRIED THE ARGUMENT FOR THREE NAMES IT STOPPED
+# RE-EXPORTING, and the argument is kept here because it is about THIS module's
+# surface rather than about the shim.
+#
+#   _REGISTRY and _LAB_REGISTRY are this module's private singleton SLOTS (they
+#   are assigned near load_registry() below). Before pass 20c-2a they lived in
+#   the shared exec namespace and load_registry()'s `global _REGISTRY` wrote
+#   back into it, so a later reader saw the built registry. After the move the
+#   write lands on THIS MODULE, and a shim's `from ... import _REGISTRY` was a
+#   SNAPSHOT taken at shim load: None, permanently, whatever load_registry()
+#   went on to build. A name that looks like an accessor and is guaranteed to be
+#   None is worse than no name -- it reads as "no registry has been built yet"
+#   and can never read as anything else. USE load_registry() /
+#   load_lab_registry(): they are the accessors, they are thread-safe, and they
+#   see the real slot. The same rule applies to any future importer, which is
+#   why this is written here and not in a commit message.
+#
+#   _var no longer exists. It was a LEAKED LOOP VARIABLE -- the canonical-order
+#   cleanup loop below deleted the four temporaries it named and left the loop
+#   variable itself bound to the string '_seen_canonical'. Pass 2a carried the
+#   leak in verbatim because it was not allowed to change File 08's logic; pass
+#   2b added '_var' to that tuple, and the comment beside the loop explains why
+#   it has to be LAST.
 #
 #------------------------------------------------------------------------------
 

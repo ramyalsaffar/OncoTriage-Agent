@@ -3,12 +3,37 @@
 
 """Step 2: keep only patients with a primary cancer diagnosis, alive, capped.
 
-Moved out of ``05- FHIR Clean Data.py`` by item 20c, pass 3a. That file survives
-as an explicit re-export shim, and it is the ONLY one of the five files this pass
-converted that keeps one: ``34- Cohort Selector Diff.py`` chains File 05 and
-calls ``has_cancer_diagnosis()`` out of the shared exec namespace, so File 05 is
-a library as well as a script and both roles have to keep working. Files 04, 06,
-11 and 12 have no chain consumer at all and became thin entry points.
+Moved out of ``05- FHIR Clean Data.py`` by item 20c, pass 3a.
+
+FILE 05 IS A THIN ENTRY POINT AS OF PASS 20e, AND THE SHIM IT USED TO CARRY IS
+GONE. Pass 3a kept a full re-export shim there for exactly one call site:
+``34- Cohort Selector Diff Read Only.py`` chained File 05 and read ``has_cancer_diagnosis``
+and ``_CANCER_REGISTRY`` out of the shared exec namespace. **Pass 20c-3d
+converted File 34** into a thin entry point over
+``oncotriage/evaluation/cohort_diff.py``, which imports ``has_cancer_diagnosis``
+from THIS module by name and gets its registry from ``cancer_registry()``. So
+the shim's only consumer stopped existing two passes before the shim did, and
+pass 20e measured that rather than inheriting the claim: every one of File 05's
+fifteen top-level names, and the string ``"05- FHIR Clean Data.py"`` itself, was
+grepped across every .py, .md, .toml and .yml in the tree, and the only
+functional hit left was ``tests/test_degraded_dependencies.py`` ast-parsing the
+file (a reader, not a chainer).
+
+WHAT THE SHIM'S DELETION TOOK WITH IT, recorded here because a deleted argument
+is how a defect returns:
+
+  * the eager bindings ``PATIENTS_DIR``, ``_MANIFEST_PATH`` and
+    ``_CANCER_REGISTRY``. They existed so an exec-chain caller saw the same
+    module-level values File 05 bound before pass 3a. With no exec-chain caller
+    they are three names nothing reads, and the accessors below are the whole
+    interface. See "WHAT CHANGED" immediately after this.
+  * the note that ``_EXCLUDE_VERIFICATION`` is NOT redefined in File 05. It was
+    a real defect once -- the pre-fix File 05 defined a second frozenset that
+    overwrote File 08's for every file loaded after it under the exec chain --
+    and ``oncotriage/evaluation/cohort_diff.py`` still keeps a deliberate
+    ``_LEGACY_EXCLUDE_VERIFICATION`` copy to MEASURE that difference. This
+    module has never had one and must not grow one: read it off the registry as
+    ``.exclude_verification``.
 
 WHAT CHANGED, and why it had to
 -------------------------------
@@ -31,16 +56,19 @@ subprocess with the root pointed at a directory that does not exist, so this one
 would have failed the moment it landed.
 
 All three are now accessors that resolve on FIRST CALL and cache:
-``patients_dir()``, ``manifest_path()``, ``cancer_registry()``. The shim calls
-all three at load and binds the eager names the exec chain expects, so a caller
-going through File 05 sees exactly what it always saw -- the same strings, and
-the SAME registry object, because the accessor caches.
+``patients_dir()``, ``manifest_path()``, ``cancer_registry()``. Pass 3a's shim
+called all three at load so that the exec chain saw the eager names File 05 used
+to bind; with the shim gone (pass 20e) the accessors are the only interface, and
+they are what ``oncotriage/evaluation/cohort_diff.py`` already used.
 
 THE COUNTERS ARE MODULE STATE AND STAY MODULE STATE. ``_DELETION_COUNTS`` is a
 plain dict of ints, mutated by ``_delete_manifested`` and read by
-``filter_cancer_patients_inplace`` at the end of the run. The shim imports the
-dict itself, not a copy, so the shim's ``_DELETION_COUNTS`` and this module's are
-one object and a caller reading it after a run sees the run's numbers.
+``filter_cancer_patients_inplace`` at the end of the run. It is one object, so a
+caller that imports the dict and reads it after a run sees the run's numbers.
+That mattered most when a shim re-exported it -- a shim re-exporting an int or a
+str re-exports a SNAPSHOT, which is the trap File 08's ``_REGISTRY`` was in --
+and it is recorded here because the rule outlives the shim: never hand out a
+copy of a counter.
 
 ITEM 11a ADDED TWO GUARDS AND A PARAMETER
 -----------------------------------------
@@ -52,9 +80,11 @@ pip package deletes patient bundles. See that function for the full argument.
 
 ``filter_cancer_patients_inplace(dry_run=True)`` scans and plans exactly as
 usual, writes the plan to ``{manifest_path()}.dryrun`` and unlinks nothing. It
-is a PARAMETER rather than a new exported helper because File 47 section 5 pins
-this module's shim surface at fourteen names, and because a plan produced by a
-second implementation is a plan that can disagree with the deletion.
+is a PARAMETER rather than a new exported helper, and the reason survives the
+shim that first prompted it: a plan produced by a second implementation is a
+plan that can disagree with the deletion it is supposed to preview. (The other
+half of the original argument -- that File 47 section 5 pinned File 05's shim
+surface at fourteen names -- retired with the shim in pass 20e.)
 """
 
 import json

@@ -1,8 +1,18 @@
-# Cohort Selector Diff
-######################
+# Cohort Selector Diff — Read Only
+##################################
 
 """
 Cohort Selector Diff — READ ONLY. Entry point.
+
+RENAMED IN PASS 20e, from "34- Cohort Selector Diff.py". The single most
+important fact about this file is that it NEVER DELETES, MOVES OR REWRITES A
+PATIENT BUNDLE, and the old name did not say so. It sits in a numbered sequence
+next to "05- FHIR Clean Data.py", which unlinks bundles in place, and it runs
+that file's cohort selector over the same directory -- so a reader scanning
+filenames had every reason to expect it to act on what it finds. The docstring
+said "READ ONLY" on its second line; a filename is what is read first, and in a
+terminal history it is all that is read. The number stays 34 so that every note
+and document naming File 34 still resolves; see "PIPELINE SEQUENCE.md".
 
 Runs both cohort selectors over the patient bundles currently on disk and
 records where they disagree. The diff itself is
@@ -45,7 +55,7 @@ every .py, .md, .toml and .yml in the tree; the only hits are the exec-bootstrap
 locals every numbered file shares.
 
 Run from terminal (or F5 in Spyder):
-    python "34- Cohort Selector Diff.py"
+    python "34- Cohort Selector Diff Read Only.py"
 
 Exit codes:
     0 -- diff completed (agreement or disagreement; both are results)

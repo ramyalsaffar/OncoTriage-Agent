@@ -227,6 +227,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 from datetime import date
 
 
@@ -299,432 +300,6 @@ def fail(label: str, detail: str) -> None:
 
 #------------------------------------------------------------------------------
 
-
-# ===========================================================================
-# THE NAMES FILES 01, 02 AND 03 DEFINED BEFORE ITEM 20c
-# ===========================================================================
-# Extracted from the three files at commit 3780ba1 -- the last commit before
-# this pass -- by walking each module's AST for top-level FunctionDef, ClassDef,
-# Assign, AnnAssign, Import and ImportFrom targets, including the targets inside
-# 01's `if IS_DOCKER:` branch.
-#
-# Written down rather than recomputed from git, because the point is to pin what
-# the contract WAS. A test that re-derives the list from whatever HEAD happens
-# to be would agree with the code by construction, which is the defect CLAUDE.md
-# records against File 42's boundary assertions.
-
-_PRE_20C_NAMES = {
-    "01- Imports.py": [
-        "APIConnectionError", "AliasOperations", "Annotated", "Any",
-        "AutoModelForSequenceClassification", "AutoTokenizer", "BM25Okapi",
-        "BaseModel", "Counter", "CreateAlias", "CreateAliasOperation",
-        "CrossEncoder", "DeleteAlias", "DeleteAliasOperation", "Dict",
-        "Distance", "END", "ET", "FastAPI", "File", "FrozenSet", "HTTPException",
-        "IS_DOCKER", "InternalServerError", "JSONResponse", "Limiter", "List",
-        "Modifier", "OpenAI", "Optional", "Path", "PayloadSchemaType",
-        "PointStruct", "QdrantClient", "RateLimitError", "RateLimitExceeded",
-        "Request", "START", "SYSTEM_KEY_ABSENT", "SYSTEM_KEY_UNRECOGNIZED",
-        "SearchRequest", "Set", "SparseIndexParams", "SparseTextEmbedding",
-        "SparseVector", "SparseVectorParams", "StateGraph", "ThreadPoolExecutor",
-        "Tuple", "TypedDict", "UnexpectedResponse", "UploadFile", "VectorParams",
-        "_caffeine_mod", "_glob_one", "_load_path_settings", "_main_path_source",
-        "_rate_limit_exceeded_handler", "airflow_path", "argparse",
-        "asynccontextmanager", "asyncio", "builtins", "checkpoint_path",
-        "code_path", "data_MeSH_path", "data_fhir_path", "data_path",
-        "data_patient_path", "data_trial_path", "date", "datetime", "defaultdict",
-        "get_remote_address", "glob", "go", "hashlib", "httpx", "importlib",
-        "inferences_path", "json", "keys_path", "ks_2samp", "load_dotenv",
-        "logging", "main_path", "make_subplots", "nest_asyncio", "np", "os",
-        "path_settings", "pd", "plt", "px", "random", "re", "relativedelta",
-        "requests", "requirements_path", "result_ablation_path",
-        "result_fhir_explore_path", "results_path", "retry",
-        "retry_if_exception_type", "shutil", "sns", "sqlite3", "st",
-        "stop_after_attempt", "subprocess", "sys", "tempfile", "threading",
-        "time", "timezone", "torch", "tqdm", "traceback", "uvicorn",
-        "wait_exponential",
-    ],
-    "02- Utility Functions.py": [
-        "CaffeinateSession", "PARTIAL_DATE_ANCHOR_DAY", "PARTIAL_DATE_ANCHOR_MONTH",
-        "PARTIAL_DATE_DEGRADATIONS", "UnknownModelPricingError",
-        "_PARTIAL_DATE_PATTERNS", "deduplicate_by_display", "exec_chain",
-        "get_age_reference_date", "get_model_cost", "load_env_keys",
-        "parse_partial_date", "qdrant_retry", "resolve_qdrant_collection",
-    ],
-    "03- Config.py": [
-        "ABLATION_DESCRIPTIVE_METRICS", "ABLATION_FDR_ALPHA", "ABLATION_MIN_PAIRED",
-        "ABLATION_OUTCOME_METRICS", "ABLATION_POWER_TARGET", "AIRFLOW_DAG_SCHEDULE",
-        "BASELINE_WINDOW_DAYS", "BATCH_SIZE", "BM25_RETRIEVAL_SIZE",
-        "CHARS_PER_TOKEN", "CHECKPOINT_FILENAME", "COHORT_MANIFEST_FILENAME",
-        "COHORT_MANIFEST_FLUSH_EVERY", "COLLECTION_NAME", "COMPARISON_WINDOW_DAYS",
-        "DATA_SNAPSHOT_DATE", "ECOG_MISSINGNESS_FRACTION", "ECOG_SCORE_DISTRIBUTION",
-        "ECOG_UNAVAILABLE_RATE_THRESHOLD", "EMBEDDING_DIM", "EMBEDDING_MODEL",
-        "EMBEDDING_REQUEST_TIMEOUT", "EMBEDDING_REQUEST_TIMEOUT_SECONDS",
-        "ENABLE_RATE_LIMITING", "EXPANSION_TEMPERATURE", "KS_TEST_THRESHOLD",
-        "MATCHING_MAX_TOKENS", "MATCHING_MODEL", "MATCHING_OUTPUT_SPLIT_FRACTION",
-        "MATCHING_OUTPUT_TOKENS_PER_TRIAL", "MATCHING_REASONING_EFFORT",
-        "MATCHING_REQUEST_TIMEOUT", "MATCHING_REQUEST_TIMEOUT_SECONDS",
-        "MATCHING_SEED", "MATCHING_TEMPERATURE", "MAX_GPT4O_RETRIES",
-        "MAX_TRIALS_FOR_EVALUATION", "MAX_TRUNCATION_SPLITS", "MAX_VARIANT_TERMS",
-        "MAX_WORKERS", "MESH_BOOST_DIRECT_FLOOR", "MESH_BOOST_DIRECT_FRACTION",
-        "MESH_BOOST_PAN_FLOOR", "MESH_BOOST_PAN_FRACTION", "MIN_SAMPLES_BASELINE",
-        "MIN_SAMPLES_COMPARISON", "OPENAI_SDK_MAX_RETRIES", "PRICING_CONFIG",
-        "PSI_BINS", "PSI_THRESHOLD", "Project_Name", "QUALITY_THRESHOLD_PERCENTILE",
-        "RATE_LIMIT", "RERANK_SCORE_THRESHOLD", "RESAMPLE_COUNT", "RESAMPLE_SEED",
-        "RESULTS_FILENAME", "RETRY_BASE_DELAY", "RRF_POOL_SIZE",
-        "SDK_DEFAULT_CONNECT_TIMEOUT_SECONDS", "TOP_K_CANDIDATES",
-        "VECTOR_RETRIEVAL_SIZE", "Z_SCORE_THRESHOLD", "_sdk_default_timeout",
-        "_structured_timeout", "keys", "openai_api_key", "openai_client",
-        "qdrant_api_key", "qdrant_client", "qdrant_url", "trial_dict",
-    ],
-}
-
-# The counts these lists must have. Stated separately so that a list truncated
-# by a bad edit fails here rather than passing a subset comparison silently --
-# CLAUDE.md's rule about assertions that can be satisfied by a degenerate value.
-_PRE_20C_COUNTS = {"01- Imports.py": 120, "02- Utility Functions.py": 14, "03- Config.py": 72}
-
-
-# ===========================================================================
-# THE NAMES FILES 08, 09 AND 10 DEFINED BEFORE PASS 2a
-# ===========================================================================
-# NOT ast-derived. RUNTIME-derived: each file was exec'd into a throwaway
-# namespace with its handful of free names pre-seeded, and every resulting
-# binding recorded. An ast walk would have been wrong in both directions:
-#
-#   TOO FEW   twenty of File 08's names and six of File 10's are ANNOTATED
-#             assignments (`_SNOMED_PRIMARY: FrozenSet[str] = ...`). A
-#             `grep "NAME ="` misses every one, and ast.Assign alone misses
-#             them too -- they are ast.AnnAssign.
-#   TOO MANY  File 08 assigns _seen_canonical at module level and then DELETES
-#             it, along with _idx / _code / _name, in a globals().pop() cleanup
-#             loop. It is not part of the surface and re-exporting it would
-#             have invented a name that never existed at runtime.
-#
-# The same loop leaves `_var` itself bound to the string '_seen_canonical'.
-# That leak is real and it is in the list below, because the list is a record of
-# what File 08 BOUND before pass 2a and that is what it bound. Pass 2b removed
-# the leak; the removal is recorded in _PASS_2B_DROPPED under the list rather
-# than by editing the list, because a pinned historical inventory that gets
-# rewritten every time the code changes is not pinned to anything.
-_PRE_2A_RUNTIME_NAMES = {
-    '08- Cancer Code Registry.py': [
-        'CancerCodeRegistry', 'OncologyLabRegistry',
-        '_CANCER_CLASSIFICATION_COUNTS', '_CANCER_DISPLAY_TERMS',
-        '_CANONICAL_ORDER', '_CLINICAL_STATUS_PRIORITY',
-        '_EXCLUDE_VERIFICATION', '_ICD10_ALPHA_NON_INVASIVE',
-        '_ICD10_ALPHA_PRIMARY', '_ICD10_ALPHA_SECONDARY',
-        '_ICD10_CONSULT_KEYS', '_ICD10_C_BLOCK_MAX',
-        '_ICD10_C_SECONDARY_HI', '_ICD10_C_SECONDARY_LO',
-        '_ICD10_D_NEOPLASM_BLOCK_MAX', '_ICD10_SEED_PRIMARY',
-        '_LAB_REGISTRY', '_NON_INVASIVE_DISPLAY_TERMS', '_ONCOLOGY_LOINC',
-        '_ONCOLOGY_LOINC_CODES', '_REGISTRY', '_REGISTRY_LOCK',
-        '_SECONDARY_DISPLAY_TERMS', '_SNOMED_CONSULT_KEYS',
-        '_SNOMED_PRIMARY', '_SNOMED_SECONDARY', '_build_icd10_cancer_sets',
-        '_var', 'get_cancer_classification_stats', 'load_lab_registry',
-        'load_registry', 'logger', 'reset_cancer_classification_stats',
-    ],
-    '09- MeSH Cancer Site Relevance Filter.py': [
-        'MeSHCancerFilter', 'PAN_CANCER_TREE_MAX_DEPTH',
-        'build_all_lookups', 'build_icd10_to_mesh_crosswalk',
-        'build_mesh_lookup', 'build_snomed_to_mesh_crosswalk',
-        'build_umls_synonym_crosswalk', 'load_mesh_filter',
-        'specific_cancer_trees',
-    ],
-    '10- Structured Eligibility Extractor.py': [
-        '_ADENOCARCINOMA_RE', '_CLAUSE_BOUNDARIES', '_EXCLUSIVE_PAIRS',
-        '_HISTOLOGY_EXTRACTION_COUNTS', '_HISTOLOGY_SUFFIX_WINDOW',
-        '_LOCALLY_ADVANCED_RE', '_LUNG_CONTEXT_RE', '_METASTATIC_RE',
-        '_NEGATION_LOOKBACK', '_NEGATION_PREFIXES', '_NEGATION_SUFFIXES',
-        '_NEUROENDOCRINE_RE', '_NON_METASTATIC_RE', '_NON_MORPH_LOOKBACK',
-        '_NON_MORPH_PREFIX_RE', '_NON_ONCOLOGY_CONTEXT_WINDOW',
-        '_NON_ONCOLOGY_STAGE_CONTEXT_RE', '_NON_SMALL_CELL_RE',
-        '_NSCLC_ABBREV_RE', '_PATIENT_STAGE_RE', '_RANGE_RE',
-        '_SCLC_ABBREV_RE', '_SINGLE_RE', '_SMALL_CELL_RE',
-        '_SNOMED_DISPLAY_STAGE_RE', '_SQUAMOUS_RE', '_STAGE_ALT',
-        '_STAGE_EXTRACTION_COUNTS', '_STAGE_FULL_RANGE_MIN_CEILING',
-        '_STAGE_MAX_ORDINAL', '_STAGE_MIN_ORDINAL', '_STAGE_ORDINAL',
-        '_TRACHEAL_RE', '_collect_stage_ordinals',
-        '_extract_accepts_metastatic', '_extract_histology_tags',
-        '_extract_stage_from_text',
-        '_extract_stage_upper_bound_from_exclusion', '_find_exclusive_pair',
-        '_has_affirmative_match', '_has_conflict', '_is_full_range_span',
-        '_is_histology_negated', '_is_negated', '_is_non_oncology_stage',
-        '_stage_negated', 'enrich_histology_tags',
-        'enrich_structured_eligibility', 'extract_patient_histology',
-        'extract_patient_stage', 'get_histology_extraction_stats',
-        'get_stage_extraction_stats', 'is_histology_mismatch',
-        'is_stage_mismatch', 'reset_histology_extraction_stats',
-        'reset_stage_extraction_stats',
-    ],
-}
-
-_PRE_2A_COUNTS = {
-    '08- Cancer Code Registry.py': 33,
-    '09- MeSH Cancer Site Relevance Filter.py': 9,
-    '10- Structured Eligibility Extractor.py': 56,
-}
-
-
-# THE ONLY NAMES PASS 2b IS ALLOWED TO REMOVE FROM THE LIST ABOVE.
-#
-# Pass 2a's contract was "nothing File 08 defined disappears", which is why the
-# shim re-exported three names nothing wants. Pass 2b removes them, and states
-# the removal here instead of quietly shortening the inventory:
-#
-#   _REGISTRY, _LAB_REGISTRY   the module's private singleton slots. Re-exported
-#                              they are SNAPSHOTS taken at shim load — None,
-#                              permanently, whatever load_registry() later
-#                              builds — so they read as "no registry yet" and
-#                              can never read as anything else. Nothing consumes
-#                              them; File 13's only mention is an assignment
-#                              that shadows the name.
-#   _var                       a leaked loop variable. The module's cleanup loop
-#                              now names it, so it does not exist to re-export.
-#
-# Checked in BOTH directions below: each of these must be genuinely absent from
-# the shim's namespace (so the exception is exercised rather than declared), and
-# every other pre-2a name must still be present. A fourth name going missing is
-# still a failure.
-_PASS_2B_DROPPED = {
-    '08- Cancer Code Registry.py': {'_REGISTRY', '_LAB_REGISTRY', '_var'},
-    '09- MeSH Cancer Site Relevance Filter.py': set(),
-    '10- Structured Eligibility Extractor.py': set(),
-    '07- FHIR Parser.py': set(),
-    '14- Database Logger.py': set(),
-    '13- LangGraph Agent.py': set(),
-    # Pass 3a drops nothing from File 05. Every one of the fourteen names it
-    # bound is still bound, including the three that are now resolved eagerly
-    # HERE from accessors that are lazy in the package.
-    '05- FHIR Clean Data.py': set(),
-}
-
-
-# ===========================================================================
-# THE NAMES FILE 05 DEFINED BEFORE PASS 3a
-# ===========================================================================
-# Same runtime method as every block above: File 05 was exec'd at commit aa1bddf
-# into a throwaway namespace, after the same base chain its own bootstrap runs
-# (01, 02, 03 raw, then exec_chain of 07 and 08), and every name it added was
-# recorded.
-#
-# FILE 05 IS THE ONLY ONE OF THE FIVE FILES CONVERTED IN PASS 3a THAT KEEPS A
-# SHIM, so it is the only one with an inventory to check. Files 04, 06, 11 and 12
-# have no chain consumer anywhere in the repository -- every top-level name each
-# of them defines was grepped against every .py, .md, .toml and .yml in the tree,
-# and the only hits are prose and unrelated same-named locals other files define
-# for themselves. They became thin entry points, so there is no shared-namespace
-# surface left to pin.
-#
-# Three of the fourteen are BOOTSTRAP LEFTOVERS rather than definitions --
-# _bootstrap and _fh from the three-file exec loop, _code_dir from the __file__
-# derivation. They are here because they were bound, and the shim keeps the same
-# bootstrap block, so it still binds them.
-#
-# PATIENTS_DIR, _MANIFEST_PATH and _CANCER_REGISTRY are in this list and must
-# still be bound, and that is the load-bearing part: in the package they became
-# patients_dir(), manifest_path() and cancer_registry(), lazy and cached, because
-# a package module may not resolve a glob or build the ICD-10-CM registry at
-# import. The shim CALLS all three at load, so a chain caller sees the same
-# strings and the same registry object it always did -- and
-# "34- Cohort Selector Diff.py" reads _CANCER_REGISTRY straight out of this
-# namespace at three separate lines.
-_PRE_3A_RUNTIME_NAMES = {
-    '05- FHIR Clean Data.py': [
-        'CAP', 'PATIENTS_DIR', 'RANDOM_SEED', '_CANCER_REGISTRY',
-        '_DELETION_COUNTS', '_MANIFEST_PATH', '_bootstrap', '_code_dir',
-        '_delete_manifested', '_fh', '_write_manifest',
-        'filter_cancer_patients_inplace', 'has_cancer_diagnosis',
-        'patient_death_status',
-    ],
-}
-
-_PRE_3A_COUNTS = {'05- FHIR Clean Data.py': 14}
-
-# NOTHING is added to File 05's shim surface. The three accessors it needs come
-# in under private aliases, are called once, and are then DELETED -- the same
-# bind-then-remove pattern File 08's cleanup loop uses -- so a name this file
-# adds cannot be silently picked up by the next file in a chain.
-_PASS_3A_ADDED = {'05- FHIR Clean Data.py': set()}
-
-
-# ===========================================================================
-# THE NAMES FILE 13 DEFINED BEFORE PASS 2c
-# ===========================================================================
-# Same method, and for File 13 it is the only method that could work at all.
-#
-# File 13 CHAINS 03, 08, 09 and 10 in its own bootstrap, so exec'ing it into a
-# throwaway namespace produces 402 bindings, 315 of which belong to the chained
-# files. The list below is the DIFFERENCE: the same base chain was exec'd into
-# one namespace, File 13 into another, and the names File 13 added recorded.
-# An ast walk over File 13 alone would have missed that entirely and reported
-# names the chain provides as File 13's own.
-#
-# Six are ANNOTATED assignments (_ICD10_RELEVANT_BLOCKS,
-# _SNOMED_RELEVANT_COMORBIDITIES, _IRRELEVANT_CONDITION_KEYWORDS,
-# _IRRELEVANT_MEDICATION_KEYWORDS, _LAB_UNIT_CONVERSIONS and _EMPTY_BOOST_STATS
-# -- the last is a plain Assign, the other five are AnnAssign), which
-# ast.Assign alone does not see and `grep "NAME ="` misses.
-#
-# Three are BOOTSTRAP LEFTOVERS rather than definitions: _bootstrap and _fh from
-# the two-file exec loop, and _code_dir from the __file__ derivation. They are
-# in the list because they were bound, and the shim keeps the same bootstrap
-# block so it still binds them.
-#
-# Recorded with ONCOTRIAGE_DEFER_LOCAL_MODELS=1 so the extraction did not load
-# MedCPT. That changes no binding: medcpt_tokenizer, medcpt_model and
-# _bm25_query_model are bound on both branches of File 13's line 414 `if`.
-_PRE_2C_RUNTIME_NAMES = {
-    '13- LangGraph Agent.py': [
-        'CHANNEL_ABLATED', 'CHANNEL_EMPTY_QUERY', 'CHANNEL_FAILED',
-        'CHANNEL_OK', 'DEFER_LOCAL_MODELS_ENV', 'EXPANSION_PATH_FALLBACK',
-        'EXPANSION_PATH_MESH', 'FINISH_REASON_LENGTH',
-        'GENOMIC_VARIANT_LOINC', 'MESH_FILTER_APPLIED',
-        'MESH_FILTER_SKIP_ABLATED', 'MESH_FILTER_SKIP_NO_FILTER',
-        'MESH_FILTER_SKIP_NO_TREES', 'MESH_RESOLUTION_NO_CONDITIONS',
-        'MESH_RESOLUTION_NO_FILTER', 'MatchingModelMismatchError',
-        'NOT_EVALUABLE_MODEL_OMITTED', 'NOT_EVALUABLE_SPLIT_BUDGET',
-        'NOT_EVALUABLE_TRUNCATION_FLOOR', 'RERANK_RRF_K',
-        'RETRIEVAL_CHANNELS', 'RUN_TEST_ON_EXECUTE',
-        'TERMINAL_NODE_ERROR', 'TERMINAL_NODE_FINALIZE',
-        'TERMINAL_NODE_NO_CANDIDATES', 'TrialMatchState',
-        '_BM25_PUNCT_PATTERN', '_CANCER_REGISTRY', '_DEFER_LOCAL_MODELS',
-        '_DeferredLocalModel', '_EMPTY_BOOST_STATS', '_EmptySparseQuery',
-        '_ICD10_RELEVANT_BLOCKS', '_IRRELEVANT_CONDITION_KEYWORDS',
-        '_IRRELEVANT_MEDICATION_KEYWORDS', '_LAB_REGISTRY',
-        '_LAB_UNIT_CONVERSIONS', '_MESH_FILTER', '_NOT_EVALUABLE_REASONS',
-        '_SNOMED_RELEVANT_COMORBIDITIES', '_VARIANT_TEXT_PATTERN',
-        '_bm25_query_model', '_bootstrap', '_build_trials_text',
-        '_classify_condition_relevance', '_classify_medication_relevance',
-        '_code_dir', '_create_patient_summary', '_empty_mesh_resolution',
-        '_fh', '_is_icd10_relevant', '_normalize_lab_unit',
-        '_pipeline_provenance', '_print_match_detail', '_split_in_half',
-        '_unevaluable_entry', 'apply_mesh_relevance_boost',
-        'apply_quality_gate', 'build_bm25_index_from_qdrant',
-        'build_initial_state', 'build_matching_graph',
-        'call_matching_model', 'compute_patient_hash',
-        'display_match_results', 'estimate_output_tokens',
-        'expand_query_from_mesh', 'extract_genomic_variant_terms',
-        'format_mesh_resolution', 'get_embedding',
-        'match_patient_to_trials', 'medcpt_model', 'medcpt_score_pairs',
-        'medcpt_tokenizer', 'node_cross_encoder_rerank',
-        'node_error_handler', 'node_finalize', 'node_gpt4o_evaluation',
-        'node_hybrid_retrieval', 'node_no_candidates',
-        'node_query_expansion', 'node_rule_based_filter',
-        'resolve_patient_mesh', 'route_after_filter', 'route_after_gpt4o',
-        'route_after_retrieval', 'tokenize_for_bm25', 'unboosted_score'
-    ],
-}
-
-_PRE_2C_COUNTS = {'13- LangGraph Agent.py': 87}
-
-
-# NAMES PASS 2c ADDED to File 13's shim surface. Declared, because the inventory
-# check runs in both directions and an undeclared addition is a name some later
-# file could pick up without asking.
-#
-#   deps                        THE SEAM. Files 35, 36, 37 and 45 install their
-#                               overrides through it, so it has to be reachable
-#                               from the shared namespace.
-#   score_pairs                 the MEDCPT_SCORER dispatcher. medcpt_score_pairs
-#                               keeps its old meaning -- the raw function -- so
-#                               a caller that wants the dispatch asks for this.
-#   _match_patient_to_trials_pkg  the package function the shim's wrapper calls.
-#   _LazyAgentDependency        the proxy class behind medcpt_tokenizer,
-#                               medcpt_model and _bm25_query_model, which are
-#                               lazy now instead of loaded at exec time.
-#   _LEGACY_REDIRECTABLE        the legacy-rebinding guard: the name -> deps-key
-#   _LEGACY_BOUND_AT_LOAD       map, the identities recorded at load, and the
-#   _detect_legacy_rebinding    two functions that turn a silent redirect-to-
-#   _assert_no_legacy_rebinding nowhere into a named RuntimeError.
-_PASS_2C_ADDED = {
-    '13- LangGraph Agent.py': {
-        'deps', 'score_pairs', '_match_patient_to_trials_pkg',
-        '_LazyAgentDependency', '_LEGACY_REDIRECTABLE', '_LEGACY_BOUND_AT_LOAD',
-        '_detect_legacy_rebinding', '_assert_no_legacy_rebinding',
-    },
-}
-
-
-# ===========================================================================
-# THE NAMES FILES 07 AND 14 DEFINED BEFORE PASS 2b
-# ===========================================================================
-# Same method as the block above, for the same reasons: each file was exec'd at
-# commit aa2438b into a throwaway namespace, with only the free names it reads
-# out of the shared exec namespace pre-seeded, and every resulting binding
-# recorded.
-#
-# AST WOULD HAVE BEEN WRONG FOR FILE 07 IN THE "TOO FEW" DIRECTION. Eleven of
-# its names are ANNOTATED assignments -- _SYSTEM_URI_TO_KEY, _SYSTEM_PREFERENCE,
-# _MCODE_STAGE_LOINCS, _ECOG_LOINC_CODE, _ECOG_LOINC_PANEL_CODE,
-# _ECOG_LOINC_INTERPRETATION_CODE, _ECOG_MIN_GRADE, _ECOG_MAX_GRADE,
-# _MCODE_GENOMIC_VARIANT_LOINC, _METASTASIS_LOINCS and the four _COMPONENT_*
-# codes -- which a `grep "NAME ="` misses and which ast.Assign does not see
-# either, because they are ast.AnnAssign.
-#
-# AND IN THE "TOO MANY" DIRECTION FOR BOTH. _EXCLUDE_CONDITION_VERIFICATION is
-# assigned inside parse_fhir_bundle, not at module level, so an ast walk that
-# did not restrict itself to tree.body would have invented a twelfth constant
-# for the shim to re-export. all_patients is bound by File 07's __main__ block,
-# which exec_chain never fires.
-#
-# Neither file has a cleanup loop, so unlike File 08 there is no name here that
-# is bound and then deleted.
-_PRE_2B_RUNTIME_NAMES = {
-    '07- FHIR Parser.py': [
-        'BIRTH_DATE_PRECISION_COUNTS', 'DEMOGRAPHIC_SOURCE_COUNTS',
-        'ECOG_SELECTION_COUNTS', 'ECOG_VALUE_SHAPE_COUNTS',
-        '_ACTIVE_ALLERGY_STATUSES', '_ACTIVE_MED_STATUSES',
-        '_COMPONENT_GENE_STUDIED', '_COMPONENT_GENOMIC_SOURCE',
-        '_COMPONENT_HGVS_CDNA', '_COMPONENT_HGVS_PROTEIN',
-        '_CONDITION_STATUS_PRIORITY', '_ECOG_LOINC_CODE',
-        '_ECOG_LOINC_INTERPRETATION_CODE', '_ECOG_LOINC_PANEL_CODE',
-        '_ECOG_MAX_GRADE', '_ECOG_MIN_GRADE',
-        '_EXCLUDE_ALLERGY_VERIFICATION', '_EXCLUDE_OBS_STATUSES',
-        '_EXCLUDE_PROC_STATUSES', '_HISTORICAL_MED_STATUSES',
-        '_MCODE_GENOMIC_VARIANT_LOINC', '_MCODE_STAGE_LOINCS',
-        '_METASTASIS_LOINCS', '_SYSTEM_PREFERENCE', '_SYSTEM_URI_TO_KEY',
-        '_US_CORE_DETAILED', '_US_CORE_OMB_CATEGORY', '_US_CORE_TEXT',
-        '_calculate_age', '_condition_sort_key', '_parse_allergy',
-        '_parse_condition', '_parse_demographics', '_parse_ecog_observation',
-        '_parse_mcode_genomic_variant', '_parse_mcode_stage_observation',
-        '_parse_medication', '_parse_medication_statement',
-        '_parse_observation', '_parse_procedure', '_read_us_core_category',
-        '_select_best_coding', '_select_ecog_performance_status',
-        'load_all_patients', 'parse_fhir_bundle',
-    ],
-    '14- Database Logger.py': [
-        'INFERENCE_COLUMN_ADDITIONS', 'TRIAL_MATCH_COLUMN_ADDITIONS',
-        '_INITIALIZED_DATABASES', '_ensure_database', '_resolve_primary_cancer',
-        'initialize_database', 'log_inference',
-    ],
-}
-
-_PRE_2B_COUNTS = {'07- FHIR Parser.py': 45, '14- Database Logger.py': 7}
-
-
-# NAMES PASS 2b ADDED to a shim's surface, and why each one is not an accident.
-#
-# The inventory check runs in BOTH directions -- nothing missing, nothing extra
-# -- because a shim that quietly puts an unexpected name into the shared exec
-# namespace is how the next file to use that name silently picks this one up.
-# So an addition has to be declared here to be allowed.
-#
-#   resolve_inference_db_path   NEW PUBLIC FUNCTION. It answers "which database
-#                               will log_inference write to", which nothing
-#                               could ask before, and it is what Files 36, 37,
-#                               38, 40 and 45 use to show that passing db_path
-#                               is doing work rather than agreeing with a
-#                               default.
-#   _package_log_inference      SHIM PLUMBING. File 14's shim cannot re-export
-#                               log_inference directly: it wraps it to supply
-#                               globals().get("inferences_path"), so it needs a
-#                               name for the thing it is wrapping. Underscored
-#                               and named for what it is.
-_PASS_2B_ADDED = {
-    '07- FHIR Parser.py': set(),
-    '14- Database Logger.py': {'resolve_inference_db_path',
-                               '_package_log_inference'},
-}
 
 
 def _bound_names(path: str) -> set:
@@ -1200,6 +775,299 @@ shutil.rmtree(_DEFERRED_ROOT, ignore_errors=True)
 
 
 # ===========================================================================
+# 1c. THE EXEC CHAIN IS DEAD  (pass 20e)
+# ===========================================================================
+
+print("\n" + "=" * 78)
+print("1c. nothing exec's a numbered file, chains one, or loads one by location")
+print("=" * 78)
+
+# WHAT THIS REPLACES, AND WHY IT IS NOT A SMALLER CHECK THAN WHAT IT REPLACES.
+#
+# Until pass 20e this file carried four pinned inventories -- the names Files
+# 01/02/03 bound before item 20c, and the RUNTIME names Files 05, 07, 08, 09,
+# 10, 13 and 14 bound before passes 2a/2b/2c/3a -- and a probe that exec'd each
+# shim into a bare namespace and compared what it bound against its inventory.
+# Those checks answered one question: "does the shim still deliver to the exec
+# chain what the exec chain reads out of it".
+#
+# THE EXEC CHAIN NO LONGER EXISTS, so the question has no subject. Pass 20e
+# measured every consumer of every shim -- each re-exported name, and each
+# shim's FILENAME as a string, against every .py, .md, .toml and .yml in the
+# tree -- found the last five chainers (05, 09, 13, 18, 19) were chaining for
+# consumers that had themselves been converted one or two passes earlier, and
+# deleted seven files: 01, 02, 03, 08, 10, 14 and oncotriage_settings.py. The
+# other five became thin entry points.
+#
+# A retired inventory is a check that stopped running, so this section is what
+# takes its place, and it is STRICTLY WIDER in the one way that matters: the
+# inventories asserted a property of ten named files, and this asserts a
+# property of EVERY file in the repository, including files written tomorrow.
+# The old checks could not have caught a new file that started exec'ing; this
+# one does.
+#
+# THE FIRST VERSION OF THIS SCAN HAD THREE DEFECTS AND ITS OWN CONTROLS FOUND
+# ALL THREE, WHICH IS THE ARGUMENT FOR CONTROLS RESTATED AS AN EVENT:
+#
+#   1. It matched the bare substring "exec_chain" inside any string literal, so
+#      it reported nine DOCSTRINGS -- including the one you are reading, and
+#      including oncotriage/utils.py's record of why exec_chain was deleted --
+#      as violations. The documentation of the fix read as the defect, which is
+#      the exact trap the drift test's `inferences_path` check already carries a
+#      note about. The literal search now requires a CALL shape.
+#
+#   2. Its "raw exec of a numbered file" arm looked for a numbered filename
+#      INSIDE the exec() call. Not one of the five real bootstraps was written
+#      that way -- every one of them was `open(_code_dir + "01- Imports.py")` on
+#      one line and `exec(_fh.read(), globals())` on the next, or a `for` loop
+#      over a tuple of filenames. So the arm would have missed all five files it
+#      was written to catch, and it took the negative control to say so.
+#
+#   3. Rewritten to match code-shaped SUBSTRINGS inside string literals, it
+#      then missed `ns["exec_chain"](...)` -- the subscript form, which is the
+#      form the retired shim probe itself used -- because the quote characters
+#      sit between the name and the paren, so "exec_chain(" is not a substring
+#      of it. String literals are RE-PARSED as Python now, which catches every
+#      call form at once and, as a side effect, stops reporting prose.
+#
+# WHAT IT DOES INSTEAD, and why this shape cannot miss the real thing: you
+# cannot run a numbered file's text without exec(), runpy, or an importlib
+# by-location load. So the check is on the MECHANISM rather than on the
+# filename:
+#
+#   Form A  a call whose unparsed callee mentions exec_chain,
+#           spec_from_file_location, SourceFileLoader or runpy. Unparsed, so
+#           the SUBSCRIPT form ns["exec_chain"](...) is seen -- which is not
+#           hypothetical, it is the form the retired shim probe used.
+#   Form B  any call to the exec builtin, anywhere, outside a closed and argued
+#           allowlist.
+#   Form C  either of the above appearing inside a STRING LITERAL, found by
+#           RE-PARSING the literal as Python and running Forms A and B over the
+#           result. A subprocess probe's source is an ordinary string to any AST
+#           walk; prose does not parse, so it is not reported.
+#
+# THIS FILE IS EXCLUDED FROM THE FORM C SEARCH, for the same reason check 2h
+# excludes it from its read corpus: the paragraph above names every pattern the
+# scan looks for, so counting this file's own strings would report it as the
+# violator.
+
+_CHAIN_CALL_MARKERS = ("exec_chain", "spec_from_file_location",
+                       "SourceFileLoader", "runpy")
+
+# Cheap pre-filter before the expensive step below. A string literal that does
+# not mention any of these cannot be an exec-chain bootstrap, and most of this
+# repository's string literals are prose.
+_STRING_PREFILTER = ("exec", "spec_from_file_location", "SourceFileLoader",
+                     "runpy")
+
+# THE exec() ALLOWLIST IS CLOSED AND HAS ONE MEMBER, WITH AN ARGUMENT.
+# tests/test_storage_query_layer.py unparses two PRE-FIX functions out of a git
+# blob and exec's them into a throwaway namespace, so that its negative controls
+# run the code item 38 replaced rather than a retyped copy of it. That is a
+# legitimate exec of text that is not a file in the working tree, and it is the
+# only one. An entry added here has to carry the same kind of argument.
+_EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py"}
+
+
+def _repo_py_files():
+    """Every .py in the repository: package, numbered scripts and tests alike.
+
+    A WALK, not an os.listdir. Pass 20d-2 found check 2h blind to tests/ for
+    exactly the reason a one-level listing is always wrong here -- a corpus that
+    silently covers less does not fail, it reports FEWER findings, which reads
+    as a clean repository.
+    """
+    out = []
+    for dirpath, dirnames, filenames in os.walk(_code_dir.rstrip(os.sep)):
+        dirnames[:] = [d for d in dirnames
+                       if d not in ("__pycache__", ".git", "build",
+                                    "oncotriage.egg-info", ".vscode")]
+        for name in sorted(filenames):
+            if name.endswith(".py"):
+                out.append(os.path.join(dirpath, name))
+    return sorted(out)
+
+
+def _scan_calls(tree, rel, allowed_exec, at_line=None, suffix=""):
+    """Chain calls and exec calls in one parsed tree."""
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        callee = ast.unparse(node.func)
+        lineno = at_line if at_line is not None else node.lineno
+        if any(m in callee for m in _CHAIN_CALL_MARKERS):
+            found.append((rel, lineno, "chain-call" + suffix,
+                          ast.unparse(node)[:100]))
+        elif callee == "exec" and node.args and not allowed_exec:
+            # node.args required: prose writes the bare word "exec()", and a
+            # call with no arguments is never a bootstrap. Without this the
+            # scan reported nineteen docstrings that merely DISCUSS the exec
+            # chain -- the documentation of the fix reading as the defect.
+            found.append((rel, lineno, "exec-call" + suffix,
+                          ast.unparse(node)[:100]))
+    return found
+
+
+def _chain_violations(paths, skip_strings_in=(), allowlist=_EXEC_ALLOWLIST):
+    """(relpath, lineno, form, text) for every exec-chain reference found.
+
+    A STRING LITERAL IS RE-PARSED AS PYTHON RATHER THAN SUBSTRING-MATCHED, and
+    that is not fastidiousness -- it is the only thing that catches the form
+    this file's own retired shim probe used. `ns["exec_chain"](...)` inside a
+    subprocess-probe string does not contain the substring "exec_chain(",
+    because the quote characters sit between the name and the paren. The
+    negative control at the bottom of this section is what established that:
+    the substring version of this scan did not fire on it.
+
+    Re-parsing also solves the opposite problem for free. Prose does not parse
+    as Python, so a docstring explaining why exec_chain was deleted -- and nine
+    of them do, deliberately, because a deleted mechanism has to leave its
+    argument behind -- is not reported.
+    """
+    found = []
+    for path in paths:
+        rel = os.path.relpath(path, _code_dir).replace(os.sep, "/")
+        try:
+            source = open(path, encoding="utf-8").read()
+        except OSError as exc:                                    # noqa: PERF203
+            found.append((rel, 0, "unreadable", str(exc)))
+            continue
+        try:
+            tree = ast.parse(source)
+        except SyntaxError as exc:
+            found.append((rel, exc.lineno or 0, "unparseable", str(exc)))
+            continue
+        skip_strings = os.path.abspath(path) in skip_strings_in
+        allowed_exec = rel in allowlist
+        found += _scan_calls(tree, rel, allowed_exec)
+        if skip_strings:
+            continue
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Constant)
+                    and isinstance(node.value, str)):
+                continue
+            if not any(m in node.value for m in _STRING_PREFILTER):
+                continue
+            for candidate in (node.value, textwrap.dedent(node.value)):
+                try:
+                    inner = ast.parse(candidate)
+                except (SyntaxError, ValueError):
+                    continue
+                found += _scan_calls(inner, rel, allowed_exec,
+                                     at_line=node.lineno,
+                                     suffix="-in-a-string")
+                break
+    return sorted(set(found))
+
+
+_REPO_ALL_PY = _repo_py_files()
+_THIS_FILE = os.path.abspath(__file__) if "__file__" in globals() else ""
+
+# NON-DEGENERATE FIRST. A corpus that lost the numbered scripts would report
+# nothing and look exactly like a clean repository -- the same failure shape
+# pass 20d-2 found in check 2h's read corpus.
+check("the scan corpus covers the whole repository, not just the package",
+      len(_REPO_ALL_PY) >= 50, True)
+check("...including the numbered entry points",
+      any(os.path.basename(p).startswith("13- ") for p in _REPO_ALL_PY), True)
+check("...and tests/",
+      any(os.sep + "tests" + os.sep in p for p in _REPO_ALL_PY), True)
+
+_VIOLATIONS = _chain_violations(_REPO_ALL_PY, skip_strings_in={_THIS_FILE})
+check("nothing in the repository calls exec_chain, calls exec(), or loads a "
+      "module by location", _VIOLATIONS, [])
+if _VIOLATIONS:
+    for _rel, _ln, _form, _text in _VIOLATIONS:
+        print(f"       {_form:20} {_rel}:{_ln}  {_text}")
+
+# THE ALLOWLIST IS NOT A GET-OUT. Its one member must still contain the exec it
+# is excused for, or the entry is a stale line excusing nothing.
+_allowlist_still_needed = []
+for _allowed in sorted(_EXEC_ALLOWLIST):
+    _p = os.path.join(_code_dir, _allowed.replace("/", os.sep))
+    if not os.path.isfile(_p):
+        _allowlist_still_needed.append(f"{_allowed}: file is gone")
+        continue
+    if not _chain_violations([_p], allowlist=set()):
+        _allowlist_still_needed.append(f"{_allowed}: no longer calls exec()")
+check("...and the one allowlisted file still needs its entry, so the allowlist "
+      "cannot go stale unnoticed", _allowlist_still_needed, [])
+
+# The deleted files are gone, asserted rather than assumed. A shim left on disk
+# and merely unreferenced is a shim someone re-wires.
+_DELETED_IN_20E = ("01- Imports.py", "02- Utility Functions.py", "03- Config.py",
+                   "08- Cancer Code Registry.py",
+                   "10- Structured Eligibility Extractor.py",
+                   "14- Database Logger.py", "oncotriage_settings.py")
+check("every shim pass 20e deleted is actually absent from the code directory",
+      sorted(n for n in _DELETED_IN_20E
+             if os.path.exists(os.path.join(_code_dir, n))), [])
+# ...and the survivors are still there, so the check above is not passing
+# because the code directory itself went missing.
+check("...while the numbered entry points that survived are still present",
+      sorted(n for n in ("05- FHIR Clean Data.py", "07- FHIR Parser.py",
+                         "13- LangGraph Agent.py", "20- Drift Detection.py")
+             if not os.path.exists(os.path.join(_code_dir, n))), [])
+
+check("oncotriage.utils no longer defines exec_chain",
+      "exec_chain" in _bound_names(os.path.join(_PKG_DIR, "utils.py")), False)
+
+# --- NEGATIVE CONTROLS, one per form, each planted and each fired -----------
+# Written to a temp directory and scanned there. Nothing in the repository is
+# edited, which is the shape CLAUDE.md prefers over an in-place plant.
+#
+# THE THIRD ONE IS THE IMPORTANT ONE. It is written the way the five real
+# bootstraps were written -- filename on the open() line, exec() on the next --
+# which is the shape the first version of this scan could not see.
+_CTRL_DIR = tempfile.mkdtemp(prefix="oncotriage_chain_ctrl_")
+_CONTROLS = {
+    "bare exec_chain call":
+        'exec_chain(["03- Config.py"], caller_file=__file__,\n'
+        '           caller_globals=globals())\n',
+    "subscript exec_chain call":
+        'ns = {}\nns["exec_chain"](["03- Config.py"], 1, 2)\n',
+    "the real bootstrap shape: open() on one line, exec() on the next":
+        '_code_dir = "/x/"\n'
+        'with open(_code_dir + "01- Imports.py") as _fh:\n'
+        '    exec(_fh.read(), globals())\n',
+    "the real loop shape":
+        'for _b in ("01- Imports.py", "02- Utility Functions.py"):\n'
+        '    with open(_code_dir + _b) as _fh:\n'
+        '        exec(_fh.read(), globals())\n',
+    "by-location load":
+        'import importlib.util\n'
+        'spec = importlib.util.spec_from_file_location("x", "/tmp/x.py")\n',
+    "hidden in a probe string":
+        '_PROBE = """\\nns["exec_chain"](chain, caller_globals=ns)\\n"""\n',
+}
+for _label, _body in _CONTROLS.items():
+    _ctrl_path = os.path.join(_CTRL_DIR, "ctrl.py")
+    with open(_ctrl_path, "w", encoding="utf-8") as _fh:
+        _fh.write(_body)
+    _hit = _chain_violations([_ctrl_path])
+    check(f"negative control fires: {_label}", len(_hit) >= 1, True)
+    os.remove(_ctrl_path)
+
+# AND THE OTHER DIRECTION. A file that merely TALKS about the exec chain in
+# prose must NOT be reported, or the scan is one people route around by not
+# writing documentation -- and nine of this repository's docstrings do exactly
+# that, deliberately, because a deleted mechanism has to leave its argument
+# behind.
+_prose_path = os.path.join(_CTRL_DIR, "prose.py")
+with open(_prose_path, "w", encoding="utf-8") as _fh:
+    _fh.write('"""exec_chain used to load this file; pass 20e deleted it.\n\n'
+              'It set __name__ to "_exec_chain_" while exec\'ing.\n"""\n')
+check("...and prose about exec_chain is NOT reported, so the scan does not "
+      "punish keeping the argument for a deleted mechanism",
+      _chain_violations([_prose_path]), [])
+os.remove(_prose_path)
+shutil.rmtree(_CTRL_DIR, ignore_errors=True)
+
+
+
+
+# ===========================================================================
 # 2. IMPORTING TOUCHES NO SOCKET, NO DATABASE, NO MODEL
 # ===========================================================================
 
@@ -1254,7 +1122,7 @@ import xml.etree.ElementTree                                              # noqa
 import numpy, rank_bm25, langgraph.graph                                  # noqa: F401
 # Pass 20c-3a: oncotriage.fhir.explore imports these THREE AT MODULE SCOPE, and
 # deliberately -- seven of its twelve functions plot, and nothing but
-# "06- FHIR Explore.py" imports it. matplotlib reads matplotlibrc and its font
+# "06- FHIR Dataset Characterization.py" imports it. matplotlib reads matplotlibrc and its font
 # cache at import, and pandas reads its own configuration, so without this
 # pre-import the trap would fire on THEIR file access rather than on anything
 # this package does. Same allowance, for the same reason, as the block above.
@@ -1592,7 +1460,7 @@ print(json.dumps({"heavy": heavy, "armed": armed, "forms": _forms,
 #
 # THREE OF THE SIX WERE THE WORST OFFENDERS IN THE PROJECT before this pass.
 # "11- RAG Trial Indexer.py" built SparseTextEmbedding at module level, so
-# reading the indexer loaded a model. "06- FHIR Explore.py" resolved three globs,
+# reading the indexer loaded a model. "06- FHIR Dataset Characterization.py" resolved three globs,
 # CREATED A DIRECTORY, built the whole ICD-10-CM registry and mutated matplotlib's
 # global style, all at exec time. "05- FHIR Clean Data.py" resolved two globs and
 # built the registry. Every one of those is now behind an accessor, and this
@@ -1613,7 +1481,7 @@ print(json.dumps({"heavy": heavy, "armed": armed, "forms": _forms,
 # that was already counted -- five modules and three package __init__ files.
 # Three of the five are the ones that matter here:
 #
-#   storage.maintenance   is the DELETE loop. "15- Database Empty.py" opened the
+#   storage.maintenance   is the DELETE loop. "15- Database Wipe All Tables.py" opened the
 #                         production database at module level until item 20b;
 #                         this import must open nothing at all.
 #   storage.queries       is forty queries that File 16 ran AT LOAD TIME, every
@@ -2855,6 +2723,72 @@ _UNREAD_CONSTANT_EXEMPTIONS = {
     # changed. RECORDED AS A FOLLOW-UP: name the error-handler case explicitly
     # in verify_recording_complete() and drop this entry.
     "oncotriage/fixtures/capture.py": ["TERMINAL_ERROR"],
+
+    # ----------------------------------------------------------------------
+    # SEVEN ENTRIES ADDED BY PASS 20e, AND NOT ONE OF THEM IS NEW CODE.
+    # ----------------------------------------------------------------------
+    # Every one of these was READ, by this scan's own rules, by a line in a
+    # deleted re-export shim: a `from oncotriage.X import NAME` counts as a
+    # read (see _all_reads), and Files 03, 07, 08, 10 and 13 listed them.
+    # Deleting the shims removed the reads and the constants became visible for
+    # the first time. THAT IS THE FINDING: for as long as a shim re-exported a
+    # module's whole surface, this scan could not see a dead name in it,
+    # because the shim read everything by construction. It is the same blind
+    # spot pass 20d-2 found in the scan's DIRECTORY corpus, in a different
+    # dimension, and it is why the shim deletions had to be paired with a run
+    # of this check rather than assumed harmless.
+    #
+    # They are split into two kinds, because they are not the same problem.
+
+    # KIND ONE: closed vocabularies and decision records -- the TERMINAL_ERROR
+    # shape above, exactly. Each names a value that exists so a reader can see
+    # it, and deleting it would tell the next reader something false.
+    #
+    #   _NOT_EVALUABLE_REASONS is the closed tuple of the three reasons Stage 5
+    #   can stamp; all three MEMBERS are read individually, and the tuple is
+    #   what says the list is closed. Naming two of three would read as "these
+    #   are the only two", which is false.
+    "oncotriage/agent/evaluation.py": ["_NOT_EVALUABLE_REASONS"],
+    #   _HISTORICAL_MED_STATUSES is the documented COMPLEMENT of
+    #   _ACTIVE_MED_STATUSES (which is read, at the medication sort key).
+    #   Nothing tests membership in it because "not active and not excluded" is
+    #   how the parser reaches historical; the set is the record of which
+    #   statuses that phrase covers, and its comment block above it is the
+    #   argument for keeping historical medications at all.
+    #   The two ECOG LOINC codes are the SAME entry the exemption for
+    #   fhir/generate.py already carries, in the module that parses rather than
+    #   the one that generates: 89247-1 is the score, and 89246-3 (panel) and
+    #   89262-0 (interpretation) are named beside it precisely so nobody
+    #   "corrects" the routing to a sibling that carries no integer grade.
+    "oncotriage/fhir/parser.py": ["_HISTORICAL_MED_STATUSES",
+                                  "_ECOG_LOINC_PANEL_CODE",
+                                  "_ECOG_LOINC_INTERPRETATION_CODE"],
+
+    # KIND TWO: GENUINELY DEAD, reported rather than deleted, and each is a
+    # ranked follow-up of pass 20e rather than a decision it made.
+    #
+    #   BATCH_SIZE and EXPANSION_TEMPERATURE are TUNABLES. CLAUDE.md tells an
+    #   operator that every tunable lives in oncotriage/config.py, so an
+    #   operator may reasonably set either and expect an effect; neither has
+    #   one. EXPANSION_TEMPERATURE's own comment says why -- "Stage 1 uses no
+    #   LLM" -- which makes it a documentation defect rather than a leftover,
+    #   and BATCH_SIZE claims to be "patients per progress-reporting batch"
+    #   while oncotriage/batch/runner.py reads no such value. DELETING A
+    #   DOCUMENTED TUNABLE IS A CHANGE TO THE CONFIGURATION SURFACE, which is a
+    #   decision for the item that owns config, not a side effect of deleting
+    #   shims. RECORDED AS A FOLLOW-UP: delete both, or wire BATCH_SIZE into
+    #   the runner's progress reporting, and say which in CLAUDE.md.
+    "oncotriage/config.py": ["BATCH_SIZE", "EXPANSION_TEMPERATURE"],
+    #   _PATIENT_STAGE_RE is a compiled regex with no reader at all --
+    #   _SNOMED_DISPLAY_STAGE_RE, defined immediately above it and differing
+    #   only by an optional "tnm " prefix, is the one extract_patient_stage()
+    #   uses. This is unambiguous dead code and the only reason it is exempted
+    #   rather than removed here is that pass 20e's acceptance criterion is
+    #   that no behaviour changed and no assertion moved except where a pinned
+    #   inventory forced it; deleting a regex from the stage extractor is
+    #   neither. RECORDED AS A FOLLOW-UP, and it is the one of the three that
+    #   should simply go.
+    "oncotriage/extraction/stage.py": ["_PATIENT_STAGE_RE"],
 }
 
 _reads, _string_blob = _all_reads(
@@ -3333,239 +3267,259 @@ shutil.rmtree(_COPY_ROOT, ignore_errors=True)
 
 
 # ===========================================================================
-# 5. NO NAME FILES 01 / 02 / 03 DEFINED WAS DROPPED
+# 5. EVERY NUMBERED FILE IS A THIN ENTRY POINT, AND EVERY PACKAGE IMPORT
+#    ANYWHERE IN THE REPOSITORY RESOLVES  (re-derived, pass 20e)
 # ===========================================================================
 
 print("\n" + "=" * 78)
-print("5. every pre-20c name is still bound by its shim")
+print("5. no numbered file re-exports; every `from oncotriage... import` resolves")
 print("=" * 78)
 
-for _filename, _expected in _PRE_20C_NAMES.items():
-    check(f"the recorded name list for {_filename[:2]} is the size it was "
-          f"extracted at", len(_expected), _PRE_20C_COUNTS[_filename])
-    _bound = _bound_names(os.path.join(_code_dir, _filename))
-    _missing = sorted(set(_expected) - _bound)
-    check(f"{_filename[:2]}: all {len(_expected)} pre-20c names still bound", _missing, [])
+# WHAT THIS REPLACES. Until pass 20e section 5 pinned four historical name
+# inventories and exec'd each shim into a bare namespace to prove it still
+# delivered them. Every one of those inventories described a contract with the
+# exec chain, and pass 20e ended the exec chain and deleted seven of the ten
+# files. See section 1c for the retirement argument; this section is the half
+# of the old section that is still answerable, RE-DERIVED rather than edited
+# down.
+#
+# The old section asked two questions. Only one of them survives:
+#
+#   "does the shim bind exactly the names it used to"   -- no subject any more.
+#   "does every name a numbered file imports out of      -- still real, and now
+#    the package actually EXIST there"                     asked of every file
+#                                                          in the repository
+#                                                          rather than of three.
+#
+# THE SECOND QUESTION IS WIDER THAN IT WAS. The old probe collected
+# `from oncotriage.X import ...` out of Files 01, 02 and 03 only. This one
+# collects it out of every .py in the tree -- the numbered entry points, the
+# eighteen tests, the two fixture harnesses -- so an import of a name the
+# package lost is caught wherever it is written, and it is caught WITHOUT
+# running the file, which for Files 18, 19 and 13 matters because running them
+# costs money.
+#
+# AND IT ADDS ONE THE OLD SECTION COULD NOT ASK. A thin entry point is defined
+# by what it does NOT do: it must not put names into anyone else's namespace,
+# because there is no longer anyone else's namespace to put them into. The
+# structural form of that is "no module-level `from oncotriage... import` whose
+# names the file's own __main__ block does not use" -- which is a re-export in
+# all but name, and is what every deleted shim was.
 
-# The AST says the shim binds the name; it does not say the package actually
-# exposes it. An import of a name the package lost fails at run time, so every
-# `from oncotriage.X import ...` in the three shims is resolved for real.
-# WHY THIS DOES NOT USE hasattr FOR EVERY NAME (corrected in pass 20c-2c).
-#
-# oncotriage.paths grew a PEP 562 __getattr__ in pass 2b, and a path name routed
-# through it RESOLVES when it is read. On a healthy tree hasattr returns True.
-# On a checkout without the sibling directories the resolver raises
-# RuntimeError, and Python does not convert that to AttributeError -- so
-# hasattr PROPAGATES it and this probe would abort with a traceback instead of
-# reporting which names are missing. It would fail on exactly the machine this
-# whole pass exists to make the package work on.
-#
-# The question being asked is "does the package expose this name", not "can this
-# name be resolved right now", and PATH_NAMES answers the first without
-# attempting the second. Membership is checked FIRST so a path name never
-# reaches hasattr; every other module is unaffected and still uses hasattr,
-# which is the right test for a function or a constant.
+# --- 5a. every package import in the repository resolves -------------------
+
+_WANTED = {}
+for _path in _REPO_ALL_PY:
+    try:
+        _tree = ast.parse(open(_path, encoding="utf-8").read())
+    except SyntaxError:
+        continue
+    for _node in ast.walk(_tree):
+        if isinstance(_node, ast.ImportFrom) and (_node.module or "").startswith("oncotriage"):
+            for _alias in _node.names:
+                if _alias.name != "*":
+                    _WANTED.setdefault(_node.module, set()).add(_alias.name)
+_WANTED = {k: sorted(v) for k, v in sorted(_WANTED.items())}
+
+# NON-DEGENERATE. A probe over an empty set proves nothing, and the number is
+# a floor rather than a pin so that adding an import is not a failure.
+check("the repository imports at least 200 names out of the package (a probe "
+      "over an empty set would prove nothing)",
+      sum(len(v) for v in _WANTED.values()) >= 200, True)
+check("...spread over at least 20 package modules",
+      len(_WANTED) >= 20, True)
+
+# WHY THIS DOES NOT USE hasattr FOR EVERY NAME (inherited from the retired
+# probe, and still the right call). oncotriage.paths has a PEP 562 __getattr__
+# and a path name RESOLVES when it is read. On a healthy tree hasattr returns
+# True; on a checkout without the sibling directories the resolver raises
+# RuntimeError, and Python does not convert that to AttributeError -- so hasattr
+# PROPAGATES it and this probe would abort with a traceback instead of reporting
+# which names are missing. It would fail on exactly the machine the package
+# split exists to work on. The question is "does the package EXPOSE this name",
+# not "can it be resolved right now", and PATH_NAMES answers the first without
+# attempting the second.
 _IMPORT_PROBE = r'''
 import importlib, json, sys
 missing = []
+unimportable = []
 checked_via_path_names = []
 for module_name, names in json.loads(sys.argv[1] if len(sys.argv) > 1 else "{}").items():
-    module = importlib.import_module(module_name)
+    try:
+        module = importlib.import_module(module_name)
+    except Exception as exc:                                    # noqa: BLE001
+        unimportable.append(f"{module_name}: {type(exc).__name__}: {exc}")
+        continue
     lazy = set(getattr(module, "PATH_NAMES", ()))
     for name in names:
         if name in lazy:
             checked_via_path_names.append(module_name + "." + name)
             continue
-        if not hasattr(module, name):
+        if hasattr(module, name):
+            continue
+        # A SUBMODULE IS NOT AN ATTRIBUTE UNTIL SOMETHING IMPORTS IT, and
+        # `from oncotriage import config` is the commonest import shape in this
+        # package. hasattr(oncotriage, "config") is False in a process that has
+        # not imported it, so the first version of this probe reported seven
+        # perfectly good modules as missing names. Try the submodule import
+        # before concluding anything.
+        try:
+            importlib.import_module(module_name + "." + name)
+        except ImportError:
             missing.append(module_name + "." + name)
 print(json.dumps({"missing": missing,
+                  "unimportable": unimportable,
                   "checked_via_path_names": sorted(checked_via_path_names)}))
 '''
 
-_wanted = {}
-for _filename in _PRE_20C_NAMES:
-    _tree = ast.parse(open(os.path.join(_code_dir, _filename), encoding="utf-8").read())
-    for _node in ast.walk(_tree):
-        if isinstance(_node, ast.ImportFrom) and (_node.module or "").startswith("oncotriage"):
-            _wanted.setdefault(_node.module, []).extend(a.name for a in _node.names)
-
-check("the shims import at least 80 names from the package (a probe over an "
-      "empty set would prove nothing)",
-      sum(len(v) for v in _wanted.values()) >= 80, True)
-
 _rc, _out, _err = _run(
     _IMPORT_PROBE.replace("sys.argv[1] if len(sys.argv) > 1 else \"{}\"",
-                          repr(json.dumps(_wanted))),
+                          repr(json.dumps(_WANTED))),
     cwd=_ELSEWHERE, extra_path=_FALLBACK_PATH)
 check("the package-surface probe ran", _rc, 0)
 if _rc == 0:
     _payload = _last_json(_out) or {}
-    check("every name the shims import actually exists on its package module",
+    check("every name imported anywhere in the repository exists on the "
+          "package module it is imported from",
           _payload.get("missing"), [])
+    check("...and every one of those modules imported at all",
+          _payload.get("unimportable"), [])
     # NON-DEGENERATE. "missing == []" is also what a probe that checked nothing
-    # returns. The lazy-path branch must have been taken for the sixteen names
-    # File 01 imports out of oncotriage.paths -- if PATH_NAMES ever stopped
-    # being exported, every one of them would silently fall through to hasattr
-    # and this file would be back to aborting on a broken tree.
+    # returns. The lazy-path branch must have been taken -- if PATH_NAMES ever
+    # stopped being exported, every path name would fall through to hasattr and
+    # this probe would be back to aborting on a tree it cannot resolve.
     _via_paths = [n for n in (_payload.get("checked_via_path_names") or [])
                   if n.startswith("oncotriage.paths.")]
-    check("...and the sixteen lazy path names were checked by membership, not "
+    check("...and the lazy path names were checked by membership rather than "
           "by hasattr, so a broken tree cannot abort this probe",
-          len(_via_paths), 16)
+          len(_via_paths) >= 5, True)
 else:
     fail("package surface probe",
          f"exit {_rc}; stderr tail: {_err.strip().splitlines()[-4:]}")
 
-
-# --- Files 08, 09 and 10: exec the shim, compare the whole namespace --------
-# A stronger check than the ast one above, and the right one for these three:
-# their surface includes a name that is assigned and then deleted, so only
-# executing the file can say what it really binds. The shim is exec'd into a
-# bare namespace in a SUBPROCESS -- File 09's shim imports the MeSH filter,
-# which resolves data_MeSH_path, and none of that should land in this process.
+# --- 5b(i). no numbered file re-exports ------------------------------------
 #
-# Nothing is pre-seeded. That is deliberate: before pass 2a these files needed
-# SYSTEM_KEY_ABSENT, data_MeSH_path and a dozen typing names out of the shared
-# exec namespace, and after it they must need nothing at all, because a shim is
-# import statements. If any of them still reached for a free name, the exec
-# would raise NameError and this check would go red.
-
-# FILE 13 NEEDS A BASE CHAIN SUBTRACTED, and the other five do not.
+# A re-export is a module-level `from oncotriage... import NAME` whose NAME the
+# file itself never reads. Under the exec chain that was the whole POINT of a
+# shim; with the chain gone it is a name put into a namespace nobody reads,
+# which is the dead declaration check 2h exists to catch -- and, worse, it is
+# the first half of rebuilding a shim.
 #
-# Files 07, 08, 09, 10 and 14's shims are import statements: exec'd into a bare
-# namespace they bind their own names and nothing else. File 13's shim keeps its
-# BOOTSTRAP -- it exec's 01 and 02 and then chains 03, 08, 09 and 10, exactly as
-# File 13 always did, because twelve callers rely on chaining 13 to get all of
-# them. So exec'ing it bare yields 402 names, 315 of which belong to those
-# files. The probe therefore runs the same base chain into the same namespace
-# FIRST, records what is there, and reports only what the shim itself added.
-#
-# The base list is passed per file, so nothing about this is special-cased in
-# the loop below: it is empty for the five import shims and is the real chain
-# for File 13.
-_SHIM_PROBE = r"""
-import json, os, sys
-path = sys.argv[1]
-base_files = json.loads(sys.argv[2]) if len(sys.argv) > 2 else []
-chain_list = json.loads(sys.argv[3]) if len(sys.argv) > 3 else []
-code_dir = os.path.dirname(path) + os.sep
+# `import oncotriage` on its own is exempt and must be: it is the six-line
+# sys.path bootstrap every entry point carries, and its whole job is the side
+# effect.
 
-ns = {"__name__": "_exec_chain_", "__file__": path}
-for name in base_files:
-    with open(code_dir + name, encoding="utf-8") as fh:
-        exec(fh.read(), ns)
-if chain_list:
-    ns["exec_chain"](chain_list, caller_file=path, caller_globals=ns,
-                     chain_label="base")
-before = set(ns)
+_NUMBERED_FILES = sorted(
+    os.path.join(_code_dir, n) for n in os.listdir(_code_dir)
+    if re.match(r"^\d\d- .*\.py$", n)
+)
+check("the numbered-file scan found the entry points",
+      len(_NUMBERED_FILES) >= 20, True)
 
-with open(path, encoding="utf-8") as fh:
-    exec(fh.read(), ns)
-print(json.dumps(sorted(k for k in ns
-                        if k not in before and not k.startswith("__"))))
-"""
-
-_SHIM_BASE_CHAIN = {
-    "13- LangGraph Agent.py": ["01- Imports.py", "02- Utility Functions.py"],
-    # File 05's shim exec's 01, 02 AND 03 raw, then chains 07 and 08 for File 34.
-    # Same treatment as File 13: run the base first, record what is there, and
-    # report only what the shim itself added.
-    "05- FHIR Clean Data.py": ["01- Imports.py", "02- Utility Functions.py",
-                               "03- Config.py"],
-}
-
-# WHICH CHAIN THE PROBE RUNS AFTER THE BASE FILES. File 13 chains 03, 08, 09 and
-# 10; File 05 chains only 07 and 08. Keyed by file so nothing in the loop below
-# is special-cased.
-_SHIM_CHAIN_LIST = {
-    "13- LangGraph Agent.py": ["03- Config.py", "08- Cancer Code Registry.py",
-                               "09- MeSH Cancer Site Relevance Filter.py",
-                               "10- Structured Eligibility Extractor.py"],
-    "05- FHIR Clean Data.py": ["07- FHIR Parser.py", "08- Cancer Code Registry.py"],
-}
-
-# Files 08, 09 and 10 (pass 2a) and Files 07 and 14 (pass 2b) are checked by the
-# same loop against the same rules. The two inventories stay in separate dicts
-# above because each was extracted at a different commit and each is pinned to
-# what its file bound at that commit; merging them here is just iteration.
-_RUNTIME_INVENTORY = dict(_PRE_2A_RUNTIME_NAMES)
-_RUNTIME_INVENTORY.update(_PRE_2B_RUNTIME_NAMES)
-_RUNTIME_INVENTORY.update(_PRE_2C_RUNTIME_NAMES)
-_RUNTIME_INVENTORY.update(_PRE_3A_RUNTIME_NAMES)
-
-_RUNTIME_COUNTS = dict(_PRE_2A_COUNTS)
-_RUNTIME_COUNTS.update(_PRE_2B_COUNTS)
-_RUNTIME_COUNTS.update(_PRE_2C_COUNTS)
-_RUNTIME_COUNTS.update(_PRE_3A_COUNTS)
-
-_RUNTIME_ADDED = {name: set() for name in _PRE_2A_RUNTIME_NAMES}
-_RUNTIME_ADDED.update(_PASS_2B_ADDED)
-_RUNTIME_ADDED.update(_PASS_2C_ADDED)
-_RUNTIME_ADDED.update(_PASS_3A_ADDED)
-
-check("the inventory covers all seven converted files",
-      sorted(_RUNTIME_INVENTORY), sorted(_PASS_2B_DROPPED))
-
-for _filename, _expected in _RUNTIME_INVENTORY.items():
-    check(f"the recorded runtime name list for {_filename[:2]} is the size it "
-          f"was extracted at", len(_expected), _RUNTIME_COUNTS[_filename])
-
-    _proc = subprocess.run(
-        [sys.executable, "-c", _SHIM_PROBE, os.path.join(_code_dir, _filename),
-         json.dumps(_SHIM_BASE_CHAIN.get(_filename, [])),
-         json.dumps(_SHIM_CHAIN_LIST.get(_filename, []))],
-        cwd=_ELSEWHERE, capture_output=True, text=True,
-        env={**{k: v for k, v in os.environ.items() if k != "PYTHONPATH"},
-             **({"PYTHONPATH": _FALLBACK_PATH} if _FALLBACK_PATH else {}),
-             # File 13's shim loads no model, but the base chain it runs would
-             # have. Set so this probe cannot be the thing that pulls MedCPT in.
-             "ONCOTRIAGE_DEFER_LOCAL_MODELS": "1"},
-    )
-    if _proc.returncode != 0:
-        fail(f"{_filename[:2]}: the shim exec'd into a bare namespace",
-             f"exit {_proc.returncode}; stderr tail: "
-             f"{_proc.stderr.strip().splitlines()[-3:]}")
+_REEXPORTERS = {}
+for _path in _NUMBERED_FILES:
+    _src = open(_path, encoding="utf-8").read()
+    _tree = ast.parse(_src)
+    _imported_at_module_scope = set()
+    for _node in _tree.body:
+        if isinstance(_node, ast.ImportFrom) and (_node.module or "").startswith("oncotriage"):
+            for _alias in _node.names:
+                _imported_at_module_scope.add(_alias.asname or _alias.name)
+    if not _imported_at_module_scope:
         continue
+    # Reads: any Name load or Attribute value anywhere in the file, plus any
+    # string literal, on the same generous basis as check 2h -- a false
+    # negative here is a missed re-export a reader can still find, a false
+    # positive is a check people route around.
+    _read = set()
+    for _node in ast.walk(_tree):
+        if isinstance(_node, ast.Name) and not isinstance(_node.ctx, ast.Store):
+            _read.add(_node.id)
+        elif isinstance(_node, ast.Attribute):
+            _read.add(_node.attr)
+        elif isinstance(_node, ast.Constant) and isinstance(_node.value, str):
+            for _candidate in list(_imported_at_module_scope):
+                if _candidate in _node.value:
+                    _read.add(_candidate)
+    _unread = sorted(_imported_at_module_scope - _read)
+    if _unread:
+        _REEXPORTERS[os.path.basename(_path)] = _unread
 
-    _lines = [ln for ln in _proc.stdout.strip().splitlines() if ln.startswith("[")]
-    _bound = json.loads(_lines[-1]) if _lines else None
-    if _bound is None:
-        fail(f"{_filename[:2]}: the shim probe returned a name list",
-             f"stdout tail: {_proc.stdout.strip().splitlines()[-3:]}")
-        continue
+# ONE ENTRY, WITH AN ARGUMENT, AND THE FILE ALREADY CARRIES IT.
+# "24- Airflow Manager.py" imports five names and calls one. The other four are
+# there because its `__main__` menu NAMES them in COMMENTED lines, and pass
+# 20c-3c-2 kept that menu byte-verbatim on purpose. Uncommenting a line is the
+# documented way to use the file, and an import that only appears once you
+# uncomment something is a NameError waiting for the operator who does -- the
+# file's own comment above the import block says exactly that.
+#
+# Two of the four (check_dag_status, set_airflow_password) are additionally
+# named in the module docstring, so the string-literal arm of the read scan
+# already counts them; the other two are named only in COMMENTS, which no AST
+# walk can see. That asymmetry is why this is an exemption rather than a
+# widening of the scan: counting comments as reads would let any dead import be
+# excused by mentioning it in a comment.
+#
+# RECORDED AS A FOLLOW-UP, and it is the same follow-up pass 20c-3c-2 already
+# recorded: replace the commented menu with a real argparse CLI, at which point
+# all five names are read by code and this entry goes.
+_REEXPORT_EXEMPTIONS = {"24- Airflow Manager.py": ["stop_airflow", "trigger_dag"]}
 
-    _dropped = _PASS_2B_DROPPED[_filename]
-    _added = _RUNTIME_ADDED[_filename]
+_REEXPORT_FINDINGS = {
+    _name: _unread for _name, _unread in _REEXPORTERS.items()
+    if sorted(_unread) != sorted(_REEXPORT_EXEMPTIONS.get(_name, []))
+}
+check("no numbered file imports a package name at module scope that it never "
+      "reads, i.e. none of them is a re-export shim", _REEXPORT_FINDINGS, {})
+if _REEXPORT_FINDINGS:
+    for _name, _unread in sorted(_REEXPORT_FINDINGS.items()):
+        print(f"       {_name}: {_unread}")
 
-    # NON-DEGENERATE FIRST. An exception list that names something the inventory
-    # never held would silently excuse nothing, and an exception list that grew
-    # to cover the whole inventory would excuse everything.
-    check(f"{_filename[:2]}: every deliberately-dropped name was in the recorded "
-          f"inventory to begin with", sorted(_dropped - set(_expected)), [])
-    check(f"{_filename[:2]}: the exception list is a small minority of the "
-          f"inventory", len(_dropped) < len(_expected) // 4, True)
+# THE EXEMPTION IS NOT A GET-OUT: it must still be describing something real.
+# An exemption for a file that has since been fixed is a line that suppresses
+# nothing and hides the fact that the list is stale.
+check("...and the one exemption is still needed",
+      sorted(_name for _name in _REEXPORT_EXEMPTIONS
+             if _name not in _REEXPORTERS), [])
 
-    check(f"{_filename[:2]}: all {len(_expected) - len(_dropped)} recorded runtime "
-          f"names still bound (minus {len(_dropped)} dropped by pass 2b)",
-          sorted(set(_expected) - _dropped - set(_bound)), [])
-    # The deletions are ASSERTED, not merely tolerated: a shim that quietly kept
-    # re-exporting a permanently-None registry snapshot would pass the check
-    # above and fail this one.
-    check(f"{_filename[:2]}: and every dropped name really is gone",
-          sorted(_dropped & set(_bound)), [])
-    # Both directions. A shim that re-exported something the file never defined
-    # would put a name into the shared exec namespace that no caller expects,
-    # and the next file to use that name would silently pick this one up. The
-    # only permitted additions are the ones declared in _PASS_2B_ADDED, and each
-    # of those must actually BE there -- a declaration for a name that is not
-    # bound would quietly widen the allowance for nothing.
-    check(f"{_filename[:2]}: every declared addition is genuinely NEW, i.e. absent "
-          f"from the recorded inventory (non-degeneracy)",
-          sorted(_added & set(_expected)), [])
-    check(f"{_filename[:2]}: and every declared addition really is bound",
-          sorted(_added - set(_bound)), [])
-    check(f"{_filename[:2]}: and nothing UNDECLARED was added to the shared "
-          f"namespace", sorted(set(_bound) - set(_expected) - _added), [])
+# NEGATIVE CONTROL. The detector must be shown to fire, or "no re-exporters"
+# is indistinguishable from a walk that found nothing to look at. A copy of a
+# real entry point with a re-export line planted at module scope.
+_RX_DIR = tempfile.mkdtemp(prefix="oncotriage_reexport_ctrl_")
+_RX_PATH = os.path.join(_RX_DIR, "99- Planted.py")
+with open(_RX_PATH, "w", encoding="utf-8") as _fh:
+    _fh.write("import os\n"
+              "from oncotriage.config import MAX_WORKERS, PRICING_CONFIG\n"
+              "if __name__ == '__main__':\n"
+              "    print(MAX_WORKERS)\n")
+
+
+def _unread_package_imports(path):
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    imported = {a.asname or a.name for n in tree.body
+                if isinstance(n, ast.ImportFrom)
+                and (n.module or "").startswith("oncotriage")
+                for a in n.names}
+    read = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and not isinstance(n.ctx, ast.Store):
+            read.add(n.id)
+        elif isinstance(n, ast.Attribute):
+            read.add(n.attr)
+        elif isinstance(n, ast.Constant) and isinstance(n.value, str):
+            for c in list(imported):
+                if c in n.value:
+                    read.add(c)
+    return sorted(imported - read)
+
+
+check("negative control: a planted re-export IS reported",
+      _unread_package_imports(_RX_PATH), ["PRICING_CONFIG"])
+check("...and the name the planted file genuinely uses is NOT reported, so the "
+      "detector distinguishes a re-export from an import",
+      "MAX_WORKERS" in _unread_package_imports(_RX_PATH), False)
+shutil.rmtree(_RX_DIR, ignore_errors=True)
+
 
 
 # ===========================================================================
@@ -3647,328 +3601,210 @@ check("...and both halves import it rather than redefining it",
 
 
 # ===========================================================================
-# 5c. THE LAZY DEPENDENCY PROXY ANSWERS FOR WHAT IT WRAPS, NOT FOR ITSELF
+# 5c. THE DEPS SEAM ANSWERS WITHOUT BUILDING  (re-derived, pass 20e)
 # ===========================================================================
 
 print("\n" + "=" * 78)
-print("5c. _LazyAgentDependency delegates bool / len / iter / in / == / repr")
+print("5c. deps.peek / resolution_state / RESOLUTION_STATES: answers, no build")
 print("=" * 78)
 
-# THE DEFECT, and it is a set of WRONG ANSWERS rather than a missing feature.
+# WHAT THIS SECTION USED TO BE, AND WHY IT COULD NOT SURVIVE UNCHANGED.
 #
-# Pass 2c bound medcpt_tokenizer, medcpt_model and _bm25_query_model in File 13's
-# shim to a proxy that forwarded __getattr__ and __call__ and nothing else, on
-# the stated grounds that "call it or read an attribute off it" is the whole
-# surface any caller uses. That was true of the three callers that existed then;
-# it was not true of Python. CPython looks an IMPLICIT special method up on the
-# TYPE, never through __getattr__, so:
+# Until pass 20e it exercised `_LazyAgentDependency`, a proxy class defined in
+# "13- LangGraph Agent.py"'s re-export shim. That class existed for one reason:
+# an exec-chain caller reads a NAME out of a namespace and cannot call an
+# accessor, so the shim had to BIND medcpt_tokenizer, medcpt_model and
+# _bm25_query_model to something -- and binding the real objects would have
+# loaded MedCPT (~110 MB) and FastEmbed for the seven files that chained File 13
+# and never scored a pair.
 #
-#   bool(proxy)    -> True, always, whatever the wrapped object says
-#   proxy == other -> False, always, by identity -- even when the wrapped object
-#                     IS `other`. The whole point of a proxy over this seam is
-#                     that a harness can ask "is the thing the agent reaches
-#                     mine?", and == answered no while the answer was yes.
-#   len / iter / in -> TypeError naming _LazyAgentDependency, which sends the
-#                     reader to the wrapper instead of to the model.
-#   repr(proxy)    -> "<lazy ...>" even when an override is installed, i.e. a
-#                     description of the wrapper at the one moment a person is
-#                     looking to find out what they actually got.
+# Pass 20e deleted that shim, having measured that no file in the repository
+# chains it. THE PROXY WENT WITH IT AND IS NOT REBUILT: every consumer now calls
+# deps.get_medcpt_tokenizer() / get_medcpt_model() / get_bm25_query_model()
+# directly, which is lazier than the proxy was and, being the real accessor,
+# cannot answer wrongly about an object it never consulted. So this section
+# cannot keep testing a class that does not exist, and it must not be quietly
+# dropped either: three facts it established are about the PACKAGE and are still
+# load-bearing.
 #
-# EAGER BINDING IS NOT THE FIX and was rejected on evidence:
-# ONCOTRIAGE_DEFER_LOCAL_MODELS appears in exactly two files in this repository,
-# File 13 and File 46, so Files 31, 32, 35, 36, 37, 39 and 40 all chain File 13
-# with the switch unset and none of them scores a pair. Binding eagerly would
-# load MedCPT (~110 MB) and FastEmbed for all seven.
+#   1. deps.peek() and deps.resolution_state() must not BUILD. They are the
+#      diagnostic path -- a debugger rendering locals, a log line formatting an
+#      object, a harness reporting what it redirected -- and a diagnostic that
+#      costs 110 MB is a diagnostic nobody runs. This is measured by COUNTING
+#      FACTORY CALLS, which is the only thing that separates the two shapes:
+#      both return a plausible answer.
+#   2. peek() must distinguish "nothing installed" from a legitimately cached
+#      None. MESH_FILTER is genuinely None on a degraded run, so `is None`
+#      cannot mean "unresolved"; that is what deps.UNSET is for.
+#   3. deps.RESOLUTION_STATES documents itself as the CLOSED set of values
+#      resolution_state() can return, "so a caller can branch on it
+#      exhaustively". Nothing in the repository read it until pass 20c-3i wired
+#      it in here -- it was a declaration with nothing holding it to the code,
+#      the same shape as PASSWORD_SOURCE_ARGUMENT. If this section simply
+#      retired, that tuple would go back to being unread, and check 2h would
+#      report it. It is read here, and both observed states are checked for
+#      membership, so a fourth state added to the function and not to the tuple
+#      fails.
 #
-# THE DEMONSTRATION RUNS BOTH CLASSES. The current class is extracted from File
-# 13 by ast and exec'd into a throwaway namespace; a copy of it with the six
-# delegating methods REMOVED stands in for the pass-2c version. Both wrap the
-# same sentinel, whose every protocol answer is unambiguous, and the old one must
-# get them wrong. Nothing is edited in place.
+# THE RULE THE PROXY TAUGHT IS RECORDED IN oncotriage/agent/deps.py rather than
+# here, because it is advice to whoever writes the next proxy: CPython looks an
+# implicit special method up on the TYPE, never through __getattr__, so a proxy
+# forwarding only __getattr__ and __call__ answers bool(), ==, len, iter, `in`
+# and repr() about ITSELF -- confidently, and wrongly.
 
-_PROXY_DEMO = r'''
-import ast, json, sys
+_SEAM_DEMO = r'''
+import json
 
 from oncotriage.agent import deps
 
-STRIPPED = {"__bool__", "__len__", "__iter__", "__contains__", "__eq__",
-            "__hash__"}
-
-source = open(sys.argv[1], encoding="utf-8").read()
-node = next(n for n in ast.parse(source).body
-            if isinstance(n, ast.ClassDef) and n.name == "_LazyAgentDependency")
-
-# The class body references `deps` by name, so both copies are exec'd into a
-# namespace that HAS it -- the shipped __repr__ asks deps two questions.
-new_ns, old_ns = {"deps": deps}, {"deps": deps}
-exec(ast.unparse(node), new_ns)
-
-# The pass-2c/3a shape: the same class with the six delegating methods removed
-# and __repr__ put back to the DELEGATING form pass 3a shipped -- the one that
-# resolves. That is the defect pass 3b removes, so it is what the control must
-# reproduce.
-old_node = ast.parse(ast.unparse(node)).body[0]
-old_node.body = [b for b in old_node.body
-                 if not (isinstance(b, ast.FunctionDef) and b.name in STRIPPED)]
-for b in old_node.body:
-    if isinstance(b, ast.FunctionDef) and b.name == "__repr__":
-        b.body = ast.parse("return repr(self._resolve())").body
-exec(ast.unparse(old_node), old_ns)
+CALLS = {"n": 0}
 
 
 class Sentinel:
-    marker = "forwarded by __getattr__"
-
-    def __call__(self, *args):
-        return ["called", list(args)]
-
-    def __bool__(self):
-        return False                      # falsy: bool(proxy) must be False
-
-    def __len__(self):
-        return 3
-
-    def __iter__(self):
-        return iter(("a", "b", "c"))
-
-    def __contains__(self, item):
-        return item == "a"
-
-    def __eq__(self, other):
-        return other is self or other == "i am the sentinel"
-
-    def __hash__(self):
-        return 4242
+    """Unambiguous stand-in. Its repr is distinctive so it can be looked for."""
 
     def __repr__(self):
-        return "<Sentinel: the object the agent actually reaches>"
+        return "<seam-sentinel>"
 
 
 SENTINEL = Sentinel()
 
-# `repr` LEFT THIS DICT IN PASS 20c-3b. It used to expect the SENTINEL's own
-# repr, i.e. delegation. Delegation is the defect now: it makes repr() resolve,
-# which downloads and loads MedCPT from a debugger, a log line, or a bare name
-# typed at a prompt -- on the diagnostic path, where the tool used to inspect
-# the state must not be the thing that changes it. repr is measured separately
-# below, by whether the ACCESSOR WAS CALLED.
-TRUTH = {
-    "bool": False,
-    "len": 3,
-    "iter": ["a", "b", "c"],
-    "contains": True,
-    "eq_identity": True,
-    "eq_value": True,
-    "hash": True,
-    "getattr": "forwarded by __getattr__",
-    "call": ["called", [1, 2]],
-}
 
-# A real deps key, because the shipped __repr__ asks deps about it. MEDCPT_MODEL
-# is one of the three this proxy is actually used for.
-KEY = deps.MEDCPT_MODEL
+def counting_factory():
+    CALLS["n"] += 1
+    return SENTINEL
 
 
-def observe(cls):
-    proxy = cls(lambda: SENTINEL, "sentinel dependency", KEY)
-    out = {}
-    for key, thunk in (
-        ("bool", lambda: bool(proxy)),
-        ("len", lambda: len(proxy)),
-        ("iter", lambda: list(proxy)),
-        ("contains", lambda: "a" in proxy),
-        ("eq_identity", lambda: proxy == SENTINEL),
-        ("eq_value", lambda: proxy == "i am the sentinel"),
-        ("hash", lambda: hash(proxy) == 4242),
-        ("getattr", lambda: proxy.marker),
-        ("call", lambda: proxy(1, 2)),
-    ):
-        try:
-            out[key] = thunk()
-        except Exception as exc:                                # noqa: BLE001
-            out[key] = "!!" + type(exc).__name__
-    return out
+# The key under test is MESH_FILTER, deliberately: it is the one key whose real
+# value may legitimately be None, so it is the only one where "unresolved" and
+# "cached None" have to be told apart by something other than the value.
+KEY = deps.MESH_FILTER
 
+result = {}
 
-old, new = observe(old_ns["_LazyAgentDependency"]), observe(new_ns["_LazyAgentDependency"])
+# --- 1. UNRESOLVED: neither query builds, and peek says UNSET, not None ------
+deps.clear_override(KEY)
+deps._CACHE.pop(KEY, None)
+result["state_unresolved"] = deps.resolution_state(KEY)
+result["peek_unresolved_is_UNSET"] = deps.peek(KEY) is deps.UNSET
+result["peek_unresolved_is_not_None"] = deps.peek(KEY) is not None
+result["is_resolved_unresolved"] = deps.is_resolved(KEY)
+result["calls_after_unresolved_queries"] = CALLS["n"]
 
+# --- 2. OVERRIDE: both queries see it, still without building ----------------
+deps.set_override(KEY, SENTINEL)
+result["state_with_override"] = deps.resolution_state(KEY)
+result["peek_is_sentinel"] = deps.peek(KEY) is SENTINEL
+result["is_resolved_with_override"] = deps.is_resolved(KEY)
+result["calls_after_override_queries"] = CALLS["n"]
 
-# ---------------------------------------------------------------------------
-# __repr__ MUST NOT RESOLVE (pass 20c-3b)
-# ---------------------------------------------------------------------------
-# Measured by COUNTING ACCESSOR CALLS, which is the only thing that can tell the
-# two shapes apart: both return a string, and both strings look reasonable.
-def counting_accessor():
-    calls = []
+# --- 3. the accessor DOES hand the agent the override ------------------------
+# Non-degeneracy for everything above: if the override never reached the
+# accessor, "peek returns the sentinel" would be a fact about peek alone.
+result["accessor_returns_sentinel"] = deps.get_mesh_filter() is SENTINEL
 
-    def accessor():
-        calls.append(1)
-        return SENTINEL
+deps.clear_override(KEY)
+result["state_after_override_removed"] = deps.resolution_state(KEY)
 
-    return accessor, calls
+# --- 4. CACHED: a build happens once, and then the queries are free again ----
+# A cached value is the third state, and it must be reachable without the
+# queries being what reached it.
+_before_build = CALLS["n"]
+# Written directly rather than by calling the accessor: calling it would load
+# the real MeSH lookups off disk, which section 2 forbids this file's
+# subprocesses from doing and which this section does not need. What is under
+# test is that the QUERIES do not build, not how the cache got filled.
+deps._CACHE[KEY] = SENTINEL
+result["state_cached"] = deps.resolution_state(KEY)
+result["peek_cached_is_sentinel"] = deps.peek(KEY) is SENTINEL
+result["cached_keys_contains"] = KEY in deps.cached_keys()
+result["calls_after_cached_queries"] = CALLS["n"] - _before_build
 
+# --- 5. the closed set ------------------------------------------------------
+result["observed_states"] = sorted({result["state_unresolved"],
+                                    result["state_with_override"],
+                                    result["state_cached"]})
+result["all_observed_in_closed_set"] = all(
+    s in deps.RESOLUTION_STATES for s in result["observed_states"])
+result["closed_set_size"] = len(deps.RESOLUTION_STATES)
 
-new_acc, new_calls = counting_accessor()
-old_acc, old_calls = counting_accessor()
+# --- 6. an unknown key is refused, not silently ignored ----------------------
+# OVERRIDE_KEYS is closed for the same reason: a dropped override is the failure
+# this module exists to prevent, and the quiet version of it is the dangerous
+# one.
+try:
+    deps.set_override("no-such-key", SENTINEL)
+    result["unknown_key_raises"] = False
+except KeyError:
+    result["unknown_key_raises"] = True
 
-new_proxy = new_ns["_LazyAgentDependency"](new_acc, "sentinel dependency", KEY)
-old_proxy = old_ns["_LazyAgentDependency"](old_acc, "sentinel dependency", KEY)
-
-new_repr_unresolved = repr(new_proxy)
-old_repr = repr(old_proxy)
-
-# With an override INSTALLED, the shipped repr must say so and must name the
-# object's TYPE -- the discriminating fact, without transformers' module tree.
-with deps.override(KEY, SENTINEL):
-    new_repr_override = repr(new_proxy)
-    state_with_override = deps.resolution_state(KEY)
-    peeked_is_sentinel = deps.peek(KEY) is SENTINEL
-
-state_after = deps.resolution_state(KEY)
-
-# A __repr__ that RAISES would break every traceback, debugger and log line that
-# formats one of these three names, so a failure is caught, RECORDED and
-# described. The way to make it fail without resolving anything is a proxy built
-# with a key deps does not know -- a defect in the shim rather than in a model.
-Cls = new_ns["_LazyAgentDependency"]
-before = len(Cls.repr_failures)
-bad = Cls(lambda: SENTINEL, "bogus dependency", "not-a-real-deps-key")
-bad_text = repr(bad)
-
-print(json.dumps({
-    "old_wrong": sorted(k for k, v in old.items() if v != TRUTH[k]),
-    "new_wrong": sorted(k for k, v in new.items() if v != TRUTH[k]),
-    # THE CONTROL: the pass-3a delegating repr calls the accessor. The shipped
-    # one does not.
-    "old_repr_resolutions": len(old_calls),
-    "new_repr_resolutions": len(new_calls),
-    "old_repr_is_the_wrapped_object": old_repr == repr(SENTINEL),
-    "new_repr_names_the_key": KEY in new_repr_unresolved,
-    "new_repr_says_unresolved": "unresolved" in new_repr_unresolved,
-    "new_repr_says_override": "override" in new_repr_override,
-    "new_repr_names_the_type": "Sentinel" in new_repr_override,
-    "new_repr_avoids_the_object_repr":
-        repr(SENTINEL) not in new_repr_override,
-    "state_with_override": state_with_override,
-    "peeked_is_sentinel": peeked_is_sentinel,
-    "state_after_override_removed": state_after,
-    # RESOLUTION_STATES IS A CLOSED SET AND THIS IS WHAT CLOSES IT (20c-3i).
-    # Its docstring says "every value resolution_state() can return ... so a
-    # caller can branch on it exhaustively", and until this pass no caller
-    # anywhere in the repository read it -- it was a declaration with nothing
-    # holding it to the code it described, the same shape as
-    # PASSWORD_SOURCE_ARGUMENT in orchestration/airflow_manager.py. Both
-    # observed states are checked for membership, so a fourth state added to
-    # resolution_state() without being added to the tuple fails here.
-    "states_are_in_the_closed_set":
-        (state_with_override in deps.RESOLUTION_STATES
-         and state_after in deps.RESOLUTION_STATES),
-    "closed_set_is_non_degenerate": len(deps.RESOLUTION_STATES) == 3,
-    "repr_did_not_raise": True,
-    "repr_names_the_error": "KeyError" in bad_text,
-    "repr_failure_recorded": len(Cls.repr_failures) == before + 1,
-}))
+deps._CACHE.pop(KEY, None)
+print(json.dumps(result))
 '''
 
-_rc, _out, _err = _run(_PROXY_DEMO.replace("sys.argv[1]",
-                                           repr(os.path.join(_code_dir,
-                                                             "13- LangGraph Agent.py"))),
-                       cwd=_ELSEWHERE, extra_path=_FALLBACK_PATH)
-check("the lazy-proxy demonstration ran", _rc, 0)
+_rc, _out, _err = _run(_SEAM_DEMO, cwd=_ELSEWHERE, extra_path=_FALLBACK_PATH)
+check("the deps-seam demonstration ran", _rc, 0)
 if _rc != 0:
-    fail("lazy-proxy demonstration",
+    fail("deps seam demonstration",
          f"exit {_rc}; stderr tail: {_err.strip().splitlines()[-4:]}")
 else:
     _payload = _last_json(_out) or {}
-    # NON-DEGENERATE FIRST, and this is the half that makes the rest evidence
-    # rather than assertion: the OLD shape must be shown to get these wrong. A
-    # demonstration where both classes pass proves only that the sentinel was
-    # too weak to tell them apart.
-    check("the pass-2c proxy shape answers bool, len, iter, in, ==, and hash "
-          "WRONGLY about the object it wraps",
-          _payload.get("old_wrong"),
-          ["bool", "contains", "eq_identity", "eq_value", "hash", "iter", "len"])
-    check("...while __getattr__ and __call__ were right even then, so the "
-          "difference is the six protocols and nothing else",
-          sorted(set(_payload.get("old_wrong") or []) & {"getattr", "call"}), [])
-    check("the shipped proxy gets every one of the nine right",
-          _payload.get("new_wrong"), [])
 
-    # --- __repr__ MUST NOT RESOLVE (pass 20c-3b) ---------------------------
-    #
-    # Pass 3a made __repr__ delegate, on the reasonable-sounding grounds that a
-    # proxy printing "<lazy MedCPT cross-encoder>" while handing the agent a
-    # fixture stub is lying. The goal was right and the mechanism was wrong:
-    # delegation means REPR TRIGGERS A BUILD. A debugger rendering locals, a
-    # logging call formatting the object, or a bare `medcpt_model` typed at a
-    # prompt now downloads and loads ~110 MB and then prints transformers'
-    # multi-thousand-line module tree -- on the DIAGNOSTIC path, so the tool
-    # used to inspect the state is what changes it.
-    #
-    # MEASURED BY COUNTING ACCESSOR CALLS, because that is the only thing that
-    # separates the two shapes: both return a plausible-looking string.
-    check("the pass-3a delegating __repr__ RESOLVES (the defect, demonstrated)",
-          _payload.get("old_repr_resolutions"), 1)
-    check("...and it did so by producing the wrapped object's own repr, which "
-          "is what made the cost invisible",
-          _payload.get("old_repr_is_the_wrapped_object"), True)
-    check("the shipped __repr__ resolves NOTHING",
-          _payload.get("new_repr_resolutions"), 0)
-    check("...and still names the deps key it stands for",
-          _payload.get("new_repr_names_the_key"), True)
-    check("...and says so when nothing is built yet",
-          _payload.get("new_repr_says_unresolved"), True)
-
-    # The honesty pass 3a was after, kept without the cost: with an override
-    # installed the repr must say "override" and name the STUB's type, so a
-    # person looking at it can tell what the agent is actually reaching.
-    check("with an override installed the repr says 'override'",
-          _payload.get("new_repr_says_override"), True)
-    check("...and names the type of the object that is installed",
-          _payload.get("new_repr_names_the_type"), True)
-    check("...without printing the object's own repr, which is the module tree "
-          "nobody asked for",
-          _payload.get("new_repr_avoids_the_object_repr"), True)
-
-    # The two non-building deps queries the repr is built on.
-    check("deps.resolution_state reports an installed override",
+    # --- the three states, each observed rather than assumed ---------------
+    check("an untouched key reports 'unresolved'",
+          _payload.get("state_unresolved"), "unresolved")
+    check("...and peek returns UNSET for it, NOT None -- MESH_FILTER may be "
+          "legitimately None, so the two have to be distinguishable",
+          _payload.get("peek_unresolved_is_UNSET"), True)
+    check("...and UNSET is not None, so the distinction is real",
+          _payload.get("peek_unresolved_is_not_None"), True)
+    check("...and is_resolved agrees", _payload.get("is_resolved_unresolved"), False)
+    check("an installed override reports 'override'",
           _payload.get("state_with_override"), "override")
-    check("deps.peek returns the installed object without building",
-          _payload.get("peeked_is_sentinel"), True)
-    check("...and the key goes back to unresolved when the override is removed, "
-          "so the state query is reading live state rather than a constant",
+    check("...and peek returns the installed object",
+          _payload.get("peek_is_sentinel"), True)
+    check("...and is_resolved agrees", _payload.get("is_resolved_with_override"), True)
+    check("a cached value reports 'cached'", _payload.get("state_cached"), "cached")
+    check("...and peek returns it", _payload.get("peek_cached_is_sentinel"), True)
+    check("...and cached_keys() lists the key",
+          _payload.get("cached_keys_contains"), True)
+
+    # --- NON-DEGENERACY: the override actually reaches the agent's accessor.
+    # Without this, every assertion above is a statement about peek() rather
+    # than about the seam, and would hold just as well if set_override wrote
+    # into a dict nothing else read.
+    check("the accessor hands back the override, so peek is reporting the "
+          "seam rather than a private dict",
+          _payload.get("accessor_returns_sentinel"), True)
+    check("...and removing the override puts the key back to unresolved, so "
+          "the state query reads live state rather than a constant",
           _payload.get("state_after_override_removed"), "unresolved")
-    # Pass 20c-3i. deps.RESOLUTION_STATES documents itself as the CLOSED set of
-    # values resolution_state() can return, and nothing in the repository read
-    # it -- a declaration with nothing holding it to the code. Both observed
-    # states are now checked against it, so a fourth state added to the function
-    # and not to the tuple fails here rather than silently widening a set
-    # callers were told they could branch on exhaustively.
-    check("both observed states are members of deps.RESOLUTION_STATES, which "
-          "is what makes that tuple a closed set rather than a comment",
-          _payload.get("states_are_in_the_closed_set"), True)
+
+    # --- THE MEASUREMENT THIS SECTION EXISTS FOR: no query built anything.
+    # Counted factory calls, not inspected values: a query that resolved would
+    # return exactly the same answers.
+    check("NOT ONE of the unresolved-state queries called a factory",
+          _payload.get("calls_after_unresolved_queries"), 0)
+    check("...nor did the override-state queries",
+          _payload.get("calls_after_override_queries"), 0)
+    check("...nor did the cached-state queries",
+          _payload.get("calls_after_cached_queries"), 0)
+
+    # --- the closed set, and why it is checked here ------------------------
+    check("all three observed states are members of deps.RESOLUTION_STATES, "
+          "which is what makes that tuple a closed set rather than a comment",
+          _payload.get("all_observed_in_closed_set"), True)
     check("...and the set is the size it claims (non-degeneracy: membership in "
           "an empty or one-element tuple would prove nothing)",
-          _payload.get("closed_set_is_non_degenerate"), True)
+          _payload.get("closed_set_size"), 3)
+    check("...and all three of its members were actually observed, so the "
+          "tuple is exhausted rather than sampled",
+          _payload.get("observed_states"), ["cached", "override", "unresolved"])
 
-    check("__repr__ over a proxy deps cannot answer for does NOT raise",
-          _payload.get("repr_did_not_raise"), True)
-    check("...and names the exception instead of hiding it",
-          _payload.get("repr_names_the_error"), True)
-    check("...and RECORDS the failure rather than swallowing it",
-          _payload.get("repr_failure_recorded"), True)
+    # --- the key set is closed too -----------------------------------------
+    check("an override for an unknown key raises KeyError rather than being "
+          "silently ignored", _payload.get("unknown_key_raises"), True)
 
-# The forwarded set is CLOSED and documented. Asserted from the class body so
-# that adding a delegation without saying so in the docstring fails here.
-_AGENT_SHIM = os.path.join(_code_dir, "13- LangGraph Agent.py")
-_PROXY_NODE = next(n for n in ast.parse(open(_AGENT_SHIM, encoding="utf-8").read()).body
-                   if isinstance(n, ast.ClassDef) and n.name == "_LazyAgentDependency")
-_PROXY_METHODS = sorted(b.name for b in _PROXY_NODE.body
-                        if isinstance(b, ast.FunctionDef))
-check("the proxy forwards exactly the documented set and nothing more",
-      _PROXY_METHODS,
-      ["__bool__", "__call__", "__contains__", "__eq__", "__getattr__",
-       "__hash__", "__init__", "__iter__", "__len__", "__repr__", "_resolve"])
 
 
 # ===========================================================================
@@ -4369,94 +4205,6 @@ else:
           f"of {_expected}; locked arm lost nothing in "
           f"{_trials}/{_trials} trials")
 
-
-# ===========================================================================
-# 6. THE THREE LATE-BINDING WRAPPERS STILL BIND LATE
-# ===========================================================================
-
-print("\n" + "=" * 78)
-print("6. File 02's wrappers still read the shared namespace at call time")
-print("=" * 78)
-
-# File 02's shim uses no name from File 01 -- it is imports, three defs and
-# comments -- so it can be exec'd into a throwaway namespace on its own. Every
-# value below differs from the package's, so a wrapper that ignored the
-# namespace would produce the package's answer and fail.
-_LATE = r'''
-import json, os
-from datetime import date
-
-_ns = {"__name__": "_exec_chain_"}
-with open(os.environ["ONCOTRIAGE_FILE_02"]) as fh:
-    exec(fh.read(), _ns)
-
-result = {}
-
-# -- get_age_reference_date: the namespace's date, not the package's 2026-08-03
-_ns["DATA_SNAPSHOT_DATE"] = "1999-01-02"
-result["namespace_date"] = _ns["get_age_reference_date"]().isoformat()
-
-_ns["DATA_SNAPSHOT_DATE"] = ""
-try:
-    _ns["get_age_reference_date"]()
-    result["empty_raises"] = False
-except ValueError:
-    result["empty_raises"] = True
-
-# -- get_model_cost: the namespace's price table
-_ns["PRICING_CONFIG"] = {"last_updated": "1970-01-01",
-                         "models": {"fake-model": {"input": 1000.0, "output": 2000.0}}}
-result["fake_cost"] = _ns["get_model_cost"]("fake-model", 1_000_000, 1_000_000)
-try:
-    _ns["get_model_cost"]("gpt-5.6-terra", 1, 1)
-    result["real_model_rejected"] = False
-except _ns["UnknownModelPricingError"]:
-    result["real_model_rejected"] = True
-
-# -- resolve_qdrant_collection: the namespace's client, no network
-class _Alias:
-    def __init__(self, alias_name, collection_name):
-        self.alias_name = alias_name
-        self.collection_name = collection_name
-
-class _Aliases:
-    aliases = [_Alias("trial_criteria", "trial_criteria_19700101_000000")]
-
-class _StubQdrant:
-    def get_aliases(self):
-        return _Aliases()
-
-_ns["qdrant_client"] = _StubQdrant()
-_ns["COLLECTION_NAME"] = "trial_criteria"
-result["resolved"] = _ns["resolve_qdrant_collection"]()
-
-print(json.dumps(result))
-'''
-
-_env_backup = os.environ.get("ONCOTRIAGE_FILE_02")
-os.environ["ONCOTRIAGE_FILE_02"] = os.path.join(_code_dir, "02- Utility Functions.py")
-_rc, _out, _err = _run(_LATE, cwd=_ELSEWHERE, extra_path=_FALLBACK_PATH)
-if _env_backup is None:
-    os.environ.pop("ONCOTRIAGE_FILE_02", None)
-else:
-    os.environ["ONCOTRIAGE_FILE_02"] = _env_backup
-
-check("File 02's shim exec's into a bare namespace", _rc, 0)
-if _rc != 0:
-    fail("late-binding wrappers",
-         f"exit {_rc}; stderr tail: {_err.strip().splitlines()[-4:]}")
-else:
-    _payload = _last_json(_out) or {}
-    check("get_age_reference_date uses the namespace's DATA_SNAPSHOT_DATE",
-          _payload.get("namespace_date"), "1999-01-02")
-    check("...and an empty one still raises (File 38 depends on this)",
-          _payload.get("empty_raises"), True)
-    check("get_model_cost uses the namespace's PRICING_CONFIG",
-          _payload.get("fake_cost"), 3000.0)
-    check("...so a model priced only in the package's table is rejected",
-          _payload.get("real_model_rejected"), True)
-    check("resolve_qdrant_collection asks the namespace's client",
-          _payload.get("resolved"), "trial_criteria_19700101_000000")
 
 
 # ===========================================================================

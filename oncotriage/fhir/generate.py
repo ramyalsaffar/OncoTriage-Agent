@@ -379,7 +379,7 @@ def _validate_ecog_config():
                     missingness fraction outside [0, 1).
     """
     if not ECOG_SCORE_DISTRIBUTION:
-        raise ValueError("ECOG_SCORE_DISTRIBUTION (03- Config.py) is empty")
+        raise ValueError("ECOG_SCORE_DISTRIBUTION (oncotriage/config.py) is empty")
 
     for score, weight in ECOG_SCORE_DISTRIBUTION.items():
         if not isinstance(score, int) or isinstance(score, bool):
@@ -1493,7 +1493,7 @@ def write_run_manifest(output_dir, generation, module_info, verification,
         "label": label,
         "written_at_utc": datetime.now(timezone.utc).isoformat(),
         "project": Project_Name,
-        "paths_are_relative_to": "main_path (01- Imports.py)",
+        "paths_are_relative_to": "main_path (oncotriage/paths.py)",
         "generation": {
             "population_size": population_size,
             "min_age": MIN_AGE,

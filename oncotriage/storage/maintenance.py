@@ -3,7 +3,7 @@
 
 """Destructive maintenance on the inference database.
 
-Moved out of ``15- Database Empty.py`` by item 20c, pass 3b. That file is now a
+Moved out of ``15- Database Wipe All Tables.py`` by item 20c, pass 3b. That file is now a
 thin entry point: the ``Flag`` switch, the ``__main__`` guard, and the one call.
 
 THIS IS THE ONLY DESTRUCTIVE SCRIPT IN THE PROJECT, so read what did NOT change
@@ -37,7 +37,7 @@ closing message names which of the two things happened. The unconditional
 indistinguishable, in a terminal scrollback, from the many that did nothing.
 
 The switch itself, ``Flag = False``, DID NOT MOVE. It stays at module level in
-"15- Database Empty.py". It is data, it is the thing a reader opens that file to
+"15- Database Wipe All Tables.py". It is data, it is the thing a reader opens that file to
 find, and leaving it there keeps the one-line edit that arms this script exactly
 where it has always been -- rather than burying it in a package module where
 someone editing it would be further from the warning.
@@ -65,7 +65,7 @@ import sqlite3
 # Item 20b: opening the connection at module level meant that merely loading
 # this code -- the one place in the project whose purpose is to destroy data --
 # opened the production database. Every statement that touches sqlite is inside
-# the function below, and in "15- Database Empty.py" the function only runs
+# the function below, and in "15- Database Wipe All Tables.py" the function only runs
 # under the __main__ guard.
 def empty_database(db_path, flag):
     """Delete every row from every table at db_path, preserving the tables.

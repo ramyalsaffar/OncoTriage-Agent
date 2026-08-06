@@ -1,10 +1,20 @@
-# Explore Synthea Patient Data
-################################
+# Characterize the Synthea Patient Dataset
+##########################################
 
 """
 Descriptive analysis of the cancer patient dataset.
 Generates statistics, distributions, and visualizations
 Uses CSV files from Synthea export + our filtered JSON patient IDs
+
+RENAMED IN PASS 20e, from "06- FHIR Explore.py". "Explore" reads as a scratch
+notebook -- something you run while poking at data and then discard -- and this
+file is the opposite of that: item 9 makes it the SOURCE of the dataset
+characterisation, so the tables and figures it writes are the ones the write-up
+cites, and its cohort has to agree with the cohort File 05 leaves on disk (see
+the paragraph below on why cancer detection is delegated rather than
+reimplemented here). A name that invites a reader to treat the output as
+throwaway is wrong about the one thing that matters. The number stays 06 so that
+every note and document naming File 06 still resolves.
 
 Cancer detection and cancer-stage extraction are NOT implemented in this file.
 They are delegated to CancerCodeRegistry (File 08) and extract_patient_stage()

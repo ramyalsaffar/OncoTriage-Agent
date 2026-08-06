@@ -420,7 +420,8 @@ def z_score_drift(baseline: np.ndarray, current: np.ndarray) -> Dict:
 # the number on its own does not say.
 ECOG_UNAVAILABLE_DIAGNOSIS = (
     "Patients had an ECOG observation on file that could not be used. A rate "
-    "near 1.0 means DATA_SNAPSHOT_DATE (03- Config.py) and the patient corpus "
+    "near 1.0 means DATA_SNAPSHOT_DATE (oncotriage/config.py) and the patient "
+    "corpus "
     "disagree -- the corpus was regenerated with observations dated after the "
     "snapshot, so every one resolves to 'all_after_reference_date' and every "
     "ECOG criterion becomes not_evaluable. Check DATA_SNAPSHOT_DATE against the "
@@ -498,7 +499,7 @@ def ecog_unavailable_rate(df: pd.DataFrame) -> Dict:
             return {**insufficient,
                     "rows_pre_migration": len(df),
                     "notes": f"Column(s) {missing} absent — database predates "
-                             f"the ecog_* migration in 14- Database Logger.py"}
+                             f"the ecog_* migration in oncotriage/storage/database_logger.py"}
 
         reported = df["ecog_selection"].notna()
         denominator = int(reported.sum())

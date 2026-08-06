@@ -1,7 +1,7 @@
 """Stratified 30-patient sample extracted into its own SQLite database.
 
-Moved out of ``28- Select 30 Samples.py`` by item 20c, pass 3d.
-``28- Select 30 Samples.py`` survives as a THIN ENTRY POINT and keeps no
+Moved out of ``28- Select Evaluation Sample.py`` by item 20c, pass 3d.
+``28- Select Evaluation Sample.py`` survives as a THIN ENTRY POINT and keeps no
 re-export shim: all 40 of its top-level names were grepped against every
 ``.py``, ``.md``, ``.toml`` and ``.yml`` in the tree, and every hit is either a
 third-party import name (``os``, ``sqlite3``, ``random``, ``importlib``), an
@@ -16,7 +16,7 @@ FILE 28 WAS UNGUARDED, and CLAUDE.md said the last such file was File 29
 That statement is true only in its literal form -- File 29 had no function at
 all -- and File 28 was the second one: it defined ``classify_cancer`` and ran
 every other statement at module level with no ``if __name__ == "__main__"``
-guard. So ``exec(open("28- Select 30 Samples.py").read())`` or any import of it
+guard. So ``exec(open("28- Select Evaluation Sample.py").read())`` or any import of it
 opened the production ``inferences.db``, sampled it, DELETED the existing output
 database and rewrote it, as a side effect of being read. Item 20b guarded Files
 15, 16, 17, 22 and 24 and pass 20c-3c-2 guarded File 29; nothing reached this

@@ -34,28 +34,64 @@ guard immediately below the bootstrap.
 """
 
 # ===========================================================================
-# EXEC CHAIN: 01 -> 02
+# IMPORTS (pass 20e — this file no longer exec's anything)
 # ===========================================================================
-# data_fhir_path, glob, json, requests and time come from 01;
-# CaffeinateSession comes from 02. Nothing here reads a config constant,
-# so 03 is not loaded.
+# IT USED TO EXEC "01- Imports.py" AND "02- Utility Functions.py" INTO ITS OWN
+# GLOBALS, and with "18- FastAPI Server Test.py" it was one of the last two
+# files in the repository that did. Those two exec'd files are deleted by this
+# pass; nothing else needed them.
 #
-# Item 20a: this file sits in the code directory, so __file__ locates it with
-# no hardcoded path. __file__ is bound when the file is run as a script (every
-# documented entry point for it) and when Spyder runfile()s it. In a bare
-# interactive paste it is not bound, and the working directory is the only
-# remaining candidate -- taken, but announced, never silently.
-import os as _os_boot
-if "__file__" in globals():
-    _code_dir = _os_boot.path.dirname(_os_boot.path.abspath(__file__)) + _os_boot.sep
-else:
-    _code_dir = _os_boot.getcwd() + _os_boot.sep
-    print(f"[Bootstrap] __file__ unbound; using the working directory as the code directory: {_code_dir}")
-del _os_boot
+# The free-name set was re-derived with symtable rather than taken from the
+# comment that used to sit here, and the comment was INCOMPLETE: besides
+# data_fhir_path, glob, json, requests, time and CaffeinateSession it also used
+# os, shutil, sqlite3, tempfile, datetime, timezone and inferences_path, all of
+# which File 01 happened to bind. Every one is imported explicitly now.
+#
+# WHAT IS LOST, stated rather than discovered: this process no longer imports
+# torch, transformers, streamlit, langgraph and eighty more libraries in order
+# to POST HTTP requests, and it no longer resolves the whole sibling data tree
+# at import. `data_fhir_path` and `inferences_path` resolve on first READ
+# instead (oncotriage/paths.py is lazy since pass 20c-2b) -- same resolver,
+# same value, later.
+import glob
+import json
+import os
+import shutil
+import sqlite3
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
 
-for _bootstrap in ("01- Imports.py", "02- Utility Functions.py"):
-    with open(_code_dir + _bootstrap) as _fh:
-        exec(_fh.read(), globals())
+import requests
+
+
+# Make the oncotriage package importable
+#---------------------------------------
+# The same six-line block every other entry point carries. `pip install -e .`
+# makes it a no-op; without it the code directory is added to sys.path and the
+# fact is printed rather than left silent. This replaces the sys.path work
+# "01- Imports.py" used to do on this file's behalf.
+try:
+    import oncotriage  # noqa: F401
+except ImportError:
+    for _candidate, _how in (
+        (os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals()
+         else None, "__file__"),
+        (os.getcwd(), "cwd"),
+    ):
+        if _candidate and os.path.isdir(os.path.join(_candidate, "oncotriage")):
+            if _candidate not in sys.path:
+                sys.path.insert(0, _candidate)
+            print(f"[Bootstrap] oncotriage package found at {_candidate} "
+                  f"(via {_how}); added to sys.path")
+            break
+    else:
+        raise
+    del _candidate, _how
+
+from oncotriage.paths import data_fhir_path, inferences_path  # noqa: E402
+from oncotriage.utils import CaffeinateSession  # noqa: E402
 
 
 #------------------------------------------------------------------------------

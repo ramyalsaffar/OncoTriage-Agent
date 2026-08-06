@@ -2,10 +2,10 @@
 
 Item 20c, pass 3d.
 
-    sampling      "28- Select 30 Samples.py" whole -- the seeded, stratified
+    sampling      "28- Select Evaluation Sample.py" whole -- the seeded, stratified
                   30-patient draw out of inferences.db into a second database.
 
-    cohort_diff   "34- Cohort Selector Diff.py" whole -- runs the LEGACY and the
+    cohort_diff   "34- Cohort Selector Diff Read Only.py" whole -- runs the LEGACY and the
                   CURRENT cohort selector over every bundle on disk and records
                   where they disagree. READ ONLY: it never deletes, moves or
                   rewrites a bundle.

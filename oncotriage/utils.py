@@ -1,47 +1,67 @@
 """Supportive functions shared across the pipeline.
 
-Moved out of ``02- Utility Functions.py`` by item 20c, which survives as a shim
-re-exporting every name below. ``load_env_keys`` did NOT come here — it went to
-``oncotriage.settings``, and that is the whole reason this module is allowed to
-import ``oncotriage.config`` at all. See the package docstring.
+Moved out of ``02- Utility Functions.py`` by item 20c. That file survived as a
+shim re-exporting every name below and IS DELETED AS OF PASS 20e — nothing in
+the repository raw-exec'd it any more once Files 05, 09, 13, 18 and 19 stopped.
+``load_env_keys`` did NOT come here — it went to ``oncotriage.paths``, and that
+is the whole reason this module is allowed to import ``oncotriage.config`` at
+all. See the package docstring.
+
+``exec_chain`` WENT WITH IT (pass 20e), and that is the point of the pass rather
+than a side effect. It loaded a list of numbered scripts into a caller's
+``globals()`` with ``__name__`` temporarily set to ``"_exec_chain_"``, which is
+the mechanism that let a numbered file be both a script and a library. There is
+no caller: the numbered files are thin entry points that import the package.
+Shipping the function that rebuilds the arrangement this pass removed is how the
+arrangement comes back, and this project treats an unreachable definition as a
+defect everywhere else. ``tests/test_package_invariants.py`` section 1c now
+scans the WHOLE repository for a call to it, or for a raw ``exec()`` of a
+numbered file, and carries a planted control.
 
 WHY THREE FUNCTIONS TAKE AN OVERRIDE ARGUMENT THEY DID NOT USED TO HAVE
 -----------------------------------------------------------------------
 ``get_model_cost``, ``resolve_qdrant_collection`` and ``get_age_reference_date``
 read ``PRICING_CONFIG`` / ``qdrant_client`` + ``COLLECTION_NAME`` /
-``DATA_SNAPSHOT_DATE`` out of the shared exec namespace at CALL time. That is
-not an accident of the exec chain — it is a seam four files depend on:
+``DATA_SNAPSHOT_DATE`` out of the shared exec namespace at CALL time. A module
+function cannot see a caller's globals, so each of the three takes the value as
+an optional argument instead, and ``02- Utility Functions.py``'s shim passed
+``globals().get(...)`` through it.
 
-  * ``fixture_capture.py`` / ``fixture_replay.py`` rebind
-    ``qdrant_client`` to recording and replaying proxies.
+EVERY CONSUMER OF THAT SEAM IS NOW GONE, and it is recorded rather than removed.
+``36-`` and ``37-`` stopped rebinding ``qdrant_client`` at pass 20c-2c and
+install ``deps.set_override(deps.QDRANT_CLIENT, ...)``; ``38-`` stopped
+rebinding ``DATA_SNAPSHOT_DATE`` at pass 20d-1 and sets
+``config.DATA_SNAPSHOT_DATE``, the attribute ``get_age_reference_date()``
+actually reads at call time; ``45-`` and ``46-`` became
+``oncotriage/fixtures/{capture,replay}.py`` at pass 20c-3d and go through
+``deps`` too; and pass 20e deleted the shim that passed the values. Measured,
+not assumed: no call site anywhere in the repository passes any of the three
+arguments today.
 
-THREE OF THE FOUR CONSUMERS ARE GONE, and the list above is what is left rather
-than what was written. ``36- Logging Contract Test.py`` and ``37- Retrieval
-Observability Test.py`` stopped rebinding ``qdrant_client`` at pass 20c-2c —
-they install ``deps.set_override(deps.QDRANT_CLIENT, ...)`` instead, and File
-37's ``swap_globals`` survives only as the honest name for something it no
-longer uses. ``38- Birth Date and Demographics Parser Test.py`` stopped
-rebinding ``DATA_SNAPSHOT_DATE`` at pass 20d-1: all three now live in ``tests/``
-(see ``tests/FILE NUMBER MAPPING.md``), import the package, and set
-``config.DATA_SNAPSHOT_DATE`` — the attribute ``get_age_reference_date()``
-actually reads at call time — for the four values that must raise.
-
-A module function cannot see a caller's globals, so each of the three now takes
-the value as an optional argument. ``02- Utility Functions.py``'s shim passes
-``globals().get(...)`` — the shim's functions are defined inside the exec'd
-text, so their ``__globals__`` IS the shared namespace and the lookup stays
-dynamic. Callers inside the package pass nothing and get the config value.
+THE PARAMETERS STAY. Removing them is a change to three public signatures, which
+is a behaviour change, and this pass promises none. They are also the documented
+patch point in ``get_age_reference_date``'s own docstring. Recorded as a
+follow-up rather than folded in here, on the same footing as File 14's
+``log_inference`` wrapper before it: "no remaining consumer" is a statement of
+fact, not an argument for deletion inside a pass about something else.
 
 ``None`` means "not supplied" for the first two, because neither
 ``PRICING_CONFIG`` nor a client is ever legitimately ``None``.
 ``get_age_reference_date`` uses a private sentinel instead, because ``""`` is
-one of the values File 38 requires to raise.
+one of the values ``tests/test_fhir_birth_date_and_demographics.py`` requires to
+raise, so it cannot double as "unset".
 """
 
 import logging
-import os
 import re
 import time
+# `os` WAS IMPORTED HERE AND IS NOT ANY MORE (pass 20e). Its only reader was
+# exec_chain(), which resolved the caller's directory with os.path -- so
+# deleting the function left the import behind, and check 2h(i) of
+# tests/test_package_invariants.py reported it on the first run after the
+# deletion. Recorded rather than silently tidied, because it is the smallest
+# possible instance of the thing that pass being about: remove a consumer and
+# what it consumed becomes dead without anything failing.
 from collections import Counter
 from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
@@ -218,37 +238,31 @@ def get_model_cost(model_name: str, input_tokens: int, output_tokens: int,
 #------------------------------------------------------------------------------
 
 
-def exec_chain(files: List[str], caller_file: str, caller_globals: dict, chain_label: str = "") -> None:
-    """Load and exec a list of project scripts into the caller's global scope.
-
-    Args:
-        files:          Ordered list of script names, e.g. ["01- Imports.py", "03- Config.py"].
-        caller_file:    Pass __file__ — resolves the directory to search in.
-        caller_globals: Pass globals() — scripts are exec'd into this namespace.
-        chain_label:    Label for the completion message, e.g. "01 → 02 → 03".
-
-    Raises:
-        FileNotFoundError: If a script can't be found under its spaced or underscore variant.
-    """
-    base_dir = os.path.dirname(os.path.abspath(caller_file)) + os.sep
-    saved_name = caller_globals.get("__name__")
-
-    for name in files:
-        for variant in (name, name.replace(" ", "_")):
-            try:
-                with open(base_dir + variant) as fh:
-                    print(f"[Init] Loading {name}...")
-                    caller_globals["__name__"] = "_exec_chain_"
-                    exec(fh.read(), caller_globals)  # noqa: S102
-                    break
-            except FileNotFoundError:
-                continue
-        else:
-            caller_globals["__name__"] = saved_name
-            raise FileNotFoundError(f"Required script not found: '{name}' (searched in: {base_dir})")
-
-    caller_globals["__name__"] = saved_name
-    print(f"[Init] Chain complete ({chain_label}).\n")
+# exec_chain() STOOD HERE AND IS DELETED (pass 20e)
+#--------------------------------------------------
+# It took a list of numbered script names, opened each one relative to the
+# caller's __file__, set caller_globals["__name__"] to "_exec_chain_" so the
+# file's `if __name__ == "__main__":` block would not fire, and exec'd it into
+# that namespace. Falling back to the underscored filename variant, printing
+# "[Init] Loading ..." per file and "[Init] Chain complete (label)." at the end.
+#
+# THAT WAS THE MECHANISM THE WHOLE PROJECT WAS BUILT ON, and pass 20e is where
+# the last caller stopped. Files 05, 09 and 13 were the last three, and each of
+# them was chaining for consumers that had themselves been converted one or two
+# passes earlier -- File 05 for File 34 (converted in 20c-3d), File 13 for
+# twelve files all converted by 20d-1, File 09 for five.
+#
+# NOT KEPT "in case", and the reason is specific rather than tidiness: the
+# function's contract is "make a numbered file's names appear in your globals",
+# which is exactly the arrangement that made oncotriage/agent/deps.py necessary,
+# made File 14's log_inference wrapper necessary, and would have sent twelve
+# fixture replays to the real OpenAI endpoint. A mechanism that is kept is a
+# mechanism that gets used. tests/test_package_invariants.py section 1c scans
+# the whole repository for a call to it or a raw exec() of a numbered file, and
+# carries a planted control so the scan is shown to be able to fail.
+#
+# Its docstring's stated failure mode is preserved for the record: it raised
+# FileNotFoundError naming the script and the directory it searched.
 
 
 #------------------------------------------------------------------------------

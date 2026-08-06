@@ -1,10 +1,29 @@
 """SQLite schema and the inference logger.
 
 Moved out of ``14- Database Logger.py`` by item 20c, pass 2b.
-``14- Database Logger.py`` survives as an explicit re-export shim over this
-module, because Files 17, 25, 26, 32, 36, 37, 38, 40 and 45 exec-chain it and
-read these names out of the shared exec namespace with no import statement of
-their own.
+``14- Database Logger.py`` survived as an explicit re-export shim over this
+module because Files 17, 25, 26, 32, 36, 37, 38, 40 and 45 exec-chained it, and
+IS DELETED AS OF PASS 20e: all nine were measured and none is a chainer any more
+(17, 25 and 26 became thin entry points; 32, 36, 37, 38 and 40 became modules
+under ``tests/`` in pass 20d-1; 45 became ``oncotriage/fixtures/capture.py``).
+
+THE SHIM'S ``log_inference`` WRAPPER WENT WITH IT, and the argument for it is
+kept here because the argument is about THIS function. The wrapper was
+``log_inference(result, patient_data, db_path=None)`` with
+``db_path = globals().get("inferences_path")`` — defined inside the exec'd text,
+so its ``__globals__`` WAS the shared namespace and the lookup stayed live. That
+mattered because five files rebound ``inferences_path`` at a temporary database
+and only then loaded File 14; without the wrapper all five would have written
+real rows into the real ``inferences.db`` while printing the name of the
+temporary file each thought it was using. Silent in both directions.
+
+By pass 20d-1 all five ALSO passed ``db_path=`` explicitly and asserted on the
+path this function returns, which is why the wrapper's removal changes nothing:
+File 14's own docstring recorded "no remaining consumer in the repository" a
+pass before it was deleted. THE RULE THAT OUTLIVES IT: this function must keep
+taking the database as an argument and must keep RETURNING the path it wrote to,
+because those two together are what let an isolation test assert where it wrote
+instead of trusting that it wrote somewhere else.
 
 TWO DELIBERATE CHANGES, and they are the reason this pass was not a straight move
 --------------------------------------------------------------------------------
@@ -21,11 +40,12 @@ TWO DELIBERATE CHANGES, and they are the reason this pass was not a straight mov
    failure mode is silent in both directions, which is why the fix is a
    parameter and not a global.
 
-   ``None`` means ``oncotriage.paths.inferences_path``. The shim's own
-   ``log_inference`` wrapper passes ``globals().get("inferences_path")``, so an
-   exec-chain caller keeps the late binding it always had; the five test files
-   now ALSO pass the path explicitly, so their isolation no longer depends on
-   that seam. See ``resolve_inference_db_path``.
+   ``None`` means ``oncotriage.paths.inferences_path``, or
+   ``ONCOTRIAGE_INFERENCES_DB`` when that is set — see
+   ``resolve_inference_db_path`` for the three-tier order and for why the
+   argument deliberately outranks the variable. The five test files pass the
+   path explicitly, which is the only mechanism now that the shim's late-binding
+   wrapper is gone (pass 20e).
 
 2. ``_resolve_primary_cancer`` LEFT ALTOGETHER (pass 20c-2c).
 
@@ -39,8 +59,10 @@ TWO DELIBERATE CHANGES, and they are the reason this pass was not a straight mov
    That direction is the point. The agent's three terminal nodes call it too, and
    while it lived here the agent depended on the storage layer for a registry
    lookup. Both callers now import it from the registries package and neither
-   imports the other. It is still re-exported by ``14- Database Logger.py``,
-   because nine files read the name out of the shared exec namespace.
+   imports the other. This module re-exports it, which is what
+   ``tests/test_fhir_birth_date_and_demographics.py`` section 9b reaches — the
+   only place in the repository that touches the storage layer without the
+   agent.
 
 WHAT IMPORTING THIS MODULE DOES
 -------------------------------

@@ -1,7 +1,7 @@
 """Cohort selector diff -- LEGACY vs CURRENT. READ ONLY.
 
-Moved out of ``34- Cohort Selector Diff.py`` by item 20c, pass 3d.
-``34- Cohort Selector Diff.py`` survives as a THIN ENTRY POINT and keeps no
+Moved out of ``34- Cohort Selector Diff Read Only.py`` by item 20c, pass 3d.
+``34- Cohort Selector Diff Read Only.py`` survives as a THIN ENTRY POINT and keeps no
 re-export shim: all 15 of its top-level names were grepped against every
 ``.py``, ``.md``, ``.toml`` and ``.yml`` in the tree and the only hits are the
 exec-bootstrap locals every numbered file shares (``_code_dir``, ``_bootstrap``,

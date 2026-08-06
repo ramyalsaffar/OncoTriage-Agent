@@ -1,91 +1,87 @@
 # MeSH Cancer Site Relevance Filter
 ###################################
-#
-# ITEM 20c, PASS 2a: THIS FILE IS A SHIM, plus its __main__ block.
-#
-# The file split in two on the way into the package:
-#
-#   oncotriage/registries/mesh.py                 PAN_CANCER_TREE_MAX_DEPTH
-#                                                 onward — the runtime filter
-#   oncotriage/registries/mesh_crosswalk_build.py lines 57-696 — the five
-#                                                 offline builders
-#
-# Logic byte-for-byte unchanged in both. The split exists because the builders
-# parse desc2026.xml and the 1.5 GB UMLS MRCONSO release, they run once by hand,
-# and they are called from NOWHERE in the pipeline — verified by grep across
-# every file in the repository, where File 09's own __main__ block below is the
-# only call site. Keeping them beside the filter meant every process that wanted
-# the filter also carried code that opens MRCONSO line by line.
-#
-# `mesh` does not import `mesh_crosswalk_build`. This shim imports both, because
-# its contract is File 09's whole pre-pass surface and because the __main__
-# block calls the builders and the loader in one run.
-#
-# Files 05, 11, 13, 30 and 31 exec-chain this file; File 32 reaches it
-# transitively through File 13.
-#
-# Explicit, by name, never a star import.
-#
-# The __main__ block below is unchanged. It bootstraps 01 -> 02 -> 03 itself,
-# which is where its Path, sys and data_MeSH_path come from; the imports above
-# supply only the builders and the loader it calls.
+
+"""
+Build the MeSH C04 lookup files and the three UMLS crosswalks the cancer-site
+relevance filter reads at run time.
+
+THIN ENTRY POINT (item 20c pass 2a moved the logic; pass 20e removed the shim)
+------------------------------------------------------------------------------
+File 09 split two ways on the way into the package and both halves stay there:
+
+  oncotriage/registries/mesh.py                 the runtime filter --
+                                                MeSHCancerFilter,
+                                                load_mesh_filter,
+                                                specific_cancer_trees,
+                                                PAN_CANCER_TREE_MAX_DEPTH
+  oncotriage/registries/mesh_crosswalk_build.py the five OFFLINE builders --
+                                                build_mesh_lookup and the three
+                                                crosswalks, plus build_all_lookups
+
+``mesh`` does not import ``mesh_crosswalk_build``, and that separation is the
+point: the builders parse desc2026.xml and the 1.5 GB UMLS MRCONSO release, they
+run once by hand, and nothing in the pipeline calls them. Keeping them beside
+the filter meant every process that wanted the filter also carried code that
+opens MRCONSO line by line.
+
+WHY THE NINE-NAME SHIM WENT. It existed because Files 05, 11, 13, 30 and 31
+exec-chained this file (File 32 reached it transitively through 13). Pass 20e
+measured all six: 11 became a thin entry point in pass 20c-3a, 30, 31 and 32
+became modules under ``tests/`` in pass 20d-1 and import the package directly,
+and 05 and 13 became thin entry points in this pass. Nothing chains this file
+any more, so the re-export block was nine names with no reader -- the dead
+declaration ``tests/test_package_invariants.py`` check 2h exists to catch.
+
+WHAT IS LEFT is the ``__main__`` block, which is what
+``python "09- MeSH Cancer Site Relevance Filter.py"`` runs and the only call
+site of the five builders anywhere in the repository. Its imports are inside the
+guard, so loading this file resolves nothing.
+
+Run from terminal:
+    python "09- MeSH Cancer Site Relevance Filter.py"
+"""
+
+import os
+import sys
 
 
-#------------------------------------------------------------------------------
-
-
-# --- Make the oncotriage package importable ----------------------------------
-# Files 08 and 10 need no block like this: they are only ever reached through
-# exec_chain, which always runs after "01- Imports.py", and File 01 is what puts
-# the code directory on sys.path. THIS file is different — it is a documented
-# entry point (`python "09- MeSH Cancer Site Relevance Filter.py"` rebuilds the
-# MeSH lookups), and when it is the entry point its own bootstrap has not run
-# yet at the moment these imports execute.
-#
-# sys.path[0] is the entry point's directory, so running it from the code
-# directory already works, as does `pip install -e .`. This block is what keeps
-# any other invocation working, and it prints the directory it added — a package
-# resolved from an unexpected place must not be silent.
-try:  # pragma: no cover - the happy path is the normal one
-    import oncotriage as _oncotriage_pkg  # noqa: F401
+# Make the oncotriage package importable
+#---------------------------------------
+# This is a documented entry point, so when it IS the entry point sys.path[0] is
+# already the code directory and `pip install -e .` makes the block a no-op.
+# It is what keeps any other invocation working, and it prints the directory it
+# added -- a package resolved from an unexpected place must not be silent.
+try:
+    import oncotriage  # noqa: F401
 except ImportError:
-    import os as _os_pkg
-    import sys as _sys_pkg
-    _here_pkg = _os_pkg.path.dirname(_os_pkg.path.abspath(__file__)) if "__file__" in globals() \
-        else _os_pkg.getcwd()
-    if _here_pkg not in _sys_pkg.path:
-        _sys_pkg.path.insert(0, _here_pkg)
-        print(f"[Bootstrap] oncotriage was not importable; added {_here_pkg} to sys.path")
-    import oncotriage as _oncotriage_pkg  # noqa: F401
-    del _os_pkg, _sys_pkg, _here_pkg
+    for _candidate, _how in (
+        (os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals()
+         else None, "__file__"),
+        (os.getcwd(), "cwd"),
+    ):
+        if _candidate and os.path.isdir(os.path.join(_candidate, "oncotriage")):
+            if _candidate not in sys.path:
+                sys.path.insert(0, _candidate)
+            print(f"[Bootstrap] oncotriage package found at {_candidate} "
+                  f"(via {_how}); added to sys.path")
+            break
+    else:
+        raise
+    del _candidate, _how
 
-# Deleted rather than left bound. This file is exec'd into the shared namespace
-# by five other files, and a probe name left behind there is a name the next
-# file to be written inherits without asking. "tests/test_package_invariants.py"
-# asserts this shim adds NOTHING to the pre-pass surface, and caught this leak.
-del _oncotriage_pkg
 
-
-# The offline builders. Imported here, and only here: nothing in the
-# pipeline calls them, and the filter module does not import them either.
+# The offline builders, and the loader the validation step below calls.
+# Imported at module scope rather than in the guard because neither module
+# resolves a path or reads a file at import -- only data_MeSH_path does, and
+# that is imported inside the guard.
 from oncotriage.registries.mesh_crosswalk_build import (  # noqa: E402
-    build_all_lookups,
     build_icd10_to_mesh_crosswalk,
     build_mesh_lookup,
     build_snomed_to_mesh_crosswalk,
     build_umls_synonym_crosswalk,
 )
 
-
-# The runtime filter. load_mesh_filter() is what File 13 calls.
-from oncotriage.registries.mesh import (
-    MeSHCancerFilter,
-    PAN_CANCER_TREE_MAX_DEPTH,
-    load_mesh_filter,
-    specific_cancer_trees,
-)
-
-
+from oncotriage.registries.mesh import load_mesh_filter  # noqa: E402
 
 
 # ===========================================================================
@@ -95,30 +91,20 @@ from oncotriage.registries.mesh import (
 
 if __name__ == "__main__":
 
-    # Paths — uses project path convention from 01- Imports.py
-    # Item 20a: this file sits in the code directory, so __file__ locates it with
-    # no hardcoded path. __file__ is bound when the file is run as a script (every
-    # documented entry point for it) and when Spyder runfile()s it. In a bare
-    # interactive paste it is not bound, and the working directory is the only
-    # remaining candidate -- taken, but announced, never silently.
-    import os as _os_boot
-    if "__file__" in globals():
-        _code_dir = _os_boot.path.dirname(_os_boot.path.abspath(__file__)) + _os_boot.sep
-    else:
-        _code_dir = _os_boot.getcwd() + _os_boot.sep
-        print(f"[Bootstrap] __file__ unbound; using the working directory as the code directory: {_code_dir}")
-    del _os_boot
+    # PASS 20e: THIS BLOCK USED TO RAW-EXEC 01 AND 02 AND CHAIN 03, for three
+    # names -- Path, sys and data_MeSH_path. Not one of them needed a shared
+    # namespace, and the chain cost a full OpenAI client, a Qdrant client, torch,
+    # transformers, streamlit and langgraph to rebuild two JSON lookup files.
+    # The three free names were re-derived with symtable before the change, not
+    # taken from the comment that used to sit here.
+    #
+    # data_MeSH_path is imported INSIDE the guard because it is a lazy attribute
+    # on oncotriage.paths and reading it resolves the sibling data tree; at
+    # module scope this file would glob that tree merely by being loaded, which
+    # is the hole pass 20c-2c found in oncotriage/registries/mesh.py.
+    from pathlib import Path
 
-    for _bootstrap in ("01- Imports.py", "02- Utility Functions.py"):
-        with open(_code_dir + _bootstrap) as _fh:
-            exec(_fh.read(), globals())
-
-    exec_chain(
-        ["03- Config.py"],
-        caller_file=_code_dir + "09- MeSH Cancer Site Relevance Filter.py",
-        caller_globals=globals(),
-        chain_label="01 → 02 → 03",
-    )
+    from oncotriage.paths import data_MeSH_path
 
     # --- Locate raw data files ---
     mesh_xml = str(Path(data_MeSH_path) / "desc2026.xml")

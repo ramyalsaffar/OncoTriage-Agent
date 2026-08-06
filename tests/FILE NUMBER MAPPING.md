@@ -13,7 +13,7 @@ them for what it covers. It is the mapping, not a memory of it.
 | `31- MeSH Boost Gate Test.py` | [tests/test_agent_mesh_boost_and_quality_gate.py](test_agent_mesh_boost_and_quality_gate.py) | `agent/retrieval.py`'s MeSH relevance boost and `agent/filtering.py`'s quality gate |
 | `32- Pan-Cancer Resolution Test.py` | [tests/test_registries_mesh_pan_cancer_resolution.py](test_registries_mesh_pan_cancer_resolution.py) | `registries/mesh.py` + `agent/mesh_expansion.py` — pan-cancer tree resolution |
 | `33- Cancer Code and Stage Extraction Test.py` | [tests/test_registries_cancer_codes_and_stage_extraction.py](test_registries_cancer_codes_and_stage_extraction.py) | `registries/cancer_code_registry.py` and `extraction/stage.py` |
-| `34- Cohort Selector Diff.py` | **not a test — unchanged.** Pass 20c-3d converted it to `oncotriage/evaluation/cohort_diff.py`; File 34 is its thin entry point | LEGACY vs CURRENT cohort selector, read only |
+| `34- Cohort Selector Diff.py` | **not a test.** Pass 20c-3d converted it to `oncotriage/evaluation/cohort_diff.py`; File 34 is its thin entry point, RENAMED in pass 20e to `34- Cohort Selector Diff Read Only.py` | LEGACY vs CURRENT cohort selector, read only |
 | `35- Ablation State Passthrough Test.py` | [tests/test_agent_ablation_flag_passthrough.py](test_agent_ablation_flag_passthrough.py) | `agent/retrieval.py` + `agent/filtering.py` — every ablation flag carries state |
 | `36- Logging Contract Test.py` | [tests/test_storage_inference_logging_contract.py](test_storage_inference_logging_contract.py) | `storage/database_logger.py` — what a row must contain and what it must not |
 | `37- Retrieval Observability Test.py` | [tests/test_agent_retrieval_observability.py](test_agent_retrieval_observability.py) | `agent/retrieval.py` + `agent/filtering.py` degradation record (item 11b) |
@@ -49,6 +49,42 @@ the correction is part of this pass's record:
 pass ends at 20e; the invariants do not. **The audit/control pairing is kept
 visible**: the two names differ only by a `_control` suffix and sort adjacently.
 
+## Pass 20e — the numbered files that were DELETED or RENAMED
+
+This table belongs here for the same reason the two above it do: notes, commit
+messages and both Word documents name these files by number, and after pass 20e
+seven of those numbers resolve to nothing on disk.
+
+**Seven shims deleted.** Each existed only to make the package's names appear in
+an `exec()`'d caller's namespace, and pass 20e measured that no such caller
+remains. The reading order they used to carry is
+[`PIPELINE SEQUENCE.md`](../PIPELINE%20SEQUENCE.md), at the code directory.
+
+| Was | Where the content is now |
+|---|---|
+| `01- Imports.py` | Third-party imports are each module's own; the `sys.path` bootstrap is the six-line block in every entry point; paths resolve lazily in `oncotriage/paths.py`. |
+| `02- Utility Functions.py` | `oncotriage/utils.py`. **`exec_chain` is deleted outright**, not moved — see that module for why. |
+| `03- Config.py` | `oncotriage/config.py` |
+| `08- Cancer Code Registry.py` | `oncotriage/registries/cancer_code_registry.py` |
+| `10- Structured Eligibility Extractor.py` | `oncotriage/extraction/{negation,stage,histology}.py` |
+| `14- Database Logger.py` | `oncotriage/storage/database_logger.py` |
+| `oncotriage_settings.py` | `oncotriage/settings.py` |
+
+**Five shims became thin entry points instead of being deleted**, because each
+keeps a runnable `__main__`: `05- FHIR Clean Data.py`, `07- FHIR Parser.py`,
+`09- MeSH Cancer Site Relevance Filter.py`, `13- LangGraph Agent.py` and
+`20- Drift Detection.py`. Same numbers, same commands, no re-exports.
+
+**Four files renamed, numbers kept.** The number is what every note resolves
+by, so it never moves; the words after it were wrong.
+
+| Was | Is | Why the old name was wrong |
+|---|---|---|
+| `06- FHIR Explore.py` | `06- FHIR Dataset Characterization.py` | "Explore" reads as a scratch notebook. Item 9 makes this file the **source** of the dataset characterisation — its tables and figures are the ones the write-up cites. |
+| `15- Database Empty.py` | `15- Database Wipe All Tables.py` | "Empty" is a state, and the name reads as a question or a report. The file issues `DELETE FROM` against every table in the production inference log. |
+| `28- Select 30 Samples.py` | `28- Select Evaluation Sample.py` | The old name baked the sample **size** into a filename — the one thing most likely to change, and a filename nothing checks. The size (10 per group, three groups, seed 42) is stated in the sampler where it can be kept true. |
+| `34- Cohort Selector Diff.py` | `34- Cohort Selector Diff Read Only.py` | It never deletes, moves or rewrites a bundle, and the old name did not say so — while sitting one number away from `05- FHIR Clean Data.py`, which unlinks bundles in place using the same selector. |
+
 ### Renamed but NOT moved
 
 | Was | Is | Why |
@@ -67,7 +103,7 @@ fallback — not the code directory.
 |---|---|
 | `18- FastAPI Server Test.py` | **A test that keeps its number.** It needs a live server on `localhost:8000` **and it costs money** — every POST is a live billed Stage 5 call, measured at $0.13–$0.17 per patient. It stays inside the pipeline numbering because that is where a thing you must start a server for and pay to run belongs, not beside a suite anyone can run. Pass 20e. |
 | `19- FastAPI Server Batch Test.py` | Same. Also runs `fhir_files[410:412]`, two patients, while its own summary describes a full-corpus run. Pass 20e. |
-| `34- Cohort Selector Diff.py` | Not a test. Pass 20c-3d converted it to `oncotriage/evaluation/cohort_diff.py`; File 34 is its thin entry point. |
+| `34- Cohort Selector Diff Read Only.py` | Not a test. Pass 20c-3d converted it to `oncotriage/evaluation/cohort_diff.py`; File 34 is its thin entry point. |
 
 ## What changed inside each file, and what did not
 

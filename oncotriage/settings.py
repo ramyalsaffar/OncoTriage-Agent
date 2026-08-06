@@ -1,12 +1,28 @@
 """OncoTriage settings — the one place a path environment variable is named.
 
 Item 20a (pass 1 of 6) created this as ``oncotriage_settings.py`` at the code
-directory, loaded by file location. Item 20c moved the content here, into a
-real package module, and left ``oncotriage_settings.py`` behind as a
-re-exporting shim: ``01- Imports.py`` still loads that filename by location and
-did not have to change. ``28- Select 30 Samples.py`` did too until item 20c pass
-3d, which moved its body into ``oncotriage/evaluation/sampling.py`` and made it
-a package import; ``01- Imports.py`` is the last by-location caller.
+directory, loaded BY FILE LOCATION, because ``01- Imports.py`` was ``exec()``'d
+as often as it was run and could not rely on ``sys.path``. Item 20c moved the
+content here, into a real package module, and left ``oncotriage_settings.py``
+behind as a re-exporting shim for those by-location callers.
+
+BOTH CALLERS ARE GONE AND SO IS THE SHIM (pass 20e). ``28- Select Evaluation Sample.py``
+stopped at pass 20c-3d, when its body moved to
+``oncotriage/evaluation/sampling.py``; a by-location load there had also been
+registering a SECOND copy of this module in ``sys.modules`` under the name
+``oncotriage_settings``, two ``_RESOLVED`` caches answering one question.
+``01- Imports.py``'s own by-location search stopped earlier still, at pass
+20c-2b, when ``oncotriage/paths.py:_load_path_settings()`` became a plain
+``import`` — File 01 imported the RESULT, not the file. So by the time pass 20e
+measured it, ``oncotriage_settings.py`` had zero consumers of any kind: the only
+hits for its filename anywhere in the tree were two comments in
+``pyproject.toml`` explaining why it was not packaged. Deleted.
+
+THE RULE THAT MADE IT NECESSARY IS WORTH KEEPING: loading a module by location
+does not consult ``sys.path``, so a file loaded that way has to exist at a fixed
+place under a fixed name, and it gets its own entry in ``sys.modules`` separate
+from any package copy. Nothing in this repository loads anything by location any
+more; ``tests/test_package_invariants.py`` section 1c scans for it.
 
 Why load_env_keys() is NOT here
 -------------------------------
@@ -57,10 +73,12 @@ globbed off it; setting this one variable relocates the whole tree.
 ENV_CODE_PATH = "ONCOTRIAGE_CODE_PATH"
 """Directory holding the numbered scripts.
 
-Only 23- Airflow DAG.py's generated DAG needs this as a separate variable. The
-29 files that carry an exec_chain bootstrap locate this directory from their
-own __file__ and must not read an environment variable for it — a stale value
-would point a file at a different copy of itself.
+Only 23- Airflow DAG.py's generated DAG needs this as a separate variable. Every
+numbered entry point locates its own directory from its own __file__ and must
+not read an environment variable for it — a stale value would point a file at a
+different copy of itself. (Before pass 20e the same sentence said "the 29 files
+that carry an exec_chain bootstrap"; there is no exec chain now, and the rule is
+unchanged.)
 """
 
 ENV_KEYS_PATH = "ONCOTRIAGE_KEYS_PATH"

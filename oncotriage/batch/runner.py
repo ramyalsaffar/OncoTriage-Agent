@@ -501,7 +501,7 @@ class _DriftAnnouncer:
         tqdm.write("!!  write no rows. This banner is printed ONCE; the per-patient failures")
         tqdm.write("!!  are counted in the pass summary.")
         tqdm.write("!!")
-        tqdm.write(f"!!  Set MATCHING_MODEL in '03- Config.py' to {returned!r} only after")
+        tqdm.write(f"!!  Set MATCHING_MODEL in 'oncotriage/config.py' to {returned!r} only after")
         tqdm.write("!!  reviewing what changed, add it to PRICING_CONFIG, and re-baseline.")
         tqdm.write("!" * 80)
         tqdm.write("")
