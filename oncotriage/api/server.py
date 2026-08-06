@@ -295,16 +295,81 @@ def create_app():
         # get_qdrant_client() BUILDS on first call, which is why it is called
         # here inside the handler and not at import: this module must import
         # without opening a client.
+        # ===================================================================
+        # TWO OF THESE STRINGS WERE STALE AND ONE OF THEM CONTRADICTED THE
+        # FIELD THREE LINES BELOW IT (pass 20g)
+        # ===================================================================
+        #
+        # Measured against a live container on 2026-08-06 rather than read off
+        # the source: GET /pipeline/info returned
+        #
+        #     "architecture": "LangGraph StateGraph + exec() chain"
+        #     "5. GPT-4o Criterion-Level Evaluation"
+        #     "matching_model": "gpt-5.6-terra"
+        #
+        # The first names a mechanism pass 20e DELETED -- there is no exec
+        # chain, `exec_chain` itself is gone from oncotriage/utils.py, and
+        # tests/test_package_invariants.py section 1c fails the build if one
+        # comes back. The second and third are the same response disagreeing
+        # with itself about which model Stage 5 calls.
+        #
+        # WHY THE FIX IS DERIVATION AND NOT A RETYPED STRING. "GPT-4o" was
+        # correct when it was written and rotted when MATCHING_MODEL changed,
+        # because nothing connected the two. Retyping "gpt-5.6-terra" here buys
+        # one correct release and re-arms the same trap for the next model
+        # change. The stage line is interpolated from the constant the stage
+        # actually calls, so the two cannot disagree again. Same reasoning as
+        # item 38's `pipeline_consistency`, which replaced the literals 100 and
+        # 30 with the config values that produce the columns.
+        #
+        # THE OTHER FIELDS WERE CHECKED, NOT ASSUMED, and they are current:
+        # stage 1 is deterministic and walks MeSH C04 (agent/mesh_expansion.py,
+        # no LLM call); stage 2 is BM25 + dense + RRF (agent/retrieval.py);
+        # stage 4 is the rule-based filter (agent/filtering.py); stage 6 is
+        # node_finalize (agent/terminal.py). The seven `config` values are read
+        # from oncotriage.config, so they cannot be stale by construction --
+        # which is exactly what the two literals above were not.
+        #
+        # `version` STAYS "2.0.0" and it is hand-maintained. It matches the
+        # FastAPI application version in create_app() above and nothing derives
+        # either from the other; it is recorded as a follow-up rather than
+        # invented here, because choosing where an API version number lives is a
+        # release decision, not a staleness fix.
+        #
+        # `collection_name` reports COLLECTION_NAME, which is the ALIAS and not
+        # the collection -- deliberately, because it is under `config` and the
+        # alias is what is configured. `trials_indexed` below resolves through
+        # that alias, so the count is the collection the alias points at.
         qdrant_client = get_qdrant_client()
+
+        # A COUNT OF ZERO MUST NOT BE INVENTED. This was
+        # `...points_count if qdrant_client else 0`, and 0 is a real, plausible
+        # answer -- "the index is empty" -- for a branch that means "there was
+        # no client to ask". get_qdrant_client() raises or returns a client and
+        # never returns None, so the branch is unreachable through the server;
+        # it IS reachable through deps.set_override(QDRANT_CLIENT, None), which
+        # is how a harness redirects this seam. Either way an unanswerable
+        # question is reported as unanswered, not as zero.
+        if qdrant_client:
+            trials_indexed = qdrant_client.get_collection(
+                COLLECTION_NAME).points_count
+            trials_indexed_note = None
+        else:
+            trials_indexed = None
+            trials_indexed_note = (
+                "no Qdrant client: oncotriage.agent.deps.get_qdrant_client() "
+                "returned a falsy object, so the index could not be asked. This "
+                "is not an empty index.")
+
         return {
             "version": "2.0.0",
-            "architecture": "LangGraph StateGraph + exec() chain",
+            "architecture": "LangGraph StateGraph over the oncotriage package",
             "stages": [
                 "1. Query Expansion (Deterministic MeSH C04 hierarchy)",
                 "2. Hybrid Retrieval (BM25 + Vector + RRF)",
-                "3. Cross-Encoder ncbi/MedCPT",
+                "3. Cross-Encoder Rerank (ncbi/MedCPT-Cross-Encoder)",
                 "4. Rule-Based Filtering",
-                "5. GPT-4o Criterion-Level Evaluation",
+                f"5. Criterion-Level Evaluation ({MATCHING_MODEL})",
                 "6. Final Ranking"
             ],
             "config": {
@@ -316,7 +381,8 @@ def create_app():
                 "max_trials_for_evaluation": MAX_TRIALS_FOR_EVALUATION,
                 "max_gpt4o_retries": MAX_GPT4O_RETRIES
             },
-            "trials_indexed": qdrant_client.get_collection(COLLECTION_NAME).points_count if qdrant_client else 0
+            "trials_indexed": trials_indexed,
+            "trials_indexed_note": trials_indexed_note
         }
 
     @app.post("/match", response_model=MatchResponse)

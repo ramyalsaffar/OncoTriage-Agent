@@ -64,6 +64,33 @@ one call earlier.
     dropped by exactly the runs that had two things wrong instead of one -- and
     main() returns 1.
 
+A SKIPPED TEST IS NOT A PASSED TEST (pass 20g). Two of the four tests sat behind
+a corpus precondition and neither precondition affected the outcome:
+
+    Test 3   `if fhir_files:`          else printed "No FHIR files found."
+    Test 4   `if len(fhir_files) > 1:` else printed "Need at least 2 FHIR files
+                                       to test both endpoints."
+
+Both messages were true and neither was read. A run against an empty FHIR
+directory therefore printed two notes, POSTed nothing, exercised neither of the
+two endpoints this file exists to exercise, and exited 0 -- indistinguishable,
+to anything reading the exit code, from a run in which both answered correctly.
+That is not hypothetical here: a container whose data volume has just been
+recreated has exactly this directory, and pass 20g's own Docker rebuild produced
+it.
+
+Each branch now records a failure, which routes it into the same summary a
+non-200 uses and the same `return 1`. Each message names WHAT was missing and
+WHICH pattern was searched, because "no FHIR files found" alone does not
+distinguish an empty directory from a wrong one from an unmounted one, and
+because the two conditions differ: Test 3 needs one bundle, Test 4 needs a
+second so the two endpoints do not run the same patient.
+
+    THE ROW-COUNT VERDICT IS STILL LAST AND STILL OVERRIDES. Nothing about the
+    ordering changed: the skips join `failures`, `failures` prints above the
+    guard, the guard prints last and returns 1 on its own finding whatever the
+    four tests did.
+
 AND IT WRITES TO WHATEVER DATABASE THE SERVER IS POINTED AT. That is not this
 script's decision to make: "17- FastAPI Server.py" calls log_inference with no
 path, so it resolves to the production inferences.db, and the server is a
@@ -367,7 +394,9 @@ def main():
     """Run the four endpoint tests inside the production-database guard.
 
     Returns the process exit code: 0 only when the production inference row
-    count is unchanged AND all four tests came back 200.
+    count is unchanged AND all four tests RAN and came back 200. "ran" is new in
+    pass 20g and it is the point of that pass: two of the four used to be
+    skippable without affecting the outcome.
 
     ORDER IS LOAD-BEARING and it is the order the file has always had. The
     row-count control fires, then the BEFORE count is read, then the first
@@ -450,7 +479,12 @@ def main():
         print("=" * 60)
 
         # Grab first FHIR bundle from the data directory
-        fhir_files = sorted(glob.glob(data_fhir_path + "*.json"))
+        #----------------------------------------------
+        # THE PATTERN IS BOUND TO A NAME because both skip messages below report
+        # it. "No FHIR files found." without saying where it looked sends the
+        # reader to grep this file for the glob; the two facts belong together.
+        fhir_pattern = data_fhir_path + "*.json"
+        fhir_files = sorted(glob.glob(fhir_pattern))
 
         if fhir_files:
             with open(fhir_files[0]) as f:
@@ -504,7 +538,24 @@ def main():
                     print("\nFull result for inspection:")
                     print(json.dumps(res, indent=2))
         else:
-            print("No FHIR files found.")
+            # A SKIPPED TEST IS NOT A PASSED TEST (pass 20g). This branch used
+            # to print one line and fall through, so a run with no corpus at all
+            # POSTed nothing, tested nothing and exited 0 -- identical, to
+            # anything reading the exit code, to a run in which both endpoints
+            # answered correctly. Recorded as a failure, which is what makes it
+            # visible; the message names WHAT was missing and WHERE it looked,
+            # because "no FHIR files found" alone does not say whether the
+            # directory is empty, wrong, or unmounted.
+            print("✗ SKIPPED: no FHIR bundle to send, so POST /match was never "
+                  "exercised.")
+            print(f"    Searched:      {fhir_pattern}")
+            print(f"    Bundles found: 0")
+            print("  data_fhir_path comes from oncotriage.paths and resolves "
+                  "under ONCOTRIAGE_MAIN_PATH; inside a container it is the "
+                  "fixed /app/data/patients/fhir/.")
+            failures.append(
+                f"Test 3: POST /match — SKIPPED, 0 bundles matched "
+                f"{fhir_pattern}")
 
         # ------------------------------------------------------------------
         # Test 4: Match via file upload (POST /match/file)
@@ -556,10 +607,26 @@ def main():
                     print("No matches — printing full result:")
                     print(json.dumps(res, indent=2))
         else:
-            print("Need at least 2 FHIR files to test both endpoints.")
+            # THE SECOND SILENT SKIP, and it is a separate condition from the
+            # first: Test 3 needs one bundle, Test 4 needs a SECOND one, so a
+            # corpus of exactly one bundle skipped only this test and still
+            # exited 0. The count is reported because it is what distinguishes
+            # the two cases -- 0 means no corpus, 1 means a corpus too small for
+            # this file's "use a different bundle per endpoint" rule.
+            print("✗ SKIPPED: POST /match/file was never exercised — it needs a "
+                  "SECOND bundle, so that the two endpoints do not run the same "
+                  "patient.")
+            print(f"    Searched:      {fhir_pattern}")
+            print(f"    Bundles found: {len(fhir_files)} (need 2)")
+            failures.append(
+                f"Test 4: POST /match/file — SKIPPED, needs 2 bundles and "
+                f"{len(fhir_files)} matched {fhir_pattern}")
 
         print("\n" + "=" * 60)
-        print("All tests complete.")
+        # "attempted", not "complete". A skipped test used to leave this line
+        # reading "All tests complete." above a run in which two of the four
+        # never ran; the summary below is what says which.
+        print("All tests attempted.")
         print("=" * 60)
         print("\n")
 
@@ -592,7 +659,9 @@ def main():
             print(f"    {_f}")
         print("  Each is diagnosed above: a non-200 prints the server's own "
               "response")
-        print("  body, an unhandled exception prints its traceback.")
+        print("  body, an unhandled exception prints its traceback, a skipped "
+              "test")
+        print("  prints the pattern it searched and what it found there.")
         print("=" * 60)
         print("\n")
 

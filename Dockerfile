@@ -207,19 +207,44 @@ COPY --from=builder --chown=appuser:appuser /opt/venv /opt/venv
 # content at the mount path, permissions and owner included. Without this, the
 # volumes would be created root-owned and appuser could not write to them.
 #
-# They are not the authority on "every path in oncotriage/paths.py:_DOCKER_PATHS
-# exists" — this list is hand-written and that one is not. docker/prepare_paths.py
-# runs from the entrypoint on every start and derives the list FROM THAT TABLE,
-# so a path added there is created without anyone remembering to edit this.
+# THE MOUNT POINTS ARE EMPTY, AND THAT IS PASS 20g's FIX FOR AN INTERMITTENT
+# CLEAN-BRING-UP FAILURE. This RUN used to create the nested tree as well —
+# data/patients/fhir, data/trials, data/mesh, results/fhir_exploration,
+# results/ablation, airflow_home/dags, airflow_home/logs — and Docker copies the
+# image content at a mount path into a named volume THE FIRST TIME that volume
+# is mounted. Five services mount /app/data and three mount /app/results, and
+# `docker compose up` CREATES all of them at once, so on a genuinely empty
+# volume several containers ran that copy concurrently. The copy is not
+# serialized across containers, and it fails rather than tolerating the
+# collision:
+#
+#     Error response from daemon: failed to mkdir
+#     /var/lib/docker/volumes/Clinical-Trial-Patient-Match-app-results/_data/
+#     fhir_exploration: file exists
+#
+# Measured on 2026-08-06, not inferred: one of four clean `down -v` + `up -d`
+# cycles failed exactly this way and left three containers in Created and three
+# never created. A second `up` always succeeded, because by then the volume was
+# no longer empty and the copy was skipped — which is what made it look like a
+# fluke rather than a defect.
+#
+# An EMPTY mount point has nothing to copy, so there is no concurrent mkdir and
+# the failure mode does not exist. The volume root still gets its ownership from
+# the directory here, which is the property this RUN is for. The nested tree is
+# created by docker/prepare_paths.py, from the entrypoint, on every start —
+# derived from oncotriage/paths.py:_DOCKER_PATHS, so it was already creating all
+# seven of these directories and this list was a duplicate that could drift.
+# `os.makedirs(..., exist_ok=True)` tolerates the concurrent case the volume
+# copy did not.
+#
+# airflow_home/dags and airflow_home/logs are not in _DOCKER_PATHS and do not
+# need to be: `write_dag_file()` does `dag_dir.mkdir(parents=True,
+# exist_ok=True)` before writing, and Airflow creates its own log tree.
 RUN mkdir -p \
-    /app/data/patients/fhir \
-    /app/data/trials \
-    /app/data/mesh \
-    /app/results/fhir_exploration \
-    /app/results/ablation \
+    /app/data \
+    /app/results \
     /app/checkpoint \
-    /app/airflow_home/dags \
-    /app/airflow_home/logs \
+    /app/airflow_home \
     && chown -R appuser:appuser /app
 
 # Copy application code

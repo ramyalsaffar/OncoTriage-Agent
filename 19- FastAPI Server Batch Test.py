@@ -40,6 +40,43 @@ script runs TWO patients while its title, its "Found N patients" line and its
 changed here -- it is reported as-is and left for the operator, because
 widening it is a spending decision.
 
+THE EXIT CODE IS A BEHAVIOUR CHANGE (pass 20g), AND IT IS STATED AS ONE.
+------------------------------------------------------------------------
+Until this pass the exit code was set by the production row-count verdict and
+by nothing else. The batch loop counted errors, printed them in the summary --
+`Errors: 2` -- and NOTHING READ THAT COUNT. So a run in which every POST came
+back HTTP 500, or timed out, or could not connect at all, printed its errors and
+then exited 0. Measured, not supposed: pass 20f ran this file against a server
+returning 500 to both POSTs and the process exited 0.
+
+    Two failed POSTs and two successful POSTs were the same exit code, so
+    anything reading it -- a CI step, `make`, a shell `&&`, the harness item 20d
+    will build -- saw a total failure as a pass.
+
+So: a non-zero error_count now returns 1. That CHANGES THIS FILE'S CONTRACT with
+any caller reading its exit code. There is no such caller in the repository
+today (grepped: this file is named only in prose), which is what makes the
+change cheap to make now and expensive to postpone -- the harness item 20d
+builds would inherit the old contract.
+
+AND AN EMPTY SELECTION IS ALSO A FAILURE, which is the same defect one step
+earlier. `fhir_files[410:412]` on a corpus of fewer than 411 bundles is the
+empty list; the loop then runs zero times, error_count stays 0, "Success: 0/0"
+prints, and the old code exited 0. A run that POSTed nothing is not a run that
+passed. It is recorded as a failure naming the glob pattern searched, the number
+of bundles that matched it and the slice that emptied it -- the three facts
+needed to tell "no corpus" from "corpus too small for this slice".
+
+    NOT A WIDENING OF THE SLICE. The slice is untouched; what changed is that
+    the file now says so out loud when the slice selects nothing.
+
+THE ROW-COUNT VERDICT IS STILL LAST AND STILL OVERRIDES. The batch summary is
+printed BEFORE the guard, for the reason File 18 records: the guard returns the
+moment it finds the count moved, so a summary below it would be dropped by
+exactly the runs that had two things wrong instead of one. The guard's own
+verdict is still the last thing on the terminal and still returns 1 on its own
+finding, whatever the batch did.
+
 THE POST TIMEOUT IS A STAGE 5 BOUND. POST_TIMEOUT_SECONDS is 180, which is the
 value this file has always passed to this endpoint; pass 20f only gave it a name
 so the number is written once instead of three times, and gave File 18 the same
@@ -295,8 +332,10 @@ def _rowcount_control_fires(production_db):
 def main():
     """Run the batch evaluation inside the production-database guard.
 
-    Returns the process exit code: 0 unless the production inference row count
-    moved during the run.
+    Returns the process exit code: 0 only when the production inference row
+    count is unchanged AND every selected patient came back HTTP 200 AND the
+    selection was non-empty. See the docstring: the last two conjuncts are new
+    in pass 20g and they are a behaviour change.
 
     ORDER IS LOAD-BEARING and it is the order the file has always had. The
     row-count control fires, then the BEFORE count is read, then the first POST
@@ -328,17 +367,51 @@ def main():
           "the end.")
 
     # Get all FHIR files
-    fhir_files = sorted(glob.glob(data_fhir_path + "*.json"))
+    #-------------------
+    # THE PATTERN IS BOUND TO A NAME because the empty-selection failure below
+    # reports it. A message reading "no patients selected" without saying where
+    # it looked sends the reader to grep this file for the glob; the two facts
+    # belong together.
+    fhir_pattern = data_fhir_path + "*.json"
+    fhir_files = sorted(glob.glob(fhir_pattern))
+    corpus_count = len(fhir_files)
 
     # For testing purposes
     #---------------------
     # TWO PATIENTS, NOT THE CORPUS. Left exactly as it was: widening this is a
     # spending decision and it is the operator's, not this pass's. See the
     # docstring.
-    fhir_files = fhir_files[410:412]
+    _SLICE = slice(410, 412)
+    fhir_files = fhir_files[_SLICE]
 
     print(f"Found {len(fhir_files)} patients")
     print(f"Running batch evaluation...\n")
+
+    # EVERY FAILED PATIENT, NAMED (pass 20g). error_count still drives the
+    # printed summary line this file has always had; `failures` is what the exit
+    # code reads, and it carries the bundle name and the reason so the summary
+    # is a diagnosis rather than a number. The two cannot disagree: every
+    # increment of one appends to the other, and main() asserts nothing about
+    # them separately.
+    failures = []
+
+    # A SELECTION OF NOTHING IS A FAILURE, NOT A CLEAN RUN. Recorded rather than
+    # returned on, so the row-count guard below still runs and still has the
+    # last word -- an early return here would skip the one check that reports
+    # whether the PREVIOUS run polluted the production database.
+    if not fhir_files:
+        print(f"✗ No patients selected, so nothing was POSTed and nothing was "
+              f"tested.")
+        print(f"    Searched:       {fhir_pattern}")
+        print(f"    Bundles found:  {corpus_count}")
+        print(f"    Slice applied:  [{_SLICE.start}:{_SLICE.stop}]")
+        print(f"  A corpus of {corpus_count} bundles cannot fill a slice that "
+              f"starts at {_SLICE.start}. Either the FHIR directory above is "
+              f"empty or wrong, or the corpus is smaller than the slice this "
+              f"file hard-codes.")
+        failures.append(
+            f"selection was empty: {corpus_count} bundle(s) matched "
+            f"{fhir_pattern}, slice [{_SLICE.start}:{_SLICE.stop}] selected 0")
 
     success_count = 0
     error_count = 0
@@ -348,6 +421,7 @@ def main():
 
         for idx, fhir_file in enumerate(fhir_files, 1):
             patient_start = time.time()
+            bundle_name = os.path.basename(fhir_file)
 
             try:
                 with open(fhir_file) as f:
@@ -366,13 +440,26 @@ def main():
                 else:
                     error_count += 1
                     print(f"[{idx}/{len(fhir_files)}] ERROR: HTTP {response.status_code}")
+                    # The server's own body is the diagnosis, exactly as
+                    # File 18's _json_or_report() prints it. Truncated because
+                    # an HTML error page from a proxy is a real shape.
+                    print(f"    Response body: {response.text[:500]}")
+                    failures.append(
+                        f"[{idx}/{len(fhir_files)}] {bundle_name}: "
+                        f"HTTP {response.status_code}")
 
             except requests.exceptions.Timeout:
                 error_count += 1
                 print(f"[{idx}/{len(fhir_files)}] TIMEOUT (>{POST_TIMEOUT_SECONDS}s)")
+                failures.append(
+                    f"[{idx}/{len(fhir_files)}] {bundle_name}: timeout after "
+                    f"{POST_TIMEOUT_SECONDS}s")
             except Exception as e:
                 error_count += 1
                 print(f"[{idx}/{len(fhir_files)}] ERROR: {e}")
+                failures.append(
+                    f"[{idx}/{len(fhir_files)}] {bundle_name}: "
+                    f"{type(e).__name__}: {e}")
 
         elapsed = time.time() - start_time
         print(f"\n{'='*60}")
@@ -383,6 +470,27 @@ def main():
         if len(fhir_files) > 0:
             print(f"  Avg time/patient: {elapsed/len(fhir_files):.1f}s")
         print(f"{'='*60}")
+
+    # =======================================================================
+    # THE BATCH'S OWN VERDICT -- printed BEFORE the database guard (pass 20g)
+    # =======================================================================
+    #
+    # ORDER, FOR THE REASON FILE 18 RECORDS. The guard below returns 1 the
+    # moment it finds the row count moved, so a summary printed after it would
+    # be dropped by exactly the runs that had two things wrong instead of one.
+    # Printing it first costs the guard nothing: the guard's verdict is still
+    # the last thing on the terminal, which is what a reader looks for.
+
+    if failures:
+        print("=" * 60)
+        print(f"✗ {len(failures)} check(s) failed:")
+        for _f in failures:
+            print(f"    {_f}")
+        print("  Each is diagnosed above: a non-200 prints the server's own "
+              "response")
+        print("  body, an empty selection prints the pattern it searched.")
+        print("=" * 60)
+        print("\n")
 
     # =======================================================================
     # THE PRODUCTION DATABASE MUST NOT MOVE -- the verdict
@@ -438,7 +546,11 @@ def main():
     print("=" * 60)
     print("\n")
 
-    return 0
+    # Non-zero when a POST failed or when nothing was selected. Before pass 20g
+    # this was a bare `return 0`, so error_count was printed and never read; see
+    # the docstring for why that is a behaviour change rather than a bug fix.
+    # The summary itself was printed above, before the guard.
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

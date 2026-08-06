@@ -480,7 +480,9 @@ ONCOTRIAGE_INFERENCES_DB=/tmp/oncotriage-test.db python "17- FastAPI Server.py"
 
 Files 18 and 19 cannot redirect the server — it is a separate process with its own environment — so they **detect** instead, on the `_production_drift_rows()` precedent from File 41: read the production inference row count before the run, read it again after, exit 1 naming the variable if it moved. The comparison is shown to discriminate before it is trusted: each file builds a scratch database carrying the **production `inferences` schema, read out of `sqlite_master` rather than retyped**, seeds two rows, inserts a third, and refuses to run unless the counter reports 2 then 3. The connections are `mode=ro` URIs, because a plain `sqlite3.connect` on an absent path *creates* the file — a guard that brought its own database into existence, counted 0 twice and reported success would be worse than no guard. The block is duplicated verbatim in both files on purpose: item 20d converts them, and a self-contained harness belongs in that pass.
 
-**File 19 runs two patients, not the corpus.** Line 219 overwrites the file list with `fhir_files[410:412]` under a comment reading "For testing purposes", while its title, its `Found N patients` line and its `Batch evaluation complete` summary all describe a full-corpus run. Reported, documented in the file's new docstring, and deliberately left — widening it is a spending decision. Both files also state their cost in their docstrings: every POST is a live billed Stage 5 call, measured at $0.13–$0.17 per patient from the six rows above.
+**File 19 runs two patients, not the corpus.** `main()` overwrites the file list with `fhir_files[410:412]` under a comment reading "For testing purposes", while its title, its `Found N patients` line and its `Batch evaluation complete` summary all describe a full-corpus run. Reported, documented in the file's docstring, and deliberately left — widening it is a spending decision. **Pass 20g did not widen it and did make it audible**: a slice that selects nothing is now a recorded failure and exit 1, because a corpus of fewer than 411 bundles used to produce `Success: 0/0`, `Errors: 0` and exit 0. Both files also state their cost in their docstrings: every POST is a live billed Stage 5 call, measured at $0.13–$0.17 per patient from the six rows above.
+
+**BOTH FILES EXIT NON-ZERO WHEN THEY TESTED NOTHING (pass 20g).** File 19's `error_count` was printed and never read; File 18 had two silent-skip branches behind a corpus precondition. See "Files 18 and 19 exit non-zero when they tested nothing" for the ten-scenario stub demonstration and for why File 19's is a contract change rather than a bug fix.
 
 To exercise the graph directly without the API, set `RUN_TEST_ON_EXECUTE = True` near the bottom of `13- LangGraph Agent.py` and run it as `__main__`. **IT COSTS MONEY** — one live billed Stage 5 call, $0.13–$0.17 — which is why it is edit-to-arm rather than a CLI flag; `fixture_replay.py` exercises the same six stages over twelve patients for nothing. The block survived the pass-20c-2c split and pass 20e's deletion of the shim around it; every import it needs is inside the guard AND inside the flag, so reading the file imports no model and resolves no path.
 
@@ -1400,6 +1402,176 @@ imports `stop_airflow` and `trigger_dag` at module scope for its byte-verbatim
 COMMENTED menu, and comments are invisible to an AST walk. Exempted with the
 argument the file already carries, and it goes when that menu becomes a real
 argparse CLI — the follow-up pass 20c-3c-2 already recorded.
+
+
+### Files 18 and 19 exit non-zero when they tested nothing (pass 20g)
+
+**THREE RUNS THAT DID NOTHING USED TO LOOK LIKE RUNS THAT PASSED, and all three
+are exit-code changes rather than behaviour changes to what either file tests.**
+Neither file's request sequence, slice, timeout or verdict ordering moved.
+
+| Was | Is |
+|---|---|
+| File 19: the batch loop counted errors, printed `Errors: 2`, and **nothing read the count** — every POST could return HTTP 500 and the process exited 0 | a non-zero `error_count` returns 1, and each failure is named with the bundle and the reason |
+| File 19: `fhir_files[410:412]` on a corpus of fewer than 411 bundles is `[]`, so the loop ran zero times, `Success: 0/0` printed and the exit was 0 | an empty selection is a recorded failure naming the glob pattern, the number of bundles that matched it and the slice that emptied it |
+| File 18: Test 3's `else: print("No FHIR files found.")` and Test 4's `else: print("Need at least 2 FHIR files…")` — two skips, neither affecting the outcome | each records a failure naming what was missing and which pattern was searched, routed into the summary a non-200 already used |
+
+**FILE 19's IS A CONTRACT CHANGE AND IS STATED AS ONE.** Its exit code used to
+be set by the production row-count verdict and by nothing else. There is no
+caller reading it today — the filename appears only in prose — which is what
+makes the change cheap now and expensive to postpone, because the harness item
+20d builds would inherit the old contract.
+
+**THE ROW-COUNT VERDICT IS STILL LAST AND STILL OVERRIDES.** File 18 already
+printed its failure summary above the guard, for the reason recorded there: the
+guard returns the moment it finds the count moved, so a summary below it would
+be dropped by exactly the runs that had two things wrong instead of one. File 19
+gained the same block in the same position. The guard's verdict is still the last
+thing on the terminal and still returns 1 on its own finding whatever the tests
+did.
+
+**DEMONSTRATED AGAINST STUB SERVERS, TEN SCENARIOS, BEFORE AND AFTER, NO MONEY
+SPENT.** The stub answers the same four routes with a configurable status and
+calls no model. Each scenario runs with `ONCOTRIAGE_MAIN_PATH` pointed at a
+throwaway project root, so `data_fhir_path` and `inferences_path` both resolve
+inside it; the scratch `inferences.db` carries the **production `inferences`
+schema read out of the real `sqlite_master` over a `mode=ro` connection**, so the
+row-count control is exercised against the table it will meet for real. The
+BEFORE arm is the committed file out of `git show HEAD:`, never a retyped copy.
+
+| scenario | before | after |
+|---|---|---|
+| 18-A  2 bundles, stub answers 200 | 0 | 0 |
+| 18-B  **no bundles** — Tests 3 and 4 both skip | **0** | **1** |
+| 18-C  **one bundle** — Test 4 skips | **0** | **1** |
+| 18-D  no bundles AND the server writes a production row | 1 | 1 |
+| 18-E  all four tests pass but the server writes a row | 1 | 1 |
+| 19-A  412 bundles, stub answers 200 | 0 | 0 |
+| 19-B  **every POST returns HTTP 500** | **0** | **1** |
+| 19-C  **corpus of 5: the slice selects nothing** | **0** | **1** |
+| 19-D  POSTs 500 AND the server writes rows | 1 | 1 |
+| 19-E  every POST succeeds but the server writes rows | 1 | 1 |
+
+Rows A are the controls: the change does not break the passing path. Rows D and E
+are the override check — the failure summary is asserted to print *before* the
+string `Production database guard`, and 19-E's last three lines are the guard's
+own failure message with every POST having succeeded. The production database
+was read at 1,106 rows before the matrix and 1,106 after.
+
+**File 18 also stopped printing `All tests complete.` above a run in which two
+of the four never ran.** It reads `All tests attempted.` and the summary below it
+says which.
+
+
+### The Docker image was a pre-20e build; item 21 re-verified against a rebuild (pass 20g)
+
+**THE RUNNING CONTAINER HELD `01- Imports.py`, `02- Utility Functions.py`, `03-
+Config.py`, `08-`, `10-`, `14-`, `oncotriage_settings.py` and all twenty numbered
+test files** — every one deleted or moved by passes 20d and 20e — so item 21's
+report described an image that no longer matched the repository. `/app` is **not**
+bind-mounted (item 21 removed that), so the image's baked copy is what runs and a
+`COPY . /app/` is the only way it changes.
+
+**THE VOLUME WIPE WAS CONFIRMED SAFE BEFORE IT WAS RUN, three ways.** The local
+`qdrant` service reported `{"collections":[]}` while `/pipeline/info` reported
+12,067, and `load_env_keys()` inside the container resolves `QDRANT_URL` to the
+Qdrant Cloud endpoint — so the container never talks to the sidecar and the
+collection the twelve fixtures are pinned against is not in a volume at all. The
+qdrant volume held 20 KB and an empty `aliases/data.json`. Two facts worth
+recording beside it: `model-cache` was **12 KB**, so no model download was lost,
+and `app-data/mesh` was **already empty**, so item 21's hand-copied lookups had
+been gone before this session. What the wipe did destroy is `airflow-db` (5 MB):
+the Airflow metadata database, the generated web password and the generated DAG —
+all three regenerated on bring-up, the password as a new random one.
+
+**PASS 20e BROKE NOTHING IN THE DOCKER FILES, and that was measured rather than
+assumed.** Every numbered filename in `Dockerfile`, `docker-compose.yml`,
+`.dockerignore`, `Makefile`, `pyproject.toml` and `docker/*` was grepped: the
+only two naming a runnable file are `uvicorn "17- FastAPI Server:app"` and
+`streamlit run "21- Streamlit Dashboard.py"`, both of which survive. The
+`pyproject.toml` `packages` list matches the sixteen `__init__.py` directories
+exactly. The image picks up deletions and renames for free because the Dockerfile
+does `COPY . /app/` — verified: the rebuilt `/app` has the four renames and none
+of the seven deletions.
+
+**WHAT THE REBUILD DID EXPOSE IS AN INTERMITTENT CLEAN-BRING-UP FAILURE, and it
+is fixed rather than documented as a retry.** Docker copies the image content at
+a mount path into a named volume the first time that volume is mounted; five
+services mount `/app/data` and three mount `/app/results`, and `docker compose
+up` **creates** all of them at once. The copy is not serialized across
+containers:
+
+```
+Error response from daemon: failed to mkdir
+/var/lib/docker/volumes/Clinical-Trial-Patient-Match-app-results/_data/
+fhir_exploration: file exists
+```
+
+One of four `down -v` + `up -d` cycles failed exactly that way, leaving three
+containers in `Created` and three never created. A second `up` always worked,
+because the volume was no longer empty and the copy was skipped — which is what
+made it read as a fluke. **The Dockerfile now creates only the four mount-point
+roots** (`/app/data`, `/app/results`, `/app/checkpoint`, `/app/airflow_home`),
+so there is nothing to copy and the concurrent `mkdir` does not exist. The volume
+root still takes its ownership from those directories, which is the property that
+`RUN` is for, and the nested tree was **already** being created on every start by
+`docker/prepare_paths.py` from `_DOCKER_PATHS` — the Dockerfile list was a
+duplicate that could drift. `airflow_home/dags` is created by `write_dag_file()`
+itself. **Five consecutive clean bring-ups after the change, all clean, 6/6
+running.**
+
+**ITEM 21's CRITERIA, RE-RUN AGAINST THE NEW IMAGE rather than carried over:**
+
+| Criterion | Result |
+|---|---|
+| every service healthy from a clean checkout | 6/6 healthy |
+| API, dashboard, Qdrant, Airflow webserver answering | 200 / 200 / 200 / 200; Airflow reports metadatabase, scheduler and dag_processor all healthy |
+| every `_DOCKER_PATHS` name resolves to a path that exists | **14/14 exist and are writable** |
+| the container imports `oncotriage` with `PYTHONPATH` unset | yes — `PYTHONPATH` is not set at all; `oncotriage`, `api.server` and `agent.graph` all import |
+| the scheduler registers the generated DAG | `trial_refresh_weekly` listed, `list-import-errors` → `No data found`, all three tasks present |
+| a second `up` behaves like the first | no-op, 6/6 still healthy; a *restart* re-runs both idempotent steps and reports `exists` ×14 and `current` with an unchanged sha256 |
+
+Two more, checked because a 200 from a Streamlit shell proves nothing: all
+**14 dashboard modules import inside the dashboard container**, and
+`importlib.import_module("17- FastAPI Server").app is oncotriage.api.server.app`
+returns **True** in the rebuilt container.
+
+**ONE CRITERION WAS NOT RE-RUN AND IS NAMED AS SUCH.** "A real request writes a
+row" is a live billed Stage 5 call. What was verified instead, and it is weaker:
+`resolve_inference_db_path(None)` returns `/app/data/inferences.db`, its parent
+exists and is writable, `initialize_database()` creates all three tables there,
+and a row inserts and deletes. **The write through the actual pipeline was proven
+once in item 21 and is not re-proven here.**
+
+**THE CLEAN BRING-UP IS DOCUMENTED, NOT QUIETLY PATCHED.**
+[`DOCKER CLEAN BRING-UP.md`](DOCKER%20CLEAN%20BRING-UP.md) records what a
+`down -v` + `up` gives you, what it does not, and the `docker compose cp` step
+for the five MeSH lookups that nobody had written down. **No files were copied in
+during this pass**, so the numbers above are a genuinely clean stack's. The
+missing lookups fail **loudly** — `load_mesh_filter()` raises
+`DegradedDependencyError` naming both files and the rebuild command, which is
+item 11a working; before it, a clean container would have passed every trial
+through the Stage 4 site filter for every patient and said nothing. Why the step
+is not automated is argued in §3 of that document; it remains item 21's
+follow-up.
+
+**`/pipeline/info` HAD TWO STALE STRINGS AND THE FIRST ONE WAS IN THE CURRENT
+SOURCE, not only in the stale image.** `"architecture": "LangGraph StateGraph +
+exec() chain"` named a mechanism pass 20e deleted, and `"5. GPT-4o
+Criterion-Level Evaluation"` sat three lines above `"matching_model":
+"gpt-5.6-terra"` — one response disagreeing with itself about which model Stage 5
+calls. **The fix is derivation, not a retyped string:** the stage line
+interpolates `MATCHING_MODEL`, so the two cannot disagree again. Same reasoning
+as item 38 replacing `pipeline_consistency`'s literals with the config values
+that produce its columns. Every other field was checked against the code rather
+than assumed — stages 1, 2, 4 and 6 are current, stage 3 now names the checkpoint
+exactly (`ncbi/MedCPT-Cross-Encoder`), and the seven `config` values are read
+from `oncotriage.config` so they cannot be stale by construction. Two residuals:
+`version` stays `"2.0.0"` and is hand-maintained in two places (recorded, not
+invented here — where an API version lives is a release decision), and
+`trials_indexed`'s `... if qdrant_client else 0` was **inventing a zero** for a
+branch meaning "there was no client to ask", which is indistinguishable from an
+empty index; it reports `null` with a named `trials_indexed_note` now.
 
 
 ## Persistence and observability
