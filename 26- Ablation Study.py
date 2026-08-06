@@ -34,6 +34,14 @@ Output
   ablation_summary.json   machine-readable summary for the paper figures.
   a console table with per-config averages and deltas against the baseline.
 
+``--db PATH`` (pass 20f-1) writes the study to a different SQLite file, with
+``ablation_summary.json`` beside it. Until that pass this was the last database
+writer in the project whose path could not be overridden, which is why it was
+also the only one with no isolation test;
+``tests/test_ablation_db_isolation.py`` is that test. The CHECKPOINT is not
+redirected by it and still lives under ``checkpoint_path`` -- recorded in
+``oncotriage/ablation/study.py``'s module docstring as a follow-up.
+
 THIS COSTS MONEY. 7 configs × 75 patients = 525 live pipeline runs, each with a
 Stage 5 call. Roughly $2.50–$4.00 and 3–5 hours at the default sample size. The
 run is checkpointed per (config, patient), so an interrupted study resumes with
@@ -53,6 +61,7 @@ Usage
     python "26- Ablation Study.py" --sample-size 20  # quick test
     python "26- Ablation Study.py" --summary-only    # reprint from the database
     python "26- Ablation Study.py" --configs full_pipeline no_mesh_filter
+    python "26- Ablation Study.py" --db /tmp/scratch/ablation_results.db
 """
 
 import os

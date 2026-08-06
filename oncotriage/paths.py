@@ -46,7 +46,10 @@ What is NOT lazy, and must not be:
     than through a module global, because a module-level ``__getattr__`` is
     consulted for attribute access on the MODULE and not for a global name
     lookup inside a function body. ``main_path`` written bare in here would be a
-    NameError, not a lazy read. The message it raises is unchanged;
+    NameError, not a lazy read. Its no-match message is unchanged since item
+    20c; pass 20f-1 added a SECOND message, for a pattern that matches more
+    than one directory, and the block above the function argues why that raises
+    rather than picking a winner;
   * ``REQUIRED_ENV_KEYS`` / ``load_env_keys`` — data and a function. Importing
     ``load_env_keys`` triggers no resolution at all; CALLING it with no argument
     resolves ``keys_path`` and nothing else.
@@ -196,8 +199,7 @@ def _resolve(name):
 # glob.glob(pattern)[0] on its own raises IndexError, and an IndexError names
 # neither the pattern that matched nothing nor the root it was anchored to.
 # Every sibling directory in the local branch is discovered by prefix glob, so
-# a wrong root produces one IndexError per run and no diagnosis. Same
-# discovery, same unsorted [0] — only the failure message changes.
+# a wrong root produces one IndexError per run and no diagnosis.
 #
 # Defined outside the branch, not inside the local one, so that both branches
 # leave the same set of names behind. The Docker branch does not call it; a
@@ -207,8 +209,56 @@ def _resolve(name):
 # It reads the root through _resolve() rather than as a bare global: see the
 # module docstring. By the time any caller reaches here the root is already
 # cached, because every local resolver below globs off it.
+#
+# ---------------------------------------------------------------------------
+# THE SECOND FAILURE MODE USED TO BE SILENT, AND PASS 20f-1 CLOSED IT
+# ---------------------------------------------------------------------------
+# Until this pass the body was `hits = glob.glob(pattern)` followed by
+# `return hits[0]`, and the comment above admitted it: "same unsorted [0]".
+# glob.glob DOES NOT SORT -- it returns os.scandir order, which on APFS is
+# neither alphabetical nor stable across a rename, a restore, a copy or a
+# different machine. So when two siblings matched one pattern, WHICH ONE THE
+# PIPELINE USED WAS FILESYSTEM ORDER, decided silently, per machine, and liable
+# to change without anything in the project changing. Determinism is a stated
+# property here -- temperature 0, stable argsort, RESAMPLE_SEED -- and this was
+# the one place a PATH resolved nondeterministically.
+#
+# MEASURED FIRST, on 2026-08-06: all FOURTEEN local call sites match exactly
+# one directory on this machine (code, data, patients, FHIR bundle, trials,
+# MeSH, inferences, results, FHIR exploration results, ablation results, keys,
+# Airflow, requirements, checkpoint). So sorting changes no value that is being
+# produced today and the raise below cannot fire today. A guard against a
+# layout that does not exist yet is the only kind that can be added for free.
+#
+# WHY MORE THAN ONE MATCH RAISES rather than taking the sorted winner:
+#
+#   * It is item 11a's line, applied. A missing or ambiguous CONFIGURATION is
+#     fixed by one command -- rename the stray sibling, or set the root
+#     variable -- and every run afterwards is correct, so it raises. A
+#     third-party DATA degradation that no operator can fix is counted instead.
+#     Two sibling directories matching one prefix is configuration.
+#   * The cost of guessing is not a degraded run but a confidently wrong one.
+#     oncotriage/fhir/clean.py UNLINKS patient bundles out of whichever
+#     "*Patients/" directory won; a wrong "*Data/" sends inferences.db, the
+#     deletion manifest and the checkpoint into a tree nobody is reading, and
+#     every one of those runs reports success.
+#   * The alternative -- pick one and warn -- is weakest exactly where it
+#     matters: one WARNING line at first read, inside a process that prints
+#     hundreds of lines, on a run that then completes and produces numbers.
+#   * The price is one failed run for an operator who genuinely added a second
+#     matching sibling, with a message naming both directories and the two ways
+#     out. That is cheap against a deleted corpus.
+#
+# THE MESSAGE STILL NAMES WHICH ONE WOULD HAVE WON, so the operator can see the
+# ambiguity AND what the pre-20f-1 code would have handed the pipeline.
+#
+# WHAT sorted() BUYS, stated honestly: only that the DIAGNOSIS is deterministic.
+# When exactly one directory matches, order cannot affect the answer; when more
+# than one does, this function refuses rather than choosing. Sorting is what
+# makes two machines meeting the same ambiguity print the same candidate list
+# and name the same "would have resolved to" directory.
 def _glob_one(pattern, label):
-    hits = glob.glob(pattern)
+    hits = sorted(glob.glob(pattern))
     if not hits:
         raise RuntimeError(
             f"No directory matched the {label} pattern: {pattern!r}\n"
@@ -216,6 +266,20 @@ def _glob_one(pattern, label):
             f"(from {_resolve('_main_path_source')})\n"
             f"Set {path_settings.ENV_MAIN_PATH} if the root is wrong, or check "
             f"that the sibling directory exists and still ends in the expected suffix."
+        )
+    if len(hits) > 1:
+        _candidates = "".join(f"  {hit}\n" for hit in hits)
+        raise RuntimeError(
+            f"{len(hits)} directories matched the {label} pattern: {pattern!r}\n"
+            f"{_candidates}"
+            f"Project root in use: {_resolve('main_path')!r} "
+            f"(from {_resolve('_main_path_source')})\n"
+            f"Before pass 20f-1 this would have resolved to {hits[0]!r} on this "
+            f"machine, chosen by filesystem enumeration order rather than by "
+            f"anything you could predict, and said nothing.\n"
+            f"Rename or move the extra sibling so that exactly one directory "
+            f"ends in the expected suffix, or set "
+            f"{path_settings.ENV_MAIN_PATH} to a root where that is true."
         )
     return hits[0]
 

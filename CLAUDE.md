@@ -385,6 +385,13 @@ python tests/test_config_snapshot_date_rot.py                      #  10; 6 subp
 python tests/test_package_invariants.py                            # 235 (was 283; see pass 20e). No network, no keys, no corpus
 python tests/test_degraded_dependencies.py                         # 172 (was 170; see pass 20e). Item 11a
 python tests/test_storage_query_layer.py                           # 194; item 38, temp SQLite only
+
+# The four added by pass 20f-1. Same shape, same directory, no network, no keys,
+# no spend, and none of them writes anything in the repository.
+python tests/test_paths_glob_determinism.py                        #  25
+python tests/test_storage_wipe_all_tables.py                       #  22
+python tests/test_fhir_parser_dict_input.py                        #  29
+python tests/test_ablation_db_isolation.py                         #  43
 pip install -e .                                         # makes `oncotriage` importable anywhere
 ```
 
@@ -488,7 +495,7 @@ To exercise the graph directly without the API, set `RUN_TEST_ON_EXECUTE = True`
 
 ## Layout outside this repo
 
-Only `03- Code/` is version-controlled. Sibling directories under the project root are resolved by **glob prefix** in `oncotriage/paths.py` (`glob.glob(main_path + "/*Data/")[0]`, via `_glob_one`, which names the pattern and the root when nothing matches), so directories can be renumbered but not renamed past their suffix. The root itself comes from `ONCOTRIAGE_MAIN_PATH` or, unset, from `FALLBACK_MAIN_PATH` in `oncotriage/settings.py`:
+Only `03- Code/` is version-controlled. Sibling directories under the project root are resolved by **glob prefix** in `oncotriage/paths.py` (`sorted(glob.glob(main_path + "/*Data/"))`, via `_glob_one`, which names the pattern and the root when nothing matches **and raises naming every candidate when more than one matches** — pass 20f-1; see "The path glob is deterministic" below), so directories can be renumbered but not renamed past their suffix. The root itself comes from `ONCOTRIAGE_MAIN_PATH` or, unset, from `FALLBACK_MAIN_PATH` in `oncotriage/settings.py`:
 
 | Path var | Sibling dir | Holds |
 |---|---|---|
@@ -582,7 +589,7 @@ These three moved into the package in pass 20c-2a. The numbered files survive as
 - **`oncotriage/registries/mesh.py`** (thin entry point: `09- MeSH Cancer Site Relevance Filter.py`, which runs the offline builders) — MeSH C04 tree ancestry match. Patient side maps SNOMED→CUI→MeSH via UMLS `MRCONSO`, falling back to fuzzy descriptor matching. Trial side is a direct lookup (ClinicalTrials.gov conditions *are* MeSH terms). **Conservative by design: unmappable on either side ⇒ KEEP.**
 - **`oncotriage/registries/mesh_crosswalk_build.py`** — File 09's five offline builders (`build_mesh_lookup`, the three crosswalks, `build_all_lookups`). They parse `desc2026.xml` and the 1.5 GB `MRCONSO_2025AB.RRF` and write the JSON that `mesh.py` reads back. **Called from nowhere in the pipeline** — File 09's `__main__` block is the only call site, and `python "09- MeSH Cancer Site Relevance Filter.py"` still runs them. `mesh` does not import this module.
 - **`oncotriage/extraction/{negation,stage,histology}.py`** (its shim, `10- Structured Eligibility Extractor.py`, was deleted in pass 20e) — index-time, rule-based, zero-LLM extraction of stage requirements into a structured dict, so stage matching in node 4 is an integer comparison. Unknown ⇒ `None` ⇒ trial passes. The three-way split rests on one measurement: walking every top-level definition in each half for `Name` loads resolving into the other half finds **exactly one edge**, `_is_histology_negated()` → `_is_negated()`. That helper is what `negation.py` holds. File 47 re-derives the measurement against the shipped modules, so a second shared name fails rather than accumulating.
-- **`oncotriage/fhir/parser.py`** (thin entry point: `07- FHIR Parser.py`, a corpus smoke run) — `parse_fhir_bundle(path)` takes a **file path**, not a dict (the API writes a temp file to bridge this). Historical medications are deliberately retained with status labels so prior-treatment criteria are evaluable. **LOINC 89247-1 (ECOG) is routed out of `observations`** into `patient_data['ecog_performance_status']`, a dict that is present on every patient. `value` is `None` when nothing was recorded and is **never defaulted to 0** — ECOG 0 is *fully active*, the most eligible a patient can be, so every consumer must test `is None`, never truthiness. Both `valueInteger` (mCODE) and `valueQuantity` (raw Synthea, unit `{score}`) parse, and which was found is kept as `value_shape`; a non-integral or out-of-range grade **raises** rather than rounding. The winner is the most recent observation dated on or before `get_age_reference_date()`, never `datetime.now()`, with the counts and the selection path recorded alongside. `compute_patient_hash` (13) hashes value/date/count/selection but deliberately **not** `value_shape` — normalizing a corpus must not change a hash when the prompt text is identical — and emits nothing at all when no ECOG was present, so hashes already logged against an ECOG-free corpus stay comparable. Covered by `tests/test_fhir_ecog_surfacing.py`. **This module's SOURCE TEXT is read by two tests, and both point here, not at the shim** — `38-` ast-parses it to prove `_calculate_age` and `_parse_demographics` contain no clock call (and now checks both functions are actually present, because a stale filename made that assertion pass on an empty result), and `39-` slices named function bodies out of it. The shim keeps File 07's `__main__` block, which is the only place in the original 1,491 lines that named a path; it now resolves `data_fhir_path` from the shared namespace when there is one and from `oncotriage.paths` otherwise, prints which, and — unlike before — works when the file is run directly.
+- **`oncotriage/fhir/parser.py`** (thin entry point: `07- FHIR Parser.py`, a corpus smoke run) — `parse_fhir_bundle(bundle_or_path)` takes **either a decoded bundle (a dict) or a file path**; the dict form was added by pass 20f-1 and the file form is unchanged. The API used to write a temp file to bridge this, on *both* endpoints, and no longer does. Historical medications are deliberately retained with status labels so prior-treatment criteria are evaluable. **LOINC 89247-1 (ECOG) is routed out of `observations`** into `patient_data['ecog_performance_status']`, a dict that is present on every patient. `value` is `None` when nothing was recorded and is **never defaulted to 0** — ECOG 0 is *fully active*, the most eligible a patient can be, so every consumer must test `is None`, never truthiness. Both `valueInteger` (mCODE) and `valueQuantity` (raw Synthea, unit `{score}`) parse, and which was found is kept as `value_shape`; a non-integral or out-of-range grade **raises** rather than rounding. The winner is the most recent observation dated on or before `get_age_reference_date()`, never `datetime.now()`, with the counts and the selection path recorded alongside. `compute_patient_hash` (13) hashes value/date/count/selection but deliberately **not** `value_shape` — normalizing a corpus must not change a hash when the prompt text is identical — and emits nothing at all when no ECOG was present, so hashes already logged against an ECOG-free corpus stay comparable. Covered by `tests/test_fhir_ecog_surfacing.py`. **This module's SOURCE TEXT is read by two tests, and both point here, not at the shim** — `38-` ast-parses it to prove `_calculate_age` and `_parse_demographics` contain no clock call (and now checks both functions are actually present, because a stale filename made that assertion pass on an empty result), and `39-` slices named function bodies out of it. The shim keeps File 07's `__main__` block, which is the only place in the original 1,491 lines that named a path; it now resolves `data_fhir_path` from the shared namespace when there is one and from `oncotriage.paths` otherwise, prints which, and — unlike before — works when the file is run directly.
 
 ### Data preparation (pass 20c-3a)
 
@@ -1067,9 +1074,9 @@ reason: nine of its functions draw, and File 47 section 2 already pre-imports
 matplotlib, seaborn and pandas before arming its traps. scipy stays inside the
 three function bodies that use it.
 
-**TWO THINGS IN FILE 26 ARE REPORTED, NOT FIXED**, because a conversion pass
+**TWO THINGS IN FILE 26 WERE REPORTED, NOT FIXED**, because a conversion pass
 whose acceptance criterion is that nothing changed is the wrong place for
-either:
+either. **PASS 20f-1 FIXED BOTH** — see "Pass 20f-1" below:
 
 - **`save_ablation_checkpoint()` catches `OSError` and `pass`es with no record.**
   It is the inner handler around the unlink of the temp file after a failed
@@ -1077,13 +1084,14 @@ either:
   follows the `os.replace`) — *not* line 188 of the old File 26, which is inside
   the `json.dump`. The exception audit lists it as SILENT and item 11a's sweep
   did not reach it. It is the one exception in the file caught without a counter
-  or a message.
+  or a message. **Closed at 20f-1: `CHECKPOINT_WRITE_FAILURES`.**
 - **`ablation_db()` is the LAST IMPLICIT-PATH DATABASE WRITER in the project.**
   Every other writer takes its path as an argument — `log_inference(db_path=)`,
   `log_drift_metrics(db_path=)`, `empty_database(db_path, flag)`,
   `select_samples(source_db, output_db)` as of this pass — and this one does
   not, so there is no way to point a study run at a scratch database and no
-  isolation test can be written for it.
+  isolation test can be written for it. **Closed at 20f-1: `--db`, and
+  `tests/test_ablation_db_isolation.py` is the test that became possible.**
 
 **A THIRD FINDING, from File 47 check 2h:** `TERMINAL_ERROR` in
 `fixtures/capture.py` is declared and read by nothing, and `git grep
@@ -1572,6 +1580,113 @@ invented here — where an API version lives is a release decision), and
 `trials_indexed`'s `... if qdrant_client else 0` was **inventing a zero** for a
 branch meaning "there was no client to ask", which is indistinguishable from an
 empty index; it reports `null` with a named `trials_indexed_note` now.
+
+
+### Five correctness fixes, each a behaviour change (pass 20f-1)
+
+Each was measured before it was changed, each is argued at the code, and each
+was demonstrated to FAIL when reverted in place — eight reverts, all eight
+fired, all eight restores byte-identical by sha256. **No money was spent**: the
+twelve fixtures replay 12/12 clean **without recapture**, which is the criterion
+that says the pipeline path did not move.
+
+**1. THE PATH GLOB WAS NONDETERMINISTIC.** `_glob_one` ended `return hits[0]` on
+an unsorted `glob.glob`, and glob returns `os.scandir` order — not alphabetical,
+not stable across a rename, a restore or a machine. Determinism is a stated
+property of this pipeline and this was the one place a PATH resolved without it.
+**Measured first: all fourteen local call sites match exactly one directory on
+this machine** (code, data, patients, FHIR bundle, trials, MeSH, inferences,
+results, FHIR exploration results, ablation results, keys, Airflow,
+requirements, checkpoint), so the guard was free to add.
+**More than one match now RAISES**, naming the pattern, every candidate sorted,
+and which one the pre-20f-1 code would have returned. It raises rather than
+taking the sorted winner because that is item 11a's line applied — an ambiguous
+CONFIGURATION is fixed by one command, so it raises, where third-party DATA is
+counted — and because the cost of guessing is a confidently wrong run:
+`oncotriage/fhir/clean.py` UNLINKS bundles out of whichever `*Patients/` won.
+**What `sorted()` buys is stated honestly: only a deterministic DIAGNOSIS.** Once
+ambiguity raises, `hits[0]` is reached only when there is one hit. That
+distinction is why the first version of the test could not fail — it built three
+real directories in reverse order and APFS handed them back sorted anyway — and
+why the shipped test injects the order through the module's own `glob` attribute
+instead.
+
+**2. THE WIPE RAISED ON A DATABASE WITH NO AUTOINCREMENT TABLE.**
+`oncotriage/storage/maintenance.py` issued an unconditional `DELETE FROM
+sqlite_sequence`; SQLite materialises that table only when something has been
+declared AUTOINCREMENT. **The failure was total, not partial** — the raise landed
+before `conn.commit()`, so a wipe that hit it deleted nothing and reported an
+error about a table the caller never named — and `sqlite3.connect` CREATES a
+missing file, so a mistyped path produced an empty database and then exactly
+that error. Pass 20b reported it and did not fix it. The presence of the table is
+read from `sqlite_master`, **not** wrapped in `try`/`except`: a bare
+`except sqlite3.OperationalError: pass` would pass the same tests and swallow a
+read-only or locked database too. The gate (`Flag`, both required arguments, no
+defaults) is untouched and is checked first.
+
+**3. THE SERVER WROTE A TEMP FILE ON EVERY REQUEST, NOT JUST UPLOADS.**
+`parse_fhir_bundle` takes `bundle_or_path` now — a dict or anything `open()`
+accepts — and `_run_matching_pipeline`'s `NamedTemporaryFile` → `json.dump` →
+parse → `os.unlink` round trip is gone. Because that helper is SHARED, `POST
+/match` was paying for a file it never had. `os` and `tempfile` left
+`oncotriage/api/server.py` with it. The dispatch tests **for dict**, not against
+`str`, so `str`, `Path` and every `os.PathLike` still take the unchanged file
+route. **The bundle is read and never written**, asserted both ways. The proof
+that no file is touched is behavioural: the helper runs with `builtins.open`,
+`io.open` and `tempfile.NamedTemporaryFile` all trapped to raise, and the traps
+are FIRED afterwards to show they were armed.
+
+**4. `ablation_db()` RESOLVED ITS OWN PATH** — the last database writer in the
+project that could not be pointed anywhere, and therefore the only one with no
+isolation test. It takes `db_path` now, threaded through `init_ablation_db`,
+`_create_run`, `_finalize_run`, `log_ablation_result` and `generate_summary`,
+with `--db` on the entry point. `None` still means production, so every
+documented command is unchanged. **An explicit argument is never cached** — the
+cache answers a question about the machine, an argument answers one about a
+call — and `ablation_summary_json()` follows the database so an isolated run
+leaves no production artifact. `tests/test_ablation_db_isolation.py` runs the
+whole writer surface twice, told and not told, and shows the "the default was
+not touched" assertion holding in one arm and FAILING in the other — against a
+**decoy** default, on File 41's precedent, because a demonstration that proved
+the point by writing real rows would be the defect it is testing for. **Not
+redirected, and recorded as a follow-up:** `_ablation_checkpoint_path()` still
+resolves `paths.checkpoint_path`, and `oncotriage/ablation/analysis.py` reads the
+production database through its own accessor (it is a reader, so outside this
+item).
+
+**5. `save_ablation_checkpoint()` CAUGHT `OSError` AND PASSED.** Item 11a's sweep
+missed it because the exception audit's line number was eleven lines off — it
+pointed inside the `json.dump` rather than at the unlink. Both handlers count
+into `CHECKPOINT_WRITE_FAILURES` (module-level `Counter`, item 11a's shape,
+keyed `write:{Type}` / `tmp_unlink:{Type}`), the unlink now prints what it could
+not remove, and `main()`'s summary reports the total when non-zero. **The outer
+handler is counted too**, not only the silent one: a `tmp_unlink` failure can
+only follow a `write` failure, so a count of the second without the first is
+uninterpretable. **Recovery is identical** — nothing raises that did not raise
+before. Section 6 of the isolation test drives both handlers FOR REAL by making
+the temp file's name a directory; no source is patched.
+
+**THE REVERT HARNESS REPRODUCED THE HAZARD FILE 43 GUARDS AGAINST, and it is
+worth recording.** Its first version had no bytecode guard and reported two of
+eight reverts as MISSED while the identical edit fired when run alone. CPython
+validates a `.pyc` on the source's mtime **in whole seconds** and its **size in
+bytes**; the two paths reverts each shorten `oncotriage/paths.py` by exactly
+eight characters and both writes landed in the same second, so the second run
+imported the first one's compiled code. `PYTHONDONTWRITEBYTECODE=1` plus an
+explicit `__pycache__` removal — the same two mechanisms
+`tests/test_registries_cancer_code_claims_audit_control.py` carries — is what
+made all eight fire. **A revert that reports MISSED can mean the check is weak
+or that the revert never took effect, and those are not the same finding.**
+
+**FOUR NEW TEST FILES, none of them in the collision matrix** (derived, not
+assumed: each writes only inside a temporary directory, patches no repository
+file, and the ablation one installs a registry STAND-IN through
+`oncotriage/agent/deps.py` precisely so it does not depend on the source text
+the audit control plants into): `tests/test_paths_glob_determinism.py` (25),
+`tests/test_storage_wipe_all_tables.py` (22),
+`tests/test_fhir_parser_dict_input.py` (29),
+`tests/test_ablation_db_isolation.py` (43). **The eighteen existing files report
+exactly the counts they reported before.**
 
 
 ## Persistence and observability

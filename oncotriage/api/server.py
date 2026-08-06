@@ -44,6 +44,17 @@ File 17 had it: ``build_matching_graph()`` runs in ``lifespan``, not at import.
 That is what makes ``import oncotriage.api.server`` cheap enough to sit in File
 47's per-module purity sweep beside every other module in the package.
 
+PASS 20f-1: NO REQUEST TOUCHES THE FILESYSTEM ANY MORE. ``json``, ``os`` and
+``tempfile`` were imported here so that ``_run_matching_pipeline`` could write
+each incoming bundle to a temporary file for a parser that only took paths.
+``oncotriage/fhir/parser.py:parse_fhir_bundle`` accepts a dict now, the round
+trip is deleted, and ``os`` and ``tempfile`` went with it -- an import kept
+after its only reader is exactly what ``tests/test_package_invariants.py`` check
+2h reports. ``json`` stays: ``POST /match/file`` still decodes an upload with
+it. The change reaches BOTH endpoints because the helper is shared, which is why
+it was worth making at all: the endpoint that never had a file was paying for
+one.
+
 THE ONE BEHAVIOUR CHANGE
 ------------------------
 ``log_inference`` is now serialized. This module calls it from
@@ -60,8 +71,6 @@ cost, which is a lost row reported as a success.
 
 import asyncio
 import json
-import os
-import tempfile
 import time
 import traceback
 from contextlib import asynccontextmanager
@@ -186,17 +195,31 @@ def _run_matching_pipeline(fhir_bundle_dict):
         raise HTTPException(status_code=422, detail="FHIR Bundle contains no Patient resource.")
 
     # ── Parse and run pipeline ─────────────────────────────────────────
-    # parse_fhir_bundle expects a file path, so write to temp file
-    with tempfile.NamedTemporaryFile(
-        mode='w', suffix='.json', delete=False
-    ) as tmp:
-        json.dump(fhir_bundle_dict, tmp)
-        tmp_path = tmp.name
-
-    try:
-        patient_data = parse_fhir_bundle(tmp_path)
-    finally:
-        os.unlink(tmp_path)
+    #
+    # THE TEMPORARY FILE IS GONE (pass 20f-1). This used to be
+    #
+    #     with tempfile.NamedTemporaryFile(mode='w', suffix='.json',
+    #                                      delete=False) as tmp:
+    #         json.dump(fhir_bundle_dict, tmp)
+    #         tmp_path = tmp.name
+    #     try:
+    #         patient_data = parse_fhir_bundle(tmp_path)
+    #     finally:
+    #         os.unlink(tmp_path)
+    #
+    # because parse_fhir_bundle took a file path and nothing else. THIS
+    # FUNCTION IS SHARED BY BOTH ENDPOINTS, so the round trip was paid by
+    # POST /match too -- a request that arrived as JSON and never came near a
+    # file still caused a serialize, a write, a read, a decode and a delete,
+    # once per request, on the event loop's thread pool where several are in
+    # flight at once. The parser accepts a dict now; the file route it kept is
+    # unchanged for load_all_patients, the batch runner and the fixture
+    # harnesses.
+    #
+    # The dict is handed over as it is, not copied: the parser reads it and
+    # never writes it, which is asserted rather than assumed in
+    # tests/test_fhir_parser_dict_input.py.
+    patient_data = parse_fhir_bundle(fhir_bundle_dict)
 
     if not patient_data or not patient_data.get('patient_id'):
         raise HTTPException(status_code=400, detail="Invalid FHIR bundle.")

@@ -44,11 +44,23 @@ someone editing it would be further from the warning.
 
 WHAT DID CHANGE
 ---------------
-One thing: the SQL is now reachable without exec-ing a numbered file. Nothing in
-the repository read File 15's namespace -- every top-level name it bound
+Pass 20c-3b: the SQL is now reachable without exec-ing a numbered file. Nothing
+in the repository read File 15's namespace -- every top-level name it bound
 (``Flag``, ``empty_database``) was grepped against every .py, .md, .toml and
 .yml in the tree and the only hit is prose in CLAUDE.md -- so there is no
 re-export shim and File 15 keeps no exec bootstrap.
+
+PASS 20f-1: THE WIPE NO LONGER RAISES ON A DATABASE WITH NO AUTOINCREMENT
+TABLE. ``DELETE FROM sqlite_sequence`` was issued unconditionally, and SQLite
+materialises that table only once something has been declared AUTOINCREMENT --
+so wiping an empty database, or one whose keys are plain rowid aliases, raised
+``no such table: sqlite_sequence`` BEFORE the commit and therefore deleted
+nothing while reporting an error about a table the caller never named. The
+presence of the table is now read out of ``sqlite_master``, which is the same
+catalogue the table loop already reads. See the comment at the statement for
+why this is a lookup and not a ``try``/``except``.
+``tests/test_storage_wipe_all_tables.py`` is the demonstration, including that
+an unrelated ``OperationalError`` still propagates.
 
 WHAT IMPORTING THIS MODULE DOES
 -------------------------------
@@ -93,7 +105,33 @@ def empty_database(db_path, flag):
         tables = cursor.fetchall()
         for (table_name,) in tables:
             cursor.execute(f"DELETE FROM {table_name}")
-        cursor.execute("DELETE FROM sqlite_sequence")
+
+        # ASKED FOR RATHER THAN ASSUMED (pass 20f-1). This was an
+        # unconditional `DELETE FROM sqlite_sequence`, and SQLite creates that
+        # table only when something in the database has been declared
+        # AUTOINCREMENT. A database without one -- an empty file, or a schema
+        # using the plain INTEGER PRIMARY KEY rowid alias -- answered with
+        # `sqlite3.OperationalError: no such table: sqlite_sequence`.
+        #
+        # THE FAILURE WAS TOTAL, NOT PARTIAL: the raise landed BEFORE the
+        # commit below, so a wipe that hit it deleted nothing at all and the
+        # caller got an error naming a table it had never mentioned. And
+        # sqlite3.connect CREATES a file that does not exist, so a mistyped
+        # path produced an empty database and then exactly that error. Pass 20b
+        # reported this and did not fix it.
+        #
+        # The question is asked of sqlite_master, the same catalogue the loop
+        # above already reads, rather than of a try/except: a bare
+        # `except sqlite3.OperationalError: pass` would make this case pass and
+        # would also swallow every OTHER OperationalError the statement can
+        # meet -- a read-only file, a locked database -- which is precisely the
+        # silent recovery this project exists to remove.
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name = 'sqlite_sequence'"
+        )
+        if cursor.fetchone() is not None:
+            cursor.execute("DELETE FROM sqlite_sequence")
 
         conn.commit()
 

@@ -28,9 +28,32 @@ the trap File 08's ``_REGISTRY`` was in before pass 20c-2b removed it.
 
 WHAT THIS MODULE IS FOR
 -----------------------
-``parse_fhir_bundle(path)`` takes a FILE PATH, not a dict — the API writes a
-temp file to bridge that — and returns the structured patient dictionary the
-whole pipeline runs on.
+``parse_fhir_bundle(bundle_or_path)`` takes EITHER an already-decoded bundle (a
+dict) OR a path to a FHIR JSON bundle file, and returns the structured patient
+dictionary the whole pipeline runs on.
+
+IT TOOK A PATH AND ONLY A PATH UNTIL PASS 20f-1, and that constraint was paid
+for on the serving path. ``oncotriage/api/server.py`` bridged it by writing
+every incoming bundle to a ``NamedTemporaryFile``, parsing that file, and
+unlinking it in a ``finally`` — inside ``_run_matching_pipeline``, which is
+SHARED by ``POST /match`` and ``POST /match/file``. So a request that arrived as
+JSON, and never came near a file, still caused a write, a read and a delete per
+request, on the event loop's thread pool. The dict is now handed straight to
+this function and the round trip is gone from both endpoints.
+
+The dispatch is ``isinstance(bundle_or_path, dict)``, not a test against ``str``:
+anything ``open()`` accepts — ``str``, ``pathlib.Path``, any ``os.PathLike`` —
+still takes the file route unchanged, which is what ``load_all_patients``, the
+batch runner and both fixture harnesses pass. THE FILE ROUTE IS BYTE-IDENTICAL:
+the same ``open`` and the same ``json.load``, and everything below the first
+four lines of the function is untouched.
+
+THE BUNDLE IS READ AND NEVER WRITTEN. On the file route the decoded object was
+this function's own; on the dict route it belongs to the caller, who may still
+be holding it. Nothing here mutates it — the per-resource parsers each build a
+fresh output dict — and ``tests/test_fhir_parser_dict_input.py`` asserts both
+halves: the input compares equal to a deep copy after parsing, and a later edit
+to the bundle does not reach a patient dictionary already produced from it.
 
 Two properties of the output are load-bearing and easy to undo by accident:
 
@@ -297,19 +320,37 @@ def _select_best_coding(
     return annotated[0], annotated
 
 
-def parse_fhir_bundle(bundle_path: str) -> Dict:
+def parse_fhir_bundle(bundle_or_path) -> Dict:
     """
     Extract structured patient data from FHIR bundle.
 
     Args:
-        bundle_path: Path to FHIR JSON bundle file
+        bundle_or_path: EITHER the decoded bundle (a dict) OR a path to a FHIR
+            JSON bundle file (str, pathlib.Path, any os.PathLike).
+
+            The dict form exists for callers that already hold the bundle in
+            memory — ``oncotriage/api/server.py`` receives one per request —
+            and it was added by pass 20f-1 to delete the temporary-file round
+            trip that stood in for it. The path form is unchanged: same
+            ``open``, same ``json.load``, same everything below.
+
+            The bundle is READ, never written. A caller passing a dict still
+            owns it and may keep using it afterwards.
 
     Returns:
         Structured patient dictionary with demographics, conditions,
         medications, observations, procedures
     """
-    with open(bundle_path, 'r') as f:
-        bundle = json.load(f)
+    # dict is tested FOR, rather than str tested against, so that every
+    # path-like object open() already accepted keeps working: str, Path, and
+    # anything implementing os.PathLike. A JSON file whose top level is a list
+    # behaves exactly as it did before -- it decodes, and the .get() below
+    # raises AttributeError -- because that shape was never supported either.
+    if isinstance(bundle_or_path, dict):
+        bundle = bundle_or_path
+    else:
+        with open(bundle_or_path, 'r') as f:
+            bundle = json.load(f)
 
     # Initialize patient data structure
     patient_data = {

@@ -40,21 +40,60 @@ its three backfills, the two locks, the checkpoint, the thread pool and the
 summary are the line slice of File 26 between its bootstrap and its ``__main__``
 guard, unmodified.
 
-TWO THINGS THIS PASS DELIBERATELY DID NOT FIX, both recorded rather than
-silently carried:
+TWO THINGS PASS 20c-3d DELIBERATELY DID NOT FIX, AND PASS 20f-1 FIXED BOTH
+--------------------------------------------------------------------------
+Both were recorded here rather than silently carried, and both are behaviour
+changes, which is why a conversion pass whose acceptance criterion was that
+nothing changed was the wrong place for either.
+
+  * ``ablation_db()`` WAS A DEFAULT WITH NO OVERRIDE -- the last implicit-path
+    database writer in the repository. Every other writer takes its path as an
+    argument (``log_inference(db_path=)``, ``log_drift_metrics(db_path=)``,
+    ``empty_database(db_path, flag)``, ``select_samples(source_db, output_db)``)
+    and this one did not, so a study run could not be pointed at a scratch file
+    and no isolation test could be written for it.
+
+    It takes ``db_path`` now, threaded through every function that opens the
+    database -- ``init_ablation_db``, ``_create_run``, ``_finalize_run``,
+    ``log_ablation_result``, ``generate_summary`` -- and ``main()`` gets it from
+    a new ``--db`` flag. ``None`` still means the production
+    ``ablation_results.db``, exactly as before, so every existing command is
+    unchanged.
+
+    AN EXPLICIT ARGUMENT IS NOT CACHED, and that is the same rule
+    ``resolve_inference_db_path`` follows: the cache below answers "where does
+    this machine keep the study database", which is a fact about the machine,
+    while an argument is a fact about one call. Caching the argument would make
+    the first call in a process decide the answer for every later one.
+
+    ``ablation_summary_json(db_path)`` FOLLOWS THE DATABASE, landing beside it
+    rather than in the production results directory. A run told to write
+    somewhere else must not leave a production artifact behind describing a
+    scratch database; with ``None`` it resolves exactly where it always did.
+
+    ``tests/test_ablation_db_isolation.py`` is the demonstration. What it can
+    NOT do is redirect the CHECKPOINT: ``_ablation_checkpoint_path()`` still
+    resolves ``paths.checkpoint_path``, so an isolated run would still share
+    the production resume file. Recorded as a follow-up rather than fixed here
+    -- the checkpoint is keyed by (config, patient) and carries no path, so
+    redirecting it is a separate decision about what "resume" means.
+    ``oncotriage/ablation/analysis.py`` reads the production database through
+    its own accessor and is a READER, so it is outside this item.
 
   * ``save_ablation_checkpoint()``'s inner ``except OSError: pass`` (the unlink
-    of the temp file after a failed write) RECORDS NOTHING. It is the one
-    exception in this file caught without a counter or a message, the exception
-    audit lists it as SILENT, and item 11a's sweep did not reach it. Fixing it
-    is a one-line change with a counter and belongs to whoever owns that item,
-    not to a conversion pass whose acceptance criterion is that nothing changed.
-  * ``ablation_db()`` is a DEFAULT WITH NO OVERRIDE. Every other database writer
-    in the project takes its path as an argument -- ``log_inference(db_path=)``,
-    ``log_drift_metrics(db_path=)``, ``empty_database(db_path, flag)`` -- and
-    this one does not, so there is no way to point a study run at a scratch
-    database and no isolation test can be written for it. It is the last
-    implicit-path database writer in the repository.
+    of the temp file after a failed write) RECORDED NOTHING. It was the one
+    exception in this file caught without a counter or a message; the exception
+    audit lists it as SILENT and item 11a's sweep missed it because the audit's
+    line number was eleven lines off.
+
+    Both handlers now count into ``CHECKPOINT_WRITE_FAILURES`` below, on item
+    11a's shape -- a module-level ``Counter``, keyed by what failed and by the
+    exception type. THE RECOVERY IS UNCHANGED: the write failure still prints
+    and continues, the unlink failure is still swallowed, and no exception
+    reaches a caller that did not get one before. The outer handler is counted
+    too, and not only the silent one, because a ``tmp_unlink`` failure can only
+    happen after a ``write`` failure -- a count of the second with no count of
+    the first is a number nobody can interpret.
 
 WHAT IMPORTING THIS MODULE DOES
 -------------------------------
@@ -76,7 +115,7 @@ import sys
 import threading
 import time
 import traceback
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -121,29 +160,60 @@ _RESOLVED = {}
 _RESOLVE_LOCK = threading.RLock()
 
 
-def ablation_db() -> Path:
-    """The study's SQLite database. Resolved on first call, cached.
+ABLATION_DB_FILENAME = "ablation_results.db"
+ABLATION_SUMMARY_FILENAME = "ablation_summary.json"
+
+
+def ablation_db(db_path=None) -> Path:
+    """The study's SQLite database.
 
     Separate from the production inferences.db on purpose: an ablation run is
     not a production inference and must not reach drift detection or the
     Reproducibility dashboard.
 
-    THIS IS A DEFAULT AND NOT A PARAMETER. Nothing in this module accepts a
-    database path, so a study run cannot be pointed at a scratch file. See the
-    module docstring; it is a recorded gap, not an oversight of this pass.
+    Args:
+        db_path: Where to write. ``None`` -- the default and what every
+            documented command produces -- means the production
+            ``ablation_results.db`` under ``result_ablation_path``, resolved on
+            first call and cached.
+
+            AN EXPLICIT ARGUMENT IS RETURNED AS GIVEN AND IS NEVER CACHED.
+            The cache answers "where does this machine keep the study
+            database", which is a fact about the machine; an argument is a fact
+            about one call, and caching it would let the first caller in a
+            process decide for every later one. Same rule as
+            ``resolve_inference_db_path`` in oncotriage/storage/database_logger.py,
+            where the explicit argument also outranks everything and is not
+            remembered.
+
+    Returns:
+        pathlib.Path. Added by pass 20f-1; see the module docstring for why
+        this was the last database writer in the project with no override.
     """
+    if db_path is not None:
+        return Path(db_path)
+
     with _RESOLVE_LOCK:
         if "ablation_db" not in _RESOLVED:
-            _RESOLVED["ablation_db"] = Path(paths.result_ablation_path) / "ablation_results.db"
+            _RESOLVED["ablation_db"] = Path(paths.result_ablation_path) / ABLATION_DB_FILENAME
         return _RESOLVED["ablation_db"]
 
 
-def ablation_summary_json() -> Path:
-    """Where generate_summary() exports the machine-readable table."""
+def ablation_summary_json(db_path=None) -> Path:
+    """Where generate_summary() exports the machine-readable table.
+
+    THE SUMMARY FOLLOWS THE DATABASE. With an explicit ``db_path`` it lands in
+    that database's directory, because a run told to write somewhere else must
+    not leave a production artifact behind that describes a scratch database.
+    With ``None`` it resolves exactly where it always did.
+    """
+    if db_path is not None:
+        return Path(db_path).parent / ABLATION_SUMMARY_FILENAME
+
     with _RESOLVE_LOCK:
         if "ablation_summary_json" not in _RESOLVED:
             _RESOLVED["ablation_summary_json"] = (
-                Path(paths.result_ablation_path) / "ablation_summary.json")
+                Path(paths.result_ablation_path) / ABLATION_SUMMARY_FILENAME)
         return _RESOLVED["ablation_summary_json"]
 
 
@@ -172,6 +242,38 @@ ABLATION_CHECKPOINT_FILENAME = "ablation_checkpoint.json"
 # Tracks completed (config_name, patient_id) pairs. If the run crashes at
 # config 5 of 7, resume skips configs 1-4 entirely and picks up mid-config-5.
 # Uses atomic temp+replace writes (same pattern as File 25 Batch Runner).
+
+# Checkpoint write degradations, keyed by WHICH step failed and by the
+# exception type (pass 20f-1, item 11a's shape).
+#
+# Module-level, following PARTIAL_DATE_DEGRADATIONS in oncotriage/utils.py,
+# AGE_PARSE_FAILURES in oncotriage/agent/filtering.py and
+# INDEX_AGE_PARSE_FAILURES in oncotriage/retrieval/indexer.py -- the same shape
+# item 11a established rather than a new one, and deliberately NOT a new key in
+# any result dict.
+#
+# TWO KEY PREFIXES, and both are needed:
+#
+#   write:{ExceptionType}       the atomic write or the os.replace failed. This
+#                               one already printed; the counter makes it
+#                               countable at the end of a run rather than
+#                               something to find by reading scrollback.
+#   tmp_unlink:{ExceptionType}  the cleanup of the temp file after that failure
+#                               ALSO failed. THIS IS THE ONE THE EXCEPTION
+#                               AUDIT LISTS AS SILENT: it was `except OSError:
+#                               pass`, with no counter and no message, so a
+#                               .tmp file left behind in the checkpoint
+#                               directory was the only trace it had happened.
+#
+# The type is in the key because the fixes differ: ENOSPC is a full disk,
+# EACCES is a permissions problem on the checkpoint directory, and
+# IsADirectoryError means something has taken the temp file's name.
+#
+# THE RECOVERY IS UNCHANGED. Both handlers still return normally, the run still
+# continues, and a checkpoint that could not be written still costs only the
+# resume, exactly as before. Recording is all that was added.
+CHECKPOINT_WRITE_FAILURES = Counter()
+
 
 def _ablation_checkpoint_path() -> Path:
     return Path(paths.checkpoint_path) / ABLATION_CHECKPOINT_FILENAME
@@ -211,12 +313,26 @@ def save_ablation_checkpoint(completed: set) -> None:
                 )
             os.replace(tmp_path, cp)
         except OSError as e:
+            CHECKPOINT_WRITE_FAILURES[f"write:{type(e).__name__}"] += 1
             print(f"[Checkpoint] WARNING: Could not write checkpoint ({e}). Continuing.")
             if tmp_path.exists():
                 try:
                     tmp_path.unlink()
-                except OSError:
-                    pass
+                except OSError as unlink_error:
+                    # Was `pass`, with nothing recorded at all -- the one
+                    # exception in this file caught without a counter or a
+                    # message (pass 20f-1, item 11a). CONTINUING IS STILL
+                    # RIGHT: this is the cleanup of a temp file whose own write
+                    # already failed and already printed, so raising here would
+                    # replace a reported degradation with an unreported crash.
+                    # What was wrong is that a leftover .tmp file in the
+                    # checkpoint directory was the only evidence it happened.
+                    CHECKPOINT_WRITE_FAILURES[
+                        f"tmp_unlink:{type(unlink_error).__name__}"] += 1
+                    print(f"[Checkpoint] WARNING: could not remove the "
+                          f"temporary checkpoint file {tmp_path} "
+                          f"({unlink_error}). Continuing; it will be "
+                          f"overwritten by the next successful write.")
                 
 
 def clear_ablation_checkpoint() -> None:
@@ -437,9 +553,14 @@ def stratified_sample(patients, sample_size, seed):
 # DATABASE
 # ===========================================================================
 
-def init_ablation_db():
-    """Create ablation database tables (idempotent)."""
-    conn = sqlite3.connect(str(ablation_db()))
+def init_ablation_db(db_path=None):
+    """Create ablation database tables (idempotent).
+
+    Args:
+        db_path: Database to create the tables in. ``None`` means the
+            production ``ablation_results.db`` -- see ``ablation_db()``.
+    """
+    conn = sqlite3.connect(str(ablation_db(db_path)))
     c = conn.cursor()
 
     c.execute("""
@@ -565,13 +686,13 @@ def init_ablation_db():
 
     conn.commit()
     conn.close()
-    print(f"Ablation database: {ablation_db()}")
+    print(f"Ablation database: {ablation_db(db_path)}")
 
 
-def _create_run(config_name, config_description, sample_size):
+def _create_run(config_name, config_description, sample_size, db_path=None):
     """Insert a new ablation_runs row, return run_id."""
     with _ablation_db_lock:
-        conn = sqlite3.connect(str(ablation_db()))
+        conn = sqlite3.connect(str(ablation_db(db_path)))
         c = conn.cursor()
         c.execute(
             "INSERT INTO ablation_runs "
@@ -585,10 +706,10 @@ def _create_run(config_name, config_description, sample_size):
         return run_id
     
 
-def _finalize_run(run_id, elapsed_seconds):
+def _finalize_run(run_id, elapsed_seconds, db_path=None):
     """Update run with total elapsed time."""
     with _ablation_db_lock:
-        conn = sqlite3.connect(str(ablation_db()))
+        conn = sqlite3.connect(str(ablation_db(db_path)))
         conn.execute(
             "UPDATE ablation_runs SET total_time_seconds = ? WHERE id = ?",
             (round(elapsed_seconds, 2), run_id),
@@ -597,9 +718,15 @@ def _finalize_run(run_id, elapsed_seconds):
         conn.close()
         
 
-def log_ablation_result(run_id, config_name, patient_data, result, ablation_flags):
+def log_ablation_result(run_id, config_name, patient_data, result,
+                        ablation_flags, db_path=None):
     """
     Log one patient's ablation result.
+
+    ``db_path`` is where the row goes; ``None`` means the production
+    ``ablation_results.db``. It is keyword-with-a-default and LAST, so every
+    existing positional call site is unchanged -- the same shape
+    ``log_inference(result, patient_data, db_path=None)`` has.
 
     Uses get_model_cost() from File 02/03 for cost consistency with
     File 14's production logging. bm25_retrieved/vector_retrieved are the
@@ -740,7 +867,7 @@ def log_ablation_result(run_id, config_name, patient_data, result, ablation_flag
                 m.get("nct_id", "") for m in near_misses if m.get("nct_id")
             )
     
-            conn = sqlite3.connect(str(ablation_db()))
+            conn = sqlite3.connect(str(ablation_db(db_path)))
             conn.execute("""
                 INSERT INTO ablation_results (
                     run_id, config_name, patient_id, cancer_group, primary_condition,
@@ -894,18 +1021,22 @@ def match_patient_ablation(patient_data, bm25_index, nct_ids, graph, ablation_fl
 # SUMMARY REPORTING
 # ===========================================================================
 
-def generate_summary():
+def generate_summary(db_path=None):
     """
     Query ablation database and produce summary table + deltas + JSON export.
 
     Uses the most recent run per config_name, so re-running a single config
     updates its row without affecting others. Returns DataFrame or None.
+
+    ``db_path`` is the database to read and the directory the JSON export lands
+    in; ``None`` means the production pair. See ``ablation_summary_json()`` for
+    why the export follows the database rather than staying put.
     """
-    if not ablation_db().exists():
+    if not ablation_db(db_path).exists():
         print("No ablation database found.")
         return None
 
-    conn = sqlite3.connect(str(ablation_db()))
+    conn = sqlite3.connect(str(ablation_db(db_path)))
     try:
         df = pd.read_sql_query("""
             SELECT
@@ -1026,9 +1157,9 @@ def generate_summary():
 
     # --- JSON export ---
     summary_records = df.to_dict(orient="records")
-    with open(ablation_summary_json(), "w") as f:
+    with open(ablation_summary_json(db_path), "w") as f:
         json.dump(summary_records, f, indent=2)
-    print(f"\n  Summary exported: {ablation_summary_json()}")
+    print(f"\n  Summary exported: {ablation_summary_json(db_path)}")
 
     return df
 
@@ -1052,6 +1183,16 @@ def parse_args():
         "--configs", nargs="+", default=None,
         help="Run only specific configs (e.g., --configs full_pipeline no_mesh_filter)"
     )
+    # Pass 20f-1. Default None, which is the production database and every
+    # documented command's behaviour. The summary JSON follows the database
+    # into the same directory, which the help says out loud because a run that
+    # quietly stopped updating ablation_summary.json would be a surprise.
+    parser.add_argument(
+        "--db", default=None, metavar="PATH",
+        help="Write the study to this SQLite database instead of the "
+             "production ablation_results.db. ablation_summary.json is "
+             "written beside it. Default: the production database."
+    )
     return parser.parse_args()
 
 
@@ -1060,11 +1201,21 @@ def main():
 
     args = parse_args()
 
+    # One local, read by every writer call below. None is the production
+    # database; --db is the only thing that changes it, and it is threaded
+    # explicitly rather than stashed in module state, so nothing this function
+    # calls can be redirected by anything except its own argument.
+    db_path = args.db
+
     print()
     print("=" * 70)
     print(f"{Project_Name}: ABLATION STUDY")
     print("=" * 70)
     print()
+    if db_path is not None:
+        print(f"  --db in effect: {ablation_db(db_path)}")
+        print(f"  Summary will go beside it: {ablation_summary_json(db_path)}")
+        print()
 
     # --- Summary-only mode ---
     # init_ablation_db() runs first even though nothing is written: the summary
@@ -1072,8 +1223,8 @@ def main():
     # column existed does not have. init is idempotent and performs the
     # migration, so --summary-only works against an old database.
     if args.summary_only:
-        init_ablation_db()
-        generate_summary()
+        init_ablation_db(db_path=db_path)
+        generate_summary(db_path=db_path)
         return
 
     # --- Validate --configs if provided ---
@@ -1090,7 +1241,7 @@ def main():
     with CaffeinateSession("Ablation Study"):
 
         # --- Step 1: Initialize ---
-        init_ablation_db()
+        init_ablation_db(db_path=db_path)
 
         print("\n[Step 1] Building BM25 index...")
         bm25_index, nct_ids = build_bm25_index_from_qdrant()
@@ -1209,7 +1360,8 @@ def main():
                     "gpt4o_output_tokens": 0,
                 }
 
-            log_ablation_result(run_id, config_name, patient_data, result, ablation_flags)
+            log_ablation_result(run_id, config_name, patient_data, result,
+                                ablation_flags, db_path=db_path)
             return pid, result
 
         try:
@@ -1231,7 +1383,8 @@ def main():
                 print(f"# Flags: {ablation_flags}")
                 print(f"{'#' * 70}")
 
-                run_id = _create_run(config_name, config["description"], len(sample))
+                run_id = _create_run(config_name, config["description"],
+                                     len(sample), db_path=db_path)
                 config_start = time.time()
 
                 # Filter to pending patients for this config
@@ -1284,7 +1437,7 @@ def main():
                         future.result()
 
                 config_elapsed = time.time() - config_start
-                _finalize_run(run_id, config_elapsed)
+                _finalize_run(run_id, config_elapsed, db_path=db_path)
                 print(f"\n  Config '{config_name}' done: {config_elapsed / 60:.1f} min")
 
         except KeyboardInterrupt:
@@ -1307,14 +1460,25 @@ def main():
         print(f"  Completed:       {run_success + run_error}")
         print(f"  Success:         {run_success}")
         print(f"  Errors:          {run_error}")
-        print(f"  Database:        {ablation_db()}")
+        print(f"  Database:        {ablation_db(db_path)}")
+
+        # Checkpoint degradations, reported here rather than left in the
+        # scrollback (pass 20f-1, item 11a's shape). Printed only when there
+        # were any, matching INDEX_AGE_PARSE_FAILURES in
+        # oncotriage/retrieval/indexer.py -- a zero line every run trains a
+        # reader to skip it.
+        if CHECKPOINT_WRITE_FAILURES:
+            print(f"  Checkpoint:      "
+                  f"{sum(CHECKPOINT_WRITE_FAILURES.values())} write "
+                  f"degradation(s) {dict(CHECKPOINT_WRITE_FAILURES)} -- resume "
+                  f"state may be behind the rows already in the database")
 
         if interrupted:
             print(f"  Status:          INTERRUPTED (resume with same command)")
         else:
-            generate_summary()
+            generate_summary(db_path=db_path)
             clear_ablation_checkpoint()
-            print(f"  Summary:         {ablation_summary_json()}")
+            print(f"  Summary:         {ablation_summary_json(db_path)}")
             print(f"  Status:          COMPLETE")
 
         print("=" * 70)
