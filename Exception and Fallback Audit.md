@@ -266,10 +266,10 @@ inference path; the rest are in tooling, dashboards, or tests.
 | `02- Utility Functions.py:176` | `FileNotFoundError` while trying filename variants in `exec_chain` | **Acceptable.** This is the variant search itself; the `for/else` raises `FileNotFoundError` naming the file when every variant misses. |
 | `02- Utility Functions.py:398` | any `Exception` from `caffeinate` teardown | **Acceptable.** Best-effort teardown of an optional macOS convenience; `__enter__` already printed if caffeine was unavailable. |
 | `11- RAG Trial Indexer.py:172` | `(IndexError, ValueError)` parsing `minimumAge` at index time | **Open — low.** Mirror of the Stage 4 defect on the indexing side: a trial with an unparseable minimum age is kept rather than skipped. Same fix, an `age_parse_failed` counter in the scrape summary. |
-| `24- Airflow Manager.py:89` | `ConnectionError` while polling the Airflow API during startup | **Acceptable.** This *is* the poll loop; the `for/else` prints `API Server did not respond within 30 seconds`. |
+| `oncotriage/orchestration/airflow_manager.py` (was `24- Airflow Manager.py:89`, now line 205) | `ConnectionError` while polling the Airflow API during startup | **Acceptable.** This *is* the poll loop; the `for/else` prints `API Server did not respond within 30 seconds`. |
 | `25- Batch Runner.py:140`, `25:214`, `26- Ablation Study.py:188` | `OSError` unlinking a temp file after the write it belonged to already failed and printed | **Acceptable.** Cleanup of a temp file on an already-reported error path. |
 | `25- Batch Runner.py:184` | `(json.JSONDecodeError, OSError)` reading the results file; returns `[]` | **Open — low.** A corrupt results file is indistinguishable from an absent one, and the run restarts from empty. One print would separate them. |
-| `29- Download Qdrant Data.py:33` | any `Exception` listing aliases | **Acceptable.** Scratch inspection script; nothing downstream depends on the output. |
+| `oncotriage/retrieval/qdrant_backup.py` (was `29- Download Qdrant Data.py:33`) | any `Exception` listing aliases | **Closed by pass 20c-3c-2.** The recovery is unchanged -- continuing is right, nothing below uses the aliases -- but it is no longer SILENT: the exception type and message are printed, the path taken is stated ("Continuing -- the download does not use them"), and the failure is recorded in the returned summary as `aliases_error`. |
 | `04- FHIR Generate Data.py:1238` | `(ValueError, OSError)` in `_relative_to_project`; returns the path unchanged | **Acceptable.** The fallback IS the documented behaviour: a path outside `main_path` (a scratch run under `/tmp`) has no relative form, and the absolute path is the correct thing to record in the manifest. Not a degradation — the manifest states which base paths are relative to. |
 
 ### Dashboard and tests
@@ -425,12 +425,12 @@ Per file, handlers / of which silent:
 | `19- FastAPI Server Batch Test.py` | 2 | 0 |
 | `20- Drift Detection.py` | 19 | 1 |
 | `oncotriage/dashboard/` (was `21- Streamlit Dashboard.py`) | 11 | 7 |
-| `22- Airflow Database.py` | 2 | 0 |
-| `24- Airflow Manager.py` | 4 | 1 |
+| `oncotriage/orchestration/airflow_setup.py` (was `22- Airflow Database.py`) | 2 | 0 |
+| `oncotriage/orchestration/airflow_manager.py` (was `24- Airflow Manager.py`) | 4 | 1 |
 | `25- Batch Runner.py` | 13 | 3 |
 | `26- Ablation Study.py` | 7 | 1 |
 | `27- Ablation Analysis.py` | 2 | 0 |
-| `29- Download Qdrant Data.py` | 1 | 1 |
+| `oncotriage/retrieval/qdrant_backup.py` (was `29- Download Qdrant Data.py`) | 1 | 0 |
 | `34- Cohort Selector Diff.py` | 2 | 0 |
 | `37- Retrieval Observability Test.py` | 1 | 0 |
 | `38- Birth Date and Demographics Parser Test.py` | 3 | 0 |
@@ -574,12 +574,12 @@ task.
 | `oncotriage/dashboard/tabs/reproducibility.py` | 973 | `(json.JSONDecodeError, TypeError, AttributeError)` | SILENT | `pass` |
 | `oncotriage/dashboard/tabs/reproducibility.py` | 1210 | `(json.JSONDecodeError, TypeError, AttributeError)` | SILENT | `continue` |
 | `oncotriage/dashboard/tabs/reproducibility.py` | 1333 | `(json.JSONDecodeError, TypeError, AttributeError)` | SILENT | `pass` |
-| `22- Airflow Database.py` | 39 | `subprocess.CalledProcessError` | LOGGED | `print(f"✗ Database migration failed:") \| print(e.stderr) \| return False` |
-| `22- Airflow Database.py` | 59 | `subprocess.CalledProcessError` | LOGGED | `print(f"✗ Database check failed:") \| print(e.stderr) \| return False` |
-| `24- Airflow Manager.py` | 89 | `requests.exceptions.ConnectionError` | SILENT | `pass` |
-| `24- Airflow Manager.py` | 121 | `ProcessLookupError` | LOGGED | `print(f" {name} (PID: {pid}) was already stopped")` |
-| `24- Airflow Manager.py` | 123 | `PermissionError` | LOGGED | `print(f"✗ Permission denied stopping {name} (PID: {pid})")` |
-| `24- Airflow Manager.py` | 137 | `ProcessLookupError` | LOGGED | `print(f" {name} confirmed stopped")` |
+| `oncotriage/orchestration/airflow_setup.py` | 91 | `subprocess.CalledProcessError` | LOGGED | `print(f"✗ Database migration failed:") \| print(e.stderr) \| return False` |
+| `oncotriage/orchestration/airflow_setup.py` | 111 | `subprocess.CalledProcessError` | LOGGED | `print(f"✗ Database check failed:") \| print(e.stderr) \| return False` |
+| `oncotriage/orchestration/airflow_manager.py` | 205 | `requests.exceptions.ConnectionError` | SILENT | `pass` |
+| `oncotriage/orchestration/airflow_manager.py` | 239 | `ProcessLookupError` | LOGGED | `print(f" {name} (PID: {pid}) was already stopped")` |
+| `oncotriage/orchestration/airflow_manager.py` | 241 | `PermissionError` | LOGGED | `print(f"✗ Permission denied stopping {name} (PID: {pid})")` |
+| `oncotriage/orchestration/airflow_manager.py` | 255 | `ProcessLookupError` | LOGGED | `print(f" {name} confirmed stopped")` |
 | `25- Batch Runner.py` | 103 | `(json.JSONDecodeError, KeyError)` | LOGGED | `print(f"[Checkpoint] WARNING: Could not read checkpoint ({e}). Starting fresh.") \| return set()` |
 | `25- Batch Runner.py` | 135 | `OSError` | LOGGED | `print(f"[Checkpoint] WARNING: Could not write checkpoint ({e}). Continuing.") \| if tmp_path.exists()...` |
 | `25- Batch Runner.py` | 140 | `OSError` | SILENT | `pass` |
@@ -602,7 +602,7 @@ task.
 | `26- Ablation Study.py` | 1187 | `KeyboardInterrupt` | LOGGED | `interrupted = True \| print("\n[INTERRUPTED] Waiting for active threads to finish...")` |
 | `27- Ablation Analysis.py` | 628 | `Exception` | RECORDED+LOGGED | `n_scipy_failures += 1 \| print(f" WARNING: wilcoxon failed for {config}/{col}: " f"{type(exc).__name_...` |
 | `27- Ablation Analysis.py` | 810 | `Exception` | RECORDED+LOGGED | `methods_used.add("normal_approx") \| print(f" WARNING: exact MDE solve failed at alpha={alpha:.6g} " ...` |
-| `29- Download Qdrant Data.py` | 33 | `Exception` | SILENT | `pass` |
+| `oncotriage/retrieval/qdrant_backup.py` | 178 | `Exception` | RECORDED+LOGGED | `summary['aliases_error'] = repr(e) \| print(f"\nAliases: unavailable ({type(e).__name__}: {e})") \| print("  Continuing -- the download does not use them.")` |
 | `34- Cohort Selector Diff.py` | 296 | `(OSError, json.JSONDecodeError)` | RECORDED+LOGGED | `read_errors.append({'file': patient_file.name, 'error': f"{type(e).__name__}: {e}"}) \| print(f" ERRO...` |
 | `34- Cohort Selector Diff.py` | 519 | `OSError` | LOGGED | `print(f"ERROR writing report: {type(e).__name__}: {e}") \| return False` |
 | `37- Retrieval Observability Test.py` | 548 | `Exception` | LOGGED | `print(f" SKIP no reachable Qdrant " f"({type(_probe_error).__name__}: {str(_probe_error)[:120]})") \|...` |

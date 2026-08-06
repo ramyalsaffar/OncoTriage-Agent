@@ -14,7 +14,7 @@ Files 01, 02 and 03 are different as of item 20c. They are now **re-export shims
 
 Files 01, 02, 03 (pass 20c-1), 08, 09, 10 (pass 20c-2a), 07, 14 (pass 20c-2b), 13 (pass 20c-2c), 05 (pass 20c-3a) and 20 (pass 20c-3b) are shims.
 
-**Files 04, 06, 11, 12 (pass 20c-3a), 15, 16, 17, 25 (pass 20c-3b) and 21 (pass 20c-3c-1) are THIN ENTRY POINTS** — a `__main__` block, the imports it needs, and nothing else. They have **no exec bootstrap at all**: no `exec()` of Files 01/02/03, no `exec_chain`. That is allowed because nothing in the repository chains them, which was verified rather than assumed — every top-level name each of them defined was grepped against every `.py`, `.md`, `.toml` and `.yml` in the tree, and the only hits are prose in CLAUDE.md / `Exception and Fallback Audit.md`, Files 39 and 40 printing `python "04- FHIR Generate Data.py" --population 3000` as a suggested command, a comment in `02- Utility Functions.py` line 46 naming File 16, a comment in File 25 naming File 17's `_run_matching_pipeline`, and coincidental same-named locals elsewhere (`conn`, `cursor`, `_in`, `_out`, `df_cost`, `graph`, `bm25_index`, `print_summary`).
+**Files 04, 06, 11, 12 (pass 20c-3a), 15, 16, 17, 25 (pass 20c-3b), 21 (pass 20c-3c-1) and 22, 23, 24, 29 (pass 20c-3c-2) are THIN ENTRY POINTS** — a `__main__` block, the imports it needs, and nothing else. They have **no exec bootstrap at all**: no `exec()` of Files 01/02/03, no `exec_chain`. That is allowed because nothing in the repository chains them, which was verified rather than assumed — every top-level name each of them defined was grepped against every `.py`, `.md`, `.toml` and `.yml` in the tree, and the only hits are prose in CLAUDE.md / `Exception and Fallback Audit.md`, Files 39 and 40 printing `python "04- FHIR Generate Data.py" --population 3000` as a suggested command, a comment in `02- Utility Functions.py` line 46 naming File 16, a comment in File 25 naming File 17's `_run_matching_pipeline`, and coincidental same-named locals elsewhere (`conn`, `cursor`, `_in`, `_out`, `df_cost`, `graph`, `bm25_index`, `print_summary`).
 
 Two of those eight keep one re-exported name each, and both are load-bearing:
 
@@ -53,6 +53,11 @@ Two of those eight keep one re-exported name each, and both are load-bearing:
 | `oncotriage/dashboard/tiers.py` | `MATCH_TIERS`, `MATCH_TIER_COLORS`, the four `TRIAL_STATUS_*`, `classify_trial_score`, `enrich_match_tiers` | nothing at all |
 | `oncotriage/dashboard/app.py` | File 21's `main` — page config, sidebar, the nine tabs | `config`, `dashboard.{data,sidebar,tiers}`, `dashboard.tabs.*` |
 | `oncotriage/dashboard/tabs/*.py` | one `render_*_tab` each, nine of them | `dashboard.{data,tiers}`, `config`, `utils` |
+| `oncotriage/retrieval/qdrant_backup.py` | File 29 whole — `default_output_dir`, `download_all_collections` | `config`, `paths` |
+| `oncotriage/orchestration/home.py` | **the one** `airflow_path` read — `resolve_airflow_home` | `paths` |
+| `oncotriage/orchestration/airflow_setup.py` | File 22 whole — `setup_airflow` | `orchestration.home` |
+| `oncotriage/orchestration/dag_generator.py` | File 23 whole — the three DAG string pieces, `build_path_block`, `build_dag_content`, `write_dag_file` | `paths`, `settings`, `orchestration.home` |
+| `oncotriage/orchestration/airflow_manager.py` | File 24 whole — start/stop, the four-tier password route, status, trigger | `settings`, `orchestration.home` |
 | `oncotriage/registries/primary_cancer.py` | `_resolve_primary_cancer` — which condition is THE cancer | `registries.cancer_code_registry` |
 | `oncotriage/agent/deps.py` | **the seam**: every client, model and registry, lazily resolved and overridable | `config`, `registries.*` |
 | `oncotriage/agent/state.py` | `TrialMatchState`, the channel / expansion-path / MeSH-filter vocabularies | nothing from the project |
@@ -262,6 +267,15 @@ python "11- RAG Trial Indexer.py" --mode staging     # staging + atomic alias sw
 python "11- RAG Trial Indexer.py" --mode direct      # rebuilds in place, causes downtime
 python "12- RAG Trial Indexer Validator.py"          # exit 1 on any CRITICAL check failure
 
+# Airflow (orchestration) — run in this order the first time
+python "22- Airflow Database.py"                     # airflow db migrate + check, rewrites airflow.cfg
+python "23- Airflow DAG.py"                          # writes {airflow_path}/dags/trial_refresh_weekly.py
+python "24- Airflow Manager.py"                      # runs start_airflow(); edit its menu for the rest
+
+# Qdrant backup
+python "29- Download Qdrant Data.py"                 # -> {data_path}/06- Qdrant Downloaded Data.../
+python "29- Download Qdrant Data.py" --output-dir <scratch>
+
 # Evaluation / monitoring
 python "26- Ablation Study.py" --sample-size 30 --configs full_pipeline no_mesh_filter
 python "26- Ablation Study.py" --summary-only        # report from existing ablation_results.db
@@ -303,9 +317,10 @@ does not invalidate the next.
 
 File 47's per-module import sweep (check 2c) runs one subprocess per package
 module through a `ThreadPoolExecutor`. Serially it took about nine minutes and
-the module count has gone 26 → 33 (pass 3a) → 42 (pass 3b) → **50** (pass 3c-1,
+the module count has gone 26 → 33 (pass 3a) → 42 (pass 3b) → 50 (pass 3c-1,
 which added thirteen dashboard modules, each of which imports streamlit in its
-own subprocess); a test nobody runs
+own subprocess) → **55** (pass 3c-2: the four orchestration modules and the
+Qdrant backup); a test nobody runs
 because it is slow protects nothing. A THREAD pool rather than a process pool is the right
 tool, not a compromise: each unit of work is already its own subprocess, so the
 parent thread spends its life blocked in `subprocess.run()` with the GIL
@@ -328,7 +343,9 @@ Only `03- Code/` is version-controlled. Sibling directories under the project ro
 | `checkpoint_path` | `08- Checkpoint/` | batch runner resume state |
 | `requirements_path` | `07- Requirements/requirements.txt` | pip deps (copied into Dockerfile) |
 
-`docker-compose.yml` mounts `.env` from a mix of `../04- Keys/` and `../05- Keys/`; only `05- Keys/` exists.
+`docker-compose.yml` mounts `.env` from a mix of `../04- Keys/` and `../05- Keys/`; only `05- Keys/` exists. Measured per service in pass 20c-3c-2, and it is a **two-two split, not a stray line**: `fastapi` (line 65) and `airflow-webserver` (line 139) mount `../04- Keys/.env`, which **does not exist**, so Docker creates an empty *directory* at that host path and bind-mounts it as `/app/.env` — the container gets a directory where a file should be, and `load_env_keys()` fails with `.env file not found` or an `IsADirectoryError` depending on how it is reached. `streamlit` (line 101) and `airflow-scheduler` (line 184) mount `../05- Keys/.env`, which is correct. Left untouched: it belongs to the Docker item.
+
+**The `AIRFLOW__CORE__DAGS_FOLDER` line is NOT a defect, and pass 20c-3c-2 checked rather than repeated the claim.** `docker-compose.yml` lines 148 and 192 set it to `/app/airflow_home/dags`; `oncotriage/paths.py` line 291 sets the Docker-branch `airflow_path` to `/app/airflow_home/`; and `write_dag_file(dags_root)` writes to `Path(dags_root) / 'dags'`. Those are the same directory, and `AIRFLOW_HOME=/app/airflow_home` agrees with both. What IS true is that **nothing in the container ever runs File 23** — the webserver's command is `mkdir -p /app/airflow_home/dags && airflow db migrate && airflow api-server`, and the scheduler's is `sleep 30 && airflow scheduler`. So the DAG folder is created empty and the scheduler parses an empty directory forever. That is the real Docker-item defect in this area, and it is a missing generation step, not a path mismatch.
 
 ## Pipeline architecture
 
@@ -516,9 +533,44 @@ it, which is a redesign. Breaking it up is its own item.
 
 `oncotriage/retrieval/index_validator.py` (entry point `12-`) reaches its clients and both MedCPT halves through `oncotriage/agent/deps.py`, not through `oncotriage.config` and not through File 13's shim proxies — it is the one module in `oncotriage.retrieval` that uses the agent's seam, because the question it answers is "is this index healthy for the AGENT to query". The indexer deliberately does **not**: an index build must not be redirected by a stub installed for an agent test, and `retrieval` importing `agent` would be the wrong direction.
 
-`23- Airflow DAG.py` writes the `trial_refresh_weekly` DAG (Sundays 02:00) into `{airflow_path}/dags/`; `22-` initializes the Airflow DB and `24-` starts/stops/triggers via the REST API v2. The DAG file is generated as a string, so DAG logic edits go in `23-`, not in the `dags/` output.
+`23- Airflow DAG.py` writes the `trial_refresh_weekly` DAG (Sundays 02:00) into `{airflow_path}/dags/`; `22-` initializes the Airflow DB and `24-` starts/stops/triggers via the REST API v2. The DAG file is generated as a string, so DAG logic edits go in `oncotriage/orchestration/dag_generator.py`, not in the `dags/` output and not in File 23 (which is now a thin entry point).
 
-**The generated DAG must be regenerated after item 20c.** Its `_config_literal()` / `_load_config()` read `oncotriage/config.py` now; a DAG file generated before this pass still reads `03- Config.py`, where the constants are no longer *assigned* — `AIRFLOW_DAG_SCHEDULE is not assigned at module level` at every scheduler parse. File 23 **will not overwrite** an existing DAG, so: `rm "{airflow_path}/dags/trial_refresh_weekly.py"` then `python "23- Airflow DAG.py"`.
+**The outstanding regeneration is DONE (pass 20c-3c-2), and it was verified with Airflow's own parser rather than assumed.** Before: the DAG under `{airflow_path}/dags/` was 19,360 bytes, sha256 `1b6e2479…`, and `DagBag(dag_folder=...)` registered **zero** DAGs with one import error — `RuntimeError: AIRFLOW_DAG_SCHEDULE is not assigned at module level in .../03- Config.py`, exactly as predicted. After `rm` + `python "23- Airflow DAG.py"`: 20,542 bytes, sha256 `68963b0c…`, `import_errors == {}`, `trial_refresh_weekly` registered with all three tasks (`scrape_and_save`, `rebuild_index`, `verify_index`), tags `['production', 'trialmatch']`, timetable summary `None` (which is `AIRFLOW_DAG_SCHEDULE = None`, as configured).
+
+### Orchestration (pass 20c-3c-2)
+
+Files 22, 23, 24 and 29 are thin entry points over `oncotriage/orchestration/` and `oncotriage/retrieval/qdrant_backup.py`. **None of them keeps a re-export shim**, verified the same way as passes 3b and 3c-1: every top-level name each defines was grepped against every `.py`, `.md`, `.toml` and `.yml` in the tree. File 22's `setup_airflow`, all five of File 23's names and all twelve of File 24's names have **no hit outside their own file**; File 29's 27 leaked names hit only third-party imports (`Path`, `json`, `time`) and coincidental same-named locals elsewhere (`c`, `f`, `name`, `info`, `points`, `offset`, `size`, `output_dir`, …), while its ten distinctive ones (`all_points`, `point_data`, `scroll_result`, `serialized_vectors`, `backup_files`, `file_size_mb`, `total_size`, `vec_name`, `vec_val`, `collection_info`) have no hit anywhere.
+
+The free-name lists were re-derived with **symtable, not a plain ast walk** — File 24's own comment records that a plain walk wrongly reported three function locals (`attempt`, `name`, `candidate`) as free. Measured: File 22 four (`Path`, `airflow_path`, `os`, `subprocess`), File 23 six (`Path`, `airflow_path`, `path_settings`, `code_path`, `keys_path`, `data_trial_path`), File 24 seven, File 29 two (`data_path`, `qdrant_client`).
+
+**THE GENERATED DAG TEXT IS BYTE-IDENTICAL, and that is the only acceptance criterion that matters for File 23** — the scheduler parses the output and never sees the generator. Proved by generating from `git show HEAD:"23- Airflow DAG.py"` into one temporary directory (exec'd with a doctored `__file__` so its bootstrap could still find File 01) and from the package module into another: same 20,542 bytes, same sha256 `68963b0c…`.
+
+**`dag_content` is a FUNCTION now, and it had to be.** File 23 assembled it at module level, and its middle third is `%`-formatted with `code_path`, `keys_path` and `data_trial_path` — three **lazy** paths. So importing the old shape resolved three directories and raised on any machine without the sibling tree. `build_dag_content()` is the fix; `dag_content_head` and `dag_content_tail` stay module-level constants because they are plain strings that resolve nothing. Note which half of File 23's own item-20b comment survives that: it said "dag_content itself stays at module level — it is a string, building it touches nothing". The first clause was right and the second was not. Under the exec chain it was invisible, because `01- Imports.py` had already resolved every path before File 23 was reached.
+
+**Two lines of PROSE inside the generated DAG still say `03- Config.py` and are deliberately left wrong.** The module docstring's Schedule line and the comment above `DAG_SCHEDULE`. The code below them opens `oncotriage/config.py` — that is what item 20c retargeted and what now parses clean. Correcting the prose changes the bytes and would have made the equivalence proof for this pass meaningless. It is a one-line follow-up whose acceptance criterion is a **new** sha256.
+
+**THE AIRFLOW PASSWORD HAS AN EXPLICIT ROUTE (`oncotriage/orchestration/airflow_manager.py`), because the old one silently stopped working.** File 24 held `AIRFLOW_PASSWORD = None` at module level, mutated through `global`, and `start_airflow()` printed `⚠️ SET AIRFLOW_PASSWORD in this file to use trigger/status functions!`. Once the functions moved into a package module, **"this file" is the wrong file**: a name bound in the entry point's namespace is not the module's global. An operator following that printed instruction would set a variable nothing reads, and **nothing would raise** — the module falls through to the generated password file and authenticates successfully with a password the operator did not choose. The instruction was already self-contradictory before the move: the comment on the same line said "Auto-read from password file (never set manually)", which is what the code actually did.
+
+Four tiers, first match wins, and `password_source()` reports which answered without returning the secret:
+
+1. `check_dag_status(password=...)` / `trigger_dag(password=...)` / `_get_token(password=...)` — **not cached**, so a one-off argument never becomes the process-wide answer;
+2. `airflow_manager.set_airflow_password(...)` — refuses `""` rather than storing a value that would 401 with no diagnosis;
+3. `ONCOTRIAGE_AIRFLOW_PASSWORD` — `settings.resolve_airflow_password()`, which is **deliberately not `_from_env`**: that helper appends a trailing separator, correct for every path and silent corruption for a credential;
+4. the generated password file — what File 24 always did, unchanged, including both error messages (the `FileNotFoundError` now also names the other three routes).
+
+`clear_airflow_password()` drops the JWT cache with the password, because a token minted with the previous one stays valid for its five-minute TTL. All of the above was demonstrated, including that the **old route is dead** — setting `AIRFLOW_PASSWORD` in File 24's namespace, and rebinding it on the package module, both leave `password_source()` reporting `password-file` — and every assertion was shown to FAIL when broken (four negative controls, all fired).
+
+**`resolve_airflow_home()` lives in `oncotriage/orchestration/home.py` and is the ONE place `paths.airflow_path` is read.** The first draft wrote the same three lines into all three orchestration modules. That is the shape the BM25 sparse model had before pass 20c-3a — one job, several construction sites, nothing that fails when they disagree. Here disagreement means `airflow_setup` migrating a database under one AIRFLOW_HOME while `airflow_manager` starts a scheduler under another: two working processes, two metadata databases, and the only symptom is a DAG that never appears in the UI.
+
+**File 29 was the LAST UNGUARDED FILE in the repository.** No function, no `__main__` guard, no bootstrap — every statement at module level, so loading it created a directory, listed every Qdrant collection, scrolled every point with payloads **and** vectors over the network, and wrote one JSON per collection. Item 20b guarded Files 15, 16, 17, 22 and 24 and never reached it, because nothing loads it: the only documented invocation was `exec(open(code_path + "29- Download Qdrant Data.py").read())` from Spyder. That line is gone from the docstring rather than left as a trap — behind a guard it would exec cleanly and download **nothing**, which is worse than failing. Its header comment also claimed it used `results_path`; it never did, and the symtable measurement is what settled that.
+
+`download_all_collections(output_dir, client=None)` takes the destination as a **required** argument with no default, on the `empty_database(db_path, flag)` precedent: a plausible thing to type while exploring a module must not start a full download of a cloud database. `default_output_dir()` resolves the historical destination lazily and **creates nothing** — the `output_dir()`/`ensure_output_dir()` lesson from pass 20c-3b. The client comes from `oncotriage.config`, **not** `agent.deps`, for the same reason `retrieval.indexer` does: a stub installed for an agent test that quietly redirected a BACKUP would be indistinguishable from a real one until the day it was restored from.
+
+One change in `qdrant_backup` is **not** a path accessor, a client accessor or a guard, and is called out rather than folded in: File 29's `except Exception: pass` around `get_aliases()` is now logged. Continuing is right (nothing below uses the aliases, and `Exception and Fallback Audit.md` line 272 rules it acceptable) but silence is not — the project's standing rule is that no exception is caught without being recorded. The type and message are printed and the failure lands in the returned summary as `aliases_error`.
+
+**File 24's `__main__` menu is kept BYTE-VERBATIM**, including its comment `# After setting AIRFLOW_PASSWORD: Check status`, which names the retired route. Replacing the commented menu with a real argparse CLI is the right end state, it is a redesign, and it is a recorded follow-up — not built here. The entry-point docstring carries a loud note immediately above the menu so no reader is misled by that one comment.
+
+**File 47 grew two traps and six modules.** `subprocess.run` and `subprocess.Popen` are patched to raise before the imports, because three of the six new modules are the only ones in the package that spawn processes and **no existing trap could see one** — a subprocess opens no socket, no database and no file *in this process*, and before item 20b loading File 22 ran `airflow db migrate` while loading File 24 launched two long-lived servers. 48 modules now import under all seven traps; the sweep is 244 checks, all passing.
 
 ## Persistence and observability
 

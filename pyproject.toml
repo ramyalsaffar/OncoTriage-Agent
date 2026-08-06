@@ -60,4 +60,8 @@ packages = [
     # "oncotriage.dashboard" would ship a wheel whose dashboard has no tabs.
     "oncotriage.dashboard",
     "oncotriage.dashboard.tabs",
+    # Pass 20c-3c-2: the Airflow orchestration layer (Files 22, 23, 24).
+    # File 29 became oncotriage/retrieval/qdrant_backup.py, inside a subpackage
+    # already listed above, so it needs no entry here.
+    "oncotriage.orchestration",
 ]

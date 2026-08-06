@@ -1,167 +1,61 @@
 # Creat Airflow Database
 ########################
 
+"""
+Initialize the Airflow metadata database and configure the admin user.
 
-#------------------------------------------------------------------------------
+THIN ENTRY POINT (item 20c, pass 3c-2)
+--------------------------------------
+``setup_airflow()`` moved to ``oncotriage/orchestration/airflow_setup.py``. What
+is left here is a ``__main__`` guard, one call, and the failure print.
 
-# ===========================================================================
-# EXEC CHAIN: 01
-# ===========================================================================
-# setup_airflow() below reads airflow_path, os, Path and subprocess, all
-# of which 01- Imports.py supplies. It calls no project function and no
-# config constant, so 02 and 03 are not loaded.
-#
-# Item 20a: this file sits in the code directory, so __file__ locates it with
-# no hardcoded path. __file__ is bound when the file is run as a script (every
-# documented entry point for it) and when Spyder runfile()s it. In a bare
-# interactive paste it is not bound, and the working directory is the only
-# remaining candidate -- taken, but announced, never silently.
-import os as _os_boot
-if "__file__" in globals():
-    _code_dir = _os_boot.path.dirname(_os_boot.path.abspath(__file__)) + _os_boot.sep
-else:
-    _code_dir = _os_boot.getcwd() + _os_boot.sep
-    print(f"[Bootstrap] __file__ unbound; using the working directory as the code directory: {_code_dir}")
-del _os_boot
+NO EXEC BOOTSTRAP. This file used to ``exec()`` "01- Imports.py" purely to get
+four names -- ``airflow_path``, ``os``, ``Path`` and ``subprocess`` -- which is
+the whole third-party import block of the project, including torch,
+transformers, streamlit and langgraph, to run two `airflow db` subcommands.
+Those four are ordinary imports in the package module now.
 
-with open(_code_dir + "01- Imports.py") as _fh:
-    exec(_fh.read(), globals())
+NO RE-EXPORT SHIM. Nothing in the repository reads this file's namespace: its
+two top-level names (``setup_airflow``, ``success``) were grepped against every
+.py, .md, .toml and .yml in the tree, ``setup_airflow`` has no hit outside this
+file, and every ``success`` hit is a same-named local or a JSON key elsewhere.
 
+WHAT THIS DOES TO YOUR MACHINE, unchanged from before the move: it runs
+`airflow db migrate`, runs `airflow db check`, and REWRITES
+{AIRFLOW_HOME}/airflow.cfg in place to add the simple_auth_manager admin user.
 
-#------------------------------------------------------------------------------
+Run from terminal:
+    python "22- Airflow Database.py"
+"""
 
+import os
+import sys
 
 
-def setup_airflow():
-    """
-    Initialize Airflow 3.1.7 with Simple Auth Manager (default).
-    Users configured via airflow.cfg file.
-    """
-    # Set Airflow home
-    os.environ['AIRFLOW_HOME'] = airflow_path
-    
-    print(f"Airflow Home: {airflow_path}\n")
-    
-    # =========================================================================
-    # Step 1: Database migration
-    # =========================================================================
-    db_path = Path(airflow_path) / 'airflow.db'
-    
-    if db_path.exists():
-        print(f"✓ Database exists: {db_path}")
+# Make the oncotriage package importable
+#---------------------------------------
+# See the same block in "04- FHIR Generate Data.py" and "16- Database Query.py".
+# `pip install -e .` makes it a no-op; without it the code directory is added to
+# sys.path and the fact is printed rather than left silent.
+try:
+    import oncotriage  # noqa: F401
+except ImportError:
+    for _candidate, _how in (
+        (os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals()
+         else None, "__file__"),
+        (os.getcwd(), "cwd"),
+    ):
+        if _candidate and os.path.isdir(os.path.join(_candidate, "oncotriage")):
+            if _candidate not in sys.path:
+                sys.path.insert(0, _candidate)
+            print(f"[Bootstrap] oncotriage package found at {_candidate} "
+                  f"(via {_how}); added to sys.path")
+            break
     else:
-        print(f"Initializing database: {db_path}")
-    
-    try:
-        result = subprocess.run(
-            ['airflow', 'db', 'migrate'],
-            check=True,
-            capture_output=True,
-            text=True,
-            env=os.environ.copy()
-        )
-        if result.stdout:
-            print(result.stdout)
-        print("✓ Database ready")
-    except subprocess.CalledProcessError as e:
-        print(f"✗ Database migration failed:")
-        print(e.stderr)
-        return False
-    
-    # =========================================================================
-    # Step 2: Verify database
-    # =========================================================================
-    print("\nVerifying database...")
-    try:
-        result = subprocess.run(
-            ['airflow', 'db', 'check'],
-            check=True,
-            capture_output=True,
-            text=True,
-            env=os.environ.copy()
-        )
-        if result.stdout:
-            print(result.stdout)
-        print("✓ Database verified")
-    except subprocess.CalledProcessError as e:
-        print(f"✗ Database check failed:")
-        print(e.stderr)
-        return False
-    
-    # =========================================================================
-    # Step 3: Configure admin user in airflow.cfg
-    # =========================================================================
-    print("\nConfiguring admin user...")
-    
-    cfg_path = Path(airflow_path) / 'airflow.cfg'
-    
-    if not cfg_path.exists():
-        print(f"✗ Config file not found: {cfg_path}")
-        print("  Run 'airflow db migrate' first to generate config")
-        return False
-    
-    # Read existing config
-    with open(cfg_path, 'r') as f:
-        lines = f.readlines()
-    
-    # Check if user already configured
-    user_configured = any('simple_auth_manager_users' in line and 'admin' in line for line in lines)
+        raise
+    del _candidate, _how
 
-    if user_configured:
-        print("✓ Admin user already configured")
-    else:
-        # Find [core] section and add user configuration
-        new_lines = []
-        core_section_found = False
-        user_line_added = False
-        
-        for line in lines:
-            new_lines.append(line)
-            
-            # Add user config right after [simple_auth_manager] section header
-            if line.strip() == '[simple_auth_manager]' and not user_line_added:
-                core_section_found = True
-                new_lines.append('simple_auth_manager_users = "admin:admin"\n')
-                user_line_added = True
-        
-        # If [simple_auth_manager] section not found, add it at the end
-        if not core_section_found:
-            new_lines = new_lines + ['\n[simple_auth_manager]\n', 'simple_auth_manager_users = "admin:admin"\n', '\n']
-        
-        # Write updated config
-        with open(cfg_path, 'w') as f:
-            f.writelines(new_lines)
-        
-        print("✓ Admin user configured in airflow.cfg")
-    
-    # =========================================================================
-    # Step 4: Password file info
-    # =========================================================================
-    password_file = Path(airflow_path) / 'simple_auth_manager_passwords.json.generated'
-    
-    print(f"\n{'='*70}")
-    print("✓ AIRFLOW SETUP COMPLETE")
-    print(f"{'='*70}")
-    print(f"Database: {db_path}")
-    print(f"Config: {cfg_path}")
-    print(f"\nUser: admin")
-    print(f"Password will be auto-generated and saved to:")
-    print(f"  {password_file}")
-    print(f"  (Also printed in webserver logs on first start)")
-# =============================================================================
-#     print(f"\nNext steps:")
-#     print(f"  1. Start webserver: airflow api-server --port 8080")  # ✅ VERIFIED: Correct syntax
-#     print(f"  2. Check webserver logs for admin password")
-#     print(f"  3. Start scheduler: airflow scheduler")  # ✅ VERIFIED: Correct command
-#     print(f"  4. Access UI: http://localhost:8080")
-#     print(f"  5. Login with username 'admin' and auto-generated password")
-#     
-# =============================================================================
-    
-    print(f"\nNext step: Run file 23, then file 24 to start services")
-    print(f"{'='*70}\n")
-    
-    return True
+from oncotriage.orchestration.airflow_setup import setup_airflow
 
 
 #------------------------------------------------------------------------------

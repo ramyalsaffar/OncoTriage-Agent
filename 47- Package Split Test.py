@@ -918,7 +918,7 @@ _PKG_FILES = sorted(
 )
 
 check("the package file list is non-empty and covers all six subpackages",
-      len(_PKG_FILES) >= 34
+      len(_PKG_FILES) >= 66
       and any(f.endswith("registries/mesh.py") for f in _PKG_FILES)
       and any(f.endswith("extraction/negation.py") for f in _PKG_FILES)
       and any(f.endswith("fhir/parser.py") for f in _PKG_FILES)
@@ -929,7 +929,12 @@ check("the package file list is non-empty and covers all six subpackages",
       # Pass 20c-3c-1: the dashboard. Named here so the two subpackages cannot
       # vanish from the tree without this scan noticing.
       and any(f.endswith("dashboard/data.py") for f in _PKG_FILES)
-      and any(f.endswith("dashboard/tabs/reproducibility.py") for f in _PKG_FILES),
+      and any(f.endswith("dashboard/tabs/reproducibility.py") for f in _PKG_FILES)
+      # Pass 20c-3c-2: orchestration, and the Qdrant backup that joined
+      # retrieval. Named for the same reason as the dashboard pair above.
+      and any(f.endswith("orchestration/dag_generator.py") for f in _PKG_FILES)
+      and any(f.endswith("orchestration/airflow_manager.py") for f in _PKG_FILES)
+      and any(f.endswith("retrieval/qdrant_backup.py") for f in _PKG_FILES),
       True)
 
 # EVERY SUBPACKAGE MUST BE DECLARED IN pyproject.toml. setuptools does not
@@ -948,14 +953,18 @@ _SUBPACKAGE_DIRS = sorted(
 check("the tree has the subpackages this pass expects (non-degeneracy)",
       _SUBPACKAGE_DIRS,
       # api, batch and monitoring are new in pass 20c-3b -- the serving layer.
-      # dashboard is new in pass 20c-3c-1. NOTE that this listdir is one level
+      # dashboard is new in pass 20c-3c-1. orchestration is new in pass
+      # 20c-3c-2 -- Files 22, 23 and 24, the Airflow layer. (File 29 landed in
+      # oncotriage.retrieval, which was already here, so that pass adds exactly
+      # one name.) NOTE that this listdir is one level
       # deep, so oncotriage.dashboard.tabs is NOT in it; the pyproject check
       # below would therefore never look at it, which is why it is asserted
       # separately -- setuptools does not recurse, so a nested subpackage
       # missing from pyproject ships a dashboard with no tabs in a built wheel.
       ["oncotriage.agent", "oncotriage.api", "oncotriage.batch",
        "oncotriage.dashboard", "oncotriage.extraction", "oncotriage.fhir",
-       "oncotriage.monitoring", "oncotriage.registries", "oncotriage.retrieval",
+       "oncotriage.monitoring", "oncotriage.orchestration",
+       "oncotriage.registries", "oncotriage.retrieval",
        "oncotriage.storage"])
 check("the NESTED subpackage oncotriage.dashboard.tabs is declared too "
       "(setuptools does not recurse into a listed package)",
@@ -1111,7 +1120,7 @@ print("=" * 78)
 # its presence says nothing about this package, and importing it loads no
 # weights.
 _PURITY = r"""
-import builtins, io, json, socket, sqlite3, sys
+import builtins, io, json, socket, sqlite3, subprocess, sys
 
 import caffeine, dotenv, httpx, openai, qdrant_client, tenacity           # noqa: F401
 import collections, glob, logging, os, pathlib, re, threading, typing     # noqa: F401
@@ -1141,6 +1150,14 @@ import scipy.stats, fastapi, slowapi                                      # noqa
 # point serves. Neither loads a model; both are listed so the trap measures this
 # package rather than its dependencies' import machinery.
 import tqdm, uvicorn                                                      # noqa: F401
+# Pass 20c-3c-2: oncotriage.orchestration.airflow_manager imports requests at
+# module scope -- every one of its status and trigger functions is an HTTP call,
+# so there is no version of that module that does not need it. requests reads
+# certifi's CA bundle location and charset_normalizer's tables at import, which
+# is not this package's doing. Same allowance, for the same reason, as the four
+# blocks above. It is NOT on the `heavy` list: it opens no socket at import (the
+# socket trap below is armed and would catch that), and it loads no model.
+import requests                                                           # noqa: F401
 
 
 class Blocked(RuntimeError):
@@ -1164,6 +1181,22 @@ socket.create_connection = _blocked
 sqlite3.connect = _blocked
 builtins.open = _blocked
 io.open = _blocked
+# PASS 20c-3c-2 ADDED THE SUBPROCESS TRAPS, and this pass is why they exist.
+# Before item 20b, LOADING "22- Airflow Database.py" ran `airflow db migrate`
+# and `airflow db check` through subprocess.run, and loading
+# "24- Airflow Manager.py" launched TWO long-lived server processes through
+# subprocess.Popen and left them running -- the heaviest import-time side effect
+# the project has ever had. None of the four traps above can see either one: a
+# subprocess opens no socket, no database and no file IN THIS PROCESS.
+#
+# Both names are patched on the `subprocess` MODULE, which is what
+# `subprocess.run(...)`/`subprocess.Popen(...)` resolve at CALL time -- and both
+# orchestration modules write exactly that, `import subprocess` plus a qualified
+# call, so the patch is in their path. A module that had done `from subprocess
+# import Popen` at import would hold the original and escape this; check 7's AST
+# scan is the backstop for that shape.
+subprocess.Popen = _blocked
+subprocess.run = _blocked
 
 import oncotriage.constants
 import oncotriage.settings
@@ -1183,6 +1216,28 @@ import oncotriage.fhir.generate
 import oncotriage.fhir.explore
 import oncotriage.retrieval.indexer
 import oncotriage.retrieval.index_validator
+# Pass 20c-3c-2. qdrant_backup is File 29, which was the LAST UNGUARDED FILE in
+# the repository: every statement in it was at module level, so loading it
+# created a directory, listed every collection over the network and wrote one
+# JSON per collection. Three of this section's five traps -- socket, open,
+# io.open -- are exactly the ones that file would have fired, and it is the
+# single strongest reason this check exists at all.
+import oncotriage.retrieval.qdrant_backup
+import oncotriage.orchestration
+import oncotriage.orchestration.home
+# airflow_setup ran `airflow db migrate` and rewrote airflow.cfg at load before
+# item 20b; airflow_manager launched TWO long-lived server processes with
+# subprocess.Popen. Neither may do anything at import, and no trap here can see
+# a subprocess -- so check 7 (below) reads their ASTs for module-level calls,
+# and this import is what proves the cheaper properties.
+import oncotriage.orchestration.airflow_setup
+import oncotriage.orchestration.airflow_manager
+# dag_generator is the one where the trap does real work: File 23 assembled
+# dag_content at module level, %-formatted with THREE lazy paths, so importing
+# the old shape resolved three directories. The `open` trap would not catch
+# that (glob uses os.scandir) -- check 2c's per-module sweep is what does --
+# but the module must also not WRITE the DAG at import, which this catches.
+import oncotriage.orchestration.dag_generator
 import oncotriage.storage.database_logger
 import oncotriage.storage.maintenance
 import oncotriage.storage.queries
@@ -1223,7 +1278,15 @@ for _name, _fn, _args in (("socket", socket.socket, (socket.AF_INET, socket.SOCK
                           # that does exist would let a FAILED trap silently
                           # succeed instead of raising FileNotFoundError.
                           ("open", builtins.open, ("/oncotriage-trap-probe",)),
-                          ("io.open", io.open, ("/oncotriage-trap-probe",))):
+                          ("io.open", io.open, ("/oncotriage-trap-probe",)),
+                          # Pass 20c-3c-2. The command never has to be real:
+                          # the trap raises before anything is spawned, and a
+                          # real command would let a FAILED trap succeed
+                          # quietly instead of raising FileNotFoundError.
+                          ("subprocess.run", subprocess.run,
+                           (["oncotriage-trap-probe"],)),
+                          ("subprocess.Popen", subprocess.Popen,
+                           (["oncotriage-trap-probe"],))):
     try:
         _fn(*_args)
         armed[_name] = False
@@ -1273,12 +1336,32 @@ print(json.dumps({"heavy": heavy, "armed": armed}))
 #                         traps are what bound that exception: an object is
 #                         constructed, and no socket, database, file or model is
 #                         touched while doing it.
-_MODULES_UNDER_TRAP = 42
+#
+# PASS 20c-3c-2 ADDS SIX: retrieval.qdrant_backup, orchestration,
+# orchestration.home, orchestration.airflow_setup, orchestration.dag_generator
+# and orchestration.airflow_manager -- five modules and one package __init__.
+# It also adds TWO TRAPS, subprocess.run and subprocess.Popen, because three of
+# the six are the only modules in the package that spawn processes and no
+# existing trap could see one. The three that matter here:
+#
+#   retrieval.qdrant_backup   was "29- Download Qdrant Data.py", the LAST file
+#                             in the repository with no __main__ guard and no
+#                             function at all. Loading it created a directory,
+#                             listed every Qdrant collection and scrolled every
+#                             point over the network. The open, io.open and
+#                             socket traps are all three of the things it did.
+#   orchestration.airflow_setup    ran `airflow db migrate` and `airflow db
+#                             check` at load before item 20b -- subprocess.run.
+#   orchestration.airflow_manager  launched the API server AND the scheduler at
+#                             load before item 20b and left them running --
+#                             subprocess.Popen, the heaviest import-time side
+#                             effect this project has ever had.
+_MODULES_UNDER_TRAP = 48
 
 _rc, _out, _err = _run(_PURITY, cwd=_ELSEWHERE, extra_path=_FALLBACK_PATH)
 check(f"all {_MODULES_UNDER_TRAP} package modules import with open, io.open, "
-      f"socket.socket, socket.create_connection and sqlite3.connect patched to "
-      f"raise", _rc, 0)
+      f"socket.socket, socket.create_connection, sqlite3.connect, "
+      f"subprocess.run and subprocess.Popen patched to raise", _rc, 0)
 if _rc != 0:
     fail("import purity",
          f"exit {_rc}; stderr tail: {_err.strip().splitlines()[-4:]}")
@@ -1290,9 +1373,11 @@ else:
     # the imports and must raise, so a run that proved nothing fails instead of
     # passing. The dict is checked whole, not key by key, so a trap that
     # disappears from the probe is a failure rather than an unnoticed omission.
-    check("every trap was ARMED after the imports (socket, sqlite3, open, io.open)",
+    check("every trap was ARMED after the imports (socket, sqlite3, open, "
+          "io.open, subprocess.run, subprocess.Popen)",
           _armed,
-          {"socket": True, "sqlite3": True, "open": True, "io.open": True})
+          {"socket": True, "sqlite3": True, "open": True, "io.open": True,
+           "subprocess.run": True, "subprocess.Popen": True})
     check("no model-bearing library was imported (torch / transformers / "
           "sentence_transformers / streamlit / langgraph / icd10)",
           _payload.get("heavy"), [])
@@ -1464,7 +1549,7 @@ _ALL_PKG_MODULES = sorted(
 )
 
 check("the module list is the size the tree says it is (non-degeneracy)",
-      len(_ALL_PKG_MODULES) >= 37, True)
+      len(_ALL_PKG_MODULES) >= 53, True)
 check("...and includes the one that used to resolve a path at import",
       "oncotriage.registries.mesh" in _ALL_PKG_MODULES, True)
 # Pass 20c-3a's three worst offenders, named individually so a module dropped
@@ -1511,6 +1596,23 @@ _DASHBOARD_MODULES = [
 ]
 check("...and covers all thirteen dashboard modules (new in pass 20c-3c-1)",
       sorted(m for m in _DASHBOARD_MODULES if m not in _ALL_PKG_MODULES), [])
+
+# Pass 20c-3c-2's five. retrieval.qdrant_backup is the one that matters most:
+# "29- Download Qdrant Data.py" was the LAST file in the repository with no
+# __main__ guard and no function -- every statement ran at module level, so
+# loading it created a directory, listed every Qdrant collection and scrolled
+# every point over the network. orchestration.dag_generator is second: File 23
+# assembled dag_content at module level and the middle third of it is
+# %-formatted with code_path, keys_path and data_trial_path, so building it
+# resolved THREE lazy paths at import. That is precisely what this sweep, run
+# with the project root pointed at a directory that does not exist, catches.
+for _added in ("oncotriage.retrieval.qdrant_backup",
+               "oncotriage.orchestration.home",
+               "oncotriage.orchestration.airflow_setup",
+               "oncotriage.orchestration.dag_generator",
+               "oncotriage.orchestration.airflow_manager"):
+    check(f"...and covers {_added} (new in pass 20c-3c-2)",
+          _added in _ALL_PKG_MODULES, True)
 
 _PER_MODULE_PROBE = (
     "import json, sys\n"

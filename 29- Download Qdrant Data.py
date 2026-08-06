@@ -1,161 +1,112 @@
+# Download Qdrant Data
+######################
+
 """
 Download ALL data from Qdrant Cloud before account deletion.
 
-Run from Spyder (after running 01, 02, 03):
-    exec(open(code_path + "29- Download Qdrant Data.py").read())
+Run from terminal:
+    python "29- Download Qdrant Data.py"                       # default location
+    python "29- Download Qdrant Data.py" --output-dir <scratch>
 
-The docstring here used to name "download_qdrant.py". No file of that name
-exists anywhere in the project -- item 20a checked. The downloader is this
-file; that line named a predecessor that is gone. It was a comment, so it
-never ran and never raised: `code_path` is referenced only inside this
-docstring, so this file has never depended on that name being bound. It is
-now defined in both branches of 01- Imports.py regardless.
+THIS FILE'S DOCUMENTED INVOCATION CHANGED, AND SO DID ITS BEHAVIOUR
+--------------------------------------------------------------------
+It used to say::
+
+    Run from Spyder (after running 01, 02, 03):
+        exec(open(code_path + "29- Download Qdrant Data.py").read())
+
+That worked because EVERY STATEMENT IN THE FILE WAS AT MODULE LEVEL. It was the
+last unguarded file in the repository: reading it into any namespace, for any
+reason, created a directory, listed every collection in the Qdrant account,
+scrolled every point of every collection over the network with payloads AND
+vectors, wrote one JSON per collection and printed a summary. Item 20b guarded
+Files 15, 16, 17, 22 and 24 and never reached this one, because nothing loads it.
+
+Item 20c pass 3c-2 moved the body to
+``oncotriage/retrieval/qdrant_backup.py:download_all_collections(output_dir)``
+and put the call behind the ``__main__`` guard below. The old exec() line would
+now load cleanly and download NOTHING, which is worse than failing, so it is
+gone from this docstring rather than left as a trap.
+
+The header comment this replaced also said the file "Uses qdrant_client and
+results_path from exec chain". It never used ``results_path``: a scope-aware
+symtable pass over the original reports exactly two free names, ``data_path``
+and ``qdrant_client``, and the output directory was built from ``data_path``.
+The comment named the wrong variable from the day it was written.
+
+THE DESTINATION IS AN ARGUMENT NOW. ``download_all_collections`` requires it and
+has no default -- the same reasoning as ``empty_database(db_path, flag)``: a
+plausible thing to type while exploring a module must not start a full download
+of a cloud database. ``--output-dir`` overrides; with no flag this entry point
+passes ``qdrant_backup.default_output_dir()``, which is the historical
+destination, ``{data_path}/06- Qdrant Downloaded Data for Latest Full Run/``.
+
+NO RE-EXPORT SHIM. Nothing in the repository reads this file's namespace -- all
+27 top-level names it leaked were grepped against every .py, .md, .toml and .yml
+in the tree; the ones with hits (``Path``, ``json``, ``time``, ``c``, ``f``,
+``name``, ``info``, ``points``, ``offset``, ``size``, ...) are third-party
+imports and coincidental same-named locals in other files, and the distinctive
+ones (``all_points``, ``point_data``, ``scroll_result``, ``serialized_vectors``,
+``backup_files``, ``file_size_mb``, ``total_size``, ``vec_name``, ``vec_val``,
+``collection_info``) have no hit anywhere outside it.
 """
 
-
-# =====================================================================
-# Uses qdrant_client and results_path from exec chain (01 + 02 + 03)
-# =====================================================================
-
-import json
-import time
-from pathlib import Path
-
-output_dir = data_path + "06- Qdrant Downloaded Data for Latest Full Run/"
-Path(output_dir).mkdir(parents=True, exist_ok=True)
+import argparse
+import os
+import sys
 
 
-# =====================================================================
-# LIST ALL COLLECTIONS
-# =====================================================================
-
-collections = qdrant_client.get_collections().collections
-print(f"Found {len(collections)} collections:")
-for c in collections:
-    print(f"  - {c.name}")
-
+# Make the oncotriage package importable
+#---------------------------------------
+# See the same block in "04- FHIR Generate Data.py" and "16- Database Query.py".
 try:
-    all_aliases = qdrant_client.get_aliases()
-    print(f"\nAliases: {all_aliases}")
-except Exception:
-    pass
-
-print()
-
-
-# =====================================================================
-# DOWNLOAD EACH COLLECTION
-# =====================================================================
-
-for collection_info in collections:
-    name = collection_info.name
-
-    info = qdrant_client.get_collection(collection_name=name)
-    point_count = info.points_count
-
-    print(f"{'='*60}")
-    print(f"Collection: {name}")
-    print(f"  Points: {point_count}")
-
-    if point_count == 0:
-        print(f"  Empty. Skipping.")
-        continue
-
-    print(f"  Downloading...")
-
-    all_points = []
-    offset = None
-
-    while True:
-        scroll_result = qdrant_client.scroll(
-            collection_name=name,
-            limit=100,
-            offset=offset,
-            with_payload=True,
-            with_vectors=True,
-        )
-
-        points, next_offset = scroll_result
-
-        for point in points:
-            point_data = {
-                "id": point.id,
-                "payload": point.payload,
-            }
-
-            if isinstance(point.vector, dict):
-                serialized_vectors = {}
-                for vec_name, vec_val in point.vector.items():
-                    if hasattr(vec_val, 'indices'):
-                        serialized_vectors[vec_name] = {
-                            "type": "sparse",
-                            "indices": list(vec_val.indices),
-                            "values": list(vec_val.values),
-                        }
-                    else:
-                        serialized_vectors[vec_name] = {
-                            "type": "dense",
-                            "values": list(vec_val) if not isinstance(vec_val, list) else vec_val,
-                        }
-                point_data["vectors"] = serialized_vectors
-            elif point.vector is not None:
-                point_data["vectors"] = {
-                    "default": {
-                        "type": "dense",
-                        "values": list(point.vector),
-                    }
-                }
-
-            all_points.append(point_data)
-
-        if next_offset is None:
+    import oncotriage  # noqa: F401
+except ImportError:
+    for _candidate, _how in (
+        (os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals()
+         else None, "__file__"),
+        (os.getcwd(), "cwd"),
+    ):
+        if _candidate and os.path.isdir(os.path.join(_candidate, "oncotriage")):
+            if _candidate not in sys.path:
+                sys.path.insert(0, _candidate)
+            print(f"[Bootstrap] oncotriage package found at {_candidate} "
+                  f"(via {_how}); added to sys.path")
             break
-        offset = next_offset
+    else:
+        raise
+    del _candidate, _how
 
-        print(f"    {len(all_points)}/{point_count}...", end="\r")
-        time.sleep(0.05)
-
-    print(f"    {len(all_points)}/{point_count} done.    ")
-
-    output_file = Path(output_dir) / f"{name}.json"
-
-    with open(output_file, "w") as f:
-        json.dump(
-            {
-                "collection_name": name,
-                "point_count": len(all_points),
-                "downloaded_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                "points": all_points,
-            },
-            f,
-            indent=2,
-        )
-
-    file_size_mb = output_file.stat().st_size / (1024 * 1024)
-    print(f"  Saved: {output_file.name} ({file_size_mb:.1f} MB)")
-    print()
+from oncotriage.retrieval.qdrant_backup import (
+    default_output_dir,
+    download_all_collections,
+)
 
 
-# =====================================================================
-# SUMMARY
-# =====================================================================
+#------------------------------------------------------------------------------
 
-print("=" * 60)
-print("DOWNLOAD COMPLETE")
-print("=" * 60)
 
-backup_files = list(Path(output_dir).glob("*.json"))
-total_size = sum(f.stat().st_size for f in backup_files) / (1024 * 1024)
+def _parse_args(argv=None):
+    """--output-dir only. Defaults to None so that the historical destination is
+    resolved INSIDE the guard, not while building the parser -- ``data_path`` is
+    a lazy glob and `--help` must not fire it."""
+    parser = argparse.ArgumentParser(
+        description="Download every Qdrant collection (payloads and vectors) "
+                    "to one JSON file each."
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Destination directory. Default: "
+             "{data_path}/06- Qdrant Downloaded Data for Latest Full Run/",
+    )
+    return parser.parse_args(argv)
 
-print(f"  Directory: {output_dir}")
-print(f"  Collections: {len(backup_files)}")
-print(f"  Total size: {total_size:.1f} MB")
 
-for f in sorted(backup_files):
-    size = f.stat().st_size / (1024 * 1024)
-    print(f"    {f.name}: {size:.1f} MB")
-
-print(f"\nQdrant data is safe.")
+if __name__ == "__main__":
+    _args = _parse_args()
+    _destination = _args.output_dir if _args.output_dir else default_output_dir()
+    download_all_collections(_destination)
 
 
 #------------------------------------------------------------------------------
@@ -168,4 +119,3 @@ Created on Sun Apr 12 13:17:38 2026
 
 @author: ramyalsaffar
 """
-

@@ -67,6 +67,38 @@ ENV_KEYS_PATH = "ONCOTRIAGE_KEYS_PATH"
 ENV_DATA_TRIAL_PATH = "ONCOTRIAGE_DATA_TRIAL_PATH"
 """Directory the trial scrape writes into. 23- Airflow DAG.py's DAG only."""
 
+ENV_AIRFLOW_PASSWORD = "ONCOTRIAGE_AIRFLOW_PASSWORD"
+"""Admin password for the Airflow REST API v2.
+
+NOT A PATH, which is why it is resolved by its own function below rather than
+by ``_from_env``: that helper runs every value through ``with_trailing_sep``,
+and a password ending in a slash-or-separator is not a directory.
+
+ADDED BY PASS 20c-3c-2, and it replaces a route that stopped working when
+"24- Airflow Manager.py" became a thin entry point. That file used to hold
+``AIRFLOW_PASSWORD = None`` at module level, mutated through ``global`` by its
+own ``_get_password()``, and it PRINTED "SET AIRFLOW_PASSWORD in this file" as
+the instruction to the operator. Once the functions moved into
+``oncotriage.orchestration.airflow_manager``, "this file" became the wrong
+file: a name bound in the entry point's namespace is not the package module's
+global, so following that printed instruction would have set a variable nothing
+reads, and the module would have gone on reading the password file as if the
+operator had set nothing. It would not have raised. It would have worked, right
+up to the first time the operator wanted a password OTHER than the generated
+one -- and then it would have used the generated one and reported success.
+
+The route is explicit now, in four tiers, and ``airflow_manager`` prints which
+one it took:
+
+    1. the ``password=`` argument on check_dag_status / trigger_dag / _get_token
+    2. ``airflow_manager.set_airflow_password(...)``   (the in-process setter)
+    3. this environment variable
+    4. {airflow_path}/simple_auth_manager_passwords.json.generated
+
+Tiers 1-3 are new; tier 4 is what File 24 always did and is still the default
+for the ordinary case, where Airflow generated the password and nobody chose it.
+"""
+
 
 # ---------------------------------------------------------------------------
 # Fallbacks
@@ -164,6 +196,37 @@ def resolve_keys_path(fallback):
 def resolve_data_trial_path(fallback):
     """Resolve the trial-data directory for the generated Airflow DAG."""
     return _from_env(ENV_DATA_TRIAL_PATH, fallback)
+
+
+def resolve_airflow_password():
+    """Resolve the Airflow admin password from the environment.
+
+    DELIBERATELY NOT ``_from_env``. That helper appends a trailing separator,
+    which is correct for every directory above and silently corrupts a
+    credential. This is the whole reason it is a separate function rather than
+    a fifth line in the table.
+
+    Returns:
+        (password, source) where source is ENV_AIRFLOW_PASSWORD when the
+        variable was set to a non-empty value, or None when it was not. The
+        caller decides what to do with "not set" -- unlike a path, there is no
+        fallback that could be right, so this function does not invent one.
+
+    Whitespace is stripped, and a value that is empty or whitespace-only counts
+    as unset. That matches every other variable here and it is the common case
+    worth handling: `export ONCOTRIAGE_AIRFLOW_PASSWORD=$(cat file)` carries the
+    file's trailing newline, and sending that newline to the auth endpoint fails
+    with a 401 that names nothing. A password whose meaning depends on its own
+    leading or trailing whitespace cannot be set this way; set it with
+    ``airflow_manager.set_airflow_password()``, which strips nothing.
+
+    Never returns the value in an exception message or a log line: the callers
+    print the SOURCE, not the secret.
+    """
+    raw = os.environ.get(ENV_AIRFLOW_PASSWORD)
+    if raw is not None and raw.strip() != "":
+        return raw.strip(), ENV_AIRFLOW_PASSWORD
+    return None, None
 
 
 #------------------------------------------------------------------------------
