@@ -83,14 +83,22 @@ from oncotriage.utils import get_age_reference_date as _get_age_reference_date_p
 # because they were defined inside the text exec'd into the shared namespace,
 # and that is not a detail — it is a seam the test and fixture harnesses use:
 #
-#   '36- Logging Contract Test.py'      rebinds qdrant_client to a stub
-#   '37- Retrieval Observability Test.py'  rebinds it via swap_globals()
 #   '45- Fixture Capture.py'            rebinds qdrant_client to a recording proxy
 #   '46- Fixture Replay.py'             rebinds it to a replaying proxy
-#   '38- Birth Date and Demographics Parser Test.py'
-#                                       rebinds DATA_SNAPSHOT_DATE to "", "2026",
-#                                       "2026-03" and "not a date" and requires
-#                                       get_age_reference_date() to raise at each
+#
+# THAT LIST USED TO HAVE THREE MORE ENTRIES AND NOW HAS TWO, which is a fact
+# about the consumers rather than about this seam:
+#
+#   Files 36 and 37 rebound qdrant_client until pass 20c-2c. They install
+#   deps.set_override(deps.QDRANT_CLIENT, ...) now; File 37's swap_globals()
+#   survives as a tool it no longer uses on this name.
+#   File 38 rebound DATA_SNAPSHOT_DATE until pass 20d-1. It sets
+#   config.DATA_SNAPSHOT_DATE now -- the attribute the package function reads at
+#   call time -- for the four values that must raise.
+#
+# All three live in tests/ as of pass 20d-1; tests/FILE NUMBER MAPPING.md is
+# the mapping. The wrappers stay for Files 45 and 46, which are still in the
+# chain and still rebind.
 #
 # The package functions take the value as an argument instead. These wrappers
 # are defined HERE, inside the exec'd text, so their __globals__ IS the shared

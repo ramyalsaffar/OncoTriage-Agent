@@ -22,7 +22,7 @@ somebody else had filled -- which meant the command in its own ``__main__``
 docstring, ``python "20- Drift Detection.py"``, could never work. It does now.
 
 Its two database calls read a bare ``inferences_path`` global, and
-"41- ECOG Availability Metric Test.py" REBOUND that global to keep its
+"tests/test_monitoring_ecog_availability_drift.py" REBOUND that global to keep its
 round-trip test off the production database. That was the last writer in the
 repository whose isolation rested on rebinding a shared global; every function
 here takes ``db_path``.

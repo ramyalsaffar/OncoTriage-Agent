@@ -195,7 +195,7 @@ been accumulating in the prompt since the corpus was generated.
 ### The empty sparse vector question, settled
 
 Both halves were measured before any code was written, and are re-measured by
-`37- Retrieval Observability Test.py`.
+`tests/test_agent_retrieval_observability.py`.
 
 1. **Can a query tokenize to nothing?** Yes. FastEmbed `Qdrant/bm25` returns
    zero indices for an empty string, whitespace, punctuation-only and
@@ -361,7 +361,7 @@ inference path; the rest are in tooling, dashboards, or tests.
 | Location | Verdict |
 |---|---|
 | `oncotriage/dashboard/tabs/performance.py:388, 504` | **Acceptable.** Optional plot annotations; failing to draw a callout must not take down the chart. |
-| `39- ECOG Performance Status Surfacing Test.py:126, 130` | **Acceptable.** `check_raises()`'s own harness: both branches increment `_RESULTS` and print, so they are `RECORDED+LOGGED`, not silent. Listed here only because the file is new. |
+| `tests/test_fhir_ecog_surfacing.py:162, 166` | **Acceptable.** `check_raises()`'s own harness: both branches increment `_RESULTS` and print, so they are `RECORDED+LOGGED`, not silent. Listed here only because the file is new. |
 | `oncotriage/dashboard/tabs/patient_explorer.py:281, 363`, `oncotriage/dashboard/tabs/reproducibility.py:973, 1210, 1333` | **Open — low.** Malformed `criterion_details` JSON is treated as "no criteria", so a parse failure and a genuinely empty criteria list render identically. A per-page count of unparseable rows would separate them. Read-only display, no effect on stored data. |
 
 ---
@@ -414,7 +414,7 @@ a pre-migration row, for a patient with no observation, and for a patient whose
 observations were all unusable. `ecog_selection` is what separates the three,
 and `ecog_value = 0` is a real, fully-active patient. Both confusions are the
 ones the column set exists to prevent — see the schema comment in
-`14- Database Logger.py` and `40- ECOG Logging Test.py` section 5.
+`14- Database Logger.py` and `tests/test_storage_ecog_logging.py` section 5.
 
 ---
 
@@ -516,10 +516,35 @@ Per file, handlers / of which silent:
 | `oncotriage/ablation/analysis.py` (was `27- Ablation Analysis.py`) | 2 | 0 |
 | `oncotriage/retrieval/qdrant_backup.py` (was `29- Download Qdrant Data.py`) | 1 | 0 |
 | `oncotriage/evaluation/cohort_diff.py` (was `34- Cohort Selector Diff.py`) | 2 | 0 |
-| `37- Retrieval Observability Test.py` | 1 | 0 |
-| `38- Birth Date and Demographics Parser Test.py` | 3 | 0 |
-| `39- ECOG Performance Status Surfacing Test.py` | 2 | 0 |
-| **Total** | **122** | **23** |
+| `tests/test_agent_retrieval_observability.py` | 1 | 0 |
+| `tests/test_fhir_birth_date_and_demographics.py` | 3 | 0 |
+| `tests/test_fhir_ecog_surfacing.py` | 2 | 0 |
+| `tests/` bootstrap (pass 20d-1) — one per moved file, eleven in all | 11 | 0 |
+| **Total** | **133** | **23** |
+
+**PASS 20d-1 ADDED ELEVEN HANDLERS OF ONE SHAPE, and they are counted as one
+row above rather than eleven near-identical ones.** Each of the eleven component
+tests that moved into `tests/` carries the package-import bootstrap Files 47, 48
+and 49 already carried:
+
+```python
+try:
+    import oncotriage                       # noqa: F401
+except ImportError:
+    for _candidate, _how in (...):
+        if _candidate and os.path.isdir(os.path.join(_candidate, "oncotriage")):
+            ...
+            break
+    else:
+        raise                               # <- RE-RAISED
+```
+
+**RE-RAISED**, on the `for ... else` — the handler recovers only when it has
+actually found the package and said so on stdout, and re-raises the original
+`ImportError` otherwise. It is compliant with the standing rule by construction
+and adds nothing to the SILENT column. The line numbers of the rows above for
+the three files that already had handlers were re-derived after the move; the
+rest of this inventory predates pass 20d-1 for those three files only.
 
 ### Note on file names and line numbers after item 20c (read before using this table)
 
@@ -689,9 +714,9 @@ task.
 | `oncotriage/retrieval/qdrant_backup.py` | 178 | `Exception` | RECORDED+LOGGED | `summary['aliases_error'] = repr(e) \| print(f"\nAliases: unavailable ({type(e).__name__}: {e})") \| print("  Continuing -- the download does not use them.")` |
 | `oncotriage/evaluation/cohort_diff.py` | 340 | `(OSError, json.JSONDecodeError)` | RECORDED+LOGGED | `read_errors.append({'file': patient_file.name, 'error': f"{type(e).__name__}: {e}"}) \| print(f" ERRO...` |
 | `oncotriage/evaluation/cohort_diff.py` | 563 | `OSError` | LOGGED | `print(f"ERROR writing report: {type(e).__name__}: {e}") \| return False` |
-| `37- Retrieval Observability Test.py` | 548 | `Exception` | LOGGED | `print(f" SKIP no reachable Qdrant " f"({type(_probe_error).__name__}: {str(_probe_error)[:120]})") \|...` |
-| `38- Birth Date and Demographics Parser Test.py` | 133 | `Exception` | RECORDED+LOGGED | `_RESULTS["failed"] += 1 \| _FAILURES.append(f"{label}\n raised: {type(exc).__name__}: {exc}") \| print...` |
-| `38- Birth Date and Demographics Parser Test.py` | 152 | `expected` | RECORDED+LOGGED | `_RESULTS["passed"] += 1 \| print(f" PASS {label}") \| return` |
-| `38- Birth Date and Demographics Parser Test.py` | 156 | `Exception` | RECORDED+LOGGED | `_RESULTS["failed"] += 1 \| _FAILURES.append(f"{label}\n expected: {expected.__name__}" f"\n actual: {...` |
-| `39- ECOG Performance Status Surfacing Test.py` | 126 | `exc_type` | RECORDED+LOGGED | `_RESULTS["passed"] += 1 \| print(f" PASS {label} ({type(exc).__name__})") \| return exc` |
-| `39- ECOG Performance Status Surfacing Test.py` | 130 | `Exception` | RECORDED+LOGGED | `_RESULTS["failed"] += 1 \| _FAILURES.append( f"{label}\n expected {exc_type.__name__}, " f"raised {ty...` |
+| `tests/test_agent_retrieval_observability.py` | 750 | `Exception` | LOGGED | `print(f" SKIP no reachable Qdrant " f"({type(_probe_error).__name__}: {str(_probe_error)[:120]})") \|...` |
+| `tests/test_fhir_birth_date_and_demographics.py` | 190 | `Exception` | RECORDED+LOGGED | `_RESULTS["failed"] += 1 \| _FAILURES.append(f"{label}\n raised: {type(exc).__name__}: {exc}") \| print...` |
+| `tests/test_fhir_birth_date_and_demographics.py` | 209 | `expected` | RECORDED+LOGGED | `_RESULTS["passed"] += 1 \| print(f" PASS {label}") \| return` |
+| `tests/test_fhir_birth_date_and_demographics.py` | 213 | `Exception` | RECORDED+LOGGED | `_RESULTS["failed"] += 1 \| _FAILURES.append(f"{label}\n expected: {expected.__name__}" f"\n actual: {...` |
+| `tests/test_fhir_ecog_surfacing.py` | 162 | `exc_type` | RECORDED+LOGGED | `_RESULTS["passed"] += 1 \| print(f" PASS {label} ({type(exc).__name__})") \| return exc` |
+| `tests/test_fhir_ecog_surfacing.py` | 166 | `Exception` | RECORDED+LOGGED | `_RESULTS["failed"] += 1 \| _FAILURES.append( f"{label}\n expected {exc_type.__name__}, " f"raised {ty...` |

@@ -27,7 +27,8 @@ Unit tests for two fixes that widen or narrow the candidate pool silently:
 No network, no LLM, no Qdrant. Pure function tests.
 
 Run from terminal (or F5 in Spyder):
-    python "33- Cancer Code and Stage Extraction Test.py"
+    python tests/test_registries_cancer_codes_and_stage_extraction.py
+    (was: python "33- Cancer Code and Stage Extraction Test.py")
 
 Exit codes:
     0 -- all assertions passed
@@ -37,28 +38,55 @@ Exit codes:
 
 # Run needed file
 #----------------
-# Item 20a: this file sits in the code directory, so __file__ locates it with
-# no hardcoded path. __file__ is bound when the file is run as a script (every
-# documented entry point for it) and when Spyder runfile()s it. In a bare
-# interactive paste it is not bound, and the working directory is the only
-# remaining candidate -- taken, but announced, never silently.
-import os as _os_boot
-if "__file__" in globals():
-    _code_dir = _os_boot.path.dirname(_os_boot.path.abspath(__file__)) + _os_boot.sep
-else:
-    _code_dir = _os_boot.getcwd() + _os_boot.sep
-    print(f"[Bootstrap] __file__ unbound; using the working directory as the code directory: {_code_dir}")
-del _os_boot
+# PASS 20d-1: THIS FILE IMPORTS THE PACKAGE. It used to exec "01- Imports.py"
+# and "02- Utility Functions.py" into its own globals and then exec_chain()
+# Files 08 and 10, which is how every name below used to arrive. Item 20c pass
+# 2a moved File 08 into oncotriage/registries/cancer_code_registry.py and File
+# 10 into oncotriage/extraction/, so each name comes from the module that
+# defines it -- including _is_negated, which the three-way extraction split put
+# in negation.py because it is the one name the stage half and the histology
+# half share.
+#
+# THE CANDIDATE DIRECTORY IS THE PARENT OF THIS FILE'S, not this file's own.
+# The same block Files 47, 48 and 49 carry looks one level up because this file
+# now sits in tests/ and the package sits BESIDE tests/, not inside it.
+# `pip install -e .` makes the whole block a no-op.
+import os
+import sys
 
-for _bootstrap in ("01- Imports.py", "02- Utility Functions.py"):
-    with open(_code_dir + _bootstrap) as _fh:
-        exec(_fh.read(), globals())
+try:
+    import oncotriage  # noqa: F401
+except ImportError:
+    for _candidate, _how in (
+        (os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+         if "__file__" in globals() else None, "__file__"),
+        (os.getcwd(), "cwd"),
+    ):
+        if _candidate and os.path.isdir(os.path.join(_candidate, "oncotriage")):
+            if _candidate not in sys.path:
+                sys.path.insert(0, _candidate)
+            print(f"[Bootstrap] oncotriage package found at {_candidate} "
+                  f"(via {_how}); added to sys.path")
+            break
+    else:
+        raise
+    del _candidate, _how
 
-exec_chain(
-    ["08- Cancer Code Registry.py", "10- Structured Eligibility Extractor.py"],
-    caller_file=_code_dir + "33- Cancer Code and Stage Extraction Test.py",
-    caller_globals=globals(),
-    chain_label="01 → 02 → 08 → 10",
+from oncotriage.constants import SYSTEM_KEY_ABSENT, SYSTEM_KEY_UNRECOGNIZED
+from oncotriage.extraction.negation import _is_negated
+from oncotriage.extraction.stage import (
+    _extract_stage_from_text,
+    _extract_stage_upper_bound_from_exclusion,
+    enrich_structured_eligibility,
+    get_stage_extraction_stats,
+    reset_stage_extraction_stats,
+)
+from oncotriage.registries.cancer_code_registry import (
+    _SNOMED_PRIMARY,
+    _SNOMED_SECONDARY,
+    get_cancer_classification_stats,
+    load_registry,
+    reset_cancer_classification_stats,
 )
 
 

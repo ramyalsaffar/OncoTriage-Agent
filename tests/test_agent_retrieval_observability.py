@@ -82,16 +82,18 @@ Covers:
 
 No LLM and no production database. Qdrant, the embedding call and the OpenAI
 client are replaced with stubs; the BM25 query model is the real one because
-Section A is a measurement of it. The database is a temporary file — File 14 is
-exec'd after inferences_path is repointed, so it is not listed in the chain.
+Section A is a measurement of it. The database is a temporary file — every
+log_inference() call passes db_path EXPLICITLY and asserts on the path the
+writer reports back.
 
 Section E is the only part that touches the network, it is read-only, and it
 reports SKIPPED rather than failing when no server is reachable. Point it at a
 local server with:
-    ONCOTRIAGE_QDRANT_PROBE_URL=http://localhost:6333 python "37- ..."
+    ONCOTRIAGE_QDRANT_PROBE_URL=http://localhost:6333 python tests/test_...py
 
 Run from terminal (or F5 in Spyder):
-    python "37- Retrieval Observability Test.py"
+    python tests/test_agent_retrieval_observability.py
+    (was: python "37- Retrieval Observability Test.py")
 
 Exit codes:
     0 -- all assertions passed
@@ -101,31 +103,81 @@ Exit codes:
 
 # Run needed file
 #----------------
-# Item 20a: this file sits in the code directory, so __file__ locates it with
-# no hardcoded path. __file__ is bound when the file is run as a script (every
-# documented entry point for it) and when Spyder runfile()s it. In a bare
-# interactive paste it is not bound, and the working directory is the only
-# remaining candidate -- taken, but announced, never silently.
-import os as _os_boot
-if "__file__" in globals():
-    _code_dir = _os_boot.path.dirname(_os_boot.path.abspath(__file__)) + _os_boot.sep
-else:
-    _code_dir = _os_boot.getcwd() + _os_boot.sep
-    print(f"[Bootstrap] __file__ unbound; using the working directory as the code directory: {_code_dir}")
-del _os_boot
+# PASS 20d-1: THIS FILE IMPORTS THE PACKAGE. It used to exec "01- Imports.py"
+# and "02- Utility Functions.py" into its own globals and then exec_chain()
+# "13- LangGraph Agent.py", which is how every name below used to arrive --
+# including QdrantClient and SparseVector, which came from File 01's verbatim
+# third-party import block.
+#
+# THE STORAGE LAYER IS IMPORTED HERE, NOT EXEC'D LATER. File 14 used to be
+# exec'd further down, AFTER inferences_path was repointed, because the shim's
+# log_inference wrapper reads globals().get("inferences_path"). That mechanism
+# is gone; mechanism 2 -- an explicit db_path on every call, asserted on the
+# path the writer returns -- is what this file already relied on. Measured
+# before the move: the three call sites are all `db_path=inferences_path`, and
+# Test 0 is the standing guard that omitting db_path resolves to PRODUCTION and
+# that production is not this file's scratch path.
+#
+# THE CANDIDATE DIRECTORY IS THE PARENT OF THIS FILE'S, not this file's own.
+# The same block Files 47, 48 and 49 carry looks one level up because this file
+# now sits in tests/ and the package sits BESIDE tests/, not inside it.
+# `pip install -e .` makes the whole block a no-op.
+import json
+import os
+import sqlite3
+import sys
 
-for _bootstrap in ("01- Imports.py", "02- Utility Functions.py"):
-    with open(_code_dir + _bootstrap) as _fh:
-        exec(_fh.read(), globals())
+from qdrant_client import QdrantClient
+from qdrant_client.models import SparseVector
 
-# 13 chains 03, 08, 09, 10 itself — do not list them again here.
-# 14 is deliberately NOT chained: it connects at load time, and this test
-# repoints inferences_path at a temporary file first (see below).
-exec_chain(
-    ["13- LangGraph Agent.py"],
-    caller_file=_code_dir + "37- Retrieval Observability Test.py",
-    caller_globals=globals(),
-    chain_label="01 → 02 → 13 (→ 03, 08, 09, 10)",
+try:
+    import oncotriage  # noqa: F401
+except ImportError:
+    for _candidate, _how in (
+        (os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+         if "__file__" in globals() else None, "__file__"),
+        (os.getcwd(), "cwd"),
+    ):
+        if _candidate and os.path.isdir(os.path.join(_candidate, "oncotriage")):
+            if _candidate not in sys.path:
+                sys.path.insert(0, _candidate)
+            print(f"[Bootstrap] oncotriage package found at {_candidate} "
+                  f"(via {_how}); added to sys.path")
+            break
+    else:
+        raise
+    del _candidate, _how
+
+from oncotriage.agent import deps
+from oncotriage.agent.evaluation import node_gpt4o_evaluation
+from oncotriage.agent.filtering import node_rule_based_filter
+from oncotriage.agent.retrieval import (
+    node_hybrid_retrieval,
+    node_query_expansion,
+)
+from oncotriage.agent.state import (
+    CHANNEL_ABLATED,
+    CHANNEL_EMPTY_QUERY,
+    CHANNEL_FAILED,
+    CHANNEL_OK,
+    EXPANSION_PATH_FALLBACK,
+    EXPANSION_PATH_MESH,
+    MESH_FILTER_APPLIED,
+    MESH_FILTER_SKIP_ABLATED,
+    MESH_FILTER_SKIP_NO_FILTER,
+    MESH_FILTER_SKIP_NO_TREES,
+    RETRIEVAL_CHANNELS,
+)
+from oncotriage.agent.terminal import (
+    node_error_handler,
+    node_finalize,
+    node_no_candidates,
+)
+from oncotriage.config import COLLECTION_NAME
+from oncotriage.paths import inferences_path
+from oncotriage.storage.database_logger import (
+    log_inference,
+    resolve_inference_db_path,
 )
 
 
@@ -166,32 +218,37 @@ def check_true(label: str, actual) -> None:
 # ===========================================================================
 # THROWAWAY DATABASE
 # ===========================================================================
-# TWO INDEPENDENT MECHANISMS KEEP THIS TEST OFF THE PRODUCTION DATABASE, and the
-# second arrived in pass 20c-2b because the first stopped being enough on its
-# own.
+# ONE MECHANISM KEEPS THIS TEST OFF THE PRODUCTION DATABASE, and it is the one
+# that never depended on a seam:
 #
-#   1. inferences_path is rebound before File 14 is loaded. That worked only
-#      because File 14 was exec'd into this namespace and read the name out of
-#      it. File 14 is now a shim over oncotriage/storage/database_logger.py, and
-#      a MODULE function cannot see a caller's globals; the redirect survives
-#      solely because the shim keeps a wrapper that passes
-#      globals().get("inferences_path") down. Had the shim re-exported the
-#      package function directly, every log_inference() call below would have
-#      written a real row into the real inferences.db while this file printed
-#      the name of a temporary one.
-#   2. Every log_inference() call passes db_path EXPLICITLY and asserts on the
-#      path the writer reports back, which depends on no seam at all.
+#   Every log_inference() call passes db_path EXPLICITLY and asserts on the path
+#   the writer reports back.
+#
+# THERE USED TO BE A SECOND, AND PASS 20d-1 RETIRED IT RATHER THAN LEAVING IT
+# LOOKING LIVE. It was: rebind inferences_path, then exec "14- Database
+# Logger.py" into this namespace so the shim's log_inference wrapper picked the
+# rebound value up through globals().get("inferences_path"). That worked only
+# while this file was part of the exec chain. It now imports
+# oncotriage.storage.database_logger directly, so the rebinding below reaches
+# the writer NOT AT ALL -- and saying so is the point, because a comment
+# claiming two mechanisms while one of them is inert is worse than having one.
 #
 # The rebinding stays because db_rows() reads back through
-# sqlite3.connect(inferences_path) and the two must name the same file.
+# sqlite3.connect(inferences_path) and it must name the same file the explicit
+# db_path argument names. Test 0 immediately below is what stops that from being
+# circular: it asserts the PACKAGE default is production and is not this scratch
+# path, so the explicit argument is doing real work and check_wrote_to_scratch()
+# can fail.
 
 _PRODUCTION_INFERENCES_PATH = inferences_path
 
 _TMP_DIR = tempfile.mkdtemp(prefix="oncotriage_retrieval_observability_")
 inferences_path = os.path.join(_TMP_DIR, "inferences_test.db")
 
-with open(_code_dir + "14- Database Logger.py") as _fh:
-    exec(_fh.read(), globals())
+# PASS 20d-1: the exec of "14- Database Logger.py" that stood here is now an
+# import at the top of the file. Mechanism 1 above is therefore GONE and
+# mechanism 2 is the whole protection -- which is what the bootstrap note says,
+# and what Test 0 immediately below proves is not vacuous.
 
 
 def check_wrote_to_scratch(label: str, reported_path) -> None:

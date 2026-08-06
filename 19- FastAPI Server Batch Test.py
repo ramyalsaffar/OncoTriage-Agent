@@ -83,7 +83,7 @@ for _bootstrap in ("01- Imports.py", "02- Utility Functions.py"):
 # resolve_inference_db_path and resolve_drift_db_path both honour it.
 #
 # SO THIS FILE DETECTS INSTEAD OF PREVENTING. Same shape as
-# "41- ECOG Availability Metric Test.py"'s _production_drift_rows(): count
+# "tests/test_monitoring_ecog_availability_drift.py"'s _production_drift_rows(): count
 # before, count after, fail if it moved. Detection is weaker than prevention and
 # it is what is available from here.
 #

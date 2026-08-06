@@ -35,9 +35,9 @@ module opens no client, loads no model, touches no database and reads nothing;
 afterwards to show they were armed.
 
 Its SOURCE TEXT is read by two tests, which point HERE and not at the shim:
-``38- Birth Date and Demographics Parser Test.py`` ast-parses it to prove the age
-path contains no clock call, and ``39- ECOG Performance Status Surfacing
-Test.py`` slices named function bodies out of it.
+``tests/test_fhir_birth_date_and_demographics.py`` ast-parses it to prove the age
+path contains no clock call, and ``tests/test_fhir_ecog_surfacing.py`` slices
+named function bodies out of it.
 """
 
 import json
@@ -168,7 +168,7 @@ _SYSTEM_URI_TO_KEY: Dict[str, str] = {
 #
 # They are not parser-private: oncotriage/registries/cancer_code_registry.py
 # branches on them to decide which code sets a coding may be looked up in, and
-# '33- Cancer Code and Stage Extraction Test.py' asserts on them while chaining
+# 'tests/test_registries_cancer_codes_and_stage_extraction.py' asserts on them while chaining
 # 01 -> 02 -> 08 -> 10 with no File 07 loaded at all. That is why they are a
 # module of their own -- oncotriage/constants.py imports NOTHING, so any of the
 # three can reach the same spelling without pulling the other two in.

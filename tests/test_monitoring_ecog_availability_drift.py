@@ -47,7 +47,8 @@ database test uses a throwaway SQLite file, so the real inferences.db is never
 opened.
 
 Run from terminal (or F5 in Spyder):
-    python "41- ECOG Availability Metric Test.py"
+    python tests/test_monitoring_ecog_availability_drift.py
+    (was: python "41- ECOG Availability Metric Test.py")
 
 Exit codes:
     0 -- all assertions passed
@@ -57,31 +58,69 @@ Exit codes:
 
 # Run needed file
 #----------------
-# Item 20a: this file sits in the code directory, so __file__ locates it with
-# no hardcoded path. __file__ is bound when the file is run as a script (every
-# documented entry point for it) and when Spyder runfile()s it. In a bare
-# interactive paste it is not bound, and the working directory is the only
-# remaining candidate -- taken, but announced, never silently.
-import os as _os_boot
-if "__file__" in globals():
-    _code_dir = _os_boot.path.dirname(_os_boot.path.abspath(__file__)) + _os_boot.sep
-else:
-    _code_dir = _os_boot.getcwd() + _os_boot.sep
-    print(f"[Bootstrap] __file__ unbound; using the working directory as the code directory: {_code_dir}")
-del _os_boot
+# PASS 20d-1: THIS FILE IMPORTS THE PACKAGE. It used to exec "01- Imports.py"
+# and "02- Utility Functions.py" into its own globals and then exec_chain()
+# Files 03 and 20, which is how `np`, `pd` and every drift name below used to
+# arrive. THIS FILE WAS THE ONLY CONSUMER OF FILE 20's SHIM -- CLAUDE.md says
+# so in as many words -- so after this pass nothing in the repository chains
+# File 20. Section 8b below still checks that the shim delivers its names, but
+# it now does so by exec'ing File 20 into a THROWAWAY namespace, because a
+# check written against this file's own globals would compare an imported name
+# with itself and pass forever.
+#
+# THE CANDIDATE DIRECTORY IS THE PARENT OF THIS FILE'S, not this file's own.
+# The same block Files 47, 48 and 49 carry looks one level up because this file
+# now sits in tests/ and the package sits BESIDE tests/, not inside it.
+# `pip install -e .` makes the whole block a no-op.
+import os
+import sqlite3
+import sys
+from pathlib import Path
 
-for _bootstrap in ("01- Imports.py", "02- Utility Functions.py"):
-    with open(_code_dir + _bootstrap) as _fh:
-        exec(_fh.read(), globals())
+import numpy as np
+import pandas as pd
 
-# 14 is deliberately NOT chained here: it connects at load time, and the one
-# database test below repoints inferences_path at a temporary file first.
-exec_chain(
-    ["03- Config.py", "20- Drift Detection.py"],
-    caller_file=_code_dir + "41- ECOG Availability Metric Test.py",
-    caller_globals=globals(),
-    chain_label="01 → 02 → 03 → 20",
+try:
+    import oncotriage  # noqa: F401
+except ImportError:
+    for _candidate, _how in (
+        (os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+         if "__file__" in globals() else None, "__file__"),
+        (os.getcwd(), "cwd"),
+    ):
+        if _candidate and os.path.isdir(os.path.join(_candidate, "oncotriage")):
+            if _candidate not in sys.path:
+                sys.path.insert(0, _candidate)
+            print(f"[Bootstrap] oncotriage package found at {_candidate} "
+                  f"(via {_how}); added to sys.path")
+            break
+    else:
+        raise
+    del _candidate, _how
+
+from oncotriage import config as _config
+from oncotriage.config import (
+    BASELINE_WINDOW_DAYS,
+    COMPARISON_WINDOW_DAYS,
+    ECOG_UNAVAILABLE_RATE_THRESHOLD,
+    MIN_SAMPLES_COMPARISON,
 )
+from oncotriage.monitoring import drift as _drift_pkg
+from oncotriage.monitoring.drift import (
+    SCIPY_AVAILABLE,
+    detect_data_availability,
+    ecog_unavailable_rate,
+    log_drift_metrics,
+    resolve_drift_db_path,
+    z_score_drift,
+)
+
+# The repository root, derived from the package's own location rather than from
+# this file's. `oncotriage/__init__.py` -> `oncotriage/` -> the code directory.
+# Section 8b needs it because "20- Drift Detection.py" is a numbered file, not
+# an importable module, and nothing but its own path can locate it.
+_CODE_DIR = os.path.dirname(
+    os.path.dirname(os.path.abspath(oncotriage.__file__))) + os.sep
 
 
 #------------------------------------------------------------------------------
@@ -521,10 +560,14 @@ print("=" * 70)
 #     expected list. An empty result is [] != ["df"], which fails. Never at
 #     risk.
 #
-# The shim is checked separately at the end of this section: the names still
-# have to reach the shared exec namespace, because that is how this file gets
-# them.
-_DRIFT_MODULE = "oncotriage/monitoring/drift.py"
+# The shim is checked separately at the end of this section. It is no longer
+# how THIS file gets its names -- pass 20d-1 made that an import -- so 8b exec's
+# File 20 into a throwaway namespace instead of inspecting this one.
+#
+# PASS 20d-1: the module path comes from the imported module's own __file__
+# rather than being a repo-relative string prefixed with _code_dir, which was
+# correct only while this file sat beside the package.
+_DRIFT_MODULE = os.path.abspath(_drift_pkg.__file__)
 
 
 def _function_body(filename: str, function_name: str) -> str:
@@ -534,7 +577,7 @@ def _function_body(filename: str, function_name: str) -> str:
     constructs, and this function's docstring explains at length why a z-score
     against baseline is wrong — which a naive grep reads as a z-score.
     """
-    text = Path(_code_dir + filename).read_text(encoding="utf-8")
+    text = Path(filename).read_text(encoding="utf-8")
     for node in ast.parse(text).body:
         if not (isinstance(node, ast.FunctionDef) and node.name == function_name):
             continue
@@ -566,7 +609,7 @@ check("threshold is not a literal in the function body", "0.20" in _src, False)
 
 # Signature: one frame in, so there is no baseline to compare against even by
 # accident.
-_sig_text = Path(_code_dir + _DRIFT_MODULE).read_text(encoding="utf-8")
+_sig_text = Path(_DRIFT_MODULE).read_text(encoding="utf-8")
 _sig_defs = [n for n in ast.parse(_sig_text).body if isinstance(n, ast.FunctionDef)]
 check("the module parsed to a non-empty set of top-level functions",
       len(_sig_defs) >= 10, True)
@@ -622,14 +665,14 @@ check("...and the detector does see the ATTRIBUTE form it is meant to allow, "
 # a shim that re-exports it and carries no comment of its own, so a grep for
 # the rationale has to look where the rationale is. Both greps target the same
 # file so they cannot disagree about which file "the config module" means.
-_CONFIG_TEXT = Path(_code_dir + "oncotriage/config.py").read_text(encoding="utf-8")
+_CONFIG_TEXT = Path(os.path.abspath(_config.__file__)).read_text(encoding="utf-8")
 check("the threshold constant lives in the config module",
       "ECOG_UNAVAILABLE_RATE_THRESHOLD" in _CONFIG_TEXT, True)
 check("and is marked as an uncalibrated holding value",
       "HOLDING VALUE, NOT CALIBRATED" in _CONFIG_TEXT, True)
 check("and the shim re-exports it, so the exec chain still sees the name",
       "ECOG_UNAVAILABLE_RATE_THRESHOLD" in
-      Path(_code_dir + "03- Config.py").read_text(encoding="utf-8"), True)
+      Path(_CODE_DIR + "03- Config.py").read_text(encoding="utf-8"), True)
 
 # The runner and the printer must both know about the new category, or the
 # metric is computed and then never shown.
@@ -648,30 +691,89 @@ check("print_drift_details renders the category",
 # ===========================================================================
 #
 # Everything above reads oncotriage/monitoring/drift.py, which is where the
-# definitions are. But THIS FILE reaches them by exec-chaining
-# "20- Drift Detection.py" and picking them out of the shared namespace, so a
-# shim that stopped re-exporting one of them would break this test in a way none
-# of the structural checks above could see -- they read the package and would
-# keep passing.
+# definitions are. This section is about "20- Drift Detection.py", the shim over
+# it: a shim that stopped re-exporting one of these names would break every
+# caller that loads it in a way none of the structural checks above could see --
+# they read the package and would keep passing.
 #
 # The two are asserted to be the same objects, not merely present, so a shim
 # that shadowed a name with a definition of its own would fail here.
+#
+# PASS 20d-1 CHANGED HOW THE SHIM'S NAMESPACE IS OBTAINED, and it had to. This
+# section used to inspect THIS FILE'S globals(), which was meaningful only while
+# this file got its names by exec-chaining the shim. It imports them now, so
+# `globals().get(name) is getattr(_drift_pkg, name)` would be an imported name
+# compared with itself: TRUE BY CONSTRUCTION, ten checks that can never fail,
+# for exactly as long as nobody notices. The blind spot CLAUDE.md names -- an
+# equivalence proof cannot see a check that has stopped checking -- is precisely
+# this shape.
+#
+# So the shim is exec'd into a THROWAWAY namespace and that namespace is what is
+# inspected. Which is also strictly better than what was here before: it tests
+# the shim itself rather than testing it via one particular caller, and it keeps
+# working when the last exec-chain consumer disappears -- which this pass is
+# what did. File 41 was the ONLY consumer of File 20's shim.
+#
+# SHOWN TO FAIL, 2026-08-06, as CLAUDE.md requires of any assertion that
+# changes. The demonstration ran out of band -- it is NOT shipped here, because
+# pass 20d-1's acceptance criterion is that this file report the SAME number of
+# checks it reported before, and a control baked in would have raised it. The
+# mutation was made to an in-memory COPY of the shim's source; nothing on disk
+# was touched, and the file's sha256 was compared before and after:
+#
+#   ks_test_drift removed from the copy's re-export list
+#     FAIL  ks_test_drift in the shim's namespace is the package's own object
+#             expected: True   actual: False
+#     ...and the other nine, including z_score_drift, still PASSED, so the
+#     control is surgical rather than a wholesale break.
+#   111 passed, 1 failed;  sha256 before == sha256 after: True
+#
+# Unmutated, all ten pass. The check the control fires on is the one this
+# section exists for, and it is the check that would have become TRUE BY
+# CONSTRUCTION had the namespace stayed this file's own.
 
 print("\n" + "=" * 70)
-print("8b. the shim re-exports what this file reads out of the namespace")
+print("8b. the shim re-exports what a caller reads out of the namespace")
 print("=" * 70)
 
-import oncotriage.monitoring.drift as _drift_pkg
+_SHIM_PATH = _CODE_DIR + "20- Drift Detection.py"
 
-for _exported in ("ecog_unavailable_rate", "detect_data_availability",
-                  "log_drift_metrics", "print_drift_details",
-                  "run_drift_detection", "z_score_drift", "ks_test_drift",
-                  "calculate_psi", "resolve_drift_db_path"):
-    check(f"{_exported} in the exec namespace is the package's own object",
-          globals().get(_exported) is getattr(_drift_pkg, _exported), True)
+# A named failure rather than a FileNotFoundError traceback if the shim moves.
+# NOT a check(): this section's count is pinned, and a guard is not a check.
+if not os.path.isfile(_SHIM_PATH):
+    raise AssertionError(
+        f"the drift shim is not where this check expects it: {_SHIM_PATH}. "
+        f"It is located from oncotriage.__file__, so this means File 20 moved "
+        f"or was deleted, not that this test moved."
+    )
+
+_SHIM_SOURCE = Path(_SHIM_PATH).read_text(encoding="utf-8")
+
+
+def _exec_shim(source: str) -> dict:
+    """Exec the shim's source into a fresh namespace and return it.
+
+    __name__ is set the way exec_chain sets it, so the shim's `__main__` block
+    does not fire and run drift detection against the production database.
+    """
+    namespace = {"__name__": "_exec_chain_", "__file__": _SHIM_PATH}
+    exec(compile(source, _SHIM_PATH, "exec"), namespace)
+    return namespace
+
+
+_SHIM_NS = _exec_shim(_SHIM_SOURCE)
+
+_SHIM_EXPORTS = ("ecog_unavailable_rate", "detect_data_availability",
+                 "log_drift_metrics", "print_drift_details",
+                 "run_drift_detection", "z_score_drift", "ks_test_drift",
+                 "calculate_psi", "resolve_drift_db_path")
+
+for _exported in _SHIM_EXPORTS:
+    check(f"{_exported} in the shim's namespace is the package's own object",
+          _SHIM_NS.get(_exported) is getattr(_drift_pkg, _exported), True)
 
 check("SCIPY_AVAILABLE reached the namespace too",
-      SCIPY_AVAILABLE is _drift_pkg.SCIPY_AVAILABLE, True)
+      _SHIM_NS.get("SCIPY_AVAILABLE") is _drift_pkg.SCIPY_AVAILABLE, True)
 
 # The scipy guard is a real ImportError guard now, not a NameError guard on
 # somebody else's namespace. Asserted from the AST, because the flag being True

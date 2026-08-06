@@ -18,7 +18,7 @@ argument is now doubly true: they sit in different MODULES too.
 # not in the file that produces them, because producer and consumers sit in
 # different exec_chain chains and cannot see each other's module constants:
 # '07- FHIR Parser.py' writes them, '08- Cancer Code Registry.py' branches on
-# them, and '33- Cancer Code and Stage Extraction Test.py' chains
+# them, and 'tests/test_registries_cancer_codes_and_stage_extraction.py' chains
 # 01 -> 02 -> 08 -> 10 with no File 07 in it at all. File 01 is the only file
 # every bootstrap loads first, so it is the only place all three can share one
 # spelling -- and File 01 now gets them from here. Everything else about coding

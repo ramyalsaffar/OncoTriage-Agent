@@ -12,7 +12,7 @@ Every definition moved to ``oncotriage/monitoring/drift.py``. This file
 re-exports the fifteen names File 20 bound and keeps its ``__main__`` block.
 
 IT KEEPS A SHIM BECAUSE ONE FILE CHAINS IT.
-``41- ECOG Availability Metric Test.py`` line 80 exec-chains this file and then
+``tests/test_monitoring_ecog_availability_drift.py`` line 80 exec-chains this file and then
 reads ``ecog_unavailable_rate``, ``detect_data_availability``,
 ``log_drift_metrics``, ``print_drift_details``, ``run_drift_detection``,
 ``z_score_drift``, ``ks_test_drift``, ``calculate_psi`` and
@@ -46,7 +46,7 @@ Run from terminal:
 # Make the oncotriage package importable
 #---------------------------------------
 # THIS FILE IS STILL EXEC'D, unlike Files 15, 16, 17 and 25:
-# "41- ECOG Availability Metric Test.py" exec-chains it INTO an already-populated
+# "tests/test_monitoring_ecog_availability_drift.py" exec-chains it INTO an already-populated
 # namespace, and the names re-exported below have to land in the CALLER's globals
 # -- which only an exec'd file can arrange. Under exec_chain __name__ is
 # "_exec_chain_", so the __main__ block at the bottom does not fire.

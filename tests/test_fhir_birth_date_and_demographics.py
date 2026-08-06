@@ -57,13 +57,14 @@ Covers:
     9. END TO END — log_inference() writes age_reference_date and
        birth_date_precision into a throwaway database.
 
-No network and no LLM: File 13 is inspected as source rather than executed, so
+No network and no LLM: the agent is inspected as source rather than imported, so
 no model or Qdrant client is touched. The database is a temporary file; the
-real inferences.db is never opened — File 14 is exec'd after inferences_path is
-repointed, so it is not listed in the chain below.
+real inferences.db is never opened — log_inference is called with db_path
+EXPLICITLY and the path it reports back is asserted.
 
 Run from terminal (or F5 in Spyder):
-    python "38- Birth Date and Demographics Parser Test.py"
+    python tests/test_fhir_birth_date_and_demographics.py
+    (was: python "38- Birth Date and Demographics Parser Test.py")
 
 Exit codes:
     0 -- all assertions passed
@@ -73,30 +74,75 @@ Exit codes:
 
 # Run needed file
 #----------------
-# Item 20a: this file sits in the code directory, so __file__ locates it with
-# no hardcoded path. __file__ is bound when the file is run as a script (every
-# documented entry point for it) and when Spyder runfile()s it. In a bare
-# interactive paste it is not bound, and the working directory is the only
-# remaining candidate -- taken, but announced, never silently.
-import os as _os_boot
-if "__file__" in globals():
-    _code_dir = _os_boot.path.dirname(_os_boot.path.abspath(__file__)) + _os_boot.sep
-else:
-    _code_dir = _os_boot.getcwd() + _os_boot.sep
-    print(f"[Bootstrap] __file__ unbound; using the working directory as the code directory: {_code_dir}")
-del _os_boot
+# PASS 20d-1: THIS FILE IMPORTS THE PACKAGE. It used to exec "01- Imports.py"
+# and "02- Utility Functions.py" into its own globals and then exec_chain()
+# Files 03 and 07, which is how every name below used to arrive.
+#
+# SECTION 3'S NEGATIVE CASES MOVED WITH THE SEAM, and this is the one place in
+# the pass where leaving the code alone would have broken a test rather than
+# preserved it. Section 3 rebound DATA_SNAPSHOT_DATE in this file's globals and
+# required get_age_reference_date() to raise. That worked because File 02's
+# wrapper passed globals().get("DATA_SNAPSHOT_DATE") down. The package function
+# reads `config.DATA_SNAPSHOT_DATE` AT CALL TIME -- which its own docstring
+# names as the supported way to patch it -- so the module-world statement of
+# exactly the same fact is to set the attribute on the config module. Same call
+# shape, same four bad values, same raise, same count. Rebinding the name here
+# instead would have reached nothing and turned four raises into four silent
+# passes-that-do-not-raise, i.e. four FAILURES; it would not have gone green,
+# but it would have been the wrong repair.
+#
+# THE STORAGE LAYER IS IMPORTED HERE, NOT EXEC'D LATER, for the reason given at
+# the throwaway-database block below.
+#
+# THE CANDIDATE DIRECTORY IS THE PARENT OF THIS FILE'S, not this file's own.
+# The same block Files 47, 48 and 49 carry looks one level up because this file
+# now sits in tests/ and the package sits BESIDE tests/, not inside it.
+# `pip install -e .` makes the whole block a no-op.
+import json
+import os
+import sqlite3
+import sys
+from datetime import date, datetime
 
-for _bootstrap in ("01- Imports.py", "02- Utility Functions.py"):
-    with open(_code_dir + _bootstrap) as _fh:
-        exec(_fh.read(), globals())
+try:
+    import oncotriage  # noqa: F401
+except ImportError:
+    for _candidate, _how in (
+        (os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+         if "__file__" in globals() else None, "__file__"),
+        (os.getcwd(), "cwd"),
+    ):
+        if _candidate and os.path.isdir(os.path.join(_candidate, "oncotriage")):
+            if _candidate not in sys.path:
+                sys.path.insert(0, _candidate)
+            print(f"[Bootstrap] oncotriage package found at {_candidate} "
+                  f"(via {_how}); added to sys.path")
+            break
+    else:
+        raise
+    del _candidate, _how
 
-# 14 is deliberately NOT chained: it connects at load time, and this test
-# repoints inferences_path at a temporary file first (see below).
-exec_chain(
-    ["03- Config.py", "07- FHIR Parser.py"],
-    caller_file=_code_dir + "38- Birth Date and Demographics Parser Test.py",
-    caller_globals=globals(),
-    chain_label="01 → 02 → 03 → 07",
+from oncotriage import config
+from oncotriage.config import DATA_SNAPSHOT_DATE
+from oncotriage.fhir import parser as _fhir_parser
+from oncotriage.fhir.parser import (
+    BIRTH_DATE_PRECISION_COUNTS,
+    _calculate_age,
+    _parse_demographics,
+    parse_fhir_bundle,
+)
+from oncotriage.paths import inferences_path
+from oncotriage.registries.primary_cancer import _resolve_primary_cancer
+from oncotriage.storage.database_logger import (
+    log_inference,
+    resolve_inference_db_path,
+)
+from oncotriage.utils import (
+    PARTIAL_DATE_ANCHOR_DAY,
+    PARTIAL_DATE_ANCHOR_MONTH,
+    PARTIAL_DATE_DEGRADATIONS,
+    get_age_reference_date,
+    parse_partial_date,
 )
 
 
@@ -179,32 +225,28 @@ def check_raises(label: str, fn, expected) -> None:
 # ===========================================================================
 # THROWAWAY DATABASE
 # ===========================================================================
-# TWO INDEPENDENT MECHANISMS KEEP THIS TEST OFF THE PRODUCTION DATABASE, and the
-# second arrived in pass 20c-2b because the first stopped being enough on its
-# own.
+# ONE MECHANISM KEEPS THIS TEST OFF THE PRODUCTION DATABASE, and it is the one
+# that never depended on a seam:
 #
-#   1. inferences_path is rebound before File 14 is loaded. That worked only
-#      because File 14 was exec'd into this namespace and read the name out of
-#      it. File 14 is now a shim over oncotriage/storage/database_logger.py, and
-#      a MODULE function cannot see a caller's globals; the redirect survives
-#      solely because the shim keeps a wrapper passing
-#      globals().get("inferences_path") down. Had the shim re-exported the
-#      package function directly, section 9 below would have written a real row
-#      into the real inferences.db -- including the INSERT it makes by hand --
-#      while this file printed the name of a temporary one.
-#   2. log_inference is called with db_path EXPLICITLY and the path it reports
-#      back is asserted, which depends on no seam at all.
+#   log_inference is called with db_path EXPLICITLY and the path it reports back
+#   is asserted.
+#
+# THERE USED TO BE A SECOND, AND PASS 20d-1 RETIRED IT RATHER THAN LEAVING IT
+# LOOKING LIVE. It was: rebind inferences_path, then exec "14- Database
+# Logger.py" into this namespace so the shim's log_inference wrapper picked the
+# rebound value up through globals().get("inferences_path"). That worked only
+# while this file was part of the exec chain; it now imports
+# oncotriage.storage.database_logger directly, so the rebinding below reaches
+# the writer NOT AT ALL.
 #
 # The rebinding stays because section 9 reads back through
-# sqlite3.connect(inferences_path) and the two must name the same file.
+# sqlite3.connect(inferences_path) and the two must name the same file. The
+# discrimination block immediately below is what stops that from being circular.
 
 _PRODUCTION_INFERENCES_PATH = inferences_path
 
 _TMP_DIR = tempfile.mkdtemp(prefix="oncotriage_birthdate_")
 inferences_path = os.path.join(_TMP_DIR, "inferences_test.db")
-
-with open(_code_dir + "14- Database Logger.py") as _fh:
-    exec(_fh.read(), globals())
 
 
 # --- THE DATABASE-ISOLATION ASSERTION IS SHOWN TO DISCRIMINATE --------------
@@ -422,8 +464,8 @@ print("\n" + "=" * 70)
 print("3. get_age_reference_date resolves DATA_SNAPSHOT_DATE, never the clock")
 print("=" * 70)
 
-check("DATA_SNAPSHOT_DATE is defined in File 03",
-      isinstance(globals().get("DATA_SNAPSHOT_DATE"), str), True)
+check("DATA_SNAPSHOT_DATE is defined in the config module",
+      isinstance(getattr(config, "DATA_SNAPSHOT_DATE", None), str), True)
 check("reference date is the configured snapshot date",
       get_age_reference_date().isoformat(), DATA_SNAPSHOT_DATE)
 check("reference date is a date, not a datetime",
@@ -431,12 +473,17 @@ check("reference date is a date, not a datetime",
 
 # An unusable snapshot date must be loud. Falling back to today() here would
 # restore the drift the constant exists to remove, and would do it silently.
+#
+# PASS 20d-1: the bad value is set on the CONFIG MODULE, not on this file's
+# globals. get_age_reference_date() reads config.DATA_SNAPSHOT_DATE at call
+# time -- see its docstring -- so this is where the value it resolves actually
+# comes from now that this file is not part of the exec chain.
 _REAL_SNAPSHOT = DATA_SNAPSHOT_DATE
 for _bad in ("", "2026", "2026-03", "not a date"):
-    DATA_SNAPSHOT_DATE = _bad
+    config.DATA_SNAPSHOT_DATE = _bad
     check_raises(f"unusable DATA_SNAPSHOT_DATE {_bad!r} raises",
                  get_age_reference_date, ValueError)
-DATA_SNAPSHOT_DATE = _REAL_SNAPSHOT
+config.DATA_SNAPSHOT_DATE = _REAL_SNAPSHOT
 check("snapshot date restored after the negative cases",
       get_age_reference_date().isoformat(), _REAL_SNAPSHOT)
 
@@ -484,7 +531,11 @@ for _bd in _SAMPLE_BIRTHS:
 # PASS on a file it had not inspected -- the check would have gone permanently
 # green while proving nothing. The definitions live in the package module now,
 # and that is what is parsed.
-_PARSER_SOURCE = os.path.join(_code_dir, "oncotriage", "fhir", "parser.py")
+# PASS 20d-1: the path comes from the imported module's own __file__ rather than
+# from os.path.join(_code_dir, ...). A directory guess was correct only while
+# this file sat beside the package; from tests/ it would have been one level off
+# and the open() below would have raised.
+_PARSER_SOURCE = os.path.abspath(_fhir_parser.__file__)
 _PARSER_TREE = ast.parse(open(_PARSER_SOURCE, encoding="utf-8").read())
 
 
@@ -728,8 +779,16 @@ print("=" * 70)
 # this check a second time.
 import glob as _glob_agent
 
+import oncotriage.agent as _agent_pkg
+
+# PASS 20d-1: the agent package's directory comes from its own __file__ (the
+# dirname of oncotriage/agent/__init__.py), not from a _code_dir guess that
+# would be one level off now that this file lives in tests/. This is a source
+# read only -- importing oncotriage.agent's __init__ opens no client and loads
+# no model, and nothing below imports a submodule.
 _AGENT_SOURCES = sorted(
-    _glob_agent.glob(os.path.join(_code_dir, "oncotriage", "agent", "*.py"))
+    _glob_agent.glob(os.path.join(
+        os.path.dirname(os.path.abspath(_agent_pkg.__file__)), "*.py"))
 )
 _AGENT_SRC  = "\n".join(
     open(_f, encoding="utf-8").read() for _f in _AGENT_SOURCES

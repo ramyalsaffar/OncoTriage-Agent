@@ -385,8 +385,9 @@ def node_hybrid_retrieval(state: TrialMatchState) -> dict:
         """Generate sparse query vector and search Qdrant.
 
         Raises _EmptySparseQuery when the text carries no BM25 terms. Measured
-        behaviour, not a defensive guess (see 37- Retrieval Observability
-        Test.py, which reproduces both halves against real components):
+        behaviour, not a defensive guess (see
+        tests/test_agent_retrieval_observability.py, which reproduces both
+        halves against real components):
 
           - FastEmbed Qdrant/bm25 returns zero indices for an empty string,
             whitespace, punctuation-only text and stopword-only text. It

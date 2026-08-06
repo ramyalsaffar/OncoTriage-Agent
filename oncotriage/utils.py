@@ -12,13 +12,19 @@ read ``PRICING_CONFIG`` / ``qdrant_client`` + ``COLLECTION_NAME`` /
 ``DATA_SNAPSHOT_DATE`` out of the shared exec namespace at CALL time. That is
 not an accident of the exec chain — it is a seam four files depend on:
 
-  * ``38- Birth Date and Demographics Parser Test.py`` rebinds
-    ``DATA_SNAPSHOT_DATE`` to "", "2026", "2026-03" and "not a date" and
-    requires ``get_age_reference_date()`` to raise at each;
-  * ``36- Logging Contract Test.py`` swaps ``qdrant_client`` for a stub;
-  * ``37- Retrieval Observability Test.py`` swaps it via ``swap_globals``;
-  * ``45- Fixture Capture.py`` / ``46- Fixture Replay.py`` rebind it to
-    recording and replaying proxies.
+  * ``45- Fixture Capture.py`` / ``46- Fixture Replay.py`` rebind
+    ``qdrant_client`` to recording and replaying proxies.
+
+THREE OF THE FOUR CONSUMERS ARE GONE, and the list above is what is left rather
+than what was written. ``36- Logging Contract Test.py`` and ``37- Retrieval
+Observability Test.py`` stopped rebinding ``qdrant_client`` at pass 20c-2c —
+they install ``deps.set_override(deps.QDRANT_CLIENT, ...)`` instead, and File
+37's ``swap_globals`` survives only as the honest name for something it no
+longer uses. ``38- Birth Date and Demographics Parser Test.py`` stopped
+rebinding ``DATA_SNAPSHOT_DATE`` at pass 20d-1: all three now live in ``tests/``
+(see ``tests/FILE NUMBER MAPPING.md``), import the package, and set
+``config.DATA_SNAPSHOT_DATE`` — the attribute ``get_age_reference_date()``
+actually reads at call time — for the four values that must raise.
 
 A module function cannot see a caller's globals, so each of the three now takes
 the value as an optional argument. ``02- Utility Functions.py``'s shim passes

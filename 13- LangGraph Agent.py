@@ -246,7 +246,7 @@ _MESH_FILTER     = deps.get_mesh_filter()       # MeSH C04 cancer site relevance
 #
 # They cannot simply be dropped: 12- RAG Trial Indexer Validator.py calls
 # medcpt_tokenizer(...) and medcpt_model(...) directly out of this namespace,
-# and 37- Retrieval Observability Test.py reads _bm25_query_model to measure
+# and tests/test_agent_retrieval_observability.py reads _bm25_query_model to measure
 # tokenization. And they cannot be bound eagerly here without reintroducing the
 # exact cost this pass removes.
 #
@@ -450,9 +450,9 @@ _bm25_query_model = _LazyAgentDependency(deps.get_bm25_query_model, "FastEmbed B
 #
 #     45- Fixture Capture.py  lines 805-821   install_recording_hooks
 #     46- Fixture Replay.py   lines 318-327   install_replay_hooks
-#     35- Ablation State Passthrough Test.py  lines 229-230
-#     36- Logging Contract Test.py            line 439
-#     37- Retrieval Observability Test.py     swap_globals(_MESH_FILTER=...)
+#     tests/test_agent_ablation_flag_passthrough.py  lines 229-230
+#     tests/test_storage_inference_logging_contract.py            line 439
+#     tests/test_agent_retrieval_observability.py     swap_globals(_MESH_FILTER=...)
 #
 # All five now install a deps override instead. A sixth caller written the old
 # way would be redirected NOWHERE, and — this is the part that made the seam

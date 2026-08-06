@@ -40,7 +40,7 @@ THE NAME KEEPS ITS LEADING UNDERSCORE. It is public API of this module in every
 practical sense -- two packages and a re-export shim import it by name -- but
 renaming it would break `08-`/`14-`-era callers reading it out of the shared exec
 namespace for no gain, and the underscore is now the only remaining trace of
-where it used to live. ``38- Birth Date and Demographics Parser Test.py``
+where it used to live. ``tests/test_fhir_birth_date_and_demographics.py``
 section 9b calls it directly, in the one chain in the repository that loads the
 storage logger without the agent, which is the chain where reading File 13's
 global used to raise NameError.

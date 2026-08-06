@@ -8,7 +8,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## The exec() chain and the `oncotriage` package — read this before touching any file
 
-Files 04 to 46 are numbered, space-containing filenames (`25- Batch Runner.py`) that are `exec()`'d into the caller's `globals()`, replicating a Spyder shared-namespace workflow. **None of those files is importable** — spaces and leading digits — and nothing in any pass has changed that.
+Files 04 to 49 are numbered, space-containing filenames (`25- Batch Runner.py`) that are `exec()`'d into the caller's `globals()`, replicating a Spyder shared-namespace workflow. **None of those files is importable** — spaces and leading digits — and nothing in any pass has changed that.
+
+**ELEVEN OF THEM ARE GONE AS OF PASS 20d-1.** The component tests — Files 30, 31, 32, 33, 35, 36, 37, 38, 39, 40 and 41 — moved into `tests/` under names describing what they cover, and import the package with no exec bootstrap at all. **[`tests/FILE NUMBER MAPPING.md`](tests/FILE%20NUMBER%20MAPPING.md) is the old-to-new mapping** and is the artefact to reach for whenever a note, a commit message or either Word document names one of them by number. See "The component tests (pass 20d-1)" below.
+
+**THE SEQUENCE DOCUMENT'S CLAIM THAT FILES 30 TO 44 ARE ALL TEST FILES IS WRONG, in two directions.** **File 34 is not a test** — it is a read-only cohort-selector comparison, and pass 20c-3d already converted it to `oncotriage/evaluation/cohort_diff.py` with File 34 as its thin entry point; it stays where it is. And Files 42, 43 and 44 *are* tests but are **not** in pass 20d-1: they mutate files in the repository and belong to `run_serial_tests.py`'s collision matrix. The group is **eleven files**, enumerated by name above, not a range.
 
 Files 01, 02 and 03 are different as of item 20c. They are now **re-export shims over a real package**:
 
@@ -20,7 +24,7 @@ Two of those eight keep one re-exported name each, and both are load-bearing:
 
 - **File 17 keeps `app`.** `docker-compose.yml` line 73 runs `uvicorn "17- FastAPI Server:app"`, and that WORKS — `importlib.import_module` does not require a valid Python identifier, only a file the path finder can locate, so a module name with a space and a leading digit imports fine as long as nobody writes an `import` STATEMENT for it. Verified rather than assumed. It is the same object as `oncotriage.api.server:app`.
 - **File 05 keeps a full shim** and its chain of Files 07 and 08: `34- Cohort Selector Diff.py` line 68 chains it and calls `has_cancer_diagnosis`.
-- **File 20 keeps a full shim** (pass 20c-3b): `41- ECOG Availability Metric Test.py` chains it and reads nine names out of the shared namespace. Its bootstrap is the lightweight six-line package-import block, **not** the 01/02 exec — running drift detection must not import torch, transformers and streamlit to run three statistical tests over a SQLite table.
+- **File 20 keeps a full shim** (pass 20c-3b). It kept it because `41- ECOG Availability Metric Test.py` chained it and read nine names out of the shared namespace. **That consumer is gone as of pass 20d-1** — the file is now `tests/test_monitoring_ecog_availability_drift.py` and imports `oncotriage.monitoring.drift` directly — so **nothing in the repository chains File 20 any more**. The shim stays: it is also the documented entry point (`python "20- Drift Detection.py"`), and its section 8b still checks it delivers all nine names, by exec'ing it into a **throwaway namespace** rather than by inspecting the test's own globals, which after the move would have compared an imported name with itself and passed forever. Its bootstrap is the lightweight six-line package-import block, **not** the 01/02 exec — running drift detection must not import torch, transformers and streamlit to run three statistical tests over a SQLite table.
 
 | Module | Holds | Imports |
 |---|---|---|
@@ -228,7 +232,7 @@ negative control that plants a second one in a copy.
 
 The real rule, replacing "nothing is importable":
 
-- **New shared code goes in `oncotriage/`, and is `import`ed.** Only put something in a numbered file if it needs the shared exec namespace. `import` of files 04-46 is still impossible; `from oncotriage.config import MAX_WORKERS` is now the normal way to reach a tunable from anything that is not in the chain.
+- **New shared code goes in `oncotriage/`, and is `import`ed.** Only put something in a numbered file if it needs the shared exec namespace. `import` of files 04-49 is still impossible; `from oncotriage.config import MAX_WORKERS` is now the normal way to reach a tunable from anything that is not in the chain.
 - **A module-level import name must not be shadowed by a function-local.** In Python a name assigned anywhere in a function is local for the whole of it, so a module that does `from oncotriage import config` and a function that does `config = info.config.params.vectors` turns every earlier `config.X` in that function into `UnboundLocalError`. Pass 3a hit this twice — `index_validator.stage1_index_health` (`config`) and `indexer._flush_embed_buffer` (`embedding`, a `zip()` loop variable) — and neither shows up at import, only at run time. Both were fixed by importing the *names* rather than the module. **File 47 check 2g scans for it** and carries a negative control.
 - **`oncotriage.config` must never import `oncotriage.utils`.** That was the cycle: File 02 read `PRICING_CONFIG` / `COLLECTION_NAME` / `qdrant_client` / `DATA_SNAPSHOT_DATE` out of File 03, while File 03 called `load_env_keys()` out of File 02. Under `exec()` both resolved at runtime; as modules it is an `ImportError`. `load_env_keys` moving out of the pair is what broke it — into `settings` in pass 20c-1, into `paths` in pass 20c-2a — and `47- Package Split Test.py` fails if the edge comes back. Note the reintroduced cycle is **order-dependent**: `import oncotriage.config` against it still succeeds, so the AST check is the guard, not the import test.
 - **No `oncotriage` module may import another `oncotriage` module from inside a function body.** A deferred import is a dependency that no scan of an import block can see, and it never fails at import in any order, so nothing but a static scan finds it. File 47 scans for it and carries a negative control. **Third-party imports in function bodies are exempt and must stay** — `import icd10` inside `_build_icd10_cancer_sets()` is deliberate: hoisting it would make importing the cancer registry load the whole ICD-10-CM release.
@@ -244,7 +248,7 @@ Everything else about the chain is unchanged:
 - A function used in file N may be *defined* in file 1, 2, 3, 8, 9, or 10 with no import statement at its use site. To find a definition, grep across all `*.py` **and** `oncotriage/*.py`.
 - Every entry-point file **that is still in the chain** begins with the same bootstrap: raw `exec()` of `01- Imports.py` and `02- Utility Functions.py` (needed because `exec_chain` itself lives in 02), then `exec_chain([...])` for the rest. Every one of those bootstraps loads 01 first, and they have to — File 02 has always used `os`, `re`, `time`, `httpx` and `logging` out of File 01's import block.
   **Files 04, 06, 11 and 12 no longer have one** (pass 20c-3a). They carry instead a six-line block that imports `oncotriage`, falling back to putting their own directory on `sys.path` and *printing* that it did — the same three candidates, in the same order, as `01- Imports.py`'s `_ensure_oncotriage_importable()`. `pip install -e .` makes it a no-op. That is what makes `python "11- RAG Trial Indexer.py" --help` stop importing torch, transformers, streamlit and langgraph, stop building an OpenAI and a Qdrant client, and stop loading a FastEmbed model, just to print an argument list.
-- `01- Imports.py` keeps its **third-party import block verbatim**. Files 04-46 reach for `np`, `pd`, `Path`, `OpenAI`, `torch` and eighty more with no import of their own, and only an exec'd file can bind those in the caller's globals. Do not move that block into the package.
+- `01- Imports.py` keeps its **third-party import block verbatim**. Files 04-49 reach for `np`, `pd`, `Path`, `OpenAI`, `torch` and eighty more with no import of their own, and only an exec'd file can bind those in the caller's globals. Do not move that block into the package.
 - `exec_chain` sets `__name__ = "_exec_chain_"` while exec'ing, so `if __name__ == "__main__":` blocks in chained files do **not** fire. That is the mechanism that lets a file be both a runnable script and a library.
 - **Do not double-load.** `13- LangGraph Agent.py` already chains 08, 09, 10 — callers of 13 (17, 25, 26) must not list them again. See the warning comment in `26- Ablation Study.py`.
 - `_code_dir` is **derived from `__file__`** at the top of each entry point (item 20a); there is no hardcoded absolute path in any tracked file except `FALLBACK_MAIN_PATH` in `oncotriage/settings.py`, which is the deliberate one-machine fallback for `ONCOTRIAGE_MAIN_PATH`. Docker mounts the code at `/app` and `oncotriage/paths.py` switches all data paths on `IS_DOCKER`.
@@ -301,7 +305,20 @@ docker compose logs -f fastapi
 ```
 
 ```bash
-python "39- ECOG Performance Status Surfacing Test.py"   # needs the scratch corpus from 04-
+# The eleven component tests (pass 20d-1). No quoting: the names have no spaces.
+# None needs a network, a key, a live server, or a cent of spend.
+python tests/test_extraction_histology.py                          # 103 checks
+python tests/test_agent_mesh_boost_and_quality_gate.py             #  54
+python tests/test_registries_mesh_pan_cancer_resolution.py         #  58
+python tests/test_registries_cancer_codes_and_stage_extraction.py  # 136
+python tests/test_agent_ablation_flag_passthrough.py               #  39
+python tests/test_storage_inference_logging_contract.py            #  79
+python tests/test_agent_retrieval_observability.py                 # 103
+python tests/test_fhir_birth_date_and_demographics.py              # 172
+python tests/test_fhir_ecog_surfacing.py                           # 105; needs 04-'s scratch corpus
+python tests/test_storage_ecog_logging.py                          # 104
+python tests/test_monitoring_ecog_availability_drift.py            # 112
+
 python "47- Package Split Test.py"                       # no network, no keys, no corpus; ~30s
 python "48- Degraded Dependency Test.py"                 # item 11a; no network, no keys; ~40s
 python "49- Database Query Layer Test.py"                # item 38; temp SQLite only; ~15s
@@ -353,7 +370,9 @@ tool, not a compromise: each unit of work is already its own subprocess, so the
 parent thread spends its life blocked in `subprocess.run()` with the GIL
 released.
 
-**Tests** are not pytest — `18-` and `19-` are procedural scripts hitting a *live* server on `localhost:8000`; start `17-` in another terminal first. `19-` slices `fhir_files[410:412]` for a smoke run; widen that slice to go broader.
+**Tests** are not pytest — **including the eleven in `tests/`, whose `test_` prefix is for discovery and for whatever item 22 decides, not a claim of pytest compatibility.** Every check runs at module level and the exit code is set in a `__main__` block, so `pytest tests/` imports each module (running every check, printing every result) and then reports "no tests collected", exit 5. Non-zero, so it cannot read as a false green; still not how to run them. `18-` and `19-` are procedural scripts hitting a *live* server on `localhost:8000`; start `17-` in another terminal first. `19-` slices `fhir_files[410:412]` for a smoke run; widen that slice to go broader.
+
+**FILES 18 AND 19 ARE TESTS THAT NO CONVERSION PASS HAS REACHED, and pass 20d-1 deliberately did not either.** They sit inside the pipeline numbering rather than with the other tests for a reason: they need a live server in a second terminal and **they cost money** — every POST is a live billed Stage 5 call, measured at $0.13–$0.17 per patient from six real rows in `inferences.db`. Converting them means deciding how a test that spends money is run and how its server is redirected, which is a spending and orchestration decision, not a mechanical move. Pass 20e.
 
 **START THAT SERVER WITH `ONCOTRIAGE_INFERENCES_DB` SET, OR FILES 18 AND 19 WILL FAIL YOU (pass 20c-3i).**
 
@@ -469,7 +488,7 @@ These three moved into the package in pass 20c-2a. The numbered files survive as
 - **`oncotriage/registries/mesh.py`** (shim: `09- MeSH Cancer Site Relevance Filter.py`) — MeSH C04 tree ancestry match. Patient side maps SNOMED→CUI→MeSH via UMLS `MRCONSO`, falling back to fuzzy descriptor matching. Trial side is a direct lookup (ClinicalTrials.gov conditions *are* MeSH terms). **Conservative by design: unmappable on either side ⇒ KEEP.**
 - **`oncotriage/registries/mesh_crosswalk_build.py`** — File 09's five offline builders (`build_mesh_lookup`, the three crosswalks, `build_all_lookups`). They parse `desc2026.xml` and the 1.5 GB `MRCONSO_2025AB.RRF` and write the JSON that `mesh.py` reads back. **Called from nowhere in the pipeline** — File 09's `__main__` block is the only call site, and `python "09- MeSH Cancer Site Relevance Filter.py"` still runs them. `mesh` does not import this module.
 - **`oncotriage/extraction/{negation,stage,histology}.py`** (shim: `10- Structured Eligibility Extractor.py`) — index-time, rule-based, zero-LLM extraction of stage requirements into a structured dict, so stage matching in node 4 is an integer comparison. Unknown ⇒ `None` ⇒ trial passes. The three-way split rests on one measurement: walking every top-level definition in each half for `Name` loads resolving into the other half finds **exactly one edge**, `_is_histology_negated()` → `_is_negated()`. That helper is what `negation.py` holds. File 47 re-derives the measurement against the shipped modules, so a second shared name fails rather than accumulating.
-- **`oncotriage/fhir/parser.py`** (shim: `07- FHIR Parser.py`) — `parse_fhir_bundle(path)` takes a **file path**, not a dict (the API writes a temp file to bridge this). Historical medications are deliberately retained with status labels so prior-treatment criteria are evaluable. **LOINC 89247-1 (ECOG) is routed out of `observations`** into `patient_data['ecog_performance_status']`, a dict that is present on every patient. `value` is `None` when nothing was recorded and is **never defaulted to 0** — ECOG 0 is *fully active*, the most eligible a patient can be, so every consumer must test `is None`, never truthiness. Both `valueInteger` (mCODE) and `valueQuantity` (raw Synthea, unit `{score}`) parse, and which was found is kept as `value_shape`; a non-integral or out-of-range grade **raises** rather than rounding. The winner is the most recent observation dated on or before `get_age_reference_date()`, never `datetime.now()`, with the counts and the selection path recorded alongside. `compute_patient_hash` (13) hashes value/date/count/selection but deliberately **not** `value_shape` — normalizing a corpus must not change a hash when the prompt text is identical — and emits nothing at all when no ECOG was present, so hashes already logged against an ECOG-free corpus stay comparable. Covered by `39- ECOG Performance Status Surfacing Test.py`. **This module's SOURCE TEXT is read by two tests, and both point here, not at the shim** — `38-` ast-parses it to prove `_calculate_age` and `_parse_demographics` contain no clock call (and now checks both functions are actually present, because a stale filename made that assertion pass on an empty result), and `39-` slices named function bodies out of it. The shim keeps File 07's `__main__` block, which is the only place in the original 1,491 lines that named a path; it now resolves `data_fhir_path` from the shared namespace when there is one and from `oncotriage.paths` otherwise, prints which, and — unlike before — works when the file is run directly.
+- **`oncotriage/fhir/parser.py`** (shim: `07- FHIR Parser.py`) — `parse_fhir_bundle(path)` takes a **file path**, not a dict (the API writes a temp file to bridge this). Historical medications are deliberately retained with status labels so prior-treatment criteria are evaluable. **LOINC 89247-1 (ECOG) is routed out of `observations`** into `patient_data['ecog_performance_status']`, a dict that is present on every patient. `value` is `None` when nothing was recorded and is **never defaulted to 0** — ECOG 0 is *fully active*, the most eligible a patient can be, so every consumer must test `is None`, never truthiness. Both `valueInteger` (mCODE) and `valueQuantity` (raw Synthea, unit `{score}`) parse, and which was found is kept as `value_shape`; a non-integral or out-of-range grade **raises** rather than rounding. The winner is the most recent observation dated on or before `get_age_reference_date()`, never `datetime.now()`, with the counts and the selection path recorded alongside. `compute_patient_hash` (13) hashes value/date/count/selection but deliberately **not** `value_shape` — normalizing a corpus must not change a hash when the prompt text is identical — and emits nothing at all when no ECOG was present, so hashes already logged against an ECOG-free corpus stay comparable. Covered by `tests/test_fhir_ecog_surfacing.py`. **This module's SOURCE TEXT is read by two tests, and both point here, not at the shim** — `38-` ast-parses it to prove `_calculate_age` and `_parse_demographics` contain no clock call (and now checks both functions are actually present, because a stale filename made that assertion pass on an empty result), and `39-` slices named function bodies out of it. The shim keeps File 07's `__main__` block, which is the only place in the original 1,491 lines that named a path; it now resolves `data_fhir_path` from the shared namespace when there is one and from `oncotriage.paths` otherwise, prints which, and — unlike before — works when the file is run directly.
 
 ### Data preparation (pass 20c-3a)
 
@@ -809,7 +828,8 @@ have no consumer at all: File 26's only outside hits are File 27's own
 and prose.
 
 **THE NAME GREP HAS A BLIND SPOT AND IT FIRED IMMEDIATELY.** It searches for
-top-level NAMES, and `40- ECOG Logging Test.py` line 585 read File 26 by
+top-level NAMES, and `40- ECOG Logging Test.py` (now
+`tests/test_storage_ecog_logging.py`) line 585 read File 26 by
 FILENAME — `Path(_code_dir + "26- Ablation Study.py").read_text()` — to slice the
 `ablation_results` CREATE TABLE out of it and assert no ECOG column was added.
 The entry point holds no schema, so `split(...)[1]` raised `IndexError` and took
@@ -1010,13 +1030,117 @@ the floors raised to 75 package files / 61 modules. All six new modules import
 under all twelve traps with the project root pointed at a directory that does not
 exist, opening nothing and pulling in no heavy library.
 
+### The component tests (pass 20d-1)
+
+**Eleven files, not a range.** Files 30, 31, 32, 33, 35, 36, 37, 38, 39, 40 and
+41 moved into `tests/` and were renamed for what they cover. Each imports the
+package with **no exec bootstrap at all** — no `exec()` of Files 01/02/03, no
+`exec_chain` — and each reports the **identical pass count** it reported before:
+103, 54, 58, 136, 39, 79, 103, 172, 105, 104, 112. Total 1,065, zero failures,
+exit 0, before and after.
+
+**[`tests/FILE NUMBER MAPPING.md`](tests/FILE%20NUMBER%20MAPPING.md) is the
+mapping, and it is an artefact rather than a memory** — every note, commit
+message and both Word documents name these files by number.
+
+**File 34 is NOT one of them.** It is a read-only cohort-selector comparison,
+converted in pass 20c-3d to `oncotriage/evaluation/cohort_diff.py`; the sequence
+document's "Files 30 to 44 are test files" is wrong about it and about Files 42,
+43 and 44, which are tests but stay in the collision matrix.
+
+**THE HAZARD WAS THE PATHS, NOT THE IMPORTS.** Every one of the eleven computed
+`_code_dir` from `__file__` and resolved things relative to it — the numbered
+bootstrap files, and in seven cases a package module it ast-parses. Moved into
+`tests/`, every one of those is one directory off. **The repair is not to walk up
+a directory: a parsed module's path comes from THAT MODULE's own `__file__`**
+(`os.path.abspath(_fhir_parser.__file__)`, `os.path.dirname(...(_agent_pkg.__file__))`),
+so a future move cannot break it again — and so the file under inspection is
+provably the one this process imported rather than a same-named copy. The two
+places that genuinely need the repository root (File 20's shim, File 03) derive
+it from `oncotriage.__file__`, never from the test's own location.
+
+**FOUR FILES LOST A PROTECTION MECHANISM AND SAY SO.** Files 36, 37, 38 and 40
+used to `exec("14- Database Logger.py")` *after* rebinding `inferences_path`, so
+the File 14 shim's `log_inference` wrapper picked the rebound value up through
+`globals().get(...)`. They import `oncotriage.storage.database_logger` directly
+now, so that redirect reaches the writer **not at all**. Measured before the
+move rather than assumed: every `log_inference` call site in all four already
+passed `db_path=` explicitly and asserted on the path the writer returns, and
+`initialize_database` already took its path as an argument. Each file's comment
+block was rewritten to claim ONE mechanism instead of two — a comment claiming
+two protections while one is inert is worse than having one. **File 14's wrapper
+now has no consumer in the repository**; it is kept, and that fact is recorded
+beside it, because removing it is a decision about File 14's surface.
+
+**TWO DIFFS FALL OUTSIDE import / path / bootstrap, and both were required
+rather than cosmetic:**
+
+- **`tests/test_fhir_birth_date_and_demographics.py` section 3** rebound
+  `DATA_SNAPSHOT_DATE` in its own globals and required
+  `get_age_reference_date()` to raise on four bad values. That reached the
+  function only through File 02's wrapper. The package function reads
+  `config.DATA_SNAPSHOT_DATE` **at call time** — its own docstring names that as
+  the supported patch point — so the value is set on the config module now. Same
+  call shape, same four values, same raise, same count. Leaving it alone would
+  not have gone green; it would have turned four raises into four failures.
+- **`tests/test_monitoring_ecog_availability_drift.py` section 8b** asserted that
+  File 20's shim re-exports nine names, by comparing **this file's globals**
+  against the package module. Once the file imports those names, that is an
+  imported name compared with itself: **true by construction, ten checks that can
+  never fail** — the exact blind spot CLAUDE.md names, an equivalence proof
+  cannot see a check that has stopped checking. The shim is exec'd into a
+  throwaway namespace now and that namespace is inspected, which tests the shim
+  itself rather than through one caller. **Shown to fail, 2026-08-06:** stripping
+  `ks_test_drift` from an in-memory copy of the shim's source gives 111 passed,
+  1 failed, the other nine still passing, shim sha256 unchanged.
+
+**Equivalence: 1,784 top-level statements byte-identical after `ast.unparse`,
+149 replaced, 0 added, 4 removed; 123 definitions byte-identical at every
+nesting depth, 2 differing, 1 added, 0 removed, 2 decorated.** The comparison is
+over the WHOLE module-level statement sequence, not only definitions — these are
+procedural scripts whose content is mostly top-level `check()` calls, so a
+definition-only proof would have covered almost nothing. Definitions are keyed by
+*qualified* name and rendered with `ast.unparse`, which includes the decorator
+list, so pass 20c-3c-1's `@st.fragment` defect cannot recur. The 4 removals are
+the four `exec("14- Database Logger.py")` blocks; the 2 differing definitions are
+`_function_source` / `_function_body` dropping their `_code_dir` prefix; the 1
+addition is `_exec_shim`.
+
+**References the move breaks were found by grepping the WHOLE repository for
+each of the eleven filenames AS A STRING**, not for their symbols — pass 20c-3d
+found File 40 reading File 26 by filename, which a name-grep cannot see. 46
+occurrences across 17 files, all prose except one: **`44- Snapshot Date Rot
+Test.py`'s `_SUITES`**, which runs two of the eleven as subprocesses. That is the
+only functional edit made to a 42–49 file in this pass (plus its display line,
+which sliced `s[:2]` to print the file number).
+
+**A top-level `tests/` directory interacts with neither `pyproject.toml` nor
+File 47's subpackage cross-check.** `pyproject.toml`'s `packages` list is
+explicit and auto-discovery is off, so `tests/` is not shipped; there is no
+`__init__.py`, so it is not a package; and File 47's subpackage scan walks
+`oncotriage/` only, so it neither sees `tests/` nor should.
+
+**FILE 47's CHECK 2h IS THE ONE THAT COULD HAVE BEEN AFFECTED, AND MEASUREMENT
+SAYS IT WAS NOT — this pass predicted a failure that did not occur, and the
+prediction is recorded because the risk it names is still there.** Check 2h asks
+whether every module-level constant in the package is read by something,
+somewhere in the repository, and its read corpus is `_PKG_FILES` plus the
+top-level `.py` files of `03- Code/` — an `os.listdir`, not a walk. Moving
+eleven readers into `tests/` therefore removed them from that corpus, and a
+package constant that ONLY they read would now report as never-read. **It does
+not happen: File 47 passes at 283 checks, zero failures, with no edit**, so no
+such constant exists today. **The latent hole is real and File 47 was left
+untouched by instruction:** a constant added tomorrow whose only reader is a test
+in `tests/` will be reported as dead. The fix is one line — make `_REPO_PY` walk
+`tests/` as well — and it belongs to whichever pass next opens File 47.
+
 ## Persistence and observability
 
 **`oncotriage/storage/database_logger.py`** (shim: `14- Database Logger.py`) opens no database at load time and never did since item 20b, which turned schema creation into a function because nine other files load 14 or are loaded beside it and every one of them was touching `inferences.db` just by being read. `initialize_database(db_path)` creates three tables: `inferences` (per-patient funnel counts, per-stage timings, token counts, cost), `trial_matches` (per-trial verdicts), `drift_metrics`. It is idempotent — every `CREATE` is `IF NOT EXISTS`, every `ALTER` is guarded by a `PRAGMA table_info` check — and `log_inference` ensures the schema once per resolved path before its first write. `16-` is a scratch query script; `15-` wipes all tables and is guarded by `Flag = False` — leave it False.
 
 **`log_inference(result, patient_data, db_path=None)` takes the database as an argument, and the five isolation tests pass it.** `db_path=None` means `oncotriage.paths.inferences_path` — `resolve_inference_db_path()` is the resolver, and it deliberately does *not* consult the exec namespace. The **shim's** `log_inference` is a wrapper that supplies `globals().get("inferences_path")`, the same late-binding seam File 02 uses for `get_model_cost` / `resolve_qdrant_collection` / `get_age_reference_date`. That seam is what keeps the redirect working for Files 36, 37, 38, 40 and 45, all of which rebind `inferences_path` at a temporary database *before* loading File 14: a module function cannot see a caller's globals, so without the wrapper all five would have written real rows into the real `inferences.db` while still printing the name of the temporary file each thought it was using. All five now **also** pass `db_path` explicitly and assert on the path `log_inference` returns, so neither mechanism is a single point of failure. Each one first checks that `resolve_inference_db_path(None)` is the production database and is *not* its own scratch path, which is what makes the assertion discriminating rather than vacuous. **No writer anywhere in the repository depends on rebinding a shared global any more (pass 20c-3b).** File 41 was the last one — it rebound `inferences_path` for `log_drift_metrics` in File 20. `log_drift_metrics`, `get_baseline_and_current_data` and `run_drift_detection` all take `db_path` now, `log_drift_metrics` **returns the path it wrote to** so a caller can assert on it, and File 41 passes its scratch path, checks the default resolves to production and is *not* that scratch path, demonstrates the assertion failing against a decoy database, and confirms the production `drift_metrics` row count is unchanged at the end.
 
-`_resolve_primary_cancer` lives in **`oncotriage/registries/primary_cancer.py`** as of pass 20c-2c, and both the agent's three terminal nodes and the storage logger import it from there. Pass 2b had already stopped it reading File 13's `_CANCER_REGISTRY` global — a layering violation that left it raising `NameError` in any chain loading 14 without 13 — in favour of `load_registry()`. Pass 2c finished the job: while the function lived in the storage module, the *agent* depended on the *storage* layer for a registry lookup. **`38- Birth Date and Demographics Parser Test.py` section 9b is the only place that exercises it**, because File 38 is the only chain in the repository that loads 14 without 13; it calls the function directly on a stub condition list and asserts a real diagnosis comes back, having first asserted the result is not `None` (which an empty registry filter also returns).
+`_resolve_primary_cancer` lives in **`oncotriage/registries/primary_cancer.py`** as of pass 20c-2c, and both the agent's three terminal nodes and the storage logger import it from there. Pass 2b had already stopped it reading File 13's `_CANCER_REGISTRY` global — a layering violation that left it raising `NameError` in any chain loading 14 without 13 — in favour of `load_registry()`. Pass 2c finished the job: while the function lived in the storage module, the *agent* depended on the *storage* layer for a registry lookup. **`tests/test_fhir_birth_date_and_demographics.py` section 9b is the only place that exercises it**, because it is the only place in the repository that reaches the storage layer without the agent — an exec chain that loaded 14 without 13 before pass 20d-1, an import of `oncotriage.storage.database_logger` without `oncotriage.agent` after it; it calls the function directly on a stub condition list and asserts a real diagnosis comes back, having first asserted the result is not `None` (which an empty registry filter also returns).
 
 `oncotriage/dashboard/` (thin entry point: `21- Streamlit Dashboard.py`) reads only from `inferences.db`, via the three `@st.cache_data(ttl=60)` loaders in `dashboard/data.py`. See "The dashboard (pass 20c-3c-1)" above.
 

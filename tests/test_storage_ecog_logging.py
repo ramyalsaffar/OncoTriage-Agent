@@ -55,11 +55,12 @@ Covers:
        parsed, run through the provenance builder, logged, and read back.
 
 No network and no LLM. The pipeline is never run: terminal nodes are called
-directly on a stubbed state, and inferences_path is repointed at a temporary
-file before File 14 is loaded, so the real inferences.db is never opened.
+directly on a stubbed state, and every write passes an explicit db_path at a
+temporary file, so the real inferences.db is never opened.
 
 Run from terminal (or F5 in Spyder):
-    python "40- ECOG Logging Test.py"
+    python tests/test_storage_ecog_logging.py
+    (was: python "40- ECOG Logging Test.py")
 
 Exit codes:
     0 -- all assertions passed
@@ -69,31 +70,57 @@ Exit codes:
 
 # Run needed file
 #----------------
-# Item 20a: this file sits in the code directory, so __file__ locates it with
-# no hardcoded path. __file__ is bound when the file is run as a script (every
-# documented entry point for it) and when Spyder runfile()s it. In a bare
-# interactive paste it is not bound, and the working directory is the only
-# remaining candidate -- taken, but announced, never silently.
-import os as _os_boot
-if "__file__" in globals():
-    _code_dir = _os_boot.path.dirname(_os_boot.path.abspath(__file__)) + _os_boot.sep
-else:
-    _code_dir = _os_boot.getcwd() + _os_boot.sep
-    print(f"[Bootstrap] __file__ unbound; using the working directory as the code directory: {_code_dir}")
-del _os_boot
+# PASS 20d-1: THIS FILE IMPORTS THE PACKAGE. It used to exec "01- Imports.py"
+# and "02- Utility Functions.py" into its own globals and then exec_chain()
+# Files 13 and 07, which is how every name below used to arrive.
+#
+# THE STORAGE LAYER IS IMPORTED HERE, NOT EXEC'D LATER, for the reason given at
+# the throwaway-database block below. The explicit initialize_database() call
+# item 20b made necessary stays exactly where it was.
+#
+# THE CANDIDATE DIRECTORY IS THE PARENT OF THIS FILE'S, not this file's own.
+# The same block Files 47, 48 and 49 carry looks one level up because this file
+# now sits in tests/ and the package sits BESIDE tests/, not inside it.
+# `pip install -e .` makes the whole block a no-op.
+import os
+import sqlite3
+import sys
+from pathlib import Path
 
-for _bootstrap in ("01- Imports.py", "02- Utility Functions.py"):
-    with open(_code_dir + _bootstrap) as _fh:
-        exec(_fh.read(), globals())
+try:
+    import oncotriage  # noqa: F401
+except ImportError:
+    for _candidate, _how in (
+        (os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+         if "__file__" in globals() else None, "__file__"),
+        (os.getcwd(), "cwd"),
+    ):
+        if _candidate and os.path.isdir(os.path.join(_candidate, "oncotriage")):
+            if _candidate not in sys.path:
+                sys.path.insert(0, _candidate)
+            print(f"[Bootstrap] oncotriage package found at {_candidate} "
+                  f"(via {_how}); added to sys.path")
+            break
+    else:
+        raise
+    del _candidate, _how
 
-# 13 chains 03, 08, 09, 10 itself -- do not list them again here.
-# 14 is deliberately NOT chained: it connects and creates its tables at load
-# time, and this test repoints inferences_path at a temporary file first.
-exec_chain(
-    ["13- LangGraph Agent.py", "07- FHIR Parser.py"],
-    caller_file=_code_dir + "40- ECOG Logging Test.py",
-    caller_globals=globals(),
-    chain_label="01 → 02 → 13 (→ 03, 08, 09, 10) → 07",
+from oncotriage.ablation import study as _ablation_study
+from oncotriage.agent import terminal as _agent_terminal
+from oncotriage.agent.terminal import (
+    _pipeline_provenance,
+    node_error_handler,
+    node_finalize,
+    node_no_candidates,
+)
+from oncotriage.config import DATA_SNAPSHOT_DATE
+from oncotriage.fhir.parser import parse_fhir_bundle
+from oncotriage.paths import data_patient_path, inferences_path
+from oncotriage.storage.database_logger import (
+    INFERENCE_COLUMN_ADDITIONS,
+    initialize_database,
+    log_inference,
+    resolve_inference_db_path,
 )
 
 
@@ -139,14 +166,16 @@ def check(label: str, actual, expected) -> None:
 # second arrived in pass 20c-2b because the first stopped being enough on its
 # own.
 #
-#   1. inferences_path is rebound before File 14 is loaded. That worked only
-#      because File 14 was exec'd into this namespace and read the name out of
-#      it. File 14 is now a shim over oncotriage/storage/database_logger.py, and
-#      a MODULE function cannot see a caller's globals; the redirect survives
-#      solely because the shim keeps a wrapper passing
-#      globals().get("inferences_path") down.
+#   1. RETIRED IN PASS 20d-1 rather than left looking live. It was: rebind
+#      inferences_path, then exec "14- Database Logger.py" into this namespace
+#      so the shim's log_inference wrapper picked the rebound value up through
+#      globals().get("inferences_path"). That worked only while this file was
+#      part of the exec chain; it now imports the package module directly, so
+#      the rebinding below reaches the writer NOT AT ALL.
 #   2. logged_row() calls log_inference with db_path EXPLICITLY and asserts on
-#      the path the writer reports back, which depends on no seam at all.
+#      the path the writer reports back, which depends on no seam at all. This
+#      is the whole protection now, and the discrimination block below is what
+#      keeps it from being circular.
 #
 # Item 20b: File 14 no longer creates its tables at load time, so the rebinding
 # was never sufficient on its own -- initialize_database() has to be called.
@@ -161,9 +190,6 @@ _PRODUCTION_INFERENCES_PATH = inferences_path
 
 _TMP_DIR = tempfile.mkdtemp(prefix="oncotriage_ecog_logging_")
 inferences_path = os.path.join(_TMP_DIR, "inferences_test.db")
-
-with open(_code_dir + "14- Database Logger.py") as _fh:
-    exec(_fh.read(), globals())
 
 initialize_database(inferences_path)
 
@@ -368,7 +394,10 @@ check("never-reported is distinguishable from none_recorded",
 # the one that would have passed on an empty body, which is why the
 # non-degeneracy check below is here anyway.
 _prov_src = inspect_source = None
-_PROVENANCE_SOURCE = os.path.join(_code_dir, "oncotriage", "agent", "terminal.py")
+# PASS 20d-1: the path comes from the imported module's own __file__ rather than
+# from os.path.join(_code_dir, ...), which was correct only while this file sat
+# beside the package.
+_PROVENANCE_SOURCE = os.path.abspath(_agent_terminal.__file__)
 _prov_text = Path(_PROVENANCE_SOURCE).read_text(encoding="utf-8")
 _prov_node = next((n for n in ast.parse(_prov_text).body
                    if isinstance(n, ast.FunctionDef)
@@ -596,7 +625,12 @@ print("=" * 70)
 # The path is asserted to exist before it is read, so a future move produces a
 # named failure here rather than a FileNotFoundError thirty lines of traceback
 # deep.
-_ablation_source = Path(_code_dir) / "oncotriage" / "ablation" / "study.py"
+# PASS 20d-1: the path comes from the imported module's own __file__. The
+# `is_file()` guard below stays -- it costs nothing and it is what turns a
+# future move into a named failure -- but a module's own __file__ is not a guess
+# that can be one directory off, which is what the previous _code_dir form
+# became the moment this file was moved into tests/.
+_ablation_source = Path(os.path.abspath(_ablation_study.__file__))
 check("the ablation schema module is where this check expects it",
       _ablation_source.is_file(), True)
 _ablation_text = _ablation_source.read_text(encoding="utf-8")

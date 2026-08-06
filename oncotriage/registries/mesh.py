@@ -873,8 +873,8 @@ def load_mesh_filter() -> Optional[MeSHCancerFilter]:
     from missing files. It arrives two ways now, both deliberate:
 
       * a dependency override -- ``deps.set_override(deps.MESH_FILTER, None)``,
-        which is what "37- Retrieval Observability Test.py" installs and what
-        "35- Ablation State Passthrough Test.py" stubs. An override never calls
+        which is what "tests/test_agent_retrieval_observability.py" installs and what
+        "tests/test_agent_ablation_flag_passthrough.py" stubs. An override never calls
         this function at all;
       * ONCOTRIAGE_ALLOW_DEGRADED_REGISTRIES=1, below, which logs at WARNING,
         records the layer, and returns None exactly as before.

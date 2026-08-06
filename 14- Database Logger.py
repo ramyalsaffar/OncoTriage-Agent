@@ -71,9 +71,9 @@ from oncotriage.storage.database_logger import (
 # function takes as an argument a value the exec chain has always supplied as a
 # shared global.
 #
-# WHY IT IS LOAD-BEARING. Five files rebind inferences_path at a temporary
-# database and only then load this file, so that their writes cannot reach the
-# production inferences.db:
+# WHY IT WAS LOAD-BEARING, and what is left of that (pass 20d-1). Five files
+# used to rebind inferences_path at a temporary database and only then load this
+# file, so that their writes could not reach the production inferences.db:
 #
 #     36- Logging Contract Test.py            line 129, exec at 131
 #     37- Retrieval Observability Test.py     line 174, exec at 176
@@ -85,9 +85,22 @@ from oncotriage.storage.database_logger import (
 # log_inference started importing inferences_path from oncotriage.paths, all
 # five would have written real rows into the real database while still printing
 # the name of the temporary file each thought it was using. Silent in both
-# directions, which is why this wrapper exists AND why all five now pass
-# db_path explicitly as well. Either mechanism alone is sufficient; both
-# together mean neither is the single point of failure.
+# directions, which is why this wrapper exists AND why all five also pass
+# db_path explicitly.
+#
+# FOUR OF THE FIVE NO LONGER LOAD THIS FILE AT ALL. Pass 20c-3d converted File
+# 45; pass 20d-1 converted the other four, which now live in tests/ under names
+# describing what they cover (see tests/FILE NUMBER MAPPING.md) and import
+# oncotriage.storage.database_logger directly. The line numbers above are kept
+# as they were, against the files as they stood at that time, because they
+# document the shape of the defect rather than a place to go and look.
+#
+# So this wrapper has NO REMAINING CONSUMER IN THE REPOSITORY, and that is a
+# statement of fact rather than an argument for deleting it: File 14 is still a
+# runnable shim over the package module, exec_chain can still load it, and a
+# caller written the old way still works. What changed is that the redirect is
+# no longer the thing keeping any test off the production database. Removing
+# the wrapper is a decision about File 14's surface, not about this pass.
 #
 # This function is DEFINED INSIDE THE EXEC'D TEXT, so its __globals__ IS the
 # shared namespace and globals().get() below is a live read, not a snapshot

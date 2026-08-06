@@ -38,12 +38,20 @@ Covers:
 
 No network and no LLM: everything runs off the pre-built MeSH JSON lookups.
 
-Running this loads file 13, which loads the MedCPT cross-encoder and the
-FastEmbed BM25 model at import (both cached locally after the first run).
-No inference is performed on either.
+Running this BUILDS NO MODEL. Measured, 2026-08-06, by inspecting
+deps.cached_keys() and oncotriage.embedding._MODEL after a full run: neither
+MedCPT half nor the FastEmbed BM25 model is constructed. This file used to
+exec-chain "13- LangGraph Agent.py", which built both at exec time; item 20c
+pass 2c made them lazy behind oncotriage/agent/deps.py, and nothing below scores
+a pair. No inference is performed.
+
+(The `fastembed` LIBRARY still arrives in sys.modules, because
+qdrant_client.fastembed_common imports it. That is a library import, not a model
+construction, and it was equally true under the old chain.)
 
 Run from terminal (or F5 in Spyder):
-    python "32- Pan-Cancer Resolution Test.py"
+    python tests/test_registries_mesh_pan_cancer_resolution.py
+    (was: python "32- Pan-Cancer Resolution Test.py")
 
 Exit codes:
     0 -- all assertions passed
@@ -53,30 +61,65 @@ Exit codes:
 
 # Run needed file
 #----------------
-# Item 20a: this file sits in the code directory, so __file__ locates it with
-# no hardcoded path. __file__ is bound when the file is run as a script (every
-# documented entry point for it) and when Spyder runfile()s it. In a bare
-# interactive paste it is not bound, and the working directory is the only
-# remaining candidate -- taken, but announced, never silently.
-import os as _os_boot
-if "__file__" in globals():
-    _code_dir = _os_boot.path.dirname(_os_boot.path.abspath(__file__)) + _os_boot.sep
-else:
-    _code_dir = _os_boot.getcwd() + _os_boot.sep
-    print(f"[Bootstrap] __file__ unbound; using the working directory as the code directory: {_code_dir}")
-del _os_boot
+# PASS 20d-1: THIS FILE IMPORTS THE PACKAGE. It used to exec "01- Imports.py"
+# and "02- Utility Functions.py" into its own globals and then exec_chain()
+# "13- LangGraph Agent.py", which is how every name below used to arrive.
+#
+# _CANCER_REGISTRY and _MESH_FILTER ARE BUILT HERE, exactly as the File 13 shim
+# builds them (deps.get_cancer_registry() / deps.get_mesh_filter()). The shim
+# binds those two EAGERLY to the real values rather than to a lazy proxy,
+# precisely because this file's line below tests `_MESH_FILTER is None` and a
+# proxy would make that test always False. Going through deps rather than
+# calling load_registry()/load_mesh_filter() directly keeps the objects under
+# test the ones the agent itself would reach.
+#
+# THE CANDIDATE DIRECTORY IS THE PARENT OF THIS FILE'S, not this file's own.
+# The same block Files 47, 48 and 49 carry looks one level up because this file
+# now sits in tests/ and the package sits BESIDE tests/, not inside it.
+# `pip install -e .` makes the whole block a no-op.
+import os
+import sqlite3
+import sys
 
-for _bootstrap in ("01- Imports.py", "02- Utility Functions.py"):
-    with open(_code_dir + _bootstrap) as _fh:
-        exec(_fh.read(), globals())
+try:
+    import oncotriage  # noqa: F401
+except ImportError:
+    for _candidate, _how in (
+        (os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+         if "__file__" in globals() else None, "__file__"),
+        (os.getcwd(), "cwd"),
+    ):
+        if _candidate and os.path.isdir(os.path.join(_candidate, "oncotriage")):
+            if _candidate not in sys.path:
+                sys.path.insert(0, _candidate)
+            print(f"[Bootstrap] oncotriage package found at {_candidate} "
+                  f"(via {_how}); added to sys.path")
+            break
+    else:
+        raise
+    del _candidate, _how
 
-# 13 chains 03, 08, 09, 10 itself — do not list them again here.
-exec_chain(
-    ["13- LangGraph Agent.py"],
-    caller_file=_code_dir + "32- Pan-Cancer Resolution Test.py",
-    caller_globals=globals(),
-    chain_label="01 → 02 → 13 (→ 03, 08, 09, 10)",
+from oncotriage.agent import deps
+from oncotriage.agent.mesh_expansion import (
+    MESH_RESOLUTION_NO_CONDITIONS,
+    MESH_RESOLUTION_NO_FILTER,
+    expand_query_from_mesh,
+    resolve_patient_mesh,
 )
+from oncotriage.agent.retrieval import (
+    apply_mesh_relevance_boost,
+    node_query_expansion,
+)
+from oncotriage.agent.terminal import (
+    node_error_handler,
+    node_finalize,
+    node_no_candidates,
+)
+from oncotriage.paths import inferences_path
+from oncotriage.registries.mesh import specific_cancer_trees
+
+_CANCER_REGISTRY = deps.get_cancer_registry()
+_MESH_FILTER = deps.get_mesh_filter()
 
 
 #------------------------------------------------------------------------------
@@ -370,15 +413,15 @@ print("=" * 70)
 # file opens the production database any more, and this was the only place that
 # did.
 #
-# The chain still loads File 14 — initialize_database has to come from
-# somewhere — but it is now loaded for the function rather than for a side
-# effect it no longer has.
-exec_chain(
-    ["14- Database Logger.py"],
-    caller_file=_code_dir + "32- Pan-Cancer Resolution Test.py",
-    caller_globals=globals(),
-    chain_label="14",
-)
+# File 14's definitions have to come from somewhere — but they are now reached
+# for the function rather than for a side effect it no longer has.
+#
+# PASS 20d-1: this was an exec_chain of "14- Database Logger.py" and is now an
+# import of the module that file re-exports. It is left HERE, below Test 6,
+# rather than hoisted into the import block at the top, because its placement is
+# the point the comment above makes: nothing before this line needs the storage
+# layer, and importing oncotriage.storage.database_logger opens no database.
+from oncotriage.storage.database_logger import initialize_database
 
 import shutil as _shutil
 import tempfile as _tempfile

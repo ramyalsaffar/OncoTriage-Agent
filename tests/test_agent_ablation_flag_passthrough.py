@@ -27,12 +27,31 @@ Covers:
        both are recomputed locally inside Stage 4 and read no Stage 3 state
     6. retrieval_mode — node_hybrid_retrieval has one return, so no path forks
 
-No network and no LLM: _MESH_FILTER and _CANCER_REGISTRY are replaced with
-stubs, and every flag exercised here takes a branch that never reaches MedCPT
-or Qdrant. The cross-encoder is loaded by file 13 at import but never run.
+No network and no LLM: the MeSH filter and the cancer registry are replaced with
+stubs through oncotriage/agent/deps.py, and no flag exercised here reaches Qdrant
+or an OpenAI endpoint.
+
+THE MedCPT CROSS-ENCODER IS LOADED, AND IT IS RUN. Measured, 2026-08-06, by
+inspecting deps.cached_keys() after a full run: `medcpt_tokenizer` and
+`medcpt_model` are both built. Test 2 calls node_cross_encoder_rerank, which
+reaches models.score_pairs -> medcpt_score_pairs -> deps.get_medcpt_tokenizer(),
+so the ~110 MB model is resolved on first use and really scores the pairs. That
+is local work against the HuggingFace cache -- no network once the cache is
+warm, no LLM, nothing billed -- but it is neither free nor instant, and this
+file's docstring claimed the opposite in both directions before: it said the
+cross-encoder was "loaded by file 13 at import but never run", of which the
+second half was already false and the first half stopped being true when item
+20c pass 2c made the load lazy.
+
+The FastEmbed BM25 model is NOT built (measured the same way:
+oncotriage.embedding._MODEL stays None). The `fastembed` LIBRARY does arrive in
+sys.modules regardless, because qdrant_client.fastembed_common imports it; that
+is a library import, not a model construction, and it was equally true under the
+old exec chain.
 
 Run from terminal (or F5 in Spyder):
-    python "35- Ablation State Passthrough Test.py"
+    python tests/test_agent_ablation_flag_passthrough.py
+    (was: python "35- Ablation State Passthrough Test.py")
 
 Exit codes:
     0 -- all assertions passed
@@ -42,30 +61,40 @@ Exit codes:
 
 # Run needed file
 #----------------
-# Item 20a: this file sits in the code directory, so __file__ locates it with
-# no hardcoded path. __file__ is bound when the file is run as a script (every
-# documented entry point for it) and when Spyder runfile()s it. In a bare
-# interactive paste it is not bound, and the working directory is the only
-# remaining candidate -- taken, but announced, never silently.
-import os as _os_boot
-if "__file__" in globals():
-    _code_dir = _os_boot.path.dirname(_os_boot.path.abspath(__file__)) + _os_boot.sep
-else:
-    _code_dir = _os_boot.getcwd() + _os_boot.sep
-    print(f"[Bootstrap] __file__ unbound; using the working directory as the code directory: {_code_dir}")
-del _os_boot
+# PASS 20d-1: THIS FILE IMPORTS THE PACKAGE. It used to exec "01- Imports.py"
+# and "02- Utility Functions.py" into its own globals and then exec_chain()
+# "13- LangGraph Agent.py", which is how `deps` and the two node functions used
+# to arrive. Item 20c split File 13 into oncotriage/agent/, so each name comes
+# from the module that defines it.
+#
+# THE CANDIDATE DIRECTORY IS THE PARENT OF THIS FILE'S, not this file's own.
+# The same block Files 47, 48 and 49 carry looks one level up because this file
+# now sits in tests/ and the package sits BESIDE tests/, not inside it.
+# `pip install -e .` makes the whole block a no-op.
+import os
+import sys
 
-for _bootstrap in ("01- Imports.py", "02- Utility Functions.py"):
-    with open(_code_dir + _bootstrap) as _fh:
-        exec(_fh.read(), globals())
+try:
+    import oncotriage  # noqa: F401
+except ImportError:
+    for _candidate, _how in (
+        (os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+         if "__file__" in globals() else None, "__file__"),
+        (os.getcwd(), "cwd"),
+    ):
+        if _candidate and os.path.isdir(os.path.join(_candidate, "oncotriage")):
+            if _candidate not in sys.path:
+                sys.path.insert(0, _candidate)
+            print(f"[Bootstrap] oncotriage package found at {_candidate} "
+                  f"(via {_how}); added to sys.path")
+            break
+    else:
+        raise
+    del _candidate, _how
 
-# 13 chains 03, 08, 09, 10 itself — do not list them again here.
-exec_chain(
-    ["13- LangGraph Agent.py"],
-    caller_file=_code_dir + "35- Ablation State Passthrough Test.py",
-    caller_globals=globals(),
-    chain_label="01 → 02 → 13 (→ 03, 08, 09, 10)",
-)
+from oncotriage.agent import deps, filtering, retrieval
+from oncotriage.agent.filtering import node_rule_based_filter
+from oncotriage.agent.retrieval import node_cross_encoder_rerank
 
 
 #------------------------------------------------------------------------------
@@ -302,9 +331,17 @@ print("=" * 70)
 # non-degeneracy block after the walk is what makes that state impossible now.
 #
 # The four nodes live in two modules, so both are parsed and their trees merged.
+#
+# PASS 20d-1: EACH PATH COMES FROM THE MODULE'S OWN __file__, not from a
+# directory guess. It used to be os.path.join(_code_dir, "oncotriage", "agent",
+# ...), which was correct only while this file sat in the code directory; moving
+# it into tests/ would have made both paths one level off and every open() below
+# raise. Asking the imported module where it lives cannot go stale that way, and
+# it is also the same object the checks are about -- a path built by hand could
+# name a copy of the agent that this process never imported.
 _AGENT_NODE_SOURCES = (
-    os.path.join(_code_dir, "oncotriage", "agent", "retrieval.py"),
-    os.path.join(_code_dir, "oncotriage", "agent", "filtering.py"),
+    os.path.abspath(retrieval.__file__),
+    os.path.abspath(filtering.__file__),
 )
 
 _tree = ast.Module(body=[], type_ignores=[])

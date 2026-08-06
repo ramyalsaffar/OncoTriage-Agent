@@ -26,9 +26,14 @@ Each factory builds at most one object and returns the same one thereafter, so
 the eager names the shim binds are the SAME objects the package hands out. That
 matters: ``45- Fixture Capture.py`` and ``46- Fixture Replay.py`` rebind
 ``openai_client`` / ``qdrant_client`` in the shared namespace to recording
-proxies, and ``36- Logging Contract Test.py`` swaps in a stub. Those seams work
-because the pipeline resolves the NAME at call time; the factories exist for
-the package's own callers, not to replace the seam.
+proxies. That seam works because the pipeline resolves the NAME at call time;
+the factories exist for the package's own callers, not to replace it.
+
+``36- Logging Contract Test.py`` used to be named here as a third consumer. It
+is not one: it stopped rebinding at pass 20c-2c and installs
+``deps.set_override(deps.QDRANT_CLIENT, ...)`` instead, and pass 20d-1 moved it
+to ``tests/test_storage_inference_logging_contract.py`` (see
+``tests/FILE NUMBER MAPPING.md``).
 
 Imports ``oncotriage.paths`` and nothing else from the project. It must never
 import ``oncotriage.utils``: that is the cycle item 20c removed.

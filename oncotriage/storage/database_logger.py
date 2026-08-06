@@ -147,7 +147,7 @@ def resolve_inference_db_path(db_path=None):
 #
 # What moved: only the executable statements. The two COLUMN_ADDITIONS dicts
 # stay at module level, byte for byte, because they are pure data and because
-# 40- ECOG Logging Test.py reads INFERENCE_COLUMN_ADDITIONS directly. The
+# tests/test_storage_ecog_logging.py reads INFERENCE_COLUMN_ADDITIONS directly. The
 # migration loops are unchanged; they are what adds a column without destroying
 # rows, and items 29b and 20a both depend on that.
 #

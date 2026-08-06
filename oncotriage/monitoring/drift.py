@@ -13,7 +13,7 @@ been captured after the thing went wrong. See that function for the reasoning.
 
 Moved out of ``20- Drift Detection.py`` by item 20c, pass 3b.
 ``20- Drift Detection.py`` survives as a full re-export shim, because
-``41- ECOG Availability Metric Test.py`` exec-chains it and reads nine of these
+``tests/test_monitoring_ecog_availability_drift.py`` exec-chains it and reads nine of these
 names out of the shared namespace with no import of its own.
 
 FILE 20 CONTAINED ZERO IMPORT STATEMENTS
@@ -38,7 +38,7 @@ THREE OTHER THINGS CHANGED, and each was a defect rather than a tidy-up
 
    ``log_drift_metrics`` and ``get_baseline_and_current_data`` each did
    ``sqlite3.connect(inferences_path)`` against a bare global, and
-   "41- ECOG Availability Metric Test.py" line 357 REBOUND that global at a
+   "tests/test_monitoring_ecog_availability_drift.py" line 357 REBOUND that global at a
    temporary database in order to keep its one round-trip test off the
    production inferences.db. A module function resolves its globals in its own
    module, so the moment this file became a module that rebinding would have
@@ -177,8 +177,9 @@ def resolve_drift_db_path(db_path=None):
     data it had not read, into a table nobody asked it to touch -- which is a
     worse outcome than either half alone.
 
-    THE ARGUMENT STILL WINS OVER THE VARIABLE. "41- ECOG Availability Metric
-    Test.py" passes an explicit scratch path and asserts on what
+    THE ARGUMENT STILL WINS OVER THE VARIABLE.
+    "tests/test_monitoring_ecog_availability_drift.py"
+    passes an explicit scratch path and asserts on what
     ``log_drift_metrics`` returns; if a stray export outranked that argument the
     assertion would be reporting the export rather than the isolation it exists
     to check.
@@ -186,7 +187,7 @@ def resolve_drift_db_path(db_path=None):
     IT DOES NOT CONSULT THE EXEC NAMESPACE, and that asymmetry is the point. The
     shim's wrappers are what read ``globals().get("inferences_path")``; this one
     always answers "what does a caller that passed nothing get", which is
-    exactly the question "41- ECOG Availability Metric Test.py" needs answered
+    exactly the question "tests/test_monitoring_ecog_availability_drift.py" needs answered
     in order to show that passing its scratch path is doing any work. If this
     resolved through the namespace too, that test would be comparing a value
     against itself.

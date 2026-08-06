@@ -45,13 +45,22 @@ Covers:
        nor the Qdrant client, so section 7 proves the summary text without a
        single network call.
 
-No network and no LLM. File 13 is loaded (its registries are local files and
-its BM25 model is a local FastEmbed cache), but no OpenAI or Qdrant call is
-made: the only File 13 functions invoked are compute_patient_hash and
-_create_patient_summary, both pure.
+No network and no LLM, and NO MODEL EITHER. The agent used to arrive by
+exec-chaining "13- LangGraph Agent.py", which built MedCPT and FastEmbed at
+exec time; item 20c pass 2c made both lazy behind oncotriage/agent/deps.py. The
+only agent functions invoked are compute_patient_hash and
+_create_patient_summary, and neither resolves a model or a client.
+
+Measured, 2026-08-06, by inspecting deps.cached_keys() and
+oncotriage.embedding._MODEL after a full run: the dependencies resolved are
+`cancer_registry`, `lab_registry` and `mesh_filter` -- all three local file
+reads, none of them a model or a network client -- and no model of either kind
+is constructed. (The `fastembed` LIBRARY still arrives in sys.modules via
+qdrant_client.fastembed_common; that is a library import, not a model.)
 
 Run from terminal (or F5 in Spyder):
-    python "39- ECOG Performance Status Surfacing Test.py"
+    python tests/test_fhir_ecog_surfacing.py
+    (was: python "39- ECOG Performance Status Surfacing Test.py")
 
 Exit codes:
     0 -- all assertions passed
@@ -61,31 +70,54 @@ Exit codes:
 
 # Run needed file
 #----------------
-# Item 20a: this file sits in the code directory, so __file__ locates it with
-# no hardcoded path. __file__ is bound when the file is run as a script (every
-# documented entry point for it) and when Spyder runfile()s it. In a bare
-# interactive paste it is not bound, and the working directory is the only
-# remaining candidate -- taken, but announced, never silently.
-import os as _os_boot
-if "__file__" in globals():
-    _code_dir = _os_boot.path.dirname(_os_boot.path.abspath(__file__)) + _os_boot.sep
-else:
-    _code_dir = _os_boot.getcwd() + _os_boot.sep
-    print(f"[Bootstrap] __file__ unbound; using the working directory as the code directory: {_code_dir}")
-del _os_boot
+# PASS 20d-1: THIS FILE IMPORTS THE PACKAGE. It used to exec "01- Imports.py"
+# and "02- Utility Functions.py" into its own globals and then exec_chain()
+# Files 13 and 07, which is how every name below used to arrive. The old
+# comment about 07 being loaded after 13 without either shadowing the other is
+# obsolete by construction: an import binds one name per module and cannot
+# overwrite another module's.
+#
+# THE CANDIDATE DIRECTORY IS THE PARENT OF THIS FILE'S, not this file's own.
+# The same block Files 47, 48 and 49 carry looks one level up because this file
+# now sits in tests/ and the package sits BESIDE tests/, not inside it.
+# `pip install -e .` makes the whole block a no-op.
+import json
+import os
+import sys
+from datetime import date
+from pathlib import Path
 
-for _bootstrap in ("01- Imports.py", "02- Utility Functions.py"):
-    with open(_code_dir + _bootstrap) as _fh:
-        exec(_fh.read(), globals())
+try:
+    import oncotriage  # noqa: F401
+except ImportError:
+    for _candidate, _how in (
+        (os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+         if "__file__" in globals() else None, "__file__"),
+        (os.getcwd(), "cwd"),
+    ):
+        if _candidate and os.path.isdir(os.path.join(_candidate, "oncotriage")):
+            if _candidate not in sys.path:
+                sys.path.insert(0, _candidate)
+            print(f"[Bootstrap] oncotriage package found at {_candidate} "
+                  f"(via {_how}); added to sys.path")
+            break
+    else:
+        raise
+    del _candidate, _how
 
-# 13 chains 03, 08, 09 and 10 itself -- they are NOT listed here. 07 is loaded
-# after it; the two files share no top-level name, so neither shadows the other.
-exec_chain(
-    ["13- LangGraph Agent.py", "07- FHIR Parser.py"],
-    caller_file=_code_dir + "39- ECOG Performance Status Surfacing Test.py",
-    caller_globals=globals(),
-    chain_label="01 → 02 → 13 → 07",
+from oncotriage.agent import patient as _agent_patient
+from oncotriage.agent.patient import _create_patient_summary, compute_patient_hash
+from oncotriage.config import DATA_SNAPSHOT_DATE
+from oncotriage.fhir import parser as _fhir_parser
+from oncotriage.fhir.parser import (
+    ECOG_SELECTION_COUNTS,
+    ECOG_VALUE_SHAPE_COUNTS,
+    _parse_ecog_observation,
+    _select_ecog_performance_status,
+    parse_fhir_bundle,
 )
+from oncotriage.paths import data_patient_path
+from oncotriage.utils import get_age_reference_date
 
 
 #------------------------------------------------------------------------------
@@ -638,9 +670,19 @@ print("\n" + "=" * 70)
 print("8. STRUCTURAL -- no OpenAI or Qdrant call in the proven path")
 print("=" * 70)
 
-# inspect.getsource() cannot be used: every project file is exec()'d into this
-# namespace under the shared-globals chain, so its functions have no source file
-# to read back. The source is read off disk and sliced with ast instead.
+# The source is read off disk and sliced with ast rather than through
+# inspect.getsource(). Under the old shared-globals chain that was forced --
+# every project file was exec()'d into this namespace, so its functions had no
+# source file to read back. It is now a choice, and still the right one: these
+# checks assert that a string is ABSENT from a function body, and ast lets the
+# docstring be dropped so a comment explaining the rule is not read as a
+# violation of it. inspect.getsource() would hand back the docstring too.
+#
+# PASS 20d-1: `filename` IS AN ABSOLUTE PATH, taken from the imported module's
+# own __file__ by the two constants below. It used to be a package-relative
+# string that this function prefixed with _code_dir, which was correct only
+# while this file sat beside the package; from tests/ every read would have
+# raised.
 def _function_source(filename: str, function_name: str) -> str:
     """Source of one top-level function's BODY, docstring excluded.
 
@@ -649,7 +691,7 @@ def _function_source(filename: str, function_name: str) -> str:
     very string being searched for. Grepping the whole function makes the
     comment that documents the rule indistinguishable from a violation of it.
     """
-    text = Path(_code_dir + filename).read_text(encoding="utf-8")
+    text = Path(filename).read_text(encoding="utf-8")
     for node in ast.parse(text).body:
         if not (isinstance(node, ast.FunctionDef) and node.name == function_name):
             continue
@@ -675,10 +717,12 @@ def _function_source(filename: str, function_name: str) -> str:
 # never runs. Either way the checks stop being performed, and the fix is to
 # point at the file the definitions are actually in.
 #
-# _function_source() prefixes _code_dir, so a package-relative path works
-# unchanged; the separator is forward-slash because that is what os.path.join
-# would produce here anyway and this string is only ever concatenated.
-_PARSER_MODULE = os.path.join("oncotriage", "fhir", "parser.py")
+# PASS 20d-1: RETARGETED A THIRD TIME, and this time at something that cannot
+# go stale. The path is the imported module's own __file__, so it names the very
+# module this process imported -- a hand-built path can name a different copy,
+# and a _code_dir-relative one breaks the moment the test file moves, which is
+# exactly what this pass did.
+_PARSER_MODULE = os.path.abspath(_fhir_parser.__file__)
 
 # RETARGETED AGAIN IN PASS 20c-2c. Both File 13 entries moved: the agent is
 # oncotriage/agent/ now, and both of these functions live in patient.py.
@@ -690,7 +734,7 @@ _PARSER_MODULE = os.path.join("oncotriage", "fhir", "parser.py")
 # it. The non-degeneracy check under the loop is added anyway, because the
 # checks themselves are all "this string is ABSENT", which an empty body
 # satisfies.
-_PATIENT_MODULE = os.path.join("oncotriage", "agent", "patient.py")
+_PATIENT_MODULE = os.path.abspath(_agent_patient.__file__)
 
 _PROVEN_PATH = (
     (_PATIENT_MODULE, "_create_patient_summary"),

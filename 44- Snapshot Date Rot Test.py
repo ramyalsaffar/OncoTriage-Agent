@@ -112,9 +112,19 @@ for _bootstrap in ("01- Imports.py", "02- Utility Functions.py"):
 # disk in a fresh process.
 _CONFIG_FILE = _code_dir + "oncotriage/config.py"
 
+# RETARGETED IN PASS 20d-1. Both suites moved into tests/ and were renamed for
+# what they cover. THIS IS THE ONLY FUNCTIONAL FILENAME REFERENCE TO EITHER OF
+# THEM ANYWHERE IN THE REPOSITORY -- measured with a repository-wide grep for
+# each of the eleven moved filenames AS A STRING, not just for their symbols,
+# because a name-grep is what missed File 40 reading File 26 by filename in
+# pass 20c-3d.
+#
+# The paths are relative to _code_dir, which is what _run_suite passes as cwd,
+# so nothing else in this file changes. Every check below reads a suite's
+# printed "Passed:"/"Failed:" lines, which the move did not touch.
 _SUITES = [
-    "38- Birth Date and Demographics Parser Test.py",
-    "39- ECOG Performance Status Surfacing Test.py",
+    "tests/test_fhir_birth_date_and_demographics.py",
+    "tests/test_fhir_ecog_surfacing.py",
 ]
 
 # The dates under test. Each must be at or after the corpus generation date --
@@ -218,7 +228,7 @@ print(f"  config file:        {os.path.relpath(_CONFIG_FILE, _code_dir)}")
 print(f"  sha256 before:      {_PRISTINE_SHA}")
 print(f"  committed value:    {_COMMITTED_DATE.group(0) if _COMMITTED_DATE else 'NOT FOUND'}")
 print(f"  dates under test:   {', '.join(_SNAPSHOT_DATES)}")
-print(f"  suites:             {', '.join(s[:2] for s in _SUITES)}")
+print(f"  suites:             {', '.join(os.path.basename(s) for s in _SUITES)}")
 print()
 
 _ROWS = []
@@ -240,11 +250,11 @@ try:
         _baseline_ok = True
         for _suite in _SUITES:
             _rc, _p, _f, _labels = _run_suite(_suite)
-            check(f"baseline: {_suite[:2]} passes unmodified", _rc, 0)
+            check(f"baseline: {os.path.basename(_suite)} passes unmodified", _rc, 0)
             _baseline_ok &= (_rc == 0)
-            print(f"    {_suite[:2]}  exit={_rc}  passed={_p}  failed={_f}", flush=True)
+            print(f"    {os.path.basename(_suite)}  exit={_rc}  passed={_p}  failed={_f}", flush=True)
             if _rc != 0:
-                fail(f"baseline for {_suite[:2]} is usable",
+                fail(f"baseline for {os.path.basename(_suite)} is usable",
                      f"exited {_rc} with the config file UNMODIFIED, so a non-zero exit "
                      f"at any date proves nothing. First failures: {_labels[:3]}")
 
@@ -268,9 +278,9 @@ try:
 
                 for _suite in _SUITES:
                     _rc, _p, _f, _labels = _run_suite(_suite)
-                    check(f"{_suite[:2]} passes at DATA_SNAPSHOT_DATE = {_date}", _rc, 0)
-                    _ROWS.append((_date, _suite[:2], _rc, _p, _f, _labels))
-                    print(f"  {_date}  {_suite[:2]}  exit={_rc}  "
+                    check(f"{os.path.basename(_suite)} passes at DATA_SNAPSHOT_DATE = {_date}", _rc, 0)
+                    _ROWS.append((_date, os.path.basename(_suite), _rc, _p, _f, _labels))
+                    print(f"  {_date}  {os.path.basename(_suite)}  exit={_rc}  "
                           f"passed={_p}  failed={_f}", flush=True)
 
                 # Restore and verify BEFORE the next date, so a failed restore
