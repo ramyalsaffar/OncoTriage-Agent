@@ -2,20 +2,217 @@
 # Docker Compose Configuration
 # ============================================================================
 # Production-ready multi-service orchestration
-# 
+#
 # Quick Start:
-#   docker-compose up -d              # Start all services
-#   docker-compose logs -f fastapi    # View logs
-#   docker-compose down               # Stop all services
+#   docker compose up -d              # Start all services
+#   docker compose logs -f fastapi    # View logs
+#   docker compose down               # Stop all services (volumes survive)
+#   docker compose down -v            # Stop and DELETE the volumes
 #
 # Access:
 #   - API Docs: http://localhost:8000/docs
 #   - Dashboard: http://localhost:8501
-#   - Airflow: http://localhost:8080 (admin/check api-server logs for password)
+#   - Airflow: http://localhost:8080 (admin / admin)
 #   - Qdrant: http://localhost:6333/dashboard
+#
+# NOTE ON THE AIRFLOW CREDENTIALS ABOVE. This header used to say "admin/check
+# api-server logs for password", which contradicted the file itself:
+# AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS below is hardcoded to `admin:admin`,
+# so the api-server generates no password and there is nothing in its log to
+# look for. The header is corrected to match what the file actually configures.
+# THE CREDENTIALS THEMSELVES ARE NOT ITEM 21's TO FIX and are deliberately left
+# alone — the hardcoded admin:admin pair, the WEBSERVER__SECRET_KEY literal
+# ending in "change_in_production", and the empty FERNET_KEY are all reported in
+# item 21's write-up and belong to the security/secrets item.
+#
+# WHAT ITEM 21 CHANGED, and why each mattered:
+#   1. `version: v5.0.2` removed — not a Compose file-format version, and
+#      compose warned that the whole field is obsolete.
+#   2. The `trialbridge` network reference on `streamlit` — a network no
+#      top-level block declared. THIS ALONE MADE THE PROJECT UNSTARTABLE:
+#      compose validates before it does anything, so `docker compose up` failed
+#      outright rather than starting four of five services, and `docker compose
+#      build` never reached the Dockerfile either. Every other defect in this
+#      file and in the Dockerfile was therefore undiscoverable until it was
+#      fixed.
+#   3. Storage. The container had none — see the `volumes` block at the bottom.
+#   4. The `.env` mount pointed at "../04- Keys/" on two of four services, and
+#      that directory does not exist.
+#   5. One image name for one Dockerfile, and it is now a legal one.
+#   6. The DAG is generated. Nothing generated it before.
+#   7. `--reload` removed from the API.
+#   8. The qdrant healthcheck no longer calls a binary that image does not have,
+#      and the airflow-scheduler healthcheck no longer calls `pgrep`, which the
+#      application image does not have either. Both probes had been failing
+#      100% of the time, and because `fastapi` waits on `qdrant` being HEALTHY,
+#      the first of those would have kept the API down on its own.
+#   9. `.:/app` removed. It is what made the `.env` mount race and what caused
+#      Docker to create a stray empty `.env` in the source directory. See
+#      x-app-volumes.
+#  10. A SIXTH SERVICE, `airflow-dag-processor`. Airflow 3 parses DAGs in a
+#      separate component; without it the DAG is generated, valid, and never
+#      registered. See that service for why the failure is invisible.
 # ============================================================================
 
-version: v5.0.2
+# Explicit project name. Without it compose derives one from the directory name,
+# which here is "03- Code" — it sanitises to "03-code", and a leading digit plus
+# the renumbering this project does to its directories makes that an unstable
+# identity for volumes and networks to hang off.
+name: clinical-trial-patient-match
+
+
+# ============================================================================
+# SHARED FRAGMENTS
+# ============================================================================
+# Anchors, not repetition. The `.env` defect (#4 above) was a two-two split
+# across four hand-maintained copies of the same three lines; the copies are
+# what made it possible for half of them to be wrong for months without anyone
+# noticing. There is one copy of each now.
+
+# ONE image from one Dockerfile, and EXACTLY ONE SERVICE DECLARES THE BUILD.
+#
+# `fastapi` used to build `trialbridge:latest` while the other three built
+# `Clinical-Trial-Patient-Match:latest`, from the same context and the same
+# file — two names, two builds, two chances to diverge.
+#
+# THE OLD NAME WAS ALSO ILLEGAL. A Docker repository name must be lowercase, so
+# `Clinical-Trial-Patient-Match:latest` is rejected with "invalid reference
+# format" — three of the five services could not have been built under it
+# whatever else was fixed. The container_name values keep their original
+# capitalisation, which is allowed there.
+#
+# AND FOUR SERVICES SHARING ONE `build:` DO NOT DEDUPLICATE — they RACE. Giving
+# all four the same build section and the same image name (the shape this file
+# had, and the shape the fix started as) makes compose run four concurrent
+# builds that all try to export to the same tag, and three of them lose:
+#
+#     target airflow-scheduler: failed to solve:
+#     image "docker.io/library/clinical-trial-patient-match:latest": already exists
+#
+# The image is produced, so it looks like it worked, but `docker compose build`
+# exits NON-ZERO — which fails any CI step that checks. Measured, not reasoned:
+# it is what the first build of this file did.
+#
+# So the build section lives on `fastapi` alone and the other three carry only
+# the `image:` reference. Compose builds before it creates, so a plain
+# `docker compose up` on a machine with no image still works — verified from a
+# clean `docker rmi`, not assumed.
+x-app-image: &app-image
+  image: clinical-trial-patient-match:latest
+
+x-app-environment: &app-environment
+  PYTHONUNBUFFERED: "1"
+  # oncotriage/paths.py switches to _DOCKER_PATHS on this (or on /.dockerenv).
+  DOCKER_CONTAINER: "true"
+
+x-app-volumes: &app-volumes
+  # THERE IS NO `.:/app` HERE ANY MORE, and removing it was forced by a
+  # measurement rather than chosen for tidiness.
+  #
+  # `.:/app` bind-mounted the host code directory over the whole of /app. The
+  # `.env` mount below then has to place a FILE inside that bind mount, and
+  # Docker must create the mountpoint to do it. On Docker Desktop it refuses:
+  #
+  #     error mounting ".../05- Keys/.env" to rootfs at "/app/.env":
+  #     create mountpoint for /app/.env mount: mountpoint
+  #     "/run/host_virtiofs/.../03- Code/.env" is outside of rootfs
+  #
+  # and — worse than refusing — for the containers that won the race it did NOT
+  # refuse: it CREATED AN EMPTY `.env` IN THE SOURCE DIRECTORY on the host and
+  # mounted over that. Observed, both halves: two of five containers failed to
+  # start with the error above, and `03- Code/.env` existed afterwards, a
+  # zero-byte file Docker had put in the repository. It is gitignored, so it
+  # would not have shown up in `git status` either.
+  #
+  # Three further things `.:/app` cost, each independently sufficient:
+  #
+  #   * it hid everything the image builds into /app — the entrypoint, the
+  #     helper scripts, `/app/requirements/` — which is why those had to be
+  #     copied to /usr/local/ to be reachable at all;
+  #   * it makes the running code the developer's working tree rather than the
+  #     built image, so the artefact is not what was tested;
+  #   * its only real consumer was `--reload`, which is gone (see `fastapi`).
+  #
+  # TO GET DEVELOPMENT MODE BACK, add `- .:/app` to this list and `--reload` to
+  # the API command — and expect to create an empty `03- Code/.env` first, or to
+  # move the credentials mount out of /app.
+  #
+  # Credentials. THE SOURCE IS "../05- Keys/", which is the directory that
+  # exists; `fastapi` and `airflow-webserver` used to name "../04- Keys/",
+  # which does not. The target is unchanged and must not change: the container's
+  # `keys_path` is "/app/", so `load_env_keys()` opens exactly /app/.env.
+  #
+  # `create_host_path: false` is the part that turns this from a fixed typo into
+  # a fixed CLASS of defect. Docker's default for a missing bind source is to
+  # CREATE IT, as a directory — so the old file did not fail, it silently
+  # mounted an empty directory at /app/.env and the failure surfaced much later
+  # as a confusing IsADirectoryError. With this flag a missing or misspelled
+  # credentials path fails at `up`, naming the path.
+  - type: bind
+    source: ../05- Keys/.env
+    target: /app/.env
+    read_only: true
+    bind:
+      create_host_path: false
+
+  # STORAGE. Before item 21 there was none of this, and `oncotriage/paths.py`
+  # points the container at /app/data/, /app/data/inferences.db, /app/results/
+  # and /app/checkpoint/ regardless. With `.:/app` covering all of /app, those
+  # resolved into the bind-mounted source tree or into nothing at all, and
+  # `log_inference` failed on the first request — as a caught, "non-critical"
+  # error, so the request still returned 200 and the row was simply lost.
+  #
+  # NAMED VOLUMES, NOT BIND MOUNTS FROM THE SIBLING DIRECTORIES, and the reason
+  # is the acceptance criterion itself: this has to work FROM A CLEAN CHECKOUT.
+  # Only "03- Code" is version-controlled. A clean checkout has no "02- Data",
+  # no "04- Results" and no "08- Checkpoint" to bind, and a bind mount with a
+  # missing source is the exact defect being fixed three lines above. Two
+  # further reasons, either of which would be enough on its own:
+  #
+  #   * the names do not line up. _DOCKER_PATHS wants /app/data/patients/,
+  #     /app/data/trials/, /app/data/mesh/; the host tree has "01- Patients",
+  #     "02- Trials", "04- MeSH". Mapping them would take a bind mount per
+  #     directory, and /app/results/fhir_exploration/ vs "01- FHIR Exploration"
+  #     does not map at all.
+  #   * `inferences_path` would then be the PRODUCTION inferences.db. Every
+  #     container request would write real rows into the real database — the
+  #     precise accident CLAUDE.md records for Files 18 and 19, which put six
+  #     junk rows into it and were only noticed because they changed which query
+  #     File 16 died at. A container writing into it over a single-file bind
+  #     mount, with SQLite locking crossing the VM boundary, is worse.
+  #
+  # The cost is stated rather than hidden: the container starts with an EMPTY
+  # corpus and an EMPTY index, so it can answer /health, /pipeline/info and a
+  # POST /match end to end, but it retrieves nothing until someone populates the
+  # volumes. Getting the real corpus in is a data-loading step, not a
+  # compose-file property. Use `docker compose cp` or point
+  # ONCOTRIAGE_INFERENCES_DB somewhere else if you want the host's database.
+  - app_data:/app/data
+  - app_results:/app/results
+  - app_checkpoint:/app/checkpoint
+
+  # MedCPT (~110 MB) and the FastEmbed BM25 model, cached across restarts.
+  # HF_HOME and FASTEMBED_CACHE_PATH point here (see the Dockerfile). Without
+  # this volume every recreated container re-downloads both, on the first
+  # request, inside that request.
+  - model_cache:/opt/models
+
+x-airflow-environment: &airflow-environment
+  AIRFLOW_HOME: /app/airflow_home
+  AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////app/airflow_home/airflow.db
+  AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+  # NOT A DEFECT AND NOT TO BE TOUCHED. This agrees with the Docker branch of
+  # oncotriage/paths.py (airflow_path == "/app/airflow_home/") and with
+  # write_dag_file, which writes to `Path(dags_root) / 'dags'`. Checked, not
+  # assumed. The real gap in this area was that nothing generated the DAG.
+  AIRFLOW__CORE__DAGS_FOLDER: /app/airflow_home/dags
+  # REPORTED, NOT FIXED (belongs to the secrets item): a literal secret key, an
+  # empty Fernet key, and a hardcoded admin password.
+  AIRFLOW__WEBSERVER__SECRET_KEY: Clinical-Trial-Patient-Match_secret_change_in_production
+  AIRFLOW__CORE__FERNET_KEY: ""
+  AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: admin:admin
+
 
 services:
 
@@ -34,13 +231,29 @@ services:
     volumes:
       - qdrant_storage:/qdrant/storage
     environment:
-      - QDRANT__SERVICE__GRPC_PORT=6334
-      - QDRANT__LOG_LEVEL=INFO
+      QDRANT__SERVICE__GRPC_PORT: "6334"
+      QDRANT__LOG_LEVEL: INFO
+    # THIS IMAGE HAS NEITHER wget NOR curl. Measured, not assumed:
+    #   docker run --rm --entrypoint sh qdrant/qdrant:v1.18.3 \
+    #       -c 'command -v wget curl'
+    # prints nothing. The old healthcheck invoked `wget`, so it could never
+    # succeed — qdrant would have sat in `starting` until it went `unhealthy`,
+    # and `fastapi` waits on `condition: service_healthy`, so THE API WOULD
+    # NEVER HAVE STARTED even after every other defect here was fixed.
+    #
+    # bash IS present, so the probe is written in bash alone: open a TCP socket
+    # to the REST port, send a real HTTP request, and require "200" in the
+    # status line. That is a stronger check than a port probe — it proves the
+    # HTTP server is answering, not merely that something is listening.
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:6333/healthz"]
-      interval: 30s
+      test:
+        - CMD
+        - bash
+        - -c
+        - 'exec 3<>/dev/tcp/127.0.0.1/6333 || exit 1; printf "GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3 || exit 1; read -r line <&3 || exit 1; case "$$line" in *200*) exit 0;; *) exit 1;; esac'
+      interval: 10s
       timeout: 10s
-      retries: 3
+      retries: 5
       start_period: 40s
     networks:
       - Clinical-Trial-Patient-Match
@@ -50,36 +263,96 @@ services:
   # FASTAPI - Clinical Trial Matching API
   # ==========================================================================
   fastapi:
+    # THE ONLY SERVICE WITH A BUILD SECTION. See the x-app-image comment above:
+    # four services sharing one build section race on the image export and make
+    # `docker compose build` exit non-zero.
+    <<: *app-image
     build:
       context: .
       dockerfile: Dockerfile
-    image: trialbridge:latest
     container_name: Clinical-Trial-Patient-Match-api
     restart: unless-stopped
     ports:
       - "8000:8000"
-    volumes:
-      # Mount entire codebase for development
-      - .:/app
-      # Mount .env file (read-only for security)
-      - ../04- Keys/.env:/app/.env:ro
-    environment:
-      - PYTHONUNBUFFERED=1
-      - QDRANT_URL=http://qdrant:6333
-      - DOCKER_CONTAINER=true
+    volumes: *app-volumes
+    # `QDRANT_URL: http://qdrant:6333` USED TO BE HERE AND IT NEVER DID ANYTHING.
+    # Removed rather than left as a comforting lie. Measured inside the running
+    # container:
+    #
+    #   os.environ QDRANT_URL before load_env_keys -> http://qdrant:6333
+    #   config.get_qdrant_url()                    -> https://bd717e5f-....qdrant.io
+    #   os.environ QDRANT_URL after  load_env_keys -> https://bd717e5f-....qdrant.io
+    #
+    # `oncotriage/config.py:get_qdrant_url()` returns `get_keys()['qdrant_url']`,
+    # and `get_keys()` calls `paths.load_env_keys()`, which POPS all three key
+    # names out of os.environ and reloads them from the .env file with
+    # `override=True`. That is deliberate there — it exists so a stale exported
+    # variable cannot shadow the credentials file — and the consequence here is
+    # that no environment variable can redirect Qdrant. The .env in
+    # "05- Keys/" points at Qdrant Cloud.
+    #
+    # SO THE `qdrant` SERVICE BELOW IS NOT USED BY THE APPLICATION. It starts, it
+    # is healthy, and `GET /collections` on it returns an empty list while
+    # `/pipeline/info` reports 12,067 indexed trials — from the cloud. The
+    # service is kept because it is declared infrastructure and because the
+    # index-build path (`11- RAG Trial Indexer.py`) is where a local Qdrant
+    # would be pointed; making the container actually use it needs a change in
+    # `oncotriage`, not in this file, and that is reported as a follow-up rather
+    # than smuggled in here.
+    environment: *app-environment
     working_dir: /app
-    # Use bash with single quotes to handle filename with spaces
-    command: >
-      bash -c 'exec uvicorn "17- FastAPI Server:app" --host 0.0.0.0 --port 8000 --reload'
+    # NO SHELL AND NO QUOTING PROBLEM. The old command wrapped everything in
+    # `bash -c '...'` to survive the space in the filename; an argument vector
+    # has no such problem, and the entrypoint `exec`s it directly.
+    #
+    # `--reload` IS GONE. Three reasons, in order of weight:
+    #   * the file's own header calls this stack production-ready, and an
+    #     auto-reloading API is not that;
+    #   * the reloader watches the whole of /app, which `.:/app` makes the
+    #     entire source tree, so any editor write — including a .pyc, a
+    #     scratch file, or a test writing beside the code — restarts the API
+    #     mid-request;
+    #   * a restart re-runs the lifespan handler, which recompiles the LangGraph
+    #     pipeline. Cheap today only because models are lazy; the first
+    #     retrieval after every restart re-pays for MedCPT and FastEmbed.
+    # Reinstate it deliberately for development, not by default.
+    #
+    # ONE THING `--reload` DOES *NOT* COST, measured rather than repeated: it
+    # does not load the app twice. The obvious worry is that the reloader parent
+    # and its child both import the application and both compile the graph. They
+    # do not. Running this image with `--reload` and counting:
+    #
+    #     processes                     -> 3 (supervisor, resource tracker, one
+    #                                          spawned server child)
+    #     "[Rate Limiting]" banners     -> 1   (create_app ran once)
+    #     "Compiling LangGraph pipeline"-> 1   (lifespan ran once)
+    #
+    # uvicorn's supervisor only resolves the `module:attribute` STRING; the
+    # child is what imports it. So that particular argument for removing
+    # `--reload` would have been wrong, and the three above are the real ones.
+    #
+    # The module name is still "17- FastAPI Server", not the package path. That
+    # is deliberate: File 17 documents that it keeps `app` at module level
+    # BECAUSE this line imports it, and `uvicorn oncotriage.api.server:app`
+    # reaches the identical object if you prefer it.
+    command:
+      - uvicorn
+      - "17- FastAPI Server:app"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
     depends_on:
       qdrant:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
+      interval: 10s
       timeout: 10s
-      retries: 3
-      start_period: 15s
+      retries: 5
+      # 15s was optimistic: startup imports torch, transformers and langgraph
+      # before the lifespan handler compiles the graph.
+      start_period: 90s
     networks:
       - Clinical-Trial-Patient-Match
 
@@ -88,80 +361,27 @@ services:
   # STREAMLIT - Monitoring Dashboard
   # ==========================================================================
   streamlit:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: Clinical-Trial-Patient-Match:latest
+    <<: *app-image
     container_name: Clinical-Trial-Patient-Match-dashboard
     restart: unless-stopped
     ports:
       - "8501:8501"
-    volumes:
-      - .:/app
-      - ../05- Keys/.env:/app/.env:ro
-    environment:
-      - PYTHONUNBUFFERED=1
-      - DOCKER_CONTAINER=true
+    volumes: *app-volumes
+    environment: *app-environment
     working_dir: /app
-    # Use quotes around filename with spaces
-    command: >
-      bash -c 'exec streamlit run "21- Streamlit Dashboard.py"
-      --server.port=8501
-      --server.address=0.0.0.0
-      --server.headless=true
-      --browser.gatherUsageStats=false'
+    command:
+      - streamlit
+      - run
+      - 21- Streamlit Dashboard.py
+      - --server.port=8501
+      - --server.address=0.0.0.0
+      - --server.headless=true
+      - --browser.gatherUsageStats=false
     depends_on:
       - qdrant
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 15s
-    networks:
-      - trialbridge
-
-
-  # ==========================================================================
-  # AIRFLOW WEBSERVER - Trial Refresh UI
-  # ==========================================================================
-  airflow-webserver:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: Clinical-Trial-Patient-Match:latest
-    container_name: Clinical-Trial-Patient-Match-airflow-web
-    restart: unless-stopped
-    ports:
-      - "8080:8080"
-    volumes:
-      - .:/app
-      - ../04- Keys/.env:/app/.env:ro
-      # Airflow needs persistent database and logs
-      - airflow_db:/app/airflow_home
-    environment:
-      # Use /app/airflow_home for Airflow home directory
-      - AIRFLOW_HOME=/app/airflow_home
-      - AIRFLOW__CORE__EXECUTOR=SequentialExecutor
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=sqlite:////app/airflow_home/airflow.db
-      - AIRFLOW__CORE__LOAD_EXAMPLES=False
-      - AIRFLOW__CORE__DAGS_FOLDER=/app/airflow_home/dags
-      - AIRFLOW__WEBSERVER__SECRET_KEY=Clinical-Trial-Patient-Match_secret_change_in_production
-      - AIRFLOW__CORE__FERNET_KEY=
-      - AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS=admin:admin
-      - DOCKER_CONTAINER=true
-      - PYTHONUNBUFFERED=1
-    working_dir: /app
-    command: >
-      bash -c "
-      mkdir -p /app/airflow_home/dags &&
-      airflow db migrate && exec airflow api-server --port 8080
-      "
-    depends_on:
-      - qdrant
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
-      interval: 30s
+      interval: 10s
       timeout: 10s
       retries: 5
       start_period: 60s
@@ -170,43 +390,177 @@ services:
 
 
   # ==========================================================================
+  # AIRFLOW WEBSERVER - Trial Refresh UI
+  # ==========================================================================
+  # ALSO THE INITIALISER. It migrates the metadata database and generates the
+  # DAG before serving, and the scheduler waits for it to report healthy, so
+  # both of those have happened before anything parses the dags folder. That is
+  # what removed the scheduler's `sleep 30` — a fixed sleep is a race with a
+  # comfortable margin, not an ordering.
+  airflow-webserver:
+    <<: *app-image
+    container_name: Clinical-Trial-Patient-Match-airflow-web
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # Same set as x-app-volumes, plus airflow_home. Written out rather than
+      # merged because YAML cannot append to an aliased sequence.
+      - type: bind
+        source: ../05- Keys/.env
+        target: /app/.env
+        read_only: true
+        bind:
+          create_host_path: false
+      - app_data:/app/data
+      - app_results:/app/results
+      - app_checkpoint:/app/checkpoint
+      - model_cache:/opt/models
+      # Airflow needs persistent database, logs and dags
+      - airflow_db:/app/airflow_home
+    environment:
+      <<: [*app-environment, *airflow-environment]
+    working_dir: /app
+    # `mkdir -p /app/airflow_home/dags` is gone from here: write_dag_file
+    # creates the directory itself (`dag_dir.mkdir(parents=True,
+    # exist_ok=True)`), and the entrypoint has already created
+    # /app/airflow_home/ from oncotriage/paths.py's own table.
+    #
+    # THE GENERATION STEP IS THE FIX FOR DEFECT 7. Nothing in the container ever
+    # ran it, so the dags folder was created empty and the scheduler parsed an
+    # empty directory forever. See docker/generate_dag.py for what it does on a
+    # second `up` and on an `up` after the generator changes — it is idempotent,
+    # and it replaces a stale DAG loudly instead of leaving the scheduler
+    # running the old one.
+    command:
+      - bash
+      - -c
+      - >
+        airflow db migrate &&
+        python /usr/local/lib/oncotriage-docker/generate_dag.py &&
+        exec airflow api-server --port 8080
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/api/v2/monitor/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+    networks:
+      - Clinical-Trial-Patient-Match
+
+
+  # ==========================================================================
+  # AIRFLOW DAG PROCESSOR - Parses the dags folder into the metadata database
+  # ==========================================================================
+  # NEW IN ITEM 21, AND THE STACK CANNOT RUN A DAG WITHOUT IT.
+  #
+  # In Airflow 2 the scheduler parsed the dags folder itself. In Airflow 3 —
+  # which is what `requirements.txt` pins and what `airflow api-server` in the
+  # webserver command implies — DAG PARSING IS A SEPARATE COMPONENT, and there
+  # is no in-scheduler mode to fall back to (`airflow config get-value scheduler
+  # standalone_dag_processor` returns nothing in 3.1.7: the option is gone
+  # because the behaviour is no longer optional).
+  #
+  # THE SYMPTOM IS PARTICULARLY BAD, which is why this is called out rather than
+  # quietly added. With the DAG generated and the scheduler running:
+  #
+  #     airflow dags list-import-errors  ->  No data found     (looks fine)
+  #     airflow tasks list trial_refresh_weekly
+  #                                      ->  scrape_and_save, rebuild_index,
+  #                                          verify_index      (looks fine!)
+  #     airflow dags list                ->  No data found     (it is NOT there)
+  #
+  # `tasks list` reads the DAG file directly, so it succeeds and makes the DAG
+  # look registered. Only `dags list`, which reads the metadata database, tells
+  # the truth. The webserver's own /api/v2/monitor/health said so too, in a
+  # field easy to skim past: "dag_processor": {"status": null}.
+  #
+  # So without this service the stack comes up entirely healthy, the UI works,
+  # the DAG file is present and valid, and the DAG never runs and never appears.
+  airflow-dag-processor:
+    <<: *app-image
+    container_name: Clinical-Trial-Patient-Match-airflow-dag-processor
+    restart: unless-stopped
+    volumes:
+      - type: bind
+        source: ../05- Keys/.env
+        target: /app/.env
+        read_only: true
+        bind:
+          create_host_path: false
+      - app_data:/app/data
+      - app_results:/app/results
+      - app_checkpoint:/app/checkpoint
+      - model_cache:/opt/models
+      - airflow_db:/app/airflow_home
+    environment:
+      <<: [*app-environment, *airflow-environment]
+    working_dir: /app
+    command: ["airflow", "dag-processor"]
+    depends_on:
+      # Same reason as the scheduler: the webserver migrates the database and
+      # writes the DAG, and this component reads both.
+      airflow-webserver:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type DagProcessorJob --local || exit 1"]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+      start_period: 120s
+    networks:
+      - Clinical-Trial-Patient-Match
+
+
+  # ==========================================================================
   # AIRFLOW SCHEDULER - Background Task Execution
   # ==========================================================================
   airflow-scheduler:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: Clinical-Trial-Patient-Match:latest
+    <<: *app-image
     container_name: Clinical-Trial-Patient-Match-airflow-scheduler
     restart: unless-stopped
     volumes:
-      - .:/app
-      - ../05- Keys/.env:/app/.env:ro
+      # Same set as x-app-volumes, plus airflow_home. Written out rather than
+      # merged because YAML cannot append to an aliased sequence.
+      - type: bind
+        source: ../05- Keys/.env
+        target: /app/.env
+        read_only: true
+        bind:
+          create_host_path: false
+      - app_data:/app/data
+      - app_results:/app/results
+      - app_checkpoint:/app/checkpoint
+      - model_cache:/opt/models
       # Share same Airflow DB with webserver
       - airflow_db:/app/airflow_home
     environment:
-      - AIRFLOW_HOME=/app/airflow_home
-      - AIRFLOW__CORE__EXECUTOR=SequentialExecutor
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=sqlite:////app/airflow_home/airflow.db
-      - AIRFLOW__CORE__LOAD_EXAMPLES=False
-      - AIRFLOW__CORE__DAGS_FOLDER=/app/airflow_home/dags
-      - DOCKER_CONTAINER=true
-      - PYTHONUNBUFFERED=1
+      <<: [*app-environment, *airflow-environment]
     working_dir: /app
-    command: >
-      bash -c "
-      sleep 30 &&
-      exec airflow scheduler
-      "
+    command: ["airflow", "scheduler"]
     depends_on:
+      # service_healthy, not service_started. The webserver runs `db migrate`
+      # and generates the DAG; starting the scheduler before those finish is a
+      # scheduler that parses an empty folder and a second process migrating the
+      # same SQLite file. The old file used service_started plus `sleep 30`.
       airflow-webserver:
-        condition: service_started
+        condition: service_healthy
+    # `pgrep -f 'airflow scheduler'` WAS THE OLD PROBE AND THIS IMAGE HAS NO
+    # pgrep — python:3.11-slim ships no procps, measured. So the scheduler could
+    # never report healthy either. procps is installed now (it is worth having
+    # in a container you may need to debug), but the probe asks Airflow instead:
+    # `airflow jobs check` consults the job table, so it answers "is the
+    # scheduler doing its job" rather than "does a process with this name
+    # exist".
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'airflow scheduler' || exit 1"]
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --local || exit 1"]
       interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+      timeout: 30s
+      retries: 5
+      start_period: 120s
     networks:
       - Clinical-Trial-Patient-Match
 
@@ -214,6 +568,9 @@ services:
 # ============================================================================
 # NETWORKS
 # ============================================================================
+# ONE network. `streamlit` used to ask for `trialbridge`, which nothing here
+# declares — see defect 2 in the header for why that made the whole project
+# unstartable rather than breaking one service.
 networks:
   Clinical-Trial-Patient-Match:
     driver: bridge
@@ -223,8 +580,23 @@ networks:
 # ============================================================================
 # VOLUMES - Persistent Data Storage
 # ============================================================================
+# app_data, app_results and app_checkpoint are new in item 21. Without them the
+# container had nowhere to put anything: see the long comment on x-app-volumes.
+#
+# They survive `docker compose down` and are removed by `docker compose down -v`.
+# That is what makes "a request writes a row and the row is still there
+# afterwards" true across a restart, and it is also why docker/generate_dag.py
+# has to cope with a dags directory that already has a file in it.
 volumes:
   qdrant_storage:
     name: Clinical-Trial-Patient-Match-qdrant-data
   airflow_db:
     name: Clinical-Trial-Patient-Match-airflow-db
+  app_data:
+    name: Clinical-Trial-Patient-Match-app-data
+  app_results:
+    name: Clinical-Trial-Patient-Match-app-results
+  app_checkpoint:
+    name: Clinical-Trial-Patient-Match-app-checkpoint
+  model_cache:
+    name: Clinical-Trial-Patient-Match-model-cache

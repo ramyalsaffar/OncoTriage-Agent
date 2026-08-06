@@ -4678,12 +4678,86 @@ check("...and guards the call, so reading the file still does nothing",
           and "__name__" in ast.unparse(n.test)
           and "__main__" in ast.unparse(n.test)
           for n in _f21_tree.body), True)
-# docker-compose runs `streamlit run "21- Streamlit Dashboard.py"`. That command
-# is unchanged by this pass and must stay that way; the file being a valid
-# script under that exact invocation is what makes the container keep working.
+# docker-compose must still launch the dashboard with `streamlit run` on File
+# 21. The file being a valid script under that invocation is what makes the
+# container keep working.
+#
+# THIS USED TO BE A SUBSTRING MATCH and item 21 broke it without breaking the
+# property:
+#
+#     check(..., 'streamlit run "21- Streamlit Dashboard.py"' in _COMPOSE, True)
+#
+# Item 21 changed the command from a shell string, `bash -c 'exec streamlit run
+# "21- ..."'`, to an argument VECTOR. The vector needs no shell and no quoting —
+# which is the whole reason the quotes were there — so the literal substring is
+# gone while the command is the same command. The check failed; nothing was
+# wrong.
+#
+# That is the third instance in this project of the failure mode CLAUDE.md
+# already records twice ("a substring is not a definition"): File 47's own BM25
+# construction-site check, which `fastembed.SparseTextEmbedding(...)` evaded,
+# and File 49's revision selector, which matched its own deletion comment. So
+# this asks the actual question — parse the compose file, take the streamlit
+# service's command, reduce it to tokens whichever form it is written in, and
+# require `streamlit`, `run`, <script> to appear as three consecutive tokens.
+# The script name is compared EXACTLY; a typo in it still fails.
 _COMPOSE = open(os.path.join(_code_dir, "docker-compose.yml"), encoding="utf-8").read()
+
+
+def _compose_command_tokens(compose_text, service):
+    """The service's command as a token list, for either compose command form.
+
+    Handles the three shapes that mean the same thing here:
+      * a string            -> shlex
+      * a list of arguments -> already tokens
+      * ["bash", "-c", "..."] (or sh) -> shlex of the script, since that is
+        where the real command lives. Without this the wrapper would hide it.
+    """
+    import shlex
+
+    import yaml
+
+    command = yaml.safe_load(compose_text)["services"][service].get("command")
+    if command is None:
+        return []
+    if isinstance(command, str):
+        return shlex.split(command)
+    tokens = list(command)
+    if len(tokens) >= 3 and os.path.basename(tokens[0]) in ("bash", "sh") \
+            and tokens[1] in ("-c", "-lc"):
+        return shlex.split(tokens[2])
+    return tokens
+
+
+def _launches_dashboard(tokens, script="21- Streamlit Dashboard.py"):
+    want = ["streamlit", "run", script]
+    return any(tokens[i:i + 3] == want for i in range(len(tokens)))
+
+
+_STREAMLIT_TOKENS = _compose_command_tokens(_COMPOSE, "streamlit")
 check("docker-compose still launches the dashboard by the same command",
-      'streamlit run "21- Streamlit Dashboard.py"' in _COMPOSE, True)
+      _launches_dashboard(_STREAMLIT_TOKENS), True)
+# NON-DEGENERATE: an empty or unparsed command would satisfy nothing above but
+# would also make the check meaningless if the helper silently returned [].
+check("...and the command was actually parsed (not an empty token list)",
+      len(_STREAMLIT_TOKENS) >= 3, True)
+# NEGATIVE CONTROLS. Each is the real check run against a doctored compose text,
+# and each must FAIL. Without these, "does the command launch the dashboard"
+# would be indistinguishable from "does the helper return something truthy".
+check("...control: a compose file running a DIFFERENT script does not pass",
+      _launches_dashboard(_compose_command_tokens(
+          _COMPOSE.replace("21- Streamlit Dashboard.py",
+                           "21- Streamlit Dashboard BACKUP.py"), "streamlit")),
+      False)
+check("...control: dropping `run` from the command does not pass",
+      _launches_dashboard([t for t in _STREAMLIT_TOKENS if t != "run"]), False)
+check("...control: the shell-string form is still recognised (it is the form "
+      "this file shipped with before item 21)",
+      _launches_dashboard(_compose_command_tokens(
+          'services: {streamlit: {command: '
+          '[bash, -c, \'exec streamlit run "21- Streamlit Dashboard.py" '
+          '--server.port=8501\']}}', "streamlit")),
+      True)
 
 
 # --- 6f. every name File 21 used to bind still exists ----------------------

@@ -40,12 +40,60 @@ from collections import Counter
 from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
 
-import caffeine as _caffeine_mod
 import httpx
 from qdrant_client.http.exceptions import UnexpectedResponse
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from oncotriage import config
+
+
+# ---------------------------------------------------------------------------
+# `caffeine`, which RUNS A macOS BINARY WHEN YOU IMPORT IT (item 21)
+# ---------------------------------------------------------------------------
+#
+# THIS IMPORT WAS UNGUARDED AND IT MADE THE WHOLE PACKAGE UNIMPORTABLE ON LINUX.
+# Measured inside the container, not reasoned about: the last two statements of
+# the installed `caffeine.py` are
+#
+#     on()
+#     atexit.register(off)
+#
+# and `on()` is `subprocess.Popen(['caffeinate', '-is', '-w', str(_pid)])`.
+# `caffeinate` is a macOS binary. So on Linux `import caffeine` does not fail
+# with an ImportError — it gets all the way through the module body and dies
+# with
+#
+#     FileNotFoundError: [Errno 2] No such file or directory: 'caffeinate'
+#
+# Every module in this package reaches `oncotriage.utils` sooner or later, so
+# that single line meant `import oncotriage.api.server` — and therefore every
+# container service — could never start. The API container crash-looped on it.
+#
+# TWO THINGS ABOUT THE except CLAUSE ARE DELIBERATE:
+#
+#   * it catches `Exception`, NOT `ImportError`. The failure is an OS error
+#     raised from a subprocess spawned during module execution. An
+#     `except ImportError` — the obvious guard, and the one a reader will be
+#     tempted to tighten this to — would not catch it, and the package would go
+#     back to being unimportable on Linux.
+#   * the reason is RECORDED, not swallowed. `CAFFEINE_IMPORT_ERROR` carries the
+#     exception type and message and `CaffeinateSession` prints it, so a run
+#     that lost sleep-prevention says why rather than being silently different
+#     from a run that kept it.
+#
+# This changes nothing on macOS: the import succeeds and `_caffeine_mod` is the
+# module, exactly as before. `CaffeinateSession` already wrapped its `.on()` and
+# `.off()` calls in try/except and already documented itself as degrading on
+# non-macOS platforms — the intent was always that this is optional. Only the
+# import was not optional, which is why the degradation could never be reached.
+try:
+    import caffeine as _caffeine_mod
+except Exception as _caffeine_exc:      # noqa: BLE001 - see above, not ImportError
+    _caffeine_mod = None
+    CAFFEINE_IMPORT_ERROR = f"{type(_caffeine_exc).__name__}: {_caffeine_exc}"
+    del _caffeine_exc
+else:
+    CAFFEINE_IMPORT_ERROR = None
 
 
 #------------------------------------------------------------------------------
@@ -430,6 +478,17 @@ class CaffeinateSession:
         self.label = label
 
     def __enter__(self):
+        # The import itself may have failed — see the guarded import at the top
+        # of this module. That is the ordinary case on Linux and in every
+        # container. Reported by NAME rather than folded into the generic
+        # "unavailable" message below, because the two are different facts: this
+        # one means the package could not be loaded at all, and it carries the
+        # reason.
+        if _caffeine_mod is None:
+            print(f"Caffeine unavailable ({CAFFEINE_IMPORT_ERROR}) "
+                  f"(continuing: {self.label})")
+            return self
+
         try:
             _caffeine_mod.on(display=False)
             print(f"Caffeine ON (preventing sleep: {self.label})")
@@ -438,6 +497,8 @@ class CaffeinateSession:
         return self
 
     def __exit__(self, *args):
+        if _caffeine_mod is None:
+            return
         try:
             _caffeine_mod.off()
             print(f"Caffeine OFF ({self.label})")
