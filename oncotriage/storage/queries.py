@@ -56,6 +56,23 @@ CRITERION IS DELIBERATELY BROKEN HERE. ``report()`` now runs to the end.
         invisible because it could not run, are fixed alongside it; see
         ``_PIPELINE_CONSISTENCY_SQL``.
 
+A CAPPED LISTING IS NOT A REPORT (the residual pass after item 38)
+------------------------------------------------------------------
+``pipeline_consistency`` shows at most ``CONSISTENCY_LISTING_LIMIT`` rows. Until
+this pass it did so with NO ORDER BY and NO STATEMENT OF HOW MANY THERE WERE, so
+twenty issues and twenty thousand printed identically and the twenty shown could
+differ between two executions of the same query on the same data. On a fresh
+full-corpus run that is the difference between a clean pipeline and a broken one,
+rendered the same way.
+
+``pipeline_consistency_totals`` counts by category over every row with no limit
+and prints IMMEDIATELY ABOVE the listing; the listing gained
+``ORDER BY issue, patient_id, id``. Both queries interpolate ONE
+``_CONSISTENCY_CASE_SQL`` and ONE ``_CONSISTENCY_CLASSIFIED_SQL``, so they cannot
+drift apart -- there is no second copy to forget. On a database with no issues
+the companion returns nothing and ``render='skip_if_empty'`` prints nothing at
+all, so a clean run still shows exactly the one clean message it always did.
+
 ONE PER-MODEL COST CALCULATION IN THE PROJECT
 ---------------------------------------------
 ``price_model_groups()`` is it. ``cost_by_model()`` feeds it the SQL GROUP BY;
@@ -75,6 +92,16 @@ one way that mattered: the dashboard used ``pd.isna()`` and this module used
     ``pd.isna()``. ``model_groups_from_frame`` passes ``min_count=1`` so that
     pandas reports an all-NULL group as NULL too, rather than importing "no
     value was ever recorded" into "the recorded value is zero".
+
+AN UNKNOWN COST IS NOT A ZERO COST, AND ``cost_complete`` IS HOW YOU ASK. A group
+whose token sums are NULL, or whose model is NULL while it carries tokens, prices
+at $0.00 -- a real float, not a NULL -- so ``recomputed_cost`` sums cleanly and
+under-reports by exactly the unpriceable spend, with nothing in the number to say
+so. The reason was in a ``note`` column, and prose is not a field. Both consumers
+of the priced frame -- ``print_cost_by_model`` and the dashboard's cost tab --
+ask the boolean and qualify their totals with it. The priced VALUE is
+deliberately unchanged: NaN would propagate into every aggregate and produce no
+number at all, which is worse than a number that says it is partial.
 
 WHAT IMPORTING THIS MODULE DOES
 -------------------------------
@@ -120,6 +147,8 @@ class Query:
                        'transpose'           print(df.T)
                        'to_string'           print(df.to_string(index=False))
                        'empty_or_to_string'  a message when empty, else to_string
+                       'skip_if_empty'       nothing at all when empty -- not
+                                             even the heading -- else to_string
                        'custom'              report() calls a named function; the
                                              frame alone does not describe the
                                              output (Query 5 prints a prompt,
@@ -232,24 +261,59 @@ for _name, _value in (("RRF_POOL_SIZE", RRF_POOL_SIZE),
 del _name, _value
 
 
-_PIPELINE_CONSISTENCY_SQL = f"""
-    SELECT * FROM (
-    SELECT
-        patient_id,
-        candidates_retrieved,
-        candidates_reranked,
-        candidates_filtered,
-        candidates_evaluated,
-        eligible_matches,
-        near_misses,
-        not_evaluable_trials,
-        CASE
+CONSISTENCY_GUARD_CATEGORY = 'Counters not reported'
+"""The category the NULL guard emits.
+
+Named because "49- Database Query Layer Test.py" locates the guard branch inside
+``_CONSISTENCY_CASE_SQL`` by this string in order to derive which columns are
+guarded and which are merely compared. A literal in the test would be a second
+copy of a value the SQL owns."""
+
+CONSISTENCY_OK_CATEGORY = 'OK'
+"""The CASE's ELSE. Both consistency queries filter on ``issue != 'OK'``, and the
+test derives the set of reportable categories by removing this one."""
+
+CONSISTENCY_LISTING_LIMIT = 20
+"""How many rows the LISTING shows. File 16 wrote ``LIMIT 20`` and the number is
+unchanged; it is a named constant now so that the companion's note can state the
+cap, and so a caller can rebuild an uncapped variant from the shipped SQL rather
+than retyping it."""
+
+
+# ---------------------------------------------------------------------------
+# ONE CASE, TWO QUERIES (the residual weakness pass after item 38)
+# ---------------------------------------------------------------------------
+#
+# WHAT WAS WRONG WITH ONE QUERY. `LIMIT 20` sat on the outer select, after
+# `WHERE issue != 'OK'`, with no ORDER BY. Three consequences, and on a fresh
+# 22,000-patient run they are the difference between a clean report and a broken
+# pipeline PRINTED IDENTICALLY:
+#
+#   1. it caps the rows and says nothing about how many there were, so twenty
+#      issues and twenty thousand issues render the same;
+#   2. with no ORDER BY, SQLite may return a different twenty on each execution,
+#      so a reader cannot re-run the report and see the same sample, and a
+#      diff between two runs is meaningless;
+#   3. a reader who acts on the twenty has no way to know whether that is the
+#      whole story.
+#
+# The companion query below counts by category over EVERY row with no limit, and
+# report() prints it IMMEDIATELY ABOVE the listing. The listing keeps its cap and
+# gains a total order.
+#
+# THE TWO AGREE BY CONSTRUCTION, NOT BY REVIEW. There is exactly one CASE
+# expression in this module and exactly one classification select; both queries
+# interpolate them. Editing the categories, the bounds or the NULL handling in
+# one and not the other is not a mistake that can be made, because there is no
+# "other" to edit. File 49 fires the demonstration: it mutates a copy of
+# _CONSISTENCY_CASE_SQL, rebuilds both, and shows both changed.
+_CONSISTENCY_CASE_SQL = f"""        CASE
             WHEN candidates_retrieved IS NULL
               OR candidates_reranked  IS NULL
               OR candidates_filtered  IS NULL
               OR candidates_evaluated IS NULL
               OR eligible_matches     IS NULL
-              OR near_misses          IS NULL       THEN 'Counters not reported'
+              OR near_misses          IS NULL       THEN '{CONSISTENCY_GUARD_CATEGORY}'
             WHEN candidates_retrieved > {RRF_POOL_SIZE}    THEN 'Retrieval anomaly'
             WHEN candidates_reranked  > {TOP_K_CANDIDATES} THEN 'Rerank anomaly'
             WHEN not_evaluable_trials IS NOT NULL
@@ -260,11 +324,60 @@ _PIPELINE_CONSISTENCY_SQL = f"""
              AND candidates_evaluated <  (eligible_matches + near_misses)
                                                     THEN 'Count mismatch'
             WHEN candidates_filtered < candidates_evaluated THEN 'Filter < evaluated'
-            ELSE 'OK'
-        END as issue
+            ELSE '{CONSISTENCY_OK_CATEGORY}'
+        END as issue"""
+"""THE classification. Every rule about what counts as an inconsistency is here
+and nowhere else.
+
+ITS TEXT IS UNCHANGED BY THIS PASS -- categories, bounds and NULL handling are
+what item 38 shipped, and File 49 pins the block by sha256 measured before the
+refactor as well as by behaviour. What moved is only that it is now a named
+constant two queries interpolate instead of a run of lines inside one of them.
+
+THE NULL GUARD IS THE FIRST BRANCH AND IT IS NOT ARBITRARY WHICH COLUMNS IT
+NAMES. The rule File 49 enforces, derived from this text rather than listed in
+the test: every column this CASE COMPARES must either be in the guard, or have
+its own explicit NULL-aware branch. `not_evaluable_trials` is deliberately
+absent from the guard and has the second treatment, because it is an added
+column that is legitimately NULL on pre-migration rows -- flagging those as
+"counters not reported" would report a schema migration as a pipeline defect.
+Any seventh counter added later must pick one of the two treatments; the check
+fails if it picks neither."""
+
+
+_CONSISTENCY_CLASSIFIED_SQL = f"""
+    SELECT
+        id,
+        patient_id,
+        candidates_retrieved,
+        candidates_reranked,
+        candidates_filtered,
+        candidates_evaluated,
+        eligible_matches,
+        near_misses,
+        not_evaluable_trials,
+{_CONSISTENCY_CASE_SQL}
     FROM inferences
-) WHERE issue != 'OK'
-LIMIT 20
+"""
+"""Every row with its issue category attached. The shared body of both
+consistency queries.
+
+`id` IS SELECTED BECAUSE THE LISTING'S ORDER BY NEEDS A TOTAL ORDER AND
+patient_id IS NOT UNIQUE. Measured on the production database rather than
+assumed: 1,106 rows carry 1,004 distinct patient_ids, up to 2 rows apiece --
+"19- FastAPI Server Batch Test.py" re-POSTs the same two bundles, and a
+re-run of the batch runner over a resumed checkpoint does the same. Ordering by
+patient_id alone therefore leaves ties, and SQLite is free to break them
+differently on each execution, which is the non-determinism this pass exists to
+remove. `id` is `inferences`' INTEGER PRIMARY KEY, so (issue, patient_id, id) is
+total. It is also the value you need in order to look the row up, which is why
+selecting it is not purely mechanical."""
+
+
+_PIPELINE_CONSISTENCY_SQL = f"""
+    SELECT * FROM ({_CONSISTENCY_CLASSIFIED_SQL}) WHERE issue != '{CONSISTENCY_OK_CATEGORY}'
+ORDER BY issue, patient_id, id
+LIMIT {CONSISTENCY_LISTING_LIMIT}
 """
 """The pipeline consistency query, with its two bounds resolved from config.
 
@@ -304,9 +417,37 @@ stray WHEN meant this query had never executed once:
     output does not show eligible_matches, near_misses or not_evaluable_trials
     cannot be acted on without a second query.
 
-LIMIT 20 IS LEFT AS FILE 16 WROTE IT. It is a pre-existing cap unrelated to the
-defects above and changing it would change the report's volume on a full
-database for no reason this item owns."""
+WHAT THE RESIDUAL PASS ADDED, AND NOTHING ELSE
+----------------------------------------------
+``ORDER BY issue, patient_id, id`` before the cap, and ``id`` in the column list
+so that ordering is TOTAL -- see ``_CONSISTENCY_CLASSIFIED_SQL`` for why
+patient_id alone is not, measured on the production table. The CASE is
+byte-identical to what item 38 shipped and File 49 pins it by sha256.
+
+THE CAP IS STILL ``CONSISTENCY_LISTING_LIMIT`` ROWS AND IS NO LONGER SILENT.
+``pipeline_consistency_totals`` runs immediately before this query in the
+registry, counts every row by category with no limit, and says in its notes that
+what follows is a capped sample. When there are no issues at all that query
+returns nothing and prints nothing, so a clean database still shows the clean
+message and only the clean message."""
+
+
+_PIPELINE_CONSISTENCY_SUMMARY_SQL = f"""
+    SELECT issue, COUNT(*) as n
+    FROM ({_CONSISTENCY_CLASSIFIED_SQL}) WHERE issue != '{CONSISTENCY_OK_CATEGORY}'
+    GROUP BY issue
+    ORDER BY n DESC, issue
+"""
+"""How many rows fall in each issue category, over EVERY row.
+
+NO LIMIT, AND THAT IS THE ENTIRE POINT. The listing beside it answers "show me
+some bad rows"; this answers "how bad is it", which is the question a capped
+listing cannot answer and had been silently declining to.
+
+``ORDER BY n DESC, issue`` is total, because ``issue`` is the GROUP BY key and is
+therefore unique in the result. Its second term is not a tiebreaker of last
+resort -- with two categories at the same count, `n DESC` alone would leave the
+order to SQLite, and this frame is printed."""
 
 
 #------------------------------------------------------------------------------
@@ -740,6 +881,25 @@ QUERIES = (
     # database_logger.py), have the terminal nodes write them, and add a query
     # under a NEW key. Reviving this one would reintroduce a query that reads
     # columns nothing writes.
+    # THE TOTALS COME FIRST, AND THE ORDER IS THE POINT. `report()` walks
+    # QUERIES in order, so putting this entry immediately before the listing is
+    # what puts "how many, by category, over every row" above "here are up to
+    # twenty of them". Reversed, a reader meets the sample first and has already
+    # formed a judgement by the time the totals arrive.
+    #
+    # render='skip_if_empty' prints NOTHING -- not the heading, not the notes,
+    # not an empty table -- when there are no issues, so a clean database still
+    # renders exactly the one clean message the listing has always printed.
+    Query(
+        key='pipeline_consistency_totals',
+        heading='=== PIPELINE CONSISTENCY: ISSUE COUNTS (ALL ROWS) ===',
+        render='skip_if_empty',
+        blank_after=True,
+        notes=(f'Counted over every row, with no limit. The listing below is a '
+               f'SAMPLE capped at {CONSISTENCY_LISTING_LIMIT} rows, ordered by '
+               f'(issue, patient_id, id).',),
+        sql=_PIPELINE_CONSISTENCY_SUMMARY_SQL,
+    ),
     # File 16 line 579, `df_consistency`. SQL and its full argument at
     # _PIPELINE_CONSISTENCY_SQL above.
     Query(
@@ -1209,9 +1369,27 @@ with the column named instead of raising AttributeError somewhere in the loop.""
 PRICED_COST_COLUMNS = ("matching_model", "model_recorded", "rows",
                        "input_tokens", "output_tokens", "reasoning_tokens",
                        "input_cost", "output_cost", "recomputed_cost",
-                       "stored_cost", "note")
+                       "cost_complete", "stored_cost", "note")
 """What ``price_model_groups`` returns, in order. Pinned because the dashboard
-renders it and "49- Database Query Layer Test.py" asserts on it."""
+renders it and "49- Database Query Layer Test.py" asserts on it.
+
+``cost_complete`` sits immediately after ``recomputed_cost`` because it is that
+column's qualifier and nothing else's -- see ``price_model_groups``."""
+
+
+COST_INCOMPLETE_NOTES = (
+    "no token counts recorded (SUM was NULL, not 0)",
+    "input token count not recorded (SUM was NULL, not 0)",
+    "output token count not recorded (SUM was NULL, not 0)",
+    "NO MODEL RECORDED BUT TOKENS PRESENT — logging defect",
+)
+"""The note fragments that accompany ``cost_complete = False``.
+
+Declared so "49- Database Query Layer Test.py" can assert the boolean and the
+prose never disagree -- a False with no explanation, or an explanation with a
+True beside it, are both worse than either alone. ``price_model_groups``
+computes the boolean from the DATA rather than from these strings; the strings
+are what a human reads and the test is what keeps the two in step."""
 
 
 def _nullable_int(value):
@@ -1274,6 +1452,36 @@ def price_model_groups(df_groups) -> pd.DataFrame:
     facts -- "no token count was ever recorded for these rows" versus "these
     rows consumed nothing" -- and collapsing the first into the second is how a
     logging hole reads as a cheap run.
+
+    ``cost_complete`` IS THE ONE FIELD A CONSUMER HAS TO ASK, and it exists
+    because the note column was not enough. ``recomputed_cost`` is a float on
+    every row including the ones that could not be priced, so anything that SUMS
+    the column -- a total, a per-patient average, a projection to 1000 patients,
+    a published figure -- under-reports by exactly the unpriceable spend and
+    reads as a cheap run unless somebody happened to read the prose beside it.
+    "Unknown reported as zero" is the one error a reader cannot detect from the
+    number, and cost per patient is a number this project publishes.
+
+    It is False in exactly two situations, both meaning "this group's
+    recomputed_cost is not an accounting of its spend":
+
+        the token SUMs are NULL     -- nothing is known about what was consumed;
+        the model is NULL AND the group carries tokens -- consumption is known
+                                       and there is no rate to price it at.
+
+    It is TRUE for a NULL-model group carrying zero tokens, which is the
+    ordinary no-candidates run: nothing was spent and $0.00 is the whole truth.
+
+    IT DELIBERATELY SAYS NOTHING ABOUT ``stored_cost``. That column carries its
+    own NA and a consumer can ask ``df["stored_cost"].isna()`` directly;
+    ``recomputed_cost`` cannot be asked, which is the whole reason it needs a
+    separate flag. One boolean spanning two different sums would answer neither
+    question exactly.
+
+    THE PRICED VALUE IS UNCHANGED. An incomplete group still prices at $0.00
+    rather than NaN. Turning it into NaN would propagate through every aggregate
+    and make a partially-observable table produce no number at all, which is a
+    different and worse failure than a number that says it is partial.
     """
     _missing = [c for c in COST_GROUP_COLUMNS if c not in df_groups.columns]
     if _missing:
@@ -1334,6 +1542,19 @@ def price_model_groups(df_groups) -> pd.DataFrame:
         if _stored is None:
             _notes.append("no stored cost recorded")
 
+        # COMPUTED FROM THE DATA, NOT FROM THE NOTE STRINGS ABOVE. A boolean
+        # derived by searching prose would agree with the prose by construction
+        # and could never catch the two disagreeing, which is the failure this
+        # project has shipped before. File 49 asserts they agree, against
+        # COST_INCOMPLETE_NOTES, which is a different thing from computing one
+        # out of the other.
+        #
+        # `_stored is None` is deliberately NOT a term: this flag qualifies
+        # recomputed_cost. See the docstring.
+        _cost_complete = ((_in is not None and _out is not None)
+                          and (_model_recorded
+                               or (_in_priced == 0 and _out_priced == 0)))
+
         _cost_rows.append({
             "matching_model": _model if _model_recorded else NO_MODEL_LABEL,
             # Carried explicitly rather than inferred from the label, so a model
@@ -1351,6 +1572,9 @@ def price_model_groups(df_groups) -> pd.DataFrame:
             "input_cost": _in_cost,
             "output_cost": _out_cost,
             "recomputed_cost": _in_cost + _out_cost,
+            # Whether the line above is an accounting of this group's spend or
+            # a floor on it. The ONE field a consumer asks before summing.
+            "cost_complete": _cost_complete,
             "stored_cost": _stored,
             "note": "; ".join(_notes),
         })
@@ -1443,8 +1667,27 @@ def print_cost_by_model(conn, out=print) -> pd.DataFrame:
     # computed over a subset is the thing this item is removing.
     _stored_total = float(df_cost["stored_cost"].sum()) if len(df_cost) else 0.0
     _stored_missing = int(df_cost["stored_cost"].isna().sum()) if len(df_cost) else 0
+
+    # THE SAME TREATMENT FOR THE RECOMPUTED SIDE, which is what the residual
+    # pass added. The stored total already said how many groups it excluded; the
+    # recomputed total said nothing, because an unpriceable group contributes a
+    # real 0.0 rather than a NULL and so cannot be spotted by looking at the
+    # column. Every line derived from this total is qualified below, not just
+    # the total itself: a projection built on a floor is a floor.
+    _incomplete_groups = (df_cost.loc[~df_cost["cost_complete"], "matching_model"]
+                          .tolist() if len(df_cost) else [])
+    _incomplete_rows = (int(df_cost.loc[~df_cost["cost_complete"], "rows"].sum())
+                        if len(df_cost) else 0)
+
     out(f"\nRows: {_total_rows}")
-    out(f"Recomputed total: ${_recomputed_total:.4f}")
+    out(f"Recomputed total: ${_recomputed_total:.4f}"
+        + ("" if not _incomplete_groups else "   <- A FLOOR, NOT A TOTAL"))
+    if _incomplete_groups:
+        out(f"  ...{len(_incomplete_groups)} of {len(df_cost)} model groups "
+            f"({_incomplete_rows} of {_total_rows} rows) could not be priced "
+            f"from what was recorded and contribute $0.00 rather than their "
+            f"real spend: {', '.join(_incomplete_groups)}. Ask cost_complete "
+            f"before summing recomputed_cost; the note column says why.")
     out(f"Stored total (estimated_cost_usd): ${_stored_total:.4f}")
     if _stored_missing:
         out(f"  ...over {len(df_cost) - _stored_missing} of {len(df_cost)} model "
@@ -1464,7 +1707,9 @@ def print_cost_by_model(conn, out=print) -> pd.DataFrame:
 
     if _total_rows:
         out(f"Projected cost for 1000 patients, at the current mix: "
-            f"${_recomputed_total / _total_rows * 1000:.2f}")
+            f"${_recomputed_total / _total_rows * 1000:.2f}"
+            + ("" if not _incomplete_groups
+               else "  (a FLOOR -- see the incomplete groups above)"))
 
     out("\n")
     return df_cost
@@ -1510,6 +1755,15 @@ def apply_display_options():
 
 def _render(df, query, out):
     """Print one query's frame the way File 16 printed it."""
+    # BEFORE the heading, deliberately. 'skip_if_empty' means "this section does
+    # not exist when there is nothing in it", and a heading with nothing under
+    # it is a section. `pipeline_consistency_totals` is the only user: on a
+    # clean database it must leave the listing's clean message standing alone,
+    # not sit above it announcing an empty count table. `blank_after` is skipped
+    # with it, so nothing at all is emitted -- including whitespace.
+    if query.render == "skip_if_empty" and df.empty:
+        return
+
     if query.heading is not None:
         out(query.heading)
     for line in query.notes:
@@ -1521,7 +1775,9 @@ def _render(df, query, out):
         out(df.describe())
     elif query.render == "transpose":
         out(df.T)
-    elif query.render == "to_string":
+    elif query.render in ("to_string", "skip_if_empty"):
+        # skip_if_empty reaches here only when the frame is NOT empty -- the
+        # guard at the top returned otherwise -- so from here it is to_string.
         out(df.to_string(index=False))
     elif query.render == "empty_or_to_string":
         if df.empty:

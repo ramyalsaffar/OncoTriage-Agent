@@ -39,9 +39,27 @@ WHAT ITEM 38 CHANGED, and what each section here holds it to
      fires once a column is float64.
   4. Two custom renderers that raised on an empty or partly-NULL table fixed.
 
+THE RESIDUAL PASS AFTER ITEM 38 added sections 4b, 4c and 5b, and grew the seed
+past the listing's cap so that the first of them has anything to measure:
+
+  1. THE CONSISTENCY REPORT COULD NOT DISTINGUISH "20 ISSUES" FROM "20 OF 400",
+     and the twenty it showed were whichever twenty SQLite chose -- ``LIMIT 20``
+     sat on the outer select with no ORDER BY. A companion query counts by
+     category over every row with no limit and prints immediately above the
+     listing; the listing gained a total order. Both derive from ONE CASE
+     expression, so they cannot disagree.
+  2. THE NULL GUARD'S COLUMN LIST WAS UNENFORCED. Section 4c derives, from the
+     SQL, which columns the CASE compares and which have a NULL treatment, and
+     fails when a column has neither -- with a control for each direction,
+     because "any new column fails" is a different and wrong rule.
+  3. AN UNRECORDED COST PRINTED AS ZERO. ``cost_complete`` is the one field a
+     consumer asks before summing ``recomputed_cost``, and every figure derived
+     from that total now says when it is a floor.
+
 Sections:
     1. The seeded temporary database: real schema from ``initialize_database``,
-       rows chosen to exercise every hard case at once.
+       rows chosen to exercise every hard case at once, and MORE inconsistent
+       rows than the listing can show.
     2. EVERY query in the registry executes, and every one returns a NON-EMPTY
        frame on the seeded data -- so a query that silently returns nothing
        cannot pass as fixed. Then ``report()`` end to end.
@@ -52,16 +70,36 @@ Sections:
        shown to be a syntax error; the bounds shown to come from config and to
        be derived from the slices that produce the columns; and a flagged row
        and an unflagged row for every branch.
+    4b. The companion totals, the listing's determinism over two runs, the clean
+       case printing the clean message alone, the two queries proved to share
+       one CASE by mutating it, and that CASE compared byte for byte against
+       item 38's own committed blob.
+    4c. Every column the CASE compares is guarded or NULL-aware, derived from
+       the SQL, with both negative controls.
     5. The cost arithmetic on the float64 case, with the pre-fix function
        EXTRACTED FROM GIT AND EXEC'd as the negative control.
+    5b. ``cost_complete``: what it is False for, what it is deliberately silent
+       about, that it agrees with the note column, that the priced value is
+       unchanged, and that every total says so -- with an all-complete control
+       proving the report does not say it unconditionally.
     6. The dashboard consumes the query layer: identical frames, function
-       identity, and a structural check that no second copy remains.
+       identity, a structural check that no second copy remains, and the tab
+       rendered end to end.
     7. The two custom renderers against an empty database, with the pre-fix
        renderer shown to raise.
     8. Neither docstring still claims the two queries are broken on purpose,
        with the scan shown to find the claim in the pre-fix text.
     9. The production database was never opened for writing and its row count
        is unchanged.
+
+NOTHING IN THIS FILE MAY ABORT THE RUN, and two things did until the reverts
+were actually run. ``QUERIES_BY_KEY["k"]`` and ``QUERY_KEYS.index("k")`` raise
+when the companion is deleted -- the very edit the section exists to catch --
+and ``text.split(marker)[1]`` raises when a report line is missing, which is
+what a reverted ``cost_complete`` produces. Both crashed at module level and
+hid every check below, so the run reported one traceback where it should have
+reported ten failures. ``after()`` and ``registry_index()`` are the fix; see
+their docstrings.
 
 No network, no LLM, no API key, no Qdrant. Everything runs against a SQLite file
 in a temporary directory that is removed at the end. The production database is
@@ -95,8 +133,10 @@ is why the four that MUTATE are the four that are serialized.
 # Run needed file
 #----------------
 import ast
+import hashlib
 import io
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -218,6 +258,27 @@ def check_does_not_raise(label: str, fn, *args, **kwargs):
     return value
 
 
+def after(text, marker):
+    """Everything in `text` after `marker`, or "" when the marker is absent.
+
+    EVERY USE OF THIS WAS FIRST WRITTEN AS ``text.split(marker)[1]``, AND THAT
+    ABORTS THE RUN. When the marker is missing -- which is precisely what a
+    reverted fix produces -- the index raises IndexError at module level and
+    every check below it never executes, so the run reports the ONE crash
+    instead of the six failures it was built to report. Found by reverting the
+    cost_complete fix in a copy of the package and watching this file crash
+    rather than fail; the same shape as File 16's own original defect, in the
+    file written to remove it.
+    """
+    _, separator, tail = text.partition(marker)
+    return tail if separator else ""
+
+
+def registry_index(key):
+    """Position of `key` in QUERY_KEYS, or -1. ``.index()`` raises ValueError."""
+    return (queries.QUERY_KEYS.index(key) if key in queries.QUERY_KEYS else -1)
+
+
 class quiet:
     """Swallow stdout for a block. initialize_database prints a migration line
     per added column and report() prints ~40 tables; neither is under test."""
@@ -248,12 +309,20 @@ class quiet:
 # BEING COMMITTED. `HEAD` is the pre-fix version only until item 38 lands, after
 # which it is the fixed one and every control here would silently stop
 # controlling anything. So: walk the file's history newest-first and take the
-# first revision whose blob still contains the broken column name. Before the
-# fix is committed that is HEAD; afterwards it is HEAD's parent; in ten commits'
-# time it is still the same blob.
+# first revision whose blob still DEFINES the query under discussion.
+#
+# THE SELECTOR IS STRUCTURAL, AND THE FIRST VERSION OF IT WAS NOT -- WHICH IS
+# HOW IT BROKE. It searched for the literal string `expansion_input_tokens`,
+# reasoning that only the broken query could name a column that does not exist.
+# That was wrong the moment item 38 was committed, because the DELETION COMMENT
+# left in its place quotes the query it removed, twice. The selector then picked
+# item 38's own revision, `_pre_fix_function("cost_by_model")` returned the
+# FIXED function, and two negative controls failed with NameError instead of
+# controlling anything. A substring is not a definition; this version parses the
+# blob and asks which query KEYS the registry actually declares, which prose can
+# never satisfy.
 
 _QUERIES_REL = "oncotriage/storage/queries.py"
-_BROKEN_MARKER = "expansion_input_tokens"
 
 
 def _git(*args):
@@ -273,10 +342,32 @@ def _git(*args):
     return completed.stdout
 
 
-def _pre_fix_queries_source():
-    """The newest committed queries.py that still contains the broken query.
+def _declared_query_keys(src):
+    """Every ``Query(key='...')`` the module source declares, as a set.
 
-    Returns (revision, source) or (None, None). A failure here is reported as a
+    AST rather than text search. A key is a keyword argument to a constructor
+    call; a mention in a comment or a docstring is not, and the difference is
+    exactly what the previous selector could not see.
+    """
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return set()
+    keys = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "Query"):
+            continue
+        for kw in node.keywords:
+            if kw.arg == "key" and isinstance(kw.value, ast.Constant):
+                keys.add(kw.value.value)
+    return keys
+
+
+def _newest_revision_where(predicate, label):
+    """Newest revision of queries.py whose declared query keys satisfy predicate.
+
+    Returns (revision, source) or (None, None). A failure is reported as a
     FAILED check by the caller rather than skipped: this repository has the
     history, and a control that quietly does not run is worse than one that
     fails.
@@ -286,12 +377,27 @@ def _pre_fix_queries_source():
         return None, None
     for rev in log.split():
         blob = _git("show", f"{rev}:{_QUERIES_REL}")
-        if blob and _BROKEN_MARKER in blob:
+        if blob and predicate(_declared_query_keys(blob)):
             return rev, blob
+    print(f"  [git] no revision of {_QUERIES_REL} matched: {label}")
     return None, None
 
 
-_PRE_FIX_REV, _PRE_FIX_SRC = _pre_fix_queries_source()
+# The last revision that still DECLARED the broken query. Everything in
+# sections 3, 5 and 7 that says "and here is the thing it used to do" comes
+# from this blob.
+_PRE_FIX_REV, _PRE_FIX_SRC = _newest_revision_where(
+    lambda keys: "expansion_token_efficiency" in keys,
+    "declares expansion_token_efficiency")
+
+# Item 38 as shipped: the consistency query exists, the companion totals query
+# does not yet. Section 4b compares this pass's CASE against that blob, so
+# "the classification is unchanged" is measured against the committed artefact
+# rather than against a hash somebody typed.
+_ITEM38_REV, _ITEM38_SRC = _newest_revision_where(
+    lambda keys: ("pipeline_consistency" in keys
+                  and "pipeline_consistency_totals" not in keys),
+    "declares pipeline_consistency but not pipeline_consistency_totals")
 
 
 def _pre_fix_string_constant(name_hint, must_contain):
@@ -536,6 +642,41 @@ _SEED_ROWS = [
         eligible_matches=6, near_misses=5, not_evaluable_trials=None)),
 ]
 
+# MORE INCONSISTENT ROWS THAN THE LISTING CAN SHOW, ACROSS TWO CATEGORIES.
+#
+# Without these the whole companion-query question is untestable: a totals query
+# that agrees with a listing which never hit its cap agrees for the wrong reason,
+# and "20 issues" versus "20 of 400" is precisely the confusion the companion
+# exists to remove. The named rows above contribute five issues; these add
+# CONSISTENCY_LISTING_LIMIT more, split across two categories, so the total is
+# comfortably past the cap and neither category alone fills it.
+#
+# Every one of these is consistent in EVERY respect but the one it is here for,
+# so a row appearing under the wrong category is a real failure rather than an
+# ambiguity.
+_BULK_COUNT_MISMATCH = queries.CONSISTENCY_LISTING_LIMIT // 2 + 3   # 13
+_BULK_RETRIEVAL_ANOMALY = queries.CONSISTENCY_LISTING_LIMIT - _BULK_COUNT_MISMATCH + 3  # 10
+
+for _n in range(_BULK_COUNT_MISMATCH):
+    _SEED_ROWS.append((f"P-BULK-COUNT-{_n:03d}", dict(
+        matching_model=_MODEL_A, gpt4o_input_tokens=700 + _n,
+        gpt4o_output_tokens=300 + _n, gpt4o_reasoning_tokens=None,
+        estimated_cost_usd=0.005, age=40 + _n,
+        candidates_retrieved=95, candidates_reranked=38,
+        candidates_filtered=12, candidates_evaluated=12,
+        # 4 + 4 + 1 == 9, not 12.
+        eligible_matches=4, near_misses=4, not_evaluable_trials=1)))
+
+for _n in range(_BULK_RETRIEVAL_ANOMALY):
+    _SEED_ROWS.append((f"P-BULK-RETRIEVAL-{_n:03d}", dict(
+        matching_model=_MODEL_A, gpt4o_input_tokens=650 + _n,
+        gpt4o_output_tokens=280 + _n, gpt4o_reasoning_tokens=None,
+        estimated_cost_usd=0.005, age=45 + _n,
+        candidates_retrieved=RRF_POOL_SIZE + 2 + _n, candidates_reranked=38,
+        candidates_filtered=11, candidates_evaluated=11,
+        eligible_matches=5, near_misses=5, not_evaluable_trials=1)))
+
+
 # Which rows the consistency query must flag, and with what. Written beside the
 # seed above rather than derived from the query, so the expectation is
 # independent of the implementation it checks.
@@ -546,6 +687,18 @@ _EXPECTED_ISSUES = {
     "P-NULL-COUNTERS":  "Counters not reported",
     "P-LEGACY-BAD":     "Count mismatch",
 }
+_EXPECTED_ISSUES.update(
+    {f"P-BULK-COUNT-{_n:03d}": "Count mismatch"
+     for _n in range(_BULK_COUNT_MISMATCH)})
+_EXPECTED_ISSUES.update(
+    {f"P-BULK-RETRIEVAL-{_n:03d}": "Retrieval anomaly"
+     for _n in range(_BULK_RETRIEVAL_ANOMALY)})
+
+# The per-category totals the companion query must reproduce, counted from the
+# expectation rather than from the query.
+_EXPECTED_ISSUE_COUNTS = {}
+for _issue in _EXPECTED_ISSUES.values():
+    _EXPECTED_ISSUE_COUNTS[_issue] = _EXPECTED_ISSUE_COUNTS.get(_issue, 0) + 1
 
 _cursor = _conn.cursor()
 _INFERENCE_IDS = {}
@@ -783,10 +936,25 @@ check_true("the stale literal 30 is NOT the value of the constant that governs "
            TOP_K_CANDIDATES != 30)
 
 # (d) the behaviour, row by row.
-_issues = queries.run(_conn, "pipeline_consistency")
-check_true("the consistency query returns rows on the seeded data "
-           "(non-degeneracy)", len(_issues) > 0)
-_flagged = dict(zip(_issues["patient_id"], _issues["issue"]))
+#
+# THE PER-ROW ASSERTIONS RUN AGAINST AN UNCAPPED VARIANT, and they have to. The
+# shipped listing stops at CONSISTENCY_LISTING_LIMIT rows, and this seed
+# deliberately produces more than that, so "exactly the inconsistent rows are
+# flagged" is not a question the capped query can answer. The variant is BUILT
+# FROM THE SHIPPED SQL by raising its cap, never retyped: the cap is a named
+# constant interpolated into the SQL, so replacing its rendered value is a
+# mechanical edit whose success is asserted below rather than assumed.
+_uncapped_sql = _fixed_sql.replace(
+    f"LIMIT {queries.CONSISTENCY_LISTING_LIMIT}", "LIMIT 1000000")
+check_true("the uncapped variant really differs from the shipped listing "
+           "(non-degeneracy: a failed replace would silently re-test the cap)",
+           _uncapped_sql != _fixed_sql
+           and f"LIMIT {queries.CONSISTENCY_LISTING_LIMIT}" not in _uncapped_sql)
+
+_all_issues = pd.read_sql_query(_uncapped_sql, _conn)
+_flagged = dict(zip(_all_issues["patient_id"], _all_issues["issue"]))
+check_true("the consistency classification returns rows on the seeded data "
+           "(non-degeneracy)", len(_all_issues) > 0)
 check("exactly the rows that are inconsistent are flagged, and with the right "
       "category", dict(sorted(_flagged.items())),
       dict(sorted(_EXPECTED_ISSUES.items())))
@@ -812,6 +980,7 @@ check_true("a row with not_evaluable trials that add up is clean -- which is "
                "SELECT not_evaluable_trials FROM inferences "
                "WHERE patient_id = 'P-CONSISTENT-A'").fetchone()[0]) > 0)
 
+_issues = queries.run(_conn, "pipeline_consistency")
 check("...and the flagged rows carry the counts a reader needs to act on them",
       [c for c in ("eligible_matches", "near_misses", "not_evaluable_trials")
        if c not in _issues.columns], [])
@@ -826,6 +995,377 @@ _a = _conn.execute(
 check_true("the two-term identity WOULD have flagged a perfectly ordinary row, "
            "which is why it was wrong", _a[0] != (_a[1] + _a[2]))
 check("...and the three-term identity does not", _a[0], _a[1] + _a[2] + _a[3])
+
+
+# ===========================================================================
+# SECTION 4b -- THE COMPANION TOTALS, AND THE LISTING'S DETERMINISM
+# ===========================================================================
+
+print()
+print("=" * 78)
+print("SECTION 4b -- the totals beside the capped listing")
+print("=" * 78)
+
+# THE PRECONDITION. Everything below is about a listing that cannot show
+# everything; if the seed never exceeded the cap, every check would pass for the
+# wrong reason and the companion would be agreeing with a listing that had
+# nothing left over to disagree about.
+check_true("the seed produces MORE inconsistent rows than the listing can show "
+           "(non-degeneracy: this is what the companion exists for)",
+           len(_EXPECTED_ISSUES) > queries.CONSISTENCY_LISTING_LIMIT)
+check_true("...across at least two categories, neither of which fills the cap "
+           "on its own", len(_EXPECTED_ISSUE_COUNTS) >= 2
+           and max(_EXPECTED_ISSUE_COUNTS.values())
+           < queries.CONSISTENCY_LISTING_LIMIT)
+
+# EVERY REFERENCE TO THE COMPANION GOES THROUGH A LOOKUP THAT CANNOT RAISE.
+# `QUERIES_BY_KEY["..."]` and `QUERY_KEYS.index("...")` both abort the run when
+# the key is absent, which is exactly what deleting the companion produces --
+# so the check written to catch that deletion would have crashed instead of
+# reporting it, hiding the ninety checks below. Demonstrated, not imagined.
+_TOTALS_KEY = "pipeline_consistency_totals"
+_totals_query = queries.QUERIES_BY_KEY.get(_TOTALS_KEY)
+check_true(f"the registry declares {_TOTALS_KEY!r}", _totals_query is not None)
+
+check("the companion runs immediately BEFORE the listing, so the totals print "
+      "above the sample",
+      registry_index("pipeline_consistency") - registry_index(_TOTALS_KEY), 1)
+
+_totals = (queries.run(_conn, _TOTALS_KEY) if _totals_query is not None
+           else pd.DataFrame(columns=["issue", "n"]))
+check("the companion reports every category, with the counts the seed put there",
+      dict(sorted(zip(_totals["issue"], (int(n) for n in _totals["n"])))),
+      dict(sorted(_EXPECTED_ISSUE_COUNTS.items())))
+
+check("the listing is capped at exactly CONSISTENCY_LISTING_LIMIT rows",
+      len(_issues), queries.CONSISTENCY_LISTING_LIMIT)
+check_true("...and the companion's total EXCEEDS what the listing shows, which "
+           "is the fact a reader could not previously recover",
+           int(_totals["n"].sum()) > len(_issues))
+check("...and the companion's total equals the uncapped row count",
+      int(_totals["n"].sum()), len(_all_issues))
+
+check("every row the listing DOES show is one the classification flagged, with "
+      "the same category",
+      sorted({(p, i) for p, i in zip(_issues["patient_id"], _issues["issue"])}
+             - {(p, i) for p, i in _EXPECTED_ISSUES.items()}), [])
+check_true("...and the sample spans more than one category, so ordering by "
+           "issue has not collapsed it onto the first one",
+           len(set(_issues["issue"])) >= 2)
+
+# --- DETERMINISM ----------------------------------------------------------
+#
+# The listing had no ORDER BY, so SQLite was free to return a different twenty
+# on each execution. Two runs, compared as ORDERED SEQUENCES rather than as
+# sets: a set comparison would pass on a query that returned the same rows in a
+# different order, which is exactly the failure being ruled out.
+_run_a = queries.run(_conn, "pipeline_consistency")
+_run_b = queries.run(_conn, "pipeline_consistency")
+check("two runs of the listing return the same patient_ids in the same order",
+      list(_run_a["patient_id"]), list(_run_b["patient_id"]))
+check("...and the same row ids, which is the part patient_id cannot pin",
+      list(_run_a["id"]), list(_run_b["id"]))
+check_true("the ordering is TOTAL, not merely stable-looking: the sequence is "
+           "sorted by (issue, patient_id, id) and every key is distinct",
+           list(zip(_run_a["issue"], _run_a["patient_id"], _run_a["id"]))
+           == sorted(zip(_run_a["issue"], _run_a["patient_id"], _run_a["id"]))
+           and len(set(_run_a["id"])) == len(_run_a))
+
+# patient_id ALONE would not have been a total order, which is why `id` is
+# selected. Measured on the seeded table the same way it was measured on
+# production (1,106 rows, 1,004 distinct patient_ids) -- here by planting a
+# duplicate, because the seed's own ids are unique by construction.
+_cursor.execute(
+    "INSERT INTO inferences (patient_id, timestamp, matching_model, error, "
+    "candidates_retrieved, candidates_reranked, candidates_filtered, "
+    "candidates_evaluated, eligible_matches, near_misses, "
+    "not_evaluable_trials, gpt4o_input_tokens, gpt4o_output_tokens, "
+    "estimated_cost_usd) VALUES ('P-BULK-COUNT-000', '2026-08-01', ?, '', "
+    "95, 38, 12, 12, 4, 4, 1, 700, 300, 0.005)", (_MODEL_A,))
+_conn.commit()
+_dupe_ids = [r[0] for r in _conn.execute(
+    "SELECT id FROM inferences WHERE patient_id = 'P-BULK-COUNT-000' ORDER BY id")]
+check_true("a duplicated patient_id really produces two rows (non-degeneracy)",
+           len(_dupe_ids) == 2)
+_dupe_run = queries.run(_conn, "pipeline_consistency")
+check("...and the listing still returns them in a fixed order, because `id` "
+      "breaks the tie",
+      [int(i) for i in _dupe_run.loc[
+          _dupe_run["patient_id"] == "P-BULK-COUNT-000", "id"]],
+      sorted(int(i) for i in _dupe_ids))
+_conn.execute("DELETE FROM inferences WHERE id = ?", (max(_dupe_ids),))
+_conn.commit()
+check("the duplicate is removed again, so later sections see the seed they "
+      "expect", _conn.execute("SELECT COUNT(*) FROM inferences").fetchone()[0],
+      len(_SEED_ROWS))
+
+# --- THE CLEAN CASE STILL READS AS CLEAN ----------------------------------
+#
+# The whole point of render='skip_if_empty'. On a database with no issues the
+# companion must print NOTHING -- not its heading, not its note, not an empty
+# table -- so the listing's clean message stands alone exactly as it always did.
+_clean_lines = []
+_clean_conn = sqlite3.connect(_EMPTY_DB_PATH)
+try:
+    queries.report(_clean_conn, out=_clean_lines.append)
+finally:
+    _clean_conn.close()
+_clean_text = "\n".join(str(l) for l in _clean_lines)
+_TOTALS_HEADING = (_totals_query.heading if _totals_query is not None
+                   else "(no companion query in the registry)")
+_TOTALS_NOTES = _totals_query.notes if _totals_query is not None else ()
+
+check("on a clean database the clean message is printed exactly once",
+      _clean_text.count(queries.CONSISTENCY_CLEAN_MESSAGE), 1)
+check("...and the companion prints nothing at all above it -- not its heading",
+      _TOTALS_HEADING in _clean_text, False)
+check("...not its note either",
+      any(n in _clean_text for n in _TOTALS_NOTES), False)
+
+# ...and on the seeded database it prints all three.
+_seeded_lines = []
+queries.report(_conn, out=_seeded_lines.append)
+_seeded_text = "\n".join(str(l) for l in _seeded_lines)
+check_true("with issues present the companion DOES print its heading and note "
+           "(negative control for the three checks above)",
+           _TOTALS_HEADING in _seeded_text
+           and bool(_TOTALS_NOTES)
+           and all(n in _seeded_text for n in _TOTALS_NOTES))
+check_true("...and the totals appear ABOVE the listing in the printed report",
+           _TOTALS_HEADING in _seeded_text
+           and _seeded_text.index(_TOTALS_HEADING)
+           < _seeded_text.index(
+               queries.QUERIES_BY_KEY["pipeline_consistency"].heading))
+check("...and the clean message does NOT appear when there are issues",
+      queries.CONSISTENCY_CLEAN_MESSAGE in _seeded_text, False)
+
+# --- ONE CASE, NOT TWO ----------------------------------------------------
+#
+# The instruction was that the two queries agree "by construction rather than by
+# two copies of the same CASE". They do: there is one _CONSISTENCY_CASE_SQL and
+# one _CONSISTENCY_CLASSIFIED_SQL, and both queries interpolate them. Asserted
+# by containment first, then DEMONSTRATED by mutating the shared source and
+# showing both derived queries move together -- which is what "cannot be edited
+# in one place only" means operationally.
+_totals_sql = _totals_query.sql if _totals_query is not None else ""
+check_true("the shared CASE appears verbatim in the listing",
+           queries._CONSISTENCY_CASE_SQL in _fixed_sql)
+check_true("...and verbatim in the companion",
+           queries._CONSISTENCY_CASE_SQL in _totals_sql)
+check("the CASE appears exactly once in each, so neither carries a second copy",
+      (_fixed_sql.count(queries._CONSISTENCY_CASE_SQL),
+       _totals_sql.count(queries._CONSISTENCY_CASE_SQL)), (1, 1))
+
+_mutated_case = queries._CONSISTENCY_CASE_SQL.replace(
+    "'Rerank anomaly'", "'MUTATED CATEGORY'")
+check_true("the mutation applies (non-degeneracy)",
+           _mutated_case != queries._CONSISTENCY_CASE_SQL)
+_mutated_classified = queries._CONSISTENCY_CLASSIFIED_SQL.replace(
+    queries._CONSISTENCY_CASE_SQL, _mutated_case)
+_rebuilt_listing = _fixed_sql.replace(
+    queries._CONSISTENCY_CLASSIFIED_SQL, _mutated_classified)
+_rebuilt_totals = _totals_sql.replace(queries._CONSISTENCY_CLASSIFIED_SQL,
+                                      _mutated_classified)
+check_true("editing the ONE CASE changes both derived queries together -- there "
+           "is no second copy to forget",
+           "MUTATED CATEGORY" in _rebuilt_listing
+           and "MUTATED CATEGORY" in _rebuilt_totals)
+check_true("...and both rebuilt queries execute, so the shared text really is "
+           "the whole classification and not a fragment of it",
+           len(pd.read_sql_query(_rebuilt_listing, _conn)) > 0
+           and len(pd.read_sql_query(_rebuilt_totals, _conn)) > 0)
+check_true("...and the mutated category reaches the RESULTS of both, not just "
+           "their text",
+           "MUTATED CATEGORY" in set(pd.read_sql_query(_rebuilt_listing,
+                                                       _conn)["issue"])
+           and "MUTATED CATEGORY" in set(pd.read_sql_query(_rebuilt_totals,
+                                                           _conn)["issue"]))
+
+# --- THE CASE ITSELF IS UNCHANGED BY THIS PASS ----------------------------
+#
+# The residual pass was permitted to add an ORDER BY to the listing and nothing
+# else: item 38's categories, bounds and NULL handling are correct and this is
+# the mechanism for "and nothing else". TWO INDEPENDENT PINS, because they fail
+# in different circumstances and neither subsumes the other.
+#
+# (i) THE COMMITTED TEXT. Pulled out of item 38's own blob, rendered through the
+# same two config constants the source interpolates, and compared byte for byte
+# against what this module holds now. This is the authoritative pin: it compares
+# code against code with nothing retyped in between.
+_ITEM38_CASE = None
+if _ITEM38_SRC:
+    _start = _ITEM38_SRC.find("        CASE\n")
+    _end = _ITEM38_SRC.find("        END as issue", _start)
+    if _start != -1 and _end != -1:
+        _raw = _ITEM38_SRC[_start:_end + len("        END as issue")]
+        try:
+            # The committed text is f-string SOURCE, so it still carries
+            # {RRF_POOL_SIZE} / {TOP_K_CANDIDATES}. Rendering it with the same
+            # constants is what makes the comparison apples-to-apples; the
+            # category literals this pass moved into named constants render back
+            # to the same strings, which is the point of naming them.
+            _ITEM38_CASE = _raw.format(RRF_POOL_SIZE=RRF_POOL_SIZE,
+                                       TOP_K_CANDIDATES=TOP_K_CANDIDATES)
+        except (KeyError, IndexError, ValueError) as _exc:
+            print(f"  [git] item-38 CASE would not render: "
+                  f"{type(_exc).__name__}: {_exc}")
+
+check_true(f"item 38's own CASE was recovered from git (rev {_ITEM38_REV}) "
+           f"and is non-degenerate",
+           _ITEM38_CASE is not None and len(_ITEM38_CASE) > 500)
+if _ITEM38_CASE:
+    check("the CASE is byte-identical to the one item 38 committed",
+          queries._CONSISTENCY_CASE_SQL, _ITEM38_CASE)
+    check("...and the same comparison rejects a one-category change (negative "
+          "control)", _mutated_case == _ITEM38_CASE, False)
+
+# (ii) A sha256 MEASURED FROM THE SHIPPED ARTEFACT BEFORE THE REFACTOR. It
+# duplicates (i) on a machine with history and is the only pin left on one
+# without -- a shallow clone, an exported tarball, a container build. Recorded
+# rather than derived precisely so it does not depend on git.
+_CASE_SHA256_AS_SHIPPED_BY_ITEM_38 = (
+    "c73948cffb6d276582a6533bf8b7b2ed792894f3b75a6da8afe17d3ec3eaee10")
+check("the CASE block hashes to what was measured before the refactor",
+      hashlib.sha256(queries._CONSISTENCY_CASE_SQL.encode()).hexdigest(),
+      _CASE_SHA256_AS_SHIPPED_BY_ITEM_38)
+check("...and the hash comparison notices a one-character change (negative "
+      "control)",
+      hashlib.sha256(_mutated_case.encode()).hexdigest()
+      == _CASE_SHA256_AS_SHIPPED_BY_ITEM_38, False)
+# The two pins must agree, or one of them is measuring something else.
+if _ITEM38_CASE:
+    check("...and the two pins agree with each other",
+          hashlib.sha256(_ITEM38_CASE.encode()).hexdigest(),
+          _CASE_SHA256_AS_SHIPPED_BY_ITEM_38)
+
+# The listing's own additions, pinned separately from the CASE.
+check_true("the listing orders by (issue, patient_id, id) before its LIMIT",
+           "ORDER BY issue, patient_id, id" in _fixed_sql
+           and _fixed_sql.index("ORDER BY issue, patient_id, id")
+           < _fixed_sql.index("LIMIT"))
+check_true("`id` is selected, which is what makes that order total",
+           "\n        id,\n" in queries._CONSISTENCY_CLASSIFIED_SQL)
+
+
+# ===========================================================================
+# SECTION 4c -- THE NULL GUARD'S COLUMN SET IS DERIVED FROM THE SQL
+# ===========================================================================
+
+print()
+print("=" * 78)
+print("SECTION 4c -- every compared column is guarded or NULL-aware")
+print("=" * 78)
+
+# THE RULE, and it is not "every compared column is in the guard". The guard
+# names six columns; not_evaluable_trials is deliberately NOT among them,
+# because it is an added column that is legitimately NULL on pre-migration rows
+# and flagging those as "counters not reported" would report a schema migration
+# as a pipeline defect. It has the other treatment instead: its own pair of
+# NULL-aware branches.
+#
+# So: EVERY COLUMN THE CASE COMPARES MUST EITHER BE IN THE NULL GUARD, OR HAVE
+# AN EXPLICIT BRANCH HANDLING ITS NULL CASE. Both sets are derived from the SQL
+# text below rather than listed here, so a seventh counter added later cannot
+# quietly skip both.
+
+
+def _sql_identifiers(text):
+    """Real `inferences` columns named in a fragment of SQL.
+
+    String literals are stripped first, so 'Count mismatch' contributes nothing.
+    Intersecting with the REAL SCHEMA rather than filtering a keyword list is
+    what keeps this honest: SQL keywords, aliases and numbers are excluded
+    because they are not columns, not because somebody remembered to list them.
+    """
+    without_literals = re.sub(r"'[^']*'", " ", text)
+    return {w for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", without_literals)
+            if w in _SCHEMA_COLUMNS}
+
+
+def _null_guard_and_compared(case_sql):
+    """Split a CASE into (guarded, compared, null_aware) column sets.
+
+    The guard is located by the category it emits, not by position: a branch
+    order change must not silently turn a different branch into "the guard".
+    """
+    marker = f"'{queries.CONSISTENCY_GUARD_CATEGORY}'"
+    if marker not in case_sql:
+        return None, None, None
+    head, tail = case_sql.split(marker, 1)
+    # The guard branch is the last WHEN before the marker.
+    guard_branch = head[head.rindex("WHEN"):]
+    guarded = _sql_identifiers(guard_branch)
+    compared = _sql_identifiers(tail)
+    null_aware = {m for m in re.findall(
+        r"([A-Za-z_][A-Za-z0-9_]*)\s+IS\s+(?:NOT\s+)?NULL", tail)
+        if m in _SCHEMA_COLUMNS}
+    return guarded, compared, null_aware
+
+
+_guarded, _compared, _null_aware = _null_guard_and_compared(
+    queries._CONSISTENCY_CASE_SQL)
+
+check_true("the guard branch was located and is non-degenerate",
+           _guarded is not None and len(_guarded) >= 5)
+check_true("the compared set is non-degenerate too -- an empty one would make "
+           "the rule below vacuous", _compared and len(_compared) >= 5)
+check_true("not_evaluable_trials is compared but deliberately NOT guarded, "
+           "which is why the rule is a disjunction",
+           "not_evaluable_trials" in _compared
+           and "not_evaluable_trials" not in _guarded)
+check_true("...and it is the NULL-aware set that covers it",
+           "not_evaluable_trials" in _null_aware)
+
+check("EVERY column the CASE compares is either in the NULL guard or has its "
+      "own NULL-aware branch",
+      sorted(_compared - _guarded - _null_aware), [])
+
+# --- TWO NEGATIVE CONTROLS, and the second is the one that matters --------
+#
+# The first shows the rule catches an unguarded new column. Alone it would be
+# satisfied by a check that simply rejects every new column, which is a
+# different and wrong rule -- it would forbid the treatment not_evaluable_trials
+# already uses. The second shows a new column WITH a NULL-aware branch passes.
+_CONTROL_COLUMN = "mesh_dropped"      # a real column, absent from the CASE
+check_true(f"the control column {_CONTROL_COLUMN!r} is real and not already in "
+           f"the CASE (non-degeneracy)",
+           _CONTROL_COLUMN in _SCHEMA_COLUMNS
+           and _CONTROL_COLUMN not in _compared)
+
+_control_untreated = queries._CONSISTENCY_CASE_SQL.replace(
+    "            ELSE '",
+    f"            WHEN {_CONTROL_COLUMN} > 5 THEN 'Planted anomaly'\n"
+    f"            ELSE '")
+check_true("the untreated control was planted (non-degeneracy)",
+           _control_untreated != queries._CONSISTENCY_CASE_SQL)
+_g1, _c1, _n1 = _null_guard_and_compared(_control_untreated)
+check(f"a seventh compared column with NEITHER treatment is REPORTED",
+      sorted(_c1 - _g1 - _n1), [_CONTROL_COLUMN])
+
+_control_treated = queries._CONSISTENCY_CASE_SQL.replace(
+    "            ELSE '",
+    f"            WHEN {_CONTROL_COLUMN} IS NOT NULL\n"
+    f"             AND {_CONTROL_COLUMN} > 5 THEN 'Planted anomaly'\n"
+    f"            ELSE '")
+check_true("the treated control was planted (non-degeneracy)",
+           _control_treated != queries._CONSISTENCY_CASE_SQL)
+_g2, _c2, _n2 = _null_guard_and_compared(_control_treated)
+check("...and a seventh compared column WITH a NULL-aware branch PASSES -- "
+      "without this the rule would collapse into 'any new column fails'",
+      sorted(_c2 - _g2 - _n2), [])
+check_true("...and the treated control really did add the column to the "
+           "compared set, so it passed for the right reason",
+           _CONTROL_COLUMN in _c2 and _CONTROL_COLUMN in _n2)
+
+# Both control CASEs must still be valid SQL, or the controls are testing a
+# string rather than a query.
+for _label, _case in (("untreated", _control_untreated),
+                      ("treated", _control_treated)):
+    check_does_not_raise(
+        f"the {_label} control CASE is executable SQL",
+        pd.read_sql_query,
+        queries._PIPELINE_CONSISTENCY_SQL.replace(
+            queries._CONSISTENCY_CASE_SQL, _case), _conn)
 
 
 # ===========================================================================
@@ -884,13 +1424,30 @@ check("...and it is priced at zero spend, without raising",
 
 # A GROUP THAT REALLY DID RECORD ZERO IS DIFFERENT FROM ONE THAT RECORDED
 # NOTHING, and the frame keeps them apart.
+#
+# The expected sums are SUMMED FROM THE SEED TABLE rather than written as a
+# literal. A literal was the first version and it went stale the moment the
+# consistency section needed more rows -- and a stale expectation in a check
+# about arithmetic is the shape this project treats as a defect, because it
+# fails for a reason that has nothing to do with the code under test.
+_expected_a = {"in": 0, "out": 0, "reasoning": 0}
+for _label, _overrides in _SEED_ROWS:
+    if _overrides.get("matching_model") != _MODEL_A:
+        continue
+    for _key, _column in (("in", "gpt4o_input_tokens"),
+                          ("out", "gpt4o_output_tokens"),
+                          ("reasoning", "gpt4o_reasoning_tokens")):
+        _value = _overrides.get(_column)
+        if _value is not None:
+            _expected_a[_key] += _value
+check_true("the expected sums are non-degenerate (a zero on both sides would "
+           "make the comparison below vacuous)",
+           all(v > 0 for v in _expected_a.values()))
 check("the group with numbers reports them as integers",
       (int(_by_label[_MODEL_A].input_tokens),
        int(_by_label[_MODEL_A].output_tokens),
        int(_by_label[_MODEL_A].reasoning_tokens)),
-      (10000 + 20000 + 9000 + 1000 + 1100 + 100 + 0 + 800 + 810,
-       5000 + 4500 + 3000 + 500 + 520 + 50 + 0 + 400 + 410,
-       1200))
+      (_expected_a["in"], _expected_a["out"], _expected_a["reasoning"]))
 check("...priced against its own model's rates, not a blended one",
       round(float(_by_label[_MODEL_A].recomputed_cost), 10),
       round(get_model_cost(_MODEL_A, int(_by_label[_MODEL_A].input_tokens), 0)
@@ -947,9 +1504,135 @@ _printed_frame = check_does_not_raise(
     queries.print_cost_by_model, _conn, out=_printed.append)
 _printed_text = "\n".join(str(l) for l in _printed)
 check_true("...and its stored total excludes the NULL group instead of turning "
-           "into nan", "nan" not in _printed_text.lower().split("recomputed")[-1][:200])
+           "into nan", "nan" not in after(_printed_text.lower(), "recomputed")[:200])
 check_true("...and it says how many groups recorded no stored cost at all",
            "recorded no stored cost" in _printed_text)
+
+
+# ===========================================================================
+# SECTION 5b -- AN UNRECORDED COST IS VISIBLE AT EVERY TOTAL
+# ===========================================================================
+
+print()
+print("=" * 78)
+print("SECTION 5b -- cost_complete")
+print("=" * 78)
+
+# THE DEFECT THIS CLOSES. An unpriceable group contributes a REAL 0.0 to
+# recomputed_cost -- not a NULL -- so nothing about the column reveals that the
+# total is a floor. A consumer summing it under-reports by exactly the
+# unpriceable spend and cannot tell. The note column said so in prose; prose is
+# not a field, and a published cost-per-patient figure is computed from the
+# number.
+
+check_true("cost_complete is in the priced frame's pinned column set",
+           "cost_complete" in queries.PRICED_COST_COLUMNS)
+check("...immediately after the column it qualifies, so the relationship is "
+      "visible in the printed table",
+      queries.PRICED_COST_COLUMNS[
+          queries.PRICED_COST_COLUMNS.index("recomputed_cost") + 1],
+      "cost_complete")
+
+# The seed carries all three shapes at once, which is the only arrangement in
+# which the flag can be shown to discriminate rather than to be constant.
+check("the priced frame reports completeness per group, and it is NOT constant "
+      "(non-degeneracy: an all-True or all-False column would satisfy every "
+      "check below)",
+      sorted(set(bool(v) for v in _priced["cost_complete"])), [False, True])
+
+check("the group with real tokens and a real model is COMPLETE",
+      bool(_by_label[_MODEL_A].cost_complete), True)
+check("the group whose token SUMs are NULL is INCOMPLETE -- nothing is known "
+      "about its spend", bool(_by_label[_MODEL_B].cost_complete), False)
+check("the NULL-model group carrying tokens is INCOMPLETE -- its consumption is "
+      "known and there is no rate to price it at",
+      bool(_by_label[queries.NO_MODEL_LABEL].cost_complete), False)
+check("a NULL-model group carrying NO tokens is COMPLETE -- an ordinary "
+      "no-candidates run really did spend nothing",
+      bool(_clean_null_model.iloc[0]["cost_complete"]), True)
+
+# A group missing only its stored cost is still complete on the recomputed side.
+# This is the distinction the docstring makes and it is easy to get wrong by
+# folding both nulls into one flag.
+_stored_only_missing = queries.price_model_groups(pd.DataFrame({
+    "matching_model": [_MODEL_A], "rows_n": [2], "input_tokens": [1000],
+    "output_tokens": [500], "reasoning_tokens": [None], "stored_cost": [None]}))
+check("a group whose STORED cost is NULL but whose tokens are recorded is "
+      "cost_complete -- the flag qualifies recomputed_cost and nothing else",
+      bool(_stored_only_missing.iloc[0]["cost_complete"]), True)
+check("...and its stored_cost is still <NA>, which is the separate signal a "
+      "consumer asks for that sum",
+      bool(pd.isna(_stored_only_missing.iloc[0]["stored_cost"])), True)
+
+# THE BOOLEAN AND THE PROSE MUST NOT DISAGREE. Computed independently -- the
+# flag from the data, the note from the same data by a different path -- so this
+# compares two derivations rather than a value against itself.
+_disagreements = []
+for _row in _priced.itertuples(index=False):
+    _note_says_incomplete = any(frag in _row.note
+                                for frag in queries.COST_INCOMPLETE_NOTES)
+    if _note_says_incomplete == bool(_row.cost_complete):
+        _disagreements.append(
+            f"{_row.matching_model}: cost_complete={_row.cost_complete} "
+            f"note={_row.note!r}")
+check("cost_complete and the note column agree on every group",
+      _disagreements, [])
+check_true("...and both fired on at least one group, so the agreement is not "
+           "between two empty sets",
+           any(frag in _row.note for _row in _priced.itertuples(index=False)
+               for frag in queries.COST_INCOMPLETE_NOTES))
+
+# THE PRICED VALUE IS UNCHANGED -- the instruction was explicit that an
+# incomplete group must keep pricing at $0.00 rather than becoming NaN, because
+# NaN would propagate into every aggregate and produce no number at all.
+for _label in (_MODEL_B, queries.NO_MODEL_LABEL):
+    check("an incomplete group still prices at 0.0, not NaN "
+          f"({_label})", float(_by_label[_label].recomputed_cost), 0.0)
+check_true("...so the recomputed total is a real number rather than NaN",
+           not pd.isna(_priced["recomputed_cost"].sum()))
+
+# THE TOTALS SAY SO. This is the fix: not a new note, but a qualifier on every
+# figure derived from the total.
+check_true("print_cost_by_model marks the recomputed total as a FLOOR",
+           "A FLOOR, NOT A TOTAL" in _printed_text)
+check_true("...names how many groups and rows could not be priced",
+           "could not be priced from what was recorded" in _printed_text)
+check_true("...names the groups themselves, so the reader can go and look",
+           _MODEL_B in after(_printed_text, "could not be priced")[:400])
+check_true("...points at the field to ask rather than only at the prose",
+           "cost_complete" in _printed_text)
+check_true("...and qualifies the 1000-patient projection too, which is the "
+           "number most likely to be quoted",
+           "(a FLOOR" in after(_printed_text, "Projected cost")[:200])
+
+# NEGATIVE CONTROL: with every group complete, none of those lines appears.
+# Without this, "the report says FLOOR" is satisfied by a report that says it
+# unconditionally, which is the same defect one step along.
+_complete_only = queries.price_model_groups(pd.DataFrame({
+    "matching_model": [_MODEL_A, _MODEL_B], "rows_n": [4, 2],
+    "input_tokens": [1000, 2000], "output_tokens": [500, 600],
+    "reasoning_tokens": [None, 10], "stored_cost": [0.01, 0.02]}))
+check("the control frame really is all-complete (non-degeneracy)",
+      sorted(set(bool(v) for v in _complete_only["cost_complete"])), [True])
+
+_complete_printed = []
+_saved_cost_by_model = queries.cost_by_model
+try:
+    queries.cost_by_model = lambda conn: _complete_only
+    queries.print_cost_by_model(None, out=_complete_printed.append)
+finally:
+    queries.cost_by_model = _saved_cost_by_model
+check_true("the module-level rebinding was undone",
+           queries.cost_by_model is _saved_cost_by_model)
+_complete_text = "\n".join(str(l) for l in _complete_printed)
+check("with every group complete, the FLOOR marker is absent",
+      "A FLOOR, NOT A TOTAL" in _complete_text, False)
+check("...and so is the incomplete-groups line",
+      "could not be priced from what was recorded" in _complete_text, False)
+check("...and the projection is unqualified",
+      "(a FLOOR" in after(_complete_text, "Projected cost"), False)
+check_true("...while the report itself still printed (non-degeneracy)",
+           "Recomputed total:" in _complete_text)
 
 
 # ===========================================================================

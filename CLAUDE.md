@@ -641,17 +641,82 @@ against the production database on 2026-08-05: exit 0, 2,629 lines, 35 headings.
   database died there) and `f"{...:.1f}"` on a possibly-NULL `total_time`
   (`TypeError` on object dtype, silent `nan` on float64). Both report the
   missing fact by name now.
-- **`49- Database Query Layer Test.py`** is the demonstration: 113 assertions,
+**Three residual weaknesses, closed in a follow-up pass.** All three mislead on a
+NORMAL full-corpus run, not only on a defective one.
+
+- **A CAPPED LISTING IS NOT A REPORT.** `pipeline_consistency`'s `LIMIT 20` sat
+  on the outer select with **no ORDER BY**, so it hid how many issues there were
+  *and* returned whichever twenty SQLite chose — twenty issues and twenty
+  thousand printed identically, and two runs of the same query on the same data
+  need not agree. `pipeline_consistency_totals` counts by category over every
+  row with no limit and prints **immediately above** the listing; the listing
+  gained `ORDER BY issue, patient_id, id`. **`id` had to be selected, because
+  patient_id is not unique** — measured on production, 1,106 rows carry 1,004
+  distinct patient_ids, so ordering on it alone leaves ties and is not
+  deterministic. Both queries interpolate **one** `_CONSISTENCY_CASE_SQL` and
+  **one** `_CONSISTENCY_CLASSIFIED_SQL`, so they cannot drift; File 49 mutates
+  the shared CASE and shows both derived queries move together. The CASE itself
+  is pinned twice — against **item 38's own committed blob**, rendered through
+  the same config constants, and against a sha256 measured before the refactor
+  (the second is the only pin left on a machine without history). A new render
+  mode `skip_if_empty` prints **nothing at all** — not even the heading — when
+  the companion is empty, so a clean database still shows exactly the one clean
+  message it always did.
+- **THE NULL GUARD'S COLUMN LIST WAS UNENFORCED.** The rule is *not* "every
+  compared column is in the guard": `not_evaluable_trials` is deliberately
+  outside it, because it is an added column legitimately NULL on pre-migration
+  rows, and it carries its own NULL-aware branches instead. So the rule is
+  **either treatment, never neither**, and File 49 derives *both* sets from the
+  SQL — guard branch located by the category it emits, columns identified by
+  intersection with the real schema — rather than listing them. **Two controls:
+  a seventh compared column with neither treatment must fail, and one with a
+  NULL-aware branch must pass.** Without the second, the rule collapses into
+  "any new column fails", which would forbid the treatment already in use.
+- **AN UNRECORDED COST PRINTED AS ZERO.** An unpriceable group contributes a
+  real `0.0` to `recomputed_cost` — not a NULL — so anything summing the column
+  under-reports by exactly the unpriceable spend and cannot tell. The reason was
+  in a `note` column, and prose is not a field. **`cost_complete` is the one
+  field a consumer asks**, False when the token sums are NULL or when the model
+  is NULL while tokens exist, True for the ordinary no-candidates group that
+  genuinely spent nothing. It says nothing about `stored_cost`, which carries
+  its own NA a caller can inspect directly. `print_cost_by_model` marks the
+  total `<- A FLOOR, NOT A TOTAL`, names the groups and rows excluded, and
+  qualifies the 1000-patient projection; the dashboard warns in the same terms.
+  **The priced value is unchanged** — NaN would propagate into every aggregate
+  and produce no number at all.
+
+- **`49- Database Query Layer Test.py`** is the demonstration: 194 assertions,
   every query in the registry run against a seeded temporary database and every
   one required to come back NON-EMPTY, `report()` end to end, and the negative
   controls **unparsed out of git rather than retyped here** — the pre-fix SQL
   shown still to raise, the pre-fix `cost_by_model` shown to raise `ValueError`
   on the very frame the fixed one prices, the pre-fix `print_slowest_prompt`
-  shown to raise `IndexError`. The commit is **derived** (newest revision of
-  `queries.py` whose blob still contains `expansion_input_tokens`), not `HEAD`,
-  so the controls survive this work being committed. It is **not** in
+  shown to raise `IndexError`. The commit is **derived**, not `HEAD`, so the
+  controls survive this work being committed. It is **not** in
   `run_serial_tests.py`'s collision matrix: it mutates no file in the repository
   and writes only into a fresh temp directory.
+
+  **THE FIRST VERSION OF THAT DERIVATION WAS A SUBSTRING SEARCH AND IT BROKE THE
+  MOMENT ITEM 38 WAS COMMITTED.** It selected the newest revision whose blob
+  contained `expansion_input_tokens`, on the reasoning that only the broken query
+  could name a column that does not exist. The **deletion comment left in its
+  place quotes the query it removed**, twice — so the selector picked item 38's
+  own revision, `_pre_fix_function("cost_by_model")` returned the *fixed*
+  function, and two negative controls failed with `NameError` instead of
+  controlling anything. It parses the blob and asks which query **keys the
+  registry declares** now, which prose cannot satisfy. Same lesson as the BM25
+  construction-site check: a substring is not a definition.
+
+  **Two things in File 49 aborted the run instead of recording a failure**, found
+  by actually reverting each fix in a copy of the package rather than reasoning
+  about it. `QUERIES_BY_KEY["k"]` and `QUERY_KEYS.index("k")` raise when the
+  companion query is deleted — the exact edit the section exists to catch — and
+  `text.split(marker)[1]` raises when a report line is missing, which is what a
+  reverted `cost_complete` produces. Both crashed at module level and hid every
+  check below, so the run reported one traceback where it owed ten failures:
+  File 16's original defect, reproduced inside the file written to remove it.
+  `after()` and `registry_index()` are the fix. **All eight reverts now produce
+  recorded failures** (10, 3, 1, 2, 5, 9, 8 and 2 respectively).
 
 ### Index lifecycle (Qdrant)
 

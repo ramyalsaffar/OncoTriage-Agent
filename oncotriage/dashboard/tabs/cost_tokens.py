@@ -22,6 +22,15 @@ arithmetic now lives once, in ``queries.price_model_groups``; this file supplies
 the group sums for the SIDEBAR-FILTERED rows it was handed, through
 ``queries.model_groups_from_frame``, and renders the result.
 
+AN UNPRICEABLE GROUP IS SURFACED AT THE TOTALS, NOT ONLY AT ITS CAUSE. A group
+whose token sums are NULL, or whose model is NULL while it carries tokens,
+prices at $0.00 — which is a floor, not a cost. The two warnings naming those
+causes were already here; what was missing was anything qualifying the FIGURES
+built on them, and a reader who scrolled past a warning had no way to tell a
+partial total from a cheap run. ``queries.price_model_groups`` exposes
+``cost_complete`` for exactly that question and this tab asks it, so this tab
+and File 16's Query 10 make the same statement about the same database.
+
 THE CONSOLIDATION DOES NOT IMPORT SQL'S NULL SEMANTICS INTO A PLACE THAT WAS
 SAFE, and the direction of that risk is worth stating because it is the reverse
 of the obvious one. This tab was never exposed to the ``int(nan)`` fault, for a
@@ -158,6 +167,28 @@ def render_cost_tokens_tab(df):
             f"{', '.join(unrecorded_token_models)}. Those groups are shown at "
             f"$0.00 because nothing is known about their spend, which is not "
             f"the same as their having spent nothing."
+        )
+
+    # THE TWO WARNINGS ABOVE NAME THE CAUSES; THIS ONE QUALIFIES THE NUMBERS.
+    # Both of them describe groups whose recomputed cost is $0.00 for want of
+    # information rather than for want of spend, and every figure below —
+    # recalc_total, the pie's percentages, the cost-share bars — is built on
+    # that total. A reader who skipped a warning about tokens has no way to know
+    # the chart under it is a floor. cost_complete is the single field the query
+    # layer exposes for exactly this question, and asking it here is what keeps
+    # this tab and File 16's Query 10 saying the same thing about the same
+    # database.
+    _incomplete = _priced[~_priced["cost_complete"]]
+    _incomplete_rows = int(_incomplete["rows"].sum()) if len(_incomplete) else 0
+    if len(_incomplete):
+        st.warning(
+            f"**The cost figures below are a FLOOR, not a total.** "
+            f"{len(_incomplete)} of {len(_priced)} model groups "
+            f"({_incomplete_rows:,} of {int(_priced['rows'].sum()):,} rows) "
+            f"could not be priced from what was recorded — "
+            f"{', '.join(_incomplete['matching_model'].tolist())} — and "
+            f"contribute $0.00 instead of their real spend. Every percentage "
+            f"and projection on this tab is computed over the priced remainder."
         )
 
     if not cost_components:
