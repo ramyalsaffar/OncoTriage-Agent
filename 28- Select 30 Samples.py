@@ -1,242 +1,114 @@
+# Select 30 Samples
+###################
+
 """
-Sample 30 patients (10 breast, 10 colon, 10 lung) from the 1,000-patient batch run.
+Sample 30 patients (10 breast, 10 colon, 10 lung) — entry point.
 
-Creates a new SQLite database (inferences_sample_30.db) containing ONLY the
-sampled patients' inferences and trial_matches rows.
+Creates a new SQLite database containing ONLY the sampled patients' inferences
+and trial_matches rows. The sampler itself is
+``oncotriage/evaluation/sampling.py``; item 20c pass 3d moved it there.
 
-Sampling:
-    - Seed: 42 (reproducible)
-    - Source: main pass inferences, deduplicated by patient_id
-    - Stratified: 10 breast, 10 colon, 10 lung by primary_condition text
-    - Output includes ALL inferences for sampled patients (main + resample)
+Sampling
+--------
+    Seed 42, reproducible.
+    Source: the production inferences.db, deduplicated by patient_id.
+    Stratified: 10 breast, 10 colon, 10 lung, classified on primary_condition.
+    The output carries ALL inferences for each sampled patient (main + resample).
+
+THIS FILE HAD NO ``__main__`` GUARD BEFORE ITEM 20c PASS 3d
+------------------------------------------------------------
+Every statement but one function ran at module level, so reading this file into
+any namespace opened the production inferences.db, sampled it, DELETED the
+existing output database and rewrote it — as a side effect of being read. Item
+20b guarded Files 15, 16, 17, 22 and 24 and pass 3c-2 guarded File 29; nothing
+reached this one, because nothing loads it. CLAUDE.md's claim that File 29 was
+"the LAST UNGUARDED FILE in the repository" is true only in its literal form —
+File 29 had no function at all — and this was the second one.
+
+An earlier version of this docstring said the sampler was
+``exec(open(".../sample_30_patients.py").read())``. No file of that name exists
+anywhere in the project; item 20a checked. It was a comment, so it never ran and
+never raised.
+
+THE DESTINATION IS AN ARGUMENT. ``select_samples(source_db, output_db)`` requires
+both and has no defaults, on the ``empty_database(db_path, flag)`` and
+``download_all_collections(output_dir)`` precedent: this function ``os.remove``s
+the output database before rebuilding it, so a plausible thing to type while
+exploring a module must not delete the file somebody's evaluation report was
+built from. ``--source-db`` and ``--output-db`` override; with no flags this
+entry point passes the two ``default_*`` accessors, which resolve the historical
+locations and create nothing.
 
 Run from terminal:
     cd ".../03- Code"
     python "28- Select 30 Samples.py"
-
-The docstring here used to say `exec(open(".../sample_30_patients.py").read())`.
-No file of that name exists anywhere in the project — item 20a checked. The
-sampler is this file; that line named a predecessor that is gone. It was a
-comment, so it never ran and never raised.
+    python "28- Select 30 Samples.py" --output-db <scratch>/sample.db
 """
 
-import sqlite3
-import random
 import os
-import importlib.util
+import sys
 
 
-# =====================================================================
-# PATHS (from 01- Imports.py)
-# =====================================================================
-# This file is not part of the exec chain -- it deliberately imports only
-# sqlite3 and random rather than pulling in 01's model and client imports for
-# two database queries. So it resolves main_path the way 01 does, by reading
-# oncotriage_settings directly, rather than duplicating 01's literal.
-#
-# The settings module sits beside this file in the code directory, which
-# __file__ locates. In a bare interactive paste __file__ is unbound and the
-# working directory is the only remaining candidate -- taken, but announced.
+# Make the oncotriage package importable
+#---------------------------------------
+# See the same block in "04- FHIR Generate Data.py" and "29- Download Qdrant
+# Data.py". `pip install -e .` from 03- Code/ makes it a no-op.
+try:
+    import oncotriage  # noqa: F401
+except ImportError:
+    for _candidate, _how in (
+        (os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals()
+         else None, "__file__"),
+        (os.getcwd(), "cwd"),
+    ):
+        if _candidate and os.path.isdir(os.path.join(_candidate, "oncotriage")):
+            if _candidate not in sys.path:
+                sys.path.insert(0, _candidate)
+            print(f"[Bootstrap] oncotriage package found at {_candidate} "
+                  f"(via {_how}); added to sys.path")
+            break
+    else:
+        raise
+    del _candidate, _how
 
-if "__file__" in globals():
-    _code_dir = os.path.dirname(os.path.abspath(__file__))
-else:
-    _code_dir = os.getcwd()
-    print(f"[Paths] __file__ unbound; using the working directory as the code directory: {_code_dir}")
+import argparse
 
-_settings_file = os.path.join(_code_dir, "oncotriage_settings.py")
-if not os.path.isfile(_settings_file):
-    raise RuntimeError(
-        f"oncotriage_settings.py was not found beside this file: {_settings_file!r}"
+from oncotriage.evaluation.sampling import (
+    default_output_db,
+    default_source_db,
+    select_samples,
+)
+
+
+#------------------------------------------------------------------------------
+
+
+def _parse_args(argv=None):
+    """Both paths default to None so the historical locations are resolved
+    INSIDE the guard rather than while the parser is built -- they are lazy
+    globs over the sibling tree, and `--help` must not fire them."""
+    parser = argparse.ArgumentParser(
+        description="Extract a seeded, stratified 30-patient sample of "
+                    "inferences.db into its own database."
     )
-_spec = importlib.util.spec_from_file_location("oncotriage_settings", _settings_file)
-path_settings = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(path_settings)
-
-main_path, _main_path_source = path_settings.resolve_main_path()
-print(f"[Paths] Project root: {main_path} (from {_main_path_source})")
-
-source_db = main_path + "02- Data/03- Inferences Storage/inferences.db"
-output_db = main_path + "04- Results/03- 30 Samples db/inferences_sample_30.db"
-
-
-# =====================================================================
-# CONFIGURATION
-# =====================================================================
-
-SEED = 42
-PATIENTS_PER_CANCER = 10
-
-CANCER_TYPES = {
-    "breast": ["breast"],
-    "colon":  ["colon", "colorectal", "rectal"],
-    "lung":   ["lung", "small cell", "non-small cell", "nsclc", "sclc"],
-}
-
-
-def classify_cancer(primary_condition):
-    if not primary_condition:
-        return "other"
-    lower = primary_condition.lower()
-    for cancer_type, keywords in CANCER_TYPES.items():
-        if any(kw in lower for kw in keywords):
-            return cancer_type
-    return "other"
-
-
-# =====================================================================
-# SAMPLE
-# =====================================================================
-
-print(f"Source: {source_db}")
-print(f"Output: {output_db}")
-print(f"Seed:   {SEED}")
-print()
-
-conn = sqlite3.connect(source_db)
-conn.row_factory = sqlite3.Row
-
-# Get unique patients (one per patient_id, lowest inference id)
-patients = conn.execute("""
-    SELECT patient_id, primary_condition, MIN(id) as first_id
-    FROM inferences
-    GROUP BY patient_id
-    ORDER BY MIN(id)
-""").fetchall()
-
-print(f"Total unique patients in DB: {len(patients)}")
-
-# Classify by cancer type
-by_type = {"breast": [], "colon": [], "lung": []}
-
-for p in patients:
-    cancer = classify_cancer(p["primary_condition"])
-    if cancer in by_type:
-        by_type[cancer].append(p["patient_id"])
-
-print(f"  Breast: {len(by_type['breast'])}")
-print(f"  Colon:  {len(by_type['colon'])}")
-print(f"  Lung:   {len(by_type['lung'])}")
-print()
-
-# Validate
-for cancer_type, pids in by_type.items():
-    if len(pids) < PATIENTS_PER_CANCER:
-        raise ValueError(f"Not enough {cancer_type} patients: need {PATIENTS_PER_CANCER}, found {len(pids)}")
-
-# Sample with seed 42. Local Random instance rather than random.seed():
-# seeding the process-wide state would shift the draw of every other consumer
-# of `random` in the same session. One rng shared across all three draws --
-# the loop below consumes a single continuing stream, as it did when the
-# global state was seeded once above it.
-rng = random.Random(SEED)
-
-sampled_pids = []
-for cancer_type in ["breast", "colon", "lung"]:
-    selected = rng.sample(by_type[cancer_type], PATIENTS_PER_CANCER)
-    sampled_pids.extend(selected)
-    print(f"  Sampled {cancer_type}: {len(selected)} patients")
-
-print(f"\nTotal sampled patients: {len(sampled_pids)}")
-
-# Get ALL inference ids for sampled patients (main + resample)
-placeholders = ",".join("?" * len(sampled_pids))
-
-inference_ids = [r["id"] for r in conn.execute(
-    f"SELECT id FROM inferences WHERE patient_id IN ({placeholders})", sampled_pids
-).fetchall()]
-
-print(f"Total inferences for sampled patients: {len(inference_ids)}")
-
-inf_placeholders = ",".join("?" * len(inference_ids))
-trial_match_count = conn.execute(
-    f"SELECT COUNT(*) FROM trial_matches WHERE inference_id IN ({inf_placeholders})", inference_ids
-).fetchone()[0]
-
-print(f"Total trial matches for sampled patients: {trial_match_count}")
-
-
-# =====================================================================
-# CREATE OUTPUT DB
-# =====================================================================
-
-if os.path.exists(output_db):
-    os.remove(output_db)
-    print(f"\nRemoved existing output file.")
-
-out_conn = sqlite3.connect(output_db)
-out_cursor = out_conn.cursor()
-
-# Copy schema
-schema_rows = conn.execute("""
-    SELECT sql FROM sqlite_master 
-    WHERE type='table' AND name IN ('inferences', 'trial_matches', 'drift_metrics')
-    ORDER BY name
-""").fetchall()
-
-for row in schema_rows:
-    out_cursor.execute(row["sql"])
-
-# Copy inferences
-inf_rows = conn.execute(
-    f"SELECT * FROM inferences WHERE patient_id IN ({placeholders})", sampled_pids
-).fetchall()
-
-if inf_rows:
-    col_count = len(inf_rows[0])
-    out_cursor.executemany(
-        f"INSERT INTO inferences VALUES ({','.join('?' * col_count)})",
-        [tuple(r) for r in inf_rows]
+    parser.add_argument(
+        "--source-db", default=None,
+        help="Inference database to sample FROM. Default: paths.inferences_path",
     )
-
-# Copy trial_matches
-tm_rows = conn.execute(
-    f"SELECT * FROM trial_matches WHERE inference_id IN ({inf_placeholders})", inference_ids
-).fetchall()
-
-if tm_rows:
-    col_count = len(tm_rows[0])
-    out_cursor.executemany(
-        f"INSERT INTO trial_matches VALUES ({','.join('?' * col_count)})",
-        [tuple(r) for r in tm_rows]
+    parser.add_argument(
+        "--output-db", default=None,
+        help="Destination. REMOVED AND REBUILT if it exists. Default: "
+             "{results_path}/03- 30 Samples db/inferences_sample_30.db",
     )
+    return parser.parse_args(argv)
 
-out_conn.commit()
 
-
-# =====================================================================
-# VERIFY
-# =====================================================================
-
-verify_patients = out_conn.execute("SELECT COUNT(DISTINCT patient_id) FROM inferences").fetchone()[0]
-verify_inferences = out_conn.execute("SELECT COUNT(*) FROM inferences").fetchone()[0]
-verify_matches = out_conn.execute("SELECT COUNT(*) FROM trial_matches").fetchone()[0]
-
-verify_types = {"breast": 0, "colon": 0, "lung": 0}
-for row in out_conn.execute("SELECT DISTINCT patient_id, primary_condition FROM inferences"):
-    cancer = classify_cancer(row[1])
-    if cancer in verify_types:
-        verify_types[cancer] += 1
-
-out_conn.close()
-conn.close()
-
-print(f"\n{'='*60}")
-print(f"OUTPUT: {output_db}")
-print(f"{'='*60}")
-print(f"  Unique patients:  {verify_patients}")
-print(f"  Total inferences: {verify_inferences}")
-print(f"  Trial matches:    {verify_matches}")
-print(f"  Breast: {verify_types['breast']}  Colon: {verify_types['colon']}  Lung: {verify_types['lung']}")
-print(f"  Seed: {SEED}")
-print(f"{'='*60}")
-
-assert verify_patients == 30, f"Expected 30 patients, got {verify_patients}"
-assert verify_types["breast"] == 10, f"Expected 10 breast, got {verify_types['breast']}"
-assert verify_types["colon"] == 10, f"Expected 10 colon, got {verify_types['colon']}"
-assert verify_types["lung"] == 10, f"Expected 10 lung, got {verify_types['lung']}"
-
-print("\nAll validations passed.")
+if __name__ == "__main__":
+    _args = _parse_args()
+    select_samples(
+        _args.source_db if _args.source_db else default_source_db(),
+        _args.output_db if _args.output_db else default_output_db(),
+    )
 
 
 #------------------------------------------------------------------------------
@@ -249,4 +121,3 @@ Created on Mon Mar 16 20:55:18 2026
 
 @author: ramyalsaffar
 """
-

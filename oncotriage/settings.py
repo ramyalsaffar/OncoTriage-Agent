@@ -3,8 +3,10 @@
 Item 20a (pass 1 of 6) created this as ``oncotriage_settings.py`` at the code
 directory, loaded by file location. Item 20c moved the content here, into a
 real package module, and left ``oncotriage_settings.py`` behind as a
-re-exporting shim: ``01- Imports.py`` and ``28- Select 30 Samples.py`` still
-load that filename by location, and neither had to change.
+re-exporting shim: ``01- Imports.py`` still loads that filename by location and
+did not have to change. ``28- Select 30 Samples.py`` did too until item 20c pass
+3d, which moved its body into ``oncotriage/evaluation/sampling.py`` and made it
+a package import; ``01- Imports.py`` is the last by-location caller.
 
 Why load_env_keys() is NOT here
 -------------------------------

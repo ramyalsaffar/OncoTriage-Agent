@@ -145,7 +145,7 @@ Four handlers and one fallback moved out of `LOGGED` into a stored record.
 | `13- LangGraph Agent.py` Stage 1, MeSH expansion fallback | printed `WARNING: MeSH expansion failed ... (degraded)` | writes `query_expansion_path`, reaches `inferences.query_expansion_path` |
 | `13- LangGraph Agent.py` Stage 4, cancer site filter | ran or did not run silently; `mesh_dropped = 0` meant either | writes `mesh_filter_applied` / `mesh_filter_skip_reason`, reaches the database **and** decides what Section 2 of the Stage 5 system prompt is allowed to assert |
 
-The ablation runner (`26- Ablation Study.py`) stores the same five fields per
+The ablation runner (`oncotriage/ablation/study.py`, entry point `26- Ablation Study.py`) stores the same five fields per
 row and prints a warning when a row's retrieval was degraded, because a
 degraded run silently folded into a configuration's mean is a wrong number
 rather than a missing one.
@@ -351,7 +351,7 @@ inference path; the rest are in tooling, dashboards, or tests.
 | `02- Utility Functions.py:398` | any `Exception` from `caffeinate` teardown | **Acceptable.** Best-effort teardown of an optional macOS convenience; `__enter__` already printed if caffeine was unavailable. |
 | `oncotriage/retrieval/indexer.py` (was `11- RAG Trial Indexer.py:172`) | `(IndexError, ValueError)` parsing `minimumAge` at index time | **CLOSED by item 11a.** `INDEX_AGE_PARSE_FAILURES` is incremented with the bound, the exception type and the (length-capped) raw text, and `scrape_trials()` prints the total in its summary when non-zero — where this row asked for it. Its own counter, NOT shared with the Stage 4 one: the two measure different populations at different times (every registered trial versus the ~75 retrieved for one patient), and one counter would sum them into a number that means neither. Recovery unchanged: the trial is indexed, because the paediatric-only skip could not be evaluated. |
 | `oncotriage/orchestration/airflow_manager.py` (was `24- Airflow Manager.py:89`, now line 205) | `ConnectionError` while polling the Airflow API during startup | **Acceptable.** This *is* the poll loop; the `for/else` prints `API Server did not respond within 30 seconds`. |
-| `25- Batch Runner.py:140`, `25:214`, `26- Ablation Study.py:188` | `OSError` unlinking a temp file after the write it belonged to already failed and printed | **Acceptable.** Cleanup of a temp file on an already-reported error path. |
+| `25- Batch Runner.py:140`, `25:214`, `oncotriage/ablation/study.py` (`save_ablation_checkpoint`, the unlink after a failed atomic write) | `OSError` unlinking a temp file after the write it belonged to already failed and printed | **Acceptable.** Cleanup of a temp file on an already-reported error path. |
 | `25- Batch Runner.py:184` | `(json.JSONDecodeError, OSError)` reading the results file; returns `[]` | **Open — low.** A corrupt results file is indistinguishable from an absent one, and the run restarts from empty. One print would separate them. |
 | `oncotriage/retrieval/qdrant_backup.py` (was `29- Download Qdrant Data.py:33`) | any `Exception` listing aliases | **Closed by pass 20c-3c-2.** The recovery is unchanged -- continuing is right, nothing below uses the aliases -- but it is no longer SILENT: the exception type and message are printed, the path taken is stated ("Continuing -- the download does not use them"), and the failure is recorded in the returned summary as `aliases_error`. |
 | `04- FHIR Generate Data.py:1238` | `(ValueError, OSError)` in `_relative_to_project`; returns the path unchanged | **Acceptable.** The fallback IS the documented behaviour: a path outside `main_path` (a scratch run under `/tmp`) has no relative form, and the absolute path is the correct thing to record in the manifest. Not a degradation — the manifest states which base paths are relative to. |
@@ -512,10 +512,10 @@ Per file, handlers / of which silent:
 | `oncotriage/orchestration/airflow_setup.py` (was `22- Airflow Database.py`) | 2 | 0 |
 | `oncotriage/orchestration/airflow_manager.py` (was `24- Airflow Manager.py`) | 4 | 1 |
 | `25- Batch Runner.py` | 13 | 3 |
-| `26- Ablation Study.py` | 7 | 1 |
-| `27- Ablation Analysis.py` | 2 | 0 |
+| `oncotriage/ablation/study.py` (was `26- Ablation Study.py`) | 7 | 1 |
+| `oncotriage/ablation/analysis.py` (was `27- Ablation Analysis.py`) | 2 | 0 |
 | `oncotriage/retrieval/qdrant_backup.py` (was `29- Download Qdrant Data.py`) | 1 | 0 |
-| `34- Cohort Selector Diff.py` | 2 | 0 |
+| `oncotriage/evaluation/cohort_diff.py` (was `34- Cohort Selector Diff.py`) | 2 | 0 |
 | `37- Retrieval Observability Test.py` | 1 | 0 |
 | `38- Birth Date and Demographics Parser Test.py` | 3 | 0 |
 | `39- ECOG Performance Status Surfacing Test.py` | 2 | 0 |
@@ -677,18 +677,18 @@ task.
 | `25- Batch Runner.py` | 552 | `KeyboardInterrupt` | LOGGED | `print("\n[INTERRUPTED] Waiting for active threads to finish...") \| executor.shutdown(wait=True, canc...` |
 | `25- Batch Runner.py` | 681 | `Exception` | RE-RAISES | `print(f"[FATAL] Could not build BM25 index: {e}") \| raise SystemExit(1)` |
 | `25- Batch Runner.py` | 690 | `Exception` | RE-RAISES | `print(f"[FATAL] Could not compile LangGraph graph: {e}") \| raise SystemExit(1)` |
-| `26- Ablation Study.py` | 161 | `(json.JSONDecodeError, KeyError)` | LOGGED | `print(f"[Checkpoint] WARNING: Could not read checkpoint ({e}). Starting fresh.") \| return set()` |
-| `26- Ablation Study.py` | 183 | `OSError` | LOGGED | `print(f"[Checkpoint] WARNING: Could not write checkpoint ({e}). Continuing.") \| if tmp_path.exists()...` |
-| `26- Ablation Study.py` | 188 | `OSError` | SILENT | `pass` |
-| `26- Ablation Study.py` | 744 | `Exception` | LOGGED | `print(f" WARNING: Failed to log result: {e}")` |
-| `26- Ablation Study.py` | 1088 | `Exception` | RECORDED | `traceback.print_exc() \| result = { "error": str(e), "matches": [], "near_misses": [], "not_evaluable...` |
-| `26- Ablation Study.py` | 1148 | `Exception` | RECORDED+LOGGED | `run_error += 1 \| progress.set_postfix(ok=run_success, err=run_error) \| progress.update(1) \| tqdm.wri...` |
-| `26- Ablation Study.py` | 1187 | `KeyboardInterrupt` | LOGGED | `interrupted = True \| print("\n[INTERRUPTED] Waiting for active threads to finish...")` |
-| `27- Ablation Analysis.py` | 628 | `Exception` | RECORDED+LOGGED | `n_scipy_failures += 1 \| print(f" WARNING: wilcoxon failed for {config}/{col}: " f"{type(exc).__name_...` |
-| `27- Ablation Analysis.py` | 810 | `Exception` | RECORDED+LOGGED | `methods_used.add("normal_approx") \| print(f" WARNING: exact MDE solve failed at alpha={alpha:.6g} " ...` |
+| `oncotriage/ablation/study.py` | 191 | `(json.JSONDecodeError, KeyError)` | LOGGED | `print(f"[Checkpoint] WARNING: Could not read checkpoint ({e}). Starting fresh.") \| return set()` |
+| `oncotriage/ablation/study.py` | 213 | `OSError` | LOGGED | `print(f"[Checkpoint] WARNING: Could not write checkpoint ({e}). Continuing.") \| if tmp_path.exists()...` |
+| `oncotriage/ablation/study.py` | 218 | `OSError` | SILENT | `pass` |
+| `oncotriage/ablation/study.py` | 829 | `Exception` | LOGGED | `print(f" WARNING: Failed to log result: {e}")` |
+| `oncotriage/ablation/study.py` | 1191 | `Exception` | RECORDED | `traceback.print_exc() \| result = { "error": str(e), "matches": [], "near_misses": [], "not_evaluable...` |
+| `oncotriage/ablation/study.py` | 1251 | `Exception` | RECORDED+LOGGED | `run_error += 1 \| progress.set_postfix(ok=run_success, err=run_error) \| progress.update(1) \| tqdm.wri...` |
+| `oncotriage/ablation/study.py` | 1290 | `KeyboardInterrupt` | LOGGED | `interrupted = True \| print("\n[INTERRUPTED] Waiting for active threads to finish...")` |
+| `oncotriage/ablation/analysis.py` | 670 | `Exception` | RECORDED+LOGGED | `n_scipy_failures += 1 \| print(f" WARNING: wilcoxon failed for {config}/{col}: " f"{type(exc).__name_...` |
+| `oncotriage/ablation/analysis.py` | 852 | `Exception` | RECORDED+LOGGED | `methods_used.add("normal_approx") \| print(f" WARNING: exact MDE solve failed at alpha={alpha:.6g} " ...` |
 | `oncotriage/retrieval/qdrant_backup.py` | 178 | `Exception` | RECORDED+LOGGED | `summary['aliases_error'] = repr(e) \| print(f"\nAliases: unavailable ({type(e).__name__}: {e})") \| print("  Continuing -- the download does not use them.")` |
-| `34- Cohort Selector Diff.py` | 296 | `(OSError, json.JSONDecodeError)` | RECORDED+LOGGED | `read_errors.append({'file': patient_file.name, 'error': f"{type(e).__name__}: {e}"}) \| print(f" ERRO...` |
-| `34- Cohort Selector Diff.py` | 519 | `OSError` | LOGGED | `print(f"ERROR writing report: {type(e).__name__}: {e}") \| return False` |
+| `oncotriage/evaluation/cohort_diff.py` | 340 | `(OSError, json.JSONDecodeError)` | RECORDED+LOGGED | `read_errors.append({'file': patient_file.name, 'error': f"{type(e).__name__}: {e}"}) \| print(f" ERRO...` |
+| `oncotriage/evaluation/cohort_diff.py` | 563 | `OSError` | LOGGED | `print(f"ERROR writing report: {type(e).__name__}: {e}") \| return False` |
 | `37- Retrieval Observability Test.py` | 548 | `Exception` | LOGGED | `print(f" SKIP no reachable Qdrant " f"({type(_probe_error).__name__}: {str(_probe_error)[:120]})") \|...` |
 | `38- Birth Date and Demographics Parser Test.py` | 133 | `Exception` | RECORDED+LOGGED | `_RESULTS["failed"] += 1 \| _FAILURES.append(f"{label}\n raised: {type(exc).__name__}: {exc}") \| print...` |
 | `38- Birth Date and Demographics Parser Test.py` | 152 | `expected` | RECORDED+LOGGED | `_RESULTS["passed"] += 1 \| print(f" PASS {label}") \| return` |

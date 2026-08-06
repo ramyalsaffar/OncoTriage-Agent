@@ -580,25 +580,45 @@ print("6. ablation_results gains none of these columns")
 print("=" * 70)
 
 # ECOG is a patient-level property, constant across configurations, so it has no
-# place on a per-configuration table. File 26 is read as source, never executed:
-# executing it would open the real ablation_results.db.
-_ablation_text = Path(_code_dir + "26- Ablation Study.py").read_text(encoding="utf-8")
+# place on a per-configuration table. The schema is read as SOURCE, never
+# executed: executing it would open the real ablation_results.db.
+#
+# IT POINTS AT THE PACKAGE MODULE, NOT AT FILE 26 (item 20c, pass 3d). File 26
+# is a thin entry point now -- a `__main__` block and one import -- so the
+# CREATE TABLE lives in oncotriage/ablation/study.py. Reading the entry point
+# would find no schema at all and `split(...)[1]` would raise IndexError, which
+# is exactly what it did the first time this suite ran after the move: a
+# structural check aimed at a file that no longer holds the thing under test
+# CANNOT PASS VACUOUSLY, but it also cannot report the defect it exists for.
+# Same retargeting, for the same reason, as Files 38, 39, 42 and 43, which all
+# read package modules rather than the shims over them.
+#
+# The path is asserted to exist before it is read, so a future move produces a
+# named failure here rather than a FileNotFoundError thirty lines of traceback
+# deep.
+_ablation_source = Path(_code_dir) / "oncotriage" / "ablation" / "study.py"
+check("the ablation schema module is where this check expects it",
+      _ablation_source.is_file(), True)
+_ablation_text = _ablation_source.read_text(encoding="utf-8")
+check("...and it actually carries the ablation_results CREATE TABLE "
+      "(non-degeneracy: a file without it would make every check below vacuous)",
+      "CREATE TABLE IF NOT EXISTS ablation_results (" in _ablation_text, True)
 _ablation_create = _ablation_text.split("CREATE TABLE IF NOT EXISTS ablation_results (", 1)[1]
 _ablation_create = _ablation_create.split(")", 1)[0]
 
 for _k in ECOG_KEYS:
     check(f"ablation_results CREATE TABLE has no {_k}", _k in _ablation_create, False)
-check("File 26 mentions no ECOG column anywhere",
+check("the ablation study module mentions no ECOG column anywhere",
       any(k in _ablation_text for k in ECOG_KEYS), False)
 
-# AST, not a substring search: File 26's docstring says "Does NOT call
+# AST, not a substring search: the module's docstring says "Does NOT call
 # log_inference()", which a grep reads as a call site. Only real Call nodes count.
 _ablation_calls = {
     n.func.id
     for n in ast.walk(ast.parse(_ablation_text))
     if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
 }
-check("and File 26 never calls log_inference",
+check("and the ablation study never calls log_inference",
       "log_inference" in _ablation_calls, False)
 
 

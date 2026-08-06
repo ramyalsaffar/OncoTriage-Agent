@@ -919,7 +919,7 @@ _PKG_FILES = sorted(
 )
 
 check("the package file list is non-empty and covers all six subpackages",
-      len(_PKG_FILES) >= 66
+      len(_PKG_FILES) >= 75
       and any(f.endswith("registries/mesh.py") for f in _PKG_FILES)
       and any(f.endswith("extraction/negation.py") for f in _PKG_FILES)
       and any(f.endswith("fhir/parser.py") for f in _PKG_FILES)
@@ -935,7 +935,16 @@ check("the package file list is non-empty and covers all six subpackages",
       # retrieval. Named for the same reason as the dashboard pair above.
       and any(f.endswith("orchestration/dag_generator.py") for f in _PKG_FILES)
       and any(f.endswith("orchestration/airflow_manager.py") for f in _PKG_FILES)
-      and any(f.endswith("retrieval/qdrant_backup.py") for f in _PKG_FILES),
+      and any(f.endswith("retrieval/qdrant_backup.py") for f in _PKG_FILES)
+      # Pass 20c-3d: the last three subpackages. fixtures/capture.py is named
+      # here for the same reason dashboard/data.py is -- it is the module whose
+      # disappearance would take the whole characterization baseline with it,
+      # and it is the one module in the package that carries a database
+      # tripwire.
+      and any(f.endswith("ablation/study.py") for f in _PKG_FILES)
+      and any(f.endswith("evaluation/cohort_diff.py") for f in _PKG_FILES)
+      and any(f.endswith("fixtures/capture.py") for f in _PKG_FILES)
+      and any(f.endswith("fixtures/replay.py") for f in _PKG_FILES),
       True)
 
 # EVERY SUBPACKAGE MUST BE DECLARED IN pyproject.toml. setuptools does not
@@ -981,9 +990,13 @@ check("the tree has the subpackages this pass expects (non-degeneracy)",
       # one name.) oncotriage.dashboard.tabs is in this list for the first time
       # in pass 20c-3i: the scan above reaches it now instead of it needing a
       # hand-written check of its own.
-      ["oncotriage.agent", "oncotriage.api", "oncotriage.batch",
+      # ablation, evaluation and fixtures are new in pass 20c-3d, the last
+      # conversion pass: Files 26 and 27, Files 28 and 34, and Files 45 and 46.
+      ["oncotriage.ablation", "oncotriage.agent", "oncotriage.api",
+       "oncotriage.batch",
        "oncotriage.dashboard", "oncotriage.dashboard.tabs",
-       "oncotriage.extraction", "oncotriage.fhir",
+       "oncotriage.evaluation", "oncotriage.extraction", "oncotriage.fhir",
+       "oncotriage.fixtures",
        "oncotriage.monitoring", "oncotriage.orchestration",
        "oncotriage.registries", "oncotriage.retrieval",
        "oncotriage.storage"])
@@ -1823,7 +1836,7 @@ _ALL_PKG_MODULES = sorted(
 )
 
 check("the module list is the size the tree says it is (non-degeneracy)",
-      len(_ALL_PKG_MODULES) >= 53, True)
+      len(_ALL_PKG_MODULES) >= 61, True)
 check("...and includes the one that used to resolve a path at import",
       "oncotriage.registries.mesh" in _ALL_PKG_MODULES, True)
 # Pass 20c-3a's three worst offenders, named individually so a module dropped
@@ -1870,6 +1883,25 @@ _DASHBOARD_MODULES = [
 ]
 check("...and covers all thirteen dashboard modules (new in pass 20c-3c-1)",
       sorted(m for m in _DASHBOARD_MODULES if m not in _ALL_PKG_MODULES), [])
+
+# Pass 20c-3d's six. fixtures.replay is the one that matters most: it is the
+# only module in the package with a MODULE-LEVEL SIDE EFFECT -- it sets
+# ONCOTRIAGE_DEFER_LOCAL_MODELS above its own imports, because
+# oncotriage.agent.deps reads that variable once at ITS import and an assignment
+# underneath would reach nothing and load ~110 MB of MedCPT on every replay.
+# This sweep runs each module in its own subprocess with the project root
+# pointed at a directory that does not exist, so it also proves that the side
+# effect is the ONLY thing importing it does.
+_PASS_3D_MODULES = [
+    "oncotriage.ablation.study",
+    "oncotriage.ablation.analysis",
+    "oncotriage.evaluation.sampling",
+    "oncotriage.evaluation.cohort_diff",
+    "oncotriage.fixtures.capture",
+    "oncotriage.fixtures.replay",
+]
+check("...and covers all six pass-20c-3d modules",
+      sorted(m for m in _PASS_3D_MODULES if m not in _ALL_PKG_MODULES), [])
 
 # Pass 20c-3c-2's five. retrieval.qdrant_backup is the one that matters most:
 # "29- Download Qdrant Data.py" was the LAST file in the repository with no
@@ -2678,6 +2710,25 @@ _UNREAD_CONSTANT_EXEMPTIONS = {
     # entries from the File 21 surface lists below, and replace the three
     # '✅ Full Match' literals with a per-patient constant that has a home.
     "oncotriage/dashboard/tiers.py": ["TRIAL_STATUS_FULL"],
+    # TERMINAL_ERROR COMPLETES A CLOSED THREE-MEMBER VOCABULARY, and it was
+    # already unread before pass 20c-3d moved it here: `git grep TERMINAL_ERROR
+    # HEAD` over the whole repository returns exactly one line, its own
+    # assignment in "45- Fixture Capture.py". This scan covers the PACKAGE, so
+    # the move is what surfaced it rather than what created it.
+    #
+    # It is exempted rather than deleted, and rather than made load-bearing.
+    # Deleting it would leave TERMINAL_FINALIZE and TERMINAL_NO_CANDIDATES named
+    # beside each other and tell a reader that those are the only two values
+    # result["terminal_node"] can carry -- which is false: node_error_handler
+    # stamps this third one, and a fixture that recorded such a run is a real
+    # (if useless) artifact. Making it load-bearing means adding a branch to
+    # verify_recording_complete(), which already REFUSES that fixture through
+    # its "no Stage 5 request/response pair was recorded" arm; the new branch
+    # would improve the diagnosis and change no outcome, so it is a behaviour
+    # edit inside a conversion pass whose acceptance criterion is that nothing
+    # changed. RECORDED AS A FOLLOW-UP: name the error-handler case explicitly
+    # in verify_recording_complete() and drop this entry.
+    "oncotriage/fixtures/capture.py": ["TERMINAL_ERROR"],
 }
 
 _reads, _string_blob = _all_reads(
@@ -2918,6 +2969,13 @@ _DECORATOR_INVENTORY = {
     # them. A bare-name inventory could not.
     "oncotriage/registries/cancer_code_registry.py::OncologyLabRegistry._date_sort_key":
         ["staticmethod"],
+    # Pass 20c-3d. compute_collection_digest()'s paging closure is the one
+    # decorated definition in the three subpackages that pass added, and it is
+    # NESTED -- a top-level walk would report it as absent, which is the shape
+    # that hid api/server.py's four endpoints from the first version of this
+    # scan.
+    "oncotriage/fixtures/capture.py::compute_collection_digest._page":
+        ["qdrant_retry"],
     "oncotriage/registries/mesh.py::MeSHCancerFilter._stem": ["staticmethod"],
     "oncotriage/retrieval/indexer.py::get_embeddings_batch._call": [
         "retry(reraise=True, stop=stop_after_attempt(5), "

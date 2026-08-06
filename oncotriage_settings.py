@@ -1,16 +1,29 @@
 """Re-export shim over ``oncotriage.settings``.
 
 Item 20a created this file with the content itself. Item 20c moved that content
-into the ``oncotriage`` package and left this behind, because two files load it
-BY FILE LOCATION under exactly this name and neither was in scope to change:
+into the ``oncotriage`` package and left this behind, because files load it BY
+FILE LOCATION under exactly this name. As of item 20c pass 3d there is exactly
+ONE such caller left:
 
     01- Imports.py          searches three candidate directories for
                             "oncotriage_settings.py" and exec_module()s it
-    28- Select 30 Samples.py  same, beside its own __file__
+
+    28- Select 30 Samples.py  DID THE SAME, beside its own __file__, and does
+                            not any more: pass 3d moved its body to
+                            ``oncotriage/evaluation/sampling.py``, which imports
+                            ``oncotriage.paths`` like every other package
+                            module. The by-location load was right when it was
+                            written -- File 28 was not in the exec chain and did
+                            not want File 01's model and client imports for two
+                            database queries -- and became obsolete once
+                            ``oncotriage.paths`` cost nothing to import. It also
+                            registered a SECOND copy of this module in
+                            ``sys.modules`` beside the one the package holds,
+                            two ``_RESOLVED`` caches answering one question.
 
 Loading a module by location does not consult sys.path, so this file has to
-keep existing at the code directory under this exact name for as long as those
-two do it that way. Passes 20d-20f are where they stop.
+keep existing at the code directory under this exact name for as long as
+``01- Imports.py`` does it that way. Passes 20d-20f are where it stops.
 
 Everything is re-exported EXPLICITLY, by name. A star import would make the
 list of what this shim provides depend on ``oncotriage.settings``'s internals,

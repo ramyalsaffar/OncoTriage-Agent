@@ -64,4 +64,10 @@ packages = [
     # File 29 became oncotriage/retrieval/qdrant_backup.py, inside a subpackage
     # already listed above, so it needs no entry here.
     "oncotriage.orchestration",
+    # Pass 20c-3d, the last conversion pass: the ablation study and its
+    # analysis (Files 26 and 27), the two offline measurements (Files 28 and
+    # 34), and the characterization fixture harness (Files 45 and 46).
+    "oncotriage.ablation",
+    "oncotriage.evaluation",
+    "oncotriage.fixtures",
 ]

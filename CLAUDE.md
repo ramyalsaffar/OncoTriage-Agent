@@ -14,7 +14,7 @@ Files 01, 02 and 03 are different as of item 20c. They are now **re-export shims
 
 Files 01, 02, 03 (pass 20c-1), 08, 09, 10 (pass 20c-2a), 07, 14 (pass 20c-2b), 13 (pass 20c-2c), 05 (pass 20c-3a) and 20 (pass 20c-3b) are shims.
 
-**Files 04, 06, 11, 12 (pass 20c-3a), 15, 16, 17, 25 (pass 20c-3b), 21 (pass 20c-3c-1) and 22, 23, 24, 29 (pass 20c-3c-2) are THIN ENTRY POINTS** — a `__main__` block, the imports it needs, and nothing else. They have **no exec bootstrap at all**: no `exec()` of Files 01/02/03, no `exec_chain`. That is allowed because nothing in the repository chains them, which was verified rather than assumed — every top-level name each of them defined was grepped against every `.py`, `.md`, `.toml` and `.yml` in the tree, and the only hits are prose in CLAUDE.md / `Exception and Fallback Audit.md`, Files 39 and 40 printing `python "04- FHIR Generate Data.py" --population 3000` as a suggested command, a comment in `02- Utility Functions.py` line 46 naming File 16, a comment in File 25 naming File 17's `_run_matching_pipeline`, and coincidental same-named locals elsewhere (`conn`, `cursor`, `_in`, `_out`, `df_cost`, `graph`, `bm25_index`, `print_summary`).
+**Files 04, 06, 11, 12 (pass 20c-3a), 15, 16, 17, 25 (pass 20c-3b), 21 (pass 20c-3c-1), 22, 23, 24, 29 (pass 20c-3c-2) and 26, 27, 28, 34, 45, 46 (pass 20c-3d) are THIN ENTRY POINTS** — a `__main__` block, the imports it needs, and nothing else. They have **no exec bootstrap at all**: no `exec()` of Files 01/02/03, no `exec_chain`. That is allowed because nothing in the repository chains them, which was verified rather than assumed — every top-level name each of them defined was grepped against every `.py`, `.md`, `.toml` and `.yml` in the tree, and the only hits are prose in CLAUDE.md / `Exception and Fallback Audit.md`, Files 39 and 40 printing `python "04- FHIR Generate Data.py" --population 3000` as a suggested command, a comment in `02- Utility Functions.py` line 46 naming File 16, a comment in File 25 naming File 17's `_run_matching_pipeline`, and coincidental same-named locals elsewhere (`conn`, `cursor`, `_in`, `_out`, `df_cost`, `graph`, `bm25_index`, `print_summary`).
 
 Two of those eight keep one re-exported name each, and both are load-bearing:
 
@@ -58,6 +58,12 @@ Two of those eight keep one re-exported name each, and both are load-bearing:
 | `oncotriage/orchestration/airflow_setup.py` | File 22 whole — `setup_airflow` | `orchestration.home` |
 | `oncotriage/orchestration/dag_generator.py` | File 23 whole — the three DAG string pieces, `build_path_block`, `build_dag_content`, `write_dag_file` | `paths`, `settings`, `orchestration.home` |
 | `oncotriage/orchestration/airflow_manager.py` | File 24 whole — start/stop, the four-tier password route, status, trigger | `settings`, `orchestration.home` |
+| `oncotriage/ablation/study.py` | File 26 whole — seven configs, the stratified sample, the checkpoint, the thread pool, the `ablation_results.db` writer | `paths`, `config`, `agent.{deps,graph,patient,retrieval,state,evaluation}`, `fhir.parser`, `utils` |
+| `oncotriage/ablation/analysis.py` | File 27 whole — the comparison table, the BH-FDR Wilcoxon family, the MDE, nine figures, two reports. READS the database, never writes it | `paths`, `config` |
+| `oncotriage/evaluation/sampling.py` | File 28 whole — the seeded 10/10/10 draw into a second database | `paths` |
+| `oncotriage/evaluation/cohort_diff.py` | File 34 whole — LEGACY vs CURRENT cohort selector, read only | `paths`, `config`, `fhir.{clean,parser}`, `registries.cancer_code_registry` |
+| `oncotriage/fixtures/capture.py` | File 45 whole — the schema, the sink, the four proxies, `build_deterministic_prefix`, the fixture I/O, the three recipes, the cohort scan | `paths`, `config`, `agent.*`, `extraction.stage`, `fhir.parser`, `storage.database_logger`, `utils` |
+| `oncotriage/fixtures/replay.py` | File 46 whole — the replay stand-ins, the OpenAI tripwire, the field diff, the five refusals | `config`, `paths`, `agent.{deps,graph,patient}`, `fhir.parser`, `fixtures.capture`, `utils` |
 | `oncotriage/registries/primary_cancer.py` | `_resolve_primary_cancer` — which condition is THE cancer | `registries.cancer_code_registry` |
 | `oncotriage/agent/deps.py` | **the seam**: every client, model and registry, lazily resolved and overridable | `config`, `registries.*` |
 | `oncotriage/agent/state.py` | `TrialMatchState`, the channel / expansion-path / MeSH-filter vocabularies | nothing from the project |
@@ -281,6 +287,12 @@ python "29- Download Qdrant Data.py" --output-dir <scratch>
 python "26- Ablation Study.py" --sample-size 30 --configs full_pipeline no_mesh_filter
 python "26- Ablation Study.py" --summary-only        # report from existing ablation_results.db
 python "27- Ablation Analysis.py"                    # tables + figures from ablation_results.db
+python "28- Select 30 Samples.py"                    # 10 breast + 10 colon + 10 lung, seed 42
+python "28- Select 30 Samples.py" --output-db <scratch>/sample.db
+python "34- Cohort Selector Diff.py"                 # LEGACY vs CURRENT selector, read only
+python "45- Fixture Capture.py" --scan-only          # cohort scan + selection, captures nothing
+python "45- Fixture Capture.py"                      # COSTS MONEY: 12 real end-to-end runs
+python "46- Fixture Replay.py"                       # free; exit 0 only if all 12 replay clean
 python "20- Drift Detection.py"                      # KS / PSI / z-score vs 30-day baseline
 
 # Docker (all five services)
@@ -333,8 +345,9 @@ File 47's per-module import sweep (check 2c) runs one subprocess per package
 module through a `ThreadPoolExecutor`. Serially it took about nine minutes and
 the module count has gone 26 → 33 (pass 3a) → 42 (pass 3b) → 50 (pass 3c-1,
 which added thirteen dashboard modules, each of which imports streamlit in its
-own subprocess) → **55** (pass 3c-2: the four orchestration modules and the
-Qdrant backup); a test nobody runs
+own subprocess) → 55 (pass 3c-2: the four orchestration modules and the
+Qdrant backup) → **61** (pass 3d: the ablation pair, the two offline
+measurements and the fixture harness); a test nobody runs
 because it is slow protects nothing. A THREAD pool rather than a process pool is the right
 tool, not a compromise: each unit of work is already its own subprocess, so the
 parent thread spends its life blocked in `subprocess.run()` with the GIL
@@ -753,7 +766,9 @@ Four tiers, first match wins, and `password_source()` reports which answered wit
 
 **`resolve_airflow_home()` lives in `oncotriage/orchestration/home.py` and is the ONE place `paths.airflow_path` is read.** The first draft wrote the same three lines into all three orchestration modules. That is the shape the BM25 sparse model had before pass 20c-3a — one job, several construction sites, nothing that fails when they disagree. Here disagreement means `airflow_setup` migrating a database under one AIRFLOW_HOME while `airflow_manager` starts a scheduler under another: two working processes, two metadata databases, and the only symptom is a DAG that never appears in the UI.
 
-**File 29 was the LAST UNGUARDED FILE in the repository.** No function, no `__main__` guard, no bootstrap — every statement at module level, so loading it created a directory, listed every Qdrant collection, scrolled every point with payloads **and** vectors over the network, and wrote one JSON per collection. Item 20b guarded Files 15, 16, 17, 22 and 24 and never reached it, because nothing loads it: the only documented invocation was `exec(open(code_path + "29- Download Qdrant Data.py").read())` from Spyder. That line is gone from the docstring rather than left as a trap — behind a guard it would exec cleanly and download **nothing**, which is worse than failing. Its header comment also claimed it used `results_path`; it never did, and the symtable measurement is what settled that.
+**File 29 was the last file in the repository with NO FUNCTION AT ALL, and
+pass 20c-3d found the second unguarded one.** Read the claim narrowly: File
+29 had no function, no `__main__` guard, no bootstrap — every statement at module level, so loading it created a directory, listed every Qdrant collection, scrolled every point with payloads **and** vectors over the network, and wrote one JSON per collection. Item 20b guarded Files 15, 16, 17, 22 and 24 and never reached it, because nothing loads it: the only documented invocation was `exec(open(code_path + "29- Download Qdrant Data.py").read())` from Spyder. That line is gone from the docstring rather than left as a trap — behind a guard it would exec cleanly and download **nothing**, which is worse than failing. Its header comment also claimed it used `results_path`; it never did, and the symtable measurement is what settled that. **`28- Select 30 Samples.py` was unguarded too** — it defined one function, `classify_cancer`, and ran every other statement at module level, so reading it opened the production `inferences.db`, sampled it, DELETED the existing `inferences_sample_30.db` and rewrote it. Nothing loads it either, which is why item 20b and pass 3c-2 both missed it. Guarded in pass 20c-3d.
 
 `download_all_collections(output_dir, client=None)` takes the destination as a **required** argument with no default, on the `empty_database(db_path, flag)` precedent: a plausible thing to type while exploring a module must not start a full download of a cloud database. `default_output_dir()` resolves the historical destination lazily and **creates nothing** — the `output_dir()`/`ensure_output_dir()` lesson from pass 20c-3b. The client comes from `oncotriage.config`, **not** `agent.deps`, for the same reason `retrieval.indexer` does: a stub installed for an agent test that quietly redirected a BACKUP would be indistinguishable from a real one until the day it was restored from.
 
@@ -761,11 +776,239 @@ One change in `qdrant_backup` is **not** a path accessor, a client accessor or a
 
 **File 24's `__main__` menu is kept BYTE-VERBATIM**, including its comment `# After setting AIRFLOW_PASSWORD: Check status`, which names the retired route. Replacing the commented menu with a real argparse CLI is the right end state, it is a redesign, and it is a recorded follow-up — not built here. The entry-point docstring carries a loud note immediately above the menu so no reader is misled by that one comment.
 
-**File 47 grew two traps and six modules.** `subprocess.run` and `subprocess.Popen` are patched to raise before the imports, because three of the six new modules are the only ones in the package that spawn processes and **no existing trap could see one** — a subprocess opens no socket, no database and no file *in this process*, and before item 20b loading File 22 ran `airflow db migrate` while loading File 24 launched two long-lived servers. 48 modules now import under all traps; the sweep is **278 checks** as of pass 20c-3i, all passing.
+**File 47 grew two traps and six modules.** `subprocess.run` and `subprocess.Popen` are patched to raise before the imports, because three of the six new modules are the only ones in the package that spawn processes and **no existing trap could see one** — a subprocess opens no socket, no database and no file *in this process*, and before item 20b loading File 22 ran `airflow db migrate` while loading File 24 launched two long-lived servers. 48 modules now import under all traps; the sweep was **278 checks** as of pass 20c-3i and is **283** as of pass 20c-3d, all passing.
 
 **Pass 20c-3i widened those two traps to twelve and added three sections.** The two subprocess patches were measured, not trusted, and the measurement changed the picture. The comment beside them claimed a `from subprocess import Popen` would escape; it does not — `from X import name` is an attribute read performed when the import *runs*, and every package import runs after the trap is armed, so the attribute, module-alias and from-import forms are all caught (each is now **fired**, not argued, as its own control). `subprocess.call` / `check_call` / `check_output` / `getoutput` and `os.popen` all funnel through the patched `Popen`, which is a CPython implementation detail rather than a guarantee, so they are trapped explicitly. What genuinely escaped was **`os.system`, `os.posix_spawn`, `os.execv` and `os.fork`** — not a reference form at all — plus one real pre-bound from-import, `prompt_toolkit.application.application.Popen`, taken before the patch and therefore out of reach of any attribute patch. The probe now sweeps `sys.modules`, **rebinds** every surviving reference to an original, sweeps again and asserts the second sweep is clean, with a planted holder as the control. Nothing in the package imports prompt_toolkit, which is exactly why reporting rather than closing would have been wrong: a trap whose coverage depends on which third-party packages happen to be installed is a coincidence, not a guarantee.
 
 The three new sections: **2h** (nothing is declared and never read — see the method rule below; its exemption list is closed and each entry argued, and this file's own string literals are excluded from the read corpus so the scan cannot read its own exemptions), **2i** (the decorator inventory of the whole package, pinned at every nesting depth), and a **recursive** subpackage scan in section 1 with a negative control planted three deep.
+
+### The ablation study, the two measurements, and the fixture harness (pass 20c-3d)
+
+**This is the LAST conversion pass.** Files 26, 27, 28, 34, 45 and 46 become thin
+entry points over `oncotriage/ablation/`, `oncotriage/evaluation/` and
+`oncotriage/fixtures/`. **None of the six keeps a re-export shim**, and for File
+45 that answer CHANGED DURING THE PASS.
+
+**THE SHIM QUESTION WAS SETTLED BY GREP, NOT BY ASSUMPTION.** The pass began on
+the premise that File 45 would need one, because `46- Fixture Replay.py`
+exec-chains it and reads eighteen names out of the shared namespace. All 101 of
+File 45's top-level names were grepped against every `.py`, `.md`, `.toml` and
+`.yml` in the tree first, and **File 46 is the only consumer of any of them** —
+every distinctive hit (`BUNDLE_DERIVED`, `BUNDLE_IN_COHORT`,
+`FIXTURE_KIND_CONSTRUCTED`, `FIXTURE_ROOT`, `SCHEMA_VERSION`, `_HOOK_KEYS`,
+`OpenAIProxy`, `QdrantProxy`, `RecordingSink`, `assert_hooks_reach_the_agent`,
+`build_deterministic_prefix`, `compute_collection_digest`, `flatten_prefix`,
+`list_fixtures`, `load_fixture`, `rebuild_derived_bundle`, `restore_hooks`,
+`sha256_json`) is a line in File 46, and the rest are prose. This same pass
+converts File 46, which imports them from `oncotriage.fixtures.capture`, so
+after it nothing chains File 45. A shim would have been re-exports with no
+reader — the dead declaration File 47 check 2h scans for. The other five files
+have no consumer at all: File 26's only outside hits are File 27's own
+`ABLATION_DB` over the same directory and two prose mentions of
+`log_ablation_result`; Files 27, 28, 34 and 46 hit nothing but bootstrap locals
+and prose.
+
+**THE NAME GREP HAS A BLIND SPOT AND IT FIRED IMMEDIATELY.** It searches for
+top-level NAMES, and `40- ECOG Logging Test.py` line 585 read File 26 by
+FILENAME — `Path(_code_dir + "26- Ablation Study.py").read_text()` — to slice the
+`ablation_results` CREATE TABLE out of it and assert no ECOG column was added.
+The entry point holds no schema, so `split(...)[1]` raised `IndexError` and took
+section 6 with it. It is retargeted at `oncotriage/ablation/study.py`, the same
+way Files 38, 39, 42 and 43 point at package modules rather than the shims over
+them, and it gained two guards — the file exists, and it carries the marker —
+so a future move produces a named failure instead of a traceback. Both new
+assertions, and the ECOG-column check they protect, were shown to FIRE against
+mutated copies. **A repo-wide grep for each file's NAME as a string is now part
+of the method, not just its symbols.**
+
+**FILE 45's ISOLATION MECHANISM PARTLY CEASED TO EXIST, and the naive conversion
+makes the guard VACUOUS rather than failing.** `_assert_database_is_isolated()`
+made five checks; the fourth was `inferences_path != FIXTURE_SCRATCH_DB`, a
+statement about a name in the shared exec namespace. A module has none. Dropping
+it loses the guard; keeping it against `paths.inferences_path` compares the
+production path to a temp path, finds them different, and **passes forever while
+asserting nothing**. It is re-expressed as the module-world statement of the same
+fact: *no name in this module's globals is bound to
+`oncotriage.storage.database_logger.log_inference`* — a scan, so an alias does
+not escape it, which is strictly stronger than the single identity test it
+replaces. The other four are unchanged: the package default IS the production
+database, it is NOT the probe path, `resolve_inference_db_path` honours an
+explicit argument, and the neutralized `log_inference` still RAISES. **All five
+were broken one at a time in an in-memory COPY of the module and shown to fire;
+the unmodified module passes.**
+
+**FILE 45's REASON FOR CHAINING FILE 14 HAD EXPIRED TWO PASSES EARLIER.** Its own
+comment said File 14 was chained only for `_resolve_primary_cancer()`, which
+File 13's terminal nodes need. Pass 20c-2b moved that function to
+`oncotriage/registries/primary_cancer.py` and `oncotriage/agent/terminal.py`
+imports it from there by name. Nothing else in File 45 used a File 14 name. The
+chain is gone, and with it the `inferences_path = FIXTURE_SCRATCH_DB` redirect
+that existed only to make the chain safe. `FIXTURE_SCRATCH_DB` survives as a
+**comparison probe** — no file is ever created at that path — because the two
+non-degeneracy checks need a second, definitely-different path to compare
+against.
+
+**THE DEFER ORDERING IS THE SHARPEST HAZARD IN THE PASS, and it is checked rather
+than trusted.** `oncotriage/agent/deps.py` reads
+`ONCOTRIAGE_DEFER_LOCAL_MODELS` **once, at its own import**. File 46 set it
+before File 13 was exec'd. In a module every import runs at the top, `deps`
+arrives transitively on the first `oncotriage` import, and an assignment
+underneath it reaches nothing — so MedCPT (~110 MB) and FastEmbed load for real
+on every replay while the run still prints `Local models: not loaded`. So
+`oncotriage/fixtures/replay.py` sets the variable **above its own imports**,
+which is the one module-level side effect anywhere in the package, and
+`assert_local_models_deferred()` — called by `main()` before a fixture is read —
+refuses on three separate facts: the assignment was not too late
+(`_DEFERRAL_WAS_LATE`), `deps` observed it, and neither `torch` nor
+`transformers` is in `sys.modules`. It is a recorded flag rather than an
+import-time raise because File 47 imports the whole package in one process in
+alphabetical order, where `oncotriage.agent.deps` is legitimately already there.
+
+**Proved rather than asserted:** a replay was run with `torch` and
+`transformers` blocked at the import hook and `fastembed.SparseTextEmbedding`
+subclassed to raise on construction. It completed clean and touched none of the
+three. The poison was shown to be real by the negative control — with `deps`
+imported first at `=0`, `assert_local_models_deferred()` fires and all three
+factories die on the blocked import or the poisoned constructor.
+
+**THIS PASS CONVERTS THE HARNESS THAT VERIFIES EVERY OTHER PASS, so "12/12
+replayed clean" proves nothing by itself.** A harness that has stopped OBSERVING
+also replays clean. So a real behaviour change was planted in the pipeline and
+the replay was required to report it. Two plants, in place, each hashed before
+and after with the restore asserted byte-identical:
+
+- **`agent/retrieval.py`, `RRF_K` 60 → 61.** Caught on **`normal_1`**, as a
+  replay MISS on `recordings.cross_encoder` — the fused pool reordered, so the
+  cross-encoder was handed a different set of trial texts and the recording had
+  no entry for that digest. Exit 1.
+- **`agent/terminal.py`, `matches.sort` descending → ascending** — a violation of
+  `node_finalize`'s own documented contract. Caught on **`normal_1`**, 10 field
+  differences, named: `stage5.verdicts[0].nct_id`
+  (`NCT06058650` → `NCT06839001`), `stage5.verdicts[0].match_score`
+  (0.24 → 0.08), `stage5.verdicts[0].trial_number`, and their pairs at index 1.
+  Exit 1.
+
+Both restored byte-identically and the suite went back to **12/12 clean, exit
+0**. A THIRD plant is recorded because it did NOT fire and the reason is a fact
+about the corpus, not a hole in the harness: dropping `deduplicate_by_display`
+from `medication_count` changes nothing, because File 07 already de-duplicates
+upstream — measured, raw and deduplicated counts are equal on all twelve
+fixtures. A plant that is not a behaviour change is not a test of the harness.
+
+**THE FIXTURE FORMAT IS FROZEN AND THAT WAS PROVED BY BYTES.** `SCHEMA_VERSION`
+is 3, the twelve fixtures on disk are v3, `load_fixture` refuses a mismatch. The
+pre-split `write_fixture` / `fixture_path` / `FIXTURE_SUFFIX` were **unparsed out
+of `git show HEAD:` and exec'd into a throwaway namespace**, never retyped, and
+handed the same twelve fixtures as the converted path: **12/12 byte-identical**,
+same sha256 each. The negative control — one fixture written with `mtime=1`
+instead of `mtime=0` — diverges, so the comparison can fail.
+
+**`46- Fixture Replay.py`'s FIVE REFUSALS RUN IN THE SAME ORDER**, and that order
+is unchanged: the dependency seam **negative control first** (the assertion must
+FAIL with no override installed, or it proves nothing), then the positive
+control, then the OpenAI tripwire, then the pinned collection NAME, then its
+CONTENTS digest, and only then a fixture. Note that the collection checks are
+first among the checks about FIXTURES but the seam probe precedes them — that
+ordering is what was shipped and what is kept.
+
+**`diff_tunables()` HAD TO STOP READING `globals()`.** It compared each recorded
+tunable against `globals().get(name)`, which under the exec chain was the shared
+namespace File 03 had filled. In a module that expression sees the replay
+module's own globals, where not one of the eighteen tunables is defined — so
+**every fixture would have reported all eighteen as `<no longer defined>`, on
+every run**, burying a real diff under eighteen lines of false finding. It reads
+`oncotriage.config` now, which is where File 03 got them.
+
+**`main()`'s local `paths` was renamed `fixture_paths`.** The module imports
+`oncotriage.paths` as `paths`, and a name assigned anywhere in a function is
+local for the whole of it. It would not have failed today — `main()` reads no
+other `paths` attribute — which is exactly what makes it the trap File 47 check
+2g exists to catch.
+
+**FILE 34 IS DELIBERATELY BUILT THE WAY IT LOOKS WRONG, and both halves survive.**
+`oncotriage/evaluation/cohort_diff.py` imports the LIVE `has_cancer_diagnosis`
+from `oncotriage.fhir.clean`, so it measures the code that will actually build
+the cohort, and it keeps its own `_LEGACY_EXCLUDE_VERIFICATION` — the pre-fix
+File 05 defined a copy that overwrote File 08's under the exec chain, so
+consolidating it would make the LEGACY arm agree with the CURRENT arm wherever
+the two sets differ, which is the disagreement the file exists to find. The
+registry comes from `clean.cancer_registry()`, **not** `agent.deps`: this
+measures the deletion path, and a stub installed for an agent test must not
+change what it reports.
+
+**File 28 loads `oncotriage_settings.py` BY LOCATION no longer.** Its argument
+was that it is not in the exec chain and should not pull in File 01's model and
+client imports for two database queries — right at the time, obsolete now:
+`oncotriage.paths` imports only `oncotriage.settings` and resolves lazily. The
+by-location load would also register a SECOND copy of the settings module under
+the name `oncotriage_settings`, beside the one `oncotriage.paths` already holds
+— two `_RESOLVED` caches answering the same question. Both database paths are
+now **required arguments with no defaults** (`select_samples(source_db,
+output_db)`), on the `empty_database(db_path, flag)` precedent, because the
+function `os.remove`s the output database before rebuilding it.
+
+**`oncotriage/ablation/analysis.py` imports matplotlib at module scope**, the
+second module allowed to after `oncotriage/fhir/explore.py` and for the same
+reason: nine of its functions draw, and File 47 section 2 already pre-imports
+matplotlib, seaborn and pandas before arming its traps. scipy stays inside the
+three function bodies that use it.
+
+**TWO THINGS IN FILE 26 ARE REPORTED, NOT FIXED**, because a conversion pass
+whose acceptance criterion is that nothing changed is the wrong place for
+either:
+
+- **`save_ablation_checkpoint()` catches `OSError` and `pass`es with no record.**
+  It is the inner handler around the unlink of the temp file after a failed
+  atomic write (`oncotriage/ablation/study.py`, in the `except OSError` that
+  follows the `os.replace`) — *not* line 188 of the old File 26, which is inside
+  the `json.dump`. The exception audit lists it as SILENT and item 11a's sweep
+  did not reach it. It is the one exception in the file caught without a counter
+  or a message.
+- **`ablation_db()` is the LAST IMPLICIT-PATH DATABASE WRITER in the project.**
+  Every other writer takes its path as an argument — `log_inference(db_path=)`,
+  `log_drift_metrics(db_path=)`, `empty_database(db_path, flag)`,
+  `select_samples(source_db, output_db)` as of this pass — and this one does
+  not, so there is no way to point a study run at a scratch database and no
+  isolation test can be written for it.
+
+**A THIRD FINDING, from File 47 check 2h:** `TERMINAL_ERROR` in
+`fixtures/capture.py` is declared and read by nothing, and `git grep
+TERMINAL_ERROR HEAD` returns exactly one line — its own assignment in File 45.
+It was dead before the move; the move is what made check 2h able to see it. It is
+**exempted with an argument** rather than deleted (it completes a closed
+three-member vocabulary whose other two members are read, and naming only two
+would tell a reader the third is impossible) and rather than made load-bearing
+(the branch that would read it sits in `verify_recording_complete()`, which
+already refuses that fixture through another arm, so the change would improve a
+diagnosis and alter no outcome — a behaviour edit inside a pass that promises
+none). Recorded as a follow-up.
+
+**Equivalence: 164 definitions across the six modules, 151 matched to an origin
+in `git show HEAD:`, 110 byte-identical after `ast.unparse`, 41 differing, 13
+with no counterpart, 1 carrying a decorator.** Every diff was printed and
+classified, and all 41 fall in five categories: path accessor
+(`ABLATION_DB`/`OUTPUT_DIR`/`FIXTURE_ROOT`/`_REPORT_*`/`checkpoint_path`/
+`data_fhir_path`/`PRODUCTION_INFERENCES_PATH`), client accessor
+(`qdrant_client` → `config.get_qdrant_client()`, `_CANCER_REGISTRY`/`_MESH_FILTER`
+→ `deps.get_*`, `_CANCER_REGISTRY` → `clean.cancer_registry()`), db_path
+(`_database_logger.resolve_inference_db_path`), env ordering (the
+`assert_local_models_deferred()` call), and guard (the re-expressed isolation
+check, the `log_inference` tripwire). **Two diffs fall OUTSIDE those five and are
+called out rather than folded in**: `diff_tunables`' `globals()` →
+`getattr(config, ...)`, and `main()`'s `paths` → `fixture_paths` rename. Both are
+argued above; both are required rather than cosmetic. The 13 without a
+counterpart are the new accessors and guards, each named. The one decorated
+definition, `compute_collection_digest._page` carrying `@qdrant_retry`, is
+NESTED — a top-level walk would have reported it absent, which is the shape that
+hid `api/server.py`'s four endpoints from the first version of File 47's
+decorator scan.
+
+**File 47 is 283 checks** as of this pass (from 278), with the three new
+subpackages in its recursive scan, the six new modules named in its per-module
+import sweep, `compute_collection_digest._page` in its decorator inventory, and
+the floors raised to 75 package files / 61 modules. All six new modules import
+under all twelve traps with the project root pointed at a directory that does not
+exist, opening nothing and pulling in no heavy library.
 
 ## Persistence and observability
 
