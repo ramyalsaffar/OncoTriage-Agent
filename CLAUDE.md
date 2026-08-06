@@ -256,7 +256,7 @@ uvicorn oncotriage.api.server:app --port 8000        # the same app, package rou
 streamlit run "21- Streamlit Dashboard.py"           # dashboard on :8501
 python "25- Batch Runner.py"                         # full-corpus run, no HTTP, checkpointed
 python "15- Database Empty.py"                       # no-op unless Flag = True at its line 78
-python "16- Database Query.py"                       # ~40 read-only queries (dies at Q19, item 38)
+python "16- Database Query.py"                       # ~40 read-only queries; runs to the end since item 38
 
 # Data + index build (one-time / weekly)
 python "04- FHIR Generate Data.py"                   # Synthea JAR -> ~22k patients
@@ -292,10 +292,14 @@ docker compose logs -f fastapi
 python "39- ECOG Performance Status Surfacing Test.py"   # needs the scratch corpus from 04-
 python "47- Package Split Test.py"                       # no network, no keys, no corpus; ~30s
 python "48- Degraded Dependency Test.py"                 # item 11a; no network, no keys; ~40s
+python "49- Database Query Layer Test.py"                # item 38; temp SQLite only; ~15s
 pip install -e .                                         # makes `oncotriage` importable anywhere
 ```
 
-**File 48 is NOT in `run_serial_tests.py`, deliberately.** It edits no file in
+**Files 48 and 49 are NOT in `run_serial_tests.py`, deliberately.** File 49
+writes only into a fresh temporary directory, reads repository source text
+without modifying a byte, and reads history through `git show`, which touches no
+working-tree file; two copies of it could run at once. File 48 edits no file in
 the repository: every degraded state it produces comes from shadowing a cached
 module attribute (`paths._RESOLVED`, `clean._RESOLVED`) or planting a module in
 `sys.modules`, each restored in a `finally`. It copies real patient bundles into
@@ -466,7 +470,7 @@ These three moved into the package in pass 20c-2a. The numbered files survive as
 ### The serving layer (pass 20c-3b)
 
 - **`oncotriage/storage/maintenance.py`** (thin entry point: `15- Database Empty.py`) — `empty_database(db_path, flag)`. **Both arguments stay required and neither gets a default.** `db_path=None` meaning "production" would turn `empty_database()` — a plausible thing to type while exploring a module — into a command that wipes the real `inferences.db`, and `flag=False` as a default would make `empty_database(path)` a no-op that looks like it worked. `Flag = False` stays at module level in File 15: it is data, and the one-line edit that arms the script belongs where a reader looks for it.
-- **`oncotriage/storage/queries.py`** (thin entry point: `16- Database Query.py`) — the ~40 queries as an ordered registry of `Query` records. `run(conn, key)` returns one frame, `run_all(conn)` returns them all, `report(conn)` prints exactly what File 16 printed. **The SQL was extracted BY AST and never retyped**, so it is byte-for-byte what it was — including **the two queries item 38 owns and has not fixed**: `expansion_token_efficiency` selects columns that do not exist and `pipeline_consistency` has a stray `WHEN` outside its `CASE`. `report()` still dies at the same query with the same message, and that is the acceptance criterion for the move rather than a defect in it. **File 16 gained a `__main__` guard**, which is a behaviour change: it had none, so loading it ran forty queries against the production database as a side effect. `apply_display_options()` holds the six `pd.set_option` calls File 16 inherited invisibly from `01- Imports.py`; without them every wide frame prints truncated, which is a different report about the same data.
+- **`oncotriage/storage/queries.py`** (thin entry point: `16- Database Query.py`) — the ~40 queries as an ordered registry of `Query` records. `run(conn, key)` returns one frame, `run_all(conn)` returns them all, `report(conn)` prints what File 16 printed. **The SQL was extracted BY AST and never retyped**, so it is byte-for-byte what it was — except the two queries **item 38 has now fixed**; see "The query layer and the cost arithmetic (item 38)" below. **File 16 gained a `__main__` guard**, which is a behaviour change: it had none, so loading it ran forty queries against the production database as a side effect. `apply_display_options()` holds the six `pd.set_option` calls File 16 inherited invisibly from `01- Imports.py`; without them every wide frame prints truncated, which is a different report about the same data.
 - **`oncotriage/api/server.py`** (thin entry point: `17- FastAPI Server.py`) — `create_app()` is the factory and `app = create_app()` the single call. **The app object at module level is the one deliberate exception to "importing a package module does nothing"**, and it is forced: ASGI takes a `module:attribute` reference. Building it opens no client, loads no model, touches no database and reads no file — the graph is compiled in the `lifespan` handler, on startup, where File 17 always had it. `/pipeline/info` reaches Qdrant through `agent.deps.get_qdrant_client()`, inside the handler, not at import.
 - **`oncotriage/monitoring/drift.py`** (shim: `20- Drift Detection.py`) — **File 20 contained ZERO import statements.** Not few; zero. It resolved only inside a namespace somebody else had filled, so `python "20- Drift Detection.py"` — the command in its own `__main__` docstring, and in `21- Streamlit Dashboard.py` line 3609 — died on `PSI_BINS` at the first `def`. Both instructions are true for the first time. `SCIPY_AVAILABLE` is a real `except ImportError` around a real import now, not a `NameError` guard on somebody else's namespace, and `ks_2samp` is bound to `None` on failure so a caller reaching past the flag gets a `TypeError` at the call site.
 - **`oncotriage/batch/runner.py`** (thin entry point: `25- Batch Runner.py`) — the checkpoint, the two `ThreadPoolExecutor` passes and the summary. Its `_db_lock` is gone (see below); what remains is `_results_lock`, renamed for what it actually guards — File 25 used one lock for the database *and* for `append_result`'s read-modify-write, so every results-file write queued behind every database write.
@@ -564,6 +568,90 @@ seaborn), and with torch / transformers / icd10 still forbidden.
 `oncotriage.dashboard.tabs.reproducibility` is ~1,450 lines because it is **one
 function**; the tab boundary is the finest cut available without restructuring
 it, which is a redesign. Breaking it up is its own item.
+
+### The query layer and the cost arithmetic (item 38)
+
+**This item DELIBERATELY BROKE pass 20c-3b's acceptance criterion.** That pass
+required `report()`'s output to be identical before and after the move,
+*including the failure*. It runs to the end now, and File 16 does too — verified
+against the production database on 2026-08-05: exit 0, 2,629 lines, 35 headings.
+
+- **`expansion_token_efficiency` is DELETED, not repaired, and `48-`-style notes
+  where it sat say so.** It selected `expansion_input_tokens` /
+  `expansion_output_tokens`, which are not columns of `inferences` and never
+  were: **Stage 1 is deterministic and issues no LLM call**, so there are no
+  expansion tokens to count. Adding the columns would have meant inventing a
+  measurement; rewriting it would have duplicated `expansion_stage_stats`, which
+  already asks the answerable version (timing, fallback rate, path-not-reported
+  count). Because File 16 was top-level statements, this query raising
+  `no such column` **took the process with it — so no query after it in the
+  registry had ever executed, in any invocation of File 16, ever.**
+- **`pipeline_consistency` had four defects, and only one of them was visible.**
+  The stray `WHEN` between the column list and the `CASE` made it a syntax
+  error, so it had never run once; the identical condition already sits *inside*
+  the `CASE` (the two lines differ only in indentation, checked against the
+  committed text rather than assumed), so removing the stray one changes no
+  logic. Behind it: `!= 100` and `!= 30` were literals for configured values,
+  **`30` matched no constant in the project at any point in tracked history**
+  (`TOP_K_CANDIDATES` has been 40 since `0d3e3eb`), `100` was ambiguous by value
+  (`VECTOR_RETRIEVAL_SIZE` and `RRF_POOL_SIZE` are both 100), and `!=` is the
+  wrong operator for either because both numbers are **caps applied with a
+  slice** — a run producing fewer is ordinary. The bounds are derived from the
+  code that produces the columns (`hybrid_results` is `[:RRF_POOL_SIZE]`,
+  `reranked_trials` is `[:TOP_K_CANDIDATES]`), interpolated from
+  `oncotriage/config.py`, and compared with `>`. **Measured, not argued: the
+  pre-fix logic flags 1,106 of 1,106 production rows and the fixed logic flags
+  0.** Two further fixes: `'Count mismatch'` now uses the three-term identity
+  (`evaluated == eligible + near_misses + not_evaluable_trials`, which is how
+  `agent/terminal.py` partitions `evaluations`) with a weaker `<` branch for
+  pre-migration rows whose `not_evaluable_trials` is NULL — never
+  `COALESCE(..., 0)`, which would assert a count nothing recorded — and a row
+  whose counters are NULL is **flagged** rather than falling through
+  three-valued logic to `ELSE 'OK'`.
+- **THERE IS NOW EXACTLY ONE PER-MODEL COST CALCULATION:
+  `queries.price_model_groups`.** `cost_by_model()` feeds it the SQL `GROUP BY`;
+  `oncotriage/dashboard/tabs/cost_tokens.py` feeds it a pandas groupby over the
+  **sidebar-filtered** frame through `queries.model_groups_from_frame()` — the
+  tab cannot call `cost_by_model(conn)`, because that would silently re-price
+  the whole table and ignore every filter the user set. The two copies had
+  already diverged in the way that mattered: the dashboard used `pd.isna` and
+  the query layer used `is None` and `int(x or 0)`.
+- **`nan` is TRUTHY, which is the whole bug.** `int(x or 0)` on a NULL `SUM`
+  raises `ValueError`, and `x is None` never fires because a NULL in a float64
+  column is `nan`. **Both fire on the real database**: 1,100 gpt-4o rows report
+  NULL `gpt4o_reasoning_tokens` and 6 gpt-5.6-terra rows report 0, so the column
+  is float64 and the pre-fix function raises on production — it had simply never
+  been reached. All four null tests are `pd.isna` now, and a NULL aggregate is
+  carried as nullable `Int64` `<NA>` with the reason in a `note` column, never
+  as 0.
+- **`model_groups_from_frame` passes `min_count=1`, and that is not a detail.**
+  pandas' `.sum()` returns 0.0 where SQL's `SUM()` returns NULL, which is why
+  the dashboard was never exposed to the fault — so the consolidation had to
+  make pandas agree with SQL rather than the reverse, or the two paths would
+  disagree about exactly the case this item is about. `groupby(dropna=False)`
+  also labels the missing group **`nan`, not `None`**, so `is None` would have
+  handed `nan` to `get_model_cost` and taken the whole cost panel down.
+- **The cost tab's stale MODULE DOCSTRING was the actual defect there.** It
+  claimed the tab "prices through `get_model_cost` and labels its chart GPT-4o";
+  both halves were false, checked against the code. One real leftover was found
+  and fixed: the tokens-per-trial legend carried `4× cost`, gpt-4o's ratio,
+  which is now derived from observed spend like the chart beside it.
+- Two custom renderers were swept for the same idioms. `print_slowest_prompt`
+  did `df.iloc[0]` on a possibly-empty frame (so `report()` against an empty
+  database died there) and `f"{...:.1f}"` on a possibly-NULL `total_time`
+  (`TypeError` on object dtype, silent `nan` on float64). Both report the
+  missing fact by name now.
+- **`49- Database Query Layer Test.py`** is the demonstration: 113 assertions,
+  every query in the registry run against a seeded temporary database and every
+  one required to come back NON-EMPTY, `report()` end to end, and the negative
+  controls **unparsed out of git rather than retyped here** — the pre-fix SQL
+  shown still to raise, the pre-fix `cost_by_model` shown to raise `ValueError`
+  on the very frame the fixed one prices, the pre-fix `print_slowest_prompt`
+  shown to raise `IndexError`. The commit is **derived** (newest revision of
+  `queries.py` whose blob still contains `expansion_input_tokens`), not `HEAD`,
+  so the controls survive this work being committed. It is **not** in
+  `run_serial_tests.py`'s collision matrix: it mutates no file in the repository
+  and writes only into a fresh temp directory.
 
 ### Index lifecycle (Qdrant)
 

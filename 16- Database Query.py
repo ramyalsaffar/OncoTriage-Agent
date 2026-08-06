@@ -22,23 +22,31 @@ it. Now:
     python "16- Database Query.py"        runs the sweep, exactly as before
     from oncotriage.storage import queries   runs nothing
 
-WHAT DID NOT CHANGE
--------------------
-NOT ONE CHARACTER OF SQL. The query bodies in the package were extracted from
-this file BY AST -- read as string constants and emitted verbatim, never
-retyped. Item 38 owns this file's two broken queries and has not been done, so
-BOTH ARE STILL BROKEN AND THE RUN STILL DIES AT THE SAME ONE:
+THE RUN COMPLETES NOW (item 38)
+-------------------------------
+It used not to. Pass 3b moved the SQL without altering one character of it, so
+this file's two broken queries survived the move intact and the sweep died part
+way through, exactly as it always had:
 
-    Query 19 (expansion_token_efficiency) selects expansion_input_tokens and
-             expansion_output_tokens, which are not columns of `inferences`. It
-             raises "no such column" and takes the process with it.
-    Query 20 (pipeline_consistency) has a stray WHEN outside its CASE and is a
-             syntax error. It has never run, because Query 19 kills the process
-             first.
+    Query 19 (expansion_token_efficiency) selected expansion_input_tokens and
+             expansion_output_tokens, which are not columns of `inferences` and
+             never were. It raised "no such column" and took the process with
+             it, so NO QUERY AFTER IT HAD EVER RUN, in any invocation of this
+             file, ever.
+    Query 20 (pipeline_consistency) had a stray WHEN between its column list
+             and its CASE, which is a syntax error. It had never run either.
 
-The acceptance criterion for this pass was that the output before and after the
-move is identical UP TO AND INCLUDING that failure, at that query, with that
-message. Fixing either one here would have made that comparison meaningless.
+Item 38 deleted Query 19 rather than repairing it -- Stage 1 is rule-based and
+calls no LLM, so there are no expansion tokens to count and
+`expansion_stage_stats` already asks the answerable version of the question --
+and repaired Query 20, whose two hardcoded pipeline sizes now resolve from
+`oncotriage/config.py`. The arguments for both are in
+`oncotriage/storage/queries.py`, beside the code. Two custom renderers that
+raised on an empty or partly-NULL table were fixed with them.
+
+"49- Database Query Layer Test.py" runs every query in the registry against a
+seeded temporary database and then runs the whole report end to end, which is
+the first time either has been possible.
 
 NO EXEC BOOTSTRAP, and no re-export shim. Nothing in the repository reads this
 file's namespace -- every top-level name it bound was grepped against every .py,

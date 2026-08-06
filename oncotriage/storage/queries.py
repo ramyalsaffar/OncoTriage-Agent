@@ -26,30 +26,55 @@ a key, the SQL, a heading and a render mode. Three things follow:
     report(conn)                        every query, printed exactly as File 16
                                         printed it
 
-NOT ONE CHARACTER OF SQL WAS ALTERED IN THE MOVE, and that is a constraint of
-this pass rather than an aspiration. The SQL bodies below were extracted from
-"16- Database Query.py" BY AST -- read as string constants and emitted verbatim,
-never retyped -- so trailing whitespace, indentation and the two broken queries
-are all byte-for-byte what they were. See THE TWO BROKEN QUERIES below.
+NOT ONE CHARACTER OF SQL WAS ALTERED IN THE MOVE (pass 3b), and every SQL body
+below except the two named in the next section is still byte-for-byte what
+"16- Database Query.py" held: extracted BY AST -- read as string constants and
+emitted verbatim, never retyped -- so trailing whitespace and indentation
+survived intact.
 
-THE TWO BROKEN QUERIES ARE STILL BROKEN, ON PURPOSE
----------------------------------------------------
-Item 38 owns File 16's SQL defects and has not been done. Both survive here
-unchanged, so that a before/after comparison of this pass is a comparison of the
-MOVE and of nothing else:
+ITEM 38 FIXED THE TWO BROKEN QUERIES, AND report()'s OUTPUT CHANGED ON PURPOSE
+------------------------------------------------------------------------------
+Pass 3b's acceptance criterion was that ``report()`` die at the same query with
+the same message, so that a before/after comparison measured the MOVE. THAT
+CRITERION IS DELIBERATELY BROKEN HERE. ``report()`` now runs to the end.
 
-    expansion_token_efficiency  (File 16's Query 19) selects
-        expansion_input_tokens / expansion_output_tokens, which are not columns
-        of `inferences`. It raises "no such column" and takes the run with it,
-        so nothing after it has ever executed.
+    expansion_token_efficiency  (File 16's Query 19) IS DELETED, not repaired.
+        It selected expansion_input_tokens / expansion_output_tokens, which are
+        not columns of `inferences` and never were: Stage 1 is rule-based and
+        issues no LLM call, so there are no expansion tokens to count. Adding
+        the columns would have meant inventing a measurement. Rewriting it
+        would have meant duplicating `expansion_stage_stats`, which already asks
+        the answerable version of the same question. See the comment where it
+        used to sit, immediately after `expansion_stage_stats` below.
 
-    pipeline_consistency        (File 16's Query 20) has a stray WHEN outside
-        its CASE and is a syntax error. It has never run, because Query 19 kills
-        the process first.
+    pipeline_consistency        (File 16's Query 20) had a stray WHEN between
+        the column list and the CASE, which made it a syntax error, so it had
+        never executed once. The identical condition already appears INSIDE the
+        CASE -- the two lines differ only in indentation, checked rather than
+        assumed -- so deleting the stray one removes a syntax error and changes
+        no logic. Three further defects in the same query, all of which had been
+        invisible because it could not run, are fixed alongside it; see
+        ``_PIPELINE_CONSISTENCY_SQL``.
 
-``report()`` therefore still dies at the same query with the same message. That
-is the acceptance criterion for this pass, not a defect in it: the output before
-and after the move is identical up to and including the failure.
+ONE PER-MODEL COST CALCULATION IN THE PROJECT
+---------------------------------------------
+``price_model_groups()`` is it. ``cost_by_model()`` feeds it the SQL GROUP BY;
+``oncotriage/dashboard/tabs/cost_tokens.py`` feeds it a pandas groupby over the
+sidebar-filtered frame, through ``model_groups_from_frame()``. The dashboard
+used to carry its own copy of the arithmetic -- the duplication File 16's own
+docstring predicted would go out of sync, and which had already diverged in the
+one way that mattered: the dashboard used ``pd.isna()`` and this module used
+``is None`` and ``or 0``.
+
+    NULL SEMANTICS DIFFER BETWEEN THE TWO SOURCES AND THE SHARED CODE HANDLES
+    BOTH. SQL ``SUM()`` over an all-NULL group returns NULL; pandas ``.sum()``
+    returns 0.0 for the same group. One such group beside a group carrying
+    numbers is what makes a pandas column float64, so a SQL NULL arrives as
+    ``NaN`` rather than ``None`` -- and ``groupby(dropna=False)`` labels the
+    missing group ``nan``, not ``None``. Every null test in the shared code is
+    ``pd.isna()``. ``model_groups_from_frame`` passes ``min_count=1`` so that
+    pandas reports an all-NULL group as NULL too, rather than importing "no
+    value was ever recorded" into "the recorded value is zero".
 
 WHAT IMPORTING THIS MODULE DOES
 -------------------------------
@@ -64,7 +89,7 @@ from typing import Dict, List
 import pandas as pd
 
 from oncotriage import paths
-from oncotriage.config import PRICING_CONFIG
+from oncotriage.config import PRICING_CONFIG, RRF_POOL_SIZE, TOP_K_CANDIDATES
 from oncotriage.utils import get_model_cost
 
 
@@ -81,9 +106,12 @@ class Query:
     Attributes:
         key:         Stable identifier. This is what ``run(conn, key)`` takes and
                      what a future consumer (File 21) names.
-        sql:         The SQL, VERBATIM from File 16. Never edit it here without
-                     editing it there in the same commit -- item 38 owns the two
-                     that are broken.
+        sql:         The SQL. Verbatim from File 16 for every query except
+                     ``pipeline_consistency``, which item 38 repaired and which
+                     builds its two bounds from oncotriage/config.py -- see
+                     ``_PIPELINE_CONSISTENCY_SQL``. File 16 is a thin entry
+                     point and holds no SQL of its own, so there is nothing to
+                     keep in step with an edit here.
         heading:     The banner File 16 printed above the result, or None where
                      it printed none.
         render:      How ``report()`` prints the frame:
@@ -124,10 +152,161 @@ class Query:
 CONSISTENCY_CLEAN_MESSAGE = "No issues found - pipeline is consistent"
 
 
+# The label the priced cost frame carries where `matching_model` is NULL. A
+# named constant because THREE places have to agree on it: this module's
+# arithmetic, the dashboard tab that renders the same frame, and the test that
+# asserts a NULL-model group is reported rather than dropped. A literal in three
+# files is the shape that goes out of sync.
+NO_MODEL_LABEL = "(none)"
+
+
 # Queries whose output is not a rendering of their own frame. report() dispatches
 # these to the functions below; run() still returns their raw frame, because
 # "give me the rows" is a separate question from "print what File 16 printed".
 _CUSTOM_RENDERERS = {}
+
+
+#------------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# THE CONSISTENCY QUERY'S BOUNDS COME FROM oncotriage/config.py (item 38)
+# ---------------------------------------------------------------------------
+#
+# File 16's Query 20 tested `candidates_retrieved != 100` and
+# `candidates_reranked != 30`. Four things were wrong with those two lines and
+# only the first was visible from the file:
+#
+# 1. THE NUMBERS WERE LITERALS FOR CONFIGURED VALUES. Retune the retrieval
+#    pool and every row in the table becomes an anomaly, in a query whose only
+#    job is to tell anomalies from normal runs.
+#
+# 2. `!= 30` MATCHED NO CONSTANT IN THE PROJECT, then or at any point in tracked
+#    history. The column it bounds is `candidates_reranked`, which
+#    oncotriage/agent/terminal.py writes as `len(state["reranked_trials"])`, and
+#    oncotriage/agent/retrieval.py builds that list at BOTH of its two exits as
+#    `sorted_by_rrf[:TOP_K_CANDIDATES]`. TOP_K_CANDIDATES has been 40 since the
+#    initial commit (`git show 0d3e3eb:"03- Config.py"`). So 30 is a stale
+#    literal from before the repository existed. The binding below is NOT a
+#    guess at which constant the 30 meant -- it is a derivation of which
+#    constant governs the column, read off the two slice expressions that
+#    produce it. The mismatch is reported rather than papered over.
+#
+# 3. `!= 100` IS AMBIGUOUS BY VALUE and unambiguous by derivation. Both
+#    VECTOR_RETRIEVAL_SIZE and RRF_POOL_SIZE are 100. The column is
+#    `candidates_retrieved` = `len(state["hybrid_results"])`, and
+#    `hybrid_results` is built from `ranked_nct_ids`, which is the fused list
+#    sliced `[:RRF_POOL_SIZE]`. RRF_POOL_SIZE it is.
+#
+# 4. `!=` IS THE WRONG OPERATOR FOR EITHER OF THEM, and that survives fixing
+#    the constants. Both numbers are CAPS applied with a slice, so a run that
+#    produces fewer is ordinary -- a rare primary site, a small index, a
+#    single-channel ablation, or payload backfill losing a ranked trial (which
+#    oncotriage/agent/retrieval.py counts as retrieval_trials_lost). Under `!=`
+#    every one of those rows is reported as a "Retrieval anomaly". The invariant
+#    that a slice actually guarantees is `<=`, so the violation is `>`: more
+#    candidates than the cap allows means the cap was not applied, which is a
+#    real defect and the only thing here worth a row in the report.
+#
+# MEASURED AGAINST THE REAL DATABASE RATHER THAN ARGUED. Every row in
+# inferences.db carries candidates_reranked = 40, so `!= 30` was true for all of
+# them; run over the production table on 2026-08-05, the pre-fix logic flags
+# 1,106 of 1,106 rows and the fixed logic flags 0. A consistency report that
+# calls every row an anomaly is indistinguishable from one that calls none, and
+# nobody would ever have found that out, because the stray WHEN meant the query
+# could not parse.
+#
+# Interpolated as integers at import rather than passed as SQL parameters,
+# because `run()` executes `Query.sql` with no parameter channel and giving one
+# query its own would make the registry two shapes. The guard below is what
+# makes the interpolation safe to read as well as safe to execute.
+for _name, _value in (("RRF_POOL_SIZE", RRF_POOL_SIZE),
+                      ("TOP_K_CANDIDATES", TOP_K_CANDIDATES)):
+    if isinstance(_value, bool) or not isinstance(_value, int) or _value <= 0:
+        raise RuntimeError(
+            f"oncotriage.storage.queries: {_name} is {_value!r}; the pipeline "
+            f"consistency query interpolates it into SQL as a positive integer "
+            f"bound. A non-integer would either fail to parse or, worse, parse "
+            f"into a comparison that silently never fires."
+        )
+del _name, _value
+
+
+_PIPELINE_CONSISTENCY_SQL = f"""
+    SELECT * FROM (
+    SELECT
+        patient_id,
+        candidates_retrieved,
+        candidates_reranked,
+        candidates_filtered,
+        candidates_evaluated,
+        eligible_matches,
+        near_misses,
+        not_evaluable_trials,
+        CASE
+            WHEN candidates_retrieved IS NULL
+              OR candidates_reranked  IS NULL
+              OR candidates_filtered  IS NULL
+              OR candidates_evaluated IS NULL
+              OR eligible_matches     IS NULL
+              OR near_misses          IS NULL       THEN 'Counters not reported'
+            WHEN candidates_retrieved > {RRF_POOL_SIZE}    THEN 'Retrieval anomaly'
+            WHEN candidates_reranked  > {TOP_K_CANDIDATES} THEN 'Rerank anomaly'
+            WHEN not_evaluable_trials IS NOT NULL
+             AND candidates_evaluated != (eligible_matches + near_misses
+                                          + not_evaluable_trials)
+                                                    THEN 'Count mismatch'
+            WHEN not_evaluable_trials IS NULL
+             AND candidates_evaluated <  (eligible_matches + near_misses)
+                                                    THEN 'Count mismatch'
+            WHEN candidates_filtered < candidates_evaluated THEN 'Filter < evaluated'
+            ELSE 'OK'
+        END as issue
+    FROM inferences
+) WHERE issue != 'OK'
+LIMIT 20
+"""
+"""The pipeline consistency query, with its two bounds resolved from config.
+
+WHAT CHANGED BESIDES THE TWO BOUNDS, all of it invisible before because the
+stray WHEN meant this query had never executed once:
+
+  - THE STRAY WHEN IS GONE. It sat between `candidates_evaluated,` and `CASE`
+    and read, character for character after stripping indentation, the same as
+    the third WHEN inside the CASE. Removing it therefore removes a syntax error
+    and nothing else. That equality is checked in "49- Database Query Layer
+    Test.py" against the pre-fix text in git rather than asserted here.
+
+  - 'Count mismatch' NOW COUNTS not_evaluable_trials. `candidates_evaluated` is
+    `len(evaluations)` and oncotriage/agent/terminal.py partitions `evaluations`
+    THREE ways -- matches, near_misses and not_evaluable -- so the identity is
+    evaluated == eligible + near + not_evaluable. Testing it against only the
+    first two flags every ordinary run in which the model declined to assess a
+    single trial. That is not an inconsistency; it is the documented behaviour
+    of `not_evaluable_trials`, which exists precisely so a non-evaluation is not
+    folded into near_misses.
+
+    not_evaluable_trials is an ADDED column (INFERENCE_COLUMN_ADDITIONS), so
+    rows written before it existed hold NULL. `a != (b + c + NULL)` is NULL,
+    which is not true, so those rows would fall through every later WHEN and be
+    reported clean -- the NULL-read-as-fine defect this project treats as its
+    own category. They get the weaker inequality that is still provable without
+    the third term: evaluated can never be LESS than eligible + near_misses.
+    COALESCE(not_evaluable_trials, 0) is what the weak version must not be,
+    because that asserts a count that was never recorded.
+
+  - A ROW WHOSE COUNTERS ARE NULL IS FLAGGED, not passed. Under SQL three-valued
+    logic every comparison against NULL is NULL, so a row missing any of these
+    counters used to reach `ELSE 'OK'` and be reported as consistent. "I cannot
+    check this row" and "this row is fine" are different answers.
+
+  - THE THREE COUNT COLUMNS ARE SELECTED. A row flagged 'Count mismatch' whose
+    output does not show eligible_matches, near_misses or not_evaluable_trials
+    cannot be acted on without a second query.
+
+LIMIT 20 IS LEFT AS FILE 16 WROTE IT. It is a pre-existing cap unrelated to the
+defects above and changing it would change the report's volume on a full
+database for no reason this item owns."""
 
 
 #------------------------------------------------------------------------------
@@ -327,7 +506,8 @@ QUERIES = (
         heading='=== EXPANSION (STAGE 1) STATS ===',
         render='transpose',
         blank_after=True,
-        notes=('Stage 1 is rule-based and calls no LLM, so there are no expansion token columns to report.',),
+        notes=('Stage 1 is rule-based and calls no LLM, so there are no expansion token columns to report.',
+               'Item 38 deleted `expansion_token_efficiency`, which asked for them; this query is the answerable version.'),
         sql="""
     SELECT
         COUNT(*)                    as rows_n,
@@ -520,48 +700,54 @@ QUERIES = (
     ORDER BY trial_count
 """,
     ),
-    # File 16 line 564, `df_expansion_tokens`
-    Query(
-        key='expansion_token_efficiency',
-        heading='=== EXPANSION TOKEN EFFICIENCY ===',
-        render='transpose',
-        blank_after=True,
-        sql="""
-    SELECT 
-        AVG(expansion_input_tokens) as avg_input,
-        AVG(expansion_output_tokens) as avg_output,
-        AVG(expansion_output_tokens / NULLIF(expansion_input_tokens, 0)) as output_input_ratio,
-        COUNT(CASE WHEN expansion_output_tokens > 200 THEN 1 END) as over_limit_count
-    FROM inferences
-    WHERE expansion_input_tokens > 0
-""",
-    ),
-    # File 16 line 579, `df_consistency`
+    # ---------------------------------------------------------------------
+    # `expansion_token_efficiency` (File 16 line 564, `df_expansion_tokens`)
+    # WAS HERE AND IS DELETED. DO NOT RE-ADD IT, AND DO NOT ADD THE COLUMNS.
+    # ---------------------------------------------------------------------
+    #
+    # It read:
+    #
+    #     SELECT AVG(expansion_input_tokens)  as avg_input,
+    #            AVG(expansion_output_tokens) as avg_output, ...
+    #     FROM inferences WHERE expansion_input_tokens > 0
+    #
+    # Neither column exists in `inferences` and neither ever did. sqlite3 raises
+    # "no such column: expansion_input_tokens", pandas re-raises it as a
+    # DatabaseError, and because File 16 was 915 lines of top-level statements
+    # that took the whole process with it -- so no query AFTER this one had ever
+    # run, in any invocation of File 16, ever.
+    #
+    # THE FIX IS DELETION, NOT MIGRATION, AND THE REASON IS ABOUT STAGE 1 RATHER
+    # THAN ABOUT SQL. `node_query_expansion` is deterministic and rule-based: it
+    # walks the cancer registry and the MeSH C04 tree and issues NO LLM CALL.
+    # There are no expansion tokens, there is no expansion prompt sent to a
+    # model to be billed, and there never were. Adding the two columns would
+    # mean inventing a measurement of something that does not happen; the
+    # honest value of every row would be NULL, and this project's whole position
+    # on NULL is that it must mean "not reported", not "the thing is absent by
+    # construction".
+    #
+    # Rewriting it to ask something Stage 1 CAN answer was the other option and
+    # it is already done: `expansion_stage_stats` immediately above reports the
+    # stage's timing distribution, how often it fell back to the un-expanded
+    # query, and how often the path was not reported at all. Those are the
+    # answerable questions. A second query asking them again under a name that
+    # promises tokens would be a duplicate whose only distinguishing feature is
+    # a misleading title.
+    #
+    # If a future stage does start calling a model during expansion: add the
+    # columns in INFERENCE_COLUMN_ADDITIONS (oncotriage/storage/
+    # database_logger.py), have the terminal nodes write them, and add a query
+    # under a NEW key. Reviving this one would reintroduce a query that reads
+    # columns nothing writes.
+    # File 16 line 579, `df_consistency`. SQL and its full argument at
+    # _PIPELINE_CONSISTENCY_SQL above.
     Query(
         key='pipeline_consistency',
         heading='=== PIPELINE CONSISTENCY ISSUES ===',
         render='empty_or_to_string',
         blank_after=True,
-        sql="""
-    SELECT * FROM (
-    SELECT 
-        patient_id,
-        candidates_retrieved,
-        candidates_reranked,
-        candidates_filtered,
-        candidates_evaluated,
-        WHEN candidates_evaluated != (eligible_matches + near_misses) THEN 'Count mismatch'
-        CASE 
-            WHEN candidates_retrieved != 100 THEN 'Retrieval anomaly'
-            WHEN candidates_reranked != 30 THEN 'Rerank anomaly'
-            WHEN candidates_evaluated != (eligible_matches + near_misses) THEN 'Count mismatch'
-            WHEN candidates_filtered < candidates_evaluated THEN 'Filter < evaluated'
-            ELSE 'OK'
-        END as issue
-    FROM inferences
-) WHERE issue != 'OK'
-LIMIT 20
-""",
+        sql=_PIPELINE_CONSISTENCY_SQL,
     ),
     # File 16 line 608, `df_med_issue`
     Query(
@@ -966,26 +1152,105 @@ def table_names(conn) -> List:
 # The two sections whose output is not a rendering of their own frame
 # ---------------------------------------------------------------------------
 
+PROMPT_UNAVAILABLE_MESSAGE = "(no rows in `inferences`, so there is no prompt to show)"
+
+
 def print_slowest_prompt(conn, out=print) -> pd.DataFrame:
     """File 16's Query 5: print the slowest patient's Stage 5 prompt in full.
 
     Returns the one-row frame so a caller can have the prompt without the
-    banners.
+    banners; an EMPTY frame when the table is empty.
+
+    TWO FAULTS OF THE SAME FAMILY AS THE COST ARITHMETIC, found by item 38's
+    sweep of the custom renderers and fixed here:
+
+      - ``df.iloc[0]`` on an empty frame raises IndexError, so ``report()``
+        against a database with no inference rows -- a freshly initialized one,
+        or any test database -- died at this query and never reached the other
+        thirty-odd. That is the same failure shape as the two broken SQL
+        queries, arriving by a different route.
+      - ``f"{...['total_time']:.1f}"`` raises TypeError when total_time is NULL
+        and the column is object dtype (which it is when every row is NULL), and
+        silently prints ``nan`` when the column is float64. Neither is a number
+        and only one of them says so.
+
+    Both are reported rather than recovered from silently: the message names
+    which fact is missing.
     """
     df_prompt = run(conn, "slowest_prompt")
     out("=== PROMPT FOR CHATGPT TESTING ===")
-    out(f"Patient: {df_prompt.iloc[0]['patient_id']}")
-    out(f"Output tokens: {df_prompt.iloc[0]['gpt4o_output_tokens']}")
-    out(f"Total time: {df_prompt.iloc[0]['total_time']:.1f}s")
+
+    if df_prompt.empty:
+        out(PROMPT_UNAVAILABLE_MESSAGE)
+        return df_prompt
+
+    _row = df_prompt.iloc[0]
+    _time = _row["total_time"]
+    out(f"Patient: {_row['patient_id']}")
+    out(f"Output tokens: {_row['gpt4o_output_tokens']}")
+    out("Total time: (not recorded)" if pd.isna(_time)
+        else f"Total time: {float(_time):.1f}s")
     out("\nCopy this prompt to ChatGPT:\n")
     out("="*80)
-    out(df_prompt.iloc[0]['gpt4o_prompt'])
+    out(_row['gpt4o_prompt'])
     out("="*80)
     return df_prompt
 
 
-def cost_by_model(conn) -> pd.DataFrame:
-    """File 16's Query 10, the arithmetic half: price each model's rows.
+COST_GROUP_COLUMNS = ("matching_model", "rows_n", "input_tokens",
+                      "output_tokens", "reasoning_tokens", "stored_cost")
+"""The exact frame ``price_model_groups`` consumes.
+
+Named so the two producers -- the ``cost_by_model`` SQL and
+``model_groups_from_frame`` -- and the test that checks they agree all state the
+same contract, and so a producer that quietly stops emitting one column fails
+with the column named instead of raising AttributeError somewhere in the loop."""
+
+PRICED_COST_COLUMNS = ("matching_model", "model_recorded", "rows",
+                       "input_tokens", "output_tokens", "reasoning_tokens",
+                       "input_cost", "output_cost", "recomputed_cost",
+                       "stored_cost", "note")
+"""What ``price_model_groups`` returns, in order. Pinned because the dashboard
+renders it and "49- Database Query Layer Test.py" asserts on it."""
+
+
+def _nullable_int(value):
+    """A SQL count as ``int``, or ``None`` when the aggregate was NULL.
+
+    ``pd.isna`` rather than ``is None`` or ``or 0``, and each of those two is a
+    defect this function exists to have exactly one copy of the fix for:
+
+      ``int(x or 0)``  -- ``float('nan')`` is TRUTHY, so ``nan or 0`` is ``nan``
+                          and ``int(nan)`` raises ValueError. One all-NULL group
+                          beside a group with numbers is enough to make the
+                          column float64 and blow the whole report up.
+      ``x is None``    -- a NULL in a float64 column is ``nan``, not ``None``,
+                          so the test never fires and the NULL is priced,
+                          printed or summed as though it were a number.
+
+    NEITHER IS HYPOTHETICAL AND NEITHER NEEDED A CONTRIVED INPUT. The
+    production inferences.db holds 1,100 gpt-4o rows whose gpt4o_reasoning_tokens
+    is NULL and 6 gpt-5.6-terra rows where it is 0, so ``SUM`` gives NULL for
+    one group and a number for the other, the column is float64, and the pre-fix
+    function raises ``ValueError: cannot convert float NaN to integer`` on the
+    real database. It had simply never been reached, because the query 40 lines
+    above it in the registry killed the process first.
+    """
+    return None if pd.isna(value) else int(value)
+
+
+def price_model_groups(df_groups) -> pd.DataFrame:
+    """Price one aggregate row per ``matching_model``. THE ONLY COPY.
+
+    Args:
+        df_groups: a frame carrying ``COST_GROUP_COLUMNS``. Two producers exist
+            and they differ in where their nulls come from -- see the module
+            docstring -- which is why every null test in here is ``pd.isna``.
+
+    Returns:
+        A frame of ``PRICED_COST_COLUMNS``, one row per model, sorted by row
+        count descending then by label, so both producers yield an identically
+        ordered frame whatever order their own grouping happened to produce.
 
     PRICED PER MODEL, NOT AT ONE RATE. File 16's Query 10 used to have 2.50 and
     10.00 written into the SQL and summed the whole table against them. That was
@@ -1000,55 +1265,167 @@ def cost_by_model(conn) -> pd.DataFrame:
     Rates come from get_model_cost() / PRICING_CONFIG, never from a literal here,
     so there is exactly one pricing table in the project and this raises
     UnknownModelPricingError rather than quietly under-reporting when a model is
-    missing from it.
+    missing from it. It is called even for a group whose token sums are NULL or
+    zero, deliberately: an unpriced model must surface on the run that used it,
+    not on the first run that happened to spend tokens on it.
 
-    Returns a frame with one row per model and a `note` column that is non-empty
-    only where the row set is self-contradictory.
+    A NULL token sum is carried through as ``<NA>`` in a nullable Int64 column
+    and priced as zero spend, with the reason in ``note``. Those are different
+    facts -- "no token count was ever recorded for these rows" versus "these
+    rows consumed nothing" -- and collapsing the first into the second is how a
+    logging hole reads as a cheap run.
     """
-    df_cost_by_model = run(conn, "cost_by_model")
+    _missing = [c for c in COST_GROUP_COLUMNS if c not in df_groups.columns]
+    if _missing:
+        raise ValueError(
+            f"price_model_groups: the group frame is missing {_missing}; it "
+            f"must carry {list(COST_GROUP_COLUMNS)}. Producing a partial "
+            f"breakdown from a partial frame would understate cost silently."
+        )
 
     _cost_rows = []
-    for _row in df_cost_by_model.itertuples(index=False):
-        _in = int(_row.input_tokens or 0)
-        _out = int(_row.output_tokens or 0)
+    for _row in df_groups.itertuples(index=False):
+        _model = _row.matching_model
+        # pd.isna, NOT `is None`. pd.read_sql_query keeps SQL NULL as None in an
+        # object column, so `is None` happened to work for the SQL producer; the
+        # pandas producer's groupby(dropna=False) labels the missing group `nan`,
+        # which `is None` reports as a real model name and get_model_cost then
+        # rejects -- taking the whole cost panel down with an
+        # UnknownModelPricingError naming 'nan'.
+        _model_recorded = not pd.isna(_model)
 
-        # matching_model IS NULL means no Stage 5 response was obtained for those
-        # rows (node_no_candidates, or a failure before the first call returned),
-        # so there is nothing to price and nothing to price it against. Reported
-        # as a group rather than dropped: a NULL group carrying non-zero tokens
-        # would be a logging defect, and silently excluding it is how that stays
-        # invisible.
-        if _row.matching_model is None:
-            _in_cost = _out_cost = 0.0
-            _note = ("no model recorded"
-                     if (_in == 0 and _out == 0)
-                     else "NO MODEL RECORDED BUT TOKENS PRESENT — logging defect")
-        else:
+        _in = _nullable_int(_row.input_tokens)
+        _out = _nullable_int(_row.output_tokens)
+        _reasoning = _nullable_int(_row.reasoning_tokens)
+        _stored = None if pd.isna(_row.stored_cost) else float(_row.stored_cost)
+
+        # The arithmetic operates on 0 where nothing was recorded; the frame
+        # keeps the None so the reader can still tell the two apart.
+        _in_priced = 0 if _in is None else _in
+        _out_priced = 0 if _out is None else _out
+
+        _notes = []
+        if _model_recorded:
             # Split into two calls purely to get the input and output halves
             # separately; get_model_cost returns their sum.
-            _in_cost = get_model_cost(_row.matching_model, _in, 0)
-            _out_cost = get_model_cost(_row.matching_model, 0, _out)
-            _note = ""
+            _in_cost = get_model_cost(_model, _in_priced, 0)
+            _out_cost = get_model_cost(_model, 0, _out_priced)
+        else:
+            # matching_model IS NULL means no Stage 5 response was obtained for
+            # those rows (node_no_candidates, or a failure before the first call
+            # returned), so there is nothing to price and nothing to price it
+            # against. Reported as a group rather than dropped: a NULL group
+            # carrying non-zero tokens would be a logging defect, and silently
+            # excluding it is how that stays invisible.
+            _in_cost = _out_cost = 0.0
+            _notes.append(
+                "no model recorded"
+                if (_in_priced == 0 and _out_priced == 0)
+                else "NO MODEL RECORDED BUT TOKENS PRESENT — logging defect"
+            )
+
+        if _in is None and _out is None:
+            _notes.append("no token counts recorded (SUM was NULL, not 0)")
+        elif _in is None or _out is None:
+            _notes.append(
+                f"{'input' if _in is None else 'output'} token count not "
+                f"recorded (SUM was NULL, not 0)"
+            )
+        if _stored is None:
+            _notes.append("no stored cost recorded")
 
         _cost_rows.append({
-            "matching_model": _row.matching_model or "(none)",
+            "matching_model": _model if _model_recorded else NO_MODEL_LABEL,
+            # Carried explicitly rather than inferred from the label, so a model
+            # genuinely named "(none)" could never be mistaken for the NULL
+            # group by a consumer.
+            "model_recorded": _model_recorded,
             "rows": int(_row.rows_n),
             "input_tokens": _in,
             "output_tokens": _out,
             # NULL-safe: SUM() over a column that is NULL on every GPT-4o-era row
-            # returns NULL for those groups. Printed as "n/a" rather than 0 —
+            # returns NULL for those groups. Carried as <NA> rather than 0 —
             # GPT-4o reported no reasoning breakdown at all, which is not the same
             # as a reasoning model that did no thinking.
-            "reasoning_tokens": ("n/a" if _row.reasoning_tokens is None
-                                 else int(_row.reasoning_tokens)),
+            "reasoning_tokens": _reasoning,
             "input_cost": _in_cost,
             "output_cost": _out_cost,
             "recomputed_cost": _in_cost + _out_cost,
-            "stored_cost": float(_row.stored_cost or 0.0),
-            "note": _note,
+            "stored_cost": _stored,
+            "note": "; ".join(_notes),
         })
 
-    return pd.DataFrame(_cost_rows)
+    df = pd.DataFrame(_cost_rows, columns=list(PRICED_COST_COLUMNS))
+    if df.empty:
+        return df
+
+    # Nullable Int64, so a NULL aggregate survives as <NA> instead of being
+    # coerced to NaN in a float column and printed as a number-shaped nothing.
+    for _column in ("input_tokens", "output_tokens", "reasoning_tokens"):
+        df[_column] = df[_column].astype("Int64")
+
+    return (df.sort_values(["rows", "matching_model"], ascending=[False, True])
+              .reset_index(drop=True))
+
+
+def model_groups_from_frame(df) -> pd.DataFrame:
+    """The ``cost_by_model`` aggregate, computed over an in-memory frame.
+
+    The second producer for ``price_model_groups``. It exists so the dashboard's
+    cost tab -- which must aggregate the SIDEBAR-FILTERED rows it was handed,
+    not the whole table -- reaches the same arithmetic as ``cost_by_model``
+    without carrying a second copy of it.
+
+    ``min_count=1`` IS THE WHOLE POINT OF THIS FUNCTION AND IS NOT A DETAIL.
+    pandas' ``.sum()`` returns 0.0 for a group in which every value is null;
+    SQL's ``SUM()`` returns NULL for the same group. Left at the default, the
+    two producers would disagree about exactly the case this item is about,
+    and the dashboard would report "$0.00 of tokens" where the query layer
+    reports "not recorded". With ``min_count=1`` an all-null group comes back
+    NaN on both sides, and ``price_model_groups`` says so in its note column.
+
+    ``dropna=False`` keeps the NULL-model group, for the reason
+    ``price_model_groups`` gives: those rows carry no Stage 5 tokens and so cost
+    nothing, but if they ever DID carry tokens that is a logging defect and
+    dropping the group is how it would stay invisible.
+    """
+    _needed = ("matching_model", "gpt4o_input_tokens", "gpt4o_output_tokens",
+               "gpt4o_reasoning_tokens", "estimated_cost_usd")
+    _missing = [c for c in _needed if c not in df.columns]
+    if _missing:
+        raise ValueError(
+            f"model_groups_from_frame: the frame is missing {_missing}. It "
+            f"expects the columns of the `inferences` table; a breakdown built "
+            f"from a frame without them would silently omit part of the spend."
+        )
+
+    if df.empty:
+        return pd.DataFrame(columns=list(COST_GROUP_COLUMNS))
+
+    _grouped = df.groupby("matching_model", dropna=False)
+    _sums = _grouped[["gpt4o_input_tokens", "gpt4o_output_tokens",
+                      "gpt4o_reasoning_tokens", "estimated_cost_usd"]].sum(min_count=1)
+
+    # reindex rather than relying on the two groupby results coming back in the
+    # same order. They do; but "rows_n" landing against the wrong model is a
+    # silent mislabelling that no later check in this module could catch.
+    return pd.DataFrame({
+        "matching_model": _sums.index,
+        "rows_n": _grouped.size().reindex(_sums.index).values,
+        "input_tokens": _sums["gpt4o_input_tokens"].values,
+        "output_tokens": _sums["gpt4o_output_tokens"].values,
+        "reasoning_tokens": _sums["gpt4o_reasoning_tokens"].values,
+        "stored_cost": _sums["estimated_cost_usd"].values,
+    })
+
+
+def cost_by_model(conn) -> pd.DataFrame:
+    """File 16's Query 10, the arithmetic half: price each model's rows.
+
+    The SQL producer. Everything about the arithmetic is in
+    ``price_model_groups``; this is the GROUP BY that feeds it.
+    """
+    return price_model_groups(run(conn, "cost_by_model"))
 
 
 def print_cost_by_model(conn, out=print) -> pd.DataFrame:
@@ -1060,15 +1437,27 @@ def print_cost_by_model(conn, out=print) -> pd.DataFrame:
 
     _total_rows = int(df_cost["rows"].sum()) if len(df_cost) else 0
     _recomputed_total = float(df_cost["recomputed_cost"].sum()) if len(df_cost) else 0.0
+    # skipna, which is pandas' default: a group whose estimated_cost_usd was
+    # NULL contributes nothing to the total rather than turning it into NaN. The
+    # count of such groups is reported below instead, because a total quietly
+    # computed over a subset is the thing this item is removing.
     _stored_total = float(df_cost["stored_cost"].sum()) if len(df_cost) else 0.0
+    _stored_missing = int(df_cost["stored_cost"].isna().sum()) if len(df_cost) else 0
     out(f"\nRows: {_total_rows}")
     out(f"Recomputed total: ${_recomputed_total:.4f}")
     out(f"Stored total (estimated_cost_usd): ${_stored_total:.4f}")
+    if _stored_missing:
+        out(f"  ...over {len(df_cost) - _stored_missing} of {len(df_cost)} model "
+            f"groups; {_stored_missing} recorded no stored cost at all and are "
+            f"excluded rather than counted as $0.00")
 
     # The two totals should agree. They diverge when PRICING_CONFIG changed after
     # rows were written — which is legitimate and is exactly why pricing_version is
     # stored per row — so this is reported, not asserted.
-    if _stored_total:
+    #
+    # Guarded on > 0 rather than on truthiness: a NaN total is truthy, and before
+    # the stored_cost NULL fix above this line divided by it and printed nan%.
+    if _stored_total > 0:
         out(f"Divergence: {(_recomputed_total - _stored_total) / _stored_total * 100:+.2f}% "
             f"(non-zero means PRICING_CONFIG changed since some rows were written; "
             f"see the pricing_version column)")
@@ -1164,11 +1553,14 @@ def report(conn, out=print) -> Dict:
     Returns:
         {key: DataFrame} for every query that completed before the run ended.
 
-    IT STILL DIES AT expansion_token_efficiency, and that is the point. Item 38
-    owns File 16's two broken queries and has not been done; this function
-    reproduces the failure at the same query with the same message so that a
-    before/after comparison of this pass measures the MOVE. When item 38 fixes
-    the SQL, this function starts completing and nothing here has to change.
+    IT RUNS TO THE END NOW (item 38). It used to die at
+    ``expansion_token_efficiency``, which selected two columns that do not
+    exist, so nothing after that query in the registry had ever executed in any
+    invocation of File 16 or of this function. That query is deleted, the
+    consistency query behind it is repaired, and the two custom renderers no
+    longer raise on an empty or partly-NULL table. "49- Database Query Layer
+    Test.py" runs every key against a seeded temporary database and then runs
+    this function end to end, which is the first time either has been possible.
     """
     results = {}
 

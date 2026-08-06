@@ -43,9 +43,21 @@ then plants and restores. 44 patches and restores config.py. 47 runs LAST, over
 a tree that every earlier file has put back, so a 47 failure means 47 found
 something rather than that it caught a neighbour mid-edit.
 
-WHAT THIS DOES NOT DO. It does not run the other tests (30-41, 45, 46). Those
-mutate nothing and are safe in parallel or in any order; adding them here would
-make a fast, safe suite wait behind a slow, serial one.
+WHAT THIS DOES NOT DO. It does not run the other tests (30-41, 45, 46, 48, 49).
+Those mutate nothing and are safe in parallel or in any order; adding them here
+would make a fast, safe suite wait behind a slow, serial one.
+
+  48 produces every degraded state by shadowing a cached module attribute or
+     planting a module in sys.modules, each restored in a finally.
+  49 writes only into a fresh temporary directory and reads history through
+     `git show`, which touches no working-tree file. The repository source it
+     reads -- queries.py, cost_tokens.py, agent/retrieval.py, agent/terminal.py
+     -- is not mutated by any of the four below, so nothing it ASSERTS on can be
+     caught mid-edit. It does IMPORT the package, and so shares with Files 30-41
+     the ordinary hazard of importing config.py or cancer_code_registry.py
+     inside 44's or 43's restore window; that is a property of importing at all
+     rather than a collision this matrix is for, and it is why the four that
+     mutate are the four that are serialized.
 
 EVERY EXIT CODE IS REPORTED, and the run does not stop at the first failure --
 each of the four leaves its own tree in the state it found it, so a failure in

@@ -1,12 +1,37 @@
 """
 Cost & Tokens tab. Moved verbatim out of "21- Streamlit Dashboard.py" (pass 20c-3c-1).
 
-THE COSTING DEFECT IN HERE IS NOT THIS PASS'S AND WAS LEFT ALONE. This tab
-prices through ``get_model_cost`` and labels its chart GPT-4o, which is wrong
-now that two judge models appear in the table. That belongs to the costing item
-in the improvement document, alongside File 16's Query 10 and File 14's
-costing. Relabelling it here would have put a behaviour change inside a
-relocation whose whole claim is that no behaviour changed.
+THE COSTING WAS ALREADY CORRECT HERE; THE DOCSTRING THAT SAID OTHERWISE WAS NOT.
+The paragraph this replaces claimed the tab "prices through ``get_model_cost``
+and labels its chart GPT-4o", and item 38 checked it against the code rather
+than believing it. Both halves were stale. The tab already grouped by
+``matching_model`` with ``dropna=False``, priced each group against its OWN
+model, tested for the missing group with ``pd.isna``, let
+``UnknownModelPricingError`` reach the reader instead of defaulting a model to
+zero, named every slice from the data, and derived the output:input price ratio
+from observed spend rather than from gpt-4o's 4x literal. What it still says
+"GPT-4o" about is one legend string in the tokens-per-trial chart, called out
+at its own line below.
+
+WHAT ITEM 38 ACTUALLY CHANGED HERE: THE DUPLICATION. The per-model breakdown
+was computed in this file AND in ``oncotriage/storage/queries.py``, from the
+same columns, by two loops that had already diverged -- this one used
+``pd.isna`` and the query layer used ``is None`` and ``int(x or 0)``, so the
+query layer raised ValueError on exactly the input this tab handled. The
+arithmetic now lives once, in ``queries.price_model_groups``; this file supplies
+the group sums for the SIDEBAR-FILTERED rows it was handed, through
+``queries.model_groups_from_frame``, and renders the result.
+
+THE CONSOLIDATION DOES NOT IMPORT SQL'S NULL SEMANTICS INTO A PLACE THAT WAS
+SAFE, and the direction of that risk is worth stating because it is the reverse
+of the obvious one. This tab was never exposed to the ``int(nan)`` fault, for a
+reason that has nothing to do with care: pandas' ``.sum()`` returns 0.0 where
+SQL's ``SUM()`` returns NULL, so the NaN the query layer chokes on never
+reached this loop. ``model_groups_from_frame`` passes ``min_count=1``, which
+makes pandas agree with SQL and report an all-null group as null -- so this tab
+now CAN see a null token sum, and the shared code is written in ``pd.isna``
+throughout precisely so that it survives one. The gain is that "no token count
+was ever recorded" stops being rendered as "$0.00 of tokens".
 """
 
 import pandas as pd
@@ -14,7 +39,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from oncotriage.utils import UnknownModelPricingError, get_model_cost
+from oncotriage.storage import queries
+from oncotriage.utils import UnknownModelPricingError
 from oncotriage.dashboard.tiers import MATCH_TIERS, MATCH_TIER_COLORS
 
 
@@ -68,41 +94,55 @@ def render_cost_tokens_tab(df):
     # the model that ANSWERED, so a row is priced and labelled by the model
     # that produced it.
     #
-    # dropna=False keeps the NULL-model group. Those are rows where Stage 5
-    # never produced a response (node_no_candidates, or a pre-response
-    # failure); they carry no Stage 5 tokens and so contribute no cost, but
-    # dropping them silently would hide a logging defect if they ever did.
+    # THE ARITHMETIC IS NOT HERE ANY MORE (item 38). It is
+    # queries.price_model_groups, the one copy in the project, shared with
+    # File 16's Query 10. What this file still owns is the SOURCE of the group
+    # sums, and that has to stay local: `df` is the sidebar-filtered selection
+    # with error rows already dropped, so calling queries.cost_by_model(conn)
+    # would silently re-price the WHOLE table and ignore every filter the user
+    # set. model_groups_from_frame produces the same aggregate the SQL does,
+    # over the rows actually on screen.
+    #
+    # dropna=False keeps the NULL-model group, inside model_groups_from_frame.
+    # Those are rows where Stage 5 never produced a response
+    # (node_no_candidates, or a pre-response failure); they carry no Stage 5
+    # tokens and so contribute no cost, but dropping them silently would hide a
+    # logging defect if they ever did.
     try:
-        _by_model = df.groupby('matching_model', dropna=False)[
-            ['gpt4o_input_tokens', 'gpt4o_output_tokens']
-        ].sum()
-
-        cost_components = []      # one row per (model, input|output)
-        gpt4o_input_cost = 0.0
-        gpt4o_output_cost = 0.0
-        unpriceable_tokens = 0
-
-        for _model, _row in _by_model.iterrows():
-            _in = int(_row['gpt4o_input_tokens'] or 0)
-            _out = int(_row['gpt4o_output_tokens'] or 0)
-
-            if pd.isna(_model):
-                # Nothing to price against. Surfaced only if it carries
-                # tokens, because a no-candidates run legitimately has none.
-                unpriceable_tokens += _in + _out
-                continue
-
-            _in_cost = get_model_cost(_model, _in, 0)
-            _out_cost = get_model_cost(_model, 0, _out)
-            gpt4o_input_cost += _in_cost
-            gpt4o_output_cost += _out_cost
-            cost_components.append((f"{_model} Output", _out_cost))
-            cost_components.append((f"{_model} Input", _in_cost))
+        _priced = queries.price_model_groups(queries.model_groups_from_frame(df))
     except UnknownModelPricingError as e:
         st.error(
             f"Cost breakdown unavailable: {e}"
         )
         return
+
+    cost_components = []      # one row per (model, input|output)
+    gpt4o_input_cost = 0.0
+    gpt4o_output_cost = 0.0
+    unpriceable_tokens = 0
+    unrecorded_token_models = []
+
+    for _row in _priced.itertuples(index=False):
+        # pd.isna, because a NULL token SUM now reaches here as pandas' <NA>
+        # rather than as 0. min_count=1 in model_groups_from_frame is what makes
+        # that possible, and it is deliberate: 0.0 said "these rows cost
+        # nothing", which is not what "no token count was ever recorded" means.
+        _in = 0 if pd.isna(_row.input_tokens) else int(_row.input_tokens)
+        _out = 0 if pd.isna(_row.output_tokens) else int(_row.output_tokens)
+
+        if pd.isna(_row.input_tokens) and pd.isna(_row.output_tokens):
+            unrecorded_token_models.append(_row.matching_model)
+
+        if not _row.model_recorded:
+            # Nothing to price against. Surfaced only if it carries
+            # tokens, because a no-candidates run legitimately has none.
+            unpriceable_tokens += _in + _out
+            continue
+
+        gpt4o_input_cost += _row.input_cost
+        gpt4o_output_cost += _row.output_cost
+        cost_components.append((f"{_row.matching_model} Output", _row.output_cost))
+        cost_components.append((f"{_row.matching_model} Input", _row.input_cost))
 
     if unpriceable_tokens:
         st.warning(
@@ -110,6 +150,14 @@ def render_cost_tokens_tab(df):
             f"matching_model recorded and are excluded from this breakdown. "
             f"A row with tokens but no model is a logging defect — the model "
             f"that produced them was not carried out of Stage 5."
+        )
+
+    if unrecorded_token_models:
+        st.warning(
+            f"No token count is recorded on ANY row for: "
+            f"{', '.join(unrecorded_token_models)}. Those groups are shown at "
+            f"$0.00 because nothing is known about their spend, which is not "
+            f"the same as their having spent nothing."
         )
 
     if not cost_components:
@@ -136,8 +184,22 @@ def render_cost_tokens_tab(df):
         ]
     })
 
+    # Effective blended output:input price ratio over whatever models this
+    # selection actually contains. Derived ONCE here because two charts want it:
+    # the volume-vs-cost stack below, and the tokens-per-trial stack further
+    # down whose legend carried "4× cost" as a literal. That literal was
+    # gpt-4o's ratio ($10.00 / $2.50) and is wrong for any table holding a
+    # second judge — the one thing in this tab that really did still say GPT-4o.
+    # Guarded on both denominators: a selection with no input tokens has no
+    # ratio to state, and both legends then say so instead of inventing one.
+    total_input_tokens = df['gpt4o_input_tokens'].sum()
+    total_output_tokens = df['gpt4o_output_tokens'].sum()
+    _in_rate = (gpt4o_input_cost / total_input_tokens) if total_input_tokens else 0
+    _out_rate = (gpt4o_output_cost / total_output_tokens) if total_output_tokens else 0
+    _price_ratio = (_out_rate / _in_rate) if (_in_rate > 0 and _out_rate > 0) else None
+
     col1, col2 = st.columns(2)
-    
+
     with col1:
         fig_pie = px.pie(df_cost, values='Cost', names='Component', template='plotly_white', title='Cost Distribution')
         fig_pie.update_traces(textposition='auto', textinfo='percent+label', textfont_size=14)
@@ -147,12 +209,9 @@ def render_cost_tokens_tab(df):
     with col2:
         # Stacked bars: token volume vs cost share — exposes the pricing
         # asymmetry. The multiplier used to be written into the legend as "4×",
-        # which was gpt-4o's ratio ($10.00 / $2.50). It is now derived from the
-        # observed spend so it stays true across a mixed-model table: with two
-        # judges at different ratios there is no single literal that is right.
-        total_input_tokens = df['gpt4o_input_tokens'].sum()
-        total_output_tokens = df['gpt4o_output_tokens'].sum()
-
+        # which was gpt-4o's ratio ($10.00 / $2.50). It is derived from the
+        # observed spend above so it stays true across a mixed-model table: with
+        # two judges at different ratios there is no single literal that is right.
         total_tokens = total_input_tokens + total_output_tokens
         input_tok_pct = total_input_tokens / total_tokens * 100 if total_tokens > 0 else 0
         output_tok_pct = total_output_tokens / total_tokens * 100 if total_tokens > 0 else 0
@@ -160,13 +219,8 @@ def render_cost_tokens_tab(df):
         input_cost_pct = gpt4o_input_cost / recalc_total * 100 if recalc_total > 0 else 0
         output_cost_pct = gpt4o_output_cost / recalc_total * 100 if recalc_total > 0 else 0
 
-        # Effective blended output:input price ratio over whatever models this
-        # table actually contains. Guarded on both denominators: a table with
-        # no input tokens has no ratio to state, and the legend then says so.
-        _in_rate = (gpt4o_input_cost / total_input_tokens) if total_input_tokens else 0
-        _out_rate = (gpt4o_output_cost / total_output_tokens) if total_output_tokens else 0
-        _ratio_label = (f"Output ({_out_rate / _in_rate:.1f}x price/tok)"
-                        if _in_rate > 0 and _out_rate > 0 else "Output")
+        _ratio_label = ("Output" if _price_ratio is None
+                        else f"Output ({_price_ratio:.1f}x price/tok)")
 
         fig_asym = go.Figure()
 
@@ -264,7 +318,9 @@ def render_cost_tokens_tab(df):
         fig_tpt.add_trace(go.Bar(
             x=tpt_stats.index,
             y=tpt_stats['avg_output'],
-            name='Output Tokens (4× cost)',
+            # Was the literal '4× cost'. See _price_ratio above.
+            name=('Output Tokens' if _price_ratio is None
+                  else f'Output Tokens ({_price_ratio:.1f}× cost)'),
             marker_color='#ff7f0e',
             text=[f"{v:,.0f}" for v in tpt_stats['avg_output']],
             textposition='inside',
