@@ -292,7 +292,7 @@ means a missing pip package deletes the dataset, and it gets it wrong in BOTH
 directions (ICD-10-coded cancers deleted as non-cancer; in-situ and
 metastatic-only records admitted by the display-term fallback). A registry that
 cannot report whether it is intact is refused too. That refusal is demonstrated
-with the variable SET, in `48- Degraded Dependency Test.py` section 5.
+with the variable SET, in `tests/test_degraded_dependencies.py` section 5.
 
 **`filter_cancer_patients_inplace(dry_run=True)`** reports exactly what it would
 delete, writes the full list to `{manifest}.dryrun`, and deletes nothing. One
@@ -320,7 +320,7 @@ produced this file can only see `except` clauses:
   `degraded_layers` at all. "Cannot tell" is not "is fine", and only one of the
   two may proceed to delete.
 
-**Covered by** `48- Degraded Dependency Test.py` — 170 assertions, no network,
+**Covered by** `tests/test_degraded_dependencies.py` — 170 assertions, no network,
 no key, no corpus written to. Every raise is demonstrated to fire with the file
 or package absent **and** demonstrated not to fire with it present; the dry run
 is demonstrated against a copy of a real cohort with a real run on an identical

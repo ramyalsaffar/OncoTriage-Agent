@@ -1,8 +1,35 @@
-# Package Split Test
+# Package Invariants
 ####################
 
 """
-Proves the item 20c package split.
+Proves the `oncotriage` package's structural invariants.
+
+RENAMED IN PASS 20d-2, from "47- Package Split Test.py". It was named for the
+pass that created it (item 20c, the split), and that pass ends at 20e. What it
+actually holds is a standing contract about the package -- what importing it may
+do, what may import what, which names must exist and which must not, what a
+wheel must ship -- and none of that stops mattering when the split is finished.
+The number-to-name mapping is in tests/FILE NUMBER MAPPING.md.
+
+THE INVARIANTS, which are what the sections below are organised around:
+
+  * importing any package module opens no client, loads no model, touches no
+    database, reads no file, creates no directory, resolves no directory and
+    spawns no process (section 2, under twelve traps);
+  * `oncotriage.config` never imports `oncotriage.utils` -- the cycle item 20c
+    removed -- and no module imports another from inside a function body;
+  * `SparseTextEmbedding("Qdrant/bm25")` has exactly ONE construction site;
+  * no module-level import is shadowed by a function-local, and no name is
+    declared and never read anywhere in the repository;
+  * every subpackage on disk is declared in pyproject.toml, at any depth;
+  * the dependency seam hands one shared object per key under MAX_WORKERS
+    threads, building each exactly once;
+  * the shims still re-export what the exec chain reads out of them.
+
+WHAT WAS CHANGED by the split this originally proved
+----------------------------------------------------
+Files 01, 02, 03, 08, 09 and 10 stopped being the definitions and became
+re-export shims over a real Python package:
 
 WHAT WAS CHANGED
 ----------------
@@ -166,8 +193,8 @@ WHAT THIS FILE CHECKS, and how each check could fail
      client and a DATA_SNAPSHOT_DATE that differs from the package's. All three
      wrappers must use the namespace's values, because '36- Logging Contract
      Test.py', '37- Retrieval Observability Test.py', '38- Birth Date and
-     Demographics Parser Test.py', '45- Fixture Capture.py' and
-     '46- Fixture Replay.py' all depend on exactly that.
+     Demographics Parser Test.py', 'fixture_capture.py' and
+     'fixture_replay.py' all depend on exactly that.
 
 WHY THIS FILE DOES NOT EXEC-CHAIN 01 AND 02
 -------------------------------------------
@@ -183,7 +210,8 @@ credentials. That is deliberate: it is the only test in the suite that can run
 on a fresh checkout before a .env exists.
 
 Run from terminal (or F5 in Spyder):
-    python "47- Package Split Test.py"
+    python tests/test_package_invariants.py
+    (was: python "47- Package Split Test.py")
 
 Exit codes:
     0 -- every check passed
@@ -202,18 +230,40 @@ import tempfile
 from datetime import date
 
 
-# Item 20a: this file sits in the code directory, so __file__ locates it with
-# no hardcoded path. __file__ is bound when the file is run as a script (every
-# documented entry point for it) and when Spyder runfile()s it. In a bare
-# interactive paste it is not bound, and the working directory is the only
-# remaining candidate -- taken, but announced, never silently.
+# THE REPOSITORY ROOT IS THE PARENT OF THIS FILE'S DIRECTORY (pass 20d-2). It
+# used to be this file's own directory, which was right while the file sat in
+# the code directory and is one level off from tests/.
+#
+# IT IS NOT DERIVED FROM `oncotriage.__file__`, and here the reason is stronger
+# than for the other two files that decline that derivation. THIS FILE MUST NOT
+# IMPORT THE PACKAGE AT ALL: section 2 asserts that importing it pulls in no
+# model-bearing library and opens nothing, and it proves that by arming traps in
+# a SUBPROCESS that has imported nothing yet. Importing oncotriage here to find
+# a directory would put the package in this process's sys.modules before a
+# single trap was set -- measuring its own bootstrap, which is the defect the
+# "WHY THIS FILE DOES NOT EXEC-CHAIN 01 AND 02" note below exists to avoid.
+#
+# The guard below is what replaces the import: the package directory must be
+# where this derivation says it is, or nothing after it means anything.
 if "__file__" in globals():
-    _code_dir = os.path.dirname(os.path.abspath(__file__)) + os.sep
+    _code_dir = os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))) + os.sep
 else:
     _code_dir = os.getcwd() + os.sep
     print(f"[Bootstrap] __file__ unbound; using the working directory as the code directory: {_code_dir}")
 
 _PKG_DIR = os.path.join(_code_dir, "oncotriage")
+
+# NOT a check(): every one of the 283 checks below reads either _PKG_DIR or a
+# path under _code_dir, so a wrong root is not one failure, it is all of them,
+# each with a misleading message. It fails here instead, naming the directory.
+if not os.path.isdir(_PKG_DIR):
+    raise AssertionError(
+        f"the oncotriage package is not where this file expects it: {_PKG_DIR}. "
+        f"The repository root was derived as {_code_dir!r} from this file's own "
+        f"location (tests/ -> its parent), so either this file moved or the "
+        f"package did."
+    )
 
 
 #------------------------------------------------------------------------------
@@ -1979,7 +2029,7 @@ print("=" * 78)
 
 # "13- LangGraph Agent.py" loaded MedCPT and FastEmbed at exec() time, lines
 # 414-434, unless ONCOTRIAGE_DEFER_LOCAL_MODELS=1 was set BEFORE the exec. That
-# switch existed for one caller — 46- Fixture Replay.py — and every other file
+# switch existed for one caller — fixture_replay.py — and every other file
 # that chained File 13 paid ~110 MB and tens of seconds just by being read.
 #
 # Pass 20c-2c made the loads lazy, so the switch must no longer matter AT IMPORT.
@@ -2039,7 +2089,7 @@ print("=" * 78)
 # openai_client, qdrant_client, _bm25_query_model, medcpt_score_pairs -- in the
 # shared exec namespace. That worked only because every project file was exec'd
 # into one dict. A module function resolves its globals in its own module, so
-# those rebindings would have reached NOTHING: 46- Fixture Replay.py would have
+# those rebindings would have reached NOTHING: fixture_replay.py would have
 # sent every Stage 5 prompt to the real OpenAI endpoint, been billed for it, and
 # still reported that all twelve fixtures replayed clean. Nothing would raise.
 #
@@ -2522,11 +2572,86 @@ print("=" * 78)
 #         the third shape finds where it lives rather than concluding it is
 #         missing.
 
+# THE READ CORPUS HAD A BLIND DIRECTORY, and pass 20d-2 closed it.
+#
+# This was `_PKG_FILES` plus an os.listdir of the code directory. That was the
+# whole repository right up until pass 20d-1 moved eleven readers into tests/,
+# and pass 20d-2 moved six more plus the serial runner -- so all EIGHTEEN .py
+# files under tests/, which is every test this project has except Files 18 and
+# 19, were invisible to the only scan that can see a name nothing reads.
+#
+# WHY THAT MATTERS MORE THAN IT SOUNDS. The equivalence proof every conversion
+# pass is accepted on compares what is THERE; a constant that is declared and
+# never read is equivalent to itself on both sides of every diff, forever. This
+# scan is the only thing in the repository that can see that shape, and
+# PASSWORD_SOURCE_ARGUMENT, PASSWORD_SOURCE_ENV and deps.RESOLUTION_STATES are
+# three constants it has already caught. Pointing it at a corpus with a hole in
+# it does not make it fail -- it makes it report FEWER findings, which reads
+# exactly like a clean package.
+#
+# Measured rather than predicted: pass 20d-1 predicted this would fail and it
+# did not, because no package constant happened to be read only by a moved test.
+# "No such constant exists today" is not the same as "the scan covers the tree",
+# and the second is what this is.
+#
+# os.walk, not listdir, and for the reason section 1's subpackage scan already
+# records: tests/ is one level deep today and a scan that assumes depth is a
+# scan that stops working the day someone nests a directory in it.
+#
+# SHOWN TO MATTER, 2026-08-06, out of band -- not shipped here, because this
+# pass's acceptance criterion is that this file report the same 283 checks it
+# reported before the move. PLANTED_ONLY_READ_BY_TESTS was appended to
+# oncotriage/constants.py and, in cases A and C, read from a file under tests/.
+# Both files were hashed before and after and both restored byte-identically:
+#
+#   A  read ONLY from tests/, corpus as shipped -> NOT reported. 283 passed,
+#      0 failed, exit 0.  <- the capability this widening buys
+#   C  the same two plants, run against a COPY of this file with `+ _TEST_PY`
+#      stripped (the pre-20d-2 corpus) -> REPORTED. 282 passed, 1 failed,
+#      exit 1.  <- the FALSE POSITIVE the widening removes
+#   B  planted with no reader anywhere at all -> REPORTED. 282 passed,
+#      1 failed, exit 1.  <- the scan still bites
+#
+# A alone would prove nothing: a scan that reported nothing would also pass it.
+# C is what shows the corpus is the variable, and B is what shows the scan is
+# still capable of a finding.
+_TESTS_DIR = os.path.join(_code_dir, "tests")
+
+_TEST_PY = sorted(
+    os.path.join(root, name)
+    for root, _dirs, files in os.walk(_TESTS_DIR)
+    for name in files
+    if name.endswith(".py") and "__pycache__" not in root
+)
+
 _REPO_PY = sorted(
     _PKG_FILES
     + [os.path.join(_code_dir, n) for n in os.listdir(_code_dir)
        if n.endswith(".py")]
+    + _TEST_PY
 )
+
+# NON-DEGENERACY, AS A GUARD RATHER THAN A check(). The whole point of the
+# paragraph above is that a corpus which silently covers less produces fewer
+# findings and looks identical to a clean one, so a shrunken corpus must not be
+# survivable. It raises for the same reason the root guard above raises: the two
+# checks fed by _REPO_PY are not merely wrong when the corpus is wrong, they are
+# vacuously right, and reporting a pass on a corpus that no longer exists is the
+# failure this whole section is about.
+#
+# It is a guard and not a check ALSO so that pass 20d-2 leaves this file's count
+# at exactly the 283 it had before the move. A pass that widens coverage must
+# not be indistinguishable, in the number it prints, from a pass that added an
+# assertion.
+if not (len(_TEST_PY) >= 18
+        and any(f.endswith("test_package_invariants.py") for f in _TEST_PY)
+        and any(f.endswith("test_extraction_histology.py") for f in _TEST_PY)):
+    raise AssertionError(
+        f"the read corpus lost tests/: found {len(_TEST_PY)} file(s) under "
+        f"{_TESTS_DIR}. Since pass 20d-2 that directory holds every test in the "
+        f"project, and the two checks fed by _REPO_PY report FEWER unread names "
+        f"when it is missing -- which looks exactly like a clean package."
+    )
 
 
 def _all_reads(paths, blob_exclude=()):
@@ -2713,7 +2838,8 @@ _UNREAD_CONSTANT_EXEMPTIONS = {
     # TERMINAL_ERROR COMPLETES A CLOSED THREE-MEMBER VOCABULARY, and it was
     # already unread before pass 20c-3d moved it here: `git grep TERMINAL_ERROR
     # HEAD` over the whole repository returns exactly one line, its own
-    # assignment in "45- Fixture Capture.py". This scan covers the PACKAGE, so
+    # assignment in what is now "fixture_capture.py". This scan covers the
+    # PACKAGE, so
     # the move is what surfaced it rather than what created it.
     #
     # It is exempted rather than deleted, and rather than made load-bearing.
@@ -2733,7 +2859,8 @@ _UNREAD_CONSTANT_EXEMPTIONS = {
 
 _reads, _string_blob = _all_reads(
     _REPO_PY, blob_exclude={os.path.abspath(__file__)} if "__file__" in globals()
-    else {os.path.abspath(os.path.join(_code_dir, "47- Package Split Test.py"))})
+    else {os.path.abspath(os.path.join(
+        _code_dir, "tests", "test_package_invariants.py"))})
 _never_read = []
 for _f in _PKG_FILES:
     _rel = os.path.relpath(_f, _code_dir).replace(os.sep, "/")

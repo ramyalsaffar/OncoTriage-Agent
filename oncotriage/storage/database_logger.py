@@ -645,7 +645,7 @@ def _ensure_database(db_path):
 # Both callers -- oncotriage/agent/terminal.py and log_inference below -- now
 # import it from the registries package, and neither imports the other. The
 # function itself is byte-identical to the one pass 2b left here, which
-# 47- Package Split Test.py re-derives with ast.unparse against git HEAD.
+# tests/test_package_invariants.py re-derives with ast.unparse against git HEAD.
 #
 # It is still re-exported by "14- Database Logger.py", because Files 17, 25, 26,
 # 32, 36, 37, 38, 40 and 45 read the name out of the shared exec namespace.

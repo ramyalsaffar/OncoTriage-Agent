@@ -310,7 +310,7 @@ class _LazyAgentDependency:
     WHY EAGER BINDING IS NOT THE ANSWER. The obvious alternative is to drop the
     proxy and bind the real objects. That reintroduces exactly what pass 2c
     removed: ONCOTRIAGE_DEFER_LOCAL_MODELS appears in only two files in this
-    repository -- this one and "46- Fixture Replay.py" -- so Files 31, 32, 35,
+    repository -- this one and "fixture_replay.py" -- so Files 31, 32, 35,
     36, 37, 39 and 40 all chain File 13 with the switch unset and none of them
     scores a pair. Eager binding would load MedCPT (~110 MB) and FastEmbed for
     all seven.
@@ -351,7 +351,7 @@ class _LazyAgentDependency:
     # Not a counter but the failures themselves, because there is exactly one
     # way to reach this list and a bare count would not say which accessor
     # failed. Class-level on purpose: a module-level name here would land in the
-    # shared exec namespace that "47- Package Split Test.py" section 5 pins.
+    # shared exec namespace that "tests/test_package_invariants.py" section 5 pins.
     repr_failures = []
 
     def __init__(self, accessor, label, key):
@@ -448,8 +448,8 @@ _bm25_query_model = _LazyAgentDependency(deps.get_bm25_query_model, "FastEmbed B
 # Before this pass, four names in this namespace were the pipeline's redirection
 # points, and rebinding one was all it took:
 #
-#     45- Fixture Capture.py  lines 805-821   install_recording_hooks
-#     46- Fixture Replay.py   lines 318-327   install_replay_hooks
+#     fixture_capture.py  lines 805-821   install_recording_hooks
+#     fixture_replay.py   lines 318-327   install_replay_hooks
 #     tests/test_agent_ablation_flag_passthrough.py  lines 229-230
 #     tests/test_storage_inference_logging_contract.py            line 439
 #     tests/test_agent_retrieval_observability.py     swap_globals(_MESH_FILTER=...)
@@ -518,7 +518,7 @@ def _assert_no_legacy_rebinding():
         "the caller expected:\n"
         f"{lines}\n"
         "This is refused rather than ignored because the failure it replaces "
-        "was silent and cost money: 46- Fixture Replay.py would have called the "
+        "was silent and cost money: fixture_replay.py would have called the "
         "real OpenAI endpoint for every fixture and still reported them clean."
     )
 

@@ -2,7 +2,8 @@
 ###############################################
 
 """
-Negative control for '42- Cancer Code Registry Audit Test.py'.
+Negative control for 'tests/test_registries_cancer_code_claims_audit.py'
+(was File 43, controlling File 42; see tests/FILE NUMBER MAPPING.md).
 
 A test that passes proves nothing on its own. File 42 asserts that every code
 and category in File 08 matches an external authority, and the only way to know
@@ -54,7 +55,8 @@ an audit that had stopped working. Warm and cold verdicts must be identical;
 they were checked and are.
 
 Run from terminal (or F5 in Spyder):
-    python "43- Cancer Code Registry Audit Negative Control.py"
+    python tests/test_registries_cancer_code_claims_audit_control.py
+    (was: python "43- Cancer Code Registry Audit Negative Control.py")
 
 Exit codes:
     0 -- every planted defect was caught, the module restored byte-for-byte
@@ -65,25 +67,37 @@ Exit codes:
 
 # Run needed file
 #----------------
-# 01 and 02 only. This file does not use File 08's symbols -- it edits File 08
-# as TEXT and runs File 42 in a subprocess -- so chaining 08 here would import
-# the very module under manipulation into this process for no purpose.
-# Item 20a: this file sits in the code directory, so __file__ locates it with
-# no hardcoded path. __file__ is bound when the file is run as a script (every
-# documented entry point for it) and when Spyder runfile()s it. In a bare
-# interactive paste it is not bound, and the working directory is the only
-# remaining candidate -- taken, but announced, never silently.
-import os as _os_boot
-if "__file__" in globals():
-    _code_dir = _os_boot.path.dirname(_os_boot.path.abspath(__file__)) + _os_boot.sep
-else:
-    _code_dir = _os_boot.getcwd() + _os_boot.sep
-    print(f"[Bootstrap] __file__ unbound; using the working directory as the code directory: {_code_dir}")
-del _os_boot
+# THIS FILE IMPORTS NOTHING FROM THE PROJECT, AND THAT IS DELIBERATE. It edits
+# the registry module as TEXT and runs the audit in a subprocess, so importing
+# the module under manipulation into THIS process would serve no purpose and
+# would leave a cached, pre-plant copy of it in sys.modules for the whole run.
+# It used to exec "01- Imports.py" and "02- Utility Functions.py" for their
+# stdlib names alone; those are imported directly now.
+#
+# THE REPOSITORY ROOT IS THE PARENT OF THIS FILE'S DIRECTORY (pass 20d-2). It
+# used to be this file's own directory, which was right while the file sat in
+# the code directory and is one level off from tests/.
+#
+# IT IS NOT DERIVED FROM `oncotriage.__file__`, which is what every other moved
+# test does, and the exception is the whole point of the paragraph above: that
+# derivation requires importing the package, and this file's contract is that it
+# imports none of it. The guard below is what replaces the import -- both files
+# this control operates on are asserted to exist before anything is planted, so
+# a wrong root is a named failure on line one rather than an "anchor not found"
+# on all fourteen cases, which is what it would otherwise look like.
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
 
-for _bootstrap in ("01- Imports.py", "02- Utility Functions.py"):
-    with open(_code_dir + _bootstrap) as _fh:
-        exec(_fh.read(), globals())
+if "__file__" in globals():
+    _code_dir = os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))) + os.sep
+else:
+    _code_dir = os.getcwd() + os.sep
+    print(f"[Bootstrap] __file__ unbound; using the working directory as the code directory: {_code_dir}")
 
 
 #------------------------------------------------------------------------------
@@ -108,7 +122,26 @@ for _bootstrap in ("01- Imports.py", "02- Utility Functions.py"):
 # patched once per case, restored from the backup after each case, and the
 # restore is verified by sha256 both per-case and at the end.
 _FILE_08 = _code_dir + "oncotriage/registries/cancer_code_registry.py"
-_FILE_42 = _code_dir + "42- Cancer Code Registry Audit Test.py"
+_FILE_42 = _code_dir + "tests/test_registries_cancer_code_claims_audit.py"
+
+# BOTH PATHS ARE ASSERTED BEFORE ANYTHING IS PLANTED (pass 20d-2). This file
+# derives the repository root from its own location rather than from an imported
+# module -- see the bootstrap note above for why it may not import the package --
+# so a wrong root has to fail HERE, loudly, naming the file it could not find.
+#
+# Without this, a wrong root produces exactly the failure mode this control is
+# supposed to be immune to: the patch target would not exist, every anchor would
+# be "not found", and all fourteen cases would report as failures that look like
+# the registry was restructured. Fourteen wrong diagnoses instead of one right
+# one. NOT a check(): a missing target means nothing below can run at all.
+for _needed, _what in ((_FILE_08, "the registry module this control patches"),
+                       (_FILE_42, "the audit this control runs as a subprocess")):
+    if not os.path.isfile(_needed):
+        raise AssertionError(
+            f"{_what} is not where this file expects it: {_needed}. The "
+            f"repository root was derived as {_code_dir!r} from this file's own "
+            f"location, so either this file moved or its target did."
+        )
 
 # Where the interpreter would cache a compiled copy of the file above.
 #

@@ -32,7 +32,7 @@ WHAT CHANGED, and nothing else did
 
 Everything else -- every query, every statistic, every figure, every line of
 the report -- is the line slice of File 27 between its constants block and its
-``__main__`` guard, unmodified. ``47- Package Split Test.py`` re-derives that
+``__main__`` guard, unmodified. ``tests/test_package_invariants.py`` re-derives that
 with ``ast.unparse`` against ``git show HEAD:``.
 
 MATPLOTLIB IS IMPORTED AT MODULE SCOPE, and that is the SECOND deliberate

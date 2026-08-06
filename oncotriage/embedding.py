@@ -27,7 +27,7 @@ given — and every one of them is scored against the wrong terms. Nothing raise
 no counter moves, and the only visible symptom is that retrieval quality drops.
 That is precisely the class of failure this project exists to remove.
 
-So there is one construction site, and ``47- Package Split Test.py`` section 2f
+So there is one construction site, and ``tests/test_package_invariants.py`` section 2f
 asserts by ast that the count is exactly one and that it is here. A second call
 to ``SparseTextEmbedding`` anywhere in the package fails that check.
 

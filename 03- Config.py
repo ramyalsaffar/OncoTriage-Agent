@@ -32,7 +32,7 @@
 # that after "03- Config.py" the clients exist, and half-loading it would move
 # the failure to a random later line instead of this one.
 #
-# DATA_SNAPSHOT_DATE MOVED. "44- Snapshot Date Rot Test.py" rewrites the
+# DATA_SNAPSHOT_DATE MOVED. "tests/test_config_snapshot_date_rot.py" rewrites the
 # assignment as TEXT and re-runs Files 38 and 39 as subprocesses at several
 # dates; it now targets oncotriage/config.py, which is where the literal is.
 # Re-exporting it here does not give it back — a name bound by an import cannot

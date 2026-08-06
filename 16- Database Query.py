@@ -44,7 +44,7 @@ and repaired Query 20, whose two hardcoded pipeline sizes now resolve from
 `oncotriage/storage/queries.py`, beside the code. Two custom renderers that
 raised on an empty or partly-NULL table were fixed with them.
 
-"49- Database Query Layer Test.py" runs every query in the registry against a
+"tests/test_storage_query_layer.py" runs every query in the registry against a
 seeded temporary database and then runs the whole report end to end, which is
 the first time either has been possible.
 

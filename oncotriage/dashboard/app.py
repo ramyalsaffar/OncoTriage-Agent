@@ -9,7 +9,7 @@ rather than moving up to the entry point. Streamlit requires it to be the first
 Streamlit call of the run; keeping it as ``main()``'s first statement preserves
 that ordering exactly, and moving it to module scope would make importing this
 module a Streamlit side effect, which is what section 2 of
-"47- Package Split Test.py" exists to forbid.
+"tests/test_package_invariants.py" exists to forbid.
 """
 
 import streamlit as st

@@ -54,7 +54,8 @@ NOTE: File 39 parses the scratch ECOG corpus, so this test inherits that
 dependency. It takes a few minutes.
 
 Run from terminal (or F5 in Spyder):
-    python "44- Snapshot Date Rot Test.py"
+    python tests/test_config_snapshot_date_rot.py
+    (was: python "44- Snapshot Date Rot Test.py")
 
 Exit codes:
     0 -- both suites passed at every date, config restored byte-for-byte
@@ -64,27 +65,38 @@ Exit codes:
 
 # Run needed file
 #----------------
-# 01 and 02 only. This file does not use File 03's values -- it rewrites
-# oncotriage/config.py as TEXT and runs Files 38 and 39 in subprocesses, so each
-# picks up the patched constant from disk. Chaining 03 here would bind
-# DATA_SNAPSHOT_DATE into THIS process, where it has no effect on the
-# subprocesses and would only mislead.
-# Item 20a: this file sits in the code directory, so __file__ locates it with
-# no hardcoded path. __file__ is bound when the file is run as a script (every
-# documented entry point for it) and when Spyder runfile()s it. In a bare
-# interactive paste it is not bound, and the working directory is the only
-# remaining candidate -- taken, but announced, never silently.
-import os as _os_boot
-if "__file__" in globals():
-    _code_dir = _os_boot.path.dirname(_os_boot.path.abspath(__file__)) + _os_boot.sep
-else:
-    _code_dir = _os_boot.getcwd() + _os_boot.sep
-    print(f"[Bootstrap] __file__ unbound; using the working directory as the code directory: {_code_dir}")
-del _os_boot
+# THIS FILE IMPORTS NOTHING FROM THE PROJECT, AND THAT IS DELIBERATE. It rewrites
+# oncotriage/config.py as TEXT and runs the two suites in subprocesses, so each
+# picks up the patched constant from disk. Importing the config module here would
+# bind DATA_SNAPSHOT_DATE into THIS process, where it has no effect on the
+# subprocesses and would only mislead. It used to exec "01- Imports.py" and
+# "02- Utility Functions.py" for their stdlib names alone; those are imported
+# directly now.
+#
+# THE REPOSITORY ROOT IS THE PARENT OF THIS FILE'S DIRECTORY (pass 20d-2). It
+# used to be this file's own directory, which was right while the file sat in
+# the code directory and is one level off from tests/.
+#
+# IT IS NOT DERIVED FROM `oncotriage.__file__` for exactly the reason above --
+# that derivation requires importing the package. The existing check "the config
+# file carries a DATA_SNAPSHOT_DATE assignment this test can rewrite" is what
+# catches a wrong root, and it already fails loudly rather than silently; the
+# guard below turns the same mistake into a message that names the path instead
+# of a regex that found nothing in a file that was never opened.
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
 
-for _bootstrap in ("01- Imports.py", "02- Utility Functions.py"):
-    with open(_code_dir + _bootstrap) as _fh:
-        exec(_fh.read(), globals())
+if "__file__" in globals():
+    _code_dir = os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))) + os.sep
+else:
+    _code_dir = os.getcwd() + os.sep
+    print(f"[Bootstrap] __file__ unbound; using the working directory as the code directory: {_code_dir}")
 
 
 #------------------------------------------------------------------------------
@@ -112,6 +124,20 @@ for _bootstrap in ("01- Imports.py", "02- Utility Functions.py"):
 # disk in a fresh process.
 _CONFIG_FILE = _code_dir + "oncotriage/config.py"
 
+# ASSERTED BEFORE ANYTHING IS COPIED OR PATCHED (pass 20d-2). The repository root
+# is derived from this file's own location rather than from an imported module --
+# see the bootstrap note above for why this file may not import the package -- so
+# a wrong root has to fail here, naming the path. NOT a check(): the copy-aside
+# on the next lines would otherwise raise FileNotFoundError from inside the try
+# block whose finally restores the file, i.e. a restore of something never
+# backed up.
+if not os.path.isfile(_CONFIG_FILE):
+    raise AssertionError(
+        f"the config module this test rewrites is not where it expects it: "
+        f"{_CONFIG_FILE}. The repository root was derived as {_code_dir!r} from "
+        f"this file's own location, so either this file moved or the module did."
+    )
+
 # RETARGETED IN PASS 20d-1. Both suites moved into tests/ and were renamed for
 # what they cover. THIS IS THE ONLY FUNCTIONAL FILENAME REFERENCE TO EITHER OF
 # THEM ANYWHERE IN THE REPOSITORY -- measured with a repository-wide grep for
@@ -126,6 +152,21 @@ _SUITES = [
     "tests/test_fhir_birth_date_and_demographics.py",
     "tests/test_fhir_ecog_surfacing.py",
 ]
+
+# BOTH SUITES ARE ASSERTED TO EXIST BEFORE THE CONFIG IS TOUCHED (pass 20d-2),
+# for the same reason as the config guard above and with a sharper consequence.
+# _run_suite() reads a subprocess's exit code, and `python <missing file>` exits
+# 2 -- so a wrong path does not raise here, it produces a non-zero exit that this
+# file reports as "the suite FAILED at this snapshot date". That is a false
+# positive pointing at date rot when the real fault is a path, and it would fire
+# six times. NOT a check(): nothing below is meaningful without both suites.
+for _suite_rel in _SUITES:
+    if not os.path.isfile(os.path.join(_code_dir, _suite_rel)):
+        raise AssertionError(
+            f"suite not found: {os.path.join(_code_dir, _suite_rel)}. "
+            f"_run_suite() would report its exit code 2 as a snapshot-date "
+            f"failure, so this is checked before any date is set."
+        )
 
 # The dates under test. Each must be at or after the corpus generation date --
 # see "WHAT IT DOES NOT PROVE" above.

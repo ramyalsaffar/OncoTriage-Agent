@@ -163,7 +163,7 @@ slowapi==0.1.9
 # `packaging<26`, which leaves packaging 25.x satisfying Airflow's `>=25` and
 # streamlit's `<26` at once. Later streamlit releases (1.61.1 drops the upper
 # bound entirely) would also resolve, and were not chosen: the dashboard code
-# was written against 1.45.x, and `47- Package Split Test.py` check 6b asserts
+# was written against 1.45.x, and `tests/test_package_invariants.py` check 6b asserts
 # against a PRIVATE streamlit internal (`cache_utils._make_function_key`), which
 # is exactly the kind of thing a sixteen-minor-version jump breaks.
 streamlit==1.46.0

@@ -1,8 +1,8 @@
-# Test file number → name mapping (pass 20d-1)
+# Test file number → name mapping (passes 20d-1 and 20d-2)
 
 Every note, every commit message and both Word documents reference these files
 **by number**. This file is the artefact that makes those references resolvable
-after pass 20d-1 moved the component tests into `tests/` and renamed each of
+after passes 20d-1 and 20d-2 moved the tests into `tests/` and renamed each of
 them for what it covers. It is the mapping, not a memory of it.
 
 ## The eleven files
@@ -29,21 +29,45 @@ the correction is part of this pass's record:
 - **File 34 is not a test.** It is a read-only comparison tool, and pass 20c-3d
   already converted it to `oncotriage/evaluation/cohort_diff.py` with File 34 as
   a thin entry point. It stays where it is.
-- **Files 42, 43 and 44 are tests but are NOT in this pass**, by instruction.
-  They mutate files in the repository and belong to `run_serial_tests.py`'s
-  collision matrix; converting them is a later pass's work.
+- **Files 42, 43 and 44 are tests but were NOT in pass 20d-1**, by instruction.
+  They mutate files in the repository and belong to the collision matrix.
+  **Pass 20d-2 moved them**; see the next table.
 
-## Not in this pass, and why
+## Pass 20d-2 — the group that patches and reads source
+
+| Was | Is | Covers |
+|---|---|---|
+| `42- Cancer Code Registry Audit Test.py` | [tests/test_registries_cancer_code_claims_audit.py](test_registries_cancer_code_claims_audit.py) | audits the inline claim beside every code in `registries/cancer_code_registry.py` against SNOMED/ICD-10/UMLS |
+| `43- Cancer Code Registry Audit Negative Control.py` | [tests/test_registries_cancer_code_claims_audit_control.py](test_registries_cancer_code_claims_audit_control.py) | plants 14 defects into that registry in place and requires the audit above to catch each |
+| `44- Snapshot Date Rot Test.py` | [tests/test_config_snapshot_date_rot.py](test_config_snapshot_date_rot.py) | rewrites `DATA_SNAPSHOT_DATE` in `oncotriage/config.py` and re-runs two suites at each date |
+| `47- Package Split Test.py` | [tests/test_package_invariants.py](test_package_invariants.py) | the package's structural invariants — import purity, no cycles, one BM25 site, no unread names, subpackages declared, the deps seam under threads |
+| `48- Degraded Dependency Test.py` | [tests/test_degraded_dependencies.py](test_degraded_dependencies.py) | item 11a — every silent degradation now raises or counts |
+| `49- Database Query Layer Test.py` | [tests/test_storage_query_layer.py](test_storage_query_layer.py) | item 38 — `storage/queries.py`, the consistency query and the cost arithmetic |
+| `run_serial_tests.py` | [tests/run_serial_tests.py](run_serial_tests.py) | the collision-matrix runner |
+
+**File 47 was renamed for what it checks, not for the pass that made it.** The
+pass ends at 20e; the invariants do not. **The audit/control pairing is kept
+visible**: the two names differ only by a `_control` suffix and sort adjacently.
+
+### Renamed but NOT moved
+
+| Was | Is | Why |
+|---|---|---|
+| `45- Fixture Capture.py` | `fixture_capture.py` (top level) | **Not tests.** A manually-run gate that items 22 and 64 consume. Capture **COSTS MONEY** — twelve real end-to-end runs at Stage 5 prices. Nothing runs them as part of a suite and nothing should; putting them beside the suite would invite exactly that. |
+| `46- Fixture Replay.py` | `fixture_replay.py` (top level) | Same. Replay is free and is the gate itself: exit 0 only if all twelve replay clean. |
+
+Their fixture directory is unaffected either way, **verified rather than
+assumed**: `oncotriage/fixtures/capture.py:fixture_root()` globs
+`paths.main_path` — the PROJECT root, from `ONCOTRIAGE_MAIN_PATH` or the
+fallback — not the code directory.
+
+## Keeping their numbers, and why
 
 | File | Status |
 |---|---|
-| `18- FastAPI Server Test.py` | A test, sitting inside the pipeline numbering. **Needs a live server on `localhost:8000` and COSTS MONEY** — every POST is a live billed Stage 5 call, measured at $0.13–$0.17 per patient. Untouched by any pass so far. Pass 20e. |
+| `18- FastAPI Server Test.py` | **A test that keeps its number.** It needs a live server on `localhost:8000` **and it costs money** — every POST is a live billed Stage 5 call, measured at $0.13–$0.17 per patient. It stays inside the pipeline numbering because that is where a thing you must start a server for and pay to run belongs, not beside a suite anyone can run. Pass 20e. |
 | `19- FastAPI Server Batch Test.py` | Same. Also runs `fhir_files[410:412]`, two patients, while its own summary describes a full-corpus run. Pass 20e. |
-| `42- Cancer Code Registry Audit Test.py` | Excluded by instruction. In `run_serial_tests.py`'s collision matrix. |
-| `43- Cancer Code Registry Audit Negative Control.py` | Excluded by instruction. Plants defects into the registry source in place. |
-| `44- Snapshot Date Rot Test.py` | Excluded from conversion, but **its `_SUITES` list was retargeted** — it runs two of the eleven as subprocesses, and the move would otherwise have broken it. That is the only functional edit made to a 42–49 file in this pass. |
-| `45-`, `46-` | Fixture capture and replay. Converted in pass 20c-3d; entry points, not component tests. |
-| `47-`, `48-`, `49-` | Already package-importing. **File 47 needed one edit**: its `_REPO_PY` read corpus was `_PKG_FILES` plus the top-level `.py` files, so moving eleven readers out of the top level would have made check 2h report package constants only they read as never-read. |
+| `34- Cohort Selector Diff.py` | Not a test. Pass 20c-3d converted it to `oncotriage/evaluation/cohort_diff.py`; File 34 is its thin entry point. |
 
 ## What changed inside each file, and what did not
 
@@ -99,8 +123,10 @@ touched. Item 22 owns the suite and its assertions.
 
 ## Pass counts, before and after
 
-Recorded before the move (from the numbered files at `HEAD`) and required to be
-identical after.
+Recorded before each move (from the numbered files at the commit that held them)
+and required to be identical after.
+
+**Pass 20d-1 — the eleven component tests**
 
 | File | Before | After |
 |---|---|---|
@@ -115,9 +141,24 @@ identical after.
 | 39 → `test_fhir_ecog_surfacing` | 105 | 105 |
 | 40 → `test_storage_ecog_logging` | 104 | 104 |
 | 41 → `test_monitoring_ecog_availability_drift` | 112 | 112 |
-| **total** | **1065** | **1065** |
+| **subtotal** | **1065** | **1065** |
 
-Every one exits 0 with zero failures, before and after.
+**Pass 20d-2 — the six that patch and read source**
+
+| File | Before | After | Also held constant |
+|---|---|---|---|
+| 42 → `test_registries_cancer_code_claims_audit` | 197 | 197 | 40 codes audited (34 primary, 6 secondary) |
+| 43 → `test_registries_cancer_code_claims_audit_control` | 16 | 16 | **14 planted, 14 caught**, restore byte-identical |
+| 44 → `test_config_snapshot_date_rot` | 10 | 10 | **6 subprocess runs**, config restored byte-identically |
+| 47 → `test_package_invariants` | 283 | 283 | — |
+| 48 → `test_degraded_dependencies` | 170 | 170 | — |
+| 49 → `test_storage_query_layer` | 194 | 194 | git selection resolves: `6a029ac`, `835d2d9` |
+| **subtotal** | **870** | **870** | |
+| **TOTAL** | **1935** | **1935** | |
+
+Every one exits 0 with zero failures, before and after. The six counts above
+were carried in the item notes as unverified; all six were measured and all six
+matched.
 
 ## Running them
 
@@ -137,5 +178,13 @@ compatibility.
 
 **`tests/` is not a package.** There is no `__init__.py`, it is not in
 `pyproject.toml`'s `packages` list (which is explicit, never auto-discovered),
-and File 47's subpackage scan walks `oncotriage/` only — so a wheel build is
-unaffected in both directions.
+and the subpackage scan in `test_package_invariants.py` walks `oncotriage/`
+only. **Verified by building a wheel** (pass 20d-2): it contains no `tests/`
+entry and no test module. `tests/` is also in `.dockerignore` now — the
+`test_*.py` pattern that was supposed to cover it never matched, because Docker
+matches with Go's `filepath.Match` where `*` does not cross a `/`.
+
+**Never edit the repository while `tests/run_serial_tests.py` is running.** Two
+of the five restore from a copy taken at their own start, so an edit to
+`oncotriage/registries/cancer_code_registry.py` or `oncotriage/config.py` made
+mid-run is silently reverted. Pass 20d-1 lost an edit exactly that way.

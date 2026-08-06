@@ -458,7 +458,7 @@ _CLINICAL_STATUS_PRIORITY: Dict[str, int] = {
 # category assigned to the wrong set, or a boundary off by one, is a comment
 # nothing checks.
 #
-# '42- Cancer Code Registry Audit Test.py' now checks all nine, so the CATEGORY
+# 'tests/test_registries_cancer_code_claims_audit.py' now checks all nine, so the CATEGORY
 # LINES BELOW ARE PARSED BY THAT TEST and their format is fixed:
 #
 #       #   <CATEGORY> = <official title> -> <SET>
@@ -691,7 +691,7 @@ def _build_icd10_cancer_sets() -> Tuple[Set[str], Set[str], Set[str], Tuple[str,
     # {"C97"} even when the installed release contributed nothing at all. The
     # guard would have passed on an empty release forever, which is exactly the
     # vacuous-assertion failure the project's testing rules name -- and it was
-    # caught by the negative control in "48- Degraded Dependency Test.py"
+    # caught by the negative control in "tests/test_degraded_dependencies.py"
     # (a stand-in icd10 module with `codes = []`), not by reading.
     #
     # The guard asks about the RELEASE. A hand-seeded code says nothing about
@@ -747,7 +747,7 @@ def _build_icd10_cancer_sets() -> Tuple[Set[str], Set[str], Set[str], Tuple[str,
             f"import succeeded."
         )
         how_to_fix = ('pip install --force-reinstall icd10-cm, then run '
-                      'python "42- Cancer Code Registry Audit Test.py"')
+                      'python "tests/test_registries_cancer_code_claims_audit.py"')
 
         allowed, source = settings.resolve_allow_degraded_registries()
         if not allowed:

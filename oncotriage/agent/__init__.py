@@ -31,7 +31,7 @@ rebinding four names -- openai_client, qdrant_client, _bm25_query_model,
 medcpt_score_pairs -- in the shared exec namespace. That worked only because
 every project file was exec'd into one dict. A module function resolves its
 globals in its own module, so those rebindings would have reached nothing, and
-46- Fixture Replay.py would have gone on reporting that every fixture replayed
+fixture_replay.py would have gone on reporting that every fixture replayed
 clean while sending each Stage 5 prompt to the real OpenAI endpoint. Nothing
 would have raised. See deps.py.
 

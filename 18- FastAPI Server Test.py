@@ -11,7 +11,7 @@ pipeline for each -- including Stage 5, which is a live billed call to the
 matching model. Measured against the six rows this file and File 19 left in the
 production database on 2026-08-05: about $0.13 to $0.17 per patient, so roughly
 $0.30 for one full run of this file. Nothing here is stubbed and nothing is
-replayed; "46- Fixture Replay.py" is the file that costs nothing.
+replayed; "fixture_replay.py" is the file that costs nothing.
 
 AND IT WRITES TO WHATEVER DATABASE THE SERVER IS POINTED AT. That is not this
 script's decision to make: "17- FastAPI Server.py" calls log_inference with no

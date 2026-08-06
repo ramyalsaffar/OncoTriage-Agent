@@ -12,7 +12,7 @@ Files 04 to 49 are numbered, space-containing filenames (`25- Batch Runner.py`) 
 
 **ELEVEN OF THEM ARE GONE AS OF PASS 20d-1.** The component tests — Files 30, 31, 32, 33, 35, 36, 37, 38, 39, 40 and 41 — moved into `tests/` under names describing what they cover, and import the package with no exec bootstrap at all. **[`tests/FILE NUMBER MAPPING.md`](tests/FILE%20NUMBER%20MAPPING.md) is the old-to-new mapping** and is the artefact to reach for whenever a note, a commit message or either Word document names one of them by number. See "The component tests (pass 20d-1)" below.
 
-**THE SEQUENCE DOCUMENT'S CLAIM THAT FILES 30 TO 44 ARE ALL TEST FILES IS WRONG, in two directions.** **File 34 is not a test** — it is a read-only cohort-selector comparison, and pass 20c-3d already converted it to `oncotriage/evaluation/cohort_diff.py` with File 34 as its thin entry point; it stays where it is. And Files 42, 43 and 44 *are* tests but are **not** in pass 20d-1: they mutate files in the repository and belong to `run_serial_tests.py`'s collision matrix. The group is **eleven files**, enumerated by name above, not a range.
+**THE SEQUENCE DOCUMENT'S CLAIM THAT FILES 30 TO 44 ARE ALL TEST FILES IS WRONG, in two directions.** **File 34 is not a test** — it is a read-only cohort-selector comparison, and pass 20c-3d already converted it to `oncotriage/evaluation/cohort_diff.py` with File 34 as its thin entry point; it stays where it is. And Files 42, 43 and 44 *are* tests but were **not** in pass 20d-1: they mutate files in the repository and belong to the collision matrix. **Pass 20d-2 moved them, with Files 47, 48, 49 and the runner** — see "The rest of the suite (pass 20d-2)" below. Pass 20d-1's group was **eleven files**, enumerated by name above, not a range.
 
 Files 01, 02 and 03 are different as of item 20c. They are now **re-export shims over a real package**:
 
@@ -98,7 +98,7 @@ names — `openai_client`, `qdrant_client`, `_bm25_query_model`,
 the same for the registries, the MeSH filter and `get_embedding`. That worked
 only because every file was `exec()`'d into one dict. A module function resolves
 its globals in its own module, so once File 13 became a package **every one of
-those rebindings would have reached nothing** — and `46- Fixture Replay.py`
+those rebindings would have reached nothing** — and `fixture_replay.py`
 would have sent all twelve fixtures' Stage 5 prompts to the real OpenAI endpoint,
 been billed, and still printed that they replayed clean. Nothing would have
 raised. All five files now install overrides and **assert by identity** that the
@@ -234,7 +234,7 @@ The real rule, replacing "nothing is importable":
 
 - **New shared code goes in `oncotriage/`, and is `import`ed.** Only put something in a numbered file if it needs the shared exec namespace. `import` of files 04-49 is still impossible; `from oncotriage.config import MAX_WORKERS` is now the normal way to reach a tunable from anything that is not in the chain.
 - **A module-level import name must not be shadowed by a function-local.** In Python a name assigned anywhere in a function is local for the whole of it, so a module that does `from oncotriage import config` and a function that does `config = info.config.params.vectors` turns every earlier `config.X` in that function into `UnboundLocalError`. Pass 3a hit this twice — `index_validator.stage1_index_health` (`config`) and `indexer._flush_embed_buffer` (`embedding`, a `zip()` loop variable) — and neither shows up at import, only at run time. Both were fixed by importing the *names* rather than the module. **File 47 check 2g scans for it** and carries a negative control.
-- **`oncotriage.config` must never import `oncotriage.utils`.** That was the cycle: File 02 read `PRICING_CONFIG` / `COLLECTION_NAME` / `qdrant_client` / `DATA_SNAPSHOT_DATE` out of File 03, while File 03 called `load_env_keys()` out of File 02. Under `exec()` both resolved at runtime; as modules it is an `ImportError`. `load_env_keys` moving out of the pair is what broke it — into `settings` in pass 20c-1, into `paths` in pass 20c-2a — and `47- Package Split Test.py` fails if the edge comes back. Note the reintroduced cycle is **order-dependent**: `import oncotriage.config` against it still succeeds, so the AST check is the guard, not the import test.
+- **`oncotriage.config` must never import `oncotriage.utils`.** That was the cycle: File 02 read `PRICING_CONFIG` / `COLLECTION_NAME` / `qdrant_client` / `DATA_SNAPSHOT_DATE` out of File 03, while File 03 called `load_env_keys()` out of File 02. Under `exec()` both resolved at runtime; as modules it is an `ImportError`. `load_env_keys` moving out of the pair is what broke it — into `settings` in pass 20c-1, into `paths` in pass 20c-2a — and `tests/test_package_invariants.py` fails if the edge comes back. Note the reintroduced cycle is **order-dependent**: `import oncotriage.config` against it still succeeds, so the AST check is the guard, not the import test.
 - **No `oncotriage` module may import another `oncotriage` module from inside a function body.** A deferred import is a dependency that no scan of an import block can see, and it never fails at import in any order, so nothing but a static scan finds it. File 47 scans for it and carries a negative control. **Third-party imports in function bodies are exempt and must stay** — `import icd10` inside `_build_icd10_cancer_sets()` is deliberate: hoisting it would make importing the cancer registry load the whole ICD-10-CM release.
 - **Importing a package module opens no client, loads no model, touches no database, reads no file, creates no directory and resolves no directory.** `get_openai_client()` / `get_qdrant_client()` build once, on first call, and cache; `load_mesh_filter()` reads its four JSON lookups on call, never at import; `_build_icd10_cancer_sets()` imports `icd10` on first registry construction; every path in `oncotriage/paths.py` resolves on first read; MedCPT and FastEmbed load on first use through `oncotriage/agent/deps.py` and `oncotriage/embedding.py`. `03- Config.py` calls the client factories at shim load and binds the eager `openai_client` / `qdrant_client` names the chain expects — same objects, no second client. File 47 proves this by trapping `builtins.open`, `io.open`, `socket.socket`, `socket.create_connection` and `sqlite3.connect` **before** importing all thirty-three modules and firing each trap afterwards to show it was armed.
   Pass 20c-3a's three converted files were the worst offenders in the project: File 11 built the FastEmbed model at module level, File 06 resolved three globs, **created a directory**, built the whole ICD-10-CM registry and mutated matplotlib's global style, and File 05 resolved two globs and built the registry. Each is now behind an accessor — `patients_dir()`, `manifest_path()`, `cancer_registry()`, `csv_dir()`, `json_dir()`, `output_dir()` (which also does the mkdir, so it still happens before any write on every call path), `apply_plot_style()`, `synthea_jar_path()`, `synthea_modules_dir()`, `output_dir_full()`. The shims that need eager values (File 05) call the accessors at load, so the chain sees exactly what it saw before.
@@ -294,9 +294,9 @@ python "27- Ablation Analysis.py"                    # tables + figures from abl
 python "28- Select 30 Samples.py"                    # 10 breast + 10 colon + 10 lung, seed 42
 python "28- Select 30 Samples.py" --output-db <scratch>/sample.db
 python "34- Cohort Selector Diff.py"                 # LEGACY vs CURRENT selector, read only
-python "45- Fixture Capture.py" --scan-only          # cohort scan + selection, captures nothing
-python "45- Fixture Capture.py"                      # COSTS MONEY: 12 real end-to-end runs
-python "46- Fixture Replay.py"                       # free; exit 0 only if all 12 replay clean
+python fixture_capture.py --scan-only               # cohort scan + selection, captures nothing
+python fixture_capture.py                           # COSTS MONEY: 12 real end-to-end runs
+python fixture_replay.py                            # free; exit 0 only if all 12 replay clean
 python "20- Drift Detection.py"                      # KS / PSI / z-score vs 30-day baseline
 
 # Docker (all five services)
@@ -319,44 +319,77 @@ python tests/test_fhir_ecog_surfacing.py                           # 105; needs 
 python tests/test_storage_ecog_logging.py                          # 104
 python tests/test_monitoring_ecog_availability_drift.py            # 112
 
-python "47- Package Split Test.py"                       # no network, no keys, no corpus; ~30s
-python "48- Degraded Dependency Test.py"                 # item 11a; no network, no keys; ~40s
-python "49- Database Query Layer Test.py"                # item 38; temp SQLite only; ~15s
+# The rest of the suite (pass 20d-2). Same shape, same directory.
+python tests/test_registries_cancer_code_claims_audit.py           # 197
+python tests/test_registries_cancer_code_claims_audit_control.py   #  16; 14 planted, 14 caught
+python tests/test_config_snapshot_date_rot.py                      #  10; 6 subprocess runs, ~6 min
+python tests/test_package_invariants.py                            # 283; no network, no keys, no corpus
+python tests/test_degraded_dependencies.py                         # 170; item 11a
+python tests/test_storage_query_layer.py                           # 194; item 38, temp SQLite only
 pip install -e .                                         # makes `oncotriage` importable anywhere
 ```
 
-**Files 48 and 49 are NOT in `run_serial_tests.py`, deliberately.** File 49
-writes only into a fresh temporary directory, reads repository source text
-without modifying a byte, and reads history through `git show`, which touches no
-working-tree file; two copies of it could run at once. File 48 edits no file in
-the repository: every degraded state it produces comes from shadowing a cached
-module attribute (`paths._RESOLVED`, `clean._RESOLVED`) or planting a module in
-`sys.modules`, each restored in a `finally`. It copies real patient bundles into
-a scratch directory and operates only on the copy, and it asserts the production
-corpus file count is unchanged at the end. So it collides with nothing and can
-run beside anything.
+**THE COLLISION MATRIX IS DERIVED FROM THE CODE, NOT DECLARED (pass 20d-2).**
+Every candidate was walked for the calls that can WRITE a repository file
+(`open(..., "w"/"a")`, `os.replace/remove/rename`, `shutil.copy*/move/rmtree`,
+`Path.write_*`) and for those that READ one, with each path expression resolved
+through the file's own module-level assignments. `str.replace` had to be
+separated from `os.replace` — matching on the bare name conflates them, and the
+first version of the derivation reported writes that do not exist.
 
-**Files 42, 43, 44 and 47 cannot run concurrently, and that is now a mechanism
-rather than a warning (pass 20c-3b).**
+**There are exactly TWO writers in the whole suite**, and everything else is
+read-only with respect to the repository:
+
+| Writer | Writes | Restored by |
+|---|---|---|
+| `tests/test_registries_cancer_code_claims_audit_control.py` | `oncotriage/registries/cancer_code_registry.py`, and `rmtree`s its `__pycache__` | `shutil.copy2` from a backup taken at start, sha256-verified per case and at the end |
+| `tests/test_config_snapshot_date_rot.py` | `oncotriage/config.py` | same shape |
+
+Membership follows from the intersection, **in either direction**:
+
+- **audit × audit control** — the audit extracts the inline comment beside every
+  code in `cancer_code_registry.py` as the claim under audit; the control plants
+  defects into that exact text.
+- **package invariants × both** — it `copytree()`s the whole package in five
+  checks, which brings both written files along, and check 4 then rewrites the
+  snapshot date in its own copy.
+- **degraded dependencies × audit control** — **NEW IN PASS 20d-2, and the
+  derivation is what found it.** This file was excluded on the "edits no file"
+  rule, which is true and is only half the rule: a file that writes nothing
+  cannot corrupt anyone, but it can still BE corrupted. It asserts
+  `sorted(_p) == ["C34.10", "C50.911", "C97"]` on the ICD-10 seed and exercises
+  SNOMED `254837009` — and the control plants into **both** of those exact
+  regions (case 4 is `C97 -> C99`, case 12 is `254837009 -> 396275006`).
+- **storage query layer STAYS OUT**, checked rather than carried forward: it
+  reads `queries.py`, `agent/retrieval.py`, `agent/terminal.py`, the cost tab and
+  File 16 — none of them written by either writer — and the only config values
+  it imports are `RRF_POOL_SIZE` and `TOP_K_CANDIDATES`, which the snapshot-date
+  rewrite does not touch. It writes only into a temp directory and reads history
+  through `git show`.
 
 ```bash
-make serial-tests          # runs 42 → 43 → 44 → 47, one at a time, ~8 min
+make serial-tests          # runs the five, one at a time, ~9 min
 make serial-tests-list     # prints the order and why, runs nothing
-python run_serial_tests.py # the same thing without make
+python tests/run_serial_tests.py   # the same thing without make
 ```
 
-`run_serial_tests.py` carries the collision matrix pair by pair. In summary: File
-44 rewrites the `DATA_SNAPSHOT_DATE` literal in `oncotriage/config.py` **in
-place** (hashing before and after, restoring byte-identically) and File 47 check
-4 copies that file; File 43 plants defects into
-`oncotriage/registries/cancer_code_registry.py` **in place** and File 42 reads
-that same source text as the claims under audit; File 47 `copytree()`s the whole
-package three times and a copy taken mid-edit carries the edit. Every collision
-produces a real-looking failure with no defect behind it. The order is
-load-bearing: 42 first against a pristine registry, 47 last over a tree every
-earlier file has restored. It runs all four and reports every exit code rather
-than stopping at the first failure — each restores its own tree, so one failure
-does not invalidate the next.
+The order is load-bearing: the audit first against a pristine registry; the
+control plants and restores; degraded dependencies immediately after that
+restore, where an incomplete restore surfaces as its failure rather than as a
+mystery later; the snapshot-date test; package invariants **last**, over a tree
+every earlier file has put back, so a failure there means it found something
+rather than that it caught a neighbour mid-edit. It runs all five and reports
+every exit code rather than stopping at the first failure.
+
+**NEVER EDIT THE REPOSITORY WHILE `run_serial_tests.py` IS RUNNING, and re-grep
+anything Files 43 and 44 touch after a run.** Both restore from a copy taken at
+their own START, so any edit made to `oncotriage/registries/cancer_code_registry.py`
+or `oncotriage/config.py` while the runner is executing is **silently reverted**
+when they finish — no error, no warning, and the file looks untouched. This is
+not hypothetical: **pass 20d-1 lost an edit to `oncotriage/config.py` exactly
+this way**, applied while File 44 held its backup, and found it only because a
+later re-grep still reported the old string. The two files to re-check after any
+serial run are those two.
 
 File 47's per-module import sweep (check 2c) runs one subprocess per package
 module through a `ThreadPoolExecutor`. Serially it took about nine minutes and
@@ -370,7 +403,7 @@ tool, not a compromise: each unit of work is already its own subprocess, so the
 parent thread spends its life blocked in `subprocess.run()` with the GIL
 released.
 
-**Tests** are not pytest — **including the eleven in `tests/`, whose `test_` prefix is for discovery and for whatever item 22 decides, not a claim of pytest compatibility.** Every check runs at module level and the exit code is set in a `__main__` block, so `pytest tests/` imports each module (running every check, printing every result) and then reports "no tests collected", exit 5. Non-zero, so it cannot read as a false green; still not how to run them. `18-` and `19-` are procedural scripts hitting a *live* server on `localhost:8000`; start `17-` in another terminal first. `19-` slices `fhir_files[410:412]` for a smoke run; widen that slice to go broader.
+**Tests** are not pytest — **including every file in `tests/`, whose `test_` prefix is for discovery and for whatever item 22 decides, not a claim of pytest compatibility.** Every check runs at module level and the exit code is set in a `__main__` block, so `pytest tests/` imports each module (running every check, printing every result) and then reports "no tests collected", exit 5. Non-zero, so it cannot read as a false green; still not how to run them. `18-` and `19-` are procedural scripts hitting a *live* server on `localhost:8000`; start `17-` in another terminal first. `19-` slices `fhir_files[410:412]` for a smoke run; widen that slice to go broader.
 
 **FILES 18 AND 19 ARE TESTS THAT NO CONVERSION PASS HAS REACHED, and pass 20d-1 deliberately did not either.** They sit inside the pipeline numbering rather than with the other tests for a reason: they need a live server in a second terminal and **they cost money** — every POST is a live billed Stage 5 call, measured at $0.13–$0.17 per patient from six real rows in `inferences.db`. Converting them means deciding how a test that spends money is run and how its server is redirected, which is a spending and orchestration decision, not a mechanical move. Pass 20e.
 
@@ -589,7 +622,7 @@ tabs, 118 metrics, 48 subheaders and 18 dataframes, with zero exceptions.
 
 **The sweep had to run at every nesting depth, and the first attempt did not.** A top-level walk reported `api/server.py`'s four endpoints as having no counterpart at all, because `create_app()` nests them — so the four definitions in the package carrying the **most** decorators were the four it could not see. Those same four separate their decorators from the `def` with **blank lines**, which is invisible to ast (`decorator_list` hangs off the node) and fatal to any check written against adjacency. What survives as a standing check is File 47 section **2i**: the exact decorator list of every decorated definition in the package, keyed by *qualified* name — which is also what distinguishes `CancerCodeRegistry._invert_date` from `OncologyLabRegistry._date_sort_key`, two `@staticmethod`s in one module that a bare-name inventory would confuse. The git comparison stays a one-time audit: it needs history, and a check that re-derives its expectation from whatever HEAD happens to be agrees with the code by construction.
 
-Section 6 of `47- Package Split Test.py` is separate from section 2 **on
+Section 6 of `tests/test_package_invariants.py` is separate from section 2 **on
 purpose**. Section 2 asserts no model-bearing library arrives and **streamlit is
 on that list** — it is what says importing the agent does not drag the dashboard
 in. The dashboard's modules import streamlit at module scope because every
@@ -717,7 +750,7 @@ NORMAL full-corpus run, not only on a defective one.
   **The priced value is unchanged** — NaN would propagate into every aggregate
   and produce no number at all.
 
-- **`49- Database Query Layer Test.py`** is the demonstration: 194 assertions,
+- **`tests/test_storage_query_layer.py`** is the demonstration: 194 assertions,
   every query in the registry run against a seeded temporary database and every
   one required to come back NON-EMPTY, `report()` end to end, and the negative
   controls **unparsed out of git rather than retyped here** — the pre-fix SQL
@@ -725,7 +758,7 @@ NORMAL full-corpus run, not only on a defective one.
   on the very frame the fixed one prices, the pre-fix `print_slowest_prompt`
   shown to raise `IndexError`. The commit is **derived**, not `HEAD`, so the
   controls survive this work being committed. It is **not** in
-  `run_serial_tests.py`'s collision matrix: it mutates no file in the repository
+  `tests/run_serial_tests.py`'s collision matrix: it mutates no file in the repository
   and writes only into a fresh temp directory.
 
   **THE FIRST VERSION OF THAT DERIVATION WAS A SUBSTRING SEARCH AND IT BROKE THE
@@ -809,7 +842,7 @@ entry points over `oncotriage/ablation/`, `oncotriage/evaluation/` and
 45 that answer CHANGED DURING THE PASS.
 
 **THE SHIM QUESTION WAS SETTLED BY GREP, NOT BY ASSUMPTION.** The pass began on
-the premise that File 45 would need one, because `46- Fixture Replay.py`
+the premise that File 45 would need one, because `fixture_replay.py` (File 46)
 exec-chains it and reads eighteen names out of the shared namespace. All 101 of
 File 45's top-level names were grepped against every `.py`, `.md`, `.toml` and
 `.yml` in the tree first, and **File 46 is the only consumer of any of them** —
@@ -923,7 +956,7 @@ handed the same twelve fixtures as the converted path: **12/12 byte-identical**,
 same sha256 each. The negative control — one fixture written with `mtime=1`
 instead of `mtime=0` — diverges, so the comparison can fail.
 
-**`46- Fixture Replay.py`'s FIVE REFUSALS RUN IN THE SAME ORDER**, and that order
+**`fixture_replay.py`'s FIVE REFUSALS RUN IN THE SAME ORDER**, and that order
 is unchanged: the dependency seam **negative control first** (the assertion must
 FAIL with no override installed, or it proves nothing), then the positive
 control, then the OpenAI tripwire, then the pinned collection NAME, then its
@@ -1134,6 +1167,100 @@ untouched by instruction:** a constant added tomorrow whose only reader is a tes
 in `tests/` will be reported as dead. The fix is one line — make `_REPO_PY` walk
 `tests/` as well — and it belongs to whichever pass next opens File 47.
 
+### The rest of the suite (pass 20d-2)
+
+The second half of the test move: the six that patch and read source, plus the
+runner, plus the two fixture entry points. **Every measured pass count is
+identical** — 197, 16 (14 planted / 14 caught), 10 (6 subprocess runs), 283, 170,
+194 — and the counts your notes carried were verified rather than trusted.
+
+| Was | Is |
+|---|---|
+| `42- Cancer Code Registry Audit Test.py` | `tests/test_registries_cancer_code_claims_audit.py` |
+| `43- Cancer Code Registry Audit Negative Control.py` | `tests/test_registries_cancer_code_claims_audit_control.py` |
+| `44- Snapshot Date Rot Test.py` | `tests/test_config_snapshot_date_rot.py` |
+| `47- Package Split Test.py` | `tests/test_package_invariants.py` |
+| `48- Degraded Dependency Test.py` | `tests/test_degraded_dependencies.py` |
+| `49- Database Query Layer Test.py` | `tests/test_storage_query_layer.py` |
+| `run_serial_tests.py` | `tests/run_serial_tests.py` |
+| `45- Fixture Capture.py` | `fixture_capture.py` — **renamed, not moved** |
+| `46- Fixture Replay.py` | `fixture_replay.py` — **renamed, not moved** |
+
+**FILE 47 WAS NAMED FOR A PASS AND THE PASS ENDS AT 20e.** It is
+`test_package_invariants.py` now, and its docstring leads with the invariants it
+actually holds — import purity under twelve traps, the config↔utils cycle, one
+BM25 construction site, no shadowed imports, no never-read names, every
+subpackage declared, the deps seam under `MAX_WORKERS` threads, the shims still
+re-exporting. The audit/control pairing stays visible by construction: the two
+names differ only by a `_control` suffix and sort adjacently.
+
+**FILES 45 AND 46 STAYED AT THE TOP LEVEL, renamed without numbers.** They are
+not tests — they are a manually-run gate that items 22 and 64 consume, capture
+COSTS MONEY (twelve real end-to-end runs), and nothing runs them as part of a
+suite. Putting them beside the suite would invite exactly that. **Their fixture
+resolution was verified rather than assumed**: `fixtures/capture.py:fixture_root()`
+globs `paths.main_path` — the PROJECT root — not the code directory, so where
+the entry point sits has no bearing on where fixtures are found.
+
+**THE RUNNER MOVED INTO `tests/`** because every test it names is there, and
+`make serial-tests` is the documented entry so the path is typed once. It
+imports nothing from the project deliberately: it is a process launcher, and
+`python tests/run_serial_tests.py` must still report a missing test file rather
+than dying on an ImportError when the package is what is broken.
+
+**THREE FILES DECLINE THE `oncotriage.__file__` DERIVATION, and each says why.**
+The audit control and the snapshot-date test may not import the package — one
+would cache a pre-plant copy of the very module it patches, the other would bind
+`DATA_SNAPSHOT_DATE` into a process whose whole point is that the subprocesses
+read it from disk. `test_package_invariants.py` may not import it either, and
+its reason is the strongest: section 2 proves that importing the package pulls
+in no model-bearing library, and it proves it by arming traps in a subprocess
+that has imported nothing yet. All three derive the root from `__file__`'s
+parent and **carry a hard guard** — not a `check()` — naming the file they could
+not find, because a wrong root there is not one failure but every failure, each
+with a misleading message.
+
+**File 43's bytecode guard is intact and was re-proved after the move**:
+`_clear_pycache()` plus `PYTHONDONTWRITEBYTECODE=1` on every subprocess, with
+`_PYCACHE_DIR` derived from `_FILE_08` so it follows the target automatically.
+14 planted, 14 caught, `sha256` before == after.
+
+**File 49's git selection was proved to still resolve**, not assumed: `_CODE_DIR`
+now comes from `oncotriage.__file__` because it is also the **git cwd**, and
+`git log -- <pathspec>` resolves the pathspec relative to cwd — run from
+`tests/` it would match nothing, `_newest_revision_where` would return
+`(None, None)`, and every negative control in sections 3, 4b, 5 and 7 would
+report a failure for the wrong reason. Measured: `_PRE_FIX_REV` = `6a029ac`,
+`_ITEM38_REV` = `835d2d9`, both blobs non-empty, no `[git]` errors, 194/0.
+
+**File 47's never-read-name scan had a blind directory and now walks `tests/`.**
+That scan is the only thing in the repository that can see a name which is
+declared and never read — the shape the `ast.unparse` equivalence proof cannot
+see by construction, and the shape that shipped `PASSWORD_SOURCE_ARGUMENT`. Its
+corpus was `_PKG_FILES` plus an `os.listdir` of the code directory, so after
+pass 20d-1 it was blind to eleven readers and after this pass to eighteen. **A
+corpus that silently covers less does not fail — it reports FEWER findings,
+which reads exactly like a clean package.** Demonstrated out of band, with both
+touched files hashed and restored byte-identically:
+
+| case | result |
+|---|---|
+| a package constant read **only** from `tests/`, corpus as shipped | **not** reported — 283 passed, 0 failed |
+| the same plants against a copy with the `tests/` walk stripped | **reported** — 282 passed, 1 failed |
+| a package constant read by nothing anywhere | **reported** — 282 passed, 1 failed |
+
+The middle row is the one that matters: it is the false positive the widening
+removes, and without it the first row would also be satisfied by a scan that had
+stopped working.
+
+**`tests/` is in `.dockerignore` now, and the two patterns that were supposed to
+cover it never did.** Docker matches `.dockerignore` with Go's `filepath.Match`,
+where `*` does not cross a `/`, so `test_*.py` matches only at the context root.
+The tests were `30- Histology Extraction Test.py` before pass 20d-1 (no
+underscore, and a space) and `tests/test_*.py` after it (nested) — **so the whole
+suite has been shipping inside the image the entire time.**
+
+
 ## Persistence and observability
 
 **`oncotriage/storage/database_logger.py`** (shim: `14- Database Logger.py`) opens no database at load time and never did since item 20b, which turned schema creation into a function because nine other files load 14 or are loaded beside it and every one of them was touching `inferences.db` just by being read. `initialize_database(db_path)` creates three tables: `inferences` (per-patient funnel counts, per-stage timings, token counts, cost), `trial_matches` (per-trial verdicts), `drift_metrics`. It is idempotent — every `CREATE` is `IF NOT EXISTS`, every `ALTER` is guarded by a `PRAGMA table_info` check — and `log_inference` ensures the schema once per resolved path before its first write. `16-` is a scratch query script; `15-` wipes all tables and is guarded by `Flag = False` — leave it False.
@@ -1148,7 +1275,7 @@ in `tests/` will be reported as dead. The fix is one line — make `_REPO_PY` wa
 
 **Degradation record.** A run that lost a retrieval channel, fell back to the un-expanded query, or skipped the cancer site filter must be identifiable from its stored row alone. The relevant state keys are written by the stage that owns them, carried to all three terminal nodes by `_pipeline_provenance()` (file 13), and logged to `inferences.retrieval_channels` / `retrieval_degraded` / `retrieval_trials_lost` / `query_expansion_path` / `mesh_filter_applied` / `mesh_filter_skip_reason`. **NULL in these columns means the stage never reported and is not the same as a clean value** — never default them to 0 in a new writer or fold NULL into 0 in a reader. Stage 5's Section 2 is conditional on `mesh_filter_applied`: it only asserts to the model that disease relevance was confirmed when the filter actually ran.
 
-**Age reference date.** Patient age is computed against `DATA_SNAPSHOT_DATE` (`oncotriage/config.py`, re-exported by 03), never `datetime.now()`, and so is the Stage 5 prompt's RULE 4 "Reference date" — a clock-derived age changes the prompt while `compute_patient_hash` (which keys on `birth_date`) cannot see it. `parse_partial_date()` / `get_age_reference_date()` live in `oncotriage/utils.py`; `get_age_reference_date()` resolves the constant through `oncotriage.config` and **raises** rather than falling back to `today()`, and `44- Snapshot Date Rot Test.py` rewrites that literal in `oncotriage/config.py` — not in File 03, which only re-exports it; `birthDate` may legally be `YYYY`, `YYYY-MM`, `YYYY-MM-DD` or a full ISO datetime, and missing components are filled from a mid-range anchor with the shape recorded as `inferences.birth_date_precision` (same NULL semantics as above). Race and ethnicity are read from the US Core extensions **by sub-extension url** (`ombCategory` → `detailed` → `text`), never by array position. `Exception and Fallback Audit.md` inventories every `except` and fallback in the codebase with a verdict and the open items.
+**Age reference date.** Patient age is computed against `DATA_SNAPSHOT_DATE` (`oncotriage/config.py`, re-exported by 03), never `datetime.now()`, and so is the Stage 5 prompt's RULE 4 "Reference date" — a clock-derived age changes the prompt while `compute_patient_hash` (which keys on `birth_date`) cannot see it. `parse_partial_date()` / `get_age_reference_date()` live in `oncotriage/utils.py`; `get_age_reference_date()` resolves the constant through `oncotriage.config` and **raises** rather than falling back to `today()`, and `tests/test_config_snapshot_date_rot.py` rewrites that literal in `oncotriage/config.py` — not in File 03, which only re-exports it; `birthDate` may legally be `YYYY`, `YYYY-MM`, `YYYY-MM-DD` or a full ISO datetime, and missing components are filled from a mid-range anchor with the shape recorded as `inferences.birth_date_precision` (same NULL semantics as above). Race and ethnicity are read from the US Core extensions **by sub-extension url** (`ombCategory` → `detailed` → `text`), never by array position. `Exception and Fallback Audit.md` inventories every `except` and fallback in the codebase with a verdict and the open items.
 
 ## Degraded dependencies (item 11a)
 
@@ -1259,7 +1386,7 @@ because its AST sweep only sees `except` clauses:
 - `require_intact_registry()` refuses a registry that cannot report its own
   state, as above.
 
-`48- Degraded Dependency Test.py` is the demonstration: 170 assertions, every
+`tests/test_degraded_dependencies.py` is the demonstration: 170 assertions, every
 raise shown to fire with the thing absent **and** shown not to fire with it
 present, the dry run shown against a copy of a real cohort with a real run on an
 identical second copy as the control, and the pre-11a histology shape

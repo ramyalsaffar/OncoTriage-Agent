@@ -250,7 +250,7 @@ def build_initial_state(patient_data: Dict, ablation_flags: Dict = None) -> Dict
     """The state every run starts from, in one place.
 
     Extracted from match_patient_to_trials() because it is no longer that
-    function's private business: 45- Fixture Capture.py and 46- Fixture
+    function's private business: fixture_capture.py and 46- Fixture
     Replay.py invoke the graph directly (they need the whole final state, not
     just state["result"]), and a second hand-written copy of this dict would
     drift from the real one exactly when it mattered — a key seeded here but

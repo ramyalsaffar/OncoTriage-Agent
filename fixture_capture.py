@@ -5,6 +5,21 @@
 Records what the pipeline does today, so item 20 can prove what it broke.
 Entry point.
 
+RENAMED, NOT MOVED, IN PASS 20d-2 (was "45- Fixture Capture.py").
+Every other test in this project now lives under tests/; these two do not, and the reason is what they
+are FOR rather than where they came from. They are not tests: they are a
+manually-run gate that items 22 and 64 consume -- capture COSTS MONEY (twelve
+real end-to-end runs at Stage 5 prices) and replay is the free check that the
+pipeline still does what it did. Nothing runs them as part of a suite, nothing
+should, and putting them beside the suite would invite exactly that. They keep
+their numbers only in the mapping file, tests/FILE NUMBER MAPPING.md.
+
+The fixture directory is unaffected either way, and that was verified rather
+than assumed: ``oncotriage/fixtures/capture.py:fixture_root()`` globs
+``paths.main_path`` -- the PROJECT root, from ONCOTRIAGE_MAIN_PATH or the
+fallback -- not the code directory, so where this entry point sits has no
+bearing on where fixtures are found.
+
 The capture harness is ``oncotriage/fixtures/capture.py``; item 20c pass 3d
 moved it there. This file is a ``__main__`` block and the one import it needs.
 
@@ -52,17 +67,17 @@ name, and one that the tripwire still raises.
 
 NO RE-EXPORT SHIM, AND THAT ANSWER CHANGED DURING THE PASS. All 101 top-level
 names were grepped against every .py, .md, .toml and .yml in the tree first. The
-only consumer of any of them is ``46- Fixture Replay.py``, which this same pass
+only consumer of any of them is ``fixture_replay.py`` (was File 46), which that pass
 converts and which now imports them from ``oncotriage.fixtures.capture``. After
 that nothing chains this file and nothing reads a name out of it, so a shim would
 be re-exports with no reader.
 
 USAGE
 -----
-    python "45- Fixture Capture.py"                    # scan, select, capture all
-    python "45- Fixture Capture.py" --scan-only        # cohort scan + case report
-    python "45- Fixture Capture.py" --probe-limit 400  # widen the no-candidates hunt
-    python "45- Fixture Capture.py" --only normal_1 gpt4o_retry_constructed
+    python fixture_capture.py                    # scan, select, capture all
+    python fixture_capture.py --scan-only        # cohort scan + case report
+    python fixture_capture.py --probe-limit 400  # widen the no-candidates hunt
+    python fixture_capture.py --only normal_1 gpt4o_retry_constructed
 """
 
 import os

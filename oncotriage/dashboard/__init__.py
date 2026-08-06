@@ -14,10 +14,10 @@ persists across reruns instead of being rebuilt. The dashboard has exactly two
 such objects, ``MATCH_TIERS`` and ``MATCH_TIER_COLORS`` in
 ``oncotriage.dashboard.tiers``, and the argument that persistence is safe for
 both is recorded there and re-derived by check 6a of
-"47- Package Split Test.py".
+"tests/test_package_invariants.py".
 
 THIS ``__init__`` IMPORTS NOTHING. Importing ``oncotriage.dashboard`` must not
-pull in streamlit, plotly and pandas -- "47- Package Split Test.py" imports
+pull in streamlit, plotly and pandas -- "tests/test_package_invariants.py" imports
 every package module under a socket / sqlite / open trap, and a convenience
 re-export here would put the whole dashboard behind every one of those imports.
 Reach for ``oncotriage.dashboard.app.main`` directly.

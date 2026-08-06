@@ -19,7 +19,7 @@ what they return, and in what a failure is allowed to do.
 THIS IS THE PACKAGE'S FIRST REAL CONCURRENCY TEST. ``MAX_WORKERS`` = 12 threads
 go through ``oncotriage.agent.deps`` on every patient, which until pass 20c-3a
 had only ever run single-threaded. Pass 3a put the whole override-then-cache
-sequence inside the lock for that reason; pass 3b's "47- Package Split Test.py"
+sequence inside the lock for that reason; pass 3b's "tests/test_package_invariants.py"
 drives MAX_WORKERS threads through every accessor and asserts one shared object
 and exactly one build per key.
 

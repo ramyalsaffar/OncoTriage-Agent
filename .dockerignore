@@ -103,6 +103,13 @@ temp/
 
 # Test Files
 # ----------------------------------------------------------------------------
+# THE TWO PATTERNS BELOW NEVER MATCHED THIS PROJECT'S TESTS, in either shape.
+# Docker matches .dockerignore patterns with Go's filepath.Match, where `*` does
+# not cross a `/`, so `test_*.py` matches only at the context root. The tests
+# were `30- Histology Extraction Test.py` before pass 20d-1 (no underscore, and
+# a space) and `tests/test_*.py` after it (nested) -- so the whole suite has
+# been shipping inside the image the entire time. `tests/` is what excludes it.
+tests/
 test_*.py
 *_test.py
 .pytest_cache/

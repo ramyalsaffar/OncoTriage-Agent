@@ -2,7 +2,23 @@
 #################################
 
 """
-Replays every fixture 45- wrote and reports every difference. Entry point.
+Replays every fixture fixture_capture.py wrote and reports every difference.
+Entry point.
+
+RENAMED, NOT MOVED, IN PASS 20d-2 (was "46- Fixture Replay.py").
+Every other test in this project now lives under tests/; these two do not, and the reason is what they
+are FOR rather than where they came from. They are not tests: they are a
+manually-run gate that items 22 and 64 consume -- capture COSTS MONEY (twelve
+real end-to-end runs at Stage 5 prices) and replay is the free check that the
+pipeline still does what it did. Nothing runs them as part of a suite, nothing
+should, and putting them beside the suite would invite exactly that. They keep
+their numbers only in the mapping file, tests/FILE NUMBER MAPPING.md.
+
+The fixture directory is unaffected either way, and that was verified rather
+than assumed: ``oncotriage/fixtures/capture.py:fixture_root()`` globs
+``paths.main_path`` -- the PROJECT root, from ONCOTRIAGE_MAIN_PATH or the
+fallback -- not the code directory, so where this entry point sits has no
+bearing on where fixtures are found.
 
 The replay harness is ``oncotriage/fixtures/replay.py``; item 20c pass 3d moved
 it there. This file is a ``__main__`` block and the one import it needs.
@@ -73,10 +89,10 @@ NO RE-EXPORT SHIM. All 27 top-level names were grepped against every .py, .md,
 
 USAGE
 -----
-    python "46- Fixture Replay.py"                     # replay all, exit 0 if clean
-    python "46- Fixture Replay.py" --only normal_1
-    python "46- Fixture Replay.py" --max-diffs 5       # truncate per-fixture output
-    python "46- Fixture Replay.py" --fixture-dir <dir>
+    python fixture_replay.py                     # replay all, exit 0 if clean
+    python fixture_replay.py --only normal_1
+    python fixture_replay.py --max-diffs 5       # truncate per-fixture output
+    python fixture_replay.py --fixture-dir <dir>
 """
 
 import os

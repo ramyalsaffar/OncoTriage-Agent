@@ -24,7 +24,7 @@ derived at import from a lazy source is not lazy at all.
 
 Each factory builds at most one object and returns the same one thereafter, so
 the eager names the shim binds are the SAME objects the package hands out. That
-matters: ``45- Fixture Capture.py`` and ``46- Fixture Replay.py`` rebind
+matters: ``fixture_capture.py`` and ``fixture_replay.py`` rebind
 ``openai_client`` / ``qdrant_client`` in the shared namespace to recording
 proxies. That seam works because the pipeline resolves the NAME at call time;
 the factories exist for the package's own callers, not to replace it.
@@ -150,7 +150,7 @@ EXPANSION_TEMPERATURE = 0  # Deterministic query expansion (Stage 1 uses no LLM)
 # dated on this day and nothing in the corpus postdates the reference; verified
 # empirically -- 0 patients resolve to 'all_after_reference_date'.
 #
-# THIS ASSIGNMENT IS REWRITTEN AS TEXT BY "44- Snapshot Date Rot Test.py",
+# THIS ASSIGNMENT IS REWRITTEN AS TEXT BY "tests/test_config_snapshot_date_rot.py",
 # which regex-matches `DATA_SNAPSHOT_DATE = "..."`, patches it to several
 # dates, re-runs Files 38 and 39 as subprocesses at each, and restores this
 # file byte-for-byte. Before item 20c it patched "03- Config.py", which is

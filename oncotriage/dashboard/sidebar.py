@@ -8,7 +8,7 @@ The refresh button calls ``st.cache_data.clear()``, which clears BY CACHE, not
 by function -- it empties every ``@st.cache_data`` entry in the process,
 including the three loaders in ``oncotriage.dashboard.data``, which now live in
 a different module than this one. That still works, and check 6b of
-"47- Package Split Test.py" is what says so.
+"tests/test_package_invariants.py" is what says so.
 """
 
 from datetime import datetime

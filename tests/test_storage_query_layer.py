@@ -106,7 +106,8 @@ in a temporary directory that is removed at the end. The production database is
 opened only through a ``mode=ro`` URI, and only to count rows.
 
 Run from terminal (or F5 in Spyder):
-    python "49- Database Query Layer Test.py"
+    python tests/test_storage_query_layer.py
+    (was: python "49- Database Query Layer Test.py")
 
 Exit codes:
     0 -- all assertions passed
@@ -146,15 +147,17 @@ import tempfile
 
 # Make the oncotriage package importable
 #---------------------------------------
-# The same six-line block Files 04, 06, 11, 12 and 48 carry. `pip install -e .`
-# makes it a no-op; without it the code directory goes on sys.path and the fact
-# is printed rather than left silent.
+# The same block Files 04, 06, 11 and 12 carry, with the one difference pass
+# 20d-2 forced: it looks at the PARENT of this file's directory, because this
+# file now sits in tests/ and the package sits BESIDE tests/, not inside it.
+# `pip install -e .` makes it a no-op; without it the code directory goes on
+# sys.path and the fact is printed rather than left silent.
 try:
     import oncotriage  # noqa: F401
 except ImportError:
     for _candidate, _how in (
-        (os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals()
-         else None, "__file__"),
+        (os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+         if "__file__" in globals() else None, "__file__"),
         (os.getcwd(), "cwd"),
     ):
         if _candidate and os.path.isdir(os.path.join(_candidate, "oncotriage")):
@@ -175,8 +178,18 @@ from oncotriage.storage.database_logger import initialize_database
 from oncotriage.utils import UnknownModelPricingError, get_model_cost
 
 
-_CODE_DIR = (os.path.dirname(os.path.abspath(__file__))
-             if "__file__" in globals() else os.getcwd())
+# PASS 20d-2: the repository root, derived from the PACKAGE's own location
+# rather than from this file's. `oncotriage/__init__.py` -> `oncotriage/` -> the
+# code directory. This file already imports the package unconditionally above.
+#
+# IT IS ALSO THE git CWD, which is what makes this more than a cosmetic change:
+# `_git("log", "--", "oncotriage/storage/queries.py")` run from tests/ still
+# finds the repository (git walks up) but the PATHSPEC is resolved relative to
+# the cwd, so it would match nothing and `_newest_revision_where` would return
+# (None, None) for both revisions -- turning every negative control in sections
+# 3, 4b, 5 and 7 into a reported failure. Loud, but for the wrong reason.
+_CODE_DIR = os.path.dirname(
+    os.path.dirname(os.path.abspath(oncotriage.__file__)))
 
 # The two priced models the seed uses. Read out of PRICING_CONFIG rather than
 # written here, so this file cannot drift from the pricing table and cannot
@@ -188,7 +201,7 @@ _PRICED_MODELS = sorted(queries.PRICING_CONFIG["models"])
 # MINIMAL ASSERTION HARNESS
 # ===========================================================================
 #
-# The same shape as "48- Degraded Dependency Test.py"'s, deliberately: a check
+# The same shape as "tests/test_degraded_dependencies.py"'s, deliberately: a check
 # that aborts the run hides every check after it, which is the exact failure
 # this file exists to have removed from File 16.
 

@@ -2,12 +2,12 @@
 
 Item 20c, pass 3d.
 
-    capture   "45- Fixture Capture.py" whole -- the schema, the recording sink,
+    capture   "fixture_capture.py" whole -- the schema, the recording sink,
               the four proxies, ``build_deterministic_prefix``, the fixture I/O,
               the three derivation recipes, the constructed retry fixture, the
               cohort scan and the selection.
 
-    replay    "46- Fixture Replay.py" whole -- the replay stand-ins, the OpenAI
+    replay    "fixture_replay.py" whole -- the replay stand-ins, the OpenAI
               tripwire, the field-by-field diff, and the five refusals that run
               before anything is replayed.
 

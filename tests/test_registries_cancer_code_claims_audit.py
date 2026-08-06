@@ -2,9 +2,13 @@
 ###########################################################################
 
 """
-Audits _SNOMED_PRIMARY and _SNOMED_SECONDARY in '08- Cancer Code Registry.py'
-against the UMLS Metathesaurus, and fails if any entry is not what File 08's
-comment says it is.
+Audits _SNOMED_PRIMARY and _SNOMED_SECONDARY in
+'oncotriage/registries/cancer_code_registry.py' against the UMLS Metathesaurus,
+and fails if any entry is not what the comment beside it says it is. (It is
+still called "File 08" throughout what follows: that is where the sets were
+written, and item 20c pass 2a moved them into the package. The path this file
+reads comes from the imported module's own __file__, so it cannot name the shim
+by accident.)
 
 WHY THIS EXISTS
 ---------------
@@ -77,7 +81,8 @@ to a weaker check: an audit that quietly does not run is worse than no audit,
 because the exit code still says 0.
 
 Run from terminal (or F5 in Spyder):
-    python "42- Cancer Code Registry Audit Test.py"
+    python tests/test_registries_cancer_code_claims_audit.py
+    (was: python "42- Cancer Code Registry Audit Test.py")
 
 Exit codes:
     0 -- every code verified
@@ -87,28 +92,55 @@ Exit codes:
 
 # Run needed file
 #----------------
-# Item 20a: this file sits in the code directory, so __file__ locates it with
-# no hardcoded path. __file__ is bound when the file is run as a script (every
-# documented entry point for it) and when Spyder runfile()s it. In a bare
-# interactive paste it is not bound, and the working directory is the only
-# remaining candidate -- taken, but announced, never silently.
-import os as _os_boot
-if "__file__" in globals():
-    _code_dir = _os_boot.path.dirname(_os_boot.path.abspath(__file__)) + _os_boot.sep
-else:
-    _code_dir = _os_boot.getcwd() + _os_boot.sep
-    print(f"[Bootstrap] __file__ unbound; using the working directory as the code directory: {_code_dir}")
-del _os_boot
+# PASS 20d-2: THIS FILE IMPORTS THE PACKAGE. It used to exec "01- Imports.py"
+# and "02- Utility Functions.py" into its own globals and then exec_chain()
+# "08- Cancer Code Registry.py", which is how every registry name below used to
+# arrive. Item 20c pass 2a moved File 08's definitions into
+# oncotriage/registries/cancer_code_registry.py, so each name comes from the
+# module that defines it.
+#
+# THE CANDIDATE DIRECTORY IS THE PARENT OF THIS FILE'S, not this file's own.
+# The same block the other tests carry looks one level up because this file now
+# sits in tests/ and the package sits BESIDE tests/, not inside it.
+# `pip install -e .` makes the whole block a no-op.
+import glob
+import json
+import os
+import re
+import sys
 
-for _bootstrap in ("01- Imports.py", "02- Utility Functions.py"):
-    with open(_code_dir + _bootstrap) as _fh:
-        exec(_fh.read(), globals())
+try:
+    import oncotriage  # noqa: F401
+except ImportError:
+    for _candidate, _how in (
+        (os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+         if "__file__" in globals() else None, "__file__"),
+        (os.getcwd(), "cwd"),
+    ):
+        if _candidate and os.path.isdir(os.path.join(_candidate, "oncotriage")):
+            if _candidate not in sys.path:
+                sys.path.insert(0, _candidate)
+            print(f"[Bootstrap] oncotriage package found at {_candidate} "
+                  f"(via {_how}); added to sys.path")
+            break
+    else:
+        raise
+    del _candidate, _how
 
-exec_chain(
-    ["08- Cancer Code Registry.py"],
-    caller_file=_code_dir + "42- Cancer Code Registry Audit Test.py",
-    caller_globals=globals(),
-    chain_label="01 → 02 → 08",
+from oncotriage.paths import data_MeSH_path
+from oncotriage.registries import cancer_code_registry as _ccr
+from oncotriage.registries.cancer_code_registry import (
+    _ICD10_ALPHA_NON_INVASIVE,
+    _ICD10_ALPHA_PRIMARY,
+    _ICD10_ALPHA_SECONDARY,
+    _ICD10_C_BLOCK_MAX,
+    _ICD10_C_SECONDARY_HI,
+    _ICD10_C_SECONDARY_LO,
+    _ICD10_D_NEOPLASM_BLOCK_MAX,
+    _ICD10_SEED_PRIMARY,
+    _SNOMED_PRIMARY,
+    _SNOMED_SECONDARY,
+    load_registry,
 )
 
 
@@ -242,10 +274,24 @@ def passed(label: str) -> None:
 # The guard below converts both into one failure that names the file and the
 # zero. It is a diagnosis, not a safety net.
 #
-# "43- Cancer Code Registry Audit Negative Control.py" plants its defects into
+# "tests/test_registries_cancer_code_claims_audit_control.py" plants its
+# defects into
 # this same file and hashes its restore against it.
 
-_REGISTRY_SOURCE = _code_dir + "oncotriage/registries/cancer_code_registry.py"
+# PASS 20d-2: the path comes from the imported module's own __file__ rather than
+# from a _code_dir guess. That was correct only while this file sat beside the
+# package; from tests/ it would have been one level off and every read below
+# would have raised.
+#
+# IT ALSO CLOSES A HOLE THE GUESS LEFT OPEN, and this file is the one place in
+# the repository where that matters most: the negative control plants defects
+# into cancer_code_registry.py IN PLACE and then runs THIS file as a subprocess
+# to prove each defect is caught. A hand-built path could name a different copy
+# of the module than the one this process imported -- the audit would then read
+# pristine text while the imported registry carried the plant, and every case
+# would report "not caught" for the wrong reason. Asking the module where it
+# lives makes the text and the behaviour the same file by construction.
+_REGISTRY_SOURCE = os.path.abspath(_ccr.__file__)
 
 def extract_file08_claims() -> dict:
     """
@@ -496,7 +542,8 @@ def save_cache(mrconso_path: str, terms: dict, absent: set) -> str:
     payload = {
         "cache_version": _CACHE_VERSION,
         "source": _source_fingerprint(mrconso_path),
-        "note": ("Extract of the rows '42- Cancer Code Registry Audit Test.py' "
+        "note": ("Extract of the rows "
+                 "'tests/test_registries_cancer_code_claims_audit.py' "
                  "needs from MRCONSO. Derived data, safe to delete: it is "
                  "rebuilt on the next run. 'absent' lists codes looked up "
                  "against this exact release and NOT found."),

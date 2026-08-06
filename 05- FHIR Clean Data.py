@@ -87,7 +87,7 @@ exec_chain(
 #
 # The three accessors come in under private aliases, are called once, and are
 # then DELETED. That keeps this file's surface exactly the fourteen names File 05
-# bound before the move -- "47- Package Split Test.py" section 5 pins that list
+# bound before the move -- "tests/test_package_invariants.py" section 5 pins that list
 # and fails on an addition as loudly as on a deletion, because a name this file
 # adds is a name the next file in a chain would silently pick up.
 from oncotriage.fhir.clean import (

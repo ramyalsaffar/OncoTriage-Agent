@@ -13,7 +13,7 @@ safe here and was measured rather than assumed: nothing in the dashboard
 mutates either one, the ``tier_colors = MATCH_TIER_COLORS`` alias in three tabs
 is never written through, and handing the dict to plotly's
 ``color_discrete_map`` leaves it unchanged. Check 6a of
-"47- Package Split Test.py" re-derives all three facts, so a future edit that
+"tests/test_package_invariants.py" re-derives all three facts, so a future edit that
 starts mutating them fails rather than corrupting every later rerun.
 """
 

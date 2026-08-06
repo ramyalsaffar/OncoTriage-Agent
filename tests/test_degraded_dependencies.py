@@ -71,7 +71,8 @@ the copy; the production corpus is never opened for writing and its file count
 is asserted unchanged at the end.
 
 Run from terminal (or F5 in Spyder):
-    python "48- Degraded Dependency Test.py"
+    python tests/test_degraded_dependencies.py
+    (was: python "48- Degraded Dependency Test.py")
 
 Exit codes:
     0 -- all assertions passed
@@ -102,15 +103,17 @@ import types
 
 # Make the oncotriage package importable
 #---------------------------------------
-# The same six-line block Files 04, 06, 11 and 12 carry. `pip install -e .`
-# makes it a no-op; without it the code directory goes on sys.path and the fact
-# is printed rather than left silent.
+# The same block Files 04, 06, 11 and 12 carry, with the one difference pass
+# 20d-2 forced: it looks at the PARENT of this file's directory, because this
+# file now sits in tests/ and the package sits BESIDE tests/, not inside it.
+# `pip install -e .` makes it a no-op; without it the code directory goes on
+# sys.path and the fact is printed rather than left silent.
 try:
     import oncotriage  # noqa: F401
 except ImportError:
     for _candidate, _how in (
-        (os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals()
-         else None, "__file__"),
+        (os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+         if "__file__" in globals() else None, "__file__"),
         (os.getcwd(), "cwd"),
     ):
         if _candidate and os.path.isdir(os.path.join(_candidate, "oncotriage")):
@@ -131,8 +134,15 @@ from oncotriage.registries import mesh
 from oncotriage.retrieval import indexer
 
 
-_CODE_DIR = (os.path.dirname(os.path.abspath(__file__)) + os.sep
-             if "__file__" in globals() else os.getcwd() + os.sep)
+# PASS 20d-2: the repository root, derived from the PACKAGE's own location
+# rather than from this file's. `oncotriage/__init__.py` -> `oncotriage/` -> the
+# code directory. This file already imports the package unconditionally above,
+# so there is no cost to asking it where it is, and the answer cannot be one
+# directory off the way a __file__-relative guess became when this file moved
+# into tests/. It also names the tree this process actually imported, which a
+# hand-built path cannot promise.
+_CODE_DIR = os.path.dirname(
+    os.path.dirname(os.path.abspath(oncotriage.__file__))) + os.sep
 
 
 # ===========================================================================
@@ -166,7 +176,7 @@ def check_raises(label: str, exc_type, fn, *args, **kwargs):
     """Assert `fn` raises `exc_type`. Returns the exception, or None.
 
     BOTH branches record and print, so this helper is never itself a silent
-    handler — the defect `39- ECOG Performance Status Surfacing Test.py` had to
+    handler — the defect `tests/test_fhir_ecog_surfacing.py` (was File 39) had to
     argue about in its own harness.
     """
     try:

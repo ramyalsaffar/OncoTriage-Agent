@@ -1,12 +1,12 @@
 """Characterization fixture capture: record what the pipeline does today.
 
-Moved out of ``45- Fixture Capture.py`` by item 20c, pass 3d.
-``45- Fixture Capture.py`` survives as a THIN ENTRY POINT.
+Moved out of ``fixture_capture.py`` by item 20c, pass 3d.
+``fixture_capture.py`` survives as a THIN ENTRY POINT.
 
 THE SHIM QUESTION WAS SETTLED BY MEASUREMENT, AND THE ANSWER CHANGED
 --------------------------------------------------------------------
 The pass began on the assumption that File 45 would need a re-export shim,
-because ``46- Fixture Replay.py`` exec-chains it and reads eighteen names out of
+because ``fixture_replay.py`` exec-chains it and reads eighteen names out of
 the shared namespace. All 101 of File 45's top-level names were grepped against
 every ``.py``, ``.md``, ``.toml`` and ``.yml`` in the tree first, and the result
 is that **File 46 is the only consumer** -- every distinctive hit
@@ -101,17 +101,17 @@ Nothing. No path is resolved, no directory is created, no client is built, no
 model is loaded, no database is opened, no fixture is read. Everything above is
 behind an accessor that answers on first call.
 
-See the original module docstring of ``45- Fixture Capture.py`` in git history
+See the original module docstring of ``fixture_capture.py`` in git history
 for the full fixture-format reference; the field-by-field description is
-reproduced in ``46- Fixture Replay.py``'s consumer-side documentation and in
+reproduced in ``fixture_replay.py``'s consumer-side documentation and in
 CLAUDE.md.
 
 USAGE
 -----
-    python "45- Fixture Capture.py"                    # scan, select, capture all
-    python "45- Fixture Capture.py" --scan-only        # cohort scan + case report
-    python "45- Fixture Capture.py" --probe-limit 400  # widen the no-candidates hunt
-    python "45- Fixture Capture.py" --only normal_1 gpt4o_retry_constructed
+    python "fixture_capture.py"                    # scan, select, capture all
+    python "fixture_capture.py" --scan-only        # cohort scan + case report
+    python "fixture_capture.py" --probe-limit 400  # widen the no-candidates hunt
+    python "fixture_capture.py" --only normal_1 gpt4o_retry_constructed
 """
 
 import argparse
@@ -205,7 +205,7 @@ from oncotriage.utils import (
 # This is the same split pass 20c-3b made in oncotriage/fhir/explore.py:
 # output_dir() answers where, and something else makes it so. A caller that
 # only wants to print the fixture directory, or list what is in it, must be able
-# to ask without anything appearing on disk -- and 46- Fixture Replay.py is
+# to ask without anything appearing on disk -- and fixture_replay.py is
 # exactly that caller: it reads fixture_root() and globs it, and must not create
 # a directory as a side effect of finding there are no fixtures in it.
 #
@@ -713,7 +713,7 @@ def _recording_medcpt(inner, sink: RecordingSink):
 #
 # THE CONSEQUENCE, IF NOTHING HAD CHANGED HERE, is the worst shape a regression
 # can have. Capture would have issued real OpenAI calls and recorded NOTHING
-# into the fixture, and 46- Fixture Replay.py -- whose entire claim is that it
+# into the fixture, and fixture_replay.py -- whose entire claim is that it
 # makes no model call -- would have sent every Stage 5 prompt to the real
 # endpoint and paid for it, while still reporting that all twelve fixtures
 # replayed clean. Nothing would have raised.
@@ -734,7 +734,7 @@ _HOOKED_NAMES = (
     "_bm25_query_model",
     "medcpt_score_pairs",
 )
-"""The four seams, under their pre-2c names. Kept because 46- Fixture Replay.py
+"""The four seams, under their pre-2c names. Kept because fixture_replay.py
 imports it and because the fixture schema and every diagnostic message in both
 files speak in these terms. _HOOK_KEYS below is the mapping to the deps keys
 that actually install them."""
@@ -775,7 +775,7 @@ def assert_hooks_reach_the_agent(expected: dict, what: str) -> None:
 
     This is the assertion that replaces "the rebinding worked because it always
     worked". It is called before every capture and before every replay, and
-    46- Fixture Replay.py demonstrates it FAILING when the overrides are not
+    fixture_replay.py demonstrates it FAILING when the overrides are not
     installed -- otherwise it would be one more thing that has only ever passed.
     """
     reached = current_hook_targets()
@@ -1989,7 +1989,7 @@ def rebuild_derived_bundle(fixture: Dict) -> str:
 
 # Marker spliced into the truncated response so a reader of the fixture can see
 # at a glance that the malformed payload was manufactured.
-MALFORMED_MARKER = "  <<< TRUNCATED BY 45- Fixture Capture.py TO FORCE A JSON PARSE FAILURE"
+MALFORMED_MARKER = "  <<< TRUNCATED BY fixture_capture.py TO FORCE A JSON PARSE FAILURE"
 
 # How much of the real response to keep before truncating. Long enough that the
 # payload is recognisably the real one, short enough that it cannot close.

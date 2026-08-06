@@ -26,7 +26,7 @@ module opens no client, loads no model, touches no database, reads no file and
 resolves no directory" -- and the first two are the exact defect pass 20c-2b
 removed from ``oncotriage/paths.py``: a module that resolves the sibling data
 tree at import cannot be imported at all on a machine that does not have it.
-``47- Package Split Test.py`` check 2c imports every package module in its own
+``tests/test_package_invariants.py`` check 2c imports every package module in its own
 subprocess with the root pointed at a directory that does not exist, so this one
 would have failed the moment it landed.
 
@@ -568,7 +568,7 @@ def filter_cancer_patients_inplace(dry_run=False):
             so the documented invocation ``python "05- FHIR Clean Data.py"``
             behaves exactly as it always has.
 
-    IT IS A PARAMETER, NOT A SECOND FUNCTION. "47- Package Split Test.py"
+    IT IS A PARAMETER, NOT A SECOND FUNCTION. "tests/test_package_invariants.py"
     section 5 pins the File 05 shim's shared-namespace surface at exactly
     fourteen names and fails on an addition, so a `plan_cancer_patient_filter()`
     helper would either fail that check or have to be hidden from the shim --

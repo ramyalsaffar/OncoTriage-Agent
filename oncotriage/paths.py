@@ -70,7 +70,7 @@ That last case is deliberate: a wrong project root must fail where it is read,
 loudly, naming the variable to set. But it means ``hasattr`` is the wrong tool
 for asking "does this module expose this name" — the question has an answer even
 when the tree is missing, and ``hasattr`` cannot give it. Ask ``name in
-PATH_NAMES or hasattr(...)`` instead, which is what ``47- Package Split Test.py``
+PATH_NAMES or hasattr(...)`` instead, which is what ``tests/test_package_invariants.py``
 does; it used to call ``hasattr`` on all sixteen and would have aborted rather
 than reported on any checkout without the sibling directories.
 
@@ -81,7 +81,7 @@ module now:
   * prints one line naming the settings module.
 
 It opens no socket, loads no model, touches no database, reads no file and
-resolves no directory. ``47- Package Split Test.py`` section 2b imports it with
+resolves no directory. ``tests/test_package_invariants.py`` section 2b imports it with
 the project root pointed at a directory that does not exist and requires the
 import to succeed and the first path READ to raise.
 """
@@ -356,7 +356,7 @@ if set(_DOCKER_PATHS) != set(_LOCAL_PATHS):
     )
 
 PATH_NAMES = tuple(sorted(_RESOLVERS))
-"""Every name this module resolves lazily. Read by ``47- Package Split Test.py``
+"""Every name this module resolves lazily. Read by ``tests/test_package_invariants.py``
 so that a path added to the tables without being added to the shim's import list
 is caught, rather than being a name only one of the two lists knows about."""
 

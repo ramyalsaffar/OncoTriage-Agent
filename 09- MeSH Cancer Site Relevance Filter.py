@@ -61,7 +61,7 @@ except ImportError:
 
 # Deleted rather than left bound. This file is exec'd into the shared namespace
 # by five other files, and a probe name left behind there is a name the next
-# file to be written inherits without asking. "47- Package Split Test.py"
+# file to be written inherits without asking. "tests/test_package_invariants.py"
 # asserts this shim adds NOTHING to the pre-pass surface, and caught this leak.
 del _oncotriage_pkg
 

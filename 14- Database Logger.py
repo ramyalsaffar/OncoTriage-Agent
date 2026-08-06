@@ -81,6 +81,13 @@ from oncotriage.storage.database_logger import (
 #     40- ECOG Logging Test.py                line 153, exec at 155
 #     45- Fixture Capture.py                  line 383, chained at 386
 #
+# (Those five names are the ones the files carried AT THAT TIME, and they are
+# left alone on purpose -- the block documents the shape of a defect, not a
+# place to go and look. Today they are tests/test_storage_inference_logging_
+# contract.py, tests/test_agent_retrieval_observability.py, tests/test_fhir_
+# birth_date_and_demographics.py, tests/test_storage_ecog_logging.py and
+# fixture_capture.py; see tests/FILE NUMBER MAPPING.md.)
+#
 # A module-level function cannot see a caller's globals, so the moment
 # log_inference started importing inferences_path from oncotriage.paths, all
 # five would have written real rows into the real database while still printing

@@ -29,7 +29,7 @@ dashboard has exactly two such objects -- ``MATCH_TIERS`` and
 ``MATCH_TIER_COLORS`` -- and neither is mutated anywhere, the
 ``tier_colors = MATCH_TIER_COLORS`` alias in three tabs is never written
 through, and plotly leaves the dict it is handed unchanged. Check 6a of
-"47- Package Split Test.py" re-derives all three, so an edit that starts
+"tests/test_package_invariants.py" re-derives all three, so an edit that starts
 mutating either one fails instead of corrupting every subsequent rerun.
 
 THE 60-SECOND CACHE TTL IS UNAFFECTED, which is worth stating because

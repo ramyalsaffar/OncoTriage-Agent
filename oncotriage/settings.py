@@ -22,7 +22,7 @@ still never imports ``utils`` — with no deferred import anywhere in the packag
 A deferred import is a dependency that does not appear in the module's import
 block, so no static scan of the import graph can see it; the package now has a
 rule that every ``oncotriage``-to-``oncotriage`` import is at module scope, and
-``47- Package Split Test.py`` enforces it. (Third-party imports inside function
+``tests/test_package_invariants.py`` enforces it. (Third-party imports inside function
 bodies are untouched by that rule — File 08's ``import icd10`` is deliberate and
 stays.)
 
@@ -45,7 +45,7 @@ import os
 # Environment variable names
 # ---------------------------------------------------------------------------
 # The ONCOTRIAGE_ prefix matches ONCOTRIAGE_DEFER_LOCAL_MODELS, which
-# 13- LangGraph Agent.py and 46- Fixture Replay.py already use.
+# 13- LangGraph Agent.py and fixture_replay.py already use.
 
 ENV_MAIN_PATH = "ONCOTRIAGE_MAIN_PATH"
 """Project root: the directory holding '02- Data', '03- Code', '05- Keys', ...
@@ -151,7 +151,7 @@ the corpus on the strength of ``CancerCodeRegistry.is_primary_cancer()``. A
 degraded registry there means a missing pip package deletes the dataset --
 the exact failure this variable would otherwise re-create --  so
 ``filter_cancer_patients_inplace()`` refuses a degraded registry whatever this
-variable says, and ``48- Degraded Dependency Test.py`` demonstrates the refusal
+variable says, and ``tests/test_degraded_dependencies.py`` demonstrates the refusal
 with the variable SET.
 
 RECOGNISED VALUES: 1/true/yes/on and 0/false/no/off, case-insensitive,
@@ -316,7 +316,7 @@ def resolve_allow_degraded_registries():
     "13- LangGraph Agent.py" is exec'd, because it selects between two ways of
     building the process. This one is consulted at the moment a file turns out
     to be missing, which is already lazy -- and reading it at call time is what
-    lets "48- Degraded Dependency Test.py" demonstrate both arms in one process
+    lets "tests/test_degraded_dependencies.py" demonstrate both arms in one process
     instead of paying for a subprocess per arm.
 
     Raises:

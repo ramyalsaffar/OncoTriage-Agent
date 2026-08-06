@@ -264,7 +264,7 @@ del _name, _value
 CONSISTENCY_GUARD_CATEGORY = 'Counters not reported'
 """The category the NULL guard emits.
 
-Named because "49- Database Query Layer Test.py" locates the guard branch inside
+Named because "tests/test_storage_query_layer.py" locates the guard branch inside
 ``_CONSISTENCY_CASE_SQL`` by this string in order to derive which columns are
 guarded and which are merely compared. A literal in the test would be a second
 copy of a value the SQL owns."""
@@ -1371,7 +1371,7 @@ PRICED_COST_COLUMNS = ("matching_model", "model_recorded", "rows",
                        "input_cost", "output_cost", "recomputed_cost",
                        "cost_complete", "stored_cost", "note")
 """What ``price_model_groups`` returns, in order. Pinned because the dashboard
-renders it and "49- Database Query Layer Test.py" asserts on it.
+renders it and "tests/test_storage_query_layer.py" asserts on it.
 
 ``cost_complete`` sits immediately after ``recomputed_cost`` because it is that
 column's qualifier and nothing else's -- see ``price_model_groups``."""
@@ -1385,7 +1385,7 @@ COST_INCOMPLETE_NOTES = (
 )
 """The note fragments that accompany ``cost_complete = False``.
 
-Declared so "49- Database Query Layer Test.py" can assert the boolean and the
+Declared so "tests/test_storage_query_layer.py" can assert the boolean and the
 prose never disagree -- a False with no explanation, or an explanation with a
 True beside it, are both worse than either alone. ``price_model_groups``
 computes the boolean from the DATA rather than from these strings; the strings

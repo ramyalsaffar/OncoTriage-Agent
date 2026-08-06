@@ -83,8 +83,8 @@ from oncotriage.utils import get_age_reference_date as _get_age_reference_date_p
 # because they were defined inside the text exec'd into the shared namespace,
 # and that is not a detail — it is a seam the test and fixture harnesses use:
 #
-#   '45- Fixture Capture.py'            rebinds qdrant_client to a recording proxy
-#   '46- Fixture Replay.py'             rebinds it to a replaying proxy
+#   'fixture_capture.py'            rebinds qdrant_client to a recording proxy
+#   'fixture_replay.py'             rebinds it to a replaying proxy
 #
 # THAT LIST USED TO HAVE THREE MORE ENTRIES AND NOW HAS TWO, which is a fact
 # about the consumers rather than about this seam:

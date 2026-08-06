@@ -31,7 +31,7 @@ WHAT IT IMPORTS, and what that costs
 ``paths`` — so importing this module pulls the config module in. As of pass 2b
 that resolves no directory and reads no file: ``paths`` is lazy. Importing this
 module opens no client, loads no model, touches no database and reads nothing;
-``47- Package Split Test.py`` section 2 imports it under traps that are fired
+``tests/test_package_invariants.py`` section 2 imports it under traps that are fired
 afterwards to show they were armed.
 
 Its SOURCE TEXT is read by two tests, which point HERE and not at the shim:

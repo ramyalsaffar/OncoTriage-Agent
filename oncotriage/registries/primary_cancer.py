@@ -19,7 +19,7 @@ Now both callers import it from here:
                                            fallback
 
 and neither of them imports the other. The function is byte-identical to the one
-pass 2b left in File 14 -- ``47- Package Split Test.py`` re-derives that with
+pass 2b left in File 14 -- ``tests/test_package_invariants.py`` re-derives that with
 ``ast.unparse`` against git HEAD, so the move is provably a move.
 
 WHY IT IS NOT IN cancer_code_registry.py

@@ -173,7 +173,7 @@ STATE = "California"
 # A FUNCTION, not a module-level constant, as of item 20c pass 3a. It used to be
 #     SYNTHEA_JAR_PATH = data_patient_path + "synthea-with-dependencies.jar"
 # which resolved the sibling data tree AT IMPORT. A package module may not do
-# that -- see CLAUDE.md, and check 2c of "47- Package Split Test.py", which
+# that -- see CLAUDE.md, and check 2c of "tests/test_package_invariants.py", which
 # imports every module in its own subprocess with the project root pointed at a
 # directory that does not exist. oncotriage.paths caches, so the glob still runs
 # at most once per process; it just runs on first USE rather than on import.

@@ -5,7 +5,7 @@ have shipped silently and billed for it.
 
 THE DEFECT THIS REPLACES
 ------------------------
-``45- Fixture Capture.py`` and ``46- Fixture Replay.py`` redirect the pipeline by
+``fixture_capture.py`` and ``fixture_replay.py`` redirect the pipeline by
 REBINDING NAMES IN THE SHARED EXEC NAMESPACE::
 
     globals()["openai_client"]      = OpenAIProxy(...)
@@ -18,7 +18,7 @@ dict, so File 13's functions resolved those four names out of that dict at CALL
 time. The moment File 13 becomes a module, its functions resolve them out of the
 MODULE's globals instead, and a rebinding in the caller reaches none of them.
 
-Nothing would have raised. ``46- Fixture Replay.py`` would have gone on printing
+Nothing would have raised. ``fixture_replay.py`` would have gone on printing
 that every fixture replayed clean while sending each Stage 5 prompt to the real
 OpenAI endpoint and paying for it — the fixtures exist precisely because those
 calls cost money, and the replay's entire claim is that it makes none of them.
@@ -108,7 +108,7 @@ WHAT IMPORTING THIS MODULE DOES
 -------------------------------
 Nothing. No client is constructed, no model is downloaded or loaded, no registry
 is built, no JSON is read, no path is resolved. Every accessor above is lazy and
-``47- Package Split Test.py`` section 2 imports this module — and the eleven
+``tests/test_package_invariants.py`` section 2 imports this module — and the eleven
 others — under traps on ``open``, ``io.open``, ``socket.socket``,
 ``socket.create_connection`` and ``sqlite3.connect`` that are fired afterwards
 to show they were armed.
@@ -125,7 +125,7 @@ THE ENVIRONMENT VARIABLE IS STILL READ AT IMPORT, deliberately
 ``_DEFER_LOCAL_MODELS`` is evaluated once, here, from the same expression File 13
 used at its line 386. It is CONSULTED lazily, on first model access. Reading it
 at import rather than at first use keeps the contract callers already have —
-``46- Fixture Replay.py`` sets it before the chain runs and says in a comment
+``fixture_replay.py`` sets it before the chain runs and says in a comment
 that setting it later would be too late — and keeps one source of truth for a
 value that must not change mid-process. An override always wins over it.
 """
@@ -462,7 +462,7 @@ def _resolve(key, factory):
 #
 #   The two local models are loaded at exec() time and cost tens of seconds plus
 #   a few hundred MB. A replay harness that serves every model output from a
-#   recording (46- Fixture Replay.py) needs neither, and "loads no model" is
+#   recording (fixture_replay.py) needs neither, and "loads no model" is
 #   part of what makes a replay a replay rather than a second run.
 #
 #   Opt-in only, and never in production: the variable is read once, here, and
@@ -571,7 +571,7 @@ def _build_bm25_query_model():
     # wrong terms: Qdrant returns results, nothing raises, no counter moves, and
     # only retrieval quality falls. File 13's own comment said the two were the
     # same model; nothing enforced it. Now one accessor does, and
-    # "47- Package Split Test.py" section 2f asserts the construction count is
+    # "tests/test_package_invariants.py" section 2f asserts the construction count is
     # exactly 1.
     #
     # THE DEFERRAL CHECK STAYS HERE, ABOVE THE DELEGATION, and that is the whole

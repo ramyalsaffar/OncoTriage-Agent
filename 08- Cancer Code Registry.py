@@ -92,7 +92,7 @@ from oncotriage.registries.cancer_code_registry import (
 # change File 08's logic; pass 2b adds '_var' to that tuple, so the module
 # binds it and then removes it and there is nothing left here to re-export.
 #
-# 47- Package Split Test.py holds the pre-2a runtime inventory and an explicit
+# tests/test_package_invariants.py holds the pre-2a runtime inventory and an explicit
 # list of these three names as the ONLY permitted deletions from it, and checks
 # that each one is genuinely absent from the shim's namespace — so the exception
 # is exercised rather than merely declared, and a fourth name going missing

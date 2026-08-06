@@ -12,7 +12,7 @@ read ``PRICING_CONFIG`` / ``qdrant_client`` + ``COLLECTION_NAME`` /
 ``DATA_SNAPSHOT_DATE`` out of the shared exec namespace at CALL time. That is
 not an accident of the exec chain — it is a seam four files depend on:
 
-  * ``45- Fixture Capture.py`` / ``46- Fixture Replay.py`` rebind
+  * ``fixture_capture.py`` / ``fixture_replay.py`` rebind
     ``qdrant_client`` to recording and replaying proxies.
 
 THREE OF THE FOUR CONSUMERS ARE GONE, and the list above is what is left rather

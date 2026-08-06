@@ -50,7 +50,7 @@ matplotlib, seaborn and pandas ARE imported at module scope, unlike the
 third-party imports deferred into function bodies elsewhere in this package.
 They are this module's whole subject — seven of its twelve functions plot — and
 nothing but ``06- FHIR Explore.py`` imports it, so the cost lands only on the
-one caller that was always going to pay it. ``47- Package Split Test.py``
+one caller that was always going to pay it. ``tests/test_package_invariants.py``
 section 2 pre-imports all three before arming its traps, the same allowance it
 already makes for openai, qdrant_client, numpy and langgraph, so the claim it
 proves stays exactly "importing an oncotriage module reads no file".

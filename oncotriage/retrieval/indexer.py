@@ -20,7 +20,7 @@ WHAT CHANGED IN THE MOVE
        _bm25_sparse_model = SparseTextEmbedding(model_name="Qdrant/bm25")
 
    at exec() time. Two things were wrong with that. It is a model load at
-   import, which the package forbids and ``47- Package Split Test.py`` section 2
+   import, which the package forbids and ``tests/test_package_invariants.py`` section 2
    traps. And it was the SECOND independent construction of the same model: the
    agent built its own in ``oncotriage/agent/deps.py`` for the query side of the
    same job. BM25 sparse vectors are token-ID vectors over the model's

@@ -1,7 +1,7 @@
 """Replay every characterization fixture and report every difference.
 
-Moved out of ``46- Fixture Replay.py`` by item 20c, pass 3d.
-``46- Fixture Replay.py`` survives as a THIN ENTRY POINT and keeps no re-export
+Moved out of ``fixture_replay.py`` by item 20c, pass 3d.
+``fixture_replay.py`` survives as a THIN ENTRY POINT and keeps no re-export
 shim: all 27 of its top-level names were grepped against every ``.py``, ``.md``,
 ``.toml`` and ``.yml`` in the tree, and the only hits are prose in File 45,
 File 13 and ``oncotriage/agent/deps.py``, plus the exec-bootstrap locals every
@@ -189,7 +189,7 @@ def assert_local_models_deferred() -> None:
       3. neither ``torch`` nor ``transformers`` is in ``sys.modules``. This is
          the empirical half. The first two say the switch is set; this says
          nothing has actually loaded the model behind its back, and it is the
-         same measurement ``47- Package Split Test.py`` check 2d makes.
+         same measurement ``tests/test_package_invariants.py`` check 2d makes.
 
     A replay whose claim is "no model was loaded" must not rest on a comment.
     """
@@ -833,7 +833,7 @@ def main() -> int:
 
     fixture_paths = list_fixtures(root)
     if not fixture_paths:
-        print(f"[FATAL] No fixtures in {root}. Run 45- Fixture Capture.py first.")
+        print(f"[FATAL] No fixtures in {root}. Run fixture_capture.py first.")
         return 1
 
     fixtures = []
@@ -969,7 +969,7 @@ def main() -> int:
               f"captured against.")
         print(f"        Refusing to diff against a different index. Either "
               f"point Qdrant back at the pinned collection, or re-capture the "
-              f"fixtures with 45- Fixture Capture.py.")
+              f"fixtures with fixture_capture.py.")
         for fixture in sorted(fixtures, key=lambda f: f["fixture_id"]):
             got = fixture["environment"]["qdrant_collection"]
             if got != live_collection:
@@ -1008,7 +1008,7 @@ def main() -> int:
               f"captured against.")
         print(f"        Every retrieval-order difference you would see below "
               f"would be the corpus, not item 20. Re-capture with "
-              f"45- Fixture Capture.py.")
+              f"fixture_capture.py.")
         for fixture_id, reason, fields in stale:
             print(f"          {fixture_id}: {reason}"
                   + (f" on {fields}" if fields else ""))
