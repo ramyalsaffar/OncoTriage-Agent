@@ -41,6 +41,20 @@ plain dict of ints, mutated by ``_delete_manifested`` and read by
 ``filter_cancer_patients_inplace`` at the end of the run. The shim imports the
 dict itself, not a copy, so the shim's ``_DELETION_COUNTS`` and this module's are
 one object and a caller reading it after a run sees the run's numbers.
+
+ITEM 11a ADDED TWO GUARDS AND A PARAMETER
+-----------------------------------------
+``require_intact_registry()`` runs before anything is scanned and raises if the
+cancer registry is missing a detection layer -- REGARDLESS of
+ONCOTRIAGE_ALLOW_DEGRADED_REGISTRIES, which is the one place in the package that
+variable is deliberately not honoured. A degraded registry here means a missing
+pip package deletes patient bundles. See that function for the full argument.
+
+``filter_cancer_patients_inplace(dry_run=True)`` scans and plans exactly as
+usual, writes the plan to ``{manifest_path()}.dryrun`` and unlinks nothing. It
+is a PARAMETER rather than a new exported helper because File 47 section 5 pins
+this module's shim surface at fourteen names, and because a plan produced by a
+second implementation is a plan that can disagree with the deletion.
 """
 
 import json
@@ -50,7 +64,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from oncotriage import paths
+from oncotriage import paths, settings
 from oncotriage.config import COHORT_MANIFEST_FILENAME, COHORT_MANIFEST_FLUSH_EVERY
 from oncotriage.fhir.parser import _select_best_coding
 from oncotriage.registries.cancer_code_registry import load_registry
@@ -156,6 +170,74 @@ def cancer_registry():
         return _RESOLVED["cancer_registry"]
 
 
+def require_intact_registry():
+    """Raise unless the cancer registry has every detection layer. Returns it.
+
+    THE DEGRADED-MODE OPT-OUT DOES NOT REACH THIS PATH, and that is the whole
+    reason this function exists rather than a bare ``cancer_registry()`` call.
+
+    ONCOTRIAGE_ALLOW_DEGRADED_REGISTRIES lets a run continue with the ICD-10-CM
+    layer absent. For the AGENT that is a defensible trade: a patient is scored
+    against fewer trials, or against trials a fuller registry would have
+    filtered, and the row in ``inferences.db`` is still there to re-run. For
+    THIS module it is not a trade at all. ``filter_cancer_patients_inplace()``
+    UNLINKS patient bundles on the strength of
+    ``CancerCodeRegistry.is_primary_cancer()``, and Synthea's corpus is
+    regenerable only by re-running File 04 with the same seed -- the deletion
+    itself is irreversible within a run.
+
+    With the ICD-10 layer gone, `is_primary_cancer` loses BOTH directions at
+    once: ICD-10-coded cancers stop being recognised, so their bundles are
+    deleted as non-cancer; and the D00-D49 / C77-C79 exclusion sets stop
+    rejecting, so in-situ and metastatic-only records can be admitted by the
+    display-term fallback. A missing `pip install icd10-cm` would delete the
+    dataset, which is precisely the failure the environment variable would
+    otherwise re-create with the operator's own blessing. So the variable is not
+    consulted here at all: this refuses on the REGISTRY's reported state.
+
+    Raises:
+        settings.DegradedDependencyError: naming the absent layer(s).
+    """
+    registry = cancer_registry()
+
+    # getattr, not attribute access. This function must also refuse a registry
+    # object that predates `degraded_layers` or a stand-in that does not carry
+    # it: "the object cannot tell me whether it is intact" is not the same
+    # answer as "it is intact", and only one of the two may proceed to delete.
+    degraded = getattr(registry, "degraded_layers", None)
+    if degraded is None:
+        raise settings.DegradedDependencyError(
+            f"the cohort filter cannot verify the cancer registry: "
+            f"{type(registry).__name__} does not report `degraded_layers`, so "
+            f"there is no way to tell an intact registry from one missing a "
+            f"detection layer.\n"
+            f"  This path DELETES patient bundles from the corpus on that "
+            f"registry's verdicts and will not do so unverified.",
+            layer=None,
+        )
+
+    if degraded:
+        raise settings.DegradedDependencyError(
+            f"REFUSING TO DELETE: the cancer registry is missing detection "
+            f"layer(s) {', '.join(degraded)}.\n"
+            f"  This path unlinks patient bundles on "
+            f"CancerCodeRegistry.is_primary_cancer(), and a degraded registry "
+            f"gets it wrong in BOTH directions -- unrecognised cancers are "
+            f"deleted as non-cancer, and non-invasive or metastatic-only "
+            f"records the exclusion sets would have rejected can be admitted "
+            f"by the display-term fallback.\n"
+            f"  Fix it:   pip install icd10-cm\n"
+            f"  {settings.ENV_ALLOW_DEGRADED_REGISTRIES} DOES NOT APPLY HERE. "
+            f"It permits a degraded agent run, whose output is a row in a "
+            f"database; this deletes data. Run "
+            f"filter_cancer_patients_inplace(dry_run=True) to see the plan "
+            f"without touching anything.",
+            layer=degraded[0],
+        )
+
+    return registry
+
+
 #------------------------------------------------------------------------------
 
 
@@ -170,50 +252,76 @@ def cancer_registry():
 
 # Outcome counters for the whole run. No except: branch below leaves without
 # incrementing one of these.
+#
+# A DRY RUN NEVER TOUCHES THESE. `would_delete` is its own key precisely so a
+# dry run cannot look like a real one in the numbers a caller reads afterwards:
+# the shim re-exports this dict itself, not a copy, so whatever a dry run wrote
+# here would still be here when the real run was inspected.
 _DELETION_COUNTS = {
     "deleted":        0,
     "already_absent": 0,
     "failed":         0,
     "manifest_write_failed": 0,
+    "would_delete":   0,
 }
 
+# What a dry run appends to the manifest filename. A SEPARATE FILE, not a
+# suppressed write: the plan is the entire product of a dry run, and printing it
+# to a console that scrolls is not a record. Writing it to the real manifest
+# path would be worse still -- it would overwrite the account of the last real
+# deletion with a description of one that never happened, and that account is
+# the only thing that says which 4,300 bundles are gone.
+DRY_RUN_MANIFEST_SUFFIX = ".dryrun"
 
-def _write_manifest(manifest):
+
+def _write_manifest(manifest, path=None):
     """
     Persist the manifest atomically (temp file + os.replace + fsync).
+
+    Args:
+        manifest: the manifest dict.
+        path:     destination. Defaults to manifest_path(); a dry run passes
+                  manifest_path() + DRY_RUN_MANIFEST_SUFFIX.
 
     Returns True on success. A manifest write that fails is recorded in
     _DELETION_COUNTS and raised: losing the record is not a recoverable
     condition, because the next thing this file does is delete data that only
     the manifest describes.
     """
-    tmp_path = manifest_path() + ".tmp"
+    target = path or manifest_path()
+    tmp_path = target + ".tmp"
     try:
         with open(tmp_path, "w") as fh:
             json.dump(manifest, fh, indent=2)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp_path, manifest_path())
+        os.replace(tmp_path, target)
         return True
     except OSError as e:
         _DELETION_COUNTS["manifest_write_failed"] += 1
-        print(f"  FATAL: cannot write deletion manifest {manifest_path()}: {e}")
+        print(f"  FATAL: cannot write deletion manifest {target}: {e}")
         raise
 
 
-def _delete_manifested(manifest, phase_key, files, reason, progress_every=500):
+def _delete_manifested(manifest, phase_key, files, reason, progress_every=500,
+                       dry_run=False, manifest_target=None):
     """
     Delete `files`, recording every outcome in the manifest.
 
     Args:
-        manifest:       the live manifest dict (mutated and rewritten here)
-        phase_key:      manifest["phases"] key for this batch, e.g. "non_cancer"
-        files:          list of Path objects to remove
-        reason:         why these files are being removed (goes in the manifest)
-        progress_every: console progress interval
+        manifest:        the live manifest dict (mutated and rewritten here)
+        phase_key:       manifest["phases"] key for this batch, e.g. "non_cancer"
+        files:           list of Path objects to remove
+        reason:          why these files are being removed (goes in the manifest)
+        progress_every:  console progress interval
+        dry_run:         when True, NOTHING is unlinked. Every target lands in
+                         phase["would_delete"] instead of phase["deleted"], and
+                         the manifest is written to `manifest_target`.
+        manifest_target: where to write the manifest; None means the real path.
 
     Returns:
-        dict: this phase's record — planned/deleted/already_absent/failed.
+        dict: this phase's record — planned/deleted/would_delete/
+        already_absent/failed.
 
     The plan is written and fsync'd before the first unlink, so a crash at any
     point leaves the full target list on disk plus every outcome recorded up to
@@ -221,21 +329,57 @@ def _delete_manifested(manifest, phase_key, files, reason, progress_every=500):
     would leave the remaining targets untouched AND unexplained, whereas
     finishing the sweep leaves a complete account. The caller decides what a
     non-zero failure count means.
+
+    THE DRY-RUN BRANCH IS ONE `if` AROUND THE UNLINK, on purpose. Everything
+    else -- the plan, the manifest shape, the flush interval, the progress
+    lines, the phase status -- runs exactly as it does for real, so what a dry
+    run reports is produced by the same code that would do the deleting rather
+    than by a second implementation that could disagree with it.
     """
     phase = {
         "reason":         reason,
         "status":         "in_progress",
+        "dry_run":        dry_run,
         "planned_count":  len(files),
         "planned":        [f.name for f in files],
         "deleted":        [],
+        # Populated only by a dry run. Present and empty on a real run so the
+        # two manifests have the same shape and a reader never has to guess
+        # whether a missing key means "none" or "this file is from before".
+        "would_delete":   [],
         "already_absent": [],
         "failed":         [],
     }
     manifest["phases"][phase_key] = phase
-    manifest["status"] = "in_progress"
-    _write_manifest(manifest)
+    manifest["status"] = "dry_run_in_progress" if dry_run else "in_progress"
+    _write_manifest(manifest, manifest_target)
 
     for idx, patient_file in enumerate(files, 1):
+
+        if dry_run:
+            # NO unlink. The existence check is still made, because "already
+            # absent" is a real outcome a plan should report and it costs one
+            # stat() call.
+            #
+            # ONLY `would_delete` IS TOUCHED IN _DELETION_COUNTS. `already_absent`
+            # is recorded in the PHASE, which belongs to this plan, and not in
+            # the module counter, which is the record of what a run DID. The
+            # shim re-exports that dict itself rather than a copy, so a number a
+            # dry run left in it would still be there when someone inspected it
+            # after a real run — and "targets already absent: 3" printed by a
+            # run that unlinked nothing is exactly the kind of trace a dry run
+            # must not leave.
+            if patient_file.exists():
+                phase["would_delete"].append(patient_file.name)
+                _DELETION_COUNTS["would_delete"] += 1
+            else:
+                phase["already_absent"].append(patient_file.name)
+
+            if idx % COHORT_MANIFEST_FLUSH_EVERY == 0:
+                _write_manifest(manifest, manifest_target)
+            if idx % progress_every == 0:
+                print(f"  [DRY RUN] Would delete {idx}/{len(files)} files...")
+            continue
 
         try:
             patient_file.unlink()
@@ -258,13 +402,18 @@ def _delete_manifested(manifest, phase_key, files, reason, progress_every=500):
             print(f"  ERROR deleting {patient_file.name}: {type(e).__name__}: {e}")
 
         if idx % COHORT_MANIFEST_FLUSH_EVERY == 0:
-            _write_manifest(manifest)
+            _write_manifest(manifest, manifest_target)
 
         if idx % progress_every == 0:
             print(f"  Deleted {idx}/{len(files)} files...")
 
-    phase["status"] = "complete" if not phase["failed"] else "partial"
-    _write_manifest(manifest)
+    if dry_run:
+        # "planned", never "complete": a dry-run phase must not be mistakable
+        # for a finished deletion by anything reading the manifest later.
+        phase["status"] = "planned"
+    else:
+        phase["status"] = "complete" if not phase["failed"] else "partial"
+    _write_manifest(manifest, manifest_target)
 
     return phase
 
@@ -405,10 +554,36 @@ def patient_death_status(bundle_data):
     return None, 'no Patient resource in bundle'
 
 
-def filter_cancer_patients_inplace():
+def filter_cancer_patients_inplace(dry_run=False):
     """
     Delete non-cancer patients, then deceased cancer patients, then cap at CAP
     (in-place filtering).
+
+    Args:
+        dry_run: when True, scan and plan exactly as usual, print exactly what
+            would be removed, write the plan to
+            ``{manifest_path()}.dryrun`` -- and unlink NOTHING. The returned
+            stats carry ``dry_run: True`` and every ``*_deleted`` count is 0,
+            with the counts that matter under ``would_delete``. Default False,
+            so the documented invocation ``python "05- FHIR Clean Data.py"``
+            behaves exactly as it always has.
+
+    IT IS A PARAMETER, NOT A SECOND FUNCTION. "47- Package Split Test.py"
+    section 5 pins the File 05 shim's shared-namespace surface at exactly
+    fourteen names and fails on an addition, so a `plan_cancer_patient_filter()`
+    helper would either fail that check or have to be hidden from the shim --
+    and a dry run reachable only through the package, while the deletion is
+    reachable from the exec chain, is the wrong way round. A parameter also
+    guarantees the plan and the deletion cannot drift: they are one code path
+    with one `if` around the unlink.
+
+    THE REGISTRY IS VERIFIED BEFORE ANYTHING IS SCANNED. `require_intact_registry()`
+    raises if the cancer registry is missing a detection layer, and it does so
+    whatever ONCOTRIAGE_ALLOW_DEGRADED_REGISTRIES says -- see that function for
+    why the opt-out stops at this door. The check runs in dry-run mode too: a
+    plan computed from a degraded registry is a wrong plan, and reporting it as
+    a preview would be worse than refusing, because a reader would take it for
+    the truth about their corpus.
 
     Three phases in that order, and the order is load-bearing:
 
@@ -441,9 +616,20 @@ def filter_cancer_patients_inplace():
     """
 
     print("="*80)
-    print("STEP 2: FILTER CANCER PATIENTS (IN-PLACE DELETION)")
+    if dry_run:
+        print("STEP 2: FILTER CANCER PATIENTS — DRY RUN (NOTHING IS DELETED)")
+    else:
+        print("STEP 2: FILTER CANCER PATIENTS (IN-PLACE DELETION)")
     print("="*80)
     print()
+
+    # BEFORE the scan, and before the manifest, and in dry-run mode too.
+    require_intact_registry()
+
+    # Where the plan or the record goes. A dry run gets its own file so it
+    # cannot overwrite the account of the last real deletion.
+    manifest_target = (manifest_path() + DRY_RUN_MANIFEST_SUFFIX
+                       if dry_run else manifest_path())
 
     directory = patients_dir()
 
@@ -574,19 +760,22 @@ def filter_cancer_patients_inplace():
         # non-zero count cannot pass as zero.
         'unknown_vital_status_retained': sorted(f.name for f in unknown_vital_status),
         'unparseable_retained': sorted(f.name for f in error_patients),
+        'dry_run':              dry_run,
         'status':               'planned',
         'phases':               {},
     }
-    _write_manifest(manifest)
-    print(f"Deletion manifest: {manifest_path()}")
+    _write_manifest(manifest, manifest_target)
+    print(f"{'DRY RUN plan' if dry_run else 'Deletion manifest'}: {manifest_target}")
     print()
 
     # STEP 1: Delete non-cancer patients (if any)
     non_cancer_deleted = 0
+    non_cancer_would_delete = 0
 
     if non_cancer_patients:
         print("="*80)
-        print(f"STEP 1: DELETE {len(non_cancer_patients)} NON-CANCER PATIENTS")
+        print(f"STEP 1: {'WOULD DELETE' if dry_run else 'DELETE'} "
+              f"{len(non_cancer_patients)} NON-CANCER PATIENTS")
         print("="*80)
         print()
 
@@ -596,10 +785,18 @@ def filter_cancer_patients_inplace():
             files=non_cancer_patients,
             reason='no primary cancer condition found by has_cancer_diagnosis()',
             progress_every=500,
+            dry_run=dry_run,
+            manifest_target=manifest_target,
         )
         non_cancer_deleted = len(phase['deleted'])
+        non_cancer_would_delete = len(phase['would_delete'])
 
-        print(f"  Deleted {non_cancer_deleted}/{len(non_cancer_patients)} non-cancer patients... \nDONE")
+        if dry_run:
+            print(f"  [DRY RUN] Would delete "
+                  f"{non_cancer_would_delete}/{len(non_cancer_patients)} "
+                  f"non-cancer patients (nothing removed)")
+        else:
+            print(f"  Deleted {non_cancer_deleted}/{len(non_cancer_patients)} non-cancer patients... \nDONE")
         if phase['failed'] or phase['already_absent']:
             print(f"  NOT deleted: {len(phase['failed'])} failed, "
                   f"{len(phase['already_absent'])} already absent (see manifest)")
@@ -626,10 +823,12 @@ def filter_cancer_patients_inplace():
     # first would spend cohort slots on the dead and then delete them, leaving
     # far fewer than CAP.
     deceased_deleted = 0
+    deceased_would_delete = 0
 
     if deceased_cancer_patients:
         print("="*80)
-        print(f"STEP 2: DELETE {len(deceased_cancer_patients)} DECEASED CANCER PATIENTS")
+        print(f"STEP 2: {'WOULD DELETE' if dry_run else 'DELETE'} "
+              f"{len(deceased_cancer_patients)} DECEASED CANCER PATIENTS")
         print("="*80)
         print()
 
@@ -640,16 +839,24 @@ def filter_cancer_patients_inplace():
             reason='Patient.deceased[x] indicates the patient is dead; a deceased '
                    'patient is not a trial candidate',
             progress_every=500,
+            dry_run=dry_run,
+            manifest_target=manifest_target,
         )
         deceased_deleted = len(phase['deleted'])
+        deceased_would_delete = len(phase['would_delete'])
 
         # The element each verdict came from, so the manifest can be audited
         # without the bundles -- which this run is about to delete.
         phase['evidence'] = {f.name: death_evidence[f.name]
                              for f in deceased_cancer_patients}
-        _write_manifest(manifest)
+        _write_manifest(manifest, manifest_target)
 
-        print(f"  Deleted {deceased_deleted}/{len(deceased_cancer_patients)} deceased patients... \nDONE")
+        if dry_run:
+            print(f"  [DRY RUN] Would delete "
+                  f"{deceased_would_delete}/{len(deceased_cancer_patients)} "
+                  f"deceased patients (nothing removed)")
+        else:
+            print(f"  Deleted {deceased_deleted}/{len(deceased_cancer_patients)} deceased patients... \nDONE")
         if phase['failed'] or phase['already_absent']:
             print(f"  NOT deleted: {len(phase['failed'])} failed, "
                   f"{len(phase['already_absent'])} already absent (see manifest)")
@@ -664,16 +871,18 @@ def filter_cancer_patients_inplace():
         manifest['phases']['deceased'] = {
             'reason':         'Patient.deceased[x] indicates the patient is dead; a '
                               'deceased patient is not a trial candidate',
-            'status':         'complete',
+            'status':         'planned' if dry_run else 'complete',
+            'dry_run':        dry_run,
             'planned_count':  0,
             'planned':        [],
             'deleted':        [],
+            'would_delete':   [],
             'already_absent': [],
             'failed':         [],
             'note':           'the vital-status check RAN and found no deceased '
                               'cancer patients; it was not skipped',
         }
-        _write_manifest(manifest)
+        _write_manifest(manifest, manifest_target)
         print("="*80)
         print("STEP 2: NO DECEASED CANCER PATIENTS TO DELETE")
         print("="*80)
@@ -689,6 +898,7 @@ def filter_cancer_patients_inplace():
     # seeded random.sample.
     remaining_files = sorted(alive_cancer_patients)
     extra_deleted = 0
+    extra_would_delete = 0
 
     if error_patients:
         print(f"NOTE: {len(error_patients)} unparseable bundle(s) left on disk and "
@@ -718,7 +928,8 @@ def filter_cancer_patients_inplace():
         patients_to_remove = [f for f in remaining_files if f not in patients_to_keep_set]
 
         print(f"Randomly selecting {CAP} patients to keep (seed={RANDOM_SEED})...")
-        print(f"Deleting {len(patients_to_remove)} extra cancer patients...")
+        print(f"{'Would delete' if dry_run else 'Deleting'} "
+              f"{len(patients_to_remove)} extra cancer patients...")
         print()
 
         phase = _delete_manifested(
@@ -727,10 +938,18 @@ def filter_cancer_patients_inplace():
             files=patients_to_remove,
             reason=f'alive cancer patient beyond CAP={CAP} (seed={RANDOM_SEED})',
             progress_every=100,
+            dry_run=dry_run,
+            manifest_target=manifest_target,
         )
         extra_deleted = len(phase['deleted'])
+        extra_would_delete = len(phase['would_delete'])
 
-        print(f"  Deleted {extra_deleted}/{len(patients_to_remove)} extra patients... \n\nDONE")
+        if dry_run:
+            print(f"  [DRY RUN] Would delete "
+                  f"{extra_would_delete}/{len(patients_to_remove)} extra "
+                  f"patients (nothing removed)")
+        else:
+            print(f"  Deleted {extra_deleted}/{len(patients_to_remove)} extra patients... \n\nDONE")
         if phase['failed'] or phase['already_absent']:
             print(f"  NOT deleted: {len(phase['failed'])} failed, "
                   f"{len(phase['already_absent'])} already absent (see manifest)")
@@ -754,22 +973,46 @@ def filter_cancer_patients_inplace():
     final_files = list(patients_path.glob("*.json"))
     deletion_failures = _DELETION_COUNTS["failed"]
 
-    manifest['status'] = 'complete' if not deletion_failures else 'partial'
+    if dry_run:
+        # "planned", never "complete". Anything reading this file later must be
+        # able to tell a plan from a record of work done, and the word is the
+        # only thing that says which.
+        manifest['status'] = 'planned'
+    else:
+        manifest['status'] = 'complete' if not deletion_failures else 'partial'
     manifest['finished_utc'] = datetime.now(timezone.utc).isoformat()
     manifest['counts'] = dict(_DELETION_COUNTS)
     manifest['files_remaining'] = len(final_files)
-    _write_manifest(manifest)
+    _write_manifest(manifest, manifest_target)
 
     print("="*80)
-    print("FILTERING COMPLETE!" if not deletion_failures else "FILTERING FINISHED WITH FAILURES")
+    if dry_run:
+        print("DRY RUN COMPLETE — NOTHING WAS DELETED")
+    else:
+        print("FILTERING COMPLETE!" if not deletion_failures else "FILTERING FINISHED WITH FAILURES")
     print("="*80)
     print()
-    print(f"✓ Non-cancer patients deleted: {non_cancer_deleted}")
-    print(f"✓ Deceased cancer patients deleted: {deceased_deleted}")
-    print(f"✓ Extra alive cancer patients deleted (for cap): {extra_deleted}")
-    print(f"✓ Files remaining in directory: {len(final_files)}")
-    print(f"✓ Directory: {patients_path}")
-    print(f"✓ Manifest: {manifest_path()} (status: {manifest['status']})")
+    if dry_run:
+        _would_total = (non_cancer_would_delete + deceased_would_delete
+                        + extra_would_delete)
+        print(f"• Non-cancer patients that WOULD be deleted: {non_cancer_would_delete}")
+        print(f"• Deceased cancer patients that WOULD be deleted: {deceased_would_delete}")
+        print(f"• Extra alive cancer patients that WOULD be deleted (cap): {extra_would_delete}")
+        print(f"• TOTAL that would be removed: {_would_total}")
+        print(f"• Files currently in directory: {len(final_files)} → "
+              f"{len(final_files) - _would_total} after a real run")
+        print(f"• Directory: {patients_path}  (UNCHANGED)")
+        print(f"• Plan written to: {manifest_target}")
+        print(f"• Every filename is in that file, under phases[*].would_delete.")
+        print()
+        print("  Re-run without dry_run=True to perform the deletion.")
+    else:
+        print(f"✓ Non-cancer patients deleted: {non_cancer_deleted}")
+        print(f"✓ Deceased cancer patients deleted: {deceased_deleted}")
+        print(f"✓ Extra alive cancer patients deleted (for cap): {extra_deleted}")
+        print(f"✓ Files remaining in directory: {len(final_files)}")
+        print(f"✓ Directory: {patients_path}")
+        print(f"✓ Manifest: {manifest_path()} (status: {manifest['status']})")
     if deletion_failures:
         print(f"✗ Deletions that FAILED: {deletion_failures} — the directory is "
               f"partially filtered. Per-file errors are in the manifest.")
@@ -780,6 +1023,18 @@ def filter_cancer_patients_inplace():
     print()
 
     stats = {
+        # FIRST, and always present. A caller that forgets to look at it is one
+        # thing; a caller that cannot tell a dry run's stats from a real run's
+        # is another, and the three *_deleted keys below read 0 in both a clean
+        # dry run and a real run that found nothing to do.
+        'dry_run': dry_run,
+        'would_delete': {
+            'non_cancer': non_cancer_would_delete,
+            'deceased':   deceased_would_delete,
+            'over_cap':   extra_would_delete,
+            'total':      (non_cancer_would_delete + deceased_would_delete
+                           + extra_would_delete),
+        },
         'total_scanned': len(patient_files),
         'cancer_patients_found': len(cancer_patients),
         'alive_cancer_patients_found': len(alive_cancer_patients),
@@ -797,7 +1052,11 @@ def filter_cancer_patients_inplace():
         'parse_errors': len(error_patients),
         'deletion_failures': deletion_failures,
         'deletions_already_absent': _DELETION_COUNTS['already_absent'],
+        # The file that was actually written -- the .dryrun copy on a dry run.
+        # 'manifest_path' keeps naming the real manifest, unchanged, because
+        # existing callers read it as "where the record of deletions lives".
         'manifest_path': manifest_path(),
+        'manifest_written': manifest_target,
         'manifest_status': manifest['status'],
     }
 

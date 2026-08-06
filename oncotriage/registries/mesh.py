@@ -36,12 +36,46 @@ The module object is imported instead and the attribute is read inside
 """
 
 import json
+import logging
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Optional, Set
 
-from oncotriage import paths
+from oncotriage import paths, settings
+
+
+logger = logging.getLogger(__name__)
+
+
+# ===========================================================================
+# DEGRADATION RECORD (item 11a)
+# ===========================================================================
+#
+# Module-level, following PARTIAL_DATE_DEGRADATIONS in oncotriage/utils.py, and
+# deliberately NOT a new key in anything the pipeline returns: the twelve
+# characterization fixtures diff what the pipeline produced field by field, and
+# a new field there means recapturing twelve fixtures -- twelve live GPT-4o
+# runs -- to record something no stage reads.
+#
+# The per-inference record for the MeSH case already exists and is unchanged:
+# Stage 4 writes MESH_FILTER_SKIP_NO_FILTER into `mesh_filter_skip_reason`,
+# which item 11b put in the `inferences` table. This counter is the PROCESS-level
+# record -- what a batch run can print once at the end -- and the layer names
+# below are the same strings the DegradedDependencyError carries as `.layer`, so
+# a run that raised and a run that degraded name the same thing.
+MESH_FILTER_DEGRADATIONS = Counter()
+
+# The layer names. The first is the one item 11a made raise; the other three are
+# the optional crosswalks, which were already LOGGED (each prints a NOTE line)
+# and are now also RECORDED. They deliberately do NOT raise: unlike the two core
+# files, the filter is fully functional without them -- it falls back to fuzzy
+# descriptor matching, which is the documented design -- so their absence is a
+# capability reduction that announces itself, not a layer vanishing in silence.
+MESH_LAYER_CORE = "mesh_c04_core"
+MESH_LAYER_SNOMED_CROSSWALK = "mesh_snomed_crosswalk"
+MESH_LAYER_ICD10_CROSSWALK = "mesh_icd10_crosswalk"
+MESH_LAYER_UMLS_SYNONYMS = "mesh_umls_synonym_crosswalk"
 
     
 
@@ -812,7 +846,7 @@ class MeSHCancerFilter:
 # ===========================================================================
 
 
-def load_mesh_filter() -> MeSHCancerFilter:
+def load_mesh_filter() -> Optional[MeSHCancerFilter]:
     """
     Load pre-built MeSH lookup files and return a MeSHCancerFilter instance.
 
@@ -824,8 +858,30 @@ def load_mesh_filter() -> MeSHCancerFilter:
       - snomed_to_mesh_trees.json  (SNOMED crosswalk, Layer 1)
       - icd10_to_mesh_trees.json   (ICD-10-CM crosswalk, Layer 2, built by Item 2.1)
 
-    If required files are missing -> returns None (filter disabled).
-    If crosswalk files are missing -> loads without them (fuzzy matching only).
+    If crosswalk files are missing -> loads without them (fuzzy matching only),
+    printing which one and counting it in MESH_FILTER_DEGRADATIONS.
+
+    IF A REQUIRED FILE IS MISSING THIS RAISES (item 11a). It used to print a
+    warning and return None, and the None then travelled all the way to Stage 4,
+    where every trial passes the cancer site filter. That is a real production
+    configuration in the sense that the pipeline keeps running and produces
+    matches; it is not one anybody chooses, because the only trace of it was a
+    warning on a console nobody reads two hours into a 22k-patient batch.
+
+    None IS STILL A REACHABLE STATE, and every branch that handles it is real
+    and still tested. What changed is that it can no longer be CREATED SILENTLY
+    from missing files. It arrives two ways now, both deliberate:
+
+      * a dependency override -- ``deps.set_override(deps.MESH_FILTER, None)``,
+        which is what "37- Retrieval Observability Test.py" installs and what
+        "35- Ablation State Passthrough Test.py" stubs. An override never calls
+        this function at all;
+      * ONCOTRIAGE_ALLOW_DEGRADED_REGISTRIES=1, below, which logs at WARNING,
+        records the layer, and returns None exactly as before.
+
+    Raises:
+        settings.DegradedDependencyError: a required lookup file is absent and
+            the degraded-mode variable is not set.
     """
     # Read HERE, not at import: oncotriage.paths resolves lazily and a
     # module-scope `from ... import data_MeSH_path` would resolve the whole
@@ -844,11 +900,34 @@ def load_mesh_filter() -> MeSHCancerFilter:
             missing.append(str(lookup_path))
         if not tree_path.exists():
             missing.append(str(tree_path))
-        print("WARNING: MeSH Cancer Filter core files not found:")
-        for m in missing:
-            print(f"  - {m}")
-        print("\nRun build_mesh_lookup() first (requires desc2026.xml).")
-        print("The cancer site filter will be DISABLED (all trials pass).\n")
+
+        what_is_missing = (
+            "MeSH Cancer Filter core lookup file(s) not found:\n"
+            + "".join(f"    - {m}\n" for m in missing)
+            + "  Without them the Stage 4 cancer site filter cannot run and "
+              "EVERY trial passes it, for every patient."
+        )
+        how_to_fix = ('python "09- MeSH Cancer Site Relevance Filter.py"   '
+                      "(runs build_mesh_lookup(); requires desc2026.xml)")
+
+        allowed, source = settings.resolve_allow_degraded_registries()
+        if not allowed:
+            raise settings.degraded_dependency_error(
+                MESH_LAYER_CORE, what_is_missing, how_to_fix)
+
+        # Degraded, deliberately. Log at WARNING naming exactly which layer is
+        # absent and which variable permitted it, record it, and return the
+        # None every downstream branch already handles.
+        MESH_FILTER_DEGRADATIONS[MESH_LAYER_CORE] += 1
+        logger.warning(
+            "DEGRADED: the %r layer is ABSENT — the Stage 4 cancer site filter "
+            "is DISABLED and every trial will pass it. Permitted by %s. "
+            "Missing: %s. Supply it with: %s",
+            MESH_LAYER_CORE, source, ", ".join(missing), how_to_fix,
+        )
+        print(f"WARNING: MeSH Cancer Filter DISABLED — {MESH_LAYER_CORE} layer "
+              f"absent, permitted by {source}. All trials will pass the cancer "
+              f"site filter.\n")
         return None
 
     print("Loading MeSH Cancer Filter...")
@@ -865,6 +944,15 @@ def load_mesh_filter() -> MeSHCancerFilter:
         with open(crosswalk_path, "r") as f:
             snomed_to_trees = json.load(f)
     else:
+        # LOGGED before item 11a, RECORDED as well now. It does not raise: the
+        # filter is designed to work without it and says so in the class
+        # docstring, so this is a documented capability reduction rather than a
+        # layer disappearing unannounced. The count is what lets a run answer
+        # "was the SNOMED layer there" after the fact instead of from scrollback.
+        MESH_FILTER_DEGRADATIONS[MESH_LAYER_SNOMED_CROSSWALK] += 1
+        logger.warning("MeSH: the %r layer is absent (%s) -- patient SNOMED "
+                       "codes will fall through to fuzzy display matching.",
+                       MESH_LAYER_SNOMED_CROSSWALK, crosswalk_path)
         print("  NOTE: snomed_to_mesh_trees.json not found -- SNOMED crosswalk disabled.")
 
     # Optional: ICD-10-CM crosswalk (Layer 2)
@@ -873,6 +961,10 @@ def load_mesh_filter() -> MeSHCancerFilter:
         with open(icd10_xwalk_path, "r") as f:
             icd10_to_trees = json.load(f)
     else:
+        MESH_FILTER_DEGRADATIONS[MESH_LAYER_ICD10_CROSSWALK] += 1
+        logger.warning("MeSH: the %r layer is absent (%s) -- patient ICD-10-CM "
+                       "codes will fall through to fuzzy display matching.",
+                       MESH_LAYER_ICD10_CROSSWALK, icd10_xwalk_path)
         print("  NOTE: icd10_to_mesh_trees.json not found -- ICD-10 crosswalk disabled.")
         print("  To enable: run build_icd10_to_mesh_crosswalk() (Item 2.1).")
 
@@ -883,6 +975,10 @@ def load_mesh_filter() -> MeSHCancerFilter:
         with open(synonym_xwalk_path, "r") as f:
             synonym_to_trees = json.load(f)
     else:
+        MESH_FILTER_DEGRADATIONS[MESH_LAYER_UMLS_SYNONYMS] += 1
+        logger.warning("MeSH: the %r layer is absent (%s) -- clinical synonyms "
+                       "will fall through to substring and stem matching.",
+                       MESH_LAYER_UMLS_SYNONYMS, synonym_xwalk_path)
         print("  NOTE: umls_synonym_to_mesh_trees.json not found -- UMLS synonym crosswalk disabled.")
         print("  To enable: run build_umls_synonym_crosswalk() (Item 1).")
 

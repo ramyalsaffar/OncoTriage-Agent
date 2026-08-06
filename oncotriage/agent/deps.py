@@ -88,11 +88,21 @@ WHAT IS OVERRIDABLE, and why each one is on the list
     CANCER_REGISTRY    ``load_registry()``     — File 35 stubs this one.
     LAB_REGISTRY       ``load_lab_registry()``
     MESH_FILTER        ``load_mesh_filter()``  — File 35 stubs this one too.
-                       Legitimately ``None`` when the MeSH JSON files are
-                       absent, which is why the cache uses a sentinel and not
-                       ``if value is None: build()``. Caching ``None`` as "not
-                       built yet" would re-read four JSON lookups on every
-                       Stage 1, 3 and 4 call of every patient in a 22k run.
+                       Legitimately ``None``, which is why the cache uses a
+                       sentinel and not ``if value is None: build()``. Caching
+                       ``None`` as "not built yet" would re-read four JSON
+                       lookups on every Stage 1, 3 and 4 call of every patient
+                       in a 22k run.
+                       WHERE THE None COMES FROM CHANGED IN ITEM 11a. It used
+                       to arrive on its own from missing MeSH JSON files:
+                       ``load_mesh_filter()`` printed a warning, returned None,
+                       and Stage 4 stopped filtering by cancer site for the
+                       whole run. That function RAISES now unless
+                       ONCOTRIAGE_ALLOW_DEGRADED_REGISTRIES is set. So None is
+                       still a real, reachable, tested state — every branch on
+                       ``is None`` stays, and File 37 installs exactly this
+                       override — but it is now always somebody's decision:
+                       an override installed here, or that variable set.
 
 WHAT IMPORTING THIS MODULE DOES
 -------------------------------
@@ -620,12 +630,18 @@ def get_lab_registry():
 
 
 def get_mesh_filter():
-    """MeSHCancerFilter, or None when the MeSH JSON lookups are absent.
+    """MeSHCancerFilter, or None when the filter was deliberately not built.
 
     None is a REAL ANSWER here, not "not built yet" — every caller inside the
     agent branches on `is None` and records MESH_FILTER_SKIP_NO_FILTER when it
     is. _resolve()'s sentinel is what keeps a legitimate None cached instead of
     re-reading four JSON files on every Stage 1, 3 and 4 call.
+
+    Item 11a narrowed how None arises without removing it. Missing MeSH JSON
+    files now raise out of ``load_mesh_filter()``; None reaches this accessor
+    only from an override installed here, or from a run that set
+    ONCOTRIAGE_ALLOW_DEGRADED_REGISTRIES and was warned about it. Both are
+    decisions somebody made, which is the whole change.
     """
     return _resolve(MESH_FILTER, load_mesh_filter)
 

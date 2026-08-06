@@ -129,6 +129,29 @@ del _patients_dir_accessor, _manifest_path_accessor, _cancer_registry_accessor
 
 if __name__ == "__main__":
 
+    # --dry-run reaches filter_cancer_patients_inplace(dry_run=True), added by
+    # item 11a. Parsed with argparse INSIDE this block so no name leaks into the
+    # shared exec namespace: exec_chain sets __name__ to "_exec_chain_", so a
+    # chained load never enters here at all, and File 47's shim probe -- which
+    # pins this file's surface at fourteen names -- does the same.
+    #
+    # A FLAG RATHER THAN A PROMPT. This is the plan, not a confirmation step:
+    # it writes the full list to {manifest}.dryrun and exits, so the operator
+    # reads it, then runs the command again without the flag.
+    import argparse as _argparse_main
+
+    _args_main = _argparse_main.ArgumentParser(
+        description="Filter the Synthea cohort to alive primary-cancer "
+                    "patients, capped. DELETES BUNDLES IN PLACE.",
+    )
+    _args_main.add_argument(
+        "--dry-run", action="store_true",
+        help="scan and report exactly what would be deleted, write the full "
+             "list to the deletion manifest path with a .dryrun suffix, and "
+             "delete NOTHING.",
+    )
+    _opts_main = _args_main.parse_args()
+
     print()
     print("╔═══════════════════════════════════════════════════════════════════════╗")
     print(f"║                  {Project_Name}: FILTER CANCER PATIENTS              ║")
@@ -136,9 +159,27 @@ if __name__ == "__main__":
     print()
 
     # Filter patients (in-place deletion)
-    stats = filter_cancer_patients_inplace()
+    stats = filter_cancer_patients_inplace(dry_run=_opts_main.dry_run)
 
-    if stats and not stats['deletion_failures']:
+    if stats and stats['dry_run']:
+        print()
+        print("DRY RUN — nothing was deleted.")
+        print()
+        print(f"Summary:")
+        print(f"  - Total scanned: {stats['total_scanned']}")
+        print(f"  - Cancer patients found: {stats['cancer_patients_found']} "
+              f"({stats['alive_cancer_patients_found']} alive, "
+              f"{stats['deceased_cancer_patients_found']} deceased)")
+        print(f"  - WOULD delete, non-cancer: {stats['would_delete']['non_cancer']}")
+        print(f"  - WOULD delete, deceased: {stats['would_delete']['deceased']}")
+        print(f"  - WOULD delete, over cap: {stats['would_delete']['over_cap']}")
+        print(f"  - WOULD delete, total: {stats['would_delete']['total']}")
+        print(f"  - Files still on disk: {stats['files_remaining']}")
+        print(f"  - Plan: {stats['manifest_written']}")
+        print()
+        print("NEXT STEP: re-run without --dry-run to perform the deletion.")
+        print()
+    elif stats and not stats['deletion_failures']:
         print()
         print("SUCCESS! Cancer patient filtering complete.")
         print()

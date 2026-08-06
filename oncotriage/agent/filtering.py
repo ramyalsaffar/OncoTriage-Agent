@@ -18,10 +18,25 @@ nothing in the stored row saying so.
 ``_MESH_FILTER`` now comes from ``oncotriage.agent.deps``; File 35 stubs it.
 ``apply_quality_gate`` is imported from ``retrieval`` rather than duplicated,
 which is the one edge this module has into another stage.
+
+ITEM 11a CHANGED TWO THINGS HERE, one of them a behaviour change:
+
+  * ``extract_patient_histology`` is called UNCONDITIONALLY. It used to sit
+    inside ``if mesh_filter is not None:``, so a missing MeSH lookup file
+    disabled the histology filter as well as the cancer site filter — two
+    unrelated checks wired to one file's presence. On the degraded path
+    (no MeSH filter) histology mismatches are now dropped instead of reaching
+    Stage 5. On the normal path nothing changes.
+  * an unparseable trial ``min_age`` / ``max_age`` is COUNTED, in the
+    module-level ``AGE_PARSE_FAILURES``, and reported in the Stage 4 line. The
+    recovery is unchanged — the trial is kept and the age check is skipped for
+    it — because the failing value comes from ClinicalTrials.gov and there is
+    no operator action that would fix it. See the counter's own note.
 """
 
 import re
 import time
+from collections import Counter
 
 from oncotriage.agent import deps
 from oncotriage.agent.retrieval import apply_quality_gate
@@ -41,6 +56,85 @@ from oncotriage.extraction.stage import extract_patient_stage, is_stage_mismatch
 
 
 #------------------------------------------------------------------------------
+
+
+# ===========================================================================
+# AGE-PARSE DEGRADATION RECORD (item 11a)
+# ===========================================================================
+#
+# `Exception and Fallback Audit.md` ranked the handler below Open, HIGHEST
+# PRIORITY, and recorded that item 11b did not change it: a trial whose
+# min_age / max_age will not parse is KEPT, so the age filter silently does not
+# run for that trial and it can reach GPT-4o for a patient outside its range.
+# The direction is safe at pre-screening — false-eligible, never
+# false-ineligible — but the RATE was unknown, and unknown is the defect.
+#
+# THIS COUNTS RATHER THAN RAISES, and that is a deliberate departure from the
+# two layers above. A missing MeSH file or a missing pip package is a
+# CONFIGURATION defect: one operator, one command, and every run afterwards is
+# correct, so raising costs one run and fixes the class. An unparseable age
+# bound is third-party DATA — whatever ClinicalTrials.gov happened to register
+# for one trial — and raising on it would abort a whole patient's pipeline
+# because one of 75 retrieved trials has a strange string in one field. There
+# is no command the operator can run to fix ClinicalTrials.gov. Converting a
+# per-trial degradation into a per-patient outage is not a safety improvement,
+# so the fix is the counter the audit asked for, on the same footing as
+# mesh_dropped, plus the Stage 4 line saying it happened.
+#
+# MODULE-LEVEL, following PARTIAL_DATE_DEGRADATIONS in oncotriage/utils.py, and
+# NOT a new key in the returned dict: the twelve characterization fixtures diff
+# the pipeline's output field by field, and a new field means recapturing all
+# twelve — twelve live GPT-4o runs — to record something no stage reads.
+#
+# Keyed by which bound failed and on what text, capped in length, so a run can
+# answer "how often, and on what" rather than only "how often". The NCT id is
+# deliberately NOT in the key: 75 trials per patient across 22k patients would
+# make this Counter unbounded, and the failing SHAPE is what a fix needs.
+AGE_PARSE_FAILURES = Counter()
+
+# Longest raw age string kept in a counter key. Long enough to see the shape of
+# a real value ("6 Months", "N/A", "18 Years and older"), short enough that a
+# pathological field cannot grow the key without bound.
+_AGE_KEY_MAX_LEN = 40
+
+
+def _record_age_parse_failure(bound: str, raw, exc: Exception) -> None:
+    """Record one unparseable trial age bound. Never raises.
+
+    `bound` is "min_age" or "max_age". The exception TYPE is in the key because
+    IndexError (the regex found no digits) and ValueError (digits that int()
+    refused) are different data problems with different fixes.
+    """
+    text = str(raw)
+    if len(text) > _AGE_KEY_MAX_LEN:
+        text = text[:_AGE_KEY_MAX_LEN] + "..."
+    AGE_PARSE_FAILURES[f"{bound}:{type(exc).__name__}:{text}"] += 1
+
+
+def _parse_age_bound(raw, default: int, bound: str):
+    """Parse one trial age bound. Returns the int, or None if it will not parse.
+
+    THE RECOVERY IS UNCHANGED AND THAT IS THE POINT. None propagates to the
+    caller, which then skips the age check for that trial and keeps it —
+    byte-for-byte the outcome of the old `except (IndexError, ValueError): pass`,
+    including the case where max_age is unparseable and min_age is fine: the
+    old `try` wrapped both parses AND the comparison, so one bad bound meant the
+    whole check was skipped rather than the good bound being applied alone.
+    Applying the good bound would be defensible and it would DROP trials the old
+    code kept, which is a live behaviour change dressed up as instrumentation.
+    Item 11a adds the record; changing which trials survive is a different
+    decision and belongs to whoever reads the counts this now produces.
+
+    What IS new is per-bound attribution: the old handler could not say which of
+    the two strings was the bad one, and the counter is only actionable if it can.
+    """
+    if not raw:
+        return default
+    try:
+        return int(re.findall(r'\d+', raw)[0])
+    except (IndexError, ValueError) as exc:
+        _record_age_parse_failure(bound, raw, exc)
+        return None
 
 
 def node_rule_based_filter(state: TrialMatchState) -> dict:
@@ -82,15 +176,31 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
     # different objects if an override is installed mid-flight.
     mesh_filter = deps.get_mesh_filter()
 
+    # --- Patient histology, computed UNCONDITIONALLY (item 11a) ---
+    #
+    # It used to be computed INSIDE the `if mesh_filter is not None:` block
+    # below, so a missing MeSH lookup file disabled the HISTOLOGY filter too —
+    # a filter that reads no MeSH data, resolves no tree numbers and has nothing
+    # to do with cancer site relevance. Two unrelated capabilities were wired to
+    # one file's presence, and nothing said so: `histology_dropped` came back 0,
+    # which is also what "checked, nothing to drop" looks like.
+    #
+    # BEHAVIOUR CHANGE ON THE DEGRADED PATH, and it is the intended one: with no
+    # MeSH filter loaded, trials whose histology contradicts the patient's are
+    # now dropped instead of being passed to GPT-4o. On the normal path
+    # (mesh_filter present) nothing changes at all — this is the same call with
+    # the same argument, one indent level out — which is why the twelve
+    # characterization fixtures, all captured with a filter loaded, replay
+    # unchanged.
+    patient_histology = extract_patient_histology(conditions)
+
     # --- Get patient's MeSH cancer site tree numbers ---
     mesh_dropped = 0
     histology_dropped = 0
     patient_trees = set()
-    patient_histology = set()
     if mesh_filter is not None:
 
         patient_trees   = state.get("patient_trees") or set()
-        patient_histology = extract_patient_histology(conditions)
 
         # Under the ablation Stage 3 never resolves the trees, so an empty set
         # here means "ablated", not "unmappable" — the ablation line below
@@ -154,6 +264,12 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
     age_dropped = 0
     sex_dropped = 0
 
+    # Trials whose age bounds would not parse, so the age check did not run for
+    # them. A LOCAL, reported in the Stage 4 line below; the durable record is
+    # the module-level AGE_PARSE_FAILURES counter, which also carries the text
+    # that failed. It is not returned, for the fixture reason argued there.
+    age_unparsed = 0
+
     for trial_obj in trials:
         trial = trial_obj["trial"]
         eligibility = trial["eligibility"]
@@ -181,15 +297,20 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
         min_age_str = eligibility.get("min_age", "0 Years")
         max_age_str = eligibility.get("max_age", "999 Years")
 
-        try:
-            min_age = int(re.findall(r'\d+', min_age_str)[0]) if min_age_str else 0
-            max_age = int(re.findall(r'\d+', max_age_str)[0]) if max_age_str else 999
+        min_age = _parse_age_bound(min_age_str, 0, "min_age")
+        max_age = _parse_age_bound(max_age_str, 999, "max_age")
 
-            if patient_age is not None and not (min_age <= patient_age <= max_age):
-                age_dropped += 1
-                continue
-        except (IndexError, ValueError):
-            pass  # Keep trial if age parsing fails
+        if min_age is None or max_age is None:
+            # Unparseable bound: keep the trial and skip the age check, which is
+            # what the bare `except ... : pass` did. It is COUNTED now, in
+            # AGE_PARSE_FAILURES, so a run can say how often the age filter did
+            # not run and on what text. Counted per trial rather than tracked in
+            # a local, because the recovery must not become a new field in the
+            # returned dict — see the note above the counter.
+            age_unparsed += 1
+        elif patient_age is not None and not (min_age <= patient_age <= max_age):
+            age_dropped += 1
+            continue
 
         # --- Sex filter ---
         trial_sex = eligibility.get("sex", "ALL").upper()
@@ -229,6 +350,9 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
         f"{f' (stage dropped {stage_dropped})' if stage_dropped else ''}"
         f"{f' (histology dropped {histology_dropped})' if histology_dropped else ''}"
         f"{f' (age dropped {age_dropped})' if age_dropped else ''}"
+        # The age filter DID NOT RUN for these. Printed only when non-zero, so
+        # the ordinary line is byte-identical to what it was.
+        f"{f' (age UNPARSED {age_unparsed} — age filter did not run for them)' if age_unparsed else ''}"
         f"{f' (sex dropped {sex_dropped})' if sex_dropped else ''}"
         f"{f' (quality dropped {quality_dropped} @ raw >= {dynamic_threshold:.5f})' if quality_dropped else ''}"
     )

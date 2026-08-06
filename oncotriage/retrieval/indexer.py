@@ -59,6 +59,7 @@ import json
 import logging
 import re
 import time
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
@@ -101,6 +102,41 @@ from oncotriage.extraction.stage import (
     get_stage_extraction_stats,
 )
 from oncotriage.utils import CaffeinateSession, qdrant_retry
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
+# INDEX-TIME AGE-PARSE DEGRADATION RECORD (item 11a)
+# ===========================================================================
+#
+# The index-time MIRROR of oncotriage/agent/filtering.py's AGE_PARSE_FAILURES,
+# and `Exception and Fallback Audit.md` lists it as its own row: "a trial with
+# an unparseable minimum age is kept rather than skipped. Same fix, an
+# age_parse_failed counter in the scrape summary."
+#
+# WHAT THE HANDLER BELOW ACTUALLY DOES, which is worth stating because it is not
+# the same recovery as Stage 4's. The scrape SKIPS trials whose minimum age is
+# above 18 — an adult-oncology corpus does not want paediatric-only studies. An
+# unparseable minimumAge therefore means the trial is KEPT, i.e. indexed,
+# because the skip test could not be evaluated. Direction is the same as Stage
+# 4's (keep, never drop) and so is the reasoning for counting rather than
+# raising: the string comes from ClinicalTrials.gov, so there is no operator
+# action that would fix it, and aborting a 292k-trial scrape over one field
+# would be a worse outcome than indexing one extra trial.
+#
+# SEPARATE from the Stage 4 counter, and deliberately not shared. These are two
+# different populations measured at two different times — every registered trial
+# at scrape time, versus the ~75 retrieved for one patient at query time — and a
+# single counter would silently sum them into a number that means neither.
+# A module-level Counter either way, following PARTIAL_DATE_DEGRADATIONS.
+INDEX_AGE_PARSE_FAILURES = Counter()
+
+# Same cap and the same reason as filtering._AGE_KEY_MAX_LEN: keep enough of the
+# raw value to see its shape, not enough for a pathological field to grow the
+# key without bound.
+_INDEX_AGE_KEY_MAX_LEN = 40
 
 
 #------------------------------------------------------------------------------
@@ -232,8 +268,18 @@ def scrape_clinicaltrials_gov(condition=None, status=None, study_type=None, age=
                             min_age = int(re.findall(r'\d+', min_age_str)[0])
                             if min_age > 18:
                                 continue
-                        except (IndexError, ValueError):
-                            pass
+                        except (IndexError, ValueError) as _age_exc:
+                            # RECOVERY UNCHANGED — the trial is indexed, because
+                            # the "skip paediatric-only" test could not be
+                            # evaluated. RECORDED now: without this the scrape
+                            # could not say whether zero such trials existed or
+                            # whether the check had quietly stopped running.
+                            _age_text = min_age_str
+                            if len(_age_text) > _INDEX_AGE_KEY_MAX_LEN:
+                                _age_text = _age_text[:_INDEX_AGE_KEY_MAX_LEN] + "..."
+                            INDEX_AGE_PARSE_FAILURES[
+                                f"minimumAge:{type(_age_exc).__name__}:{_age_text}"
+                            ] += 1
 
                     # A trial tagged with a mutually exclusive pair PERMITS
                     # either histology, it does not require both. Both tags are
@@ -313,6 +359,15 @@ def scrape_clinicaltrials_gov(condition=None, status=None, study_type=None, age=
     _stage_stats = get_stage_extraction_stats()
     if any(_stage_stats.values()):
         print(f"Stage negation/span/exclusion-bound counters: {_stage_stats}")
+
+    # The age-parse counter the exception audit asked for, in the scrape summary
+    # where it asked for it. Printed only when non-zero, so a clean scrape's
+    # output is unchanged.
+    if INDEX_AGE_PARSE_FAILURES:
+        _age_total = sum(INDEX_AGE_PARSE_FAILURES.values())
+        print(f"minimumAge UNPARSEABLE on {_age_total} trial(s) — the "
+              f"paediatric-only skip did not run for them and they ARE indexed: "
+              f"{dict(INDEX_AGE_PARSE_FAILURES)}")
 
     if scrape_complete and checkpoint_file.exists():
         checkpoint_file.unlink()

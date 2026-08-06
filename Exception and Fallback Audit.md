@@ -11,6 +11,14 @@ the codebase, and every non-exception degradation path, with a verdict.
 handlers were found in 24 of them.
 **Last swept:** after the ECOG availability metric item (files 03, 20, 41).
 
+> **ITEM 11a (degraded dependencies) CLOSED FOUR ROWS and the handler table
+> below has NOT been re-swept for them.** The four are the two highest-priority
+> `SILENT` rows in the production path (`min_age`/`max_age`, `_normalize_lab_unit`),
+> the index-time `minimumAge` mirror, and the `08-` line-359 `ImportError`. Each
+> carries its new verdict inline. See "What item 11a changed" below for the
+> layer-level story, which the AST sweep cannot see at all — a detection layer
+> that was never built raises no exception.
+
 > **STALE FILE/LINE REFERENCES FOR FIVE FILES, as of item 20c pass 20c-3a.**
 > Files 04, 05, 06, 11 and 12 moved into the package. Every handler this
 > inventory attributes to one of them now lives in the corresponding module:
@@ -244,6 +252,82 @@ split on `mesh_filter_skip_reason`.
 
 ---
 
+## What item 11a changed
+
+Item 11b was about a stage that failed and left no trace. **Item 11a is about a
+LAYER that was never there and left no trace** — a different failure, because
+nothing failed at all: the pipeline ran, produced matches, logged a warning to a
+console nobody was watching, and every downstream number was computed as if the
+missing layer had agreed with the rest.
+
+**Two layers could disappear from a missing file or a missing pip package, and
+both now RAISE by default.**
+
+| Layer | Was | Is |
+|---|---|---|
+| MeSH C04 site relevance (`registries/mesh.py:load_mesh_filter`) | prints a warning, returns `None`; Stage 4's cancer site filter never runs and **every trial passes it for the whole run** | raises `settings.DegradedDependencyError` naming both missing JSON files, the command that builds them, and the opt-out |
+| ICD-10-CM cancer codes (`registries/cancer_code_registry.py:_build_icd10_cancer_sets`) | catches `ImportError`, `logger.error`, returns **three empty sets** while the registry goes on logging "CancerCodeRegistry ready" | raises, naming the package and `pip install icd10-cm`, and says that the C77-C79 / D00-D49 **exclusion** sets go with the primary ones |
+
+**`None` is still a reachable state and every branch handling it is still real.**
+Stage 4 records four distinct skip reasons and File 37 installs
+`deps.set_override(deps.MESH_FILTER, None)` to exercise one of them. What item
+11a removed is the ability to CREATE that state silently from missing files. It
+now arrives only from an override, or from an operator who set the variable.
+
+**The opt-out.** `ONCOTRIAGE_ALLOW_DEGRADED_REGISTRIES=1`
+(`oncotriage/settings.py`, deliberately not routed through `_from_env`, which
+appends a trailing separator and would make the flag never match). When set, the
+run continues, logs at WARNING naming exactly which layer is absent and which
+variable permitted it, and records the layer in a module-level counter
+(`MESH_FILTER_DEGRADATIONS`, `REGISTRY_DEGRADATIONS`). Per inference the MeSH
+case was already recorded, by item 11b, in `mesh_filter_skip_reason` — no new
+column and no new field. An unrecognised value **raises** rather than being read
+as "off".
+
+**The opt-out does not reach the deletion path, and that is the point.**
+`oncotriage/fhir/clean.py:require_intact_registry()` refuses a degraded registry
+whatever the variable says, because `filter_cancer_patients_inplace()` unlinks
+patient bundles on `is_primary_cancer()` verdicts — a degraded registry there
+means a missing pip package deletes the dataset, and it gets it wrong in BOTH
+directions (ICD-10-coded cancers deleted as non-cancer; in-situ and
+metastatic-only records admitted by the display-term fallback). A registry that
+cannot report whether it is intact is refused too. That refusal is demonstrated
+with the variable SET, in `48- Degraded Dependency Test.py` section 5.
+
+**`filter_cancer_patients_inplace(dry_run=True)`** reports exactly what it would
+delete, writes the full list to `{manifest}.dryrun`, and deletes nothing. One
+`if` around the unlink, so the plan and the deletion are one code path.
+
+**Three paths COUNT rather than raise, and the distinction is not arbitrary.** A
+missing file or package is a CONFIGURATION defect: one command fixes it and
+every run afterwards is correct, so raising costs one run and fixes the class.
+An unparseable trial age bound or an unrecognised lab unit is third-party DATA —
+there is no operator action that would fix ClinicalTrials.gov — and raising
+would convert a per-trial degradation into a per-patient outage. Those get the
+counters this file asked for; see the three CLOSED rows below.
+
+**Two guards were added that no row here asked for**, because the sweep that
+produced this file can only see `except` clauses:
+
+- the ICD-10 build raises when the package **imports and yields no primary
+  codes**. A release whose chapter-2 categories moved produces exactly the three
+  empty sets the missing-package path produced, with the import succeeding, so
+  neither the old handler nor the new raise could see it on its own. Its first
+  form (`if not primary:`) could never fire — `_ICD10_SEED_PRIMARY` seeds `C97`
+  unconditionally — and the negative control in File 48 is what found that, not
+  reading;
+- `require_intact_registry()` refuses an object that does not report
+  `degraded_layers` at all. "Cannot tell" is not "is fine", and only one of the
+  two may proceed to delete.
+
+**Covered by** `48- Degraded Dependency Test.py` — 170 assertions, no network,
+no key, no corpus written to. Every raise is demonstrated to fire with the file
+or package absent **and** demonstrated not to fire with it present; the dry run
+is demonstrated against a copy of a real cohort with a real run on an identical
+second copy as the control.
+
+---
+
 ## Silent handlers, one by one
 
 Every `SILENT` row above, with a verdict. Three are in the production
@@ -253,8 +337,8 @@ inference path; the rest are in tooling, dashboards, or tests.
 
 | Location | What it swallows | Verdict |
 |---|---|---|
-| `13- LangGraph Agent.py:1941` | `(IndexError, ValueError)` from parsing a trial's `min_age` / `max_age`; `pass` keeps the trial | **Open — highest priority.** A trial with unparseable age bounds silently skips the age filter and can reach GPT-4o for a patient outside its range. The direction is safe (false-eligible at pre-screening, not false-ineligible) but the rate is unknown. Needs an `age_parse_failed` counter on the same footing as `mesh_dropped`. Not changed by item 11b. |
-| `13- LangGraph Agent.py:3660` | any `Exception` in `_normalize_lab_unit`; returns the original `(value, unit)` | **Open — low.** Value and unit stay paired, so nothing is mislabelled and the model still sees a self-consistent lab result — it just sees `4.5 10*9/L` where the conversion table would have given `4500 cells/µL`, and has to convert itself. No correctness break, but the rate at which the normalizer gives up is unknown. Needs a counter. |
+| `oncotriage/agent/filtering.py` (was `13- LangGraph Agent.py:1941`) | `(IndexError, ValueError)` from parsing a trial's `min_age` / `max_age`; the trial is kept and the age check is skipped for it | **CLOSED by item 11a.** The recovery is deliberately unchanged — the trial is still kept, because the failing string comes from ClinicalTrials.gov and raising would abort a whole patient's pipeline over one of 75 retrieved trials, with no operator action that would fix it. What changed is that it is no longer SILENT: `_parse_age_bound()` records `AGE_PARSE_FAILURES[f"{bound}:{ExcType}:{text}"]` (module-level, the `PARTIAL_DATE_DEGRADATIONS` pattern), the Stage 4 line prints `age UNPARSED N — age filter did not run for them` when non-zero, and the count is attributed PER BOUND, which the old single `try` around both parses could not do. Deliberately NOT a new key in the returned dict: the twelve characterization fixtures diff that dict. |
+| `oncotriage/agent/patient.py` (was `13- LangGraph Agent.py:3660`) | any `Exception` in `_normalize_lab_unit`; returns the original `(value, unit)` | **CLOSED by item 11a**, and the measurement corrected the question. There are **three** silent exits, not one, and counting them together would have buried the one that matters: `no_value_or_unit` (expected, harmless — a unitless score), `conversion_error` (this row's exception exit, now keyed with the exception TYPE), and `unconverted` — every rule consulted, none matched — which is the real gap the row was about. All three land in `LAB_UNIT_DEGRADATIONS` under their own key namespace; the `unconverted` keys name the lab AND the unit, because the fix is a new row in `_LAB_UNIT_CONVERSIONS` and that needs both. Still broad, still recovering: the docstring's "never raises" is a contract the Stage 5 prompt builder depends on. |
 | `13- LangGraph Agent.py:3364` | `ValueError` from `int()` on an ICD-10 block; returns `False` | **Acceptable.** A code whose positions 2–3 are not numeric is not in a relevant block by construction. No information is lost. |
 | `08- Cancer Code Registry.py:632` | `(ValueError, IndexError)` parsing an onset date; returns the sentinel `"9999-99-99"` | **Acceptable.** This is a sort key. The sentinel sorts unparseable dates last, which is the same treatment `onset == "unknown"` gets one line above. |
 | `02- Utility Functions.py:233` | any `Exception` from `get_collection()` in `resolve_qdrant_collection()` | **Acceptable.** The very next line prints `FAILED to resolve collection after N attempts`, so the fallback announces itself; only this one probe inside it is quiet. |
@@ -265,7 +349,7 @@ inference path; the rest are in tooling, dashboards, or tests.
 |---|---|---|
 | `02- Utility Functions.py:176` | `FileNotFoundError` while trying filename variants in `exec_chain` | **Acceptable.** This is the variant search itself; the `for/else` raises `FileNotFoundError` naming the file when every variant misses. |
 | `02- Utility Functions.py:398` | any `Exception` from `caffeinate` teardown | **Acceptable.** Best-effort teardown of an optional macOS convenience; `__enter__` already printed if caffeine was unavailable. |
-| `11- RAG Trial Indexer.py:172` | `(IndexError, ValueError)` parsing `minimumAge` at index time | **Open — low.** Mirror of the Stage 4 defect on the indexing side: a trial with an unparseable minimum age is kept rather than skipped. Same fix, an `age_parse_failed` counter in the scrape summary. |
+| `oncotriage/retrieval/indexer.py` (was `11- RAG Trial Indexer.py:172`) | `(IndexError, ValueError)` parsing `minimumAge` at index time | **CLOSED by item 11a.** `INDEX_AGE_PARSE_FAILURES` is incremented with the bound, the exception type and the (length-capped) raw text, and `scrape_trials()` prints the total in its summary when non-zero — where this row asked for it. Its own counter, NOT shared with the Stage 4 one: the two measure different populations at different times (every registered trial versus the ~75 retrieved for one patient), and one counter would sum them into a number that means neither. Recovery unchanged: the trial is indexed, because the paediatric-only skip could not be evaluated. |
 | `oncotriage/orchestration/airflow_manager.py` (was `24- Airflow Manager.py:89`, now line 205) | `ConnectionError` while polling the Airflow API during startup | **Acceptable.** This *is* the poll loop; the `for/else` prints `API Server did not respond within 30 seconds`. |
 | `25- Batch Runner.py:140`, `25:214`, `26- Ablation Study.py:188` | `OSError` unlinking a temp file after the write it belonged to already failed and printed | **Acceptable.** Cleanup of a temp file on an already-reported error path. |
 | `25- Batch Runner.py:184` | `(json.JSONDecodeError, OSError)` reading the results file; returns `[]` | **Open — low.** A corrupt results file is indistinguishable from an absent one, and the run restarts from empty. One print would separate them. |
@@ -294,7 +378,7 @@ than catching an error.
 | `13-` Stage 3, `apply_mesh_relevance_boost` | no trials / no patient trees / pan-cancer-only → boost skipped | yes, `boost_stats["path"]` is printed | partially — the path is printed but not stored per inference |
 | `13-` Stage 4, cancer site filter | filter not loaded / no patient trees / ablated → every trial kept | yes | **yes, as of 11b** (`mesh_filter_applied`) |
 | `13-` Stage 4, stage filter | `patient_stage is None` → filter skipped for the whole run | yes | no — `stage_dropped = 0` means both "checked, nothing to drop" and "never checked". Same defect class as `mesh_dropped`, unfixed. |
-| `13-` Stage 4, histology filter | `patient_histology` empty → filter skipped | no | no — same as above, and it does not even print. |
+| `13-` Stage 4, histology filter | `patient_histology` empty → filter skipped | no | no — same as above, and it does not even print. **Item 11a fixed the WORSE half of this row, which the row did not name:** `patient_histology` was computed INSIDE `if mesh_filter is not None:`, so it was empty for every patient of a run whose MeSH lookup files were absent — the histology filter was disabled by the absence of a file it never reads. It is computed unconditionally now. The `patient_histology` empty case itself (a patient whose displays carry no histology token) is still unrecorded and still open. |
 | `13-` Stage 4, sex filter | unparseable / absent `sex` → `"ALL"` assumed, trial kept | no | no |
 | `09-` MeSH filter, `is_cancer_relevant` | unmappable on either side → KEEP | by design, documented | no per-inference count of how many KEEPs were unmappable rather than matched |
 | `08-` `is_primary_cancer` | no coding recognized → display-term morphology layer | `logger.debug` | yes — `_CANCER_CLASSIFICATION_COUNTS["display_fallback"]` |
@@ -507,7 +591,7 @@ task.
 | `05- FHIR Clean Data.py` | 330 | `Exception` | RECORDED+LOGGED | `print(f" ERROR processing {patient_file.name}: {e}") \| error_patients.append(patient_file)` |
 | `06- FHIR Explore.py` | 165 | `Exception` | RECORDED+LOGGED | `errors += 1 \| if errors <= 5: # Only show first 5 errors print(f" Warning: Could not extract ID from...` |
 | `07- FHIR Parser.py` | 1357 | `Exception` | RECORDED+LOGGED | `errors.append({ 'file': str(fhir_file), 'error': str(e) }) \| print(f"Error parsing {fhir_file.name}:...` |
-| `08- Cancer Code Registry.py` | 359 | `ImportError` | LOGGED | `logger.error( "icd10-cm package not installed. Run: pip install icd10-cm\n" "ICD-10 layer will be em...` |
+| `08- Cancer Code Registry.py` | 359 | `ImportError` | **RE-RAISES as of item 11a** | was `logger.error(...)` + three empty sets. Now raises `settings.DegradedDependencyError` unless `ONCOTRIAGE_ALLOW_DEGRADED_REGISTRIES` is set; when it is, it logs at WARNING, records `REGISTRY_DEGRADATIONS[ICD10_LAYER]` and returns the empty sets plus the layer name. |
 | `08- Cancer Code Registry.py` | 392 | `ValueError` | RECORDED+LOGGED | `skipped["c_block_unparsed"] += 1 \| logger.debug(f"ICD-10 C-code with non-numeric block, skipped: {co...` |
 | `08- Cancer Code Registry.py` | 414 | `ValueError` | RECORDED+LOGGED | `skipped["d_block_unparsed"] += 1 \| logger.debug(f"ICD-10 D-code with non-numeric block, skipped: {co...` |
 | `08- Cancer Code Registry.py` | 632 | `(ValueError, IndexError)` | SILENT | `return "9999-99-99"` |

@@ -499,8 +499,16 @@ check_true("full expanded query yields BM25 terms",
 # ===========================================================================
 # Section A shows the tokenizer can return nothing. This shows Stage 1 can hand
 # it a text that does. _MESH_FILTER is None here, which is a real production
-# configuration (the MeSH data files are optional and load_mesh_filter()
-# returns None when they are absent), not a contrivance for the test.
+# configuration, not a contrivance for the test.
+#
+# HOW THAT None ARISES CHANGED IN ITEM 11a, and the sentence that used to be
+# here is now wrong: the MeSH data files were "optional" in the sense that
+# load_mesh_filter() printed a warning and returned None when they were absent.
+# It RAISES now unless ONCOTRIAGE_ALLOW_DEGRADED_REGISTRIES is set. None is
+# still reachable and still tested -- by that variable, and by the deps override
+# swap_deps() installs below, which is the route this file takes and which never
+# calls load_mesh_filter() at all. So these cases are unaffected; only the story
+# about where a production None comes from is.
 
 print("\n" + "=" * 75)
 print("SECTION B -- Stage 1 fallback produces an empty disease query")

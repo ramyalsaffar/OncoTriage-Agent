@@ -29,6 +29,7 @@ none of them.
 
 import hashlib
 import re
+from collections import Counter
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 from oncotriage.agent import deps
@@ -630,6 +631,51 @@ _LAB_UNIT_CONVERSIONS: Dict[Tuple[str, str], Tuple[str, Any]] = {
 }
 
 
+# ===========================================================================
+# LAB UNIT NORMALIZATION DEGRADATION RECORD (item 11a)
+# ===========================================================================
+#
+# `Exception and Fallback Audit.md` ranked _normalize_lab_unit's bare
+# `except Exception: pass` Open (low): "the rate at which the normalizer gives
+# up is unknown". Measured against the code, it gives up THREE ways, not one,
+# and only one of them is the thing that matters:
+#
+#   no_value_or_unit  value or unit is None, so there is nothing to convert.
+#                     Ordinary and expected — a qualitative observation, or a
+#                     unitless score. NOT a failure.
+#   conversion_error  float(value) or the conversion lambda raised. The value
+#                     looked convertible and was not. This is the exception exit.
+#   unconverted       every rule was consulted and none matched. THIS is the one
+#                     the audit was worried about: a real unit reached GPT-4o
+#                     unconverted, so the model sees "4.5 10*9/L" where a rule
+#                     would have given "4500 cells/µL" and has to do the
+#                     conversion itself against a threshold criterion.
+#
+# COUNTED SEPARATELY OR THE SIGNAL IS LOST. One counter over all three would be
+# dominated by no_value_or_unit — the common, harmless case — and the number
+# that matters would be invisible inside it. Three key namespaces in one
+# Counter, following PARTIAL_DATE_DEGRADATIONS' `out_of_range:{precision}`
+# shape, which is the same "one Counter, self-describing keys" pattern.
+#
+# The `unconverted` keys name the LAB AND THE UNIT, because a fix means adding
+# a row to _LAB_UNIT_CONVERSIONS and that row needs both. The other two name the
+# lab only.
+#
+# NOT a new key in anything the pipeline returns: the twelve characterization
+# fixtures diff the pipeline's output field by field.
+#
+# THIS COUNTS RATHER THAN RAISES, for the reason argued at
+# AGE_PARSE_FAILURES: an unrecognised unit is third-party data, the recovery is
+# correct (value and unit stay paired, so nothing is mislabelled), and aborting
+# a patient's evaluation over one lab row would trade a small, safe degradation
+# for a total one.
+LAB_UNIT_DEGRADATIONS = Counter()
+
+LAB_UNIT_NO_VALUE_OR_UNIT = "no_value_or_unit"
+LAB_UNIT_CONVERSION_ERROR = "conversion_error"
+LAB_UNIT_UNCONVERTED = "unconverted"
+
+
 def _normalize_lab_unit(
     canonical_display: str,
     value: Any,
@@ -639,17 +685,56 @@ def _normalize_lab_unit(
     Normalize a lab value+unit to canonical US clinical units if a conversion
     exists in _LAB_UNIT_CONVERSIONS. Returns original (value, unit) otherwise.
     Never raises.
+
+    Every exit that does NOT convert is recorded in LAB_UNIT_DEGRADATIONS under
+    its own key namespace — see the block above for why all three are counted
+    and why they are counted apart. The returned values are unchanged from
+    before item 11a on every one of the four paths.
     """
-    if value is None or unit is None:
+    # OUTSIDE the try, and coerced rather than assumed. It used to be the first
+    # statement INSIDE the try, so a non-string canonical_display raised
+    # AttributeError there and was swallowed into "return the original". Moving
+    # it out would have turned that swallow into a raise out of a function whose
+    # contract is "never raises", so it is coerced with str() instead — the same
+    # outcome as before for every caller, and no new way to fail.
+    display_key = str(canonical_display or "").lower().strip()
+
+    if value is None or unit is None or not str(unit).strip():
+        # AN EMPTY-STRING UNIT COUNTS HERE, NOT AS "unconverted", and getting
+        # that wrong would have made the whole counter useless. _create_patient_summary
+        # calls this with `obs.get("unit") or ""`, so a unit-less observation
+        # arrives as "" and never as None — every one of them would have landed
+        # in the `unconverted` bucket, which is supposed to mean "a real unit
+        # this table does not know reached the judge". The common harmless case
+        # would then have swamped the one number the audit asked for, which is
+        # the exact failure the item's "count them separately or the signal is
+        # lost" warns about.
+        #
+        # RETURN VALUE UNCHANGED: an empty unit fell through every rule before
+        # and was returned as-is, and it still is.
+        LAB_UNIT_DEGRADATIONS[f"{LAB_UNIT_NO_VALUE_OR_UNIT}:{display_key}"] += 1
         return value, unit
     try:
-        display_key = canonical_display.lower().strip()
         unit_key    = unit.lower().strip().replace(" ", "")
         for (disp, u), (target_unit, convert_fn) in _LAB_UNIT_CONVERSIONS.items():
             if disp in display_key and u == unit_key:
                 return convert_fn(float(value)), target_unit
-    except Exception:
-        pass
+    except Exception as exc:
+        # STILL BROAD, and still recovering — the docstring's "never raises" is
+        # a contract Stage 5's prompt builder depends on. What changed is that
+        # it is no longer silent: the exception TYPE is in the key, because a
+        # ValueError from float("N/A") and a TypeError from a list value are
+        # different data problems.
+        LAB_UNIT_DEGRADATIONS[
+            f"{LAB_UNIT_CONVERSION_ERROR}:{display_key}:{type(exc).__name__}"
+        ] += 1
+        return value, unit
+
+    # Fell through every rule: a unit this table does not know reaches the judge
+    # as it was recorded. The one exit of the three that is a genuine gap.
+    LAB_UNIT_DEGRADATIONS[
+        f"{LAB_UNIT_UNCONVERTED}:{display_key}:{unit.lower().strip()}"
+    ] += 1
     return value, unit
 
 

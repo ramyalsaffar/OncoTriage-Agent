@@ -24,14 +24,14 @@ Two of those eight keep one re-exported name each, and both are load-bearing:
 
 | Module | Holds | Imports |
 |---|---|---|
-| `oncotriage/settings.py` | `ENV_*` names, `resolve_*_path()` | nothing from the project |
+| `oncotriage/settings.py` | `ENV_*` names, `resolve_*_path()`, `DegradedDependencyError` + `resolve_allow_degraded_registries()` (item 11a) | nothing from the project |
 | `oncotriage/paths.py` | `IS_DOCKER`, `_glob_one`, every path variable (**lazy**), `load_env_keys()` | `settings` |
 | `oncotriage/constants.py` | `SYSTEM_KEY_ABSENT` / `SYSTEM_KEY_UNRECOGNIZED` | nothing at all |
 | `oncotriage/config.py` | every tunable, `PRICING_CONFIG`, `DATA_SNAPSHOT_DATE`, lazy client factories | `paths` |
 | `oncotriage/utils.py` | `get_model_cost`, `qdrant_retry`, `resolve_qdrant_collection`, `parse_partial_date`, `get_age_reference_date`, `exec_chain`, `CaffeinateSession` | `config` |
 | `oncotriage/embedding.py` | **the one** `SparseTextEmbedding("Qdrant/bm25")` construction site — `get_bm25_sparse_model`, `BM25_SPARSE_MODEL_NAME` | nothing from the project |
-| `oncotriage/registries/cancer_code_registry.py` | File 08 whole — `CancerCodeRegistry`, `OncologyLabRegistry`, `load_registry`, `load_lab_registry` | `constants` |
-| `oncotriage/registries/mesh.py` | File 09's filter half — `MeSHCancerFilter`, `load_mesh_filter`, `specific_cancer_trees` | `paths` |
+| `oncotriage/registries/cancer_code_registry.py` | File 08 whole — `CancerCodeRegistry`, `OncologyLabRegistry`, `load_registry`, `load_lab_registry`, `REGISTRY_DEGRADATIONS` | `constants`, `settings` |
+| `oncotriage/registries/mesh.py` | File 09's filter half — `MeSHCancerFilter`, `load_mesh_filter`, `specific_cancer_trees`, `MESH_FILTER_DEGRADATIONS` | `paths`, `settings` |
 | `oncotriage/registries/mesh_crosswalk_build.py` | File 09's five offline builders | nothing from the project |
 | `oncotriage/extraction/negation.py` | `_is_negated` + the three constants only it reads | nothing from the project |
 | `oncotriage/extraction/stage.py` | File 10 to line 698 — stage requirements | `extraction.negation` |
@@ -263,6 +263,7 @@ python "04- FHIR Generate Data.py"                   # Synthea JAR -> ~22k patie
 python "04- FHIR Generate Data.py" --population 3000 --seed 1 --output-dir <scratch>
 python "04- FHIR Generate Data.py" --module-only     # rewrite the ECOG module, no generation
 python "05- FHIR Clean Data.py"                      # in-place DELETE of non-cancer patients
+python "05- FHIR Clean Data.py" --dry-run            # report what it would delete, delete nothing
 python "11- RAG Trial Indexer.py" --mode staging     # staging + atomic alias swap (default)
 python "11- RAG Trial Indexer.py" --mode direct      # rebuilds in place, causes downtime
 python "12- RAG Trial Indexer Validator.py"          # exit 1 on any CRITICAL check failure
@@ -290,8 +291,17 @@ docker compose logs -f fastapi
 ```bash
 python "39- ECOG Performance Status Surfacing Test.py"   # needs the scratch corpus from 04-
 python "47- Package Split Test.py"                       # no network, no keys, no corpus; ~30s
+python "48- Degraded Dependency Test.py"                 # item 11a; no network, no keys; ~40s
 pip install -e .                                         # makes `oncotriage` importable anywhere
 ```
+
+**File 48 is NOT in `run_serial_tests.py`, deliberately.** It edits no file in
+the repository: every degraded state it produces comes from shadowing a cached
+module attribute (`paths._RESOLVED`, `clean._RESOLVED`) or planting a module in
+`sys.modules`, each restored in a `finally`. It copies real patient bundles into
+a scratch directory and operates only on the copy, and it asserts the production
+corpus file count is unchanged at the end. So it collides with nothing and can
+run beside anything.
 
 **Files 42, 43, 44 and 47 cannot run concurrently, and that is now a mechanism
 rather than a warning (pass 20c-3b).**
@@ -358,6 +368,12 @@ Only `03- Code/` is version-controlled. Sibling directories under the project ro
 | `keys_path` | `05- Keys/.env` | `OPENAI_API_KEY`, `QDRANT_URL`, `QDRANT_API_KEY` |
 | `checkpoint_path` | `08- Checkpoint/` | batch runner resume state |
 | `requirements_path` | `07- Requirements/requirements.txt` | pip deps (copied into Dockerfile) |
+
+`ONCOTRIAGE_ALLOW_DEGRADED_REGISTRIES` permits a run to continue with the MeSH
+site-relevance layer or the ICD-10-CM layer ABSENT rather than raising; it is
+named in `oncotriage/settings.py`, does **not** go through `_from_env`, and does
+**not** reach `oncotriage/fhir/clean.py`'s deletion path. See "Degraded
+dependencies (item 11a)" below.
 
 `ONCOTRIAGE_INFERENCES_DB` overrides `inferences_path` for **both** database writers (`resolve_inference_db_path`, `resolve_drift_db_path`) and is the only way to redirect a running FastAPI server; it is named in `oncotriage/settings.py` and does **not** go through `_from_env`. See the Tests paragraph above for what it is for and why the helper would corrupt it.
 
@@ -613,6 +629,121 @@ The three new sections: **2h** (nothing is declared and never read — see the m
 **Degradation record.** A run that lost a retrieval channel, fell back to the un-expanded query, or skipped the cancer site filter must be identifiable from its stored row alone. The relevant state keys are written by the stage that owns them, carried to all three terminal nodes by `_pipeline_provenance()` (file 13), and logged to `inferences.retrieval_channels` / `retrieval_degraded` / `retrieval_trials_lost` / `query_expansion_path` / `mesh_filter_applied` / `mesh_filter_skip_reason`. **NULL in these columns means the stage never reported and is not the same as a clean value** — never default them to 0 in a new writer or fold NULL into 0 in a reader. Stage 5's Section 2 is conditional on `mesh_filter_applied`: it only asserts to the model that disease relevance was confirmed when the filter actually ran.
 
 **Age reference date.** Patient age is computed against `DATA_SNAPSHOT_DATE` (`oncotriage/config.py`, re-exported by 03), never `datetime.now()`, and so is the Stage 5 prompt's RULE 4 "Reference date" — a clock-derived age changes the prompt while `compute_patient_hash` (which keys on `birth_date`) cannot see it. `parse_partial_date()` / `get_age_reference_date()` live in `oncotriage/utils.py`; `get_age_reference_date()` resolves the constant through `oncotriage.config` and **raises** rather than falling back to `today()`, and `44- Snapshot Date Rot Test.py` rewrites that literal in `oncotriage/config.py` — not in File 03, which only re-exports it; `birthDate` may legally be `YYYY`, `YYYY-MM`, `YYYY-MM-DD` or a full ISO datetime, and missing components are filled from a mid-range anchor with the shape recorded as `inferences.birth_date_precision` (same NULL semantics as above). Race and ethnicity are read from the US Core extensions **by sub-extension url** (`ombCategory` → `detailed` → `text`), never by array position. `Exception and Fallback Audit.md` inventories every `except` and fallback in the codebase with a verdict and the open items.
+
+## Degraded dependencies (item 11a)
+
+**Two detection layers could DISAPPEAR without anything failing, and both now
+raise.** Item 11b was about a stage that failed and left no trace; this is about
+a layer that was never there and left no trace, which is worse because nothing
+failed at all — the pipeline ran, produced matches, and every downstream number
+was computed as though the missing layer had agreed.
+
+| Layer | Was | Is |
+|---|---|---|
+| `registries/mesh.py:load_mesh_filter()` | printed a warning, returned `None`; Stage 4's cancer site filter never ran and **every trial passed it for the whole run** | raises `settings.DegradedDependencyError` naming both missing JSON files and `python "09- MeSH Cancer Site Relevance Filter.py"` |
+| `registries/cancer_code_registry.py:_build_icd10_cancer_sets()` | caught `ImportError`, `logger.error`, returned **three empty sets** while `CancerCodeRegistry` logged "ready" | raises, naming the package and `pip install icd10-cm` |
+
+**`None` IS STILL A REACHABLE STATE and every branch handling it is real and
+tested.** Stage 4 records four distinct skip reasons, and `37- Retrieval
+Observability Test.py` installs `deps.set_override(deps.MESH_FILTER, None)` to
+exercise one. What changed is that the state can no longer be CREATED SILENTLY
+from missing files: it arrives from an override, or from an operator who set the
+variable below. `deps.get_mesh_filter()`'s docstring says so.
+
+**`ONCOTRIAGE_ALLOW_DEGRADED_REGISTRIES` is the one opt-out**, named in
+`oncotriage/settings.py` beside the other `ONCOTRIAGE_*` names and **deliberately
+not routed through `_from_env`** — that helper appends a trailing separator, so
+`=1` would come back `"1/"` and the flag could never match again. Same reasoning
+as `resolve_airflow_password` and `resolve_inferences_db`, third victim. Set, the
+run continues, logs at WARNING naming exactly which layer is absent and which
+variable permitted it, and records it in a module-level counter
+(`mesh.MESH_FILTER_DEGRADATIONS`, `cancer_code_registry.REGISTRY_DEGRADATIONS`);
+per inference the MeSH case is already recorded by item 11b in
+`mesh_filter_skip_reason`, so there is no new column and no new field. An
+unrecognised value **raises** rather than being read as "off": a switch that
+decides whether a missing layer may be tolerated must not itself be tolerant of
+a value nobody meant.
+
+**THE OPT-OUT DOES NOT REACH THE DELETION PATH, and that exemption is the point.**
+`oncotriage/fhir/clean.py:require_intact_registry()` runs before anything is
+scanned and refuses a degraded registry **whatever the variable says**, because
+`filter_cancer_patients_inplace()` unlinks patient bundles on
+`is_primary_cancer()` verdicts. A degraded registry there means a missing pip
+package deletes the dataset, and it is wrong in BOTH directions at once:
+ICD-10-coded cancers stop being recognised and are deleted as non-cancer, and
+the D00-D49 / C77-C79 exclusion sets stop rejecting, so in-situ and
+metastatic-only records can be admitted by the display-term fallback. It also
+refuses an object that does not report `degraded_layers` at all — "cannot tell"
+is not "is fine", and only one of the two may proceed to delete. Demonstrated
+with the variable SET (File 48 section 5).
+
+**`filter_cancer_patients_inplace(dry_run=True)`** scans and plans exactly as
+usual, writes the full list to `{manifest_path()}.dryrun` and unlinks nothing.
+A **PARAMETER, not a new exported helper**: File 47 section 5 pins the File 05
+shim's surface at fourteen names, and a plan produced by a second implementation
+is a plan that can disagree with the deletion. One `if` around the unlink;
+everything else — the plan, the manifest shape, the flush interval, the phase
+status — is the same code. Reachable as `python "05- FHIR Clean Data.py" --dry-run`
+(argparse inside the `__main__` block, so no name leaks into the exec namespace).
+
+**THREE PATHS COUNT RATHER THAN RAISE, and the line is not arbitrary.** A missing
+file or package is a CONFIGURATION defect: one command fixes it and every run
+afterwards is correct, so raising costs one run and fixes the class. An
+unparseable trial age bound or an unrecognised lab unit is third-party DATA —
+there is no operator action that would fix ClinicalTrials.gov — and raising
+would turn a per-trial degradation into a per-patient outage.
+
+- `agent/filtering.py:AGE_PARSE_FAILURES` — the `Exception and Fallback Audit.md`
+  row ranked **Open, highest priority**. Recovery unchanged (the trial is kept,
+  the age check is skipped for it), now recorded per bound with the exception
+  type and the text, and printed in the Stage 4 line as `age UNPARSED N`.
+- `retrieval/indexer.py:INDEX_AGE_PARSE_FAILURES` — the index-time mirror,
+  printed in the scrape summary. **Its own counter, not shared with Stage 4's:**
+  the two measure different populations at different times (every registered
+  trial versus the ~75 retrieved for one patient) and one counter would sum them
+  into a number that means neither.
+- `agent/patient.py:LAB_UNIT_DEGRADATIONS` — `_normalize_lab_unit` has **three**
+  silent exits, not one, and counting them together would bury the one that
+  matters: `no_value_or_unit` (expected and harmless), `conversion_error` (the
+  exception exit, keyed with the exception type), and `unconverted` — every rule
+  consulted, none matched — which is the real gap. The `unconverted` keys name
+  the lab AND the unit, because the fix is a new row in `_LAB_UNIT_CONVERSIONS`.
+
+All four counters are **module-level**, following `PARTIAL_DATE_DEGRADATIONS` in
+`oncotriage/utils.py`, and **none is a new key in the Stage 4 result dict**: the
+twelve characterization fixtures diff that dict field by field, and a new field
+means recapturing all twelve at GPT-4o prices for something no stage reads.
+File 48 pins the dict's exact key set.
+
+**HISTOLOGY IS COMPUTED UNCONDITIONALLY, and that is a real behaviour change on
+the degraded path.** `extract_patient_histology(conditions)` sat INSIDE
+`if mesh_filter is not None:`, so a missing MeSH lookup file disabled the
+histology filter — a filter that reads no MeSH data and resolves no tree numbers
+— and `histology_dropped` came back 0, which is also what "checked, nothing to
+drop" looks like. With no MeSH filter, trials whose histology contradicts the
+patient's are now DROPPED instead of reaching GPT-4o. On the normal path nothing
+changes at all, which is why all twelve fixtures (every one captured with a
+filter loaded) replay clean without recapture.
+
+**Two guards were added that the exception audit could not have asked for**,
+because its AST sweep only sees `except` clauses:
+
+- the ICD-10 build raises when the package **imports and yields no primary
+  codes**. A release whose chapter-2 categories moved produces exactly the three
+  empty sets the missing-package path produced, with the import succeeding.
+  Its first form was `if not primary:` and **could never fire** —
+  `_ICD10_SEED_PRIMARY` seeds `C97` unconditionally, so `primary` is `{"C97"}`
+  even when the release contributed nothing. It asks `derived_primary_count`,
+  captured before the seed. **The negative control in File 48 found that, not
+  reading**, which is the argument for controls restated as an event.
+- `require_intact_registry()` refuses a registry that cannot report its own
+  state, as above.
+
+`48- Degraded Dependency Test.py` is the demonstration: 170 assertions, every
+raise shown to fire with the thing absent **and** shown not to fire with it
+present, the dry run shown against a copy of a real cohort with a real run on an
+identical second copy as the control, and the pre-11a histology shape
+reconstructed in an AST copy so the structural check has something to fail on.
 
 ## Conventions
 

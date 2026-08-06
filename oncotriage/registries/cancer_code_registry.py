@@ -75,9 +75,10 @@ Works with: Synthea FHIR bundles (SNOMED) + real EHR data (ICD-10)
 
 import logging
 import threading
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
+from oncotriage import settings
 from oncotriage.constants import SYSTEM_KEY_ABSENT, SYSTEM_KEY_UNRECOGNIZED
 
 
@@ -134,6 +135,28 @@ Usage:
 """
 
 logger = logging.getLogger(__name__)
+
+
+# ===========================================================================
+# DEGRADATION RECORD (item 11a)
+# ===========================================================================
+#
+# Module-level, following PARTIAL_DATE_DEGRADATIONS in oncotriage/utils.py, and
+# deliberately NOT a new key in _CANCER_CLASSIFICATION_COUNTS: that dict is a
+# per-CONDITION decision tally whose keys several tests enumerate, and "the
+# ICD-10 layer was never built" is a per-PROCESS fact about the registry, not a
+# verdict on a condition. Mixing the two would make every classification
+# counter's denominator ambiguous.
+#
+# Keyed by layer name, which is the same string the DegradedDependencyError
+# carries as `.layer` and the same string CancerCodeRegistry.degraded_layers
+# reports, so a run that raised, a run that degraded and a registry object
+# holding the result all name the failure identically.
+REGISTRY_DEGRADATIONS = Counter()
+
+ICD10_LAYER = "icd10_cancer_codes"
+"""The ICD-10-CM detection layer: 1,600+ primary codes plus the secondary and
+non-invasive exclusion sets, built from the icd10-cm release."""
 
 
 # ===========================================================================
@@ -491,7 +514,7 @@ _ICD10_D_NEOPLASM_BLOCK_MAX = 49   # D00-D49 is the rest of chapter 2;
                                    # D50+ is chapter 3 (blood/immune)
 
 
-def _build_icd10_cancer_sets() -> Tuple[Set[str], Set[str], Set[str]]:
+def _build_icd10_cancer_sets() -> Tuple[Set[str], Set[str], Set[str], Tuple[str, ...]]:
     """
     Build ICD-10-CM primary, secondary and non-invasive code sets from the
     full icd10-cm 2024 release (95,622 codes, no external API).
@@ -540,17 +563,65 @@ def _build_icd10_cancer_sets() -> Tuple[Set[str], Set[str], Set[str]]:
                   DECISION: EXCLUDED, same reasoning as D37-D48.
 
     Returns:
-        (primary, secondary, non_invasive) — raw, dot-formatted code strings.
-        All three are empty when the icd10-cm package is missing.
+        (primary, secondary, non_invasive, degraded_layers) — the first three
+        raw, dot-formatted code strings; the fourth a tuple naming any layer
+        that could not be built. It is EMPTY on the normal path and holds
+        ICD10_LAYER when degraded mode was permitted and the package is absent.
+
+        The fourth element is why this is a 4-tuple as of item 11a. The caller
+        needs to know the sets are empty BECAUSE the layer is gone, and the sets
+        themselves cannot say so: an empty primary set is exactly what a present
+        but broken release would also produce, and inferring "degraded" from
+        emptiness is the degenerate-value trap this project's testing rules name
+        explicitly. Nothing outside this module calls this function — checked
+        across every .py in the tree — so widening the tuple costs nothing.
+
+    Raises:
+        settings.DegradedDependencyError: the icd10-cm package is absent and the
+            degraded-mode variable is not set. It USED TO catch the ImportError,
+            call logger.error and return three empty sets, so a machine that had
+            simply not run `pip install icd10-cm` lost the entire real-EHR
+            detection path while CancerCodeRegistry went on logging "ready".
     """
+    # THE OPT-OUT IS CONSULTED ONLY WHERE A DEGRADATION IS ACTUALLY FOUND, in
+    # both branches below and nowhere else. It was read once at the top of this
+    # function in the first draft, which meant a typo in an unrelated shell
+    # export — resolve_allow_degraded_registries() raises on a value that is
+    # neither on nor off — took down every registry build on a machine where
+    # nothing was degraded at all. It also disagreed with
+    # registries/mesh.py:load_mesh_filter(), which reads it inside its
+    # missing-file branch. The variable's only meaning is "may THIS degradation
+    # be tolerated"; with nothing degraded there is nothing to ask about.
     try:
         import icd10
-    except ImportError:
-        logger.error(
-            "icd10-cm package not installed. Run: pip install icd10-cm\n"
-            "ICD-10 layer will be empty; only SNOMED and display fallback active."
+    except ImportError as exc:
+        allowed, source = settings.resolve_allow_degraded_registries()
+        what_is_missing = (
+            f"the icd10-cm package is not installed ({exc}).\n"
+            "  Without it the ICD-10-CM detection layer is EMPTY: 1,600+ "
+            "primary codes,\n"
+            "  plus the C77-C79 secondary and D00-D49 non-invasive EXCLUSION "
+            "sets, all gone.\n"
+            "  Only SNOMED exact match and the display-term fallback remain, "
+            "and the\n"
+            "  display fallback fires more often precisely because fewer codes "
+            "are recognised."
         )
-        return set(), set(), set()
+        how_to_fix = "pip install icd10-cm"
+
+        if not allowed:
+            raise settings.degraded_dependency_error(
+                ICD10_LAYER, what_is_missing, how_to_fix) from exc
+
+        REGISTRY_DEGRADATIONS[ICD10_LAYER] += 1
+        logger.warning(
+            "DEGRADED: the %r layer is ABSENT — no ICD-10-CM code will be "
+            "classified, in EITHER direction: neither admitted as a primary "
+            "cancer nor excluded as secondary/non-invasive. Permitted by %s. "
+            "Supply it with: %s",
+            ICD10_LAYER, source, how_to_fix,
+        )
+        return set(), set(), set(), (ICD10_LAYER,)
 
     primary: Set[str] = set()
     secondary: Set[str] = set()
@@ -612,6 +683,21 @@ def _build_icd10_cancer_sets() -> Tuple[Set[str], Set[str], Set[str]]:
             else:
                 skipped["d_outside_chapter2"] += 1
 
+    # HOW MANY CODES THE RELEASE ITSELF SUPPLIED, captured BEFORE the seed.
+    #
+    # This line exists because the emptiness guard at the end of the function
+    # was written against `primary` and could therefore never fire: the seed
+    # below adds C97 unconditionally when it is absent, so `primary` is
+    # {"C97"} even when the installed release contributed nothing at all. The
+    # guard would have passed on an empty release forever, which is exactly the
+    # vacuous-assertion failure the project's testing rules name -- and it was
+    # caught by the negative control in "48- Degraded Dependency Test.py"
+    # (a stand-in icd10 module with `codes = []`), not by reading.
+    #
+    # The guard asks about the RELEASE. A hand-seeded code says nothing about
+    # whether the package's table is intact.
+    derived_primary_count = len(primary)
+
     # Seed codes the package's table omits. Logged either way so a future
     # package release that adds them is visible rather than silently absorbed.
     seeded = {s for s in _ICD10_SEED_PRIMARY
@@ -639,7 +725,45 @@ def _build_icd10_cancer_sets() -> Tuple[Set[str], Set[str], Set[str]]:
         logger.warning(f"ICD-10-CM codes assigned to no set: {unexpected}")
     logger.debug(f"ICD-10-CM non-neoplasm D-codes ignored: {skipped['d_outside_chapter2']}")
 
-    return primary, secondary, non_invasive
+    # THE PACKAGE IMPORTED AND STILL YIELDED NOTHING (item 11a). This is the
+    # non-degeneracy guard, and it is not hypothetical padding: `icd10.codes`
+    # is a table the package builds, and a release whose table is empty, or one
+    # whose C/D categories moved, produces exactly the same three empty sets the
+    # missing-package path used to produce — with the import succeeding, so
+    # neither the old `except ImportError` nor the new raise above would see it.
+    # An empty layer must fail the same way whether the cause was a missing
+    # package or a present one that answered with nothing.
+    if not derived_primary_count:
+        what_is_missing = (
+            f"the icd10-cm package imported, but yielded NO primary cancer "
+            f"codes.\n"
+            f"  Read {len(icd10.codes):,} codes from the installed release and "
+            f"assigned 0 to the\n"
+            f"  primary set, {len(secondary):,} to secondary and "
+            f"{len(non_invasive):,} to non-invasive. A release whose\n"
+            f"  chapter-2 categories no longer match this file's block "
+            f"boundaries looks exactly\n"
+            f"  like a package that was never installed, except that the "
+            f"import succeeded."
+        )
+        how_to_fix = ('pip install --force-reinstall icd10-cm, then run '
+                      'python "42- Cancer Code Registry Audit Test.py"')
+
+        allowed, source = settings.resolve_allow_degraded_registries()
+        if not allowed:
+            raise settings.degraded_dependency_error(
+                ICD10_LAYER, what_is_missing, how_to_fix)
+
+        REGISTRY_DEGRADATIONS[ICD10_LAYER] += 1
+        logger.warning(
+            "DEGRADED: the %r layer built EMPTY from an installed release — "
+            "no ICD-10-CM code will be classified in either direction. "
+            "Permitted by %s. %s",
+            ICD10_LAYER, source, how_to_fix,
+        )
+        return primary, secondary, non_invasive, (ICD10_LAYER,)
+
+    return primary, secondary, non_invasive, ()
 
 
 class CancerCodeRegistry:
@@ -649,12 +773,25 @@ class CancerCodeRegistry:
     Identifies the primary cancer diagnosis from a FHIR condition list using
     a three-layer detection system: SNOMED → ICD-10-CM → display fallback.
     Secondary/metastatic codes are excluded at every layer.
+
+    ``degraded_layers`` (item 11a) names any detection layer that is ABSENT
+    from this instance. It is an empty tuple on the normal path, and holds
+    ICD10_LAYER only when ONCOTRIAGE_ALLOW_DEGRADED_REGISTRIES permitted the
+    registry to be built without it. It is an ATTRIBUTE rather than a module
+    global because it describes THIS registry: a process can hold a full one
+    from load_registry() and a deliberately-degraded one built directly by a
+    test at the same time, and a caller deciding whether to trust a
+    classification has to ask the object it classified with. That is exactly
+    what ``oncotriage/fhir/clean.py`` does before it unlinks anything.
     """
 
     def __init__(self):
         (icd10_primary_raw,
          icd10_secondary_raw,
-         icd10_non_invasive_raw) = _build_icd10_cancer_sets()
+         icd10_non_invasive_raw,
+         degraded_layers) = _build_icd10_cancer_sets()
+
+        self.degraded_layers: Tuple[str, ...] = tuple(degraded_layers)
 
         self.snomed_primary: FrozenSet[str] = _SNOMED_PRIMARY
         self.snomed_secondary: FrozenSet[str] = _SNOMED_SECONDARY
@@ -676,11 +813,26 @@ class CancerCodeRegistry:
             c.upper().replace(".", "") for c in icd10_non_invasive_raw
         )
 
-        logger.info(
-            f"CancerCodeRegistry ready: {len(self.snomed_primary)} SNOMED + "
-            f"{len(self._icd10_primary_norm)} ICD-10-CM primary codes indexed "
-            f"({len(self._icd10_non_invasive_norm)} non-invasive codes rejected)."
-        )
+        # "ready" is no longer said unconditionally. Before item 11a this line
+        # printed the same word whether the ICD-10 layer held 1,609 codes or
+        # zero, so the log of a registry that had lost its whole real-EHR
+        # detection path was indistinguishable from a healthy one except by
+        # reading the number.
+        if self.degraded_layers:
+            logger.warning(
+                f"CancerCodeRegistry ready DEGRADED — layer(s) absent: "
+                f"{', '.join(self.degraded_layers)}. "
+                f"{len(self.snomed_primary)} SNOMED primary codes indexed, "
+                f"{len(self._icd10_primary_norm)} ICD-10-CM. Classifications "
+                f"from this registry rest on SNOMED and the display-term "
+                f"fallback alone."
+            )
+        else:
+            logger.info(
+                f"CancerCodeRegistry ready: {len(self.snomed_primary)} SNOMED + "
+                f"{len(self._icd10_primary_norm)} ICD-10-CM primary codes indexed "
+                f"({len(self._icd10_non_invasive_norm)} non-invasive codes rejected)."
+            )
 
 
     def is_primary_cancer(self, condition: Dict) -> bool:

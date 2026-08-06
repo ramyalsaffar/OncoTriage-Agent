@@ -108,6 +108,60 @@ because that is the case sqlite cannot recover from and the one that would
 otherwise be swallowed by ``log_inference``'s broad except.
 """
 
+ENV_ALLOW_DEGRADED_REGISTRIES = "ONCOTRIAGE_ALLOW_DEGRADED_REGISTRIES"
+"""Permit the pipeline to run with a detection layer MISSING rather than raise.
+
+NOT A PATH, which is why it is resolved by its own function below rather than
+by ``_from_env``: that helper runs every value through ``with_trailing_sep``,
+so ``ONCOTRIAGE_ALLOW_DEGRADED_REGISTRIES=1`` would come back as ``"1/"`` and
+never compare equal to ``"1"`` again. The switch would then be permanently off
+however it was set, which is the quiet direction -- a run that was meant to be
+allowed to degrade would instead raise, and the operator would have no way to
+tell the variable from a typo. Same reasoning as ENV_AIRFLOW_PASSWORD and
+ENV_INFERENCES_DB, third victim.
+
+ADDED BY ITEM 11a. Two layers of this pipeline could DISAPPEAR without anything
+failing, and both were measured rather than supposed:
+
+  * ``registries/mesh.py:load_mesh_filter()`` printed a warning and returned
+    None when ``mesh_c04_lookup.json`` / ``mesh_tree_to_name.json`` were
+    absent. Stage 4's cancer site filter then keeps every trial, and
+    ``oncotriage/agent/deps.py`` documented that None as legitimate.
+  * ``registries/cancer_code_registry.py:_build_icd10_cancer_sets()`` caught
+    ImportError on ``icd10``, called ``logger.error`` and returned three EMPTY
+    sets. The registry then logged "CancerCodeRegistry ready" and went on
+    classifying with SNOMED and the display-term fallback only -- 1,600+
+    ICD-10-CM primary codes silently gone, on a corpus whose real-EHR path is
+    exactly the ICD-10 one.
+
+Both now RAISE ``DegradedDependencyError`` by default, naming the missing file
+or package and the command that supplies it. This variable is the documented
+way to run anyway: the run continues, a WARNING names exactly which layer is
+absent, and the degradation is recorded (``mesh.MESH_FILTER_DEGRADATIONS`` /
+``cancer_code_registry.REGISTRY_DEGRADATIONS``, and per inference in the
+existing ``mesh_filter_skip_reason`` column for the MeSH case).
+
+    export ONCOTRIAGE_ALLOW_DEGRADED_REGISTRIES=1
+
+IT DOES NOT REACH THE DELETION PATH, and that exemption is the point rather
+than an oversight. ``oncotriage/fhir/clean.py`` unlinks patient bundles from
+the corpus on the strength of ``CancerCodeRegistry.is_primary_cancer()``. A
+degraded registry there means a missing pip package deletes the dataset --
+the exact failure this variable would otherwise re-create --  so
+``filter_cancer_patients_inplace()`` refuses a degraded registry whatever this
+variable says, and ``48- Degraded Dependency Test.py`` demonstrates the refusal
+with the variable SET.
+
+RECOGNISED VALUES: 1/true/yes/on and 0/false/no/off, case-insensitive,
+whitespace stripped; empty or unset means off. Anything else RAISES rather than
+being read as off. A variable whose whole job is to permit a degraded run must
+not itself degrade silently: ``=True`` is fine, but ``=maybe`` or a shell that
+exported the literal string ``$FLAG`` would otherwise leave the operator
+believing degradation was permitted while every run kept raising -- or, worse
+under any other spelling of the default, believing it was forbidden while every
+run kept degrading.
+"""
+
 ENV_AIRFLOW_PASSWORD = "ONCOTRIAGE_AIRFLOW_PASSWORD"
 """Admin password for the Airflow REST API v2.
 
@@ -165,8 +219,129 @@ FALLBACK_MAIN_PATH = (
 
 
 # ---------------------------------------------------------------------------
+# Degraded-dependency failure
+# ---------------------------------------------------------------------------
+#
+# WHY THE EXCEPTION LIVES IN settings AND NOT BESIDE EITHER RAISE SITE.
+#
+# Two modules raise it -- oncotriage.registries.mesh and
+# oncotriage.registries.cancer_code_registry -- and neither may import the
+# other: mesh needs paths, the cancer registry deliberately needs nothing but
+# constants, and a shared parent under registries/ would be a third module
+# whose only content is one class. This module already imports NOTHING from the
+# project, which is what makes it importable from anywhere without a cycle, and
+# it is where ENV_ALLOW_DEGRADED_REGISTRIES is named. Keeping the class beside
+# the variable is what stops the message and the variable drifting apart: every
+# raise below is constructed through `degraded_dependency_error()`, so the
+# opt-out instruction is written once.
+#
+# A RuntimeError SUBCLASS, and deliberately NOT an ImportError or an OSError,
+# for the same reason UnknownModelPricingError is deliberately not a KeyError:
+# the ICD-10 raise replaces an `except ImportError` and the MeSH raise replaces
+# a missing-file check, so both sit inside code that callers already wrap in
+# handlers for exactly those types. An ImportError subclass here would be
+# swallowed by the very handler this item exists to remove -- including
+# `_build_icd10_cancer_sets`'s own, one frame up.
+
+class DegradedDependencyError(RuntimeError):
+    """A detection layer's data file or package is missing.
+
+    Raised instead of continuing with the layer silently absent. Carries
+    ``layer`` (the machine-readable name recorded in the degradation counters)
+    so a caller can branch on which one failed without parsing the message.
+    """
+
+    def __init__(self, message, layer=None):
+        super().__init__(message)
+        self.layer = layer
+
+
+def degraded_dependency_error(layer, what_is_missing, how_to_fix):
+    """Build the DegradedDependencyError for `layer`, opt-out instruction included.
+
+    Args:
+        layer:           machine-readable layer name, e.g. "icd10_cancer_codes".
+                         Also the key used in the module-level degradation
+                         counters, so the exception and the counter cannot name
+                         the same failure two different ways.
+        what_is_missing: one line naming the file or package, in full.
+        how_to_fix:      the command that supplies it.
+
+    Every raise in the package goes through here, so the sentence telling the
+    operator how to run anyway is written once and cannot go stale in one of
+    the two raise sites while staying correct in the other.
+    """
+    return DegradedDependencyError(
+        f"{what_is_missing}\n"
+        f"  Fix it:   {how_to_fix}\n"
+        f"  Or run degraded, accepting that the {layer!r} layer is ABSENT:\n"
+        f"      export {ENV_ALLOW_DEGRADED_REGISTRIES}=1\n"
+        f"  Degraded runs log a WARNING naming the layer and record it. They "
+        f"are NOT permitted for the in-place cohort deletion in "
+        f"oncotriage/fhir/clean.py, which refuses a degraded registry however "
+        f"this variable is set.",
+        layer=layer,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Resolution
 # ---------------------------------------------------------------------------
+
+# Accepted spellings of the degraded-mode switch. Both directions are listed
+# explicitly and anything outside the two sets raises: see the argument at
+# ENV_ALLOW_DEGRADED_REGISTRIES for why an unrecognised value must not be read
+# as "off".
+_ALLOW_DEGRADED_TRUE = frozenset({"1", "true", "yes", "on"})
+_ALLOW_DEGRADED_FALSE = frozenset({"0", "false", "no", "off"})
+
+
+def resolve_allow_degraded_registries():
+    """Whether a missing detection layer may be tolerated. Returns (bool, source).
+
+    DELIBERATELY NOT ``_from_env`` -- that helper appends a trailing separator,
+    which is right for a directory and turns this flag into a string that can
+    never match. See ENV_ALLOW_DEGRADED_REGISTRIES.
+
+    Returns:
+        (allowed, source) where source is ENV_ALLOW_DEGRADED_REGISTRIES when
+        the variable decided the answer, and None when it was unset or empty
+        and the default (do not tolerate) applied. Callers print the SOURCE, so
+        a degraded run always says why it was permitted.
+
+    Read at CALL time, not at import, and that is the opposite choice from
+    ONCOTRIAGE_DEFER_LOCAL_MODELS. That variable has to be decided before
+    "13- LangGraph Agent.py" is exec'd, because it selects between two ways of
+    building the process. This one is consulted at the moment a file turns out
+    to be missing, which is already lazy -- and reading it at call time is what
+    lets "48- Degraded Dependency Test.py" demonstrate both arms in one process
+    instead of paying for a subprocess per arm.
+
+    Raises:
+        RuntimeError: the variable is set to something that is neither a
+            recognised true value nor a recognised false one.
+    """
+    raw = os.environ.get(ENV_ALLOW_DEGRADED_REGISTRIES)
+    if raw is None or raw.strip() == "":
+        return False, None
+
+    value = raw.strip().lower()
+    if value in _ALLOW_DEGRADED_TRUE:
+        return True, ENV_ALLOW_DEGRADED_REGISTRIES
+    if value in _ALLOW_DEGRADED_FALSE:
+        return False, ENV_ALLOW_DEGRADED_REGISTRIES
+
+    raise RuntimeError(
+        f"{ENV_ALLOW_DEGRADED_REGISTRIES} is set to {raw!r}, which is neither "
+        f"on nor off.\n"
+        f"  Accepted (case-insensitive): "
+        f"{', '.join(sorted(_ALLOW_DEGRADED_TRUE))} to permit a degraded run, "
+        f"{', '.join(sorted(_ALLOW_DEGRADED_FALSE))} to forbid one.\n"
+        f"  Unset or empty means forbid. It is not read as 'off', because a "
+        f"switch that decides whether a missing detection layer may be "
+        f"tolerated must not itself be tolerant of a value nobody meant."
+    )
+
 
 def _from_env(var_name, fallback):
     """Return os.environ[var_name] if it is set and non-empty, else fallback.

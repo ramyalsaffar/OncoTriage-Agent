@@ -158,6 +158,16 @@ if __name__ == "__main__":
         print("To enable crosswalks: download MRCONSO_2025AB.RRF from UMLS and re-run.\n")
 
     # --- Quick validation ---
+    #
+    # ITEM 11a CHANGED WHAT A FAILED BUILD LOOKS LIKE HERE, for the better. This
+    # call used to return None when build_mesh_lookup() had not produced the two
+    # core files, and the `if` below then skipped validation in silence — the
+    # one command whose entire job is to build those files reported nothing when
+    # it had not. It RAISES now, naming the file that is missing.
+    #
+    # The `else` is still reachable, and only one way: a run with
+    # ONCOTRIAGE_ALLOW_DEGRADED_REGISTRIES set. It says so rather than falling
+    # off the end of the block.
     mesh_filter = load_mesh_filter()
     if mesh_filter:
         print("\n--- Quick Validation ---")
@@ -181,6 +191,13 @@ if __name__ == "__main__":
             print(f"  Breast ↔ Colonic related? {related} (expected: False)")
 
         print("\n✓ MeSH Cancer Filter ready for use.")
+
+    else:
+        print("\n✗ VALIDATION SKIPPED — load_mesh_filter() returned None, which "
+              "at this point means ONCOTRIAGE_ALLOW_DEGRADED_REGISTRIES is set "
+              "and the two core lookup files were NOT built. The cancer site "
+              "filter will be disabled for every run against this data "
+              "directory; unset that variable to see which file is missing.")
 
 
 #------------------------------------------------------------------------------
