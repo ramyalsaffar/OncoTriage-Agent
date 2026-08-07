@@ -101,6 +101,7 @@ Verified rather than assumed. It is the same object as
 | `oncotriage/agent/readiness.py` | the index probe (`probe_index`, four named states), Stage 2's gate (`require_populated_index`, `EmptyIndexError`), the API's startup gate (`serving_readiness`) | `config`, `agent.deps`, `registries.mesh`, `settings` |
 | `oncotriage/paths.py` | `IS_DOCKER`, `_glob_one`, every path variable (**lazy**), `load_env_keys()` | `settings` |
 | `oncotriage/constants.py` | `SYSTEM_KEY_ABSENT` / `SYSTEM_KEY_UNRECOGNIZED` | nothing at all |
+| `oncotriage/observability.py` | **the one place output goes** — the structured JSON logger (`get_logger`, `StructuredLogger`), the correlation ID (`correlation_scope`, `NO_CORRELATION`), the field allowlist (`LOGGABLE_FIELDS`, `filter_fields`, `FIELD_DROPS`), the console UI channel (`console.out/banner/attach_bar/detach_bar`) and `_emit_line`, the single choke point both channels write through | `settings` |
 | `oncotriage/config.py` | every tunable, `PRICING_CONFIG`, `DATA_SNAPSHOT_DATE`, lazy client factories | `paths` |
 | `oncotriage/utils.py` | `get_model_cost`, `qdrant_retry`, `resolve_qdrant_collection`, `parse_partial_date`, `get_age_reference_date`, `CaffeinateSession`. **`exec_chain` was here and is deleted (pass 20e)** | `config` |
 | `oncotriage/embedding.py` | **the one** `SparseTextEmbedding("Qdrant/bm25")` construction site — `get_bm25_sparse_model`, `BM25_SPARSE_MODEL_NAME` | nothing from the project |
@@ -421,6 +422,12 @@ python tests/test_docker_qdrant_override_and_readiness.py           # 122
 # and 6 make real Qdrant round trips, because the readiness gate and the trial
 # lookup are what it exists to prove. Not in the collision matrix. ~2 min.
 python tests/test_mcp_server_stdio_contract.py                      # 135
+
+# The structured-logging pass. Same shape, same directory. No keys and NO SPEND
+# -- section 8 drives all six stages of the real graph with the Qdrant client,
+# the cross-encoder and the OpenAI client replaced through
+# oncotriage/agent/deps.py. Not in the collision matrix. ~40 s.
+python tests/test_observability_logging.py                          #  82
 
 pip install -e .                                         # makes `oncotriage` importable anywhere
 ```
@@ -2753,6 +2760,229 @@ paths in it are absolute on purpose — that rule is about SOURCE, and a client
 launches the server from a working directory nobody here chooses. No `cwd` key
 is needed: the bootstrap finds the package from the script's own `__file__`.
 
+### Structured logging (the logging pass)
+
+**1,273 `print` CALLS IN THE PACKAGE AND ZERO LOGGERS OUTSIDE THREE MODULES.**
+Measured by AST before anything moved, because a `grep -c 'print('` counts
+docstrings and `print_slowest_prompt` and was wrong about several files:
+`oncotriage/` held **1,273** print calls, **29** `tqdm.write` calls and **26**
+`logger.*` calls across three modules (`registries/cancer_code_registry.py` 20,
+`registries/mesh.py` 4, `utils.py` 1, `retrieval/indexer.py` 1). Nothing had a
+severity, nothing carried a correlation ID, and in a container it all arrived as
+unstructured text on stdout.
+
+**`oncotriage/observability.py` IS THE ONE MODULE, AND IT HOLDS BOTH CHANNELS.**
+They are not the same thing and the file says so at the top: LOGGING is
+machine-readable (one JSON object per line, a severity, a correlation ID, an
+allowlisted field set); CONSOLE UI is the tqdm bar, the mid-run drift banner and
+`agent/display.py`'s per-patient match report, which turned into JSON would make
+a 22,000-patient run unwatchable. Both stay. Both go through **one** function,
+`_emit_line`, which is what makes a bar-aware rule possible at all.
+
+**THE STREAM COLLISION, AND THE CHOICE.** tqdm draws its bar on **stderr**; any
+other writer on stderr while a bar is live interleaves with the redraw and the
+two shred each other. **Stdout was not available** — `mcp_server.py` serves
+JSON-RPC there and one stray byte ends a client session — so the obvious split
+(bar on stderr, logs on stdout) is exactly the one that cannot be taken. **A
+third stream was rejected on its own merits**: logs to a file or to fd 3 keep
+the terminal clean and take the logs out of `docker logs`, which is where a
+containerised deployment reads them and half the reason for the pass. So **both
+channels write to stderr and the writer is bar-aware**: `console.attach_bar()`
+registers `tqdm.write` as the active writer, `_emit_line` routes every console
+line AND every log record through it until `detach_bar()`. That is the mechanism
+the monkey-patch was borrowing; what changes is that the bar registers itself
+rather than a builtin being hijacked, and that the routing now covers the
+logging handler, which a patch on `builtins.print` could not see at all.
+
+**THE `builtins.print` MONKEY-PATCH IS DELETED, AND ITS DEFECT IS WORTH
+NAMING.** Three sites (`batch/runner.py` ×2, `ablation/study.py` ×1) rebound
+`builtins.print` to `def _tqdm_print(*args, **kwargs)` that took `**kwargs` and
+**threw them away**. For the whole of a batch run — in every module, every
+library, every dependency, not just the runner — `print(end="")` grew a newline,
+`print(sep="")` grew spaces, `print(file=handle)` was redirected to the terminal
+and `flush=` did nothing. `console.out()` honours all four, which
+`tests/test_observability_logging.py` section 5 asserts one keyword at a time.
+
+**THE CORRELATION ID IS A `contextvars.ContextVar`, NOT A FIELD IN
+`TrialMatchState`.** The state reaches the six graph nodes and nothing else,
+while the lines that most need correlating are emitted *below* them — the MedCPT
+load in `agent/deps.py`, the alias retry in `utils.py`, the write in
+`storage/database_logger.py` — so threading it through would be a signature
+change on each and would still carry nothing for a non-agent caller. A
+ContextVar isolates **by construction**: a thread starts with an empty context,
+so a value set on the main thread is invisible in a worker and a value set in a
+worker is unreachable from its sibling. Measured before it was relied on.
+`correlation_scope()` is a context manager because `ThreadPoolExecutor` REUSES
+workers — an ID merely `set` would be inherited by the next patient on that
+thread — and its `finally` resets the token whether the body returns or raises.
+
+**FOUR SITES OPEN A SCOPE, and the fourth was found by running the replay.**
+`agent/graph.py:match_patient_to_trials` (the API, the batch runner and the MCP
+server all reach it), `ablation/study.py:_process_one`, and both fixture
+harnesses. The three direct `graph.invoke` callers bypass
+`match_patient_to_trials`, so their lines came out carrying the `-` sentinel;
+the ablation study is the one that mattered, because it drives `MAX_WORKERS`
+pairs at once and its whole log would have been one undifferentiated stream. The
+ablation scope sits in `_process_one`, not in `match_patient_ablation`: the
+config NAME is not in that function, and a first draft logged
+`ablation_flags.get("_config_name")`, which is **not a key of that dict** and
+would have written `null` on every line of every study.
+
+**LINES THAT BELONG TO NO PATIENT CARRY `correlation_id: "-"`** (`NO_CORRELATION`
+— startup, the BM25 index build, shutdown). A documented sentinel, never a
+missing key, so no consumer has to test for presence before every read.
+
+**THE ID IS DELIBERATELY NOT STAMPED ONTO `result`.** A first draft did, so a
+stored row could be tied back to its lines — and that is a contract change
+wearing the costume of an observability edit, since `result` is what
+`POST /match` serialises and what `log_inference` writes. The join available
+today is `patient_id`, which is on every agent line and is a column of
+`inferences`. Persisting the ID properly means a new column; recorded as a
+follow-up rather than half-done.
+
+**THE FIELD ALLOWLIST IS ENFORCED IN THE FORMATTER, NOT AT THE CALL SITES.** A
+call site can be added by anyone; the formatter is the one place every record
+passes through — including a record from a caller that reached for
+`logging.getLogger("oncotriage.x").info(..., extra=...)` and went around every
+helper in the module. Section 4e of the test drives exactly that caller and
+requires it to be filtered. Anything not on `LOGGABLE_FIELDS` is **dropped**,
+its KEY NAME (never its value) is reported in `dropped_fields` on the same
+record and counted in `FIELD_DROPS`; a silent drop would be indistinguishable
+from a caller that forgot the field.
+
+**WHAT THE ALLOWLIST ACTUALLY KEPT OUT, because on Synthea data it looks like
+paranoia.** The node prints this pass converted carried: the patient's MeSH C04
+tree numbers (`C04.588.180` *is* breast), the patient's cancer stage ordinal,
+`expanded_query` and every `rerank_queries` entry (built from the primary
+diagnosis display, the histology and gene symbols), `disease_query`, the
+per-query rerank breakdown with its query text, and a 300-character preview of
+the model's criterion-level response. Each is replaced by the operational fact
+that diagnoses a problem: a COUNT of trees, `status="known"|"unknown"` for the
+stage, `query_count` and `query_length`, an aggregate `score_min`/`score_max`,
+`response_chars`. **The response preview goes to the CONSOLE**, which is
+transient and unindexed, because it is the one thing that diagnoses a malformed
+answer; `response_preview` is absent from the allowlist and would be dropped if
+anyone passed it.
+
+**THE LIMIT IS STATED RATHER THAN GLOSSED, AND IT IS CLOSED STATICALLY.** The
+allowlist governs FIELDS. It cannot police the free-text `message`, because by
+the time an f-string reaches the formatter it is a `str` and no longer
+distinguishable from a constant. The convention is "the message is a template,
+the data goes in fields", and section 6c of the test walks `oncotriage/agent/`
+by AST and fails on any `log.*()` whose message argument is an `ast.JoinedStr` —
+with its own non-degeneracy probe, because a walk that cannot see an f-string
+would pass for free.
+
+**QUERY 5's PROMPT DUMP STAYS ON THE CONSOLE, ARGUED.**
+`storage/queries.py:print_slowest_prompt` renders a whole Stage 5 prompt —
+patient summary, conditions, labs. Its `out=` default moved from `print` to
+`console.out`. It is an operator running File 16 interactively at a terminal,
+not a durable record, and `gpt4o_prompt` is not on the allowlist, so it cannot
+enter one.
+
+**`ONCOTRIAGE_LOG_LEVEL`** is named in `oncotriage/settings.py` and resolved by
+`resolve_log_level()`, which is **deliberately not `_from_env`** — that helper
+appends a trailing separator and `"DEBUG/"` is not a level name. Fourth victim
+of that helper after the airflow password, the inferences DB and the degraded
+flag, and the one worth naming again because it fails in the useful direction:
+an unrecognised level read as "the default" would leave an operator hunting for
+DEBUG lines that were never emitted. It **raises**. Unset means INFO.
+
+**THE MCP fd GUARD IS NOW WITHOUT A KNOWN SUBJECT, AND SAYS SO RATHER THAN
+BEING QUIETLY KEPT.** It existed because `oncotriage/paths.py` printed
+`[Paths] Settings module loaded from ...` to stdout at module scope and
+`mcp_server.py`'s own bootstrap printed there too. Both are on stderr now
+(measured: `python -c "import oncotriage.mcp.server" 1>/dev/null` prints the
+banner; `2>/dev/null` prints nothing). It is KEPT — the import window pulls in
+openai, qdrant-client, langgraph, fastembed and transformers, and a banner from
+any of them on any future version is a dead client session with no diagnosis —
+and the retention cost is paid: **`tests/test_mcp_server_stdio_contract.py`
+section 8c no longer depends on a defect existing and PLANTS one instead.** It
+copies the package and `mcp_server.py` into a temp directory, appends a stdout
+write to the copy's `oncotriage/__init__.py`, and runs both arms against it:
+bypassed → corrupted, guarded → clean, plus a non-degeneracy probe that the
+plant reaches stdout at all. `cwd` is the load-bearing detail — `python -c` puts
+the working directory at `sys.path[0]` AHEAD of `PYTHONPATH`, so the first
+version imported the real package in both arms and reported "no corruption" as
+though the guard had done it. **135 → 142 checks.**
+
+**TWO DEFECTS IN THIS PASS'S OWN CODE WERE FOUND BY RUNNING, NOT BY READING, AND
+BOTH ARE RECORDED BECAUSE THE SECOND IS THE INSTRUCTIVE ONE.**
+
+- The formatter stamped `formatTime(...) + "Z"` while `logging.Formatter`
+  defaults to `time.localtime`. A local time suffixed `Z` parses cleanly, sorts
+  cleanly and is wrong by the machine's UTC offset. `converter = time.gmtime`,
+  and check 1b compares the stamp against `datetime.now(timezone.utc)`.
+- **`tqdm.write`'s signature is `write(s, file=None, end="\n")` and it resolves
+  `file=None` to `sys.stdout`.** So the first version of `attach_bar` installed
+  a bare `tqdm.write` and sent every console line and every JSON record to
+  **stdout** for as long as a bar was live — the MCP protocol stream, and the
+  stream this pass promises is empty. It is also wrong about the bar: `tqdm(...)`
+  draws on stderr, so the clear-write-redraw dance would have cleared one stream
+  and written to the other. The writer passes `file=_console_stream()` now, and
+  `progress()` sets the same default on the bar so the two cannot drift.
+  **Section 5e could never have caught it** — it installs a FAKE writer and
+  tests the routing — so section **5i** drives the real one and is shown to fail
+  against a reverted copy.
+
+**THE THREE PLANTED DEFECTS, each measured to fire.** They go into an exec'd
+COPY of the module, never the shipped file, which is why
+`tests/test_observability_logging.py` is the second member of
+`test_package_invariants.py`'s `_EXEC_ALLOWLIST` — argued there, and it is
+CLAUDE.md's own instruction to prefer a mutated copy over an in-place edit.
+
+| plant | caught by |
+|---|---|
+| the ContextVar replaced by a module-level global | section 3, and **which** assertion was measured rather than assumed: a shared global does not give one patient several IDs, it gives **twelve patients one ID** — 3c, "every correlation ID belongs to exactly one patient", which is also the literal property the brief asks for. The first version of the control asserted 3b and reported the plant as uncaught |
+| `filter_fields` not consulting the allowlist | section 4c — the clinical values appear in the record |
+| a `os.write(1, ...)` in the pipeline driver | section 8b — stdout is no longer empty |
+
+**VERIFIED BY RUNNING.** All 21 existing test files at their documented counts,
+`tests/test_package_invariants.py` unchanged at **247**, the serial runner 5/5,
+`fixture_replay.py` **12/12 clean without recapture** (which is what says the
+pipeline path did not move) — and afterwards `oncotriage/config.py` and
+`oncotriage/registries/cancer_code_registry.py` confirmed restored. **No money
+was spent.** The bar and the banner were demonstrated on a real **pty** with 12
+threads emitting log lines through a live bar: stdout empty, 48/48 JSON records
+whole and parseable on the same stream as the bar, 48/48 console lines intact,
+all 18 banner lines intact, the bar owning the bottom of the screen.
+
+**WHAT THE NEXT PASS OWES, BY MODULE.** This pass moved every remaining print to
+the console channel MECHANICALLY — `print(` → `console.out(`, position-based so
+no file was reformatted, proved exactly reversible (all 83 touched files
+byte-identical after undoing the transformation). Giving those lines severity,
+structure and correlation is the next pass. **1,199 `console.out`/`banner` calls
+remain**, against **65** structured log calls already in place:
+
+| console | module | | console | module |
+|---:|---|---|---:|---|
+| 156 | `fhir/generate.py` | | 30 | `retrieval/index_validator.py` |
+| 119 | `fhir/explore.py` | | 28 | `orchestration/airflow_setup.py` |
+| 115 | `fhir/clean.py` | | 24 | `evaluation/sampling.py` |
+| 82 | `ablation/study.py` | | 23 | `retrieval/qdrant_backup.py` |
+| 82 | `batch/runner.py` | | 23 | `evaluation/cohort_diff.py` |
+| 75 | `orchestration/airflow_manager.py` | | 12 | `ablation/figures.py` |
+| 65 | `monitoring/drift.py` | | 12 | `fhir/parser.py` |
+| 54 | `fixtures/replay.py` | | 10 | `api/server.py` |
+| 53 | `registries/mesh_crosswalk_build.py` | | 9 | `registries/mesh.py` |
+| 53 | `fixtures/capture.py` | | 8 | `utils.py` |
+| 51 | `retrieval/indexer.py` | | 7 | `orchestration/dag_generator.py` |
+| 49 | `ablation/analysis.py` | | 6 | `storage/database_logger.py` |
+| **41** | **`agent/display.py` — STAYS CONSOLE** | | 4 | `paths.py` |
+| | | | 2 each | `embedding.py`, `agent/evaluation.py`, `storage/maintenance.py` |
+| | | | 1 each | `config.py`, `mcp/server.py` |
+
+**`agent/display.py` IS NOT ON THAT WORKLIST.** Its own module docstring reads
+"Console output only", it renders the per-patient match report a human reads,
+and nothing in the pipeline consumes it. It is console UI by definition and
+converting it to JSON would delete the report. Its 41 lines are the one entry
+above that is finished, not pending.
+
+**THE ENTRY POINTS AND `tests/` ARE OUT OF SCOPE AND STILL CALL `print`** — 291
+and 1,216 calls respectively. A test's output IS its report, and an entry point
+is a `__main__` block. Neither is package code and neither is affected by the
+deleted monkey-patch, which lived in the package.
+
 ## Persistence and observability
 
 **`oncotriage/storage/database_logger.py`** (its shim, `14- Database Logger.py`, was deleted in pass 20e) opens no database at load time and never did since item 20b, which turned schema creation into a function because nine other files load 14 or are loaded beside it and every one of them was touching `inferences.db` just by being read. `initialize_database(db_path)` creates three tables: `inferences` (per-patient funnel counts, per-stage timings, token counts, cost), `trial_matches` (per-trial verdicts), `drift_metrics`. It is idempotent — every `CREATE` is `IF NOT EXISTS`, every `ALTER` is guarded by a `PRAGMA table_info` check — and `log_inference` ensures the schema once per resolved path before its first write. `16-` is a scratch query script; `15-` wipes all tables and is guarded by `Flag = False` — leave it False.
@@ -2888,6 +3118,7 @@ reconstructed in an AST copy so the structural check has something to fail on.
 
 - **All tunables live in `oncotriage/config.py`, and every one of them has a reader.** (`03- Config.py` used to re-export them for the exec chain; pass 20e deleted it.) Retrieval sizes, thresholds, rate limiting, drift windows, batch runner settings. Don't scatter magic numbers into node bodies. **The second half of that sentence is new in pass 20f-2 and it is enforced**, by `tests/test_package_invariants.py` check 2h: a constant here that nothing anywhere reads fails, and the exemption list is closed. That is what this promise is worth — an operator who sets a value in this file is entitled to an effect, and `BATCH_SIZE` and `EXPANSION_TEMPERATURE` were two that had none. Note the parenthesis that used to say "temperatures (both 0 for determinism)": `MATCHING_TEMPERATURE` is `None` because gpt-5.6-terra rejects the parameter, and `EXPANSION_TEMPERATURE` is deleted — so the phrase described neither of the two things it named.
 - **The three model identities — `EMBEDDING_MODEL`, `MATCHING_MODEL`, `CROSS_ENCODER_MODEL` — live in `oncotriage/config.py` together**, and `BM25_SPARSE_MODEL_NAME` deliberately does not (it stays in `oncotriage/embedding.py`, beside the one construction site, with the "changing it rebuilds the index" warning it needs). The asymmetry is argued at both constants; the short version is that `storage` may not import `agent`, so the cross-encoder's name cannot live beside its loader.
+- **There is no `print` anywhere in `oncotriage/`, and there is no `builtins.print` monkey-patch.** Output goes to one of two channels in `oncotriage/observability.py`: `log = get_logger(__name__)` for anything machine-readable, `console.out(...)` for anything a human watches. Both write to **stderr** — stdout is the MCP server's protocol stream. See "Structured logging (the logging pass)" below.
 - `ENABLE_RATE_LIMITING = False` by default so batch evaluation isn't throttled; flip it for production.
 - Long local runs wrap in `with CaffeinateSession("label"):` to stop macOS sleeping.
 - Qdrant calls use the shared `qdrant_retry` tenacity decorator (`oncotriage/utils.py`) for connect/timeout/`UnexpectedResponse`.

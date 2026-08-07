@@ -56,6 +56,7 @@ from oncotriage import paths
 from oncotriage.config import (ECOG_MISSINGNESS_FRACTION,
                                ECOG_SCORE_DISTRIBUTION,
                                Project_Name)
+from oncotriage.observability import console
 
 
 #------------------------------------------------------------------------------
@@ -682,13 +683,13 @@ def write_ecog_module(modules_dir=None):
 
     digest = hashlib.sha256(payload).hexdigest()
 
-    print(f"✓ ECOG module {status}: {module_path.name}")
-    print(f"  Directory: {modules_dir}")
-    print(f"  sha256:    {digest}")
-    print("  Scores:    " + ", ".join(
+    console.out(f"✓ ECOG module {status}: {module_path.name}")
+    console.out(f"  Directory: {modules_dir}")
+    console.out(f"  sha256:    {digest}")
+    console.out("  Scores:    " + ", ".join(
         f"{s}={ECOG_SCORE_DISTRIBUTION[s]}" for s in sorted(ECOG_SCORE_DISTRIBUTION)
     ))
-    print(f"  Missing:   {ECOG_MISSINGNESS_FRACTION} (configured, uncalibrated)")
+    console.out(f"  Missing:   {ECOG_MISSINGNESS_FRACTION} (configured, uncalibrated)")
 
     return {
         "filename": ECOG_MODULE_FILENAME,
@@ -763,10 +764,10 @@ def generate_synthea_patients(population_size=None, output_dir=None,
     output_dir = output_dir or output_dir_full()
     modules_dir = modules_dir or synthea_modules_dir()
 
-    print("="*80)
-    print("STEP 1: GENERATE SYNTHEA PATIENTS")
-    print("="*80)
-    print()
+    console.out("="*80)
+    console.out("STEP 1: GENERATE SYNTHEA PATIENTS")
+    console.out("="*80)
+    console.out()
 
     outcome = {
         "success": False,
@@ -800,42 +801,42 @@ def generate_synthea_patients(population_size=None, output_dir=None,
     existing_fhir = Path(output_dir) / "fhir"
     if not force and existing_fhir.is_dir() and any(existing_fhir.glob("*.json")):
         existing_count = len(list(existing_fhir.glob("*.json")))
-        print("="*80)
-        print("REFUSING TO GENERATE: output directory already holds a corpus")
-        print("="*80)
-        print(f"  {existing_fhir}")
-        print(f"  contains {existing_count} JSON bundles.")
-        print()
-        print("Synthea appends to this directory rather than replacing it, so this")
-        print("run would interleave two populations into one indistinguishable corpus.")
-        print("Pass a different --output-dir for a scratch run, or --force to add to")
-        print("this one on purpose.")
+        console.out("="*80)
+        console.out("REFUSING TO GENERATE: output directory already holds a corpus")
+        console.out("="*80)
+        console.out(f"  {existing_fhir}")
+        console.out(f"  contains {existing_count} JSON bundles.")
+        console.out()
+        console.out("Synthea appends to this directory rather than replacing it, so this")
+        console.out("run would interleave two populations into one indistinguishable corpus.")
+        console.out("Pass a different --output-dir for a scratch run, or --force to add to")
+        console.out("this one on purpose.")
         outcome["failure_reason"] = "output_dir_not_empty"
         return outcome
 
     # Check if Synthea JAR exists
     if not os.path.exists(synthea_jar_path()):
-        print(f"ERROR: Synthea JAR not found at: {synthea_jar_path()}")
-        print("Please download synthea-with-dependencies.jar and place it in:")
-        print(f"  {paths.data_patient_path}")
-        print()
-        print("Download from: https://github.com/synthetichealth/synthea/releases")
+        console.out(f"ERROR: Synthea JAR not found at: {synthea_jar_path()}")
+        console.out("Please download synthea-with-dependencies.jar and place it in:")
+        console.out(f"  {paths.data_patient_path}")
+        console.out()
+        console.out("Download from: https://github.com/synthetichealth/synthea/releases")
         outcome["failure_reason"] = "synthea_jar_missing"
         return outcome
 
-    print(f"✓ Found Synthea JAR: {synthea_jar_path()}")
+    console.out(f"✓ Found Synthea JAR: {synthea_jar_path()}")
 
     if not os.path.isdir(modules_dir):
-        print(f"ERROR: Local module directory not found: {modules_dir}")
-        print("Run write_ecog_module() before generating.")
+        console.out(f"ERROR: Local module directory not found: {modules_dir}")
+        console.out("Run write_ecog_module() before generating.")
         outcome["failure_reason"] = "modules_dir_missing"
         return outcome
 
-    print(f"✓ Local modules directory: {modules_dir}")
+    console.out(f"✓ Local modules directory: {modules_dir}")
 
     # Create output directory if it doesn't exist
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    print(f"✓ Output directory: {output_dir}")
+    console.out(f"✓ Output directory: {output_dir}")
 
     # Seeds go in as their own argument pairs. -s seeds the population draw,
     # -cs seeds the clinician/provider population; they are independent
@@ -873,27 +874,27 @@ def generate_synthea_patients(population_size=None, output_dir=None,
 
     outcome["command"] = list(command)
 
-    print()
-    print("="*80)
-    print("SYNTHEA COMMAND")
-    print("="*80)
-    print(" ".join(command))
-    print()
-    print("="*80)
-    print("GENERATING PATIENTS...")
-    print("="*80)
-    print()
-    print(f"Population size: {population_size}")
-    print(f"Age range: {MIN_AGE}-{MAX_AGE} years")
-    print("Module filter: (none -- -m not passed, all modules load)")
-    print(f"Local modules: {modules_dir}")
-    print(f"Population seed (-s):  {seed if seed is not None else '(Synthea default)'}")
-    print(f"Clinician seed (-cs):  {clinician_seed if clinician_seed is not None else '(Synthea default)'}")
-    print(f"State: {STATE}")
-    print()
-    print("This will take few moments depending on population size...")
-    print("You'll see 'Loading modules...' messages from Synthea")
-    print()
+    console.out()
+    console.out("="*80)
+    console.out("SYNTHEA COMMAND")
+    console.out("="*80)
+    console.out(" ".join(command))
+    console.out()
+    console.out("="*80)
+    console.out("GENERATING PATIENTS...")
+    console.out("="*80)
+    console.out()
+    console.out(f"Population size: {population_size}")
+    console.out(f"Age range: {MIN_AGE}-{MAX_AGE} years")
+    console.out("Module filter: (none -- -m not passed, all modules load)")
+    console.out(f"Local modules: {modules_dir}")
+    console.out(f"Population seed (-s):  {seed if seed is not None else '(Synthea default)'}")
+    console.out(f"Clinician seed (-cs):  {clinician_seed if clinician_seed is not None else '(Synthea default)'}")
+    console.out(f"State: {STATE}")
+    console.out()
+    console.out("This will take few moments depending on population size...")
+    console.out("You'll see 'Loading modules...' messages from Synthea")
+    console.out()
 
     # Execute Synthea
     start_time = time.time()
@@ -921,10 +922,10 @@ def generate_synthea_patients(population_size=None, output_dir=None,
             if ' -- ' in line and '(' in line and 'y/o' in line:
                 patient_count += 1
                 if patient_count % 100 == 0:
-                    print(f"  Generated {patient_count} patients...")
+                    console.out(f"  Generated {patient_count} patients...")
             # Show module loading and important messages
             elif 'Loading' in line or 'Running with options' in line or 'Loaded' in line:
-                print(line.strip())
+                console.out(line.strip())
 
         # Wait for completion
         process.wait()
@@ -939,8 +940,8 @@ def generate_synthea_patients(population_size=None, output_dir=None,
         log_path = Path(output_dir) / SYNTHEA_LOG_FILENAME
         log_path.write_text("\n".join(log_lines), encoding="utf-8")
         outcome["log_path"] = str(log_path)
-        print()
-        print(f"✓ Synthea log: {log_path}")
+        console.out()
+        console.out(f"✓ Synthea log: {log_path}")
 
         outcome["loaded_modules"] = [
             line.split("Loading module", 1)[1].strip()
@@ -952,14 +953,14 @@ def generate_synthea_patients(population_size=None, output_dir=None,
 
         # Check if successful
         if result.returncode != 0:
-            print()
-            print("="*80)
-            print("ERROR: Synthea generation failed!")
-            print("="*80)
-            print(f"Return code: {result.returncode}")
-            print("Last 20 log lines:")
+            console.out()
+            console.out("="*80)
+            console.out("ERROR: Synthea generation failed!")
+            console.out("="*80)
+            console.out(f"Return code: {result.returncode}")
+            console.out("Last 20 log lines:")
             for line in log_lines[-20:]:
-                print(f"  {line}")
+                console.out(f"  {line}")
             outcome["failure_reason"] = f"synthea_returncode_{result.returncode}"
             return outcome
 
@@ -969,66 +970,66 @@ def generate_synthea_patients(population_size=None, output_dir=None,
         # ONLY proof the module loaded. Fail here instead of discovering it
         # three steps downstream.
         if not outcome["ecog_module_loaded"]:
-            print()
-            print("="*80)
-            print("ERROR: The ECOG module was not loaded by Synthea")
-            print("="*80)
-            print(f"Expected a 'Loading module ...{ECOG_MODULE_FILENAME}' line; none present.")
-            print("No -m filter is passed, so this is NOT a filter miss: Synthea")
-            print("did not see the module at all.")
-            print(f"Local module directory passed to -d: {modules_dir}")
-            print(f"Modules Synthea reported loading: {len(outcome['loaded_modules'])}")
+            console.out()
+            console.out("="*80)
+            console.out("ERROR: The ECOG module was not loaded by Synthea")
+            console.out("="*80)
+            console.out(f"Expected a 'Loading module ...{ECOG_MODULE_FILENAME}' line; none present.")
+            console.out("No -m filter is passed, so this is NOT a filter miss: Synthea")
+            console.out("did not see the module at all.")
+            console.out(f"Local module directory passed to -d: {modules_dir}")
+            console.out(f"Modules Synthea reported loading: {len(outcome['loaded_modules'])}")
             for module in outcome["loaded_modules"]:
-                print(f"  {module}")
-            print()
-            print("Check that the directory above exists, is readable, and holds")
-            print(f"{ECOG_MODULE_FILENAME} -- write_ecog_module() puts it there.")
+                console.out(f"  {module}")
+            console.out()
+            console.out("Check that the directory above exists, is readable, and holds")
+            console.out(f"{ECOG_MODULE_FILENAME} -- write_ecog_module() puts it there.")
             outcome["failure_reason"] = "ecog_module_not_loaded"
             return outcome
 
-        print()
-        print("="*80)
-        print("GENERATION COMPLETE!")
-        print("="*80)
-        print(f"Time elapsed: {elapsed_time/60:.1f} minutes")
-        print(f"✓ ECOG module loaded by Synthea")
+        console.out()
+        console.out("="*80)
+        console.out("GENERATION COMPLETE!")
+        console.out("="*80)
+        console.out(f"Time elapsed: {elapsed_time/60:.1f} minutes")
+        console.out(f"✓ ECOG module loaded by Synthea")
 
         # Check output directory
         fhir_dir = Path(output_dir) / "fhir"
         if fhir_dir.exists():
             patient_files = list(fhir_dir.glob("*.json"))
-            print(f"✓ Generated {len(patient_files)} patient FHIR files")
-            print(f"✓ Location: {fhir_dir}")
+            console.out(f"✓ Generated {len(patient_files)} patient FHIR files")
+            console.out(f"✓ Location: {fhir_dir}")
         else:
-            print(f"⚠ Warning: FHIR directory not found at {fhir_dir}")
-            print("Synthea may have used a different output structure")
+            console.out(f"⚠ Warning: FHIR directory not found at {fhir_dir}")
+            console.out("Synthea may have used a different output structure")
 
-        print()
-        print("Next step: Run filter script to extract cancer patients only")
-        print()
+        console.out()
+        console.out("Next step: Run filter script to extract cancer patients only")
+        console.out()
 
         outcome["success"] = True
         return outcome
 
     except FileNotFoundError:
-        print()
-        print("="*80)
-        print("ERROR: Java not found!")
-        print("="*80)
-        print("Please install Java JDK 11 or newer:")
-        print("  macOS: brew install openjdk@11")
-        print("  Or download from: https://adoptium.net/")
-        print()
+        console.out()
+        console.out("="*80)
+        console.out("ERROR: Java not found!")
+        console.out("="*80)
+        console.out("Please install Java JDK 11 or newer:")
+        console.out("  macOS: brew install openjdk@11")
+        console.out("  Or download from: https://adoptium.net/")
+        console.out()
         outcome["failure_reason"] = "java_not_found"
         return outcome
 
     except Exception as e:
-        print()
-        print("="*80)
-        print("ERROR: Unexpected error during generation")
-        print("="*80)
-        print(f"Error: {e}")
-        print()
+        console.out()
+        console.out("="*80)
+        console.out("ERROR: Unexpected error during generation")
+        console.out("="*80)
+        console.out(f"Error: {e}")
+        console.out()
         outcome["failure_reason"] = f"unexpected_error: {type(e).__name__}: {e}"
         return outcome
 
@@ -1108,10 +1109,10 @@ def normalize_ecog_observations(output_dir=None):
     if not fhir_dir.exists():
         raise FileNotFoundError(f"FHIR directory not found for normalization: {fhir_dir}")
 
-    print()
-    print("="*80)
-    print("NORMALIZING ECOG OBSERVATIONS TO mCODE (valueQuantity -> valueInteger)")
-    print("="*80)
+    console.out()
+    console.out("="*80)
+    console.out("NORMALIZING ECOG OBSERVATIONS TO mCODE (valueQuantity -> valueInteger)")
+    console.out("="*80)
 
     for path in sorted(fhir_dir.glob("*.json")):
         try:
@@ -1182,22 +1183,22 @@ def normalize_ecog_observations(output_dir=None):
             path.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
             counts["bundles_rewritten"] += 1
 
-    print(f"  Bundles scanned:              {counts['bundles_scanned']}")
-    print(f"  Bundles rewritten:            {counts['bundles_rewritten']}")
-    print(f"  ECOG observations seen:       {counts['observations_seen']}")
-    print(f"  Converted to valueInteger:    {counts['observations_converted']}")
-    print(f"  Already integer (idempotent): {counts['observations_already_integer']}")
-    print(f"  mCODE profiles stamped:       {counts['profiles_stamped']}")
-    print(f"  dataAbsentReason removed:     {counts['data_absent_reasons_removed']}")
+    console.out(f"  Bundles scanned:              {counts['bundles_scanned']}")
+    console.out(f"  Bundles rewritten:            {counts['bundles_rewritten']}")
+    console.out(f"  ECOG observations seen:       {counts['observations_seen']}")
+    console.out(f"  Converted to valueInteger:    {counts['observations_converted']}")
+    console.out(f"  Already integer (idempotent): {counts['observations_already_integer']}")
+    console.out(f"  mCODE profiles stamped:       {counts['profiles_stamped']}")
+    console.out(f"  dataAbsentReason removed:     {counts['data_absent_reasons_removed']}")
     if counts["unreadable_files"]:
-        print(f"  ⚠ UNREADABLE FILES:           {counts['unreadable_files']}")
+        console.out(f"  ⚠ UNREADABLE FILES:           {counts['unreadable_files']}")
         for name in counts["unreadable_file_names"][:10]:
-            print(f"      {name}")
+            console.out(f"      {name}")
 
-    print()
-    print("NOTE: the CSV export (observations.csv) is NOT normalized. It keeps")
-    print("Synthea's numeric-with-unit form. The FHIR bundles are the corpus the")
-    print("pipeline reads; the CSVs are not.")
+    console.out()
+    console.out("NOTE: the CSV export (observations.csv) is NOT normalized. It keeps")
+    console.out("Synthea's numeric-with-unit form. The FHIR bundles are the corpus the")
+    console.out("pipeline reads; the CSVs are not.")
 
     return counts
 
@@ -1221,15 +1222,15 @@ def verify_generation(output_dir=None, sample_size=10):
     """
     output_dir = output_dir or output_dir_full()
 
-    print()
-    print("="*80)
-    print("VERIFYING GENERATION")
-    print("="*80)
+    console.out()
+    console.out("="*80)
+    console.out("VERIFYING GENERATION")
+    console.out("="*80)
 
     fhir_dir = Path(output_dir) / "fhir"
 
     if not fhir_dir.exists():
-        print("✗ FHIR directory not found")
+        console.out("✗ FHIR directory not found")
         return None
 
     patient_files = list(fhir_dir.glob("*.json"))
@@ -1239,13 +1240,13 @@ def verify_generation(output_dir=None, sample_size=10):
         "fhir_directory": str(fhir_dir)
     }
 
-    print(f"✓ Total patient files: {stats['total_files']}")
-    print(f"✓ FHIR directory: {stats['fhir_directory']}")
+    console.out(f"✓ Total patient files: {stats['total_files']}")
+    console.out(f"✓ FHIR directory: {stats['fhir_directory']}")
 
     # Sample a few files to check they're valid JSON
-    print()
+    console.out()
     sample_size = min(sample_size, len(patient_files))
-    print(f"Checking {sample_size} random files for validity...")
+    console.out(f"Checking {sample_size} random files for validity...")
     invalid_count = 0
 
     for i, file in enumerate(random.sample(patient_files, sample_size), 1):
@@ -1254,27 +1255,27 @@ def verify_generation(output_dir=None, sample_size=10):
                 data = json.load(f)
                 bundle_type = data.get('resourceType')
                 if bundle_type != 'Bundle':
-                    print(f"  {i}. {file.name}: WARNING - unexpected resourceType={bundle_type}")
+                    console.out(f"  {i}. {file.name}: WARNING - unexpected resourceType={bundle_type}")
                     invalid_count += 1
                 else:
-                    print(f"  {i}. {file.name}: Valid Bundle")
+                    console.out(f"  {i}. {file.name}: Valid Bundle")
         except Exception as e:
-            print(f"  {i}. {file.name}: ERROR - {e}")
+            console.out(f"  {i}. {file.name}: ERROR - {e}")
             invalid_count += 1
 
     if invalid_count > 0:
-        print(f"⚠ {invalid_count}/{sample_size} sampled files had issues.")
+        console.out(f"⚠ {invalid_count}/{sample_size} sampled files had issues.")
     else:
-        print(f"✓ All {sample_size} sampled files are valid Bundles.")
+        console.out(f"✓ All {sample_size} sampled files are valid Bundles.")
 
     stats["sampled_files"] = sample_size
     stats["sampled_invalid"] = invalid_count
 
-    print()
-    print("="*80)
-    print("Generation verified!")
-    print("="*80)
-    print()
+    console.out()
+    console.out("="*80)
+    console.out("Generation verified!")
+    console.out("="*80)
+    console.out()
 
     return stats
 
@@ -1321,10 +1322,10 @@ def summarize_ecog_coverage(output_dir=None):
         "missing_mcode_profile": 0,
     }
 
-    print()
-    print("="*80)
-    print("ECOG COVERAGE SUMMARY")
-    print("="*80)
+    console.out()
+    console.out("="*80)
+    console.out("ECOG COVERAGE SUMMARY")
+    console.out("="*80)
 
     for path in sorted(fhir_dir.glob("*.json")):
         try:
@@ -1402,21 +1403,21 @@ def summarize_ecog_coverage(output_dir=None):
 
     summary["score_counts"] = {str(k): v for k, v in sorted(summary["score_counts"].items())}
 
-    print(f"  Patient bundles:                 {summary['patient_bundles']}")
-    print(f"  Cancer patients:                 {summary['cancer_patients']}")
-    print(f"  Cancer patients with ECOG:       {summary['cancer_patients_with_ecog']}")
-    print(f"  ECOG observations total:         {summary['observations_total']}")
-    print(f"  Score distribution:              {summary['score_counts']}")
-    print(f"  Missingness configured:          {ECOG_MISSINGNESS_FRACTION}")
-    print(f"  Missingness observed:            {summary['missingness_fraction_observed']}")
-    print()
-    print("  Violations (all must be 0):")
+    console.out(f"  Patient bundles:                 {summary['patient_bundles']}")
+    console.out(f"  Cancer patients:                 {summary['cancer_patients']}")
+    console.out(f"  Cancer patients with ECOG:       {summary['cancer_patients_with_ecog']}")
+    console.out(f"  ECOG observations total:         {summary['observations_total']}")
+    console.out(f"  Score distribution:              {summary['score_counts']}")
+    console.out(f"  Missingness configured:          {ECOG_MISSINGNESS_FRACTION}")
+    console.out(f"  Missingness observed:            {summary['missingness_fraction_observed']}")
+    console.out()
+    console.out("  Violations (all must be 0):")
     for key in ("non_cancer_with_ecog", "value_5_emitted", "non_integer_value",
                 "non_survey_category", "missing_encounter_reference",
                 "missing_effective_datetime", "data_absent_reason_present",
                 "missing_mcode_profile", "unreadable_files"):
         flag = "✓" if summary[key] == 0 else "✗"
-        print(f"    {flag} {key}: {summary[key]}")
+        console.out(f"    {flag} {key}: {summary[key]}")
 
     return summary
 
@@ -1577,11 +1578,11 @@ def write_run_manifest(output_dir, generation, module_info, verification,
     manifest_path = Path(output_dir) / RUN_MANIFEST_FILENAME
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-    print()
-    print("="*80)
-    print("RUN MANIFEST")
-    print("="*80)
-    print(f"✓ Written: {manifest_path}")
+    console.out()
+    console.out("="*80)
+    console.out("RUN MANIFEST")
+    console.out("="*80)
+    console.out(f"✓ Written: {manifest_path}")
 
     return manifest
 

@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Optional, Set
 
 from oncotriage import paths, settings
+from oncotriage.observability import console
 
 
 logger = logging.getLogger(__name__)
@@ -193,7 +194,7 @@ class MeSHCancerFilter:
         icd10_status = f"{icd10_count:,} ICD-10 crosswalk entries" if icd10_count else "ICD-10 crosswalk not loaded"
         synonym_count = len(self.synonym_to_trees)
         synonym_status = f"{synonym_count:,} UMLS synonym entries" if synonym_count else "UMLS synonym crosswalk not loaded"
-        print(f"MeSHCancerFilter loaded: {len(self.name_to_trees):,} C04 descriptors, "
+        console.out(f"MeSHCancerFilter loaded: {len(self.name_to_trees):,} C04 descriptors, "
               f"{len(self.snomed_to_trees):,} SNOMED crosswalk entries, "
               f"{icd10_status}, {synonym_status}")
 
@@ -925,12 +926,12 @@ def load_mesh_filter() -> Optional[MeSHCancerFilter]:
             "Missing: %s. Supply it with: %s",
             MESH_LAYER_CORE, source, ", ".join(missing), how_to_fix,
         )
-        print(f"WARNING: MeSH Cancer Filter DISABLED — {MESH_LAYER_CORE} layer "
+        console.out(f"WARNING: MeSH Cancer Filter DISABLED — {MESH_LAYER_CORE} layer "
               f"absent, permitted by {source}. All trials will pass the cancer "
               f"site filter.\n")
         return None
 
-    print("Loading MeSH Cancer Filter...")
+    console.out("Loading MeSH Cancer Filter...")
 
     with open(lookup_path, "r") as f:
         name_to_trees = json.load(f)
@@ -953,7 +954,7 @@ def load_mesh_filter() -> Optional[MeSHCancerFilter]:
         logger.warning("MeSH: the %r layer is absent (%s) -- patient SNOMED "
                        "codes will fall through to fuzzy display matching.",
                        MESH_LAYER_SNOMED_CROSSWALK, crosswalk_path)
-        print("  NOTE: snomed_to_mesh_trees.json not found -- SNOMED crosswalk disabled.")
+        console.out("  NOTE: snomed_to_mesh_trees.json not found -- SNOMED crosswalk disabled.")
 
     # Optional: ICD-10-CM crosswalk (Layer 2)
     icd10_to_trees = {}
@@ -965,8 +966,8 @@ def load_mesh_filter() -> Optional[MeSHCancerFilter]:
         logger.warning("MeSH: the %r layer is absent (%s) -- patient ICD-10-CM "
                        "codes will fall through to fuzzy display matching.",
                        MESH_LAYER_ICD10_CROSSWALK, icd10_xwalk_path)
-        print("  NOTE: icd10_to_mesh_trees.json not found -- ICD-10 crosswalk disabled.")
-        print("  To enable: run build_icd10_to_mesh_crosswalk() (Item 2.1).")
+        console.out("  NOTE: icd10_to_mesh_trees.json not found -- ICD-10 crosswalk disabled.")
+        console.out("  To enable: run build_icd10_to_mesh_crosswalk() (Item 2.1).")
 
     # Optional: UMLS synonym crosswalk (Strategy 0 in fuzzy matching)
     synonym_xwalk_path = mesh_dir / "umls_synonym_to_mesh_trees.json"
@@ -979,11 +980,11 @@ def load_mesh_filter() -> Optional[MeSHCancerFilter]:
         logger.warning("MeSH: the %r layer is absent (%s) -- clinical synonyms "
                        "will fall through to substring and stem matching.",
                        MESH_LAYER_UMLS_SYNONYMS, synonym_xwalk_path)
-        print("  NOTE: umls_synonym_to_mesh_trees.json not found -- UMLS synonym crosswalk disabled.")
-        print("  To enable: run build_umls_synonym_crosswalk() (Item 1).")
+        console.out("  NOTE: umls_synonym_to_mesh_trees.json not found -- UMLS synonym crosswalk disabled.")
+        console.out("  To enable: run build_umls_synonym_crosswalk() (Item 1).")
 
     if not snomed_to_trees and not icd10_to_trees and not synonym_to_trees:
-        print("  Filter will use fuzzy string matching only.")
+        console.out("  Filter will use fuzzy string matching only.")
 
     return MeSHCancerFilter(name_to_trees, tree_to_name, snomed_to_trees,
                             icd10_to_trees, synonym_to_trees)

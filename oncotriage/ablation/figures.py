@@ -41,6 +41,7 @@ import numpy as np
 import pandas as pd
 
 from oncotriage.ablation.common import BASELINE, CONFIG_LABELS, CONFIG_ORDER
+from oncotriage.observability import console
 
 
 #------------------------------------------------------------------------------
@@ -76,7 +77,7 @@ def plot_funnel_chart(df: pd.DataFrame, out_dir: Path) -> None:
     path = out_dir / "ablation_funnel_chart.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved: {path}")
+    console.out(f"  Saved: {path}")
 
 
 def plot_delta_chart(table: pd.DataFrame, out_dir: Path) -> None:
@@ -112,7 +113,7 @@ def plot_delta_chart(table: pd.DataFrame, out_dir: Path) -> None:
     path = out_dir / "ablation_delta_chart.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved: {path}")
+    console.out(f"  Saved: {path}")
 
 
 def plot_cost_efficiency(df: pd.DataFrame, out_dir: Path) -> None:
@@ -157,7 +158,7 @@ def plot_cost_efficiency(df: pd.DataFrame, out_dir: Path) -> None:
     path = out_dir / "ablation_cost_efficiency.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved: {path}")
+    console.out(f"  Saved: {path}")
 
 
 def plot_score_distribution(df: pd.DataFrame, out_dir: Path) -> None:
@@ -195,7 +196,7 @@ def plot_score_distribution(df: pd.DataFrame, out_dir: Path) -> None:
     path = out_dir / "ablation_score_distribution.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved: {path}")
+    console.out(f"  Saved: {path}")
 
 
 def plot_cancer_group_heatmap(df: pd.DataFrame, out_dir: Path) -> None:
@@ -211,7 +212,7 @@ def plot_cancer_group_heatmap(df: pd.DataFrame, out_dir: Path) -> None:
     pivot.columns = [CONFIG_LABELS.get(c, c) for c in pivot.columns]
 
     if pivot.empty:
-        print("  Skipped: cancer group heatmap (no data)")
+        console.out("  Skipped: cancer group heatmap (no data)")
         return
 
     fig, ax = plt.subplots(figsize=(14, max(6, len(pivot) * 0.5 + 2)))
@@ -235,7 +236,7 @@ def plot_cancer_group_heatmap(df: pd.DataFrame, out_dir: Path) -> None:
     path = out_dir / "ablation_cancer_group_heatmap.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved: {path}")
+    console.out(f"  Saved: {path}")
 
 
 def plot_timing_breakdown(df: pd.DataFrame, out_dir: Path) -> None:
@@ -263,13 +264,13 @@ def plot_timing_breakdown(df: pd.DataFrame, out_dir: Path) -> None:
     path = out_dir / "ablation_timing_breakdown.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved: {path}")
+    console.out(f"  Saved: {path}")
 
 
 def plot_win_loss_chart(wl_table: pd.DataFrame, out_dir: Path) -> None:
     """Stacked horizontal bar: wins/ties/losses per config."""
     if wl_table.empty:
-        print("  Skipped: win/loss chart (no data)")
+        console.out("  Skipped: win/loss chart (no data)")
         return
 
     labels = wl_table["config_label"].values
@@ -296,7 +297,7 @@ def plot_win_loss_chart(wl_table: pd.DataFrame, out_dir: Path) -> None:
     path = out_dir / "ablation_win_loss_chart.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved: {path}")
+    console.out(f"  Saved: {path}")
 
 
 def plot_retrieval_venn(df: pd.DataFrame, out_dir: Path) -> None:
@@ -321,7 +322,7 @@ def plot_retrieval_venn(df: pd.DataFrame, out_dir: Path) -> None:
 
     shared = baseline_df.index.intersection(bm25_df.index).intersection(vector_df.index)
     if len(shared) < 5:
-        print("  Skipped: retrieval venn (insufficient data)")
+        console.out("  Skipped: retrieval venn (insufficient data)")
         return
 
     if has_nct_ids:
@@ -423,7 +424,7 @@ def plot_retrieval_venn(df: pd.DataFrame, out_dir: Path) -> None:
     path = out_dir / "ablation_retrieval_venn.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved: {path}")
+    console.out(f"  Saved: {path}")
 
 
 def plot_patient_scatter(df: pd.DataFrame, out_dir: Path) -> None:
@@ -480,7 +481,7 @@ def plot_patient_scatter(df: pd.DataFrame, out_dir: Path) -> None:
     path = out_dir / "ablation_patient_scatter.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved: {path}")
+    console.out(f"  Saved: {path}")
 
 
 #------------------------------------------------------------------------------

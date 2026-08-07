@@ -52,7 +52,11 @@ from oncotriage.config import (
     MAX_TRUNCATION_SPLITS,
     RETRY_BASE_DELAY,
 )
+from oncotriage.observability import console, get_logger
 from oncotriage.utils import get_age_reference_date
+
+
+log = get_logger(__name__)
 
 
 #------------------------------------------------------------------------------
@@ -410,7 +414,9 @@ def node_gpt4o_evaluation(state: TrialMatchState) -> dict:
     # Exponential backoff on retries (skip delay on first attempt)
     if retry_count > 0:
         delay = RETRY_BASE_DELAY * (2 ** (retry_count - 1))
-        print(f"  [Retry {retry_count}/{MAX_GPT4O_RETRIES}] Waiting {delay}s before retry...")
+        log.info("backing off before a Stage 5 retry", stage=5,
+                 retry=retry_count, max_retries=MAX_GPT4O_RETRIES,
+                 delay_s=delay)
         time.sleep(delay)
 
     # Build patient summary
@@ -819,9 +825,10 @@ CLINICAL TRIALS:
                     halved.append(chunk)
             initial_chunks = halved
             depth += 1
-        print(f"  [Pre-split] estimate {estimated_output} tokens > threshold "
-              f"{split_threshold} — sending {len(initial_chunks)} chunk(s) "
-              f"instead of 1")
+        log.info("pre-splitting the Stage 5 request: the output estimate is "
+                 "over the split threshold", stage=5, event="pre_split",
+                 tokens_estimated=estimated_output, threshold=split_threshold,
+                 chunks=len(initial_chunks), depth=depth)
         pending = [(c, depth) for c in reversed(initial_chunks)]
     else:
         pending = [(trials, 0)]
@@ -869,7 +876,9 @@ CLINICAL TRIALS:
             # the parse/API budget, not the split budget.
             elapsed = time.time() - start
             error_msg = f"GPT-4o API error (attempt {retry_count + 1}): {str(e)}"
-            print(f"  ERROR: {error_msg}")
+            log.error("Stage 5 API call failed", stage=5, status="error",
+                      retry=retry_count + 1, error_type=type(e).__name__,
+                      error_message=str(e))
             return {
                 "evaluations": [],
                 "gpt4o_retries": retry_count + 1,
@@ -924,9 +933,10 @@ CLINICAL TRIALS:
         # no truncation detection on this run, and that is worth a line.
         finish_reason = getattr(choice, "finish_reason", None)
         if finish_reason is None and not _finish_reason_warned:
-            print("  WARNING: the response object carries no finish_reason; "
-                  "truncation cannot be detected on this run. Falling back to "
-                  "JSON-parse failure as the only signal.")
+            log.warning("the response object carries no finish_reason; "
+                        "truncation cannot be detected on this run, falling "
+                        "back to JSON-parse failure as the only signal",
+                        stage=5, event="finish_reason_absent", degraded=True)
             _finish_reason_warned = True
 
         # ── Reactive: the response was cut off, not malformed ──────────────
@@ -943,16 +953,20 @@ CLINICAL TRIALS:
             if len(chunk) == 1:
                 # THE FLOOR. One trial, still over the ceiling; there is
                 # nothing left to halve. Recorded, not retried and not dropped.
-                print(f"  TRUNCATION FLOOR: {chunk[0]['trial']['nct_id']} alone "
-                      f"exceeds the output ceiling. Recording as not evaluable.")
+                log.warning("truncation floor: a single trial exceeds the "
+                            "output ceiling; recording it as not evaluable",
+                            stage=5, event="truncation_floor",
+                            nct_id=chunk[0]["trial"]["nct_id"], depth=depth)
                 unevaluable.append(
                     _unevaluable_entry(chunk[0], NOT_EVALUABLE_TRUNCATION_FLOOR)
                 )
                 continue
 
             if depth >= MAX_TRUNCATION_SPLITS:
-                print(f"  TRUNCATION: split budget exhausted at depth {depth}; "
-                      f"recording {len(chunk)} trial(s) as not evaluable.")
+                log.warning("truncation split budget exhausted; recording the "
+                            "chunk as not evaluable", stage=5,
+                            event="split_budget_exhausted", depth=depth,
+                            count=len(chunk), max_retries=MAX_TRUNCATION_SPLITS)
                 unevaluable.extend(
                     _unevaluable_entry(t, NOT_EVALUABLE_SPLIT_BUDGET)
                     for t in chunk
@@ -961,9 +975,9 @@ CLINICAL TRIALS:
 
             left, right = _split_in_half(chunk)
             truncation_splits += 1
-            print(f"  TRUNCATION at depth {depth}: {len(chunk)} trial(s) -> "
-                  f"{len(left)} + {len(right)}, retrying as two calls "
-                  f"(split {truncation_splits})")
+            log.info("response truncated; splitting the chunk and retrying as "
+                     "two calls", stage=5, event="truncation_split",
+                     depth=depth, count=len(chunk), chunks=truncation_splits)
             # Pushed right-then-left so the LIFO pops left first and the
             # evaluation order stays the batch's original order.
             pending.append((right, depth + 1))
@@ -986,8 +1000,17 @@ CLINICAL TRIALS:
             # one, and re-sending is the right response to it.
             elapsed = time.time() - start
             error_msg = f"GPT-4o JSON parse error (attempt {retry_count + 1}): {str(e)}"
-            print(f"  ERROR: {error_msg}")
-            print(f"  Response preview: {chunk_text[:300]}")
+            log.error("Stage 5 response was not valid JSON", stage=5,
+                      status="error", retry=retry_count + 1,
+                      error_type=type(e).__name__, error_message=str(e),
+                      response_chars=len(chunk_text))
+            # THE PREVIEW GOES TO THE CONSOLE, NOT THE RECORD. It is the one
+            # thing that diagnoses a malformed answer and it is also the
+            # model's criterion-level reasoning about this patient, so it is
+            # not a field: `response_preview` is absent from LOGGABLE_FIELDS on
+            # purpose and would be dropped if it were passed. Console output is
+            # transient and unindexed; the structured record is neither.
+            console.out(f"  [Stage 5] response preview: {chunk_text[:300]}")
             return {
                 "evaluations": [],
                 "gpt4o_retries": retry_count + 1,
@@ -1010,8 +1033,12 @@ CLINICAL TRIALS:
         if not isinstance(parsed, list):
             elapsed = time.time() - start
             error_msg = f"GPT-4o returned non-list JSON (type={type(parsed).__name__})"
-            print(f"  ERROR: {error_msg}")
-            print(f"  Response preview: {chunk_text[:300]}")
+            log.error("Stage 5 returned JSON that is not a list", stage=5,
+                      status="error", retry=retry_count + 1,
+                      error_message=error_msg,
+                      response_chars=len(chunk_text))
+            # Same reasoning as the parse-error branch above.
+            console.out(f"  [Stage 5] response preview: {chunk_text[:300]}")
             return {
                 "evaluations": [],
                 "gpt4o_retries": retry_count + 1,
@@ -1034,9 +1061,10 @@ CLINICAL TRIALS:
         evaluations.extend(parsed)
 
     if truncations_observed:
-        print(f"  [Truncation] {truncations_observed} response(s) hit the "
-              f"{MATCHING_MAX_TOKENS}-token ceiling; {truncation_splits} split(s) "
-              f"performed across {calls_made} call(s)")
+        log.info("responses hit the output ceiling", stage=5,
+                 event="truncation_summary", count=truncations_observed,
+                 threshold=MATCHING_MAX_TOKENS, chunks=truncation_splits,
+                 calls=calls_made)
 
     # ── Estimate against actual, so the calibration can be tightened ───────
     # Logged every run, not only when it matters. The constants in File 03 were
@@ -1045,16 +1073,18 @@ CLINICAL TRIALS:
     # The reasoning share is printed beside the total rather than added to it,
     # so the line reads the way the billing does: one output figure, with the
     # invisible part of it named.
-    _reasoning_note = (
-        f", of which {reasoning_tokens} reasoning"
-        if reasoning_tokens_reported else
-        ", reasoning share not reported"
-    )
-    print(f"  [Output tokens] estimated {estimated_output}, actual "
-          f"{output_tokens}{_reasoning_note} across {calls_made} call(s) "
-          f"(ratio {output_tokens / estimated_output:.2f})"
-          if estimated_output else
-          f"  [Output tokens] actual {output_tokens}{_reasoning_note}")
+    # The reasoning share is carried BESIDE the total rather than added to it,
+    # so the record reads the way the billing does: one output figure, with the
+    # invisible part of it named. `None` when the API did not report it -- never
+    # 0, which would assert a share nothing measured.
+    log.info("Stage 5 output token accounting", stage=5,
+             event="output_tokens", tokens_estimated=estimated_output,
+             tokens_actual=output_tokens,
+             tokens_reasoning=reasoning_tokens if reasoning_tokens_reported
+                              else None,
+             calls=calls_made,
+             estimate_ratio=(round(output_tokens / estimated_output, 3)
+                             if estimated_output else None))
 
     # SUCCESS: enrich evaluations with trial metadata (title, phase)
     for eval_result in evaluations:
@@ -1161,11 +1191,10 @@ CLINICAL TRIALS:
         eval_result["score_denominator"] = denominator
         eval_result["criteria_not_applicable"] = n_na
         if denominator == 0:
-            print(
-                f"  [Validator] {nct_id or '(no NCT ID)'}: all "
-                f"{n_na} criterion(s) inapplicable to this patient -- "
-                f"match_score 0.0 over an empty denominator."
-            )
+            log.info("every criterion was inapplicable to this patient; "
+                     "match_score 0.0 over an empty denominator", stage=5,
+                     event="empty_denominator", nct_id=nct_id or None,
+                     criteria_not_applicable=n_na)
         return score
 
     def _record_zero_score(eval_result, inc, exc):
@@ -1299,17 +1328,15 @@ CLINICAL TRIALS:
             _record_zero_score(eval_result, inc, exc)
 
     if label_remaps:
-        print(
-            f"  [Validator] Remapped {len(label_remaps)} out-of-vocabulary criterion "
-            f"label(s) to not_evaluable across "
-            f"{len(set(r['nct_id'] for r in label_remaps))} trial(s)."
-        )
+        log.info("remapped out-of-vocabulary criterion labels to "
+                 "not_evaluable", stage=5, event="label_remap",
+                 count=len(label_remaps),
+                 total=len({r["nct_id"] for r in label_remaps}))
     if unevaluable_trials:
-        print(
-            f"  [Validator] {len(unevaluable_trials)} trial(s) recorded as "
-            f"not_evaluable (not rejections): "
-            f"{', '.join(sorted(set(t['reason'] for t in unevaluable_trials)))}."
-        )
+        log.info("trials recorded as not_evaluable (these are not rejections)",
+                 stage=5, event="not_evaluable",
+                 not_evaluable=len(unevaluable_trials),
+                 reason=sorted({t["reason"] for t in unevaluable_trials}))
 
 
     # ── Absent-data validator: catch GPT-4o absent-data disqualifications ──
@@ -1457,11 +1484,11 @@ CLINICAL TRIALS:
                 for c in absent_data_corrections
             ) and e.get("eligible") == "eligible"
         )
-        print(
-            f"  [Validator] Corrected {len(absent_data_corrections)} absent-data "
-            f"criterion(s) across {len(set(c['nct_id'] for c in absent_data_corrections))} "
-            f"trial(s). Flipped {flipped_trials} trial(s) to eligible."
-        )
+        log.info("corrected absent-data criterion disqualifications", stage=5,
+                 event="absent_data_correction",
+                 count=len(absent_data_corrections),
+                 total=len({c["nct_id"] for c in absent_data_corrections}),
+                 eligible=flipped_trials)
 
     # ── Report not-applicable exclusions ────────────────────────────────────
     #
@@ -1476,12 +1503,10 @@ CLINICAL TRIALS:
             1 for e in evaluations
             if e.get("criteria_not_applicable", 0) and e.get("score_denominator", 0) == 0
         )
-        print(
-            f"  [Validator] Excluded {_na_total} not-applicable criterion(s) from "
-            f"match_score across {_na_trials} trial(s)"
-            + (f"; {_na_empty} trial(s) had no applicable criterion left."
-               if _na_empty else ".")
-        )
+        log.info("excluded not-applicable criteria from match_score", stage=5,
+                 event="not_applicable_excluded",
+                 criteria_not_applicable=_na_total, total=_na_trials,
+                 empty_denominator_trials=_na_empty)
 
     # ── Reconciliation: every trial that entered Stage 5 must be accounted for ──
     #
@@ -1498,9 +1523,10 @@ CLINICAL TRIALS:
     _evaluated_ids = {e.get("nct_id") for e in evaluations}
     _omitted = [t for t in trials if t["trial"]["nct_id"] not in _evaluated_ids]
     if _omitted:
-        print(f"  [Reconciliation] {len(_omitted)} trial(s) sent to the model "
-              f"came back with no entry; recording as not evaluable: "
-              f"{[t['trial']['nct_id'] for t in _omitted]}")
+        log.warning("trials sent to the model came back with no entry; "
+                    "recording them as not evaluable", stage=5,
+                    event="reconciliation", count=len(_omitted),
+                    nct_ids=[t["trial"]["nct_id"] for t in _omitted])
         evaluations.extend(
             _unevaluable_entry(t, NOT_EVALUABLE_MODEL_OMITTED) for t in _omitted
         )
@@ -1518,10 +1544,14 @@ CLINICAL TRIALS:
      )
 
     elapsed = time.time() - start
-    print(f"[Stage 5] GPT-4o evaluation: {elapsed:.2f}s | {len(evaluations)} trials evaluated")
-    print(f"  Scope limitation: relevance "
-          f"{'confirmed upstream' if _mesh_filter_applied else 'NOT confirmed'} "
-          f"[{_mesh_filter_reason}]")
+    log.info("Stage 5 evaluation complete", stage=5,
+             duration_s=round(elapsed, 3), evaluated=len(evaluations),
+             # The scope limitation, as a field rather than a sentence: Stage
+             # 5's system prompt only asserts that disease relevance was
+             # confirmed when the MeSH filter actually ran, and a run where it
+             # did not is a different claim about the same output.
+             mesh_filter_applied=_mesh_filter_applied,
+             skip_reason=_mesh_filter_reason)
 
     return {
         "evaluations": evaluations,

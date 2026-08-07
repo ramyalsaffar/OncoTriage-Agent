@@ -24,6 +24,7 @@ import re
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
+from oncotriage.observability import console
 
 
 
@@ -59,8 +60,8 @@ def build_mesh_lookup(mesh_xml_path: str, output_dir: str) -> dict:
     """
     
 
-    print("Parsing MeSH descriptor XML (C04 Neoplasms subtree)...")
-    print(f"  Source: {mesh_xml_path}")
+    console.out("Parsing MeSH descriptor XML (C04 Neoplasms subtree)...")
+    console.out(f"  Source: {mesh_xml_path}")
 
     name_to_trees = {}   # {descriptor_name_lower: [tree_numbers]}
     tree_to_name  = {}   # {tree_number: descriptor_name}
@@ -119,10 +120,10 @@ def build_mesh_lookup(mesh_xml_path: str, output_dir: str) -> dict:
         # Free memory — critical for 300MB file
         elem.clear()
 
-    print(f"  Parsed {descriptor_count:,} descriptors total")
-    print(f"  Retained {c04_count:,} C04 (Neoplasms) descriptors")
-    print(f"  Tree numbers indexed: {len(tree_to_name):,}")
-    print(f"  Descriptor UIDs indexed: {len(uid_to_trees):,}")
+    console.out(f"  Parsed {descriptor_count:,} descriptors total")
+    console.out(f"  Retained {c04_count:,} C04 (Neoplasms) descriptors")
+    console.out(f"  Tree numbers indexed: {len(tree_to_name):,}")
+    console.out(f"  Descriptor UIDs indexed: {len(uid_to_trees):,}")
 
     # --- Save to JSON ---
     output_path = Path(output_dir)
@@ -134,15 +135,15 @@ def build_mesh_lookup(mesh_xml_path: str, output_dir: str) -> dict:
 
     with open(lookup_path, "w") as f:
         json.dump(name_to_trees, f, indent=2)
-    print(f"  Saved: {lookup_path} ({len(name_to_trees):,} entries)")
+    console.out(f"  Saved: {lookup_path} ({len(name_to_trees):,} entries)")
 
     with open(tree_path, "w") as f:
         json.dump(tree_to_name, f, indent=2)
-    print(f"  Saved: {tree_path} ({len(tree_to_name):,} entries)")
+    console.out(f"  Saved: {tree_path} ({len(tree_to_name):,} entries)")
 
     with open(uid_path, "w") as f:
         json.dump(uid_to_trees, f, indent=2)
-    print(f"  Saved: {uid_path} ({len(uid_to_trees):,} entries)")
+    console.out(f"  Saved: {uid_path} ({len(uid_to_trees):,} entries)")
 
     return {"name_to_trees": name_to_trees, "tree_to_name": tree_to_name,
             "uid_to_trees": uid_to_trees}
@@ -181,14 +182,14 @@ def build_snomed_to_mesh_crosswalk(mrconso_path: str, output_dir: str,
     Returns:
         dict: {snomed_code: [mesh_descriptor_names_lower]}
     """
-    print("\nBuilding SNOMED → MeSH crosswalk from MRCONSO_2025AB.RRF...")
-    print(f"  Source: {mrconso_path}")
+    console.out("\nBuilding SNOMED → MeSH crosswalk from MRCONSO_2025AB.RRF...")
+    console.out(f"  Source: {mrconso_path}")
 
     # --- Pass 1: Build CUI → MeSH C04 tree numbers mapping ---
     # Match on CODE (descriptor UID), NOT on STR (which varies by TTY).
     cui_to_trees = defaultdict(set)   # {CUI: {tree_number, ...}}
 
-    print("  Pass 1: Extracting CUI → MeSH C04 mappings (via descriptor UID)...")
+    console.out("  Pass 1: Extracting CUI → MeSH C04 mappings (via descriptor UID)...")
     mesh_rows = 0
     matched_rows = 0
 
@@ -211,12 +212,12 @@ def build_snomed_to_mesh_crosswalk(mrconso_path: str, output_dir: str,
                 matched_rows += 1
                 cui_to_trees[cui].update(mesh_uid_to_trees[mesh_code])
 
-    print(f"    MSH rows scanned: {mesh_rows:,}")
-    print(f"    MSH rows matched to C04: {matched_rows:,}")
-    print(f"    CUIs with C04 trees: {len(cui_to_trees):,}")
+    console.out(f"    MSH rows scanned: {mesh_rows:,}")
+    console.out(f"    MSH rows matched to C04: {matched_rows:,}")
+    console.out(f"    CUIs with C04 trees: {len(cui_to_trees):,}")
 
     # --- Pass 2: Build SNOMED code → CUI, then resolve to tree numbers ---
-    print("  Pass 2: Extracting SNOMED → CUI → C04 tree mappings...")
+    console.out("  Pass 2: Extracting SNOMED → CUI → C04 tree mappings...")
     snomed_to_trees = defaultdict(set)  # {snomed_code: {tree_number, ...}}
     snomed_rows = 0
 
@@ -238,8 +239,8 @@ def build_snomed_to_mesh_crosswalk(mrconso_path: str, output_dir: str,
             if cui in cui_to_trees:
                 snomed_to_trees[snomed_code].update(cui_to_trees[cui])
 
-    print(f"    SNOMEDCT_US rows scanned: {snomed_rows:,}")
-    print(f"    SNOMED codes with C04 tree mapping: {len(snomed_to_trees):,}")
+    console.out(f"    SNOMEDCT_US rows scanned: {snomed_rows:,}")
+    console.out(f"    SNOMED codes with C04 tree mapping: {len(snomed_to_trees):,}")
 
     # Convert sets to sorted lists for JSON serialization
     snomed_to_trees_serializable = {
@@ -253,7 +254,7 @@ def build_snomed_to_mesh_crosswalk(mrconso_path: str, output_dir: str,
 
     with open(crosswalk_path, "w") as f:
         json.dump(snomed_to_trees_serializable, f, indent=2)
-    print(f"  Saved: {crosswalk_path} ({len(snomed_to_trees_serializable):,} entries)")
+    console.out(f"  Saved: {crosswalk_path} ({len(snomed_to_trees_serializable):,} entries)")
 
     return snomed_to_trees_serializable
 
@@ -292,15 +293,15 @@ def build_icd10_to_mesh_crosswalk(mrconso_path: str, output_dir: str,
     Returns:
         dict: {icd10_code: [tree_numbers]} with both dotted and dot-free keys
     """
-    print("\nBuilding ICD-10-CM -> MeSH crosswalk from MRCONSO_2025AB.RRF...")
-    print(f"  Source: {mrconso_path}")
+    console.out("\nBuilding ICD-10-CM -> MeSH crosswalk from MRCONSO_2025AB.RRF...")
+    console.out(f"  Source: {mrconso_path}")
 
     # --- Pass 1: Build CUI -> MeSH C04 tree numbers mapping ---
     # Identical to build_snomed_to_mesh_crosswalk Pass 1.
     # Could be shared, but kept separate to avoid restructuring tested code.
     cui_to_trees = defaultdict(set)
 
-    print("  Pass 1: Extracting CUI -> MeSH C04 mappings (via descriptor UID)...")
+    console.out("  Pass 1: Extracting CUI -> MeSH C04 mappings (via descriptor UID)...")
     mesh_rows = 0
     matched_rows = 0
 
@@ -322,12 +323,12 @@ def build_icd10_to_mesh_crosswalk(mrconso_path: str, output_dir: str,
                 matched_rows += 1
                 cui_to_trees[cui].update(mesh_uid_to_trees[mesh_code])
 
-    print(f"    MSH rows scanned: {mesh_rows:,}")
-    print(f"    MSH rows matched to C04: {matched_rows:,}")
-    print(f"    CUIs with C04 trees: {len(cui_to_trees):,}")
+    console.out(f"    MSH rows scanned: {mesh_rows:,}")
+    console.out(f"    MSH rows matched to C04: {matched_rows:,}")
+    console.out(f"    CUIs with C04 trees: {len(cui_to_trees):,}")
 
     # --- Pass 2: Build ICD-10-CM code -> CUI, then resolve to tree numbers ---
-    print("  Pass 2: Extracting ICD-10-CM -> CUI -> C04 tree mappings...")
+    console.out("  Pass 2: Extracting ICD-10-CM -> CUI -> C04 tree mappings...")
     icd10_to_trees = defaultdict(set)
     icd10_rows = 0
 
@@ -348,8 +349,8 @@ def build_icd10_to_mesh_crosswalk(mrconso_path: str, output_dir: str,
             if cui in cui_to_trees:
                 icd10_to_trees[icd10_code].update(cui_to_trees[cui])
 
-    print(f"    ICD10CM rows scanned: {icd10_rows:,}")
-    print(f"    ICD-10-CM codes with C04 tree mapping: {len(icd10_to_trees):,}")
+    console.out(f"    ICD10CM rows scanned: {icd10_rows:,}")
+    console.out(f"    ICD-10-CM codes with C04 tree mapping: {len(icd10_to_trees):,}")
 
     # --- Expand to dot-free variants ---
     # MRCONSO stores ICD-10-CM codes with dots (e.g., "C34.10").
@@ -363,7 +364,7 @@ def build_icd10_to_mesh_crosswalk(mrconso_path: str, output_dir: str,
         if dot_free != code:
             expanded[dot_free] = trees
 
-    print(f"    After dot-free expansion: {len(expanded):,} entries")
+    console.out(f"    After dot-free expansion: {len(expanded):,} entries")
 
     # Convert sets to sorted lists for JSON serialization
     icd10_serializable = {
@@ -377,7 +378,7 @@ def build_icd10_to_mesh_crosswalk(mrconso_path: str, output_dir: str,
 
     with open(crosswalk_path, "w") as f:
         json.dump(icd10_serializable, f, indent=2)
-    print(f"  Saved: {crosswalk_path} ({len(icd10_serializable):,} entries)")
+    console.out(f"  Saved: {crosswalk_path} ({len(icd10_serializable):,} entries)")
 
     return icd10_serializable
 
@@ -438,14 +439,14 @@ def build_umls_synonym_crosswalk(mrconso_path: str, output_dir: str,
     Output file:
         umls_synonym_to_mesh_trees.json in output_dir
     """
-    print("\nBuilding UMLS synonym-to-MeSH crosswalk from MRCONSO_2025AB.RRF...")
-    print(f"  Source: {mrconso_path}")
+    console.out("\nBuilding UMLS synonym-to-MeSH crosswalk from MRCONSO_2025AB.RRF...")
+    console.out(f"  Source: {mrconso_path}")
 
     # --- Pass 1: Build CUI -> MeSH C04 tree numbers mapping ---
     # Same CUI bridge as SNOMED and ICD-10 crosswalks.
     cui_to_trees = defaultdict(set)
 
-    print("  Pass 1: Extracting CUI -> MeSH C04 mappings (via descriptor UID)...")
+    console.out("  Pass 1: Extracting CUI -> MeSH C04 mappings (via descriptor UID)...")
     mesh_rows = 0
     matched_rows = 0
 
@@ -467,16 +468,16 @@ def build_umls_synonym_crosswalk(mrconso_path: str, output_dir: str,
                 matched_rows += 1
                 cui_to_trees[cui].update(mesh_uid_to_trees[mesh_code])
 
-    print(f"    MSH rows scanned: {mesh_rows:,}")
-    print(f"    MSH rows matched to C04: {matched_rows:,}")
-    print(f"    CUIs with C04 trees: {len(cui_to_trees):,}")
+    console.out(f"    MSH rows scanned: {mesh_rows:,}")
+    console.out(f"    MSH rows matched to C04: {matched_rows:,}")
+    console.out(f"    CUIs with C04 trees: {len(cui_to_trees):,}")
 
     # --- Pass 2: Collect ALL English synonyms for cancer CUIs ---
     # For every row in MRCONSO where the CUI has C04 trees and the
     # language is English, capture the STR field as a synonym.
     # This spans ALL source vocabularies (NCI, SNOMED, ICD-10, ICD-O,
     # OMIM, common names, etc.).
-    print("  Pass 2: Collecting English synonyms for cancer CUIs (all vocabularies)...")
+    console.out("  Pass 2: Collecting English synonyms for cancer CUIs (all vocabularies)...")
     synonym_to_trees = defaultdict(set)
     total_rows_scanned = 0
     synonym_hits = 0
@@ -541,9 +542,9 @@ def build_umls_synonym_crosswalk(mrconso_path: str, output_dir: str,
             synonym_to_trees[synonym_lower].update(cui_to_trees[cui])
             synonym_hits += 1
 
-    print(f"    Total MRCONSO rows scanned: {total_rows_scanned:,}")
-    print(f"    Synonym-tree associations found: {synonym_hits:,}")
-    print(f"    Unique synonyms (before filtering): {len(synonym_to_trees):,}")
+    console.out(f"    Total MRCONSO rows scanned: {total_rows_scanned:,}")
+    console.out(f"    Synonym-tree associations found: {synonym_hits:,}")
+    console.out(f"    Unique synonyms (before filtering): {len(synonym_to_trees):,}")
 
     # --- Post-processing: remove synonyms already in name_to_trees ---
     # These are MeSH descriptor names already handled by direct lookup.
@@ -555,8 +556,8 @@ def build_umls_synonym_crosswalk(mrconso_path: str, output_dir: str,
             del synonym_to_trees[key]
             removed_duplicates += 1
 
-    print(f"    Removed {removed_duplicates:,} synonyms already in MeSH name_to_trees")
-    print(f"    Final unique synonyms: {len(synonym_to_trees):,}")
+    console.out(f"    Removed {removed_duplicates:,} synonyms already in MeSH name_to_trees")
+    console.out(f"    Final unique synonyms: {len(synonym_to_trees):,}")
 
     # --- Spot-check: verify critical cancer names resolved correctly ---
     _SPOT_CHECKS = {
@@ -573,7 +574,7 @@ def build_umls_synonym_crosswalk(mrconso_path: str, output_dir: str,
         "cholangiocarcinoma":    "C04.588",           # prefix for bile duct/liver
     }
 
-    print("\n  --- Spot Check (critical cancer synonyms) ---")
+    console.out("\n  --- Spot Check (critical cancer synonyms) ---")
     spot_pass = 0
     spot_fail = 0
     for term, expected_prefix in _SPOT_CHECKS.items():
@@ -586,12 +587,12 @@ def build_umls_synonym_crosswalk(mrconso_path: str, output_dir: str,
             else:
                 spot_fail += 1
             sample_tree = sorted(trees)[0]
-            print(f"    '{term}' -> {len(trees)} trees, sample: {sample_tree} [{status}]")
+            console.out(f"    '{term}' -> {len(trees)} trees, sample: {sample_tree} [{status}]")
         else:
             spot_fail += 1
-            print(f"    '{term}' -> NOT FOUND [MISSING]")
+            console.out(f"    '{term}' -> NOT FOUND [MISSING]")
 
-    print(f"  Spot check: {spot_pass} passed, {spot_fail} failed out of {len(_SPOT_CHECKS)}")
+    console.out(f"  Spot check: {spot_pass} passed, {spot_fail} failed out of {len(_SPOT_CHECKS)}")
 
     # Convert sets to sorted lists for JSON serialization
     synonym_serializable = {
@@ -605,7 +606,7 @@ def build_umls_synonym_crosswalk(mrconso_path: str, output_dir: str,
 
     with open(crosswalk_path, "w") as f:
         json.dump(synonym_serializable, f, indent=2)
-    print(f"\n  Saved: {crosswalk_path} ({len(synonym_serializable):,} entries)")
+    console.out(f"\n  Saved: {crosswalk_path} ({len(synonym_serializable):,} entries)")
 
     return synonym_serializable
 
@@ -629,9 +630,9 @@ def build_all_lookups(mesh_xml_path: str, mrconso_path: str, output_dir: str):
         mrconso_path:  Path to MRCONSO_2025AB.RRF
         output_dir:    Directory to write JSON files (data_MeSH_path)
     """
-    print("=" * 60)
-    print("  MeSH Cancer Filter: Building Lookup Files")
-    print("=" * 60)
+    console.out("=" * 60)
+    console.out("  MeSH Cancer Filter: Building Lookup Files")
+    console.out("=" * 60)
 
     # Step 1: MeSH hierarchy
     mesh_data = build_mesh_lookup(mesh_xml_path, output_dir)
@@ -655,9 +656,9 @@ def build_all_lookups(mesh_xml_path: str, mrconso_path: str, output_dir: str):
         name_to_trees=mesh_data["name_to_trees"],
     )
 
-    print(f"\n{'=' * 60}")
-    print("  All lookup files built successfully!")
-    print(f"{'=' * 60}\n")
+    console.out(f"\n{'=' * 60}")
+    console.out("  All lookup files built successfully!")
+    console.out(f"{'=' * 60}\n")
 
 
 #------------------------------------------------------------------------------

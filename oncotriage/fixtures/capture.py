@@ -182,6 +182,7 @@ from oncotriage.utils import (
     qdrant_retry,
     resolve_qdrant_collection,
 )
+from oncotriage.observability import console, correlation_scope
 
 
 #------------------------------------------------------------------------------
@@ -1231,7 +1232,7 @@ def _resolve_and_verify_collection() -> tuple:
         )
 
     if not alias_resolved:
-        print(f"  WARNING: '{COLLECTION_NAME}' did not resolve through an alias. "
+        console.out(f"  WARNING: '{COLLECTION_NAME}' did not resolve through an alias. "
               f"Pinning the alias name itself; a future alias swap will make "
               f"this fixture's retrieval diff meaningless rather than failing "
               f"the collection check.")
@@ -1242,7 +1243,7 @@ def _resolve_and_verify_collection() -> tuple:
 def build_environment_block() -> Dict:
     resolved, alias_resolved = _resolve_and_verify_collection()
     digest, elapsed = compute_collection_digest(resolved)
-    print(f"  Collection digest: {digest['point_count']} points, "
+    console.out(f"  Collection digest: {digest['point_count']} points, "
           f"{digest['distinct_nct_ids']} distinct NCT IDs, "
           f"sha256 {digest['nct_id_sha256'][:16]}... ({elapsed}s)")
     return {
@@ -1541,7 +1542,7 @@ def capture_fixture(fixture_id: str,
     but its input is not, and fixture_kind is set to "constructed" so no
     consumer can miss that. derivation carries the recipe that reproduces it.
     """
-    print(f"\n{'#' * 78}\n# CAPTURE {fixture_id}  [{', '.join(case_labels)}]\n{'#' * 78}")
+    console.out(f"\n{'#' * 78}\n# CAPTURE {fixture_id}  [{', '.join(case_labels)}]\n{'#' * 78}")
 
     patient_data = parse_fhir_bundle(bundle_path)
 
@@ -1555,7 +1556,11 @@ def capture_fixture(fixture_id: str,
         # fixture must start from the same ground production starts from, and a
         # second copy would drift silently (see File 13).
         initial_state = build_initial_state(patient_data, ablation_flags)
-        final_state = graph.invoke(initial_state)
+        # Scoped for the same reason match_patient_to_trials() scopes: this is
+        # one patient's run, and a capture whose log lines carry the "-"
+        # sentinel cannot be read back against the fixture it produced.
+        with correlation_scope():
+            final_state = graph.invoke(initial_state)
 
         result = final_state["result"]
         # The two things match_patient_to_trials() stamps on after invoke().
@@ -2195,7 +2200,7 @@ def scan_cohort(bundle_paths: List[str]) -> List[Dict]:
     the SAME helpers Stage 1 and Stage 4 call, so a patient selected here is a
     patient the pipeline will agree with.
     """
-    print(f"\n[Scan] Classifying {len(bundle_paths)} patient bundles "
+    console.out(f"\n[Scan] Classifying {len(bundle_paths)} patient bundles "
           f"(no network calls)...")
 
     rows = []
@@ -2203,14 +2208,14 @@ def scan_cohort(bundle_paths: List[str]) -> List[Dict]:
 
     for index, path in enumerate(bundle_paths, start=1):
         if index % 200 == 0:
-            print(f"  ...{index}/{len(bundle_paths)}")
+            console.out(f"  ...{index}/{len(bundle_paths)}")
         try:
             patient_data = parse_fhir_bundle(path)
         except Exception as exc:
             # Counted, not swallowed: a cohort with unparseable bundles is a
             # fact about the corpus that the selection report has to state.
             failures += 1
-            print(f"  WARNING: parse failed for {os.path.basename(path)}: "
+            console.out(f"  WARNING: parse failed for {os.path.basename(path)}: "
                   f"{type(exc).__name__}: {exc}")
             continue
 
@@ -2245,7 +2250,7 @@ def scan_cohort(bundle_paths: List[str]) -> List[Dict]:
             "ecog": (patient_data.get("ecog_performance_status") or {}).get("value"),
         })
 
-    print(f"[Scan] Parsed {len(rows)} bundle(s); {failures} failed.")
+    console.out(f"[Scan] Parsed {len(rows)} bundle(s); {failures} failed.")
     return rows
 
 
@@ -2354,7 +2359,7 @@ def select_cases(rows: List[Dict], probe_limit: int) -> Dict:
         key=lambda r: (diagnosis_counts[r["primary_diagnosis"]], r["bundle"]),
     )[:probe_limit]
 
-    print(f"\n[Probe] Hunting for an empty candidate pool across "
+    console.out(f"\n[Probe] Hunting for an empty candidate pool across "
           f"{len(probe_order)} patient(s), rarest cancer site first...")
 
     found = None
@@ -2362,11 +2367,11 @@ def select_cases(rows: List[Dict], probe_limit: int) -> Dict:
         try:
             outcome = probe_empty_candidate_pool(row["path"])
         except Exception as exc:
-            print(f"  WARNING: probe failed for {row['bundle']}: "
+            console.out(f"  WARNING: probe failed for {row['bundle']}: "
                   f"{type(exc).__name__}: {exc}")
             continue
         if index % 25 == 0 or outcome["empty_pool"]:
-            print(f"  [{index}/{len(probe_order)}] {row['bundle'][:40]:<40} "
+            console.out(f"  [{index}/{len(probe_order)}] {row['bundle'][:40]:<40} "
                   f"pool={outcome['pool_size']:>3} "
                   f"survivors={outcome['survivors']:>3} "
                   f"({row['primary_diagnosis'][:40]})")
@@ -2380,7 +2385,7 @@ def select_cases(rows: List[Dict], probe_limit: int) -> Dict:
         selection[CASE_NO_CANDIDATES] = found
     else:
         selection[CASE_NO_CANDIDATES] = None
-        print(f"[Probe] No patient in the probed {len(probe_order)} produced an "
+        console.out(f"[Probe] No patient in the probed {len(probe_order)} produced an "
               f"empty candidate pool.")
 
     # --- Ablation run and the normal patients ------------------------------
@@ -2587,9 +2592,9 @@ def _assert_database_is_isolated() -> None:
         )
 
     if os.path.exists(production_inferences_path()):
-        print(f"  Production inferences.db left untouched "
+        console.out(f"  Production inferences.db left untouched "
               f"({os.path.getsize(production_inferences_path()) / 1024:.0f} KB).")
-    print(f"  No database is opened by this run; the scratch path "
+    console.out(f"  No database is opened by this run; the scratch path "
           f"{FIXTURE_SCRATCH_DB} is a comparison probe only.")
 
 
@@ -2613,32 +2618,32 @@ def main() -> int:
 
     _assert_database_is_isolated()
 
-    print(f"\n{'=' * 78}")
-    print(f"{Project_Name}: Characterization Fixture Capture (schema v{SCHEMA_VERSION})")
-    print(f"{'=' * 78}")
-    print(f"  Fixture directory: {root}")
+    console.out(f"\n{'=' * 78}")
+    console.out(f"{Project_Name}: Characterization Fixture Capture (schema v{SCHEMA_VERSION})")
+    console.out(f"{'=' * 78}")
+    console.out(f"  Fixture directory: {root}")
 
     bundle_paths = sorted(glob.glob(paths.data_fhir_path + "*.json"))
     if not bundle_paths:
-        print(f"[FATAL] No FHIR bundles found in {paths.data_fhir_path}")
+        console.out(f"[FATAL] No FHIR bundles found in {paths.data_fhir_path}")
         return 1
-    print(f"  Cohort: {len(bundle_paths)} bundles\n")
+    console.out(f"  Cohort: {len(bundle_paths)} bundles\n")
 
     rows = scan_cohort(bundle_paths)
     if not rows:
-        print("[FATAL] No bundle parsed successfully.")
+        console.out("[FATAL] No bundle parsed successfully.")
         return 1
 
     # --- Cohort summary ----------------------------------------------------
     n_fallback = sum(1 for r in rows if r["expansion_path"] == EXPANSION_PATH_FALLBACK)
     n_unknown_stage = sum(1 for r in rows if r["stage"] is None)
-    print(f"\n[Scan] {n_fallback} patient(s) take EXPANSION_PATH_FALLBACK; "
+    console.out(f"\n[Scan] {n_fallback} patient(s) take EXPANSION_PATH_FALLBACK; "
           f"{n_unknown_stage} have no determinable cancer stage.")
 
     selection = select_cases(rows, args.probe_limit)
 
     # --- Report the selection ----------------------------------------------
-    print(f"\n{'-' * 78}\nCASE COVERAGE\n{'-' * 78}")
+    console.out(f"\n{'-' * 78}\nCASE COVERAGE\n{'-' * 78}")
     plan = []
 
     def _add(fixture_id, row, labels, flags=None, config_name=None,
@@ -2693,7 +2698,7 @@ def main() -> int:
             # Not silent: an unreadable fixture here means the donor is about
             # to be re-chosen, which repoints a bundle that something on disk
             # may still reference. The reader has to see why.
-            print(f"  WARNING: cannot read the existing {derived_id} fixture "
+            console.out(f"  WARNING: cannot read the existing {derived_id} fixture "
                   f"to recover its donor ({exc}). Searching for a new one.")
             return None
         bundle = (recorded.get("derivation") or {}).get("donor_bundle")
@@ -2702,7 +2707,7 @@ def main() -> int:
         for candidate in rows:
             if candidate["bundle"] == bundle:
                 return candidate
-        print(f"  WARNING: {derived_id} names donor {bundle}, which is no "
+        console.out(f"  WARNING: {derived_id} names donor {bundle}, which is no "
               f"longer in the cohort. Searching for a new one.")
         return None
 
@@ -2725,22 +2730,22 @@ def main() -> int:
 
         known = _recorded_donor(derived_id)
         if known is not None:
-            print(f"\n[Derive] {derived_id}: rebuilding from the donor the "
+            console.out(f"\n[Derive] {derived_id}: rebuilding from the donor the "
                   f"existing fixture records ({known['bundle'][:44]})")
             info = build_no_candidates_bundle(
                 known["path"], out_path, NO_CANDIDATES_AGE_YEARS
             )
             outcome = probe_empty_candidate_pool(out_path)
             tried = 1
-            print(f"  survivors={outcome['survivors']}")
+            console.out(f"  survivors={outcome['survivors']}")
             if outcome["empty_pool"]:
                 accepted = (known, info, outcome)
             else:
-                print("  The recorded donor no longer empties the pool — the "
+                console.out("  The recorded donor no longer empties the pool — the "
                       "index has changed. Searching for another.")
 
         if accepted is None:
-            print(f"\n[Derive] {derived_id}: no cohort patient empties the "
+            console.out(f"\n[Derive] {derived_id}: no cohort patient empties the "
                   f"candidate pool. Searching donors, age forced to "
                   f"{NO_CANDIDATES_AGE_YEARS}y...")
         while accepted is None and tried < NO_CANDIDATES_MAX_DONORS and donors:
@@ -2753,7 +2758,7 @@ def main() -> int:
             if best is None or outcome["survivors"] < best[1]["survivors"]:
                 best = (donor, outcome)
             if outcome["empty_pool"] or tried % 10 == 0:
-                print(f"  [{tried}/{NO_CANDIDATES_MAX_DONORS}] "
+                console.out(f"  [{tried}/{NO_CANDIDATES_MAX_DONORS}] "
                       f"{donor['bundle'][:38]:<38} "
                       f"survivors={outcome['survivors']:>3} "
                       f"({donor['primary_diagnosis'][:34]})")
@@ -2761,7 +2766,7 @@ def main() -> int:
                 accepted = (donor, info, outcome)
                 break
         if accepted is None:
-            print(f"  [Derive] FAILED after {tried} donor(s). Best was "
+            console.out(f"  [Derive] FAILED after {tried} donor(s). Best was "
                   f"{best[1]['survivors']} survivor(s) "
                   f"({best[0]['bundle'][:40]}). Every Stage 4 rule is "
                   f"conservative, so a trial stating no age, sex, stage or "
@@ -2819,12 +2824,12 @@ def main() -> int:
         # re-running this file regenerates the same bundle instead of
         # repointing a captured fixture at a different patient.
         donor = _recorded_donor(derived_id) or _next_donor()
-        print(f"\n[Derive] {derived_id}: no cohort patient takes "
+        console.out(f"\n[Derive] {derived_id}: no cohort patient takes "
               f"EXPANSION_PATH_FALLBACK; deriving from {donor['bundle'][:44]}")
         info = build_mesh_fallback_bundle(donor["path"], out_path)
         was = ", ".join(f"{c['was_code']} ({c['was_display']})"
                         for c in info["codings_rewritten"])
-        print(f"  rewrote {len(info['codings_rewritten'])} primary-cancer "
+        console.out(f"  rewrote {len(info['codings_rewritten'])} primary-cancer "
               f"coding(s): {was[:100]}")
         _add(derived_id, donor, [CASE_MESH_FALLBACK],
              bundle_path=out_path,
@@ -2863,10 +2868,10 @@ def main() -> int:
                                              suffix=".bundle.json")
         os.close(_handle)
         donor = _recorded_donor(derived_id) or _next_donor()
-        print(f"\n[Derive] {derived_id}: no cohort bundle carries LOINC "
+        console.out(f"\n[Derive] {derived_id}: no cohort bundle carries LOINC "
               f"{MCODE_VARIANT_LOINC}; deriving from {donor['bundle'][:44]}")
         info = build_mcode_variant_bundle(donor["path"], out_path)
-        print(f"  injected {info['gene']} {info['protein_change']} "
+        console.out(f"  injected {info['gene']} {info['protein_change']} "
               f"(LOINC {info['loinc']}) dated {info['effective'][:10]}")
         _add(derived_id, donor, [CASE_MCODE_VARIANT],
              bundle_path=out_path,
@@ -2940,26 +2945,26 @@ def main() -> int:
 
     for entry in plan:
         row = entry["row"]
-        print(f"  {entry['fixture_id']:<28} {row['bundle'][:44]:<44}")
-        print(f"  {'':<28} patient_id={row['patient_id']}")
-        print(f"  {'':<28} dx={row['primary_diagnosis'][:60]}")
-        print(f"  {'':<28} mesh={row['mesh_resolution']} "
+        console.out(f"  {entry['fixture_id']:<28} {row['bundle'][:44]:<44}")
+        console.out(f"  {'':<28} patient_id={row['patient_id']}")
+        console.out(f"  {'':<28} dx={row['primary_diagnosis'][:60]}")
+        console.out(f"  {'':<28} mesh={row['mesh_resolution']} "
               f"path={row['expansion_path']} stage={row['stage']} "
               f"ecog={row['ecog']}")
         if entry["config_name"]:
-            print(f"  {'':<28} ablation={entry['config_name']}")
+            console.out(f"  {'':<28} ablation={entry['config_name']}")
         if entry["construction"]:
-            print(f"  {'':<28} DERIVED BUNDLE from "
+            console.out(f"  {'':<28} DERIVED BUNDLE from "
                   f"{entry['construction']['derived_from_bundle'][:40]}")
-    print(f"  {'gpt4o_retry_constructed':<28} constructed from normal_1")
+    console.out(f"  {'gpt4o_retry_constructed':<28} constructed from normal_1")
 
     if args.scan_only:
-        print("\n--scan-only: nothing captured.")
+        console.out("\n--scan-only: nothing captured.")
         return 0
 
     # --- Capture -----------------------------------------------------------
     environment = build_environment_block()
-    print(f"\n[Env] Pinned Qdrant collection: {environment['qdrant_collection']}"
+    console.out(f"\n[Env] Pinned Qdrant collection: {environment['qdrant_collection']}"
           f"{'' if environment['alias_resolved'] else '  (alias fallback!)'}")
 
     graph = build_matching_graph()
@@ -2994,7 +2999,7 @@ def main() -> int:
             )
             path = write_fixture(fixture, root)
             written.append(fixture)
-            print(f"  -> {os.path.basename(path)} "
+            console.out(f"  -> {os.path.basename(path)} "
                   f"({os.path.getsize(path) / 1024:.0f} KB, "
                   f"terminal={fixture['deterministic_prefix']['terminal']['terminal_node']})")
             if entry["fixture_id"] == "normal_1":
@@ -3006,7 +3011,7 @@ def main() -> int:
     for entry in plan:
         if entry["derivation"] and os.path.exists(entry["bundle_path"]):
             os.remove(entry["bundle_path"])
-            print(f"  removed temporary bundle for {entry['fixture_id']}")
+            console.out(f"  removed temporary bundle for {entry['fixture_id']}")
 
     # --- The constructed retry fixture -------------------------------------
     if normal_1_fixture is None:
@@ -3021,10 +3026,10 @@ def main() -> int:
         )
         path = write_fixture(retry_fixture, root)
         written.append(retry_fixture)
-        print(f"\n  -> {os.path.basename(path)} (constructed from "
+        console.out(f"\n  -> {os.path.basename(path)} (constructed from "
               f"{retry_fixture['construction']['derived_from']})")
     elif normal_1_fixture is None:
-        print("\n  WARNING: normal_1 was not captured, so the constructed retry "
+        console.out("\n  WARNING: normal_1 was not captured, so the constructed retry "
               "fixture was not built.")
 
     # --- Index -------------------------------------------------------------
@@ -3033,7 +3038,7 @@ def main() -> int:
         try:
             all_fixtures.append(load_fixture(path))
         except ValueError as exc:
-            print(f"  WARNING: {exc}")
+            console.out(f"  WARNING: {exc}")
 
     index = {
         "schema_version": SCHEMA_VERSION,
@@ -3060,13 +3065,13 @@ def main() -> int:
     for f in all_fixtures:
         covered.update(f["case_labels"])
 
-    print(f"\n{'=' * 78}")
-    print(f"Wrote {len(written)} fixture(s); {len(all_fixtures)} in {root}")
-    print(f"Branch cases covered: {sorted(covered & set(ALL_BRANCH_CASES))}")
+    console.out(f"\n{'=' * 78}")
+    console.out(f"Wrote {len(written)} fixture(s); {len(all_fixtures)} in {root}")
+    console.out(f"Branch cases covered: {sorted(covered & set(ALL_BRANCH_CASES))}")
     uncovered = sorted(set(ALL_BRANCH_CASES) - covered)
     if uncovered:
-        print(f"Branch cases NOT covered: {uncovered}")
-    print(f"{'=' * 78}\n")
+        console.out(f"Branch cases NOT covered: {uncovered}")
+    console.out(f"{'=' * 78}\n")
 
     return 0 if not uncovered else 1
 #------------------------------------------------------------------------------

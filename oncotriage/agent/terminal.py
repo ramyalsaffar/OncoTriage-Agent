@@ -26,8 +26,12 @@ from datetime import datetime
 from typing import Dict
 
 from oncotriage.agent.state import TrialMatchState
+from oncotriage.observability import get_logger
 from oncotriage.registries.primary_cancer import _resolve_primary_cancer
 from oncotriage.utils import deduplicate_by_display, get_age_reference_date
+
+
+log = get_logger(__name__)
 
 
 #------------------------------------------------------------------------------
@@ -323,14 +327,12 @@ def node_finalize(state: TrialMatchState) -> dict:
         **_pipeline_provenance(state),
     }
 
-    eligible_count = len(matches)
-    print(
-        f"[Stage 6] Finalized: {eligible_count} eligible, "
-        f"{len(near_misses)} not_eligible, "
-        f"{len(not_evaluable)} not_evaluable "
-        f"for patient {patient_data['patient_id']}"
-    )
-    
+    log.info("finalized", stage=6, node=TERMINAL_NODE_FINALIZE,
+             patient_id=patient_data["patient_id"],
+             eligible=len(matches), not_eligible=len(near_misses),
+             not_evaluable=len(not_evaluable))
+
+
     return {"result": result}
 
 
@@ -387,7 +389,9 @@ def node_no_candidates(state: TrialMatchState) -> dict:
         **_pipeline_provenance(state),
     }
 
-    print(f"[No Candidates] No matching trials for patient {patient_data['patient_id']}")
+    log.info("no candidates survived the pipeline",
+             node=TERMINAL_NODE_NO_CANDIDATES,
+             patient_id=patient_data["patient_id"], eligible=0)
 
     return {"result": result}
 
@@ -448,7 +452,9 @@ def node_error_handler(state: TrialMatchState) -> dict:
         **_pipeline_provenance(state),
     }
 
-    print(f"[ERROR] Pipeline failed for patient {patient_data['patient_id']}: {error_msg}")
+    log.error("pipeline failed", node=TERMINAL_NODE_ERROR,
+              patient_id=patient_data["patient_id"], status="error",
+              error_message=error_msg)
 
     return {"result": result}
 

@@ -83,6 +83,7 @@ from pathlib import Path
 
 from oncotriage import config
 from oncotriage import paths
+from oncotriage.observability import console
 
 
 #------------------------------------------------------------------------------
@@ -164,9 +165,9 @@ def download_all_collections(output_dir, client=None):
     # =====================================================================
 
     collections = client.get_collections().collections
-    print(f"Found {len(collections)} collections:")
+    console.out(f"Found {len(collections)} collections:")
     for c in collections:
-        print(f"  - {c.name}")
+        console.out(f"  - {c.name}")
     summary["collections"] = [c.name for c in collections]
 
     # File 29 swallowed this with a bare `pass`. Continuing is right -- nothing
@@ -174,13 +175,13 @@ def download_all_collections(output_dir, client=None):
     # is printed and the failure is recorded in the summary.
     try:
         all_aliases = client.get_aliases()
-        print(f"\nAliases: {all_aliases}")
+        console.out(f"\nAliases: {all_aliases}")
     except Exception as e:
         summary["aliases_error"] = repr(e)
-        print(f"\nAliases: unavailable ({type(e).__name__}: {e})")
-        print("  Continuing -- the download does not use them.")
+        console.out(f"\nAliases: unavailable ({type(e).__name__}: {e})")
+        console.out("  Continuing -- the download does not use them.")
 
-    print()
+    console.out()
 
     # =====================================================================
     # DOWNLOAD EACH COLLECTION
@@ -192,16 +193,16 @@ def download_all_collections(output_dir, client=None):
         info = client.get_collection(collection_name=name)
         point_count = info.points_count
 
-        print(f"{'='*60}")
-        print(f"Collection: {name}")
-        print(f"  Points: {point_count}")
+        console.out(f"{'='*60}")
+        console.out(f"Collection: {name}")
+        console.out(f"  Points: {point_count}")
 
         if point_count == 0:
-            print(f"  Empty. Skipping.")
+            console.out(f"  Empty. Skipping.")
             summary["skipped_empty"].append(name)
             continue
 
-        print(f"  Downloading...")
+        console.out(f"  Downloading...")
 
         all_points = []
         offset = None
@@ -252,10 +253,10 @@ def download_all_collections(output_dir, client=None):
                 break
             offset = next_offset
 
-            print(f"    {len(all_points)}/{point_count}...", end="\r")
+            console.out(f"    {len(all_points)}/{point_count}...", end="\r")
             time.sleep(0.05)
 
-        print(f"    {len(all_points)}/{point_count} done.    ")
+        console.out(f"    {len(all_points)}/{point_count} done.    ")
 
         output_file = Path(output_dir) / f"{name}.json"
 
@@ -272,30 +273,30 @@ def download_all_collections(output_dir, client=None):
             )
 
         file_size_mb = output_file.stat().st_size / (1024 * 1024)
-        print(f"  Saved: {output_file.name} ({file_size_mb:.1f} MB)")
-        print()
+        console.out(f"  Saved: {output_file.name} ({file_size_mb:.1f} MB)")
+        console.out()
         summary["points_written"][name] = len(all_points)
 
     # =====================================================================
     # SUMMARY
     # =====================================================================
 
-    print("=" * 60)
-    print("DOWNLOAD COMPLETE")
-    print("=" * 60)
+    console.out("=" * 60)
+    console.out("DOWNLOAD COMPLETE")
+    console.out("=" * 60)
 
     backup_files = list(Path(output_dir).glob("*.json"))
     total_size = sum(f.stat().st_size for f in backup_files) / (1024 * 1024)
 
-    print(f"  Directory: {output_dir}")
-    print(f"  Collections: {len(backup_files)}")
-    print(f"  Total size: {total_size:.1f} MB")
+    console.out(f"  Directory: {output_dir}")
+    console.out(f"  Collections: {len(backup_files)}")
+    console.out(f"  Total size: {total_size:.1f} MB")
 
     for f in sorted(backup_files):
         size = f.stat().st_size / (1024 * 1024)
-        print(f"    {f.name}: {size:.1f} MB")
+        console.out(f"    {f.name}: {size:.1f} MB")
 
-    print(f"\nQdrant data is safe.")
+    console.out(f"\nQdrant data is safe.")
 
     summary["total_size_mb"] = total_size
     return summary

@@ -381,20 +381,32 @@ class captured_warnings:
 
 
 def quiet(fn, *args, **kwargs):
-    """Run `fn`, swallowing its stdout. Returns (value, captured_text).
+    """Run `fn`, swallowing its console output. Returns (value, captured_text).
 
-    The degraded paths print as well as log, and this file calls them a dozen
-    times. Captured rather than discarded, so a section that wants to assert on
-    the printed text still can.
+    The degraded paths announce as well as log, and this file calls them a
+    dozen times. Captured rather than discarded, so a section that wants to
+    assert on the announced text still can.
+
+    BOTH STREAMS, AND STDERR IS THE ONE THAT MATTERS NOW. This captured stdout
+    alone until the structured-logging pass, which moved every human-facing
+    line in the package onto ``oncotriage.observability``'s console channel --
+    and that channel writes to stderr, because stdout is the MCP server's
+    protocol stream and nothing this project writes may land there. With stdout
+    alone the buffer came back EMPTY and "the console said nothing was deleted"
+    failed against a dry run that had said exactly that.
+
+    Both are taken rather than swapping one for the other: a future line that
+    goes back to stdout should be caught by the assertion, not silently missed
+    by a helper that has stopped looking there.
     """
-    buffer = io.StringIO()
-    previous = sys.stdout
-    sys.stdout = buffer
+    out_buffer, err_buffer = io.StringIO(), io.StringIO()
+    previous_out, previous_err = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = out_buffer, err_buffer
     try:
         value = fn(*args, **kwargs)
     finally:
-        sys.stdout = previous
-    return value, buffer.getvalue()
+        sys.stdout, sys.stderr = previous_out, previous_err
+    return value, out_buffer.getvalue() + err_buffer.getvalue()
 
 
 def sha256_of(path):

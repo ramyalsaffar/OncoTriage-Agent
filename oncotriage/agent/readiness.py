@@ -49,8 +49,12 @@ from collections import Counter
 
 from oncotriage import config
 from oncotriage.agent import deps
+from oncotriage.observability import get_logger
 from oncotriage.registries import mesh
 from oncotriage.settings import DegradedDependencyError
+
+
+log = get_logger(__name__)
 
 
 #------------------------------------------------------------------------------
@@ -288,9 +292,11 @@ def require_populated_index(client=None, collection=None) -> dict:
                               endpoint=verdict["endpoint"])
 
     # unverifiable: recorded above by probe_index, announced here, not fatal.
-    print(f"  WARNING: could not verify the trial index before retrieval — "
-          f"{verdict['error']}. Endpoint: {verdict['endpoint']}. "
-          f"Continuing; retrieval failures are recorded per channel.")
+    log.warning("could not verify the trial index before retrieval; "
+                "continuing, retrieval failures are recorded per channel",
+                event="index_probe_unverifiable", status=verdict["state"],
+                collection=verdict["collection"], endpoint=verdict["endpoint"],
+                error_message=str(verdict["error"]))
     return verdict
 
 

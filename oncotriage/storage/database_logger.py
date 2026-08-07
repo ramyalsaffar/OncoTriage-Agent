@@ -91,6 +91,7 @@ from oncotriage import settings
 from oncotriage.config import CROSS_ENCODER_MODEL, MATCHING_MODEL, PRICING_CONFIG
 from oncotriage.registries.primary_cancer import _resolve_primary_cancer
 from oncotriage.utils import deduplicate_by_display, get_model_cost
+from oncotriage.observability import console
 
 
 #------------------------------------------------------------------------------
@@ -573,7 +574,7 @@ CREATE TABLE IF NOT EXISTS inferences (
     for _column, _sql_type in INFERENCE_COLUMN_ADDITIONS.items():
         if _column not in _existing_inference_columns:
             cursor.execute(f"ALTER TABLE inferences ADD COLUMN {_column} {_sql_type}")
-            print(f"Schema migration: added inferences.{_column}")
+            console.out(f"Schema migration: added inferences.{_column}")
 
 
     # Trial matches table
@@ -605,7 +606,7 @@ CREATE TABLE IF NOT EXISTS trial_matches (
     for _column, _sql_type in TRIAL_MATCH_COLUMN_ADDITIONS.items():
         if _column not in _existing_trial_match_columns:
             cursor.execute(f"ALTER TABLE trial_matches ADD COLUMN {_column} {_sql_type}")
-            print(f"Schema migration: added trial_matches.{_column}")
+            console.out(f"Schema migration: added trial_matches.{_column}")
 
 
     # Drift metrics table
@@ -631,7 +632,7 @@ CREATE TABLE IF NOT EXISTS drift_metrics (
 
     conn.commit()
     conn.close()
-    print(f"Database initialized at: {db_path}")
+    console.out(f"Database initialized at: {db_path}")
 
     _INITIALIZED_DATABASES.add(os.path.abspath(db_path))
     return os.path.abspath(db_path)
@@ -1055,18 +1056,18 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
             ))
         
         conn.commit()
-        print(f"✓ Logged inference for patient {result['patient_id']} (ID: {inference_id})")
+        console.out(f"✓ Logged inference for patient {result['patient_id']} (ID: {inference_id})")
         
     except sqlite3.Error as e:
         if conn:
             conn.rollback()
-        print(f"⚠ Database logging failed (non-critical): {e}")
+        console.out(f"⚠ Database logging failed (non-critical): {e}")
         # DO NOT re-raise - logging failure should not break pipeline
     
     except Exception as e:
         if conn:
             conn.rollback()
-        print(f"⚠ Logging error (non-critical): {e}")
+        console.out(f"⚠ Logging error (non-critical): {e}")
         # DO NOT re-raise - logging failure should not break pipeline
     
     finally:

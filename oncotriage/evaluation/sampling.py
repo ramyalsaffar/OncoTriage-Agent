@@ -63,6 +63,7 @@ import sqlite3
 import threading
 
 from oncotriage import paths
+from oncotriage.observability import console
 
 
 #------------------------------------------------------------------------------
@@ -187,10 +188,10 @@ def select_samples(source_db, output_db, seed=SEED,
         than parse the printed report. File 28 asserted inline and printed;
         both are kept, and the dict is what makes the function testable.
     """
-    print(f"Source: {source_db}")
-    print(f"Output: {output_db}")
-    print(f"Seed:   {seed}")
-    print()
+    console.out(f"Source: {source_db}")
+    console.out(f"Output: {output_db}")
+    console.out(f"Seed:   {seed}")
+    console.out()
 
     conn = sqlite3.connect(source_db)
     conn.row_factory = sqlite3.Row
@@ -204,7 +205,7 @@ def select_samples(source_db, output_db, seed=SEED,
             ORDER BY MIN(id)
         """).fetchall()
 
-        print(f"Total unique patients in DB: {len(patients)}")
+        console.out(f"Total unique patients in DB: {len(patients)}")
 
         # Classify by cancer type
         by_type = {"breast": [], "colon": [], "lung": []}
@@ -214,10 +215,10 @@ def select_samples(source_db, output_db, seed=SEED,
             if cancer in by_type:
                 by_type[cancer].append(p["patient_id"])
 
-        print(f"  Breast: {len(by_type['breast'])}")
-        print(f"  Colon:  {len(by_type['colon'])}")
-        print(f"  Lung:   {len(by_type['lung'])}")
-        print()
+        console.out(f"  Breast: {len(by_type['breast'])}")
+        console.out(f"  Colon:  {len(by_type['colon'])}")
+        console.out(f"  Lung:   {len(by_type['lung'])}")
+        console.out()
 
         # Validate
         for cancer_type, pids in by_type.items():
@@ -235,9 +236,9 @@ def select_samples(source_db, output_db, seed=SEED,
         for cancer_type in ["breast", "colon", "lung"]:
             selected = rng.sample(by_type[cancer_type], patients_per_cancer)
             sampled_pids.extend(selected)
-            print(f"  Sampled {cancer_type}: {len(selected)} patients")
+            console.out(f"  Sampled {cancer_type}: {len(selected)} patients")
 
-        print(f"\nTotal sampled patients: {len(sampled_pids)}")
+        console.out(f"\nTotal sampled patients: {len(sampled_pids)}")
 
         # Get ALL inference ids for sampled patients (main + resample)
         placeholders = ",".join("?" * len(sampled_pids))
@@ -246,14 +247,14 @@ def select_samples(source_db, output_db, seed=SEED,
             f"SELECT id FROM inferences WHERE patient_id IN ({placeholders})", sampled_pids
         ).fetchall()]
 
-        print(f"Total inferences for sampled patients: {len(inference_ids)}")
+        console.out(f"Total inferences for sampled patients: {len(inference_ids)}")
 
         inf_placeholders = ",".join("?" * len(inference_ids))
         trial_match_count = conn.execute(
             f"SELECT COUNT(*) FROM trial_matches WHERE inference_id IN ({inf_placeholders})", inference_ids
         ).fetchone()[0]
 
-        print(f"Total trial matches for sampled patients: {trial_match_count}")
+        console.out(f"Total trial matches for sampled patients: {trial_match_count}")
 
         # =====================================================================
         # CREATE OUTPUT DB
@@ -261,7 +262,7 @@ def select_samples(source_db, output_db, seed=SEED,
 
         if os.path.exists(output_db):
             os.remove(output_db)
-            print(f"\nRemoved existing output file.")
+            console.out(f"\nRemoved existing output file.")
 
         out_conn = sqlite3.connect(output_db)
         out_cursor = out_conn.cursor()
@@ -325,15 +326,15 @@ def select_samples(source_db, output_db, seed=SEED,
             out_conn.close()
         conn.close()
 
-    print(f"\n{'='*60}")
-    print(f"OUTPUT: {output_db}")
-    print(f"{'='*60}")
-    print(f"  Unique patients:  {verify_patients}")
-    print(f"  Total inferences: {verify_inferences}")
-    print(f"  Trial matches:    {verify_matches}")
-    print(f"  Breast: {verify_types['breast']}  Colon: {verify_types['colon']}  Lung: {verify_types['lung']}")
-    print(f"  Seed: {seed}")
-    print(f"{'='*60}")
+    console.out(f"\n{'='*60}")
+    console.out(f"OUTPUT: {output_db}")
+    console.out(f"{'='*60}")
+    console.out(f"  Unique patients:  {verify_patients}")
+    console.out(f"  Total inferences: {verify_inferences}")
+    console.out(f"  Trial matches:    {verify_matches}")
+    console.out(f"  Breast: {verify_types['breast']}  Colon: {verify_types['colon']}  Lung: {verify_types['lung']}")
+    console.out(f"  Seed: {seed}")
+    console.out(f"{'='*60}")
 
     expected_total = patients_per_cancer * len(verify_types)
     assert verify_patients == expected_total, f"Expected {expected_total} patients, got {verify_patients}"
@@ -341,7 +342,7 @@ def select_samples(source_db, output_db, seed=SEED,
     assert verify_types["colon"] == patients_per_cancer, f"Expected {patients_per_cancer} colon, got {verify_types['colon']}"
     assert verify_types["lung"] == patients_per_cancer, f"Expected {patients_per_cancer} lung, got {verify_types['lung']}"
 
-    print("\nAll validations passed.")
+    console.out("\nAll validations passed.")
 
     return {
         "output_db": output_db,

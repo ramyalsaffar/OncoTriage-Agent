@@ -110,6 +110,7 @@ from oncotriage.config import (
     PSI_THRESHOLD,
     Z_SCORE_THRESHOLD,
 )
+from oncotriage.observability import console
 
 
 #------------------------------------------------------------------------------
@@ -832,7 +833,7 @@ def log_drift_metrics(
                 rows_inserted += 1
         
         conn.commit()
-        print(f"✓ Logged {rows_inserted} drift metrics to database")
+        console.out(f"✓ Logged {rows_inserted} drift metrics to database")
 
     except sqlite3.Error as e:
         if conn:
@@ -899,7 +900,7 @@ def get_baseline_and_current_data(
         
         # Warn if dataset is large (production consideration)
         if total_rows > 10000:
-            print(f"⚠ Large dataset detected ({total_rows} rows). Consider implementing chunked loading for better memory efficiency.")
+            console.out(f"⚠ Large dataset detected ({total_rows} rows). Consider implementing chunked loading for better memory efficiency.")
         
         # Get all data sorted by timestamp
         query = "SELECT * FROM inferences ORDER BY timestamp ASC"
@@ -949,8 +950,8 @@ def get_baseline_and_current_data(
                 f"Currently have {total_rows} total inferences."
             )
         
-        print(f"✓ Loaded baseline: {len(baseline_df)} samples ({first_timestamp.date()} to {baseline_end.date()})")
-        print(f"✓ Loaded current: {len(current_df)} samples ({comparison_start.date()} to {last_timestamp.date()})")
+        console.out(f"✓ Loaded baseline: {len(baseline_df)} samples ({first_timestamp.date()} to {baseline_end.date()})")
+        console.out(f"✓ Loaded current: {len(current_df)} samples ({comparison_start.date()} to {last_timestamp.date()})")
         
         return baseline_df, current_df
         
@@ -1024,15 +1025,15 @@ def run_drift_detection(
         Exception: If drift detection or logging fails
     """
     
-    print("=" * 70)
-    print("DRIFT DETECTION PIPELINE")
-    print("=" * 70)
-    print(f"Baseline window: {baseline_days} days")
-    print(f"Comparison window: {comparison_days} days")
-    print()
+    console.out("=" * 70)
+    console.out("DRIFT DETECTION PIPELINE")
+    console.out("=" * 70)
+    console.out(f"Baseline window: {baseline_days} days")
+    console.out(f"Comparison window: {comparison_days} days")
+    console.out()
     
     # Step 1: Load data
-    print("[1/5] Loading baseline and current data...")
+    console.out("[1/5] Loading baseline and current data...")
     try:
         baseline_df, current_df = get_baseline_and_current_data(
             baseline_days=baseline_days,
@@ -1053,56 +1054,56 @@ def run_drift_detection(
             raise ValueError(f"Missing required columns in data: {missing_cols}")
             
     except ValueError as e:
-        print(f"✗ {e}")
+        console.out(f"✗ {e}")
         raise
     except Exception as e:
-        print(f"✗ Data loading failed: {e}")
+        console.out(f"✗ Data loading failed: {e}")
         raise
-    print()
+    console.out()
     
     # Step 2: Detect data drift
-    print("[2/5] Detecting data drift...")
+    console.out("[2/5] Detecting data drift...")
     try:
         data_drift = detect_data_drift(baseline_df, current_df)
         data_alerts = sum(1 for m in data_drift.values() if m.get("alert") == 1)
-        print(f"✓ Data drift: {data_alerts} alert(s)")
+        console.out(f"✓ Data drift: {data_alerts} alert(s)")
     except Exception as e:
-        print(f"✗ Data drift detection failed: {e}")
+        console.out(f"✗ Data drift detection failed: {e}")
         raise
-    print()
+    console.out()
     
     # Step 3: Detect retrieval drift
-    print("[3/5] Detecting retrieval drift...")
+    console.out("[3/5] Detecting retrieval drift...")
     try:
         retrieval_drift = detect_retrieval_drift(baseline_df, current_df)
         retrieval_alerts = sum(1 for m in retrieval_drift.values() if m.get("alert") == 1)
-        print(f"✓ Retrieval drift: {retrieval_alerts} alert(s)")
+        console.out(f"✓ Retrieval drift: {retrieval_alerts} alert(s)")
     except Exception as e:
-        print(f"✗ Retrieval drift detection failed: {e}")
+        console.out(f"✗ Retrieval drift detection failed: {e}")
         raise
-    print()
+    console.out()
     
     # Step 4: Detect performance drift
-    print("[4/6] Detecting performance drift...")
+    console.out("[4/6] Detecting performance drift...")
     try:
         performance_drift = detect_performance_drift(baseline_df, current_df)
         performance_alerts = sum(1 for m in performance_drift.values() if m.get("alert") == 1)
-        print(f"✓ Performance drift: {performance_alerts} alert(s)")
+        console.out(f"✓ Performance drift: {performance_alerts} alert(s)")
     except Exception as e:
-        print(f"✗ Performance drift detection failed: {e}")
+        console.out(f"✗ Performance drift detection failed: {e}")
         raise
-    print()
+    console.out()
 
     # Step 5: Assess input availability (threshold alerts, current window only)
-    print("[5/6] Assessing data availability...")
+    console.out("[5/6] Assessing data availability...")
     try:
         data_availability = detect_data_availability(current_df)
         availability_alerts = sum(1 for m in data_availability.values() if m.get("alert") == 1)
-        print(f"✓ Data availability: {availability_alerts} alert(s)")
+        console.out(f"✓ Data availability: {availability_alerts} alert(s)")
     except Exception as e:
-        print(f"✗ Data availability assessment failed: {e}")
+        console.out(f"✗ Data availability assessment failed: {e}")
         raise
-    print()
+    console.out()
 
     # Compile results
     results = {
@@ -1122,7 +1123,7 @@ def run_drift_detection(
     
     # Step 6: Log to database
     if log_to_db:
-        print("[6/6] Logging results to database...")
+        console.out("[6/6] Logging results to database...")
         try:
             log_drift_metrics(
                 {k: v for k, v in results.items() if k != "summary"},
@@ -1131,25 +1132,25 @@ def run_drift_detection(
                 db_path=db_path
             )
         except Exception as e:
-            print(f"⚠ Database logging failed (non-critical): {e}")
+            console.out(f"⚠ Database logging failed (non-critical): {e}")
             # Don't raise - logging failure should not break drift detection
     else:
-        print("[6/6] Skipping database logging (log_to_db=False)")
-    print()
+        console.out("[6/6] Skipping database logging (log_to_db=False)")
+    console.out()
     
     # Print summary
-    print("=" * 70)
-    print("DRIFT DETECTION SUMMARY")
-    print("=" * 70)
-    print(f"Total alerts: {results['summary']['total_alerts']}")
-    print(f"  - Data drift: {data_alerts}")
-    print(f"  - Retrieval drift: {retrieval_alerts}")
-    print(f"  - Performance drift: {performance_alerts}")
-    print(f"  - Data availability: {availability_alerts}")
-    print()
-    print(f"Baseline: {results['summary']['baseline_samples']} samples ({results['summary']['baseline_period']})")
-    print(f"Current: {results['summary']['comparison_samples']} samples ({results['summary']['comparison_period']})")
-    print("=" * 70)
+    console.out("=" * 70)
+    console.out("DRIFT DETECTION SUMMARY")
+    console.out("=" * 70)
+    console.out(f"Total alerts: {results['summary']['total_alerts']}")
+    console.out(f"  - Data drift: {data_alerts}")
+    console.out(f"  - Retrieval drift: {retrieval_alerts}")
+    console.out(f"  - Performance drift: {performance_alerts}")
+    console.out(f"  - Data availability: {availability_alerts}")
+    console.out()
+    console.out(f"Baseline: {results['summary']['baseline_samples']} samples ({results['summary']['baseline_period']})")
+    console.out(f"Current: {results['summary']['comparison_samples']} samples ({results['summary']['comparison_period']})")
+    console.out("=" * 70)
     
     return results
 
@@ -1162,17 +1163,17 @@ def print_drift_details(results: Dict[str, Dict]) -> None:
         results: Output from run_drift_detection()
     """
     
-    print("\n" + "=" * 70)
-    print("DETAILED DRIFT ANALYSIS")
-    print("=" * 70)
+    console.out("\n" + "=" * 70)
+    console.out("DETAILED DRIFT ANALYSIS")
+    console.out("=" * 70)
     
     for category in ["data_drift", "retrieval_drift", "performance_drift",
                      "data_availability"]:
         if category not in results:
             continue
             
-        print(f"\n{category.upper().replace('_', ' ')}")
-        print("-" * 70)
+        console.out(f"\n{category.upper().replace('_', ' ')}")
+        console.out("-" * 70)
         
         metrics = results[category]
         for metric_name, metric_data in metrics.items():
@@ -1187,13 +1188,13 @@ def print_drift_details(results: Dict[str, Dict]) -> None:
             # Format metric name
             display_name = metric_name.replace("_", " ").title()
             
-            print(f"{indicator} {display_name}")
+            console.out(f"{indicator} {display_name}")
             
             # Value and threshold (check for None to avoid format errors)
             if value is not None and threshold is not None:
-                print(f"   Value: {value:.4f} | Threshold: {threshold}")
+                console.out(f"   Value: {value:.4f} | Threshold: {threshold}")
             elif notes:
-                print(f"   Status: {notes}")
+                console.out(f"   Status: {notes}")
 
             # An alerting metric prints its notes even when it has a value.
             # Previously notes were shown only on the no-value branch, so a
@@ -1201,21 +1202,21 @@ def print_drift_details(results: Dict[str, Dict]) -> None:
             # the whole reason it carries one -- printed the number and
             # swallowed the explanation.
             if value is not None and notes:
-                print(f"   Note: {notes}")
+                console.out(f"   Note: {notes}")
 
             # Additional details
             p_value = metric_data.get("p_value")
             if p_value is not None:
-                print(f"   P-value: {p_value:.4f}")
+                console.out(f"   P-value: {p_value:.4f}")
             
             baseline_mean = metric_data.get("baseline_mean")
             baseline_std = metric_data.get("baseline_std")
             if baseline_mean is not None and baseline_std is not None:
-                print(f"   Baseline: μ={baseline_mean:.2f}, σ={baseline_std:.2f}")
+                console.out(f"   Baseline: μ={baseline_mean:.2f}, σ={baseline_std:.2f}")
 
-            print()
+            console.out()
 
-    print("=" * 70)
+    console.out("=" * 70)
 
 
 #------------------------------------------------------------------------------
@@ -1258,15 +1259,15 @@ def main(db_path=None):
         return results
 
     except ValueError as e:
-        print(f"\n✗ Drift detection cannot run: {e}")
-        print("\nTo enable drift detection:")
-        print("1. Run the pipeline to generate more inferences")
-        print("2. Ensure inferences span at least 30 days")
-        print("3. Have at least 20 inferences in the baseline period")
+        console.out(f"\n✗ Drift detection cannot run: {e}")
+        console.out("\nTo enable drift detection:")
+        console.out("1. Run the pipeline to generate more inferences")
+        console.out("2. Ensure inferences span at least 30 days")
+        console.out("3. Have at least 20 inferences in the baseline period")
         return None
 
     except Exception as e:
-        print(f"\n✗ Drift detection failed: {e}")
+        console.out(f"\n✗ Drift detection failed: {e}")
         traceback.print_exc()
         return None
 

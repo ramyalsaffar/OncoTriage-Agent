@@ -78,6 +78,7 @@ from oncotriage.registries.cancer_code_registry import (
 # analyze_demographics() calls datetime.now() and generate_summary_report()
 # calls datetime.now().strftime().
 from datetime import datetime
+from oncotriage.observability import console
 
 
 #------------------------------------------------------------------------------
@@ -243,7 +244,7 @@ def flag_primary_cancer(df_conditions):
     if 'CODE' not in df_conditions.columns:
         # No code column: every row falls to the registry's display-term
         # fallback. Say so — a run classified this way is weaker evidence.
-        print("  Note: conditions.csv has no CODE column — cancer detection "
+        console.out("  Note: conditions.csv has no CODE column — cancer detection "
               "falls back to display-term matching inside the registry")
         codes = [''] * len(df_conditions)
     else:
@@ -263,10 +264,10 @@ def flag_primary_cancer(df_conditions):
 def print_cancer_classification_stats():
     """Report which registry layer decided each condition (File 08 counters)."""
     stats = get_cancer_classification_stats()
-    print("\nCancer classification paths (CancerCodeRegistry):")
+    console.out("\nCancer classification paths (CancerCodeRegistry):")
     for path, count in stats.items():
         if count:
-            print(f"  {path}: {count}")
+            console.out(f"  {path}: {count}")
 
 
 def get_filtered_patient_ids():
@@ -280,8 +281,8 @@ def get_filtered_patient_ids():
     patient_files = list(json_path.glob("*.json"))
     
     total_files = len(patient_files)
-    print(f"Found {total_files} JSON files to process")
-    print()
+    console.out(f"Found {total_files} JSON files to process")
+    console.out()
     
     patient_ids = set()
     errors = 0
@@ -290,7 +291,7 @@ def get_filtered_patient_ids():
         # Progress indicator every 100 files
         if idx % 100 == 0 or idx == total_files:
             progress = (idx / total_files) * 100
-            print(f"  Processing: {idx}/{total_files} files ({progress:.1f}%)")
+            console.out(f"  Processing: {idx}/{total_files} files ({progress:.1f}%)")
         
         try:
             with open(file, 'r') as f:
@@ -307,13 +308,13 @@ def get_filtered_patient_ids():
         except Exception as e:
             errors += 1
             if errors <= 5:  # Only show first 5 errors
-                print(f"  Warning: Could not extract ID from {file.name}: {e}")
+                console.out(f"  Warning: Could not extract ID from {file.name}: {e}")
     
-    print()
-    print(f"✓ Extracted {len(patient_ids)} unique patient IDs")
+    console.out()
+    console.out(f"✓ Extracted {len(patient_ids)} unique patient IDs")
     if errors > 0:
-        print(f"⚠ {errors} files had errors")
-    print()
+        console.out(f"⚠ {errors} files had errors")
+    console.out()
     
     return patient_ids
 
@@ -336,7 +337,7 @@ def load_and_filter_csv(filename, patient_ids):
     csv_path = Path(csv_dir()) / filename
 
     if not csv_path.exists():
-        print(f"Warning: {filename} not found at {csv_path}")
+        console.out(f"Warning: {filename} not found at {csv_path}")
         return None
 
     df = pd.read_csv(csv_path)
@@ -344,14 +345,14 @@ def load_and_filter_csv(filename, patient_ids):
     # Filter to our patient IDs
     if 'PATIENT' in df.columns:
         df_filtered = df[df['PATIENT'].isin(patient_ids)].copy()
-        print(f"Loaded {filename}: {len(df)} total → {len(df_filtered)} filtered")
+        console.out(f"Loaded {filename}: {len(df)} total → {len(df_filtered)} filtered")
         return df_filtered
     elif 'Id' in df.columns:
         df_filtered = df[df['Id'].isin(patient_ids)].copy()
-        print(f"Loaded {filename}: {len(df)} total → {len(df_filtered)} filtered")
+        console.out(f"Loaded {filename}: {len(df)} total → {len(df_filtered)} filtered")
         return df_filtered
     else:
-        print(f"Warning: No patient ID column found in {filename}")
+        console.out(f"Warning: No patient ID column found in {filename}")
         return df
 
 
@@ -406,30 +407,30 @@ Action if abnormal: Check Synthea demographics settings, regenerate if needed
     """
     apply_plot_style()
     ensure_output_dir()
-    print("\n" + "="*80)
-    print("DEMOGRAPHICS ANALYSIS")
-    print("="*80 + "\n")
+    console.out("\n" + "="*80)
+    console.out("DEMOGRAPHICS ANALYSIS")
+    console.out("="*80 + "\n")
     
     # Basic stats
-    print(f"Total patients: {len(df_patients)}")
-    print(f"\nGender distribution:")
-    print(df_patients['GENDER'].value_counts())
-    print(f"\nGender percentages:")
-    print(df_patients['GENDER'].value_counts(normalize=True) * 100)
+    console.out(f"Total patients: {len(df_patients)}")
+    console.out(f"\nGender distribution:")
+    console.out(df_patients['GENDER'].value_counts())
+    console.out(f"\nGender percentages:")
+    console.out(df_patients['GENDER'].value_counts(normalize=True) * 100)
     
     # Age distribution
     today = datetime.now().date()
     df_patients['AGE'] = pd.to_datetime(df_patients['BIRTHDATE']).apply(
         lambda dob: today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
     )    
-    print(f"\nAge statistics:")
-    print(df_patients['AGE'].describe())
+    console.out(f"\nAge statistics:")
+    console.out(df_patients['AGE'].describe())
     
     # Race/Ethnicity
-    print(f"\nRace distribution:")
-    print(df_patients['RACE'].value_counts())
-    print(f"\nEthnicity distribution:")
-    print(df_patients['ETHNICITY'].value_counts())
+    console.out(f"\nRace distribution:")
+    console.out(df_patients['RACE'].value_counts())
+    console.out(f"\nEthnicity distribution:")
+    console.out(df_patients['ETHNICITY'].value_counts())
     
     # Visualizations
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
@@ -493,7 +494,7 @@ Action if abnormal: Check Synthea demographics settings, regenerate if needed
     
     plt.tight_layout()
     plt.savefig(output_dir() + 'demographics.png', dpi=300, bbox_inches='tight')
-    print(f"\n✓ Saved demographics plot: {output_dir()}demographics.png")
+    console.out(f"\n✓ Saved demographics plot: {output_dir()}demographics.png")
     plt.close()
     
     return df_patients
@@ -535,23 +536,23 @@ Action if abnormal: Check cancer categorization logic, verify Synthea modules lo
     """
     apply_plot_style()
     ensure_output_dir()
-    print("\n" + "="*80)
-    print("CANCER DIAGNOSES ANALYSIS")
-    print("="*80 + "\n")
+    console.out("\n" + "="*80)
+    console.out("CANCER DIAGNOSES ANALYSIS")
+    console.out("="*80 + "\n")
     
     # Filter to primary cancer conditions only. IS_CANCER is set once in
     # main() by flag_primary_cancer(), which routes through File 08's registry.
     # .copy() because CATEGORY is added below.
     df_cancer = df_conditions[df_conditions['IS_CANCER']].copy()
 
-    print(f"Total condition records: {len(df_conditions)}")
-    print(f"Primary cancer condition records: {len(df_cancer)}")
-    print(f"Unique patients with primary cancer: {df_cancer['PATIENT'].nunique()}")
+    console.out(f"Total condition records: {len(df_conditions)}")
+    console.out(f"Primary cancer condition records: {len(df_cancer)}")
+    console.out(f"Unique patients with primary cancer: {df_cancer['PATIENT'].nunique()}")
     
     # Top cancer types
-    print(f"\nTop 10 cancer diagnoses:")
+    console.out(f"\nTop 10 cancer diagnoses:")
     top_cancers = df_cancer['DESCRIPTION'].value_counts().head(10)
-    print(top_cancers)
+    console.out(top_cancers)
     
     # Visualization
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
@@ -604,7 +605,7 @@ Action if abnormal: Check cancer categorization logic, verify Synthea modules lo
     
     plt.tight_layout()
     plt.savefig(output_dir() + 'cancer_types.png', dpi=300, bbox_inches='tight')
-    print(f"\n✓ Saved cancer types plot: {output_dir()}cancer_types.png")
+    console.out(f"\n✓ Saved cancer types plot: {output_dir()}cancer_types.png")
     plt.close()
     
     return df_cancer
@@ -631,23 +632,23 @@ Action if abnormal: Check if Synthea cancer modules include treatment protocols,
     """
     apply_plot_style()
     ensure_output_dir()
-    print("\n" + "="*80)
-    print("MEDICATIONS ANALYSIS")
-    print("="*80 + "\n")
+    console.out("\n" + "="*80)
+    console.out("MEDICATIONS ANALYSIS")
+    console.out("="*80 + "\n")
     
-    print(f"Total medication records: {len(df_medications)}")
-    print(f"Unique patients on medications: {df_medications['PATIENT'].nunique()}")
-    print(f"Unique medications: {df_medications['DESCRIPTION'].nunique()}")
+    console.out(f"Total medication records: {len(df_medications)}")
+    console.out(f"Unique patients on medications: {df_medications['PATIENT'].nunique()}")
+    console.out(f"Unique medications: {df_medications['DESCRIPTION'].nunique()}")
     
     # Top medications
-    print(f"\nTop 15 medications:")
+    console.out(f"\nTop 15 medications:")
     top_meds = df_medications['DESCRIPTION'].value_counts().head(15)
-    print(top_meds)
+    console.out(top_meds)
     
     # Medications per patient
     meds_per_patient = df_medications.groupby('PATIENT').size()
-    print(f"\nMedications per patient:")
-    print(meds_per_patient.describe())
+    console.out(f"\nMedications per patient:")
+    console.out(meds_per_patient.describe())
     
     # Visualization
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
@@ -668,7 +669,7 @@ Action if abnormal: Check if Synthea cancer modules include treatment protocols,
     
     plt.tight_layout()
     plt.savefig(output_dir() + 'medications.png', dpi=300, bbox_inches='tight')
-    print(f"\n✓ Saved medications plot: {output_dir()}medications.png")
+    console.out(f"\n✓ Saved medications plot: {output_dir()}medications.png")
     plt.close()
 
 
@@ -720,7 +721,7 @@ def generate_summary_report(df_patients, df_cancer, patient_ids, data_source: st
         
         f.write("\n" + "="*80 + "\n")
     
-    print(f"\n✓ Saved summary report: {report_path}")
+    console.out(f"\n✓ Saved summary report: {report_path}")
     
     
 def analyze_cancer_stages(df_cancer, df_conditions):
@@ -749,9 +750,9 @@ Action if abnormal: Regenerate, check if Synthea cancer modules include staging
     apply_plot_style()
     ensure_output_dir()
 
-    print("\n" + "="*80)
-    print("CANCER STAGE ANALYSIS")
-    print("="*80 + "\n")
+    console.out("\n" + "="*80)
+    console.out("CANCER STAGE ANALYSIS")
+    console.out("="*80 + "\n")
 
     # Stage comes from File 10's extract_patient_stage() — the same function
     # Stage 4 of the pipeline calls. The local extract_stage() this replaces
@@ -791,15 +792,15 @@ Action if abnormal: Regenerate, check if Synthea cancer modules include staging
     # Calculate percentages
     stage_percentages = (stage_counts / stage_counts.sum()) * 100
 
-    print(f"Total cancer patients: {len(patient_stages)}")
-    print(f"Primary cancer condition records: {len(df_cancer)}")
-    print(f"Condition records searched for stage text: {len(df_staged)}")
-    print()
-    print("Patient distribution by stage:")
+    console.out(f"Total cancer patients: {len(patient_stages)}")
+    console.out(f"Primary cancer condition records: {len(df_cancer)}")
+    console.out(f"Condition records searched for stage text: {len(df_staged)}")
+    console.out()
+    console.out("Patient distribution by stage:")
     for stage, count in stage_counts.items():
         pct = (count / len(patient_stages)) * 100
-        print(f"  {stage}: {count} patients ({pct:.1f}%)")
-    print()
+        console.out(f"  {stage}: {count} patients ({pct:.1f}%)")
+    console.out()
     
     # Visualization
     plt.figure(figsize=(12, 7))
@@ -823,11 +824,11 @@ Action if abnormal: Regenerate, check if Synthea cancer modules include staging
     # Print warning if too many unspecified
     unspecified_pct = stage_percentages.get('Unspecified', 0)
     if unspecified_pct > 50:
-        print(f"⚠️  WARNING: {unspecified_pct:.1f}% of patients have unspecified stage")
-        print("   This reflects Synthea's cancer module limitations - staging not always generated")
-        print("   This is also realistic (real EHR data often lacks complete staging)")
+        console.out(f"⚠️  WARNING: {unspecified_pct:.1f}% of patients have unspecified stage")
+        console.out("   This reflects Synthea's cancer module limitations - staging not always generated")
+        console.out("   This is also realistic (real EHR data often lacks complete staging)")
     
-    print(f"\n✓ Saved cancer stages plot")
+    console.out(f"\n✓ Saved cancer stages plot")
     plt.close()
     
 
@@ -865,7 +866,7 @@ Action if abnormal: Regenerate with wider age range, check if age filters are to
     categories = category_counts[category_counts >= 20].index.tolist()
     
     if len(categories) == 0:
-        print("Not enough patients per category for age analysis")
+        console.out("Not enough patients per category for age analysis")
         return
     
     # Dynamic subplot grid
@@ -899,7 +900,7 @@ Action if abnormal: Regenerate with wider age range, check if age filters are to
     
     plt.tight_layout()
     plt.savefig(output_dir() + 'age_by_cancer_type.png', dpi=300, bbox_inches='tight')
-    print(f"✓ Saved age by cancer type plot (n={len(categories)} cancer types)")
+    console.out(f"✓ Saved age by cancer type plot (n={len(categories)} cancer types)")
     plt.close()
     
 
@@ -928,8 +929,8 @@ Action if abnormal: Check if patients have duplicate/multiple cancer diagnoses, 
     # Get unique patients per category
     patients_per_category = df_cancer.groupby('CATEGORY')['PATIENT'].nunique().sort_values(ascending=False)
     
-    print("\nUnique Patients per Cancer Type:")
-    print(patients_per_category)
+    console.out("\nUnique Patients per Cancer Type:")
+    console.out(patients_per_category)
     
     plt.figure(figsize=(10, 6))
     bars = plt.bar(range(len(patients_per_category)), patients_per_category.values, alpha=0.7, edgecolor='black')
@@ -946,7 +947,7 @@ Action if abnormal: Check if patients have duplicate/multiple cancer diagnoses, 
     
     plt.tight_layout()
     plt.savefig(output_dir() + 'patients_per_cancer_type.png', dpi=300, bbox_inches='tight')
-    print(f"✓ Saved patients per cancer type plot")
+    console.out(f"✓ Saved patients per cancer type plot")
     plt.close()
 
 
@@ -981,9 +982,9 @@ Young patients (age 20-30) have 10+ conditions → Age mismatch
     """
     apply_plot_style()
     ensure_output_dir()
-    print("\n" + "="*80)
-    print("COMORBIDITIES ANALYSIS")
-    print("="*80 + "\n")
+    console.out("\n" + "="*80)
+    console.out("COMORBIDITIES ANALYSIS")
+    console.out("="*80 + "\n")
     
     # Separate cancer vs non-cancer conditions using the same IS_CANCER column
     # the diagnosis analysis used — one registry decision per row, not a second
@@ -996,24 +997,24 @@ Young patients (age 20-30) have 10+ conditions → Age mismatch
     other_per_patient = df_other_cond.groupby('PATIENT').size()
     total_per_patient = df_conditions.groupby('PATIENT').size()
 
-    print(f"Total condition records: {len(df_conditions)}")
-    print(f"Primary cancer conditions: {len(df_cancer_cond)}")
-    print(f"Non-cancer conditions (incl. secondary/metastatic): {len(df_other_cond)}")
-    print()
+    console.out(f"Total condition records: {len(df_conditions)}")
+    console.out(f"Primary cancer conditions: {len(df_cancer_cond)}")
+    console.out(f"Non-cancer conditions (incl. secondary/metastatic): {len(df_other_cond)}")
+    console.out()
     
-    print("Conditions per patient (including cancer):")
-    print(total_per_patient.describe())
-    print()
+    console.out("Conditions per patient (including cancer):")
+    console.out(total_per_patient.describe())
+    console.out()
     
-    print("Non-cancer conditions per patient:")
-    print(other_per_patient.describe())
-    print()
+    console.out("Non-cancer conditions per patient:")
+    console.out(other_per_patient.describe())
+    console.out()
     
     # Top non-cancer conditions
-    print("Top 15 non-cancer comorbidities:")
+    console.out("Top 15 non-cancer comorbidities:")
     top_comorbidities = df_other_cond['DESCRIPTION'].value_counts().head(15)
-    print(top_comorbidities)
-    print()
+    console.out(top_comorbidities)
+    console.out()
     
     # Check for common expected conditions
     common_expected = {
@@ -1024,13 +1025,13 @@ Young patients (age 20-30) have 10+ conditions → Age mismatch
         'COPD/Asthma': ['asthma', 'copd', 'chronic obstructive']
     }
     
-    print("Prevalence of common conditions:")
+    console.out("Prevalence of common conditions:")
     total_patients = df_conditions['PATIENT'].nunique()
     for condition_name, keywords in common_expected.items():
         pattern = '|'.join(keywords)
         count = df_other_cond[df_other_cond['DESCRIPTION'].str.lower().str.contains(pattern, na=False)]['PATIENT'].nunique()
         percentage = (count / total_patients) * 100
-        print(f"  {condition_name}: {count} patients ({percentage:.1f}%)")
+        console.out(f"  {condition_name}: {count} patients ({percentage:.1f}%)")
     
     # Visualizations
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
@@ -1089,7 +1090,7 @@ Young patients (age 20-30) have 10+ conditions → Age mismatch
     
     plt.tight_layout()
     plt.savefig(output_dir() + 'comorbidities.png', dpi=300, bbox_inches='tight')
-    print(f"\n✓ Saved comorbidities plot: {output_dir()}comorbidities.png")
+    console.out(f"\n✓ Saved comorbidities plot: {output_dir()}comorbidities.png")
     plt.close()
 
 
@@ -1106,32 +1107,32 @@ def main():
     apply_plot_style()
     ensure_output_dir()
 
-    print("\n" + "╔" + "═"*78 + "╗")
-    print("║" + " "*20 + f"{Project_Name}: DATA EXPLORATION" + " "*24 + "║")
-    print("╚" + "═"*78 + "╝\n")
+    console.out("\n" + "╔" + "═"*78 + "╗")
+    console.out("║" + " "*20 + f"{Project_Name}: DATA EXPLORATION" + " "*24 + "║")
+    console.out("╚" + "═"*78 + "╝\n")
     
     # Step 1: Get filtered patient IDs
-    print("="*80)
-    print("STEP 1: LOADING FILTERED PATIENT IDs")
-    print("="*80 + "\n")
+    console.out("="*80)
+    console.out("STEP 1: LOADING FILTERED PATIENT IDs")
+    console.out("="*80 + "\n")
     
     patient_ids = get_filtered_patient_ids()
     
     if not patient_ids:
-        print("ERROR: No patient IDs found. Run filter script first!")
+        console.out("ERROR: No patient IDs found. Run filter script first!")
         return
     
     # Step 2: Load and filter CSV files
-    print("\n" + "="*80)
-    print("STEP 2: LOADING AND FILTERING CSV FILES")
-    print("="*80 + "\n")
+    console.out("\n" + "="*80)
+    console.out("STEP 2: LOADING AND FILTERING CSV FILES")
+    console.out("="*80 + "\n")
     
     df_patients = load_and_filter_csv('patients.csv', patient_ids)
     df_conditions = load_and_filter_csv('conditions.csv', patient_ids)
     df_medications = load_and_filter_csv('medications.csv', patient_ids)
     
     if df_patients is None:
-        print("ERROR: Could not load patients.csv. Make sure CSV export was enabled during generation!")
+        console.out("ERROR: Could not load patients.csv. Make sure CSV export was enabled during generation!")
         return
 
     # Classify conditions once, with the pipeline's registry, so every
@@ -1142,9 +1143,9 @@ def main():
         print_cancer_classification_stats()
 
     # Step 3: Run analyses
-    print("\n" + "="*80)
-    print("STEP 3: RUNNING ANALYSES")
-    print("="*80)
+    console.out("\n" + "="*80)
+    console.out("STEP 3: RUNNING ANALYSES")
+    console.out("="*80)
     
     df_patients = analyze_demographics(df_patients)
     
@@ -1157,36 +1158,36 @@ def main():
     
     else:
         df_cancer = None
-        print("\nWarning: conditions.csv not found, skipping cancer analysis")
+        console.out("\nWarning: conditions.csv not found, skipping cancer analysis")
     
     if df_medications is not None:
         analyze_medications(df_medications)
     else:
-        print("\nWarning: medications.csv not found, skipping medication analysis")
+        console.out("\nWarning: medications.csv not found, skipping medication analysis")
     
     if df_conditions is not None:
         analyze_comorbidities(df_conditions, df_patients)
     
     # Step 4: Generate summary report
-    print("\n" + "="*80)
-    print("STEP 4: GENERATING SUMMARY REPORT")
-    print("="*80)
+    console.out("\n" + "="*80)
+    console.out("STEP 4: GENERATING SUMMARY REPORT")
+    console.out("="*80)
     
     if df_cancer is not None:
         generate_summary_report(df_patients, df_cancer, patient_ids)
     
     # Final summary
-    print("\n" + "="*80)
-    print("EXPLORATION COMPLETE!")
-    print("="*80 + "\n")
-    print(f"Output directory: {output_dir()}")
-    print(f"Generated files:")
-    print(f"  - demographics.png")
-    print(f"  - cancer_types.png")
-    print(f"  - medications.png")
-    print(f"  - comorbidities.png")
-    print(f"  - summary_report.txt")
-    print()
+    console.out("\n" + "="*80)
+    console.out("EXPLORATION COMPLETE!")
+    console.out("="*80 + "\n")
+    console.out(f"Output directory: {output_dir()}")
+    console.out(f"Generated files:")
+    console.out(f"  - demographics.png")
+    console.out(f"  - cancer_types.png")
+    console.out(f"  - medications.png")
+    console.out(f"  - comorbidities.png")
+    console.out(f"  - summary_report.txt")
+    console.out()
 
 
 #------------------------------------------------------------------------------

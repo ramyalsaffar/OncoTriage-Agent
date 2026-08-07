@@ -109,6 +109,7 @@ from oncotriage.config import (
 from oncotriage.fhir.parser import parse_fhir_bundle
 from oncotriage.storage.database_logger import log_inference
 from oncotriage.utils import deduplicate_by_display
+from oncotriage.observability import console
 
 
 #------------------------------------------------------------------------------
@@ -130,11 +131,11 @@ async def lifespan(_app):
     """Compile LangGraph pipeline at startup. BM25 is Qdrant-native — no pre-build needed."""
     global graph
 
-    print("\n" + "="*60)
-    print(f"{Project_Name} — Starting...")
-    print("="*60 + "\n")
+    console.out("\n" + "="*60)
+    console.out(f"{Project_Name} — Starting...")
+    console.out("="*60 + "\n")
 
-    print("[Startup] Compiling LangGraph pipeline...")
+    console.out("[Startup] Compiling LangGraph pipeline...")
     graph = build_matching_graph()
 
     # ── SERVING READINESS ────────────────────────────────────────────────
@@ -153,16 +154,16 @@ async def lifespan(_app):
     #
     # It is re-run per request by /health (see there), so populating the missing
     # dependency makes the stack go green on its own without a restart.
-    print("[Startup] Checking serving readiness...")
+    console.out("[Startup] Checking serving readiness...")
     report = serving_readiness()
     for _check in report["checks"]:
-        print(f"[Startup]   {'OK  ' if _check['ok'] else 'FAIL'} "
+        console.out(f"[Startup]   {'OK  ' if _check['ok'] else 'FAIL'} "
               f"{_check['name']}: {_check['detail']}")
     if report["status"] == READY:
-        print(f"\n[Ready] Pipeline compiled and serviceable "
+        console.out(f"\n[Ready] Pipeline compiled and serviceable "
               f"(BM25 is Qdrant-native, no pre-build needed)\n")
     else:
-        print(f"\n[NOT READY] The pipeline compiled but CANNOT serve a match "
+        console.out(f"\n[NOT READY] The pipeline compiled but CANNOT serve a match "
               f"request. GET /health reports 503 until the failures above are "
               f"fixed; no request is refused on the strength of this, so a "
               f"POST /match will still run and fail at the stage that needs "
@@ -170,7 +171,7 @@ async def lifespan(_app):
 
     yield
 
-    print("\n[Shutdown] Server stopping...")
+    console.out("\n[Shutdown] Server stopping...")
 
 
 # ===========================================================================
@@ -362,7 +363,7 @@ def create_app():
 
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-    print(f"[Rate Limiting] {'ENABLED' if ENABLE_RATE_LIMITING else 'DISABLED'} {RATE_LIMIT}")
+    console.out(f"[Rate Limiting] {'ENABLED' if ENABLE_RATE_LIMITING else 'DISABLED'} {RATE_LIMIT}")
 
     # =======================================================================
     # ENDPOINTS

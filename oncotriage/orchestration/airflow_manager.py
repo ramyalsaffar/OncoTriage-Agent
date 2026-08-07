@@ -96,6 +96,7 @@ import requests
 
 from oncotriage import settings as path_settings
 from oncotriage.orchestration.home import resolve_airflow_home
+from oncotriage.observability import console
 
 
 #------------------------------------------------------------------------------
@@ -152,9 +153,9 @@ def start_airflow(airflow_home=None):
 
     os.environ['AIRFLOW_HOME'] = airflow_path
 
-    print("=" * 70)
-    print("STARTING AIRFLOW SERVICES")
-    print("=" * 70)
+    console.out("=" * 70)
+    console.out("STARTING AIRFLOW SERVICES")
+    console.out("=" * 70)
 
     # Start API Server
     api_log_path = Path(airflow_path) / 'api_server.log'
@@ -164,8 +165,8 @@ def start_airflow(airflow_home=None):
         stdout=open(api_log_path, 'w'),
         stderr=subprocess.STDOUT
     )
-    print(f"\n✓ API Server started (PID: {api_server.pid})")
-    print(f"  Logs: {Path(airflow_path) / 'api_server.log'}")
+    console.out(f"\n✓ API Server started (PID: {api_server.pid})")
+    console.out(f"  Logs: {Path(airflow_path) / 'api_server.log'}")
 
     # Start Scheduler
     scheduler_log_path = Path(airflow_path) / 'scheduler.log'
@@ -175,8 +176,8 @@ def start_airflow(airflow_home=None):
         stdout=open(scheduler_log_path, 'w'),
         stderr=subprocess.STDOUT
     )
-    print(f"✓ Scheduler started (PID: {scheduler.pid})")
-    print(f"  Logs: {Path(airflow_path) / 'scheduler.log'}")
+    console.out(f"✓ Scheduler started (PID: {scheduler.pid})")
+    console.out(f"  Logs: {Path(airflow_path) / 'scheduler.log'}")
 
     # Save PIDs for later shutdown
     pid_file = Path(airflow_path) / 'airflow_pids.json'
@@ -186,16 +187,16 @@ def start_airflow(airflow_home=None):
             'scheduler_pid': scheduler.pid
         }, f)
 
-    print(f"\n  PIDs saved to: {pid_file}")
+    console.out(f"\n  PIDs saved to: {pid_file}")
 
     # Wait for services to start
-    print("\nWaiting for API server to start...")
+    console.out("\nWaiting for API server to start...")
     for attempt in range(30):
         try:
             response = requests.get(f"{AIRFLOW_URL}/api/v2/monitor/health", timeout=2)
             if response.status_code == 200:
-                print(f"\n✓ API Server is healthy! (took {attempt + 1} seconds)")
-                print(f"  UI: {AIRFLOW_URL}")
+                console.out(f"\n✓ API Server is healthy! (took {attempt + 1} seconds)")
+                console.out(f"  UI: {AIRFLOW_URL}")
                 password_file = Path(airflow_path) / 'simple_auth_manager_passwords.json.generated'
                 if password_file.exists():
                     # THE SECRET IS NOT PRINTED ANY MORE (pass 20f-3). This line
@@ -224,35 +225,35 @@ def start_airflow(airflow_home=None):
                     # password in it" -- but only the VERDICT is printed.
                     with open(password_file, 'r') as f:
                         passwords = json.load(f)
-                    print(f"\n  Username: admin")
+                    console.out(f"\n  Username: admin")
                     if passwords.get('admin'):
-                        print(f"  Password: not printed — read it from")
-                        print(f"            {password_file}")
+                        console.out(f"  Password: not printed — read it from")
+                        console.out(f"            {password_file}")
                     else:
-                        print(f"  Password: the generated file exists but holds no "
+                        console.out(f"  Password: the generated file exists but holds no "
                               f"'admin' entry:")
-                        print(f"            {password_file}")
+                        console.out(f"            {password_file}")
                     # THE MESSAGE THIS REPLACED SAID "SET AIRFLOW_PASSWORD in
                     # this file", which stopped being reachable the moment these
                     # functions moved into a package module -- see the module
                     # docstring. It now names routes that exist.
-                    print(f"\n  ℹ️  trigger/status read that file themselves; they need")
-                    print(f"     no further setup.")
-                    print(f"     To use a DIFFERENT password, pick one route:")
-                    print(f"       export {path_settings.ENV_AIRFLOW_PASSWORD}='...'")
-                    print(f"       oncotriage.orchestration.airflow_manager.set_airflow_password('...')")
-                    print(f"       python \"24- Airflow Manager.py\" status --password-stdin")
+                    console.out(f"\n  ℹ️  trigger/status read that file themselves; they need")
+                    console.out(f"     no further setup.")
+                    console.out(f"     To use a DIFFERENT password, pick one route:")
+                    console.out(f"       export {path_settings.ENV_AIRFLOW_PASSWORD}='...'")
+                    console.out(f"       oncotriage.orchestration.airflow_manager.set_airflow_password('...')")
+                    console.out(f"       python \"24- Airflow Manager.py\" status --password-stdin")
                 break
         except requests.exceptions.ConnectionError:
             pass
         time.sleep(1)
     else:
-        print("\n⚠️  API Server did not respond within 30 seconds. Check api_server.log")
-        print(f"  tail -f {Path(airflow_path) / 'api_server.log'}")
+        console.out("\n⚠️  API Server did not respond within 30 seconds. Check api_server.log")
+        console.out(f"  tail -f {Path(airflow_path) / 'api_server.log'}")
 
-    print(f"\n{'=' * 70}")
-    print("Scheduler will automatically run DAG every Sunday at 2:00 AM")
-    print(f"{'=' * 70}")
+    console.out(f"\n{'=' * 70}")
+    console.out("Scheduler will automatically run DAG every Sunday at 2:00 AM")
+    console.out(f"{'=' * 70}")
 
 
 # =============================================================================
@@ -267,7 +268,7 @@ def stop_airflow(airflow_home=None):
     pid_file = Path(airflow_path) / 'airflow_pids.json'
 
     if not pid_file.exists():
-        print("✗ No PID file found. Services may not be running.")
+        console.out("✗ No PID file found. Services may not be running.")
         return
 
     with open(pid_file, 'r') as f:
@@ -276,11 +277,11 @@ def stop_airflow(airflow_home=None):
     for name, pid in pids.items():
         try:
             os.kill(pid, signal.SIGTERM)
-            print(f"✓ Sent SIGTERM to {name} (PID: {pid})")
+            console.out(f"✓ Sent SIGTERM to {name} (PID: {pid})")
         except ProcessLookupError:
-            print(f"  {name} (PID: {pid}) was already stopped")
+            console.out(f"  {name} (PID: {pid}) was already stopped")
         except PermissionError:
-            print(f"✗ Permission denied stopping {name} (PID: {pid})")
+            console.out(f"✗ Permission denied stopping {name} (PID: {pid})")
 
     # Wait up to 10s for processes to exit before declaring success
 
@@ -294,15 +295,15 @@ def stop_airflow(airflow_home=None):
                 os.kill(pid, 0)  # signal 0 = existence check, no actual signal
                 still_running.append((name, pid))
             except ProcessLookupError:
-                print(f"  {name} confirmed stopped")
+                console.out(f"  {name} confirmed stopped")
         remaining = still_running
 
     if remaining:
-        print(f"\n⚠️  These processes did not exit within 10s: {[n for n,_ in remaining]}")
-        print("  You may need to kill them manually.")
+        console.out(f"\n⚠️  These processes did not exit within 10s: {[n for n,_ in remaining]}")
+        console.out("  You may need to kill them manually.")
 
     pid_file.unlink()
-    print("\n✓ Airflow services stopped")
+    console.out("\n✓ Airflow services stopped")
 
 
 # =============================================================================
@@ -413,7 +414,7 @@ def _get_password(password=None, airflow_home=None) -> str:
         # value password_source() can no longer return -- with the assertion
         # still compiling and now unfailable.
         _PASSWORD_STATE["source"] = PASSWORD_SOURCE_ENV
-        print(f"[Airflow] Admin password read from {env_source}")
+        console.out(f"[Airflow] Admin password read from {env_source}")
         return env_password
 
     airflow_path = resolve_airflow_home(airflow_home)
@@ -470,14 +471,14 @@ def _auth_headers(password=None, airflow_home=None) -> dict:
 # =============================================================================
 def check_dag_status(password=None, airflow_home=None):
     """Check if DAG is registered and get its status via REST API v2."""
-    print("=" * 70)
-    print("DAG STATUS CHECK")
-    print("=" * 70)
+    console.out("=" * 70)
+    console.out("DAG STATUS CHECK")
+    console.out("=" * 70)
 
     headers = _auth_headers(password, airflow_home)
 
     # Check DAG exists
-    print(f"\n[1] Checking DAG '{DAG_ID}'...")
+    console.out(f"\n[1] Checking DAG '{DAG_ID}'...")
     response = requests.get(
         f"{AIRFLOW_URL}/api/v2/dags/{DAG_ID}",
         headers=headers,
@@ -486,8 +487,8 @@ def check_dag_status(password=None, airflow_home=None):
 
     if response.status_code == 200:
         dag_info = response.json()
-        print(f"  ✓ DAG '{DAG_ID}' is registered!")
-        print(f"  Active: {not dag_info.get('is_paused', True)}")
+        console.out(f"  ✓ DAG '{DAG_ID}' is registered!")
+        console.out(f"  Active: {not dag_info.get('is_paused', True)}")
 
         # Airflow 3's API v2 does not return 'schedule_interval' -- that field
         # was Airflow 2's, and reading it here printed "N/A" on every run,
@@ -506,26 +507,26 @@ def check_dag_status(password=None, airflow_home=None):
                 break
 
         if schedule_field is None:
-            print("  Schedule: UNKNOWN - no schedule field in the API response")
-            print(f"            (keys returned: {sorted(dag_info.keys())})")
+            console.out("  Schedule: UNKNOWN - no schedule field in the API response")
+            console.out(f"            (keys returned: {sorted(dag_info.keys())})")
         else:
             schedule_value = dag_info[schedule_field]
             if schedule_value in (None, "", "None"):
-                print(f"  Schedule: DISABLED - no automatic runs  [{schedule_field}]")
+                console.out(f"  Schedule: DISABLED - no automatic runs  [{schedule_field}]")
             else:
-                print(f"  Schedule: {schedule_value}  [{schedule_field}]")
+                console.out(f"  Schedule: {schedule_value}  [{schedule_field}]")
 
-        print(f"  Tags: {[t.get('name', '') for t in dag_info.get('tags', [])]}")
+        console.out(f"  Tags: {[t.get('name', '') for t in dag_info.get('tags', [])]}")
     elif response.status_code == 404:
-        print(f"  ✗ DAG '{DAG_ID}' NOT FOUND")
-        print("  Make sure the scheduler is running and has parsed the DAG file.")
+        console.out(f"  ✗ DAG '{DAG_ID}' NOT FOUND")
+        console.out("  Make sure the scheduler is running and has parsed the DAG file.")
         return
     else:
-        print(f"  ✗ Error: {response.status_code} - {response.text}")
+        console.out(f"  ✗ Error: {response.status_code} - {response.text}")
         return
 
     # Get recent DAG runs
-    print(f"\n[2] Recent DAG runs:")
+    console.out(f"\n[2] Recent DAG runs:")
     response = requests.get(
         f"{AIRFLOW_URL}/api/v2/dags/{DAG_ID}/dagRuns",
         headers=headers,
@@ -537,18 +538,18 @@ def check_dag_status(password=None, airflow_home=None):
         runs = response.json().get("dag_runs", [])
         if runs:
             for run in runs:
-                print(f"  - Run ID: {run.get('dag_run_id', 'N/A')}")
-                print(f"    State: {run.get('state', 'N/A')}")
-                print(f"    Start: {run.get('start_date', 'N/A')}")
-                print(f"    End: {run.get('end_date', 'N/A')}")
-                print()
+                console.out(f"  - Run ID: {run.get('dag_run_id', 'N/A')}")
+                console.out(f"    State: {run.get('state', 'N/A')}")
+                console.out(f"    Start: {run.get('start_date', 'N/A')}")
+                console.out(f"    End: {run.get('end_date', 'N/A')}")
+                console.out()
         else:
-            print("  No runs yet (DAG has not been triggered)")
+            console.out("  No runs yet (DAG has not been triggered)")
     else:
-        print(f"  Error fetching runs: {response.status_code}")
+        console.out(f"  Error fetching runs: {response.status_code}")
 
     # Get tasks
-    print(f"[3] Tasks in DAG:")
+    console.out(f"[3] Tasks in DAG:")
     response = requests.get(
         f"{AIRFLOW_URL}/api/v2/dags/{DAG_ID}/tasks",
         headers=headers,
@@ -558,11 +559,11 @@ def check_dag_status(password=None, airflow_home=None):
     if response.status_code == 200:
         tasks = response.json().get("tasks", [])
         for t in tasks:
-            print(f"  - {t.get('task_id', 'N/A')}")
+            console.out(f"  - {t.get('task_id', 'N/A')}")
     else:
-        print(f"  Error fetching tasks: {response.status_code}")
+        console.out(f"  Error fetching tasks: {response.status_code}")
 
-    print(f"\n{'=' * 70}")
+    console.out(f"\n{'=' * 70}")
 
 
 # =============================================================================
@@ -570,9 +571,9 @@ def check_dag_status(password=None, airflow_home=None):
 # =============================================================================
 def trigger_dag(password=None, airflow_home=None):
     """Trigger DAG run via REST API v2."""
-    print("=" * 70)
-    print("MANUALLY TRIGGERING DAG")
-    print("=" * 70)
+    console.out("=" * 70)
+    console.out("MANUALLY TRIGGERING DAG")
+    console.out("=" * 70)
 
     headers = _auth_headers(password, airflow_home)
 
@@ -584,7 +585,7 @@ def trigger_dag(password=None, airflow_home=None):
         timeout=10
     )
     if unpause_response.status_code not in (200, 204):
-        print(f"⚠️  Could not unpause DAG: {unpause_response.status_code} - {unpause_response.text}")
+        console.out(f"⚠️  Could not unpause DAG: {unpause_response.status_code} - {unpause_response.text}")
 
     # Trigger
     response = requests.post(
@@ -596,17 +597,17 @@ def trigger_dag(password=None, airflow_home=None):
 
     if response.status_code in (200, 201):
         run = response.json()
-        print(f"\n✓ DAG triggered successfully!")
-        print(f"  Run ID: {run.get('dag_run_id', 'N/A')}")
-        print(f"  State: {run.get('state', 'N/A')}")
-        print(f"  Logical Date: {run.get('logical_date', 'N/A')}")
-        print(f"\n  Monitor at: {AIRFLOW_URL}/dags/{DAG_ID}")
+        console.out(f"\n✓ DAG triggered successfully!")
+        console.out(f"  Run ID: {run.get('dag_run_id', 'N/A')}")
+        console.out(f"  State: {run.get('state', 'N/A')}")
+        console.out(f"  Logical Date: {run.get('logical_date', 'N/A')}")
+        console.out(f"\n  Monitor at: {AIRFLOW_URL}/dags/{DAG_ID}")
     else:
-        print(f"\n✗ Failed to trigger DAG")
-        print(f"  Status: {response.status_code}")
-        print(f"  Response: {response.text}")
+        console.out(f"\n✗ Failed to trigger DAG")
+        console.out(f"  Status: {response.status_code}")
+        console.out(f"  Response: {response.text}")
 
-    print(f"{'=' * 70}")
+    console.out(f"{'=' * 70}")
 
 
 #------------------------------------------------------------------------------

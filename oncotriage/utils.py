@@ -85,6 +85,7 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from oncotriage import config
+from oncotriage.observability import console
 
 
 # ---------------------------------------------------------------------------
@@ -326,9 +327,9 @@ def resolve_qdrant_collection() -> str:
             for a in all_aliases:
                 if a.alias_name == collection_name:
                     return a.collection_name
-            print(f"⚠ Alias '{collection_name}' not found in Qdrant (attempt {attempt}/{MAX_RETRIES})")
+            console.out(f"⚠ Alias '{collection_name}' not found in Qdrant (attempt {attempt}/{MAX_RETRIES})")
         except Exception as e:
-            print(f"⚠ Qdrant alias resolution error (attempt {attempt}/{MAX_RETRIES}): {e}")
+            console.out(f"⚠ Qdrant alias resolution error (attempt {attempt}/{MAX_RETRIES}): {e}")
 
         if attempt < MAX_RETRIES:
             time.sleep(1)
@@ -336,12 +337,12 @@ def resolve_qdrant_collection() -> str:
     # Final fallback: check if collection_name is itself a real collection (no alias)
     try:
         client.get_collection(collection_name)
-        print(f"⚠ '{collection_name}' is a real collection, not an alias. Using as-is.")
+        console.out(f"⚠ '{collection_name}' is a real collection, not an alias. Using as-is.")
         return collection_name
     except Exception:
         pass
 
-    print(f"⚠ FAILED to resolve collection after {MAX_RETRIES} attempts. Using '{collection_name}' as fallback.")
+    console.out(f"⚠ FAILED to resolve collection after {MAX_RETRIES} attempts. Using '{collection_name}' as fallback.")
     return collection_name
 
 
@@ -517,15 +518,15 @@ class CaffeinateSession:
         # one means the package could not be loaded at all, and it carries the
         # reason.
         if _caffeine_mod is None:
-            print(f"Caffeine unavailable ({CAFFEINE_IMPORT_ERROR}) "
+            console.out(f"Caffeine unavailable ({CAFFEINE_IMPORT_ERROR}) "
                   f"(continuing: {self.label})")
             return self
 
         try:
             _caffeine_mod.on(display=False)
-            print(f"Caffeine ON (preventing sleep: {self.label})")
+            console.out(f"Caffeine ON (preventing sleep: {self.label})")
         except Exception:
-            print(f"Caffeine unavailable (non-macOS?) (continuing: {self.label})")
+            console.out(f"Caffeine unavailable (non-macOS?) (continuing: {self.label})")
         return self
 
     def __exit__(self, *args):
@@ -533,7 +534,7 @@ class CaffeinateSession:
             return
         try:
             _caffeine_mod.off()
-            print(f"Caffeine OFF ({self.label})")
+            console.out(f"Caffeine OFF ({self.label})")
         except Exception:
             pass
 

@@ -70,6 +70,7 @@ from oncotriage.registries.cancer_code_registry import (
     get_cancer_classification_stats,
     reset_cancer_classification_stats,
 )
+from oncotriage.observability import console
 
 
 #------------------------------------------------------------------------------
@@ -293,22 +294,22 @@ def run_diff():
     patients_path = Path(paths.data_fhir_path)
 
     if not patients_path.exists():
-        print(f"ERROR: Patient directory not found: {paths.data_fhir_path}")
+        console.out(f"ERROR: Patient directory not found: {paths.data_fhir_path}")
         return None
 
     patient_files = sorted(patients_path.glob("*.json"))
 
     if not patient_files:
-        print(f"ERROR: No patient bundles found in: {paths.data_fhir_path}")
+        console.out(f"ERROR: No patient bundles found in: {paths.data_fhir_path}")
         return None
 
-    print("="*80)
-    print("COHORT SELECTOR DIFF (READ ONLY)")
-    print("="*80)
-    print()
-    print(f"Directory: {patients_path}")
-    print(f"Bundles:   {len(patient_files)}")
-    print()
+    console.out("="*80)
+    console.out("COHORT SELECTOR DIFF (READ ONLY)")
+    console.out("="*80)
+    console.out()
+    console.out(f"Directory: {patients_path}")
+    console.out(f"Bundles:   {len(patient_files)}")
+    console.out()
 
     agree_cancer     = []
     agree_non_cancer = []
@@ -332,7 +333,7 @@ def run_diff():
     for idx, patient_file in enumerate(patient_files, 1):
 
         if idx % 200 == 0:
-            print(f"  Compared {idx}/{len(patient_files)} bundles...")
+            console.out(f"  Compared {idx}/{len(patient_files)} bundles...")
 
         try:
             with open(patient_file, 'r') as fh:
@@ -340,7 +341,7 @@ def run_diff():
         except (OSError, json.JSONDecodeError) as e:
             read_errors.append({'file': patient_file.name,
                                 'error': f"{type(e).__name__}: {e}"})
-            print(f"  ERROR reading {patient_file.name}: {type(e).__name__}: {e}")
+            console.out(f"  ERROR reading {patient_file.name}: {type(e).__name__}: {e}")
             continue
 
         probe_coding_shapes(bundle, shape_counts)
@@ -374,8 +375,8 @@ def run_diff():
                 'conditions':    cond_rows,
             })
 
-    print(f"  Compared {len(patient_files)}/{len(patient_files)} bundles... \nDONE")
-    print()
+    console.out(f"  Compared {len(patient_files)}/{len(patient_files)} bundles... \nDONE")
+    console.out()
 
     compared = len(patient_files) - len(read_errors)
     disagreements = len(legacy_only) + len(current_only)
@@ -561,7 +562,7 @@ def write_reports(diff):
             json.dump(diff, fh, indent=2)
         return True
     except OSError as e:
-        print(f"ERROR writing report: {type(e).__name__}: {e}")
+        console.out(f"ERROR writing report: {type(e).__name__}: {e}")
         return False
 
 
@@ -576,25 +577,25 @@ def main() -> int:
     diff without ending its own process. The three codes are unchanged: 1 when
     no bundle was found, 1 when a report could not be written, 0 otherwise.
     """
-    print()
-    print("╔═══════════════════════════════════════════════════════════════════════╗")
-    print(f"║              {Project_Name}: COHORT SELECTOR DIFF (READ ONLY)         ║")
-    print("╚═══════════════════════════════════════════════════════════════════════╝")
-    print()
+    console.out()
+    console.out("╔═══════════════════════════════════════════════════════════════════════╗")
+    console.out(f"║              {Project_Name}: COHORT SELECTOR DIFF (READ ONLY)         ║")
+    console.out("╚═══════════════════════════════════════════════════════════════════════╝")
+    console.out()
 
     _diff = run_diff()
 
     if _diff is None:
         return 1
 
-    print(_format_report(_diff))
+    console.out(_format_report(_diff))
 
     if not write_reports(_diff):
         return 1
 
-    print(f"Report written: {report_txt()}")
-    print(f"Detail written: {report_json()}")
-    print()
+    console.out(f"Report written: {report_txt()}")
+    console.out(f"Detail written: {report_json()}")
+    console.out()
 
     return 0
 

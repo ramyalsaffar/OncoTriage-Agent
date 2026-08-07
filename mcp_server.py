@@ -39,24 +39,43 @@ it calls" -- and no invariant has to be weakened to get the guard.
 THE GUARD, AND THE WINDOW IT CLOSES
 -----------------------------------
 Over stdio the client parses this process's stdout as JSON-RPC, one message per
-line. One stray byte ends the session. This project writes to stdout during
-import, measured rather than assumed:
+line. One stray byte ends the session.
 
-    $ python -c "import oncotriage.fhir.parser" 2>/dev/null
+**THIS GUARD NO LONGER HAS A KNOWN SUBJECT IN THIS REPOSITORY, and that is
+stated rather than left for a reader to discover.** It used to: ``oncotriage/
+paths.py`` printed ``[Paths] Settings module loaded from ...`` to stdout at
+module scope, two more lines landed there when a path first resolved, and the
+six-line bootstrap below printed on the branch a first-time user is on. The
+structured-logging pass moved every one of them -- all 1,273 prints in the
+package go to the console channel, which is stderr, and the bootstrap below
+calls ``_stderr()``. Measured after that pass, not assumed:
+
+    $ python -c "import oncotriage.mcp.server" 1>/dev/null
     [Paths] Settings module loaded from .../oncotriage/settings.py (via the ...)
+    $ python -c "import oncotriage.mcp.server" 2>/dev/null
+    (nothing)
 
-That is ``oncotriage/paths.py`` line 121, at module scope; lines 318 and 323 add
-``Running on local machine`` and ``[Paths] Project root: ...`` when a path first
-resolves. THE SIX-LINE PACKAGE BOOTSTRAP BELOW PRINTS TOO, on the branch where
-``oncotriage`` is not installed and this directory has to go on ``sys.path`` --
-which is the branch a first-time user is on.
+IT IS KEPT ANYWAY, and the argument is not sentiment. The import window pulls
+in openai, qdrant-client, langgraph, fastembed and transformers; a banner
+printed to stdout by any of them on any future version is a dead client session
+with no diagnosis, and none of that is under this project's control. A
+regression here is equally cheap to make -- one ``print`` at module scope in a
+package module -- and equally expensive to find.
+
+What the retention costs is that "the guard works" can no longer be proved by
+the defect it was written for. ``tests/test_mcp_server_stdio_contract.py``
+section 8c therefore PLANTS one: it copies the package into a temp directory,
+appends a stdout write to ``oncotriage/__init__.py``, and requires the bypassed
+run to be corrupted and the guarded run to be clean. Nothing in the repository
+is edited, and the check is stronger than the one it replaces because it does
+not depend on a defect happening to exist.
 
 mcp 2.0.0's ``stdio_server()`` protects the SERVING window on its own:
 ``_claim_fd(1, ...)`` in ``mcp/server/stdio.py`` duplicates the real stdout to a
 private descriptor and points fd 1 at stderr, so a ``print`` from inside a tool
 misses the wire. But that claim is made when the transport starts, and every
-module-scope ``print`` in the dependency graph has already run by then. Two
-windows, two guards; this is the first one.
+module-scope write in the dependency graph has already run by then. Two windows,
+two guards; this is the first one.
 
 FILE-DESCRIPTOR LEVEL, not ``contextlib.redirect_stdout``. A Python-level
 redirect rebinds ``sys.stdout`` and is invisible to anything writing to fd 1
@@ -135,8 +154,14 @@ def _bootstrap_and_import():
             if _candidate and os.path.isdir(os.path.join(_candidate, "oncotriage")):
                 if _candidate not in sys.path:
                     sys.path.insert(0, _candidate)
-                print(f"[Bootstrap] oncotriage package found at {_candidate} "
-                      f"(via {_how}); added to sys.path")
+                # ROUTED TO STDERR, unlike every other entry point's copy of
+                # this block. The six-line bootstrap prints to stdout by
+                # convention, and stdout is the protocol stream here. The fd
+                # guard below would catch it anyway; writing it to the right
+                # stream in the first place means the guard is defence rather
+                # than the only thing between this line and a dead session.
+                _stderr(f"[Bootstrap] oncotriage package found at {_candidate} "
+                        f"(via {_how}); added to sys.path")
                 break
         else:
             raise

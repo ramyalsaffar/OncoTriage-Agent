@@ -59,6 +59,7 @@ importing the indexer pull in onnxruntime and a tokenizer.
 """
 
 import threading
+from oncotriage.observability import console
 
 
 #------------------------------------------------------------------------------
@@ -101,9 +102,9 @@ def get_bm25_sparse_model():
         if _MODEL is None:
             from fastembed import SparseTextEmbedding
 
-            print("Loading BM25 sparse embedding model (FastEmbed)...")
+            console.out("Loading BM25 sparse embedding model (FastEmbed)...")
             _MODEL = SparseTextEmbedding(model_name=BM25_SPARSE_MODEL_NAME)
-            print("BM25 sparse model loaded.\n")
+            console.out("BM25 sparse model loaded.\n")
         return _MODEL
 
 

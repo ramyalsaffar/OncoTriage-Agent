@@ -50,6 +50,7 @@ import subprocess
 from pathlib import Path
 
 from oncotriage.orchestration.home import resolve_airflow_home
+from oncotriage.observability import console
 
 
 #------------------------------------------------------------------------------
@@ -65,7 +66,7 @@ def setup_airflow(airflow_home=None):
     # Set Airflow home
     os.environ['AIRFLOW_HOME'] = airflow_path
 
-    print(f"Airflow Home: {airflow_path}\n")
+    console.out(f"Airflow Home: {airflow_path}\n")
 
     # =========================================================================
     # Step 1: Database migration
@@ -73,9 +74,9 @@ def setup_airflow(airflow_home=None):
     db_path = Path(airflow_path) / 'airflow.db'
 
     if db_path.exists():
-        print(f"✓ Database exists: {db_path}")
+        console.out(f"✓ Database exists: {db_path}")
     else:
-        print(f"Initializing database: {db_path}")
+        console.out(f"Initializing database: {db_path}")
 
     try:
         result = subprocess.run(
@@ -86,17 +87,17 @@ def setup_airflow(airflow_home=None):
             env=os.environ.copy()
         )
         if result.stdout:
-            print(result.stdout)
-        print("✓ Database ready")
+            console.out(result.stdout)
+        console.out("✓ Database ready")
     except subprocess.CalledProcessError as e:
-        print(f"✗ Database migration failed:")
-        print(e.stderr)
+        console.out(f"✗ Database migration failed:")
+        console.out(e.stderr)
         return False
 
     # =========================================================================
     # Step 2: Verify database
     # =========================================================================
-    print("\nVerifying database...")
+    console.out("\nVerifying database...")
     try:
         result = subprocess.run(
             ['airflow', 'db', 'check'],
@@ -106,23 +107,23 @@ def setup_airflow(airflow_home=None):
             env=os.environ.copy()
         )
         if result.stdout:
-            print(result.stdout)
-        print("✓ Database verified")
+            console.out(result.stdout)
+        console.out("✓ Database verified")
     except subprocess.CalledProcessError as e:
-        print(f"✗ Database check failed:")
-        print(e.stderr)
+        console.out(f"✗ Database check failed:")
+        console.out(e.stderr)
         return False
 
     # =========================================================================
     # Step 3: Configure admin user in airflow.cfg
     # =========================================================================
-    print("\nConfiguring admin user...")
+    console.out("\nConfiguring admin user...")
 
     cfg_path = Path(airflow_path) / 'airflow.cfg'
 
     if not cfg_path.exists():
-        print(f"✗ Config file not found: {cfg_path}")
-        print("  Run 'airflow db migrate' first to generate config")
+        console.out(f"✗ Config file not found: {cfg_path}")
+        console.out("  Run 'airflow db migrate' first to generate config")
         return False
 
     # Read existing config
@@ -133,7 +134,7 @@ def setup_airflow(airflow_home=None):
     user_configured = any('simple_auth_manager_users' in line and 'admin' in line for line in lines)
 
     if user_configured:
-        print("✓ Admin user already configured")
+        console.out("✓ Admin user already configured")
     else:
         # Find [core] section and add user configuration
         new_lines = []
@@ -157,22 +158,22 @@ def setup_airflow(airflow_home=None):
         with open(cfg_path, 'w') as f:
             f.writelines(new_lines)
 
-        print("✓ Admin user configured in airflow.cfg")
+        console.out("✓ Admin user configured in airflow.cfg")
 
     # =========================================================================
     # Step 4: Password file info
     # =========================================================================
     password_file = Path(airflow_path) / 'simple_auth_manager_passwords.json.generated'
 
-    print(f"\n{'='*70}")
-    print("✓ AIRFLOW SETUP COMPLETE")
-    print(f"{'='*70}")
-    print(f"Database: {db_path}")
-    print(f"Config: {cfg_path}")
-    print(f"\nUser: admin")
-    print(f"Password will be auto-generated and saved to:")
-    print(f"  {password_file}")
-    print(f"  (Also printed in webserver logs on first start)")
+    console.out(f"\n{'='*70}")
+    console.out("✓ AIRFLOW SETUP COMPLETE")
+    console.out(f"{'='*70}")
+    console.out(f"Database: {db_path}")
+    console.out(f"Config: {cfg_path}")
+    console.out(f"\nUser: admin")
+    console.out(f"Password will be auto-generated and saved to:")
+    console.out(f"  {password_file}")
+    console.out(f"  (Also printed in webserver logs on first start)")
 # =============================================================================
 #     print(f"\nNext steps:")
 #     print(f"  1. Start webserver: airflow api-server --port 8080")  # ✅ VERIFIED: Correct syntax
@@ -183,8 +184,8 @@ def setup_airflow(airflow_home=None):
 #
 # =============================================================================
 
-    print(f"\nNext step: Run file 23, then file 24 to start services")
-    print(f"{'='*70}\n")
+    console.out(f"\nNext step: Run file 23, then file 24 to start services")
+    console.out(f"{'='*70}\n")
 
     return True
 

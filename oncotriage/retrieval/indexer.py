@@ -102,6 +102,7 @@ from oncotriage.extraction.stage import (
     get_stage_extraction_stats,
 )
 from oncotriage.utils import CaffeinateSession, qdrant_retry
+from oncotriage.observability import console
 
 
 #------------------------------------------------------------------------------
@@ -159,16 +160,16 @@ def create_payload_indexes(collection_name: str):
                     field_name=field_name,
                     field_schema=field_schema,
                 )
-                print(f"✓ Payload index created: {field_name} on '{collection_name}'")
+                console.out(f"✓ Payload index created: {field_name} on '{collection_name}'")
                 return
             except Exception as e:
                 wait_time = 2 ** attempt
-                print(f"  Attempt {attempt}/{max_retries} failed for {field_name}: {e}")
+                console.out(f"  Attempt {attempt}/{max_retries} failed for {field_name}: {e}")
                 if attempt < max_retries:
-                    print(f"  Retrying in {wait_time}s...")
+                    console.out(f"  Retrying in {wait_time}s...")
                     time.sleep(wait_time)
                 else:
-                    print(f"  FAILED to create index {field_name} after {max_retries} attempts")
+                    console.out(f"  FAILED to create index {field_name} after {max_retries} attempts")
                     raise
 
     _create_index_with_retry("nct_id", PayloadSchemaType.KEYWORD)    
@@ -211,13 +212,13 @@ def scrape_clinicaltrials_gov(condition=None, status=None, study_type=None, age=
             ckpt = json.load(f)
         trials     = ckpt.get("trials", [])
         page_token = ckpt.get("page_token", None)
-        print(f"Resuming scrape from checkpoint: {len(trials)} trials already scraped.")
+        console.out(f"Resuming scrape from checkpoint: {len(trials)} trials already scraped.")
     else:
         trials     = []
         page_token = None
-        print("Starting fresh scrape from ClinicalTrials.gov...")
+        console.out("Starting fresh scrape from ClinicalTrials.gov...")
 
-    print(f"Filters: condition={condition}, status={status}, type={study_type}, max={max_trials}")
+    console.out(f"Filters: condition={condition}, status={status}, type={study_type}, max={max_trials}")
 
     scrape_complete = False
     scrape_start    = time.time()
@@ -247,7 +248,7 @@ def scrape_clinicaltrials_gov(condition=None, status=None, study_type=None, age=
 
                 studies = data.get("studies", [])
                 if not studies:
-                    tqdm.write("No more trials found.")
+                    console.out("No more trials found.")
                     scrape_complete = True
                     break
 
@@ -337,8 +338,8 @@ def scrape_clinicaltrials_gov(condition=None, status=None, study_type=None, age=
                 time.sleep(1)
 
             except requests.exceptions.RequestException as e:
-                tqdm.write(f"Network error fetching trials: {e}")
-                tqdm.write("Progress saved to checkpoint — re-run to resume.")
+                console.out(f"Network error fetching trials: {e}")
+                console.out("Progress saved to checkpoint — re-run to resume.")
                 break
 
     elapsed = time.time() - scrape_start
@@ -346,32 +347,32 @@ def scrape_clinicaltrials_gov(condition=None, status=None, study_type=None, age=
     mins, secs = divmod(rem, 60)
     elapsed_str = f"{hrs:02d}:{mins:02d}:{secs:02d}" if hrs > 0 else f"{mins:02d}:{secs:02d}"
 
-    print(f"\nTotal trials scraped: {len(trials)}  |  Scrape time: {elapsed_str}")
+    console.out(f"\nTotal trials scraped: {len(trials)}  |  Scrape time: {elapsed_str}")
 
     _histology_stats = get_histology_extraction_stats()
     if _histology_stats.get("exclusive_pair_kept"):
-        print(f"Trials carrying a mutually exclusive histology pair: "
+        console.out(f"Trials carrying a mutually exclusive histology pair: "
               f"{_histology_stats['exclusive_pair_kept']}  (permit either "
               f"histology — both tags indexed, both populations match)")
     if any(_histology_stats.values()):
-        print(f"Histology negation/exclusive-pair counters: {_histology_stats}")
+        console.out(f"Histology negation/exclusive-pair counters: {_histology_stats}")
 
     _stage_stats = get_stage_extraction_stats()
     if any(_stage_stats.values()):
-        print(f"Stage negation/span/exclusion-bound counters: {_stage_stats}")
+        console.out(f"Stage negation/span/exclusion-bound counters: {_stage_stats}")
 
     # The age-parse counter the exception audit asked for, in the scrape summary
     # where it asked for it. Printed only when non-zero, so a clean scrape's
     # output is unchanged.
     if INDEX_AGE_PARSE_FAILURES:
         _age_total = sum(INDEX_AGE_PARSE_FAILURES.values())
-        print(f"minimumAge UNPARSEABLE on {_age_total} trial(s) — the "
+        console.out(f"minimumAge UNPARSEABLE on {_age_total} trial(s) — the "
               f"paediatric-only skip did not run for them and they ARE indexed: "
               f"{dict(INDEX_AGE_PARSE_FAILURES)}")
 
     if scrape_complete and checkpoint_file.exists():
         checkpoint_file.unlink()
-        print("Scrape checkpoint cleared.")
+        console.out("Scrape checkpoint cleared.")
 
     return trials
 
@@ -698,7 +699,7 @@ def create_qdrant_collection(collection_name: str, delete_if_exists: bool = Fals
     if delete_if_exists:
         try:
             get_qdrant_client().delete_collection(collection_name=collection_name)
-            print(f"Deleted existing collection: {collection_name}")
+            console.out(f"Deleted existing collection: {collection_name}")
         
         except Exception as e:
             if "doesn't exist" not in str(e).lower() and "not found" not in str(e).lower():
@@ -714,9 +715,9 @@ def create_qdrant_collection(collection_name: str, delete_if_exists: bool = Fals
         },
     )
     
-    print(f"Created collection: {collection_name}")
-    print(f"  Dense vector:  {EMBEDDING_DIM}-dim cosine (OpenAI {EMBEDDING_MODEL})")
-    print(f"  Sparse vectors: title-bm25, conditions-bm25, criteria-bm25 (BM25 + IDF)")
+    console.out(f"Created collection: {collection_name}")
+    console.out(f"  Dense vector:  {EMBEDDING_DIM}-dim cosine (OpenAI {EMBEDDING_MODEL})")
+    console.out(f"  Sparse vectors: title-bm25, conditions-bm25, criteria-bm25 (BM25 + IDF)")
 
 
 def create_trial_bm25_fields(trial: Dict) -> Dict[str, str]:
@@ -799,7 +800,7 @@ def index_trials(trials: List[Dict], collection_name: str):
         trials:          List of trial dictionaries
         collection_name: Target Qdrant collection name
     """
-    print(f"\nIndexing {len(trials)} trials into '{collection_name}'...")
+    console.out(f"\nIndexing {len(trials)} trials into '{collection_name}'...")
 
     # ------------------------------------------------------------------
     # Checkpoint: fixed filename, not tied to collection_name.
@@ -816,7 +817,7 @@ def index_trials(trials: List[Dict], collection_name: str):
         indexed_nct_ids  = set(ckpt.get("nct_ids", []))
 
         if saved_collection != collection_name:
-            print(
+            console.out(
                 f"WARNING: Checkpoint was for collection '{saved_collection}', "
                 f"but current collection is '{collection_name}'. "
                 f"Discarding checkpoint and starting fresh."
@@ -824,13 +825,13 @@ def index_trials(trials: List[Dict], collection_name: str):
             indexed_nct_ids = set()
             embed_checkpoint_file.unlink()
         else:
-            print(
+            console.out(
                 f"Resuming embedding checkpoint: "
                 f"{len(indexed_nct_ids)} / {len(trials)} trials already indexed."
             )
     else:
         indexed_nct_ids = set()
-        print("No embedding checkpoint found. Starting fresh.")
+        console.out("No embedding checkpoint found. Starting fresh.")
 
     # ------------------------------------------------------------------
     # Filter: skip already-indexed and trials with missing nct_id.
@@ -838,19 +839,19 @@ def index_trials(trials: List[Dict], collection_name: str):
     # ------------------------------------------------------------------
     skipped_no_id = [t for t in trials if not t.get("nct_id")]
     if skipped_no_id:
-        print(f"WARNING: Skipping {len(skipped_no_id)} trials with missing nct_id.")
+        console.out(f"WARNING: Skipping {len(skipped_no_id)} trials with missing nct_id.")
 
     remaining = [
         t for t in trials
         if t.get("nct_id") and t["nct_id"] not in indexed_nct_ids
     ]
 
-    print(f"Trials to embed now: {len(remaining)} "
+    console.out(f"Trials to embed now: {len(remaining)} "
           f"({len(indexed_nct_ids)} already done, "
           f"{len(skipped_no_id)} skipped — missing nct_id).")
 
     if not remaining:
-        print("All trials already indexed. Nothing to do.")
+        console.out("All trials already indexed. Nothing to do.")
         return
 
     # ------------------------------------------------------------------
@@ -869,7 +870,7 @@ def index_trials(trials: List[Dict], collection_name: str):
     avg_tokens       = avg_chars / CHARS_PER_TOKEN
     embed_batch_size = max(1, min(int(TARGET_TOKENS // avg_tokens), MAX_INPUTS))
 
-    print(f"Dynamic embedding batch size: {embed_batch_size} "
+    console.out(f"Dynamic embedding batch size: {embed_batch_size} "
           f"(avg ~{avg_tokens:.0f} tokens/trial, target {TARGET_TOKENS:,} tokens/request)")
 
     # ------------------------------------------------------------------
@@ -995,11 +996,11 @@ def index_trials(trials: List[Dict], collection_name: str):
     mins, secs = divmod(rem, 60)
     elapsed_str = f"{hrs:02d}:{mins:02d}:{secs:02d}" if hrs > 0 else f"{mins:02d}:{secs:02d}"
 
-    print(f"\n✓ Indexed {len(indexed_nct_ids)} trials into '{collection_name}'  |  Embed time: {elapsed_str}")
+    console.out(f"\n✓ Indexed {len(indexed_nct_ids)} trials into '{collection_name}'  |  Embed time: {elapsed_str}")
 
     if embed_checkpoint_file.exists():
         embed_checkpoint_file.unlink()
-        print("Embedding checkpoint cleared.")
+        console.out("Embedding checkpoint cleared.")
         
 
 def save_trials_to_disk(trials: List[Dict], output_path: str):
@@ -1013,7 +1014,7 @@ def save_trials_to_disk(trials: List[Dict], output_path: str):
         output_path: Directory to write the file into (paths.data_trial_path)
     """
     if not trials:
-        print("No trials to save.")
+        console.out("No trials to save.")
         return
 
     output_dir  = Path(output_path)
@@ -1023,11 +1024,11 @@ def save_trials_to_disk(trials: List[Dict], output_path: str):
     try:
         with open(output_file, "w") as f:
             json.dump(trials, f, indent=2)
-        print(f"Saved {len(trials)} trials to {output_file}")
+        console.out(f"Saved {len(trials)} trials to {output_file}")
 
     except OSError as e:
-        print(f"WARNING: Could not save trials to disk: {e}")
-        print("Continuing to indexing step — trials are still in memory.")
+        console.out(f"WARNING: Could not save trials to disk: {e}")
+        console.out("Continuing to indexing step — trials are still in memory.")
         
 
 def swap_alias_atomic(new_collection: str, alias_name: str):
@@ -1066,7 +1067,7 @@ def swap_alias_atomic(new_collection: str, alias_name: str):
                 )
             ]
         )
-        print(f"Swapped alias '{alias_name}' -> '{new_collection}'")
+        console.out(f"Swapped alias '{alias_name}' -> '{new_collection}'")
 
     else:
         # First run — alias does not exist yet, create it directly.
@@ -1080,7 +1081,7 @@ def swap_alias_atomic(new_collection: str, alias_name: str):
                 )
             ]
         )
-        print(f"Created alias '{alias_name}' -> '{new_collection}'")
+        console.out(f"Created alias '{alias_name}' -> '{new_collection}'")
         
 
 def cleanup_old_collections(keep_recent: int = 1):
@@ -1093,7 +1094,7 @@ def cleanup_old_collections(keep_recent: int = 1):
     """
     # Enforce minimum of 1 to never delete the live collection
     if keep_recent < 1:
-        print("WARNING: keep_recent must be >= 1. Defaulting to 1.")
+        console.out("WARNING: keep_recent must be >= 1. Defaulting to 1.")
         keep_recent = 1
 
     collections = get_qdrant_client().get_collections().collections
@@ -1109,17 +1110,17 @@ def cleanup_old_collections(keep_recent: int = 1):
     to_delete = timestamped[keep_recent:]
 
     if not to_delete:
-        print(f"No old collections to clean up. Keeping: {to_keep}")
+        console.out(f"No old collections to clean up. Keeping: {to_keep}")
         return
 
     for name in to_delete:
         try:
             get_qdrant_client().delete_collection(collection_name=name)
-            print(f"Deleted old collection: {name}")
+            console.out(f"Deleted old collection: {name}")
         except Exception as e:
-            print(f"WARNING: Could not delete collection '{name}': {e}")
+            console.out(f"WARNING: Could not delete collection '{name}': {e}")
 
-    print(f"Kept {keep_recent} recent collection(s): {to_keep}")
+    console.out(f"Kept {keep_recent} recent collection(s): {to_keep}")
     
 
 #------------------------------------------------------------------------------
@@ -1134,17 +1135,17 @@ def main(use_staging: bool = True):
                      If False, rebuild production directly (causes downtime).
     """
     with CaffeinateSession("RAG Indexing"):
-        print(f"=== {Project_Name}: Clinical Trial RAG Indexer ===\n")
+        console.out(f"=== {Project_Name}: Clinical Trial RAG Indexer ===\n")
 
         trials = scrape_clinicaltrials_gov()
         if not trials:
-            print("No trials scraped. Exiting.")
+            console.out("No trials scraped. Exiting.")
             return
 
         save_trials_to_disk(trials, output_path=paths.data_trial_path)
 
         if use_staging:
-            print("\n=== STAGING REBUILD (ZERO DOWNTIME) ===\n")
+            console.out("\n=== STAGING REBUILD (ZERO DOWNTIME) ===\n")
             staging_name = f"trial_criteria_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
             create_qdrant_collection(staging_name, delete_if_exists=False)
@@ -1153,19 +1154,19 @@ def main(use_staging: bool = True):
             swap_alias_atomic(staging_name, "trial_criteria")
             cleanup_old_collections(keep_recent=1)
 
-            print(f"\n✓ Staging rebuild complete")
-            print(f"✓ Alias 'trial_criteria' now points to '{staging_name}'")
-            print(f"✓ FastAPI experienced zero downtime\n")
+            console.out(f"\n✓ Staging rebuild complete")
+            console.out(f"✓ Alias 'trial_criteria' now points to '{staging_name}'")
+            console.out(f"✓ FastAPI experienced zero downtime\n")
             
         else:
-            print("\n=== DIRECT REBUILD (CAUSES DOWNTIME) ===\n")
+            console.out("\n=== DIRECT REBUILD (CAUSES DOWNTIME) ===\n")
             create_qdrant_collection("trial_criteria", delete_if_exists=True)
             index_trials(trials, collection_name="trial_criteria")
             create_payload_indexes("trial_criteria")
-            print(f"\n✓ Direct rebuild complete\n")
+            console.out(f"\n✓ Direct rebuild complete\n")
 
-        print("=== Indexing Complete ===")
-        print("Ready for hybrid BM25 + Vector retrieval!")
+        console.out("=== Indexing Complete ===")
+        console.out("Ready for hybrid BM25 + Vector retrieval!")
 
 
 #------------------------------------------------------------------------------

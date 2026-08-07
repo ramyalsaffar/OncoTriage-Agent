@@ -672,6 +672,60 @@ def resolve_airflow_password():
 #------------------------------------------------------------------------------
 
 
+ENV_LOG_LEVEL = "ONCOTRIAGE_LOG_LEVEL"
+"""Severity floor for the structured JSON logger in ``oncotriage.observability``.
+
+NOT A PATH, so it is resolved by its own function below rather than by
+``_from_env``: that helper appends a trailing separator, and ``"DEBUG/"`` is not
+a level name. Fourth victim of the same helper after ENV_AIRFLOW_PASSWORD,
+ENV_INFERENCES_DB and ENV_ALLOW_DEGRADED_REGISTRIES, and the reason it is worth
+naming again is that this one fails QUIETLY in the useful direction: an
+unrecognised level would fall back to the default, so an operator who set DEBUG
+to diagnose a failing run would get INFO and conclude the lines do not exist.
+
+Accepted: the five standard names, case-insensitive. Unset means INFO.
+"""
+
+_LOG_LEVELS = {
+    "CRITICAL": 50, "ERROR": 40, "WARNING": 30, "INFO": 20, "DEBUG": 10,
+}
+
+DEFAULT_LOG_LEVEL = "INFO"
+
+
+def resolve_log_level():
+    """The configured severity floor as an int. Raises on an unrecognised name.
+
+    Returns:
+        A ``logging`` level integer. Unset or empty gives ``INFO``.
+
+    Raises:
+        RuntimeError: the variable names something that is not one of the five
+            standard levels. It RAISES rather than falling back, on the same
+            argument as ``resolve_allow_degraded_registries``: a typo in a
+            switch that decides what gets recorded must not be read as "the
+            default", because the operator would then be looking for lines that
+            were never emitted and would have no way to tell the variable from
+            the code.
+    """
+    raw = os.environ.get(ENV_LOG_LEVEL)
+    if raw is None or raw.strip() == "":
+        return _LOG_LEVELS[DEFAULT_LOG_LEVEL]
+
+    name = raw.strip().upper()
+    if name in _LOG_LEVELS:
+        return _LOG_LEVELS[name]
+
+    raise RuntimeError(
+        f"{ENV_LOG_LEVEL} is set to {raw!r}, which is not a logging level.\n"
+        f"  Accepted (case-insensitive): "
+        f"{', '.join(sorted(_LOG_LEVELS, key=_LOG_LEVELS.get, reverse=True))}.\n"
+        f"  Unset or empty means {DEFAULT_LOG_LEVEL}.")
+
+
+#------------------------------------------------------------------------------
+
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """

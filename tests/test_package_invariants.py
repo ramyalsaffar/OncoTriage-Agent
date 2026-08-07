@@ -891,13 +891,26 @@ _CHAIN_CALL_MARKERS = ("exec_chain", "spec_from_file_location",
 _STRING_PREFILTER = ("exec", "spec_from_file_location", "SourceFileLoader",
                      "runpy")
 
-# THE exec() ALLOWLIST IS CLOSED AND HAS ONE MEMBER, WITH AN ARGUMENT.
+# THE exec() ALLOWLIST IS CLOSED AND HAS TWO MEMBERS, EACH WITH AN ARGUMENT.
+#
 # tests/test_storage_query_layer.py unparses two PRE-FIX functions out of a git
 # blob and exec's them into a throwaway namespace, so that its negative controls
 # run the code item 38 replaced rather than a retyped copy of it. That is a
 # legitimate exec of text that is not a file in the working tree, and it is the
 # only one. An entry added here has to carry the same kind of argument.
-_EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py"}
+#
+# tests/test_observability_logging.py (the structured-logging pass) exec's a
+# PATCHED COPY of oncotriage/observability.py to plant two defects it then
+# requires to fire: the correlation ID as a module-level global instead of a
+# ContextVar, and the field allowlist not being consulted. The argument is the
+# same shape and it is CLAUDE.md's own instruction: "prefer a demonstration
+# that mutates a COPY of the source and execs it over one that edits a file in
+# place". The alternative -- editing observability.py, running, restoring -- is
+# the in-place shape that cost pass 20d-1 an edit to config.py, and it would put
+# a window in the run during which the shipped logger is wrong. Nothing here
+# execs a file in the working tree, which is what this section is about.
+_EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
+                   "tests/test_observability_logging.py"}
 
 
 def _repo_py_files():
@@ -1012,7 +1025,7 @@ if _VIOLATIONS:
     for _rel, _ln, _form, _text in _VIOLATIONS:
         print(f"       {_form:20} {_rel}:{_ln}  {_text}")
 
-# THE ALLOWLIST IS NOT A GET-OUT. Its one member must still contain the exec it
+# THE ALLOWLIST IS NOT A GET-OUT. Every member must still contain the exec it
 # is excused for, or the entry is a stale line excusing nothing.
 _allowlist_still_needed = []
 for _allowed in sorted(_EXEC_ALLOWLIST):
@@ -1022,7 +1035,7 @@ for _allowed in sorted(_EXEC_ALLOWLIST):
         continue
     if not _chain_violations([_p], allowlist=set()):
         _allowlist_still_needed.append(f"{_allowed}: no longer calls exec()")
-check("...and the one allowlisted file still needs its entry, so the allowlist "
+check("...and every allowlisted file still needs its entry, so the allowlist "
       "cannot go stale unnoticed", _allowlist_still_needed, [])
 
 # The deleted files are gone, asserted rather than assumed. A shim left on disk
@@ -3376,6 +3389,20 @@ _DECORATOR_INVENTORY = {
     "oncotriage/mcp/server.py::lookup_trial_tool": ["_counted('lookup_trial')"],
     "oncotriage/retrieval/trial_lookup.py::lookup_trial._scroll": ["qdrant_retry"],
     "oncotriage/registries/mesh.py::MeSHCancerFilter._stem": ["staticmethod"],
+    # The structured-logging pass. `_Console` is a namespace of @staticmethods
+    # rather than a module of bare functions so that `console.out` reads at
+    # 1,100 call sites the way `print` did; `progress` stacks
+    # @contextlib.contextmanager UNDER @staticmethod, and the order is
+    # load-bearing (the other way round decorates the staticmethod descriptor,
+    # which is not callable). `correlation_scope` is the ID's set-and-reset
+    # pair, which is why it is a context manager and not a setter.
+    "oncotriage/observability.py::_Console.out": ["staticmethod"],
+    "oncotriage/observability.py::_Console.banner": ["staticmethod"],
+    "oncotriage/observability.py::_Console.attach_bar": ["staticmethod"],
+    "oncotriage/observability.py::_Console.detach_bar": ["staticmethod"],
+    "oncotriage/observability.py::correlation_scope":
+        ["contextlib.contextmanager"],
+    "oncotriage/observability.py::StructuredLogger.std": ["property"],
     "oncotriage/retrieval/indexer.py::get_embeddings_batch._call": [
         "retry(reraise=True, stop=stop_after_attempt(5), "
         "wait=wait_exponential(multiplier=1, min=2, max=60), "

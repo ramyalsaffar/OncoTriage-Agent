@@ -118,7 +118,6 @@ accessors that build on first call.
 """
 
 import argparse
-import builtins
 import json
 import os
 import random
@@ -154,6 +153,10 @@ from oncotriage.utils import (
     get_model_cost,
     resolve_qdrant_collection,
 )
+from oncotriage.observability import console, correlation_scope, get_logger
+
+
+log = get_logger(__name__)
 
 
 #------------------------------------------------------------------------------
@@ -363,10 +366,10 @@ def load_ablation_checkpoint(db_path=None) -> set:
         with open(cp, "r") as f:
             data = json.load(f)
         completed = set(tuple(pair) for pair in data.get("completed", []))
-        print(f"[Checkpoint] Resuming: {len(completed)} patient-config pairs already completed.")
+        console.out(f"[Checkpoint] Resuming: {len(completed)} patient-config pairs already completed.")
         return completed
     except (json.JSONDecodeError, KeyError) as e:
-        print(f"[Checkpoint] WARNING: Could not read checkpoint ({e}). Starting fresh.")
+        console.out(f"[Checkpoint] WARNING: Could not read checkpoint ({e}). Starting fresh.")
         return set()
 
 
@@ -389,7 +392,7 @@ def save_ablation_checkpoint(completed: set, db_path=None) -> None:
             os.replace(tmp_path, cp)
         except OSError as e:
             CHECKPOINT_WRITE_FAILURES[f"write:{type(e).__name__}"] += 1
-            print(f"[Checkpoint] WARNING: Could not write checkpoint ({e}). Continuing.")
+            console.out(f"[Checkpoint] WARNING: Could not write checkpoint ({e}). Continuing.")
             if tmp_path.exists():
                 try:
                     tmp_path.unlink()
@@ -404,7 +407,7 @@ def save_ablation_checkpoint(completed: set, db_path=None) -> None:
                     # checkpoint directory was the only evidence it happened.
                     CHECKPOINT_WRITE_FAILURES[
                         f"tmp_unlink:{type(unlink_error).__name__}"] += 1
-                    print(f"[Checkpoint] WARNING: could not remove the "
+                    console.out(f"[Checkpoint] WARNING: could not remove the "
                           f"temporary checkpoint file {tmp_path} "
                           f"({unlink_error}). Continuing; it will be "
                           f"overwritten by the next successful write.")
@@ -415,7 +418,7 @@ def clear_ablation_checkpoint(db_path=None) -> None:
     cp = _ablation_checkpoint_path(db_path)
     if cp.exists():
         cp.unlink()
-        print("[Checkpoint] Cleared.")
+        console.out("[Checkpoint] Cleared.")
 
 
 # ===========================================================================
@@ -576,7 +579,7 @@ def stratified_sample(patients, sample_size, seed):
         List of patient dicts, length = min(sample_size, len(patients))
     """
     if len(patients) <= sample_size:
-        print(f"  Population ({len(patients)}) <= sample ({sample_size}). Using all.")
+        console.out(f"  Population ({len(patients)}) <= sample ({sample_size}). Using all.")
         return sorted(patients, key=lambda p: p["patient_id"])
 
     # Local Random instance rather than random.seed(): seeding the
@@ -612,14 +615,14 @@ def stratified_sample(patients, sample_size, seed):
     sampled.sort(key=lambda p: p["patient_id"])
 
     # Report
-    print(f"\nStratified sample: {len(sampled)} patients, "
+    console.out(f"\nStratified sample: {len(sampled)} patients, "
           f"{len(cancer_groups)} cancer groups")
     
     sampled_ids = {p["patient_id"] for p in sampled}
     for gname in sorted(cancer_groups):
         n_sample = sum(1 for p in cancer_groups[gname] if p["patient_id"] in sampled_ids)
         n_pop = len(cancer_groups[gname])
-        print(f"  {gname:15s}: {n_sample:3d} sampled / {n_pop:4d} total")
+        console.out(f"  {gname:15s}: {n_sample:3d} sampled / {n_pop:4d} total")
 
     return sampled
 
@@ -733,7 +736,7 @@ def init_ablation_db(db_path=None):
     }.items():
         if _column not in _existing:
             c.execute(f"ALTER TABLE ablation_results ADD COLUMN {_column} {_sql_type}")
-            print(f"Schema migration: added ablation_results.{_column}")
+            console.out(f"Schema migration: added ablation_results.{_column}")
 
             # ADD COLUMN fills existing rows with the DEFAULT, which for these
             # two is the wrong value on any row that DID have matches. Backfill
@@ -744,24 +747,24 @@ def init_ablation_db(db_path=None):
                     "UPDATE ablation_results "
                     "SET avg_match_score_all = COALESCE(avg_match_score, 0.0)"
                 )
-                print(f"  Backfilled avg_match_score_all for {c.rowcount} row(s) "
+                console.out(f"  Backfilled avg_match_score_all for {c.rowcount} row(s) "
                       f"(null match score -> 0.0)")
             elif _column == "has_match":
                 c.execute(
                     "UPDATE ablation_results "
                     "SET has_match = CASE WHEN eligible_count > 0 THEN 1 ELSE 0 END"
                 )
-                print(f"  Backfilled has_match for {c.rowcount} row(s)")
+                console.out(f"  Backfilled has_match for {c.rowcount} row(s)")
             elif _column == "criteria_not_applicable":
                 # No historical source: pre-migration runs never recorded it.
                 # Left at 0 and called out so a zero is not read as "none were
                 # excluded" when it means "not measured".
-                print("  criteria_not_applicable left at 0 for pre-migration "
+                console.out("  criteria_not_applicable left at 0 for pre-migration "
                       "rows (not measured, not zero)")
 
     conn.commit()
     conn.close()
-    print(f"Ablation database: {ablation_db(db_path)}")
+    console.out(f"Ablation database: {ablation_db(db_path)}")
 
 
 def _create_run(config_name, config_description, sample_size, db_path=None):
@@ -914,10 +917,10 @@ def log_ablation_result(run_id, config_name, patient_data, result,
             # would silently invalidate the configuration under test.
             _mode = ablation_flags.get("retrieval_mode", "hybrid")
             if _mode == "vector_only" and bm25_retrieved:
-                print(f"  WARNING: vector_only run returned {bm25_retrieved} "
+                console.out(f"  WARNING: vector_only run returned {bm25_retrieved} "
                       f"BM25 trials — retrieval_mode did not reach Stage 2")
             if _mode == "bm25_only" and vector_retrieved:
-                print(f"  WARNING: bm25_only run returned {vector_retrieved} "
+                console.out(f"  WARNING: bm25_only run returned {vector_retrieved} "
                       f"vector trials — retrieval_mode did not reach Stage 2")
 
             # A channel that dropped out mid-run contaminates the configuration
@@ -930,7 +933,7 @@ def log_ablation_result(run_id, config_name, patient_data, result,
                     for name, c in (result.get("retrieval_channels") or {}).items()
                     if c["status"] not in (CHANNEL_OK, CHANNEL_ABLATED)
                 ]
-                print(f"  WARNING: degraded retrieval for "
+                console.out(f"  WARNING: degraded retrieval for "
                       f"{patient_data['patient_id']} — {', '.join(_lost)}. "
                       f"This row does not describe the '{config_name}' config.")
     
@@ -1029,7 +1032,7 @@ def log_ablation_result(run_id, config_name, patient_data, result,
             conn.commit()
     
         except Exception as e:
-            print(f"  WARNING: Failed to log result: {e}")
+            console.out(f"  WARNING: Failed to log result: {e}")
     
         finally:
             if conn is not None:
@@ -1085,6 +1088,15 @@ def match_patient_ablation(patient_data, bm25_index, nct_ids, graph, ablation_fl
         "ablation_flags":                   ablation_flags,
     }
 
+    # THE CORRELATION SCOPE IS NOT OPENED HERE. It is opened by _process_one()
+    # in run_ablation_study(), one level up, and the reason is that the config
+    # NAME is not in this function -- `ablation_flags` carries the flags, never
+    # the name. A first draft scoped here and logged
+    # ablation_flags.get("_config_name"), which is not a key of that dict: the
+    # field would have been None on every line of every study, which reads as
+    # "the config was not recorded" rather than as "this code asked the wrong
+    # object". _process_one is also the narrowest scope that contains the
+    # DATABASE WRITE as well as the pipeline run, so the two share an ID.
     final_state = graph.invoke(initial_state)
     result = final_state["result"]
     result["qdrant_collection"] = resolve_qdrant_collection()
@@ -1108,7 +1120,7 @@ def generate_summary(db_path=None):
     why the export follows the database rather than staying put.
     """
     if not ablation_db(db_path).exists():
-        print("No ablation database found.")
+        console.out("No ablation database found.")
         return None
 
     conn = sqlite3.connect(str(ablation_db(db_path)))
@@ -1165,7 +1177,7 @@ def generate_summary(db_path=None):
         conn.close()
 
     if df.empty:
-        print("No ablation results found.")
+        console.out("No ablation results found.")
         return None
 
     # Reorder to match ABLATION_CONFIGS
@@ -1174,11 +1186,11 @@ def generate_summary(db_path=None):
     df = df.sort_values("_sort").drop(columns=["_sort"]).reset_index(drop=True)
 
     # --- Print compact table ---
-    print("\n" + "=" * 130)
-    print("  ABLATION STUDY RESULTS")
-    print("=" * 130 + "\n")
-    print(df.to_string(index=False))
-    print(
+    console.out("\n" + "=" * 130)
+    console.out("  ABLATION STUDY RESULTS")
+    console.out("=" * 130 + "\n")
+    console.out(df.to_string(index=False))
+    console.out(
         "\n  avg_score_all  = mean match score over ALL n sampled patients "
         "(no eligible trial counts as 0.0)."
         "\n  match_rate     = proportion of sampled patients with >= 1 eligible trial."
@@ -1193,18 +1205,18 @@ def generate_summary(db_path=None):
     if not bl_rows.empty:
         bl = bl_rows.iloc[0]
 
-        print("\n" + "-" * 130)
-        print("  DELTAS vs FULL PIPELINE (baseline)")
-        print("-" * 130)
-        print(f"  {'Config':25s} | {'Δevaluated':>11s} | {'Δeligible':>10s} | "
+        console.out("\n" + "-" * 130)
+        console.out("  DELTAS vs FULL PIPELINE (baseline)")
+        console.out("-" * 130)
+        console.out(f"  {'Config':25s} | {'Δevaluated':>11s} | {'Δeligible':>10s} | "
               f"{'Δscore_all':>10s} | {'Δmatch_rate':>12s} | {'Δcost/pt':>10s} | "
               f"{'Δtime/pt':>9s} | {'Δmesh_drop':>11s} | {'Δstage_drop':>12s}")
-        print("  " + "-" * 122)
+        console.out("  " + "-" * 122)
 
         for _, row in df.iterrows():
             if row["config_name"] == "full_pipeline":
                 continue
-            print(
+            console.out(
                 f"  {row['config_name']:25s} | "
                 f"{row['avg_evaluated']  - bl['avg_evaluated']:+11.1f} | "
                 f"{row['avg_eligible']   - bl['avg_eligible']:+10.2f} | "
@@ -1219,13 +1231,13 @@ def generate_summary(db_path=None):
         # The conditional mean is shown only against its own n, never as a
         # bare delta: the two configs being differenced averaged over different
         # patient sets, so the difference is not attributable to the ablation.
-        print("\n  CONDITIONAL SCORE (mean over matched patients only -- read with n)")
-        print(f"  {'Config':25s} | {'score_cond':>10s} | {'n_scored':>8s} | {'n':>5s}")
-        print("  " + "-" * 56)
+        console.out("\n  CONDITIONAL SCORE (mean over matched patients only -- read with n)")
+        console.out(f"  {'Config':25s} | {'score_cond':>10s} | {'n_scored':>8s} | {'n':>5s}")
+        console.out("  " + "-" * 56)
         for _, row in df.iterrows():
             _cond = row["avg_score_cond"]
             _cond_s = "N/A" if pd.isna(_cond) else f"{_cond:.3f}"
-            print(
+            console.out(
                 f"  {row['config_name']:25s} | {_cond_s:>10s} | "
                 f"{int(row['n_scored']):>8d} | {int(row['n']):>5d}"
             )
@@ -1234,7 +1246,7 @@ def generate_summary(db_path=None):
     summary_records = df.to_dict(orient="records")
     with open(ablation_summary_json(db_path), "w") as f:
         json.dump(summary_records, f, indent=2)
-    print(f"\n  Summary exported: {ablation_summary_json(db_path)}")
+    console.out(f"\n  Summary exported: {ablation_summary_json(db_path)}")
 
     return df
 
@@ -1282,19 +1294,19 @@ def main():
     # calls can be redirected by anything except its own argument.
     db_path = args.db
 
-    print()
-    print("=" * 70)
-    print(f"{Project_Name}: ABLATION STUDY")
-    print("=" * 70)
-    print()
+    console.out()
+    console.out("=" * 70)
+    console.out(f"{Project_Name}: ABLATION STUDY")
+    console.out("=" * 70)
+    console.out()
     if db_path is not None:
-        print(f"  --db in effect: {ablation_db(db_path)}")
-        print(f"  Summary will go beside it: {ablation_summary_json(db_path)}")
+        console.out(f"  --db in effect: {ablation_db(db_path)}")
+        console.out(f"  Summary will go beside it: {ablation_summary_json(db_path)}")
         # Named as loudly as the database, because pass 20f-3 changed WHICH
         # file this is and an operator resuming an isolated study needs to see
         # that it is not the production one.
-        print(f"  Checkpoint (resume state): {_ablation_checkpoint_path(db_path)}")
-        print()
+        console.out(f"  Checkpoint (resume state): {_ablation_checkpoint_path(db_path)}")
+        console.out()
 
     # --- Summary-only mode ---
     # init_ablation_db() runs first even though nothing is written: the summary
@@ -1310,8 +1322,8 @@ def main():
     if args.configs:
         invalid = set(args.configs) - _VALID_CONFIG_NAMES
         if invalid:
-            print(f"ERROR: Unknown config(s): {invalid}")
-            print(f"Valid configs: {sorted(_VALID_CONFIG_NAMES)}")
+            console.out(f"ERROR: Unknown config(s): {invalid}")
+            console.out(f"Valid configs: {sorted(_VALID_CONFIG_NAMES)}")
             sys.exit(1)
         configs = [c for c in ABLATION_CONFIGS if c["name"] in args.configs]
     else:
@@ -1322,24 +1334,24 @@ def main():
         # --- Step 1: Initialize ---
         init_ablation_db(db_path=db_path)
 
-        print("\n[Step 1] Building BM25 index...")
+        console.out("\n[Step 1] Building BM25 index...")
         bm25_index, nct_ids = build_bm25_index_from_qdrant()
-        print(f"  {len(nct_ids)} trials indexed")
+        console.out(f"  {len(nct_ids)} trials indexed")
 
         if not nct_ids:
-            print("ERROR: No trials in Qdrant. Run File 11 first.")
+            console.out("ERROR: No trials in Qdrant. Run File 11 first.")
             sys.exit(1)
 
-        print("[Step 1] Compiling LangGraph pipeline...")
+        console.out("[Step 1] Compiling LangGraph pipeline...")
         graph = build_matching_graph()
 
         # --- Step 2: Load and sample patients ---
-        print(f"\n[Step 2] Loading patients from {paths.data_fhir_path}...")
+        console.out(f"\n[Step 2] Loading patients from {paths.data_fhir_path}...")
         all_patients = load_all_patients(paths.data_fhir_path)
-        print(f"  {len(all_patients)} patients loaded")
+        console.out(f"  {len(all_patients)} patients loaded")
 
         if not all_patients:
-            print("ERROR: No patients found. Run Files 04-07 first.")
+            console.out("ERROR: No patients found. Run Files 04-07 first.")
             sys.exit(1)
 
         sample = stratified_sample(all_patients, args.sample_size, ABLATION_SEED)
@@ -1354,13 +1366,13 @@ def main():
         remaining = total_runs - already_done
         study_start = time.time()
 
-        print(f"\n  Total runs:     {total_runs} ({total_configs} configs × {len(sample)} patients)")
-        print(f"  Already done:   {already_done}")
-        print(f"  Remaining:      {remaining}")
-        print()
+        console.out(f"\n  Total runs:     {total_runs} ({total_configs} configs × {len(sample)} patients)")
+        console.out(f"  Already done:   {already_done}")
+        console.out(f"  Remaining:      {remaining}")
+        console.out()
 
         # --- tqdm progress bar ---
-        print("*" * 70)
+        console.out("*" * 70)
         progress = tqdm(
             total=total_runs,
             initial=already_done,
@@ -1376,14 +1388,13 @@ def main():
         run_error = 0
         interrupted = False
 
-        # Redirect print through tqdm.write to keep progress bar clean
-        _original_print = builtins.print
-
-        def _tqdm_print(*args, **kwargs):
-            text = " ".join(str(a) for a in args)
-            tqdm.write(text)
-
-        builtins.print = _tqdm_print
+        # THE builtins.print MONKEY-PATCH USED TO BE HERE, AND IT IS DELETED.
+        # See oncotriage/batch/runner.py for what it did to every print(end=),
+        # print(sep=), print(file=) and print(flush=) in the process while it
+        # was live. Registering the bar with the console channel serves the one
+        # real purpose it had -- keeping output off the bar's redraw -- and
+        # covers the structured log handler too, which the patch could not.
+        _bar_token = console.attach_bar()
 
         def _process_one(patient_data, config_name, ablation_flags, run_id):
             """Run pipeline + log for one patient-config pair.
@@ -1409,6 +1420,32 @@ def main():
             checkpoint means resuming after fixing File 03 costs nothing.
             """
             pid = patient_data["patient_id"]
+            # ONE (patient, config) PAIR IS ONE CORRELATION ID, and this is the
+            # narrowest scope that contains the whole pair -- the pipeline run
+            # AND the ablation_results.db write below. The study drives
+            # MAX_WORKERS of these at once, so without a scope every line it
+            # emits would carry the "-" sentinel and a study's logs would be one
+            # undifferentiated stream.
+            #
+            # Two configs of the same patient are two runs and get two IDs, on
+            # purpose; `config_name` and `patient_id` are the fields that join
+            # them back together.
+            with correlation_scope():
+                log.info("ablation run started",
+                         event="ablation_run_started", patient_id=pid,
+                         config_name=config_name, run_id=run_id)
+                return _process_one_scoped(patient_data, config_name,
+                                           ablation_flags, run_id, pid)
+
+        def _process_one_scoped(patient_data, config_name, ablation_flags,
+                                run_id, pid):
+            """The body of _process_one, inside its correlation scope.
+
+            Split out rather than indenting the original eighty-line body: a
+            re-indentation of that size is a diff nobody can review in a pass
+            whose promise is that only output routing changed, and this way the
+            body below is byte-identical to what it was.
+            """
             try:
                 result = match_patient_ablation(
                     patient_data, bm25_index, nct_ids, graph, ablation_flags
@@ -1452,15 +1489,15 @@ def main():
                 config_pairs = {(config_name, p["patient_id"]) for p in sample}
                 
                 if config_pairs.issubset(completed):
-                    print(f"\n  [SKIP] Config '{config_name}' already completed.")
+                    console.out(f"\n  [SKIP] Config '{config_name}' already completed.")
                     progress.update(len(config_pairs))
                     continue
 
-                print(f"\n{'#' * 70}")
-                print(f"# CONFIG {config_idx}/{total_configs}: {config_name}")
-                print(f"# {config['description']}")
-                print(f"# Flags: {ablation_flags}")
-                print(f"{'#' * 70}")
+                console.out(f"\n{'#' * 70}")
+                console.out(f"# CONFIG {config_idx}/{total_configs}: {config_name}")
+                console.out(f"# {config['description']}")
+                console.out(f"# Flags: {ablation_flags}")
+                console.out(f"{'#' * 70}")
 
                 run_id = _create_run(config_name, config["description"],
                                      len(sample), db_path=db_path)
@@ -1484,7 +1521,7 @@ def main():
                         run_error += 1
                         progress.set_postfix(ok=run_success, err=run_error)
                         progress.update(1)
-                        tqdm.write(f"  [CALLBACK ERROR] {_config_name}: {type(e).__name__}: {e}")
+                        console.out(f"  [CALLBACK ERROR] {_config_name}: {type(e).__name__}: {e}")
                         return
 
                     if result.get("error"):
@@ -1517,29 +1554,29 @@ def main():
 
                 config_elapsed = time.time() - config_start
                 _finalize_run(run_id, config_elapsed, db_path=db_path)
-                print(f"\n  Config '{config_name}' done: {config_elapsed / 60:.1f} min")
+                console.out(f"\n  Config '{config_name}' done: {config_elapsed / 60:.1f} min")
 
         except KeyboardInterrupt:
             interrupted = True
-            print("\n[INTERRUPTED] Waiting for active threads to finish...")
+            console.out("\n[INTERRUPTED] Waiting for active threads to finish...")
             # ThreadPoolExecutor's with-block handles shutdown
 
         finally:
             progress.close()
-            builtins.print = _original_print
+            console.detach_bar(_bar_token)
 
         # --- Step 5: Summary ---
         study_elapsed = time.time() - study_start
 
-        print()
-        print("=" * 70)
-        print(f"{Project_Name}: ABLATION STUDY SUMMARY")
-        print("=" * 70)
-        print(f"  Wall time:       {study_elapsed / 60:.1f} min")
-        print(f"  Completed:       {run_success + run_error}")
-        print(f"  Success:         {run_success}")
-        print(f"  Errors:          {run_error}")
-        print(f"  Database:        {ablation_db(db_path)}")
+        console.out()
+        console.out("=" * 70)
+        console.out(f"{Project_Name}: ABLATION STUDY SUMMARY")
+        console.out("=" * 70)
+        console.out(f"  Wall time:       {study_elapsed / 60:.1f} min")
+        console.out(f"  Completed:       {run_success + run_error}")
+        console.out(f"  Success:         {run_success}")
+        console.out(f"  Errors:          {run_error}")
+        console.out(f"  Database:        {ablation_db(db_path)}")
 
         # Checkpoint degradations, reported here rather than left in the
         # scrollback (pass 20f-1, item 11a's shape). Printed only when there
@@ -1547,21 +1584,21 @@ def main():
         # oncotriage/retrieval/indexer.py -- a zero line every run trains a
         # reader to skip it.
         if CHECKPOINT_WRITE_FAILURES:
-            print(f"  Checkpoint:      "
+            console.out(f"  Checkpoint:      "
                   f"{sum(CHECKPOINT_WRITE_FAILURES.values())} write "
                   f"degradation(s) {dict(CHECKPOINT_WRITE_FAILURES)} -- resume "
                   f"state may be behind the rows already in the database")
 
         if interrupted:
-            print(f"  Status:          INTERRUPTED (resume with same command)")
+            console.out(f"  Status:          INTERRUPTED (resume with same command)")
         else:
             generate_summary(db_path=db_path)
             clear_ablation_checkpoint(db_path=db_path)
-            print(f"  Summary:         {ablation_summary_json(db_path)}")
-            print(f"  Status:          COMPLETE")
+            console.out(f"  Summary:         {ablation_summary_json(db_path)}")
+            console.out(f"  Status:          COMPLETE")
 
-        print("=" * 70)
-        print()
+        console.out("=" * 70)
+        console.out()
 #------------------------------------------------------------------------------
 
 

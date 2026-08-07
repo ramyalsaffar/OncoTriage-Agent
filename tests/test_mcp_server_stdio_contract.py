@@ -778,7 +778,8 @@ _FRAMES = "".join(json.dumps(m) + "\n"
                   for m in (_INIT, _INITIALIZED, _LIST, _CALL))
 
 
-def _run_server(argv, stdin_text, expect_ids=(1, 2, 3), timeout=240):
+def _run_server(argv, stdin_text, expect_ids=(1, 2, 3), timeout=240,
+                path_prefix=None, cwd=None):
     """Drive the server as a real subprocess session; return (stdout, stderr, rc).
 
     stdout and stderr are captured SEPARATELY, which is the whole point: the
@@ -800,7 +801,8 @@ def _run_server(argv, stdin_text, expect_ids=(1, 2, 3), timeout=240):
     buffer.
     """
     env = dict(os.environ)
-    env["PYTHONPATH"] = _CODE_DIR + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join(
+        [p for p in (path_prefix, _CODE_DIR) if p] + [env.get("PYTHONPATH", "")])
     # Unbuffered, so a stray write cannot be hidden by the process dying before
     # a flush -- which would make the stdout assertion pass for the wrong reason.
     env["PYTHONUNBUFFERED"] = "1"
@@ -808,7 +810,7 @@ def _run_server(argv, stdin_text, expect_ids=(1, 2, 3), timeout=240):
     proc = subprocess.Popen(
         [sys.executable] + argv,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, cwd=_CODE_DIR, env=env)
+        text=True, cwd=cwd or _CODE_DIR, env=env)
 
     out_lines, err_chunks = [], []
 
@@ -919,7 +921,7 @@ check("8b     the tool result carries the framing over the wire",
       _LONG in _call_text, True)
 
 # The import banner went SOMEWHERE -- it must be on stderr, not lost.
-check("8b     the import banner was diverted to stderr",
+check("8b     the import banner is on stderr",
       "[Paths]" in _err, True)
 print(f"  [info] stdout: {len(_protocol)} protocol messages, "
       f"{len(_garbage)} other lines; stderr: {len(_err.splitlines())} lines")
@@ -927,39 +929,115 @@ print(f"  [info] stdout: {len(_protocol)} protocol messages, "
 
 # --- 8c: THE CONTROL for 8b ------------------------------------------------
 #
-# The guard 8b depends on is the fd-level redirect in oncotriage/mcp/__main__.py,
-# which wraps the IMPORT of the server module. The SDK protects the SERVING
-# window on its own (mcp/server/stdio.py `_claim_fd` points fd 1 at stderr while
-# serving); nothing but __main__.py protects the import window, and this project
-# genuinely writes there -- oncotriage/paths.py prints `[Paths] Settings module
-# loaded from ...` at module scope.
+# WHAT THIS CONTROL USED TO BE, AND WHY IT HAD TO CHANGE. It ran the same
+# server with the import guard bypassed and required stdout to be CORRUPTED,
+# on the strength of a real defect: oncotriage/paths.py printed
+# "[Paths] Settings module loaded from ..." to stdout at module scope, so
+# importing the server outside the guard put a non-protocol line on fd 1.
 #
-# The control bypasses __main__.py WITHOUT editing a single file: it imports the
-# server module directly and calls main(). That is the same server, the same
-# transport and the same tools, with only the guard removed.
+# The structured-logging pass fixed that print -- it goes to the console
+# channel, which is stderr -- along with every other print in the package and
+# the six-line bootstrap in mcp_server.py. Measured after that pass:
+#
+#     $ python -c "import oncotriage.mcp.server" 1>/dev/null
+#     (stdout empty; the [Paths] line is on stderr)
+#
+# So the old control would now find NO corruption and fire its fail() -- which
+# would be reporting the fix as a broken test. Deleting it is worse: 8b would
+# then assert that stdout is clean with nothing showing that the guard is what
+# makes it clean, and a guard removed entirely would still pass.
+#
+# THE CONTROL NOW PLANTS ITS OWN SUBJECT, which is strictly stronger than
+# depending on a defect that happened to exist. A COPY of the package is made
+# in a temp directory with a single stdout write appended to
+# oncotriage/__init__.py -- standing in for exactly what the guard is retained
+# for: a third-party import banner, or a print reintroduced here tomorrow. Both
+# arms run against that copy, so the ONLY difference between them is the guard.
+# Nothing in the repository is edited.
 
-print("  running the CONTROL: the same server with the import guard bypassed")
-_ctl_out, _ctl_err, _ctl_rc = _run_server(
-    ["-c", "from oncotriage.mcp.server import main; main()"], _FRAMES)
+_PLANT = "STDOUT-NOISE-PLANTED-BY-8c"
+_PLANT_ROOT = tempfile.mkdtemp(prefix="oncotriage-mcp-8c-")
+try:
+    shutil.copytree(os.path.join(_CODE_DIR, "oncotriage"),
+                    os.path.join(_PLANT_ROOT, "oncotriage"),
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    # mcp_server.py is copied too, and the guarded arm is run as
+    # `python <copy>/mcp_server.py`, because sys.path[0] is the SCRIPT's
+    # directory and it beats PYTHONPATH. Running the repository's copy would
+    # have imported the repository's package and the plant would never load.
+    shutil.copy2(os.path.join(_CODE_DIR, "mcp_server.py"),
+                 os.path.join(_PLANT_ROOT, "mcp_server.py"))
 
-_ctl_protocol, _ctl_garbage = _classify_stdout(_ctl_out)
+    _init = os.path.join(_PLANT_ROOT, "oncotriage", "__init__.py")
+    with open(_init, "a", encoding="utf-8") as _fh:
+        _fh.write("\n\nimport sys as _sys_8c\n"
+                  "print(%r, file=_sys_8c.stdout, flush=True)\n" % _PLANT)
 
-check("8c     CONTROL: the control session also answered (it is a real server)",
-      len(_ctl_protocol) >= 3, True)
-if _ctl_garbage:
-    check("8c     CONTROL: stdout IS corrupted when the import guard is bypassed",
-          len(_ctl_garbage) > 0, True)
-    print(f"  [info] control stdout garbage, first line: "
-          f"{_ctl_garbage[0][:100]!r}")
-else:
-    fail("8c     CONTROL: stdout IS corrupted when the import guard is bypassed",
-         "the control produced NO non-protocol output, so check 8b passes "
-         "whether or not the guard works and proves nothing")
+    # The plant must actually reach stdout on a plain import, or both arms
+    # below would be clean and the control would prove nothing about the guard.
+    # cwd=_PLANT_ROOT IS LOAD-BEARING AND THE FIRST VERSION GOT IT WRONG.
+    # `python -c` puts the working directory at sys.path[0], AHEAD of
+    # PYTHONPATH -- so with cwd left at the repository both arms imported the
+    # REAL package, the plant never loaded, and the control reported "no
+    # corruption" as though the guard had done it. Running from the plant root
+    # is what makes `import oncotriage` find the copy. Path resolution is
+    # unaffected: oncotriage/paths.py resolves from ONCOTRIAGE_MAIN_PATH or the
+    # settings fallback, both absolute.
+    _probe = subprocess.run(
+        [sys.executable, "-c", "import oncotriage"],
+        capture_output=True, text=True, cwd=_PLANT_ROOT, timeout=120,
+        env={**os.environ,
+             "PYTHONPATH": os.pathsep.join([_PLANT_ROOT, _CODE_DIR,
+                                            os.environ.get("PYTHONPATH", "")])})
+    check("8c     the plant reaches stdout on a plain import (non-degeneracy)",
+          _PLANT in _probe.stdout, True)
 
-# The two runs must differ in exactly the way claimed. Without this, 8b and 8c
-# could both be true of two unrelated processes.
-check("8c     the guarded run is clean and the unguarded one is not",
-      (len(_garbage), len(_ctl_garbage) > 0), (0, True))
+    print("  running the CONTROL: the planted package, import guard BYPASSED")
+    _ctl_out, _ctl_err, _ctl_rc = _run_server(
+        ["-c", "from oncotriage.mcp.server import main; main()"], _FRAMES,
+        path_prefix=_PLANT_ROOT, cwd=_PLANT_ROOT)
+
+    print("  running the same planted package THROUGH the entry point's guard")
+    _grd_out, _grd_err, _grd_rc = _run_server(
+        [os.path.join(_PLANT_ROOT, "mcp_server.py")], _FRAMES,
+        path_prefix=_PLANT_ROOT, cwd=_PLANT_ROOT)
+
+    _ctl_protocol, _ctl_garbage = _classify_stdout(_ctl_out)
+    _grd_protocol, _grd_garbage = _classify_stdout(_grd_out)
+
+    check("8c     CONTROL: the control session also answered (it is a real server)",
+          len(_ctl_protocol) >= 3, True)
+    check("8c     the guarded planted session also answered",
+          len(_grd_protocol) >= 3, True)
+
+    # The plant landed on stdout without the guard...
+    check("8c     CONTROL: the plant IS on stdout when the import guard is bypassed",
+          any(_PLANT in line for line in _ctl_garbage), True)
+    # ...and did not with it. This is the pair; either half alone proves nothing.
+    check("8c     the plant is NOT on stdout when the guard is in place",
+          any(_PLANT in line for line in _grd_garbage), False)
+    check("8c     the guarded planted run put the plant on stderr instead",
+          _PLANT in _grd_err, True)
+    check("8c     the guarded planted run's stdout carries ONLY protocol",
+          len(_grd_garbage), 0)
+    check("8c     the two runs differ in exactly the way claimed",
+          (len(_grd_garbage), len(_ctl_garbage) > 0), (0, True))
+finally:
+    shutil.rmtree(_PLANT_ROOT, ignore_errors=True)
+
+# The repository's own entry point (8b, above) is clean for a second, stronger
+# reason as of the structured-logging pass: nothing in the package writes to
+# stdout at all. That is asserted directly rather than inferred from 8b, since
+# 8b would also pass if the guard alone were doing the work.
+_no_stdout = subprocess.run(
+    [sys.executable, "-c", "import oncotriage.mcp.server"],
+    capture_output=True, text=True, cwd=_CODE_DIR, timeout=300,
+    env={**os.environ, "PYTHONPATH": _CODE_DIR + os.pathsep
+         + os.environ.get("PYTHONPATH", ""), "PYTHONUNBUFFERED": "1"})
+check("8c     importing the real server writes NOTHING to stdout",
+      _no_stdout.stdout, "")
+check("8c     ...and its [Paths] banner went to stderr",
+      "[Paths]" in _no_stdout.stderr, True)
 
 
 #------------------------------------------------------------------------------

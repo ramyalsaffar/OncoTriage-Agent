@@ -69,6 +69,7 @@ resolve to the production database. ``sqlite3`` is imported and not called.
 """
 
 import sqlite3
+from oncotriage.observability import console
 
 
 #------------------------------------------------------------------------------
@@ -142,9 +143,9 @@ def empty_database(db_path, flag):
     # Flag was False, so the one run that mattered and the many that did
     # nothing were indistinguishable in a terminal scrollback.
     if flag:
-        print(f"Database cleared, tables preserved: {db_path}")
+        console.out(f"Database cleared, tables preserved: {db_path}")
     else:
-        print(f"Flag is False -- nothing was deleted. Database untouched: {db_path}")
+        console.out(f"Flag is False -- nothing was deleted. Database untouched: {db_path}")
 
 
 #------------------------------------------------------------------------------

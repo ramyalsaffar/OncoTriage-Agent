@@ -45,7 +45,6 @@ from rank_bm25 import BM25Okapi
 from oncotriage.agent import deps, models
 from oncotriage.agent.mesh_expansion import (
     expand_query_from_mesh,
-    format_mesh_resolution,
     resolve_patient_mesh,
 )
 from oncotriage.agent.patient import extract_genomic_variant_terms
@@ -76,8 +75,12 @@ from oncotriage.config import (
     TOP_K_CANDIDATES,
     VECTOR_RETRIEVAL_SIZE,
 )
+from oncotriage.observability import get_logger
 from oncotriage.registries.mesh import specific_cancer_trees
 from oncotriage.utils import qdrant_retry
+
+
+log = get_logger(__name__)
 
 
 #------------------------------------------------------------------------------
@@ -252,8 +255,10 @@ def node_query_expansion(state: dict) -> dict:
         # degraded query, so the rate at which the pipeline searched without
         # any MeSH expansion was unknowable from the stored records.
         expansion_path = EXPANSION_PATH_FALLBACK
-        print(f"  WARNING: MeSH expansion failed (resolution={mesh_result['resolution']}). "
-              f"Falling back to base query (degraded).")
+        log.warning("MeSH expansion failed; falling back to the base query "
+                    "(degraded)", stage=1, degraded=True,
+                    expansion_path=expansion_path,
+                    mesh_resolution=mesh_result["resolution"])
         expanded_query = base_query
         
         rerank_queries = [primary_diagnosis] * 3
@@ -268,28 +273,42 @@ def node_query_expansion(state: dict) -> dict:
 
     # ── Logging (same format as previous version) ─────────────────────────
     elapsed = time.time() - start
-    print(f"[Stage 1] Query expansion (MeSH deterministic): {elapsed:.2f}s")
-    print(f"  Expanded query: {expanded_query[:150]}...")
-    print(f"  Rerank queries ({len(rerank_queries)}):")
-    for i, rq in enumerate(rerank_queries, 1):
-        print(f"    R{i}: {rq}")
-    print(f"  Expansion path: {expansion_path}")
+    # THE QUERIES THEMSELVES ARE NOT LOGGED, and this is the single largest
+    # redaction in the pass. `expanded_query` is built from the patient's
+    # primary diagnosis display -- "Malignant neoplasm of breast", a stage, a
+    # histology, gene symbols -- and each `rerank_queries` entry is a
+    # diagnosis string. Printed to a terminal they were transient. As
+    # structured fields keyed by a correlation ID they are a durable,
+    # searchable statement of what this patient has, which is precisely what
+    # LOGGABLE_FIELDS refuses. The shape of the expansion is what diagnoses a
+    # retrieval problem, and the shape is what is kept: the path taken, how
+    # many queries came out, and how long each is.
+    log.info("query expansion complete (MeSH deterministic)", stage=1,
+             duration_s=round(elapsed, 3), expansion_path=expansion_path,
+             query_count=len(rerank_queries),
+             query_length=len(expanded_query))
     # Which detector found the variants, not just how many there were. A run
     # whose only variants came from the free-text path is searching on weaker
     # evidence than one backed by mCODE records, and the counts are the only
     # thing that distinguishes them.
     _vc = variant_result["counts"]
     if gene_parts or any(_vc.values()):
-        print(f"  Genomic variants: {len(gene_parts)} term(s) "
-              f"[mcode={_vc['mcode']} structured={_vc['structured']} "
-              f"free_text={_vc['free_text']}]"
-              + (f" — {variant_result['truncated']} dropped by "
-                 f"MAX_VARIANT_TERMS={MAX_VARIANT_TERMS}"
-                 if variant_result["truncated"] else ""))
+        # Counts per detector, never the gene symbols: a variant term names a
+        # somatic finding in this patient's tumour. Which DETECTOR found them
+        # is the operational fact -- a run whose variants came only from the
+        # free-text path is searching on weaker evidence -- and it survives.
+        log.info("genomic variant terms resolved", stage=1,
+                 variant_count=len(gene_parts),
+                 variants_mcode=_vc["mcode"],
+                 variants_structured=_vc["structured"],
+                 variants_free_text=_vc["free_text"],
+                 dropped=variant_result["truncated"],
+                 threshold=MAX_VARIANT_TERMS)
     if mesh_result["mesh_terms"]:
-        print(f"  MeSH resolution: {mesh_result['resolution']} | "
-              f"trees: {len(mesh_result['patient_trees'])} | "
-              f"terms: {len(mesh_result['mesh_terms'])}")
+        log.info("MeSH resolution", stage=1,
+                 mesh_resolution=mesh_result["resolution"],
+                 trees_count=len(mesh_result["patient_trees"]),
+                 count=len(mesh_result["mesh_terms"]))
 
     return {
         "expanded_query": expanded_query,
@@ -473,7 +492,9 @@ def node_hybrid_retrieval(state: TrialMatchState) -> dict:
                 _sparse_query, "criteria-bm25", query, BM25_RETRIEVAL_SIZE
             )
         else:
-            print("  [Ablation] BM25 sparse search SKIPPED (vector_only mode)")
+            log.info("BM25 sparse search skipped by ablation flag", stage=2,
+                     channel="bm25", ablation_flag="retrieval_mode",
+                     mode=_retrieval_mode)
 
         # Dense vector query
         if _retrieval_mode != "bm25_only":
@@ -487,7 +508,9 @@ def node_hybrid_retrieval(state: TrialMatchState) -> dict:
                 ).points
             futures["dense"] = executor.submit(_dense_query)
         else:
-            print("  [Ablation] Dense vector search SKIPPED (bm25_only mode)")
+            log.info("dense vector search skipped by ablation flag", stage=2,
+                     channel="dense", ablation_flag="retrieval_mode",
+                     mode=_retrieval_mode)
 
     # Collect results, recording the outcome of every channel this mode ran.
     #
@@ -526,14 +549,18 @@ def node_hybrid_retrieval(state: TrialMatchState) -> dict:
                 "count": 0,
                 "error": str(e)[:_CHANNEL_ERROR_MAX_CHARS],
             }
-            print(f"  WARNING: {channel_name} search skipped — {e}")
+            log.warning("retrieval channel skipped: the query carried no "
+                        "BM25 terms", stage=2, channel=channel_name,
+                        status=CHANNEL_EMPTY_QUERY, error_message=str(e))
         except Exception as e:
             retrieval_channels[channel_name] = {
                 "status": CHANNEL_FAILED,
                 "count": 0,
                 "error": f"{type(e).__name__}: {e}"[:_CHANNEL_ERROR_MAX_CHARS],
             }
-            print(f"  WARNING: {channel_name} search failed: {e}")
+            log.warning("retrieval channel failed", stage=2,
+                        channel=channel_name, status=CHANNEL_FAILED,
+                        error_type=type(e).__name__, error_message=str(e))
 
     # ------------------------------------------------------------------
     # Weighted RRF fusion across all channels
@@ -640,8 +667,11 @@ def node_hybrid_retrieval(state: TrialMatchState) -> dict:
                     trials_lost += 1
         except Exception as e:
             trials_lost += len(missing_nct_ids)
-            print(f"  WARNING: Batch scroll failed: {e}")
-            print(f"  Lost {len(missing_nct_ids)} trials from retrieval pool")
+            log.warning("payload backfill scroll failed; ranked trials were "
+                        "lost from the retrieval pool", stage=2,
+                        event="payload_backfill_failed",
+                        lost=len(missing_nct_ids),
+                        error_type=type(e).__name__, error_message=str(e))
 
     elapsed = time.time() - start
 
@@ -693,26 +723,22 @@ def node_hybrid_retrieval(state: TrialMatchState) -> dict:
     else:
         mode_label = "dense-only (BM25 fallback)"
 
-    print(f"[Stage 2] {mode_label} retrieval: {elapsed:.2f}s | {len(trials)} trials")
-    print(f"  Channels: {', '.join(active_channels)}")
-    print(
-        "  Channel status: "
-        + ", ".join(
-            f"{name}={retrieval_channels[name]['status']}"
-            for name in RETRIEVAL_CHANNELS
-        )
-        + f" | {channels_ok}/{channels_expected} expected channels returned"
-        + (" [DEGRADED]" if retrieval_degraded else "")
-    )
-    print(f"  Disease query: \"{disease_query}\"")
-    print(f"  Fusion pool: {len(all_nct_ids)} unique NCTs -> top {len(ranked_nct_ids)}")
-    print(
-        f"  Observed: bm25={bm25_retrieved} unique (of "
-        f"{3 * BM25_RETRIEVAL_SIZE} requested), vector={vector_retrieved} "
-        f"(of {VECTOR_RETRIEVAL_SIZE} requested)"
-    )
-    if trials_lost:
-        print(f"  Payload backfill lost {trials_lost} ranked trial(s)")
+    # `disease_query` is NOT logged: it is the patient's primary diagnosis
+    # display, verbatim. Its length is, because a suspiciously short one is
+    # what a degraded expansion looks like from the outside.
+    log.info("hybrid retrieval complete", stage=2, mode=mode_label,
+             duration_s=round(elapsed, 3), trials_out=len(trials),
+             channels={name: retrieval_channels[name]["status"]
+                       for name in RETRIEVAL_CHANNELS},
+             channels_ok=channels_ok, channels_expected=channels_expected,
+             degraded=retrieval_degraded,
+             query_length=len(disease_query),
+             fusion_pool=len(all_nct_ids), ranked=len(ranked_nct_ids),
+             bm25_retrieved=bm25_retrieved,
+             bm25_requested=3 * BM25_RETRIEVAL_SIZE,
+             vector_retrieved=vector_retrieved,
+             vector_requested=VECTOR_RETRIEVAL_SIZE,
+             lost=trials_lost)
 
     return {
         "hybrid_results": trials,
@@ -934,7 +960,8 @@ def node_cross_encoder_rerank(state: dict) -> dict:
 
     # Guard: no trials to rerank — pass through empty
     if not trials:
-        print("[Stage 3] Cross-encoder rerank: 0 trials — nothing to rerank")
+        log.info("cross-encoder rerank: nothing to rerank", stage=3,
+                 trials_in=0, trials_out=0)
         return {
             "reranked_trials": [],
             # Declared on every Stage 3 exit so no downstream reader has to
@@ -978,9 +1005,13 @@ def node_cross_encoder_rerank(state: dict) -> dict:
     patient_trees = set()
 
     if _skip_mesh_boost:
-        print("  MeSH patient resolution [ablation_skipped]: skip_mesh_filter set")
+        log.info("MeSH patient resolution skipped by ablation flag", stage=3,
+                 mesh_path="ablation_skipped",
+                 ablation_flag="skip_mesh_filter")
     elif mesh_filter is None:
-        print("  MeSH patient resolution [no_mesh_filter]: filter unavailable")
+        log.warning("MeSH patient resolution skipped: the filter is "
+                    "unavailable", stage=3, mesh_path="no_mesh_filter",
+                    degraded=True)
     else:
         # Same helper, same conditions and same verification filter as Stage 1,
         # so the trees handed to Stage 4 match the identity the expanded query
@@ -992,7 +1023,19 @@ def node_cross_encoder_rerank(state: dict) -> dict:
             mesh_filter,
         )
         patient_trees = mesh_resolution["trees"]
-        print(f"  MeSH patient resolution {format_mesh_resolution(mesh_resolution)}")
+        # This replaces format_mesh_resolution(), which rendered the same
+        # facts into one string and is deleted with this call site -- its
+        # counts survive as fields, which is strictly more queryable, and the
+        # TREES it also rendered do not, because a MeSH C04 tree number names
+        # the patient's cancer site.
+        log.info("MeSH patient resolution", stage=3,
+                 mesh_resolution=mesh_resolution["resolution"],
+                 trees_count=len(patient_trees),
+                 conditions_resolved=mesh_resolution["conditions_resolved"],
+                 conditions_total=mesh_resolution["conditions_total"],
+                 conditions_pan_only=mesh_resolution["conditions_pan_only"],
+                 conditions_unmapped=mesh_resolution["conditions_unmapped"],
+                 pan_only_layers=mesh_resolution["pan_only_layers"])
 
     # --- Ablation: skip cross-encoder ---
     if _ablation.get("skip_cross_encoder", False):
@@ -1008,7 +1051,8 @@ def node_cross_encoder_rerank(state: dict) -> dict:
         # The rule filter's dynamic quality threshold (25th percentile) and
         # MAX_TRIALS_FOR_EVALUATION cap still apply downstream. This only
         # removes the cross-encoder's contribution to ranking quality.
-        print("[Stage 3] Cross-encoder rerank: SKIPPED (ablation)")
+        log.info("cross-encoder rerank skipped by ablation flag", stage=3,
+                 ablation_flag="skip_cross_encoder", trials_in=len(trials))
         sorted_trials = sorted(
             trials,
             key=lambda t: t.get("fusion_score", 0.0),
@@ -1038,8 +1082,9 @@ def node_cross_encoder_rerank(state: dict) -> dict:
     
     # Fallback: if no rerank queries, use expanded_query (degraded, old behavior)
     if not rerank_queries:
-        print("  WARNING: No rerank queries available. "
-              "Falling back to expanded_query (degraded).")
+        log.warning("no rerank queries available; falling back to the "
+                    "expanded query (degraded)", stage=3, degraded=True,
+                    query_count=0)
         rerank_queries = [state["expanded_query"]]
 
     # -----------------------------------------------------------------
@@ -1125,37 +1170,45 @@ def node_cross_encoder_rerank(state: dict) -> dict:
     if _skip_mesh_boost:
         # The MeSH ablation must remove BOTH uses of MeSH, otherwise the
         # no_mesh_filter row still carries the boost's effect on ranking.
-        print("  MeSH relevance boost [ablation_skipped]: skip_mesh_filter set")
+        log.info("MeSH relevance boost skipped by ablation flag", stage=3,
+                 boost_path="ablation_skipped",
+                 ablation_flag="skip_mesh_filter")
     elif mesh_filter is None:
-        print("  MeSH relevance boost [no_mesh_filter]: filter unavailable")
+        log.warning("MeSH relevance boost skipped: the filter is unavailable",
+                    stage=3, boost_path="no_mesh_filter", degraded=True)
     elif top_trials:
         boost_stats = apply_mesh_relevance_boost(
             top_trials, patient_trees, mesh_filter
         )
-        print(f"  MeSH relevance boost [{boost_stats['path']}]: "
-              f"direct={boost_stats['direct_boosted']} "
-              f"(+{boost_stats['boost_direct']:.5f}) "
-              f"pan={boost_stats['pan_boosted']} "
-              f"(+{boost_stats['boost_pan']:.5f}) "
-              f"unboosted={boost_stats['unboosted']}")
+        log.info("MeSH relevance boost applied", stage=3,
+                 boost_path=boost_stats["path"],
+                 boosted_direct=boost_stats["direct_boosted"],
+                 boosted_pan=boost_stats["pan_boosted"],
+                 unboosted=boost_stats["unboosted"],
+                 boost_direct=round(boost_stats["boost_direct"], 5),
+                 boost_pan=round(boost_stats["boost_pan"], 5))
 
     # -----------------------------------------------------------------
     # Logging
     # -----------------------------------------------------------------
     elapsed = time.time() - start
 
-    print(f"[Stage 3] Multi-query cross-encoder rerank: {elapsed:.2f}s "
-          f"| {len(rerank_queries)} queries x {len(trials)} trials "
-          f"| {len(top_trials)} kept")
-    for i, stats in enumerate(per_query_stats):
-        print(f"  R{i+1}: [{stats['min']:.1f} to {stats['max']:.1f}] "
-              f"spread={stats['spread']:.1f} "
-              f"pos={stats['positive']}/{len(trials)} "
-              f'"{stats["query"]}"')
-
     rrf_values = [s for _, s in sorted_by_rrf]
-    if rrf_values:
-        print(f"  RRF range: {rrf_values[-1]:.5f} to {rrf_values[0]:.5f}")
+    # The per-query score spread is what says whether the cross-encoder
+    # discriminated at all, so it is kept -- as an aggregate across the
+    # queries, with the QUERY TEXT dropped. Each stats["query"] is a patient
+    # diagnosis string, and a per-query breakdown that carried it would put
+    # one line per diagnosis into the record.
+    log.info("multi-query cross-encoder rerank complete", stage=3,
+             duration_s=round(elapsed, 3), query_count=len(rerank_queries),
+             trials_in=len(trials), trials_out=len(top_trials),
+             score_min=round(min((st["min"] for st in per_query_stats),
+                                 default=0.0), 3),
+             score_max=round(max((st["max"] for st in per_query_stats),
+                                 default=0.0), 3),
+             positive=sum(st["positive"] for st in per_query_stats),
+             rrf_min=round(rrf_values[-1], 5) if rrf_values else None,
+             rrf_max=round(rrf_values[0], 5) if rrf_values else None)
 
     return {
         "reranked_trials": top_trials,
@@ -1185,7 +1238,8 @@ def build_bm25_index_from_qdrant() -> Tuple[BM25Okapi, List[str]]:
     Returns:
         Tuple of (BM25Okapi index, list of NCT IDs in same order)
     """
-    print("Building BM25 index from Qdrant...")
+    log.info("building the BM25 index from Qdrant",
+             event="bm25_index_build_started", collection=COLLECTION_NAME)
 
     all_trials = []
     offset = None
@@ -1227,9 +1281,8 @@ def build_bm25_index_from_qdrant() -> Tuple[BM25Okapi, List[str]]:
 
     bm25_index = BM25Okapi(trial_texts)
 
-    print(f"\n{'='*50}")
-    print(f"  BM25 index built: {len(trial_texts)} trials indexed")
-    print(f"{'='*50}\n")
+    log.info("BM25 index built", event="bm25_index_build_finished",
+             collection=COLLECTION_NAME, count=len(trial_texts))
 
     return bm25_index, nct_ids
 

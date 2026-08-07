@@ -83,6 +83,7 @@ from qdrant_client import QdrantClient
 
 from oncotriage import paths
 from oncotriage import settings
+from oncotriage.observability import console
 
 
 #------------------------------------------------------------------------------
@@ -483,7 +484,7 @@ def _resolve_qdrant_endpoint():
             resolved = (override_url, url_source, override_key, key_source)
 
     _QDRANT_ENDPOINT_CACHE = resolved
-    print(f"[Qdrant] endpoint {resolved[0]} (from {resolved[1]}); "
+    console.out(f"[Qdrant] endpoint {resolved[0]} (from {resolved[1]}); "
           f"api key from {resolved[3]}")
     return resolved
 

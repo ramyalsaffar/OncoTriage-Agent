@@ -53,6 +53,10 @@ from oncotriage.extraction.histology import (
     is_histology_mismatch,
 )
 from oncotriage.extraction.stage import extract_patient_stage, is_stage_mismatch
+from oncotriage.observability import get_logger
+
+
+log = get_logger(__name__)
 
 
 #------------------------------------------------------------------------------
@@ -207,13 +211,21 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
         # says which, so do not also claim the trees were unresolvable.
         if not _skip_mesh:
             if patient_trees:
-                print(f"  MeSH patient trees: {patient_trees}")
+                # THE COUNT, NOT THE TREES. A MeSH C04 tree number names the
+                # patient's cancer site -- "C04.588.180" is breast. Printed to
+                # a terminal that was transient; in a structured record keyed by
+                # a correlation ID it is a durable statement of this patient's
+                # diagnosis, which is exactly what LOGGABLE_FIELDS exists to
+                # keep out. The operationally useful fact is how many resolved.
+                log.info("MeSH patient trees resolved", stage=4,
+                         filter="mesh_site", trees_count=len(patient_trees))
             else:
                 # Say which outcome this is. "pan_cancer_only" is a resolution
                 # that was deliberately rejected, not a lookup that missed.
-                print(f"  MeSH: no patient cancer trees resolved "
-                      f"[{state.get('mesh_resolution') or 'unrecorded'}] — "
-                      f"cancer site filter skipped")
+                log.info("no patient cancer trees resolved; cancer site filter "
+                         "skipped", stage=4, filter="mesh_site", trees_count=0,
+                         mesh_resolution=state.get("mesh_resolution")
+                                         or "unrecorded")
 
     # --- Did the cancer site filter actually run? ---
     #
@@ -244,17 +256,27 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
     stage_dropped = 0
     
     if patient_stage is not None:
-        print(f"  Patient cancer stage: {patient_stage}")
+        # KNOWN vs UNKNOWN, not the ordinal. A cancer stage is a clinical fact
+        # about this patient; whether the filter had one to work with is an
+        # operational fact about the run, and it is the one that explains the
+        # funnel. The ordinal is still in `inferences`, which is a clinical
+        # store with access control; the log is not.
+        log.info("patient cancer stage extracted", stage=4,
+                 filter="cancer_stage", status="known")
     else:
-        print("  Patient cancer stage: unknown — stage filter skipped")
+        log.info("patient cancer stage unknown; stage filter skipped", stage=4,
+                 filter="cancer_stage", status="unknown")
     
     if _skip_mesh:
-        print("  [Ablation] MeSH cancer site filter SKIPPED "
-              "(Stage 3 relevance boost was skipped too)")
+        log.info("MeSH cancer site filter skipped by ablation flag "
+                 "(the Stage 3 relevance boost was skipped too)",
+                 stage=4, filter="mesh_site", ablation_flag="skip_mesh_filter")
     if _skip_stage:
-        print("  [Ablation] Cancer stage filter SKIPPED")
+        log.info("cancer stage filter skipped by ablation flag", stage=4,
+                 filter="cancer_stage", ablation_flag="skip_stage_filter")
     if _skip_histology:
-        print("  [Ablation] Histology mismatch filter SKIPPED")
+        log.info("histology mismatch filter skipped by ablation flag", stage=4,
+                 filter="histology", ablation_flag="skip_histology_filter")
 
     filtered = []
 
@@ -340,22 +362,22 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
     elapsed = time.time() - start
     
     if not mesh_filter_applied:
-        print(f"  Cancer site filter DID NOT RUN [{mesh_filter_skip_reason}] — "
-              f"Stage 5 will not assert that disease relevance was confirmed")
+        log.warning("cancer site filter did not run; Stage 5 will not assert "
+                    "that disease relevance was confirmed", stage=4,
+                    filter="mesh_site", skip_reason=mesh_filter_skip_reason)
 
-    print(
-        f"[Stage 4] Rule-based filter: {elapsed:.2f}s | "
-        f"{len(trials)} -> {len(quality_filtered)} trials"
-        f"{f' (MeSH dropped {mesh_dropped})' if mesh_dropped else ''}"
-        f"{f' (stage dropped {stage_dropped})' if stage_dropped else ''}"
-        f"{f' (histology dropped {histology_dropped})' if histology_dropped else ''}"
-        f"{f' (age dropped {age_dropped})' if age_dropped else ''}"
-        # The age filter DID NOT RUN for these. Printed only when non-zero, so
-        # the ordinary line is byte-identical to what it was.
-        f"{f' (age UNPARSED {age_unparsed} — age filter did not run for them)' if age_unparsed else ''}"
-        f"{f' (sex dropped {sex_dropped})' if sex_dropped else ''}"
-        f"{f' (quality dropped {quality_dropped} @ raw >= {dynamic_threshold:.5f})' if quality_dropped else ''}"
-    )
+    log.info("rule-based filter complete", stage=4, duration_s=round(elapsed, 3),
+             trials_in=len(trials), trials_out=len(quality_filtered),
+             dropped=len(trials) - len(quality_filtered),
+             # Every drop reason as its own field rather than folded into a
+             # sentence: the whole point of the funnel is that a query can ask
+             # "which stage lost the trials" without parsing prose.
+             mesh_dropped=mesh_dropped, stage_dropped=stage_dropped,
+             histology_dropped=histology_dropped, age_dropped=age_dropped,
+             # The age filter DID NOT RUN for these -- distinct from a drop.
+             age_unparsed=age_unparsed, sex_dropped=sex_dropped,
+             quality_dropped=quality_dropped,
+             threshold=round(dynamic_threshold, 5))
 
     return {
         "filtered_trials": quality_filtered,

@@ -73,6 +73,7 @@ from pathlib import Path
 from oncotriage import paths
 from oncotriage import settings as path_settings
 from oncotriage.orchestration.home import resolve_airflow_home
+from oncotriage.observability import console
 
 
 #------------------------------------------------------------------------------
@@ -705,16 +706,16 @@ def write_dag_file(dags_root, content=None):
     # If it exists
     if dag_file.exists():
         if dag_file.read_text() == content:
-            print(f"✓ DAG file already exists and matches this generator: {dag_file}")
+            console.out(f"✓ DAG file already exists and matches this generator: {dag_file}")
         else:
-            print(f"! DAG file already exists and DIFFERS from this generator: {dag_file}")
-            print("  Not overwriting, in case it was edited in place.")
-            print("  The scheduler parses that file, not the string in this one, so every")
-            print("  edit made here -- including the schedule -- is inert until it is replaced.")
-            print("  Delete it and re-run this file to regenerate.")
+            console.out(f"! DAG file already exists and DIFFERS from this generator: {dag_file}")
+            console.out("  Not overwriting, in case it was edited in place.")
+            console.out("  The scheduler parses that file, not the string in this one, so every")
+            console.out("  edit made here -- including the schedule -- is inert until it is replaced.")
+            console.out("  Delete it and re-run this file to regenerate.")
     else:
         dag_file.write_text(content)
-        print(f"✓ New DAG file created: {dag_file}")
+        console.out(f"✓ New DAG file created: {dag_file}")
 
     return dag_file
 

@@ -97,6 +97,7 @@ from oncotriage.utils import (
     get_age_reference_date,
     parse_partial_date,
 )
+from oncotriage.observability import console
 
 #------------------------------------------------------------------------------
 
@@ -641,10 +642,10 @@ def _parse_demographics(patient_resource: Dict) -> Dict:
         # the data outran DATA_SNAPSHOT_DATE, or the record is wrong. Either
         # way there is no age to state, and the reason has to survive in the row.
         precision = "after_reference"
-        print(f"  WARNING: birthDate {birth_date_raw!r} is after the age reference "
+        console.out(f"  WARNING: birthDate {birth_date_raw!r} is after the age reference "
               f"date {reference_date.isoformat()} — age not computed")
     elif precision == "unparseable":
-        print(f"  WARNING: unparseable birthDate {birth_date_raw!r} — age not computed")
+        console.out(f"  WARNING: unparseable birthDate {birth_date_raw!r} — age not computed")
 
     BIRTH_DATE_PRECISION_COUNTS[precision] += 1
 
@@ -1540,7 +1541,7 @@ def load_all_patients(patients_dir: str) -> List[Dict]:
 
     for idx, fhir_file in enumerate(patient_files, 1):
         if idx % 100 == 0 or idx == len(patient_files):
-            print(f"  Parsing {idx}/{len(patient_files)} patients...")
+            console.out(f"  Parsing {idx}/{len(patient_files)} patients...")
         try:
             patient_data = parse_fhir_bundle(str(fhir_file))
             patients.append(patient_data)
@@ -1549,19 +1550,19 @@ def load_all_patients(patients_dir: str) -> List[Dict]:
                 'file':  str(fhir_file),
                 'error': str(e)
             })
-            print(f"Error parsing {fhir_file.name}: {e}")
+            console.out(f"Error parsing {fhir_file.name}: {e}")
 
-    print(f"Successfully parsed {len(patients)} patients")
+    console.out(f"Successfully parsed {len(patients)} patients")
     if errors:
-        print(f"Failed to parse {len(errors)} patients")
+        console.out(f"Failed to parse {len(errors)} patients")
 
     # Which parsing path each field took. Printed unconditionally: "every
     # birthDate was a full date" is itself a result worth stating, and a
     # corpus that drifts toward imputed ages or free-text race should be
     # visible at the point of load rather than inferred later from the rows.
-    print(f"  Birth date precision: {dict(sorted(BIRTH_DATE_PRECISION_COUNTS.items()))}")
-    print(f"  Age reference date:   {get_age_reference_date().isoformat()}")
-    print(f"  Demographic sources:  {dict(sorted(DEMOGRAPHIC_SOURCE_COUNTS.items()))}")
+    console.out(f"  Birth date precision: {dict(sorted(BIRTH_DATE_PRECISION_COUNTS.items()))}")
+    console.out(f"  Age reference date:   {get_age_reference_date().isoformat()}")
+    console.out(f"  Demographic sources:  {dict(sorted(DEMOGRAPHIC_SOURCE_COUNTS.items()))}")
 
     # ECOG coverage. Printed unconditionally for the same reason as the two
     # above: "no patient in this corpus carries a performance status" is a
@@ -1573,9 +1574,9 @@ def load_all_patients(patients_dir: str) -> List[Dict]:
         1 for p in patients
         if (p.get('ecog_performance_status') or {}).get('value') is not None
     )
-    print(f"  ECOG scored patients: {scored}/{len(patients)}")
-    print(f"  ECOG value shapes:    {dict(sorted(ECOG_VALUE_SHAPE_COUNTS.items()))}")
-    print(f"  ECOG selection paths: {dict(sorted(ECOG_SELECTION_COUNTS.items()))}")
+    console.out(f"  ECOG scored patients: {scored}/{len(patients)}")
+    console.out(f"  ECOG value shapes:    {dict(sorted(ECOG_VALUE_SHAPE_COUNTS.items()))}")
+    console.out(f"  ECOG selection paths: {dict(sorted(ECOG_SELECTION_COUNTS.items()))}")
 
     return patients
 

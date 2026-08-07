@@ -163,6 +163,7 @@ from oncotriage.constants import NOT_FOR_CLINICAL_USE, NOT_FOR_CLINICAL_USE_SHOR
 from oncotriage.fhir.parser import parse_fhir_bundle
 from oncotriage.retrieval.trial_lookup import lookup_trial
 from oncotriage.utils import deduplicate_by_display
+from oncotriage.observability import console
 
 
 #------------------------------------------------------------------------------
@@ -195,7 +196,7 @@ def _log(message):
     what an MCP client gives it, and a diagnostic that arrives after the process
     dies is not a diagnostic.
     """
-    print(f"[{SERVER_NAME}-mcp] {message}", file=sys.stderr, flush=True)
+    console.out(f"[{SERVER_NAME}-mcp] {message}", file=sys.stderr, flush=True)
 
 
 @contextlib.contextmanager

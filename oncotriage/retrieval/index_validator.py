@@ -77,6 +77,7 @@ from oncotriage.config import (
     EMBEDDING_MODEL,
     Project_Name,
 )
+from oncotriage.observability import console
 
 
 #------------------------------------------------------------------------------
@@ -474,48 +475,48 @@ def print_summary(stage1: list, stage2: list) -> int:
     warns   = [r for r in all_results if r.status == CheckResult.WARN]
     fails   = [r for r in all_results if r.status == CheckResult.FAIL]
 
-    print()
-    print("=" * 80)
-    print(f"{Project_Name}: RAG TRIAL INDEXER VALIDATION REPORT")
-    print("=" * 80)
-    print()
+    console.out()
+    console.out("=" * 80)
+    console.out(f"{Project_Name}: RAG TRIAL INDEXER VALIDATION REPORT")
+    console.out("=" * 80)
+    console.out()
 
-    print("--- STAGE 1: INDEX HEALTH ---")
+    console.out("--- STAGE 1: INDEX HEALTH ---")
     for r in stage1:
-        print(r)
-    print()
+        console.out(r)
+    console.out()
 
-    print("--- STAGE 2: RETRIEVAL SMOKE TESTS ---")
+    console.out("--- STAGE 2: RETRIEVAL SMOKE TESTS ---")
     for r in stage2:
-        print(r)
-    print()
+        console.out(r)
+    console.out()
 
-    print("--- SUMMARY ---")
-    print(f"  PASS:  {len(passes)}")
-    print(f"  WARN:  {len(warns)}")
-    print(f"  FAIL:  {len(fails)}")
-    print()
+    console.out("--- SUMMARY ---")
+    console.out(f"  PASS:  {len(passes)}")
+    console.out(f"  WARN:  {len(warns)}")
+    console.out(f"  FAIL:  {len(fails)}")
+    console.out()
 
     if fails:
-        print("CRITICAL FAILURES -- Index is NOT safe to use with 13- LangGraph Agent.py")
+        console.out("CRITICAL FAILURES -- Index is NOT safe to use with 13- LangGraph Agent.py")
         for r in fails:
-            print(f"  ✗ {r.name}: {r.detail}")
-        print()
-        print("=" * 80)
-        print("VALIDATION FAILED")
-        print("=" * 80)
+            console.out(f"  ✗ {r.name}: {r.detail}")
+        console.out()
+        console.out("=" * 80)
+        console.out("VALIDATION FAILED")
+        console.out("=" * 80)
         return 1
     elif warns:
-        print("Warnings detected -- review above, but index is usable.")
-        print()
-        print("=" * 80)
-        print("VALIDATION PASSED WITH WARNINGS")
-        print("=" * 80)
+        console.out("Warnings detected -- review above, but index is usable.")
+        console.out()
+        console.out("=" * 80)
+        console.out("VALIDATION PASSED WITH WARNINGS")
+        console.out("=" * 80)
         return 0
     else:
-        print("=" * 80)
-        print("VALIDATION PASSED -- Index is healthy and ready for patient matching.")
-        print("=" * 80)
+        console.out("=" * 80)
+        console.out("VALIDATION PASSED -- Index is healthy and ready for patient matching.")
+        console.out("=" * 80)
         return 0
 
 

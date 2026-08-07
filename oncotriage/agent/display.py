@@ -10,6 +10,7 @@ agent module that imports only two config constants.
 from typing import Dict
 
 from oncotriage.config import MAX_GPT4O_RETRIES, Project_Name
+from oncotriage.observability import console
 
 
 #------------------------------------------------------------------------------
@@ -32,79 +33,79 @@ def display_match_results(result: Dict):
     from the patient record so the coordinator knows what to verify.
     """
 
-    print(f"\n{'='*80}")
-    print(f"{Project_Name}: MATCH RESULTS FOR PATIENT {result['patient_id']}")
-    print(f"{'='*80}\n")
+    console.out(f"\n{'='*80}")
+    console.out(f"{Project_Name}: MATCH RESULTS FOR PATIENT {result['patient_id']}")
+    console.out(f"{'='*80}\n")
 
     # Check for pipeline error
     if result.get("error"):
-        print(f"PIPELINE ERROR: {result['error']}")
+        console.out(f"PIPELINE ERROR: {result['error']}")
         retries = result.get("gpt4o_retries", 0)
         if retries:
-            print(f"GPT-4o retries exhausted: {retries}/{MAX_GPT4O_RETRIES}")
-        print()
+            console.out(f"GPT-4o retries exhausted: {retries}/{MAX_GPT4O_RETRIES}")
+        console.out()
 
     # Pipeline summary
     matches = result.get("matches", [])
     near_misses = result.get("near_misses", [])
     not_evaluable = result.get("not_evaluable", [])
 
-    print(f"Pipeline Summary:")
-    print(f"  BM25 Retrieved:        {result.get('bm25_retrieved', 0)}")
-    print(f"  Vector Retrieved:      {result.get('vector_retrieved', 0)}")
-    print(f"  Candidates Retrieved:  {result.get('candidates_retrieved', 0)}")
+    console.out(f"Pipeline Summary:")
+    console.out(f"  BM25 Retrieved:        {result.get('bm25_retrieved', 0)}")
+    console.out(f"  Vector Retrieved:      {result.get('vector_retrieved', 0)}")
+    console.out(f"  Candidates Retrieved:  {result.get('candidates_retrieved', 0)}")
 
-    print(f"  Candidates Re-Ranked:  {result.get('candidates_reranked', 0)}")
-    print(f"  After Rule Filters:    {result.get('candidates_after_rule_filter', 0)}")
-    print(f"  After Quality Filter:  {result.get('candidates_after_quality_filter', 0)}")
-    print(f"  Candidates Filtered:   {result.get('candidates_filtered', 0)}")
-    print(f"  Candidates Evaluated:  {result.get('candidates_evaluated', 0)}")
-    print(f"  Matches:               {len(matches)}")
-    print(f"  Not Eligible:          {len(near_misses)}")
-    print(f"  Not Evaluable:         {len(not_evaluable)}")
-    print(f"  Label Remaps:          {result.get('cross_vocab_remaps', 0)}")
+    console.out(f"  Candidates Re-Ranked:  {result.get('candidates_reranked', 0)}")
+    console.out(f"  After Rule Filters:    {result.get('candidates_after_rule_filter', 0)}")
+    console.out(f"  After Quality Filter:  {result.get('candidates_after_quality_filter', 0)}")
+    console.out(f"  Candidates Filtered:   {result.get('candidates_filtered', 0)}")
+    console.out(f"  Candidates Evaluated:  {result.get('candidates_evaluated', 0)}")
+    console.out(f"  Matches:               {len(matches)}")
+    console.out(f"  Not Eligible:          {len(near_misses)}")
+    console.out(f"  Not Evaluable:         {len(not_evaluable)}")
+    console.out(f"  Label Remaps:          {result.get('cross_vocab_remaps', 0)}")
     if result.get("gpt4o_retries", 0):
-        print(f"  GPT-4o Retries:        {result['gpt4o_retries']}/{MAX_GPT4O_RETRIES}")
+        console.out(f"  GPT-4o Retries:        {result['gpt4o_retries']}/{MAX_GPT4O_RETRIES}")
     if result.get("ablation_flags"):
-        print(f"  Ablation Flags:        {result['ablation_flags']}")
+        console.out(f"  Ablation Flags:        {result['ablation_flags']}")
 
     timings = result.get("stage_timings", {})
     if timings:
-        print(f"\nStage Latencies:")
+        console.out(f"\nStage Latencies:")
         for stage, seconds in timings.items():
-            print(f"  {stage}: {seconds:.3f}s")
+            console.out(f"  {stage}: {seconds:.3f}s")
         total = sum(timings.values())
-        print(f"  TOTAL: {total:.3f}s")
+        console.out(f"  TOTAL: {total:.3f}s")
 
-    print()
+    console.out()
 
     # ── ELIGIBLE ─────────────────────────────────────────────────────────
     if matches:
-        print(f"ELIGIBLE — Pre-Screening Candidates ({len(matches)}):\n")
+        console.out(f"ELIGIBLE — Pre-Screening Candidates ({len(matches)}):\n")
         for idx, match in enumerate(matches[:10], 1):
             _print_match_detail(idx, match)
 
     # ── NOT ELIGIBLE ─────────────────────────────────────────────────────
     if not matches:
-        print("No matching trials found for this patient.\n")
+        console.out("No matching trials found for this patient.\n")
 
         if near_misses:
-            print(f"NOT ELIGIBLE — Top 3 Near-Misses:\n")
+            console.out(f"NOT ELIGIBLE — Top 3 Near-Misses:\n")
             for idx, match in enumerate(near_misses[:3], 1):
-                print(f"  {idx}. {match.get('nct_id', 'N/A')} | {match.get('title', 'No title')}")
-                print(f"     {match.get('explanation', 'N/A')}")
-                print()
+                console.out(f"  {idx}. {match.get('nct_id', 'N/A')} | {match.get('title', 'No title')}")
+                console.out(f"     {match.get('explanation', 'N/A')}")
+                console.out()
     elif near_misses:
         # Matches exist, but also show count of rejected trials
-        print(f"({len(near_misses)} additional trials evaluated but not eligible.)\n")
+        console.out(f"({len(near_misses)} additional trials evaluated but not eligible.)\n")
 
     # ── NOT EVALUABLE ────────────────────────────────────────────────────
     # Reported separately from rejections: these trials were never assessed.
     if not_evaluable:
-        print(f"NOT EVALUABLE — could not be assessed ({len(not_evaluable)}):\n")
+        console.out(f"NOT EVALUABLE — could not be assessed ({len(not_evaluable)}):\n")
         for trial in not_evaluable:
-            print(f"  - {trial.get('nct_id', 'N/A')} | {trial.get('explanation', 'No criteria returned.')}")
-        print()
+            console.out(f"  - {trial.get('nct_id', 'N/A')} | {trial.get('explanation', 'No criteria returned.')}")
+        console.out()
 
 
 def _print_match_detail(idx: int, match: Dict):
@@ -115,9 +116,9 @@ def _print_match_detail(idx: int, match: Dict):
     which criteria could not be evaluated from the patient record. This tells
     the research coordinator exactly what tests/data to obtain before referral.
     """
-    print(f"  {idx}. {match.get('nct_id', 'N/A')} | {match.get('title', 'No title')}")
-    print(f"     Score: {match.get('match_score', 0):.2f} | Status: {match.get('eligible', 'unknown')}")
-    print(f"     {match.get('explanation', 'N/A')}")
+    console.out(f"  {idx}. {match.get('nct_id', 'N/A')} | {match.get('title', 'No title')}")
+    console.out(f"     Score: {match.get('match_score', 0):.2f} | Status: {match.get('eligible', 'unknown')}")
+    console.out(f"     {match.get('explanation', 'N/A')}")
 
     # Show criteria that need verification (not_evaluable from inclusions)
     needs_verification = [
@@ -134,11 +135,11 @@ def _print_match_detail(idx: int, match: Dict):
     ]
 
     if needs_verification:
-        print(f"     Needs verification ({len(needs_verification)}):")
+        console.out(f"     Needs verification ({len(needs_verification)}):")
         for criterion in needs_verification:
-            print(f"       - {criterion}")
+            console.out(f"       - {criterion}")
 
-    print()                
+    console.out()                
 
 
 #------------------------------------------------------------------------------

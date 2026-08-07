@@ -176,8 +176,12 @@ import os
 import threading
 
 from oncotriage import config, embedding
+from oncotriage.observability import get_logger
 from oncotriage.registries.cancer_code_registry import load_lab_registry, load_registry
 from oncotriage.registries.mesh import load_mesh_filter
+
+
+log = get_logger(__name__)
 
 
 #------------------------------------------------------------------------------
@@ -574,7 +578,9 @@ class _DeferredLocalModel:
 
 def _build_medcpt_tokenizer():
     if _DEFER_LOCAL_MODELS:
-        print(f"{DEFER_LOCAL_MODELS_ENV}=1 — skipping the MedCPT tokenizer load.")
+        log.info("skipping the MedCPT tokenizer load",
+                 event="local_model_deferred", model=config.CROSS_ENCODER_MODEL,
+                 reason=f"{DEFER_LOCAL_MODELS_ENV}=1")
         return _DeferredLocalModel("MedCPT tokenizer")
 
     from transformers import AutoTokenizer
@@ -589,15 +595,19 @@ def _build_medcpt_tokenizer():
     # wrong. tests/test_package_invariants.py section 2f(ii) asserts by ast that
     # both from_pretrained calls are handed this name and that the literal
     # itself appears exactly once in the package.
-    print("Loading MedCPT cross-encoder tokenizer...")
+    log.info("loading the MedCPT cross-encoder tokenizer",
+             event="local_model_load_started", model=config.CROSS_ENCODER_MODEL)
     tokenizer = AutoTokenizer.from_pretrained(config.CROSS_ENCODER_MODEL)
-    print("MedCPT tokenizer loaded!")
+    log.info("MedCPT cross-encoder tokenizer loaded",
+             event="local_model_load_finished", model=config.CROSS_ENCODER_MODEL)
     return tokenizer
 
 
 def _build_medcpt_model():
     if _DEFER_LOCAL_MODELS:
-        print(f"{DEFER_LOCAL_MODELS_ENV}=1 — skipping the MedCPT cross-encoder load.")
+        log.info("skipping the MedCPT cross-encoder load",
+                 event="local_model_deferred", model=config.CROSS_ENCODER_MODEL,
+                 reason=f"{DEFER_LOCAL_MODELS_ENV}=1")
         return _DeferredLocalModel("MedCPT cross-encoder")
 
     from transformers import AutoModelForSequenceClassification
@@ -609,11 +619,13 @@ def _build_medcpt_model():
     #
     # Same constant as the tokenizer above, deliberately: see the note there for
     # what a divergent pair costs and why nothing would raise.
-    print("Loading MedCPT cross-encoder re-ranker...")
+    log.info("loading the MedCPT cross-encoder weights",
+             event="local_model_load_started", model=config.CROSS_ENCODER_MODEL)
     model = AutoModelForSequenceClassification.from_pretrained(
         config.CROSS_ENCODER_MODEL)
     model.eval()
-    print("MedCPT re-ranker loaded!\n")
+    log.info("MedCPT cross-encoder weights loaded",
+             event="local_model_load_finished", model=config.CROSS_ENCODER_MODEL)
     return model
 
 
@@ -638,7 +650,10 @@ def _build_bm25_query_model():
     # written to Qdrant and swapped onto the live alias looking exactly like a
     # real one.
     if _DEFER_LOCAL_MODELS:
-        print(f"{DEFER_LOCAL_MODELS_ENV}=1 — skipping the FastEmbed BM25 load.")
+        log.info("skipping the FastEmbed BM25 query model load",
+                 event="local_model_deferred",
+                 model=embedding.BM25_SPARSE_MODEL_NAME,
+                 reason=f"{DEFER_LOCAL_MODELS_ENV}=1")
         return _DeferredLocalModel("FastEmbed BM25 query model")
 
     return embedding.get_bm25_sparse_model()

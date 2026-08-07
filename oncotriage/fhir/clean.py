@@ -98,6 +98,7 @@ from oncotriage import paths, settings
 from oncotriage.config import COHORT_MANIFEST_FILENAME, COHORT_MANIFEST_FLUSH_EVERY
 from oncotriage.fhir.parser import _select_best_coding
 from oncotriage.registries.cancer_code_registry import load_registry
+from oncotriage.observability import console
 
 
 #------------------------------------------------------------------------------
@@ -329,7 +330,7 @@ def _write_manifest(manifest, path=None):
         return True
     except OSError as e:
         _DELETION_COUNTS["manifest_write_failed"] += 1
-        print(f"  FATAL: cannot write deletion manifest {target}: {e}")
+        console.out(f"  FATAL: cannot write deletion manifest {target}: {e}")
         raise
 
 
@@ -408,7 +409,7 @@ def _delete_manifested(manifest, phase_key, files, reason, progress_every=500,
             if idx % COHORT_MANIFEST_FLUSH_EVERY == 0:
                 _write_manifest(manifest, manifest_target)
             if idx % progress_every == 0:
-                print(f"  [DRY RUN] Would delete {idx}/{len(files)} files...")
+                console.out(f"  [DRY RUN] Would delete {idx}/{len(files)} files...")
             continue
 
         try:
@@ -421,7 +422,7 @@ def _delete_manifested(manifest, phase_key, files, reason, progress_every=500,
             # concurrent writer. Not an error, but it is not a deletion either.
             phase["already_absent"].append(patient_file.name)
             _DELETION_COUNTS["already_absent"] += 1
-            print(f"  WARNING: already absent, not deleted: {patient_file.name}")
+            console.out(f"  WARNING: already absent, not deleted: {patient_file.name}")
 
         except OSError as e:
             phase["failed"].append({
@@ -429,13 +430,13 @@ def _delete_manifested(manifest, phase_key, files, reason, progress_every=500,
                 "error": f"{type(e).__name__}: {e}",
             })
             _DELETION_COUNTS["failed"] += 1
-            print(f"  ERROR deleting {patient_file.name}: {type(e).__name__}: {e}")
+            console.out(f"  ERROR deleting {patient_file.name}: {type(e).__name__}: {e}")
 
         if idx % COHORT_MANIFEST_FLUSH_EVERY == 0:
             _write_manifest(manifest, manifest_target)
 
         if idx % progress_every == 0:
-            print(f"  Deleted {idx}/{len(files)} files...")
+            console.out(f"  Deleted {idx}/{len(files)} files...")
 
     if dry_run:
         # "planned", never "complete": a dry-run phase must not be mistakable
@@ -645,13 +646,13 @@ def filter_cancer_patients_inplace(dry_run=False):
         dict: Statistics about filtering
     """
 
-    print("="*80)
+    console.out("="*80)
     if dry_run:
-        print("STEP 2: FILTER CANCER PATIENTS — DRY RUN (NOTHING IS DELETED)")
+        console.out("STEP 2: FILTER CANCER PATIENTS — DRY RUN (NOTHING IS DELETED)")
     else:
-        print("STEP 2: FILTER CANCER PATIENTS (IN-PLACE DELETION)")
-    print("="*80)
-    print()
+        console.out("STEP 2: FILTER CANCER PATIENTS (IN-PLACE DELETION)")
+    console.out("="*80)
+    console.out()
 
     # BEFORE the scan, and before the manifest, and in dry-run mode too.
     require_intact_registry()
@@ -666,20 +667,20 @@ def filter_cancer_patients_inplace(dry_run=False):
     # Check directory exists
     patients_path = Path(directory)
     if not patients_path.exists():
-        print(f"ERROR: Patient directory not found: {directory}")
+        console.out(f"ERROR: Patient directory not found: {directory}")
         return None
 
     # Get all patient files
     patient_files = list(patients_path.glob("*.json"))
 
-    print(f"Patient directory: {directory}")
-    print(f"Total patients: {len(patient_files)}")
-    print()
+    console.out(f"Patient directory: {directory}")
+    console.out(f"Total patients: {len(patient_files)}")
+    console.out()
 
-    print("="*80)
-    print("SCANNING PATIENTS FOR CANCER DIAGNOSES...")
-    print("="*80)
-    print()
+    console.out("="*80)
+    console.out("SCANNING PATIENTS FOR CANCER DIAGNOSES...")
+    console.out("="*80)
+    console.out()
 
     cancer_patients = []          # every primary-cancer patient, alive or not
     alive_cancer_patients = []    # the cap sampling pool
@@ -701,7 +702,7 @@ def filter_cancer_patients_inplace(dry_run=False):
     # two counts never overlap.
     for idx, patient_file in enumerate(patient_files, 1):
         if idx % 500 == 0:
-            print(f"  Processed {idx}/{len(patient_files)} patients...")
+            console.out(f"  Processed {idx}/{len(patient_files)} patients...")
 
         try:
             with open(patient_file, 'r') as f:
@@ -734,41 +735,41 @@ def filter_cancer_patients_inplace(dry_run=False):
                 alive_cancer_patients.append(patient_file)
 
         except Exception as e:
-            print(f"  ERROR processing {patient_file.name}: {e}")
+            console.out(f"  ERROR processing {patient_file.name}: {e}")
             error_patients.append(patient_file)
 
-    print(f"  Processed {len(patient_files)}/{len(patient_files)} patients... \nDONE")
-    print()
+    console.out(f"  Processed {len(patient_files)}/{len(patient_files)} patients... \nDONE")
+    console.out()
 
     # Results
-    print("="*80)
-    print("FILTERING RESULTS")
-    print("="*80)
-    print()
-    print(f"Total patients scanned: {len(patient_files)}")
-    print(f"Cancer patients found: {len(cancer_patients)}")
-    print(f"  ... alive:    {len(alive_cancer_patients)}")
-    print(f"  ... deceased: {len(deceased_cancer_patients)}")
-    print(f"Non-cancer patients: {len(non_cancer_patients)}")
+    console.out("="*80)
+    console.out("FILTERING RESULTS")
+    console.out("="*80)
+    console.out()
+    console.out(f"Total patients scanned: {len(patient_files)}")
+    console.out(f"Cancer patients found: {len(cancer_patients)}")
+    console.out(f"  ... alive:    {len(alive_cancer_patients)}")
+    console.out(f"  ... deceased: {len(deceased_cancer_patients)}")
+    console.out(f"Non-cancer patients: {len(non_cancer_patients)}")
     cancer_pct = len(cancer_patients) / len(patient_files) * 100 if patient_files else 0.0
     alive_pct = len(alive_cancer_patients) / len(patient_files) * 100 if patient_files else 0.0
-    print(f"Cancer percentage: {cancer_pct:.1f}%  (alive cancer: {alive_pct:.1f}%)")
+    console.out(f"Cancer percentage: {cancer_pct:.1f}%  (alive cancer: {alive_pct:.1f}%)")
     if unknown_vital_status:
-        print(f"Cancer patients with UNREADABLE vital status (kept): {len(unknown_vital_status)}")
+        console.out(f"Cancer patients with UNREADABLE vital status (kept): {len(unknown_vital_status)}")
     if error_patients:
-        print(f"Files with parse errors (skipped): {len(error_patients)}")
-    print()
+        console.out(f"Files with parse errors (skipped): {len(error_patients)}")
+    console.out()
 
     if cancer_counts:
-        print("Cancer types distribution:")
+        console.out("Cancer types distribution:")
         for cancer_type, count in sorted(cancer_counts.items(),
                                          key=lambda x: x[1],
                                          reverse=True)[:15]:
-            print(f"  • {cancer_type}: {count}")
+            console.out(f"  • {cancer_type}: {count}")
 
         if len(cancer_counts) > 15:
-            print(f"  ... and {len(cancer_counts) - 15} more types")
-    print()
+            console.out(f"  ... and {len(cancer_counts) - 15} more types")
+    console.out()
 
     # Open the deletion manifest before anything is unlinked.
     manifest = {
@@ -795,19 +796,19 @@ def filter_cancer_patients_inplace(dry_run=False):
         'phases':               {},
     }
     _write_manifest(manifest, manifest_target)
-    print(f"{'DRY RUN plan' if dry_run else 'Deletion manifest'}: {manifest_target}")
-    print()
+    console.out(f"{'DRY RUN plan' if dry_run else 'Deletion manifest'}: {manifest_target}")
+    console.out()
 
     # STEP 1: Delete non-cancer patients (if any)
     non_cancer_deleted = 0
     non_cancer_would_delete = 0
 
     if non_cancer_patients:
-        print("="*80)
-        print(f"STEP 1: {'WOULD DELETE' if dry_run else 'DELETE'} "
+        console.out("="*80)
+        console.out(f"STEP 1: {'WOULD DELETE' if dry_run else 'DELETE'} "
               f"{len(non_cancer_patients)} NON-CANCER PATIENTS")
-        print("="*80)
-        print()
+        console.out("="*80)
+        console.out()
 
         phase = _delete_manifested(
             manifest,
@@ -822,20 +823,20 @@ def filter_cancer_patients_inplace(dry_run=False):
         non_cancer_would_delete = len(phase['would_delete'])
 
         if dry_run:
-            print(f"  [DRY RUN] Would delete "
+            console.out(f"  [DRY RUN] Would delete "
                   f"{non_cancer_would_delete}/{len(non_cancer_patients)} "
                   f"non-cancer patients (nothing removed)")
         else:
-            print(f"  Deleted {non_cancer_deleted}/{len(non_cancer_patients)} non-cancer patients... \nDONE")
+            console.out(f"  Deleted {non_cancer_deleted}/{len(non_cancer_patients)} non-cancer patients... \nDONE")
         if phase['failed'] or phase['already_absent']:
-            print(f"  NOT deleted: {len(phase['failed'])} failed, "
+            console.out(f"  NOT deleted: {len(phase['failed'])} failed, "
                   f"{len(phase['already_absent'])} already absent (see manifest)")
-        print()
+        console.out()
     else:
-        print("="*80)
-        print("STEP 1: NO NON-CANCER PATIENTS TO DELETE")
-        print("="*80)
-        print()
+        console.out("="*80)
+        console.out("STEP 1: NO NON-CANCER PATIENTS TO DELETE")
+        console.out("="*80)
+        console.out()
 
     # STEP 2: Delete DECEASED cancer patients
     #
@@ -856,11 +857,11 @@ def filter_cancer_patients_inplace(dry_run=False):
     deceased_would_delete = 0
 
     if deceased_cancer_patients:
-        print("="*80)
-        print(f"STEP 2: {'WOULD DELETE' if dry_run else 'DELETE'} "
+        console.out("="*80)
+        console.out(f"STEP 2: {'WOULD DELETE' if dry_run else 'DELETE'} "
               f"{len(deceased_cancer_patients)} DECEASED CANCER PATIENTS")
-        print("="*80)
-        print()
+        console.out("="*80)
+        console.out()
 
         phase = _delete_manifested(
             manifest,
@@ -882,15 +883,15 @@ def filter_cancer_patients_inplace(dry_run=False):
         _write_manifest(manifest, manifest_target)
 
         if dry_run:
-            print(f"  [DRY RUN] Would delete "
+            console.out(f"  [DRY RUN] Would delete "
                   f"{deceased_would_delete}/{len(deceased_cancer_patients)} "
                   f"deceased patients (nothing removed)")
         else:
-            print(f"  Deleted {deceased_deleted}/{len(deceased_cancer_patients)} deceased patients... \nDONE")
+            console.out(f"  Deleted {deceased_deleted}/{len(deceased_cancer_patients)} deceased patients... \nDONE")
         if phase['failed'] or phase['already_absent']:
-            print(f"  NOT deleted: {len(phase['failed'])} failed, "
+            console.out(f"  NOT deleted: {len(phase['failed'])} failed, "
                   f"{len(phase['already_absent'])} already absent (see manifest)")
-        print()
+        console.out()
     else:
         # Record the phase even with nothing to delete. An ABSENT phase key and
         # a phase key with planned_count 0 are different claims: the first is
@@ -913,11 +914,11 @@ def filter_cancer_patients_inplace(dry_run=False):
                               'cancer patients; it was not skipped',
         }
         _write_manifest(manifest, manifest_target)
-        print("="*80)
-        print("STEP 2: NO DECEASED CANCER PATIENTS TO DELETE")
-        print("="*80)
-        print("  (checked; recorded in the manifest as a zero-count phase)")
-        print()
+        console.out("="*80)
+        console.out("STEP 2: NO DECEASED CANCER PATIENTS TO DELETE")
+        console.out("="*80)
+        console.out("  (checked; recorded in the manifest as a zero-count phase)")
+        console.out()
 
     # STEP 3: Cap at CAP patients (if needed)
     #
@@ -931,19 +932,19 @@ def filter_cancer_patients_inplace(dry_run=False):
     extra_would_delete = 0
 
     if error_patients:
-        print(f"NOTE: {len(error_patients)} unparseable bundle(s) left on disk and "
+        console.out(f"NOTE: {len(error_patients)} unparseable bundle(s) left on disk and "
               f"excluded from the cap pool (listed in the manifest).")
-        print()
+        console.out()
 
     if len(remaining_files) > CAP:
-        print("="*80)
-        print(f"STEP 3: CAP DATASET AT {CAP} PATIENTS")
-        print("="*80)
-        print()
-        print(f"Current alive cancer patients: {len(remaining_files)}")
-        print(f"Target: {CAP} patients")
-        print(f"Need to remove: {len(remaining_files) - CAP} patients")
-        print()
+        console.out("="*80)
+        console.out(f"STEP 3: CAP DATASET AT {CAP} PATIENTS")
+        console.out("="*80)
+        console.out()
+        console.out(f"Current alive cancer patients: {len(remaining_files)}")
+        console.out(f"Target: {CAP} patients")
+        console.out(f"Need to remove: {len(remaining_files) - CAP} patients")
+        console.out()
 
         # Reproducible random sampling. Local Random instance rather than
         # random.seed(): seeding the process-wide state would shift the draw
@@ -957,10 +958,10 @@ def filter_cancer_patients_inplace(dry_run=False):
         # Delete the rest
         patients_to_remove = [f for f in remaining_files if f not in patients_to_keep_set]
 
-        print(f"Randomly selecting {CAP} patients to keep (seed={RANDOM_SEED})...")
-        print(f"{'Would delete' if dry_run else 'Deleting'} "
+        console.out(f"Randomly selecting {CAP} patients to keep (seed={RANDOM_SEED})...")
+        console.out(f"{'Would delete' if dry_run else 'Deleting'} "
               f"{len(patients_to_remove)} extra cancer patients...")
-        print()
+        console.out()
 
         phase = _delete_manifested(
             manifest,
@@ -975,29 +976,29 @@ def filter_cancer_patients_inplace(dry_run=False):
         extra_would_delete = len(phase['would_delete'])
 
         if dry_run:
-            print(f"  [DRY RUN] Would delete "
+            console.out(f"  [DRY RUN] Would delete "
                   f"{extra_would_delete}/{len(patients_to_remove)} extra "
                   f"patients (nothing removed)")
         else:
-            print(f"  Deleted {extra_deleted}/{len(patients_to_remove)} extra patients... \n\nDONE")
+            console.out(f"  Deleted {extra_deleted}/{len(patients_to_remove)} extra patients... \n\nDONE")
         if phase['failed'] or phase['already_absent']:
-            print(f"  NOT deleted: {len(phase['failed'])} failed, "
+            console.out(f"  NOT deleted: {len(phase['failed'])} failed, "
                   f"{len(phase['already_absent'])} already absent (see manifest)")
-        print()
+        console.out()
     else:
         # Under-cap is a REPORTED outcome, not a quiet one: it means
         # POPULATION_SIZE (04- FHIR Generate Data.py) was sized too low for the
         # alive-cancer yield, and the corpus is smaller than CAP asked for.
-        print("="*80)
-        print(f"STEP 3: ALREADY AT OR BELOW {CAP} PATIENTS")
-        print("="*80)
-        print()
+        console.out("="*80)
+        console.out(f"STEP 3: ALREADY AT OR BELOW {CAP} PATIENTS")
+        console.out("="*80)
+        console.out()
         if len(remaining_files) < CAP:
-            print(f"! Only {len(remaining_files)} alive cancer patients available, "
+            console.out(f"! Only {len(remaining_files)} alive cancer patients available, "
                   f"CAP is {CAP}. The cohort is {CAP - len(remaining_files)} short.")
-            print("  Raise POPULATION_SIZE in '04- FHIR Generate Data.py' and "
+            console.out("  Raise POPULATION_SIZE in '04- FHIR Generate Data.py' and "
                   "regenerate; this run cannot be topped up (Synthea appends).")
-            print()
+            console.out()
 
     # FINAL STATS
     final_files = list(patients_path.glob("*.json"))
@@ -1015,42 +1016,42 @@ def filter_cancer_patients_inplace(dry_run=False):
     manifest['files_remaining'] = len(final_files)
     _write_manifest(manifest, manifest_target)
 
-    print("="*80)
+    console.out("="*80)
     if dry_run:
-        print("DRY RUN COMPLETE — NOTHING WAS DELETED")
+        console.out("DRY RUN COMPLETE — NOTHING WAS DELETED")
     else:
-        print("FILTERING COMPLETE!" if not deletion_failures else "FILTERING FINISHED WITH FAILURES")
-    print("="*80)
-    print()
+        console.out("FILTERING COMPLETE!" if not deletion_failures else "FILTERING FINISHED WITH FAILURES")
+    console.out("="*80)
+    console.out()
     if dry_run:
         _would_total = (non_cancer_would_delete + deceased_would_delete
                         + extra_would_delete)
-        print(f"• Non-cancer patients that WOULD be deleted: {non_cancer_would_delete}")
-        print(f"• Deceased cancer patients that WOULD be deleted: {deceased_would_delete}")
-        print(f"• Extra alive cancer patients that WOULD be deleted (cap): {extra_would_delete}")
-        print(f"• TOTAL that would be removed: {_would_total}")
-        print(f"• Files currently in directory: {len(final_files)} → "
+        console.out(f"• Non-cancer patients that WOULD be deleted: {non_cancer_would_delete}")
+        console.out(f"• Deceased cancer patients that WOULD be deleted: {deceased_would_delete}")
+        console.out(f"• Extra alive cancer patients that WOULD be deleted (cap): {extra_would_delete}")
+        console.out(f"• TOTAL that would be removed: {_would_total}")
+        console.out(f"• Files currently in directory: {len(final_files)} → "
               f"{len(final_files) - _would_total} after a real run")
-        print(f"• Directory: {patients_path}  (UNCHANGED)")
-        print(f"• Plan written to: {manifest_target}")
-        print(f"• Every filename is in that file, under phases[*].would_delete.")
-        print()
-        print("  Re-run without dry_run=True to perform the deletion.")
+        console.out(f"• Directory: {patients_path}  (UNCHANGED)")
+        console.out(f"• Plan written to: {manifest_target}")
+        console.out(f"• Every filename is in that file, under phases[*].would_delete.")
+        console.out()
+        console.out("  Re-run without dry_run=True to perform the deletion.")
     else:
-        print(f"✓ Non-cancer patients deleted: {non_cancer_deleted}")
-        print(f"✓ Deceased cancer patients deleted: {deceased_deleted}")
-        print(f"✓ Extra alive cancer patients deleted (for cap): {extra_deleted}")
-        print(f"✓ Files remaining in directory: {len(final_files)}")
-        print(f"✓ Directory: {patients_path}")
-        print(f"✓ Manifest: {manifest_path()} (status: {manifest['status']})")
+        console.out(f"✓ Non-cancer patients deleted: {non_cancer_deleted}")
+        console.out(f"✓ Deceased cancer patients deleted: {deceased_deleted}")
+        console.out(f"✓ Extra alive cancer patients deleted (for cap): {extra_deleted}")
+        console.out(f"✓ Files remaining in directory: {len(final_files)}")
+        console.out(f"✓ Directory: {patients_path}")
+        console.out(f"✓ Manifest: {manifest_path()} (status: {manifest['status']})")
     if deletion_failures:
-        print(f"✗ Deletions that FAILED: {deletion_failures} — the directory is "
+        console.out(f"✗ Deletions that FAILED: {deletion_failures} — the directory is "
               f"partially filtered. Per-file errors are in the manifest.")
     if _DELETION_COUNTS["already_absent"]:
-        print(f"! Targets already absent: {_DELETION_COUNTS['already_absent']}")
+        console.out(f"! Targets already absent: {_DELETION_COUNTS['already_absent']}")
     if error_patients:
-        print(f"! Unparseable bundles left on disk (not in cohort): {len(error_patients)}")
-    print()
+        console.out(f"! Unparseable bundles left on disk (not in cohort): {len(error_patients)}")
+    console.out()
 
     stats = {
         # FIRST, and always present. A caller that forgets to look at it is one

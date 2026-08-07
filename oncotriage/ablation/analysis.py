@@ -79,6 +79,7 @@ from oncotriage.config import (
     ABLATION_POWER_TARGET,
     Project_Name,
 )
+from oncotriage.observability import console
 
 
 #------------------------------------------------------------------------------
@@ -91,7 +92,7 @@ from oncotriage.config import (
 def load_ablation_data(db_path=None) -> pd.DataFrame:
     """Load ablation_results table into a DataFrame."""
     if not ablation_db(db_path).exists():
-        print(f"ERROR: {ablation_db(db_path)} not found. Run File 26 first.")
+        console.out(f"ERROR: {ablation_db(db_path)} not found. Run File 26 first.")
         sys.exit(1)
 
     conn = sqlite3.connect(str(ablation_db(db_path)))
@@ -117,7 +118,7 @@ def load_ablation_data(db_path=None) -> pd.DataFrame:
         subset=["config_name", "patient_id"], keep="first"
     )
     if len(df) < before:
-        print(f"  WARNING: Dropped {before - len(df)} duplicate rows (kept most recent run)")
+        console.out(f"  WARNING: Dropped {before - len(df)} duplicate rows (kept most recent run)")
 
     # ── Match rate: the metric every conditional mean is conditioned on ─────
     df["has_match"] = (df["eligible_count"] > 0).astype(int)
@@ -140,11 +141,11 @@ def load_ablation_data(db_path=None) -> pd.DataFrame:
             df.loc[_missing_all, "avg_match_score_all"] = (
                 df.loc[_missing_all, "avg_match_score"].fillna(0.0)
             )
-            print(f"  Backfilled avg_match_score_all for {int(_missing_all.sum())} "
+            console.out(f"  Backfilled avg_match_score_all for {int(_missing_all.sum())} "
                   f"pre-migration row(s) from avg_match_score (null -> 0.0)")
     else:
         df["avg_match_score_all"] = df["avg_match_score"].fillna(0.0)
-        print("  avg_match_score_all absent from database (pre-migration): "
+        console.out("  avg_match_score_all absent from database (pre-migration): "
               "derived from avg_match_score with null -> 0.0")
 
     # ── Efficiency ratios ───────────────────────────────────────────────────
@@ -166,7 +167,7 @@ def load_ablation_data(db_path=None) -> pd.DataFrame:
         if row["eligible_count"] > 0 else None, axis=1
     )
 
-    print(f"Loaded {len(df)} results ({df['config_name'].nunique()} configs, "
+    console.out(f"Loaded {len(df)} results ({df['config_name'].nunique()} configs, "
           f"{df['patient_id'].nunique()} patients)")
 
     return df
@@ -282,11 +283,11 @@ def build_comparison_table(df: pd.DataFrame) -> pd.DataFrame:
             if len(vals) < 2:
                 table.loc[idx, f"{col}_ci_lo"] = np.nan
                 table.loc[idx, f"{col}_ci_hi"] = np.nan
-                print(f"  WARNING: {config}/{col}: {len(vals)} non-null value(s), "
+                console.out(f"  WARNING: {config}/{col}: {len(vals)} non-null value(s), "
                       f"CI not computed")
                 continue
             if len(vals) < len(config_data):
-                print(f"  NOTE: {config}/{col}: CI bootstrapped on {len(vals)} of "
+                console.out(f"  NOTE: {config}/{col}: CI bootstrapped on {len(vals)} of "
                       f"{len(config_data)} patients ({len(config_data) - len(vals)} "
                       f"null); interval and mean cover different populations")
             boot_means = [
@@ -300,7 +301,7 @@ def build_comparison_table(df: pd.DataFrame) -> pd.DataFrame:
     # Compute deltas vs baseline
     bl_rows = table[table["config_name"] == BASELINE]
     if bl_rows.empty:
-        print("  WARNING: Baseline config not found in results. Deltas skipped.")
+        console.out("  WARNING: Baseline config not found in results. Deltas skipped.")
         table["config_label"] = table["config_name"].map(CONFIG_LABELS)
         return table
 
@@ -559,7 +560,7 @@ def run_statistical_tests(df: pd.DataFrame, pairing: pd.DataFrame) -> pd.DataFra
             # Previously a bare `continue`: the configuration vanished from the
             # output with no row and no warning, and a reader counting rows had
             # no way to tell an excluded configuration from one never run.
-            print(f"  EXCLUDED from test family: {config} has {len(shared)} "
+            console.out(f"  EXCLUDED from test family: {config} has {len(shared)} "
                   f"paired patient(s), below ABLATION_MIN_PAIRED="
                   f"{ABLATION_MIN_PAIRED}")
             for col in ABLATION_OUTCOME_METRICS:
@@ -604,7 +605,7 @@ def run_statistical_tests(df: pd.DataFrame, pairing: pd.DataFrame) -> pd.DataFra
                 # Recorded as a distinct status with the exception text, so a
                 # scipy failure can never be read as a genuine null.
                 n_scipy_failures += 1
-                print(f"  WARNING: wilcoxon failed for {config}/{col}: "
+                console.out(f"  WARNING: wilcoxon failed for {config}/{col}: "
                       f"{type(exc).__name__}: {exc}")
                 row.update({
                     "n_nonzero": int(np.count_nonzero(diff)), "stat": None,
@@ -631,7 +632,7 @@ def run_statistical_tests(df: pd.DataFrame, pairing: pd.DataFrame) -> pd.DataFra
 
     stats = pd.DataFrame(results)
     if stats.empty:
-        print("  WARNING: no comparisons produced; test family is empty")
+        console.out("  WARNING: no comparisons produced; test family is empty")
         return stats
 
     # ── Benjamini-Hochberg over the family that actually ran ────────────────
@@ -657,10 +658,10 @@ def run_statistical_tests(df: pd.DataFrame, pairing: pd.DataFrame) -> pd.DataFra
 
     n_family = int(family_mask.sum())
     n_excluded = len(stats) - n_family
-    print(f"  Test family: {n_family} test(s) corrected (BH FDR, "
+    console.out(f"  Test family: {n_family} test(s) corrected (BH FDR, "
           f"alpha={ABLATION_FDR_ALPHA}); {n_excluded} comparison(s) recorded "
           f"but not tested; {n_scipy_failures} scipy failure(s)")
-    print(f"  Rejected after correction: {int(stats['rejected_fdr'].sum())} "
+    console.out(f"  Rejected after correction: {int(stats['rejected_fdr'].sum())} "
           f"of {n_family}")
 
     return stats
@@ -784,7 +785,7 @@ def compute_minimum_detectable_effect(df: pd.DataFrame,
             return float(exact) / scale
         except Exception as exc:
             methods_used.add("normal_approx")
-            print(f"  WARNING: exact MDE solve failed at alpha={alpha:.6g} "
+            console.out(f"  WARNING: exact MDE solve failed at alpha={alpha:.6g} "
                   f"({type(exc).__name__}: {exc}); fell back to normal "
                   f"approximation, which UNDERSTATES the MDE")
             return approx / scale
@@ -828,7 +829,7 @@ def compute_minimum_detectable_effect(df: pd.DataFrame,
             "mde_units_strict": round(out["dz_strict"] * sd, 4),
         }
 
-    print(f"  MDE at n={n}, {m} tests, power={ABLATION_POWER_TARGET}: "
+    console.out(f"  MDE at n={n}, {m} tests, power={ABLATION_POWER_TARGET}: "
           f"dz={out['dz_loose']} (alpha={alpha_loose}) to "
           f"dz={out['dz_strict']} (alpha={out['alpha_strict']}) "
           f"[{out['method']}]")
@@ -1316,13 +1317,13 @@ def generate_report(df: pd.DataFrame, table: pd.DataFrame,
     report_text = "\n".join(lines)
 
     # Print to terminal
-    print(report_text)
+    console.out(report_text)
 
     # Save to file
     path = out_dir / "ablation_full_report.txt"
     with open(path, "w") as f:
         f.write(report_text)
-    print(f"\n  Saved: {path}")
+    console.out(f"\n  Saved: {path}")
 
 
 # ===========================================================================
@@ -1342,11 +1343,11 @@ def main(db_path=None):
             (``common._require_writable_parent``, pass 20f-3), not by sqlite3.
     """
 
-    print()
-    print("=" * 70)
-    print(f"{Project_Name}: ABLATION ANALYSIS")
-    print("=" * 70)
-    print()
+    console.out()
+    console.out("=" * 70)
+    console.out(f"{Project_Name}: ABLATION ANALYSIS")
+    console.out("=" * 70)
+    console.out()
 
     # ONE resolution, read by every writer below. The outputs FOLLOW the
     # database: with --db they land beside it, so a scratch analysis cannot
@@ -1354,56 +1355,56 @@ def main(db_path=None):
     # different database.
     out_dir = output_dir(db_path)
     if db_path is not None:
-        print(f"  --db in effect: {ablation_db(db_path)}")
-        print(f"  Outputs will go beside it: {out_dir}")
-        print()
+        console.out(f"  --db in effect: {ablation_db(db_path)}")
+        console.out(f"  Outputs will go beside it: {out_dir}")
+        console.out()
 
     # --- Load data ---
-    print("[1/9] Loading data...")
+    console.out("[1/9] Loading data...")
     df = load_ablation_data(db_path)
     errors = load_error_data(db_path)
 
     if len(df) == 0:
-        print("ERROR: No successful results found in ablation database.")
+        console.out("ERROR: No successful results found in ablation database.")
         sys.exit(1)
 
     # --- Build comparison table (with bootstrapped 95% CIs) ---
-    print("[2/9] Building comparison table with 95% CIs...")
+    console.out("[2/9] Building comparison table with 95% CIs...")
     table = build_comparison_table(df)
     csv_path = out_dir / "ablation_comparison_table.csv"
     table.to_csv(csv_path, index=False)
-    print(f"  Saved: {csv_path}")
+    console.out(f"  Saved: {csv_path}")
 
     # --- Pairing / dropped-patient accounting (feeds the tests) ---
-    print("[3/9] Auditing patient pairing and dropped set...")
+    console.out("[3/9] Auditing patient pairing and dropped set...")
     pairing = build_pairing_report(df, errors)
     pairing_path = out_dir / "ablation_pairing_report.csv"
     pairing.to_csv(pairing_path, index=False)
-    print(f"  Saved: {pairing_path}")
+    console.out(f"  Saved: {pairing_path}")
 
     # --- Statistical tests (BH-FDR corrected, signed effect sizes) ---
-    print("[4/9] Running statistical tests (BH-FDR corrected)...")
+    console.out("[4/9] Running statistical tests (BH-FDR corrected)...")
     stats = run_statistical_tests(df, pairing)
     stats_path = out_dir / "ablation_statistical_tests.csv"
     stats.to_csv(stats_path, index=False)
-    print(f"  Saved: {stats_path}")
+    console.out(f"  Saved: {stats_path}")
 
     mde = compute_minimum_detectable_effect(df, stats)
 
     descriptive = build_descriptive_deltas(df)
     desc_path = out_dir / "ablation_descriptive_metrics.csv"
     descriptive.to_csv(desc_path, index=False)
-    print(f"  Saved: {desc_path}")
+    console.out(f"  Saved: {desc_path}")
 
     # --- Win/Tie/Loss pairwise analysis ---
-    print("[5/9] Building win/tie/loss table...")
+    console.out("[5/9] Building win/tie/loss table...")
     wl_table = build_win_loss_table(df)
     wl_path = out_dir / "ablation_win_loss_table.csv"
     wl_table.to_csv(wl_path, index=False)
-    print(f"  Saved: {wl_path}")
+    console.out(f"  Saved: {wl_path}")
 
     # --- Visualizations (original + new) ---
-    print("[6/9] Generating visualizations...")
+    console.out("[6/9] Generating visualizations...")
     figures.plot_funnel_chart(df, out_dir)
     figures.plot_delta_chart(table, out_dir)
     figures.plot_cost_efficiency(df, out_dir)
@@ -1415,12 +1416,12 @@ def main(db_path=None):
     figures.plot_patient_scatter(df, out_dir)
 
     # --- Full report ---
-    print("[7/9] Generating report...")
+    console.out("[7/9] Generating report...")
     generate_report(df, table, stats, wl_table, errors, pairing, descriptive,
                     mde, out_dir)
 
     # --- Summary JSON (for programmatic use) ---
-    print("[8/9] Exporting summary JSON...")
+    console.out("[8/9] Exporting summary JSON...")
     _tested = stats[stats["status"] == "tested"] if len(stats) else stats
     summary = {
         "comparison_table": table.to_dict(orient="records"),
@@ -1452,10 +1453,10 @@ def main(db_path=None):
     json_path = out_dir / "ablation_analysis.json"
     with open(json_path, "w") as f:
         json.dump(summary, f, indent=2, default=str)
-    print(f"  Saved: {json_path}")
+    console.out(f"  Saved: {json_path}")
 
     # --- Worst-degradation patients (flagged for manual review) ---
-    print("[9/9] Flagging worst-degradation patients...")
+    console.out("[9/9] Flagging worst-degradation patients...")
     baseline_df = df[df["config_name"] == BASELINE].set_index("patient_id")
     worst = []
     for config in CONFIG_ORDER:
@@ -1481,15 +1482,15 @@ def main(db_path=None):
         worst_df = pd.DataFrame(worst).sort_values("delta")
         worst_path = out_dir / "ablation_worst_degradation.csv"
         worst_df.to_csv(worst_path, index=False)
-        print(f"  Top degradation cases saved: {worst_path}")
-        print("  (Review these patients manually for qualitative error analysis)")
+        console.out(f"  Top degradation cases saved: {worst_path}")
+        console.out("  (Review these patients manually for qualitative error analysis)")
 
-    print()
-    print("=" * 70)
-    print("  ANALYSIS COMPLETE")
-    print(f"  All outputs in: {out_dir}")
-    print("=" * 70)
-    print()
+    console.out()
+    console.out("=" * 70)
+    console.out("  ANALYSIS COMPLETE")
+    console.out(f"  All outputs in: {out_dir}")
+    console.out("=" * 70)
+    console.out()
 
 #------------------------------------------------------------------------------
 

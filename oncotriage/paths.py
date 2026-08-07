@@ -96,6 +96,7 @@ import threading
 from dotenv import load_dotenv
 
 from oncotriage import settings as path_settings
+from oncotriage.observability import console
 
 
 # Detect if running in Docker container
@@ -118,7 +119,7 @@ def _load_path_settings():
     return path_settings, os.path.dirname(os.path.abspath(path_settings.__file__))
 
 
-print(f"[Paths] Settings module loaded from {path_settings.__file__} "
+console.out(f"[Paths] Settings module loaded from {path_settings.__file__} "
       f"(via the oncotriage package)")
 
 
@@ -307,7 +308,7 @@ def _resolve_root():
 
     if IS_DOCKER:
         # Docker container paths (Linux environment)
-        print("🐳 Running in Docker container")
+        console.out("🐳 Running in Docker container")
 
         # Provenance of main_path, recorded in both branches so a reader of a
         # log can tell a container run from a local one without inferring it.
@@ -315,12 +316,12 @@ def _resolve_root():
         _RESOLVED["main_path"] = "/app/"
     else:
         # Local development paths (macOS)
-        print("💻 Running on local machine")
+        console.out("💻 Running on local machine")
 
         main, source = path_settings.resolve_main_path()
         _RESOLVED["main_path"] = main
         _RESOLVED["_main_path_source"] = source
-        print(f"[Paths] Project root: {main} (from {source})")
+        console.out(f"[Paths] Project root: {main} (from {source})")
 
     return _RESOLVED
 

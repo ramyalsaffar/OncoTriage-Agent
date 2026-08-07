@@ -164,6 +164,7 @@ from oncotriage.fixtures.capture import (
     sha256_json,
 )
 from oncotriage.utils import CaffeinateSession, resolve_qdrant_collection
+from oncotriage.observability import console, correlation_scope
 
 
 #------------------------------------------------------------------------------
@@ -644,9 +645,9 @@ def obtain_bundle(fixture: Dict) -> tuple:
 def replay_fixture(fixture: Dict, graph: object) -> Dict:
     """Replay one fixture and return its report."""
     fixture_id = fixture["fixture_id"]
-    print(f"\n{'-' * 78}\n{fixture_id}  [{', '.join(fixture['case_labels'])}]"
+    console.out(f"\n{'-' * 78}\n{fixture_id}  [{', '.join(fixture['case_labels'])}]"
           f"{'  (CONSTRUCTED)' if fixture['fixture_kind'] == FIXTURE_KIND_CONSTRUCTED else ''}")
-    print(f"{'-' * 78}")
+    console.out(f"{'-' * 78}")
 
     report = {
         "fixture_id": fixture_id,
@@ -667,7 +668,7 @@ def replay_fixture(fixture: Dict, graph: object) -> Dict:
     except Exception as exc:
         report["fatal"] = (f"could not obtain the source bundle: "
                            f"{type(exc).__name__}: {exc}")
-        print(f"  FATAL: {report['fatal']}")
+        console.out(f"  FATAL: {report['fatal']}")
         return report
 
     try:
@@ -680,7 +681,7 @@ def replay_fixture(fixture: Dict, graph: object) -> Dict:
                 fixture["deterministic_prefix"]["patient_data"]
             )
             report["parse_source"] = "stored_dict_bundle_missing"
-            print(f"  WARNING: source bundle not found at {bundle_path}; "
+            console.out(f"  WARNING: source bundle not found at {bundle_path}; "
                   f"replaying from the stored patient dict. The parser is NOT "
                   f"under test for this fixture.")
         else:
@@ -692,7 +693,7 @@ def replay_fixture(fixture: Dict, graph: object) -> Dict:
                 report["fatal"] = (f"parse_fhir_bundle failed on "
                                    f"{fixture['identity']['source_bundle']}: "
                                    f"{type(exc).__name__}: {exc}")
-                print(f"  FATAL: {report['fatal']}")
+                console.out(f"  FATAL: {report['fatal']}")
                 return report
 
             # A recipe that no longer reproduces its input is a broken fixture,
@@ -710,9 +711,9 @@ def replay_fixture(fixture: Dict, graph: object) -> Dict:
                         f"{expected_hash}. The recipe, the donor bundle or the "
                         f"parser changed — this is not a pipeline difference."
                     )
-                    print(f"  FATAL: {report['fatal']}")
+                    console.out(f"  FATAL: {report['fatal']}")
                     return report
-                print(f"  rebuilt from recipe "
+                console.out(f"  rebuilt from recipe "
                       f"{fixture['derivation']['recipe']}: patient_data_hash "
                       f"{rebuilt_hash} matches")
     finally:
@@ -726,7 +727,9 @@ def replay_fixture(fixture: Dict, graph: object) -> Dict:
         initial_state = build_initial_state(
             patient_data, fixture["inputs"]["ablation_flags"]
         )
-        final_state = graph.invoke(initial_state)
+        # Scoped: see oncotriage/agent/graph.py. One fixture is one patient.
+        with correlation_scope():
+            final_state = graph.invoke(initial_state)
         result = final_state["result"]
         result["qdrant_collection"] = resolve_qdrant_collection()
         result["patient_data_hash"] = compute_patient_hash(patient_data)
@@ -736,13 +739,13 @@ def replay_fixture(fixture: Dict, graph: object) -> Dict:
         # which is why sink.replay_misses is reported either way.
         report["fatal"] = f"replay miss: {exc}"
         report["replay_misses"] = list(sink.replay_misses)
-        print(f"  FATAL: {report['fatal']}")
+        console.out(f"  FATAL: {report['fatal']}")
         return report
     except Exception as exc:
         report["fatal"] = (f"pipeline raised {type(exc).__name__}: {exc}\n"
                            f"{traceback.format_exc()}")
         report["replay_misses"] = list(sink.replay_misses)
-        print(f"  FATAL: pipeline raised {type(exc).__name__}: {exc}")
+        console.out(f"  FATAL: pipeline raised {type(exc).__name__}: {exc}")
         return report
     finally:
         restore_hooks(saved)
@@ -771,29 +774,29 @@ def replay_fixture(fixture: Dict, graph: object) -> Dict:
 
 def print_report(report: Dict, max_diffs: int) -> None:
     if report["tunables_moved"]:
-        print("  CONFIG MOVED SINCE CAPTURE (explains prefix differences):")
+        console.out("  CONFIG MOVED SINCE CAPTURE (explains prefix differences):")
         for moved in report["tunables_moved"]:
-            print(f"    {moved['name']}: {moved['was']!r} -> {moved['now']!r}")
+            console.out(f"    {moved['name']}: {moved['was']!r} -> {moved['now']!r}")
 
     for miss in report["replay_misses"]:
-        print(f"  REPLAY MISS  {miss['field']}: {miss['detail']}")
+        console.out(f"  REPLAY MISS  {miss['field']}: {miss['detail']}")
 
     if report["fatal"]:
         return
 
     differences = report["differences"]
     if not differences:
-        print(f"  CLEAN — deterministic prefix identical "
+        console.out(f"  CLEAN — deterministic prefix identical "
               f"({report['parse_source']}).")
         return
 
-    print(f"  {len(differences)} DIFFERENCE(S):")
+    console.out(f"  {len(differences)} DIFFERENCE(S):")
     for difference in differences[:max_diffs]:
-        print(f"    [{difference['kind']}] {difference['field']}")
-        print(f"        fixture: {difference['expected']}")
-        print(f"        replay : {difference['actual']}")
+        console.out(f"    [{difference['kind']}] {difference['field']}")
+        console.out(f"        fixture: {difference['expected']}")
+        console.out(f"        replay : {difference['actual']}")
     if len(differences) > max_diffs:
-        print(f"    ... and {len(differences) - max_diffs} more "
+        console.out(f"    ... and {len(differences) - max_diffs} more "
               f"(raise --max-diffs to see them)")
 
 
@@ -826,14 +829,14 @@ def main() -> int:
 
     root = args.fixture_dir or fixture_root()
 
-    print(f"\n{'=' * 78}")
-    print(f"{Project_Name}: Characterization Fixture Replay (schema v{SCHEMA_VERSION})")
-    print(f"{'=' * 78}")
-    print(f"  Fixture directory: {root}")
+    console.out(f"\n{'=' * 78}")
+    console.out(f"{Project_Name}: Characterization Fixture Replay (schema v{SCHEMA_VERSION})")
+    console.out(f"{'=' * 78}")
+    console.out(f"  Fixture directory: {root}")
 
     fixture_paths = list_fixtures(root)
     if not fixture_paths:
-        print(f"[FATAL] No fixtures in {root}. Run fixture_capture.py first.")
+        console.out(f"[FATAL] No fixtures in {root}. Run fixture_capture.py first.")
         return 1
 
     fixtures = []
@@ -843,16 +846,16 @@ def main() -> int:
             fixtures.append(load_fixture(path))
         except (ValueError, json.JSONDecodeError) as exc:
             load_failures += 1
-            print(f"  LOAD FAILED  {os.path.basename(path)}: {exc}")
+            console.out(f"  LOAD FAILED  {os.path.basename(path)}: {exc}")
 
     if args.only:
         fixtures = [f for f in fixtures if f["fixture_id"] in args.only]
         if not fixtures:
-            print(f"[FATAL] --only matched no fixture in {root}")
+            console.out(f"[FATAL] --only matched no fixture in {root}")
             return 1
 
     if not fixtures:
-        print("[FATAL] No fixture could be loaded.")
+        console.out("[FATAL] No fixture could be loaded.")
         return 1
 
     # --- THE SEAM, CHECKED BEFORE ANYTHING IS REPLAYED ----------------------
@@ -879,7 +882,7 @@ def main() -> int:
     #   2. Then the real thing, installed and torn down, must pass.
     #
     # No fixture is loaded and no model is called by either step.
-    print("\n  Dependency seam (oncotriage.agent.deps):")
+    console.out("\n  Dependency seam (oncotriage.agent.deps):")
 
     _probe_sink = RecordingSink()
     # An EMPTY fixture, of the shape _ReplayState indexes. Nothing is served
@@ -910,12 +913,12 @@ def main() -> int:
     try:
         assert_hooks_reach_the_agent(_probe_expected, "negative control")
     except RuntimeError as _exc:
-        print(f"    negative control: the assertion FAILS with no override "
+        console.out(f"    negative control: the assertion FAILS with no override "
               f"installed, as it must")
-        print(f"      {str(_exc).splitlines()[0]}")
+        console.out(f"      {str(_exc).splitlines()[0]}")
     else:
-        print("\n[FATAL] THE SEAM CHECK PROVES NOTHING.")
-        print("        assert_hooks_reach_the_agent() passed with NO override "
+        console.out("\n[FATAL] THE SEAM CHECK PROVES NOTHING.")
+        console.out("        assert_hooks_reach_the_agent() passed with NO override "
               "installed, so it would also pass if install_replay_hooks() "
               "redirected nothing -- and every Stage 5 call below would be a "
               "real, billed request to OpenAI.")
@@ -924,7 +927,7 @@ def main() -> int:
     _probe_saved = deps.set_overrides(_probe_proxies)
     try:
         assert_hooks_reach_the_agent(_probe_expected, "positive control")
-        print("    positive control: with the overrides installed, the agent "
+        console.out("    positive control: with the overrides installed, the agent "
               "reaches all four proxies")
     finally:
         deps.restore_overrides(_probe_saved)
@@ -944,11 +947,11 @@ def main() -> int:
     except FixtureReplayMiss:
         _tripwire_armed += 1
     if _tripwire_armed == 2:
-        print("    OpenAI tripwire armed: an unrecorded surface AND an "
+        console.out("    OpenAI tripwire armed: an unrecorded surface AND an "
               "unshadowed chat.completions.create both raise instead of "
               "reaching the network")
     else:
-        print(f"\n[FATAL] the OpenAI tripwire raised on {_tripwire_armed}/2 "
+        console.out(f"\n[FATAL] the OpenAI tripwire raised on {_tripwire_armed}/2 "
               f"probes; refusing to replay.")
         return 1
 
@@ -959,21 +962,21 @@ def main() -> int:
     # nothing. This is a refusal, not a warning.
     live_collection = resolve_qdrant_collection()
     pinned = {f["environment"]["qdrant_collection"] for f in fixtures}
-    print(f"  Live Qdrant collection:   {live_collection}")
-    print(f"  Fixtures pinned to:       {', '.join(sorted(pinned))}")
+    console.out(f"  Live Qdrant collection:   {live_collection}")
+    console.out(f"  Fixtures pinned to:       {', '.join(sorted(pinned))}")
 
     if pinned != {live_collection}:
-        print(f"\n[FATAL] THE INDEX CHANGED, NOT THE CODE.")
-        print(f"        The alias '{COLLECTION_NAME}' now resolves to "
+        console.out(f"\n[FATAL] THE INDEX CHANGED, NOT THE CODE.")
+        console.out(f"        The alias '{COLLECTION_NAME}' now resolves to "
               f"'{live_collection}', which is not what these fixtures were "
               f"captured against.")
-        print(f"        Refusing to diff against a different index. Either "
+        console.out(f"        Refusing to diff against a different index. Either "
               f"point Qdrant back at the pinned collection, or re-capture the "
               f"fixtures with fixture_capture.py.")
         for fixture in sorted(fixtures, key=lambda f: f["fixture_id"]):
             got = fixture["environment"]["qdrant_collection"]
             if got != live_collection:
-                print(f"          {fixture['fixture_id']}: pinned {got}")
+                console.out(f"          {fixture['fixture_id']}: pinned {got}")
         return 1
 
     # --- ...and what is IN it -----------------------------------------------
@@ -985,7 +988,7 @@ def main() -> int:
     # reaches the diff, so it is caught here, before anything is replayed, and
     # named for what it is.
     live_digest, digest_seconds = compute_collection_digest(live_collection)
-    print(f"  Collection contents:      {live_digest['point_count']} points, "
+    console.out(f"  Collection contents:      {live_digest['point_count']} points, "
           f"{live_digest['distinct_nct_ids']} distinct NCT IDs, sha256 "
           f"{live_digest['nct_id_sha256'][:16]}... ({digest_seconds}s)")
 
@@ -1002,27 +1005,27 @@ def main() -> int:
             stale.append((fixture["fixture_id"], "digest mismatch", differing))
 
     if stale:
-        print(f"\n[FATAL] THE INDEX CHANGED, NOT THE CODE.")
-        print(f"        '{live_collection}' still exists under the same name, "
+        console.out(f"\n[FATAL] THE INDEX CHANGED, NOT THE CODE.")
+        console.out(f"        '{live_collection}' still exists under the same name, "
               f"but its contents no longer match what these fixtures were "
               f"captured against.")
-        print(f"        Every retrieval-order difference you would see below "
+        console.out(f"        Every retrieval-order difference you would see below "
               f"would be the corpus, not item 20. Re-capture with "
               f"fixture_capture.py.")
         for fixture_id, reason, fields in stale:
-            print(f"          {fixture_id}: {reason}"
+            console.out(f"          {fixture_id}: {reason}"
                   + (f" on {fields}" if fields else ""))
         for fixture in fixtures:
             recorded = fixture["environment"].get("collection_digest")
             if recorded and recorded != live_digest:
-                print(f"        fixture: {recorded}")
-                print(f"        live   : {live_digest}")
+                console.out(f"        fixture: {recorded}")
+                console.out(f"        live   : {live_digest}")
                 break
         return 1
 
-    print(f"  Local models:             not loaded "
+    console.out(f"  Local models:             not loaded "
           f"({DEFER_LOCAL_MODELS_ENV}=1)")
-    print(f"  Replaying {len(fixtures)} fixture(s)\n")
+    console.out(f"  Replaying {len(fixtures)} fixture(s)\n")
 
     graph = build_matching_graph()
 
@@ -1034,7 +1037,7 @@ def main() -> int:
             reports.append(report)
 
     # --- Summary ------------------------------------------------------------
-    print(f"\n{'=' * 78}\nSUMMARY\n{'=' * 78}")
+    console.out(f"\n{'=' * 78}\nSUMMARY\n{'=' * 78}")
     failed = 0
     for report in reports:
         n_diff = len(report["differences"])
@@ -1054,14 +1057,14 @@ def main() -> int:
             detail.append(f"{n_miss} replay miss(es)")
         if report["parse_source"] not in ("reparsed", "rebuilt_from_recipe"):
             detail.append(report["parse_source"])
-        print(f"  {status:<8} {report['fixture_id']:<28} "
+        console.out(f"  {status:<8} {report['fixture_id']:<28} "
               f"{'; '.join(detail)}")
 
     if load_failures:
-        print(f"\n  {load_failures} fixture(s) could not be loaded.")
+        console.out(f"\n  {load_failures} fixture(s) could not be loaded.")
 
-    print(f"\n  {len(reports) - failed}/{len(reports)} replayed clean.")
-    print(f"{'=' * 78}\n")
+    console.out(f"\n  {len(reports) - failed}/{len(reports)} replayed clean.")
+    console.out(f"{'=' * 78}\n")
 
     return 0 if (failed == 0 and load_failures == 0) else 1
 #------------------------------------------------------------------------------

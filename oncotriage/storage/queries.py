@@ -117,6 +117,7 @@ import pandas as pd
 
 from oncotriage import paths
 from oncotriage.config import PRICING_CONFIG, RRF_POOL_SIZE, TOP_K_CANDIDATES
+from oncotriage.observability import console
 from oncotriage.utils import get_model_cost
 
 
@@ -1315,7 +1316,7 @@ def table_names(conn) -> List:
 PROMPT_UNAVAILABLE_MESSAGE = "(no rows in `inferences`, so there is no prompt to show)"
 
 
-def print_slowest_prompt(conn, out=print) -> pd.DataFrame:
+def print_slowest_prompt(conn, out=console.out) -> pd.DataFrame:
     """File 16's Query 5: print the slowest patient's Stage 5 prompt in full.
 
     Returns the one-row frame so a caller can have the prompt without the
@@ -1652,7 +1653,7 @@ def cost_by_model(conn) -> pd.DataFrame:
     return price_model_groups(run(conn, "cost_by_model"))
 
 
-def print_cost_by_model(conn, out=print) -> pd.DataFrame:
+def print_cost_by_model(conn, out=console.out) -> pd.DataFrame:
     """File 16's Query 10, the printing half. Returns the priced frame."""
     df_cost = cost_by_model(conn)
     out("=== COST BREAKDOWN BY MODEL ===")
@@ -1797,12 +1798,12 @@ def _render(df, query, out):
         out("\n")
 
 
-def report(conn, out=print) -> Dict:
+def report(conn, out=console.out) -> Dict:
     """Run every query in registry order and print exactly what File 16 printed.
 
     Args:
         conn: An open connection. NOT closed here -- see ``connect()``.
-        out:  Where each line goes. Defaults to ``print``. Passing
+        out:  Where each line goes. Defaults to ``console.out``. Passing
               ``lambda *a: None`` runs the whole sweep silently, which is what
               makes this testable without capturing stdout.
 

@@ -87,7 +87,6 @@ functions in File 25 and stay functions, so ``paths.checkpoint_path`` resolves
 on first call rather than at import.
 """
 
-import builtins
 import glob
 import json
 import os
@@ -118,6 +117,7 @@ from oncotriage.storage.database_logger import (
     resolve_inference_db_path,
 )
 from oncotriage.utils import CaffeinateSession
+from oncotriage.observability import console
 
 
 #------------------------------------------------------------------------------
@@ -184,10 +184,10 @@ def load_checkpoint() -> set:
         with open(cp, "r") as f:
             data = json.load(f)
         completed = set(data.get("completed_stems", []))
-        print(f"[Checkpoint] Resuming: {len(completed)} patients already completed.")
+        console.out(f"[Checkpoint] Resuming: {len(completed)} patients already completed.")
         return completed
     except (json.JSONDecodeError, KeyError) as e:
-        print(f"[Checkpoint] WARNING: Could not read checkpoint ({e}). Starting fresh.")
+        console.out(f"[Checkpoint] WARNING: Could not read checkpoint ({e}). Starting fresh.")
         return set()
 
 
@@ -219,7 +219,7 @@ def save_checkpoint(completed_stems: set) -> None:
                 )
             os.replace(tmp_path, cp)
         except OSError as e:
-            print(f"[Checkpoint] WARNING: Could not write checkpoint ({e}). Continuing.")
+            console.out(f"[Checkpoint] WARNING: Could not write checkpoint ({e}). Continuing.")
             if tmp_path.exists():
                 try:
                     tmp_path.unlink()
@@ -232,7 +232,7 @@ def clear_checkpoint() -> None:
     cp = _checkpoint_path()
     if cp.exists():
         cp.unlink()
-        print("[Checkpoint] Cleared.")
+        console.out("[Checkpoint] Cleared.")
 
 
 def clear_results() -> None:
@@ -240,14 +240,14 @@ def clear_results() -> None:
     rp = _results_path()
     if rp.exists():
         rp.unlink()
-        print("[Results] Cleared.")
+        console.out("[Results] Cleared.")
 
 
 def clear_all() -> None:
     """Delete both checkpoint and results files for a completely fresh run."""
     clear_checkpoint()
     clear_results()
-    print("[State] All batch runner state cleared. Ready for fresh run.")
+    console.out("[State] All batch runner state cleared. Ready for fresh run.")
 
 
 # ===========================================================================
@@ -292,7 +292,7 @@ def append_result(results_list: list, entry: dict) -> None:
                 json.dump(results_list, f, indent=2)
             os.replace(tmp_path, rp)
         except OSError as e:
-            print(f"[Results] WARNING: Could not write results file ({e}). Continuing.")
+            console.out(f"[Results] WARNING: Could not write results file ({e}). Continuing.")
             # Clean up temp file if it was created
             if tmp_path.exists():
                 try:
@@ -380,7 +380,7 @@ def process_patient(
 
         status = "error" if error_msg else "success"
 
-        print(
+        console.out(
             f"  {run_label} {patient_id} | "
             f"eligible={eligible_count} near_miss={near_miss_count} "
             f"not_evaluable={not_evaluable_count} | "
@@ -425,7 +425,7 @@ def process_patient(
 
     except Exception as e:
         error_msg = f"{type(e).__name__}: {e}"
-        print(f"  {run_label} {patient_id_hint} | EXCEPTION: {error_msg}")
+        console.out(f"  {run_label} {patient_id_hint} | EXCEPTION: {error_msg}")
         return {
             "patient_id": patient_id_hint,
             "status": "exception",
@@ -489,9 +489,11 @@ class _DriftAnnouncer:
                 return False
             self._announced = True
 
-        # Written through tqdm.write for the same reason every other line in
-        # these passes is: builtins.print is redirected while a progress bar is
-        # live, and a raw print would be overwritten by the bar.
+        # Written through console.banner() rather than a bare write: while a
+        # progress bar is live every line has to go through tqdm.write or the
+        # bar's redraw overwrites it. That used to be arranged by hijacking
+        # builtins.print; it is now a property of the console channel, which
+        # the bar registers itself with in run_batch() and run_resample().
         #
         # .requested and .returned are attributes File 13 puts on the exception
         # (item 29b). Read defensively anyway: this runs on the failure path of
@@ -499,26 +501,28 @@ class _DriftAnnouncer:
         # with a traceback nobody asked for.
         requested = getattr(exc, "requested", "<not recorded>")
         returned = getattr(exc, "returned", "<not recorded>")
-        tqdm.write("")
-        tqdm.write("!" * 80)
-        tqdm.write("!!  JUDGING MODEL CHANGED MID-RUN — THIS RUN'S RESULTS MUST NOT BE USED")
-        tqdm.write("!" * 80)
-        tqdm.write(f"!!  requested : {requested}")
-        tqdm.write(f"!!  answered  : {returned}")
-        tqdm.write("!!")
-        tqdm.write("!!  Every patient judged before this point used a different model than")
-        tqdm.write("!!  every patient judged after it, so the corpus is split down the middle")
-        tqdm.write("!!  by a change nothing in the request asked for.")
-        tqdm.write("!!")
-        tqdm.write("!!  The batch is now DRAINING: all remaining patients were queued before")
-        tqdm.write("!!  this was detected and will still run. They will fail the same way and")
-        tqdm.write("!!  write no rows. This banner is printed ONCE; the per-patient failures")
-        tqdm.write("!!  are counted in the pass summary.")
-        tqdm.write("!!")
-        tqdm.write(f"!!  Set MATCHING_MODEL in 'oncotriage/config.py' to {returned!r} only after")
-        tqdm.write("!!  reviewing what changed, add it to PRICING_CONFIG, and re-baseline.")
-        tqdm.write("!" * 80)
-        tqdm.write("")
+        console.banner(
+            "",
+            "!" * 80,
+            "!!  JUDGING MODEL CHANGED MID-RUN — THIS RUN'S RESULTS MUST NOT BE USED",
+            "!" * 80,
+            f"!!  requested : {requested}",
+            f"!!  answered  : {returned}",
+            "!!",
+            "!!  Every patient judged before this point used a different model than",
+            "!!  every patient judged after it, so the corpus is split down the middle",
+            "!!  by a change nothing in the request asked for.",
+            "!!",
+            "!!  The batch is now DRAINING: all remaining patients were queued before",
+            "!!  this was detected and will still run. They will fail the same way and",
+            "!!  write no rows. This banner is printed ONCE; the per-patient failures",
+            "!!  are counted in the pass summary.",
+            "!!",
+            f"!!  Set MATCHING_MODEL in 'oncotriage/config.py' to {returned!r} only after",
+            "!!  reviewing what changed, add it to PRICING_CONFIG, and re-baseline.",
+            "!" * 80,
+            "",
+        )
         return True
 
 
@@ -555,25 +559,25 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
     total_files = len(fhir_files)
     already_done = total_files - total_pending
 
-    print("=" * 80)
-    print("MAIN BATCH PASS")
-    print("=" * 80)
-    print(f"Total patient files:    {total_files}")
-    print(f"Already completed:      {already_done}")
-    print(f"Remaining to process:   {total_pending}")
-    print(f"Concurrent workers:     {MAX_WORKERS}")
-    print()
+    console.out("=" * 80)
+    console.out("MAIN BATCH PASS")
+    console.out("=" * 80)
+    console.out(f"Total patient files:    {total_files}")
+    console.out(f"Already completed:      {already_done}")
+    console.out(f"Remaining to process:   {total_pending}")
+    console.out(f"Concurrent workers:     {MAX_WORKERS}")
+    console.out()
 
     if not pending_files:
-        print("All patients already completed. Skipping main pass.")
+        console.out("All patients already completed. Skipping main pass.")
         return completed_ids, True
 
     batch_success = 0
     batch_error = 0
 
     # Keep the progress bar prominent
-    print()
-    print("*" * 80)
+    console.out()
+    console.out("*" * 80)
     progress = tqdm(
         total=len(pending_files),
         desc="🔬 MAIN PASS PROGRESS",
@@ -604,7 +608,7 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
         except Exception as e:
             batch_error += 1
             progress.update(1)
-            tqdm.write(f"  [CALLBACK ERROR] {type(e).__name__}: {e}")
+            console.out(f"  [CALLBACK ERROR] {type(e).__name__}: {e}")
             return
         
         append_result(results_list, entry)
@@ -620,14 +624,21 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
         
         progress.update(1)
     
-    _original_print = builtins.print
-    
-    def _tqdm_print(*args, **kwargs):
-        """Route all print() calls through tqdm.write() to keep progress bar at bottom."""
-        text = " ".join(str(a) for a in args)
-        tqdm.write(text)
-    
-    builtins.print = _tqdm_print
+    # THE builtins.print MONKEY-PATCH USED TO BE HERE, AND IT IS DELETED.
+    #
+    # It rebound builtins.print to a replacement that took **kwargs and threw
+    # them away, so for the whole of a 22,000-patient run every print(end=""),
+    # print(sep=...), print(file=...) and print(flush=...) in this PROCESS --
+    # in every module and every dependency, not just this one -- silently did
+    # something else. It existed for one real reason: while a tqdm bar is live,
+    # a line written straight to stderr is overwritten by the bar's redraw.
+    #
+    # That reason is served by registering the bar with the console channel.
+    # oncotriage.observability then routes every console line AND every
+    # structured log record through tqdm.write for as long as this registration
+    # stands, which is strictly more than the patch covered -- a patch on
+    # builtins.print cannot see a logging handler at all.
+    _bar_token = console.attach_bar()
     
     # ── WHAT A MatchingModelMismatchError ACTUALLY DOES HERE ────────────────
     #
@@ -682,19 +693,19 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
                 future.result()
 
     except KeyboardInterrupt:
-        print("\n[INTERRUPTED] Waiting for active threads to finish...")
+        console.out("\n[INTERRUPTED] Waiting for active threads to finish...")
         executor.shutdown(wait=True, cancel_futures=True)
-        print("[INTERRUPTED] Checkpoint saved. Safe to resume.")
+        console.out("[INTERRUPTED] Checkpoint saved. Safe to resume.")
 
     finally:
         progress.close()
-        builtins.print = _original_print
+        console.detach_bar(_bar_token)
 
-    print()
-    print("=" * 80)
-    print(f"MAIN BATCH COMPLETE: {batch_success} success, {batch_error} errors")
-    print("=" * 80)
-    print()
+    console.out()
+    console.out("=" * 80)
+    console.out(f"MAIN BATCH COMPLETE: {batch_success} success, {batch_error} errors")
+    console.out("=" * 80)
+    console.out()
 
     return completed_ids, True
 
@@ -723,9 +734,9 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
         graph:         Compiled LangGraph StateGraph (read-only, shared).
         results_list:  In-memory results list (mutated via append_result).
     """
-    print("=" * 80)
-    print("RESAMPLE PASS")
-    print("=" * 80)
+    console.out("=" * 80)
+    console.out("RESAMPLE PASS")
+    console.out("=" * 80)
 
     completed_files = [
         f for f in fhir_files
@@ -733,7 +744,7 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
     ]
 
     if not completed_files:
-        print("No completed patients available for resampling. Skipping.")
+        console.out("No completed patients available for resampling. Skipping.")
         return
 
     actual_resample = min(RESAMPLE_COUNT, len(completed_files))
@@ -744,22 +755,18 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
     rng = random.Random(RESAMPLE_SEED)
     resample_files = rng.sample(completed_files, actual_resample)
 
-    print(f"Resampling {actual_resample} patients (seed={RESAMPLE_SEED}).")
-    print(f"Concurrent workers: {MAX_WORKERS}")
-    print()
+    console.out(f"Resampling {actual_resample} patients (seed={RESAMPLE_SEED}).")
+    console.out(f"Concurrent workers: {MAX_WORKERS}")
+    console.out()
 
     resample_success = 0
     resample_error = 0
 
     progress = tqdm(total=actual_resample, desc="Resample", unit="patient")
 
-    _original_print = builtins.print
-    
-    def _tqdm_print(*args, **kwargs):
-        text = " ".join(str(a) for a in args)
-        tqdm.write(text)
-    
-    builtins.print = _tqdm_print
+    # Same registration as run_batch(); see the note there for what the deleted
+    # builtins.print monkey-patch did and why this replaces it.
+    _bar_token = console.attach_bar()
 
 
     # This pass gets its OWN announcer. Note the callback below takes (future)
@@ -781,7 +788,7 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
         except Exception as e:
             resample_error += 1
             progress.update(1)
-            tqdm.write(f"  [CALLBACK ERROR] {type(e).__name__}: {e}")
+            console.out(f"  [CALLBACK ERROR] {type(e).__name__}: {e}")
             return
 
         append_result(results_list, entry)
@@ -816,17 +823,17 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
                 future.result()
 
     except KeyboardInterrupt:
-        print("\n[INTERRUPTED] Waiting for active threads to finish...")
+        console.out("\n[INTERRUPTED] Waiting for active threads to finish...")
         executor.shutdown(wait=True, cancel_futures=True)
-        print("[INTERRUPTED] Resample interrupted. Results saved.")
+        console.out("[INTERRUPTED] Resample interrupted. Results saved.")
 
     finally:
         progress.close()
-        builtins.print = _original_print
+        console.detach_bar(_bar_token)
 
-    print()
-    print("=" * 80)
-    print(f"RESAMPLE COMPLETE: {resample_success} success, {resample_error} errors")
+    console.out()
+    console.out("=" * 80)
+    console.out(f"RESAMPLE COMPLETE: {resample_success} success, {resample_error} errors")
 
 # ===========================================================================
 # SUMMARY REPORT
@@ -889,42 +896,42 @@ def print_summary(results_list: list, total_wall_time: float, db_path=None) -> N
         key = r["error"][:120]  # truncate very long error strings
         error_counts[key] = error_counts.get(key, 0) + 1
 
-    print()
-    print("=" * 80)
-    print(f"{Project_Name}: BATCH RUN SUMMARY")
-    print("=" * 80)
-    print(f"Total wall time:  {total_wall_time/60:.1f} min")
-    print(f"Results file:     {_results_path()}")
-    print(f"Checkpoint file:  {_checkpoint_path()}")
-    print(f"Database:         {resolve_inference_db_path(db_path)}")
-    print()
+    console.out()
+    console.out("=" * 80)
+    console.out(f"{Project_Name}: BATCH RUN SUMMARY")
+    console.out("=" * 80)
+    console.out(f"Total wall time:  {total_wall_time/60:.1f} min")
+    console.out(f"Results file:     {_results_path()}")
+    console.out(f"Checkpoint file:  {_checkpoint_path()}")
+    console.out(f"Database:         {resolve_inference_db_path(db_path)}")
+    console.out()
 
-    print("--- MAIN PASS ---")
+    console.out("--- MAIN PASS ---")
     if main_stats:
         for k, v in main_stats.items():
-            print(f"  {k:<30} {v}")
+            console.out(f"  {k:<30} {v}")
     else:
-        print("  No main pass records.")
-    print()
+        console.out("  No main pass records.")
+    console.out()
 
-    print("--- RESAMPLE PASS ---")
+    console.out("--- RESAMPLE PASS ---")
     if resample_stats:
         for k, v in resample_stats.items():
-            print(f"  {k:<30} {v}")
+            console.out(f"  {k:<30} {v}")
     else:
-        print("  No resample records.")
-    print()
+        console.out("  No resample records.")
+    console.out()
 
     if error_counts:
-        print("--- ERROR BREAKDOWN ---")
+        console.out("--- ERROR BREAKDOWN ---")
         for msg, count in sorted(error_counts.items(), key=lambda x: -x[1]):
-            print(f"  [{count}x] {msg}")
-        print()
+            console.out(f"  [{count}x] {msg}")
+        console.out()
 
-    print("=" * 80)
-    print("Run complete.")
-    print("=" * 80)
-    print()
+    console.out("=" * 80)
+    console.out("Run complete.")
+    console.out("=" * 80)
+    console.out()
 
 #------------------------------------------------------------------------------
 
@@ -952,34 +959,34 @@ def main():
 
         run_start = time.time()
 
-        print()
-        print("=" * 80)
-        print(f"{Project_Name}: BATCH RUNNER")
-        print("=" * 80)
-        print()
+        console.out()
+        console.out("=" * 80)
+        console.out(f"{Project_Name}: BATCH RUNNER")
+        console.out("=" * 80)
+        console.out()
 
         # ------------------------------------------------------------------
         # 1. Build shared pipeline resources (once, reused for all patients)
         # ------------------------------------------------------------------
-        print("[Setup] Building BM25 index from Qdrant...")
+        console.out("[Setup] Building BM25 index from Qdrant...")
         try:
             bm25_index, nct_ids = build_bm25_index_from_qdrant()
             if not nct_ids:
                 raise ValueError("Qdrant returned 0 trials. Run 11- RAG Trial Indexer first.")
         except Exception as e:
-            print(f"[FATAL] Could not build BM25 index: {e}")
+            console.out(f"[FATAL] Could not build BM25 index: {e}")
             raise SystemExit(1)
 
-        print(f"[Setup] BM25 index ready: {len(nct_ids)} trials.\n")
+        console.out(f"[Setup] BM25 index ready: {len(nct_ids)} trials.\n")
 
-        print("[Setup] Compiling LangGraph pipeline...")
+        console.out("[Setup] Compiling LangGraph pipeline...")
         try:
             graph = build_matching_graph()
         except Exception as e:
-            print(f"[FATAL] Could not compile LangGraph graph: {e}")
+            console.out(f"[FATAL] Could not compile LangGraph graph: {e}")
             raise SystemExit(1)
 
-        print("[Setup] LangGraph pipeline ready.\n")
+        console.out("[Setup] LangGraph pipeline ready.\n")
 
         # ------------------------------------------------------------------
         # 2. Load FHIR patient files
@@ -987,10 +994,10 @@ def main():
         fhir_files = sorted(glob.glob(paths.data_fhir_path + "*.json"))
 
         if not fhir_files:
-            print(f"[FATAL] No FHIR files found in: {paths.data_fhir_path}")
+            console.out(f"[FATAL] No FHIR files found in: {paths.data_fhir_path}")
             raise SystemExit(1)
 
-        print(f"[Setup] Found {len(fhir_files)} FHIR patient files.\n")
+        console.out(f"[Setup] Found {len(fhir_files)} FHIR patient files.\n")
 
         # ------------------------------------------------------------------
         # 3. Load checkpoint and results (resume support)
@@ -1026,7 +1033,7 @@ def main():
                 results_list=results_list,
             )
         else:
-            print("[Resample] Skipped: no successfully completed patients.")
+            console.out("[Resample] Skipped: no successfully completed patients.")
 
         # ------------------------------------------------------------------
         # 6. Final summary
@@ -1041,9 +1048,9 @@ def main():
         main_errors = [r for r in main_results if r["status"] != "success"]
         if not main_errors:
             clear_checkpoint()
-            print("[Checkpoint] Cleared for next fresh run.")
+            console.out("[Checkpoint] Cleared for next fresh run.")
         else:
-            print(f"[Checkpoint] Kept: {len(main_errors)} patients errored. Re-run to retry failures.")
+            console.out(f"[Checkpoint] Kept: {len(main_errors)} patients errored. Re-run to retry failures.")
 
         return results_list
 

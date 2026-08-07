@@ -9,16 +9,27 @@ cancer registry and the MeSH filter as ARGUMENTS rather than reaching for them,
 which is why this module needs no dependency seam of its own -- its callers
 (``retrieval``) pass what ``deps`` handed them.
 
-``format_mesh_resolution`` is the one-line log form, and the two
-MESH_RESOLUTION_* constants are the outcomes that never reach the filter itself,
-so they are named here rather than on MeSHCancerFilter.
+The two MESH_RESOLUTION_* constants are the outcomes that never reach the
+filter itself, so they are named here rather than on MeSHCancerFilter.
+
+``format_mesh_resolution`` WAS here and is deleted (the structured-logging
+pass). It rendered a resolve_patient_mesh() result into one line for the Stage
+3 stage log, and that log line is now a structured record: every count it
+formatted is a field on it, which is more queryable than the string was, and
+the resolved TREES it also rendered are deliberately absent because a MeSH C04
+tree number names the patient's cancer site. It had exactly one caller, so it
+is deleted rather than left as a renderer nothing renders with.
 
 Imports ``oncotriage.registries.mesh`` for the filter type and
 ``specific_cancer_trees``; importing it reads no JSON, because
 ``load_mesh_filter()`` is a function and this module does not call it.
 """
 
+from oncotriage.observability import get_logger
 from oncotriage.registries.mesh import MeSHCancerFilter, specific_cancer_trees
+
+
+log = get_logger(__name__)
 
 
 #------------------------------------------------------------------------------
@@ -78,21 +89,6 @@ def resolve_patient_mesh(conditions: list, cancer_registry, mesh_filter) -> dict
         return _empty_mesh_resolution(MESH_RESOLUTION_NO_CONDITIONS)
 
     return mesh_filter.resolve_patient_trees(valid_conditions, cancer_registry)
-
-
-def format_mesh_resolution(diag: dict) -> str:
-    """One-line summary of a resolve_patient_mesh() result, for stage logs."""
-    parts = [
-        f"{diag['conditions_resolved']}/{diag['conditions_total']} cancer conditions",
-        f"{len(diag['trees'])} trees",
-    ]
-    if diag["pan_only_layers"]:
-        parts.append(f"escalated past {'+'.join(diag['pan_only_layers'])}")
-    if diag["conditions_pan_only"]:
-        parts.append(f"{diag['conditions_pan_only']} pan-cancer-only")
-    if diag["conditions_unmapped"]:
-        parts.append(f"{diag['conditions_unmapped']} unmapped")
-    return f"[{diag['resolution']}] " + ", ".join(parts)
 
 
 def expand_query_from_mesh(conditions: list, cancer_registry, mesh_filter) -> dict:
@@ -194,9 +190,10 @@ def expand_query_from_mesh(conditions: list, cancer_registry, mesh_filter) -> di
     patient_trees = specific_cancer_trees(resolved_trees)
 
     if patient_trees != resolved_trees:
-        print(f"  Stage 1 MeSH guard: dropped "
-              f"{len(resolved_trees) - len(patient_trees)} pan-cancer tree(s) "
-              f"from the patient resolution")
+        log.info("MeSH guard dropped pan-cancer trees from the patient "
+                 "resolution", stage=1, filter="mesh_pan_cancer_guard",
+                 dropped=len(resolved_trees) - len(patient_trees),
+                 kept=len(patient_trees))
         if not patient_trees:
             result["resolution"] = MeSHCancerFilter.RESOLUTION_PAN_ONLY
 

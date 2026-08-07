@@ -38,8 +38,12 @@ from oncotriage.agent.terminal import (
     node_finalize,
     node_no_candidates,
 )
-from oncotriage.config import MAX_GPT4O_RETRIES, Project_Name
+from oncotriage.config import MAX_GPT4O_RETRIES
+from oncotriage.observability import correlation_scope, get_logger
 from oncotriage.utils import resolve_qdrant_collection
+
+
+log = get_logger(__name__)
 
 
 #------------------------------------------------------------------------------
@@ -203,7 +207,7 @@ def build_matching_graph() -> object:
     # --- Compile ---
     graph = workflow.compile()
 
-    print("LangGraph pipeline compiled successfully.")
+    log.info("pipeline compiled", event="graph_compiled")
     return graph
 
 
@@ -227,23 +231,50 @@ def match_patient_to_trials(
 
     Returns:
         Result dictionary with ranked trials, explanations, and metadata
+
+    THIS IS WHERE THE CORRELATION ID IS BORN, and it is the right place for
+    exactly one reason: it is the narrowest scope that contains a whole
+    patient. Opening it in ``run_batch`` would put twelve patients under one ID;
+    opening it inside a node would give the six stages of one patient six IDs
+    and make the run unjoinable.
+
+    ``correlation_scope`` resets its token on the way out, which is what stops
+    a ``ThreadPoolExecutor`` worker from carrying this patient's ID into the
+    next patient scheduled onto the same thread.
+
+    THE ID IS DELIBERATELY NOT STAMPED ONTO ``result``. It was, in a first
+    draft, so that a stored row could be tied back to the lines that produced
+    it -- and that is a contract change wearing the costume of an observability
+    edit. ``result`` is what ``oncotriage/api/server.py`` serialises into the
+    ``POST /match`` response and what ``log_inference`` writes, and this pass
+    promises no behaviour change outside output routing. The join available
+    today is ``patient_id``, which is on every line below AND is a column of
+    ``inferences``. Persisting the ID properly means a new column and a schema
+    migration; it is recorded as a follow-up rather than half-done here.
     """
-    print(f"\n{'='*80}")
-    print(f"{Project_Name}: Matching Patient {patient_data['patient_id']}")
-    print(f"{'='*80}\n")
+    with correlation_scope():
+        log.info("match started", event="match_started",
+                 patient_id=patient_data["patient_id"])
 
-    initial_state = build_initial_state(patient_data)
+        initial_state = build_initial_state(patient_data)
 
-    # Invoke the LangGraph pipeline
-    final_state = graph.invoke(initial_state)
+        # Invoke the LangGraph pipeline
+        final_state = graph.invoke(initial_state)
 
-    result = final_state["result"]
+        result = final_state["result"]
 
-    result["qdrant_collection"] = resolve_qdrant_collection()
+        result["qdrant_collection"] = resolve_qdrant_collection()
 
-    result["patient_data_hash"] = compute_patient_hash(patient_data)
+        result["patient_data_hash"] = compute_patient_hash(patient_data)
 
-    return result
+        log.info("match finished", event="match_finished",
+                 patient_id=patient_data["patient_id"],
+                 eligible=len(result.get("matches") or []),
+                 not_eligible=len(result.get("near_misses") or []),
+                 not_evaluable=len(result.get("not_evaluable") or []),
+                 status="error" if result.get("error") else "ok")
+
+        return result
 
 
 def build_initial_state(patient_data: Dict, ablation_flags: Dict = None) -> Dict:
