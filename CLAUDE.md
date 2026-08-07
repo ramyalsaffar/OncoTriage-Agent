@@ -398,10 +398,11 @@ python tests/test_storage_wipe_all_tables.py                       #  22
 python tests/test_fhir_parser_dict_input.py                        #  29
 python tests/test_ablation_db_isolation.py                         #  72 (was 43; pass 20f-3 added section 5b for the --db parent guard and the checkpoint)
 
-# The render-snapshot test (pass 20f-5). Same shape, same directory, no network,
-# no keys, no spend. It reads a SEEDED SCRATCH database and never the production
-# one, writes nothing in the repository, and is not in the collision matrix.
-python tests/test_dashboard_reproducibility_tab.py                 # 163; ~1.2 s
+# The render-snapshot test (pass 20f-5, extended by 20f-6). Same shape, same
+# directory, no keys, no spend, and "no network" is now MEASURED rather than
+# claimed. It reads a SEEDED SCRATCH database and never the production one,
+# writes nothing in the repository, and is not in the collision matrix.
+python tests/test_dashboard_reproducibility_tab.py                 # 200 (was 163; pass 20f-6 added the template-pool controls, the offline guard and the enrichment-divergence check); ~1.7 s
 python tests/test_dashboard_reproducibility_tab.py --update-snapshot  # regenerate the golden snapshot ON PURPOSE
 pip install -e .                                         # makes `oncotriage` importable anywhere
 ```
@@ -2301,8 +2302,10 @@ harness was searched for first — repository, git history and stash, every
 sibling directory under the project root, both backup trees and every scratch
 directory: `AppTest`, `no_collection_column`, `empty_hash_column` and
 `perfectly_stable` appear in exactly one file, **CLAUDE.md, as prose**. It was
-rebuilt, as `tests/test_dashboard_reproducibility_tab.py`. **163 checks, 1.2 s,
-no network, no keys, no spend.**
+rebuilt, as `tests/test_dashboard_reproducibility_tab.py`. **It shipped at 163
+checks and is 200 after pass 20f-6; 1.7 s, no keys, no spend, and "no network"
+is measured rather than claimed — see "The template pool, the offline guard and
+the enrichment divergence (pass 20f-6)" below.**
 
 **THREE THINGS HAD TO CHANGE FOR IT TO BE A TEST RATHER THAN A FILE MOVE.**
 
@@ -2368,6 +2371,123 @@ directory, patches no repository file, and the only repository file it reads is
 **It does not inventory decorators** — `tests/test_package_invariants.py`
 section 2i already compares them as an exact dict keyed by
 `path::qualified_name`, and that file still reports **247**.
+
+### The template pool, the offline guard and the enrichment divergence (pass 20f-6)
+
+**163 → 200 checks.** Three gaps, all of them places where the file said
+something that nothing in it measured.
+
+**1. THE POOLED PLOTLY TEMPLATE HAD NO CONTROL, AND THE POOL COULD COLLIDE.**
+The snapshot hoists each figure's `layout.template` — ~7 KB of boilerplate on
+every one of the 20 figures — into a digest-keyed pool so the file diffs
+readably, and the docstring said the bytes were still compared. Nothing proved
+it: the two existing plotly plants move a marker colour (5a) and a figure height
+(5h), and **both live outside `layout.template`**. So the one part of the
+snapshot with custom machinery between capture and comparison was the one part
+with no planted defect behind it.
+
+**Stated from the code that builds the pool, not from intent.** The key was
+`sha256(json.dumps(template, sort_keys=True))[:16]` and the value the template
+dict, assigned with `_TEMPLATE_POOL[ref] = template`.
+
+- **Does a figure whose template changes get a new entry?** Yes — the ref is
+  derived from the template, so a changed template is a changed ref, a changed
+  `__template_ref__` in the spec, and a section 2b failure. Nothing is silently
+  reused.
+- **Can two figures with different templates collide onto one entry?** With
+  `sort_keys=True`, **yes, by construction rather than by luck**: two templates
+  differing only in KEY ORDER hash to one ref, the second assignment overwrites
+  the first, and neither the ref in the spec nor the pool digest moves — the
+  digest check sorted keys too, so it was blind to exactly the same thing.
+
+`_template_blob()` serializes with **`sort_keys=False`** now, the exact bytes the
+snapshot stores, so a distinct JSON document can share a ref only through a real
+64-bit sha256 collision — which `_pack_plotly_spec` **records** into
+`_TEMPLATE_POOL_COLLISIONS` rather than absorbing, and section 2c reads. 2c also
+gained: the pool is non-degenerate, every ref a live figure carries is IN the
+pool, the same holds INSIDE the snapshot file, and every pool key IS the digest
+of the bytes under it.
+
+**5m is the plant: one integer ~7 KB deep inside ONE template**
+(`fig_flip_types.layout.template.layout.font.size = 99`). Caught by `plotly`, on
+the `full` scenario. Measured, not assumed: **exactly one of the six figures
+changed its ref, the other five did not, the original pool entry survived beside
+the new one, and no collision was recorded.** Plotly **copies** a named template
+into the figure on assignment — checked before the plant was chosen, because a
+plant that mutated `plotly.io.templates` would have poisoned every render after
+it and looked like a much larger defect. **5n** is the realistic shape of the
+same regression: one figure switched to `plotly_dark`, giving two genuinely
+different templates in one pool at once, both preserved, three distinct refs.
+
+**THE REGENERATION IS THE DANGEROUS PART AND IT WAS PROVED, NOT ASSERTED.**
+Keying on exact bytes changed every ref (`027bcf62442dfca9` →
+`27989c9f28fc96fd`), so the golden file had to be rewritten — and a golden file
+regenerated to accommodate a fix makes whatever the code does correct by
+definition. Both files were **decoded back to the thing they are a compressed
+record OF**: every pooled template spliced back inline, then compared directly.
+**20 figures inlined on each side, 973 items compared across all seven
+scenarios, identical**, with a control (one integer changed inside an inlined
+template) shown to make that comparison fail. The new snapshot is
+**byte-identical across three regenerations** (`a432b500…`), same 4,624 lines.
+
+**2. "NO NETWORK" WAS A DOCSTRING CLAIM.** Every render now runs with
+`socket.socket.connect`, `socket.socket.connect_ex`, `socket.create_connection`
+and `socket.getaddrinfo` replaced by a recorder that **raises** and names the
+calling frame — armed and disarmed around each render, beside the existing
+`sqlite3.connect` recorder. Section 5o reads all seven scenarios and carries the
+control the readings would otherwise be vacuous without: the identical guard
+armed, a real outbound call made, blocked and recorded.
+
+**The imports were measured separately, out of band, with networking genuinely
+unavailable** — `sandbox-exec` with `(deny network*)`, verified to deny a
+connection before it was trusted. The whole file: **exit 0, 200/200, and no
+resolver or connection error anywhere in the output.** Not committed as the way
+to run it, because a test that needs a macOS sandbox profile is a test that
+stops running everywhere else.
+
+**3. THE FRAME THE TEST HANDS THE TAB IS NOT THE FRAME PRODUCTION HANDS IT.**
+The tab takes one argument, the `inferences` frame, and reads `trial_matches`
+**itself** (`load_trial_matches_data()`, its fourth statement) — which is the
+read the decoy control fires on, and why `no_collection_column`, which returns
+above that line, opens nothing at all. But `oncotriage/dashboard/app.py` calls
+`enrich_match_tiers(filtered_df, trial_matches)` **before** passing the frame, so
+production carries four columns this file's frame does not. Equivalent only for
+as long as the tab reads none of them, so section 1c asserts that against the
+shipped source in **both** forms a column can be read by — `df['x']` is a string
+literal, `df.x` is an attribute — **each with its own non-degeneracy probe**.
+The first version had three probes that were all string literals, so the
+attribute half of the walk could be deleted outright and it still passed;
+measured, and it is why `columns` / `empty` (attribute-only in that module) sit
+beside `patient_id` / `nct_id` (literal-only).
+
+**TEN PLANTS, TEN FIRED, AND THREE OF THEM FOUND DEFECTS IN THIS PASS'S OWN
+WORK.** Every new assertion was planted against a COPY of the test file in a
+temp directory, with the shipped file hashed before and after and byte-identical.
+The three defects the plants found — none of them by reading:
+
+- **A short figure list ABORTED THE RUN.** `len({_refs_5m[2], _refs_5n[0],
+  _BASE_REFS[0]}), 3` raises `IndexError` when a defect makes a render produce
+  no figures — so the offline plant, which does exactly that, took section 5o
+  and the whole of section 6 down with it and reported one traceback where it
+  owed ninety-four failures. **This is the defect
+  `tests/test_storage_query_layer.py` already had to fix once**, reproduced
+  inside the file written to prevent that class. `_at()` converts the
+  `IndexError` into a value that makes `check()` FAIL and name what was missing.
+  Re-measured after the fix: the plant reports 101 passed / 94 failed and runs
+  to the summary.
+- **The enrichment scan's non-degeneracy control did not discriminate**, as
+  above.
+- **THE OFFLINE GUARD NAMED ITS OWN LAMBDA.** The four stand-ins were lambdas
+  and `_network_caller` walked back a FIXED two frames, so the frame it reported
+  was the lambda — every message said "this file, the line the lambda is on"
+  whatever had actually called out. **Its control passed anyway**, because it
+  asserted only that the caller string started with this file's basename, and
+  the lambda IS in this file: satisfied for the wrong reason, which is the shape
+  the project's rules exist to catch. The stand-ins are named functions, the
+  guard's own frames are skipped by name, and the control now asserts the
+  reported frame is `_offline_control_call` — an assertion a guard that names
+  itself cannot satisfy.
+
 
 ## Persistence and observability
 

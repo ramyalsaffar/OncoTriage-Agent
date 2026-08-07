@@ -1,6 +1,6 @@
 {
   "plotly_templates": {
-    "027bcf62442dfca9": {
+    "27989c9f28fc96fd": {
       "data": {
         "barpolar": [
           {
@@ -1808,7 +1808,7 @@
                 "text": "Min vs Max Match Score Across Inferences"
               },
               "height": 450,
-              "__template_ref__": "027bcf62442dfca9"
+              "__template_ref__": "27989c9f28fc96fd"
             }
           },
           "use_container_width": true,
@@ -1914,7 +1914,7 @@
               },
               "height": 450,
               "showlegend": false,
-              "__template_ref__": "027bcf62442dfca9"
+              "__template_ref__": "27989c9f28fc96fd"
             }
           },
           "use_container_width": true,
@@ -1968,7 +1968,7 @@
                 }
               },
               "showlegend": false,
-              "__template_ref__": "027bcf62442dfca9"
+              "__template_ref__": "27989c9f28fc96fd"
             }
           },
           "use_container_width": true,
@@ -2034,7 +2034,7 @@
                 }
               },
               "showlegend": false,
-              "__template_ref__": "027bcf62442dfca9"
+              "__template_ref__": "27989c9f28fc96fd"
             }
           },
           "use_container_width": true,
@@ -2083,7 +2083,7 @@
                   "text": "Number of Flips"
                 }
               },
-              "__template_ref__": "027bcf62442dfca9"
+              "__template_ref__": "27989c9f28fc96fd"
             }
           },
           "use_container_width": true,
@@ -2129,7 +2129,7 @@
                   "text": "Number of Flips"
                 }
               },
-              "__template_ref__": "027bcf62442dfca9"
+              "__template_ref__": "27989c9f28fc96fd"
             }
           },
           "use_container_width": true,
@@ -2645,7 +2645,7 @@
                 "text": "Min vs Max Match Score Across Inferences"
               },
               "height": 450,
-              "__template_ref__": "027bcf62442dfca9"
+              "__template_ref__": "27989c9f28fc96fd"
             }
           },
           "use_container_width": true,
@@ -2742,7 +2742,7 @@
               },
               "height": 450,
               "showlegend": false,
-              "__template_ref__": "027bcf62442dfca9"
+              "__template_ref__": "27989c9f28fc96fd"
             }
           },
           "use_container_width": true,
@@ -3371,7 +3371,7 @@
                 "text": "Min vs Max Match Score Across Inferences"
               },
               "height": 450,
-              "__template_ref__": "027bcf62442dfca9"
+              "__template_ref__": "27989c9f28fc96fd"
             }
           },
           "use_container_width": true,
@@ -3468,7 +3468,7 @@
               },
               "height": 450,
               "showlegend": false,
-              "__template_ref__": "027bcf62442dfca9"
+              "__template_ref__": "27989c9f28fc96fd"
             }
           },
           "use_container_width": true,
@@ -3514,7 +3514,7 @@
                 }
               },
               "showlegend": false,
-              "__template_ref__": "027bcf62442dfca9"
+              "__template_ref__": "27989c9f28fc96fd"
             }
           },
           "use_container_width": true,
@@ -3560,7 +3560,7 @@
                 }
               },
               "showlegend": false,
-              "__template_ref__": "027bcf62442dfca9"
+              "__template_ref__": "27989c9f28fc96fd"
             }
           },
           "use_container_width": true,
@@ -3603,7 +3603,7 @@
                   "text": "Number of Flips"
                 }
               },
-              "__template_ref__": "027bcf62442dfca9"
+              "__template_ref__": "27989c9f28fc96fd"
             }
           },
           "use_container_width": true,
@@ -3646,7 +3646,7 @@
                   "text": "Number of Flips"
                 }
               },
-              "__template_ref__": "027bcf62442dfca9"
+              "__template_ref__": "27989c9f28fc96fd"
             }
           },
           "use_container_width": true,
@@ -4336,7 +4336,7 @@
                 "text": "Min vs Max Match Score Across Inferences"
               },
               "height": 450,
-              "__template_ref__": "027bcf62442dfca9"
+              "__template_ref__": "27989c9f28fc96fd"
             }
           },
           "use_container_width": true,
@@ -4433,7 +4433,7 @@
               },
               "height": 450,
               "showlegend": false,
-              "__template_ref__": "027bcf62442dfca9"
+              "__template_ref__": "27989c9f28fc96fd"
             }
           },
           "use_container_width": true,
@@ -4479,7 +4479,7 @@
                 }
               },
               "showlegend": false,
-              "__template_ref__": "027bcf62442dfca9"
+              "__template_ref__": "27989c9f28fc96fd"
             }
           },
           "use_container_width": true,
@@ -4525,7 +4525,7 @@
                 }
               },
               "showlegend": false,
-              "__template_ref__": "027bcf62442dfca9"
+              "__template_ref__": "27989c9f28fc96fd"
             }
           },
           "use_container_width": true,
@@ -4568,7 +4568,7 @@
                   "text": "Number of Flips"
                 }
               },
-              "__template_ref__": "027bcf62442dfca9"
+              "__template_ref__": "27989c9f28fc96fd"
             }
           },
           "use_container_width": true,
@@ -4611,7 +4611,7 @@
                   "text": "Number of Flips"
                 }
               },
-              "__template_ref__": "027bcf62442dfca9"
+              "__template_ref__": "27989c9f28fc96fd"
             }
           },
           "use_container_width": true,

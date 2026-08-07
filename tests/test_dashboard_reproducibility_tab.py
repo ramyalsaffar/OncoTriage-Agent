@@ -67,11 +67,47 @@ text, success and info bodies, expander labels, dataframes as complete CSV text
 plus their column config and height, selectboxes with their KEY, label, option
 list and value, and plotly figures as their complete JSON spec.
 
-The plotly ``layout.template`` -- ~3 KB of identical boilerplate on every figure
--- is replaced by a digest reference and the templates are stored once in a pool
-at the top of the snapshot. Nothing is dropped: a changed template changes the
-digest, and the template bytes themselves are still in the file. It is the
-difference between a snapshot a person can read a diff of and one they cannot.
+THE PLOTLY TEMPLATE POOL, AND WHAT IT IS AND IS NOT BLIND TO
+------------------------------------------------------------
+``layout.template`` is ~7 KB of identical boilerplate on every figure, so it is
+replaced in each spec by a 16-hex-character reference and the templates are
+stored once in a pool at the top of the snapshot. It is the difference between
+a snapshot a person can read a diff of and one they cannot.
+
+That is the one part of the file with custom machinery between capture and
+comparison, and the first version of it was the one part with no planted defect
+behind it -- 5a moves a marker colour and 5h a figure height, and BOTH live
+outside the template, so "a changed template is still compared" rested on
+reading ``_pack_plotly_spec`` rather than on breaking it. 5m and 5n are that
+plant: one integer changed ~7 KB deep inside ONE of the six figures' templates,
+and one figure switched to a different named template.
+
+Two facts about the pool, stated from the code that builds it:
+
+    A figure whose template changes gets a NEW pool entry. The ref is the
+    digest of the template, so a changed template is a changed ref, the spec
+    that carries it differs, and section 2b reports it. Nothing is silently
+    reused, and 5m measures exactly that: one of six refs moves, five do not,
+    and the original entry stays in the pool beside the new one.
+
+    Two DIFFERENT templates cannot share an entry -- now. ``_template_blob``
+    serializes with ``sort_keys=FALSE``, deliberately. The first version sorted,
+    which makes the ref blind to key order: two templates differing only in the
+    order of their keys hashed to one ref, the second silently overwrote the
+    first, and no ``__template_ref__`` and no pool digest moved. That was a
+    distinct JSON document colliding onto one entry by construction. Keying on
+    the exact bytes the snapshot stores removes the case, and what remains -- a
+    real 64-bit sha256 collision -- is RECORDED by the guard in
+    ``_pack_plotly_spec`` and read by section 2c rather than absorbed.
+
+Changing the key changed every ref, so the snapshot was regenerated. A golden
+file regenerated to accommodate a fix makes whatever the code does correct by
+definition, so before the new one was committed both files were decoded back to
+the thing they are a compressed record OF -- the full element capture, every
+pooled template spliced back inline -- and compared directly. 20 figures inlined
+on each side, 973 items compared across all seven scenarios, IDENTICAL, with a
+control (one integer changed inside an inlined template) shown to make that
+comparison fail. The new snapshot is byte-identical across three regenerations.
 
 SIX SCENARIOS, FIVE OF THEM UNREACHABLE FROM ORDINARY DATA
 -----------------------------------------------------------
@@ -124,10 +160,46 @@ It does not inventory decorators. ``tests/test_package_invariants.py`` section
 2i already compares them as an exact dict keyed by ``path::qualified_name``, and
 a second copy is a second thing to keep in step.
 
-NO NETWORK, NO KEYS, NO MODEL, NO SPEND, NO ABSOLUTE PATH, and nothing in the
-repository is written: every plant is applied to a COPY of the module source
-written into a temporary directory, and section 6 hashes the shipped file before
-and after to say so.
+NO NETWORK, MEASURED RATHER THAN CLAIMED
+----------------------------------------
+"No network" used to be a sentence in this docstring with nothing behind it.
+Every render now runs with ``socket.socket.connect``, ``socket.socket.connect_ex``,
+``socket.create_connection`` and ``socket.getaddrinfo`` replaced by a recorder
+that RAISES -- so a render that reached out fails at the call site and names the
+frame it came from, rather than succeeding quietly against a live endpoint.
+Section 5o reads what those recorders saw for all seven scenarios, and its
+CONTROL arms the identical guard and makes a real outbound call, which must be
+blocked and recorded: without it the seven readings are seven looks at a list
+nothing could ever have appended to.
+
+That covers the renders. The IMPORTS were measured separately and out of band,
+by running this whole file under ``sandbox-exec`` with ``(deny network*)`` --
+genuine OS-level unavailability, not a patch this process could undo. Result:
+exit 0, every check passing, and no resolver or connection error anywhere in the
+output. Reported rather than committed, because a test that requires a macOS
+sandbox profile to run is a test that stops running everywhere else.
+
+NO KEYS, NO MODEL, NO SPEND, NO ABSOLUTE PATH, and nothing in the repository is
+written: every plant is applied to a COPY of the module source written into a
+temporary directory, and section 6 hashes the shipped file before and after to
+say so.
+
+WHICH TABLE IS READ BY WHOM
+---------------------------
+The tab takes ONE argument -- the ``inferences`` frame -- and reads
+``trial_matches`` ITSELF, through ``load_trial_matches_data()`` on its fourth
+statement. That is the read the decoy control in 5l fires on, and it is why six
+of the seven scenarios open the database exactly once while
+``no_collection_column``, which returns above that line, opens nothing.
+
+``oncotriage/dashboard/app.py`` does not hand it the raw frame: it calls
+``enrich_match_tiers(filtered_df, trial_matches)`` first, so production adds
+four columns this file's frame does not have. That is equivalent only for as
+long as the tab reads none of them, so section 1c asserts it against the shipped
+source in both forms a column can be read by -- ``df['x']`` is a string literal,
+``df.x`` is an attribute -- each with its own non-degeneracy probe, because the
+first version used three probes that were all string literals and would have
+passed with the attribute half of the walk deleted.
 
 WHY IT IS NOT IN tests/run_serial_tests.py, derived rather than assumed: it
 writes only inside a temporary directory, it patches no file in the repository,
@@ -178,9 +250,11 @@ import importlib
 import json
 import pickle
 import shutil
+import socket
 import sqlite3
 import tempfile
 import time
+import traceback
 from pathlib import Path
 
 import pandas as pd
@@ -550,6 +624,27 @@ def _frame_for(scenario_df_source, prefix, mutation):
 # in a file whose whole purpose is being read as a diff.
 
 _TEMPLATE_POOL = {}
+_TEMPLATE_POOL_BLOBS = {}
+_TEMPLATE_POOL_COLLISIONS = []
+
+
+def _template_blob(template):
+    """The exact serialization the pool is keyed on.
+
+    ``sort_keys=False``, DELIBERATELY, and it is the one thing about this pool
+    that is not obvious. The first version keyed on the SORTED serialization,
+    which makes the ref blind to key order -- so two templates differing only in
+    the order of their keys hash to one ref, the second silently overwrites the
+    first in the pool, the ``__template_ref__`` in every spec stays put, and
+    NOTHING in this file reports it. That is a distinct JSON document colliding
+    onto one entry by construction rather than by luck, inside the one part of
+    the snapshot with custom machinery between capture and comparison.
+
+    Keying on the exact bytes the snapshot stores removes the case: two
+    templates share a ref only through a real 64-bit sha256 collision, and the
+    guard in ``_pack_plotly_spec`` RECORDS that rather than absorbing it.
+    """
+    return json.dumps(template, sort_keys=False, separators=(",", ":"))
 
 
 def _pack_plotly_spec(spec_text):
@@ -557,8 +652,14 @@ def _pack_plotly_spec(spec_text):
     spec = json.loads(spec_text)
     template = spec.get("layout", {}).pop("template", None)
     if template is not None:
-        blob = json.dumps(template, sort_keys=True, separators=(",", ":"))
+        blob = _template_blob(template)
         ref = hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+        if _TEMPLATE_POOL_BLOBS.get(ref, blob) != blob:
+            # Two different templates under one ref. Not raised -- this runs
+            # inside the capture, where a raise would be reported as a render
+            # failure and name the wrong thing. Section 2c reads the list.
+            _TEMPLATE_POOL_COLLISIONS.append(ref)
+        _TEMPLATE_POOL_BLOBS[ref] = blob
         _TEMPLATE_POOL[ref] = template
         spec["layout"]["__template_ref__"] = ref
     return spec
@@ -667,8 +768,95 @@ def _recording_connect(database, *args, **kwargs):
     return _REAL_CONNECT(database, *args, **kwargs)
 
 
+# --- the offline guard -------------------------------------------------------
+#
+# "No network" was a claim in this file's docstring that nothing measured. It is
+# measured now, the way the database isolation is: by making the thing fail and
+# recording every attempt, not by reading the import list. The three primitives
+# below are every way this process can open an outbound connection --
+# ``socket.create_connection`` builds a ``socket.socket`` and calls ``connect``
+# on it, so patching the class method covers the helper as well, and both are
+# patched anyway rather than reasoned about. ``getaddrinfo`` is included because
+# a resolver call is an outbound packet even when no connection follows it.
+#
+# It RAISES as well as records: a render that reaches the network must fail
+# audibly at the call site rather than continue against a stub. The raise lands
+# inside the AppTest script run, so it also surfaces through `capture.exception`
+# and section 2a's "no scenario raised" check.
+
+_NETWORK_ATTEMPTS = []
+_REAL_SOCKET_CONNECT = socket.socket.connect
+_REAL_SOCKET_CONNECT_EX = socket.socket.connect_ex
+_REAL_CREATE_CONNECTION = socket.create_connection
+_REAL_GETADDRINFO = socket.getaddrinfo
+
+
+def _blocked(call_name, target):
+    where = _network_caller()
+    _NETWORK_ATTEMPTS.append({"call": call_name, "target": repr(target),
+                              "caller": where})
+    raise OSError(f"[offline guard] {call_name} to {target!r} blocked; "
+                  f"attempted from {where}")
+
+
+def _guard_connect(self, address, *a, **k):
+    return _blocked("socket.connect", address)
+
+
+def _guard_connect_ex(self, address, *a, **k):
+    return _blocked("socket.connect_ex", address)
+
+
+def _guard_create_connection(address, *a, **k):
+    return _blocked("socket.create_connection", address)
+
+
+def _guard_getaddrinfo(host, port, *a, **k):
+    return _blocked("socket.getaddrinfo", (host, port))
+
+
+# THE FOUR STAND-INS ARE NAMED FUNCTIONS, NOT LAMBDAS, and that is what makes
+# `_network_caller` able to answer. The first version used lambdas and walked
+# back a FIXED two frames, so the frame it named was its own lambda -- every
+# report said "this file, the line the lambda is on", whatever had actually
+# called out. Its control passed anyway, because the control's caller is also
+# this file: the assertion was satisfied for the wrong reason. Measured, not
+# noticed by reading. The guard's own frames are skipped BY NAME now, and the
+# control below asserts the reported frame is the function that made the call.
+_GUARD_FRAMES = {"_blocked", "_network_caller", "_guard_connect",
+                 "_guard_connect_ex", "_guard_create_connection",
+                 "_guard_getaddrinfo"}
+
+
+def _network_caller():
+    """The innermost frame outside this guard and the socket module."""
+    for frame in reversed(traceback.extract_stack()):
+        if os.path.basename(frame.filename) == "socket.py":
+            continue
+        if frame.name in _GUARD_FRAMES:
+            continue
+        return f"{os.path.basename(frame.filename)}:{frame.lineno} in {frame.name}"
+    return "unknown"
+
+
+def _arm_offline_guard():
+    socket.socket.connect = _guard_connect
+    socket.socket.connect_ex = _guard_connect_ex
+    socket.create_connection = _guard_create_connection
+    socket.getaddrinfo = _guard_getaddrinfo
+
+
+def _disarm_offline_guard():
+    socket.socket.connect = _REAL_SOCKET_CONNECT
+    socket.socket.connect_ex = _REAL_SOCKET_CONNECT_EX
+    socket.create_connection = _REAL_CREATE_CONNECTION
+    socket.getaddrinfo = _REAL_GETADDRINFO
+
+
 def _render(module_name, df, extra_path=""):
-    """Render one frame through one module. Returns (capture, connected paths).
+    """Render one frame through one module.
+
+    Returns (capture, connected sqlite paths, attempted network calls).
 
     The cache is cleared first so every render actually opens the database --
     without that only the first render of the run would, and the isolation
@@ -683,16 +871,19 @@ def _render(module_name, df, extra_path=""):
 
     st.cache_data.clear()
     del _CONNECTED_PATHS[:]
+    del _NETWORK_ATTEMPTS[:]
     sqlite3.connect = _recording_connect
     _dashboard_data.sqlite3.connect = _recording_connect
+    _arm_offline_guard()
     try:
         at = AppTest.from_string(script, default_timeout=120)
         at.run()
     finally:
+        _disarm_offline_guard()
         sqlite3.connect = _REAL_CONNECT
         _dashboard_data.sqlite3.connect = _REAL_CONNECT
 
-    return _capture_tree(at), list(_CONNECTED_PATHS)
+    return _capture_tree(at), list(_CONNECTED_PATHS), list(_NETWORK_ATTEMPTS)
 
 
 # ===========================================================================
@@ -805,6 +996,52 @@ _ALL_INFERENCES = _dashboard_data.load_inferences_data()
 check("1b  ...and the dashboard loader reads it back",
       len(_ALL_INFERENCES), len(_inf_rows))
 
+# WHICH TABLE IS READ BY WHOM, and why the frame handed over is the raw one.
+# The tab takes ONE argument, the `inferences` frame, and reads `trial_matches`
+# ITSELF -- `load_trial_matches_data()` at the top of the render, which is what
+# every scenario but `no_collection_column` is seen to open in 5l. This file
+# hands it exactly that: `load_inferences_data()`, sliced by patient-id prefix.
+#
+# `oncotriage/dashboard/app.py` does NOT hand it that. It calls
+# `enrich_match_tiers(filtered_df, trial_matches)` first, so in production the
+# frame carries four extra columns. Handing over the un-enriched frame is
+# equivalent only for as long as the tab reads none of them -- so that is
+# asserted against the shipped source rather than assumed, in both reference
+# forms a column can be read by (`df['x']` is a string constant, `df.x` is an
+# attribute). If the tab ever starts reading one, this frame stops being
+# representative of production and this check says so instead of the test
+# quietly rendering a branch the dashboard never takes.
+_ENRICHED_COLUMNS = {"full_match_count", "partial_match_count",
+                     "unconfirmed_match_count", "match_tier"}
+_REPRO_TREE = ast.parse(_REPRO_SOURCE)
+_REPRO_STRING_LITERALS = set()
+_REPRO_ATTRIBUTES = set()
+for _node in ast.walk(_REPRO_TREE):
+    if isinstance(_node, ast.Constant) and isinstance(_node.value, str):
+        _REPRO_STRING_LITERALS.add(_node.value)
+    elif isinstance(_node, ast.Attribute):
+        _REPRO_ATTRIBUTES.add(_node.attr)
+_REPRO_NAMES_USED = _REPRO_STRING_LITERALS | _REPRO_ATTRIBUTES
+
+check("1c  the frame handed to the tab is the raw inferences frame, and the tab "
+      "reads none of the four columns app.py's enrich_match_tiers adds",
+      _ENRICHED_COLUMNS & _REPRO_NAMES_USED, set())
+# THE TWO FORMS GET SEPARATE CONTROLS. The first version asserted one union
+# against three column names that all appear as STRING LITERALS, so the
+# attribute half of the walk could be deleted outright and the check still
+# passed -- measured, not supposed. `columns` and `empty` appear in this module
+# only as attributes and `patient_id` and friends only as literals, so each
+# branch now has a probe no other branch can satisfy.
+check("1c  ...and the STRING-LITERAL half of that scan can see a column name, "
+      "so the empty result above is a finding, not a broken walk",
+      {"patient_id", "qdrant_collection", "nct_id"} <= _REPRO_STRING_LITERALS, True)
+check("1c  ...and the ATTRIBUTE half can too — a `df.match_tier` read must not "
+      "escape it just because `df['match_tier']` would not",
+      {"columns", "empty"} <= _REPRO_ATTRIBUTES, True)
+check("1c  ...and the tab reads trial_matches itself rather than receiving it — "
+      "the frame this file passes carries no trial-match column",
+      _ENRICHED_COLUMNS & set(_ALL_INFERENCES.columns), set())
+
 
 # ===========================================================================
 # SECTION 2: EVERY SCENARIO, ELEMENT FOR ELEMENT, AGAINST THE SNAPSHOT
@@ -817,18 +1054,28 @@ print("=" * 70)
 
 _CAPTURES = {}
 _CONNECTS = {}
+_NETWORK = {}
 
 for _name, _prefix, _mutation in _SCENARIOS:
     _frame = _frame_for(_ALL_INFERENCES, _prefix, _mutation)
-    _cap, _conn = _render("oncotriage.dashboard.tabs.reproducibility", _frame)
+    _cap, _conn, _net = _render("oncotriage.dashboard.tabs.reproducibility", _frame)
     _CAPTURES[_name] = _cap
     _CONNECTS[_name] = _conn
+    _NETWORK[_name] = _net
     print(f"  rendered {_name:22s} {len(_cap['element_order']):4d} elements, "
           f"{len(_cap['metrics']):2d} metrics, {len(_cap['dataframes'])} dataframes, "
           f"{len(_cap['plotly'])} figures")
 
+# THE POOL AS THE SCENARIOS LEFT IT, frozen by COPY. `_TEMPLATE_POOL` keeps
+# filling for the rest of the run -- section 5's template plants each add an
+# entry to it on purpose -- and the snapshot must carry the seven scenarios'
+# templates and nothing else. Binding the live dict here (which is what the
+# first version did) makes the file that is written depend on where in this
+# file the write happens to sit.
+_SCENARIO_TEMPLATE_POOL = dict(_TEMPLATE_POOL)
+
 _LIVE = {
-    "plotly_templates": _TEMPLATE_POOL,
+    "plotly_templates": _SCENARIO_TEMPLATE_POOL,
     "literals": _literals_from_module(_repro),
     "scenarios": _CAPTURES,
 }
@@ -888,12 +1135,38 @@ for _name, _, _ in _SCENARIOS:
                             break
             check(f"2b  {_name}.{_field} matches the snapshot", _detail, "no difference")
 
+_SNAP_POOL = _SNAP.get("plotly_templates", {})
+
+# Non-degeneracy first. A pool that came back empty would satisfy every
+# comparison below while proving that no template was ever captured.
+_LIVE_REFS = {f["spec"].get("layout", {}).get("__template_ref__")
+              for c in _CAPTURES.values() for f in c["plotly"]}
+_SNAP_REFS = {f["spec"].get("layout", {}).get("__template_ref__")
+              for c in _SNAP.get("scenarios", {}).values() for f in c.get("plotly", [])}
+
+check("2c  the pool is non-degenerate — at least one template was captured and "
+      "every figure carries a ref",
+      bool(_SCENARIO_TEMPLATE_POOL) and _LIVE_REFS and None not in _LIVE_REFS, True)
+check("2c  every ref a live figure carries is IN the pool (a hoisted template "
+      "that never made it into the pool would be dropped, not compared)",
+      _LIVE_REFS - set(_SCENARIO_TEMPLATE_POOL), set())
+check("2c  ...and the same holds inside the snapshot file itself, so a pool "
+      "written short is caught rather than silently believed",
+      _SNAP_REFS - set(_SNAP_POOL), set())
 check("2c  every plotly template referenced by a scenario is in the pool",
-      sorted(_TEMPLATE_POOL), sorted(_SNAP.get("plotly_templates", {})))
-check("2c  ...and the template bytes themselves are unchanged",
-      {k: _digest_text(json.dumps(v, sort_keys=True)) for k, v in _TEMPLATE_POOL.items()},
-      {k: _digest_text(json.dumps(v, sort_keys=True))
-       for k, v in _SNAP.get("plotly_templates", {}).items()})
+      sorted(_SCENARIO_TEMPLATE_POOL), sorted(_SNAP_POOL))
+# EXACT bytes, key order included. `sort_keys=True` here would make this blind
+# to precisely the thing `_template_blob` was changed to stop being blind to.
+check("2c  ...and the template bytes themselves are unchanged, key order included",
+      {k: _digest_text(_template_blob(v)) for k, v in _SCENARIO_TEMPLATE_POOL.items()},
+      {k: _digest_text(_template_blob(v)) for k, v in _SNAP_POOL.items()})
+check("2c  ...and each pool key IS the digest of the bytes stored under it, so "
+      "the ref is derived from the template rather than assigned beside it",
+      {k for k, v in _SNAP_POOL.items()
+       if hashlib.sha256(_template_blob(v).encode("utf-8")).hexdigest()[:16] != k},
+      set())
+check("2c  no two distinct templates were pooled under one ref",
+      _TEMPLATE_POOL_COLLISIONS, [])
 
 
 # ===========================================================================
@@ -989,19 +1262,52 @@ _BASE = _SNAP.get("scenarios", {}).get("full") or _CAPTURES["full"]
 
 
 def _plant_and_render(label, old, new, fields, expect_caught=True, count=1):
-    """Plant, render the 'full' frame through the copy, report which fields moved."""
+    """Plant, render the 'full' frame through the copy, report which fields moved.
+
+    Returns (moved fields, capture). The capture is returned because the two
+    template plants need the per-figure refs out of it, not only the verdict.
+    """
     name, occurrences = _plant_module(old, new, count)
     check(f"5.  [{label}] the planted text occurs exactly once in the module",
           occurrences, 1)
-    cap, _ = _render(name, _FULL_FRAME, extra_path=_PLANT_DIR)
+    cap, _, _ = _render(name, _FULL_FRAME, extra_path=_PLANT_DIR)
     if cap["exception"]:
         check(f"5.  [{label}] the planted module rendered without raising",
               cap["exception"], [])
-        return set()
+        return set(), cap
     moved = {f for f in _FIELDS if cap[f] != _BASE[f]}
     for field in fields:
         check(f"5.  [{label}] caught by {field}", field in moved, expect_caught)
-    return moved
+    return moved, cap
+
+
+def _figure_refs(cap):
+    """The template ref of every figure in a capture, in document order."""
+    return [f["spec"].get("layout", {}).get("__template_ref__") for f in cap["plotly"]]
+
+
+def _at(seq, index, label):
+    """``seq[index]``, or a string naming the absence.
+
+    A check that indexes a list which a defect can SHORTEN raises, and a raise
+    at module level in a file like this one aborts the run and hides every
+    check below it -- one traceback where ten failures were owed.
+    ``tests/test_storage_query_layer.py`` had to fix exactly this, and the
+    first version of section 5n reproduced it: a planted defect that made a
+    render produce no figures at all took `_refs_5n[0]` with it and section 5o
+    and the whole of section 6 never ran. Measured against that plant, not
+    anticipated.
+
+    The IndexError is not swallowed: it is converted into a value that makes
+    the caller's `check()` FAIL and say what was missing.
+    """
+    try:
+        return seq[index]
+    except IndexError:
+        return f"<no {label} at index {index}: only {len(seq)} captured>"
+
+
+_BASE_REFS = _figure_refs(_BASE)
 
 
 # --- 5a  a rendered colour ---------------------------------------------------
@@ -1016,7 +1322,7 @@ _name_5b, _occ_5b = _plant_module(
     "'Full Match ↔ Partial Match': '#2ca02c',",
     "'Full Match ↔ Partial Match': '#2ecc71',")
 check("5.  [5b unreachable colour] the planted text occurs exactly once", _occ_5b, 1)
-_cap_5b, _ = _render(_name_5b, _FULL_FRAME, extra_path=_PLANT_DIR)
+_cap_5b, _, _ = _render(_name_5b, _FULL_FRAME, extra_path=_PLANT_DIR)
 _moved_5b = {f for f in _FIELDS if _cap_5b[f] != _BASE[f]}
 check("5b  the RENDER comparison sees nothing — this is pass 20f-4's actual "
       "shipped defect, and it is invisible to every element",
@@ -1040,7 +1346,7 @@ _ORDER_NEW = """    'Zzz Placeholder Category': {
     },
     'Temporal / Resolved Status': {
         'keywords': ["""
-_moved_5c = _plant_and_render(
+_moved_5c, _ = _plant_and_render(
     "5c failure-category key order", _ORDER_OLD, _ORDER_NEW, ())
 check("5c  a reordered _FAILURE_CATEGORIES is caught by the literal check",
       _literals_from_source(os.path.join(_PLANT_DIR, f"repro_plant_{_PLANT_SEQ[0]}.py"))
@@ -1112,6 +1418,74 @@ _plant_and_render(
     ("element_order", "captions", "markdown"))
 
 
+# --- 5m  INSIDE layout.template ITSELF ---------------------------------------
+# The one part of the snapshot with custom machinery between capture and
+# comparison was the one part with no plant behind it: 5a moves a marker colour
+# and 5h a figure height, and BOTH live outside `layout.template`. So the claim
+# that a changed template is still compared rested on reading `_pack_plotly_spec`
+# rather than on breaking it.
+#
+# This plant changes ONE integer ~7 KB deep inside the template of ONE of the
+# six figures the 'full' scenario renders, and touches nothing else. Measured
+# before it was chosen: plotly COPIES a named template into the figure on
+# assignment, so mutating `fig.layout.template` leaves `plotly.io.templates`
+# and every other figure in this process untouched -- a plant that corrupted the
+# registry would poison the renders after it and look like a much larger defect.
+
+_moved_5m, _cap_5m = _plant_and_render(
+    "5m one field inside layout.template",
+    "    return fig_flip_types",
+    "    fig_flip_types.layout.template.layout.font.size = 99\n"
+    "    return fig_flip_types",
+    ("plotly",))
+
+_refs_5m = _figure_refs(_cap_5m)
+_new_5m = set(_TEMPLATE_POOL) - set(_SCENARIO_TEMPLATE_POOL)
+
+check("5m  the mutated template produced a NEW pool entry — it did not reuse "
+      "the entry the unmutated template already had",
+      len(_new_5m), 1)
+check("5m  ...and the pool kept the original entry alongside it, so the new "
+      "template did not overwrite the old one",
+      set(_SCENARIO_TEMPLATE_POOL) <= set(_TEMPLATE_POOL), True)
+check("5m  ...still with no two distinct templates under one ref",
+      _TEMPLATE_POOL_COLLISIONS, [])
+check("5m  exactly ONE of the six figures changed its ref",
+      sum(1 for a, b in zip(_refs_5m, _BASE_REFS) if a != b), 1)
+check("5m  ...and it is the flip-type chart, the figure the plant edits "
+      "(figure 2 of 6 in document order)",
+      [i for i, (a, b) in enumerate(zip(_refs_5m, _BASE_REFS)) if a != b], [2])
+check("5m  ...and the other five still carry the unmutated ref, so the change "
+      "was not smeared across the pool",
+      [r for i, r in enumerate(_refs_5m) if i != 2],
+      [r for i, r in enumerate(_BASE_REFS) if i != 2])
+
+# --- 5n  A WHOLE DIFFERENT TEMPLATE ------------------------------------------
+# The realistic version of the same defect: somebody restyles one chart. Two
+# genuinely different templates are then live in one pool at once, which is the
+# state the collision question is about.
+_moved_5n, _cap_5n = _plant_and_render(
+    "5n one figure switched to a different named template",
+    "        template='plotly_white',\n        xaxis=dict(range=[-0.05, 1.05]),",
+    "        template='plotly_dark',\n        xaxis=dict(range=[-0.05, 1.05]),",
+    ("plotly",))
+
+_refs_5n = _figure_refs(_cap_5n)
+
+check("5n  the swapped template is a second NEW pool entry",
+      len(set(_TEMPLATE_POOL) - set(_SCENARIO_TEMPLATE_POOL) - _new_5m), 1)
+check("5n  exactly ONE of the six figures changed its ref",
+      sum(1 for a, b in zip(_refs_5n, _BASE_REFS) if a != b), 1)
+check("5n  ...and it is the min/max scatter, figure 0 of 6",
+      [i for i, (a, b) in enumerate(zip(_refs_5n, _BASE_REFS)) if a != b], [0])
+check("5n  ...with the two mutated templates distinct from each other and from "
+      "the original (three refs, not one absorbing the others)",
+      len({_at(_refs_5m, 2, "5m figure ref"),
+           _at(_refs_5n, 0, "5n figure ref"),
+           _at(_BASE_REFS, 0, "baseline figure ref")}), 3)
+check("5n  ...and still no collisions", _TEMPLATE_POOL_COLLISIONS, [])
+
+
 # --- 5l  THE ISOLATION ASSERTION ITSELF -------------------------------------
 # Section 1 asserts the render only ever opened the scratch database. Run the
 # same assertion against a DECOY standing in for a wrong path and it must FAIL.
@@ -1154,8 +1528,8 @@ check("5l  ...and every other scenario opened exactly the scratch database, so "
        if s != "no_collection_column"})
 
 _paths._RESOLVED["inferences_path"] = _DECOY_DB
-_, _decoy_connects = _render("oncotriage.dashboard.tabs.reproducibility",
-                             _FULL_FRAME)
+_, _decoy_connects, _ = _render("oncotriage.dashboard.tabs.reproducibility",
+                                _FULL_FRAME)
 _paths._RESOLVED["inferences_path"] = _SCRATCH_DB
 
 check("5l  CONTROL: pointed at a decoy database, the identical assertion FAILS",
@@ -1164,6 +1538,67 @@ check("5l  ...and the decoy is what it opened, so the control failed for the "
       "reason claimed",
       {os.path.abspath(p) for p in _decoy_connects},
       {os.path.abspath(_DECOY_DB)})
+
+
+# --- 5o  NO OUTBOUND CONNECTION, MEASURED RATHER THAN READ -------------------
+# "No network" was a docstring claim with nothing behind it. Every render above
+# ran with `socket.socket.connect`, `socket.socket.connect_ex`,
+# `socket.create_connection` and `socket.getaddrinfo` replaced by a recorder
+# that RAISES, so a render that reached out would have failed at the call site
+# and named it. What follows reads what those recorders saw.
+
+print()
+print("  --- 5o the offline guard ---")
+
+for _scn, _attempts in _NETWORK.items():
+    check(f"5o  [{_scn}] the render attempted no outbound connection",
+          _attempts, [])
+
+check("5o  ...which is not a claim about an unarmed trap: the guard is armed "
+      "and disarmed around every render, and is disarmed now",
+      (socket.socket.connect is _REAL_SOCKET_CONNECT
+       and socket.create_connection is _REAL_CREATE_CONNECTION
+       and socket.getaddrinfo is _REAL_GETADDRINFO), True)
+
+# CONTROL: arm the identical guard and make the identical call. It must raise,
+# and it must record what it blocked -- otherwise the seven checks above are
+# seven readings of a list nothing could ever have appended to.
+def _offline_control_call():
+    """Named on purpose: 5o asserts the guard reports THIS frame.
+
+    `basename(__file__)` alone would not discriminate -- the guard's own
+    stand-ins live in this file too, so a guard that named itself would satisfy
+    it. Naming the function that made the call is the assertion that can only
+    be satisfied by walking the stack correctly.
+    """
+    socket.create_connection(("clinicaltrials.gov", 443), timeout=1)
+
+
+_arm_offline_guard()
+del _NETWORK_ATTEMPTS[:]
+_control_raised = False
+try:
+    _offline_control_call()
+except OSError as _exc:
+    _control_raised = "[offline guard]" in str(_exc)
+finally:
+    _disarm_offline_guard()
+
+check("5o  CONTROL: the armed guard blocks a real outbound call", _control_raised, True)
+check("5o  ...and records the call and its target",
+      [(a["call"], a["target"]) for a in _NETWORK_ATTEMPTS],
+      [("socket.create_connection", repr(("clinicaltrials.gov", 443)))])
+check("5o  ...naming the frame that made the call, not one of its own",
+      _NETWORK_ATTEMPTS[0]["caller"].endswith(" in _offline_control_call")
+      if _NETWORK_ATTEMPTS else "nothing recorded", True)
+check("5o  ...and in this file, at a real line",
+      _NETWORK_ATTEMPTS[0]["caller"].startswith(os.path.basename(__file__) + ":")
+      if _NETWORK_ATTEMPTS else "nothing recorded", True)
+del _NETWORK_ATTEMPTS[:]
+
+check("5o  ...and the guard is off again afterwards, so nothing below runs "
+      "against a patched socket module",
+      socket.create_connection is _REAL_CREATE_CONNECTION, True)
 
 
 # ===========================================================================
