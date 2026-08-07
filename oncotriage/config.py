@@ -115,6 +115,55 @@ EMBEDDING_DIM = 1536
 # gpt-4o-2024-08-06 -- but the pipeline no longer assumes it.
 MATCHING_MODEL = "gpt-5.6-terra"  # For criterion-level evaluation
 
+# CROSS_ENCODER_MODEL is the Stage 3 re-ranker's HuggingFace checkpoint, and
+# before pass 20f-2 it was WRITTEN OUT SIX TIMES with no constant and no check
+# (oncotriage/agent/deps.py twice, oncotriage/api/server.py,
+# oncotriage/storage/database_logger.py, oncotriage/fixtures/capture.py, and a
+# row seed in tests/test_storage_query_layer.py).
+#
+# THE PAIR THAT MATTERS IS THE TOKENIZER AND THE CHECKPOINT. deps.py loads
+# AutoTokenizer.from_pretrained(...) and
+# AutoModelForSequenceClassification.from_pretrained(...) independently. A
+# cross-encoder scores a (query, document) pair by tokenizing both with the
+# tokenizer that was trained with the weights: give it a tokenizer from another
+# checkpoint and the token IDs address a different vocabulary than the
+# embedding matrix was trained on. transformers raises nothing for that -- it
+# will happily run a BERT tokenizer into a BERT-shaped model -- so the run
+# produces scores, node_cross_encoder_rerank sorts them, RERANK_SCORE_THRESHOLD
+# drops some, and the only symptom is that the ranking is noise. That is the
+# same shape as the BM25 vocabulary hazard oncotriage/embedding.py exists for,
+# with the same absence of any error to notice.
+#
+# WHY IT IS HERE AND NOT BESIDE ITS LOADER, which is where the BM25 precedent
+# put BM25_SPARSE_MODEL_NAME. Two reasons, and the first one is decisive rather
+# than aesthetic:
+#
+#   1. LAYERING. oncotriage/storage/database_logger.py writes this string into
+#      inferences.cross_encoder_model on every row, and `storage` may not import
+#      `agent` -- the dependency direction in oncotriage/__init__.py has storage
+#      below the agent, and an accessor module for the agent's models is the
+#      wrong place for a column value the logger needs. `config` is already
+#      imported by all four package readers (deps, server, database_logger,
+#      fixtures.capture) and imports none of them.
+#   2. FAMILY. This is a model IDENTITY, the same kind of fact as
+#      EMBEDDING_MODEL and MATCHING_MODEL directly above it: a string naming
+#      which model answers, reported by GET /pipeline/info beside those two and
+#      logged beside them per row. Three model identities in three places would
+#      be the arrangement that let this one rot in the first place.
+#
+# BM25_SPARSE_MODEL_NAME STAYS IN oncotriage/embedding.py, and the asymmetry is
+# argued rather than tolerated: that name has exactly one consumer that matters
+# -- the single construction site in the same file -- and its comment carries
+# the "changing it rebuilds the index" warning, which belongs against the line
+# that builds the encoder. This one has readers in four subpackages that must
+# not import one another, which is a constraint that name does not have.
+#
+# CHANGING IT INVALIDATES NOTHING ON DISK, unlike the BM25 name: the
+# cross-encoder scores at query time and writes no vectors. It DOES change every
+# ranking, so the twelve characterization fixtures would replay as misses on
+# recordings.cross_encoder and would have to be recaptured -- which costs money.
+CROSS_ENCODER_MODEL = "ncbi/MedCPT-Cross-Encoder"
+
 # Matching parameters
 TOP_K_CANDIDATES = 40  # Top N of trials to evaluate initially with cross encoder
 BM25_RETRIEVAL_SIZE = 75  # Trials from BM25 search
@@ -141,7 +190,23 @@ RRF_POOL_SIZE = 100 # Maximum candidates passed from RRF fusion to cross-encoder
 # identical input can now produce different verdicts across runs. MATCHING_SEED
 # below is the only remaining lever and it is best-effort.
 MATCHING_TEMPERATURE = None  # gpt-5.6-terra rejects any value but its default
-EXPANSION_TEMPERATURE = 0  # Deterministic query expansion (Stage 1 uses no LLM)
+#
+# EXPANSION_TEMPERATURE WAS HERE AND IS DELETED (pass 20f-2). It read
+# `EXPANSION_TEMPERATURE = 0  # Deterministic query expansion (Stage 1 uses no
+# LLM)`, and the comment was the whole finding: a temperature for a stage that
+# issues no LLM call cannot have an effect, and its own line said so. Nothing in
+# the repository read it -- checked by tests/test_package_invariants.py check
+# 2h, which is what surfaced it once pass 20e deleted the shim whose
+# re-export counted as a read.
+#
+# IT IS A DOCUMENTATION DEFECT RATHER THAN A LEFTOVER, which is why deleting it
+# is the fix rather than a tidy-up. CLAUDE.md tells an operator that every
+# tunable lives in this file; an operator who sets a value here is entitled to
+# an effect, and this one silently had none. Compare MATCHING_TEMPERATURE
+# immediately above, which is ALSO not sent to the API and is deliberately kept:
+# it is recorded into every fixture's environment block, so its None is the
+# honest record of a parameter a recorded run did not set. That is a reader.
+# EXPANSION_TEMPERATURE had none, in any fixture, in any row, in any report.
 
 
 # Patient data snapshot date
@@ -1026,8 +1091,33 @@ ECOG_UNAVAILABLE_RATE_THRESHOLD = 0.20
 # BATCH RUNNER CONFIGURATION
 # ===========================================================================
 
-# Patients per progress-reporting batch (does NOT limit total patients)
-BATCH_SIZE = 200
+# BATCH_SIZE WAS HERE AND IS DELETED (pass 20f-2). It read
+# `BATCH_SIZE = 200  # Patients per progress-reporting batch (does NOT limit
+# total patients)`, and no reader existed anywhere in the repository -- check 2h
+# of tests/test_package_invariants.py is what surfaced it, once pass 20e removed
+# the shim whose re-export counted as a read.
+#
+# DELETED RATHER THAN WIRED IN, and the choice was made by reading the runner
+# rather than by preference. oncotriage/batch/runner.py has no batch: it submits
+# every pending patient to ONE ThreadPoolExecutor of MAX_WORKERS threads and
+# reports progress through a tqdm bar that advances once per patient, in
+# `run_batch` and again in `run_resample`. There is nothing for a batch size to
+# size. Wiring it in would mean INVENTING a chunking layer whose only effect is
+# to make the progress report coarser than the one that exists -- new behaviour,
+# in a pass whose job was to make the configuration surface honest.
+#
+# The runner's own module docstring made the same promise ("Process patients in
+# configurable batch sizes with progress reporting") and was corrected in the
+# same commit. Every other constant in this section has a reader -- check 2h
+# says so for the whole file, which is the only reason this one could be found.
+#
+# DO NOT NAME THE DELETED CONSTANT IN A DOCSTRING if you write about it
+# elsewhere. Check 2h counts a name appearing in any STRING LITERAL as a read,
+# deliberately, so that getattr(module, "NAME") is not mistaken for dead code.
+# The first draft of the runner's docstring said `config.<the name>`, and the
+# revert harness measured the consequence: putting the constant back with no
+# reader and no exemption was NOT reported, because that sentence looked like
+# its reader. This block is a COMMENT, which no AST walk sees.
 
 # Number of already-processed patients to re-run after the main pass
 RESAMPLE_COUNT = 100

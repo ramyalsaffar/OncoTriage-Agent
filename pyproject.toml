@@ -1,7 +1,8 @@
-# Packaging for the `oncotriage` package (item 20c, pass 1).
+# Packaging for the `oncotriage` package (item 20c, pass 1; dependencies and
+# version merged in at pass 20f-2).
 #
-# WHAT THIS DOES AND DOES NOT DECLARE
-# -----------------------------------
+# WHAT THIS DECLARES AND DOES NOT DECLARE
+# ---------------------------------------
 # It declares ONE package: `oncotriage`. The numbered scripts beside it are not
 # modules and are not listed — their filenames contain spaces and leading
 # digits, so they are not importable under any name.
@@ -16,20 +17,96 @@
 # filename in the whole tree were these two comments — and deleted it, along
 # with six other numbered shims. See "PIPELINE SEQUENCE.md".
 #
-# NO DEPENDENCY PINS IN THIS PASS. Deliberate. The real dependency list lives
-# in {requirements_path}/requirements.txt, which the Dockerfile copies and
-# installs, and it is the list this project has actually been run against.
-# Restating a subset of it here — openai, qdrant-client, httpx, python-dotenv,
-# tenacity, caffeine — would create a second, shorter, unversioned list that
-# `pip install -e .` would happily resolve to different versions than the
-# tested ones. Merging the two is its own task and needs the versions pinned
-# from a working environment, not guessed. Until then this is a packaging
-# declaration only, and `pip install -e .` installs no third-party code.
 #
-# CONSEQUENCE, stated rather than discovered: `pip install -e .` into an empty
-# environment gives you an importable package whose imports all fail. That is
-# the honest state of the split, and it is why the Dockerfile still installs
-# requirements.txt.
+# THE DEPENDENCY LIST IS HERE NOW, AND IT IS THE ONLY ONE (pass 20f-2)
+# ---------------------------------------------------------------------------
+# Until this pass there were THREE declarations and they disagreed:
+#
+#   requirements/requirements.txt   30 pins, measured from the development
+#                                   interpreter on 2026-08-06
+#   pyproject.toml                  none at all, with a written argument for
+#                                   declaring none
+#   {project root}/07- Requirements/requirements.txt
+#                                   a stale sibling, outside the repository,
+#                                   read by nothing
+#
+# The in-repo file's own header called the duplication "THE TOP-RANKED
+# FOLLOW-UP" and named the blocker: this file "declines to do that today and
+# says why (needs the versions pinned from a working environment, not
+# guessed)". Item 21 supplied exactly that measurement, so the blocker was
+# already gone; what remained was that merging changes how the package installs
+# for every consumer, which is what this pass decided to do.
+#
+# WHAT HAPPENED TO `requirements/requirements.txt`: IT IS DELETED. Not kept as
+# a lock file, not generated, not checked for agreement — deleted, because a
+# second list is a second list however it is produced, and every argument its
+# header made for its own existence is now served by this file:
+#
+#   * "an image that depends on the sibling tree cannot be built from a clean
+#     checkout" — pyproject.toml is in the same directory, in the same commit,
+#     inside the same Docker build context;
+#   * "the versions must come from a working environment, not be guessed" —
+#     every pin below is the one it carried, which was read out of `pip list`
+#     on the development interpreter (macOS/arm64, Python 3.13.5), with the two
+#     exceptions argued at their lines;
+#   * "the Dockerfile copies it" — the Dockerfile now reads THIS file, with
+#     tomllib, and installs what it finds. See the note there; the layer
+#     caching that the separate copy existed for is preserved, because only
+#     this file lands in the layer that installs.
+#
+# `requirements/README.md` replaces it and holds no versions. The directory
+# survives because `oncotriage/paths.py:requirements_path` names it and
+# `_DOCKER_PATHS` maps it to /app/requirements/, so deleting the directory
+# would leave a path variable pointing at nothing and change the container's
+# 14-path bring-up report. RECORDED AS A FOLLOW-UP, with the whole edit: drop
+# `requirements_path` from both tables in oncotriage/paths.py, drop the
+# directory, and correct the "fourteen" in DOCKER CLEAN BRING-UP.md and
+# CLAUDE.md. That is a paths decision, not a dependency one.
+#
+# THE STALE SIBLING IS NOT TOUCHED, and it is outside the repository so this
+# commit cannot touch it. It is dead: `requirements_path` is read by no code
+# (measured — the only hits are its own definition, the _DOCKER_PATHS entry and
+# prose), so nothing has installed from it since item 21.
+#
+# CONSEQUENCE, stated rather than discovered: `pip install .` into an empty
+# environment now gives you a WORKING package, which it did not before. The old
+# note here recorded the opposite — "an importable package whose imports all
+# fail" — as "the honest state of the split". That state is over.
+#
+#
+# HOW THE PINS WERE CHOSEN
+# ---------------------------------------------------------------------------
+# `==` on everything, carried over verbatim from the file this replaces, and
+# that is a deliberate choice rather than an oversight. This project's stated
+# property is determinism, its acceptance criterion is twelve byte-compared
+# characterization fixtures, and a `>=` range means two machines running the
+# same commit can disagree about a ranking with nothing to point at. The cost
+# is that `pip install oncotriage` alongside anything else will conflict, and
+# that cost is accepted: this is an application, distributed as a container and
+# as a checkout, not a library other people depend on.
+#
+# TWO PACKAGES ARE IMPORT-TIME HARD REQUIREMENTS and are easy to miss because
+# neither is imported at the top of any module:
+#
+#   * fastembed  — `oncotriage/embedding.py` is the ONE construction site for
+#                  SparseTextEmbedding(BM25_SPARSE_MODEL_NAME), the sparse
+#                  encoder BOTH halves of BM25 retrieval depend on. The import
+#                  is inside get_bm25_sparse_model(), so nothing fails until
+#                  the first query or the first index build.
+#   * icd10-cm   — `_build_icd10_cancer_sets()` does `import icd10` inside the
+#                  function, and since item 11a a failed import RAISES rather
+#                  than returning three empty sets. Absent, the cancer registry
+#                  cannot be built at all.
+#
+# httpx is NOT listed: `openai` requires it, so it arrives pinned by a package
+# that actually declares the constraint. rank-bm25 IS listed even though
+# retrieval has been Qdrant-native since the indexer moved to sparse vectors —
+# it is the one entry here whose only justification was "01- Imports.py line 51
+# imports BM25Okapi into the shared exec namespace", and pass 20e deleted that
+# file. RECORDED AS A FOLLOW-UP: `git grep -n "BM25Okapi\|rank_bm25"` returns
+# nothing in the package today, so this pin is a candidate for removal, and it
+# is left in place here because dropping a dependency is a change to what an
+# existing environment resolves to and belongs in a pass that measures it.
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -37,9 +114,149 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "oncotriage"
-version = "0.1.0"
-description = "OncoTriage Agent — the importable foundation: settings, paths, config, utils."
+# THE VERSION IS NOT TYPED HERE. It is `oncotriage.__version__`, taken through
+# [tool.setuptools.dynamic] below, and pass 20f-2's note in
+# oncotriage/__init__.py argues why that direction and not the reverse. This
+# file used to declare 0.1.0 while the API served 2.0.0 from two separate
+# literals, so `pip show oncotriage` and GET /pipeline/info described the same
+# build two major versions apart.
+dynamic = ["version"]
+# WAS "the importable foundation: settings, paths, config, utils", which was
+# true at pass 20c-1 and describes about a tenth of what is in the package now.
+description = "OncoTriage Agent — oncology patient / clinical-trial matching over a LangGraph pipeline and hybrid BM25 + vector RAG."
 requires-python = ">=3.10"
+dependencies = [
+    # --- Core scientific computing ------------------------------------------
+    "numpy==2.1.3",
+    "pandas==2.2.3",
+    "scipy==1.15.3",
+
+    # --- HTTP and utilities -------------------------------------------------
+    "requests==2.32.3",
+    "python-dotenv==1.1.0",
+    "python-dateutil==2.9.0.post0",
+
+    # --- OpenAI -------------------------------------------------------------
+    "openai==1.99.9",
+
+    # --- Vector database ----------------------------------------------------
+    # 1.18.0, NOT the 1.16.2 the requirements file pinned, and the bump is a fix
+    # rather than a refresh (pass 20f-2). Qdrant Cloud is serving 1.18.3, and
+    # qdrant-client checks the pair on construction:
+    #
+    #     UserWarning: Qdrant client version 1.16.2 is incompatible with server
+    #     version 1.18.3. Major versions should match and minor version
+    #     difference must not exceed 1.
+    #
+    # Every get_qdrant_client() call emitted that — the indexer, the validator,
+    # the agent, the backup, the fixture harness — so the project's own logs
+    # carried a compatibility warning on every run and nothing acted on it.
+    #
+    # 1.18.0 rather than 1.19.0 (the latest) because matching the server's MINOR
+    # exactly leaves a full version of margin in BOTH directions: it stays
+    # inside the rule if the cloud rolls forward to 1.19 or back to 1.17, and
+    # 1.19.0 would not survive a rollback. Nothing else in the environment moved
+    # to accommodate it — measured with `pip install --dry-run`, the resolution
+    # touches qdrant-client alone.
+    "qdrant-client==1.18.0",
+
+    # --- Embeddings and NLP -------------------------------------------------
+    "sentence-transformers==5.2.2",
+    "transformers==4.57.1",
+    "torch==2.9.0",
+    # The Qdrant/bm25 sparse encoder. See the note above; it is a hard
+    # requirement that no module imports at the top.
+    "fastembed==0.7.4",
+
+    # --- Search and ranking -------------------------------------------------
+    "rank-bm25==0.2.2",
+
+    # --- Medical coding -----------------------------------------------------
+    # `import icd10`. Since item 11a its absence RAISES instead of silently
+    # degrading the cancer registry to three empty sets.
+    "icd10-cm==0.0.5",
+
+    # --- Agent framework ----------------------------------------------------
+    "langgraph==1.0.8",
+
+    # --- API server ---------------------------------------------------------
+    "fastapi==0.117.1",
+    "uvicorn[standard]==0.40.0",
+    "python-multipart==0.0.22",
+    "pydantic==2.12.5",
+    "slowapi==0.1.9",
+
+    # --- Dashboard and plotting ---------------------------------------------
+    # 1.46.0, NOT the 1.45.1 installed on the development machine, and this is
+    # the one pin here that is not simply what `pip list` reported. THE MEASURED
+    # ENVIRONMENT IS NOT INSTALLABLE:
+    #
+    #     streamlit           1.45.1  requires packaging >=20,<25
+    #     apache-airflow-core 3.1.7   requires packaging >=25.0
+    #
+    # No version of `packaging` satisfies both, so pip refuses the combination
+    # outright ("ResolutionImpossible") — measured by building the image with
+    # 1.45.1 pinned. The development machine has both installed anyway, with
+    # packaging 26.0, and `pip check` says so in as many words:
+    #
+    #     streamlit 1.45.1 has requirement packaging<25,>=20, but you have
+    #     packaging 26.0
+    #
+    # STILL TRUE AT PASS 20f-2, re-measured: `pip check` reports that same line
+    # today. The dashboard on that machine runs against a `packaging` its own
+    # metadata declares incompatible. That is a finding about the development
+    # environment, not about this pin, and the fix is `pip install
+    # streamlit==1.46.0` on that machine — bringing it up to what this file
+    # already says — not editing the pin down to match a stale install.
+    #
+    # 1.46.0 is the SMALLEST step that resolves: it relaxes the cap to
+    # `packaging<26`, so packaging 25.x satisfies Airflow's `>=25` and
+    # streamlit's `<26` at once. Later releases (1.61.1 drops the bound
+    # entirely) would also resolve and were not chosen: the dashboard code was
+    # written against 1.45.x, and tests/test_package_invariants.py check 6b
+    # asserts against a PRIVATE streamlit internal
+    # (cache_utils._make_function_key), which is exactly what a sixteen-minor
+    # jump breaks.
+    "streamlit==1.46.0",
+    "plotly==5.24.1",
+    "matplotlib==3.10.0",
+    "seaborn==0.13.2",
+
+    # --- Orchestration ------------------------------------------------------
+    "apache-airflow==3.1.7",
+    "pendulum==3.2.0",
+
+    # --- Async support ------------------------------------------------------
+    "nest-asyncio==1.6.0",
+
+    # --- macOS sleep suppression --------------------------------------------
+    # macOS-only in EFFECT (CaffeinateSession is a no-op elsewhere) but NOT in
+    # IMPORT: `oncotriage/utils.py` does an unguarded `import caffeine as
+    # _caffeine_mod` at module scope, so it has to be installed on Linux too or
+    # importing utils fails.
+    "caffeine==0.5",
+
+    # --- Retry / progress ---------------------------------------------------
+    "tenacity==9.0.0",
+    "tqdm==4.67.1",
+]
+
+# NOTES CARRIED OVER FROM THE FILE THIS REPLACES
+# ---------------------------------------------------------------------------
+# - sqlite3 is built into Python; no pin exists or is needed.
+# - On Apple Silicon, torch auto-detects and uses MPS.
+# - The container is linux/<host arch> on Python 3.11; the measured environment
+#   above is macOS/arm64 on Python 3.13. Same package versions, different
+#   interpreter minor. That combination is exercised by item 21's in-container
+#   import sweep and by a real POST /match, not assumed.
+
+[tool.setuptools.dynamic]
+# setuptools reads this attribute from the AST of oncotriage/__init__.py at
+# BUILD time — it does not import the package, so nothing here depends on the
+# sibling data tree being present. The one requirement it imposes is that
+# `__version__` stays a plain string literal assigned at module level in that
+# file.
+version = {attr = "oncotriage.__version__"}
 
 [tool.setuptools]
 # Explicit, not auto-discovered. Auto-discovery over this directory would trip

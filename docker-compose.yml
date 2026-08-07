@@ -458,7 +458,8 @@ services:
   # NEW IN ITEM 21, AND THE STACK CANNOT RUN A DAG WITHOUT IT.
   #
   # In Airflow 2 the scheduler parsed the dags folder itself. In Airflow 3 —
-  # which is what `requirements.txt` pins and what `airflow api-server` in the
+  # which is what `pyproject.toml` pins (`requirements.txt` before pass 20f-2
+  # merged the two lists) and what `airflow api-server` in the
   # webserver command implies — DAG PARSING IS A SEPARATE COMPONENT, and there
   # is no in-scheduler mode to fall back to (`airflow config get-value scheduler
   # standalone_dag_processor` returns nothing in 3.1.7: the option is gone

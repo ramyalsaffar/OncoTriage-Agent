@@ -147,6 +147,7 @@ from oncotriage.config import (
     BM25_RETRIEVAL_SIZE,
     CHARS_PER_TOKEN,
     COLLECTION_NAME,
+    CROSS_ENCODER_MODEL,
     DATA_SNAPSHOT_DATE,
     EMBEDDING_MODEL,
     MATCHING_MAX_TOKENS,
@@ -171,6 +172,7 @@ from oncotriage.config import (
     TOP_K_CANDIDATES,
     VECTOR_RETRIEVAL_SIZE,
 )
+from oncotriage.embedding import BM25_SPARSE_MODEL_NAME
 from oncotriage.extraction.stage import extract_patient_stage
 from oncotriage.fhir.parser import parse_fhir_bundle
 from oncotriage.storage import database_logger as _database_logger
@@ -1267,8 +1269,36 @@ def build_environment_block() -> Dict:
         "matching_max_tokens": MATCHING_MAX_TOKENS,
         "matching_reasoning_effort": MATCHING_REASONING_EFFORT,
         "matching_seed": MATCHING_SEED,
-        "cross_encoder_model": "ncbi/MedCPT-Cross-Encoder",
-        "sparse_model": "Qdrant/bm25",
+        # BOTH WERE LITERALS UNTIL PASS 20f-2, and both are now the constants
+        # the pipeline actually loads: config.CROSS_ENCODER_MODEL is what
+        # oncotriage/agent/deps.py hands from_pretrained, and
+        # BM25_SPARSE_MODEL_NAME is what oncotriage/embedding.py hands
+        # SparseTextEmbedding at the one construction site.
+        #
+        # THE HAZARD WAS SPECIFIC TO A FIXTURE. These two fields are the record
+        # of which models produced the recorded scores, and a fixture is read
+        # back months later to explain a diff. A literal here goes on saying
+        # "MedCPT" after the loader has moved on, so the artifact that exists to
+        # say what ran would be the one thing in the run that could not.
+        #
+        # NEITHER FIELD IS COMPARED BY THE REPLAY, measured rather than assumed:
+        # oncotriage/fixtures/replay.py touches fixture["environment"] on five
+        # lines and reads exactly three keys out of it -- "tunables"
+        # (diff_tunables), "qdrant_collection" (the pinned-name refusal) and
+        # "collection_digest" (the contents refusal). So changing how these two
+        # values are PRODUCED cannot move a fixture byte, and the twelve
+        # fixtures on disk replay clean without recapture. Recording a field
+        # nothing compares is still worth doing -- it is the provenance a human
+        # reads -- but it is why this edit was safe to make without spending.
+        #
+        # IMPORTING BM25_SPARSE_MODEL_NAME CONSTRUCTS NOTHING: oncotriage/
+        # embedding.py holds the name at module level and does
+        # `from fastembed import SparseTextEmbedding` INSIDE
+        # get_bm25_sparse_model(). tests/test_package_invariants.py check 2f
+        # counts construction SITES by ast and is unaffected by a name import;
+        # the count is still exactly one, in embedding.py.
+        "cross_encoder_model": CROSS_ENCODER_MODEL,
+        "sparse_model": BM25_SPARSE_MODEL_NAME,
         # The File 03 constants the prefix is a function of. A diff caused by
         # editing one of these is a configuration change, not a refactor
         # regression, and without them recorded the two are indistinguishable.

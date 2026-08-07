@@ -80,6 +80,32 @@ stay free; the caller names the module it wants.
 __all__ = ["settings", "paths", "constants", "config", "utils",
            "registries", "extraction", "fhir", "storage"]
 
+# THE ONE VERSION NUMBER (pass 20f-2).
+#
+# Three used to disagree: ``oncotriage/api/server.py`` typed "2.0.0" into
+# ``FastAPI(version=...)``, typed it a second time into GET /pipeline/info, and
+# ``pyproject.toml`` declared ``version = "0.1.0"``. So the HTTP surface and
+# ``pip show oncotriage`` reported the same build two major versions apart, and
+# the follow-up recorded in the server named only two of the three sites.
+#
+# WHY IT LIVES IN THIS FILE rather than in pyproject.toml with the code reading
+# it back. ``importlib.metadata.version("oncotriage")`` reads the installed
+# dist-info FROM DISK, and ``app = create_app()`` runs at import of
+# ``oncotriage.api.server`` -- which ``tests/test_package_invariants.py``
+# section 2 imports with ``builtins.open`` and ``io.open`` trapped to raise, on
+# the standing rule that importing a package module reads no file. A module
+# attribute costs nothing and cannot break that. pyproject.toml takes this
+# string through ``[tool.setuptools.dynamic]``, which setuptools resolves by
+# reading the AST of this file at BUILD time, so the direction is
+# source -> metadata and there is no runtime edge at all.
+#
+# WHY 2.0.0: it is what the API has always told clients, and 0.1.0 described a
+# package that no longer exists (pyproject's own description called it "the
+# importable foundation: settings, paths, config, utils", true at pass 20c-1).
+# Raising the metadata is invisible; lowering the API would announce a
+# regression that never happened. Full argument at ``create_app()``.
+__version__ = "2.0.0"
+
 
 #------------------------------------------------------------------------------
 

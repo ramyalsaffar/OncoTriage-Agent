@@ -382,7 +382,7 @@ python tests/test_monitoring_ecog_availability_drift.py            # 111 (was 11
 python tests/test_registries_cancer_code_claims_audit.py           # 197
 python tests/test_registries_cancer_code_claims_audit_control.py   #  16; 14 planted, 14 caught
 python tests/test_config_snapshot_date_rot.py                      #  10; 6 subprocess runs, ~6 min
-python tests/test_package_invariants.py                            # 235 (was 283; see pass 20e). No network, no keys, no corpus
+python tests/test_package_invariants.py                            # 248 (was 235 at pass 20e; +13 is section 2f(ii), pass 20f-2). No network, no keys, no corpus
 python tests/test_degraded_dependencies.py                         # 172 (was 170; see pass 20e). Item 11a
 python tests/test_storage_query_layer.py                           # 194; item 38, temp SQLite only
 
@@ -504,7 +504,7 @@ Only `03- Code/` is version-controlled. Sibling directories under the project ro
 | `data_MeSH_path` | `02- Data/…/MeSH/` | MeSH C04 + UMLS crosswalk JSONs |
 | `keys_path` | `05- Keys/.env` | `OPENAI_API_KEY`, `QDRANT_URL`, `QDRANT_API_KEY` |
 | `checkpoint_path` | `08- Checkpoint/` | batch runner resume state |
-| `requirements_path` | `07- Requirements/requirements.txt` | pip deps (copied into Dockerfile) |
+| `requirements_path` | `07- Requirements/` | **nothing any more.** A stale, unread copy of a dependency list; read by no code, and pass 20f-2 made `pyproject.toml` the one list |
 
 `ONCOTRIAGE_ALLOW_DEGRADED_REGISTRIES` permits a run to continue with the MeSH
 site-relevance layer or the ICD-10-CM layer ABSENT rather than raising; it is
@@ -1401,7 +1401,9 @@ vocabularies and decision records, exempted with an argument each) and
 `BATCH_SIZE`, `EXPANSION_TEMPERATURE`, `_PATIENT_STAGE_RE` (**genuinely dead**,
 exempted and recorded as follow-ups: the first two are documented TUNABLES that
 do nothing, which is a configuration-surface decision, and the third is an
-unused compiled regex that should simply go). Deleting `exec_chain` also left
+unused compiled regex that should simply go). **Pass 20f-2 closed the first two
+by deleting them** — see "Two dead tunables" below; `_PATIENT_STAGE_RE` is still
+exempted. Deleting `exec_chain` also left
 `import os` unread in `oncotriage/utils.py`, which check 2h(i) reported on the
 first run — the smallest possible instance of the same thing.
 
@@ -1576,7 +1578,11 @@ than assumed — stages 1, 2, 4 and 6 are current, stage 3 now names the checkpo
 exactly (`ncbi/MedCPT-Cross-Encoder`), and the seven `config` values are read
 from `oncotriage.config` so they cannot be stale by construction. Two residuals:
 `version` stays `"2.0.0"` and is hand-maintained in two places (recorded, not
-invented here — where an API version lives is a release decision), and
+invented here — where an API version lives is a release decision) — **pass 20f-2
+closed that one and found a third site, `pyproject.toml`'s `version = "0.1.0"`;
+see "One version number" below**, and the stage-3 checkpoint literal became
+`CROSS_ENCODER_MODEL` in the same pass, on the same derivation argument as
+stage 5 — and
 `trials_indexed`'s `... if qdrant_client else 0` was **inventing a zero** for a
 branch meaning "there was no client to ask", which is indistinguishable from an
 empty index; it reports `null` with a named `trials_indexed_note` now.
@@ -1687,6 +1693,188 @@ the audit control plants into): `tests/test_paths_glob_determinism.py` (25),
 `tests/test_fhir_parser_dict_input.py` (29),
 `tests/test_ablation_db_isolation.py` (43). **The eighteen existing files report
 exactly the counts they reported before.**
+
+
+### Settings and packaging: one name per fact (pass 20f-2)
+
+Seven items, all about declarations that had drifted apart. **No money was
+spent**: the twelve fixtures replay 12/12 clean **without recapture**, which is
+what says the pipeline path did not move.
+
+**1. THE MedCPT CHECKPOINT HAS ONE NAME: `config.CROSS_ENCODER_MODEL`.**
+`"ncbi/MedCPT-Cross-Encoder"` was written out six times with no constant and no
+check — `agent/deps.py` twice (the tokenizer and the weights),
+`api/server.py`'s stage-3 line, `storage/database_logger.py`'s
+`inferences.cross_encoder_model` column, `fixtures/capture.py`'s environment
+block, and a seeded row in `tests/test_storage_query_layer.py`. Pass 20c-3a had
+given `"Qdrant/bm25"` a constant, one construction site and an AST check, and
+left this one alone.
+
+**The operative pair is the tokenizer and the weights, and the failure is
+silent.** A cross-encoder tokenizes its (query, document) pair with the
+tokenizer trained alongside the weights; point one literal elsewhere and the
+token IDs address a vocabulary the embedding matrix never saw. `transformers`
+raises nothing — both halves are BERT-shaped and the call is type-correct — so
+Stage 3 keeps scoring, `node_cross_encoder_rerank` keeps sorting, and only the
+ranking is noise. The other four sites are REPORTS of what ran, and a report
+naming a model the process did not load is the artefact somebody trusts later.
+
+**WHERE THE CONSTANT LIVES IS DECIDED BY LAYERING, not by taste.**
+`storage/database_logger.py` writes the string on every row and `storage` may
+not import `agent`, so the name cannot sit beside its loader the way
+`BM25_SPARSE_MODEL_NAME` sits beside `SparseTextEmbedding` in
+`oncotriage/embedding.py`. `config` is already imported by all four package
+readers and imports none of them; it is also where `EMBEDDING_MODEL` and
+`MATCHING_MODEL` — the same kind of fact — already are. **The BM25 name stays
+where it is**, because its only consumer that matters is the construction site
+in the same file and its comment carries the "changing it rebuilds the index"
+warning, which belongs against the line that builds the encoder.
+
+**THE SIXTH SITE STAYS A LITERAL, ARGUED.** `tests/test_storage_query_layer.py`
+seeds a row standing in for what a database written months ago holds, beside
+`_MODEL_A = "gpt-4o-2024-08-06"` and a hardcoded `pricing_version`. Making a
+stored historical value track what the pipeline loads today is the opposite of
+what that column means. The check is scoped to the package for that reason and
+says so.
+
+**`tests/test_package_invariants.py` SECTION 2f(ii) IS THE ENFORCEMENT, 13
+checks.** It counts non-docstring string literals naming the checkpoint by AST
+(exactly one, in `config.py`, and it is `CROSS_ENCODER_MODEL`'s value), requires
+both `from_pretrained` calls in `deps.py` to be handed that name in either
+reference form, requires there to be exactly two of them, and requires no other
+package module to call `from_pretrained` at all. Controls: a bare literal and an
+**f-string** planted in a copy are both caught; a **docstring** mention is not
+(so the prose arguing for the check does not fail it); and the `from_pretrained`
+scan is fired on the bare-name form, the attribute form and the literal form.
+Docstring tolerance is the same allowance 2f makes by counting calls rather than
+text. **The stated limit:** a literal split across concatenation escapes, as it
+does for 2f.
+
+**2. `"Qdrant/bm25"` HAD ONE STRAY COPY**, in `fixtures/capture.py`, which now
+imports `BM25_SPARSE_MODEL_NAME`. **Importing that name constructs nothing** —
+`embedding.py` does `from fastembed import SparseTextEmbedding` inside the
+accessor — so check 2f's construction count is unchanged at one, confirmed by
+running it rather than assumed.
+
+**3. ONE VERSION NUMBER: `oncotriage.__version__ = "2.0.0"`.** Three
+declarations disagreed — `FastAPI(version="2.0.0")`, a second `"2.0.0"` typed
+into `GET /pipeline/info`, and `pyproject.toml`'s `version = "0.1.0"` — so
+`pip show oncotriage` and the API described the same build two major versions
+apart. Pass 20g's follow-up in the server named only the first two, because it
+had compared only what was in that file.
+
+**2.0.0 wins, and the direction matters.** It is what the API has told clients
+for its whole life; 0.1.0 described the package pyproject's own description
+still called "the importable foundation: settings, paths, config, utils", true
+at pass 20c-1. Raising the metadata is invisible to every consumer; lowering the
+API would announce a two-major-version regression over HTTP that never happened.
+
+**IT IS A MODULE ATTRIBUTE AND NOT `importlib.metadata`.** That reads the
+installed dist-info FROM DISK, and `app = create_app()` runs at import — which
+section 2 imports with `builtins.open` and `io.open` trapped to raise.
+`pyproject.toml` takes the same attribute through `[tool.setuptools.dynamic]`,
+which setuptools resolves from the AST at BUILD time, so the edge is
+source → metadata and there is no runtime one. **What a reader of
+`/pipeline/info` should see:** the same string `pip show` prints and
+`/openapi.json` reports as `info.version` — one number for one artifact, not an
+independent HTTP-contract version. If the contract ever needs to move on its
+own that is a second named constant with its own argument.
+
+**A FOURTH VERSION SITE WAS FOUND AND IS DELIBERATELY LEFT**: `Dockerfile`
+STAGE 2's `LABEL version="1.0.0"`. A LABEL cannot read a Python attribute, so
+closing it means an `ARG` here plus a `build.args` entry in `docker-compose.yml`
+plus something to keep that in step — build plumbing, not the release decision.
+Recorded in the Dockerfile header so the next reader sees the number is known to
+be stale. **A FIFTH was a stale build artefact**: `oncotriage.egg-info/PKG-INFO`
+still said `0.1.0`, and because the code directory is on `sys.path`,
+`importlib.metadata.version("oncotriage")` run from there answered `0.1.0` while
+the installed dist-info said `2.0.0`. It and `build/` (which held a whole stale
+copy of the package) are gitignored leftovers and were deleted.
+
+**4. NEITHER FIXTURE FIELD IS COMPARED, and that was measured before capture.py
+was touched.** `oncotriage/fixtures/replay.py` reaches `fixture["environment"]`
+on five lines and reads three keys out of it: `tunables` (`diff_tunables`),
+`qdrant_collection` (the pinned-name refusal) and `collection_digest` (the
+contents refusal). `cross_encoder_model` and `sparse_model` are recorded and
+never compared — a repo-wide grep for both names returns only the writer.
+So items 1 to 3 cannot move a fixture byte, and the twelve replay clean without
+recapture. Recording a field nothing compares is still worth doing: it is the
+provenance a human reads.
+
+**5. TWO DEAD TUNABLES, DELETED.** `BATCH_SIZE` claimed to be "patients per
+progress-reporting batch" and `oncotriage/batch/runner.py` has no batch — one
+`ThreadPoolExecutor` over every pending patient and a tqdm bar that advances
+once per patient, in `run_batch` and again in `run_resample`. Wiring it in would
+have meant INVENTING a chunking layer whose only effect is a coarser progress
+report. `EXPANSION_TEMPERATURE`'s own comment said why it was dead — "Stage 1
+uses no LLM". Both were **documentation defects**, because CLAUDE.md tells an
+operator every tunable lives in `config.py`. The runner's module docstring made
+the same promise ("Process patients in configurable batch sizes") and was
+corrected in the same commit. **The exemption entry in
+`tests/test_package_invariants.py` had to go with them**, and the file's two
+staleness guards force that in both directions: leaving the entry with the
+constants deleted fails "every exempted constant still exists", and deleting the
+entry with the constants present fails "every module-level constant is read".
+Compare `MATCHING_TEMPERATURE`, also not sent to the API and deliberately kept:
+it is recorded into every fixture's environment block, so its `None` is the
+honest record of a parameter a recorded run did not set. That is a reader.
+
+**6. THE DEPENDENCY LIST IS `pyproject.toml`'s, AND IT IS THE ONLY ONE.** Three
+declarations disagreed: `requirements/requirements.txt` (30 pins measured from
+the development interpreter), `pyproject.toml` (none, with a written argument),
+and the stale sibling `07- Requirements/requirements.txt` outside the
+repository. The in-repo file's own header called the duplication the top-ranked
+follow-up and named the blocker — "needs the versions pinned from a working
+environment, not guessed" — which item 21 had already supplied.
+
+**`requirements/requirements.txt` IS DELETED**, not kept as a lock and not
+generated: a second list is a second list however it is produced. Every argument
+its header made for its own existence is served by `pyproject.toml`, which sits
+in the same directory, in the same commit, inside the same Docker build context.
+`requirements/README.md` replaces it and holds no versions. **The directory
+survives** because `paths.requirements_path` names it and `_DOCKER_PATHS` maps
+it to `/app/requirements/`; deleting it would leave a path variable naming
+nothing and change the container's fourteen-path bring-up report. Recorded as a
+follow-up with the whole edit.
+
+**THE DOCKERFILE READS `pyproject.toml` WITH `tomllib`** (standard library on
+the image's Python 3.11 — nothing is installed in order to read the file that
+says what to install), writes the list to `/tmp` and `pip install -r`s it.
+**Copying only that one file is the point**: the expensive layer is torch, and
+`pip install .` needs the source tree, so a one-character code edit would
+invalidate it. This keeps the layer caching the separate `requirements.txt` copy
+existed for, without a second list. The runtime stage's
+`pip install --no-deps --editable /app` is unchanged, but its `--no-deps`
+argument INVERTED — it used to mean "pyproject declares no dependencies", and it
+now means "STAGE 1 already installed exactly this list; do not re-resolve it
+over the network in the runtime stage".
+
+**Consequence, stated:** `pip install .` into an empty environment now gives a
+working package. The old note in `pyproject.toml` recorded the opposite — "an
+importable package whose imports all fail" — as "the honest state of the split".
+
+**7. THE QDRANT CLIENT PIN WAS BUMPED 1.16.2 → 1.18.0 AND THE WARNING IS GONE.**
+Qdrant Cloud serves 1.18.3 and the client checks the pair on construction, so
+every `get_qdrant_client()` call — indexer, validator, agent, backup, fixture
+harness — emitted `UserWarning: Qdrant client version 1.16.2 is incompatible
+with server version 1.18.3` and nothing acted on it. **1.18.0 rather than 1.19.0
+(the latest)**: matching the server's minor exactly leaves a full version of
+margin in BOTH directions, and 1.19.0 would not survive a rollback to 1.17.
+`pip install --dry-run` showed the resolution touches qdrant-client alone.
+Verified by running: the warning is absent from the replay log and the twelve
+fixtures still replay clean, which is the test that matters because the
+collection digest and every retrieval call go through that client.
+
+**THE STREAMLIT MISMATCH IS REPORTED, NOT PAPERED OVER.** The pin is 1.46.0 and
+1.45.1 is installed, and `pip check` still says
+`streamlit 1.45.1 has requirement packaging<25,>=20, but you have packaging
+26.0` — so the dashboard on this machine runs against a `packaging` its own
+metadata declares incompatible. **What the machine needs to satisfy its own
+pins is `pip install streamlit==1.46.0`**, bringing the install up to what the
+declaration already says. The pin was not edited down to match a stale install:
+1.45.1 is not installable alongside `apache-airflow-core 3.1.7` at all
+(`packaging<25` versus `packaging>=25.0`, no version satisfies both), so
+recording it would make the dependency list unresolvable.
 
 
 ## Persistence and observability
@@ -1822,7 +2010,8 @@ reconstructed in an AST copy so the structural check has something to fail on.
 
 ## Conventions
 
-- **All tunables live in `oncotriage/config.py`.** (`03- Config.py` used to re-export them for the exec chain; pass 20e deleted it.) Retrieval sizes, thresholds, temperatures (both 0 for determinism), rate limiting, drift windows, batch runner settings. Don't scatter magic numbers into node bodies.
+- **All tunables live in `oncotriage/config.py`, and every one of them has a reader.** (`03- Config.py` used to re-export them for the exec chain; pass 20e deleted it.) Retrieval sizes, thresholds, rate limiting, drift windows, batch runner settings. Don't scatter magic numbers into node bodies. **The second half of that sentence is new in pass 20f-2 and it is enforced**, by `tests/test_package_invariants.py` check 2h: a constant here that nothing anywhere reads fails, and the exemption list is closed. That is what this promise is worth — an operator who sets a value in this file is entitled to an effect, and `BATCH_SIZE` and `EXPANSION_TEMPERATURE` were two that had none. Note the parenthesis that used to say "temperatures (both 0 for determinism)": `MATCHING_TEMPERATURE` is `None` because gpt-5.6-terra rejects the parameter, and `EXPANSION_TEMPERATURE` is deleted — so the phrase described neither of the two things it named.
+- **The three model identities — `EMBEDDING_MODEL`, `MATCHING_MODEL`, `CROSS_ENCODER_MODEL` — live in `oncotriage/config.py` together**, and `BM25_SPARSE_MODEL_NAME` deliberately does not (it stays in `oncotriage/embedding.py`, beside the one construction site, with the "changing it rebuilds the index" warning it needs). The asymmetry is argued at both constants; the short version is that `storage` may not import `agent`, so the cross-encoder's name cannot live beside its loader.
 - `ENABLE_RATE_LIMITING = False` by default so batch evaluation isn't throttled; flip it for production.
 - Long local runs wrap in `with CaffeinateSession("label"):` to stop macOS sleeping.
 - Qdrant calls use the shared `qdrant_retry` tenacity decorator (`oncotriage/utils.py`) for connect/timeout/`UnexpectedResponse`.

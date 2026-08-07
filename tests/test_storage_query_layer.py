@@ -521,6 +521,18 @@ _BASE_ROW = {
     "query_expansion_time": 0.01, "hybrid_retrieval_time": 1.5,
     "cross_encoder_time": 2.5, "rule_filter_time": 0.2,
     "gpt4o_evaluation_time": 60.0, "total_time": 64.2,
+    # STAYS A LITERAL, and pass 20f-2 checked rather than assumed it should.
+    # That pass gave the checkpoint one name, oncotriage.config.
+    # CROSS_ENCODER_MODEL, and replaced the five other copies of the string --
+    # but every one of those was a LOAD or a live REPORT, where a stale copy
+    # means the row says one thing and the process did another. This is neither:
+    # it is a stored value in a seeded row, standing in for what a database
+    # written months ago holds, exactly like _MODEL_A ("gpt-4o-2024-08-06")
+    # above it and "pricing_version" below. Importing the constant here would
+    # make a fixed historical row track whatever the pipeline loads today, which
+    # is the opposite of what a stored column means. The check that enforces the
+    # single name (test_package_invariants.py 2f(ii)) is scoped to the package
+    # for this reason, and says so.
     "cross_encoder_model": "ncbi/MedCPT-Cross-Encoder",
     "pricing_version": "2026-08-04", "qdrant_collection": "trial_criteria_x",
     "error": "", "patient_data_hash": "deadbeef",

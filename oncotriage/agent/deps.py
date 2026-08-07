@@ -579,8 +579,18 @@ def _build_medcpt_tokenizer():
 
     from transformers import AutoTokenizer
 
+    # THE CHECKPOINT NAME IS config.CROSS_ENCODER_MODEL AND MUST STAY THAT WAY
+    # (pass 20f-2). This load and _build_medcpt_model() below are the operative
+    # pair: a cross-encoder tokenizes its (query, document) pair with the
+    # tokenizer trained alongside the weights, and two literals here could be
+    # edited apart. transformers raises nothing for a mismatched pair -- it runs
+    # one BERT vocabulary into another BERT's embedding matrix and returns
+    # scores -- so Stage 3 would go on ranking, and only the ranking would be
+    # wrong. tests/test_package_invariants.py section 2f(ii) asserts by ast that
+    # both from_pretrained calls are handed this name and that the literal
+    # itself appears exactly once in the package.
     print("Loading MedCPT cross-encoder tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained("ncbi/MedCPT-Cross-Encoder")
+    tokenizer = AutoTokenizer.from_pretrained(config.CROSS_ENCODER_MODEL)
     print("MedCPT tokenizer loaded!")
     return tokenizer
 
@@ -596,8 +606,12 @@ def _build_medcpt_model():
     # CrossEncoder wrapper because: (1) MedCPT's official usage is via
     # AutoModelForSequenceClassification, (2) the CrossEncoder wrapper applies a
     # default sigmoid that squashes MedCPT's raw values, range -25 to 25.
+    #
+    # Same constant as the tokenizer above, deliberately: see the note there for
+    # what a divergent pair costs and why nothing would raise.
     print("Loading MedCPT cross-encoder re-ranker...")
-    model = AutoModelForSequenceClassification.from_pretrained("ncbi/MedCPT-Cross-Encoder")
+    model = AutoModelForSequenceClassification.from_pretrained(
+        config.CROSS_ENCODER_MODEL)
     model.eval()
     print("MedCPT re-ranker loaded!\n")
     return model

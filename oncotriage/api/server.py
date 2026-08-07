@@ -83,10 +83,12 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
+from oncotriage import __version__
 from oncotriage.agent.deps import get_qdrant_client
 from oncotriage.agent.graph import build_matching_graph, match_patient_to_trials
 from oncotriage.config import (
     COLLECTION_NAME,
+    CROSS_ENCODER_MODEL,
     EMBEDDING_MODEL,
     ENABLE_RATE_LIMITING,
     MATCHING_MODEL,
@@ -277,10 +279,43 @@ def create_app():
     handlers are registered, not called. The graph is compiled in ``lifespan``,
     on startup — the expensive thing stays where File 17 had it.
     """
+    # THE VERSION IS oncotriage.__version__ AND THERE IS NOW ONE OF IT
+    # (pass 20f-2). Three declarations disagreed: this line said "2.0.0",
+    # /pipeline/info repeated "2.0.0" as a second hand-maintained literal, and
+    # pyproject.toml declared version = "0.1.0" -- so `pip show oncotriage` and
+    # the API contradicted each other by two major versions, and the follow-up
+    # recorded in /pipeline/info did not mention the third site because nobody
+    # had looked at the packaging metadata.
+    #
+    # WHY 2.0.0 AND NOT 0.1.0, since one of the two had to lose. 2.0.0 is what
+    # the API has been TELLING CLIENTS for its whole life; 0.1.0 was written
+    # when pyproject.toml's own description called the package "the importable
+    # foundation: settings, paths, config, utils", which was true for pass
+    # 20c-1 and stopped being true when the last conversion pass landed. Moving
+    # the packaging metadata up is invisible to every consumer. Moving the API
+    # down would announce a two-major-version regression over HTTP to anyone
+    # who checks, for a number that never described a smaller API.
+    #
+    # WHY ONE NUMBER FOR BOTH, stated so the next release does not have to guess:
+    # this project ships ONE artifact. The package, the container and the HTTP
+    # surface are cut from the same commit and there is no version of the API
+    # that is not a version of the package. If the HTTP contract ever needs to
+    # move independently -- a v2 route family served beside a v1 -- that is a
+    # SECOND named constant with its own argument, not a re-divergence of this
+    # one.
+    #
+    # oncotriage/__init__.py is the source, read as a plain module attribute, so
+    # this stays free of the filesystem: importlib.metadata.version() would read
+    # the installed dist-info, and `app = create_app()` runs at import, which
+    # tests/test_package_invariants.py section 2 imports under a trapped
+    # builtins.open. pyproject.toml takes the same attribute through
+    # [tool.setuptools.dynamic], which setuptools reads from the AST at BUILD
+    # time -- so the wheel, `pip show`, the FastAPI app and /pipeline/info all
+    # carry one string that is typed once.
     app = FastAPI(
         title=Project_Name,
         description="Clinical trial patient matching — LangGraph + hybrid RAG",
-        version="2.0.0",
+        version=__version__,
         lifespan=lifespan
     )
 
@@ -353,11 +388,19 @@ def create_app():
         # from oncotriage.config, so they cannot be stale by construction --
         # which is exactly what the two literals above were not.
         #
-        # `version` STAYS "2.0.0" and it is hand-maintained. It matches the
-        # FastAPI application version in create_app() above and nothing derives
-        # either from the other; it is recorded as a follow-up rather than
-        # invented here, because choosing where an API version number lives is a
-        # release decision, not a staleness fix.
+        # `version` IS NO LONGER HAND-MAINTAINED, and pass 20g's follow-up here
+        # is closed. It was "2.0.0" typed a second time beside the identical
+        # literal in create_app() above, and pyproject.toml declared a THIRD
+        # value, 0.1.0, which pass 20g did not mention because it had only
+        # compared the two inside this file. All three are now
+        # oncotriage.__version__; the release decision that picked 2.0.0 over
+        # 0.1.0 is argued in full at create_app().
+        #
+        # WHAT A READER OF THIS ENDPOINT SHOULD SEE: the same string that
+        # `pip show oncotriage` prints, that /openapi.json reports as
+        # info.version, and that the image was built from -- one number for one
+        # artifact. It is NOT an independent HTTP-contract version, and this
+        # response does not claim to carry one.
         #
         # `collection_name` reports COLLECTION_NAME, which is the ALIAS and not
         # the collection -- deliberately, because it is under `config` and the
@@ -385,12 +428,17 @@ def create_app():
                 "is not an empty index.")
 
         return {
-            "version": "2.0.0",
+            "version": __version__,
             "architecture": "LangGraph StateGraph over the oncotriage package",
             "stages": [
                 "1. Query Expansion (Deterministic MeSH C04 hierarchy)",
                 "2. Hybrid Retrieval (BM25 + Vector + RRF)",
-                "3. Cross-Encoder Rerank (ncbi/MedCPT-Cross-Encoder)",
+                # Interpolated for the reason the stage-5 line above it already
+                # was: pass 20g derived that one from MATCHING_MODEL after
+                # finding it still said "GPT-4o", and this line was the same
+                # shape of literal one row up -- correct today, and connected to
+                # nothing that would move it when the checkpoint changed.
+                f"3. Cross-Encoder Rerank ({CROSS_ENCODER_MODEL})",
                 "4. Rule-Based Filtering",
                 f"5. Criterion-Level Evaluation ({MATCHING_MODEL})",
                 "6. Final Ranking"
@@ -398,6 +446,14 @@ def create_app():
             "config": {
                 "collection_name": COLLECTION_NAME,
                 "embedding_model": EMBEDDING_MODEL,
+                # NOT ADDING "cross_encoder_model" HERE, deliberately. It would
+                # be the third model identity in a block that already carries
+                # two, which reads like an omission being corrected -- but the
+                # stage-3 line above already reports it, from the same constant,
+                # so the only thing a second field buys is a response that says
+                # one fact twice. Adding a key is also a response-shape change,
+                # and this pass's job in this file was to stop it carrying three
+                # version numbers, not to widen what it answers.
                 "matching_model": MATCHING_MODEL,
                 "top_k_candidates": TOP_K_CANDIDATES,
                 "rerank_threshold": RERANK_SCORE_THRESHOLD,

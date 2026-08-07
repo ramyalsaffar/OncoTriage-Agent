@@ -28,12 +28,24 @@
 #
 #   1. The requirements COPY had NEVER MATCHED ANYTHING. It named
 #      `05-*Requirements/requirements.txt`, and the build context is "03- Code",
-#      which has no such directory — the dependency list lives one level up, in
+#      which has no such directory — the dependency list lived one level up, in
 #      "07- Requirements". So `docker build` failed at that line on every
-#      checkout this repository has ever had. It now copies
-#      `requirements/requirements.txt`, which is IN the context, is
-#      version-controlled, and lands at the path `oncotriage/paths.py` already
-#      names for the container (`requirements_path` == "/app/requirements/").
+#      checkout this repository has ever had. Item 21 pointed it at
+#      `requirements/requirements.txt`, which was IN the context.
+#      PASS 20f-2 SUPERSEDED THAT: there is one dependency list and it is
+#      `pyproject.toml`'s `[project] dependencies`. This stage copies that file
+#      alone and extracts the list from it; see STAGE 1.
+#
+#   PASS 20f-2 ALSO LEFT ONE THING HERE UNRECONCILED, ON PURPOSE. The LABEL
+#   `version="1.0.0"` in STAGE 2 is a FOURTH version number, beside
+#   `oncotriage.__version__` (2.0.0), which the FastAPI app, GET /pipeline/info
+#   and `pip show oncotriage` now all derive from. It is not derived, because a
+#   Dockerfile LABEL cannot read a Python attribute: closing it means an `ARG
+#   ONCOTRIAGE_VERSION` here plus a `build.args` entry in docker-compose.yml
+#   plus something to keep THAT in step — which is a build-plumbing decision,
+#   not the release decision item 3 of that pass made. RECORDED AS A FOLLOW-UP,
+#   and named here rather than in a commit message so the next reader of this
+#   file sees the number is known to be stale.
 #   2. The image never installed the package. It relied on `PYTHONPATH=/app`,
 #      which is a different mechanism with different failure modes. It now does
 #      an editable install; PYTHONPATH is gone. See STAGE 2.
@@ -84,15 +96,21 @@ ENV PATH="/opt/venv/bin:$PATH"
 # Set working directory
 WORKDIR /app
 
-# Copy requirements file
+# Copy the dependency declaration
 #
-# ITEM 21: the source is `requirements/requirements.txt`, INSIDE the build
-# context. It used to be `05-*Requirements/requirements.txt`, which matched
-# nothing — see the header. The destination keeps the historical
-# /app/requirements.txt for the pip invocation below; the copy that the
-# container's `requirements_path` points at arrives with the code tree in
-# STAGE 2, at /app/requirements/requirements.txt.
-COPY --chown=appuser:appuser requirements/requirements.txt /app/requirements.txt
+# ITEM 21 copied `requirements/requirements.txt` here. PASS 20f-2 DELETED THAT
+# FILE: the dependency list lives in `pyproject.toml` now and there is exactly
+# one of it. See the header of that file for why the merge happened and what
+# happened to the `requirements/` directory.
+#
+# ONLY pyproject.toml LANDS IN THIS LAYER, and that is the whole reason the
+# install below extracts the list instead of doing `pip install .`. The
+# expensive layer here is torch; `pip install .` needs the source tree, so a
+# one-character edit to any .py would invalidate the copy and re-download it.
+# With only this file in the layer, the dependency install is re-run when — and
+# only when — the dependency list changes. That is the property the separate
+# requirements.txt copy existed for, kept without a second list.
+COPY --chown=appuser:appuser pyproject.toml /app/pyproject.toml
 
 # Install Python dependencies as non-root user
 # This is the CRITICAL security step - running as appuser prevents:
@@ -107,8 +125,28 @@ COPY --chown=appuser:appuser requirements/requirements.txt /app/requirements.txt
 # `--no-build-isolation` (so the build reaches for no network), which means the
 # backend it uses is THIS setuptools. Without the upgrade that install fails on
 # the version floor.
+#
+# THE LIST IS READ OUT OF pyproject.toml WITH tomllib, which is standard
+# library from Python 3.11 and this base image is python:3.11-slim — so nothing
+# is installed in order to read the file that says what to install. It writes
+# to /tmp rather than /app because /app is created by the WORKDIR above and is
+# not owned by appuser, and a redirect into a root-owned directory fails at a
+# point that reads like a dependency problem.
+#
+# IT MUST NOT SILENTLY INSTALL NOTHING. A pyproject.toml with a renamed or
+# absent `[project] dependencies` key would make `d["project"]["dependencies"]`
+# raise, which is the intended outcome — but a future edit reaching for
+# `.get("dependencies", [])` would produce an empty file, a successful pip run,
+# and an image whose imports all fail at runtime. The `assert` is the guard
+# against that shape, and the floor is deliberately loose: it says "this is a
+# real list", not a count that has to be maintained.
 RUN pip install --upgrade pip setuptools wheel && \
-    pip install -r /app/requirements.txt
+    python -c "import tomllib; \
+deps = tomllib.load(open('/app/pyproject.toml','rb'))['project']['dependencies']; \
+assert len(deps) > 10, f'pyproject.toml declared only {len(deps)} dependencies'; \
+open('/tmp/requirements.txt','w').write('\n'.join(deps) + '\n')" && \
+    cat /tmp/requirements.txt && \
+    pip install -r /tmp/requirements.txt
 
 
 # ===========================================================================
@@ -270,8 +308,10 @@ USER appuser
 # Install the project itself.
 #
 # WHY HERE AND NOT IN THE BUILDER, which is where a wheel would normally be
-# built: the builder stage copies only requirements.txt. It has no source to
-# install. Copying the source into the builder as well and installing a wheel
+# built: the builder stage copies only pyproject.toml (requirements.txt before
+# pass 20f-2). It has no source to install — deliberately, because that is what
+# keeps a code edit from invalidating the torch layer. Copying the source into
+# the builder as well and installing a wheel
 # into /opt/venv is the other option the item named, and it was rejected for a
 # specific reason rather than for effort — it produces TWO copies of the
 # package: the wheel's, inside /opt/venv, and the tree's, at /app. Which one
@@ -291,10 +331,16 @@ USER appuser
 # One copy in both cases, and no PYTHONPATH. A non-editable wheel would have
 # given two copies in the second case, resolved by sys.path order.
 #
-# --no-deps:            pyproject.toml declares no dependencies by design (it
-#                       says so and says why); requirements.txt above is the
-#                       dependency list. This makes that explicit and keeps the
-#                       install from reaching the network.
+# --no-deps:            THE REASON CHANGED AT PASS 20f-2 AND THE FLAG DID NOT.
+#                       It used to be "pyproject.toml declares no dependencies
+#                       by design", which is no longer true — it declares all of
+#                       them. It is now load-bearing in the opposite direction:
+#                       STAGE 1 has already installed exactly that list into
+#                       /opt/venv, and without this flag pip would re-resolve it
+#                       here, over the network, in the runtime stage, at a point
+#                       where the whole dependency layer was supposed to be
+#                       settled. Same flag, same effect, a reason that is now
+#                       the load-bearing one rather than a formality.
 # --no-build-isolation: use the setuptools already in /opt/venv — upgraded in
 #                       the builder for exactly this — instead of pip fetching a
 #                       fresh build environment over the network at image-build

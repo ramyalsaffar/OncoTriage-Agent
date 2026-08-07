@@ -18,7 +18,9 @@ THE INVARIANTS, which are what the sections below are organised around:
     spawns no process (section 2, under twelve traps);
   * `oncotriage.config` never imports `oncotriage.utils` -- the cycle item 20c
     removed -- and no module imports another from inside a function body;
-  * `SparseTextEmbedding("Qdrant/bm25")` has exactly ONE construction site;
+  * `SparseTextEmbedding("Qdrant/bm25")` has exactly ONE construction site, and
+    the MedCPT cross-encoder checkpoint is NAMED in exactly one place, with the
+    tokenizer and the weights loaded from that one name (section 2f);
   * no module-level import is shadowed by a function-local, and no name is
     declared and never read anywhere in the repository;
   * every subpackage on disk is declared in pyproject.toml, at any depth;
@@ -2210,6 +2212,245 @@ check("...and the validator reaches it through the agent's own accessor, so it "
 
 
 # ===========================================================================
+# 2f(ii). EXACTLY ONE PLACE NAMES THE MEDCPT CROSS-ENCODER CHECKPOINT
+# ===========================================================================
+
+print("\n" + "=" * 78)
+print("2f(ii). the MedCPT cross-encoder checkpoint is named in exactly one place")
+print("=" * 78)
+
+# THE ASYMMETRY THIS CLOSES (pass 20f-2).
+#
+# 2f above gave "Qdrant/bm25" a named constant, ONE construction site and this
+# check. The OTHER local model in the pipeline had neither: before this pass
+# "ncbi/MedCPT-Cross-Encoder" was written out six times, as a bare literal,
+# with nothing connecting any copy to any other --
+#
+#     oncotriage/agent/deps.py          line 583   the tokenizer load
+#     oncotriage/agent/deps.py          line 600   the weights load
+#     oncotriage/api/server.py          line 393   the stage-3 line of
+#                                                  GET /pipeline/info
+#     oncotriage/storage/database_logger.py  932   inferences.cross_encoder_model,
+#                                                  written on every row
+#     oncotriage/fixtures/capture.py    line 1270  every fixture's environment
+#                                                  block
+#     tests/test_storage_query_layer.py line 524   a seeded row (see below)
+#
+# THE OPERATIVE PAIR IS THE FIRST TWO, and the hazard has the same shape as the
+# BM25 one: a cross-encoder tokenizes its (query, document) pair with the
+# tokenizer trained alongside the weights. Point one literal at another
+# checkpoint and the token IDs address a vocabulary the embedding matrix was not
+# trained on -- and transformers raises NOTHING, because both halves are
+# BERT-shaped and the call is type-correct. Stage 3 would go on returning
+# scores, node_cross_encoder_rerank would sort them, RERANK_SCORE_THRESHOLD
+# would drop some, and the only symptom would be that the ranking was noise.
+# Nothing raises, no counter moves, retrieval quality falls: the sentence is
+# copied from 2f above because the failure is the same one.
+#
+# The other four are REPORTS of what ran -- a row, a fixture, an endpoint -- and
+# a report that names a model the process did not load is worse than no report,
+# because it is the artefact somebody trusts six months later.
+#
+# WHAT IS DELIBERATELY OUTSIDE THIS SCAN. It covers _PKG_FILES, exactly as 2f
+# does, and the sixth site above is in tests/. That one STAYS a literal and the
+# reason is at the line: it is a value seeded into a temporary database standing
+# in for what a row written months ago holds, beside _MODEL_A =
+# "gpt-4o-2024-08-06" and a hardcoded pricing_version. Making a stored
+# historical value track what the pipeline loads today is the opposite of what
+# that column means. Every OTHER copy was a load or a live report.
+#
+# DOCSTRINGS ARE EXEMPT, and 2f's detector makes the same allowance by counting
+# calls rather than text: several docstrings in this package now name the
+# checkpoint precisely because they explain why there is only one literal.
+# Both directions are controlled below -- a docstring mention must NOT be
+# reported, an f-string one MUST be.
+#
+# THE LIMIT, STATED: a literal deliberately split across concatenation
+# ("ncbi/MedCPT-" "Cross-Encoder") escapes a substring match on constants, as it
+# escapes 2f's call detector's equivalents. This catches the shapes somebody
+# writes without noticing they have created a second name, which is the failure
+# mode, rather than the shapes somebody writes to evade a check.
+
+_MEDCPT_FRAGMENT = "MedCPT-Cross-Encoder"
+
+
+def _docstring_constant_ids(tree):
+    """id() of every ast.Constant that IS a docstring in `tree`."""
+    out = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.FunctionDef,
+                                 ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        body = getattr(node, "body", None)
+        if (body and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            out.add(id(body[0].value))
+    return out
+
+
+def _checkpoint_literals(path):
+    """Line numbers of every non-docstring string literal naming the checkpoint.
+
+    ast.walk descends into JoinedStr, so the f-string form -- which needs no
+    assignment and is what anyone interpolating the name into a message writes
+    -- is counted with the plain one.
+    """
+    tree = ast.parse(open(path, encoding="utf-8").read(), path)
+    skip = _docstring_constant_ids(tree)
+    return sorted(
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and _MEDCPT_FRAGMENT in node.value
+        and id(node) not in skip
+    )
+
+
+_checkpoint_sites = {}
+for _f in _PKG_FILES:
+    _hits = _checkpoint_literals(_f)
+    if _hits:
+        _checkpoint_sites[os.path.relpath(_f, _code_dir)] = _hits
+
+check("exactly one package file writes the MedCPT checkpoint as a literal",
+      sorted(_checkpoint_sites), ["oncotriage/config.py"])
+check("...and it writes it exactly once",
+      len(_checkpoint_sites.get("oncotriage/config.py", [])), 1)
+
+# AND THAT ONE LITERAL IS THE CONSTANT, not a string that happens to sit in the
+# same file. Without this, a literal moved into config.py as an argument to
+# something else would satisfy both checks above while leaving
+# CROSS_ENCODER_MODEL bound to whatever it liked.
+_CONFIG_PY = os.path.join(_PKG_DIR, "config.py")
+_cross_encoder_assignments = []
+for _node in ast.parse(open(_CONFIG_PY, encoding="utf-8").read()).body:
+    if isinstance(_node, ast.Assign) and isinstance(_node.value, ast.Constant):
+        for _t in _node.targets:
+            if isinstance(_t, ast.Name) and _t.id == "CROSS_ENCODER_MODEL":
+                _cross_encoder_assignments.append(_node.value.value)
+check("...and that literal is the value of config.CROSS_ENCODER_MODEL",
+      _cross_encoder_assignments, ["ncbi/MedCPT-Cross-Encoder"])
+
+# THE TWO LOADS MUST BOTH BE HANDED THAT NAME. This is the claim 2f makes with
+# "both SIDES reach the same accessor", in the form this model needs: there is
+# no shared accessor to reach, because the tokenizer and the weights are two
+# different transformers entry points, so what has to be shared is the ARGUMENT.
+
+
+def _from_pretrained_arguments(path):
+    """(lineno, how the first argument is written) for every from_pretrained call.
+
+    Both reference forms are recognised -- the bare name `CROSS_ENCODER_MODEL`
+    and the attribute form `config.CROSS_ENCODER_MODEL` -- because a check that
+    named one would pass over the other, and this package uses the second.
+    A literal argument is reported as its repr, so a regression names itself.
+    """
+    tree = ast.parse(open(path, encoding="utf-8").read(), path)
+    out = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "from_pretrained"):
+            continue
+        arg = node.args[0] if node.args else None
+        if isinstance(arg, ast.Name):
+            out.append((node.lineno, arg.id))
+        elif isinstance(arg, ast.Attribute):
+            out.append((node.lineno, arg.attr))
+        elif isinstance(arg, ast.Constant):
+            out.append((node.lineno, repr(arg.value)))
+        else:
+            out.append((node.lineno, f"<{type(arg).__name__}>"))
+    return out
+
+
+_deps_loads = _from_pretrained_arguments(_DEPS_PY)
+check("the two MedCPT loads in deps.py are both handed CROSS_ENCODER_MODEL, so "
+      "the tokenizer and the weights cannot be edited apart",
+      sorted(name for _ln, name in _deps_loads),
+      ["CROSS_ENCODER_MODEL", "CROSS_ENCODER_MODEL"])
+
+# NON-DEGENERATE in the way that matters here: the assertion above is satisfied
+# by a file with no from_pretrained call at all only if the sorted list is
+# empty, which it is not -- but say so explicitly, because "deps.py stopped
+# loading MedCPT" and "deps.py loads it correctly" must not print the same.
+check("...and there are exactly two of them, so a third load cannot appear "
+      "unnamed", len(_deps_loads), 2)
+
+# No OTHER package module may load a checkpoint. deps.py is the seam; a second
+# module calling from_pretrained is a second model in the process, whether or
+# not it names the same string.
+_other_loaders = sorted(
+    os.path.relpath(_f, _code_dir) for _f in _PKG_FILES
+    if _f != _DEPS_PY and _from_pretrained_arguments(_f)
+)
+check("...and no other package module calls from_pretrained at all",
+      _other_loaders, [])
+
+# --- NEGATIVE CONTROLS, one per reference form, each planted and each fired ---
+#
+# Everything above is also what a detector that never matches returns. Each form
+# is planted in a COPY and the detector is required to find it; the docstring
+# tolerance is fired in the other direction, because an exemption that exempts
+# nothing looks identical to one doing real work.
+_MEDCPT_PLANT_ROOT = tempfile.mkdtemp(prefix="oncotriage_medcpt_")
+try:
+    shutil.copytree(_PKG_DIR, os.path.join(_MEDCPT_PLANT_ROOT, "oncotriage"))
+    _PLANTED_DEPS = os.path.join(_MEDCPT_PLANT_ROOT, "oncotriage", "agent",
+                                 "deps.py")
+
+    check("the checkpoint detector reports NOTHING on the shipped deps.py, "
+          "which is what makes each plant below the only difference",
+          _checkpoint_literals(_PLANTED_DEPS), [])
+
+    with open(_PLANTED_DEPS, "a", encoding="utf-8") as _fh:
+        _fh.write('\n\ndef _planted_bare_literal():\n'
+                  '    return "ncbi/MedCPT-Cross-Encoder"\n')
+    check("...CATCHES a bare literal planted in a copy",
+          len(_checkpoint_literals(_PLANTED_DEPS)), 1)
+
+    with open(_PLANTED_DEPS, "a", encoding="utf-8") as _fh:
+        _fh.write('\n\ndef _planted_fstring(x):\n'
+                  '    return f"loading ncbi/MedCPT-Cross-Encoder for {x}"\n')
+    check("...and the F-STRING form, which needs no assignment and is what "
+          "anyone interpolating the name into a message writes",
+          len(_checkpoint_literals(_PLANTED_DEPS)), 2)
+
+    with open(_PLANTED_DEPS, "a", encoding="utf-8") as _fh:
+        _fh.write('\n\ndef _planted_docstring():\n'
+                  '    """Explains why ncbi/MedCPT-Cross-Encoder is named once."""\n'
+                  '    return None\n')
+    check("...and a DOCSTRING mention is still not reported, so the prose that "
+          "argues for this check does not fail it",
+          len(_checkpoint_literals(_PLANTED_DEPS)), 2)
+
+    # The from_pretrained check, fired in both reference forms it accepts and
+    # in the form it must reject.
+    _ARG_PROBE = os.path.join(_MEDCPT_PLANT_ROOT, "argprobe.py")
+    for _label, (_code, _expected) in {
+        "a literal argument is REPORTED AS THE LITERAL, so the regression "
+        "names itself": (
+            'AutoTokenizer.from_pretrained("ncbi/MedCPT-Cross-Encoder")\n',
+            [(1, "'ncbi/MedCPT-Cross-Encoder'")]),
+        "the BARE-NAME reference form is recognised": (
+            'AutoTokenizer.from_pretrained(CROSS_ENCODER_MODEL)\n',
+            [(1, "CROSS_ENCODER_MODEL")]),
+        "the ATTRIBUTE reference form is recognised -- the one this package "
+        "actually uses": (
+            'AutoTokenizer.from_pretrained(config.CROSS_ENCODER_MODEL)\n',
+            [(1, "CROSS_ENCODER_MODEL")]),
+    }.items():
+        with open(_ARG_PROBE, "w", encoding="utf-8") as _fh:
+            _fh.write(_code)
+        check(f"from_pretrained scan: {_label}",
+              _from_pretrained_arguments(_ARG_PROBE), _expected)
+finally:
+    shutil.rmtree(_MEDCPT_PLANT_ROOT, ignore_errors=True)
+
+
+# ===========================================================================
 # 2g. NO FUNCTION-LOCAL SHADOWS A MODULE-LEVEL IMPORT
 # ===========================================================================
 
@@ -2767,18 +3008,23 @@ _UNREAD_CONSTANT_EXEMPTIONS = {
     # KIND TWO: GENUINELY DEAD, reported rather than deleted, and each is a
     # ranked follow-up of pass 20e rather than a decision it made.
     #
-    #   BATCH_SIZE and EXPANSION_TEMPERATURE are TUNABLES. CLAUDE.md tells an
-    #   operator that every tunable lives in oncotriage/config.py, so an
-    #   operator may reasonably set either and expect an effect; neither has
-    #   one. EXPANSION_TEMPERATURE's own comment says why -- "Stage 1 uses no
-    #   LLM" -- which makes it a documentation defect rather than a leftover,
-    #   and BATCH_SIZE claims to be "patients per progress-reporting batch"
-    #   while oncotriage/batch/runner.py reads no such value. DELETING A
-    #   DOCUMENTED TUNABLE IS A CHANGE TO THE CONFIGURATION SURFACE, which is a
-    #   decision for the item that owns config, not a side effect of deleting
-    #   shims. RECORDED AS A FOLLOW-UP: delete both, or wire BATCH_SIZE into
-    #   the runner's progress reporting, and say which in CLAUDE.md.
-    "oncotriage/config.py": ["BATCH_SIZE", "EXPANSION_TEMPERATURE"],
+    #   BATCH_SIZE AND EXPANSION_TEMPERATURE WERE EXEMPTED HERE AND ARE NOW
+    #   DELETED (pass 20f-2), so the entry is gone rather than kept. This is the
+    #   shape an exemption is supposed to have: pass 20e recorded the finding
+    #   with a named follow-up ("delete both, or wire BATCH_SIZE into the
+    #   runner's progress reporting, and say which in CLAUDE.md"), and the
+    #   follow-up closed it. Both were TUNABLES that did nothing -- CLAUDE.md
+    #   tells an operator every tunable lives in oncotriage/config.py, so an
+    #   operator setting either was entitled to an effect neither had.
+    #   EXPANSION_TEMPERATURE's own comment said why ("Stage 1 uses no LLM") and
+    #   BATCH_SIZE claimed to be "patients per progress-reporting batch" while
+    #   oncotriage/batch/runner.py has no batch at all -- one thread pool and a
+    #   tqdm bar that advances per patient. Deleting was chosen over wiring
+    #   because wiring meant inventing a chunking layer to make the progress
+    #   report coarser. The two "still needed" / "still exists" checks below are
+    #   what force the entry out with the constants: leaving it here would fail
+    #   the second, which is exactly what a staleness guard is for.
+    #
     #   _PATIENT_STAGE_RE is a compiled regex with no reader at all --
     #   _SNOMED_DISPLAY_STAGE_RE, defined immediately above it and differing
     #   only by an optional "tnm " prefix, is the one extract_patient_stage()

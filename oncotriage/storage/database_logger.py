@@ -88,7 +88,7 @@ from typing import Dict
 
 from oncotriage import paths
 from oncotriage import settings
-from oncotriage.config import MATCHING_MODEL, PRICING_CONFIG
+from oncotriage.config import CROSS_ENCODER_MODEL, MATCHING_MODEL, PRICING_CONFIG
 from oncotriage.registries.primary_cancer import _resolve_primary_cancer
 from oncotriage.utils import deduplicate_by_display, get_model_cost
 
@@ -929,7 +929,16 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
             # get_model_cost() was called with. Reading it twice could price a
             # row against one model and label it with another.
             matching_model_used,
-            "ncbi/MedCPT-Cross-Encoder",
+            # WAS A LITERAL "ncbi/MedCPT-Cross-Encoder" (pass 20f-2). It is the
+            # same fact as the checkpoint oncotriage/agent/deps.py loads, and a
+            # row that names one model while Stage 3 ran another is a row that
+            # cannot be reasoned about later. Note the asymmetry with
+            # matching_model_used directly above, which is read off the Stage 5
+            # RESPONSE rather than from config: the API can answer with a dated
+            # snapshot of the model it was asked for, so there the request and
+            # the answer are two different facts. The cross-encoder runs in this
+            # process, so what was asked for IS what ran.
+            CROSS_ENCODER_MODEL,
             PRICING_CONFIG["last_updated"],
             total_cost,
             result.get("qdrant_collection", ""),

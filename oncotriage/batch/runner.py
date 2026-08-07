@@ -18,7 +18,21 @@ Execution flow:
     1. Build BM25 index + compile LangGraph graph
     2. Load all FHIR patient files
     3. Skip patients already in checkpoint (resume support)
-    4. Process patients in configurable batch sizes with progress reporting
+    4. Process every pending patient through ONE MAX_WORKERS thread pool, with
+       a tqdm bar that advances once per patient (pass 20f-2 corrected this
+       line: it used to say "in configurable batch sizes", and there is no
+       batch and no size -- the tunable that claimed to set one is deleted, and
+       the argument is in the BATCH RUNNER section of oncotriage/config.py)
+
+       THE DELETED TUNABLE IS DELIBERATELY NOT NAMED IN THIS DOCSTRING, and
+       that is not fussiness. tests/test_package_invariants.py check 2h counts
+       a name appearing in any STRING LITERAL as a read -- deliberately, so
+       that getattr(module, "NAME") is not mistaken for dead code -- and this
+       docstring is a string literal. The first draft of this line said
+       `config.<the name>`, and the revert harness measured the consequence:
+       reinstating that constant with no reader and no exemption was NOT
+       reported, because this sentence looked like its reader. Prose that names
+       a deleted constant is prose that hides its return.
     5. Run resample pass on randomly selected already-processed patients
     6. Print final summary report
 
