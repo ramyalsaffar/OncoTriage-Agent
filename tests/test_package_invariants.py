@@ -2295,7 +2295,7 @@ print("=" * 78)
 # checkpoint and the token IDs address a vocabulary the embedding matrix was not
 # trained on -- and transformers raises NOTHING, because both halves are
 # BERT-shaped and the call is type-correct. Stage 3 would go on returning
-# scores, node_cross_encoder_rerank would sort them, RERANK_SCORE_THRESHOLD
+# scores, node_cross_encoder_rerank would sort them, the Stage 4 quality gate
 # would drop some, and the only symptom would be that the ranking was noise.
 # Nothing raises, no counter moves, retrieval quality falls: the sentence is
 # copied from 2f above because the failure is the same one.

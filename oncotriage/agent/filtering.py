@@ -47,7 +47,7 @@ from oncotriage.agent.state import (
     MESH_FILTER_SKIP_NO_TREES,
     TrialMatchState,
 )
-from oncotriage.config import MAX_TRIALS_FOR_EVALUATION
+from oncotriage.config import MAX_TRIALS_FOR_EVALUATION, MEDCPT_SCORE_FLOOR
 from oncotriage.extraction.histology import (
     extract_patient_histology,
     is_histology_mismatch,
@@ -149,10 +149,12 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
         - Cancer site: patient cancer type must match trial cancer type (MeSH)  # NEW
         - Age: patient age must fall within trial's min/max age
         - Sex: patient sex must match trial's sex requirement
-        - Quality threshold: drop trials whose UNBOOSTED rerank score falls
-          below the QUALITY_THRESHOLD_PERCENTILE of the surviving pool
-          (hard floor RERANK_SCORE_THRESHOLD). Computed on rerank_score_raw
-          so the gate measures trial quality, not MeSH boost membership.
+        - Quality gate, two independent knobs, both must pass: the UNBOOSTED
+          rerank score must reach QUALITY_THRESHOLD_PERCENTILE of the surviving
+          pool (computed on rerank_score_raw, so the gate measures trial
+          quality and not MeSH boost membership), AND medcpt_score_max must
+          reach MEDCPT_SCORE_FLOOR. A trial with no MedCPT score is not
+          dropped by the second. Each knob reports its own drop count.
         - Cost cap: limit to MAX_TRIALS_FOR_EVALUATION candidates
     """
     start = time.time()
@@ -349,8 +351,12 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
          reverse=True
      )
 
-    # Dynamic quality threshold: percentile of the UNBOOSTED score, hard floor.
-    quality_filtered, dynamic_threshold = apply_quality_gate(filtered)
+    # Two independent quality knobs: a percentile of the UNBOOSTED fused score
+    # within this pool, and an absolute floor on the trial's best MedCPT
+    # cross-encoder score. A trial must pass both. quality_dropped stays the
+    # total so no existing reader changes meaning; the per-knob counts are
+    # reported beside it because the two overlap and their sum is not the total.
+    quality_filtered, dynamic_threshold, quality_drops = apply_quality_gate(filtered)
     quality_dropped = len(filtered) - len(quality_filtered)
 
     candidates_after_quality = len(quality_filtered)
@@ -377,7 +383,19 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
              # The age filter DID NOT RUN for these -- distinct from a drop.
              age_unparsed=age_unparsed, sex_dropped=sex_dropped,
              quality_dropped=quality_dropped,
-             threshold=round(dynamic_threshold, 5))
+             # The two knobs, apart. They OVERLAP -- a trial can fail both --
+             # so these do not sum to quality_dropped, and quality_dropped_floor
+             # alone does not say whether the absolute knob did any work the
+             # percentile had not already done. quality_dropped_floor_only does.
+             quality_dropped_percentile=quality_drops["percentile"],
+             quality_dropped_floor=quality_drops["floor"],
+             quality_dropped_floor_only=quality_drops["floor_only"],
+             medcpt_floor=MEDCPT_SCORE_FLOOR,
+             # None when the pool reaching the gate was empty -- no cut was
+             # made, so there is no score to report. round(None, 5) raises, so
+             # the guard is not decoration.
+             threshold=(round(dynamic_threshold, 5)
+                        if dynamic_threshold is not None else None))
 
     return {
         "filtered_trials": quality_filtered,
@@ -392,7 +410,28 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
         "age_dropped": age_dropped,
         "sex_dropped": sex_dropped,
         "quality_dropped": quality_dropped,
-        "quality_threshold": float(dynamic_threshold),
+        # THE TWO KNOBS, SEPARATELY. The gate stopped being one number, so one
+        # counter can no longer describe it: a run that lost trials to a
+        # mis-set absolute floor and a run that lost them to an unusually tight
+        # pool are the same quality_dropped and different findings.
+        #
+        # These ARE new keys in this dict, which the item 11a note above the
+        # AGE_PARSE_FAILURES counter forbids for a DEGRADATION counter. The
+        # reason given there was that the twelve characterization fixtures diff
+        # this dict field by field. Measured rather than inherited:
+        # oncotriage/fixtures/capture.py builds its stage4 block by naming keys
+        # one at a time, so a key added here is not in the fixture prefix and
+        # costs no recapture. What these are is a FILTER's own accounting, not
+        # a recovery record, and it belongs where every other drop count is.
+        "quality_dropped_percentile": quality_drops["percentile"],
+        "quality_dropped_floor": quality_drops["floor"],
+        "quality_dropped_floor_only": quality_drops["floor_only"],
+        # NULL rather than a forged number when the gate saw an empty pool.
+        # float(None) RAISES, so the unguarded float() this replaced would have
+        # taken Stage 4 down on any patient whose whole pool was removed by the
+        # MeSH / stage / histology / age / sex filters above.
+        "quality_threshold": (float(dynamic_threshold)
+                              if dynamic_threshold is not None else None),
         # Read by Stage 5 to decide what its system prompt may assert, and
         # logged so a stored inference says whether the check ran.
         "mesh_filter_applied": mesh_filter_applied,

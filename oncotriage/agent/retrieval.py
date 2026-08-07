@@ -65,12 +65,12 @@ from oncotriage.config import (
     BM25_RETRIEVAL_SIZE,
     COLLECTION_NAME,
     MAX_VARIANT_TERMS,
+    MEDCPT_SCORE_FLOOR,
     MESH_BOOST_DIRECT_FLOOR,
     MESH_BOOST_DIRECT_FRACTION,
     MESH_BOOST_PAN_FLOOR,
     MESH_BOOST_PAN_FRACTION,
     QUALITY_THRESHOLD_PERCENTILE,
-    RERANK_SCORE_THRESHOLD,
     RRF_POOL_SIZE,
     TOP_K_CANDIDATES,
     VECTOR_RETRIEVAL_SIZE,
@@ -904,34 +904,106 @@ def unboosted_score(trial_obj: Dict, default: float = -999.0) -> float:
     return raw
 
 
+# WHY THE ABSOLUTE KNOB MOVED OFF THE FUSED SCORE. It used to be a floor on
+# the fused RRF score, named RERANK_SCORE_THRESHOLD and set to -10 -- a value
+# that dated from when Stage 3 reported a raw MedCPT score. The old shape was
+# max(percentile, floor): ONE number, so the two knobs could not both apply and
+# could not be counted apart. A fused RRF value runs about 0.01 .. 0.06, so the
+# floor could never be reached. Not rarely -- never. An RRF value is a function
+# of pool size and query count, not of quality, so no absolute threshold on one
+# can mean anything; a calibrated per-query MedCPT score is what an absolute
+# gate has to read, which is why Stage 3 now retains medcpt_score_max.
+#
+# THIS ARGUMENT IS A COMMENT AND NOT PART OF THE DOCSTRING BELOW, deliberately.
+# tests/test_package_invariants.py check 2h counts a name inside ANY string
+# literal as a read, so a deleted constant left in a docstring is invisible to
+# the scan that would report it if somebody reinstated it. A `#` comment is not
+# a string literal. Same rule pass 20f-3 applied to its own deletions.
+
 def apply_quality_gate(trials: List[Dict],
                        percentile: float = None,
-                       floor: float = None) -> tuple:
-    """Drop weak trials using a percentile of the UNBOOSTED rerank score.
+                       medcpt_floor: float = None) -> tuple:
+    """Drop weak trials with TWO INDEPENDENT KNOBS. A trial must pass both.
 
-    Gating on the boosted score would measure whether a trial received a
-    MeSH boost rather than whether it is any good: with a boost of 0.25 of
-    the spread the whole boosted cohort sits above the 25th percentile by
-    construction, so the survivors are the boosted set and the trials the
-    MeSH filter deliberately KEPT as unmappable get cut here instead. That
-    would be a second, uncounted MeSH filter. Gating on rerank_score_raw
-    keeps the boost a ranking signal only.
+    1. RELATIVE — a percentile of the UNBOOSTED rerank score, within this
+       pool. Unchanged. Gating on the boosted score would measure whether a
+       trial received a MeSH boost rather than whether it is any good: with a
+       boost of 0.25 of the spread the whole boosted cohort sits above the 25th
+       percentile by construction, so the survivors are the boosted set and the
+       trials the MeSH filter deliberately KEPT as unmappable get cut here
+       instead. That would be a second, uncounted MeSH filter. Gating on
+       rerank_score_raw keeps the boost a ranking signal only.
 
-    Returns (kept, threshold). Input order is preserved; callers sort by the
-    boosted score before calling.
+    2. ABSOLUTE — a floor on ``medcpt_score_max``, the trial's best MedCPT
+       cross-encoder score across the rerank queries. See the comment above
+       this function for why it reads that quantity and not the fused score.
+
+    A trial whose ``medcpt_score_max`` is None is NOT dropped by the floor.
+    Absence of a score is not a low score: the ``skip_cross_encoder`` ablation
+    produces None for every trial, and so does a trial no query scored.
+
+    Returns ``(kept, threshold, drops)`` where ``threshold`` is the relative
+    cut actually used -- **None on an empty pool**, where no cut was made and
+    any number would claim one -- and ``drops`` is
+    ``{"percentile": int, "floor": int, "floor_only": int}``:
+
+      percentile   dropped by the relative knob (whatever the floor said)
+      floor        dropped by the absolute knob (whatever the percentile said)
+      floor_only   dropped by the floor and NOT by the percentile — the number
+                   that says whether the absolute knob is doing any work the
+                   relative one was not already doing. The two overlap, so
+                   percentile + floor does not equal the total dropped, and
+                   reporting a single "quality_dropped" for both would make the
+                   two indistinguishable in exactly the measurement this split
+                   exists to enable.
+
+    Input order is preserved; callers sort by the boosted score before calling.
     """
     if percentile is None:
         percentile = QUALITY_THRESHOLD_PERCENTILE
-    if floor is None:
-        floor = RERANK_SCORE_THRESHOLD
+    if medcpt_floor is None:
+        medcpt_floor = MEDCPT_SCORE_FLOOR
 
     if not trials:
-        return [], floor
+        # THE RELATIVE THRESHOLD IS UNDEFINED ON AN EMPTY POOL, and None is how
+        # this project says so -- the same NULL convention as the degradation
+        # columns, where a missing value must never be forged into a clean one.
+        #
+        # NOT the floor, which is what the pre-change code returned: the floor
+        # is a MedCPT score now, and handing it back here would put a value
+        # from one quantity into the field that holds the other -- the exact
+        # confusion this change exists to end.
+        #
+        # AND NOT float("-inf"), which an earlier version of this function
+        # returned. It is honest arithmetic and invalid JSON: json.dumps emits
+        # `-Infinity`, which RFC 8259 has no literal for, and BOTH consumers of
+        # this value serialize to JSON -- the structured log line in
+        # oncotriage/observability.py and the fixture prefix in
+        # oncotriage/fixtures/capture.py. An empty Stage 4 pool would have
+        # written a log record no strict parser could read.
+        return [], None, {"percentile": 0, "floor": 0, "floor_only": 0}
 
     raw_scores = [unboosted_score(t) for t in trials]
-    threshold = max(float(np.percentile(raw_scores, percentile)), floor)
-    kept = [t for t in trials if unboosted_score(t) >= threshold]
-    return kept, threshold
+    threshold = float(np.percentile(raw_scores, percentile))
+
+    kept = []
+    drops = {"percentile": 0, "floor": 0, "floor_only": 0}
+    for t in trials:
+        by_percentile = unboosted_score(t) < threshold
+        medcpt = t.get("medcpt_score_max")
+        by_floor = medcpt is not None and float(medcpt) < medcpt_floor
+
+        if by_percentile:
+            drops["percentile"] += 1
+        if by_floor:
+            drops["floor"] += 1
+            if not by_percentile:
+                drops["floor_only"] += 1
+
+        if not by_percentile and not by_floor:
+            kept.append(t)
+
+    return kept, threshold, drops
 
 
 def node_cross_encoder_rerank(state: dict) -> dict:
@@ -1067,6 +1139,15 @@ def node_cross_encoder_rerank(state: dict) -> dict:
                 "rerank_score_raw": t.get("fusion_score", 0.0),
                 "mesh_boost":       0.0,
                 "mesh_boost_tier":  "none",
+                # DECLARED ON THIS PATH TOO, so no downstream reader has to
+                # distinguish "not resolved" from "key never written". None,
+                # emphatically not 0.0: the cross-encoder never ran, so there
+                # is no score -- and the Stage 4 absolute floor reads None as
+                # "do not judge", which is the only correct reading. A 0.0 here
+                # would put every ablation trial below any negative floor and
+                # silently turn the no_cross_encoder row into a no-trials row.
+                "medcpt_score_max":      None,
+                "medcpt_queries_scored": 0,
             }
             for t in sorted_trials[:TOP_K_CANDIDATES]
         ]
@@ -1108,10 +1189,40 @@ def node_cross_encoder_rerank(state: dict) -> dict:
         i: [] for i in range(len(trials))
     }
 
+    # THE RAW MedCPT SCORE, RETAINED. RRF throws the scores away and keeps only
+    # the ranks, which is right for FUSION -- the scores are not comparable
+    # across queries -- and wrong for anything that needs an absolute judgement,
+    # because a fused RRF value is a function of pool size and query count
+    # rather than of quality. The per-query MedCPT score is the only calibrated
+    # relevance signal this stage produces, so the strongest one is kept.
+    #
+    # MAXIMUM, not mean: a MedCPT score is per-query relevance, and the
+    # strongest single match is the evidence that the trial is relevant at all.
+    # A mean would let two deliberately-different rerank queries (they target
+    # different vocabulary dimensions, so most trials are irrelevant to at least
+    # one) drag a genuine hit down.
+    #
+    # medcpt_queries_scored is kept beside it so the maximum is interpretable:
+    # a max over 1 query and a max over 3 are different facts, and a trial no
+    # query scored gets None rather than a number nothing produced.
+    medcpt_score_max: Dict[int, float] = {}
+    medcpt_queries_scored: Dict[int, int] = {
+        i: 0 for i in range(len(trials))
+    }
+
     per_query_stats = []  # for logging
 
     for q_idx, query in enumerate(rerank_queries):
         scores = models.score_pairs(query, trial_texts)
+
+        # Bounded by len(scores) rather than len(trials) so a scorer that
+        # returned a short array under-reports the query count instead of
+        # raising here -- the same array the rank loop below is bounded by.
+        for _i in range(len(scores)):
+            _s = float(scores[_i])
+            _prev = medcpt_score_max.get(_i)
+            medcpt_score_max[_i] = _s if _prev is None else max(_prev, _s)
+            medcpt_queries_scored[_i] = medcpt_queries_scored.get(_i, 0) + 1
 
         # Log per-query score distribution
         per_query_stats.append({
@@ -1159,6 +1270,13 @@ def node_cross_encoder_rerank(state: dict) -> dict:
             "rerank_score_raw": float(rrf_score),
             "mesh_boost":       0.0,
             "mesh_boost_tier":  "none",
+            # None when no query scored this trial, never 0.0 -- a trial that
+            # was not scored and a trial that scored zero are different facts.
+            "medcpt_score_max": (
+                float(medcpt_score_max[trial_idx])
+                if trial_idx in medcpt_score_max else None
+            ),
+            "medcpt_queries_scored": medcpt_queries_scored.get(trial_idx, 0),
         }
         for trial_idx, rrf_score in sorted_by_rrf[:TOP_K_CANDIDATES]
     ]

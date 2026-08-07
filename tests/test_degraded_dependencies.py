@@ -1363,16 +1363,40 @@ check("NEGATIVE CONTROL: a patient with no histology tags keeps both trials, "
                                         "conditions": [{"display": "Neoplasm"}]}}
             )[0]["histology_dropped"], 0)
 
-# --- THE RESULT DICT IS UNCHANGED -----------------------------------------
+# --- THE RESULT DICT CARRIES NO DEGRADATION COUNTER ------------------------
 #
-# The item forbids any counter becoming a new key here, because the twelve
-# characterization fixtures diff this dict and a new field means recapturing all
-# twelve at GPT-4o prices. Pinned literally rather than derived, so a key added
-# in either direction fails.
+# WHAT THIS PINNED, AND WHAT IT PINS NOW. Item 11a forbids any DEGRADATION
+# counter becoming a key here -- AGE_PARSE_FAILURES and friends are recorded in
+# module-level Counters instead -- and the pin was written as "the key set is
+# exactly what it was before item 11a", which also froze the dict against every
+# other kind of addition.
+#
+# THE STATED REASON FOR THE WIDER FREEZE WAS WRONG, and it was checked rather
+# than inherited: it said the twelve characterization fixtures diff this dict
+# field by field, so a new key means recapturing all twelve at GPT-4o prices.
+# oncotriage/fixtures/capture.py builds its stage4 block by NAMING KEYS ONE AT A
+# TIME -- filtered_order, the six entries of its own `drops` dict,
+# quality_threshold, the two mesh_filter fields -- so a key added here does not
+# reach the fixture prefix and costs no recapture. Verified by reading the
+# builder, not assumed.
+#
+# WHAT CHANGED. The Stage 4 quality gate became two independent knobs (a
+# percentile of the unboosted fused score, and an absolute floor on
+# medcpt_score_max). They OVERLAP, so one count cannot describe them: a run
+# that lost trials to a mis-set floor and a run that lost them to a tight pool
+# are the same quality_dropped and different findings. The three added keys are
+# a FILTER'S OWN ACCOUNTING, which is what every other entry in this set is,
+# and not a recovery record, which is what item 11a's rule is about.
+#
+# So the pin keeps both halves and states them separately: the literal set
+# below (a key added in either direction fails), and the item 11a rule proper,
+# which is the "no degradation counter leaked into it" check underneath.
 _STAGE4_KEYS = {
     "filtered_trials", "candidates_after_rule_filter",
     "candidates_after_quality_filter", "mesh_dropped", "histology_dropped",
     "stage_dropped", "age_dropped", "sex_dropped", "quality_dropped",
+    "quality_dropped_percentile", "quality_dropped_floor",
+    "quality_dropped_floor_only",
     "quality_threshold", "mesh_filter_applied", "mesh_filter_skip_reason",
     "stage_timings",
 }
@@ -1388,7 +1412,7 @@ for _node in ast.walk(_filtering_tree):
 
 check_true("the Stage 4 return dict was found (non-degeneracy)",
            _returned is not None and len(_returned) > 5)
-check("and its keys are exactly what they were before item 11a",
+check("and its keys are exactly the pinned set",
       sorted(_returned or []), sorted(_STAGE4_KEYS))
 check("no degradation counter leaked into it",
       sorted(k for k in (_returned or [])

@@ -161,13 +161,13 @@ from oncotriage.config import (
     MAX_TRIALS_FOR_EVALUATION,
     MAX_TRUNCATION_SPLITS,
     MAX_VARIANT_TERMS,
+    MEDCPT_SCORE_FLOOR,
     MESH_BOOST_DIRECT_FLOOR,
     MESH_BOOST_DIRECT_FRACTION,
     MESH_BOOST_PAN_FLOOR,
     MESH_BOOST_PAN_FRACTION,
     Project_Name,
     QUALITY_THRESHOLD_PERCENTILE,
-    RERANK_SCORE_THRESHOLD,
     RRF_POOL_SIZE,
     TOP_K_CANDIDATES,
     VECTOR_RETRIEVAL_SIZE,
@@ -1309,7 +1309,12 @@ def build_environment_block() -> Dict:
             "RRF_POOL_SIZE": RRF_POOL_SIZE,
             "TOP_K_CANDIDATES": TOP_K_CANDIDATES,
             "MAX_TRIALS_FOR_EVALUATION": MAX_TRIALS_FOR_EVALUATION,
-            "RERANK_SCORE_THRESHOLD": RERANK_SCORE_THRESHOLD,
+            # Was RERANK_SCORE_THRESHOLD, a floor on the fused RRF score that
+            # could never fire. A fixture captured before this change records
+            # the old name, and File 46's diff_tunables() will report it as
+            # "<no longer defined>" -- which is the correct finding, not a
+            # harness fault: the tunable that shaped that capture is gone.
+            "MEDCPT_SCORE_FLOOR": MEDCPT_SCORE_FLOOR,
             "QUALITY_THRESHOLD_PERCENTILE": QUALITY_THRESHOLD_PERCENTILE,
             "MESH_BOOST_DIRECT_FRACTION": MESH_BOOST_DIRECT_FRACTION,
             "MESH_BOOST_PAN_FRACTION": MESH_BOOST_PAN_FRACTION,

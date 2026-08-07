@@ -100,9 +100,10 @@ from oncotriage.config import (
     MATCHING_MODEL,
     MAX_GPT4O_RETRIES,
     MAX_TRIALS_FOR_EVALUATION,
+    MEDCPT_SCORE_FLOOR,
     Project_Name,
+    QUALITY_THRESHOLD_PERCENTILE,
     RATE_LIMIT,
-    RERANK_SCORE_THRESHOLD,
     TOP_K_CANDIDATES,
     qdrant_endpoint_sources,
 )
@@ -553,7 +554,18 @@ def create_app():
                 # version numbers, not to widen what it answers.
                 "matching_model": MATCHING_MODEL,
                 "top_k_candidates": TOP_K_CANDIDATES,
-                "rerank_threshold": RERANK_SCORE_THRESHOLD,
+                # RENAMED, not retyped. This key was "rerank_threshold" and
+                # carried RERANK_SCORE_THRESHOLD = -10, a floor on the FUSED
+                # RRF score -- which runs about 0.01 .. 0.06, so the value it
+                # reported could never fire. The constant is deleted and the
+                # Stage 4 absolute knob is a floor on the MedCPT cross-encoder
+                # score instead. Keeping the old key over the new quantity
+                # would leave one name covering two different measurements,
+                # which is the defect this change exists to remove; a client
+                # reading "rerank_threshold" gets a KeyError and looks, rather
+                # than silently reading a MedCPT score as an RRF one.
+                "medcpt_score_floor": MEDCPT_SCORE_FLOOR,
+                "quality_threshold_percentile": QUALITY_THRESHOLD_PERCENTILE,
                 "max_trials_for_evaluation": MAX_TRIALS_FOR_EVALUATION,
                 "max_gpt4o_retries": MAX_GPT4O_RETRIES
             },

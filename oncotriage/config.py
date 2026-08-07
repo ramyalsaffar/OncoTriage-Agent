@@ -131,8 +131,8 @@ MATCHING_MODEL = "gpt-5.6-terra"  # For criterion-level evaluation
 # checkpoint and the token IDs address a different vocabulary than the
 # embedding matrix was trained on. transformers raises nothing for that -- it
 # will happily run a BERT tokenizer into a BERT-shaped model -- so the run
-# produces scores, node_cross_encoder_rerank sorts them, RERANK_SCORE_THRESHOLD
-# drops some, and the only symptom is that the ranking is noise. That is the
+# produces scores, node_cross_encoder_rerank sorts them, the Stage 4 quality
+# gate drops some, and the only symptom is that the ranking is noise. That is the
 # same shape as the BM25 vocabulary hazard oncotriage/embedding.py exists for,
 # with the same absence of any error to notice.
 #
@@ -266,12 +266,6 @@ trial_dict = {"condition": "neoplasms",
               "age": "ADULT",
               "max_trials": 25000}
 
-# Trials re-rank score
-# dropping below threshold because they have weak relevance
-# High End ~+10, Neutral (0.0), Low End ~-25.0
-RERANK_SCORE_THRESHOLD = -10
-
-
 # MeSH relevance boost (end of Stage 3, cross-encoder rerank)
 #------------------------------------------------------------
 # Expressed as a FRACTION of the RRF score spread (max - min) inside the
@@ -295,12 +289,92 @@ MESH_BOOST_DIRECT_FLOOR = 0.005
 MESH_BOOST_PAN_FLOOR    = 0.005
 
 
-# Stage 4 dynamic quality gate
-#-----------------------------
-# Percentile of the UNBOOSTED rerank score below which a trial is dropped.
-# Computed on rerank_score_raw, never on the MeSH-boosted score: gating on the
-# boosted score would make the gate a second, uncounted MeSH filter.
+# Stage 4 dynamic quality gate — TWO INDEPENDENT KNOBS
+#-----------------------------------------------------
+# A trial is kept only if it passes BOTH. They measure different things and
+# each reports its own drop count (quality_dropped_percentile /
+# quality_dropped_floor), so a later measurement can never confuse them.
+#
+# 1. RELATIVE. Percentile of the UNBOOSTED rerank score below which a trial is
+#    dropped. Computed on rerank_score_raw, never on the MeSH-boosted score:
+#    gating on the boosted score would make the gate a second, uncounted MeSH
+#    filter.
 QUALITY_THRESHOLD_PERCENTILE = 25
+
+# 2. ABSOLUTE. Floor on the trial's best MedCPT cross-encoder score across the
+#    rerank queries (`medcpt_score_max`, written by Stage 3).
+#
+# WHY IT IS NOT A FLOOR ON THE RERANK SCORE, which is what the deleted
+# RERANK_SCORE_THRESHOLD = -10 was. That constant dated from when Stage 3
+# reported a raw MedCPT score, which runs roughly -25 .. +10 — so -10 was a
+# meaningful "weak relevance" line. Stage 3 has since moved to multi-query RRF
+# fusion, and an RRF value is a function of POOL SIZE AND QUERY COUNT, not of
+# quality: a trial ranked first by all three queries scores 3/(60+0) ~= 0.050
+# however good or bad it is, and the whole fused range is about 0.01 .. 0.06.
+# The gate took max(percentile, floor), so a floor of -10 could never be
+# reached — not rarely, NEVER — and the relative percentile was doing 100% of
+# the filtering. A patient whose four surviving trials are all excellent still
+# lost one. An absolute gate has to read the calibrated per-query score, which
+# is what medcpt_score_max retains.
+#
+# A trial whose medcpt_score_max is None is NOT dropped here: absence of a
+# score (the skip_cross_encoder ablation, or a trial no query scored) is not a
+# low score.
+#
+# PROVISIONAL, MEASURED, NOT TUNED.
+#
+# It is the 5th percentile of the observed medcpt_score_max distribution over
+# 1,200 reranked trials from 30 patients -- 10 breast + 10 colon + 10 lung,
+# classified by oncotriage/evaluation/sampling.py:classify_cancer over the
+# primary condition registries/primary_cancer.py resolves, drawn with
+# random.Random(42).sample from each filename-sorted group of the 1,000-bundle
+# FHIR corpus. Run through Stages 1-3 only -- no rule filter, no billed Stage 5
+# call -- against the live 14,324-trial index on 2026-08-07.
+#
+# OBSERVED, and the whole shape is recorded so a reader can disagree with the
+# choice of percentile from the same numbers rather than from this sentence:
+#
+#              per patient   per distinct pool
+#     p0        -12.1689         -12.1689
+#     p1        -10.6643         -10.3281
+#     p5         -8.4173          -8.4035     <- the floor
+#     p10        -7.4909          -7.4909
+#     p25        -4.6214          -4.4771
+#     p50        -2.1574          -2.1574
+#     p75        +2.1062          +2.1062
+#     p95        +4.6252          +4.9323
+#     p100      +13.9987         +13.9987
+#     mean       -1.6813   std 4.3548
+#
+#     1,200 of 1,200 reranked trials carried a score; 0 came back None.
+#     800 were scored by 3 rerank queries and 400 by 4.
+#
+# THE SECOND COLUMN IS NOT DECORATION. The 30 patients produce only 19 DISTINCT
+# reranked pools -- 760 distinct trials counted 1,200 times -- because Synthea
+# patients within one cancer type carry near-identical condition lists, so
+# Stage 1 builds the same expanded query and Stage 2 retrieves the same trials.
+# "1,200 trials" is a sample size this measurement does not have, and the
+# per-patient column is weighted by how often each pool RECURS. Both are
+# reported so neither can be mistaken for the other.
+#
+# WHICH ONE WINS IS A RULE, NOT A JUDGEMENT: the LOWER of the two, always. A
+# floor set too low drops nothing, which is the state it replaced, so the cost
+# is zero and the error is visible as floor_only == 0. Set too high it silently
+# removes trials that would have been evaluated, and that loss appears in no
+# counter and no stored row. Here the per-patient figure is lower, so it wins.
+#
+# IT WAS NOT ADJUSTED AFTERWARDS TO HIT A DROP COUNT. Measured impact on those
+# same 30 pools, by RUNNING the gate rather than by arguing from the value:
+# the relative percentile dropped 300 trials, the floor dropped 60, and the
+# floor dropped 10 THAT THE PERCENTILE DID NOT -- 6 once duplicate pools are
+# removed, across 10 of the 30 patients. Six distinct trials out of 760 is the
+# honest size of this knob's effect on this sample, and it is recorded whether
+# or not it flatters the change.
+#
+# STALE AS SOON AS ANY OF THREE THINGS MOVES: the indexed corpus, the rerank
+# queries, or the cross-encoder checkpoint. Re-measure with
+# `python measure_medcpt_scores.py`.
+MEDCPT_SCORE_FLOOR = -8.4173
 
 
 # Limiting the number of trials sent to GPT

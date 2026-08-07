@@ -12,13 +12,221 @@ import streamlit as st
 from oncotriage.config import MAX_TRIALS_FOR_EVALUATION
 from oncotriage.dashboard.data import load_trial_matches_data
 from oncotriage.dashboard.tiers import MATCH_TIER_COLORS, classify_trial_score
+# THE RATE IS NOT REIMPLEMENTED HERE. oncotriage/monitoring/drift.py already
+# owns the definition -- numerator, denominator and the three exclusions -- and
+# it is the definition the drift alert fires on. A second copy in the dashboard
+# is a second copy to drift, and the two disagreeing about what "unavailable"
+# means is precisely the failure that would make this panel worse than nothing.
+# Importing it costs no filesystem work: drift.py resolves its paths lazily.
+from oncotriage.monitoring.drift import (
+    ECOG_UNAVAILABLE_RATE_THRESHOLD,
+    ecog_unavailable_rate,
+)
+
+
+# ===========================================================================
+# ECOG AVAILABILITY
+# ===========================================================================
+#
+# NOTHING IN THE DASHBOARD READ ecog_value, ecog_selection OR
+# ecog_observations_found BEFORE THIS. Measured, not assumed: a repo-wide grep
+# for all three names returns hits only in tests/, in oncotriage/monitoring/,
+# in oncotriage/storage/ and in "Exception and Fallback Audit.md". The two
+# dashboard hits for the string "ecog" are keyword lists that scan GPT-4o's
+# free-text explanations (overview.py's clinical-gap categories,
+# match_quality.py's criterion categories) -- they read what the JUDGE SAID
+# about a missing performance status, never what the PIPELINE RECORDED about
+# one, so they cannot distinguish "no ECOG on file" from "an ECOG existed and
+# the reference date made it unusable".
+#
+# WHY IT BELONGS BESIDE THE RETRIEVAL QUALITY METRICS. When
+# DATA_SNAPSHOT_DATE drifts past the corpus, every ECOG observation falls after
+# the reference date, ecog_selection becomes 'all_after_reference_date',
+# ecog_value goes NULL, and every ECOG criterion in Stage 5 becomes
+# not_evaluable. Eligible matches fall across the board -- and the panels that
+# show the fall had nothing beside them naming the cause. This row is that
+# explanation.
+#
+# THE THREE-WAY DISTINCTION IS THE WHOLE POINT and the panel refuses to
+# collapse it. ecog_value IS NULL means one of three different things:
+#   selection NULL                          the row predates the migration
+#   selection 'none_recorded'               the patient genuinely had none
+#   selection 'all_after_reference_date' |  an observation existed and could
+#             'undated_ambiguous'           not be used  <- the actionable one
+# and ecog_value = 0 is a real, fully active patient -- the most eligible there
+# is -- so it is never treated as missing.
+
+def _render_ecog_availability(df):
+    """ECOG unavailable rate + selection-path breakdown, as a metrics row."""
+    st.subheader("🩺 ECOG Performance Status Availability")
+
+    if 'ecog_selection' not in df.columns:
+        st.info(
+            "This database predates the `ecog_*` columns in "
+            "`oncotriage/storage/database_logger.py`, so nothing here can be "
+            "said about ECOG availability. Not 0% — unknown."
+        )
+        return
+
+    result = ecog_unavailable_rate(df)
+    rate = result["metric_value"]
+    denominator = result["denominator"]
+    pre_migration = result["rows_pre_migration"] or 0
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        # None is rendered as "n/a", NEVER as 0%. ecog_unavailable_rate returns
+        # None when the denominator is below the drift module's own minimum,
+        # and "no usable sample" and "nothing was unavailable" are opposite
+        # findings that would print identically as 0%.
+        st.metric(
+            "ECOG Unavailable Rate",
+            f"{rate * 100:.1f}%" if rate is not None else "n/a",
+            delta=(f"alert: > {ECOG_UNAVAILABLE_RATE_THRESHOLD * 100:.0f}%"
+                   if result["alert"] else None),
+            delta_color="inverse",
+            help="Of the rows that REPORT an ECOG selection path, the fraction "
+                 "that had an observation on file which could not be used. "
+                 "Patients who genuinely carried no ECOG are in the "
+                 "denominator and not in the numerator — counting them as "
+                 "unavailable would make a cohort that never had the data look "
+                 "like a pipeline fault. Same definition the drift alert uses."
+        )
+
+    with col2:
+        st.metric(
+            "Rows Reporting",
+            f"{denominator:,}",
+            delta=f"{pre_migration:,} pre-migration" if pre_migration else None,
+            delta_color="off",
+            help="Rows with a non-NULL ecog_selection. Rows without one are "
+                 "excluded from the denominator entirely: they predate the "
+                 "migration, so nothing is known about their ECOG, and "
+                 "counting them as fine would dilute the rate."
+        )
+
+    with col3:
+        _unusable = result["numerator"]
+        st.metric(
+            "Observation Present but Unusable",
+            f"{_unusable:,}" if _unusable is not None else "n/a",
+            help="The numerator. An ECOG observation existed and was rejected "
+                 "— almost always because every one of them is dated after "
+                 "DATA_SNAPSHOT_DATE. Every ECOG criterion for these patients "
+                 "becomes not_evaluable in Stage 5."
+        )
+
+    with col4:
+        _scored = int(df['ecog_value'].notna().sum()) \
+            if 'ecog_value' in df.columns else 0
+        st.metric(
+            "Patients with a Usable Score",
+            f"{_scored:,}",
+            help="Rows carrying an actual ECOG grade. NOTE: a grade of 0 is "
+                 "counted here — ECOG 0 is 'fully active', the most eligible a "
+                 "patient can be, and treating it as missing is the single "
+                 "most common way to misread this column."
+        )
+
+    # --- The selection-path breakdown ---------------------------------------
+    #
+    # The rate above says HOW MUCH; this says WHICH PATH, which is what decides
+    # what an operator does next. 'all_after_reference_date' points at
+    # DATA_SNAPSHOT_DATE; 'none_recorded' points at the cohort;
+    # 'undated_ambiguous' points at the bundles.
+    _PATH_MEANING = {
+        "most_recent_on_or_before_reference":
+            "usable — the most recent observation dated on or before the "
+            "reference date",
+        "undated_single":
+            "usable — one undated observation, taken as the patient's",
+        "none_recorded":
+            "no ECOG observation existed for this patient at all",
+        "all_after_reference_date":
+            "UNUSABLE — every observation is dated AFTER "
+            "DATA_SNAPSHOT_DATE. Check the snapshot date against the corpus.",
+        "undated_ambiguous":
+            "UNUSABLE — several undated observations and no way to order them",
+    }
+
+    counts = df['ecog_selection'].value_counts(dropna=False)
+    total = int(counts.sum())
+    rows = []
+    for path, n in counts.items():
+        label = "(not reported — row predates the migration)" \
+            if pd.isna(path) else str(path)
+        rows.append({
+            "Selection Path": label,
+            "Patients": int(n),
+            "% of Rows": round(n / total * 100, 1) if total else 0.0,
+            "What it means": _PATH_MEANING.get(
+                label, "unrecognised path — not one of the five this pipeline "
+                       "writes; check oncotriage/fhir/parser.py"),
+        })
+
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # THE ALERT FLAG DECIDES THE SEVERITY, NOT THE PRESENCE OF A NOTE.
+    # ecog_unavailable_rate() writes `notes` on two quite different occasions:
+    # when the rate crossed the threshold (alert=1) and when it could not be
+    # computed at all (alert=0, metric_value None). Rendering both as
+    # st.warning -- which the first version of this panel did, found by driving
+    # the two-row scenario rather than by reading -- paints a red box over "we
+    # only have 2 rows", which reads as a pipeline fault and is not one.
+    if result["notes"]:
+        if result["alert"]:
+            st.warning(result["notes"])
+        else:
+            st.info(result["notes"])
+
+    st.caption(
+        "A high unavailable rate does not mean the patients are ineligible — "
+        "it means the pipeline could not tell. Eligible matches fall across "
+        "every panel below when this rises, and the cause is upstream of "
+        "retrieval: it is a reference-date or corpus-date question, not a "
+        "ranking one."
+    )
+
+    st.markdown("---")
 
 
 def render_performance_tab(df):
     """Render Performance tab with latency analysis."""
-    
+
+    # THE JUDGE COMES FROM THE DATA, never from MATCHING_MODEL and never from a
+    # literal, exactly as the cost breakdown does it: this table can hold rows
+    # from more than one judge, and naming the configured one relabels history
+    # every time the config moves. "GPT-4o" was written into three trace names,
+    # two axis titles, a chart title, a stage label and four captions while the
+    # configured judge was something else.
+    #
+    # RESOLVED AT THE TOP OF THE FUNCTION, not beside the first chart that uses
+    # it. The first use is the latency histogram immediately below, ~250 lines
+    # above the retrieval-quality block where an earlier version of this edit
+    # put the assignment -- a NameError on every render, caught by running the
+    # tab rather than by reading it.
+    # MEASURED ON THE REAL DATABASE, 2026-08-07: this table holds TWO judges,
+    # gpt-4o-2024-08-06 and gpt-5.6-terra. The literal "GPT-4o" these labels
+    # carried was therefore not merely stale -- it was actively wrong about
+    # every gpt-5.6-terra row on the same chart.
+    _judges_present = sorted(
+        str(m) for m in df['matching_model'].dropna().unique()
+    ) if 'matching_model' in df.columns else []
+
+    # Named while the list is short enough to read; counted once it is not. An
+    # axis title is not a place to enumerate eight model IDs, and truncating to
+    # the FIRST two would name some judges on a chart that plots all of them --
+    # which is the same defect as the literal, in a smaller font.
+    if not _judges_present:
+        _judge = "Stage 5 judge"
+    elif len(_judges_present) <= 2:
+        _judge = " / ".join(_judges_present)
+    else:
+        _judge = f"{len(_judges_present)} Stage 5 judges"
+
     st.header("⚡ Pipeline Performance")
-    
+
     # Latency Overview
     st.subheader("Latency Distribution")
     
@@ -57,9 +265,9 @@ def render_performance_tab(df):
             df,
             x='gpt4o_evaluation_time',
             nbins=30,
-            labels={'gpt4o_evaluation_time': 'GPT-4o Time (seconds)'},
+            labels={'gpt4o_evaluation_time': f'{_judge} Time (seconds)'},
             template='plotly_white',
-            title='GPT-4o Evaluation Latency'
+            title=f'{_judge} Evaluation Latency'
         )
         fig_gpt4o.add_vline(
             x=df['gpt4o_evaluation_time'].median(),
@@ -217,7 +425,7 @@ def render_performance_tab(df):
         'Hybrid Retrieval',
         'Cross-Encoder',
         'Rule Filter',
-        'GPT-4o Evaluation'
+        f'{_judge} Evaluation'
     ]
     
     median_times = [df[col].median() for col in stage_cols]
@@ -286,11 +494,11 @@ def render_performance_tab(df):
     
     slowest.columns = [
         'Rank', 'Patient ID', 'Age', 'Sex', 'Conditions', 'Medications',
-        'Trials Evaluated', 'Total Time (s)', 'GPT-4o Time (s)', 'Output Tokens'
+        'Trials Evaluated', 'Total Time (s)', f'{_judge} Time (s)', 'Output Tokens'
     ]
     
     slowest['Total Time (s)'] = slowest['Total Time (s)'].round(1)
-    slowest['GPT-4o Time (s)'] = slowest['GPT-4o Time (s)'].round(1)
+    slowest[f'{_judge} Time (s)'] = slowest[f'{_judge} Time (s)'].round(1)
     
     st.dataframe(
         slowest,
@@ -300,13 +508,31 @@ def render_performance_tab(df):
     
     st.caption(
         "Top 10 patients by total end-to-end pipeline latency. "
-        "Rank 1 = slowest. High latency typically correlates with more trials evaluated or larger GPT-4o output."
+        f"Rank 1 = slowest. High latency typically correlates with more trials "
+        f"evaluated or larger {_judge} output."
     )
 
     st.markdown("---")
 
     # ── Retrieval Quality Analysis ─────────────────────────────────────────
-    st.subheader("🎯 Retrieval Quality: Rerank Score vs Match Outcome")
+    #
+    # WHAT IS ACTUALLY PLOTTED IN THIS WHOLE SECTION, and it is not what the
+    # labels used to say. trial_matches.rerank_score is Stage 3's FUSED RRF
+    # score AFTER the MeSH relevance boost -- oncotriage/agent/terminal.py
+    # writes the boosted value into that column and rerank_score_raw beside it.
+    # It is not a MedCPT score. Every chart here read "Rerank Score" and every
+    # caption attributed it to MedCPT, which is true of the input to the fusion
+    # and false of the number on the axis: a fused RRF value is a function of
+    # pool size and query count, so the axis is not a relevance scale and a
+    # cutoff on it does not mean what a cutoff on a MedCPT score would.
+    #
+    # THE LABEL IS A CONSTANT, ONCE. Six charts, axes and captions named the
+    # quantity; they now cannot disagree with each other.
+    _SCORE_LABEL = "Fused Rerank Score (RRF, MeSH-boosted)"
+
+    _render_ecog_availability(df)
+
+    st.subheader(f"🎯 Retrieval Quality: {_SCORE_LABEL} vs Match Outcome")
 
     trial_matches_perf = load_trial_matches_data()
 
@@ -370,16 +596,16 @@ def render_performance_tab(df):
                     x=recall_df['Rerank Threshold'],
                     y=recall_df['Trials Sent (%)'],
                     mode='lines',
-                    name='Trials Sent to GPT-4o',
+                    name=f'Trials Sent to {_judge}',
                     line=dict(color='#1f77b4', width=2.5, dash='dash')
                 ))
                 
                 fig_recall.update_layout(
-                    title='Recall vs Cost Tradeoff by Rerank Threshold',
+                    title=f'Recall vs Cost Tradeoff by {_SCORE_LABEL} Cutoff',
                     height=350,
                     margin=dict(l=20, r=20, t=40, b=20),
                     template='plotly_white',
-                    xaxis_title='Rerank Score Threshold (cutoff)',
+                    xaxis_title=f'{_SCORE_LABEL} — cutoff',
                     yaxis_title='Percentage (%)',
                     legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
                     hovermode='x unified'
@@ -425,7 +651,7 @@ def render_performance_tab(df):
                             text=(
                                 f"✅ Safe score cutoff (≥95% recall):<br>"
                                 f"~{avg_safe_trials} trials/patient avg<br>"
-                                f"Saves {cost_saved_safe}% GPT-4o cost"
+                                f"Saves {cost_saved_safe}% {_judge} cost"
                             ),
                             showarrow=True,
                             arrowhead=2,
@@ -444,10 +670,17 @@ def render_performance_tab(df):
                 st.plotly_chart(fig_recall, use_container_width=True)
 
                 st.caption(
-                    "Each point on the x-axis is a candidate rerank score cutoff — trials scoring below it are filtered before GPT-4o. "
-                    "Green = fraction of true matches still captured; dashed blue = fraction of all trials still sent (proxy for GPT-4o cost). "
-                    "When both lines track closely, no aggressive score cutoff is safe without sacrificing recall — "
-                    "confirming that MedCPT scores topical relevance uniformly and eligibility discrimination belongs to GPT-4o."
+                    f"Each point on the x-axis is a candidate cutoff on the **{_SCORE_LABEL}** — "
+                    f"the value stored in trial_matches.rerank_score, which is Stage 3's RRF fusion of the "
+                    f"per-query MedCPT rankings with the MeSH relevance boost added. It is NOT a MedCPT score: "
+                    f"an RRF value is a function of pool size and query count, so this axis is a ranking "
+                    f"position in disguise and not a calibrated relevance scale. The absolute knob in the "
+                    f"Stage 4 quality gate reads medcpt_score_max instead, which is not yet a column of "
+                    f"trial_matches and so cannot be plotted here. "
+                    f"Green = fraction of true matches still captured; dashed blue = fraction of all trials "
+                    f"still sent (proxy for {_judge} cost). "
+                    f"When both lines track closely, no aggressive cutoff on this quantity is safe without "
+                    f"sacrificing recall."
                 )
 
                 # ── Top-N Cap: Recall vs Cost by Trials Per Patient ───────────
@@ -486,7 +719,7 @@ def render_performance_tab(df):
                     x=topn_df['Trials Per Patient'],
                     y=topn_df['Trials Sent (%)'],
                     mode='lines',
-                    name='Trials Sent to GPT-4o',
+                    name=f'Trials Sent to {_judge}',
                     line=dict(color='#1f77b4', width=2.5, dash='dash')
                 ))
 
@@ -495,7 +728,7 @@ def render_performance_tab(df):
                     height=350,
                     margin=dict(l=20, r=20, t=40, b=20),
                     template='plotly_white',
-                    xaxis_title='Trials Sent to GPT-4o Per Patient (N)',
+                    xaxis_title=f'Trials Sent to {_judge} Per Patient (N)',
                     yaxis_title='Percentage (%)',
                     legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
                     hovermode='x unified'
@@ -537,8 +770,8 @@ def render_performance_tab(df):
                                 y=alt_recall_n,
                                 text=(
                                     f"Cut {current_max}→{alt_max} trials per patient:<br>"
-                                    f"❌ Lose {recall_lost}% of matches ({matched_lost} matched trials of current db never reach GPT-4o)<br>"
-                                    f"✅ Save {cost_saved}% GPT-4o cost"
+                                    f"❌ Lose {recall_lost}% of matches ({matched_lost} matched trials of current db never reach {_judge})<br>"
+                                    f"✅ Save {cost_saved}% {_judge} cost"
                                 ),
                                 showarrow=True,
                                 arrowhead=2,
@@ -573,7 +806,7 @@ def render_performance_tab(df):
                                 text=(
                                     f"✅ Safe cap (≥95% recall):<br>"
                                     f"{safe_n} trials/patient<br>"
-                                    f"Saves {cost_saved_safe}% GPT-4o cost"
+                                    f"Saves {cost_saved_safe}% {_judge} cost"
                                 ),
                                 showarrow=True,
                                 arrowhead=2,
@@ -592,11 +825,11 @@ def render_performance_tab(df):
                 st.plotly_chart(fig_topn, use_container_width=True)
 
                 st.caption(
-                    "Each point on the x-axis is a per-patient top-N cap — only the N highest rerank-scoring trials "
-                    "per patient are sent to GPT-4o. Green = fraction of true matches still captured; "
-                    "dashed blue = fraction of all trials still sent (proxy for GPT-4o cost). "
-                    "Use this chart to find the minimum N that preserves ≥95% recall, "
-                    "directly informing the MAX_TRIALS_FOR_EVALUATION config value."
+                    f"Each point on the x-axis is a per-patient top-N cap — only the N trials with the highest "
+                    f"**{_SCORE_LABEL}** per patient are sent to {_judge}. Green = fraction of true matches still "
+                    f"captured; dashed blue = fraction of all trials still sent (proxy for {_judge} cost). "
+                    f"Use this chart to find the minimum N that preserves ≥95% recall, "
+                    f"directly informing the MAX_TRIALS_FOR_EVALUATION config value."
                 )
 
             # ── Row 2: Strip plot + KDE side by side ─────────────────────────
@@ -629,12 +862,12 @@ def render_performance_tab(df):
                     ))
 
                 fig_strip.update_layout(
-                    title='Rerank Score by Match Outcome (each dot = one trial)',
+                    title=f'{_SCORE_LABEL} by Match Outcome (each dot = one trial)',
                     height=350,
                     margin=dict(l=20, r=20, t=40, b=20),
                     template='plotly_white',
                     xaxis_title='Match Status',
-                    yaxis_title='Rerank Score',
+                    yaxis_title=_SCORE_LABEL,
                     xaxis=dict(categoryorder='array', categoryarray=category_order),
                 )
                 st.plotly_chart(fig_strip, use_container_width=True)
@@ -690,11 +923,11 @@ def render_performance_tab(df):
                     )
 
                 fig_kde.update_layout(
-                    title='Rerank Score Density by Outcome (aggregated)',
+                    title=f'{_SCORE_LABEL} Density by Outcome (aggregated)',
                     height=350,
                     margin=dict(l=20, r=20, t=40, b=20),
                     template='plotly_white',
-                    xaxis_title='Rerank Score',
+                    xaxis_title=_SCORE_LABEL,
                     yaxis_title='Density',
                     legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
                 )
@@ -702,28 +935,34 @@ def render_performance_tab(df):
                 st.plotly_chart(fig_kde, use_container_width=True)
 
             st.caption(
-                "Left: each dot is one trial scored by MedCPT. Overlapping distributions across outcome groups are expected — "
-                "MedCPT measures topical relevance, not eligibility. "
-                "Right: aggregated score distributions confirm both groups are oncologically relevant; "
-                "GPT-4o handles eligibility discrimination in the next stage. Dashed lines mark group medians."
+                f"Left: each dot is one trial, at its **{_SCORE_LABEL}**. Overlapping distributions across "
+                f"outcome groups are expected — the underlying MedCPT cross-encoder measures topical relevance, "
+                f"not eligibility, and the RRF fusion plotted here compresses even that into a rank-derived "
+                f"value. Right: the aggregated distributions. "
+                f"{_judge} handles eligibility discrimination in the next stage. Dashed lines mark group medians."
             )
 
             # Summary metrics
             col1, col2, col3 = st.columns(3)
             with col1:
                 median_match = tm_perf[tm_perf['eligible'] == 'eligible']['rerank_score'].median()
-                st.metric("Median Rerank Score (Matches)", f"{median_match:.3f}" if not pd.isna(median_match) else "N/A")
+                st.metric(f"Median {_SCORE_LABEL} (Matches)",
+                          f"{median_match:.3f}" if not pd.isna(median_match) else "N/A")
             with col2:
                 median_nonmatch = tm_perf[tm_perf['eligible'] == 'not_eligible']['rerank_score'].median()
-                st.metric("Median Rerank Score (Not Eligible)", f"{median_nonmatch:.3f}" if not pd.isna(median_nonmatch) else "N/A")
+                st.metric(f"Median {_SCORE_LABEL} (Not Eligible)",
+                          f"{median_nonmatch:.3f}" if not pd.isna(median_nonmatch) else "N/A")
             with col3:
                 separation = median_match - median_nonmatch if not pd.isna(median_match) and not pd.isna(median_nonmatch) else None
                 st.metric("Score Separation", f"{separation:.3f}" if separation is not None else "N/A",
                          help=(
-                             "Difference in median MedCPT rerank scores between matches and non-matches. "
-                             "Values near zero are expected — MedCPT is a topical relevance model (trained on PubMed search logs), "
-                             "not an eligibility classifier. All retrieved trials are oncologically relevant by design; "
-                             "eligibility discrimination is handled by GPT-4o in the next pipeline stage."
+                             f"Difference in the median {_SCORE_LABEL} between matches and non-matches. "
+                             f"Values near zero are expected, for TWO reasons that are usually conflated: the "
+                             f"underlying MedCPT cross-encoder is a topical relevance model (trained on PubMed "
+                             f"search logs) and not an eligibility classifier, AND this axis is an RRF value, "
+                             f"which is derived from rank position within a fixed-size pool and therefore has a "
+                             f"narrow range by construction. All retrieved trials are oncologically relevant by "
+                             f"design; eligibility discrimination is handled by {_judge} in the next stage."
                          ))
         else:
             st.info("No rerank score data available for the selected filters.")

@@ -188,13 +188,26 @@ class TrialMatchState(TypedDict):
     # trials removed for reasons that could only be guessed at, and the age and
     # sex drops in particular were bare `continue`s with nothing recorded.
     #
-    # quality_threshold is the score the gate actually used, not the configured
-    # floor: it is max(percentile of the surviving pool, RERANK_SCORE_THRESHOLD),
-    # so the configured constant alone does not say where the cut fell.
+    # quality_threshold is the RELATIVE cut the gate actually used -- the
+    # QUALITY_THRESHOLD_PERCENTILE of this pool's unboosted fused scores -- so
+    # the configured percentile alone does not say where the cut fell.
+    #
+    # THE GATE IS TWO KNOBS AND THEY OVERLAP. quality_dropped is the total; the
+    # three below split it. percentile + floor does NOT equal quality_dropped,
+    # because a trial can fail both. floor_only is the one that answers "is the
+    # absolute knob doing anything the relative knob was not already doing".
+    # quality_threshold describes ONLY the relative knob; the absolute one cuts
+    # at MEDCPT_SCORE_FLOOR, which is a MedCPT score and not comparable to it.
     age_dropped: int                            # Trials dropped by the age window
     sex_dropped: int                            # Trials dropped by the sex requirement
-    quality_dropped: int                        # Trials dropped by the dynamic quality gate
-    quality_threshold: float                    # Unboosted score the gate cut at
+    quality_dropped: int                        # Trials dropped by the quality gate, both knobs
+    quality_dropped_percentile: int             # ...of which, by the relative percentile
+    quality_dropped_floor: int                  # ...of which, by the absolute MedCPT floor
+    quality_dropped_floor_only: int             # ...by the floor and NOT by the percentile
+    # NULL when the gate saw an EMPTY pool -- every trial was already removed
+    # by the per-trial filters above, so no cut was made and any number here
+    # would claim one. Same NULL convention as the degradation columns.
+    quality_threshold: float                    # Unboosted fused score the relative knob cut at, or None
 
 
     patient_trees: set                           # Resolved MeSH C04 tree numbers (Stage 3 → Stage 4)

@@ -504,6 +504,15 @@ LOGGABLE_FIELDS = frozenset({
     # age check skipped, and conflating the two would misreport the funnel.
     "mesh_dropped", "stage_dropped", "histology_dropped", "age_dropped",
     "age_unparsed", "sex_dropped", "quality_dropped",
+    # The quality gate is two independent knobs, so one drop count cannot
+    # describe it. They OVERLAP -- a trial can fail both -- which is why
+    # quality_dropped_floor_only is carried as well: without it, a floor count
+    # and a percentile count that sum past the total are uninterpretable.
+    # medcpt_floor is the configured value the absolute knob used, so a stored
+    # line says where the cut was without a second lookup into the config of
+    # the day. None of the four names a trial, a patient or a diagnosis.
+    "quality_dropped_percentile", "quality_dropped_floor",
+    "quality_dropped_floor_only", "medcpt_floor",
 
     # --- retrieval and filtering shape ------------------------------------
     "channel", "channels", "degraded", "expansion_path", "mesh_resolution",
