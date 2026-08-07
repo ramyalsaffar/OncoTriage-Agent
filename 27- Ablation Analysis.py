@@ -50,6 +50,17 @@ recorded with a status and excluded from the correction rather than entered as
 p = 1.0. Effect sizes are SIGNED. The minimum detectable effect for the design is
 computed once and printed in the report's methods block.
 
+``--db PATH`` (pass 20f-4) analyses a database other than the production
+``ablation_results.db``, and every table, figure and report above lands in THAT
+database's directory rather than beside the production one. It matches
+``26- Ablation Study.py --db`` exactly: same flag, same shared
+``ABLATION_DB_FILENAME``, same parent-directory guard, so a study written to a
+scratch path can now be analysed. Before this pass ``analysis.ablation_db()``
+took no argument at all and hardcoded the filename, which meant the isolation
+File 26 gained in pass 20f-1 stopped at the writer -- and it also meant the
+outputs would have been written over the production tables and figures while
+describing a different database.
+
 THIS COSTS NOTHING. It makes no model call and no network call; it reads one
 SQLite file and writes files beside it.
 
@@ -63,8 +74,10 @@ the exec-bootstrap locals every numbered file shares.
 Run from terminal:
     cd ".../03- Code"
     python "27- Ablation Analysis.py"
+    python "27- Ablation Analysis.py" --db /tmp/scratch/ablation_results.db
 """
 
+import argparse
 import os
 import sys
 
@@ -97,8 +110,29 @@ from oncotriage.ablation.analysis import main
 #------------------------------------------------------------------------------
 
 
+def parse_args():
+    """--db, matching "26- Ablation Study.py"'s flag of the same name.
+
+    Default None, which is the production database and every documented
+    command's behaviour. The help says out loud that the OUTPUTS follow the
+    database, because a run that quietly stopped updating the production tables
+    -- or, worse, one that overwrote them from a scratch database -- would be a
+    surprise. Same wording discipline as File 26's --db help.
+    """
+    parser = argparse.ArgumentParser(
+        description="Ablation analysis: tables, figures and statistical tests."
+    )
+    parser.add_argument(
+        "--db", default=None, metavar="PATH",
+        help="Analyse this SQLite database instead of the production "
+             "ablation_results.db. Every table, figure and report is written "
+             "beside it. Default: the production database."
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    main()
+    main(db_path=parse_args().db)
 
 
 #------------------------------------------------------------------------------

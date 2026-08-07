@@ -132,7 +132,9 @@ Verified rather than assumed. It is the same object as
 | `oncotriage/orchestration/dag_generator.py` | File 23 whole — the three DAG string pieces, `build_path_block`, `build_dag_content`, `write_dag_file` | `paths`, `settings`, `orchestration.home` |
 | `oncotriage/orchestration/airflow_manager.py` | File 24 whole — start/stop, the four-tier password route, status, trigger | `settings`, `orchestration.home` |
 | `oncotriage/ablation/study.py` | File 26 whole — seven configs, the stratified sample, the checkpoint, the thread pool, the `ablation_results.db` writer | `paths`, `config`, `agent.{deps,graph,patient,retrieval,state,evaluation}`, `fhir.parser`, `utils` |
-| `oncotriage/ablation/analysis.py` | File 27 whole — the comparison table, the BH-FDR Wilcoxon family, the MDE, nine figures, two reports. READS the database, never writes it | `paths`, `config` |
+| `oncotriage/ablation/common.py` | **the one** `ABLATION_DB_FILENAME` / `ABLATION_SUMMARY_FILENAME` / `_require_writable_parent`, plus `CONFIG_ORDER` / `CONFIG_LABELS` / `BASELINE` and the analysis side's `output_dir()` / `ablation_db()` (pass 20f-4) | `paths` |
+| `oncotriage/ablation/figures.py` | File 27's **nine figures** — the one module-scope `matplotlib` import on the ablation side (pass 20f-4) | `ablation.common` |
+| `oncotriage/ablation/analysis.py` | File 27's statistics — the comparison table, the BH-FDR Wilcoxon family, the MDE, two reports, `main`. READS the database, never writes it. No matplotlib | `ablation.{common,figures}`, `config` |
 | `oncotriage/evaluation/sampling.py` | File 28 whole — the seeded 10/10/10 draw into a second database | `paths` |
 | `oncotriage/evaluation/cohort_diff.py` | File 34 whole — LEGACY vs CURRENT cohort selector, read only | `paths`, `config`, `fhir.{clean,parser}`, `registries.cancer_code_registry` |
 | `oncotriage/fixtures/capture.py` | File 45 whole — the schema, the sink, the four proxies, `build_deterministic_prefix`, the fixture I/O, the three recipes, the cohort scan | `paths`, `config`, `agent.*`, `extraction.stage`, `fhir.parser`, `storage.database_logger`, `utils` |
@@ -293,7 +295,7 @@ The rules, in force and enforced:
 - **No `oncotriage` module may import another `oncotriage` module from inside a function body.** A deferred import is a dependency that no scan of an import block can see, and it never fails at import in any order, so nothing but a static scan finds it. Check 1b scans for it and carries a negative control. **Third-party imports in function bodies are exempt and must stay** — `import icd10` inside `_build_icd10_cancer_sets()` is deliberate: hoisting it would make importing the cancer registry load the whole ICD-10-CM release.
 - **Importing a package module opens no client, loads no model, touches no database, reads no file, creates no directory, resolves no directory and spawns no process.** `get_openai_client()` / `get_qdrant_client()` build once, on first call, and cache; `load_mesh_filter()` reads its four JSON lookups on call, never at import; `_build_icd10_cancer_sets()` imports `icd10` on first registry construction; every path in `oncotriage/paths.py` resolves on first read; MedCPT and FastEmbed load on first use through `oncotriage/agent/deps.py` and `oncotriage/embedding.py`. `tests/test_package_invariants.py` section 2 proves it by trapping twelve entry points — `builtins.open`, `io.open`, `socket.socket`, `socket.create_connection`, `sqlite3.connect`, `subprocess.run`/`Popen`, `os.system`/`posix_spawn`/`execv`/`fork` — **before** importing every package module, and firing each trap afterwards to show it was armed. **This got stricter in pass 20e, for free**: `03- Config.py` used to call the client factories at shim load, so any process that touched the chain opened both clients; nothing does that now.
   Pass 20c-3a's three converted files were the worst offenders in the project: File 11 built the FastEmbed model at module level, File 06 resolved three globs, **created a directory**, built the whole ICD-10-CM registry and mutated matplotlib's global style, and File 05 resolved two globs and built the registry. Each is now behind an accessor — `patients_dir()`, `manifest_path()`, `cancer_registry()`, `csv_dir()`, `json_dir()`, `output_dir()`, `ensure_output_dir()`, `apply_plot_style()`, `synthea_jar_path()`, `synthea_modules_dir()`, `output_dir_full()`.
-  **`oncotriage/fhir/explore.py` imports matplotlib, seaborn and pandas at module scope** and that is the one deliberate exception, with `oncotriage/ablation/analysis.py` the second: seven of explore's twelve functions plot and nine of analysis's do, and section 2 pre-imports those three before arming its traps — the same allowance it makes for openai, qdrant_client, numpy and langgraph.
+  **`oncotriage/fhir/explore.py` imports matplotlib, seaborn and pandas at module scope** and that is the one deliberate exception, with **`oncotriage/ablation/figures.py`** the second: seven of explore's twelve functions plot and all nine of figures' do, and section 2 pre-imports those three before arming its traps — the same allowance it makes for openai, qdrant_client, numpy and langgraph. **Pass 20f-4 moved the second exception out of `analysis.py`**, which was 1,976 lines with 24 top-level definitions of which nine touched `plt`; it is 1,503 lines and imports no plotting library now. That does **not** make importing `analysis` matplotlib-free — `main()` calls all nine, so `analysis` imports `figures` at module scope and check 1b forbids deferring it — it makes the exception 495 lines wide instead of 1,976, and it lets anything that wants the statistics without the figures import `ablation.common` and the statistics functions directly.
   The `glob` in `paths` was the one exception until pass 20c-2b, and pass 20c-2c found that the fix had a hole: `oncotriage/registries/mesh.py` still wrote `from oncotriage.paths import data_MeSH_path` at module scope, and a `from X import name` is an **attribute read**, so it fired the lazy resolver — meaning importing the *agent* globbed the whole sibling tree and raised on any machine without it. Check 2c now imports **every** package module in its own subprocess with the root pointed at a directory that does not exist. Note that no `open` trap could ever have caught this: `glob.glob` uses `os.scandir`.
   **The same trap applies to a numbered entry point's module scope**, which is why `07- FHIR Parser.py`, `09- MeSH Cancer Site Relevance Filter.py`, `13- LangGraph Agent.py` and `20- Drift Detection.py` import their lazy paths INSIDE the `__main__` guard.
 - **Nothing calls `exec_chain`, calls `exec()`, or loads a module by location.** `exec_chain` no longer exists. The one allowed `exec()` in the repository is `tests/test_storage_query_layer.py`, which execs two pre-fix functions unparsed out of a git blob so its negative controls run the real replaced code rather than a retyped copy; that allowlist is closed, argued, and checked for staleness. Section 1c enforces all of it with six planted controls.
@@ -348,6 +350,7 @@ python "29- Download Qdrant Data.py" --output-dir <scratch>
 python "26- Ablation Study.py" --sample-size 30 --configs full_pipeline no_mesh_filter
 python "26- Ablation Study.py" --summary-only        # report from existing ablation_results.db
 python "27- Ablation Analysis.py"                    # tables + figures from ablation_results.db
+python "27- Ablation Analysis.py" --db <scratch>/ablation_results.db   # analyse an isolated study; outputs land beside it
 python "28- Select Evaluation Sample.py"             # 10 breast + 10 colon + 10 lung, seed 42
 python "28- Select Evaluation Sample.py" --output-db <scratch>/sample.db
 python "34- Cohort Selector Diff Read Only.py"       # LEGACY vs CURRENT selector, read only
@@ -700,9 +703,13 @@ render function needs it, so they get their own trap run with streamlit and
 plotly pre-imported (the same allowance section 2 makes for matplotlib and
 seaborn), and with torch / transformers / icd10 still forbidden.
 
-`oncotriage.dashboard.tabs.reproducibility` is ~1,450 lines because it is **one
-function**; the tab boundary is the finest cut available without restructuring
-it, which is a redesign. Breaking it up is its own item.
+`oncotriage.dashboard.tabs.reproducibility` was ~1,450 lines because it was
+**one function**, and the tab boundary was the finest cut available without
+restructuring it. **Pass 20f-4 is that item** — see "The two function splits
+(pass 20f-4)" below. `render_reproducibility_tab` keeps its name, its module and
+its single `@st.fragment`; what came out is 4 literal tables and 19 pure helpers, and the function
+itself is 928 lines instead of 1,444;
+proven element-for-element identical through streamlit's `AppTest`.
 
 ### The query layer and the cost arithmetic (item 38)
 
@@ -1074,7 +1081,9 @@ function `os.remove`s the output database before rebuilding it.
 second module allowed to after `oncotriage/fhir/explore.py` and for the same
 reason: nine of its functions draw, and File 47 section 2 already pre-imports
 matplotlib, seaborn and pandas before arming its traps. scipy stays inside the
-three function bodies that use it.
+three function bodies that use it. (**Pass 20f-4 moved those nine functions and
+that import to `oncotriage/ablation/figures.py`**; the exception is unchanged in
+kind and now lives in a small file.)
 
 **TWO THINGS IN FILE 26 WERE REPORTED, NOT FIXED**, because a conversion pass
 whose acceptance criterion is that nothing changed is the wrong place for
@@ -2094,6 +2103,189 @@ table taking its own staleness check with it) and
 items 10 and 11 made possible — a behaviour change with nothing asserting it is
 what this project calls the defect).
 
+
+### The two function splits (pass 20f-4) — the last of item 20
+
+Two files were one function too many. Neither split may change what is rendered
+or computed, and neither does: **no money was spent**, the twelve fixtures
+replay 12/12 clean **without recapture**, and both splits were proven by
+BEHAVIOUR rather than by `ast.unparse`, because the point of both is that code
+moves BETWEEN functions and a definition-level diff cannot see that.
+
+**1. `oncotriage/dashboard/tabs/reproducibility.py` — 1,478 lines, ONE
+definition.** symtable, not reading, is what established the shape: one
+top-level function, five nested ones, and of those five only
+`status_display_map` closed over anything (`_STATUS_DISPLAY_BASE_FLIP`).
+
+**MECHANICAL, AND DONE:** four LITERAL tables hoisted to module scope
+(`_STATUS_DISPLAY_BASE_FLIP`, `_FLIP_TYPE_SEVERITY`, `_FLIP_TYPE_COLORS`,
+`_FAILURE_CATEGORIES`) and nineteen pure helpers extracted — fourteen computations
+and five figure builders, the two already-pure nested defs among them. Every
+one of them takes its inputs as arguments, calls no `st.*`, and closes over
+nothing.
+
+**`mode_colors` and `mode_fixes` STAYED**, and that is the same measurement
+reaching the opposite answer. They are DERIVED (a comprehension over
+`_FAILURE_CATEGORIES`, then one key assigned) and they are MUTATED after
+construction. Hoisting a derived table is a behaviour change wearing the costume
+of a move, and a module-level mutable rebuilt by every rerun is exactly the
+hazard section 6a of `tests/test_package_invariants.py` exists to catch for
+`MATCH_TIERS` / `MATCH_TIER_COLORS`.
+
+**JUDGEMENT, AND LEFT:** every `st.*` call, every early return, both
+`st.expander` blocks and the whole control flow. They share `grouped`,
+`relevant_matches`, `patient_groups` and `flipped_comps_enriched` with what
+follows, so cutting there means threading four to six arguments through a
+wrapper that renders and returns nothing. A smaller honest split beats a
+complete one that guesses.
+
+**EXTRACT, DO NOT DECORATE.** Nothing extracted carries a decorator.
+`render_reproducibility_tab` keeps its name, its module and its ONE
+`@st.fragment`: a helper called from INSIDE the fragment changes nothing about
+what re-runs, while a helper carrying its own `@st.fragment` would create a
+NESTED fragment and change it. The decorator inventory (section 2i) is
+**unchanged**, and so is `_F21_HOMES` — no pinned tab name or home moved.
+
+**THE THREE WIDGET KEYS ARE UNMOVED AND CHECKED**: `repro_collection_filter`,
+`flip_deep_dive_selector`, `drift_deep_dive_selector`. A key is session state,
+so renaming one silently resets a widget for every user whose session carried
+it. The AppTest capture records each key, its label, its option list and its
+value.
+
+**TWO PAIRS THAT LOOK LIKE DUPLICATES, MEASURED RATHER THAN ASSUMED.** The flip
+deep dive and the score-drift deep dive carried CHARACTER-IDENTICAL copies of
+the `criterion_details` parse and of the criterion-alignment loop, and two
+`normalize_criterion` / `normalize_criterion_text` closures with identical
+bodies; those are shared now. Their **diff-row builders are NOT the same and are
+NOT shared** — the flip one has a `_rejected_` branch (GPT-4o stops evaluating
+after the first disqualifier, so a rejected run renders "🚫 Not Evaluated
+(Rejected)" rather than "—") and tracks patient values; the drift one has
+neither, because every run that reaches the drift table was eligible. Merging
+them would have put a rejected branch into a table that cannot contain one.
+
+**HOW IT WAS PROVED: streamlit's `AppTest`, element for element**, the same
+comparison pass 20c-3c-1 used. The tab is rendered from the real
+`inferences.db` (1,106 inferences, 12,862 trial matches) and everything it
+produces is captured in full — 32 metrics with labels/values/deltas, 52
+markdown, 15 captions, 5 subheaders, 8 dataframes as complete CSV, 3 selectboxes
+with their KEYS, 6 plotly figures as their complete JSON spec, and the type of
+all 183 elements in document order. **Before and after are identical in every
+one of those, with zero exceptions.**
+
+**AND ON FIVE MORE SCENARIOS, because the production database cannot reach the
+empty branches** — there are always flips and always score drift. Synthetic
+frames drive `no_collection_column`, `no_repeats` (the two-metric branch),
+`no_overlap`, `perfectly_stable` (both `st.success` else-branches) and
+`empty_hash_column` (which forces `_build_patient_groups` onto its
+(patient, collection) fallback key and renders the whole deep dive). All five
+compare the pre-split module out of `git show HEAD:` against the shipped one and
+all five are identical. **The first attempt at `no_repeats` returned at an
+EARLIER guard than the one it was written for** — an empty `trial_matches`
+frame — so it tested a branch it never reached; it is recorded because that is
+the shape a scenario harness fails in silently.
+
+**SEVEN PLANTED DEFECTS, SIX CAUGHT, AND THE SEVENTH IS A FINDING.** Plants ran
+against a COPY of the package, never the shipped file, and the copy was restored
+byte-identically. A used flip-type colour, a `fix` string, a metric percentage,
+a helper's sort direction, a figure height and a WIDGET KEY were each caught, in
+`plotly_specs` / `dataframes` / `metrics` / `selectboxes` respectively. Dropping
+`.lower()` from `_normalize_criterion` was not caught, because the criteria in
+the selected flip already agree in case.
+
+**THREE EARLIER PLANTS WERE NO-OPS ON THIS DATA, AND MEASURING THAT IS THE
+POINT** — a plant that is not a behaviour change is not a test of the harness
+(pass 20c-3d's rule, restated as an event). Changing
+`_FLIP_TYPE_COLORS['Full Match ↔ Partial Match']` changes nothing because only
+two flip types occur in 1,106 inferences (`Rejection ↔ Partial Match` 63,
+`Rejection ↔ Zero Score` 3). Dropping `'metastatic'` from a keyword list changes
+nothing because four other keywords in the same category still match (9 → 9).
+`n > 1` → `n > 2` in `_group_metrics` changes nothing because no group has n = 2
+(they are 1,136 / 527 / 66 / 543).
+
+**THAT THIRD FACT CAUGHT A REAL BUG IN THIS PASS, AND THE APPTEST PROOF COULD
+NOT HAVE.** The first draft of `_FLIP_TYPE_COLORS` was hand-transcribed and had
+`#2ecc71` where the original has `#2ca02c` — and since that entry is never
+rendered on this corpus, the element-for-element comparison passed. What caught
+it is a second check that does not depend on the data at all: **every hoisted
+literal is lifted out of `git show HEAD:` by AST, evaluated with
+`ast.literal_eval`, and compared to the module constant, VALUE and KEY ORDER**
+(the failure-mode chart iterates `_FAILURE_CATEGORIES` keys, so order is
+load-bearing), and the three moved function bodies are compared with
+`ast.unparse`, docstring aside. 21 assertions, all passing after the fix. **Do
+not hand-transcribe a literal in a move; lift it and compare it.**
+
+**2. `oncotriage/ablation/analysis.py` — 1,976 lines, 24 top-level
+definitions.** An AST walk over every `Name` load in each definition says NINE
+of them touch `plt`, and `matplotlib.pyplot` was the only plotting import, at
+module scope. Those nine are now `oncotriage/ablation/figures.py`, extracted
+**by AST span and never retyped**, with exactly two mechanical edits per body,
+each asserted rather than assumed: `output_dir() / "x.png"` → `out_dir / "x.png"`,
+and `out_dir` added as a required second parameter. Required, not defaulting —
+a default means a caller who forgets it during a `--db` run writes nine PNGs
+into the PRODUCTION results directory describing a scratch database, which is
+the `empty_database(db_path, flag)` argument again. `main()` is the only caller
+in the repository, checked before the signature moved.
+
+**`oncotriage/ablation/common.py` EXISTS TO BREAK A CYCLE, and the cycle is
+real.** `analysis.main()` calls the nine, so `analysis` must import `figures` at
+MODULE scope — check 1b forbids a package import in a function body — and the
+figures need `CONFIG_ORDER`, `CONFIG_LABELS`, `BASELINE` and `output_dir()`,
+which used to live in `analysis`. Importing them back would be the cycle. They
+live in `common`, and both modules import DOWN into it.
+
+**WHAT REMAINS LARGEST, REPORTED AND NOT SPLIT IN THIS PASS**, as instructed:
+`generate_report` is **416 lines**, a third of what is left, and it is one
+function that appends to one `lines` list. It is a genuine candidate — the
+report has eight clearly-titled blocks — but splitting it is a second pass with
+its own proof, and this pass promised the two it named.
+
+**ITEM 6, AND IT WAS TWO DEFECTS RATHER THAN ONE.** `analysis.ablation_db()`
+took no argument and HARDCODED `"ablation_results.db"` while
+`study.ablation_db(db_path)` took a path and read `ABLATION_DB_FILENAME`. So a
+study written with File 26's `--db` — the isolation pass 20f-1 added — **could
+not be analysed at all**, and the filename existed as a constant AND as a
+literal that can drift, the shape pass 20f-2 removed for the MedCPT checkpoint
+and pass 20c-3a for the BM25 sparse model. Both constants and
+`_require_writable_parent` moved to `common`; `study` imports them by NAME so
+`study.ABLATION_DB_FILENAME` still resolves, which
+`tests/test_ablation_db_isolation.py` reads.
+
+**THE EXISTING PARENT-DIRECTORY GUARD IS REUSED, NOT REIMPLEMENTED.** Pass
+20f-3 built it and gave it a message that names the directory; a second copy in
+the reader is a second copy to drift. The ONE thing added is an
+`example_command` argument, so File 26's message is byte-identical to what pass
+20f-3 shipped (that is its default) and File 27's names File 27 — **verified by
+running both**. `study.ablation_db()` and `study.ablation_summary_json()`
+deliberately keep their own bodies and their own `_RESOLVED` cache, because
+`tests/test_ablation_db_isolation.py` installs a decoy into `study._RESOLVED` by
+name and a delegating function would leave that decoy unread and the test
+passing for the wrong reason.
+
+**THE OUTPUTS FOLLOW THE DATABASE, and that is a behaviour change beyond the
+letter of the item.** `output_dir(db_path)` returns the database's directory,
+on exactly the argument `study.ablation_summary_json()` already made: without
+it, `--db` would read a scratch database and OVERWRITE the production tables and
+figures with numbers computed from it. The default path is untouched, so no
+documented command moves.
+
+**THE TEST COUNTS DID NOT MOVE.** All twenty-one files report exactly what
+they reported before — including `tests/test_package_invariants.py` at **247**,
+whose decorator inventory (2i), `_F21_HOMES` pin (6f), fifteen-dashboard-module
+count (6a) and never-read-name scan (2h) are the four this pass could most
+easily have disturbed. `tests/run_serial_tests.py` passes 5/5, and
+`oncotriage/config.py` and `oncotriage/registries/cancer_code_registry.py` were
+confirmed restored afterwards. The twelve fixtures replay 12/12 clean.
+
+**HOW IT WAS PROVED: every artifact, as bytes.** The analysis was run against
+the real 525-row `ablation_results.db` before and after, into scratch
+directories, and all **17 artifacts are byte-identical — 7 CSVs, 2 reports and
+all 9 PNGs**. Byte comparison is valid because two BEFORE runs were first shown
+to produce identical bytes for all 17, PNGs included. **Six planted defects were
+each caught**: a `CONFIG_ORDER` reordering (16 of 17 artifacts move), a
+`CONFIG_LABELS` edit (15), a figure colour (1), a figure size (1), the bootstrap
+seed (3) and a changed output filename (1). The default path was then run for
+real through `python "27- Ablation Analysis.py"` with no flag, and the
+production results directory is **byte-unchanged**, all 19 files.
 
 ## Persistence and observability
 

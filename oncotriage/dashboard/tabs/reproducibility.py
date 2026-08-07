@@ -1,12 +1,52 @@
 """
 Reproducibility tab. Moved verbatim out of "21- Streamlit Dashboard.py"
-(pass 20c-3c-1).
+(pass 20c-3c-1); the one function it held was broken up in pass 20f-4.
 
-THIS MODULE IS 1,400+ LINES BECAUSE IT IS ONE FUNCTION. The tab split is the
-finest cut available without restructuring ``render_reproducibility_tab``
-itself, which would be a redesign rather than a relocation and does not belong
-in the same pass as an equivalence proof. Breaking it up is recorded as its own
-item.
+WHAT PASS 20f-4 DID, AND WHAT IT DELIBERATELY DID NOT
+-----------------------------------------------------
+Pass 20c-3c-1 recorded this module as "1,400+ lines because it is ONE function"
+and called breaking it up its own item. This is that item, and it is a
+MECHANICAL split only: every piece moved out is either a LITERAL TABLE or a
+function of its arguments alone -- no ``st`` call, no closure over the render
+function's locals, no read of anything the caller did not hand it.
+
+``render_reproducibility_tab`` keeps its name, its module and its ONE
+``@st.fragment``. Nothing extracted carries a decorator, and that is a decision
+rather than an omission: a helper CALLED FROM INSIDE the fragment changes
+nothing about what re-runs, while a helper carrying its own ``@st.fragment``
+would create a NESTED fragment and change it. ``tests/test_package_invariants.py``
+section 2i is an exact dict comparison keyed by ``path::qualified_name``, so a
+decorator added here fails rather than merely appearing.
+
+The three widget KEYS -- ``repro_collection_filter``,
+``flip_deep_dive_selector``, ``drift_deep_dive_selector`` -- are session state.
+Every one of them stays on the same ``st.selectbox`` call with the same string;
+moving one would silently reset a widget for every user whose session carried it.
+
+WHAT STAYED, AND WHY (the judgement half, left rather than guessed)
+------------------------------------------------------------------
+Every ``st.*`` call, every early return, both ``st.expander`` blocks and the
+whole control flow stay in the render function. They share ``grouped``,
+``relevant_matches``, ``patient_groups`` and ``flipped_comps_enriched`` with
+what follows them, so cutting at any of those points means threading four to six
+arguments through a wrapper that renders and returns nothing. A smaller honest
+split beats a complete one that guesses.
+
+TWO PAIRS THAT LOOK LIKE DUPLICATES AND ARE MEASURED RATHER THAN ASSUMED
+------------------------------------------------------------------------
+The flip deep dive and the score-drift deep dive both parse ``criterion_details``
+and both align criteria across runs, and in both cases the two copies were
+character-identical -- so ``_parse_criterion_details`` and
+``_ordered_criterion_keys`` are shared, and the two ``normalize_criterion`` /
+``normalize_criterion_text`` closures collapse into one ``_normalize_criterion``.
+
+Their DIFF-ROW BUILDERS ARE NOT the same and are NOT shared: the flip one
+carries a ``_rejected_`` branch (GPT-4o stops evaluating after the first
+disqualifier, so a rejected run has no criteria and must render
+"🚫 Not Evaluated (Rejected)" rather than "—") and tracks patient values across
+runs; the drift one has neither, because a run that reached the drift table was
+eligible in every inference. Merging them would have introduced a rejected
+branch into a table that cannot contain one.
 """
 
 from collections import Counter
@@ -18,6 +58,663 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from oncotriage.dashboard.data import load_trial_matches_data
+
+
+# ===========================================================================
+# LITERAL TABLES  (pass 20f-4)
+# ===========================================================================
+#
+# These four were function locals. Each is a LITERAL -- no expression in any of
+# them reads a value computed above it -- which is what makes hoisting them a
+# move rather than a behaviour change. They were rebuilt on every rerun of the
+# fragment and are now built once, at import.
+#
+# `mode_colors` and `mode_fixes` are NOT here, and that is the same measurement
+# reaching the opposite answer: both are DERIVED (a comprehension over
+# _FAILURE_CATEGORIES, then one key assigned), so they stay where they are built.
+# They are also MUTATED after construction, and a module-level mutable rebuilt
+# by every rerun is the hazard section 6a of tests/test_package_invariants.py
+# exists to catch for MATCH_TIERS / MATCH_TIER_COLORS.
+
+# Criterion status -> display string. `not_evaluable` is deliberately absent:
+# it is decided by _status_display_map from the patient value, not by lookup.
+_STATUS_DISPLAY_BASE_FLIP = {
+    "met": "✅ Met",
+    "not_met": "❌ Not Met",
+    "violated": "❌ Violated",
+    "not_violated": "✅ Not Violated",
+}
+
+# Severity ordering for the flip-type bar chart. Rendered descending.
+_FLIP_TYPE_SEVERITY = {
+    'Rejection ↔ Full Match': 4,
+    'Rejection ↔ Partial Match': 3,
+    'Rejection ↔ Zero Score': 2,
+    'Full Match ↔ Partial Match': 1,
+    'Other': 0,
+}
+
+_FLIP_TYPE_COLORS = {
+    'Rejection ↔ Full Match': '#d62728',
+    'Rejection ↔ Partial Match': '#ff7f0e',
+    'Rejection ↔ Zero Score': '#9467bd',
+    'Full Match ↔ Partial Match': '#2ca02c',
+    'Other': '#7f7f7f',
+}
+
+# Root-cause categories for the failure-mode analysis, keyed by display name.
+# ORDER IS LOAD-BEARING: the bar chart and the recommended-fix table iterate
+# this dict's keys, so it is the actionability ordering the caption promises.
+_FAILURE_CATEGORIES = {
+    'Temporal / Resolved Status': {
+        'keywords': [
+            'resolved', 'no current', 'not current', 'no active',
+            'historical', 'long-standing', 'years ago',
+            'requires active', 'requires current', 'requires patient undergoing',
+        ],
+        'color': '#d62728',
+        'fix': 'Present-tense rule (prompt)',
+    },
+    'Missing Data as Disqualifier': {
+        'keywords': [
+            'not confirmed', 'no data on', 'lacks evidence',
+            'does not indicate', 'not in record',
+            'has no such', 'status not confirmed',
+            'does not confirm', 'no record of',
+            'lacks this information', 'no evidence of',
+            'but no evidence of', 'record lacks',
+        ],
+        'color': '#ff7f0e',
+        'fix': 'Reinforce Rule 1 (prompt)',
+    },
+    'Disease Stage / Extent': {
+        'keywords': [
+            'metastatic', 'non-metastatic', 'oligometastatic',
+            'oligoprogressive', 'recurrent', 'locally advanced',
+            'requires metastatic', 'requires recurrent',
+            'primary small cell', 'recurrent small cell',
+            'not metastatic',
+        ],
+        'color': '#e45756',
+        'fix': 'Stage/extent mismatch — clinical ambiguity',
+    },
+    'Procedure Ambiguity': {
+        'keywords': [
+            'prior lumpectomy', 'prior breast surgery',
+            'ipsilateral breast surgery', 'prior ipsilateral',
+            'previous resection', 'polypectomy',
+            'partial resection', 'colectomy',
+            'excision of lesion',
+            'previous breast surgery', 'history of lumpectomy',
+            'axillary lymph node excision', 'axillary lymph node',
+        ],
+        'color': '#9467bd',
+        'fix': 'Irreducible — clinical ambiguity',
+    },
+    'Biomarker / Subtype': {
+        'keywords': [
+            'her2', 'triple-negative', 'triple negative',
+            'er+', 'er-', 'hr+', 'hr-',
+            'hormone receptor', 'hormone-receptor',
+            'pik3ca', 'ccne1', 'brca',
+            'biomarker', 'mutation', 'amplification',
+            'ductal carcinoma in situ', 'mammaprint',
+        ],
+        'color': '#2ca02c',
+        'fix': 'Receptor/biomarker tagging (pipeline)',
+    },
+    'Medical Concept Error': {
+        'keywords': [
+            'anemia', 'hypertension', 'diabetes',
+            'inflammatory colonic conditions (anemia',
+            'inflammatory colonic conditions',
+            'not a malignancy', 'benign',
+            'seizures', 'seizure',
+        ],
+        'color': '#e377c2',
+        'fix': 'Neoplasm tagging (pipeline)',
+    },
+    'Terminology Mismatch': {
+        'keywords': [
+            'adenocarcinoma', 'without specified',
+            'malignant neoplasm of colon',
+            'does not have recurrent pelvic',
+        ],
+        'color': '#17becf',
+        'fix': 'Terminology matching rule (prompt Step 3)',
+    },
+    'Lab / Age Threshold': {
+        'keywords': [
+            'creatinine', 'gfr', 'hemoglobin', 'bilirubin',
+            'platelet', 'neutrophil', 'albumin',
+            'organ function', 'renal function',
+            'exceeds the age', 'age limit', 'older than',
+        ],
+        'color': '#bcbd22',
+        'fix': 'Legitimate catch — no fix needed',
+    },
+    'Treatment Requirement': {
+        'keywords': [
+            'prior chemotherapy', 'received chemotherapy',
+            'received prior', 'recent chemotherapy',
+            'neoadjuvant', 'preoperative',
+            'progression on', 'endocrine therapy',
+            'completed all', 'ongoing chemotherapy',
+            'prior therapy for', 'cisplatin', 'paclitaxel',
+            'received cisplatin', 'prior therapy',
+            'no standard protocol', 'multiline standard therapy',
+        ],
+        'color': '#7f7f7f',
+        'fix': 'Mixed — some temporal, some missing data',
+    },
+}
+
+
+# ===========================================================================
+# PURE HELPERS  (pass 20f-4) — no `st` call, no closure, no I/O
+# ===========================================================================
+
+def _build_patient_groups(grouped):
+    """Patients with 2+ inferences on one collection, as a list of dicts.
+
+    Groups on the patient hash when the column is present and non-empty, so
+    only inferences over IDENTICAL patient data are ever compared; without it
+    (old rows, written before the hash existed) it falls back to
+    (patient, collection).
+    """
+    group_keys = ['patient_id', 'qdrant_collection', 'patient_data_hash'] if 'patient_data_hash' in grouped.columns and (grouped['patient_data_hash'] != '').any() else ['patient_id', 'qdrant_collection']
+
+    patient_groups = []
+    for group_key, group in grouped.groupby(group_keys):
+        pid = group_key[0]
+        col_name = group_key[1]
+        inf_ids = group['id'].tolist()
+        if len(inf_ids) < 2:
+            continue
+        patient_groups.append({
+            'patient_id': pid,
+            'qdrant_collection': col_name,
+            'inference_ids': inf_ids,
+            'num_inferences': len(inf_ids),
+        })
+    return patient_groups
+
+
+def _build_comparisons(patient_groups, relevant_matches):
+    """One record per (patient, trial) evaluated in 2+ of that patient's runs.
+
+    A trial that appeared in only one inference is skipped: there is nothing to
+    compare it against, and including it would report perfect agreement for a
+    measurement never made.
+    """
+    comparisons = []
+    for pg in patient_groups:
+        pid = pg['patient_id']
+        col_name = pg['qdrant_collection']
+        inf_ids = pg['inference_ids']
+
+        # Get all trial matches for this patient's inferences
+        patient_matches = relevant_matches[relevant_matches['inference_id'].isin(inf_ids)]
+
+        # Group by nct_id — each trial evaluated across multiple inferences
+        for nct_id, trial_group in patient_matches.groupby('nct_id'):
+            # Only include trials present in ALL inferences for this patient
+            inferences_with_trial = trial_group['inference_id'].nunique()
+            if inferences_with_trial < 2:
+                continue  # trial only appeared in 1 inference, cannot compare
+
+            scores = trial_group['match_score'].tolist()
+            classifications = trial_group['eligible'].tolist()
+
+            score_min = min(scores)
+            score_max = max(scores)
+            score_spread = score_max - score_min
+            all_scores_identical = len(set(scores)) == 1
+            all_classifications_identical = len(set(classifications)) == 1
+
+            # Determine group category
+            unique_classifications = set(classifications)
+            if unique_classifications == {'eligible'}:
+                category = 'eligible_all'
+            elif unique_classifications == {'not_eligible'}:
+                category = 'not_eligible_all'
+            else:
+                category = 'flipped'
+
+            comparisons.append({
+                'patient_id': pid,
+                'qdrant_collection': col_name,
+                'nct_id': nct_id,
+                'num_inferences': inferences_with_trial,
+                'scores': scores,
+                'classifications': classifications,
+                'score_min': score_min,
+                'score_max': score_max,
+                'score_spread': score_spread,
+                'all_scores_identical': all_scores_identical,
+                'all_classifications_identical': all_classifications_identical,
+                'category': category,
+            })
+    return comparisons
+
+
+def _group_metrics(group_df):
+    """n, % identical scores, and mean/max/std spread for one category."""
+    n = len(group_df)
+    if n == 0:
+        return {'n': 0, 'identical_scores': 100.0, 'mean': 0.0, 'max': 0.0, 'std': 0.0}
+    identical = group_df['all_scores_identical'].sum()
+    return {
+        'n': n,
+        'identical_scores': identical / n * 100,
+        'mean': group_df['score_spread'].mean(),
+        'max': group_df['score_spread'].max(),
+        'std': group_df['score_spread'].std() if n > 1 else 0.0,
+    }
+
+
+def _summary_statistics(comp_df):
+    """Every number the Summary block renders, and the three category frames.
+
+    The three frames are returned rather than recomputed by the caller because
+    two of them (``eligible_all``, ``flipped_comps``) are read again by the
+    sections below, and a second ``comp_df[comp_df['category'] == ...]`` is a
+    second chance to disagree about which rows a section covers.
+    """
+    total_comparisons = len(comp_df)
+    flip_count = (~comp_df['all_classifications_identical']).sum()
+    flip_rate = flip_count / total_comparisons * 100 if total_comparisons > 0 else 0
+    identical_classification = (1 - flip_count / total_comparisons) * 100 if total_comparisons > 0 else 100.0
+
+    # Split into 4 mutually exclusive groups
+    eligible_all = comp_df[comp_df['category'] == 'eligible_all']
+    not_eligible_all = comp_df[comp_df['category'] == 'not_eligible_all']
+    flipped_comps = comp_df[comp_df['category'] == 'flipped']
+
+    return {
+        'total_comparisons': total_comparisons,
+        'flip_count': flip_count,
+        'flip_rate': flip_rate,
+        'identical_classification': identical_classification,
+        'eligible_all': eligible_all,
+        'not_eligible_all': not_eligible_all,
+        'flipped_comps': flipped_comps,
+        'all_m': _group_metrics(comp_df),
+        'elig_m': _group_metrics(eligible_all),
+        'flip_m': _group_metrics(flipped_comps),
+        'not_elig_m': _group_metrics(not_eligible_all),
+    }
+
+
+def _build_flip_detail(flipped_comps):
+    """Per-flip counts of eligible vs not_eligible runs, and the eligible scores."""
+    flip_rows = []
+    for _, row in flipped_comps.iterrows():
+        classifications = row['classifications']
+        scores = row['scores']
+        n_eligible = sum(1 for c in classifications if c == 'eligible')
+        n_not_eligible = sum(1 for c in classifications if c == 'not_eligible')
+        eligible_scores = [s for s, c in zip(scores, classifications) if c == 'eligible']
+
+        flip_rows.append({
+            'patient_id': row['patient_id'],
+            'nct_id': row['nct_id'],
+            'num_inferences': row['num_inferences'],
+            'n_eligible': n_eligible,
+            'n_not_eligible': n_not_eligible,
+            'eligible_scores': eligible_scores,
+            'score_spread': row['score_spread'],
+        })
+
+    return pd.DataFrame(flip_rows)
+
+
+def _format_flip_detail(flip_detail_df):
+    """The flip table as displayed: renamed, sorted by spread, 1-based Row index."""
+    flip_display = flip_detail_df.copy()
+    flip_display['Eligible Score(s)'] = flip_display['eligible_scores'].apply(
+        lambda s: f"{min(s)*100:.0f}%–{max(s)*100:.0f}%" if len(s) > 1 else (f"{s[0]*100:.0f}%" if len(s) == 1 else "—")
+    )
+
+    flip_display['Classification'] = flip_display.apply(
+        lambda r: f"{r['n_eligible']} eligible / {r['n_not_eligible']} not eligible", axis=1
+    )
+
+    flip_display = flip_display.rename(columns={
+        'patient_id': 'Patient ID',
+        'nct_id': 'NCT ID',
+        'num_inferences': 'Inferences',
+    })
+
+    flip_display = flip_display.sort_values('score_spread', ascending=False)
+
+    flip_display = flip_display[['Patient ID', 'NCT ID', 'Inferences', 'Classification', 'Eligible Score(s)']]
+    flip_display = flip_display.reset_index(drop=True)
+    flip_display.index = flip_display.index + 1
+    flip_display.index.name = "Row"
+    return flip_display
+
+
+def _classify_flip_type(classifications, scores):
+    """Classify the flip scenario from N runs."""
+    tiers_seen = set()
+    for cls, score in zip(classifications, scores):
+        if cls == 'not_eligible':
+            tiers_seen.add('Rejected')
+        elif score >= 1.0:
+            tiers_seen.add('Full Match')
+        elif score > 0.0:
+            tiers_seen.add('Partial Match')
+        else:
+            tiers_seen.add('Zero Score')
+
+    if 'Rejected' in tiers_seen and 'Full Match' in tiers_seen:
+        return 'Rejection ↔ Full Match'
+    elif 'Rejected' in tiers_seen and 'Partial Match' in tiers_seen:
+        return 'Rejection ↔ Partial Match'
+    elif 'Rejected' in tiers_seen and 'Zero Score' in tiers_seen:
+        return 'Rejection ↔ Zero Score'
+    elif 'Full Match' in tiers_seen and 'Partial Match' in tiers_seen:
+        return 'Full Match ↔ Partial Match'
+    else:
+        return 'Other'
+
+
+def _with_flip_types(flipped_comps):
+    """A copy of the flipped frame carrying a `flip_type` column."""
+    flip_types = []
+    for _, row in flipped_comps.iterrows():
+        ft = _classify_flip_type(row['classifications'], row['scores'])
+        flip_types.append(ft)
+
+    flipped_comps_enriched = flipped_comps.copy()
+    flipped_comps_enriched['flip_type'] = flip_types
+    return flipped_comps_enriched
+
+
+def _classify_failure_modes(flipped_comps_enriched, patient_groups,
+                            relevant_matches):
+    """Root-cause categories per flip, from the rejection explanation.
+
+    A flip can match several categories; one that matches none is 'Other'. The
+    explanation is taken from the FIRST not_eligible row for that (patient,
+    trial) -- there is only one rejection reason per run and every rejected run
+    of the same trial is rejecting it for the same class of reason.
+    """
+    flip_failure_modes = []
+    for _, row in flipped_comps_enriched.iterrows():
+        pid = row['patient_id']
+        nct = row['nct_id']
+
+        # Get rejection explanation for this (patient, trial)
+        patient_inf_ids_local = []
+        for pg in patient_groups:
+            if pg['patient_id'] == pid:
+                patient_inf_ids_local = pg['inference_ids']
+                break
+
+        rej_matches = relevant_matches[
+            (relevant_matches['nct_id'] == nct) &
+            (relevant_matches['eligible'] == 'not_eligible') &
+            (relevant_matches['inference_id'].isin(patient_inf_ids_local))
+        ]
+
+        explanation = ''
+        if not rej_matches.empty:
+            explanation = str(rej_matches.iloc[0].get('explanation', ''))
+
+        explanation_lower = explanation.lower()
+        matched_modes = []
+
+        for mode_name, mode_info in _FAILURE_CATEGORIES.items():
+            for kw in mode_info['keywords']:
+                if kw.lower() in explanation_lower:
+                    matched_modes.append(mode_name)
+                    break
+
+        if not matched_modes:
+            matched_modes = ['Other']
+
+        flip_failure_modes.append({
+            'patient_id': pid,
+            'nct_id': nct,
+            'flip_type': row['flip_type'],
+            'explanation': explanation,
+            'failure_modes': matched_modes,
+        })
+
+    return flip_failure_modes
+
+
+def _status_display_map(status: str, patient_value: str = "") -> str:
+    """Criterion status as displayed, with the patient value deciding two cases."""
+    pv = (patient_value or "").strip()
+    if pv.lower().startswith("not applicable"):
+        return "➖ Not Applicable"
+    if status == "not_evaluable":
+        if pv and pv.lower() != "not in patient record":
+            return "🔍 Unverifiable"
+        return "⚠️ Missing Data"
+    return _STATUS_DISPLAY_BASE_FLIP.get(status, status)
+
+
+def _parse_criterion_details(tm_row):
+    """Inclusion + exclusion criteria out of one trial_matches row.
+
+    A row with no criterion_details, or unparseable JSON, yields []: a rejected
+    run has no criteria because GPT-4o stops evaluating at the first
+    disqualifier, and that is a normal state rather than an error.
+
+    SHARED by the flip deep dive and the score-drift deep dive, which carried
+    character-identical copies of this block.
+    """
+    criteria_list = []
+    if pd.notna(tm_row.get('criterion_details')) and tm_row['criterion_details']:
+        try:
+            parsed = json.loads(tm_row['criterion_details'])
+            for c in parsed.get('inclusion', []):
+                criteria_list.append({
+                    'type': 'Inclusion',
+                    'criterion': c.get('criterion', ''),
+                    'status': c.get('status', ''),
+                    'patient_value': c.get('patient_value', ''),
+                })
+            for c in parsed.get('exclusion', []):
+                criteria_list.append({
+                    'type': 'Exclusion',
+                    'criterion': c.get('criterion', ''),
+                    'status': c.get('status', ''),
+                    'patient_value': c.get('patient_value', ''),
+                })
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            pass
+    return criteria_list
+
+
+def _normalize_criterion(text):
+    """Whitespace- and case-insensitive key for aligning criteria across runs."""
+    return ' '.join(text.lower().strip().split())
+
+
+def _ordered_criterion_keys(run_criteria):
+    """(type, normalized, display) for every distinct criterion, in run order.
+
+    First appearance wins the display text, so the table reads in the order the
+    earliest run produced. SHARED by both deep dives, which carried identical
+    copies.
+    """
+    all_criteria_keys = []
+    seen_keys = set()
+
+    for run_idx in sorted(run_criteria.keys()):
+        for c in run_criteria[run_idx]:
+            norm_key = (c['type'], _normalize_criterion(c['criterion']))
+            if norm_key not in seen_keys:
+                seen_keys.add(norm_key)
+                all_criteria_keys.append((c['type'], _normalize_criterion(c['criterion']), c['criterion']))
+    return all_criteria_keys
+
+
+def _build_patient_repro(comp_df):
+    """Per-patient reproducibility rollup, worst score agreement first."""
+    patient_repro = comp_df.groupby('patient_id').agg(
+        trials_compared=('nct_id', 'count'),
+        inferences=('num_inferences', 'max'),
+        identical_scores=('all_scores_identical', 'sum'),
+        flips=('all_classifications_identical', lambda x: (~x).sum()),
+        mean_spread=('score_spread', 'mean'),
+        max_spread=('score_spread', 'max'),
+    ).reset_index()
+
+    patient_repro['score_agreement'] = (patient_repro['identical_scores'] / patient_repro['trials_compared'] * 100).round(1)
+    return patient_repro.sort_values('score_agreement', ascending=True)
+
+
+# ===========================================================================
+# FIGURE BUILDERS  (pass 20f-4) — each returns a figure and renders nothing
+# ===========================================================================
+
+def _figure_min_max_scatter(comp_df):
+    """Min vs max score per (patient, trial), stable points and flips apart."""
+    fig_scatter = go.Figure()
+
+    # Diagonal reference line
+    fig_scatter.add_trace(go.Scatter(
+        x=[0, 1], y=[0, 1],
+        mode='lines',
+        line=dict(color='gray', dash='dash', width=1),
+        name='Perfect Agreement',
+        showlegend=True
+    ))
+
+    # Stable points (same classification across all inferences)
+    stable = comp_df[comp_df['all_classifications_identical']]
+    if not stable.empty:
+        fig_scatter.add_trace(go.Scatter(
+            x=stable['score_min'],
+            y=stable['score_max'],
+            mode='markers',
+            marker=dict(color='#2ca02c', size=6, opacity=0.6),
+            name='Stable Classification',
+            hovertemplate='Patient: %{customdata[0]}<br>Trial: %{customdata[1]}<br>Min Score: %{x:.2f}<br>Max Score: %{y:.2f}<br>Inferences: %{customdata[2]}<extra></extra>',
+            customdata=stable[['patient_id', 'nct_id', 'num_inferences']].values
+        ))
+
+    # Flipped points (classification changed across inferences)
+    flipped_chart = comp_df[~comp_df['all_classifications_identical']]
+    if not flipped_chart.empty:
+        fig_scatter.add_trace(go.Scatter(
+            x=flipped_chart['score_min'],
+            y=flipped_chart['score_max'],
+            mode='markers',
+            marker=dict(color='#d62728', size=10, symbol='x', line=dict(width=2)),
+            name='Eligibility Flipped',
+            hovertemplate='Patient: %{customdata[0]}<br>Trial: %{customdata[1]}<br>Min Score: %{x:.2f}<br>Max Score: %{y:.2f}<br>Inferences: %{customdata[2]}<extra></extra>',
+            customdata=flipped_chart[['patient_id', 'nct_id', 'num_inferences']].values
+        ))
+
+    fig_scatter.update_layout(
+        title='Min vs Max Match Score Across Inferences',
+        xaxis_title='Minimum Score (across inferences)',
+        yaxis_title='Maximum Score (across inferences)',
+        height=450,
+        margin=dict(l=20, r=20, t=40, b=20),
+        template='plotly_white',
+        xaxis=dict(range=[-0.05, 1.05]),
+        yaxis=dict(range=[-0.05, 1.05]),
+    )
+    return fig_scatter
+
+
+def _figure_spread_histogram(comp_df):
+    """Distribution of (max - min) score, with the 0.05 target line."""
+    fig_hist = px.histogram(
+        comp_df, x='score_spread', nbins=30,
+        labels={'score_spread': 'Score Spread (max - min)'},
+        template='plotly_white',
+        title='Score Spread Distribution'
+    )
+    fig_hist.add_vline(
+        x=0.05, line_dash="dash", line_color="red",
+        annotation_text="0.05 target", annotation_position="top right"
+    )
+    fig_hist.update_traces(marker_color='#1f77b4')
+    fig_hist.update_layout(
+        height=450,
+        margin=dict(l=20, r=20, t=40, b=20),
+        showlegend=False
+    )
+    return fig_hist
+
+
+def _figure_flip_types(type_counts, sorted_types, flip_count):
+    """Horizontal bar of flip types, most severe at the top."""
+    fig_flip_types = go.Figure()
+    fig_flip_types.add_trace(go.Bar(
+        x=[type_counts[t] for t in sorted_types],
+        y=sorted_types,
+        orientation='h',
+        marker_color=[_FLIP_TYPE_COLORS.get(t, '#7f7f7f') for t in sorted_types],
+        text=[f"{type_counts[t]} ({type_counts[t]/flip_count*100:.0f}%)" for t in sorted_types],
+        textposition='auto',
+    ))
+    fig_flip_types.update_layout(
+        height=max(200, len(sorted_types) * 60),
+        margin=dict(l=20, r=20, t=10, b=20),
+        template='plotly_white',
+        xaxis_title='Number of Flips',
+        yaxis=dict(autorange='reversed'),
+        showlegend=False,
+    )
+    return fig_flip_types
+
+
+def _figure_failure_modes(sorted_modes, mode_counts, mode_colors, n_flipped):
+    """Horizontal bar of failure-mode counts. A flip can appear in several."""
+    fig_modes = go.Figure()
+    fig_modes.add_trace(go.Bar(
+        x=[mode_counts.get(m, 0) for m in sorted_modes],
+        y=[f"{m} ({mode_counts.get(m, 0)})" for m in sorted_modes],
+        orientation='h',
+        marker_color=[mode_colors.get(m, '#aaaaaa') for m in sorted_modes],
+        text=[f"{mode_counts.get(m, 0)/n_flipped*100:.0f}%" for m in sorted_modes],
+        textposition='auto',
+    ))
+    fig_modes.update_layout(
+        height=max(250, len(sorted_modes) * 45),
+        margin=dict(l=20, r=20, t=10, b=20),
+        template='plotly_white',
+        xaxis_title='Number of Flips (a flip can appear in multiple categories)',
+        yaxis=dict(autorange='reversed'),
+        showlegend=False,
+    )
+    return fig_modes
+
+
+def _figure_flip_counts(counts, color):
+    """Horizontal bar of a value_counts series.
+
+    ONE builder for the two Flip Pattern charts. They were character-identical
+    apart from `marker_color` -- '#ff7f0e' for cancer type, '#9467bd' for trial
+    phase -- which is the whole of the difference and is now the argument.
+    """
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        y=counts.index,
+        x=counts.values,
+        orientation='h',
+        marker_color=color,
+        text=counts.values,
+        textposition='auto',
+    ))
+    fig.update_layout(
+        height=max(250, len(counts) * 40),
+        margin=dict(l=20, r=20, t=10, b=20),
+        template='plotly_white',
+        xaxis_title='Number of Flips',
+        yaxis=dict(autorange='reversed'),
+    )
+    return fig
 
 
 @st.fragment
@@ -94,22 +791,8 @@ def render_reproducibility_tab(df):
             grouped = grouped[grouped['qdrant_collection'] == selected_collection]
     
     # Collect all inference IDs for patients with 2+ inferences
-    group_keys = ['patient_id', 'qdrant_collection', 'patient_data_hash'] if 'patient_data_hash' in grouped.columns and (grouped['patient_data_hash'] != '').any() else ['patient_id', 'qdrant_collection']
-    
-    patient_groups = []
-    for group_key, group in grouped.groupby(group_keys):
-        pid = group_key[0]
-        col_name = group_key[1]
-        inf_ids = group['id'].tolist()
-        if len(inf_ids) < 2:
-            continue
-        patient_groups.append({
-            'patient_id': pid,
-            'qdrant_collection': col_name,
-            'inference_ids': inf_ids,
-            'num_inferences': len(inf_ids),
-        })
-    
+    patient_groups = _build_patient_groups(grouped)
+
     if not patient_groups:
         st.info("No valid comparison groups found.")
         return
@@ -125,55 +808,8 @@ def render_reproducibility_tab(df):
     
     # Build per-(patient, trial) comparisons across ALL inferences
     # For each (patient, nct_id), collect all scores and classifications from every inference
-    comparisons = []
-    for pg in patient_groups:
-        pid = pg['patient_id']
-        col_name = pg['qdrant_collection']
-        inf_ids = pg['inference_ids']
-        
-        # Get all trial matches for this patient's inferences
-        patient_matches = relevant_matches[relevant_matches['inference_id'].isin(inf_ids)]
-        
-        # Group by nct_id — each trial evaluated across multiple inferences
-        for nct_id, trial_group in patient_matches.groupby('nct_id'):
-            # Only include trials present in ALL inferences for this patient
-            inferences_with_trial = trial_group['inference_id'].nunique()
-            if inferences_with_trial < 2:
-                continue  # trial only appeared in 1 inference, cannot compare
-            
-            scores = trial_group['match_score'].tolist()
-            classifications = trial_group['eligible'].tolist()
-            
-            score_min = min(scores)
-            score_max = max(scores)
-            score_spread = score_max - score_min
-            all_scores_identical = len(set(scores)) == 1
-            all_classifications_identical = len(set(classifications)) == 1
-            
-            # Determine group category
-            unique_classifications = set(classifications)
-            if unique_classifications == {'eligible'}:
-                category = 'eligible_all'
-            elif unique_classifications == {'not_eligible'}:
-                category = 'not_eligible_all'
-            else:
-                category = 'flipped'
-            
-            comparisons.append({
-                'patient_id': pid,
-                'qdrant_collection': col_name,
-                'nct_id': nct_id,
-                'num_inferences': inferences_with_trial,
-                'scores': scores,
-                'classifications': classifications,
-                'score_min': score_min,
-                'score_max': score_max,
-                'score_spread': score_spread,
-                'all_scores_identical': all_scores_identical,
-                'all_classifications_identical': all_classifications_identical,
-                'category': category,
-            })
-    
+    comparisons = _build_comparisons(patient_groups, relevant_matches)
+
     if not comparisons:
         st.info("No overlapping trials found across inferences. "
                 "This may happen if the trial corpus changed entirely between inferences.")
@@ -186,34 +822,18 @@ def render_reproducibility_tab(df):
     # =====================================================================
     st.subheader("Summary")
     
-    total_comparisons = len(comp_df)
-    flip_count = (~comp_df['all_classifications_identical']).sum()
-    flip_rate = flip_count / total_comparisons * 100 if total_comparisons > 0 else 0
-    identical_classification = (1 - flip_count / total_comparisons) * 100 if total_comparisons > 0 else 100.0
-    
-    # Split into 4 mutually exclusive groups
-    eligible_all = comp_df[comp_df['category'] == 'eligible_all']
-    not_eligible_all = comp_df[comp_df['category'] == 'not_eligible_all']
-    flipped_comps = comp_df[comp_df['category'] == 'flipped']
-    
-    def _group_metrics(group_df):
-        n = len(group_df)
-        if n == 0:
-            return {'n': 0, 'identical_scores': 100.0, 'mean': 0.0, 'max': 0.0, 'std': 0.0}
-        identical = group_df['all_scores_identical'].sum()
-        return {
-            'n': n,
-            'identical_scores': identical / n * 100,
-            'mean': group_df['score_spread'].mean(),
-            'max': group_df['score_spread'].max(),
-            'std': group_df['score_spread'].std() if n > 1 else 0.0,
-        }
-    
-    all_m = _group_metrics(comp_df)
-    elig_m = _group_metrics(eligible_all)
-    flip_m = _group_metrics(flipped_comps)
-    not_elig_m = _group_metrics(not_eligible_all)
-    
+    _summary = _summary_statistics(comp_df)
+    total_comparisons = _summary['total_comparisons']
+    flip_count = _summary['flip_count']
+    flip_rate = _summary['flip_rate']
+    identical_classification = _summary['identical_classification']
+    eligible_all = _summary['eligible_all']
+    flipped_comps = _summary['flipped_comps']
+    all_m = _summary['all_m']
+    elig_m = _summary['elig_m']
+    flip_m = _summary['flip_m']
+    not_elig_m = _summary['not_elig_m']
+
     # === Critical Alerts ===
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -346,74 +966,11 @@ def render_reproducibility_tab(df):
     
     with col1:
         # Scatter: min score vs max score per (patient, trial)
-        fig_scatter = go.Figure()
-        
-        # Diagonal reference line
-        fig_scatter.add_trace(go.Scatter(
-            x=[0, 1], y=[0, 1],
-            mode='lines',
-            line=dict(color='gray', dash='dash', width=1),
-            name='Perfect Agreement',
-            showlegend=True
-        ))
-        
-        # Stable points (same classification across all inferences)
-        stable = comp_df[comp_df['all_classifications_identical']]
-        if not stable.empty:
-            fig_scatter.add_trace(go.Scatter(
-                x=stable['score_min'],
-                y=stable['score_max'],
-                mode='markers',
-                marker=dict(color='#2ca02c', size=6, opacity=0.6),
-                name='Stable Classification',
-                hovertemplate='Patient: %{customdata[0]}<br>Trial: %{customdata[1]}<br>Min Score: %{x:.2f}<br>Max Score: %{y:.2f}<br>Inferences: %{customdata[2]}<extra></extra>',
-                customdata=stable[['patient_id', 'nct_id', 'num_inferences']].values
-            ))
-        
-        # Flipped points (classification changed across inferences)
-        flipped_chart = comp_df[~comp_df['all_classifications_identical']]
-        if not flipped_chart.empty:
-            fig_scatter.add_trace(go.Scatter(
-                x=flipped_chart['score_min'],
-                y=flipped_chart['score_max'],
-                mode='markers',
-                marker=dict(color='#d62728', size=10, symbol='x', line=dict(width=2)),
-                name='Eligibility Flipped',
-                hovertemplate='Patient: %{customdata[0]}<br>Trial: %{customdata[1]}<br>Min Score: %{x:.2f}<br>Max Score: %{y:.2f}<br>Inferences: %{customdata[2]}<extra></extra>',
-                customdata=flipped_chart[['patient_id', 'nct_id', 'num_inferences']].values
-            ))
-        
-        fig_scatter.update_layout(
-            title='Min vs Max Match Score Across Inferences',
-            xaxis_title='Minimum Score (across inferences)',
-            yaxis_title='Maximum Score (across inferences)',
-            height=450,
-            margin=dict(l=20, r=20, t=40, b=20),
-            template='plotly_white',
-            xaxis=dict(range=[-0.05, 1.05]),
-            yaxis=dict(range=[-0.05, 1.05]),
-        )
-        st.plotly_chart(fig_scatter, use_container_width=True)
-    
+        st.plotly_chart(_figure_min_max_scatter(comp_df), use_container_width=True)
+
     with col2:
         # Score spread distribution
-        fig_hist = px.histogram(
-            comp_df, x='score_spread', nbins=30,
-            labels={'score_spread': 'Score Spread (max - min)'},
-            template='plotly_white',
-            title='Score Spread Distribution'
-        )
-        fig_hist.add_vline(
-            x=0.05, line_dash="dash", line_color="red",
-            annotation_text="0.05 target", annotation_position="top right"
-        )
-        fig_hist.update_traces(marker_color='#1f77b4')
-        fig_hist.update_layout(
-            height=450,
-            margin=dict(l=20, r=20, t=40, b=20),
-            showlegend=False
-        )
-        st.plotly_chart(fig_hist, use_container_width=True)
+        st.plotly_chart(_figure_spread_histogram(comp_df), use_container_width=True)
     
     
     st.caption(
@@ -432,26 +989,8 @@ def render_reproducibility_tab(df):
         
         # Build flip detail from flipped_comps
         # For each flipped (patient, trial), show how many inferences said eligible vs not_eligible
-        flip_rows = []
-        for _, row in flipped_comps.iterrows():
-            classifications = row['classifications']
-            scores = row['scores']
-            n_eligible = sum(1 for c in classifications if c == 'eligible')
-            n_not_eligible = sum(1 for c in classifications if c == 'not_eligible')
-            eligible_scores = [s for s, c in zip(scores, classifications) if c == 'eligible']
-            
-            flip_rows.append({
-                'patient_id': row['patient_id'],
-                'nct_id': row['nct_id'],
-                'num_inferences': row['num_inferences'],
-                'n_eligible': n_eligible,
-                'n_not_eligible': n_not_eligible,
-                'eligible_scores': eligible_scores,
-                'score_spread': row['score_spread'],
-            })
-        
-        flip_detail_df = pd.DataFrame(flip_rows)
-        
+        flip_detail_df = _build_flip_detail(flipped_comps)
+
         # Direction summary: majority eligible or majority not_eligible
         majority_eligible = len(flip_detail_df[flip_detail_df['n_eligible'] > flip_detail_df['n_not_eligible']])
         majority_not_eligible = len(flip_detail_df[flip_detail_df['n_not_eligible'] > flip_detail_df['n_eligible']])
@@ -480,29 +1019,8 @@ def render_reproducibility_tab(df):
         st.markdown("")
         
         # Detail table
-        flip_display = flip_detail_df.copy()
-        flip_display['Eligible Score(s)'] = flip_display['eligible_scores'].apply(
-            lambda s: f"{min(s)*100:.0f}%–{max(s)*100:.0f}%" if len(s) > 1 else (f"{s[0]*100:.0f}%" if len(s) == 1 else "—")
-        )
-        
-        flip_display['Classification'] = flip_display.apply(
-            lambda r: f"{r['n_eligible']} eligible / {r['n_not_eligible']} not eligible", axis=1
-        )
-        
-        flip_display = flip_display.rename(columns={
-            'patient_id': 'Patient ID',
-            'nct_id': 'NCT ID',
-            'num_inferences': 'Inferences',
-        })
-
-        flip_display = flip_display.sort_values('score_spread', ascending=False)
-        
-        flip_display = flip_display[['Patient ID', 'NCT ID', 'Inferences', 'Classification', 'Eligible Score(s)']]
-        flip_display = flip_display.reset_index(drop=True)
-        flip_display.index = flip_display.index + 1
-        flip_display.index.name = "Row"
-        
-        st.dataframe(flip_display, use_container_width=True, hide_index=False)
+        st.dataframe(_format_flip_detail(flip_detail_df),
+                     use_container_width=True, hide_index=False)
         
         st.caption("Each row is a (patient, trial) where GPT-4o changed the eligibility decision across inferences. "
                    "'Classification' shows how many inferences said eligible vs not_eligible. "
@@ -530,100 +1048,20 @@ def render_reproducibility_tab(df):
             "Supports any number of runs per patient."
         )
         
-        # Shared status display mapping for criterion-level diffs
-        _STATUS_DISPLAY_BASE_FLIP = {
-            "met": "✅ Met",
-            "not_met": "❌ Not Met",
-            "violated": "❌ Violated",
-            "not_violated": "✅ Not Violated",
-        }
-
-        def status_display_map(status: str, patient_value: str = "") -> str:
-            pv = (patient_value or "").strip()
-            if pv.lower().startswith("not applicable"):
-                return "➖ Not Applicable"
-            if status == "not_evaluable":
-                if pv and pv.lower() != "not in patient record":
-                    return "🔍 Unverifiable"
-                return "⚠️ Missing Data"
-            return _STATUS_DISPLAY_BASE_FLIP.get(status, status)
-        
         # -----------------------------------------------------------------
         # 1. Flip Type Classification
         # -----------------------------------------------------------------
-        
-        def classify_flip_type(classifications, scores):
-            """Classify the flip scenario from N runs."""
-            tiers_seen = set()
-            for cls, score in zip(classifications, scores):
-                if cls == 'not_eligible':
-                    tiers_seen.add('Rejected')
-                elif score >= 1.0:
-                    tiers_seen.add('Full Match')
-                elif score > 0.0:
-                    tiers_seen.add('Partial Match')
-                else:
-                    tiers_seen.add('Zero Score')
-            
-            if 'Rejected' in tiers_seen and 'Full Match' in tiers_seen:
-                return 'Rejection ↔ Full Match'
-            elif 'Rejected' in tiers_seen and 'Partial Match' in tiers_seen:
-                return 'Rejection ↔ Partial Match'
-            elif 'Rejected' in tiers_seen and 'Zero Score' in tiers_seen:
-                return 'Rejection ↔ Zero Score'
-            elif 'Full Match' in tiers_seen and 'Partial Match' in tiers_seen:
-                return 'Full Match ↔ Partial Match'
-            else:
-                return 'Other'
-        
-        flip_type_severity = {
-            'Rejection ↔ Full Match': 4,
-            'Rejection ↔ Partial Match': 3,
-            'Rejection ↔ Zero Score': 2,
-            'Full Match ↔ Partial Match': 1,
-            'Other': 0,
-        }
-        
-        flip_type_colors = {
-            'Rejection ↔ Full Match': '#d62728',
-            'Rejection ↔ Partial Match': '#ff7f0e',
-            'Rejection ↔ Zero Score': '#9467bd',
-            'Full Match ↔ Partial Match': '#2ca02c',
-            'Other': '#7f7f7f',
-        }
-        
-        flip_types = []
-        for _, row in flipped_comps.iterrows():
-            ft = classify_flip_type(row['classifications'], row['scores'])
-            flip_types.append(ft)
-        
-        flipped_comps_enriched = flipped_comps.copy()
-        flipped_comps_enriched['flip_type'] = flip_types
-        
+
+        flipped_comps_enriched = _with_flip_types(flipped_comps)
+
         # --- Flip Type Breakdown Chart ---
         st.markdown("#### Flip Type Breakdown")
-        
+
         type_counts = flipped_comps_enriched['flip_type'].value_counts()
-        sorted_types = sorted(type_counts.index, key=lambda t: flip_type_severity.get(t, 0), reverse=True)
-        
-        fig_flip_types = go.Figure()
-        fig_flip_types.add_trace(go.Bar(
-            x=[type_counts[t] for t in sorted_types],
-            y=sorted_types,
-            orientation='h',
-            marker_color=[flip_type_colors.get(t, '#7f7f7f') for t in sorted_types],
-            text=[f"{type_counts[t]} ({type_counts[t]/flip_count*100:.0f}%)" for t in sorted_types],
-            textposition='auto',
-        ))
-        fig_flip_types.update_layout(
-            height=max(200, len(sorted_types) * 60),
-            margin=dict(l=20, r=20, t=10, b=20),
-            template='plotly_white',
-            xaxis_title='Number of Flips',
-            yaxis=dict(autorange='reversed'),
-            showlegend=False,
-        )
-        st.plotly_chart(fig_flip_types, use_container_width=True)
+        sorted_types = sorted(type_counts.index, key=lambda t: _FLIP_TYPE_SEVERITY.get(t, 0), reverse=True)
+
+        st.plotly_chart(_figure_flip_types(type_counts, sorted_types, flip_count),
+                        use_container_width=True)
         
         st.caption(
             "**Rejection ↔ Full Match** (red): Most severe — trial went from all-criteria-confirmed to rejected or vice versa. "
@@ -648,153 +1086,9 @@ def render_reproducibility_tab(df):
             "actionability — top categories have concrete pipeline fixes."
         )
         
-        failure_categories = {
-            'Temporal / Resolved Status': {
-                'keywords': [
-                    'resolved', 'no current', 'not current', 'no active',
-                    'historical', 'long-standing', 'years ago',
-                    'requires active', 'requires current', 'requires patient undergoing',
-                ],
-                'color': '#d62728',
-                'fix': 'Present-tense rule (prompt)',
-            },
-            'Missing Data as Disqualifier': {
-                'keywords': [
-                    'not confirmed', 'no data on', 'lacks evidence',
-                    'does not indicate', 'not in record',
-                    'has no such', 'status not confirmed',
-                    'does not confirm', 'no record of',
-                    'lacks this information', 'no evidence of',
-                    'but no evidence of', 'record lacks',
-                ],
-                'color': '#ff7f0e',
-                'fix': 'Reinforce Rule 1 (prompt)',
-            },
-            'Disease Stage / Extent': {
-                'keywords': [
-                    'metastatic', 'non-metastatic', 'oligometastatic',
-                    'oligoprogressive', 'recurrent', 'locally advanced',
-                    'requires metastatic', 'requires recurrent',
-                    'primary small cell', 'recurrent small cell',
-                    'not metastatic',
-                ],
-                'color': '#e45756',
-                'fix': 'Stage/extent mismatch — clinical ambiguity',
-            },
-            'Procedure Ambiguity': {
-                'keywords': [
-                    'prior lumpectomy', 'prior breast surgery',
-                    'ipsilateral breast surgery', 'prior ipsilateral',
-                    'previous resection', 'polypectomy',
-                    'partial resection', 'colectomy',
-                    'excision of lesion',
-                    'previous breast surgery', 'history of lumpectomy',
-                    'axillary lymph node excision', 'axillary lymph node',
-                ],
-                'color': '#9467bd',
-                'fix': 'Irreducible — clinical ambiguity',
-            },
-            'Biomarker / Subtype': {
-                'keywords': [
-                    'her2', 'triple-negative', 'triple negative',
-                    'er+', 'er-', 'hr+', 'hr-',
-                    'hormone receptor', 'hormone-receptor',
-                    'pik3ca', 'ccne1', 'brca',
-                    'biomarker', 'mutation', 'amplification',
-                    'ductal carcinoma in situ', 'mammaprint',
-                ],
-                'color': '#2ca02c',
-                'fix': 'Receptor/biomarker tagging (pipeline)',
-            },
-            'Medical Concept Error': {
-                'keywords': [
-                    'anemia', 'hypertension', 'diabetes',
-                    'inflammatory colonic conditions (anemia',
-                    'inflammatory colonic conditions',
-                    'not a malignancy', 'benign',
-                    'seizures', 'seizure',
-                ],
-                'color': '#e377c2',
-                'fix': 'Neoplasm tagging (pipeline)',
-            },
-            'Terminology Mismatch': {
-                'keywords': [
-                    'adenocarcinoma', 'without specified',
-                    'malignant neoplasm of colon',
-                    'does not have recurrent pelvic',
-                ],
-                'color': '#17becf',
-                'fix': 'Terminology matching rule (prompt Step 3)',
-            },
-            'Lab / Age Threshold': {
-                'keywords': [
-                    'creatinine', 'gfr', 'hemoglobin', 'bilirubin',
-                    'platelet', 'neutrophil', 'albumin',
-                    'organ function', 'renal function',
-                    'exceeds the age', 'age limit', 'older than',
-                ],
-                'color': '#bcbd22',
-                'fix': 'Legitimate catch — no fix needed',
-            },
-            'Treatment Requirement': {
-                'keywords': [
-                    'prior chemotherapy', 'received chemotherapy',
-                    'received prior', 'recent chemotherapy',
-                    'neoadjuvant', 'preoperative',
-                    'progression on', 'endocrine therapy',
-                    'completed all', 'ongoing chemotherapy',
-                    'prior therapy for', 'cisplatin', 'paclitaxel',
-                    'received cisplatin', 'prior therapy',
-                    'no standard protocol', 'multiline standard therapy',
-                ],
-                'color': '#7f7f7f',
-                'fix': 'Mixed — some temporal, some missing data',
-            },
-        }
-        
-        # Categorize each flip
-        flip_failure_modes = []
-        for _, row in flipped_comps_enriched.iterrows():
-            pid = row['patient_id']
-            nct = row['nct_id']
-            
-            # Get rejection explanation for this (patient, trial)
-            patient_inf_ids_local = []
-            for pg in patient_groups:
-                if pg['patient_id'] == pid:
-                    patient_inf_ids_local = pg['inference_ids']
-                    break
-            
-            rej_matches = relevant_matches[
-                (relevant_matches['nct_id'] == nct) &
-                (relevant_matches['eligible'] == 'not_eligible') &
-                (relevant_matches['inference_id'].isin(patient_inf_ids_local))
-            ]
-            
-            explanation = ''
-            if not rej_matches.empty:
-                explanation = str(rej_matches.iloc[0].get('explanation', ''))
-            
-            explanation_lower = explanation.lower()
-            matched_modes = []
-            
-            for mode_name, mode_info in failure_categories.items():
-                for kw in mode_info['keywords']:
-                    if kw.lower() in explanation_lower:
-                        matched_modes.append(mode_name)
-                        break
-            
-            if not matched_modes:
-                matched_modes = ['Other']
-            
-            flip_failure_modes.append({
-                'patient_id': pid,
-                'nct_id': nct,
-                'flip_type': row['flip_type'],
-                'explanation': explanation,
-                'failure_modes': matched_modes,
-            })
-        
+        flip_failure_modes = _classify_failure_modes(
+            flipped_comps_enriched, patient_groups, relevant_matches)
+
         failure_df = pd.DataFrame(flip_failure_modes)
         
         # Count failure modes
@@ -805,36 +1099,26 @@ def render_reproducibility_tab(df):
         
         # Display as horizontal bar chart
         sorted_modes = []
-        for mode_name in failure_categories.keys():
+        for mode_name in _FAILURE_CATEGORIES.keys():
             if mode_name in mode_counts:
                 sorted_modes.append(mode_name)
         if 'Other' in mode_counts:
             sorted_modes.append('Other')
-        
-        mode_colors = {name: info['color'] for name, info in failure_categories.items()}
+
+        # DERIVED, so they stay here rather than being hoisted with the four
+        # literal tables: each is a comprehension over _FAILURE_CATEGORIES with
+        # one key assigned afterwards. Hoisting a derived table -- and a MUTATED
+        # one -- is a behaviour change wearing the costume of a move.
+        mode_colors = {name: info['color'] for name, info in _FAILURE_CATEGORIES.items()}
         mode_colors['Other'] = '#aaaaaa'
-        
-        mode_fixes = {name: info['fix'] for name, info in failure_categories.items()}
+
+        mode_fixes = {name: info['fix'] for name, info in _FAILURE_CATEGORIES.items()}
         mode_fixes['Other'] = 'Review manually'
-        
-        fig_modes = go.Figure()
-        fig_modes.add_trace(go.Bar(
-            x=[mode_counts.get(m, 0) for m in sorted_modes],
-            y=[f"{m} ({mode_counts.get(m, 0)})" for m in sorted_modes],
-            orientation='h',
-            marker_color=[mode_colors.get(m, '#aaaaaa') for m in sorted_modes],
-            text=[f"{mode_counts.get(m, 0)/len(flipped_comps)*100:.0f}%" for m in sorted_modes],
-            textposition='auto',
-        ))
-        fig_modes.update_layout(
-            height=max(250, len(sorted_modes) * 45),
-            margin=dict(l=20, r=20, t=10, b=20),
-            template='plotly_white',
-            xaxis_title='Number of Flips (a flip can appear in multiple categories)',
-            yaxis=dict(autorange='reversed'),
-            showlegend=False,
-        )
-        st.plotly_chart(fig_modes, use_container_width=True)
+
+        st.plotly_chart(
+            _figure_failure_modes(sorted_modes, mode_counts, mode_colors,
+                                  len(flipped_comps)),
+            use_container_width=True)
         
         # Recommended fixes table
         fix_rows = []
@@ -963,46 +1247,12 @@ def render_reproducibility_tab(df):
                 
                 run_criteria = {}
                 run_explanations = {}
-                
+
                 for run_idx, (_, tm_row) in enumerate(flip_matches.iterrows(), 1):
-                    criteria_list = []
-                    explanation = tm_row.get('explanation', '')
-                    run_explanations[run_idx] = explanation
-                    
-                    if pd.notna(tm_row.get('criterion_details')) and tm_row['criterion_details']:
-                        try:
-                            parsed = json.loads(tm_row['criterion_details'])
-                            for c in parsed.get('inclusion', []):
-                                criteria_list.append({
-                                    'type': 'Inclusion',
-                                    'criterion': c.get('criterion', ''),
-                                    'status': c.get('status', ''),
-                                    'patient_value': c.get('patient_value', ''),
-                                })
-                            for c in parsed.get('exclusion', []):
-                                criteria_list.append({
-                                    'type': 'Exclusion',
-                                    'criterion': c.get('criterion', ''),
-                                    'status': c.get('status', ''),
-                                    'patient_value': c.get('patient_value', ''),
-                                })
-                        except (json.JSONDecodeError, TypeError, AttributeError):
-                            pass
-                    
-                    run_criteria[run_idx] = criteria_list
-                
-                def normalize_criterion(text):
-                    return ' '.join(text.lower().strip().split())
-                
-                all_criteria_keys = []
-                seen_keys = set()
-                
-                for run_idx in sorted(run_criteria.keys()):
-                    for c in run_criteria[run_idx]:
-                        norm_key = (c['type'], normalize_criterion(c['criterion']))
-                        if norm_key not in seen_keys:
-                            seen_keys.add(norm_key)
-                            all_criteria_keys.append((c['type'], normalize_criterion(c['criterion']), c['criterion']))
+                    run_explanations[run_idx] = tm_row.get('explanation', '')
+                    run_criteria[run_idx] = _parse_criterion_details(tm_row)
+
+                all_criteria_keys = _ordered_criterion_keys(run_criteria)
                 
                 diff_rows = []
                 for crit_type, norm_crit, display_crit in all_criteria_keys:
@@ -1018,13 +1268,13 @@ def render_reproducibility_tab(df):
                     for run_idx in sorted(run_criteria.keys()):
                         found = None
                         for c in run_criteria[run_idx]:
-                            if c['type'] == crit_type and normalize_criterion(c['criterion']) == norm_crit:
+                            if c['type'] == crit_type and _normalize_criterion(c['criterion']) == norm_crit:
                                 found = c
                                 break
-                        
+
                         if found:
                             pval = found.get('patient_value', '')
-                            status_str = status_display_map(found['status'], pval)
+                            status_str = _status_display_map(found['status'], pval)
                             row_data[f'Run {run_idx}'] = f"{status_str}  ·  {pval}" if pval else status_str
                             statuses_across_runs.append(found['status'])
                             values_across_runs.append(pval)
@@ -1134,23 +1384,9 @@ def render_reproducibility_tab(df):
             if 'primary_condition' in flipped_patients.columns:
                 condition_counts = flipped_patients['primary_condition'].value_counts().head(10)
                 if not condition_counts.empty:
-                    fig_cond = go.Figure()
-                    fig_cond.add_trace(go.Bar(
-                        y=condition_counts.index,
-                        x=condition_counts.values,
-                        orientation='h',
-                        marker_color='#ff7f0e',
-                        text=condition_counts.values,
-                        textposition='auto',
-                    ))
-                    fig_cond.update_layout(
-                        height=max(250, len(condition_counts) * 40),
-                        margin=dict(l=20, r=20, t=10, b=20),
-                        template='plotly_white',
-                        xaxis_title='Number of Flips',
-                        yaxis=dict(autorange='reversed'),
-                    )
-                    st.plotly_chart(fig_cond, use_container_width=True)
+                    st.plotly_chart(
+                        _figure_flip_counts(condition_counts, '#ff7f0e'),
+                        use_container_width=True)
                 else:
                     st.info("No condition data available.")
             else:
@@ -1161,23 +1397,9 @@ def render_reproducibility_tab(df):
             if 'trial_phase' in flipped_patients.columns:
                 phase_counts = flipped_patients['trial_phase'].fillna('Not Specified').value_counts()
                 if not phase_counts.empty:
-                    fig_phase = go.Figure()
-                    fig_phase.add_trace(go.Bar(
-                        y=phase_counts.index,
-                        x=phase_counts.values,
-                        orientation='h',
-                        marker_color='#9467bd',
-                        text=phase_counts.values,
-                        textposition='auto',
-                    ))
-                    fig_phase.update_layout(
-                        height=max(250, len(phase_counts) * 40),
-                        margin=dict(l=20, r=20, t=10, b=20),
-                        template='plotly_white',
-                        xaxis_title='Number of Flips',
-                        yaxis=dict(autorange='reversed'),
-                    )
-                    st.plotly_chart(fig_phase, use_container_width=True)
+                    st.plotly_chart(
+                        _figure_flip_counts(phase_counts, '#9467bd'),
+                        use_container_width=True)
                 else:
                     st.info("No trial phase data available.")
             else:
@@ -1328,39 +1550,9 @@ def render_reproducibility_tab(df):
                 if not drift_matches.empty:
                     drift_run_criteria = {}
                     for run_idx, (_, tm_row) in enumerate(drift_matches.iterrows(), 1):
-                        criteria_list = []
-                        if pd.notna(tm_row.get('criterion_details')) and tm_row['criterion_details']:
-                            try:
-                                parsed = json.loads(tm_row['criterion_details'])
-                                for c in parsed.get('inclusion', []):
-                                    criteria_list.append({
-                                        'type': 'Inclusion',
-                                        'criterion': c.get('criterion', ''),
-                                        'status': c.get('status', ''),
-                                        'patient_value': c.get('patient_value', ''),
-                                    })
-                                for c in parsed.get('exclusion', []):
-                                    criteria_list.append({
-                                        'type': 'Exclusion',
-                                        'criterion': c.get('criterion', ''),
-                                        'status': c.get('status', ''),
-                                        'patient_value': c.get('patient_value', ''),
-                                    })
-                            except (json.JSONDecodeError, TypeError, AttributeError):
-                                pass
-                        drift_run_criteria[run_idx] = criteria_list
-                    
-                    def normalize_criterion_text(text):
-                        return ' '.join(text.lower().strip().split())
-                    
-                    drift_all_keys = []
-                    drift_seen = set()
-                    for ri in sorted(drift_run_criteria.keys()):
-                        for c in drift_run_criteria[ri]:
-                            nk = (c['type'], normalize_criterion_text(c['criterion']))
-                            if nk not in drift_seen:
-                                drift_seen.add(nk)
-                                drift_all_keys.append((c['type'], normalize_criterion_text(c['criterion']), c['criterion']))
+                        drift_run_criteria[run_idx] = _parse_criterion_details(tm_row)
+
+                    drift_all_keys = _ordered_criterion_keys(drift_run_criteria)
                     
                     drift_diff_rows = []
                     for ctype, ncrit, dcrit in drift_all_keys:
@@ -1369,12 +1561,12 @@ def render_reproducibility_tab(df):
                         for ri in sorted(drift_run_criteria.keys()):
                             found = None
                             for c in drift_run_criteria[ri]:
-                                if c['type'] == ctype and normalize_criterion_text(c['criterion']) == ncrit:
+                                if c['type'] == ctype and _normalize_criterion(c['criterion']) == ncrit:
                                     found = c
                                     break
                             if found:
                                 pval = found.get('patient_value', '')
-                                status_str = status_display_map(found['status'], pval)
+                                status_str = _status_display_map(found['status'], pval)
                                 rd[f'Run {ri}'] = f"{status_str}  ·  {pval}" if pval else status_str
                                 statuses.append(found['status'])
                             else:
@@ -1421,18 +1613,8 @@ def render_reproducibility_tab(df):
     # =====================================================================
     st.subheader("Per-Patient Reproducibility")
     
-    patient_repro = comp_df.groupby('patient_id').agg(
-        trials_compared=('nct_id', 'count'),
-        inferences=('num_inferences', 'max'),
-        identical_scores=('all_scores_identical', 'sum'),
-        flips=('all_classifications_identical', lambda x: (~x).sum()),
-        mean_spread=('score_spread', 'mean'),
-        max_spread=('score_spread', 'max'),
-    ).reset_index()
-    
-    patient_repro['score_agreement'] = (patient_repro['identical_scores'] / patient_repro['trials_compared'] * 100).round(1)
-    patient_repro = patient_repro.sort_values('score_agreement', ascending=True)
-    
+    patient_repro = _build_patient_repro(comp_df)
+
     display = patient_repro.rename(columns={
         'patient_id': 'Patient ID',
         'trials_compared': 'Trials Compared',

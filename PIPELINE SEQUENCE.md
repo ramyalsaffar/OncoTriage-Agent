@@ -72,7 +72,7 @@ is `python "<filename>"` from `03- Code/`. `—` means the number is now a gap.
 | 24 | `24- Airflow Manager.py` | x | Start / stop / status / trigger via the REST API v2, and the four-tier password route. **argparse CLI since pass 20f-3** (`start\|stop\|status\|trigger`; a bare invocation prints usage and exits 2). | `oncotriage/orchestration/airflow_manager.py` |
 | 25 | `25- Batch Runner.py` | x | Full-corpus run with no HTTP: checkpointed, two thread pools, summary. | `oncotriage/batch/runner.py` |
 | 26 | `26- Ablation Study.py` | x | Seven configs over a stratified sample, into `ablation_results.db`. | `oncotriage/ablation/study.py` |
-| 27 | `27- Ablation Analysis.py` | x | Comparison table, BH-FDR Wilcoxon family, MDE, nine figures. **Reads** the database, never writes it. | `oncotriage/ablation/analysis.py` |
+| 27 | `27- Ablation Analysis.py` | x | Comparison table, BH-FDR Wilcoxon family, MDE, two reports; `--db` analyses an isolated study. **Reads** the database, never writes it. | `oncotriage/ablation/analysis.py`, `oncotriage/ablation/figures.py` (the nine figures), `oncotriage/ablation/common.py` |
 | 28 | `28- Select Evaluation Sample.py` | x | The seeded 10/10/10 stratified draw into a second database. **Renamed in 20e** from `28- Select 30 Samples.py`. | `oncotriage/evaluation/sampling.py` |
 | 29 | `29- Download Qdrant Data.py` | x | Every Qdrant collection — payloads **and** vectors — to JSON on disk. | `oncotriage/retrieval/qdrant_backup.py` |
 | 34 | `34- Cohort Selector Diff Read Only.py` | x | LEGACY vs CURRENT cohort selector, **read only**. Not a test. **Renamed in 20e** from `34- Cohort Selector Diff.py`. | `oncotriage/evaluation/cohort_diff.py` |

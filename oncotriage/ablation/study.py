@@ -136,6 +136,11 @@ import pandas as pd
 from tqdm import tqdm
 
 from oncotriage import paths
+from oncotriage.ablation.common import (
+    ABLATION_DB_FILENAME,
+    ABLATION_SUMMARY_FILENAME,
+    _require_writable_parent,
+)
 from oncotriage.agent import deps
 from oncotriage.agent.evaluation import MatchingModelMismatchError
 from oncotriage.agent.graph import build_matching_graph
@@ -172,57 +177,19 @@ _RESOLVED = {}
 _RESOLVE_LOCK = threading.RLock()
 
 
-ABLATION_DB_FILENAME = "ablation_results.db"
-ABLATION_SUMMARY_FILENAME = "ablation_summary.json"
+# BOTH FILENAMES AND THE PARENT-DIRECTORY GUARD MOVED TO
+# oncotriage/ablation/common.py (pass 20f-4), because the ANALYSIS side needs
+# them: `analysis.ablation_db()` took no argument and hardcoded the string
+# "ablation_results.db", so a study written with --db could not be analysed and
+# the filename existed as a constant here AND as a literal there. One
+# definition, two consumers. They are imported by NAME rather than through the
+# module so that `study.ABLATION_DB_FILENAME` still resolves -- it is read by
+# tests/test_ablation_db_isolation.py.
+#
+# `_require_writable_parent`'s message is byte-identical to the one pass 20f-3
+# shipped: the example command it names is that function's default argument.
 
 
-def _require_writable_parent(path: Path) -> Path:
-    """Refuse an explicit database path whose parent directory is missing.
-
-    TWO DATABASE WRITERS, ONE BEHAVIOUR (pass 20f-3). ``--db /nowhere/x.db``
-    used to reach ``sqlite3.connect`` and come back as
-
-        sqlite3.OperationalError: unable to open database file
-
-    which names nothing: not the path, not the flag, not the directory. It
-    surfaces at the first ``init_ablation_db()`` call, after the argument
-    parsing and the banner, so the operator sees a study that started and then
-    died on a message about "database file".
-
-    ``settings.resolve_inferences_db()`` had already settled the shape for the
-    OTHER redirectable database, and its argument transfers unchanged: a
-    database FILE that does not exist is the normal case -- sqlite creates it --
-    but a missing PARENT is a configuration defect, and the check is worth
-    making eagerly and loudly. There the risk was a swallowed
-    ``OperationalError`` reported as one non-critical logging failure per
-    patient; here nothing swallows it, and the cost is a bare exception instead
-    of an instruction. Both are the same defect and both now name the directory.
-
-    NOT APPLIED TO THE DEFAULT, deliberately. ``db_path=None`` resolves
-    ``paths.result_ablation_path``, which ``_glob_one`` has already proved
-    exists -- it raises naming the pattern when nothing matches. Checking it
-    again here would only be able to fail on a directory deleted between the
-    glob and the connect.
-
-    ``~`` is expanded, for the reason ``resolve_inferences_db`` expands it:
-    ``--db ~/scratch.db`` is a plausible thing to type, and a shell that does
-    not expand it (it will not, after ``=``, in some shells and in most
-    programmatic invocations) leaves a path inside a directory literally named
-    "~".
-    """
-    expanded = Path(os.path.expanduser(str(path)))
-    parent = expanded.expanduser().resolve().parent
-    if not parent.is_dir():
-        raise RuntimeError(
-            f"--db points into a directory that does not exist: {str(parent)!r} "
-            f"(from {str(path)!r})\n"
-            f"Create the directory, or give --db a path whose parent exists, "
-            f"e.g.\n"
-            f"    python \"26- Ablation Study.py\" --db /tmp/ablation/results.db\n"
-            f"Without this check sqlite3 raises 'unable to open database file', "
-            f"which names neither the path nor the flag."
-        )
-    return expanded
 
 
 def ablation_db(db_path=None) -> Path:

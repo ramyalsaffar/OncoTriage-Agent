@@ -10,54 +10,67 @@ tree and the only hits outside the file itself are ``ABLATION_DB`` and
 names, plus the exec-bootstrap locals every numbered file shares
 (``_code_dir``, ``_bootstrap``, ``_fh``, ``_os_boot``) and the generic ``main``.
 
-WHAT CHANGED, and nothing else did
-----------------------------------
+WHAT PASS 20c-3d CHANGED, and nothing else did
+----------------------------------------------
 1. ``ABLATION_DB`` and ``OUTPUT_DIR`` were module-level ``Path(result_ablation_path)``
    expressions. ``result_ablation_path`` is LAZY (``oncotriage/paths.py``), and a
    ``from oncotriage.paths import result_ablation_path`` -- or a bare read of it
    at module scope -- is an ATTRIBUTE READ that fires the resolver, so importing
    this module would have globbed the whole sibling data tree and raised on any
-   machine without it. They are accessors now: ``ablation_db()`` and
-   ``output_dir()``, resolved on first call and cached under a lock, exactly the
-   shape ``oncotriage/fhir/clean.py`` uses.
-
-   ``output_dir()`` RESOLVES AND CREATES NOTHING. File 27 never created the
-   directory either -- it wrote into whatever ``result_ablation_path`` globbed
-   to -- so there is no ``ensure_output_dir()`` here and adding one would be a
-   behaviour change, not a fix.
+   machine without it. They became accessors, resolved on first call and cached
+   under a lock, exactly the shape ``oncotriage/fhir/clean.py`` uses. Pass 20f-4
+   moved both to ``oncotriage/ablation/common.py``; they resolve and create
+   nothing there either, and the argument for keeping resolution and creation
+   separate is recorded with them.
 
 2. The four ``ABLATION_*`` tuning constants and ``Project_Name`` are imported
    from ``oncotriage.config`` instead of being read out of the shared exec
-   namespace. Same objects; File 03 re-exports them from there.
+   namespace. Same objects.
 
-Everything else -- every query, every statistic, every figure, every line of
-the report -- is the line slice of File 27 between its constants block and its
-``__main__`` guard, unmodified. ``tests/test_package_invariants.py`` re-derives that
-with ``ast.unparse`` against ``git show HEAD:``.
+Everything else -- every query, every statistic, every line of the report -- is
+the line slice of File 27 between its constants block and its ``__main__``
+guard, unmodified.
 
-MATPLOTLIB IS IMPORTED AT MODULE SCOPE, and that is the SECOND deliberate
-exception in the package, after ``oncotriage/fhir/explore.py``. Nine of this
-module's functions draw; nothing but the File 27 entry point imports it; and
-File 47 section 2 already pre-imports matplotlib, seaborn and pandas before
-arming its traps, for exactly this reason. scipy stays inside the three function
-bodies that use it -- the third-party-in-a-function-body exemption -- so
-importing this module does not pull in scipy either.
+MATPLOTLIB IS NO LONGER IMPORTED HERE (pass 20f-4). The nine functions that
+drew moved to ``oncotriage/ablation/figures.py``, and the module-scope
+matplotlib import went with them -- so the second of the package's two
+deliberate exceptions now lives in a 496-line file rather than a 1,976-line one.
+This module still imports ``figures`` at module scope, because ``main()`` calls
+all nine and check 1b forbids a package import inside a function body; what
+changed is WHERE the exception is written down, not that importing this module
+avoids matplotlib. scipy stays inside the three function bodies that use it --
+the third-party-in-a-function-body exemption -- so importing this module does
+not pull in scipy either.
+
+THE CONFIG VOCABULARY AND THE TWO PATH ACCESSORS MOVED TO
+``oncotriage/ablation/common.py`` in the same pass, because ``figures`` needs
+them and importing them back from here would be a cycle.
 
 THIS MODULE NEVER WRITES TO ``ablation_results.db``. It reads it. File 26 is the
 writer; see ``oncotriage/ablation/study.py``.
+
+``--db`` (pass 20f-4). ``main(db_path)`` analyses a database other than the
+production one, and every table, figure and report follows it into that
+database's directory. Before this pass ``ablation_db()`` took no argument at
+all, so a study written with File 26's ``--db`` -- which pass 20f-1 added
+precisely so a run could be isolated -- COULD NOT BE ANALYSED.
 """
 
 import json
 import sqlite3
 import sys
-import threading
-from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from oncotriage import paths
+from oncotriage.ablation import figures
+from oncotriage.ablation.common import (
+    BASELINE,
+    CONFIG_LABELS,
+    CONFIG_ORDER,
+    ablation_db,
+    output_dir,
+)
 from oncotriage.config import (
     ABLATION_DESCRIPTIVE_METRICS,
     ABLATION_FDR_ALPHA,
@@ -72,96 +85,16 @@ from oncotriage.config import (
 
 
 # ===========================================================================
-# LAZY PATHS
-# ===========================================================================
-#
-# File 27 wrote these two as module-level expressions over result_ablation_path.
-# Importing this module would then have resolved a sibling directory, which is
-# the one thing every module in this package is forbidden to do at import: a
-# wheel install, a CI checkout of "03- Code" alone or a container built before
-# its data volume is mounted has no such tree, and the failure is an ImportError
-# from a module that was only meant to be read.
-#
-# Locked for the same reason oncotriage/fhir/clean.py locks its three: `if k not
-# in d: d[k] = build()` is two atomic operations and one non-atomic sequence.
-# Nothing here runs multi-threaded today; the lock is about the pattern being
-# copied when a third accessor is added.
-
-_RESOLVED = {}
-_RESOLVE_LOCK = threading.RLock()
-
-
-def output_dir() -> Path:
-    """Where every table, figure and report is written. Creates nothing.
-
-    File 27 did not create this directory either -- it wrote into whatever
-    ``result_ablation_path`` globbed to, and a missing directory surfaced as an
-    OSError from the first ``to_csv``. Adding a mkdir here would be a behaviour
-    change dressed as a fix, and ``oncotriage/fhir/explore.py`` already carries
-    the argument for keeping resolution and creation separate.
-    """
-    with _RESOLVE_LOCK:
-        if "output_dir" not in _RESOLVED:
-            _RESOLVED["output_dir"] = Path(paths.result_ablation_path)
-        return _RESOLVED["output_dir"]
-
-
-def ablation_db() -> Path:
-    """The database File 26 wrote. READ ONLY from here.
-
-    Resolved on first call, cached. Note that this is a DEFAULT and not a
-    parameter: nothing in this module lets a caller name a different database,
-    which is the same gap ``oncotriage/ablation/study.py`` has on the writing
-    side and is recorded there.
-    """
-    with _RESOLVE_LOCK:
-        if "ablation_db" not in _RESOLVED:
-            _RESOLVED["ablation_db"] = Path(paths.result_ablation_path) / "ablation_results.db"
-        return _RESOLVED["ablation_db"]
-
-
-# ===========================================================================
-# CONSTANTS
-# ===========================================================================
-
-# File 27 defined its two Path constants here, over the lazy
-# result_ablation_path. They are the two accessors above.
-
-# Config display order (matches File 26 ABLATION_CONFIGS)
-CONFIG_ORDER = [
-    "full_pipeline",
-    "no_mesh_filter",
-    "no_stage_filter",
-    "no_histology_filter",
-    "no_cross_encoder",
-    "bm25_only",
-    "vector_only",
-]
-
-CONFIG_LABELS = {
-    "full_pipeline":       "Full Pipeline (baseline)",
-    "no_mesh_filter":      "− MeSH Filter",
-    "no_stage_filter":     "− Stage Filter",
-    "no_histology_filter": "− Histology Filter",
-    "no_cross_encoder":    "− Cross-Encoder",
-    "bm25_only":           "BM25 Only",
-    "vector_only":         "Vector Only",
-}
-
-BASELINE = "full_pipeline"
-
-
-# ===========================================================================
 # DATA LOADING
 # ===========================================================================
 
-def load_ablation_data() -> pd.DataFrame:
+def load_ablation_data(db_path=None) -> pd.DataFrame:
     """Load ablation_results table into a DataFrame."""
-    if not ablation_db().exists():
-        print(f"ERROR: {ablation_db()} not found. Run File 26 first.")
+    if not ablation_db(db_path).exists():
+        print(f"ERROR: {ablation_db(db_path)} not found. Run File 26 first.")
         sys.exit(1)
 
-    conn = sqlite3.connect(str(ablation_db()))
+    conn = sqlite3.connect(str(ablation_db(db_path)))
     try:
         df = pd.read_sql_query("""
             SELECT r.*, runs.config_description
@@ -239,9 +172,9 @@ def load_ablation_data() -> pd.DataFrame:
     return df
 
 
-def load_error_data() -> pd.DataFrame:
+def load_error_data(db_path=None) -> pd.DataFrame:
     """Load error rows separately for error rate analysis."""
-    conn = sqlite3.connect(str(ablation_db()))
+    conn = sqlite3.connect(str(ablation_db(db_path)))
     try:
         df = pd.read_sql_query("""
             SELECT config_name, patient_id, error
@@ -904,224 +837,14 @@ def compute_minimum_detectable_effect(df: pd.DataFrame,
 
 
 # ===========================================================================
-# 3. VISUALIZATIONS
+# 3. VISUALIZATIONS -> oncotriage/ablation/figures.py  (pass 20f-4)
 # ===========================================================================
-
-def plot_funnel_chart(df: pd.DataFrame) -> None:
-    """Per-stage candidate funnel by config (grouped bar chart)."""
-    stages = [
-        ("candidates_retrieved",           "Retrieved"),
-        ("candidates_reranked",            "Reranked"),
-        ("candidates_after_rule_filter",   "After Rules"),
-        ("candidates_after_quality_filter","After Quality"),
-        ("candidates_evaluated",           "Evaluated"),
-        ("eligible_count",                 "Eligible"),
-    ]
-
-    means = df.groupby("config_name", observed=True)[[s[0] for s in stages]].mean()
-    means = means.loc[CONFIG_ORDER]
-    means.columns = [s[1] for s in stages]
-    means.index = [CONFIG_LABELS[c] for c in means.index]
-
-    fig, ax = plt.subplots(figsize=(14, 7))
-    means.plot(kind="bar", ax=ax, width=0.8)
-    ax.set_ylabel("Average Candidate Count")
-    ax.set_title("Pipeline Funnel by Ablation Configuration")
-    ax.legend(title="Stage", bbox_to_anchor=(1.02, 1), loc="upper left")
-    ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha="right")
-    plt.tight_layout()
-    path = output_dir() / "ablation_funnel_chart.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {path}")
-
-
-def plot_delta_chart(table: pd.DataFrame) -> None:
-    """Delta from baseline bar chart for key metrics."""
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-
-    non_baseline = table[table["config_name"] != BASELINE].copy()
-    labels = non_baseline["config_label"].values
-
-    for ax, col, title, fmt in [
-        (axes[0], "Δ_eligible_mean",  "Δ Eligible Count",    "{:.2f}"),
-        (axes[1], "Δ_cost_mean",      "Δ Cost (USD)",        "{:.4f}"),
-        (axes[2], "Δ_time_mean",      "Δ Latency (sec)",     "{:.1f}"),
-    ]:
-        vals = non_baseline[col].values
-        colors = ["#e74c3c" if v < 0 else "#2ecc71" for v in vals]
-        # For cost and time, positive delta = worse (red), negative = better (green)
-        if "cost" in col or "time" in col:
-            colors = ["#2ecc71" if v < 0 else "#e74c3c" for v in vals]
-
-        ax.barh(range(len(labels)), vals, color=colors)
-        ax.set_yticks(range(len(labels)))
-        ax.set_yticklabels(labels)
-        ax.axvline(0, color="black", linewidth=0.8)
-        ax.set_title(title)
-
-        for i, v in enumerate(vals):
-            ax.text(v, i, f" {fmt.format(v)}", va="center",
-                    ha="left" if v >= 0 else "right", fontsize=8)
-
-    plt.suptitle("Ablation Impact vs Full Pipeline Baseline", fontsize=13, y=1.02)
-    plt.tight_layout()
-    path = output_dir() / "ablation_delta_chart.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {path}")
-
-
-def plot_cost_efficiency(df: pd.DataFrame) -> None:
-    """
-    Pooled cost-per-eligible-match by config (the key rule filter argument).
-
-    Pooled (total spend / total matches) over ALL sampled patients, not a mean
-    of the per-patient ratio over the subset that matched. The per-patient
-    ratio is undefined at zero matches, so averaging it discards precisely the
-    patients whose spend returned nothing and flatters whichever configuration
-    failed most often. There is no error bar because a pooled ratio is a single
-    quantity, not a distribution over patients.
-    """
-    grouped = df.groupby("config_name", observed=True).agg(
-        total_cost=("estimated_cost_usd", "sum"),
-        total_eligible=("eligible_count", "sum"),
-        n_patients=("patient_id", "count"),
-    ).reindex(CONFIG_ORDER)
-
-    pooled = grouped["total_cost"] / grouped["total_eligible"].replace(0, np.nan)
-    labels = [CONFIG_LABELS[c] for c in grouped.index]
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    bars = ax.bar(range(len(pooled)), pooled.values,
-                  color=["#3498db"] + ["#95a5a6"] * (len(pooled) - 1))
-    bars[0].set_color("#2ecc71")  # Highlight baseline
-
-    ax.set_xticks(range(len(pooled)))
-    ax.set_xticklabels(labels, rotation=30, ha="right")
-    ax.set_ylabel("Cost per Eligible Match (USD, pooled)")
-    ax.set_title("Cost Efficiency: Pooled Cost per Eligible Match by Configuration")
-
-    for i, (m, n) in enumerate(zip(pooled.values, grouped["n_patients"].values)):
-        if not np.isnan(m):
-            ax.text(i, m, f"${m:.4f}\n(n={int(n)})", ha="center",
-                    va="bottom", fontsize=8)
-
-    ax.set_xlabel("Pooled over all sampled patients; zero-match patients keep "
-                  "their cost in the numerator", fontsize=8)
-
-    plt.tight_layout()
-    path = output_dir() / "ablation_cost_efficiency.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {path}")
-
-
-def plot_score_distribution(df: pd.DataFrame) -> None:
-    """
-    Box plot of match score distributions per config, over ALL sampled patients.
-
-    Every box covers the same patients. Dropping the zero-match patients (the
-    old behaviour) made each box cover a different, configuration-selected
-    subpopulation, so the boxes were not comparable to each other. The match
-    rate is annotated under each box: a high box over a low match rate is a
-    configuration that scores well on the few patients it did not lose.
-    """
-    fig, ax = plt.subplots(figsize=(12, 6))
-
-    data = [df[df["config_name"] == c]["avg_match_score_all"].dropna().values
-            for c in CONFIG_ORDER]
-    rates = [df[df["config_name"] == c]["has_match"].mean() for c in CONFIG_ORDER]
-    counts = [len(d) for d in data]
-    labels = [
-        f"{CONFIG_LABELS[c]}\nn={n}, matched {r:.0%}"
-        for c, n, r in zip(CONFIG_ORDER, counts, rates)
-    ]
-
-    bp = ax.boxplot(data, labels=labels, patch_artist=True, showmeans=True,
-                    meanprops={"marker": "D", "markerfacecolor": "red", "markersize": 5})
-
-    colors = ["#2ecc71"] + ["#bdc3c7"] * (len(CONFIG_ORDER) - 1)
-    for patch, color in zip(bp["boxes"], colors):
-        patch.set_facecolor(color)
-
-    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
-    ax.set_ylabel("Average Match Score (all patients, no match = 0.0)")
-    ax.set_title("Match Quality Distribution by Configuration")
-    plt.tight_layout()
-    path = output_dir() / "ablation_score_distribution.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {path}")
-
-
-def plot_cancer_group_heatmap(df: pd.DataFrame) -> None:
-    """Heatmap: avg eligible count by config × cancer group."""
-    pivot = df.pivot_table(
-        values="eligible_count",
-        index="cancer_group",
-        columns="config_name",
-        aggfunc="mean",
-    )
-    # Reorder columns
-    pivot = pivot[[c for c in CONFIG_ORDER if c in pivot.columns]]
-    pivot.columns = [CONFIG_LABELS.get(c, c) for c in pivot.columns]
-
-    if pivot.empty:
-        print("  Skipped: cancer group heatmap (no data)")
-        return
-
-    fig, ax = plt.subplots(figsize=(14, max(6, len(pivot) * 0.5 + 2)))
-    im = ax.imshow(pivot.values, cmap="YlOrRd", aspect="auto")
-
-    ax.set_xticks(range(len(pivot.columns)))
-    ax.set_xticklabels(pivot.columns, rotation=35, ha="right")
-    ax.set_yticks(range(len(pivot.index)))
-    ax.set_yticklabels(pivot.index)
-
-    # Annotate cells
-    for i in range(len(pivot.index)):
-        for j in range(len(pivot.columns)):
-            val = pivot.values[i, j]
-            if not np.isnan(val):
-                ax.text(j, i, f"{val:.1f}", ha="center", va="center", fontsize=8)
-
-    plt.colorbar(im, ax=ax, label="Avg Eligible Count")
-    ax.set_title("Eligible Matches by Cancer Group × Configuration")
-    plt.tight_layout()
-    path = output_dir() / "ablation_cancer_group_heatmap.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {path}")
-
-
-def plot_timing_breakdown(df: pd.DataFrame) -> None:
-    """Stacked bar chart of per-stage latency by config."""
-    timing_cols = [
-        ("query_expansion_time",  "Query Expansion"),
-        ("hybrid_retrieval_time", "Hybrid Retrieval"),
-        ("cross_encoder_time",    "Cross-Encoder"),
-        ("rule_filter_time",      "Rule Filter"),
-        ("gpt4o_evaluation_time", "GPT-4o Evaluation"),
-    ]
-
-    means = df.groupby("config_name", observed=True)[[t[0] for t in timing_cols]].mean()
-    means = means.loc[CONFIG_ORDER]
-    means.columns = [t[1] for t in timing_cols]
-    means.index = [CONFIG_LABELS[c] for c in means.index]
-
-    fig, ax = plt.subplots(figsize=(12, 6))
-    means.plot(kind="barh", stacked=True, ax=ax,
-               color=["#3498db", "#2ecc71", "#e74c3c", "#f39c12", "#9b59b6"])
-    ax.set_xlabel("Average Latency (seconds)")
-    ax.set_title("Pipeline Latency Breakdown by Configuration")
-    ax.legend(title="Stage", bbox_to_anchor=(1.02, 1), loc="upper left")
-    plt.tight_layout()
-    path = output_dir() / "ablation_timing_breakdown.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {path}")
-
+#
+# All nine plot functions moved there, unchanged apart from taking their output
+# directory as an argument. They were the only definitions in this file that
+# ever touched matplotlib -- measured by an AST walk over every Name load, not
+# by reading -- which is why the module-scope import went with them. main()
+# calls them through the `figures` import at the top.
 
 # ===========================================================================
 # 3b. WIN/TIE/LOSS PAIRWISE ANALYSIS
@@ -1173,229 +896,11 @@ def build_win_loss_table(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(results)
 
 
-def plot_win_loss_chart(wl_table: pd.DataFrame) -> None:
-    """Stacked horizontal bar: wins/ties/losses per config."""
-    if wl_table.empty:
-        print("  Skipped: win/loss chart (no data)")
-        return
-
-    labels = wl_table["config_label"].values
-    wins = wl_table["win_pct"].values
-    ties = wl_table["tie_pct"].values
-    losses = wl_table["loss_pct"].values
-
-    fig, ax = plt.subplots(figsize=(10, 5))
-    y = range(len(labels))
-
-    ax.barh(y, losses, color="#e74c3c", label="Loss (fewer eligible)")
-    ax.barh(y, ties, left=losses, color="#bdc3c7", label="Tie (same)")
-    ax.barh(y, wins, left=[l + t for l, t in zip(losses, ties)],
-            color="#2ecc71", label="Win (more eligible)")
-
-    ax.set_yticks(y)
-    ax.set_yticklabels(labels)
-    ax.set_xlabel("% of Patients")
-    ax.set_title("Per-Patient Win/Tie/Loss vs Baseline (Eligible Count)")
-    ax.legend(loc="lower right")
-    ax.set_xlim(0, 100)
-
-    plt.tight_layout()
-    path = output_dir() / "ablation_win_loss_chart.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {path}")
 
 
 # ===========================================================================
-# 3c. RETRIEVAL MODE UNIQUE CONTRIBUTION (BM25 vs Vector Venn)
+# 3c/3d. RETRIEVAL VENN and PER-PATIENT SCATTER -> figures.py (pass 20f-4)
 # ===========================================================================
-
-def plot_retrieval_venn(df: pd.DataFrame) -> None:
-    """
-    Compare bm25_only vs vector_only vs hybrid: unique trial contributions.
-
-    Uses eligible_nct_ids column to compute exact trial-level overlap:
-      - Trials found by BOTH retrieval modes
-      - Trials found ONLY by BM25
-      - Trials found ONLY by vector
-      - Trials found ONLY by hybrid (synergy from fusion)
-
-    Falls back to eligible_count proxy if eligible_nct_ids is unavailable.
-    """
-    has_nct_ids = ("eligible_nct_ids" in df.columns
-                   and df["eligible_nct_ids"].notna().any()
-                   and (df["eligible_nct_ids"] != "").any())
-
-    baseline_df = df[df["config_name"] == "full_pipeline"].set_index("patient_id")
-    bm25_df = df[df["config_name"] == "bm25_only"].set_index("patient_id")
-    vector_df = df[df["config_name"] == "vector_only"].set_index("patient_id")
-
-    shared = baseline_df.index.intersection(bm25_df.index).intersection(vector_df.index)
-    if len(shared) < 5:
-        print("  Skipped: retrieval venn (insufficient data)")
-        return
-
-    if has_nct_ids:
-        # True trial-level overlap analysis using NCT IDs
-        bm25_only_total = 0
-        vector_only_total = 0
-        both_total = 0
-        hybrid_synergy_total = 0
-
-        for pid in shared:
-            bl_ids = set(baseline_df.loc[pid, "eligible_nct_ids"].split(",")) - {""}
-            bm_ids = set(bm25_df.loc[pid, "eligible_nct_ids"].split(",")) - {""}
-            vc_ids = set(vector_df.loc[pid, "eligible_nct_ids"].split(",")) - {""}
-
-            both = bm_ids & vc_ids
-            bm25_unique = bm_ids - vc_ids
-            vec_unique = vc_ids - bm_ids
-            hybrid_unique = bl_ids - bm_ids - vc_ids
-
-            bm25_only_total += len(bm25_unique)
-            vector_only_total += len(vec_unique)
-            both_total += len(both)
-            hybrid_synergy_total += len(hybrid_unique)
-
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-        # Left: Venn-style bar chart
-        ax = axes[0]
-        categories = ["BM25 Only", "Both", "Vector Only", "Hybrid Synergy"]
-        values = [bm25_only_total, both_total, vector_only_total, hybrid_synergy_total]
-        colors = ["#e74c3c", "#9b59b6", "#3498db", "#2ecc71"]
-        ax.bar(categories, values, color=colors)
-        ax.set_ylabel("Total Eligible Trials (across all patients)")
-        ax.set_title("Trial-Level Retrieval Contributions")
-        for i, v in enumerate(values):
-            ax.text(i, v + 0.5, str(v), ha="center", fontsize=10)
-
-        # Right: per-patient who contributes more
-        bm25_better = 0
-        vector_better = 0
-        equal = 0
-        for pid in shared:
-            bm_ids = set(bm25_df.loc[pid, "eligible_nct_ids"].split(",")) - {""}
-            vc_ids = set(vector_df.loc[pid, "eligible_nct_ids"].split(",")) - {""}
-            if len(bm_ids) > len(vc_ids):
-                bm25_better += 1
-            elif len(vc_ids) > len(bm_ids):
-                vector_better += 1
-            else:
-                equal += 1
-
-        ax = axes[1]
-        ax.bar(["BM25 Better", "Equal", "Vector Better"],
-               [bm25_better, equal, vector_better],
-               color=["#e74c3c", "#bdc3c7", "#3498db"])
-        ax.set_ylabel("Patient Count")
-        ax.set_title("Per-Patient: Which Retrieval Mode Finds More?")
-        for i, v in enumerate([bm25_better, equal, vector_better]):
-            ax.text(i, v + 0.3, str(v), ha="center", fontsize=10)
-
-    else:
-        # Fallback: proxy analysis using eligible_count recovery rates
-        bl = baseline_df.loc[shared, "eligible_count"].values
-        bm = bm25_df.loc[shared, "eligible_count"].values
-        vc = vector_df.loc[shared, "eligible_count"].values
-
-        bm25_recovery = np.where(bl > 0, bm / bl, 0)
-        vector_recovery = np.where(bl > 0, vc / bl, 0)
-
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-        ax = axes[0]
-        ax.hist(bm25_recovery, bins=20, alpha=0.6, label="BM25 Only", color="#e74c3c")
-        ax.hist(vector_recovery, bins=20, alpha=0.6, label="Vector Only", color="#3498db")
-        ax.axvline(1.0, color="black", linestyle="--", linewidth=0.8, label="100% recovery")
-        ax.set_xlabel("Recovery Rate (eligible found / baseline eligible)")
-        ax.set_ylabel("Patient Count")
-        ax.set_title("Eligible Match Recovery by Retrieval Mode")
-        ax.legend()
-
-        ax = axes[1]
-        ax.scatter(bm25_recovery, vector_recovery, alpha=0.5, s=30, c="#9b59b6")
-        max_r = max(bm25_recovery.max(), vector_recovery.max(), 1.5)
-        ax.plot([0, max_r], [0, max_r], "k--", linewidth=0.8, label="Equal recovery")
-        ax.set_xlabel("BM25 Recovery Rate")
-        ax.set_ylabel("Vector Recovery Rate")
-        ax.set_title("BM25 vs Vector: Per-Patient Recovery")
-        ax.legend()
-
-        bm25_better = int(np.sum(bm25_recovery > vector_recovery))
-        vector_better = int(np.sum(vector_recovery > bm25_recovery))
-        equal = int(np.sum(bm25_recovery == vector_recovery))
-        ax.text(0.02, 0.98, f"BM25 better: {bm25_better}\nVector better: {vector_better}\nEqual: {equal}",
-                transform=ax.transAxes, va="top", fontsize=9,
-                bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
-
-    plt.suptitle("Hybrid Retrieval Justification: BM25 vs Vector Unique Contributions", y=1.02)
-    plt.tight_layout()
-    path = output_dir() / "ablation_retrieval_venn.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {path}")
-
-
-# ===========================================================================
-# 3d. PER-PATIENT SCATTER: BASELINE vs ABLATED
-# ===========================================================================
-
-def plot_patient_scatter(df: pd.DataFrame) -> None:
-    """
-    Scatter plot: baseline eligible count vs ablated eligible count per patient.
-    One subplot per config. Points below the diagonal = degradation.
-    Shows WHERE each config fails, not just averages.
-    """
-    baseline_df = df[df["config_name"] == BASELINE].set_index("patient_id")
-    non_baseline = [c for c in CONFIG_ORDER if c != BASELINE]
-
-    n_configs = len(non_baseline)
-    cols = 3
-    rows = (n_configs + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4.5 * rows), squeeze=False)
-
-    for idx, config in enumerate(non_baseline):
-        ax = axes[idx // cols][idx % cols]
-        config_df = df[df["config_name"] == config].set_index("patient_id")
-        shared = baseline_df.index.intersection(config_df.index)
-
-        bl = baseline_df.loc[shared, "eligible_count"].values
-        cf = config_df.loc[shared, "eligible_count"].values
-
-        if len(bl) == 0:
-            ax.text(0.5, 0.5, "No shared patients", transform=ax.transAxes,
-                    ha="center", va="center", fontsize=9)
-            ax.set_title(CONFIG_LABELS[config], fontsize=10)
-            continue
-
-        ax.scatter(bl, cf, alpha=0.5, s=25, c="#3498db")
-        max_val = max(bl.max(), cf.max(), 1) + 1
-        
-        ax.plot([0, max_val], [0, max_val], "k--", linewidth=0.8)
-        ax.set_xlabel("Baseline Eligible")
-        ax.set_ylabel(f"{CONFIG_LABELS[config]} Eligible")
-        ax.set_title(CONFIG_LABELS[config], fontsize=10)
-        ax.set_xlim(-0.5, max_val)
-        ax.set_ylim(-0.5, max_val)
-
-        # Count degraded patients
-        degraded = np.sum(cf < bl)
-        improved = np.sum(cf > bl)
-        ax.text(0.02, 0.98, f"Degraded: {degraded}\nImproved: {improved}",
-                transform=ax.transAxes, va="top", fontsize=8,
-                bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.7))
-
-    # Hide unused subplots
-    for idx in range(n_configs, rows * cols):
-        axes[idx // cols][idx % cols].set_visible(False)
-
-    plt.suptitle("Per-Patient Eligible Count: Baseline vs Each Ablation", fontsize=13, y=1.01)
-    plt.tight_layout()
-    path = output_dir() / "ablation_patient_scatter.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {path}")
 
 
 # ===========================================================================
@@ -1405,7 +910,8 @@ def plot_patient_scatter(df: pd.DataFrame) -> None:
 def generate_report(df: pd.DataFrame, table: pd.DataFrame,
                     stats: pd.DataFrame, wl_table: pd.DataFrame,
                     errors: pd.DataFrame, pairing: pd.DataFrame,
-                    descriptive: pd.DataFrame, mde: dict) -> None:
+                    descriptive: pd.DataFrame, mde: dict,
+                    out_dir) -> None:
     """Generate a plain-text report for quick review."""
     lines = []
     lines.append("=" * 70)
@@ -1813,7 +1319,7 @@ def generate_report(df: pd.DataFrame, table: pd.DataFrame,
     print(report_text)
 
     # Save to file
-    path = output_dir() / "ablation_full_report.txt"
+    path = out_dir / "ablation_full_report.txt"
     with open(path, "w") as f:
         f.write(report_text)
     print(f"\n  Saved: {path}")
@@ -1823,8 +1329,18 @@ def generate_report(df: pd.DataFrame, table: pd.DataFrame,
 # MAIN
 # ===========================================================================
 
-def main():
-    """Run full ablation analysis."""
+def main(db_path=None):
+    """Run full ablation analysis.
+
+    Args:
+        db_path: ``None`` -- the default and what every documented command
+            produces -- reads the production ``ablation_results.db`` and writes
+            beside it. An explicit path reads THAT database and writes every
+            table, figure and report into ITS directory, so an isolated study
+            can be analysed without overwriting the production artifacts. The
+            parent directory must exist; a missing one is refused by name
+            (``common._require_writable_parent``, pass 20f-3), not by sqlite3.
+    """
 
     print()
     print("=" * 70)
@@ -1832,10 +1348,20 @@ def main():
     print("=" * 70)
     print()
 
+    # ONE resolution, read by every writer below. The outputs FOLLOW the
+    # database: with --db they land beside it, so a scratch analysis cannot
+    # overwrite the production tables and figures with numbers computed from a
+    # different database.
+    out_dir = output_dir(db_path)
+    if db_path is not None:
+        print(f"  --db in effect: {ablation_db(db_path)}")
+        print(f"  Outputs will go beside it: {out_dir}")
+        print()
+
     # --- Load data ---
     print("[1/9] Loading data...")
-    df = load_ablation_data()
-    errors = load_error_data()
+    df = load_ablation_data(db_path)
+    errors = load_error_data(db_path)
 
     if len(df) == 0:
         print("ERROR: No successful results found in ablation database.")
@@ -1844,53 +1370,54 @@ def main():
     # --- Build comparison table (with bootstrapped 95% CIs) ---
     print("[2/9] Building comparison table with 95% CIs...")
     table = build_comparison_table(df)
-    csv_path = output_dir() / "ablation_comparison_table.csv"
+    csv_path = out_dir / "ablation_comparison_table.csv"
     table.to_csv(csv_path, index=False)
     print(f"  Saved: {csv_path}")
 
     # --- Pairing / dropped-patient accounting (feeds the tests) ---
     print("[3/9] Auditing patient pairing and dropped set...")
     pairing = build_pairing_report(df, errors)
-    pairing_path = output_dir() / "ablation_pairing_report.csv"
+    pairing_path = out_dir / "ablation_pairing_report.csv"
     pairing.to_csv(pairing_path, index=False)
     print(f"  Saved: {pairing_path}")
 
     # --- Statistical tests (BH-FDR corrected, signed effect sizes) ---
     print("[4/9] Running statistical tests (BH-FDR corrected)...")
     stats = run_statistical_tests(df, pairing)
-    stats_path = output_dir() / "ablation_statistical_tests.csv"
+    stats_path = out_dir / "ablation_statistical_tests.csv"
     stats.to_csv(stats_path, index=False)
     print(f"  Saved: {stats_path}")
 
     mde = compute_minimum_detectable_effect(df, stats)
 
     descriptive = build_descriptive_deltas(df)
-    desc_path = output_dir() / "ablation_descriptive_metrics.csv"
+    desc_path = out_dir / "ablation_descriptive_metrics.csv"
     descriptive.to_csv(desc_path, index=False)
     print(f"  Saved: {desc_path}")
 
     # --- Win/Tie/Loss pairwise analysis ---
     print("[5/9] Building win/tie/loss table...")
     wl_table = build_win_loss_table(df)
-    wl_path = output_dir() / "ablation_win_loss_table.csv"
+    wl_path = out_dir / "ablation_win_loss_table.csv"
     wl_table.to_csv(wl_path, index=False)
     print(f"  Saved: {wl_path}")
 
     # --- Visualizations (original + new) ---
     print("[6/9] Generating visualizations...")
-    plot_funnel_chart(df)
-    plot_delta_chart(table)
-    plot_cost_efficiency(df)
-    plot_score_distribution(df)
-    plot_cancer_group_heatmap(df)
-    plot_timing_breakdown(df)
-    plot_win_loss_chart(wl_table)
-    plot_retrieval_venn(df)
-    plot_patient_scatter(df)
+    figures.plot_funnel_chart(df, out_dir)
+    figures.plot_delta_chart(table, out_dir)
+    figures.plot_cost_efficiency(df, out_dir)
+    figures.plot_score_distribution(df, out_dir)
+    figures.plot_cancer_group_heatmap(df, out_dir)
+    figures.plot_timing_breakdown(df, out_dir)
+    figures.plot_win_loss_chart(wl_table, out_dir)
+    figures.plot_retrieval_venn(df, out_dir)
+    figures.plot_patient_scatter(df, out_dir)
 
     # --- Full report ---
     print("[7/9] Generating report...")
-    generate_report(df, table, stats, wl_table, errors, pairing, descriptive, mde)
+    generate_report(df, table, stats, wl_table, errors, pairing, descriptive,
+                    mde, out_dir)
 
     # --- Summary JSON (for programmatic use) ---
     print("[8/9] Exporting summary JSON...")
@@ -1922,7 +1449,7 @@ def main():
             "baseline": BASELINE,
         },
     }
-    json_path = output_dir() / "ablation_analysis.json"
+    json_path = out_dir / "ablation_analysis.json"
     with open(json_path, "w") as f:
         json.dump(summary, f, indent=2, default=str)
     print(f"  Saved: {json_path}")
@@ -1952,7 +1479,7 @@ def main():
                 })
     if worst:
         worst_df = pd.DataFrame(worst).sort_values("delta")
-        worst_path = output_dir() / "ablation_worst_degradation.csv"
+        worst_path = out_dir / "ablation_worst_degradation.csv"
         worst_df.to_csv(worst_path, index=False)
         print(f"  Top degradation cases saved: {worst_path}")
         print("  (Review these patients manually for qualitative error analysis)")
@@ -1960,7 +1487,7 @@ def main():
     print()
     print("=" * 70)
     print("  ANALYSIS COMPLETE")
-    print(f"  All outputs in: {output_dir()}")
+    print(f"  All outputs in: {out_dir}")
     print("=" * 70)
     print()
 
