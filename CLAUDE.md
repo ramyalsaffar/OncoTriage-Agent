@@ -397,6 +397,12 @@ python tests/test_paths_glob_determinism.py                        #  25
 python tests/test_storage_wipe_all_tables.py                       #  22
 python tests/test_fhir_parser_dict_input.py                        #  29
 python tests/test_ablation_db_isolation.py                         #  72 (was 43; pass 20f-3 added section 5b for the --db parent guard and the checkpoint)
+
+# The render-snapshot test (pass 20f-5). Same shape, same directory, no network,
+# no keys, no spend. It reads a SEEDED SCRATCH database and never the production
+# one, writes nothing in the repository, and is not in the collision matrix.
+python tests/test_dashboard_reproducibility_tab.py                 # 163; ~1.2 s
+python tests/test_dashboard_reproducibility_tab.py --update-snapshot  # regenerate the golden snapshot ON PURPOSE
 pip install -e .                                         # makes `oncotriage` importable anywhere
 ```
 
@@ -2286,6 +2292,82 @@ each caught**: a `CONFIG_ORDER` reordering (16 of 17 artifacts move), a
 seed (3) and a changed output filename (1). The default path was then run for
 real through `python "27- Ablation Analysis.py"` with no flag, and the
 production results directory is **byte-unchanged**, all 19 files.
+
+### The reproducibility tab has a standing guard (pass 20f-5)
+
+Pass 20f-4's AppTest comparison **was never committed**, so the largest render
+function in the dashboard was proved correct once and then unguarded. That
+harness was searched for first — repository, git history and stash, every
+sibling directory under the project root, both backup trees and every scratch
+directory: `AppTest`, `no_collection_column`, `empty_hash_column` and
+`perfectly_stable` appear in exactly one file, **CLAUDE.md, as prose**. It was
+rebuilt, as `tests/test_dashboard_reproducibility_tab.py`. **163 checks, 1.2 s,
+no network, no keys, no spend.**
+
+**THREE THINGS HAD TO CHANGE FOR IT TO BE A TEST RATHER THAN A FILE MOVE.**
+
+- **There is no "before" any more.** The old harness rendered the pre-split
+  module out of `git show`, and a commit recedes — a shallow clone, a squash or
+  an export drops `e7c9742^` and the test then fails for something that is not a
+  defect. The reference is a **golden snapshot committed beside the file**,
+  `tests/snapshots/dashboard_reproducibility_tab.json`, 4,624 lines of plain
+  JSON, regenerated only on purpose with `--update-snapshot` and **byte-identical
+  across regenerations** (verified: three runs, one sha256). It was established
+  against the pre-split source **once**: the four hoisted literals lifted from
+  `git show e7c9742^:...` by AST, `ast.literal_eval`'d and compared to the module
+  constants by value and by key order — **all four identical on both**. Nothing
+  in the shipped test reads git.
+- **It does not touch the production database.** A scratch SQLite file in a
+  temp directory carries **both** tables, built by the project's own
+  `initialize_database()` so the schema is real by construction. `dashboard/data.py`
+  reads `paths.inferences_path`, which does **not** honour
+  `ONCOTRIAGE_INFERENCES_DB` (that reaches the two writers), so the scratch path
+  goes into `paths._RESOLVED` — the seam
+  `tests/test_ablation_db_isolation.py` already uses — and is restored.
+  Isolation is asserted **behaviourally**: `sqlite3.connect` is recorded for
+  every render and no render may open anything else.
+- **It drives the tab, not the app.** `AppTest.from_string` runs a four-line
+  driver over one module and one function with a frame the test supplies.
+
+**THE LITERAL CHECK IS SEPARATE FROM THE RENDER COMPARISON, AND THIS PASS
+MEASURED WHY.** Pass 20f-4's hand-transcribed `#2ecc71` survived an
+element-for-element comparison because that flip type never occurs — and that is
+not luck. `_with_flip_types` runs only over `flipped_comps`, which by
+construction holds two or more distinct classifications, so `'Rejected'` is
+always in `tiers_seen` and `_classify_flip_type` **can never return** `'Full
+Match ↔ Partial Match'` or `'Other'`. **Two of the five entries in
+`_FLIP_TYPE_COLORS` are unreachable by any data**, as is
+`_STATUS_DISPLAY_BASE_FLIP['violated']` (a run that violates an exclusion
+criterion is rejected, and a rejected run stores no `criterion_details`).
+Section 4 compares every literal by value **and key order** — the failure-mode
+chart and the recommended-fix table both iterate `_FAILURE_CATEGORIES.keys()` —
+and **section 5b plants pass 20f-4's actual shipped defect and requires the
+render comparison to see NOTHING while the literal check fires.**
+
+**SIX SCENARIOS FOR FIVE NAMED BRANCHES, and the sixth is forced.**
+`perfectly_stable` (no flips) reaches the first `st.success`; the second one is
+nested **inside** `if flip_count > 0`, so one render cannot satisfy both.
+`flips_no_drift` is that second render. `no_repeats` is seeded as one patient
+with two inferences on **different** collections, so `patients_with_multi` is 1
+rather than 0 and the branch is exercised with a non-degenerate number.
+
+**TWELVE PLANTED DEFECTS, TWELVE CAUGHT, EACH MEASURED — and one plant had to be
+replaced because it was a no-op.** `max(200, len(sorted_types) * 60)` → `* 61`
+moves nothing: three flip types render, and both arms evaluate to the floor. The
+control moves the **floor**, which is what that figure's height actually is on
+this data. `_normalize_criterion` losing `.lower()` was pass 20f-4's other
+measured no-op; the seeded corpus spells one criterion in a different case
+across runs, so here it bites. Plants are applied to a **copy** written into a
+temp directory, never the shipped file, and section 6 hashes the shipped file to
+say so. **Section 2 was also shown to fire against a real in-place edit** to the
+shipped module (four scenarios failed; restore byte-identical by sha256).
+
+**It is NOT in the collision matrix**, derived: it writes only inside a temp
+directory, patches no repository file, and the only repository file it reads is
+`oncotriage/dashboard/tabs/reproducibility.py`, which neither writer writes.
+**It does not inventory decorators** — `tests/test_package_invariants.py`
+section 2i already compares them as an exact dict keyed by
+`path::qualified_name`, and that file still reports **247**.
 
 ## Persistence and observability
 

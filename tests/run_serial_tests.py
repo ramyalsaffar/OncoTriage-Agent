@@ -97,10 +97,24 @@ WHY THIS ORDER. It is not arbitrary.
      neighbour mid-edit.
 
 WHAT THIS DOES NOT RUN. The other tests under tests/ -- the eleven component
-tests from pass 20d-1 and storage_query_layer -- write nothing in the repository
-and are safe in parallel and in any order. Adding them would make a fast, safe
-suite wait behind a slow, serial one. Files 18 and 19 are also not here: they
-need a live server and they cost money.
+tests from pass 20d-1, storage_query_layer, the four from pass 20f-1 and
+test_dashboard_reproducibility_tab -- write nothing in the repository and are
+safe in parallel and in any order. Adding them would make a fast, safe suite
+wait behind a slow, serial one. Files 18 and 19 are also not here: they need a
+live server and they cost money.
+
+  dashboard_reproducibility_tab  STAYS OUT, derived the same way as
+                             storage_query_layer above. It writes only inside a
+                             temporary directory -- the seeded scratch database,
+                             the pickled frame and every planted COPY of the
+                             module -- and the only repository file it READS is
+                             oncotriage/dashboard/tabs/reproducibility.py, which
+                             neither writer writes. It installs a scratch path
+                             into paths._RESOLVED and restores it. Like every
+                             other reader it imports the package, which is the
+                             ordinary hazard of importing config.py or
+                             cancer_code_registry.py inside a restore window,
+                             not a collision this matrix is for.
 
 NEVER EDIT THE REPOSITORY WHILE THIS IS RUNNING. Two of the five below restore
 from a copy taken at their own start, so an edit made to
