@@ -891,7 +891,7 @@ _CHAIN_CALL_MARKERS = ("exec_chain", "spec_from_file_location",
 _STRING_PREFILTER = ("exec", "spec_from_file_location", "SourceFileLoader",
                      "runpy")
 
-# THE exec() ALLOWLIST IS CLOSED AND HAS TWO MEMBERS, EACH WITH AN ARGUMENT.
+# THE exec() ALLOWLIST IS CLOSED AND HAS THREE MEMBERS, EACH WITH AN ARGUMENT.
 #
 # tests/test_storage_query_layer.py unparses two PRE-FIX functions out of a git
 # blob and exec's them into a throwaway namespace, so that its negative controls
@@ -909,8 +909,19 @@ _STRING_PREFILTER = ("exec", "spec_from_file_location", "SourceFileLoader",
 # the in-place shape that cost pass 20d-1 an edit to config.py, and it would put
 # a window in the run during which the shipped logger is wrong. Nothing here
 # execs a file in the working tree, which is what this section is about.
+# tests/test_indexer_admission_filters.py (the scrape-admission pass) compiles
+# ONE named top-level function out of a git blob of the pre-fix
+# oncotriage/retrieval/indexer.py and exec's it into a throwaway namespace, so
+# that its negative controls run the splitter that actually shipped rather than
+# a retyped paraphrase of it. Same argument as test_storage_query_layer.py, and
+# the same reason it cannot simply import the old module: the pre-fix indexer
+# imports openai and qdrant_client at module scope, so importing it to reach one
+# pure string function would build neither client but would drag both libraries
+# in. Only the one FunctionDef is compiled, into a namespace holding `re`.
+# Nothing here execs a file in the working tree.
 _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
-                   "tests/test_observability_logging.py"}
+                   "tests/test_observability_logging.py",
+                   "tests/test_indexer_admission_filters.py"}
 
 
 def _repo_py_files():

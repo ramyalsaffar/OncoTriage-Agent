@@ -77,6 +77,7 @@ except ImportError:
 from oncotriage.registries.mesh_crosswalk_build import (  # noqa: E402
     build_icd10_to_mesh_crosswalk,
     build_mesh_lookup,
+    build_mesh_non_oncology_lookup,
     build_snomed_to_mesh_crosswalk,
     build_umls_synonym_crosswalk,
 )
@@ -117,6 +118,12 @@ if __name__ == "__main__":
 
     # --- Step 1: Always build MeSH hierarchy (only needs desc2026.xml) ---
     mesh_data = build_mesh_lookup(mesh_xml, output_dir=data_MeSH_path)
+
+    # --- Step 1b: the non-oncology complement (only needs desc2026.xml) ---
+    # Required by the scraper's admission screen, which may drop a trial only
+    # on a POSITIVE non-oncology determination and therefore needs the whole
+    # descriptor set, not just C04.
+    build_mesh_non_oncology_lookup(mesh_xml, output_dir=data_MeSH_path)
 
     # --- Step 2: Build crosswalks only if MRCONSO available ---
     if Path(mrconso).exists():

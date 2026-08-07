@@ -75,9 +75,37 @@ if __name__ == "__main__":
         default='staging',
         help='staging: zero downtime (default) | direct: causes downtime'
     )
+    parser.add_argument(
+        '--compare-to',
+        default=None,
+        metavar='COLLECTION',
+        help='Collection the size floor is measured against. Default: whatever '
+             'the alias points at. Name one explicitly when the alias target is '
+             'known bad -- a floor derived from a truncated collection protects '
+             'nothing.'
+    )
+    parser.add_argument(
+        '--no-cleanup',
+        action='store_true',
+        help='Keep every existing collection instead of pruning to the two '
+             'most recent.'
+    )
+    parser.add_argument(
+        '--max-cost-usd',
+        type=float,
+        default=None,
+        metavar='USD',
+        help='Refuse to embed if the scraped corpus would cost more than this. '
+             'Checked AFTER the (free) scrape and BEFORE the first embedding '
+             'call, which is the only moment both the corpus size and the '
+             'price are known.'
+    )
     args = parser.parse_args()
 
-    main(use_staging=(args.mode == 'staging'))
+    main(use_staging=(args.mode == 'staging'),
+         compare_to=args.compare_to,
+         run_cleanup=not args.no_cleanup,
+         max_cost_usd=args.max_cost_usd)
 
 
 #------------------------------------------------------------------------------

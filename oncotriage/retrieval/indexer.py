@@ -58,6 +58,7 @@ import hashlib
 import json
 import logging
 import re
+import threading
 import time
 from collections import Counter
 from datetime import datetime
@@ -72,6 +73,9 @@ from qdrant_client.models import (
     DeleteAlias,
     DeleteAliasOperation,
     Distance,
+    FieldCondition,
+    Filter,
+    MatchValue,
     Modifier,
     PayloadSchemaType,
     PointStruct,
@@ -101,43 +105,190 @@ from oncotriage.extraction.stage import (
     enrich_structured_eligibility,
     get_stage_extraction_stats,
 )
-from oncotriage.utils import CaffeinateSession, qdrant_retry
-from oncotriage.observability import console
+from oncotriage.registries.mesh import (
+    TRIAL_NON_ONCOLOGY,
+    TRIAL_ONCOLOGY,
+    TRIAL_UNRESOLVED,
+    load_mesh_filter,
+)
+from oncotriage.utils import CaffeinateSession, get_model_cost, qdrant_retry
+from oncotriage.observability import console, get_logger
+
+
+log = get_logger(__name__)
 
 
 #------------------------------------------------------------------------------
 
 
 # ===========================================================================
-# INDEX-TIME AGE-PARSE DEGRADATION RECORD (item 11a)
+# DEFECT 1: THE INDEX-TIME AGE FILTER IS DELETED, NOT WIDENED
 # ===========================================================================
 #
-# The index-time MIRROR of oncotriage/agent/filtering.py's AGE_PARSE_FAILURES,
-# and `Exception and Fallback Audit.md` lists it as its own row: "a trial with
-# an unparseable minimum age is kept rather than skipped. Same fix, an
-# age_parse_failed counter in the scrape summary."
+# The scrape loop used to run
 #
-# WHAT THE HANDLER BELOW ACTUALLY DOES, which is worth stating because it is not
-# the same recovery as Stage 4's. The scrape SKIPS trials whose minimum age is
-# above 18 — an adult-oncology corpus does not want paediatric-only studies. An
-# unparseable minimumAge therefore means the trial is KEPT, i.e. indexed,
-# because the skip test could not be evaluated. Direction is the same as Stage
-# 4's (keep, never drop) and so is the reasoning for counting rather than
-# raising: the string comes from ClinicalTrials.gov, so there is no operator
-# action that would fix it, and aborting a 292k-trial scrape over one field
-# would be a worse outcome than indexing one extra trial.
+#     min_age = int(re.findall(r'\d+', min_age_str)[0])
+#     if min_age > 18:
+#         continue
 #
-# SEPARATE from the Stage 4 counter, and deliberately not shared. These are two
-# different populations measured at two different times — every registered trial
-# at scrape time, versus the ~75 retrieved for one patient at query time — and a
-# single counter would silently sum them into a number that means neither.
-# A module-level Counter either way, following PARTIAL_DATE_DEGRADATIONS.
-INDEX_AGE_PARSE_FAILURES = Counter()
+# which is not an adult filter. It is an EXACTLY-18 filter: a trial whose
+# minimumAge is 19, 20 or 21 was discarded, so a 70-year-old who qualifies for
+# a trial requiring 21 could never be matched to it, because the trial was
+# never in the corpus. The loss happens before any gate the pipeline measures,
+# so no stage-wise recall number could ever show it.
+#
+# WHY DELETED RATHER THAN WIDENED, and this was checked in the executable code
+# before it was decided. oncotriage/agent/filtering.py:node_rule_based_filter
+# parses both bounds and applies
+#
+#     elif patient_age is not None and not (min_age <= patient_age <= max_age):
+#         age_dropped += 1
+#         continue
+#
+# -- the full range, per patient, per request, counted into `age_dropped` and
+# reported in the Stage 4 log line. So the trial's own eligibility window is
+# already enforced against the actual patient at query time, and the scrape's
+# copy could only ever remove trials that check would have handled correctly.
+#
+# Widening the scrape filter to "the oldest patient we serve" was rejected on
+# the same grounds the item is about: it writes TODAY'S COHORT into the corpus.
+# Change the cohort -- a younger trial population, a paediatric arm, one older
+# patient -- and the corpus is silently wrong again, in the identical
+# undetectable way. A corpus must describe the registry, not the roster.
+#
+# WHAT WENT WITH IT: INDEX_AGE_PARSE_FAILURES. That Counter existed only to
+# record when the skip test above could not be evaluated. With no test there is
+# nothing to fail, and a counter that can never increment is a dead declaration
+# of exactly the shape tests/test_package_invariants.py check 2h exists to
+# report. Stage 4's AGE_PARSE_FAILURES is untouched and is now the only
+# age-parse record in the project, which is correct: it is the only place an
+# age bound is still parsed.
 
-# Same cap and the same reason as filtering._AGE_KEY_MAX_LEN: keep enough of the
-# raw value to see its shape, not enough for a pathological field to grow the
-# key without bound.
-_INDEX_AGE_KEY_MAX_LEN = 40
+
+# ===========================================================================
+# DEFECT 2: THE ADMISSION SCREEN, AND WHY IT MAY ONLY DROP ONE WAY
+# ===========================================================================
+#
+# The screen this replaces was a frozenset substring test over sixteen words.
+# It held "glioma" but neither "blastoma" nor "thelioma", so a trial registered
+# only as Glioblastoma, Mesothelioma, Neuroblastoma, Retinoblastoma or
+# Hepatoblastoma matched nothing in it and was discarded. Measured against the
+# shipped list, all five drop; measured against the C04 crosswalk, all five
+# resolve to specific tree numbers.
+#
+# Patching the word list was rejected because the list is the defect. Any
+# hand-maintained vocabulary of oncology has the same failure mode and no way
+# to know it is incomplete -- the losses are silent by construction.
+#
+# THE CROSSWALK IS NOT TREATED AS KNOWN-GOOD. On the patient side 224 of 1,000
+# patients resolve their site through fuzzy stemming rather than a crosswalk
+# hit, and that path's accuracy has never been measured. Trials carry free-text
+# condition strings, so this screen depends on the same resolution machinery.
+# The screen is therefore built so that resolution QUALITY cannot cost a trial:
+#
+#   TRIAL_ONCOLOGY     -> admit
+#   TRIAL_UNRESOLVED   -> ADMIT, and count. A failure to resolve is not
+#                         evidence of anything.
+#   TRIAL_NON_ONCOLOGY -> drop, and log the trial WITH its conditions. This is
+#                         the only verdict that removes a trial, and it needs
+#                         every registered condition to be a known MeSH term
+#                         positively outside C04.
+#
+# UNRESOLVED_KEPT IS THE NUMBER THAT MATTERS and it is reported at the end of
+# every scrape: it is the size of the uncertainty the screen is absorbing. A
+# false keep costs a little retrieval noise that Stage 4 and the judge already
+# filter per patient. A false drop is permanent, invisible and unmeasurable.
+ADMISSION_SCREEN = Counter()
+
+# MeSH top-level categories (C19, F03, ...) that justified a drop, so the
+# dropped population is auditable in aggregate and not only line by line.
+ADMISSION_DROPPED_CATEGORIES = Counter()
+
+# The screen's MeSH filter, resolved once, lazily, behind a lock.
+#
+# NOT through oncotriage.agent.deps, on the same argument the module docstring
+# already makes for the clients and that oncotriage/fhir/clean.py makes for the
+# cancer registry: a stub installed for an agent test must not change which
+# trials are admitted to the corpus. This calls load_mesh_filter() directly.
+#
+# It is allowed to RAISE. load_mesh_filter() raises DegradedDependencyError
+# when the two core C04 files are missing (item 11a), and that is right here
+# too: without them the screen resolves nothing, admits everything, and
+# produces a corpus quietly containing non-oncology trials -- which is the
+# class of defect this whole file is being changed to remove. One command
+# fixes it. The OPTIONAL non-oncology layer is different and does not raise:
+# its absence can only stop a drop, never cause one, so it degrades to
+# "admit everything" with a counter (see mesh.classify_trial_oncology).
+_SCREEN_LOCK = threading.RLock()
+_SCREEN_CACHE = {}
+
+
+def admission_screen_filter():
+    """The MeSHCancerFilter used by the scrape's admission screen.
+
+    Lazy and locked, matching oncotriage/agent/deps.py and
+    oncotriage/fhir/clean.py: importing this module must load nothing, and the
+    check-then-build sequence must not be able to build twice.
+    """
+    with _SCREEN_LOCK:
+        if "filter" not in _SCREEN_CACHE:
+            _SCREEN_CACHE["filter"] = load_mesh_filter()
+        return _SCREEN_CACHE["filter"]
+
+
+def reset_admission_screen_cache():
+    """Drop the cached filter. For harnesses that install their own."""
+    with _SCREEN_LOCK:
+        _SCREEN_CACHE.clear()
+
+
+def screen_trial_for_admission(trial: Dict, mesh_filter) -> bool:
+    """True if `trial` may enter the corpus. Records every outcome.
+
+    `mesh_filter` is passed in rather than resolved here so the scrape loop
+    resolves it once and so a test can drive this function directly.
+    A None filter admits everything and says so.
+    """
+    if mesh_filter is None:
+        ADMISSION_SCREEN[f"{TRIAL_UNRESOLVED}:no_mesh_filter"] += 1
+        return True
+
+    result = mesh_filter.classify_trial_oncology(trial)
+    verdict = result["verdict"]
+    ADMISSION_SCREEN[f"{verdict}:{result['evidence']}"] += 1
+
+    if verdict == TRIAL_ONCOLOGY:
+        return True
+
+    if verdict == TRIAL_UNRESOLVED:
+        # KEPT. Logged at INFO rather than WARNING: on a registry of free-text
+        # condition strings this is an expected outcome, not a fault, and the
+        # aggregate is what an operator acts on.
+        log.info("trial admitted unresolved by the oncology screen",
+                 nct_id=trial.get("nct_id", ""), verdict=verdict,
+                 evidence=result["evidence"],
+                 trial_conditions=result["unresolved"] or trial.get("conditions") or [])
+        return True
+
+    if verdict == TRIAL_NON_ONCOLOGY:
+        # The only drop.
+        for cat in result["categories"]:
+            ADMISSION_DROPPED_CATEGORIES[cat] += 1
+        log.info("trial dropped by the oncology admission screen",
+                 nct_id=trial.get("nct_id", ""), verdict=verdict,
+                 evidence=result["evidence"],
+                 trial_conditions=trial.get("conditions") or [],
+                 mesh_categories=result["categories"])
+        return False
+
+    # The vocabulary is closed (TRIAL_ONCOLOGY_VERDICTS) and every member is
+    # handled above, so this is unreachable unless a member is added without a
+    # policy here. Admitting on an unknown verdict would be the silent drop's
+    # mirror image -- a silent KEEP that hides the omission -- so it raises.
+    raise RuntimeError(
+        f"admission screen: unknown verdict {verdict!r} for "
+        f"{trial.get('nct_id', '')!r}. Every member of "
+        f"TRIAL_ONCOLOGY_VERDICTS needs an explicit policy here.")
 
 
 #------------------------------------------------------------------------------
@@ -220,7 +371,16 @@ def scrape_clinicaltrials_gov(condition=None, status=None, study_type=None, age=
 
     console.out(f"Filters: condition={condition}, status={status}, type={study_type}, max={max_trials}")
 
-    scrape_complete = False
+    # Resolved ONCE, before the loop, for two reasons. It reads four JSON
+    # lookups, and resolving it per study would do that per study. And it can
+    # raise (missing C04 core, item 11a) -- which must happen before a single
+    # page is fetched, not 200 pages in.
+    screen_filter = admission_screen_filter()
+
+    # A resumed checkpoint that already holds the cap is COMPLETE: the loop
+    # below will not run, and without this the incompleteness raise at the end
+    # would fire on a scrape that had in fact finished.
+    scrape_complete = len(trials) >= max_trials
     scrape_start    = time.time()
     page_num        = 0
 
@@ -242,9 +402,39 @@ def scrape_clinicaltrials_gov(condition=None, status=None, study_type=None, age=
                 params["pageToken"] = page_token
 
             try:
-                response = requests.get(base_url, params=params, timeout=30)
-                response.raise_for_status()
-                data = response.json()
+                # ONE PAGE, WITH RETRIES. Without this a single transient
+                # ReadTimeout ends a five-minute scrape, and ClinicalTrials.gov
+                # produced one on two of three full runs during this pass --
+                # measured, not feared. The IncompleteScrapeError below is the
+                # correctness guarantee; this is what stops it firing on a
+                # fault that clears itself in two seconds.
+                #
+                # Every attempt is counted, so a scrape that completed only
+                # because it retried eleven times is visible rather than
+                # looking identical to one that never stumbled.
+                data = None
+                for _attempt in range(1, _SCRAPE_PAGE_ATTEMPTS + 1):
+                    try:
+                        response = requests.get(base_url, params=params,
+                                                timeout=_SCRAPE_PAGE_TIMEOUT)
+                        response.raise_for_status()
+                        data = response.json()
+                        break
+                    except requests.exceptions.RequestException as _page_exc:
+                        SCRAPE_RETRIES[type(_page_exc).__name__] += 1
+                        if _attempt == _SCRAPE_PAGE_ATTEMPTS:
+                            raise
+                        _wait = 2 ** _attempt
+                        console.out(f"  page fetch failed "
+                                    f"({type(_page_exc).__name__}), attempt "
+                                    f"{_attempt}/{_SCRAPE_PAGE_ATTEMPTS}; "
+                                    f"retrying in {_wait}s")
+                        log.warning("scrape page retry",
+                                    retry=_attempt,
+                                    max_retries=_SCRAPE_PAGE_ATTEMPTS,
+                                    delay_s=_wait,
+                                    error_type=type(_page_exc).__name__)
+                        time.sleep(_wait)
 
                 studies = data.get("studies", [])
                 if not studies:
@@ -262,25 +452,9 @@ def scrape_clinicaltrials_gov(condition=None, status=None, study_type=None, age=
                     if design.get("studyType") != "INTERVENTIONAL":
                         continue
 
-                    eligibility = protocol.get("eligibilityModule", {})
-                    min_age_str = eligibility.get("minimumAge", "")
-                    if min_age_str and "year" in min_age_str.lower():
-                        try:
-                            min_age = int(re.findall(r'\d+', min_age_str)[0])
-                            if min_age > 18:
-                                continue
-                        except (IndexError, ValueError) as _age_exc:
-                            # RECOVERY UNCHANGED — the trial is indexed, because
-                            # the "skip paediatric-only" test could not be
-                            # evaluated. RECORDED now: without this the scrape
-                            # could not say whether zero such trials existed or
-                            # whether the check had quietly stopped running.
-                            _age_text = min_age_str
-                            if len(_age_text) > _INDEX_AGE_KEY_MAX_LEN:
-                                _age_text = _age_text[:_INDEX_AGE_KEY_MAX_LEN] + "..."
-                            INDEX_AGE_PARSE_FAILURES[
-                                f"minimumAge:{type(_age_exc).__name__}:{_age_text}"
-                            ] += 1
+                    # DEFECT 1: the minimumAge > 18 skip WAS HERE and is gone.
+                    # Stage 4 enforces the trial's full age window against the
+                    # actual patient; see the note at the top of this module.
 
                     # A trial tagged with a mutually exclusive pair PERMITS
                     # either histology, it does not require both. Both tags are
@@ -289,28 +463,13 @@ def scrape_clinicaltrials_gov(condition=None, status=None, study_type=None, age=
                     # matches. Counted as exclusive_pair_kept, reported below.
                     trial = parse_trial_metadata(protocol)
 
-                    # Post-scrape oncology validation:
-                    # Drop trials whose registered conditions contain no
-                    # cancer/neoplasm signal. ClinicalTrials.gov returns
-                    # non-cancer trials under "neoplasms" query when the
-                    # word appears only in the title or eligibility text.
-                    _ONCOLOGY_KEYWORDS = frozenset({
-                        "neoplasm", "cancer", "carcinoma", "sarcoma",
-                        "lymphoma", "leukemia", "melanoma", "glioma",
-                        "myeloma", "tumor", "tumour", "malignant",
-                        "malignancy", "oncology", "metastatic", "metastasis",
-                    })
-                    trial_conditions_lower = " ".join(
-                        trial.get("conditions") or []
-                    ).lower()
-                    trial_keywords_lower = " ".join(
-                        trial.get("keywords") or []
-                    ).lower()
-                    combined = trial_conditions_lower + " " + trial_keywords_lower
-                    
-                    if not any(kw in combined for kw in _ONCOLOGY_KEYWORDS):
+                    # DEFECT 2: the sixteen-word frozenset screen WAS HERE.
+                    # It is now the MeSH-routed admission screen, which drops
+                    # only on a positive non-oncology determination and admits
+                    # -- and counts -- every trial it cannot resolve.
+                    if not screen_trial_for_admission(trial, screen_filter):
                         continue
-                    
+
                     trials.append(trial)
                     added += 1
 
@@ -338,8 +497,15 @@ def scrape_clinicaltrials_gov(condition=None, status=None, study_type=None, age=
                 time.sleep(1)
 
             except requests.exceptions.RequestException as e:
+                # Recorded, then re-raised below via scrape_complete=False.
+                # This handler used to `break` and let the function RETURN the
+                # partial list, which main() then indexed and PROMOTED.
+                SCRAPE_INTERRUPTIONS[type(e).__name__] += 1
                 console.out(f"Network error fetching trials: {e}")
                 console.out("Progress saved to checkpoint — re-run to resume.")
+                log.warning("scrape interrupted by a network error",
+                            error_type=type(e).__name__, error_message=str(e),
+                            count=len(trials))
                 break
 
     elapsed = time.time() - scrape_start
@@ -348,6 +514,15 @@ def scrape_clinicaltrials_gov(condition=None, status=None, study_type=None, age=
     elapsed_str = f"{hrs:02d}:{mins:02d}:{secs:02d}" if hrs > 0 else f"{mins:02d}:{secs:02d}"
 
     console.out(f"\nTotal trials scraped: {len(trials)}  |  Scrape time: {elapsed_str}")
+
+    # A scrape that only completed because it retried is not the same event as
+    # one that never stumbled, and the corpus cannot tell them apart.
+    if SCRAPE_RETRIES:
+        console.out(f"Page fetches retried: {dict(SCRAPE_RETRIES)} "
+                    f"({sum(SCRAPE_RETRIES.values())} total)")
+        log.warning("scrape completed with retries",
+                    retry=sum(SCRAPE_RETRIES.values()),
+                    count=len(trials))
 
     _histology_stats = get_histology_extraction_stats()
     if _histology_stats.get("exclusive_pair_kept"):
@@ -361,18 +536,75 @@ def scrape_clinicaltrials_gov(condition=None, status=None, study_type=None, age=
     if any(_stage_stats.values()):
         console.out(f"Stage negation/span/exclusion-bound counters: {_stage_stats}")
 
-    # The age-parse counter the exception audit asked for, in the scrape summary
-    # where it asked for it. Printed only when non-zero, so a clean scrape's
-    # output is unchanged.
-    if INDEX_AGE_PARSE_FAILURES:
-        _age_total = sum(INDEX_AGE_PARSE_FAILURES.values())
-        console.out(f"minimumAge UNPARSEABLE on {_age_total} trial(s) — the "
-              f"paediatric-only skip did not run for them and they ARE indexed: "
-              f"{dict(INDEX_AGE_PARSE_FAILURES)}")
+    # --- The admission screen's funnel, always reported ---------------------
+    #
+    # ALWAYS, not only when non-zero. A screen that dropped nothing and a
+    # screen that did not run produce the same corpus, and the whole point of
+    # this item is that such a difference must never again be invisible.
+    _screened = sum(ADMISSION_SCREEN.values())
+    _dropped = sum(v for k, v in ADMISSION_SCREEN.items()
+                   if k.startswith(f"{TRIAL_NON_ONCOLOGY}:"))
+    _unresolved = sum(v for k, v in ADMISSION_SCREEN.items()
+                      if k.startswith(f"{TRIAL_UNRESOLVED}:"))
+    console.out(f"\nOncology admission screen: {_screened:,} screened, "
+                f"{_screened - _dropped:,} admitted, {_dropped:,} dropped "
+                f"(positive non-oncology determination only).")
+    console.out(f"  Admitted because the screen COULD NOT RESOLVE them: "
+                f"{_unresolved:,}  <- the uncertainty this screen absorbs")
+    console.out(f"  Verdicts: {dict(ADMISSION_SCREEN)}")
+    if ADMISSION_DROPPED_CATEGORIES:
+        console.out(f"  Dropped by MeSH top-level category: "
+                    f"{dict(ADMISSION_DROPPED_CATEGORIES)}")
+    log.info("oncology admission screen complete", screened=_screened,
+             admitted=_screened - _dropped, non_oncology_dropped=_dropped,
+             unresolved_kept=_unresolved)
+
+    # --- Defect 3: the residual unsplit population --------------------------
+    _unsplit = sum(v for k, v in CRITERIA_SPLIT_METHODS.items()
+                   if k == CRITERIA_SPLIT_UNSPLIT)
+    console.out(f"Criteria split: {dict(CRITERIA_SPLIT_METHODS)}")
+    console.out(f"  UNSPLIT (whole text is inclusion, exclusion empty): "
+                f"{_unsplit:,} — each carries criteria_split="
+                f"'{CRITERIA_SPLIT_UNSPLIT}' as a trial-level field")
+    log.info("criteria split complete", unsplit_count=_unsplit,
+             total=sum(CRITERIA_SPLIT_METHODS.values()))
 
     if scrape_complete and checkpoint_file.exists():
         checkpoint_file.unlink()
         console.out("Scrape checkpoint cleared.")
+
+    # ===================================================================
+    # A PARTIAL SCRAPE IS NOT A CORPUS, AND MUST NOT BE RETURNED AS ONE
+    # ===================================================================
+    #
+    # THIS RAISE EXISTS BECAUSE THE ALTERNATIVE HAPPENED, on the first real
+    # run of this pass. A transient ClinicalTrials.gov read timeout hit the
+    # handler above, which `break`s. `scrape_complete` stayed False -- so the
+    # checkpoint was correctly KEPT -- but the function then returned 5,482 of
+    # ~14,300 trials as its ordinary return value. main() had no way to tell a
+    # complete corpus from a truncated one, built an index from it, and
+    # promoted the alias onto a collection holding 38% of the registry. The
+    # console said "re-run to resume" and the run exited 0.
+    #
+    # That is exactly the defect class this whole item exists to remove: a
+    # silent loss upstream of every gate the pipeline measures. It was
+    # pre-existing -- the `break` and the `return trials` are both original --
+    # and it was invisible because nothing downstream knew what a complete
+    # scrape looked like.
+    #
+    # Raising is right rather than harsh. The checkpoint is already on disk, so
+    # re-running RESUMES from the saved page_token and costs nothing; the only
+    # thing lost is the ability to promote a corpus nobody knows the size of.
+    if not scrape_complete:
+        raise IncompleteScrapeError(
+            f"the scrape ended early with {len(trials):,} trial(s) and did NOT "
+            f"reach the end of the result set. "
+            f"Interruptions: {dict(SCRAPE_INTERRUPTIONS) or 'none recorded'}.\n"
+            f"  The checkpoint at {checkpoint_file} has been KEPT — re-run this "
+            f"command and the scrape resumes from where it stopped.\n"
+            f"  Refusing to return a partial corpus: an index built from one "
+            f"looks identical to an index built from a complete one, and the "
+            f"trials it is missing are invisible to every downstream stage.")
 
     return trials
 
@@ -434,8 +666,9 @@ def parse_trial_metadata(protocol: Dict) -> Dict:
             interventions.append(name)
             seen_names.add(name)
 
-    eligibility_text               = eligibility.get("eligibilityCriteria", "")
-    inclusion_text, exclusion_text = split_inclusion_exclusion(eligibility_text)
+    eligibility_text = eligibility.get("eligibilityCriteria", "")
+    inclusion_text, exclusion_text, split_method = \
+        split_inclusion_exclusion(eligibility_text)
 
     trial = {
         "nct_id":               identification.get("nctId", ""),
@@ -450,6 +683,11 @@ def parse_trial_metadata(protocol: Dict) -> Dict:
         "conditions":           conditions,    # NEW — MeSH disease terms
         "keywords":             keywords,      # NEW — study keywords
         "interventions":        interventions, # NEW — deduplicated intervention names
+        # DEFECT 3: criteria_split is a REAL FIELD, written here, not inferred
+        # downstream. It rides into Qdrant inside full_trial_json like every
+        # other key of this dict, so a downstream ingestion gate can assert on
+        # it without re-implementing the splitter.
+        "criteria_split":       split_method,
         "eligibility": {
             "criteria_text":      eligibility_text,
             "inclusion_criteria": inclusion_text,
@@ -477,28 +715,155 @@ def parse_trial_metadata(protocol: Dict) -> Dict:
     return trial
 
 
-def split_inclusion_exclusion(criteria_text: str) -> tuple:
-    """Split eligibility criteria into inclusion and exclusion sections"""
-    
-    text_lower = criteria_text.lower()
-    
-    inclusion_markers = ["inclusion criteria:", "inclusion:", "patients must have"]
-    exclusion_markers = ["exclusion criteria:", "exclusion:", "patients must not"]
-    
-    inclusion_start = -1
-    for marker in inclusion_markers:
-        pos = text_lower.find(marker)
-        if pos != -1:
-            if inclusion_start == -1 or pos < inclusion_start:
-                inclusion_start = pos
+# ===========================================================================
+# DEFECT 3: THE CRITERIA SPLIT, MEASURED BEFORE IT WAS CHANGED
+# ===========================================================================
+#
+# MEASURED ON THE STORED 12,067-TRIAL CORPUS, by branch, before any edit:
+#
+#     both            11,218   92.96%
+#     inclusion_only     299    2.48%   <- exclusion_criteria ends up EMPTY
+#     exclusion_only     103    0.85%
+#     neither            447    3.70%   <- exclusion_criteria ends up EMPTY
+#
+# THE BRIEF NAMED ONLY THE `neither` BRANCH (3.70%). The harm it describes --
+# "the whole criteria text goes to inclusion and exclusion is empty" -- is
+# produced by TWO branches, because `elif inclusion_start != -1` also sets
+# exclusion_text = "". The real rate of trials reaching the judge with no
+# exclusion section is 746, 6.18%, and 681 of those contain exclusion
+# vocabulary, i.e. genuine exclusion criteria arriving under inclusion labels.
+#
+# WHY THE MARKERS MISSED: the old list required a COLON. "Inclusion Criteria"
+# followed by a newline -- the single commonest heading style on
+# ClinicalTrials.gov -- matched nothing. "Key Exclusion Criteria" matched only
+# at the offset of the inner "Exclusion Criteria". And the substring search was
+# unanchored, so "Patients must not be breastfeeding" INSIDE an inclusion
+# bullet was taken as the start of the exclusion section: measured, that
+# mis-cut 100 trials that the anchored search resolves correctly.
+#
+# THE POLICY IS BOTH, NOT EITHER. The brief offered a choice between "a richer
+# marker list and a flag"; it also requires the unsplit state to be recorded
+# per trial as a real field. Those are answers to different questions -- richer
+# markers reduce the population, the flag records whatever survives -- and one
+# does not substitute for the other. Measured outcome of doing both:
+#
+#     empty exclusion   746 (6.18%)  ->  213 (1.77%)
+#     recovered                                533
+#     LOST                                       0
+#
+# LOST == 0 IS A DESIGN CONSTRAINT, NOT AN OBSERVATION. The anchored search
+# alone lost 116 splits that the old unanchored search found, because a real
+# heading is not always at a line start. Losing a split is the same silent
+# harm in a new place, so the anchored search FALLS BACK to the original
+# substring markers whenever it finds nothing. The new split is therefore a
+# strict superset of the old one by construction.
 
-    exclusion_start = -1
-    for marker in exclusion_markers:
+CRITERIA_SPLIT_BOTH = "both"
+CRITERIA_SPLIT_INCLUSION_ONLY = "inclusion_only"
+CRITERIA_SPLIT_EXCLUSION_ONLY = "exclusion_only"
+CRITERIA_SPLIT_UNSPLIT = "unsplit"
+CRITERIA_SPLIT_EMPTY = "empty_criteria"
+
+CRITERIA_SPLIT_METHODS = Counter()
+
+# The original markers. Retained verbatim as the FALLBACK, so no split the old
+# code found can be lost. Substring, unanchored, colon-bearing.
+_LEGACY_INCLUSION_MARKERS = ["inclusion criteria:", "inclusion:", "patients must have"]
+_LEGACY_EXCLUSION_MARKERS = ["exclusion criteria:", "exclusion:", "patients must not"]
+
+# A heading sits at the start of a line, optionally behind a bullet or a list
+# number. Anchoring on that is what separates "Exclusion Criteria:" the heading
+# from "...meets any exclusion criteria:" the sentence.
+_HEADING_LEAD = r"(?:^|\n)[ \t]*(?:[-*#>•]+[ \t]*)?(?:\d+[.)][ \t]*)?"
+
+# Longest alternatives FIRST: "key exclusion criteria" must win over the
+# "exclusion criteria" nested inside it, or the heading is cut four characters
+# late. Python's `|` is first-match, not longest-match.
+_INCLUSION_HEADINGS = [
+    r"key\s+inclusion\s+criteria", r"inclusion\s+criteria", r"inclusion",
+    r"patients\s+must\s+have", r"eligibility\s+criteria",
+    r"eligible\s+patients", r"inclusion\s+guidelines",
+]
+_EXCLUSION_HEADINGS = [
+    r"key\s+exclusion\s+criteria", r"exclusion\s+criteria", r"exclusion",
+    r"patients\s+must\s+not", r"exclusionary\s+criteria",
+    r"ineligibility\s+criteria", r"non-?inclusion\s+criteria",
+    r"exclusion\s+guidelines", r"excluded\s+patients", r"patients?\s+excluded",
+]
+
+
+def _compile_headings(alternatives):
+    return re.compile(_HEADING_LEAD + r"(?:" + "|".join(alternatives) + r")\b",
+                      re.IGNORECASE)
+
+
+_INCLUSION_RE = _compile_headings(_INCLUSION_HEADINGS)
+_EXCLUSION_RE = _compile_headings(_EXCLUSION_HEADINGS)
+
+
+def _first_heading(pattern, text: str) -> int:
+    """Offset of the first line-anchored heading, or -1.
+
+    The match starts at the newline/bullet/number that _HEADING_LEAD consumed,
+    so the offset is walked forward to the first character of the heading
+    WORD -- otherwise every section would begin with the previous section's
+    line break and the bullet that introduced it.
+    """
+    m = pattern.search(text)
+    if not m:
+        return -1
+    i = m.start()
+    while i < len(text) and text[i] in "\n \t-*#>•":
+        i += 1
+    while i < len(text) and (text[i].isdigit() or text[i] in ".)"):
+        i += 1
+    while i < len(text) and text[i] in " \t":
+        i += 1
+    return i
+
+
+def _legacy_marker_position(text_lower: str, markers) -> int:
+    """The old unanchored substring search, byte-for-byte in behaviour."""
+    position = -1
+    for marker in markers:
         pos = text_lower.find(marker)
-        if pos != -1:
-            if exclusion_start == -1 or pos < exclusion_start:
-                exclusion_start = pos
-    
+        if pos != -1 and (position == -1 or pos < position):
+            position = pos
+    return position
+
+
+def _section_start(pattern, markers, criteria_text: str, text_lower: str) -> int:
+    """Anchored heading if there is one, else the legacy substring match."""
+    pos = _first_heading(pattern, criteria_text)
+    if pos != -1:
+        return pos
+    return _legacy_marker_position(text_lower, markers)
+
+
+def split_inclusion_exclusion(criteria_text: str) -> tuple:
+    """Split eligibility criteria into inclusion and exclusion sections.
+
+    Returns:
+        (inclusion_text, exclusion_text, split_method)
+
+    THE RETURN IS A 3-TUPLE AS OF THIS ITEM. The third member is one of the
+    CRITERIA_SPLIT_* constants and is stored per trial, because the unsplit
+    state has to be a real recorded field rather than something a later
+    consumer re-derives -- a downstream ingestion gate needs it as a standing
+    check, and re-deriving it means re-implementing this function, which is how
+    the two copies in this repository drifted apart in the first place.
+    """
+    if not criteria_text or not criteria_text.strip():
+        CRITERIA_SPLIT_METHODS[CRITERIA_SPLIT_EMPTY] += 1
+        return "", "", CRITERIA_SPLIT_EMPTY
+
+    text_lower = criteria_text.lower()
+
+    inclusion_start = _section_start(
+        _INCLUSION_RE, _LEGACY_INCLUSION_MARKERS, criteria_text, text_lower)
+    exclusion_start = _section_start(
+        _EXCLUSION_RE, _LEGACY_EXCLUSION_MARKERS, criteria_text, text_lower)
+
     if inclusion_start != -1 and exclusion_start != -1:
         if inclusion_start < exclusion_start:
             inclusion_text = criteria_text[inclusion_start:exclusion_start].strip()
@@ -506,17 +871,26 @@ def split_inclusion_exclusion(criteria_text: str) -> tuple:
         else:
             exclusion_text = criteria_text[exclusion_start:inclusion_start].strip()
             inclusion_text = criteria_text[inclusion_start:].strip()
+        method = CRITERIA_SPLIT_BOTH
     elif inclusion_start != -1:
         inclusion_text = criteria_text[inclusion_start:].strip()
         exclusion_text = ""
+        method = CRITERIA_SPLIT_INCLUSION_ONLY
     elif exclusion_start != -1:
         inclusion_text = ""
         exclusion_text = criteria_text[exclusion_start:].strip()
+        method = CRITERIA_SPLIT_EXCLUSION_ONLY
     else:
+        # UNSPLIT. The trial is KEPT -- excluding it would delete a trial to
+        # fix a labelling bug, which is the silent drop this item removes --
+        # and the state is recorded so a consumer can see that this trial's
+        # "inclusion" text is really its whole criteria block.
         inclusion_text = criteria_text
         exclusion_text = ""
-    
-    return inclusion_text, exclusion_text
+        method = CRITERIA_SPLIT_UNSPLIT
+
+    CRITERIA_SPLIT_METHODS[method] += 1
+    return inclusion_text, exclusion_text, method
 
 
 def extract_locations(locations_list: List[Dict]) -> List[Dict]:
@@ -657,6 +1031,20 @@ def get_embeddings_batch(texts: List[str]) -> List[List[float]]:
             model=EMBEDDING_MODEL,
             input=texts,
         )
+        # WHAT THE API SAYS IT BILLED, recorded rather than discarded.
+        #
+        # The batch size is derived from a chars/4 token PROXY, so this module
+        # has never known what an index build actually cost -- only what it
+        # guessed. An estimate that is never compared with a bill is a number
+        # nobody can be wrong about. Counted per call and reported by
+        # index_trials(); a response without usage is counted apart rather than
+        # treated as zero, because zero is also what a free call looks like.
+        usage = getattr(response, "usage", None)
+        if usage is not None and getattr(usage, "prompt_tokens", None) is not None:
+            EMBEDDING_USAGE["prompt_tokens"] += usage.prompt_tokens
+            EMBEDDING_USAGE["calls"] += 1
+        else:
+            EMBEDDING_USAGE["calls_without_usage"] += 1
         # Sort by .index — OpenAI does not guarantee response order matches input order
         return [e.embedding for e in sorted(response.data, key=lambda x: x.index)]
 
@@ -776,6 +1164,41 @@ def create_trial_bm25_fields(trial: Dict) -> Dict[str, str]:
         "conditions": conditions_text,
         "criteria": criteria_text,
     }
+
+
+class EmbeddingBudgetExceeded(RuntimeError):
+    """The corpus would cost more to embed than the caller authorised.
+
+    Raised BEFORE the first embedding call. A RuntimeError subclass for the
+    same reason as UnknownModelPricingError: a spend refusal must not be
+    swallowed by a caller reaching for a narrower exception.
+    """
+
+
+def estimate_embedding_cost(trials: List[Dict]) -> dict:
+    """Exact token count and cost for embedding `trials`. Calls no API.
+
+    Uses tiktoken when available -- the real encoder for the configured model,
+    so the number is what will be billed rather than a proxy. Falls back to the
+    chars/4 heuristic the batch sizer uses, and SAYS WHICH, because a estimate
+    presented without its method invites the reader to trust the wrong digits.
+
+    The import is inside the function on the project's standing exemption for
+    third-party imports in function bodies: hoisting it would make importing
+    the indexer pull in tiktoken for every caller that never costs anything.
+    """
+    texts = [create_trial_embedding_text(t) for t in trials]
+    try:
+        import tiktoken
+        enc = tiktoken.encoding_for_model(EMBEDDING_MODEL)
+        tokens = sum(len(enc.encode(t)) for t in texts)
+        method = "tiktoken"
+    except Exception as exc:  # noqa: BLE001 - recorded, never silent
+        EMBEDDING_USAGE[f"estimate_fallback:{type(exc).__name__}"] += 1
+        tokens = sum(len(t) for t in texts) // 4
+        method = "chars/4 (tiktoken unavailable)"
+    return {"tokens": tokens, "method": method, "trials": len(trials),
+            "cost_usd": get_model_cost(EMBEDDING_MODEL, tokens, 0)}
 
 
 def index_trials(trials: List[Dict], collection_name: str):
@@ -998,6 +1421,22 @@ def index_trials(trials: List[Dict], collection_name: str):
 
     console.out(f"\n✓ Indexed {len(indexed_nct_ids)} trials into '{collection_name}'  |  Embed time: {elapsed_str}")
 
+    # --- WHAT THIS ACTUALLY COST, from the API's own usage numbers ----------
+    _billed = EMBEDDING_USAGE.get("prompt_tokens", 0)
+    if _billed:
+        _cost = get_model_cost(EMBEDDING_MODEL, _billed, 0)
+        console.out(f"  Embedding tokens BILLED: {_billed:,} over "
+                    f"{EMBEDDING_USAGE.get('calls', 0):,} API call(s)")
+        console.out(f"  Embedding cost: ${_cost:.4f}")
+        log.info("embedding usage", model=EMBEDDING_MODEL, tokens_in=_billed,
+                 calls=EMBEDDING_USAGE.get("calls", 0), cost_usd=round(_cost, 6))
+    if EMBEDDING_USAGE.get("calls_without_usage"):
+        # Reported, never folded into the total: a missing usage block and a
+        # zero-token call are different facts and only one is free.
+        console.out(f"  WARNING: {EMBEDDING_USAGE['calls_without_usage']} embedding "
+                    f"call(s) returned no usage block — the billed total above "
+                    f"EXCLUDES them and is therefore a floor, not a total.")
+
     if embed_checkpoint_file.exists():
         embed_checkpoint_file.unlink()
         console.out("Embedding checkpoint cleared.")
@@ -1084,18 +1523,411 @@ def swap_alias_atomic(new_collection: str, alias_name: str):
         console.out(f"Created alias '{alias_name}' -> '{new_collection}'")
         
 
-def cleanup_old_collections(keep_recent: int = 1):
+# ===========================================================================
+# DEFECT 4: VERIFY BEFORE THE SWAP, AND KEEP A ROLLBACK TARGET
+# ===========================================================================
+#
+# main() used to run create -> index -> payload index -> swap -> cleanup(1).
+# Two independent faults in that order:
+#
+#   * NOTHING WAS VERIFIED. The alias moved onto the staging collection on the
+#     strength of index_trials() having returned. A run that embedded half the
+#     corpus and then lost its connection, or wrote points with an empty dense
+#     vector, promoted itself into production identically to a good one.
+#   * THE ROLLBACK WAS DESTROYED. cleanup_old_collections(keep_recent=1) runs
+#     immediately after the swap and keeps only the newest timestamped
+#     collection -- which is the one just promoted. The previous good
+#     collection was deleted seconds after the new one went live and before
+#     anybody could have observed the new one serving traffic.
+#
+# WHAT VERIFICATION CANNOT DO HERE, STATED PLAINLY. The strengthened index
+# validator this ought to call does not exist, and everything below is built
+# from what a freshly-built collection can be asked about itself for free.
+# It does NOT check:
+#
+#   - RETRIEVAL QUALITY. Nothing here judges relevance. A collection whose
+#     embeddings are uniformly wrong but well-formed passes every check below.
+#   - THAT EACH VECTOR BELONGS TO ITS TRIAL. Detecting a shuffle would mean
+#     re-embedding sampled trials and comparing, which is a paid API call, so
+#     it is deliberately not done. The per-point checks confirm a dense vector
+#     of the right dimension EXISTS beside the right payload, not that it
+#     encodes that payload.
+#   - THAT THE BM25 VOCABULARY MATCHES THE QUERY SIDE. Both sides reach one
+#     construction site (oncotriage/embedding.py) and File 47 check 2f asserts
+#     that statically; this run-time check only proves the sparse vectors are
+#     non-empty and searchable.
+#   - COMPLETENESS AGAINST ClinicalTrials.gov. The expected count is what this
+#     process scraped, so a scrape that silently missed 40% of the registry
+#     verifies clean.
+#   - ANY COMPARISON WITH THE COLLECTION IT IS ABOUT TO REPLACE. A corpus that
+#     collapsed from 12,000 trials to 300 passes if all 300 are well-formed.
+#     The count is reported beside the live collection's so an operator sees
+#     it, and REPORTING IS NOT CHECKING.
+
+# How many points are pulled back and inspected individually.
+_VERIFY_SAMPLE_SIZE = 25
+
+# How long to wait for a `yellow` collection to finish optimizing, and how
+# often to re-ask. 300s covers a 14k-point bulk build comfortably; the observed
+# time to green on this corpus was under two minutes.
+_STATUS_WAIT_SECONDS = 300
+_STATUS_POLL_SECONDS = 10
+
+# A staging collection holding less than this fraction of the collection it
+# would replace fails verification. 0.90 admits ordinary registry churn -- the
+# measured four-day drift on this corpus was 43 trials removed against 68 added,
+# well under 1% -- and refuses the 45% collapse that actually shipped.
+_MIN_CORPUS_RATIO = 0.90
+
+# The three named sparse vectors every point must carry.
+_SPARSE_VECTOR_NAMES = ("title-bm25", "conditions-bm25", "criteria-bm25")
+
+
+# Attempts per page before a fetch is treated as fatal to the scrape, and the
+# per-request timeout. Five attempts with 2/4/8/16s backoff covers ~30s of
+# endpoint unavailability; the timeout is 60s rather than the original 30s
+# because every observed failure here was a READ timeout on a slow page, not a
+# refused connection.
+_SCRAPE_PAGE_ATTEMPTS = 5
+_SCRAPE_PAGE_TIMEOUT = 60
+
+SCRAPE_RETRIES = Counter()
+"""Page fetches that failed and were retried, keyed by exception type.
+
+Distinct from SCRAPE_INTERRUPTIONS, which counts only faults that ENDED a
+scrape. A run that finished after eleven retries and one that never stumbled
+produce the same corpus and must not produce the same record: the first is an
+endpoint degrading, and the only place that is visible is here.
+"""
+
+SCRAPE_INTERRUPTIONS = Counter()
+"""Network faults that ended a scrape early, keyed by exception type.
+
+Read by the IncompleteScrapeError raised at the end of
+scrape_clinicaltrials_gov, so the operator is told what stopped it and not
+merely that something did.
+"""
+
+
+class IncompleteScrapeError(RuntimeError):
+    """The scrape did not reach the end of the result set.
+
+    A RuntimeError subclass and deliberately NOT a
+    requests.exceptions.RequestException: the whole point is that it must not
+    be caught by the same `except` that swallowed the underlying network fault.
     """
-    Delete old timestamped staging collections, keep N most recent.
-    Called after alias swap so the live collection is always kept.
+
+
+EMBEDDING_USAGE = Counter()
+"""What the embedding API reported it billed, across this process.
+
+`prompt_tokens` is the API's own number, not the chars/4 proxy the batch size
+is derived from. `calls_without_usage` counts responses that carried no usage
+block at all -- kept apart from a genuine zero, because an estimate compared
+against a silently-missing bill is worse than no comparison.
+"""
+
+CLEANUP_FAILURES = Counter()
+"""Old-collection deletions that failed, keyed by exception type.
+
+Continuing is right -- a stale collection costs storage and nothing else -- but
+a cleanup that failed on every collection and one with nothing to do print the
+same thing, so the failures are counted as well as logged.
+"""
+
+
+class IndexVerificationError(RuntimeError):
+    """A staging collection failed a pre-swap check. The alias is not moved.
+
+    A RuntimeError subclass and deliberately not a ValueError or a KeyError:
+    the failures below must not be swallowed by a caller reaching for a
+    narrower exception, on the same argument as UnknownModelPricingError.
+    """
+
+
+def verify_collection(collection_name: str, expected_count: int,
+                      compare_to: str = None,
+                      min_ratio: float = _MIN_CORPUS_RATIO) -> dict:
+    """Check a freshly built collection. Raises IndexVerificationError on any
+    failure. Returns a dict of what was measured.
+
+    Every check is free: the dense probe searches with a vector READ BACK OUT
+    of the collection rather than a newly embedded one, and the sparse probes
+    use the local FastEmbed model. Nothing here calls a paid API.
 
     Args:
-        keep_recent: Number of recent timestamped collections to keep (minimum 1)
+        collection_name: the staging collection to check.
+        expected_count:  how many trials this run intended to index.
+        compare_to:      the collection this one would REPLACE. When given, a
+                         staging collection holding less than `min_ratio` of
+                         its point count FAILS. See below.
+        min_ratio:       the floor, as a fraction of `compare_to`'s count.
+
+    THE compare_to CHECK EXISTS BECAUSE ITS ABSENCE COST A PROMOTION. The first
+    real run of this pass verified clean and promoted a collection holding
+    5,482 trials over one holding 12,067, because `expected_count` is what the
+    process scraped and the scrape had been truncated by a network fault. Every
+    other check here asks "is this collection well-formed"; a truncated corpus
+    is perfectly well-formed. Only a comparison with what it replaces can see
+    it.
+
+    It is a RATIO and not equality because a registry legitimately shrinks --
+    trials stop recruiting every day, and the measured four-day drift on this
+    corpus was 43 removed against 68 added. It is overridable because a
+    deliberate corpus reduction is a real operation; passing compare_to=None
+    skips it, and that decision is then visible at the call site rather than
+    being a silent default.
     """
-    # Enforce minimum of 1 to never delete the live collection
-    if keep_recent < 1:
-        console.out("WARNING: keep_recent must be >= 1. Defaulting to 1.")
-        keep_recent = 1
+    console.out(f"\n=== VERIFYING '{collection_name}' BEFORE SWAP ===")
+    client = get_qdrant_client()
+    failures = []
+    measured = {"collection": collection_name, "expected_count": expected_count}
+
+    def _fail(msg):
+        failures.append(msg)
+        console.out(f"  ✗ {msg}")
+
+    def _ok(msg):
+        console.out(f"  ✓ {msg}")
+
+    # --- 1. The collection exists and reports a usable status ---------------
+    #
+    # YELLOW IS NOT A FAULT AND TREATING IT AS ONE COST A BUILD. Qdrant reports
+    # `yellow` while its optimizers are still constructing the HNSW index after
+    # a bulk upsert -- which is the NORMAL state seconds after indexing 14,000
+    # points. The first version of this check failed on anything that was not
+    # green, so a run that had scraped, embedded and paid in full was refused
+    # at the last step by a collection that was busy finishing, and was green
+    # ninety seconds later. Every functional probe below had passed.
+    #
+    # The three states mean different things and now get different policies:
+    #   green  -> ready
+    #   yellow -> optimizers running. WAIT for it, bounded. Queries already
+    #             work (Qdrant falls back to exact search), but promoting
+    #             before the index is built means every request pays for that
+    #             fallback, so this waits rather than shrugging.
+    #   red    -> a real failure. Fail immediately, never wait.
+    info = client.get_collection(collection_name=collection_name)
+    status = str(getattr(info, "status", "")).lower()
+    waited = 0
+    while "yellow" in status and waited < _STATUS_WAIT_SECONDS:
+        if waited == 0:
+            console.out(f"  status is yellow (optimizers building the index); "
+                        f"waiting up to {_STATUS_WAIT_SECONDS}s for green...")
+        time.sleep(_STATUS_POLL_SECONDS)
+        waited += _STATUS_POLL_SECONDS
+        info = client.get_collection(collection_name=collection_name)
+        status = str(getattr(info, "status", "")).lower()
+    measured["status"] = status
+    measured["status_wait_s"] = waited
+    if "red" in status:
+        _fail(f"status is {status!r} — this is a real failure, not optimization")
+    elif "green" in status or "ok" in status:
+        _ok(f"status: {status}" + (f" (after waiting {waited}s)" if waited else ""))
+    else:
+        _fail(f"status is still {status!r} after {waited}s. The vector index "
+              f"has not finished building, so every query would fall back to "
+              f"an exact scan. Re-run verification once it settles.")
+
+    # --- 2. Point count matches what this run intended to index -------------
+    actual = client.count(collection_name=collection_name, exact=True).count
+    measured["actual_count"] = actual
+    if actual == expected_count:
+        _ok(f"point count: {actual:,} == {expected_count:,} scraped")
+    else:
+        _fail(f"point count {actual:,} != {expected_count:,} scraped "
+              f"(missing {expected_count - actual:,})")
+
+    # --- 3. Vector configuration -------------------------------------------
+    vectors = info.config.params.vectors
+    dense = vectors.get("") if isinstance(vectors, dict) else vectors
+    if dense is None:
+        _fail("no dense vector configured")
+    else:
+        if dense.size == EMBEDDING_DIM:
+            _ok(f"dense vector: {dense.size} dims")
+        else:
+            _fail(f"dense vector is {dense.size} dims, expected {EMBEDDING_DIM}")
+        if str(dense.distance).lower().endswith("cosine"):
+            _ok("dense distance: cosine")
+        else:
+            _fail(f"dense distance is {dense.distance}, expected COSINE")
+
+    sparse_cfg = info.config.params.sparse_vectors or {}
+    for name in _SPARSE_VECTOR_NAMES:
+        if name not in sparse_cfg:
+            _fail(f"sparse vector {name!r} is not configured")
+        elif getattr(sparse_cfg[name], "modifier", None) is None:
+            _fail(f"sparse vector {name!r} has no IDF modifier")
+        else:
+            _ok(f"sparse vector {name!r} configured with IDF")
+
+    # --- 4. A sample of points is well-formed -------------------------------
+    sample, _ = client.scroll(collection_name=collection_name,
+                              limit=_VERIFY_SAMPLE_SIZE,
+                              with_payload=True, with_vectors=True)
+    measured["sampled"] = len(sample)
+    if not sample:
+        _fail("scroll returned no points at all")
+    else:
+        bad_dense = bad_sparse = bad_payload = 0
+        probe_vector = None
+        for p in sample:
+            vec = p.vector if isinstance(p.vector, dict) else {"": p.vector}
+            d = vec.get("")
+            if not d or len(d) != EMBEDDING_DIM:
+                bad_dense += 1
+            elif probe_vector is None:
+                probe_vector = list(d)
+            for name in _SPARSE_VECTOR_NAMES:
+                sv = vec.get(name)
+                # criteria-bm25 is legitimately empty when a trial registers no
+                # eligibility text, so emptiness is only a fault if the field
+                # is missing entirely.
+                if sv is None:
+                    bad_sparse += 1
+                    break
+            payload = p.payload or {}
+            if not payload.get("nct_id") or not payload.get("full_trial_json"):
+                bad_payload += 1
+        if bad_dense:
+            _fail(f"{bad_dense}/{len(sample)} sampled points have a missing or "
+                  f"wrong-sized dense vector")
+        else:
+            _ok(f"{len(sample)} sampled points carry a {EMBEDDING_DIM}-dim dense vector")
+        if bad_sparse:
+            _fail(f"{bad_sparse}/{len(sample)} sampled points are missing a "
+                  f"named sparse vector")
+        else:
+            _ok(f"{len(sample)} sampled points carry all three sparse vectors")
+        if bad_payload:
+            _fail(f"{bad_payload}/{len(sample)} sampled points lack nct_id or "
+                  f"full_trial_json in the payload")
+        else:
+            _ok(f"{len(sample)} sampled points carry nct_id and full_trial_json")
+
+        # --- 5. The payload index works (this is what scroll-by-nct_id needs)
+        probe_nct = (sample[0].payload or {}).get("nct_id")
+        if probe_nct:
+            found, _ = client.scroll(
+                collection_name=collection_name,
+                scroll_filter=Filter(must=[FieldCondition(
+                    key="nct_id", match=MatchValue(value=probe_nct))]),
+                limit=1, with_payload=True)
+            if found:
+                _ok(f"payload index resolves nct_id {probe_nct}")
+            else:
+                _fail(f"payload index did NOT resolve nct_id {probe_nct}")
+
+        # --- 6. Dense search answers, using a vector from the collection ----
+        if probe_vector is not None:
+            hits = client.query_points(collection_name=collection_name,
+                                       query=probe_vector, limit=5,
+                                       with_payload=True).points
+            if hits:
+                _ok(f"dense search returned {len(hits)} hits")
+            else:
+                _fail("dense search returned nothing for a vector taken from "
+                      "this very collection")
+
+    # --- 7. Each BM25 channel answers a real query --------------------------
+    bm25 = get_bm25_sparse_model()
+    for name, probe in ((("title-bm25"), "cancer"),
+                        ("conditions-bm25", "carcinoma"),
+                        ("criteria-bm25", "patients")):
+        emb = next(bm25.query_embed(probe))
+        indices = emb.indices.tolist()
+        if not indices:
+            _fail(f"{name}: probe {probe!r} produced no BM25 terms")
+            continue
+        hits = client.query_points(
+            collection_name=collection_name,
+            query=SparseVector(indices=indices, values=emb.values.tolist()),
+            using=name, limit=5, with_payload=False).points
+        if hits:
+            _ok(f"{name}: probe {probe!r} returned {len(hits)} hits")
+        else:
+            _fail(f"{name}: probe {probe!r} returned NOTHING — the sparse "
+                  f"index is present but not answering")
+
+    # --- 8. Is this a plausible replacement for what is live? --------------
+    if compare_to:
+        try:
+            live_count = client.count(collection_name=compare_to, exact=True).count
+        except Exception as e:
+            # Counted and reported, never swallowed. A comparison that could
+            # not be made must not read as a comparison that passed.
+            CLEANUP_FAILURES[f"compare_count:{type(e).__name__}"] += 1
+            live_count = None
+            _fail(f"could not count '{compare_to}' to compare against: "
+                  f"{type(e).__name__}: {e}. The size check DID NOT RUN.")
+        if live_count:
+            measured["live_count"] = live_count
+            floor = int(live_count * min_ratio)
+            measured["size_floor"] = floor
+            if actual >= floor:
+                _ok(f"size vs live '{compare_to}': {actual:,} >= {floor:,} "
+                    f"({min_ratio:.0%} of {live_count:,})")
+            else:
+                _fail(f"{actual:,} points is only "
+                      f"{actual / live_count:.1%} of the live collection "
+                      f"'{compare_to}' ({live_count:,}). Below the "
+                      f"{min_ratio:.0%} floor, so this looks like a TRUNCATED "
+                      f"corpus rather than a rebuild. If the reduction is "
+                      f"intended, re-run passing a lower min_ratio.")
+    else:
+        console.out("  - size-vs-live check SKIPPED (no collection to compare "
+                    "against; this is a first build or it was disabled)")
+
+    measured["failures"] = failures
+    if failures:
+        raise IndexVerificationError(
+            f"'{collection_name}' failed {len(failures)} pre-swap check(s) and "
+            f"the alias was NOT moved:\n"
+            + "".join(f"    - {f}\n" for f in failures)
+            + "  The live collection is untouched. Inspect the staging "
+              "collection, or delete it and re-run.")
+
+    console.out(f"=== '{collection_name}' PASSED every pre-swap check ===")
+    log.info("staging collection verified", collection=collection_name,
+             count=measured.get("actual_count"), total=expected_count)
+    return measured
+
+
+def resolve_alias_target(alias_name: str):
+    """Which collection `alias_name` currently points at, or None."""
+    for a in get_qdrant_client().get_aliases().aliases:
+        if a.alias_name == alias_name:
+            return a.collection_name
+    return None
+
+
+def cleanup_old_collections(keep_recent: int = 2, alias_name: str = "trial_criteria"):
+    """
+    Delete old timestamped staging collections, keep N most recent.
+
+    THE DEFAULT IS 2, NOT 1, AND THAT IS DEFECT 4's SECOND HALF. At 1 the only
+    collection kept is the one the alias was just moved onto, so the previous
+    good collection -- the only thing a rollback could point back at -- was
+    destroyed in the same run that promoted its replacement. Keeping two means
+    a bad promotion can be undone with a single update_collection_aliases call
+    against a collection that is still there.
+
+    THE ALIAS TARGET IS NEVER DELETED, whatever `keep_recent` says and whatever
+    its name sorts like. The old code kept the newest N by NAME and relied on
+    the alias pointing at the newest, which is true only when the swap
+    succeeded; after a failed or skipped swap it is exactly false, and the
+    collection actually serving traffic was the one sorted out of the keep
+    window.
+
+    Args:
+        keep_recent: Number of recent timestamped collections to keep (min 2)
+        alias_name:  Alias whose target must survive regardless
+    """
+    if keep_recent < 2:
+        console.out(f"WARNING: keep_recent={keep_recent} would leave no rollback "
+                    f"target. Using 2.")
+        keep_recent = 2
 
     collections = get_qdrant_client().get_collections().collections
     timestamped = [
@@ -1106,8 +1938,20 @@ def cleanup_old_collections(keep_recent: int = 1):
     # Sort descending: newest first (YYYYMMDD_HHMMSS format sorts correctly)
     timestamped.sort(reverse=True)
 
+    live = resolve_alias_target(alias_name)
     to_keep   = timestamped[:keep_recent]
-    to_delete = timestamped[keep_recent:]
+    to_delete = [n for n in timestamped[keep_recent:] if n != live]
+
+    if live and live not in to_keep:
+        # The alias points at something outside the keep window. Report it
+        # loudly rather than quietly protecting it: it means the swap did not
+        # land where this run thinks it did.
+        console.out(f"WARNING: alias '{alias_name}' points at '{live}', which is "
+                    f"NOT in the {keep_recent} newest collections. It will be "
+                    f"kept anyway.")
+        log.warning("alias target is outside the cleanup keep window",
+                    collection=live, kept=len(to_keep))
+        to_keep = to_keep + [live]
 
     if not to_delete:
         console.out(f"No old collections to clean up. Keeping: {to_keep}")
@@ -1118,21 +1962,48 @@ def cleanup_old_collections(keep_recent: int = 1):
             get_qdrant_client().delete_collection(collection_name=name)
             console.out(f"Deleted old collection: {name}")
         except Exception as e:
+            # Counted, not only printed: a cleanup that silently failed for
+            # every collection looks identical to one with nothing to do.
+            CLEANUP_FAILURES[type(e).__name__] += 1
             console.out(f"WARNING: Could not delete collection '{name}': {e}")
+            log.warning("could not delete old collection", collection=name,
+                        error_type=type(e).__name__, error_message=str(e))
 
-    console.out(f"Kept {keep_recent} recent collection(s): {to_keep}")
+    console.out(f"Kept {len(to_keep)} collection(s): {to_keep}")
+    console.out(f"  Rollback target: "
+                f"{[n for n in to_keep if n != live] or ['NONE — this is the first build']}")
     
 
 #------------------------------------------------------------------------------
 
 
-def main(use_staging: bool = True):
+def main(use_staging: bool = True, compare_to: str = None,
+         run_cleanup: bool = True, max_cost_usd: float = None):
     """
     Main execution: scrape, embed, index with zero-downtime swap.
 
     Args:
         use_staging: If True, build in staging and swap atomically.
                      If False, rebuild production directly (causes downtime).
+        compare_to:  Collection the size floor is measured against. None means
+                     "whatever the alias points at", which is the right default
+                     and the WRONG answer when the alias itself is bad -- see
+                     below.
+        run_cleanup: False keeps every existing collection. Use it when the
+                     retained set is being preserved deliberately.
+
+    WHY compare_to IS A PARAMETER, AND IT IS NOT HYPOTHETICAL. The size floor
+    defends against promoting a truncated corpus, and it measures against the
+    collection being replaced. That baseline is the alias target -- which is
+    exactly the thing that is wrong when a truncated corpus has ALREADY been
+    promoted. On this project that happened: a network fault truncated a scrape
+    to 5,482 trials, the alias moved onto it, and the next run's floor would
+    have been 90% of 5,482 rather than of the 12,067 that preceded it. A guard
+    whose reference point is the previous failure is not a guard.
+
+    So the baseline is nameable. None keeps the ordinary behaviour; an explicit
+    name is logged as an override so the run says what it measured against
+    rather than leaving a reader to infer it.
     """
     with CaffeinateSession("RAG Indexing"):
         console.out(f"=== {Project_Name}: Clinical Trial RAG Indexer ===\n")
@@ -1144,25 +2015,111 @@ def main(use_staging: bool = True):
 
         save_trials_to_disk(trials, output_path=paths.data_trial_path)
 
+        # --- THE SPEND GATE, BEFORE THE FIRST EMBEDDING CALL ---------------
+        #
+        # The corpus size is whatever the registry holds today, so the bill is
+        # not knowable until after the scrape -- and the scrape is free while
+        # the embedding is not. This is the only point where both facts exist.
+        _estimate = estimate_embedding_cost(trials)
+        console.out(f"\nEmbedding estimate: {_estimate['trials']:,} trials, "
+                    f"{_estimate['tokens']:,} tokens via {_estimate['method']} "
+                    f"-> ${_estimate['cost_usd']:.4f} at the configured "
+                    f"{EMBEDDING_MODEL} price")
+        log.info("embedding cost estimated", model=EMBEDDING_MODEL,
+                 tokens_estimated=_estimate["tokens"],
+                 total=_estimate["trials"],
+                 cost_usd=round(_estimate["cost_usd"], 6))
+        if max_cost_usd is not None and _estimate["cost_usd"] > max_cost_usd:
+            raise EmbeddingBudgetExceeded(
+                f"embedding this corpus is estimated at "
+                f"${_estimate['cost_usd']:.4f}, above the authorised "
+                f"${max_cost_usd:.4f}.\n"
+                f"  {_estimate['trials']:,} trials, {_estimate['tokens']:,} "
+                f"tokens ({_estimate['method']}).\n"
+                f"  NOTHING HAS BEEN EMBEDDED and the alias has not moved. The "
+                f"scraped corpus is on disk; re-run with a higher "
+                f"max_cost_usd to proceed.")
+
         if use_staging:
             console.out("\n=== STAGING REBUILD (ZERO DOWNTIME) ===\n")
             staging_name = f"trial_criteria_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
+            # What the alias points at BEFORE anything moves, so the rollback
+            # target can be named in the report rather than inferred later.
+            previous = resolve_alias_target("trial_criteria")
+
+            # The size floor's baseline. Named explicitly when the alias target
+            # is not trustworthy; see this function's docstring.
+            baseline = compare_to or previous
+            if compare_to and compare_to != previous:
+                console.out(f"SIZE FLOOR BASELINE OVERRIDDEN: measuring against "
+                            f"'{compare_to}', NOT the current alias target "
+                            f"'{previous}'.")
+                log.warning("size floor baseline overridden",
+                            collection=compare_to, reason="explicit_compare_to")
+            if previous:
+                try:
+                    previous_count = get_qdrant_client().count(
+                        collection_name=previous, exact=True).count
+                except Exception as e:
+                    # Counted and reported. This is a diagnostic read; failing
+                    # it must not stop a rebuild, but it must not be silent.
+                    CLEANUP_FAILURES[f"previous_count:{type(e).__name__}"] += 1
+                    previous_count = None
+                    log.warning("could not count the live collection",
+                                collection=previous, error_type=type(e).__name__,
+                                error_message=str(e))
+                console.out(f"Live collection before this run: {previous} "
+                            f"({previous_count if previous_count is not None else '?'} points)")
+            else:
+                console.out("No live collection yet — this is the first build.")
+
             create_qdrant_collection(staging_name, delete_if_exists=False)
             index_trials(trials, collection_name=staging_name)
             create_payload_indexes(staging_name)
+
+            # DEFECT 4: VERIFY, THEN SWAP. This raises IndexVerificationError
+            # on any failure, which leaves the alias exactly where it was and
+            # the staging collection in place for inspection.
+            #
+            # `compare_to` is what makes the count check mean anything:
+            # expected_count is what THIS PROCESS scraped, so a truncated
+            # scrape agrees with itself. Only the live collection knows how big
+            # the corpus is supposed to be.
+            verify_collection(staging_name, expected_count=len(trials),
+                              compare_to=baseline)
+
             swap_alias_atomic(staging_name, "trial_criteria")
-            cleanup_old_collections(keep_recent=1)
+
+            # keep_recent=2 so `previous` survives as the rollback target.
+            if run_cleanup:
+                cleanup_old_collections(keep_recent=2, alias_name="trial_criteria")
+            else:
+                console.out("Cleanup SKIPPED (run_cleanup=False): every existing "
+                            "collection is retained.")
+                log.info("cleanup skipped by request", mode="no_cleanup")
 
             console.out(f"\n✓ Staging rebuild complete")
             console.out(f"✓ Alias 'trial_criteria' now points to '{staging_name}'")
-            console.out(f"✓ FastAPI experienced zero downtime\n")
-            
+            console.out(f"✓ FastAPI experienced zero downtime")
+            if previous:
+                console.out(f"✓ ROLLBACK TARGET RETAINED: '{previous}'")
+                console.out(f"    to roll back, point the alias back at it with "
+                            f"swap_alias_atomic('{previous}', 'trial_criteria')\n")
+            else:
+                console.out("")
+
         else:
             console.out("\n=== DIRECT REBUILD (CAUSES DOWNTIME) ===\n")
             create_qdrant_collection("trial_criteria", delete_if_exists=True)
             index_trials(trials, collection_name="trial_criteria")
             create_payload_indexes("trial_criteria")
+            # Verified AFTER the fact here, because direct mode has already
+            # replaced production by the time there is anything to verify.
+            # That is what "causes downtime" means and it is why staging is the
+            # default; the check still runs so a bad direct build is at least
+            # LOUD rather than silent.
+            verify_collection("trial_criteria", expected_count=len(trials))
             console.out(f"\n✓ Direct rebuild complete\n")
 
         console.out("=== Indexing Complete ===")

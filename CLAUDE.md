@@ -2983,6 +2983,153 @@ and 1,216 calls respectively. A test's output IS its report, and an entry point
 is a `__main__` block. Neither is package code and neither is affected by the
 deleted monkey-patch, which lived in the package.
 
+### The scrape admission filters (the admission pass)
+
+**THREE FILTERS IN THE SCRAPER DECIDED WHICH TRIALS EVER ENTERED THE CORPUS, AND
+NOTHING DOWNSTREAM COULD SEE WHAT THEY DISCARDED.** Stage-wise recall records
+what each gate drops; it cannot see a trial that was never indexed. Every number
+this project reports was computed against a corpus quietly missing 2,219 trials.
+
+**MEASURED BY RUNNING, ONE INSTRUMENTED SCRAPE, 188 HTTP REQUESTS, FREE.** A
+single pass records, per study, what the OLD filters would have done and what
+the NEW ones do, so each defect is attributed separately without scraping a
+moving registry twice.
+
+| | |
+|---|---|
+| raw studies seen | 18,773 (14,342 INTERVENTIONAL) |
+| admitted, OLD filters | **12,092** |
+| admitted, NEW filters | **14,311**  (+2,219) |
+| recovered by defect 1 alone (age) | 1,051 |
+| recovered by defect 2 alone (keywords) | 1,070 |
+| recovered by both at once | 98 |
+| dropped by the NEW screen that the old one kept | **0** |
+
+**DEFECT 1 — `if min_age > 18: continue` IS AN EXACTLY-18 FILTER, AND IT IS
+DELETED, NOT WIDENED.** A trial requiring 19, 20 or 21 was discarded, and so was
+every trial requiring 40, 50 or 65 — the recovered population's `minimumAge`
+distribution is 189×19, 178×20, 108×50, 107×21, 99×40, 74×65, … The decision was
+deleted because `agent/filtering.py:node_rule_based_filter` already enforces
+`min_age <= patient_age <= max_age` against the actual patient and counts it into
+`age_dropped`. **Widening it to "the oldest patient we serve" was rejected**: that
+writes today's cohort into the corpus, so changing the cohort makes the corpus
+silently wrong again in the identical undetectable way. `INDEX_AGE_PARSE_FAILURES`
+went with it — see the item 11a list above.
+
+**DEFECT 2 — THE ONCOLOGY SCREEN ROUTES THROUGH MeSH, AND MAY ONLY DROP ONE
+WAY.** The old screen was a sixteen-word frozenset holding "glioma" but neither
+"blastoma" nor "thelioma". Measured against the shipped list, Glioblastoma,
+Mesothelioma, Neuroblastoma, Retinoblastoma and Hepatoblastoma **all drop**;
+measured against the C04 crosswalk, **all five resolve** to specific tree
+numbers. Recovered: 117 glioblastoma, 36 neuroblastoma, 8 mesothelioma, 8
+retinoblastoma, 2 hepatoblastoma trials.
+
+`registries/mesh.py:classify_trial_oncology()` answers a **closed three-member
+vocabulary** (`TRIAL_ONCOLOGY_VERDICTS`). Three tests can vote KEEP; exactly one
+can vote DROP:
+
+- C04 crosswalk hit → `TRIAL_ONCOLOGY` (9,773 trials)
+- oncology vocabulary in conditions/keywords/title → `TRIAL_ONCOLOGY` (4,362).
+  A **keep-signal only**, so its gaps cost nothing.
+- every registered condition a known MeSH term positively outside C04 →
+  `TRIAL_NON_ONCOLOGY` (**31**). The only drop.
+- anything else → `TRIAL_UNRESOLVED` (**176**) — KEPT and counted. **That number
+  is the size of the uncertainty the screen absorbs**, and it is reported at the
+  end of every scrape.
+
+**A POSITIVE NON-ONCOLOGY DETERMINATION NEEDED A LOOKUP THAT DID NOT EXIST.**
+`mesh_c04_lookup.json` is C04-only, so the one thing it can report is "resolved
+to cancer" or nothing — and nothing conflates "Diabetes Mellitus, definitively
+not a neoplasm" with "resolved to nothing at all". A screen built on it would
+drop every trial it merely failed to parse.
+`registries/mesh_crosswalk_build.py:build_mesh_non_oncology_lookup()` reads the
+whole of `desc2026.xml` (NLM, public domain, already on disk) and keeps the
+complement: **258,369 terms**, descriptor headings AND entry terms, every one
+with tree numbers none of which is under C04. A name shared with any C04
+descriptor is excluded outright, because ambiguity must not licence a drop. The
+layer is OPTIONAL and its absence can only stop a drop, never cause one, so it
+degrades to "admit everything" with a counter rather than raising.
+
+**C04 IS BROADER THAN "CANCER", AND THAT IS A MeSH FACT RATHER THAN A DEFECT.**
+It contains `C04.182` (Cysts) and `C04.588.614` (Paraneoplastic Syndromes), so
+Polycystic Ovary Syndrome (`C04.182.612.765`) and Myasthenia Gravis
+(`C04.588.614.550.500`) resolve as oncology and are admitted. Some of the 1,168
+trials recovered by defect 2 are therefore not cancer trials. This is the false
+keep the governing principle explicitly buys — Stage 4 filters per patient by
+tree ancestry, so a breast-cancer patient never matches `C04.182.612.765` — and
+it is **pre-existing**, since `trial_mesh_trees()` has always resolved them.
+
+**DEFECT 3 — MEASURED FIRST, AND THE BRIEF NAMED ONLY HALF THE POPULATION.**
+On the stored 12,067-trial corpus, by branch: `both` 11,218 (92.96%),
+`inclusion_only` 299 (2.48%), `exclusion_only` 103 (0.85%), `neither` 447
+(3.70%). The harm — whole criteria block to inclusion, exclusion empty — comes
+from **two** branches, because `elif inclusion_start != -1` also sets
+`exclusion_text = ""`. The real rate is **746, 6.18%**, of which 681 contain
+exclusion vocabulary.
+
+The policy is **BOTH a richer marker list AND the flag**, not either: they answer
+different questions, and the flag is separately required. Markers are
+**line-anchored** (a heading is at a line start, optionally behind a bullet or a
+number), longest-alternative-first so "Key Exclusion Criteria" wins over the
+"Exclusion Criteria" nested in it. **The anchored search FALLS BACK to the
+original substring markers**, because anchoring alone lost 116 splits that the
+old code found — the new split is a strict superset by construction, and
+`LOST == 0` is a design constraint rather than an observation.
+
+    empty exclusion   746 (6.18%)  ->  213 (1.77%)   recovered 533, LOST 0
+
+`split_inclusion_exclusion` returns a **3-tuple** now; the third member is one of
+the `CRITERIA_SPLIT_*` constants and is stored as `trial["criteria_split"]`,
+which rides into Qdrant inside `full_trial_json`. A downstream ingestion gate
+reads it without re-implementing the splitter — which is exactly how the two
+copies in this repository drifted apart. **Unsplit trials are KEPT**: excluding
+them would delete trials to fix a labelling bug.
+
+**DEFECT 4 — VERIFY BEFORE THE SWAP, KEEP A ROLLBACK.** `main()` ran create →
+index → payload index → swap → `cleanup_old_collections(keep_recent=1)`. Nothing
+was verified, and the cleanup destroyed the previous good collection seconds
+after promoting its replacement. Now: create → index → payload index →
+**`verify_collection()`** → swap → `cleanup_old_collections(keep_recent=2)`.
+`verify_collection` RAISES `IndexVerificationError` (a `RuntimeError` subclass,
+deliberately not a `ValueError`) so the alias cannot move by a caller forgetting
+to test a boolean. `cleanup_old_collections` **never deletes the alias target**
+whatever its name sorts like — the old code assumed the alias pointed at the
+newest collection, which after a failed swap is exactly false.
+
+**WHAT VERIFICATION DOES NOT CHECK, stated at the code.** Not retrieval quality;
+not that each vector belongs to its trial (detecting a shuffle means re-embedding,
+which is a paid call); not that the BM25 vocabulary matches the query side
+(static, File 47 check 2f); not completeness against ClinicalTrials.gov; and not
+any comparison with the collection it replaces — a corpus that collapsed to 300
+well-formed trials passes. The live count is REPORTED beside it, and reporting is
+not checking.
+
+**THE GENERATED AIRFLOW DAG CARRIED A SECOND, ALREADY-DIVERGED SCRAPER, and this
+pass deleted it.** ~370 lines in `orchestration/dag_generator.py` reimplemented
+the indexer, and every difference made it build a worse index: its inclusion
+marker `"patients must"` is a **prefix** of its own exclusion marker
+`"patients must not"`, so an exclusion heading matched both and the split
+collapsed to empty; its `_parse_trial_metadata` read **no conditionsModule at
+all**; its collection was created with `vectors_config` only, so **none of the
+three BM25 sparse vectors and no `nct_id` payload index existed**; it embedded
+one trial per API call with `time.sleep(0.1)`; it carried the same exactly-18
+filter; and it verified AFTER the swap. The tasks delegate to
+`oncotriage.retrieval.indexer` now, **with the import deferred inside each task**
+— a module-scope import that fails makes the DAG vanish from the scheduler with
+an import error, while a deferred one fails a run loudly. Regenerated and parsed
+with Airflow's own `DagBag`: `import_errors == {}`, all three tasks, 20,689 bytes
+`949283c4…` → 13,071 bytes `7caece14…`.
+
+**`tests/test_indexer_admission_filters.py` — 131 checks, no network, no keys, no
+spend, not in the collision matrix.** Every check is paired with a control that
+FIRES against the old implementation, and the old implementations are lifted out
+of `git show` rather than retyped. **The revision is DERIVED by AST**, not by
+substring: the current file quotes `if min_age > 18` verbatim in the comment
+explaining its deletion, so a substring search selects the commit that REMOVED
+it and every control then tests the fix against itself — the lesson
+`tests/test_storage_query_layer.py` had to learn. It is the third member of
+`test_package_invariants.py`'s `_EXEC_ALLOWLIST`, argued there.
+
 ## Persistence and observability
 
 **`oncotriage/storage/database_logger.py`** (its shim, `14- Database Logger.py`, was deleted in pass 20e) opens no database at load time and never did since item 20b, which turned schema creation into a function because nine other files load 14 or are loaded beside it and every one of them was touching `inferences.db` just by being read. `initialize_database(db_path)` creates three tables: `inferences` (per-patient funnel counts, per-stage timings, token counts, cost), `trial_matches` (per-trial verdicts), `drift_metrics`. It is idempotent — every `CREATE` is `IF NOT EXISTS`, every `ALTER` is guarded by a `PRAGMA table_info` check — and `log_inference` ensures the schema once per resolved path before its first write. `16-` is a scratch query script; `15-` wipes all tables and is guarded by `Flag = False` — leave it False.
@@ -3066,11 +3213,22 @@ would turn a per-trial degradation into a per-patient outage.
   row ranked **Open, highest priority**. Recovery unchanged (the trial is kept,
   the age check is skipped for it), now recorded per bound with the exception
   type and the text, and printed in the Stage 4 line as `age UNPARSED N`.
-- `retrieval/indexer.py:INDEX_AGE_PARSE_FAILURES` — the index-time mirror,
-  printed in the scrape summary. **Its own counter, not shared with Stage 4's:**
-  the two measure different populations at different times (every registered
-  trial versus the ~75 retrieved for one patient) and one counter would sum them
-  into a number that means neither.
+- ~~`retrieval/indexer.py:INDEX_AGE_PARSE_FAILURES`~~ — **DELETED by the
+  scrape-admission pass, with the decision it recorded.** It counted failures to
+  evaluate `if min_age > 18: continue`, which was not an adult filter but an
+  **exactly-18** filter: a trial whose `minimumAge` was 19, 20 or 21 was
+  discarded, so a 70-year-old who qualifies for a trial requiring 21 could never
+  be matched to it because the trial was never in the corpus. The skip was
+  deleted rather than widened — Stage 4 already enforces
+  `min_age <= patient_age <= max_age` against the actual patient — and with no
+  age decision at scrape time the counter could only ever read zero, which is
+  the dead-declaration shape check 2h exists to report.
+  **Stage 4's `AGE_PARSE_FAILURES` is now the only age-parse record in the
+  project**, which is correct: it is the only place an age bound is still
+  parsed. `tests/test_degraded_dependencies.py` asserts the ABSENCE of both the
+  counter and any age comparison in the scraper's executable code — a stronger
+  check than the one it replaced, because it fires if anyone reintroduces an
+  index-time age decision.
 - `agent/patient.py:LAB_UNIT_DEGRADATIONS` — `_normalize_lab_unit` has **three**
   silent exits, not one, and counting them together would bury the one that
   matters: `no_value_or_unit` (expected and harmless), `conversion_error` (the

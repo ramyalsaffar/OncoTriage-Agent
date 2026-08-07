@@ -77,6 +77,40 @@ MESH_LAYER_CORE = "mesh_c04_core"
 MESH_LAYER_SNOMED_CROSSWALK = "mesh_snomed_crosswalk"
 MESH_LAYER_ICD10_CROSSWALK = "mesh_icd10_crosswalk"
 MESH_LAYER_UMLS_SYNONYMS = "mesh_umls_synonym_crosswalk"
+# The non-oncology complement, read by the SCRAPER's admission screen rather
+# than by Stage 4. Optional and degrades in the safe direction: without it
+# classify_trial_oncology() can never return TRIAL_NON_ONCOLOGY, so the screen
+# admits everything it cannot positively rule out. See that method.
+MESH_LAYER_NON_ONCOLOGY = "mesh_non_oncology_terms"
+
+
+# ===========================================================================
+# TRIAL ADMISSION VERDICT (the scraper's oncology screen)
+# ===========================================================================
+#
+# A CLOSED three-member vocabulary, on the same footing as
+# oncotriage/agent/readiness.py's four index states: the caller branches on it
+# exhaustively and an unknown value is a bug rather than a default.
+#
+# The distinction that matters is the one a keyword substring test cannot make.
+# "not resolvable to a cancer tree" is TWO facts:
+#
+#   TRIAL_NON_ONCOLOGY  -- every registered condition is a known MeSH term and
+#                          none of them is under C04. A positive determination.
+#                          This is the ONLY verdict that may drop a trial.
+#   TRIAL_UNRESOLVED    -- at least one condition resolved to nothing at all.
+#                          The screen has no opinion, so the trial is KEPT and
+#                          the fact is counted, because the size of this bucket
+#                          is the size of the uncertainty being absorbed.
+#
+# Collapsing them is what the old frozenset keyword screen did, and it is why
+# Glioblastoma, Mesothelioma, Neuroblastoma, Retinoblastoma and Hepatoblastoma
+# were dropped: no substring of any of them appears in that list.
+TRIAL_ONCOLOGY = "oncology"
+TRIAL_NON_ONCOLOGY = "non_oncology"
+TRIAL_UNRESOLVED = "unresolved"
+
+TRIAL_ONCOLOGY_VERDICTS = (TRIAL_ONCOLOGY, TRIAL_NON_ONCOLOGY, TRIAL_UNRESOLVED)
 
     
 
@@ -165,20 +199,26 @@ class MeSHCancerFilter:
 
     def __init__(self, name_to_trees: dict, tree_to_name: dict,
                  snomed_to_trees: dict, icd10_to_trees: dict = None,
-                 synonym_to_trees: dict = None):
+                 synonym_to_trees: dict = None, non_oncology_terms: dict = None):
         """
         Args:
-            name_to_trees:    {mesh_name_lower: [tree_numbers]}
-            tree_to_name:     {tree_number: mesh_name}
-            snomed_to_trees:  {snomed_code: [tree_numbers]}
-            icd10_to_trees:   {icd10_code: [tree_numbers]} (optional)
-            synonym_to_trees: {synonym_lower: [tree_numbers]} (optional, UMLS crosswalk)
+            name_to_trees:      {mesh_name_lower: [tree_numbers]}
+            tree_to_name:       {tree_number: mesh_name}
+            snomed_to_trees:    {snomed_code: [tree_numbers]}
+            icd10_to_trees:     {icd10_code: [tree_numbers]} (optional)
+            synonym_to_trees:   {synonym_lower: [tree_numbers]} (optional, UMLS crosswalk)
+            non_oncology_terms: {term_lower: [top_categories]} (optional) — MeSH
+                terms positively OUTSIDE C04. Read only by
+                classify_trial_oncology(). Absent means that method can never
+                return TRIAL_NON_ONCOLOGY, so the scraper's screen admits
+                everything; that is the safe direction and it is counted.
         """
         self.name_to_trees    = name_to_trees    # lowercase keys
         self.tree_to_name     = tree_to_name
         self.snomed_to_trees  = snomed_to_trees
         self.icd10_to_trees   = icd10_to_trees or {}
         self.synonym_to_trees = synonym_to_trees or {}
+        self.non_oncology_terms = non_oncology_terms or {}
 
         # Pre-compute: set of all lowercase MeSH names for fuzzy matching
         self._all_names = set(name_to_trees.keys())
@@ -194,9 +234,12 @@ class MeSHCancerFilter:
         icd10_status = f"{icd10_count:,} ICD-10 crosswalk entries" if icd10_count else "ICD-10 crosswalk not loaded"
         synonym_count = len(self.synonym_to_trees)
         synonym_status = f"{synonym_count:,} UMLS synonym entries" if synonym_count else "UMLS synonym crosswalk not loaded"
+        non_onc_count = len(self.non_oncology_terms)
+        non_onc_status = (f"{non_onc_count:,} non-oncology terms"
+                          if non_onc_count else "non-oncology lookup not loaded")
         console.out(f"MeSHCancerFilter loaded: {len(self.name_to_trees):,} C04 descriptors, "
               f"{len(self.snomed_to_trees):,} SNOMED crosswalk entries, "
-              f"{icd10_status}, {synonym_status}")
+              f"{icd10_status}, {synonym_status}, {non_onc_status}")
 
     # -----------------------------------------------------------------
     # Patient side: condition → MeSH tree numbers
@@ -710,6 +753,163 @@ class MeSHCancerFilter:
     
 
     # -----------------------------------------------------------------
+    # Admission decision: may this trial enter the corpus at all?
+    # -----------------------------------------------------------------
+
+    # Retained from the scraper's old frozenset screen, and retained ONLY as a
+    # keep-signal. It can move a verdict to TRIAL_ONCOLOGY and can never move
+    # one to TRIAL_NON_ONCOLOGY, so it cannot cause a drop and its famous gaps
+    # ("blastoma", "thelioma") cost nothing: a trial it misses falls through to
+    # the crosswalk, which resolves all five of them.
+    _ONCOLOGY_VOCABULARY = frozenset({
+        "neoplasm", "cancer", "carcinoma", "sarcoma", "lymphoma", "leukemia",
+        "leukaemia", "melanoma", "glioma", "myeloma", "tumor", "tumour",
+        "malignant", "malignancy", "oncology", "oncologic", "oncolyt",
+        "metastatic", "metastasis", "blastoma", "thelioma", "adenoma",
+        "myelodysplas", "myeloproliferat", "carcinoid", "chemotherapy",
+        "radiotherapy", "dysplas", "mastectom",
+    })
+
+    # MeSH top-level categories that name a DISEASE. C is the Diseases tree;
+    # F03 is Mental Disorders. Everything else -- E (Analytical, Diagnostic and
+    # Therapeutic Techniques), N (Health Care), M (Named Groups), G (Phenomena),
+    # B (Organisms), D (Chemicals), F01 (Behavior) -- names something that is
+    # not a disease at all.
+    #
+    # WHY THIS GATES THE DROP, and it was found by inspecting the trials the
+    # first version of this screen actually removed rather than by reading it.
+    # ClinicalTrials.gov's condition field is free text and sponsors put
+    # non-diseases in it. Two real examples out of 31 drops:
+    #
+    #   NCT06545292  conditions=["Drug Monitoring"]        (E01)
+    #                title="...Drug Monitoring of Oncolytics"
+    #   NCT05436561  conditions=["Disease-free Survival"]  (E01, E05, N04...)
+    #                title="...Reduced Conditioning Regimen..."
+    #
+    # Both are oncology trials. "Drug Monitoring" IS a MeSH term and it IS
+    # outside C04, so the naive rule made a confident positive non-oncology
+    # determination from a string that names no disease whatsoever. A term that
+    # is not a disease is not evidence that the trial is not cancer, so it now
+    # reads as UNRESOLVED and the trial is kept. Measured against the captured
+    # drop set: 11 of 31 drops become keeps, including both of the above and a
+    # trial in Clonal Cytopenia of Undetermined Significance, which is a
+    # PRE-MALIGNANT myeloid state.
+    # Prefixes, matched with startswith: "C" covers the whole Diseases tree
+    # (C01..C26), "F03" covers Mental Disorders without admitting F01 Behavior.
+    _DISEASE_CATEGORIES = ("C", "F03")
+
+    def _is_disease_category(self, categories) -> bool:
+        """True if any category names a disease. See _DISEASE_CATEGORIES.
+
+        Deliberately UNDECORATED. It reads no instance state and would be a
+        natural @classmethod, but every decorated definition in the package is
+        pinned by name in tests/test_package_invariants.py section 2i, and a
+        decorator added for tidiness is a pinned-inventory edit for no
+        behavioural gain. A plain method costs nothing and keeps that inventory
+        meaning "something structural changed".
+        """
+        return any(
+            any(c.startswith(prefix) for prefix in self._DISEASE_CATEGORIES)
+            for c in categories
+        )
+
+    def classify_trial_oncology(self, trial: dict) -> dict:
+        """Decide whether a trial may be admitted to the corpus.
+
+        THE ASYMMETRY IS THE WHOLE DESIGN. Three independent tests can vote
+        KEEP; exactly one test can vote DROP, and it requires every registered
+        condition to be a MeSH term positively outside C04.
+
+        Order, first hit wins:
+
+          1. C04 crosswalk on conditions + keywords (trial_mesh_trees) ->
+             TRIAL_ONCOLOGY. This is the layer the old keyword screen should
+             have been, and it resolves Glioblastoma, Mesothelioma,
+             Neuroblastoma, Retinoblastoma and Hepatoblastoma, none of which
+             contains any substring in the old list.
+          2. Oncology vocabulary anywhere in conditions/keywords/title ->
+             TRIAL_ONCOLOGY. A pure keep-signal, see _ONCOLOGY_VOCABULARY.
+          3. Every registered condition present in non_oncology_terms ->
+             TRIAL_NON_ONCOLOGY. The only verdict that permits a drop.
+          4. Anything else -> TRIAL_UNRESOLVED. KEEP, and counted.
+
+        WHY ONLY `conditions` DECIDES STEP 3, when steps 1 and 2 also read
+        keywords and title. conditions is the registered disease list; keywords
+        are free-text author tags and a title is prose. A term missing from
+        either of those is not evidence of anything, so letting them contribute
+        to a DROP would manufacture positive determinations out of noise. They
+        may only ever add a keep.
+
+        A trial with NO registered conditions is TRIAL_UNRESOLVED, never
+        TRIAL_NON_ONCOLOGY: "all zero of its conditions are non-cancer" is
+        vacuously true and would drop every such trial on no evidence.
+
+        Returns:
+            dict:
+              "verdict"       : one of TRIAL_ONCOLOGY_VERDICTS
+              "evidence"      : short machine-readable reason
+              "trees"         : sorted C04 trees found (may be empty)
+              "categories"    : sorted non-C04 MeSH top categories, step 3 only
+              "unresolved"    : condition strings that resolved to nothing
+        """
+        conditions = [c.strip() for c in (trial.get("conditions") or [])
+                      if isinstance(c, str) and c.strip()]
+        keywords = [k.strip() for k in (trial.get("keywords") or [])
+                    if isinstance(k, str) and k.strip()]
+
+        # --- 1. Positive oncology by crosswalk ---
+        trees = self.trial_mesh_trees(trial)
+        if trees:
+            return {"verdict": TRIAL_ONCOLOGY, "evidence": "c04_crosswalk",
+                    "trees": sorted(trees), "categories": [], "unresolved": []}
+
+        # --- 2. Positive oncology by vocabulary (keep-signal only) ---
+        haystack = " ".join(conditions + keywords
+                            + [str(trial.get("title") or "")]).lower()
+        if any(term in haystack for term in self._ONCOLOGY_VOCABULARY):
+            return {"verdict": TRIAL_ONCOLOGY, "evidence": "oncology_vocabulary",
+                    "trees": [], "categories": [], "unresolved": []}
+
+        # --- 3. Positive NON-oncology: the only route to a drop ---
+        if not conditions:
+            return {"verdict": TRIAL_UNRESOLVED, "evidence": "no_conditions",
+                    "trees": [], "categories": [], "unresolved": []}
+
+        if not self.non_oncology_terms:
+            # The layer is absent. It cannot make a positive determination, so
+            # it must not pretend to: everything is unresolved and kept.
+            return {"verdict": TRIAL_UNRESOLVED,
+                    "evidence": "non_oncology_layer_absent",
+                    "trees": [], "categories": [], "unresolved": conditions}
+
+        categories = set()
+        unresolved = []
+        not_a_disease = []
+        for cond in conditions:
+            cats = self.non_oncology_terms.get(cond.lower())
+            if cats is None:
+                unresolved.append(cond)
+            elif not self._is_disease_category(cats):
+                # A MeSH term that names no disease. See _DISEASE_CATEGORIES:
+                # this is the shape that produced real false drops.
+                not_a_disease.append(cond)
+            else:
+                categories.update(cats)
+
+        if unresolved or not_a_disease:
+            # Either way the screen has no opinion. The two are reported apart
+            # because they need different fixes: an unresolved string may be a
+            # missing synonym, a non-disease string is a registration habit.
+            return {"verdict": TRIAL_UNRESOLVED,
+                    "evidence": ("condition_unresolved" if unresolved
+                                 else "condition_not_a_disease"),
+                    "trees": [], "categories": sorted(categories),
+                    "unresolved": unresolved + not_a_disease}
+
+        return {"verdict": TRIAL_NON_ONCOLOGY, "evidence": "all_conditions_non_c04",
+                "trees": [], "categories": sorted(categories), "unresolved": []}
+
+    # -----------------------------------------------------------------
     # Filter decision: is this trial relevant to this patient?
     # -----------------------------------------------------------------
 
@@ -983,11 +1183,32 @@ def load_mesh_filter() -> Optional[MeSHCancerFilter]:
         console.out("  NOTE: umls_synonym_to_mesh_trees.json not found -- UMLS synonym crosswalk disabled.")
         console.out("  To enable: run build_umls_synonym_crosswalk() (Item 1).")
 
+    # Optional: the non-oncology complement, read only by the scraper's
+    # admission screen (classify_trial_oncology). Its absence CANNOT cause a
+    # trial to be dropped -- it can only stop one from being ruled out -- so it
+    # degrades in the safe direction and does not raise. It is still recorded,
+    # because "the screen admitted everything" and "the screen ran" look
+    # identical in a corpus count.
+    non_oncology_path = mesh_dir / "mesh_non_oncology_terms.json"
+    non_oncology_terms = {}
+    if non_oncology_path.exists():
+        with open(non_oncology_path, "r") as f:
+            non_oncology_terms = json.load(f)
+    else:
+        MESH_FILTER_DEGRADATIONS[MESH_LAYER_NON_ONCOLOGY] += 1
+        logger.warning("MeSH: the %r layer is absent (%s) -- the trial "
+                       "admission screen cannot make a positive non-oncology "
+                       "determination and will ADMIT every trial.",
+                       MESH_LAYER_NON_ONCOLOGY, non_oncology_path)
+        console.out("  NOTE: mesh_non_oncology_terms.json not found -- the scrape "
+              "admission screen will admit every trial.")
+        console.out('  To enable: run python "09- MeSH Cancer Site Relevance Filter.py"')
+
     if not snomed_to_trees and not icd10_to_trees and not synonym_to_trees:
         console.out("  Filter will use fuzzy string matching only.")
 
     return MeSHCancerFilter(name_to_trees, tree_to_name, snomed_to_trees,
-                            icd10_to_trees, synonym_to_trees)
+                            icd10_to_trees, synonym_to_trees, non_oncology_terms)
 
 
 #------------------------------------------------------------------------------

@@ -30,11 +30,16 @@ per-trial degradation into a per-patient outage):
      and only the third is the one the exception audit was worried about. All
      three are counted apart in ``LAB_UNIT_DEGRADATIONS``.
   4. an unparseable trial min_age / max_age at filter time
-     (``agent/filtering.py:AGE_PARSE_FAILURES``) and at index time
-     (``retrieval/indexer.py:INDEX_AGE_PARSE_FAILURES``). The RECOVERY IS
-     UNCHANGED in both — the trial is kept — because changing which trials
-     survive is a different decision, and it would break the twelve
-     characterization fixtures without being an improvement.
+     (``agent/filtering.py:AGE_PARSE_FAILURES``). The RECOVERY IS UNCHANGED —
+     the trial is kept — because changing which trials survive is a different
+     decision, and it would break the twelve characterization fixtures without
+     being an improvement.
+
+     THE INDEX-TIME MIRROR IS GONE. ``retrieval/indexer.py`` used to carry
+     ``INDEX_AGE_PARSE_FAILURES`` beside a ``min_age > 18`` skip; that skip was
+     an exactly-18 filter and was deleted, so the counter had nothing left to
+     record. Its ABSENCE is now asserted, along with the absence of any age
+     comparison in the scraper's executable code.
 
 Plus two behaviour changes with no exception behind them:
 
@@ -89,6 +94,7 @@ and 47.
 # Run needed file
 #----------------
 import ast
+import collections
 import hashlib
 import inspect
 import io
@@ -1127,18 +1133,52 @@ check_true("a pathological value is truncated in the key",
 
 filtering.AGE_PARSE_FAILURES.clear()
 
-# The counters are MODULE-LEVEL and separate at the two times.
-check_true("filter-time and index-time counters are different objects",
-           filtering.AGE_PARSE_FAILURES is not indexer.INDEX_AGE_PARSE_FAILURES)
-check("the index-time counter exists and starts empty here",
-      dict(indexer.INDEX_AGE_PARSE_FAILURES), {})
+# THE INDEX-TIME AGE COUNTER IS GONE, AND ITS ABSENCE IS THE CHECK NOW.
+#
+# INDEX_AGE_PARSE_FAILURES recorded when the scrape's `if min_age > 18: continue`
+# could not be evaluated. That skip was an EXACTLY-18 filter -- a trial
+# requiring 19, 20 or 21 was discarded, so a 70-year-old could never be matched
+# to it -- and it was deleted rather than widened, because
+# agent/filtering.py:node_rule_based_filter already enforces the trial's full
+# window against the actual patient (`min_age <= patient_age <= max_age`).
+#
+# With no age decision at scrape time there is nothing to fail, so a counter
+# there could only ever read zero. Asserting its ABSENCE is strictly stronger
+# than asserting it existed: it fails if anyone reintroduces an index-time age
+# decision, which is the thing that must not come back.
+check_true("no index-time age counter survives",
+           not hasattr(indexer, "INDEX_AGE_PARSE_FAILURES"))
+check_true("Stage 4 is now the only age-parse record in the project",
+           isinstance(filtering.AGE_PARSE_FAILURES, collections.Counter))
 
-# The index-time handler is inside the scrape loop and cannot be called in
-# isolation, so the SHAPE is checked structurally: the except clause records
-# rather than passing. Section 9 does the same for Stage 4.
 _indexer_src = open(os.path.join(_CODE_DIR, "oncotriage", "retrieval",
                                  "indexer.py"), encoding="utf-8").read()
 _indexer_tree = ast.parse(_indexer_src)
+
+
+def _executable_comparisons(tree):
+    """Every ast.Compare in `tree`, unparsed. COMMENTS ARE INVISIBLE HERE,
+    which is the point: indexer.py's note about the deleted filter quotes the
+    old `if min_age > 18` verbatim, and a substring search over the source
+    reports that argument as the defect it describes."""
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Compare):
+            try:
+                out.append(ast.unparse(node))
+            except Exception:
+                continue
+    return out
+
+
+_indexer_compares = _executable_comparisons(_indexer_tree)
+check_true("the scraper makes NO age comparison in executable code",
+           not any("min_age" in c or "minimum_age" in c
+                   for c in _indexer_compares))
+# Non-degeneracy: the walk must actually be finding comparisons, or the
+# assertion above passes for free on an empty list.
+check_true("...and that walk found comparisons at all (non-degeneracy)",
+           len(_indexer_compares) > 5)
 
 
 def _handlers_that_only_pass(tree):
@@ -1162,9 +1202,8 @@ def _handler_bodies_naming(tree, name):
                 found.append(node.lineno)
     return found
 
-check_true("the index-time age handler records the counter",
-           len(_handler_bodies_naming(_indexer_tree,
-                                      "INDEX_AGE_PARSE_FAILURES")) == 1)
+check("no `except: pass` survives in indexer.py either",
+      _handlers_that_only_pass(_indexer_tree), [])
 
 _filtering_src = open(os.path.join(_CODE_DIR, "oncotriage", "agent",
                                    "filtering.py"), encoding="utf-8").read()

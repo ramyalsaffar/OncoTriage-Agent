@@ -526,6 +526,31 @@ LOGGABLE_FIELDS = frozenset({
     # --- identifiers of PUBLIC objects -------------------------------------
     # An NCT ID names a trial on a public registry. It is not patient data.
     "nct_id",
+    # The trial's REGISTERED condition strings, straight off ClinicalTrials.gov.
+    # Same argument as nct_id and nct_ids: this is the public registry's own
+    # description of a study, published by its sponsor, and it exists in the
+    # Qdrant payload of every indexed trial already. It is allowed because the
+    # scraper's admission screen must log every drop WITH the conditions that
+    # caused it -- a drop record naming only a count is unauditable, and this
+    # screen is the one whose losses nothing downstream can detect.
+    #
+    # NOTE THE DIRECTION. A trial condition describes a STUDY. A patient
+    # condition describes a PERSON, and no patient-side condition string is on
+    # this list or may ever be added to it -- see conditions_total above, which
+    # is how the patient side reports the same shape.
+    "trial_conditions",
+
+    # --- the scraper's admission screen ------------------------------------
+    # Closed vocabularies (registries/mesh.py:TRIAL_ONCOLOGY_VERDICTS and the
+    # evidence strings beside them) plus the MeSH top-level categories that
+    # justified a non-oncology verdict. Categories are branch letters like
+    # "C19", not tree numbers, and they are about the TRIAL.
+    "verdict", "evidence", "mesh_categories",
+    # Screen funnel counts.
+    "screened", "admitted", "non_oncology_dropped", "unresolved_kept",
+    # Defect 3: how split_inclusion_exclusion resolved this trial's criteria,
+    # and the corpus-level residue. A closed vocabulary, see CRITERIA_SPLIT_*.
+    "split_method", "unsplit_count",
 
     # --- failures ----------------------------------------------------------
     # error_type is a class name and is always safe. error_message is allowed

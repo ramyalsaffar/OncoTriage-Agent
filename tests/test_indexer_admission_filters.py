@@ -1,0 +1,1015 @@
+"""The four scrape-time admission defects, each with a control that FIRES.
+
+WHAT THIS FILE IS ABOUT
+=======================
+Three filters in ``oncotriage/retrieval/indexer.py`` decided which trials ever
+entered the corpus, and a fourth defect promoted an unverified collection over
+its own rollback target. Every one of them was a SILENT DROP: the loss happens
+before any gate the pipeline measures, so stage-wise recall -- which records
+what each gate discarded -- cannot see a trial that was never indexed at all.
+
+  DEFECT 1  ``if min_age > 18: continue`` is an EXACTLY-18 filter. A trial whose
+            minimumAge is 19, 20 or 21 was discarded, so a 70-year-old who
+            qualifies for a trial requiring 21 could never be matched to it.
+  DEFECT 2  a sixteen-word frozenset screen holding "glioma" but neither
+            "blastoma" nor "thelioma". Glioblastoma, Mesothelioma,
+            Neuroblastoma, Retinoblastoma and Hepatoblastoma all dropped.
+  DEFECT 3  ``split_inclusion_exclusion`` finding no marker sent the whole
+            criteria block to inclusion, so exclusion criteria reached the
+            judge under inclusion vocabulary.
+  DEFECT 4  main() swapped the alias with no verification and then deleted the
+            previous good collection, destroying the only rollback target.
+
+EVERY CHECK HERE IS PAIRED WITH ITS OWN NEGATIVE CONTROL, and the controls run
+against the OLD implementations -- lifted out of ``git show HEAD:`` where that
+is possible and reconstructed in a throwaway namespace where it is not -- never
+against a retyped paraphrase. An assertion that has only ever passed is not
+evidence that it can catch anything.
+
+NO NETWORK, NO KEYS, NO SPEND. Every Qdrant client here is a stand-in. The MeSH
+filter is the real one, because defect 2's whole claim is about what the real
+crosswalk resolves; if its lookups are absent the affected section reports that
+and is skipped rather than passing vacuously.
+
+NOT IN THE COLLISION MATRIX, derived: this file writes nothing anywhere in the
+repository -- no temp copies of package modules, no in-place edits -- and the
+only repository files it READS are indexer.py and mesh.py, neither of which is
+written by ``tests/test_registries_cancer_code_claims_audit_control.py`` or by
+``tests/test_config_snapshot_date_rot.py``.
+"""
+
+import ast
+import os
+import re
+import subprocess
+import sys
+import types
+
+
+# --- package bootstrap ------------------------------------------------------
+try:
+    import oncotriage
+except ImportError:
+    _here = os.path.dirname(os.path.abspath(__file__))
+    for _candidate in (os.path.dirname(_here), os.getcwd()):
+        if os.path.isdir(os.path.join(_candidate, "oncotriage")):
+            sys.path.insert(0, _candidate)
+            print(f"[bootstrap] added {_candidate} to sys.path")
+            break
+    import oncotriage
+
+# The repository root, derived from the package this process actually imported
+# rather than from this file's location, so a future move of tests/ cannot make
+# it read a same-named copy.
+_CODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(oncotriage.__file__)))
+
+from oncotriage.registries import mesh as _mesh
+from oncotriage.retrieval import indexer
+
+
+_passed = 0
+_failed = 0
+
+
+def check(label, got, want):
+    global _passed, _failed
+    if got == want:
+        _passed += 1
+        print(f"  PASS  {label}")
+    else:
+        _failed += 1
+        print(f"  FAIL  {label}\n          got  {got!r}\n          want {want!r}")
+
+
+def check_true(label, cond):
+    check(label, bool(cond), True)
+
+
+def section(title):
+    print(f"\n{'=' * 78}\n{title}\n{'=' * 78}")
+
+
+# ===========================================================================
+# The OLD implementations, for the negative controls.
+# ===========================================================================
+#
+# Lifted out of git rather than retyped. A retyped control tests the retyping.
+# The revision is derived -- the newest one whose indexer still contains the
+# exactly-18 comparison in EXECUTABLE code -- so these controls keep working
+# after this work is committed, the lesson tests/test_storage_query_layer.py
+# had to learn when its substring-based selector picked its own fix commit.
+
+
+def _git(*args):
+    return subprocess.run(("git",) + args, cwd=_CODE_DIR, capture_output=True,
+                          text=True, timeout=60)
+
+
+def _revision_with_old_age_filter():
+    """Newest revision whose indexer has `min_age > 18` in EXECUTABLE code.
+
+    Parsed, not grepped: the current file quotes that comparison verbatim in
+    the comment explaining its deletion, so a substring search selects the
+    revision that REMOVED it and every control below then tests the fix
+    against itself.
+    """
+    log = _git("log", "--format=%H", "--", "oncotriage/retrieval/indexer.py")
+    if log.returncode != 0:
+        return None, None
+    for rev in log.stdout.split():
+        blob = _git("show", f"{rev}:oncotriage/retrieval/indexer.py")
+        if blob.returncode != 0 or not blob.stdout:
+            continue
+        try:
+            tree = ast.parse(blob.stdout)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Compare):
+                try:
+                    seg = ast.unparse(node)
+                except Exception:
+                    continue
+                if "min_age" in seg and "18" in seg:
+                    return rev, blob.stdout
+    return None, None
+
+
+_OLD_REV, _OLD_SRC = _revision_with_old_age_filter()
+
+
+def _old_function(name):
+    """One top-level function out of the pre-fix indexer, exec'd in isolation.
+
+    Never imported: the old module imports openai and qdrant_client at module
+    scope and we want neither. Only the named function's source is compiled,
+    into a namespace carrying just the builtins it needs.
+    """
+    if not _OLD_SRC:
+        return None
+    tree = ast.parse(_OLD_SRC)
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            ns = {"re": re}
+            exec(compile(ast.Module(body=[node], type_ignores=[]),
+                         "<old-indexer>", "exec"), ns)
+            return ns[name]
+    return None
+
+
+# ===========================================================================
+# SECTION 1 -- DEFECT 1: the exactly-18 age filter
+# ===========================================================================
+section("SECTION 1 -- DEFECT 1: the scrape-time age filter is gone")
+
+check_true("a pre-fix revision of the indexer was located",
+           _OLD_REV is not None)
+print(f"    control revision: {(_OLD_REV or '?')[:12]}")
+
+
+def _old_age_filter_drops(min_age_str):
+    """The old scrape-loop test, reproduced from the located blob's own text.
+
+    Reconstructed rather than exec'd because the comparison lived INSIDE the
+    scrape loop and there is no function to lift. Its equivalence to the blob
+    is asserted immediately below rather than assumed.
+    """
+    if min_age_str and "year" in min_age_str.lower():
+        try:
+            return int(re.findall(r"\d+", min_age_str)[0]) > 18
+        except (IndexError, ValueError):
+            return False
+    return False
+
+
+# The reconstruction is checked against the blob, so a wrong reconstruction
+# fails here rather than silently weakening every control below it.
+if _OLD_SRC:
+    _old_tree = ast.parse(_OLD_SRC)
+    _cmps = [ast.unparse(n) for n in ast.walk(_old_tree)
+             if isinstance(n, ast.Compare)]
+    check_true("the pre-fix blob really contains `min_age > 18`",
+               "min_age > 18" in _cmps)
+
+# --- the control: these are the trials the old filter destroyed -------------
+_REALISTIC_ADULT_BOUNDS = ["19 Years", "20 Years", "21 Years", "22 Years"]
+for _b in _REALISTIC_ADULT_BOUNDS:
+    check_true(f"CONTROL: the OLD filter drops a trial requiring {_b!r}",
+               _old_age_filter_drops(_b))
+
+check_true("CONTROL: the OLD filter keeps exactly 18",
+           not _old_age_filter_drops("18 Years"))
+
+# --- the fix: no age decision survives in the scraper ----------------------
+_indexer_src = open(os.path.join(_CODE_DIR, "oncotriage", "retrieval",
+                                 "indexer.py"), encoding="utf-8").read()
+_indexer_tree = ast.parse(_indexer_src)
+_compares = [ast.unparse(n) for n in ast.walk(_indexer_tree)
+             if isinstance(n, ast.Compare)]
+
+check_true("FIXED: no comparison in the scraper names min_age",
+           not any("min_age" in c for c in _compares))
+check_true("...and the comparison walk is finding things (non-degeneracy)",
+           len(_compares) > 5)
+check_true("FIXED: the index-time age counter is gone with its only producer",
+           not hasattr(indexer, "INDEX_AGE_PARSE_FAILURES"))
+
+# The decision was DELETED, not moved: Stage 4 already enforces the full
+# window. This asserts the enforcement it was delegated to actually exists.
+from oncotriage.agent import filtering as _filtering  # noqa: E402
+
+_filtering_src = open(os.path.join(_CODE_DIR, "oncotriage", "agent",
+                                   "filtering.py"), encoding="utf-8").read()
+check_true("Stage 4 enforces the trial's FULL window against the patient",
+           "min_age <= patient_age <= max_age" in _filtering_src)
+check_true("...and counts what it drops there",
+           "age_dropped" in _filtering_src)
+
+# And behaviourally: a 70-year-old is inside a 21+ trial's window, which is the
+# concrete patient the old scrape filter made unmatchable.
+check_true("a 70-year-old falls inside a trial requiring 21 and no maximum",
+           _filtering._parse_age_bound("21 Years", 0, "min_age") <= 70
+           <= _filtering._parse_age_bound("", 999, "max_age"))
+
+
+# ===========================================================================
+# SECTION 2 -- DEFECT 2: the oncology screen
+# ===========================================================================
+section("SECTION 2 -- DEFECT 2: the oncology screen routes through MeSH")
+
+_OLD_ONCOLOGY_KEYWORDS = frozenset({
+    "neoplasm", "cancer", "carcinoma", "sarcoma",
+    "lymphoma", "leukemia", "melanoma", "glioma",
+    "myeloma", "tumor", "tumour", "malignant",
+    "malignancy", "oncology", "metastatic", "metastasis",
+})
+
+# The old list is lifted from the pre-fix blob and compared with the one above,
+# so this control cannot drift away from what actually shipped.
+if _OLD_SRC:
+    _found_sets = [ast.literal_eval(n.args[0])
+                   for n in ast.walk(ast.parse(_OLD_SRC))
+                   if isinstance(n, ast.Call)
+                   and getattr(n.func, "id", "") == "frozenset"
+                   and n.args and isinstance(n.args[0], ast.Set)]
+    _shipped = next((s for s in _found_sets if "glioma" in s), None)
+    check_true("the old keyword set was recovered from git", _shipped is not None)
+    if _shipped is not None:
+        check("...and matches the control used here",
+              sorted(_shipped), sorted(_OLD_ONCOLOGY_KEYWORDS))
+        check_true("...and really lacks 'blastoma'", "blastoma" not in _shipped)
+        check_true("...and really lacks 'thelioma'", "thelioma" not in _shipped)
+
+
+def _old_screen_admits(trial):
+    """The old screen: substring over conditions + keywords only."""
+    combined = (" ".join(trial.get("conditions") or []).lower() + " "
+                + " ".join(trial.get("keywords") or []).lower())
+    return any(kw in combined for kw in _OLD_ONCOLOGY_KEYWORDS)
+
+
+# THE FIVE NAMED CANCER TYPES, each an explicit case.
+FIVE_CANCERS = ["Glioblastoma", "Mesothelioma", "Neuroblastoma",
+                "Retinoblastoma", "Hepatoblastoma"]
+
+_filter = None
+try:
+    _filter = _mesh.load_mesh_filter()
+except Exception as exc:  # noqa: BLE001 - reported, never swallowed
+    print(f"  SKIP  MeSH lookups unavailable ({type(exc).__name__}: {exc}); "
+          f"section 2's crosswalk checks cannot run")
+
+check_true("the MeSH filter loaded (section 2 needs the real crosswalk)",
+           _filter is not None)
+
+if _filter is not None:
+    check_true("the non-oncology layer is loaded (needed for any DROP)",
+               len(_filter.non_oncology_terms) > 1000)
+
+    for _name in FIVE_CANCERS:
+        _trial = {"nct_id": f"NCT-{_name}", "conditions": [_name],
+                  "keywords": [], "title": ""}
+
+        # CONTROL: the old screen destroys it.
+        check_true(f"CONTROL: the OLD keyword screen DROPS {_name}",
+                   not _old_screen_admits(_trial))
+
+        # FIXED: and it is admitted, on POSITIVE crosswalk evidence rather
+        # than by falling through the unresolved fallback. A screen that
+        # admitted these because it could not classify them would be a screen
+        # that had stopped working, and it would pass a weaker assertion.
+        _res = _filter.classify_trial_oncology(_trial)
+        check(f"FIXED: {_name} is admitted as oncology",
+              _res["verdict"], _mesh.TRIAL_ONCOLOGY)
+        check(f"...on C04 crosswalk evidence, not the fallback",
+              _res["evidence"], "c04_crosswalk")
+        check_true(f"...with real C04 tree numbers", len(_res["trees"]) > 0)
+        check_true(f"...all of which are under C04",
+                   all(t.startswith("C04") for t in _res["trees"]))
+        check_true("...and screen_trial_for_admission agrees",
+                   indexer.screen_trial_for_admission(_trial, _filter))
+
+    # --- a positive NON-oncology determination may drop --------------------
+    _diabetes = {"nct_id": "NCT-D", "conditions": ["Diabetes Mellitus"],
+                 "keywords": [], "title": "A study of insulin dosing"}
+    _res = _filter.classify_trial_oncology(_diabetes)
+    check("a wholly non-oncology trial is positively determined",
+          _res["verdict"], _mesh.TRIAL_NON_ONCOLOGY)
+    check_true("...with the MeSH categories that justified it",
+               len(_res["categories"]) > 0)
+    check_true("...and is dropped",
+               not indexer.screen_trial_for_admission(_diabetes, _filter))
+
+    # --- THE FALLBACK: a PLANTED resolution failure is KEPT and LOGGED ------
+    #
+    # This is the requirement the whole screen is shaped around. A condition
+    # string that resolves to nothing must not be treated as evidence of
+    # anything. The plant is a string that cannot be in any MeSH release.
+    _planted = "Zzq Unresolvable Syndrome Of The Left Parenthesis"
+    check_true("the planted condition really resolves to nothing (C04)",
+               not _filter.trial_mesh_trees(
+                   {"conditions": [_planted], "keywords": []}))
+    check_true("...and is really absent from the non-oncology lookup",
+               _planted.lower() not in _filter.non_oncology_terms)
+
+    _plant_trial = {"nct_id": "NCT-PLANT", "conditions": [_planted],
+                    "keywords": [], "title": "A study"}
+    _res = _filter.classify_trial_oncology(_plant_trial)
+    check("PLANTED resolution failure -> unresolved, not non-oncology",
+          _res["verdict"], _mesh.TRIAL_UNRESOLVED)
+    check("...with the reason recorded", _res["evidence"], "condition_unresolved")
+    check("...naming the string that failed", _res["unresolved"], [_planted])
+
+    _before = dict(indexer.ADMISSION_SCREEN)
+    check_true("PLANTED resolution failure is KEPT",
+               indexer.screen_trial_for_admission(_plant_trial, _filter))
+    _after = dict(indexer.ADMISSION_SCREEN)
+    _key = f"{_mesh.TRIAL_UNRESOLVED}:condition_unresolved"
+    check_true("...and COUNTED under its own key",
+               _after.get(_key, 0) == _before.get(_key, 0) + 1)
+
+    # A MIXED trial -- one resolvable non-cancer condition and one that does
+    # not resolve -- must NOT be dropped. "All conditions are non-cancer" is
+    # false when one of them is unknown.
+    _mixed = {"nct_id": "NCT-MIX",
+              "conditions": ["Diabetes Mellitus", _planted],
+              "keywords": [], "title": "A study"}
+    check("a MIXED trial is unresolved, never non-oncology",
+          _filter.classify_trial_oncology(_mixed)["verdict"],
+          _mesh.TRIAL_UNRESOLVED)
+    check_true("...and is kept",
+               indexer.screen_trial_for_admission(_mixed, _filter))
+
+    # A trial with NO conditions at all is unresolved, not vacuously dropped.
+    _empty = {"nct_id": "NCT-EMPTY", "conditions": [], "keywords": [],
+              "title": "A study"}
+    check("no registered conditions -> unresolved, not a vacuous drop",
+          _filter.classify_trial_oncology(_empty)["verdict"],
+          _mesh.TRIAL_UNRESOLVED)
+    check_true("...and is kept",
+               indexer.screen_trial_for_admission(_empty, _filter))
+
+    # --- A NON-DISEASE CONDITION IS NOT EVIDENCE OF ANYTHING ---------------
+    #
+    # These two are REAL trials that the first version of this screen dropped,
+    # found by inspecting all 31 of its drops rather than by reading the code.
+    # Both are oncology trials whose sponsor registered a non-disease string in
+    # the condition field, and "Drug Monitoring" IS a MeSH term outside C04 --
+    # so the naive rule made a confident positive non-oncology determination
+    # from a string that names no disease at all.
+    _REAL_FALSE_DROPS = [
+        ("NCT06545292", ["Drug Monitoring"],
+         "Microsampling to Facilitate Drug Monitoring of Oncolytics"),
+        ("NCT05436561", ["Disease-free Survival"],
+         "A Multiple-center Phase II Study to Evaluate the Clinical Outcome "
+         "of Reduced Conditioning Regimen"),
+    ]
+    for _nct, _conds, _title in _REAL_FALSE_DROPS:
+        _t = {"nct_id": _nct, "conditions": _conds, "keywords": [],
+              "title": _title}
+        # Non-degeneracy: the condition really IS a known non-C04 MeSH term,
+        # or this case is not testing the branch it claims to test.
+        _cats = _filter.non_oncology_terms.get(_conds[0].lower())
+        check_true(f"{_nct}: {_conds[0]!r} really is a known non-C04 MeSH term",
+                   _cats is not None)
+        if _cats is not None:
+            check_true(f"{_nct}: ...and names NO disease category",
+                       not _filter._is_disease_category(_cats))
+        _res = _filter.classify_trial_oncology(_t)
+        check_true(f"{_nct}: is NOT dropped",
+                   _res["verdict"] != _mesh.TRIAL_NON_ONCOLOGY)
+        check_true(f"{_nct}: is KEPT by the screen",
+                   indexer.screen_trial_for_admission(_t, _filter))
+
+    # ...and a trial whose conditions ARE diseases outside C04 still drops, or
+    # the rule above would have disabled the screen rather than corrected it.
+    check("a DISEASE outside C04 still yields a positive determination",
+          _filter.classify_trial_oncology(_diabetes)["verdict"],
+          _mesh.TRIAL_NON_ONCOLOGY)
+    check_true("Diabetes Mellitus really resolves to a disease category",
+               _filter._is_disease_category(
+                   _filter.non_oncology_terms["diabetes mellitus"]))
+
+    # The two unresolved reasons are reported apart: they need different fixes.
+    _nd = {"nct_id": "NCT-ND", "conditions": ["Drug Monitoring"],
+           "keywords": [], "title": "A study"}
+    check("a non-disease condition is reported as such",
+          _filter.classify_trial_oncology(_nd)["evidence"],
+          "condition_not_a_disease")
+
+    # --- the layer being ABSENT can never cause a drop ---------------------
+    _no_layer = _mesh.MeSHCancerFilter(
+        _filter.name_to_trees, _filter.tree_to_name, _filter.snomed_to_trees,
+        _filter.icd10_to_trees, _filter.synonym_to_trees,
+        non_oncology_terms={})
+    check("with the non-oncology layer absent, a non-cancer trial is UNRESOLVED",
+          _no_layer.classify_trial_oncology(_diabetes)["verdict"],
+          _mesh.TRIAL_UNRESOLVED)
+    check_true("...and is therefore KEPT",
+               indexer.screen_trial_for_admission(_diabetes, _no_layer))
+
+    # --- a None filter admits everything and says so -----------------------
+    check_true("a None filter admits everything",
+               indexer.screen_trial_for_admission(_diabetes, None))
+
+# The vocabulary is closed and every member has a policy. An added member with
+# no branch must raise rather than being silently admitted.
+check("the verdict vocabulary is exactly three members",
+      sorted(_mesh.TRIAL_ONCOLOGY_VERDICTS),
+      sorted([_mesh.TRIAL_ONCOLOGY, _mesh.TRIAL_NON_ONCOLOGY,
+              _mesh.TRIAL_UNRESOLVED]))
+
+
+class _RogueVerdictFilter:
+    """Returns a verdict outside the closed set. The screen must not guess."""
+
+    def classify_trial_oncology(self, trial):
+        return {"verdict": "something_new", "evidence": "x", "trees": [],
+                "categories": [], "unresolved": []}
+
+
+try:
+    indexer.screen_trial_for_admission({"nct_id": "NCT-R"}, _RogueVerdictFilter())
+    check_true("an unknown verdict RAISES rather than silently admitting", False)
+except RuntimeError as exc:
+    check_true("an unknown verdict RAISES rather than silently admitting",
+               "unknown verdict" in str(exc))
+
+
+# ===========================================================================
+# SECTION 3 -- DEFECT 3: the criteria split
+# ===========================================================================
+section("SECTION 3 -- DEFECT 3: the criteria split and its recorded flag")
+
+_old_split = _old_function("split_inclusion_exclusion")
+check_true("the OLD splitter was lifted out of git", _old_split is not None)
+
+# The heading styles the old markers mishandled. They fail in TWO distinct
+# ways and the controls are separated accordingly, because asserting the wrong
+# failure mode is how a control ends up passing for a reason that has nothing
+# to do with the defect.
+#
+#   LOST      -- the old markers matched nothing, so exclusion came back "" and
+#                every exclusion criterion reached the judge as an inclusion.
+#   MISPLACED -- the old markers matched the INNER "exclusion criteria:" of a
+#                "Key Exclusion Criteria:" heading, four characters late, so
+#                the orphaned word "Key" was left on the end of the inclusion
+#                text. Measured, not assumed: see the assertion below.
+LOST_CASES = [
+    ("no colon after the heading",
+     "Inclusion Criteria\n\n* Adults\n\nExclusion Criteria\n\n* Pregnancy"),
+    ("bulleted headings",
+     "* Inclusion Criteria\n* Adults\n\n* Exclusion Criteria\n* Pregnancy"),
+]
+
+for _label, _text in LOST_CASES:
+    _o_inc, _o_exc = _old_split(_text)
+    check_true(f"CONTROL: the OLD splitter LOSES the exclusion section -- {_label}",
+               _o_exc == "")
+    check_true(f"CONTROL: ...so 'Pregnancy' reached the judge as an INCLUSION"
+               f" -- {_label}", "Pregnancy" in _o_inc)
+    _n_inc, _n_exc, _n_method = indexer.split_inclusion_exclusion(_text)
+    check_true(f"FIXED: an exclusion section is recovered -- {_label}",
+               _n_exc != "")
+    check(f"FIXED: and the method is recorded -- {_label}",
+          _n_method, indexer.CRITERIA_SPLIT_BOTH)
+    check_true(f"FIXED: 'Pregnancy' is in EXCLUSION, not inclusion -- {_label}",
+               "Pregnancy" in _n_exc and "Pregnancy" not in _n_inc)
+
+_KEY_TEXT = ("Key Inclusion Criteria:\n\n* Adults\n\n"
+             "Key Exclusion Criteria:\n\n* Pregnancy")
+_o_inc, _o_exc = _old_split(_KEY_TEXT)
+check_true("CONTROL: the OLD splitter DOES find a Key-prefixed exclusion",
+           _o_exc != "")
+check_true("CONTROL: ...but cuts four characters late, orphaning 'Key' onto "
+           "the end of the inclusion text",
+           _o_inc.endswith("Key"))
+check_true("CONTROL: ...and drops 'Key' from the exclusion heading",
+           _o_exc.startswith("Exclusion Criteria"))
+_n_inc, _n_exc, _n_method = indexer.split_inclusion_exclusion(_KEY_TEXT)
+check_true("FIXED: the boundary is at the real heading, no orphaned 'Key'",
+           not _n_inc.endswith("Key"))
+check_true("FIXED: ...and the exclusion section starts at 'Key Exclusion'",
+           _n_exc.startswith("Key Exclusion Criteria"))
+check("FIXED: ...and the method is recorded",
+      _n_method, indexer.CRITERIA_SPLIT_BOTH)
+
+# --- the anchored search must never LOSE a split the old one found ---------
+#
+# The anchored pattern alone lost 116 splits on the stored corpus, because a
+# real heading is not always at a line start. The fallback to the original
+# substring markers is what makes the new split a strict superset. This is the
+# check that would catch someone deleting that fallback.
+_MID_LINE = ("Patients will be enrolled per protocol. Exclusion criteria: "
+             "prior therapy.")
+_o_inc, _o_exc = _old_split(_MID_LINE)
+check_true("the old splitter finds a MID-LINE exclusion marker", _o_exc != "")
+_n_inc, _n_exc, _n_method = indexer.split_inclusion_exclusion(_MID_LINE)
+check_true("FIXED: the fallback keeps that split rather than losing it",
+           _n_exc != "")
+
+# --- the unsplit state is a RECORDED FIELD, not an inference ---------------
+_UNSPLIT = "Participants aged 18 or older with a confirmed diagnosis."
+_inc, _exc, _method = indexer.split_inclusion_exclusion(_UNSPLIT)
+check("a genuinely unsplit block is reported as unsplit",
+      _method, indexer.CRITERIA_SPLIT_UNSPLIT)
+check_true("...and the trial is KEPT, not excluded from the corpus",
+           _inc == _UNSPLIT)
+
+check("empty criteria text has its own outcome",
+      indexer.split_inclusion_exclusion("")[2], indexer.CRITERIA_SPLIT_EMPTY)
+
+# The flag rides on the trial dict, which is what goes into Qdrant. A
+# downstream ingestion gate must be able to read it without re-deriving it.
+_protocol = {
+    "identificationModule": {"nctId": "NCT-SPLIT", "briefTitle": "t"},
+    "eligibilityModule": {"eligibilityCriteria": _UNSPLIT},
+}
+_trial = indexer.parse_trial_metadata(_protocol)
+check_true("criteria_split is a real field on the trial dict",
+           "criteria_split" in _trial)
+check("...carrying the unsplit verdict",
+      _trial["criteria_split"], indexer.CRITERIA_SPLIT_UNSPLIT)
+
+# CONTROL: the old parse_trial_metadata carried no such field.
+_old_parse_src = _OLD_SRC or ""
+if _old_parse_src:
+    _old_tree = ast.parse(_old_parse_src)
+    _old_keys = set()
+    for _n in ast.walk(_old_tree):
+        if isinstance(_n, ast.FunctionDef) and _n.name == "parse_trial_metadata":
+            for _d in ast.walk(_n):
+                if isinstance(_d, ast.Dict):
+                    for _k in _d.keys:
+                        if isinstance(_k, ast.Constant):
+                            _old_keys.add(_k.value)
+    check_true("CONTROL: the OLD trial dict had no criteria_split field",
+               "criteria_split" not in _old_keys)
+    check_true("...and that key walk found the other keys (non-degeneracy)",
+               "nct_id" in _old_keys and "eligibility" in _old_keys)
+
+# The 3-tuple is the contract now; a 2-tuple caller would silently unpack wrong.
+check("split_inclusion_exclusion returns three members",
+      len(indexer.split_inclusion_exclusion("Inclusion Criteria:\nx")), 3)
+check_true("CONTROL: the OLD one returned two", len(_old_split("x")) == 2)
+
+
+# ===========================================================================
+# SECTION 4 -- DEFECT 4: verify before swap, keep a rollback
+# ===========================================================================
+section("SECTION 4 -- DEFECT 4: verification gates the swap")
+
+
+class _FakeCollections:
+    def __init__(self, names):
+        self.collections = [types.SimpleNamespace(name=n) for n in names]
+
+
+class _FakeAliases:
+    def __init__(self, mapping):
+        self.aliases = [types.SimpleNamespace(alias_name=a, collection_name=c)
+                        for a, c in mapping.items()]
+
+
+class _RecordingClient:
+    """Enough Qdrant surface for cleanup and alias resolution. No network."""
+
+    def __init__(self, names, aliases):
+        self._names = list(names)
+        self._aliases = dict(aliases)
+        self.deleted = []
+
+    def get_collections(self):
+        return _FakeCollections(self._names)
+
+    def get_aliases(self):
+        return _FakeAliases(self._aliases)
+
+    def delete_collection(self, collection_name):
+        self.deleted.append(collection_name)
+        self._names.remove(collection_name)
+
+
+_ORDERED = ["trial_criteria_20260101_000000",
+            "trial_criteria_20260201_000000",
+            "trial_criteria_20260301_000000",
+            "trial_criteria_20260401_000000"]
+
+
+def _with_client(client, fn):
+    """Run fn with indexer.get_qdrant_client swapped for a stand-in."""
+    original = indexer.get_qdrant_client
+    indexer.get_qdrant_client = lambda: client
+    try:
+        return fn()
+    finally:
+        indexer.get_qdrant_client = original
+
+
+# --- CONTROL: keep_recent=1 destroys the rollback target -------------------
+#
+# Reproducing the OLD cleanup exactly: keep the newest N by name, no alias
+# awareness. With N=1 the only survivor is the collection just promoted.
+def _old_cleanup(client, keep_recent=1):
+    names = sorted([c.name for c in client.get_collections().collections
+                    if c.name.startswith("trial_criteria_")], reverse=True)
+    for name in names[keep_recent:]:
+        client.delete_collection(collection_name=name)
+    return names[:keep_recent]
+
+
+_c = _RecordingClient(_ORDERED, {"trial_criteria": _ORDERED[-1]})
+_kept = _old_cleanup(_c, keep_recent=1)
+check("CONTROL: the OLD cleanup keeps exactly one collection", len(_kept), 1)
+check_true("CONTROL: ...so NO rollback target survives",
+           len([n for n in _kept if n != _ORDERED[-1]]) == 0)
+check("CONTROL: ...and it deleted the previous good collection",
+      sorted(_c.deleted), sorted(_ORDERED[:-1]))
+
+# --- FIXED: a rollback target survives -------------------------------------
+_c = _RecordingClient(_ORDERED, {"trial_criteria": _ORDERED[-1]})
+_with_client(_c, lambda: indexer.cleanup_old_collections(
+    keep_recent=2, alias_name="trial_criteria"))
+check_true("FIXED: the promoted collection survives",
+           _ORDERED[-1] not in _c.deleted)
+check_true("FIXED: the PREVIOUS good collection survives as a rollback target",
+           _ORDERED[-2] not in _c.deleted)
+check("FIXED: only the genuinely old ones are deleted",
+      sorted(_c.deleted), sorted(_ORDERED[:-2]))
+
+# --- FIXED: keep_recent=1 is refused ---------------------------------------
+_c = _RecordingClient(_ORDERED, {"trial_criteria": _ORDERED[-1]})
+_with_client(_c, lambda: indexer.cleanup_old_collections(
+    keep_recent=1, alias_name="trial_criteria"))
+check_true("FIXED: keep_recent=1 is floored to 2, rollback still there",
+           _ORDERED[-2] not in _c.deleted)
+
+# --- FIXED: the alias target is never deleted, even out of the window ------
+#
+# The old code assumed the alias pointed at the newest collection. After a
+# failed swap that is exactly false, and the live collection was the one
+# sorted out of the keep window.
+_c = _RecordingClient(_ORDERED, {"trial_criteria": _ORDERED[0]})  # oldest is live
+_with_client(_c, lambda: indexer.cleanup_old_collections(
+    keep_recent=2, alias_name="trial_criteria"))
+check_true("FIXED: the LIVE collection is kept even when it sorts oldest",
+           _ORDERED[0] not in _c.deleted)
+
+_c = _RecordingClient(_ORDERED, {"trial_criteria": _ORDERED[0]})
+_old_cleanup(_c, keep_recent=2)
+check_true("CONTROL: the OLD cleanup DELETES the live collection in that case",
+           _ORDERED[0] in _c.deleted)
+
+# --- resolve_alias_target ---------------------------------------------------
+_c = _RecordingClient(_ORDERED, {"trial_criteria": _ORDERED[2]})
+check("resolve_alias_target reports the live collection",
+      _with_client(_c, lambda: indexer.resolve_alias_target("trial_criteria")),
+      _ORDERED[2])
+check("...and None when the alias does not exist",
+      _with_client(_c, lambda: indexer.resolve_alias_target("nope")), None)
+
+# --- verification exists, gates the swap, and raises -----------------------
+check_true("verify_collection exists", callable(indexer.verify_collection))
+check_true("IndexVerificationError is a RuntimeError",
+           issubclass(indexer.IndexVerificationError, RuntimeError))
+check_true("...and NOT a ValueError (a stray except must not eat it)",
+           not issubclass(indexer.IndexVerificationError, ValueError))
+
+# The ORDER is the defect. In main(), verification must precede the swap, and
+# the swap must precede cleanup. Asserted structurally against the real AST.
+_main = next(n for n in ast.walk(_indexer_tree)
+             if isinstance(n, ast.FunctionDef) and n.name == "main")
+_call_order = [ast.unparse(n.func) for n in ast.walk(_main)
+               if isinstance(n, ast.Call)]
+
+
+def _first_index(name):
+    for i, c in enumerate(_call_order):
+        if c.endswith(name):
+            return i
+    return -1
+
+
+_v, _s, _c_i = (_first_index("verify_collection"),
+                _first_index("swap_alias_atomic"),
+                _first_index("cleanup_old_collections"))
+check_true("main() calls verify_collection", _v >= 0)
+check_true("main() calls swap_alias_atomic", _s >= 0)
+check_true("FIXED: verification happens BEFORE the alias swap", _v < _s)
+check_true("FIXED: the swap happens before cleanup", _s < _c_i)
+
+# CONTROL: the old main() had no verification call at all.
+if _OLD_SRC:
+    _old_main = next((n for n in ast.walk(ast.parse(_OLD_SRC))
+                      if isinstance(n, ast.FunctionDef) and n.name == "main"),
+                     None)
+    if _old_main is not None:
+        _old_calls = [ast.unparse(n.func) for n in ast.walk(_old_main)
+                      if isinstance(n, ast.Call)]
+        check_true("CONTROL: the OLD main() had NO verification step",
+                   not any("verify" in c for c in _old_calls))
+        check_true("CONTROL: ...and swapped the alias anyway",
+                   any("swap_alias_atomic" in c for c in _old_calls))
+        check_true("CONTROL: ...and cleaned up with keep_recent=1",
+                   "cleanup_old_collections(keep_recent=1)" in
+                   ast.unparse(_old_main))
+
+# verify_collection must RAISE, not return False, when a check fails. A caller
+# that forgot to test a boolean would swap anyway; an exception cannot be
+# ignored by omission.
+_verify_fn = next(n for n in ast.walk(_indexer_tree)
+                  if isinstance(n, ast.FunctionDef)
+                  and n.name == "verify_collection")
+_raises = [n for n in ast.walk(_verify_fn) if isinstance(n, ast.Raise)]
+check_true("verify_collection raises rather than returning a flag",
+           len(_raises) >= 1)
+
+# --- yellow is optimization, not a fault -----------------------------------
+#
+# THIS COST A BUILD. The first version failed on any status that was not
+# green, and Qdrant reports `yellow` while its optimizers construct the HNSW
+# index after a bulk upsert -- the normal state seconds after indexing 14,324
+# points. A run that had scraped, embedded and PAID IN FULL was refused at the
+# last step by a collection that was busy finishing and was green ninety
+# seconds later, with every functional probe already passing.
+_verify_src = ast.get_source_segment(_indexer_src, _verify_fn) or ""
+check_true("red is treated as a real failure",
+           '"red" in status' in _verify_src)
+check_true("yellow is WAITED for, not failed",
+           "yellow" in _verify_src and "_STATUS_WAIT_SECONDS" in _verify_src)
+check_true("...with a bounded wait, so a stuck collection still fails",
+           isinstance(indexer._STATUS_WAIT_SECONDS, int)
+           and indexer._STATUS_WAIT_SECONDS > 0)
+check_true("...and a poll interval smaller than the wait",
+           0 < indexer._STATUS_POLL_SECONDS < indexer._STATUS_WAIT_SECONDS)
+# The wait loop must exit on green, or a green collection would still spin.
+check_true("the wait loop is conditioned on yellow, not on 'not green'",
+           'while "yellow" in status' in _verify_src)
+
+
+# ===========================================================================
+# SECTION 5 -- the generated Airflow DAG carries no second implementation
+# ===========================================================================
+section("SECTION 5 -- the DAG delegates instead of duplicating")
+
+from oncotriage.orchestration.dag_generator import build_dag_content  # noqa: E402
+
+_dag = build_dag_content(code_path="/x/code/", keys_path="/x/keys/",
+                         data_trial_path="/x/trials/")
+_dag_tree = ast.parse(_dag)
+_dag_funcs = {n.name for n in ast.walk(_dag_tree)
+              if isinstance(n, ast.FunctionDef)}
+
+check_true("the generated DAG still parses as Python", True)
+for _gone in ("_split_inclusion_exclusion", "_parse_trial_metadata",
+              "_create_trial_embedding_text", "_extract_locations"):
+    check_true(f"the DAG no longer defines its own {_gone}",
+               _gone not in _dag_funcs)
+check_true("...and the function walk found the DAG's real functions",
+           "trial_refresh_weekly" in _dag_funcs)
+
+_dag_compares = [ast.unparse(n) for n in ast.walk(_dag_tree)
+                 if isinstance(n, ast.Compare)]
+check_true("the DAG carries no age comparison in executable code",
+           not any("min_age" in c for c in _dag_compares))
+check_true("...and that walk found comparisons (non-degeneracy)",
+           len(_dag_compares) > 0)
+
+check_true("the DAG delegates to the package's indexer",
+           "from oncotriage.retrieval import indexer" in _dag)
+
+# The import must be DEFERRED: a module-scope import that fails makes the DAG
+# vanish from the scheduler with an import error instead of failing one run.
+_module_level_imports = [ast.unparse(n) for n in _dag_tree.body
+                         if isinstance(n, (ast.Import, ast.ImportFrom))]
+check_true("the oncotriage import is NOT at module scope in the DAG",
+           not any("oncotriage" in i for i in _module_level_imports))
+check_true("...and the module-level import walk found imports (non-degeneracy)",
+           len(_module_level_imports) > 3)
+
+# And the DAG's own verify must precede its swap, same as main().
+check_true("the DAG verifies before swapping",
+           _dag.index("verify_collection") < _dag.index("swap_alias_atomic"))
+check_true("the DAG keeps a rollback target",
+           "keep_recent=2" in _dag)
+
+
+# ===========================================================================
+# SECTION 6 -- A PARTIAL SCRAPE MUST NOT BECOME A CORPUS
+# ===========================================================================
+section("SECTION 6 -- a truncated scrape raises instead of being promoted")
+
+# THIS SECTION EXISTS BECAUSE THE DEFECT SHIPPED. The first real run of this
+# pass hit a ClinicalTrials.gov read timeout, returned 5,482 of ~14,300 trials
+# as an ordinary return value, and main() indexed and PROMOTED it over a
+# 12,067-trial collection. Every other check in this file was green.
+
+import json as _json  # noqa: E402
+import tempfile  # noqa: E402
+from oncotriage import paths as _paths  # noqa: E402
+
+check_true("IncompleteScrapeError exists",
+           hasattr(indexer, "IncompleteScrapeError"))
+check_true("...and is a RuntimeError",
+           issubclass(indexer.IncompleteScrapeError, RuntimeError))
+# It must NOT be a RequestException, or the same `except` that swallowed the
+# underlying network fault would swallow the refusal built to surface it.
+import requests as _requests  # noqa: E402
+check_true("...and NOT a requests exception",
+           not issubclass(indexer.IncompleteScrapeError,
+                          _requests.exceptions.RequestException))
+
+
+class _FailingSession:
+    """Answers page 1, then raises the fault that actually occurred.
+
+    Carries `.exceptions` because the scrape's own `except` clause resolves
+    `requests.exceptions.RequestException` through this same module object.
+    Without it the stand-in raises AttributeError from inside the handler and
+    the test reports a crash rather than the refusal it is checking for.
+    """
+
+    exceptions = _requests.exceptions
+
+    def __init__(self, pages_before_failure=1):
+        self.calls = 0
+        self.pages_before_failure = pages_before_failure
+
+    def get(self, url, params=None, timeout=None):
+        self.calls += 1
+        if self.calls > self.pages_before_failure:
+            raise _requests.exceptions.ReadTimeout("Read timed out.")
+
+        class _R:
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            @staticmethod
+            def json():
+                return {
+                    "studies": [{
+                        "protocolSection": {
+                            "identificationModule": {"nctId": "NCT00000001",
+                                                     "briefTitle": "A cancer study"},
+                            "designModule": {"studyType": "INTERVENTIONAL"},
+                            "conditionsModule": {"conditions": ["Breast Neoplasms"]},
+                            "eligibilityModule": {"eligibilityCriteria":
+                                                  "Inclusion Criteria:\nx"},
+                        }
+                    }],
+                    "nextPageToken": "MORE",
+                }
+        return _R()
+
+
+_scratch = tempfile.mkdtemp(prefix="oncotriage-scrape-")
+_saved_requests = indexer.requests
+_saved_resolved = dict(getattr(_paths, "_RESOLVED", {}))
+_session = _FailingSession()
+try:
+    indexer.requests = _session
+    _paths._RESOLVED["checkpoint_path"] = _scratch + os.sep
+    indexer.SCRAPE_INTERRUPTIONS.clear()
+    try:
+        indexer.scrape_clinicaltrials_gov(max_trials=5000)
+        check_true("a truncated scrape RAISES rather than returning a corpus",
+                   False)
+    except indexer.IncompleteScrapeError as _exc:
+        check_true("a truncated scrape RAISES rather than returning a corpus",
+                   True)
+        check_true("...naming how many trials it did get",
+                   "1 trial" in str(_exc) or "1," in str(_exc)
+                   or " 1 " in str(_exc))
+        check_true("...and naming the interruption that stopped it",
+                   "ReadTimeout" in str(_exc))
+        check_true("...and telling the operator the checkpoint was kept",
+                   "resume" in str(_exc).lower())
+    check_true("the network fault was COUNTED, not swallowed",
+               indexer.SCRAPE_INTERRUPTIONS.get("ReadTimeout", 0) == 1)
+    # The checkpoint must SURVIVE, or "re-run to resume" is a lie.
+    _ckpt = os.path.join(_scratch, "scrape_checkpoint.json")
+    check_true("the checkpoint is KEPT so a re-run resumes", os.path.exists(_ckpt))
+    if os.path.exists(_ckpt):
+        _saved = _json.load(open(_ckpt))
+        check_true("...carrying the page_token it stopped at",
+                   bool(_saved.get("page_token")))
+finally:
+    indexer.requests = _saved_requests
+    _paths._RESOLVED.clear()
+    _paths._RESOLVED.update(_saved_resolved)
+    import shutil as _shutil
+    _shutil.rmtree(_scratch, ignore_errors=True)
+
+# --- the size-vs-live guard, the second line of defence --------------------
+#
+# Even if a scrape truncates some other way, a collection materially smaller
+# than the one it would replace must not be promoted. Driven against
+# stand-ins: no network, no Qdrant.
+
+
+class _CountingClient:
+    """Only what the size branch of verify_collection touches."""
+
+    def __init__(self, counts):
+        self._counts = counts
+
+    def count(self, collection_name, exact=True):
+        return types.SimpleNamespace(count=self._counts[collection_name])
+
+
+def _size_verdict(new_n, live_n, ratio=0.90):
+    """True if the size branch would ACCEPT this pair."""
+    return new_n >= int(live_n * ratio)
+
+
+check_true("CONTROL: the collection that actually shipped is REFUSED "
+           "(5,482 vs 12,067)", not _size_verdict(5482, 12067))
+check_true("a same-size rebuild is accepted", _size_verdict(12067, 12067))
+check_true("ordinary registry churn is accepted (43 removed of 12,067)",
+           _size_verdict(12067 - 43, 12067))
+check_true("a genuine growth rebuild is accepted", _size_verdict(14311, 12067))
+check_true("a 15% collapse is refused", _size_verdict(int(12067 * 0.85), 12067) is False)
+check("the floor is a named constant, not a literal at the call site",
+      indexer._MIN_CORPUS_RATIO, 0.90)
+
+# verify_collection must ACCEPT the compare_to argument, and main() must pass
+# it -- a guard nobody calls is not a guard.
+import inspect as _inspect  # noqa: E402
+check_true("verify_collection takes compare_to",
+           "compare_to" in _inspect.signature(indexer.verify_collection).parameters)
+_main_src = ast.get_source_segment(_indexer_src, _main) or ""
+check_true("main() passes compare_to to verify_collection",
+           "compare_to=baseline" in _main_src)
+# The baseline is the explicit override when given, else the alias target.
+check_true("...and the baseline falls back to the alias target",
+           "baseline = compare_to or previous" in _main_src)
+check_true("...resolved BEFORE the rebuild starts",
+           _main_src.index("previous = resolve_alias_target")
+           < _main_src.index("verify_collection"))
+# main() must expose the override, or a bad alias target cannot be worked
+# around without editing the package.
+check_true("main() takes compare_to",
+           "compare_to" in _inspect.signature(indexer.main).parameters)
+check_true("main() takes run_cleanup",
+           "run_cleanup" in _inspect.signature(indexer.main).parameters)
+check_true("main() takes max_cost_usd",
+           "max_cost_usd" in _inspect.signature(indexer.main).parameters)
+
+# --- the spend gate ---------------------------------------------------------
+check_true("EmbeddingBudgetExceeded is a RuntimeError",
+           issubclass(indexer.EmbeddingBudgetExceeded, RuntimeError))
+# The gate must sit between the scrape and index_trials, or it is not a gate.
+check_true("the budget check precedes index_trials in main()",
+           _main_src.index("max_cost_usd is not None")
+           < _main_src.index("index_trials("))
+check_true("...and follows the scrape, since the corpus size is not knowable "
+           "before it",
+           _main_src.index("scrape_clinicaltrials_gov(")
+           < _main_src.index("max_cost_usd is not None"))
+# The estimator must be exact where it can be. Measured against the API's own
+# usage block on a real run: 5,960,458 tokens estimated, 5,960,458 billed.
+_est = indexer.estimate_embedding_cost([
+    {"title": "A study of breast cancer", "conditions": ["Breast Neoplasms"],
+     "eligibility": {"min_age": "18 Years", "max_age": "99 Years", "sex": "ALL"}}])
+check("the estimator reports which method produced the number",
+      _est["method"], "tiktoken")
+check_true("...and a non-zero token count (non-degeneracy)", _est["tokens"] > 0)
+
+
+# ===========================================================================
+section("SUMMARY")
+print(f"  passed: {_passed}")
+print(f"  failed: {_failed}")
+
+if __name__ == "__main__":
+    sys.exit(1 if _failed else 0)
+
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Aug 07 2026
+
+@author: ramyalsaffar
+"""

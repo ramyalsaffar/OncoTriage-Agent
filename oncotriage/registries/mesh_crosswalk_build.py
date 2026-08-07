@@ -22,7 +22,7 @@ block supplies it, the way it always did.
 import json
 import re
 import xml.etree.ElementTree as ET
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from oncotriage.observability import console
 
@@ -611,6 +611,145 @@ def build_umls_synonym_crosswalk(mrconso_path: str, output_dir: str,
     return synonym_serializable
 
 
+def build_mesh_non_oncology_lookup(mesh_xml_path: str, output_dir: str) -> dict:
+    """
+    Parse desc2026.xml for terms that are POSITIVELY NOT oncology.
+
+    WHY THIS FILE HAS TO EXIST, and why ``mesh_c04_lookup.json`` could not
+    answer the question. That lookup holds C04 descriptors ONLY, so the one
+    thing it can report about a name is "resolved to a cancer tree" or nothing.
+    Nothing is two different facts wearing one answer:
+
+        "Diabetes Mellitus"        -- a real MeSH descriptor, indexed under
+                                      C19/C18, definitively not a neoplasm
+        "Pt-Assessed Sx Burden"    -- resolves to nothing at all; the lookup
+                                      has no opinion
+
+    The scraper's oncology screen may only DROP on the first and must KEEP on
+    the second (see ``_screen_trial_oncology``). A C04-only lookup collapses
+    them, so a screen built on it would drop every trial it merely failed to
+    parse -- the silent drop this whole item exists to remove, rebuilt in a
+    new place.
+
+    This builder therefore reads the WHOLE descriptor set and keeps the
+    complement: every name whose tree numbers exist and none of which is under
+    C04. A name that is an entry term for both a C04 descriptor and a non-C04
+    one is treated as ONCOLOGY and excluded from this file, because the screen
+    must never drop on an ambiguous name.
+
+    ENTRY TERMS ARE INCLUDED, not just descriptor names. ClinicalTrials.gov
+    condition strings are free text -- "Diabetes", "Heart Attack", "High Blood
+    Pressure" -- and matching descriptor headings alone would resolve almost
+    none of them, leaving the screen unable to make a positive determination
+    and keeping everything. That is safe but useless.
+
+    Produces:
+      mesh_non_oncology_terms.json : {term_lower: [top_level_categories]}
+
+    The value is the sorted set of top-level MeSH categories the term sits
+    under ("C19", "F03"), not the full tree list: it is what a log line needs
+    to say WHY a trial was dropped, and it keeps the file small enough to
+    vendor. The full trees are recoverable from desc2026.xml if ever needed.
+
+    Args:
+        mesh_xml_path: Path to desc2026.xml
+        output_dir:    Directory to write the JSON file
+
+    Returns:
+        dict {term_lower: [top_level_categories]}
+    """
+    console.out("Parsing MeSH descriptor XML (non-oncology complement)...")
+    console.out(f"  Source: {mesh_xml_path}")
+
+    # name_lower -> set of top-level categories seen for that name across
+    # every descriptor it names or is an entry term of.
+    name_to_categories = defaultdict(set)
+    # Names that reach C04 anywhere. Excluded from the output unconditionally.
+    oncology_names = set()
+
+    descriptor_count = 0
+    tree_bearing_count = 0
+    # Item 11a shape: a malformed record is recovered from, and counted, never
+    # swallowed. Reported below and returned to the caller's console.
+    malformed = Counter()
+
+    context = ET.iterparse(mesh_xml_path, events=("end",))
+
+    for _event, elem in context:
+        if elem.tag != "DescriptorRecord":
+            continue
+
+        descriptor_count += 1
+
+        tree_numbers = []
+        tree_list = elem.find("TreeNumberList")
+        if tree_list is not None:
+            for tn in tree_list.findall("TreeNumber"):
+                if tn.text:
+                    tree_numbers.append(tn.text.strip())
+
+        if not tree_numbers:
+            # A descriptor with no tree numbers places nothing. It cannot
+            # support a positive determination in either direction, so it is
+            # skipped rather than counted as malformed.
+            elem.clear()
+            continue
+
+        tree_bearing_count += 1
+        is_oncology = any(t.startswith("C04") for t in tree_numbers)
+        categories = {t.split(".")[0] for t in tree_numbers}
+
+        # Every string that names this descriptor: the heading plus every
+        # entry term in every concept.
+        names = set()
+        name_elem = elem.find("DescriptorName/String")
+        if name_elem is not None and name_elem.text:
+            names.add(name_elem.text.strip().lower())
+        for term in elem.iterfind("ConceptList/Concept/TermList/Term/String"):
+            if term.text and term.text.strip():
+                names.add(term.text.strip().lower())
+
+        if not names:
+            malformed["descriptor_without_any_name"] += 1
+            elem.clear()
+            continue
+
+        for n in names:
+            if is_oncology:
+                oncology_names.add(n)
+            else:
+                name_to_categories[n].update(categories)
+
+        elem.clear()
+
+    # A name shared with any C04 descriptor is ambiguous, and ambiguity must
+    # not licence a drop. Remove it from the non-oncology set entirely.
+    ambiguous = len(oncology_names & set(name_to_categories))
+    non_oncology = {
+        name: sorted(cats)
+        for name, cats in name_to_categories.items()
+        if name not in oncology_names
+    }
+
+    console.out(f"  Parsed {descriptor_count:,} descriptors total")
+    console.out(f"  With tree numbers: {tree_bearing_count:,}")
+    console.out(f"  Oncology (C04) names, incl. entry terms: {len(oncology_names):,}")
+    console.out(f"  Non-oncology names retained: {len(non_oncology):,}")
+    console.out(f"  Ambiguous names dropped (also name a C04 descriptor): {ambiguous:,}")
+    if malformed:
+        console.out(f"  Malformed records recovered from: {dict(malformed)}")
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    out_file = output_path / "mesh_non_oncology_terms.json"
+
+    with open(out_file, "w") as f:
+        json.dump(non_oncology, f, indent=0, sort_keys=True)
+    console.out(f"  Saved: {out_file} ({len(non_oncology):,} entries)")
+
+    return non_oncology
+
+
 def build_all_lookups(mesh_xml_path: str, mrconso_path: str, output_dir: str):
     """
     One-shot builder: parse MeSH XML + MRCONSO_2025AB.RRF -> JSON lookup files.
@@ -619,6 +758,7 @@ def build_all_lookups(mesh_xml_path: str, mrconso_path: str, output_dir: str):
       - mesh_c04_lookup.json       (MeSH C04 descriptor names -> tree numbers)
       - mesh_tree_to_name.json     (tree number -> descriptor name)
       - mesh_uid_to_trees.json     (descriptor UID -> tree numbers)
+      - mesh_non_oncology_terms.json (non-C04 MeSH terms -> top categories)
       - snomed_to_mesh_trees.json  (SNOMED code -> C04 tree numbers)
       - icd10_to_mesh_trees.json   (ICD-10-CM code -> C04 tree numbers)
 
@@ -636,6 +776,11 @@ def build_all_lookups(mesh_xml_path: str, mrconso_path: str, output_dir: str):
 
     # Step 1: MeSH hierarchy
     mesh_data = build_mesh_lookup(mesh_xml_path, output_dir)
+
+    # Step 1b: the non-oncology complement, read from the same XML. Required by
+    # the scraper's oncology screen, which may only drop a trial on a POSITIVE
+    # non-oncology determination -- see build_mesh_non_oncology_lookup.
+    build_mesh_non_oncology_lookup(mesh_xml_path, output_dir)
 
     # Step 2: SNOMED crosswalk (needs uid_to_trees from step 1)
     build_snomed_to_mesh_crosswalk(
