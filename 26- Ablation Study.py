@@ -38,9 +38,14 @@ Output
 ``ablation_summary.json`` beside it. Until that pass this was the last database
 writer in the project whose path could not be overridden, which is why it was
 also the only one with no isolation test;
-``tests/test_ablation_db_isolation.py`` is that test. The CHECKPOINT is not
-redirected by it and still lives under ``checkpoint_path`` -- recorded in
-``oncotriage/ablation/study.py``'s module docstring as a follow-up.
+``tests/test_ablation_db_isolation.py`` is that test. PASS 20f-3 CLOSED THE TWO
+THINGS THAT PASS RECORDED AS FOLLOW-UPS: the CHECKPOINT follows ``--db`` now
+(beside the database, named after it -- before, an isolated run read the
+production resume file, skipped every pair a production run had done, wrote
+nothing for them and still printed ``Status: COMPLETE``), and a ``--db`` whose
+PARENT DIRECTORY is missing is refused by name instead of reaching sqlite3 and
+coming back as "unable to open database file", which names neither the path nor
+the flag. Both are argued in ``oncotriage/ablation/study.py``.
 
 THIS COSTS MONEY. 7 configs × 75 patients = 525 live pipeline runs, each with a
 Stage 5 call. Roughly $2.50–$4.00 and 3–5 hours at the default sample size. The

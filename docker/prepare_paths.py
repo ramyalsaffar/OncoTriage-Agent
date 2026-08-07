@@ -8,7 +8,8 @@ service does.
 
 THE DEFECT THIS CLOSES
 ----------------------
-``oncotriage/paths.py`` fixes fourteen absolute paths for the container. The
+``oncotriage/paths.py`` fixes thirteen absolute paths for the container (it
+was fourteen until pass 20f-3 dropped the never-read ``requirements_path``). The
 Dockerfile created three of them; ``docker-compose.yml`` then mounted the host
 code directory over the whole of ``/app``, hiding those three, and declared no
 volume for data or results at all. The consequences were not symmetrical — one
@@ -47,8 +48,7 @@ it means the volume was empty, which on a restart means the volume was replaced.
 WHY IT DOES NOT SIMPLY TRUST THE VOLUMES. A directory under ``/app`` that no
 volume covers is created inside the BIND MOUNT, i.e. in the developer's checked
 out repository. There are none today: every writable path in the table is
-covered by a named volume, and ``/app/`` and ``/app/requirements/`` already
-exist in the code tree. The report is what would make a future one visible
+covered by a named volume, and ``/app/`` already exists in the code tree. The report is what would make a future one visible
 instead of leaving a mystery directory in someone's git status.
 """
 

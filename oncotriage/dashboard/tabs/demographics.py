@@ -8,6 +8,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+from oncotriage.dashboard.tiers import PATIENT_OUTCOME_FULL
+
 
 def render_patient_demographics_tab(df):
     """Render Patient Demographics tab with equity analysis."""
@@ -32,7 +34,7 @@ def render_patient_demographics_tab(df):
         st.metric("Avg Conditions", f"{df['condition_count'].mean():.1f}",
                   help="Average number of conditions per patient")
     with col4:
-        st.metric("✅ Full Match", f"{full_match_rate_demo:.1f}%",
+        st.metric(PATIENT_OUTCOME_FULL, f"{full_match_rate_demo:.1f}%",
                   help="Patients with at least 1 trial where ALL criteria confirmed (100% score)")
     with col5:
         st.metric("🟡 Partial Match", f"{partial_match_rate_demo:.1f}%",

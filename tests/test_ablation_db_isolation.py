@@ -452,6 +452,166 @@ check("...and the scan reports the call it was removed from",
 
 
 # ===========================================================================
+# SECTION 5b: --db NAMES AN ABSENT PARENT, AND THE CHECKPOINT FOLLOWS IT
+# ===========================================================================
+# Pass 20f-3. Two behaviour changes, both recorded as follow-ups by pass 20f-1
+# and both untestable before it made the database redirectable at all.
+#
+# THIS SECTION IS WHY THIS FILE'S COUNT MOVED (43 -> 72). Every other count in
+# the suite is unchanged; a behaviour change with no assertion behind it is what
+# this project treats as the defect, so the two are added here rather than
+# argued in a commit message.
+
+print()
+print("=" * 70)
+print("Section 5b: an absent --db parent is refused by name; the checkpoint "
+      "follows the database")
+print("=" * 70)
+
+_ABSENT_PARENT = os.path.join(_TMP, "does-not-exist", "ablation.db")
+check("the probe parent really is absent (non-degeneracy)",
+      os.path.isdir(os.path.dirname(_ABSENT_PARENT)), False)
+
+for _label, _fn in (("ablation_db", _study.ablation_db),
+                    ("ablation_summary_json", _study.ablation_summary_json),
+                    ("_ablation_checkpoint_path", _study._ablation_checkpoint_path)):
+    _t, _m = raises(lambda _f=_fn: _f(_ABSENT_PARENT))
+    check(f"{_label}() RAISES on an absent parent", _t, "RuntimeError")
+    check(f"...naming the directory", os.path.dirname(_ABSENT_PARENT) in _m, True)
+    check(f"...and naming the flag the operator used", "--db" in _m, True)
+
+# WHAT THE GUARD REPLACED, shown rather than described: the pre-20f-3 path was
+# straight to sqlite3, whose message names neither the path nor the flag.
+_t, _m = raises(lambda: sqlite3.connect(_ABSENT_PARENT))
+check("control: sqlite3 alone raises OperationalError on the same path",
+      _t, "OperationalError")
+check("...and its message names NEITHER the directory NOR the flag, which is "
+      "the whole reason for the guard",
+      (os.path.dirname(_ABSENT_PARENT) in _m, "--db" in _m), (False, False))
+
+# NON-DEGENERATE: the guard must not fire on the default, which resolves a
+# directory _glob_one has already proved exists.
+_t, _m = raises(lambda: _study.ablation_db())
+check("the DEFAULT path is not subjected to the guard and still resolves",
+      (_t, str(_study.ablation_db()).endswith(_study.ABLATION_DB_FILENAME)),
+      (None, True))
+
+# --- the checkpoint follows the database ----------------------------------
+_PROD_CKPT = _study._ablation_checkpoint_path()
+_SCRATCH_CKPT = _study._ablation_checkpoint_path(_SCRATCH_DB)
+
+check("the default checkpoint is still the production one, unchanged",
+      str(_PROD_CKPT).endswith(_study.ABLATION_CHECKPOINT_FILENAME), True)
+check("...and an explicit --db gets a DIFFERENT one",
+      _SCRATCH_CKPT == _PROD_CKPT, False)
+check("...beside that database rather than in the production checkpoint "
+      "directory",
+      str(_SCRATCH_CKPT.parent), str(Path(_SCRATCH_DB).parent))
+check("...named after it, so two scratch databases in one directory do not "
+      "share resume state either",
+      _study._ablation_checkpoint_path(
+          os.path.join(os.path.dirname(_SCRATCH_DB), "other.db")) == _SCRATCH_CKPT,
+      False)
+
+# THE ASSERTION MUST BE ABLE TO FAIL, and the demonstration drives the DEFECT
+# through the real caller rather than reasoning about it. The pre-20f-3 shape is
+# a function that IGNORES db_path and always answers the production path; a
+# stand-in of exactly that shape is installed on the module -- the mechanism
+# section 6 below already uses, and the one the fixture harnesses use -- and
+# `load_ablation_checkpoint(db_path=B)` is then asked what it sees.
+#
+# Two throwaway "databases" stand in for production and scratch, so nothing here
+# reads or writes the real checkpoint at all. NO exec(), no source patching:
+# tests/test_storage_query_layer.py holds the repository's one argued exec()
+# allowance and this file has no business joining it.
+_ISO_DIR = os.path.join(_TMP, "resume-isolation")
+os.makedirs(_ISO_DIR)
+_DB_A = os.path.join(_ISO_DIR, "stands_in_for_production.db")
+_DB_B = os.path.join(_ISO_DIR, "scratch.db")
+_CKPT_A = _study._ablation_checkpoint_path(_DB_A)
+
+_study.save_ablation_checkpoint({("full_pipeline", "already-done")}, db_path=_DB_A)
+check("A's checkpoint was written (non-degeneracy: the defect below needs "
+      "something to be wrongly inherited)", _CKPT_A.exists(), True)
+
+_saved_ckpt_fn = _study._ablation_checkpoint_path
+try:
+    # The pre-20f-3 shape: db_path is accepted and discarded.
+    _study._ablation_checkpoint_path = lambda db_path=None: _CKPT_A
+    check("PRE-20f-3: a run told to write to B reads A's resume state -- it "
+          "would skip those pairs and write nothing for them into B, then "
+          "print COMPLETE. THIS IS THE DEFECT.",
+          _study.load_ablation_checkpoint(db_path=_DB_B),
+          {("full_pipeline", "already-done")})
+finally:
+    _study._ablation_checkpoint_path = _saved_ckpt_fn
+
+check("...while the SHIPPED function gives B its own, empty, resume state",
+      _study.load_ablation_checkpoint(db_path=_DB_B), set())
+check("...and A's is still A's, so the fix isolates rather than disabling "
+      "resume", _study.load_ablation_checkpoint(db_path=_DB_A),
+      {("full_pipeline", "already-done")})
+check("...and the two are different files (non-degeneracy)",
+      _study._ablation_checkpoint_path(_DB_A)
+      == _study._ablation_checkpoint_path(_DB_B), False)
+
+# --- load / save / clear honour it, and the production file is untouched ---
+_prod_ckpt_before = (_PROD_CKPT.exists(),
+                     _PROD_CKPT.read_bytes() if _PROD_CKPT.exists() else None)
+
+_study.save_ablation_checkpoint({("full_pipeline", "iso-1")}, db_path=_SCRATCH_DB)
+check("save_ablation_checkpoint() wrote the scratch checkpoint",
+      _SCRATCH_CKPT.exists(), True)
+check("...and load_ablation_checkpoint() reads it back",
+      _study.load_ablation_checkpoint(db_path=_SCRATCH_DB),
+      {("full_pipeline", "iso-1")})
+_study.clear_ablation_checkpoint(db_path=_SCRATCH_DB)
+check("...and clear_ablation_checkpoint() removes THAT one",
+      _SCRATCH_CKPT.exists(), False)
+
+check("the production checkpoint was neither created nor modified by any of "
+      "the three",
+      (_PROD_CKPT.exists(),
+       _PROD_CKPT.read_bytes() if _PROD_CKPT.exists() else None),
+      _prod_ckpt_before)
+
+# --- main() threads db_path to the checkpoint too --------------------------
+_CKPT_FNS = ("load_ablation_checkpoint", "save_ablation_checkpoint",
+             "clear_ablation_checkpoint")
+
+
+def _ckpt_calls_missing_db_path(tree, function_name):
+    target = next((n for n in ast.walk(tree)
+                   if isinstance(n, ast.FunctionDef) and n.name == function_name),
+                  None)
+    if target is None:
+        return ["<function not found>"]
+    return [f"{getattr(n.func, 'id', None)}@line{n.lineno}"
+            for n in ast.walk(target)
+            if isinstance(n, ast.Call)
+            and getattr(n.func, "id", None) in _CKPT_FNS
+            and not any(kw.arg == "db_path" for kw in n.keywords)]
+
+
+check("main() reaches all three checkpoint functions with db_path",
+      _ckpt_calls_missing_db_path(_STUDY_TREE, "main"), [])
+
+_MUTATED_CKPT = ast.parse(_STUDY_SRC)
+_removed_ckpt = None
+for _node in ast.walk(_MUTATED_CKPT):
+    if (isinstance(_node, ast.Call)
+            and getattr(_node.func, "id", None) in _CKPT_FNS
+            and any(_kw.arg == "db_path" for _kw in _node.keywords)):
+        _node.keywords = [_kw for _kw in _node.keywords if _kw.arg != "db_path"]
+        _removed_ckpt = getattr(_node.func, "id", None)
+        break
+check("a db_path keyword was found to remove (non-degeneracy)",
+      _removed_ckpt in _CKPT_FNS, True)
+check("...and the scan reports the call it was removed from",
+      len(_ckpt_calls_missing_db_path(_MUTATED_CKPT, "main")), 1)
+
+
+# ===========================================================================
 # SECTION 6: THE CHECKPOINT WRITE FAILURES ARE COUNTED (item 11a)
 # ===========================================================================
 # Both handlers are driven FOR REAL. The temp file's name is made a DIRECTORY,
@@ -476,7 +636,10 @@ _CHECKPOINT = Path(_CHECKPOINT_DIR) / "ablation_checkpoint.json"
 # A healthy write first, so the failure below is a statement about the failure
 # and not about the function never having worked here.
 _saved_path_fn = _study._ablation_checkpoint_path
-_study._ablation_checkpoint_path = lambda: _CHECKPOINT
+# `db_path=None` because pass 20f-3 gave the real function that parameter;
+# the stand-in ignores it, which is right here -- this section is about the
+# two OSError handlers and not about which checkpoint is chosen.
+_study._ablation_checkpoint_path = lambda db_path=None: _CHECKPOINT
 try:
     _study.save_ablation_checkpoint({("full_pipeline", "p1")})
     check("a healthy write produces the checkpoint file (non-degeneracy)",

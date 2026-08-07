@@ -18,38 +18,52 @@ defect everywhere else. ``tests/test_package_invariants.py`` section 1c now
 scans the WHOLE repository for a call to it, or for a raw ``exec()`` of a
 numbered file, and carries a planted control.
 
-WHY THREE FUNCTIONS TAKE AN OVERRIDE ARGUMENT THEY DID NOT USED TO HAVE
------------------------------------------------------------------------
+THE THREE EXEC-CHAIN OVERRIDE ARGUMENTS ARE DELETED (pass 20f-3)
+-----------------------------------------------------------------
 ``get_model_cost``, ``resolve_qdrant_collection`` and ``get_age_reference_date``
-read ``PRICING_CONFIG`` / ``qdrant_client`` + ``COLLECTION_NAME`` /
+used to read ``PRICING_CONFIG`` / ``qdrant_client`` + ``COLLECTION_NAME`` /
 ``DATA_SNAPSHOT_DATE`` out of the shared exec namespace at CALL time. A module
-function cannot see a caller's globals, so each of the three takes the value as
-an optional argument instead, and ``02- Utility Functions.py``'s shim passed
-``globals().get(...)`` through it.
+function cannot see a caller's globals, so item 20c gave each of them the value
+as an OPTIONAL ARGUMENT and ``02- Utility Functions.py``'s shim passed
+``globals().get(...)`` through it. Four parameters across three functions:
+``pricing_config``, ``client``, ``collection_name``, ``snapshot_date``.
 
-EVERY CONSUMER OF THAT SEAM IS NOW GONE, and it is recorded rather than removed.
-``36-`` and ``37-`` stopped rebinding ``qdrant_client`` at pass 20c-2c and
-install ``deps.set_override(deps.QDRANT_CLIENT, ...)``; ``38-`` stopped
-rebinding ``DATA_SNAPSHOT_DATE`` at pass 20d-1 and sets
-``config.DATA_SNAPSHOT_DATE``, the attribute ``get_age_reference_date()``
-actually reads at call time; ``45-`` and ``46-`` became
-``oncotriage/fixtures/{capture,replay}.py`` at pass 20c-3d and go through
-``deps`` too; and pass 20e deleted the shim that passed the values. Measured,
-not assumed: no call site anywhere in the repository passes any of the three
-arguments today.
+THEY WERE A BRIDGE TO A MECHANISM THAT NO LONGER EXISTS. ``36-`` and ``37-``
+stopped rebinding ``qdrant_client`` at pass 20c-2c and install
+``deps.set_override(deps.QDRANT_CLIENT, ...)``; ``38-`` stopped rebinding
+``DATA_SNAPSHOT_DATE`` at pass 20d-1 and sets ``config.DATA_SNAPSHOT_DATE``, the
+attribute ``get_age_reference_date()`` reads at call time; ``45-`` and ``46-``
+became ``oncotriage/fixtures/{capture,replay}.py`` at pass 20c-3d and go through
+``deps`` too; and pass 20e deleted the shim that passed the values, along with
+``exec_chain`` itself.
 
-THE PARAMETERS STAY. Removing them is a change to three public signatures, which
-is a behaviour change, and this pass promises none. They are also the documented
-patch point in ``get_age_reference_date``'s own docstring. Recorded as a
-follow-up rather than folded in here, on the same footing as File 14's
-``log_inference`` wrapper before it: "no remaining consumer" is a statement of
-fact, not an argument for deletion inside a pass about something else.
+MEASURED BEFORE REMOVAL, BY AST RATHER THAN BY GREP: 29 call sites across the
+whole repository -- package, entry points and tests -- and not one of them
+passes any of the four, positionally or by keyword. 4 to ``get_model_cost``
+(all with exactly 3 positional arguments), 6 to ``resolve_qdrant_collection``
+(all with none), 19 to ``get_age_reference_date`` (all with none).
 
-``None`` means "not supplied" for the first two, because neither
-``PRICING_CONFIG`` nor a client is ever legitimately ``None``.
-``get_age_reference_date`` uses a private sentinel instead, because ``""`` is
-one of the values ``tests/test_fhir_birth_date_and_demographics.py`` requires to
-raise, so it cannot double as "unset".
+THIS IS A BEHAVIOUR CHANGE AND IT IS STATED AS ONE: three public signatures
+narrowed, so a caller outside this repository passing any of the four now gets a
+``TypeError`` where it used to get an override. Pass 20e recorded the removal as
+a follow-up and named the one thing that had to be settled first --
+``get_age_reference_date``'s docstring called ``snapshot_date`` "the supported
+patch point". IT IS NOT, AND HAD NOT BEEN SINCE PASS 20d-1: the file that
+patches it, ``tests/test_fhir_birth_date_and_demographics.py`` section 3, sets
+``config.DATA_SNAPSHOT_DATE`` and always did after the move, because the shim
+that carried the argument was gone. The docstring named a seam its own test had
+stopped using. The supported patch point is the config attribute, the function
+reads it at CALL time so patching takes effect, and the docstring says that now.
+
+The private "not supplied" sentinel went with ``snapshot_date``; it is named and
+argued in the COMMENT that stands where it was defined, and DELIBERATELY NOT
+HERE. ``tests/test_package_invariants.py`` check 2h counts a name inside any
+string literal as a read, and this docstring is a string literal -- so naming the
+deleted constant in it would mean that reinstating the constant, unread, is
+NOT REPORTED. That is not hypothetical: it is what pass 20f-2 shipped and caught
+only through a revert control, and it is what the revert control for THIS pass
+caught here. A `#` comment is invisible to an AST walk, which is exactly why the
+argument belongs in one.
 """
 
 import logging
@@ -178,8 +192,8 @@ class UnknownModelPricingError(RuntimeError):
     """
 
 
-def get_model_cost(model_name: str, input_tokens: int, output_tokens: int,
-                   pricing_config: Optional[dict] = None) -> float:
+def get_model_cost(model_name: str, input_tokens: int,
+                   output_tokens: int) -> float:
     """
     Calculate USD cost from token counts using current pricing.
 
@@ -187,11 +201,11 @@ def get_model_cost(model_name: str, input_tokens: int, output_tokens: int,
         model_name: Model identifier (e.g., 'gpt-4o-2024-08-06')
         input_tokens: Input token count from response.usage
         output_tokens: Output token count from response.usage
-        pricing_config: Price table to use. None (the default) means
-            ``oncotriage.config.PRICING_CONFIG``. The shim in
-            '02- Utility Functions.py' passes the shared exec namespace's
-            PRICING_CONFIG so that the exec chain keeps the late-binding it
-            had; see this module's docstring.
+
+        The price table is ``oncotriage.config.PRICING_CONFIG``, read HERE at
+        call time rather than bound at import, so setting the module attribute
+        takes effect. A ``pricing_config`` parameter stood here until pass
+        20f-3; see this module's docstring for why it went.
 
     Returns:
         Total cost in USD
@@ -211,8 +225,7 @@ def get_model_cost(model_name: str, input_tokens: int, output_tokens: int,
         cost = get_model_cost('gpt-4o-2024-08-06', 1000, 500)
         # Returns: 0.0025 + 0.0050 = 0.0075 USD
     """
-    if pricing_config is None:
-        pricing_config = config.PRICING_CONFIG
+    pricing_config = config.PRICING_CONFIG
 
     pricing = pricing_config["models"].get(model_name)
     if not pricing:
@@ -281,7 +294,7 @@ qdrant_retry = retry(
 
 # Collecting the clinical trial batch name from the Qdrant
 #---------------------------------------------------------
-def resolve_qdrant_collection(client=None, collection_name: Optional[str] = None) -> str:
+def resolve_qdrant_collection() -> str:
     """Resolve the COLLECTION_NAME alias to the actual backing collection.
 
     Qdrant aliases allow COLLECTION_NAME to remain constant ('trial_criteria')
@@ -290,20 +303,19 @@ def resolve_qdrant_collection(client=None, collection_name: Optional[str] = None
 
     Retries up to 3 times with 1s delay if resolution fails or alias not found.
 
-    Args:
-        client: Qdrant client to ask. None means ``config.get_qdrant_client()``.
-            The shim in '02- Utility Functions.py' passes the shared exec
-            namespace's ``qdrant_client``, so a recording proxy installed by
-            File 45 / 46 or a stub installed by File 36 is still the thing this
-            function talks to. Building the real client here instead would have
-            been a silent second connection.
-        collection_name: Alias to resolve. None means ``config.COLLECTION_NAME``.
+    Takes no arguments. It asks ``config.get_qdrant_client()`` for the client
+    and resolves ``config.COLLECTION_NAME``, both read HERE rather than bound at
+    import. ``client`` and ``collection_name`` parameters stood here until pass
+    20f-3, for the exec chain's benefit; a fixture harness redirects this
+    function's client the same way it redirects the agent's, by installing
+    ``deps.set_override(deps.QDRANT_CLIENT, ...)`` -- except that this one goes
+    through ``oncotriage.config``, which is deliberate and unchanged: a
+    logging helper must not open a second connection, and it must not be
+    silently pointed elsewhere by an agent test either.
     """
 
-    if client is None:
-        client = config.get_qdrant_client()
-    if collection_name is None:
-        collection_name = config.COLLECTION_NAME
+    client = config.get_qdrant_client()
+    collection_name = config.COLLECTION_NAME
 
     MAX_RETRIES = 3
 
@@ -436,12 +448,14 @@ def parse_partial_date(value) -> Tuple[Optional[date], str]:
     return None, "unparseable"
 
 
-# Distinct from None and from "": File 38 requires get_age_reference_date() to
-# raise on a snapshot date of "", so "" cannot double as "nothing was passed".
-_SNAPSHOT_NOT_SUPPLIED = object()
+# _SNAPSHOT_NOT_SUPPLIED STOOD HERE AND IS DELETED (pass 20f-3). It was a
+# sentinel distinct from None and from "", because File 38 requires
+# get_age_reference_date() to raise on a snapshot date of "" and so "" could not
+# double as "nothing was passed". With the `snapshot_date` parameter gone there
+# is nothing left to be unsupplied.
 
 
-def get_age_reference_date(snapshot_date=_SNAPSHOT_NOT_SUPPLIED) -> date:
+def get_age_reference_date() -> date:
     """The fixed date this run computes patient ages against.
 
     Resolves DATA_SNAPSHOT_DATE from oncotriage.config -- see the comment there
@@ -449,12 +463,13 @@ def get_age_reference_date(snapshot_date=_SNAPSHOT_NOT_SUPPLIED) -> date:
     ``globals().get("DATA_SNAPSHOT_DATE", "")``, which only worked because
     every project file shared one exec namespace.
 
-    Args:
-        snapshot_date: Override. Omitted means read ``config.DATA_SNAPSHOT_DATE``
-            at call time (not bound at import, so patching the module attribute
-            takes effect). The shim in '02- Utility Functions.py' passes the
-            shared exec namespace's value so File 38's negative cases still
-            reach this function.
+    Takes no arguments. THE SUPPORTED PATCH POINT IS
+    ``oncotriage.config.DATA_SNAPSHOT_DATE``, which this function reads at CALL
+    time rather than binding at import, so setting the module attribute takes
+    effect -- that is what ``tests/test_fhir_birth_date_and_demographics.py``
+    section 3 does to drive the four values below. A ``snapshot_date`` parameter
+    stood here until pass 20f-3 and its docstring called ITSELF the supported
+    patch point; no caller had passed it since pass 20d-1.
 
     Raises ValueError when the constant is missing or is not a full date.
     Falling back to today() here would restore the exact defect the constant
@@ -462,10 +477,7 @@ def get_age_reference_date(snapshot_date=_SNAPSHOT_NOT_SUPPLIED) -> date:
     configuration error, not a runtime condition to recover from.
     """
 
-    if snapshot_date is _SNAPSHOT_NOT_SUPPLIED:
-        raw = getattr(config, "DATA_SNAPSHOT_DATE", "")
-    else:
-        raw = snapshot_date
+    raw = getattr(config, "DATA_SNAPSHOT_DATE", "")
 
     reference, precision = parse_partial_date(raw)
 

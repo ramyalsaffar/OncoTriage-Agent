@@ -29,7 +29,7 @@ Six containers, all healthy, from a checkout of `03- Code` alone:
 
 And these facts, each verified rather than assumed:
 
-* **All fourteen `oncotriage/paths.py:_DOCKER_PATHS` names resolve to a path
+* **All thirteen `oncotriage/paths.py:_DOCKER_PATHS` names resolve to a path
   that exists and is writable.** `docker/prepare_paths.py` creates them from
   that table on every start and prints one line per path.
 * **`import oncotriage` works with `PYTHONPATH` unset** — the image does
@@ -47,13 +47,16 @@ And these facts, each verified rather than assumed:
   `trial_criteria` alias.
 * **A second `up` is a no-op**, and a container *restart* re-runs both
   idempotent steps and says so: `prepare-paths` reports `exists` for all
-  fourteen, `generate-dag` reports `current` with the sha256 unchanged.
+  thirteen, `generate-dag` reports `current` with the sha256 unchanged.
+  (It was fourteen until pass 20f-3 deleted the never-read `requirements_path`
+  from both path tables, and the `requirements/` directory with it.)
 
 ---
 
 ## 2. What it does NOT give you
 
-Four things, and they are not the same kind of missing.
+Five things, and they are not the same kind of missing. (Four until pass 20f-3
+added 2e, which is a consequence of that pass rather than of a bring-up.)
 
 ### 2a. The MeSH lookup JSONs — this is the one that stops `POST /match`
 
@@ -137,6 +140,48 @@ container's volume is in after `down -v`.
 So the Streamlit dashboard comes up healthy and shows nothing. That is correct
 for a fresh stack and is called out only because "healthy but blank" reads like
 a fault.
+
+### 2e. The Airflow admin password is new, and nothing prints it (pass 20f-3)
+
+`docker compose down -v` destroys `airflow-db`, so the next bring-up generates a
+**new random** admin password. It lands in Airflow's own home:
+
+```
+{AIRFLOW_HOME}/simple_auth_manager_passwords.json.generated
+```
+
+which in the container is `/app/airflow_home/`.
+
+**Nothing in this project prints it any more.** `start_airflow()` used to echo
+it to the terminal; pass 20f-3 stopped, because the four-tier password route
+means `status` and `trigger` read that file themselves and no human ever needed
+to see the value. The only consumer who does is somebody logging into the web UI
+by hand, and this is where they read it:
+
+```bash
+docker exec Clinical-Trial-Patient-Match-airflow-webserver \
+  cat /app/airflow_home/simple_auth_manager_passwords.json.generated
+```
+
+**It is not in `api_server.log`** — checked rather than assumed, on a 12 KB log
+from a real `airflow api-server` run: zero occurrences of "password". That file
+is the server subprocess's own stdout, and Airflow 3.1.7 does not write the
+credential into it.
+
+**Scope of the measurement, stated:** that log was the **host's**, and pass 20f-3
+did **not** rebuild or bring up the stack. The container path
+`/app/airflow_home/` is derived from `oncotriage/paths.py`'s Docker branch and
+`AIRFLOW_HOME`, both of which item 21 verified and neither of which this pass
+changed; the `docker exec` line above is therefore a written-down step, not a
+re-run one. Everything else in this document is item 21's and pass 20g's
+measurement, unchanged.
+
+To choose the password instead of reading one, set
+`ONCOTRIAGE_AIRFLOW_PASSWORD` in the service's environment, or pipe it in:
+
+```bash
+printf '%s\n' "$PW" | python "24- Airflow Manager.py" status --password-stdin
+```
 
 ---
 

@@ -180,9 +180,16 @@ else:
     # once" and "every path resolved", both of which an EMPTY observation list
     # satisfies for free -- and an empty list is exactly what a spy installed
     # after the cache was warm would produce.
+    # THIRTEEN, not fourteen, since pass 20f-3 deleted `requirements_path` from
+    # both path tables -- a variable no code had ever read, whose directory held
+    # only a README after pass 20f-2 merged the dependency list into
+    # pyproject.toml. The number is the count of LOCAL RESOLVERS, so it moves
+    # with the table by construction; what it is guarding is that the spy saw
+    # every one of them, and a spy installed after the cache was warm would see
+    # none.
     check("the spy observed one _glob_one call per local path resolver "
           "(non-degeneracy)",
-          len(_observed), 14)
+          len(_observed), 13)
 
     _ambiguous = [f"{_label}: {_n} matches for {_pattern}"
                   for _label, _pattern, _n in _observed if _n != 1]

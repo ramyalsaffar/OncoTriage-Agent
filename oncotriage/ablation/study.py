@@ -19,7 +19,9 @@ WHAT CHANGED, and why each one had to
 
 2. ``_ablation_checkpoint_path()`` read a bare ``checkpoint_path``; it reads
    ``paths.checkpoint_path`` inside the function body now. Same value, resolved
-   on the call rather than out of a namespace this module does not have.
+   on the call rather than out of a namespace this module does not have. (Pass
+   20f-3 gave it a ``db_path`` argument as well -- with ``None`` it is still
+   that same value.)
 
 3. ``_CANCER_REGISTRY`` was read out of the shared exec namespace, where File
    13's shim binds it as ``deps.get_cancer_registry()``. Both sites call that
@@ -71,12 +73,22 @@ nothing changed was the wrong place for either.
     somewhere else must not leave a production artifact behind describing a
     scratch database; with ``None`` it resolves exactly where it always did.
 
-    ``tests/test_ablation_db_isolation.py`` is the demonstration. What it can
-    NOT do is redirect the CHECKPOINT: ``_ablation_checkpoint_path()`` still
-    resolves ``paths.checkpoint_path``, so an isolated run would still share
-    the production resume file. Recorded as a follow-up rather than fixed here
-    -- the checkpoint is keyed by (config, patient) and carries no path, so
-    redirecting it is a separate decision about what "resume" means.
+    ``tests/test_ablation_db_isolation.py`` is the demonstration.
+
+    TWO THINGS PASS 20f-1 LEFT AND PASS 20f-3 CLOSED, and both were named there:
+
+      * THE CHECKPOINT DID NOT FOLLOW ``--db``. An isolated run read the
+        PRODUCTION resume file, skipped every pair a production run had already
+        done, wrote nothing for them into the scratch database, and reported
+        COMPLETE. ``_ablation_checkpoint_path(db_path)`` puts the checkpoint
+        beside the database now; the decision it needed -- what "resume" means
+        across two databases -- is argued at that function.
+      * AN ABSENT PARENT DIRECTORY gave a bare
+        ``sqlite3.OperationalError: unable to open database file``, naming
+        neither the path nor the flag. ``_require_writable_parent()`` refuses it
+        by name, which is what ``settings.resolve_inferences_db()`` already did
+        for the other redirectable database.
+
     ``oncotriage/ablation/analysis.py`` reads the production database through
     its own accessor and is a READER, so it is outside this item.
 
@@ -164,6 +176,55 @@ ABLATION_DB_FILENAME = "ablation_results.db"
 ABLATION_SUMMARY_FILENAME = "ablation_summary.json"
 
 
+def _require_writable_parent(path: Path) -> Path:
+    """Refuse an explicit database path whose parent directory is missing.
+
+    TWO DATABASE WRITERS, ONE BEHAVIOUR (pass 20f-3). ``--db /nowhere/x.db``
+    used to reach ``sqlite3.connect`` and come back as
+
+        sqlite3.OperationalError: unable to open database file
+
+    which names nothing: not the path, not the flag, not the directory. It
+    surfaces at the first ``init_ablation_db()`` call, after the argument
+    parsing and the banner, so the operator sees a study that started and then
+    died on a message about "database file".
+
+    ``settings.resolve_inferences_db()`` had already settled the shape for the
+    OTHER redirectable database, and its argument transfers unchanged: a
+    database FILE that does not exist is the normal case -- sqlite creates it --
+    but a missing PARENT is a configuration defect, and the check is worth
+    making eagerly and loudly. There the risk was a swallowed
+    ``OperationalError`` reported as one non-critical logging failure per
+    patient; here nothing swallows it, and the cost is a bare exception instead
+    of an instruction. Both are the same defect and both now name the directory.
+
+    NOT APPLIED TO THE DEFAULT, deliberately. ``db_path=None`` resolves
+    ``paths.result_ablation_path``, which ``_glob_one`` has already proved
+    exists -- it raises naming the pattern when nothing matches. Checking it
+    again here would only be able to fail on a directory deleted between the
+    glob and the connect.
+
+    ``~`` is expanded, for the reason ``resolve_inferences_db`` expands it:
+    ``--db ~/scratch.db`` is a plausible thing to type, and a shell that does
+    not expand it (it will not, after ``=``, in some shells and in most
+    programmatic invocations) leaves a path inside a directory literally named
+    "~".
+    """
+    expanded = Path(os.path.expanduser(str(path)))
+    parent = expanded.expanduser().resolve().parent
+    if not parent.is_dir():
+        raise RuntimeError(
+            f"--db points into a directory that does not exist: {str(parent)!r} "
+            f"(from {str(path)!r})\n"
+            f"Create the directory, or give --db a path whose parent exists, "
+            f"e.g.\n"
+            f"    python \"26- Ablation Study.py\" --db /tmp/ablation/results.db\n"
+            f"Without this check sqlite3 raises 'unable to open database file', "
+            f"which names neither the path nor the flag."
+        )
+    return expanded
+
+
 def ablation_db(db_path=None) -> Path:
     """The study's SQLite database.
 
@@ -189,9 +250,13 @@ def ablation_db(db_path=None) -> Path:
     Returns:
         pathlib.Path. Added by pass 20f-1; see the module docstring for why
         this was the last database writer in the project with no override.
+
+    Raises:
+        RuntimeError: an explicit ``db_path`` whose PARENT DIRECTORY does not
+            exist (pass 20f-3). See ``_require_writable_parent`` below.
     """
     if db_path is not None:
-        return Path(db_path)
+        return _require_writable_parent(Path(db_path))
 
     with _RESOLVE_LOCK:
         if "ablation_db" not in _RESOLVED:
@@ -208,7 +273,7 @@ def ablation_summary_json(db_path=None) -> Path:
     With ``None`` it resolves exactly where it always did.
     """
     if db_path is not None:
-        return Path(db_path).parent / ABLATION_SUMMARY_FILENAME
+        return _require_writable_parent(Path(db_path)).parent / ABLATION_SUMMARY_FILENAME
 
     with _RESOLVE_LOCK:
         if "ablation_summary_json" not in _RESOLVED:
@@ -275,13 +340,56 @@ ABLATION_CHECKPOINT_FILENAME = "ablation_checkpoint.json"
 CHECKPOINT_WRITE_FAILURES = Counter()
 
 
-def _ablation_checkpoint_path() -> Path:
+def _ablation_checkpoint_path(db_path=None) -> Path:
+    """Where the resume state for `db_path` lives.
+
+    THE CHECKPOINT FOLLOWS THE DATABASE (pass 20f-3), on exactly the argument
+    ``ablation_summary_json()`` already made: an artifact that describes one
+    database must not be shared with another.
+
+    WHAT WENT WRONG WITHOUT IT. The checkpoint is a set of
+    ``(config_name, patient_id)`` pairs, and the ONLY thing it can mean is
+    "already written". Pass 20f-1 gave the database a ``--db`` override and left
+    this function taking no argument, so an isolated run read the PRODUCTION
+    resume file: every pair a production run had completed was skipped, nothing
+    was written for it into the scratch database, and the run printed
+    ``Status: COMPLETE``. A scratch database silently missing up to 525 rows,
+    reported as a finished study -- and the ablation ANALYSIS averages per
+    config, so a config that lost rows comes back with a plausible number
+    computed over a different sample than its neighbours.
+
+    Pass 20f-1 recorded this as a follow-up and named the decision it needed:
+    "the checkpoint is keyed by (config, patient) and carries no path, so
+    redirecting it is a separate decision about what RESUME means". THE ANSWER
+    IS THAT RESUME IS PER DATABASE, because "already written" is a statement
+    about a database and about nothing else. Two consequences, both intended:
+
+      * ``--db scratch.db`` twice in a row resumes the second run from the
+        first -- the property that makes an interrupted study cheap, now
+        available to an isolated one;
+      * a production run and a scratch run do not see each other at all, in
+        either direction. The production checkpoint is not read by a ``--db``
+        run and is not written by one, so an isolated run can no longer
+        CLEAR it either (``clear_ablation_checkpoint()`` runs on a clean
+        finish, and before this pass an isolated run's finish deleted the
+        production resume state).
+
+    Args:
+        db_path: ``None`` -- the default and what every documented command
+            produces -- means ``{checkpoint_path}/ablation_checkpoint.json``,
+            exactly where it has always been. An explicit path puts the
+            checkpoint BESIDE that database, named after it, so two scratch
+            databases in one directory do not share resume state either.
+    """
+    if db_path is not None:
+        db = _require_writable_parent(Path(db_path))
+        return db.parent / (db.stem + "_checkpoint.json")
     return Path(paths.checkpoint_path) / ABLATION_CHECKPOINT_FILENAME
 
 
-def load_ablation_checkpoint() -> set:
-    """Load set of completed (config_name, patient_id) tuples."""
-    cp = _ablation_checkpoint_path()
+def load_ablation_checkpoint(db_path=None) -> set:
+    """Load set of completed (config_name, patient_id) tuples for `db_path`."""
+    cp = _ablation_checkpoint_path(db_path)
     if not cp.exists():
         return set()
     try:
@@ -295,10 +403,10 @@ def load_ablation_checkpoint() -> set:
         return set()
 
 
-def save_ablation_checkpoint(completed: set) -> None:
-    """Atomically persist completed set to checkpoint file."""
+def save_ablation_checkpoint(completed: set, db_path=None) -> None:
+    """Atomically persist completed set to `db_path`'s checkpoint file."""
     with _ablation_checkpoint_lock:
-        cp = _ablation_checkpoint_path()
+        cp = _ablation_checkpoint_path(db_path)
         tmp_path = cp.with_suffix(".tmp")
         try:
             with open(tmp_path, "w") as f:
@@ -335,9 +443,9 @@ def save_ablation_checkpoint(completed: set) -> None:
                           f"overwritten by the next successful write.")
                 
 
-def clear_ablation_checkpoint() -> None:
-    """Delete checkpoint file to start a fresh run."""
-    cp = _ablation_checkpoint_path()
+def clear_ablation_checkpoint(db_path=None) -> None:
+    """Delete `db_path`'s checkpoint file to start a fresh run."""
+    cp = _ablation_checkpoint_path(db_path)
     if cp.exists():
         cp.unlink()
         print("[Checkpoint] Cleared.")
@@ -1215,6 +1323,10 @@ def main():
     if db_path is not None:
         print(f"  --db in effect: {ablation_db(db_path)}")
         print(f"  Summary will go beside it: {ablation_summary_json(db_path)}")
+        # Named as loudly as the database, because pass 20f-3 changed WHICH
+        # file this is and an operator resuming an isolated study needs to see
+        # that it is not the production one.
+        print(f"  Checkpoint (resume state): {_ablation_checkpoint_path(db_path)}")
         print()
 
     # --- Summary-only mode ---
@@ -1266,7 +1378,7 @@ def main():
         sample = stratified_sample(all_patients, args.sample_size, ABLATION_SEED)
 
         # --- Step 3: Resume support ---
-        completed = load_ablation_checkpoint()
+        completed = load_ablation_checkpoint(db_path=db_path)
 
         # --- Step 4: Run each config ---
         total_configs = len(configs)
@@ -1414,7 +1526,7 @@ def main():
                         run_success += 1
 
                     completed.add((_config_name, pid))
-                    save_ablation_checkpoint(completed)
+                    save_ablation_checkpoint(completed, db_path=db_path)
 
                     progress.set_postfix(ok=run_success, err=run_error)
                     progress.update(1)
@@ -1477,7 +1589,7 @@ def main():
             print(f"  Status:          INTERRUPTED (resume with same command)")
         else:
             generate_summary(db_path=db_path)
-            clear_ablation_checkpoint()
+            clear_ablation_checkpoint(db_path=db_path)
             print(f"  Summary:         {ablation_summary_json(db_path)}")
             print(f"  Status:          COMPLETE")
 

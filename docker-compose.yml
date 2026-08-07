@@ -127,7 +127,8 @@ x-app-volumes: &app-volumes
   # Three further things `.:/app` cost, each independently sufficient:
   #
   #   * it hid everything the image builds into /app — the entrypoint, the
-  #     helper scripts, `/app/requirements/` — which is why those had to be
+  #     helper scripts (and `/app/requirements/`, which pass 20f-3 deleted along
+#     with `paths.requirements_path`) — which is why those had to be
   #     copied to /usr/local/ to be reachable at all;
   #   * it makes the running code the developer's working tree rather than the
   #     built image, so the artefact is not what was tested;

@@ -108,6 +108,39 @@ cancer_code_registry.py or config.py mid-run is silently reverted when they
 finish. That is not hypothetical: pass 20d-1 lost an edit to oncotriage/config.py
 exactly this way and found it only by re-grepping afterwards.
 
+AND TWO OF THESE RUNS AT ONCE IS THE SAME DEFECT WITH NO HUMAN IN IT (pass 20f-3)
+---------------------------------------------------------------------------------
+Until pass 20f-3 this file had 239 lines, no lock and no pid file. Its entire
+reason for existing is that two members rewrite source IN PLACE and restore it
+from a backup taken at their own start -- and NOTHING STOPPED TWO COPIES OF IT
+FROM RUNNING AT ONCE. Interleave two runs of
+test_registries_cancer_code_claims_audit_control.py and the second one's backup
+is a copy of the first one's PLANTED tree; whichever finishes last restores
+that, and cancer_code_registry.py is left holding a deliberate defect with both
+runs reporting 16/16 passed and exit 0. The paragraph above is the mechanism;
+the only difference is that here there is no operator to have ignored a warning.
+
+Two terminals is the obvious way in, and it is not the likely one. A CI job that
+runs `make serial-tests` on push, a `watch`, a re-run started because the first
+looked stuck, a second checkout of the same working tree -- none of those
+involves anybody deciding to overlap.
+
+SO THE GUARD IS STRUCTURAL AND NOT A CHECK. `flock(LOCK_EX | LOCK_NB)` on a file
+outside the repository, held for the whole run, released by the KERNEL when this
+process exits -- including on SIGKILL, a panic, or a laptop lid. That property is
+what rules out the alternative shape: a pid file written and deleted by this
+program leaves a stale lock behind every time it dies badly, and the "is that pid
+still alive" repair re-introduces a check-then-act race of its own.
+
+    The lock file is in the system temp directory, named after a hash of the
+    CODE DIRECTORY, so two different checkouts do not block each other -- they
+    rewrite different files -- and two runs against the same tree do. It carries
+    the holder's pid, host, user and start time so the refusal names something
+    an operator can act on. It is never removed: an empty lock file is 0 bytes
+    and removing it is what would open the race.
+
+    `--list` runs nothing and takes no lock.
+
 EVERY EXIT CODE IS REPORTED, and the run does not stop at the first failure --
 each of the five leaves its own tree in the state it found it, so a failure in
 one does not make the next meaningless. The process exits non-zero if any of
@@ -122,13 +155,29 @@ Exit codes:
     0 -- every test exited 0
     1 -- at least one test exited non-zero
     2 -- a test file is missing
+    3 -- another run of this file already holds the lock  (pass 20f-3)
 """
 
 import argparse
+import contextlib
+import getpass
+import hashlib
+import json
 import os
+import socket
 import subprocess
 import sys
+import tempfile
 import time
+
+# fcntl IS REQUIRED, AND ITS ABSENCE IS A REFUSAL RATHER THAN A DEGRADATION.
+# It is POSIX-only, so this fails on Windows -- where every documented command in
+# this project already fails, since the numbered filenames contain spaces and
+# `make` is assumed. Running the suite UNLOCKED because the locking primitive
+# was missing would be precisely the failure the lock exists to prevent, and it
+# would be silent. Import it at module scope so the failure is at load, not
+# three tests into a run.
+import fcntl
 
 
 # PASS 20d-2: this file lives in tests/ and the tests it runs are named relative
@@ -158,6 +207,81 @@ SERIAL_TESTS = (
 )
 
 
+# ===========================================================================
+# THE RUN LOCK  (pass 20f-3)
+# ===========================================================================
+
+EXIT_LOCKED = 3
+
+
+def lock_path(code_dir=_CODE_DIR):
+    """Where the run lock for `code_dir` lives.
+
+    Outside the repository -- a test suite that writes a file into the tree it
+    is about to hash is the defect this file is for -- and keyed on the code
+    directory rather than fixed, so two checkouts are independent and two runs
+    against one checkout are not. The hash is truncated for a readable name; a
+    collision between two directories on one machine costs a spurious refusal
+    with the holder's own path printed, not a corrupted tree.
+    """
+    digest = hashlib.sha256(os.path.abspath(code_dir).encode("utf-8")).hexdigest()
+    return os.path.join(tempfile.gettempdir(),
+                        f"oncotriage-serial-tests-{digest[:16]}.lock")
+
+
+class AlreadyRunning(RuntimeError):
+    """Raised when another process holds the run lock. Carries its record."""
+
+    def __init__(self, path, holder):
+        self.path = path
+        self.holder = holder
+        super().__init__(f"{path} is held by {holder}")
+
+
+@contextlib.contextmanager
+def exclusive_run_lock(path=None):
+    """Hold an exclusive, non-blocking flock for the duration of the block.
+
+    Yields the lock file's path. Raises AlreadyRunning immediately -- never
+    waits -- if another process holds it, because a second run that queued
+    behind the first would still run, just later, and an operator who started
+    it by accident would rather be told.
+
+    THE LOCK IS RELEASED BY THE KERNEL when this process exits, however it
+    exits. Nothing in here deletes the file, and that is deliberate: the lock is
+    the flock on the inode, not the file's existence, so removing it on the way
+    out would let a second process create a NEW inode and lock that instead
+    while a third still held the old one.
+    """
+    path = path or lock_path()
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.lseek(fd, 0, os.SEEK_SET)
+            raw = os.read(fd, 4096).decode("utf-8", "replace").strip()
+            try:
+                holder = json.loads(raw) if raw else {}
+            except ValueError:
+                holder = {"record": raw}
+            raise AlreadyRunning(path, holder) from None
+        # Only now, holding the lock, is it safe to overwrite the record.
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, json.dumps({
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "user": getpass.getuser(),
+            "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "code_dir": _CODE_DIR,
+        }).encode("utf-8"))
+        os.fsync(fd)
+        yield path
+    finally:
+        os.close(fd)          # releases the flock
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Run the source-mutating tests serially, in order.")
@@ -179,6 +303,32 @@ def main(argv=None):
             print(f"  - {name}")
         return 2
 
+    # THE LOCK IS TAKEN BEFORE THE FIRST TEST AND HELD PAST THE LAST. It wraps
+    # the whole run rather than each subprocess, because the hazard is not two
+    # tests overlapping -- it is one run's RESTORE landing inside another run's
+    # backup window, which spans the gaps between tests too.
+    try:
+        with exclusive_run_lock():
+            return _run_all()
+    except AlreadyRunning as exc:
+        print("[Serial] REFUSING TO RUN: another serial run holds the lock.")
+        print(f"         lock file: {exc.path}")
+        for key in ("pid", "host", "user", "started", "code_dir", "record"):
+            if key in exc.holder:
+                print(f"         {key:9s} {exc.holder[key]}")
+        print()
+        print("         Two of these tests rewrite files in "
+              "oncotriage/ and restore them")
+        print("         from a backup taken at their own start. Overlap them "
+              "and the later")
+        print("         restore writes back the earlier run's PLANTED tree, "
+              "with both runs")
+        print("         reporting success. Wait for the other run, or kill it.")
+        return EXIT_LOCKED
+
+
+def _run_all():
+    """The run itself. Called with the lock held; see main()."""
     print("=" * 78)
     print(f"SERIAL TEST RUN — {len(SERIAL_TESTS)} tests, one at a time")
     print("=" * 78)

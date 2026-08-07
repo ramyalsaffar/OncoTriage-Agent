@@ -52,7 +52,9 @@ Run from terminal:
 NO RE-EXPORT SHIM. Nothing in the repository reads this file's namespace:
 every top-level name it bound -- the three loaders, ``render_sidebar``, the
 nine ``render_*_tab`` functions, ``MATCH_TIERS``, ``MATCH_TIER_COLORS``, the
-four ``TRIAL_STATUS_*`` labels, ``classify_trial_score``,
+four ``TRIAL_STATUS_*`` labels (three of them as of pass 20f-3, which deleted
+the never-read fourth and gave its string a home in the per-PATIENT
+vocabulary), ``classify_trial_score``,
 ``enrich_match_tiers`` and ``main`` -- was grepped against every .py, .md,
 .toml and .yml in the tree, and every hit is inside this file itself, prose in
 CLAUDE.md / "Exception and Fallback Audit.md", or the ``streamlit run`` command

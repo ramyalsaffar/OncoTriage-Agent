@@ -1406,6 +1406,34 @@ def verify_recording_complete(fixture: Dict, sink: RecordingSink) -> None:
             )
 
     # --- Stage 5: one exchange, unless the run never reached it ------------
+    #
+    # THE ERROR-HANDLER CASE IS NAMED (pass 20f-3), and it is the reason
+    # TERMINAL_ERROR exists as a constant at all. Before this pass the three
+    # terminal nodes were a closed vocabulary of which only two were read here,
+    # and a run that ended at node_error_handler fell into one of two shapes:
+    #
+    #   n_chat == 0  -- refused by the `elif` below, with the message "no Stage 5
+    #                   request/response pair was recorded". True, and the least
+    #                   useful true thing available: the fixture is unusable
+    #                   because the RUN FAILED, not because a recording hook
+    #                   missed an exchange, and those two have completely
+    #                   different fixes.
+    #   n_chat >= 1  -- an exception thrown AFTER Stage 5 answered. Nothing here
+    #                   said a word, and the fixture was written. A replay would
+    #                   then diff against a prefix stamped by the error handler,
+    #                   whose funnel counters and verdict lists are the
+    #                   handler's own placeholders rather than the pipeline's
+    #                   output.
+    #
+    # THAT SECOND SHAPE IS AN OUTCOME CHANGE AND IS STATED AS ONE: a fixture
+    # that used to be written is now refused. It is the right way round --
+    # capture_fixture() exists to record a run a replay can be diffed against,
+    # and a run the pipeline itself declared failed is not one -- and it is
+    # unreachable by the twelve shipped fixtures, every one of which ends at
+    # node_finalize or node_no_candidates (verify_case_coverage() asserts the
+    # first for every `normal` label and the second for CASE_NO_CANDIDATES).
+    # Nothing on disk changes, which is why the byte-identity proof for this
+    # pass is about the WRITER and not about this branch.
     n_chat = len(sink.chat_completions)
     if terminal == TERMINAL_NO_CANDIDATES:
         if n_chat:
@@ -1413,6 +1441,13 @@ def verify_recording_complete(fixture: Dict, sink: RecordingSink) -> None:
                 f"run ended at node_no_candidates but {n_chat} Stage 5 call(s) "
                 f"were made"
             )
+    elif terminal == TERMINAL_ERROR:
+        problems.append(
+            f"the run ended at {TERMINAL_ERROR}: the pipeline raised and the "
+            f"error handler produced the result, so this fixture records a "
+            f"FAILURE rather than a baseline ({n_chat} Stage 5 call(s) were "
+            f"recorded before it). Fix the run, then capture again."
+        )
     elif n_chat < 1:
         problems.append("no Stage 5 request/response pair was recorded")
 

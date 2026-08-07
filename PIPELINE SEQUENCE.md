@@ -69,7 +69,7 @@ is `python "<filename>"` from `03- Code/`. `—` means the number is now a gap.
 | 21 | `21- Streamlit Dashboard.py` | `streamlit run` | Nine tabs over `inferences.db`. | `oncotriage/dashboard/` — fifteen modules |
 | 22 | `22- Airflow Database.py` | x | `airflow db migrate` + check; rewrites `airflow.cfg`. | `oncotriage/orchestration/airflow_setup.py` |
 | 23 | `23- Airflow DAG.py` | x | Generates `trial_refresh_weekly` into `{airflow_path}/dags/`. **The DAG is built as a string**, so DAG logic edits go in the generator. | `oncotriage/orchestration/dag_generator.py` |
-| 24 | `24- Airflow Manager.py` | x | Start / stop / status / trigger via the REST API v2, and the four-tier password route. | `oncotriage/orchestration/airflow_manager.py` |
+| 24 | `24- Airflow Manager.py` | x | Start / stop / status / trigger via the REST API v2, and the four-tier password route. **argparse CLI since pass 20f-3** (`start\|stop\|status\|trigger`; a bare invocation prints usage and exits 2). | `oncotriage/orchestration/airflow_manager.py` |
 | 25 | `25- Batch Runner.py` | x | Full-corpus run with no HTTP: checkpointed, two thread pools, summary. | `oncotriage/batch/runner.py` |
 | 26 | `26- Ablation Study.py` | x | Seven configs over a stratified sample, into `ablation_results.db`. | `oncotriage/ablation/study.py` |
 | 27 | `27- Ablation Analysis.py` | x | Comparison table, BH-FDR Wilcoxon family, MDE, nine figures. **Reads** the database, never writes it. | `oncotriage/ablation/analysis.py` |

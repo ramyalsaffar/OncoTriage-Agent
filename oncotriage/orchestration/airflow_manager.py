@@ -57,12 +57,23 @@ password and nobody wants to. Tiers 1-3 exist so that an operator who DOES have
 a chosen password has a route that works and is named in the printed message.
 
 ``password_source()`` reports which tier answered, without returning the secret.
-Every print in this module names the SOURCE and never the value -- with one
-pre-existing exception, kept deliberately: ``start_airflow()`` prints the
-generated password it just read out of the file, exactly as File 24 did. That is
-a local development tool printing a locally-generated credential to the terminal
-of the person who generated it, and changing it is a behaviour change this
-relocation pass has no business making. It is recorded as a follow-up.
+EVERY PRINT IN THIS MODULE NAMES THE SOURCE AND NEVER THE VALUE, with no
+exception as of pass 20f-3. ``start_airflow()`` used to print the generated
+password it had just read out of the file -- pass 3c-2's one deliberate
+exception, kept on the argument that a local development tool may print a
+locally-generated credential to the terminal of the person who generated it, and
+recorded as a follow-up. What closed the follow-up is that the four-tier route
+made the print POINTLESS as well as leaky: tier 4 reads the same file, so
+``check_dag_status`` and ``trigger_dag`` never needed a human to have seen it.
+The only consumer who does is somebody logging into the web UI, and they are now
+given the file's PATH. See the comment at the call site for the rest.
+
+MEASURED, because pass 20f-3's brief said the password also reached
+``api_server.log`` and it does not: that file is the SUBPROCESS's stdout
+(``stdout=open(api_log_path, 'w')`` on the ``airflow api-server`` Popen), while
+these prints go to the manager's own stdout. A 12 KB ``api_server.log`` from a
+real run on the development machine contains zero occurrences of "password".
+The leak was the terminal, and only the terminal.
 
 WHAT IMPORTING THIS MODULE DOES
 -------------------------------
@@ -187,20 +198,50 @@ def start_airflow(airflow_home=None):
                 print(f"  UI: {AIRFLOW_URL}")
                 password_file = Path(airflow_path) / 'simple_auth_manager_passwords.json.generated'
                 if password_file.exists():
+                    # THE SECRET IS NOT PRINTED ANY MORE (pass 20f-3). This line
+                    # used to read the JSON and print `Password: <the actual
+                    # password>` to whatever terminal ran the manager -- into a
+                    # scrollback, a `tee`, a CI job log, a screen share, and any
+                    # `script`/`asciinema` recording. Item 20c-3c-2 kept it and
+                    # recorded it as a follow-up, on the argument that it is a
+                    # local development tool printing a locally-generated
+                    # credential to the person who generated it. That argument
+                    # was true and it stopped being the whole story once the
+                    # four-tier route existed: THE PASSWORD NO LONGER HAS TO BE
+                    # READ BY A HUMAN AT ALL for trigger/status to work, because
+                    # _get_password() reads this same file itself (tier 4). A
+                    # secret printed for no consumer is a secret leaked for no
+                    # reason.
+                    #
+                    # WHAT AN OPERATOR DOES INSTEAD, in the two cases:
+                    #   * status / trigger -- nothing. Tier 4 is automatic.
+                    #   * the WEB UI at {AIRFLOW_URL}, which does need a human to
+                    #     type it -- read the file named below. It is 0600 in
+                    #     Airflow's own home and it is where Airflow put it.
+                    #
+                    # The file is opened and the admin key is looked up, so
+                    # "the file exists" is not mistaken for "the file has your
+                    # password in it" -- but only the VERDICT is printed.
                     with open(password_file, 'r') as f:
                         passwords = json.load(f)
                     print(f"\n  Username: admin")
-                    print(f"  Password: {passwords.get('admin', 'check api_server.log')}")
+                    if passwords.get('admin'):
+                        print(f"  Password: not printed — read it from")
+                        print(f"            {password_file}")
+                    else:
+                        print(f"  Password: the generated file exists but holds no "
+                              f"'admin' entry:")
+                        print(f"            {password_file}")
                     # THE MESSAGE THIS REPLACED SAID "SET AIRFLOW_PASSWORD in
                     # this file", which stopped being reachable the moment these
                     # functions moved into a package module -- see the module
                     # docstring. It now names routes that exist.
-                    print(f"\n  ℹ️  The password above is read automatically; trigger/status")
-                    print(f"     functions need no further setup.")
+                    print(f"\n  ℹ️  trigger/status read that file themselves; they need")
+                    print(f"     no further setup.")
                     print(f"     To use a DIFFERENT password, pick one route:")
                     print(f"       export {path_settings.ENV_AIRFLOW_PASSWORD}='...'")
                     print(f"       oncotriage.orchestration.airflow_manager.set_airflow_password('...')")
-                    print(f"       check_dag_status(password='...') / trigger_dag(password='...')")
+                    print(f"       python \"24- Airflow Manager.py\" status --password-stdin")
                 break
         except requests.exceptions.ConnectionError:
             pass

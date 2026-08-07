@@ -10,6 +10,12 @@
 # from the code rather than declaring. Before pass 20c-3b that fact was a
 # warning paragraph in CLAUDE.md, which is followed by whoever read it and by
 # nobody else.
+#
+# TWO OF THESE AT ONCE IS THE SAME DEFECT WITH NO HUMAN IN IT, which is what a
+# Makefile target invites: `make serial-tests` on push, plus a developer running
+# it locally, is two runs interleaving two backup/restore windows. Pass 20f-3
+# gave the runner an flock, so the second one REFUSES with exit 3 and names the
+# holder instead of silently reverting the first one's planted tree.
 
 PYTHON ?= python
 

@@ -2724,20 +2724,57 @@ print("=" * 78)
 # A alone would prove nothing: a scan that reported nothing would also pass it.
 # C is what shows the corpus is the variable, and B is what shows the scan is
 # still capable of a finding.
+# AND THE SAME HOLE, ONE DIRECTORY OUT: `docker/` (pass 20f-3)
+# -------------------------------------------------------------
+# The corpus was _PKG_FILES + an os.listdir of the code directory + tests/. An
+# os.listdir does not descend, so `docker/prepare_paths.py` and
+# `docker/generate_dag.py` were outside it -- and BOTH IMPORT FROM THE PACKAGE.
+# prepare_paths.py:107 reads `paths._DOCKER_PATHS`, and it is that table's ONLY
+# reader anywhere outside oncotriage/paths.py itself.
+#
+# It is latent today rather than a live false positive, and the distinction is
+# the same one pass 20d-1 drew about tests/: paths.py reads its own constant
+# (`_RESOLVERS` is built from it, and the two-table guard compares it), so the
+# scan sees a read and reports nothing. The hole is what happens NEXT -- a
+# package constant added tomorrow whose only reader is in docker/ is reported as
+# dead, and the operator's fix is to delete a name the container needs.
+#
+# SHOWN TO BITE, out of band, with the touched file hashed before and after and
+# restored byte-identically:
+#
+#   A  PLANTED_ONLY_READ_BY_DOCKER in oncotriage/constants.py, read only from
+#      docker/prepare_paths.py, corpus as shipped -> NOT reported.  <- the
+#      capability this widening buys
+#   C  the same plant against a copy of this file with `+ _DOCKER_PY` stripped
+#      -> REPORTED.  <- the FALSE POSITIVE the widening removes
+#   B  planted with no reader anywhere -> REPORTED.  <- the scan still bites
+#
+# C is the row that matters: without it, A is also satisfied by a scan that had
+# stopped working.
+#
+# os.walk, not listdir, for the reason above -- twice over now.
 _TESTS_DIR = os.path.join(_code_dir, "tests")
+_DOCKER_DIR = os.path.join(_code_dir, "docker")
 
-_TEST_PY = sorted(
-    os.path.join(root, name)
-    for root, _dirs, files in os.walk(_TESTS_DIR)
-    for name in files
-    if name.endswith(".py") and "__pycache__" not in root
-)
+
+def _py_under(directory):
+    return sorted(
+        os.path.join(root, name)
+        for root, _dirs, files in os.walk(directory)
+        for name in files
+        if name.endswith(".py") and "__pycache__" not in root
+    )
+
+
+_TEST_PY = _py_under(_TESTS_DIR)
+_DOCKER_PY = _py_under(_DOCKER_DIR)
 
 _REPO_PY = sorted(
     _PKG_FILES
     + [os.path.join(_code_dir, n) for n in os.listdir(_code_dir)
        if n.endswith(".py")]
     + _TEST_PY
+    + _DOCKER_PY
 )
 
 # NON-DEGENERACY, AS A GUARD RATHER THAN A check(). The whole point of the
@@ -2760,6 +2797,20 @@ if not (len(_TEST_PY) >= 18
         f"{_TESTS_DIR}. Since pass 20d-2 that directory holds every test in the "
         f"project, and the two checks fed by _REPO_PY report FEWER unread names "
         f"when it is missing -- which looks exactly like a clean package."
+    )
+
+# The same guard for docker/, for the same reason and in the same shape. It
+# names prepare_paths.py explicitly because that file is the only reader of
+# oncotriage/paths.py:_DOCKER_PATHS outside paths.py itself: lose it from the
+# corpus and that table becomes a candidate finding the moment paths.py stops
+# reading its own constant.
+if not (len(_DOCKER_PY) >= 2
+        and any(f.endswith("prepare_paths.py") for f in _DOCKER_PY)):
+    raise AssertionError(
+        f"the read corpus lost docker/: found {len(_DOCKER_PY)} file(s) under "
+        f"{_DOCKER_DIR}. Both files there import from the package, and the two "
+        f"checks fed by _REPO_PY report FEWER unread names when it is missing "
+        f"-- which looks exactly like a clean package."
     )
 
 
@@ -2927,43 +2978,34 @@ _UNREAD_CONSTANT_EXEMPTIONS = {
     # facts, which CLAUDE.md requires be named constants rather than tunables.
     "oncotriage/fhir/generate.py": ["ECOG_LOINC_PANEL_CODE",
                                     "ECOG_LOINC_INTERPRETATION_CODE"],
-    # TRIAL_STATUS_FULL IS DEAD, AND IT WAS DEAD BEFORE THE SPLIT.
-    # "21- Streamlit Dashboard.py" bound it at its line 3853 and referenced it
-    # nowhere -- checked against `git show ae3f6c6^` -- while writing the same
-    # string as a literal in three places. The per-trial classifiers in
-    # patient_explorer and trial_explorer return '✅ Eligible' for the top
-    # bucket, so this constant names a value the per-trial vocabulary never
-    # produces: the PASSWORD_SOURCE_ARGUMENT shape exactly.
+    # THE SECOND ENTRY WAS `oncotriage/dashboard/tiers.py: TRIAL_STATUS_FULL`
+    # AND PASS 20f-3 DELETED THE CONSTANT. It was dead before the split --
+    # "21- Streamlit Dashboard.py" bound it at line 3853 and referenced it
+    # nowhere, checked against `git show ae3f6c6^` -- and it was also WRONG: the
+    # per-trial classifiers in patient_explorer and trial_explorer return
+    # '✅ Eligible' for their top bucket, so it named a value the per-trial
+    # vocabulary cannot produce. Its string belonged to the per-PATIENT
+    # vocabulary, which is where pass 20f-3 put it (PATIENT_OUTCOME_FULL and the
+    # three beside it, all read). See the argued change to the pinned File 21
+    # surface in section 6f -- deleting an entry from a pin is a check that
+    # stops running, and that one is argued where it happens rather than here.
+    # THE THIRD ENTRY WAS `oncotriage/fixtures/capture.py: TERMINAL_ERROR`, AND
+    # PASS 20f-3 MADE IT LOAD-BEARING RATHER THAN DELETING IT -- the one of the
+    # five follow-ups on this list that asked for the opposite of a deletion.
+    # It completes a closed three-member vocabulary; removing it would have left
+    # TERMINAL_FINALIZE and TERMINAL_NO_CANDIDATES named beside each other and
+    # told a reader those are the only two values result["terminal_node"] can
+    # carry, which is false.
     #
-    # It is EXEMPTED RATHER THAN DELETED because section 6 of this file pins
-    # every one of the 22 names File 21 bound and requires each to still be
-    # exported by the module that owns it. Removing the constant would fail that
-    # check correctly -- the pre-split surface really did include it -- so
-    # deleting it is a change to the pinned surface and belongs in a pass that
-    # says so. RECORDED AS A FOLLOW-UP: drop TRIAL_STATUS_FULL, drop its two
-    # entries from the File 21 surface lists below, and replace the three
-    # '✅ Full Match' literals with a per-patient constant that has a home.
-    "oncotriage/dashboard/tiers.py": ["TRIAL_STATUS_FULL"],
-    # TERMINAL_ERROR COMPLETES A CLOSED THREE-MEMBER VOCABULARY, and it was
-    # already unread before pass 20c-3d moved it here: `git grep TERMINAL_ERROR
-    # HEAD` over the whole repository returns exactly one line, its own
-    # assignment in what is now "fixture_capture.py". This scan covers the
-    # PACKAGE, so
-    # the move is what surfaced it rather than what created it.
-    #
-    # It is exempted rather than deleted, and rather than made load-bearing.
-    # Deleting it would leave TERMINAL_FINALIZE and TERMINAL_NO_CANDIDATES named
-    # beside each other and tell a reader that those are the only two values
-    # result["terminal_node"] can carry -- which is false: node_error_handler
-    # stamps this third one, and a fixture that recorded such a run is a real
-    # (if useless) artifact. Making it load-bearing means adding a branch to
-    # verify_recording_complete(), which already REFUSES that fixture through
-    # its "no Stage 5 request/response pair was recorded" arm; the new branch
-    # would improve the diagnosis and change no outcome, so it is a behaviour
-    # edit inside a conversion pass whose acceptance criterion is that nothing
-    # changed. RECORDED AS A FOLLOW-UP: name the error-handler case explicitly
-    # in verify_recording_complete() and drop this entry.
-    "oncotriage/fixtures/capture.py": ["TERMINAL_ERROR"],
+    # verify_recording_complete() now names the error-handler case explicitly,
+    # so the constant is read by the code it describes. Pass 20e predicted that
+    # branch "would improve the diagnosis and change no outcome"; the first half
+    # holds and THE SECOND HALF WAS WRONG, which is why it was worth doing in a
+    # pass that could say so. The old arm only refused an error run when NO
+    # Stage 5 exchange was recorded. An exception thrown after Stage 5 answered
+    # left n_chat >= 1, nothing complained, and the fixture was written -- with
+    # a prefix stamped by the error handler's placeholders. That fixture is
+    # refused now. See the branch itself for the argument.
 
     # ----------------------------------------------------------------------
     # SEVEN ENTRIES ADDED BY PASS 20e, AND NOT ONE OF THEM IS NEW CODE.
@@ -3025,16 +3067,15 @@ _UNREAD_CONSTANT_EXEMPTIONS = {
     #   what force the entry out with the constants: leaving it here would fail
     #   the second, which is exactly what a staleness guard is for.
     #
-    #   _PATIENT_STAGE_RE is a compiled regex with no reader at all --
-    #   _SNOMED_DISPLAY_STAGE_RE, defined immediately above it and differing
-    #   only by an optional "tnm " prefix, is the one extract_patient_stage()
-    #   uses. This is unambiguous dead code and the only reason it is exempted
-    #   rather than removed here is that pass 20e's acceptance criterion is
-    #   that no behaviour changed and no assertion moved except where a pinned
-    #   inventory forced it; deleting a regex from the stage extractor is
-    #   neither. RECORDED AS A FOLLOW-UP, and it is the one of the three that
-    #   should simply go.
-    "oncotriage/extraction/stage.py": ["_PATIENT_STAGE_RE"],
+    #   THE THIRD ENTRY WAS `oncotriage/extraction/stage.py: _PATIENT_STAGE_RE`
+    #   AND PASS 20f-3 DELETED THE REGEX, so the entry is gone rather than kept
+    #   -- the same shape BATCH_SIZE and EXPANSION_TEMPERATURE took above. Pass
+    #   20e called it "the one of the three that should simply go": a compiled
+    #   regex with no reader at all, differing from _SNOMED_DISPLAY_STAGE_RE
+    #   (immediately above it, and the one extract_patient_stage() actually
+    #   uses at both match sites) only by an optional "tnm " prefix that the
+    #   survivor's \b already admits. The two guards below are what force the
+    #   entry out with the constant, in both directions.
 }
 
 _reads, _string_blob = _all_reads(
@@ -3691,42 +3732,42 @@ for _path in _NUMBERED_FILES:
     if _unread:
         _REEXPORTERS[os.path.basename(_path)] = _unread
 
-# ONE ENTRY, WITH AN ARGUMENT, AND THE FILE ALREADY CARRIES IT.
-# "24- Airflow Manager.py" imports five names and calls one. The other four are
-# there because its `__main__` menu NAMES them in COMMENTED lines, and pass
-# 20c-3c-2 kept that menu byte-verbatim on purpose. Uncommenting a line is the
-# documented way to use the file, and an import that only appears once you
-# uncomment something is a NameError waiting for the operator who does -- the
-# file's own comment above the import block says exactly that.
+# THERE IS NO EXEMPTION TABLE HERE ANY MORE (pass 20f-3), AND THE TABLE IS
+# DELETED RATHER THAN EMPTIED.
 #
-# Two of the four (check_dag_status, set_airflow_password) are additionally
-# named in the module docstring, so the string-literal arm of the read scan
-# already counts them; the other two are named only in COMMENTS, which no AST
-# walk can see. That asymmetry is why this is an exemption rather than a
-# widening of the scan: counting comments as reads would let any dead import be
-# excused by mentioning it in a comment.
+# It held one entry: `{"24- Airflow Manager.py": ["stop_airflow", "trigger_dag"]}`.
+# That file imported five names and called one; the other four existed so that
+# uncommenting a line of its `__main__` MENU would not raise NameError. Two of
+# the four were additionally named in its module docstring, so the
+# string-literal arm of the read scan above already counted them -- the two
+# exempted were the two named ONLY in COMMENTS, which no AST walk can see. The
+# asymmetry was the argument for an exemption rather than a widening: counting
+# comments as reads would let any dead import be excused by mentioning it in a
+# comment, which is the opposite of what this check is for.
 #
-# RECORDED AS A FOLLOW-UP, and it is the same follow-up pass 20c-3c-2 already
-# recorded: replace the commented menu with a real argparse CLI, at which point
-# all five names are read by code and this entry goes.
-_REEXPORT_EXEMPTIONS = {"24- Airflow Manager.py": ["stop_airflow", "trigger_dag"]}
-
-_REEXPORT_FINDINGS = {
-    _name: _unread for _name, _unread in _REEXPORTERS.items()
-    if sorted(_unread) != sorted(_REEXPORT_EXEMPTIONS.get(_name, []))
-}
+# Pass 20f-3 replaced that menu with a real argparse CLI -- the follow-up pass
+# 20c-3c-2 recorded and this file's exemption comment repeated. All four
+# functions are now CALLED by `main()`, so all four are ordinary reads and the
+# finding is gone at its source.
+#
+# WHY THE DICT AND ITS STALENESS CHECK GO TOGETHER. The check was "...and the
+# one exemption is still needed", i.e. every key in the dict is still a file the
+# scan reports. With an empty dict that check iterates nothing and passes for
+# free -- a check that has stopped checking, which is the exact shape this
+# project treats as a defect (see the retirements pass 20e argued, and
+# `PASSWORD_SOURCE_ARGUMENT` before them). Keeping an empty dict would ALSO
+# invite the next re-export to be silenced by adding a line rather than by being
+# fixed. The scan itself is unchanged and is now unconditional: any numbered
+# file that imports a package name it never reads is reported, with no way to
+# opt out. THIS FILE'S CHECK COUNT DROPS BY ONE, and that is the whole of the
+# movement pass 20f-3 makes here.
+_REEXPORT_FINDINGS = dict(_REEXPORTERS)
 check("no numbered file imports a package name at module scope that it never "
-      "reads, i.e. none of them is a re-export shim", _REEXPORT_FINDINGS, {})
+      "reads, i.e. none of them is a re-export shim (no exemptions)",
+      _REEXPORT_FINDINGS, {})
 if _REEXPORT_FINDINGS:
     for _name, _unread in sorted(_REEXPORT_FINDINGS.items()):
         print(f"       {_name}: {_unread}")
-
-# THE EXEMPTION IS NOT A GET-OUT: it must still be describing something real.
-# An exemption for a file that has since been fixed is a line that suppresses
-# nothing and hides the fact that the list is stale.
-check("...and the one exemption is still needed",
-      sorted(_name for _name in _REEXPORT_EXEMPTIONS
-             if _name not in _REEXPORTERS), [])
 
 # NEGATIVE CONTROL. The detector must be shown to fire, or "no re-exporters"
 # is indistinguishable from a walk that found nothing to look at. A copy of a
@@ -4949,9 +4990,35 @@ check("...control: the shell-string form is still recognised (it is the form "
 # The three bootstrap leftovers -- _bootstrap, _code_dir, _fh -- are deliberately
 # absent: they were exec-chain scaffolding, they are private, and nothing read
 # them. Everything else must still be reachable.
+#
+# ONE NAME WAS REMOVED FROM THIS PIN (pass 20f-3), AND REMOVING A NAME FROM A
+# PIN IS A CHECK THAT STOPS RUNNING, so it is argued here rather than in a
+# commit message -- the same discipline pass 20e applied to the four inventories
+# it retired.
+#
+# The name is `TRIAL_STATUS_FULL`. What this pin asserts is "every name File 21
+# bound is still REACHABLE somewhere in the package", and its purpose is to
+# catch a name LOST in the twelve-way split -- a real hazard, because the split
+# was done by slicing definitions out of a 5,481-line file and a dropped slice
+# is invisible. It is not, and was never, an assertion that File 21's surface
+# may not shrink deliberately.
+#
+# So the question this pin can answer about TRIAL_STATUS_FULL is "did the split
+# lose it", and the answer is on record: it did not, it was carried into
+# oncotriage/dashboard/tiers.py, and it sat there for two passes with check 2h
+# reporting it as never-read and an exemption arguing why it was kept. Pass
+# 20f-3 deleted it on the merits (see that exemption's replacement text above),
+# so this pin's subject is gone. Keeping the entry would fail the probe below
+# CORRECTLY -- the name really is not exported any more -- and the failure would
+# say "the split lost a name", which is false.
+#
+# THE PIN IS 21 NAMES NOW, NOT 22, and the two counts below move with it. The
+# other 21 are untouched, which is the property that keeps this check able to
+# fail: it is still the whole of File 21's surface minus one name whose deletion
+# is written down in three places.
 _PRE_3C_F21_NAMES = [
     "MATCH_TIERS", "MATCH_TIER_COLORS",
-    "TRIAL_STATUS_FULL", "TRIAL_STATUS_PARTIAL", "TRIAL_STATUS_REJECTED",
+    "TRIAL_STATUS_PARTIAL", "TRIAL_STATUS_REJECTED",
     "TRIAL_STATUS_UNCONFIRMED",
     "classify_trial_score", "enrich_match_tiers",
     "load_drift_metrics_data", "load_inferences_data", "load_trial_matches_data",
@@ -4962,8 +5029,9 @@ _PRE_3C_F21_NAMES = [
     "render_performance_tab", "render_reproducibility_tab",
     "render_sidebar", "render_trial_explorer_tab",
 ]
-check("the recorded File 21 name list is the size it was extracted at",
-      len(_PRE_3C_F21_NAMES), 22)
+check("the recorded File 21 name list is the size it was extracted at, "
+      "less the one name pass 20f-3 deleted with an argument",
+      len(_PRE_3C_F21_NAMES), 21)
 
 _F21_SURFACE_PROBE = r"""
 import importlib, json, sys
@@ -4978,7 +5046,6 @@ print(json.dumps({"missing": missing, "checked": len(wanted)}))
 _F21_HOMES = {
     "MATCH_TIERS": "oncotriage.dashboard.tiers",
     "MATCH_TIER_COLORS": "oncotriage.dashboard.tiers",
-    "TRIAL_STATUS_FULL": "oncotriage.dashboard.tiers",
     "TRIAL_STATUS_PARTIAL": "oncotriage.dashboard.tiers",
     "TRIAL_STATUS_REJECTED": "oncotriage.dashboard.tiers",
     "TRIAL_STATUS_UNCONFIRMED": "oncotriage.dashboard.tiers",
@@ -5010,8 +5077,8 @@ if _rc == 0:
     _payload = _last_json(_out) or {}
     check("every name File 21 bound before this pass is still exported by the "
           "module that now owns it", _payload.get("missing"), [])
-    check("...over all 22 names (a probe over an empty set proves nothing)",
-          _payload.get("checked"), 22)
+    check("...over all 21 names (a probe over an empty set proves nothing)",
+          _payload.get("checked"), 21)
 else:
     fail("File 21 surface probe",
          f"exit {_rc}; stderr tail: {_err.strip().splitlines()[-4:]}")

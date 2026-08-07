@@ -33,10 +33,70 @@ MATCH_TIER_COLORS = {
 }
 
 # Per-trial status labels, same partition applied to a single trial row.
-TRIAL_STATUS_FULL        = '✅ Full Match'
+#
+# THERE WERE FOUR AND THERE ARE THREE (pass 20f-3). `TRIAL_STATUS_FULL =
+# '✅ Full Match'` stood at the top of this block and was READ BY NOTHING --
+# not here, not in any tab, and not in "21- Streamlit Dashboard.py" before the
+# split, checked against `git show ae3f6c6^`. It was dead on the day it was
+# written, which is why deleting it changes no rendered pixel.
+#
+# It was also WRONG, which is the part worth recording. The per-TRIAL
+# classifiers in patient_explorer and trial_explorer return the literal
+# '✅ Eligible' for their top bucket, so this constant named a value the
+# per-trial vocabulary cannot produce -- the PASSWORD_SOURCE_ARGUMENT shape
+# exactly: a constant a caller would assert against, whose assertion could only
+# ever fail. Its string belonged to the PER-PATIENT vocabulary below, where it
+# was being typed out as a literal in three tabs.
 TRIAL_STATUS_PARTIAL     = '🟡 Partial Match'
 TRIAL_STATUS_UNCONFIRMED = '🔶 Unconfirmed'
 TRIAL_STATUS_REJECTED    = '❌ Not Eligible'
+
+
+# Per-PATIENT outcome labels: the display form of each `match_tier` value that
+# `enrich_match_tiers()` assigns below.
+#
+# THIS IS THE HOME THE THREE LITERALS DID NOT HAVE (pass 20f-3). The strings
+# were typed out in overview, demographics and match_quality -- five
+# occurrences of '✅ Full Match' across three files, not the three that pass
+# 20e's follow-up note recorded; the note counted files rather than sites, and
+# the pie chart in match_quality carries two of them (its `Outcome` list and its
+# `color_discrete_map` key, which had to be kept in step by hand).
+#
+# THE VALUES ARE UNCHANGED, character for character, so nothing renders
+# differently. What changes is that the per-patient vocabulary stops borrowing
+# from the per-trial one: match_quality's pie chart listed
+# `['✅ Full Match', TRIAL_STATUS_PARTIAL, '🔶 Unconfirmed Match', '❌ No Match']`,
+# so editing the per-TRIAL partial label would silently have moved a per-PATIENT
+# chart's slice name and its colour key together. Two vocabularies that happen
+# to share a string are still two vocabularies.
+PATIENT_OUTCOME_FULL        = '✅ Full Match'
+PATIENT_OUTCOME_PARTIAL     = '🟡 Partial Match'
+PATIENT_OUTCOME_UNCONFIRMED = '🔶 Unconfirmed Match'
+PATIENT_OUTCOME_NO_MATCH    = '❌ No Match'
+
+# In MATCH_TIERS order, so a chart can zip the two together instead of repeating
+# the labels beside the colours. A TUPLE rather than a list or a dict on purpose:
+# check 6a of tests/test_package_invariants.py rests on MATCH_TIERS and
+# MATCH_TIER_COLORS being the only module-level MUTABLE objects the dashboard
+# has, and an immutable container adds nothing for that scan to watch.
+PATIENT_OUTCOME_LABELS = (
+    PATIENT_OUTCOME_FULL,
+    PATIENT_OUTCOME_PARTIAL,
+    PATIENT_OUTCOME_UNCONFIRMED,
+    PATIENT_OUTCOME_NO_MATCH,
+)
+
+# A raise rather than an assert: `python -O` strips asserts, and an invariant
+# that disappears under an interpreter flag is not one. Same shape as the
+# two-table guard in oncotriage/paths.py. A tier added to MATCH_TIERS with no
+# label here would otherwise reach the pie chart as a silently shorter list,
+# whose slices would then be labelled by position with the wrong names.
+if len(PATIENT_OUTCOME_LABELS) != len(MATCH_TIERS):
+    raise RuntimeError(
+        f"the per-patient label vocabulary has {len(PATIENT_OUTCOME_LABELS)} "
+        f"entries and MATCH_TIERS has {len(MATCH_TIERS)}: "
+        f"{MATCH_TIERS!r}. They are zipped together, so they must correspond."
+    )
 
 
 def classify_trial_score(match_score) -> str:

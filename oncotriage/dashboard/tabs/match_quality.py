@@ -8,7 +8,12 @@ import plotly.express as px
 import streamlit as st
 
 from oncotriage.dashboard.data import load_trial_matches_data
-from oncotriage.dashboard.tiers import MATCH_TIERS, MATCH_TIER_COLORS, TRIAL_STATUS_PARTIAL
+from oncotriage.dashboard.tiers import (
+    MATCH_TIERS,
+    MATCH_TIER_COLORS,
+    PATIENT_OUTCOME_FULL,
+    PATIENT_OUTCOME_LABELS,
+)
 
 
 def render_match_quality_tab(df):
@@ -257,7 +262,7 @@ def render_match_quality_tab(df):
     with col1:
         st.metric("Error Rate", f"{err_rate:.1f}%", delta=f"{err_cnt} errors" if err_cnt > 0 else None, delta_color="inverse", help="Percentage of inferences that encountered pipeline errors")
     with col2:
-        st.metric("✅ Full Match", f"{full_cnt}", delta=f"{full_cnt / len(df) * 100:.1f}%" if len(df) > 0 else "0%", help="Patients with at least 1 trial where ALL criteria confirmed (100% score)")
+        st.metric(PATIENT_OUTCOME_FULL, f"{full_cnt}", delta=f"{full_cnt / len(df) * 100:.1f}%" if len(df) > 0 else "0%", help="Patients with at least 1 trial where ALL criteria confirmed (100% score)")
     with col3:
         st.metric("🟡 Partial Match", f"{partial_cnt}", delta=f"{partial_cnt / len(df) * 100:.1f}%" if len(df) > 0 else "0%", help="Patients whose best trial had SOME criteria confirmed (0% < score < 100%)")
     with col4:
@@ -294,18 +299,24 @@ def render_match_quality_tab(df):
         st.plotly_chart(fig_q, use_container_width=True)
     
     with col2:
+        # PATIENT_OUTCOME_LABELS is in MATCH_TIERS order and 'Count' is built in
+        # that same order, so the two zip. Before pass 20f-3 the four labels were
+        # typed here TWICE -- once as the `Outcome` list and once as the keys of
+        # the colour map -- with one of the four borrowed from the per-TRIAL
+        # vocabulary (TRIAL_STATUS_PARTIAL). Same strings, same colours, one
+        # place to change them, and the per-patient chart no longer moves when
+        # the per-trial labels do.
         sd = pd.DataFrame({
-            'Outcome': ['✅ Full Match', TRIAL_STATUS_PARTIAL, '🔶 Unconfirmed Match', '❌ No Match'],
+            'Outcome': list(PATIENT_OUTCOME_LABELS),
             'Count': [full_cnt, partial_cnt, unconfirmed_cnt, no_match_cnt]
         })
 
         fig_s = px.pie(sd, values='Count', names='Outcome', template='plotly_white',
                        title='Patient Match Distribution', color='Outcome',
                        color_discrete_map={
-                           '✅ Full Match':        MATCH_TIER_COLORS['Full Match'],
-                           TRIAL_STATUS_PARTIAL:   MATCH_TIER_COLORS['Partial Match'],
-                           '🔶 Unconfirmed Match': MATCH_TIER_COLORS['Unconfirmed Match'],
-                           '❌ No Match':          MATCH_TIER_COLORS['No Match'],
+                           label: MATCH_TIER_COLORS[tier]
+                           for label, tier in zip(PATIENT_OUTCOME_LABELS,
+                                                  MATCH_TIERS)
                        })
         fig_s.update_traces(
             textposition='inside',

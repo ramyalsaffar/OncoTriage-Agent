@@ -123,7 +123,7 @@ Verified rather than assumed. It is the same object as
 | `oncotriage/batch/runner.py` | File 25 whole — checkpoint, the two thread pools, the summary | `paths`, `config`, `agent.{graph,retrieval,evaluation}`, `fhir.parser`, `storage.database_logger`, `utils` |
 | `oncotriage/dashboard/data.py` | File 21's three `@st.cache_data(ttl=60)` loaders | `paths` |
 | `oncotriage/dashboard/sidebar.py` | File 21's `render_sidebar` — filters, Refresh, CSV export | nothing from the project |
-| `oncotriage/dashboard/tiers.py` | `MATCH_TIERS`, `MATCH_TIER_COLORS`, the four `TRIAL_STATUS_*`, `classify_trial_score`, `enrich_match_tiers` | nothing at all |
+| `oncotriage/dashboard/tiers.py` | `MATCH_TIERS`, `MATCH_TIER_COLORS`, the **three** `TRIAL_STATUS_*` (per-trial) and the **four** `PATIENT_OUTCOME_*` + `PATIENT_OUTCOME_LABELS` (per-patient; pass 20f-3), `classify_trial_score`, `enrich_match_tiers` | nothing at all |
 | `oncotriage/dashboard/app.py` | File 21's `main` — page config, sidebar, the nine tabs | `config`, `dashboard.{data,sidebar,tiers}`, `dashboard.tabs.*` |
 | `oncotriage/dashboard/tabs/*.py` | one `render_*_tab` each, nine of them | `dashboard.{data,tiers}`, `config`, `utils` |
 | `oncotriage/retrieval/qdrant_backup.py` | File 29 whole — `default_output_dir`, `download_all_collections` | `config`, `paths` |
@@ -298,7 +298,7 @@ The rules, in force and enforced:
   **The same trap applies to a numbered entry point's module scope**, which is why `07- FHIR Parser.py`, `09- MeSH Cancer Site Relevance Filter.py`, `13- LangGraph Agent.py` and `20- Drift Detection.py` import their lazy paths INSIDE the `__main__` guard.
 - **Nothing calls `exec_chain`, calls `exec()`, or loads a module by location.** `exec_chain` no longer exists. The one allowed `exec()` in the repository is `tests/test_storage_query_layer.py`, which execs two pre-fix functions unparsed out of a git blob so its negative controls run the real replaced code rather than a retyped copy; that allowlist is closed, argued, and checked for staleness. Section 1c enforces all of it with six planted controls.
 - **A numbered file must not import a package name at module scope that it never reads.** That is what a re-export IS, and it is the first half of rebuilding a shim. Section 5 scans for it with a planted control. One exemption, argued: `24- Airflow Manager.py` imports two names its byte-verbatim COMMENTED menu calls, and comments are invisible to an AST walk.
-- The three functions that used to read a value out of the shared namespace at call time — `get_model_cost`, `resolve_qdrant_collection`, `get_age_reference_date` — still take that value as an **optional argument**. **No caller passes it any more** (measured in pass 20e); the parameters stay because removing three public signatures is a behaviour change, and `get_age_reference_date`'s docstring names its argument as the supported patch point. Recorded as a follow-up.
+- The three functions that used to read a value out of the shared namespace at call time — `get_model_cost`, `resolve_qdrant_collection`, `get_age_reference_date` — **took that value as an optional argument, and pass 20f-3 deleted all four parameters** (`pricing_config`, `client`, `collection_name`, `snapshot_date`). Re-measured by AST first: 29 call sites across the package, the entry points and the tests, not one passing any of them. **It is a behaviour change** — three public signatures narrowed, so an outside caller passing one now gets a `TypeError`. The one thing pass 20e said had to be settled first was `get_age_reference_date`'s docstring, which called its argument "the supported patch point"; it was not, and had not been since pass 20d-1 — `tests/test_fhir_birth_date_and_demographics.py` section 3 sets `config.DATA_SNAPSHOT_DATE`, which the function reads at **call** time. The private sentinel `_SNAPSHOT_NOT_SUPPLIED` went with the parameter.
 - `pip install -e .` from `03- Code/` makes the package importable from anywhere. Without it, each entry point's own six-line block puts the code directory on `sys.path` and prints that it did.
 
 Everything else worth knowing:
@@ -336,7 +336,9 @@ python "12- RAG Trial Indexer Validator.py"          # exit 1 on any CRITICAL ch
 # Airflow (orchestration) — run in this order the first time
 python "22- Airflow Database.py"                     # airflow db migrate + check, rewrites airflow.cfg
 python "23- Airflow DAG.py"                          # writes {airflow_path}/dags/trial_refresh_weekly.py
-python "24- Airflow Manager.py"                      # runs start_airflow(); edit its menu for the rest
+python "24- Airflow Manager.py" start                # argparse CLI (pass 20f-3): start | stop | status | trigger
+python "24- Airflow Manager.py" status               # a bare invocation now prints usage and exits 2
+python "24- Airflow Manager.py" trigger --password-stdin   # the only way to pass a password; never on argv
 
 # Qdrant backup
 python "29- Download Qdrant Data.py"                 # -> {data_path}/06- Qdrant Downloaded Data.../
@@ -382,7 +384,7 @@ python tests/test_monitoring_ecog_availability_drift.py            # 111 (was 11
 python tests/test_registries_cancer_code_claims_audit.py           # 197
 python tests/test_registries_cancer_code_claims_audit_control.py   #  16; 14 planted, 14 caught
 python tests/test_config_snapshot_date_rot.py                      #  10; 6 subprocess runs, ~6 min
-python tests/test_package_invariants.py                            # 248 (was 235 at pass 20e; +13 is section 2f(ii), pass 20f-2). No network, no keys, no corpus
+python tests/test_package_invariants.py                            # 247 (was 248; pass 20f-3 deleted the _REEXPORT_EXEMPTIONS staleness check with the table). No network, no keys, no corpus
 python tests/test_degraded_dependencies.py                         # 172 (was 170; see pass 20e). Item 11a
 python tests/test_storage_query_layer.py                           # 194; item 38, temp SQLite only
 
@@ -391,7 +393,7 @@ python tests/test_storage_query_layer.py                           # 194; item 3
 python tests/test_paths_glob_determinism.py                        #  25
 python tests/test_storage_wipe_all_tables.py                       #  22
 python tests/test_fhir_parser_dict_input.py                        #  29
-python tests/test_ablation_db_isolation.py                         #  43
+python tests/test_ablation_db_isolation.py                         #  72 (was 43; pass 20f-3 added section 5b for the --db parent guard and the checkpoint)
 pip install -e .                                         # makes `oncotriage` importable anywhere
 ```
 
@@ -504,7 +506,7 @@ Only `03- Code/` is version-controlled. Sibling directories under the project ro
 | `data_MeSH_path` | `02- Data/…/MeSH/` | MeSH C04 + UMLS crosswalk JSONs |
 | `keys_path` | `05- Keys/.env` | `OPENAI_API_KEY`, `QDRANT_URL`, `QDRANT_API_KEY` |
 | `checkpoint_path` | `08- Checkpoint/` | batch runner resume state |
-| `requirements_path` | `07- Requirements/` | **nothing any more.** A stale, unread copy of a dependency list; read by no code, and pass 20f-2 made `pyproject.toml` the one list |
+| ~~`requirements_path`~~ | `07- Requirements/` | **DELETED (pass 20f-3)**, from both path tables, with the in-repo `requirements/` directory. It was read by no code, ever; `pyproject.toml` is the one dependency list. The stale sibling outside the repository is untouched and nothing resolves to it any more |
 
 `ONCOTRIAGE_ALLOW_DEGRADED_REGISTRIES` permits a run to continue with the MeSH
 site-relevance layer or the ICD-10-CM layer ABSENT rather than raising; it is
@@ -1096,7 +1098,18 @@ either. **PASS 20f-1 FIXED BOTH** — see "Pass 20f-1" below:
 **A THIRD FINDING, from File 47 check 2h:** `TERMINAL_ERROR` in
 `fixtures/capture.py` is declared and read by nothing, and `git grep
 TERMINAL_ERROR HEAD` returns exactly one line — its own assignment in File 45.
-It was dead before the move; the move is what made check 2h able to see it. It is
+It was dead before the move; the move is what made check 2h able to see it. **PASS
+20f-3 MADE IT LOAD-BEARING** — `verify_recording_complete()` names the
+error-handler case explicitly and the exemption is gone. Pass 20e predicted that
+branch would "improve the diagnosis and change no outcome"; the first half held
+and the second did not, which is why it was worth doing in a pass that could say
+so. The old arm refused an error run only when NO Stage 5 exchange was recorded,
+so an exception thrown AFTER Stage 5 answered left the fixture written, with a
+prefix stamped by the error handler's placeholders. That fixture is refused now.
+**Twelve fixtures written by the changed writer are byte-identical to twelve
+written by the pre-change writer** (`git show HEAD:`, exec'd rather than
+retyped), so nothing on disk moved. What follows is what pass 20e argued at the
+time. It was
 **exempted with an argument** rather than deleted (it completes a closed
 three-member vocabulary whose other two members are read, and naming only two
 would tell a reader the third is impossible) and rather than made load-bearing
@@ -1402,8 +1415,11 @@ vocabularies and decision records, exempted with an argument each) and
 exempted and recorded as follow-ups: the first two are documented TUNABLES that
 do nothing, which is a configuration-surface decision, and the third is an
 unused compiled regex that should simply go). **Pass 20f-2 closed the first two
-by deleting them** — see "Two dead tunables" below; `_PATIENT_STAGE_RE` is still
-exempted. Deleting `exec_chain` also left
+by deleting them** — see "Two dead tunables" below; **pass 20f-3 deleted
+`_PATIENT_STAGE_RE` too**, which pass 20e had called "the one of the three that
+should simply go": it differed from `_SNOMED_DISPLAY_STAGE_RE` only by an
+optional `tnm ` prefix that the survivor's `\b` already admits (measured —
+`extract_patient_stage()` still resolves "TNM stage 3 (disorder)" to 3). Deleting `exec_chain` also left
 `import os` unread in `oncotriage/utils.py`, which check 2h(i) reported on the
 first run — the smallest possible instance of the same thing.
 
@@ -1831,11 +1847,12 @@ environment, not guessed" — which item 21 had already supplied.
 generated: a second list is a second list however it is produced. Every argument
 its header made for its own existence is served by `pyproject.toml`, which sits
 in the same directory, in the same commit, inside the same Docker build context.
-`requirements/README.md` replaces it and holds no versions. **The directory
-survives** because `paths.requirements_path` names it and `_DOCKER_PATHS` maps
-it to `/app/requirements/`; deleting it would leave a path variable naming
-nothing and change the container's fourteen-path bring-up report. Recorded as a
-follow-up with the whole edit.
+`requirements/README.md` replaced it and held no versions, and **pass 20f-3
+deleted that directory too, with `requirements_path` from both path tables**.
+Pass 20f-2 left it standing only because the variable named it, and recorded the
+follow-up with the whole edit; that edit is done. The container's bring-up report
+is **thirteen** paths, and no path variable in this project is unread by all
+code. Everything the README said now lives in `pyproject.toml`'s header.
 
 **THE DOCKERFILE READS `pyproject.toml` WITH `tomllib`** (standard library on
 the image's Python 3.11 — nothing is installed in order to read the file that
@@ -1875,6 +1892,207 @@ declaration already says. The pin was not edited down to match a stale install:
 1.45.1 is not installable alongside `apache-airflow-core 3.1.7` at all
 (`packaging<25` versus `packaging>=25.0`, no version satisfies both), so
 recording it would make the dependency list unresolvable.
+
+
+### Dead code and small seams (pass 20f-3)
+
+Eleven items, none of them large, all of them measured before they were changed.
+**No money was spent**: the twelve fixtures replay 12/12 clean **without
+recapture**, and — because this pass touches the fixture WRITER — a fixture
+written by the changed writer was additionally shown to be **byte-identical** to
+one written by the pre-change writer for the same input.
+
+**A RULE THAT APPLIES TO EVERY DELETION BELOW, AND PASS 20f-2 PAID FOR IT.**
+Check 2h counts a name inside **any string literal** as a read, so a constant
+deleted from the code but still named in a docstring or a prose block is
+invisible to the scan when somebody later reinstates it. Every deleted name here
+was therefore purged from `.py` prose as well as from the code — every surviving
+mention is a `#` comment, which no AST walk sees — and each deletion was
+**reverted in place and shown to FIRE**, with the touched file hashed before and
+after and the restore asserted byte-identical.
+
+**1. `24- Airflow Manager.py` HAS AN ARGPARSE CLI**, which pass 20c-3c-2 recorded
+as a follow-up and which two other items were waiting on. `start | stop | status
+| trigger`, a global `--airflow-home`, and `--password-stdin` on the two
+commands that authenticate. **There is deliberately no `--password VALUE`**: a
+command line is in the process table for every user on the machine, so tier 1 is
+reachable only through stdin, which is not cached and so does not become the
+process-wide answer.
+
+- **The commented menu is gone**, and with it the comment naming the retired
+  `AIRFLOW_PASSWORD` route that pass 3c-2 kept byte-verbatim.
+- **`_REEXPORT_EXEMPTIONS` IS DELETED, NOT EMPTIED.** It held one entry
+  (`stop_airflow`, `trigger_dag`), because those two were named only in
+  COMMENTED menu lines and no AST walk can see a comment. All four functions are
+  called by `main()` now. The dict went with its own staleness check — "…and the
+  one exemption is still needed" iterates nothing when the dict is empty and
+  passes for free, which is a check that has stopped checking. **That is the −1
+  in `tests/test_package_invariants.py`: 248 → 247.** The scan itself is
+  unchanged and is now unconditional.
+- **A BARE INVOCATION NO LONGER STARTS TWO SERVERS.** `python "24- Airflow
+  Manager.py"` used to run `start_airflow()`. The subcommand is required; a bare
+  invocation prints usage and exits 2. **A contract change, stated as one.**
+
+**1b. THE GENERATED ADMIN PASSWORD IS NOT PRINTED.** `start_airflow()` echoed it
+to the terminal — scrollback, `tee`, CI log, screen share, `script` recording.
+Pass 3c-2 kept it on the argument that a local tool may print a locally-generated
+credential; what closed it is that the four-tier route made the print **pointless
+as well as leaky**, since tier 4 reads the same file and `status`/`trigger` never
+needed a human to have seen it. The line now names the **path**, which is what
+the one real consumer (a person logging into the web UI) needs.
+**`DOCKER CLEAN BRING-UP.md` §2e says the same thing** for the container, where
+`down -v` regenerates the password.
+
+**MEASURED, AND THE BRIEF WAS WRONG ABOUT ONE HALF:** the password did **not**
+also reach `api_server.log`. That file is the `airflow api-server` subprocess's
+own stdout (`stdout=open(api_log_path, 'w')` on the Popen), while these prints go
+to the manager's stdout. A 12 KB `api_server.log` from a real run on the
+development machine contains **zero** occurrences of "password". The leak was the
+terminal and only the terminal.
+
+**2. `_PATIENT_STAGE_RE` IS DELETED** (`oncotriage/extraction/stage.py`), the one
+of pass 20e's three findings it said "should simply go". It differed from
+`_SNOMED_DISPLAY_STAGE_RE` — immediately above it, and the one
+`extract_patient_stage()` uses at both match sites — only by an optional `tnm `
+prefix that the survivor's `\b` already admits. Measured rather than argued:
+`extract_patient_stage()` still resolves `"TNM stage 3 (disorder)"` to 3.
+
+**3. `TRIAL_STATUS_FULL` IS DELETED, AND ITS STRING GOT A HOME.** It was dead
+before the split (`git show ae3f6c6^`) and it was also **wrong**: the per-trial
+classifiers return `'✅ Eligible'` for their top bucket, so it named a value the
+per-trial vocabulary cannot produce — the `PASSWORD_SOURCE_ARGUMENT` shape.
+`oncotriage/dashboard/tiers.py` now carries a **per-PATIENT** vocabulary
+(`PATIENT_OUTCOME_FULL/PARTIAL/UNCONFIRMED/NO_MATCH` plus
+`PATIENT_OUTCOME_LABELS`, a TUPLE in `MATCH_TIERS` order, with a `RuntimeError`
+guard that the two correspond).
+
+- **FIVE literals, not the three pass 20e's note recorded** — that note counted
+  files. `match_quality`'s pie chart holds two of them, its `Outcome` list and
+  its `color_discrete_map` key, previously kept in step by hand.
+- **The pie chart was BORROWING from the per-trial vocabulary**
+  (`TRIAL_STATUS_PARTIAL` sat in a per-patient list), so editing a per-trial
+  label would silently have moved a per-patient chart's slice name and its
+  colour key together. The labels and the colour map are now zipped from one
+  source. **Values are character-identical**, so nothing renders differently.
+- **DROPPING AN ENTRY FROM THE PINNED FILE 21 SURFACE IS A CHECK THAT STOPS
+  RUNNING**, so it is argued in place (section 6f), on pass 20e's footing: that
+  pin exists to catch a name LOST in the twelve-way split, the record shows this
+  one was not lost but carried and then deliberately deleted, so keeping the
+  entry would fail the probe with a message that is false. **22 → 21 names**, and
+  the two counts beside it move with it. The check count does not.
+
+**4. `TERMINAL_ERROR` IS LOAD-BEARING, WHICH ITS OWN EXEMPTION ASKED FOR** — the
+one of the five follow-ups that wanted the opposite of a deletion.
+`verify_recording_complete()` names the error-handler case explicitly.
+**Pass 20e predicted "improve the diagnosis and change no outcome"; the first
+half held and the second did not.** The old arm refused an error run only when
+NO Stage 5 exchange had been recorded, so an exception thrown AFTER Stage 5
+answered left the fixture WRITTEN — with a prefix stamped by the error handler's
+placeholders. That fixture is refused now. Measured on synthetic sinks against
+the pre-change writer: `n_chat=0` refused before and after (diagnosis moved),
+`n_chat=1` **accepted before, refused now**, both other terminals untouched.
+None of the twelve shipped fixtures ends at the error handler.
+
+**THE FORMAT IS FROZEN, SO BYTE-IDENTITY WAS PROVED RATHER THAN INFERRED.**
+`SCHEMA_VERSION` is 3 and `load_fixture()` refuses a mismatch; a replay compares
+the deterministic prefix, not the bytes, so "12/12 replayed clean" would survive
+a writer that had started emitting a different gzip stream. HEAD's `capture.py`
+was taken out of git and exec'd into a throwaway namespace — never retyped — and
+handed the same twelve fixtures: **12/12 byte-identical sha256**, with a
+perturbed-field negative control that diverges.
+
+**5. FOUR DEAD PARAMETERS DELETED FROM THREE PUBLIC SIGNATURES**
+(`get_model_cost`'s `pricing_config`, `resolve_qdrant_collection`'s `client` and
+`collection_name`, `get_age_reference_date`'s `snapshot_date`), plus the private
+`_SNAPSHOT_NOT_SUPPLIED` sentinel that existed only to serve the last one. They
+were the seam that let an exec-chain caller redirect a value, and there is no
+exec chain. **Re-measured by AST: 29 call sites across the package, the entry
+points and the tests, not one passing any of the four.** It IS a behaviour
+change — an outside caller passing one now gets a `TypeError` — and the thing
+pass 20e said had to be settled first, `get_age_reference_date`'s docstring
+calling its argument "the supported patch point", **was wrong and had been since
+pass 20d-1**: `tests/test_fhir_birth_date_and_demographics.py` section 3 sets
+`config.DATA_SNAPSHOT_DATE`, which the function reads at CALL time. The
+docstrings say that now.
+
+**6. `tests/run_serial_tests.py` REFUSES A CONCURRENT RUN.** It had 239 lines, no
+lock and no pid file, while its entire reason for existing is that two members
+rewrite source in place and restore it from a backup taken at their own start.
+Interleave two runs and the later restore writes back the earlier one's
+**planted** tree, with both runs reporting 16/16 and exit 0 — the silent revert
+that cost pass 20d-1 an edit to `config.py`, with no operator to have ignored a
+warning. `flock(LOCK_EX | LOCK_NB)` on a file outside the repository, keyed on a
+hash of the code directory, held for the whole run, **released by the kernel**
+when the process exits however it exits — which is why it is not a pid file, a
+shape that leaves a stale lock on every bad exit and whose "is that pid alive"
+repair is a check-then-act race of its own. **Exit code 3**, naming the holder's
+pid, host, user and start time. `--list` takes no lock. Demonstrated: a real
+runner invocation against a held lock exits 3 in under a second, runs none of the
+five, and the lock is free again once the holder dies.
+
+**7. `_REPO_PY` COVERS `docker/`** — the same blind directory pass 20d-2 closed
+for `tests/`, one level out. `docker/prepare_paths.py` and
+`docker/generate_dag.py` both import from the package, and `prepare_paths.py` is
+the **only reader of `oncotriage/paths.py:_DOCKER_PATHS` outside `paths.py`
+itself**. Latent rather than live, because `paths.py` reads its own constant —
+and the hole is what happens next: a constant added tomorrow whose only reader is
+in `docker/` is reported as dead and the operator's fix is to delete a name the
+container needs. Demonstrated out of band, both files restored byte-identically:
+a plant read only from `docker/` is **not** reported with the corpus as shipped,
+**is** reported against a copy with the `+ _DOCKER_PY` term stripped, and a plant
+with no reader anywhere is reported either way.
+
+**8. THE GENERATED DAG REFERENCES NO DELETED FILE, AND THE CRITERION WAS A NEW
+sha256.** Two prose lines inside the generated string said `03- Config.py` — a
+file pass 20e **deleted** — and a third, in the tail, described it as a shim that
+no longer exists. Pass 3c-2 left them wrong on purpose (correcting a character
+would have broken its byte-identity proof) and recorded the follow-up "whose
+acceptance criterion is a NEW sha256". Delivered: **20,542 bytes /
+`68963b0c…` → 20,689 bytes / `949283c4…`**, regenerated by deleting the deployed
+file and re-running `23- Airflow DAG.py`, and parsed by **Airflow's own
+`DagBag`** rather than assumed — `import_errors == {}`, `trial_refresh_weekly`
+registered, all three tasks, tags `['production','trialmatch']`, timetable
+summary `None`.
+
+**9. `requirements_path` AND THE `requirements/` DIRECTORY ARE DELETED.** Pass
+20f-2 wrote the whole edit down as a follow-up and named the blocker: the
+variable named the directory, so the directory could not go first. Both go
+together. **No path variable in this project is now unread by all code.** The
+container's bring-up report is **thirteen** paths, and
+`tests/test_paths_glob_determinism.py`'s resolver-count non-degeneracy check
+moves 14 → 13 with the table. Everything the deleted `README.md` said already
+lived in `pyproject.toml`'s header, which now records the follow-up as closed.
+The stale sibling outside the repository is untouched and nothing resolves to it
+any more.
+
+**10. `--db` WITH AN ABSENT PARENT IS REFUSED BY NAME.** It used to reach
+`sqlite3.connect` and come back as `unable to open database file`, which names
+neither the path nor the flag, after the argument parsing and the banner.
+`_require_writable_parent()` is the guard, and it is
+`settings.resolve_inferences_db()`'s argument applied to the second redirectable
+database: a database FILE that does not exist is normal — sqlite creates it — but
+a missing PARENT is a configuration defect. **Not applied to the default**, which
+resolves a directory `_glob_one` has already proved exists.
+
+**11. `--db` REACHES THE CHECKPOINT, AND "RESUME" IS PER DATABASE.** Pass 20f-1
+recorded this and named the decision it needed. The checkpoint is a set of
+`(config, patient)` pairs whose only possible meaning is "already written", which
+is a statement about a database and about nothing else — so an explicit `--db`
+gets a checkpoint **beside that database, named after it**, on the same footing
+as `ablation_summary_json()`. Before: an isolated run read the PRODUCTION resume
+file, skipped every pair a production run had done, wrote nothing for them into
+the scratch database, printed `Status: COMPLETE`, **and deleted the production
+checkpoint on its way out**. `tests/test_ablation_db_isolation.py` section 5b
+drives that defect through the real caller with a stand-in of the pre-20f-3 shape
+and shows it inheriting the wrong resume state.
+
+**PASS COUNTS.** Nineteen of the twenty-one test files report **exactly** what
+they reported before. Two moved, each argued in place:
+`tests/test_package_invariants.py` **248 → 247** (item 1a, the retired exemption
+table taking its own staleness check with it) and
+`tests/test_ablation_db_isolation.py` **43 → 72** (section 5b, the assertions
+items 10 and 11 made possible — a behaviour change with nothing asserting it is
+what this project calls the defect).
 
 
 ## Persistence and observability

@@ -54,19 +54,23 @@
 #     caching that the separate copy existed for is preserved, because only
 #     this file lands in the layer that installs.
 #
-# `requirements/README.md` replaces it and holds no versions. The directory
-# survives because `oncotriage/paths.py:requirements_path` names it and
-# `_DOCKER_PATHS` maps it to /app/requirements/, so deleting the directory
-# would leave a path variable pointing at nothing and change the container's
-# 14-path bring-up report. RECORDED AS A FOLLOW-UP, with the whole edit: drop
-# `requirements_path` from both tables in oncotriage/paths.py, drop the
-# directory, and correct the "fourteen" in DOCKER CLEAN BRING-UP.md and
-# CLAUDE.md. That is a paths decision, not a dependency one.
+# `requirements/README.md` replaced it and held no versions, and PASS 20f-3
+# DELETED THAT DIRECTORY TOO. Pass 20f-2 left it standing only because
+# `oncotriage/paths.py:requirements_path` named it and `_DOCKER_PATHS` mapped it
+# to /app/requirements/, and it recorded the follow-up with the whole edit
+# written out: drop the variable from both tables, drop the directory, and
+# correct the "fourteen" in DOCKER CLEAN BRING-UP.md and CLAUDE.md. That is
+# done. The container's bring-up report is thirteen paths, and there is no path
+# variable left in this project that no code reads.
+#
+# Everything the deleted README said is in THIS comment block already — the
+# install command, what the Dockerfile does with this file, and the stale
+# sibling below — so nothing went with it.
 #
 # THE STALE SIBLING IS NOT TOUCHED, and it is outside the repository so this
-# commit cannot touch it. It is dead: `requirements_path` is read by no code
-# (measured — the only hits are its own definition, the _DOCKER_PATHS entry and
-# prose), so nothing has installed from it since item 21.
+# commit cannot touch it. Nothing resolves to it any more: pass 20f-3 removed
+# the only variable that ever pointed at it, and no code ever read that
+# variable.
 #
 # CONSEQUENCE, stated rather than discovered: `pip install .` into an empty
 # environment now gives you a WORKING package, which it did not before. The old

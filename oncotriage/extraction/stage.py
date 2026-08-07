@@ -461,10 +461,26 @@ _SNOMED_DISPLAY_STAGE_RE = re.compile(
     re.IGNORECASE,
 )
 
-_PATIENT_STAGE_RE = re.compile(
-    r"(?:tnm\s+)?stage\s+(" + _STAGE_ALT + r")(?![a-z])",
-    re.IGNORECASE,
-)
+# A SECOND PATIENT-SIDE STAGE REGEX STOOD HERE AND IS DELETED (pass 20f-3).
+#
+# It was `(?:tnm\s+)?stage\s+(...)`, differing from the one above only by an
+# optional "tnm " prefix -- which the `\b` in the survivor already admits, since
+# "TNM stage 1 (disorder)" contains "stage 1" on a word boundary. Nothing read
+# it: `extract_patient_stage()` uses _SNOMED_DISPLAY_STAGE_RE at both of its
+# match sites, and a repository-wide grep for the name returned only its own
+# assignment and the prose recording that it was dead.
+#
+# Pass 20e's check 2h(ii) is what surfaced it -- deleting the numbered shims
+# removed the `from oncotriage.extraction.stage import *`-shaped reads that had
+# been masking every dead name in this module -- and pass 20e exempted rather
+# than removed it, because that pass's acceptance criterion was that no
+# behaviour changed and deleting a regex from the stage extractor is a change
+# to this module. It is the follow-up that pass recorded, and it is the one of
+# its three findings it said "should simply go".
+#
+# Its exemption entry in tests/test_package_invariants.py went with it, and had
+# to: that file's "every exempted constant still exists" guard fails on an
+# exemption for a deleted name.
 
 
 def extract_patient_stage(

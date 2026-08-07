@@ -353,7 +353,19 @@ _DOCKER_PATHS = {
     "result_ablation_path":     "/app/results/ablation/",
     "keys_path":                "/app/",
     "airflow_path":             "/app/airflow_home/",
-    "requirements_path":        "/app/requirements/",
+    # `requirements_path` STOOD HERE AND IS DELETED (pass 20f-3). It resolved
+    # `{root}/*Requirements/` locally and /app/requirements/ in the container,
+    # and NO CODE HAS EVER READ IT -- measured at pass 20f-2, and again here:
+    # the only hits for the name in the tree were its own two table entries and
+    # prose. Pass 20f-2 deleted `requirements/requirements.txt` (pyproject.toml
+    # is the one dependency list) and left the DIRECTORY standing precisely
+    # because this variable named it, recording the removal as a follow-up with
+    # the whole edit written out. This is that edit: the variable goes, the
+    # directory goes with it, and the container's bring-up report is thirteen
+    # paths instead of fourteen.
+    #
+    # The stale sibling `{root}/07- Requirements/` is outside the repository and
+    # is not touched by this or any commit. Nothing resolves to it any more.
     "data_MeSH_path":           "/app/data/mesh/",
     "checkpoint_path":          "/app/checkpoint/",
 }
@@ -393,8 +405,6 @@ _LOCAL_PATHS = {
         lambda: _glob_one(_root() + "/*Keys/", "keys"),
     "airflow_path":
         lambda: _glob_one(_root() + "/*Airflow/", "Airflow"),
-    "requirements_path":
-        lambda: _glob_one(_root() + "/*Requirements/", "requirements"),
     "checkpoint_path":
         lambda: _glob_one(_root() + "/*Checkpoint/", "checkpoint"),
 }
@@ -406,7 +416,7 @@ _RESOLVERS.update(
     if IS_DOCKER else _LOCAL_PATHS
 )
 
-# Both branches must expose the SAME fourteen names — that is the defect item
+# Both branches must expose the SAME thirteen names — that is the defect item
 # 20a found in code_path, restated as a check now that the two branches are two
 # dicts rather than two halves of an if. Checked at import because it costs one
 # set comparison and catches a name added to one table and not the other.

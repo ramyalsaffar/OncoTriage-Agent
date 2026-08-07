@@ -8,7 +8,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from oncotriage.dashboard.data import load_trial_matches_data
-from oncotriage.dashboard.tiers import MATCH_TIER_COLORS
+from oncotriage.dashboard.tiers import MATCH_TIER_COLORS, PATIENT_OUTCOME_FULL
 
 
 def render_overview_tab(df):
@@ -54,7 +54,7 @@ def render_overview_tab(df):
     
     with col3:
         st.metric(
-            "✅ Full Match",
+            PATIENT_OUTCOME_FULL,
             f"{full_rate:.1f}%",
             delta=f"{(df['match_tier'] == 'Full Match').sum()} patients",
             help="Patients with at least 1 trial where ALL criteria were confirmed met (100% match score)"
