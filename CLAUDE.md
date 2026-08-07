@@ -321,6 +321,7 @@ All commands run from `03- Code/`. Filenames contain spaces — always quote the
 # Pipeline services
 python "17- FastAPI Server.py"                       # API on :8000 (/docs)
 uvicorn oncotriage.api.server:app --port 8000        # the same app, package route
+python mcp_server.py                                 # MCP server on stdio (a client starts it; by hand it looks like a hang)
 streamlit run "21- Streamlit Dashboard.py"           # dashboard on :8501
 python "25- Batch Runner.py"                         # full-corpus run, no HTTP, checkpointed
 python "15- Database Wipe All Tables.py"             # no-op unless Flag = True near its top
@@ -414,6 +415,12 @@ python tests/test_dashboard_reproducibility_tab.py --update-snapshot  # regenera
 # and no Docker daemon: every Qdrant client is a stand-in and section 1's
 # subprocesses import oncotriage.config only. Not in the collision matrix.
 python tests/test_docker_qdrant_override_and_readiness.py           # 122
+
+# The MCP pass. Same shape, same directory. No keys and NO SPEND -- the judging
+# is stubbed through oncotriage/agent/deps.py. It is NOT offline: sections 4, 5
+# and 6 make real Qdrant round trips, because the readiness gate and the trial
+# lookup are what it exists to prove. Not in the collision matrix. ~2 min.
+python tests/test_mcp_server_stdio_contract.py                      # 135
 
 pip install -e .                                         # makes `oncotriage` importable anywhere
 ```
@@ -2670,6 +2677,81 @@ The three defects the plants found — none of them by reading:
   reported frame is `_offline_control_call` — an assertion a guard that names
   itself cannot satisfy.
 
+
+### The MCP server (the MCP pass)
+
+A second protocol over the same pipeline, beside `oncotriage/api/server.py`.
+`oncotriage/mcp/server.py` exposes three tools on **stdio** — `parse_fhir_bundle`
+and `match_patient` take a **path** to a FHIR bundle, `lookup_trial` takes an NCT
+ID — and every one is a wrapper. The entry point is **`mcp_server.py`** at the
+code root, unnumbered, on the `fixture_capture.py` precedent.
+
+**`python -m oncotriage.mcp` WAS BUILT FIRST AND WAS WITHDRAWN.** It needed
+`oncotriage/mcp/__main__.py` to import `oncotriage.mcp.server` from inside a
+function, because the stdout guard has to wrap that import — and that is exactly
+what `tests/test_package_invariants.py` **check 1b forbids**. The check caught
+it. A top-level script is not a package module, so the deferred import is the
+ordinary entry-point shape and no invariant had to be weakened.
+
+**STDOUT IS THE PROTOCOL CHANNEL, AND THERE ARE TWO WINDOWS.** The client parses
+this process's stdout as JSON-RPC, one message per line; one stray byte ends the
+session. The **serving window** is protected by the SDK itself — mcp 2.0.0's
+`stdio_server()` calls `_claim_fd(1, ...)`, which dups the real stdout to a
+private descriptor and points fd 1 at stderr, so a `print` inside a tool cannot
+reach the wire. The **import window** is not, and this project genuinely writes
+there: `oncotriage/paths.py` line 121 prints `[Paths] Settings module loaded
+from …` at module scope, and the six-line bootstrap prints on the
+not-installed branch. `mcp_server.py` closes it with an fd-level `dup2`,
+released before the transport starts — because `stdio_server()` serves the
+protocol on a duplicate of whatever fd 1 points at, so leaving it diverted would
+write the protocol to **stderr**. `oncotriage/mcp/server.py` adds a per-call
+Python-level redirect on top, which is load-bearing only on the SDK's own
+documented fallback path (`_claim_fd` returns `stream.buffer` unchanged when the
+descriptor cannot be diverted, and then the protocol shares `sys.stdout.buffer`
+with every `print` in the pipeline).
+
+**AN UNUSABLE INDEX RETURNS A MESSAGE WITH NO `matches` KEY, NOT AN EMPTY LIST.**
+The gate reads `oncotriage/agent/readiness.py:probe_index` and is the **third**
+caller to apply its own policy to that module's four-state vocabulary:
+`populated` proceeds; `empty`/`absent` refuse; **`unverifiable` also refuses**,
+which is the API-startup policy and not Stage 2's — an MCP caller sees one JSON
+payload with no channel report, and `match_patient` would otherwise spend a live
+billed Stage 5 call on retrieval nobody could vouch for. The refusal carries no
+`matches`, `result` or `trial` key at all, because a model summarising a payload
+turns an empty list beside a caveat into "no matching trials".
+
+**THE NOT-FOR-CLINICAL-USE FRAMING IS NEW, AND THAT IS A FINDING.** The pass was
+told to reuse the project's existing wording. **There is none** — the whole tree
+was searched and the only hits are Synthea's `-cs clinician seed` flag and a
+comment about what a clinician has to read. `NOT_FOR_CLINICAL_USE` and
+`NOT_FOR_CLINICAL_USE_SHORT` are in `oncotriage/constants.py`, the leaf of the
+import graph, so the API and the dashboard can adopt them; **only the MCP server
+reads them today**, and widening an HTTP response shape is a contract change for
+a pass that measures it.
+
+**`oncotriage/retrieval/trial_lookup.py` IS THE ONE NEW NON-WRAPPER**, and it is
+new because no public "give me the trial with this NCT ID" existed anywhere —
+only an inline `scroll` inside `node_hybrid_retrieval`'s payload backfill. It
+takes the **agent's** client seam on `index_validator`'s precedent (the question
+is about the collection the agent retrieves from), and it **raises** rather than
+reporting `found: False` when the index could not be asked, because "no such
+trial" and "the server is unreachable" are the same empty list at the Qdrant API.
+
+**`mcp==2.0.0` FORCED A SECOND PIN, AND WITHOUT IT THE FASTAPI SERVER BREAKS.**
+mcp requires `sse-starlette>=3.0.0`; that package's current release requires
+`starlette>=0.49.1`; `fastapi==0.117.1` requires `starlette<0.49.0`. Installing
+mcp plain drags starlette to 1.4.1 and `import oncotriage.api.server` then dies
+at `FastAPI(...)` with `TypeError: Router.__init__() got an unexpected keyword
+argument 'on_startup'` — measured, not predicted. `sse-starlette==3.0.2` is the
+newest release whose starlette requirement is an **extra**, so it constrains
+nothing; nothing here uses it, since the server speaks stdio only. The real fix
+is moving fastapi past its cap, which is a serving-layer change item 21 and
+Files 18/19 measure. **Recorded as a follow-up.**
+
+**The client config block is in `oncotriage/mcp/server.py`'s docstring.** Both
+paths in it are absolute on purpose — that rule is about SOURCE, and a client
+launches the server from a working directory nobody here chooses. No `cwd` key
+is needed: the bootstrap finds the package from the script's own `__file__`.
 
 ## Persistence and observability
 

@@ -643,11 +643,16 @@ check("the tree has the subpackages this pass expects (non-degeneracy)",
       # hand-written check of its own.
       # ablation, evaluation and fixtures are new in pass 20c-3d, the last
       # conversion pass: Files 26 and 27, Files 28 and 34, and Files 45 and 46.
+      # oncotriage.mcp is the MCP pass: the stdio Model Context Protocol server
+      # over the same pipeline the API serves. It is named beside the
+      # third-party `mcp` it imports, which is safe because Python 3 resolves
+      # imports absolutely; tests/test_mcp_server_stdio_contract.py section 1
+      # fires that rather than arguing it.
       ["oncotriage.ablation", "oncotriage.agent", "oncotriage.api",
        "oncotriage.batch",
        "oncotriage.dashboard", "oncotriage.dashboard.tabs",
        "oncotriage.evaluation", "oncotriage.extraction", "oncotriage.fhir",
-       "oncotriage.fixtures",
+       "oncotriage.fixtures", "oncotriage.mcp",
        "oncotriage.monitoring", "oncotriage.orchestration",
        "oncotriage.registries", "oncotriage.retrieval",
        "oncotriage.storage"])
@@ -3348,6 +3353,28 @@ _DECORATOR_INVENTORY = {
     # scan.
     "oncotriage/fixtures/capture.py::compute_collection_digest._page":
         ["qdrant_retry"],
+    # ---- The MCP pass ----------------------------------------------------
+    # The stdio server and the trial lookup it wraps. Five of these six are in
+    # oncotriage/mcp/server.py and one is the lookup's paging-free scroll.
+    #
+    # `_counted.decorate.wrapper` carrying `functools.wraps(fn)` is the entry
+    # in this table that is load-bearing rather than descriptive, and it is
+    # worth a sentence because it looks like the most cosmetic line here. The
+    # MCP SDK derives each tool's JSON Schema by calling `inspect.signature` on
+    # the registered callable, and `inspect.signature` follows `__wrapped__`,
+    # which is what `functools.wraps` sets. Without it the three tools
+    # advertised `{"args": string, "kwargs": string}` -- the decorator's own
+    # `*args, **kwargs` -- and no caller could have supplied a valid argument.
+    # Nothing raised; three tools listed; it was found by printing the schema.
+    # tests/test_mcp_server_stdio_contract.py section 2 asserts the parameter
+    # NAMES, and this entry is what makes the decorator's loss visible here too.
+    "oncotriage/mcp/server.py::_stdout_to_stderr": ["contextlib.contextmanager"],
+    "oncotriage/mcp/server.py::_counted.decorate.wrapper": ["functools.wraps(fn)"],
+    "oncotriage/mcp/server.py::parse_fhir_bundle_tool":
+        ["_counted('parse_fhir_bundle')"],
+    "oncotriage/mcp/server.py::match_patient_tool": ["_counted('match_patient')"],
+    "oncotriage/mcp/server.py::lookup_trial_tool": ["_counted('lookup_trial')"],
+    "oncotriage/retrieval/trial_lookup.py::lookup_trial._scroll": ["qdrant_retry"],
     "oncotriage/registries/mesh.py::MeSHCancerFilter._stem": ["staticmethod"],
     "oncotriage/retrieval/indexer.py::get_embeddings_batch._call": [
         "retry(reraise=True, stop=stop_after_attempt(5), "

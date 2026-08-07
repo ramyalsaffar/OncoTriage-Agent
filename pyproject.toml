@@ -183,6 +183,40 @@ dependencies = [
     # --- Agent framework ----------------------------------------------------
     "langgraph==1.0.8",
 
+    # --- Model Context Protocol ---------------------------------------------
+    # The official MCP Python SDK, for `oncotriage/mcp/server.py`. 2.0.0 is the
+    # current release and the one the server was written against: its API is
+    # `from mcp.server import MCPServer` plus `@mcp.tool()`, which is NOT the
+    # `mcp.server.fastmcp.FastMCP` of the 1.x line, so this pin and that code
+    # move together.
+    #
+    # `sse-starlette` IS PINNED HERE AND MCP DOES NOT PIN IT, and that is a
+    # conflict fix rather than a preference. mcp 2.0.0 requires
+    # `sse-starlette>=3.0.0`; the current release of that package, 3.4.8,
+    # requires `starlette>=0.49.1`; and `fastapi==0.117.1` above requires
+    # `starlette<0.49.0`. Installing mcp without this line therefore drags
+    # starlette to 1.4.1 and BREAKS THE FASTAPI SERVER -- measured, not
+    # predicted: `import oncotriage.api.server` then dies at `FastAPI(...)` with
+    # `TypeError: Router.__init__() got an unexpected keyword argument
+    # 'on_startup'`, so item 17, the dashboard's sibling service and the whole
+    # compose stack stop working the moment somebody installs the MCP extra.
+    #
+    # 3.0.2 is the newest release whose starlette requirement is an EXTRA
+    # (`starlette>=0.41.3; extra == "examples"`) rather than a hard dependency,
+    # so it constrains nothing and satisfies mcp's `>=3.0.0`. Every 3.1.0 and
+    # later carries the hard `>=0.49.1`. Nothing in this project uses
+    # sse-starlette at all -- the MCP server speaks stdio and never the SSE or
+    # streamable-HTTP transports -- so pinning it low costs nothing that is
+    # used; it is here purely to keep pip's resolver off starlette.
+    #
+    # THE REAL FIX IS TO MOVE FASTAPI FORWARD, and it is deliberately not done
+    # here: raising fastapi past its starlette cap is a change to the serving
+    # layer that item 21's container bring-up and Files 18/19 measure, and it
+    # does not belong in the pass that added a second protocol. Recorded as a
+    # follow-up.
+    "mcp==2.0.0",
+    "sse-starlette==3.0.2",
+
     # --- API server ---------------------------------------------------------
     "fastapi==0.117.1",
     "uvicorn[standard]==0.40.0",
@@ -297,4 +331,10 @@ packages = [
     "oncotriage.ablation",
     "oncotriage.evaluation",
     "oncotriage.fixtures",
+    # The MCP pass: the stdio Model Context Protocol server. Named
+    # `oncotriage.mcp` beside the third-party `mcp` it imports, which is safe
+    # because Python 3 resolves imports absolutely; the argument and the check
+    # that proves it are in `oncotriage/mcp/__init__.py` and
+    # `tests/test_mcp_server_stdio_contract.py`.
+    "oncotriage.mcp",
 ]
