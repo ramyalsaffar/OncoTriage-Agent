@@ -4,16 +4,32 @@
 # Production-ready multi-service orchestration
 #
 # Quick Start:
-#   docker compose up -d              # Start all services
+#   make up                           # build (with the derived version) + up -d
 #   docker compose logs -f fastapi    # View logs
 #   docker compose down               # Stop all services (volumes survive)
 #   docker compose down -v            # Stop and DELETE the volumes
+#
+# USE `make up`, NOT `docker compose up`, AND THE REASON IS NOT PREFERENCE. The
+# image's version label is derived from oncotriage.__version__ through the
+# APP_VERSION build arg below, and a build handed no value FAILS rather than
+# stamping a stale number. `make` derives it; a bare `docker compose build`
+# prints the one-liner that does the same thing. `docker compose up` on a
+# machine that already has the image is unaffected.
 #
 # Access:
 #   - API Docs: http://localhost:8000/docs
 #   - Dashboard: http://localhost:8501
 #   - Airflow: http://localhost:8080 (admin / admin)
 #   - Qdrant: http://localhost:6333/dashboard
+#
+# A CLEAN `down -v` + `up` LEAVES THE API `unhealthy`, ON PURPOSE. Five services
+# go healthy; `fastapi` reports 503 from GET /health because its Qdrant volume
+# was destroyed and an empty index is not something this pipeline will answer
+# from — every retrieval against one succeeds and returns nothing, which is
+# indistinguishable from a patient who matches no trial. Populate it and the
+# container goes green within one probe interval, no restart:
+# see "DOCKER CLEAN BRING-UP.md" §5. The MeSH lookups, which used to need a
+# hand-typed `docker compose cp`, are seeded from the image on every start.
 #
 # NOTE ON THE AIRFLOW CREDENTIALS ABOVE. This header used to say "admin/check
 # api-server logs for password", which contradicted the file itself:
@@ -104,6 +120,54 @@ x-app-environment: &app-environment
   PYTHONUNBUFFERED: "1"
   # oncotriage/paths.py switches to _DOCKER_PATHS on this (or on /.dockerenv).
   DOCKER_CONTAINER: "true"
+
+  # THE CONTAINER USES THE `qdrant` SERVICE BELOW, AND THIS IS WHAT CARRIES IT.
+  #
+  # `QDRANT_URL: http://qdrant:6333` used to sit on the `fastapi` service and it
+  # NEVER DID ANYTHING. Measured inside the running container on 2026-08-06:
+  #
+  #     os.environ QDRANT_URL before load_env_keys -> http://qdrant:6333
+  #     config.get_qdrant_url()                    -> https://bd717e5f-....qdrant.io
+  #     os.environ QDRANT_URL after  load_env_keys -> https://bd717e5f-....qdrant.io
+  #
+  # `paths.load_env_keys()` POPS OPENAI_API_KEY, QDRANT_URL and QDRANT_API_KEY
+  # out of os.environ and reloads them from /app/.env with `override=True`. That
+  # pop is deliberate — it stops a stale exported credential shadowing the
+  # credentials file — so no environment variable could redirect Qdrant, and the
+  # `qdrant` service started, went healthy, held zero collections and was
+  # queried by nothing while /pipeline/info reported 12,067 trials from the
+  # cloud.
+  #
+  # `ONCOTRIAGE_QDRANT_URL` is the fix and it is a DIFFERENT VARIABLE on
+  # purpose. `QDRANT_URL` in the environment is what an accident looks like — a
+  # leftover export, a CI runner's inherited variable — and it must still lose
+  # to the .env, and it still does: the pop is untouched. This one is
+  # project-prefixed, nothing else in any tool's namespace sets it, and
+  # `oncotriage/config.py` prints which source answered before the first
+  # request. See oncotriage/settings.py:ENV_QDRANT_URL for the full argument.
+  #
+  # NO `ONCOTRIAGE_QDRANT_API_KEY` HERE, AND THAT IS THE POINT RATHER THAN AN
+  # OMISSION. With the URL overridden and no key named, `config` sends NO KEY AT
+  # ALL rather than falling back to the .env's — which is a Qdrant Cloud
+  # credential, and forwarding it to a host named by an environment variable is
+  # credential exfiltration by configuration. The `qdrant` service below sets no
+  # QDRANT__SERVICE__API_KEY, so it ignores the header entirely.
+  #
+  # THE .env IS STILL MOUNTED AND STILL REQUIRED: OPENAI_API_KEY comes from it,
+  # and Stage 2's dense channel and Stage 5 both need that.
+  #
+  # THIS SERVICE'S QDRANT STARTS EMPTY. `docker compose down -v` destroys its
+  # volume, and an empty index is not a quiet degradation — Stage 2 now refuses
+  # to run against one (oncotriage/agent/readiness.py) and GET /health returns
+  # 503 naming it. To populate it, from the host, with the stack up:
+  #
+  #     ONCOTRIAGE_QDRANT_URL=http://localhost:6333 \
+  #         python "11- RAG Trial Indexer.py" --mode direct
+  #
+  # (`localhost` from the host, `qdrant` from inside the network — the same
+  # server either way. `--mode direct` because a staging build plus an alias
+  # swap is for a live index that must not blink, and this one is empty.)
+  ONCOTRIAGE_QDRANT_URL: http://qdrant:6333
 
 x-app-volumes: &app-volumes
   # THERE IS NO `.:/app` HERE ANY MORE, and removing it was forced by a
@@ -271,35 +335,24 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # THE IMAGE'S VERSION LABEL, DERIVED. `oncotriage/__init__.py` is the
+        # single declaration of this project's version; a Dockerfile LABEL
+        # cannot read a Python attribute, so it arrives as this ARG and a
+        # `RUN --check` in STAGE 2 fails the build if it disagrees with the
+        # source that was copied in.
+        #
+        # `:-unset` is NOT a default version — it is a sentinel the guard
+        # rejects. A bare `docker compose build` therefore FAILS with a message
+        # naming `make build`, which is the trade this closure cost and is
+        # argued at the ARG in the Dockerfile. The Makefile derives the value
+        # with docker/app_version.py; so does the one-liner the guard prints.
+        APP_VERSION: ${ONCOTRIAGE_APP_VERSION:-unset}
     container_name: Clinical-Trial-Patient-Match-api
     restart: unless-stopped
     ports:
       - "8000:8000"
     volumes: *app-volumes
-    # `QDRANT_URL: http://qdrant:6333` USED TO BE HERE AND IT NEVER DID ANYTHING.
-    # Removed rather than left as a comforting lie. Measured inside the running
-    # container:
-    #
-    #   os.environ QDRANT_URL before load_env_keys -> http://qdrant:6333
-    #   config.get_qdrant_url()                    -> https://bd717e5f-....qdrant.io
-    #   os.environ QDRANT_URL after  load_env_keys -> https://bd717e5f-....qdrant.io
-    #
-    # `oncotriage/config.py:get_qdrant_url()` returns `get_keys()['qdrant_url']`,
-    # and `get_keys()` calls `paths.load_env_keys()`, which POPS all three key
-    # names out of os.environ and reloads them from the .env file with
-    # `override=True`. That is deliberate there — it exists so a stale exported
-    # variable cannot shadow the credentials file — and the consequence here is
-    # that no environment variable can redirect Qdrant. The .env in
-    # "05- Keys/" points at Qdrant Cloud.
-    #
-    # SO THE `qdrant` SERVICE BELOW IS NOT USED BY THE APPLICATION. It starts, it
-    # is healthy, and `GET /collections` on it returns an empty list while
-    # `/pipeline/info` reports 12,067 indexed trials — from the cloud. The
-    # service is kept because it is declared infrastructure and because the
-    # index-build path (`11- RAG Trial Indexer.py`) is where a local Qdrant
-    # would be pointed; making the container actually use it needs a change in
-    # `oncotriage`, not in this file, and that is reported as a follow-up rather
-    # than smuggled in here.
     environment: *app-environment
     working_dir: /app
     # NO SHELL AND NO QUOTING PROBLEM. The old command wrapped everything in

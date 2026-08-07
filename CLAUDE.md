@@ -97,7 +97,8 @@ Verified rather than assumed. It is the same object as
 
 | Module | Holds | Imports |
 |---|---|---|
-| `oncotriage/settings.py` | `ENV_*` names, `resolve_*_path()`, `DegradedDependencyError` + `resolve_allow_degraded_registries()` (item 11a) | nothing from the project |
+| `oncotriage/settings.py` | `ENV_*` names, `resolve_*_path()`, `DegradedDependencyError` + `resolve_allow_degraded_registries()` (item 11a), `resolve_qdrant_url()` / `resolve_qdrant_api_key()` (Docker pass) | nothing from the project |
+| `oncotriage/agent/readiness.py` | the index probe (`probe_index`, four named states), Stage 2's gate (`require_populated_index`, `EmptyIndexError`), the API's startup gate (`serving_readiness`) | `config`, `agent.deps`, `registries.mesh`, `settings` |
 | `oncotriage/paths.py` | `IS_DOCKER`, `_glob_one`, every path variable (**lazy**), `load_env_keys()` | `settings` |
 | `oncotriage/constants.py` | `SYSTEM_KEY_ABSENT` / `SYSTEM_KEY_UNRECOGNIZED` | nothing at all |
 | `oncotriage/config.py` | every tunable, `PRICING_CONFIG`, `DATA_SNAPSHOT_DATE`, lazy client factories | `paths` |
@@ -363,9 +364,13 @@ python "07- FHIR Parser.py"                          # smoke run: parse the corp
 python "09- MeSH Cancer Site Relevance Filter.py"    # rebuild the MeSH C04 + UMLS lookups
 python "13- LangGraph Agent.py"                      # no-op unless RUN_TEST_ON_EXECUTE = True; COSTS MONEY
 
-# Docker (all five services)
-docker compose build && docker compose up -d
+# Docker (all six services)
+make up                                              # build + up -d; `make build` alone builds
 docker compose logs -f fastapi
+# A clean `docker compose down -v` + `up` leaves the API deliberately UNHEALTHY:
+# its Qdrant volume is gone and an empty index raises rather than answering.
+# The MeSH lookups need no manual copy. See "DOCKER CLEAN BRING-UP.md" §5.
+ONCOTRIAGE_QDRANT_URL=http://localhost:6333 python "11- RAG Trial Indexer.py" --mode direct
 ```
 
 ```bash
@@ -404,6 +409,12 @@ python tests/test_ablation_db_isolation.py                         #  72 (was 43
 # writes nothing in the repository, and is not in the collision matrix.
 python tests/test_dashboard_reproducibility_tab.py                 # 200 (was 163; pass 20f-6 added the template-pool controls, the offline guard and the enrichment-divergence check); ~1.7 s
 python tests/test_dashboard_reproducibility_tab.py --update-snapshot  # regenerate the golden snapshot ON PURPOSE
+
+# The Docker pass. Same shape, same directory. No network, no keys, no spend,
+# and no Docker daemon: every Qdrant client is a stand-in and section 1's
+# subprocesses import oncotriage.config only. Not in the collision matrix.
+python tests/test_docker_qdrant_override_and_readiness.py           # 122
+
 pip install -e .                                         # makes `oncotriage` importable anywhere
 ```
 
@@ -524,9 +535,11 @@ named in `oncotriage/settings.py`, does **not** go through `_from_env`, and does
 **not** reach `oncotriage/fhir/clean.py`'s deletion path. See "Degraded
 dependencies (item 11a)" below.
 
+`ONCOTRIAGE_QDRANT_URL` moves the Qdrant endpoint, and `ONCOTRIAGE_QDRANT_API_KEY` the credential; both are named in `oncotriage/settings.py` and neither goes through `_from_env`. See "The Qdrant endpoint has one deliberate override (the Docker pass)" below — the short version is that `QDRANT_URL` in the environment is an ACCIDENT and still loses to the .env, because `load_env_keys()` pops it, and this one is a DECISION and wins.
+
 `ONCOTRIAGE_INFERENCES_DB` overrides `inferences_path` for **both** database writers (`resolve_inference_db_path`, `resolve_drift_db_path`) and is the only way to redirect a running FastAPI server; it is named in `oncotriage/settings.py` and does **not** go through `_from_env`. See the Tests paragraph above for what it is for and why the helper would corrupt it.
 
-`docker-compose.yml` mounts `.env` from a mix of `../04- Keys/` and `../05- Keys/`; only `05- Keys/` exists. Measured per service in pass 20c-3c-2, and it is a **two-two split, not a stray line**: `fastapi` (line 65) and `airflow-webserver` (line 139) mount `../04- Keys/.env`, which **does not exist**, so Docker creates an empty *directory* at that host path and bind-mounts it as `/app/.env` — the container gets a directory where a file should be, and `load_env_keys()` fails with `.env file not found` or an `IsADirectoryError` depending on how it is reached. `streamlit` (line 101) and `airflow-scheduler` (line 184) mount `../05- Keys/.env`, which is correct. Left untouched: it belongs to the Docker item.
+**THE `../04- Keys/` MOUNT IS FIXED AND THIS PARAGRAPH USED TO SAY IT WAS NOT** — corrected during the Docker pass, which measured the compose file rather than re-reading this note. What was true: pass 20c-3c-2 found a **two-two split, not a stray line** — `fastapi` and `airflow-webserver` mounted `../04- Keys/.env`, which does not exist, so Docker created an empty *directory* at that host path and bind-mounted it as `/app/.env`, and `load_env_keys()` failed with `.env file not found` or an `IsADirectoryError` depending on how it was reached; `streamlit` and `airflow-scheduler` were correct. **Item 21 closed it**: all four (now five, with `airflow-dag-processor`) name `../05- Keys/.env`, and every one carries `create_host_path: false`, which turns a missing or misspelled credentials path from a silently-mounted empty directory into a failure at `up` that names the path. The only occurrences of `04- Keys` left in `docker-compose.yml` are the two comments recording the fix.
 
 **The `AIRFLOW__CORE__DAGS_FOLDER` line is NOT a defect, and pass 20c-3c-2 checked rather than repeated the claim.** `docker-compose.yml` lines 148 and 192 set it to `/app/airflow_home/dags`; `oncotriage/paths.py` line 291 sets the Docker-branch `airflow_path` to `/app/airflow_home/`; and `write_dag_file(dags_root)` writes to `Path(dags_root) / 'dags'`. Those are the same directory, and `AIRFLOW_HOME=/app/airflow_home` agrees with both. What IS true is that **nothing in the container ever runs File 23** — the webserver's command is `mkdir -p /app/airflow_home/dags && airflow db migrate && airflow api-server`, and the scheduler's is `sleep 30 && airflow scheduler`. So the DAG folder is created empty and the scheduler parses an empty directory forever. That is the real Docker-item defect in this area, and it is a missing generation step, not a path mismatch.
 
@@ -1504,6 +1517,175 @@ was read at 1,106 rows before the matrix and 1,106 after.
 of the four never ran.** It reads `All tests attempted.` and the summary below it
 says which.
 
+
+### The Qdrant endpoint has one deliberate override, and a clean stack cannot report healthy while unusable (the Docker pass)
+
+**FOUR THINGS, AND THE FIRST ONE SETTLES A DISAGREEMENT BETWEEN TWO DOCUMENTS
+IN THIS REPOSITORY.** Measured 2026-08-06/07 by running it, not by reading:
+
+| Question | Answer |
+|---|---|
+| `QDRANT_URL` in `05- Keys/.env` | `https://bd717e5f-…us-east-1-1.aws.cloud.qdrant.io` — **Qdrant Cloud**, mtime 2026-08-03, never repointed |
+| `config.get_qdrant_url()` on the HOST | the same cloud URL |
+| ...INSIDE the container (before this pass) | the same cloud URL |
+| points at that URL | **12,067** on `trial_criteria` → `trial_criteria_20260803_104642` |
+| the compose `qdrant` service | `{"collections":[]}` — **nothing**, and it was queried by nothing |
+
+`DOCKER CLEAN BRING-UP.md` §2b and `docker-compose.yml`'s comment block both
+recorded the cloud measurement and were **both right**. Nothing in this
+repository ever claimed the .env had been repointed at a local Qdrant — the
+whole-tree grep for such a claim is in the Docker pass's report. **The disagreement
+is between the compose file and ITSELF**: its header advertises
+`Qdrant: http://localhost:6333/dashboard` as one of the stack's four access
+points while its own `fastapi` comment records that the service is used by
+nothing.
+
+**1. `ONCOTRIAGE_QDRANT_URL` IS THE DELIBERATE OVERRIDE, AND THE POP THAT MADE
+IT NECESSARY IS KEPT.** `paths.load_env_keys()` POPS `OPENAI_API_KEY`,
+`QDRANT_URL` and `QDRANT_API_KEY` out of `os.environ` and reloads all three from
+the .env with `override=True`, so `QDRANT_URL: http://qdrant:6333` in
+docker-compose.yml was set, popped, and reached nothing. That pop exists so a
+stale exported credential cannot shadow the credentials file, and it is
+untouched. What is added is a second tier that beats it, on the
+`ENV_INFERENCES_DB` precedent: a project-prefixed name, resolved by its own
+function (**not** `_from_env`, which appends `os.sep` — harmless-looking on a
+URL and fatal on Windows), returning `(value, source)`, with
+`oncotriage/config.py` printing which source won before the first request. All
+four required behaviours were driven in separate subprocesses, because `config`
+caches per process:
+
+    no override                    -> .env url, .env key
+    QDRANT_URL exported            -> .env url, .env key      (accident still loses)
+    ONCOTRIAGE_QDRANT_URL          -> that url, NO KEY AT ALL
+    ...and ONCOTRIAGE_QDRANT_API_KEY -> that url, that key
+    BOTH set                       -> the project-prefixed one wins
+    a value that is not a URL      -> RAISES, naming the variable
+
+**THE KEY DOES NOT FOLLOW THE URL, and that is the point rather than an
+omission.** With the URL overridden and no key named, **no key is sent** — the
+.env's is deliberately not consulted. A key is issued by one endpoint for one
+endpoint, and forwarding a live Qdrant Cloud credential to a host named in an
+environment variable is credential exfiltration by configuration, of the kind
+that leaves no trace because the request succeeds. Redirecting to a second
+authenticated cluster without naming its key gets a 401 that names the host and
+is one variable away from fixed.
+
+**2. AN EMPTY INDEX RAISES INSTEAD OF ANSWERING.** Every Qdrant call in Stage 2
+SUCCEEDS against a collection with zero points and returns an empty list; the
+graph routes to `node_no_candidates`, the API returns 200 with "no eligible
+trials found", and the stored row is well-formed — the same output a genuinely
+unmatchable patient produces. Nothing raises, no counter moves.
+`oncotriage/agent/readiness.py` answers with a **closed four-state vocabulary**
+(`populated` / `empty` / `absent` / `unverifiable`) and the two callers apply
+different policies, each written at its own call site:
+
+- **Stage 2, per request:** `empty`/`absent` RAISE `EmptyIndexError`;
+  `unverifiable` is COUNTED (`INDEX_PROBE_FAILURES`), printed and CONTINUES —
+  a probe that could not run is not evidence of emptiness, and blocking on it
+  would put a new hard dependency in front of machinery designed to degrade.
+  The gate runs **before** the channel `try`, because each channel is wrapped in
+  `except Exception` and a raise from inside would be absorbed into "one channel
+  was unavailable" — the report that hides this exact fault.
+- **API startup, and every `/health`:** `unverifiable` is NOT ready. A startup
+  probe can afford to demand proof.
+
+`absent` is deliberately not folded into `empty`: the operator's next command
+differs. The probe itself RAISES NOTHING — it is a diagnostic, and
+`/pipeline/info` routes its trial count through it precisely so the endpoint an
+operator asks first survives the failure they are asking about.
+
+**3. "HEALTHY" MEANS "SERVICEABLE".** `GET /health` returns **503** while a
+required dependency is missing, which is what `curl -f` in the compose
+healthcheck reads. It RE-PROBES rather than reporting what startup found, so a
+stack recovers on its own once the index is populated — measured: 503 → 200
+immediately, Docker's healthcheck following within one 10-second interval, no
+restart. `pipeline_ready` is kept and still means "the graph compiled"; it is
+now one field among several rather than the whole answer, because it was the
+field that reported `true` while the server was unusable. Item 11a's
+`DegradedDependencyError` is **surfaced earlier, not replaced**: its message,
+naming both missing files and the rebuild command, is carried verbatim into the
+`/health` body.
+
+**4. THE MeSH CORE LOOKUPS ARE PROVISIONED WITH NO MANUAL STEP, AND
+`DOCKER CLEAN BRING-UP.md` §3's DECIDING PREMISE WAS NEVER MEASURED.** That
+section rejected "bake them into the image" partly because the lookups are
+"generated from two multi-hundred-megabyte source files". That is the size of
+the SOURCES. The two files `load_mesh_filter()` REQUIRES total **107,282 bytes**
+and are built from `desc2026.xml` alone — NLM MeSH, public domain. They are
+vendored at `docker/mesh-core/` and seeded into the volume by
+`docker/prepare_paths.py` on every start: verified against a sha256 manifest
+(a truncated lookup is still valid JSON, so a `json.load` guard would pass it),
+written with write-to-temp + `os.replace` so five containers racing on a fresh
+volume cannot tear a file, and **never overwriting** a file already there.
+The three OPTIONAL crosswalks are UMLS-derived and are deliberately NOT vendored
+— that is a licensing question, not an engineering one — so they keep the
+documented `docker compose cp` step and their `NOTE:` lines.
+
+They go to an image-only path and NOT to `/app/data/mesh/`: Docker initialises a
+fresh named volume by copying the image content at the mount path, five
+containers do it at once, and the concurrent `mkdir` fails — the intermittent
+bring-up failure pass 20g fixed by emptying those mount points.
+
+**5. THE VERSION LABEL IS DERIVED; THE COUNT OF HAND-MAINTAINED VERSION STRINGS
+IS ZERO** (it was one). `LABEL version="1.0.0"` was the site pass 20f-2 named as
+a follow-up and left, because "a Dockerfile LABEL cannot read a Python
+attribute" — true, and the reason the value arrives as `ARG APP_VERSION`.
+`docker/app_version.py` derives it by reading `oncotriage/__init__.py` as TEXT
+(the host may not have the package installed, and an `import` there could
+resolve to another copy); the Makefile and `docker-compose.yml`'s `build.args`
+call it; and a `RUN --check` after the source `COPY` **fails the build** when the
+ARG disagrees. **The cost is stated rather than hidden: a bare
+`docker compose build` now fails**, printing `make build`. That is the trade for
+"a stale label cannot ship", and `docker compose up` on a machine that already
+has the image is unaffected.
+
+**WHAT WAS VERIFIED BY RUNNING IT.** A genuinely clean `docker compose down -v`
++ `up`, twice, with nothing copied in by hand: `up -d` returns at t+11.6 s, five
+services healthy at t+22 s, `fastapi` **unhealthy** at t+140.6 s naming the empty
+index — which is the empty-index probe firing in production rather than in a
+test. MeSH `loaded` with no manual step. After migrating the cloud collection
+into the sidecar (12,067 points, 65–79 s, free — see `DOCKER CLEAN BRING-UP.md`
+§5 and why re-scraping would produce a different corpus), 6/6 healthy. **One live
+`POST /match`: HTTP 200 in 159.0 s, $0.18084, 1 inference row + 15 trial_matches
+rows, surviving both a restart and a rebuild-and-recreate.** The production
+`inferences.db` read 1,106 rows before and 1,106 after. **The cost is not in the
+response** — `/match` returns token counts and no dollar figure; it is
+`inferences.estimated_cost_usd`.
+
+**EVERY NEW ASSERTION WAS SHOWN TO FAIL.**
+`tests/test_docker_qdrant_override_and_readiness.py` is 122 checks, no network,
+no keys, no spend, no Docker daemon, and not in the collision matrix (derived:
+it writes only in a temp directory and the four repository files it READS are
+written by neither of the suite's two writers). A revert harness broke each of
+the seven changes in place — with `PYTHONDONTWRITEBYTECODE=1` and an explicit
+`__pycache__` clear, the pass 20f-1 lesson — and **7/7 fired, every restore
+byte-identical**.
+
+**AND THE HARNESS FOUND THREE DEFECTS IN THIS PASS'S OWN WORK THAT READING DID
+NOT.** (i) Section 1 originally asserted on `qdrant_endpoint_sources()`, the
+REPORTER; reverting `get_qdrant_url()` to its pre-pass body — the whole defect —
+left every check passing. It reads the two functions `get_qdrant_client()` is
+built from now, and asserts by AST that those are the two it passes. (ii) A bare
+`next(...)` in section 8 raised `StopIteration` when the gate was removed —
+exactly the edit the section exists to catch — so the run reported one traceback
+where it owed a summary and 114 results. **That is the third time this project
+has shipped that shape**, after `tests/test_storage_query_layer.py` and
+`tests/test_dashboard_reproducibility_tab.py`. (iii) Three assertions searched
+`Dockerfile` and `docker-compose.yml` as strings and were satisfied or defeated
+by the COMMENTS EXPLAINING THEM — a file that argues about its own settings
+cannot be grepped for them; they read instruction lines and comment-stripped
+settings now.
+
+**One pre-existing defect was found and fixed in `tests/test_package_invariants.py`.**
+Its config↔utils cycle control planted with the bare substring
+`"from oncotriage import paths"`, which this pass's edit to that import line
+matched IN THE MIDDLE — so the control spliced its plant into a statement and
+produced a SyntaxError-free import of a name `utils` does not export. The copied
+package then failed for a reason unrelated to the cycle, and the check whose
+whole point is that this import order SUCCEEDS reported a failure that was true
+of the control and false of the package. **A control that plants the wrong thing
+is worse than no control: it fails, so it looks like it is working.** The needle
+is line-anchored now and a future edit hits the `fail()` beneath it by name.
 
 ### The Docker image was a pre-20e build; item 21 re-verified against a rebuild (pass 20g)
 

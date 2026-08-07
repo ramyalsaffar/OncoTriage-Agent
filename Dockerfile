@@ -36,16 +36,16 @@
 #      `pyproject.toml`'s `[project] dependencies`. This stage copies that file
 #      alone and extracts the list from it; see STAGE 1.
 #
-#   PASS 20f-2 ALSO LEFT ONE THING HERE UNRECONCILED, ON PURPOSE. The LABEL
-#   `version="1.0.0"` in STAGE 2 is a FOURTH version number, beside
-#   `oncotriage.__version__` (2.0.0), which the FastAPI app, GET /pipeline/info
-#   and `pip show oncotriage` now all derive from. It is not derived, because a
-#   Dockerfile LABEL cannot read a Python attribute: closing it means an `ARG
-#   ONCOTRIAGE_VERSION` here plus a `build.args` entry in docker-compose.yml
-#   plus something to keep THAT in step — which is a build-plumbing decision,
-#   not the release decision item 3 of that pass made. RECORDED AS A FOLLOW-UP,
-#   and named here rather than in a commit message so the next reader of this
-#   file sees the number is known to be stale.
+#   PASS 20f-2's FOLLOW-UP HERE IS CLOSED. The LABEL `version="1.0.0"` in
+#   STAGE 2 was a FOURTH version number beside `oncotriage.__version__` (2.0.0),
+#   which the FastAPI app, GET /pipeline/info and `pip show oncotriage` all
+#   derive from. That pass named the plumbing it would take — "an ARG here plus
+#   a `build.args` entry in docker-compose.yml plus something to keep THAT in
+#   step" — and all three now exist: `docker/app_version.py` is the something,
+#   the Makefile and the compose file call it, and a `RUN --check` after the
+#   source COPY fails the build if the ARG disagrees with the source. THE COUNT
+#   OF HAND-MAINTAINED VERSION STRINGS IN THIS PROJECT IS ZERO. See the ARG at
+#   the top of STAGE 2 for the trade that closing it cost.
 #   2. The image never installed the package. It relied on `PYTHONPATH=/app`,
 #      which is a different mechanism with different failure modes. It now does
 #      an editable install; PYTHONPATH is gone. See STAGE 2.
@@ -154,10 +154,35 @@ open('/tmp/requirements.txt','w').write('\n'.join(deps) + '\n')" && \
 # ===========================================================================
 FROM python:3.11-slim@sha256:94c50be2dc994b873b55bc123e95e6dbade08095b3dfd790f51c34de3f08cbb7
 
+# THE VERSION LABEL IS DERIVED, AND A WRONG ONE FAILS THE BUILD.
+#
+# Pass 20f-2 made oncotriage/__init__.py:__version__ the single declaration and
+# left this label as a FOURTH number, "1.0.0", beside a package that said 2.0.0.
+# It recorded the reason: a LABEL cannot read a Python attribute. That is still
+# true, so the value arrives as a build ARG — and an ARG somebody has to supply
+# is a fifth hand-maintained site unless two things are also true:
+#
+#   * something DERIVES it (docker/app_version.py, called by the Makefile and
+#     interpolated into docker-compose.yml's build.args), and
+#   * a wrong or absent value cannot ship (the RUN --check below).
+#
+# THE DEFAULT IS A SENTINEL THAT CANNOT PASS THE CHECK, deliberately. `unset` is
+# not a version; a build that reaches the guard with it stops and names
+# `make build`. The alternative — defaulting to the real number here — would put
+# the literal back in this file, which is the entire defect.
+#
+# THE COST, STATED: a bare `docker compose build` now fails instead of silently
+# labelling the image wrong. That is a real usability regression and it is the
+# intended trade. `make build` and `make up` supply the arg; so does the
+# one-liner the guard prints. A stale version label is the kind of thing nobody
+# notices until it is being used to decide what is deployed.
+ARG APP_VERSION=unset
+
 # Set metadata for security scanning and compliance
 LABEL maintainer="Ramy Alsaffar" \
       description="Clinical-Trial-Patient-Match - Clinical Trial Matching System" \
-      version="1.0.0" \
+      version="${APP_VERSION}" \
+      org.opencontainers.image.version="${APP_VERSION}" \
       org.opencontainers.image.source="https://github.com/ramyalsaffar/trialbridge-ai" \
       org.opencontainers.image.vendor="Ramy Alsaffar" \
       org.opencontainers.image.title="Clinical-Trial-Patient-Match" \
@@ -298,8 +323,26 @@ COPY --chown=appuser:appuser . /app/
 # entrypoint with whatever happens to be in a working tree.
 COPY --chown=appuser:appuser docker/entrypoint.sh /usr/local/bin/oncotriage-entrypoint
 COPY --chown=appuser:appuser docker/prepare_paths.py docker/generate_dag.py \
+     docker/app_version.py \
      /usr/local/lib/oncotriage-docker/
 RUN chmod 0755 /usr/local/bin/oncotriage-entrypoint
+
+# THE TWO MeSH LOOKUPS load_mesh_filter() REQUIRES, 105 KB, vendored.
+#
+# They go to an IMAGE-ONLY path and NOT to /app/data/mesh/, and that is not a
+# preference. /app/data is a named volume, and Docker initialises a fresh volume
+# by copying the image content at the mount path into it — concurrently, once
+# per container, and the concurrent mkdir FAILS. That is the exact intermittent
+# clean-bring-up failure pass 20g fixed by emptying these mount points; putting
+# data back under one would put the race back with it.
+#
+# docker/prepare_paths.py:seed_mesh_core() copies them into the volume on every
+# start instead: idempotent, never overwriting a file already there, and
+# verified against docker/mesh-core/PROVENANCE.json before it writes. See
+# docker/mesh-core/PROVENANCE.md for why these two and not the other three, and
+# for the measurement that overturned DOCKER CLEAN BRING-UP.md §3's claim that
+# this could not be done.
+COPY --chown=appuser:appuser docker/mesh-core/ /usr/local/lib/oncotriage-docker/mesh-core/
 
 # Switch to non-root user for runtime
 # CRITICAL: All processes run as appuser, not root
@@ -346,6 +389,22 @@ USER appuser
 #                       fresh build environment over the network at image-build
 #                       time.
 RUN pip install --no-deps --no-build-isolation --editable /app
+
+# THE VERSION GUARD. See the ARG at the top of this stage for why it exists.
+#
+# It runs HERE, after `COPY . /app/`, because that is the first point at which
+# /app/oncotriage/__init__.py — the single declaration — is in the image to be
+# compared against. It reads the file as text rather than importing the package,
+# so the check costs nothing and cannot be answered by a different copy on
+# sys.path.
+#
+# A mismatch or the `unset` default fails the build and prints the command that
+# supplies the value. The ARG is NOT re-declared here: it is declared once at the
+# top of this stage and an ARG stays in scope for the rest of the stage it is
+# declared in. A second bare `ARG APP_VERSION` would RESET it to empty when the
+# build arg is not supplied, which would make the guard's message say `''`
+# instead of `unset` — a worse diagnostic for the commonest failure.
+RUN python /usr/local/lib/oncotriage-docker/app_version.py --check "${APP_VERSION}"
 
 # Expose ports (documentation only)
 EXPOSE 8000 8501 8080

@@ -128,6 +128,84 @@ because that is the case sqlite cannot recover from and the one that would
 otherwise be swallowed by ``log_inference``'s broad except.
 """
 
+ENV_QDRANT_URL = "ONCOTRIAGE_QDRANT_URL"
+"""Endpoint of the Qdrant server, overriding the ``QDRANT_URL`` line in the .env.
+
+NOT A PATH, which is why it is resolved by its own function below rather than by
+``_from_env``. That helper runs every value through ``with_trailing_sep``, which
+appends ``os.sep`` -- on macOS and Linux that turns ``http://qdrant:6333`` into
+``http://qdrant:6333/``, which qdrant-client happens to tolerate, and on Windows
+into ``http://qdrant:6333\\``, which it does not. A helper whose correctness
+depends on which operating system the container host runs is not a helper. Same
+reasoning as ENV_AIRFLOW_PASSWORD, ENV_INFERENCES_DB and
+ENV_ALLOW_DEGRADED_REGISTRIES; fourth victim.
+
+WHY THIS EXISTS, AND WHY IT IS NOT SIMPLY ``QDRANT_URL``. ``paths.load_env_keys()``
+POPS ``OPENAI_API_KEY``, ``QDRANT_URL`` and ``QDRANT_API_KEY`` out of
+``os.environ`` and reloads all three from the .env with ``override=True``. That
+pop is deliberate and is KEPT: it exists so a stale exported credential cannot
+shadow the credentials file, which is the direction that silently sends a
+production key to the wrong endpoint or a dead key to the right one. The
+consequence, measured inside the running container on 2026-08-06, was that
+``QDRANT_URL: http://qdrant:6333`` in docker-compose.yml set the variable, was
+popped, and the client still opened Qdrant Cloud -- so the compose `qdrant`
+service was declared, started, healthy, and used by nothing.
+
+So there are two different intents wearing one variable name, and they are split
+rather than reconciled:
+
+  * ``QDRANT_URL`` in the environment is an ACCIDENT -- a leftover export, a
+    shell profile, a CI runner's inherited variable. It must not win, and it
+    still does not: the pop is untouched.
+  * ``ONCOTRIAGE_QDRANT_URL`` is a DECISION. Nothing exports it by accident;
+    the prefix is this project's and it appears in no other tool's namespace.
+    It wins, and ``oncotriage.config`` prints which source answered.
+
+That asymmetry is the whole design. It is the same shape as ENV_INFERENCES_DB,
+which redirects a database that otherwise resolves from ``paths`` -- a named,
+project-prefixed variable beating a default, with the accidental route left
+closed.
+
+WHAT IT DOES NOT VALIDATE: that anything is listening. A URL that resolves to
+nothing fails at the first client call, loudly, naming the endpoint; a
+connectivity probe here would open a socket at settings-resolution time, which
+is the one thing every module in this package promises not to do at import.
+What IS checked is that the value looks like a URL at all -- see
+``resolve_qdrant_url``.
+
+THE API KEY DOES NOT FOLLOW THE URL. See ENV_QDRANT_API_KEY.
+"""
+
+ENV_QDRANT_API_KEY = "ONCOTRIAGE_QDRANT_API_KEY"
+"""API key for the Qdrant server, overriding the ``QDRANT_API_KEY`` .env line.
+
+NOT A PATH, and a credential besides, so ``_from_env``'s trailing separator
+would corrupt it exactly the way it would corrupt ENV_AIRFLOW_PASSWORD.
+
+READ ONLY WHEN ENV_QDRANT_URL IS ALSO SET, and that coupling is the point rather
+than an omission. A key is a credential issued BY one endpoint FOR one endpoint.
+If ``ONCOTRIAGE_QDRANT_URL`` redirects the client to a host the operator named
+in an environment variable, sending the .env's Qdrant Cloud key along to it
+would forward a live production credential to an arbitrary address on the
+strength of one exported string -- credential exfiltration by configuration, and
+the kind that leaves no trace because the request succeeds.
+
+So the rule is:
+
+    URL not overridden  -> .env url,      .env key
+    URL overridden, key overridden -> override url, override key
+    URL overridden, key NOT overridden -> override url, NO KEY AT ALL
+
+The third row is the ordinary case and it is what the compose stack uses: a
+local Qdrant with no ``QDRANT__SERVICE__API_KEY`` configured ignores the header
+entirely. Redirecting to a SECOND authenticated cluster without naming its key
+gets a 401/403 from that cluster, which names the host and is one variable away
+from fixed -- loud, immediate, and strictly better than the silent forward.
+
+``oncotriage.config`` prints which of the three rows applied on every process
+that opens a Qdrant client, so a run never has to be guessed at afterwards.
+"""
+
 ENV_ALLOW_DEGRADED_REGISTRIES = "ONCOTRIAGE_ALLOW_DEGRADED_REGISTRIES"
 """Permit the pipeline to run with a detection layer MISSING rather than raise.
 
@@ -481,6 +559,83 @@ def resolve_inferences_db():
             f"    export {ENV_INFERENCES_DB}='/tmp/oncotriage-test.db'"
         )
     return path, ENV_INFERENCES_DB
+
+
+def resolve_qdrant_url():
+    """Resolve the Qdrant endpoint override from the environment.
+
+    DELIBERATELY NOT ``_from_env``, for the reason written at ENV_QDRANT_URL:
+    that helper appends ``os.sep``, which is right for a directory and wrong for
+    a URL on every platform and catastrophic on one of them.
+
+    Returns:
+        (url, source) where source is ENV_QDRANT_URL when the variable was set
+        to a non-empty value, or (None, None) when it was not. Like the password
+        and inferences-database resolvers, this invents no fallback: "not set"
+        means the caller should use its own default, and the caller
+        (``oncotriage.config``) is the only thing that knows the default is the
+        .env.
+
+    Whitespace is stripped, for the same reason ``resolve_inferences_db`` strips
+    it: ``export ONCOTRIAGE_QDRANT_URL=$(cat somefile)`` carries a trailing
+    newline, and a URL ending in "\\n" fails to connect with an error about the
+    host rather than about the variable.
+
+    Raises:
+        RuntimeError: the value does not begin with ``http://`` or ``https://``.
+            This is the one check worth making eagerly, and it is a check about
+            SHAPE, not about reachability. ``QdrantClient(url=...)`` accepts a
+            bare host and then behaves in ways that depend on the value: it may
+            treat it as a path, or default a port, and the failure surfaces
+            later as a connection error naming something the operator never
+            typed. Naming the variable here costs one comparison and turns a
+            confusing runtime failure into a configuration message. Reachability
+            is deliberately NOT probed -- opening a socket while resolving a
+            setting is the one thing every module in this package promises not
+            to do outside a call the caller asked for.
+    """
+    raw = os.environ.get(ENV_QDRANT_URL)
+    if raw is None or raw.strip() == "":
+        return None, None
+
+    url = raw.strip()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise RuntimeError(
+            f"{ENV_QDRANT_URL} is set to {raw!r}, which is not a URL.\n"
+            f"  It must begin with 'http://' or 'https://', e.g.\n"
+            f"      export {ENV_QDRANT_URL}='http://localhost:6333'\n"
+            f"  A bare host is accepted by QdrantClient and then interpreted in "
+            f"a way that depends on the value, so the connection failure that "
+            f"follows names a host nobody typed."
+        )
+    return url, ENV_QDRANT_URL
+
+
+def resolve_qdrant_api_key():
+    """Resolve the Qdrant API key override from the environment.
+
+    DELIBERATELY NOT ``_from_env``: a credential with a separator appended is a
+    credential that authenticates nowhere, and the server's answer to it (401)
+    says nothing about a trailing slash. Same reasoning as
+    ``resolve_airflow_password``.
+
+    Returns:
+        (key, source) where source is ENV_QDRANT_API_KEY when the variable was
+        set to a non-empty value, or (None, None) when it was not.
+
+    ONLY ``oncotriage.config`` CALLS THIS, and only when
+    ``resolve_qdrant_url()`` has already answered. An unset key beside an
+    overridden URL means "send no key", NOT "fall back to the .env key" -- see
+    ENV_QDRANT_API_KEY for why forwarding a cloud credential to an
+    environment-named host is the failure this coupling exists to prevent.
+    Nothing is validated about the value: unlike a URL there is no shape a key
+    is required to have, and the only authority on whether it is right is the
+    server.
+    """
+    raw = os.environ.get(ENV_QDRANT_API_KEY)
+    if raw is None or raw.strip() == "":
+        return None, None
+    return raw.strip(), ENV_QDRANT_API_KEY
 
 
 def resolve_airflow_password():

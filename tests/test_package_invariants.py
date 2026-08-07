@@ -477,14 +477,38 @@ shutil.copytree(_PKG_DIR, os.path.join(_BROKEN_ROOT, "oncotriage"))
 _BROKEN_CONFIG = os.path.join(_BROKEN_ROOT, "oncotriage", "config.py")
 
 _src = open(_BROKEN_CONFIG, encoding="utf-8").read()
-_needle = "from oncotriage import paths"
+
+# LINE-ANCHORED, and that is a repair rather than a tidy-up. The needle used to
+# be the bare substring "from oncotriage import paths", and the Docker pass added
+# a second name to that import in config.py. Written as `from oncotriage import
+# paths, settings`, the substring still MATCHED -- in the middle of the line --
+# so the control spliced its planted import into the middle of a statement and
+# produced
+#
+#     from oncotriage import paths
+#     from oncotriage.utils import get_model_cost, settings
+#
+# which is a SyntaxError-free import of a name utils does not export. The copied
+# package then failed to import for a reason that had nothing to do with the
+# cycle, and the check below -- whose whole point is that this order SUCCEEDS --
+# reported a failure that was true of the control and false of the package.
+#
+# A control that plants the wrong thing is worse than no control: it fails, so
+# it looks like it is working. Anchoring on the newlines means a future edit to
+# that import line finds NO match and hits the `fail()` underneath, which says
+# so by name.
+_needle = "\nfrom oncotriage import paths\n"
 if _needle not in _src:
     fail("the negative control can find its insertion point",
          f"{_needle!r} is not in the copied config.py; this control is not "
          f"testing what it claims to")
 else:
+    # The needle carries its own trailing newline now, so the planted line has
+    # to carry one too -- without it the plant is concatenated onto whatever
+    # follows and the copy is a SyntaxError rather than a cycle.
+    _planted = _needle + "from oncotriage.utils import get_model_cost\n"
     open(_BROKEN_CONFIG, "w", encoding="utf-8").write(
-        _src.replace(_needle, _needle + "\nfrom oncotriage.utils import get_model_cost", 1))
+        _src.replace(_needle, _planted, 1))
 
     check("the structural detector CATCHES a reintroduced config -> utils import",
           _mentions_module(_BROKEN_CONFIG, "oncotriage.utils"), True)

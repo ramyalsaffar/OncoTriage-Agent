@@ -1,0 +1,20 @@
+{
+  "_what": "The two MeSH lookup files load_mesh_filter() REQUIRES, vendored into the build context so a container has them with no manual step. See PROVENANCE.md beside this file for why only these two, and why the other three are not here.",
+  "_verified_by": "docker/prepare_paths.py seeds /app/data/mesh from these and refuses a file whose sha256 does not match the entry here.",
+  "source_file": "desc2026.xml",
+  "source_bytes": 312952703,
+  "source_authority": "U.S. National Library of Medicine, MeSH 2026 descriptor file",
+  "built_by": "oncotriage/registries/mesh_crosswalk_build.py:build_mesh_lookup()",
+  "built_via": "python \"09- MeSH Cancer Site Relevance Filter.py\"",
+  "copied_on": "2026-08-06",
+  "files": {
+    "mesh_c04_lookup.json": {
+      "bytes": 52883,
+      "sha256": "193abedae2d6a56f26fa61d86526589edd2481fecb4832a7a5793ca800076871"
+    },
+    "mesh_tree_to_name.json": {
+      "bytes": 54399,
+      "sha256": "423522b3d4301cf0b882266673418f0e7b904aa5e4d1d8de196b6158e4845162"
+    }
+  }
+}

@@ -1,0 +1,2484 @@
+{
+  "abdominal neoplasms": [
+    "C04.588.033"
+  ],
+  "acth syndrome, ectopic": [
+    "C04.730.713.317"
+  ],
+  "adenocarcinoma": [
+    "C04.557.470.200.025"
+  ],
+  "adenocarcinoma, papillary": [
+    "C04.557.470.200.025.085"
+  ],
+  "adenofibroma": [
+    "C04.557.450.565.590.595.050",
+    "C04.557.470.625.050"
+  ],
+  "adenolymphoma": [
+    "C04.557.435.075"
+  ],
+  "adenoma": [
+    "C04.557.470.035"
+  ],
+  "adenoma, basophil": [
+    "C04.557.465.625.650.075",
+    "C04.557.470.035.075",
+    "C04.557.580.625.650.075"
+  ],
+  "adenoma, chromophobe": [
+    "C04.557.465.625.650.095",
+    "C04.557.470.035.095",
+    "C04.557.580.625.650.095"
+  ],
+  "adenoma, acidophil": [
+    "C04.557.465.625.650.025",
+    "C04.557.470.035.025",
+    "C04.557.580.625.650.025"
+  ],
+  "adrenal cortex neoplasms": [
+    "C04.588.322.078.265"
+  ],
+  "adrenal gland neoplasms": [
+    "C04.588.322.078"
+  ],
+  "adrenal rest tumor": [
+    "C04.557.470.035.232"
+  ],
+  "ameloblastoma": [
+    "C04.557.695.065"
+  ],
+  "anal gland neoplasms": [
+    "C04.588.083",
+    "C04.588.274.476.411.307.790.040.040"
+  ],
+  "anaplasia": [
+    "C04.697.045"
+  ],
+  "angiokeratoma": [
+    "C04.557.645.115"
+  ],
+  "anus neoplasms": [
+    "C04.588.274.476.411.307.790.040"
+  ],
+  "appendiceal neoplasms": [
+    "C04.588.274.476.411.184.290"
+  ],
+  "apudoma": [
+    "C04.557.465.625.650.135",
+    "C04.557.470.035.250",
+    "C04.557.580.625.650.135"
+  ],
+  "astrocytoma": [
+    "C04.557.465.625.600.380.080",
+    "C04.557.470.670.380.080",
+    "C04.557.580.625.600.380.080"
+  ],
+  "avian leukosis": [
+    "C04.557.337.372.216",
+    "C04.619.531.216"
+  ],
+  "sarcoma, avian": [
+    "C04.557.450.795.830.800",
+    "C04.619.857.800"
+  ],
+  "barrett esophagus": [
+    "C04.834.154"
+  ],
+  "basal cell nevus syndrome": [
+    "C04.182.089.530.690.150",
+    "C04.557.470.200.649.002.001",
+    "C04.588.805.511.002.001",
+    "C04.700.175"
+  ],
+  "bile duct neoplasms": [
+    "C04.588.274.120.250"
+  ],
+  "biliary tract neoplasms": [
+    "C04.588.274.120"
+  ],
+  "urinary bladder neoplasms": [
+    "C04.588.945.947.960"
+  ],
+  "blast crisis": [
+    "C04.557.337.539.250.100",
+    "C04.697.098.500.110"
+  ],
+  "bone cysts": [
+    "C04.182.089"
+  ],
+  "bone neoplasms": [
+    "C04.588.149"
+  ],
+  "bowen's disease": [
+    "C04.557.470.200.649.001.001",
+    "C04.588.805.511.001.001"
+  ],
+  "brain neoplasms": [
+    "C04.588.614.250.195"
+  ],
+  "branchioma": [
+    "C04.182.117"
+  ],
+  "breast neoplasms": [
+    "C04.588.180"
+  ],
+  "brenner tumor": [
+    "C04.557.450.565.590.595.150",
+    "C04.557.470.625.150"
+  ],
+  "bronchial neoplasms": [
+    "C04.588.894.797.520.109"
+  ],
+  "bronchogenic cyst": [
+    "C04.182.195"
+  ],
+  "burkitt lymphoma": [
+    "C04.557.386.480.150.165"
+  ],
+  "carcinoid heart disease": [
+    "C04.557.465.625.650.200.500.205",
+    "C04.557.470.200.025.200.500.205",
+    "C04.557.580.625.650.200.500.205"
+  ],
+  "carcinoid tumor": [
+    "C04.557.465.625.650.200",
+    "C04.557.470.200.025.200",
+    "C04.557.580.625.650.200"
+  ],
+  "carcinoma": [
+    "C04.557.470.200"
+  ],
+  "carcinoma in situ": [
+    "C04.557.470.200.240"
+  ],
+  "carcinoma 256, walker": [
+    "C04.557.435.290.210",
+    "C04.557.450.795.290.210",
+    "C04.619.045"
+  ],
+  "basal cell carcinoma": [
+    "C04.557.470.200.649.002",
+    "C04.557.470.565.165",
+    "C04.588.805.511.002"
+  ],
+  "carcinoma, basosquamous": [
+    "C04.557.470.200.170",
+    "C04.557.470.565.170"
+  ],
+  "adenocarcinoma, bronchiolo-alveolar": [
+    "C04.557.470.200.025.022.500",
+    "C04.588.894.797.520.055.500"
+  ],
+  "carcinoma, bronchogenic": [
+    "C04.588.894.797.520.109.220"
+  ],
+  "carcinoma, brown-pearce": [
+    "C04.619.124"
+  ],
+  "carcinoma, intraductal, noninfiltrating": [
+    "C04.557.470.200.025.275",
+    "C04.557.470.200.240.187.250",
+    "C04.557.470.615.275"
+  ],
+  "carcinoma, ehrlich tumor": [
+    "C04.557.470.200.200",
+    "C04.619.169"
+  ],
+  "carcinoma, krebs 2": [
+    "C04.557.470.200.255",
+    "C04.619.214"
+  ],
+  "adenocarcinoma, mucinous": [
+    "C04.557.470.200.025.075",
+    "C04.557.470.590.075"
+  ],
+  "carcinoma, non-small-cell lung": [
+    "C04.588.894.797.520.109.220.249"
+  ],
+  "carcinoma, papillary": [
+    "C04.557.470.200.360",
+    "C04.557.470.700.360"
+  ],
+  "carcinoma, renal cell": [
+    "C04.557.470.200.025.390",
+    "C04.588.945.947.535.160"
+  ],
+  "adenocarcinoma, scirrhous": [
+    "C04.557.470.200.025.095"
+  ],
+  "carcinoma, squamous cell": [
+    "C04.557.470.200.400",
+    "C04.557.470.700.400"
+  ],
+  "carcinoma, transitional cell": [
+    "C04.557.470.200.430"
+  ],
+  "carcinosarcoma": [
+    "C04.557.435.290",
+    "C04.557.450.795.290"
+  ],
+  "carotid body tumor": [
+    "C04.557.465.625.650.700.705.220",
+    "C04.557.580.625.650.700.705.220"
+  ],
+  "cecal neoplasms": [
+    "C04.588.274.476.411.184"
+  ],
+  "cell transformation, neoplastic": [
+    "C04.697.098.500"
+  ],
+  "cell transformation, viral": [
+    "C04.697.098.500.160"
+  ],
+  "cementoma": [
+    "C04.557.695.210"
+  ],
+  "cerebellar neoplasms": [
+    "C04.588.614.250.195.411.211"
+  ],
+  "cerebral ventricle neoplasms": [
+    "C04.588.614.250.195.205"
+  ],
+  "uterine cervical dysplasia": [
+    "C04.834.818"
+  ],
+  "uterine cervical neoplasms": [
+    "C04.588.945.418.948.850"
+  ],
+  "adenoma, bile duct": [
+    "C04.557.470.035.085"
+  ],
+  "chondroblastoma": [
+    "C04.557.450.565.250"
+  ],
+  "chondroma": [
+    "C04.557.450.565.265"
+  ],
+  "chondrosarcoma": [
+    "C04.557.450.565.280",
+    "C04.557.450.795.300"
+  ],
+  "chordoma": [
+    "C04.557.465.220"
+  ],
+  "hydatidiform mole, invasive": [
+    "C04.557.465.955.416.812.500",
+    "C04.850.908.416.750.500"
+  ],
+  "choriocarcinoma": [
+    "C04.557.465.955.207",
+    "C04.557.470.200.025.455",
+    "C04.850.908.208"
+  ],
+  "choroid neoplasms": [
+    "C04.588.364.978.223"
+  ],
+  "cocarcinogenesis": [
+    "C04.697.098.875"
+  ],
+  "colonic neoplasms": [
+    "C04.588.274.476.411.307.180"
+  ],
+  "colorectal neoplasms, hereditary nonpolyposis": [
+    "C04.588.274.476.411.307.190",
+    "C04.700.250"
+  ],
+  "common bile duct neoplasms": [
+    "C04.588.274.120.250.250"
+  ],
+  "conjunctival neoplasms": [
+    "C04.588.364.235"
+  ],
+  "cranial nerve neoplasms": [
+    "C04.588.614.300",
+    "C04.588.614.596.240"
+  ],
+  "craniopharyngioma": [
+    "C04.557.465.625.200",
+    "C04.557.580.625.200"
+  ],
+  "carcinoma, adenoid cystic": [
+    "C04.557.470.200.025.220"
+  ],
+  "cystadenocarcinoma": [
+    "C04.557.470.200.025.480",
+    "C04.557.470.590.480"
+  ],
+  "cystadenoma": [
+    "C04.557.470.035.320",
+    "C04.557.470.590.485"
+  ],
+  "phyllodes tumor": [
+    "C04.557.450.795.650"
+  ],
+  "cysts": [
+    "C04.182"
+  ],
+  "dentigerous cyst": [
+    "C04.182.089.530.690.310"
+  ],
+  "dermoid cyst": [
+    "C04.182.201",
+    "C04.557.465.910.250"
+  ],
+  "vipoma": [
+    "C04.557.465.625.650.240.847",
+    "C04.557.470.200.025.370.847",
+    "C04.588.274.761.500.750",
+    "C04.588.322.475.500.750"
+  ],
+  "digestive system neoplasms": [
+    "C04.588.274"
+  ],
+  "duodenal neoplasms": [
+    "C04.588.274.476.411.445"
+  ],
+  "dupuytren contracture": [
+    "C04.557.450.565.590.340.173"
+  ],
+  "dysgerminoma": [
+    "C04.557.465.330.300"
+  ],
+  "dysplastic nevus syndrome": [
+    "C04.557.465.625.650.510.520.001",
+    "C04.557.665.560.260",
+    "C04.700.305"
+  ],
+  "ear neoplasms": [
+    "C04.588.443.665.312"
+  ],
+  "endocrine gland neoplasms": [
+    "C04.588.322"
+  ],
+  "ependymoma": [
+    "C04.557.465.625.600.380.290",
+    "C04.557.470.670.380.290",
+    "C04.557.580.625.600.380.290"
+  ],
+  "epidermal cyst": [
+    "C04.182.254"
+  ],
+  "leukemia, erythroblastic, acute": [
+    "C04.557.337.539.275.325"
+  ],
+  "erythroplasia": [
+    "C04.834.288"
+  ],
+  "esophageal cyst": [
+    "C04.182.281"
+  ],
+  "esophageal neoplasms": [
+    "C04.588.274.476.205",
+    "C04.588.443.353"
+  ],
+  "exostoses, multiple hereditary": [
+    "C04.557.450.565.575.610.615.325",
+    "C04.700.330"
+  ],
+  "eye neoplasms": [
+    "C04.588.364"
+  ],
+  "eyelid neoplasms": [
+    "C04.588.443.392.500"
+  ],
+  "facial neoplasms": [
+    "C04.588.443.392"
+  ],
+  "fallopian tube neoplasms": [
+    "C04.588.945.418.365"
+  ],
+  "femoral neoplasms": [
+    "C04.588.149.276"
+  ],
+  "fibroma": [
+    "C04.557.450.565.590.340"
+  ],
+  "fibrosarcoma": [
+    "C04.557.450.565.590.350",
+    "C04.557.450.795.350"
+  ],
+  "follicular cyst": [
+    "C04.182.300"
+  ],
+  "gallbladder neoplasms": [
+    "C04.588.274.120.401"
+  ],
+  "ganglioneuroma": [
+    "C04.557.465.625.600.355",
+    "C04.557.470.670.355",
+    "C04.557.580.625.600.355"
+  ],
+  "gardner syndrome": [
+    "C04.557.470.035.215.100.500",
+    "C04.588.274.476.411.307.089.393",
+    "C04.700.100.392"
+  ],
+  "gastrointestinal neoplasms": [
+    "C04.588.274.476"
+  ],
+  "genital neoplasms, female": [
+    "C04.588.945.418"
+  ],
+  "genital neoplasms, male": [
+    "C04.588.945.440"
+  ],
+  "giant cell tumors": [
+    "C04.557.450.565.380"
+  ],
+  "gingival neoplasms": [
+    "C04.588.443.591.402"
+  ],
+  "glioblastoma": [
+    "C04.557.465.625.600.380.080.335",
+    "C04.557.470.670.380.080.335",
+    "C04.557.580.625.600.380.080.335"
+  ],
+  "glioma": [
+    "C04.557.465.625.600.380",
+    "C04.557.470.670.380",
+    "C04.557.580.625.600.380"
+  ],
+  "glomus tumor": [
+    "C04.557.645.350"
+  ],
+  "glomus jugulare tumor": [
+    "C04.557.465.625.650.700.705.340",
+    "C04.557.580.625.650.700.705.340"
+  ],
+  "glucagonoma": [
+    "C04.557.470.200.025.290.750",
+    "C04.588.274.761.500.249",
+    "C04.588.322.475.500.249"
+  ],
+  "granulosa cell tumor": [
+    "C04.557.475.750.656",
+    "C04.588.322.455.398"
+  ],
+  "hamartoma": [
+    "C04.445"
+  ],
+  "hamartoma syndrome, multiple": [
+    "C04.445.435",
+    "C04.651.435",
+    "C04.700.435"
+  ],
+  "head and neck neoplasms": [
+    "C04.588.443"
+  ],
+  "heart neoplasms": [
+    "C04.588.894.309"
+  ],
+  "hemangioendothelioma": [
+    "C04.557.645.375.370"
+  ],
+  "hemangioma": [
+    "C04.557.645.375"
+  ],
+  "hemangioma, cavernous": [
+    "C04.557.645.375.385"
+  ],
+  "hemangiopericytoma": [
+    "C04.557.645.380"
+  ],
+  "hemangiosarcoma": [
+    "C04.557.450.795.390",
+    "C04.557.645.390"
+  ],
+  "carcinoma, hepatocellular": [
+    "C04.557.470.200.025.255",
+    "C04.588.274.623.160"
+  ],
+  "adenoma, sweat gland": [
+    "C04.557.470.035.175",
+    "C04.557.470.550.175"
+  ],
+  "hodgkin disease": [
+    "C04.557.386.355"
+  ],
+  "hydatidiform mole": [
+    "C04.557.465.955.416.812",
+    "C04.850.908.416.750"
+  ],
+  "hypopharyngeal neoplasms": [
+    "C04.588.443.665.710.485"
+  ],
+  "hypothalamic neoplasms": [
+    "C04.588.614.250.195.885.500"
+  ],
+  "ileal neoplasms": [
+    "C04.588.274.476.411.501"
+  ],
+  "immunoproliferative small intestinal disease": [
+    "C04.557.386.390"
+  ],
+  "insulinoma": [
+    "C04.557.470.035.100.852",
+    "C04.588.274.761.249.500",
+    "C04.588.322.475.249.500"
+  ],
+  "intestinal neoplasms": [
+    "C04.588.274.476.411"
+  ],
+  "adenoma, islet cell": [
+    "C04.557.470.035.100",
+    "C04.588.274.761.249",
+    "C04.588.322.475.249"
+  ],
+  "jaw cysts": [
+    "C04.182.089.530"
+  ],
+  "jaw neoplasms": [
+    "C04.588.149.721.450"
+  ],
+  "jejunal neoplasms": [
+    "C04.588.274.476.411.523"
+  ],
+  "kidney neoplasms": [
+    "C04.588.945.947.535"
+  ],
+  "krukenberg tumor": [
+    "C04.557.470.200.025.415.410",
+    "C04.557.470.590.415.410"
+  ],
+  "laryngeal neoplasms": [
+    "C04.588.443.665.481"
+  ],
+  "leiomyoma": [
+    "C04.557.450.590.450"
+  ],
+  "leiomyosarcoma": [
+    "C04.557.450.590.455",
+    "C04.557.450.795.455"
+  ],
+  "leukemia": [
+    "C04.557.337"
+  ],
+  "leukemia l1210": [
+    "C04.557.337.372.594",
+    "C04.619.531.594"
+  ],
+  "leukemia l5178": [
+    "C04.557.337.372.602",
+    "C04.619.531.602"
+  ],
+  "leukemia p388": [
+    "C04.557.337.372.782",
+    "C04.619.531.782"
+  ],
+  "leukemia, experimental": [
+    "C04.557.337.372",
+    "C04.619.531"
+  ],
+  "leukemia, hairy cell": [
+    "C04.557.337.415"
+  ],
+  "leukemia, lymphoid": [
+    "C04.557.337.428"
+  ],
+  "leukemia, mast-cell": [
+    "C04.557.337.440",
+    "C04.557.337.539.275.440"
+  ],
+  "leukemia, megakaryoblastic, acute": [
+    "C04.557.337.539.275.450"
+  ],
+  "leukemia, monocytic, acute": [
+    "C04.557.337.539.275.484"
+  ],
+  "leukemia, myeloid": [
+    "C04.557.337.539"
+  ],
+  "leukemia, plasma cell": [
+    "C04.557.337.595",
+    "C04.557.595.500.500"
+  ],
+  "leukemia, radiation-induced": [
+    "C04.557.337.650",
+    "C04.682.512"
+  ],
+  "leukoplakia": [
+    "C04.834.512"
+  ],
+  "leukoplakia, oral": [
+    "C04.588.443.591.545",
+    "C04.834.512.513"
+  ],
+  "leydig cell tumor": [
+    "C04.557.475.750.847.249",
+    "C04.588.322.762.500.249",
+    "C04.588.945.440.915.500.249"
+  ],
+  "linitis plastica": [
+    "C04.557.470.200.025.095.410"
+  ],
+  "lip neoplasms": [
+    "C04.588.443.591.550"
+  ],
+  "lipoma": [
+    "C04.557.450.550.400"
+  ],
+  "liposarcoma": [
+    "C04.557.450.550.420",
+    "C04.557.450.795.465"
+  ],
+  "liver neoplasms": [
+    "C04.588.274.623"
+  ],
+  "liver neoplasms, experimental": [
+    "C04.588.274.623.460",
+    "C04.619.540"
+  ],
+  "lung neoplasms": [
+    "C04.588.894.797.520"
+  ],
+  "lymphangioma": [
+    "C04.557.375.450"
+  ],
+  "lymphangiomyoma": [
+    "C04.557.375.460"
+  ],
+  "lymphangiosarcoma": [
+    "C04.557.375.480",
+    "C04.557.450.795.480"
+  ],
+  "lymphatic metastasis": [
+    "C04.697.650.560"
+  ],
+  "lymphocele": [
+    "C04.182.430"
+  ],
+  "lymphoma": [
+    "C04.557.386"
+  ],
+  "lymphoma, follicular": [
+    "C04.557.386.480.350"
+  ],
+  "lymphoma, non-hodgkin": [
+    "C04.557.386.480"
+  ],
+  "lymphomatoid granulomatosis": [
+    "C04.557.386.480.150.600",
+    "C04.834.567"
+  ],
+  "waldenstrom macroglobulinemia": [
+    "C04.557.595.925"
+  ],
+  "malignant carcinoid syndrome": [
+    "C04.557.465.625.650.200.500",
+    "C04.557.470.200.025.200.500",
+    "C04.557.580.625.650.200.500"
+  ],
+  "mammary neoplasms, experimental": [
+    "C04.588.531.500",
+    "C04.619.590"
+  ],
+  "mandibular neoplasms": [
+    "C04.588.149.721.450.583"
+  ],
+  "mastocytosis": [
+    "C04.557.450.565.465"
+  ],
+  "maxillary neoplasms": [
+    "C04.588.149.721.450.601"
+  ],
+  "maxillary sinus neoplasms": [
+    "C04.588.443.665.650.693.575"
+  ],
+  "mediastinal cyst": [
+    "C04.182.444"
+  ],
+  "mediastinal neoplasms": [
+    "C04.588.894.479"
+  ],
+  "medulloblastoma": [
+    "C04.557.465.625.600.380.515",
+    "C04.557.465.625.600.590.500",
+    "C04.557.470.670.380.515",
+    "C04.557.470.670.590.500",
+    "C04.557.580.625.600.380.515",
+    "C04.557.580.625.600.590.500"
+  ],
+  "meigs syndrome": [
+    "C04.588.322.455.531"
+  ],
+  "melanoma": [
+    "C04.557.465.625.650.510",
+    "C04.557.580.625.650.510",
+    "C04.557.665.510",
+    "C04.588.805.377"
+  ],
+  "melanoma, experimental": [
+    "C04.557.465.625.650.510.525",
+    "C04.557.580.625.650.510.525",
+    "C04.557.665.510.525",
+    "C04.619.600"
+  ],
+  "meningeal neoplasms": [
+    "C04.588.614.250.580"
+  ],
+  "meningioma": [
+    "C04.557.580.520",
+    "C04.557.645.520",
+    "C04.588.614.250.580.500"
+  ],
+  "mesenchymoma": [
+    "C04.557.435.500"
+  ],
+  "mesenteric cyst": [
+    "C04.182.473"
+  ],
+  "mesonephroma": [
+    "C04.557.465.510"
+  ],
+  "mesothelioma": [
+    "C04.557.470.035.510",
+    "C04.557.470.660.510"
+  ],
+  "adenoma, pleomorphic": [
+    "C04.557.435.090",
+    "C04.557.470.035.155"
+  ],
+  "mouth neoplasms": [
+    "C04.588.443.591"
+  ],
+  "mucocele": [
+    "C04.182.511"
+  ],
+  "multiple myeloma": [
+    "C04.557.595.500"
+  ],
+  "myasthenia gravis": [
+    "C04.588.614.550.500",
+    "C04.730.856.490"
+  ],
+  "mycosis fungoides": [
+    "C04.557.386.480.750.800.550"
+  ],
+  "myelitis, transverse": [
+    "C04.588.614.550.550",
+    "C04.730.856.543"
+  ],
+  "myoepithelioma": [
+    "C04.557.435.585"
+  ],
+  "myoma": [
+    "C04.557.450.590.540"
+  ],
+  "myosarcoma": [
+    "C04.557.450.590.550",
+    "C04.557.450.795.550"
+  ],
+  "myxoma": [
+    "C04.557.450.565.550"
+  ],
+  "myxosarcoma": [
+    "C04.557.450.565.560",
+    "C04.557.450.795.560"
+  ],
+  "nasopharyngeal neoplasms": [
+    "C04.588.443.665.710.650"
+  ],
+  "nelson syndrome": [
+    "C04.588.322.609.145.500"
+  ],
+  "neoplastic cells, circulating": [
+    "C04.697.650.900"
+  ],
+  "neoplasm invasiveness": [
+    "C04.697.645"
+  ],
+  "neoplasm metastasis": [
+    "C04.697.650"
+  ],
+  "neoplasm recurrence, local": [
+    "C04.697.655"
+  ],
+  "neoplasm regression, spontaneous": [
+    "C04.697.670"
+  ],
+  "neoplasm seeding": [
+    "C04.697.650.830"
+  ],
+  "neoplasms": [
+    "C04"
+  ],
+  "neoplasms by histologic type": [
+    "C04.557"
+  ],
+  "neoplasms by site": [
+    "C04.588"
+  ],
+  "neoplasms, connective tissue": [
+    "C04.557.450.565"
+  ],
+  "neoplasms, germ cell and embryonal": [
+    "C04.557.465"
+  ],
+  "neoplasms, experimental": [
+    "C04.619"
+  ],
+  "neoplasms, glandular and epithelial": [
+    "C04.557.470"
+  ],
+  "neoplasms, hormone-dependent": [
+    "C04.626"
+  ],
+  "multiple endocrine neoplasia": [
+    "C04.588.322.400",
+    "C04.651.600",
+    "C04.700.630"
+  ],
+  "neoplasms, multiple primary": [
+    "C04.651"
+  ],
+  "neoplasms, muscle tissue": [
+    "C04.557.450.590"
+  ],
+  "neoplasms, nerve tissue": [
+    "C04.557.580"
+  ],
+  "neoplasms, radiation-induced": [
+    "C04.682"
+  ],
+  "neoplasms, unknown primary": [
+    "C04.697.650.895"
+  ],
+  "neoplasms, vascular tissue": [
+    "C04.557.645"
+  ],
+  "paraneoplastic endocrine syndromes": [
+    "C04.588.322.490",
+    "C04.730.713"
+  ],
+  "neoplastic processes": [
+    "C04.697"
+  ],
+  "neoplastic syndromes, hereditary": [
+    "C04.700"
+  ],
+  "wilms tumor": [
+    "C04.557.435.595",
+    "C04.588.945.947.535.585",
+    "C04.700.900"
+  ],
+  "nervous system neoplasms": [
+    "C04.588.614"
+  ],
+  "neurilemmoma": [
+    "C04.557.465.625.650.595",
+    "C04.557.580.600.610.595",
+    "C04.557.580.625.650.595"
+  ],
+  "neuroblastoma": [
+    "C04.557.465.625.600.590.650.550",
+    "C04.557.470.670.590.650.550",
+    "C04.557.580.625.600.590.650.550"
+  ],
+  "neurofibroma": [
+    "C04.557.580.600.580"
+  ],
+  "neurofibromatosis 1": [
+    "C04.557.580.600.580.590.650",
+    "C04.700.631.650"
+  ],
+  "neuroma": [
+    "C04.557.580.600.610"
+  ],
+  "neuroma, acoustic": [
+    "C04.557.465.625.650.595.610",
+    "C04.557.580.600.610.595.610",
+    "C04.557.580.625.650.595.610",
+    "C04.588.614.300.015",
+    "C04.588.614.596.240.015"
+  ],
+  "nevus": [
+    "C04.557.665.560"
+  ],
+  "nevus of ota": [
+    "C04.557.665.560.615.585"
+  ],
+  "nevus, pigmented": [
+    "C04.557.665.560.615"
+  ],
+  "nonodontogenic cysts": [
+    "C04.182.089.530.660"
+  ],
+  "nose neoplasms": [
+    "C04.588.149.721.600",
+    "C04.588.443.665.650"
+  ],
+  "odontogenic cysts": [
+    "C04.182.089.530.690"
+  ],
+  "odontogenic tumors": [
+    "C04.557.695"
+  ],
+  "odontoma": [
+    "C04.557.695.610"
+  ],
+  "oligodendroglioma": [
+    "C04.557.465.625.600.380.590",
+    "C04.557.470.670.380.590",
+    "C04.557.580.625.600.380.590"
+  ],
+  "orbital neoplasms": [
+    "C04.588.149.721.656",
+    "C04.588.364.659"
+  ],
+  "oropharyngeal neoplasms": [
+    "C04.588.443.665.710.684"
+  ],
+  "osteoma": [
+    "C04.557.450.565.575.625"
+  ],
+  "osteoma, osteoid": [
+    "C04.557.450.565.575.625.625"
+  ],
+  "otorhinolaryngologic neoplasms": [
+    "C04.588.443.665"
+  ],
+  "ovarian cysts": [
+    "C04.182.612"
+  ],
+  "ovarian neoplasms": [
+    "C04.588.322.455"
+  ],
+  "paget's disease, mammary": [
+    "C04.557.470.200.240.187.500",
+    "C04.557.470.615.275.625"
+  ],
+  "paget disease, extramammary": [
+    "C04.557.470.200.025.660",
+    "C04.557.470.615.660"
+  ],
+  "palatal neoplasms": [
+    "C04.588.149.721.450.692",
+    "C04.588.443.591.692"
+  ],
+  "pancoast syndrome": [
+    "C04.588.894.797.520.734"
+  ],
+  "pancreatic cyst": [
+    "C04.182.640"
+  ],
+  "pancreatic neoplasms": [
+    "C04.588.274.761",
+    "C04.588.322.475"
+  ],
+  "pancreatic pseudocyst": [
+    "C04.182.640.692"
+  ],
+  "papilloma": [
+    "C04.557.470.700.600"
+  ],
+  "paraganglioma": [
+    "C04.557.465.625.650.700",
+    "C04.557.580.625.650.700"
+  ],
+  "paraganglioma, extra-adrenal": [
+    "C04.557.465.625.650.700.705",
+    "C04.557.580.625.650.700.705"
+  ],
+  "paranasal sinus neoplasms": [
+    "C04.588.443.665.650.693"
+  ],
+  "paraneoplastic syndromes": [
+    "C04.730"
+  ],
+  "parathyroid neoplasms": [
+    "C04.588.322.525",
+    "C04.588.443.680"
+  ],
+  "parotid neoplasms": [
+    "C04.588.443.591.824.695"
+  ],
+  "parovarian cyst": [
+    "C04.182.668"
+  ],
+  "pelvic neoplasms": [
+    "C04.588.699"
+  ],
+  "penile neoplasms": [
+    "C04.588.945.440.715"
+  ],
+  "periodontal cyst": [
+    "C04.182.089.530.690.790"
+  ],
+  "peripheral nervous system neoplasms": [
+    "C04.588.614.596"
+  ],
+  "peritoneal neoplasms": [
+    "C04.588.033.513",
+    "C04.588.274.780"
+  ],
+  "peutz-jeghers syndrome": [
+    "C04.700.633"
+  ],
+  "pharyngeal neoplasms": [
+    "C04.588.443.665.710"
+  ],
+  "pheochromocytoma": [
+    "C04.557.465.625.650.700.725",
+    "C04.557.580.625.650.700.725"
+  ],
+  "pilonidal sinus": [
+    "C04.182.710"
+  ],
+  "pinealoma": [
+    "C04.557.465.625.600.657",
+    "C04.557.470.670.657",
+    "C04.557.580.625.600.657",
+    "C04.588.614.250.195.766"
+  ],
+  "pituitary neoplasms": [
+    "C04.588.322.609",
+    "C04.588.614.250.195.885.500.600"
+  ],
+  "plasmacytoma": [
+    "C04.557.595.600"
+  ],
+  "pleural neoplasms": [
+    "C04.588.894.797.640"
+  ],
+  "polycystic ovary syndrome": [
+    "C04.182.612.765"
+  ],
+  "polycythemia vera": [
+    "C04.588.448.200.500"
+  ],
+  "adenomatous polyposis coli": [
+    "C04.557.470.035.215.100",
+    "C04.588.274.476.411.307.089",
+    "C04.700.100"
+  ],
+  "popliteal cyst": [
+    "C04.182.867.500"
+  ],
+  "precancerous conditions": [
+    "C04.834"
+  ],
+  "pregnancy complications, neoplastic": [
+    "C04.850"
+  ],
+  "preleukemia": [
+    "C04.834.770"
+  ],
+  "prostatic neoplasms": [
+    "C04.588.945.440.770"
+  ],
+  "pseudomyxoma peritonei": [
+    "C04.557.470.200.025.075.500",
+    "C04.557.470.590.075.500"
+  ],
+  "pulmonary adenomatosis, ovine": [
+    "C04.557.470.200.025.715"
+  ],
+  "radicular cyst": [
+    "C04.182.089.530.690.790.820"
+  ],
+  "ranula": [
+    "C04.182.766"
+  ],
+  "rectal neoplasms": [
+    "C04.588.274.476.411.307.790"
+  ],
+  "respiratory tract neoplasms": [
+    "C04.588.894.797"
+  ],
+  "retinoblastoma": [
+    "C04.557.465.625.600.725",
+    "C04.557.470.670.725",
+    "C04.557.580.625.600.725",
+    "C04.588.364.818.760"
+  ],
+  "retroperitoneal neoplasms": [
+    "C04.588.033.731"
+  ],
+  "rhabdomyoma": [
+    "C04.557.450.590.540.700"
+  ],
+  "rhabdomyosarcoma": [
+    "C04.557.450.590.550.660",
+    "C04.557.450.795.550.660"
+  ],
+  "salivary gland neoplasms": [
+    "C04.588.443.591.824"
+  ],
+  "sarcoma": [
+    "C04.557.450.795"
+  ],
+  "sarcoma 180": [
+    "C04.557.450.795.830.780",
+    "C04.619.857.656"
+  ],
+  "sarcoma 37": [
+    "C04.557.450.795.830.760",
+    "C04.619.857.573"
+  ],
+  "sarcoma, ewing": [
+    "C04.557.450.565.575.650.800",
+    "C04.557.450.795.620.800"
+  ],
+  "sarcoma, experimental": [
+    "C04.557.450.795.830",
+    "C04.619.857"
+  ],
+  "sarcoma, kaposi": [
+    "C04.557.450.795.850",
+    "C04.557.645.750"
+  ],
+  "mast-cell sarcoma": [
+    "C04.557.450.565.465.124"
+  ],
+  "osteosarcoma": [
+    "C04.557.450.565.575.650",
+    "C04.557.450.795.620"
+  ],
+  "sarcoma, yoshida": [
+    "C04.557.450.795.830.850",
+    "C04.619.857.822"
+  ],
+  "sebaceous gland neoplasms": [
+    "C04.588.805.578"
+  ],
+  "sertoli cell tumor": [
+    "C04.557.475.750.847.500",
+    "C04.588.322.762.500.500",
+    "C04.588.945.440.915.500.500"
+  ],
+  "sezary syndrome": [
+    "C04.557.386.480.750.800.775"
+  ],
+  "sigmoid neoplasms": [
+    "C04.588.274.476.411.307.180.800"
+  ],
+  "skin neoplasms": [
+    "C04.588.805"
+  ],
+  "skull neoplasms": [
+    "C04.588.149.721"
+  ],
+  "soft tissue neoplasms": [
+    "C04.588.839"
+  ],
+  "somatostatinoma": [
+    "C04.557.465.625.650.240.695",
+    "C04.557.470.200.025.370.695",
+    "C04.588.274.761.500.500",
+    "C04.588.322.475.500.500"
+  ],
+  "spinal cord neoplasms": [
+    "C04.588.614.250.803"
+  ],
+  "spinal neoplasms": [
+    "C04.588.149.828"
+  ],
+  "splenic neoplasms": [
+    "C04.588.842"
+  ],
+  "stomach neoplasms": [
+    "C04.588.274.476.767"
+  ],
+  "struma ovarii": [
+    "C04.557.465.910.850"
+  ],
+  "sturge-weber syndrome": [
+    "C04.557.645.375.850"
+  ],
+  "sublingual gland neoplasms": [
+    "C04.588.443.591.824.882"
+  ],
+  "submandibular gland neoplasms": [
+    "C04.588.443.591.824.885"
+  ],
+  "sweat gland neoplasms": [
+    "C04.588.805.776"
+  ],
+  "synovial cyst": [
+    "C04.182.867"
+  ],
+  "sarcoma, synovial": [
+    "C04.557.450.565.835",
+    "C04.557.450.795.875"
+  ],
+  "synovitis, pigmented villonodular": [
+    "C04.557.450.565.380.690.500"
+  ],
+  "teratoma": [
+    "C04.557.465.910"
+  ],
+  "testicular neoplasms": [
+    "C04.588.322.762",
+    "C04.588.945.440.915"
+  ],
+  "thecoma": [
+    "C04.557.475.750.875",
+    "C04.588.322.455.765"
+  ],
+  "thoracic neoplasms": [
+    "C04.588.894"
+  ],
+  "thymoma": [
+    "C04.557.435.850",
+    "C04.588.894.949.500"
+  ],
+  "thymus neoplasms": [
+    "C04.588.894.949"
+  ],
+  "thyroglossal cyst": [
+    "C04.182.902"
+  ],
+  "thyroid neoplasms": [
+    "C04.588.322.894",
+    "C04.588.443.915"
+  ],
+  "tongue neoplasms": [
+    "C04.588.443.591.925"
+  ],
+  "tonsillar neoplasms": [
+    "C04.588.443.665.710.684.800"
+  ],
+  "tracheal neoplasms": [
+    "C04.588.443.925",
+    "C04.588.894.797.760"
+  ],
+  "trophoblastic neoplasms": [
+    "C04.557.465.955",
+    "C04.850.908"
+  ],
+  "tuberous sclerosis": [
+    "C04.445.810",
+    "C04.651.800",
+    "C04.700.700"
+  ],
+  "urachal cyst": [
+    "C04.182.946"
+  ],
+  "ureteral neoplasms": [
+    "C04.588.945.947.940"
+  ],
+  "urethral neoplasms": [
+    "C04.588.945.947.945"
+  ],
+  "urogenital neoplasms": [
+    "C04.588.945"
+  ],
+  "urologic neoplasms": [
+    "C04.588.945.947"
+  ],
+  "urticaria pigmentosa": [
+    "C04.557.450.565.465.500.850",
+    "C04.588.805.309.850"
+  ],
+  "uterine neoplasms": [
+    "C04.588.945.418.948"
+  ],
+  "uveal neoplasms": [
+    "C04.588.364.978"
+  ],
+  "vaginal neoplasms": [
+    "C04.588.945.418.955"
+  ],
+  "venereal tumors, veterinary": [
+    "C04.588.945.956"
+  ],
+  "vulvar neoplasms": [
+    "C04.588.945.418.968"
+  ],
+  "xeroderma pigmentosum": [
+    "C04.834.867"
+  ],
+  "zollinger-ellison syndrome": [
+    "C04.730.713.988"
+  ],
+  "supratentorial neoplasms": [
+    "C04.588.614.250.195.885"
+  ],
+  "epidural neoplasms": [
+    "C04.588.614.250.803.342"
+  ],
+  "prolactinoma": [
+    "C04.557.470.035.625",
+    "C04.588.322.609.792"
+  ],
+  "colorectal neoplasms": [
+    "C04.588.274.476.411.307"
+  ],
+  "infratentorial neoplasms": [
+    "C04.588.614.250.195.411"
+  ],
+  "carcinoma, merkel cell": [
+    "C04.557.465.625.650.240.325",
+    "C04.557.470.200.025.370.325",
+    "C04.557.580.625.650.240.325"
+  ],
+  "gastrinoma": [
+    "C04.557.470.200.025.290.500",
+    "C04.588.274.761.500.124",
+    "C04.588.322.475.500.124"
+  ],
+  "leukemia, b-cell": [
+    "C04.557.337.428.080"
+  ],
+  "leukemia, lymphocytic, chronic, b-cell": [
+    "C04.557.337.428.080.125"
+  ],
+  "precursor b-cell lymphoblastic leukemia-lymphoma": [
+    "C04.557.337.428.600.600"
+  ],
+  "leukemia, biphenotypic, acute": [
+    "C04.557.337.428.100"
+  ],
+  "leukemia, t-cell": [
+    "C04.557.337.428.580"
+  ],
+  "leukemia-lymphoma, adult t-cell": [
+    "C04.557.337.428.580.100"
+  ],
+  "leukemia, prolymphocytic, t-cell": [
+    "C04.557.337.428.565.750",
+    "C04.557.337.428.580.075"
+  ],
+  "leukemia, prolymphocytic": [
+    "C04.557.337.428.565"
+  ],
+  "leukemia, myelogenous, chronic, bcr-abl positive": [
+    "C04.557.337.539.250"
+  ],
+  "leukemia, myeloid, accelerated phase": [
+    "C04.557.337.539.250.300"
+  ],
+  "leukemia, myeloid, chronic-phase": [
+    "C04.557.337.539.250.400"
+  ],
+  "leukemia, myeloid, acute": [
+    "C04.557.337.539.275"
+  ],
+  "leukemia, basophilic, acute": [
+    "C04.557.337.539.275.125"
+  ],
+  "leukemia, eosinophilic, acute": [
+    "C04.557.337.539.275.300"
+  ],
+  "leukemia, promyelocytic, acute": [
+    "C04.557.337.539.275.700"
+  ],
+  "leukemia, myelomonocytic, chronic": [
+    "C04.557.337.539.522"
+  ],
+  "leukemia, myelomonocytic, acute": [
+    "C04.557.337.539.520"
+  ],
+  "choledochal cyst": [
+    "C04.182.198"
+  ],
+  "histiocytic disorders, malignant": [
+    "C04.557.227"
+  ],
+  "lambert-eaton myasthenic syndrome": [
+    "C04.588.614.550.500.225",
+    "C04.730.856.490.225"
+  ],
+  "mammary neoplasms, animal": [
+    "C04.588.531"
+  ],
+  "iris neoplasms": [
+    "C04.588.364.978.400"
+  ],
+  "osteochondroma": [
+    "C04.557.450.565.575.610"
+  ],
+  "pleural effusion, malignant": [
+    "C04.588.894.797.640.700"
+  ],
+  "arachnoid cysts": [
+    "C04.182.044",
+    "C04.588.614.250.387.100"
+  ],
+  "lymphoma, b-cell": [
+    "C04.557.386.480.150"
+  ],
+  "lymphoma, t-cell": [
+    "C04.557.386.480.750"
+  ],
+  "lymphoma, large-cell, immunoblastic": [
+    "C04.557.386.480.493"
+  ],
+  "lymphoma, large b-cell, diffuse": [
+    "C04.557.386.480.150.585"
+  ],
+  "lymphoma, t-cell, cutaneous": [
+    "C04.557.386.480.750.800"
+  ],
+  "lymphoma, t-cell, peripheral": [
+    "C04.557.386.480.750.825"
+  ],
+  "lymphoma, aids-related": [
+    "C04.557.386.480.150.450"
+  ],
+  "neurofibromatosis 2": [
+    "C04.557.465.625.650.595.610.500",
+    "C04.557.580.600.580.590.655",
+    "C04.557.580.600.610.595.610.500",
+    "C04.700.631.655"
+  ],
+  "central nervous system neoplasms": [
+    "C04.588.614.250"
+  ],
+  "choroid plexus neoplasms": [
+    "C04.588.614.250.195.205.200"
+  ],
+  "leukemia, feline": [
+    "C04.557.337.385"
+  ],
+  "enzootic bovine leukosis": [
+    "C04.557.337.100"
+  ],
+  "granular cell tumor": [
+    "C04.557.450.590.350"
+  ],
+  "thyroid nodule": [
+    "C04.588.322.894.800",
+    "C04.588.443.915.800"
+  ],
+  "neoplasms, second primary": [
+    "C04.692"
+  ],
+  "proteus syndrome": [
+    "C04.445.435.500",
+    "C04.651.435.500"
+  ],
+  "li-fraumeni syndrome": [
+    "C04.700.600"
+  ],
+  "endometrial neoplasms": [
+    "C04.588.945.418.948.585"
+  ],
+  "chalazion": [
+    "C04.182.197"
+  ],
+  "neoplasms, post-traumatic": [
+    "C04.666"
+  ],
+  "neurofibromatoses": [
+    "C04.557.580.600.580.590",
+    "C04.700.631"
+  ],
+  "leukemic infiltration": [
+    "C04.697.645.500"
+  ],
+  "neuroectodermal tumors": [
+    "C04.557.465.625",
+    "C04.557.580.625"
+  ],
+  "neuroectodermal tumor, melanotic": [
+    "C04.557.465.625.630",
+    "C04.557.580.625.630"
+  ],
+  "wagr syndrome": [
+    "C04.557.435.595.950",
+    "C04.588.945.947.535.585.950",
+    "C04.700.900.950"
+  ],
+  "lymphoma, large-cell, anaplastic": [
+    "C04.557.386.480.750.399"
+  ],
+  "lymphomatoid papulosis": [
+    "C04.557.386.480.750.800.528"
+  ],
+  "leukoplakia, hairy": [
+    "C04.588.443.591.545.500",
+    "C04.834.512.513.500"
+  ],
+  "bone cysts, aneurysmal": [
+    "C04.182.089.265"
+  ],
+  "neoplasm, lymphatic tissue": [
+    "C04.557.375"
+  ],
+  "lymphangioma, cystic": [
+    "C04.557.375.450.450"
+  ],
+  "lymphangioleiomyomatosis": [
+    "C04.557.375.460.465",
+    "C04.557.450.692.500"
+  ],
+  "neoplasms, complex and mixed": [
+    "C04.557.435"
+  ],
+  "adenomyoma": [
+    "C04.557.435.110"
+  ],
+  "adenosarcoma": [
+    "C04.557.435.135",
+    "C04.557.450.795.135"
+  ],
+  "carcinoma, adenosquamous": [
+    "C04.557.435.250",
+    "C04.557.470.200.150"
+  ],
+  "hepatoblastoma": [
+    "C04.557.435.380"
+  ],
+  "mixed tumor, malignant": [
+    "C04.557.435.525"
+  ],
+  "mixed tumor, mesodermal": [
+    "C04.557.435.530",
+    "C04.557.450.795.530"
+  ],
+  "mixed tumor, mullerian": [
+    "C04.557.435.540"
+  ],
+  "nephroma, mesoblastic": [
+    "C04.557.435.600",
+    "C04.588.945.947.535.790"
+  ],
+  "pulmonary blastoma": [
+    "C04.557.435.675",
+    "C04.588.894.797.520.867"
+  ],
+  "sarcoma, endometrial stromal": [
+    "C04.557.435.775",
+    "C04.557.450.795.332.500"
+  ],
+  "neoplasms, connective and soft tissue": [
+    "C04.557.450"
+  ],
+  "neoplasms, adipose tissue": [
+    "C04.557.450.550"
+  ],
+  "angiolipoma": [
+    "C04.557.450.550.100"
+  ],
+  "angiomyolipoma": [
+    "C04.557.450.550.125",
+    "C04.557.450.692.249"
+  ],
+  "liposarcoma, myxoid": [
+    "C04.557.450.550.420.425",
+    "C04.557.450.795.465.425"
+  ],
+  "myelolipoma": [
+    "C04.557.450.550.710"
+  ],
+  "chondromatosis": [
+    "C04.557.450.565.265.270"
+  ],
+  "chondrosarcoma, mesenchymal": [
+    "C04.557.450.565.280.280",
+    "C04.557.450.795.300.280"
+  ],
+  "giant cell tumor of bone": [
+    "C04.557.450.565.380.380",
+    "C04.557.450.565.575.420"
+  ],
+  "neoplasms, bone tissue": [
+    "C04.557.450.565.575"
+  ],
+  "fibroma, ossifying": [
+    "C04.557.450.565.575.400",
+    "C04.557.450.565.590.340.360"
+  ],
+  "osteoblastoma": [
+    "C04.557.450.565.575.600"
+  ],
+  "osteochondromatosis": [
+    "C04.557.450.565.575.610.615"
+  ],
+  "osteosarcoma, juxtacortical": [
+    "C04.557.450.565.575.650.655",
+    "C04.557.450.795.620.655"
+  ],
+  "neoplasms, fibrous tissue": [
+    "C04.557.450.565.590"
+  ],
+  "histiocytoma, benign fibrous": [
+    "C04.557.450.565.590.425.350"
+  ],
+  "fibroma, desmoplastic": [
+    "C04.557.450.565.590.340.345"
+  ],
+  "fibromatosis, abdominal": [
+    "C04.557.450.565.590.340.400"
+  ],
+  "desmoid tumors": [
+    "C04.557.450.565.590.340.410"
+  ],
+  "dermatofibrosarcoma": [
+    "C04.557.450.565.590.350.320",
+    "C04.557.450.795.350.320"
+  ],
+  "myofibromatosis": [
+    "C04.557.450.565.590.550"
+  ],
+  "neoplasms, fibroepithelial": [
+    "C04.557.450.565.590.595",
+    "C04.557.470.625"
+  ],
+  "fibroadenoma": [
+    "C04.557.450.565.590.595.350",
+    "C04.557.470.625.350"
+  ],
+  "sarcoma, clear cell": [
+    "C04.557.450.565.800",
+    "C04.557.450.795.800"
+  ],
+  "sarcoma, small cell": [
+    "C04.557.450.565.825",
+    "C04.557.450.795.870"
+  ],
+  "angiomyoma": [
+    "C04.557.450.590.450.125"
+  ],
+  "leiomyoma, epithelioid": [
+    "C04.557.450.590.450.455"
+  ],
+  "leiomyomatosis": [
+    "C04.557.450.590.450.465"
+  ],
+  "rhabdomyosarcoma, alveolar": [
+    "C04.557.450.590.550.660.665",
+    "C04.557.450.795.550.660.665"
+  ],
+  "rhabdomyosarcoma, embryonal": [
+    "C04.557.450.590.550.660.675",
+    "C04.557.450.795.550.660.675"
+  ],
+  "sarcoma, alveolar soft part": [
+    "C04.557.450.590.775",
+    "C04.557.450.795.775"
+  ],
+  "smooth muscle tumor": [
+    "C04.557.450.590.800"
+  ],
+  "carcinoma, embryonal": [
+    "C04.557.465.200"
+  ],
+  "germinoma": [
+    "C04.557.465.330"
+  ],
+  "gonadoblastoma": [
+    "C04.557.465.420",
+    "C04.557.475.395"
+  ],
+  "seminoma": [
+    "C04.557.465.330.800"
+  ],
+  "endodermal sinus tumor": [
+    "C04.557.465.510.350"
+  ],
+  "neuroectodermal tumors, primitive, peripheral": [
+    "C04.557.465.625.600.590.650",
+    "C04.557.470.670.590.650",
+    "C04.557.580.625.600.590.650"
+  ],
+  "neuroectodermal tumors, primitive": [
+    "C04.557.465.625.600.590",
+    "C04.557.470.670.590",
+    "C04.557.580.625.600.590"
+  ],
+  "teratocarcinoma": [
+    "C04.557.465.900"
+  ],
+  "trophoblastic tumor, placental site": [
+    "C04.557.465.955.207.875",
+    "C04.557.470.200.025.455.875",
+    "C04.850.908.208.875"
+  ],
+  "adrenocortical adenoma": [
+    "C04.588.322.078.265.500"
+  ],
+  "adenoma, liver cell": [
+    "C04.557.470.035.120",
+    "C04.588.274.623.040"
+  ],
+  "adenoma, oxyphilic": [
+    "C04.557.470.035.140"
+  ],
+  "acrospiroma": [
+    "C04.557.470.035.175.125",
+    "C04.557.470.550.175.125"
+  ],
+  "hidrocystoma": [
+    "C04.557.470.035.175.375",
+    "C04.557.470.550.175.375"
+  ],
+  "syringoma": [
+    "C04.557.470.035.175.800",
+    "C04.557.470.550.175.800"
+  ],
+  "adenoma, villous": [
+    "C04.557.470.035.185"
+  ],
+  "adenomatoid tumor": [
+    "C04.557.470.035.200",
+    "C04.557.470.660.200"
+  ],
+  "adenomatosis, pulmonary": [
+    "C04.557.470.035.210"
+  ],
+  "adenomatous polyps": [
+    "C04.557.470.035.215"
+  ],
+  "mesothelioma, cystic": [
+    "C04.557.470.035.510.515",
+    "C04.557.470.660.510.515"
+  ],
+  "adenocarcinoma, clear cell": [
+    "C04.557.470.200.025.045"
+  ],
+  "adenocarcinoma, follicular": [
+    "C04.557.470.200.025.060"
+  ],
+  "carcinoma, papillary, follicular": [
+    "C04.557.470.200.025.060.225",
+    "C04.557.470.200.025.085.225"
+  ],
+  "adenocarcinoma, sebaceous": [
+    "C04.557.470.200.025.105",
+    "C04.557.470.550.105"
+  ],
+  "carcinoma, acinar cell": [
+    "C04.557.470.200.025.215"
+  ],
+  "adrenocortical carcinoma": [
+    "C04.557.470.200.025.152",
+    "C04.588.322.078.265.750"
+  ],
+  "carcinoma, endometrioid": [
+    "C04.557.470.200.025.240",
+    "C04.588.945.418.948.585.124"
+  ],
+  "carcinoma, ductal, breast": [
+    "C04.557.470.200.025.232.500",
+    "C04.557.470.615.132.500",
+    "C04.588.180.390"
+  ],
+  "carcinoma, islet cell": [
+    "C04.557.470.200.025.290",
+    "C04.588.274.761.500",
+    "C04.588.322.475.500"
+  ],
+  "carcinoma, lobular": [
+    "C04.557.470.200.025.305",
+    "C04.557.470.615.305",
+    "C04.588.180.437"
+  ],
+  "carcinoma, medullary": [
+    "C04.557.465.625.650.240.315",
+    "C04.557.470.200.025.370.315",
+    "C04.557.470.615.315",
+    "C04.557.580.625.650.240.315"
+  ],
+  "carcinoma, mucoepidermoid": [
+    "C04.557.470.200.025.340",
+    "C04.557.470.590.340"
+  ],
+  "carcinoma, neuroendocrine": [
+    "C04.557.465.625.650.240",
+    "C04.557.470.200.025.370",
+    "C04.557.580.625.650.240"
+  ],
+  "carcinoma, signet ring cell": [
+    "C04.557.470.200.025.415",
+    "C04.557.470.590.415"
+  ],
+  "carcinoma, skin appendage": [
+    "C04.557.470.200.025.420",
+    "C04.557.470.550.420"
+  ],
+  "cholangiocarcinoma": [
+    "C04.557.470.200.025.450"
+  ],
+  "cystadenocarcinoma, mucinous": [
+    "C04.557.470.200.025.480.225",
+    "C04.557.470.590.480.225"
+  ],
+  "cystadenocarcinoma, papillary": [
+    "C04.557.470.200.025.480.230",
+    "C04.557.470.590.480.230"
+  ],
+  "cystadenocarcinoma, serous": [
+    "C04.557.470.200.025.480.240",
+    "C04.557.470.590.480.240"
+  ],
+  "klatskin tumor": [
+    "C04.557.470.200.025.450.500"
+  ],
+  "carcinoma, giant cell": [
+    "C04.557.470.200.220"
+  ],
+  "carcinoma, large cell": [
+    "C04.557.470.200.260"
+  ],
+  "carcinoma, small cell": [
+    "C04.557.470.200.380"
+  ],
+  "carcinoma, verrucous": [
+    "C04.557.470.200.450",
+    "C04.557.470.700.450"
+  ],
+  "cystadenoma, mucinous": [
+    "C04.557.470.035.320.225",
+    "C04.557.470.590.485.225"
+  ],
+  "cystadenoma, papillary": [
+    "C04.557.470.035.320.230",
+    "C04.557.470.590.485.230"
+  ],
+  "cystadenoma, serous": [
+    "C04.557.470.035.320.240",
+    "C04.557.470.590.485.240"
+  ],
+  "neoplasms, adnexal and skin appendage": [
+    "C04.557.470.550"
+  ],
+  "neoplasms, basal cell": [
+    "C04.557.470.565"
+  ],
+  "pilomatrixoma": [
+    "C04.557.470.565.625"
+  ],
+  "neoplasms, cystic, mucinous, and serous": [
+    "C04.557.470.590"
+  ],
+  "mucoepidermoid tumor": [
+    "C04.557.470.590.580"
+  ],
+  "neoplasms, ductal, lobular, and medullary": [
+    "C04.557.470.615"
+  ],
+  "papilloma, intraductal": [
+    "C04.557.470.615.670"
+  ],
+  "neoplasms, mesothelial": [
+    "C04.557.470.660"
+  ],
+  "neoplasms, neuroepithelial": [
+    "C04.557.465.625.600",
+    "C04.557.470.670",
+    "C04.557.580.625.600"
+  ],
+  "ganglioglioma": [
+    "C04.557.465.625.600.380.350",
+    "C04.557.470.670.380.350",
+    "C04.557.580.625.600.380.350"
+  ],
+  "esthesioneuroblastoma, olfactory": [
+    "C04.557.465.625.600.590.650.550.150",
+    "C04.557.470.670.590.650.550.150",
+    "C04.557.580.625.600.590.650.550.150"
+  ],
+  "ganglioneuroblastoma": [
+    "C04.557.465.625.600.590.650.550.300",
+    "C04.557.470.670.590.650.550.300",
+    "C04.557.580.625.600.590.650.550.300"
+  ],
+  "neurocytoma": [
+    "C04.557.465.625.600.580",
+    "C04.557.470.670.580",
+    "C04.557.580.625.600.580",
+    "C04.588.614.250.195.648"
+  ],
+  "neoplasms, squamous cell": [
+    "C04.557.470.700"
+  ],
+  "papilloma, inverted": [
+    "C04.557.470.700.600.610"
+  ],
+  "neoplasms, gonadal tissue": [
+    "C04.557.475"
+  ],
+  "sertoli-leydig cell tumor": [
+    "C04.557.475.750.847",
+    "C04.588.322.455.648",
+    "C04.588.322.762.500",
+    "C04.588.945.440.915.500"
+  ],
+  "luteoma": [
+    "C04.557.475.750.751",
+    "C04.588.322.455.464"
+  ],
+  "sex cord-gonadal stromal tumors": [
+    "C04.557.475.750"
+  ],
+  "glioma, subependymal": [
+    "C04.557.465.625.600.380.290.390",
+    "C04.557.470.670.380.290.390",
+    "C04.557.580.625.600.380.290.390"
+  ],
+  "gliosarcoma": [
+    "C04.557.465.625.600.380.400",
+    "C04.557.470.670.380.400",
+    "C04.557.580.625.600.380.400"
+  ],
+  "nerve sheath neoplasms": [
+    "C04.557.580.600"
+  ],
+  "neurofibroma, plexiform": [
+    "C04.557.580.600.580.585"
+  ],
+  "neurofibrosarcoma": [
+    "C04.557.450.565.590.350.590",
+    "C04.557.450.795.350.590",
+    "C04.557.580.600.580.795"
+  ],
+  "neurothekeoma": [
+    "C04.557.450.565.550.625",
+    "C04.557.580.600.625"
+  ],
+  "angiofibroma": [
+    "C04.557.645.100"
+  ],
+  "hemangioendothelioma, epithelioid": [
+    "C04.557.645.375.370.380"
+  ],
+  "hemangioma, capillary": [
+    "C04.557.645.375.380"
+  ],
+  "hemangioblastoma": [
+    "C04.557.645.375.380.370"
+  ],
+  "nevi and melanomas": [
+    "C04.557.665"
+  ],
+  "hutchinson's melanotic freckle": [
+    "C04.557.465.625.650.510.385",
+    "C04.557.580.625.650.510.385",
+    "C04.557.665.510.385"
+  ],
+  "melanoma, amelanotic": [
+    "C04.557.465.625.650.510.515",
+    "C04.557.580.625.650.510.515",
+    "C04.557.665.510.515"
+  ],
+  "nevus, blue": [
+    "C04.557.665.560.615.550"
+  ],
+  "nevus, intradermal": [
+    "C04.557.665.560.590"
+  ],
+  "nevus, spindle cell": [
+    "C04.557.665.560.615.625"
+  ],
+  "nevus, epithelioid and spindle cell": [
+    "C04.557.665.560.615.625.585"
+  ],
+  "odontogenic cyst, calcifying": [
+    "C04.182.089.530.690.605",
+    "C04.557.695.605"
+  ],
+  "rhabdoid tumor": [
+    "C04.557.435.710"
+  ],
+  "neuroendocrine tumors": [
+    "C04.557.465.625.650",
+    "C04.557.580.625.650"
+  ],
+  "neoplasm, residual": [
+    "C04.697.700"
+  ],
+  "lymphoma, b-cell, marginal zone": [
+    "C04.557.386.480.150.570"
+  ],
+  "breast neoplasms, male": [
+    "C04.588.180.260"
+  ],
+  "multiple endocrine neoplasia type 1": [
+    "C04.588.322.400.500",
+    "C04.651.600.500",
+    "C04.700.630.500"
+  ],
+  "multiple endocrine neoplasia type 2a": [
+    "C04.588.322.400.505",
+    "C04.651.600.505",
+    "C04.700.630.505"
+  ],
+  "multiple endocrine neoplasia type 2b": [
+    "C04.588.322.400.510",
+    "C04.651.600.510",
+    "C04.700.630.510"
+  ],
+  "carcinoma, lewis lung": [
+    "C04.557.470.200.280",
+    "C04.619.230"
+  ],
+  "muscle neoplasms": [
+    "C04.588.839.500"
+  ],
+  "vascular neoplasms": [
+    "C04.588.839.750"
+  ],
+  "bone marrow neoplasms": [
+    "C04.588.448.200"
+  ],
+  "prostatic intraepithelial neoplasia": [
+    "C04.557.470.200.240.500"
+  ],
+  "skull base neoplasms": [
+    "C04.588.149.721.828"
+  ],
+  "hematologic neoplasms": [
+    "C04.588.448"
+  ],
+  "retinal neoplasms": [
+    "C04.588.364.818"
+  ],
+  "optic nerve neoplasms": [
+    "C04.588.614.300.600",
+    "C04.588.614.596.240.240"
+  ],
+  "papilloma, choroid plexus": [
+    "C04.588.614.250.195.205.200.500"
+  ],
+  "brain stem neoplasms": [
+    "C04.588.614.250.195.411.100"
+  ],
+  "optic nerve glioma": [
+    "C04.557.465.625.600.380.795",
+    "C04.557.470.670.380.795",
+    "C04.557.580.625.600.380.795",
+    "C04.588.614.300.600.600",
+    "C04.588.614.596.240.240.500"
+  ],
+  "paraneoplastic syndromes, nervous system": [
+    "C04.588.614.550",
+    "C04.730.856"
+  ],
+  "paraneoplastic cerebellar degeneration": [
+    "C04.588.614.550.650",
+    "C04.730.856.650"
+  ],
+  "limbic encephalitis": [
+    "C04.588.614.550.450",
+    "C04.730.856.437"
+  ],
+  "paraneoplastic polyneuropathy": [
+    "C04.588.614.550.700",
+    "C04.730.856.700"
+  ],
+  "lymphoma, mantle-cell": [
+    "C04.557.386.480.525"
+  ],
+  "hemangioma, cavernous, central nervous system": [
+    "C04.557.645.375.385.500"
+  ],
+  "central nervous system venous angioma": [
+    "C04.557.645.375.185"
+  ],
+  "central nervous system cysts": [
+    "C04.588.614.250.387"
+  ],
+  "carcinoma, pancreatic ductal": [
+    "C04.557.470.200.025.232.750",
+    "C04.557.470.615.132.750",
+    "C04.588.274.761.750",
+    "C04.588.322.475.750"
+  ],
+  "sarcoma, myeloid": [
+    "C04.557.337.539.775",
+    "C04.557.450.795.853"
+  ],
+  "denys-drash syndrome": [
+    "C04.557.435.595.220",
+    "C04.588.945.947.535.585.220",
+    "C04.700.900.220"
+  ],
+  "gestational trophoblastic disease": [
+    "C04.557.465.955.416",
+    "C04.850.908.416"
+  ],
+  "choriocarcinoma, non-gestational": [
+    "C04.557.465.955.207.438",
+    "C04.557.470.200.025.455.750",
+    "C04.850.908.208.438"
+  ],
+  "mastocytosis, cutaneous": [
+    "C04.557.450.565.465.500",
+    "C04.588.805.309"
+  ],
+  "mastocytosis, systemic": [
+    "C04.557.450.565.465.750"
+  ],
+  "mastocytoma": [
+    "C04.557.450.565.465.249"
+  ],
+  "endometrial stromal tumors": [
+    "C04.557.450.565.325",
+    "C04.557.450.795.332"
+  ],
+  "glomus tympanicum tumor": [
+    "C04.557.465.625.650.700.705.360",
+    "C04.557.580.625.650.700.705.360"
+  ],
+  "carcinoma, ductal": [
+    "C04.557.470.200.025.232",
+    "C04.557.470.615.132"
+  ],
+  "ganglion cysts": [
+    "C04.182.347"
+  ],
+  "gastrointestinal stromal tumors": [
+    "C04.557.450.565.370"
+  ],
+  "breast cyst": [
+    "C04.182.156"
+  ],
+  "myofibroma": [
+    "C04.557.450.565.540"
+  ],
+  "pulmonary sclerosing hemangioma": [
+    "C04.588.894.797.520.933"
+  ],
+  "acanthoma": [
+    "C04.557.470.700.040",
+    "C04.588.805.040"
+  ],
+  "mongolian spot": [
+    "C04.557.665.560.615.530"
+  ],
+  "growth hormone-secreting pituitary adenoma": [
+    "C04.557.470.035.415",
+    "C04.588.322.609.292"
+  ],
+  "acth-secreting pituitary adenoma": [
+    "C04.557.470.035.012",
+    "C04.588.322.609.145"
+  ],
+  "adamantinoma": [
+    "C04.588.149.030"
+  ],
+  "odontogenic tumor, squamous": [
+    "C04.557.695.607"
+  ],
+  "histiocytoma": [
+    "C04.557.450.565.590.425"
+  ],
+  "histiocytoma, malignant fibrous": [
+    "C04.557.450.565.590.425.360",
+    "C04.557.450.795.400"
+  ],
+  "tarlov cysts": [
+    "C04.182.872"
+  ],
+  "opsoclonus-myoclonus syndrome": [
+    "C04.588.614.550.600",
+    "C04.730.856.596"
+  ],
+  "nevus, sebaceous of jadassohn": [
+    "C04.557.665.560.700"
+  ],
+  "leukemia, large granular lymphocytic": [
+    "C04.557.337.428.580.049"
+  ],
+  "precursor cell lymphoblastic leukemia-lymphoma": [
+    "C04.557.337.428.600"
+  ],
+  "precursor t-cell lymphoblastic leukemia-lymphoma": [
+    "C04.557.337.428.600.620"
+  ],
+  "neoplasms, plasma cell": [
+    "C04.557.595"
+  ],
+  "solitary fibrous tumor, pleural": [
+    "C04.557.450.565.590.797.750",
+    "C04.588.894.797.640.800"
+  ],
+  "solitary fibrous tumors": [
+    "C04.557.450.565.590.797"
+  ],
+  "lymphoma, extranodal nk-t-cell": [
+    "C04.557.386.480.750.199"
+  ],
+  "leukemia, prolymphocytic, b-cell": [
+    "C04.557.337.428.080.562",
+    "C04.557.337.428.565.745"
+  ],
+  "leukemia, myelomonocytic, juvenile": [
+    "C04.557.337.539.525"
+  ],
+  "leukemia, myeloid, chronic, atypical, bcr-abl negative": [
+    "C04.557.337.539.300"
+  ],
+  "lymphoma, primary cutaneous anaplastic large cell": [
+    "C04.557.386.480.750.800.507"
+  ],
+  "lymphoma, primary effusion": [
+    "C04.557.386.480.150.592"
+  ],
+  "mastocytoma, skin": [
+    "C04.557.450.565.465.249.500",
+    "C04.557.450.565.465.500.500",
+    "C04.588.805.309.500"
+  ],
+  "dendritic cell sarcoma, interdigitating": [
+    "C04.557.227.199"
+  ],
+  "dendritic cell sarcoma, follicular": [
+    "C04.557.227.190"
+  ],
+  "histiocytic sarcoma": [
+    "C04.557.227.380"
+  ],
+  "langerhans cell sarcoma": [
+    "C04.557.227.500"
+  ],
+  "perivascular epithelioid cell neoplasms": [
+    "C04.557.450.692"
+  ],
+  "pallister-hall syndrome": [
+    "C04.445.622",
+    "C04.588.614.250.195.885.500.299"
+  ],
+  "adenomyoepithelioma": [
+    "C04.557.435.108"
+  ],
+  "multiple pulmonary nodules": [
+    "C04.588.894.797.520.237"
+  ],
+  "keratosis, actinic": [
+    "C04.834.450"
+  ],
+  "muir-torre syndrome": [
+    "C04.588.805.578.500",
+    "C04.700.250.500.500"
+  ],
+  "small cell lung carcinoma": [
+    "C04.588.894.797.520.109.220.624"
+  ],
+  "meningeal carcinomatosis": [
+    "C04.588.614.250.580.150"
+  ],
+  "lynch syndrome ii": [
+    "C04.700.250.500"
+  ],
+  "nevus, halo": [
+    "C04.557.665.560.580"
+  ],
+  "pagetoid reticulosis": [
+    "C04.557.386.480.750.800.550.600"
+  ],
+  "colloid cysts": [
+    "C04.182.199",
+    "C04.588.614.250.387.200"
+  ],
+  "carney complex": [
+    "C04.557.450.565.550.312",
+    "C04.588.894.309.500"
+  ],
+  "eccrine porocarcinoma": [
+    "C04.557.470.200.025.500"
+  ],
+  "poroma": [
+    "C04.557.470.035.175.588",
+    "C04.557.470.550.175.588"
+  ],
+  "birt-hogg-dube syndrome": [
+    "C04.700.212"
+  ],
+  "sister mary joseph's nodule": [
+    "C04.588.033.740"
+  ],
+  "desmoplastic small round cell tumor": [
+    "C04.557.450.795.315"
+  ],
+  "enteropathy-associated t-cell lymphoma": [
+    "C04.557.386.480.750.099"
+  ],
+  "composite lymphoma": [
+    "C04.557.386.150",
+    "C04.557.435.295"
+  ],
+  "aberrant crypt foci": [
+    "C04.834.020"
+  ],
+  "inflammatory breast neoplasms": [
+    "C04.588.180.576"
+  ],
+  "paraneoplastic syndromes, ocular": [
+    "C04.588.364.738",
+    "C04.730.900"
+  ],
+  "kasabach-merritt syndrome": [
+    "C04.557.645.375.617"
+  ],
+  "anti-n-methyl-d-aspartate receptor encephalitis": [
+    "C04.588.614.550.112",
+    "C04.730.856.112"
+  ],
+  "neoplasm micrometastasis": [
+    "C04.697.650.695"
+  ],
+  "hereditary breast and ovarian cancer syndrome": [
+    "C04.588.180.483",
+    "C04.588.322.455.431",
+    "C04.700.517"
+  ],
+  "cystadenofibroma": [
+    "C04.557.450.565.590.595.050.500",
+    "C04.557.470.590.482",
+    "C04.557.470.625.050.500"
+  ],
+  "buschke-lowenstein tumor": [
+    "C04.557.470.200.450.500",
+    "C04.557.470.700.450.500"
+  ],
+  "lipoblastoma": [
+    "C04.557.450.550.400.500"
+  ],
+  "carcinogenesis": [
+    "C04.697.098"
+  ],
+  "intraocular lymphoma": [
+    "C04.557.386.435",
+    "C04.588.364.447"
+  ],
+  "prostatic neoplasms, castration-resistant": [
+    "C04.588.945.440.770.500"
+  ],
+  "triple negative breast neoplasms": [
+    "C04.588.180.788"
+  ],
+  "atypical squamous cells of the cervix": [
+    "C04.834.818.249"
+  ],
+  "squamous intraepithelial lesions of the cervix": [
+    "C04.834.818.500"
+  ],
+  "adenocarcinoma in situ": [
+    "C04.557.470.200.025.014",
+    "C04.557.470.200.240.124"
+  ],
+  "thyroid carcinoma, anaplastic": [
+    "C04.557.470.200.725"
+  ],
+  "plasmablastic lymphoma": [
+    "C04.557.386.480.150.585.500"
+  ],
+  "mammary analogue secretory carcinoma": [
+    "C04.557.470.200.588"
+  ],
+  "unilateral breast neoplasms": [
+    "C04.588.180.800"
+  ],
+  "giant cell tumor of tendon sheath": [
+    "C04.557.450.565.380.690"
+  ],
+  "fibromatosis, plantar": [
+    "C04.557.450.565.590.340.705"
+  ],
+  "breast carcinoma in situ": [
+    "C04.557.470.200.240.187",
+    "C04.588.180.130"
+  ],
+  "tubular sweat gland adenomas": [
+    "C04.557.470.035.175.900",
+    "C04.557.470.550.175.900"
+  ],
+  "oncogene addiction": [
+    "C04.697.850"
+  ],
+  "smoldering multiple myeloma": [
+    "C04.834.794"
+  ],
+  "immunoglobulin light-chain amyloidosis": [
+    "C04.557.595.250"
+  ],
+  "adenocarcinoma of lung": [
+    "C04.557.470.200.025.022",
+    "C04.588.894.797.520.055"
+  ],
+  "squamous cell carcinoma of head and neck": [
+    "C04.557.470.200.400.565",
+    "C04.588.443.177"
+  ],
+  "chondrosarcoma, clear cell": [
+    "C04.557.450.565.280.140",
+    "C04.557.450.795.300.140"
+  ],
+  "carcinoma, ovarian epithelial": [
+    "C04.557.470.200.295",
+    "C04.588.322.455.199"
+  ],
+  "thyroid cancer, papillary": [
+    "C04.557.470.200.025.085.612",
+    "C04.588.322.894.400",
+    "C04.588.443.915.400"
+  ],
+  "nasopharyngeal carcinoma": [
+    "C04.557.470.200.623",
+    "C04.588.443.665.710.650.500"
+  ],
+  "esophageal squamous cell carcinoma": [
+    "C04.557.470.200.400.330",
+    "C04.557.470.700.400.565",
+    "C04.588.274.476.205.500",
+    "C04.588.443.353.500"
+  ],
+  "myopericytoma": [
+    "C04.557.450.565.545",
+    "C04.557.645.380.500"
+  ],
+  "pancreatic intraductal neoplasms": [
+    "C04.557.470.615.665",
+    "C04.588.274.761.875",
+    "C04.588.322.475.875"
+  ],
+  "extranodal extension": [
+    "C04.697.650.280"
+  ],
+  "diffuse intrinsic pontine glioma": [
+    "C04.557.465.625.600.380.185",
+    "C04.557.470.670.380.185",
+    "C04.557.580.625.600.380.185",
+    "C04.588.614.250.195.411.100.500"
+  ],
+  "warburg effect, oncologic": [
+    "C04.697.098.500.580"
+  ],
+  "colitis-associated neoplasms": [
+    "C04.588.274.476.411.307.180.400"
+  ],
+  "cardiac papillary fibroelastoma": [
+    "C04.588.894.309.250"
+  ],
+  "mesothelioma, malignant": [
+    "C04.557.470.035.510.757",
+    "C04.557.470.660.510.757",
+    "C04.588.894.797.520.173",
+    "C04.588.894.797.640.350"
+  ],
+  "non-muscle invasive bladder neoplasms": [
+    "C04.557.470.200.674",
+    "C04.588.945.947.960.500"
+  ],
+  "cutaneous malignant melanoma": [
+    "C04.557.465.625.650.510.520",
+    "C04.557.580.625.650.510.520",
+    "C04.557.665.510.520",
+    "C04.588.805.444"
+  ],
+  "uveal melanoma": [
+    "C04.557.465.625.650.510.762",
+    "C04.557.580.625.650.510.762",
+    "C04.557.665.510.762",
+    "C04.588.364.978.312"
+  ],
+  "blastic plasmacytoid dendritic cell neoplasm": [
+    "C04.557.227.001",
+    "C04.557.337.001",
+    "C04.557.386.001",
+    "C04.588.448.001",
+    "C04.588.805.175"
+  ],
+  "non-melanoma skin neoplasms": [
+    "C04.557.470.200.649",
+    "C04.588.805.511"
+  ],
+  "cutaneous squamous cell carcinoma": [
+    "C04.557.470.200.649.001",
+    "C04.588.805.511.001"
+  ]
+}

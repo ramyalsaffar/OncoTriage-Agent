@@ -82,6 +82,7 @@ from openai import OpenAI
 from qdrant_client import QdrantClient
 
 from oncotriage import paths
+from oncotriage import settings
 
 
 #------------------------------------------------------------------------------
@@ -403,12 +404,115 @@ def get_openai_api_key() -> str:
     return get_keys()['openai']
 
 
+# ---------------------------------------------------------------------------
+# The Qdrant endpoint, and the one deliberate way to move it
+# ---------------------------------------------------------------------------
+#
+# THE DEFECT THIS CLOSES, measured inside the running container on 2026-08-06
+# rather than read off the source:
+#
+#     os.environ QDRANT_URL before load_env_keys -> http://qdrant:6333
+#     config.get_qdrant_url()                    -> https://bd717e5f-....qdrant.io
+#     os.environ QDRANT_URL after  load_env_keys -> https://bd717e5f-....qdrant.io
+#
+# `paths.load_env_keys()` POPS all three key names out of os.environ and reloads
+# them from the .env with `override=True`, so NO environment variable and no
+# compose setting could redirect Qdrant. docker-compose.yml had carried
+# `QDRANT_URL: http://qdrant:6333` for exactly that purpose, and the `qdrant`
+# service it named started, went healthy, held zero collections and was queried
+# by nothing while /pipeline/info reported 12,067 trials from the cloud.
+#
+# THE POP IS NOT THE BUG AND IS NOT TOUCHED. It exists so a stale exported
+# credential cannot shadow the credentials file -- the direction that quietly
+# sends a live key to the wrong endpoint. `load_env_keys` is unchanged, and
+# `get_keys()` still returns exactly what the .env says.
+#
+# What is added is a SECOND, deliberately-named tier that beats it. See
+# settings.ENV_QDRANT_URL for why the accidental route stays closed while this
+# one is open, and settings.ENV_QDRANT_API_KEY for why the key does not
+# automatically follow the URL.
+#
+# RESOLVED ONCE PER PROCESS AND ANNOUNCED ONCE. The announcement is not
+# decoration: with two possible endpoints and a client that reports neither, a
+# run against the wrong index looks exactly like a run against the right one
+# that retrieved badly. Every process that opens a Qdrant client now says which
+# source answered, on one line, before the first request.
+
+_QDRANT_SOURCE_ENV_FILE = "keys/.env"
+"""``source`` reported when the .env decided the endpoint. Not an environment
+variable name, which is why it is spelled as a path: it is what a reader has to
+open to change the answer."""
+
+_QDRANT_KEY_SOURCE_NONE = "none (URL overridden, no key named)"
+"""``source`` reported when no key is sent at all. A distinct string rather than
+None so the log line reads as a decision rather than a missing field."""
+
+_QDRANT_ENDPOINT_CACHE = None
+
+
+def _resolve_qdrant_endpoint():
+    """(url, url_source, api_key, key_source). Resolved once, logged once.
+
+    The three rows of settings.ENV_QDRANT_API_KEY's table, in order. Nothing
+    here opens a socket: this is string resolution, and the client is built by
+    ``get_qdrant_client()``.
+    """
+    global _QDRANT_ENDPOINT_CACHE
+    if _QDRANT_ENDPOINT_CACHE is not None:
+        return _QDRANT_ENDPOINT_CACHE
+
+    override_url, url_source = settings.resolve_qdrant_url()
+
+    if override_url is None:
+        # Row 1: no override. `get_keys()` reads the .env -- and raises if it is
+        # absent or incomplete, which is the pre-existing behaviour and the
+        # right one: with no override in force, the .env is the only answer.
+        keys = get_keys()
+        resolved = (keys['qdrant_url'], _QDRANT_SOURCE_ENV_FILE,
+                    keys['qdrant_key'], _QDRANT_SOURCE_ENV_FILE)
+    else:
+        override_key, key_source = settings.resolve_qdrant_api_key()
+        if override_key is None:
+            # Row 3. The .env is deliberately NOT consulted -- not even for the
+            # key -- so that a container pointed at its own Qdrant never opens
+            # the credentials file for this purpose and never forwards a cloud
+            # credential to an environment-named host.
+            resolved = (override_url, url_source, None, _QDRANT_KEY_SOURCE_NONE)
+        else:
+            # Row 2.
+            resolved = (override_url, url_source, override_key, key_source)
+
+    _QDRANT_ENDPOINT_CACHE = resolved
+    print(f"[Qdrant] endpoint {resolved[0]} (from {resolved[1]}); "
+          f"api key from {resolved[3]}")
+    return resolved
+
+
 def get_qdrant_url() -> str:
-    return get_keys()['qdrant_url']
+    """The Qdrant endpoint: ONCOTRIAGE_QDRANT_URL if set, else the .env."""
+    return _resolve_qdrant_endpoint()[0]
 
 
-def get_qdrant_api_key() -> str:
-    return get_keys()['qdrant_key']
+def get_qdrant_api_key():
+    """The Qdrant API key, or None when the URL was overridden without one.
+
+    Returns None rather than raising, and ``QdrantClient(api_key=None)`` sends
+    no auth header -- which is what a local Qdrant with no configured key wants.
+    See settings.ENV_QDRANT_API_KEY for why this does not fall back to the .env.
+    """
+    return _resolve_qdrant_endpoint()[2]
+
+
+def qdrant_endpoint_sources() -> dict:
+    """Which source decided the endpoint and the key. Opens nothing.
+
+    Exists so a report -- GET /pipeline/info, a bring-up log, a test -- can
+    state where the client is pointed without reading the credential. The key
+    itself is never returned by this function, only the name of what supplied
+    it.
+    """
+    url, url_source, _key, key_source = _resolve_qdrant_endpoint()
+    return {"url": url, "url_source": url_source, "api_key_source": key_source}
 
 
 # How many times the OpenAI SDK may retry ONE request by itself.

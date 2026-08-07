@@ -49,6 +49,7 @@ from oncotriage.agent.mesh_expansion import (
     resolve_patient_mesh,
 )
 from oncotriage.agent.patient import extract_genomic_variant_terms
+from oncotriage.agent.readiness import require_populated_index
 from oncotriage.agent.state import (
     CHANNEL_ABLATED,
     CHANNEL_EMPTY_QUERY,
@@ -356,6 +357,25 @@ def node_hybrid_retrieval(state: TrialMatchState) -> dict:
     # different objects if an override is installed mid-flight.
     bm25_query_model = deps.get_bm25_query_model()
     qdrant = deps.get_qdrant_client()
+
+    # AN EMPTY INDEX MUST NOT LOOK LIKE A PATIENT WHO MATCHED NOTHING.
+    #
+    # Every Qdrant call below SUCCEEDS against a collection with zero points and
+    # returns an empty list. The graph's conditional edge then routes to
+    # node_no_candidates, the API answers 200 with "no eligible trials found",
+    # and the stored inference row is well-formed -- the same output a genuinely
+    # unmatchable patient produces. Nothing raises and no counter moves.
+    #
+    # This is BEFORE the channel machinery on purpose. Each channel below is
+    # wrapped in `except Exception` and records itself as failed, so a raise
+    # from inside that region would be absorbed into "one channel was
+    # unavailable" -- the report that hides this exact fault.
+    #
+    # Cost: one `collection_exists` + one `count` per PROCESS, not per patient
+    # (see readiness.require_populated_index for why only the good verdict is
+    # cached). An unverifiable probe is counted and does not block; the policy
+    # and its reasons are at that function.
+    require_populated_index(client=qdrant)
 
     query = state["expanded_query"]
     rerank_queries = state.get("rerank_queries", [])

@@ -77,7 +77,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Dict, Optional
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
 from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -86,6 +86,12 @@ from slowapi.util import get_remote_address
 from oncotriage import __version__
 from oncotriage.agent.deps import get_qdrant_client
 from oncotriage.agent.graph import build_matching_graph, match_patient_to_trials
+from oncotriage.agent.readiness import (
+    INDEX_POPULATED,
+    READY,
+    probe_index,
+    serving_readiness,
+)
 from oncotriage.config import (
     COLLECTION_NAME,
     CROSS_ENCODER_MODEL,
@@ -98,6 +104,7 @@ from oncotriage.config import (
     RATE_LIMIT,
     RERANK_SCORE_THRESHOLD,
     TOP_K_CANDIDATES,
+    qdrant_endpoint_sources,
 )
 from oncotriage.fhir.parser import parse_fhir_bundle
 from oncotriage.storage.database_logger import log_inference
@@ -130,7 +137,36 @@ async def lifespan(_app):
     print("[Startup] Compiling LangGraph pipeline...")
     graph = build_matching_graph()
 
-    print(f"\n[Ready] Pipeline compiled (BM25 is Qdrant-native, no pre-build needed)\n")
+    # ── SERVING READINESS ────────────────────────────────────────────────
+    # "HEALTHY" USED TO MEAN "uvicorn IS ANSWERING", and the gap between that
+    # and "can serve a request" was the whole of the pipeline's data
+    # dependencies. Measured on a clean `docker compose down -v && up`: all six
+    # containers reported healthy, `GET /health` returned 200 with
+    # `"pipeline_ready": true`, and the first `POST /match` died inside Stage 1
+    # because /app/data/mesh/ was empty. Nothing between the two said so.
+    #
+    # This runs the probes ONCE, at startup, and prints the result. It does NOT
+    # raise: a container that dies here leaves only a log, while one that starts
+    # and answers /health with the reason can be asked what is wrong over HTTP,
+    # by `docker inspect`, and by the compose healthcheck — which is what turns
+    # the failure into a red container instead of a green unusable one.
+    #
+    # It is re-run per request by /health (see there), so populating the missing
+    # dependency makes the stack go green on its own without a restart.
+    print("[Startup] Checking serving readiness...")
+    report = serving_readiness()
+    for _check in report["checks"]:
+        print(f"[Startup]   {'OK  ' if _check['ok'] else 'FAIL'} "
+              f"{_check['name']}: {_check['detail']}")
+    if report["status"] == READY:
+        print(f"\n[Ready] Pipeline compiled and serviceable "
+              f"(BM25 is Qdrant-native, no pre-build needed)\n")
+    else:
+        print(f"\n[NOT READY] The pipeline compiled but CANNOT serve a match "
+              f"request. GET /health reports 503 until the failures above are "
+              f"fixed; no request is refused on the strength of this, so a "
+              f"POST /match will still run and fail at the stage that needs "
+              f"the missing dependency.\n")
 
     yield
 
@@ -333,11 +369,41 @@ def create_app():
     # =======================================================================
 
     @app.get("/health")
-    async def health_check():
-        """Health check and pipeline readiness."""
+    async def health_check(response: Response):
+        """Health check and pipeline readiness. 503 when a dependency is missing.
+
+        THE STATUS CODE IS THE POINT. docker-compose.yml probes this endpoint
+        with `curl -f`, which fails on any 4xx/5xx, so a 503 here is what makes
+        `docker compose ps` say `unhealthy` instead of green. Before this, a
+        stack with an empty /app/data/mesh/ and an empty Qdrant collection
+        reported six healthy containers and could not answer a single request.
+
+        IT RE-RUNS THE PROBES rather than reporting what startup found, and the
+        cost is bounded: `serving_readiness()` calls `deps.get_mesh_filter()`,
+        which is cached by the seam after the first success, and
+        `readiness.probe_index()`, which caches only a POPULATED verdict — so a
+        healthy server pays one cached lookup and no network call, and an
+        unhealthy one pays a `collection_exists` + `count` per probe interval.
+        That asymmetry is deliberate: it is what lets a stack recover on its own
+        the moment the operator populates the index, with no restart, and the
+        only process paying for it is one that is already failing.
+
+        ``pipeline_ready`` is KEPT and still means what it always meant — the
+        graph compiled. It is now one field among several rather than the whole
+        answer, because it was the field that reported true while the server was
+        unusable.
+        """
+        report = serving_readiness()
+        healthy = report["status"] == READY and graph is not None
+
+        if not healthy:
+            response.status_code = 503
+
         return {
-            "status": "healthy",
+            "status": "healthy" if healthy else "unhealthy",
             "pipeline_ready": graph is not None,
+            "serving_ready": report["status"],
+            "checks": report["checks"],
             "timestamp": datetime.now().isoformat()
         }
 
@@ -416,10 +482,26 @@ def create_app():
         # it IS reachable through deps.set_override(QDRANT_CLIENT, None), which
         # is how a harness redirects this seam. Either way an unanswerable
         # question is reported as unanswered, not as zero.
+        #
+        # THE COUNT NOW COMES THROUGH readiness.probe_index AND NOT THROUGH A
+        # BARE get_collection, and the reason is a real regression this pass
+        # would otherwise have introduced. `get_collection(COLLECTION_NAME)`
+        # RAISES UnexpectedResponse 404 when no such collection or alias exists
+        # -- measured -- which is precisely the state a clean
+        # `docker compose down -v && up` leaves the compose `qdrant` service in
+        # now that the container uses it. This endpoint is the first thing an
+        # operator asks in that state, and it would have answered with a 500 and
+        # a traceback about a missing collection instead of describing the
+        # pipeline. `probe_index` raises nothing and returns a named state, so
+        # the diagnostic survives the failure it is being used to diagnose.
         if qdrant_client:
-            trials_indexed = qdrant_client.get_collection(
-                COLLECTION_NAME).points_count
-            trials_indexed_note = None
+            _verdict = probe_index(client=qdrant_client)
+            trials_indexed = _verdict["points"]        # None unless counted
+            trials_indexed_note = (
+                None if _verdict["state"] == INDEX_POPULATED
+                else f"index state: {_verdict['state']}"
+                     + (f" ({_verdict['error']})" if _verdict["error"] else "")
+                     + f"; endpoint {_verdict['endpoint']}")
         else:
             trials_indexed = None
             trials_indexed_note = (
@@ -445,6 +527,20 @@ def create_app():
             ],
             "config": {
                 "collection_name": COLLECTION_NAME,
+                # WHICH SERVER, AND WHO SAID SO. Until this pass there was only
+                # one possible Qdrant endpoint -- whatever the .env named -- so
+                # a response naming the collection named the index. There are
+                # two now (the .env, and ONCOTRIAGE_QDRANT_URL), and a report
+                # that says "trial_criteria, 12067 points" without saying WHERE
+                # cannot distinguish the cloud index from a local one that was
+                # populated to a different depth. This is a response-shape
+                # change and it is the one this pass owes: it makes an existing
+                # field unambiguous rather than adding a new fact.
+                #
+                # qdrant_endpoint_sources() NEVER RETURNS THE KEY, only the name
+                # of what supplied it, so this endpoint cannot leak a credential
+                # however it is called.
+                "qdrant_endpoint": qdrant_endpoint_sources(),
                 "embedding_model": EMBEDDING_MODEL,
                 # NOT ADDING "cross_encoder_model" HERE, deliberately. It would
                 # be the third model identity in a block that already carries
