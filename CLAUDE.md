@@ -442,6 +442,11 @@ python tests/test_indexer_admission_filters.py                      # 175
 # written by neither of the suite's two writers). ~3 s.
 python tests/test_agent_age_units_and_sex_filter.py                 # 112
 
+# The AJCC M-category pass. Same shape, same directory. No network, no keys, no
+# spend, no git history, no corpus -- every fixture in it is a literal dict --
+# and NOT in the collision matrix. ~2 s.
+python tests/test_extraction_stage_m_category.py                    # 119
+
 pip install -e .                                         # makes `oncotriage` importable anywhere
 ```
 
@@ -3241,6 +3246,112 @@ IGNORECASE removed (133 → 114 pass / 19 fail), the conversion removed (23 fail
 the result rounded (16 fail), the old sex predicate (19 fail), the unguarded
 `.upper()` (7 fail). Baseline on the unreverted copy is green both files.
 Nothing in the repository is written.
+
+### The stage extractor reads the AJCC M category (the M-category pass)
+
+**`extract_patient_stage()` GAINED A TIER AND STAGE 4 GAINED AN ARGUMENT.**
+`oncotriage/fhir/parser.py` had been routing LOINC **21907-1**, the AJCC
+clinical M category, into `cancer_metastasis_observations` since the metastasis
+item — where it reached `compute_patient_hash` and the Stage 5 prompt and
+**nothing that decides a stage**. A comment beside the routing recorded the
+deferral. The tier is in `oncotriage/extraction/stage.py`; the argument that
+makes it reachable is in `oncotriage/agent/filtering.py`, and
+`oncotriage/fixtures/capture.py:scan_cohort` got the same one because its
+docstring promises it classifies with the helpers Stage 4 calls.
+
+**THE RULE READS ONE DIRECTION ONLY.** cM1 → 4. cM0 → **nothing**: it is a
+POSITIVE statement that there is no distant metastasis, and a patient can be
+cM0 and stage IIIC. cMX ("cannot be assessed") → nothing. The comment in
+parser.py claiming 290 cM0 to 5 cM1 was **re-measured over all 1,000 bundles
+rather than trusted, and is exactly right**: 295 observations, one per patient,
+no patient carrying two, values `1229901006` / `1229903009` with full SNOMED
+display text. So reading cM0 as an early stage would reach 58 patients wrongly
+for every one it reached rightly, in the damaging direction — a stage floor low
+enough to drop the advanced-disease trials they qualify for.
+
+**THE MEASURED EFFECT ON THIS CORPUS IS ZERO, AND THE REASON OVERTURNS THE
+ITEM'S PREMISE.** All five cM1 patients **also carry a stage GROUP Observation
+reading "Stage 4 (qualifier value)"**, so the tier above the new one already
+answered for them. 0 patients change stage; 0 trials newly dropped; 0 newly
+kept. Nobody is "staged from their diagnosis text instead, or not at all"
+today. Three things keep that zero from being vacuous:
+
+- **The tier fires on real data.** Withhold the stage-group list from those same
+  five real patients and the M rule reaches 4 on its own — **three of the five
+  have no stage anywhere else in their record**, and a fourth resolves to 3
+  without it.
+- **The ruler is not blind.** Priced over the real 14,324-trial corpus, a
+  None → 4 transition newly drops **1,093** trials; 1 → 4 drops 622 and keeps
+  4,641; 3 → 4 drops 747 and keeps 3,745.
+- **cM0 moves nobody.** All 290 cM0 patients, stage group withheld: 0 change.
+
+**"CARRYING BOTH IS A CONTRADICTION" IS ALSO WRONG AS STATED.** Five patients
+carry a stage group *and* cM1, and all five **agree** at IV. A contradiction is
+a group BELOW IV beside cM1, and there are **zero** of those. The extractor
+does not try to reconcile them — the tier order means the assigned group wins —
+and that is argued at the function.
+
+**THE LOINC HAS ONE SPELLING**, `constants.LOINC_AJCC_CLINICAL_M`, because
+parser.py ROUTES by it and stage.py SELECTS by it and two literals that drift
+make the rule **silently never fire** — the CROSS_ENCODER_MODEL shape. The
+other three codes in `_METASTASIS_LOINCS` deliberately keep their literals:
+each has one reader, and **44667-4 must not be treated as an M category** even
+though it shares the axis, because it carries metastasis SITE names. The rule
+therefore keys on the CODE, never on `metastasis_category == "M"`.
+
+**`M_CATEGORY_UNREADABLE`** counts 21907-1 values the regex cannot read, keyed
+by the capped text, on `AGE_PARSE_FAILURES`' footing (third-party data counts,
+configuration raises). **cM0 and cMX are NOT counted** — they were read, and
+"this axis contributes no stage" is a determinate answer, not a degradation.
+It measures **zero** over the corpus.
+
+**`tests/test_extraction_stage_m_category.py` — 119 checks**, no network, no
+keys, no spend, no git history, no corpus, not in the collision matrix. Ten
+planted defects, ten caught, each into an in-memory COPY with both touched
+files hashed before any plant and compared at the end **plus a non-degeneracy
+probe, because the first version of that comparison hashed one file twice in
+one expression and was a tautology**. It is the sixth member of
+`_EXEC_ALLOWLIST`, and its control 8 is why: it reverts **only Stage 4's call
+site** while leaving the extractor entirely correct, which is a state no commit
+ever had, so `git show` could not produce it.
+
+**`fixture_replay.py` COULD NOT RUN, AND THE REASON IS NOT THIS CHANGE.** It
+refuses at its pinned-collection gate, before any fixture is diffed: the alias
+`trial_criteria` now resolves to **`trial_criteria_20260807_111807`** while all
+twelve fixtures are pinned to `trial_criteria_20260803_104642`. That is the
+scrape-admission re-index (the same run that produced today's
+`trials_latest.json`), and it predates this pass — the refusal is item 20c-3d's
+guard working. **Every pass that claims "12/12 clean without recapture" from
+here on has to re-capture first, or point the alias back.**
+
+What was proven instead, directly and without Qdrant: the **twelve fixture
+patients were looked up in the corpus by the patient_id stored on each
+fixture**, and Stage 4's `patient_stage` is **identical before and after for all
+twelve, and equal to the stage each fixture recorded at capture** (2, 1, 3, 2,
+4, 1, 1, 2, 4, 4, 1, None — five distinct values, so the comparison is not
+degenerate). None of the twelve carries cM1. `patient_stage` is the only
+pipeline value this change can move, so no fixture's deterministic prefix can
+have moved either.
+
+**explore.py's stage analysis is UNCHANGED, run rather than argued.** All 278
+distinct condition displays in the corpus through the shipped extractor and
+through `git show HEAD:`'s: **0 differ**. `analyze_cancer_stages()` then run end
+to end on frames built from the real corpus, both ways: console output
+identical (781 chars) and the PNG **byte-identical**. Note `06- FHIR Dataset
+Characterization.py` cannot be run whole on this machine — it reads Synthea's
+CSV export and `EXPORT_CSV` is off, so `.../01- Patients/csv/` does not exist.
+
+**A LARGE PRE-EXISTING DEFECT WAS FOUND AND DELIBERATELY NOT FIXED HERE.**
+`_SNOMED_DISPLAY_STAGE_RE` matches **"Chronic kidney disease stage 3
+(disorder)"**. Of the 260 corpus patients with no stage group whose stage comes
+from a condition display, **245 (94%) get it from chronic kidney disease** and
+only 15 from a real cancer TNM display — so those 245 are filtered against a
+kidney stage. Corpus-wide the regex matches CKD displays 1,025 times against 16
+cancer ones. Fixing it means restricting the tier to conditions the cancer
+registry calls cancer, which is a 245-patient behaviour change with its own
+measurement, and folding it in here would have broken this pass's own
+acceptance criterion that every patient not carrying cM1 resolves exactly as
+before. **Recorded as the top-ranked follow-up.**
 
 ## Persistence and observability
 

@@ -119,6 +119,44 @@ NOT_FOR_CLINICAL_USE_SHORT = (
 #------------------------------------------------------------------------------
 
 
+# The AJCC clinical M category LOINC
+#-----------------------------------
+#
+# 21907-1 "Distant metastases.clinical [Class] Cancer" — the AJCC clinical M
+# category. A fact about an external standard, so a named constant rather than
+# configuration; what puts it HERE rather than inline is that TWO modules must
+# agree on the spelling and neither can see the other's private constant:
+#
+#   oncotriage/fhir/parser.py     ROUTES the Observation by this code, out of
+#                                 the general `observations` pool and into
+#                                 `cancer_metastasis_observations`.
+#   oncotriage/extraction/stage.py SELECTS it back out of that list, by the same
+#                                 code, to read cM1 as stage IV.
+#
+# If those two spellings ever disagree the rule does not fail — it silently
+# never fires. The observation is routed somewhere the stage extractor does not
+# look, `extract_patient_stage()` falls through to the condition-display tiers,
+# and a patient with recorded distant metastasis is staged from their diagnosis
+# text or not at all. Nothing raises and no counter moves: exactly the shape
+# CROSS_ENCODER_MODEL and BM25_SPARSE_MODEL_NAME were each given one name to
+# remove. `tests/test_extraction_stage_m_category.py` section 6 asserts by AST
+# that the literal "21907-1" appears exactly once in the package.
+#
+# `extraction/stage.py` may import this module and stay honest about doing no
+# work at import: this file imports nothing, opens nothing and resolves nothing.
+#
+# The three OTHER codes in parser.py's `_METASTASIS_LOINCS` deliberately do NOT
+# get a shared name. Only one module reads each of them, so there is nothing to
+# drift against — and 44667-4 in particular must NOT be treated as an M
+# category by the stage rule: it is "Site of distant metastasis in Breast
+# tumor", whose 290 corpus values are all "None (qualifier value)". It shares
+# the M *axis* with this code and carries an entirely different vocabulary.
+LOINC_AJCC_CLINICAL_M = "21907-1"
+
+
+#------------------------------------------------------------------------------
+
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """

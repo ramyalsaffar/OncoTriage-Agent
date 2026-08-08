@@ -437,9 +437,19 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
     mesh_filter_applied = mesh_filter_skip_reason == MESH_FILTER_APPLIED
 
     # --- Extract patient cancer stage ---
+    #
+    # The metastasis list is passed as well as the stage-group list, and it had
+    # to be added explicitly: this call site is the ONLY thing that decides
+    # whether the extractor's AJCC M tier ever runs in the pipeline. The
+    # observations were routed into their own field by File 07 and reached
+    # nothing but the patient hash and the Stage 5 prompt, so a patient whose
+    # record states distant metastasis on LOINC 21907-1 was staged from their
+    # diagnosis text or not at all — and "not at all" means the stage filter
+    # kept every trial for them, including trials written for early disease.
     patient_stage = extract_patient_stage(
         conditions,
-        cancer_stage_observations=patient_data.get('cancer_stage_observations') or []
+        cancer_stage_observations=patient_data.get('cancer_stage_observations') or [],
+        cancer_metastasis_observations=patient_data.get('cancer_metastasis_observations') or [],
     )
     
     stage_dropped = 0

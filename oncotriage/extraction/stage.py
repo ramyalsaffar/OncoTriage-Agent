@@ -9,14 +9,22 @@ enrich_structured_eligibility(trial) per trial. QUERY TIME: File 13 calls
 extract_patient_stage() then is_stage_mismatch(), which is an integer
 comparison. Unknown -> None -> the trial passes through unfiltered.
 
-This module reads NOTHING from the project except _is_negated. It touches no
-config constant, no path, and no file. Importing it compiles regexes and
-nothing else.
+This module reads TWO names from the project — _is_negated, and
+LOINC_AJCC_CLINICAL_M out of oncotriage.constants, which is the leaf of the
+import graph and imports nothing itself. It touches no config constant, no
+path, and no file. Importing it compiles regexes and nothing else.
+
+(That sentence read "NOTHING except _is_negated" until the M-category item. The
+LOINC has to be shared rather than inline because oncotriage/fhir/parser.py
+ROUTES the Observation by it and this module SELECTS it back; two spellings
+that drift make the rule silently never fire. Argued at the constant.)
 """
 
 import re
+from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
+from oncotriage.constants import LOINC_AJCC_CLINICAL_M
 from oncotriage.extraction.negation import _is_negated
 
 
@@ -483,9 +491,128 @@ _SNOMED_DISPLAY_STAGE_RE = re.compile(
 # exemption for a deleted name.
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# THE AJCC CLINICAL M CATEGORY (LOINC 21907-1)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# M1 means distant metastasis. In every AJCC solid-tumour staging system that is
+# stage IV by definition, whatever T and N say — so an M category is the one
+# TNM axis a stage GROUP can be derived from on its own.
+#
+# THIS AXIS IS READ IN ONE DIRECTION ONLY, and getting that wrong is the way to
+# do far more damage than the rule repairs:
+#
+#   cM1  ->  4        distant metastasis. Determinate.
+#   cM0  ->  NOTHING  a POSITIVE statement that there is no distant metastasis.
+#                     It is not evidence of an early stage: a patient can be
+#                     cM0 and stage IIIC, and reading it as stage 0 or I would
+#                     hand the Stage 4 filter a floor low enough to drop every
+#                     advanced-disease trial they actually qualify for.
+#   cMX  ->  NOTHING  "cannot be assessed" — the absence of a determination.
+#
+# Measured over all 1,000 corpus bundles on 2026-08-07 rather than taken from
+# the note in oncotriage/fhir/parser.py that claimed it: 295 observations on
+# 295 patients, one each, no patient carrying two — 290 cM0 (SNOMED 1229901006)
+# and 5 cM1 (SNOMED 1229903009). So the mapping above is not a symmetry
+# question. A rule that also read cM0 would reach 58 patients wrongly for every
+# one it reached rightly.
+#
+# WHY THE WHOLE LIST IS SCANNED RATHER THAN THE MOST RECENT OBSERVATION WINNING,
+# which is what the stage-GROUP tier above does. An AJCC stage group is
+# RESTATED on re-staging and the newest assignment supersedes the older one, so
+# "most recent wins" is right there. The M axis is not restated that way: a
+# later cM0 after treatment records a RESPONSE, and AJCC does not de-stage a
+# patient who has had distant metastasis — the stage group stays IV. So any cM1
+# anywhere in the record answers the question. It is also the conservative
+# direction for pre-screening, where a stage read too low drops trials
+# permanently and invisibly while one read too high is still read by Stage 5.
+# No corpus patient carries two of these observations, so this is a statement
+# about what the rule MEANS rather than a behaviour difference today.
+#
+# The value text is what is matched, because that is what survives parsing:
+# _parse_observation() keeps valueCodeableConcept's display and drops the code
+# beside it. Changing that dict is not available — it feeds compute_patient_hash
+# and the Stage 5 prompt, so widening it would invalidate all twelve
+# characterization fixtures to read a code the display already carries.
+#
+# The optional prefix covers the AJCC notation for how the category was
+# determined (c linical, p athological, y post-therapy, r recurrence) so a real
+# EHR writing "ypM1a" is read; the subcategory letter covers M1a/M1b/M1c/M1d,
+# every one of which is distant metastasis and therefore stage IV. The
+# surrounding guards are lookarounds rather than \b because \b would not admit
+# the "c" in "cM1" — the character before the M is a word character, so
+# r"\bM1\b" matches nothing in the string this corpus actually stores.
+_AJCC_M_CATEGORY_RE = re.compile(
+    r"(?<![A-Za-z0-9])"                 # start of a token, not mid-word
+    r"(?:yc|yp|rc|rp|[cpry])?"          # optional AJCC determination prefix
+    r"m(?P<category>[01x])"             # the axis value itself
+    r"(?P<subcategory>[a-d])?"          # M1a / M1b / M1c / M1d
+    r"(?![A-Za-z0-9])",                 # end of a token
+    re.IGNORECASE,
+)
+
+# 21907-1 values on which _AJCC_M_CATEGORY_RE found NO category at all, keyed by
+# the text that failed. Module-level, following AGE_PARSE_FAILURES in
+# oncotriage/agent/filtering.py, and NOT a new key in any returned dict for the
+# reason argued there: the twelve characterization fixtures diff Stage 4's
+# output field by field.
+#
+# ONLY the unreadable case is counted. cM0 and cMX are READ, and they mean "this
+# axis contributes no stage" — a determinate answer, not a degradation. Counting
+# them would put 290 entries per corpus pass into a counter whose whole purpose
+# is to make the rare failure visible. This is third-party data, so it counts
+# rather than raises, on exactly the footing AGE_PARSE_FAILURES argues.
+M_CATEGORY_UNREADABLE: Dict[str, int] = Counter()
+
+# Longest raw value kept in a counter key, matching _AGE_KEY_MAX_LEN's reasoning:
+# long enough to see the shape of a real value, short enough that a pathological
+# field cannot grow the key without bound.
+_M_KEY_MAX_LEN: int = 60
+
+
+def _stage_from_m_category(
+    cancer_metastasis_observations: Optional[List[Dict]],
+) -> Optional[int]:
+    """
+    Stage IV if any AJCC clinical M observation reports M1, else None.
+
+    Reads LOINC 21907-1 ONLY, selected by code. The other three codes in
+    parser.py's _METASTASIS_LOINCS travel in the same list and must not be read
+    here: 44667-4 shares the M axis but carries metastasis SITE names (all 290
+    corpus values are "None (qualifier value)"), and 85343-2 / 85344-0 are nodal
+    COUNTS on the N axis. Keying on the ``metastasis_category == "M"`` field
+    instead of the code would pull 44667-4 in.
+
+    Returns 4 or None. None means "this axis says nothing", never "stage 0".
+    """
+    for obs in cancer_metastasis_observations or []:
+        if (obs.get("code") or "").strip() != LOINC_AJCC_CLINICAL_M:
+            continue
+
+        raw = obs.get("value")
+        text = "" if raw is None else str(raw)
+
+        match = _AJCC_M_CATEGORY_RE.search(text)
+        if match is None:
+            M_CATEGORY_UNREADABLE[_m_key_text(text)] += 1
+            continue
+
+        if match.group("category") == "1":
+            return _STAGE_MAX_ORDINAL
+
+    return None
+
+
+def _m_key_text(raw) -> str:
+    """The raw value, capped, for use in a counter key. Never raises."""
+    text = str(raw)
+    return text if len(text) <= _M_KEY_MAX_LEN else text[:_M_KEY_MAX_LEN] + "..."
+
+
 def extract_patient_stage(
     conditions: List[Dict],
     cancer_stage_observations: Optional[List[Dict]] = None,
+    cancer_metastasis_observations: Optional[List[Dict]] = None,
 ) -> Optional[int]:
     """
     Extract patient's cancer stage ordinal (0–4) from FHIR data.
@@ -494,10 +621,30 @@ def extract_patient_stage(
       0. mCODE TNM stage group Observations (LOINC 21908-9/21902-2/21914-7)
          — structured, most reliable, used by mCODE-compliant EHRs (Epic etc.)
          — most recent observation wins when multiple exist.
-      1. Condition display text regex — catches "TNM stage 1", "Stage III",
+      1. AJCC clinical M category Observation (LOINC 21907-1): M1 → 4.
+         cM0 and cMX contribute nothing. See _stage_from_m_category().
+      2. Condition display text regex — catches "TNM stage 1", "Stage III",
          "Carcinoma of breast, Stage 3" etc. across ALL cancer types.
          Works with Synthea, real EHRs, and any SNOMED display text.
-      2. "metastatic" keyword in Condition display (→ 4)
+      3. "metastatic" keyword in Condition display (→ 4)
+
+    WHY THE M TIER SITS WHERE IT DOES. Below the stage group, because a stage
+    group is the stage the clinician ASSIGNED — it already accounts for T, N and
+    M together — and deriving one from a single axis is weaker evidence than
+    being handed the answer. Above both condition-display tiers, because those
+    read a diagnosis NAME: a coded Observation on a standard LOINC beats prose
+    that happens to contain the word "stage", and it beats the "metastatic"
+    keyword outright, since that keyword is the same clinical fact this tier
+    reads from a structured field instead of a free-text one.
+
+    CARRYING BOTH IS NOT ITSELF A CONTRADICTION, and the corpus is the reason
+    to say so precisely. All five cM1 patients in the 1,000-bundle corpus also
+    carry a stage GROUP, and all five groups read "Stage 4" — they AGREE, so
+    this tier never fires for them and the change measured zero. A record is
+    contradicting itself only when the group is BELOW IV beside a cM1, of which
+    there are ZERO. Should one appear, this function does not reconcile: it
+    takes the stage group, which is what the tier order means, and the
+    disagreement is a data finding for whoever owns the record.
 
     Returns ordinal 0–4 or None.  None → stage filter keeps all trials.
     """
@@ -521,7 +668,13 @@ def extract_patient_stage(
             if 'metastatic' in display.lower() and 'non-metastatic' not in display.lower():
                 return 4
 
-    # Tier 1: Condition display text regex (covers all cancer types, all SNOMED displays)
+    # Tier 1: AJCC clinical M category Observation — structured, and the one
+    # TNM axis that determines a stage group on its own.
+    m_category_stage = _stage_from_m_category(cancer_metastasis_observations)
+    if m_category_stage is not None:
+        return m_category_stage
+
+    # Tier 2: Condition display text regex (covers all cancer types, all SNOMED displays)
     for cond in conditions:
         display = cond.get("display") or ""
         m = _SNOMED_DISPLAY_STAGE_RE.search(display)
@@ -530,7 +683,7 @@ def extract_patient_stage(
             if ordinal is not None:
                 return ordinal
 
-    # Tier 2: Metastatic keyword in Condition display
+    # Tier 3: Metastatic keyword in Condition display
     for cond in conditions:
         display = (cond.get("display") or "").lower()
         if "metastatic" in display and "non-metastatic" not in display:

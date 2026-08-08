@@ -941,11 +941,25 @@ _STRING_PREFILTER = ("exec", "spec_from_file_location", "SourceFileLoader",
 # the committed control asserts the trap directly before relying on the wiring.
 # Neither file execs a file in the working tree; both hash the source before and
 # after and fail if it moved.
+#
+# tests/test_extraction_stage_m_category.py (the AJCC M-category item) is the
+# sixth member and the argument is the same one again: it execs a PATCHED COPY
+# of oncotriage/extraction/stage.py -- the tier deleted, cM0 read as a stage,
+# the tier hoisted above the stage group, the LOINC guard replaced by the
+# metastasis_category field, the counter removed, the regex re-anchored on \b --
+# and of oncotriage/agent/filtering.py with the new call-site argument reverted.
+# THAT LAST ONE IS WHY THE git show ROUTE WAS NOT AVAILABLE, for the reason
+# recorded for the fifth member: the control has to leave the EXTRACTOR entirely
+# correct and revert only the CALL SITE, which is a state no commit ever had.
+# Nothing execs a file in the working tree; both source files are hashed before
+# any plant runs and compared at the end, with a non-degeneracy probe so the
+# comparison cannot be a tautology.
 _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    "tests/test_observability_logging.py",
                    "tests/test_indexer_admission_filters.py",
                    "tests/test_extraction_histology.py",
-                   "tests/test_agent_age_units_and_sex_filter.py"}
+                   "tests/test_agent_age_units_and_sex_filter.py",
+                   "tests/test_extraction_stage_m_category.py"}
 
 
 def _repo_py_files():

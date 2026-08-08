@@ -91,7 +91,11 @@ from typing import Dict, FrozenSet, List, Optional, Tuple
 
 from dateutil.relativedelta import relativedelta
 
-from oncotriage.constants import SYSTEM_KEY_ABSENT, SYSTEM_KEY_UNRECOGNIZED
+from oncotriage.constants import (
+    LOINC_AJCC_CLINICAL_M,
+    SYSTEM_KEY_ABSENT,
+    SYSTEM_KEY_UNRECOGNIZED,
+)
 from oncotriage.utils import (
     deduplicate_by_display,
     get_age_reference_date,
@@ -1185,13 +1189,26 @@ _MCODE_GENOMIC_VARIANT_LOINC: str = "69548-6"
 # trial's exclusion criteria treat them differently. Callers that need one and
 # not the other can filter without re-deriving the mapping from the display.
 #
-# DELIBERATELY NOT ADDED to _MCODE_STAGE_LOINCS. That list feeds
-# extract_patient_stage (File 10), whose regex expects stage GROUP values --
-# "Stage IIB", "IIIA". It does not read "cM1" as Stage IV, and teaching it to
-# is a matching change with its own consequences for the Stage 4 stage filter.
-# That belongs in its own item, after the refactor.
+# STILL DELIBERATELY NOT IN _MCODE_STAGE_LOINCS, and the reason is unchanged by
+# the M-category item: that list feeds _parse_mcode_stage_observation(), which
+# reads a stage GROUP out of valueCodeableConcept -- "Stage IIB", "IIIA" -- and
+# extract_patient_stage()'s tier over it matches with _SNOMED_DISPLAY_STAGE_RE.
+# "American Joint Committee on Cancer cM1 (qualifier value)" matches neither
+# that regex nor the "metastatic" keyword beside it, so adding 21907-1 here
+# would route the observation into `cancer_stage_observations` and have it
+# SILENTLY IGNORED -- the same non-effect as today, reached by a longer path,
+# and with the M observation removed from the patient summary and the hash on
+# the way.
+#
+# WHAT DID CHANGE: extract_patient_stage() now has a rule of its own that reads
+# this list. It selects LOINC 21907-1 by the shared constant above and maps cM1
+# -- and only cM1 -- to stage IV. cM0 is a POSITIVE statement that there is no
+# distant metastasis and maps to nothing at all; a cM0 patient can be stage IIIC.
+# The corpus split measured 2026-08-07 over all 1,000 bundles is 290 cM0 to 5
+# cM1, so a rule that read cM0 as an early stage would mis-stage 58 patients for
+# every one it fixed. See oncotriage/extraction/stage.py.
 _METASTASIS_LOINCS: Dict[str, str] = {
-    "21907-1": "M",   # AJCC clinical M category
+    LOINC_AJCC_CLINICAL_M: "M",   # AJCC clinical M category (21907-1)
     "44667-4": "M",   # site of distant metastasis
     "85344-0": "N",   # nodal micrometastases, count
     "85343-2": "N",   # nodal macrometastases, count

@@ -2226,9 +2226,17 @@ def scan_cohort(bundle_paths: List[str]) -> List[Dict]:
 
         conditions = patient_data.get("conditions") or []
         mesh_result = expand_query_from_mesh(conditions, deps.get_cancer_registry(), deps.get_mesh_filter())
+        # Every argument Stage 4 passes, for the reason this function's
+        # docstring gives: a patient classified here as CASE_UNKNOWN_STAGE has
+        # to be one the pipeline will also find unstaged. Omitting the
+        # metastasis list would leave the scan blind to the AJCC M tier and it
+        # would label a cM1 patient "unknown stage" while Stage 4 resolved them
+        # to IV — a fixture that fails verify_recording_complete() for a reason
+        # that is in this file rather than in the run it recorded.
         stage = extract_patient_stage(
             conditions,
             cancer_stage_observations=patient_data.get("cancer_stage_observations") or [],
+            cancer_metastasis_observations=patient_data.get("cancer_metastasis_observations") or [],
         )
 
         primary = "cancer"
