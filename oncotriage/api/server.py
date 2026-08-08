@@ -110,7 +110,11 @@ from oncotriage.config import (
 from oncotriage.fhir.parser import parse_fhir_bundle
 from oncotriage.storage.database_logger import log_inference
 from oncotriage.utils import deduplicate_by_display
-from oncotriage.observability import console
+from oncotriage.observability import console, get_logger
+
+# The first structured logger in this module. Everything else here is still
+# console output; see the logging pass's per-module worklist.
+log = get_logger(__name__)
 
 
 #------------------------------------------------------------------------------
@@ -277,7 +281,35 @@ def _run_matching_pipeline(fhir_bundle_dict):
     # that serializes them now lives inside log_inference itself. It used to be
     # a monkeypatch in "25- Batch Runner.py", which meant this call site -- the
     # only OTHER concurrent writer in the project -- had none at all.
-    log_inference(result, patient_data)
+    # THE OUTCOME IS READ, THE RESPONSE SHAPE IS NOT CHANGED (the
+    # write-durability pass). log_inference returns an InferenceWriteResult --
+    # still the database path, still `== db_path`, now carrying `.ok`. Before
+    # this pass a lost row and a stored row were the same return value, so this
+    # endpoint answered 200 with a well-formed body either way and nothing
+    # anywhere recorded that the row was gone.
+    #
+    # WHAT IS DELIBERATELY NOT DONE HERE:
+    #
+    #   - the response body is NOT widened. MatchResponse is this server's
+    #     public contract and adding a field to it is a versioning decision, not
+    #     an observability one. The client asked for matches and the matches are
+    #     correct; what failed is this server's own record-keeping.
+    #   - the request is NOT failed. A 500 would discard a complete, paid-for
+    #     pipeline result over a logging fault, which is the exact trade
+    #     log_inference's broad handler exists to refuse.
+    #
+    # So it is recorded, at ERROR, with the patient id that is the join key back
+    # into the table it is missing from. The operator-facing consequence is that
+    # a server losing rows is now greppable in `docker logs`, where before it
+    # printed one "non-critical" console line and no severity at all.
+    write_result = log_inference(result, patient_data)
+    if getattr(write_result, "ok", None) is False:
+        log.error("inference row was NOT stored for a served request",
+                  event="inference_write_lost",
+                  patient_id=str(patient_data.get("patient_id", "")),
+                  error_message=str(getattr(write_result, "error", "")),
+                  attempts=getattr(write_result, "attempts", None),
+                  db_path=str(write_result))
 
     elapsed = time.time() - start_time
 

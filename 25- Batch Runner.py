@@ -61,15 +61,31 @@ except ImportError:
         raise
     del _candidate, _how
 
-from oncotriage.batch.runner import main
+from oncotriage.batch.runner import main, reconciliation_exit_code
 
 
 # ===========================================================================
 # MAIN
 # ===========================================================================
+#
+# THE EXIT CODE IS A CONTRACT CHANGE (the write-durability pass), stated as one
+# on File 19's precedent. This file used to call main() and fall off the end,
+# so it exited 0 whatever happened -- including a run that lost inference rows
+# and printed "Run complete."
+#
+#   0  every inference this run produced is in the database
+#   1  rows were lost; the reconciliation block above names them
+#   2  main() never reached the reconciliation at all
+#
+# There is no caller reading this file's exit code today -- the filename appears
+# only in prose -- which is what makes the change cheap now and expensive later.
+#
+# main() STILL RETURNS results_list and its return type is untouched; the
+# verdict is read off the module. See last_reconciliation() for why.
 
 if __name__ == "__main__":
     main()
+    sys.exit(reconciliation_exit_code())
 
 
 #------------------------------------------------------------------------------

@@ -1320,6 +1320,76 @@ MAX_WORKERS = 12
 
 
 # ===========================================================================
+# SQLITE WRITE DURABILITY (the write-durability pass)
+# ===========================================================================
+#
+# WHAT THESE ARE FOR. oncotriage/storage/database_logger.py catches
+# sqlite3.Error, prints "Database logging failed (non-critical)" and continues,
+# because a logging fault must not destroy a ~70-second pipeline result. The
+# consequence is that a lost row is invisible: the patient is recorded as
+# successful and the run reports complete. _WRITE_LOCK closes the IN-PROCESS
+# race; these four constants are about everything the lock cannot reach, which
+# is every OTHER process writing the same file.
+#
+# WHO ELSE WRITES IT, established by reading rather than assumed:
+#   - oncotriage/batch/runner.py, MAX_WORKERS threads, one process;
+#   - oncotriage/api/server.py, from loop.run_in_executor(...), one process;
+#   - NOT the Airflow DAG. Its three tasks are scrape_and_save, rebuild_index
+#     and verify_index (oncotriage/orchestration/dag_generator.py); all three
+#     delegate to oncotriage.retrieval.indexer, which touches Qdrant and never
+#     opens inferences.db.
+# So the multi-process case is one batch run and one live API server on one
+# machine, which is exactly the configuration the paper's final run uses.
+
+# The journal mode applied to the inference database, verified after it is set.
+#
+# WAL, because a threading.Lock serializes one process and this file has two
+# writers. Under the default rollback journal a reader blocks a writer and a
+# writer blocks a reader, so a dashboard refresh or a File 16 query landing on
+# the same file as a batch write is a "database is locked" away from a lost row.
+# WAL lets one writer and any number of readers proceed at once.
+#
+# IT IS A PROPERTY OF THE FILE, NOT OF THE CONNECTION, so setting it once
+# converts the database permanently -- and it can silently fail to take, which
+# is why database_logger reads the pragma back and records a degradation naming
+# the mode it actually got. The two cases that fail are a network filesystem
+# (WAL needs shared memory the mount cannot provide) and a read-only directory.
+#
+# SET IT TO "DELETE" TO OPT OUT. That is the escape hatch for a network share,
+# and it is why this is a tunable rather than a literal in the writer.
+SQLITE_JOURNAL_MODE = "WAL"
+
+# Seconds a connection waits for a lock held by another connection before
+# raising "database is locked".
+#
+# Python's sqlite3 defaults to 5.0, which tests/test_package_invariants.py
+# section 5e records measuring -- but a default nobody chose is not a decision,
+# and it is the wrong size here. The competing writer is the API server, whose
+# critical section is a multi-row INSERT + commit, and the waiting writer is a
+# batch worker that has already spent ~70 seconds and one paid Stage 5 call on
+# the row it is trying to store. Waiting 30 seconds to save that is cheap; the
+# only thing this bounds is how long a genuinely stuck database is tolerated
+# before it is reported.
+SQLITE_BUSY_TIMEOUT_SECONDS = 30.0
+
+# Total attempts at the inference write, including the first.
+#
+# Small on purpose: the retry is for CONTENTION, which is transient by nature,
+# and database_logger only retries the transient class (see _is_retryable there
+# -- a schema or integrity error is retried zero times). Four attempts with the
+# backoff below spans about a second and a half of contention on top of the
+# 30-second busy timeout each attempt already carries.
+SQLITE_WRITE_MAX_ATTEMPTS = 4
+
+# Base seconds for the exponential backoff between those attempts: the Nth
+# retry sleeps BASE * 2**(N-1), so 0.05 gives 0.05, 0.1, 0.2.
+SQLITE_WRITE_RETRY_BASE_DELAY = 0.05
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
 # COHORT FILTER CONFIGURATION (File 05)
 # ===========================================================================
 

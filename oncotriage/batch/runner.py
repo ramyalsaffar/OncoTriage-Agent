@@ -91,6 +91,7 @@ import glob
 import json
 import os
 import random
+import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -145,6 +146,86 @@ from oncotriage.observability import console
 _results_lock = threading.Lock()
 
 _checkpoint_lock = threading.Lock()
+
+
+# ===========================================================================
+# THE WRITE LEDGER (the write-durability pass)
+# ===========================================================================
+#
+# WHAT IT IS FOR. log_inference does not raise when a row is lost -- it must
+# not, because a logging fault cannot be allowed to destroy a ~70-second
+# pipeline result that cost a live Stage 5 call. So the loss has to be carried
+# out of the worker some other way, and this is it: one entry per attempted
+# write, appended by the worker thread that made it.
+#
+# WHY NOT COUNT ROWS AND COMPARE WITH PATIENTS, which is the obvious thing. Two
+# facts about this runner make that number wrong, and they pull in opposite
+# directions:
+#
+#   1. THE RESAMPLE PASS deliberately re-runs a seeded subset of already-
+#      processed patients (RESAMPLE_COUNT = 100). Each re-run writes ANOTHER
+#      inference row, so rows are not one per patient and a run that lost
+#      nothing would look like a run with 100 extra rows.
+#   2. A CHECKPOINT RESUME skips every patient an earlier process completed.
+#      Those rows are in the table and this process did not write them, so a
+#      run that lost nothing would look like a run with hundreds of extra rows
+#      -- and, symmetrically, a resumed run that lost 50 rows could still show
+#      a total far above its own patient count and read as healthy.
+#
+# The ledger sidesteps both by construction rather than by correcting for them:
+# it records CALLS, so a resample re-run is a second entry and a skipped patient
+# is no entry at all. Neither case needs arithmetic.
+#
+# AND IT IS EXACT RATHER THAN STATISTICAL, which a before/after row count cannot
+# be. log_inference reports the `inferences.id` it was assigned, so
+# reconcile_writes asks the database whether THOSE ROWS are present, by id. A
+# count delta would be inflated by any other process writing the same file
+# during the run -- and there is one, "17- FastAPI Server.py", which resolves to
+# the same production database unless it was started with
+# ONCOTRIAGE_INFERENCES_DB set. The delta is still reported, because it is the
+# cheap cross-check File 19 uses and because a discrepancy between it and the
+# ledger is itself informative; it just does not decide the verdict.
+_write_ledger_lock = threading.Lock()
+
+_WRITE_LEDGER = []
+"""One dict per log_inference call this process made: patient_id, db_path, ok,
+error, inference_id, attempts, is_resample."""
+
+
+def clear_write_ledger() -> None:
+    """Empty the ledger. Called by main() before the run, and by tests."""
+    with _write_ledger_lock:
+        _WRITE_LEDGER.clear()
+
+
+def record_write(patient_id: str, write_result, is_resample: bool) -> None:
+    """Append one log_inference outcome to the ledger.
+
+    Args:
+        patient_id:   The patient the write was for.
+        write_result: What log_inference returned -- an InferenceWriteResult,
+                      which IS the database path string and also carries `.ok`,
+                      `.error`, `.attempts` and `.inference_id`.
+        is_resample:  Whether this was the resample pass's re-run.
+
+    TOLERATES A PLAIN STRING. A caller running against a pre-durability
+    log_inference, or a test that stubs it, gets a `str` with no `.ok`. That is
+    recorded as ok=None -- "this writer did not report" -- and reconcile_writes
+    counts those separately rather than assuming success. Defaulting an absent
+    report to True would reintroduce the exact defect this pass removes, one
+    layer up.
+    """
+    entry = {
+        "patient_id":   patient_id,
+        "db_path":      str(write_result) if write_result is not None else None,
+        "ok":           getattr(write_result, "ok", None),
+        "error":        getattr(write_result, "error", None),
+        "inference_id": getattr(write_result, "inference_id", None),
+        "attempts":     getattr(write_result, "attempts", None),
+        "is_resample":  is_resample,
+    }
+    with _write_ledger_lock:
+        _WRITE_LEDGER.append(entry)
 
 
 
@@ -367,7 +448,24 @@ def process_patient(
             graph=graph,
         )
 
-        log_inference(result, patient_data)
+        # THE RETURN VALUE IS READ NOW, and before the write-durability pass it
+        # was discarded. log_inference does not raise when the row is lost -- by
+        # design, so a logging fault cannot destroy a result that cost a live
+        # Stage 5 call -- so the outcome it reports is the only channel by which
+        # the loss leaves this worker thread. record_write puts it in the ledger
+        # that reconcile_writes reads at the end of the run.
+        write_result = log_inference(result, patient_data)
+        record_write(patient_id, write_result, is_resample)
+
+        # DELIBERATELY NOT FOLDED INTO `status`. A lost row means the DATABASE is
+        # incomplete; it does not mean the pipeline failed for this patient, and
+        # the two are separately actionable. Conflating them would also change
+        # what gets checkpointed -- a non-"success" status skips
+        # save_checkpoint(), so a database hiccup would silently re-queue a
+        # patient for a second paid Stage 5 call on the next resume. The
+        # reconciliation block reports it instead, and main() makes the RUN
+        # report incomplete.
+        db_row_written = getattr(write_result, "ok", None)
 
         elapsed = round(time.time() - start, 3)
 
@@ -385,6 +483,7 @@ def process_patient(
             f"eligible={eligible_count} near_miss={near_miss_count} "
             f"not_evaluable={not_evaluable_count} | "
             f"{elapsed:.1f}s | {status}"
+            + ("" if db_row_written is not False else " | DB WRITE LOST")
         )
 
         return {
@@ -397,6 +496,11 @@ def process_patient(
             "timestamp": timestamp,
             "error": error_msg,
             "is_resample": is_resample,
+            # None means the writer did not report -- see record_write. Written
+            # into the results JSON so a run's per-patient record says whether
+            # its row landed, which is otherwise only in the ledger and dies
+            # with the process.
+            "db_row_written": db_row_written,
         }
 
     except MatchingModelMismatchError:
@@ -839,7 +943,256 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
 # SUMMARY REPORT
 # ===========================================================================
 
-def print_summary(results_list: list, total_wall_time: float, db_path=None) -> None:
+# ===========================================================================
+# RECONCILIATION (the write-durability pass)
+# ===========================================================================
+
+def inference_row_count(db_path):
+    """Rows in db_path's inferences table, or None if it cannot be read.
+
+    READ-ONLY URI, on File 19's precedent and for its reason: a plain
+    ``sqlite3.connect`` on an absent path CREATES the file, so a guard run
+    against a mistyped path would bring an empty database into existence, count
+    0 twice and report success.
+
+    None is a real answer and callers must treat it as one -- ``reconcile_writes``
+    reports the baseline as unavailable rather than comparing None with None,
+    which passes whatever the run did.
+    """
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM inferences").fetchone()[0]
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
+def reconcile_writes(db_path=None, rows_before=None) -> dict:
+    """Check that every row this process was told it wrote is actually there.
+
+    THE SHAPE IS FILE 19's -- read the count before the run, read it after,
+    report a shortfall -- with one deliberate strengthening. File 19 asks
+    whether a count MOVED, which is the right question for a guard whose whole
+    subject is "did the server write anywhere near this file". This asks whether
+    SPECIFIC ROWS ARE PRESENT, by the ids log_inference reported, because the
+    question here is the opposite one and a count cannot answer it: another
+    process writing the same database during the run inflates the delta, and a
+    delta inflated by exactly as many rows as this run lost reconciles perfectly
+    while the data is gone.
+
+    So the delta is REPORTED and the id check DECIDES.
+
+    Args:
+        db_path:     The database to check. None means whatever the ledger's
+                     entries name, which is what log_inference actually
+                     resolved -- not a re-resolution here, which could differ if
+                     ONCOTRIAGE_INFERENCES_DB changed mid-run.
+        rows_before: The count read before the run started, for the delta line.
+                     None means it was not read, and the delta is reported as
+                     unavailable rather than as zero.
+
+    Returns a dict; ``complete`` is the verdict.
+
+    WHAT THIS COVERS AND WHAT IT DOES NOT, stated because a reconciliation that
+    overstates itself is worse than none:
+
+      COVERS  every log_inference call THIS PROCESS made, including the resample
+              pass's re-runs (each is its own ledger entry) and excluding
+              patients skipped by a checkpoint resume (which make no call).
+      COVERS  a row that was reported written and is not in the table.
+      DOES NOT cover rows written by an earlier process, or by another process
+              running concurrently. It is not a statement about the table's
+              total contents; it is a statement about this run's writes.
+      DOES NOT cover trial_matches children. The FK-less schema means an
+              inference row can be present with its children missing, and the
+              writer commits both in one transaction so that cannot happen from
+              a partial write -- but this function does not prove it.
+    """
+    with _write_ledger_lock:
+        entries = list(_WRITE_LEDGER)
+
+    attempted    = len(entries)
+    reported_ok  = [e for e in entries if e["ok"] is True]
+    reported_bad = [e for e in entries if e["ok"] is False]
+    unreported   = [e for e in entries if e["ok"] is None]
+
+    # The path the WRITER used, never a re-resolution -- see the docstring.
+    paths_seen = sorted({e["db_path"] for e in entries if e["db_path"]})
+    target = db_path or (paths_seen[0] if len(paths_seen) == 1 else None)
+
+    ids = [e["inference_id"] for e in reported_ok
+           if e["inference_id"] is not None]
+    ok_without_id = len(reported_ok) - len(ids)
+
+    verified = 0
+    verify_error = None
+    if ids and target:
+        try:
+            conn = sqlite3.connect(f"file:{target}?mode=ro", uri=True)
+            try:
+                # Chunked: SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999 on
+                # older builds and a 22,000-patient run has far more ids than
+                # that. Chunking is not an optimisation, it is what stops the
+                # query raising "too many SQL variables" on exactly the corpus
+                # size this runner exists for.
+                for start in range(0, len(ids), 500):
+                    chunk = ids[start:start + 500]
+                    placeholders = ",".join("?" * len(chunk))
+                    verified += conn.execute(
+                        f"SELECT COUNT(*) FROM inferences WHERE id IN ({placeholders})",
+                        chunk).fetchone()[0]
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            # Recorded, never swallowed: an unverifiable reconciliation is not a
+            # clean one, and `complete` below is False when this is set.
+            verify_error = f"{type(exc).__name__}: {exc}"
+            verified = None
+
+    rows_after = inference_row_count(target) if target else None
+    delta = (rows_after - rows_before
+             if rows_after is not None and rows_before is not None else None)
+
+    missing = (len(ids) - verified) if verified is not None else None
+
+    complete = (
+        attempted > 0
+        and not reported_bad
+        and not unreported
+        and ok_without_id == 0
+        and verify_error is None
+        and missing == 0
+    )
+
+    return {
+        "attempted":     attempted,
+        "reported_ok":   len(reported_ok),
+        "reported_lost": len(reported_bad),
+        "unreported":    len(unreported),
+        "ok_without_id": ok_without_id,
+        "verified":      verified,
+        "missing":       missing,
+        "verify_error":  verify_error,
+        "rows_before":   rows_before,
+        "rows_after":    rows_after,
+        "delta":         delta,
+        "db_paths":      paths_seen,
+        "target":        target,
+        "complete":      complete,
+        "failures":      [f"{e['patient_id']}: {e['error']}" for e in reported_bad],
+        "retried":       sum(1 for e in reported_ok if (e["attempts"] or 1) > 1),
+    }
+
+
+_LAST_RECONCILIATION = {"value": None}
+
+
+def _publish_reconciliation(rec: dict) -> None:
+    """Record the run's verdict where the entry point can read it."""
+    _LAST_RECONCILIATION["value"] = rec
+
+
+def last_reconciliation():
+    """What the most recent main() reconciled, or None if it has not run.
+
+    WHY THIS EXISTS RATHER THAN A CHANGED RETURN TYPE. main() returns
+    results_list and its docstring promises that to embedders; widening it to a
+    pair would break every one of them to serve one caller. The one caller is
+    "25- Batch Runner.py", which needs a process exit code.
+
+    None is a REAL answer and reconciliation_exit_code() treats it as one: it
+    means main() never got as far as reconciling, which is a failure, not a
+    clean run.
+    """
+    return _LAST_RECONCILIATION["value"]
+
+
+def reconciliation_exit_code() -> int:
+    """0 only if the last run stored everything it processed.
+
+    2 -- not 1 -- when there is no reconciliation at all, so "the run lost rows"
+    and "the run never reached the reconciliation" are distinguishable from a
+    shell. A caller that saw neither would otherwise read an exception during
+    setup as a data-loss finding.
+    """
+    rec = last_reconciliation()
+    if rec is None:
+        return 2
+    return 0 if rec["complete"] else 1
+
+
+def print_reconciliation(rec: dict) -> None:
+    """Print the reconciliation block, and say plainly whether the run is whole.
+
+    Nothing here decides an exit code; main() reads ``rec["complete"]``. Kept
+    separate from print_summary so a caller embedding the runner can reconcile
+    without printing, and so this block can be printed on its own.
+    """
+    console.out("--- DATABASE WRITE RECONCILIATION ---")
+    console.out(f"  {'writes attempted (this process)':<34} {rec['attempted']}")
+    console.out(f"  {'reported written':<34} {rec['reported_ok']}")
+    console.out(f"  {'rows verified present by id':<34} "
+                f"{'UNKNOWN' if rec['verified'] is None else rec['verified']}")
+    console.out(f"  {'reported LOST by the writer':<34} {rec['reported_lost']}")
+    if rec["unreported"]:
+        console.out(f"  {'writer did not report outcome':<34} {rec['unreported']}")
+    if rec["ok_without_id"]:
+        console.out(f"  {'reported ok with no row id':<34} {rec['ok_without_id']}")
+    if rec["retried"]:
+        console.out(f"  {'succeeded only after a retry':<34} {rec['retried']}")
+
+    console.out(f"  {'database':<34} {rec['target']}")
+    if len(rec["db_paths"]) > 1:
+        console.out(f"  {'!! writes went to SEVERAL files':<34} {rec['db_paths']}")
+
+    # The count delta is a CROSS-CHECK, not the verdict -- see reconcile_writes.
+    if rec["delta"] is None:
+        console.out(f"  {'row count before -> after':<34} unavailable "
+                    f"(could not read the table both times)")
+    else:
+        console.out(f"  {'row count before -> after':<34} "
+                    f"{rec['rows_before']} -> {rec['rows_after']} "
+                    f"(delta {rec['delta']:+d}, attempted {rec['attempted']})")
+        if rec["delta"] != rec["attempted"]:
+            console.out("      NOTE: a delta unequal to the attempts is not "
+                        "itself a fault. Another process writing this file "
+                        "during the run inflates it, and the id check above is "
+                        "what decides.")
+
+    if rec["verify_error"]:
+        console.out(f"  !! the verification query failed: {rec['verify_error']}")
+
+    console.out()
+    if rec["complete"]:
+        console.out("  ✓ COMPLETE: every inference this run wrote is in the "
+                    "database.")
+    else:
+        console.out("  ✗ INCOMPLETE: this run did NOT store everything it "
+                    "processed.")
+        if rec["attempted"] == 0:
+            console.out("      No writes were attempted at all. If patients "
+                        "were processed, log_inference was never reached; if "
+                        "none were, the run tested nothing.")
+        for line in rec["failures"][:20]:
+            console.out(f"      lost: {line}")
+        if len(rec["failures"]) > 20:
+            console.out(f"      ... and {len(rec['failures']) - 20} more")
+        if rec["missing"]:
+            console.out(f"      {rec['missing']} row(s) the writer reported as "
+                        f"written are NOT in the table.")
+        console.out("      Any analysis over this database is computed over "
+                    "fewer patients than were processed. Re-run the missing "
+                    "patients before using these numbers.")
+    console.out()
+
+
+#------------------------------------------------------------------------------
+
+
+def print_summary(results_list: list, total_wall_time: float, db_path=None,
+                  reconciliation: dict = None) -> None:
     """
     Print a concise final summary report for the entire batch run.
 
@@ -853,6 +1206,12 @@ def print_summary(results_list: list, total_wall_time: float, db_path=None) -> N
                           to rather than a global that happened to be nearby.
                           File 25 read a bare `inferences_path` here, which was
                           correct only as long as nothing had rebound it.
+        reconciliation:   What reconcile_writes returned, or None to skip the
+                          block. None is NOT "nothing to report" -- it is "not
+                          asked" -- and the closing line says which, because a
+                          summary that reads "Run complete." with no
+                          reconciliation is exactly the report this pass exists
+                          to stop being trusted.
     """
     main_results = [r for r in results_list if not r.get("is_resample")]
     resample_results = [r for r in results_list if r.get("is_resample")]
@@ -928,8 +1287,25 @@ def print_summary(results_list: list, total_wall_time: float, db_path=None) -> N
             console.out(f"  [{count}x] {msg}")
         console.out()
 
+    # THE RECONCILIATION IS THE LAST BLOCK BEFORE THE VERDICT, on File 19's
+    # ordering argument: the thing a reader looks for is the bottom of the
+    # output, so the statement about whether the data is whole belongs there
+    # rather than above the per-pass statistics it qualifies.
+    if reconciliation is not None:
+        print_reconciliation(reconciliation)
+
     console.out("=" * 80)
-    console.out("Run complete.")
+    if reconciliation is None:
+        # "Run complete." with nothing behind it is what this pass removes. If
+        # nobody reconciled, the summary says only that the run ENDED.
+        console.out("Run ended. (No write reconciliation was performed, so this "
+                    "says nothing about whether every row was stored.)")
+    elif reconciliation["complete"]:
+        console.out("Run complete: every inference this run produced is in the "
+                    "database.")
+    else:
+        console.out("RUN INCOMPLETE: rows were lost. See the reconciliation "
+                    "block above.")
     console.out("=" * 80)
     console.out()
 
@@ -954,7 +1330,18 @@ def main():
     Returns:
         The results list, so a caller embedding this has the run's outcome
         rather than only its printed summary.
+
+        THE RETURN TYPE IS UNCHANGED, deliberately. The write-durability pass
+        needed the run's completeness to reach the process exit code, and the
+        obvious move -- returning a (results, reconciliation) pair -- is a
+        contract change for every embedder to buy one caller a value. The
+        verdict is published on the module instead, through
+        ``last_reconciliation()``, which "25- Batch Runner.py" reads. See the
+        note there: that file's exit code IS a contract change and is stated as
+        one.
     """
+    clear_write_ledger()
+
     with CaffeinateSession("Batch Runner"):
 
         run_start = time.time()
@@ -999,6 +1386,23 @@ def main():
 
         console.out(f"[Setup] Found {len(fhir_files)} FHIR patient files.\n")
 
+        # THE BASELINE ROW COUNT, read BEFORE the first write and never after
+        # it -- File 19's ordering, and for its reason: read after the first
+        # POST and it measures nothing. It resolves through the same function
+        # log_inference uses, so it names the file that will actually be
+        # written rather than a global that happened to be nearby.
+        #
+        # It is a CROSS-CHECK and not the verdict. See reconcile_writes.
+        _reconcile_db = resolve_inference_db_path(None)
+        rows_before = inference_row_count(_reconcile_db)
+        console.out(f"[Guard] Inference rows before this run: "
+                    f"{'UNREADABLE' if rows_before is None else rows_before} "
+                    f"({_reconcile_db})")
+        if rows_before is None:
+            console.out("[Guard] The table could not be read. That is normal on "
+                        "a database that does not exist yet; the id-based "
+                        "reconciliation below does not depend on it.\n")
+
         # ------------------------------------------------------------------
         # 3. Load checkpoint and results (resume support)
         # ------------------------------------------------------------------
@@ -1036,10 +1440,13 @@ def main():
             console.out("[Resample] Skipped: no successfully completed patients.")
 
         # ------------------------------------------------------------------
-        # 6. Final summary
+        # 6. Reconcile the writes, then the final summary
         # ------------------------------------------------------------------
         total_wall_time = time.time() - run_start
-        print_summary(results_list, total_wall_time)
+        reconciliation = reconcile_writes(rows_before=rows_before)
+        _publish_reconciliation(reconciliation)
+        print_summary(results_list, total_wall_time,
+                      reconciliation=reconciliation)
 
         # ------------------------------------------------------------------
         # 7. Clean up checkpoint only if all main-pass patients succeeded

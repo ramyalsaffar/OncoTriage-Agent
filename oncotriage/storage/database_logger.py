@@ -84,14 +84,26 @@ import json
 import os
 import sqlite3
 import threading
+import time
+from collections import Counter
 from typing import Dict
 
 from oncotriage import paths
 from oncotriage import settings
-from oncotriage.config import CROSS_ENCODER_MODEL, MATCHING_MODEL, PRICING_CONFIG
+from oncotriage.config import (
+    CROSS_ENCODER_MODEL,
+    MATCHING_MODEL,
+    PRICING_CONFIG,
+    SQLITE_BUSY_TIMEOUT_SECONDS,
+    SQLITE_JOURNAL_MODE,
+    SQLITE_WRITE_MAX_ATTEMPTS,
+    SQLITE_WRITE_RETRY_BASE_DELAY,
+)
 from oncotriage.registries.primary_cancer import _resolve_primary_cancer
 from oncotriage.utils import deduplicate_by_display, get_model_cost
-from oncotriage.observability import console
+from oncotriage.observability import console, get_logger
+
+log = get_logger(__name__)
 
 
 #------------------------------------------------------------------------------
@@ -415,6 +427,235 @@ _INITIALIZED_DATABASES = set()
 #------------------------------------------------------------------------------
 
 
+# ===========================================================================
+# WRITE DURABILITY (the write-durability pass)
+# ===========================================================================
+#
+# THE DEFECT. ``_write_inference_row`` catches ``sqlite3.Error``, rolls back,
+# prints "Database logging failed (non-critical)" and continues -- and
+# ``log_inference`` then returns ``db_path`` exactly as it does on success. The
+# caller cannot tell the row was lost, so the patient is recorded as successful
+# and the run reports complete. Every number in the paper comes from one final
+# run; if that run loses rows and reports complete, the result looks whole and
+# is not.
+#
+# NOT RE-RAISING IS STILL RIGHT. The existing comment is correct that a logging
+# fault must not destroy a ~70-second pipeline result that cost a live Stage 5
+# call. What was wrong was that it also did not TELL anyone. Three things close
+# that, in the order they take effect:
+#
+#   1. WAL and an explicit busy timeout, so contention mostly does not happen;
+#   2. a bounded retry, so transient contention that does happen is survived;
+#   3. an outcome the caller can read, and a counter, so a write that is lost
+#      anyway is visible from the return value, from the log, and from the
+#      batch summary's reconciliation.
+#
+# WHAT THIS DELIBERATELY DOES NOT TOUCH: ``_WRITE_LOCK``, the schema, and the
+# broad ``except Exception`` below ``except sqlite3.Error``. The lock closes the
+# IN-PROCESS race and is measured doing so by
+# ``tests/test_package_invariants.py`` section 5e; everything here is about the
+# processes it cannot reach.
+
+
+INFERENCE_WRITE_FAILURES = Counter()
+"""Inference writes that were given up on, keyed ``{ExceptionType}:{retryable}``.
+
+Module-level, following ``AGE_PARSE_FAILURES`` and ``CHECKPOINT_WRITE_FAILURES``
+rather than becoming a new column: this is a property of the RUN, and a new
+column would mean a schema migration to record that a row could not be written,
+which is circular.
+
+The ``retryable`` half is the diagnosis. ``sqlite3.OperationalError:retryable``
+means contention outlived ``SQLITE_WRITE_MAX_ATTEMPTS`` and the fix is more
+attempts, a longer timeout or fewer writers. ``sqlite3.IntegrityError:terminal``
+means the write was never going to succeed and retrying it would only have made
+the run slower.
+"""
+
+INFERENCE_WRITE_RETRIES = Counter()
+"""Retries actually made, keyed by exception type. Attempts, not calls.
+
+Separate from the failure counter because the two answer different questions: a
+run with 400 retries and 0 failures is one where this pass did its job, and a run
+with 0 of each is one where there was no contention to survive. Folding them
+together would make those two indistinguishable.
+"""
+
+JOURNAL_MODE_DEGRADATIONS = Counter()
+"""Databases whose journal mode is not what ``SQLITE_JOURNAL_MODE`` asked for.
+
+Keyed ``requested->actual``. WAL is a property of the FILE, not of the
+connection, and it can fail to take -- a network filesystem cannot provide the
+shared memory the wal-index needs, and a read-only directory cannot hold the
+``-wal`` file. Both leave the pragma returning the OLD mode with nothing raised,
+which is the silent-degradation shape this project exists to remove.
+"""
+
+
+class InferenceWriteResult(str):
+    """The database path this call wrote to, plus whether the row landed.
+
+    A ``str`` SUBCLASS, and the choice is forced rather than clever. Before this
+    pass ``log_inference`` returned ``db_path``, and that return value is a
+    pinned contract in five places:
+
+        tests/test_storage_ecog_logging.py:328
+        tests/test_storage_inference_logging_contract.py:811, :910
+        tests/test_agent_retrieval_observability.py:994, :1027, :1061
+        tests/test_fhir_birth_date_and_demographics.py:896
+
+    each of which compares it with ``==`` against its own scratch path. That
+    comparison is what makes those five isolation tests checkable at all, so it
+    may not break. A subclass of ``str`` compares, hashes, formats,
+    ``os.path``-joins and JSON-serialises exactly as the path string did, while
+    carrying the four facts a caller now needs.
+
+    WHAT CONSTRAINS THE SHAPE, read rather than assumed. The two production
+    callers -- ``oncotriage/batch/runner.py`` line 370 and
+    ``oncotriage/api/server.py`` line 280 -- both DISCARD the return value
+    today. So a return value alone reaches neither, which is why the counters
+    above and ``runner``'s ledger exist as well; the batch runner is changed to
+    read ``.ok``, and the API server deliberately is not (see the note there).
+
+    Attributes:
+        ok:           True only if the row and its children are committed.
+        error:        ``"{Type}: {message}"`` when not, else None.
+        attempts:     Attempts made, 1 when it worked first time.
+        inference_id: The ``inferences.id`` assigned, or None if nothing landed.
+                      This is what makes reconciliation exact rather than
+                      statistical -- see ``runner.reconcile_writes``.
+    """
+
+    # __slots__ so an instance cannot silently grow an attribute that a reader
+    # then trusts; str subclasses get no __dict__ from this alone, which is the
+    # point.
+    __slots__ = ("ok", "error", "attempts", "inference_id")
+
+    def __new__(cls, db_path, ok=True, error=None, attempts=1,
+                inference_id=None):
+        obj = super().__new__(cls, db_path)
+        obj.ok = bool(ok)
+        obj.error = error
+        obj.attempts = int(attempts)
+        obj.inference_id = inference_id
+        return obj
+
+    def __repr__(self):
+        # NOT str.__repr__. A caller who prints this in a diagnosis must see the
+        # outcome, not just a path that looks like a success. Equality, which is
+        # what the five pinned tests use, is untouched: it comes from str.
+        return (f"InferenceWriteResult({str.__repr__(self)}, ok={self.ok}, "
+                f"attempts={self.attempts}, inference_id={self.inference_id!r})")
+
+
+# THE RETRYABLE CLASS IS NARROW, AND THAT IS A DECISION WITH A CONTROL BEHIND IT.
+#
+# "Retry the write" is only correct for failures that are transient. SQLite
+# reports contention as an OperationalError whose message names a lock or a busy
+# database; those clear on their own and a retry is exactly right.
+#
+# WHAT IS DELIBERATELY NOT RETRIED, and this is the important half:
+#
+#   "duplicate column name: X" is ALSO a sqlite3.OperationalError, and retrying
+#   it would in fact succeed -- the second thread's ALTER already added the
+#   column, so a second attempt finds the schema complete and the INSERT lands.
+#   It is excluded anyway. That error is the signature of the migration race
+#   ``_WRITE_LOCK`` exists to close, and
+#   tests/test_package_invariants.py section 5e proves the lock necessary by
+#   STRIPPING it and requiring rows to be lost. A retry broad enough to repair
+#   that race would repair the negative control too, and the check whose whole
+#   job is to show the lock is load-bearing would start passing for free.
+#   Silently deleting the evidence for a lock is worse than not retrying an
+#   error that the lock already prevents.
+#
+#   IntegrityError, ProgrammingError, DatabaseError-on-corruption and a full
+#   disk are not transient at all. Retrying them spends SQLITE_WRITE_MAX_ATTEMPTS
+#   x SQLITE_BUSY_TIMEOUT_SECONDS of a batch run to arrive at the same failure.
+#
+# Matched on the MESSAGE because sqlite3 does not expose a distinct exception
+# type for contention; `sqlite3.OperationalError` covers both cases above. The
+# strings are SQLite's own and stable ("database is locked", "database table is
+# locked", "database is busy"), and the match is substring-and-lowercase so a
+# wrapped or prefixed message still resolves.
+_RETRYABLE_MESSAGE_MARKERS = ("database is locked", "database table is locked",
+                              "database is busy", "database schema is locked")
+
+
+def _is_retryable(exc):
+    """True if exc is transient contention worth another attempt.
+
+    Returns False for every other sqlite3.Error, including the migration race --
+    see the block above for why that exclusion is deliberate.
+    """
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    message = str(exc).lower()
+    return any(marker in message for marker in _RETRYABLE_MESSAGE_MARKERS)
+
+
+def _open_connection(db_path):
+    """``sqlite3.connect`` with this project's busy timeout applied.
+
+    THE TIMEOUT IS PER CONNECTION, so it has to be set on every one of them --
+    it is not a property of the file the way the journal mode is. Passed to
+    ``connect()`` rather than issued as a PRAGMA afterwards because the
+    connection attempt itself can meet a locked database, and a PRAGMA on the
+    next line would be too late to help it.
+
+    ``sqlite3.connect`` takes SECONDS as a float; ``PRAGMA busy_timeout`` takes
+    MILLISECONDS as an integer. Mixing those up gives a 30-millisecond timeout
+    that looks like a 30-second one, so the config constant is in seconds and
+    the conversion happens in exactly one place, below.
+    """
+    return sqlite3.connect(db_path, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)
+
+
+def _apply_journal_mode(conn, db_path):
+    """Set ``SQLITE_JOURNAL_MODE`` on db_path and VERIFY it took.
+
+    Returns the mode the database is actually in, lowercased.
+
+    WHY VERIFY. ``PRAGMA journal_mode=WAL`` does not raise when it cannot be
+    honoured; it returns the mode still in force. On a network filesystem (no
+    shared memory for the wal-index) or in a read-only directory, that is the
+    old mode, and a caller that assumed it took would go on believing readers
+    and the writer no longer block each other. The pragma statement RETURNS the
+    resulting mode, so the check costs nothing extra -- but it has to be read,
+    and reading it is the entire mechanism.
+
+    LOUD, ONCE PER DATABASE PER PROCESS. This runs inside initialize_database,
+    which runs once per resolved path per process, so a mismatch is one WARNING
+    and one counter increment rather than one per row.
+    """
+    requested = str(SQLITE_JOURNAL_MODE).strip().lower()
+
+    row = conn.execute(f"PRAGMA journal_mode = {requested}").fetchone()
+    actual = str(row[0]).lower() if row else "unknown"
+
+    if actual != requested:
+        JOURNAL_MODE_DEGRADATIONS[f"{requested}->{actual}"] += 1
+        console.out(
+            f"⚠ SQLite journal mode: asked for {requested.upper()}, the "
+            f"database is in {actual.upper()}. Concurrent readers and the "
+            f"writer will block each other, so a second writing process can "
+            f"still lose rows under contention.\n"
+            f"    Database: {db_path}\n"
+            f"    Usual causes: the file is on a network filesystem (WAL needs "
+            f"shared memory the mount cannot provide), or its directory is not "
+            f"writable.\n"
+            f"    Set SQLITE_JOURNAL_MODE in oncotriage/config.py to "
+            f"'{actual}' to accept this deliberately and stop this warning.")
+        log.warning("sqlite journal mode not applied",
+                    event="journal_mode_degraded",
+                    journal_mode_requested=requested, journal_mode=actual,
+                    db_path=str(db_path))
+    else:
+        log.info("sqlite journal mode applied", event="journal_mode",
+                 journal_mode=actual, db_path=str(db_path))
+
+    return actual
+
+
 # ---------------------------------------------------------------------------
 # THE WRITE LOCK (pass 20c-3b)
 # ---------------------------------------------------------------------------
@@ -504,7 +745,19 @@ def _initialize_database_locked(db_path):
     """initialize_database's body. Callers hold _WRITE_LOCK."""
     # Connect
     # It will create it if deos not exist, and it won't override if it does.
-    conn = sqlite3.connect(db_path)
+    #
+    # Through _open_connection so this connection carries the same busy timeout
+    # every other one does. It matters MORE here than on the insert path: this
+    # is where the ALTER TABLE migrations run, and DDL takes an exclusive lock.
+    conn = _open_connection(db_path)
+
+    # THE JOURNAL MODE IS SET HERE AND NOWHERE ELSE, because it is a property of
+    # the FILE: one successful application converts the database permanently and
+    # every later connection inherits it. Doing it on the insert path instead
+    # would issue a pragma per row to change nothing. It is applied BEFORE the
+    # CREATE statements so the schema work itself runs under the mode the
+    # database will keep.
+    _apply_journal_mode(conn, db_path)
 
     # Create cursor
     cursor = conn.cursor()
@@ -779,9 +1032,17 @@ def log_inference(result: Dict, patient_data: Dict, db_path=None):
     # whose indentation is part of nothing, but re-indenting 250 lines to add a
     # `with` would bury the actual change of this pass in a whitespace diff
     # nobody can review. The guarantee is identical.
+    #
+    # STILL EXACTLY THREE `with _WRITE_LOCK:` SITES IN THIS MODULE, and the
+    # retry loop is INSIDE this one rather than around it. Two reasons, both
+    # load-bearing: a retry that released and re-took the lock would let a
+    # second thread interleave between attempts, which is the interleaving the
+    # lock exists to forbid; and section 5e of tests/test_package_invariants.py
+    # asserts `locks_stripped == 3`, so a fourth site would fail a check that is
+    # measuring the lock rather than this pass.
     with _WRITE_LOCK:
-        _write_inference_row(result, patient_data, db_path,
-                             matching_model_used, total_cost)
+        outcome = _write_inference_row_with_retry(
+            result, patient_data, db_path, matching_model_used, total_cost)
 
     # AFTER the finally inside _write_inference_row, not inside it. A return
     # inside a finally block SWALLOWS any exception propagating out of the try
@@ -791,7 +1052,93 @@ def log_inference(result: Dict, patient_data: Dict, db_path=None):
     # discarded by a `return` in the finally and the caller would be told the
     # write succeeded. It escapes the `with` above instead, releasing the lock
     # on the way, and this line is never reached.
-    return db_path
+    #
+    # THE RETURN IS AN InferenceWriteResult, which IS db_path -- see that class
+    # for why a str subclass rather than a tuple. `== db_path` and every other
+    # string operation are unchanged; `.ok` is the new fact.
+    return InferenceWriteResult(
+        db_path,
+        ok=outcome["ok"],
+        error=outcome["error"],
+        attempts=outcome["attempts"],
+        inference_id=outcome["inference_id"],
+    )
+
+
+def _write_inference_row_with_retry(result: Dict, patient_data: Dict, db_path,
+                                    matching_model_used, total_cost):
+    """Attempt the write up to ``SQLITE_WRITE_MAX_ATTEMPTS`` times.
+
+    CALLERS HOLD ``_WRITE_LOCK``; see log_inference for why the loop is inside
+    it rather than around it.
+
+    Returns a dict: ok, error, attempts, inference_id. RAISES NOTHING that
+    ``_write_inference_row`` did not already raise, which is nothing except the
+    two that must escape (KeyboardInterrupt, MemoryError) -- so the contract
+    "a database fault does not kill the pipeline" is unchanged.
+
+    Only the transient class is retried. ``_is_retryable`` is where that is
+    decided and the block above it is why the migration race is excluded.
+    """
+    # max(1, ...) so a misconfigured 0 -- or a negative -- still makes ONE
+    # attempt rather than skipping the loop entirely, which would leave
+    # `outcome` None and turn a config typo into an AttributeError inside the
+    # writer. A logging config defect must not become a pipeline crash; that is
+    # the same reasoning as the broad handler below it.
+    max_attempts = max(1, int(SQLITE_WRITE_MAX_ATTEMPTS))
+
+    attempts = 0
+    outcome = None
+
+    while attempts < max_attempts:
+        attempts += 1
+        outcome = _write_inference_row(result, patient_data, db_path,
+                                       matching_model_used, total_cost)
+        outcome["attempts"] = attempts
+
+        if outcome["ok"]:
+            if attempts > 1:
+                # Recovered. Recorded at INFO rather than silently, because a
+                # run that needed 400 retries to lose nothing is a run whose
+                # next increment of load loses rows.
+                log.info("inference write succeeded after retrying",
+                         event="inference_write_retried",
+                         patient_id=str(result.get("patient_id", "")),
+                         attempts=attempts, db_path=str(db_path))
+            return outcome
+
+        exc = outcome["exception"]
+        if not _is_retryable(exc) or attempts >= max_attempts:
+            break
+
+        INFERENCE_WRITE_RETRIES[type(exc).__name__] += 1
+        delay = SQLITE_WRITE_RETRY_BASE_DELAY * (2 ** (attempts - 1))
+        console.out(f"  ↻ Retrying inference write in {delay:.2f}s "
+                    f"(attempt {attempts + 1}/{max_attempts}): "
+                    f"{type(exc).__name__}: {exc}")
+        log.warning("inference write contended, retrying",
+                    event="inference_write_retry",
+                    patient_id=str(result.get("patient_id", "")),
+                    attempts=attempts, max_retries=max_attempts,
+                    delay_s=round(delay, 3),
+                    error_type=type(exc).__name__, error_message=str(exc),
+                    db_path=str(db_path))
+        time.sleep(delay)
+
+    # Given up. The pipeline result is NOT destroyed -- that is still the
+    # contract -- but the loss is now recorded in three places a reader can
+    # reach: this counter, this log record, and the returned object's `.ok`.
+    exc = outcome["exception"]
+    retryable = "retryable" if _is_retryable(exc) else "terminal"
+    INFERENCE_WRITE_FAILURES[f"{type(exc).__name__}:{retryable}"] += 1
+    log.error("inference write LOST after exhausting attempts",
+              event="inference_write_lost",
+              patient_id=str(result.get("patient_id", "")),
+              attempts=attempts, max_retries=max_attempts,
+              status=retryable,
+              error_type=type(exc).__name__, error_message=str(exc),
+              db_path=str(db_path))
+    return outcome
 
 
 def _write_inference_row(result: Dict, patient_data: Dict, db_path,
@@ -801,8 +1148,28 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
     Split out of log_inference in pass 20c-3b so the lock could be taken with a
     `with` statement without re-indenting the whole body. Everything here is
     byte-for-byte what log_inference did; nothing was reordered.
+
+    RETURNS AN OUTCOME DICT as of the write-durability pass -- ``ok``,
+    ``error``, ``exception``, ``attempts``, ``inference_id``. It used to return
+    nothing at all, which is precisely the defect: the two handlers below print
+    "non-critical" and the caller was told the same thing on both paths.
+
+    Raising is still confined to what raised before (nothing but
+    KeyboardInterrupt and MemoryError, which are not Exception subclasses and
+    are meant to escape), so the "a logging fault does not kill the pipeline"
+    contract is unchanged. The single caller,
+    ``_write_inference_row_with_retry``, decides what to do with a failure.
+
+    ONE CALL IS ONE TRANSACTION, which is what makes a retry safe. sqlite3's
+    default isolation opens an implicit transaction at the first INSERT and
+    ``conn.rollback()`` in both handlers below discards the inference row AND
+    its trial_matches children together, so a retried attempt cannot duplicate a
+    partially-written row. The only statement after ``conn.commit()`` is a
+    console line; if THAT raised, the generic handler records a terminal (not
+    retryable) failure, so a committed row is never written twice.
     """
     conn = None
+    inference_id = None
     try:
         # Item 20b: the schema is no longer created when this file is loaded,
         # so it is ensured here, once per resolved path, before the first
@@ -813,7 +1180,9 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
         # an unpriced model is a configuration defect, not a database one.
         _ensure_database(db_path)
 
-        conn = sqlite3.connect(db_path)
+        # Through _open_connection: the busy timeout is per connection and this
+        # is the one that meets the other process's writes.
+        conn = _open_connection(db_path)
         cursor = conn.cursor()
 
         demographics = patient_data.get("demographics", {})
@@ -1057,26 +1426,41 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
         
         conn.commit()
         console.out(f"✓ Logged inference for patient {result['patient_id']} (ID: {inference_id})")
-        
+        outcome = {"ok": True, "error": None, "exception": None,
+                   "attempts": 1, "inference_id": inference_id}
+
     except sqlite3.Error as e:
         if conn:
             conn.rollback()
         console.out(f"⚠ Database logging failed (non-critical): {e}")
         # DO NOT re-raise - logging failure should not break pipeline
-    
+        #
+        # BUT DO REPORT IT. Before the write-durability pass this handler ended
+        # here and log_inference returned db_path exactly as on success, so
+        # "the row is stored" and "the row is gone" were the same answer to the
+        # caller. The outcome below is what makes them different; the retry
+        # decision on top of it is _write_inference_row_with_retry's.
+        outcome = {"ok": False, "error": f"{type(e).__name__}: {e}",
+                   "exception": e, "attempts": 1, "inference_id": None}
+
     except Exception as e:
         if conn:
             conn.rollback()
         console.out(f"⚠ Logging error (non-critical): {e}")
         # DO NOT re-raise - logging failure should not break pipeline
-    
+        outcome = {"ok": False, "error": f"{type(e).__name__}: {e}",
+                   "exception": e, "attempts": 1, "inference_id": None}
+
     finally:
         if conn:
             conn.close()
 
-    # NOTHING IS RETURNED HERE, deliberately. log_inference returns db_path
-    # after this function comes back; see the comment at that return for why a
-    # return inside a finally block would swallow a propagating exception.
+    # RETURNED HERE, AFTER the finally and never inside it. A `return` inside a
+    # finally block swallows any exception propagating out of the try -- and two
+    # are meant to propagate (KeyboardInterrupt, MemoryError, neither an
+    # Exception subclass, so neither is caught above). Returning here leaves
+    # them escaping exactly as they did before this pass.
+    return outcome
 
 
 #------------------------------------------------------------------------------

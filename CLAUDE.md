@@ -457,6 +457,13 @@ python tests/test_extraction_stage_non_oncology_guard.py            #  80
 # collision matrix. ~25 s.
 python tests/test_agent_trial_verdict_normalization.py              # 161
 
+# The write-durability pass. Same shape, same directory. No network, no keys,
+# no spend, no git history, no corpus, NOT in the collision matrix, and it execs
+# nothing -- every control is driven through the real shipped module by creating
+# the failing condition for real (an exclusive lock from a second connection, an
+# unwritable path, a deleted row). ~4 s, most of it deliberate lock contention.
+python tests/test_storage_write_durability.py                       #  99
+
 pip install -e .                                         # makes `oncotriage` importable anywhere
 ```
 
@@ -3580,6 +3587,123 @@ traceback where it owed 161 results. Both are closed the way
 `tests/test_dashboard_reproducibility_tab.py` had to close them: the drivers
 return a result-shaped stand-in carrying `raised`, and `field(records, key)`
 returns a named absence instead of indexing.
+
+### A lost inference row is no longer invisible (the write-durability pass)
+
+**`log_inference` CAUGHT `sqlite3.Error`, PRINTED "non-critical", AND RETURNED
+`db_path` EXACTLY AS ON SUCCESS.** The caller could not tell the row was lost, so
+the patient was recorded as successful and the run reported complete. Every
+number in the paper comes from one final run; if that run loses rows and reports
+complete, the result looks whole and is not. **`_WRITE_LOCK` IS UNTOUCHED** — it
+closes the in-process race and section 5e measures it doing so. Everything here
+is about the processes it cannot reach.
+
+**WHO ACTUALLY WRITES `inferences.db`, established by reading rather than
+assumed.** `oncotriage/batch/runner.py` (MAX_WORKERS threads, one process) and
+`oncotriage/api/server.py` (`loop.run_in_executor`, once per in-flight request).
+**NOT the Airflow DAG**: its three tasks are `scrape_and_save`, `rebuild_index`
+and `verify_index`, all three delegate to `oncotriage.retrieval.indexer`, and
+that module touches Qdrant and never opens the inference database.
+
+**1. WAL, VERIFIED BY READING THE PRAGMA BACK.** Journal mode is a property of
+the FILE, not the connection, and `PRAGMA journal_mode=WAL` does not raise when
+it cannot be honoured — it returns the mode still in force. `_apply_journal_mode`
+reads it back, and a mismatch is a `JOURNAL_MODE_DEGRADATIONS` entry keyed
+`requested->actual` plus a WARNING naming both modes, the file, the two usual
+causes (network filesystem, unwritable directory) and how to accept it
+deliberately. `SQLITE_JOURNAL_MODE` is the opt-out for a network share, which is
+why it is a tunable rather than a literal. **The production database is in
+`delete` mode today (1,106 rows, 86 MB) and the next run converts it
+permanently.** `mode=ro` URI readers were checked against a WAL database with a
+live `-wal` file present and still read it, so Files 18/19's guards and every
+read-only consumer survive.
+
+**2. THE BUSY TIMEOUT IS A DECISION.** Python's sqlite3 defaults to 5.0 s, which
+section 5e records measuring; `SQLITE_BUSY_TIMEOUT_SECONDS = 30.0` is chosen, and
+it is applied through `_open_connection` — **every** `sqlite3.connect` in the
+module is inside that function, asserted by AST rather than by inspection,
+because the timeout is per connection and the migration connection is the one
+that takes an exclusive lock.
+
+**3. THE RETRY IS NARROW, AND THE EXCLUSION IS THE INTERESTING HALF.**
+`_is_retryable` retries only contention — a `sqlite3.OperationalError` whose
+message names a locked or busy database. **`duplicate column name` is
+deliberately NOT retried even though retrying it would work**: that error is the
+signature of the migration race `_WRITE_LOCK` exists to close, and section 5e
+proves the lock necessary by STRIPPING it and requiring rows to be lost. A retry
+broad enough to repair that race repairs the negative control too, and silently
+deleting the evidence for a lock is worse than not retrying an error the lock
+already prevents. **Confirmed by running: section 5e's control still fires, 6/8
+trials lost rows.**
+
+**4. THE OUTCOME REACHES THE CALLER, AND THE SHAPE WAS FORCED.**
+`log_inference` returns an `InferenceWriteResult`, a **`str` subclass** carrying
+`.ok`, `.error`, `.attempts` and `.inference_id`. Not a tuple: the return value
+is a pinned contract at **seven call sites across four test files** (counted, not
+recalled — `test_storage_ecog_logging.py:328`,
+`test_storage_inference_logging_contract.py:811,910`,
+`test_agent_retrieval_observability.py:994,1027,1061`,
+`test_fhir_birth_date_and_demographics.py:896`), each comparing it with `==`
+against its own scratch path, and that comparison is what makes those isolation
+tests checkable. A str subclass compares, hashes, formats, os.path-joins
+and JSON-serialises exactly as the path did. `__slots__` is non-empty and
+verified to reject an arbitrary attribute, so a reader cannot trust a field
+nothing set. Both production callers **discarded** the return value before this
+pass, which is why the counters exist as well.
+
+**5. RECONCILIATION IS EXACT, NOT STATISTICAL.** A rows-vs-patients count is
+wrong in two directions here — the resample pass writes a SECOND row per
+re-run patient, and a checkpoint resume leaves rows this process did not write —
+so `oncotriage/batch/runner.py` keeps a **ledger of CALLS**, which sidesteps both
+by construction rather than by correcting for them. The verdict then asks the
+database whether **those specific ids** are present. The before/after count delta
+is reported as a cross-check and deliberately does **not** decide, because
+another process writing the same file inflates it, and a delta inflated by
+exactly as many rows as the run lost reconciles perfectly while the data is gone.
+`25- Batch Runner.py` exits **0 / 1 / 2** (complete / rows lost / never
+reconciled) — **a contract change, stated as one**, on File 19's precedent; no
+caller reads it today. `main()`'s return type is unchanged.
+
+**THE MULTI-PROCESS CASE WAS TESTED, CHEAPLY, AND THE HONEST FINDING IS
+REPORTED.** 8 and 16 real OS processes, synchronised on a start gate, each
+writing 15 `trial_matches` children per row into one file:
+
+| configuration | rows lost |
+|---|---|
+| pre-pass as shipped (delete journal, 5 s, no retry), 8 and 16 procs | **0** |
+| shipped now (WAL, 30 s, 4 attempts) | **0** |
+| squeezed to a 10 ms timeout, no retry, delete journal | **10 of 200** |
+| squeezed to a 10 ms timeout, WITH the retry | **0** |
+
+So at this machine's contention the old configuration was already sufficient —
+the same shape as section 5e's honest finding about the steady-state insert path,
+and real writes are separated by ~70 s of pipeline, so production contention is
+LOWER than this harness's. **What the pass actually buys is headroom and, far
+more importantly, visibility: in every arm the workers' reported losses matched
+the table's shortfall exactly, and before it those 10 rows would have been
+silent.** The first version of that harness lost nothing in ANY arm because
+process spawn staggered the writers past each other — a control that produces no
+contention proves nothing about a fix for contention, and it is recorded because
+that is how it failed rather than how it was reasoned about.
+
+**`tests/test_storage_write_durability.py` — 99 checks**, no network, no keys, no
+spend, no git history, no corpus, not in the collision matrix, and it **execs
+nothing**, so it needs no `_EXEC_ALLOWLIST` entry: every control creates the
+failing condition for real (a genuine `BEGIN EXCLUSIVE` from a second connection,
+an unwritable path, a row deleted behind the writer's back) or rebinds a module
+attribute inside a `try/finally`, with both touched files' sha256 compared at the
+end. **Nine reverts, nine caught**, each in a `copytree`'d copy with a realpath
+preflight asserting the COPY is what imports and `PYTHONDONTWRITEBYTECODE=1` set
+— including the original defect itself (a lost write reporting success: 15
+failures). The strongest control is section 7: a row the writer reported as
+written is deleted behind its back and the reconciliation must find it missing,
+which a report-trusting counter cannot.
+
+**VERIFIED BY RUNNING.** All 25 existing test files at their documented counts,
+`tests/test_package_invariants.py` unchanged at **247**, the serial runner
+**5/5**, and `fixture_replay.py` **12/12 clean without recapture**. **No money
+was spent.** `oncotriage/config.py` and
+`oncotriage/registries/cancer_code_registry.py` confirmed restored afterwards.
 
 ## Persistence and observability
 

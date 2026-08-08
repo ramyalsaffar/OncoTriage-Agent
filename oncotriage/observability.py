@@ -561,6 +561,29 @@ LOGGABLE_FIELDS = frozenset({
     # and the corpus-level residue. A closed vocabulary, see CRITERIA_SPLIT_*.
     "split_method", "unsplit_count",
 
+    # --- the inference write's durability (the write-durability pass) ------
+    # db_path names a FILE on the machine running the pipeline. It is
+    # infrastructure, on exactly the footing `endpoint` is already on, and it is
+    # the first thing an operator needs when a row is reported lost: with two
+    # writing processes and ONCOTRIAGE_INFERENCES_DB able to point either of
+    # them elsewhere, "a row was lost" without "from which file" is not
+    # actionable. It carries no clinical content -- resolve_inference_db_path
+    # returns a configured path, never anything derived from a patient.
+    "db_path",
+    # The journal mode the pragma actually reported back, and the mode that was
+    # asked for. Both are SQLite vocabulary ("wal", "delete", ...), and the pair
+    # is the whole point: WAL is a property of the FILE and can fail to take.
+    "journal_mode", "journal_mode_requested",
+    # Reconciliation: writes attempted by this process, writes whose rows were
+    # then FOUND in the table, and the shortfall. `attempted` and `missing` are
+    # not covered by `count`/`total`/`lost` without conflating three numbers
+    # that only mean anything side by side.
+    "attempted", "verified", "missing",
+    # Which attempt of SQLITE_WRITE_MAX_ATTEMPTS succeeded or gave up. `retry`
+    # is already here but means "the retry index" at the OpenAI call sites, and
+    # a write that succeeded first time has made zero retries and one attempt.
+    "attempts",
+
     # --- failures ----------------------------------------------------------
     # error_type is a class name and is always safe. error_message is allowed
     # because an error with no message is not actionable; the judgement is that
