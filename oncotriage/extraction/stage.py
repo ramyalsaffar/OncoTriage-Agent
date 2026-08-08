@@ -128,9 +128,25 @@ _LOCALLY_ADVANCED_RE = re.compile(
 # Which stage-extraction path fired. Nothing here recovers silently: a
 # skipped mention, a discarded span and a tightened bound each land in a
 # counter, readable after an index build via get_stage_extraction_stats().
+#
+# THE TWO non_oncology_* KEYS ARE SEPARATE ON PURPOSE, and folding them would
+# destroy both. `non_oncology_stage_skipped` counts TRIAL text and is read by
+# `oncotriage/retrieval/indexer.py` through get_stage_extraction_stats() after
+# an index build, to describe the corpus it just wrote. The patient-side guard
+# fires at QUERY time, once per matching condition display, on every patient of
+# every run -- so sharing the key would add an unbounded query-time count to an
+# index-time statistic and make that number mean nothing at all. Nothing pins
+# this dict's key set (checked: tests/test_registries_cancer_codes_and_stage_
+# extraction.py reads individual keys and `any(values())`, and no test compares
+# `.keys()`), so adding one is safe; what is NOT safe is reusing one.
+#
+# A plain dict rather than a Counter, and that is load-bearing: `d[k] += 1` on
+# a key that is not declared here raises KeyError instead of silently creating
+# a counter nobody reads. A typo at an increment site fails loudly.
 _STAGE_EXTRACTION_COUNTS: Dict[str, int] = {
     "negated_skipped":            0,  # mention sat in a negative context
-    "non_oncology_stage_skipped": 0,  # "stage 4" of CKD/GVHD/Child-Pugh etc.
+    "non_oncology_stage_skipped": 0,  # TRIAL text: "stage 4" of CKD/GVHD/etc.
+    "non_oncology_patient_stage_skipped": 0,  # PATIENT condition display, ditto
     "full_range_unresolved":      0,  # collected span covered the whole scale
     "exclusion_upper_bound":      0,  # exclusion text lowered max_stage
     "exclusion_not_suffix":       0,  # exclusion stages did not reach stage IV
@@ -189,7 +205,8 @@ def _stage_negated(text: str, match_start: int) -> bool:
     return False
 
 
-def _is_non_oncology_stage(text: str, match_start: int, match_end: int) -> bool:
+def _is_non_oncology_stage(text: str, match_start: int, match_end: int,
+                           counter_key: str = "non_oncology_stage_skipped") -> bool:
     """
     True if a "stage N" mention is qualified by a non-cancer staging system
     within _NON_ONCOLOGY_CONTEXT_WINDOW chars either side.
@@ -198,11 +215,16 @@ def _is_non_oncology_stage(text: str, match_start: int, match_end: int) -> bool:
     the inclusion block it would invent a requirement, and in the exclusion
     block it would cap the trial below the stages it actually accepts, which
     hides it from patients it wants.
+
+    `counter_key` exists so the PATIENT side can share this implementation
+    without sharing its statistic -- see _STAGE_EXTRACTION_COUNTS. The default
+    is the trial-side key, so every existing call site is unchanged. A key not
+    declared in that dict raises KeyError rather than being created silently.
     """
     lo = max(0, match_start - _NON_ONCOLOGY_CONTEXT_WINDOW)
     hi = match_end + _NON_ONCOLOGY_CONTEXT_WINDOW
     if _NON_ONCOLOGY_STAGE_CONTEXT_RE.search(text[lo:hi]):
-        _STAGE_EXTRACTION_COUNTS["non_oncology_stage_skipped"] += 1
+        _STAGE_EXTRACTION_COUNTS[counter_key] += 1
         return True
     return False
 
@@ -626,6 +648,9 @@ def extract_patient_stage(
       2. Condition display text regex — catches "TNM stage 1", "Stage III",
          "Carcinoma of breast, Stage 3" etc. across ALL cancer types.
          Works with Synthea, real EHRs, and any SNOMED display text.
+         GUARDED by _is_non_oncology_stage: "Chronic kidney disease stage 3"
+         is a staging system, not a cancer stage, and on this corpus it was
+         supplying 245 of the 260 stages this tier produced.
       3. "metastatic" keyword in Condition display (→ 4)
 
     WHY THE M TIER SITS WHERE IT DOES. Below the stage group, because a stage
@@ -675,15 +700,59 @@ def extract_patient_stage(
         return m_category_stage
 
     # Tier 2: Condition display text regex (covers all cancer types, all SNOMED displays)
+    #
+    # GUARDED BY _is_non_oncology_stage, WHICH THIS TIER DID NOT CONSULT UNTIL
+    # THE CKD ITEM. The regex sees the word "stage" and a numeral; it cannot
+    # tell AJCC staging from any other staging system, and a patient's
+    # condition list is FULL of other staging systems. Measured over all 1,000
+    # corpus bundles on 2026-08-08: of the 260 patients whose stage came from
+    # this tier, 245 got it from "Chronic kidney disease stage N (disorder)"
+    # and 15 from a real cancer TNM display. Corpus-wide the regex matched CKD
+    # displays 1,025 times against 16 cancer ones.
+    #
+    # It damages in BOTH directions, which is why "conservative" cannot mean
+    # keeping it: a CKD stage 1 sets a floor that drops the advanced-disease
+    # trials the patient qualifies for, and a CKD stage 4 sets a ceiling that
+    # drops the early ones.
+    #
+    # finditer + continue, not search + give up, so that a display carrying two
+    # stage mentions can still yield the cancer one when the first is
+    # suppressed. That mirrors _collect_stage_ordinals() on the trial side
+    # exactly -- this is the same guard wired the same way, not a second one.
     for cond in conditions:
         display = cond.get("display") or ""
-        m = _SNOMED_DISPLAY_STAGE_RE.search(display)
-        if m:
+        for m in _SNOMED_DISPLAY_STAGE_RE.finditer(display):
+            if _is_non_oncology_stage(
+                    display, m.start(), m.end(),
+                    counter_key="non_oncology_patient_stage_skipped"):
+                continue
             ordinal = _STAGE_ORDINAL.get(m.group(1).lower())
             if ordinal is not None:
                 return ordinal
 
     # Tier 3: Metastatic keyword in Condition display
+    #
+    # DELIBERATELY NOT GUARDED by _is_non_oncology_stage, and the reason is that
+    # the guard is the wrong instrument here rather than that this tier is
+    # safe. That function answers "is this STAGE NUMERAL qualified by a
+    # non-cancer STAGING SYSTEM": it needs a match span to window around, and
+    # its vocabulary is CKD / GVHD / NYHA / Child-Pugh / COPD. This tier has no
+    # numeral and no staging system -- it reads one word. Calling it here would
+    # mean inventing a window around a keyword and asking a question about
+    # staging systems that no display containing "metastatic" will answer.
+    #
+    # The real false-positive class for this tier is a DIFFERENT vocabulary:
+    # "metastatic calcification" (calcium deposition in normal tissue, classically
+    # secondary to chronic kidney disease), "metastatic abscess" and "metastatic
+    # infection" (septic emboli) are non-cancer uses of the word. The guard
+    # above would not catch any of them -- none is in its regex -- so widening
+    # this tier means a new vocabulary, which is its own item with its own
+    # measurement. Measured over all 1,000 corpus bundles on 2026-08-08:
+    # exactly ONE condition display in the whole corpus contains "metastatic"
+    # ("Metastatic malignant neoplasm to prostate (disorder)", 1 occurrence),
+    # it is genuine cancer, and this tier is the answering tier for ZERO
+    # patients. So the exposure today is nil and inventing a guard for it would
+    # be untested code guarding nothing.
     for cond in conditions:
         display = (cond.get("display") or "").lower()
         if "metastatic" in display and "non-metastatic" not in display:

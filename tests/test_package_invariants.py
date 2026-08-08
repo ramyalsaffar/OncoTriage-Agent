@@ -954,12 +954,25 @@ _STRING_PREFILTER = ("exec", "spec_from_file_location", "SourceFileLoader",
 # Nothing execs a file in the working tree; both source files are hashed before
 # any plant runs and compared at the end, with a non-degeneracy probe so the
 # comparison cannot be a tautology.
+#
+# tests/test_extraction_stage_non_oncology_guard.py (the CKD item) is the
+# seventh, same shape again: it execs a PATCHED COPY of
+# oncotriage/extraction/stage.py with the patient-side guard call deleted, its
+# vocabulary widened to a bare organ word, its counter key shared with the
+# trial side, its counter removed, its finditer reverted to search, and the
+# guard wrongly applied to the mCODE stage-group tier. Six defects, six
+# controls, none of them a state any commit ever had -- the guard has never
+# existed on the patient side before, so `git show` has no version to compare
+# with. Nothing execs a file in the working tree; the source is hashed before
+# any plant and compared at the end against a baseline, with a non-degeneracy
+# probe so that comparison cannot be a tautology.
 _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    "tests/test_observability_logging.py",
                    "tests/test_indexer_admission_filters.py",
                    "tests/test_extraction_histology.py",
                    "tests/test_agent_age_units_and_sex_filter.py",
-                   "tests/test_extraction_stage_m_category.py"}
+                   "tests/test_extraction_stage_m_category.py",
+                   "tests/test_extraction_stage_non_oncology_guard.py"}
 
 
 def _repo_py_files():

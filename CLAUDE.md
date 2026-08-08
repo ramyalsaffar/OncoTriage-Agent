@@ -447,6 +447,10 @@ python tests/test_agent_age_units_and_sex_filter.py                 # 112
 # and NOT in the collision matrix. ~2 s.
 python tests/test_extraction_stage_m_category.py                    # 119
 
+# The CKD / non-oncology guard pass. Same shape, same conditions, same
+# directory, also not in the collision matrix. ~2 s.
+python tests/test_extraction_stage_non_oncology_guard.py            #  80
+
 pip install -e .                                         # makes `oncotriage` importable anywhere
 ```
 
@@ -3347,11 +3351,137 @@ CSV export and `EXPORT_CSV` is off, so `.../01- Patients/csv/` does not exist.
 from a condition display, **245 (94%) get it from chronic kidney disease** and
 only 15 from a real cancer TNM display — so those 245 are filtered against a
 kidney stage. Corpus-wide the regex matches CKD displays 1,025 times against 16
-cancer ones. Fixing it means restricting the tier to conditions the cancer
-registry calls cancer, which is a 245-patient behaviour change with its own
-measurement, and folding it in here would have broken this pass's own
-acceptance criterion that every patient not carrying cM1 resolves exactly as
-before. **Recorded as the top-ranked follow-up.**
+cancer ones. Folding it in here would have broken this pass's own acceptance
+criterion that every patient not carrying cM1 resolves exactly as before.
+**Closed by the next section.**
+
+### The patient stage tier stopped reading kidney disease (the CKD guard pass)
+
+**THE GUARD ALREADY EXISTED AND WAS WIRED UP, NOT REWRITTEN.**
+`_is_non_oncology_stage` + `_NON_ONCOLOGY_STAGE_CONTEXT_RE` (CKD, GVHD, NYHA,
+Child-Pugh, COPD, pressure ulcers, retinopathy, …) had been in
+`oncotriage/extraction/stage.py` all along, used by the TRIAL-side extractor
+through `_collect_stage_ordinals()`. `extract_patient_stage()`'s
+condition-display tier never consulted it. It does now, with `finditer` +
+`continue` mirroring the trial side exactly — **not** `search` + give up, so a
+display carrying two stage mentions can still yield the cancer one.
+
+**THE PRIOR PASS'S FIGURES WERE RE-MEASURED, NOT INHERITED, and are exactly
+right:** 260 display-derived patients, **245 from CKD, 15 from a real cancer TNM
+display**; corpus-wide **1,025 CKD matches against 16 cancer**. (The corpus
+cache used was itself re-validated: 20 bundles re-parsed fresh with the real
+parser, 0 differences.)
+
+**244 OF 1,000 PATIENTS CHANGE STAGE**, and every one of them had a CKD display
+as the source of the old stage — **zero non-CKD patients moved**:
+
+| transition | patients |
+|---|---|
+| 1 → None | 33 |
+| 2 → None | 61 |
+| 3 → None | 65 |
+| 4 → None | 84 |
+| **3 → 4** | **1** |
+
+**THE TWO PATIENTS WHOSE CKD STAGE WAS MASKING A REAL CANCER ARE THE POINT.**
+`404d2880…` read as stage **3** from "Chronic kidney disease stage 3" while
+carrying **"Metastatic malignant neoplasm to prostate (disorder)"** — suppressing
+the CKD mention lets the metastatic tier answer, and they are now **4**.
+`1c1fdc23…` read as **1** from "Chronic kidney disease stage 1" while carrying
+**"Non-small cell carcinoma of lung, TNM stage 1"** — same number, and for the
+first time the right reason.
+
+**WHAT MUST STILL BE TRUE, ALL RUN:** the 295 patients carrying a resolving
+stage GROUP — **0 moved** (the mCODE tier is deliberately unguarded: those
+observations are cancer staging by their LOINC, so a guard there could only
+suppress a legitimate stage). The 16 patients with a real cancer TNM display —
+**0 moved**. Of the 260 display-derived patients, **17 still hold a stage**: the
+15 genuine TNM ones plus the two above. And the disease-specific-phrase rule
+holds by measurement rather than by citing the comment — `Stage IV renal cell
+carcinoma` → 4, `Stage 2 carcinoma of kidney` → 2, `Hepatocellular carcinoma,
+Stage 4` → 4, `Malignant neoplasm of kidney, TNM stage 1` → 1, all unchanged.
+
+**THE MATCHING COST IS ENORMOUS AND IT IS ALMOST ALL RECOVERY.** Over the real
+14,324-trial corpus, summed across the 244 changed patients:
+
+- **trials NEWLY KEPT (dropped before, kept now): 827,665**
+- **trials NEWLY DROPPED (kept before, dropped now): 747** — all of them the one
+  3 → 4 patient, who is genuinely metastatic.
+
+Per patient that is 5,112 recovered for a 1 → None, 4,877 for 2 → None, 4,091
+for 3 → None and 1,093 for 4 → None. **Stated at the scale that matters**: a
+stage of 1 drops **35.7%** of the trial corpus and Stage 4 only ever judges
+`TOP_K_CANDIDATES = 40`, so a wrongly-CKD-staged patient was losing on the order
+of **14 of their 40 candidate trials**.
+
+**THE COUNTER KEY IS SEPARATE, AND THAT WAS CHECKED BEFORE IT WAS ADDED.**
+`non_oncology_stage_skipped` is read by `oncotriage/retrieval/indexer.py` after
+an index build to describe TRIAL text; the patient side fires at QUERY time on
+every patient of every run, so sharing it would put an unbounded query-time
+count into an index-time statistic. `_is_non_oncology_stage` takes a
+`counter_key` defaulting to the trial-side key — one implementation, two
+statistics, no existing call site changed — and the patient side passes
+**`non_oncology_patient_stage_skipped`**, which reads **783** over one clean
+pass of the corpus. **Nothing pins that dict's key set**: the only readers are
+`tests/test_registries_cancer_codes_and_stage_extraction.py` (individual keys
+and `any(values())`) and the indexer (prints the whole dict); no test compares
+`.keys()`. Section 4e re-derives that finding by AST so it cannot rot. The dict
+stays a **plain dict rather than a Counter** so an undeclared key raises
+`KeyError` instead of silently creating a counter nobody reads.
+
+**THE METASTATIC-KEYWORD TIER IS DELIBERATELY UNGUARDED, and the reason is that
+the guard is the wrong instrument rather than that the tier is safe.**
+`_is_non_oncology_stage` answers "is this stage NUMERAL qualified by a non-cancer
+STAGING SYSTEM" — it needs a match span to window around and its vocabulary is
+CKD/GVHD/NYHA/Child-Pugh/COPD. This tier has no numeral and no staging system.
+Its real false-positive class is a different vocabulary — "metastatic
+calcification" (classically secondary to CKD), "metastatic abscess", "metastatic
+infection" — **none of which that regex contains**. Measured: exactly **one**
+condition display in the whole corpus contains "metastatic", it is genuine
+cancer, and this tier is the answering tier for **zero** patients. Inventing a
+guard for it would be untested code guarding nothing; the vocabulary is a
+recorded follow-up.
+
+**FIVE OF THE TWELVE FIXTURE PATIENTS MOVE, AND THAT IS STATED PLAINLY RATHER
+THAN ENGINEERED AROUND.** `ablation_bm25_only` 2 → None, `ablation_vector_only`
+3 → None, `mcode_genomic_variant` 4 → None, `normal_2` 4 → None, `normal_3`
+4 → None — **every one of them a CKD display**. Those five fixtures' pipeline
+output has moved with the stage, so they are stale and **must be re-captured**.
+The other seven are unchanged (1, 2, 1, 1, 2, 1, None). `fixture_replay.py`
+could not be used as the check either way: it refuses at its pinned-collection
+gate because the alias now resolves to `trial_criteria_20260807_111807` while the
+fixtures are pinned to `…20260803_104642`.
+
+**`oncotriage/fhir/explore.py`'s STAGE DISTRIBUTION MOVES A LOT, AND THE NEW ONE
+IS THE HONEST ONE.** It calls `extract_patient_stage([{'display': d}])` per
+condition row with **no observations at all**, so its entire chart was built from
+condition displays — which are 98% CKD:
+
+| bucket | before | after |
+|---|---|---|
+| Stage I | 34 (3.6%) | 16 (1.7%) |
+| Stage II | 55 (5.8%) | 0 |
+| Stage III | 58 (6.1%) | 0 |
+| Stage IV/Metastatic | 180 (18.9%) | 1 (0.1%) |
+| Unspecified | 624 (65.6%) | **934 (98.2%)** |
+
+**That chart has been mostly a chart of chronic kidney disease stages.** It now
+says what its inputs actually support, and its own ">50% unspecified" warning
+fires at 98.2%. The fix is for `explore.py` to read the mCODE stage-group
+observations the pipeline reads — 295 patients carry one — which its
+CSV-derived frame does not currently carry. **Recorded as the top follow-up.**
+
+**`tests/test_extraction_stage_non_oncology_guard.py` — 80 checks**, no network,
+no keys, no spend, no git history, no corpus, not in the collision matrix.
+**Eight planted defects, eight caught**, each into an in-memory copy with the
+file hashed before any plant and compared at the end against a real baseline
+plus a non-degeneracy probe. The controls include the two mistakes that no CKD
+test would catch on its own: **widening the guard's vocabulary to the bare word
+"renal"** (which suppresses `Stage IV renal cell carcinoma`) and **applying the
+guard to the stage-GROUP tier** (which suppresses a legitimate stage for any
+patient who also has CKD). It is the seventh member of `_EXEC_ALLOWLIST`, and
+`git show` could not have supplied any of these controls: the patient side has
+never had this guard, so there is no revision to compare against.
 
 ## Persistence and observability
 
