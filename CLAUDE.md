@@ -379,7 +379,7 @@ ONCOTRIAGE_QDRANT_URL=http://localhost:6333 python "11- RAG Trial Indexer.py" --
 # The eleven component tests (pass 20d-1). No quoting: the names have no spaces.
 # None needs a network, a key, a live server, or a cent of spend.
 python tests/test_extraction_histology.py                          # 103 checks
-python tests/test_agent_mesh_boost_and_quality_gate.py             #  54
+python tests/test_agent_mesh_boost_and_quality_gate.py             #  89 (was 54; the two-knob quality gate added Test 7)
 python tests/test_registries_mesh_pan_cancer_resolution.py         #  58
 python tests/test_registries_cancer_codes_and_stage_extraction.py  # 136
 python tests/test_agent_ablation_flag_passthrough.py               #  39
@@ -395,7 +395,7 @@ python tests/test_registries_cancer_code_claims_audit.py           # 197
 python tests/test_registries_cancer_code_claims_audit_control.py   #  16; 14 planted, 14 caught
 python tests/test_config_snapshot_date_rot.py                      #  10; 6 subprocess runs, ~6 min
 python tests/test_package_invariants.py                            # 247 (was 248; pass 20f-3 deleted the _REEXPORT_EXEMPTIONS staleness check with the table). No network, no keys, no corpus
-python tests/test_degraded_dependencies.py                         # 172 (was 170; see pass 20e). Item 11a
+python tests/test_degraded_dependencies.py                         # 174 (was 172 in this note, and 170 before pass 20e; the 172 was never true of the file). Item 11a
 python tests/test_storage_query_layer.py                           # 194; item 38, temp SQLite only
 
 # The four added by pass 20f-1. Same shape, same directory, no network, no keys,
@@ -421,13 +421,20 @@ python tests/test_docker_qdrant_override_and_readiness.py           # 122
 # is stubbed through oncotriage/agent/deps.py. It is NOT offline: sections 4, 5
 # and 6 make real Qdrant round trips, because the readiness gate and the trial
 # lookup are what it exists to prove. Not in the collision matrix. ~2 min.
-python tests/test_mcp_server_stdio_contract.py                      # 135
+python tests/test_mcp_server_stdio_contract.py                      # 142 (was 135; the logging pass's section 8c raised it, and said so 500 lines below while this line stayed at 135)
 
 # The structured-logging pass. Same shape, same directory. No keys and NO SPEND
 # -- section 8 drives all six stages of the real graph with the Qdrant client,
 # the cross-encoder and the OpenAI client replaced through
 # oncotriage/agent/deps.py. Not in the collision matrix. ~40 s.
 python tests/test_observability_logging.py                          #  82
+
+# The scrape-admission pass. Same shape, same directory. No network, no keys, no
+# spend, not in the collision matrix -- but it DOES need git history, and in a
+# tree without `.git` it aborts rather than failing (see its own section below).
+# This line is new: the file has existed since the admission pass with its count
+# recorded only in prose, so an operator working from this block never ran it.
+python tests/test_indexer_admission_filters.py                      # 175
 
 pip install -e .                                         # makes `oncotriage` importable anywhere
 ```
@@ -3122,8 +3129,16 @@ an import error, while a deferred one fails a run loudly. Regenerated and parsed
 with Airflow's own `DagBag`: `import_errors == {}`, all three tasks, 20,689 bytes
 `949283c4…` → 13,071 bytes `7caece14…`.
 
-**`tests/test_indexer_admission_filters.py` — 131 checks, no network, no keys, no
-spend, not in the collision matrix.** Every check is paired with a control that
+**`tests/test_indexer_admission_filters.py` — 175 checks (this note said 131; the
+file has never reported that), no network, no keys, no
+spend, not in the collision matrix.** **IT NEEDS GIT HISTORY AND ABORTS WITHOUT
+IT** — the controls are lifted out of `git show`, and in a tree with no `.git`
+`_old_split` comes back `None` and the file dies at `TypeError: 'NoneType'
+object is not callable` rather than recording failures. Measured, not predicted:
+run from a `git archive` export it crashes; run from a `git worktree` it reports
+175/0. Same shape as the aborts `tests/test_storage_query_layer.py` and
+`tests/test_dashboard_reproducibility_tab.py` had to fix, and it is a recorded
+follow-up. Every check is paired with a control that
 FIRES against the old implementation, and the old implementations are lifted out
 of `git show` rather than retyped. **The revision is DERIVED by AST**, not by
 substring: the current file quotes `if min_age > 18` verbatim in the comment
