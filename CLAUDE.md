@@ -464,6 +464,14 @@ python tests/test_agent_trial_verdict_normalization.py              # 161
 # unwritable path, a deleted row). ~4 s, most of it deliberate lock contention.
 python tests/test_storage_write_durability.py                       #  99
 
+# The reproducibility-hash pass. Same shape, same directory. No network, no
+# keys, no spend, no git history, not in the collision matrix, and it execs
+# nothing -- every control is a different INPUT to the shipped function, which
+# is the natural control for a pure function of its argument. It DOES need the
+# corpus (sections 4 and 7 parse real bundles read-only) and says so as a
+# recorded failure rather than a silent skip. ~2 min, almost all of it parsing.
+python tests/test_agent_patient_hash_coverage.py                    #  69
+
 pip install -e .                                         # makes `oncotriage` importable anywhere
 ```
 
@@ -3704,6 +3712,122 @@ which a report-trusting counter cannot.
 **5/5**, and `fixture_replay.py` **12/12 clean without recapture**. **No money
 was spent.** `oncotriage/config.py` and
 `oncotriage/registries/cancer_code_registry.py` confirmed restored afterwards.
+
+### The reproducibility hash covers what the pipeline reads (the hash pass)
+
+**`compute_patient_hash`'s DOCSTRING PROMISED SOMETHING IT DID NOT DELIVER** —
+"two inferences with the same hash are guaranteed to have identical input data"
+— while three parsed fields were absent from it, each reaching the output by a
+different route: `cancer_genomic_variants` (File 07 routes mCODE variants OUT of
+`observations` entirely, so biomarkers drove the retrieval query and a named
+Stage 5 section while being invisible to the hash), `allergies` (their own
+prompt heading), and `cancer_stage_observations` (Tier 0 of
+`extract_patient_stage`, whose ordinal drives the Stage 4 stage filter).
+
+**THE BRIEF SAID FOUR FIELDS AND IT IS THREE.**
+`cancer_metastasis_observations` was **already hashed** — the AJCC M-category
+pass added it — and only the docstring never listed it. Measured before anything
+was edited, by constructing a patient differing only in that field and watching
+the hash move.
+
+**`patient_data_hash` IS NOT IN THE DETERMINISTIC PREFIX, so no billed recapture
+was needed.** Verified two ways: `build_deterministic_prefix` never reads it, and
+flattening a real fixture gives **94,329 leaves and zero hash keys**. **But there
+is a SECOND gate the brief did not name**, and it would have failed five
+fixtures: `oncotriage/fixtures/replay.py` compared
+`compute_patient_hash(rebuilt)` against `fixture["identity"]["patient_data_hash"]`
+and made a mismatch **FATAL** for constructed fixtures. All twelve recorded
+hashes move; five are constructed.
+
+**THAT GATE IS FIXED RATHER THAN WORKED AROUND, AND THE FIX IS STRICTLY
+STRONGER.** The property it exists to defend is "the recipe still reproduces its
+input", and it tested that through a FUNCTION — so any legitimate change to what
+that function hashes turns every constructed fixture fatal with a message
+blaming the recipe, the donor bundle or the parser, none of which moved. It
+compares the rebuilt `patient_data` against the recorded `patient_data` now: the
+hash is 16 truncated hex characters over a chosen subset of sub-fields and can
+collide, a dict comparison cannot, and it NAMES the field that moved. The
+capture-time hash is **provenance**, like `captured_at_utc` beside it in the same
+`identity` block — reported on every replay, never enforced, so drift is visible
+rather than silent or fatal. **No fixture file was rewritten.**
+
+**WHAT WENT IN, PER FIELD, WITH ITS READERS NAMED.** `allergies`: display,
+category, criticality — the three `_create_patient_summary` renders; `code` and
+`onset_date` are excluded (no reader), and `clinical_status`/`verification_status`
+are read by the PARSER, which admits only active non-refuted allergies, so their
+effect is already visible as presence. `cancer_genomic_variants`: display,
+gene_symbol, hgvs_protein, hgvs_cdna, result_value, interpretation, date — one
+per reader, including `result_value`/`interpretation` because
+`filter_relevant_genomic_variants` DROPS Absent results, so a flip to "Absent"
+removes a whole prompt line; `code`, `genomic_source` and `value` are excluded.
+`cancer_stage_observations`: stage_display, date, loinc — the extractor reads the
+first, sorts on the second, and the third is the staging AXIS (the analogue of
+`metastasis_category`); `stage_code` is excluded as a second encoding with no
+reader, **and if the extractor ever reads it this entry must gain it**.
+
+**THE OBSERVATIONS ARE HASHED, NOT THE STAGE** — the `birth_date` rule again. The
+ordinal is a function of these records AND of the extractor's tier order and
+regexes, both changed twice recently, so hashing it would move every patient's
+hash whenever the extractor was edited while their bundle had not changed.
+
+**A SECOND, SEPARABLE DEFECT WAS FOUND WHILE CHECKING THE BRIEF'S OWN
+REQUIREMENT, AND IT WAS PRE-EXISTING.** "Parsing it in a different order produces
+the same hash" was listed under what must STILL be true. It was **not** true:
+each collection was sorted by a KEY and emitted with MORE fields than the key
+covered, so ties kept parse order. Measured — one real bundle shuffled six times
+gave two different hashes, and the **pre-change** function did the same on the
+same three shuffles; the culprit was `observations`, 3,660 records with one tied
+`(display, date)` pair whose `value` differed. **20 of 30 bundles were
+order-unstable before; 1 of 30 is now.** Every collection is emitted through
+`_emit`, which sorts the **line** rather than a subset of its fields — equivalent
+today, and it cannot go stale when a field is added to the string.
+
+**THE TWO CHANGES CONFLICT AND THE NUMBERS ARE REPORTED SEPARATELY**, because
+"a patient carrying none of the new fields hashes exactly as before" and "parse
+order does not reach the hash" cannot both hold:
+
+| change | patients whose hash moves (of 1,000) |
+|---|---|
+| the three new fields, alone | **392** — and **0** of the 608 carrying none |
+| the tie-break canonicalisation, alone | **1,000** |
+
+The corpus carries **131** patients with allergies, **295** with stage
+observations and **0** with genomic variants (Synthea generates none; only the
+constructed `mcode_genomic_variant` fixture has one). The production database
+holds **1,106** rows carrying a hash, **1,004 of them distinct**, and the
+canonicalisation invalidates every one — reported for the record, and per the
+brief not a constraint: that database is disposable and every published number
+comes from a fresh end-to-end run. Nothing was designed around them.
+
+**THE ONE REMAINING ORDER DEPENDENCE IS THE PARSER'S, NOT THE HASH'S, and it is
+reported rather than fixed.** `parse_fhir_bundle` keeps the FIRST record per
+medication display, so a shuffle changes which duplicate survives — invisible to
+the hash, which reads only the display SET, until a bundle carries two spellings
+of one drug. One does: `Aspirin 81 MG Oral Tablet` and `aspirin 81 MG Oral
+Tablet`. Choosing a canonical spelling changes the Stage 5 prompt text, which is
+a decision about the prompt rather than about the hash.
+
+**`tests/test_agent_patient_hash_coverage.py` — 69 checks.** Every included
+sub-field is shown to move the hash and every EXCLUDED one shown not to, which is
+"say which you included and why" made executable; a literal patient carrying none
+of the five is PINNED, which is the only thing that catches an entry made
+unconditional (revert r5 fails on that check alone). **Eleven reverts, eleven
+caught.**
+
+**THREE DEFECTS IN THIS PASS'S OWN WORK WERE FOUND BY RUNNING, NOT BY READING.**
+The pin was written as a placeholder and had to be LIFTED from the function
+rather than guessed — the pass-20f-4 lesson, reproduced. The docstring said
+"ecog" where the code reads `ecog_performance_status`, caught by section 6's own
+derived-key scan. And section 4e was written twice wrongly before it was right:
+first comparing parsed dicts with `==` (which includes list ORDER, so shuffling
+made every sample "different" and the check asserted over an empty set), then
+comparing full record content (which differs on every shuffle because of the
+medication de-duplication above). **Its non-degeneracy assertion is what caught
+both** — without it, 4e would have passed vacuously, twice.
+
+**VERIFIED BY RUNNING.** `fixture_replay.py` **12/12 clean without recapture**,
+`tests/test_package_invariants.py` **247**, and every hash-adjacent existing test
+at its documented count. **No money was spent.**
 
 ## Persistence and observability
 

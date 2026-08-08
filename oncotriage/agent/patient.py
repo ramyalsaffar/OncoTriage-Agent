@@ -152,19 +152,50 @@ def extract_genomic_variant_terms(patient_data: Dict) -> Dict:
 
 def compute_patient_hash(patient_data: Dict) -> str:
     """Compute a deterministic hash of patient data for reproducibility tracking.
-    
-    Captures the exact patient record state at inference time. Two inferences
-    with the same hash are guaranteed to have identical input data, making
-    score/eligibility differences attributable solely to GPT-4o non-determinism.
-    
-    Hash inputs (order-stable):
-      - demographics: birth_date, sex, race, ethnicity
-      - conditions: sorted by (display, onset_date)
-      - medications: sorted by display
-      - observations: sorted by (display, date)
-      - procedures: sorted by (display, date)
-      - ecog: value, date, shape and count — emitted ONLY when the bundle
-        carried at least one ECOG observation (see below)
+
+    WHAT EQUAL HASHES ACTUALLY GUARANTEE, stated precisely because the previous
+    wording was false. Two inferences with the same hash had the same patient
+    input AS THE PIPELINE READS IT: the same Stage 5 prompt text and the same
+    inputs to every Stage 4 filter. So a score or eligibility difference between
+    them is attributable to model non-determinism rather than to the patient.
+
+    That is deliberately NOT "identical input data", and the difference is not
+    pedantry -- it is the rule that decides what goes in. Sub-fields the parser
+    carries but no consumer reads are excluded, because including them would
+    make the hash move on a re-encoding that changes no prompt and no filter,
+    and the ablation study reads a hash change as an input change. The ECOG
+    entry has always worked this way (see ``value_shape`` below); every field
+    added since follows it, and each one names its readers.
+
+    Hash inputs, IN EMISSION ORDER. Every collection is sorted by its emitted
+    line before it is appended, so no entry depends on parse order:
+      - demographics: birth_date, sex, race, ethnicity (a fixed sequence, not a
+        collection, so it is the one block that is not sorted)
+      - conditions: display, onset_date, clinical_status
+      - medications: display only, de-duplicated
+      - observations: display, value, unit, date
+      - procedures: display, date
+      - ecog_performance_status: value, date, observations_found, selection
+      - cancer_metastasis_observations: display, value, unit, date,
+        metastasis_category
+      - allergies: display, category, criticality
+      - cancer_genomic_variants: display, gene_symbol, hgvs_protein, hgvs_cdna,
+        result_value, interpretation, date
+      - cancer_stage_observations: stage_display, date, loinc
+
+    Each name above is the patient_data KEY, not a nickname for it. The ECOG
+    line used to read "ecog", which is not a field of anything --
+    tests/test_agent_patient_hash_coverage.py section 6 derives the read keys
+    from this function's own body and compares them against this list, so a
+    name here that no longer exists, or a field read but not listed, fails.
+
+    THE LAST FIVE ARE EMITTED ONLY WHEN PRESENT. Each is a field File 07 routes
+    OUT of ``observations`` into a list of its own, so each contributes nothing
+    to the five entries above it and each had to be added separately. Emitting
+    nothing when the list is empty is what keeps a hash comparable across the
+    addition: a patient who never carried that data hashes exactly as they did
+    before the entry existed. An unconditional line would have invalidated every
+    stored hash to record "still nothing".
     """
 
     demographics = patient_data.get("demographics", {})
@@ -176,7 +207,48 @@ def compute_patient_hash(patient_data: Dict) -> str:
     
     # Build deterministic string representation
     parts = []
-    
+
+    # ---------------------------------------------------------------------
+    # EVERY COLLECTION IS SORTED BY ITS EMITTED LINE, NOT BY A SUBSET OF ITS
+    # FIELDS. This is a correctness fix, and the defect it removes was
+    # measured rather than suspected.
+    #
+    # WHAT WAS WRONG. Each collection was sorted by a KEY -- observations by
+    # (display, date), conditions by (display, onset_date) -- and then emitted
+    # with MORE fields than the key covered. Python's sort is stable, so two
+    # records sharing a key kept their PARSE order, and the line they produced
+    # differed in a field the key never looked at. The hash therefore depended
+    # on the order the FHIR `entry` array happened to arrive in.
+    #
+    # MEASURED: parsing one real bundle six times with its `entry` array
+    # shuffled produced two different hashes, and the pre-change function did
+    # the same on the same three shuffles -- so this is not new, and it is not
+    # theoretical. The culprit on that patient was `observations`: 3,660
+    # records, one tied (display, date) pair whose `value` differed. Across the
+    # corpus, all 1,000 patients have at least one such tie.
+    #
+    # WHY IT MATTERS DESPITE THE FILE ON DISK BEING FIXED. Nothing re-orders a
+    # bundle that is never rewritten -- but File 04's mCODE normalizer rewrites
+    # every exported bundle, a Synthea regeneration produces new serialisations,
+    # and the dashboard's reproducibility tab GROUPS BY patient_data_hash. A
+    # hash that moves when the same clinical record is re-serialised splits one
+    # patient into two groups and reports it as an input change.
+    #
+    # WHY SORTING THE LINE RATHER THAN WIDENING THE KEY. They are equivalent
+    # today; they do not stay equivalent. A key listing the same fields as the
+    # f-string is two lists to keep in step, and the failure mode when they
+    # drift is silent and order-dependent -- exactly what is being fixed. The
+    # emitted line IS the content, so sorting it cannot go stale when a field
+    # is added to the string.
+    #
+    # THE COST IS STATED: this moves the hash of every patient in the corpus,
+    # including patients carrying none of the fields added alongside it. It is
+    # separable from that addition and was measured separately.
+    def _emit(prefix, lines):
+        """Append `lines` under `prefix`, in canonical (sorted) order."""
+        parts.extend(f"{prefix}={line}" for line in sorted(lines))
+
+
     # Demographics (fixed order)
     # birth_date instead of age: birth_date is what the FHIR source actually
     # carries, so it is immutable across re-parses. age is derived from it
@@ -189,25 +261,26 @@ def compute_patient_hash(patient_data: Dict) -> str:
     parts.append(f"race={demographics.get('race', '')}")
     parts.append(f"ethnicity={demographics.get('ethnicity', '')}")
     
-    # Conditions (sorted for determinism)
-    sorted_conds = sorted(conditions, key=lambda c: (c.get('display', ''), c.get('onset_date', '')))
-    for c in sorted_conds:
-        parts.append(f"cond={c.get('display', '')}|{c.get('onset_date', '')}|{c.get('clinical_status', '')}")
-    
-    # Medications (sorted, deduplicated by display)
-    sorted_meds = sorted(set(m.get('display', '') for m in medications))
-    for m in sorted_meds:
-        parts.append(f"med={m}")
-    
-    # Observations (sorted)
-    sorted_obs = sorted(observations, key=lambda o: (o.get('display', ''), o.get('date', '')))
-    for o in sorted_obs:
-        parts.append(f"obs={o.get('display', '')}|{o.get('value', '')}|{o.get('unit', '')}|{o.get('date', '')}")
-    
-    # Procedures (sorted)
-    sorted_procs = sorted(procedures, key=lambda p: (p.get('display', ''), p.get('date', '')))
-    for p in sorted_procs:
-        parts.append(f"proc={p.get('display', '')}|{p.get('date', '')}")
+    # Conditions
+    _emit("cond", [
+        f"{c.get('display', '')}|{c.get('onset_date', '')}|{c.get('clinical_status', '')}"
+        for c in conditions
+    ])
+
+    # Medications (deduplicated by display, which is all that is emitted)
+    _emit("med", set(m.get('display', '') for m in medications))
+
+    # Observations
+    _emit("obs", [
+        f"{o.get('display', '')}|{o.get('value', '')}|{o.get('unit', '')}|{o.get('date', '')}"
+        for o in observations
+    ])
+
+    # Procedures
+    _emit("proc", [
+        f"{p.get('display', '')}|{p.get('date', '')}"
+        for p in procedures
+    ])
 
     # ECOG performance status.
     #
@@ -260,15 +333,110 @@ def compute_patient_hash(patient_data: Dict) -> str:
     # them do get a new hash: their observations moved between fields, which is
     # a real change to the parsed record and to the prompt built from it.
     metastasis = patient_data.get("cancer_metastasis_observations") or []
-    for m in sorted(metastasis, key=lambda o: (o.get("display", ""),
-                                               o.get("date", ""))):
-        parts.append(
-            f"met={m.get('display', '')}"
-            f"|{m.get('value', '')}"
-            f"|{m.get('unit', '')}"
-            f"|{m.get('date', '')}"
-            f"|{m.get('metastasis_category', '')}"
-        )
+    _emit("met", [
+        f"{m.get('display', '')}"
+        f"|{m.get('value', '')}"
+        f"|{m.get('unit', '')}"
+        f"|{m.get('date', '')}"
+        f"|{m.get('metastasis_category', '')}"
+        for m in metastasis
+    ])
+
+    # Allergies, for the same reason ECOG and metastasis are here: File 07 gives
+    # them a list of their own, so they contribute nothing to the five entries
+    # above and two patients differing only in their allergies hashed
+    # identically. They are not incidental -- _create_patient_summary renders
+    # them under their own "Allergies:" heading, and drug allergy is a standing
+    # exclusion criterion in oncology trials ("no known allergy to
+    # platinum-based agents").
+    #
+    # THE THREE SUB-FIELDS ARE THE THREE THE PROMPT RENDERS: display, category
+    # and criticality. What is left out and why:
+    #   - code: the coding-system identity of the same allergen. Nothing reads
+    #     it. Same exclusion the metastasis entry above already makes.
+    #   - onset_date: no consumer reads it. Two allergies identical except for
+    #     onset produce byte-identical prompt text, so hashing it would move the
+    #     hash without moving the prompt -- the value_shape mistake.
+    #   - clinical_status / verification_status: read by the PARSER, which
+    #     admits only active, non-refuted allergies. Their effect is therefore
+    #     already visible here as presence or absence, and an allergy that
+    #     becomes inactive leaves the list and changes the hash by disappearing.
+    allergies = patient_data.get("allergies") or []
+    _emit("allergy", [
+        f"{a.get('display') or ''}"
+        f"|{a.get('category') or ''}"
+        f"|{a.get('criticality') or ''}"
+        for a in allergies
+    ])
+
+    # mCODE genomic variants. THE SHARPEST OF THE THREE, because the routing is
+    # total: extract_genomic_variant_terms' own docstring records that File 07
+    # takes these OUT of `observations` entirely, so a patient's biomarkers were
+    # invisible to this function while driving both the retrieval query and a
+    # named section of the Stage 5 prompt. Two patients differing only in EGFR
+    # status hashed identically.
+    #
+    # SEVEN SUB-FIELDS, one per reader, and every reader is named:
+    #   - gene_symbol, hgvs_protein, hgvs_cdna: extract_genomic_variant_terms'
+    #     _structured_term() builds the retrieval term from them.
+    #   - display: the same function's fallback when gene_symbol is absent, AND
+    #     what _create_patient_summary prints for each variant.
+    #   - result_value, interpretation: OncologyLabRegistry
+    #     .filter_relevant_genomic_variants drops Absent/Negative results
+    #     outright, so a variant flipping to "Absent" removes a whole line from
+    #     the prompt. Omitting these would let that flip pass unhashed.
+    #   - date: the same filter keeps the most recent observation per gene, so
+    #     the date decides WHICH variant survives; it is also rendered.
+    # Left out: `code` (encoding, as above), `genomic_source` (no reader), and
+    # `value` (a duplicate of result_value that nothing on this path reads).
+    variants = patient_data.get("cancer_genomic_variants") or []
+    _emit("variant", [
+        f"{v.get('display') or ''}"
+        f"|{v.get('gene_symbol') or ''}"
+        f"|{v.get('hgvs_protein') or ''}"
+        f"|{v.get('hgvs_cdna') or ''}"
+        f"|{v.get('result_value') or ''}"
+        f"|{v.get('interpretation') or ''}"
+        f"|{v.get('date') or ''}"
+        for v in variants
+    ])
+
+    # mCODE TNM stage group observations. These are Tier 0 of
+    # extract_patient_stage, which is the highest-priority tier and the one that
+    # answers for the 295 corpus patients who carry a stage group -- and the
+    # stage ordinal it returns drives Stage 4's stage filter, which on this
+    # corpus drops on the order of a third of the trial pool for an early-stage
+    # patient.
+    #
+    # THE OBSERVATIONS ARE HASHED, NOT THE STAGE. That is the birth_date rule
+    # applied again: the ordinal is a function of these records AND of the
+    # extractor's tier order and regexes, both of which have changed twice
+    # recently (the AJCC M-category tier, the non-oncology guard). Hashing the
+    # derived ordinal would make every patient's hash move whenever the
+    # extractor was edited, while their bundle -- the thing the hash is supposed
+    # to identify -- had not changed at all.
+    #
+    # THREE SUB-FIELDS:
+    #   - stage_display: the only field the extractor reads; both its regex and
+    #     its "metastatic" fallback run against this string.
+    #   - date: the extractor sorts on it and takes the most recent, so it
+    #     decides which observation answers when a patient was restaged.
+    #   - loinc: which staging axis the observation is (clinical, pathological,
+    #     other), which is what the parser routed on. It is the analogue of
+    #     metastasis_category in the entry above, and it is kept for the same
+    #     reason: it identifies the record rather than re-encoding its value.
+    # Left out: stage_code, a second encoding of stage_display with no reader --
+    # the same exclusion `code` gets everywhere else here. IF THE EXTRACTOR EVER
+    # READS stage_code, this entry has to gain it, or a bundle whose code moved
+    # while its display did not would change the filter without changing the
+    # hash.
+    stage_obs = patient_data.get("cancer_stage_observations") or []
+    _emit("stage_obs", [
+        f"{s.get('stage_display') or ''}"
+        f"|{s.get('date') or ''}"
+        f"|{s.get('loinc') or ''}"
+        for s in stage_obs
+    ])
 
     hash_input = "\n".join(parts)
     return hashlib.sha256(hash_input.encode('utf-8')).hexdigest()[:16]

@@ -700,22 +700,72 @@ def replay_fixture(fixture: Dict, graph: object) -> Dict:
             # not a code regression, and it has to say so in its own words
             # before the diff blames Stage 1 for a different patient.
             if temporary:
-                rebuilt_hash = compute_patient_hash(patient_data)
-                expected_hash = fixture["identity"]["patient_data_hash"]
-                report["recipe_hash_ok"] = rebuilt_hash == expected_hash
-                if not report["recipe_hash_ok"]:
+                # THE GATE COMPARES THE PARSED RECORD, NOT ITS HASH, and that
+                # is a correctness fix rather than a preference.
+                #
+                # The property this gate exists to defend is "the recipe still
+                # reproduces its input". It used to test that by comparing
+                # compute_patient_hash(rebuilt) against the hash recorded at
+                # capture time -- which couples a fixture-integrity check to a
+                # FUNCTION, so any legitimate change to what that function
+                # hashes turns every constructed fixture FATAL with a message
+                # blaming the recipe, the donor bundle or the parser, none of
+                # which moved. The reproducibility-hash pass hit exactly that:
+                # adding allergies, genomic variants and stage observations
+                # moved all twelve recorded hashes and would have failed five
+                # constructed fixtures for a reason the message could not name.
+                #
+                # Comparing the dicts is STRICTLY STRONGER on top of being
+                # stable: the hash is truncated to 16 hex characters and covers
+                # only the sub-fields it chooses, so two genuinely different
+                # patient records could share one. The dict comparison sees
+                # every field the parser produced, and it can NAME the one that
+                # moved instead of printing two opaque hashes.
+                recorded_patient = fixture["deterministic_prefix"]["patient_data"]
+                report["recipe_patient_ok"] = patient_data == recorded_patient
+                if not report["recipe_patient_ok"]:
+                    differing = sorted(
+                        k for k in set(patient_data) | set(recorded_patient or {})
+                        if patient_data.get(k) != (recorded_patient or {}).get(k)
+                    )
+                    report["recipe_differing_fields"] = differing
+                    # BUILT ON ITS OWN LINE, NOT INSIDE THE f-STRING. The first
+                    # version put this `or` expression inside a replacement
+                    # field that spanned a line break, which is PEP 701 syntax
+                    # and therefore Python 3.12+ ONLY. The development machine
+                    # runs 3.13 and compiled it; the Docker image is
+                    # python:3.11-slim, where it is a SyntaxError and this
+                    # module would not import at all. Reproduced on a 3.9
+                    # interpreter, which shares the pre-701 tokenizer.
+                    differing_text = ", ".join(differing) or \
+                        "(no top-level field — check ordering)"
                     report["fatal"] = (
                         f"the derivation recipe "
                         f"{fixture['derivation']['recipe']!r} rebuilt a patient "
-                        f"whose hash is {rebuilt_hash}, but the fixture records "
-                        f"{expected_hash}. The recipe, the donor bundle or the "
+                        f"that differs from the one the fixture recorded, in: "
+                        f"{differing_text}. The recipe, the donor bundle or the "
                         f"parser changed — this is not a pipeline difference."
                     )
                     console.out(f"  FATAL: {report['fatal']}")
                     return report
-                console.out(f"  rebuilt from recipe "
-                      f"{fixture['derivation']['recipe']}: patient_data_hash "
-                      f"{rebuilt_hash} matches")
+
+                # The capture-time hash is PROVENANCE, like captured_at_utc
+                # beside it: a record of what compute_patient_hash returned on
+                # the day this fixture was made. It is reported, never enforced,
+                # so a change to the hash function is VISIBLE here rather than
+                # either silent or fatal.
+                rebuilt_hash = compute_patient_hash(patient_data)
+                expected_hash = fixture["identity"]["patient_data_hash"]
+                report["recipe_hash_ok"] = rebuilt_hash == expected_hash
+                console.out(
+                    f"  rebuilt from recipe "
+                    f"{fixture['derivation']['recipe']}: patient_data matches "
+                    f"the recorded record"
+                    + ("" if report["recipe_hash_ok"] else
+                       f"; NOTE the capture-time patient_data_hash "
+                       f"{expected_hash} is now {rebuilt_hash} — "
+                       f"compute_patient_hash has changed since capture, which "
+                       f"is not a fixture fault"))
     finally:
         if temporary and os.path.exists(bundle_path):
             os.remove(bundle_path)
