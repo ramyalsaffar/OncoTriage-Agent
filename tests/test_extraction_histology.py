@@ -70,9 +70,11 @@ except ImportError:
         raise
     del _candidate, _how
 
+from oncotriage.extraction import histology as _histology_module
 from oncotriage.extraction.histology import (
     _EXCLUSIVE_PAIRS,
     _extract_histology_tags,
+    _SCLC_ABBREV_RE,
     enrich_histology_tags,
     extract_patient_histology,
     get_histology_extraction_stats,
@@ -562,6 +564,214 @@ check("exclusive_pair_kept incremented by a permissive trial",
 reset_histology_extraction_stats()
 check("reset zeroes the counters",
       any(get_histology_extraction_stats().values()), False)
+
+
+# ===========================================================================
+# TEST 9: THE TWO LUNG ABBREVIATIONS ARE CASE-INSENSITIVE
+# ===========================================================================
+# _NSCLC_ABBREV_RE and _SCLC_ABBREV_RE were compiled WITHOUT re.IGNORECASE
+# while every other pattern in the module had it. So "nsclc" in lower case
+# produced no tag at all, and an untagged trial is filtered by nobody:
+# is_histology_mismatch() returns False the moment either side's tag set is
+# empty, so a small cell trial reached a non-small cell patient -- the exact
+# confusion this module exists to prevent.
+#
+# WHY THE PLANTS ARE EXEC'd COPIES AND NOT git show. A control that reads the
+# pre-fix source out of history dies rather than reporting in a tree with no
+# .git -- a git archive export, a vendored copy, a shallow clone past the
+# commit -- and this project already has three files with that shape. Worse
+# here: HEAD now CARRIES the fix, so a history-based control would compare the
+# fixed module with itself and pass for exactly the reason it exists to catch.
+# The defect is planted into an in-memory copy of the shipped source instead,
+# and THE PLANT IS PROVED BY BEHAVIOUR rather than by trusting the edit.
+
+print()
+print("=" * 70)
+print("Test 9: Lung abbreviation patterns are case-insensitive")
+print("=" * 70)
+
+import hashlib   # noqa: E402  - used only by the plant machinery below
+import types     # noqa: E402
+
+# THE PATH COMES FROM THE MODULE THIS PROCESS IMPORTED, never from this file's
+# own location. Moving the test cannot break it, and the source being planted
+# into is provably the one under test rather than a same-named copy.
+_HISTOLOGY_SRC_PATH = os.path.abspath(_histology_module.__file__)
+_HISTOLOGY_SHA_AT_START = hashlib.sha256(
+    open(_HISTOLOGY_SRC_PATH, encoding="utf-8").read().encode()).hexdigest()
+
+_SHIPPED_NSCLC_LINE = '_NSCLC_ABBREV_RE = re.compile(r"\\bNSCLC\\b", re.IGNORECASE)'
+_SHIPPED_SCLC_LINE = ('_SCLC_ABBREV_RE = re.compile(r"(?<!\\bN)\\bSCLC\\b", '
+                      're.IGNORECASE)')
+
+
+class _PlantFailed(Exception):
+    """A plant that did not apply or did not compile. Never escapes a check."""
+
+
+def _plant(name, *subs):
+    """Exec an in-memory COPY of histology.py with `subs` applied.
+
+    Raises _PlantFailed -- never SyntaxError, never NameError -- so that a
+    malformed plant is RECORDED as a failure instead of aborting the run and
+    hiding every check below it. A control that takes the process down is not a
+    control; it is an outage that happens to be red.
+
+    The file on disk is hashed before and after and asserted byte-identical,
+    because "mutates a COPY" is only true if it stays true.
+    """
+    source = open(_HISTOLOGY_SRC_PATH, encoding="utf-8").read()
+    before = hashlib.sha256(source.encode()).hexdigest()
+    try:
+        for old, new in subs:
+            if old not in source:
+                raise _PlantFailed(f"plant target absent: {old!r}")
+            source = source.replace(old, new, 1)
+        module = types.ModuleType(name)
+        module.__file__ = _HISTOLOGY_SRC_PATH
+        exec(compile(source, _HISTOLOGY_SRC_PATH, "exec"), module.__dict__)
+    except _PlantFailed:
+        raise
+    except Exception as exc:                      # noqa: BLE001 - reported, not raised
+        raise _PlantFailed(f"{type(exc).__name__}: {exc}") from None
+    finally:
+        after = hashlib.sha256(
+            open(_HISTOLOGY_SRC_PATH, encoding="utf-8").read().encode()).hexdigest()
+        if before != after:
+            raise AssertionError("the shipped histology.py was modified on disk")
+    return module
+
+
+def _plant_outcome(subs):
+    """The exception TYPE NAME a plant produced, or 'no exception'.
+
+    Exists so the guard above can be tested without the test itself being the
+    thing that aborts: it catches Exception, so a _plant() that had LOST its
+    guard would report 'SyntaxError' here rather than killing the run.
+
+    TAKES A LIST, exactly as _control() does, and this signature is not
+    incidental. It was `*subs` first, so a caller passing a list handed _plant()
+    one positional it then failed to unpack -- and the two "a bad plant is
+    recorded" checks below PASSED, because ValueError-caught-as-_PlantFailed is
+    the answer they wanted. They were reporting the argument shape, not the
+    guard. The well-formed case is what exposed it, which is the whole argument
+    for including a case whose expected answer is "no exception".
+    """
+    try:
+        _plant("h_probe", *subs)
+    except Exception as exc:                      # noqa: BLE001 - the point
+        return type(exc).__name__
+    return "no exception"
+
+
+def _control(label, subs, probe, expected):
+    """Run a negative control. A BAD PLANT IS A RECORDED FAILURE, not a crash."""
+    try:
+        module = _plant(f"h_ctl_{len(_FAILURES)}_{_RESULTS['passed']}", *subs)
+    except _PlantFailed as exc:
+        check(f"{label}  [THE PLANT ITSELF FAILED: {exc}]", "plant-failed", expected)
+        return
+    check(label, probe(module), expected)
+
+
+# --- 9a. both abbreviations tag in every casing ----------------------------
+print()
+print("--- 9a. lower and mixed case now produce a tag")
+
+for _spelling in ("NSCLC", "nsclc", "Nsclc", "nSCLC", "NSCLc"):
+    check(f"{_spelling!r} tags nsclc", sorted(tags(_spelling)), ["nsclc"])
+
+for _spelling in ("SCLC", "sclc", "Sclc", "sClC", "scLC"):
+    check(f"{_spelling!r} tags sclc", sorted(tags(_spelling)), ["sclc"])
+
+# In running prose, which is where these actually appear.
+check("lower-case abbreviation in a sentence tags",
+      sorted(tags("Patients with advanced sclc after platinum therapy")),
+      ["sclc"])
+check("...and the non-small cell one does too",
+      sorted(tags("Patients with advanced nsclc after platinum therapy")),
+      ["nsclc"])
+
+# UPPERCASE BEHAVIOUR IS UNCHANGED. Stated as its own group because the whole
+# risk of adding a flag is that it moves something that already worked.
+check("the spelled-out form still tags, unaffected by the flag",
+      sorted(tags("Non-small cell lung cancer")), ["nsclc"])
+check("small cell spelled out in lung context still tags",
+      sorted(tags("Small cell lung cancer")), ["sclc"])
+check("nsclc still wins over sclc when a trial names both",
+      sorted(tags("NSCLC and SCLC cohorts")), ["nsclc"])
+check("...in lower case too, so precedence did not become case-dependent",
+      sorted(tags("nsclc and sclc cohorts")), ["nsclc"])
+
+# --- 9b. SCLC must not fire inside NSCLC, in ANY casing --------------------
+print()
+print("--- 9b. the small cell pattern does not fire inside the non-small cell one")
+
+# Case-folding widened what the negative lookbehind excludes, so this is
+# checked rather than reasoned about. It holds because `\bSCLC\b` needs a word
+# boundary before the S and the preceding N is a word character -- the
+# lookbehind is belt-and-braces, not the mechanism.
+_NSCLC_SPELLINGS = ("NSCLC", "nsclc", "Nsclc", "nSCLC", "NSCLc", "NsClC")
+check("the small cell pattern matches no NSCLC spelling",
+      [s for s in _NSCLC_SPELLINGS if _SCLC_ABBREV_RE.search(s)], [])
+check("...and the probe list is non-degenerate",
+      len(_NSCLC_SPELLINGS) >= 6, True)
+check("...while it DOES match a bare SCLC in the same casings",
+      [s for s in ("SCLC", "sclc", "Sclc", "sClC")
+       if not _SCLC_ABBREV_RE.search(s)], [])
+check("no NSCLC spelling produces an sclc tag",
+      sorted({t for s in _NSCLC_SPELLINGS for t in tags(s)}), ["nsclc"])
+
+# --- 9c. non-degeneracy, before any control is believed -------------------
+print()
+print("--- 9c. the shipped module actually tags (so a control can differ)")
+check("shipped: lower-case sclc is a NON-EMPTY tag set", bool(tags("sclc")), True)
+check("shipped: lower-case nsclc is a NON-EMPTY tag set", bool(tags("nsclc")), True)
+
+# --- 9d. negative controls, each planted and each shown to fire -----------
+print()
+print("--- 9d. negative controls")
+
+_control("CONTROL: without IGNORECASE, lower-case sclc tags NOTHING",
+         [(_SHIPPED_SCLC_LINE,
+           '_SCLC_ABBREV_RE = re.compile(r"(?<!\\bN)\\bSCLC\\b")')],
+         lambda m: sorted(m._extract_histology_tags("sclc")), [])
+_control("CONTROL: without IGNORECASE, lower-case nsclc tags NOTHING",
+         [(_SHIPPED_NSCLC_LINE,
+           '_NSCLC_ABBREV_RE = re.compile(r"\\bNSCLC\\b")')],
+         lambda m: sorted(m._extract_histology_tags("nsclc")), [])
+_control("CONTROL: ...and the same plant leaves UPPER case working, so it is "
+         "the flag that is under test and not the pattern",
+         [(_SHIPPED_SCLC_LINE,
+           '_SCLC_ABBREV_RE = re.compile(r"(?<!\\bN)\\bSCLC\\b")')],
+         lambda m: sorted(m._extract_histology_tags("SCLC")), ["sclc"])
+
+# 9b would pass for free against a pattern that can never match anything, so it
+# is controlled from the other side: a boundary-free pattern DOES fire inside
+# NSCLC, which is what makes the check above discriminating.
+_control("CONTROL: a boundary-free small cell pattern DOES fire inside nsclc",
+         [(_SHIPPED_SCLC_LINE,
+           '_SCLC_ABBREV_RE = re.compile(r"SCLC", re.IGNORECASE)')],
+         lambda m: [s for s in _NSCLC_SPELLINGS if m._SCLC_ABBREV_RE.search(s)],
+         list(_NSCLC_SPELLINGS))
+
+# --- 9e. the plant machinery itself ---------------------------------------
+print()
+print("--- 9e. a bad plant is recorded, never raised")
+check("a plant whose target is absent is reported as _PlantFailed",
+      _plant_outcome([("this text is not in histology.py", "x")]),
+      "_PlantFailed")
+check("a plant that produces invalid Python is reported, not raised",
+      _plant_outcome([(_SHIPPED_SCLC_LINE, "_SCLC_ABBREV_RE = re.compile(")]),
+      "_PlantFailed")
+check("...and a well-formed plant produces no exception at all",
+      _plant_outcome([(_SHIPPED_SCLC_LINE,
+                       '_SCLC_ABBREV_RE = re.compile(r"(?<!\\bN)\\bSCLC\\b")')]),
+      "no exception")
+check("the shipped histology.py is byte-identical after every plant above",
+      hashlib.sha256(
+          open(_HISTOLOGY_SRC_PATH, encoding="utf-8").read().encode()
+      ).hexdigest(), _HISTOLOGY_SHA_AT_START)
 
 
 # ===========================================================================

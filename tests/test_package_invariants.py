@@ -891,7 +891,7 @@ _CHAIN_CALL_MARKERS = ("exec_chain", "spec_from_file_location",
 _STRING_PREFILTER = ("exec", "spec_from_file_location", "SourceFileLoader",
                      "runpy")
 
-# THE exec() ALLOWLIST IS CLOSED AND HAS THREE MEMBERS, EACH WITH AN ARGUMENT.
+# THE exec() ALLOWLIST IS CLOSED AND HAS FIVE MEMBERS, EACH WITH AN ARGUMENT.
 #
 # tests/test_storage_query_layer.py unparses two PRE-FIX functions out of a git
 # blob and exec's them into a throwaway namespace, so that its negative controls
@@ -919,9 +919,33 @@ _STRING_PREFILTER = ("exec", "spec_from_file_location", "SourceFileLoader",
 # pure string function would build neither client but would drag both libraries
 # in. Only the one FunctionDef is compiled, into a namespace holding `re`.
 # Nothing here execs a file in the working tree.
+#
+# tests/test_extraction_histology.py (Test 9) and
+# tests/test_agent_age_units_and_sex_filter.py both exec a PATCHED COPY of a
+# shipped module -- histology.py with re.IGNORECASE stripped from the two lung
+# abbreviation patterns, filtering.py with the age-unit conversion or the sex
+# predicate reverted -- to plant the defects their controls then require to
+# fire. Same argument as test_observability_logging.py, and the same CLAUDE.md
+# instruction: "prefer a demonstration that mutates a COPY of the source and
+# execs it over one that edits a file in place".
+#
+# THE SECOND FILE COULD NOT USE THE git show ROUTE THE OTHER THREE MEMBERS USE,
+# and the reason is worth recording rather than being rediscovered. Its most
+# valuable control compares the shipped Stage 4 node against one wired to the
+# pre-fix histology extractor. Read out of git that control is worthless twice
+# over: HEAD now CARRIES the fix, so it would compare the fixed module with
+# itself; and exec'ing a pre-fix filtering.py runs its
+# `from oncotriage.extraction.histology import ...` line, which resolves to the
+# LIVE module, so the "old" side runs the NEW extractor and reports no
+# difference for the wrong reason. That is not hypothetical -- it happened, and
+# the committed control asserts the trap directly before relying on the wiring.
+# Neither file execs a file in the working tree; both hash the source before and
+# after and fail if it moved.
 _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    "tests/test_observability_logging.py",
-                   "tests/test_indexer_admission_filters.py"}
+                   "tests/test_indexer_admission_filters.py",
+                   "tests/test_extraction_histology.py",
+                   "tests/test_agent_age_units_and_sex_filter.py"}
 
 
 def _repo_py_files():

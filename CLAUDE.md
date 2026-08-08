@@ -71,8 +71,8 @@ the same selector).
 
 **WHAT ENFORCES ALL OF THIS.** `tests/test_package_invariants.py` **section 1c**
 scans every `.py` in the repository for a call to `exec_chain`, a call to
-`exec()` outside a one-member argued allowlist
-(`tests/test_storage_query_layer.py`, which execs git blobs), or a by-location
+`exec()` outside a **closed five-member argued allowlist** (two exec git blobs,
+three exec a patched in-memory copy — see the rule below), or a by-location
 module load — **re-parsing string literals as Python** so that
 `ns["exec_chain"](...)` hidden in a subprocess probe is caught and so that prose
 about the exec chain is not. Six planted controls, each fired. **Section 5**
@@ -300,7 +300,7 @@ The rules, in force and enforced:
   **`oncotriage/fhir/explore.py` imports matplotlib, seaborn and pandas at module scope** and that is the one deliberate exception, with **`oncotriage/ablation/figures.py`** the second: seven of explore's twelve functions plot and all nine of figures' do, and section 2 pre-imports those three before arming its traps — the same allowance it makes for openai, qdrant_client, numpy and langgraph. **Pass 20f-4 moved the second exception out of `analysis.py`**, which was 1,976 lines with 24 top-level definitions of which nine touched `plt`; it is 1,503 lines and imports no plotting library now. That does **not** make importing `analysis` matplotlib-free — `main()` calls all nine, so `analysis` imports `figures` at module scope and check 1b forbids deferring it — it makes the exception 495 lines wide instead of 1,976, and it lets anything that wants the statistics without the figures import `ablation.common` and the statistics functions directly.
   The `glob` in `paths` was the one exception until pass 20c-2b, and pass 20c-2c found that the fix had a hole: `oncotriage/registries/mesh.py` still wrote `from oncotriage.paths import data_MeSH_path` at module scope, and a `from X import name` is an **attribute read**, so it fired the lazy resolver — meaning importing the *agent* globbed the whole sibling tree and raised on any machine without it. Check 2c now imports **every** package module in its own subprocess with the root pointed at a directory that does not exist. Note that no `open` trap could ever have caught this: `glob.glob` uses `os.scandir`.
   **The same trap applies to a numbered entry point's module scope**, which is why `07- FHIR Parser.py`, `09- MeSH Cancer Site Relevance Filter.py`, `13- LangGraph Agent.py` and `20- Drift Detection.py` import their lazy paths INSIDE the `__main__` guard.
-- **Nothing calls `exec_chain`, calls `exec()`, or loads a module by location.** `exec_chain` no longer exists. The one allowed `exec()` in the repository is `tests/test_storage_query_layer.py`, which execs two pre-fix functions unparsed out of a git blob so its negative controls run the real replaced code rather than a retyped copy; that allowlist is closed, argued, and checked for staleness. Section 1c enforces all of it with six planted controls.
+- **Nothing calls `exec_chain`, calls `exec()`, or loads a module by location.** `exec_chain` no longer exists. The allowed `exec()`s live in a **closed five-member allowlist**, each entry argued at `_EXEC_ALLOWLIST` in `tests/test_package_invariants.py` and each checked for staleness (an entry whose file no longer execs anything fails). **This note said "one" through three additions and was wrong by four**; the members are `tests/test_storage_query_layer.py` and `tests/test_indexer_admission_filters.py`, which unparse pre-fix code out of a **git blob** so their negative controls run what actually shipped, and `tests/test_observability_logging.py`, `tests/test_extraction_histology.py` and `tests/test_agent_age_units_and_sex_filter.py`, which exec a **patched in-memory copy** of a shipped module to plant a defect their controls then require to fire. The two shapes are not interchangeable: git is right for code that was REPLACED, and a patched copy is right for a fix that is AT HEAD, where a git blob would compare the fixed module with itself. Section 1c enforces all of it with six planted controls.
 - **A numbered file must not import a package name at module scope that it never reads.** That is what a re-export IS, and it is the first half of rebuilding a shim. Section 5 scans for it with a planted control. One exemption, argued: `24- Airflow Manager.py` imports two names its byte-verbatim COMMENTED menu calls, and comments are invisible to an AST walk.
 - The three functions that used to read a value out of the shared namespace at call time — `get_model_cost`, `resolve_qdrant_collection`, `get_age_reference_date` — **took that value as an optional argument, and pass 20f-3 deleted all four parameters** (`pricing_config`, `client`, `collection_name`, `snapshot_date`). Re-measured by AST first: 29 call sites across the package, the entry points and the tests, not one passing any of them. **It is a behaviour change** — three public signatures narrowed, so an outside caller passing one now gets a `TypeError`. The one thing pass 20e said had to be settled first was `get_age_reference_date`'s docstring, which called its argument "the supported patch point"; it was not, and had not been since pass 20d-1 — `tests/test_fhir_birth_date_and_demographics.py` section 3 sets `config.DATA_SNAPSHOT_DATE`, which the function reads at **call** time. The private sentinel `_SNAPSHOT_NOT_SUPPLIED` went with the parameter.
 - `pip install -e .` from `03- Code/` makes the package importable from anywhere. Without it, each entry point's own six-line block puts the code directory on `sys.path` and prints that it did.
@@ -378,7 +378,7 @@ ONCOTRIAGE_QDRANT_URL=http://localhost:6333 python "11- RAG Trial Indexer.py" --
 ```bash
 # The eleven component tests (pass 20d-1). No quoting: the names have no spaces.
 # None needs a network, a key, a live server, or a cent of spend.
-python tests/test_extraction_histology.py                          # 103 checks
+python tests/test_extraction_histology.py                          # 133 (was 103; the promotion pass added Test 9, the two lung abbreviations' case-insensitivity)
 python tests/test_agent_mesh_boost_and_quality_gate.py             #  89 (was 54; the two-knob quality gate added Test 7)
 python tests/test_registries_mesh_pan_cancer_resolution.py         #  58
 python tests/test_registries_cancer_codes_and_stage_extraction.py  # 136
@@ -435,6 +435,12 @@ python tests/test_observability_logging.py                          #  82
 # This line is new: the file has existed since the admission pass with its count
 # recorded only in prose, so an operator working from this block never ran it.
 python tests/test_indexer_admission_filters.py                      # 175
+
+# The promotion pass. Same shape, same directory. No network, no keys, no spend,
+# no git history, and NOT in the collision matrix (it writes nothing anywhere --
+# every plant goes into an in-memory copy, and the two source files it reads are
+# written by neither of the suite's two writers). ~3 s.
+python tests/test_agent_age_units_and_sex_filter.py                 # 112
 
 pip install -e .                                         # makes `oncotriage` importable anywhere
 ```
@@ -1417,9 +1423,10 @@ wider than what they replaced.**
 
 - **Section 1c is new and is the widest thing in the file.** The old inventories
   asserted a property of ten named files; this scans **every `.py` in the
-  repository** for a call to `exec_chain`, a call to `exec()` outside a
-  one-member argued allowlist, or a by-location module load. The old checks
-  could not have caught a *new* file that started exec'ing; this does.
+  repository** for a call to `exec_chain`, a call to `exec()` outside the
+  argued allowlist (one member then, five now), or a by-location module load.
+  The old checks could not have caught a *new* file that started exec'ing; this
+  does — and it did, twice, in the promotion pass.
 - **Section 5 keeps the half of the old section that still has a subject** —
   "does every name imported out of the package actually exist there" — and asks
   it of **every file in the tree** rather than of three, without running any of
@@ -3146,6 +3153,94 @@ explaining its deletion, so a substring search selects the commit that REMOVED
 it and every control then tests the fix against itself — the lesson
 `tests/test_storage_query_layer.py` had to learn. It is the third member of
 `test_package_invariants.py`'s `_EXEC_ALLOWLIST`, argued there.
+
+### Three Stage 4 fixes, and the pass that committed their proof
+
+**THE FIXES (commit `1fcecbb`). Each changes which trials survive.**
+
+- **`oncotriage/extraction/histology.py`: `_NSCLC_ABBREV_RE` and
+  `_SCLC_ABBREV_RE` gained `re.IGNORECASE`**, which every other pattern in the
+  module already had. Lower-case "nsclc" produced NO tag, and an untagged trial
+  is filtered by nobody — `is_histology_mismatch()` returns False the moment
+  either side's tag set is empty — so a small cell trial reached a non-small
+  cell patient. Case-folding widens what `_SCLC_ABBREV_RE`'s negative lookbehind
+  excludes, and that costs nothing because **the lookbehind is unreachable in
+  both cases**: `\bSCLC\b` needs a word boundary before the S and the preceding
+  N is a word character. Measured on the 14,324-trial corpus: **0 trials change
+  tags**, because ClinicalTrials.gov writes these abbreviations upper-case. The
+  effect is on the PATIENT side, and trial tags are written at INDEX time, so
+  the trial side would need a re-index to move at all.
+- **`agent/filtering.py:_parse_age_bound` converts the unit** to FRACTIONAL
+  years. It took the digits and discarded the unit, so `"240 Months"` — twenty
+  years — read as two hundred and forty and stopped excluding anybody, and a
+  `min_age` of `"6 Months"` read as six years. Nothing was recorded, because
+  digits WERE found. Six months is 0.5: rounding moves the boundary in the
+  direction the fix exists to correct. The number and its unit come from ONE
+  match, so a unit belonging to a later number is not pulled back onto the
+  first. An unrecognised unit is recorded in `AGE_PARSE_FAILURES` under a key
+  NAMING the unit and the bound is unusable — **recovery unchanged: the trial is
+  kept and the age check is skipped**. Measured: 167 bound values across 158
+  trials change; at age 5 the filter now drops 6 it kept and keeps 104 it
+  dropped.
+- **`agent/filtering.py`: an unusable patient sex stops excluding.** The old
+  predicate kept a trial when its sex was ALL or equalled the patient's, so a
+  patient whose sex did not parse failed it against all 2,485 sex-specific
+  trials. The same line called `.upper()` on the patient's sex unguarded, and
+  `oncotriage/fhir/parser.py` sets `sex = patient_resource.get('gender',
+  'unknown')` — so a `gender` present and **JSON-null arrives as None** (a
+  `.get` default does not apply to a key that exists) and RAISED rather than
+  dropping. There is no sentinel, so the rule is not "equals some magic string"
+  but "can the trial vocabulary (ALL / MALE / FEMALE) express it".
+  `SEX_UNKNOWN_KEPT` records the survivals **apart from `sex_dropped`**, because
+  a real mismatch and a missing field are different findings with different
+  owners. Measured: zero effect on today's cohort — all 1,000 bundles carry
+  female or male.
+
+Both new records are **module-level counters, not keys in Stage 4's returned
+dict**, on the `AGE_PARSE_FAILURES` precedent: the twelve characterization
+fixtures diff that dict field by field.
+
+**THE PROOF IS COMMITTED (the promotion pass), and it lives in two files.**
+`tests/test_extraction_histology.py` **Test 9** (103 → **133**) and
+`tests/test_agent_age_units_and_sex_filter.py` (**112**, new). The second is a
+NEW file rather than an addition, and the reason is in its docstring: five files
+touch `node_rule_based_filter` or `_parse_age_bound`, and the only one that
+covers both — `tests/test_degraded_dependencies.py` — is a **collision-matrix
+member**, so forty checks needing no serialization would sit behind a six-minute
+serial run. Pass 20f-1's precedent is four new files for four fixes.
+
+**THE MOST VALUABLE CONTROL IS THE ONE THAT CANNOT BE WRITTEN WITH `git show`,
+and it is worth reading before writing the next one.** The scratch harness
+compared the shipped Stage 4 node against the pre-fix node read out of
+`git show HEAD:`. It reported NO DIFFERENCE — and not because there is none:
+exec'ing a pre-fix `agent/filtering.py` runs its
+`from oncotriage.extraction.histology import ...`, **which resolves to the LIVE,
+already-fixed module**, so the "old" side ran the NEW extractor and agreed with
+itself. Committed unchanged it would have been worse still, because HEAD now
+CARRIES the fix. The committed version therefore: plants the defect into an
+**in-memory copy**, **asserts the trap directly** (a freshly exec'd filtering
+copy IS wired to the live histology module), asserts the rebinding took, and
+requires the two extractors to **disagree by behaviour** before comparing
+anything built on them. It reads no git, so it does not die in a tree without
+`.git` the way three files in this suite still do.
+
+**A CONTROL THAT ABORTS IS NOT A CONTROL, and this pass shipped that defect
+twice before catching it.** `_plant()` raises `_PlantFailed` — never
+SyntaxError — so a malformed plant is a RECORDED failure instead of a traceback
+hiding every check below. And `run()` converts a node RAISE into a marker
+string: reverting the sex normalisation makes the node raise `AttributeError`
+on a null sex, which is exactly what Test 3 exists to catch, and with a bare
+call that raise escaped `check()` while its argument was being evaluated — the
+file died with no summary, reporting one traceback where it owed 112 results.
+
+**FIVE REVERTS, FIVE CAUGHT, run rather than argued.** The package and `tests/`
+are copied to a temp tree, one production fix is reverted THERE, and the
+committed tests are run against the copy (with a preflight asserting the COPY is
+what imports, on realpaths, because macOS `/var` is a symlink to `/private/var`):
+IGNORECASE removed (133 → 114 pass / 19 fail), the conversion removed (23 fail),
+the result rounded (16 fail), the old sex predicate (19 fail), the unguarded
+`.upper()` (7 fail). Baseline on the unreverted copy is green both files.
+Nothing in the repository is written.
 
 ## Persistence and observability
 
