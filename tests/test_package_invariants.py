@@ -966,13 +966,44 @@ _STRING_PREFILTER = ("exec", "spec_from_file_location", "SourceFileLoader",
 # with. Nothing execs a file in the working tree; the source is hashed before
 # any plant and compared at the end against a baseline, with a non-degeneracy
 # probe so that comparison cannot be a tautology.
+#
+# tests/test_agent_trial_verdict_normalization.py (the trial-verdict item) is
+# the eighth, and it execs a PATCHED COPY of three modules:
+# oncotriage/agent/evaluation.py with the fabricated-rejection clobber restored,
+# with the non-object drop reverted, with either audit append deleted, with the
+# malformed counter silenced and with the disqualification check made to yield
+# to an unreadable label; oncotriage/agent/terminal.py with Stage 6's
+# fall-through to near_misses restored; and oncotriage/agent/state.py with the
+# normalizer made to guess a verdict and with its bool test moved behind a dict
+# lookup so `1` resolves as `True`.
+#
+# git show COULD NOT SUPPLY ANY OF THEM, for three separate reasons rather than
+# one. normalize_trial_verdict has never existed before, so there is no prior
+# revision to compare with. Several controls revert ONE line while leaving the
+# rest of the item correct -- a state no commit ever had. And the trap the
+# fifth member recorded applies here in full: an exec'd copy of evaluation.py
+# runs its own `from oncotriage.agent.state import ...`, which resolves to the
+# LIVE, already-correct module, so a control planted in state.py is invisible
+# through a planted evaluation module. That is not reasoned about in the test,
+# it is ASSERTED as a precondition before any control runs, and the two state.py
+# controls are probed directly for exactly that reason.
+#
+# Section 8 uses the same mechanism for the opposite purpose: it RECONSTRUCTS
+# the pre-fix module by reverting this item's two behavioural lines in memory,
+# and requires it to agree with the shipped module on ten well-formed responses
+# -- a git blob would be the fixed module the moment the item is committed,
+# which is the failure test_storage_query_layer.py had to fix, and a shallow
+# clone has no history at all. Nothing execs a file in the working tree; all
+# three sources are hashed before any plant and compared at the end, with a
+# non-degeneracy probe so the comparison cannot be a tautology.
 _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    "tests/test_observability_logging.py",
                    "tests/test_indexer_admission_filters.py",
                    "tests/test_extraction_histology.py",
                    "tests/test_agent_age_units_and_sex_filter.py",
                    "tests/test_extraction_stage_m_category.py",
-                   "tests/test_extraction_stage_non_oncology_guard.py"}
+                   "tests/test_extraction_stage_non_oncology_guard.py",
+                   "tests/test_agent_trial_verdict_normalization.py"}
 
 
 def _repo_py_files():

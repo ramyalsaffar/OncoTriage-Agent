@@ -25,7 +25,12 @@ logger import it from there, and neither imports the other.
 from datetime import datetime
 from typing import Dict
 
-from oncotriage.agent.state import TrialMatchState
+from oncotriage.agent.state import (
+    TRIAL_VERDICT_ELIGIBLE,
+    TRIAL_VERDICT_NOT_EVALUABLE,
+    TrialMatchState,
+    normalize_trial_verdict,
+)
 from oncotriage.observability import get_logger
 from oncotriage.registries.primary_cancer import _resolve_primary_cancer
 from oncotriage.utils import deduplicate_by_display, get_age_reference_date
@@ -222,28 +227,41 @@ def node_finalize(state: TrialMatchState) -> dict:
     evaluations = state.get("evaluations", [])
 
     # ── Normalize eligible field ─────────────────────────────────────────
-    # GPT-4o returns "eligible" / "not_eligible" / "not_evaluable". Handle edge cases.
-    _ELIGIBLE_NORM = {
-        True:  "eligible",
-        False: "not_eligible",
-        "true":  "eligible",
-        "false": "not_eligible",
-        "yes":   "eligible",
-        "no":    "not_eligible",
-    }
+    #
+    # The vocabulary and the synonym map moved to oncotriage/agent/state.py,
+    # which Stage 5 also calls. THE MAP THAT USED TO BE HERE COULD NOT BE
+    # REACHED: Stage 5 ran first and forced every value outside its own
+    # three-member tuple to "not_eligible", so boolean True and "Eligible"
+    # arrived already destroyed and this map's whole recovery vocabulary was
+    # dead code that looked live. One normalizer now answers for both stages.
+    #
+    # AN UNRESOLVABLE LABEL BECOMES not_evaluable RATHER THAN FALLING THROUGH
+    # TO near_misses, which is what the deleted `# else: leave as-is` comment
+    # arranged. That fall-through is the same fabricated rejection Stage 5 has
+    # just stopped making, one stage later and reachable by any caller that
+    # builds `evaluations` without Stage 5. On every path the pipeline actually
+    # takes it is a no-op, because Stage 5 now emits only the canonical three.
+    _unresolved_verdicts = []
 
     for e in evaluations:
         raw = e.get("eligible")
-        if isinstance(raw, bool):
-            e["eligible"] = _ELIGIBLE_NORM[raw]
-        elif isinstance(raw, str):
-            normalized = raw.strip().lower()
-            e["eligible"] = _ELIGIBLE_NORM.get(normalized, normalized)
-        # else: leave as-is (will fall through to near_misses)
+        verdict, _source = normalize_trial_verdict(raw)
+        if verdict is None:
+            _unresolved_verdicts.append(type(raw).__name__)
+            verdict = TRIAL_VERDICT_NOT_EVALUABLE
+        e["eligible"] = verdict
+
+    if _unresolved_verdicts:
+        log.warning("trial-level verdict labels reached Stage 6 unresolvable; "
+                    "recording them as not evaluable rather than as rejections",
+                    stage=6, node=TERMINAL_NODE_FINALIZE,
+                    patient_id=patient_data["patient_id"],
+                    count=len(_unresolved_verdicts),
+                    error_type=",".join(sorted(set(_unresolved_verdicts))))
 
     # ── Split into matches vs. near-misses vs. non-evaluations ───────────
-    _ACTIONABLE = frozenset({"eligible"})
-    _UNEVALUABLE = frozenset({"not_evaluable"})
+    _ACTIONABLE = frozenset({TRIAL_VERDICT_ELIGIBLE})
+    _UNEVALUABLE = frozenset({TRIAL_VERDICT_NOT_EVALUABLE})
 
     # Build score lookup from filtered_trials by nct_id.
     # The boosted score, the unboosted score and the boost itself are all

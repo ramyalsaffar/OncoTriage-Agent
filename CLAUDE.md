@@ -451,6 +451,12 @@ python tests/test_extraction_stage_m_category.py                    # 119
 # directory, also not in the collision matrix. ~2 s.
 python tests/test_extraction_stage_non_oncology_guard.py            #  80
 
+# The trial-verdict pass. Same shape, same directory. No network, no keys, no
+# spend -- every model response is a literal served by a stub installed through
+# oncotriage/agent/deps.py -- no git history, no corpus, and NOT in the
+# collision matrix. ~25 s.
+python tests/test_agent_trial_verdict_normalization.py              # 161
+
 pip install -e .                                         # makes `oncotriage` importable anywhere
 ```
 
@@ -3482,6 +3488,98 @@ guard to the stage-GROUP tier** (which suppresses a legitimate stage for any
 patient who also has CKD). It is the seventh member of `_EXEC_ALLOWLIST`, and
 `git show` could not have supplied any of these controls: the patient side has
 never had this guard, so there is no revision to compare against.
+
+### Stage 5 stopped inventing rejections (the trial-verdict pass)
+
+**AN UNRECOGNISED TRIAL-LEVEL VERDICT WAS RECORDED AS `not_eligible`.** The
+post-processing loop in `oncotriage/agent/evaluation.py` opened with
+`if eval_result.get("eligible") not in _TRIAL_LEVEL_LABELS: eval_result
+["eligible"] = "not_eligible"` — a rejection, a statement that this trial
+assessed the patient and turned them down, which the model never made. Every
+other unreadable answer in that file resolves to "not evaluated" and says why:
+Step 2 for a trial returned with no criteria, Step 3's remap branch for a
+rejection whose every disqualifier was out of vocabulary, `_normalize_arm` one
+level down for a criterion status. The zero-criteria branch rescued only the
+entries with NO criteria; an entry WITH criteria kept the fabricated rejection
+and flowed into the patient's near-miss list.
+
+**IT WAS DESTROYING THE VALUES THE PIPELINE'S OWN NORMALIZER EXISTED TO RESCUE,
+and that was found by running rather than by reading.** `node_finalize` has
+always carried a six-entry map for boolean `True`, `"Eligible"` and `"yes"` —
+and Stage 5 runs first, so the clobber reached those values before the map could
+and the map could never be observed to disagree. Measured on the shipped code:
+`True` → `not_eligible` → **near_misses**. So the vocabulary was written twice
+and the two copies disagreed about the same input, invisibly.
+
+**ONE VOCABULARY, ONE NORMALIZER, TWO CALLERS.** `oncotriage/agent/state.py`
+now holds `TRIAL_VERDICT_*`, the closed `TRIAL_VERDICTS`, the closed
+`VERDICT_SOURCES` and `normalize_trial_verdict(raw) -> (verdict, source)`. It
+**returns `None` rather than a default**, because every default available there
+is a claim: `not_eligible` asserts a rejection, `eligible` asserts a match, and
+`not_evaluable` is a policy about an uninterpretable answer rather than a
+reading of one. The policy lives at each call site, where the criteria are in
+scope. The recovery vocabulary is deliberately small — case-folding and
+whitespace are parsing, not guessing, and the four synonyms are Stage 6's own,
+adopted verbatim rather than invented. **The bool test runs before any dict
+lookup**: `True` and `1` are the same dict key in Python, so one map holding
+both would answer for the integer 1 as though the model had written `true`.
+
+**THE DISQUALIFICATION CHECK OUTRANKS AN UNREADABLE LABEL, and that is the one
+decision not in the brief.** Criteria are the model's evidence; the trial-level
+label is its summary of them. An unreadable summary does not delete a criterion
+the model marked `not_met`, and recording such a trial as "not evaluated" would
+hide a stated failure and hand a clinician a candidate the model had already
+disqualified — the same fabrication pointing the other way. So the rejection
+stands, and the label defect is recorded in `verdict_normalizations` rather than
+in `unevaluable_trials`, which feeds a log line reading "these are not
+rejections".
+
+**A TOP-LEVEL ENTRY THAT IS NOT AN OBJECT CRASHED THE WHOLE PATIENT.** The
+response was validated as a LIST and its MEMBERS were not, so a bare NCT id
+string, a number, a null or a nested list reached the enrichment loop and raised
+`AttributeError: 'str' object has no attribute 'get'` — confirmed by running,
+at `evaluation.py:1091`, for all four shapes. Nothing catches it: `graph.invoke`
+wraps nothing. Such an entry is **dropped**, counted in the module-level
+`MALFORMED_EVALUATION_ENTRIES` (keyed by JSON type name, on `AGE_PARSE_FAILURES`'
+footing) and logged — never repaired and never turned into a verdict, because it
+carries no nct_id and there is nothing to attribute one to. **The trial is not
+lost**: the reconciliation block already records an absent trial by nct_id, and
+the test proves it does.
+
+**MEASURED AGAINST THE PRODUCTION DATABASE, read-only, 1,106 rows before and
+after.** The raw label is not a column, so the exact count is not recoverable;
+what is, is the only stored population the changed line can reach — a
+`not_eligible` row with criteria and no surviving disqualifier. **43 of 12,862
+(0.334%), across 43 inferences, and all 43 carry the model's own "Known
+disqualifier: …" explanation**, which a fabricated rejection would not (it keeps
+the model's positive text). **Zero stored evaluations show the signature.** The
+model's out-of-vocabulary rate is not zero, though: **212 stored criterion
+entries carry an exclusion-arm status on an inclusion criterion**.
+
+**VERIFIED BY RUNNING.** All 24 existing test files at their documented counts,
+`tests/test_package_invariants.py` unchanged at **247** (the new file is the
+**eighth** `_EXEC_ALLOWLIST` member, argued there — `git show` could supply none
+of its controls: `normalize_trial_verdict` has no prior revision, several
+controls revert one line while leaving the rest correct, and an exec'd copy of
+`evaluation.py` binds the LIVE `state` module, which the test asserts as a
+precondition before relying on it), the serial runner **5/5**, and
+`fixture_replay.py` **12/12 clean without recapture**. **No money was spent.**
+**Eight reverts, eight caught** — each production fix broken in a copytree'd
+copy with `PYTHONPATH` pointed at it (the first version of that harness reported
+**0/8** because the editable install meant the copy was never imported, so a
+preflight now asserts on realpaths that it is), and the run's own summary
+required each time.
+
+**THE TEST FILE SHIPPED TWO OF THIS PROJECT'S RECURRING DEFECTS BEFORE THE
+REVERT HARNESS FOUND THEM, and neither was visible by reading.** A bare call
+into production code let a planted `AttributeError` and a planted `TypeError`
+escape through `check()`'s argument list, and a bare `log_records(...)[0]` raised
+`IndexError` when a defect stopped a record being emitted — the run reported one
+traceback where it owed 161 results. Both are closed the way
+`tests/test_storage_query_layer.py` and
+`tests/test_dashboard_reproducibility_tab.py` had to close them: the drivers
+return a result-shaped stand-in carrying `raised`, and `field(records, key)`
+returns a named absence instead of indexing.
 
 ## Persistence and observability
 

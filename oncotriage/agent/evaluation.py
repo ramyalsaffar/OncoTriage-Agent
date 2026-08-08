@@ -34,12 +34,21 @@ nothing, replay would go to the network instead of serving its recording.
 
 import json
 import time
+from collections import Counter
 from typing import Dict, List, Tuple
 
 from oncotriage import config
 from oncotriage.agent import deps
 from oncotriage.agent.patient import _create_patient_summary
-from oncotriage.agent.state import TrialMatchState
+from oncotriage.agent.state import (
+    TRIAL_VERDICT_ELIGIBLE,
+    TRIAL_VERDICT_NOT_ELIGIBLE,
+    TRIAL_VERDICT_NOT_EVALUABLE,
+    VERDICT_SOURCE_CANONICAL,
+    VERDICT_SOURCE_UNRECOGNIZED,
+    TrialMatchState,
+    normalize_trial_verdict,
+)
 from oncotriage.config import (
     CHARS_PER_TOKEN,
     MATCHING_MAX_TOKENS,
@@ -252,6 +261,72 @@ _NOT_EVALUABLE_REASONS = (
 
 # Finish reason the API returns when it stopped because it hit max_tokens.
 FINISH_REASON_LENGTH = "length"
+
+
+# ---------------------------------------------------------------------------
+# Malformed response entries
+# ---------------------------------------------------------------------------
+
+# A top-level entry in the model's JSON array that is not an object at all.
+#
+# The response is validated as a LIST and nothing below validated its MEMBERS,
+# so a list holding a bare NCT id string, a number or a null reached the
+# metadata-enrichment loop and raised AttributeError on ``.get`` -- uncaught,
+# out through node_gpt4o_evaluation and out through graph.invoke, which wraps
+# nothing. Confirmed by running: 'str' object has no attribute 'get', at the
+# first statement of that loop, for a string, an int, a list and a null alike.
+#
+# A crash is the safe direction and it is not the right one: it costs the whole
+# patient's run -- every trial in it, including the well-formed entries in the
+# same response -- for one malformed element, and it is a recovery the file
+# already performs one level down, where _normalize_arm drops a criterion that
+# is not an object. So the entry is DROPPED rather than repaired, and dropping
+# is the whole of it: a non-object carries no nct_id, so there is nothing to
+# attribute a verdict to and no verdict of any kind may be manufactured from
+# it. The trial it was meant to answer for, if it was meant to answer for one,
+# is then absent from the response and the reconciliation block at the end of
+# the node records it as not evaluable by nct_id -- which is a fact about a
+# trial rather than a guess about a fragment.
+#
+# Keyed by the JSON type name, capped at a handful of keys by construction, so
+# a run answers "how often, and of what shape". Module-level, following
+# AGE_PARSE_FAILURES in oncotriage/agent/filtering.py, and deliberately NOT a
+# key in the returned dict: the twelve characterization fixtures diff Stage 5
+# field by field and a new field means recapturing all twelve.
+MALFORMED_EVALUATION_ENTRIES = Counter()
+
+# Longest fragment of a dropped entry kept for the log line. Long enough to
+# recognise a bare NCT id or a stray sentence, short enough that a pathological
+# element cannot put the model's clinical prose into a durable record.
+_MALFORMED_ENTRY_PREVIEW_LEN = 60
+
+
+def _partition_response_entries(parsed: List) -> Tuple[List[Dict], List]:
+    """Split one parsed chunk into usable objects and unusable entries.
+
+    Returns ``(objects, dropped)``. Nothing is mutated and nothing is coerced;
+    the caller records the drops.
+    """
+    objects = []
+    dropped = []
+    for entry in parsed:
+        if isinstance(entry, dict):
+            objects.append(entry)
+        else:
+            dropped.append(entry)
+    return objects, dropped
+
+
+# Why a trial-level verdict was recorded as not evaluable. Free text, matching
+# the two reasons already written into `unevaluable_trials` below, but named
+# because the test that proves this path asserts on it and a literal in two
+# files is a literal that drifts.
+#
+# NOT one of the NOT_EVALUABLE_* constants above: those are values of the
+# `not_evaluable_reason` FIELD and _unevaluable_entry() indexes an explanation
+# table with them, so a fourth member there would be a KeyError waiting for the
+# first caller who passed it.
+UNEVALUABLE_UNRECOGNIZED_VERDICT = "trial-level verdict label not recognised"
 
 
 def estimate_output_tokens(trials: List[Dict]) -> int:
@@ -1058,7 +1133,30 @@ CLINICAL TRIALS:
                 "stage_timings": {**state.get("stage_timings", {}), "gpt4o_evaluation": round(prior_gpt4o_time + elapsed, 3)}
             }
 
-        evaluations.extend(parsed)
+        # A well-formed response is a list OF OBJECTS, and only the list half
+        # was checked. See MALFORMED_EVALUATION_ENTRIES for why a non-object is
+        # dropped and counted here rather than left to raise AttributeError in
+        # the enrichment loop below.
+        _objects, _dropped = _partition_response_entries(parsed)
+        if _dropped:
+            for _entry in _dropped:
+                MALFORMED_EVALUATION_ENTRIES[type(_entry).__name__] += 1
+            log.warning("the model returned entries that are not objects; "
+                        "dropping them -- a non-object carries no nct_id and "
+                        "cannot become a verdict. Any trial they were meant to "
+                        "answer for is recorded by the reconciliation below",
+                        stage=5, event="malformed_entry",
+                        count=len(_dropped),
+                        # The TYPE is the diagnosis; the fragment is capped and
+                        # goes to the console only, on the same rule as the
+                        # parse-failure preview above -- it is model output
+                        # about this patient and the structured record is
+                        # durable and indexed.
+                        error_type=",".join(sorted(
+                            {type(e).__name__ for e in _dropped})))
+            console.out("  [Stage 5] dropped non-object entries: " + "; ".join(
+                repr(e)[:_MALFORMED_ENTRY_PREVIEW_LEN] for e in _dropped[:5]))
+        evaluations.extend(_objects)
 
     if truncations_observed:
         log.info("responses hit the output ceiling", stage=5,
@@ -1115,10 +1213,15 @@ CLINICAL TRIALS:
     _INCLUSION_STATUSES = frozenset({"met", "not_met", "not_evaluable"})
     _EXCLUSION_STATUSES = frozenset({"not_violated", "violated", "not_evaluable"})
 
-    _TRIAL_LEVEL_LABELS = ("eligible", "not_eligible", "not_evaluable")
+    # The trial-level vocabulary lives in oncotriage/agent/state.py and is
+    # reached ONLY through normalize_trial_verdict, which node_finalize calls
+    # too. The three-member tuple that used to be here was consulted by exactly
+    # one `not in` test; leaving it as a local nothing reads is the declared-
+    # and-never-read shape the project's own scan exists to report.
 
     label_remaps = []       # audit log: criterion labels outside their vocabulary
     unevaluable_trials = []  # audit log: trials that could not be evaluated
+    verdict_normalizations = []  # audit log: trial-level labels not written canonically
 
     # ── Not-applicable criteria are scored by neither party ──────────────────
     #
@@ -1256,9 +1359,53 @@ CLINICAL TRIALS:
     for eval_result in evaluations:
         nct_id = eval_result.get("nct_id", "")
 
-        # Normalize unexpected trial-level labels
-        if eval_result.get("eligible") not in _TRIAL_LEVEL_LABELS:
-            eval_result["eligible"] = "not_eligible"
+        # ── Step 0: the trial-level verdict ─────────────────────────────────
+        #
+        # THIS LINE USED TO READ `eligible = "not_eligible"` FOR ANYTHING
+        # OUTSIDE THE VOCABULARY, and that is a rejection: a statement that
+        # this trial assessed the patient and turned them down. The model never
+        # said it. It is the one place in this file that resolved an
+        # uninterpretable answer INTO a verdict; every other place resolves one
+        # into "not evaluated" and says why -- Step 2 for a trial the model
+        # returned no criteria for, Step 3's remap branch for a rejection whose
+        # every disqualifier was out of vocabulary, and _normalize_arm one
+        # level down for a criterion status.
+        #
+        # It was worse than a mislabel. The clobber ran BEFORE node_finalize,
+        # whose own synonym map has always resolved boolean True, "Eligible"
+        # and "yes" correctly -- so this line was destroying exactly the values
+        # the pipeline's own downstream normalizer existed to rescue, and the
+        # map could never be reached to disagree with it. Measured on the
+        # shipped code: `True` -> not_eligible -> near_misses. See
+        # normalize_trial_verdict, which both stages now call.
+        #
+        # The verdict is set to "not_evaluable" here and NOT recorded yet. The
+        # recording waits for the branch chain below, because Step 3 can still
+        # reach a supported verdict for this entry out of the criteria -- and
+        # unevaluable_trials feeds a log line that says "these are not
+        # rejections", so an entry that ends as one must not be in it.
+        raw_verdict = eval_result.get("eligible")
+        verdict, verdict_source = normalize_trial_verdict(raw_verdict)
+        verdict_unrecognized = verdict_source == VERDICT_SOURCE_UNRECOGNIZED
+        if verdict_source != VERDICT_SOURCE_CANONICAL:
+            verdict_normalizations.append({
+                "nct_id": nct_id,
+                # repr, capped: the label is model output of unknown type and
+                # unknown length, and "" and None must not read alike.
+                "original_label": repr(raw_verdict)[:_MALFORMED_ENTRY_PREVIEW_LEN],
+                # The TYPE is what the log line carries, because it diagnoses
+                # the defect (a bool where a string was asked for, a null, a
+                # nested object) and carries no clinical content. The label
+                # TEXT stays in this list and out of the record: it is model
+                # output of unbounded content and `original_label` is not on
+                # LOGGABLE_FIELDS, so passing it would be dropped anyway.
+                "original_type": type(raw_verdict).__name__,
+                "resolved_to": verdict or TRIAL_VERDICT_NOT_EVALUABLE,
+                "source": verdict_source,
+            })
+        eval_result["eligible"] = (
+            verdict if verdict is not None else TRIAL_VERDICT_NOT_EVALUABLE
+        )
 
         inc = eval_result.get("inclusion_criteria", [])
         exc = eval_result.get("exclusion_criteria", [])
@@ -1284,13 +1431,23 @@ CLINICAL TRIALS:
         # verdict the model never reached. It gets its own trial-level outcome
         # so non-evaluation is counted instead of masquerading as a rejection.
         if total == 0:
-            if eval_result["eligible"] != "not_evaluable":
+            # An unrecognised verdict is recorded under its OWN reason and with
+            # the label the model actually wrote. Step 0 has already set the
+            # value to not_evaluable, so the `!=` guard below would see nothing
+            # to report and this trial's real defect would go unnamed.
+            if verdict_unrecognized:
+                unevaluable_trials.append({
+                    "nct_id": nct_id,
+                    "original_label": repr(raw_verdict)[:_MALFORMED_ENTRY_PREVIEW_LEN],
+                    "reason": UNEVALUABLE_UNRECOGNIZED_VERDICT,
+                })
+            elif eval_result["eligible"] != TRIAL_VERDICT_NOT_EVALUABLE:
                 unevaluable_trials.append({
                     "nct_id": nct_id,
                     "original_label": eval_result["eligible"],
                     "reason": "model returned no criteria",
                 })
-            eval_result["eligible"] = "not_evaluable"
+            eval_result["eligible"] = TRIAL_VERDICT_NOT_EVALUABLE
             _record_zero_score(eval_result, inc, exc)
             continue
 
@@ -1299,14 +1456,25 @@ CLINICAL TRIALS:
         has_violated = any(c.get("status") == "violated" for c in exc)
 
         if has_not_met or has_violated:
-            eval_result["eligible"] = "not_eligible"
+            # UNCHANGED, AND IT OUTRANKS AN UNRECOGNISED LABEL ON PURPOSE. This
+            # check reads the model's own criteria, which are the evidence; the
+            # trial-level label is its summary of them. A summary that cannot be
+            # read does not delete a criterion the model marked "not_met", and
+            # recording such a trial as "not evaluated" would hide a stated
+            # failure from a clinician and hand them a candidate the model had
+            # already disqualified -- the same fabrication as before, pointing
+            # the other way. So the rejection stands, on the criterion that
+            # justifies it, and the unreadable label is reported in
+            # verdict_normalizations rather than in unevaluable_trials, which
+            # is a list of trials that are NOT rejections.
+            eval_result["eligible"] = TRIAL_VERDICT_NOT_ELIGIBLE
             _record_zero_score(eval_result, inc, exc)
 
-        elif eval_result["eligible"] == "eligible":
+        elif eval_result["eligible"] == TRIAL_VERDICT_ELIGIBLE:
             # Legitimate eligible: recompute match_score over applicable criteria
             _record_score(eval_result, inc, exc, nct_id)
 
-        elif eval_result["eligible"] == "not_eligible" and remapped_here:
+        elif eval_result["eligible"] == TRIAL_VERDICT_NOT_ELIGIBLE and remapped_here:
             # The model rejected this trial, but every disqualifying label it
             # wrote was out of vocabulary and Step 1 resolved them all away.
             # Keeping "not_eligible" would store a rejection with nothing left
@@ -1315,16 +1483,29 @@ CLINICAL TRIALS:
             # recorded as not evaluated.
             unevaluable_trials.append({
                 "nct_id": nct_id,
-                "original_label": "not_eligible",
+                "original_label": TRIAL_VERDICT_NOT_ELIGIBLE,
                 "reason": "sole disqualifier was an out-of-vocabulary label",
             })
-            eval_result["eligible"] = "not_evaluable"
+            eval_result["eligible"] = TRIAL_VERDICT_NOT_EVALUABLE
             _record_zero_score(eval_result, inc, exc)
 
         else:
             # Model-declared "not_eligible" with no surviving disqualifier and
-            # no remap, or model-declared "not_evaluable" with criteria present.
-            # Verdict left as the model wrote it.
+            # no remap, or model-declared "not_evaluable" with criteria present,
+            # or an UNRECOGNISED label whose criteria disqualify nobody.
+            #
+            # The third is the fabricated rejection this branch used to receive
+            # as a settled "not_eligible" from Step 0 and pass through untouched
+            # under a comment reading "verdict left as the model wrote it" --
+            # which was false of exactly that case, and only that case. It is
+            # the one arm here that changed anything, and it is recorded, with
+            # the label the model actually wrote.
+            if verdict_unrecognized:
+                unevaluable_trials.append({
+                    "nct_id": nct_id,
+                    "original_label": repr(raw_verdict)[:_MALFORMED_ENTRY_PREVIEW_LEN],
+                    "reason": UNEVALUABLE_UNRECOGNIZED_VERDICT,
+                })
             _record_zero_score(eval_result, inc, exc)
 
     if label_remaps:
@@ -1337,6 +1518,20 @@ CLINICAL TRIALS:
                  stage=5, event="not_evaluable",
                  not_evaluable=len(unevaluable_trials),
                  reason=sorted({t["reason"] for t in unevaluable_trials}))
+    if verdict_normalizations:
+        # Separate from the two above, and from unevaluable_trials in
+        # particular: this says the LABEL was not written canonically, which is
+        # true whatever verdict the entry finally reached. An entry here may
+        # have ended eligible (a recovered "Eligible"), not_eligible (an
+        # unreadable label over a criterion the model marked not_met) or
+        # not_evaluable, and only the last is in that list.
+        log.info("trial-level verdict labels were not written canonically",
+                 stage=5, event="verdict_normalization",
+                 count=len(verdict_normalizations),
+                 total=len({v["nct_id"] for v in verdict_normalizations}),
+                 reason=sorted({v["source"] for v in verdict_normalizations}),
+                 error_type=",".join(sorted(
+                     {v["original_type"] for v in verdict_normalizations})))
 
 
     # ── Absent-data validator: catch GPT-4o absent-data disqualifications ──

@@ -83,6 +83,104 @@ MESH_FILTER_SKIP_NO_FILTER = "no_mesh_filter"    # MeSH data files never loaded
 MESH_FILTER_SKIP_NO_TREES = "no_patient_trees"   # patient never resolved to C04 trees
 
 
+# --- Stages 5 and 6, the trial-level verdict ---------------------------------
+#
+# The three labels a trial can carry when it leaves the pipeline, and the one
+# place that decides what an off-vocabulary label means. Stage 5 writes them and
+# Stage 6 splits on them, so a fourth spelling anywhere is a trial that lands in
+# the wrong bucket -- and every one of them reaches trial_matches.eligible.
+#
+# THEY LIVE HERE BECAUSE THE VOCABULARY WAS WRITTEN TWICE. Stage 5 held a
+# three-member tuple and Stage 6 held a six-entry synonym map, and the two
+# disagreed about the same input: Stage 5 forced "Eligible" and boolean True to
+# "not_eligible" (a rejection nothing said), while Stage 6's map, had it ever
+# been reached with those values, resolved both to "eligible". Stage 5 runs
+# first, so the map could not be reached and the disagreement was invisible.
+# One vocabulary, one normalizer, two callers.
+
+TRIAL_VERDICT_ELIGIBLE = "eligible"
+TRIAL_VERDICT_NOT_ELIGIBLE = "not_eligible"
+TRIAL_VERDICT_NOT_EVALUABLE = "not_evaluable"
+
+# Closed, and ordered as the pipeline reports them. A caller may branch on it
+# exhaustively.
+TRIAL_VERDICTS = (
+    TRIAL_VERDICT_ELIGIBLE,
+    TRIAL_VERDICT_NOT_ELIGIBLE,
+    TRIAL_VERDICT_NOT_EVALUABLE,
+)
+
+# How normalize_trial_verdict() reached its answer. Recorded rather than
+# inferred: "the model wrote the canonical label" and "the model wrote
+# something else that meant the same thing" are different facts about the same
+# verdict, and only the second is worth a log line.
+VERDICT_SOURCE_CANONICAL = "canonical"        # already one of TRIAL_VERDICTS
+VERDICT_SOURCE_NORMALIZED = "normalized"      # case/whitespace/synonym recovery
+VERDICT_SOURCE_UNRECOGNIZED = "unrecognized"  # no verdict; the caller decides
+
+VERDICT_SOURCES = (
+    VERDICT_SOURCE_CANONICAL,
+    VERDICT_SOURCE_NORMALIZED,
+    VERDICT_SOURCE_UNRECOGNIZED,
+)
+
+# The recovery vocabulary, and it is deliberately SMALL. Case-folding and
+# whitespace are parsing, not guessing: "Eligible " and "eligible" are the same
+# token. The four synonyms below are the JSON spellings of a yes/no answer, and
+# they are here because Stage 6 has carried exactly these four for the whole
+# life of the pipeline -- adopting them changes no rule, it moves one that was
+# already shipped to where the first reader can see it.
+#
+# Nothing else is added. A label this map cannot resolve is UNRECOGNIZED, and
+# the caller must not guess at it: the same argument _normalize_arm makes at
+# criterion level, that a guessed label can disqualify a patient with no
+# quotable evidence behind it.
+_TRIAL_VERDICT_SYNONYMS = {
+    "true": TRIAL_VERDICT_ELIGIBLE,
+    "false": TRIAL_VERDICT_NOT_ELIGIBLE,
+    "yes": TRIAL_VERDICT_ELIGIBLE,
+    "no": TRIAL_VERDICT_NOT_ELIGIBLE,
+}
+
+
+def normalize_trial_verdict(raw):
+    """Resolve one model-written trial-level label into the fixed vocabulary.
+
+    Returns ``(verdict, source)``:
+
+      * ``verdict`` is a member of TRIAL_VERDICTS, or ``None`` when the label
+        could not be resolved at all.
+      * ``source`` is a member of VERDICT_SOURCES, naming how the answer was
+        reached, so a caller can log the fallback path it took.
+
+    ``None`` is returned rather than a default verdict ON PURPOSE. Every default
+    available here is a claim: "not_eligible" asserts a rejection the model
+    never made, "eligible" asserts a match it never made, and "not_evaluable"
+    is a policy about what to do with an uninterpretable answer rather than a
+    reading of one. The policy belongs at the call site, beside the criteria
+    that may or may not justify something better; the parsing belongs here.
+
+    A bool is tested BEFORE str, and before any dict lookup, because ``True``
+    and ``1`` are the same dict key in Python -- a single map holding both bool
+    and string keys would silently answer for the integer 1 as though the model
+    had written ``true``.
+    """
+    if isinstance(raw, bool):
+        return (TRIAL_VERDICT_ELIGIBLE if raw else TRIAL_VERDICT_NOT_ELIGIBLE,
+                VERDICT_SOURCE_NORMALIZED)
+
+    if isinstance(raw, str):
+        folded = raw.strip().lower()
+        if folded in TRIAL_VERDICTS:
+            return (folded,
+                    VERDICT_SOURCE_CANONICAL if folded == raw
+                    else VERDICT_SOURCE_NORMALIZED)
+        if folded in _TRIAL_VERDICT_SYNONYMS:
+            return _TRIAL_VERDICT_SYNONYMS[folded], VERDICT_SOURCE_NORMALIZED
+
+    return None, VERDICT_SOURCE_UNRECOGNIZED
+
+
 class _EmptySparseQuery(Exception):
     """A BM25 query text tokenized to zero terms, so there is nothing to search.
 
