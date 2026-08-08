@@ -60,7 +60,13 @@ _NON_SMALL_CELL_RE = re.compile(
 )
 
 # Detect "NSCLC" abbreviation
-_NSCLC_ABBREV_RE = re.compile(r"\bNSCLC\b")
+#
+# IGNORECASE, like every other pattern in this file. Without it "nsclc" in
+# lower case produced NO histology tag, and an untagged trial is filtered by
+# nobody: is_histology_mismatch() only fires when the trial carries a tag, so a
+# lower-case small-cell trial reached a non-small-cell patient — the exact
+# confusion this module exists to prevent.
+_NSCLC_ABBREV_RE = re.compile(r"\bNSCLC\b", re.IGNORECASE)
 
 # Detect "small cell" that is NOT preceded by "non-"
 # Uses negative lookbehind for "non" + separator
@@ -71,7 +77,16 @@ _SMALL_CELL_RE = re.compile(
 )
 
 # Detect "SCLC" abbreviation (but NOT "NSCLC")
-_SCLC_ABBREV_RE = re.compile(r"(?<!\bN)\bSCLC\b")
+#
+# IGNORECASE for the reason above. It changes what the negative lookbehind
+# excludes — case-folded, `(?<!\bN)` now also excludes a preceding lower-case
+# "n" — and that widening costs nothing, because THE LOOKBEHIND IS UNREACHABLE
+# IN BOTH CASES. `\bSCLC\b` requires a word boundary before the S, and in
+# "NSCLC"/"nsclc" the preceding N is itself a word character, so there is no
+# boundary there and the alternative branch never gets as far as the lookbehind.
+# It is kept as a belt-and-braces guard, not deleted, but it is not what stops
+# SCLC firing inside NSCLC. Proved by running both cases and both spellings.
+_SCLC_ABBREV_RE = re.compile(r"(?<!\bN)\bSCLC\b", re.IGNORECASE)
 
 # --- Pattern: Neuroendocrine ---
 # Neuroendocrine tumors/carcinomas are distinct from carcinomas.

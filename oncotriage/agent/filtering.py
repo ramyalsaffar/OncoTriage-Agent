@@ -32,6 +32,21 @@ ITEM 11a CHANGED TWO THINGS HERE, one of them a behaviour change:
     recovery is unchanged — the trial is kept and the age check is skipped for
     it — because the failing value comes from ClinicalTrials.gov and there is
     no operator action that would fix it. See the counter's own note.
+
+TWO LATER FIXES, BOTH OF WHICH CHANGE WHICH TRIALS SURVIVE:
+
+  * ``_parse_age_bound`` CONVERTS THE UNIT. It used to take the digits and
+    discard the unit, so "240 Months" -- twenty years -- was read as two hundred
+    and forty years and stopped excluding anyone, and a min_age of "6 Months"
+    was read as six years. The result is fractional years and must stay
+    fractional. An unrecognised unit is recorded and the bound is unusable; the
+    recovery is unchanged.
+  * AN UNKNOWN PATIENT SEX NO LONGER EXCLUDES EVERY SEX-SPECIFIC TRIAL, and a
+    sex arriving as None no longer raises. Trials kept for that reason are
+    counted in ``SEX_UNKNOWN_KEPT``, apart from ``sex_dropped``, because a
+    mismatch and a missing field are different findings.
+
+Neither adds a key to the returned dict.
 """
 
 import re
@@ -102,21 +117,140 @@ AGE_PARSE_FAILURES = Counter()
 _AGE_KEY_MAX_LEN = 40
 
 
-def _record_age_parse_failure(bound: str, raw, exc: Exception) -> None:
-    """Record one unparseable trial age bound. Never raises.
+# ===========================================================================
+# AGE UNITS (the unit fix)
+# ===========================================================================
+#
+# ClinicalTrials.gov registers an age bound as "<number> <Unit>", and the unit
+# is NOT always Years. The parser below used to extract the digits and throw
+# the unit away, so "240 Months" — twenty years — was read as two hundred and
+# forty years and that trial's upper bound stopped excluding anyone, while a
+# min_age of "6 Months" was read as six years and excluded every infant the
+# trial was written for. Nothing was recorded, because digits WERE found.
+#
+# Conversions are calendar-average and exact enough for a boundary comparison
+# against a whole-number patient age: a month is a twelfth of a year, and a
+# year is 365.25 days so that the day and week factors agree with the month one
+# to within a day. Hours and minutes are in the table because CT.gov registers
+# them too (neonatal trials) and converting them involves no guess; leaving
+# them out would send a "23 Hours" bound down the unrecognised path and quietly
+# disable that trial's age check.
+_AGE_UNIT_YEARS = {
+    "year":   1.0,
+    "month":  1.0 / 12.0,
+    "week":   7.0 / 365.25,
+    "day":    1.0 / 365.25,
+    "hour":   1.0 / (365.25 * 24.0),
+    "minute": 1.0 / (365.25 * 24.0 * 60.0),
+}
 
-    `bound` is "min_age" or "max_age". The exception TYPE is in the key because
-    IndexError (the regex found no digits) and ValueError (digits that int()
-    refused) are different data problems with different fixes.
-    """
+# The first number in the string and the alphabetic token immediately after it,
+# AS ONE MATCH so the two cannot come from different places. Two independent
+# searches would pair them wrongly on a bound like "5, 240 Months", where the
+# first number is 5 and the only unit belongs to 240 — read separately that is
+# "five months", read together it is "5" with nothing adjacent. Group 2 is "" on
+# a bare number.
+#
+# `findall(...)[0]` rather than `search` keeps the digit-less case failing as an
+# IndexError, so it still records under the key it has always recorded under.
+_AGE_BOUND_RE = re.compile(r'(\d+(?:\.\d+)?)\s*([A-Za-z]+)?')
+
+# Any recognised unit word ANYWHERE in the string, used only when the token
+# immediately after the number is not a unit at all.
+#
+# WHY THIS EXISTS: "18 to 65 Years" puts the word "to" where the unit goes.
+# Without this, the bound would be unusable and the age check would not run for
+# that trial — which is a REGRESSION against the pre-fix code, which read the
+# digits and filtered at 18. It measures ZERO on the 14,324-trial corpus (every
+# bound there is "<number> <Unit>") and is here so that a shape which does occur
+# elsewhere cannot silently turn a working filter off.
+#
+# It is not a guess. The fallback fires only when EXACTLY ONE distinct unit word
+# appears in the string, so "6 Months to 2 Years" — where pairing the leading
+# number with either unit would be an invention — stays unusable and recorded.
+_AGE_ANY_UNIT_RE = re.compile(
+    r'\b(year|month|week|day|hour|minute)s?\b', re.IGNORECASE)
+
+
+def _age_key_text(raw) -> str:
+    """The raw bound, capped, for use in a counter key. Never raises."""
     text = str(raw)
-    if len(text) > _AGE_KEY_MAX_LEN:
-        text = text[:_AGE_KEY_MAX_LEN] + "..."
-    AGE_PARSE_FAILURES[f"{bound}:{type(exc).__name__}:{text}"] += 1
+    return text if len(text) <= _AGE_KEY_MAX_LEN else text[:_AGE_KEY_MAX_LEN] + "..."
+
+# A bound that carried a number and NO unit at all. Not a failure — it is used,
+# as years, which is exactly what the pre-fix code did with every bound — but it
+# is an ASSUMPTION, and the project's rule is that a fallback path records which
+# path it took. Separate from AGE_PARSE_FAILURES on purpose: everything in that
+# counter is a bound the age check did NOT run on, and folding a bound that WAS
+# applied into it would make `age_unparsed` uninterpretable.
+AGE_UNIT_ASSUMPTIONS = Counter()
 
 
-def _parse_age_bound(raw, default: int, bound: str):
-    """Parse one trial age bound. Returns the int, or None if it will not parse.
+# ===========================================================================
+# UNKNOWN PATIENT SEX (the sex fix)
+# ===========================================================================
+#
+# WHAT AN UNPARSED SEX ACTUALLY HOLDS, read from the parser rather than assumed:
+# `oncotriage/fhir/parser.py:_parse_demographics` sets
+# `sex = patient_resource.get('gender', 'unknown')`. So an ABSENT `gender`
+# element gives the string "unknown"; a `gender` present and JSON-null gives
+# **None**, because `.get`'s default does not apply to a key that exists; and a
+# `gender` present and empty gives "". FHIR itself also admits "other" as a
+# registered value, which is a known sex the trial vocabulary (ALL / MALE /
+# FEMALE) cannot express. None therefore CAN reach this filter, and the
+# unguarded `.upper()` it used to meet raised AttributeError rather than
+# dropping — a crash, not a drop.
+#
+# So there is no sentinel to key on, and this module does not invent one. The
+# question the filter can actually answer is whether the patient's sex is one
+# the trial's own vocabulary can be compared against, which is MALE or FEMALE
+# and nothing else. Everything else — None, "", "unknown", "other", any junk —
+# is not a mismatch, it is an absence of evidence.
+#
+# THE FAILURE DIRECTION IS ASYMMETRIC. Keeping a sex-specific trial for a
+# patient whose sex never parsed costs one judged trial, and Stage 5 reads the
+# criteria and can still reject it. Dropping it removes an eligible trial
+# permanently and invisibly, and the funnel would report it as a sex mismatch —
+# a clinical finding — when it is a missing field.
+_COMPARABLE_PATIENT_SEXES = frozenset({"male", "female"})
+
+# Trials kept because the patient's sex was not comparable, keyed by the raw
+# value that reached the filter. Module-level, following AGE_PARSE_FAILURES
+# above and NOT a new key in the returned dict, for the reason argued there:
+# the twelve characterization fixtures diff that dict field by field.
+#
+# Separate from `sex_dropped` because one number cannot tell a real mismatch
+# from a missing field. `sex_dropped` is a statement about the TRIALS — their
+# requirement and this patient's sex disagree. This is a statement about the
+# CORPUS — a patient record arrived without a usable sex — and the two have
+# different owners and different fixes.
+SEX_UNKNOWN_KEPT = Counter()
+
+
+def _record_age_parse_failure(bound: str, raw, exc, unit=None) -> None:
+    """Record one unusable trial age bound. Never raises.
+
+    `bound` is "min_age" or "max_age". `exc` is the exception, or a string
+    naming the failure kind for a failure that is not an exception (the
+    unrecognised-unit case, which is a decision rather than a raise). The KIND
+    is in the key because IndexError (the regex found no digits), ValueError
+    (digits that float() refused) and UnknownAgeUnit (digits and a unit this
+    module will not convert) are three different data problems with three
+    different fixes.
+
+    `unit` adds the offending unit as its own segment, so a counter dump answers
+    "which unit do we not handle" without anyone having to re-parse the text.
+    Omitted for the exception cases, whose keys are therefore unchanged.
+    """
+    text = _age_key_text(raw)
+    kind = exc if isinstance(exc, str) else type(exc).__name__
+    key = (f"{bound}:{kind}:{text}" if unit is None
+           else f"{bound}:{kind}:{unit}:{text}")
+    AGE_PARSE_FAILURES[key] += 1
+
+
+def _parse_age_bound(raw, default, bound: str):
+    """Parse one trial age bound TO YEARS. Returns a number, or None.
 
     THE RECOVERY IS UNCHANGED AND THAT IS THE POINT. None propagates to the
     caller, which then skips the age check for that trial and keeps it —
@@ -129,16 +263,61 @@ def _parse_age_bound(raw, default: int, bound: str):
     Item 11a adds the record; changing which trials survive is a different
     decision and belongs to whoever reads the counts this now produces.
 
-    What IS new is per-bound attribution: the old handler could not say which of
+    Per-bound attribution is item 11a's: the old handler could not say which of
     the two strings was the bad one, and the counter is only actionable if it can.
+
+    THE RETURN IS FRACTIONAL YEARS AND MUST STAY FRACTIONAL. Six months is 0.5,
+    not 0 and not 1. Rounding would move the boundary — and it would move it in
+    the direction this fix exists to correct, since a min_age rounded down to 0
+    stops excluding anybody and a max_age rounded up does the same. The only
+    consumer is the numeric comparison `min_age <= patient_age <= max_age`,
+    where a float works unchanged.
+
+    An unrecognised unit is NOT guessed at. It returns None like any other
+    unusable bound — same recovery, trial kept, age check skipped — and records
+    under its own key naming the unit, so the fix for it is one row in
+    _AGE_UNIT_YEARS rather than an archaeology session.
     """
     if not raw:
         return default
+
+    text = str(raw)
+
     try:
-        return int(re.findall(r'\d+', raw)[0])
+        number_text, raw_unit = _AGE_BOUND_RE.findall(text)[0]
+        number = float(number_text)
     except (IndexError, ValueError) as exc:
         _record_age_parse_failure(bound, raw, exc)
         return None
+
+    if not raw_unit:
+        # A bare number. Years is what the pre-fix code assumed for every bound,
+        # so assuming it here preserves that behaviour rather than turning a
+        # bound that used to filter into one that does not; it is recorded
+        # because an assumption nobody can count is the defect, not the value.
+        AGE_UNIT_ASSUMPTIONS[f"{bound}:no_unit:{_age_key_text(raw)}"] += 1
+        return number
+
+    raw_unit = raw_unit.lower()
+    unit = raw_unit[:-1] if raw_unit.endswith("s") else raw_unit
+    factor = _AGE_UNIT_YEARS.get(unit)
+
+    if factor is None:
+        # The token after the number is not a unit ("18 to 65 Years"). Recover
+        # ONLY when the string names exactly one unit, so nothing is paired with
+        # a number it does not belong to; anything else stays unusable.
+        elsewhere = {m.group(1).lower() for m in _AGE_ANY_UNIT_RE.finditer(text)}
+        if len(elsewhere) == 1:
+            unit = elsewhere.pop()
+            factor = _AGE_UNIT_YEARS[unit]
+            AGE_UNIT_ASSUMPTIONS[
+                f"{bound}:unit_not_adjacent:{unit}:{_age_key_text(raw)}"] += 1
+        else:
+            _record_age_parse_failure(bound, raw, "UnknownAgeUnit",
+                                      unit=raw_unit)
+            return None
+
+    return number * factor
 
 
 def node_rule_based_filter(state: TrialMatchState) -> dict:
@@ -166,7 +345,15 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
     conditions = patient_data["conditions"]
 
     patient_age = demographics.get("age")
-    patient_sex = demographics.get("sex", "unknown").lower()
+
+    # `.get("sex", "unknown").lower()` raised AttributeError when `gender` was
+    # present and null, because a default does not apply to a key that exists.
+    # Normalised here once, and whether it is USABLE is a separate question from
+    # what it says -- see _COMPARABLE_PATIENT_SEXES.
+    _raw_patient_sex = demographics.get("sex")
+    patient_sex = ("unknown" if _raw_patient_sex is None
+                   else str(_raw_patient_sex).strip().lower())
+    patient_sex_comparable = patient_sex in _COMPARABLE_PATIENT_SEXES
 
     # --- Ablation flags (read once, not per-trial) ---
     _ablation = state.get("ablation_flags") or {}
@@ -294,6 +481,12 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
     # that failed. It is not returned, for the fixture reason argued there.
     age_unparsed = 0
 
+    # Sex-specific trials KEPT because the patient's sex was not comparable.
+    # A LOCAL, reported below when non-zero; the durable record is the
+    # module-level SEX_UNKNOWN_KEPT, which also carries the value that arrived.
+    # Not returned, for the fixture reason argued at that counter.
+    sex_unknown_kept = 0
+
     for trial_obj in trials:
         trial = trial_obj["trial"]
         eligibility = trial["eligibility"]
@@ -337,10 +530,21 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
             continue
 
         # --- Sex filter ---
-        trial_sex = eligibility.get("sex", "ALL").upper()
-        if trial_sex not in ["ALL", patient_sex.upper()]:
-            sex_dropped += 1
-            continue
+        #
+        # `or "ALL"` rather than a `.get` default: the indexer writes whatever
+        # ClinicalTrials.gov registered, so the key can be present and null or
+        # empty, where a default does not apply and `.upper()` raised.
+        trial_sex = str(eligibility.get("sex") or "ALL").upper()
+        if trial_sex != "ALL":
+            if patient_sex_comparable:
+                if trial_sex != patient_sex.upper():
+                    sex_dropped += 1
+                    continue
+            else:
+                # NOT a drop and not a mismatch: the patient's sex never parsed,
+                # so this trial's requirement was never tested. Counted apart
+                # from sex_dropped because the two are different findings.
+                sex_unknown_kept += 1
 
         filtered.append(trial_obj)
 
@@ -367,6 +571,18 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
 
     elapsed = time.time() - start
     
+    if sex_unknown_kept:
+        # Durable, keyed by what actually arrived, so a corpus-quality question
+        # ("how many patients, and carrying what") is answerable across a run.
+        # Once per call rather than per trial: the loop already has the count.
+        SEX_UNKNOWN_KEPT[patient_sex] += sex_unknown_kept
+        # `kept` and `status` are already on LOGGABLE_FIELDS, so this needs no
+        # widening of the allowlist. The patient's sex VALUE is deliberately not
+        # a field -- it is clinical, it goes in the in-process counter only.
+        log.warning("patient sex not comparable; sex-specific trials kept "
+                    "rather than dropped", stage=4, filter="sex",
+                    status="unknown", kept=sex_unknown_kept)
+
     if not mesh_filter_applied:
         log.warning("cancer site filter did not run; Stage 5 will not assert "
                     "that disease relevance was confirmed", stage=4,
