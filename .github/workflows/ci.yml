@@ -96,7 +96,7 @@ jobs:
 
     steps:
       - name: Check out into a directory matching the *Code/ glob
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: '03- Code'
           # REQUIRED. tests/test_storage_query_layer.py and
@@ -109,7 +109,7 @@ jobs:
           fetch-depth: 0
 
       - name: Set up Python 3.11 (the container's version)
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -276,7 +276,7 @@ jobs:
 
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: '03- Code'
           fetch-depth: 0
@@ -285,7 +285,7 @@ jobs:
         # Needed only so `python` is on PATH for the Makefile's
         # `$(shell $(PYTHON) docker/app_version.py)`. That script is stdlib-only
         # and imports nothing from the project, so no install is required here.
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -321,6 +321,15 @@ jobs:
           test "$built" = "$derived"
 
       - name: Container image vulnerability scan (Trivy)
+        # `--timeout 20m` IS REQUIRED, NOT DEFENSIVE. Trivy's default is 5
+        # minutes and the first real run died on it:
+        #     FATAL  run error: image scan error: ... context deadline exceeded
+        # after 295s. The image is 2.91 GB and its site-packages tree is ~2 GB
+        # of small files, so the analysis phase alone exceeds the default. This
+        # is a CI-invocation defect rather than a finding, and it hid the
+        # findings completely — a timeout and a clean scan both exit non-zero
+        # here only because `--exit-code 1` is set, so without this the job
+        # would have looked like a vulnerability report while producing none.
         run: |
           mkdir -p "$RUNNER_TEMP/trivy-cache"
           docker run --rm \
@@ -330,6 +339,7 @@ jobs:
               --scanners vuln \
               --severity HIGH,CRITICAL \
               --exit-code 1 \
+              --timeout 20m \
               --no-progress \
               clinical-trial-patient-match:latest
 
@@ -343,7 +353,7 @@ jobs:
 
     steps:
       - name: Check out with full history
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           # REQUIRED. The working tree is one commit; a credential removed in a
           # later commit is still in the objects and still clonable.
