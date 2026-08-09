@@ -110,6 +110,16 @@ temp/
 # a space) and `tests/test_*.py` after it (nested) -- so the whole suite has
 # been shipping inside the image the entire time. `tests/` is what excludes it.
 tests/
+
+# CI Definition
+# ----------------------------------------------------------------------------
+# The workflow and its three helper scripts are build-time-irrelevant: the image
+# is built BY CI, not FOR it. Without this line `COPY . /app/` ships them, and
+# every edit to a workflow comment invalidates the source layer and rebuilds the
+# image for a change that cannot affect it. Same reasoning as `tests/` above,
+# and the same trap avoided: `.github/` is a directory prefix, not a `*` pattern
+# that would have to cross a `/`.
+.github/
 test_*.py
 *_test.py
 .pytest_cache/

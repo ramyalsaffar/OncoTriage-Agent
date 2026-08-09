@@ -1,0 +1,337 @@
+# OncoTriage Agent — Continuous Integration
+###########################################
+#
+# WHAT RUNS HERE, AND WHAT DELIBERATELY DOES NOT
+# ----------------------------------------------
+# Buckets A and B only. The classification, the evidence for each entry and the
+# reason every excluded file is excluded live in
+# `.github/scripts/ci_test_buckets.py`; `--check` fails when a test file under
+# tests/ is not in it, so a new file becomes a NAMED failure here rather than a
+# file that silently never runs.
+#
+# NOT RUN, ON PURPOSE:
+#   * fixture_replay.py — it refuses unless the LIVE Qdrant collection digest
+#     matches what the twelve fixtures were captured against. That is a machine
+#     with a real index, not a runner, and standing an index up here would be
+#     inventing the thing under test.
+#   * Files 18 and 19, fixture_capture.py, File 13 armed — every POST is a
+#     billed Stage 5 call at $0.13–$0.17 per patient.
+#   * Everything needing the corpus, the UMLS Metathesaurus, the production
+#     inference database or the UMLS-derived MeSH crosswalks.
+#
+# THE PYTHON VERSION IS THE CONTAINER'S, NOT THE DEVELOPER'S. The Dockerfile
+# pins `python:3.11-slim@sha256:94c50be2…`, verified by running the built image
+# to report 3.11.15. The development machine is on 3.13. That gap is not
+# hypothetical here: the Dockerfile's own header records this project shipping a
+# base image two minor versions from what its tag claimed, found only by running
+# it.
+#
+# FOUR THINGS THAT WOULD OTHERWISE COST A DEBUGGING CYCLE, each handled below:
+#   1. fetch-depth: 0 — several tests lift control implementations out of git
+#      history and the secret scan reads every commit.
+#   2. Bucket B goes through `make serial-tests` and nothing else: two members
+#      rewrite source in place and restore it, the order is derived, and the
+#      runner holds an flock. It also runs in a separate STEP after bucket A,
+#      never beside it.
+#   3. The image goes through `make build`, never `docker compose build`. The
+#      version label is derived by the Makefile and a `RUN --check` inside the
+#      build refuses an ARG that disagrees with `oncotriage/__init__.py`.
+#   4. Only `03- Code/` is version-controlled, and every data path is resolved
+#      by GLOB against the repository's PARENT. `_glob_one` raises when nothing
+#      matches, so a bare checkout cannot resolve a single path variable and 22
+#      of 27 non-serial test files die before their first check. The checkout
+#      therefore lands in a directory named to match the `*Code/` glob and
+#      `provision_ci_paths.py` creates the sibling skeleton beside it.
+#
+# THE CHECKOUT DIRECTORY NAME IS LOAD-BEARING AND IS WRITTEN OUT IN FULL, not
+# carried in a workflow-level `env`. The `env` context is not available in every
+# workflow key — `jobs.<id>.defaults.run.working-directory` is the one that
+# bites — and a path that silently resolves to an empty string puts the checkout
+# at the workspace root, where `*Code/` matches nothing and every job fails with
+# a glob error instead of a missing-variable error.
+#
+# THE SECURITY JOBS ARE EXPECTED TO BE RED, and they are left that way on
+# purpose. A dependency bump in this repository can move retrieval or model
+# behaviour and void the twelve characterization fixtures, and suppressing a
+# finding to get a green badge is the one thing a security gate must never do.
+# Triage belongs to a human; the CI report records what each one found.
+
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+# A superseded run on the same branch is cancelled. Keyed on `github.ref` rather
+# than `github.sha` so a force-push or a fast follow-up kills the older run;
+# `github.workflow` keeps push and pull_request runs in separate groups.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege. Nothing here writes to the repository, opens a pull request
+# or publishes a package, and no job pushes the image it builds.
+permissions:
+  contents: read
+
+jobs:
+
+  # =========================================================================
+  # TESTS — buckets A and B, in that order, in separate steps
+  # =========================================================================
+  tests:
+    name: tests (buckets A and B)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    defaults:
+      run:
+        working-directory: '03- Code'
+
+    steps:
+      - name: Check out into a directory matching the *Code/ glob
+        uses: actions/checkout@v4
+        with:
+          path: '03- Code'
+          # REQUIRED. tests/test_storage_query_layer.py and
+          # tests/test_indexer_admission_filters.py derive a revision and lift
+          # their negative controls out of `git show`; in a tree without history
+          # they crash rather than failing cleanly. Measured: bucket A reports
+          # identical counts at depth 1 and at full depth today, so for the
+          # tests this is insurance against the next control added — but the
+          # secret scan requires it outright.
+          fetch-depth: 0
+
+      - name: Set up Python 3.11 (the container's version)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          # pyproject.toml is the ONE dependency list in this project; pass
+          # 20f-2 deleted requirements/requirements.txt precisely so there could
+          # not be a second one to key a cache on.
+          cache-dependency-path: '03- Code/pyproject.toml'
+
+      - name: Reclaim runner disk before install
+        # MEASURED, NOT PRECAUTIONARY. `torch==2.9.0`'s x86_64 wheel is 900 MB
+        # and pulls 15 `nvidia-*` CUDA packages totalling 2,988 MB — ~3.9 GB of
+        # downloads, against 104 MB for the same pin on arm64. Installed, the
+        # dependency set is ~2 GB on arm64 (measured in the built image) and
+        # several times that on x86_64. A hosted runner starts with roughly
+        # 14 GB free, and pip failing on ENOSPC surfaces as a wheel error that
+        # reads like a dependency problem.
+        #
+        # This removes preinstalled toolchains this project never uses. It
+        # changes no dependency and no pin — trimming the dependency set is a
+        # decision about what the project resolves to, and is not made here.
+        working-directory: .
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/local/.ghcup || true
+          df -h / | tail -1
+
+      - name: Record the interpreter
+        run: |
+          python --version
+          python -c "import sys; print(sys.executable)"
+
+      - name: Install (make install)
+        run: make install
+
+      - name: Disk after install
+        run: df -h / | tail -1
+
+      - name: Provision the sibling data-directory skeleton
+        # Directories only, plus the two MeSH lookups this repository already
+        # vendors at docker/mesh-core/ with a sha256 manifest. No patient data,
+        # no trial corpus, no inference database and no credential is created.
+        run: python .github/scripts/provision_ci_paths.py --root "$GITHUB_WORKSPACE"
+
+      - name: Check the test classification is complete
+        # Fails when a tests/test_*.py is unclassified, and when bucket B here
+        # disagrees with tests/run_serial_tests.py's collision matrix.
+        run: python .github/scripts/ci_test_buckets.py --check
+
+      - name: Static checks (syntax gate on Python 3.11)
+        # There is no linter or type-checker configuration in this repository —
+        # pyproject.toml has only [build-system], [project] and
+        # [tool.setuptools*], and there is no setup.cfg, tox.ini, .flake8,
+        # ruff.toml or mypy.ini. This step compiles every file on the
+        # container's interpreter and prints, in its own output, exactly what it
+        # does not check.
+        run: python .github/scripts/static_checks.py
+
+      - name: Bucket A — parallel-safe tests
+        env:
+          ONCOTRIAGE_MAIN_PATH: ${{ github.workspace }}
+        run: python .github/scripts/ci_test_buckets.py --run A
+
+      - name: Bucket B — serial preconditions
+        id: serial
+        env:
+          ONCOTRIAGE_MAIN_PATH: ${{ github.workspace }}
+        # The report goes to RUNNER_TEMP, never into the checkout: bucket B's
+        # last member copytree()s the package and scans the tree, and a stray
+        # file dropped in by the harness is the kind of thing that turns into a
+        # mystery failure.
+        run: |
+          python .github/scripts/ci_test_buckets.py --serial-preconditions \
+            | tee "$RUNNER_TEMP/serial-preconditions.txt"
+          grep '^serial_ready=' "$RUNNER_TEMP/serial-preconditions.txt" >> "$GITHUB_OUTPUT"
+
+      - name: Bucket B — serial tests (make serial-tests)
+        # ONLY through the Makefile. Never a bucket B file directly: two of the
+        # five rewrite oncotriage/ in place and restore from a backup taken at
+        # their own start, the order is load-bearing, and run_serial_tests.py
+        # holds an flock so two runs cannot interleave their restore windows.
+        # A separate step AFTER bucket A, so the two never overlap.
+        if: steps.serial.outputs.serial_ready == 'true'
+        env:
+          ONCOTRIAGE_MAIN_PATH: ${{ github.workspace }}
+        run: make serial-tests
+
+      - name: Bucket B — report why the serial suite did not run
+        # NOT a silent skip. Four of the five members need licence-gated or
+        # generated inputs that cannot exist on a hosted runner, so on
+        # GitHub-hosted runners this is the branch taken, and it prints exactly
+        # which member needed what. A run that tested nothing must not read like
+        # a run that passed — that is the defect pass 20g fixed in Files 18/19.
+        if: steps.serial.outputs.serial_ready != 'true'
+        run: |
+          echo "::warning title=Serial suite not run::4 of 5 collision-matrix members need inputs a hosted runner cannot have. See the step output."
+          cat "$RUNNER_TEMP/serial-preconditions.txt"
+          {
+            echo "### Bucket B (serial) — NOT RUN"
+            echo
+            echo 'Members run only through `make serial-tests`, which needs every member runnable.'
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/serial-preconditions.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Dependency vulnerability audit (pip-audit)
+        # Deliberately last in this job, and deliberately against the RESOLVED
+        # environment rather than the declared pin list: that is the only way to
+        # see transitive vulnerabilities. It runs after the tests so their
+        # per-step status is already recorded when this turns the job red.
+        run: |
+          python -m pip install --quiet pip-audit
+          pip-audit --progress-spinner off --desc
+
+  # =========================================================================
+  # IMAGE — built through the Makefile, scanned, never pushed
+  # =========================================================================
+  image:
+    name: image (make build + scan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    defaults:
+      run:
+        working-directory: '03- Code'
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          path: '03- Code'
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        # Needed only so `python` is on PATH for the Makefile's
+        # `$(shell $(PYTHON) docker/app_version.py)`. That script is stdlib-only
+        # and imports nothing from the project, so no install is required here.
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Reclaim runner disk before build
+        # The built image is 2.91 GB (measured), and the builder stage installs
+        # the same ~3.9 GB torch/CUDA download on x86_64. Same reasoning as the
+        # tests job; no dependency or pin is changed.
+        working-directory: .
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/local/.ghcup || true
+          df -h / | tail -1
+
+      - name: Show the derived version
+        run: make version
+
+      - name: Build (make build)
+        # NOT `docker compose build`. A bare compose build fails by design: the
+        # version label arrives as an ARG the Makefile derives, and a
+        # `RUN --check` after the source COPY refuses a value that disagrees
+        # with oncotriage/__init__.py. Nothing here pushes the image.
+        run: make build
+
+      - name: Confirm the image label matches the source
+        # The build's own guard already refuses a mismatched ARG. This asserts
+        # the label that actually shipped, which is the thing a consumer reads.
+        run: |
+          built=$(docker inspect clinical-trial-patient-match:latest \
+                    --format '{{index .Config.Labels "version"}}')
+          derived=$(make --no-print-directory version)
+          echo "label=$built derived=$derived"
+          test "$built" = "$derived"
+
+      - name: Container image vulnerability scan (Trivy)
+        run: |
+          mkdir -p "$RUNNER_TEMP/trivy-cache"
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            aquasec/trivy:0.73.0 image \
+              --scanners vuln \
+              --severity HIGH,CRITICAL \
+              --exit-code 1 \
+              --no-progress \
+              clinical-trial-patient-match:latest
+
+  # =========================================================================
+  # SECRET SCAN — the full history, not the working tree
+  # =========================================================================
+  secret-scan:
+    name: secret scan (full git history)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out with full history
+        uses: actions/checkout@v4
+        with:
+          # REQUIRED. The working tree is one commit; a credential removed in a
+          # later commit is still in the objects and still clonable.
+          fetch-depth: 0
+
+      - name: Name the scanner and version
+        # So an empty result is attributable to a specific scanner build rather
+        # than to "nothing ran".
+        run: docker run --rm zricethezav/gitleaks:v8.30.1 version
+
+      - name: gitleaks — every commit on every ref
+        # `--log-opts` is what makes this a history scan: --all covers every
+        # ref, --full-history stops git simplifying merge history away.
+        # --redact keeps any hit out of a public log; the fingerprint is enough
+        # to locate it.
+        run: |
+          docker run --rm -v "$PWD":/repo -w /repo \
+            zricethezav/gitleaks:v8.30.1 git \
+              --log-opts="--all --full-history" \
+              --report-format=sarif \
+              --report-path=/repo/gitleaks.sarif \
+              --redact \
+              --exit-code 1 \
+              --verbose
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-sarif
+          path: gitleaks.sarif
+          if-no-files-found: warn
