@@ -79,3 +79,30 @@ CVE-2026-54283   # HIGH   fixed 1.3.1
 # --- MODEL: transformers 4.57.1, the MedCPT cross-encoder loader -------------
 CVE-2026-4372    # HIGH   fixed 5.3.0
 CVE-2026-5241    # HIGH   fixed 5.5.0
+
+# --- VENDORED: bundled inside pip itself, not separately installable ---------
+#
+# A FOURTH CLASS, and the only one where "a fix exists" is true of the package
+# and false of this image. Both are libraries pip VENDORS -- it ships its own
+# copies under pip/_vendor/ and imports those, never site-packages -- so there
+# is nothing to upgrade independently and no pip flag that swaps them out.
+#
+# Measured rather than inferred. pip is at 26.2.1, the current release, in both
+# the venv and the base image's system python; its own manifest says:
+#
+#     /usr/local/lib/python3.11/site-packages/pip/_vendor/vendor.txt:15
+#         setuptools==70.3.0
+#     ...same file
+#         msgpack==1.1.2
+#
+# Those are the versions Trivy reports, and they are NOT the setuptools and
+# msgpack the project uses: the venv has setuptools 84.0.0 installed normally,
+# which this build upgraded and which produces no finding. Upgrading pip is
+# already done and does not move these; the remediation is upstream re-vendoring
+# in a future pip, which is why nothing here can take it.
+#
+# THIS IS ALSO WHY THE EARLIER FIX LOOKED LIKE IT FAILED: upgrading setuptools
+# in the venv and then in the system python each cleared real findings, and left
+# these two, because they were never the copies being upgraded.
+CVE-2025-47273         # HIGH  setuptools 70.3.0 vendored in pip  fixed 78.1.1
+GHSA-6v7p-g79w-8964    # HIGH  msgpack 1.1.2 vendored in pip      fixed 1.2.1
