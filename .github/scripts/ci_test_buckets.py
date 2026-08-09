@@ -347,8 +347,27 @@ def run_bucket(letter, root=None, workers=None):
             "restore it, the order is load-bearing, and the runner holds an "
             "flock that stops two runs from interleaving their restores.")
 
+    # A BUCKET THAT RUNS NOTHING MUST NOT EXIT 0. `--run Z` on a letter that is
+    # not a bucket, or a bucket whose every member became unrunnable, would
+    # otherwise print "ran 0, failed 0" and return success -- a CI step that
+    # tested nothing and looked exactly like one that passed. That is the defect
+    # pass 20g fixed in Files 18 and 19, and it is easier to reintroduce in a
+    # runner than anywhere else.
+    members = in_bucket(letter)
+    if not members:
+        raise RuntimeError(
+            f"{letter!r} is not a bucket with any members. Known buckets: "
+            f"{sorted({b for b, _, _ in BUCKETS.values()})}.")
+
     names = runnable_in_ci(letter)
-    skipped = [n for n in in_bucket(letter) if n not in names]
+    if not names:
+        raise RuntimeError(
+            f"bucket {letter} has {len(members)} member(s) and NONE of them is "
+            f"runnable in CI, so this step would have tested nothing and "
+            f"exited 0. Members and what each needs:\n" +
+            "\n".join(f"    {n}: {BUCKETS[n][1]}" for n in members))
+
+    skipped = [n for n in members if n not in names]
 
     if workers is None:
         workers = min(4, (os.cpu_count() or 2))
