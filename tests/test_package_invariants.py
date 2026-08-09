@@ -1047,7 +1047,15 @@ _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    "tests/test_agent_age_units_and_sex_filter.py",
                    "tests/test_extraction_stage_m_category.py",
                    "tests/test_extraction_stage_non_oncology_guard.py",
-                   "tests/test_agent_trial_verdict_normalization.py"}
+                   "tests/test_agent_trial_verdict_normalization.py",
+                   # Plants into an in-memory copy of agent/patient.py. Two of
+                   # its seven controls are one-token edits INSIDE a function
+                   # body -- `is not None` made truthy, and the two observation
+                   # arguments dropped from the extractor call -- so there is
+                   # no attribute to rebind, and `git show` cannot supply them
+                   # either: the Cancer Stage section is new, so every revision
+                   # that HAS it also has it correct.
+                   "tests/test_agent_summary_cancer_stage.py"}
 
 
 def _repo_py_files():

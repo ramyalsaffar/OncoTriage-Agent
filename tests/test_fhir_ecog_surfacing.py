@@ -445,8 +445,36 @@ print("\n" + "=" * 70)
 print("6. _create_patient_summary emits a named Performance Status line")
 print("=" * 70)
 
+def _performance_status_section(summary: str) -> str:
+    """The Performance Status section of a summary, and nothing else.
+
+    THE THREE 'not recorded' CHECKS BELOW USED TO SEARCH
+    ``summary.split("Conditions:")[0]`` -- everything above the condition list.
+    That was a proxy for "the Performance Status region" and it was correct only
+    for as long as Performance Status was the ONLY section in that region. It
+    stopped being true when the Cancer Stage section was added directly beneath
+    it, whose own absence wording is "Cancer Stage: not recorded in this
+    record" -- so all three began failing on a string that is not about ECOG at
+    all, and had the polarity been the other way they would have PASSED on it.
+
+    Narrowing to the section keeps the breadth those checks want -- any wording
+    ANYWHERE in the ECOG region that claims absence, not just the one line this
+    file happens to know about -- while making the region the one they name.
+    """
+    if "Performance Status:" not in summary:
+        return ""
+    return summary.split("Performance Status:", 1)[1].split("\n\n", 1)[0]
+
+
 _sum_one = _create_patient_summary(_p_one)
 check("section header present", "Performance Status:" in _sum_one, True)
+# NON-DEGENERACY: an extractor that returned "" would satisfy every
+# `"not recorded" in section` == False check below for free.
+check("the section slice is non-degenerate",
+      "ECOG performance status" in _performance_status_section(_sum_one), True)
+check("...and it excludes the section beneath it, which is what the old "
+      "split(\"Conditions:\") slice did not",
+      "Cancer Stage" in _performance_status_section(_sum_one), False)
 check("value on its own named line",
       "- ECOG performance status: 1 (2021-03-03)" in _sum_one, True)
 
@@ -454,7 +482,7 @@ _sum_zero = _create_patient_summary(_p_zero)
 check("ECOG 0 is rendered as 0, not swallowed by a truthiness test",
       "- ECOG performance status: 0 (2019-01-01)" in _sum_zero, True)
 check("ECOG 0 is not reported as missing",
-      "not recorded" in _sum_zero.split("Conditions:")[0], False)
+      "not recorded" in _performance_status_section(_sum_zero), False)
 
 _sum_absent = _create_patient_summary(_p_absent)
 check("absence is stated explicitly",
@@ -462,7 +490,7 @@ check("absence is stated explicitly",
 
 _sum_unusable = _create_patient_summary(_p_unusable)
 check("present-but-unusable is not reported as 'not recorded'",
-      "not recorded" in _sum_unusable.split("Conditions:")[0], False)
+      "not recorded" in _performance_status_section(_sum_unusable), False)
 check("present-but-unusable states the count",
       "1 observation(s) on file" in _sum_unusable, True)
 check("present-but-unusable names the reason",
@@ -592,7 +620,8 @@ else:
         check("real present-but-unusable patient keeps value None",
               _ustatus["value"], None)
         check("and its summary does not say 'not recorded'",
-              "not recorded" in _create_patient_summary(_upatient).split("Conditions:")[0],
+              "not recorded" in _performance_status_section(
+                  _create_patient_summary(_upatient)),
               False)
     else:
         print("  NOTE  no scratch observation postdates the reference date; "

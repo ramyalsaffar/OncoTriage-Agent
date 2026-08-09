@@ -35,6 +35,15 @@ from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 from oncotriage.agent import deps
 from oncotriage.agent.state import GENOMIC_VARIANT_LOINC, _VARIANT_TEXT_PATTERN
 from oncotriage.config import MAX_VARIANT_TERMS
+from oncotriage.extraction.stage import (
+    STAGE_NUMERALS,
+    STAGE_SOURCE_CONDITION_DISPLAY,
+    STAGE_SOURCE_M_CATEGORY,
+    STAGE_SOURCE_METASTATIC_KEYWORD,
+    STAGE_SOURCE_STAGE_GROUP,
+    STAGE_SOURCES,
+    extract_patient_stage_with_source,
+)
 from oncotriage.utils import deduplicate_by_display
 
 
@@ -909,6 +918,40 @@ def _normalize_lab_unit(
 #------------------------------------------------------------------------------
 
 
+# How each extractor tier is described to the model, in the tier's own words
+# rather than in the extractor's identifier. Stage 4 acts on the ordinal alone;
+# the model is being asked to reason about a stage-gated criterion, and "the
+# clinician recorded a stage group" and "a diagnosis name contained the word
+# metastatic" are different grades of evidence for the same number.
+#
+# The wording lives here and the vocabulary lives in
+# oncotriage/extraction/stage.py, which is the split the dashboard's
+# PATIENT_OUTCOME_LABELS already uses: the module that OWNS the fact names its
+# members, and the module that RENDERS them holds the prose.
+_STAGE_SOURCE_PHRASES: Dict[str, str] = {
+    STAGE_SOURCE_STAGE_GROUP:
+        "from a recorded stage group observation",
+    STAGE_SOURCE_M_CATEGORY:
+        "from a recorded AJCC clinical M category observation",
+    STAGE_SOURCE_CONDITION_DISPLAY:
+        "from diagnosis text",
+    STAGE_SOURCE_METASTATIC_KEYWORD:
+        "from diagnosis text describing metastatic disease",
+}
+
+# A tier added to the extractor without a phrase here would reach this module
+# as a KeyError while a prompt was being built -- inside node_llm_classifier_
+# evaluation, where the graph's error handler turns it into a whole patient
+# lost. Raising at import instead makes it the failure it is: an incomplete
+# edit, found before anything runs.
+if set(_STAGE_SOURCE_PHRASES) != set(STAGE_SOURCES):
+    raise RuntimeError(
+        "_STAGE_SOURCE_PHRASES and STAGE_SOURCES disagree: "
+        f"phrases {sorted(_STAGE_SOURCE_PHRASES)} vs "
+        f"vocabulary {sorted(STAGE_SOURCES)}"
+    )
+
+
 def _create_patient_summary(patient_data: Dict) -> str:
     """
     Create compact patient summary for GPT-4o criterion-level evaluation.
@@ -917,6 +960,10 @@ def _create_patient_summary(patient_data: Dict) -> str:
       Demographics      : age, sex, race, ethnicity
       Performance Status: ECOG (LOINC 89247-1), or an explicit statement that
                           none is recorded. Never defaults to 0.
+      Cancer Stage      : the ordinal Stage 4's filter acted on, rendered as
+                          the AJCC numeral with the tier that produced it, or
+                          an explicit statement that none is recorded. Never
+                          treats stage 0 as absent.
       Conditions        : relevance-filtered into three tiers:
                           Tier A (cancer): full detail with [neoplasm] tag
                           Tier B (relevant): full detail with [comorbidity] tag
@@ -1007,6 +1054,45 @@ def _create_patient_summary(patient_data: Dict) -> str:
         )
     else:
         summary += "- ECOG performance status: not recorded\n"
+
+    # ── Cancer Stage ──────────────────────────────────────────────────────
+    # Directly under Performance Status because these are the two most common
+    # gates in interventional oncology and the model should not have to hunt
+    # for either. ECOG got its own named line for that reason; stage had none,
+    # while Stage 4's filter was already DROPPING trials on the ordinal — so
+    # the model was resolving stage-gated criteria for a patient whose stage
+    # the pipeline knew and never stated.
+    #
+    # THE SAME CALL STAGE 4 MAKES, with the same three inputs read from the
+    # same three patient_data keys. Not a second derivation: if this section
+    # and the filter could disagree, the prompt would be asserting a stage the
+    # trial list was not selected under, which is the class of defect the
+    # single-vocabulary rule exists to prevent. The delegate
+    # extract_patient_stage() and extract_patient_stage_with_source() are one
+    # implementation, so "the same call" is a fact about the code rather than a
+    # promise about keeping two call sites in step.
+    #
+    # `is None` is the test, never truthiness — the same trap as ECOG 0 above.
+    # Stage 0 is in-situ disease, a real stage that gates real trials, and
+    # `if stage:` would report the earliest stage a patient can carry as no
+    # stage at all.
+    #
+    # ABSENCE IS STATED, NOT OMITTED, on the Performance Status precedent. "No
+    # stage on file" is itself a fact a stage-gated criterion needs: under the
+    # system prompt's conservatism rule the model can resolve such a criterion
+    # to not_evaluable from a stated absence, whereas silence leaves it to
+    # infer a stage from the diagnosis text — which is the weakest of the four
+    # tiers, applied without any of the guards the extractor applies.
+    stage_ordinal, stage_source = extract_patient_stage_with_source(
+        conditions,
+        cancer_stage_observations=patient_data.get('cancer_stage_observations') or [],
+        cancer_metastasis_observations=patient_data.get('cancer_metastasis_observations') or [],
+    )
+    if stage_ordinal is not None:
+        summary += (f"\n\nCancer Stage: {STAGE_NUMERALS[stage_ordinal]} "
+                    f"({_STAGE_SOURCE_PHRASES[stage_source]})\n")
+    else:
+        summary += "\n\nCancer Stage: not recorded in this record\n"
 
     # ── Conditions (relevance-filtered) ───────────────────────────────────
     # Tier A (cancer) and Tier B (relevant comorbidities) get full detail.

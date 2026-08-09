@@ -119,6 +119,11 @@ BUCKETS = {
         "point of it (a commit recedes; the reference is the golden snapshot)"),
     "test_agent_retrieval_observability.py": (
         _A, None, "ran green in 3.5s; needs .env to EXIST, makes no live call"),
+    "test_agent_summary_cancer_stage.py": (
+        _A, None,
+        "ran green in 2.0s, 53 checks; every patient is a literal dict, the "
+        "plants go into an in-memory copy of oncotriage/agent/patient.py, and "
+        "it reads no git, no corpus and no database"),
     "test_agent_trial_verdict_normalization.py": (
         _A, None, "ran green in 1.9s; every model response is a literal via a deps stub"),
     "test_dashboard_reproducibility_tab.py": (

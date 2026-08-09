@@ -631,11 +631,94 @@ def _m_key_text(raw) -> str:
     return text if len(text) <= _M_KEY_MAX_LEN else text[:_M_KEY_MAX_LEN] + "..."
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# WHICH TIER ANSWERED
+# ═══════════════════════════════════════════════════════════════════════════════
+# A closed vocabulary, one member per tier of extract_patient_stage(), in tier
+# order. It exists because the Stage 5 prompt states the stage's PROVENANCE
+# beside the stage: "Stage IV" resolved from a clinician-assigned stage group
+# and "Stage IV" inferred from the word "metastatic" in a diagnosis name are
+# the same ordinal and very different evidence, and a model asked to resolve a
+# stage-gated criterion conservatively needs to know which it was handed.
+#
+# MACHINE TOKENS, NOT PROMPT WORDING. The wording a reader sees belongs to the
+# thing doing the rendering; these name the tier. oncotriage/agent/patient.py
+# holds the phrases and guards its map against STAGE_SOURCES at import, so a
+# tier added here cannot reach the prompt as a KeyError or as silence.
+#
+# These are values, not tunables: each names a tier that exists in the function
+# below, and adding one without adding a tier would be a declaration about
+# machinery that is not there.
+STAGE_SOURCE_STAGE_GROUP: str = "stage_group_observation"
+STAGE_SOURCE_M_CATEGORY: str = "m_category_observation"
+STAGE_SOURCE_CONDITION_DISPLAY: str = "condition_display"
+STAGE_SOURCE_METASTATIC_KEYWORD: str = "metastatic_keyword"
+
+STAGE_SOURCES: Tuple[str, ...] = (
+    STAGE_SOURCE_STAGE_GROUP,
+    STAGE_SOURCE_M_CATEGORY,
+    STAGE_SOURCE_CONDITION_DISPLAY,
+    STAGE_SOURCE_METASTATIC_KEYWORD,
+)
+
+# The clinical numeral for each ordinal, which is what trial criteria text is
+# written in ("Stage IV or recurrent disease", "Stage IB-IIIA"). A fact about
+# AJCC stage groups, not a tunable, and it lives here rather than at the render
+# site because it is the inverse of _STAGE_ORDINAL above -- the one place the
+# numeral/ordinal correspondence is stated. Stage 0 is in-situ disease and is a
+# stage: it is spelled "Stage 0" because AJCC does, not because it is a
+# placeholder for absence.
+STAGE_NUMERALS: Dict[int, str] = {
+    0: "Stage 0",
+    1: "Stage I",
+    2: "Stage II",
+    3: "Stage III",
+    4: "Stage IV",
+}
+
+# The two maps have to cover the same scale, and nothing else would notice if
+# they stopped: _STAGE_ORDINAL is what produces an ordinal and STAGE_NUMERALS
+# is what renders one, so a value producible but not renderable is a KeyError
+# in the middle of building a prompt.
+if set(STAGE_NUMERALS) != set(_STAGE_ORDINAL.values()):
+    raise RuntimeError(
+        "STAGE_NUMERALS does not cover the ordinal scale _STAGE_ORDINAL "
+        f"produces: numerals {sorted(STAGE_NUMERALS)} vs ordinals "
+        f"{sorted(set(_STAGE_ORDINAL.values()))}"
+    )
+
+
 def extract_patient_stage(
     conditions: List[Dict],
     cancer_stage_observations: Optional[List[Dict]] = None,
     cancer_metastasis_observations: Optional[List[Dict]] = None,
 ) -> Optional[int]:
+    """Extract patient's cancer stage ordinal (0-4). See
+    ``extract_patient_stage_with_source`` for the tiers and the reasoning.
+
+    THIS IS A THIN DELEGATE AND THAT IS DELIBERATE. The tier logic lives in
+    ``extract_patient_stage_with_source`` and is not duplicated here: two
+    implementations of "what stage is this patient" is exactly the disagreement
+    between the Stage 4 filter and the Stage 5 prompt that adding the prompt's
+    stage section exists to remove. Callers that do not need the provenance
+    keep this signature -- the pipeline's Stage 4 and the fixture cohort scan
+    are both pinned to it by name.
+
+    Returns ordinal 0-4 or None.  None -> stage filter keeps all trials.
+    """
+    ordinal, _source = extract_patient_stage_with_source(
+        conditions,
+        cancer_stage_observations,
+        cancer_metastasis_observations,
+    )
+    return ordinal
+
+
+def extract_patient_stage_with_source(
+    conditions: List[Dict],
+    cancer_stage_observations: Optional[List[Dict]] = None,
+    cancer_metastasis_observations: Optional[List[Dict]] = None,
+) -> Tuple[Optional[int], Optional[str]]:
     """
     Extract patient's cancer stage ordinal (0–4) from FHIR data.
 
@@ -671,7 +754,16 @@ def extract_patient_stage(
     takes the stage group, which is what the tier order means, and the
     disagreement is a data finding for whoever owns the record.
 
-    Returns ordinal 0–4 or None.  None → stage filter keeps all trials.
+    Returns ``(ordinal, source)``. ``ordinal`` is 0–4 or None; None → stage
+    filter keeps all trials. ``source`` is the STAGE_SOURCES member naming the
+    tier that answered, and is None exactly when the ordinal is None — no tier
+    answered, so there is no provenance to state.
+
+    THE SOURCE IS REPORTED, NOT DECIDED HERE. Nothing in this function branches
+    on it and no tier's logic or order changed when it was added; each tier
+    already knew which one it was, and that fact was simply being dropped on
+    the way out. What consumes it is the Stage 5 prompt, which states the
+    evidence class beside the stage.
     """
     # Tier 0: mCODE TNM stage group Observations — structured, highest priority
     if cancer_stage_observations:
@@ -688,16 +780,16 @@ def extract_patient_stage(
             if m:
                 ordinal = _STAGE_ORDINAL.get(m.group(1).lower())
                 if ordinal is not None:
-                    return ordinal
+                    return ordinal, STAGE_SOURCE_STAGE_GROUP
             # Fallback: "metastatic" in display
             if 'metastatic' in display.lower() and 'non-metastatic' not in display.lower():
-                return 4
+                return 4, STAGE_SOURCE_STAGE_GROUP
 
     # Tier 1: AJCC clinical M category Observation — structured, and the one
     # TNM axis that determines a stage group on its own.
     m_category_stage = _stage_from_m_category(cancer_metastasis_observations)
     if m_category_stage is not None:
-        return m_category_stage
+        return m_category_stage, STAGE_SOURCE_M_CATEGORY
 
     # Tier 2: Condition display text regex (covers all cancer types, all SNOMED displays)
     #
@@ -728,7 +820,7 @@ def extract_patient_stage(
                 continue
             ordinal = _STAGE_ORDINAL.get(m.group(1).lower())
             if ordinal is not None:
-                return ordinal
+                return ordinal, STAGE_SOURCE_CONDITION_DISPLAY
 
     # Tier 3: Metastatic keyword in Condition display
     #
@@ -756,9 +848,9 @@ def extract_patient_stage(
     for cond in conditions:
         display = (cond.get("display") or "").lower()
         if "metastatic" in display and "non-metastatic" not in display:
-            return 4
+            return 4, STAGE_SOURCE_METASTATIC_KEYWORD
 
-    return None
+    return None, None
 
 
 def is_stage_mismatch(patient_stage: Optional[int], trial: Dict) -> bool:

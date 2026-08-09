@@ -688,10 +688,16 @@ print("=" * 70)
 print("Each plant goes into an in-memory COPY of the module; the file on disk")
 print("is hashed before and after and asserted byte-identical.")
 
+# The needle is the SHIPPED text of the tier, and it moved when the extractor
+# started reporting which tier answered: the return carries STAGE_SOURCE_M_
+# CATEGORY beside the ordinal now. Updated rather than loosened -- an exact
+# needle is what makes `_plant` able to say "plant target absent" instead of
+# silently planting nothing, and both controls below reported exactly that when
+# this line went stale.
 _TIER_CALL = (
     "    m_category_stage = _stage_from_m_category(cancer_metastasis_observations)\n"
     "    if m_category_stage is not None:\n"
-    "        return m_category_stage\n")
+    "        return m_category_stage, STAGE_SOURCE_M_CATEGORY\n")
 
 _MATCH_LINE = '        if match.group("category") == "1":'
 

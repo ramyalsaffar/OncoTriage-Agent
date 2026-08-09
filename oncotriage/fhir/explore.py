@@ -67,6 +67,7 @@ import seaborn as sns
 from oncotriage import paths
 from oncotriage.config import Project_Name
 from oncotriage.extraction.stage import extract_patient_stage
+from oncotriage.fhir.parser import parse_fhir_bundle
 from oncotriage.registries.cancer_code_registry import (
     get_cancer_classification_stats,
     load_registry,
@@ -317,6 +318,99 @@ def get_filtered_patient_ids():
     console.out()
     
     return patient_ids
+
+
+def patient_stage_ordinals(patient_ids):
+    """Stage ordinal per patient, read from the FHIR bundles.
+
+    Returns ``(stage_by_patient, stats)``. ``stage_by_patient`` maps patient id
+    to the ordinal ``extract_patient_stage()`` produced, or to None when no
+    tier answered; ``stats`` carries the counts the caller has to state
+    (bundles read, cohort patients not found in any bundle, parse failures).
+
+    WHY THIS EXISTS AND WHAT IT REPLACES. The stage analysis used to call
+    ``extract_patient_stage([{'display': ...}])`` once per CONDITION ROW of the
+    Synthea CSV export -- one condition at a time, with NEITHER observation
+    list. That is a single tier of the extractor's four, and it is the weakest
+    one: the mCODE stage GROUP observations that 295 of the 1,000 corpus
+    patients carry live in the FHIR bundles and never entered the CSV frame at
+    all, so the chart could not see the one piece of evidence the pipeline
+    trusts most. What it saw instead was diagnosis text, which on this corpus
+    is 98% chronic-kidney-disease staging -- so the published distribution was
+    98.2% "Unspecified" over a cohort where nearly a third of patients have a
+    clinician-assigned cancer stage on file.
+
+    THE SAME THREE INPUTS STAGE 4 PASSES, through the same function, once per
+    PATIENT rather than once per row. Per-patient is not a convenience: the
+    extractor's answer is TIER-ORDERED over a whole record, and feeding it one
+    row at a time destroys the ordering -- the caller was recovering from that
+    by taking each patient's maximum ordinal across rows, which is a different
+    rule from the pipeline's and the reason a CKD stage 4 outranked a real
+    stage I.
+
+    Reads only. Parses each bundle once and holds one integer per patient, not
+    the parsed record, so the cohort's memory cost does not scale with bundle
+    size.
+    """
+    json_path = Path(json_dir())
+    # sorted() so two runs on the same directory read in the same order; the
+    # result is a dict keyed by patient id and does not depend on it, but a
+    # parse-failure REPORT that lists a different first casualty each run is
+    # not a report. Matches _glob_one's determinism rule in oncotriage/paths.py.
+    bundle_files = sorted(json_path.glob("*.json"))
+
+    wanted = set(patient_ids)
+    stage_by_patient = {}
+    stats = {"bundles_read": 0, "parse_failures": 0, "patients_without_bundle": 0}
+
+    total = len(bundle_files)
+    console.out(f"Reading cancer stage from {total} FHIR bundles "
+                f"(stage group + M category + diagnosis text)...")
+
+    for idx, file in enumerate(bundle_files, 1):
+        if idx % 100 == 0 or idx == total:
+            console.out(f"  Staging: {idx}/{total} bundles ({(idx / total) * 100:.1f}%)")
+
+        try:
+            patient_data = parse_fhir_bundle(str(file))
+        except Exception as exc:
+            # COUNTED AND NAMED, never swallowed: a bundle that fails to parse
+            # is a patient silently missing from the distribution, and a
+            # distribution that quietly shrinks looks exactly like one over a
+            # smaller cohort. Same treatment scan_cohort() gives the same
+            # failure in oncotriage/fixtures/capture.py.
+            stats["parse_failures"] += 1
+            if stats["parse_failures"] <= 5:
+                console.out(f"  Warning: could not parse {file.name}: "
+                            f"{type(exc).__name__}: {exc}")
+            continue
+
+        stats["bundles_read"] += 1
+
+        patient_id = patient_data.get("patient_id")
+        if patient_id not in wanted:
+            continue
+
+        stage_by_patient[patient_id] = extract_patient_stage(
+            patient_data.get("conditions") or [],
+            cancer_stage_observations=patient_data.get("cancer_stage_observations") or [],
+            cancer_metastasis_observations=patient_data.get("cancer_metastasis_observations") or [],
+        )
+
+    # A cohort patient with no bundle is NOT a patient with no stage, and the
+    # two must not be collapsed: the caller renders a missing ordinal as
+    # "Unspecified", so an unread bundle would arrive in the chart as a
+    # clinical finding about that patient. Counted here and reported there.
+    stats["patients_without_bundle"] = len(wanted) - len(stage_by_patient)
+
+    if stats["parse_failures"]:
+        console.out(f"  ⚠ {stats['parse_failures']} bundle(s) failed to parse "
+                    f"and contribute no stage")
+    if stats["patients_without_bundle"]:
+        console.out(f"  ⚠ {stats['patients_without_bundle']} cohort patient(s) "
+                    f"had no bundle in {json_path} — counted as Unspecified")
+
+    return stage_by_patient, stats
 
 
 def load_and_filter_csv(filename, patient_ids):
@@ -745,7 +839,10 @@ Action if abnormal: Regenerate, check if Synthea cancer modules include staging
 
     Args:
         df_cancer:     primary cancer condition rows (defines the cohort)
-        df_conditions: all condition rows (the text stage is read from)
+        df_conditions: all condition rows. Retained for the cohort-coverage
+                       line only; the stage itself no longer comes from here.
+                       See patient_stage_ordinals() for why the CSV frame is
+                       the wrong source for a stage.
     """
     apply_plot_style()
     ensure_output_dir()
@@ -754,34 +851,38 @@ Action if abnormal: Regenerate, check if Synthea cancer modules include staging
     console.out("CANCER STAGE ANALYSIS")
     console.out("="*80 + "\n")
 
-    # Stage comes from File 10's extract_patient_stage() — the same function
-    # Stage 4 of the pipeline calls. The local extract_stage() this replaces
-    # tested 'stage i' before 'stage iii' and 'stage iv', and 'stage i' is a
-    # prefix of both, so every stage above I was reported as Stage I and none
-    # of the abnormality thresholds above could ever fire.
+    # Stage comes from extract_patient_stage() — the same function, with the
+    # same three inputs, that Stage 4 of the pipeline filters on. It is read
+    # from the FHIR BUNDLES, not from the CSV condition frame: the stage GROUP
+    # observations the extractor trusts above everything else are in the
+    # bundles only, and reading diagnosis text alone left this chart reporting
+    # chronic-kidney-disease staging as cancer stage. patient_stage_ordinals()
+    # holds the full argument.
     #
-    # Read over ALL conditions of the cancer patients, not only the rows the
-    # registry marked primary: the pipeline also sees the whole condition
-    # list, so "Metastatic malignant neoplasm to colon" still contributes its
-    # Stage IV through extract_patient_stage()'s metastatic tier even though
-    # the registry keeps that row out of the primary-cancer cohort.
+    # The cohort is unchanged — the patients df_cancer marks as having a
+    # primary cancer — and so is everything below this block.
     cancer_patients = set(df_cancer['PATIENT'])
     df_staged = df_conditions[df_conditions['PATIENT'].isin(cancer_patients)].copy()
 
-    df_staged['STAGE_ORDINAL'] = pd.array(
-        [
-            extract_patient_stage([{'display': '' if pd.isna(d) else str(d)}])
-            for d in df_staged['DESCRIPTION']
-        ],
-        dtype='Int64',   # nullable: <NA> is "no stage in this row", not 0
-    )
+    stage_by_patient, stage_stats = patient_stage_ordinals(cancer_patients)
 
-    # Count UNIQUE PATIENTS per stage (not condition records)
-    # Strategy: For each patient, take their WORST stage (highest ordinal).
-    # max() skips <NA>; a patient with no staged row at all stays <NA>.
-    worst_ordinal = df_staged.groupby('PATIENT')['STAGE_ORDINAL'].max()
-    patient_stages = worst_ordinal.map(
-        lambda o: STAGE_UNSPECIFIED if pd.isna(o) else STAGE_LABELS[int(o)]
+    # One ordinal per patient, so no per-patient reduction is needed or wanted:
+    # the extractor already answered ONCE for the whole record, in tier order.
+    # The old max()-across-rows was a repair for feeding it one row at a time,
+    # and it is a DIFFERENT rule from the pipeline's — worst-of-any-row rather
+    # than best-evidence — which is precisely how a CKD stage outranked a
+    # cancer one. sorted() so the series order does not depend on set iteration.
+    #
+    # A patient absent from stage_by_patient (no bundle, or a bundle that
+    # failed to parse) lands in Unspecified, counted in stage_stats and
+    # reported below rather than passed off as a clinical finding.
+    patient_stages = pd.Series(
+        {
+            pid: (STAGE_UNSPECIFIED if stage_by_patient.get(pid) is None
+                  else STAGE_LABELS[int(stage_by_patient[pid])])
+            for pid in sorted(cancer_patients)
+        },
+        dtype='object',
     )
 
     # Fixed bucket order, zeros kept: "zero Stage I or II" is one of the
@@ -794,7 +895,15 @@ Action if abnormal: Regenerate, check if Synthea cancer modules include staging
 
     console.out(f"Total cancer patients: {len(patient_stages)}")
     console.out(f"Primary cancer condition records: {len(df_cancer)}")
-    console.out(f"Condition records searched for stage text: {len(df_staged)}")
+    # The old line here read "Condition records searched for stage text: N".
+    # It is replaced rather than kept because it is no longer true — no stage
+    # is read from a condition RECORD now — and a stale provenance line under a
+    # chart is the defect this rewire exists to remove, one level up.
+    console.out(f"Condition records for those patients: {len(df_staged)}")
+    console.out(f"Bundles read for stage: {stage_stats['bundles_read']}"
+                f" (parse failures: {stage_stats['parse_failures']};"
+                f" cohort patients with no bundle: "
+                f"{stage_stats['patients_without_bundle']})")
     console.out()
     console.out("Patient distribution by stage:")
     for stage, count in stage_counts.items():
