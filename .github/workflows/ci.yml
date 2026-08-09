@@ -170,6 +170,12 @@ jobs:
 
       - name: Bucket B — serial preconditions
         id: serial
+        # `always()` because a bucket A failure must not silently cancel bucket
+        # B and the dependency audit below. Without it a single red test in
+        # bucket A skips every later step, and the pipeline reports one problem
+        # while hiding two — including a security scan. The job's conclusion is
+        # unaffected: a failed step still fails the job.
+        if: always()
         env:
           ONCOTRIAGE_MAIN_PATH: ${{ github.workspace }}
         # The report goes to RUNNER_TEMP, never into the checkout: bucket B's
@@ -187,7 +193,7 @@ jobs:
         # their own start, the order is load-bearing, and run_serial_tests.py
         # holds an flock so two runs cannot interleave their restore windows.
         # A separate step AFTER bucket A, so the two never overlap.
-        if: steps.serial.outputs.serial_ready == 'true'
+        if: always() && steps.serial.outputs.serial_ready == 'true'
         env:
           ONCOTRIAGE_MAIN_PATH: ${{ github.workspace }}
         run: make serial-tests
@@ -198,7 +204,7 @@ jobs:
         # GitHub-hosted runners this is the branch taken, and it prints exactly
         # which member needed what. A run that tested nothing must not read like
         # a run that passed — that is the defect pass 20g fixed in Files 18/19.
-        if: steps.serial.outputs.serial_ready != 'true'
+        if: always() && steps.serial.outputs.serial_ready != 'true'
         run: |
           echo "::warning title=Serial suite not run::4 of 5 collision-matrix members need inputs a hosted runner cannot have. See the step output."
           cat "$RUNNER_TEMP/serial-preconditions.txt"
@@ -217,6 +223,8 @@ jobs:
         # environment rather than the declared pin list: that is the only way to
         # see transitive vulnerabilities. It runs after the tests so their
         # per-step status is already recorded when this turns the job red.
+        # `always()` so a red test never hides a dependency vulnerability.
+        if: always()
         run: |
           python -m pip install --quiet pip-audit
           pip-audit --progress-spinner off --desc
