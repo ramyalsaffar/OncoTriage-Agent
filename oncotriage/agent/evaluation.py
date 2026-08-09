@@ -6,7 +6,7 @@ The largest single stage, and the only one that spends money. It carries three
 budgets that must not be confused with each other, and File 03's reconciliation
 is the argument for keeping them separate:
 
-    MAX_GPT4O_RETRIES      the response came back and was unusable
+    MAX_LLM_CLASSIFIER_RETRIES      the response came back and was unusable
     MAX_TRUNCATION_SPLITS  the response was fine but hit the output ceiling
     OPENAI_SDK_MAX_RETRIES the request never produced a usable HTTP response
 
@@ -57,7 +57,7 @@ from oncotriage.config import (
     MATCHING_OUTPUT_TOKENS_PER_TRIAL,
     MATCHING_REASONING_EFFORT,
     MATCHING_SEED,
-    MAX_GPT4O_RETRIES,
+    MAX_LLM_CLASSIFIER_RETRIES,
     MAX_TRUNCATION_SPLITS,
     RETRY_BASE_DELAY,
 )
@@ -134,13 +134,13 @@ class MatchingModelMismatchError(RuntimeError):
 def call_matching_model(system_prompt: str, user_prompt: str):
     """Issue the Stage 5 evaluation request and return the raw API response.
 
-    Lifted out of node_gpt4o_evaluation unchanged. It is the single point where
+    Lifted out of node_llm_classifier_evaluation unchanged. It is the single point where
     the pipeline talks to the matching model, which is what lets a recording
     harness capture the request and response verbatim and a replay harness
     serve them back without a network call (45-/46- Fixture Capture/Replay).
 
     The caller owns error handling: this raises whatever the client raises, and
-    node_gpt4o_evaluation's except block turns that into a retry.
+    node_llm_classifier_evaluation's except block turns that into a retry.
 
     REQUEST SHAPE, AND WHY EACH PARAMETER IS OR IS NOT HERE. Every one of these
     was probed live against gpt-5.6-terra on 2026-08-04 rather than inferred
@@ -171,7 +171,7 @@ def call_matching_model(system_prompt: str, user_prompt: str):
                               It is the other half of the bound -- a timeout
                               with the SDK's default of 2 retries is still
                               three attempts -- and it is the TRANSPORT budget,
-                              deliberately distinct from MAX_GPT4O_RETRIES,
+                              deliberately distinct from MAX_LLM_CLASSIFIER_RETRIES,
                               which covers a response that arrived and would
                               not parse. File 03 states both, plus the
                               truncation-split budget, and the worst-case wall
@@ -272,7 +272,7 @@ FINISH_REASON_LENGTH = "length"
 # The response is validated as a LIST and nothing below validated its MEMBERS,
 # so a list holding a bare NCT id string, a number or a null reached the
 # metadata-enrichment loop and raised AttributeError on ``.get`` -- uncaught,
-# out through node_gpt4o_evaluation and out through graph.invoke, which wraps
+# out through node_llm_classifier_evaluation and out through graph.invoke, which wraps
 # nothing. Confirmed by running: 'str' object has no attribute 'get', at the
 # first statement of that loop, for a string, an int, a list and a null alike.
 #
@@ -334,22 +334,22 @@ def estimate_output_tokens(trials: List[Dict]) -> int:
 
     HOW THIS WAS CALIBRATED, so it can be re-derived when the model changes:
 
-        SELECT candidates_evaluated, gpt4o_output_tokens, gpt4o_calls,
-               gpt4o_reasoning_tokens, matching_model
+        SELECT candidates_evaluated, llm_classifier_output_tokens, llm_classifier_calls,
+               llm_classifier_reasoning_tokens, matching_model
         FROM inferences
-        WHERE candidates_evaluated > 0 AND gpt4o_output_tokens > 0
-          AND gpt4o_calls = 1            -- see below
+        WHERE candidates_evaluated > 0 AND llm_classifier_output_tokens > 0
+          AND llm_classifier_calls = 1            -- see below
         GROUP BY matching_model
 
-    RESTRICT TO gpt4o_calls = 1 AND GROUP BY matching_model. Both matter now.
+    RESTRICT TO llm_classifier_calls = 1 AND GROUP BY matching_model. Both matter now.
     A split run sums its tokens across chunks and, when the split was reactive,
     includes the wasted truncated call, so output/trials over those rows
     over-states the per-trial cost. And inferences.db holds rows from two
     judges since 2026-08-04; pooling them calibrates against neither.
 
-    gpt4o_output_tokens ALREADY INCLUDES reasoning tokens (they are a subset of
+    llm_classifier_output_tokens ALREADY INCLUDES reasoning tokens (they are a subset of
     usage.completion_tokens, not an addition to it), so no term is added for
-    them. gpt4o_reasoning_tokens is selected above only to see how much of the
+    them. llm_classifier_reasoning_tokens is selected above only to see how much of the
     figure is invisible: at the configured effort of 'none' it is 0.
 
     2026-08-04, gpt-5.6-terra at reasoning_effort='none', over the 27
@@ -363,7 +363,7 @@ def estimate_output_tokens(trials: List[Dict]) -> int:
 
     WHAT DID NOT PREDICT ANYTHING. Fitting output against both trial count and
     criteria length — the criteria text measured with File 11's characters/4
-    proxy, taken from the gpt4o_prompt column — gives
+    proxy, taken from the llm_classifier_prompt column — gives
 
         output ~= 708 * trials + (-0.0107) * criteria_tokens
 
@@ -462,17 +462,20 @@ def _unevaluable_entry(trial_obj: Dict, reason: str) -> Dict:
     }
 
 
-def node_gpt4o_evaluation(state: TrialMatchState) -> dict:
+def node_llm_classifier_evaluation(state: TrialMatchState) -> dict:
     """
-    Stage 5: GPT-4o criterion-level evaluation.
+    Stage 5: LLM classifier, criterion-level evaluation.
 
-    Sends ALL filtered trials to GPT-4o in a SINGLE call.
-    GPT-4o evaluates every inclusion/exclusion criterion for each trial
+    Sends ALL filtered trials to the classifier in a SINGLE call. Which model
+    that is comes from ``config.MATCHING_MODEL`` and is NOT named here: this
+    node was called ``node_gpt4o_evaluation`` while the judge was gpt-4o, the
+    judge became gpt-5.6-terra on 2026-08-04, and the name went stale in place.
+    The classifier evaluates every inclusion/exclusion criterion for each trial
     and returns structured JSON with match scores and explanations.
 
     On JSON parse failure or API error, sets error flag so the retry
     router (conditional edge) can loop back for another attempt.
-    Up to MAX_GPT4O_RETRIES attempts with exponential backoff.
+    Up to MAX_LLM_CLASSIFIER_RETRIES attempts with exponential backoff.
 
     Temperature = 0 for deterministic, reproducible medical decisions.
     """
@@ -481,16 +484,16 @@ def node_gpt4o_evaluation(state: TrialMatchState) -> dict:
 
     patient_data = state["patient_data"]
     trials = state["filtered_trials"]
-    retry_count = state.get("gpt4o_retries", 0)
+    retry_count = state.get("llm_classifier_retries", 0)
     
     # Accumulate timing across retries (previous attempts' time is already in stage_timings)
-    prior_gpt4o_time = state.get("stage_timings", {}).get("gpt4o_evaluation", 0.0)
+    prior_llm_classifier_time = state.get("stage_timings", {}).get("llm_classifier_evaluation", 0.0)
 
     # Exponential backoff on retries (skip delay on first attempt)
     if retry_count > 0:
         delay = RETRY_BASE_DELAY * (2 ** (retry_count - 1))
         log.info("backing off before a Stage 5 retry", stage=5,
-                 retry=retry_count, max_retries=MAX_GPT4O_RETRIES,
+                 retry=retry_count, max_retries=MAX_LLM_CLASSIFIER_RETRIES,
                  delay_s=delay)
         time.sleep(delay)
 
@@ -872,7 +875,7 @@ CLINICAL TRIALS:
     # The WHOLE batch, not the chunk that happened to be sent last. When a run
     # splits, the stored prompt is the one the run would have sent unsplit,
     # which is the thing that is comparable across runs; the split itself is
-    # recorded in gpt4o_truncation_splits, not by mutating this.
+    # recorded in llm_classifier_truncation_splits, not by mutating this.
     prompt = f"[SYSTEM]\n{system_prompt}\n\n[USER]\n{_user_prompt_for(trials)}"
 
     # ------------------------------------------------------------------
@@ -956,12 +959,12 @@ CLINICAL TRIALS:
                       error_message=str(e))
             return {
                 "evaluations": [],
-                "gpt4o_retries": retry_count + 1,
-                "gpt4o_truncation_splits": truncation_splits,
-                "gpt4o_output_tokens_estimated": estimated_output,
-                "gpt4o_raw_response": "",
+                "llm_classifier_retries": retry_count + 1,
+                "llm_classifier_truncation_splits": truncation_splits,
+                "llm_classifier_output_tokens_estimated": estimated_output,
+                "llm_classifier_raw_response": "",
                 "error": error_msg,
-                "stage_timings": {**state.get("stage_timings", {}), "gpt4o_evaluation": round(prior_gpt4o_time + elapsed, 3)}
+                "stage_timings": {**state.get("stage_timings", {}), "llm_classifier_evaluation": round(prior_llm_classifier_time + elapsed, 3)}
             }
 
         calls_made += 1
@@ -1088,10 +1091,10 @@ CLINICAL TRIALS:
             console.out(f"  [Stage 5] response preview: {chunk_text[:300]}")
             return {
                 "evaluations": [],
-                "gpt4o_retries": retry_count + 1,
-                "gpt4o_truncation_splits": truncation_splits,
-                "gpt4o_output_tokens_estimated": estimated_output,
-                "gpt4o_raw_response": chunk_text,
+                "llm_classifier_retries": retry_count + 1,
+                "llm_classifier_truncation_splits": truncation_splits,
+                "llm_classifier_output_tokens_estimated": estimated_output,
+                "llm_classifier_raw_response": chunk_text,
                 # A model DID answer here -- badly, but it answered -- so the
                 # run is not anonymous. Carried so that a patient whose retries
                 # all end in malformed JSON still logs which model produced
@@ -1102,7 +1105,7 @@ CLINICAL TRIALS:
                 # would be arithmetically incoherent.
                 "matching_model": model_answered,
                 "error": error_msg,
-                "stage_timings": {**state.get("stage_timings", {}), "gpt4o_evaluation": round(prior_gpt4o_time + elapsed, 3)}
+                "stage_timings": {**state.get("stage_timings", {}), "llm_classifier_evaluation": round(prior_llm_classifier_time + elapsed, 3)}
             }
 
         if not isinstance(parsed, list):
@@ -1116,10 +1119,10 @@ CLINICAL TRIALS:
             console.out(f"  [Stage 5] response preview: {chunk_text[:300]}")
             return {
                 "evaluations": [],
-                "gpt4o_retries": retry_count + 1,
-                "gpt4o_truncation_splits": truncation_splits,
-                "gpt4o_output_tokens_estimated": estimated_output,
-                "gpt4o_raw_response": chunk_text,
+                "llm_classifier_retries": retry_count + 1,
+                "llm_classifier_truncation_splits": truncation_splits,
+                "llm_classifier_output_tokens_estimated": estimated_output,
+                "llm_classifier_raw_response": chunk_text,
                 # A model DID answer here -- badly, but it answered -- so the
                 # run is not anonymous. Carried so that a patient whose retries
                 # all end in malformed JSON still logs which model produced
@@ -1130,7 +1133,7 @@ CLINICAL TRIALS:
                 # would be arithmetically incoherent.
                 "matching_model": model_answered,
                 "error": error_msg,
-                "stage_timings": {**state.get("stage_timings", {}), "gpt4o_evaluation": round(prior_gpt4o_time + elapsed, 3)}
+                "stage_timings": {**state.get("stage_timings", {}), "llm_classifier_evaluation": round(prior_llm_classifier_time + elapsed, 3)}
             }
 
         # A well-formed response is a list OF OBJECTS, and only the list half
@@ -1750,23 +1753,23 @@ CLINICAL TRIALS:
 
     return {
         "evaluations": evaluations,
-        "gpt4o_retries": retry_count,
-        # Two budgets, two counters. gpt4o_retries counts whole-node retries
+        "llm_classifier_retries": retry_count,
+        # Two budgets, two counters. llm_classifier_retries counts whole-node retries
         # for malformed or failed responses; this counts levels of halving
         # spent because a response was cut off. Sharing one would have failed a
         # patient that hit a single parse error and then needed two splits.
-        "gpt4o_truncation_splits": truncation_splits,
-        "gpt4o_output_tokens_estimated": estimated_output,
+        "llm_classifier_truncation_splits": truncation_splits,
+        "llm_classifier_output_tokens_estimated": estimated_output,
         "not_evaluable_truncated": not_evaluable_truncated,
-        "gpt4o_calls": calls_made,
-        "gpt4o_raw_response": response_text,
-        "gpt4o_prompt": prompt,
-        "gpt4o_input_tokens": input_tokens,
-        "gpt4o_output_tokens": output_tokens,
-        # The reasoning share of gpt4o_output_tokens, NOT an extra charge on top
+        "llm_classifier_calls": calls_made,
+        "llm_classifier_raw_response": response_text,
+        "llm_classifier_prompt": prompt,
+        "llm_classifier_input_tokens": input_tokens,
+        "llm_classifier_output_tokens": output_tokens,
+        # The reasoning share of llm_classifier_output_tokens, NOT an extra charge on top
         # of it. None when no response carried the breakdown -- see the
         # accumulator above.
-        "gpt4o_reasoning_tokens": (reasoning_tokens if reasoning_tokens_reported
+        "llm_classifier_reasoning_tokens": (reasoning_tokens if reasoning_tokens_reported
                                    else None),
         # The model that actually answered. File 14 logs this into
         # inferences.matching_model and prices against it, so the stored cost is
@@ -1775,7 +1778,7 @@ CLINICAL TRIALS:
         "matching_model": model_answered,
         "cross_vocab_remaps": len(label_remaps),
         "error": "",  # Clear error on success
-        "stage_timings": {**state.get("stage_timings", {}), "gpt4o_evaluation": round(prior_gpt4o_time + elapsed, 3)}
+        "stage_timings": {**state.get("stage_timings", {}), "llm_classifier_evaluation": round(prior_llm_classifier_time + elapsed, 3)}
     }
 
 

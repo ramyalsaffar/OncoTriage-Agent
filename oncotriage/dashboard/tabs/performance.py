@@ -261,32 +261,32 @@ def render_performance_tab(df):
         st.plotly_chart(fig_latency, use_container_width=True)
     
     with col2:
-        fig_gpt4o = px.histogram(
+        fig_llm_classifier = px.histogram(
             df,
-            x='gpt4o_evaluation_time',
+            x='llm_classifier_evaluation_time',
             nbins=30,
-            labels={'gpt4o_evaluation_time': f'{_judge} Time (seconds)'},
+            labels={'llm_classifier_evaluation_time': f'{_judge} Time (seconds)'},
             template='plotly_white',
             title=f'{_judge} Evaluation Latency'
         )
-        fig_gpt4o.add_vline(
-            x=df['gpt4o_evaluation_time'].median(),
+        fig_llm_classifier.add_vline(
+            x=df['llm_classifier_evaluation_time'].median(),
             line_dash="dash",
             line_color="red"
         )
-        fig_gpt4o.add_annotation(
-            x=df['gpt4o_evaluation_time'].median(), y=1, yref="paper",
-            text=f"Median: {df['gpt4o_evaluation_time'].median():.1f}s",
+        fig_llm_classifier.add_annotation(
+            x=df['llm_classifier_evaluation_time'].median(), y=1, yref="paper",
+            text=f"Median: {df['llm_classifier_evaluation_time'].median():.1f}s",
             showarrow=True, arrowhead=0, ax=45, ay=-25,
             font=dict(size=11, color="red"),
             bgcolor="white", borderpad=2
         )
-        fig_gpt4o.update_layout(
+        fig_llm_classifier.update_layout(
             height=300,
             margin=dict(l=20, r=20, t=40, b=20),
             showlegend=False
         )
-        st.plotly_chart(fig_gpt4o, use_container_width=True)
+        st.plotly_chart(fig_llm_classifier, use_container_width=True)
     
     # Latency stats
     col1, col2, col3, col4 = st.columns(4)
@@ -418,7 +418,7 @@ def render_performance_tab(df):
         'hybrid_retrieval_time',
         'cross_encoder_time',
         'rule_filter_time',
-        'gpt4o_evaluation_time'
+        'llm_classifier_evaluation_time'
     ]
     
     stage_labels = [
@@ -486,8 +486,8 @@ def render_performance_tab(df):
     
     slowest = df.nlargest(10, 'total_time')[
         ['patient_id', 'age', 'sex', 'condition_count', 'medication_count',
-         'candidates_evaluated', 'total_time', 'gpt4o_evaluation_time',
-         'gpt4o_output_tokens']
+         'candidates_evaluated', 'total_time', 'llm_classifier_evaluation_time',
+         'llm_classifier_output_tokens']
     ].copy()
     
     slowest.insert(0, 'Rank', range(1, len(slowest) + 1))

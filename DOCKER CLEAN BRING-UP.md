@@ -345,8 +345,8 @@ named volumes rather than sibling bind mounts is what guarantees:
 trial matches before this request and reads the same afterwards.
 
 **THE COST IS NOT IN THE RESPONSE**, and that is worth knowing before you look
-for it. `POST /match` returns token counts (`gpt4o_input_tokens`,
-`gpt4o_output_tokens`) but no cost field; the dollar figure is computed by
+for it. `POST /match` returns token counts (`llm_classifier_input_tokens`,
+`llm_classifier_output_tokens`) but no cost field; the dollar figure is computed by
 `log_inference` and lands in `inferences.estimated_cost_usd`. The number above
 was read from the row the request wrote:
 

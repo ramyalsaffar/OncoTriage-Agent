@@ -4,7 +4,7 @@
 """
 Trial Verdict Normalization Test
 
-TWO DEFECTS IN ``node_gpt4o_evaluation``'s post-processing loop, both about an
+TWO DEFECTS IN ``node_llm_classifier_evaluation``'s post-processing loop, both about an
 answer the model did not give.
 
 1. AN UNRECOGNISED TRIAL-LEVEL VERDICT WAS RECORDED AS A REJECTION. The loop
@@ -106,7 +106,7 @@ from oncotriage.agent import terminal as _terminal_module
 from oncotriage.agent.evaluation import (
     MALFORMED_EVALUATION_ENTRIES,
     UNEVALUABLE_UNRECOGNIZED_VERDICT,
-    node_gpt4o_evaluation,
+    node_llm_classifier_evaluation,
 )
 from oncotriage.agent.state import (
     TRIAL_VERDICT_ELIGIBLE,
@@ -273,7 +273,7 @@ class _StubResponse:
         self.choices = [_StubChoice(content)]
         self.usage = _StubUsage()
         # None means "the response carried no model field", which
-        # node_gpt4o_evaluation handles explicitly and which keeps
+        # node_llm_classifier_evaluation handles explicitly and which keeps
         # MatchingModelMismatchError out of a test that is not about it.
         self.model = None
 
@@ -327,12 +327,12 @@ def norm(raw):
 
 def run_stage5(payload, nct_ids=("NCT00000001",), node=None):
     """Drive Stage 5 with a stubbed model. Returns (result, stderr_text)."""
-    node = node or node_gpt4o_evaluation
+    node = node or node_llm_classifier_evaluation
     state = {
         "patient_data": PATIENT,
         "filtered_trials": [{"trial": trial(n), "rerank_score": 5.0,
                              "rerank_score_raw": 5.0} for n in nct_ids],
-        "gpt4o_retries": 0,
+        "llm_classifier_retries": 0,
         "mesh_filter_applied": True,
         "mesh_filter_skip_reason": "applied",
         "stage_timings": {},
@@ -814,7 +814,7 @@ check("PRECONDITION: an exec'd copy of evaluation.py is wired to the LIVE "
 check("PRECONDITION: an unplanted copy agrees with the shipped module",
       verdict_of(run_stage5([entry("NCT00000001", "elligible",
                                    inclusion=[crit("met")])],
-                            node=_probe_module.node_gpt4o_evaluation)[0]),
+                            node=_probe_module.node_llm_classifier_evaluation)[0]),
       TRIAL_VERDICT_NOT_EVALUABLE)
 
 _CLOBBER = """        eval_result["eligible"] = (
@@ -831,7 +831,7 @@ _control(
       '        )')],
     lambda m: verdict_of(run_stage5(
         [entry("NCT00000001", "elligible", inclusion=[crit("met")])],
-        node=m.node_gpt4o_evaluation)[0]),
+        node=m.node_llm_classifier_evaluation)[0]),
     TRIAL_VERDICT_NOT_ELIGIBLE,
 )
 
@@ -845,7 +845,7 @@ _control(
       '        )')],
     lambda m: bucket_of(run_stage6(run_stage5(
         [entry("NCT00000001", "elligible", inclusion=[crit("met")])],
-        node=m.node_gpt4o_evaluation)[0]["evaluations"])[0]),
+        node=m.node_llm_classifier_evaluation)[0]["evaluations"])[0]),
     "near_misses",
 )
 
@@ -865,7 +865,7 @@ _control(
     [(_ELSE_APPEND, "            _record_zero_score(eval_result, inc, exc)")],
     lambda m: len(log_records(run_stage5(
         [entry("NCT00000001", "elligible", inclusion=[crit("met")])],
-        node=m.node_gpt4o_evaluation)[1], "not_evaluable")),
+        node=m.node_llm_classifier_evaluation)[1], "not_evaluable")),
     0,
 )
 
@@ -884,7 +884,7 @@ _control(
     [(_ZERO_CRIT, '            if eval_result["eligible"] != TRIAL_VERDICT_NOT_EVALUABLE:')],
     lambda m: len(log_records(run_stage5(
         [entry("NCT00000001", "elligible")],
-        node=m.node_gpt4o_evaluation)[1], "not_evaluable")),
+        node=m.node_llm_classifier_evaluation)[1], "not_evaluable")),
     0,
 )
 
@@ -897,7 +897,7 @@ _control(
       "    objects = []\n    dropped = []")],
     lambda m: run_stage5(["NCT00000001", _GOOD],
                          nct_ids=("NCT00000001", "NCT00000002"),
-                         node=m.node_gpt4o_evaluation)[0].get("raised"),
+                         node=m.node_llm_classifier_evaluation)[0].get("raised"),
     "AttributeError",
 )
 
@@ -910,7 +910,7 @@ _control(
       "        if (has_not_met or has_violated) and not verdict_unrecognized:")],
     lambda m: verdict_of(run_stage5(
         [entry("NCT00000001", "elligible", inclusion=[crit("not_met")])],
-        node=m.node_gpt4o_evaluation)[0]),
+        node=m.node_llm_classifier_evaluation)[0]),
     TRIAL_VERDICT_NOT_EVALUABLE,
 )
 
@@ -922,7 +922,7 @@ _control(
     [("                MALFORMED_EVALUATION_ENTRIES[type(_entry).__name__] += 1",
       "                pass")],
     lambda m: (run_stage5([42, _GOOD], nct_ids=("NCT00000001", "NCT00000002"),
-                          node=m.node_gpt4o_evaluation)
+                          node=m.node_llm_classifier_evaluation)
                and sum(m.MALFORMED_EVALUATION_ENTRIES.values())),
     0,
 )
@@ -935,7 +935,7 @@ _control(
     "7g-positive. an unplanted copy's counter DOES move (7g is not vacuous)",
     _EVAL_SRC, [],
     lambda m: (run_stage5([42, _GOOD], nct_ids=("NCT00000001", "NCT00000002"),
-                          node=m.node_gpt4o_evaluation)
+                          node=m.node_llm_classifier_evaluation)
                and sum(m.MALFORMED_EVALUATION_ENTRIES.values())),
     1,
 )
@@ -996,7 +996,7 @@ _control(
       '        )')],
     lambda m: verdict_of(run_stage5(
         [entry("NCT00000001", "eligible", inclusion=[crit("met")])],
-        node=m.node_gpt4o_evaluation)[0]),
+        node=m.node_llm_classifier_evaluation)[0]),
     TRIAL_VERDICT_ELIGIBLE,
 )
 
@@ -1076,7 +1076,7 @@ if _pre_fix is not None:
         _ids = tuple(sorted(e["nct_id"] for e in _payload))
         _new, _ = run_stage5(_payload, nct_ids=_ids)
         _old, _ = run_stage5(_payload, nct_ids=_ids,
-                             node=_pre_fix.node_gpt4o_evaluation)
+                             node=_pre_fix.node_llm_classifier_evaluation)
         _same = _shape(_new) == _shape(_old)
         if not _same:
             _differing += 1
@@ -1091,7 +1091,7 @@ if _pre_fix is not None:
     check("non-degeneracy: the SAME comparison separates the two modules on "
           "an unrecognised label",
           _shape(run_stage5(_bad)[0])
-          == _shape(run_stage5(_bad, node=_pre_fix.node_gpt4o_evaluation)[0]),
+          == _shape(run_stage5(_bad, node=_pre_fix.node_llm_classifier_evaluation)[0]),
           False)
 
 

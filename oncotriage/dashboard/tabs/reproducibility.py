@@ -1227,7 +1227,7 @@ def render_reproducibility_tab(df):
                     st.markdown(f"**Primary Condition:** {patient_row.get('primary_condition', 'N/A')}")
                     
                     # Extract patient record from GPT-4o prompt if available
-                    prompt = patient_row.get('gpt4o_prompt', '')
+                    prompt = patient_row.get('llm_classifier_prompt', '')
                     if prompt and str(prompt) != 'nan':
                         # The patient record is between [USER] and CLINICAL TRIALS:
                         user_start = str(prompt).find('PATIENT RECORD:')

@@ -2,13 +2,13 @@
 
 Item 20c, pass 2c. Two slices of "13- LangGraph Agent.py":
 
-    5062-5221  route_after_retrieval, route_after_filter, route_after_gpt4o,
+    5062-5221  route_after_retrieval, route_after_filter, route_after_llm_classifier,
                build_matching_graph
     5284-5358  match_patient_to_trials, build_initial_state
 
 The three routers are the conditional edges: skip the cross-encoder when
 retrieval returned nothing, skip Stage 5 when the filter emptied the pool, and
-loop Stage 5 back on a JSON parse failure up to MAX_GPT4O_RETRIES. Any exception
+loop Stage 5 back on a JSON parse failure up to MAX_LLM_CLASSIFIER_RETRIES. Any exception
 anywhere lands in node_error_handler, which still emits a well-formed result.
 
 ``match_patient_to_trials`` is the public entry point. It stamps
@@ -24,7 +24,7 @@ from typing import Dict
 
 from langgraph.graph import END, START, StateGraph
 
-from oncotriage.agent.evaluation import node_gpt4o_evaluation
+from oncotriage.agent.evaluation import node_llm_classifier_evaluation
 from oncotriage.agent.filtering import node_rule_based_filter
 from oncotriage.agent.patient import compute_patient_hash
 from oncotriage.agent.retrieval import (
@@ -38,7 +38,7 @@ from oncotriage.agent.terminal import (
     node_finalize,
     node_no_candidates,
 )
-from oncotriage.config import MAX_GPT4O_RETRIES
+from oncotriage.config import MAX_LLM_CLASSIFIER_RETRIES
 from oncotriage.observability import correlation_scope, get_logger
 from oncotriage.utils import resolve_qdrant_collection
 
@@ -71,27 +71,27 @@ def route_after_filter(state: TrialMatchState) -> str:
     """
     Conditional edge after rule-based filtering.
 
-    If filtered_trials is empty, skip GPT-4o evaluation (saves cost)
+    If filtered_trials is empty, skip the LLM classifier (saves cost)
     and go directly to the no_candidates terminal node.
     """
     filtered = state.get("filtered_trials", [])
 
     if not filtered:
         return "no_candidates"
-    return "gpt4o_evaluation"
+    return "llm_classifier_evaluation"
 
 
-def route_after_gpt4o(state: TrialMatchState) -> str:
+def route_after_llm_classifier(state: TrialMatchState) -> str:
     """
-    Conditional edge after GPT-4o evaluation.
+    Conditional edge after the LLM classifier stage.
 
     Three possible outcomes:
         1. Success (evaluations exist, no error) -> finalize
-        2. Failure + retries remaining -> retry (loop back to gpt4o_evaluation)
+        2. Failure + retries remaining -> retry (loop back to llm_classifier_evaluation)
         3. Failure + retries exhausted -> error_handler
     """
     error = state.get("error", "")
-    retries = state.get("gpt4o_retries", 0)
+    retries = state.get("llm_classifier_retries", 0)
     evaluations = state.get("evaluations", [])
 
     # Success: got valid evaluations
@@ -99,8 +99,8 @@ def route_after_gpt4o(state: TrialMatchState) -> str:
         return "finalize"
 
     # Failure but retries remaining: loop back
-    if retries < MAX_GPT4O_RETRIES:
-        return "gpt4o_retry"
+    if retries < MAX_LLM_CLASSIFIER_RETRIES:
+        return "llm_classifier_retry"
 
     # Retries exhausted: go to error handler
     return "error_handler"
@@ -132,13 +132,13 @@ def build_matching_graph() -> object:
       (has  (empty)
       trials)  |
         |   no_candidates ---> END
-      gpt4o_evaluation
+      llm_classifier_evaluation
        /  |  \\
      (ok) |  (fail + retries left)
       |   |       |
       | (fail + exhausted)
       |   |       |
-      |  error   gpt4o_evaluation  <-- RETRY LOOP (cyclic edge)
+      |  error   llm_classifier_evaluation  <-- RETRY LOOP (cyclic edge)
       |  handler
       |   |
     finalize
@@ -153,7 +153,7 @@ def build_matching_graph() -> object:
     workflow.add_node("hybrid_retrieval",      node_hybrid_retrieval)
     workflow.add_node("cross_encoder_rerank",  node_cross_encoder_rerank)
     workflow.add_node("rule_based_filter",     node_rule_based_filter)
-    workflow.add_node("gpt4o_evaluation",      node_gpt4o_evaluation)
+    workflow.add_node("llm_classifier_evaluation",      node_llm_classifier_evaluation)
     workflow.add_node("finalize",              node_finalize)
     workflow.add_node("no_candidates",         node_no_candidates)
     workflow.add_node("error_handler",         node_error_handler)
@@ -177,24 +177,24 @@ def build_matching_graph() -> object:
     workflow.add_edge("cross_encoder_rerank",  "rule_based_filter")
 
     # --- Conditional Edge 2: After Filtering ---
-    # Skip GPT-4o if no candidates survived
+    # Skip the LLM classifier if no candidates survived
     workflow.add_conditional_edges(
         "rule_based_filter",
         route_after_filter,
         {
-            "gpt4o_evaluation": "gpt4o_evaluation",
+            "llm_classifier_evaluation": "llm_classifier_evaluation",
             "no_candidates":    "no_candidates"
         }
     )
 
-    # --- Conditional Edge 3: After GPT-4o (retry loop) ---
+    # --- Conditional Edge 3: After the LLM classifier (retry loop) ---
     # Success -> finalize | Parse failure + retries left -> retry | Exhausted -> error
     workflow.add_conditional_edges(
-        "gpt4o_evaluation",
-        route_after_gpt4o,
+        "llm_classifier_evaluation",
+        route_after_llm_classifier,
         {
             "finalize":       "finalize",
-            "gpt4o_retry":    "gpt4o_evaluation",   # <-- CYCLIC EDGE (retry loop)
+            "llm_classifier_retry":    "llm_classifier_evaluation",   # <-- CYCLIC EDGE (retry loop)
             "error_handler":  "error_handler"
         }
     )
@@ -301,8 +301,8 @@ def build_initial_state(patient_data: Dict, ablation_flags: Dict = None) -> Dict
         "candidates_after_rule_filter": 0,
         "candidates_after_quality_filter": 0,
         "evaluations":        [],
-        "gpt4o_retries":      0,
-        "gpt4o_raw_response": "",
+        "llm_classifier_retries":      0,
+        "llm_classifier_raw_response": "",
         "cross_vocab_remaps": 0,
         "result":             {},
         "error":              "",

@@ -4573,8 +4573,8 @@ def make_result(i):
         "patient_id": f"patient-{i:04d}",
         "timestamp": f"2026-08-05T00:00:{i % 60:02d}",
         "matching_model": "gpt-5.6-terra",
-        "gpt4o_input_tokens": 10,
-        "gpt4o_output_tokens": 5,
+        "llm_classifier_input_tokens": 10,
+        "llm_classifier_output_tokens": 5,
         "matches": [], "near_misses": [], "not_evaluable": [],
         "stage_timings": {},
     }

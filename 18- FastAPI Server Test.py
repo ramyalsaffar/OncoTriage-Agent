@@ -37,7 +37,7 @@ BOTH POSTS CARRY A TIMEOUT, AND THE VALUE IS NOT ARBITRARY. POST_TIMEOUT_SECONDS
 is 180, the same value "19- FastAPI Server Batch Test.py" has always passed to
 the same endpoint, and it is a STAGE 5 BOUND: one POST runs all six stages on
 the server and the fifth is a live model call that the server itself retries up
-to MAX_GPT4O_RETRIES (3) times, so the ceiling has to cover a full pipeline run
+to MAX_LLM_CLASSIFIER_RETRIES (3) times, so the ceiling has to cover a full pipeline run
 plus those retries rather than a single round trip. Before pass 20f these two
 POSTs had no timeout at all, so a server that accepted the connection and then
 hung left this script waiting forever with no output and no verdict. The two

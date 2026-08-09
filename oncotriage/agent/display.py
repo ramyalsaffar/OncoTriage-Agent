@@ -9,7 +9,7 @@ agent module that imports only two config constants.
 
 from typing import Dict
 
-from oncotriage.config import MAX_GPT4O_RETRIES, Project_Name
+from oncotriage.config import MAX_LLM_CLASSIFIER_RETRIES, Project_Name
 from oncotriage.observability import console
 
 
@@ -40,9 +40,9 @@ def display_match_results(result: Dict):
     # Check for pipeline error
     if result.get("error"):
         console.out(f"PIPELINE ERROR: {result['error']}")
-        retries = result.get("gpt4o_retries", 0)
+        retries = result.get("llm_classifier_retries", 0)
         if retries:
-            console.out(f"GPT-4o retries exhausted: {retries}/{MAX_GPT4O_RETRIES}")
+            console.out(f"GPT-4o retries exhausted: {retries}/{MAX_LLM_CLASSIFIER_RETRIES}")
         console.out()
 
     # Pipeline summary
@@ -64,8 +64,8 @@ def display_match_results(result: Dict):
     console.out(f"  Not Eligible:          {len(near_misses)}")
     console.out(f"  Not Evaluable:         {len(not_evaluable)}")
     console.out(f"  Label Remaps:          {result.get('cross_vocab_remaps', 0)}")
-    if result.get("gpt4o_retries", 0):
-        console.out(f"  GPT-4o Retries:        {result['gpt4o_retries']}/{MAX_GPT4O_RETRIES}")
+    if result.get("llm_classifier_retries", 0):
+        console.out(f"  GPT-4o Retries:        {result['llm_classifier_retries']}/{MAX_LLM_CLASSIFIER_RETRIES}")
     if result.get("ablation_flags"):
         console.out(f"  Ablation Flags:        {result['ablation_flags']}")
 

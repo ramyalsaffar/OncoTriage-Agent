@@ -98,7 +98,7 @@ from oncotriage.config import (
     EMBEDDING_MODEL,
     ENABLE_RATE_LIMITING,
     MATCHING_MODEL,
-    MAX_GPT4O_RETRIES,
+    MAX_LLM_CLASSIFIER_RETRIES,
     MAX_TRIALS_FOR_EVALUATION,
     MEDCPT_SCORE_FLOOR,
     Project_Name,
@@ -599,7 +599,7 @@ def create_app():
                 "medcpt_score_floor": MEDCPT_SCORE_FLOOR,
                 "quality_threshold_percentile": QUALITY_THRESHOLD_PERCENTILE,
                 "max_trials_for_evaluation": MAX_TRIALS_FOR_EVALUATION,
-                "max_gpt4o_retries": MAX_GPT4O_RETRIES
+                "max_llm_classifier_retries": MAX_LLM_CLASSIFIER_RETRIES
             },
             "trials_indexed": trials_indexed,
             "trials_indexed_note": trials_indexed_note

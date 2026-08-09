@@ -94,7 +94,7 @@ part of any suite, and capture costs money.
 | 2 `node_hybrid_retrieval` | `agent/retrieval.py` | Qdrant-native BM25 (sparse, 75) + dense `text-embedding-3-small` (100), fused by RRF into `RRF_POOL_SIZE`. Falls back to BM25-only if vector search fails. |
 | 3 `node_cross_encoder_rerank` | `agent/retrieval.py` | MedCPT cross-encoder, multi-query RRF across queries, stable argsort for determinism. |
 | 4 `node_rule_based_filter` | `agent/filtering.py` | MeSH site relevance, stage ordinal, histology, age, sex, dynamic quality threshold, cost cap at 15 trials. |
-| 5 `node_gpt4o_evaluation` | `agent/evaluation.py` | One call producing per-criterion verdicts. JSON-parse failures loop back, up to 3 attempts. |
+| 5 `node_llm_classifier_evaluation` | `agent/evaluation.py` | One call producing per-criterion verdicts. JSON-parse failures loop back, up to 3 attempts. |
 | 6 `node_finalize` | `agent/terminal.py` | Splits eligible / not_eligible / not_evaluable and normalizes labels. |
 
 `node_no_candidates` and `node_error_handler` are the other two terminal nodes,

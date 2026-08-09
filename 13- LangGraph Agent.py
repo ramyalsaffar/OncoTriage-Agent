@@ -12,7 +12,7 @@ by ``build_matching_graph()`` in ``oncotriage/agent/graph.py`` over
   2  node_hybrid_retrieval       Qdrant-native BM25 + dense, fused by RRF
   3  node_cross_encoder_rerank   MedCPT, multi-query RRF, stable argsort
   4  node_rule_based_filter      MeSH site, stage, histology, age, sex, cost cap
-  5  node_gpt4o_evaluation       one call, per-criterion verdicts, JSON retry
+  5  node_llm_classifier_evaluation       one call, per-criterion verdicts, JSON retry
   6  node_finalize               split eligible / not_eligible / not_evaluable
 
 Conditional edges route to ``node_no_candidates`` when a stage empties the pool,

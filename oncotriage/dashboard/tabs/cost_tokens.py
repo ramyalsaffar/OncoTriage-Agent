@@ -126,8 +126,8 @@ def render_cost_tokens_tab(df):
         return
 
     cost_components = []      # one row per (model, input|output)
-    gpt4o_input_cost = 0.0
-    gpt4o_output_cost = 0.0
+    llm_classifier_input_cost = 0.0
+    llm_classifier_output_cost = 0.0
     unpriceable_tokens = 0
     unrecorded_token_models = []
 
@@ -148,8 +148,8 @@ def render_cost_tokens_tab(df):
             unpriceable_tokens += _in + _out
             continue
 
-        gpt4o_input_cost += _row.input_cost
-        gpt4o_output_cost += _row.output_cost
+        llm_classifier_input_cost += _row.input_cost
+        llm_classifier_output_cost += _row.output_cost
         cost_components.append((f"{_row.matching_model} Output", _row.output_cost))
         cost_components.append((f"{_row.matching_model} Input", _row.input_cost))
 
@@ -204,7 +204,7 @@ def render_cost_tokens_tab(df):
         )
         return
 
-    recalc_total = gpt4o_input_cost + gpt4o_output_cost
+    recalc_total = llm_classifier_input_cost + llm_classifier_output_cost
 
     df_cost = pd.DataFrame({
         'Component': [c for c, _ in cost_components],
@@ -223,10 +223,10 @@ def render_cost_tokens_tab(df):
     # second judge — the one thing in this tab that really did still say GPT-4o.
     # Guarded on both denominators: a selection with no input tokens has no
     # ratio to state, and both legends then say so instead of inventing one.
-    total_input_tokens = df['gpt4o_input_tokens'].sum()
-    total_output_tokens = df['gpt4o_output_tokens'].sum()
-    _in_rate = (gpt4o_input_cost / total_input_tokens) if total_input_tokens else 0
-    _out_rate = (gpt4o_output_cost / total_output_tokens) if total_output_tokens else 0
+    total_input_tokens = df['llm_classifier_input_tokens'].sum()
+    total_output_tokens = df['llm_classifier_output_tokens'].sum()
+    _in_rate = (llm_classifier_input_cost / total_input_tokens) if total_input_tokens else 0
+    _out_rate = (llm_classifier_output_cost / total_output_tokens) if total_output_tokens else 0
     _price_ratio = (_out_rate / _in_rate) if (_in_rate > 0 and _out_rate > 0) else None
 
     col1, col2 = st.columns(2)
@@ -247,8 +247,8 @@ def render_cost_tokens_tab(df):
         input_tok_pct = total_input_tokens / total_tokens * 100 if total_tokens > 0 else 0
         output_tok_pct = total_output_tokens / total_tokens * 100 if total_tokens > 0 else 0
 
-        input_cost_pct = gpt4o_input_cost / recalc_total * 100 if recalc_total > 0 else 0
-        output_cost_pct = gpt4o_output_cost / recalc_total * 100 if recalc_total > 0 else 0
+        input_cost_pct = llm_classifier_input_cost / recalc_total * 100 if recalc_total > 0 else 0
+        output_cost_pct = llm_classifier_output_cost / recalc_total * 100 if recalc_total > 0 else 0
 
         _ratio_label = ("Output" if _price_ratio is None
                         else f"Output ({_price_ratio:.1f}x price/tok)")
@@ -263,7 +263,7 @@ def render_cost_tokens_tab(df):
             marker_color='#1f77b4',
             text=[
                 f"{input_tok_pct:.0f}%<br>({total_input_tokens:,.0f} tok)",
-                f"{input_cost_pct:.0f}%<br>(${gpt4o_input_cost:.3f})"
+                f"{input_cost_pct:.0f}%<br>(${llm_classifier_input_cost:.3f})"
             ],
             textposition='inside',
             insidetextanchor='middle',
@@ -278,7 +278,7 @@ def render_cost_tokens_tab(df):
             marker_color='#ff7f0e',
             text=[
                 f"{output_tok_pct:.0f}%<br>({total_output_tokens:,.0f} tok)",
-                f"{output_cost_pct:.0f}%<br>(${gpt4o_output_cost:.3f})"
+                f"{output_cost_pct:.0f}%<br>(${llm_classifier_output_cost:.3f})"
             ],
             textposition='inside',
             insidetextanchor='middle',
@@ -325,8 +325,8 @@ def render_cost_tokens_tab(df):
     
     with col1:
         df_tpt = df[df['candidates_evaluated'] > 0].copy()
-        df_tpt['input_per_trial'] = df_tpt['gpt4o_input_tokens'] / df_tpt['candidates_evaluated']
-        df_tpt['output_per_trial'] = df_tpt['gpt4o_output_tokens'] / df_tpt['candidates_evaluated']
+        df_tpt['input_per_trial'] = df_tpt['llm_classifier_input_tokens'] / df_tpt['candidates_evaluated']
+        df_tpt['output_per_trial'] = df_tpt['llm_classifier_output_tokens'] / df_tpt['candidates_evaluated']
         
         tier_order = list(MATCH_TIERS)
         tier_colors = MATCH_TIER_COLORS
@@ -370,7 +370,7 @@ def render_cost_tokens_tab(df):
     
     with col2:
         df_efficiency = df[df['candidates_evaluated'] > 0].copy()
-        df_efficiency['tokens_per_trial'] = (df_efficiency['gpt4o_input_tokens'] + df_efficiency['gpt4o_output_tokens']) / df_efficiency['candidates_evaluated']
+        df_efficiency['tokens_per_trial'] = (df_efficiency['llm_classifier_input_tokens'] + df_efficiency['llm_classifier_output_tokens']) / df_efficiency['candidates_evaluated']
         
         fig_efficiency = px.histogram(df_efficiency, x='tokens_per_trial', nbins=30, labels={'tokens_per_trial': 'Tokens/Trial'}, template='plotly_white', title='Token Efficiency (Total per Trial)')
         fig_efficiency.add_vline(x=df_efficiency['tokens_per_trial'].median(), line_dash="dash", line_color="red", annotation_text=f"Median: {df_efficiency['tokens_per_trial'].median():.0f}")
@@ -380,9 +380,9 @@ def render_cost_tokens_tab(df):
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        st.metric("Avg Input Tokens", f"{df['gpt4o_input_tokens'].mean():,.0f}", help="Average GPT-4o input tokens per patient (prompt + criteria + patient data)")
+        st.metric("Avg Input Tokens", f"{df['llm_classifier_input_tokens'].mean():,.0f}", help="Average GPT-4o input tokens per patient (prompt + criteria + patient data)")
     with col2:
-        st.metric("Avg Output Tokens", f"{df['gpt4o_output_tokens'].mean():,.0f}", help="Average GPT-4o output tokens per patient (eligibility assessments)")
+        st.metric("Avg Output Tokens", f"{df['llm_classifier_output_tokens'].mean():,.0f}", help="Average GPT-4o output tokens per patient (eligibility assessments)")
     with col3:
         st.metric("Avg Tokens/Trial", f"{df_efficiency['tokens_per_trial'].mean():.0f}" if len(df_efficiency) > 0 else "N/A", help="Average total tokens consumed per trial evaluation")
     

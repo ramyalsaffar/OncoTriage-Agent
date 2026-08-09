@@ -616,7 +616,7 @@ def qdrant_endpoint_sources() -> dict:
 #
 # WHY 1 RATHER THAN THE SDK's DEFAULT OF 2. See the budget reconciliation
 # beside MATCHING_REQUEST_TIMEOUT_SECONDS: anything that fails twice in a row
-# is not transient, and MAX_GPT4O_RETRIES is the budget that should see it.
+# is not transient, and MAX_LLM_CLASSIFIER_RETRIES is the budget that should see it.
 # Kept at 1 rather than 0 because a single transient blip is the common case
 # and recovering it in-SDK is far cheaper than re-entering the node.
 OPENAI_SDK_MAX_RETRIES = 1
@@ -789,7 +789,7 @@ def get_qdrant_client() -> QdrantClient:
 # Configuration Constants (retry behavior) for LangGraph Agent
 # ---------------------------------------------------------------------------
 
-MAX_GPT4O_RETRIES = 3
+MAX_LLM_CLASSIFIER_RETRIES = 3
 RETRY_BASE_DELAY = 1  # seconds, doubles each retry
 
 
@@ -953,7 +953,7 @@ MATCHING_SEED = 42
 #       0 because the common case is a single transient blip and recovering it
 #       in-SDK is far cheaper than re-entering the node; kept at 1 rather than
 #       the SDK's default 2 because anything that fails twice in a row is not
-#       transient and MAX_GPT4O_RETRIES is the budget that should see it.
+#       transient and MAX_LLM_CLASSIFIER_RETRIES is the budget that should see it.
 #
 #       WHY THIS ONE AND NOT TENACITY, for get_embedding(). That function used
 #       to carry @retry(stop_after_attempt(5), wait_exponential(min=2, max=60),
@@ -984,10 +984,10 @@ MATCHING_SEED = 42
 #       Attempts for one Stage 5 request: UNCHANGED at 1 + 1 = 2, so the
 #       per-patient arithmetic below is unaffected by the embedding decision.
 #
-#   MAX_GPT4O_RETRIES (3)
+#   MAX_LLM_CLASSIFIER_RETRIES (3)
 #       THE RESPONSE CAME BACK AND WAS UNUSABLE. Malformed JSON, a non-list
 #       payload, or an exception that escaped the call. Retried by re-entering
-#       node_gpt4o_evaluation, which rebuilds and re-sends the whole prompt.
+#       node_llm_classifier_evaluation, which rebuilds and re-sends the whole prompt.
 #       Note this budget ALSO absorbs a transport failure that survived the SDK
 #       retry above, which is why the two multiply in the arithmetic below.
 #
@@ -1005,7 +1005,7 @@ MATCHING_SEED = 42
 #       = 2 x 300 = 600s
 #
 #   one patient, every node attempt dying at transport  <-- THE REAL BOUND
-#       MAX_GPT4O_RETRIES x 600 = 3 x 600 = 1,800s = 30 MINUTES
+#       MAX_LLM_CLASSIFIER_RETRIES x 600 = 3 x 600 = 1,800s = 30 MINUTES
 #       (3 node attempts, not 4: retry_count is incremented before the router
 #        compares it, so the loop runs 3 times and then routes to the error
 #        handler.)
@@ -1139,7 +1139,7 @@ MATCHING_OUTPUT_SPLIT_FRACTION = 0.90
 
 # How many times a batch may be HALVED because of truncation. This is depth,
 # not repetition, and it is deliberately a separate budget from
-# MAX_GPT4O_RETRIES: a patient that hits one malformed response and then needs
+# MAX_LLM_CLASSIFIER_RETRIES: a patient that hits one malformed response and then needs
 # two splits must not be failed for exhausting a shared counter. Three levels
 # takes a 15-trial batch to 2 trials.
 MAX_TRUNCATION_SPLITS = 3

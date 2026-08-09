@@ -513,14 +513,14 @@ _BASE_ROW = {
     "age": 60, "sex": "male", "race": "White", "ethnicity": "Not Hispanic",
     "primary_condition": "Malignant neoplasm of breast",
     "condition_count": 6, "medication_count": 12, "allergy_count": 1,
-    "expanded_query": "breast carcinoma", "gpt4o_prompt": "PROMPT TEXT",
+    "expanded_query": "breast carcinoma", "llm_classifier_prompt": "PROMPT TEXT",
     "bm25_retrieved": 60, "vector_retrieved": 80,
     "candidates_after_rule_filter": 20, "candidates_after_quality_filter": 15,
     "mesh_dropped": 3, "mesh_resolution": "snomed",
     "stage_dropped": 1, "histology_dropped": 0, "cross_vocab_remaps": 0,
     "query_expansion_time": 0.01, "hybrid_retrieval_time": 1.5,
     "cross_encoder_time": 2.5, "rule_filter_time": 0.2,
-    "gpt4o_evaluation_time": 60.0, "total_time": 64.2,
+    "llm_classifier_evaluation_time": 60.0, "total_time": 64.2,
     # STAYS A LITERAL, and pass 20f-2 checked rather than assumed it should.
     # That pass gave the checkpoint one name, oncotriage.config.
     # CROSS_ENCODER_MODEL, and replaced the five other copies of the string --
@@ -536,7 +536,7 @@ _BASE_ROW = {
     "cross_encoder_model": "ncbi/MedCPT-Cross-Encoder",
     "pricing_version": "2026-08-04", "qdrant_collection": "trial_criteria_x",
     "error": "", "patient_data_hash": "deadbeef",
-    "gpt4o_retries": 0, "ablation_flags": "{}",
+    "llm_classifier_retries": 0, "ablation_flags": "{}",
     "retrieval_channels_expected": 4, "retrieval_channels_ok": 4,
     "retrieval_degraded": 0, "retrieval_trials_lost": 0,
     "query_expansion_path": "mesh_expanded",
@@ -544,8 +544,8 @@ _BASE_ROW = {
     "age_reference_date": "2026-02-26", "birth_date_precision": "day",
     "ecog_value": 1, "ecog_selection": "most_recent_on_or_before_reference",
     "ecog_observations_found": 2,
-    "gpt4o_truncation_splits": 0, "gpt4o_calls": 1,
-    "not_evaluable_truncated": 0, "gpt4o_output_tokens_estimated": 5000,
+    "llm_classifier_truncation_splits": 0, "llm_classifier_calls": 1,
+    "not_evaluable_truncated": 0, "llm_classifier_output_tokens_estimated": 5000,
 }
 
 # (label, overrides). The consistency expectation for each is asserted in
@@ -556,19 +556,19 @@ _SEED_ROWS = [
     # `extreme_cases`, `medication_duplication_suspects` and `slowest_prompt`
     # non-empty.
     ("P-CONSISTENT-A", dict(
-        matching_model=_MODEL_A, gpt4o_input_tokens=10000,
-        gpt4o_output_tokens=5000, gpt4o_reasoning_tokens=None,
+        matching_model=_MODEL_A, llm_classifier_input_tokens=10000,
+        llm_classifier_output_tokens=5000, llm_classifier_reasoning_tokens=None,
         estimated_cost_usd=0.075, medication_count=120, condition_count=10,
         total_time=130.0, age=61,
         candidates_retrieved=100, candidates_reranked=40,
         candidates_filtered=15, candidates_evaluated=15,
         eligible_matches=5, near_misses=8, not_evaluable_trials=2)),
     # Consistent: 3 + 12 + 0 == 15. Same candidates_evaluated as the row above,
-    # which is what satisfies `gpt4o_efficiency_by_trial_count`'s HAVING >= 2,
+    # which is what satisfies `llm_classifier_efficiency_by_trial_count`'s HAVING >= 2,
     # and >4000 output tokens, which is what makes `verbose_output` non-empty.
     ("P-CONSISTENT-B", dict(
-        matching_model=_MODEL_A, gpt4o_input_tokens=20000,
-        gpt4o_output_tokens=4500, gpt4o_reasoning_tokens=1200,
+        matching_model=_MODEL_A, llm_classifier_input_tokens=20000,
+        llm_classifier_output_tokens=4500, llm_classifier_reasoning_tokens=1200,
         estimated_cost_usd=0.095, age=72, sex="female", medication_count=60,
         candidates_retrieved=87, candidates_reranked=40,
         candidates_filtered=15, candidates_evaluated=15,
@@ -577,8 +577,8 @@ _SEED_ROWS = [
     # NULL. Beside the two rows above this is what makes the aggregate columns
     # float64 and turns `int(x or 0)` into a ValueError.
     ("P-NULL-TOKENS", dict(
-        matching_model=_MODEL_B, gpt4o_input_tokens=None,
-        gpt4o_output_tokens=None, gpt4o_reasoning_tokens=None,
+        matching_model=_MODEL_B, llm_classifier_input_tokens=None,
+        llm_classifier_output_tokens=None, llm_classifier_reasoning_tokens=None,
         estimated_cost_usd=None, age=55, total_time=50.0,
         retrieval_degraded=1, retrieval_channels_ok=3,
         retrieval_channels='{"title": {"status": "ok", "count": 60}}',
@@ -588,8 +588,8 @@ _SEED_ROWS = [
         eligible_matches=2, near_misses=7, not_evaluable_trials=1)),
     # NULL model, no tokens. A no-candidates run.
     ("P-NOMODEL-CLEAN", dict(
-        matching_model=None, gpt4o_input_tokens=0, gpt4o_output_tokens=0,
-        gpt4o_reasoning_tokens=None, estimated_cost_usd=0.0, age=44,
+        matching_model=None, llm_classifier_input_tokens=0, llm_classifier_output_tokens=0,
+        llm_classifier_reasoning_tokens=None, estimated_cost_usd=0.0, age=44,
         sex="female", medication_count=2, condition_count=1, total_time=5.0,
         query_expansion_path="base_query_fallback", mesh_filter_applied=0,
         mesh_filter_skip_reason="no_mesh_filter", mesh_resolution="unmapped",
@@ -598,15 +598,15 @@ _SEED_ROWS = [
         eligible_matches=0, near_misses=0, not_evaluable_trials=0)),
     # NULL model WITH tokens. The logging defect the note is for.
     ("P-NOMODEL-TOKENS", dict(
-        matching_model=None, gpt4o_input_tokens=1234, gpt4o_output_tokens=567,
-        gpt4o_reasoning_tokens=None, estimated_cost_usd=0.0, age=66,
+        matching_model=None, llm_classifier_input_tokens=1234, llm_classifier_output_tokens=567,
+        llm_classifier_reasoning_tokens=None, estimated_cost_usd=0.0, age=66,
         candidates_retrieved=50, candidates_reranked=30,
         candidates_filtered=12, candidates_evaluated=12,
         eligible_matches=4, near_misses=8, not_evaluable_trials=0)),
     # 5 + 3 + 2 == 10, not 15. A genuine count mismatch.
     ("P-COUNT-MISMATCH", dict(
-        matching_model=_MODEL_A, gpt4o_input_tokens=9000,
-        gpt4o_output_tokens=3000, gpt4o_reasoning_tokens=None,
+        matching_model=_MODEL_A, llm_classifier_input_tokens=9000,
+        llm_classifier_output_tokens=3000, llm_classifier_reasoning_tokens=None,
         estimated_cost_usd=0.06, age=50, sex="female",
         candidates_retrieved=100, candidates_reranked=40,
         candidates_filtered=15, candidates_evaluated=15,
@@ -614,16 +614,16 @@ _SEED_ROWS = [
     # One past the fusion-pool cap. Counts otherwise consistent, so this row can
     # only be flagged for the reason it is here for.
     ("P-CAP-RETRIEVAL", dict(
-        matching_model=_MODEL_A, gpt4o_input_tokens=1000,
-        gpt4o_output_tokens=500, gpt4o_reasoning_tokens=None,
+        matching_model=_MODEL_A, llm_classifier_input_tokens=1000,
+        llm_classifier_output_tokens=500, llm_classifier_reasoning_tokens=None,
         estimated_cost_usd=0.008, age=58,
         candidates_retrieved=RRF_POOL_SIZE + 1, candidates_reranked=40,
         candidates_filtered=5, candidates_evaluated=5,
         eligible_matches=2, near_misses=2, not_evaluable_trials=1)),
     # One past the rerank cap, same discipline.
     ("P-CAP-RERANK", dict(
-        matching_model=_MODEL_A, gpt4o_input_tokens=1100,
-        gpt4o_output_tokens=520, gpt4o_reasoning_tokens=None,
+        matching_model=_MODEL_A, llm_classifier_input_tokens=1100,
+        llm_classifier_output_tokens=520, llm_classifier_reasoning_tokens=None,
         estimated_cost_usd=0.009, age=59,
         candidates_retrieved=100, candidates_reranked=TOP_K_CANDIDATES + 1,
         candidates_filtered=5, candidates_evaluated=5,
@@ -632,8 +632,8 @@ _SEED_ROWS = [
     # is NULL, so before item 38 this row reached ELSE 'OK' and was reported as
     # consistent.
     ("P-NULL-COUNTERS", dict(
-        matching_model=_MODEL_A, gpt4o_input_tokens=100,
-        gpt4o_output_tokens=50, gpt4o_reasoning_tokens=None,
+        matching_model=_MODEL_A, llm_classifier_input_tokens=100,
+        llm_classifier_output_tokens=50, llm_classifier_reasoning_tokens=None,
         estimated_cost_usd=0.001, age=48,
         candidates_retrieved=None, candidates_reranked=None,
         candidates_filtered=None, candidates_evaluated=None,
@@ -641,8 +641,8 @@ _SEED_ROWS = [
     # A failed run. Makes `error_types` non-empty, and retrieved > 0 with
     # evaluated == 0 makes `extreme_cases` non-empty for a second reason.
     ("P-ERROR", dict(
-        matching_model=_MODEL_A, gpt4o_input_tokens=0, gpt4o_output_tokens=0,
-        gpt4o_reasoning_tokens=None, estimated_cost_usd=0.0, age=70,
+        matching_model=_MODEL_A, llm_classifier_input_tokens=0, llm_classifier_output_tokens=0,
+        llm_classifier_reasoning_tokens=None, estimated_cost_usd=0.0, age=70,
         error="Stage 5 timeout after 300s",
         candidates_retrieved=100, candidates_reranked=40,
         candidates_filtered=0, candidates_evaluated=0,
@@ -650,8 +650,8 @@ _SEED_ROWS = [
     # A PRE-MIGRATION row: not_evaluable_trials NULL, and evaluated equal to
     # eligible + near_misses. The weak branch must NOT flag it.
     ("P-LEGACY-OK", dict(
-        matching_model=_MODEL_A, gpt4o_input_tokens=800,
-        gpt4o_output_tokens=400, gpt4o_reasoning_tokens=None,
+        matching_model=_MODEL_A, llm_classifier_input_tokens=800,
+        llm_classifier_output_tokens=400, llm_classifier_reasoning_tokens=None,
         estimated_cost_usd=0.006, age=64,
         candidates_retrieved=90, candidates_reranked=35,
         candidates_filtered=9, candidates_evaluated=9,
@@ -659,8 +659,8 @@ _SEED_ROWS = [
     # A PRE-MIGRATION row that is provably wrong even without the third term:
     # 9 evaluated cannot be fewer than 6 + 5.
     ("P-LEGACY-BAD", dict(
-        matching_model=_MODEL_A, gpt4o_input_tokens=810,
-        gpt4o_output_tokens=410, gpt4o_reasoning_tokens=None,
+        matching_model=_MODEL_A, llm_classifier_input_tokens=810,
+        llm_classifier_output_tokens=410, llm_classifier_reasoning_tokens=None,
         estimated_cost_usd=0.006, age=65,
         candidates_retrieved=90, candidates_reranked=35,
         candidates_filtered=9, candidates_evaluated=9,
@@ -684,8 +684,8 @@ _BULK_RETRIEVAL_ANOMALY = queries.CONSISTENCY_LISTING_LIMIT - _BULK_COUNT_MISMAT
 
 for _n in range(_BULK_COUNT_MISMATCH):
     _SEED_ROWS.append((f"P-BULK-COUNT-{_n:03d}", dict(
-        matching_model=_MODEL_A, gpt4o_input_tokens=700 + _n,
-        gpt4o_output_tokens=300 + _n, gpt4o_reasoning_tokens=None,
+        matching_model=_MODEL_A, llm_classifier_input_tokens=700 + _n,
+        llm_classifier_output_tokens=300 + _n, llm_classifier_reasoning_tokens=None,
         estimated_cost_usd=0.005, age=40 + _n,
         candidates_retrieved=95, candidates_reranked=38,
         candidates_filtered=12, candidates_evaluated=12,
@@ -694,8 +694,8 @@ for _n in range(_BULK_COUNT_MISMATCH):
 
 for _n in range(_BULK_RETRIEVAL_ANOMALY):
     _SEED_ROWS.append((f"P-BULK-RETRIEVAL-{_n:03d}", dict(
-        matching_model=_MODEL_A, gpt4o_input_tokens=650 + _n,
-        gpt4o_output_tokens=280 + _n, gpt4o_reasoning_tokens=None,
+        matching_model=_MODEL_A, llm_classifier_input_tokens=650 + _n,
+        llm_classifier_output_tokens=280 + _n, llm_classifier_reasoning_tokens=None,
         estimated_cost_usd=0.005, age=45 + _n,
         candidates_retrieved=RRF_POOL_SIZE + 2 + _n, candidates_reranked=38,
         candidates_filtered=11, candidates_evaluated=11,
@@ -1104,7 +1104,7 @@ _cursor.execute(
     "INSERT INTO inferences (patient_id, timestamp, matching_model, error, "
     "candidates_retrieved, candidates_reranked, candidates_filtered, "
     "candidates_evaluated, eligible_matches, near_misses, "
-    "not_evaluable_trials, gpt4o_input_tokens, gpt4o_output_tokens, "
+    "not_evaluable_trials, llm_classifier_input_tokens, llm_classifier_output_tokens, "
     "estimated_cost_usd) VALUES ('P-BULK-COUNT-000', '2026-08-01', ?, '', "
     "95, 38, 12, 12, 4, 4, 1, 700, 300, 0.005)", (_MODEL_A,))
 _conn.commit()
@@ -1459,9 +1459,9 @@ _expected_a = {"in": 0, "out": 0, "reasoning": 0}
 for _label, _overrides in _SEED_ROWS:
     if _overrides.get("matching_model") != _MODEL_A:
         continue
-    for _key, _column in (("in", "gpt4o_input_tokens"),
-                          ("out", "gpt4o_output_tokens"),
-                          ("reasoning", "gpt4o_reasoning_tokens")):
+    for _key, _column in (("in", "llm_classifier_input_tokens"),
+                          ("out", "llm_classifier_output_tokens"),
+                          ("reasoning", "llm_classifier_reasoning_tokens")):
         _value = _overrides.get(_column)
         if _value is not None:
             _expected_a[_key] += _value
@@ -1695,8 +1695,8 @@ check("...and that comparison reports a one-microdollar difference as unequal",
 # min_count=1 IS WHAT MAKES THE TWO AGREE, and the disagreement it removes is
 # demonstrated rather than described.
 _naive = _full_frame.groupby("matching_model", dropna=False)[
-    ["gpt4o_input_tokens"]].sum()
-_naive_b = _naive.loc[_MODEL_B, "gpt4o_input_tokens"]
+    ["llm_classifier_input_tokens"]].sum()
+_naive_b = _naive.loc[_MODEL_B, "llm_classifier_input_tokens"]
 check("without min_count=1 pandas reports the all-NULL group as 0.0, where SQL "
       "reports NULL", float(_naive_b), 0.0)
 check_true("...and with min_count=1 it agrees with SQL",
@@ -1802,16 +1802,16 @@ if _tab_module is not None:
 
         # NEGATIVE CONTROL for the render: drop a column the SHARED AGGREGATE
         # needs and the tab must fail loudly rather than draw a partial chart.
-        # gpt4o_reasoning_tokens is the right column to drop -- the tab itself
+        # llm_classifier_reasoning_tokens is the right column to drop -- the tab itself
         # never reads it, so only model_groups_from_frame can notice, which is
         # what makes this a control on the consolidation rather than on the
         # tab's own indexing (dropping estimated_cost_usd raises KeyError at
         # the metrics row above, long before the costing block).
         with quiet():
             _control = check_raises(
-                "  (a frame missing gpt4o_reasoning_tokens)", ValueError,
+                "  (a frame missing llm_classifier_reasoning_tokens)", ValueError,
                 _tab_module.render_cost_tokens_tab,
-                _tab_frame.drop(columns=["gpt4o_reasoning_tokens"]))
+                _tab_frame.drop(columns=["llm_classifier_reasoning_tokens"]))
         check_true("...and a frame missing a column only the shared aggregate "
                    "reads makes it raise rather than render a partial breakdown",
                    isinstance(_control, ValueError))

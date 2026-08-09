@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-**OncoTriage Agent** — matches oncology patients (Synthea FHIR bundles) to recruiting ClinicalTrials.gov trials using a 6-stage LangGraph pipeline over hybrid BM25 + vector RAG on Qdrant, with GPT-4o for criterion-level eligibility evaluation.
+**OncoTriage Agent** — matches oncology patients (Synthea FHIR bundles) to recruiting ClinicalTrials.gov trials using a 6-stage LangGraph pipeline over hybrid BM25 + vector RAG on Qdrant, with an LLM classifier (`config.MATCHING_MODEL`, `gpt-5.6-terra` since 2026-08-04) for criterion-level eligibility evaluation.
 
 ## THE EXEC CHAIN IS DEAD (pass 20e) — read this before touching any file
 
@@ -394,7 +394,7 @@ python tests/test_monitoring_ecog_availability_drift.py            # 111 (was 11
 python tests/test_registries_cancer_code_claims_audit.py           # 197
 python tests/test_registries_cancer_code_claims_audit_control.py   #  16; 14 planted, 14 caught
 python tests/test_config_snapshot_date_rot.py                      #  10; 6 subprocess runs, ~6 min
-python tests/test_package_invariants.py                            # 247 (was 248; pass 20f-3 deleted the _REEXPORT_EXEMPTIONS staleness check with the table). No network, no keys, no corpus
+python tests/test_package_invariants.py                            # 247/0/0 on macOS; 245/2/2 on Linux (was 234/6 there before commit ec2033a gave it a SKIP mechanism). No network, no keys, no corpus. NOT in CI — see below
 python tests/test_degraded_dependencies.py                         # 174 (was 172 in this note, and 170 before pass 20e; the 172 was never true of the file). Item 11a
 python tests/test_storage_query_layer.py                           # 194; item 38, temp SQLite only
 
@@ -610,7 +610,7 @@ dependencies (item 11a)" below.
 4. **`node_rule_based_filter`** — MeSH site relevance, cancer stage ordinal, histology, age, sex + a **two-knob quality gate** and cost cap (`MAX_TRIALS_FOR_EVALUATION = 15`). Both knobs must pass: `QUALITY_THRESHOLD_PERCENTILE = 25` of the **unboosted fused** score within the pool, and `MEDCPT_SCORE_FLOOR` on `medcpt_score_max`. A trial with no MedCPT score is not dropped by the floor — absence of a score is not a low score. Each knob reports its own count (`quality_dropped_percentile` / `quality_dropped_floor` / `quality_dropped_floor_only`); they **overlap**, so they do not sum to `quality_dropped`.
 
 **`RERANK_SCORE_THRESHOLD` IS DELETED AND THE REASON IS THE POINT.** It was `-10`, a floor on the *fused RRF* score, under a comment describing MedCPT's `-25 .. +10` range — true of the code it was written for, false of the code it sat above. A fused RRF value runs about **0.01 .. 0.06** and is a function of pool size and query count, not of quality (a trial ranked first by all three queries scores ~0.050 however good it is). The gate took `max(percentile, floor)`, so the floor could never be selected — **not rarely, never** — and the relative percentile was doing 100% of the filtering, cutting one trial from a patient whose four survivors were all excellent. `MEDCPT_SCORE_FLOOR` is measured, not chosen: `python measure_medcpt_scores.py` (thin entry point over `oncotriage/evaluation/medcpt_calibration.py`) runs Stages 1–3 only over a seeded 10-breast/10-colon/10-lung sample and reports the distribution plus what the floor would drop *that the percentile does not*. Re-run it after an index rebuild, a rerank-query change, or a cross-encoder checkpoint change.
-5. **`node_gpt4o_evaluation`** — one GPT-4o call producing per-criterion verdicts; JSON-parse failures loop back up to `MAX_GPT4O_RETRIES = 3`.
+5. **`node_llm_classifier_evaluation`** — one `MATCHING_MODEL` call producing per-criterion verdicts; JSON-parse failures loop back up to `MAX_LLM_CLASSIFIER_RETRIES = 3`.
 6. **`node_finalize`** — splits eligible/not_eligible, normalizes labels.
 
 Nodes 1–3 are in `agent/retrieval.py`, node 4 in `agent/filtering.py`, node 5 in `agent/evaluation.py`, node 6 and the other two terminal nodes in `agent/terminal.py`.
@@ -2147,9 +2147,11 @@ collection digest and every retrieval call go through that client.
 metadata declares incompatible. **What the machine needs to satisfy its own
 pins is `pip install streamlit==1.46.0`**, bringing the install up to what the
 declaration already says. The pin was not edited down to match a stale install:
-1.45.1 is not installable alongside `apache-airflow-core 3.1.7` at all
-(`packaging<25` versus `packaging>=25.0`, no version satisfies both), so
-recording it would make the dependency list unresolvable.
+1.45.1 is not installable alongside `apache-airflow-core` at all
+(`packaging<25` versus `packaging>=25.0`, no version satisfies both — measured
+against 3.1.7, which was the pin at the time; the pin is **3.3.0** now and lives
+in the `orchestration` extra), so recording it would make the dependency list
+unresolvable. **Still 1.45.1 on this machine at 2026-08-09**, re-measured.
 
 
 ### Dead code and small seams (pass 20f-3)
@@ -2790,16 +2792,68 @@ is about the collection the agent retrieves from), and it **raises** rather than
 reporting `found: False` when the index could not be asked, because "no such
 trial" and "the server is unreachable" are the same empty list at the Qdrant API.
 
-**`mcp==2.0.0` FORCED A SECOND PIN, AND WITHOUT IT THE FASTAPI SERVER BREAKS.**
-mcp requires `sse-starlette>=3.0.0`; that package's current release requires
-`starlette>=0.49.1`; `fastapi==0.117.1` requires `starlette<0.49.0`. Installing
-mcp plain drags starlette to 1.4.1 and `import oncotriage.api.server` then dies
-at `FastAPI(...)` with `TypeError: Router.__init__() got an unexpected keyword
-argument 'on_startup'` — measured, not predicted. `sse-starlette==3.0.2` is the
-newest release whose starlette requirement is an **extra**, so it constrains
-nothing; nothing here uses it, since the server speaks stdio only. The real fix
-is moving fastapi past its cap, which is a serving-layer change item 21 and
-Files 18/19 measure. **Recorded as a follow-up.**
+**`mcp==2.0.0` ONCE FORCED A SECOND PIN. THAT PIN IS GONE AND THE CONFLICT NO
+LONGER EXISTS (commit `ec2033a`).** The history, because the shape recurs: mcp
+requires `sse-starlette>=3.0.0`, that package's releases from 3.1.0 on require
+`starlette>=0.49.1`, and `fastapi==0.117.1` required `starlette<0.49.0`.
+Installing mcp plain dragged starlette forward and `import oncotriage.api.server`
+died at `FastAPI(...)` with `TypeError: Router.__init__() got an unexpected
+keyword argument 'on_startup'` — measured, not predicted. `sse-starlette==3.0.2`
+was pinned as the newest release whose starlette requirement is an **extra**, so
+it constrained nothing, and the follow-up recorded here was "move fastapi past
+its cap".
+
+**THAT FOLLOW-UP IS CLOSED, AND WHAT CLOSED IT WAS THE AIRFLOW UPGRADE RATHER
+THAN THE SERVING LAYER.** `apache-airflow` moves 3.1.7 → **3.3.0** to fix two
+CRITICALs (`CVE-2025-57735` JWT-valid-after-logout, `CVE-2026-42252`
+template-engine injection) that were previously *accepted* through
+`.trivyignore`. Airflow 3.1.7 declared `fastapi<0.118.0`; 3.2.2 and 3.3.0
+declare `>=0.129.0` (3.3.0 also `<0.137.0`), and pip refuses every combination
+in between — so the Airflow move and the fastapi move are **one move**.
+`fastapi` is **0.136.3**, the highest release inside 3.3.0's window, and it
+declares `starlette>=0.46.0` with **no upper bound**; starlette resolves to
+**1.6.0**. The `sse-starlette` pin is **deleted** rather than moved forward:
+keeping a pin whose reason has expired is how a dependency gets held at an old
+release by an argument nobody re-reads. It is a transitive dependency of `mcp`
+now, the way `httpx` is a transitive dependency of `openai`.
+
+Releasing the `starlette<0.49.0` cap is what made **six starlette advisories**
+fixable; all six are deleted from `.github/scripts/audit_gate.py` and three from
+`.trivyignore`, and `audit_gate.py` **fails on a stale accepted id**, so leaving
+them behind would have turned the gate red rather than passing quietly.
+
+**Airflow lives in an optional extra now**, `[project.optional-dependencies]`
+`orchestration = ["apache-airflow==3.3.0", "pendulum==3.2.0"]`. The extra is a
+**packaging boundary and was never a fix** — it narrows what a default
+`pip install` resolves and therefore what CI's pip-audit sees; the image still
+installs it explicitly, so Trivy always saw those packages. Nothing in
+`oncotriage/orchestration/` imports airflow (verified by AST — the
+`import pendulum` and `from airflow.sdk import ...` a grep finds live inside the
+generated DAG *string*), so the package imports and bucket A passes with Airflow
+absent:
+
+```bash
+pip install -e .                    # pipeline only, no Airflow
+pip install -e ".[orchestration]"   # adds Airflow, for Files 22/23/24
+```
+
+**`caffeine` IS macOS-ONLY BY ENVIRONMENT MARKER** — `caffeine==0.5;
+sys_platform == 'darwin'`. The old note said it had to be installed on Linux too
+because `oncotriage/utils.py` did an unguarded module-scope `import caffeine`;
+that stopped being true at item 21 (the import is inside `try/except Exception`,
+the reason is recorded in `CAFFEINE_IMPORT_ERROR`, and `CaffeinateSession`
+degrades). Installing it on Linux buys nothing and **costs**: the package's last
+two module-level statements are `on()` and `atexit.register(off)`, and `on()` is
+`subprocess.Popen(['caffeinate', ...])` — a process spawn at import time, which
+is exactly what `tests/test_package_invariants.py` section 2 exists to forbid.
+
+**THE DEVELOPMENT MACHINE'S INSTALL IS BEHIND THESE PINS, and that is a fact
+about the machine, not about the declaration.** Measured 2026-08-09 with
+`importlib.metadata`: `fastapi 0.117.1`, `starlette 0.48.0`,
+`apache-airflow 3.1.7`, `sse-starlette 3.0.2` still present, `streamlit 1.45.1`.
+`pip install -e ".[orchestration]"` is what brings it up to what
+`pyproject.toml` says. **Nothing in this repository is pinned to the installed
+set** — `pyproject.toml` is the one dependency list.
 
 **The client config block is in `oncotriage/mcp/server.py`'s docstring.** Both
 paths in it are absolute on purpose — that rule is about SOURCE, and a client
@@ -2923,7 +2977,7 @@ would pass for free.
 `storage/queries.py:print_slowest_prompt` renders a whole Stage 5 prompt —
 patient summary, conditions, labs. Its `out=` default moved from `print` to
 `console.out`. It is an operator running File 16 interactively at a terminal,
-not a durable record, and `gpt4o_prompt` is not on the allowlist, so it cannot
+not a durable record, and `llm_classifier_prompt` is not on the allowlist, so it cannot
 enter one.
 
 **`ONCOTRIAGE_LOG_LEVEL`** is named in `oncotriage/settings.py` and resolved by
@@ -3828,6 +3882,107 @@ both** — without it, 4e would have passed vacuously, twice.
 **VERIFIED BY RUNNING.** `fixture_replay.py` **12/12 clean without recapture**,
 `tests/test_package_invariants.py` **247**, and every hash-adjacent existing test
 at its documented count. **No money was spent.**
+
+### A SKIP IS NOT A PASS (commit `ec2033a`)
+
+`tests/test_package_invariants.py` has a third counter. `skip(label, reason)`
+records coverage that could **not** be exercised on this platform, into
+`_RESULTS["skipped"]` and `_SKIPS` — never into `passed`. The count is
+**always printed, even at zero**, because a skip count that only appears when
+non-zero is indistinguishable from a file that has no skip mechanism at all.
+
+It exists because `caffeine` became darwin-only: sections 2 and 5 pre-import it
+before arming their traps, and on Linux that import is a process spawn that
+cannot succeed. Both preambles guard it and record a SKIP.
+
+| platform | before | after |
+|---|---|---|
+| Linux | 234 passed / 6 failed | **245 / 2 / 2** |
+| macOS | 247 / 0 | **247 / 0 / 0** (unchanged) |
+
+**It is still NOT in CI bucket A.** The two remaining Linux failures are check
+2b's non-degeneracy half, which restores the project root by unsetting
+`ONCOTRIAGE_MAIN_PATH` and leaning on a fallback that exists on one machine.
+That is an assumption in the test, not a defect in the package, and it is an
+open follow-up.
+
+### `gpt4o` IS `llm_classifier` EVERYWHERE (the naming pass)
+
+Stage 5 stopped calling GPT-4o on **2026-08-04** (`MATCHING_MODEL` is
+`gpt-5.6-terra`) and the name stayed in 476 places: a graph node, a router, a
+config constant, ten state/result keys, nine database columns, three ablation
+columns, nine recorded fixture fields, a drift metric and an API response key.
+**A name that pins a vendor's model to a pipeline stage goes stale the first
+time the model changes, and this one had.** The prefix is `llm_classifier` and
+**not** a bare `classifier`, because the pipeline also contains a cross-encoder
+ranker (Stage 3) and rule-based filters (Stage 4).
+
+| was | is |
+|---|---|
+| `node_gpt4o_evaluation` | `node_llm_classifier_evaluation` |
+| `route_after_gpt4o` | `route_after_llm_classifier` |
+| `MAX_GPT4O_RETRIES` | `MAX_LLM_CLASSIFIER_RETRIES` |
+| `CASE_GPT4O_RETRY = "gpt4o_retry"` | `CASE_LLM_CLASSIFIER_PARSE_RETRY = "llm_classifier_parse_retry"` |
+| fixture `gpt4o_retry_constructed` | `llm_classifier_parse_retry_constructed` |
+| every `gpt4o_*` key, column, field, metric | `llm_classifier_*` |
+
+**THE FIXTURE CASE IS NOT A STRAIGHT PREFIX SWAP.** Its subject is the
+**parse-failure** retry budget; truncation is a separate mechanism with a
+separate budget (`MAX_TRUNCATION_SPLITS`) and its own fixture
+(`truncation_split`), and `gpt4o_retry` did not say which of the two it meant.
+
+**NO MIGRATION WAS WRITTEN, DELIBERATELY.** The column-additions dicts are the
+only migration mechanism in `storage/database_logger.py` and they can only ADD
+columns — `ALTER TABLE ... RENAME COLUMN` is not expressible through them, and a
+compatibility shim reading both names is a second vocabulary that has to be kept
+in step forever. The production database is disposable, a separate copy exists,
+and every published number comes from a fresh end-to-end run. **An existing
+database keeps the old column names until it is rebuilt**, and the readers will
+not find them. Measured, by rebuilding the pre-rename `CREATE TABLE` out of
+`git show HEAD:` and running the registry against it: **12 of the 39 queries
+raise** (`DatabaseError` wrapping sqlite's `no such column`) and **0 succeed
+silently**. That is the intended loud failure — no reader returns a wrong
+number, and none returns zero.
+
+**THE FIXTURE SCHEMA WENT 3 → 4** and the twelve recordings on disk are
+therefore unreadable. `load_fixture()` refuses by version *before* any field is
+read, naming both versions and the re-capture command, and `fixture_replay.py`
+exits 1 on a load failure — the alternative is a replay that reports every
+renamed field as absent and compares `None` with `None`. They were already
+unreplayable for an unrelated reason (the alias moved past their pinned
+collection digest at the M-category pass), so no working gate was lost; the
+re-capture is scheduled separately and **no model call was made in this pass**.
+
+**SIX HISTORICAL-RECORD SITES KEEP THE OLD NAME**, because renaming inside an
+account of a past defect makes it describe something that never happened. The
+rule applied: *a past-tense account keeps the old spelling when the thing it
+names no longer exists under any name.*
+
+| site | what it records |
+|---|---|
+| `storage/database_logger.py` (the `llm_classifier_retries` insert) | File 14 read `result["gpt4o_retries_exhausted"]`, a key only the error handler wrote |
+| `agent/terminal.py` (the provenance block) | `gpt4o_retries` existed only on the error path |
+| `storage/queries.py` (above `llm_classifier_efficiency_by_trial_count`) | File 16 line 545, `df_gpt4o_efficiency` — a variable in a deleted file |
+| `storage/queries.py` (`_int_or_none`'s docstring) | a dated measurement of rows *stored under the old schema* |
+| `tests/test_storage_inference_logging_contract.py` (module docstring) | the same File 14 read |
+| this file, item 38's account | the same dated measurement |
+
+**WHAT WAS DELIBERATELY NOT SWEPT.** The hyphenated `GPT-4o` prose family — ~161
+mentions, mostly dashboard help text, console strings, chart labels and dated
+calibration notes — is a **separate** family that a `gpt4o` search does not
+match. Comments and docstrings documenting a *renamed identifier* were corrected
+(the node, the router, the two terminal nodes, the Stage 5 state block); **no
+emitted string changed**, so no console line, chart label or report heading
+moved. Where prose needs a model name it should interpolate `MATCHING_MODEL`, on
+`/pipeline/info`'s precedent — writing `gpt-5.6-terra` into a comment creates the
+next stale site rather than removing one.
+
+**ONE EMITTED VALUE DID CHANGE, and it is a contract change stated as one:**
+`GET /pipeline/info` reports `config.max_llm_classifier_retries` where it
+reported `max_gpt4o_retries`. `result["gpt4o_retries_exhausted"]` —
+`node_error_handler`'s deliberate alias for an external consumer — became
+`llm_classifier_retries_exhausted` with it. No caller in this repository reads
+either.
 
 ## Persistence and observability
 

@@ -307,16 +307,16 @@ INFERENCE_COLUMN_ADDITIONS = {
 
     # --- Stage 5 truncation control (item 19c) -----------------------------
     #
-    # Two counters because there are two budgets. gpt4o_retries counts whole-
-    # node retries for a malformed or failed response; gpt4o_truncation_splits
+    # Two counters because there are two budgets. llm_classifier_retries counts whole-
+    # node retries for a malformed or failed response; llm_classifier_truncation_splits
     # counts levels of halving spent because a response was CUT OFF at the
     # model's output ceiling. Before this, a truncated response fell through to
     # the JSON parser, failed there, and was retried as an identical request
     # that truncated again -- so a truncation was logged as three parse
     # retries, and the two causes were indistinguishable in the record.
     #
-    # gpt4o_output_tokens_estimated is the pre-call estimate, stored beside the
-    # actual in gpt4o_output_tokens. That column pair is what the constants in
+    # llm_classifier_output_tokens_estimated is the pre-call estimate, stored beside the
+    # actual in llm_classifier_output_tokens. That column pair is what the constants in
     # 03- Config.py were derived from over 1,094 historical rows, and storing
     # the estimate is what lets the next derivation be measured rather than
     # guessed. NULL when Stage 5 never ran: "estimated nothing" is not "0".
@@ -327,23 +327,23 @@ INFERENCE_COLUMN_ADDITIONS = {
     # and only this column separates "the model assessed it and could not
     # conclude" from "the model never got to answer".
     #
-    # gpt4o_calls is how many requests the stage actually issued. Without it a
+    # llm_classifier_calls is how many requests the stage actually issued. Without it a
     # split run and an unsplit one are indistinguishable in the token columns,
     # because the tokens are summed across chunks.
-    "gpt4o_truncation_splits":      "INTEGER",
-    "gpt4o_output_tokens_estimated": "INTEGER",
+    "llm_classifier_truncation_splits":      "INTEGER",
+    "llm_classifier_output_tokens_estimated": "INTEGER",
     "not_evaluable_truncated":      "INTEGER",
-    "gpt4o_calls":                  "INTEGER",
+    "llm_classifier_calls":                  "INTEGER",
 
     # --- Reasoning-model accounting (item 29a, gpt-5.6-terra migration) ------
     #
-    # The reasoning share OF gpt4o_output_tokens. NOT an additional charge.
+    # The reasoning share OF llm_classifier_output_tokens. NOT an additional charge.
     # OpenAI's reasoning guide and a live probe on 2026-08-04 both put
     # usage.completion_tokens_details.reasoning_tokens INSIDE
     # usage.completion_tokens, billed at the output rate. So:
     #
     #     estimated_cost_usd already includes these tokens.
-    #     gpt4o_output_tokens already includes these tokens.
+    #     llm_classifier_output_tokens already includes these tokens.
     #
     # Anyone adding this column into a cost calculation is double-billing.
     # It is stored because it is the only way to see what fraction of the
@@ -357,7 +357,7 @@ INFERENCE_COLUMN_ADDITIONS = {
     # genuinely reports reasoning_tokens=0 stores 0, and the two must stay
     # distinguishable: a query averaging this column has to exclude NULL, not
     # coalesce it.
-    "gpt4o_reasoning_tokens":       "INTEGER",
+    "llm_classifier_reasoning_tokens":       "INTEGER",
 }
 
 
@@ -798,11 +798,11 @@ CREATE TABLE IF NOT EXISTS inferences (
     hybrid_retrieval_time REAL,
     cross_encoder_time REAL,
     rule_filter_time REAL,
-    gpt4o_evaluation_time REAL,
+    llm_classifier_evaluation_time REAL,
     total_time REAL,
-    gpt4o_prompt TEXT,
-    gpt4o_input_tokens INTEGER,
-    gpt4o_output_tokens INTEGER,
+    llm_classifier_prompt TEXT,
+    llm_classifier_input_tokens INTEGER,
+    llm_classifier_output_tokens INTEGER,
     matching_model TEXT,
     cross_encoder_model TEXT,
     pricing_version TEXT,
@@ -811,7 +811,7 @@ CREATE TABLE IF NOT EXISTS inferences (
     error TEXT,
     patient_data_hash TEXT,
     expansion_prompt TEXT,
-    gpt4o_retries INTEGER,
+    llm_classifier_retries INTEGER,
     ablation_flags TEXT,
     hallucinated_trials INTEGER,
     ecog_value INTEGER,
@@ -1014,16 +1014,16 @@ def log_inference(result: Dict, patient_data: Dict, db_path=None):
     # fallback key was used, so "priced against the model that answered" and
     # "priced against the configured model because nothing answered" are
     # separable in the table without a second column. A NULL matching_model row
-    # carrying non-zero gpt4o tokens would be the one case where they are not,
+    # carrying non-zero llm_classifier tokens would be the one case where they are not,
     # and File 16's Query 10 and File 21's cost tab both call that out.
     #
     # Reasoning tokens are NOT added to the output figure here. They are
-    # already inside gpt4o_output_tokens (see the schema note on
-    # gpt4o_reasoning_tokens); adding them would bill every one of them twice.
+    # already inside llm_classifier_output_tokens (see the schema note on
+    # llm_classifier_reasoning_tokens); adding them would bill every one of them twice.
     total_cost = get_model_cost(
         matching_model_used or MATCHING_MODEL,
-        result.get("gpt4o_input_tokens", 0),
-        result.get("gpt4o_output_tokens", 0)
+        result.get("llm_classifier_input_tokens", 0),
+        result.get("llm_classifier_output_tokens", 0)
     )
 
     # EVERYTHING BELOW THIS LINE TOUCHES THE DATABASE, so it is serialized.
@@ -1233,21 +1233,21 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 eligible_matches, near_misses,
                 not_evaluable_trials, cross_vocab_remaps,
                 query_expansion_time, hybrid_retrieval_time, cross_encoder_time,
-                rule_filter_time, gpt4o_evaluation_time, total_time,
-                gpt4o_prompt, gpt4o_input_tokens, gpt4o_output_tokens,
+                rule_filter_time, llm_classifier_evaluation_time, total_time,
+                llm_classifier_prompt, llm_classifier_input_tokens, llm_classifier_output_tokens,
                 matching_model, cross_encoder_model,
                 pricing_version, estimated_cost_usd, qdrant_collection, error,
                 patient_data_hash, expansion_prompt,
-                gpt4o_retries, ablation_flags, hallucinated_trials,
+                llm_classifier_retries, ablation_flags, hallucinated_trials,
                 retrieval_channels, retrieval_channels_expected,
                 retrieval_channels_ok, retrieval_degraded,
                 retrieval_trials_lost, query_expansion_path,
                 mesh_filter_applied, mesh_filter_skip_reason,
                 age_reference_date, birth_date_precision,
                 ecog_value, ecog_selection, ecog_observations_found,
-                gpt4o_truncation_splits, gpt4o_output_tokens_estimated,
-                not_evaluable_truncated, gpt4o_calls,
-                gpt4o_reasoning_tokens
+                llm_classifier_truncation_splits, llm_classifier_output_tokens_estimated,
+                not_evaluable_truncated, llm_classifier_calls,
+                llm_classifier_reasoning_tokens
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             result["patient_id"],
@@ -1290,11 +1290,11 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
             timings.get("hybrid_retrieval", 0),
             timings.get("cross_encoder", 0),
             timings.get("rule_filter", 0),
-            timings.get("gpt4o_evaluation", 0),
+            timings.get("llm_classifier_evaluation", 0),
             total_time,
-            result.get("gpt4o_prompt", ""),
-            result.get("gpt4o_input_tokens", 0),
-            result.get("gpt4o_output_tokens", 0),
+            result.get("llm_classifier_prompt", ""),
+            result.get("llm_classifier_input_tokens", 0),
+            result.get("llm_classifier_output_tokens", 0),
             # Resolved above, outside the tuple, because the same value is what
             # get_model_cost() was called with. Reading it twice could price a
             # row against one model and label it with another.
@@ -1319,7 +1319,7 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
             # (File 13). Reading "gpt4o_retries_exhausted" here logged 0 for
             # every run that did not end in node_error_handler, because that
             # node was the only writer of the old key.
-            result.get("gpt4o_retries", 0),                  # gpt4o_retries
+            result.get("llm_classifier_retries", 0),                  # llm_classifier_retries
             json.dumps(result.get("ablation_flags") or {}),  # ablation_flags
             # NULL until item 33's detector writes the key: see the migration
             # note above for why this is not defaulted to 0.
@@ -1362,16 +1362,16 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
             # a run that ended before Stage 5 genuinely performed zero splits
             # and lost zero trials to truncation; the ESTIMATE has no default,
             # because a run that never estimated anything did not estimate 0.
-            result.get("gpt4o_truncation_splits", 0),
-            result.get("gpt4o_output_tokens_estimated"),
+            result.get("llm_classifier_truncation_splits", 0),
+            result.get("llm_classifier_output_tokens_estimated"),
             result.get("not_evaluable_truncated", 0),
-            result.get("gpt4o_calls", 0),
+            result.get("llm_classifier_calls", 0),
             # No default. A response that carried no reasoning breakdown, and a
             # response that spent zero reasoning tokens, are different facts;
             # .get() with no default stores NULL for the first and 0 for the
             # second. Defaulting to 0 here would make every GPT-4o-era row and
             # every stubbed run look like a reasoning run that did no thinking.
-            result.get("gpt4o_reasoning_tokens"),
+            result.get("llm_classifier_reasoning_tokens"),
         ))
         
         inference_id = cursor.lastrowid

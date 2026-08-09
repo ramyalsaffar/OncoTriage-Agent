@@ -88,12 +88,28 @@ deterministic prefix, the completeness checks, the three derivation recipes, the
 constructed retry fixture, the cohort scan, the selection and ``main()`` are the
 line slice of File 45 between its bootstrap and its ``__main__`` guard.
 
-**THE FIXTURE FORMAT IS FROZEN.** ``SCHEMA_VERSION`` is 3, the twelve fixtures on
-disk are v3, and ``load_fixture()`` refuses a mismatch. Nothing in this pass
-touches the schema, the field set, ``write_fixture``'s JSON, or the gzip
-settings -- ``compresslevel=9, mtime=0``, where the zeroed mtime is what makes
-two captures of identical content produce identical bytes instead of a git diff
-per re-capture.
+**THE FIXTURE FORMAT WAS FROZEN AT v3 AND THE llm_classifier RENAME BROKE IT.**
+``SCHEMA_VERSION`` is 4. Eight recorded fields under ``stage5`` and one key in
+``environment`` carried the ``gpt4o`` prefix and now carry ``llm_classifier``;
+the constructed fixture's id and case label changed with them. Every field's
+MEANING is unchanged -- only its name moved -- and that is precisely the case
+the version exists for, because a v3 fixture read by this code would report
+every renamed field as absent and a replay would compare ``None`` with ``None``
+and call it a match. ``load_fixture()`` refuses the mismatch by version, before
+any field is read.
+
+THE TWELVE FIXTURES ON DISK ARE v3 AND ARE THEREFORE UNREADABLE. They were
+already unreplayable for an unrelated reason -- the alias ``trial_criteria``
+resolved past the collection digest they pin at the M-category pass -- so this
+does not lose a working gate. A re-capture is scheduled separately and is the
+only thing that clears it; nothing here silently skips them, and
+``fixture_replay.py`` exits 1 when a fixture fails to load.
+
+Nothing else about the format moved: the field SET is the same size, and
+``write_fixture``'s JSON and the gzip settings are untouched --
+``compresslevel=9, mtime=0``, where the zeroed mtime is what makes two captures
+of identical content produce identical bytes instead of a git diff per
+re-capture.
 
 WHAT IMPORTING THIS MODULE DOES
 -------------------------------
@@ -111,7 +127,7 @@ USAGE
     python "fixture_capture.py"                    # scan, select, capture all
     python "fixture_capture.py" --scan-only        # cohort scan + case report
     python "fixture_capture.py" --probe-limit 400  # widen the no-candidates hunt
-    python "fixture_capture.py" --only normal_1 gpt4o_retry_constructed
+    python "fixture_capture.py" --only normal_1 llm_classifier_parse_retry_constructed
 """
 
 import argparse
@@ -157,7 +173,7 @@ from oncotriage.config import (
     MATCHING_REASONING_EFFORT,
     MATCHING_SEED,
     MATCHING_TEMPERATURE,
-    MAX_GPT4O_RETRIES,
+    MAX_LLM_CLASSIFIER_RETRIES,
     MAX_TRIALS_FOR_EVALUATION,
     MAX_TRUNCATION_SPLITS,
     MAX_VARIANT_TERMS,
@@ -330,7 +346,12 @@ def log_inference(*_args, **_kwargs):
 # is added to deterministic_prefix — an older fixture has no value for it, and
 # a replay that silently treats "absent" as "matched" is a gate that passes
 # because it stopped looking.
-SCHEMA_VERSION = 3
+# v4: the gpt4o -> llm_classifier rename. Same fields, same meanings, new names
+# for nine of them (eight under stage5, one in environment). A v3 fixture read
+# by v4 code answers None for every renamed field, and a diff of None against
+# None is a gate that passes because it stopped looking -- which is the exact
+# failure this counter exists to prevent.
+SCHEMA_VERSION = 4
 
 # Branch cases the fixture set must cover. Values are stored in case_labels.
 CASE_NO_CANDIDATES = "no_candidates"        # a terminal node_no_candidates run
@@ -338,7 +359,7 @@ CASE_UNKNOWN_STAGE = "unknown_stage"        # extract_patient_stage() -> None
 CASE_MESH_FALLBACK = "mesh_fallback"        # Stage 1 took EXPANSION_PATH_FALLBACK
 CASE_ABLATION = "ablation"                  # run under a File 26 config
 CASE_MCODE_VARIANT = "mcode_variant"        # structural genomic variant detection
-CASE_GPT4O_RETRY = "gpt4o_retry"            # the MAX_GPT4O_RETRIES loop
+CASE_LLM_CLASSIFIER_PARSE_RETRY = "llm_classifier_parse_retry"  # the MAX_LLM_CLASSIFIER_RETRIES loop
 CASE_TRUNCATION = "truncation_split"        # the MAX_TRUNCATION_SPLITS loop
 CASE_NORMAL = "normal"                      # full pipeline, no branch of note
 
@@ -347,7 +368,7 @@ ALL_BRANCH_CASES = (
     CASE_UNKNOWN_STAGE,
     CASE_MESH_FALLBACK,
     CASE_ABLATION,
-    CASE_GPT4O_RETRY,
+    CASE_LLM_CLASSIFIER_PARSE_RETRY,
     CASE_MCODE_VARIANT,
     CASE_TRUNCATION,
 )
@@ -982,27 +1003,27 @@ def build_deterministic_prefix(final_state: Dict,
             "request_sha256_by_call": [
                 sha256_json(c["request"]) for c in sink.chat_completions
             ],
-            "gpt4o_calls": len(sink.chat_completions),
+            "llm_classifier_calls": len(sink.chat_completions),
             # Reported by the stage as well as counted at the client, because
             # the two agreeing is itself the check: a split run that recorded
             # fewer exchanges than it made would replay a different number of
             # requests than it captured.
-            "gpt4o_calls_reported": result.get("gpt4o_calls"),
+            "llm_classifier_calls_reported": result.get("llm_classifier_calls"),
             # The truncation budget, separate from the retry budget below.
-            "gpt4o_truncation_splits": result.get("gpt4o_truncation_splits"),
+            "llm_classifier_truncation_splits": result.get("llm_classifier_truncation_splits"),
             "not_evaluable_truncated": result.get("not_evaluable_truncated"),
             # The pre-call estimate. Diffed exactly: it is a pure function of
             # the filtered trial set and the File 03 constants, so a change to
             # either shows up here rather than only in a log line.
-            "gpt4o_output_tokens_estimated": result.get("gpt4o_output_tokens_estimated"),
+            "llm_classifier_output_tokens_estimated": result.get("llm_classifier_output_tokens_estimated"),
             "finish_reasons": [
                 c["response"].get("finish_reason") for c in sink.chat_completions
             ],
-            "gpt4o_retries": result.get("gpt4o_retries"),
+            "llm_classifier_retries": result.get("llm_classifier_retries"),
             "cross_vocab_remaps": result.get("cross_vocab_remaps"),
-            "gpt4o_input_tokens": result.get("gpt4o_input_tokens"),
-            "gpt4o_output_tokens": result.get("gpt4o_output_tokens"),
-            "gpt4o_prompt_sha256": sha256_text(result.get("gpt4o_prompt") or ""),
+            "llm_classifier_input_tokens": result.get("llm_classifier_input_tokens"),
+            "llm_classifier_output_tokens": result.get("llm_classifier_output_tokens"),
+            "llm_classifier_prompt_sha256": sha256_text(result.get("llm_classifier_prompt") or ""),
             "verdicts": [
                 {
                     "nct_id": e.get("nct_id"),
@@ -1126,10 +1147,13 @@ def load_fixture(path: str) -> Dict:
     version = fixture.get("schema_version")
     if version != SCHEMA_VERSION:
         raise ValueError(
-            f"{os.path.basename(path)}: schema_version {version!r}, but this "
-            f"code reads version {SCHEMA_VERSION}. Re-capture the fixture "
-            f"rather than diffing across versions — a field whose meaning "
-            f"changed compares equal for the wrong reason."
+            f"{os.path.basename(path)}: RE-CAPTURE REQUIRED. This fixture was "
+            f"written at schema_version {version!r}; this code reads version "
+            f"{SCHEMA_VERSION}. Re-capture with `python fixture_capture.py` "
+            f"rather than diffing across versions — a field whose name or "
+            f"meaning changed reads as absent and compares equal for the "
+            f"wrong reason. (v3 -> v4 renamed the nine gpt4o_* recorded "
+            f"fields to llm_classifier_*.)"
         )
     return fixture
 
@@ -1320,7 +1344,7 @@ def build_environment_block() -> Dict:
             "MESH_BOOST_PAN_FRACTION": MESH_BOOST_PAN_FRACTION,
             "MESH_BOOST_DIRECT_FLOOR": MESH_BOOST_DIRECT_FLOOR,
             "MESH_BOOST_PAN_FLOOR": MESH_BOOST_PAN_FLOOR,
-            "MAX_GPT4O_RETRIES": MAX_GPT4O_RETRIES,
+            "MAX_LLM_CLASSIFIER_RETRIES": MAX_LLM_CLASSIFIER_RETRIES,
             "MAX_TRUNCATION_SPLITS": MAX_TRUNCATION_SPLITS,
             "MATCHING_OUTPUT_TOKENS_PER_TRIAL": MATCHING_OUTPUT_TOKENS_PER_TRIAL,
             "MATCHING_OUTPUT_SPLIT_FRACTION": MATCHING_OUTPUT_SPLIT_FRACTION,
@@ -1466,8 +1490,8 @@ def verify_recording_complete(fixture: Dict, sink: RecordingSink) -> None:
     # sink counts every exchange across the whole run — so on a retried run the
     # two legitimately differ, and requiring them to match would fail a fixture
     # for recording the truth.
-    _reported = prefix["stage5"].get("gpt4o_calls_reported")
-    _retries = prefix["stage5"].get("gpt4o_retries") or 0
+    _reported = prefix["stage5"].get("llm_classifier_calls_reported")
+    _retries = prefix["stage5"].get("llm_classifier_retries") or 0
     if _reported is not None and not _retries and _reported != n_chat:
         problems.append(
             f"Stage 5 reported {_reported} call(s) but {n_chat} were recorded"
@@ -1477,7 +1501,7 @@ def verify_recording_complete(fixture: Dict, sink: RecordingSink) -> None:
             f"Stage 5 reported {_reported} call(s) on its final attempt but "
             f"only {n_chat} exchange(s) were recorded in total"
         )
-    if (prefix["stage5"].get("gpt4o_truncation_splits") or 0) and n_chat < 2:
+    if (prefix["stage5"].get("llm_classifier_truncation_splits") or 0) and n_chat < 2:
         problems.append(
             f"truncation splits were reported but only {n_chat} call(s) recorded"
         )
@@ -2072,7 +2096,7 @@ MALFORMED_PREFIX_CHARS = 400
 
 
 def build_constructed_retry_fixture(base: Dict, fixture_id: str) -> Dict:
-    """Assemble the MAX_GPT4O_RETRIES fixture from a recorded normal run.
+    """Assemble the MAX_LLM_CLASSIFIER_RETRIES fixture from a recorded normal run.
 
     The retry loop cannot be found by scanning the cohort: it fires on a
     malformed model response, which is a property of the model on the day, not
@@ -2081,8 +2105,8 @@ def build_constructed_retry_fixture(base: Dict, fixture_id: str) -> Dict:
     one, truncated so json.loads raises.
 
     On replay: attempt 1 parses the truncated payload and fails, Stage 5
-    returns gpt4o_retries=1 with an error, route_after_gpt4o sends it back
-    round the cyclic edge (1 < MAX_GPT4O_RETRIES), attempt 2 receives the real
+    returns llm_classifier_retries=1 with an error, route_after_llm_classifier sends it back
+    round the cyclic edge (1 < MAX_LLM_CLASSIFIER_RETRIES), attempt 2 receives the real
     response and succeeds. Everything upstream of Stage 5 is untouched, so the
     only expected difference from the base fixture is the retry count and a
     second identical request.
@@ -2140,14 +2164,14 @@ def build_constructed_retry_fixture(base: Dict, fixture_id: str) -> Dict:
     # parse-failure budget.
     malformed_call["response"]["finish_reason"] = "stop"
     malformed_call["call_index"] = 0
-    # Usage is read BEFORE the JSON parse in node_gpt4o_evaluation, so the
+    # Usage is read BEFORE the JSON parse in node_llm_classifier_evaluation, so the
     # failing attempt still needs a usage block. The real one is reused: the
     # attempt returns before those numbers reach the result.
     real_call["call_index"] = 1
 
     fixture["fixture_id"] = fixture_id
     fixture["fixture_kind"] = FIXTURE_KIND_CONSTRUCTED
-    fixture["case_labels"] = [CASE_GPT4O_RETRY]
+    fixture["case_labels"] = [CASE_LLM_CLASSIFIER_PARSE_RETRY]
     fixture["captured_at_utc"] = datetime.now(timezone.utc).isoformat()
     fixture["construction"] = {
         "derived_from": base["fixture_id"],
@@ -2173,17 +2197,17 @@ def build_constructed_retry_fixture(base: Dict, fixture_id: str) -> Dict:
     stage5 = fixture["deterministic_prefix"]["stage5"]
     request_sha = base["deterministic_prefix"]["stage5"]["request_sha256_by_call"][0]
     stage5["request_sha256_by_call"] = [request_sha, request_sha]
-    stage5["gpt4o_calls"] = 2
-    stage5["gpt4o_retries"] = 1
+    stage5["llm_classifier_calls"] = 2
+    stage5["llm_classifier_retries"] = 1
     # Both responses claim to have finished normally. That is what a parse
     # failure IS: the model stopped of its own accord and produced something
     # that does not parse. "length" would make it a truncation, which since
     # item 19c is a different mechanism with a different budget.
     stage5["finish_reasons"] = ["stop", "stop"]
-    # gpt4o_calls_reported is left at the base value of 1 and that is correct,
+    # llm_classifier_calls_reported is left at the base value of 1 and that is correct,
     # not an oversight: it is what the SUCCESSFUL node invocation reports, and
     # Stage 5's own counter resets when the router re-enters the node. The
-    # sink-side gpt4o_calls of 2 spans both invocations. The two disagreeing is
+    # sink-side llm_classifier_calls of 2 spans both invocations. The two disagreeing is
     # the signature of a retry, and is why both are recorded.
 
     return fixture
@@ -2969,7 +2993,7 @@ def main() -> int:
         if entry["construction"]:
             console.out(f"  {'':<28} DERIVED BUNDLE from "
                   f"{entry['construction']['derived_from_bundle'][:40]}")
-    console.out(f"  {'gpt4o_retry_constructed':<28} constructed from normal_1")
+    console.out(f"  {'llm_classifier_parse_retry_constructed':<28} constructed from normal_1")
 
     if args.scan_only:
         console.out("\n--scan-only: nothing captured.")
@@ -3033,9 +3057,9 @@ def main() -> int:
             normal_1_fixture = load_fixture(existing)
 
     if normal_1_fixture is not None and (
-            not args.only or "gpt4o_retry_constructed" in args.only):
+            not args.only or "llm_classifier_parse_retry_constructed" in args.only):
         retry_fixture = build_constructed_retry_fixture(
-            normal_1_fixture, "gpt4o_retry_constructed"
+            normal_1_fixture, "llm_classifier_parse_retry_constructed"
         )
         path = write_fixture(retry_fixture, root)
         written.append(retry_fixture)

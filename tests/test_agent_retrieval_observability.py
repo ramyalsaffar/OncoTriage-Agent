@@ -149,7 +149,7 @@ except ImportError:
     del _candidate, _how
 
 from oncotriage.agent import deps
-from oncotriage.agent.evaluation import node_gpt4o_evaluation
+from oncotriage.agent.evaluation import node_llm_classifier_evaluation
 from oncotriage.agent.filtering import node_rule_based_filter
 from oncotriage.agent.retrieval import (
     node_hybrid_retrieval,
@@ -846,13 +846,13 @@ def run_evaluation(mesh_filter_applied, skip_reason):
         "patient_data": PATIENT_DATA,
         "filtered_trials": [{"trial": TRIALS[0], "rerank_score": 5.0,
                              "rerank_score_raw": 5.0}],
-        "gpt4o_retries": 0,
+        "llm_classifier_retries": 0,
         "mesh_filter_applied": mesh_filter_applied,
         "mesh_filter_skip_reason": skip_reason,
         "stage_timings": {},
     }
     with swap_deps(openai_client=stub_openai):
-        result = node_gpt4o_evaluation(state)
+        result = node_llm_classifier_evaluation(state)
     system_message = stub_openai.captured_messages[0]["content"]
     return result, system_message
 
@@ -899,7 +899,7 @@ check("unrecorded filter state: prompt says so",
 # The stored prompt is the one that was sent, so the record is self-describing.
 check("stored prompt carries the variant that was sent",
       "Disease relevance has NOT been confirmed"
-      in unconfirmed_result["gpt4o_prompt"], True)
+      in unconfirmed_result["llm_classifier_prompt"], True)
 
 
 # ===========================================================================
@@ -928,11 +928,11 @@ def terminal_state(**overrides):
         "stage_dropped": 0,
         "histology_dropped": 0,
         "evaluations": [],
-        "gpt4o_retries": 0,
+        "llm_classifier_retries": 0,
         "cross_vocab_remaps": 0,
-        "gpt4o_prompt": "",
-        "gpt4o_input_tokens": 0,
-        "gpt4o_output_tokens": 0,
+        "llm_classifier_prompt": "",
+        "llm_classifier_input_tokens": 0,
+        "llm_classifier_output_tokens": 0,
         "expansion_prompt": "",
         "expansion_input_tokens": 0,
         "expansion_output_tokens": 0,

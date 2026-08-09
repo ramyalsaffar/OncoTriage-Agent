@@ -612,7 +612,7 @@ def _seed_rows():
 
 _INF_COLUMNS = ("id", "patient_id", "timestamp", "age", "sex", "primary_condition",
                 "condition_count", "medication_count", "qdrant_collection",
-                "patient_data_hash", "gpt4o_prompt")
+                "patient_data_hash", "llm_classifier_prompt")
 _TM_COLUMNS = ("inference_id", "nct_id", "trial_title", "trial_phase",
                "match_score", "eligible", "explanation", "criterion_details")
 

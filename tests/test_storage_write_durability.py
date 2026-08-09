@@ -279,8 +279,8 @@ def result_dict(patient_id, **extra):
         "patient_id": patient_id,
         "timestamp": "2026-08-08T00:00:00",
         "matching_model": "gpt-5.6-terra",
-        "gpt4o_input_tokens": 10,
-        "gpt4o_output_tokens": 5,
+        "llm_classifier_input_tokens": 10,
+        "llm_classifier_output_tokens": 5,
         "matches": [], "near_misses": [], "not_evaluable": [],
         "stage_timings": {},
     }

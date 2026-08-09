@@ -77,7 +77,7 @@ USAGE
     python fixture_capture.py                    # scan, select, capture all
     python fixture_capture.py --scan-only        # cohort scan + case report
     python fixture_capture.py --probe-limit 400  # widen the no-candidates hunt
-    python fixture_capture.py --only normal_1 gpt4o_retry_constructed
+    python fixture_capture.py --only normal_1 llm_classifier_parse_retry_constructed
 """
 
 import os

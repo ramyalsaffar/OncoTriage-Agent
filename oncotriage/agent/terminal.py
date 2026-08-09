@@ -100,7 +100,7 @@ def _pipeline_provenance(state) -> Dict:
         # Retries actually spent in Stage 5. Stage 5 writes the count back into
         # state on its success return and on every failure return, so this is
         # the observed number of API / JSON-parse retries, not a ceiling.
-        "gpt4o_retries": state.get("gpt4o_retries", 0),
+        "llm_classifier_retries": state.get("llm_classifier_retries", 0),
 
         # --- Stage 5 truncation record ------------------------------------
         # Defaulted to 0 rather than None, unlike the degradation keys below,
@@ -110,10 +110,10 @@ def _pipeline_provenance(state) -> Dict:
         # splits. The estimate is the exception -- it is None when Stage 5
         # never ran, because "we estimated nothing" and "we estimated 0 tokens"
         # are different claims.
-        "gpt4o_truncation_splits": state.get("gpt4o_truncation_splits", 0),
-        "gpt4o_output_tokens_estimated": state.get("gpt4o_output_tokens_estimated"),
+        "llm_classifier_truncation_splits": state.get("llm_classifier_truncation_splits", 0),
+        "llm_classifier_output_tokens_estimated": state.get("llm_classifier_output_tokens_estimated"),
         "not_evaluable_truncated": state.get("not_evaluable_truncated", 0),
-        "gpt4o_calls": state.get("gpt4o_calls", 0),
+        "llm_classifier_calls": state.get("llm_classifier_calls", 0),
 
         # --- Which model answered, and what it spent thinking ---------------
         #
@@ -131,14 +131,14 @@ def _pipeline_provenance(state) -> Dict:
         # assert on a run that never made a request. File 14 prices against
         # this value.
         #
-        # gpt4o_reasoning_tokens is the reasoning SUBSET of
-        # gpt4o_output_tokens, not an addition to it, so it is a breakdown
+        # llm_classifier_reasoning_tokens is the reasoning SUBSET of
+        # llm_classifier_output_tokens, not an addition to it, so it is a breakdown
         # column and never a costing term. None -- not 0 -- when no response
         # carried the breakdown: a stub, a replayed pre-migration fixture, or a
         # run that never reached Stage 5. A non-reasoning model reporting a
         # genuine 0 is a different fact and stays 0.
         "matching_model": state.get("matching_model"),
-        "gpt4o_reasoning_tokens": state.get("gpt4o_reasoning_tokens"),
+        "llm_classifier_reasoning_tokens": state.get("llm_classifier_reasoning_tokens"),
         # Which stages were disabled for this run; {} = full pipeline. Copied
         # rather than aliased so the logged record cannot be mutated later.
         "ablation_flags": dict(state.get("ablation_flags") or {}),
@@ -334,9 +334,9 @@ def node_finalize(state: TrialMatchState) -> dict:
         "expansion_prompt": state.get("expansion_prompt", ""),
         "expansion_input_tokens": state.get("expansion_input_tokens", 0),
         "expansion_output_tokens": state.get("expansion_output_tokens", 0),
-        "gpt4o_prompt": state.get("gpt4o_prompt", ""),
-        "gpt4o_input_tokens": state.get("gpt4o_input_tokens", 0),
-        "gpt4o_output_tokens": state.get("gpt4o_output_tokens", 0),
+        "llm_classifier_prompt": state.get("llm_classifier_prompt", ""),
+        "llm_classifier_input_tokens": state.get("llm_classifier_input_tokens", 0),
+        "llm_classifier_output_tokens": state.get("llm_classifier_output_tokens", 0),
         "timestamp": datetime.now().isoformat(),
         "error": "",
         "patient_data_hash": "",
@@ -359,7 +359,7 @@ def node_no_candidates(state: TrialMatchState) -> dict:
     Terminal node: no candidates survived retrieval or filtering.
 
     Returns a clean result indicating no trials were found,
-    rather than wasting a GPT-4o call on an empty candidate set.
+    rather than wasting an LLM classifier call on an empty candidate set.
     """
     patient_data = state["patient_data"]
 
@@ -395,9 +395,9 @@ def node_no_candidates(state: TrialMatchState) -> dict:
         "expansion_prompt": state.get("expansion_prompt", ""),
         "expansion_input_tokens": state.get("expansion_input_tokens", 0),
         "expansion_output_tokens": state.get("expansion_output_tokens", 0),
-        "gpt4o_prompt": "",
-        "gpt4o_input_tokens": 0,
-        "gpt4o_output_tokens": 0,
+        "llm_classifier_prompt": "",
+        "llm_classifier_input_tokens": 0,
+        "llm_classifier_output_tokens": 0,
         "message": "No trials passed retrieval or filtering for this patient.",
         "error": "",
         "patient_data_hash": "",
@@ -416,7 +416,7 @@ def node_no_candidates(state: TrialMatchState) -> dict:
 
 def node_error_handler(state: TrialMatchState) -> dict:
     """
-    Error terminal node: GPT-4o failed after all retries.
+    Error terminal node: the LLM classifier failed after all retries.
 
     Packages whatever information is available into a clean error
     response so the caller gets structured output (not a crash).
@@ -453,18 +453,18 @@ def node_error_handler(state: TrialMatchState) -> dict:
         "expansion_prompt": state.get("expansion_prompt", ""),
         "expansion_input_tokens": state.get("expansion_input_tokens", 0),
         "expansion_output_tokens": state.get("expansion_output_tokens", 0),
-        "gpt4o_prompt": state.get("gpt4o_prompt", ""),
-        "gpt4o_input_tokens": state.get("gpt4o_input_tokens", 0),
-        "gpt4o_output_tokens": state.get("gpt4o_output_tokens", 0),
+        "llm_classifier_prompt": state.get("llm_classifier_prompt", ""),
+        "llm_classifier_input_tokens": state.get("llm_classifier_input_tokens", 0),
+        "llm_classifier_output_tokens": state.get("llm_classifier_output_tokens", 0),
         "error": error_msg,
         "patient_data_hash": "",
         "terminal_node": TERMINAL_NODE_ERROR,
-        # Retired key. It said the same thing as gpt4o_retries but existed only
+        # Retired key. It said the same thing as llm_classifier_retries but existed only
         # on this path, which is how the count came to be logged as 0 for every
         # run that did not end here. Kept as an alias for one release so an
         # external consumer of the API response is not broken by the rename;
         # nothing inside this repo reads it.
-        "gpt4o_retries_exhausted": state.get("gpt4o_retries", 0),
+        "llm_classifier_retries_exhausted": state.get("llm_classifier_retries", 0),
         "stage_timings": state.get("stage_timings", {}),
         "timestamp": datetime.now().isoformat(),
         **_pipeline_provenance(state),

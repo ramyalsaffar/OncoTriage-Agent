@@ -146,7 +146,7 @@ def render_overview_tab(df):
             'Hybrid Retrieval': df['hybrid_retrieval_time'].mean(),
             'Cross-Encoder': df['cross_encoder_time'].mean(),
             'Rule Filter': df['rule_filter_time'].mean(),
-            'GPT-4o Eval': df['gpt4o_evaluation_time'].mean()
+            'GPT-4o Eval': df['llm_classifier_evaluation_time'].mean()
         }
         
         fig_stages = go.Figure(data=[

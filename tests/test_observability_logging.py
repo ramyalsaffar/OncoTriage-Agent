@@ -351,7 +351,7 @@ check("4a     ...and names the dropped, sorted",
       _dropped, ["condition_display", "lab_value"])
 
 _CLINICAL = ["condition_display", "conditions", "lab_value", "labs",
-             "medications", "patient_summary", "gpt4o_prompt", "prompt",
+             "medications", "patient_summary", "llm_classifier_prompt", "prompt",
              "response_preview", "birth_date", "patient_trees", "mesh_terms",
              "expanded_query", "rerank_queries", "disease_query",
              "patient_stage", "criterion_details", "explanation"]

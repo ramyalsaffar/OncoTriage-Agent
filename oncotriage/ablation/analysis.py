@@ -161,7 +161,7 @@ def load_ablation_data(db_path=None) -> pd.DataFrame:
         lambda row: row["estimated_cost_usd"] / row["eligible_count"]
         if row["eligible_count"] > 0 else None, axis=1
     )
-    df["total_tokens"] = df["gpt4o_input_tokens"] + df["gpt4o_output_tokens"]
+    df["total_tokens"] = df["llm_classifier_input_tokens"] + df["llm_classifier_output_tokens"]
     df["tokens_per_eligible"] = df.apply(
         lambda row: row["total_tokens"] / row["eligible_count"]
         if row["eligible_count"] > 0 else None, axis=1
@@ -223,7 +223,7 @@ def build_comparison_table(df: pd.DataFrame) -> pd.DataFrame:
         mesh_dropped_mean   =("mesh_dropped", "mean"),
         stage_dropped_mean  =("stage_dropped", "mean"),
         histo_dropped_mean  =("histology_dropped", "mean"),
-        input_tokens_mean   =("gpt4o_input_tokens", "mean"),
+        input_tokens_mean   =("llm_classifier_input_tokens", "mean"),
         # Conditional per-patient ratios. Reported only with n_scored.
         cost_per_elig_mean  =("cost_per_eligible", "mean"),
         tokens_per_elig_mean=("tokens_per_eligible", "mean"),

@@ -11,9 +11,9 @@ configuration instead of the run.
 
 The three defects under test:
 
-  1. gpt4o_retries — File 14 read result["gpt4o_retries_exhausted"], a key only
+  1. llm_classifier_retries — File 14 read result["gpt4o_retries_exhausted"], a key only
      node_error_handler wrote. Every successful inference logged 0 retries no
-     matter how many were spent, so File 20's gpt4o_retry_rate_z_score watched
+     matter how many were spent, so File 20's llm_classifier_retry_rate_z_score watched
      a column that could not vary.
 
   2. ablation_flags — no terminal node wrote the key at all, so the production
@@ -29,14 +29,14 @@ Covers:
     1. STRUCTURAL — the three terminal nodes declare the same result key set,
        so no future key can exist on one path only. This is the regression
        guard: it fails for any key added to node_finalize alone.
-    2. STRUCTURAL — every dict return in node_gpt4o_evaluation carries
-       gpt4o_retries, so the count reaches Stage 6 on the success path and on
+    2. STRUCTURAL — every dict return in node_llm_classifier_evaluation carries
+       llm_classifier_retries, so the count reaches Stage 6 on the success path and on
        each failure path.
     3. Retry count and ablation flags survive all three terminal nodes.
     4. Stage 2 reports OBSERVED per-channel counts: sparse counts are the union
        of the three field queries (not their sum, not the request size), an
        ablated channel reports 0, and a channel whose query raises reports 0.
-    5. END TO END — log_inference() writes a row whose gpt4o_retries,
+    5. END TO END — log_inference() writes a row whose llm_classifier_retries,
        ablation_flags, bm25_retrieved and vector_retrieved match the run rather
        than the config, into a throwaway database.
     6. The hallucinated-trial columns exist and default to NULL (not measured),
@@ -440,11 +440,11 @@ def make_terminal_state(**overrides) -> dict:
         "stage_dropped":                   0,
         "histology_dropped":               0,
         "evaluations":                     [],
-        "gpt4o_retries":                   0,
+        "llm_classifier_retries":                   0,
         "cross_vocab_remaps":              0,
-        "gpt4o_prompt":                    "",
-        "gpt4o_input_tokens":              0,
-        "gpt4o_output_tokens":             0,
+        "llm_classifier_prompt":                    "",
+        "llm_classifier_input_tokens":              0,
+        "llm_classifier_output_tokens":             0,
         "expansion_prompt":                "",
         "expansion_input_tokens":          0,
         "expansion_output_tokens":         0,
@@ -467,7 +467,7 @@ TERMINAL_NODES = {
 ALLOWED_EXTRA_KEYS = {
     "node_finalize":      set(),
     "node_no_candidates": {"message"},
-    "node_error_handler": {"gpt4o_retries_exhausted"},
+    "node_error_handler": {"llm_classifier_retries_exhausted"},
 }
 
 
@@ -481,7 +481,7 @@ print("=" * 70)
 # ===========================================================================
 # The defect was a key on one terminal path only: File 14 read it, the other
 # two paths never wrote it, and the column was constant for every row those
-# paths produced. This test does not know about gpt4o_retries specifically —
+# paths produced. This test does not know about llm_classifier_retries specifically —
 # it fails for any key added to one terminal node and not the others.
 
 print("\n" + "=" * 70)
@@ -504,7 +504,7 @@ for _name, _keys in _terminal_keys.items():
 
 # The four columns this item is about must be in the shared set, not in any
 # node's extras.
-for _key in ("gpt4o_retries", "ablation_flags", "bm25_retrieved", "vector_retrieved"):
+for _key in ("llm_classifier_retries", "ablation_flags", "bm25_retrieved", "vector_retrieved"):
     check(f"{_key} is declared by all three terminal nodes", _key in _core, True)
 
 
@@ -515,13 +515,13 @@ for _key in ("gpt4o_retries", "ablation_flags", "bm25_retrieved", "vector_retrie
 # exactly the runs that retried the most.
 
 print("\n" + "=" * 70)
-print("Test 2: every node_gpt4o_evaluation return carries gpt4o_retries")
+print("Test 2: every node_llm_classifier_evaluation return carries llm_classifier_retries")
 print("=" * 70)
 
 # RETARGETED IN PASS 20c-2c, and this one COULD have gone silently green.
-# node_gpt4o_evaluation moved to oncotriage/agent/evaluation.py, and
+# node_llm_classifier_evaluation moved to oncotriage/agent/evaluation.py, and
 # "13- LangGraph Agent.py" is now a re-export shim with no function definitions
-# in it. The walk below would have found nothing, left _gpt4o_returns EMPTY, and
+# in it. The walk below would have found nothing, left _llm_classifier_returns EMPTY, and
 # then:
 #     len([]) >= 2                                  -> False -> that check FAILS
 #     sorted(ln for ln, keys in [] if ...) == []    -> True  -> this one PASSES
@@ -537,25 +537,25 @@ _EVALUATION_SOURCE = os.path.abspath(_agent_evaluation.__file__)
 with open(_EVALUATION_SOURCE, encoding="utf-8") as _fh:
     _tree = ast.parse(_fh.read())
 
-_gpt4o_returns = []
+_llm_classifier_returns = []
 for _fn in ast.walk(_tree):
-    if isinstance(_fn, ast.FunctionDef) and _fn.name == "node_gpt4o_evaluation":
+    if isinstance(_fn, ast.FunctionDef) and _fn.name == "node_llm_classifier_evaluation":
         for _node in ast.walk(_fn):
             if isinstance(_node, ast.Return) and isinstance(_node.value, ast.Dict):
-                _gpt4o_returns.append((
+                _llm_classifier_returns.append((
                     _node.lineno,
                     {k.value for k in _node.value.keys
                      if isinstance(k, ast.Constant) and isinstance(k.value, str)},
                 ))
 
-# NON-DEGENERATE FIRST. "no return omits gpt4o_retries" is vacuously true for a
+# NON-DEGENERATE FIRST. "no return omits llm_classifier_retries" is vacuously true for a
 # function that was never found, which is exactly what a stale filename gives.
-check("the parsed source actually defines node_gpt4o_evaluation",
-      any(isinstance(n, ast.FunctionDef) and n.name == "node_gpt4o_evaluation"
+check("the parsed source actually defines node_llm_classifier_evaluation",
+      any(isinstance(n, ast.FunctionDef) and n.name == "node_llm_classifier_evaluation"
           for n in ast.walk(_tree)), True)
-check("found node_gpt4o_evaluation's dict returns", len(_gpt4o_returns) >= 2, True)
-check("every return declares gpt4o_retries",
-      sorted(ln for ln, keys in _gpt4o_returns if "gpt4o_retries" not in keys),
+check("found node_llm_classifier_evaluation's dict returns", len(_llm_classifier_returns) >= 2, True)
+check("every return declares llm_classifier_retries",
+      sorted(ln for ln, keys in _llm_classifier_returns if "llm_classifier_retries" not in keys),
       [])
 
 # The logger must not reach for a retrieval constant: that was the bug --
@@ -650,12 +650,12 @@ FLAGS = {"retrieval_mode": "bm25_only", "skip_mesh_filter": True}
 
 for _name, _fn in TERMINAL_NODES.items():
     _out = _fn(make_terminal_state(
-        gpt4o_retries=2,
+        llm_classifier_retries=2,
         ablation_flags=FLAGS,
         error="GPT-4o JSON parse error (attempt 3)" if _name == "node_error_handler" else "",
     ))["result"]
 
-    check(f"{_name}: logs the retries actually spent", _out["gpt4o_retries"], 2)
+    check(f"{_name}: logs the retries actually spent", _out["llm_classifier_retries"], 2)
     check(f"{_name}: logs the ablation flags of the run",
           _out["ablation_flags"], FLAGS)
 
@@ -670,7 +670,7 @@ check("ablation_flags is snapshotted, not aliased",
 # Full pipeline: an empty flag dict, not a missing key.
 _res_full = node_finalize(make_terminal_state())["result"]
 check("full pipeline logs an empty flag dict", _res_full["ablation_flags"], {})
-check("no-retry run logs 0 retries", _res_full["gpt4o_retries"], 0)
+check("no-retry run logs 0 retries", _res_full["llm_classifier_retries"], 0)
 
 
 # ===========================================================================
@@ -800,7 +800,7 @@ print("Test 5: log_inference writes the run, not the config")
 print("=" * 70)
 
 _logged = node_finalize(make_terminal_state(
-    gpt4o_retries=2,
+    llm_classifier_retries=2,
     ablation_flags=FLAGS,
     bm25_retrieved=EXPECTED_BM25_UNIQUE,
     vector_retrieved=EXPECTED_VECTOR,
@@ -820,7 +820,7 @@ _row = _conn.execute(
 check("a row was written", _row is not None, True)
 
 if _row is not None:
-    check("gpt4o_retries is the count spent", _row["gpt4o_retries"], 2)
+    check("llm_classifier_retries is the count spent", _row["llm_classifier_retries"], 2)
     check("ablation_flags records the configuration",
           json.loads(_row["ablation_flags"]), FLAGS)
     check("bm25_retrieved is the observed count",
@@ -855,7 +855,7 @@ _conn.close()
 #
 # On a reasoning model, usage.completion_tokens_details.reasoning_tokens is a
 # SUBSET of usage.completion_tokens -- billed at the output rate, already
-# inside the number File 13 stores as gpt4o_output_tokens. Adding the two would
+# inside the number File 13 stores as llm_classifier_output_tokens. Adding the two would
 # bill every reasoning token twice.
 #
 # WHY THIS TEST IS SHAPED THE WAY IT IS. Item 29a's check for the same property
@@ -896,14 +896,14 @@ check("reasoning tokens are a subset of output tokens, as the API reports them",
       COST_REASONING < COST_OUTPUT, True)
 
 _reasoning_result = node_finalize(make_terminal_state(
-    gpt4o_input_tokens=COST_INPUT,
-    gpt4o_output_tokens=COST_OUTPUT,
+    llm_classifier_input_tokens=COST_INPUT,
+    llm_classifier_output_tokens=COST_OUTPUT,
 ))["result"]
 _reasoning_result["patient_id"]             = "reasoning-cost-patient"
 _reasoning_result["matching_model"]         = COST_MODEL
-_reasoning_result["gpt4o_input_tokens"]     = COST_INPUT
-_reasoning_result["gpt4o_output_tokens"]    = COST_OUTPUT
-_reasoning_result["gpt4o_reasoning_tokens"] = COST_REASONING
+_reasoning_result["llm_classifier_input_tokens"]     = COST_INPUT
+_reasoning_result["llm_classifier_output_tokens"]    = COST_OUTPUT
+_reasoning_result["llm_classifier_reasoning_tokens"] = COST_REASONING
 
 check_wrote_to_scratch(
     "the reasoning-cost row also went to the scratch database",
@@ -921,10 +921,10 @@ check("a row was written for the reasoning case", _row is not None, True)
 if _row is not None:
     # The reasoning count must survive the round trip, or the cost assertion
     # below would be testing a value the writer never saw.
-    check("gpt4o_reasoning_tokens round-trips into the row",
-          _row["gpt4o_reasoning_tokens"], COST_REASONING)
-    check("gpt4o_output_tokens is stored as reported, reasoning included in it",
-          _row["gpt4o_output_tokens"], COST_OUTPUT)
+    check("llm_classifier_reasoning_tokens round-trips into the row",
+          _row["llm_classifier_reasoning_tokens"], COST_REASONING)
+    check("llm_classifier_output_tokens is stored as reported, reasoning included in it",
+          _row["llm_classifier_output_tokens"], COST_OUTPUT)
 
     check("estimated_cost_usd is priced on input and output alone",
           _row["estimated_cost_usd"], _cost_correct)

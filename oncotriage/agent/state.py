@@ -322,19 +322,19 @@ class TrialMatchState(TypedDict):
     mesh_filter_applied: bool
     mesh_filter_skip_reason: str
 
-    # --- Stage 5: GPT-4o Evaluation ---
+    # --- Stage 5: LLM Classifier Evaluation ---
     evaluations: List[Dict]                     # Criterion-level match results
-    gpt4o_retries: int                          # Current retry count for GPT-4o
+    llm_classifier_retries: int                          # Current retry count for Stage 5
 
-    # Truncation control (Stage 5). A SEPARATE budget from gpt4o_retries: that
+    # Truncation control (Stage 5). A SEPARATE budget from llm_classifier_retries: that
     # one counts whole-node retries for a malformed or failed response, this
     # counts levels of halving spent because a response was cut off at
     # MATCHING_MAX_TOKENS. A patient that hits one parse failure and then needs
     # two splits must not be failed for exhausting a shared counter.
-    gpt4o_truncation_splits: int
+    llm_classifier_truncation_splits: int
     # The pre-call estimate, logged beside the actual so the calibration in
     # 03- Config.py can be re-derived from measured data rather than re-guessed.
-    gpt4o_output_tokens_estimated: int
+    llm_classifier_output_tokens_estimated: int
     # Trials that entered Stage 5 and left it with no verdict because of
     # truncation (the floor, or the split budget). Distinct from
     # not_evaluable_trials, which counts trials the model assessed and could
@@ -343,15 +343,15 @@ class TrialMatchState(TypedDict):
     # How many model calls this stage actually made. 1 unsplit; more when a
     # batch was split. Without it a chunked run is indistinguishable from an
     # unsplit one in the token columns.
-    gpt4o_calls: int
-    gpt4o_raw_response: str                     # Raw GPT-4o text (for retry debugging)
-    gpt4o_prompt: str                           # Prompt sent to matching model
-    gpt4o_input_tokens: int
-    gpt4o_output_tokens: int
-    # The reasoning share OF gpt4o_output_tokens on a reasoning model, not an
+    llm_classifier_calls: int
+    llm_classifier_raw_response: str                     # Raw classifier text (retry debugging)
+    llm_classifier_prompt: str                           # Prompt sent to matching model
+    llm_classifier_input_tokens: int
+    llm_classifier_output_tokens: int
+    # The reasoning share OF llm_classifier_output_tokens on a reasoning model, not an
     # amount on top of it. None when no response reported the breakdown; see
     # _pipeline_provenance() for why that is not 0.
-    gpt4o_reasoning_tokens: Optional[int]
+    llm_classifier_reasoning_tokens: Optional[int]
     # The model string the API answered with (response.model), which is not
     # necessarily MATCHING_MODEL: an alias can resolve to a dated snapshot.
     # This is what File 14 logs and prices against.

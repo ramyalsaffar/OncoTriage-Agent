@@ -683,10 +683,10 @@ def init_ablation_db(db_path=None):
             hybrid_retrieval_time           REAL DEFAULT 0,
             cross_encoder_time              REAL DEFAULT 0,
             rule_filter_time                REAL DEFAULT 0,
-            gpt4o_evaluation_time           REAL DEFAULT 0,
+            llm_classifier_evaluation_time           REAL DEFAULT 0,
             total_time                      REAL DEFAULT 0,
-            gpt4o_input_tokens              INTEGER DEFAULT 0,
-            gpt4o_output_tokens             INTEGER DEFAULT 0,
+            llm_classifier_input_tokens              INTEGER DEFAULT 0,
+            llm_classifier_output_tokens             INTEGER DEFAULT 0,
             estimated_cost_usd              REAL DEFAULT 0,
             error                           TEXT DEFAULT '',
             FOREIGN KEY (run_id) REFERENCES ablation_runs(id)
@@ -819,8 +819,8 @@ def log_ablation_result(run_id, config_name, patient_data, result,
     """
 
     # Cost via same pricing function as File 14 — outside the try, see docstring.
-    input_tok = result.get("gpt4o_input_tokens", 0)
-    output_tok = result.get("gpt4o_output_tokens", 0)
+    input_tok = result.get("llm_classifier_input_tokens", 0)
+    output_tok = result.get("llm_classifier_output_tokens", 0)
 
     # The model that ACTUALLY answered, read off response.model by Stage 5 and
     # carried to all three terminal nodes by _pipeline_provenance() (File 13).
@@ -851,7 +851,7 @@ def log_ablation_result(run_id, config_name, patient_data, result,
     # nothing answered" stay separable without a second column.
     #
     # Reasoning tokens are NOT added to output_tok. They are already inside
-    # usage.completion_tokens and therefore inside gpt4o_output_tokens; adding
+    # usage.completion_tokens and therefore inside llm_classifier_output_tokens; adding
     # them would bill every one of them twice.
     cost = get_model_cost(matching_model_used or MATCHING_MODEL,
                           input_tok, output_tok)
@@ -958,8 +958,8 @@ def log_ablation_result(run_id, config_name, patient_data, result,
                     eligible_nct_ids, near_miss_nct_ids,
                     mesh_dropped, stage_dropped, histology_dropped,
                     query_expansion_time, hybrid_retrieval_time, cross_encoder_time,
-                    rule_filter_time, gpt4o_evaluation_time, total_time,
-                    gpt4o_input_tokens, gpt4o_output_tokens,
+                    rule_filter_time, llm_classifier_evaluation_time, total_time,
+                    llm_classifier_input_tokens, llm_classifier_output_tokens,
                     estimated_cost_usd, error,
                     retrieval_channels, retrieval_degraded, retrieval_trials_lost,
                     query_expansion_path, mesh_filter_applied, mesh_filter_skip_reason,
@@ -1006,7 +1006,7 @@ def log_ablation_result(run_id, config_name, patient_data, result,
                 round(timings.get("hybrid_retrieval", 0), 3),
                 round(timings.get("cross_encoder", 0), 3),
                 round(timings.get("rule_filter", 0), 3),
-                round(timings.get("gpt4o_evaluation", 0), 3),
+                round(timings.get("llm_classifier_evaluation", 0), 3),
                 round(sum(timings.values()), 3),
                 input_tok,
                 output_tok,
@@ -1062,7 +1062,7 @@ def match_patient_ablation(patient_data, bm25_index, nct_ids, graph, ablation_fl
 
     Returns:
         Result dict with: patient_id, matches, near_misses, stage_timings,
-        candidates_*, gpt4o_*_tokens, mesh/stage/histology_dropped, error
+        candidates_*, llm_classifier_*_tokens, mesh/stage/histology_dropped, error
     """
     initial_state = {
         "patient_data":                     patient_data,
@@ -1077,8 +1077,8 @@ def match_patient_ablation(patient_data, bm25_index, nct_ids, graph, ablation_fl
         "candidates_after_rule_filter":     0,
         "candidates_after_quality_filter":  0,
         "evaluations":                      [],
-        "gpt4o_retries":                    0,
-        "gpt4o_raw_response":               "",
+        "llm_classifier_retries":                    0,
+        "llm_classifier_raw_response":               "",
         "result":                           {},
         "error":                            "",
         "stage_timings":                    {},
@@ -1472,8 +1472,8 @@ def main():
                     "mesh_dropped": 0,
                     "stage_dropped": 0,
                     "histology_dropped": 0,
-                    "gpt4o_input_tokens": 0,
-                    "gpt4o_output_tokens": 0,
+                    "llm_classifier_input_tokens": 0,
+                    "llm_classifier_output_tokens": 0,
                 }
 
             log_ablation_result(run_id, config_name, patient_data, result,

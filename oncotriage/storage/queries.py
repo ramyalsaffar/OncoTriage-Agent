@@ -469,7 +469,7 @@ QUERIES = (
         heading=None,
         render='describe',
         blank_after=False,
-        sql='SELECT total_time, gpt4o_evaluation_time, gpt4o_output_tokens FROM inferences',
+        sql='SELECT total_time, llm_classifier_evaluation_time, llm_classifier_output_tokens FROM inferences',
     ),
     # File 16 line 88, `df_timeout`
     Query(
@@ -479,8 +479,8 @@ QUERIES = (
         blank_after=False,
         sql="""
     SELECT patient_id, age, condition_count, medication_count, 
-           candidates_evaluated, total_time, gpt4o_evaluation_time, 
-           gpt4o_input_tokens, gpt4o_output_tokens, error
+           candidates_evaluated, total_time, llm_classifier_evaluation_time, 
+           llm_classifier_input_tokens, llm_classifier_output_tokens, error
     FROM inferences 
     ORDER BY total_time DESC 
     LIMIT 5
@@ -495,9 +495,9 @@ QUERIES = (
         sql="""
     SELECT 
         total_time,
-        gpt4o_evaluation_time,
-        gpt4o_input_tokens,
-        gpt4o_output_tokens,
+        llm_classifier_evaluation_time,
+        llm_classifier_input_tokens,
+        llm_classifier_output_tokens,
         candidates_evaluated,
         estimated_cost_usd,
         error
@@ -520,9 +520,9 @@ QUERIES = (
         medication_count,
         candidates_evaluated,
         total_time,
-        gpt4o_evaluation_time,
-        gpt4o_input_tokens,
-        gpt4o_output_tokens,
+        llm_classifier_evaluation_time,
+        llm_classifier_input_tokens,
+        llm_classifier_output_tokens,
         error
     FROM inferences
     ORDER BY total_time DESC
@@ -539,12 +539,12 @@ QUERIES = (
     SELECT 
         patient_id,
         candidates_evaluated,
-        gpt4o_output_tokens,
-        gpt4o_output_tokens / NULLIF(candidates_evaluated, 0) as tokens_per_trial,
+        llm_classifier_output_tokens,
+        llm_classifier_output_tokens / NULLIF(candidates_evaluated, 0) as tokens_per_trial,
         total_time
     FROM inferences
-    WHERE gpt4o_output_tokens > 4000
-    ORDER BY gpt4o_output_tokens DESC
+    WHERE llm_classifier_output_tokens > 4000
+    ORDER BY llm_classifier_output_tokens DESC
 """,
     ),
     # File 16 line 168, `df_errors`
@@ -571,8 +571,8 @@ QUERIES = (
         sql="""
     SELECT 
         patient_id,
-        gpt4o_prompt,
-        gpt4o_output_tokens,
+        llm_classifier_prompt,
+        llm_classifier_output_tokens,
         total_time
     FROM inferences
     ORDER BY total_time DESC
@@ -591,12 +591,12 @@ QUERIES = (
         AVG(hybrid_retrieval_time) as avg_retrieval,
         AVG(cross_encoder_time) as avg_cross_encoder,
         AVG(rule_filter_time) as avg_filter,
-        AVG(gpt4o_evaluation_time) as avg_gpt4o,
+        AVG(llm_classifier_evaluation_time) as avg_llm_classifier,
         MAX(query_expansion_time) as max_expansion,
         MAX(hybrid_retrieval_time) as max_retrieval,
         MAX(cross_encoder_time) as max_cross_encoder,
         MAX(rule_filter_time) as max_filter,
-        MAX(gpt4o_evaluation_time) as max_gpt4o
+        MAX(llm_classifier_evaluation_time) as max_llm_classifier
     FROM inferences
 """,
     ),
@@ -631,9 +631,9 @@ QUERIES = (
         condition_count,
         medication_count,
         candidates_evaluated,
-        AVG(gpt4o_input_tokens) as avg_input_tokens,
-        AVG(gpt4o_output_tokens) as avg_output_tokens,
-        AVG(gpt4o_output_tokens / NULLIF(candidates_evaluated, 0)) as avg_tokens_per_trial,
+        AVG(llm_classifier_input_tokens) as avg_input_tokens,
+        AVG(llm_classifier_output_tokens) as avg_output_tokens,
+        AVG(llm_classifier_output_tokens / NULLIF(candidates_evaluated, 0)) as avg_tokens_per_trial,
         COUNT(*) as patient_count
     FROM inferences
     WHERE candidates_evaluated > 0
@@ -670,9 +670,9 @@ QUERIES = (
     SELECT
         matching_model,
         COUNT(*)                     as rows_n,
-        SUM(gpt4o_input_tokens)      as input_tokens,
-        SUM(gpt4o_output_tokens)     as output_tokens,
-        SUM(gpt4o_reasoning_tokens)  as reasoning_tokens,
+        SUM(llm_classifier_input_tokens)      as input_tokens,
+        SUM(llm_classifier_output_tokens)     as output_tokens,
+        SUM(llm_classifier_reasoning_tokens)  as reasoning_tokens,
         SUM(estimated_cost_usd)      as stored_cost
     FROM inferences
     GROUP BY matching_model
@@ -746,19 +746,19 @@ QUERIES = (
         condition_count,
         medication_count,
         candidates_evaluated,
-        gpt4o_output_tokens,
+        llm_classifier_output_tokens,
         total_time,
         eligible_matches,
         CASE 
             WHEN medication_count > 100 THEN 'High Med Count'
-            WHEN gpt4o_output_tokens > 10000 THEN 'Verbose Output'
+            WHEN llm_classifier_output_tokens > 10000 THEN 'Verbose Output'
             WHEN total_time > 120 THEN 'Slow Processing'
             WHEN candidates_evaluated = 0 THEN 'No Candidates'
             ELSE 'Other'
         END as anomaly_type
     FROM inferences
     WHERE medication_count > 100 
-       OR gpt4o_output_tokens > 10000 
+       OR llm_classifier_output_tokens > 10000 
        OR total_time > 120
        OR (candidates_retrieved > 0 AND candidates_evaluated = 0)
     ORDER BY total_time DESC
@@ -793,8 +793,8 @@ QUERIES = (
     SELECT 
         patient_id,
         medication_count,
-        gpt4o_input_tokens,
-        gpt4o_input_tokens / NULLIF(candidates_evaluated, 0) as tokens_per_trial,
+        llm_classifier_input_tokens,
+        llm_classifier_input_tokens / NULLIF(candidates_evaluated, 0) as tokens_per_trial,
         CASE 
             WHEN medication_count > 100 THEN 'High'
             WHEN medication_count > 50 THEN 'Medium'
@@ -824,7 +824,7 @@ QUERIES = (
     ),
     # File 16 line 545, `df_gpt4o_efficiency`
     Query(
-        key='gpt4o_efficiency_by_trial_count',
+        key='llm_classifier_efficiency_by_trial_count',
         heading='=== GPT-4O EFFICIENCY BY TRIAL COUNT ===',
         render='to_string',
         blank_after=True,
@@ -832,9 +832,9 @@ QUERIES = (
     SELECT 
         candidates_evaluated as trial_count,
         COUNT(*) as patient_count,
-        AVG(gpt4o_evaluation_time) as avg_time,
-        AVG(gpt4o_output_tokens) as avg_output_tokens,
-        AVG(gpt4o_output_tokens / NULLIF(candidates_evaluated, 0)) as tokens_per_trial
+        AVG(llm_classifier_evaluation_time) as avg_time,
+        AVG(llm_classifier_output_tokens) as avg_output_tokens,
+        AVG(llm_classifier_output_tokens / NULLIF(candidates_evaluated, 0)) as tokens_per_trial
     FROM inferences
     WHERE candidates_evaluated > 0
     GROUP BY candidates_evaluated
@@ -1348,12 +1348,12 @@ def print_slowest_prompt(conn, out=console.out) -> pd.DataFrame:
     _row = df_prompt.iloc[0]
     _time = _row["total_time"]
     out(f"Patient: {_row['patient_id']}")
-    out(f"Output tokens: {_row['gpt4o_output_tokens']}")
+    out(f"Output tokens: {_row['llm_classifier_output_tokens']}")
     out("Total time: (not recorded)" if pd.isna(_time)
         else f"Total time: {float(_time):.1f}s")
     out("\nCopy this prompt to ChatGPT:\n")
     out("="*80)
-    out(_row['gpt4o_prompt'])
+    out(_row['llm_classifier_prompt'])
     out("="*80)
     return df_prompt
 
@@ -1614,8 +1614,8 @@ def model_groups_from_frame(df) -> pd.DataFrame:
     nothing, but if they ever DID carry tokens that is a logging defect and
     dropping the group is how it would stay invisible.
     """
-    _needed = ("matching_model", "gpt4o_input_tokens", "gpt4o_output_tokens",
-               "gpt4o_reasoning_tokens", "estimated_cost_usd")
+    _needed = ("matching_model", "llm_classifier_input_tokens", "llm_classifier_output_tokens",
+               "llm_classifier_reasoning_tokens", "estimated_cost_usd")
     _missing = [c for c in _needed if c not in df.columns]
     if _missing:
         raise ValueError(
@@ -1628,8 +1628,8 @@ def model_groups_from_frame(df) -> pd.DataFrame:
         return pd.DataFrame(columns=list(COST_GROUP_COLUMNS))
 
     _grouped = df.groupby("matching_model", dropna=False)
-    _sums = _grouped[["gpt4o_input_tokens", "gpt4o_output_tokens",
-                      "gpt4o_reasoning_tokens", "estimated_cost_usd"]].sum(min_count=1)
+    _sums = _grouped[["llm_classifier_input_tokens", "llm_classifier_output_tokens",
+                      "llm_classifier_reasoning_tokens", "estimated_cost_usd"]].sum(min_count=1)
 
     # reindex rather than relying on the two groupby results coming back in the
     # same order. They do; but "rows_n" landing against the wrong model is a
@@ -1637,9 +1637,9 @@ def model_groups_from_frame(df) -> pd.DataFrame:
     return pd.DataFrame({
         "matching_model": _sums.index,
         "rows_n": _grouped.size().reindex(_sums.index).values,
-        "input_tokens": _sums["gpt4o_input_tokens"].values,
-        "output_tokens": _sums["gpt4o_output_tokens"].values,
-        "reasoning_tokens": _sums["gpt4o_reasoning_tokens"].values,
+        "input_tokens": _sums["llm_classifier_input_tokens"].values,
+        "output_tokens": _sums["llm_classifier_output_tokens"].values,
+        "reasoning_tokens": _sums["llm_classifier_reasoning_tokens"].values,
         "stored_cost": _sums["estimated_cost_usd"].values,
     })
 
@@ -1736,7 +1736,7 @@ def apply_display_options():
     never set them. "01- Imports.py" did, at its lines 237-242, as a side effect
     of the exec chain -- so File 16's tables printed wide and at five decimal
     places because of a file it did not know it depended on. Drop the chain and
-    ``print(df_inferences)`` collapses to `id  ...  gpt4o_reasoning_tokens`,
+    ``print(df_inferences)`` collapses to `id  ...  llm_classifier_reasoning_tokens`,
     which is a different report about the same data. That is not a difference
     anyone would have predicted from reading either file, and it is exactly the
     kind of hidden coupling this whole item exists to make explicit.

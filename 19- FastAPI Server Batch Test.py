@@ -81,7 +81,7 @@ THE POST TIMEOUT IS A STAGE 5 BOUND. POST_TIMEOUT_SECONDS is 180, which is the
 value this file has always passed to this endpoint; pass 20f only gave it a name
 so the number is written once instead of three times, and gave File 18 the same
 constant. One POST runs all six stages on the server and the fifth is a live
-model call the server retries up to MAX_GPT4O_RETRIES (3) times, so the ceiling
+model call the server retries up to MAX_LLM_CLASSIFIER_RETRIES (3) times, so the ceiling
 has to cover a full pipeline run plus those retries rather than a single round
 trip.
 

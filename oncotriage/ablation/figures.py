@@ -246,7 +246,7 @@ def plot_timing_breakdown(df: pd.DataFrame, out_dir: Path) -> None:
         ("hybrid_retrieval_time", "Hybrid Retrieval"),
         ("cross_encoder_time",    "Cross-Encoder"),
         ("rule_filter_time",      "Rule Filter"),
-        ("gpt4o_evaluation_time", "GPT-4o Evaluation"),
+        ("llm_classifier_evaluation_time", "GPT-4o Evaluation"),
     ]
 
     means = df.groupby("config_name", observed=True)[[t[0] for t in timing_cols]].mean()

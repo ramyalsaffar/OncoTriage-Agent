@@ -714,10 +714,10 @@ def detect_performance_drift(baseline_df: pd.DataFrame, current_df: pd.DataFrame
     # this z-score was computed over a column that could not vary. A baseline
     # window that straddles the fix understates the baseline mean.
     retry_result = z_score_drift(
-        baseline_df['gpt4o_retries'].fillna(0).values.astype(float),
-        current_df['gpt4o_retries'].fillna(0).values.astype(float)
+        baseline_df['llm_classifier_retries'].fillna(0).values.astype(float),
+        current_df['llm_classifier_retries'].fillna(0).values.astype(float)
     )
-    results['gpt4o_retry_rate_z_score'] = retry_result
+    results['llm_classifier_retry_rate_z_score'] = retry_result
 
     return results
 
@@ -1046,7 +1046,7 @@ def run_drift_detection(
             'timestamp', 'age', 'condition_count', 'medication_count',
             'candidates_retrieved', 'candidates_reranked', 'candidates_filtered',
             'candidates_evaluated', 'eligible_matches', 'total_time', 'error',
-            'gpt4o_retries', 'ablation_flags'
+            'llm_classifier_retries', 'ablation_flags'
         ]
         
         missing_cols = [col for col in required_cols if col not in baseline_df.columns]
