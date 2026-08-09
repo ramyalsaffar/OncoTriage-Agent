@@ -50,3 +50,21 @@
 # unchanged at HEAD, so a future scan of HEAD's blob would need its own entry if
 # the rule ever fires there too.
 6a029ac2dbae950ee647905733b95f9aecb15397:oncotriage/storage/queries.py:generic-api-key:505
+
+# .gitleaksignore:28 at commit 5df6901 — THIS FILE'S OWN FIRST DRAFT.
+#
+# NOT A CREDENTIAL, and not a finding about the project at all. The first
+# version of the entry above quoted the queries.py line verbatim in order to
+# explain it, which put the same string into this file and produced a second
+# finding. The comment was rewritten to describe the line instead of
+# reproducing it, but the old blob is still reachable in history and
+# `--log-opts="--all --full-history"` reads every commit, so the historical copy
+# is still matched.
+#
+# It is fingerprinted rather than erased because the alternative is rewriting a
+# pushed branch to hide a comment, which costs more than it is worth and would
+# invalidate every SHA below it. Two entries, both exact, both explained.
+#
+# THE LESSON IS THE POINT: a suppression file that quotes what it suppresses
+# will suppress itself into existence. Describe, do not reproduce.
+5df6901b24b797ac0e2d22d9de41889f1e9e489d:.gitleaksignore:generic-api-key:28
