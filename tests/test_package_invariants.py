@@ -1018,7 +1018,29 @@ _STRING_PREFILTER = ("exec", "spec_from_file_location", "SourceFileLoader",
 # clone has no history at all. Nothing execs a file in the working tree; all
 # three sources are hashed before any plant and compared at the end, with a
 # non-degeneracy probe so the comparison cannot be a tautology.
+# tests/test_agent_prompt_version.py (the Stage 5 prompt-version guard) is the
+# ninth, and its argument is the shortest of the nine. Every other check in that
+# file compares digests it computed itself against digests it wrote to a golden
+# file, so all of them would still pass against a render function that had been
+# quietly disconnected from the shipped template -- the digests would simply
+# agree with each other. Its control therefore execs a copy of
+# oncotriage/agent/prompts.py with ONE CHARACTER of the template changed, and
+# requires all sixteen variant digests to move; that is what establishes that
+# the subject of the guard is the shipped text.
+#
+# git show could not supply it for the ordinary reason and one extra. The
+# ordinary one: a one-character perturbation of the CURRENT template is a state
+# no commit has ever had. The extra one is the point of the whole file -- it
+# exists because a commit recedes, so reaching for `git show` inside it would
+# reintroduce the dependency it was written to remove, and three files in this
+# suite already abort in a tree with no `.git`.
+#
+# Nothing execs a file in the working tree: the patch is a string built in
+# memory, prompts.py is hashed before and after with a non-degeneracy probe,
+# and the file writes nothing in the repository except through an explicit
+# --update-snapshot flag.
 _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
+                   "tests/test_agent_prompt_version.py",
                    "tests/test_observability_logging.py",
                    "tests/test_indexer_admission_filters.py",
                    "tests/test_extraction_histology.py",

@@ -110,6 +110,13 @@ BUCKETS = {
         _A, None, "ran green in 1.8s; plants into in-memory copies, reads no git"),
     "test_agent_mesh_boost_and_quality_gate.py": (
         _A, None, "ran green in 1.8s once the two vendored MeSH lookups are seeded"),
+    "test_agent_prompt_version.py": (
+        _A, None,
+        "ran green in 0.74s wall (0.00s of checks) in a `git ls-files` checkout "
+        "with ONLY the skeleton: 41 passed, 0 failed, exit 0. It renders 16 "
+        "strings and reads one committed JSON file -- no network, no keys, no "
+        "spend, no database, no subprocess, no corpus, and NO GIT, which is the "
+        "point of it (a commit recedes; the reference is the golden snapshot)"),
     "test_agent_retrieval_observability.py": (
         _A, None, "ran green in 3.5s; needs .env to EXIST, makes no live call"),
     "test_agent_trial_verdict_normalization.py": (

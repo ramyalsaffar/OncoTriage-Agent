@@ -1,0 +1,790 @@
+# Stage 5 System Prompt Version Guard
+#####################################
+
+"""The Stage 5 system prompt cannot change without somebody deciding it did.
+
+WHY THIS FILE EXISTS
+--------------------
+``oncotriage/agent/prompts.py`` carries two identifiers that answer different
+questions about the same text:
+
+    PROMPT_VERSION      what a human INTENDED. Hand-maintained, and therefore
+                        capable of being wrong.
+    prompt_sha256(...)  what was ACTUALLY sent. Mechanical, and therefore
+                        incapable of being wrong.
+
+Nothing made them agree. An edit to the template shipped silently: the stored
+``inferences.llm_classifier_prompt_sha256`` moved, ``llm_classifier_prompt_version``
+did not, and two runs of "version 1.0.0" meant two different classifiers. The
+disagreement was recoverable from the database AFTER the fact and nothing
+raised BEFORE it. This file is what raises.
+
+It is also the standing guard the extraction pass owed. That pass proved the
+rendered prompt byte-identical across every variant and then threw the proof
+away with the session -- which is pass 20f-5's lesson verbatim ("proved correct
+once and then unguarded"), and this file is written so it cannot happen twice.
+
+WHAT IT HOLDS
+-------------
+    1. THE AXES ARE DERIVED, NOT REMEMBERED. The variant matrix is a
+       cross-product with one axis per PARAMETER of ``render_system_prompt``,
+       read off ``inspect.signature``. A parameter added, removed or renamed is
+       a NAMED failure rather than silent under-coverage -- the matrix cannot
+       quietly stop covering an input it does not know about. The skip-reason
+       axis is likewise derived: the three ``MESH_FILTER_SKIP_*`` constants come
+       out of ``oncotriage/agent/state.py``, and the ``"unrecorded"`` fallback is
+       lifted BY AST out of the one line in ``oncotriage/agent/evaluation.py``
+       that supplies it.
+    2. THE SNAPSHOT, ``tests/snapshots/prompt_version_digests.json``: the
+       version, the parameter list, and one sha256 per variant.
+    3. TWO FAILURE MODES WITH DIFFERENT MESSAGES, because they have different
+       fixes. A digest that moved while the version held is "you edited the
+       template and did not bump"; a version that moved is "regenerate so the
+       new version is deliberately recorded". Reporting either as the other
+       sends the reader to the wrong file.
+    4. TWO INVARIANTS THE MATRIX ITSELF PROVES. Within the confirmed branch the
+       skip reason is unread, so those digests must agree; across trial counts
+       they must not. The second is the non-degeneracy guard on the first --
+       without it, "all these digests are equal" is also satisfied by a render
+       function that returns a constant.
+    5. THE CONTROLS, four of them, run as part of this file so they cannot go
+       stale. Three drive the comparison directly with doctored inputs; the
+       fourth EXECS A ONE-CHARACTER-PATCHED IN-MEMORY COPY of prompts.py, which
+       is what establishes that the digests track the SHIPPED template rather
+       than something this file computed for itself.
+
+WHY THERE IS NO ``git show`` ANYWHERE IN HERE. A commit recedes. A shallow
+clone, a squash, a `git archive` export or a subtree move leaves the revision
+unreachable, and three files in this suite already abort in a tree with no
+`.git` for exactly that reason. The reference is a committed golden file, and
+it is regenerated ONLY through ``--update-snapshot`` -- never automatically,
+because a snapshot that rewrites itself to accommodate the code makes whatever
+the code does correct by definition.
+
+NO NETWORK, NO KEYS, NO SPEND, NO DATABASE, NO SUBPROCESS, NO FIXTURE, NO GIT,
+NO CORPUS. It renders sixteen strings, hashes them, and reads one JSON file.
+Not in the collision matrix: it writes nothing in the repository except through
+the explicit ``--update-snapshot`` flag, and the two source files it reads are
+written by neither of the suite's two writers.
+
+Run from terminal:
+    python tests/test_agent_prompt_version.py
+    python tests/test_agent_prompt_version.py --update-snapshot
+
+Exit codes:
+    0 -- all assertions passed
+    1 -- one or more failures
+"""
+
+
+# Run needed file
+#----------------
+# The package bootstrap every file in tests/ carries. The candidate directory
+# is the PARENT of this file's, because the package sits beside tests/ rather
+# than inside it. `pip install -e .` makes the whole block a no-op.
+import os
+import sys
+
+try:
+    import oncotriage  # noqa: F401
+except ImportError:
+    for _candidate, _how in (
+        (os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+         if "__file__" in globals() else None, "__file__"),
+        (os.getcwd(), "cwd"),
+    ):
+        if _candidate and os.path.isdir(os.path.join(_candidate, "oncotriage")):
+            if _candidate not in sys.path:
+                sys.path.insert(0, _candidate)
+            print(f"[Bootstrap] oncotriage package found at {_candidate} "
+                  f"(via {_how}); added to sys.path")
+            break
+    else:
+        raise
+    del _candidate, _how
+
+import ast
+import hashlib
+import inspect
+import json
+import time
+
+from oncotriage.agent import evaluation as _evaluation
+from oncotriage.agent import prompts as _prompts
+from oncotriage.agent import state as _state
+from oncotriage.agent.prompts import (
+    PROMPT_VERSION,
+    prompt_sha256,
+    render_system_prompt,
+)
+
+
+#------------------------------------------------------------------------------
+
+
+_T_START = time.time()
+
+
+# ===========================================================================
+# MINIMAL ASSERTION HARNESS
+# ===========================================================================
+
+_RESULTS = {"passed": 0, "failed": 0}
+_FAILURES = []
+
+
+def check(label: str, actual, expected) -> None:
+    """Assert equality, record the outcome, never abort the run."""
+    if actual == expected:
+        _RESULTS["passed"] += 1
+        print(f"  PASS  {label}")
+    else:
+        _RESULTS["failed"] += 1
+        _FAILURES.append(f"{label}\n          expected: {expected}\n"
+                         f"          actual:   {actual}")
+        print(f"  FAIL  {label}")
+        print(f"          expected: {expected}")
+        print(f"          actual:   {actual}")
+
+
+def fail(label: str, message: str) -> None:
+    """Record a failure that is not an equality comparison."""
+    _RESULTS["failed"] += 1
+    _FAILURES.append(f"{label}\n          {message}")
+    print(f"  FAIL  {label}")
+    print(f"          {message}")
+
+
+def detail(message: str) -> None:
+    """Attach diagnostic text to the run without counting it as an outcome.
+
+    The findings evaluate() produces are DETAIL on one recorded failure, not
+    failures in their own right: counting them would make the file's failure
+    total depend on how many variants happen to be in the matrix, so the same
+    defect would report 1 or 16 depending on how many skip reasons state.py
+    declares.
+    """
+    _FAILURES.append(f"          {message}")
+    print(f"        {message}")
+
+
+# THE PATHS COME FROM THE MODULES' OWN __file__, never from a _code_dir guess.
+# Pass 20d-1 moved eleven files into tests/ and every one of them had a path
+# one directory off; deriving from the imported module's __file__ also proves
+# the file under inspection is the one THIS process imported rather than a
+# same-named copy elsewhere on sys.path.
+_PROMPTS_PATH = os.path.abspath(_prompts.__file__)
+_EVALUATION_PATH = os.path.abspath(_evaluation.__file__)
+_SNAPSHOT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "snapshots", "prompt_version_digests.json")
+_UPDATE_SNAPSHOT = "--update-snapshot" in sys.argv
+
+print("=" * 78)
+print("STAGE 5 SYSTEM PROMPT VERSION GUARD")
+print("=" * 78)
+print(f"Template:  {_PROMPTS_PATH}")
+print(f"Snapshot:  {_SNAPSHOT_PATH}")
+print(f"Version:   {PROMPT_VERSION}")
+
+
+# ===========================================================================
+# SECTION 1 -- THE AXES, DERIVED FROM THE CODE
+# ===========================================================================
+#
+# The matrix is a cross-product with one axis per parameter of
+# render_system_prompt. Hardcoding the axis names would mean a parameter added
+# tomorrow is simply never varied -- the snapshot would still match, every
+# check would still pass, and the guard would cover strictly less than it
+# claims. That is the shape this project calls a check that has stopped
+# checking, so the parameter list is read off the signature and any name this
+# file does not know how to drive is a NAMED failure.
+
+print("\n" + "=" * 78)
+print("SECTION 1 -- the variant axes are derived from the render signature")
+print("=" * 78)
+
+_SIG_PARAMS = tuple(inspect.signature(render_system_prompt).parameters)
+
+
+def _skip_reason_constants():
+    """The MESH_FILTER_SKIP_* vocabulary, read out of oncotriage/agent/state.py.
+
+    A closed vocabulary declared in one place; reading it here rather than
+    retyping it means a fourth skip reason added to state.py widens this matrix
+    automatically and fails the snapshot until somebody records the new digest
+    on purpose.
+    """
+    return {name: value for name, value in vars(_state).items()
+            if name.startswith("MESH_FILTER_SKIP_") and isinstance(value, str)}
+
+
+def _unrecorded_fallback():
+    """The literal Stage 5 substitutes for an absent skip reason, BY AST.
+
+    ``oncotriage/agent/evaluation.py`` builds the value the renderer is handed
+    as ``state.get("mesh_filter_skip_reason") or "unrecorded"``. That string is
+    a real variant of the prompt -- it is what every run whose Stage 4 never
+    reported renders -- and it is not in state.py's vocabulary, so it has to
+    come from the line that produces it. Returns None when the shape is no
+    longer there, which the caller reports rather than papering over with the
+    remembered value.
+    """
+    tree = ast.parse(open(_EVALUATION_PATH, encoding="utf-8").read())
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Assign)
+                and any(getattr(t, "id", None) == "_mesh_filter_reason"
+                        for t in node.targets)):
+            continue
+        if not isinstance(node.value, ast.BoolOp) or not isinstance(node.value.op, ast.Or):
+            continue
+        for operand in node.value.values:
+            if isinstance(operand, ast.Constant) and isinstance(operand.value, str):
+                return operand.value
+    return None
+
+
+_SKIP_CONSTANTS = _skip_reason_constants()
+_FALLBACK = _unrecorded_fallback()
+
+check("state.py declares a non-empty MESH_FILTER_SKIP_* vocabulary "
+      "(non-degeneracy: an empty one would collapse the matrix silently)",
+      len(_SKIP_CONSTANTS) >= 2, True)
+
+if _FALLBACK is None:
+    fail("evaluation.py's absent-skip-reason fallback was located by AST",
+         "no `_mesh_filter_reason = ... or \"<literal>\"` assignment found in "
+         f"{_EVALUATION_PATH}. The renderer is handed a value this matrix no "
+         f"longer covers; re-derive the axis before trusting this run.")
+else:
+    check("evaluation.py's absent-skip-reason fallback was located by AST",
+          isinstance(_FALLBACK, str) and bool(_FALLBACK), True)
+
+# The reason axis: every declared skip reason, plus the fallback that no
+# constant names. Sorted so the matrix -- and therefore the snapshot -- is
+# stable across runs and machines.
+_REASONS = tuple(sorted(set(_SKIP_CONSTANTS.values())
+                        | ({_FALLBACK} if _FALLBACK else set())))
+
+# One axis per parameter. The values are this file's choice; the KEYS are not.
+_AXES = {
+    # Both branches of the one conditional in the template.
+    "mesh_filter_applied": (True, False),
+    "mesh_filter_skip_reason": _REASONS,
+    # The zero-trial form of each branch, and an ordinary batch. Zero is
+    # included because Section 5 of the prompt renders the count into an
+    # instruction ("Evaluate ALL 0 trials"), so it is a real reachable string
+    # rather than a degenerate input.
+    "trial_count": (0, 3),
+}
+
+check("every parameter of render_system_prompt has an axis in this matrix",
+      sorted(_SIG_PARAMS), sorted(_AXES))
+check("...and this matrix drives no axis the signature does not have",
+      sorted(set(_AXES) - set(_SIG_PARAMS)), [])
+check("the reason axis is non-degenerate (more than one distinct value)",
+      len(_REASONS) >= 2, True)
+
+print(f"  [info] axes: " + ", ".join(f"{k}={len(v)}" for k, v in _AXES.items())
+      + f"  ->  {len(_AXES['mesh_filter_applied']) * len(_REASONS) * len(_AXES['trial_count'])} variants")
+
+
+# ===========================================================================
+# SECTION 2 -- RENDER EVERY VARIANT AND DIGEST IT
+# ===========================================================================
+
+print("\n" + "=" * 78)
+print("SECTION 2 -- render every variant")
+print("=" * 78)
+
+
+def _variant_id(kwargs: dict) -> str:
+    """A stable key built from the PARAMETER NAMES, so a rename shows up.
+
+    The id is derived rather than labelled ("confirmed", "unconfirmed") on
+    purpose: a hand-written label survives a signature change unchanged and
+    would keep the snapshot matching a matrix that had quietly stopped
+    describing the function.
+
+    IT MUST NOT RAISE ON A SIGNATURE THAT NO LONGER MATCHES THE MATRIX, and the
+    first version did: a plain `kwargs[name] for name in _SIG_PARAMS` throws
+    KeyError the moment a parameter is renamed, which is the exact condition
+    Section 1 exists to REPORT -- so the file died with a traceback before its
+    own finding could be printed. Measured, not reasoned about: renaming
+    `trial_count` to `n_trials` in a copy produced a KeyError and no summary.
+    Names the signature does not mention are appended in sorted order, so the
+    id is total over any kwargs dict while staying byte-identical to what it
+    produced before whenever the two agree -- which is every run where the
+    snapshot is meant to match.
+    """
+    ordered = [name for name in _SIG_PARAMS if name in kwargs]
+    ordered += sorted(k for k in kwargs if k not in ordered)
+    return ";".join(f"{name}={kwargs[name]!r}" for name in ordered)
+
+
+def _matrix():
+    """Every combination, in a deterministic order."""
+    out = []
+    for applied in _AXES["mesh_filter_applied"]:
+        for reason in _AXES["mesh_filter_skip_reason"]:
+            for count in _AXES["trial_count"]:
+                out.append({"mesh_filter_applied": applied,
+                            "mesh_filter_skip_reason": reason,
+                            "trial_count": count})
+    return out
+
+
+_RENDER_ERRORS = []
+
+
+def _render(render_fn, kwargs: dict) -> str:
+    """Render one variant, converting a RAISE into a recorded value.
+
+    A BARE CALL HERE WOULD ABORT THE FILE, and the case that aborts it is
+    precisely the one Section 1 exists to detect: rename a parameter of
+    render_system_prompt and `render_fn(**kwargs)` raises TypeError at module
+    level, so the run reports one traceback where it owes 39 results -- Section
+    1's named failure among them. This project has shipped that shape three
+    times (test_storage_query_layer.py, test_dashboard_reproducibility_tab.py,
+    test_agent_trial_verdict_normalization.py); it is not shipping it a fourth.
+
+    The marker is returned INSTEAD of a rendered prompt, so it flows into the
+    digest as a value that cannot match the snapshot and is separately reported
+    by the check below. It is never silently swallowed.
+    """
+    try:
+        return render_fn(**kwargs)
+    except Exception as exc:                                     # noqa: BLE001
+        _RENDER_ERRORS.append(f"{_variant_id(kwargs)}: "
+                              f"{type(exc).__name__}: {exc}")
+        return f"<render raised {type(exc).__name__}: {exc}>"
+
+
+def _digests(render_fn) -> dict:
+    """{variant id: sha256 of the rendered system prompt} for the whole matrix.
+
+    Takes the render function as an argument so the controls below can drive
+    this exact code path with a doctored renderer. A comparison harness that
+    can only be run one way is a comparison harness whose failure path has
+    never executed.
+    """
+    return {_variant_id(kw): prompt_sha256(_render(render_fn, kw))
+            for kw in _matrix()}
+
+
+_LIVE_DIGESTS = _digests(render_system_prompt)
+
+check("every variant rendered without raising",
+      _RENDER_ERRORS, [])
+check("the matrix rendered every variant",
+      len(_LIVE_DIGESTS), len(_matrix()))
+check("every digest is a 64-character hex sha256 (non-degeneracy: an empty "
+      "render would still produce a digest, but not this one)",
+      sorted({len(d) for d in _LIVE_DIGESTS.values()}), [64])
+check("the rendered prompts are non-empty",
+      min(len(_render(render_system_prompt, kw)) for kw in _matrix()) > 1000,
+      True)
+
+
+# ===========================================================================
+# SECTION 3 -- THE SNAPSHOT
+# ===========================================================================
+
+print("\n" + "=" * 78)
+print("SECTION 3 -- the golden snapshot")
+print("=" * 78)
+
+# The parameter list is snapshotted alongside the digests, so a signature
+# REORDER -- which changes no rendered byte and would therefore pass every
+# digest comparison -- still requires a deliberate regeneration. Section 1
+# already fails on an added or removed parameter; this covers the third case.
+_LIVE_SNAPSHOT = {
+    "prompt_version": PROMPT_VERSION,
+    "render_parameters": list(_SIG_PARAMS),
+    "digests": dict(sorted(_LIVE_DIGESTS.items())),
+}
+
+
+def _serialize(snapshot: dict) -> str:
+    """The exact bytes of the golden file.
+
+    sort_keys and a trailing newline so two regenerations of unchanged code
+    produce a byte-identical file; the digests dict is pre-sorted above for the
+    same reason.
+    """
+    return json.dumps(snapshot, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+
+
+if _UPDATE_SNAPSHOT:
+    os.makedirs(os.path.dirname(_SNAPSHOT_PATH), exist_ok=True)
+    with open(_SNAPSHOT_PATH, "w", encoding="utf-8") as _fh:
+        _fh.write(_serialize(_LIVE_SNAPSHOT))
+    print(f"  [--update-snapshot] wrote {_SNAPSHOT_PATH}")
+
+check("the snapshot file exists (regenerate with --update-snapshot)",
+      os.path.isfile(_SNAPSHOT_PATH), True)
+
+if os.path.isfile(_SNAPSHOT_PATH):
+    _SNAP = json.loads(open(_SNAPSHOT_PATH, encoding="utf-8").read())
+else:
+    _SNAP = {"prompt_version": None, "render_parameters": [], "digests": {}}
+
+check("the snapshot declares the three fields this guard reads",
+      sorted(_SNAP), ["digests", "prompt_version", "render_parameters"])
+check("the snapshot is non-degenerate: it records more than one digest",
+      len(_SNAP.get("digests") or {}) > 1, True)
+
+
+# ===========================================================================
+# SECTION 4 -- THE COMPARISON, AS A PURE FUNCTION
+# ===========================================================================
+#
+# evaluate() is separated from the live data so the controls in Section 6 can
+# drive it with doctored inputs and observe which mode it reports. A comparison
+# written inline against the live values can only ever be run in the state
+# where it passes.
+
+_MODE_UNBUMPED = "template-edited-without-bumping"
+_MODE_VERSION_MOVED = "version-moved"
+_MODE_VARIANT_SET = "variant-set-changed"
+_MODE_SIGNATURE = "signature-changed"
+
+_FIX_UPDATE = ("regenerate with `python tests/test_agent_prompt_version.py "
+               "--update-snapshot`")
+
+
+def evaluate(live_version, live_params, live_digests, snapshot):
+    """Return [(mode, message)] for every disagreement with the snapshot.
+
+    ORDER MATTERS AND IS THE WHOLE DESIGN. The version is compared FIRST,
+    because it decides what a moved digest MEANS. With the version unchanged, a
+    moved digest is an unrecorded template edit and the fix is in prompts.py.
+    With the version moved, the same moved digest is the expected consequence
+    of a deliberate bump and the fix is in the snapshot -- reporting it as
+    "you forgot to bump" would send the reader to change a version they have
+    just changed.
+    """
+    problems = []
+    snap_version = snapshot.get("prompt_version")
+    snap_digests = snapshot.get("digests") or {}
+    snap_params = list(snapshot.get("render_parameters") or [])
+
+    if list(live_params) != snap_params:
+        problems.append((_MODE_SIGNATURE, (
+            f"render_system_prompt's parameters are {list(live_params)}; the "
+            f"snapshot records {snap_params}. The rendered text may not have "
+            f"moved at all -- a reorder does not -- but the matrix this guard "
+            f"drives has. Review the change, then {_FIX_UPDATE}.")))
+
+    missing = sorted(set(snap_digests) - set(live_digests))
+    added = sorted(set(live_digests) - set(snap_digests))
+    if missing or added:
+        problems.append((_MODE_VARIANT_SET, (
+            f"the variant matrix no longer matches the snapshot: "
+            f"{len(missing)} recorded variant(s) are no longer rendered "
+            f"{missing[:3]}, {len(added)} new variant(s) are "
+            f"{added[:3]}. A skip reason added to oncotriage/agent/state.py "
+            f"does this. Confirm the new matrix is what you meant, then "
+            f"{_FIX_UPDATE}.")))
+
+    moved = sorted(k for k in set(live_digests) & set(snap_digests)
+                   if live_digests[k] != snap_digests[k])
+
+    if live_version != snap_version:
+        problems.append((_MODE_VERSION_MOVED, (
+            f"PROMPT_VERSION is {live_version!r}; the snapshot records "
+            f"{snap_version!r}. A version bump is a deliberate act and the "
+            f"snapshot has to record it deliberately too: {_FIX_UPDATE}. "
+            f"({len(moved)} of {len(snap_digests)} digests also moved, which "
+            f"is expected when the bump accompanied a wording change and is "
+            f"NOT reported as an unbumped edit.)")))
+        return problems
+
+    for key in moved:
+        problems.append((_MODE_UNBUMPED, (
+            f"the rendered system prompt changed for variant {key} "
+            f"({snap_digests[key][:16]} -> {live_digests[key][:16]}) while "
+            f"PROMPT_VERSION stayed {live_version!r}. THE TEMPLATE WAS EDITED "
+            f"WITHOUT BUMPING THE VERSION, so two runs would store the same "
+            f"version against different prompts. Fix: bump PROMPT_VERSION in "
+            f"oncotriage/agent/prompts.py (middle number if the meaning "
+            f"changed, last if it cannot have), then {_FIX_UPDATE}.")))
+
+    return problems
+
+
+print("\n" + "=" * 78)
+print("SECTION 4 -- the shipped template against the snapshot")
+print("=" * 78)
+
+_LIVE_PROBLEMS = evaluate(PROMPT_VERSION, _SIG_PARAMS, _LIVE_DIGESTS, _SNAP)
+
+# NON-DEGENERATE FIRST. An empty matrix compared against an empty snapshot
+# agrees perfectly, so the agreement below is only worth reading once the
+# comparison is known to have had something to compare.
+check("the comparison ran over the whole matrix and the snapshot is not empty",
+      (len(_LIVE_DIGESTS) == len(_matrix()) > 1,
+       len(_SNAP.get("digests") or {}) > 1),
+      (True, True))
+
+# ONE recorded outcome, carrying the MODES; the messages are detail beneath it.
+# Recording one failure per variant would make the same defect report 1 or 16
+# depending on how many skip reasons state.py happens to declare.
+check("the shipped Stage 5 system prompt agrees with the golden snapshot",
+      sorted({_mode for _mode, _ in _LIVE_PROBLEMS}), [])
+for _mode, _message in _LIVE_PROBLEMS:
+    detail(f"[{_mode}] {_message}")
+
+
+# ===========================================================================
+# SECTION 5 -- WHAT THE MATRIX ITSELF PROVES
+# ===========================================================================
+#
+# Two properties of the template that no single digest can express, and that a
+# reader would otherwise have to take on trust from a comment.
+
+print("\n" + "=" * 78)
+print("SECTION 5 -- properties the matrix proves about the template")
+print("=" * 78)
+
+_confirmed_by_count = {}
+_unconfirmed_by_count = {}
+for _kw in _matrix():
+    _bucket = (_confirmed_by_count if _kw["mesh_filter_applied"]
+               else _unconfirmed_by_count)
+    _bucket.setdefault(_kw["trial_count"], set()).add(_LIVE_DIGESTS[_variant_id(_kw)])
+
+# The confirmed branch never interpolates the skip reason, so every reason must
+# render the same bytes at a given trial count. This is what makes the reason
+# column of the confirmed rows in the snapshot redundant BY PROOF rather than
+# by assertion.
+check("confirmed branch: the skip reason is unread, so one digest per "
+      "trial count",
+      sorted({len(v) for v in _confirmed_by_count.values()}), [1])
+
+# The unconfirmed branch DOES interpolate it, so the same test must come out
+# the other way -- otherwise "one digest per trial count" above would also be
+# satisfied by a renderer that ignores its arguments entirely.
+check("unconfirmed branch: the skip reason IS interpolated, so one digest per "
+      "reason (the non-degeneracy control on the check above)",
+      sorted({len(v) for v in _unconfirmed_by_count.values()}),
+      [len(_REASONS)])
+
+# And the count axis has to move something, or "the zero-trial form" is not a
+# variant at all. Flattened rather than `next(iter(v))` per bucket: that form
+# raises StopIteration on an empty bucket, which is an abort where a failure is
+# owed -- the same family as the guarded render above.
+check("the trial count reaches the rendered text",
+      len({d for v in _confirmed_by_count.values() for d in v}),
+      len(_AXES["trial_count"]))
+
+check("the two branches never render the same bytes",
+      set().union(*_confirmed_by_count.values())
+      & set().union(*_unconfirmed_by_count.values()), set())
+
+
+# ===========================================================================
+# SECTION 6 -- THE CONTROLS
+# ===========================================================================
+#
+# Every assertion above must be shown to FAIL when the thing it checks is
+# broken. Three controls doctor the INPUTS to evaluate(); the fourth doctors
+# the TEMPLATE ITSELF, which is the only one that can establish that these
+# digests are computed over the shipped file rather than over something this
+# test made up.
+
+print("\n" + "=" * 78)
+print("SECTION 6 -- the controls")
+print("=" * 78)
+
+_GOOD_SNAPSHOT = json.loads(_serialize(_LIVE_SNAPSHOT))   # a real round trip
+
+# --- 6a: unpatched, the comparison passes ---------------------------------
+check("6a  positive control: the live values against a snapshot of themselves "
+      "report nothing",
+      evaluate(PROMPT_VERSION, _SIG_PARAMS, _LIVE_DIGESTS, _GOOD_SNAPSHOT), [])
+
+# --- 6b: a digest moves, the version does not -> mode A --------------------
+_one_key = sorted(_LIVE_DIGESTS)[0]
+_bent = dict(_LIVE_DIGESTS)
+_bent[_one_key] = _bent[_one_key][:-1] + ("0" if _bent[_one_key][-1] != "0" else "1")
+_p6b = evaluate(PROMPT_VERSION, _SIG_PARAMS, _bent, _GOOD_SNAPSHOT)
+check("6b  a moved digest under an unchanged version is reported, once",
+      [m for m, _ in _p6b], [_MODE_UNBUMPED])
+check("6b  ...and the message names the fix: bump PROMPT_VERSION",
+      "bump PROMPT_VERSION in oncotriage/agent/prompts.py" in _p6b[0][1]
+      if _p6b else False, True)
+check("6b  ...and names the update flag",
+      "--update-snapshot" in _p6b[0][1] if _p6b else False, True)
+
+# --- 6c: the version moves -> mode B, and NOT mode A -----------------------
+_p6c = evaluate("9.9.9", _SIG_PARAMS, _bent, _GOOD_SNAPSHOT)
+check("6c  a moved version is reported as its own mode",
+      [m for m, _ in _p6c], [_MODE_VERSION_MOVED])
+check("6c  ...and a digest that moved WITH it is not also reported as an "
+      "unbumped edit",
+      _MODE_UNBUMPED in [m for m, _ in _p6c], False)
+check("6c  ...and the message says to regenerate the snapshot",
+      "--update-snapshot" in _p6c[0][1] if _p6c else False, True)
+
+# --- 6d: the variant set changes ------------------------------------------
+_short = {k: v for k, v in list(_LIVE_DIGESTS.items())[1:]}
+check("6d  a variant that disappeared from the matrix is reported",
+      _MODE_VARIANT_SET in
+      [m for m, _ in evaluate(PROMPT_VERSION, _SIG_PARAMS, _short, _GOOD_SNAPSHOT)],
+      True)
+
+# --- 6e: the signature changes without moving a byte -----------------------
+_reordered = dict(_GOOD_SNAPSHOT)
+_reordered["render_parameters"] = list(reversed(_GOOD_SNAPSHOT["render_parameters"]))
+check("6e  a parameter REORDER, which moves no rendered byte, is still "
+      "reported",
+      [m for m, _ in evaluate(PROMPT_VERSION, _SIG_PARAMS, _LIVE_DIGESTS,
+                              _reordered)],
+      [_MODE_SIGNATURE])
+
+# --- 6f: THE TEMPLATE ITSELF, patched by one character ---------------------
+#
+# The three controls above prove the COMPARISON discriminates. This one proves
+# its SUBJECT is right: that the digests come from the template in
+# oncotriage/agent/prompts.py and would move if a single character of it did.
+# Without it, every check in this file would still pass against a render
+# function that had been quietly disconnected from the shipped text.
+#
+# A PATCHED IN-MEMORY COPY, never an edit to the file. That is this project's
+# stated preference and it is also what keeps this test out of the collision
+# matrix -- nothing on disk is written, so no concurrent run can be corrupted
+# by it. The file is hashed before and after anyway, with a non-degeneracy
+# probe, because "the restore was byte-identical" is worthless if both sides of
+# the comparison are the same read.
+
+_PROMPTS_SRC = open(_PROMPTS_PATH, encoding="utf-8").read()
+_SHA_BEFORE = hashlib.sha256(_PROMPTS_SRC.encode("utf-8")).hexdigest()
+
+# One character, inside the template, in a line every variant renders. Asserted
+# unique first: a needle occurring twice would patch a place this test did not
+# choose, and a needle occurring zero times would make the control a no-op that
+# reports success.
+_NEEDLE = "You are a clinical trial pre-screening classifier."
+check("6f  the patch site occurs exactly once in prompts.py",
+      _PROMPTS_SRC.count(_NEEDLE), 1)
+check("6f  ...and it is a line every variant renders (non-degeneracy)",
+      all(_NEEDLE in _render(render_system_prompt, kw) for kw in _matrix()),
+      True)
+
+_PATCHED_SRC = _PROMPTS_SRC.replace(_NEEDLE, _NEEDLE[:-1] + "!", 1)
+check("6f  the patch changes exactly one character",
+      (len(_PATCHED_SRC) == len(_PROMPTS_SRC),
+       sum(1 for a, b in zip(_PATCHED_SRC, _PROMPTS_SRC) if a != b)),
+      (True, 1))
+
+_patched_ns = {"__name__": "oncotriage.agent._prompts_patched_copy",
+               "__file__": _PROMPTS_PATH}
+exec(compile(_PATCHED_SRC, "<one-character-patched copy of prompts.py>",
+             "exec"), _patched_ns)
+_patched_render = _patched_ns["render_system_prompt"]
+
+check("6f  the patched copy still renders (the control is a real prompt, not "
+      "a traceback)",
+      len(_render(_patched_render, _matrix()[0])) > 1000, True)
+
+_PATCHED_DIGESTS = _digests(_patched_render)
+check("6f  every variant's digest moved under the one-character patch",
+      sorted(k for k in _LIVE_DIGESTS
+             if _LIVE_DIGESTS[k] != _PATCHED_DIGESTS.get(k)),
+      sorted(_LIVE_DIGESTS))
+
+_p6f = evaluate(_patched_ns["PROMPT_VERSION"], _SIG_PARAMS, _PATCHED_DIGESTS,
+                _GOOD_SNAPSHOT)
+check("6f  ...and the guard reports every one of them as an unbumped edit",
+      sorted({m for m, _ in _p6f}), [_MODE_UNBUMPED])
+check("6f  ...one finding per variant, none swallowed",
+      len(_p6f), len(_LIVE_DIGESTS))
+
+# The unpatched half of the control, run AFTER the patched half so it also
+# proves the exec did not disturb the live module.
+check("6f  unpatched, the same comparison reports nothing (the other half of "
+      "the control)",
+      evaluate(PROMPT_VERSION, _SIG_PARAMS, _digests(render_system_prompt),
+               _GOOD_SNAPSHOT), [])
+
+_SHA_AFTER = hashlib.sha256(
+    open(_PROMPTS_PATH, encoding="utf-8").read().encode("utf-8")).hexdigest()
+check("6f  prompts.py on disk is byte-identical (nothing was written)",
+      _SHA_AFTER, _SHA_BEFORE)
+check("6f  ...and that comparison is not a tautology: the file is non-empty "
+      "and was re-read from disk",
+      len(_PROMPTS_SRC) > 1000 and _SHA_BEFORE != hashlib.sha256(b"").hexdigest(),
+      True)
+
+# _RENDER_ERRORS was asserted empty in Section 2 over the LIVE renders only;
+# every render since -- including the patched copy's sixteen -- appends to the
+# same list, so re-asserting it here is what stops a raise in the control being
+# swallowed by the guard that exists to stop a raise aborting the file.
+check("6f  cumulative: no render anywhere in this file raised",
+      _RENDER_ERRORS, [])
+
+
+# ===========================================================================
+# SECTION 7 -- REGENERATION IS DETERMINISTIC
+# ===========================================================================
+#
+# --update-snapshot has to produce the SAME bytes twice for unchanged code, or
+# every regeneration is a diff and the golden file stops being reviewable.
+# Checked by serializing twice rather than by writing twice: writing is what
+# the flag does, and this file must not write outside the flag.
+
+print("\n" + "=" * 78)
+print("SECTION 7 -- the snapshot serializes deterministically")
+print("=" * 78)
+
+check("two serializations of the same snapshot are byte-identical",
+      _serialize(_LIVE_SNAPSHOT), _serialize(json.loads(_serialize(_LIVE_SNAPSHOT))))
+check("the snapshot ends with exactly one trailing newline",
+      _serialize(_LIVE_SNAPSHOT).endswith("}\n"), True)
+
+# THE ON-DISK COMPARISON IS ASSERTED IN BOTH STATES rather than skipped in one.
+# A `... if not _LIVE_PROBLEMS else True` guard here would be a check that
+# passes for free on exactly the runs where something is wrong -- the shape
+# this project treats as a check that has stopped checking. So: with the guard
+# green the bytes on disk must equal what --update-snapshot would write, and
+# with it red they must NOT, which independently corroborates that the findings
+# above are real rather than an artefact of how the live values were built.
+_ON_DISK = (open(_SNAPSHOT_PATH, encoding="utf-8").read()
+            if os.path.isfile(_SNAPSHOT_PATH) else None)
+check("the golden file is current when the guard is green, and stale when it "
+      "is red -- never the other way round",
+      (_serialize(_LIVE_SNAPSHOT) == _ON_DISK) if _ON_DISK is not None else None,
+      not _LIVE_PROBLEMS)
+
+
+# ===========================================================================
+# SUMMARY
+# ===========================================================================
+
+print()
+print("=" * 78)
+print("SUMMARY")
+print("=" * 78)
+print(f"Passed: {_RESULTS['passed']}")
+print(f"Failed: {_RESULTS['failed']}")
+print(f"Runtime: {time.time() - _T_START:.2f}s")
+
+if _FAILURES:
+    print("\nFailures:")
+    for _f in _FAILURES:
+        print(f"  - {_f}")
+
+if __name__ == "__main__":
+    sys.exit(1 if _RESULTS["failed"] else 0)
+
+
+#------------------------------------------------------------------------------
+
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Sun Aug  9 09:00:00 2026
+
+@author: ramyalsaffar
+"""
