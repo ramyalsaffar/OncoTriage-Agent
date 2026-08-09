@@ -54,8 +54,11 @@
 # three gates fails on what is ACTIONABLE HERE and prints everything else:
 #
 #   pip-audit  fails on a fixable finding that is not in the per-id accepted
-#              table in .github/scripts/audit_gate.py. 32 accepted, 4 unfixable,
-#              all printed on every run.
+#              table in .github/scripts/audit_gate.py. 26 accepted, 4 unfixable,
+#              all printed on every run. It was 32 until the Airflow upgrade
+#              released fastapi from `starlette<0.49.0`; those six starlette
+#              entries are deleted because they are FIXED, and the gate's own
+#              staleness check would have failed on them otherwise.
 #   Trivy      fails on a fixable HIGH/CRITICAL that is not in `.trivyignore`.
 #              A second, non-gating step prints every severity including the
 #              unfixable ones.
@@ -66,32 +69,67 @@
 # package-level or path-level suppression anywhere in this pipeline, so a NEW
 # advisory against an already-accepted package still turns a gate red.
 #
-# WHAT IS ACCEPTED AND NOT FIXED, in one place:
-#   apache-airflow 3.1.7   CVE-2025-57735, CVE-2026-42252 (both CRITICAL) and
-#                          nine HIGHs. Airflow moved to the `orchestration`
-#                          extra, so it is out of the DEFAULT install and out of
-#                          CI's pip-audit — but the IMAGE still installs it,
-#                          because docker-compose.yml runs the scheduler and the
-#                          api-server from it, so Trivy still reports it. THE
-#                          MOVE IS A SCOPE REDUCTION, NOT A FIX. Nothing about
-#                          those two CRITICALs changed.
+# THERE ARE NO CRITICAL FINDINGS IN THIS IMAGE'S PYTHON PACKAGES ANY MORE.
+# There were two, both apache-airflow 3.1.7 (CVE-2025-57735, CVE-2026-42252),
+# and they are FIXED by the upgrade to 3.3.0 rather than accepted. Measured on
+# the built image with Trivy 0.73.0, the FULL non-gating scan, before -> after:
+#
+#     Python (python-pkg)    66 findings (2 CRITICAL, 29 HIGH)  ->  29 (0, 17)
+#     debian  (os-pkgs)     208 findings (4 CRITICAL, 27 HIGH)  -> 208 (4, 27)
+#
+# The four OS CRITICALs are perl-base and Debian has published no fix for any of
+# them, which is exactly why the gate is `--ignore-unfixed`. The OS row does not
+# move because nothing in this pass touched the base image; the Dockerfile's
+# FROM lines say how Debian patches are taken (by re-pinning the digest).
+#
+# WHAT IS ACCEPTED AND NOT FIXED, in one place — every entry a HIGH, none a
+# CRITICAL:
 #   pillow 11.3.0          13 HIGHs. Fixes are all 12.x; streamlit 1.46.0 and
 #                          fastembed 0.7.4 both cap `pillow<12`.
-#   starlette 0.48.0       CVE-2025-62727 (fixed 0.49.1) + two more. fastapi
-#                          0.117.1 caps `starlette<0.49.0`. Named in the brief
-#                          as a known accepted constraint; both left alone.
 #   transformers 4.57.1    two HIGHs, fixed in 5.x. It loads the MedCPT
 #                          cross-encoder that Stage 3's ranking depends on.
+#   setuptools / msgpack   two HIGHs, in copies VENDORED INSIDE pip. Neither is
+#                          separately installable and neither is what this
+#                          project imports; argued in `.trivyignore`.
 #
-# tests/test_package_invariants.py IS NOT RUN HERE, and the reason is not the
-# collision matrix. It cannot pass on Linux at all: it hardcodes `import
-# caffeine` in its trap preamble (two sites), and `caffeine` runs the macOS
-# binary `caffeinate` when imported — present, it spawns a process and fails the
-# import-purity check; absent, the preamble itself raises ModuleNotFoundError.
-# Two further checks unset ONCOTRIAGE_MAIN_PATH to exercise the FALLBACK root,
-# which is a hardcoded path that exists only on the original development
-# machine. Measured: 234 passed / 6 failed on Linux, identical before and after
-# this pass's changes, so none of it is caused by CI. See the CI report.
+# starlette IS NO LONGER ON THAT LIST, and it was not dropped — it was fixed.
+# Its three ids were accepted because `fastapi==0.117.1` declared
+# `starlette<0.49.0`. apache-airflow-core 3.3.0 requires `fastapi>=0.129.0`, so
+# the Airflow upgrade forced fastapi to 0.136.3 and starlette to 1.6.0, past
+# every one of those fix versions. The same move deleted six starlette entries
+# from the pip-audit gate's accepted table.
+#
+# tests/test_package_invariants.py IS STILL NOT RUN HERE, and one of its two
+# blockers is now gone. Measured on Linux, x86-equivalent conditions (a
+# container with /.dockerenv removed and DOCKER_CONTAINER=false, so
+# oncotriage.paths takes the same branch a runner does):
+#
+#     before this pass   234 passed /  6 failed / (no skip mechanism)
+#     after              245 passed /  2 failed / 2 skipped
+#
+# CLOSED — caffeine. It hardcoded `import caffeine` in both trap preambles.
+# The package is macOS-only (its module body spawns the `caffeinate` binary),
+# so on Linux the preamble raised and took four checks and two probes with it.
+# pyproject now declares it `sys_platform == "darwin"` and the two preambles
+# guard the import, recording a SKIP — never a pass — for the one thing that
+# genuinely cannot be covered where the package is absent.
+#
+# STILL OPEN — the FALLBACK root, 2 failures, and they are an assumption about
+# the developer's machine rather than a defect in the package. Check 2b proves
+# that reading a path RAISES when the project root is unreachable, then proves
+# the raise was not vacuous by restoring the root and requiring the same read to
+# succeed. It restores it by UNSETTING ONCOTRIAGE_MAIN_PATH so that
+# settings.FALLBACK_MAIN_PATH applies — a hardcoded absolute path that exists on
+# exactly one machine. On a runner nothing is restored, the read raises again,
+# and the two non-degeneracy assertions fail. The package is behaving correctly
+# throughout: it raises, and the message names the variable to set.
+#
+# IT IS NOT ADDED TO CI UNTIL THAT IS ZERO. A structural guard that is allowed
+# in with two known failures is a guard nobody will look at again, and the fix
+# is not to relax it — it is to give the second probe a root that exists
+# anywhere, which this workflow already builds (provision_ci_paths.py). That is
+# a change to the guard itself and belongs in its own reviewed commit, with the
+# usual break-it-and-watch-it-fail demonstration. See the CI report.
 
 name: CI
 

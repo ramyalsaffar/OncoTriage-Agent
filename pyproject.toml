@@ -206,35 +206,52 @@ dependencies = [
     # `mcp.server.fastmcp.FastMCP` of the 1.x line, so this pin and that code
     # move together.
     #
-    # `sse-starlette` IS PINNED HERE AND MCP DOES NOT PIN IT, and that is a
-    # conflict fix rather than a preference. mcp 2.0.0 requires
-    # `sse-starlette>=3.0.0`; the current release of that package, 3.4.8,
-    # requires `starlette>=0.49.1`; and `fastapi==0.117.1` above requires
-    # `starlette<0.49.0`. Installing mcp without this line therefore drags
-    # starlette to 1.4.1 and BREAKS THE FASTAPI SERVER -- measured, not
-    # predicted: `import oncotriage.api.server` then dies at `FastAPI(...)` with
-    # `TypeError: Router.__init__() got an unexpected keyword argument
-    # 'on_startup'`, so item 17, the dashboard's sibling service and the whole
-    # compose stack stop working the moment somebody installs the MCP extra.
+    # `sse-starlette` WAS PINNED HERE AT 3.0.2 AND THE PIN IS GONE. It was
+    # never wanted for itself — nothing in this project imports it, the MCP
+    # server speaks stdio and never the SSE or streamable-HTTP transports — it
+    # was there purely to keep pip's resolver away from starlette, because
+    # every sse-starlette from 3.1.0 on declares `starlette>=0.49.1` and
+    # `fastapi==0.117.1` declared `starlette<0.49.0`. 3.0.2 was the newest
+    # release whose starlette requirement was an EXTRA and therefore
+    # constrained nothing.
     #
-    # 3.0.2 is the newest release whose starlette requirement is an EXTRA
-    # (`starlette>=0.41.3; extra == "examples"`) rather than a hard dependency,
-    # so it constrains nothing and satisfies mcp's `>=3.0.0`. Every 3.1.0 and
-    # later carries the hard `>=0.49.1`. Nothing in this project uses
-    # sse-starlette at all -- the MCP server speaks stdio and never the SSE or
-    # streamable-HTTP transports -- so pinning it low costs nothing that is
-    # used; it is here purely to keep pip's resolver off starlette.
-    #
-    # THE REAL FIX IS TO MOVE FASTAPI FORWARD, and it is deliberately not done
-    # here: raising fastapi past its starlette cap is a change to the serving
-    # layer that item 21's container bring-up and Files 18/19 measure, and it
-    # does not belong in the pass that added a second protocol. Recorded as a
-    # follow-up.
+    # THE CAP IT WAS WORKING AROUND IS GONE (see the fastapi pin below), so the
+    # line is deleted rather than moved forward. Keeping a pin whose reason has
+    # expired is how a dependency gets held at an old release by an argument
+    # nobody re-reads; sse-starlette is a transitive dependency of mcp now, the
+    # same way httpx is a transitive dependency of openai, and it is left to
+    # mcp's own `>=3.0.0` to choose.
     "mcp==2.0.0",
-    "sse-starlette==3.0.2",
 
     # --- API server ---------------------------------------------------------
-    "fastapi==0.117.1",
+    # 0.136.3, NOT 0.117.1, AND THE AIRFLOW UPGRADE IS WHAT FORCED IT.
+    # `apache-airflow-core` 3.1.7 declared
+    # `fastapi[standard-no-fastapi-cloud-cli]<0.118.0,>=0.116.0`; 3.2.2 and
+    # 3.3.0 declare `>=0.129.0`, and 3.3.0 additionally `<0.137.0`. No Airflow
+    # release clears CVE-2025-57735 and CVE-2026-42252 while coexisting with
+    # the old pin — pip refuses the combination outright — so the two moves are
+    # one move. 0.136.3 is the highest release inside 3.3.0's window.
+    #
+    # WHAT IT CLEARS, and it is the second half of the reason: fastapi's
+    # `starlette<0.49.0` was the PIN-CAP that made SIX starlette advisories
+    # unfixable, each of them an accepted entry in
+    # .github/scripts/audit_gate.py and three of them also in `.trivyignore`.
+    # fastapi 0.136.3 declares `starlette>=0.46.0` with no upper bound, Airflow
+    # 3.3.0 declares `starlette>=1.0.1`, and starlette resolves to 1.x — past
+    # every one of those six fix versions. All six entries are deleted from
+    # both files in the same commit, and audit_gate.py FAILS on a stale
+    # accepted id, so leaving them behind would have turned the gate red rather
+    # than passing quietly.
+    #
+    # WHAT IT COSTS, stated rather than discovered later: this is a starlette
+    # MAJOR (0.48 -> 1.x) under the serving layer, and `slowapi==0.1.9` sits on
+    # top of it. The pass that deferred this move deferred it because "Files 18
+    # and 19 measure it and they make billed model calls". That is still true
+    # and they are still not run here. What IS run: the whole compose stack is
+    # brought up and every service's healthcheck is required green, which
+    # exercises `GET /health` through this fastapi and this starlette, and
+    # bucket A imports `oncotriage.api.server` in a subprocess with traps armed.
+    "fastapi==0.136.3",
     "uvicorn[standard]==0.40.0",
     "python-multipart==0.0.31",
     "pydantic==2.12.5",
@@ -285,11 +302,30 @@ dependencies = [
     "nest-asyncio==1.6.0",
 
     # --- macOS sleep suppression --------------------------------------------
-    # macOS-only in EFFECT (CaffeinateSession is a no-op elsewhere) but NOT in
-    # IMPORT: `oncotriage/utils.py` does an unguarded `import caffeine as
-    # _caffeine_mod` at module scope, so it has to be installed on Linux too or
-    # importing utils fails.
-    "caffeine==0.5",
+    # MACOS ONLY, BY ENVIRONMENT MARKER. The old note here said this had to be
+    # installed on Linux as well, "because oncotriage/utils.py does an
+    # unguarded `import caffeine` at module scope". That has not been true
+    # since item 21: the import is inside a `try/except Exception` (Exception,
+    # not ImportError -- the failure is a FileNotFoundError from the
+    # `caffeinate` subprocess the module body spawns), the reason is recorded
+    # in `CAFFEINE_IMPORT_ERROR`, and `CaffeinateSession` prints it and
+    # degrades. The comment outlived the fix.
+    #
+    # WHAT INSTALLING IT ON LINUX ACTUALLY BUYS: nothing, and it costs. The
+    # package's last two module-level statements are `on()` and
+    # `atexit.register(off)`, and `on()` is
+    # `subprocess.Popen(['caffeinate', ...])` -- a macOS binary. So on Linux
+    # every `import caffeine` spawns a process that cannot exist, raises, and
+    # emits a UserWarning first. That is a process spawn at import time, which
+    # is the single thing `tests/test_package_invariants.py` section 2 exists
+    # to forbid, and it is why that file had to pre-import caffeine before
+    # arming its traps at two separate sites.
+    #
+    # `sys_platform == "darwin"` is the marker rather than `platform_system`
+    # because pip evaluates both and darwin is the value CPython reports on
+    # macOS for sys.platform. On Linux the package is simply absent, `_caffeine_mod`
+    # is None, and CaffeinateSession says so.
+    "caffeine==0.5; sys_platform == 'darwin'",
 
     # --- Retry / progress ---------------------------------------------------
     "tenacity==9.0.0",
@@ -308,23 +344,55 @@ dependencies = [
 [project.optional-dependencies]
 # ORCHESTRATION — Airflow, and the only other package that exists for it.
 #
-# THIS IS A SCOPE REDUCTION, NOT REMEDIATION. Moving Airflow out of the default
-# install does not fix anything in it. It removes it from what a default
-# `pip install` resolves, and therefore from what CI installs and what
-# pip-audit and Trivy see. These two CRITICALs are still present, still
-# unfixed, and still shipped to anyone who installs the extra or runs the
-# Docker stack:
+# THE EXTRA IS A PACKAGING BOUNDARY AND WAS NEVER A FIX. Moving Airflow out of
+# the default install narrowed what a default `pip install` resolves, and
+# therefore what CI's pip-audit sees; it changed nothing about the code that
+# ships. The image installs this extra explicitly (docker-compose.yml runs
+# airflow-scheduler and airflow-apiserver from it), so Trivy always saw these
+# packages and always reported them. Two of what it reported were CRITICAL:
 #
-#     CVE-2025-57735  apache-airflow 3.1.7  JWT token still valid after logout
-#                                           (fixed in 3.2.0)
-#     CVE-2026-42252  apache-airflow 3.1.7  template-engine injection
-#                                           (fixed in 3.2.2)
+#     CVE-2025-57735  JWT token still valid after logout    fixed 3.2.0
+#     CVE-2026-42252  template-engine injection             fixed 3.2.2
 #
-# plus nine HIGHs across apache-airflow and apache-airflow-core at the same
-# version. Do not describe this move as a fix anywhere. The remediation is an
-# upgrade to >= 3.2.2, which is a separate decision because Airflow majors
-# change the scheduler, the metadata database schema and the REST API this
-# project's `oncotriage/orchestration/airflow_manager.py` talks to.
+# BOTH ARE FIXED HERE BY UPGRADING, and the version was measured rather than
+# assumed. pip-audit against each candidate release, reading the fix version
+# off the advisory rather than off a changelog:
+#
+#     3.1.7   39 advisories on apache-airflow, 8 on apache-airflow-core
+#     3.1.8   30 / 8      — clears neither CRITICAL
+#     3.2.0   22 / 1      — clears CVE-2025-57735, not CVE-2026-42252
+#     3.2.1   21 / 1
+#     3.2.2    5 / 0      — THE LOWEST RELEASE THAT CLEARS BOTH
+#     3.3.0    0 / 0
+#
+# 3.3.0 IS PINNED, NOT 3.2.2, AND THE ONE EXTRA RELEASE IS ARGUED. 3.2.2 is
+# the literal answer to "the lowest that clears both", and it still carries
+# five advisories that pip-audit reports as fixed in 3.3.0 — CVE-2026-33264,
+# CVE-2026-49296, CVE-2026-48891, CVE-2026-48892, CVE-2026-49487. Those five
+# are worse than an ordinary accepted finding because NEITHER GATE WOULD EVER
+# NAME THEM: this package is outside the default install so CI's pip-audit
+# does not see it, and Trivy 0.73.0's database has no entry for any of the
+# five (measured — a probe image carrying only an
+# `apache_airflow-3.2.2.dist-info/METADATA` reports zero findings, while the
+# same probe at 3.1.7 reproduces exactly the eleven ids the old .trivyignore
+# listed). Pinning 3.2.2 would therefore ship five known-fixable advisories
+# into a pipeline whose stated property is that nothing is accepted silently.
+#
+# CVE-2026-42252 IS NOT IN pip-audit's DATA AT ALL, under that id or any alias
+# of it, at any version. It comes from Trivy, whose advisory carries the fixed
+# version 3.2.2. So "determine the version from pip-audit" answers only half
+# the question and the two scanners had to be read together; the table above
+# is pip-audit's and the 3.2.2 floor for that one CVE is Trivy's.
+#
+# WHAT THIS UPGRADE DRAGS WITH IT, stated because it is much larger than the
+# line it changes: `apache-airflow-core` 3.1.7 declared
+# `fastapi[standard-no-fastapi-cloud-cli]<0.118.0,>=0.116.0`, which is why
+# `fastapi==0.117.1` was installable beside it. 3.2.2 and 3.3.0 declare
+# `>=0.129.0` (3.3.0 also `<0.137.0`). There is no version of Airflow that
+# clears both CRITICALs and coexists with the old fastapi pin — the resolver
+# refuses outright — so THE AIRFLOW UPGRADE FORCES THE FASTAPI UPGRADE, which
+# in turn releases starlette from the cap that made six starlette advisories
+# unfixable. See the fastapi pin above for what that cost and cleared.
 #
 # WHY THESE TWO PACKAGES AND NOTHING ELSE, derived rather than assumed. The
 # full dependency closure was resolved twice with pip's own resolver, once with
@@ -360,7 +428,7 @@ dependencies = [
 # airflow-scheduler and airflow-apiserver from the same image, and a
 # default-only install would leave both without Airflow. See the Dockerfile.
 orchestration = [
-    "apache-airflow==3.1.7",
+    "apache-airflow==3.3.0",
     "pendulum==3.2.0",
 ]
 

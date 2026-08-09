@@ -278,8 +278,9 @@ if not os.path.isdir(_PKG_DIR):
 # Same shape as Files 33, 42, 43 and 44: record every outcome, never abort on
 # the first failure, exit non-zero at the end.
 
-_RESULTS = {"passed": 0, "failed": 0}
+_RESULTS = {"passed": 0, "failed": 0, "skipped": 0}
 _FAILURES = []
+_SKIPS = []
 
 
 def check(label: str, actual, expected) -> None:
@@ -298,6 +299,27 @@ def fail(label: str, detail: str) -> None:
     _RESULTS["failed"] += 1
     _FAILURES.append(f"{label}\n          {detail}")
     print(f"  FAIL  {label}")
+
+
+def skip(label: str, reason: str) -> None:
+    """Record coverage that could NOT be exercised on this platform.
+
+    A SKIP IS NOT A PASS AND IS NEVER COUNTED AS ONE. It has its own counter,
+    its own line in the summary and its own list, so a run that could not
+    exercise something says so instead of reporting a smaller green number that
+    reads identically to a full one. It does not affect the exit code: the
+    thing skipped is not broken, it is absent.
+
+    The only caller today is the `caffeine` guard -- see the pre-import in
+    _PURITY. `caffeine` is a macOS-only dependency (pyproject declares it
+    `sys_platform == "darwin"`), so on Linux there is no caffeine import for
+    the purity probes to have to arrange around, and the coverage that the
+    package's own guarded import of it stays clean is genuinely unavailable
+    rather than passing.
+    """
+    _RESULTS["skipped"] += 1
+    _SKIPS.append(f"{label}\n          {reason}")
+    print(f"  SKIP  {label}")
 
 
 #------------------------------------------------------------------------------
@@ -1249,7 +1271,32 @@ print("=" * 78)
 _PURITY = r"""
 import builtins, io, json, socket, sqlite3, subprocess, sys
 
-import caffeine, dotenv, httpx, openai, qdrant_client, tenacity           # noqa: F401
+import dotenv, httpx, openai, qdrant_client, tenacity                     # noqa: F401
+# caffeine IS PRE-IMPORTED ONLY WHERE IT EXISTS, and the guard is the whole
+# reason this file can run on Linux. pyproject declares it
+# `caffeine==0.5; sys_platform == "darwin"`, because the package's module body
+# ends in `on()` -> `subprocess.Popen(['caffeinate', ...])` and `caffeinate` is
+# a macOS binary. So:
+#
+#   macOS  -- installed. The import happens HERE, before the traps below are
+#             armed, exactly as it always did; `oncotriage.utils` then finds it
+#             in sys.modules and its own guarded import is a no-op. Nothing
+#             about this run changes.
+#   Linux  -- absent. There is nothing to pre-import, `oncotriage.utils`'s
+#             `except Exception` records CAFFEINE_IMPORT_ERROR, and a failed
+#             import spawns no process and opens no file (the path finder uses
+#             os.scandir), so every trap below stays quiet on its own merit.
+#
+# `except Exception`, not `except ImportError`, for the same reason
+# oncotriage/utils.py uses the broad one: on a Linux box that HAS the package
+# installed anyway, the failure is a FileNotFoundError out of that Popen, not
+# an ImportError. The flag is reported so the parent can record a SKIP rather
+# than silently covering less.
+try:
+    import caffeine                                                       # noqa: F401
+    _caffeine_preimported = True
+except Exception:                                                         # noqa: BLE001
+    _caffeine_preimported = False
 import collections, glob, logging, os, pathlib, re, threading, typing     # noqa: F401
 import xml.etree.ElementTree                                              # noqa: F401
 # Pre-imported for the same reason as the block above: the agent imports these
@@ -1583,6 +1630,7 @@ _planted_now_blocked = _fires(_planted_mod.Popen, ["oncotriage-trap-probe"])
 del sys.modules["oncotriage_planted_holder"]
 
 print(json.dumps({"heavy": heavy, "armed": armed, "forms": _forms,
+                  "caffeine_preimported": _caffeine_preimported,
                   "prebound_holders": _holders,
                   "closed_holders": sorted(_CLOSED_HOLDERS),
                   "control_found_planted":
@@ -1680,6 +1728,21 @@ else:
     check("no model-bearing library was imported (torch / transformers / "
           "sentence_transformers / streamlit / langgraph / icd10)",
           _payload.get("heavy"), [])
+
+    # THE ONE THING THIS PROBE COVERS LESS OF WHERE caffeine IS ABSENT. On
+    # macOS the pre-import is what keeps `caffeine`'s own module-level
+    # `subprocess.Popen(['caffeinate', ...])` outside the trap window, so a run
+    # there proves that oncotriage.utils' guarded import of it stays clean.
+    # Off darwin the package is not installed (pyproject marks it
+    # `sys_platform == "darwin"`), so there is no such import to prove anything
+    # about. Recorded as a SKIP, never as a pass: the counter is separate and
+    # the summary prints it, so a Linux run cannot be mistaken for a full one.
+    if not _payload.get("caffeine_preimported"):
+        skip("oncotriage.utils' caffeine import stays inside the pre-import "
+             "window (section 2)",
+             "caffeine is not installed on this platform -- pyproject declares "
+             "it `sys_platform == \"darwin\"`, and its module body spawns the "
+             "macOS `caffeinate` binary. Run this file on macOS to cover it.")
 
     # --- every reference form is covered, with a control each (20c-3i) -----
     #
@@ -4902,7 +4965,15 @@ _DASHBOARD_PURITY = r"""
 import builtins, io, json, socket, sqlite3, sys
 
 import numpy, pandas                                                      # noqa: F401
-import openai, qdrant_client, dotenv, httpx, tenacity, caffeine           # noqa: F401
+import openai, qdrant_client, dotenv, httpx, tenacity                     # noqa: F401
+# Same guard, same reason, as section 2's pre-import block -- see the long note
+# there. caffeine is a macOS-only dependency; where it is absent there is no
+# import for this probe to arrange around, and the parent records a SKIP.
+try:
+    import caffeine                                                       # noqa: F401
+    _caffeine_preimported = True
+except Exception:                                                         # noqa: BLE001
+    _caffeine_preimported = False
 # The dashboard's module-scope third-party dependencies. streamlit reads its
 # config file and plotly loads its package data at import; neither is this
 # package's doing, which is the same allowance section 2 makes for matplotlib.
@@ -4963,6 +5034,7 @@ for _name, _fn, _args in (("socket", socket.socket, (socket.AF_INET, socket.SOCK
         armed[_name] = True
 
 print(json.dumps({"heavy": heavy, "armed": armed,
+                  "caffeine_preimported": _caffeine_preimported,
                   "resolved": sorted(_p._RESOLVED)}))
 """
 
@@ -4985,6 +5057,13 @@ else:
     check("importing the dashboard resolves NO path -- data.py reads "
           "paths.inferences_path inside the function body, not at module scope",
           _payload.get("resolved"), [])
+    # Same skip, same reason, as section 2's. See the note there.
+    if not _payload.get("caffeine_preimported"):
+        skip("oncotriage.utils' caffeine import stays inside the pre-import "
+             "window (section 6c, the dashboard probe)",
+             "caffeine is not installed on this platform -- pyproject declares "
+             "it `sys_platform == \"darwin\"`. Run this file on macOS to cover "
+             "it.")
 
 
 # --- 6d. the three loaders read the path lazily and their SQL is unchanged --
@@ -5274,6 +5353,16 @@ print("SUMMARY")
 print("=" * 78)
 print(f"Passed: {_RESULTS['passed']}")
 print(f"Failed: {_RESULTS['failed']}")
+# ALWAYS PRINTED, even at zero. A skip count that only appears when non-zero
+# makes its absence ambiguous -- the reader cannot tell a run with nothing
+# skipped from a run by a version of this file that had no skip mechanism.
+print(f"Skipped: {_RESULTS['skipped']}   (a skip is NOT a pass and is not "
+      f"counted as one)")
+
+if _SKIPS:
+    print("\nSkipped — coverage NOT exercised on this platform:")
+    for _s in _SKIPS:
+        print(f"  - {_s}")
 
 if _FAILURES:
     print("\nFailures:")

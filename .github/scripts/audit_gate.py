@@ -71,10 +71,14 @@ import sys
 #             to trial_criteria_20260807_111807 while the fixtures are pinned to
 #             ...20260803_104642 -- so a bump here would be unverifiable by the
 #             one mechanism built to verify it.
-#   SCOPE     apache-airflow, moved to the `orchestration` extra. NOT fixed; see
-#             pyproject.toml. It is not in the default install so it is not in
-#             this audit, and these ids are listed for the day someone audits
-#             with the extra installed.
+#   (THE `SCOPE` CLASS IS GONE.) It described apache-airflow, moved to the
+#             `orchestration` extra and therefore invisible to this audit, with
+#             two CRITICALs left unfixed. The upgrade to 3.3.0 is done, so there
+#             is nothing to scope away. Note what that class always was: a
+#             statement about what this gate can SEE, not about what ships. If
+#             a package is ever moved out of the default install again, the
+#             right home for its findings is `.trivyignore`, which scans the
+#             image and therefore sees the extra.
 _ACCEPTED = {
     # ---- pillow: PIN-CAP -------------------------------------------------
     # Every pillow fix is a 12.x release. streamlit 1.46.0 declares
@@ -102,17 +106,19 @@ _ACCEPTED = {
     "PYSEC-2026-3495": ("pillow", "12.3.0", "PIN-CAP streamlit<12 / fastembed<12"),
     "PYSEC-2026-3496": ("pillow", "12.3.0", "PIN-CAP streamlit<12 / fastembed<12"),
 
-    # ---- starlette: PIN-CAP ----------------------------------------------
-    # fastapi 0.117.1 declares `starlette<0.49.0`. Every starlette fix is
-    # >= 0.49.1. Named in the brief as a known accepted constraint; the
-    # remediation is moving fastapi past its cap, which is a serving-layer
-    # change with its own verification (Files 18/19 cost money to run).
-    "PYSEC-2026-1942": ("starlette", "0.49.1", "PIN-CAP fastapi<0.49.0 (CVE-2025-62727)"),
-    "PYSEC-2026-161":  ("starlette", "1.0.1",  "PIN-CAP fastapi<0.49.0"),
-    "PYSEC-2026-2280": ("starlette", "1.1.0",  "PIN-CAP fastapi<0.49.0"),
-    "PYSEC-2026-2281": ("starlette", "1.1.0",  "PIN-CAP fastapi<0.49.0"),
-    "PYSEC-2026-248":  ("starlette", "1.3.0",  "PIN-CAP fastapi<0.49.0"),
-    "PYSEC-2026-249":  ("starlette", "1.3.1",  "PIN-CAP fastapi<0.49.0"),
+    # ---- starlette: SIX ENTRIES DELETED, AND THEY WERE FIXED, NOT DROPPED --
+    # PYSEC-2026-1942 (CVE-2025-62727), -161, -2280, -2281, -248 and -249 were
+    # accepted here on the argument that `fastapi==0.117.1` declares
+    # `starlette<0.49.0` and every fix is >= 0.49.1. That cap is gone: the
+    # Airflow upgrade forced fastapi to 0.136.3, because apache-airflow-core
+    # 3.3.0 requires `fastapi>=0.129.0,<0.137.0` and no Airflow release clears
+    # its two CRITICALs while coexisting with the old pin. starlette resolves to
+    # 1.6.0, past all six fix versions.
+    #
+    # THE STALENESS CHECK BELOW IS WHAT MAKES THIS SAFE TO DO IN ONE COMMIT: an
+    # accepted id that no longer appears in the audit exits 2. Leaving these six
+    # behind after the pin moved would have turned the gate red rather than
+    # letting a dead exemption sit here being re-read as a live constraint.
 
     # ---- streamlit: RENDER -----------------------------------------------
     "PYSEC-2026-212":  ("streamlit", "1.53.1", "RENDER dashboard snapshot"),

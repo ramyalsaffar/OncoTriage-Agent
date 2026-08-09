@@ -59,6 +59,41 @@
 # ===========================================================================
 # STAGE 1: Builder - Install dependencies as non-root in venv
 # ===========================================================================
+#
+# HOW DEBIAN SECURITY PATCHES ENTER THIS IMAGE: BY CHANGING THIS DIGEST, AND BY
+# NOTHING ELSE THAT HAPPENS AT BUILD TIME.
+#
+# The digest fixes the content of all 111 OS packages at the moment it was
+# published, and a pinned digest cannot receive Debian's later updates. There
+# was an `apt-get upgrade` in STAGE 2 that reached the network at build time to
+# close that gap; it is reverted, because it cleared zero findings (measured
+# twice, 208 -> 208, argued at the line where it used to be) and it made two
+# builds of one commit able to differ, which is exactly the property this pin
+# exists to provide. Picking patches up therefore means editing the digest on
+# BOTH FROM lines in the same commit, so the builder and the runtime stage stay
+# the same Debian.
+#
+# The fixable-only Trivy gate in .github/workflows/ci.yml is what makes that
+# non-optional rather than a chore somebody remembers: it fails on any HIGH or
+# CRITICAL that Debian HAS released a fix for, so the day a fix lands, CI goes
+# red and stays red until the digest moves. Today it is green with 208 OS
+# findings outstanding because Debian has fixed none of them.
+#
+# ANY DIGEST CHANGE MUST BE FOLLOWED BY RUNNING THE IMAGE AND READING THE
+# INTERPRETER VERSION BACK:
+#
+#     docker run --rm <image> python --version        # expect Python 3.11.x
+#
+# This is the lesson recorded at the top of this file, and it is repeated here
+# because this is the line it is about. A TAG WRITTEN NEXT TO A DIGEST IS A
+# COMMENT — Docker resolves the digest and never checks the tag against it. The
+# previous pin here read `python:3.11-slim@sha256:2bac4376...` and resolved to
+# PYTHON 3.10.0, so a file whose own header advertised "pinned base image
+# digest for reproducibility" was reproducibly building on an interpreter two
+# minor versions older than it claimed. Nothing failed; it surfaced only from a
+# container traceback naming /opt/venv/lib/python3.10/. The digest below is
+# `python:3.11-slim` as it resolves today, verified by running it to report
+# Python 3.11.15.
 FROM python:3.11-slim@sha256:94c50be2dc994b873b55bc123e95e6dbade08095b3dfd790f51c34de3f08cbb7 AS builder
 
 # Prevent Python from writing .pyc files and buffering
@@ -177,6 +212,21 @@ open('/tmp/requirements.txt','w').write('\n'.join(deps + extra) + '\n')" && \
 # ===========================================================================
 # STAGE 2: Runtime - Minimal production image
 # ===========================================================================
+#
+# THE SECOND HALF OF THE PIN. This digest and STAGE 1's must be the same value
+# and must move together in one commit — the venv is built against STAGE 1's
+# libc and copied into this stage, so two different Debians here is a runtime
+# failure with no build-time symptom.
+#
+# Debian security patches are taken by editing these two lines, never by an
+# `apt-get upgrade` below; the full argument, the measurement that removed that
+# line, and the CI gate that forces the digest forward are at STAGE 1's FROM.
+#
+# AND THE SAME RULE APPLIES HERE: THE TAG BESIDE THE DIGEST IS NEVER CHECKED.
+# `python:3.11-slim@sha256:2bac4376...` silently resolved to PYTHON 3.10.0 in
+# this project, on this line as well as STAGE 1's. After any digest change, run
+# the image and read the version back — `docker run --rm <image> python
+# --version` — rather than trusting the tag you wrote beside it.
 FROM python:3.11-slim@sha256:94c50be2dc994b873b55bc123e95e6dbade08095b3dfd790f51c34de3f08cbb7
 
 # THE VERSION LABEL IS DERIVED, AND A WRONG ONE FAILS THE BUILD.
@@ -242,45 +292,40 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 #       file now uses `airflow jobs check` instead, which is the authoritative
 #       answer rather than a process-table guess, but procps stays because a
 #       container you cannot run `ps` in is very hard to debug.
-# THE DISTRIBUTION PACKAGES ARE UPGRADED, NOT JUST INSTALLED.
+# THE DISTRIBUTION PACKAGES ARE INSTALLED AND NOT UPGRADED, AND THE `apt-get
+# upgrade` THAT WAS HERE IS REVERTED.
 #
-# The base image is pinned by digest, which fixes the CONTENT of every OS
-# package in it at the moment that digest was published. Debian keeps shipping
-# security updates afterwards, and a pinned digest cannot receive them — so
-# every day the image ages, the gap between "what this image has" and "what
-# Debian has fixed" widens, and a scanner reports the difference as
-# vulnerabilities that look unfixable because the base image tag never moved.
+# It was added on the argument that a digest pin cannot receive Debian's later
+# security updates, which is true, and it was kept after its own measurement
+# said it cleared nothing, which was the mistake. The measurement stands and is
+# reproduced below; what changed is the conclusion drawn from it.
 #
-# `apt-get upgrade` closes exactly that gap while keeping the digest pin: the
-# pin still decides which Debian release and which package set, and this line
-# takes the patched versions of that same set.
+#     Trivy 0.73.0, debian 13.6, with the upgrade  ->  without it
+#         all OS findings   208 (98 LOW, 79 MEDIUM, 27 HIGH, 4 CRITICAL)
+#                        ->  208 (98 LOW, 79 MEDIUM, 27 HIGH, 4 CRITICAL)
+#         OS findings WITH a fix   0  ->  0
 #
-# MEASURED EFFECT TODAY: NONE, AND THAT IS THE HONEST NUMBER. Trivy 0.73.0
-# against debian 13.6, HIGH+CRITICAL, before and after this line:
+# Identical, package for package. Every one of the 208 is a package Debian has
+# not released a fix for, the four CRITICALs among them all perl-base
+# (CVE-2026-13221, CVE-2026-42496, CVE-2026-57433, CVE-2026-8376), none with a
+# fixed version in the Debian tracker. There was nothing for the line to take.
 #
-#     all OS findings          31 (27 HIGH, 4 CRITICAL)  ->  31 (27 HIGH, 4 CRITICAL)
-#     OS findings WITH a fix    0                        ->   0
+# WHAT IT COST, WHICH IS WHY "IT CLEARS NOTHING TODAY" IS NOT NEUTRAL. Both
+# stages pin the base by sha256 digest. `apt-get upgrade` reaches the network
+# at BUILD time and takes whatever Debian has published that day, so two builds
+# of the same commit produce different package sets — the digest pin stops
+# meaning what the header at the top of this file says it means, and the thing
+# it stopped meaning is the only reproducibility guarantee the image has. A
+# line that buys zero findings and sells that is a bad trade at any price.
 #
-# Every one of the 31 is a package Debian has not yet released a fix for --
-# including all four CRITICALs, which are perl-base (CVE-2026-13221,
-# CVE-2026-42496, CVE-2026-57433, CVE-2026-8376) and carry no fixed version in
-# the Debian tracker. So there was nothing for this line to take, and it is
-# kept for the day there is: the fixable-only gate in the workflow will fail the
-# moment Debian publishes a fix this build has not picked up.
-#
-# THE COST, stated rather than hidden: this line makes the build no longer
-# byte-reproducible from the digest alone. Two builds of the same commit on
-# different days can install different package versions. That is the trade for
-# not shipping a knowingly-stale OS, and it is why the version LABEL and the
-# application pins are unaffected -- only Debian's own packages move.
-#
-# WHY NOT `dist-upgrade`: it may add or remove packages to satisfy changed
-# dependencies, which can pull a different package set into a supposedly pinned
-# image. `upgrade` only takes newer versions of what is already there.
-#
-# The `rm -rf /var/lib/apt/lists/*` still runs last, so the package index this
-# adds does not ship in the layer.
-RUN apt-get update && apt-get upgrade -y --no-install-recommends && \
+# HOW DEBIAN SECURITY PATCHES ARE PICKED UP INSTEAD: BY RE-PINNING THE DIGEST
+# at the two FROM lines. That is a reviewable, committed, single-valued change
+# — one build of one commit gives one package set — and the fixable-only Trivy
+# gate in .github/workflows/ci.yml is what makes it non-optional: the moment
+# Debian publishes a fix for anything in this image, that gate turns red and
+# stays red until the digest moves. See the note at the FROM lines for the
+# check that must follow any digest change.
+RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
