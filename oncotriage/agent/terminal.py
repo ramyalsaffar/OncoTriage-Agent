@@ -31,6 +31,7 @@ from oncotriage.agent.state import (
     TrialMatchState,
     normalize_trial_verdict,
 )
+from oncotriage.agent.prompts import PROMPT_VERSION
 from oncotriage.observability import get_logger
 from oncotriage.registries.primary_cancer import _resolve_primary_cancer
 from oncotriage.utils import deduplicate_by_display, get_age_reference_date
@@ -139,6 +140,29 @@ def _pipeline_provenance(state) -> Dict:
         # genuine 0 is a different fact and stays 0.
         "matching_model": state.get("matching_model"),
         "llm_classifier_reasoning_tokens": state.get("llm_classifier_reasoning_tokens"),
+
+        # --- Which Stage 5 system prompt produced this row ------------------
+        #
+        # THE TWO FIELDS DEFAULT DIFFERENTLY, AND THE ASYMMETRY IS THE POINT.
+        #
+        # The VERSION is what a human intended the template to be, and it is a
+        # property of the CODE this process is running, not of any stage. So it
+        # is answered even when Stage 5 never ran: node_no_candidates emptied
+        # the pool before the prompt was rendered, and the honest statement
+        # about that row is still "this build carried template 1.0.0". Stage 5
+        # writes it into state on every one of its returns, so a run that DID
+        # render reports the version that rendered; the fallback is for the
+        # paths that never reached the node.
+        #
+        # The HASH has no fallback and is None when no prompt was rendered.
+        # NULL is the honest value for the hash of a prompt that never existed;
+        # rendering one here to hash it would record an event that did not
+        # happen, which is the defect class this project exists to remove. A
+        # reader therefore separates "Stage 5 ran" from "Stage 5 never ran" by
+        # llm_classifier_prompt_sha256 IS NULL, never by the version.
+        "llm_classifier_prompt_version": (state.get("llm_classifier_prompt_version")
+                                          or PROMPT_VERSION),
+        "llm_classifier_prompt_sha256": state.get("llm_classifier_prompt_sha256"),
         # Which stages were disabled for this run; {} = full pipeline. Copied
         # rather than aliased so the logged record cannot be mutated later.
         "ablation_flags": dict(state.get("ablation_flags") or {}),

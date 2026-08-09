@@ -346,6 +346,20 @@ class TrialMatchState(TypedDict):
     llm_classifier_calls: int
     llm_classifier_raw_response: str                     # Raw classifier text (retry debugging)
     llm_classifier_prompt: str                           # Prompt sent to matching model
+    # Which SYSTEM prompt template produced this run, and the sha256 of the
+    # exact rendered bytes. Both come from oncotriage/agent/prompts.py; the
+    # version is hand-maintained and says what a human intended, the hash is
+    # computed per call and says what was actually sent. Note the hash covers
+    # the SYSTEM message only -- llm_classifier_prompt above is system + user,
+    # and the user half varies per patient, so hashing it would identify the
+    # patient rather than the template.
+    #
+    # The version is present on every terminal path; the hash is None when no
+    # prompt was ever rendered (node_no_candidates, or a failure upstream of
+    # Stage 5). Hashing an unsent prompt would record an event that did not
+    # happen.
+    llm_classifier_prompt_version: str
+    llm_classifier_prompt_sha256: Optional[str]
     llm_classifier_input_tokens: int
     llm_classifier_output_tokens: int
     # The reasoning share OF llm_classifier_output_tokens on a reasoning model, not an

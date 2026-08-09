@@ -358,6 +358,47 @@ INFERENCE_COLUMN_ADDITIONS = {
     # distinguishable: a query averaging this column has to exclude NULL, not
     # coalesce it.
     "llm_classifier_reasoning_tokens":       "INTEGER",
+
+    # --- Which Stage 5 system prompt produced this row ----------------------
+    #
+    # READ THIS BEFORE WRITING A QUERY AGAINST EITHER COLUMN.
+    #
+    # llm_classifier_prompt_sha256 IS NOT sha256(llm_classifier_prompt). The
+    # prompt column holds the SYSTEM message and the USER message concatenated
+    # ("[SYSTEM]\n...\n\n[USER]\n..."), and the user half carries this
+    # patient's record, so its hash identifies the PATIENT. This column hashes
+    # the SYSTEM message alone, which is what identifies the TEMPLATE and is
+    # therefore the thing that can be grouped on across patients. The two
+    # cannot be reconciled by re-hashing the stored text and must not be
+    # compared with each other.
+    #
+    # llm_classifier_prompt_version is hand-maintained in
+    # oncotriage/agent/prompts.py and says what a human intended; the hash is
+    # computed per call and says what was actually sent. They can disagree --
+    # an edit made without bumping the version leaves two runs sharing a
+    # version and differing in hash -- and that disagreement is exactly what
+    # the pair exists to make visible. Trust the hash for identity; read the
+    # version for intent.
+    #
+    # NULL AND NOT-NULL MEAN DIFFERENT THINGS ON THE TWO COLUMNS:
+    #
+    #   version NULL   the row predates this migration, or was logged by a
+    #                  caller that did not come from a pipeline terminal node.
+    #   version SET    this build's template version. Set on EVERY terminal
+    #                  path, including the ones where Stage 5 never ran, because
+    #                  it is a property of the code rather than of the run.
+    #   hash NULL      no system prompt was ever rendered for this row --
+    #                  node_no_candidates, or a failure upstream of Stage 5.
+    #                  It is NOT "the hash was not recorded".
+    #   hash SET       these are the exact bytes the model was sent. One value
+    #                  per inference even when the batch split into chunks: the
+    #                  system message is rendered once and reused for every
+    #                  chunk, and only the user message differs.
+    #
+    # So "did Stage 5 run" is `llm_classifier_prompt_sha256 IS NOT NULL`, never
+    # a test on the version.
+    "llm_classifier_prompt_version":         "TEXT",
+    "llm_classifier_prompt_sha256":          "TEXT",
 }
 
 
@@ -1247,8 +1288,9 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 ecog_value, ecog_selection, ecog_observations_found,
                 llm_classifier_truncation_splits, llm_classifier_output_tokens_estimated,
                 not_evaluable_truncated, llm_classifier_calls,
-                llm_classifier_reasoning_tokens
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                llm_classifier_reasoning_tokens,
+                llm_classifier_prompt_version, llm_classifier_prompt_sha256
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             result["patient_id"],
             result["timestamp"],
@@ -1372,6 +1414,14 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
             # second. Defaulting to 0 here would make every GPT-4o-era row and
             # every stubbed run look like a reasoning run that did no thinking.
             result.get("llm_classifier_reasoning_tokens"),
+            # Which Stage 5 system prompt produced this row. Neither is
+            # defaulted: a result dict that did not come from a pipeline
+            # terminal node reports NULL for both, which is honest -- nothing
+            # is known about which template it used. Note that the two NULLs
+            # are read differently once a terminal node HAS written them; see
+            # the migration comment above.
+            result.get("llm_classifier_prompt_version"),
+            result.get("llm_classifier_prompt_sha256"),
         ))
         
         inference_id = cursor.lastrowid
