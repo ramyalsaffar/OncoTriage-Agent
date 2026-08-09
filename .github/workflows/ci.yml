@@ -128,6 +128,27 @@ jobs:
       # the ONE dependency list in this project (pass 20f-2 deleted
       # requirements/requirements.txt precisely so there could not be a second
       # one to key a cache on).
+      #
+      # AND ITS BENEFIT IS INSIDE THE NOISE. Measured across four real runs:
+      #
+      #   run 1  no cache present    restore    -    install 214s   = 214s
+      #   run 2  cache being built   restore   1s    install 207s   = 208s (+57s save)
+      #   run 3  4365 MB restored    restore  83s    install 216s   = 299s
+      #   run 4  4365 MB restored    restore  43s    install 149s   = 192s
+      #
+      # Cold 214s and 208s; warm 299s and 192s. The warm runs straddle the cold
+      # ones, so on this evidence the cache neither reliably helps nor reliably
+      # hurts — run-to-run variance on hosted runners is larger than the effect
+      # being measured, and two samples a side cannot separate them.
+      #
+      # The reason there is no clear win: `pip install` here is dominated by
+      # UNPACKING ~13 GB to disk, not by downloading, and restoring a 4.4 GB
+      # Actions cache is itself a large transfer that replaces one download with
+      # another. What the cache DOES buy unconditionally is independence from
+      # PyPI being slow, rate-limiting or down — a different property from
+      # speed, and the reason it is kept. Caching the installed environment
+      # rather than pip's download cache is the change that would attack the
+      # 149-216s that actually dominates.
       - name: Restore pip cache
         id: pipcache
         uses: actions/cache/restore@v4
