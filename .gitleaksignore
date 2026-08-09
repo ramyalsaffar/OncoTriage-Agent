@@ -1,0 +1,44 @@
+# gitleaks — accepted findings
+##############################
+#
+# ONE ENTRY PER FINDING, BY FINGERPRINT. A fingerprint is
+# `commit:path:rule:line`, so an entry here suppresses exactly one match at one
+# line of one blob and nothing else.
+#
+# DELIBERATELY NOT USED, and each for the same reason — every one of them would
+# suppress findings nobody has looked at, including ones that do not exist yet:
+#
+#   * no `[allowlist] paths` entry for oncotriage/storage/queries.py — that
+#     would hide a real credential added to that file tomorrow;
+#   * no `stopwords` or regex allowlist — that would hide the same string
+#     anywhere it appears in the repository;
+#   * no rule disable for generic-api-key — that rule is the one most likely to
+#     catch a real leak in a project whose .env carries an OpenAI key and a
+#     Qdrant cloud credential.
+#
+# The cost of the narrow form is that a rebase or a filter-branch changes the
+# commit hash and the entry stops matching, so the finding comes back. That is
+# the correct failure direction: it fails loudly and gets re-reviewed, rather
+# than staying suppressed against a blob nobody can locate any more.
+
+# oncotriage/storage/queries.py:505 — NOT A CREDENTIAL.
+#
+# The line is a keyword argument in the query registry:
+#
+#     key='gpt4o_efficiency_by_trial_count',
+#
+# `Query(key=...)` names one of the ~40 read-only reports in
+# oncotriage/storage/queries.py; the value is the report's identifier and it is
+# printed in that file's own output. gitleaks' generic-api-key rule fires on the
+# assignment shape `key=<high-entropy-looking string>` plus an entropy score of
+# 3.91, which a long snake_case metric name clears on length alone.
+#
+# Checked rather than assumed: the blob at that commit was read, the surrounding
+# Query(...) record inspected, and the same construction appears ~40 times in the
+# file with only this one crossing the entropy threshold. Nothing at that line
+# is secret, rotatable, or usable against any service.
+#
+# The commit is where the query layer was extracted (item 38); the string is
+# unchanged at HEAD, so a future scan of HEAD's blob would need its own entry if
+# the rule ever fires there too.
+6a029ac2dbae950ee647905733b95f9aecb15397:oncotriage/storage/queries.py:generic-api-key:505

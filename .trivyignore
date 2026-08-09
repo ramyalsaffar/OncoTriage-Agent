@@ -1,0 +1,81 @@
+# Trivy — accepted findings for clinical-trial-patient-match:latest
+###################################################################
+#
+# ONE LINE PER CVE. No package wildcards, no severity downgrade, no `--ignore-
+# unfixed` substitute — the gate already skips unfixed findings on its own
+# argument, and this file is only for findings that DO have a fix and still
+# cannot be taken here.
+#
+# NOTHING IN THIS FILE IS FIXED. Every CVE below is present in the image that
+# ships. The gate is green because these are accepted, not because they are
+# absent, and the non-gating FULL scan step in the workflow prints all of them
+# on every run so they stay visible.
+#
+# A new CVE against any package named here still fails the gate — that is the
+# property a package-level ignore would destroy, and it is why this file is
+# written out one id at a time.
+#
+# THREE BLOCKING CLASSES, mirroring .github/scripts/audit_gate.py so the two
+# gates cannot drift in their reasoning:
+#
+#   SCOPE    apache-airflow. Moved to the `orchestration` extra in
+#            pyproject.toml, which removes it from the DEFAULT install and
+#            therefore from CI's pip-audit — but the IMAGE still installs the
+#            extra, because docker-compose.yml runs airflow-scheduler and
+#            airflow-apiserver from it. So the image still contains these and
+#            Trivy still reports them, correctly. Moving the package was a
+#            scope reduction; it fixed nothing. Remediation is >= 3.2.2, which
+#            changes the scheduler, the metadata database schema and the REST
+#            API that oncotriage/orchestration/airflow_manager.py drives.
+#
+#   PIN-CAP  another pinned dependency's metadata forbids the fixed version.
+#            pillow: every fix is 12.x; streamlit 1.46.0 says `pillow<12` and
+#            fastembed 0.7.4 says `pillow<12.0`. The earliest streamlit lifting
+#            that cap is 1.51.0, which changes 96 values in the committed
+#            dashboard snapshot (43 True->False, four figure heights to 0).
+#            starlette: every fix is >= 0.49.1; fastapi 0.117.1 says
+#            `starlette<0.49.0`.
+#
+#   MODEL    transformers is the MedCPT cross-encoder's loader and Stage 3's
+#            ranking is what the twelve characterization fixtures pin. Those
+#            fixtures cannot currently be replayed to prove a bump safe — the
+#            Qdrant alias moved to trial_criteria_20260807_111807 while they
+#            are pinned to ...20260803_104642 — so the one mechanism built to
+#            verify this change is unavailable.
+
+# --- SCOPE: apache-airflow 3.1.7, shipped for the orchestration services -----
+CVE-2025-57735   # CRITICAL  JWT token still valid after logout   fixed 3.2.0
+CVE-2026-42252   # CRITICAL  template-engine injection            fixed 3.2.2
+CVE-2025-54550   # HIGH                                           fixed 3.2.0
+CVE-2026-26929   # HIGH                                           fixed 3.1.8
+CVE-2026-28779   # HIGH                                           fixed 3.1.8
+CVE-2026-30911   # HIGH                                           fixed 3.1.8
+CVE-2026-40961   # HIGH                                           fixed 3.2.2
+CVE-2026-45360   # HIGH                                           fixed 3.2.2
+CVE-2026-25917   # HIGH  apache-airflow-core                      fixed 3.2.0
+CVE-2026-32228   # HIGH  apache-airflow-core                      fixed 3.2.0
+CVE-2026-49298   # HIGH  apache-airflow-core                      fixed 3.2.2
+
+# --- PIN-CAP: pillow 11.3.0, capped below 12 by streamlit and fastembed ------
+CVE-2026-25990   # HIGH   fixed 12.1.1
+CVE-2026-40192   # HIGH   fixed 12.2.0
+CVE-2026-42311   # HIGH   fixed 12.2.0
+CVE-2026-54058   # HIGH   fixed 12.3.0
+CVE-2026-54059   # HIGH   fixed 12.3.0
+CVE-2026-54060   # HIGH   fixed 12.3.0
+CVE-2026-55379   # HIGH   fixed 12.3.0
+CVE-2026-55380   # HIGH   fixed 12.3.0
+CVE-2026-59197   # HIGH   fixed 12.3.0
+CVE-2026-59199   # HIGH   fixed 12.3.0
+CVE-2026-59200   # HIGH   fixed 12.3.0
+CVE-2026-59204   # HIGH   fixed 12.3.0
+CVE-2026-59205   # HIGH   fixed 12.3.0
+
+# --- PIN-CAP: starlette 0.48.0, capped below 0.49.0 by fastapi 0.117.1 -------
+CVE-2025-62727   # HIGH   fixed 0.49.1   named in the brief as accepted
+CVE-2026-48818   # HIGH   fixed 1.1.0
+CVE-2026-54283   # HIGH   fixed 1.3.1
+
+# --- MODEL: transformers 4.57.1, the MedCPT cross-encoder loader -------------
+CVE-2026-4372    # HIGH   fixed 5.3.0
+CVE-2026-5241    # HIGH   fixed 5.5.0

@@ -50,11 +50,48 @@
 # at the workspace root, where `*Code/` matches nothing and every job fails with
 # a glob error instead of a missing-variable error.
 #
-# THE SECURITY JOBS ARE EXPECTED TO BE RED, and they are left that way on
-# purpose. A dependency bump in this repository can move retrieval or model
-# behaviour and void the twelve characterization fixtures, and suppressing a
-# finding to get a green badge is the one thing a security gate must never do.
-# Triage belongs to a human; the CI report records what each one found.
+# THE SECURITY GATES ARE GREEN, AND GREEN DOES NOT MEAN CLEAN. Each of the
+# three gates fails on what is ACTIONABLE HERE and prints everything else:
+#
+#   pip-audit  fails on a fixable finding that is not in the per-id accepted
+#              table in .github/scripts/audit_gate.py. 32 accepted, 4 unfixable,
+#              all printed on every run.
+#   Trivy      fails on a fixable HIGH/CRITICAL that is not in `.trivyignore`.
+#              A second, non-gating step prints every severity including the
+#              unfixable ones.
+#   gitleaks   fails on any finding not fingerprinted in `.gitleaksignore`,
+#              which holds exactly one entry, argued.
+#
+# EVERY ACCEPTED ENTRY IS ONE ID WITH ONE REASON. There is no rule-level,
+# package-level or path-level suppression anywhere in this pipeline, so a NEW
+# advisory against an already-accepted package still turns a gate red.
+#
+# WHAT IS ACCEPTED AND NOT FIXED, in one place:
+#   apache-airflow 3.1.7   CVE-2025-57735, CVE-2026-42252 (both CRITICAL) and
+#                          nine HIGHs. Airflow moved to the `orchestration`
+#                          extra, so it is out of the DEFAULT install and out of
+#                          CI's pip-audit — but the IMAGE still installs it,
+#                          because docker-compose.yml runs the scheduler and the
+#                          api-server from it, so Trivy still reports it. THE
+#                          MOVE IS A SCOPE REDUCTION, NOT A FIX. Nothing about
+#                          those two CRITICALs changed.
+#   pillow 11.3.0          13 HIGHs. Fixes are all 12.x; streamlit 1.46.0 and
+#                          fastembed 0.7.4 both cap `pillow<12`.
+#   starlette 0.48.0       CVE-2025-62727 (fixed 0.49.1) + two more. fastapi
+#                          0.117.1 caps `starlette<0.49.0`. Named in the brief
+#                          as a known accepted constraint; both left alone.
+#   transformers 4.57.1    two HIGHs, fixed in 5.x. It loads the MedCPT
+#                          cross-encoder that Stage 3's ranking depends on.
+#
+# tests/test_package_invariants.py IS NOT RUN HERE, and the reason is not the
+# collision matrix. It cannot pass on Linux at all: it hardcodes `import
+# caffeine` in its trap preamble (two sites), and `caffeine` runs the macOS
+# binary `caffeinate` when imported — present, it spawns a process and fails the
+# import-purity check; absent, the preamble itself raises ModuleNotFoundError.
+# Two further checks unset ONCOTRIAGE_MAIN_PATH to exercise the FALLBACK root,
+# which is a hardcoded path that exists only on the original development
+# machine. Measured: 234 passed / 6 failed on Linux, identical before and after
+# this pass's changes, so none of it is caused by CI. See the CI report.
 
 name: CI
 
@@ -113,51 +150,6 @@ jobs:
         with:
           python-version: '3.11'
 
-      # THE CACHE IS RESTORED AND SAVED EXPLICITLY, NOT VIA `cache: pip`.
-      #
-      # `actions/setup-python`'s built-in cache saves in its POST step, and a
-      # post step is skipped when the job has already failed. Measured on the
-      # first real run: bucket A went red on a repository defect, the post step
-      # was skipped, and `GET /actions/caches` returned `total_count: 0`. So the
-      # caching this pipeline was asked for would have been inert for exactly as
-      # long as the suite was red — which is now, and for a defect CI is not
-      # allowed to fix.
-      #
-      # restore + save with `if: always()` decouples the two: the download is
-      # paid once even if every test fails afterwards. Keyed on pyproject.toml,
-      # the ONE dependency list in this project (pass 20f-2 deleted
-      # requirements/requirements.txt precisely so there could not be a second
-      # one to key a cache on).
-      #
-      # AND ITS BENEFIT IS INSIDE THE NOISE. Measured across four real runs:
-      #
-      #   run 1  no cache present    restore    -    install 214s   = 214s
-      #   run 2  cache being built   restore   1s    install 207s   = 208s (+57s save)
-      #   run 3  4365 MB restored    restore  83s    install 216s   = 299s
-      #   run 4  4365 MB restored    restore  43s    install 149s   = 192s
-      #
-      # Cold 214s and 208s; warm 299s and 192s. The warm runs straddle the cold
-      # ones, so on this evidence the cache neither reliably helps nor reliably
-      # hurts — run-to-run variance on hosted runners is larger than the effect
-      # being measured, and two samples a side cannot separate them.
-      #
-      # The reason there is no clear win: `pip install` here is dominated by
-      # UNPACKING ~13 GB to disk, not by downloading, and restoring a 4.4 GB
-      # Actions cache is itself a large transfer that replaces one download with
-      # another. What the cache DOES buy unconditionally is independence from
-      # PyPI being slow, rate-limiting or down — a different property from
-      # speed, and the reason it is kept. Caching the installed environment
-      # rather than pip's download cache is the change that would attack the
-      # 149-216s that actually dominates.
-      - name: Restore pip cache
-        id: pipcache
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-${{ runner.os }}-py3.11-${{ hashFiles('03- Code/pyproject.toml') }}
-          restore-keys: |
-            pip-${{ runner.os }}-py3.11-
-
       - name: Reclaim runner disk before install
         # MEASURED, NOT PRECAUTIONARY. `torch==2.9.0`'s x86_64 wheel is 900 MB
         # and pulls 15 `nvidia-*` CUDA packages totalling 2,988 MB — ~3.9 GB of
@@ -184,15 +176,6 @@ jobs:
 
       - name: Install (make install)
         run: make install
-
-      - name: Save pip cache
-        # `always()` is the whole point: see the restore step above. Skipped on
-        # an exact hit so the same key is not re-uploaded every run.
-        if: always() && steps.pipcache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-${{ runner.os }}-py3.11-${{ hashFiles('03- Code/pyproject.toml') }}
 
       - name: Disk after install
         run: df -h / | tail -1
@@ -273,15 +256,32 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Dependency vulnerability audit (pip-audit)
-        # Deliberately last in this job, and deliberately against the RESOLVED
-        # environment rather than the declared pin list: that is the only way to
-        # see transitive vulnerabilities. It runs after the tests so their
-        # per-step status is already recorded when this turns the job red.
-        # `always()` so a red test never hides a dependency vulnerability.
+        # GATES ON FIXABLE FINDINGS, PRINTS EVERYTHING. The gate and the
+        # per-id accepted table live in .github/scripts/audit_gate.py; every
+        # accepted entry names the pin that blocks its fix. There is no
+        # rule-level or package-level suppression.
+        #
+        # SEVERITY IS NOT AVAILABLE HERE. pip-audit's JSON carries id,
+        # description and fix_versions and no CVSS at all — measured. The
+        # severity-aware gate is Trivy, in the `image` job, which scans the same
+        # Python packages inside the built image and does report CRITICAL/HIGH.
+        #
+        # KNOWN ACCEPTED CONSTRAINT, named as the brief requires:
+        #     starlette CVE-2025-62727 (PYSEC-2026-1942) is fixed in 0.49.1.
+        #     fastapi==0.117.1 declares `starlette<0.49.0`, so pip cannot
+        #     resolve the fix. Both are deliberately left alone. Remediation is
+        #     moving fastapi past its cap, which is a serving-layer change whose
+        #     verification (Files 18 and 19) makes billed model calls.
+        #
+        # pip and setuptools are upgraded FIRST and deliberately not pinned:
+        # they arrive with the runner image, their advisories are about the
+        # build tooling rather than this project, and the gate fails if one is
+        # still outdated afterwards.
         if: always()
         run: |
+          python -m pip install --quiet --upgrade pip setuptools wheel
           python -m pip install --quiet pip-audit
-          pip-audit --progress-spinner off --desc
+          python .github/scripts/audit_gate.py
 
   # =========================================================================
   # IMAGE — built through the Makefile, scanned, never pushed
@@ -366,25 +366,61 @@ jobs:
           docker image inspect clinical-trial-patient-match:latest \
             --format 'image still present: {{.Id}}'
 
-      - name: Container image vulnerability scan (Trivy)
-        # `--timeout 20m` IS REQUIRED, NOT DEFENSIVE. Trivy's default is 5
-        # minutes and the first real run died on it:
-        #     FATAL  run error: image scan error: ... context deadline exceeded
-        # after 295s. The image is 2.91 GB and its site-packages tree is ~2 GB
-        # of small files, so the analysis phase alone exceeds the default. This
-        # is a CI-invocation defect rather than a finding, and it hid the
-        # findings completely — a timeout and a clean scan both exit non-zero
-        # here only because `--exit-code 1` is set, so without this the job
-        # would have looked like a vulnerability report while producing none.
+      - name: Container image vulnerability scan (Trivy) — GATE, fixable only
+        # `--ignore-unfixed` IS THE GATE'S SHAPE. A finding Debian has not
+        # released a fix for cannot be acted on here: the base distribution is
+        # fixed by the digest pin and changing it is out of scope. Gating on
+        # those would be a permanently-red check no commit can turn green.
+        #
+        # What IS actionable is anything Debian has already patched, and the
+        # Dockerfile now runs `apt-get upgrade` so those are taken at build time
+        # rather than reported forever. The pairing is the point: the upgrade
+        # clears the fixable OS findings and this gate fails if any return.
+        #
+        # `--ignorefile` points at the repository's `.trivyignore`, which lists
+        # accepted findings ONE CVE AT A TIME with the constraint that blocks
+        # each fix. It is mounted read-only rather than relied on by working
+        # directory, because Trivy runs inside its own container here and would
+        # otherwise never see it — a silently-unread ignore file would make this
+        # gate fail on findings the repository has already argued about.
+        #
+        # `--timeout 20m` is required — the default is 5 minutes and the first
+        # real run died on it. See the disk-reclaim step above for the second
+        # failure this scan hit (`no space left on device`).
         run: |
           mkdir -p "$RUNNER_TEMP/trivy-cache"
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            -v "$PWD/.trivyignore:/tmp/.trivyignore:ro" \
             aquasec/trivy:0.73.0 image \
               --scanners vuln \
               --severity HIGH,CRITICAL \
+              --ignore-unfixed \
+              --ignorefile /tmp/.trivyignore \
               --exit-code 1 \
+              --timeout 20m \
+              --no-progress \
+              clinical-trial-patient-match:latest
+
+      - name: Container image vulnerability scan (Trivy) — FULL, non-gating
+        # EVERYTHING, including the unfixable findings the gate skips, so
+        # nothing disappears from view. `--exit-code 0` and `if: always()`: this
+        # step reports, it does not decide, and it runs even when the gate above
+        # failed because the complete picture is most wanted exactly then.
+        #
+        # NO `--ignorefile` HERE, deliberately: this step's whole job is to show
+        # the accepted findings too. Shares $RUNNER_TEMP/trivy-cache with the
+        # gate, so the vulnerability database is downloaded once.
+        if: always()
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            aquasec/trivy:0.73.0 image \
+              --scanners vuln \
+              --severity LOW,MEDIUM,HIGH,CRITICAL \
+              --exit-code 0 \
               --timeout 20m \
               --no-progress \
               clinical-trial-patient-match:latest

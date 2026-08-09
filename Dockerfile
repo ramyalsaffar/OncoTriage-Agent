@@ -140,13 +140,38 @@ COPY --chown=appuser:appuser pyproject.toml /app/pyproject.toml
 # and an image whose imports all fail at runtime. The `assert` is the guard
 # against that shape, and the floor is deliberately loose: it says "this is a
 # real list", not a count that has to be maintained.
+#
+# setuptools AND wheel ARE UPGRADED AGAIN AFTER THE REQUIREMENTS INSTALL, and
+# the repetition is deliberate. They are upgraded once BEFORE, so the build
+# backend satisfies `requires = ["setuptools>=68"]`; the requirements install
+# then resolves them back DOWN when a dependency's own metadata pins them, which
+# is measured rather than theoretical -- the image shipped setuptools 70.3.0 and
+# wheel 0.45.1 despite the earlier upgrade line. Trivy reported four HIGH
+# findings against that pair and their vendored copies (CVE-2025-47273
+# setuptools, CVE-2026-24049 wheel, CVE-2026-23949 jaraco.context and
+# GHSA-6v7p-g79w-8964 msgpack, the last two vendored INSIDE them, which is why
+# neither has its own dist-info in the venv). Floors rather than pins, because
+# these are build tooling and nothing in this project imports them.
+#
+# THE `orchestration` EXTRA IS INSTALLED HERE TOO, AND IT HAS TO BE. Airflow
+# moved out of the default dependencies, and docker-compose.yml runs
+# `airflow-scheduler` and `airflow-apiserver` from THIS image — a
+# default-only install leaves both services without the `airflow` binary, and
+# they fail at start rather than at build, which is the expensive place to find
+# it. Both keys are read with `[...]` and not `.get(...)`: a renamed extra must
+# raise here, and the second `assert` catches the subtler case where the extra
+# still exists but no longer carries Airflow.
 RUN pip install --upgrade pip setuptools wheel && \
     python -c "import tomllib; \
-deps = tomllib.load(open('/app/pyproject.toml','rb'))['project']['dependencies']; \
+p = tomllib.load(open('/app/pyproject.toml','rb'))['project']; \
+deps = list(p['dependencies']); \
+extra = p['optional-dependencies']['orchestration']; \
 assert len(deps) > 10, f'pyproject.toml declared only {len(deps)} dependencies'; \
-open('/tmp/requirements.txt','w').write('\n'.join(deps) + '\n')" && \
+assert any(d.startswith('apache-airflow') for d in extra), 'the orchestration extra no longer carries apache-airflow'; \
+open('/tmp/requirements.txt','w').write('\n'.join(deps + extra) + '\n')" && \
     cat /tmp/requirements.txt && \
-    pip install -r /tmp/requirements.txt
+    pip install -r /tmp/requirements.txt && \
+    pip install --upgrade "setuptools>=78.1.1" "wheel>=0.46.2"
 
 
 # ===========================================================================
@@ -217,13 +242,85 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 #       file now uses `airflow jobs check` instead, which is the authoritative
 #       answer rather than a process-table guess, but procps stays because a
 #       container you cannot run `ps` in is very hard to debug.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# THE DISTRIBUTION PACKAGES ARE UPGRADED, NOT JUST INSTALLED.
+#
+# The base image is pinned by digest, which fixes the CONTENT of every OS
+# package in it at the moment that digest was published. Debian keeps shipping
+# security updates afterwards, and a pinned digest cannot receive them — so
+# every day the image ages, the gap between "what this image has" and "what
+# Debian has fixed" widens, and a scanner reports the difference as
+# vulnerabilities that look unfixable because the base image tag never moved.
+#
+# `apt-get upgrade` closes exactly that gap while keeping the digest pin: the
+# pin still decides which Debian release and which package set, and this line
+# takes the patched versions of that same set.
+#
+# MEASURED EFFECT TODAY: NONE, AND THAT IS THE HONEST NUMBER. Trivy 0.73.0
+# against debian 13.6, HIGH+CRITICAL, before and after this line:
+#
+#     all OS findings          31 (27 HIGH, 4 CRITICAL)  ->  31 (27 HIGH, 4 CRITICAL)
+#     OS findings WITH a fix    0                        ->   0
+#
+# Every one of the 31 is a package Debian has not yet released a fix for --
+# including all four CRITICALs, which are perl-base (CVE-2026-13221,
+# CVE-2026-42496, CVE-2026-57433, CVE-2026-8376) and carry no fixed version in
+# the Debian tracker. So there was nothing for this line to take, and it is
+# kept for the day there is: the fixable-only gate in the workflow will fail the
+# moment Debian publishes a fix this build has not picked up.
+#
+# THE COST, stated rather than hidden: this line makes the build no longer
+# byte-reproducible from the digest alone. Two builds of the same commit on
+# different days can install different package versions. That is the trade for
+# not shipping a knowingly-stale OS, and it is why the version LABEL and the
+# application pins are unaffected -- only Debian's own packages move.
+#
+# WHY NOT `dist-upgrade`: it may add or remove packages to satisfy changed
+# dependencies, which can pull a different package set into a supposedly pinned
+# image. `upgrade` only takes newer versions of what is already there.
+#
+# The `rm -rf /var/lib/apt/lists/*` still runs last, so the package index this
+# adds does not ship in the layer.
+RUN apt-get update && apt-get upgrade -y --no-install-recommends && \
+    apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     bash \
     procps \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
+
+# THE BASE IMAGE'S OWN pip / setuptools / wheel ARE UPGRADED, and they are a
+# different copy from the venv's.
+#
+# Nothing in this image runs them: `ENV PATH="/opt/venv/bin:$PATH"` puts the
+# virtualenv first, and `which python` in the built image answers
+# /opt/venv/bin/python. They sit at /usr/local/lib/python3.11/site-packages
+# purely because the base image ships them — and Trivy scans the filesystem, not
+# the PATH, so it reports them exactly like any other package.
+#
+# FOUR HIGHs CAME FROM HERE, and three of them from VENDORED copies nested
+# inside those two packages, which is why upgrading the venv alone did not move
+# them and why they have no dist-info of their own in site-packages:
+#
+#     CVE-2025-47273       setuptools                        -> 78.1.1
+#     CVE-2026-24049       wheel                             -> 0.46.2
+#     CVE-2026-23949       setuptools/_vendor/jaraco.context -> 6.1.0
+#     GHSA-6v7p-g79w-8964  pip/_vendor/msgpack               -> 1.2.1
+#
+# The two vendored ones are fixed by taking a newer setuptools and pip rather
+# than by touching them directly; a newer setuptools vendors a newer
+# jaraco.context, and a newer pip a newer msgpack.
+#
+# `/usr/local/bin/python` IS SPELLED OUT rather than `python`, because at this
+# point in the file PATH already prefers the venv and a bare `python` would
+# upgrade the venv's copies a second time and leave these untouched — which is
+# the mistake that made the first attempt at this look like it had worked.
+#
+# Floors, not pins: these are build tooling, nothing in this project imports
+# them, and pinning them would create a fourth place versions have to be
+# maintained.
+RUN /usr/local/bin/python -m pip install --no-cache-dir --upgrade \
+        pip "setuptools>=78.1.1" "wheel>=0.46.2"
 
 # Create non-root user (must match builder stage UID)
 RUN groupadd -r appuser && \

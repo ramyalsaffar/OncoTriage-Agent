@@ -30,6 +30,46 @@ WHAT CHANGED, AND WHY EACH CHANGE WAS FORCED
     git; that comparison is what makes the committed snapshot the reference
     rather than a photograph of whatever the module happened to do.
 
+    WHICH STREAMLIT THE SNAPSHOT WAS RECORDED ON, AND WHY IT MOVED ONCE.
+    Recorded on **streamlit 1.46.0**, which is what ``pyproject.toml`` pins.
+    It was originally recorded on **1.45.1** -- the version that happened to be
+    installed on the development machine, which the pin had already moved past
+    -- so the committed snapshot disagreed with the project's own declared
+    dependency and 8 checks failed for anyone who installed from
+    ``pyproject.toml``: CI, the Docker image, a fresh ``pip install -e .``.
+
+    IT WAS REGENERATED ONLY AFTER THE FULL DIFF WAS SHOWN TO BE A RENAME.
+    Every difference between the 1.45.1 and 1.46.0 snapshots was enumerated --
+    46 of them, all in ``element_order``, and all one substitution:
+
+        2:horizontal -> 2:flex_container   (36x)
+        1:vertical   -> 1:flex_container   ( 7x)
+        3:horizontal -> 3:flex_container   ( 3x)
+
+    streamlit 1.46.0 collapsed its ``vertical`` and ``horizontal`` layout
+    containers into a single ``flex_container`` element type. ZERO differences
+    in metrics, markdown, captions, subheaders, dataframes, selectboxes, plotly
+    specs, the pooled templates or the hoisted literals -- so nothing this tab
+    computes or displays changed, only what streamlit calls the boxes it draws
+    them in.
+
+    THE RULE THAT REGENERATION HAS TO PASS, because a golden file refreshed to
+    accommodate a change makes whatever the code does correct by definition:
+    regenerate only when every difference is a streamlit-internal structural
+    rename, never when a label, a value, a count or a figure spec moves. Two
+    later versions were tested against that rule and BOTH FAILED it, which is
+    why the pin stays at 1.46.0:
+
+        1.51.0   96 differences -- including 43 True -> False and four element
+                 heights collapsing to 0
+        1.61.1   element counts change (165->164, 7->6), types reorder
+                 (4:plotly_chart -> 2:markdown), and st.info loses its emoji
+                 prefix in the rendered text
+
+    Note for whoever bumps streamlit next: 1.51.0 is also the first release
+    that lifts streamlit's ``pillow<12`` cap, so the pillow advisories and this
+    snapshot are the same decision. See pyproject.toml's pillow note.
+
 2.  IT MUST NOT TOUCH THE PRODUCTION DATABASE. The old harness rendered from the
     real ``inferences.db``. This one seeds a scratch SQLite file in a temporary
     directory -- BOTH tables, because the tab is rendered from the join of

@@ -136,8 +136,24 @@ dependencies = [
     "scipy==1.15.3",
 
     # --- HTTP and utilities -------------------------------------------------
-    "requests==2.32.3",
-    "python-dotenv==1.1.0",
+    # THE THREE PINS BELOW AND `langgraph` MOVED FOR SECURITY, not for features.
+    # Each clears pip-audit findings that HAVE a fix, and each was chosen as the
+    # lowest release clearing all of that package's findings:
+    #
+    #   requests          2.32.3  -> 2.33.0   PYSEC-2026-1872, -2275
+    #   python-dotenv     1.1.0   -> 1.2.2    PYSEC-2026-2270
+    #   python-multipart  0.0.22  -> 0.0.31   PYSEC-2026-3036..3040 (five)
+    #   langgraph         1.0.8   -> 1.0.10   PYSEC-2026-83
+    #
+    # NONE OF THE FOUR TOUCHES RANKING OR MODEL OUTPUT, which is the line this
+    # project draws: requests and python-dotenv are I/O and config plumbing,
+    # python-multipart parses multipart form bodies for the one upload endpoint,
+    # and langgraph 1.0.8 -> 1.0.10 is a patch on the graph runner rather than on
+    # any node. Contrast torch, transformers, streamlit and pillow, which all
+    # have fixes available and are all deliberately NOT bumped here -- see the
+    # accepted-findings table in .github/scripts/audit_gate.py.
+    "requests==2.33.0",
+    "python-dotenv==1.2.2",
     "python-dateutil==2.9.0.post0",
 
     # --- OpenAI -------------------------------------------------------------
@@ -181,7 +197,7 @@ dependencies = [
     "icd10-cm==0.0.5",
 
     # --- Agent framework ----------------------------------------------------
-    "langgraph==1.0.8",
+    "langgraph==1.0.10",
 
     # --- Model Context Protocol ---------------------------------------------
     # The official MCP Python SDK, for `oncotriage/mcp/server.py`. 2.0.0 is the
@@ -220,7 +236,7 @@ dependencies = [
     # --- API server ---------------------------------------------------------
     "fastapi==0.117.1",
     "uvicorn[standard]==0.40.0",
-    "python-multipart==0.0.22",
+    "python-multipart==0.0.31",
     "pydantic==2.12.5",
     "slowapi==0.1.9",
 
@@ -261,8 +277,9 @@ dependencies = [
     "seaborn==0.13.2",
 
     # --- Orchestration ------------------------------------------------------
-    "apache-airflow==3.1.7",
-    "pendulum==3.2.0",
+    # MOVED OUT OF THE DEFAULT INSTALL to [project.optional-dependencies] as
+    # the `orchestration` extra. See the argument there, including the two
+    # CRITICALs this does NOT fix.
 
     # --- Async support ------------------------------------------------------
     "nest-asyncio==1.6.0",
@@ -287,6 +304,65 @@ dependencies = [
 #   above is macOS/arm64 on Python 3.13. Same package versions, different
 #   interpreter minor. That combination is exercised by item 21's in-container
 #   import sweep and by a real POST /match, not assumed.
+
+[project.optional-dependencies]
+# ORCHESTRATION — Airflow, and the only other package that exists for it.
+#
+# THIS IS A SCOPE REDUCTION, NOT REMEDIATION. Moving Airflow out of the default
+# install does not fix anything in it. It removes it from what a default
+# `pip install` resolves, and therefore from what CI installs and what
+# pip-audit and Trivy see. These two CRITICALs are still present, still
+# unfixed, and still shipped to anyone who installs the extra or runs the
+# Docker stack:
+#
+#     CVE-2025-57735  apache-airflow 3.1.7  JWT token still valid after logout
+#                                           (fixed in 3.2.0)
+#     CVE-2026-42252  apache-airflow 3.1.7  template-engine injection
+#                                           (fixed in 3.2.2)
+#
+# plus nine HIGHs across apache-airflow and apache-airflow-core at the same
+# version. Do not describe this move as a fix anywhere. The remediation is an
+# upgrade to >= 3.2.2, which is a separate decision because Airflow majors
+# change the scheduler, the metadata database schema and the REST API this
+# project's `oncotriage/orchestration/airflow_manager.py` talks to.
+#
+# WHY THESE TWO PACKAGES AND NOTHING ELSE, derived rather than assumed. The
+# full dependency closure was resolved twice with pip's own resolver, once with
+# apache-airflow and pendulum and once without:
+#
+#     with    207 packages
+#     without 131 packages
+#     -> 76 packages exist ONLY because of Airflow
+#
+# Of those 76, exactly TWO are declared here; the other 74 are transitive and
+# follow automatically (alembic, sqlalchemy, the four opentelemetry exporters,
+# the six apache-airflow-providers-*, rich, typer, croniter, ...). `pendulum`
+# is in that set and nothing else in the closure requires it: it appears in the
+# with-Airflow resolution and not in the without-Airflow one, and the project's
+# only use of it is the `import pendulum` line INSIDE the generated DAG string
+# in oncotriage/orchestration/dag_generator.py, which is executed by Airflow's
+# parser in a separate process.
+#
+# NOTHING IN oncotriage/orchestration/ IMPORTS AIRFLOW, verified by AST rather
+# than by grep: dag_generator.py's only imports are pathlib, oncotriage.paths,
+# oncotriage.settings, orchestration.home and observability. The `import
+# pendulum` and `from airflow.sdk import dag, task` that a grep finds at lines
+# 112-113 sit inside a string literal spanning lines 91-121 — the DAG text,
+# not this module's imports. airflow_manager.py shells out through subprocess
+# and talks to the scheduler over REST; airflow_setup.py shells out to
+# `airflow db migrate`. So the package imports, and bucket A passes, with
+# Airflow absent.
+#
+#     pip install -e .                    # pipeline only, no Airflow
+#     pip install -e ".[orchestration]"   # adds Airflow, for Files 22/23/24
+#
+# The Docker image installs this extra explicitly — docker-compose.yml runs
+# airflow-scheduler and airflow-apiserver from the same image, and a
+# default-only install would leave both without Airflow. See the Dockerfile.
+orchestration = [
+    "apache-airflow==3.1.7",
+    "pendulum==3.2.0",
+]
 
 [tool.setuptools.dynamic]
 # setuptools reads this attribute from the AST of oncotriage/__init__.py at
