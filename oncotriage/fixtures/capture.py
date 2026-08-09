@@ -88,8 +88,14 @@ deterministic prefix, the completeness checks, the three derivation recipes, the
 constructed retry fixture, the cohort scan, the selection and ``main()`` are the
 line slice of File 45 between its bootstrap and its ``__main__`` guard.
 
+**THE FIXTURE FORMAT IS AT v5 AND TWO SEPARATE CHANGES GOT IT THERE.** The
+Structured Outputs pass added ``response_format`` -- the whole strict
+json_schema -- to the recorded request block, and that block is hashed into
+``stage5.request_sha256_by_call``, so every v4 digest is unreachable from here.
+The v4 change is recorded immediately below and still holds.
+
 **THE FIXTURE FORMAT WAS FROZEN AT v3 AND THE llm_classifier RENAME BROKE IT.**
-``SCHEMA_VERSION`` is 4. Eight recorded fields under ``stage5`` and one key in
+That was v4. Eight recorded fields under ``stage5`` and one key in
 ``environment`` carried the ``gpt4o`` prefix and now carry ``llm_classifier``;
 the constructed fixture's id and case label changed with them. Every field's
 MEANING is unchanged -- only its name moved -- and that is precisely the case
@@ -351,7 +357,14 @@ def log_inference(*_args, **_kwargs):
 # by v4 code answers None for every renamed field, and a diff of None against
 # None is a gate that passes because it stopped looking -- which is the exact
 # failure this counter exists to prevent.
-SCHEMA_VERSION = 4
+# v5: Structured Outputs. The recorded request block gained `response_format`,
+# which carries the whole strict json_schema. This is the PARENTHETICAL case in
+# the rule above rather than a judgement call: `request_sha256_by_call` in the
+# deterministic prefix is sha256_json(request), so the new key lands INSIDE the
+# digest and every v4 fixture's stored digest is unreachable by v5 code. A v4
+# recording replayed here would miss on the request digest of every call, and a
+# reader would go looking for a pipeline change that did not happen.
+SCHEMA_VERSION = 5
 
 # Branch cases the fixture set must cover. Values are stored in case_labels.
 CASE_NO_CANDIDATES = "no_candidates"        # a terminal node_no_candidates run
@@ -591,6 +604,16 @@ def _recording_chat(sink: RecordingSink, truncate_first_call: bool = False):
                 "max_completion_tokens": kwargs.get("max_completion_tokens"),
                 "reasoning_effort": kwargs.get("reasoning_effort"),
                 "seed": kwargs.get("seed"),
+                # THE WHOLE SCHEMA, not a flag saying one was sent. Structured
+                # Outputs constrains decoding, so response_format is the single
+                # parameter here with the most direct effect on what comes back
+                # -- an enum member added or a field made optional changes the
+                # answer as surely as changing the prompt does, and a fixture
+                # that recorded only "json_schema" could not see either.
+                # Deep-copied for the same reason `messages` is: the SDK is
+                # handed this object and the recording must be of what was sent,
+                # not of whatever it looks like later.
+                "response_format": copy.deepcopy(kwargs.get("response_format")),
             },
             "response": {
                 "content": choice.message.content,

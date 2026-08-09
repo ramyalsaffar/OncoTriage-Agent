@@ -326,6 +326,27 @@ class TrialMatchState(TypedDict):
     evaluations: List[Dict]                     # Criterion-level match results
     llm_classifier_retries: int                          # Current retry count for Stage 5
 
+    # The model DECLINED to answer, as opposed to answering badly. Set only by
+    # Stage 5's refusal path (see REFUSAL_ERROR_PREFIX in
+    # oncotriage/agent/evaluation.py), carrying a capped copy of the refusal
+    # text; absent on every other path.
+    #
+    # IT EXISTS BECAUSE THE ROUTER NEEDS A TERMINAL SIGNAL, and a bare error
+    # string is not one. route_after_llm_classifier retries whenever there is an
+    # error and the retry count is under the ceiling, so a refusal that sets an
+    # error WITHOUT spending a retry -- which is the correct accounting, since
+    # no retry was spent -- would loop the graph until LangGraph's recursion
+    # limit raised, killing the patient with an error about recursion rather
+    # than about a refusal. The two honest alternatives were this flag or
+    # writing MAX_LLM_CLASSIFIER_RETRIES into the count, and the second records
+    # three retries that never happened.
+    #
+    # NOT in the result dict and therefore not a database column: the refusal is
+    # already in `error`, verbatim and prefixed, which is what a reader queries.
+    # This is a routing fact, and the characterization fixtures diff the result
+    # field by field.
+    llm_classifier_refusal: Optional[str]
+
     # Truncation control (Stage 5). A SEPARATE budget from llm_classifier_retries: that
     # one counts whole-node retries for a malformed or failed response, this
     # counts levels of halving spent because a response was cut off at

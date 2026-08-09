@@ -124,6 +124,13 @@ BUCKETS = {
         "ran green in 2.0s, 53 checks; every patient is a literal dict, the "
         "plants go into an in-memory copy of oncotriage/agent/patient.py, and "
         "it reads no git, no corpus and no database"),
+    "test_agent_structured_outputs.py": (
+        _A, None,
+        "ran green in 1.9s, 134 checks; the Stage 5 response schema and the "
+        "refusal path. Every model response is a literal served through a "
+        "deps stub, every plant doctors a COPY of a dict the shipped builder "
+        "returns or an in-memory AST, and it execs nothing -- no network, no "
+        "keys, no spend, no git, no corpus, no database, no subprocess"),
     "test_agent_trial_verdict_normalization.py": (
         _A, None, "ran green in 1.9s; every model response is a literal via a deps stub"),
     "test_dashboard_reproducibility_tab.py": (

@@ -45,6 +45,10 @@ from oncotriage.agent.prompts import (
     prompt_sha256,
     render_system_prompt,
 )
+from oncotriage.agent.response_schema import (
+    EVALUATIONS_KEY,
+    build_response_format,
+)
 from oncotriage.agent.state import (
     TRIAL_VERDICT_ELIGIBLE,
     TRIAL_VERDICT_NOT_ELIGIBLE,
@@ -183,18 +187,33 @@ def call_matching_model(system_prompt: str, user_prompt: str):
       temperature             NOT SENT. Rejected for every value but the
                               provider default of 1, so there is nothing to
                               send. MATCHING_TEMPERATURE is None.
-      response_format         NOT SENT, deliberately. The model does support
-                              it -- a json_object probe failed only on the
-                              unrelated "messages must contain the word json"
-                              rule, not on the parameter -- and Stage 5 would
-                              be a good candidate for Structured Outputs. It is
-                              held back so the model migration can be measured
-                              on its own; adding it here would change the
-                              parsing contract and the verdict distribution in
-                              the same commit.
+      response_format         SENT, as of the Structured Outputs pass, and it
+                              is a strict `json_schema` built by
+                              oncotriage/agent/response_schema.py. The note
+                              here used to say it was held back so the model
+                              migration could be measured on its own; that
+                              migration is done and this is the isolated change
+                              that follows it.
+
+                              PROBED LIVE before it was wired in, on
+                              2026-08-09, one call, $0.002400: gpt-5.6-terra
+                              accepts strict mode with this exact schema, the
+                              response parses, every enum lands in vocabulary
+                              and message.refusal is None. What the probe ALSO
+                              found is that the model emits object keys
+                              ALPHABETICALLY rather than in the schema's
+                              `properties` order -- see the ordering block in
+                              response_schema.py, because that defeats the
+                              prompt's "explanation before eligible" device and
+                              is the one behaviour change here that nobody
+                              asked for.
 
     Anything added to this call must also be added to the request block File 45
-    records and File 46 replays, or a fixture stops being able to see it.
+    records and File 46 replays, or a fixture stops being able to see it. That
+    is why `response_format` is in both, and why it is built by a call HERE
+    rather than passed in: the recorder reads it out of kwargs, so the fixture
+    sees the schema that was actually sent rather than one re-derived at
+    diff time.
     """
     # NOTE THE ASYMMETRY: timeout is set HERE, the retry budget is not.
     #
@@ -226,6 +245,11 @@ def call_matching_model(system_prompt: str, user_prompt: str):
         max_completion_tokens=MATCHING_MAX_TOKENS,
         reasoning_effort=MATCHING_REASONING_EFFORT,
         seed=MATCHING_SEED,
+        # BUILT PER CALL, not read from a module constant. The schema is a
+        # nested dict handed to an SDK that may hold or mutate it; a shared
+        # module-level copy is the MATCH_TIERS hazard, one layer down. Building
+        # it is a handful of dict literals.
+        response_format=build_response_format(),
         # The STRUCTURED Timeout, not the bare number. A per-request timeout
         # replaces the client's Timeout object outright rather than merging with
         # it, so passing the float here would have re-flattened the connect
@@ -303,6 +327,96 @@ MALFORMED_EVALUATION_ENTRIES = Counter()
 # recognise a bare NCT id or a stray sentence, short enough that a pathological
 # element cannot put the model's clinical prose into a durable record.
 _MALFORMED_ENTRY_PREVIEW_LEN = 60
+
+
+# ---------------------------------------------------------------------------
+# Model refusals
+# ---------------------------------------------------------------------------
+#
+# A REFUSAL IS THE MODEL DECLINING. IT IS NOT A PARSE FAILURE, AND BEFORE THIS
+# THE TWO WERE THE SAME ROW.
+#
+# When a model refuses, the Chat Completions message carries `refusal` (a
+# string) and `content` is None. Stage 5 read only content, coerced the None to
+# "", and handed "" to json.loads -- which raises JSONDecodeError, so a refusal
+# was recorded as `GPT-4o JSON parse error ... Expecting value: line 1 column 1`
+# and RETRIED, up to MAX_LLM_CLASSIFIER_RETRIES times, at full price, against a
+# model that had already declined. Three billed calls and a record that names
+# the wrong fault.
+#
+# The two are different facts and a reader has to be able to tell them apart:
+# a parse failure says the judge tried and produced garbage (re-send it), a
+# refusal says the judge would not answer (re-sending is spending money to be
+# told no again). So the refusal gets its own error string, its own log event
+# and its own terminal route.
+#
+# THE PREFIX IS A CONSTANT BECAUSE THE ROUTER READS IT. Not by string test --
+# route_after_llm_classifier branches on the state key below -- but every
+# consumer that greps inferences.error for refusals needs one spelling, and a
+# literal in two files is a literal that drifts.
+REFUSAL_ERROR_PREFIX = "Stage 5 refusal"
+
+# Longest fragment of the model's refusal text kept in the error string. The
+# refusal is model prose of unbounded length; the error column is durable and
+# indexed, and the diagnostic value is in the first sentence.
+_REFUSAL_PREVIEW_LEN = 300
+
+# How often the model declined, by nothing finer than a count -- the refusal
+# TEXT is not a key, because it is unbounded model output about a specific
+# patient and this is a process-lifetime dict. Module-level, following
+# MALFORMED_EVALUATION_ENTRIES above and AGE_PARSE_FAILURES in
+# oncotriage/agent/filtering.py, and deliberately NOT a key in the returned
+# dict: the characterization fixtures diff Stage 5 field by field.
+REFUSALS_OBSERVED = Counter()
+
+
+def _refusal_text(message) -> str:
+    """The refusal string on a response message, or "" if there is none.
+
+    Read through getattr for the same reason finish_reason and
+    completion_tokens_details are: a stub response object (File 37,
+    tests/test_agent_trial_verdict_normalization.py) does not define the
+    attribute at all, and a recording made before the field existed does not
+    carry it. Absent is "not refused", which is the behaviour this node had
+    before refusals were detected -- so a client that does not report the field
+    degrades to the old path rather than to a new one.
+
+    A non-string truthy value is stringified rather than trusted: the only
+    thing done with it is naming the fault.
+    """
+    refusal = getattr(message, "refusal", None)
+    if not refusal:
+        return ""
+    return refusal if isinstance(refusal, str) else str(refusal)
+
+
+def _unwrap_evaluations(parsed):
+    """The list of trial verdicts out of a parsed Stage 5 response, or None.
+
+    TWO SHAPES ARE ACCEPTED AND THAT IS FORCED, not generous.
+
+    Structured Outputs requires the ROOT of a strict json_schema to be an
+    object, so the schema wraps the array as ``{"evaluations": [...]}`` and
+    that is what the model now emits. The system prompt still asks for a bare
+    array, and a bare array is also what every response before this pass looked
+    like and what an old fixture recording holds. Both parse.
+
+    Returns None when neither shape is present, which the caller turns into the
+    existing "non-list JSON" error -- unchanged, including its message, so a
+    genuinely malformed response is reported exactly as it was.
+
+    A dict carrying the key but not a list under it is NOT unwrapped: that is a
+    response that agreed about the envelope and not about the contents, and
+    coercing it would manufacture an empty verdict set out of a malformed
+    answer.
+    """
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict):
+        inner = parsed.get(EVALUATIONS_KEY)
+        if isinstance(inner, list):
+            return inner
+    return None
 
 
 def _partition_response_entries(parsed: List) -> Tuple[List[Dict], List]:
@@ -727,6 +841,66 @@ CLINICAL TRIALS:
 
         model_answered = _model_returned or model_answered
 
+        # ── The model declined ─────────────────────────────────────────────
+        #
+        # Checked HERE: after the call is counted and the answering model is
+        # known, so the record is not anonymous, and BEFORE the truncation
+        # branch, the fence strip and json.loads, none of which has anything to
+        # do with a refusal. See REFUSAL_ERROR_PREFIX above for why this is not
+        # the parse-error path.
+        #
+        # IT DOES NOT SPEND A PARSE RETRY. `llm_classifier_retries` is carried
+        # through as `retry_count`, unincremented, and the run is routed
+        # straight to the error handler by `llm_classifier_refusal` -- see
+        # route_after_llm_classifier. Incrementing instead would have been the
+        # smaller edit and it would be a lie in the column: no retry was spent,
+        # and re-sending an identical request to a model that has refused it
+        # buys another refusal at full price.
+        #
+        # A refusal ends the whole node, not just this chunk. Every chunk of a
+        # split batch carries the same system prompt and the same patient; a
+        # model that declined one has declined the premise, and issuing the
+        # remaining chunks would spend money to collect the same answer N more
+        # times.
+        _refusal = _refusal_text(choice.message)
+        if _refusal:
+            elapsed = time.time() - start
+            REFUSALS_OBSERVED[MATCHING_MODEL] += 1
+            error_msg = (f"{REFUSAL_ERROR_PREFIX}: the model declined to "
+                         f"answer (attempt {retry_count + 1}): "
+                         f"{_refusal[:_REFUSAL_PREVIEW_LEN]}")
+            # A DISTINCT EVENT, which is the whole point of the path: a query
+            # counting event="refusal" must not also be counting malformed
+            # JSON, and before this both arrived as status=error with
+            # error_type=JSONDecodeError. The refusal TEXT is not a field --
+            # it is model prose about this patient and the structured record is
+            # durable -- so only its length travels, on the same rule as the
+            # parse-failure preview below.
+            log.error("Stage 5: the model refused to answer", stage=5,
+                      status="error", event="refusal", retry=retry_count,
+                      response_chars=len(_refusal))
+            console.out(f"  [Stage 5] refusal: {_refusal[:_REFUSAL_PREVIEW_LEN]}")
+            return {
+                "evaluations": [],
+                # UNINCREMENTED, deliberately. See above.
+                "llm_classifier_retries": retry_count,
+                # The flag the router terminates on. Written only here.
+                "llm_classifier_refusal": _refusal[:_REFUSAL_PREVIEW_LEN],
+                "llm_classifier_truncation_splits": truncation_splits,
+                "llm_classifier_output_tokens_estimated": estimated_output,
+                # The refusal text is the whole of what the model returned, so
+                # it IS the raw response for this run. Capped by the same rule
+                # as the error string.
+                "llm_classifier_raw_response": _refusal[:_REFUSAL_PREVIEW_LEN],
+                # A model DID answer -- by declining -- so the run is not
+                # anonymous, on the same argument as the parse-error path.
+                "matching_model": model_answered,
+                "error": error_msg,
+                "llm_classifier_prompt_version": PROMPT_VERSION,
+                "llm_classifier_prompt_sha256": system_prompt_sha256,
+                "stage_timings": {**state.get("stage_timings", {}), "llm_classifier_evaluation": round(prior_llm_classifier_time + elapsed, 3)}
+            }
+
         # finish_reason is read defensively because not every client object
         # that reaches here carries one: the retrieval-observability test
         # (File 37) drives this node with a stub response, and a stub is
@@ -844,7 +1018,21 @@ CLINICAL TRIALS:
                 "stage_timings": {**state.get("stage_timings", {}), "llm_classifier_evaluation": round(prior_llm_classifier_time + elapsed, 3)}
             }
 
-        if not isinstance(parsed, list):
+        # THE ARRAY, out of whichever envelope carried it. Structured Outputs
+        # forces an object root, so the model now sends {"evaluations": [...]};
+        # a bare array -- the pre-pass shape, an old recording, any run where
+        # the response format did not take -- is accepted unchanged. See
+        # _unwrap_evaluations. None means neither shape, which falls into the
+        # branch below with its message untouched.
+        #
+        # THE ORIGINAL `parsed` IS NOT OVERWRITTEN UNTIL THE GUARD HAS PASSED,
+        # and that is not tidiness: the error message below reports
+        # type(parsed).__name__, so assigning the unwrap result first would have
+        # made every failure report `type=NoneType` -- the type of the failure
+        # itself -- instead of the dict or string the model actually sent. The
+        # message is the only diagnosis this path produces.
+        _unwrapped = _unwrap_evaluations(parsed)
+        if not isinstance(_unwrapped, list):
             elapsed = time.time() - start
             error_msg = f"GPT-4o returned non-list JSON (type={type(parsed).__name__})"
             log.error("Stage 5 returned JSON that is not a list", stage=5,
@@ -879,6 +1067,8 @@ CLINICAL TRIALS:
                 "llm_classifier_prompt_sha256": system_prompt_sha256,
                 "stage_timings": {**state.get("stage_timings", {}), "llm_classifier_evaluation": round(prior_llm_classifier_time + elapsed, 3)}
             }
+
+        parsed = _unwrapped
 
         # A well-formed response is a list OF OBJECTS, and only the list half
         # was checked. See MALFORMED_EVALUATION_ENTRIES for why a non-object is

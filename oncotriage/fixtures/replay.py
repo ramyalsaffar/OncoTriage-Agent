@@ -361,6 +361,11 @@ def _replay_chat(state: _ReplayState):
                 "max_completion_tokens": kwargs.get("max_completion_tokens"),
                 "reasoning_effort": kwargs.get("reasoning_effort"),
                 "seed": kwargs.get("seed"),
+                # Same key, same position, same deepcopy as the recorder in
+                # oncotriage/fixtures/capture.py -- the two blocks are diffed
+                # against each other, so a key on one side only reads as a
+                # request change on every fixture.
+                "response_format": copy.deepcopy(kwargs.get("response_format")),
             },
             "response": copy.deepcopy(recorded["response"]),
             "served_from_recorded_index": recorded.get("call_index", index),

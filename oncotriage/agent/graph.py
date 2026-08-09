@@ -85,10 +85,11 @@ def route_after_llm_classifier(state: TrialMatchState) -> str:
     """
     Conditional edge after the LLM classifier stage.
 
-    Three possible outcomes:
+    Four possible outcomes:
         1. Success (evaluations exist, no error) -> finalize
-        2. Failure + retries remaining -> retry (loop back to llm_classifier_evaluation)
-        3. Failure + retries exhausted -> error_handler
+        2. The model REFUSED -> error_handler, whatever the retry count
+        3. Failure + retries remaining -> retry (loop back to llm_classifier_evaluation)
+        4. Failure + retries exhausted -> error_handler
     """
     error = state.get("error", "")
     retries = state.get("llm_classifier_retries", 0)
@@ -97,6 +98,18 @@ def route_after_llm_classifier(state: TrialMatchState) -> str:
     # Success: got valid evaluations
     if evaluations and not error:
         return "finalize"
+
+    # A REFUSAL IS TERMINAL AND IS NOT A RETRY BUDGET QUESTION. The model
+    # declined; re-sending the identical request buys the same declination at
+    # full price, which is the same argument the truncation floor makes about
+    # re-sending a request that cannot fit. Stage 5 deliberately does NOT
+    # increment llm_classifier_retries on this path -- no retry was spent -- so
+    # without this branch the check below would be satisfied forever and the
+    # graph would spin until LangGraph's recursion limit raised, reporting a
+    # recursion failure for what is a refusal. See llm_classifier_refusal in
+    # oncotriage/agent/state.py.
+    if state.get("llm_classifier_refusal"):
+        return "error_handler"
 
     # Failure but retries remaining: loop back
     if retries < MAX_LLM_CLASSIFIER_RETRIES:
