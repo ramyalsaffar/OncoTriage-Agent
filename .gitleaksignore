@@ -23,15 +23,23 @@
 
 # oncotriage/storage/queries.py:505 — NOT A CREDENTIAL.
 #
-# The line is a keyword argument in the query registry:
+# THE OFFENDING LINE IS DESCRIBED HERE, NEVER QUOTED, and that is not fussiness:
+# the first version of this file reproduced it verbatim to explain it, and
+# gitleaks promptly flagged THIS FILE at the quoted line
+# (.gitleaksignore:28, a finding that did not exist before the fix was written).
+# The documentation of a suppression must not itself be suppressible. This
+# project has hit the same shape before — pass 20e's exec-chain scanner reported
+# nine docstrings explaining the defect it was written to catch.
 #
-#     key='gpt4o_efficiency_by_trial_count',
+# What is at that line: a `Query(...)` record in the query registry, whose first
+# keyword argument is named `key` and whose value is the report's identifier —
+# a long lower-case snake_case metric name, ~34 characters, made of English
+# words joined by underscores. It names one of the ~40 read-only reports in
+# oncotriage/storage/queries.py and is printed in that file's own output.
 #
-# `Query(key=...)` names one of the ~40 read-only reports in
-# oncotriage/storage/queries.py; the value is the report's identifier and it is
-# printed in that file's own output. gitleaks' generic-api-key rule fires on the
-# assignment shape `key=<high-entropy-looking string>` plus an entropy score of
-# 3.91, which a long snake_case metric name clears on length alone.
+# gitleaks' generic-api-key rule fires on that argument NAME next to a
+# long-enough string, plus a Shannon entropy of 3.91 — which any long
+# underscore-joined identifier clears on length alone.
 #
 # Checked rather than assumed: the blob at that commit was read, the surrounding
 # Query(...) record inspected, and the same construction appears ~40 times in the
