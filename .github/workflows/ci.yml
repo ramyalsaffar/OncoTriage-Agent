@@ -320,6 +320,31 @@ jobs:
           echo "label=$built derived=$derived"
           test "$built" = "$derived"
 
+      - name: Reclaim disk after the build, before the scan
+        # THE BUILD FILLS THE RUNNER, AND TRIVY NEEDS ROOM AFTER IT. Measured on
+        # run 3: 34 GB free after the pre-build reclaim, then `make build` left
+        # 2 MB and Trivy died with
+        #     no space left on device ... /tmp/trivy-*/docker-export-*
+        # because scanning through the docker socket EXPORTS the whole 2.91 GB
+        # image to a temp file first.
+        #
+        # The build cache is what to drop: it holds the builder stage's ~2 GB
+        # venv and every intermediate layer, and the tagged image does not need
+        # any of it. `docker builder prune -af` keeps
+        # clinical-trial-patient-match:latest, which the next two steps read —
+        # asserted below rather than assumed, because a prune that removed the
+        # image would make the scan pass by scanning nothing.
+        working-directory: .
+        run: |
+          df -h / | tail -1
+          docker builder prune -af
+          docker image prune -f
+          sudo rm -rf /opt/hostedtoolcache/CodeQL /usr/share/swift \
+                      /usr/local/share/powershell || true
+          df -h / | tail -1
+          docker image inspect clinical-trial-patient-match:latest \
+            --format 'image still present: {{.Id}}'
+
       - name: Container image vulnerability scan (Trivy)
         # `--timeout 20m` IS REQUIRED, NOT DEFENSIVE. Trivy's default is 5
         # minutes and the first real run died on it:
