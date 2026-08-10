@@ -274,16 +274,23 @@ print("=" * 75)
 
 
 def _extract_json_template(prompt_text: str):
-    """The JSON array under 'JSON template:' in a rendered system prompt.
+    """The JSON OBJECT under 'JSON template:' in a rendered system prompt.
 
-    Sliced by BRACKET COUNTING with string awareness rather than by a regex or a
-    rindex of ']': the template contains bracketed prose above it and quoted
-    text inside it, and a slice that ends at the wrong bracket produces a
+    Sliced by BRACE COUNTING with string awareness rather than by a regex or a
+    rindex of '}': the template contains braced prose above it and quoted text
+    inside it, and a slice that ends at the wrong brace produces a
     JSONDecodeError that reads like a prompt defect rather than a test defect.
+
+    IT COUNTS BRACES, NOT BRACKETS, AND THAT IS NOT INTERCHANGEABLE HERE. The
+    previous version looked for the first '[' and would still have "worked"
+    against the 1.2.0 envelope -- it would have found the array under
+    "evaluations" and returned the trial list, silently never seeing the
+    envelope it exists to check. A slice that succeeds for the wrong reason is
+    the shape this suite keeps having to remove.
     """
     marker = "JSON template:"
     start_of_marker = prompt_text.index(marker) + len(marker)
-    start = prompt_text.index("[", start_of_marker)
+    start = prompt_text.index("{", start_of_marker)
     depth = 0
     in_string = False
     escaped = False
@@ -299,13 +306,13 @@ def _extract_json_template(prompt_text: str):
             continue
         if char == '"':
             in_string = True
-        elif char == "[":
+        elif char == "{":
             depth += 1
-        elif char == "]":
+        elif char == "}":
             depth -= 1
             if depth == 0:
                 return json.loads(prompt_text[start:index + 1])
-    raise ValueError("the JSON template's array is not closed")
+    raise ValueError("the JSON template's object is not closed")
 
 
 # Rendered from the SHIPPED template, in the variant Stage 5 sends when the MeSH
@@ -315,14 +322,31 @@ def _extract_json_template(prompt_text: str):
 _PROMPT = render_system_prompt(mesh_filter_applied=True,
                                mesh_filter_skip_reason="applied",
                                trial_count=2)
-_TEMPLATE = guarded(_extract_json_template, _PROMPT)
+_TEMPLATE_DOC = guarded(_extract_json_template, _PROMPT)
 
 check("the JSON template parses out of the rendered prompt",
-      isinstance(_TEMPLATE, list), True)
+      isinstance(_TEMPLATE_DOC, dict), True)
+# THE ENVELOPE THE DECODER ACTUALLY PRODUCES. Strict mode forces an object root,
+# and since PROMPT_VERSION 1.2.0 the template shows one instead of a bare array.
+check("the template's root is the one-key evaluations envelope",
+      sorted(_TEMPLATE_DOC) if isinstance(_TEMPLATE_DOC, dict) else _TEMPLATE_DOC,
+      [EVALUATIONS_KEY])
+_TEMPLATE = (_TEMPLATE_DOC.get(EVALUATIONS_KEY)
+             if isinstance(_TEMPLATE_DOC, dict) else None)
+check("...holding an array of trial objects", isinstance(_TEMPLATE, list), True)
 # NON-DEGENERACY FIRST. An empty template compared against a schema would
 # satisfy every "every entry agrees" assertion below for free.
 check("non-degeneracy: the template holds more than one trial",
       len(_TEMPLATE) > 1 if isinstance(_TEMPLATE, list) else False, True)
+# THE PROSE AND THE TEMPLATE MUST AGREE ABOUT THE ENVELOPE. Section 5's three
+# array statements were rewritten at 1.2.0; a template updated without them, or
+# the reverse, is the disagreement this pass existed to remove.
+check("Section 5's prose no longer asks for a bare JSON array",
+      "valid JSON array" in _PROMPT, False)
+check("...and names the object envelope instead",
+      'single key "evaluations"' in _PROMPT, True)
+check("...and asks for all trials in the one array under that key",
+      'trials in the one array under "evaluations"' in _PROMPT, True)
 
 _schema_trial = _SCHEMA["properties"][EVALUATIONS_KEY]["items"]
 _schema_trial_fields = tuple(_schema_trial["properties"])
@@ -930,6 +954,21 @@ check("...whereas the parse failure names the exception type",
 
 check("assessment sorts before eligible -- the whole reason for the name",
       "assessment" < "eligible", True)
+
+# THE GUARD'S RULE, APPLIED TO THE PROMPT'S OWN TEMPLATE. The template is an
+# EXAMPLE of a conforming response, so a template that would trip the guard is
+# a prompt showing the model the shape the guard exists to report. Checked on
+# the rendered TEXT with the guard's own two needles, not on the parsed dict,
+# because the guard reads bytes.
+_TPL_TEXT = _PROMPT[_PROMPT.index("JSON template:"):]
+check("the prompt's template puts assessment before eligible, as the guard "
+      "requires of a real response",
+      0 <= _TPL_TEXT.find('"assessment"') < _TPL_TEXT.find('"eligible"'), True)
+# NON-DEGENERACY: both needles are actually present in the sliced text, so the
+# comparison above is over two real positions rather than two -1s.
+check("non-degeneracy: both needles occur in the template text",
+      (_TPL_TEXT.find('"assessment"') >= 0,
+       _TPL_TEXT.find('"eligible"') >= 0), (True, True))
 
 _ORDERED = json.dumps({EVALUATIONS_KEY: [{
     "assessment": "No known disqualifiers.", "eligible": "eligible",

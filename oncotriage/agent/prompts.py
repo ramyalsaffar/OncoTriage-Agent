@@ -85,7 +85,12 @@ from oncotriage.utils import get_age_reference_date
 # that mechanism instead of commanding an order the model no longer controls.
 # MIDDLE number: the reasoning-first design is what the prompt MEANS to the
 # model, and this restores it.
-PROMPT_VERSION = "1.1.0"
+#
+# 1.2.0 made Section 5 describe the envelope the decoder actually produces: a
+# single JSON object under the key "evaluations" rather than a bare array, and a
+# template whose fields are in the alphabetical order the decoder emits. MIDDLE
+# number: the output contract the prompt states is part of what it means.
+PROMPT_VERSION = "1.2.0"
 
 
 def prompt_sha256(rendered_text: str) -> str:
@@ -373,8 +378,8 @@ If the patient record does not contain the biomarker result:
 SECTION 5 -- OUTPUT FORMAT
 =====================================================================
 
-Return ONLY a valid JSON array. No markdown fences. No text outside the array.
-Evaluate ALL {trial_count} trials in one JSON array.
+Return ONLY a valid JSON object with the single key "evaluations". No markdown fences. No text outside the object.
+Evaluate ALL {trial_count} trials in the one array under "evaluations".
 
 Every trial object carries exactly these seven fields, and the response format
 emits them in this order:
@@ -395,36 +400,38 @@ assessment is emitted BEFORE eligible, so you write it first and it determines t
     For "not_evaluable" trials: begin with "Not evaluable:" then state what was missing from the trial's criteria text.
 
 JSON template:
-[
-  {{
-    "trial_number": 1,
-    "nct_id": "NCT12345678",
-    "match_score": 0.0,
-    "inclusion_criteria": [
-      {{"criterion": "Age 18-75", "patient_value": "62", "status": "met"}},
-      {{"criterion": "ECOG 0-1", "patient_value": "Not in patient record", "status": "not_evaluable"}}
-    ],
-    "exclusion_criteria": [
-      {{"criterion": "Active autoimmune disease", "patient_value": "Not in patient record", "status": "not_evaluable"}}
-    ],
-    "assessment": "No known disqualifiers. Age confirmed. ECOG and autoimmune status not documented.",
-    "eligible": "eligible"
-  }},
-  {{
-    "trial_number": 2,
-    "nct_id": "NCT87654321",
-    "match_score": 0.0,
-    "inclusion_criteria": [
-      {{"criterion": "Adequate renal function (creatinine ≤ 1.5 x ULN)", "patient_value": "Creatinine: 3.4 mg/dL", "status": "not_met"}},
-      {{"criterion": "ECOG 0-1", "patient_value": "Not in patient record", "status": "not_evaluable"}}
-    ],
-    "exclusion_criteria": [
-      {{"criterion": "Active hepatitis B", "patient_value": "Not in patient record", "status": "not_evaluable"}}
-    ],
-    "assessment": "Known disqualifier: Creatinine 3.4 mg/dL contradicts inclusion criterion requiring creatinine ≤ 1.5 x ULN.",
-    "eligible": "not_eligible"
-  }}
-]
+{{
+  "evaluations": [
+    {{
+      "assessment": "No known disqualifiers. Age confirmed. ECOG and autoimmune status not documented.",
+      "eligible": "eligible",
+      "exclusion_criteria": [
+        {{"criterion": "Active autoimmune disease", "patient_value": "Not in patient record", "status": "not_evaluable"}}
+      ],
+      "inclusion_criteria": [
+        {{"criterion": "Age 18-75", "patient_value": "62", "status": "met"}},
+        {{"criterion": "ECOG 0-1", "patient_value": "Not in patient record", "status": "not_evaluable"}}
+      ],
+      "match_score": 0.0,
+      "nct_id": "NCT12345678",
+      "trial_number": 1
+    }},
+    {{
+      "assessment": "Known disqualifier: Creatinine 3.4 mg/dL contradicts inclusion criterion requiring creatinine ≤ 1.5 x ULN.",
+      "eligible": "not_eligible",
+      "exclusion_criteria": [
+        {{"criterion": "Active hepatitis B", "patient_value": "Not in patient record", "status": "not_evaluable"}}
+      ],
+      "inclusion_criteria": [
+        {{"criterion": "Adequate renal function (creatinine ≤ 1.5 x ULN)", "patient_value": "Creatinine: 3.4 mg/dL", "status": "not_met"}},
+        {{"criterion": "ECOG 0-1", "patient_value": "Not in patient record", "status": "not_evaluable"}}
+      ],
+      "match_score": 0.0,
+      "nct_id": "NCT87654321",
+      "trial_number": 2
+    }}
+  ]
+}}
 
 =====================================================================
 SECTION 6 -- ABSOLUTE CONSTRAINTS

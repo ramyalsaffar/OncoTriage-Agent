@@ -16,31 +16,24 @@ LOSS: the criterion the model actually judged is gone, and enough of them gone
 turns a rejection into an unevaluable trial. Under an enum the model cannot
 spell it wrong -- the decoder will not emit a token outside the vocabulary.
 
-THE ROOT IS AN OBJECT AND THE PROMPT ASKS FOR AN ARRAY. THIS IS A REAL
-DISAGREEMENT AND IT IS NOT RESOLVABLE HERE.
+THE ROOT IS AN OBJECT, AND SINCE PROMPT_VERSION 1.2.0 THE PROMPT SAYS SO.
 
-    Section 5 of the system prompt says "Return ONLY a valid JSON array" and its
-    JSON template is a bare ``[ ... ]``. OpenAI Structured Outputs requires the
-    ROOT of a ``json_schema`` to be an object; an array root is rejected by the
-    API. So the schema wraps the array in a one-key object, and the model --
-    which is constrained by the schema at decode time, not by the prose --
-    emits ``{"evaluations": [...]}``.
+    OpenAI Structured Outputs requires the ROOT of a ``json_schema`` to be an
+    object; an array root is rejected by the API. So the schema wraps the array
+    in a one-key object and the model emits ``{"evaluations": [...]}``. The
+    wrapper is forced by the API, not chosen.
 
-    The wrapper is therefore forced by the API, not chosen, and the schema is
-    what actually binds: a prompt sentence the decoder overrides is stale prose,
-    not a live instruction.
-
-    THE ARRAY SENTENCE IS STILL STALE AND IS STILL A FOLLOW-UP. PROMPT_VERSION
-    1.1.0 corrected Section 5's two ORDERING sentences, which were the ones with
-    a live consequence -- they claimed the model controlled a field order it no
-    longer controls. "Return ONLY a valid JSON array" was left alone in that
-    pass because it was out of its scope, so Section 5 still asks for an array
-    while the decoder emits an object. It costs nothing today and it is one more
-    place the prompt disagrees with what is sent.
+    Section 5 asked for a bare array through versions 1.0.0 and 1.1.0, which was
+    prose the decoder simply overrode. 1.2.0 rewrote its three array statements
+    and its JSON template to describe the object envelope, so the prompt and the
+    schema now state one contract. The prompt still does not CAUSE the shape --
+    the schema does -- but a reader of either is no longer told something false.
 
     ``oncotriage/agent/evaluation.py`` accepts BOTH shapes -- see
     ``_unwrap_evaluations`` there -- so a bare array (an old fixture, a run with
-    the response format somehow absent) parses exactly as it did before.
+    the response format somehow absent) parses exactly as it did before. That
+    tolerance is deliberately KEPT: it is what makes the response format a
+    change to enforcement rather than to the parser.
 
 THE TWO CRITERION VOCABULARIES ARE TWO SCHEMA DEFINITIONS, NOT ONE SHARED ONE.
 Section 1 of the prompt states they are disjoint and non-interchangeable, and
@@ -81,44 +74,37 @@ from oncotriage.agent.state import TRIAL_VERDICTS
 # The field names, mirroring prompts.py Section 5
 # ---------------------------------------------------------------------------
 #
-# THE ORDER HERE MIRRORS SECTION 5, AND THE MODEL NO LONGER HONOURS IT. THIS IS
-# THE ONE MEASURED SURPRISE OF THE PASS AND IT IS A BEHAVIOUR CHANGE.
+# THIS ORDER IS DESCRIPTIVE, NOT PRESCRIPTIVE, AND THE DIFFERENCE IS THE WHOLE
+# POINT OF THE COMMENT.
 #
-# Section 5 says "Fields MUST appear in this exact order" and lists them in the
-# order below. The live probe (2026-08-09, gpt-5.6-terra, strict json_schema,
-# one call, $0.002400) came back with the trial object's keys in STRICTLY
-# ALPHABETICAL order instead:
-#
-#     assessment, eligible, exclusion_criteria, inclusion_criteria,
-#     match_score, nct_id, trial_number
+# The live probe (2026-08-09, gpt-5.6-terra, strict json_schema, one call,
+# $0.002400) came back with the trial object's keys in STRICTLY ALPHABETICAL
+# order -- not in the schema's `properties` order, and not in the order the
+# prompt then commanded. The key SET was exactly right and every enum was in
+# vocabulary; only the order moved.
 #
 # (measured with the field still named `explanation`, which sorted between
-# exclusion_criteria and inclusion_criteria; the rename to `assessment` is
-# what moved it to the front)
+# exclusion_criteria and inclusion_criteria; the rename to `assessment` is what
+# moved it to the front, which is the entire reason for the name)
 #
-# The key SET is exactly right and every enum is in vocabulary; only the order
-# moved, and it moved away from both the schema's `properties` order and the
-# prompt's explicit instruction. So a JSON Schema cannot pin emission order
-# here, and the prompt sentence that claims to is now false in practice.
+# So NOTHING IN THIS FILE CAN PIN EMISSION ORDER. Writing the tuple below
+# alphabetically does not cause the alphabetical output -- the decoder does that
+# on its own -- it just stops three statements of one fact from disagreeing:
+# this tuple, the JSON template in prompts.py, and _trial_schema()'s properties
+# dict all now read in the order that is actually produced. Section 2 of
+# tests/test_agent_structured_outputs.py compares all three, and
+# `reasoning_order_regression` in oncotriage/agent/evaluation.py watches the
+# only consequence that matters -- assessment before eligible -- on the bytes of
+# every response, because alphabetical emission is observed behaviour of the
+# current model and not a documented API guarantee.
 #
-# TWO CONSEQUENCES, NEITHER OF THEM COSMETIC:
-#
-#   1. Section 5 also says "explanation MUST be written BEFORE eligible and
-#      determines it". That is a chain-of-thought device -- the model reasons in
-#      the explanation and the verdict is conditioned on it. Alphabetically,
-#      `eligible` is emitted FIRST. The device is defeated by the serialization,
-#      not by anything in this file, and no prompt edit short of renaming a
-#      field can restore it while Structured Outputs is on.
-#   2. The raw response text changes shape, so llm_classifier_raw_response and
-#      any digest built over it move. Fixtures were already dark pending
-#      re-capture, so nothing on disk regressed -- but the re-capture inherits
-#      this, and phase three's classifier measurement must attribute what it
-#      sees to the enum AND to this reordering, not to the enum alone.
-#
-# The order is kept as written anyway: it is what the prompt asks for, it is
-# what a reader comparing the two files expects to find, and if the serializer
-# ever honours `properties` again this is the order it should honour. What is
-# NOT claimed any more is that it takes effect.
+# THE CONSEQUENCE THAT IS NOT COSMETIC, and it survives: the raw response text
+# has a different shape than it had before Structured Outputs, so
+# llm_classifier_raw_response and any digest built over it move. Fixtures were
+# already dark pending re-capture, so nothing on disk regressed -- but the
+# re-capture inherits this, and phase three's classifier measurement must
+# attribute what it sees to the enum AND to the reordering, not to the enum
+# alone.
 #
 # ``tests/test_agent_structured_outputs.py`` section 2 parses the JSON template
 # out of the RENDERED system prompt and compares these tuples against it
@@ -126,13 +112,13 @@ from oncotriage.agent.state import TRIAL_VERDICTS
 # comment. Hand-transcribing a moved literal is how pass 20f-4 shipped
 # `#2ecc71` where the original had `#2ca02c`.
 TRIAL_FIELDS: Tuple[str, ...] = (
-    "trial_number",
-    "nct_id",
-    "match_score",
-    "inclusion_criteria",
-    "exclusion_criteria",
     "assessment",
     "eligible",
+    "exclusion_criteria",
+    "inclusion_criteria",
+    "match_score",
+    "nct_id",
+    "trial_number",
 )
 
 CRITERION_FIELDS: Tuple[str, ...] = (
@@ -215,25 +201,33 @@ def _trial_schema() -> Dict:
     """One trial's verdict block."""
     return {
         "type": "object",
+        # IN TRIAL_FIELDS ORDER, which is the order the decoder emits. The
+        # schema does not IMPOSE that order -- see the ordering block above --
+        # so writing them this way buys agreement between three statements of
+        # one fact (the prompt's template, TRIAL_FIELDS, and this dict) rather
+        # than any behaviour. Section 2 of
+        # tests/test_agent_structured_outputs.py compares all three.
         "properties": {
-            "trial_number": {"type": "integer"},
-            "nct_id": {"type": "string"},
+            # Emitted first, and that is the whole reason for its name: the
+            # model writes its reasoning before it writes the verdict.
+            "assessment": {"type": "string"},
+            "eligible": {"type": "string", "enum": list(TRIAL_VERDICT_ENUM)},
+            "exclusion_criteria": {
+                "type": "array",
+                "items": _criterion_schema(EXCLUSION_STATUSES),
+            },
+            "inclusion_criteria": {
+                "type": "array",
+                "items": _criterion_schema(INCLUSION_STATUSES),
+            },
             # The prompt says "match_score: always 0.0". A number rather than a
             # const, because the schema's job here is the shape: the value is
             # recomputed by _record_score over applicable criteria and the
             # model's figure is never read. A `const` would additionally be
             # unsupported by strict mode's subset of JSON Schema.
             "match_score": {"type": "number"},
-            "inclusion_criteria": {
-                "type": "array",
-                "items": _criterion_schema(INCLUSION_STATUSES),
-            },
-            "exclusion_criteria": {
-                "type": "array",
-                "items": _criterion_schema(EXCLUSION_STATUSES),
-            },
-            "assessment": {"type": "string"},
-            "eligible": {"type": "string", "enum": list(TRIAL_VERDICT_ENUM)},
+            "nct_id": {"type": "string"},
+            "trial_number": {"type": "integer"},
         },
         "required": list(TRIAL_FIELDS),
         "additionalProperties": False,

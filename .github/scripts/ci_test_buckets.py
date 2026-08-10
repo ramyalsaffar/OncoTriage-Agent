@@ -126,7 +126,7 @@ BUCKETS = {
         "it reads no git, no corpus and no database"),
     "test_agent_structured_outputs.py": (
         _A, None,
-        "ran green in 2.0s, 145 checks; the Stage 5 response schema, the reasoning-first field order and the "
+        "ran green in 2.0s, 152 checks; the Stage 5 response schema, the reasoning-first field order and the "
         "refusal path. Every model response is a literal served through a "
         "deps stub, every plant doctors a COPY of a dict the shipped builder "
         "returns or an in-memory AST, and it execs nothing -- no network, no "
