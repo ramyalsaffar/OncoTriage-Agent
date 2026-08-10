@@ -139,6 +139,15 @@ BUCKETS = {
         "deps stub, every plant doctors a COPY of a dict the shipped builder "
         "returns or an in-memory AST, and it execs nothing -- no network, no "
         "keys, no spend, no git, no corpus, no database, no subprocess"),
+    "test_agent_trial_data_fencing.py": (
+        _A, None,
+        "ran green in 0.02s of checks, 86 checks; the TRIAL_DATA fences in the "
+        "USER message, the fence-marker neutralization of scraped text, and "
+        "the system prompt's C6 data boundary. Every trial is a literal dict "
+        "and the renderer is a pure function of it; the ten controls plant "
+        "into in-memory copies of agent/evaluation.py and agent/prompts.py -- "
+        "no network, no keys, no spend, no git, no corpus, no database, no "
+        "subprocess, no model call"),
     "test_agent_trial_verdict_normalization.py": (
         _A, None, "ran green in 1.9s; every model response is a literal via a deps stub"),
     "test_dashboard_reproducibility_tab.py": (

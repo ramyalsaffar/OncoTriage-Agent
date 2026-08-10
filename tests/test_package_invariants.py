@@ -1066,7 +1066,18 @@ _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    # no attribute to rebind, and `git show` cannot supply them
                    # either: the Cancer Stage section is new, so every revision
                    # that HAS it also has it correct.
-                   "tests/test_agent_summary_cancer_stage.py"}
+                   "tests/test_agent_summary_cancer_stage.py",
+                   # Plants into in-memory copies of agent/evaluation.py (the
+                   # TRIAL_DATA fence render and its marker neutralization) and
+                   # agent/prompts.py (the C6 data boundary). `git show` cannot
+                   # supply any of the ten: C6 has no prior revision at all,
+                   # and several controls revert ONE line while leaving the
+                   # rest of the pass correct -- the fence attributes left raw
+                   # while the bodies are neutralized, the close fence emitted
+                   # without its id, the run regex swapped for the str.replace
+                   # form that was never shipped, C6 rendered into one Section 2
+                   # variant only. None of those is a state any commit has had.
+                   "tests/test_agent_trial_data_fencing.py"}
 
 
 def _repo_py_files():

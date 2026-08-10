@@ -33,6 +33,7 @@ nothing, replay would go to the network instead of serving its recording.
 """
 
 import json
+import re
 import time
 from collections import Counter
 from typing import Dict, List, Tuple
@@ -74,6 +75,15 @@ from oncotriage.observability import console, get_logger
 
 
 log = get_logger(__name__)
+
+
+# A MAXIMAL RUN of three or more angle brackets, which is what the user
+# message's TRIAL_DATA fences are built from. Third-party text is rewritten
+# through this before it is interpolated into a block; see
+# _neutralize_fence_markers, which argues why the subject is the RUN and not
+# the three-character substring. It is compiled once here rather than inside
+# the function because _build_trials_text runs once per trial per render.
+_FENCE_MARKER_RUN_RE = re.compile(r"<{3,}|>{3,}")
 
 
 #------------------------------------------------------------------------------
@@ -746,8 +756,78 @@ def _split_in_half(trials: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
     return trials[:midpoint], trials[midpoint:]
 
 
+def _neutralize_fence_markers(text: str) -> Tuple[str, int]:
+    """Spell out any fence marker inside third-party text so it cannot BE one.
+
+    A fence isolates data only if the data cannot spell the fence. Every
+    character of a trial's criteria comes from ClinicalTrials.gov, is
+    re-scraped weekly, and is under no control of this project -- so a trial
+    whose criteria contain ``<<<END_TRIAL_DATA nct_id=...>>>`` would close its
+    own block from the inside and everything after it would read as though it
+    were outside the quoted region.
+
+    WHY A RUN REGEX RATHER THAN ``str.replace``. The obvious form,
+    ``text.replace("<<<", "<< <")``, is not closed under its own output: five
+    consecutive ``>`` characters replace to ``> >>`` + ``>>``, which spells
+    ``>>>`` again. Any replacement that ends in the marker character can
+    re-form the marker from the tail of an odd-length run, so the substitution
+    is over the WHOLE maximal run (``<{3,}`` is greedy, and the character
+    either side of a maximal run is by definition not that character) and the
+    replacement inserts nothing but spaces between characters the run already
+    had. No run of three can survive and none can be created.
+
+    Args:
+        text: the third-party string about to be interpolated.
+
+    Returns:
+        ``(neutralized_text, runs_rewritten)``. The count is of RUNS, which is
+        the number of substitutions actually performed; ``<<<<<<`` is one run
+        and one replacement, not two.
+    """
+    if not text:
+        return text, 0
+    hits = [0]
+
+    def _space_out(match: "re.Match") -> str:
+        hits[0] += 1
+        return " ".join(match.group(0))
+
+    return _FENCE_MARKER_RUN_RE.sub(_space_out, text), hits[0]
+
+
 def _build_trials_text(trials: List[Dict]) -> str:
-    """Render one batch of trials for the user prompt.
+    """Render one batch of trials for the user prompt, each inside a fence.
+
+    EVERY TRIAL IS WRAPPED IN AN EXPLICIT DATA DELIMITER, and Section 6's C6
+    tells the model what a delimiter means. The trial text is third party --
+    scraped from ClinicalTrials.gov and re-indexed weekly by anyone who can get
+    a study registered -- and it used to sit in the same message as the patient
+    record with nothing marking where it began or ended. Prose inside a
+    criteria block reading like an instruction was, byte for byte,
+    indistinguishable from an instruction. The block is::
+
+        <<<TRIAL_DATA nct_id=NCT01234567 phase=PHASE2>>>
+        ...inclusion criteria, exactly as scraped...
+        ...exclusion criteria, exactly as scraped...
+        <<<END_TRIAL_DATA nct_id=NCT01234567>>>
+
+    THE nct_id RIDES IN BOTH FENCE LINES. In the open line because the header
+    that used to carry it is gone and Section 5 tells the model to copy the id
+    from the fence attribute; in the CLOSE line because a close that named
+    nothing would let two adjacent blocks be misread as one under a truncated
+    or reflowed render, which would silently merge one trial's exclusions into
+    another's.
+
+    NEUTRALIZATION HAPPENS BEFORE INTERPOLATION, NEVER AFTER ASSEMBLY. Each
+    third-party value is passed through _neutralize_fence_markers on its way
+    into the block; the assembled message is never re-scanned, because a scan
+    of the assembled message would rewrite the fences this function just
+    wrote. The values neutralized are the criteria bodies AND the two values
+    interpolated into the fence lines themselves (nct_id, phase) -- both of
+    those are scraped registry fields too, and a fence whose own attribute
+    values can spell ``>>>`` is not a boundary. On every real trial in the
+    corpus this changes nothing: a well-formed NCT id and a phase string
+    contain no angle brackets at all.
 
     THE HEADER CARRIES NO ORDINAL, AND THAT IS THE POINT RATHER THAN A
     SIMPLIFICATION. It used to read ``Trial {n} (NCT..., PHASE):`` with the
@@ -763,21 +843,48 @@ def _build_trials_text(trials: List[Dict]) -> str:
     It also removed an ambiguity the old docstring had to apologise for: a
     chunked run showed "Trial 1" twice inside one inference.
 
-    Order is unchanged -- the trials are still rendered in the order they were
-    ranked -- as are the criteria body and the ``---`` separator. The rank is
-    still real and still stored: node_finalize assigns trial_number from the
-    position in filtered_trials and trial_matches.trial_number records it.
+    The ordinal-free header and the ``---`` separator are BOTH gone now: the
+    fence lines replace them, and the two facts the old header carried
+    (nct_id, phase) are the two attributes of the open fence. Order is
+    unchanged -- the trials are still rendered in the order they were ranked --
+    and so are the criteria bodies. The rank is still real and still stored:
+    node_finalize assigns trial_number from the position in filtered_trials and
+    trial_matches.trial_number records it.
     """
-    trials_text = ""
+    parts = []
     for trial_obj in trials:
         trial = trial_obj["trial"]
-        trials_text += f"""Trial {trial['nct_id']} ({trial['phase']}):
-{trial['eligibility']['inclusion_criteria']}
-{trial['eligibility']['exclusion_criteria']}
+        # str() rather than `or ""`: the values used to reach an f-string, so
+        # this reproduces exactly what the f-string did with a None or a
+        # non-string, including rendering it as "None". Changing that would be
+        # a body change this pass does not make.
+        nct_id, hits_id = _neutralize_fence_markers(str(trial["nct_id"]))
+        phase, hits_phase = _neutralize_fence_markers(str(trial["phase"]))
+        inclusion, hits_inc = _neutralize_fence_markers(
+            str(trial["eligibility"]["inclusion_criteria"]))
+        exclusion, hits_exc = _neutralize_fence_markers(
+            str(trial["eligibility"]["exclusion_criteria"]))
 
----
-"""
-    return trials_text
+        neutralized = hits_id + hits_phase + hits_inc + hits_exc
+        if neutralized:
+            # The nct_id reported is the NEUTRALIZED one, so the line names the
+            # string that was actually sent rather than one that never left
+            # this function. It fires once per render of the trial, so a batch
+            # that splits reports it per chunk as well as for the whole-batch
+            # render kept for logging -- that is a count of renders, not of
+            # trials, and the event name says so.
+            log.warning("neutralized a fence marker inside scraped trial text",
+                        stage=5, node="llm_classifier_evaluation",
+                        event="trial_fence_marker_neutralized",
+                        nct_id=nct_id, count=neutralized)
+
+        parts.append(
+            f"<<<TRIAL_DATA nct_id={nct_id} phase={phase}>>>\n"
+            f"{inclusion}\n"
+            f"{exclusion}\n"
+            f"<<<END_TRIAL_DATA nct_id={nct_id}>>>\n\n"
+        )
+    return "".join(parts)
 
 
 def _unevaluable_entry(trial_obj: Dict, reason: str) -> Dict:
