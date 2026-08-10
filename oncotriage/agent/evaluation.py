@@ -280,11 +280,17 @@ NOT_EVALUABLE_MODEL_OMITTED = "omitted_from_model_response"
 # ^ the call succeeded and parsed, but the model returned no entry for this
 #   trial. Not a truncation and not a parse failure; the reconciliation below
 #   is the only thing that would ever have noticed.
+NOT_EVALUABLE_CONFLICTING_DUPLICATES = "conflicting_duplicate_answers"
+# ^ the model returned SEVERAL entries for this trial and they did not agree on
+#   the verdict. Distinct from every reason above: the model answered, more than
+#   once, and contradicted itself. See _collapse_duplicate_entries for why that
+#   is a non-evaluation rather than a choice between the answers.
 
 _NOT_EVALUABLE_REASONS = (
     NOT_EVALUABLE_TRUNCATION_FLOOR,
     NOT_EVALUABLE_SPLIT_BUDGET,
     NOT_EVALUABLE_MODEL_OMITTED,
+    NOT_EVALUABLE_CONFLICTING_DUPLICATES,
 )
 
 # Finish reason the API returns when it stopped because it hit max_tokens.
@@ -358,6 +364,23 @@ _MALFORMED_ENTRY_PREVIEW_LEN = 60
 # the trials in its own chunk; an id belonging to a different chunk of the same
 # split batch is an answer to a question that call was not asked, and treating
 # the union as the sent set would accept it.
+#
+# BUT THE TWO CAUSES OF A DROP ARE DIFFERENT DISEASES AND ARE COUNTED APART.
+#
+#   CROSS-CHUNK -- the id is in the node's full sent set, just not this chunk's.
+#       The model answered about the whole batch on every call. Nothing was
+#       invented and nothing is lost: the id's OWN chunk answers it, or the
+#       reconciliation records it as omitted. It costs the patient nothing and
+#       it is a fact about how the provider handled a split request.
+#   FABRICATED -- the id is in no sent set at all (or is not a string). The
+#       model produced a verdict about a trial that does not exist in this run.
+#       This is the clinical fault, and it is the ONLY one written to
+#       inferences.hallucinated_trials, whose own definition is "trials never
+#       in the candidate set sent to it".
+#
+# One number for both would have made an unsplit run's fabrication rate
+# incomparable with a split run's, and would have put a provider quirk into a
+# column a reader treats as a hallucination rate.
 
 # Longest fragment of a returned nct_id kept for the log line. An NCT id is 11
 # characters; this leaves room for a recognisable variant of one and refuses a
@@ -390,32 +413,140 @@ def _out_of_set_label(raw_id) -> str:
     return raw_id[:_OUT_OF_SET_ID_PREVIEW_LEN] or "<empty>"
 
 
-def _partition_out_of_set(objects: List[Dict], sent_ids) -> Tuple[List[Dict], List[str]]:
-    """Split one chunk's entries into those it was asked about, and the rest.
+def _partition_out_of_set(
+    objects: List[Dict], chunk_ids, batch_ids,
+) -> Tuple[List[Dict], List[str], List[str]]:
+    """Split one chunk's entries three ways: asked about, cross-chunk, invented.
 
-    Returns ``(in_set, out_of_set_labels)``. Nothing is mutated and nothing is
-    coerced; the caller records the drops.
+    Returns ``(in_set, cross_chunk_labels, fabricated_labels)``. Nothing is
+    mutated and nothing is coerced; the caller records the drops.
 
-    ``isinstance(raw_id, str)`` is tested BEFORE the membership test and that is
-    not defensiveness about a schema-constrained field: ``[] in {"a"}`` raises
-    TypeError on an unhashable value, so an nct_id the model emitted as a list
-    or a dict would take the whole patient's run down inside the detector added
-    to stop exactly that class of loss. A non-string id is also, unambiguously,
-    not one of the ids that were sent.
+    ``chunk_ids`` is what THIS call asked about and decides what is kept.
+    ``batch_ids`` is the whole node's candidate set and decides only how a drop
+    is CLASSIFIED -- never whether it is dropped. See the block above for why
+    the two causes are counted apart.
+
+    ``isinstance(raw_id, str)`` is tested BEFORE either membership test and that
+    is not defensiveness about a schema-constrained field: ``[] in {"a"}``
+    raises TypeError on an unhashable value, so an nct_id the model emitted as a
+    list or a dict would take the whole patient's run down inside the detector
+    added to stop exactly that class of loss. A non-string id is also,
+    unambiguously, not one of the ids that were sent, and it is counted as
+    FABRICATED -- it names no trial anywhere in this run, which is what that
+    bucket means.
 
     A missing nct_id is out of set for the same reason, and this is where such
     an entry now stops: before, it reached enrichment with ``""``, matched no
     trial, kept no title, and left the stage as a verdict about nothing.
     """
     in_set = []
-    out_of_set = []
+    cross_chunk = []
+    fabricated = []
     for entry in objects:
         raw_id = entry.get("nct_id")
-        if isinstance(raw_id, str) and raw_id in sent_ids:
+        if not isinstance(raw_id, str):
+            fabricated.append(_out_of_set_label(raw_id))
+        elif raw_id in chunk_ids:
             in_set.append(entry)
+        elif raw_id in batch_ids:
+            cross_chunk.append(_out_of_set_label(raw_id))
         else:
-            out_of_set.append(_out_of_set_label(raw_id))
-    return in_set, out_of_set
+            fabricated.append(_out_of_set_label(raw_id))
+    return in_set, cross_chunk, fabricated
+
+
+# ---------------------------------------------------------------------------
+# The same trial answered more than once
+# ---------------------------------------------------------------------------
+#
+# A model that returns two entries for one sent trial used to have BOTH kept:
+# two verdicts for one trial, two trial_matches rows under one inference, and a
+# candidates_evaluated that counted a trial twice. The reconciliation could not
+# see it -- it asks whether each sent trial appears AT LEAST once -- and the
+# out-of-set detector cannot either, because the id was genuinely sent.
+#
+# THE POLICY IS THE PROMPT'S OWN CONSERVATISM RULE (C5), APPLIED TO THE MODEL'S
+# SELF-CONTRADICTION:
+#
+#   identical verdicts   -> keep the FIRST, drop the rest. The model said one
+#       thing twice. Choosing the first is arbitrary only in the sense that any
+#       of two equal answers is; it is deterministic, which is the property
+#       this pipeline is built on.
+#   conflicting verdicts -> ALL of them are replaced by one not_evaluable entry.
+#       A judge that says "eligible" and "not_eligible" about the same trial in
+#       one response has not evaluated it, and picking either answer would be
+#       choosing a verdict the model itself contradicted. Not a rejection: that
+#       would be the fabricated-rejection defect the verdict-normalization pass
+#       removed, arriving by a different road.
+#
+# COMPARED ON THE NORMALIZED VERDICT, NOT THE RAW LABEL, and that decides one
+# case deliberately. "Eligible" beside "eligible" is one answer typed twice, not
+# a contradiction. Two DIFFERENT unreadable labels both normalize to None and
+# are therefore treated as one unreadable answer -- which preserves the
+# disqualification rule that already governs them: the first entry is kept and
+# its criteria decide, so a stated "not_met" still produces a rejection rather
+# than being deleted by a conflict verdict.
+#
+# CROSS-CHUNK DUPLICATES NEED NO HANDLING AND THAT IS A FACT ABOUT THE SPLIT,
+# NOT AN OVERSIGHT. _split_in_half partitions the batch, so every sent id lives
+# in exactly one chunk; an entry for that id arriving in any OTHER chunk's
+# response is out of set for the call that produced it and has already been
+# dropped above. Grouping therefore only ever has to be within a chunk.
+
+DUPLICATE_CASE_IDENTICAL = "identical"
+DUPLICATE_CASE_CONFLICTING = "conflicting"
+
+# Closed, and a caller may branch on it exhaustively.
+DUPLICATE_CASES = (DUPLICATE_CASE_IDENTICAL, DUPLICATE_CASE_CONFLICTING)
+
+
+def _collapse_duplicate_entries(
+    objects: List[Dict],
+) -> Tuple[List[Dict], List[Dict]]:
+    """Reduce each nct_id to at most one entry.
+
+    Returns ``(kept, collapsed)``. ``kept`` holds the surviving entries in
+    their original order, with at most one per nct_id and NONE at all for an id
+    whose answers conflicted -- the caller replaces those with an unevaluable
+    entry, on the _unevaluable_entry precedent, because building one here would
+    mean this helper reaching for the trial metadata it has no business knowing
+    about.
+
+    ``collapsed`` is one record per DUPLICATED id: ``{"nct_id", "case",
+    "count"}``, where count is how many entries that id arrived with.
+
+    Every entry is assumed to carry a string nct_id: _partition_out_of_set runs
+    first and drops everything else, which is what makes the grouping safe to
+    key on.
+    """
+    order: List[str] = []
+    grouped: Dict[str, List[Dict]] = {}
+    for entry in objects:
+        nct_id = entry.get("nct_id")
+        if nct_id not in grouped:
+            grouped[nct_id] = []
+            order.append(nct_id)
+        grouped[nct_id].append(entry)
+
+    kept = []
+    collapsed = []
+    for nct_id in order:
+        entries = grouped[nct_id]
+        if len(entries) == 1:
+            kept.append(entries[0])
+            continue
+        verdicts = {normalize_trial_verdict(e.get("eligible"))[0]
+                    for e in entries}
+        if len(verdicts) == 1:
+            collapsed.append({"nct_id": nct_id,
+                              "case": DUPLICATE_CASE_IDENTICAL,
+                              "count": len(entries)})
+            kept.append(entries[0])
+        else:
+            collapsed.append({"nct_id": nct_id,
+                              "case": DUPLICATE_CASE_CONFLICTING,
+                              "count": len(entries)})
+    return kept, collapsed
 
 
 # ---------------------------------------------------------------------------
@@ -618,15 +749,29 @@ def _split_in_half(trials: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
 def _build_trials_text(trials: List[Dict]) -> str:
     """Render one batch of trials for the user prompt.
 
-    Numbering restarts at 1 within each chunk. The model is told to key its
-    output on nct_id, and every merge downstream matches on nct_id, so the
-    ordinal is presentation only — but it is worth saying out loud, because a
-    chunked run makes "Trial 1" appear more than once in a single inference.
+    THE HEADER CARRIES NO ORDINAL, AND THAT IS THE POINT RATHER THAN A
+    SIMPLIFICATION. It used to read ``Trial {n} (NCT..., PHASE):`` with the
+    numbering restarting at 1 inside each chunk, and the ordinal was
+    presentation only -- the model was told to key its output on nct_id, and
+    every merge downstream matches on nct_id. But it was not free: the trials
+    arrive in RETRIEVAL ORDER, so a number beside each one tells a judge where
+    the pipeline ranked it, which is a bias channel pointing straight at the
+    trial isolation C4 demands. The response schema's ``trial_number`` went in
+    the same pass (see oncotriage/agent/response_schema.py), so the model
+    neither reads a rank nor states one.
+
+    It also removed an ambiguity the old docstring had to apologise for: a
+    chunked run showed "Trial 1" twice inside one inference.
+
+    Order is unchanged -- the trials are still rendered in the order they were
+    ranked -- as are the criteria body and the ``---`` separator. The rank is
+    still real and still stored: node_finalize assigns trial_number from the
+    position in filtered_trials and trial_matches.trial_number records it.
     """
     trials_text = ""
-    for idx, trial_obj in enumerate(trials):
+    for trial_obj in trials:
         trial = trial_obj["trial"]
-        trials_text += f"""Trial {idx + 1} ({trial['nct_id']}, {trial['phase']}):
+        trials_text += f"""Trial {trial['nct_id']} ({trial['phase']}):
 {trial['eligibility']['inclusion_criteria']}
 {trial['eligibility']['exclusion_criteria']}
 
@@ -665,6 +810,9 @@ def _unevaluable_entry(trial_obj: Dict, reason: str) -> Dict:
             NOT_EVALUABLE_MODEL_OMITTED:
                 "The model returned a well-formed response that contained no "
                 "entry for this trial. Not assessed.",
+            NOT_EVALUABLE_CONFLICTING_DUPLICATES:
+                "The model returned more than one evaluation for this trial "
+                "and they disagreed on the verdict. Not assessed.",
         }[reason],
     }
 
@@ -707,23 +855,23 @@ def node_llm_classifier_evaluation(state: TrialMatchState) -> dict:
     # Build patient summary
     patient_summary = _create_patient_summary(patient_data)
 
-    # Build trials text for prompt
-    # Only eligibility criteria sent to GPT-4o. Title, conditions, brief
-    # summary, interventions stripped to prevent GPT-4o from performing
-    # its own disease relevance check. Disease relevance enforced upstream by
-    # hybrid retrieval, cross-encoder reranking and — when it ran — the MeSH
-    # site filter. Whether it ran is what Section 2 below is conditional on.
-    trials_text = ""
-    for idx, trial_obj in enumerate(trials):
-        trial = trial_obj["trial"]
-
-        trials_text += f"""Trial {idx + 1} ({trial['nct_id']}, {trial['phase']}):
-{trial['eligibility']['inclusion_criteria']}
-{trial['eligibility']['exclusion_criteria']}
-
----
-"""
-
+    # The trials are rendered by _build_trials_text, per chunk, in
+    # _user_prompt_for below. Only eligibility criteria are sent: title,
+    # conditions, brief summary and interventions are stripped so the judge
+    # cannot perform its own disease relevance check. Relevance is enforced
+    # upstream by hybrid retrieval, cross-encoder reranking and -- when it ran
+    # -- the MeSH site filter. Whether it ran is what Section 2 below is
+    # conditional on.
+    #
+    # A SECOND, DEAD COPY OF THAT RENDERER STOOD HERE and is deleted. It built
+    # a local `trials_text` over the WHOLE batch that nothing ever read --
+    # measured by AST, not by eye: zero Load references to the name in this
+    # function, the only reference being the `+=`'s own. So every Stage 5 call
+    # formatted the entire candidate set into a string and discarded it. It was
+    # harmless while it agreed with _build_trials_text and stopped being
+    # harmless the moment the header changed: a stale duplicate of the exact
+    # text under edit, sitting above a comment that points at it, is a false
+    # statement about what the model is sent.
 
     # ------------------------------------------------------------------
     # Section 2 of the system prompt is an assertion about THIS run
@@ -740,8 +888,8 @@ def node_llm_classifier_evaluation(state: TrialMatchState) -> dict:
     #   - The indexed corpus is oncology-only, so "every trial is a cancer
     #     trial" holds regardless. The claim that fails is the narrower one,
     #     that the trial matches THIS patient's cancer site.
-    #   - Only eligibility criteria text is sent (see the trials_text build
-    #     above), and RULE 3's categorically-different-diseases branch already
+    #   - Only eligibility criteria text is sent (see _build_trials_text and
+    #     the note above), and RULE 3's categorically-different-diseases branch already
     #     turns an off-site trial into a criterion-level "not_met" whenever the
     #     criteria name the disease, which most oncology criteria do.
     # The residual exposure is a trial whose criteria never state the disease,
@@ -839,12 +987,25 @@ CLINICAL TRIALS:
     # ------------------------------------------------------------------
     evaluations = []
     unevaluable = []              # trials accounted for without a verdict
-    # Entries the model returned for a trial that was not in the chunk it was
-    # answering. One label per ENTRY, not per distinct id, so a model that
-    # invents the same id twice is reported as two fabricated verdicts -- which
-    # is what it produced. The list is what the log line names; its length is
-    # what reaches inferences.hallucinated_trials.
+    # Entries the model returned for a trial that is in NO sent set at all.
+    # One label per ENTRY, not per distinct id, so a model that invents the
+    # same id twice is reported as two fabricated verdicts -- which is what it
+    # produced. The list is what the log line names; its length is what reaches
+    # inferences.hallucinated_trials.
     hallucinated_ids = []
+    # Entries for a real candidate of this run that belongs to a DIFFERENT
+    # chunk. Counted apart and deliberately not stored: nothing is lost, the
+    # id's own chunk answers it. See the block above _partition_out_of_set.
+    cross_chunk_ids = []
+    # One record per collapsed duplicate id: {"nct_id", "case", "count"}.
+    duplicate_ids = []
+    # The candidate set of the WHOLE node, which classifies a drop but never
+    # causes one, and the trial objects an unevaluable entry is built from.
+    # Both are computed once here rather than per chunk: they are properties of
+    # the batch, and rebuilding them inside the loop would be N scans of the
+    # same list for a value that cannot change.
+    _batch_ids = {t["trial"]["nct_id"] for t in trials}
+    _trial_by_id = {t["trial"]["nct_id"]: t for t in trials}
     truncation_splits = proactive_splits
     truncations_observed = 0
     input_tokens = 0
@@ -1244,23 +1405,68 @@ CLINICAL TRIALS:
         # block above _partition_out_of_set for why it is dropped rather than
         # repaired, and for why the trial it displaced is left to the
         # reconciliation at the end of this node rather than handled here.
-        _sent_ids = {t["trial"]["nct_id"] for t in chunk}
-        _objects, _out_of_set = _partition_out_of_set(_objects, _sent_ids)
-        if _out_of_set:
-            hallucinated_ids.extend(_out_of_set)
-            log.warning("the model returned evaluations for trials that were "
-                        "not sent to it; dropping them -- an id outside the "
-                        "candidate set names no trial in this run. Any "
-                        "candidate they displaced is recorded by the "
-                        "reconciliation below", stage=5,
-                        event="out_of_set_entry", count=len(_out_of_set),
-                        # The ids only. The rest of a fabricated entry is the
-                        # model's criterion-level prose about this patient and
-                        # the structured record is durable and indexed, so it
-                        # goes nowhere -- not even to the console, which the
-                        # malformed-entry path uses for a type fragment. Here
-                        # the id IS the whole diagnosis.
-                        nct_ids=_out_of_set)
+        _chunk_ids = {t["trial"]["nct_id"] for t in chunk}
+        _objects, _cross_chunk, _fabricated = _partition_out_of_set(
+            _objects, _chunk_ids, _batch_ids)
+        if _cross_chunk or _fabricated:
+            # ONLY THE FABRICATED IDS REACH inferences.hallucinated_trials.
+            # A cross-chunk id names a real candidate of this run and costs the
+            # patient nothing; folding it into the same number would put a
+            # provider's handling of a split request into a column a reader
+            # treats as a hallucination rate.
+            hallucinated_ids.extend(_fabricated)
+            cross_chunk_ids.extend(_cross_chunk)
+            log.warning("the model returned evaluations for trials this call "
+                        "did not ask about; dropping them. A fabricated id "
+                        "names no trial in this run; a cross-chunk id names "
+                        "one another call answers. Any candidate they "
+                        "displaced is recorded by the reconciliation below",
+                        stage=5, event="out_of_set_entry",
+                        # The ids only, in two named buckets. The rest of such
+                        # an entry is the model's criterion-level prose about
+                        # this patient and the structured record is durable and
+                        # indexed, so it goes nowhere -- not even to the
+                        # console, which the malformed-entry path uses for a
+                        # type fragment. Here the id IS the whole diagnosis.
+                        count=len(_cross_chunk) + len(_fabricated),
+                        fabricated_count=len(_fabricated),
+                        fabricated_nct_ids=_fabricated,
+                        cross_chunk_count=len(_cross_chunk),
+                        cross_chunk_nct_ids=_cross_chunk)
+
+        # ── The same trial answered more than once ─────────────────────────
+        #
+        # Within the chunk, and that is complete rather than partial: the split
+        # partitions the batch, so a repeat arriving in another chunk's
+        # response was already dropped as cross-chunk above. See
+        # _collapse_duplicate_entries.
+        _objects, _collapsed = _collapse_duplicate_entries(_objects)
+        if _collapsed:
+            _identical = [d["nct_id"] for d in _collapsed
+                          if d["case"] == DUPLICATE_CASE_IDENTICAL]
+            _conflicting = [d["nct_id"] for d in _collapsed
+                            if d["case"] == DUPLICATE_CASE_CONFLICTING]
+            duplicate_ids.extend(_collapsed)
+            # A conflicting id keeps NO entry, so it is accounted for here or
+            # nowhere -- the reconciliation would otherwise record it as
+            # "omitted from the model response", which is false: the model
+            # answered twice.
+            unevaluable.extend(
+                _unevaluable_entry(_trial_by_id[nct_id],
+                                   NOT_EVALUABLE_CONFLICTING_DUPLICATES)
+                for nct_id in _conflicting
+            )
+            log.warning("the model returned more than one evaluation for the "
+                        "same trial; collapsing. Identical verdicts keep the "
+                        "first entry; conflicting verdicts are recorded as "
+                        "not evaluable, because a judge that contradicts "
+                        "itself about a trial has not assessed it",
+                        stage=5, event="duplicate_answers",
+                        count=len(_collapsed),
+                        duplicate_identical_count=len(_identical),
+                        duplicate_identical_nct_ids=_identical,
+                        duplicate_conflicting_count=len(_conflicting),
+                        duplicate_conflicting_nct_ids=_conflicting)
 
         evaluations.extend(_objects)
 
@@ -1880,8 +2086,11 @@ CLINICAL TRIALS:
         "llm_classifier_truncation_splits": truncation_splits,
         "llm_classifier_output_tokens_estimated": estimated_output,
         "not_evaluable_truncated": not_evaluable_truncated,
-        # How many entries the model returned for trials it was not sent, this
-        # run. WRITTEN ONLY HERE, on the success path, and deliberately absent
+        # How many entries the model returned for a trial that is in NO sent
+        # set of this run -- FABRICATED ONLY. A cross-chunk repeat is dropped
+        # by the same code and counted separately, in the log event, because it
+        # names a real candidate and costs the patient nothing.
+        # WRITTEN ONLY HERE, on the success path, and deliberately absent
         # from every early return above: those end the node before the whole
         # response has been compared against the whole candidate set, so any
         # number they carried would be a partial count reported as a total.

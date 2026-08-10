@@ -217,6 +217,17 @@ INFERENCE_COLUMN_ADDITIONS = {
     # be enriched or scored, and writes the total into
     # result["hallucinated_trials"] via _pipeline_provenance.
     #
+    # FABRICATED ONLY, WHICH IS WHAT THE SENTENCE ABOVE HAS ALWAYS SAID. The
+    # detector drops two kinds of entry and this column counts one of them: an
+    # id that is in no candidate set of the run. The other kind -- an id in the
+    # node's sent set but not in the chunk that answered, which is the model
+    # answering the whole batch to every call of a SPLIT request -- is dropped
+    # by the same code and counted only in the `out_of_set_entry` log event,
+    # under cross_chunk_count / cross_chunk_nct_ids. It costs the patient
+    # nothing (that id's own chunk answers it, or the reconciliation records it
+    # as omitted) and folding it in here would make a split run's number
+    # incomparable with an unsplit run's.
+    #
     # 0 IS A MEASUREMENT AND NULL IS NOT. A normal run stores 0, which asserts
     # that every returned entry was compared against the candidate set and
     # every one belonged to it. NULL means no such comparison was completed --

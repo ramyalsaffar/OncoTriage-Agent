@@ -118,7 +118,6 @@ TRIAL_FIELDS: Tuple[str, ...] = (
     "inclusion_criteria",
     "match_score",
     "nct_id",
-    "trial_number",
 )
 
 CRITERION_FIELDS: Tuple[str, ...] = (
@@ -127,19 +126,36 @@ CRITERION_FIELDS: Tuple[str, ...] = (
     "status",
 )
 
-# ``trial_number`` and ``match_score`` ARE IN THE SCHEMA EVEN THOUGH BOTH ARE
-# OVERWRITTEN DOWNSTREAM. The model's trial_number is replaced by the rank
-# position in ``oncotriage/agent/terminal.py`` and its match_score is recomputed
-# over applicable criteria by ``_record_score`` / ``_record_zero_score`` on
-# every branch, so neither value is read as sent.
+# ``trial_number`` IS GONE, AND THE ARGUMENT THAT KEPT IT HAS ENDED RATHER THAN
+# BEEN OVERRULED.
 #
-# They are here anyway, and omitting them would have been a behaviour change
-# rather than a tidy-up: strict mode requires `required` to name every property
-# and `additionalProperties: false` to forbid the rest, so a schema without them
-# makes it IMPOSSIBLE for the model to emit the two fields the prompt's own
-# template shows it emitting. That changes the response text, and therefore
-# llm_classifier_raw_response, every fixture digest built over it, and the
-# prompt's claim about its own output format -- for no gain.
+# It used to be here beside ``match_score`` on one argument: both are
+# overwritten downstream, so removing either would change the response text --
+# and therefore llm_classifier_raw_response and every digest built over it --
+# for no gain. The premise was "for no gain", and it was measuring the wrong
+# side of the ledger. The field was not merely useless: it made the model READ
+# and RESTATE a rank position, and a rank shown to a judge is a documented bias
+# channel. The trials in the user message arrive in retrieval order and the
+# model was asked to echo each one's ordinal, which invites exactly the
+# position-anchored reasoning C4 (TRIAL ISOLATION) forbids in words.
+#
+# So the cost is paid deliberately: the response text moves, PROMPT_VERSION
+# goes to 1.3.0, and the fixtures -- already dark pending re-capture -- inherit
+# it. ``nct_id`` is the model's only trial identity now, which is what every
+# merge downstream has always matched on.
+#
+# THE RANK ITSELF IS UNTOUCHED AND STILL STORED. ``node_finalize`` assigns
+# ``trial_number`` from the position in ``filtered_trials`` -- the pipeline's
+# own ranking -- and ``trial_matches.trial_number`` records it. What changed is
+# only that the model neither sees a rank nor states one.
+#
+# ``match_score`` STAYS, and the asymmetry is the point: strict mode requires
+# `required` to name every property and `additionalProperties: false` to forbid
+# the rest, so a field removed from here becomes a field the model CANNOT emit.
+# For trial_number that is the intent. For match_score it is not: the prompt's
+# template shows it, "match_score: always 0.0" is a one-token answer that
+# anchors nothing, and removing it would be a second behaviour change riding on
+# this one.
 
 
 # ---------------------------------------------------------------------------
@@ -226,8 +242,10 @@ def _trial_schema() -> Dict:
             # model's figure is never read. A `const` would additionally be
             # unsupported by strict mode's subset of JSON Schema.
             "match_score": {"type": "number"},
+            # The model's only statement of which trial it is answering about.
+            # There is deliberately no rank field beside it; see the block
+            # above TRIAL_FIELDS.
             "nct_id": {"type": "string"},
-            "trial_number": {"type": "integer"},
         },
         "required": list(TRIAL_FIELDS),
         "additionalProperties": False,

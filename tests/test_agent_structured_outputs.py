@@ -14,7 +14,11 @@ THE PROMPT MOVED ONCE, DELIBERATELY, AT PROMPT_VERSION 1.1.0 -- the field rename
 and Section 5's two ordering sentences. ``tests/test_agent_prompt_version.py``
 is the guard, and its golden snapshot was regenerated through its own
 ``--update-snapshot`` flag rather than by hand. Everything else about the shape
-asked for is unchanged: the same seven fields, the same three vocabularies.
+asked for is unchanged apart from one deletion: PROMPT_VERSION 1.3.0 removed
+``trial_number`` from the contract, so the model is asked for SIX fields, and
+the three vocabularies are untouched. The payload literals below carry the six
+-- a stub does not validate against the schema, so a seventh field left here
+would be this file simulating a response the contract now forbids.
 
 WHY IT IS WORTH ENFORCING, in one sentence: a criterion status outside its arm's
 vocabulary is resolved to "not_evaluable" by ``_normalize_arm``, which is the
@@ -347,6 +351,36 @@ check("...and names the object envelope instead",
       'single key "evaluations"' in _PROMPT, True)
 check("...and asks for all trials in the one array under that key",
       'trials in the one array under "evaluations"' in _PROMPT, True)
+
+# SECTION 5 NAMES THE FIELDS IN PROSE AS WELL AS SHOWING THEM IN THE TEMPLATE,
+# AND THAT PROSE LINE WAS THE ONE STATEMENT OF TRIAL_FIELDS NOTHING CHECKED.
+# The template is compared field-for-field below and the schema is built from
+# the tuple, so those two cannot drift; the sentence a reader of the prompt
+# actually reads could, and did not have to move when trial_number was removed
+# at 1.3.0 for the response to still validate. A prompt that lists a field the
+# schema forbids is a prompt commanding output the API will reject.
+#
+# THE COMPARISON IS ON THE WHOLE LINE, NOT A SUBSTRING, and that was measured
+# rather than assumed: the first version of this check asked
+# `", ".join(TRIAL_FIELDS) in _PROMPT`, and when the 1.3.0 prompt edit was
+# reverted in an in-memory copy it still PASSED -- the seven-field line begins
+# with the six-field list, so the needle matched a prose line that named a
+# field the schema forbids. Same defect class as the unanchored plant
+# tests/test_package_invariants.py had to fix.
+_FIELD_LIST_ANCHOR = "emits them in this order:\n"
+_field_line = (_PROMPT.split(_FIELD_LIST_ANCHOR, 1)[1].split("\n", 1)[0]
+               if _FIELD_LIST_ANCHOR in _PROMPT else "<anchor not found>")
+check("non-degeneracy: Section 5's field-list line was located at all",
+      _field_line != "<anchor not found>", True)
+check("Section 5's prose field list is exactly TRIAL_FIELDS, in order, and "
+      "nothing else",
+      _field_line, ", ".join(TRIAL_FIELDS))
+# The stale spelling, named rather than inferred: trial_number is gone from the
+# contract, so no sentence may still describe seven fields or name it.
+check("...and no trial_number survives anywhere in the rendered prompt",
+      "trial_number" in _PROMPT, False)
+check("...nor the seven-field count it was part of",
+      "seven fields" in _PROMPT, False)
 
 _schema_trial = _SCHEMA["properties"][EVALUATIONS_KEY]["items"]
 _schema_trial_fields = tuple(_schema_trial["properties"])
@@ -792,7 +826,7 @@ def run_stage5(content, refusal=None, finish_reason="stop", nct_ids=("NCT0000000
 
 # ---- the ordinary path still works, and now sends the schema --------------
 _GOOD = json.dumps({EVALUATIONS_KEY: [{
-    "trial_number": 1, "nct_id": "NCT00000001", "match_score": 0.0,
+    "nct_id": "NCT00000001", "match_score": 0.0,
     "inclusion_criteria": [{"criterion": "Age 18-75",
                             "patient_value": "62", "status": "met"}],
     "exclusion_criteria": [{"criterion": "Pregnancy",
@@ -974,12 +1008,12 @@ _ORDERED = json.dumps({EVALUATIONS_KEY: [{
     "assessment": "No known disqualifiers.", "eligible": "eligible",
     "exclusion_criteria": [], "inclusion_criteria": [
         {"criterion": "Age 18-75", "patient_value": "62", "status": "met"}],
-    "match_score": 0.0, "nct_id": "NCT00000001", "trial_number": 1}]})
+    "match_score": 0.0, "nct_id": "NCT00000001"}]})
 _REVERSED = json.dumps({EVALUATIONS_KEY: [{
     "eligible": "eligible", "assessment": "No known disqualifiers.",
     "exclusion_criteria": [], "inclusion_criteria": [
         {"criterion": "Age 18-75", "patient_value": "62", "status": "met"}],
-    "match_score": 0.0, "nct_id": "NCT00000001", "trial_number": 1}]})
+    "match_score": 0.0, "nct_id": "NCT00000001"}]})
 
 _ord_result, _ord_stub = run_stage5(_ORDERED)
 _rev_result, _rev_stub = run_stage5(_REVERSED)
@@ -1015,7 +1049,7 @@ _PROSE_ELIGIBLE = json.dumps({EVALUATIONS_KEY: [{
                             "patient_value": "Documented", "status": "met"}],
     "assessment": "No known disqualifiers.",
     "exclusion_criteria": [], "match_score": 0.0,
-    "nct_id": "NCT00000001", "trial_number": 1, "eligible": "eligible"}]})
+    "nct_id": "NCT00000001", "eligible": "eligible"}]})
 _pe_result, _pe_stub = run_stage5(_PROSE_ELIGIBLE)
 check("the word 'eligible' in criterion prose does not fake an order event",
       "reasoning_order_regression" in log_events(_pe_stub.stderr), False)
@@ -1034,7 +1068,7 @@ _NOT_ELIG = json.dumps({EVALUATIONS_KEY: [{
     "assessment": "Known disqualifier: creatinine 3.4.",
     "exclusion_criteria": [], "inclusion_criteria": [
         {"criterion": "Creatinine", "patient_value": "3.4", "status": "not_met"}],
-    "match_score": 0.0, "nct_id": "NCT00000001", "trial_number": 1,
+    "match_score": 0.0, "nct_id": "NCT00000001",
     "eligible": "not_eligible"}]})
 _ne_result, _ne_stub = run_stage5(_NOT_ELIG)
 check("a not_eligible VALUE does not raise the order event",

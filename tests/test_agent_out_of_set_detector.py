@@ -21,12 +21,39 @@ TWO CHANGES, ONE OF WHICH IS THE MIRROR IMAGE OF SOMETHING ALREADY BUILT.
    separates it is the candidate set, which is known in that node and nowhere
    downstream.
 
-   The entry is now DROPPED before enrichment, counted into
-   ``inferences.hallucinated_trials``, and named in one structured log event.
-   The displaced trial is left to the reconciliation -- section 3 proves that
-   handoff happens rather than duplicating it -- and the comparison is against
-   THE CHUNK's sent set, not the node's, which section 4 drives through a real
-   proactive split.
+   The entry is now DROPPED before enrichment, counted, and named in one
+   structured log event. The displaced trial is left to the reconciliation --
+   section 3 proves that handoff happens rather than duplicating it -- and the
+   comparison is against THE CHUNK's sent set, not the node's, which section 4
+   drives through a real proactive split.
+
+   THE DROP HAS TWO CAUSES AND THEY ARE COUNTED APART. An id in the node's full
+   sent set but not in the chunk that answered is the model answering the whole
+   batch to every call of a split request: nothing is invented and nothing is
+   lost, because that id's own chunk answers it. An id in no sent set at all is
+   a fabrication. Only the second reaches
+   ``inferences.hallucinated_trials``, whose own definition is "trials never in
+   the candidate set sent to it"; the first is visible in the log event, under
+   its own count and id list. One number for both would put a provider quirk
+   into a column a reader treats as a hallucination rate, and would make a
+   split run's figure incomparable with an unsplit run's.
+
+1b. THE SAME TRIAL ANSWERED TWICE. A duplicated SENT id used to leave the stage
+   twice -- two trial_matches rows for one trial and an over-counted
+   candidates_evaluated -- because the detector cannot see it (the id WAS sent)
+   and the reconciliation cannot either (it asks whether each sent trial
+   appears AT LEAST once). Within each chunk, entries are now grouped by
+   nct_id: identical verdicts keep the FIRST and drop the rest; conflicting
+   verdicts are replaced by ONE not_evaluable entry carrying
+   NOT_EVALUABLE_CONFLICTING_DUPLICATES, because a judge that contradicts
+   itself about a trial has not evaluated it and picking either answer would be
+   recording a verdict the model itself contradicted. Compared on the
+   NORMALIZED verdict, so "Eligible" beside "eligible" is one answer typed
+   twice rather than a contradiction.
+
+   THE INVARIANT THIS FILE NOW PROVES: every sent nct_id leaves the stage
+   EXACTLY once, no unsent id ever does, under every combination of fabricated,
+   omitted and repeated.
 
 2. trial_number IS THE RETRIEVAL RANK. ``node_finalize`` assigned it by
    ``enumerate`` over the evaluations list, which Stage 5 sorts by match_score
@@ -93,8 +120,13 @@ from oncotriage.agent import deps
 from oncotriage.agent import evaluation as _evaluation_module
 from oncotriage.agent import terminal as _terminal_module
 from oncotriage.agent.evaluation import (
+    DUPLICATE_CASE_CONFLICTING,
+    DUPLICATE_CASE_IDENTICAL,
+    DUPLICATE_CASES,
     HALLUCINATION_CHECKED_CLEAN,
+    NOT_EVALUABLE_CONFLICTING_DUPLICATES,
     NOT_EVALUABLE_MODEL_OMITTED,
+    _collapse_duplicate_entries,
     _out_of_set_label,
     _partition_out_of_set,
     node_llm_classifier_evaluation,
@@ -446,34 +478,49 @@ print("\n" + "=" * 75)
 print("SECTION 1 -- _partition_out_of_set and _out_of_set_label")
 print("=" * 75)
 
+# The chunk's sent set and the node's. Equal here except where a case needs
+# them to differ, which is what makes the cross-chunk bucket observable at the
+# unit level as well as through a real split (section 4).
 _sent = {SENT, SENT_2}
 
-_in, _out = _partition_out_of_set(
-    [entry(SENT), entry(FAKE), entry(SENT_2)], _sent)
-check("entries whose id was sent are kept, in order",
+_in, _cross, _fab = _partition_out_of_set(
+    [entry(SENT), entry(FAKE), entry(SENT_2)], _sent, _sent)
+check("entries whose id this call asked about are kept, in order",
       [e["nct_id"] for e in _in], [SENT, SENT_2])
-check("...and the one that was not is reported by id", _out, [FAKE])
+check("...an id in no sent set at all is FABRICATED", _fab, [FAKE])
+check("...and nothing is miscounted as cross-chunk", _cross, [])
 
-check("an empty sent set rejects everything",
-      _partition_out_of_set([entry(SENT)], set())[1], [SENT])
+# THE SPLIT THE COLUMN DEPENDS ON. Same drop, two different faults: the id is a
+# real candidate of this run, answered by another chunk.
+_in2, _cross2, _fab2 = _partition_out_of_set(
+    [entry(SENT), entry(SENT_2)], {SENT}, {SENT, SENT_2})
+check("an id in the node's sent set but not this chunk's is CROSS-CHUNK",
+      (_cross2, _fab2), ([SENT_2], []))
+check("...and it is still dropped from what this call contributes",
+      [e["nct_id"] for e in _in2], [SENT])
+
+check("an empty chunk set rejects everything",
+      _partition_out_of_set([entry(SENT)], set(), set())[2], [SENT])
 check("an empty response reports nothing",
-      _partition_out_of_set([], _sent), ([], []))
+      _partition_out_of_set([], _sent, _sent), ([], [], []))
 
 # A MISSING id is out of set, and this is where such an entry now stops. Before
 # it reached enrichment as "", matched no trial, kept no title or phase, and
 # left the stage as a verdict about nothing.
-check("an entry with no nct_id at all is out of set",
-      _partition_out_of_set([entry(SENT, omit_id=True)], _sent)[1], ["<NoneType>"])
+check("an entry with no nct_id at all is out of set, as a fabrication",
+      _partition_out_of_set([entry(SENT, omit_id=True)], _sent, _sent)[2],
+      ["<NoneType>"])
 
 # THE UNHASHABLE CASE. `[] in {"a"}` raises TypeError, so without the isinstance
 # test the detector added to stop a class of loss would itself take the whole
-# patient's run down. Each is also, unambiguously, not one of the ids sent.
+# patient's run down. Each is also, unambiguously, not one of the ids sent, and
+# each is FABRICATED: it names no trial anywhere in this run.
 for _bad, _label in (([], "<list>"), ({}, "<dict>"), (42, "<int>"),
                      (None, "<NoneType>"), (3.5, "<float>"), (True, "<bool>")):
     _e = entry(SENT)
     _e["nct_id"] = _bad
-    check(f"a {type(_bad).__name__} nct_id is out of set and does not raise",
-          _partition_out_of_set([_e], _sent)[1], [_label])
+    check(f"a {type(_bad).__name__} nct_id is fabricated and does not raise",
+          _partition_out_of_set([_e], _sent, _sent)[2], [_label])
 
 # The label: the id and nothing else, capped.
 check("a string id is reported as itself", _out_of_set_label(SENT), SENT)
@@ -486,10 +533,72 @@ check("a long id is capped, so a sentence written into the field cannot "
 check("a non-string id is reported by TYPE, never by content",
       _out_of_set_label({"secret": "clinical prose"}), "<dict>")
 
-# Non-degeneracy: the partition can put entries on both sides at once, so the
-# assertions above are not all reading one branch.
-check("non-degeneracy: one call can produce both a keep and a drop",
-      (len(_in), len(_out)), (2, 1))
+# Non-degeneracy: the partition can put entries on all three sides at once, so
+# the assertions above are not all reading one branch.
+_in3, _cross3, _fab3 = _partition_out_of_set(
+    [entry(SENT), entry(SENT_2), entry(FAKE)], {SENT}, {SENT, SENT_2})
+check("non-degeneracy: one call can produce a keep, a cross-chunk and a "
+      "fabrication",
+      (len(_in3), len(_cross3), len(_fab3)), (1, 1, 1))
+
+
+# ===========================================================================
+# SECTION 1b -- the duplicate collapse, as a unit
+# ===========================================================================
+
+print("\n" + "=" * 75)
+print("SECTION 1b -- _collapse_duplicate_entries")
+print("=" * 75)
+
+check("the case vocabulary is closed and a caller may branch on it",
+      DUPLICATE_CASES, (DUPLICATE_CASE_IDENTICAL, DUPLICATE_CASE_CONFLICTING))
+
+_kept, _coll = _collapse_duplicate_entries([entry(SENT), entry(SENT_2)])
+check("entries with no duplicate are untouched",
+      ([e["nct_id"] for e in _kept], _coll), ([SENT, SENT_2], []))
+
+# IDENTICAL: the model said one thing twice. The FIRST is kept, which is the
+# deterministic choice rather than an arbitrary one.
+_first = entry(SENT, "eligible", assessment="the first answer")
+_second = entry(SENT, "eligible", assessment="the second answer")
+_kept, _coll = _collapse_duplicate_entries([_first, _second])
+check("identical verdicts collapse to one entry", len(_kept), 1)
+check("...and it is the FIRST one, by identity", _kept[0] is _first, True)
+check("...reported with its case and how many arrived",
+      _coll, [{"nct_id": SENT, "case": DUPLICATE_CASE_IDENTICAL, "count": 2}])
+
+# CASE AND WHITESPACE ARE NOT A CONTRADICTION. Compared on the normalized
+# verdict, so "Eligible" beside "eligible" is one answer typed twice.
+_kept, _coll = _collapse_duplicate_entries(
+    [entry(SENT, "eligible"), entry(SENT, "Eligible")])
+check("'Eligible' beside 'eligible' is identical, not conflicting",
+      [d["case"] for d in _coll], [DUPLICATE_CASE_IDENTICAL])
+
+# CONFLICTING: no entry survives. The caller replaces them with one
+# not_evaluable record; building it here would need trial metadata this helper
+# has no business knowing.
+_kept, _coll = _collapse_duplicate_entries(
+    [entry(SENT, "eligible"), entry(SENT, "not_eligible")])
+check("conflicting verdicts leave NO entry for the caller to keep", _kept, [])
+check("...reported as conflicting",
+      _coll, [{"nct_id": SENT, "case": DUPLICATE_CASE_CONFLICTING, "count": 2}])
+
+# TWO DIFFERENT UNREADABLE LABELS ARE ONE UNREADABLE ANSWER, and that choice is
+# load-bearing: it leaves the existing rule intact, where the criteria decide
+# and a stated "not_met" is still a rejection rather than being deleted by a
+# conflict verdict.
+_kept, _coll = _collapse_duplicate_entries(
+    [entry(SENT, "elligible"), entry(SENT, "maybe")])
+check("two different unreadable labels are treated as one unreadable answer",
+      [d["case"] for d in _coll], [DUPLICATE_CASE_IDENTICAL])
+
+# Three entries, and a clean one beside them.
+_kept, _coll = _collapse_duplicate_entries(
+    [entry(SENT), entry(SENT_2), entry(SENT), entry(SENT)])
+check("the count is how many entries arrived for that id",
+      _coll, [{"nct_id": SENT, "case": DUPLICATE_CASE_IDENTICAL, "count": 3}])
+check("...and the entry beside them is untouched, in order",
+      [e["nct_id"] for e in _kept], [SENT, SENT_2])
 
 
 # ===========================================================================
@@ -517,8 +626,13 @@ check("the count reaches the result dict", _res["hallucinated_trials"], 1)
 
 _ooset = log_records(_err, "out_of_set_entry")
 check("one structured event was emitted", len(_ooset), 1)
-check("...naming the count and the offending id",
-      (field(_ooset, "count"), field(_ooset, "nct_ids")), (1, [FAKE]))
+check("...naming the total, and the fabricated count and ids",
+      (field(_ooset, "count"), field(_ooset, "fabricated_count"),
+       field(_ooset, "fabricated_nct_ids")), (1, 1, [FAKE]))
+check("...and reporting the cross-chunk bucket as empty rather than omitting "
+      "it, so a reader never has to guess which bucket a drop fell in",
+      (field(_ooset, "cross_chunk_count"),
+       field(_ooset, "cross_chunk_nct_ids")), (0, []))
 check("...at WARNING, not swallowed at INFO",
       field(_ooset, "level"), "WARNING")
 check("...and it carries no field beyond the ids -- no verdict, no criteria, "
@@ -533,7 +647,8 @@ _all_fake, _af_err = run_stage5(
 check("a response that is entirely out of set counts every entry",
       _all_fake["hallucinated_trials"], 3)
 check("...and one record names all three",
-      sorted(field(log_records(_af_err, "out_of_set_entry"), "nct_ids")),
+      sorted(field(log_records(_af_err, "out_of_set_entry"),
+                   "fabricated_nct_ids")),
       ["NCT77777777", "NCT88888888", FAKE])
 check("...and the only evaluation left is the sent trial, reconciled",
       [(e["nct_id"], e["eligible"]) for e in _all_fake["evaluations"]],
@@ -582,7 +697,8 @@ check("...with the omission reason the existing reconciliation names",
 check("...by the existing reconciliation, which announced it",
       field(log_records(_sub_err, "reconciliation"), "nct_ids"), [SENT_2])
 check("...and the detector announced its own half separately",
-      field(log_records(_sub_err, "out_of_set_entry"), "nct_ids"), [FAKE])
+      field(log_records(_sub_err, "out_of_set_entry"), "fabricated_nct_ids"),
+      [FAKE])
 check("the trial that WAS answered keeps its verdict",
       verdict_of(_sub, SENT), TRIAL_VERDICT_ELIGIBLE)
 
@@ -597,6 +713,14 @@ _INVARIANT_CASES = (
     ("an entry with no id", [entry(SENT), entry(SENT_2, omit_id=True)]),
     ("a non-object beside a fabrication", ["NCT00000001", entry(FAKE)]),
     ("an empty response", []),
+    # The three faults at once, which is what the invariant is for: one id
+    # fabricated, one sent trial omitted, one sent trial answered twice.
+    ("fabricated + omitted + duplicated",
+     [entry(SENT), entry(FAKE), entry(SENT)]),
+    ("identical duplicates of both sent trials",
+     [entry(SENT), entry(SENT_2), entry(SENT), entry(SENT_2)]),
+    ("conflicting duplicates of one, clean answer for the other",
+     [entry(SENT, "eligible"), entry(SENT, "not_eligible"), entry(SENT_2)]),
 )
 for _label, _payload in _INVARIANT_CASES:
     _r, _ = run_stage5(_payload, nct_ids=(SENT, SENT_2))
@@ -604,24 +728,105 @@ for _label, _payload in _INVARIANT_CASES:
           f"unsent id ever does",
           ids_of(_r), [SENT, SENT_2])
 
-# A DUPLICATED SENT ID IS NOT THE DETECTOR'S BUSINESS, AND THE MEASUREMENT
-# BELOW RECORDS A PRE-EXISTING DEFECT RATHER THAN ASSERTING A FIX.
+# A DUPLICATED SENT ID IS NOT A FABRICATION AND IS NOW COLLAPSED.
 #
-# The id WAS in the candidate set, so it is in set, and the detector reports 0.
-# But nothing else deduplicates either: the reconciliation only asks whether
-# each sent trial appears at least once, so a model that answers twice for one
-# trial leaves TWO evaluations for it, two trial_matches rows, and a
-# candidates_evaluated that over-counts. That is true of the shipped pipeline
-# before this pass and is untouched by it -- fixing it is a decision about
-# which of two verdicts for one trial wins, which is not this pass's -- so it
-# is measured here rather than corrected, and the invariant loop above
-# deliberately does not include the case.
+# THIS PIN USED TO RECORD THE OPPOSITE. It read "PRE-EXISTING, NOT FIXED HERE:
+# a duplicated sent id leaves the stage twice" -- two evaluations for one
+# trial, two trial_matches rows, a candidates_evaluated that over-counts --
+# because the detector cannot see it (the id WAS sent) and the reconciliation
+# cannot either (it asks whether each sent trial appears AT LEAST once). That
+# defect is closed by the duplicate policy, so the pin now asserts the policy.
+# Section 3b drives both cases through the node.
 _dup, _ = run_stage5([entry(SENT), entry(SENT)], nct_ids=(SENT,))
-check("a duplicated SENT id is not counted as out of set",
+check("a duplicated SENT id is not counted as a fabrication",
       _dup["hallucinated_trials"], 0)
-check("PRE-EXISTING, NOT FIXED HERE: a duplicated sent id leaves the stage "
-      "twice",
-      ids_of(_dup), [SENT, SENT])
+check("...and it now leaves the stage exactly once", ids_of(_dup), [SENT])
+
+
+# ===========================================================================
+# SECTION 3b -- the duplicate policy, through the node
+# ===========================================================================
+
+print("\n" + "=" * 75)
+print("SECTION 3b -- identical duplicates collapse, conflicting ones do not "
+      "get to pick a winner")
+print("=" * 75)
+
+# IDENTICAL: one entry survives, and it is the FIRST answer -- checked on the
+# assessment text, because the two entries are otherwise indistinguishable and
+# an assertion that could not tell them apart would pass either way.
+_ident, _ident_err = run_stage5(
+    [entry(SENT, "eligible", inclusion=[crit("met")], assessment="first"),
+     entry(SENT, "eligible", inclusion=[crit("met")], assessment="second")],
+    nct_ids=(SENT,))
+check("identical duplicates leave one evaluation", ids_of(_ident), [SENT])
+check("...and it is the FIRST answer, not the last",
+      [e.get("assessment") for e in _ident["evaluations"]], ["first"])
+check("...which keeps its verdict", verdict_of(_ident, SENT),
+      TRIAL_VERDICT_ELIGIBLE)
+check("...and is not recorded as a non-evaluation",
+      reason_of(_ident, SENT), None)
+
+_dup_rec = log_records(_ident_err, "duplicate_answers")
+check("one structured event was emitted", len(_dup_rec), 1)
+check("...naming the identical case and its id",
+      (field(_dup_rec, "count"), field(_dup_rec, "duplicate_identical_count"),
+       field(_dup_rec, "duplicate_identical_nct_ids")), (1, 1, [SENT]))
+check("...and reporting the conflicting bucket as empty rather than omitting "
+      "it",
+      (field(_dup_rec, "duplicate_conflicting_count"),
+       field(_dup_rec, "duplicate_conflicting_nct_ids")), (0, []))
+check("...at WARNING", field(_dup_rec, "level"), "WARNING")
+
+# CONFLICTING: neither answer wins. Picking one would be recording a verdict
+# the model itself contradicted.
+_conf, _conf_err = run_stage5(
+    [entry(SENT, "eligible", inclusion=[crit("met")]),
+     entry(SENT, "not_eligible", inclusion=[crit("not_met")])],
+    nct_ids=(SENT,))
+check("conflicting duplicates leave one evaluation", ids_of(_conf), [SENT])
+check("...and it is a non-evaluation, not either of the two verdicts",
+      verdict_of(_conf, SENT), TRIAL_VERDICT_NOT_EVALUABLE)
+check("...naming the conflicting-duplicate reason",
+      reason_of(_conf, SENT), NOT_EVALUABLE_CONFLICTING_DUPLICATES)
+check("...with an assessment that says what happened",
+      "disagreed on the verdict" in str(
+          [e.get("assessment") for e in _conf["evaluations"]]), True)
+check("...and the event names it as conflicting",
+      (field(log_records(_conf_err, "duplicate_conflicting_count")
+             or log_records(_conf_err, "duplicate_answers"),
+             "duplicate_conflicting_nct_ids"),
+       field(log_records(_conf_err, "duplicate_answers"),
+             "duplicate_identical_nct_ids")), ([SENT], []))
+check("...and it is NOT reported as an omission, which would be false -- the "
+      "model answered, twice",
+      len(log_records(_conf_err, "reconciliation")), 0)
+
+# THE NEIGHBOUR IS UNTOUCHED. A duplicate pair beside a clean entry must not
+# cost the clean entry its verdict.
+_pair, _ = run_stage5(
+    [entry(SENT, "eligible", inclusion=[crit("met")]),
+     entry(SENT, "not_eligible", inclusion=[crit("not_met")]),
+     entry(SENT_2, "eligible", inclusion=[crit("met")])],
+    nct_ids=(SENT, SENT_2))
+check("a conflicting pair beside a clean entry leaves the clean one alone",
+      verdict_of(_pair, SENT_2), TRIAL_VERDICT_ELIGIBLE)
+check("...with its score still recomputed",
+      [e["match_score"] for e in _pair["evaluations"]
+       if e["nct_id"] == SENT_2], [1.0])
+check("...while the contradicted trial is not evaluable",
+      verdict_of(_pair, SENT), TRIAL_VERDICT_NOT_EVALUABLE)
+check("...and every sent id still leaves exactly once",
+      ids_of(_pair), [SENT, SENT_2])
+
+# A duplicate is not a fabrication, in either case.
+check("neither duplicate case is counted into hallucinated_trials",
+      (_ident["hallucinated_trials"], _conf["hallucinated_trials"]), (0, 0))
+
+# THREE identical answers, so "collapse" is not just "drop the second".
+_three, _ = run_stage5([entry(SENT, "eligible", inclusion=[crit("met")])] * 3,
+                       nct_ids=(SENT,))
+check("three identical answers collapse to one", ids_of(_three), [SENT])
 
 
 # ===========================================================================
@@ -676,14 +881,49 @@ check("...each with the verdict its own chunk's response carried",
 
 # EACH CALL WAS HANDED THE WHOLE ANSWER, so each one sees the other chunk's ids
 # as entries it did not ask about. Against the union of the node's sent ids the
-# count would be 0 and every trial would be evaluated TWICE.
-check("ids belonging to another chunk are out of set for the call that got "
-      "them",
-      _split["hallucinated_trials"], _SPLIT_N * (_stub.calls - 1))
-check("...reported once per call",
-      len(log_records(_split_err, "out_of_set_entry")), _stub.calls)
-check("non-degeneracy: that count is not zero",
-      _split["hallucinated_trials"] > 0, True)
+# drop would not happen at all and every trial would be evaluated TWICE.
+_split_records = log_records(_split_err, "out_of_set_entry")
+_cross_total = sum(r.get("cross_chunk_count", 0) for r in _split_records)
+_fab_total = sum(r.get("fabricated_count", 0) for r in _split_records)
+check("ids belonging to another chunk are dropped by the call that got them",
+      _cross_total, _SPLIT_N * (_stub.calls - 1))
+check("...reported once per call", len(_split_records), _stub.calls)
+check("non-degeneracy: that count is not zero", _cross_total > 0, True)
+
+# AND THEY ARE NOT FABRICATIONS. This is the whole reason for the split: every
+# one of those ids names a real candidate of this run, answered by another
+# call, so it costs the patient nothing and must not enter the column a reader
+# treats as a hallucination rate.
+check("a cross-chunk id is NOT counted as a fabrication", _fab_total, 0)
+check("...so the stored count stays 0 on a split with no invented id",
+      _split["hallucinated_trials"], 0)
+check("...and the ids named in the cross-chunk bucket are all real candidates",
+      sorted(set(sum((r.get("cross_chunk_nct_ids", [])
+                      for r in _split_records), []))) == sorted(_SPLIT_IDS),
+      True)
+
+# A FABRICATION INSIDE A SPLIT IS STILL A FABRICATION, which is what makes the
+# two buckets discriminating rather than one of them just being empty.
+_mixed_stub = StubOpenAI([entry(n, "eligible", inclusion=[crit("met")])
+                          for n in _SPLIT_IDS] + [entry(FAKE)])
+_saved = deps.set_overrides({"openai_client": _mixed_stub})
+_mixed_err = io.StringIO()
+try:
+    with contextlib.redirect_stderr(_mixed_err):
+        _mixed = node_llm_classifier_evaluation(make_state(_SPLIT_IDS))
+except Exception as _exc:               # noqa: BLE001 - a raise IS an outcome
+    _mixed = _raised_result(_exc)
+finally:
+    deps.restore_overrides(_saved)
+_mixed_records = log_records(_mixed_err.getvalue(), "out_of_set_entry")
+check("a fabricated id inside a split run is counted as fabricated, once per "
+      "call that received it",
+      _mixed["hallucinated_trials"], _mixed_stub.calls)
+check("...while the cross-chunk ids beside it stay in their own bucket",
+      sum(r.get("cross_chunk_count", 0) for r in _mixed_records),
+      _SPLIT_N * (_mixed_stub.calls - 1))
+check("...and every sent trial still leaves exactly once",
+      ids_of(_mixed), sorted(_SPLIT_IDS))
 
 
 # ===========================================================================
@@ -760,6 +1000,39 @@ check("...and the fabricated id is in no trial_matches row",
 check("...while both SENT trials are, both marked checked-and-clean",
       stored_marks("planted-run"),
       {SENT: HALLUCINATION_CHECKED_CLEAN, SENT_2: HALLUCINATION_CHECKED_CLEAN})
+
+# --- THE COLUMN IS FABRICATED-ONLY (item 3), stored -----------------------
+# The split run of section 4 dropped _SPLIT_N cross-chunk entries and invented
+# nothing. The column must therefore read 0, and the drop must be visible only
+# in the log. Written through the real terminal node and the real INSERT, not
+# read off the node's return, because the claim is about what a reader of the
+# database sees.
+_split_final, _ = run_stage6(_split, nct_ids=_SPLIT_IDS)
+store(_split_final, "cross-chunk-only")
+check("a split run whose only drops were cross-chunk stores 0 fabrications",
+      stored("cross-chunk-only"), 0)
+check("non-degeneracy: that run really did drop cross-chunk entries",
+      _cross_total, _SPLIT_N * (_stub.calls - 1))
+check("...and every sent trial got a row, all marked checked-and-clean",
+      sorted(stored_marks("cross-chunk-only")) == sorted(_SPLIT_IDS)
+      and set(stored_marks("cross-chunk-only").values()) ==
+      {HALLUCINATION_CHECKED_CLEAN}, True)
+
+_mixed_final, _ = run_stage6(_mixed, nct_ids=_SPLIT_IDS)
+store(_mixed_final, "cross-chunk-and-fabrication")
+check("...while a fabrication in the same run IS stored",
+      stored("cross-chunk-and-fabrication"), _mixed_stub.calls)
+check("non-degeneracy: the two stored counts differ, so the column "
+      "discriminates",
+      stored("cross-chunk-only") != stored("cross-chunk-and-fabrication"), True)
+
+# --- a run whose duplicates were collapsed: still 0 fabrications ----------
+_conf_final, _ = run_stage6(_conf, nct_ids=(SENT,))
+store(_conf_final, "conflicting-duplicates")
+check("a collapsed duplicate is not a fabrication in the database",
+      stored("conflicting-duplicates"), 0)
+check("...and the contradicted trial is ONE row, not two",
+      list(stored_marks("conflicting-duplicates")), [SENT])
 
 # --- a path where Stage 5 never ran: NULL --------------------------------
 # node_no_candidates ends the run before the model is called, so no comparison
@@ -888,8 +1161,10 @@ check("PRECONDITION: an unplanted copy of evaluation.py agrees with the "
                  node=_probe_module.node_llm_classifier_evaluation
                  )[0]["hallucinated_trials"], 1)
 
-_DETECTOR_CALL = """        _sent_ids = {t["trial"]["nct_id"] for t in chunk}
-        _objects, _out_of_set = _partition_out_of_set(_objects, _sent_ids)"""
+_DETECTOR_CALL = """        _chunk_ids = {t["trial"]["nct_id"] for t in chunk}
+        _objects, _cross_chunk, _fabricated = _partition_out_of_set(
+            _objects, _chunk_ids, _batch_ids)"""
+_NO_DETECTOR = "        _cross_chunk, _fabricated = [], []"
 
 # 7a. THE DEFECT ITSELF, restored: no detector at all. The fabricated entry
 #     flows on and becomes a verdict in the patient's results.
@@ -897,7 +1172,7 @@ _control(
     "7a. removing the detector lets a fabricated entry become a verdict "
     "-- CAUGHT",
     _EVAL_SRC,
-    [(_DETECTOR_CALL, "        _out_of_set = []")],
+    [(_DETECTOR_CALL, _NO_DETECTOR)],
     lambda m: verdict_of(run_stage5([entry(FAKE, "eligible",
                                            inclusion=[crit("met")]),
                                      entry(SENT)], nct_ids=(SENT,),
@@ -910,7 +1185,7 @@ _control(
 _control(
     "7b. removing the detector reports 0 fabrications -- CAUGHT",
     _EVAL_SRC,
-    [(_DETECTOR_CALL, "        _out_of_set = []")],
+    [(_DETECTOR_CALL, _NO_DETECTOR)],
     lambda m: run_stage5([entry(FAKE), entry(SENT)], nct_ids=(SENT,),
                          node=m.node_llm_classifier_evaluation
                          )[0]["hallucinated_trials"],
@@ -924,12 +1199,49 @@ _control(
     "7c. comparing against the node's sent set instead of the chunk's is "
     "CAUGHT",
     _EVAL_SRC,
-    [('        _sent_ids = {t["trial"]["nct_id"] for t in chunk}',
-      '        _sent_ids = {t["trial"]["nct_id"] for t in trials}')],
-    lambda m: (lambda r: (r["hallucinated_trials"],
-                          len(r["evaluations"])))(
-        _run_split(m.node_llm_classifier_evaluation)[0]),
+    [('        _objects, _cross_chunk, _fabricated = _partition_out_of_set(\n'
+      '            _objects, _chunk_ids, _batch_ids)',
+      '        _objects, _cross_chunk, _fabricated = _partition_out_of_set(\n'
+      '            _objects, _batch_ids, _batch_ids)')],
+    # PROBED ON THE CROSS-CHUNK COUNT AND THE EVALUATION COUNT, not on
+    # hallucinated_trials: since item 3 split the buckets, the shipped code
+    # ALSO reports 0 fabrications for this scenario, so that field can no
+    # longer discriminate here and using it would be a control satisfied by
+    # the correct code.
+    lambda m: (lambda r, e: (sum(x.get("cross_chunk_count", 0) for x in
+                                 log_records(e, "out_of_set_entry")),
+                             len(r["evaluations"])))(
+        *_run_split(m.node_llm_classifier_evaluation)[:2]),
     (0, _SPLIT_N * 2),
+)
+
+# 7c-positive. The same probe against an unplanted copy must report the drop
+# and one evaluation per sent trial, or 7c would pass for a plant that failed
+# to apply.
+_control(
+    "7c-positive. an unplanted copy drops the cross-chunk ids (7c is not "
+    "vacuous)",
+    _EVAL_SRC, [],
+    lambda m: (lambda r, e: (sum(x.get("cross_chunk_count", 0) for x in
+                                 log_records(e, "out_of_set_entry")),
+                             len(r["evaluations"])))(
+        *_run_split(m.node_llm_classifier_evaluation)[:2]),
+    (_SPLIT_N, _SPLIT_N),
+)
+
+# 7c-bis. THE CLASSIFICATION SWAPPED: a cross-chunk id counted as a
+#     fabrication. The drop is identical and the stored column is wrong, which
+#     is the entire reason the two buckets exist.
+_control(
+    "7c-bis. counting a cross-chunk id as a fabrication is CAUGHT",
+    _EVAL_SRC,
+    [("        elif raw_id in batch_ids:\n"
+      "            cross_chunk.append(_out_of_set_label(raw_id))",
+      "        elif raw_id in batch_ids:\n"
+      "            fabricated.append(_out_of_set_label(raw_id))")],
+    lambda m: _run_split(m.node_llm_classifier_evaluation)[0][
+        "hallucinated_trials"],
+    _SPLIT_N,
 )
 
 # 7d. The unhashable guard, removed. `[] in {...}` raises, and the raise is out
@@ -938,8 +1250,10 @@ _control(
     "7d. dropping the isinstance guard restores the unhashable-id crash "
     "-- CAUGHT",
     _EVAL_SRC,
-    [("        if isinstance(raw_id, str) and raw_id in sent_ids:",
-      "        if raw_id in sent_ids:")],
+    [("        if not isinstance(raw_id, str):\n"
+      "            fabricated.append(_out_of_set_label(raw_id))\n"
+      "        elif raw_id in chunk_ids:",
+      "        if raw_id in chunk_ids:")],
     lambda m: run_stage5([_UNHASHABLE_ENTRY], nct_ids=(SENT,),
                          node=m.node_llm_classifier_evaluation)[0].get("raised"),
     "TypeError",
@@ -958,15 +1272,104 @@ _control(
     [("def _out_of_set_label(raw_id) -> str:",
       "def _swallow(*a, **k):\n    return None\n\n\n"
       "def _out_of_set_label(raw_id) -> str:"),
-     ("            hallucinated_ids.extend(_out_of_set)\n"
+     ("            cross_chunk_ids.extend(_cross_chunk)\n"
       "            log.warning(",
-      "            hallucinated_ids.extend(_out_of_set)\n"
+      "            cross_chunk_ids.extend(_cross_chunk)\n"
       "            _swallow(")],
     lambda m: len(log_records(
         run_stage5([entry(FAKE), entry(SENT)], nct_ids=(SENT,),
                    node=m.node_llm_classifier_evaluation)[1],
         "out_of_set_entry")),
     0,
+)
+
+# 7e-dup. The duplicate event, silenced. Same shape as 7e and it needs its own
+#     plant: the two events are emitted at different call sites.
+_control(
+    "7e-dup. silencing the duplicate_answers event is CAUGHT",
+    _EVAL_SRC,
+    [("def _out_of_set_label(raw_id) -> str:",
+      "def _swallow(*a, **k):\n    return None\n\n\n"
+      "def _out_of_set_label(raw_id) -> str:"),
+     ('            log.warning("the model returned more than one evaluation ',
+      '            _swallow("the model returned more than one evaluation ')],
+    lambda m: len(log_records(
+        run_stage5([entry(SENT), entry(SENT)], nct_ids=(SENT,),
+                   node=m.node_llm_classifier_evaluation)[1],
+        "duplicate_answers")),
+    0,
+)
+
+# ── THE DUPLICATE POLICY (item 2) ─────────────────────────────────────────
+
+# 7p. THE DEFECT ITSELF, restored: no collapse at all. One trial leaves the
+#     stage twice, which is two trial_matches rows and an over-counted
+#     candidates_evaluated. This is exactly the state the old PRE-EXISTING pin
+#     in section 3 recorded.
+_COLLAPSE_CALL = "        _objects, _collapsed = _collapse_duplicate_entries(_objects)"
+_control(
+    "7p. removing the collapse lets one trial leave the stage twice -- CAUGHT",
+    _EVAL_SRC,
+    [(_COLLAPSE_CALL, "        _collapsed = []")],
+    lambda m: ids_of(run_stage5([entry(SENT), entry(SENT)], nct_ids=(SENT,),
+                                node=m.node_llm_classifier_evaluation)[0]),
+    [SENT, SENT],
+)
+
+# 7q. THE CONFLICT ARM, made to pick a winner. The model said both "eligible"
+#     and "not_eligible" about this trial and the run now reports one of them.
+_control(
+    "7q. letting a conflicting duplicate keep the first answer is CAUGHT",
+    _EVAL_SRC,
+    [("            collapsed.append({\"nct_id\": nct_id,\n"
+      "                              \"case\": DUPLICATE_CASE_CONFLICTING,\n"
+      "                              \"count\": len(entries)})",
+      "            collapsed.append({\"nct_id\": nct_id,\n"
+      "                              \"case\": DUPLICATE_CASE_CONFLICTING,\n"
+      "                              \"count\": len(entries)})\n"
+      "            kept.append(entries[0])")],
+    lambda m: verdict_of(run_stage5(
+        [entry(SENT, "eligible", inclusion=[crit("met")]),
+         entry(SENT, "not_eligible", inclusion=[crit("not_met")])],
+        nct_ids=(SENT,), node=m.node_llm_classifier_evaluation)[0], SENT),
+    TRIAL_VERDICT_ELIGIBLE,
+)
+
+# 7r. THE COMPARISON MADE LITERAL. On the raw label, "Eligible" beside
+#     "eligible" becomes a contradiction and a perfectly answered trial is
+#     recorded as not evaluable -- a false non-evaluation, which is the
+#     opposite failure from 7q and just as wrong.
+_control(
+    "7r. comparing raw labels instead of normalized verdicts is CAUGHT",
+    _EVAL_SRC,
+    [("        verdicts = {normalize_trial_verdict(e.get(\"eligible\"))[0]\n"
+      "                    for e in entries}",
+      "        verdicts = {repr(e.get(\"eligible\")) for e in entries}")],
+    lambda m: verdict_of(run_stage5(
+        [entry(SENT, "eligible", inclusion=[crit("met")]),
+         entry(SENT, "Eligible", inclusion=[crit("met")])],
+        nct_ids=(SENT,), node=m.node_llm_classifier_evaluation)[0], SENT),
+    TRIAL_VERDICT_NOT_EVALUABLE,
+)
+
+# 7s. The conflicting trial's replacement entry, dropped. Nothing is kept and
+#     nothing replaces it, so the reconciliation picks the trial up and calls
+#     it OMITTED -- a false statement: the model answered, twice.
+_control(
+    "7s. dropping the replacement entry mislabels a contradiction as an "
+    "omission -- CAUGHT",
+    _EVAL_SRC,
+    [("            unevaluable.extend(\n"
+      "                _unevaluable_entry(_trial_by_id[nct_id],\n"
+      "                                   NOT_EVALUABLE_CONFLICTING_DUPLICATES)\n"
+      "                for nct_id in _conflicting\n"
+      "            )",
+      "            pass")],
+    lambda m: reason_of(run_stage5(
+        [entry(SENT, "eligible", inclusion=[crit("met")]),
+         entry(SENT, "not_eligible", inclusion=[crit("not_met")])],
+        nct_ids=(SENT,), node=m.node_llm_classifier_evaluation)[0], SENT),
+    NOT_EVALUABLE_MODEL_OMITTED,
 )
 
 # 7f. The per-trial stamp, removed: a stored row can no longer say it was

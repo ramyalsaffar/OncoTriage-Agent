@@ -90,7 +90,15 @@ from oncotriage.utils import get_age_reference_date
 # single JSON object under the key "evaluations" rather than a bare array, and a
 # template whose fields are in the alphabetical order the decoder emits. MIDDLE
 # number: the output contract the prompt states is part of what it means.
-PROMPT_VERSION = "1.2.0"
+# 1.3.0 removed `trial_number` from the output contract: from Section 5's field
+# list, from both objects of the JSON template, and from the response schema, so
+# the model can no longer emit it -- and removed the ordinal from the trial
+# headers in the USER message, so it can no longer read one either. A rank
+# position shown to a judge is a bias channel, and this one bought nothing: the
+# value was overwritten by node_finalize from the sent list and never read.
+# MIDDLE number: what the prompt asks the model to produce, and what it shows
+# the model about the candidates, are both part of what it means.
+PROMPT_VERSION = "1.3.0"
 
 
 def prompt_sha256(rendered_text: str) -> str:
@@ -381,9 +389,11 @@ SECTION 5 -- OUTPUT FORMAT
 Return ONLY a valid JSON object with the single key "evaluations". No markdown fences. No text outside the object.
 Evaluate ALL {trial_count} trials in the one array under "evaluations".
 
-Every trial object carries exactly these seven fields, and the response format
+Every trial object carries exactly these six fields, and the response format
 emits them in this order:
-assessment, eligible, exclusion_criteria, inclusion_criteria, match_score, nct_id, trial_number
+assessment, eligible, exclusion_criteria, inclusion_criteria, match_score, nct_id
+
+nct_id: the trial's NCT identifier, copied exactly from the trial's header line. It is the only identity of the trial you are answering about.
 
 match_score: always 0.0
 
@@ -413,8 +423,7 @@ JSON template:
         {{"criterion": "ECOG 0-1", "patient_value": "Not in patient record", "status": "not_evaluable"}}
       ],
       "match_score": 0.0,
-      "nct_id": "NCT12345678",
-      "trial_number": 1
+      "nct_id": "NCT12345678"
     }},
     {{
       "assessment": "Known disqualifier: Creatinine 3.4 mg/dL contradicts inclusion criterion requiring creatinine ≤ 1.5 x ULN.",
@@ -427,8 +436,7 @@ JSON template:
         {{"criterion": "ECOG 0-1", "patient_value": "Not in patient record", "status": "not_evaluable"}}
       ],
       "match_score": 0.0,
-      "nct_id": "NCT87654321",
-      "trial_number": 2
+      "nct_id": "NCT87654321"
     }}
   ]
 }}

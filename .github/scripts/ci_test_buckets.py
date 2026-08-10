@@ -112,8 +112,9 @@ BUCKETS = {
         _A, None, "ran green in 1.8s once the two vendored MeSH lookups are seeded"),
     "test_agent_out_of_set_detector.py": (
         _A, None,
-        "ran green in 2.2s, 103 checks; Stage 5's out-of-set detector and the "
-        "retrieval-rank trial_number. Every model response is a literal served "
+        "ran green in 2.4s, 167 checks; Stage 5's out-of-set detector (split "
+        "into fabricated vs cross-chunk), the duplicate-answer collapse and "
+        "the retrieval-rank trial_number. Every model response is a literal served "
         "through a deps stub, the database is a temp file every log_inference "
         "call is pointed at explicitly, and every plant goes into an in-memory "
         "copy -- no network, no keys, no spend, no git, no corpus"),

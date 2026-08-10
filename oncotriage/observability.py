@@ -531,6 +531,22 @@ LOGGABLE_FIELDS = frozenset({
     "mesh_filter_applied",
     # A LIST of public trial identifiers. Same argument as nct_id.
     "nct_ids",
+    # Stage 5's out-of-set detector reports its drops in TWO buckets, because
+    # they are two different faults: `fabricated` names an id that is in no
+    # candidate set of this run at all (the clinical fault, and the only one
+    # written to inferences.hallucinated_trials), `cross_chunk` names a real
+    # candidate belonging to another chunk of a split request (a provider
+    # quirk that costs the patient nothing). One count and one id list each;
+    # `count` beside them is the total. Same argument as nct_ids for the lists.
+    "fabricated_count", "fabricated_nct_ids",
+    "cross_chunk_count", "cross_chunk_nct_ids",
+    # And its duplicate-answer collapse reports the two cases apart for the
+    # same reason: identical verdicts are one answer typed twice (the first is
+    # kept), conflicting verdicts are the model contradicting itself (the trial
+    # becomes not evaluable). A single count could not tell a reader which of
+    # those a run saw, and only the second is a quality signal.
+    "duplicate_identical_count", "duplicate_identical_nct_ids",
+    "duplicate_conflicting_count", "duplicate_conflicting_nct_ids",
 
     # --- identifiers of PUBLIC objects -------------------------------------
     # An NCT ID names a trial on a public registry. It is not patient data.
