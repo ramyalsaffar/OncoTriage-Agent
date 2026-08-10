@@ -886,7 +886,7 @@ CREATE TABLE IF NOT EXISTS trial_matches (
     mesh_boost_tier TEXT,
     match_score REAL,
     eligible TEXT,
-    explanation TEXT,
+    assessment TEXT,
     criterion_details TEXT,
     hallucinated INTEGER,
     FOREIGN KEY (inference_id) REFERENCES inferences(id)
@@ -1450,7 +1450,7 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 INSERT INTO trial_matches (
                     inference_id, nct_id, trial_title, trial_phase,
                     trial_number, rerank_score, rerank_score_raw, mesh_boost, mesh_boost_tier,
-                    match_score, eligible, explanation, criterion_details,
+                    match_score, eligible, assessment, criterion_details,
                     score_confirmed, score_denominator, criteria_not_applicable,
                     hallucinated
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1466,7 +1466,7 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 match.get("mesh_boost_tier"),
                 match.get("match_score", 0.0),
                 match.get("eligible", "not_eligible"),
-                match.get("explanation", ""),
+                match.get("assessment", ""),
                 criterion_json,
                 match.get("score_confirmed"),
                 match.get("score_denominator"),

@@ -565,7 +565,7 @@ def _unevaluable_entry(trial_obj: Dict, reason: str) -> Dict:
         "criteria_not_applicable": 0,
         "criteria": [],
         "not_evaluable_reason": reason,
-        "explanation": {
+        "assessment": {
             NOT_EVALUABLE_TRUNCATION_FLOOR:
                 "The model's response exceeded its output ceiling with this "
                 "trial sent on its own, so there was no smaller batch to fall "
@@ -775,6 +775,8 @@ CLINICAL TRIALS:
     response_text = ""
     calls_made = 0
     _finish_reason_warned = False
+    # Once per run, not once per chunk. See the guard below the parse.
+    _reasoning_order_warned = False
 
     while pending:
         chunk, depth = pending.pop()
@@ -1069,6 +1071,48 @@ CLINICAL TRIALS:
             }
 
         parsed = _unwrapped
+
+        # ── The reasoning-first design, checked on the bytes ────────────────
+        #
+        # ALPHABETICAL KEY EMISSION IS OBSERVED BEHAVIOUR OF THE CURRENT MODEL,
+        # NOT A DOCUMENTED API GUARANTEE. The field is named "assessment" so
+        # that it sorts before "eligible" and the model writes its reasoning
+        # before its verdict; nothing in the Structured Outputs contract
+        # promises that ordering, so a provider change could silently put the
+        # verdict first again and every symptom would be a slightly worse
+        # classifier with no signal anywhere. This turns that into a visible
+        # event.
+        #
+        # On the TEXT, not on the parsed dict: json.loads preserves insertion
+        # order, but the whole question is what the model emitted, and re-asking
+        # the parsed object is one indirection further from the bytes. Two
+        # str.find calls on a string already in memory.
+        #
+        # Both needles are quoted, which is what makes them KEY positions:
+        # '"eligible"' does not match inside '"not_eligible"' (the preceding
+        # character is an underscore, not a quote), and a key precedes its own
+        # value, so the first hit of each is the first trial object's key.
+        # Either needle absent means the shape is not what this guard describes
+        # and it says nothing -- the schema's `required` is what enforces
+        # presence, and a guard that also reported absence would fire twice for
+        # one fault.
+        #
+        # WARN ONLY, ONCE PER RUN. It never fails the run: the response is
+        # valid, the verdicts are usable, and refusing them would trade a
+        # quality signal for an outage. Once, because a split batch would
+        # otherwise report the identical finding per chunk.
+        if not _reasoning_order_warned:
+            _first_assessment = chunk_text.find('"assessment"')
+            _first_eligible = chunk_text.find('"eligible"')
+            if (_first_assessment >= 0 and _first_eligible >= 0
+                    and _first_assessment > _first_eligible):
+                _reasoning_order_warned = True
+                log.warning("the model emitted its verdict before its "
+                            "assessment; the reasoning-first design of the "
+                            "Stage 5 prompt is no longer in force and the "
+                            "field name may need to change again", stage=5,
+                            event="reasoning_order_regression",
+                            response_chars=len(chunk_text))
 
         # A well-formed response is a list OF OBJECTS, and only the list half
         # was checked. See MALFORMED_EVALUATION_ENTRIES for why a non-object is
@@ -1600,11 +1644,11 @@ CLINICAL TRIALS:
                 _record_score(eval_result, inc, exc, eval_result.get("nct_id", ""))
  
                 # Update explanation prefix
-                original_explanation = eval_result.get("explanation", "")
-                if original_explanation.startswith("Known disqualifier:"):
-                    eval_result["explanation"] = (
+                original_assessment = eval_result.get("assessment", "")
+                if original_assessment.startswith("Known disqualifier:"):
+                    eval_result["assessment"] = (
                         "No known disqualifiers. [Validator corrected absent-data disqualification.] "
-                        + original_explanation
+                        + original_assessment
                     )
             # else: legitimate disqualifiers remain, trial stays not_eligible
  

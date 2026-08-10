@@ -385,7 +385,7 @@ def render_overview_tab(df):
         filtered_tm = trial_matches[trial_matches['inference_id'].isin(filtered_ids)].copy()
         
         if not filtered_tm.empty:
-            explanations = filtered_tm['explanation'].fillna('').str.lower()
+            explanations = filtered_tm['assessment'].fillna('').str.lower()
             
             # Keywords indicating missing/unavailable clinical data in GPT-4o explanations
             missing_data_keywords = {

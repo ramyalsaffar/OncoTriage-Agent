@@ -78,7 +78,14 @@ from oncotriage.utils import get_age_reference_date
 # 1.0.0 is the template as it stood when it was extracted from
 # oncotriage/agent/evaluation.py. It is NOT a claim that the wording is new;
 # the wording is unchanged and was proved byte-identical.
-PROMPT_VERSION = "1.0.0"
+#
+# 1.1.0 renamed the output field "explanation" to "assessment" so that strict
+# Structured Outputs' alphabetical key emission puts the model's reasoning
+# before its verdict, and rewrote Section 5's two ordering sentences to describe
+# that mechanism instead of commanding an order the model no longer controls.
+# MIDDLE number: the reasoning-first design is what the prompt MEANS to the
+# model, and this restores it.
+PROMPT_VERSION = "1.1.0"
 
 
 def prompt_sha256(rendered_text: str) -> str:
@@ -369,8 +376,9 @@ SECTION 5 -- OUTPUT FORMAT
 Return ONLY a valid JSON array. No markdown fences. No text outside the array.
 Evaluate ALL {trial_count} trials in one JSON array.
 
-Fields MUST appear in this exact order:
-trial_number, nct_id, match_score, inclusion_criteria, exclusion_criteria, explanation, eligible
+Every trial object carries exactly these seven fields, and the response format
+emits them in this order:
+assessment, eligible, exclusion_criteria, inclusion_criteria, match_score, nct_id, trial_number
 
 match_score: always 0.0
 
@@ -381,7 +389,7 @@ inclusion_criteria and exclusion_criteria:
 
 patient_value: exact data point/s from patient record, OR "Not in patient record", OR "Not applicable -- [reason]". No interpretive statements.
 
-explanation MUST be written BEFORE eligible and determines it:
+assessment is emitted BEFORE eligible, so you write it first and it determines the verdict. Reason in assessment, then conclude in eligible; do not decide the verdict first and describe it afterwards.
     For "eligible" trials: begin with "No known disqualifiers."
     For "not_eligible" trials: begin with "Known disqualifier:" then quote the specific patient data.
     For "not_evaluable" trials: begin with "Not evaluable:" then state what was missing from the trial's criteria text.
@@ -399,7 +407,7 @@ JSON template:
     "exclusion_criteria": [
       {{"criterion": "Active autoimmune disease", "patient_value": "Not in patient record", "status": "not_evaluable"}}
     ],
-    "explanation": "No known disqualifiers. Age confirmed. ECOG and autoimmune status not documented.",
+    "assessment": "No known disqualifiers. Age confirmed. ECOG and autoimmune status not documented.",
     "eligible": "eligible"
   }},
   {{
@@ -413,7 +421,7 @@ JSON template:
     "exclusion_criteria": [
       {{"criterion": "Active hepatitis B", "patient_value": "Not in patient record", "status": "not_evaluable"}}
     ],
-    "explanation": "Known disqualifier: Creatinine 3.4 mg/dL contradicts inclusion criterion requiring creatinine ≤ 1.5 x ULN.",
+    "assessment": "Known disqualifier: Creatinine 3.4 mg/dL contradicts inclusion criterion requiring creatinine ≤ 1.5 x ULN.",
     "eligible": "not_eligible"
   }}
 ]

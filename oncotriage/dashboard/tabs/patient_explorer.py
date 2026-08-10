@@ -121,7 +121,7 @@ def render_patient_explorer_tab(df):
                 'Phase':       t.get('trial_phase', ''),
                 'Status':      status,
                 'Match Score':  f"{t['match_score'] * 100:.0f}%",
-                'Explanation': t.get('explanation', ''),
+                'Assessment': t.get('assessment', ''),
             })
     
     export_df = pd.DataFrame(export_rows)
@@ -286,7 +286,7 @@ def render_patient_explorer_tab(df):
                 return default
             
             display_df = patient_matches[[
-                'Status', 'nct_id', 'trial_title', 'trial_phase', 'match_score', 'explanation'
+                'Status', 'nct_id', 'trial_title', 'trial_phase', 'match_score', 'assessment'
             ]].copy()
             
             display_df = display_df.rename(columns={
@@ -294,7 +294,7 @@ def render_patient_explorer_tab(df):
                 'trial_title': 'Trial Title',
                 'trial_phase': 'Phase',
                 'match_score': 'Match Score',
-                'explanation': 'Explanation'
+                'assessment': 'Assessment'
             })
             
             # Convert match score to percentage

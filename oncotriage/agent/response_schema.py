@@ -26,13 +26,17 @@ DISAGREEMENT AND IT IS NOT RESOLVABLE HERE.
     which is constrained by the schema at decode time, not by the prose --
     emits ``{"evaluations": [...]}``.
 
-    The wrapper is therefore forced by the API, not chosen. The prompt was left
-    byte-identical because changing it was explicitly out of scope for the pass
-    that added this file, and because the schema is what actually binds: a
-    prompt sentence the decoder overrides is stale prose, not a live
-    instruction. IT IS STILL STALE PROSE, and correcting Section 5 (with a
-    PROMPT_VERSION bump and a snapshot regeneration) is the top-ranked
-    follow-up this file records.
+    The wrapper is therefore forced by the API, not chosen, and the schema is
+    what actually binds: a prompt sentence the decoder overrides is stale prose,
+    not a live instruction.
+
+    THE ARRAY SENTENCE IS STILL STALE AND IS STILL A FOLLOW-UP. PROMPT_VERSION
+    1.1.0 corrected Section 5's two ORDERING sentences, which were the ones with
+    a live consequence -- they claimed the model controlled a field order it no
+    longer controls. "Return ONLY a valid JSON array" was left alone in that
+    pass because it was out of its scope, so Section 5 still asks for an array
+    while the decoder emits an object. It costs nothing today and it is one more
+    place the prompt disagrees with what is sent.
 
     ``oncotriage/agent/evaluation.py`` accepts BOTH shapes -- see
     ``_unwrap_evaluations`` there -- so a bare array (an old fixture, a run with
@@ -85,8 +89,12 @@ from oncotriage.agent.state import TRIAL_VERDICTS
 # one call, $0.002400) came back with the trial object's keys in STRICTLY
 # ALPHABETICAL order instead:
 #
-#     eligible, exclusion_criteria, explanation, inclusion_criteria,
+#     assessment, eligible, exclusion_criteria, inclusion_criteria,
 #     match_score, nct_id, trial_number
+#
+# (measured with the field still named `explanation`, which sorted between
+# exclusion_criteria and inclusion_criteria; the rename to `assessment` is
+# what moved it to the front)
 #
 # The key SET is exactly right and every enum is in vocabulary; only the order
 # moved, and it moved away from both the schema's `properties` order and the
@@ -123,7 +131,7 @@ TRIAL_FIELDS: Tuple[str, ...] = (
     "match_score",
     "inclusion_criteria",
     "exclusion_criteria",
-    "explanation",
+    "assessment",
     "eligible",
 )
 
@@ -224,7 +232,7 @@ def _trial_schema() -> Dict:
                 "type": "array",
                 "items": _criterion_schema(EXCLUSION_STATUSES),
             },
-            "explanation": {"type": "string"},
+            "assessment": {"type": "string"},
             "eligible": {"type": "string", "enum": list(TRIAL_VERDICT_ENUM)},
         },
         "required": list(TRIAL_FIELDS),

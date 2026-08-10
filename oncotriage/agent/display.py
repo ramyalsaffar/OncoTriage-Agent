@@ -93,7 +93,7 @@ def display_match_results(result: Dict):
             console.out(f"NOT ELIGIBLE — Top 3 Near-Misses:\n")
             for idx, match in enumerate(near_misses[:3], 1):
                 console.out(f"  {idx}. {match.get('nct_id', 'N/A')} | {match.get('title', 'No title')}")
-                console.out(f"     {match.get('explanation', 'N/A')}")
+                console.out(f"     {match.get('assessment', 'N/A')}")
                 console.out()
     elif near_misses:
         # Matches exist, but also show count of rejected trials
@@ -104,7 +104,7 @@ def display_match_results(result: Dict):
     if not_evaluable:
         console.out(f"NOT EVALUABLE — could not be assessed ({len(not_evaluable)}):\n")
         for trial in not_evaluable:
-            console.out(f"  - {trial.get('nct_id', 'N/A')} | {trial.get('explanation', 'No criteria returned.')}")
+            console.out(f"  - {trial.get('nct_id', 'N/A')} | {trial.get('assessment', 'No criteria returned.')}")
         console.out()
 
 
@@ -118,7 +118,7 @@ def _print_match_detail(idx: int, match: Dict):
     """
     console.out(f"  {idx}. {match.get('nct_id', 'N/A')} | {match.get('title', 'No title')}")
     console.out(f"     Score: {match.get('match_score', 0):.2f} | Status: {match.get('eligible', 'unknown')}")
-    console.out(f"     {match.get('explanation', 'N/A')}")
+    console.out(f"     {match.get('assessment', 'N/A')}")
 
     # Show criteria that need verification (not_evaluable from inclusions)
     needs_verification = [

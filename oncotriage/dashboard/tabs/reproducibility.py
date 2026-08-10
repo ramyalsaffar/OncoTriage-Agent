@@ -461,7 +461,7 @@ def _classify_failure_modes(flipped_comps_enriched, patient_groups,
 
         explanation = ''
         if not rej_matches.empty:
-            explanation = str(rej_matches.iloc[0].get('explanation', ''))
+            explanation = str(rej_matches.iloc[0].get('assessment', ''))
 
         explanation_lower = explanation.lower()
         matched_modes = []
@@ -479,7 +479,7 @@ def _classify_failure_modes(flipped_comps_enriched, patient_groups,
             'patient_id': pid,
             'nct_id': nct,
             'flip_type': row['flip_type'],
-            'explanation': explanation,
+            'assessment': explanation,
             'failure_modes': matched_modes,
         })
 
@@ -1146,7 +1146,7 @@ def render_reproducibility_tab(df):
         if not other_flips.empty:
             with st.expander(f"'Other' flips ({len(other_flips)}) — uncategorized rejection reasons"):
                 for i, (_, row) in enumerate(other_flips.iterrows(), 1):
-                    st.markdown(f"**{i}.** [{row['nct_id']}] {row['explanation']}")
+                    st.markdown(f"**{i}.** [{row['nct_id']}] {row['assessment']}")
         
         st.markdown("")
         
@@ -1249,7 +1249,7 @@ def render_reproducibility_tab(df):
                 run_explanations = {}
 
                 for run_idx, (_, tm_row) in enumerate(flip_matches.iterrows(), 1):
-                    run_explanations[run_idx] = tm_row.get('explanation', '')
+                    run_explanations[run_idx] = tm_row.get('assessment', '')
                     run_criteria[run_idx] = _parse_criterion_details(tm_row)
 
                 all_criteria_keys = _ordered_criterion_keys(run_criteria)

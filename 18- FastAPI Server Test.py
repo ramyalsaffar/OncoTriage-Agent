@@ -532,7 +532,7 @@ def main():
                         print(f"     Phase: {m.get('phase', 'N/A')}")
                         print(f"     Match Score: {m.get('match_score', 'N/A')}")
                         print(f"     Eligible: {m.get('eligible', 'N/A')}")
-                        print(f"     Explanation: {m.get('explanation', 'N/A')[:200]}")
+                        print(f"     Explanation: {m.get('assessment', 'N/A')[:200]}")
                 else:
                     print("\nNo matches found.")
                     print("\nFull result for inspection:")
@@ -602,7 +602,7 @@ def main():
                         print(f"     Phase: {m.get('phase', 'N/A')}")
                         print(f"     Match Score: {m.get('match_score', 'N/A')}")
                         print(f"     Eligible: {m.get('eligible', 'N/A')}")
-                        print(f"     Explanation: {m.get('explanation', 'N/A')[:200]}")
+                        print(f"     Explanation: {m.get('assessment', 'N/A')[:200]}")
                 else:
                     print("No matches — printing full result:")
                     print(json.dumps(res, indent=2))

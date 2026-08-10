@@ -420,11 +420,11 @@ def bucket_of(final_result, nct_id="NCT00000001"):
     return "<absent>"
 
 
-def entry(nct_id, eligible, inclusion=(), exclusion=(), explanation="text",
+def entry(nct_id, eligible, inclusion=(), exclusion=(), assessment="text",
           omit_verdict=False):
     """One evaluation entry as the model returns it."""
     payload = {
-        "nct_id": nct_id, "match_score": 0.5, "explanation": explanation,
+        "nct_id": nct_id, "match_score": 0.5, "assessment": assessment,
         "inclusion_criteria": list(inclusion),
         "exclusion_criteria": list(exclusion),
     }
@@ -557,7 +557,7 @@ print("=" * 75)
 _misspelled, _mis_err = run_stage5([
     entry("NCT00000001", "elligible",
           inclusion=[crit("met")], exclusion=[crit("not_violated")],
-          explanation="No known disqualifiers."),
+          assessment="No known disqualifiers."),
 ])
 check("a misspelled verdict over real, non-disqualifying criteria "
       "becomes not_evaluable",

@@ -757,7 +757,7 @@ for _i, (_nct, _phase, _eligible, _score) in enumerate([
     _cursor.execute(
         "INSERT INTO trial_matches (inference_id, nct_id, trial_title, "
         "trial_phase, trial_number, rerank_score, match_score, eligible, "
-        "explanation, criterion_details) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "assessment, criterion_details) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (_INFERENCE_IDS["P-CONSISTENT-A" if _i < 2 else "P-CONSISTENT-B"],
          _nct, f"Trial {_nct}", _phase, _i + 1, 3.5 - _i * 0.1, _score,
          _eligible, "because", '{"inclusion": [], "exclusion": []}'))

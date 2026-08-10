@@ -6,9 +6,15 @@
 WHAT THE CHANGE UNDER TEST IS. ``oncotriage/agent/evaluation.py`` now sends a
 strict ``json_schema`` ``response_format``, built by
 ``oncotriage/agent/response_schema.py``, on the one call it makes to the
-matching model. The prompt is BYTE-IDENTICAL -- ``tests/test_agent_prompt_version.py``
-is the guard on that and it passes untouched -- so this changes how the shape is
-enforced and not which shape is asked for.
+matching model, and the output field the model reasons in is named
+``assessment`` so that strict mode's alphabetical key emission puts that
+reasoning BEFORE the verdict.
+
+THE PROMPT MOVED ONCE, DELIBERATELY, AT PROMPT_VERSION 1.1.0 -- the field rename
+and Section 5's two ordering sentences. ``tests/test_agent_prompt_version.py``
+is the guard, and its golden snapshot was regenerated through its own
+``--update-snapshot`` flag rather than by hand. Everything else about the shape
+asked for is unchanged: the same seven fields, the same three vocabularies.
 
 WHY IT IS WORTH ENFORCING, in one sentence: a criterion status outside its arm's
 vocabulary is resolved to "not_evaluable" by ``_normalize_arm``, which is the
@@ -768,7 +774,7 @@ _GOOD = json.dumps({EVALUATIONS_KEY: [{
     "exclusion_criteria": [{"criterion": "Pregnancy",
                             "patient_value": "Not applicable -- male",
                             "status": "not_violated"}],
-    "explanation": "No known disqualifiers.", "eligible": "eligible"}]})
+    "assessment": "No known disqualifiers.", "eligible": "eligible"}]})
 
 _ok_result, _ok_stub = run_stage5(_GOOD)
 check("the wrapper-object response parses end to end",
@@ -915,6 +921,89 @@ check("...whereas the parse failure names the exception type",
       any(r.get("error_type") == "JSONDecodeError"
           for r in log_records(_parse_stderr)), True)
 
+# ---- the reasoning-first order guard --------------------------------------
+#
+# The field is named `assessment` so alphabetical emission puts it before
+# `eligible`. That ordering is OBSERVED behaviour of the current model, not a
+# documented API guarantee, so the guard turns a silent regression into an
+# event. It must warn and must NOT fail the run.
+
+check("assessment sorts before eligible -- the whole reason for the name",
+      "assessment" < "eligible", True)
+
+_ORDERED = json.dumps({EVALUATIONS_KEY: [{
+    "assessment": "No known disqualifiers.", "eligible": "eligible",
+    "exclusion_criteria": [], "inclusion_criteria": [
+        {"criterion": "Age 18-75", "patient_value": "62", "status": "met"}],
+    "match_score": 0.0, "nct_id": "NCT00000001", "trial_number": 1}]})
+_REVERSED = json.dumps({EVALUATIONS_KEY: [{
+    "eligible": "eligible", "assessment": "No known disqualifiers.",
+    "exclusion_criteria": [], "inclusion_criteria": [
+        {"criterion": "Age 18-75", "patient_value": "62", "status": "met"}],
+    "match_score": 0.0, "nct_id": "NCT00000001", "trial_number": 1}]})
+
+_ord_result, _ord_stub = run_stage5(_ORDERED)
+_rev_result, _rev_stub = run_stage5(_REVERSED)
+
+check("the ordinary (assessment-first) response raises no order event",
+      "reasoning_order_regression" in log_events(_ord_stub.stderr), False)
+check("a verdict-before-assessment response DOES raise the event",
+      "reasoning_order_regression" in log_events(_rev_stub.stderr), True)
+# NON-DEGENERACY: both runs are otherwise identical and both SUCCEEDED, so the
+# difference above is the key order and nothing else.
+check("non-degeneracy: both responses parsed and produced a verdict",
+      (len(_ord_result.get("evaluations", [])),
+       len(_rev_result.get("evaluations", []))), (1, 1))
+check("the guard does NOT fail the run: the verdict still comes through",
+      at(_rev_result.get("evaluations", []), 0).get("eligible")
+      if _rev_result.get("evaluations") else "<absent>", "eligible")
+check("...and no error is set by the guard", _rev_result.get("error"), "")
+# THE NEEDLES ARE QUOTED, AND THE FIRST VERSION OF THIS CHECK COULD NOT SEE
+# WHETHER THEY WERE. It fed a response whose verdict key came last and whose
+# value was "not_eligible", and asserted no event -- which passes with an
+# UNQUOTED needle too, because a key always precedes its own value, so the
+# first hit is the key either way. The revert harness reported it as MISSED,
+# which is the only reason it was found: the assertion was vacuous.
+#
+# This one discriminates. The word "eligible" appears inside a CRITERION placed
+# before "assessment", so:
+#   quoted   -- the first '"eligible"' is the key, which is after assessment
+#               -> no event, correct
+#   unquoted -- the first 'eligible' is inside the criterion prose, before
+#               assessment -> a false event on a perfectly ordered response
+_PROSE_ELIGIBLE = json.dumps({EVALUATIONS_KEY: [{
+    "inclusion_criteria": [{"criterion": "Not eligible for curative surgery",
+                            "patient_value": "Documented", "status": "met"}],
+    "assessment": "No known disqualifiers.",
+    "exclusion_criteria": [], "match_score": 0.0,
+    "nct_id": "NCT00000001", "trial_number": 1, "eligible": "eligible"}]})
+_pe_result, _pe_stub = run_stage5(_PROSE_ELIGIBLE)
+check("the word 'eligible' in criterion prose does not fake an order event",
+      "reasoning_order_regression" in log_events(_pe_stub.stderr), False)
+# NON-DEGENERACY: the prose really is positioned where an unquoted needle would
+# trip, i.e. before the assessment key.
+check("non-degeneracy: the prose hit really does precede the assessment key",
+      (_PROSE_ELIGIBLE.find("eligible") < _PROSE_ELIGIBLE.find('"assessment"'),
+       _PROSE_ELIGIBLE.find('"eligible"') > _PROSE_ELIGIBLE.find('"assessment"')),
+      (True, True))
+check("non-degeneracy: that response parsed and produced a verdict",
+      at(_pe_result.get("evaluations", []), 0).get("eligible")
+      if _pe_result.get("evaluations") else "<absent>", "eligible")
+
+# And a not_eligible VALUE is still not mistaken for the key.
+_NOT_ELIG = json.dumps({EVALUATIONS_KEY: [{
+    "assessment": "Known disqualifier: creatinine 3.4.",
+    "exclusion_criteria": [], "inclusion_criteria": [
+        {"criterion": "Creatinine", "patient_value": "3.4", "status": "not_met"}],
+    "match_score": 0.0, "nct_id": "NCT00000001", "trial_number": 1,
+    "eligible": "not_eligible"}]})
+_ne_result, _ne_stub = run_stage5(_NOT_ELIG)
+check("a not_eligible VALUE does not raise the order event",
+      "reasoning_order_regression" in log_events(_ne_stub.stderr), False)
+check("non-degeneracy: that response really did carry not_eligible",
+      at(_ne_result.get("evaluations", []), 0).get("eligible")
+      if _ne_result.get("evaluations") else "<absent>", "not_eligible")
+
 # ---- the router terminates on it -----------------------------------------
 _ref_state = {"error": _ref_result.get("error"),
               "llm_classifier_retries": 0,
@@ -979,8 +1068,8 @@ check("control 8a: a dropped additionalProperties three levels down is caught",
 # 8b -- an incomplete `required`, the other half of strict mode.
 _c = copy.deepcopy(_SCHEMA)
 _req = _c["properties"][EVALUATIONS_KEY]["items"]["required"]
-if "explanation" in _req:
-    _req.remove("explanation")
+if "assessment" in _req:
+    _req.remove("assessment")
 check("control 8b: a property missing from required is caught",
       len(_strict_defects(_c)) >= 1, True)
 

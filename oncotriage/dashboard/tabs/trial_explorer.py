@@ -177,7 +177,7 @@ def render_trial_explorer_tab(df):
         ascending=[True, False]
     )
     
-    display_cols = ['Status', 'patient_id', 'age', 'sex', 'primary_condition', 'Match Score', 'explanation']
+    display_cols = ['Status', 'patient_id', 'age', 'sex', 'primary_condition', 'Match Score', 'assessment']
     display_df = patient_details[display_cols].copy()
     
     display_df.columns = ['Status', 'Patient ID', 'Age', 'Sex', 'Primary Condition', 'Match Score', 'Explanation']

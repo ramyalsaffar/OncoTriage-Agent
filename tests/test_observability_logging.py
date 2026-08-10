@@ -354,7 +354,7 @@ _CLINICAL = ["condition_display", "conditions", "lab_value", "labs",
              "medications", "patient_summary", "llm_classifier_prompt", "prompt",
              "response_preview", "birth_date", "patient_trees", "mesh_terms",
              "expanded_query", "rerank_queries", "disease_query",
-             "patient_stage", "criterion_details", "explanation"]
+             "patient_stage", "criterion_details", "assessment"]
 check("4b     no clinical-payload name is on the allowlist",
       sorted(n for n in _CLINICAL if n in LOGGABLE_FIELDS), [])
 
@@ -639,7 +639,7 @@ class _Qdrant:
 
 class _Msg:
     content = json.dumps([{"nct_id": f"NCT0000000{i}", "eligible": "eligible",
-                           "explanation": "ok", "criteria_details": []}
+                           "assessment": "ok", "criteria_details": []}
                           for i in range(1, 6)])
 class _Choice:
     message = _Msg(); finish_reason = "stop"

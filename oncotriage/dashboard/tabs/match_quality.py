@@ -158,7 +158,7 @@ def render_match_quality_tab(df):
                 counts = {}
                 for cat, kws in keywords.items():
                     
-                    explanations = partial_matches['explanation'].fillna('').str.lower()
+                    explanations = partial_matches['assessment'].fillna('').str.lower()
                     count = explanations.apply(lambda x: any(kw in x for kw in kws)).sum()
                     
                     if count > 0:
@@ -210,7 +210,7 @@ def render_match_quality_tab(df):
                 eligible_matches_only['match_score'] <= 0.0
             ]
             if not partial_misses.empty:
-                top = partial_misses.nlargest(5, 'match_score')[['nct_id', 'trial_title', 'match_score', 'explanation']].copy()
+                top = partial_misses.nlargest(5, 'match_score')[['nct_id', 'trial_title', 'match_score', 'assessment']].copy()
                 top.columns = ['NCT ID', 'Trial', 'Score', 'Reason']
                 top['Score'] = (top['Score'] * 100).round(0).astype(int)
                 top['Trial'] = top['Trial'].str[:80]
@@ -230,7 +230,7 @@ def render_match_quality_tab(df):
 
             if not unconfirmed_misses.empty:
                 st.markdown("**Unconfirmed Eligible Trials (0% of criteria confirmed):**")
-                unc = unconfirmed_misses[['nct_id', 'trial_title', 'explanation']].head(5).copy()
+                unc = unconfirmed_misses[['nct_id', 'trial_title', 'assessment']].head(5).copy()
                 unc.columns = ['NCT ID', 'Trial', 'Reason']
                 unc['Trial'] = unc['Trial'].str[:80]
                 unc['Reason'] = unc['Reason'].str[:120]

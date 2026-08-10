@@ -832,7 +832,7 @@ _EVALUATION_PAYLOAD = [{
     "nct_id": TRIALS[0]["nct_id"],
     "eligible": "eligible",
     "match_score": 1.0,
-    "explanation": "No known disqualifiers.",
+    "assessment": "No known disqualifiers.",
     "inclusion_criteria": [{"criterion": "NSCLC", "status": "met",
                             "patient_value": "Non-small cell lung cancer"}],
     "exclusion_criteria": [],

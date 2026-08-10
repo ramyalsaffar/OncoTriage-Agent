@@ -614,7 +614,7 @@ _INF_COLUMNS = ("id", "patient_id", "timestamp", "age", "sex", "primary_conditio
                 "condition_count", "medication_count", "qdrant_collection",
                 "patient_data_hash", "llm_classifier_prompt")
 _TM_COLUMNS = ("inference_id", "nct_id", "trial_title", "trial_phase",
-               "match_score", "eligible", "explanation", "criterion_details")
+               "match_score", "eligible", "assessment", "criterion_details")
 
 
 def _build_database(db_path, inf_rows, tm_rows):
