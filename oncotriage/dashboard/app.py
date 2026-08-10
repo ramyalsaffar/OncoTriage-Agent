@@ -15,6 +15,7 @@ module a Streamlit side effect, which is what section 2 of
 import streamlit as st
 
 from oncotriage.config import Project_Name
+from oncotriage.constants import NOT_FOR_CLINICAL_USE
 from oncotriage.dashboard.data import load_inferences_data, load_trial_matches_data
 from oncotriage.dashboard.sidebar import render_sidebar
 from oncotriage.dashboard.tabs.cost_tokens import render_cost_tokens_tab
@@ -41,7 +42,30 @@ def main():
     
     st.title(f"🏥 {Project_Name}: Clinical Trial Matching Dashboard")
     st.markdown("Real-time monitoring and analytics for the patient-trial matching pipeline")
-    
+
+    # THE CLINICAL-USE FRAMING, ONCE PER PAGE.
+    #
+    # WHY HERE AND NOT IN A TAB. Five of the nine tabs render eligibility
+    # verdicts or match scores -- Overview, Match Quality, Patient Explorer,
+    # Trial Explorer and Reproducibility -- and a person reading this dashboard
+    # moves between them without the page reloading. One caption per tab would
+    # be five copies of the same sentence competing for the same screen; one
+    # caption per ROW would be thousands. This is the only page, so "once per
+    # page" is one call, and it sits above the tab strip where it is on screen
+    # whichever tab is selected.
+    #
+    # WHY ABOVE THE DATA LOAD. main() returns early twice below -- no data, and
+    # no data matching the filters -- and both of those returns are reached by a
+    # reader who is about to add data or widen a filter and then look at
+    # verdicts. Placing the caption after either guard would make the framing
+    # conditional on the page having something to frame.
+    #
+    # st.caption IS the muted style: streamlit renders it small and grey, which
+    # is what a standing caveat should look like beside a title. It is NOT
+    # st.warning -- an amber box that never goes away is read as an error the
+    # operator has failed to clear, and stops being read at all.
+    st.caption(NOT_FOR_CLINICAL_USE)
+
     df = load_inferences_data()
     
     if df is None or df.empty:

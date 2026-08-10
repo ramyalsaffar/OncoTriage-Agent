@@ -92,6 +92,7 @@ from oncotriage.agent.readiness import (
     probe_index,
     serving_readiness,
 )
+from oncotriage.constants import NOT_FOR_CLINICAL_USE
 from oncotriage.config import (
     COLLECTION_NAME,
     CROSS_ENCODER_MODEL,
@@ -201,6 +202,33 @@ class MatchResponse(BaseModel):
     result: Dict
     processing_time_seconds: float
 
+    # THE FRAMING IS DECLARED ON THE MODEL, NOT AT THE CONSTRUCTION SITE, and
+    # that is the nearest thing this file has to "one shared response-
+    # construction path". There is exactly one place a MatchResponse is built
+    # (`_run_matching_pipeline`) and two endpoints reach it, so a default here
+    # is a single declaration that BOTH POST /match and POST /match/file carry,
+    # and neither endpoint can omit it by forgetting a keyword.
+    #
+    # THERE IS NO SHARED PATH WITH GET /pipeline/info, which returns a bare dict
+    # from its own handler and shares no model, no helper and no serializer with
+    # these two. That endpoint therefore repeats the FIELD NAME and imports the
+    # same constant; the string itself is still typed once, in
+    # oncotriage/constants.py. Making the two share a construction path would
+    # mean inventing an envelope model for a response whose only other field is
+    # already a nested dict -- a response-shape change far larger than the one
+    # this pass is here to make.
+    #
+    # WHY A DEFAULT AND NOT A COMPUTED FIELD: `response_model=MatchResponse`
+    # makes FastAPI serialize exactly the declared fields, so the default is
+    # what a client receives, and a test can assert the value is the constant
+    # by identity of source rather than by string comparison alone.
+    #
+    # THE KEY NAME IS THE MCP SERVER'S. oncotriage/mcp/server.py has answered
+    # with "not_for_clinical_use" since the MCP pass; two surfaces spelling one
+    # fact two ways is the drift this project removes elsewhere by giving a
+    # thing one name.
+    not_for_clinical_use: str = NOT_FOR_CLINICAL_USE
+
 
 # ===========================================================================
 # HELPER
@@ -290,10 +318,14 @@ def _run_matching_pipeline(fhir_bundle_dict):
     #
     # WHAT IS DELIBERATELY NOT DONE HERE:
     #
-    #   - the response body is NOT widened. MatchResponse is this server's
-    #     public contract and adding a field to it is a versioning decision, not
-    #     an observability one. The client asked for matches and the matches are
-    #     correct; what failed is this server's own record-keeping.
+    #   - the response body is NOT widened TO CARRY THIS OUTCOME. MatchResponse
+    #     is this server's public contract and adding a field to it is a
+    #     versioning decision, not an observability one. The client asked for
+    #     matches and the matches are correct; what failed is this server's own
+    #     record-keeping. (MatchResponse HAS since gained one field --
+    #     `not_for_clinical_use` -- in the pass that attached the clinical-use
+    #     framing. That was a deliberate contract change, argued at the model;
+    #     it does not licence adding a write-outcome field here.)
     #   - the request is NOT failed. A 500 would discard a complete, paid-for
     #     pipeline result over a logging fault, which is the exact trade
     #     log_inference's broad handler exists to refuse.
@@ -602,7 +634,23 @@ def create_app():
                 "max_llm_classifier_retries": MAX_LLM_CLASSIFIER_RETRIES
             },
             "trials_indexed": trials_indexed,
-            "trials_indexed_note": trials_indexed_note
+            "trials_indexed_note": trials_indexed_note,
+            # THE SAME FIELD NAME AND THE SAME CONSTANT AS MatchResponse, and
+            # this is the one place in this file the name is written twice. It
+            # is written twice because there is nothing to share: this handler
+            # returns a bare dict and MatchResponse is a pydantic model, so
+            # there is no envelope, no serializer and no helper between them.
+            # The STRING is still typed exactly once, in
+            # oncotriage/constants.py; what is repeated is a key, which
+            # tests/test_clinical_use_framing.py asserts by AST is bound to the
+            # imported name and not to a retyped literal.
+            #
+            # WHY THIS ENDPOINT AT ALL, when it returns no verdicts: it is the
+            # first thing a program integrating against this server reads, and
+            # it is what /docs shows an operator. A framing that appears only on
+            # the response carrying the verdicts is a framing the integrator
+            # meets after they have already written the client.
+            "not_for_clinical_use": NOT_FOR_CLINICAL_USE,
         }
 
     @app.post("/match", response_model=MatchResponse)

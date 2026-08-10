@@ -1077,7 +1077,24 @@ _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    # without its id, the run regex swapped for the str.replace
                    # form that was never shipped, C6 rendered into one Section 2
                    # variant only. None of those is a state any commit has had.
-                   "tests/test_agent_trial_data_fencing.py"}
+                   "tests/test_agent_trial_data_fencing.py",
+                   # Execs in-memory copies of oncotriage/api/server.py to
+                   # drive POST /match, POST /match/file and GET /pipeline/info
+                   # with one of the clinical-use framing sites removed or
+                   # retyped. `git show` cannot supply any of these: the
+                   # `not_for_clinical_use` field on MatchResponse has no prior
+                   # revision at all, and each control reverts ONE site while
+                   # leaving the other two correct -- the model field retyped
+                   # while /pipeline/info still imports the constant, the info
+                   # entry deleted while the model keeps it -- which is a state
+                   # no commit has ever had. An exec'd copy of server.py also
+                   # binds the LIVE oncotriage.constants, which is what makes a
+                   # plant in server.py itself the only thing a probe through
+                   # the endpoint can observe. Its two DASHBOARD controls
+                   # deliberately do NOT exec: streamlit's AppTest runs a
+                   # script that IMPORTS a module by name, so those plants are
+                   # written as an importable copy into a temp directory.
+                   "tests/test_clinical_use_framing.py"}
 
 
 def _repo_py_files():

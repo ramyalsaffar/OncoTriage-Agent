@@ -150,6 +150,24 @@ BUCKETS = {
         "subprocess, no model call"),
     "test_agent_trial_verdict_normalization.py": (
         _A, None, "ran green in 1.9s; every model response is a literal via a deps stub"),
+    "test_clinical_use_framing.py": (
+        _A, None,
+        "ran green in 2.3s, 71 checks, against ONLY the directory skeleton: "
+        "the not-for-clinical-use framing on POST /match, POST /match/file, "
+        "GET /pipeline/info and the dashboard page. The three responses are "
+        "driven through FastAPI's TestClient WITHOUT its context manager, so "
+        "no lifespan runs; the pipeline and the database writer are replaced "
+        "on the server module and the Qdrant client through "
+        "oncotriage/agent/deps.py, and the dashboard renders all nine tabs "
+        "from a scratch SQLite file built by initialize_database(). Every "
+        "plant goes into an in-memory copy or a temp-directory copy. No "
+        "network (MEASURED -- all four socket entry points are replaced by a "
+        "recorder that raises, with a control that makes a real call), no "
+        "keys, no spend, no live server, no live Qdrant, no git, no corpus. "
+        "It DOES need the placeholder .env to EXIST, which this skeleton "
+        "writes, because GET /pipeline/info reports which source supplied the "
+        "Qdrant endpoint -- the same precondition "
+        "test_agent_retrieval_observability.py carries"),
     "test_dashboard_reproducibility_tab.py": (
         _A, None,
         "parallel-safe and needs no external data (green in 7.2s on streamlit "
