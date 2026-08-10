@@ -125,17 +125,30 @@ UNREADABLE = indexer.CRITERIA_SPLIT_PAYLOAD_UNREADABLE
 section("SECTION 1 -- the live corpus passes")
 
 # Not invented. This is exactly what scroll_criteria_split_distribution()
-# returned from `trial_criteria_20260807_111807` on 2026-08-09, and the same
+# returned from `trial_criteria_20260810_125943` on 2026-08-10, and the same
 # counts appear in the on-disk trials_latest.json the collection was built
 # from. If the thresholds are ever tightened past the corpus they were derived
 # on, this fails and names the fraction.
+#
+# THE PREVIOUS CENSUS IS KEPT AS HISTORY AND AS A SECOND CASE, not deleted:
+# `trial_criteria_20260807_111807` on 2026-08-09 was both 14,034 /
+# inclusion_only 178 / unsplit 82 / exclusion_only 30, and it is still the
+# rollback target, so a gate that refused it would refuse the collection an
+# operator would roll back to. It is asserted to pass immediately below.
 LIVE_CENSUS = {
+    BOTH: 14075,
+    INCLUSION_ONLY: 166,
+    UNSPLIT: 51,
+    EXCLUSION_ONLY: 32,
+}
+LIVE_TOTAL = 14324
+
+ROLLBACK_CENSUS = {
     BOTH: 14034,
     INCLUSION_ONLY: 178,
     UNSPLIT: 82,
     EXCLUSION_ONLY: 30,
 }
-LIVE_TOTAL = 14324
 
 check("the recorded census totals the live collection's point count",
       sum(LIVE_CENSUS.values()), LIVE_TOTAL)
@@ -143,16 +156,27 @@ check("the recorded census totals the live collection's point count",
 _live = indexer.evaluate_criteria_split_distribution(LIVE_CENSUS)
 check("the live distribution produces NO failures", _live["failures"], [])
 check("...over the whole corpus, not a sample", _live["total"], LIVE_TOTAL)
-check("degraded is unsplit + empty_criteria", _live["degraded_count"], 82)
-check("no_exclusion is unsplit + inclusion_only", _live["no_exclusion_count"], 260)
+check("degraded is unsplit + empty_criteria", _live["degraded_count"], 51)
+check("no_exclusion is unsplit + inclusion_only", _live["no_exclusion_count"], 217)
 check("unusable is zero on the live corpus", _live["unusable_count"], 0)
-check_true("...and the degraded fraction is the measured 0.572%",
-           abs(_live["degraded_fraction"] - 82 / LIVE_TOTAL) < 1e-12)
-check_true("...and the no-exclusion fraction is the measured 1.815%",
-           abs(_live["no_exclusion_fraction"] - 260 / LIVE_TOTAL) < 1e-12)
+check_true("...and the degraded fraction is the measured 0.356%",
+           abs(_live["degraded_fraction"] - 51 / LIVE_TOTAL) < 1e-12)
+check_true("...and the no-exclusion fraction is the measured 1.515%",
+           abs(_live["no_exclusion_fraction"] - 217 / LIVE_TOTAL) < 1e-12)
 
 _raised, _msg = verdict(LIVE_CENSUS)
 check("check_...() does not raise on the live distribution", _raised, False)
+
+# The ROLLBACK TARGET must pass too, or the gate would refuse the collection an
+# operator rolls back to. Both fractions were HIGHER there, which is what makes
+# this a real second case rather than a restatement of the one above.
+check("the rollback target's census totals the same point count",
+      sum(ROLLBACK_CENSUS.values()), LIVE_TOTAL)
+_rollback = indexer.evaluate_criteria_split_distribution(ROLLBACK_CENSUS)
+check("the rollback target also passes every ceiling", _rollback["failures"], [])
+check_true("...and its fractions really are higher (non-degeneracy)",
+           _rollback["degraded_count"] > _live["degraded_count"]
+           and _rollback["no_exclusion_count"] > _live["no_exclusion_count"])
 
 # NON-DEGENERACY. "no failures" is also what an evaluator that lost its
 # comparisons reports, so the same distribution must FAIL once a ceiling is
@@ -160,7 +184,7 @@ check("check_...() does not raise on the live distribution", _raised, False)
 _raised, _msg = verdict(LIVE_CENSUS, max_degraded=0.001)
 check_true("CONTROL: the same distribution FAILS at a ceiling below it",
            _raised)
-check_true("...naming the measured fraction", "0.57%" in _msg)
+check_true("...naming the measured fraction", "0.36%" in _msg)
 
 # The unrecognised-value fold is what stops a renamed vocabulary passing with
 # every fraction at zero.

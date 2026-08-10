@@ -757,6 +757,65 @@ def parse_trial_metadata(protocol: Dict) -> Dict:
 # harm in a new place, so the anchored search FALLS BACK to the original
 # substring markers whenever it finds nothing. The new split is therefore a
 # strict superset of the old one by construction.
+#
+# ---------------------------------------------------------------------------
+# 2026-08-10: THE EXCLUSION-HEADING FAMILIES, MEASURED ON THE 14,324-TRIAL
+# CORPUS. The figures above are the older 12,067-trial scrape and are kept as
+# history; these are today's.
+#
+# A SCAN OF THE 260 TRIALS THAT REACH THE JUDGE WITH NO EXCLUSION SECTION found
+# that 153 of them carry a line naming exclusion, and that the misses fall into
+# three families with a line-anchored heading the pattern could not describe.
+# Each was counted on the corpus before it was added:
+#
+#     family                                        trials whose class changed
+#     multi-level section number  "4.2 Exclusion Criteria"              13
+#     sentence form               "The main exclusion criteria ..."      8
+#     wrapper  "\[Exclusion Criteria\]" / "\<...\>" / "\- ..."          10
+#     word prefix  main / general / core / case / participant           12
+#     inclusion-side heading recovered (no exclusion family)             2
+#     other                                                              1
+#
+#     both            14,034  97.975%  ->  14,075  98.262%
+#     inclusion_only     178   1.243%  ->     166   1.159%
+#     unsplit             82   0.572%  ->      51   0.356%
+#     exclusion_only      30   0.209%  ->      32   0.223%
+#
+#     NO_EXCLUSION       260   1.815%  ->     217   1.515%
+#     DEGRADED            82   0.572%  ->      51   0.356%
+#     recovered                              46 trials changed class
+#     LOST                                    0
+#     `both` trials that changed class        0
+#
+# THE SUPERSET PROOF IS THE ACCEPTANCE CRITERION, not the recovery count, and
+# it is re-run corpus-wide by tests/test_indexer_admission_filters.py section
+# 3b against the pre-extension splitter lifted out of git.
+#
+# TWO SHAPES WERE MEASURED AND REJECTED, each because it mis-split a trial the
+# pre-extension splitter split correctly -- the wrong side of the trade however
+# many it recovers:
+#
+#   a bulleted sub-number ("* 3.1.2 Patients must not have received prior
+#       treatment") let the existing `patients must not` alternative match an
+#       INCLUSION bullet and cut NCT07178301's exclusion section early.
+#   an escaped list terminator ("11\. Patients must not ...") did the same to
+#       NCT06822010, for two recoveries.
+#
+# THE FUZZY MID-SENTENCE BOUNDARIES ARE A STATED LIMITATION, NOT A TARGET.
+# "An individual who meets any of the following criteria will be excluded"
+# and its relatives (~14 trials) have no heading to anchor on, and recognising
+# them needs a different mechanism than a line-anchored pattern. They stay
+# unrecognised deliberately, and the negative controls pin that.
+#
+# WHAT THIS DID NOT FIX, AND IT IS A DEFECT IN A DIFFERENT BRANCH. Three trials
+# move `unsplit` -> `exclusion_only` (NCT06934382, NCT04581512, NCT05464082):
+# their exclusion heading is now found and they have no inclusion heading at
+# all, and the `exclusion_only` branch below DISCARDS everything before the
+# exclusion start. That branch already drops leading text for 29 of the 30
+# trials it classified before this change -- 76,052 characters, up to 12,438 in
+# one trial -- so it is pre-existing rather than introduced here, and it is
+# reported rather than repaired because repairing it moves 29 further trials.
+# ---------------------------------------------------------------------------
 
 CRITERIA_SPLIT_BOTH = "both"
 CRITERIA_SPLIT_INCLUSION_ONLY = "inclusion_only"
@@ -774,17 +833,95 @@ _LEGACY_EXCLUSION_MARKERS = ["exclusion criteria:", "exclusion:", "patients must
 # A heading sits at the start of a line, optionally behind a bullet or a list
 # number. Anchoring on that is what separates "Exclusion Criteria:" the heading
 # from "...meets any exclusion criteria:" the sentence.
-_HEADING_LEAD = r"(?:^|\n)[ \t]*(?:[-*#>•]+[ \t]*)?(?:\d+[.)][ \t]*)?"
+#
+# THE WRAPPER CHARACTERS ARE BACKSLASH-ESCAPED IN THE STORED TEXT, which is
+# measured rather than assumed: ClinicalTrials.gov markdown-escapes its
+# punctuation, so this corpus holds "\<Exclusion Criteria\>" and
+# "\[Exclusion Criteria\]" and "\- Exclusion Criteria", never the bare
+# bracket. The backslash therefore sits in the class beside the bracket it
+# escapes; without it the whole family stays unrecognised however many bracket
+# characters are added. `>` was already here as a quote bullet.
+#
+# ONE LITERAL SET, and the regex class is DERIVED from it with re.escape rather
+# than spelled a second time. _first_heading walks the same characters forward
+# to find the heading word, and a hand-copied second spelling is exactly how
+# the walk and the pattern drift apart -- a walk that stops early leaves the
+# section starting with "\<" instead of "Exclusion".
+_HEADING_LEAD_CHARS = "\\-*#<>[•"
+
+# THE LIST NUMBER IN TWO SHAPES, AND THE ASYMMETRY IS MEASURED, NOT STYLISTIC.
+#
+#   after a bullet -- only the ORIGINAL single-level "1." / "1)". A bullet
+#       followed by a dotted number is a LIST ITEM and not a section heading:
+#       "* 3.1.2 Patients must not have received prior treatment" is an
+#       INCLUSION bullet, and admitting a dotted number there let the existing
+#       `patients must not` alternative match it, cutting NCT07178301's
+#       exclusion section early against a correct "Exclusion Criteria:"
+#       heading further down. Measured on the stored corpus, both directions.
+#
+#   at the margin, with no bullet -- multi-level "4.2", "4.1.2", "2.0", "5.2."
+#       as well. Every section-numbered exclusion heading measured in this
+#       corpus is at the margin, and none of them carries a bullet.
+#
+# Bounded to digits, dots and ONE closing dot or parenthesis, and nothing else.
+# An ESCAPED terminator ("11\. Patients must not ...") is deliberately NOT
+# admitted: it recovers two trials and mis-splits one that the pre-extension
+# splitter split correctly, which is the wrong side of that trade.
+_HEADING_LEAD_NUMBER = r"(?:\d+(?:\.\d+)+[.)]?|\d+[.)])"
+
+_HEADING_LEAD_CLASS = "[" + "".join(re.escape(c) for c in _HEADING_LEAD_CHARS) + "]"
+
+_HEADING_LEAD = (r"(?:^|\n)[ \t]*"
+                 r"(?:" + _HEADING_LEAD_CLASS + r"+[ \t]*(?:\d+[.)][ \t]*)?"
+                 r"|" + _HEADING_LEAD_NUMBER + r"[ \t]*)?")
+
+# Everything _HEADING_LEAD can consume before the heading word, as a plain
+# character set for _first_heading's walk. Same source as the class above.
+_HEADING_LEAD_STRIP = "\n \t" + _HEADING_LEAD_CHARS
 
 # Longest alternatives FIRST: "key exclusion criteria" must win over the
 # "exclusion criteria" nested inside it, or the heading is cut four characters
 # late. Python's `|` is first-match, not longest-match.
+#
+# THE WORD-PREFIXED ALTERNATIVES ARE MEASURED FAMILIES, one side at a time.
+# A prefixed heading ("Main Exclusion Criteria") matches nothing today, because
+# the lead requires a line start and the bare "exclusion criteria" inside it is
+# five characters in. Each prefix below was counted across the whole corpus on
+# BOTH sides before it was added, and the inclusion side carries only the
+# prefixes the corpus actually shows:
+#
+#     prefix         inclusion trials   exclusion trials   added
+#     the main               50                 49         both sides
+#     main                   27                 30         both sides
+#     general                24                 18         both sides
+#     core                    6                  6         both sides
+#     participant            11                 12         both sides
+#     case                    0                  1         EXCLUSION ONLY
+#
+# `case` is the one asymmetry and it is deliberate: there is no
+# "Case Inclusion Criteria" anywhere in this corpus, and inventing one would be
+# a pattern with no evidence behind it. THE SYMMETRY MATTERS BEYOND TIDINESS --
+# an exclusion heading recovered while its inclusion counterpart stays
+# unmatched turns an `unsplit` trial into `exclusion_only`, and that branch
+# discards everything before the exclusion heading. See the split-measurement
+# block above for the three trials where that still happens.
 _INCLUSION_HEADINGS = [
+    r"the\s+main\s+inclusion\s+criteria",
+    r"participant\s+inclusion\s+criteria",
+    r"general\s+inclusion\s+criteria",
+    r"main\s+inclusion\s+criteria",
+    r"core\s+inclusion\s+criteria",
     r"key\s+inclusion\s+criteria", r"inclusion\s+criteria", r"inclusion",
     r"patients\s+must\s+have", r"eligibility\s+criteria",
     r"eligible\s+patients", r"inclusion\s+guidelines",
 ]
 _EXCLUSION_HEADINGS = [
+    r"the\s+main\s+exclusion\s+criteria",
+    r"participant\s+exclusion\s+criteria",
+    r"general\s+exclusion\s+criteria",
+    r"main\s+exclusion\s+criteria",
+    r"core\s+exclusion\s+criteria",
+    r"case\s+exclusion\s+criteria",
     r"key\s+exclusion\s+criteria", r"exclusion\s+criteria", r"exclusion",
     r"patients\s+must\s+not", r"exclusionary\s+criteria",
     r"ineligibility\s+criteria", r"non-?inclusion\s+criteria",
@@ -813,7 +950,7 @@ def _first_heading(pattern, text: str) -> int:
     if not m:
         return -1
     i = m.start()
-    while i < len(text) and text[i] in "\n \t-*#>•":
+    while i < len(text) and text[i] in _HEADING_LEAD_STRIP:
         i += 1
     while i < len(text) and (text[i].isdigit() or text[i] in ".)"):
         i += 1
@@ -1727,25 +1864,37 @@ CRITERIA_SPLIT_VALUES = (
 # --- The thresholds, and the census they come from ---------------------------
 #
 # EVERY NUMBER BELOW WAS MEASURED BEFORE IT WAS CHOSEN. The live collection
-# `trial_criteria_20260807_111807` was scrolled in full on 2026-08-09 through
+# `trial_criteria_20260810_125943` was scrolled in full on 2026-08-10 through
 # scroll_criteria_split_distribution() -- 14,324 points, census total equal to
 # the server's exact count, and identical to the same census over the on-disk
 # `trials_latest.json` the collection was built from:
 #
-#     both              14,034   97.975%
-#     inclusion_only       178    1.243%
-#     unsplit               82    0.572%
-#     exclusion_only        30    0.209%
+#     both              14,075   98.262%
+#     inclusion_only       166    1.159%
+#     unsplit               51    0.356%
+#     exclusion_only        32    0.223%
 #     empty_criteria         0    0.000%
 #     field_absent           0    0.000%
 #     payload_unreadable     0    0.000%
 #
+# THE CEILINGS DID NOT MOVE. The exclusion-heading families widened the
+# splitter on 2026-08-10 and every gated fraction FELL -- degraded 0.572% ->
+# 0.356%, no-exclusion 1.815% -> 1.515% -- so the headroom arguments below hold
+# a fortiori and re-deriving the thresholds from a corpus they already pass
+# would only ratchet them toward whatever ran last, which is the relative gate
+# this one exists not to be. The census they were originally derived from,
+# `trial_criteria_20260807_111807` on 2026-08-09, is kept as history: both
+# 14,034 / inclusion_only 178 / unsplit 82 / exclusion_only 30, degraded
+# 0.572%, no-exclusion 1.815%. That collection is still the rollback target.
+#
 # THE THREE FIGURES IN CIRCULATION RECONCILE ONCE EACH IS READ AS A DIFFERENT
 # POPULATION, and two of them are reproduced exactly by this census:
 #
-#   82          the `unsplit` branch alone, this corpus. Reproduced: 82.
+#   82          the `unsplit` branch alone, on the 2026-08-09 census.
+#               Reproduced: 82. Today's is 51.
 #   1.82%       the EMPTY-EXCLUSION population -- unsplit + inclusion_only --
-#               on this corpus. Reproduced: 260/14,324 = 1.815%.
+#               on the 2026-08-09 census. Reproduced: 260/14,324 = 1.815%.
+#               Today's is 217/14,324 = 1.515%.
 #   6.18% ->    the same empty-exclusion population on the older 12,067-trial
 #   1.77%       scrape, before and after the marker fix. NOT reproducible from
 #               storage: `trial_criteria_20260803_104642` was censused too and
@@ -1753,21 +1902,25 @@ CRITERIA_SPLIT_VALUES = (
 #               existed -- so those two are process-time measurements over a
 #               scrape, not over any stored index.
 #
-# DEGRADED = unsplit + empty_criteria = 82, 0.572%.
+# DEGRADED = unsplit + empty_criteria = 51, 0.356% (was 82, 0.572%, before the
+# exclusion-heading families).
 #
-# 3.0% is that with 5.2x headroom, and the headroom is set by what can move the
+# 3.0% is that with 8.4x headroom -- it was 5.2x when the ceiling was chosen,
+# and the extension widened the margin rather than the ceiling. The headroom is
+# set by what can move the
 # fraction rather than by taste. This population is effectively bimodal: a
 # splitter that stops finding headings sends it to ~100%, while ordinary
 # registry churn moves it by single trials -- the measured four-day drift on
 # this corpus was 43 trials removed against 68 added, of which ~0.6% would be
-# unsplit. In absolute terms 3.0% is 430 trials against a measured 82, so
+# unsplit. In absolute terms 3.0% is 430 trials against a measured 51, so
 # reaching it through churn alone would take tens of thousands of new trials,
 # and it still sits an order of magnitude below a collapse. A tighter ceiling
 # buys sensitivity to a new heading format used by 1-2% of the registry; a
 # looser one stops separating the two scenarios at all.
 _MAX_CRITERIA_SPLIT_DEGRADED = 0.03
 
-# NO_EXCLUSION = unsplit + inclusion_only = 260, 1.815%.
+# NO_EXCLUSION = unsplit + inclusion_only = 217, 1.515% (was 260, 1.815%,
+# before the exclusion-heading families).
 #
 # THIS THRESHOLD IS AN ADDITION TO THE BRIEF THIS GATE WAS BUILT FROM, and the
 # reason is a measurement rather than a preference. The brief gates the
@@ -1779,15 +1932,18 @@ _MAX_CRITERIA_SPLIT_DEGRADED = 0.03
 # `inclusion_only` rather than `unsplit`, and the degraded fraction does not
 # move at all -- while every affected trial reaches the judge with its
 # exclusion criteria silently relabelled as inclusion criteria, which is the
-# exact harm this gate exists to catch. `inclusion_only` is already twice the
-# size of `unsplit` on this corpus for that reason.
+# exact harm this gate exists to catch. `inclusion_only` is already three times
+# the size of `unsplit` on this corpus for that reason (166 against 51; it was
+# twice, 178 against 82, before the exclusion-heading families -- which is the
+# same argument reading louder, since those families were exclusion-side).
 #
 # It is a SEPARATE fraction rather than a widening of the degraded one because
 # the two populations are not equally suspicious: a trial that genuinely
 # registers no exclusion section is legitimately `inclusion_only`, so this
 # fraction has a real, corpus-composition-driven floor that `unsplit` does not.
-# 5.0% is 2.75x the measured 1.815%, or 716 trials against a measured 260; a
-# single-heading regression takes it above 90%.
+# 5.0% is 3.3x the measured 1.515%, or 716 trials against a measured 217 -- it
+# was 2.75x against 260 when the ceiling was chosen; a single-heading regression
+# takes it above 90%.
 _MAX_CRITERIA_SPLIT_NO_EXCLUSION = 0.05
 
 # UNUSABLE = field_absent + payload_unreadable + any value outside the closed
@@ -1855,10 +2011,12 @@ def scroll_criteria_split_distribution(collection_name: str, client=None,
         # one key returns {"full_trial_json": {"criteria_split": "both"}}, the
         # same shape the parser below already reads.
         #
-        # MEASURED, NOT ASSUMED: both selectors were run over the full live
-        # collection and returned IDENTICAL counts (both 14,034 /
-        # inclusion_only 178 / unsplit 82 / exclusion_only 30), in 10.3s and
-        # 1.7s respectively, over the same 15 pages.
+        # MEASURED, NOT ASSUMED: on 2026-08-09 both selectors were run over the
+        # then-live `trial_criteria_20260807_111807` and returned IDENTICAL
+        # counts (both 14,034 / inclusion_only 178 / unsplit 82 /
+        # exclusion_only 30), in 10.3s and 1.7s respectively, over the same 15
+        # pages. That is a record of the SELECTOR comparison, not of today's
+        # census -- see the threshold block above for that.
         #
         # The failure direction is safe. A server that ignored the nested path
         # would return the whole blob, which this parser reads; one that

@@ -575,6 +575,305 @@ check_true("CONTROL: the OLD one returned two", len(_old_split("x")) == 2)
 
 
 # ===========================================================================
+# SECTION 3b -- THE EXCLUSION-HEADING FAMILIES THE ANCHORED SEARCH MISSED
+# ===========================================================================
+section("SECTION 3b -- the measured exclusion-heading families")
+
+# WHY A SECOND CONTROL SPLITTER. _old_split above comes from the pre-DEFECT-3
+# revision: it returns a 2-tuple and has no anchored search at all, so it is
+# the wrong control for an extension TO the anchored search -- against it every
+# case below would "pass" for the same reason every case in section 3 does, and
+# nothing would be testing this work. The control needed here is the splitter
+# as it stood AFTER defect 3 and BEFORE these families were added.
+#
+# THE REVISION IS DERIVED STRUCTURALLY, NOT BY SUBSTRING. The extension turned
+# _HEADING_LEAD from a plain string literal into an expression built from two
+# named constants, so "the newest revision whose top-level _HEADING_LEAD is an
+# ast.Constant" identifies the pre-extension state exactly and cannot be
+# satisfied by a comment quoting the old pattern -- the trap that made
+# tests/test_storage_query_layer.py's first selector pick its own fix commit.
+
+
+def _revision_with_literal_heading_lead():
+    """Newest revision whose `_HEADING_LEAD` is a plain string literal."""
+    log = _git("log", "--format=%H", "--", "oncotriage/retrieval/indexer.py")
+    if log.returncode != 0:
+        return None, None
+    for rev in log.stdout.split():
+        blob = _git("show", f"{rev}:oncotriage/retrieval/indexer.py")
+        if blob.returncode != 0 or not blob.stdout:
+            continue
+        try:
+            tree = ast.parse(blob.stdout)
+        except SyntaxError:
+            continue
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if (isinstance(target, ast.Name)
+                        and target.id == "_HEADING_LEAD"
+                        and isinstance(node.value, ast.Constant)):
+                    return rev, blob.stdout
+    return None, None
+
+
+_PRE_EXT_REV, _PRE_EXT_SRC = _revision_with_literal_heading_lead()
+
+# The whole splitter machinery out of that blob, exec'd into a throwaway
+# namespace. Lifted, never retyped: a retyped control tests the retyping.
+_PRE_EXT_WANT = {
+    "_LEGACY_INCLUSION_MARKERS", "_LEGACY_EXCLUSION_MARKERS", "_HEADING_LEAD",
+    "_INCLUSION_HEADINGS", "_EXCLUSION_HEADINGS", "_INCLUSION_RE",
+    "_EXCLUSION_RE", "CRITERIA_SPLIT_BOTH", "CRITERIA_SPLIT_INCLUSION_ONLY",
+    "CRITERIA_SPLIT_EXCLUSION_ONLY", "CRITERIA_SPLIT_UNSPLIT",
+    "CRITERIA_SPLIT_EMPTY", "CRITERIA_SPLIT_METHODS", "_compile_headings",
+    "_first_heading", "_legacy_marker_position", "_section_start",
+    "split_inclusion_exclusion",
+}
+
+
+def _pre_extension_splitter():
+    if not _PRE_EXT_SRC:
+        return None
+    tree = ast.parse(_PRE_EXT_SRC)
+    picked = []
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in _PRE_EXT_WANT:
+            picked.append(node)
+        elif isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id in _PRE_EXT_WANT
+                for t in node.targets):
+            picked.append(node)
+    ns = {"re": re, "Counter": __import__("collections").Counter}
+    exec(compile(ast.Module(body=picked, type_ignores=[]),
+                 "<pre-extension-indexer>", "exec"), ns)
+    return ns.get("split_inclusion_exclusion")
+
+
+_pre_split = _pre_extension_splitter()
+
+check_true("a pre-extension revision of the splitter was located",
+           _PRE_EXT_REV is not None)
+print(f"    control revision: {(_PRE_EXT_REV or '?')[:12]}")
+check_true("the pre-extension splitter was lifted out of git",
+           _pre_split is not None)
+# NON-DEGENERACY. It must be the POST-defect-3 splitter, or these controls are
+# the section-3 controls wearing a different name: a 2-tuple return means the
+# selector walked back past defect 3 and every case below is vacuous.
+check("CONTROL: ...and it is the POST-defect-3 splitter (3-tuple)",
+      len(_pre_split("Inclusion Criteria:\nx")) if _pre_split else None, 3)
+check_true("CONTROL: ...with the anchored search already present -- a colonless "
+           "heading splits (this is what section 3 fixed)",
+           bool(_pre_split("Inclusion Criteria\n* A\n\nExclusion Criteria\n* P")[1])
+           if _pre_split else False)
+
+
+def _recovers(label, text, expect_in_exclusion="Pregnancy"):
+    """One family: the pre-extension splitter misses it, the shipped one does not."""
+    if not _pre_split:
+        check_true(f"CONTROL unavailable -- {label}", False)
+        return
+    o_inc, o_exc, o_method = _pre_split(text)
+    check_true(f"CONTROL: the PRE-EXTENSION splitter finds no exclusion "
+               f"section -- {label}", o_exc == "")
+    check_true(f"CONTROL: ...so {expect_in_exclusion!r} reached the judge as an "
+               f"INCLUSION -- {label}", expect_in_exclusion in o_inc)
+    n_inc, n_exc, n_method = indexer.split_inclusion_exclusion(text)
+    check_true(f"FIXED: the exclusion section is recovered -- {label}",
+               n_exc != "")
+    check(f"FIXED: ...and the method is recorded -- {label}",
+          n_method, indexer.CRITERIA_SPLIT_BOTH)
+    check_true(f"FIXED: ...and {expect_in_exclusion!r} is in EXCLUSION, not "
+               f"inclusion -- {label}",
+               expect_in_exclusion in n_exc and expect_in_exclusion not in n_inc)
+
+
+# --- family (a): wrapper characters, AS THE CORPUS SPELLS THEM --------------
+#
+# ClinicalTrials.gov markdown-escapes its punctuation, so these carry a literal
+# backslash. Writing them unescaped would test a string the corpus does not
+# contain -- measured on the stored corpus, every occurrence is escaped.
+_INC = "Inclusion Criteria\n* Adults\n"
+_recovers("wrapper: \\<Exclusion Criteria\\>",
+          _INC + "\\<Exclusion Criteria\\>\n* Pregnancy")
+_recovers("wrapper: \\[Exclusion Criteria\\]",
+          _INC + "\\[Exclusion Criteria\\]\n* Pregnancy")
+_recovers("wrapper: \\- Exclusion Criteria",
+          _INC + "\\- Exclusion Criteria\n* Pregnancy")
+
+# --- family (b): multi-level section numbers at the margin ------------------
+_recovers("list number: 4.2 Exclusion Criteria",
+          _INC + "4.2 Exclusion Criteria\n* Pregnancy")
+_recovers("list number: 4.1.2 Exclusion Criteria",
+          _INC + "4.1.2 Exclusion Criteria\n* Pregnancy")
+_recovers("list number: 5.2. Exclusion Criteria",
+          _INC + "5.2. Exclusion Criteria\n* Pregnancy")
+_recovers("list number: 2.0 Exclusion Criteria",
+          _INC + "2.0 Exclusion Criteria\n* Pregnancy")
+
+# --- family (c): measured word prefixes -------------------------------------
+_recovers("prefix: Main Exclusion Criteria",
+          "Main Inclusion Criteria\n* Adults\nMain Exclusion Criteria\n* Pregnancy")
+_recovers("prefix: General Exclusion Criteria",
+          "General Inclusion Criteria\n* Adults\n"
+          "General Exclusion Criteria\n* Pregnancy")
+_recovers("prefix: Core Exclusion Criteria",
+          "Core Inclusion Criteria\n* Adults\nCore Exclusion Criteria\n* Pregnancy")
+_recovers("prefix: Participant Exclusion Criteria",
+          "Participant Inclusion Criteria\n* Adults\n"
+          "Participant Exclusion Criteria\n* Pregnancy")
+_recovers("prefix: Case Exclusion Criteria",
+          _INC + "Case Exclusion Criteria\n* Pregnancy")
+_recovers("sentence-form: The main exclusion criteria include ...",
+          _INC + "The main exclusion criteria include but are not limited to "
+                 "the following:\n* Pregnancy")
+
+# The inclusion side carries only the prefixes the corpus shows on BOTH sides.
+# `case` is the one asymmetry and it is deliberate: no "Case Inclusion
+# Criteria" occurs anywhere in the stored corpus.
+check_true("the inclusion side gained the five symmetric prefixes",
+           all(any(p in h for h in indexer._INCLUSION_HEADINGS)
+               for p in ("the\\s+main", "participant", "general", "main", "core")))
+check_true("...and NOT `case`, which the corpus shows on the exclusion side only",
+           not any("case" in h for h in indexer._INCLUSION_HEADINGS))
+check_true("CONTROL: `case` IS on the exclusion side",
+           any("case\\s+exclusion" in h for h in indexer._EXCLUSION_HEADINGS))
+
+
+# --- the negative controls: prose must still not be a heading --------------
+#
+# Anchoring is the whole protection, and these are the phrasings that would
+# defeat a wildcard prefix. Each is required to resolve IDENTICALLY before and
+# after -- not merely "not to become `both`", which a shape that broke the
+# inclusion side would also satisfy.
+_NEGATIVE = [
+    ("prose: 'Non-exclusion criteria :'", "Non-exclusion criteria :\n* anything"),
+    ("prose: 'none of the exclusion criteria'",
+     _INC + "none of the exclusion criteria apply to this participant"),
+    ("prose: 'meets any exclusion criteria'",
+     _INC + "meets any exclusion criteria listed in the protocol"),
+    ("fuzzy: 'An individual who meets ... will be excluded'",
+     _INC + "An individual who meets any of the following criteria will be "
+            "excluded from the study:\n* Pregnancy"),
+    ("fuzzy: 'Participants will be excluded if they meet'",
+     _INC + "Participants will be excluded if they meet any of the following "
+            "criteria:\n* Pregnancy"),
+    ("fuzzy: 'Subjects who meet ... should be excluded'",
+     _INC + "Subjects who meet any of the following criteria should be "
+            "excluded from the trial:\n* Pregnancy"),
+    ("mid-sentence: '... meeting the main exclusion criteria'",
+     _INC + "* Adults meeting the main exclusion criteria are ineligible"),
+    ("mid-sentence: '... does not meet general exclusion criteria'",
+     _INC + "* Subject does not meet general exclusion criteria"),
+]
+for _label, _text in _NEGATIVE:
+    _n = indexer.split_inclusion_exclusion(_text)
+    if _pre_split:
+        check(f"UNCHANGED by the extension -- {_label}", _n, _pre_split(_text))
+    check_true(f"...and no exclusion section is invented -- {_label}", _n[1] == "")
+
+# The fuzzy cases are a STATED LIMITATION rather than an oversight: they are
+# mid-sentence boundaries with no heading to anchor on, and recognising them
+# needs a different mechanism than a line-anchored pattern.
+check("the fuzzy mid-sentence cases stay unrecognised, deliberately",
+      indexer.split_inclusion_exclusion(
+          _INC + "An individual who meets any of the following criteria will "
+                 "be excluded:\n* Pregnancy")[2],
+      indexer.CRITERIA_SPLIT_INCLUSION_ONLY)
+
+
+# --- the two shapes deliberately NOT admitted, each with its control --------
+#
+# Both were measured and both were rejected because they mis-split a trial the
+# pre-extension splitter split correctly. A test that only asserts what WAS
+# added cannot see either of them come back.
+
+# (i) a bulleted sub-number is a LIST ITEM, not a section heading. Admitting it
+#     let the existing `patients must not` alternative match an INCLUSION
+#     bullet and cut the exclusion section 40 criteria early (NCT07178301).
+_BULLETED_SUBNUMBER = ("Inclusion Criteria:\n"
+                       "* 3.1.1 Histologically confirmed disease.\n"
+                       "* 3.1.2 Patients must not have received prior treatment.\n"
+                       "Exclusion Criteria:\n* Pregnancy")
+_b = indexer.split_inclusion_exclusion(_BULLETED_SUBNUMBER)
+check_true("a bulleted sub-number does NOT start the exclusion section",
+           _b[1].startswith("Exclusion Criteria"))
+check_true("...so the inclusion bullet stays in INCLUSION",
+           "3.1.2" in _b[0] and "3.1.2" not in _b[1])
+check("CONTROL: the pre-extension splitter agrees (this is not a regression "
+      "the extension had to introduce)",
+      _pre_split(_BULLETED_SUBNUMBER) if _pre_split else _b, _b)
+
+# (ii) an ESCAPED list terminator ("11\. Patients must not ...") is not
+#      admitted. It recovers two trials and mis-splits one (NCT06822010).
+_ESCAPED_TERMINATOR = ("Inclusion Criteria:\n"
+                       "11\\. Patients must not have any other medical condition.\n"
+                       "Exclusion Criteria:\n* Pregnancy")
+_e = indexer.split_inclusion_exclusion(_ESCAPED_TERMINATOR)
+check_true("an escaped list terminator does NOT start the exclusion section",
+           _e[1].startswith("Exclusion Criteria"))
+check("CONTROL: the pre-extension splitter agrees",
+      _pre_split(_ESCAPED_TERMINATOR) if _pre_split else _e, _e)
+
+# The lead's character set and _first_heading's walk come from ONE constant, so
+# the pattern cannot admit a character the walk then fails to step over --
+# which would leave the section starting with "\<" instead of "Exclusion".
+check_true("the wrapper class and the walk set share one source",
+           all(c in indexer._HEADING_LEAD_STRIP
+               for c in indexer._HEADING_LEAD_CHARS))
+check_true("...and the walk set adds only whitespace",
+           set(indexer._HEADING_LEAD_STRIP) - set(indexer._HEADING_LEAD_CHARS)
+           == set("\n \t"))
+check_true("the escaped wrapper characters the corpus actually uses are in it",
+           all(c in indexer._HEADING_LEAD_CHARS for c in "\\<[-"))
+
+
+# --- THE SUPERSET PROOF, over the stored corpus ----------------------------
+#
+# LOST == 0 IS A DESIGN CONSTRAINT, NOT AN OBSERVATION (see the split
+# measurement block in the indexer). The unit cases above show each family
+# recovers; only this shows that nothing was traded away to get them.
+#
+# IT NEEDS THE STORED CORPUS AND SAYS SO AS A RECORDED FAILURE rather than a
+# silent skip: a superset proof that quietly did not run is indistinguishable
+# from one that passed. Read-only, ~2s, no network.
+_CORPUS = None
+try:
+    from oncotriage import paths as _paths
+    _CORPUS = os.path.join(_paths.data_trial_path, "trials_latest.json")
+except Exception as _exc:                                    # noqa: BLE001
+    print(f"    corpus path unavailable: {type(_exc).__name__}: {_exc}")
+
+check_true("the stored corpus is present for the superset proof",
+           bool(_CORPUS) and os.path.exists(_CORPUS))
+
+if _CORPUS and os.path.exists(_CORPUS) and _pre_split:
+    import json as _json
+    with open(_CORPUS, encoding="utf-8") as _fh:
+        _corpus = _json.load(_fh)
+    check_true("...and it is non-degenerate", len(_corpus) > 1000)
+
+    _lost_exc = _both_moved = _changed = 0
+    for _t in _corpus:
+        _text = (_t.get("eligibility") or {}).get("criteria_text") or ""
+        _o_inc, _o_exc, _o_m = _pre_split(_text)
+        _n_inc, _n_exc, _n_m = indexer.split_inclusion_exclusion(_text)
+        if _o_exc and not _n_exc:
+            _lost_exc += 1
+        if _o_m == indexer.CRITERIA_SPLIT_BOTH and _n_m != _o_m:
+            _both_moved += 1
+        if _o_m != _n_m:
+            _changed += 1
+    check("SUPERSET: no trial loses an exclusion split", _lost_exc, 0)
+    check("SUPERSET: no `both` trial changes classification", _both_moved, 0)
+    check_true("...and the comparison is not vacuous -- trials DID move",
+               _changed > 0)
+    print(f"    corpus: {len(_corpus):,} trials, {_changed} changed "
+          f"classification, {_lost_exc} lost")
+
+
+# ===========================================================================
 # SECTION 4 -- DEFECT 4: verify before swap, keep a rollback
 # ===========================================================================
 section("SECTION 4 -- DEFECT 4: verification gates the swap")
