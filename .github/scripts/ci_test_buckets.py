@@ -110,6 +110,13 @@ BUCKETS = {
         _A, None, "ran green in 1.8s; plants into in-memory copies, reads no git"),
     "test_agent_mesh_boost_and_quality_gate.py": (
         _A, None, "ran green in 1.8s once the two vendored MeSH lookups are seeded"),
+    "test_agent_out_of_set_detector.py": (
+        _A, None,
+        "ran green in 2.2s, 103 checks; Stage 5's out-of-set detector and the "
+        "retrieval-rank trial_number. Every model response is a literal served "
+        "through a deps stub, the database is a temp file every log_inference "
+        "call is pointed at explicitly, and every plant goes into an in-memory "
+        "copy -- no network, no keys, no spend, no git, no corpus"),
     "test_agent_prompt_version.py": (
         _A, None,
         "ran green in 0.74s wall (0.00s of checks) in a `git ls-files` checkout "

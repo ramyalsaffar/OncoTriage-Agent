@@ -116,6 +116,18 @@ def _pipeline_provenance(state) -> Dict:
         "not_evaluable_truncated": state.get("not_evaluable_truncated", 0),
         "llm_classifier_calls": state.get("llm_classifier_calls", 0),
 
+        # --- The out-of-set detector's count ------------------------------
+        #
+        # NO DEFAULT, and it is the prompt-hash rule rather than the truncation
+        # rule immediately above. Those counters describe work that either
+        # happened or did not, so 0 is true of a run that ended early. This one
+        # describes a CHECK: 0 asserts that every entry the model returned was
+        # compared against the candidate set and every one of them belonged to
+        # it, which is a claim no run that ended before Stage 5 completed is
+        # entitled to make. Stage 5 writes the key on its success return only,
+        # so None here means the detector did not run and File 14 stores NULL.
+        "hallucinated_trials": state.get("hallucinated_trials"),
+
         # --- Which model answered, and what it spent thinking ---------------
         #
         # BOTH BELONG HERE RATHER THAN ON node_finalize. File 14 reads them on
@@ -302,15 +314,42 @@ def node_finalize(state: TrialMatchState) -> dict:
         if "trial" in t and "nct_id" in t["trial"]
     }
 
+    # ── trial_number is the RETRIEVAL rank, not the answer order ───────────
+    #
+    # It used to be `enumerate(evaluations)`. Stage 5 sorts that list by
+    # match_score descending immediately before returning it, so the stored
+    # number was a rank within the model's own verdicts -- and it moved
+    # whenever the verdicts moved, while the pipeline's ranking underneath it
+    # had not. Two runs over an identical candidate set could disagree about
+    # which trial is "1" because one criterion was scored differently.
+    #
+    # The rank is the position in filtered_trials, which is the list Stage 5
+    # was sent, in the order Stages 3 and 4 left it. That is the pipeline's own
+    # ranking, so trial_number 1 is the top-ranked candidate whatever order the
+    # model answered in, and a reconciliation entry for a trial the model never
+    # mentioned carries its real rank rather than falling to the bottom.
+    #
+    # FIRST position wins on a repeated id, so a duplicate cannot promote a
+    # trial past its own best rank. None when the id is not in filtered_trials
+    # at all: that is unreachable from Stage 5 (the out-of-set detector drops
+    # such an entry before it can get here) and reachable by a caller that
+    # builds `evaluations` by hand, for which "this trial has no position in a
+    # ranking that was never produced" is the honest answer -- the same one the
+    # rerank_score lookup beside it already gives.
+    _rank_by_nct = {}
+    for _pos, _t in enumerate(state.get("filtered_trials", []), start=1):
+        if "trial" in _t and "nct_id" in _t["trial"]:
+            _rank_by_nct.setdefault(_t["trial"]["nct_id"], _pos)
+
     # Merge scores and trial_number into each evaluation
-    for rank_pos, e in enumerate(evaluations, start=1):
+    for e in evaluations:
         nct_id = e.get("nct_id", "")
         _scores = _rerank_lookup.get(nct_id, (None, None, None, None))
         e["rerank_score"]     = _scores[0]
         e["rerank_score_raw"] = _scores[1]
         e["mesh_boost"]       = _scores[2]
         e["mesh_boost_tier"]  = _scores[3]
-        e["trial_number"] = rank_pos
+        e["trial_number"] = _rank_by_nct.get(nct_id)
 
     matches = [e for e in evaluations if e.get("eligible") in _ACTIONABLE]
     not_evaluable = [e for e in evaluations if e.get("eligible") in _UNEVALUABLE]

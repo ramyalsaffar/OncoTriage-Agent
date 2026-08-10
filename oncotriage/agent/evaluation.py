@@ -330,6 +330,95 @@ _MALFORMED_ENTRY_PREVIEW_LEN = 60
 
 
 # ---------------------------------------------------------------------------
+# Entries for a trial that was never sent
+# ---------------------------------------------------------------------------
+#
+# THE RECONCILIATION BLOCK AT THE END OF THIS NODE ANSWERS ONE DIRECTION OF THIS
+# QUESTION AND THIS ANSWERS THE OTHER. That block asks "was every trial we SENT
+# accounted for"; nothing asked "is every trial that came BACK one we sent". The
+# two are one problem, because the usual shape of the fault is a substitution:
+# the model answers about NCT99999999, which displaces a real candidate, and the
+# real candidate is then missing -- so the reconciliation records the omission
+# and the fabricated verdict flows on beside it, enriched, scored, normalized,
+# ranked, returned to the caller and written to trial_matches as an evaluation
+# of a trial this patient was never a candidate for.
+#
+# A well-formed entry is indistinguishable from a real one by inspection: it
+# carries an NCT-shaped id, criteria, a verdict and an explanation. The ONLY
+# thing that separates it from a genuine verdict is the candidate set, which is
+# known here and nowhere downstream.
+#
+# So the entry is DROPPED -- before enrichment, before normalization, before
+# scoring -- and never becomes a verdict of any kind. Nothing is repaired: the
+# id names no trial in this run, so there is nothing to attribute it to, and the
+# trial it displaced is picked up BY NCT ID by the reconciliation below. That
+# handoff is deliberately not duplicated here.
+#
+# THE COMPARISON IS AGAINST THE CHUNK, NOT THE NODE. Each call answers exactly
+# the trials in its own chunk; an id belonging to a different chunk of the same
+# split batch is an answer to a question that call was not asked, and treating
+# the union as the sent set would accept it.
+
+# Longest fragment of a returned nct_id kept for the log line. An NCT id is 11
+# characters; this leaves room for a recognisable variant of one and refuses a
+# sentence written into the field. Separate from _MALFORMED_ENTRY_PREVIEW_LEN
+# above because that caps a whole entry's repr and this caps one field.
+_OUT_OF_SET_ID_PREVIEW_LEN = 24
+
+# The value stamped onto every evaluation that survived the check, and written
+# to trial_matches.hallucinated. 1 is unreachable BY CONSTRUCTION -- an
+# out-of-set entry never becomes a row -- and that is the point: the column
+# separates "checked, and this row was in the candidate set" from NULL, which
+# means no check ran for this row at all.
+HALLUCINATION_CHECKED_CLEAN = 0
+
+
+def _out_of_set_label(raw_id) -> str:
+    """A loggable name for an entry that was not asked about.
+
+    THE ID IS THE DIAGNOSIS AND THE REST OF THE ENTRY IS NOT. A fabricated
+    entry carries the model's criterion-level prose about this patient, so
+    nothing but the id travels, and even the id is capped: the field is model
+    output and is only an identifier by convention.
+
+    A non-string id is reported by TYPE alone. Its content is not an identifier
+    by any reading, so printing it would be printing model output for no
+    diagnostic gain.
+    """
+    if not isinstance(raw_id, str):
+        return f"<{type(raw_id).__name__}>"
+    return raw_id[:_OUT_OF_SET_ID_PREVIEW_LEN] or "<empty>"
+
+
+def _partition_out_of_set(objects: List[Dict], sent_ids) -> Tuple[List[Dict], List[str]]:
+    """Split one chunk's entries into those it was asked about, and the rest.
+
+    Returns ``(in_set, out_of_set_labels)``. Nothing is mutated and nothing is
+    coerced; the caller records the drops.
+
+    ``isinstance(raw_id, str)`` is tested BEFORE the membership test and that is
+    not defensiveness about a schema-constrained field: ``[] in {"a"}`` raises
+    TypeError on an unhashable value, so an nct_id the model emitted as a list
+    or a dict would take the whole patient's run down inside the detector added
+    to stop exactly that class of loss. A non-string id is also, unambiguously,
+    not one of the ids that were sent.
+
+    A missing nct_id is out of set for the same reason, and this is where such
+    an entry now stops: before, it reached enrichment with ``""``, matched no
+    trial, kept no title, and left the stage as a verdict about nothing.
+    """
+    in_set = []
+    out_of_set = []
+    for entry in objects:
+        raw_id = entry.get("nct_id")
+        if isinstance(raw_id, str) and raw_id in sent_ids:
+            in_set.append(entry)
+        else:
+            out_of_set.append(_out_of_set_label(raw_id))
+    return in_set, out_of_set
+
+
+# ---------------------------------------------------------------------------
 # Model refusals
 # ---------------------------------------------------------------------------
 #
@@ -750,6 +839,12 @@ CLINICAL TRIALS:
     # ------------------------------------------------------------------
     evaluations = []
     unevaluable = []              # trials accounted for without a verdict
+    # Entries the model returned for a trial that was not in the chunk it was
+    # answering. One label per ENTRY, not per distinct id, so a model that
+    # invents the same id twice is reported as two fabricated verdicts -- which
+    # is what it produced. The list is what the log line names; its length is
+    # what reaches inferences.hallucinated_trials.
+    hallucinated_ids = []
     truncation_splits = proactive_splits
     truncations_observed = 0
     input_tokens = 0
@@ -1137,6 +1232,36 @@ CLINICAL TRIALS:
                             {type(e).__name__ for e in _dropped})))
             console.out("  [Stage 5] dropped non-object entries: " + "; ".join(
                 repr(e)[:_MALFORMED_ENTRY_PREVIEW_LEN] for e in _dropped[:5]))
+
+        # ── Entries for a trial this call did not ask about ────────────────
+        #
+        # Against THIS CHUNK's sent set, which is why the check is here rather
+        # than after the loop: a response answers its own chunk, and the union
+        # over a split batch would admit an id belonging to a different call.
+        #
+        # Runs before enrichment, scoring and normalization -- all of which are
+        # below the loop -- so a fabricated entry reaches none of them. See the
+        # block above _partition_out_of_set for why it is dropped rather than
+        # repaired, and for why the trial it displaced is left to the
+        # reconciliation at the end of this node rather than handled here.
+        _sent_ids = {t["trial"]["nct_id"] for t in chunk}
+        _objects, _out_of_set = _partition_out_of_set(_objects, _sent_ids)
+        if _out_of_set:
+            hallucinated_ids.extend(_out_of_set)
+            log.warning("the model returned evaluations for trials that were "
+                        "not sent to it; dropping them -- an id outside the "
+                        "candidate set names no trial in this run. Any "
+                        "candidate they displaced is recorded by the "
+                        "reconciliation below", stage=5,
+                        event="out_of_set_entry", count=len(_out_of_set),
+                        # The ids only. The rest of a fabricated entry is the
+                        # model's criterion-level prose about this patient and
+                        # the structured record is durable and indexed, so it
+                        # goes nowhere -- not even to the console, which the
+                        # malformed-entry path uses for a type fragment. Here
+                        # the id IS the whole diagnosis.
+                        nct_ids=_out_of_set)
+
         evaluations.extend(_objects)
 
     if truncations_observed:
@@ -1707,6 +1832,22 @@ CLINICAL TRIALS:
             _unevaluable_entry(t, NOT_EVALUABLE_MODEL_OMITTED) for t in _omitted
         )
 
+    # ── The per-trial record that the check ran ────────────────────────────
+    #
+    # Stamped on EVERY surviving evaluation, including the ones this node
+    # constructed itself (a truncation floor, an exhausted split budget, a
+    # model omission). Those name a trial that was in the candidate set by
+    # definition, so 0 is the true answer for them as much as for a verdict the
+    # model returned.
+    #
+    # It is written here, on the success path only, and that is what gives
+    # trial_matches.hallucinated its meaning: NULL is a row from a run where
+    # this node never reached this line -- an API failure, a refusal, an
+    # unparseable response, or a database written before the detector existed.
+    # A row that says 0 is a row that was checked.
+    for _e in evaluations:
+        _e["hallucinated"] = HALLUCINATION_CHECKED_CLEAN
+
     not_evaluable_truncated = sum(
         1 for e in evaluations
         if e.get("not_evaluable_reason") in (NOT_EVALUABLE_TRUNCATION_FLOOR,
@@ -1739,6 +1880,16 @@ CLINICAL TRIALS:
         "llm_classifier_truncation_splits": truncation_splits,
         "llm_classifier_output_tokens_estimated": estimated_output,
         "not_evaluable_truncated": not_evaluable_truncated,
+        # How many entries the model returned for trials it was not sent, this
+        # run. WRITTEN ONLY HERE, on the success path, and deliberately absent
+        # from every early return above: those end the node before the whole
+        # response has been compared against the whole candidate set, so any
+        # number they carried would be a partial count reported as a total.
+        # A key that is never written leaves state.get() at None, and
+        # _pipeline_provenance turns that into a NULL column meaning "the
+        # detector did not run" -- the same convention as
+        # llm_classifier_prompt_sha256. 0 is therefore a measurement.
+        "hallucinated_trials": len(hallucinated_ids),
         "llm_classifier_calls": calls_made,
         "llm_classifier_raw_response": response_text,
         "llm_classifier_prompt": prompt,

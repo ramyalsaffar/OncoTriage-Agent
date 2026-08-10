@@ -361,6 +361,16 @@ class TrialMatchState(TypedDict):
     # not_evaluable_trials, which counts trials the model assessed and could
     # not conclude on.
     not_evaluable_truncated: int
+    # Entries the model returned for a trial that was never in the chunk it was
+    # answering. Dropped before enrichment, so they reach no verdict, no result
+    # list and no trial_matches row; this is the only record that they arrived.
+    #
+    # Optional, and None is not 0: Stage 5 writes it on its success return
+    # alone, so None means the response was never fully compared against the
+    # candidate set (an API failure, a refusal, an unparseable answer, or a run
+    # that never reached Stage 5). Same convention as
+    # llm_classifier_prompt_sha256 below.
+    hallucinated_trials: Optional[int]
     # How many model calls this stage actually made. 1 unsplit; more when a
     # batch was split. Without it a chunked run is indistinguishable from an
     # unsplit one in the token columns.

@@ -39,8 +39,14 @@ Covers:
     5. END TO END — log_inference() writes a row whose llm_classifier_retries,
        ablation_flags, bm25_retrieved and vector_retrieved match the run rather
        than the config, into a throwaway database.
-    6. The hallucinated-trial columns exist and default to NULL (not measured),
-       so item 33's detector has somewhere to write.
+    6. The hallucinated-trial columns exist and separate MEASURED from NOT
+       MEASURED. Stage 5's out-of-set detector now runs, so a result that came
+       through a terminal node carrying the key stores 0 -- "checked, and every
+       returned entry was in the candidate set" -- while NULL is reserved for a
+       result dict that never passed through a terminal node and for a terminal
+       path where Stage 5 never ran. This test used to assert NULL on a clean
+       run; that premise ended with the detector, and asserting it still would
+       be asserting the absence of the feature.
 
 No network and no LLM: Qdrant, the sparse query model and the embedding call
 are replaced with stubs, and no terminal node calls a model. The database is a
@@ -441,6 +447,12 @@ def make_terminal_state(**overrides) -> dict:
         "histology_dropped":               0,
         "evaluations":                     [],
         "llm_classifier_retries":                   0,
+        # Stage 5 completed and its out-of-set detector found nothing. Present
+        # for the same reason cross_vocab_remaps is: this fixture stands for a
+        # state a terminal node is handed after a COMPLETE run, and Stage 5
+        # writes this key on its success return. A test that wants the "Stage 5
+        # never ran" shape omits it -- see Test 6.
+        "hallucinated_trials":             0,
         "cross_vocab_remaps":              0,
         "llm_classifier_prompt":                    "",
         "llm_classifier_input_tokens":              0,
@@ -832,15 +844,101 @@ if _row is not None:
     check("vector_retrieved is not the config constant",
           _row["vector_retrieved"] == VECTOR_RETRIEVAL_SIZE, False)
 
-    # ── TEST 6: hallucinated-trial columns exist and read as "not measured" ──
+    # ── TEST 6: the hallucinated-trial columns separate 0 from NULL ─────────
+    #
+    # THIS TEST USED TO ASSERT NULL ON A CLEAN RUN, and that assertion was true
+    # only because no detector existed: it was a record of an absent feature,
+    # not a property of the writer. Stage 5 now compares every returned entry
+    # against the candidate set it sent and writes the count, so the truth to
+    # assert is the DISCRIMINATION -- 0 where the check ran, NULL where it did
+    # not -- which is the mesh_resolution precedent and the one thing a single
+    # default (either default) could not deliver.
+    #
+    # The two arms are each other's control. If _pipeline_provenance stopped
+    # carrying the key, or the INSERT stopped reading it, the 0 arm fails; if
+    # either of them defaulted the absent value to 0, the NULL arms fail. No
+    # source is patched: each arm creates its own condition for real.
     print("\n" + "=" * 70)
-    print("Test 6: hallucinated-trial marker exists and defaults to NULL")
+    print("Test 6: hallucinated_trials is 0 when checked, NULL when not")
     print("=" * 70)
 
     check("inferences.hallucinated_trials exists",
           "hallucinated_trials" in _row.keys(), True)
-    check("no detector ran, so the count is NULL not 0",
-          _row["hallucinated_trials"], None)
+    check("a completed run through node_finalize stores the measured count",
+          _row["hallucinated_trials"], 0)
+    check("...and it is a stored 0, not a NULL that compares equal to nothing",
+          _row["hallucinated_trials"] is None, False)
+
+# --- NULL arm 1: a terminal path on which Stage 5 never ran ----------------
+# node_no_candidates ends the run before the model is called, so nothing was
+# ever compared against a candidate set. The key is simply absent from state --
+# exactly the shape a production no-candidates run produces -- and the terminal
+# node must not invent a value for it. (Test 1 already proves all three
+# terminal nodes DECLARE the key; this is about what they declare it AS.)
+_never_ran = make_terminal_state()
+del _never_ran["hallucinated_trials"]
+_never_ran_result = node_no_candidates(_never_ran)["result"]
+_never_ran_result["patient_id"] = "stage5-never-ran"
+check("a run where Stage 5 never ran reports no count rather than 0",
+      _never_ran_result["hallucinated_trials"], None)
+check_wrote_to_scratch(
+    "the never-ran result was written to the scratch database",
+    log_inference(_never_ran_result, PATIENT_DATA, db_path=inferences_path))
+
+# --- NULL arm 2: a result dict that never passed through a terminal node ---
+_hand_built = {
+    "patient_id": "hand-built-no-terminal-node",
+    "timestamp": "2026-08-09T00:00:00",
+    "matches": [], "near_misses": [], "not_evaluable": [],
+    "stage_timings": {}, "error": "",
+}
+check_wrote_to_scratch(
+    "a hand-built result was written to the scratch database",
+    log_inference(_hand_built, PATIENT_DATA, db_path=inferences_path))
+
+_conn2 = sqlite3.connect(inferences_path)
+_conn2.row_factory = sqlite3.Row
+for _pid, _label in (("stage5-never-ran",
+                      "a terminal path where Stage 5 never ran"),
+                     ("hand-built-no-terminal-node",
+                      "a result dict that never met a terminal node")):
+    _null_row = _conn2.execute(
+        "SELECT hallucinated_trials FROM inferences WHERE patient_id = ? "
+        "ORDER BY id DESC LIMIT 1", (_pid,)).fetchone()
+    check(f"{_label}: a row was written", _null_row is not None, True)
+    check(f"{_label} stores NULL",
+          _null_row["hallucinated_trials"] if _null_row else "<no row>", None)
+_conn2.close()
+
+# --- The per-trial marker, both values, through the real INSERT ------------
+# One evaluation carrying the flag Stage 5 stamps, one without it. The pair is
+# written by one call, so a writer that defaulted or dropped the field cannot
+# satisfy both rows.
+_per_trial = node_finalize(make_terminal_state(
+    evaluations=[
+        {"nct_id": "NCT00000001", "eligible": "eligible", "match_score": 1.0,
+         "hallucinated": 0},
+        {"nct_id": "NCT00000002", "eligible": "eligible", "match_score": 0.5},
+    ],
+))["result"]
+_per_trial["patient_id"] = "per-trial-hallucinated-marker"
+check_wrote_to_scratch(
+    "the per-trial result was written to the scratch database",
+    log_inference(_per_trial, PATIENT_DATA, db_path=inferences_path))
+
+_conn3 = sqlite3.connect(inferences_path)
+_conn3.row_factory = sqlite3.Row
+_marks = dict(_conn3.execute(
+    "SELECT nct_id, hallucinated FROM trial_matches WHERE inference_id = "
+    "(SELECT id FROM inferences WHERE patient_id = ? ORDER BY id DESC LIMIT 1)",
+    ("per-trial-hallucinated-marker",)).fetchall())
+check("an evaluation Stage 5 stamped stores 0 (checked, in the candidate set)",
+      _marks.get("NCT00000001"), 0)
+check("an evaluation carrying no marker stores NULL (never checked)",
+      _marks.get("NCT00000002"), None)
+check("non-degeneracy: both rows were written, so the pair discriminates",
+      sorted(_marks), ["NCT00000001", "NCT00000002"])
+_conn3.close()
 
 _trial_columns = {
     r[1] for r in _conn.execute("PRAGMA table_info(trial_matches)")

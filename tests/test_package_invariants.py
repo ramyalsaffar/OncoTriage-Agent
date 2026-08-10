@@ -1048,6 +1048,17 @@ _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    "tests/test_extraction_stage_m_category.py",
                    "tests/test_extraction_stage_non_oncology_guard.py",
                    "tests/test_agent_trial_verdict_normalization.py",
+                   # Plants into in-memory copies of agent/evaluation.py and
+                   # agent/terminal.py. `git show` cannot supply these
+                   # controls: the out-of-set detector has no prior revision,
+                   # and several plants revert ONE line while leaving the rest
+                   # of the pass correct (the chunk/node sent-set confusion,
+                   # the isinstance guard, the per-trial stamp) -- a state no
+                   # commit ever had. An exec'd copy of evaluation.py also
+                   # binds the LIVE state and observability modules, which is
+                   # what makes a plant in evaluation.py itself the only thing
+                   # a probe through it can observe.
+                   "tests/test_agent_out_of_set_detector.py",
                    # Plants into an in-memory copy of agent/patient.py. Two of
                    # its seven controls are one-token edits INSIDE a function
                    # body -- `is not None` made truthy, and the two observation

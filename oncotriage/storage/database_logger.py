@@ -211,13 +211,19 @@ INFERENCE_COLUMN_ADDITIONS = {
     # both "the filter found nothing to drop" and "the patient was never
     # resolved, so the filter never ran". This column separates the two.
     "mesh_resolution":      "TEXT",
-    # Count of trials GPT-4o returned an evaluation for that were never in the
-    # candidate set sent to it. The detector (item 33) writes
-    # result["hallucinated_trials"]; until it does, no terminal node emits the
-    # key and the column stays NULL on every row. NULL is the correct value:
-    # inserting 0 would assert that the check ran and found nothing, which is
-    # the exact confusion this project treats as a defect. The column exists
-    # now so the detector has somewhere to write without a second migration.
+    # Count of entries the model returned an evaluation for that were never in
+    # the candidate set sent to it. THE DETECTOR EXISTS NOW: it runs per chunk
+    # in node_llm_classifier_evaluation, drops every such entry before it can
+    # be enriched or scored, and writes the total into
+    # result["hallucinated_trials"] via _pipeline_provenance.
+    #
+    # 0 IS A MEASUREMENT AND NULL IS NOT. A normal run stores 0, which asserts
+    # that every returned entry was compared against the candidate set and
+    # every one belonged to it. NULL means no such comparison was completed --
+    # a row written before the detector existed, or a run that ended at an API
+    # failure, a refusal or an unparseable response, where Stage 5's success
+    # return was never reached. Never fold the two together, and never default
+    # this to 0 in a reader.
     "hallucinated_trials":  "INTEGER",
     # --- Retrieval and expansion degradation (item 11b) ---------------------
     # Stage 2 runs four retrieval channels behind one try/except each. Before
@@ -424,9 +430,23 @@ TRIAL_MATCH_COLUMN_ADDITIONS = {
     "score_confirmed":         "INTEGER",  # match_score numerator
     "score_denominator":       "INTEGER",  # match_score denominator (applicable only)
     "criteria_not_applicable": "INTEGER",  # criteria excluded from both
-    # Per-trial marker for the same detection as inferences.hallucinated_trials:
-    # 1 = this NCT ID was not in the candidate set sent to the model, 0 = it was,
-    # NULL = the check did not run for this row. Written from match["hallucinated"].
+    # Per-trial marker for the same detection as inferences.hallucinated_trials.
+    # Written from match["hallucinated"], which Stage 5 stamps onto every
+    # surviving evaluation on its success path.
+    #
+    # TWO VALUES ARE REACHABLE AND THE THIRD IS NOT, BY CONSTRUCTION.
+    #   0    = this row was checked and its NCT ID was in the candidate set.
+    #   NULL = no check ran for this row: a run that ended before Stage 5
+    #          completed, a result dict built outside the pipeline, or a row
+    #          written before the detector existed.
+    #   1    NEVER APPEARS. An entry outside the candidate set is dropped in
+    #          node_llm_classifier_evaluation before enrichment, so it becomes
+    #          no evaluation and therefore no row. The count of what was
+    #          dropped lives in inferences.hallucinated_trials, which is the
+    #          only place it can live -- there is no trial to hang it on.
+    # The value is kept as a marker rather than removed because 0 against NULL
+    # is what separates a checked row from an unchecked one, which is the whole
+    # question this column answers.
     "hallucinated":            "INTEGER",
 }
 
@@ -1363,8 +1383,10 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
             # node was the only writer of the old key.
             result.get("llm_classifier_retries", 0),                  # llm_classifier_retries
             json.dumps(result.get("ablation_flags") or {}),  # ablation_flags
-            # NULL until item 33's detector writes the key: see the migration
-            # note above for why this is not defaulted to 0.
+            # No default, and 0 is now a real value rather than an unreached
+            # one: Stage 5's detector writes the key on its success return, so
+            # NULL here means the check did not complete. See the migration
+            # note above.
             result.get("hallucinated_trials"),               # hallucinated_trials
             # Degradation record. Every one of these is .get() with no default,
             # so a result dict that never reached the stage in question writes
@@ -1471,7 +1493,9 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 match.get("score_confirmed"),
                 match.get("score_denominator"),
                 match.get("criteria_not_applicable"),
-                match.get("hallucinated"),   # NULL until item 33's detector runs
+                # 0 when Stage 5's out-of-set detector checked this row, NULL
+                # when it never ran. 1 is unreachable: see the migration note.
+                match.get("hallucinated"),
             ))
         
         conn.commit()
