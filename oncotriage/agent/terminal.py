@@ -26,12 +26,14 @@ from datetime import datetime
 from typing import Dict
 
 from oncotriage.agent.state import (
+    MESH_FILTER_SKIP_NO_FILTER,
     TRIAL_VERDICT_ELIGIBLE,
     TRIAL_VERDICT_NOT_EVALUABLE,
     TrialMatchState,
     normalize_trial_verdict,
 )
 from oncotriage.agent.prompts import PROMPT_VERSION
+from oncotriage.config import MAX_LLM_CLASSIFIER_RETRIES
 from oncotriage.observability import get_logger
 from oncotriage.registries.primary_cancer import _resolve_primary_cancer
 from oncotriage.utils import deduplicate_by_display, get_age_reference_date
@@ -79,6 +81,93 @@ TERMINAL_NODE_ERROR = "node_error_handler"
 #
 # Every value is read from state, so a stage that never ran contributes its
 # initialized value rather than a fabricated one.
+
+# ---------------------------------------------------------------------------
+# THE ONE-GLANCE DEGRADATION MARKER
+# ---------------------------------------------------------------------------
+#
+# WHAT degraded_run IS, EXACTLY. It is 1 when at least one of the four
+# observations below is POSITIVELY set on this run's state, and 0 when none of
+# them is. It is a summary of columns that already exist; it adds no
+# measurement of its own, and the per-stage columns remain the detail.
+#
+# WHAT 0 DOES AND DOES NOT ASSERT — read this before writing a query.
+#
+#   0 means "no degradation signal fired".
+#   0 does NOT mean "every check ran and passed".
+#
+# Those differ on a run that ended early: node_no_candidates on a patient whose
+# pool emptied at Stage 2 never reaches Stage 4, so mesh_filter_applied is NULL
+# rather than 0 and the mesh term below cannot fire. The honest reading of that
+# row is "nothing went wrong that this run got far enough to observe", and the
+# way to ask the stronger question is the one the existing columns already
+# answer: `retrieval_degraded IS NOT NULL AND mesh_filter_applied IS NOT NULL
+# AND ... AND degraded_run = 0`. Collapsing that into this column would mean
+# choosing between calling every no-candidate run degraded (false) and calling
+# an unobserved check clean (also false), so the column reports the one thing
+# it can state without inventing either.
+#
+# NULL is the third value and it is NOT produced here. Every terminal node
+# spreads this dict, so a result that came from the graph always carries an int.
+# NULL appears in the database when the result dict reaching log_inference has
+# no such key at all: a caller that built a result by hand, or a row written
+# before this column existed. That is llm_classifier_prompt_sha256's convention,
+# not llm_classifier_prompt_version's -- absence of the fact, never a fallback.
+#
+# THE FOUR TERMS, and what was considered and left out.
+#
+#   1. state["error"] is non-empty. The run ended at node_error_handler, which
+#      is only reachable from Stage 5's failure and refusal paths, and `error`
+#      is seeded "" by build_initial_state and CLEARED by Stage 5's success
+#      return -- so this is exactly "this run failed", not a stale flag. Listed
+#      first because a crashed run reported as clean is the worst thing this
+#      column could do, and the brief's four signals do not by themselves cover
+#      a Stage 1 or Stage 2 exception.
+#   2. retrieval_degraded is truthy. Stage 2 sets it to 1 when an EXPECTED
+#      channel did not return; ablated channels are excluded from "expected" by
+#      Stage 2 itself, so an ablation run is not reported as degraded here for
+#      free.
+#   3. The cancer site filter was skipped BECAUSE ITS DATA WAS ABSENT
+#      (MESH_FILTER_SKIP_NO_FILTER). Deliberately not the other two skips:
+#      MESH_FILTER_SKIP_ABLATED is a configured experiment, on exactly the
+#      footing Stage 2 excludes ablated channels; MESH_FILTER_SKIP_NO_TREES is
+#      a property of the patient's record rather than of the run's health, it
+#      is already carried in full by mesh_resolution, and counting it would
+#      mark every unmappable patient as a degraded run. That second exclusion
+#      is the judgement call in this predicate -- it is the one to revisit
+#      first if the marker ever reads too clean.
+#   4. Stage 5 exhausted a budget: llm_classifier_retries reached
+#      MAX_LLM_CLASSIFIER_RETRIES, or a trial left Stage 5 with no verdict
+#      because of truncation (not_evaluable_truncated > 0, which covers both
+#      the single-trial floor and the exhausted split budget).
+#
+# CONSIDERED AND NOT INCLUDED, so the next reader does not have to re-derive
+# the absence: retrieval_trials_lost > 0 (a real degradation, but it is the
+# brief's next item rather than this one's, and adding it silently would change
+# what a column means between two runs of the same build);
+# query_expansion_path == EXPANSION_PATH_FALLBACK (the fallback is a designed
+# path, not a fault); the three new *_filter_applied = 0 markers (all three
+# skips are ordinary properties of a patient record). Each of those is one term
+# away if it is wanted, and each is a decision rather than an oversight.
+
+def _derive_degraded_run(state) -> int:
+    """1 if any degradation signal fired on this run, else 0. Never None.
+
+    Reads state only. Adds no measurement: every term is a value some stage
+    already wrote and already logs to its own column.
+    """
+    if state.get("error"):
+        return 1
+    if state.get("retrieval_degraded"):
+        return 1
+    if state.get("mesh_filter_skip_reason") == MESH_FILTER_SKIP_NO_FILTER:
+        return 1
+    if (state.get("llm_classifier_retries") or 0) >= MAX_LLM_CLASSIFIER_RETRIES:
+        return 1
+    if (state.get("not_evaluable_truncated") or 0) > 0:
+        return 1
+    return 0
+
 
 def _pipeline_provenance(state) -> Dict:
     """Run-level provenance keys that all three terminal results must carry."""
@@ -223,6 +312,22 @@ def _pipeline_provenance(state) -> Dict:
         "query_expansion_path": state.get("query_expansion_path"),
         "mesh_filter_applied": state.get("mesh_filter_applied"),
         "mesh_filter_skip_reason": state.get("mesh_filter_skip_reason"),
+
+        # The same pair for the other four Stage 4 filters. No default, for the
+        # reason the four keys above have none: a run that ended before Stage 4
+        # has no filter outcome to report, and 0 would assert that the filter
+        # ran and dropped nothing.
+        "stage_filter_applied": state.get("stage_filter_applied"),
+        "stage_filter_skip_reason": state.get("stage_filter_skip_reason"),
+        "histology_filter_applied": state.get("histology_filter_applied"),
+        "histology_filter_skip_reason": state.get("histology_filter_skip_reason"),
+        "age_filter_applied": state.get("age_filter_applied"),
+        "age_filter_skip_reason": state.get("age_filter_skip_reason"),
+        "sex_filter_applied": state.get("sex_filter_applied"),
+        "sex_filter_skip_reason": state.get("sex_filter_skip_reason"),
+
+        # --- The one-glance marker ------------------------------------------
+        "degraded_run": _derive_degraded_run(state),
 
         # --- ECOG performance status (see File 07) -------------------------
         #

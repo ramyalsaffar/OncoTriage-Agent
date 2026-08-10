@@ -159,6 +159,22 @@ _RESULTS = {"passed": 0, "failed": 0}
 _FAILURES = []
 
 
+class _SectionSkipped(Exception):
+    """A section's precondition is absent, so its body must not run.
+
+    NOT A SKIP MECHANISM AND NOT A THIRD COUNTER. `tests/test_package_invariants.py`
+    has the project's only `skip()`, and this file deliberately does not grow
+    one: every precondition here is already asserted by a non-degeneracy
+    `check_true`, so the absence is recorded as a FAILURE and this exception
+    only stops the section's body from raising on top of it.
+
+    It exists so a section whose body is 150 lines can bail without being
+    re-indented under an `if` -- a re-indentation of that size is a diff nobody
+    can review, which is the argument oncotriage/ablation/study.py already makes
+    for the same shape.
+    """
+
+
 def check(label: str, actual, expected) -> None:
     """Assert equality, record the outcome, never abort the run."""
     if actual == expected:
@@ -841,16 +857,69 @@ print("=" * 78)
 _REAL_CORPUS = paths.data_fhir_path
 _SAMPLE_SIZE = 12
 
-_corpus_files = sorted(f for f in os.listdir(_REAL_CORPUS)
-                       if f.endswith(".json"))[:_SAMPLE_SIZE]
-_PRODUCTION_COUNT_BEFORE = len([f for f in os.listdir(_REAL_CORPUS)
-                                if f.endswith(".json")])
+# THE LISTING IS GUARDED, AND THE CASCADE IT PREVENTED IS WORTH NAMING. On a
+# tree with no patient corpus this section used to fail three times over, and
+# only the last failure reached the terminal:
+#
+#   1. `_corpus_files[0]` raised IndexError inside the try below;
+#   2. the finally block then referenced `_dry_counts`, which is assigned AFTER
+#      that line, so the IndexError was replaced by
+#      `NameError: name '_dry_counts' is not defined`;
+#   3. the NameError propagated out of module scope, so the file died with no
+#      summary, no exit code from its own __main__ block, and a traceback
+#      pointing at a counter restore that has nothing to do with the cause.
+#
+# The real cause was ALREADY MEASURED by the non-degeneracy check below -- it
+# just never got to be read. Three changes make it the thing that surfaces, and
+# none of them touches an assertion:
+#
+#   * the listing itself cannot raise, so a missing directory is reported by
+#     that same check rather than by a traceback five lines above it;
+#   * `_dry_counts` is snapshotted BEFORE the try, so the finally can never
+#     reference an unbound name (it is a read of module state that nothing
+#     between here and its old position mutates -- copying files does not
+#     touch _DELETION_COUNTS);
+#   * the body runs only when there are bundles to run it on, so the IndexError
+#     cannot fire at all.
+#
+# WHAT A BARE SKELETON REPORTS NOW: the non-degeneracy check fails, naming the
+# corpus, and every other section of the file runs and reports normally. The
+# checks inside this section do not run, and the printed line below says so --
+# this file has no skip counter (test_package_invariants.py has the only one),
+# so the honest signal is a recorded FAILURE plus a smaller total, never a
+# silent pass.
+try:
+    _corpus_listing = sorted(f for f in os.listdir(_REAL_CORPUS)
+                             if f.endswith(".json"))
+    _corpus_listing_error = None
+except OSError as _exc:
+    _corpus_listing = []
+    _corpus_listing_error = f"{type(_exc).__name__}: {_exc}"
+
+_corpus_files = _corpus_listing[:_SAMPLE_SIZE]
+_PRODUCTION_COUNT_BEFORE = len(_corpus_listing)
+
+if _corpus_listing_error:
+    print(f"  the corpus directory could not be listed: {_corpus_listing_error}")
 
 check_true(f"there are real bundles to copy (non-degeneracy): "
            f"{len(_corpus_files)}", len(_corpus_files) >= 2)
 
+# Snapshotted BEFORE the try, so the finally that restores it cannot reference
+# an unbound name however the body fails. See the block above.
+_dry_counts = dict(clean._DELETION_COUNTS)
+
+if len(_corpus_files) < 2:
+    print(f"\n  SECTION 6 NOT RUN: it needs at least 2 real patient bundles in\n"
+          f"  {_REAL_CORPUS}\n"
+          f"  and found {len(_corpus_files)}. The failure recorded above is the\n"
+          f"  finding; the checks below it did not execute and are absent from\n"
+          f"  the total rather than counted as passes.")
+
 _scratch = tempfile.mkdtemp(prefix="oncotriage-dryrun-")
 try:
+    if len(_corpus_files) < 2:
+        raise _SectionSkipped(f"{len(_corpus_files)} corpus bundles")
     _dry_dir = os.path.join(_scratch, "dry", "fhir")
     _real_dir = os.path.join(_scratch, "real", "fhir")
     _manifest_dry = os.path.join(_scratch, "dry", "cohort_manifest.json")
@@ -912,7 +981,9 @@ try:
     # The phases that DO fire are non_cancer and deceased, which is what makes
     # the comparison meaningful: the corpus is the filtered cohort, so most of
     # these are alive cancer patients and a few may not be.
-    _dry_counts = dict(clean._DELETION_COUNTS)
+    #
+    # (_dry_counts is snapshotted above the try, not here -- see the block at
+    # the top of this section.)
 
     with _resolved_override("patients_dir", _dry_dir), \
             _resolved_override("manifest_path", _manifest_dry), \
@@ -998,6 +1069,13 @@ try:
     check("and its status is not 'planned'",
           json.load(open(_manifest_real))["status"] in ("complete", "partial"),
           True)
+except _SectionSkipped:
+    # NOT A SILENT RECOVERY. The reason was printed immediately above the try
+    # and, more importantly, the non-degeneracy check has already recorded a
+    # FAILURE naming the corpus. This handler exists for one purpose: to stop a
+    # missing corpus from taking the six sections BELOW this one with it, which
+    # is what the IndexError/NameError cascade used to do.
+    pass
 finally:
     shutil.rmtree(_scratch, ignore_errors=True)
     # _DELETION_COUNTS is module state shared with the shim. Restore it so this
@@ -1009,8 +1087,18 @@ finally:
 # calls a function whose ordinary behaviour is to delete patient bundles, and
 # the accessor shadow is the only thing standing between it and the real
 # directory.
+#
+# The listing is guarded the same way the one at the top of this section is, and
+# for the same reason: a directory that cannot be listed must reach the check as
+# a value, not as a traceback that hides every result after it.
+try:
+    _production_count_after = len([f for f in os.listdir(_REAL_CORPUS)
+                                   if f.endswith(".json")])
+except OSError as _exc:
+    _production_count_after = f"<unlistable: {type(_exc).__name__}>"
+
 check("the production corpus file count is unchanged",
-      len([f for f in os.listdir(_REAL_CORPUS) if f.endswith(".json")]),
+      _production_count_after,
       _PRODUCTION_COUNT_BEFORE)
 check("and clean.patients_dir() points back at it",
       clean.patients_dir(), _REAL_CORPUS)
@@ -1391,6 +1479,21 @@ check("NEGATIVE CONTROL: a patient with no histology tags keeps both trials, "
 # So the pin keeps both halves and states them separately: the literal set
 # below (a key added in either direction fails), and the item 11a rule proper,
 # which is the "no degradation counter leaked into it" check underneath.
+# WHAT CHANGED AGAIN (the filter-applied markers). Eight more keys, and they
+# pass the same test the three quality_dropped_* keys passed: a FILTER'S OWN
+# ACCOUNTING, not a recovery record. mesh_dropped had mesh_filter_applied beside
+# it and the other four drop counters had nothing, so `stage_dropped = 0` meant
+# "checked, nothing to drop" AND "the ablation flag disabled it" AND "this
+# patient has no stage" -- the exact ambiguity mesh_resolution was added to
+# remove one column over. None of the eight is a Counter, none records a
+# recovery from a fault, and each is a loop-invariant condition the filter
+# itself branches on: the per-trial code reads `if stage_filter_applied:`, so
+# the marker IS the predicate rather than a second declaration that can
+# disagree with it.
+#
+# The fixture argument above was re-measured rather than inherited a second
+# time, and it still holds: capture.py's stage4 block names its keys one at a
+# time, so none of these eight reaches a deterministic prefix.
 _STAGE4_KEYS = {
     "filtered_trials", "candidates_after_rule_filter",
     "candidates_after_quality_filter", "mesh_dropped", "histology_dropped",
@@ -1398,6 +1501,10 @@ _STAGE4_KEYS = {
     "quality_dropped_percentile", "quality_dropped_floor",
     "quality_dropped_floor_only",
     "quality_threshold", "mesh_filter_applied", "mesh_filter_skip_reason",
+    "stage_filter_applied", "stage_filter_skip_reason",
+    "histology_filter_applied", "histology_filter_skip_reason",
+    "age_filter_applied", "age_filter_skip_reason",
+    "sex_filter_applied", "sex_filter_skip_reason",
     "stage_timings",
 }
 

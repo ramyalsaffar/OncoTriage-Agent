@@ -56,10 +56,16 @@ from collections import Counter
 from oncotriage.agent import deps
 from oncotriage.agent.retrieval import apply_quality_gate
 from oncotriage.agent.state import (
+    AGE_FILTER_SKIP_NO_PATIENT_AGE,
+    FILTER_APPLIED,
+    FILTER_SKIP_ABLATED,
+    HISTOLOGY_FILTER_SKIP_NO_PATIENT_HISTOLOGY,
     MESH_FILTER_APPLIED,
     MESH_FILTER_SKIP_ABLATED,
     MESH_FILTER_SKIP_NO_FILTER,
     MESH_FILTER_SKIP_NO_TREES,
+    SEX_FILTER_SKIP_NOT_COMPARABLE,
+    STAGE_FILTER_SKIP_NO_PATIENT_STAGE,
     TrialMatchState,
 )
 from oncotriage.config import MAX_TRIALS_FOR_EVALUATION, MEDCPT_SCORE_FLOOR
@@ -453,7 +459,50 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
     )
     
     stage_dropped = 0
-    
+
+    # --- Did the other four per-trial filters actually run? -----------------
+    #
+    # Decided HERE, once, for the same reason mesh_filter_skip_reason is decided
+    # here: every one of these conditions is loop-invariant, so evaluating them
+    # per trial would be four redundant tests and, worse, would leave the answer
+    # nowhere a stored row can read it. Each drop counter below already existed;
+    # what did not exist was the statement that the filter which owns it ran.
+    #
+    # ORDER MATTERS INSIDE EACH: the ablation flag is checked FIRST, because a
+    # deliberately disabled filter is not a patient whose data was missing, and
+    # reporting "no_patient_stage" for an ablation run would be a false fact
+    # about the patient. Same precedence mesh_filter_skip_reason uses.
+    if _skip_stage:
+        stage_filter_skip_reason = FILTER_SKIP_ABLATED
+    elif patient_stage is None:
+        stage_filter_skip_reason = STAGE_FILTER_SKIP_NO_PATIENT_STAGE
+    else:
+        stage_filter_skip_reason = FILTER_APPLIED
+    stage_filter_applied = stage_filter_skip_reason == FILTER_APPLIED
+
+    if _skip_histology:
+        histology_filter_skip_reason = FILTER_SKIP_ABLATED
+    elif not patient_histology:
+        histology_filter_skip_reason = HISTOLOGY_FILTER_SKIP_NO_PATIENT_HISTOLOGY
+    else:
+        histology_filter_skip_reason = FILTER_APPLIED
+    histology_filter_applied = histology_filter_skip_reason == FILTER_APPLIED
+
+    # Neither of these two has an ablation flag, so neither has an ablated arm.
+    # Adding one "for symmetry" would declare a state the pipeline cannot reach,
+    # which is the never-read-value shape check 2h reports.
+    if patient_age is None:
+        age_filter_skip_reason = AGE_FILTER_SKIP_NO_PATIENT_AGE
+    else:
+        age_filter_skip_reason = FILTER_APPLIED
+    age_filter_applied = age_filter_skip_reason == FILTER_APPLIED
+
+    if not patient_sex_comparable:
+        sex_filter_skip_reason = SEX_FILTER_SKIP_NOT_COMPARABLE
+    else:
+        sex_filter_skip_reason = FILTER_APPLIED
+    sex_filter_applied = sex_filter_skip_reason == FILTER_APPLIED
+
     if patient_stage is not None:
         # KNOWN vs UNKNOWN, not the ordinal. A cancer stage is a clinical fact
         # about this patient; whether the filter had one to work with is an
@@ -508,18 +557,24 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
                 continue
 
         # --- Cancer stage filter ---
-        if not _skip_stage:
-            if patient_stage is not None:
-                if is_stage_mismatch(patient_stage, trial):
-                    stage_dropped += 1
-                    continue
+        #
+        # THE MARKER IS THE CONDITION, not a second declaration beside it. This
+        # read `if not _skip_stage: if patient_stage is not None:` and the marker
+        # computed above repeated both tests; two copies of one predicate is how
+        # a column comes to say a filter ran on a run where it did not. Same for
+        # the three below. Behaviour is byte-for-byte what it was: each
+        # *_applied is exactly the conjunction it replaces.
+        if stage_filter_applied:
+            if is_stage_mismatch(patient_stage, trial):
+                stage_dropped += 1
+                continue
 
         # --- Histology filter ---
-        if not _skip_histology:
-            if patient_histology and is_histology_mismatch(patient_histology, trial):
+        if histology_filter_applied:
+            if is_histology_mismatch(patient_histology, trial):
                 histology_dropped += 1
                 continue
-        
+
         # --- Age filter ---
         min_age_str = eligibility.get("min_age", "0 Years")
         max_age_str = eligibility.get("max_age", "999 Years")
@@ -535,7 +590,7 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
             # a local, because the recovery must not become a new field in the
             # returned dict — see the note above the counter.
             age_unparsed += 1
-        elif patient_age is not None and not (min_age <= patient_age <= max_age):
+        elif age_filter_applied and not (min_age <= patient_age <= max_age):
             age_dropped += 1
             continue
 
@@ -546,7 +601,7 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
         # empty, where a default does not apply and `.upper()` raised.
         trial_sex = str(eligibility.get("sex") or "ALL").upper()
         if trial_sex != "ALL":
-            if patient_sex_comparable:
+            if sex_filter_applied:
                 if trial_sex != patient_sex.upper():
                     sex_dropped += 1
                     continue
@@ -597,6 +652,26 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
         log.warning("cancer site filter did not run; Stage 5 will not assert "
                     "that disease relevance was confirmed", stage=4,
                     filter="mesh_site", skip_reason=mesh_filter_skip_reason)
+
+    # ONE LINE PER FILTER THAT DID NOT RUN, at INFO rather than WARNING. The
+    # cancer site filter above is a WARNING because its absence changes what
+    # Stage 5 is TOLD; these four change only what was checked, and three of the
+    # four skip reasons are ordinary properties of a patient record (no stage
+    # recorded, no histology keyword, no usable birth date) rather than faults.
+    # A WARNING per patient for "this patient has no cancer stage" would be a
+    # warning on a large fraction of any real cohort, which is how a warning
+    # channel stops being read.
+    #
+    # `filter` and `skip_reason` are already on LOGGABLE_FIELDS; no widening.
+    for _name, _applied, _reason in (
+        ("cancer_stage", stage_filter_applied, stage_filter_skip_reason),
+        ("histology", histology_filter_applied, histology_filter_skip_reason),
+        ("age", age_filter_applied, age_filter_skip_reason),
+        ("sex", sex_filter_applied, sex_filter_skip_reason),
+    ):
+        if not _applied:
+            log.info("Stage 4 filter did not run for this patient", stage=4,
+                     filter=_name, status="skipped", skip_reason=_reason)
 
     log.info("rule-based filter complete", stage=4, duration_s=round(elapsed, 3),
              trials_in=len(trials), trials_out=len(quality_filtered),
@@ -662,6 +737,27 @@ def node_rule_based_filter(state: TrialMatchState) -> dict:
         # logged so a stored inference says whether the check ran.
         "mesh_filter_applied": mesh_filter_applied,
         "mesh_filter_skip_reason": mesh_filter_skip_reason,
+        # THE SAME PAIR FOR THE FOUR FILTERS THAT HAD A DROP COUNTER AND NO
+        # MARKER. Read nowhere in the pipeline -- unlike mesh_filter_applied,
+        # which Stage 5 consults -- and logged for exactly the reason
+        # mesh_resolution is: `stage_dropped = 0` is ambiguous on its own and
+        # this is what separates "checked, nothing to drop" from "never ran".
+        #
+        # These ARE new keys in this dict. The rule at the AGE_PARSE_FAILURES
+        # counter forbids that for a DEGRADATION counter, and these are not
+        # one: they are a FILTER's own accounting, the same argument the four
+        # quality_dropped_* keys above are admitted on. Re-measured rather than
+        # inherited: oncotriage/fixtures/capture.py's stage4 block names its
+        # keys one at a time, so a key added here is not in any fixture's
+        # deterministic prefix and costs no recapture.
+        "stage_filter_applied": stage_filter_applied,
+        "stage_filter_skip_reason": stage_filter_skip_reason,
+        "histology_filter_applied": histology_filter_applied,
+        "histology_filter_skip_reason": histology_filter_skip_reason,
+        "age_filter_applied": age_filter_applied,
+        "age_filter_skip_reason": age_filter_skip_reason,
+        "sex_filter_applied": sex_filter_applied,
+        "sex_filter_skip_reason": sex_filter_skip_reason,
         "stage_timings": {**state.get("stage_timings", {}), "rule_filter": round(elapsed, 3)}
     }
 

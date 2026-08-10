@@ -85,7 +85,10 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from oncotriage import config
-from oncotriage.observability import console
+from oncotriage.observability import console, get_logger
+
+
+log = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -282,11 +285,80 @@ def get_model_cost(model_name: str, input_tokens: int,
 #------------------------------------------------------------------------------
 
 
+QDRANT_RETRIES = Counter()
+"""Qdrant calls that ``qdrant_retry`` slept and retried, keyed by function name.
+
+Module-level, following ``INFERENCE_WRITE_RETRIES`` in
+``oncotriage/storage/database_logger.py`` rather than becoming a column: this is
+a property of the RUN and of the network under it, not of any one patient. A
+retry can happen inside ``build_bm25_index_from_qdrant`` before the first
+patient exists and inside ``compute_collection_digest`` after the last one, so
+there is no row it could belong to.
+
+WHAT IT REPLACES: nothing, which was the defect. ``qdrant_retry`` decorates
+six call sites across the agent, the indexer, the trial lookup and the fixture
+harness, and until this counter existed a run in which every Qdrant call
+succeeded and a run in which a third of them succeeded only on the second
+attempt were the same run in every record the project kept. Retrying IS the
+right recovery; not saying it happened is not.
+
+KEYED BY THE DECORATED FUNCTION'S NAME because that is what makes it
+actionable: `_scroll_page` retrying says the collection scan is struggling,
+`_search` retrying says query time is. `retry_state.fn` is None on tenacity's
+statistics-only paths, so the key falls back to a named sentinel rather than
+letting the hook raise -- a counter that can take down the call it is counting
+is worse than no counter.
+
+ATTEMPTS, NOT CALLS, and the distinction is `INFERENCE_WRITE_RETRIES`'s: three
+retries of one call and one retry of three calls are the same total and
+different findings, and the total is what a run-end summary can act on.
+"""
+
+_QDRANT_RETRY_UNNAMED = "<unnamed>"
+"""Key used when tenacity's retry state carries no function to name.
+
+A documented constant rather than a bare literal, because a run reporting
+retries under this key means the hook fired somewhere the name was not
+recoverable -- which is a finding about tenacity's call path, not about Qdrant.
+"""
+
+
+def _count_qdrant_retry(retry_state) -> None:
+    """``before_sleep`` hook: record that a Qdrant call is about to be retried.
+
+    Fires once per SLEEP, so a call that succeeds first time records nothing and
+    a call that exhausts the three attempts records two. It does not decide
+    anything -- tenacity's stop, wait and exception predicates are untouched by
+    this pass -- and it must not raise, because it runs inside the retry
+    machinery of a call that has already failed once.
+    """
+    fn = getattr(retry_state, "fn", None)
+    name = getattr(fn, "__qualname__", None) or _QDRANT_RETRY_UNNAMED
+    QDRANT_RETRIES[name] += 1
+
+    outcome = getattr(retry_state, "outcome", None)
+    exc = outcome.exception() if outcome is not None and outcome.failed else None
+    # `attempts`, `delay_s`, `error_type` and `event` are already on
+    # LOGGABLE_FIELDS. The function NAME is deliberately not a field: adding one
+    # would widen the allowlist for a value the counter already carries and the
+    # run-end summary already prints. It is a code identifier, so the reason is
+    # surface area rather than confidentiality.
+    log.warning("Qdrant call failed; retrying", event="qdrant_retry",
+                attempts=retry_state.attempt_number,
+                delay_s=round(getattr(retry_state.next_action, "sleep", 0.0), 3),
+                error_type=type(exc).__name__ if exc is not None else None)
+
+
 # Tenacity retry decorator for Qdrant operations (network hiccups, timeouts)
+#
+# THE ATTEMPTS, WAITS AND EXCEPTION CLASSES ARE UNCHANGED. The only addition is
+# before_sleep, which counts and logs; tenacity calls it between the failure and
+# the sleep, so it cannot alter what is retried or for how long.
 qdrant_retry = retry(
     wait=wait_exponential(multiplier=1, min=2, max=10),
     stop=stop_after_attempt(3),
     retry=retry_if_exception_type((httpx.ConnectError, httpx.TimeoutException, UnexpectedResponse)),
+    before_sleep=_count_qdrant_retry,
 )
 
 

@@ -273,6 +273,64 @@ INFERENCE_COLUMN_ADDITIONS = {
     # belongs in the record of the inference it shaped.
     "mesh_filter_applied":          "INTEGER",
     "mesh_filter_skip_reason":      "TEXT",
+    # The same pair for the four Stage 4 filters that had a drop counter and no
+    # marker. mesh_dropped got mesh_filter_applied because Stage 5's prompt
+    # depends on it; stage_dropped, histology_dropped, age_dropped and
+    # sex_dropped got nothing, so a 0 in any of those four columns meant both
+    # "checked, nothing to drop" and "never checked" -- exactly the ambiguity
+    # mesh_resolution was added to remove one column over.
+    #
+    # Each *_applied is 1/0/NULL on the same convention as mesh_filter_applied:
+    # NULL is "Stage 4 did not report", never "did not run". Each
+    # *_skip_reason is 'applied' when it ran, or one of that filter's own
+    # constants in oncotriage/agent/state.py:
+    #
+    #   stage      'ablation_skipped' | 'no_patient_stage'
+    #   histology  'ablation_skipped' | 'no_patient_histology'
+    #   age        'no_patient_age'            (never ablated)
+    #   sex        'sex_not_comparable'        (never ablated)
+    #
+    # THE AGE MARKER IS PATIENT-LEVEL AND DOES NOT COVER PER-TRIAL SKIPS. A
+    # trial whose own min_age/max_age text will not parse is kept and skipped
+    # individually; that is recorded in agent/filtering.py's AGE_PARSE_FAILURES
+    # and in the Stage 4 log line's `age_unparsed`, not here. So
+    # `age_filter_applied = 1 AND age_dropped = 0` still admits "every trial's
+    # bounds were unreadable", and the counter is where that is answered.
+    "stage_filter_applied":         "INTEGER",
+    "stage_filter_skip_reason":     "TEXT",
+    "histology_filter_applied":     "INTEGER",
+    "histology_filter_skip_reason": "TEXT",
+    "age_filter_applied":           "INTEGER",
+    "age_filter_skip_reason":       "TEXT",
+    "sex_filter_applied":           "INTEGER",
+    "sex_filter_skip_reason":       "TEXT",
+    # --- The one-glance degradation marker ---------------------------------
+    #
+    # 1 = at least one degradation signal fired on this run; 0 = none did;
+    # NULL = this row did not come from a pipeline terminal node, or predates
+    # the column. Derived in oncotriage/agent/terminal.py:_derive_degraded_run,
+    # which is where the exact predicate and every term left out of it are
+    # argued -- read that before querying this.
+    #
+    # IT IS A SUMMARY, NOT A MEASUREMENT. Every term is a column that is
+    # already here (error, retrieval_degraded, mesh_filter_skip_reason,
+    # llm_classifier_retries, not_evaluable_truncated), and this column exists
+    # only so "was anything wrong with this run" is one predicate rather than
+    # five with three different NULL conventions between them.
+    #
+    # 0 DOES NOT ASSERT THAT EVERY CHECK RAN. A run that ended at
+    # node_no_candidates before Stage 4 stores 0 with mesh_filter_applied NULL
+    # beside it. The stronger question -- "clean AND fully observed" -- is
+    # `degraded_run = 0 AND retrieval_degraded IS NOT NULL AND
+    # mesh_filter_applied IS NOT NULL`. This is deliberate and the reason is at
+    # the derivation.
+    #
+    # WHY THIS IS A COLUMN WHILE INFERENCE_WRITE_FAILURES IS NOT. This is a
+    # per-PATIENT observation and it belongs on the patient's row. That counter
+    # is a per-RUN property, and a column recording that a row could not be
+    # written is circular -- the argument is at the counter, and this pass did
+    # not weaken it.
+    "degraded_run":                 "INTEGER",
     # --- Age provenance (item 12) -------------------------------------------
     # The date this run computed patient ages against (DATA_SNAPSHOT_DATE,
     # File 03), and how much of the patient's birthDate the record carried.
@@ -1315,13 +1373,18 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 retrieval_channels_ok, retrieval_degraded,
                 retrieval_trials_lost, query_expansion_path,
                 mesh_filter_applied, mesh_filter_skip_reason,
+                stage_filter_applied, stage_filter_skip_reason,
+                histology_filter_applied, histology_filter_skip_reason,
+                age_filter_applied, age_filter_skip_reason,
+                sex_filter_applied, sex_filter_skip_reason,
+                degraded_run,
                 age_reference_date, birth_date_precision,
                 ecog_value, ecog_selection, ecog_observations_found,
                 llm_classifier_truncation_splits, llm_classifier_output_tokens_estimated,
                 not_evaluable_truncated, llm_classifier_calls,
                 llm_classifier_reasoning_tokens,
                 llm_classifier_prompt_version, llm_classifier_prompt_sha256
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             result["patient_id"],
             result["timestamp"],
@@ -1416,6 +1479,29 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
             (None if result.get("mesh_filter_applied") is None
              else int(bool(result["mesh_filter_applied"]))),
             result.get("mesh_filter_skip_reason"),
+            # The four other Stage 4 filters, same three-state treatment. The
+            # bool -> 0/1 conversion is written out per column rather than
+            # looped, because the VALUES tuple is positional and a loop here
+            # would put the column order in two places.
+            (None if result.get("stage_filter_applied") is None
+             else int(bool(result["stage_filter_applied"]))),
+            result.get("stage_filter_skip_reason"),
+            (None if result.get("histology_filter_applied") is None
+             else int(bool(result["histology_filter_applied"]))),
+            result.get("histology_filter_skip_reason"),
+            (None if result.get("age_filter_applied") is None
+             else int(bool(result["age_filter_applied"]))),
+            result.get("age_filter_skip_reason"),
+            (None if result.get("sex_filter_applied") is None
+             else int(bool(result["sex_filter_applied"]))),
+            result.get("sex_filter_skip_reason"),
+            # The one-glance marker. No default: a result dict that did not
+            # come from a terminal node reports NULL, which is the honest
+            # value -- nothing is known about whether that run was degraded.
+            # int(bool(...)) rather than the raw value so a caller handing back
+            # True/False stores 1/0 like every other flag column.
+            (None if result.get("degraded_run") is None
+             else int(bool(result["degraded_run"]))),
             # Age provenance. The reference date comes from the result, written
             # by _pipeline_provenance() (File 13) on all three terminal paths;
             # it falls back to the patient dict only for a caller that logs a

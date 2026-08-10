@@ -94,6 +94,7 @@ import random
 import sqlite3
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -118,7 +119,11 @@ from oncotriage.storage.database_logger import (
     resolve_inference_db_path,
 )
 from oncotriage.utils import CaffeinateSession
-from oncotriage.observability import console
+from oncotriage.observability import console, get_logger
+from oncotriage import degradation
+
+
+log = get_logger(__name__)
 
 
 #------------------------------------------------------------------------------
@@ -335,21 +340,221 @@ def clear_all() -> None:
 # RESULTS HELPERS
 # ===========================================================================
 
-def load_results() -> list:
+RESULTS_FILE_FAILURES = Counter()
+"""Results-file faults, keyed ``{phase}:{ExceptionType}``.
+
+Module-level, following ``CHECKPOINT_WRITE_FAILURES`` in
+``oncotriage/ablation/study.py`` and ``INFERENCE_WRITE_FAILURES`` in the storage
+layer rather than becoming a column: this is a property of the RUN's state files,
+and there is no patient row it belongs to -- the whole point is that the fault
+happens BEFORE the first patient of a resumed run.
+
+Phases:
+    ``load:``      the file existed and could not be read back
+    ``shape:``     it parsed, and was not a JSON array
+    ``preserve:``  the unreadable file could not be renamed out of the way, so
+                   the next write WILL destroy it. The most serious key here.
+"""
+
+CORRUPT_RESULTS_SUFFIX = ".corrupt"
+"""Suffix the unreadable results file is renamed to before anything can replace it."""
+
+
+# THE COUNTER JOINS THE REGISTRY HERE, not in oncotriage/degradation.py, and the
+# direction of the import is why: this module CALLS the degradation report, so
+# that module cannot import this one back without a cycle. Registration at the
+# owner's module scope is the documented second route, and it is a dict insert
+# -- no file, no client, no process -- so "importing a package module does
+# nothing" is intact. It sits immediately below the counter it registers, so a
+# reader cannot find one without the other.
+degradation.register(
+    "RESULTS_FILE_FAILURES", RESULTS_FILE_FAILURES,
+    "the per-patient results FILE could not be read, was not an array, or "
+    "could not be preserved; the checkpoint is unaffected and no patient was "
+    "re-run because of it")
+
+
+class ResultsLoad(list):
+    """The loaded results, plus whether they were loaded.
+
+    A ``list`` SUBCLASS, and forced rather than clever -- the same shape and the
+    same reason as ``InferenceWriteResult`` being a ``str`` subclass in the
+    storage layer. ``main()`` hands this object to ``run_batch``,
+    ``run_resample`` and ``print_summary``, and ``append_result`` MUTATES IT IN
+    PLACE, so the object identity is the thread the whole run hangs on. A tuple
+    return would have meant unpacking at one call site and threading a second
+    variable through three signatures to carry one fact.
+
+    Because it is mutated in place, ``print_summary`` reads the outcome off the
+    same object it is already given -- the fact travels with the data rather
+    than as a parallel argument that can be forgotten.
+
+    ``ok`` is FALSE ONLY FOR "COULD NOT LOAD", never for "loaded nothing". An
+    empty results file, a first run with no file at all, and a file of two
+    hundred entries are all ``ok=True``; only a decode error, an OS error or a
+    non-array payload is ``ok=False``. That distinction is the return-contract
+    half of this fix: before it, all four cases returned ``[]``.
+    """
+
+    __slots__ = ("ok", "error", "preserved_path", "source_path")
+
+    def __new__(cls, entries, **kwargs):
+        return super().__new__(cls, entries)
+
+    def __init__(self, entries, ok=True, error=None, preserved_path=None,
+                 source_path=None):
+        super().__init__(entries)
+        self.ok = ok
+        self.error = error
+        self.preserved_path = preserved_path
+        self.source_path = source_path
+
+
+_PRESERVE_EXHAUSTED = "SidecarNamesExhausted"
+"""Counter key for "1000 .corrupt sidecars already exist beside the results file".
+
+A NAMED CONSTANT rather than a slice of the message, because the message has no
+colon and the first draft keyed the counter on `error.split(':')[0]` -- which for
+this branch is the whole 80-character sentence. A counter key that is a sentence
+is a counter nobody can aggregate.
+"""
+
+
+def _preserve_corrupt_results(rp) -> tuple:
+    """Rename an unreadable results file out of the way. Returns (path, error, key).
+
+    The third member is the COUNTER KEY for the failure, decided here rather
+    than derived from the message text at the call site.
+
+    BEFORE ANY WRITE CAN REPLACE IT, which is the point. ``append_result`` does
+    write-temp-then-``os.replace``, so the FIRST patient of a resumed run
+    overwrote the unreadable file with a one-entry list and every prior
+    patient's results were gone -- irrecoverably, silently, and while the run
+    reported success.
+
+    THE SUFFIX IS NUMBERED WHEN IT COLLIDES. A fixed ``.corrupt`` would let the
+    second corruption destroy the copy taken at the first, which is the same
+    data loss one step removed. ``os.replace`` is deliberately not used to pick
+    the name -- it overwrites -- so the first free suffix is searched for and
+    ``os.rename`` onto it is guarded by that search.
+
+    A RENAME FAILURE IS RETURNED, NOT RAISED. Losing the prior results is bad;
+    failing the whole run because they could not be renamed is worse, and the
+    caller records it under the ``preserve:`` key precisely so the operator is
+    told the next write is about to destroy the file.
+    """
+    for suffix in range(0, 1000):
+        candidate = rp.with_name(
+            rp.name + CORRUPT_RESULTS_SUFFIX + (f".{suffix}" if suffix else ""))
+        if candidate.exists():
+            continue
+        try:
+            os.rename(rp, candidate)
+            return str(candidate), None, None
+        except OSError as exc:
+            return None, f"{type(exc).__name__}: {exc}", type(exc).__name__
+    return (None,
+            "1000 .corrupt sidecars already exist beside the results file; "
+            "refusing to guess a name",
+            _PRESERVE_EXHAUSTED)
+
+
+def load_results() -> ResultsLoad:
     """
     Load existing per-patient results from results file.
 
     Returns:
-        List of result summary dicts. Empty list if file does not exist.
+        A ``ResultsLoad`` -- a list of result summary dicts carrying ``ok``,
+        ``error`` and ``preserved_path``. Empty AND ``ok=True`` when the file
+        does not exist; empty and ``ok=False`` when it existed and could not be
+        read, in which case the unreadable file has been renamed to a
+        ``.corrupt`` sidecar and ``preserved_path`` names it.
+
+    WHAT THIS USED TO DO, AND THE FULL CONSEQUENCE. It caught
+    ``(json.JSONDecodeError, OSError)`` and returned ``[]`` with no log, no
+    counter and no trace. On a RESUME that is not a degraded read, it is
+    permanent data loss in three steps: the results list comes back empty, the
+    final summary is then computed over this session's patients only (so a run
+    that resumed at patient 19,000 reports statistics for the last 3,000 and
+    looks like a small clean run), and the first ``append_result`` REPLACES the
+    unreadable file with a one-entry list -- destroying every prior patient's
+    results, including the ones that were still readable JSON before whatever
+    truncated the tail.
+
+    WHAT DOES NOT CHANGE: the checkpoint. ``load_checkpoint()`` is untouched and
+    is still the only thing that decides what re-runs. The results file is a
+    report; the checkpoint is the ledger. A corrupt report must not cause 19,000
+    patients to be re-run at ~$0.15 each, and this function deliberately does
+    not touch the thing that would.
+
+    WHAT THE CALLER DOES DIFFERENTLY, per case:
+
+        file absent           ok=True,  []           -- unchanged; fresh run
+        file is []            ok=True,  []           -- unchanged; nothing to resume
+        file is [...]         ok=True,  [...]        -- unchanged
+        unreadable            ok=False, []           -- NEW: the file is renamed
+                                                        to .corrupt, the fault is
+                                                        logged and counted, and
+                                                        print_summary states that
+                                                        prior results were not
+                                                        loaded, so the per-pass
+                                                        statistics below it are
+                                                        read as partial
     """
     rp = _results_path()
     if not rp.exists():
-        return []
+        return ResultsLoad([], source_path=str(rp))
+
     try:
         with open(rp, "r") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return []
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        return _unreadable_results(rp, f"{type(e).__name__}: {e}",
+                                   f"load:{type(e).__name__}")
+
+    # A payload that parses and is not a list is unreadable for this purpose:
+    # `results_list.append(...)` on a dict raises inside the thread pool, and
+    # `[r for r in results_list ...]` in print_summary would iterate its keys.
+    # Same treatment, its own phase key, because "truncated file" and "somebody
+    # wrote a different shape here" want different fixes.
+    if not isinstance(data, list):
+        return _unreadable_results(
+            rp, f"expected a JSON array, found {type(data).__name__}",
+            f"shape:{type(data).__name__}")
+
+    return ResultsLoad(data, source_path=str(rp))
+
+
+def _unreadable_results(rp, error: str, counter_key: str) -> ResultsLoad:
+    """Count, preserve, log, and return the could-not-load answer.
+
+    Shared by both unreadable branches so the counter key is the only thing
+    that differs between them -- two copies of this sequence is two chances for
+    one of them to stop preserving the file.
+    """
+    RESULTS_FILE_FAILURES[counter_key] += 1
+    preserved, preserve_error, preserve_key = _preserve_corrupt_results(rp)
+
+    if preserved:
+        # Named like load_checkpoint's warning, which is the shape this branch
+        # should always have had.
+        console.out(f"[Results] WARNING: Could not read results file ({error}). "
+                    f"The unreadable file has been preserved as {preserved} and "
+                    f"this run starts its results list empty. THE CHECKPOINT IS "
+                    f"UNAFFECTED: no patient will be re-run because of this.")
+    else:
+        RESULTS_FILE_FAILURES[f"preserve:{preserve_key}"] += 1
+        console.out(f"[Results] WARNING: Could not read results file ({error}), "
+                    f"AND could not preserve it ({preserve_error}). The next "
+                    f"write WILL overwrite it and its contents will be lost. "
+                    f"Copy {rp} elsewhere now if it matters. THE CHECKPOINT IS "
+                    f"UNAFFECTED.")
+
+    log.warning("results file could not be loaded", event="results_load_failed",
+                status="degraded", error_message=error, db_path=str(rp))
+
+    return ResultsLoad([], ok=False, error=error, preserved_path=preserved,
+                       source_path=str(rp))
 
 
 def append_result(results_list: list, entry: dict) -> None:
@@ -1192,7 +1397,8 @@ def print_reconciliation(rec: dict) -> None:
 
 
 def print_summary(results_list: list, total_wall_time: float, db_path=None,
-                  reconciliation: dict = None) -> None:
+                  reconciliation: dict = None,
+                  degradation_snapshot: dict = None) -> None:
     """
     Print a concise final summary report for the entire batch run.
 
@@ -1212,6 +1418,20 @@ def print_summary(results_list: list, total_wall_time: float, db_path=None,
                           summary that reads "Run complete." with no
                           reconciliation is exactly the report this pass exists
                           to stop being trusted.
+        degradation_snapshot:
+                          What oncotriage/degradation.py:snapshot() returned, or
+                          None to skip the block. TAKEN BY THE CALLER, not read
+                          here, for the reason reconciliation is passed rather
+                          than recomputed: main() takes ONE snapshot and gives it
+                          to both the printed block and the logged event, so the
+                          two describe the same instant. Reading the live
+                          counters here would let a line the report itself emits
+                          move a counter (EMIT_FAILURES) between the event and
+                          the block.
+
+                          {} is a REAL VALUE and is not None: it means every
+                          counter was read and every one was zero, and the block
+                          says so. None means nobody asked.
     """
     main_results = [r for r in results_list if not r.get("is_resample")]
     resample_results = [r for r in results_list if r.get("is_resample")]
@@ -1265,6 +1485,33 @@ def print_summary(results_list: list, total_wall_time: float, db_path=None,
     console.out(f"Database:         {resolve_inference_db_path(db_path)}")
     console.out()
 
+    # THE RESUMED-RUN CAVEAT GOES ABOVE THE STATISTICS IT QUALIFIES, which is
+    # the opposite of where the reconciliation block sits and for the same
+    # reason: the reconciliation is a VERDICT on the run and belongs at the
+    # bottom where a reader stops, while this changes how every number below it
+    # must be read. A run whose prior results could not be loaded reports
+    # per-pass statistics over THIS SESSION's patients only, and without this
+    # line a resumed run that lost 19,000 prior entries looks like a small clean
+    # run. The fact is read off the results object itself, which append_result
+    # mutated in place, so it cannot be forgotten at the call site.
+    if getattr(results_list, "ok", True) is False:
+        console.out("--- PRIOR RESULTS WERE NOT LOADED ---")
+        console.out(f"  the results file could not be read: "
+                    f"{getattr(results_list, 'error', 'unknown')}")
+        _preserved = getattr(results_list, "preserved_path", None)
+        if _preserved:
+            console.out(f"  it was preserved as: {_preserved}")
+        else:
+            console.out("  it could NOT be preserved, and has been overwritten "
+                        "by this run's writes.")
+        console.out("  EVERY STATISTIC BELOW COVERS THIS SESSION'S PATIENTS "
+                    "ONLY. Patients completed by an earlier run are absent from "
+                    "them.")
+        console.out("  The checkpoint was NOT affected, so no patient was "
+                    "re-run because of this, and the database still holds every "
+                    "earlier row.")
+        console.out()
+
     console.out("--- MAIN PASS ---")
     if main_stats:
         for k, v in main_stats.items():
@@ -1291,6 +1538,15 @@ def print_summary(results_list: list, total_wall_time: float, db_path=None,
     # ordering argument: the thing a reader looks for is the bottom of the
     # output, so the statement about whether the data is whole belongs there
     # rather than above the per-pass statistics it qualifies.
+    # THE DEGRADATION BLOCK SITS ABOVE THE RECONCILIATION, and the order is
+    # argued rather than arbitrary. The reconciliation is the run's VERDICT and
+    # File 19's rule puts a verdict last; this is evidence, and one of its
+    # counters (INFERENCE_WRITE_FAILURES) is evidence FOR that verdict, so it
+    # reads as the reasoning above the conclusion rather than as an appendix
+    # below it.
+    if degradation_snapshot is not None:
+        degradation.print_report(degradation_snapshot)
+
     if reconciliation is not None:
         print_reconciliation(reconciliation)
 
@@ -1445,8 +1701,20 @@ def main():
         total_wall_time = time.time() - run_start
         reconciliation = reconcile_writes(rows_before=rows_before)
         _publish_reconciliation(reconciliation)
+
+        # ONE SNAPSHOT, TWO CONSUMERS, exactly as the reconciliation above is
+        # computed once and given to both the publisher and the printer. The
+        # structured event goes out FIRST because emitting it can itself move
+        # EMIT_FAILURES; taking the snapshot before either consumer means the
+        # printed block and the logged event agree, and a failure to emit the
+        # event shows up in the NEXT run's report rather than making this one's
+        # two halves disagree about their own subject.
+        degradation_snapshot = degradation.snapshot()
+        degradation.log_summary(degradation_snapshot)
+
         print_summary(results_list, total_wall_time,
-                      reconciliation=reconciliation)
+                      reconciliation=reconciliation,
+                      degradation_snapshot=degradation_snapshot)
 
         # ------------------------------------------------------------------
         # 7. Clean up checkpoint only if all main-pass patients succeeded

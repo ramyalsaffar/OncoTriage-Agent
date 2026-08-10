@@ -82,6 +82,57 @@ MESH_FILTER_SKIP_ABLATED = "ablation_skipped"    # skip_mesh_filter flag set
 MESH_FILTER_SKIP_NO_FILTER = "no_mesh_filter"    # MeSH data files never loaded
 MESH_FILTER_SKIP_NO_TREES = "no_patient_trees"   # patient never resolved to C04 trees
 
+# --- Stage 4, whether the OTHER four per-trial filters ran -------------------
+#
+# THE SAME FACT MESH_FILTER_APPLIED RECORDS, FOR THE FOUR FILTERS THAT DID NOT
+# RECORD IT. Every drop in Stage 4 had a counter; only the cancer site filter
+# had a marker saying whether the filter that owns the counter ran at all. So
+# ``stage_dropped = 0`` meant three different things -- "checked, nothing to
+# drop", "the ablation flag disabled it", "this patient has no stage" -- and
+# a stored funnel could not separate them. Same for histology, age and sex.
+#
+# The vocabularies are deliberately NOT shared with MESH_FILTER_SKIP_*. Each
+# filter's reasons are its own: sharing a constant would mean a reader of one
+# column having to know that a value it can never produce belongs to another
+# filter, which is the shape TRIAL_STATUS_FULL had before pass 20f-3 deleted
+# it. What IS shared is the word "applied" and the suffix "ablation_skipped",
+# because those two mean the same thing everywhere and a second spelling of
+# either would be the drift this file exists to prevent.
+FILTER_APPLIED = "applied"
+FILTER_SKIP_ABLATED = "ablation_skipped"
+
+# Cancer stage filter. Gated on the ablation flag AND on the patient having a
+# resolvable stage ordinal; extraction/stage.py returns None for both "no stage
+# recorded" and "a stage was recorded that no tier could read", and
+# inferences.mesh_resolution's sibling for that distinction does not exist, so
+# this says only that the filter had nothing to compare with.
+STAGE_FILTER_SKIP_NO_PATIENT_STAGE = "no_patient_stage"
+
+# Histology filter. Gated on the ablation flag AND on the patient's condition
+# displays producing at least one histology tag. An untagged patient is not a
+# degraded run -- most cancers carry no histology keyword -- but it IS a run in
+# which histology_dropped could not have been anything but 0.
+HISTOLOGY_FILTER_SKIP_NO_PATIENT_HISTOLOGY = "no_patient_histology"
+
+# Age filter. Never ablated. Gated on the patient having a computable age,
+# which is birth_date_precision's business: "missing", "unparseable" and
+# "after_reference" all yield age None and no trial's window can be tested.
+#
+# NOTE WHAT THIS DOES NOT COVER. It is a PATIENT-level marker. A trial whose
+# own min_age/max_age text will not parse is skipped individually, kept, and
+# recorded in agent/filtering.py's AGE_PARSE_FAILURES plus the `age_unparsed`
+# field of the Stage 4 log line. So `age_filter_applied = 1` with
+# `age_dropped = 0` still admits "every trial's bounds were unreadable"; the
+# counter is where that is answered, not this column.
+AGE_FILTER_SKIP_NO_PATIENT_AGE = "no_patient_age"
+
+# Sex filter. Never ablated. Gated on the patient's recorded sex being
+# expressible in the trial vocabulary (ALL / MALE / FEMALE) -- see
+# _COMPARABLE_PATIENT_SEXES in agent/filtering.py. When it is not, sex-specific
+# trials are KEPT rather than dropped and counted in SEX_UNKNOWN_KEPT, which is
+# the governing rule stated at that counter: a filter that cannot decide keeps.
+SEX_FILTER_SKIP_NOT_COMPARABLE = "sex_not_comparable"
+
 
 # --- Stages 5 and 6, the trial-level verdict ---------------------------------
 #
@@ -321,6 +372,24 @@ class TrialMatchState(TypedDict):
     # assert that disease relevance was confirmed. Both are logged.
     mesh_filter_applied: bool
     mesh_filter_skip_reason: str
+
+    # The same pair for the four filters that had a drop counter and no marker.
+    # Each *_applied is a bool decided ONCE, outside the per-trial loop, because
+    # every one of the conditions is loop-invariant; each *_skip_reason is
+    # FILTER_APPLIED when it ran and one of that filter's own skip constants
+    # when it did not. All eight are logged.
+    #
+    # Read them the way mesh_filter_applied is read: a drop count of 0 beside
+    # applied=1 is "checked, nothing to drop", and beside applied=0 it is "the
+    # filter never ran", and those are not the same run.
+    stage_filter_applied: bool
+    stage_filter_skip_reason: str
+    histology_filter_applied: bool
+    histology_filter_skip_reason: str
+    age_filter_applied: bool
+    age_filter_skip_reason: str
+    sex_filter_applied: bool
+    sex_filter_skip_reason: str
 
     # --- Stage 5: LLM Classifier Evaluation ---
     evaluations: List[Dict]                     # Criterion-level match results

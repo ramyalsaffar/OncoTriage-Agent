@@ -944,6 +944,63 @@ _trial_columns = {
     r[1] for r in _conn.execute("PRAGMA table_info(trial_matches)")
 }
 check("trial_matches.hallucinated exists", "hallucinated" in _trial_columns, True)
+
+
+# ── TEST 6b: degraded_run separates 0 from NULL, the same way ──────────────
+#
+# THE NEW KEY, ASSERTED BY THIS FILE'S CONVENTION AND NOT MORE. Test 1 above
+# already proves all three terminal nodes DECLARE it -- it rides in
+# _pipeline_provenance, so a key on one path only is structurally impossible --
+# and tests/test_agent_degraded_run_and_reporting.py owns the derivation matrix
+# (clean state, each contributing observation alone, the never-reached arm).
+# What belongs HERE is the thing this file is about: that the column exists and
+# that the writer's three states reach it.
+#
+# The two rows below were already written above for Test 6 and are re-read for
+# a different column, which is deliberate: a second pair of log_inference calls
+# would be a second chance for one of them to write a different result dict.
+print("\n" + "=" * 70)
+print("Test 6b: degraded_run is 0/1 from a terminal node, NULL without one")
+print("=" * 70)
+
+check("inferences.degraded_run exists", "degraded_run" in _row.keys(), True)
+check("a clean run through node_finalize stores 0",
+      _row["degraded_run"], 0)
+check("...and it is a stored 0, not a NULL that compares equal to nothing",
+      _row["degraded_run"] is None, False)
+
+_conn4 = sqlite3.connect(inferences_path)
+_conn4.row_factory = sqlite3.Row
+_degraded_null = _conn4.execute(
+    "SELECT degraded_run FROM inferences WHERE patient_id = ? "
+    "ORDER BY id DESC LIMIT 1", ("hand-built-no-terminal-node",)).fetchone()
+check("a result dict that never met a terminal node stores NULL",
+      _degraded_null["degraded_run"] if _degraded_null else "<no row>", None)
+
+# The 1 arm, through the real INSERT rather than through the derivation alone:
+# a Stage 5 failure is what node_error_handler is reached by, and `error` being
+# non-empty is the first term of the predicate.
+_degraded_result = node_error_handler(make_terminal_state(
+    error="planted Stage 5 failure",
+))["result"]
+_degraded_result["patient_id"] = "degraded-run-error-path"
+check_wrote_to_scratch(
+    "the degraded result was written to the scratch database",
+    log_inference(_degraded_result, PATIENT_DATA, db_path=inferences_path))
+_degraded_row = _conn4.execute(
+    "SELECT degraded_run FROM inferences WHERE patient_id = ? "
+    "ORDER BY id DESC LIMIT 1", ("degraded-run-error-path",)).fetchone()
+check("a run that ended at the error handler stores 1",
+      _degraded_row["degraded_run"] if _degraded_row else "<no row>", 1)
+# NON-DEGENERACY: without this the three arms above could all be reading one
+# constant. They are three different values from one column in one database.
+check("the three arms are three distinct stored values (non-degeneracy)",
+      sorted({0, None, 1} - {_row["degraded_run"],
+                             _degraded_null["degraded_run"],
+                             _degraded_row["degraded_run"]}, key=str),
+      [])
+_conn4.close()
+
 _conn.close()
 
 

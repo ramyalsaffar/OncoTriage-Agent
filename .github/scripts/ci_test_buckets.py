@@ -108,6 +108,20 @@ BUCKETS = {
         _A, None, "ran green in 8.3s; registries and clients replaced through deps"),
     "test_agent_age_units_and_sex_filter.py": (
         _A, None, "ran green in 1.8s; plants into in-memory copies, reads no git"),
+    "test_agent_degraded_run_and_reporting.py": (
+        _A, None,
+        "ran green in 2.6s, 118 checks, against ONLY the directory skeleton: "
+        "the degraded_run derivation and its column, the four Stage 4 "
+        "filter-applied markers, QDRANT_RETRIES through tenacity's own "
+        "machinery, load_results' corrupt-file preservation and the run-end "
+        "degradation report. Every patient and trial is a literal dict, the "
+        "MeSH filter is replaced through oncotriage/agent/deps.py, the "
+        "database is a temp file every log_inference call is pointed at "
+        "explicitly and the results path is redirected through "
+        "paths._RESOLVED -- no network, no keys, no spend, no live Qdrant, no "
+        "git, no corpus. It execs nothing: the controls feed different inputs "
+        "to a pure function, create genuinely corrupt files, or rebind a "
+        "module attribute inside try/finally"),
     "test_agent_mesh_boost_and_quality_gate.py": (
         _A, None, "ran green in 1.8s once the two vendored MeSH lookups are seeded"),
     "test_agent_out_of_set_detector.py": (
@@ -218,7 +232,12 @@ BUCKETS = {
         "'File 42 exited 1 with NO defect planted, so a non-zero exit proves nothing'"),
     "test_degraded_dependencies.py": (
         _B, "the real Synthea patient corpus",
-        "IndexError on an empty corpus list, then NameError: '_dry_counts' (see report)"),
+        "148 passed, 1 failed on the skeleton: 'there are real bundles to "
+        "copy (non-degeneracy): 0'. THE EVIDENCE HERE USED TO READ 'IndexError "
+        "on an empty corpus list, then NameError: _dry_counts' -- that cascade "
+        "buried the real cause and killed the file with no summary; it is "
+        "fixed, and the recorded outcome is now the diagnostic the file always "
+        "measured and never got to print"),
     "test_config_snapshot_date_rot.py": (
         _B, "the generated scratch_ecog Synthea corpus (it runs ecog_surfacing)",
         "'baseline for test_fhir_ecog_surfacing.py is usable' failed"),

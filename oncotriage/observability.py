@@ -612,6 +612,14 @@ LOGGABLE_FIELDS = frozenset({
     # not covered by `count`/`total`/`lost` without conflating three numbers
     # that only mean anything side by side.
     "attempted", "verified", "missing",
+    # The run-end degradation summary: {counter NAME: total}. Names only, and
+    # that restriction is the reason this is allowlistable at all -- a counter
+    # name is a code identifier, while counter KEYS carry third-party and
+    # clinical text (SEX_UNKNOWN_KEPT is keyed by the patient's recorded sex,
+    # M_CATEGORY_UNREADABLE by a capped observation display). The keys go to the
+    # console block, which is transient, on the same footing as the Stage 5
+    # response preview. See oncotriage/degradation.py:totals().
+    "degradation_totals",
     # Which attempt of SQLITE_WRITE_MAX_ATTEMPTS succeeded or gave up. `retry`
     # is already here but means "the retry index" at the OpenAI call sites, and
     # a write that succeeded first time has made zero retries and one attempt.

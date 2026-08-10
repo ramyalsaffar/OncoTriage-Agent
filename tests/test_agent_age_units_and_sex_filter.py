@@ -244,9 +244,17 @@ _SEX_NORMALISE_LINES = (
     '    _raw_patient_sex = demographics.get("sex")\n'
     '    patient_sex = ("unknown" if _raw_patient_sex is None\n'
     '                   else str(_raw_patient_sex).strip().lower())')
+# THE `if` READS sex_filter_applied, NOT patient_sex_comparable, AND THE
+# CONTROL IS UNCHANGED BY THAT. The filter-applied marker pass made the marker
+# BE the loop's predicate rather than a second copy of it -- one name assigned
+# once, read in the loop and returned as sex_filter_applied -- so this quotation
+# tracks the shipped source, which is what it is for. The replacement below
+# names neither variable: it substitutes the whole block for the pre-fix
+# one-liner, so what this control asserts (the old predicate drops every
+# sex-specific trial for an unknown sex) is the same claim it always made.
 _SEX_PREDICATE_BLOCK = (
     '        if trial_sex != "ALL":\n'
-    '            if patient_sex_comparable:\n'
+    '            if sex_filter_applied:\n'
     '                if trial_sex != patient_sex.upper():\n'
     '                    sex_dropped += 1\n'
     '                    continue\n'
@@ -614,15 +622,28 @@ check("...so one number could not have told them apart, which is why there "
 
 
 # ===========================================================================
-# TEST 4: THE RETURNED DICT GAINED NO KEY
+# TEST 4: THE RETURNED DICT GAINED NO RECOVERY-RECORD KEY
 # ===========================================================================
-# The twelve characterization fixtures diff Stage 4's output field by field, so
-# a recovery record that became a key here would cost twelve live GPT-4o runs
-# to recapture. Both new records are module-level counters for that reason.
+# THIS TEST IS ABOUT WHAT MAY NOT BE A KEY, not about the key count. AGE_PARSE_
+# FAILURES, AGE_UNIT_ASSUMPTIONS and SEX_UNKNOWN_KEPT are RECOVERY RECORDS --
+# "the filter could not decide, so it kept and recorded why" -- and item 11a's
+# rule sends those to module-level counters. The three checks under the pinned
+# set are that rule, and they are what actually enforces it: they scan the
+# returned key set for an unknown-sex or age-unit name rather than trusting the
+# literal above.
+#
+# THE PINNED SET STILL MOVES WHEN A KEY IS ADDED, and it moved here: the
+# filter-applied marker pass added eight (stage/histology/age/sex x
+# applied/skip_reason). Those are not recovery records -- they are a FILTER'S
+# OWN ACCOUNTING, the same admission the three quality_dropped_* keys were made
+# on, and each one is the loop-invariant condition the filter itself branches
+# on. Re-measured rather than inherited: oncotriage/fixtures/capture.py builds
+# its stage4 block by naming keys one at a time, so none of the eight reaches a
+# fixture's deterministic prefix and none costs a recapture.
 
 print()
 print("=" * 70)
-print("Test 4: Stage 4's returned dict gained no key")
+print("Test 4: Stage 4's returned dict gained no recovery-record key")
 print("=" * 70)
 
 _EXPECTED_KEYS = sorted([
@@ -631,7 +652,12 @@ _EXPECTED_KEYS = sorted([
     "stage_dropped", "age_dropped", "sex_dropped", "quality_dropped",
     "quality_dropped_percentile", "quality_dropped_floor",
     "quality_dropped_floor_only", "quality_threshold", "mesh_filter_applied",
-    "mesh_filter_skip_reason", "stage_timings",
+    "mesh_filter_skip_reason",
+    "stage_filter_applied", "stage_filter_skip_reason",
+    "histology_filter_applied", "histology_filter_skip_reason",
+    "age_filter_applied", "age_filter_skip_reason",
+    "sex_filter_applied", "sex_filter_skip_reason",
+    "stage_timings",
 ])
 _r_keys = keys_of(run(_filtering_module, _POOL_SEX, sex="unknown"))
 check("the key set is exactly the pinned one", _r_keys, _EXPECTED_KEYS)
