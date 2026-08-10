@@ -166,6 +166,19 @@ BUCKETS = {
         _A, None, "ran green in 2.6s; no corpus, no git"),
     "test_fhir_birth_date_and_demographics.py": (
         _A, None, "ran green in 2.3s"),
+    "test_indexer_criteria_split_gate.py": (
+        _A, None,
+        "ran green in 0.78s, 109 checks, against ONLY the directory skeleton: "
+        "the criteria_split ingestion gate inside verify_collection. The "
+        "decision is a pure function of a counted distribution and every "
+        "input here is a literal dict; the Qdrant scroll is driven against a "
+        "paging stand-in and the three structural checks mutate an ast COPY "
+        "in memory. No network, no keys, no spend, no live Qdrant, no git, no "
+        "corpus, no database, no subprocess, and it execs nothing. NOTE the "
+        "separation from test_indexer_admission_filters.py, which is bucket E "
+        "for the UMLS-derived non-oncology lookup: nothing here touches the "
+        "MeSH filter, which is why this is a new file rather than a section "
+        "added to that one"),
     "test_observability_logging.py": (
         _A, None, "ran green in 9.2s; all six stages driven with deps stand-ins"),
     "test_paths_glob_determinism.py": (

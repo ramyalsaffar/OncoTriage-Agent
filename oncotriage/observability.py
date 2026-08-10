@@ -576,6 +576,23 @@ LOGGABLE_FIELDS = frozenset({
     # Defect 3: how split_inclusion_exclusion resolved this trial's criteria,
     # and the corpus-level residue. A closed vocabulary, see CRITERIA_SPLIT_*.
     "split_method", "unsplit_count",
+    # The criteria_split ingestion gate's standing measurement, emitted on
+    # every index verification whether it passes or fails. Three (count,
+    # fraction, ceiling) triples plus the four raw branch counts the fractions
+    # are built from. Every one is a CARDINALITY over the trial corpus or a
+    # configured threshold -- there is no per-trial content here, and the
+    # branch names are the closed CRITERIA_SPLIT_* vocabulary. The counts and
+    # the fractions are both carried because a fraction alone cannot say
+    # whether a corpus shrank or a population grew, and the ceiling is carried
+    # beside each so a stored line says where the cut was without a second
+    # lookup into the config of the day -- the same argument medcpt_floor
+    # already makes above. `total` and `unsplit_count` are reused rather than
+    # duplicated.
+    "split_degraded_count", "split_degraded_fraction", "split_degraded_max",
+    "split_no_exclusion_count", "split_no_exclusion_fraction",
+    "split_no_exclusion_max",
+    "split_unusable_count", "split_unusable_fraction", "split_unusable_max",
+    "empty_criteria_count", "field_absent_count", "payload_unreadable_count",
 
     # --- the inference write's durability (the write-durability pass) ------
     # db_path names a FILE on the machine running the pipeline. It is

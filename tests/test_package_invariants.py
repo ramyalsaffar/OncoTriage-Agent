@@ -3596,6 +3596,14 @@ _DECORATOR_INVENTORY = {
     "oncotriage/mcp/server.py::match_patient_tool": ["_counted('match_patient')"],
     "oncotriage/mcp/server.py::lookup_trial_tool": ["_counted('lookup_trial')"],
     "oncotriage/retrieval/trial_lookup.py::lookup_trial._scroll": ["qdrant_retry"],
+    # The criteria_split ingestion gate. The third nested @qdrant_retry paging
+    # closure in the package, and the same shape as the two above: the census
+    # makes ~15 round trips over a 14k-point collection, so a transient fault
+    # part way through would otherwise abort a verification that has already
+    # passed every other check. It is NESTED, so a top-level walk reports it
+    # as absent -- this entry is what caught it being added.
+    "oncotriage/retrieval/indexer.py::scroll_criteria_split_distribution._page":
+        ["qdrant_retry"],
     "oncotriage/registries/mesh.py::MeSHCancerFilter._stem": ["staticmethod"],
     # The structured-logging pass. `_Console` is a namespace of @staticmethods
     # rather than a module of bare functions so that `console.out` reads at

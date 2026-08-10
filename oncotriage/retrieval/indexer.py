@@ -1543,7 +1543,17 @@ def swap_alias_atomic(new_collection: str, alias_name: str):
 # WHAT VERIFICATION CANNOT DO HERE, STATED PLAINLY. The strengthened index
 # validator this ought to call does not exist, and everything below is built
 # from what a freshly-built collection can be asked about itself for free.
-# It does NOT check:
+#
+# THE ONE CONTENT CHECK, AND ITS EXACT SCOPE. This block used to disclaim
+# content checking outright; that became false when the criteria_split
+# ingestion gate landed as check 9. What the gate reads is ONE payload field,
+# `criteria_split`, which records how split_inclusion_exclusion resolved each
+# trial's eligibility block, and it gates on the aggregate distribution of that
+# field against three absolute ceilings. It is not a judgement about any
+# individual trial's text and it does not read the criteria themselves: a trial
+# whose exclusion section is labelled `both` but is nonsense passes.
+#
+# Everything else this does NOT check is unchanged:
 #
 #   - RETRIEVAL QUALITY. Nothing here judges relevance. A collection whose
 #     embeddings are uniformly wrong but well-formed passes every check below.
@@ -1559,10 +1569,22 @@ def swap_alias_atomic(new_collection: str, alias_name: str):
 #   - COMPLETENESS AGAINST ClinicalTrials.gov. The expected count is what this
 #     process scraped, so a scrape that silently missed 40% of the registry
 #     verifies clean.
-#   - ANY COMPARISON WITH THE COLLECTION IT IS ABOUT TO REPLACE. A corpus that
-#     collapsed from 12,000 trials to 300 passes if all 300 are well-formed.
-#     The count is reported beside the live collection's so an operator sees
-#     it, and REPORTING IS NOT CHECKING.
+#   - WHETHER THE SPLIT IS CORRECT, only how it was reached. A trial whose
+#     exclusion heading the splitter matched is counted `both` regardless of
+#     whether the resulting sections are right, and the distribution gate is
+#     blind to a regression that keeps the branch counts steady.
+#   - ANYTHING ABOUT THE PREVIOUS DISTRIBUTION. The ceilings are absolute
+#     numbers, on purpose: the weekly DAG stores no baseline, a first build has
+#     no history, and a relative gate decays into "whatever ran last time is
+#     correct". A slow drift that stays under a ceiling forever is invisible
+#     to the gate and visible only in the distribution it reports every run.
+#
+# Two things it once could not do and now can. The size-vs-live comparison
+# arrived with the `compare_to` argument -- a corpus that collapsed from 12,000
+# trials to 300 used to pass if all 300 were well-formed -- and the criteria
+# split distribution arrived with check 9. Both were "REPORTING IS NOT
+# CHECKING" entries here, and each stopped being one when something gated
+# on it.
 
 # How many points are pulled back and inspected individually.
 _VERIFY_SAMPLE_SIZE = 25
@@ -1581,6 +1603,16 @@ _MIN_CORPUS_RATIO = 0.90
 
 # The three named sparse vectors every point must carry.
 _SPARSE_VECTOR_NAMES = ("title-bm25", "conditions-bm25", "criteria-bm25")
+
+# How many points one scroll page pulls back for the criteria_split census.
+# The census asks for ONE nested payload key, so a page is small however large
+# the stored trial is; 1000 keeps the round trip count at ~15 on this corpus.
+_CRITERIA_SPLIT_PAGE = 1000
+
+# What the census asks Qdrant for. A nested path INSIDE the stored trial blob,
+# because that is where criteria_split lives -- it is not a top-level payload
+# field, which is also why no server-side filter or facet can count it.
+_CRITERIA_SPLIT_SELECTOR = ["full_trial_json.criteria_split"]
 
 
 # Attempts per page before a fetch is treated as fatal to the scrape, and the
@@ -1643,6 +1675,430 @@ class IndexVerificationError(RuntimeError):
     the failures below must not be swallowed by a caller reaching for a
     narrower exception, on the same argument as UnknownModelPricingError.
     """
+
+
+# ===========================================================================
+# THE INGESTION GATE: criteria_split, READ BACK OUT OF THE INDEX
+# ===========================================================================
+#
+# `criteria_split` has been written by parse_trial_metadata since defect 3 and
+# READ BY NOTHING. A trial whose exclusion criteria arrive under inclusion
+# labels produces inverted verdicts at Stage 5 -- the judge is told "the patient
+# must have" what the sponsor wrote as "the patient must not have" -- and no
+# downstream stage can tell, because the criteria block is well-formed text
+# either way. The flag records which branch produced it; this is what reads it.
+#
+# WHY IT LIVES INSIDE verify_collection RATHER THAN BESIDE IT. The escape then
+# comes free: verify_collection already runs before swap_alias_atomic on both
+# call paths (main() and the generated DAG's rebuild_index task), and its raise
+# already means "the alias was not moved and the previous collection is still
+# serving". A separate gate would need its own call site on both paths, and the
+# path that forgot it would promote silently -- which is the shape of defect 4.
+#
+# THE CHECKS ARE ABSOLUTE, NOT RELATIVE. There is deliberately no comparison
+# with last week's distribution: the weekly DAG keeps no baseline store, the
+# first run of any new deployment has no history at all, and a
+# relative-to-previous gate degrades gracefully into "whatever we did last time
+# is correct". The thresholds below are fixed numbers derived from a census of
+# the live collection, with stated headroom, and they are what a schema change
+# at ClinicalTrials.gov would blow through.
+
+# Census categories the SPLITTER CANNOT PRODUCE. They describe a point rather
+# than a criteria block, so they are deliberately not CRITERIA_SPLIT_* members
+# of split_inclusion_exclusion's closed return vocabulary.
+#
+# An absent field is not the same finding as an unreadable payload -- the first
+# says the point predates the splitter contract, the second says the payload
+# itself is damaged -- so they are counted apart even though the gate treats
+# both as "no usable verdict".
+CRITERIA_SPLIT_FIELD_ABSENT = "field_absent"
+CRITERIA_SPLIT_PAYLOAD_UNREADABLE = "payload_unreadable"
+
+# The closed vocabulary split_inclusion_exclusion can return. Any other value
+# in the index came from something that is not this splitter.
+CRITERIA_SPLIT_VALUES = (
+    CRITERIA_SPLIT_BOTH,
+    CRITERIA_SPLIT_INCLUSION_ONLY,
+    CRITERIA_SPLIT_EXCLUSION_ONLY,
+    CRITERIA_SPLIT_UNSPLIT,
+    CRITERIA_SPLIT_EMPTY,
+)
+
+# --- The thresholds, and the census they come from ---------------------------
+#
+# EVERY NUMBER BELOW WAS MEASURED BEFORE IT WAS CHOSEN. The live collection
+# `trial_criteria_20260807_111807` was scrolled in full on 2026-08-09 through
+# scroll_criteria_split_distribution() -- 14,324 points, census total equal to
+# the server's exact count, and identical to the same census over the on-disk
+# `trials_latest.json` the collection was built from:
+#
+#     both              14,034   97.975%
+#     inclusion_only       178    1.243%
+#     unsplit               82    0.572%
+#     exclusion_only        30    0.209%
+#     empty_criteria         0    0.000%
+#     field_absent           0    0.000%
+#     payload_unreadable     0    0.000%
+#
+# THE THREE FIGURES IN CIRCULATION RECONCILE ONCE EACH IS READ AS A DIFFERENT
+# POPULATION, and two of them are reproduced exactly by this census:
+#
+#   82          the `unsplit` branch alone, this corpus. Reproduced: 82.
+#   1.82%       the EMPTY-EXCLUSION population -- unsplit + inclusion_only --
+#               on this corpus. Reproduced: 260/14,324 = 1.815%.
+#   6.18% ->    the same empty-exclusion population on the older 12,067-trial
+#   1.77%       scrape, before and after the marker fix. NOT reproducible from
+#               storage: `trial_criteria_20260803_104642` was censused too and
+#               is 12,067/12,067 field_absent -- it was built before this field
+#               existed -- so those two are process-time measurements over a
+#               scrape, not over any stored index.
+#
+# DEGRADED = unsplit + empty_criteria = 82, 0.572%.
+#
+# 3.0% is that with 5.2x headroom, and the headroom is set by what can move the
+# fraction rather than by taste. This population is effectively bimodal: a
+# splitter that stops finding headings sends it to ~100%, while ordinary
+# registry churn moves it by single trials -- the measured four-day drift on
+# this corpus was 43 trials removed against 68 added, of which ~0.6% would be
+# unsplit. In absolute terms 3.0% is 430 trials against a measured 82, so
+# reaching it through churn alone would take tens of thousands of new trials,
+# and it still sits an order of magnitude below a collapse. A tighter ceiling
+# buys sensitivity to a new heading format used by 1-2% of the registry; a
+# looser one stops separating the two scenarios at all.
+_MAX_CRITERIA_SPLIT_DEGRADED = 0.03
+
+# NO_EXCLUSION = unsplit + inclusion_only = 260, 1.815%.
+#
+# THIS THRESHOLD IS AN ADDITION TO THE BRIEF THIS GATE WAS BUILT FROM, and the
+# reason is a measurement rather than a preference. The brief gates the
+# degraded fraction on unsplit + empty_criteria, on the argument that "a schema
+# change at ClinicalTrials.gov that breaks the splitter shows up as unsplit
+# exploding". That is true only when BOTH heading families stop matching.
+# split_inclusion_exclusion searches for the two independently, so a change to
+# the EXCLUSION heading alone leaves every inclusion heading matching, produces
+# `inclusion_only` rather than `unsplit`, and the degraded fraction does not
+# move at all -- while every affected trial reaches the judge with its
+# exclusion criteria silently relabelled as inclusion criteria, which is the
+# exact harm this gate exists to catch. `inclusion_only` is already twice the
+# size of `unsplit` on this corpus for that reason.
+#
+# It is a SEPARATE fraction rather than a widening of the degraded one because
+# the two populations are not equally suspicious: a trial that genuinely
+# registers no exclusion section is legitimately `inclusion_only`, so this
+# fraction has a real, corpus-composition-driven floor that `unsplit` does not.
+# 5.0% is 2.75x the measured 1.815%, or 716 trials against a measured 260; a
+# single-heading regression takes it above 90%.
+_MAX_CRITERIA_SPLIT_NO_EXCLUSION = 0.05
+
+# UNUSABLE = field_absent + payload_unreadable + any value outside the closed
+# vocabulary. Measured at 0.00% -- every one of the 14,324 live points carries
+# a recognised verdict -- so this one has no measurement to add headroom to.
+#
+# IT IS NOT A HYPOTHETICAL POPULATION. The census over
+# `trial_criteria_20260803_104642` reports 12,067 of 12,067 field_absent: that
+# collection was indexed before parse_trial_metadata stamped the field, and
+# this gate refuses it. That is the correct verdict rather than an awkward one
+# -- nothing downstream can tell whether any of those 12,067 trials had its
+# exclusion criteria labelled correctly.
+#
+# 0.5% rather than 0.0% because the gate must not fire on a handful of points
+# whose payload was truncated in transit, which is a Qdrant fault and not an
+# ingestion-contract fault. Note what 0.0 would cost: one damaged payload out
+# of 14,324 would refuse an otherwise perfect corpus, and the operator's only
+# remedy would be to edit this constant. Below 0.5%, any population written by
+# something that does not stamp the field is still refused.
+_MAX_CRITERIA_SPLIT_UNUSABLE = 0.005
+
+# One sentence, used by both raise sites, so the two cannot say different
+# things about what happened to the alias.
+_SWAP_REFUSED_NOTE = (
+    "The alias was NOT moved: the swap is refused and the PREVIOUS COLLECTION "
+    "IS STILL SERVING traffic. Inspect the staging collection, or delete it "
+    "and re-run.")
+
+
+def scroll_criteria_split_distribution(collection_name: str, client=None,
+                                       page_size: int = _CRITERIA_SPLIT_PAGE
+                                       ) -> Counter:
+    """Count `criteria_split` over EVERY point in `collection_name`.
+
+    THE FLAG IS NOT A TOP-LEVEL PAYLOAD FIELD. It rides inside the
+    `full_trial_json` blob, so no server-side filter or facet can reach it and
+    there is nothing to count with a `count(filter=...)` call: the only way to
+    measure it is to pull every point's blob back and read it. That is what
+    this does, and it is why the census is a scroll rather than a query.
+
+    Paginated on Qdrant's own `next_page_offset`, never on an assumed single
+    page: this collection is 14,324 points against a default page limit of 10.
+
+    Returns a Counter over the values found, plus CRITERIA_SPLIT_FIELD_ABSENT
+    for a point whose blob carries no such key and
+    CRITERIA_SPLIT_PAYLOAD_UNREADABLE for one whose blob is missing or is not a
+    JSON object. Nothing is skipped -- `sum(counter.values())` is the point
+    count -- because a point silently omitted from the census is exactly the
+    population the census exists to find.
+
+    This is the ONE feeder. The standing gate below and the operator-facing
+    measurement both call it; a second scroll written for the report would be a
+    second implementation that can disagree with the one that gates.
+    """
+    client = client or get_qdrant_client()
+    counts = Counter()
+    offset = None
+
+    @qdrant_retry
+    def _page(next_offset):
+        # A NESTED PAYLOAD SELECTOR, and the difference is not cosmetic.
+        # `full_trial_json` is the whole stored trial -- ~10 KB per point, so
+        # asking for it pulls ~150 MB back to read a five-character string, and
+        # the DAG runs verification twice per refresh. Asking Qdrant for the
+        # one key returns {"full_trial_json": {"criteria_split": "both"}}, the
+        # same shape the parser below already reads.
+        #
+        # MEASURED, NOT ASSUMED: both selectors were run over the full live
+        # collection and returned IDENTICAL counts (both 14,034 /
+        # inclusion_only 178 / unsplit 82 / exclusion_only 30), in 10.3s and
+        # 1.7s respectively, over the same 15 pages.
+        #
+        # The failure direction is safe. A server that ignored the nested path
+        # would return the whole blob, which this parser reads; one that
+        # returned nothing for a key that exists would produce field_absent,
+        # which FAILS the gate loudly rather than passing it.
+        return client.scroll(collection_name=collection_name,
+                             limit=page_size, offset=next_offset,
+                             with_payload=_CRITERIA_SPLIT_SELECTOR,
+                             with_vectors=False)
+
+    while True:
+        points, offset = _page(offset)
+        for point in points:
+            blob = (point.payload or {}).get("full_trial_json")
+            if isinstance(blob, str):
+                # Defensive: this writer stores a dict, but a blob written as a
+                # JSON string by anything else must be read rather than
+                # reported as damaged.
+                try:
+                    blob = json.loads(blob)
+                except (ValueError, TypeError):
+                    blob = None
+            if not isinstance(blob, dict):
+                counts[CRITERIA_SPLIT_PAYLOAD_UNREADABLE] += 1
+                continue
+            value = blob.get("criteria_split")
+            if value is None:
+                counts[CRITERIA_SPLIT_FIELD_ABSENT] += 1
+            else:
+                counts[str(value)] += 1
+        if offset is None or not points:
+            break
+
+    return counts
+
+
+def evaluate_criteria_split_distribution(
+        distribution,
+        max_degraded: float = _MAX_CRITERIA_SPLIT_DEGRADED,
+        max_no_exclusion: float = _MAX_CRITERIA_SPLIT_NO_EXCLUSION,
+        max_unusable: float = _MAX_CRITERIA_SPLIT_UNUSABLE) -> dict:
+    """Judge a counted distribution. Pure: no client, no network, no raise.
+
+    Returns a dict carrying the counts, the three gated fractions, the
+    thresholds they were compared against, and a `failures` list of message
+    strings -- empty when the distribution passes.
+
+    IT RETURNS RATHER THAN RAISING so verify_collection can append the failures
+    to the same list its other checks use and raise ONCE at the end naming
+    everything that is wrong. A gate that raised here would report the split
+    distribution and hide a simultaneously-broken sparse vector.
+
+    THE THREE FRACTIONS:
+
+      degraded      unsplit + empty_criteria. The splitter found no heading of
+                    either family, or there was no criteria text at all.
+      no_exclusion  unsplit + inclusion_only. Every trial the judge sees with
+                    NO exclusion section, whichever branch produced it -- the
+                    `elif inclusion_start != -1` arm sets exclusion_text = ""
+                    just as the unsplit arm does. This is the population the
+                    harm is actually defined over; see the constant.
+      unusable      field_absent + payload_unreadable + any value outside
+                    CRITERIA_SPLIT_VALUES. An unrecognised value is not a
+                    fourth thing to gate on -- it is the same finding as an
+                    absent field, namely that this point carries no verdict
+                    this contract defines. Folding it in cannot make the gate
+                    weaker, and leaving it out would let a splitter that
+                    renamed its constants pass with every fraction at zero
+                    while every trial in the corpus was unsplit.
+
+    The first two OVERLAP -- `unsplit` is in both -- so they do not sum, and
+    each is reported with its own count for that reason.
+
+    A fraction EQUAL to its threshold passes; only `>` fails. The thresholds
+    are ceilings on an observed rate, and a run that lands exactly on one is
+    within what was authorised.
+    """
+    counts = Counter(distribution)
+    total = sum(counts.values())
+    failures = []
+
+    unrecognised = {k: v for k, v in counts.items()
+                    if k not in CRITERIA_SPLIT_VALUES
+                    and k not in (CRITERIA_SPLIT_FIELD_ABSENT,
+                                  CRITERIA_SPLIT_PAYLOAD_UNREADABLE)}
+
+    degraded = (counts.get(CRITERIA_SPLIT_UNSPLIT, 0)
+                + counts.get(CRITERIA_SPLIT_EMPTY, 0))
+    no_exclusion = (counts.get(CRITERIA_SPLIT_UNSPLIT, 0)
+                    + counts.get(CRITERIA_SPLIT_INCLUSION_ONLY, 0))
+    unusable = (counts.get(CRITERIA_SPLIT_FIELD_ABSENT, 0)
+                + counts.get(CRITERIA_SPLIT_PAYLOAD_UNREADABLE, 0)
+                + sum(unrecognised.values()))
+
+    measured = {
+        "total": total,
+        "counts": dict(sorted(counts.items())),
+        "unrecognised": dict(sorted(unrecognised.items())),
+        "degraded_count": degraded,
+        "no_exclusion_count": no_exclusion,
+        "unusable_count": unusable,
+        "max_degraded": max_degraded,
+        "max_no_exclusion": max_no_exclusion,
+        "max_unusable": max_unusable,
+    }
+
+    # A CENSUS OVER NOTHING MUST NOT PASS. Zero points divides by zero and,
+    # guarded the lazy way, would report 0.0 -- three fractions comfortably
+    # under their ceilings and a gate that measured nothing looking exactly
+    # like one that measured a perfect corpus.
+    if total == 0:
+        measured["degraded_fraction"] = None
+        measured["no_exclusion_fraction"] = None
+        measured["unusable_fraction"] = None
+        measured["fractions"] = {}
+        failures.append(
+            "the criteria_split census counted 0 points, so the distribution "
+            "gate MEASURED NOTHING. A collection this check cannot read must "
+            f"not be promoted on the strength of it. {_SWAP_REFUSED_NOTE}")
+        measured["failures"] = failures
+        return measured
+
+    degraded_fraction = degraded / total
+    no_exclusion_fraction = no_exclusion / total
+    unusable_fraction = unusable / total
+    measured["degraded_fraction"] = degraded_fraction
+    measured["no_exclusion_fraction"] = no_exclusion_fraction
+    measured["unusable_fraction"] = unusable_fraction
+    measured["fractions"] = {k: v / total for k, v in sorted(counts.items())}
+
+    if degraded_fraction > max_degraded:
+        failures.append(
+            f"criteria_split: {degraded:,} of {total:,} points "
+            f"({degraded_fraction:.2%}) carry '{CRITERIA_SPLIT_UNSPLIT}' or "
+            f"'{CRITERIA_SPLIT_EMPTY}', above the {max_degraded:.2%} ceiling. "
+            f"The splitter found no heading of either family in those trials, "
+            f"so the whole criteria block was sent to inclusion and any "
+            f"exclusion criteria it holds reach the judge as inclusion "
+            f"criteria, inverting every verdict on them. A jump here is what a "
+            f"heading-format change at ClinicalTrials.gov looks like. "
+            f"{_SWAP_REFUSED_NOTE}")
+
+    if no_exclusion_fraction > max_no_exclusion:
+        failures.append(
+            f"criteria_split: {no_exclusion:,} of {total:,} points "
+            f"({no_exclusion_fraction:.2%}) carry '{CRITERIA_SPLIT_UNSPLIT}' "
+            f"or '{CRITERIA_SPLIT_INCLUSION_ONLY}', above the "
+            f"{max_no_exclusion:.2%} ceiling. Every one of those trials "
+            f"reaches the judge with an EMPTY exclusion section. This fires "
+            f"without the degraded fraction moving when only the exclusion "
+            f"heading family stops matching, which is the half of a splitter "
+            f"regression that unsplit alone cannot see. {_SWAP_REFUSED_NOTE}")
+
+    if unusable_fraction > max_unusable:
+        detail = (f" Unrecognised values: {measured['unrecognised']}."
+                  if unrecognised else "")
+        failures.append(
+            f"criteria_split: {unusable:,} of {total:,} points "
+            f"({unusable_fraction:.2%}) carry no usable verdict — the field is "
+            f"absent, the payload is unreadable, or the value is outside the "
+            f"closed vocabulary {list(CRITERIA_SPLIT_VALUES)} — above the "
+            f"{max_unusable:.2%} ceiling. Those points were written by "
+            f"something that is not this splitter, so nothing downstream can "
+            f"tell whether their exclusion criteria are labelled correctly."
+            f"{detail} {_SWAP_REFUSED_NOTE}")
+
+    measured["failures"] = failures
+    return measured
+
+
+def check_criteria_split_distribution(
+        distribution,
+        max_degraded: float = _MAX_CRITERIA_SPLIT_DEGRADED,
+        max_no_exclusion: float = _MAX_CRITERIA_SPLIT_NO_EXCLUSION,
+        max_unusable: float = _MAX_CRITERIA_SPLIT_UNUSABLE) -> dict:
+    """evaluate_criteria_split_distribution, but RAISING on any failure.
+
+    The standalone form, for a caller that wants the gate on its own rather
+    than as one section of verify_collection. Returns what it measured.
+
+    It raises IndexVerificationError -- the same type verify_collection raises,
+    deliberately, so a caller wrapping either one catches the same thing.
+    """
+    measured = evaluate_criteria_split_distribution(
+        distribution, max_degraded=max_degraded,
+        max_no_exclusion=max_no_exclusion, max_unusable=max_unusable)
+    if measured["failures"]:
+        raise IndexVerificationError(
+            f"the criteria_split distribution failed "
+            f"{len(measured['failures'])} check(s):\n"
+            + "".join(f"    - {f}\n" for f in measured["failures"]))
+    return measured
+
+
+def report_criteria_split_distribution(measured: dict, out=None) -> None:
+    """Print and log the whole distribution, whether it passed or failed.
+
+    ALWAYS, not only on failure. A gate that reports only when it fires leaves
+    nobody a number to compare next week's against, and this fraction is the
+    only standing measurement of how much of the corpus reaches the judge with
+    its exclusion criteria mislabelled.
+    """
+    out = out or console.out
+    total = measured["total"]
+    out(f"  criteria_split census over {total:,} point(s):")
+    for value, n in measured["counts"].items():
+        share = f"{n / total:7.3%}" if total else "       —"
+        out(f"      {value:<22} {n:>7,}  {share}")
+
+    def _pct(value):
+        return "n/a" if value is None else f"{value:.3%}"
+
+    out(f"      degraded (unsplit+empty)      "
+        f"{measured['degraded_count']:>7,}  {_pct(measured['degraded_fraction'])}"
+        f"  ceiling {measured['max_degraded']:.2%}")
+    out(f"      no exclusion section          "
+        f"{measured['no_exclusion_count']:>7,}  "
+        f"{_pct(measured['no_exclusion_fraction'])}"
+        f"  ceiling {measured['max_no_exclusion']:.2%}")
+    out(f"      no usable verdict             "
+        f"{measured['unusable_count']:>7,}  {_pct(measured['unusable_fraction'])}"
+        f"  ceiling {measured['max_unusable']:.2%}")
+
+    log.info("criteria split distribution measured",
+             total=total,
+             split_degraded_count=measured["degraded_count"],
+             split_degraded_fraction=measured["degraded_fraction"],
+             split_degraded_max=measured["max_degraded"],
+             split_no_exclusion_count=measured["no_exclusion_count"],
+             split_no_exclusion_fraction=measured["no_exclusion_fraction"],
+             split_no_exclusion_max=measured["max_no_exclusion"],
+             split_unusable_count=measured["unusable_count"],
+             split_unusable_fraction=measured["unusable_fraction"],
+             split_unusable_max=measured["max_unusable"],
+             unsplit_count=measured["counts"].get(CRITERIA_SPLIT_UNSPLIT, 0),
+             empty_criteria_count=measured["counts"].get(CRITERIA_SPLIT_EMPTY, 0),
+             field_absent_count=measured["counts"].get(
+                 CRITERIA_SPLIT_FIELD_ABSENT, 0),
+             payload_unreadable_count=measured["counts"].get(
+                 CRITERIA_SPLIT_PAYLOAD_UNREADABLE, 0))
 
 
 def verify_collection(collection_name: str, expected_count: int,
@@ -1878,6 +2334,41 @@ def verify_collection(collection_name: str, expected_count: int,
     else:
         console.out("  - size-vs-live check SKIPPED (no collection to compare "
                     "against; this is a first build or it was disabled)")
+
+    # --- 9. THE INGESTION GATE: is criteria_split still being written? ------
+    #
+    # A CONTENT CHECK, and the only one here. Every check above asks whether
+    # the collection is well-formed; this one asks whether the eligibility text
+    # inside it is labelled the way the pipeline assumes. It is a full scroll
+    # of one payload key -- ~15 round trips and ~9s on a 14k corpus, no model
+    # call, no paid API -- and it reports on every run, pass or fail.
+    split_counts = scroll_criteria_split_distribution(collection_name,
+                                                      client=client)
+    split_report = evaluate_criteria_split_distribution(split_counts)
+    measured["criteria_split"] = split_report
+    report_criteria_split_distribution(split_report)
+    for message in split_report["failures"]:
+        _fail(message)
+
+    # THE CENSUS MUST HAVE COVERED THE WHOLE COLLECTION, or every fraction
+    # above is computed over a subset and diluted by exactly the points it
+    # missed. A scroll that stopped after one page reports a corpus of 1,000
+    # with three tidy fractions and no error; a scroll that repeated a page
+    # reports 20,000 and dilutes the degraded population by half. Neither is
+    # visible in the distribution itself -- only against the count section 2
+    # already took, which is why this is asserted here rather than inside the
+    # pure evaluator, which has nothing to compare against.
+    if split_report["total"] != actual:
+        _fail(f"the criteria_split census covered {split_report['total']:,} "
+              f"point(s) but the collection holds {actual:,}. Every fraction "
+              f"reported above is computed over that subset, so the gate did "
+              f"not measure what it claims to have measured. {_SWAP_REFUSED_NOTE}")
+    if not split_report["failures"]:
+        _ok(f"criteria_split distribution within every ceiling "
+            f"({split_report['degraded_count']:,} degraded, "
+            f"{split_report['no_exclusion_count']:,} without an exclusion "
+            f"section, {split_report['unusable_count']:,} unusable of "
+            f"{split_report['total']:,})")
 
     measured["failures"] = failures
     if failures:
