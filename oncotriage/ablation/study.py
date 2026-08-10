@@ -153,6 +153,7 @@ from oncotriage.utils import (
     get_model_cost,
     resolve_qdrant_collection,
 )
+from oncotriage import tracking
 from oncotriage.observability import console, correlation_scope, get_logger
 
 
@@ -1359,45 +1360,80 @@ def main():
         # --- Step 3: Resume support ---
         completed = load_ablation_checkpoint(db_path=db_path)
 
-        # --- Step 4: Run each config ---
-        total_configs = len(configs)
-        total_runs = total_configs * len(sample)
-        already_done = len(completed)
-        remaining = total_runs - already_done
-        study_start = time.time()
-
-        console.out(f"\n  Total runs:     {total_runs} ({total_configs} configs × {len(sample)} patients)")
-        console.out(f"  Already done:   {already_done}")
-        console.out(f"  Remaining:      {remaining}")
-        console.out()
-
-        # --- tqdm progress bar ---
-        console.out("*" * 70)
-        progress = tqdm(
-            total=total_runs,
-            initial=already_done,
-            desc="🔬 ABLATION PROGRESS",
-            unit="run",
-            bar_format="{desc}: {percentage:3.0f}%|{bar:40}| {n_fmt}/{total_fmt} "
-                       "[Elapsed: {elapsed} | ETA: {remaining} | {rate_fmt}] {postfix}",
-            ncols=120,
-            smoothing=0.1,
+        # --- Step 3b: Open the parent tracking run (the tracking pass) ---
+        # ONE PARENT PER STUDY, one nested child per configuration, and the
+        # children are opened AFTER the run loop rather than around it -- see
+        # the block below generate_summary(). The parent opens here because
+        # this is the last line before the first billed call and the first
+        # point at which the sample size, the seed, the config selection and
+        # the resume state are all known.
+        #
+        # A RESUMED STUDY IS A NEW PARENT, TAGGED `resumed=true`, exactly as in
+        # oncotriage/batch/runner.py and for the same reason recorded there: no
+        # run-continuation machinery is invented, and the tag is what joins the
+        # two parents a resumed study produces.
+        #
+        # MAIN THREAD ONLY. Every tracking call in this file is outside the
+        # ThreadPoolExecutor -- this one before it is created, the rest after
+        # the last future has been waited on.
+        tracking.start_run(
+            kind="ablation",
+            params={
+                "sample_size": args.sample_size,
+                "seed": ABLATION_SEED,
+                "configs": ",".join(c["name"] for c in configs),
+                "db_path": str(ablation_db(db_path)),
+            },
+            tags={"resumed": "true" if completed else "false"},
         )
 
-        run_success = 0
-        run_error = 0
-        interrupted = False
+        # THE PARENT RUN IS CLOSED ON EVERY EXIT PATH. See the identical guard
+        # in oncotriage/batch/runner.py:main() for the measurement behind it --
+        # MLflow's own atexit hook records a crashed run as FINISHED. The
+        # KeyboardInterrupt this file already handles is caught further in and
+        # ends the parent as KILLED; what this catches is everything else -- a
+        # raise from generate_summary(), from the checkpoint clear, or from the
+        # pool.
+        try:
+            # --- Step 4: Run each config ---
+            total_configs = len(configs)
+            total_runs = total_configs * len(sample)
+            already_done = len(completed)
+            remaining = total_runs - already_done
+            study_start = time.time()
 
-        # THE builtins.print MONKEY-PATCH USED TO BE HERE, AND IT IS DELETED.
-        # See oncotriage/batch/runner.py for what it did to every print(end=),
-        # print(sep=), print(file=) and print(flush=) in the process while it
-        # was live. Registering the bar with the console channel serves the one
-        # real purpose it had -- keeping output off the bar's redraw -- and
-        # covers the structured log handler too, which the patch could not.
-        _bar_token = console.attach_bar()
+            console.out(f"\n  Total runs:     {total_runs} ({total_configs} configs × {len(sample)} patients)")
+            console.out(f"  Already done:   {already_done}")
+            console.out(f"  Remaining:      {remaining}")
+            console.out()
 
-        def _process_one(patient_data, config_name, ablation_flags, run_id):
-            """Run pipeline + log for one patient-config pair.
+            # --- tqdm progress bar ---
+            console.out("*" * 70)
+            progress = tqdm(
+                total=total_runs,
+                initial=already_done,
+                desc="🔬 ABLATION PROGRESS",
+                unit="run",
+                bar_format="{desc}: {percentage:3.0f}%|{bar:40}| {n_fmt}/{total_fmt} "
+                       "[Elapsed: {elapsed} | ETA: {remaining} | {rate_fmt}] {postfix}",
+                ncols=120,
+                smoothing=0.1,
+            )
+
+            run_success = 0
+            run_error = 0
+            interrupted = False
+
+            # THE builtins.print MONKEY-PATCH USED TO BE HERE, AND IT IS DELETED.
+            # See oncotriage/batch/runner.py for what it did to every print(end=),
+            # print(sep=), print(file=) and print(flush=) in the process while it
+            # was live. Registering the bar with the console channel serves the one
+            # real purpose it had -- keeping output off the bar's redraw -- and
+            # covers the structured log handler too, which the patch could not.
+            _bar_token = console.attach_bar()
+
+            def _process_one(patient_data, config_name, ablation_flags, run_id):
+                """Run pipeline + log for one patient-config pair.
 
             A pipeline failure is caught and turned into an error result, so
             one bad patient does not stop the study. There are TWO exceptions
@@ -1419,186 +1455,242 @@ def main():
             Both propagate through future.result() and stop the run. The
             checkpoint means resuming after fixing File 03 costs nothing.
             """
-            pid = patient_data["patient_id"]
-            # ONE (patient, config) PAIR IS ONE CORRELATION ID, and this is the
-            # narrowest scope that contains the whole pair -- the pipeline run
-            # AND the ablation_results.db write below. The study drives
-            # MAX_WORKERS of these at once, so without a scope every line it
-            # emits would carry the "-" sentinel and a study's logs would be one
-            # undifferentiated stream.
-            #
-            # Two configs of the same patient are two runs and get two IDs, on
-            # purpose; `config_name` and `patient_id` are the fields that join
-            # them back together.
-            with correlation_scope():
-                log.info("ablation run started",
-                         event="ablation_run_started", patient_id=pid,
-                         config_name=config_name, run_id=run_id)
-                return _process_one_scoped(patient_data, config_name,
-                                           ablation_flags, run_id, pid)
+                pid = patient_data["patient_id"]
+                # ONE (patient, config) PAIR IS ONE CORRELATION ID, and this is the
+                # narrowest scope that contains the whole pair -- the pipeline run
+                # AND the ablation_results.db write below. The study drives
+                # MAX_WORKERS of these at once, so without a scope every line it
+                # emits would carry the "-" sentinel and a study's logs would be one
+                # undifferentiated stream.
+                #
+                # Two configs of the same patient are two runs and get two IDs, on
+                # purpose; `config_name` and `patient_id` are the fields that join
+                # them back together.
+                with correlation_scope():
+                    log.info("ablation run started",
+                             event="ablation_run_started", patient_id=pid,
+                             config_name=config_name, run_id=run_id)
+                    return _process_one_scoped(patient_data, config_name,
+                                               ablation_flags, run_id, pid)
 
-        def _process_one_scoped(patient_data, config_name, ablation_flags,
-                                run_id, pid):
-            """The body of _process_one, inside its correlation scope.
+            def _process_one_scoped(patient_data, config_name, ablation_flags,
+                                    run_id, pid):
+                """The body of _process_one, inside its correlation scope.
 
             Split out rather than indenting the original eighty-line body: a
             re-indentation of that size is a diff nobody can review in a pass
             whose promise is that only output routing changed, and this way the
             body below is byte-identical to what it was.
             """
+                try:
+                    result = match_patient_ablation(
+                        patient_data, bm25_index, nct_ids, graph, ablation_flags
+                    )
+                except MatchingModelMismatchError:
+                    # Re-raised before the blanket handler can see it. Deliberately
+                    # not wrapped or re-worded: File 13's message already carries
+                    # both model strings and what to do about them.
+                    raise
+                except Exception as e:
+                    traceback.print_exc()
+                    result = {
+                        "error": str(e),
+                        "matches": [],
+                        "near_misses": [],
+                        "not_evaluable": [],
+                        "stage_timings": {},
+                        "primary_condition": "",
+                        "candidates_retrieved": 0,
+                        "candidates_reranked": 0,
+                        "candidates_after_rule_filter": 0,
+                        "candidates_after_quality_filter": 0,
+                        "candidates_evaluated": 0,
+                        "mesh_dropped": 0,
+                        "stage_dropped": 0,
+                        "histology_dropped": 0,
+                        "llm_classifier_input_tokens": 0,
+                        "llm_classifier_output_tokens": 0,
+                    }
+
+                log_ablation_result(run_id, config_name, patient_data, result,
+                                    ablation_flags, db_path=db_path)
+                return pid, result
+
             try:
-                result = match_patient_ablation(
-                    patient_data, bm25_index, nct_ids, graph, ablation_flags
-                )
-            except MatchingModelMismatchError:
-                # Re-raised before the blanket handler can see it. Deliberately
-                # not wrapped or re-worded: File 13's message already carries
-                # both model strings and what to do about them.
-                raise
-            except Exception as e:
-                traceback.print_exc()
-                result = {
-                    "error": str(e),
-                    "matches": [],
-                    "near_misses": [],
-                    "not_evaluable": [],
-                    "stage_timings": {},
-                    "primary_condition": "",
-                    "candidates_retrieved": 0,
-                    "candidates_reranked": 0,
-                    "candidates_after_rule_filter": 0,
-                    "candidates_after_quality_filter": 0,
-                    "candidates_evaluated": 0,
-                    "mesh_dropped": 0,
-                    "stage_dropped": 0,
-                    "histology_dropped": 0,
-                    "llm_classifier_input_tokens": 0,
-                    "llm_classifier_output_tokens": 0,
-                }
+                for config_idx, config in enumerate(configs, 1):
+                    config_name = config["name"]
+                    ablation_flags = config["flags"]
 
-            log_ablation_result(run_id, config_name, patient_data, result,
-                                ablation_flags, db_path=db_path)
-            return pid, result
-
-        try:
-            for config_idx, config in enumerate(configs, 1):
-                config_name = config["name"]
-                ablation_flags = config["flags"]
-
-                # Skip entirely completed configs
-                config_pairs = {(config_name, p["patient_id"]) for p in sample}
+                    # Skip entirely completed configs
+                    config_pairs = {(config_name, p["patient_id"]) for p in sample}
                 
-                if config_pairs.issubset(completed):
-                    console.out(f"\n  [SKIP] Config '{config_name}' already completed.")
-                    progress.update(len(config_pairs))
-                    continue
+                    if config_pairs.issubset(completed):
+                        console.out(f"\n  [SKIP] Config '{config_name}' already completed.")
+                        progress.update(len(config_pairs))
+                        continue
 
-                console.out(f"\n{'#' * 70}")
-                console.out(f"# CONFIG {config_idx}/{total_configs}: {config_name}")
-                console.out(f"# {config['description']}")
-                console.out(f"# Flags: {ablation_flags}")
-                console.out(f"{'#' * 70}")
+                    console.out(f"\n{'#' * 70}")
+                    console.out(f"# CONFIG {config_idx}/{total_configs}: {config_name}")
+                    console.out(f"# {config['description']}")
+                    console.out(f"# Flags: {ablation_flags}")
+                    console.out(f"{'#' * 70}")
 
-                run_id = _create_run(config_name, config["description"],
-                                     len(sample), db_path=db_path)
-                config_start = time.time()
+                    run_id = _create_run(config_name, config["description"],
+                                         len(sample), db_path=db_path)
+                    config_start = time.time()
 
-                # Filter to pending patients for this config
-                pending_patients = [
-                    p for p in sample
-                    if (config_name, p["patient_id"]) not in completed
-                ]
-                # Update progress for already-completed patients in this config
-                already_done_in_config = len(sample) - len(pending_patients)
-                if already_done_in_config > 0:
-                    progress.update(already_done_in_config)
+                    # Filter to pending patients for this config
+                    pending_patients = [
+                        p for p in sample
+                        if (config_name, p["patient_id"]) not in completed
+                    ]
+                    # Update progress for already-completed patients in this config
+                    already_done_in_config = len(sample) - len(pending_patients)
+                    if already_done_in_config > 0:
+                        progress.update(already_done_in_config)
 
-                def _on_done(future, _config_name=config_name):
-                    nonlocal run_success, run_error
-                    try:
-                        pid, result = future.result()
-                    except Exception as e:
-                        run_error += 1
+                    def _on_done(future, _config_name=config_name):
+                        nonlocal run_success, run_error
+                        try:
+                            pid, result = future.result()
+                        except Exception as e:
+                            run_error += 1
+                            progress.set_postfix(ok=run_success, err=run_error)
+                            progress.update(1)
+                            console.out(f"  [CALLBACK ERROR] {_config_name}: {type(e).__name__}: {e}")
+                            return
+
+                        if result.get("error"):
+                            run_error += 1
+                        else:
+                            run_success += 1
+
+                        completed.add((_config_name, pid))
+                        save_ablation_checkpoint(completed, db_path=db_path)
+
                         progress.set_postfix(ok=run_success, err=run_error)
                         progress.update(1)
-                        console.out(f"  [CALLBACK ERROR] {_config_name}: {type(e).__name__}: {e}")
-                        return
 
-                    if result.get("error"):
-                        run_error += 1
-                    else:
-                        run_success += 1
+                    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                        futures = []
+                        for patient_data in pending_patients:
+                            future = executor.submit(
+                                _process_one,
+                                patient_data=patient_data,
+                                config_name=config_name,
+                                ablation_flags=ablation_flags,
+                                run_id=run_id,
+                            )
+                            future.add_done_callback(_on_done)
+                            futures.append(future)
 
-                    completed.add((_config_name, pid))
-                    save_ablation_checkpoint(completed, db_path=db_path)
+                        # Wait for all to complete (callbacks handle progress)
+                        for future in futures:
+                            future.result()
 
-                    progress.set_postfix(ok=run_success, err=run_error)
-                    progress.update(1)
+                    config_elapsed = time.time() - config_start
+                    _finalize_run(run_id, config_elapsed, db_path=db_path)
+                    console.out(f"\n  Config '{config_name}' done: {config_elapsed / 60:.1f} min")
 
-                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                    futures = []
-                    for patient_data in pending_patients:
-                        future = executor.submit(
-                            _process_one,
-                            patient_data=patient_data,
-                            config_name=config_name,
-                            ablation_flags=ablation_flags,
-                            run_id=run_id,
-                        )
-                        future.add_done_callback(_on_done)
-                        futures.append(future)
+            except KeyboardInterrupt:
+                interrupted = True
+                console.out("\n[INTERRUPTED] Waiting for active threads to finish...")
+                # ThreadPoolExecutor's with-block handles shutdown
 
-                    # Wait for all to complete (callbacks handle progress)
-                    for future in futures:
-                        future.result()
+            finally:
+                progress.close()
+                console.detach_bar(_bar_token)
 
-                config_elapsed = time.time() - config_start
-                _finalize_run(run_id, config_elapsed, db_path=db_path)
-                console.out(f"\n  Config '{config_name}' done: {config_elapsed / 60:.1f} min")
+            # --- Step 5: Summary ---
+            study_elapsed = time.time() - study_start
 
-        except KeyboardInterrupt:
-            interrupted = True
-            console.out("\n[INTERRUPTED] Waiting for active threads to finish...")
-            # ThreadPoolExecutor's with-block handles shutdown
+            console.out()
+            console.out("=" * 70)
+            console.out(f"{Project_Name}: ABLATION STUDY SUMMARY")
+            console.out("=" * 70)
+            console.out(f"  Wall time:       {study_elapsed / 60:.1f} min")
+            console.out(f"  Completed:       {run_success + run_error}")
+            console.out(f"  Success:         {run_success}")
+            console.out(f"  Errors:          {run_error}")
+            console.out(f"  Database:        {ablation_db(db_path)}")
 
-        finally:
-            progress.close()
-            console.detach_bar(_bar_token)
-
-        # --- Step 5: Summary ---
-        study_elapsed = time.time() - study_start
-
-        console.out()
-        console.out("=" * 70)
-        console.out(f"{Project_Name}: ABLATION STUDY SUMMARY")
-        console.out("=" * 70)
-        console.out(f"  Wall time:       {study_elapsed / 60:.1f} min")
-        console.out(f"  Completed:       {run_success + run_error}")
-        console.out(f"  Success:         {run_success}")
-        console.out(f"  Errors:          {run_error}")
-        console.out(f"  Database:        {ablation_db(db_path)}")
-
-        # Checkpoint degradations, reported here rather than left in the
-        # scrollback (pass 20f-1, item 11a's shape). Printed only when there
-        # were any, matching INDEX_AGE_PARSE_FAILURES in
-        # oncotriage/retrieval/indexer.py -- a zero line every run trains a
-        # reader to skip it.
-        if CHECKPOINT_WRITE_FAILURES:
-            console.out(f"  Checkpoint:      "
+            # Checkpoint degradations, reported here rather than left in the
+            # scrollback (pass 20f-1, item 11a's shape). Printed only when there
+            # were any, matching INDEX_AGE_PARSE_FAILURES in
+            # oncotriage/retrieval/indexer.py -- a zero line every run trains a
+            # reader to skip it.
+            if CHECKPOINT_WRITE_FAILURES:
+                console.out(f"  Checkpoint:      "
                   f"{sum(CHECKPOINT_WRITE_FAILURES.values())} write "
                   f"degradation(s) {dict(CHECKPOINT_WRITE_FAILURES)} -- resume "
                   f"state may be behind the rows already in the database")
 
-        if interrupted:
-            console.out(f"  Status:          INTERRUPTED (resume with same command)")
-        else:
-            generate_summary(db_path=db_path)
-            clear_ablation_checkpoint(db_path=db_path)
-            console.out(f"  Summary:         {ablation_summary_json(db_path)}")
-            console.out(f"  Status:          COMPLETE")
+            if interrupted:
+                console.out(f"  Status:          INTERRUPTED (resume with same command)")
+            else:
+                summary_df = generate_summary(db_path=db_path)
+                clear_ablation_checkpoint(db_path=db_path)
+                console.out(f"  Summary:         {ablation_summary_json(db_path)}")
+                console.out(f"  Status:          COMPLETE")
 
-        console.out("=" * 70)
-        console.out()
+            # --- Step 6: Close the tracking run (the tracking pass) ---
+            # THE CHILDREN ARE OPENED HERE, FROM THE SUMMARY, and not around each
+            # config's loop. Two reasons, both about honesty rather than
+            # convenience:
+            #
+            #   * the numbers a child carries are generate_summary()'s, which are
+            #     computed by ONE SQL query over the whole database after the last
+            #     config finishes. A child opened around the loop would have to
+            #     recompute them per config, which is a second computation of a
+            #     figure the study already produces -- the shape this project has
+            #     removed twice (cost_by_model, ablation_db).
+            #   * generate_summary() reports the LATEST run per config, so it
+            #     covers configs this invocation resumed rather than ran. A child
+            #     per loop iteration would index only what this process executed,
+            #     and a resumed study's index would be missing its earlier configs.
+            #
+            # AN INTERRUPTED STUDY GETS NO CHILDREN AND A `KILLED` PARENT. That is
+            # the honest record: generate_summary() was not called, so there are no
+            # per-config numbers to index, and inventing them from a partial
+            # database would be the metric invention this pass forbids.
+            if interrupted:
+                tracking.end_run(status="KILLED")
+            else:
+                _summary_records = ([] if summary_df is None
+                                    else summary_df.to_dict(orient="records"))
+                for _record in _summary_records:
+                    # `configs` is the only legal caller param here: the child's
+                    # subject IS one configuration, and every other parameter it
+                    # would carry is the parent's, logged once there.
+                    tracking.start_run(
+                        kind="ablation",
+                        params={"configs": _record["config_name"],
+                                "sample_size": args.sample_size,
+                                "seed": ABLATION_SEED},
+                        run_name=_record["config_name"],
+                        nested=True,
+                    )
+                    # EVERY NUMERIC COLUMN generate_summary() produced, under the
+                    # column's own name. Nothing is computed here and nothing is
+                    # renamed: a metric whose name differs from the summary table's
+                    # column is a number a reviewer has to translate.
+                    # log_run_metrics drops a non-numeric value by KEY and counts
+                    # it, which is what happens to a NULL cost_per_eligible -- it is
+                    # visible in the summary table and it is not a metric.
+                    tracking.log_run_metrics(
+                        {_k: _v for _k, _v in _record.items() if _k != "config_name"})
+                    tracking.end_run(status="FINISHED")
+
+                tracking.end_run(
+                    status="FINISHED" if run_error == 0 else "FAILED",
+                    artifacts=[ablation_summary_json(db_path)])
+
+            console.out("=" * 70)
+            console.out()
+        except BaseException:
+            tracking.end_run(status="FAILED")
+            raise
+
 #------------------------------------------------------------------------------
 
 

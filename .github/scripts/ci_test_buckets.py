@@ -214,13 +214,26 @@ BUCKETS = {
     "test_observability_logging.py": (
         _A, None, "ran green in 9.2s; all six stages driven with deps stand-ins"),
     "test_paths_glob_determinism.py": (
-        _A, None, "ran green in 0.1s against the skeleton; asserts 13 resolvers"),
+        _A, None, "ran green in 0.1s against the skeleton; asserts 14 resolvers"),
     "test_registries_cancer_codes_and_stage_extraction.py": (
         _A, None, "ran green in 0.2s"),
     "test_storage_inference_logging_contract.py": (
         _A, None, "ran green in 1.8s; temp SQLite only"),
     "test_storage_query_layer.py": (
         _A, None, "ran green in 2.6s, 191 checks, identical in a depth-1 clone"),
+    "test_tracking_mlflow_index.py": (
+        _A, None,
+        "ran green in 1.4s, 99 checks, against ONLY the directory skeleton: the "
+        "MLflow file-store round trip, the parameter enumeration, the two "
+        "degrade-to-unknown paths and the missing-package refusal. The tracking "
+        "store is a temp directory installed into paths._RESOLVED, "
+        "resolve_qdrant_collection is replaced by a stand-in (it is the module's "
+        "one live call) and the git probe is driven through a stubbed subprocess "
+        "-- no network, no keys, no spend, no live Qdrant, no corpus, and no git "
+        "history REQUIRED: section 8f accepts either outcome from the real probe "
+        "so a `git archive` export reports rather than aborts. It execs nothing; "
+        "the missing-package control masks sys.modules['mlflow'], which drives "
+        "the SHIPPED function because the import is deferred into it"),
 
     # ---- B: the collision matrix ------------------------------------------
     # Bucket assignment is asserted against run_serial_tests.py in check_complete().

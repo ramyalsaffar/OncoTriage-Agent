@@ -103,6 +103,7 @@ Verified rather than assumed. It is the same object as
 | `oncotriage/constants.py` | `SYSTEM_KEY_ABSENT` / `SYSTEM_KEY_UNRECOGNIZED` | nothing at all |
 | `oncotriage/observability.py` | **the one place output goes** — the structured JSON logger (`get_logger`, `StructuredLogger`), the correlation ID (`correlation_scope`, `NO_CORRELATION`), the field allowlist (`LOGGABLE_FIELDS`, `filter_fields`, `FIELD_DROPS`), the console UI channel (`console.out/banner/attach_bar/detach_bar`) and `_emit_line`, the single choke point both channels write through | `settings` |
 | `oncotriage/config.py` | every tunable, `PRICING_CONFIG`, `DATA_SNAPSHOT_DATE`, lazy client factories | `paths` |
+| `oncotriage/tracking.py` | **the run-to-configuration index** — `start_run` / `log_run_metrics` / `end_run`, the parameter enumeration, `TRACKING_DEGRADATIONS`. **The one module that imports `mlflow`, and it imports it inside the function bodies** | `config`, `paths`, `utils`, `agent.prompts`, `observability` |
 | `oncotriage/utils.py` | `get_model_cost`, `qdrant_retry`, `resolve_qdrant_collection`, `parse_partial_date`, `get_age_reference_date`, `CaffeinateSession`. **`exec_chain` was here and is deleted (pass 20e)** | `config` |
 | `oncotriage/embedding.py` | **the one** `SparseTextEmbedding("Qdrant/bm25")` construction site — `get_bm25_sparse_model`, `BM25_SPARSE_MODEL_NAME` | nothing from the project |
 | `oncotriage/registries/cancer_code_registry.py` | File 08 whole — `CancerCodeRegistry`, `OncologyLabRegistry`, `load_registry`, `load_lab_registry`, `REGISTRY_DEGRADATIONS` | `constants`, `settings` |
@@ -472,6 +473,13 @@ python tests/test_storage_write_durability.py                       #  99
 # recorded failure rather than a silent skip. ~2 min, almost all of it parsing.
 python tests/test_agent_patient_hash_coverage.py                    #  69
 
+# The tracking pass. Same shape, same directory. No network, no keys, no spend,
+# no live Qdrant, no corpus, no git history required, not in the collision
+# matrix, and it execs nothing -- the missing-package control masks
+# sys.modules['mlflow'], which drives the SHIPPED function because the import is
+# deferred into it. ~1.4 s.
+python tests/test_tracking_mlflow_index.py                          #  99
+
 pip install -e .                                         # makes `oncotriage` importable anywhere
 ```
 
@@ -584,6 +592,7 @@ Only `03- Code/` is version-controlled. Sibling directories under the project ro
 | `data_MeSH_path` | `02- Data/…/MeSH/` | MeSH C04 + UMLS crosswalk JSONs |
 | `keys_path` | `05- Keys/.env` | `OPENAI_API_KEY`, `QDRANT_URL`, `QDRANT_API_KEY` |
 | `checkpoint_path` | `08- Checkpoint/` | batch runner resume state |
+| `result_tracking_path` | `04- Results/06- MLflow Tracking/` | the MLflow file-backed tracking store (the tracking pass) |
 | ~~`requirements_path`~~ | `07- Requirements/` | **DELETED (pass 20f-3)**, from both path tables, with the in-repo `requirements/` directory. It was read by no code, ever; `pyproject.toml` is the one dependency list. The stale sibling outside the repository is untouched and nothing resolves to it any more |
 
 `ONCOTRIAGE_ALLOW_DEGRADED_REGISTRIES` permits a run to continue with the MeSH
@@ -3882,6 +3891,161 @@ both** — without it, 4e would have passed vacuously, twice.
 **VERIFIED BY RUNNING.** `fixture_replay.py` **12/12 clean without recapture**,
 `tests/test_package_invariants.py` **247**, and every hash-adjacent existing test
 at its documented count. **No money was spent.**
+
+### The run-to-configuration index (the tracking pass)
+
+**PROVING WHICH CONFIGURATION PRODUCED WHICH NUMBER WAS NOT POSSIBLE FROM THE
+DATABASES, AND STILL IS NOT — THAT IS WHAT THIS ADDS.** `inferences.db` and
+`ablation_results.db` store PER-PATIENT rows; neither stores a run's INPUTS. So
+"which prompt version, model, retrieval sizes, thresholds and commit produced
+the headline number" had no answer in the artifacts, only in whoever remembered.
+`oncotriage/tracking.py` is an index over runs, above both databases and
+replacing neither.
+
+**THE PACKAGE IS `mlflow-skinny==3.15.1`, AND THE FILE STORE NEEDED AN OPT-OUT
+NOBODY EXPECTED.** Skinny is the client-only distribution — no flask, no
+alembic, no sqlalchemy, no server, no UI — and installing it into the
+development environment adds exactly **two** distributions (`mlflow-skinny`,
+`databricks-sdk`) and **moves no pin**, measured with `pip install --dry-run`.
+`pip-audit` over the resulting tree reports **zero** findings, so nothing was
+added to `audit_gate.py`'s accepted table. Every one of its own requirement
+bounds is an open-ended upper bound (`fastapi<1`, `pydantic<3`, `starlette<2`,
+`uvicorn<1`) that the existing pins already satisfy, so it does not drag the
+serving layer forward the way `mcp` once dragged starlette.
+
+**What it costs: MLflow 3.15 put the FILESYSTEM backend into maintenance mode
+and it RAISES unless `MLFLOW_ALLOW_FILE_STORE` is set.** The message names
+`sqlite:///mlflow.db` as the replacement and that route is **not available under
+skinny** — measured, not assumed: a sqlite URI fails with
+`UnsupportedModelRegistryStoreURIException`, because the model-registry store has
+no sqlite implementation in this distribution, and a SQLAlchemy backend would
+need the alembic tree skinny exists to avoid. The module sets the vendor's own
+documented opt-out, only when it is unset, and prints which. Setting it at CALL
+time is safe rather than lucky: MLflow reads the variable when the store is
+CONSTRUCTED, proved both ways.
+
+**THE PATH TABLES ARE A TRIPLE, NOT A PAIR.** `result_tracking_path` went into
+the local glob branch, the Docker branch's literal `/app/...` table AND
+`.github/scripts/provision_ci_paths.py:_skeleton()`. The first two are
+cross-checked at import by `paths.py` itself; the third cross-checks itself
+against `PATH_NAMES` at the end of its own `main()`. The local branch resolves
+`{results}/*MLflow Tracking/`, under the existing results tree rather than as a
+fourteenth root-level sibling glob. **Thirteen path variables became fourteen**,
+and `tests/test_paths_glob_determinism.py`'s resolver-count non-degeneracy check
+moved with them.
+
+**THREE FUNCTIONS, AND NOTHING ELSE IMPORTS `mlflow`.** `start_run(kind,
+params)` / `log_run_metrics(metrics)` / `end_run(status, artifacts)`. The
+artifact store moves to S3 at the migration — recorded as a comment at
+`tracking_uri()`, not as a half-built switch — and one wrapper makes that move
+one file. The import is INSIDE the function bodies (the `import icd10` /
+`import torch` third-party exemption), so importing the package pulls in no part
+of a 33 MB tree and `tests/test_package_invariants.py` section 2 still passes
+**247/0/0** with its twelve traps armed.
+
+**WHERE IT RAISES AND WHERE IT COUNTS IS ITEM 11a's LINE.** `start_run` RAISES —
+it runs before a cent is spent and everything that can fail there is
+configuration; a missing package refuses by name with the install command and
+**never** shrinks to a no-op. `log_run_metrics` and `end_run` DO NOT raise: they
+run after the run has spent its money and written its rows, so they count into
+`TRACKING_DEGRADATIONS` (registered in `oncotriage/degradation.py`, eighteenth
+counter) and return False. A tracking layer that destroys the run it exists to
+describe is worse than no tracking layer.
+
+**PARAMS ARE NAMED CONSTANTS ONLY, AND THAT IS ENFORCED RATHER THAN CONVENED.**
+`CONFIGURATION_PARAM_NAMES` enumerates 24 constants read off `oncotriage.config`
+by name; `CALLER_PARAM_KEYS` is a CLOSED set of seven run-shape facts a constant
+cannot carry (`sample_size`, `seed`, `configs`, `db_path`, …) and **an unknown
+key raises**, `deps.OVERRIDE_KEYS`' shape. There is no `os.environ`, no
+`config.__dict__`, no `vars()` and nothing from the keys directory anywhere in
+the parameter path, asserted by AST — a credential in a tracking store outlives
+every scrub. The test seeds a fake `OPENAI_API_KEY` and requires it in no key and
+no value.
+
+**"PROMPT SHA COVERAGE" IS TWO TEMPLATE FINGERPRINTS, NOT A RUN'S PROMPT SHA,
+and the difference is stated at the code.** `render_system_prompt` takes three
+arguments and two vary PER PATIENT, so a run has no single prompt sha — the
+per-inference one already exists as `inferences.llm_classifier_prompt_sha256`.
+What a run does have is a template with exactly one branch
+(`mesh_filter_applied`), so one digest per branch is logged, rendered with
+DECLARED probe arguments that are logged beside them.
+
+**DEGRADE HONESTLY, TWICE.** The git commit is read by subprocess and records
+`"unknown"` with a `git_commit_unknown` tag where git or `.git` is absent (the
+container); the Qdrant collection goes through `resolve_qdrant_collection` and
+does the same when the client cannot be built. **`git_dirty` is the one addition
+beyond the brief**, argued: a commit identifies the code only if the tree matches
+it, and the pass's stated goal is proving which CODE produced which number.
+
+**THE BATCH RUNNER's METRICS SELECT, THEY DO NOT COMPUTE.** `print_summary`'s
+`_stats` closure became the module-level `pass_stats()` — moved unchanged, it
+closed over nothing — so the printed block and the index read ONE computation.
+Proved: `print_summary`'s output is **byte-identical across 20 scenarios**
+against `git show HEAD:`, with a control that differs. Five of its eleven
+members are numbers and six are display strings ("12.3s"); only the five are
+logged, because parsing a number back out of a display string would be inventing
+a metric. An absent resample pass emits **no** resample metric rather than five
+zeros, and no reconciliation emits **no** reconciliation metric — "not asked" is
+not "rows were lost".
+
+**THE ABLATION STUDY IS ONE PARENT AND ONE NESTED CHILD PER CONFIGURATION**, and
+the children are opened AFTER `generate_summary()` rather than around each
+config's loop: that function computes its numbers in one SQL query over the whole
+database and reports the LATEST run per config, so a child per loop iteration
+would both recompute the figures and miss every config a resumed study did not
+re-run. An INTERRUPTED study gets no children and a `KILLED` parent — there are
+no per-config numbers to index, and inventing them from a partial database is
+the metric invention this pass forbids.
+
+**A CRASHED RUN IS INDEXED AS `FAILED`, AND THE MEASUREMENT BEHIND THAT IS THE
+SHARPEST THING IN THE PASS.** A process that opens an MLflow run and then dies
+on an uncaught exception has that run recorded as **FINISHED** — MLflow's own
+`atexit` hook ends it and does not know the process was failing. So a campaign
+that crashed halfway would be indexed as a campaign that completed, which is
+worse than an orphan left at RUNNING. Both callers wrap their body in
+`except BaseException: tracking.end_run("FAILED"); raise` — the exception is
+re-raised unchanged, so no pipeline behaviour moves and nothing is swallowed to
+protect the index.
+
+**THE REINDENT THAT GUARD NEEDED DAMAGED TWO DOCSTRINGS ON THE FIRST ATTEMPT.**
+Adding four spaces to every line of the wrapped region also indented the
+CONTINUATION LINES of multi-line string literals, silently editing two nested
+docstrings in `study.py`. Caught by an AST comparison, not by reading. The
+shipped version derives the protected line numbers from the AST and then PROVES
+no literal moved — 40 and 117 string constants in the two `main()` bodies,
+preserved exactly, plus the one `"FAILED"` the guard itself introduces — and a
+`SequenceMatcher` over the flattened statement sequence shows **insertions only:
+zero deletions and zero unexpected replacements** in either function.
+
+**A RESUMED RUN IS A NEW TRACKING RUN TAGGED `resumed=true`**, in both entry
+points. No run-continuation machinery was invented; the tag is what joins them.
+
+**`tests/test_tracking_mlflow_index.py` — 99 checks**, bucket A, ~1.4 s, no
+network, no keys, no spend, no live Qdrant, no corpus, **no git history
+required** (section 8f accepts either outcome from the real probe, so a
+`git archive` export reports rather than aborts), and not in the collision
+matrix. It **execs nothing**: the missing-package control masks
+`sys.modules["mlflow"]`, which drives the SHIPPED function precisely because the
+import is deferred into it. Bucket A wall time **15.0 s → 15.8 s**.
+
+**FOURTEEN REVERTS, FOURTEEN CAUGHT**, each applied to a `copytree`'d copy with a
+realpath preflight asserting the COPY is what imports. **Two of them were initially "caught" by ABORTING the test file** — `git_commit` re-raising and
+`start_run`'s validation moving below `mlflow.start_run` produced a traceback and
+**zero** recorded failures where they owed several. That is the shape this
+project has shipped four times before; every call into the module now goes
+through a `drive()` / `raises()` wrapper that converts a raise into a value
+`check()` fails on, and the same two reverts now report **5** and **26** failing
+checks.
+
+**THREE DEFECTS IN THIS PASS'S OWN CODE WERE FOUND BY RUNNING, NOT BY READING.**
+(i) `start_run` resolved the Qdrant collection TWICE — once for the parameter and
+once for the warning tag — two live calls that can disagree across an alias swap;
+(ii) an `isinstance(value, (int, float))` metric test silently dropped every
+`numpy.int64`, which is **not** a subclass of `int`, so every integer column the
+ablation summary produces (`n`, `n_scored`, `errors`) would have been absent from
+the index while every float column landed; (iii) a validation raise sat BELOW
+`mlflow.start_run`, which would have left an orphan run at RUNNING forever. All
+three are fixed and each has a check.
 
 ### A SKIP IS NOT A PASS (commit `ec2033a`)
 

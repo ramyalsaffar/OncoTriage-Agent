@@ -51,7 +51,7 @@ Run from terminal:
     python .github/scripts/provision_ci_paths.py --root /path/to/ci-root
 
 Exit codes:
-    0 -- the skeleton is present and all thirteen path variables resolve
+    0 -- the skeleton is present and all fourteen path variables resolve
     1 -- a directory could not be created, or a path still does not resolve
 """
 
@@ -87,6 +87,12 @@ def _skeleton(root):
         "results_path":             results + os.sep,
         "result_fhir_explore_path": os.path.join(results, "01- FHIR Exploration") + os.sep,
         "result_ablation_path":     os.path.join(results, "02- Ablation") + os.sep,
+        # The MLflow file-backed tracking store (the tracking pass). A DIRECTORY
+        # and nothing else -- no experiment is created here. `mlflow` creates
+        # its own `meta.yaml` on first use, and a skeleton that pre-created one
+        # would be fabricating tracking state, which is the line the header
+        # above draws.
+        "result_tracking_path":     os.path.join(results, "06- MLflow Tracking") + os.sep,
         "keys_path":                os.path.join(root, "05- Keys") + os.sep,
         "airflow_path":             os.path.join(root, "06- Airflow") + os.sep,
         "checkpoint_path":          os.path.join(root, "08- Checkpoint") + os.sep,
@@ -141,7 +147,7 @@ def main(argv=None):
     #
     # `oncotriage/paths.py` sets
     # `IS_DOCKER = os.path.exists('/.dockerenv') or DOCKER_CONTAINER == 'true'`,
-    # and under it `_RESOLVERS` becomes `_DOCKER_PATHS` -- thirteen literal
+    # and under it `_RESOLVERS` becomes `_DOCKER_PATHS` -- fourteen literal
     # `/app/...` strings. Those resolve without globbing anything, so the
     # verification at the end of this function passes whatever this function
     # created, `ONCOTRIAGE_MAIN_PATH` is ignored entirely, and the tests then

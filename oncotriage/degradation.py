@@ -78,6 +78,7 @@ from oncotriage import utils as _utils
 from oncotriage.registries import cancer_code_registry as _cancer_code_registry
 from oncotriage.registries import mesh as _mesh
 from oncotriage.storage import database_logger as _database_logger
+from oncotriage import tracking as _tracking
 
 
 log = get_logger(__name__)
@@ -150,6 +151,16 @@ _REGISTRY_SPEC = (
     ("EMIT_FAILURES", _observability.EMIT_FAILURES,
      "a console or log line could not be written; THIS REPORT IS ITSELF "
      "SUSPECT when this is non-zero"),
+    # LAST, and after EMIT_FAILURES on purpose: it is the only counter here
+    # that says nothing about the RUN. Every entry above it describes something
+    # that happened to the pipeline; this one says the run was fine and its
+    # INDEX is incomplete -- the git commit, the resolved collection, a metric
+    # or an artifact did not reach the tracking store. A reader scanning the
+    # block top to bottom walks the run and then reaches the record of the run.
+    ("TRACKING_DEGRADATIONS", _tracking.TRACKING_DEGRADATIONS,
+     "the run completed but its tracking record is incomplete -- 'unknown' "
+     "metadata, a dropped metric or an unattached artifact; the numbers are "
+     "sound and what produced them is less traceable"),
 )
 
 _REGISTRY: Dict[str, Counter] = {name: counter for name, counter, _ in _REGISTRY_SPEC}

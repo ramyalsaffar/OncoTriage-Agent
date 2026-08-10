@@ -8,7 +8,7 @@ service does.
 
 THE DEFECT THIS CLOSES
 ----------------------
-``oncotriage/paths.py`` fixes thirteen absolute paths for the container (it
+``oncotriage/paths.py`` fixes fourteen absolute paths for the container (it
 was fourteen until pass 20f-3 dropped the never-read ``requirements_path``). The
 Dockerfile created three of them; ``docker-compose.yml`` then mounted the host
 code directory over the whole of ``/app``, hiding those three, and declared no

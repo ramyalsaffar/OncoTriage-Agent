@@ -257,6 +257,37 @@ dependencies = [
     "pydantic==2.12.5",
     "slowapi==0.1.9",
 
+    # --- Experiment tracking -------------------------------------------------
+    # THE RUN-TO-CONFIGURATION INDEX (the tracking pass). `mlflow-skinny` is the
+    # CLIENT-ONLY distribution: no flask, no alembic, no sqlalchemy, no server
+    # and no UI, so none of that reaches the pip-audit surface or the image.
+    #
+    # A DEFAULT DEPENDENCY AND NOT AN EXTRA, deliberately. The batch runner and
+    # the ablation study are package code and both are indexed by it, so an
+    # extra would make the campaign's index optional -- and an index that is
+    # optional is an index that is missing exactly when somebody asks which
+    # configuration produced a number. Contrast `apache-airflow` in the
+    # `orchestration` extra below: nothing in oncotriage/ imports airflow, and
+    # the package imports fine without it.
+    #
+    # MEASURED, not assumed (2026-08-10): installing it into the development
+    # environment adds exactly TWO distributions -- this one and databricks-sdk
+    # -- and moves NO existing pin. Its own requirement floors are all
+    # open-ended upper bounds (`fastapi<1`, `pydantic<3`, `starlette<2`,
+    # `uvicorn<1`), which the pins above already satisfy, so it does not drag
+    # the serving layer forward the way `mcp` once dragged starlette. pip-audit
+    # over the resulting tree reports ZERO findings, so nothing is added to
+    # .github/scripts/audit_gate.py's accepted table.
+    #
+    # 3.15.1 IS WHERE THE FILE STORE ENTERED MAINTENANCE MODE, and that is
+    # recorded here because it is the version that made an environment variable
+    # necessary: from this release the filesystem backend raises unless
+    # MLFLOW_ALLOW_FILE_STORE is set. oncotriage/tracking.py sets it, and its
+    # docstring argues why the recommended `sqlite:///` route is not available
+    # under skinny (no sqlalchemy, and the model-registry store has no sqlite
+    # implementation in this distribution).
+    "mlflow-skinny==3.15.1",
+
     # --- Dashboard and plotting ---------------------------------------------
     # 1.46.0, NOT the 1.45.1 installed on the development machine, and this is
     # the one pin here that is not simply what `pip list` reported. THE MEASURED

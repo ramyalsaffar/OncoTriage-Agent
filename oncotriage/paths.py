@@ -352,6 +352,18 @@ _DOCKER_PATHS = {
     "results_path":             "/app/results/",
     "result_fhir_explore_path": "/app/results/fhir_exploration/",
     "result_ablation_path":     "/app/results/ablation/",
+    # The MLflow file-backed tracking store (the tracking pass). It sits under
+    # the RESULTS tree rather than as a new top-level sibling, because it is an
+    # output of runs, and inventing a fourteenth root-level glob would mean a
+    # fourteenth way for `_glob_one` to fail on a machine that has everything
+    # else.
+    #
+    # IN THE CONTAINER THIS WRITES INSIDE THE CONTAINER'S OWN VOLUME, and that
+    # is stated rather than discovered: `docker-compose.yml` is unchanged by
+    # this pass, so a containerised run's tracking store lives in the
+    # `app-results` volume and is not the developer's. The campaign runs on the
+    # host.
+    "result_tracking_path":     "/app/results/mlflow_tracking/",
     "keys_path":                "/app/",
     "airflow_path":             "/app/airflow_home/",
     # `requirements_path` STOOD HERE AND IS DELETED (pass 20f-3). It resolved
@@ -362,8 +374,10 @@ _DOCKER_PATHS = {
     # is the one dependency list) and left the DIRECTORY standing precisely
     # because this variable named it, recording the removal as a follow-up with
     # the whole edit written out. This is that edit: the variable goes, the
-    # directory goes with it, and the container's bring-up report is thirteen
-    # paths instead of fourteen.
+    # directory goes with it, and the container's bring-up report was thirteen
+    # paths instead of fourteen. (It is fourteen again since the tracking pass
+    # added `result_tracking_path` above — a different name, and one that code
+    # reads.)
     #
     # The stale sibling `{root}/07- Requirements/` is outside the repository and
     # is not touched by this or any commit. Nothing resolves to it any more.
@@ -402,6 +416,9 @@ _LOCAL_PATHS = {
     "result_ablation_path":
         lambda: _glob_one(_resolve("results_path") + "/*Ablation/",
                           "ablation results"),
+    "result_tracking_path":
+        lambda: _glob_one(_resolve("results_path") + "/*MLflow Tracking/",
+                          "MLflow tracking"),
     "keys_path":
         lambda: _glob_one(_root() + "/*Keys/", "keys"),
     "airflow_path":
@@ -417,10 +434,18 @@ _RESOLVERS.update(
     if IS_DOCKER else _LOCAL_PATHS
 )
 
-# Both branches must expose the SAME thirteen names — that is the defect item
+# Both branches must expose the SAME fourteen names — that is the defect item
 # 20a found in code_path, restated as a check now that the two branches are two
 # dicts rather than two halves of an if. Checked at import because it costs one
 # set comparison and catches a name added to one table and not the other.
+#
+# THE TABLES ARE A TRIPLE, NOT A PAIR, and this check only sees two of them.
+# `.github/scripts/provision_ci_paths.py:_skeleton()` is the third: it creates
+# the directories a CI checkout does not have, and a name present here and
+# absent there resolves on a developer machine and raises in CI. That file
+# cross-checks itself against `PATH_NAMES` at the end of its own main(), so the
+# third table fails loudly rather than silently — but the check lives THERE,
+# because this module must not import a CI script.
 #
 # A raise rather than an assert: `python -O` strips assert statements, and an
 # invariant that disappears under a common interpreter flag is not an invariant.

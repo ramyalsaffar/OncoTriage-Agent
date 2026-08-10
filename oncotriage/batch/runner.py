@@ -121,6 +121,7 @@ from oncotriage.storage.database_logger import (
 from oncotriage.utils import CaffeinateSession
 from oncotriage.observability import console, get_logger
 from oncotriage import degradation
+from oncotriage import tracking
 
 
 log = get_logger(__name__)
@@ -1396,6 +1397,126 @@ def print_reconciliation(rec: dict) -> None:
 #------------------------------------------------------------------------------
 
 
+def pass_stats(records: list) -> dict:
+    """The per-pass statistics block. ``{}`` for an empty pass.
+
+    THE BODY IS ``print_summary``'s ``_stats`` CLOSURE, MOVED OUT UNCHANGED
+    (the tracking pass). It closed over nothing -- ``records`` was its only
+    input -- so hoisting it is a relocation and not a rewrite, and
+    ``print_summary`` still calls it for exactly the two blocks it printed
+    before.
+
+    WHY IT HAD TO MOVE. ``oncotriage/tracking.py`` logs the run's summary
+    numbers, and the brief for that pass is explicit that it may log only
+    numbers the summary ALREADY computes. A second computation beside this one
+    is the shape this project has removed twice already -- ``cost_by_model``
+    against the dashboard's pandas groupby, ``analysis.ablation_db()`` against
+    ``study.ablation_db()`` -- and both times the two copies had already
+    diverged before anyone noticed. One function, two readers.
+
+    THE RETURN SHAPE IS UNCHANGED, INCLUDING THE FORMATTED STRINGS. Five values
+    here are numbers and six are pre-formatted display strings ("12.3s",
+    "4.2 min", "31.0%"). Converting them to numbers would be a rewrite of what
+    ``print_summary`` prints, which this pass does not do -- so
+    ``tracking_metrics`` below takes the five numeric members and computes
+    nothing from the other six. Parsing a number back out of "12.3s" to log it
+    would be inventing a metric out of a display string, which is worse than
+    not logging it.
+    """
+    if not records:
+        return {}
+    success = [r for r in records if r["status"] == "success"]
+    errors  = [r for r in records if r["status"] != "success"]
+    # Include ALL records with a meaningful total_time in timing stats
+    # (not just status=="success"). A patient whose pipeline ran but
+    # returned an error_msg still has a valid elapsed time worth tracking.
+    times   = [r["total_time"] for r in records if r.get("total_time", 0) > 0]
+    # Eligible match counts are only meaningful for successful runs
+    eligible = [r["eligible_matches"] for r in success]
+    # Trials the model could not assess, surfaced so a run that quietly
+    # stops evaluating is visible instead of looking like a run with fewer
+    # matches. Older checkpoint records predate the key.
+    unevaluable = [r.get("not_evaluable", 0) for r in success]
+    return {
+        "total":               len(records),
+        "success":             len(success),
+        "errors":              len(errors),
+        "error_rate":          f"{len(errors)/len(records)*100:.1f}%",
+        "avg_time":            f"{sum(times)/len(times):.1f}s" if times else "N/A",
+        "min_time":            f"{min(times):.1f}s"            if times else "N/A",
+        "max_time":            f"{max(times):.1f}s"            if times else "N/A",
+        "total_time":          f"{sum(times)/60:.1f} min"      if times else "N/A",
+        "avg_eligible":        f"{sum(eligible)/len(eligible):.2f}" if eligible else "N/A",
+        "patients_with_match": sum(1 for e in eligible if e > 0),
+        "not_evaluable":       sum(unevaluable),
+    }
+
+
+# The five members of pass_stats() that are numbers rather than display
+# strings. Named rather than filtered by isinstance at call time, because
+# "whatever happens to be an int today" is not a contract -- adding a numeric
+# member to pass_stats() would silently start logging it under a name nobody
+# chose, and REMOVING one would silently stop logging it.
+_TRACKED_PASS_STATS = ("total", "success", "errors", "patients_with_match",
+                       "not_evaluable")
+
+
+def tracking_metrics(results_list: list, total_wall_time: float,
+                     reconciliation: dict = None,
+                     degradation_snapshot: dict = None) -> dict:
+    """The run's summary numbers, as ``{metric name: number}`` for the index.
+
+    SELECTS, NEVER COMPUTES. Every value here is read from ``pass_stats``, from
+    ``reconcile_writes``' verdict or from ``degradation.totals`` -- the three
+    things ``print_summary`` prints. This function does arithmetic on none of
+    them, so a number in the tracking store and the number in the printed
+    summary cannot disagree.
+
+    ``total_wall_time`` is the one value passed in rather than derived, exactly
+    as ``print_summary`` takes it, and it is logged in SECONDS while the
+    summary prints minutes. That is a unit, not a second computation: a metric
+    store wants a base unit, and `/60` at the print site is the display.
+
+    Args:
+        results_list: the run's per-patient records.
+        total_wall_time: seconds, as handed to ``print_summary``.
+        reconciliation: ``reconcile_writes``' dict, or None. None means nobody
+            reconciled, and NO reconciliation metric is emitted -- an absent
+            metric is "not asked", while ``reconciliation_complete=0`` would
+            assert that rows were lost.
+        degradation_snapshot: ``degradation.snapshot()``'s dict, or None. Its
+            TOTALS are logged, keyed by counter NAME -- never the counter's own
+            keys, which carry third-party and clinical text. That is the
+            distinction ``degradation.totals()`` exists to make, and it is the
+            reason this is loggable at all.
+    """
+    metrics = {"wall_time_seconds": total_wall_time}
+
+    for label, records in (
+        ("main", [r for r in results_list if not r.get("is_resample")]),
+        ("resample", [r for r in results_list if r.get("is_resample")]),
+    ):
+        stats = pass_stats(records)
+        for key in _TRACKED_PASS_STATS:
+            # An EMPTY PASS EMITS NOTHING, rather than five zeros. pass_stats
+            # returns {} for no records, and a run with no resample pass is not
+            # a run whose resample pass found nothing -- logging zeros would
+            # make those two indistinguishable in every comparison.
+            if key in stats:
+                metrics[f"{label}_{key}"] = stats[key]
+
+    if reconciliation is not None:
+        for key in ("attempted", "verified", "missing"):
+            metrics[f"reconciliation_{key}"] = reconciliation[key]
+        metrics["reconciliation_complete"] = reconciliation["complete"]
+
+    if degradation_snapshot is not None:
+        for name, total in degradation.totals(degradation_snapshot).items():
+            metrics[f"degradation_{name}"] = total
+
+    return metrics
+
+
 def print_summary(results_list: list, total_wall_time: float, db_path=None,
                   reconciliation: dict = None,
                   degradation_snapshot: dict = None) -> None:
@@ -1436,38 +1557,8 @@ def print_summary(results_list: list, total_wall_time: float, db_path=None,
     main_results = [r for r in results_list if not r.get("is_resample")]
     resample_results = [r for r in results_list if r.get("is_resample")]
 
-    def _stats(records: list) -> dict:
-        if not records:
-            return {}
-        success = [r for r in records if r["status"] == "success"]
-        errors  = [r for r in records if r["status"] != "success"]
-        # Include ALL records with a meaningful total_time in timing stats
-        # (not just status=="success"). A patient whose pipeline ran but
-        # returned an error_msg still has a valid elapsed time worth tracking.
-        times   = [r["total_time"] for r in records if r.get("total_time", 0) > 0]
-        # Eligible match counts are only meaningful for successful runs
-        eligible = [r["eligible_matches"] for r in success]
-        # Trials the model could not assess, surfaced so a run that quietly
-        # stops evaluating is visible instead of looking like a run with fewer
-        # matches. Older checkpoint records predate the key.
-        unevaluable = [r.get("not_evaluable", 0) for r in success]
-        return {
-            "total":               len(records),
-            "success":             len(success),
-            "errors":              len(errors),
-            "error_rate":          f"{len(errors)/len(records)*100:.1f}%",
-            "avg_time":            f"{sum(times)/len(times):.1f}s" if times else "N/A",
-            "min_time":            f"{min(times):.1f}s"            if times else "N/A",
-            "max_time":            f"{max(times):.1f}s"            if times else "N/A",
-            "total_time":          f"{sum(times)/60:.1f} min"      if times else "N/A",
-            "avg_eligible":        f"{sum(eligible)/len(eligible):.2f}" if eligible else "N/A",
-            "patients_with_match": sum(1 for e in eligible if e > 0),
-            "not_evaluable":       sum(unevaluable),
-        }
-
-    main_stats = _stats(main_results)
-    resample_stats = _stats(resample_results)
-
+    main_stats = pass_stats(main_results)
+    resample_stats = pass_stats(resample_results)
     # Error detail: list unique error messages and their counts
     error_records = [r for r in results_list if r["status"] != "success" and r.get("error")]
     error_counts: dict = {}
@@ -1666,68 +1757,169 @@ def main():
         results_list = load_results()
 
         # ------------------------------------------------------------------
-        # 4. Main batch pass
+        # 3b. Open the tracking run (the tracking pass)
         # ------------------------------------------------------------------
-        completed_ids, _ = run_batch(
-            fhir_files=fhir_files,
-            bm25_index=bm25_index,
-            nct_ids=nct_ids,
-            graph=graph,
-            completed_ids=completed_ids,
-            results_list=results_list,
+        # WHY HERE AND NOT HIGHER. It is after every preflight -- the BM25
+        # index, the graph, the corpus, the baseline row count and now the
+        # checkpoint -- and BEFORE the first billed call, which is the first
+        # patient of step 4. Two of the values it logs are only known at this
+        # point: how many bundles the corpus holds, and whether this is a
+        # resumed run. A start_run three blocks higher would have to log
+        # neither or guess both.
+        #
+        # It RAISES if tracking is unavailable, and that is the point: this is
+        # the last line before the run starts spending, so a campaign that
+        # would not be indexed stops here having cost nothing.
+        #
+        # A RESUMED RUN IS A NEW TRACKING RUN, TAGGED `resumed=true`. There is
+        # deliberately no run-continuation machinery: MLflow can reopen a run
+        # by id, which would mean persisting that id beside the checkpoint,
+        # deciding what happens when the two disagree, and merging two sets of
+        # parameters that may have been produced by different code. The
+        # question a reviewer asks is "which configuration produced this
+        # number", and two runs sharing a checkpoint answer it as well as one
+        # run reopened -- the tag is what joins them.
+        #
+        # MAIN THREAD ONLY. This and the two calls at the end of main() are
+        # the only tracking calls in this module, and all three run before the
+        # pool is created or after it has been joined; no worker touches
+        # oncotriage/tracking.py.
+        tracking.start_run(
+            kind="batch",
+            params={
+                "patient_count": len(fhir_files),
+                "resample_count": RESAMPLE_COUNT,
+                "resample_seed": RESAMPLE_SEED,
+            },
+            tags={"resumed": "true" if completed_ids else "false"},
         )
 
-        # ------------------------------------------------------------------
-        # 5. Resample pass
-        #    run_batch always returns main_pass_complete=True when it returns
-        #    at all (a mid-loop crash exits the process before any return).
-        #    Guard on completed_ids to skip gracefully if every patient errored.
-        # ------------------------------------------------------------------
-        if completed_ids:
-            run_resample(
+        # THE RUN IS CLOSED ON EVERY EXIT PATH, and this try exists only for
+        # that. MEASURED, not assumed: a process that opens an MLflow run and
+        # then dies on an uncaught exception has that run recorded as
+        # **FINISHED** -- MLflow's own atexit hook ends it and does not know the
+        # process was failing. So without this, a campaign that crashed halfway
+        # is indexed as a campaign that completed, which is worse than an orphan
+        # left at RUNNING and is exactly the "quietly wrong record" this module
+        # exists to remove.
+        #
+        # `except BaseException` + `raise` rather than `finally`: the normal
+        # path closes the run with its real status a few lines down, and a bare
+        # finally would need a flag to avoid closing it twice.
+        #
+        # IT CHANGES NO PIPELINE BEHAVIOUR. The exception is re-raised
+        # unchanged, so every caller sees exactly what it saw before; the only
+        # thing that happens first is one FAILED status write, which cannot
+        # raise (see oncotriage/tracking.py).
+        try:
+            # ------------------------------------------------------------------
+            # 4. Main batch pass
+            # ------------------------------------------------------------------
+            completed_ids, _ = run_batch(
                 fhir_files=fhir_files,
-                completed_ids=completed_ids,
                 bm25_index=bm25_index,
                 nct_ids=nct_ids,
                 graph=graph,
+                completed_ids=completed_ids,
                 results_list=results_list,
             )
-        else:
-            console.out("[Resample] Skipped: no successfully completed patients.")
 
-        # ------------------------------------------------------------------
-        # 6. Reconcile the writes, then the final summary
-        # ------------------------------------------------------------------
-        total_wall_time = time.time() - run_start
-        reconciliation = reconcile_writes(rows_before=rows_before)
-        _publish_reconciliation(reconciliation)
+            # ------------------------------------------------------------------
+            # 5. Resample pass
+            #    run_batch always returns main_pass_complete=True when it returns
+            #    at all (a mid-loop crash exits the process before any return).
+            #    Guard on completed_ids to skip gracefully if every patient errored.
+            # ------------------------------------------------------------------
+            if completed_ids:
+                run_resample(
+                    fhir_files=fhir_files,
+                    completed_ids=completed_ids,
+                    bm25_index=bm25_index,
+                    nct_ids=nct_ids,
+                    graph=graph,
+                    results_list=results_list,
+                )
+            else:
+                console.out("[Resample] Skipped: no successfully completed patients.")
 
-        # ONE SNAPSHOT, TWO CONSUMERS, exactly as the reconciliation above is
-        # computed once and given to both the publisher and the printer. The
-        # structured event goes out FIRST because emitting it can itself move
-        # EMIT_FAILURES; taking the snapshot before either consumer means the
-        # printed block and the logged event agree, and a failure to emit the
-        # event shows up in the NEXT run's report rather than making this one's
-        # two halves disagree about their own subject.
-        degradation_snapshot = degradation.snapshot()
-        degradation.log_summary(degradation_snapshot)
+            # ------------------------------------------------------------------
+            # 6. Reconcile the writes, then the final summary
+            # ------------------------------------------------------------------
+            total_wall_time = time.time() - run_start
+            reconciliation = reconcile_writes(rows_before=rows_before)
+            _publish_reconciliation(reconciliation)
 
-        print_summary(results_list, total_wall_time,
-                      reconciliation=reconciliation,
-                      degradation_snapshot=degradation_snapshot)
+            # ONE SNAPSHOT, TWO CONSUMERS, exactly as the reconciliation above is
+            # computed once and given to both the publisher and the printer. The
+            # structured event goes out FIRST because emitting it can itself move
+            # EMIT_FAILURES; taking the snapshot before either consumer means the
+            # printed block and the logged event agree, and a failure to emit the
+            # event shows up in the NEXT run's report rather than making this one's
+            # two halves disagree about their own subject.
+            degradation_snapshot = degradation.snapshot()
+            degradation.log_summary(degradation_snapshot)
 
-        # ------------------------------------------------------------------
-        # 7. Clean up checkpoint only if all main-pass patients succeeded
-        # ------------------------------------------------------------------
-        main_results = [r for r in results_list if not r.get("is_resample")]
-        main_errors = [r for r in main_results if r["status"] != "success"]
-        if not main_errors:
-            clear_checkpoint()
-            console.out("[Checkpoint] Cleared for next fresh run.")
-        else:
-            console.out(f"[Checkpoint] Kept: {len(main_errors)} patients errored. Re-run to retry failures.")
+            print_summary(results_list, total_wall_time,
+                          reconciliation=reconciliation,
+                          degradation_snapshot=degradation_snapshot)
 
-        return results_list
+            # ------------------------------------------------------------------
+            # 7. Clean up checkpoint only if all main-pass patients succeeded
+            # ------------------------------------------------------------------
+            main_results = [r for r in results_list if not r.get("is_resample")]
+            main_errors = [r for r in main_results if r["status"] != "success"]
+            if not main_errors:
+                clear_checkpoint()
+                console.out("[Checkpoint] Cleared for next fresh run.")
+            else:
+                console.out(f"[Checkpoint] Kept: {len(main_errors)} patients errored. Re-run to retry failures.")
+
+            # ------------------------------------------------------------------
+            # 8. Close the tracking run (the tracking pass)
+            # ------------------------------------------------------------------
+            # The metrics come from the SAME objects print_summary was handed --
+            # the same results list, the same reconciliation dict and the same
+            # degradation snapshot -- so the index and the printed block describe
+            # one instant and cannot disagree. That is why the snapshot is taken
+            # once above and passed twice, rather than re-read here.
+            #
+            # THE STATUS IS THE MAIN PASS'S, as the brief specifies, and it is the
+            # same fact the checkpoint decision above is made on: main-pass errors
+            # remaining means the run did not finish its job, whatever the resample
+            # pass did. Note it is deliberately NOT the reconciliation verdict --
+            # a run whose patients all succeeded but whose rows were lost is
+            # FINISHED with `reconciliation_complete=0`, and collapsing those two
+            # into one status would delete the distinction the write-durability
+            # pass exists to surface.
+            #
+            # Neither call raises. See oncotriage/tracking.py: by this line the run
+            # has spent its money and written its rows, and an index failure must
+            # not take those with it. It lands in TRACKING_DEGRADATIONS instead --
+            # which the NEXT run's degradation block reports, since this one has
+            # already printed.
+            tracking.log_run_metrics(
+                tracking_metrics(results_list, total_wall_time,
+                                 reconciliation=reconciliation,
+                                 degradation_snapshot=degradation_snapshot))
+            tracking.end_run(
+                status="FINISHED" if not main_errors else "FAILED",
+                artifacts=[
+                    # The results file, as it stands on disk after this run.
+                    _results_path(),
+                    # The degradation block, which exists NOWHERE as a file -- it
+                    # is a list of lines print_summary emitted. See end_run's
+                    # `artifacts` argument for why the (filename, text) form is
+                    # accepted rather than the caller writing a temp file to hand
+                    # over a path.
+                    ("degradation_summary.txt",
+                     "\n".join(degradation.report_lines(degradation_snapshot))),
+                ])
+
+            return results_list
+        except BaseException:
+            tracking.end_run(status="FAILED")
+            raise
+
 
 
 #------------------------------------------------------------------------------
