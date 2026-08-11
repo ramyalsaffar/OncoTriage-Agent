@@ -1215,6 +1215,47 @@ PRICING_CONFIG = {
 }
 
 
+# Pricing for the independent LLM rater (oncotriage/evaluation/rater.py), which
+# calls a DIFFERENT vendor over the Message Batches API. It is a separate table
+# from PRICING_CONFIG on purpose, and the reason is a contract rather than a
+# preference: get_model_cost() takes an {input, output} pair per model and is
+# read by 29 call sites plus the inferences.estimated_cost_usd column. Batch
+# pricing needs four more terms -- a batch discount and three cache multipliers
+# -- and widening that shape would change what every existing caller computes.
+#
+# Rates are Anthropic's published per-million-token list prices for the Claude
+# API, read 2026-08-11. The multipliers are the documented cache economics: a
+# 5-minute cache write costs 1.25x base input, a 1-hour write 2x, and a cache
+# read 0.1x. batch_discount is the flat 50% the Message Batches API applies to
+# ALL token usage, cached and uncached alike.
+#
+# An unpriced model RAISES in rater_pricing() rather than defaulting to zero,
+# for the reason get_model_cost() gives: a zero-cost row cannot be told apart
+# from a genuinely free run, and every aggregate over it under-reports by
+# exactly the amount nobody noticed.
+RATER_PRICING = {
+    "last_updated": "2026-08-11",
+    "batch_discount": 0.50,
+    "cache_write_5m_multiplier": 1.25,
+    "cache_write_1h_multiplier": 2.00,
+    "cache_read_multiplier": 0.10,
+    "models": {
+        "claude-sonnet-4-6": {
+            "input_per_mtok": 3.00,
+            "output_per_mtok": 15.00,
+        },
+        "claude-opus-4-8": {
+            "input_per_mtok": 5.00,
+            "output_per_mtok": 25.00,
+        },
+        "claude-haiku-4-5": {
+            "input_per_mtok": 1.00,
+            "output_per_mtok": 5.00,
+        },
+    },
+}
+
+
 #------------------------------------------------------------------------------
 
 
