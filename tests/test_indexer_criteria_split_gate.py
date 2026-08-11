@@ -125,29 +125,53 @@ UNREADABLE = indexer.CRITERIA_SPLIT_PAYLOAD_UNREADABLE
 section("SECTION 1 -- the live corpus passes")
 
 # Not invented. This is exactly what scroll_criteria_split_distribution()
-# returned from `trial_criteria_20260810_125943` on 2026-08-10, and the same
-# counts appear in the on-disk trials_latest.json the collection was built
-# from. If the thresholds are ever tightened past the corpus they were derived
-# on, this fails and names the fraction.
+# returned from `trial_criteria_20260810_145902` on 2026-08-10. If the
+# thresholds are ever tightened past the corpus they were derived on, this
+# fails and names the fraction.
 #
-# THE PREVIOUS CENSUS IS KEPT AS HISTORY AND AS A SECOND CASE, not deleted:
-# `trial_criteria_20260807_111807` on 2026-08-09 was both 14,034 /
-# inclusion_only 178 / unsplit 82 / exclusion_only 30, and it is still the
-# rollback target, so a gate that refused it would refuse the collection an
-# operator would roll back to. It is asserted to pass immediately below.
+# IT IS NOT WHAT THE STORED `criteria_split` FIELD IN trials_latest.json SAYS,
+# and that is the design rather than a discrepancy. The file is the record of
+# a SCRAPE; index_trials re-derives the split (and every field below it) from
+# criteria_text in memory before embedding, so the file keeps the split the
+# scraper computed on its own day while the index carries today's. Re-split
+# the file and it agrees exactly -- which is what
+# tests/test_indexer_admission_filters.py sections 3b and 3c do.
+#
+# THE ROLLBACK TARGET IS KEPT AS A SECOND CASE, not deleted: a gate that
+# refused the collection an operator would roll back to is not a usable gate.
+# It is asserted to pass immediately below.
+#
+# WHAT MOVED, 2026-08-10, and it is one branch only. The exclusion_only branch
+# used to discard everything above the exclusion heading; it keeps it now, so
+# 31 of the 32 trials it classified are `both` and one -- the heading at
+# offset zero, which genuinely has nothing above it -- is not.
+#
+#     both            14,075  ->  14,106
+#     exclusion_only      32  ->       1
+#     inclusion_only     166  ->     166   (untouched)
+#     unsplit             51  ->      51   (untouched)
+#
+# NOT ONE GATED FRACTION MOVED, which is the point rather than a coincidence:
+# `degraded` counts unsplit + empty_criteria and `no_exclusion` counts
+# unsplit + inclusion_only, and exclusion_only is in neither. The repair
+# recovers inclusion text; it cannot recover an exclusion section, so a gate
+# reading those two fractions is blind to it by construction. That is why the
+# rollback census below still passes every ceiling.
 LIVE_CENSUS = {
+    BOTH: 14106,
+    INCLUSION_ONLY: 166,
+    UNSPLIT: 51,
+    EXCLUSION_ONLY: 1,
+}
+LIVE_TOTAL = 14324
+
+# `trial_criteria_20260810_125943`, the retained rollback target: the same
+# corpus with the pre-repair split.
+ROLLBACK_CENSUS = {
     BOTH: 14075,
     INCLUSION_ONLY: 166,
     UNSPLIT: 51,
     EXCLUSION_ONLY: 32,
-}
-LIVE_TOTAL = 14324
-
-ROLLBACK_CENSUS = {
-    BOTH: 14034,
-    INCLUSION_ONLY: 178,
-    UNSPLIT: 82,
-    EXCLUSION_ONLY: 30,
 }
 
 check("the recorded census totals the live collection's point count",
@@ -168,15 +192,39 @@ _raised, _msg = verdict(LIVE_CENSUS)
 check("check_...() does not raise on the live distribution", _raised, False)
 
 # The ROLLBACK TARGET must pass too, or the gate would refuse the collection an
-# operator rolls back to. Both fractions were HIGHER there, which is what makes
-# this a real second case rather than a restatement of the one above.
+# operator rolls back to.
 check("the rollback target's census totals the same point count",
       sum(ROLLBACK_CENSUS.values()), LIVE_TOTAL)
 _rollback = indexer.evaluate_criteria_split_distribution(ROLLBACK_CENSUS)
 check("the rollback target also passes every ceiling", _rollback["failures"], [])
-check_true("...and its fractions really are higher (non-degeneracy)",
-           _rollback["degraded_count"] > _live["degraded_count"]
-           and _rollback["no_exclusion_count"] > _live["no_exclusion_count"])
+
+# NON-DEGENERACY, AND IT HAD TO BE REWRITTEN RATHER THAN KEPT. This used to
+# assert the rollback's two gated counts were strictly HIGHER, which was true
+# of the older rollback target and is FALSE of this one -- and the reason it is
+# false is the fact worth asserting. The repair moved trials between `both` and
+# `exclusion_only`, and neither gated fraction reads either branch, so the two
+# censuses are genuinely different distributions with identical gated counts.
+# "Higher" would now be a check that fails for being right.
+check_true("the two censuses are different distributions (non-degeneracy)",
+           dict(ROLLBACK_CENSUS) != dict(LIVE_CENSUS))
+check("...differing in exactly the two branches the repair moved",
+      sorted(k for k in set(ROLLBACK_CENSUS) | set(LIVE_CENSUS)
+             if ROLLBACK_CENSUS.get(k) != LIVE_CENSUS.get(k)),
+      sorted([BOTH, EXCLUSION_ONLY]))
+check_true("...and the gated counts are identical across them, because the "
+           "gate reads neither branch",
+           _rollback["degraded_count"] == _live["degraded_count"]
+           and _rollback["no_exclusion_count"] == _live["no_exclusion_count"]
+           and _rollback["unusable_count"] == _live["unusable_count"])
+# CONTROL for the claim above: a census that moves a branch the gate DOES read
+# must move the gated count, or the three assertions are satisfied by an
+# evaluator that has stopped counting anything.
+_moved_gated = dict(LIVE_CENSUS)
+_moved_gated[UNSPLIT] = _moved_gated[UNSPLIT] + 10
+_moved_gated[BOTH] = _moved_gated[BOTH] - 10
+check_true("CONTROL: moving a branch the gate DOES read moves the gated count",
+           indexer.evaluate_criteria_split_distribution(
+               _moved_gated)["degraded_count"] == _live["degraded_count"] + 10)
 
 # NON-DEGENERACY. "no failures" is also what an evaluator that lost its
 # comparisons reports, so the same distribution must FAIL once a ceiling is

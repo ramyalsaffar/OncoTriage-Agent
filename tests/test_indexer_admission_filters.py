@@ -874,6 +874,456 @@ if _CORPUS and os.path.exists(_CORPUS) and _pre_split:
 
 
 # ===========================================================================
+# SECTION 3c -- THE exclusion_only BRANCH KEEPS ITS LEADING TEXT
+# ===========================================================================
+section("SECTION 3c -- the exclusion_only branch keeps its leading text")
+
+# A THIRD CONTROL SPLITTER, and it has to be a third one. _old_split predates
+# defect 3 entirely and _pre_split predates the heading families; against
+# either, every case below "passes" for a reason that has nothing to do with
+# this repair. The control needed here is the splitter as it stood AFTER the
+# families and BEFORE the branch was repaired.
+#
+# THE REVISION IS DERIVED STRUCTURALLY. The repair introduced a local named
+# `prefix` inside split_inclusion_exclusion; no revision before it binds that
+# name, and a comment or docstring quoting the old branch cannot create a Name
+# STORE. So "the newest revision whose split_inclusion_exclusion never assigns
+# `prefix`" identifies the pre-repair state exactly.
+
+
+def _revision_before_prefix_kept():
+    """Newest revision whose splitter binds no local called `prefix`."""
+    log = _git("log", "--format=%H", "--", "oncotriage/retrieval/indexer.py")
+    if log.returncode != 0:
+        return None, None
+    for rev in log.stdout.split():
+        blob = _git("show", f"{rev}:oncotriage/retrieval/indexer.py")
+        if blob.returncode != 0 or not blob.stdout:
+            continue
+        try:
+            tree = ast.parse(blob.stdout)
+        except SyntaxError:
+            continue
+        for node in tree.body:
+            if (isinstance(node, ast.FunctionDef)
+                    and node.name == "split_inclusion_exclusion"):
+                binds = any(isinstance(n, ast.Name) and n.id == "prefix"
+                            and isinstance(n.ctx, ast.Store)
+                            for n in ast.walk(node))
+                if not binds:
+                    return rev, blob.stdout
+                break
+    return None, None
+
+
+_PRE_KEEP_REV, _PRE_KEEP_SRC = _revision_before_prefix_kept()
+
+
+def _splitter_from(source):
+    """The whole splitter machinery out of one blob, lifted, never retyped."""
+    if not source:
+        return None
+    tree = ast.parse(source)
+    want = _PRE_EXT_WANT | {"_HEADING_LEAD_CHARS", "_HEADING_LEAD_NUMBER",
+                            "_HEADING_LEAD_CLASS", "_HEADING_LEAD_STRIP"}
+    picked = []
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in want:
+            picked.append(node)
+        elif isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id in want for t in node.targets):
+            picked.append(node)
+    ns = {"re": re, "Counter": __import__("collections").Counter}
+    exec(compile(ast.Module(body=picked, type_ignores=[]),
+                 "<pre-repair-indexer>", "exec"), ns)
+    return ns.get("split_inclusion_exclusion")
+
+
+_pre_keep = _splitter_from(_PRE_KEEP_SRC)
+
+check_true("a pre-repair revision of the splitter was located",
+           _PRE_KEEP_REV is not None)
+print(f"    control revision: {(_PRE_KEEP_REV or '?')[:12]}")
+check_true("the pre-repair splitter was lifted out of git", _pre_keep is not None)
+
+# NON-DEGENERACY, TWO WAYS. It must be the POST-families splitter, or this is
+# section 3b's control under a new name and every case below is vacuous; and it
+# must still DISCARD the prefix, or it is not a control for this repair at all.
+check_true("CONTROL: ...and the heading families are already present",
+           _pre_keep("Inclusion Criteria\n* A\n4.2 Exclusion Criteria\n* P")[2]
+           == indexer.CRITERIA_SPLIT_BOTH if _pre_keep else False)
+check("CONTROL: ...and it still DISCARDS the leading text",
+      _pre_keep("Adults with disease.\nExclusion Criteria\n* Pregnancy")[0]
+      if _pre_keep else None, "")
+
+# --- the repair: headingless leading text is the inclusion section ----------
+_HEADINGLESS = ("Patients aged 18 or older with histologically confirmed "
+                "disease.\nExclusion Criteria\n* Pregnancy")
+_k_inc, _k_exc, _k_m = indexer.split_inclusion_exclusion(_HEADINGLESS)
+check("a headingless prefix above an exclusion heading is classified `both`",
+      _k_m, indexer.CRITERIA_SPLIT_BOTH)
+check_true("...and the prefix IS the inclusion section",
+           _k_inc == "Patients aged 18 or older with histologically confirmed "
+                     "disease.")
+check_true("...and the exclusion section is unchanged by the repair",
+           _k_exc == _pre_keep(_HEADINGLESS)[1] if _pre_keep else False)
+check("CONTROL: the pre-repair splitter called the same text `exclusion_only`",
+      _pre_keep(_HEADINGLESS)[2] if _pre_keep else None,
+      indexer.CRITERIA_SPLIT_EXCLUSION_ONLY)
+check_true("CONTROL: ...and the inclusion text vanished entirely",
+           _pre_keep(_HEADINGLESS)[0] == "" if _pre_keep else False)
+
+# --- position zero still has nothing above it -------------------------------
+#
+# The branch is not deleted, and this is the case that proves it. A heading at
+# offset zero genuinely has no inclusion text, so inventing `both` for it would
+# assert a section that does not exist.
+for _label, _text in (
+    ("bare heading at offset 0", "Exclusion Criteria\n* Pregnancy\n* Age < 18"),
+    ("heading behind leading whitespace",
+     "\n\nExclusion Criteria\n* Pregnancy"),
+    ("heading behind a bullet", "* Exclusion Criteria\n* Pregnancy"),
+):
+    _z = indexer.split_inclusion_exclusion(_text)
+    check(f"still `exclusion_only` -- {_label}", _z[2],
+          indexer.CRITERIA_SPLIT_EXCLUSION_ONLY)
+    check(f"...with an EMPTY inclusion section -- {_label}", _z[0], "")
+    if _pre_keep:
+        check(f"UNCHANGED by the repair -- {_label}", _z, _pre_keep(_text))
+
+# A whitespace-only prefix is not a section. Asserted apart from the cases
+# above because it is the one that distinguishes `if prefix` from
+# `if criteria_text[:exclusion_start]`, which is truthy for a single newline.
+check("a whitespace-only prefix does not become an inclusion section",
+      indexer.split_inclusion_exclusion(" \t\n Exclusion Criteria\n* P")[2],
+      indexer.CRITERIA_SPLIT_EXCLUSION_ONLY)
+
+# --- nothing else moves -----------------------------------------------------
+#
+# The repair touches ONE branch. Every other branch must resolve identically,
+# or something was traded for these recoveries.
+for _label, _text in (
+    ("both", "Inclusion Criteria:\n* Adults\nExclusion Criteria:\n* Pregnancy"),
+    ("inclusion_only", "Inclusion Criteria:\n* Adults over 18"),
+    ("unsplit", "Adults with measurable disease and adequate organ function."),
+    ("empty_criteria", "   "),
+):
+    if _pre_keep:
+        check(f"UNCHANGED by the repair -- {_label}",
+              indexer.split_inclusion_exclusion(_text), _pre_keep(_text))
+
+# --- the three named trials, out of the stored corpus -----------------------
+#
+# These are the three the heading families moved into this branch, and the
+# reason the repair could not be postponed: recovering their exclusion heading
+# is what destroyed their inclusion text. Recorded as a FAILURE when the corpus
+# is absent, never a silent skip -- the same rule section 3b's superset proof
+# follows, and for the same reason.
+_NAMED_RECOVERY = {
+    # nct_id: (criteria chars, prefix chars the branch used to discard)
+    "NCT06934382": (5522, 3561),
+    "NCT04581512": (3436, 1777),
+    "NCT05464082": (8116, 4914),
+}
+
+if _CORPUS and os.path.exists(_CORPUS) and _pre_keep:
+    import json as _json2
+    with open(_CORPUS, encoding="utf-8") as _fh:
+        _corpus3c = _json2.load(_fh)
+    _by_id = {t.get("nct_id"): t for t in _corpus3c}
+    for _nct, (_want_total, _want_prefix) in _NAMED_RECOVERY.items():
+        _t = _by_id.get(_nct)
+        check_true(f"{_nct} is in the stored corpus", _t is not None)
+        if not _t:
+            continue
+        _text = (_t.get("eligibility") or {}).get("criteria_text") or ""
+        check(f"{_nct}: its criteria block is the measured length",
+              len(_text), _want_total)
+        _o = _pre_keep(_text)
+        _n = indexer.split_inclusion_exclusion(_text)
+        check(f"CONTROL: {_nct} reached the judge with NO inclusion text",
+              len(_o[0]), 0)
+        check(f"{_nct}: the full inclusion prefix is recovered",
+              len(_n[0]), _want_prefix)
+        check(f"{_nct}: ...and it is classified `both`", _n[2],
+              indexer.CRITERIA_SPLIT_BOTH)
+        check(f"{_nct}: ...and its exclusion section is untouched",
+              _n[1], _o[1])
+        check_true(f"{_nct}: ...so no character of the criteria block is lost",
+                   len(_n[0]) + len(_n[1]) >= len(_o[0]) + len(_o[1]))
+
+    # THE CORPUS-WIDE CONTAINMENT PROOF for this repair, the counterpart of
+    # section 3b's superset proof. Only the exclusion_only population may move.
+    _moved = _lost = _both_moved = _other_moved = _recovered = 0
+    for _t in _corpus3c:
+        _text = (_t.get("eligibility") or {}).get("criteria_text") or ""
+        _o_inc, _o_exc, _o_m = _pre_keep(_text)
+        _n_inc, _n_exc, _n_m = indexer.split_inclusion_exclusion(_text)
+        if len(_n_inc) < len(_o_inc) or len(_n_exc) < len(_o_exc):
+            _lost += 1
+        _recovered += max(0, (len(_n_inc) + len(_n_exc))
+                          - (len(_o_inc) + len(_o_exc)))
+        if _o_m != _n_m:
+            _moved += 1
+            if _o_m == indexer.CRITERIA_SPLIT_BOTH:
+                _both_moved += 1
+            elif _o_m != indexer.CRITERIA_SPLIT_EXCLUSION_ONLY:
+                _other_moved += 1
+    check("CONTAINMENT: no trial loses a character of criteria text", _lost, 0)
+    check("CONTAINMENT: no `both` trial changes classification", _both_moved, 0)
+    check("CONTAINMENT: nothing but `exclusion_only` changes classification",
+          _other_moved, 0)
+    check("31 trials are recovered", _moved, 31)
+    check("...and the measured 86,058 characters with them", _recovered, 86058)
+    print(f"    corpus: {len(_corpus3c):,} trials, {_moved} recovered, "
+          f"{_recovered:,} characters, {_lost} lost")
+
+
+# ===========================================================================
+# SECTION 3d -- THE SPLIT IS RE-DERIVED AT INDEX TIME
+# ===========================================================================
+section("SECTION 3d -- the rebuild path re-derives the split")
+
+# THE HAZARD: the DAG loads trials_latest.json and hands the stored trials to
+# index_trials, so any splitter change after a scrape rebuilds with the STALE
+# split. Fixing it inside index_trials is what makes both entry paths inherit
+# it -- and it must be inside index_trials, because the generated DAG is
+# pinned and a second copy of this logic in a generated string is how the
+# DAG's old private scraper drifted.
+
+_STALE = {
+    "nct_id": "NCTSTALE01",
+    "title": "A Study of Squamous Non-Small Cell Lung Cancer",
+    "eligibility": {
+        "criteria_text": "Stage III squamous NSCLC.\n"
+                         "Exclusion Criteria\n* Pregnancy",
+        # what a pre-repair scrape stored: the prefix discarded
+        "inclusion_criteria": "",
+        "exclusion_criteria": "Exclusion Criteria\n* Pregnancy",
+    },
+    "criteria_split": indexer.CRITERIA_SPLIT_EXCLUSION_ONLY,
+    # enrichments computed from the empty inclusion section, plus a value no
+    # extractor can produce, so "unchanged" cannot be mistaken for "correct"
+    "structured_eligibility": {"min_stage": 9, "max_stage": 9,
+                               "accepts_metastatic": True},
+    "histology_tags": ["planted-tag"],
+}
+
+import copy as _copy                                          # noqa: E402
+
+# A DEEP COPY, so the literal above stays the untouched statement of what a
+# pre-repair scrape wrote and can be reused by the control below.
+_planted = _copy.deepcopy(_STALE)
+_counts = indexer.renormalize_criteria_derived_fields([_planted])
+
+check("the normalizer reports the trial it saw", _counts.get("trials"), 1)
+check("the stale criteria_split is corrected", _planted["criteria_split"],
+      indexer.CRITERIA_SPLIT_BOTH)
+check("...and reported as changed", _counts.get("changed:criteria_split"), 1)
+check("the discarded inclusion section is restored",
+      _planted["eligibility"]["inclusion_criteria"], "Stage III squamous NSCLC.")
+check("...and reported as changed",
+      _counts.get("changed:inclusion_criteria"), 1)
+check_true("the exclusion section is unchanged, and reported as unchanged",
+           _planted["eligibility"]["exclusion_criteria"]
+           == "Exclusion Criteria\n* Pregnancy"
+           and "changed:exclusion_criteria" not in _counts)
+
+# THE DERIVED FIELDS ONE LEVEL DOWN. Recomputing only the split recreates the
+# same disagreement here: both of these read the INCLUSION section.
+check("the planted structured_eligibility is recomputed",
+      _planted["structured_eligibility"],
+      {"min_stage": 3, "max_stage": 3, "accepts_metastatic": None})
+check("...and reported as changed",
+      _counts.get("changed:structured_eligibility"), 1)
+check("the planted histology_tags are recomputed",
+      _planted["histology_tags"], ["nsclc", "squamous"])
+check("...and reported as changed", _counts.get("changed:histology_tags"), 1)
+check_true("...and the planted value is gone, not merely appended to",
+           "planted-tag" not in _planted["histology_tags"])
+
+# NON-DEGENERACY: the recomputed values must come from the RECOVERED text, not
+# from the title alone, or this section would pass with the repair reverted.
+_title_only = _copy.deepcopy(_STALE)
+_title_only["eligibility"]["criteria_text"] = "Exclusion Criteria\n* Pregnancy"
+indexer.renormalize_criteria_derived_fields([_title_only])
+check("CONTROL: with no prefix to recover, no stage is extracted",
+      _title_only["structured_eligibility"]["min_stage"], None)
+
+# IDEMPOTENT: the source is criteria_text, which the splitter never modifies.
+_again = indexer.renormalize_criteria_derived_fields([_planted])
+check("a second pass changes nothing", _again, {"trials": 1})
+
+# A trial whose eligibility cannot be read is COUNTED AND SKIPPED, never
+# repaired into a shape the parser does not produce.
+_bad = {"nct_id": "NCTBAD", "eligibility": None}
+check("an unreadable eligibility mapping is counted, not raised on",
+      indexer.renormalize_criteria_derived_fields([_bad]),
+      {"trials": 1, "skipped:eligibility_NoneType": 1})
+check_true("...and nothing is invented in its place", "criteria_split" not in _bad)
+
+# --- the wiring: BOTH entry paths reach it, and the DAG does not change -----
+_ix_src = open(os.path.join(_CODE_DIR, "oncotriage", "retrieval", "indexer.py"),
+               encoding="utf-8").read()
+_ix_tree = ast.parse(_ix_src)
+
+
+def _fn_node(tree, name):
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name:
+            return n
+    return None
+
+
+def _called_names(node):
+    out = set()
+    for c in ast.walk(node):
+        if isinstance(c, ast.Call):
+            f = c.func
+            out.add(f.id if isinstance(f, ast.Name) else getattr(f, "attr", ""))
+    return out
+
+
+_index_trials = _fn_node(_ix_tree, "index_trials")
+check_true("index_trials was located in the shipped module", _index_trials is not None)
+check_true("index_trials re-derives the split",
+           "renormalize_criteria_derived_fields" in _called_names(_index_trials))
+
+# THE MODULE COUNTER HAS A READER, and that is asserted rather than assumed. It
+# accumulates across calls, and a counter whose only mention is a docstring
+# satisfies check 2h's scan without anyone ever seeing the number -- the dead
+# declaration wearing a passing test.
+check_true("the cumulative counter moved with the calls above",
+           indexer.CRITERIA_RENORMALIZED.get("trials", 0) >= 4
+           and indexer.CRITERIA_RENORMALIZED.get("changed:criteria_split", 0) >= 1)
+check_true("...and index_trials READS it, in executable code",
+           any(isinstance(n, ast.Name) and n.id == "CRITERIA_RENORMALIZED"
+               and isinstance(n.ctx, ast.Load)
+               for n in ast.walk(_index_trials)))
+
+# ORDER: the recompute must precede the first thing that consumes the fields,
+# or it corrects a trial after its embedding text has been built.
+_first_norm = min(
+    [n.lineno for n in ast.walk(_index_trials) if isinstance(n, ast.Call)
+     and getattr(n.func, "id", "") == "renormalize_criteria_derived_fields"],
+    default=None)
+_first_use = min(
+    [n.lineno for n in ast.walk(_index_trials) if isinstance(n, ast.Call)
+     and getattr(n.func, "id", getattr(n.func, "attr", ""))
+     in ("create_trial_embedding_text", "create_trial_bm25_fields")],
+    default=None)
+check_true("...and does it BEFORE any field derived from the split is read",
+           _first_norm is not None and _first_use is not None
+           and _first_norm < _first_use)
+
+# THE CENSUS COUNTER IS CLEARED BEFORE THE RE-DERIVATION, and this is asserted
+# because the hazard is invisible otherwise. Every splitter call increments
+# CRITERIA_SPLIT_METHODS, so on the scrape path -- parse_trial_metadata splits,
+# then index_trials splits again -- each trial is counted TWICE, and the
+# counter is documented as one entry per trial. Demonstrated first, then
+# pinned: without the clear, the count below is 2 for one trial.
+_dbl = {"nct_id": "NCTDBL", "eligibility": {"criteria_text":
+        "Inclusion Criteria:\n* Adults\nExclusion Criteria:\n* Pregnancy"}}
+_before_total = sum(indexer.CRITERIA_SPLIT_METHODS.values())
+indexer.split_inclusion_exclusion(_dbl["eligibility"]["criteria_text"])  # "parse"
+indexer.renormalize_criteria_derived_fields([_dbl])                     # "index"
+check("HAZARD: splitting twice counts the same trial twice",
+      sum(indexer.CRITERIA_SPLIT_METHODS.values()) - _before_total, 2)
+check_true("...which is why index_trials clears the census first",
+           any(isinstance(n, ast.Call)
+               and getattr(n.func, "attr", "") == "clear"
+               and getattr(getattr(n.func, "value", None), "id", "")
+               == "CRITERIA_SPLIT_METHODS"
+               for n in ast.walk(_index_trials)))
+_clear_line = min(
+    [n.lineno for n in ast.walk(_index_trials) if isinstance(n, ast.Call)
+     and getattr(n.func, "attr", "") == "clear"
+     and getattr(getattr(n.func, "value", None), "id", "")
+     == "CRITERIA_SPLIT_METHODS"], default=None)
+check_true("...and clears it BEFORE re-deriving, or it would erase the answer",
+           _clear_line is not None and _first_norm is not None
+           and _clear_line < _first_norm)
+# It is cleared IN PLACE and never rebound: oncotriage/degradation.py binds
+# counter OBJECTS, so `NAME = Counter()` would leave every reader holding a
+# counter that reports zero forever.
+check_true("...in place, never rebound",
+           not any(isinstance(n, ast.Assign)
+                   and any(isinstance(t, ast.Name)
+                           and t.id == "CRITERIA_SPLIT_METHODS"
+                           for t in n.targets)
+                   for n in ast.walk(_index_trials)))
+check_true("main() reaches index_trials",
+           "index_trials" in _called_names(_fn_node(_ix_tree, "main")))
+
+# CONTROL: strip the call out of an AST copy and the wiring check must FAIL.
+_stripped = ast.parse(_ix_src)
+_st_node = _fn_node(_stripped, "index_trials")
+
+
+class _DropNormalize(ast.NodeTransformer):
+    def visit_Expr(self, node):
+        return None if (isinstance(node.value, ast.Call)
+                        and getattr(node.value.func, "id", "")
+                        == "renormalize_criteria_derived_fields") else node
+
+    def visit_Assign(self, node):
+        return None if (isinstance(node.value, ast.Call)
+                        and getattr(node.value.func, "id", "")
+                        == "renormalize_criteria_derived_fields") else node
+
+
+_DropNormalize().visit(_st_node)
+check_true("CONTROL: with the call stripped, the wiring check FAILS",
+           "renormalize_criteria_derived_fields" not in _called_names(_st_node))
+
+# The generated DAG must not have moved by one byte, and must still carry no
+# splitter of its own -- the recompute belongs to index_trials, which the DAG
+# calls, so putting it in the DAG would be the second copy this avoids.
+from oncotriage.orchestration.dag_generator import build_dag_content  # noqa: E402
+
+_dag3d = build_dag_content(code_path="/x/code/", keys_path="/x/keys/",
+                           data_trial_path="/x/data/")
+_dag3d_head = None
+_blob3d = _git("show", "HEAD:oncotriage/orchestration/dag_generator.py")
+if _blob3d.returncode == 0 and _blob3d.stdout:
+    _ns3d = {}
+    exec(compile(_blob3d.stdout, "<HEAD-dag>", "exec"), _ns3d)
+    _dag3d_head = _ns3d["build_dag_content"](
+        code_path="/x/code/", keys_path="/x/keys/", data_trial_path="/x/data/")
+check_true("the generated DAG is byte-identical to HEAD's",
+           _dag3d_head is not None and _dag3d == _dag3d_head)
+check_true("...and is non-degenerate", len(_dag3d) > 10_000)
+_dag3d_tree = ast.parse(_dag3d)
+check_true("the DAG's rebuild task reaches index_trials",
+           "index_trials" in _called_names(_fn_node(_dag3d_tree, "rebuild_index")))
+
+# THE ABSENCE CHECK IS STRUCTURAL, NOT A SUBSTRING. The generated DAG's own
+# comment block NAMES `_split_inclusion_exclusion` while recording that the
+# private scraper reimplementing it was deleted -- so a substring test is
+# defeated by the prose explaining the fix, which is the trap this project has
+# hit three times (the exec_chain scan, the query-layer selector, the Docker
+# settings greps). Definitions and calls are what "carries logic" means.
+_DAG_FORBIDDEN = ("split_inclusion_exclusion",
+                  "renormalize_criteria_derived_fields")
+_dag_defs = {n.name for n in ast.walk(_dag3d_tree)
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+_dag_calls_all = set()
+for _c in ast.walk(_dag3d_tree):
+    if isinstance(_c, ast.Call):
+        _dag_calls_all.add(getattr(_c.func, "id",
+                                   getattr(_c.func, "attr", "")))
+check_true("...and defines no splitter of its own to drift from this one",
+           not (_dag_defs & set(_DAG_FORBIDDEN)))
+check_true("...and calls neither the splitter nor the normalizer directly",
+           not (_dag_calls_all & set(_DAG_FORBIDDEN)))
+check_true("CONTROL: the scan CAN see a call of that name (non-degeneracy)",
+           "index_trials" in _dag_calls_all)
+check_true("CONTROL: ...and a substring test would have been defeated by the "
+           "DAG's own comment about the deleted copy",
+           "split_inclusion_exclusion" in _dag3d)
+
+
+# ===========================================================================
 # SECTION 4 -- DEFECT 4: verify before swap, keep a rollback
 # ===========================================================================
 section("SECTION 4 -- DEFECT 4: verification gates the swap")

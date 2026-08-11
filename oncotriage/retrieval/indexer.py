@@ -815,6 +815,38 @@ def parse_trial_metadata(protocol: Dict) -> Dict:
 # trials it classified before this change -- 76,052 characters, up to 12,438 in
 # one trial -- so it is pre-existing rather than introduced here, and it is
 # reported rather than repaired because repairing it moves 29 further trials.
+#
+# ---------------------------------------------------------------------------
+# 2026-08-10 (SAME DAY, SEPARATE PASS): THAT DEFECT IS REPAIRED. The paragraph
+# above is kept as the record of what was known when the families landed; the
+# `exclusion_only` branch now keeps its leading text. Re-measured on the same
+# 14,324-trial corpus AFTER the families were in, so these supersede the "29 of
+# 30 / 76,052" figures above, which were the pre-families population:
+#
+#     exclusion_only trials                                     32
+#     of which discarded leading text                           31
+#     characters discarded                                  86,058
+#     largest single discard        12,438  (NCT06330064, of 13,232 total)
+#
+# The three trials named above are in that population, and the character counts
+# this file recorded for them (5,522 / 3,436 / 8,116) were their WHOLE criteria
+# blocks rather than the discarded prefix. The prefixes are 3,561 / 1,777 /
+# 4,914, and each is recovered in full.
+#
+#     both            14,075  98.262%  ->  14,106  98.478%
+#     inclusion_only     166   1.159%  ->     166   1.159%
+#     unsplit             51   0.356%  ->      51   0.356%
+#     exclusion_only      32   0.223%  ->       1   0.007%
+#
+#     31 trials changed class, all of them exclusion_only -> both
+#     characters recovered                              86,058
+#     trials losing any text                                 0
+#     `both` trials changing class                           0
+#     `unsplit` / `inclusion_only` trials changing class     0
+#
+# The one survivor is the position-zero case: an exclusion heading with nothing
+# above it has no inclusion text to recover, which is the branch behaving as it
+# always did rather than a residue.
 # ---------------------------------------------------------------------------
 
 CRITERIA_SPLIT_BOTH = "both"
@@ -1014,9 +1046,49 @@ def split_inclusion_exclusion(criteria_text: str) -> tuple:
         exclusion_text = ""
         method = CRITERIA_SPLIT_INCLUSION_ONLY
     elif exclusion_start != -1:
-        inclusion_text = ""
+        # THE LEADING TEXT IS KEPT (2026-08-10). This branch used to discard
+        # everything before the exclusion heading, and that discarded text is
+        # the trial's inclusion criteria written without a heading -- it
+        # vanished from the payload, from the dense embedding input, and from
+        # what Stage 5 is shown. Measured on the 14,324-trial corpus: 31 of the
+        # 32 trials this branch classified lost text, 86,058 characters, up to
+        # 12,438 in one trial (NCT06330064).
+        #
+        # THE LABEL IS A BEST-EFFORT ASSIGNMENT, NOT A DETECTED HEADING, and
+        # that distinction is the whole argument for it. No inclusion heading
+        # was found; what is known is that a non-empty block of criteria text
+        # sits above a heading that says everything below it is exclusionary,
+        # so everything above it is what the trial requires. `both` is what a
+        # trial with both sections present IS, and inventing a sixth constant
+        # for "both, one side unlabelled" would put a value in the closed
+        # vocabulary that the ingestion gate and every consumer would have to
+        # learn in order to treat it exactly like `both`.
+        #
+        # This is the unsplit branch's own keep-and-show reasoning applied one
+        # branch over: text the model can read under an imprecise label beats
+        # text it can never see, which is this project's false-keep-over-
+        # false-drop rule. An empty prefix still resolves to exclusion_only --
+        # a heading at position zero genuinely has nothing above it.
+        #
+        # THE DECISION AND THE TEXT ARE STRIPPED DIFFERENTLY, AND THAT IS THE
+        # WHOLE OF IT. _first_heading walks FORWARD over the bullet, wrapper or
+        # list number that _HEADING_LEAD consumed, so those characters belong
+        # to the heading and are left behind in the prefix by construction: a
+        # criteria block opening "* Exclusion Criteria" has a prefix of "* ",
+        # and a whitespace-only .strip() leaves "*" -- truthy, and a one-
+        # character "inclusion section" that says nothing. So the DECISION
+        # strips the lead characters too. The TEXT does not: .strip() removes
+        # whitespace only, so a real section keeps every character it has,
+        # including a leading bullet of its own. Found by the bullet case in
+        # tests/test_indexer_admission_filters.py section 3c, not by reading.
+        prefix = criteria_text[:exclusion_start].strip()
         exclusion_text = criteria_text[exclusion_start:].strip()
-        method = CRITERIA_SPLIT_EXCLUSION_ONLY
+        if prefix.strip(_HEADING_LEAD_STRIP):
+            inclusion_text = prefix
+            method = CRITERIA_SPLIT_BOTH
+        else:
+            inclusion_text = ""
+            method = CRITERIA_SPLIT_EXCLUSION_ONLY
     else:
         # UNSPLIT. The trial is KEPT -- excluding it would delete a trial to
         # fix a labelling bug, which is the silent drop this item removes --
@@ -1303,6 +1375,119 @@ def create_trial_bm25_fields(trial: Dict) -> Dict[str, str]:
     }
 
 
+# ===========================================================================
+# THE SPLIT IS RE-DERIVED AT INDEX TIME, NOT TRUSTED FROM THE CORPUS FILE
+# ===========================================================================
+#
+# THE HAZARD, MEASURED RATHER THAN IMAGINED. There are two ways into
+# index_trials and only one of them has just run the splitter:
+#
+#   main()                     scrape -> parse_trial_metadata -> index_trials
+#   the generated Airflow DAG  json.load(trials_latest.json)  -> index_trials
+#
+# The second hands over trials whose split was computed by whatever the
+# splitter was on the day of the scrape. Every change to it after that point --
+# a heading family, a branch repair -- rebuilds the index with the STALE split,
+# silently, because a stored `criteria_split` string is indistinguishable from
+# a freshly computed one. The heading pass hit exactly this and worked around
+# it by rewriting the corpus file by hand, which is a manual step nobody will
+# repeat and which the DAG cannot perform at all.
+#
+# WHY HERE AND NOT IN THE DAG. Putting the recompute in the generated DAG puts
+# a second copy of this logic in a file built as a string -- the shape that let
+# the DAG's old private scraper drift until it was building a strictly worse
+# index. tests/test_indexer_criteria_split_gate.py asserts the DAG carries no
+# criteria_split logic of its own, and both entry paths converge on
+# index_trials, so one call here covers both by construction.
+#
+# EVERY FIELD DERIVED FROM THE SPLIT IS RECOMPUTED, NOT JUST THE SPLIT.
+# Recomputing the split alone recreates the same disagreement one level down:
+# the two enrichments below read the inclusion and exclusion sections, so a
+# trial that recovers inclusion text can gain stage requirements and histology
+# tags it never had, and a stored enrichment computed from the old sections
+# would contradict the sections stored beside it.
+#
+#   RECOMPUTED HERE, because it is baked into the stored corpus:
+#     eligibility.inclusion_criteria    split output
+#     eligibility.exclusion_criteria    split output
+#     criteria_split                    the method, read by the ingestion gate
+#     structured_eligibility            title + INCLUSION, capped by EXCLUSION
+#     histology_tags                    title + INCLUSION
+#
+#   ALREADY INDEX-TIME, so it follows for free once the above are current:
+#     the dense embedding input         create_trial_embedding_text() reads
+#                                       inclusion and exclusion as sections
+#     the `bm25_text` payload           the same string
+#     the three BM25 sparse fields      create_trial_bm25_fields() reads
+#                                       criteria_text, title, conditions and
+#                                       interventions -- NONE of them split-
+#                                       derived, so they are unaffected either
+#                                       way. Named here because "unaffected"
+#                                       is a measurement, not an omission.
+#
+# THE SOURCE IS eligibility.criteria_text, which the splitter never modifies,
+# so this is idempotent: running it on an already-current corpus changes
+# nothing and running it twice is the same as running it once.
+CRITERIA_RENORMALIZED = Counter()
+
+
+def renormalize_criteria_derived_fields(trials: List[Dict]) -> dict:
+    """Recompute every stored field derived from the criteria split, in place.
+
+    Returns a dict of the counts, and records them in CRITERIA_RENORMALIZED.
+
+    A trial whose `eligibility` is not a mapping is COUNTED AND SKIPPED rather
+    than repaired: there is no criteria_text to split, and manufacturing the
+    key would write a shape the parser never produces. Third-party data that
+    cannot be read is counted; it does not raise.
+    """
+    counts = Counter()
+    for trial in trials:
+        counts["trials"] += 1
+        eligibility = trial.get("eligibility")
+        if not isinstance(eligibility, dict):
+            counts[f"skipped:eligibility_{type(eligibility).__name__}"] += 1
+            continue
+
+        # THE TWO MUTABLE FIELDS ARE SNAPSHOT-COPIED, NOT REFERENCED. Both
+        # enrichers below ASSIGN a fresh object today, so a reference would
+        # compare correctly -- but an enricher that ever mutated its dict or
+        # list in place would leave this comparing an object with itself and
+        # reporting "unchanged" forever, which is a check that has silently
+        # stopped checking. A shallow copy is enough: the stage values are
+        # scalars and the tags are strings.
+        _se = trial.get("structured_eligibility")
+        _ht = trial.get("histology_tags")
+        before = (eligibility.get("inclusion_criteria"),
+                  eligibility.get("exclusion_criteria"),
+                  trial.get("criteria_split"),
+                  dict(_se) if isinstance(_se, dict) else _se,
+                  list(_ht) if isinstance(_ht, list) else _ht)
+
+        inclusion_text, exclusion_text, split_method = \
+            split_inclusion_exclusion(eligibility.get("criteria_text") or "")
+        eligibility["inclusion_criteria"] = inclusion_text
+        eligibility["exclusion_criteria"] = exclusion_text
+        trial["criteria_split"] = split_method
+
+        enrich_structured_eligibility(trial)
+        enrich_histology_tags(trial)
+
+        for key, was, now in (
+            ("inclusion_criteria", before[0], inclusion_text),
+            ("exclusion_criteria", before[1], exclusion_text),
+            ("criteria_split", before[2], split_method),
+            ("structured_eligibility", before[3],
+             trial.get("structured_eligibility")),
+            ("histology_tags", before[4], trial.get("histology_tags")),
+        ):
+            if was != now:
+                counts[f"changed:{key}"] += 1
+
+    CRITERIA_RENORMALIZED.update(counts)
+    return dict(counts)
+
+
 class EmbeddingBudgetExceeded(RuntimeError):
     """The corpus would cost more to embed than the caller authorised.
 
@@ -1361,6 +1546,40 @@ def index_trials(trials: List[Dict], collection_name: str):
         collection_name: Target Qdrant collection name
     """
     console.out(f"\nIndexing {len(trials)} trials into '{collection_name}'...")
+
+    # ------------------------------------------------------------------
+    # RE-DERIVE THE SPLIT AND EVERYTHING BELOW IT, for both entry paths.
+    # See renormalize_criteria_derived_fields() for why this is here and not
+    # in the DAG, and for the full list of what is recomputed.
+    #
+    # THE CENSUS COUNTER IS CLEARED FIRST, and that is deliberate. Every call
+    # to the splitter increments CRITERIA_SPLIT_METHODS, so without this a
+    # scrape-then-index run would count each trial twice -- and the counter is
+    # documented as one entry per trial. Cleared IN PLACE, never rebound: the
+    # readers hold the object (see oncotriage/degradation.py's note on that).
+    # The scrape's own census line has already been printed by this point, and
+    # what the counter holds afterwards is the census of what was INDEXED,
+    # which is the more useful of the two and the only one the DAG path has.
+    # ------------------------------------------------------------------
+    CRITERIA_SPLIT_METHODS.clear()
+    _renorm = renormalize_criteria_derived_fields(trials)
+    _renorm_changed = {k[len("changed:"):]: v for k, v in _renorm.items()
+                       if k.startswith("changed:")}
+    console.out(f"Criteria split re-derived at index time: "
+                f"{dict(CRITERIA_SPLIT_METHODS)}")
+    if _renorm_changed:
+        console.out(f"  STORED FIELDS WERE STALE and have been recomputed: "
+                    f"{_renorm_changed}")
+    else:
+        console.out("  every stored field already agreed with the current "
+                    "splitter; nothing was recomputed away.")
+    _renorm_skipped = {k: v for k, v in _renorm.items()
+                       if k.startswith("skipped:")}
+    if _renorm_skipped:
+        console.out(f"  WARNING: trials whose eligibility could not be read: "
+                    f"{_renorm_skipped}")
+    log.info("criteria split re-derived", total=_renorm.get("trials", 0),
+             collection=collection_name)
 
     # ------------------------------------------------------------------
     # Checkpoint: fixed filename, not tied to collection_name.
@@ -1567,6 +1786,19 @@ def index_trials(trials: List[Dict], collection_name: str):
         console.out(f"  Embedding cost: ${_cost:.4f}")
         log.info("embedding usage", model=EMBEDDING_MODEL, tokens_in=_billed,
                  calls=EMBEDDING_USAGE.get("calls", 0), cost_usd=round(_cost, 6))
+    # WHAT THE RE-DERIVATION FOUND, cumulative over this process. The per-call
+    # numbers were printed above; this is the counter's reader, and it exists
+    # because a counter nothing reads is the dead declaration
+    # tests/test_package_invariants.py check 2h reports -- a docstring naming
+    # it satisfies that scan without anyone ever seeing the number.
+    _renorm_total = sum(v for k, v in CRITERIA_RENORMALIZED.items()
+                        if k.startswith("changed:"))
+    if _renorm_total:
+        console.out(f"  Stale split-derived fields corrected this process: "
+                    f"{_renorm_total:,} field(s) across "
+                    f"{CRITERIA_RENORMALIZED.get('trials', 0):,} trial(s) — "
+                    f"{dict(CRITERIA_RENORMALIZED)}")
+
     if EMBEDDING_USAGE.get("calls_without_usage"):
         # Reported, never folded into the total: a missing usage block and a
         # zero-token call are different facts and only one is free.
