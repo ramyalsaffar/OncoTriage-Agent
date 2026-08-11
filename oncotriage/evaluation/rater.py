@@ -94,6 +94,16 @@ VERDICT_VALUES = ("agree", "disagree")
 RATING_KEYS = ("patient_value_support", "status_verdict", "corrected_status",
                "rationale")
 
+# ``corrected_status`` is the one key a rating may omit, and only when the
+# verdict is "agree", where its sole legal value is null. An omitted null and
+# an explicit null say the same thing, so refusing the first is strictness with
+# no measurement behind it -- one decision on the live 2,212-request run was
+# lost exactly that way, to a response that was otherwise valid. The reverse is
+# NOT symmetric: a "disagree" that omits its correction has not answered the
+# question it was asked, and stays unrated as missing_corrected_status.
+REQUIRED_RATING_KEYS = ("patient_value_support", "status_verdict",
+                        "rationale")
+
 
 #------------------------------------------------------------------------------
 # Lifting the rubric out of the shipped Stage 5 prompt
@@ -1267,13 +1277,19 @@ def parse_rating(text, arm, recorded_status):
             return None, "unparseable_json"
     if not isinstance(obj, dict):
         return None, "not_a_json_object"
-    if set(obj.keys()) != set(RATING_KEYS):
+    keys = set(obj.keys())
+    # Subset: no key outside the contract. Superset: every required key
+    # present. Together these admit exactly one absence -- corrected_status --
+    # and only its legality on an "agree" is decided below, once the verdict
+    # has been validated.
+    if not keys <= set(RATING_KEYS) or not keys >= set(REQUIRED_RATING_KEYS):
         return None, "wrong_keys"
 
     support = obj.get("patient_value_support")
     verdict = obj.get("status_verdict")
     corrected = obj.get("corrected_status")
     rationale = obj.get("rationale")
+    corrected_omitted = "corrected_status" not in obj
 
     if support not in SUPPORT_VALUES:
         return None, "bad_support_value"
@@ -1298,7 +1314,8 @@ def parse_rating(text, arm, recorded_status):
              "corrected_status": corrected,
              "rationale": rationale.strip(),
              "fenced": fenced,
-             "extracted": extracted}, None)
+             "extracted": extracted,
+             "corrected_status_omitted": corrected_omitted}, None)
 
 
 #------------------------------------------------------------------------------
@@ -1915,6 +1932,7 @@ def build_rating_rows(index, rated, unrated, retried):
                               "corrected_status", "rationale")}
             row["response_was_fenced"] = rating["fenced"]
             row["response_was_extracted"] = rating["extracted"]
+            row["corrected_status_omitted"] = rating["corrected_status_omitted"]
             row["rated_by"] = rating["rated_by"]
             row["batch_id"] = rating["batch_id"]
         rows.append(row)
@@ -2278,6 +2296,7 @@ def main(argv=None):
     summary = summarize(index, rated, unrated, run)
     fenced = sum(1 for r in rows if r.get("response_was_fenced"))
     extracted = sum(1 for r in rows if r.get("response_was_extracted"))
+    omitted = sum(1 for r in rows if r.get("corrected_status_omitted"))
 
     manifest = {
         "schema_version": 1,
@@ -2306,6 +2325,7 @@ def main(argv=None):
             "retried": len(retried),
             "responses_with_markdown_fences": fenced,
             "responses_carved_out_of_prose": extracted,
+            "responses_omitting_corrected_status": omitted,
             "unrated_by_reason": summary["unrated_by_reason"],
             "stop_reasons": dict(stop_reasons),
         },
