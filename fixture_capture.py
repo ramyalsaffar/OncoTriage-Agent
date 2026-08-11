@@ -37,9 +37,14 @@ where that is meaningful, and 46- replays it and reports every difference. A
 difference is not automatically a defect — but after a 6,000-line refactor, an
 unexplained difference is the only warning you get.
 
-THE FIXTURE FORMAT IS FROZEN AT SCHEMA VERSION 3. The twelve fixtures on disk are
-v3 and ``load_fixture()`` refuses a mismatch. Fixtures are stored gzipped, one
-per file, at ``compresslevel=9, mtime=0`` — the zeroed mtime is what makes two
+THE FIXTURE FORMAT IS VERSIONED, AND ``SCHEMA_VERSION`` IN
+``oncotriage/fixtures/capture.py`` IS THE AUTHORITY. This line named a number
+for two versions after that number stopped being true — it read "frozen at
+schema version 3" through the v4 rename and the v5 request-block change — so it
+names the constant instead. ``load_fixture()`` refuses any fixture whose stored
+version is not the current one, and the comment block above ``SCHEMA_VERSION``
+records what every bump changed and why. Fixtures are stored gzipped, one per
+file, at ``compresslevel=9, mtime=0`` — the zeroed mtime is what makes two
 captures of identical content produce identical bytes rather than a git diff on
 every re-capture. See ``oncotriage/fixtures/capture.py`` for the field-by-field
 description of every section: identity, environment, derivation, inputs,

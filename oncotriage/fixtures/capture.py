@@ -88,11 +88,18 @@ deterministic prefix, the completeness checks, the three derivation recipes, the
 constructed retry fixture, the cohort scan, the selection and ``main()`` are the
 line slice of File 45 between its bootstrap and its ``__main__`` guard.
 
-**THE FIXTURE FORMAT IS AT v5 AND TWO SEPARATE CHANGES GOT IT THERE.** The
-Structured Outputs pass added ``response_format`` -- the whole strict
+**THE FIXTURE FORMAT IS AT v6 AND THREE SEPARATE CHANGES GOT IT THERE.** v6 is
+provenance: ``stage3`` gained the two cross-encoder score lists
+(``medcpt_score_max``, ``medcpt_queries_scored``) that MEDCPT_SCORE_FLOOR is
+applied to, ``stage5`` gained ``llm_classifier_prompt_version`` and the
+SYSTEM-only ``llm_classifier_prompt_sha256``, and the old combined system+user
+hash was renamed ``llm_classifier_combined_prompt_sha256`` because it collided
+with the database column of the former name while holding a different value.
+The v5 and v4 changes are recorded immediately below and both still hold.
+
+v5: the Structured Outputs pass added ``response_format`` -- the whole strict
 json_schema -- to the recorded request block, and that block is hashed into
 ``stage5.request_sha256_by_call``, so every v4 digest is unreachable from here.
-The v4 change is recorded immediately below and still holds.
 
 **THE FIXTURE FORMAT WAS FROZEN AT v3 AND THE llm_classifier RENAME BROKE IT.**
 That was v4. Eight recorded fields under ``stage5`` and one key in
@@ -104,18 +111,18 @@ every renamed field as absent and a replay would compare ``None`` with ``None``
 and call it a match. ``load_fixture()`` refuses the mismatch by version, before
 any field is read.
 
-THE TWELVE FIXTURES ON DISK ARE v3 AND ARE THEREFORE UNREADABLE. They were
-already unreplayable for an unrelated reason -- the alias ``trial_criteria``
-resolved past the collection digest they pin at the M-category pass -- so this
-does not lose a working gate. A re-capture is scheduled separately and is the
-only thing that clears it; nothing here silently skips them, and
-``fixture_replay.py`` exits 1 when a fixture fails to load.
+THE TWELVE FIXTURES ON DISK ARE v3 AND ARE THEREFORE UNREADABLE -- three
+versions stale now, not one. They were already unreplayable for an unrelated
+reason -- the alias ``trial_criteria`` resolved past the collection digest they
+pin at the M-category pass -- so neither v4, v5 nor v6 lost a working gate. A
+re-capture is scheduled separately and is the only thing that clears it;
+nothing here silently skips them, and ``fixture_replay.py`` exits 1 when a
+fixture fails to load.
 
-Nothing else about the format moved: the field SET is the same size, and
-``write_fixture``'s JSON and the gzip settings are untouched --
-``compresslevel=9, mtime=0``, where the zeroed mtime is what makes two captures
-of identical content produce identical bytes instead of a git diff per
-re-capture.
+Nothing else about the STORAGE moved: ``write_fixture``'s JSON and the gzip
+settings are untouched -- ``compresslevel=9, mtime=0``, where the zeroed mtime
+is what makes two captures of identical content produce identical bytes instead
+of a git diff per re-capture.
 
 WHAT IMPORTING THIS MODULE DOES
 -------------------------------
@@ -364,7 +371,35 @@ def log_inference(*_args, **_kwargs):
 # digest and every v4 fixture's stored digest is unreachable by v5 code. A v4
 # recording replayed here would miss on the request digest of every call, and a
 # reader would go looking for a pipeline change that did not happen.
-SCHEMA_VERSION = 5
+# v6: four provenance fields, and one rename that had to ride the same bump
+# because the version was already moving.
+#   - stage3 gained `medcpt_score_max` and `medcpt_queries_scored`, two lists
+#     parallel to `rerank_scores_raw` over the same reranked trials in the same
+#     order. Stage 3 has written both onto every reranked trial since the
+#     two-knob quality gate, and MEDCPT_SCORE_FLOOR -- one of the two knobs --
+#     reads the first of them. So the input to half of Stage 4's gate was
+#     invisible to every fixture: a cross-encoder change that moved the
+#     absolute scores while leaving the RRF ORDER alone reordered nothing,
+#     dropped nothing, and diffed as clean.
+#   - stage5 gained `llm_classifier_prompt_version` and
+#     `llm_classifier_prompt_sha256`, taken verbatim off the result. They are
+#     the two identifiers the Stage 5 system prompt is tracked by, `inferences`
+#     has stored both since the prompt-version guard, and the fixture recorded
+#     neither -- so a template edit that did not move a verdict was not a
+#     diffed fact.
+#   - the pre-v6 `llm_classifier_prompt_sha256` key is RENAMED to
+#     `llm_classifier_combined_prompt_sha256`. It never held what its name
+#     said: it is sha256 of `result["llm_classifier_prompt"]`, which is system
+#     + user concatenated, while the identically named database column holds
+#     the SYSTEM-only hash. One name, two values, and the fixture's was the one
+#     nothing else in the project could reproduce. The database rename window
+#     is closed -- that column ships -- and the fixture one is open exactly
+#     here, because the version is moving and every fixture on disk is already
+#     unreadable.
+# A v5 fixture read by v6 code answers None for all four new keys and for the
+# renamed one, and a diff of None against None is a gate that passes because it
+# stopped looking -- which is the mismatch this version gate exists to refuse.
+SCHEMA_VERSION = 6
 
 # Branch cases the fixture set must cover. Values are stored in case_labels.
 CASE_NO_CANDIDATES = "no_candidates"        # a terminal node_no_candidates run
@@ -994,6 +1029,29 @@ def build_deterministic_prefix(final_state: Dict,
             "rerank_scores_raw": [t.get("rerank_score_raw") for t in reranked],
             "mesh_boosts": [t.get("mesh_boost") for t in reranked],
             "mesh_boost_tiers": [t.get("mesh_boost_tier") for t in reranked],
+            # The RAW cross-encoder score Stage 3 retained, and how many rerank
+            # queries contributed to it. Parallel to the three lists above,
+            # over the same reranked trials in the same order.
+            #
+            # RRF keeps ranks and throws the scores away, so the three lists
+            # above describe the fused ORDER and nothing calibrated. These two
+            # are what MEDCPT_SCORE_FLOOR -- one of Stage 4's two quality knobs
+            # -- is applied to, which means a cross-encoder checkpoint change
+            # that shifted the absolute scores without reordering the pool
+            # moved the floor's drop set while every list above stayed
+            # byte-identical.
+            #
+            # None is stored as JSON null and is NEVER coerced to 0.0: Stage 3
+            # writes None when no rerank query scored the trial at all, and the
+            # floor deliberately does not drop such a trial -- absence of a
+            # score is not a low score. A 0.0 here would read as a real score
+            # at the bottom of the distribution and would make the two cases
+            # indistinguishable in the one record that exists to distinguish
+            # them.
+            "medcpt_score_max": [t.get("medcpt_score_max") for t in reranked],
+            "medcpt_queries_scored": [
+                t.get("medcpt_queries_scored") for t in reranked
+            ],
             # A set has no stable iteration order, so it is sorted before it is
             # stored. The pipeline sorts it too wherever order matters.
             "patient_trees": sorted(final_state.get("patient_trees") or []),
@@ -1046,7 +1104,34 @@ def build_deterministic_prefix(final_state: Dict,
             "cross_vocab_remaps": result.get("cross_vocab_remaps"),
             "llm_classifier_input_tokens": result.get("llm_classifier_input_tokens"),
             "llm_classifier_output_tokens": result.get("llm_classifier_output_tokens"),
-            "llm_classifier_prompt_sha256": sha256_text(result.get("llm_classifier_prompt") or ""),
+            # sha256 of result["llm_classifier_prompt"], which is the SYSTEM
+            # message and the USER message concatenated. It therefore moves
+            # with the patient record and with the filtered trial set, so it
+            # identifies THIS RUN and not the prompt template -- which is why
+            # it carries "combined" in its name from v6 on. Until v6 it was
+            # called llm_classifier_prompt_sha256, colliding with the database
+            # column of that name, which holds the SYSTEM-only hash.
+            "llm_classifier_combined_prompt_sha256": sha256_text(
+                result.get("llm_classifier_prompt") or ""),
+            # The two identifiers of the TEMPLATE, taken verbatim off the
+            # result rather than re-rendered or re-hashed here: a fixture that
+            # recomputed either would be comparing this file against itself
+            # instead of against what Stage 5 published. The version is what a
+            # human intended, the sha256 is what was actually sent, and both
+            # are the same values stored in the identically named `inferences`
+            # columns.
+            #
+            # THEY HAVE DIFFERENT NULL CONVENTIONS and both are stored as-is.
+            # _pipeline_provenance falls the VERSION back to PROMPT_VERSION on
+            # every path, including the two terminal nodes where Stage 5 never
+            # ran -- it is a property of the build, not of the stage -- so this
+            # is a string on every fixture. The HASH has no fallback and is
+            # None for a run that rendered no prompt, which is how a reader
+            # separates "Stage 5 ran" from "Stage 5 never ran". Coercing that
+            # None to "" here would record the hash of a prompt that never
+            # existed.
+            "llm_classifier_prompt_version": result.get("llm_classifier_prompt_version"),
+            "llm_classifier_prompt_sha256": result.get("llm_classifier_prompt_sha256"),
             "verdicts": [
                 {
                     "nct_id": e.get("nct_id"),
@@ -1176,7 +1261,11 @@ def load_fixture(path: str) -> Dict:
             f"rather than diffing across versions — a field whose name or "
             f"meaning changed reads as absent and compares equal for the "
             f"wrong reason. (v3 -> v4 renamed the nine gpt4o_* recorded "
-            f"fields to llm_classifier_*.)"
+            f"fields to llm_classifier_*; v4 -> v5 put response_format inside "
+            f"every request digest; v5 -> v6 added the two stage3 MedCPT score "
+            f"lists and the two stage5 prompt-template identifiers, and "
+            f"renamed the combined system+user hash to "
+            f"llm_classifier_combined_prompt_sha256.)"
         )
     return fixture
 
@@ -2227,6 +2316,33 @@ def build_constructed_retry_fixture(base: Dict, fixture_id: str) -> Dict:
     # that does not parse. "length" would make it a truncation, which since
     # item 19c is a different mechanism with a different budget.
     stage5["finish_reasons"] = ["stop", "stop"]
+    # THE THREE PROMPT IDENTIFIERS ARE DELIBERATELY NOT TOUCHED, and that is a
+    # statement about the case rather than an omission. The retry re-enters
+    # node_llm_classifier_evaluation with the same patient and the same
+    # filtered set, so attempt 2 renders the same system prompt and the same
+    # user message as attempt 1: llm_classifier_prompt_version,
+    # llm_classifier_prompt_sha256 and llm_classifier_combined_prompt_sha256
+    # all carry through the deepcopy unchanged, which is the same reason
+    # request_sha256_by_call above is the base digest REPEATED rather than a
+    # second, different one.
+    #
+    # The key SET is asserted rather than assumed. Every edit in this function
+    # is a subscript assignment, and a subscript assignment against a key name
+    # that has moved does not raise -- it silently ADDS a key the replay will
+    # then diff against a fixture that has no such field. That is exactly what
+    # the v6 rename of llm_classifier_prompt_sha256 could have done here, and
+    # the only thing that catches it is comparing the two key sets.
+    _base_stage5_keys = set(base["deterministic_prefix"]["stage5"])
+    if set(stage5) != _base_stage5_keys:
+        raise ValueError(
+            "the constructed retry fixture's stage5 key set diverged from "
+            f"{base['fixture_id']}'s: added "
+            f"{sorted(set(stage5) - _base_stage5_keys)}, lost "
+            f"{sorted(_base_stage5_keys - set(stage5))}. An edit above wrote a "
+            "key name that build_deterministic_prefix no longer produces, so "
+            "the field it meant to override is still at its base value and a "
+            "replay would diff a field that exists on only one side."
+        )
     # llm_classifier_calls_reported is left at the base value of 1 and that is correct,
     # not an oversight: it is what the SUCCESSFUL node invocation reports, and
     # Stage 5's own counter resets when the router re-enters the node. The
