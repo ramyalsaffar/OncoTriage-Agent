@@ -3591,6 +3591,10 @@ _DECORATOR_INVENTORY = {
     # scan.
     "oncotriage/fixtures/capture.py::compute_collection_digest._page":
         ["qdrant_retry"],
+    # The rater harness. Decision.key is a plain read-only accessor over the
+    # four-field join key; it carries no behaviour and is pinned here because
+    # this check pins every decorated definition, not because it is delicate.
+    "oncotriage/evaluation/rater.py::Decision.key": ["property"],
     # ---- The MCP pass ----------------------------------------------------
     # The stdio server and the trial lookup it wraps. Five of these six are in
     # oncotriage/mcp/server.py and one is the lookup's paging-free scroll.
