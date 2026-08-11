@@ -910,7 +910,15 @@ def main() -> int:
             return 1
 
     if not fixtures:
+        # Every fixture present failed the version gate: the extreme of the
+        # load-failure case, so it takes that code rather than the one meaning
+        # "the pipeline changed". Nothing was replayed, so nothing differed.
         console.out("[FATAL] No fixture could be loaded.")
+        if load_failures:
+            console.out("  exit 2 (load failures only, nothing replayed "
+                  "differently)")
+            return 2
+        console.out("  exit 1 (no fixture to replay)")
         return 1
 
     # --- THE SEAM, CHECKED BEFORE ANYTHING IS REPLAYED ----------------------
@@ -1119,9 +1127,27 @@ def main() -> int:
         console.out(f"\n  {load_failures} fixture(s) could not be loaded.")
 
     console.out(f"\n  {len(reports) - failed}/{len(reports)} replayed clean.")
+
+    # A STALE FILE AND A CHANGED PIPELINE ARE DIFFERENT FINDINGS WITH DIFFERENT
+    # OWNERS, and one exit code for both said neither. A load failure is a file
+    # lying in the directory at the wrong schema version -- nothing replayed
+    # differently, and the fix is to migrate or delete it. A difference is the
+    # pipeline no longer doing what it did, and the fix is to explain why.
+    #
+    # Differences WIN when both occur: the loud finding must not be masked by
+    # the housekeeping one, and a caller branching on the code has to reach the
+    # pipeline change first. The load failures are still printed above, so
+    # nothing is skipped silently -- only the code collapses.
+    if failed:
+        exit_code, why = 1, "replay differences or misses"
+    elif load_failures:
+        exit_code, why = 2, "load failures only, nothing replayed differently"
+    else:
+        exit_code, why = 0, "clean"
+    console.out(f"  exit {exit_code} ({why})")
     console.out(f"{'=' * 78}\n")
 
-    return 0 if (failed == 0 and load_failures == 0) else 1
+    return exit_code
 #------------------------------------------------------------------------------
 
 

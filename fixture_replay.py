@@ -78,10 +78,23 @@ OpenAI tripwire, then the pinned collection NAME, then its CONTENTS digest. Only
 then is a fixture replayed, so a difference is never reported against a different
 index.
 
-EXIT CODE
----------
-0 only when every fixture replays clean. Any difference, any replay miss, any
-collection mismatch, any load failure -> 1.
+EXIT CODES
+----------
+0   every fixture loaded and replayed clean.
+1   at least one fixture replayed with a DIFFERENCE or a replay miss -- the
+    pipeline no longer does what it did. Also the code for the five refusals
+    above (seam, tripwire, collection name, collection digest), which all mean
+    the same thing: what would have been replayed is not comparable.
+2   at least one fixture FAILED TO LOAD and nothing that did load replayed
+    differently. A stale file at an older schema version lying in the fixture
+    directory; migrate or delete it. Nothing replayed differently.
+
+1 WINS WHEN BOTH OCCUR. A stale file is housekeeping and a changed pipeline is
+a finding; collapsing them into one code, which is what this file did until the
+codes were split, meant a re-capture that left one old file behind was
+indistinguishable from a pipeline regression. Both are always printed in the
+summary -- only the code collapses -- and the summary states which code is
+being returned and why.
 
 NO RE-EXPORT SHIM. All 27 top-level names were grepped against every .py, .md,
 .toml and .yml in the tree; every hit is prose in File 45, File 13 or

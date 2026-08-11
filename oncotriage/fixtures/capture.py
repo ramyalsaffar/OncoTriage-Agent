@@ -88,8 +88,16 @@ deterministic prefix, the completeness checks, the three derivation recipes, the
 constructed retry fixture, the cohort scan, the selection and ``main()`` are the
 line slice of File 45 between its bootstrap and its ``__main__`` guard.
 
-**THE FIXTURE FORMAT IS AT v6 AND THREE SEPARATE CHANGES GOT IT THERE.** v6 is
-provenance: ``stage3`` gained the two cross-encoder score lists
+**THE FIXTURE FORMAT IS AT v7.** v7 is one field's null convention:
+``stage5.llm_classifier_combined_prompt_sha256`` records ``None`` when Stage 5
+rendered no prompt, where it used to record the sha256 of the empty string --
+a real-looking digest for a prompt that never existed, on the one fixture that
+terminates at ``node_no_candidates``. Its sibling
+``llm_classifier_prompt_sha256`` has always used ``None`` for that case; there
+is one convention now. See the per-bump block at ``SCHEMA_VERSION``.
+
+**v6 WAS PROVENANCE, AND THREE SEPARATE CHANGES GOT IT THERE.** ``stage3``
+gained the two cross-encoder score lists
 (``medcpt_score_max``, ``medcpt_queries_scored``) that MEDCPT_SCORE_FLOOR is
 applied to, ``stage5`` gained ``llm_classifier_prompt_version`` and the
 SYSTEM-only ``llm_classifier_prompt_sha256``, and the old combined system+user
@@ -111,13 +119,19 @@ every renamed field as absent and a replay would compare ``None`` with ``None``
 and call it a match. ``load_fixture()`` refuses the mismatch by version, before
 any field is read.
 
-THE TWELVE FIXTURES ON DISK ARE v3 AND ARE THEREFORE UNREADABLE -- three
-versions stale now, not one. They were already unreplayable for an unrelated
-reason -- the alias ``trial_criteria`` resolved past the collection digest they
-pin at the M-category pass -- so neither v4, v5 nor v6 lost a working gate. A
-re-capture is scheduled separately and is the only thing that clears it;
-nothing here silently skips them, and ``fixture_replay.py`` exits 1 when a
-fixture fails to load.
+THE TWELVE FIXTURES ON DISK ARE AT THE CURRENT VERSION and replay clean. They
+were at v3 through the v4/v5/v6 bumps -- unreadable, and already unreplayable
+for an unrelated reason, the alias ``trial_criteria`` having resolved past the
+collection digest they pin at the M-category pass -- so none of those three
+bumps lost a working gate. The v6 re-capture cleared both. The v6 -> v7 move was
+then applied to the files IN PLACE by a migration rather than by re-capturing,
+because v7 changes one stored value on one fixture and a re-capture costs twelve
+live Stage 5 calls to reproduce eleven fixtures byte-for-byte.
+
+Nothing here silently skips an unreadable fixture: ``fixture_replay.py`` prints
+every load failure and exits 2 for them, distinctly from the 1 it exits on a
+replay difference (a stale file lying in the directory and the pipeline having
+changed are different findings with different owners).
 
 Nothing else about the STORAGE moved: ``write_fixture``'s JSON and the gzip
 settings are untouched -- ``compresslevel=9, mtime=0``, where the zeroed mtime
@@ -207,7 +221,9 @@ from oncotriage.fhir.parser import parse_fhir_bundle
 from oncotriage.storage import database_logger as _database_logger
 from oncotriage.utils import (
     CaffeinateSession,
+    UnknownModelPricingError,
     get_age_reference_date,
+    get_model_cost,
     qdrant_retry,
     resolve_qdrant_collection,
 )
@@ -399,7 +415,26 @@ def log_inference(*_args, **_kwargs):
 # A v5 fixture read by v6 code answers None for all four new keys and for the
 # renamed one, and a diff of None against None is a gate that passes because it
 # stopped looking -- which is the mismatch this version gate exists to refuse.
-SCHEMA_VERSION = 6
+# v7: `llm_classifier_combined_prompt_sha256` records None, not the sha256 of
+# the empty string, when Stage 5 rendered no prompt. It was
+# `sha256_text(result.get("llm_classifier_prompt") or "")`, so a terminal
+# node_no_candidates run -- which never reaches Stage 5 -- stored
+# e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855, the sha256
+# of "". That is a well-known constant that a reader has no way to distinguish
+# from a real digest by looking at it, and any consumer comparing hashes as
+# STRINGS reads it as "a prompt was rendered and here is its hash". The field's
+# own sibling three lines below, `llm_classifier_prompt_sha256`, has always
+# recorded None for exactly this case, and the comment above it already argued
+# the point -- "Coercing that None to '' here would record the hash of a prompt
+# that never existed" -- while this field did precisely that. One convention
+# now: None means nothing was rendered.
+# This is the MEANING of a stored field changing, which is the first line of the
+# rule at the top of this block, so the version moves. A v6 fixture read by v7
+# code compares e3b0c442... against None on the one fixture that never called
+# Stage 5 -- a real difference, reported as a pipeline change that did not
+# happen -- and every OTHER fixture would compare equal, which is worse: it
+# would look like a verified set with one inexplicable outlier.
+SCHEMA_VERSION = 7
 
 # Branch cases the fixture set must cover. Values are stored in case_labels.
 CASE_NO_CANDIDATES = "no_candidates"        # a terminal node_no_candidates run
@@ -1111,8 +1146,15 @@ def build_deterministic_prefix(final_state: Dict,
             # it carries "combined" in its name from v6 on. Until v6 it was
             # called llm_classifier_prompt_sha256, colliding with the database
             # column of that name, which holds the SYSTEM-only hash.
-            "llm_classifier_combined_prompt_sha256": sha256_text(
-                result.get("llm_classifier_prompt") or ""),
+            #
+            # None -- NOT sha256("") -- when no prompt was rendered, from v7 on.
+            # `or ""` stood here and hashed the empty string, so a terminal
+            # node_no_candidates run stored e3b0c442..., which is a real-looking
+            # digest for a prompt that never existed. Same convention as the
+            # sibling field below, and for the reason its comment already gave.
+            "llm_classifier_combined_prompt_sha256": (
+                sha256_text(result["llm_classifier_prompt"])
+                if result.get("llm_classifier_prompt") else None),
             # The two identifiers of the TEMPLATE, taken verbatim off the
             # result rather than re-rendered or re-hashed here: a fixture that
             # recomputed either would be comparing this file against itself
@@ -1265,9 +1307,156 @@ def load_fixture(path: str) -> Dict:
             f"every request digest; v5 -> v6 added the two stage3 MedCPT score "
             f"lists and the two stage5 prompt-template identifiers, and "
             f"renamed the combined system+user hash to "
-            f"llm_classifier_combined_prompt_sha256.)"
+            f"llm_classifier_combined_prompt_sha256; v6 -> v7 records that "
+            f"combined hash as None rather than the sha256 of the empty string "
+            f"when Stage 5 rendered no prompt.)"
         )
     return fixture
+
+
+# The fixtures whose Stage 5 recordings were COPIED from another fixture rather
+# than produced by their own run. Counting them double-bills.
+#
+# THE TEST IS `construction.derived_from`, NOT `fixture_kind == "constructed"`,
+# and the difference is most of the bill. Five of the twelve fixtures are
+# `constructed`, and FOUR of those are real, live, billed runs on a derived
+# INPUT -- mcode_genomic_variant, mesh_fallback_siteless_code,
+# no_candidates_pediatric_age and truncation_split each made their own Stage 5
+# calls. Only build_constructed_retry_fixture() copies another fixture's
+# recordings, and it is the only writer that sets `construction.derived_from`
+# (a FIXTURE id); the derived-input fixtures set `derived_from_bundle`
+# (a BUNDLE filename) instead. Measured on the v6 set: excluding by
+# `fixture_kind` would have reported $0.53 of a $1.14 run.
+def _recordings_are_copied(fixture: Dict) -> bool:
+    construction = fixture.get("construction")
+    return bool(isinstance(construction, dict) and construction.get("derived_from"))
+
+
+def stage5_cost_summary(fixtures: List[Dict]) -> Dict:
+    """What the Stage 5 calls in these fixtures cost, priced by recorded model.
+
+    Pure: reads the passed fixtures, calls ``get_model_cost`` and nothing else.
+    No network, no client, no config beyond the price table that function reads.
+
+    Tokens come from each recorded call's own ``response.usage`` and the model
+    from that call's own ``response.model`` -- what the API said it charged for,
+    not what config asks for today. A capture that ran while MATCHING_MODEL was
+    being changed prices each call against the model that answered it.
+
+    ``reasoning_tokens`` are deliberately NOT added: ``completion_tokens``
+    already includes them, and the evaluation module's comment records that
+    adding them bills every reasoning token twice.
+
+    An unpriced model does not raise here and does not become a zero. This is a
+    terminal REPORT on a run whose money is already spent, so refusing to print
+    a number would fail a capture that succeeded, and printing a silent zero is
+    the defect item 38 removed from the cost query -- an unpriceable group
+    contributing a real 0.0 that every aggregate absorbs. The unpriced models
+    are named and ``cost_complete`` goes False, which is the one field a
+    consumer asks before trusting the total.
+
+    Returns a dict: cost_usd, cost_complete, calls_priced, calls_unpriced,
+    input_tokens, output_tokens, models, unpriced_models, excluded_fixture_ids.
+    """
+    by_model = {}
+    excluded = []
+    unpriced = {}
+    calls_priced = calls_unpriced = 0
+
+    for fixture in fixtures:
+        if _recordings_are_copied(fixture):
+            excluded.append(fixture.get("fixture_id"))
+            continue
+        for call in (fixture.get("recordings") or {}).get("chat_completions") or []:
+            response = call.get("response") or {}
+            usage = response.get("usage") or {}
+            model = response.get("model")
+            entry = by_model.setdefault(model, {"input": 0, "output": 0, "calls": 0})
+            entry["input"] += usage.get("prompt_tokens") or 0
+            entry["output"] += usage.get("completion_tokens") or 0
+            entry["calls"] += 1
+
+    cost = 0.0
+    for model, entry in by_model.items():
+        try:
+            cost += get_model_cost(model, entry["input"], entry["output"])
+            calls_priced += entry["calls"]
+        except UnknownModelPricingError:
+            unpriced[model] = entry
+            calls_unpriced += entry["calls"]
+
+    return {
+        "cost_usd": cost,
+        "cost_complete": not unpriced,
+        "calls_priced": calls_priced,
+        "calls_unpriced": calls_unpriced,
+        "input_tokens": sum(e["input"] for e in by_model.values()),
+        "output_tokens": sum(e["output"] for e in by_model.values()),
+        "models": sorted(m for m in by_model if m is not None),
+        "unpriced_models": sorted(str(m) for m in unpriced),
+        "excluded_fixture_ids": sorted(x for x in excluded if x),
+    }
+
+
+def read_recorded_donor_bundle(path: str) -> str:
+    """The donor bundle filename a fixture records, read WITHOUT the version gate.
+
+    Returns the bundle filename, or None when the file does not exist, cannot be
+    read, or records no donor. Raises nothing: every failure is None, and the
+    caller decides what to print.
+
+    WHY THIS BYPASSES ``load_fixture()``, AND WHY THAT IS SAFE HERE
+    --------------------------------------------------------------
+    ``load_fixture()`` refuses any schema mismatch before a field is read, which
+    is right for a REPLAY input -- a renamed field read as absent compares equal
+    to absent and the gate passes because it stopped looking. It is wrong for
+    this read, and the cost was measured: the recovery below is what stops a
+    re-capture repointing a derived fixture at a different patient, and it was
+    reached through the gate, so every schema bump erased the donor memory of
+    every derived fixture at exactly the moment it forced the re-capture. At the
+    v6 capture that rebound four of twelve fixtures -- three whose recorded donor
+    the gate hid, and ``truncation_split``, which had no memory at all.
+
+    Two properties make the bypass safe, and both are about THIS field rather
+    than about fixtures in general:
+
+      - ``derivation.donor_bundle`` and ``construction.derived_from_bundle``
+        have carried the same NAME and the same MEANING -- the filename of the
+        cohort bundle the derived input was built from -- since schema v2. Every
+        bump since has moved something else: v4 renamed nine stage5/environment
+        keys, v5 put ``response_format`` inside the request digest, v6 added two
+        stage3 lists and two stage5 identifiers and renamed one hash, v7 changed
+        one hash's null convention. None of them touched either key.
+      - The read is ADVISORY. Its only effect is which cohort patient the NEXT
+        capture derives from. It never enters a deterministic prefix, is never
+        compared on replay, and is never stored as a recorded value. A wrong or
+        stale answer costs a donor search, which is what happens anyway when it
+        returns None -- so the failure mode of trusting an old file here is the
+        failure mode of not reading it at all.
+
+    ``construction.derived_from_bundle`` is the fallback because
+    ``truncation_split`` rewrites no bundle and therefore carries no
+    ``derivation`` block at all; its donor is recorded only there. Fixtures whose
+    ``construction`` names another FIXTURE rather than a bundle
+    (``derived_from``) have no donor of their own and answer None.
+    """
+    if not os.path.exists(path):
+        return None
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            recorded = json.load(fh)
+    except (OSError, EOFError, json.JSONDecodeError, UnicodeDecodeError):
+        # Corrupt or truncated. The caller warns and searches; raising here
+        # would take down a capture over a file it is about to overwrite.
+        return None
+    if not isinstance(recorded, dict):
+        return None
+    for block, key in (("derivation", "donor_bundle"),
+                       ("construction", "derived_from_bundle")):
+        section = recorded.get(block)
+        if isinstance(section, dict) and section.get(key):
+            return section[key]
+    return None
 
 
 def list_fixtures(root: str = None) -> List[str]:
@@ -2864,27 +3053,66 @@ def main() -> int:
         running this file twice cannot silently repoint it at someone else.
         Returns None when there is no such fixture, or its donor is no longer
         in the cohort.
+
+        The donor is read by ``read_recorded_donor_bundle()``, which does NOT go
+        through ``load_fixture()``'s version gate. That is argued in full at
+        that function; the short form is that this read is advisory and the key
+        it reads has been stable since v2, while routing it through the gate
+        erased the donor memory of every derived fixture on every schema bump.
         """
         path = fixture_path(derived_id, root)
         if not os.path.exists(path):
             return None
-        try:
-            recorded = load_fixture(path)
-        except (ValueError, json.JSONDecodeError) as exc:
-            # Not silent: an unreadable fixture here means the donor is about
-            # to be re-chosen, which repoints a bundle that something on disk
-            # may still reference. The reader has to see why.
-            console.out(f"  WARNING: cannot read the existing {derived_id} fixture "
-                  f"to recover its donor ({exc}). Searching for a new one.")
-            return None
-        bundle = (recorded.get("derivation") or {}).get("donor_bundle")
+        bundle = read_recorded_donor_bundle(path)
         if not bundle:
+            # The file is there and names no donor: unreadable, corrupt, or
+            # written before the field existed. Not silent -- the donor is about
+            # to be re-chosen, which repoints a bundle that something on disk may
+            # still reference, and the reader has to see why.
+            console.out(f"  WARNING: the existing {derived_id} fixture records no "
+                  f"donor bundle (missing, corrupt, or pre-v2). Searching for "
+                  f"a new one.")
             return None
         for candidate in rows:
             if candidate["bundle"] == bundle:
                 return candidate
         console.out(f"  WARNING: {derived_id} names donor {bundle}, which is no "
               f"longer in the cohort. Searching for a new one.")
+        return None
+
+    def _recorded_pool_donor(derived_id: str) -> Dict:
+        """The recorded donor of a fixture that derives NOTHING from the bundle.
+
+        ``truncation_split`` runs a real, unmodified cohort bundle and injects
+        the truncation into the RESPONSE, so its donor has no recipe to satisfy
+        -- the only predicate is the one the donor pool already encodes: an
+        ordinary patient (MeSH resolved, stage known) that no other fixture in
+        this run has taken. So the recorded donor is reused only when it is
+        still in the REMAINING pool, and it is popped from that pool when it is.
+
+        Membership in the remaining pool, rather than in the cohort, is the
+        predicate on purpose. A recorded donor that this run has already
+        selected as an ablation or a normal is NOT reusable: two fixtures on one
+        patient differ only by the injected truncation, and the retrieval half
+        of both is then the same run recorded twice -- which is the same
+        argument the ablation selection makes for taking a distinct patient per
+        config. Popping is what stops a later ``_next_donor()`` handing the same
+        patient out a second time.
+        """
+        path = fixture_path(derived_id, root)
+        if not os.path.exists(path):
+            return None
+        bundle = read_recorded_donor_bundle(path)
+        if not bundle:
+            console.out(f"  [Donor] {derived_id}: the existing fixture records no "
+                  f"donor bundle; taking the next pool donor.")
+            return None
+        for index, candidate in enumerate(donors):
+            if candidate["bundle"] == bundle:
+                return donors.pop(index)
+        console.out(f"  [Donor] {derived_id}: recorded donor {bundle[:44]} is no "
+              f"longer an available donor (taken by another fixture this run, "
+              f"or no longer an ordinary patient); taking the next pool donor.")
         return None
 
     # --- no_candidates -----------------------------------------------------
@@ -3095,7 +3323,18 @@ def main() -> int:
     # recorded — so the expected prefix is observed, not hand-derived. The
     # fixture is marked constructed because the truncation was injected.
     if not args.scan_only and _wanted("truncation_split"):
-        _trunc_row = _next_donor()
+        # Prefer the donor the existing fixture records, exactly as the three
+        # recipe-derived fixtures above do. Without this it took _next_donor()
+        # unconditionally and therefore rebound on EVERY capture -- and worse,
+        # it rebound as a side effect of how many donors the no_candidates
+        # search happened to burn first, so its patient was a function of an
+        # unrelated probe loop.
+        _trunc_row = _recorded_pool_donor("truncation_split")
+        if _trunc_row is None:
+            _trunc_row = _next_donor()
+        else:
+            console.out(f"  [Donor] truncation_split: reusing the recorded donor "
+                  f"{_trunc_row['bundle'][:44]}")
         _add("truncation_split", _trunc_row, [CASE_TRUNCATION],
              truncate_first_call=True,
              construction={
@@ -3241,8 +3480,38 @@ def main() -> int:
     for f in all_fixtures:
         covered.update(f["case_labels"])
 
+    # What this run cost. Priced from the recordings THIS run wrote, never from
+    # the directory: `all_fixtures` includes fixtures an earlier capture left
+    # there, and billing the operator for those would be a number that grows
+    # every time --only is used.
+    spend = stage5_cost_summary(written)
     console.out(f"\n{'=' * 78}")
     console.out(f"Wrote {len(written)} fixture(s); {len(all_fixtures)} in {root}")
+    console.out(
+        f"Stage 5 spend: ${spend['cost_usd']:.5f} over {spend['calls_priced']} "
+        f"call(s), {spend['input_tokens']:,} in / {spend['output_tokens']:,} out"
+        f"{'' if spend['cost_complete'] else '   <- A FLOOR, NOT A TOTAL'}"
+    )
+    if spend["excluded_fixture_ids"]:
+        console.out(
+            f"  excludes {len(spend['excluded_fixture_ids'])} fixture(s) whose "
+            f"recordings are copied from another fixture, which would "
+            f"double-bill: {', '.join(spend['excluded_fixture_ids'])}"
+        )
+    if not spend["cost_complete"]:
+        console.out(
+            f"  {spend['calls_unpriced']} call(s) on unpriced model(s) "
+            f"{', '.join(spend['unpriced_models'])} contribute NOTHING to the "
+            f"figure above; add them to PRICING_CONFIG (oncotriage/config.py)."
+        )
+    # Embeddings are EXCLUDED and that is not an oversight. The recordings store
+    # each embedding's input TEXT and model, never a token count, so pricing them
+    # would mean tokenizing here -- an estimate presented beside a measurement.
+    # They would also be incomplete: only the per-fixture query embeddings are
+    # recorded, while the cohort probe issues hundreds more that no fixture sees.
+    console.out("  Stage 5 only: embeddings are not priced (the recordings store "
+          "input text, not token counts) and the cohort probe's embeddings are "
+          "recorded nowhere.")
     console.out(f"Branch cases covered: {sorted(covered & set(ALL_BRANCH_CASES))}")
     uncovered = sorted(set(ALL_BRANCH_CASES) - covered)
     if uncovered:
