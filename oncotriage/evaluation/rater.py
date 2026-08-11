@@ -646,6 +646,98 @@ def choose_custom_id_form(decisions):
 #------------------------------------------------------------------------------
 
 
+def select_smoke_decisions(decisions, n):
+    """A deterministic N-decision slice that spans the corpus's strata.
+
+    A prefix slice is the wrong smoke test. The decisions are ordered by
+    (patient, trial, arm, index), so ``decisions[:20]`` is one patient, mostly
+    one trial, and whatever statuses that trial happened to produce -- it
+    exercises the API path but proves nothing about the parser's behaviour on
+    the vocabularies it will actually meet. This selects across every
+    (arm, status) cell present, then across patients, then fills by striding.
+
+    Guarantees, asserted before returning rather than assumed:
+      * every (arm, status) cell present in ``decisions`` is represented, which
+        subsumes "both arms" and "every status present";
+      * at least two patients, when the corpus has two;
+      * exactly ``min(n, len(decisions))`` decisions, no duplicates;
+      * a function of the input alone -- no clock, no randomness.
+    """
+    if n <= 0 or n >= len(decisions):
+        return list(decisions)
+
+    cells = OrderedDict()
+    for d in decisions:
+        cells.setdefault((d.arm, d.status), []).append(d)
+
+    if n < len(cells):
+        raise RaterRefusal(
+            f"--limit {n} cannot span this corpus: it holds {len(cells)} "
+            f"(arm, status) cells {sorted(cells)} and a smoke test that misses "
+            f"one proves nothing about the vocabulary it missed. Use "
+            f"--limit {len(cells)} or more.", code="limit_too_small")
+
+    chosen = OrderedDict()
+
+    # Phase A -- one from every (arm, status) cell, in sorted cell order,
+    # PREFERRING a patient not yet represented. Taking each cell's first
+    # member unconditionally can fill every slot from one patient (it does on
+    # this corpus at n=6, where the cell count equals the budget), leaving the
+    # two-patient guarantee unsatisfiable with no slots left to fix it.
+    patients = set()
+    for key in sorted(cells):
+        members = cells[key]
+        pick = next((m for m in members if m.patient_id not in patients),
+                    members[0])
+        chosen[pick.key] = pick
+        patients.add(pick.patient_id)
+
+    # Phase B -- a second patient, if the corpus has one and phase A missed it.
+    if len(patients) < 2:
+        for d in decisions:
+            if d.patient_id not in patients and len(chosen) < n:
+                chosen[d.key] = d
+                patients.add(d.patient_id)
+                break
+
+    # Phase C -- fill by striding the whole list, which spreads across
+    # patients and trials rather than clustering at the front.
+    if len(chosen) < n:
+        stride = max(1, len(decisions) // (n - len(chosen) + 1))
+        for start in range(stride):
+            for i in range(start, len(decisions), stride):
+                if len(chosen) >= n:
+                    break
+                d = decisions[i]
+                chosen.setdefault(d.key, d)
+            if len(chosen) >= n:
+                break
+    # Belt and braces: if striding still under-filled, take in run order.
+    for d in decisions:
+        if len(chosen) >= n:
+            break
+        chosen.setdefault(d.key, d)
+
+    picked = sorted(chosen.values(),
+                    key=lambda d: (d.patient_index, d.nct_id, d.arm, d.index))
+
+    got_cells = {(d.arm, d.status) for d in picked}
+    if got_cells != set(cells):
+        raise RaterRefusal(
+            f"smoke selection missed cells {sorted(set(cells) - got_cells)}",
+            code="smoke_selection_incomplete")
+    if len({d.patient_id for d in picked}) < min(
+            2, len({d.patient_id for d in decisions})):
+        raise RaterRefusal("smoke selection covers fewer than 2 patients",
+                           code="smoke_selection_incomplete")
+    if len(picked) != n or len({d.key for d in picked}) != n:
+        raise RaterRefusal(
+            f"smoke selection produced {len(picked)} decisions "
+            f"({len({d.key for d in picked})} distinct), expected {n}",
+            code="smoke_selection_incomplete")
+    return picked
+
+
 class RequestIndex(object):
     """The built requests plus everything needed to join results back."""
 
@@ -674,7 +766,7 @@ def build_requests(run, system_prompt, rubric_meta, model, max_tokens,
     record is third-party data under audit, and the data-boundary rule above
     says so. Putting audited data where instructions live would contradict it.
     """
-    decisions = run.decisions if not limit else run.decisions[:limit]
+    decisions = select_smoke_decisions(run.decisions, limit)
     form = choose_custom_id_form(decisions)
     patient_by_ordinal = {v: k for k, v in run.patient_order.items()}
 
@@ -874,6 +966,111 @@ def estimate_tokens(index, run, chars_per_token, cache_ttl,
             "input_tokens": int(round(decision_tok)),
             "output_tokens": int(round(output_tok)),
         },
+    }
+
+
+def measured_cache_report(usage_by_cid, index):
+    """What the API actually did with the cache, per request.
+
+    Hit rate is MEASURED here, never assumed. A request is a cache hit when it
+    reports cache_read_input_tokens > 0, a write when it reports
+    cache_creation_input_tokens > 0, and a full-price miss when it reports
+    neither -- in which case the whole prefix sits in input_tokens.
+    """
+    # COUNTED INDEPENDENTLY, NOT AS A PARTITION. A single response routinely
+    # reads one cached block and writes another -- on the full run 43 of 2,212
+    # did exactly that, reading the shared system prompt while writing that
+    # patient's record. An if/elif chain counts those as hits only and reports
+    # "0 writes" beside a five-figure write bill, which is how the first
+    # version of this function described the run that paid for 248,540 write
+    # tokens. Reads, writes and misses each get their own counter, and the
+    # overlap is reported rather than hidden.
+    reads = writes = misses = both = 0
+    prefix_sizes = []
+    uncached_tail = []
+    outputs = []
+    for cid, u in usage_by_cid.items():
+        read = u["cache_read_input_tokens"]
+        created = u["cache_creation_input_tokens"]
+        if read:
+            reads += 1
+        if created:
+            writes += 1
+        if read and created:
+            both += 1
+        if read or created:
+            # The whole cached prefix this request presented: what was served
+            # from cache plus what it had to write.
+            prefix_sizes.append(read + created)
+        else:
+            misses += 1
+        # With a cache read or write, input_tokens is the part of the prompt
+        # outside the cached prefix: the per-decision block plus envelope.
+        if read or created:
+            uncached_tail.append(u["input_tokens"])
+        outputs.append(u["output_tokens"])
+    hits = reads
+    n = len(usage_by_cid)
+    return {
+        "responses": n,
+        "cache_hits": hits, "cache_writes": writes, "full_price_misses": misses,
+        "responses_that_both_read_and_wrote": both,
+        "hit_rate": _rate(hits, n),
+        "write_rate": _rate(writes, n),
+        "mean_cached_prefix_tokens": (
+            sum(prefix_sizes) / float(len(prefix_sizes))
+            if prefix_sizes else None),
+        "mean_uncached_tail_tokens": (
+            sum(uncached_tail) / float(len(uncached_tail))
+            if uncached_tail else None),
+        "mean_output_tokens": (sum(outputs) / float(len(outputs))
+                               if outputs else None),
+    }
+
+
+def project_full_run(measured, run, model, cache_ttl, n_full):
+    """Project the full run from MEASURED token sizes, as a range.
+
+    WHY THIS IS STILL A RANGE, AND WHY THE SMOKE'S OWN HIT RATE IS NOT THE
+    PROJECTION. The smoke is deliberately spread across many patients to span
+    the strata, which is the WORST case for a per-patient cache: with one or
+    two requests per patient, almost every one is a write. The full run is the
+    opposite -- 95 to 298 requests per patient. Scaling the smoke's hit rate
+    linearly would therefore over-estimate badly, and quoting it as "the"
+    projection would be quoting the least representative number available.
+
+    What the smoke does supply, and what is used here, is the SIZE of each
+    component in real tokens: the cached prefix per patient, the per-decision
+    tail, and the output. Those scale honestly.
+    """
+    prefix = measured["mean_cached_prefix_tokens"]
+    tail = measured["mean_uncached_tail_tokens"]
+    out = measured["mean_output_tokens"]
+    if prefix is None or tail is None or out is None:
+        return None
+
+    counts = Counter(d.patient_id for d in run.decisions)
+    n_patients = len(counts)
+    write_key = ("cache_creation_1h" if cache_ttl == "1h"
+                 else "cache_creation_5m")
+
+    upper = {"input_tokens": int(round((prefix + tail) * n_full)),
+             "output_tokens": int(round(out * n_full))}
+    lower = {write_key: int(round(prefix * n_patients)),
+             "cache_read_input_tokens": int(round(prefix
+                                                  * (n_full - n_patients))),
+             "input_tokens": int(round(tail * n_full)),
+             "output_tokens": int(round(out * n_full))}
+    return {
+        "basis": "measured token sizes from the smoke batch, not chars/4",
+        "requests": n_full, "patients": n_patients,
+        "mean_cached_prefix_tokens": prefix,
+        "mean_uncached_tail_tokens": tail,
+        "mean_output_tokens": out,
+        "upper_bound_usage": upper,
+        "lower_bound_usage": lower,
+        "upper_bound_usd": price_usage(model, upper),
+        "lower_bound_usd": price_usage(model, lower),
     }
 
 
@@ -1113,7 +1310,9 @@ def _usage_totals():
     return {"input_tokens": 0, "output_tokens": 0,
             "cache_read_input_tokens": 0,
             "cache_creation_5m": 0, "cache_creation_1h": 0,
-            "cache_creation_input_tokens": 0}
+            "cache_creation_input_tokens": 0,
+            "breakdown_mismatch_tokens": 0, "breakdown_absent": 0,
+            "responses": 0}
 
 
 def _accumulate_usage(totals, usage):
@@ -1123,16 +1322,25 @@ def _accumulate_usage(totals, usage):
         getattr(usage, "cache_read_input_tokens", 0) or 0)
     created = getattr(usage, "cache_creation_input_tokens", 0) or 0
     totals["cache_creation_input_tokens"] += created
+    totals["responses"] += 1
     breakdown = getattr(usage, "cache_creation", None)
     if breakdown is not None:
         five = getattr(breakdown, "ephemeral_5m_input_tokens", 0) or 0
         hour = getattr(breakdown, "ephemeral_1h_input_tokens", 0) or 0
         totals["cache_creation_5m"] += five
         totals["cache_creation_1h"] += hour
+        # The breakdown is documented to sum to the total. RECONCILED rather
+        # than trusted: the two are priced at different rates, so a silent
+        # divergence would mis-price every write. Recorded, not raised -- a
+        # billing-report discrepancy must not destroy a run that has already
+        # spent the money.
+        if five + hour != created:
+            totals["breakdown_mismatch_tokens"] += abs(five + hour - created)
     else:
         # No breakdown: attribute to 5m, the cheaper write, so an unpriced
         # split cannot silently inflate the reported bill.
         totals["cache_creation_5m"] += created
+        totals["breakdown_absent"] += 1
 
 
 def submit_batches(client, chunks, state, state_path, tag):
@@ -1187,6 +1395,7 @@ def collect_results(client, batch_id, index, model):
     rated = {}
     unrated = {}
     usage = _usage_totals()
+    usage_by_cid = {}
     seen = set()
     stop_reasons = Counter()
 
@@ -1222,6 +1431,20 @@ def collect_results(client, batch_id, index, model):
 
         message = result.result.message
         _accumulate_usage(usage, message.usage)
+        u = message.usage
+        bd = getattr(u, "cache_creation", None)
+        usage_by_cid[cid] = {
+            "input_tokens": getattr(u, "input_tokens", 0) or 0,
+            "output_tokens": getattr(u, "output_tokens", 0) or 0,
+            "cache_read_input_tokens":
+                getattr(u, "cache_read_input_tokens", 0) or 0,
+            "cache_creation_input_tokens":
+                getattr(u, "cache_creation_input_tokens", 0) or 0,
+            "cache_creation_5m":
+                (getattr(bd, "ephemeral_5m_input_tokens", 0) or 0) if bd else 0,
+            "cache_creation_1h":
+                (getattr(bd, "ephemeral_1h_input_tokens", 0) or 0) if bd else 0,
+        }
         stop_reasons[message.stop_reason or "none"] += 1
 
         if message.stop_reason == "refusal":
@@ -1249,7 +1472,8 @@ def collect_results(client, batch_id, index, model):
 
     missing = set(index.by_custom_id) - seen
     return {"rated": rated, "unrated": unrated, "usage": usage,
-            "missing": missing, "stop_reasons": dict(stop_reasons)}
+            "usage_by_cid": usage_by_cid, "missing": missing,
+            "stop_reasons": dict(stop_reasons)}
 
 
 #------------------------------------------------------------------------------
@@ -1285,6 +1509,96 @@ def read_state(path):
 
 def _rate(numer, denom):
     return None if not denom else numer / float(denom)
+
+
+def confusion_matrix(pairs, categories):
+    """Square count matrix of (pipeline_status, rater_implied_status).
+
+    ``pairs`` is an iterable of two-tuples. ``categories`` fixes the row and
+    column order so the matrix is comparable across runs. A pair naming a
+    category outside the list raises rather than being dropped: a silently
+    discarded cell would lower N and inflate every rate computed from it.
+    """
+    idx = {c: i for i, c in enumerate(categories)}
+    m = [[0] * len(categories) for _ in categories]
+    for a, b in pairs:
+        if a not in idx or b not in idx:
+            raise RaterRefusal(
+                f"confusion_matrix: ({a!r}, {b!r}) falls outside the declared "
+                f"categories {categories!r}.", code="matrix_category")
+        m[idx[a]][idx[b]] += 1
+    return m
+
+
+def cohens_kappa(matrix, categories):
+    """Cohen's kappa, with everything needed to interpret it beside it.
+
+    WHAT KAPPA DOES AND DOES NOT CORRECT FOR. It discounts the agreement two
+    raters would reach by chance GIVEN THEIR MARGINAL DISTRIBUTIONS. On a
+    corpus that is 82% one category, two raters drawing independently from that
+    same distribution already agree ~70% of the time, and kappa removes that.
+
+    It does NOT detect a rater that simply never disagrees. Such a rater's
+    implied status equals the pipeline's on every decision, so observed
+    agreement is 1.0, the marginals are identical, and kappa is 1.0 -- the
+    correct value for perfect inter-rater agreement, and useless as a
+    sycophancy check. That is what ``rater_categories_used`` and the two
+    marginals below are for: a rater that never moves produces marginals
+    identical to the pipeline's, which is visible at a glance.
+
+    Returns a dict; ``kappa`` is None when it is undefined, with ``undefined``
+    naming why. Two cases produce that: an empty matrix, and expected agreement
+    of exactly 1.0 (every observation in one category for both raters), where
+    the denominator ``1 - Pe`` is zero. Neither is an error -- a degenerate
+    corpus has no chance-corrected answer, and returning 0.0 or 1.0 there would
+    be inventing one.
+    """
+    n = sum(sum(row) for row in matrix)
+    k = len(categories)
+    if not n:
+        return {"kappa": None, "undefined": "no rated decisions", "n": 0,
+                "observed_agreement": None, "expected_agreement": None,
+                "pipeline_prevalence": {}, "rater_prevalence": {},
+                "rater_categories_used": 0, "categories": list(categories)}
+
+    row_tot = [sum(matrix[i]) for i in range(k)]
+    col_tot = [sum(matrix[i][j] for i in range(k)) for j in range(k)]
+
+    po = sum(matrix[i][i] for i in range(k)) / float(n)
+    pe = sum((row_tot[i] / float(n)) * (col_tot[i] / float(n))
+             for i in range(k))
+
+    if abs(1.0 - pe) < 1e-12:
+        kappa, undefined = None, ("expected agreement is 1.0; every "
+                                  "observation falls in one category")
+    else:
+        kappa, undefined = (po - pe) / (1.0 - pe), None
+
+    return {
+        "kappa": kappa,
+        "undefined": undefined,
+        "n": n,
+        "observed_agreement": po,
+        "expected_agreement": pe,
+        "pipeline_prevalence": {categories[i]: _rate(row_tot[i], n)
+                                for i in range(k)},
+        "rater_prevalence": {categories[i]: _rate(col_tot[i], n)
+                             for i in range(k)},
+        "pipeline_counts": {categories[i]: row_tot[i] for i in range(k)},
+        "rater_counts": {categories[i]: col_tot[i] for i in range(k)},
+        "rater_categories_used": sum(1 for c in col_tot if c),
+        "categories": list(categories),
+        "matrix": [list(r) for r in matrix],
+    }
+
+
+def rater_implied_status(decision_status, rating):
+    """The status the rater's answer implies: the recorded one when it agreed,
+    its correction when it did not. This is the second rater's label, and it is
+    what makes a two-rater agreement statistic computable at all."""
+    if rating["status_verdict"] == "agree":
+        return decision_status
+    return rating["corrected_status"]
 
 
 def summarize(index, rated, unrated, run):
@@ -1365,6 +1679,49 @@ def summarize(index, rated, unrated, run):
     total_rated = sum(d["rated"] for d in per_status.values())
     total_agree = sum(d["agree"] for d in per_status.values())
 
+    # Chance-corrected agreement. Per arm over that arm's own three-category
+    # vocabulary, and once over the five-category union.
+    #
+    # THE UNION FIGURE IS REPORTED WITH A CAVEAT, not silently. An inclusion
+    # decision can never carry an exclusion status and vice versa, so the union
+    # matrix is block structured and part of what the overall kappa rewards is
+    # the two raters agreeing about which ARM a criterion sits in -- which is
+    # given by the input, not judged. The per-arm figures are the ones that
+    # measure judgement; the union figure is included because it is the number
+    # a reader expects to see and omitting it invites a worse hand-rolled one.
+    pairs_by_arm = {arm: [] for arm in ARMS}
+    for cid, decision in index.by_custom_id.items():
+        rating = rated.get(cid)
+        if rating is None:
+            continue
+        pairs_by_arm[decision.arm].append(
+            (decision.status, rater_implied_status(decision.status, rating)))
+
+    union_categories = []
+    for arm in ARMS:
+        for st in ARM_STATUSES[arm]:
+            if st not in union_categories:
+                union_categories.append(st)
+
+    agreement = {}
+    for arm in ARMS:
+        cats = list(ARM_STATUSES[arm])
+        agreement[arm] = cohens_kappa(
+            confusion_matrix(pairs_by_arm[arm], cats), cats)
+    all_pairs = [p for arm in ARMS for p in pairs_by_arm[arm]]
+    agreement["overall_union"] = cohens_kappa(
+        confusion_matrix(all_pairs, union_categories), union_categories)
+    agreement["overall_union"]["caveat"] = (
+        "computed over the five-category union of both arm vocabularies; part "
+        "of the agreement it credits is arm separability, which is given by "
+        "the input rather than judged. Prefer the per-arm figures.")
+    agreement["interpretation"] = (
+        "Cohen's kappa discounts the agreement two raters reach by chance "
+        "GIVEN their marginal distributions. It does NOT detect a rater that "
+        "never disagrees: such a rater scores kappa 1.0. Compare "
+        "pipeline_prevalence with rater_prevalence -- a rater that never moves "
+        "reproduces the pipeline's marginals exactly.")
+
     return {
         "note": ("Agreement between an independent rater and the recorded "
                  "decisions. AGREEMENT, not accuracy: the rater is a "
@@ -1378,6 +1735,7 @@ def summarize(index, rated, unrated, run):
         "overall_agreement_rate": _rate(total_agree, total_rated),
         "overall_agree": total_agree,
         "overall_disagree": total_rated - total_agree,
+        "chance_corrected_agreement": agreement,
         "per_arm": {k: per_arm[k] for k in sorted(per_arm)},
         "per_arm_and_recorded_status": {k: per_status[k]
                                         for k in sorted(per_status)},
@@ -1435,6 +1793,33 @@ def print_summary(summary, top_n=30):
         console.out(f"    {key:<28}{d['rated']:>7}{d['agree']:>7}"
                     f"{d['disagree']:>10}{_fmt_rate(d['agreement_rate']):>8}"
                     f"{d['unrated']:>9}")
+
+    console.out("")
+    console.out("  Chance-corrected agreement (Cohen's kappa)")
+    cca = summary.get("chance_corrected_agreement") or {}
+    console.out("    " + cca.get("interpretation", ""))
+    for key in [a for a in ARMS if a in cca] + ["overall_union"]:
+        k = cca.get(key)
+        if not k:
+            continue
+        if k["kappa"] is None:
+            console.out(f"    {key:<16} kappa  undefined  "
+                        f"({k['undefined']}), n={k['n']}")
+        else:
+            console.out(f"    {key:<16} kappa {k['kappa']:+.4f}   "
+                        f"observed {k['observed_agreement'] * 100:5.1f}%   "
+                        f"expected {k['expected_agreement'] * 100:5.1f}%   "
+                        f"n={k['n']}   rater used "
+                        f"{k['rater_categories_used']}/"
+                        f"{len(k['categories'])} categories")
+        console.out(f"    {'':<16} prevalence (pipeline -> rater)")
+        for cat in k["categories"]:
+            pp = k["pipeline_prevalence"].get(cat)
+            rp = k["rater_prevalence"].get(cat)
+            console.out(f"    {'':<18}{cat:<16}"
+                        f"{_fmt_rate(pp)} ({k['pipeline_counts'][cat]:>5})"
+                        f"  ->  {_fmt_rate(rp)} "
+                        f"({k['rater_counts'][cat]:>5})")
 
     console.out("")
     console.out("  patient_value support (rated decisions)")
@@ -1783,6 +2168,22 @@ def main(argv=None):
         if args.submit:
             plan = _report_plan(run, index, out_dir, args, cache_ttl)
             console.out("")
+            if args.limit:
+                console.out("")
+                console.out(f"  SMOKE SELECTION -- {len(index.requests)} "
+                            f"requests, chosen to span every (arm, status) "
+                            f"cell and multiple patients:")
+                cells = Counter()
+                for req in index.requests:
+                    d = index.by_custom_id[req["custom_id"]]
+                    cells[(d.arm, d.status)] += 1
+                    console.out(f"    {req['custom_id']}   {d.arm}/{d.status}")
+                console.out("    cells covered: "
+                            + ", ".join(f"{a}/{st}={n}"
+                                        for (a, st), n in sorted(cells.items())))
+                console.out(f"    patients: "
+                            f"{len({index.by_custom_id[r['custom_id']].patient_id for r in index.requests})}")
+            console.out("")
             console.out("  SUBMITTING. Batch ids are printed as they are "
                         "created and written to")
             console.out(f"  {state_path} -- an interrupted session resumes "
@@ -1805,6 +2206,7 @@ def main(argv=None):
 
         rated, unrated = {}, {}
         usage = _usage_totals()
+        usage_by_cid = {}
         stop_reasons = Counter()
         for bid in batch_ids:
             poll_batch(client, bid, args.poll_seconds, args.poll_timeout)
@@ -1814,6 +2216,7 @@ def main(argv=None):
                 unrated[cid] = u
             for k, v in got["usage"].items():
                 usage[k] += v
+            usage_by_cid.update(got["usage_by_cid"])
             stop_reasons.update(got["stop_reasons"])
 
         for cid in set(index.by_custom_id) - set(rated) - set(unrated):
@@ -1855,6 +2258,7 @@ def main(argv=None):
                     retried.add(cid)
                 for k, v in got["usage"].items():
                     usage[k] += v
+                usage_by_cid.update(got["usage_by_cid"])
                 stop_reasons.update(got["stop_reasons"])
         elif retryable:
             console.out(f"  {len(retryable)} retryable failure(s) left "
@@ -1867,6 +2271,9 @@ def main(argv=None):
 
     # ---- persist -------------------------------------------------------
     actual_cost = price_usage(args.model, usage)
+    measured = measured_cache_report(usage_by_cid, index)
+    projection = project_full_run(measured, run, args.model,
+                                  cache_ttl or "5m", len(run.decisions))
     rows = build_rating_rows(index, rated, unrated, retried)
     summary = summarize(index, rated, unrated, run)
     fenced = sum(1 for r in rows if r.get("response_was_fenced"))
@@ -1903,6 +2310,9 @@ def main(argv=None):
             "stop_reasons": dict(stop_reasons),
         },
         "usage": usage,
+        "usage_by_custom_id": usage_by_cid,
+        "measured_cache": measured,
+        "full_run_projection_from_measured": projection,
         "cost": {
             "actual_usd": actual_cost,
             "basis": "measured from the batch results' usage objects at batch "
@@ -1930,8 +2340,50 @@ def main(argv=None):
                 f"cache-write {usage['cache_creation_input_tokens']:>9}   "
                 f"cache-read {usage['cache_read_input_tokens']:>9}   "
                 f"out {usage['output_tokens']:>8}")
+    rates = rater_pricing(args.model)
+    console.out("  cost by component, each at its stacked rate "
+                "(multiplier x batch discount):")
+    for label, tok, rate in (
+            ("uncached input", usage["input_tokens"], rates["input"]),
+            ("cache read", usage["cache_read_input_tokens"],
+             rates["cache_read"]),
+            ("cache write 5m", usage["cache_creation_5m"],
+             rates["cache_write_5m"]),
+            ("cache write 1h", usage["cache_creation_1h"],
+             rates["cache_write_1h"]),
+            ("output", usage["output_tokens"], rates["output"])):
+        console.out(f"    {label:<16}{tok:>10} tok  x "
+                    f"${rate * 1e6:7.4f}/Mtok  = ${tok * rate:9.4f}")
     console.out(f"  ACTUAL COST  ${actual_cost:,.4f}   "
                 f"(batch prices, from the returned usage objects)")
+    console.out("")
+    console.out(f"  measured cache over {measured['responses']} responses: "
+                f"{measured['cache_hits']} read "
+                f"({_fmt_rate(measured['hit_rate'])}), "
+                f"{measured['cache_writes']} wrote "
+                f"({_fmt_rate(measured['write_rate'])}), of which "
+                f"{measured['responses_that_both_read_and_wrote']} did both; "
+                f"{measured['full_price_misses']} full-price misses")
+    if usage["breakdown_mismatch_tokens"] or usage["breakdown_absent"]:
+        console.out(f"  cache_creation breakdown discrepancies: "
+                    f"{usage['breakdown_mismatch_tokens']} tokens, "
+                    f"{usage['breakdown_absent']} responses with no breakdown")
+    else:
+        console.out("  cache_creation breakdown reconciles: 5m + 1h == total "
+                    "on every response")
+    if projection and args.limit:
+        console.out("")
+        console.out(f"  FULL-RUN PROJECTION from measured token sizes "
+                    f"({projection['requests']} requests, "
+                    f"{projection['patients']} patients)")
+        console.out(f"    mean cached prefix "
+                    f"{projection['mean_cached_prefix_tokens']:.0f} tok  "
+                    f"tail {projection['mean_uncached_tail_tokens']:.0f} tok  "
+                    f"output {projection['mean_output_tokens']:.0f} tok")
+        console.out(f"    upper bound (no cache hits)   "
+                    f"${projection['upper_bound_usd']:,.2f}")
+        console.out(f"    lower bound (one write/patient)"
+                    f"${projection['lower_bound_usd']:,.2f}")
     console.out(f"  wall time    {manifest['wall_time_s']}s")
     console.out(f"  written to   {out_dir}")
 
