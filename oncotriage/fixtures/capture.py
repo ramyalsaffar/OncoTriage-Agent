@@ -1459,6 +1459,59 @@ def read_recorded_donor_bundle(path: str) -> str:
     return None
 
 
+# How choose_pool_donor() answered. A CLOSED set, so a caller may branch on it
+# exhaustively and a new member is a change every caller has to see rather than
+# a string that silently falls through an if/elif chain. Same shape as
+# agent.deps.RESOLUTION_STATES and agent.state.TRIAL_VERDICTS.
+DONOR_FROM_MEMORY = "from_memory"      # the recorded donor was still available
+DONOR_NO_MEMORY = "no_memory"          # nothing recorded a donor to reuse
+DONOR_NOT_IN_POOL = "not_in_pool"      # recorded, but no longer selectable
+DONOR_OUTCOMES = (DONOR_FROM_MEMORY, DONOR_NO_MEMORY, DONOR_NOT_IN_POOL)
+
+
+def choose_pool_donor(recorded_bundle: str, donors: List[Dict]) -> tuple:
+    """Pick the donor for a fixture that derives NOTHING from its bundle.
+
+    Returns ``(donor, outcome)`` where outcome is one of ``DONOR_OUTCOMES``.
+    ``donor`` is None for both fallback outcomes, and the caller is expected to
+    take the next pool donor and to print WHY -- the reason is a fact about this
+    run that the operator has to see, and printing it here would put I/O in a
+    function whose whole value is being callable without a paid capture.
+
+    ``truncation_split`` is the caller. It runs a real, unmodified cohort bundle
+    and injects the truncation into the RESPONSE, so its donor has no recipe to
+    satisfy -- the only predicate is the one the donor pool already encodes: an
+    ordinary patient (MeSH resolved, stage known) that no other fixture in this
+    run has taken.
+
+    MEMBERSHIP IN THE REMAINING POOL, NOT IN THE COHORT, IS THE PREDICATE, and
+    that is deliberate. A recorded donor this run has already selected as an
+    ablation or a normal is NOT reusable: two fixtures on one patient would
+    differ only by the injected truncation, and the retrieval half of both is
+    then the same run recorded twice -- the same argument the ablation selection
+    makes for taking a distinct patient per config.
+
+    THE ONE SIDE EFFECT IS THE POINT: a reused donor is POPPED from ``donors``,
+    which is what stops a later ``_next_donor()`` handing the same patient out a
+    second time. The list is mutated in place, so the caller's pool is the same
+    object this function shortens. Nothing else is touched -- no file is read
+    (the fixture read is ``read_recorded_donor_bundle()`` at the call site), no
+    path resolved, nothing printed.
+    """
+    if not recorded_bundle:
+        return None, DONOR_NO_MEMORY
+    for index, candidate in enumerate(donors):
+        # candidate["bundle"], not .get("bundle"): a pool row without a bundle
+        # name is a malformed selection, and the loud KeyError this raises is
+        # what the nested version raised. `.get` would skip such a row silently
+        # and fall through to "recorded donor no longer available" -- a wrong
+        # diagnosis for a broken pool, and a donor repointed on the strength of
+        # it.
+        if candidate["bundle"] == recorded_bundle:
+            return donors.pop(index), DONOR_FROM_MEMORY
+    return None, DONOR_NOT_IN_POOL
+
+
 def list_fixtures(root: str = None) -> List[str]:
     """Every fixture in the directory.
 
@@ -3081,39 +3134,37 @@ def main() -> int:
         return None
 
     def _recorded_pool_donor(derived_id: str) -> Dict:
-        """The recorded donor of a fixture that derives NOTHING from the bundle.
+        """I/O and reporting around ``choose_pool_donor()``.
 
-        ``truncation_split`` runs a real, unmodified cohort bundle and injects
-        the truncation into the RESPONSE, so its donor has no recipe to satisfy
-        -- the only predicate is the one the donor pool already encodes: an
-        ordinary patient (MeSH resolved, stage known) that no other fixture in
-        this run has taken. So the recorded donor is reused only when it is
-        still in the REMAINING pool, and it is popped from that pool when it is.
+        The DECISION is module-level and pure so it can be exercised without a
+        paid capture -- reaching this nested wrapper means running main() past
+        `if not args.scan_only`, which captures fixtures with live billed Stage
+        5 calls, so anything left in here is untestable for free. What stays is
+        exactly the part that cannot be pure: resolving the path, reading the
+        file, and printing why a fallback happened.
 
-        Membership in the remaining pool, rather than in the cohort, is the
-        predicate on purpose. A recorded donor that this run has already
-        selected as an ablation or a normal is NOT reusable: two fixtures on one
-        patient differ only by the injected truncation, and the retrieval half
-        of both is then the same run recorded twice -- which is the same
-        argument the ablation selection makes for taking a distinct patient per
-        config. Popping is what stops a later ``_next_donor()`` handing the same
-        patient out a second time.
+        THE ABSENT-FILE CASE IS SILENT AND THE EMPTY-MEMORY CASE IS NOT, which
+        is why the existence check is here rather than folded into the read.
+        ``read_recorded_donor_bundle()`` answers None for both, but they are
+        different events: no file at all is the FIRST capture of this fixture
+        and there is nothing to report, while a file that exists and records no
+        donor means memory was expected and is missing.
         """
         path = fixture_path(derived_id, root)
         if not os.path.exists(path):
             return None
+        # Read ONCE. The name is needed again for the not-in-pool message, and a
+        # second read is both wasted I/O and a chance for the two to disagree.
         bundle = read_recorded_donor_bundle(path)
-        if not bundle:
+        donor, outcome = choose_pool_donor(bundle, donors)
+        if outcome == DONOR_NO_MEMORY:
             console.out(f"  [Donor] {derived_id}: the existing fixture records no "
                   f"donor bundle; taking the next pool donor.")
-            return None
-        for index, candidate in enumerate(donors):
-            if candidate["bundle"] == bundle:
-                return donors.pop(index)
-        console.out(f"  [Donor] {derived_id}: recorded donor {bundle[:44]} is no "
-              f"longer an available donor (taken by another fixture this run, "
-              f"or no longer an ordinary patient); taking the next pool donor.")
-        return None
+        elif outcome == DONOR_NOT_IN_POOL:
+            console.out(f"  [Donor] {derived_id}: recorded donor {bundle[:44]} is no "
+                  f"longer an available donor (taken by another fixture this run, "
+                  f"or no longer an ordinary patient); taking the next pool donor.")
+        return donor
 
     # --- no_candidates -----------------------------------------------------
     if selection.get(CASE_NO_CANDIDATES):
