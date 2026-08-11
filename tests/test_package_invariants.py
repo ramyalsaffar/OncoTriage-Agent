@@ -3595,6 +3595,15 @@ _DECORATOR_INVENTORY = {
     # four-field join key; it carries no behaviour and is pinned here because
     # this check pins every decorated definition, not because it is delicate.
     "oncotriage/evaluation/rater.py::Decision.key": ["property"],
+    # The Ragas harness, on exactly the same footing as Decision.key above:
+    # each is a plain read-only accessor over that sample type's join key --
+    # (patient_id,) for a retrieval sample, (patient_id, nct_id) for a
+    # generation one -- read by the deterministic sort in load_run(). They
+    # carry no behaviour and are pinned because this check pins every
+    # decorated definition in the package, not because they are delicate.
+    "oncotriage/evaluation/ragas_harness.py::RetrievalSample.key": ["property"],
+    "oncotriage/evaluation/ragas_harness.py::GenerationSample.key":
+        ["property"],
     # ---- The MCP pass ----------------------------------------------------
     # The stdio server and the trial lookup it wraps. Five of these six are in
     # oncotriage/mcp/server.py and one is the lookup's paging-free scroll.
