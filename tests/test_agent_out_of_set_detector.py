@@ -753,15 +753,31 @@ print("SECTION 3b -- identical duplicates collapse, conflicting ones do not "
 print("=" * 75)
 
 # IDENTICAL: one entry survives, and it is the FIRST answer -- checked on the
-# assessment text, because the two entries are otherwise indistinguishable and
+# assessment DRAFT, because the two entries are otherwise indistinguishable and
 # an assertion that could not tell them apart would pass either way.
+#
+# IT USED TO READ `assessment`, AND SINCE PROMPT_VERSION 1.5.0 THAT FIELD CANNOT
+# DISCRIMINATE. Stage 5 now composes the stored assessment from the criteria
+# arrays (evaluation.py:compose_assessment), and these two entries carry
+# IDENTICAL arrays by construction -- that is what makes them identical
+# duplicates -- so both collapse to the same composed string and the check would
+# pass whichever survived. `assessment_draft` is the model's own text, snapshot
+# before any validator runs, and it is the only per-entry field left that still
+# tells the two apart. The non-degeneracy probe below is what says so.
 _ident, _ident_err = run_stage5(
     [entry(SENT, "eligible", inclusion=[crit("met")], assessment="first"),
      entry(SENT, "eligible", inclusion=[crit("met")], assessment="second")],
     nct_ids=(SENT,))
 check("identical duplicates leave one evaluation", ids_of(_ident), [SENT])
 check("...and it is the FIRST answer, not the last",
-      [e.get("assessment") for e in _ident["evaluations"]], ["first"])
+      [e.get("assessment_draft") for e in _ident["evaluations"]], ["first"])
+check("...non-degeneracy: the two drafts really were distinguishable, and the "
+      "composed assessment really is not (which is why the check above moved "
+      "off it)",
+      ("first" != "second",
+       [e.get("assessment") for e in _ident["evaluations"]]
+       != ["first"]),
+      (True, True))
 check("...which keeps its verdict", verdict_of(_ident, SENT),
       TRIAL_VERDICT_ELIGIBLE)
 check("...and is not recorded as a non-evaluation",

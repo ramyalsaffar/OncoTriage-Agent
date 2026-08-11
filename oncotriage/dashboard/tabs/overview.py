@@ -386,7 +386,28 @@ def render_overview_tab(df):
         
         if not filtered_tm.empty:
             explanations = filtered_tm['assessment'].fillna('').str.lower()
-            
+
+            # THIS PANEL READS FREE PROSE AND THE COLUMN STOPPED BEING FREE
+            # PROSE AT PROMPT_VERSION 1.5.0. `assessment` is now composed from
+            # the criteria arrays for every eligible / not_eligible row
+            # (oncotriage/agent/evaluation.py:compose_assessment), so a
+            # model-written phrasing like "stage not specified" no longer
+            # occurs: an undocumented criterion is rendered as
+            # `Not documented in the patient record: "<criterion text>"`.
+            # The phrase lists below therefore match ROWS WRITTEN BEFORE 1.5.0
+            # and increasingly little else, and this panel under-reports on a
+            # fresh corpus rather than reporting nothing -- single words that
+            # occur in criterion text ("staging", "histology") still hit.
+            #
+            # THE FIX IS NOT A LONGER PHRASE LIST. The fact this panel wants is
+            # in `criterion_details` on the same row, exactly and without
+            # parsing prose: a criterion whose patient_value is "Not in patient
+            # record" IS the missing data point, and its `criterion` text is
+            # what says which category it belongs to. Rewriting the panel onto
+            # that column is a recorded follow-up; it is a redesign of an
+            # untested render path and was deliberately not folded into the
+            # pass that changed the column's meaning.
+            #
             # Keywords indicating missing/unavailable clinical data in GPT-4o explanations
             missing_data_keywords = {
                 'Cancer Stage':       ['stage not specified', 'stage unknown', 'stage not documented',

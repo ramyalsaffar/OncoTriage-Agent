@@ -1585,6 +1585,22 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 match.get("mesh_boost_tier"),
                 match.get("match_score", 0.0),
                 match.get("eligible", "not_eligible"),
+                # WHAT THIS COLUMN MEANS CHANGED AT PROMPT_VERSION 1.5.0, and
+                # nothing about the write did. For an "eligible" or a
+                # "not_eligible" trial this is no longer the model's free-written
+                # draft: it is a rendering COMPOSED by
+                # oncotriage/agent/evaluation.py:compose_assessment out of the
+                # criterion / patient_value / status rows stored beside it in
+                # criterion_details, so the two can no longer contradict each
+                # other. For a "not_evaluable" trial it is still the model's own
+                # text, because that trial's arrays are empty by contract and
+                # there is nothing to compose from. The draft is NOT stored here
+                # and gets no column of its own; it survives in
+                # inferences.llm_classifier_raw_response only for a run that
+                # made ONE call, because that column is assigned per chunk
+                # rather than appended (see the block above compose_assessment
+                # in oncotriage/agent/evaluation.py).
+                # A row written before 1.5.0 carries the draft.
                 match.get("assessment", ""),
                 criterion_json,
                 match.get("score_confirmed"),

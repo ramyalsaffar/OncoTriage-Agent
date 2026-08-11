@@ -924,6 +924,248 @@ def _unevaluable_entry(trial_obj: Dict, reason: str) -> Dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# The stored assessment is composed, not quoted (PROMPT_VERSION 1.5.0)
+# ---------------------------------------------------------------------------
+#
+# WHAT WAS WRONG. Section 5 orders the model to write `assessment` FIRST, as its
+# reasoning, and that draft was then stored verbatim as the trial's assessment.
+# Those are two jobs and the draft is only good at one of them. Audited
+# assessments contradicted their own criteria arrays in three ways: they called
+# a field "not documented" while the arrays quoted a value for it from the
+# record; they named numeric thresholds that appear nowhere in the trial's
+# criteria text; and one emitted both mandated openings at once ("No known
+# disqualifiers" and "Known disqualifier:"). The arrays were right in every one
+# of those cases. The stored prose was not, and the stored prose is what a
+# reader sees.
+#
+# WHY NOT JUST REORDER THE EMISSION. Because it is not available. Strict
+# Structured Outputs emits a trial object's keys ALPHABETICALLY, regardless of
+# the schema's `properties` order -- measured, and argued at length in
+# oncotriage/agent/response_schema.py. `assessment` sorts before `eligible` and
+# before both criteria arrays, so there is no arrangement of field names that
+# lets the model write its criteria before its prose. Reasoning-first is
+# therefore kept: the draft still decides the verdict, and
+# `reasoning_order_regression` still watches for a response that inverted it.
+#
+# WHAT IS DONE INSTEAD. The model contract is unchanged -- same fields, same
+# order, same schema -- and the STORED assessment for an `eligible` or
+# `not_eligible` trial is composed here, mechanically, out of the criterion /
+# patient_value / status rows the model returned. A composed assessment cannot
+# assert anything the arrays do not carry, because there is no other input to
+# it. The draft is kept beside it under `assessment_draft`, IN MEMORY ONLY:
+# no database column was added, so it reaches node_finalize, the API response
+# and a run artifact, and it does not reach `trial_matches`.
+#
+# WHAT THAT COSTS, STATED RATHER THAN GLOSSED. The reason given for adding no
+# column was that the draft is already durable in
+# inferences.llm_classifier_raw_response -- and THAT IS TRUE ONLY OF A RUN THAT
+# MADE ONE CALL. `response_text` above is ASSIGNED per chunk, not appended, so
+# a run that split (a truncation, or an over-ceiling estimate) stores the LAST
+# chunk's raw text and nothing else. The drafts of every trial in every earlier
+# chunk are then unrecoverable from the database. That is a pre-existing
+# property of the raw-response column, not something this change introduced --
+# a split run's stored "raw response" has never contained most of its own
+# verdicts -- but this change is the first thing to depend on it, so it is
+# recorded here rather than left for a reader to discover from a missing
+# answer. The fix is to accumulate the chunks into that column; it is a change
+# to a stored column's contents and belongs to its own pass.
+#
+# A `not_evaluable` trial's arrays are EMPTY BY CONTRACT (Section 1), so there
+# is nothing to compose from and the model's own text -- which the prompt
+# requires to open "Not evaluable:" and to say what was missing from the
+# TRIAL's criteria text, not from the patient's record -- is kept unchanged.
+
+# The three mandated openings, as constants rather than as literals typed at
+# each site. The first two are what this module now WRITES; all three are what
+# the prompt tells the model to write, and the pair has to stay in step -- a
+# composed opening that no longer matches the prompt's instruction would make
+# the stored text disagree with the draft it replaced for a formatting reason.
+ASSESSMENT_ELIGIBLE_OPENING = "No known disqualifiers."
+ASSESSMENT_NOT_ELIGIBLE_OPENING = "Known disqualifier:"
+ASSESSMENT_NOT_EVALUABLE_OPENING = "Not evaluable:"
+
+# The clause an eligible assessment carries when the model recorded criteria it
+# could not evaluate. It is the ONLY source of a "not documented" claim in a
+# composed assessment.
+ASSESSMENT_UNDOCUMENTED_OPENING = "Not documented in the patient record:"
+
+# THE ONE patient_value that licenses that clause. Section 5 mandates this exact
+# string, and it is deliberately NOT `_is_absent_patient_value` from the
+# absent-data validator below: that predicate carries twenty synonyms and nine
+# prefixes, on purpose, because its job is to CATCH a disqualification the model
+# should not have made. Reusing it here would invert its direction -- a
+# free-written patient_value would become a positive claim about the record in
+# text a clinician reads. Whitespace and case are tolerated because they are
+# transcription, not vocabulary; nothing else is.
+ASSESSMENT_UNDOCUMENTED_PATIENT_VALUE = "Not in patient record"
+
+# status -> how a composed line words it. The two disqualifying statuses, one
+# per arm (Section 1). Both arms are scanned for both statuses: by the time
+# this runs, `_normalize_arm` has already resolved a cross-arm status away, so
+# in the pipeline the map is per-arm in effect -- but this function is pure and
+# is unit-tested on synthetic verdicts, and a renderer that silently dropped a
+# row it was handed would be reporting fewer disqualifiers than the record
+# holds.
+_DISQUALIFYING_STATUS_PHRASES = {
+    "not_met": "not met",
+    "violated": "violated",
+}
+
+_NOT_EVALUABLE_STATUS = "not_evaluable"
+
+# What compose_assessment did, as a closed vocabulary. A caller counts these so
+# the path taken is recorded rather than inferred -- and so the two members that
+# should be UNREACHABLE in the pipeline are visible if they ever occur.
+ASSESSMENT_COMPOSED_ELIGIBLE = "composed_eligible"
+ASSESSMENT_COMPOSED_NOT_ELIGIBLE = "composed_not_eligible"
+ASSESSMENT_KEPT_NOT_EVALUABLE = "kept_draft_not_evaluable"
+ASSESSMENT_KEPT_NO_DISQUALIFIER = "kept_draft_no_disqualifying_row"
+ASSESSMENT_KEPT_UNKNOWN_VERDICT = "kept_draft_unknown_verdict"
+
+ASSESSMENT_CASES = (
+    ASSESSMENT_COMPOSED_ELIGIBLE,
+    ASSESSMENT_COMPOSED_NOT_ELIGIBLE,
+    ASSESSMENT_KEPT_NOT_EVALUABLE,
+    ASSESSMENT_KEPT_NO_DISQUALIFIER,
+    ASSESSMENT_KEPT_UNKNOWN_VERDICT,
+)
+
+# The two that cannot happen if the node's own normalizer ran: Step 3 sets
+# `not_eligible` only when a surviving row carries a disqualifying status, and
+# Step 0 resolves every verdict into the three-member trial vocabulary. Counted
+# module-level, on the AGE_PARSE_FAILURES footing, because they would mean the
+# composition ran against a verdict the normalizer had not produced.
+ASSESSMENT_COMPOSITION_ANOMALIES = Counter()
+
+_ASSESSMENT_ANOMALY_CASES = (ASSESSMENT_KEPT_NO_DISQUALIFIER,
+                             ASSESSMENT_KEPT_UNKNOWN_VERDICT)
+
+
+def _criteria_rows(verdict: Dict):
+    """[(arm, row)] over both criteria arrays, inclusion first, in array order.
+
+    Non-list arrays and non-dict rows are skipped rather than raised on: this
+    runs after `_normalize_arm` has already dropped both shapes in the pipeline,
+    and the function must be total over a hand-built dict in a test.
+
+    INCLUSION BEFORE EXCLUSION, which is the order `_compute_match_score` walks
+    the arms and the order Step 3 checks them -- not the alphabetical order the
+    decoder emits them in. Either is deterministic; this one keeps every place
+    in the file that iterates both arms reading the same way.
+    """
+    for arm, key in (("inclusion", "inclusion_criteria"),
+                     ("exclusion", "exclusion_criteria")):
+        rows = verdict.get(key)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if isinstance(row, dict):
+                yield arm, row
+
+
+def _row_text(row: Dict, field: str) -> str:
+    """One quoted field of one criterion row, as a string, whitespace-trimmed.
+
+    Trimming is the ONLY transformation applied to model text on its way into a
+    composed assessment. Nothing is rephrased, truncated, capitalised or
+    re-punctuated: the composed text's whole claim is that every clinical
+    statement in it was written by the model into the arrays, and a renderer
+    that edited the words would be making that claim about words it had changed.
+    """
+    value = row.get(field, "")
+    return value.strip() if isinstance(value, str) else str(value).strip()
+
+
+def _is_undocumented_row(row: Dict) -> bool:
+    """True for a row that says, in the arrays, that the record has no data.
+
+    Both halves are required. A `not_evaluable` status alone does not license
+    the claim -- the prompt's RULE 1 also produces it for a criterion whose
+    components are partly documented -- and the canonical patient_value alone
+    does not either, because a row carrying it under any other status is a row
+    whose status contradicts its own value.
+    """
+    return (row.get("status") == _NOT_EVALUABLE_STATUS
+            and _row_text(row, "patient_value").casefold()
+            == ASSESSMENT_UNDOCUMENTED_PATIENT_VALUE.casefold())
+
+
+def assessment_composition_case(verdict: Dict) -> str:
+    """Which member of ASSESSMENT_CASES applies to this verdict.
+
+    Separated from compose_assessment so the caller can COUNT the path taken
+    without re-deriving the branch, and so the two cannot disagree:
+    compose_assessment calls this and branches on its answer. One decision, two
+    entry points.
+    """
+    label = verdict.get("eligible")
+    if label == TRIAL_VERDICT_NOT_EVALUABLE:
+        return ASSESSMENT_KEPT_NOT_EVALUABLE
+    if label == TRIAL_VERDICT_ELIGIBLE:
+        return ASSESSMENT_COMPOSED_ELIGIBLE
+    if label == TRIAL_VERDICT_NOT_ELIGIBLE:
+        for _arm, row in _criteria_rows(verdict):
+            if row.get("status") in _DISQUALIFYING_STATUS_PHRASES:
+                return ASSESSMENT_COMPOSED_NOT_ELIGIBLE
+        # A rejection with nothing in the arrays to justify it. Composing
+        # "Known disqualifier:" here would fabricate the one thing this whole
+        # mechanism exists to stop: a claim the arrays do not carry.
+        return ASSESSMENT_KEPT_NO_DISQUALIFIER
+    return ASSESSMENT_KEPT_UNKNOWN_VERDICT
+
+
+def compose_assessment(verdict: Dict) -> str:
+    """The text to STORE as this trial's assessment.
+
+    PURE. It reads one dict and returns a string; it opens nothing, counts
+    nothing and mutates nothing, so it is unit-testable on a literal and the
+    caller owns the recording of which case fired.
+
+    For the two composed cases the returned text is a function of the criteria
+    arrays alone, which is the property the whole change rests on: every
+    clinical statement in it was written by the model into a `criterion` or a
+    `patient_value`, and no number, threshold, unit or "not documented" claim
+    can enter it from anywhere else. The scaffolding words this function adds
+    contain no digits, so a numeric token in the output came from a row.
+
+    For the three kept cases it returns `verdict["assessment"]` UNCHANGED --
+    the model's draft. That is not a silent fallback: the caller asks
+    assessment_composition_case() for the same answer and logs it, and the two
+    unreachable cases also land in ASSESSMENT_COMPOSITION_ANOMALIES.
+    """
+    case = assessment_composition_case(verdict)
+
+    if case == ASSESSMENT_COMPOSED_NOT_ELIGIBLE:
+        sentences = []
+        for arm, row in _criteria_rows(verdict):
+            phrase = _DISQUALIFYING_STATUS_PHRASES.get(row.get("status"))
+            if phrase is None:
+                continue
+            sentences.append(
+                f'{arm.capitalize()} criterion "{_row_text(row, "criterion")}" '
+                f'{phrase}; patient record: '
+                f'"{_row_text(row, "patient_value")}".')
+        return f"{ASSESSMENT_NOT_ELIGIBLE_OPENING} " + " ".join(sentences)
+
+    if case == ASSESSMENT_COMPOSED_ELIGIBLE:
+        undocumented = [f'"{_row_text(row, "criterion")}"'
+                        for _arm, row in _criteria_rows(verdict)
+                        if _is_undocumented_row(row)]
+        if not undocumented:
+            # No clause at all, rather than an empty one. "Not documented in
+            # the patient record: " with nothing after it reads as a truncated
+            # sentence and would be the only place in this output where a
+            # reader could not tell a rendering fault from a finding.
+            return ASSESSMENT_ELIGIBLE_OPENING
+        return (f"{ASSESSMENT_ELIGIBLE_OPENING} "
+                f"{ASSESSMENT_UNDOCUMENTED_OPENING} "
+                + "; ".join(undocumented) + ".")
+
+    draft = verdict.get("assessment", "")
+    return draft if isinstance(draft, str) else str(draft)
+
+
 def node_llm_classifier_evaluation(state: TrialMatchState) -> dict:
     """
     Stage 5: LLM classifier, criterion-level evaluation.
@@ -1605,6 +1847,25 @@ CLINICAL TRIALS:
 
     # SUCCESS: enrich evaluations with trial metadata (title, phase)
     for eval_result in evaluations:
+        # THE DRAFT IS SNAPSHOTTED HERE, WHICH IS THE FIRST PASS OVER THE
+        # PARSED RESPONSE AND BEFORE ANY VALIDATOR HAS TOUCHED IT.
+        #
+        # AS OF THIS CHANGE IT IS EQUIVALENT TO SNAPSHOTTING AT COMPOSITION
+        # TIME, AND THAT IS SAID PLAINLY RATHER THAN LEFT AS AN IMPLIED
+        # NECESSITY. The one thing between here and the composition that used
+        # to rewrite `assessment` was the absent-data validator's bracketed
+        # annotation, which this same change deletes -- so nothing does, and a
+        # revert harness confirmed that dropping this line changes no observed
+        # value. It is kept as defence against the next validator that patches
+        # the field, since the whole worth of `assessment_draft` is that it is
+        # what the MODEL said and not what this pipeline made of it, and the
+        # placement is held by tests/test_agent_composed_assessment.py check 5h
+        # rather than by a behaviour that no longer exists to observe.
+        #
+        # In memory only -- there is no database column for it. See the block
+        # above compose_assessment for what that costs on a SPLIT run, where
+        # inferences.llm_classifier_raw_response holds the last chunk alone.
+        eval_result["assessment_draft"] = eval_result.get("assessment", "")
         nct_id = eval_result.get("nct_id", "")
         for trial_obj in trials:
             if trial_obj["trial"]["nct_id"] == nct_id:
@@ -2081,13 +2342,26 @@ CLINICAL TRIALS:
                 # same rule as the inline validator above.
                 _record_score(eval_result, inc, exc, eval_result.get("nct_id", ""))
  
-                # Update explanation prefix
-                original_assessment = eval_result.get("assessment", "")
-                if original_assessment.startswith("Known disqualifier:"):
-                    eval_result["assessment"] = (
-                        "No known disqualifiers. [Validator corrected absent-data disqualification.] "
-                        + original_assessment
-                    )
+                # THE ASSESSMENT IS NOT PATCHED HERE ANY MORE, AND THE DELETION
+                # IS THE POINT RATHER THAN A TIDY-UP. This block used to prepend
+                # "No known disqualifiers. [Validator corrected absent-data
+                # disqualification.] " to the model's draft, because the draft
+                # was what got stored and it still opened "Known disqualifier:"
+                # after the flip. Since PROMPT_VERSION 1.5.0 the stored
+                # assessment for an eligible trial is COMPOSED from the criteria
+                # arrays -- which this validator has just corrected -- so a
+                # write here would be overwritten unconditionally by the
+                # composition pass below. A write nothing can read is the
+                # declared-and-never-read shape this project reports on sight,
+                # and leaving it would tell the next reader that the annotation
+                # still reaches the record.
+                #
+                # NOTHING IS LOST. The correction is in `absent_data_corrections`
+                # and in the `absent_data_correction` log event below, with its
+                # count; the corrected rows now read "not_evaluable" in
+                # criterion_details; and the model's original wording, opening
+                # and all, is in `assessment_draft` and in
+                # inferences.llm_classifier_raw_response.
             # else: legitimate disqualifiers remain, trial stays not_eligible
  
     if absent_data_corrections:
@@ -2144,6 +2418,53 @@ CLINICAL TRIALS:
         evaluations.extend(
             _unevaluable_entry(t, NOT_EVALUABLE_MODEL_OMITTED) for t in _omitted
         )
+
+    # ── The stored assessment is composed from the arrays ───────────────────
+    #
+    # LAST, AND OVER THE COMPLETE LIST, which is what makes it correct. Every
+    # pass above can still move what this one reads: `_normalize_arm` rewrites a
+    # criterion status, Step 3 rewrites the trial verdict, the absent-data
+    # validator rewrites both and can flip a rejection to eligible, and the
+    # reconciliation appends entries that were never in the response at all.
+    # Composing earlier would render a state that the node then changed, and the
+    # stored assessment would contradict the stored criteria -- which is the
+    # defect this whole mechanism exists to remove, reintroduced by placement.
+    #
+    # `assessment_draft` is set with setdefault, so the model-returned entries
+    # keep the snapshot taken before any validator ran, and the entries this
+    # node CONSTRUCTED (a truncation floor, an exhausted split budget, a model
+    # omission, conflicting duplicates) get their own fixed text as their draft.
+    # Every entry carries the key, so no consumer has to test for its presence.
+    _assessment_cases = Counter()
+    _assessment_anomalies = []
+    for _e in evaluations:
+        _e.setdefault("assessment_draft", _e.get("assessment", ""))
+        _case = assessment_composition_case(_e)
+        _assessment_cases[_case] += 1
+        if _case in _ASSESSMENT_ANOMALY_CASES:
+            ASSESSMENT_COMPOSITION_ANOMALIES[_case] += 1
+            _assessment_anomalies.append((_case, _e.get("nct_id", "")))
+        _e["assessment"] = compose_assessment(_e)
+
+    _composed = (_assessment_cases[ASSESSMENT_COMPOSED_ELIGIBLE]
+                 + _assessment_cases[ASSESSMENT_COMPOSED_NOT_ELIGIBLE])
+    log.info("composed the stored assessment from the criteria arrays",
+             stage=5, event="assessment_composition",
+             count=_composed, total=len(evaluations),
+             kept=len(evaluations) - _composed,
+             reason=sorted(k for k, v in _assessment_cases.items() if v))
+    if _assessment_anomalies:
+        # Unreachable if the normalizer above ran: Step 3 only writes
+        # not_eligible off a surviving disqualifying row, and Step 0 resolves
+        # every verdict into the three-member vocabulary. So this is not a
+        # degradation to absorb -- it says the composition saw a verdict the
+        # normalizer did not produce, and the trial kept the model's draft.
+        log.warning("kept the model's draft assessment: the verdict and the "
+                    "criteria arrays could not support a composed one",
+                    stage=5, event="assessment_composition_anomaly",
+                    count=len(_assessment_anomalies),
+                    reason=sorted({c for c, _ in _assessment_anomalies}),
+                    nct_ids=[n for _, n in _assessment_anomalies if n])
 
     # ── The per-trial record that the check ran ────────────────────────────
     #

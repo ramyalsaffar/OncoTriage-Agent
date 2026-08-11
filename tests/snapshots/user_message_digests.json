@@ -6,6 +6,6 @@
     "trials_text": "ebe7894db6cbb4d2da7ccdedad2cc292d89765ced62946f85629479849d40006",
     "user_message": "fc15e6bf5597016e567d2af706dcc192401f11622a3de6bb0f9dc18b45441ea4"
   },
-  "prompt_version": "1.4.0",
+  "prompt_version": "1.5.0",
   "user_prompt_template": "def _user_prompt_for(chunk: List[Dict]) -> str:\n    return f'\\nPATIENT RECORD:\\n{patient_summary}\\n\\nCLINICAL TRIALS:\\n{_build_trials_text(chunk)}\\n'"
 }

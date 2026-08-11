@@ -105,6 +105,20 @@ _FLIP_TYPE_COLORS = {
 # Root-cause categories for the failure-mode analysis, keyed by display name.
 # ORDER IS LOAD-BEARING: the bar chart and the recommended-fix table iterate
 # this dict's keys, so it is the actionability ordering the caption promises.
+# THE CORPUS THESE KEYWORDS ARE MATCHED AGAINST CHANGED AT PROMPT_VERSION
+# 1.5.0. `trial_matches.assessment` is no longer the model's free-written draft
+# for an eligible or not_eligible trial: it is composed from that trial's own
+# criteria rows (oncotriage/agent/evaluation.py:compose_assessment), so it
+# carries each disqualifying criterion and its patient_value VERBATIM and no
+# paraphrase. Clinical words that occur in criterion text ("metastatic",
+# "resolved", "recurrent") still match, and match a more reliable corpus than
+# before; the phrasal ones ("does not indicate", "lacks evidence", "no data
+# on") were the model's own wording and now match only rows written before
+# 1.5.0. The category counts are therefore comparable WITHIN an era and not
+# across one. Rebuilding them off `criterion_details` -- where the status and
+# the patient_value are structured fields rather than prose -- is the recorded
+# follow-up; it is a redesign of a render path and was not folded into the pass
+# that changed the column's meaning.
 _FAILURE_CATEGORIES = {
     'Temporal / Resolved Status': {
         'keywords': [

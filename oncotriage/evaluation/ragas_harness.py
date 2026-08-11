@@ -454,6 +454,27 @@ def load_run(run_dir):
                 # metric would measure the harness's context choice rather than
                 # the pipeline.
                 retrieved_contexts=[summary, trial_text],
+                # WHAT THIS RESPONSE IS CHANGED AT PROMPT_VERSION 1.5.0, AND
+                # THE METRIC'S MEANING CHANGED WITH IT. For an eligible or
+                # not_eligible trial, `assessment` is no longer the model's
+                # free-written reasoning: it is composed from that trial's own
+                # criteria rows (oncotriage/agent/evaluation.py:
+                # compose_assessment), quoting each `criterion` (which restates
+                # the trial text) and each `patient_value` (which comes from the
+                # patient record) VERBATIM. Both of this sample's contexts are
+                # therefore the sources the response was built from, so
+                # faithfulness over a 1.5.0 run measures the RENDERER and is
+                # expected near its ceiling -- a metric that cannot fail is not
+                # a measurement. Runs either side of 1.5.0 are not comparable
+                # on this metric.
+                #
+                # The model's own reasoning is still available: `collect_verdicts`
+                # copies each verdict verbatim, so a 1.5.0 run artifact carries
+                # `assessment_draft`. Scoring THAT is what keeps this metric
+                # about the pipeline. It is deliberately not switched here --
+                # pre-1.5.0 artifacts have no such key, so the switch needs a
+                # stated fallback and a note on every published figure, which is
+                # a measurement decision rather than an edit.
                 response=assessment,
                 eligible=verdict.get("eligible"),
                 verdict_group=verdict.get("verdict_group")))
