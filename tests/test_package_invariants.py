@@ -1059,6 +1059,25 @@ _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    # what makes a plant in evaluation.py itself the only thing
                    # a probe through it can observe.
                    "tests/test_agent_out_of_set_detector.py",
+                   # Plants into in-memory copies of agent/evaluation.py and
+                   # agent/prompts.py for the Stage 5 input packer and the
+                   # PROMPT_VERSION 1.6.0 prompt restructure. A patched copy is
+                   # the right shape rather than a git blob for two reasons.
+                   # The packer is AT HEAD and has no prior revision, so a blob
+                   # would compare the fixed module with itself -- the defect
+                   # tests/test_storage_query_layer.py had to learn. And the
+                   # copies are also used as the OTHER ARM of two equivalence
+                   # proofs rather than only as controls: section 6 execs a copy
+                   # with the packing branch disabled to reconstruct the
+                   # pre-packing node and compares its requests field for field
+                   # against the shipped node with the switch off, and control
+                   # c16 execs a copy that charges packing a truncation-split
+                   # level to show the recorded not-evaluable reason move. The
+                   # copies are exec'd into a real ModuleType rather than a
+                   # dict-backed class on purpose: a function's globals ARE the
+                   # dict it was exec'd into, so a throwaway class would leave
+                   # every constant override the harness installs unread.
+                   "tests/test_agent_stage5_input_packing.py",
                    # Plants into an in-memory copy of agent/patient.py. Two of
                    # its seven controls are one-token edits INSIDE a function
                    # body -- `is not None` made truthy, and the two observation

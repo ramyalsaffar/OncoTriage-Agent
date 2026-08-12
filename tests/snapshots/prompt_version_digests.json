@@ -1,26 +1,26 @@
 {
   "digests": {
-    "mesh_filter_applied=False;mesh_filter_skip_reason='ablation_skipped';trial_count=0": "bb4943270a7e4648b0ab552fefc96768931f326b2c1886873185382065198c1c",
-    "mesh_filter_applied=False;mesh_filter_skip_reason='ablation_skipped';trial_count=3": "367d0607ba5aaf8012daae53e2fe6cc7cf31262c620dde7f0c01901f901c60fe",
-    "mesh_filter_applied=False;mesh_filter_skip_reason='no_mesh_filter';trial_count=0": "f219524cea4e1da262a5833d7ead5efcfdeab96e1877ca848aed2ff87abc7d8f",
-    "mesh_filter_applied=False;mesh_filter_skip_reason='no_mesh_filter';trial_count=3": "392250a93510d6012ab197a7b6881846ecb71814a83836054a48a7aba6faed99",
-    "mesh_filter_applied=False;mesh_filter_skip_reason='no_patient_trees';trial_count=0": "d453da3856188faae5c2611cc66d2d9ea97df733193868dc4397ef119149ef9b",
-    "mesh_filter_applied=False;mesh_filter_skip_reason='no_patient_trees';trial_count=3": "d1fd0eda759e51d41540df24de603678a000497d3f08118ec230e57b4b1865bb",
-    "mesh_filter_applied=False;mesh_filter_skip_reason='unrecorded';trial_count=0": "d04cbcda1eea643562574f2858ee8fbc0da3c6a02933f07b2b28098580f5095f",
-    "mesh_filter_applied=False;mesh_filter_skip_reason='unrecorded';trial_count=3": "521ff690c8cdd2cb1f6b166a5f21da2c75941b6517fc027d7ebddb31f62b453d",
-    "mesh_filter_applied=True;mesh_filter_skip_reason='ablation_skipped';trial_count=0": "b90cfd044950ea29bc626dac3499818bbf7827a021b1b3750d8b06c09d728e6c",
-    "mesh_filter_applied=True;mesh_filter_skip_reason='ablation_skipped';trial_count=3": "7806bf3df9dde8618012c7f18caf1fbfc3a8cb7d144e0fa78e676be40ce0cc4a",
-    "mesh_filter_applied=True;mesh_filter_skip_reason='no_mesh_filter';trial_count=0": "b90cfd044950ea29bc626dac3499818bbf7827a021b1b3750d8b06c09d728e6c",
-    "mesh_filter_applied=True;mesh_filter_skip_reason='no_mesh_filter';trial_count=3": "7806bf3df9dde8618012c7f18caf1fbfc3a8cb7d144e0fa78e676be40ce0cc4a",
-    "mesh_filter_applied=True;mesh_filter_skip_reason='no_patient_trees';trial_count=0": "b90cfd044950ea29bc626dac3499818bbf7827a021b1b3750d8b06c09d728e6c",
-    "mesh_filter_applied=True;mesh_filter_skip_reason='no_patient_trees';trial_count=3": "7806bf3df9dde8618012c7f18caf1fbfc3a8cb7d144e0fa78e676be40ce0cc4a",
-    "mesh_filter_applied=True;mesh_filter_skip_reason='unrecorded';trial_count=0": "b90cfd044950ea29bc626dac3499818bbf7827a021b1b3750d8b06c09d728e6c",
-    "mesh_filter_applied=True;mesh_filter_skip_reason='unrecorded';trial_count=3": "7806bf3df9dde8618012c7f18caf1fbfc3a8cb7d144e0fa78e676be40ce0cc4a"
+    "mesh_filter_applied=False;mesh_filter_skip_reason='ablation_skipped';patient_record='<probe A: no patient record>'": "dd393994db99f582af3140a597cf16eb2d0506795a164afa338edc5a15b176ad",
+    "mesh_filter_applied=False;mesh_filter_skip_reason='ablation_skipped';patient_record='Age: 61 | Sex: female\\nCancer Stage: 3'": "ea657aa6b13483eb688ebd5a883e686eb6915142a4ff162f4d559a703add1406",
+    "mesh_filter_applied=False;mesh_filter_skip_reason='no_mesh_filter';patient_record='<probe A: no patient record>'": "f1bdcdf6116fac7ace9911a99367b03fce314aa13131f8518b2bc8aea891683f",
+    "mesh_filter_applied=False;mesh_filter_skip_reason='no_mesh_filter';patient_record='Age: 61 | Sex: female\\nCancer Stage: 3'": "7af602617e09f661c7979b80941a032a08a31141f6694ab92cbbfccae9280c0b",
+    "mesh_filter_applied=False;mesh_filter_skip_reason='no_patient_trees';patient_record='<probe A: no patient record>'": "631264d77fd82b6d44bd1ee637b8853f28f15b85119cc1b36a33af7b7182999c",
+    "mesh_filter_applied=False;mesh_filter_skip_reason='no_patient_trees';patient_record='Age: 61 | Sex: female\\nCancer Stage: 3'": "3d19e0669bb1ec4d0cd7706a3a71ea09db815b61c422c033b3a396051ab7c6bb",
+    "mesh_filter_applied=False;mesh_filter_skip_reason='unrecorded';patient_record='<probe A: no patient record>'": "70a7543a22b7369270428e41de100de9511aa7d07d965f763508570e93740242",
+    "mesh_filter_applied=False;mesh_filter_skip_reason='unrecorded';patient_record='Age: 61 | Sex: female\\nCancer Stage: 3'": "f7e41cb366a89250a2d065537061451e48873b4a594e7b7cb0cef74ff5d66349",
+    "mesh_filter_applied=True;mesh_filter_skip_reason='ablation_skipped';patient_record='<probe A: no patient record>'": "e80de2619312c5ca49c17f671369e77c16acbbfd3e4f462f336391a5fc199b2d",
+    "mesh_filter_applied=True;mesh_filter_skip_reason='ablation_skipped';patient_record='Age: 61 | Sex: female\\nCancer Stage: 3'": "7fb14f9574cd0833491f75ed43a0de1484c777693a7298ed0178199cc79ac378",
+    "mesh_filter_applied=True;mesh_filter_skip_reason='no_mesh_filter';patient_record='<probe A: no patient record>'": "e80de2619312c5ca49c17f671369e77c16acbbfd3e4f462f336391a5fc199b2d",
+    "mesh_filter_applied=True;mesh_filter_skip_reason='no_mesh_filter';patient_record='Age: 61 | Sex: female\\nCancer Stage: 3'": "7fb14f9574cd0833491f75ed43a0de1484c777693a7298ed0178199cc79ac378",
+    "mesh_filter_applied=True;mesh_filter_skip_reason='no_patient_trees';patient_record='<probe A: no patient record>'": "e80de2619312c5ca49c17f671369e77c16acbbfd3e4f462f336391a5fc199b2d",
+    "mesh_filter_applied=True;mesh_filter_skip_reason='no_patient_trees';patient_record='Age: 61 | Sex: female\\nCancer Stage: 3'": "7fb14f9574cd0833491f75ed43a0de1484c777693a7298ed0178199cc79ac378",
+    "mesh_filter_applied=True;mesh_filter_skip_reason='unrecorded';patient_record='<probe A: no patient record>'": "e80de2619312c5ca49c17f671369e77c16acbbfd3e4f462f336391a5fc199b2d",
+    "mesh_filter_applied=True;mesh_filter_skip_reason='unrecorded';patient_record='Age: 61 | Sex: female\\nCancer Stage: 3'": "7fb14f9574cd0833491f75ed43a0de1484c777693a7298ed0178199cc79ac378"
   },
-  "prompt_version": "1.5.0",
+  "prompt_version": "1.6.0",
   "render_parameters": [
     "mesh_filter_applied",
     "mesh_filter_skip_reason",
-    "trial_count"
+    "patient_record"
   ]
 }

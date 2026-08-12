@@ -494,13 +494,25 @@ check("4f  ...and it is counted and logged like any other",
 
 section("SECTION 5 -- C6, the data boundary")
 
+# A declared stand-in for the patient record, which PROMPT_VERSION 1.6.0 moved
+# into the system message. C6 and Section 5 -- everything section 5 of this file
+# reads -- sit outside the PATIENT RECORD block, so no probe value reaches them.
+#
+# THIS FILE STILL OWNS THE TRIAL FENCE AND ONLY THAT. 1.6.0 added a SECOND fence
+# -- <<<PATIENT_RECORD>>> / <<<END_PATIENT_RECORD>>> around the record in the
+# system message -- and its contract is held by
+# tests/test_agent_stage5_input_packing.py, the file that introduced it, rather
+# than restated here. Two files claiming one property is a maintenance cost with
+# no coverage behind it.
+_PROBE_RECORD = "<probe: no patient record>"
+
 _VARIANTS = {
     "confirmed": render_system_prompt(mesh_filter_applied=True,
                                       mesh_filter_skip_reason="unrecorded",
-                                      trial_count=3),
+                                      patient_record=_PROBE_RECORD),
     "unconfirmed": render_system_prompt(mesh_filter_applied=False,
                                         mesh_filter_skip_reason="no_mesh_filter",
-                                        trial_count=3),
+                                        patient_record=_PROBE_RECORD),
 }
 
 check("5a  the two variants really are different text (non-degeneracy)",
@@ -669,7 +681,7 @@ control("c8  a prompt with C6 deleted fails the data-boundary check [5b]",
         [("\nC6 -- DATA BOUNDARY:", "\nC6X -- SOMETHING ELSE:")],
         lambda m: "C6 -- DATA BOUNDARY:" in m.render_system_prompt(
             mesh_filter_applied=True, mesh_filter_skip_reason="unrecorded",
-            trial_count=3), False)
+            patient_record=_PROBE_RECORD), False)
 
 control("c9  Section 5 sent back to the header line fails [5i]",
         _PROMPTS_SRC,
@@ -678,7 +690,7 @@ control("c9  Section 5 sent back to the header line fails [5i]",
           "copied exactly from the trial's header line")],
         lambda m: "header line" in m.render_system_prompt(
             mesh_filter_applied=True, mesh_filter_skip_reason="unrecorded",
-            trial_count=3), True)
+            patient_record=_PROBE_RECORD), True)
 
 # 10 -- C6 present in only one Section 2 variant. A constraint that is absent
 #       for exactly the runs whose retrieval was least verified is worse than
@@ -690,7 +702,8 @@ control("c10 C6 in the confirmed variant only is caught [5b unconfirmed]",
           "In the message that follows")],
         lambda m: "C6 -- DATA BOUNDARY:" in m.render_system_prompt(
             mesh_filter_applied=False,
-            mesh_filter_skip_reason="no_mesh_filter", trial_count=3), False)
+            mesh_filter_skip_reason="no_mesh_filter",
+            patient_record=_PROBE_RECORD), False)
 
 
 # --- nothing on disk moved --------------------------------------------------

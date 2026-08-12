@@ -4,8 +4,8 @@
     "trial[1]=NCT00000002": "75fdcdf015b8b849669659c13a6f50d3bf60d991911f708388f82b35381a94a9",
     "trial[2]=NCT00000003": "05f18264997e92024767f9b881b7753cb540a34dfdc94e9c3c924e1b0df8e7da",
     "trials_text": "ebe7894db6cbb4d2da7ccdedad2cc292d89765ced62946f85629479849d40006",
-    "user_message": "fc15e6bf5597016e567d2af706dcc192401f11622a3de6bb0f9dc18b45441ea4"
+    "user_message": "a08fed329b291ed0b291260556248f8c15badeae3a49b0e2353f59eea46d0b42"
   },
-  "prompt_version": "1.5.0",
-  "user_prompt_template": "def _user_prompt_for(chunk: List[Dict]) -> str:\n    return f'\\nPATIENT RECORD:\\n{patient_summary}\\n\\nCLINICAL TRIALS:\\n{_build_trials_text(chunk)}\\n'"
+  "prompt_version": "1.6.0",
+  "user_prompt_template": "def _user_prompt_for(chunk: List[Dict]) -> str:\n    return f'\\nCLINICAL TRIALS:\\n{_build_trials_text(chunk)}\\n'"
 }

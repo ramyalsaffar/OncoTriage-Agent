@@ -43,10 +43,12 @@ WHAT IT HOLDS
        new version is deliberately recorded". Reporting either as the other
        sends the reader to the wrong file.
     4. TWO INVARIANTS THE MATRIX ITSELF PROVES. Within the confirmed branch the
-       skip reason is unread, so those digests must agree; across trial counts
-       they must not. The second is the non-degeneracy guard on the first --
-       without it, "all these digests are equal" is also satisfied by a render
-       function that returns a constant.
+       skip reason is unread, so those digests must agree; across patient
+       records they must not. The second is the non-degeneracy guard on the
+       first -- without it, "all these digests are equal" is also satisfied by a
+       render function that returns a constant. (The second axis was
+       ``trial_count`` until PROMPT_VERSION 1.6.0 deleted that parameter and
+       moved the patient record into this message.)
     5. THE CONTROLS, four of them, run as part of this file so they cannot go
        stale. Three drive the comparison directly with doctored inputs; the
        fourth EXECS A ONE-CHARACTER-PATCHED IN-MEMORY COPY of prompts.py, which
@@ -62,7 +64,8 @@ because a snapshot that rewrites itself to accommodate the code makes whatever
 the code does correct by definition.
 
 NO NETWORK, NO KEYS, NO SPEND, NO DATABASE, NO SUBPROCESS, NO FIXTURE, NO GIT,
-NO CORPUS. It renders sixteen strings, hashes them, and reads one JSON file.
+NO CORPUS. It renders one string per variant, hashes them, and reads one JSON
+file.
 Not in the collision matrix: it writes nothing in the repository except through
 the explicit ``--update-snapshot`` flag, and the two source files it reads are
 written by neither of the suite's two writers.
@@ -270,11 +273,27 @@ _AXES = {
     # Both branches of the one conditional in the template.
     "mesh_filter_applied": (True, False),
     "mesh_filter_skip_reason": _REASONS,
-    # The zero-trial form of each branch, and an ordinary batch. Zero is
-    # included because Section 5 of the prompt renders the count into an
-    # instruction ("Evaluate ALL 0 trials"), so it is a real reachable string
-    # rather than a degenerate input.
-    "trial_count": (0, 3),
+    # THE trial_count AXIS WAS HERE AND ITS PARAMETER IS GONE (PROMPT_VERSION
+    # 1.6.0). Section 5 used to render the count into an instruction
+    # ("Evaluate ALL 0 trials"), which is why the zero form was a variant; the
+    # instruction now counts the trials in the user message, the parameter was
+    # interpolated nowhere, and it was deleted rather than left as an argument
+    # the renderer accepts and discards. An axis for a parameter that does not
+    # exist would fail the signature check immediately below -- which is the
+    # check doing its job, not a reason to keep the parameter.
+    #
+    # Its replacement is patient_record, which 1.6.0 moved into this message.
+    # Two values, and NEITHER IS EMPTY: "" and a real record differ in the
+    # rendered bytes, but an empty-string axis point would also be satisfied by
+    # a template that had stopped interpolating the argument at all. Both points
+    # are non-empty and distinct, so the digest can only separate them if the
+    # value genuinely reaches the text.
+    #
+    # They are LITERALS, never _create_patient_summary output: this matrix must
+    # render the same bytes on a machine with no data directory, and a snapshot
+    # keyed on a parsed bundle would be a snapshot of the corpus.
+    "patient_record": ("<probe A: no patient record>",
+                       "Age: 61 | Sex: female\nCancer Stage: 3"),
 }
 
 check("every parameter of render_system_prompt has an axis in this matrix",
@@ -285,7 +304,7 @@ check("the reason axis is non-degenerate (more than one distinct value)",
       len(_REASONS) >= 2, True)
 
 print(f"  [info] axes: " + ", ".join(f"{k}={len(v)}" for k, v in _AXES.items())
-      + f"  ->  {len(_AXES['mesh_filter_applied']) * len(_REASONS) * len(_AXES['trial_count'])} variants")
+      + f"  ->  {len(_AXES['mesh_filter_applied']) * len(_REASONS) * len(_AXES['patient_record'])} variants")
 
 
 # ===========================================================================
@@ -310,7 +329,7 @@ def _variant_id(kwargs: dict) -> str:
     KeyError the moment a parameter is renamed, which is the exact condition
     Section 1 exists to REPORT -- so the file died with a traceback before its
     own finding could be printed. Measured, not reasoned about: renaming
-    `trial_count` to `n_trials` in a copy produced a KeyError and no summary.
+    `patient_record` to `record` in a copy produced a KeyError and no summary.
     Names the signature does not mention are appended in sorted order, so the
     id is total over any kwargs dict while staying byte-identical to what it
     produced before whenever the two agree -- which is every run where the
@@ -326,10 +345,10 @@ def _matrix():
     out = []
     for applied in _AXES["mesh_filter_applied"]:
         for reason in _AXES["mesh_filter_skip_reason"]:
-            for count in _AXES["trial_count"]:
+            for record in _AXES["patient_record"]:
                 out.append({"mesh_filter_applied": applied,
                             "mesh_filter_skip_reason": reason,
-                            "trial_count": count})
+                            "patient_record": record})
     return out
 
 
@@ -546,19 +565,23 @@ print("\n" + "=" * 78)
 print("SECTION 5 -- properties the matrix proves about the template")
 print("=" * 78)
 
+# Bucketed by every axis EXCEPT the skip reason, which is what the two checks
+# below are about. The key was `trial_count` alone until PROMPT_VERSION 1.6.0
+# replaced that axis with `patient_record`.
 _confirmed_by_count = {}
 _unconfirmed_by_count = {}
 for _kw in _matrix():
     _bucket = (_confirmed_by_count if _kw["mesh_filter_applied"]
                else _unconfirmed_by_count)
-    _bucket.setdefault(_kw["trial_count"], set()).add(_LIVE_DIGESTS[_variant_id(_kw)])
+    _bucket.setdefault(_kw["patient_record"], set()).add(
+        _LIVE_DIGESTS[_variant_id(_kw)])
 
 # The confirmed branch never interpolates the skip reason, so every reason must
-# render the same bytes at a given trial count. This is what makes the reason
+# render the same bytes for a given patient record. This is what makes the reason
 # column of the confirmed rows in the snapshot redundant BY PROOF rather than
 # by assertion.
 check("confirmed branch: the skip reason is unread, so one digest per "
-      "trial count",
+      "patient record",
       sorted({len(v) for v in _confirmed_by_count.values()}), [1])
 
 # The unconfirmed branch DOES interpolate it, so the same test must come out
@@ -569,13 +592,23 @@ check("unconfirmed branch: the skip reason IS interpolated, so one digest per "
       sorted({len(v) for v in _unconfirmed_by_count.values()}),
       [len(_REASONS)])
 
-# And the count axis has to move something, or "the zero-trial form" is not a
-# variant at all. Flattened rather than `next(iter(v))` per bucket: that form
+# And the record axis has to move something, or the patient record is not in
+# this message at all -- which is the whole of what 1.6.0 changed, so a matrix
+# that could not see it would be pinning the wrong prompt. This REPLACES the
+# identical check the deleted trial_count axis carried; the subject moved, the
+# property did not. Flattened rather than `next(iter(v))` per bucket: that form
 # raises StopIteration on an empty bucket, which is an abort where a failure is
 # owed -- the same family as the guarded render above.
-check("the trial count reaches the rendered text",
+check("the patient record reaches the rendered text",
       len({d for v in _confirmed_by_count.values() for d in v}),
-      len(_AXES["trial_count"]))
+      len(_AXES["patient_record"]))
+# ...and it reaches it VERBATIM rather than as a digest of itself, which no
+# comparison of hashes could establish.
+check("...verbatim, in both Section 2 variants",
+      sorted({_AXES["patient_record"][1] in _render(render_system_prompt, _kw)
+              for _kw in _matrix()
+              if _kw["patient_record"] == _AXES["patient_record"][1]}),
+      [True])
 
 check("the two branches never render the same bytes",
       set().union(*_confirmed_by_count.values())

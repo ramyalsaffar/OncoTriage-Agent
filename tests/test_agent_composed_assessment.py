@@ -1057,9 +1057,15 @@ def extract_json_template(prompt_text):
     return None
 
 
+# A declared stand-in for the patient record, which PROMPT_VERSION 1.6.0
+# moved into the system message. It exists only so the template renders;
+# nothing below reads it, and every span this file inspects (Section 5, the
+# JSON template, the output contract) is outside the PATIENT RECORD block.
+_PROBE_RECORD = "<probe: no patient record>"
+
 _PROMPT = render_system_prompt(mesh_filter_applied=True,
                                mesh_filter_skip_reason="applied",
-                               trial_count=2)
+                               patient_record=_PROBE_RECORD)
 try:
     _TEMPLATE = extract_json_template(_PROMPT)
 except Exception as _exc:               # noqa: BLE001 - a raise IS an outcome

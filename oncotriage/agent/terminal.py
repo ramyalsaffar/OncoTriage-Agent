@@ -242,6 +242,31 @@ def _pipeline_provenance(state) -> Dict:
         "matching_model": state.get("matching_model"),
         "llm_classifier_reasoning_tokens": state.get("llm_classifier_reasoning_tokens"),
 
+        # --- What the Stage 5 INPUT packer did, and what caching returned ---
+        #
+        # ALL THREE TAKE THE NO-DEFAULT ROUTE, with hallucinated_trials above
+        # rather than with the truncation counters. Each describes a MEASUREMENT
+        # this run either made or did not: how many requests the packer produced
+        # and how they were sized, and how much of the shared prefix the
+        # provider served from cache. A run that ended at node_no_candidates
+        # packed nothing and asked nothing, and 0 there would assert one request
+        # of zero cached tokens rather than "no request was made".
+        #
+        # llm_classifier_cached_input_tokens is a SUBSET of
+        # llm_classifier_input_tokens and never a costing term -- get_model_cost
+        # prices the whole input at the uncached rate, deliberately, so the
+        # stored cost stays comparable with every historical row.
+        #
+        # NEITHER PACKING KEY HAS A DATABASE COLUMN. They reach the API response
+        # and any in-process consumer; File 14 writes the columns it declares and
+        # ignores the rest. That is stated rather than left to be discovered:
+        # the validation run reads these off the result, and persisting them is
+        # a schema decision this pass does not make.
+        "llm_classifier_packed_chunks": state.get("llm_classifier_packed_chunks"),
+        "llm_classifier_packing": state.get("llm_classifier_packing"),
+        "llm_classifier_cached_input_tokens": state.get(
+            "llm_classifier_cached_input_tokens"),
+
         # --- Which Stage 5 system prompt produced this row ------------------
         #
         # THE TWO FIELDS DEFAULT DIFFERENTLY, AND THE ASYMMETRY IS THE POINT.

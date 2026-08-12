@@ -167,13 +167,23 @@ _RUBRIC_SPANS = (
 # no probe value can reach the rubric. If a future edit interpolates a
 # run-specific value into a lifted span, these stop agreeing and lift_rubric
 # raises instead of baking a probe value into every request.
+#
+# THE patient_record VALUES ARE DELIBERATELY DIFFERENT FROM EACH OTHER, and
+# that is a check rather than decoration. PROMPT_VERSION 1.6.0 moved the
+# patient's record into the system message, between Section 2 and Section 3 --
+# outside every span lifted below. Varying it across the probes is what PROVES
+# that: if a future edit ever moved a lifted span so that it enclosed the
+# record, the spans would stop agreeing across probes and lift_rubric would
+# raise, instead of baking one probe patient's clinical data into every rater
+# request for every criterion of every run. (1.6.0 also deleted trial_count,
+# which these probes used to vary for the same reason.)
 _RENDER_PROBES = (
     {"mesh_filter_applied": True, "mesh_filter_skip_reason": "applied",
-     "trial_count": 15},
-    {"mesh_filter_applied": False,
-     "mesh_filter_skip_reason": "no_mesh_filter", "trial_count": 1},
+     "patient_record": "<probe A: no patient record>"},
+    {"mesh_filter_applied": False, "mesh_filter_skip_reason": "no_mesh_filter",
+     "patient_record": "<probe B: Age 61 | Sex female | ECOG 1>"},
     {"mesh_filter_applied": True, "mesh_filter_skip_reason": "applied",
-     "trial_count": 3},
+     "patient_record": "<probe C: a third and longer stand-in record>"},
 )
 
 _BANNER = "=" * 69

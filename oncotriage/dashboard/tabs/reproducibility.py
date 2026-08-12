@@ -569,6 +569,41 @@ def _ordered_criterion_keys(run_criteria):
     return all_criteria_keys
 
 
+def _extract_patient_record(prompt):
+    """The patient record out of a stored Stage 5 prompt, or None.
+
+    ``inferences.llm_classifier_prompt`` holds "[SYSTEM]\\n...\\n\\n[USER]\\n..."
+    and the record has been on both sides of that marker:
+
+        <= PROMPT_VERSION 1.5.0   in the USER message, under a "PATIENT RECORD:"
+                                  heading, running to "CLINICAL TRIALS:".
+        >= PROMPT_VERSION 1.6.0   in the SYSTEM message, fenced between
+                                  <<<PATIENT_RECORD>>> and
+                                  <<<END_PATIENT_RECORD>>>.
+
+    Both layouts are in this table at once and will stay that way -- the column
+    is historical -- so both are read. The FENCED form is tried first: a 1.6.0
+    prompt also contains the string "CLINICAL TRIALS:", hundreds of lines below
+    the record, so the legacy slice applied to it would return the entire rule
+    set as though it were the patient's record.
+
+    Returns None when neither layout is present, which the caller renders as
+    "not available" rather than as an empty record.
+    """
+    open_mark = '<<<PATIENT_RECORD>>>'
+    close_mark = '<<<END_PATIENT_RECORD>>>'
+    start = prompt.find(open_mark)
+    end = prompt.find(close_mark)
+    if start != -1 and end > start:
+        return prompt[start + len(open_mark):end].strip()
+
+    legacy_start = prompt.find('PATIENT RECORD:')
+    trials_start = prompt.find('CLINICAL TRIALS:')
+    if legacy_start != -1 and trials_start > legacy_start:
+        return prompt[legacy_start:trials_start].strip()
+    return None
+
+
 def _build_patient_repro(comp_df):
     """Per-patient reproducibility rollup, worst score agreement first."""
     patient_repro = comp_df.groupby('patient_id').agg(
@@ -1240,14 +1275,24 @@ def render_reproducibility_tab(df):
                     
                     st.markdown(f"**Primary Condition:** {patient_row.get('primary_condition', 'N/A')}")
                     
-                    # Extract patient record from GPT-4o prompt if available
-                    prompt = patient_row.get('llm_classifier_prompt', '')
-                    if prompt and str(prompt) != 'nan':
-                        # The patient record is between [USER] and CLINICAL TRIALS:
-                        user_start = str(prompt).find('PATIENT RECORD:')
-                        trials_start = str(prompt).find('CLINICAL TRIALS:')
-                        if user_start != -1 and trials_start != -1:
-                            patient_text = str(prompt)[user_start:trials_start].strip()
+                    # Extract patient record from the stored Stage 5 prompt.
+                    #
+                    # TWO LAYOUTS, AND BOTH ARE LIVE IN THIS TABLE. Up to
+                    # PROMPT_VERSION 1.5.0 the record sat in the USER message
+                    # under a "PATIENT RECORD:" heading and ran to
+                    # "CLINICAL TRIALS:". From 1.6.0 it is in the SYSTEM
+                    # message, fenced between <<<PATIENT_RECORD>>> and
+                    # <<<END_PATIENT_RECORD>>>, and "CLINICAL TRIALS:" is now
+                    # hundreds of lines further on -- so the old slice would
+                    # have rendered the whole rule set as though it were the
+                    # patient's record, for every row written from 1.6.0 on.
+                    #
+                    # The fenced form is tried FIRST and the old one is the
+                    # fallback, so historical rows render exactly as they did.
+                    prompt = str(patient_row.get('llm_classifier_prompt', ''))
+                    if prompt and prompt != 'nan':
+                        patient_text = _extract_patient_record(prompt)
+                        if patient_text is not None:
                             st.text(patient_text)
                         else:
                             st.text("Full patient record not available in prompt format.")

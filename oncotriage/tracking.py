@@ -379,7 +379,12 @@ runner's corpus size and resample settings."""
 _PROMPT_PROBE = {
     "mesh_filter_applied": None,          # filled per variant below
     "mesh_filter_skip_reason": "unrecorded",
-    "trial_count": 0,
+    # PROMPT_VERSION 1.6.0 moved the patient record into the system message and
+    # deleted trial_count (which this dict used to carry as 0). The probe value
+    # is a fixed placeholder, never a real record: these digests fingerprint the
+    # TEMPLATE, and a patient's data in a tracking store would outlive every
+    # retention policy this project has.
+    "patient_record": "<probe: no patient record>",
 }
 """Fixed arguments for the prompt-template fingerprints below.
 
@@ -393,10 +398,13 @@ def _prompt_params():
 
     WHY TWO DIGESTS AND NOT ONE, AND WHY THEY ARE NOT "THE RUN'S PROMPT SHA".
     ``render_system_prompt`` takes three arguments and two of them vary PER
-    PATIENT -- ``trial_count`` is the size of that patient's batch, and
+    PATIENT -- ``patient_record`` is that patient's whole record, and
     ``mesh_filter_skip_reason`` is whichever reason Stage 4 recorded. A run
     therefore does not have "a" prompt sha, and the per-inference one already
     exists and is already stored: ``inferences.llm_classifier_prompt_sha256``.
+    Since 1.6.0 that stored hash covers the patient record too, which makes it
+    more per-patient than it was and leaves this pair the only template-level
+    identity there is.
 
     What a run DOES have is a template, and the template has exactly one
     branch: ``mesh_filter_applied``. So the coverage this logs is one digest per
@@ -413,13 +421,13 @@ def _prompt_params():
         "prompt_digest_probe": (
             f"mesh_filter_skip_reason="
             f"{_PROMPT_PROBE['mesh_filter_skip_reason']!r}, "
-            f"trial_count={_PROMPT_PROBE['trial_count']}"),
+            f"patient_record={_PROMPT_PROBE['patient_record']!r}"),
     }
     for applied, label in ((True, "site_confirmed"), (False, "site_unconfirmed")):
         rendered = render_system_prompt(
             mesh_filter_applied=applied,
             mesh_filter_skip_reason=_PROMPT_PROBE["mesh_filter_skip_reason"],
-            trial_count=_PROMPT_PROBE["trial_count"],
+            patient_record=_PROMPT_PROBE["patient_record"],
         )
         out[f"prompt_template_sha256_{label}"] = prompt_sha256(rendered)
     return out

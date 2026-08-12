@@ -1148,7 +1148,76 @@ MAX_TRUNCATION_SPLITS = 3
 # batch sizing; kept identical so the two agree, and kept crude on purpose —
 # tiktoken would be a dependency and an import cost for an estimate whose job
 # is to be roughly right before a call that is about to measure it exactly.
+#
+# IT IS ALSO THE INPUT-PACKING DIVISOR (see MATCHING_INPUT_TOKEN_BUDGET below),
+# and there it is deliberately CONSERVATIVE rather than accurate. Measured on
+# this project's own Stage 5 prompts the true ratio is 4.2-4.4 characters per
+# token, so dividing by 4 over-states the token count by 5-10% and the packer
+# closes a chunk slightly early. That is the direction a budget guard must err
+# in: an under-estimate ships a chunk over the threshold the packing exists to
+# stay under, and the threshold is where the measured degradation begins.
 CHARS_PER_TOKEN = 4
+
+
+# ---------------------------------------------------------------------------
+# Stage 5 INPUT packing
+# ---------------------------------------------------------------------------
+#
+# A SECOND SPLITTER, ON A DIFFERENT AXIS FROM THE THREE BUDGETS ABOVE. Those
+# are all about the RESPONSE -- MATCHING_OUTPUT_SPLIT_FRACTION pre-splits on an
+# output estimate and MAX_TRUNCATION_SPLITS halves reactively when the response
+# was cut off. Nothing looked at the size of the REQUEST, and the request is
+# where the fault measured for this pass lives:
+#
+#   * output quality degrades above roughly 12,000 input tokens -- verdicts get
+#     thinner and criteria arrays shorter as the prompt grows;
+#   * trials are silently omitted from the response, which the reconciliation
+#     block records as NOT_EVALUABLE_MODEL_OMITTED but cannot prevent;
+#   * reasoning demonstrably leaks between trials inside one prompt, which is
+#     the thing constraint C4 asks the model not to do and cannot enforce.
+#
+# None of the three raises, none moves a counter on its own, and all three get
+# worse as MAX_TRIALS_FOR_EVALUATION or the criteria text grows.
+#
+# THE TWO MECHANISMS COMPOSE AND ARE NOT ALTERNATIVES. Packing bounds what goes
+# IN; the pre-split and the reactive split bound what comes OUT. A packed chunk
+# is still subject to both -- see node_llm_classifier_evaluation, which seeds the
+# pre-split loop with the packed chunks rather than with the whole batch.
+
+# Master switch. OFF reproduces the pre-packing behaviour EXACTLY: the node
+# seeds its pending queue with the whole batch, as it always did, and the two
+# output budgets are untouched. It is a switch rather than a threshold of
+# infinity because the validation run needs both arms, and because "packing did
+# not run" and "packing ran and produced one chunk" are different facts that the
+# provenance record has to be able to state apart.
+MATCHING_INPUT_PACKING_ENABLED = True
+
+# The per-chunk input ceiling, in estimated tokens, counting the WHOLE request:
+# the system message (instructions + this patient's record) plus the user
+# message carrying that chunk's fenced trials. Not the trials alone -- the model
+# reads one prompt, and a budget over half of it is not a budget.
+#
+# 12,000 is where the degradation above was measured to begin. It is not derived
+# from the model's context window, which is far larger; a context limit says
+# what will be REFUSED and this says where the answers get worse.
+MATCHING_INPUT_TOKEN_BUDGET = 12000
+
+# Ceiling on how many chunks INPUT packing may produce for one patient. The
+# output splitters keep their own budgets and are not counted here.
+#
+# WHAT HAPPENS AT THE CEILING IS THE POINT: the per-chunk budget is RAISED
+# uniformly to the smallest value that fits within this many chunks, and no
+# trial is ever dropped. A false keep -- a chunk larger than the ideal budget --
+# costs some answer quality on that chunk. A false drop costs a patient a trial
+# they may be eligible for, silently, with no counter that could report it. The
+# two are not comparable, so the packer has exactly one degree of freedom and it
+# is the budget.
+#
+# 5 x 12,000 = 60,000 input tokens of headroom against a 15-trial batch that
+# runs ~20,000, so this does not bite as configured; it exists so that a corpus
+# whose criteria text grows, or a raised MAX_TRIALS_FOR_EVALUATION, produces a
+# bounded number of billed calls rather than one per trial.
+MATCHING_MAX_INPUT_PACKED_CHUNKS = 5
 
 
 # ---------------------------------------------------------------------------

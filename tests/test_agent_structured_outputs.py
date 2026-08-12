@@ -323,9 +323,15 @@ def _extract_json_template(prompt_text: str):
 # filter ran. Section 5's output-format block is outside the Section 2 variant
 # switch, so either variant carries the same template; the confirmed one is
 # chosen because it is the ordinary path.
+# A declared stand-in for the patient record, which PROMPT_VERSION 1.6.0
+# moved into the system message. It exists only so the template renders;
+# nothing below reads it, and every span this file inspects (Section 5, the
+# JSON template, the output contract) is outside the PATIENT RECORD block.
+_PROBE_RECORD = "<probe: no patient record>"
+
 _PROMPT = render_system_prompt(mesh_filter_applied=True,
                                mesh_filter_skip_reason="applied",
-                               trial_count=2)
+                               patient_record=_PROBE_RECORD)
 _TEMPLATE_DOC = guarded(_extract_json_template, _PROMPT)
 
 check("the JSON template parses out of the rendered prompt",
@@ -349,8 +355,22 @@ check("Section 5's prose no longer asks for a bare JSON array",
       "valid JSON array" in _PROMPT, False)
 check("...and names the object envelope instead",
       'single key "evaluations"' in _PROMPT, True)
+# The needle dropped its leading "trials " at PROMPT_VERSION 1.6.0. Section 5
+# used to open "Evaluate ALL {trial_count} trials in the one array"; it now
+# counts the trials in the USER MESSAGE instead, because every chunk of a split
+# or packed batch carries this identical system message and a whole-batch number
+# in it instructed the model to answer about trials it had not been shown. The
+# PROPERTY this check is about -- one array, under that key -- is unchanged, so
+# the needle is narrowed to the part that states it rather than to the sentence
+# that happened to carry it.
 check("...and asks for all trials in the one array under that key",
-      'trials in the one array under "evaluations"' in _PROMPT, True)
+      'in the one array under "evaluations"' in _PROMPT, True)
+# ...and the count is about the MESSAGE, not about a number the system prompt
+# cannot know per chunk. This is the half of 1.6.0 the guard above cannot see.
+check("...and the completeness instruction names the user message rather than "
+      "a batch-wide trial count",
+      ("Evaluate EVERY trial in the user message" in _PROMPT,
+       "Evaluate ALL" in _PROMPT), (True, False))
 
 # SECTION 5 NAMES THE FIELDS IN PROSE AS WELL AS SHOWING THEM IN THE TEMPLATE,
 # AND THAT PROSE LINE WAS THE ONE STATEMENT OF TRIAL_FIELDS NOTHING CHECKED.

@@ -459,29 +459,60 @@ for _label, _p in ([(s, _TIER_PATIENTS[s]) for s in STAGE_SOURCES]
 
 
 # ===========================================================================
-# 6. THE DECLARATION IS IN THE USER MESSAGE ONLY
+# 6. THE STAGE SECTION IS THE RECORD'S, NEVER THE TEMPLATE'S
 # ===========================================================================
 
 print("\n" + "=" * 70)
-print("6. the system prompt does not carry a stage section")
+print("6. the system prompt template does not carry a stage section")
 print("=" * 70)
 
-# tests/test_agent_prompt_version.py holds the system prompt's BYTES against a
-# committed snapshot. What is asserted here is the narrower fact this change is
-# responsible for: nothing about the patient's stage entered that template.
+# THE CLAIM THIS SECTION MAKES CHANGED AT PROMPT_VERSION 1.6.0, and it is
+# restated rather than deleted or left standing while false.
+#
+# It used to read "the declaration is in the USER message only", which was true
+# while _create_patient_summary's output went into the user message. 1.6.0 moved
+# the patient's record into the SYSTEM message -- so the stage section IS in the
+# system message now, and a check asserting otherwise would either fail or, worse,
+# pass against a probe record that happened not to mention a stage and thereby
+# assert nothing.
+#
+# The fact this file is responsible for survives the move intact: the stage
+# section is the RECORD's, so it appears exactly when the record it was rendered
+# from contains it, and the TEMPLATE contributes nothing of its own. Both halves
+# are asserted, which is strictly more than the old check did -- the old form
+# could not distinguish "the template has no stage section" from "the renderer
+# ignores its arguments".
+_EMPTY_RECORD = "<probe: no patient record>"
+
 for _applied in (True, False):
     _sys = render_system_prompt(mesh_filter_applied=_applied,
                                 mesh_filter_skip_reason="no_mesh_filter",
-                                trial_count=3)
-    check(f"[mesh_filter_applied={_applied}] the system prompt has no "
-          "Cancer Stage section", "Cancer Stage" in _sys, False)
+                                patient_record=_EMPTY_RECORD)
+    check(f"[mesh_filter_applied={_applied}] the template has no Cancer Stage "
+          "section of its own", "Cancer Stage" in _sys, False)
     check(f"[mesh_filter_applied={_applied}] ...and does not state the "
           "absence sentence either", _ABSENCE_LINE in _sys, False)
+
+# THE OTHER HALF, AND IT IS THE NON-DEGENERACY OF THE TWO ABOVE. A renderer that
+# dropped its patient_record argument entirely would satisfy both of them.
+_REAL_RECORD = _create_patient_summary(_TIER_PATIENTS[STAGE_SOURCE_STAGE_GROUP])
+check("the record's stage section reaches the system message when the record "
+      "carries one (non-degeneracy on the two checks above)",
+      "Cancer Stage" in render_system_prompt(
+          mesh_filter_applied=True, mesh_filter_skip_reason="no_mesh_filter",
+          patient_record=_REAL_RECORD), True)
+check("...and the absence sentence reaches it for a patient with no stage",
+      _ABSENCE_LINE in render_system_prompt(
+          mesh_filter_applied=True, mesh_filter_skip_reason="no_mesh_filter",
+          patient_record=_create_patient_summary(_NO_STAGE)), True)
+check("...and the summary that carries it is itself non-degenerate",
+      "Cancer Stage" in _REAL_RECORD, True)
+
 # Non-degeneracy: the renders above are real prompts, not empty strings.
 check("the rendered system prompt is non-degenerate",
       len(render_system_prompt(mesh_filter_applied=True,
                                mesh_filter_skip_reason="no_mesh_filter",
-                               trial_count=3)) > 500, True)
+                               patient_record=_EMPTY_RECORD)) > 500, True)
 
 
 # ===========================================================================

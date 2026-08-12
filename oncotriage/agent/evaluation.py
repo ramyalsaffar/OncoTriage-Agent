@@ -61,6 +61,9 @@ from oncotriage.agent.state import (
 )
 from oncotriage.config import (
     CHARS_PER_TOKEN,
+    MATCHING_INPUT_PACKING_ENABLED,
+    MATCHING_INPUT_TOKEN_BUDGET,
+    MATCHING_MAX_INPUT_PACKED_CHUNKS,
     MATCHING_MAX_TOKENS,
     MATCHING_MODEL,
     MATCHING_OUTPUT_SPLIT_FRACTION,
@@ -887,6 +890,236 @@ def _build_trials_text(trials: List[Dict]) -> str:
     return "".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Stage 5 INPUT packing
+# ---------------------------------------------------------------------------
+#
+# THE OTHER AXIS. estimate_output_tokens and the two splitters built on it are
+# about the RESPONSE. This is about the REQUEST, and the two are independent:
+# a batch can be small enough to answer inside the output ceiling and still be
+# large enough on the way in to degrade the answers, omit trials silently, and
+# let reasoning leak between trials inside one prompt. oncotriage/config.py's
+# MATCHING_INPUT_TOKEN_BUDGET block records the measurements.
+#
+# THE TWO COMPOSE, THEY DO NOT REPLACE EACH OTHER. The packer produces the
+# chunks the node's existing pre-split loop then works over, so a packed chunk
+# whose OUTPUT estimate is still too large is halved by the machinery that
+# already existed, and a packed chunk whose response is cut off is halved
+# reactively by the machinery that already existed. Nothing about merging,
+# duplicate handling, out-of-set classification, refusal semantics or the
+# reconciliation is duplicated here -- all of it is already chunk-aware, and
+# packing only changes how the first generation of chunks is produced.
+
+# What the token figures in the packing record were measured with. Recorded in
+# provenance rather than left implicit: the packer's decisions are only
+# reproducible if the estimator that made them is named, and this project has
+# been through one estimator change already.
+PACKING_METHOD_CHARS = f"characters/{CHARS_PER_TOKEN}"
+
+
+def estimate_prompt_tokens(text: str) -> int:
+    """Estimated tokens for a piece of prompt text.
+
+    The same characters/CHARS_PER_TOKEN proxy File 11 uses for embedding batch
+    sizing and estimate_output_tokens uses for its criteria term, applied to the
+    request instead of the response. No tokenizer: tiktoken would be a new heavy
+    dependency and an import cost, and it would still not be the model's own
+    tokenizer -- gpt-5.6-terra publishes none.
+
+    CHARS_PER_TOKEN is 4 against a measured 4.2-4.4 on this project's prompts,
+    so this OVER-states by 5-10%. That is the direction a budget guard has to
+    err in; see the constant.
+
+    Rounded UP, for the same reason. int() truncation would let a chunk sit one
+    token over the budget for every fractional remainder in it, which across
+    fifteen trials is a systematic under-count of a guard.
+    """
+    if not text:
+        return 0
+    return -(-len(text) // CHARS_PER_TOKEN)
+
+
+def _trial_input_tokens(trial_obj: Dict) -> int:
+    """Estimated request tokens contributed by one trial's rendered block.
+
+    MEASURED THROUGH THE SHIPPED RENDERER, never through a second formula.
+    ``_build_trials_text`` concatenates one self-contained block per trial with
+    no separator, so ``len(_build_trials_text(chunk))`` equals the sum of the
+    per-trial lengths exactly -- which makes a per-trial measurement additive
+    and makes the packer's arithmetic a statement about the bytes that will be
+    sent rather than about a model of them. A hand-written "length of the
+    criteria plus a fence allowance" would be a second implementation of the
+    renderer, free to drift from it silently.
+
+    THE COST IS ONE EXTRA RENDER PER TRIAL, and one consequence is worth naming:
+    a trial whose scraped text contains fence markers emits its
+    ``trial_fence_marker_neutralized`` warning once for this measurement as well
+    as once per chunk it is sent in. That is already the documented meaning of
+    the event -- ``_build_trials_text`` records that it counts RENDERS rather
+    than trials -- and no real trial in the corpus contains a bracket run.
+    """
+    return estimate_prompt_tokens(_build_trials_text([trial_obj]))
+
+
+def _pack_greedy(costs: List[int], fixed_tokens: int,
+                 budget: int) -> List[List[int]]:
+    """Greedy next-fit over ``costs``, in order, into chunks of ``budget``.
+
+    ``costs`` are per-trial token estimates and the return value is a list of
+    lists of INDEXES into it, so the caller can map back to trial objects
+    without this function knowing what a trial is.
+
+    NEXT-FIT, IN THE GIVEN ORDER, and both halves matter. Order is preserved
+    because the trials arrive ranked and the pipeline's determinism is built on
+    that ranking; a bin-packing heuristic that reorders (first-fit-decreasing
+    and friends) would pack marginally tighter and would send trials to the
+    judge in an order nothing else in this pipeline produces. Next-fit, with the
+    order fixed, is also MONOTONE in the budget -- a larger budget never yields
+    more chunks -- which is what makes the binary search in
+    ``pack_trials_by_input_tokens`` correct rather than approximate.
+
+    A cost that does not fit in an EMPTY chunk gets its own chunk anyway. It is
+    the caller that flags it; dropping it is not an option this function has.
+    """
+    chunks: List[List[int]] = []
+    current: List[int] = []
+    used = 0
+    for index, cost in enumerate(costs):
+        if current and fixed_tokens + used + cost > budget:
+            chunks.append(current)
+            current = []
+            used = 0
+        current.append(index)
+        used += cost
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _minimum_budget_for(costs: List[int], fixed_tokens: int, lower: int,
+                        max_chunks: int) -> int:
+    """The smallest budget >= ``lower`` that packs ``costs`` into <= max_chunks.
+
+    Exists only for the cap: when the configured budget would produce more
+    chunks than MATCHING_MAX_INPUT_PACKED_CHUNKS allows, the budget is raised
+    UNIFORMLY to the least value that fits, and no trial is dropped. See the
+    constant for why the only degree of freedom is the budget.
+
+    BINARY SEARCH IS EXACT HERE, not a heuristic, because _pack_greedy's chunk
+    count is monotone non-increasing in the budget. Sketch: let f_B(j) be the
+    index reached after j chunks at budget B. f_B'(0) = f_B(0) = 0 for
+    B' >= B; and if chunk j+1 under B' starts at s' >= s = f_B(j), then either
+    s' is already past the end of chunk j+1 under B, or the items from s' to
+    that end are a suffix of a set that fit in B <= B', so B' reaches at least
+    as far. So the predicate "fits in <= max_chunks" is monotone in B and the
+    search finds its threshold.
+
+    The upper bound always satisfies the predicate: fixed + sum(costs) packs
+    everything into one chunk, and max_chunks >= 1. So this never returns
+    without an answer, which is what "never drop a trial" rests on.
+    """
+    high = fixed_tokens + sum(costs)
+    low = max(lower, 1)
+    if len(_pack_greedy(costs, fixed_tokens, low)) <= max_chunks:
+        return low
+    while low < high:
+        mid = (low + high) // 2
+        if len(_pack_greedy(costs, fixed_tokens, mid)) <= max_chunks:
+            high = mid
+        else:
+            low = mid + 1
+    return low
+
+
+def pack_trials_by_input_tokens(trials: List[Dict], fixed_tokens: int,
+                                budget: int,
+                                max_chunks: int) -> Tuple[List[List[Dict]], Dict]:
+    """Split a batch into chunks whose estimated INPUT stays under ``budget``.
+
+    Args:
+        trials: the batch, in the order Stage 4 ranked it. Never reordered.
+        fixed_tokens: estimated tokens every request carries whatever is in it
+            -- the system message (instructions plus this patient's record) and
+            the user message's wrapper. It is charged to EVERY chunk, because
+            the model reads one prompt and a budget that ignored half of it
+            would not be a budget.
+        budget: MATCHING_INPUT_TOKEN_BUDGET, or whatever the caller passes.
+        max_chunks: MATCHING_MAX_INPUT_PACKED_CHUNKS.
+
+    Returns:
+        ``(chunks, report)``. ``chunks`` is a partition of ``trials`` -- every
+        trial in exactly one chunk, order preserved, no chunk empty -- and
+        ``report`` is the provenance record the node publishes.
+
+    THE INVARIANT THIS FUNCTION EXISTS TO KEEP is that a trial is never dropped.
+    Every path here either places a trial or raises; there is no branch that
+    discards one, and the two ways a batch can refuse to fit are both resolved
+    by RAISING THE BUDGET rather than by shedding load:
+
+      * more chunks than the cap allows -> the budget is raised uniformly to
+        the least value that fits (``_minimum_budget_for``), and
+        ``cap_relaxed_budget`` records it;
+      * a single trial larger than the budget on its own -> it ships as its own
+        over-budget chunk, and ``over_budget_chunk`` records it. There is
+        nothing smaller to send it in; the alternative is not sending it.
+
+    A false keep costs some answer quality on one chunk. A false drop costs a
+    patient a trial they might be eligible for, silently. They are not
+    comparable.
+
+    THE TWO FLAGS MEASURE AGAINST DIFFERENT BUDGETS, DELIBERATELY.
+    ``cap_relaxed_budget`` says the CONFIGURED budget could not fit the batch in
+    ``max_chunks`` and records what it was raised to. ``over_budget_chunk`` is
+    then measured against the EFFECTIVE budget, so it means "this chunk could
+    not be made to fit by any amount of packing" -- which after a relaxation is
+    only ever a single trial larger than the whole allowance. One flag folded
+    over both budgets would report a relaxed run and an unpackable trial as the
+    same finding, and they have different fixes.
+    """
+    report = {
+        "enabled": True,
+        "method": PACKING_METHOD_CHARS,
+        "fixed_tokens": fixed_tokens,
+        "budget_tokens_configured": budget,
+        "budget_tokens": budget,
+        "max_chunks": max_chunks,
+        "cap_relaxed_budget": False,
+        "over_budget_chunk": False,
+        "trials": len(trials),
+        "chunks": [],
+    }
+    if not trials:
+        # A zero-trial batch is a real state -- Stage 4 can empty the pool and
+        # the graph routes elsewhere, but this node must not depend on that.
+        # One empty chunk would issue a request about nothing; no chunk at all
+        # is the truthful answer and the caller's loop handles it.
+        return [], report
+
+    costs = [_trial_input_tokens(t) for t in trials]
+
+    effective = budget
+    index_chunks = _pack_greedy(costs, fixed_tokens, effective)
+    if len(index_chunks) > max_chunks:
+        effective = _minimum_budget_for(costs, fixed_tokens, budget, max_chunks)
+        index_chunks = _pack_greedy(costs, fixed_tokens, effective)
+        report["cap_relaxed_budget"] = True
+        report["budget_tokens"] = effective
+
+    chunks = []
+    for indexes in index_chunks:
+        tokens = fixed_tokens + sum(costs[i] for i in indexes)
+        over = tokens > effective
+        if over:
+            report["over_budget_chunk"] = True
+        report["chunks"].append({
+            "trials": len(indexes),
+            "tokens_estimated": tokens,
+            "over_budget": over,
+        })
+        chunks.append([trials[i] for i in indexes])
+    return chunks, report
+
+
 def _unevaluable_entry(trial_obj: Dict, reason: str) -> Dict:
     """A verdict-shaped record for a trial that could not be evaluated.
 
@@ -1266,10 +1499,31 @@ def node_llm_classifier_evaluation(state: TrialMatchState) -> dict:
     # chunk (see call_matching_model(system_prompt, _user_prompt_for(chunk))
     # below). A hash per call would therefore record the same value N times and
     # say nothing a single column does not.
+    #
+    # THE PATIENT RECORD IS IN IT AS OF PROMPT_VERSION 1.6.0, which is what
+    # makes "one hash per inference" a statement about the patient as well as
+    # about the template, and what makes the system message the CACHED PREFIX:
+    # every chunk of one patient sends these identical bytes, so the provider
+    # discounts them from the second request on.
+    #
+    # NEUTRALIZED FIRST, by the same function and for the same reason
+    # _build_trials_text neutralizes trial text. The record is assembled from
+    # FHIR values this project does not author, it is about to be placed inside
+    # the message C6 calls the only source of instructions, and a fence whose
+    # own body can spell the closing marker is not a boundary. On every real
+    # patient this changes nothing -- a summary contains no bracket runs -- and
+    # the count is logged when it does.
+    patient_record, _record_runs = _neutralize_fence_markers(patient_summary)
+    if _record_runs:
+        log.warning("neutralized a fence marker inside the patient record",
+                    stage=5, node="llm_classifier_evaluation",
+                    event="patient_record_fence_marker_neutralized",
+                    count=_record_runs)
+
     system_prompt = render_system_prompt(
         mesh_filter_applied=_mesh_filter_applied,
         mesh_filter_skip_reason=_mesh_filter_reason,
-        trial_count=len(trials),
+        patient_record=patient_record,
     )
     # The mechanical record of what was actually sent, beside PROMPT_VERSION's
     # record of what was intended. Computed here rather than at logging time so
@@ -1282,11 +1536,14 @@ def node_llm_classifier_evaluation(state: TrialMatchState) -> dict:
 # USER MESSAGE
 # ================================================================
 
+    # THE PATIENT RECORD IS NOT HERE ANY MORE (PROMPT_VERSION 1.6.0). The user
+    # message carries this chunk's fenced trials and nothing else, so the only
+    # thing that differs between two requests of one patient is the part after
+    # the cached prefix. The `CLINICAL TRIALS:` heading stays: it is a
+    # structural label rather than patient data, and it is the anchor the
+    # dashboard's stored-prompt reader already keys on.
     def _user_prompt_for(chunk: List[Dict]) -> str:
         return f"""
-PATIENT RECORD:
-{patient_summary}
-
 CLINICAL TRIALS:
 {_build_trials_text(chunk)}
 """
@@ -1296,7 +1553,73 @@ CLINICAL TRIALS:
     # splits, the stored prompt is the one the run would have sent unsplit,
     # which is the thing that is comparable across runs; the split itself is
     # recorded in llm_classifier_truncation_splits, not by mutating this.
+    #
+    # THE CONVENTION SURVIVES 1.6.0 UNCHANGED, and that is the reason this line
+    # is untouched. "The prompt the run would have sent unsplit" is still
+    # exactly what it holds: the system message, which is byte-identical on
+    # every request this node makes, and the user message for the WHOLE batch,
+    # which is what an unsplit run would have sent. What moved is which side of
+    # the [SYSTEM]/[USER] marker the patient record sits on -- so the column
+    # still round-trips to one well-defined request, and a reader that wants
+    # the record now finds it above the marker instead of below it. The
+    # PATIENT RECORD block carries its own <<<PATIENT_RECORD>>> /
+    # <<<END_PATIENT_RECORD>>> delimiters precisely so that reader does not have
+    # to guess where it ends.
     prompt = f"[SYSTEM]\n{system_prompt}\n\n[USER]\n{_user_prompt_for(trials)}"
+
+    # Everything a request carries whatever chunk is in it: the system message
+    # in full, and the user message's wrapper with no trials in it. Measured
+    # rather than approximated -- _user_prompt_for([]) IS the wrapper, so this
+    # cannot drift from the template the way a hand-counted allowance would.
+    fixed_input_tokens = (estimate_prompt_tokens(system_prompt)
+                          + estimate_prompt_tokens(_user_prompt_for([])))
+
+    # ------------------------------------------------------------------
+    # Packing: bound the INPUT before the output splitters see the batch
+    # ------------------------------------------------------------------
+    #
+    # FIRST, AND THE ORDER IS THE DESIGN. Packing produces contiguous chunks
+    # under an input ceiling; the pre-split below then halves any of THOSE whose
+    # output estimate is still too large, and the reactive splitter halves
+    # further if a response is actually cut off. Running the halving first and
+    # packing inside it would give the same partition on ordinary input and a
+    # worse one in general -- a halved chunk is not a chunk the input budget
+    # chose -- and it would make the pre-split's depth accounting describe
+    # something other than the chunks that were sent.
+    #
+    # OFF REPRODUCES THE OLD BEHAVIOUR EXACTLY: initial_chunks is [trials], the
+    # single-element list the pre-split loop has always started from, and every
+    # branch below is the code that was already here.
+    if MATCHING_INPUT_PACKING_ENABLED:
+        initial_chunks, packing_report = pack_trials_by_input_tokens(
+            trials, fixed_input_tokens, MATCHING_INPUT_TOKEN_BUDGET,
+            MATCHING_MAX_INPUT_PACKED_CHUNKS)
+        # tokens_estimated IS THE WHOLE BATCH'S INPUT, not the fixed overhead.
+        # It is the number the threshold beside it is a threshold ON, and a
+        # reader comparing the two is asking "how far over was this patient" --
+        # which is unanswerable if the field carries the constant part instead.
+        log.info("packed the Stage 5 request by input token estimate", stage=5,
+                 event="input_packing", chunks=len(initial_chunks),
+                 total=len(trials),
+                 tokens_estimated=(fixed_input_tokens + sum(
+                     c["tokens_estimated"] - fixed_input_tokens
+                     for c in packing_report["chunks"])),
+                 threshold=packing_report["budget_tokens"],
+                 degraded=(packing_report["cap_relaxed_budget"]
+                           or packing_report["over_budget_chunk"]))
+    else:
+        initial_chunks = [trials]
+        # NOT None, and not an omitted key. "Packing did not run" is a fact the
+        # provenance has to be able to state, and it is different from "packing
+        # ran and produced one chunk" -- which is the comparison the validation
+        # experiment is built on.
+        packing_report = {"enabled": False, "method": PACKING_METHOD_CHARS,
+                          "fixed_tokens": fixed_input_tokens,
+                          "budget_tokens_configured": MATCHING_INPUT_TOKEN_BUDGET,
+                          "budget_tokens": None, "max_chunks": None,
+                          "cap_relaxed_budget": False,
+                          "over_budget_chunk": False,
+                          "trials": len(trials), "chunks": []}
 
     # ------------------------------------------------------------------
     # Proactive: split before sending if the batch is expected to overflow
@@ -1306,7 +1629,12 @@ CLINICAL TRIALS:
 
     pending = []          # LIFO of (chunk, split_depth), so a split is depth-first
     proactive_splits = 0
-    initial_chunks = [trials]
+    # THE GUARD IS STILL THE WHOLE BATCH'S ESTIMATE, and that is safe rather
+    # than sloppy: estimate_output_tokens is monotone in the trial set (its
+    # count term is linear and its criteria term is a min of two non-decreasing
+    # quantities), so no packed chunk can be over the threshold when the whole
+    # batch is under it. Keeping the original guard is also what makes the OFF
+    # arm byte-identical to the pre-packing node rather than merely equivalent.
     if estimated_output > split_threshold:
         depth = 0
         while depth < MAX_TRUNCATION_SPLITS and any(
@@ -1329,7 +1657,20 @@ CLINICAL TRIALS:
                  chunks=len(initial_chunks), depth=depth)
         pending = [(c, depth) for c in reversed(initial_chunks)]
     else:
-        pending = [(trials, 0)]
+        # DEPTH 0 FOR A PACKED CHUNK, WHICH IS A DECISION AND NOT AN ACCIDENT.
+        # `depth` is the TRUNCATION-split budget: how many further HALVINGS a
+        # chunk may spend when the model's answer is cut off. Packing is not a
+        # halving and it does not address the output ceiling, so charging it a
+        # level would take budget away from the only mechanism that can recover
+        # a truncated response -- and it would do so on every packed run,
+        # including the ones that never truncate. The pre-split above still
+        # charges its own levels, exactly as before, because those ARE halvings
+        # and they are performed for the same reason the reactive ones are.
+        #
+        # So a packed chunk enters the loop with the full MAX_TRUNCATION_SPLITS
+        # available, the same as the whole batch used to. Packing only makes
+        # truncation less likely: a smaller chunk produces a smaller response.
+        pending = [(c, 0) for c in reversed(initial_chunks)]
 
     # ------------------------------------------------------------------
     # Evaluate, splitting reactively on finish_reason == "length"
@@ -1369,6 +1710,24 @@ CLINICAL TRIALS:
     # token twice.
     reasoning_tokens = 0
     reasoning_tokens_reported = False   # any response carried the breakdown
+    # Cached INPUT tokens, the provider's own report of how much of this
+    # request's prefix it served from cache. A SUBSET of prompt_tokens, exactly
+    # as reasoning is a subset of completion_tokens, and it is accumulated the
+    # same way and for the same reason: it is the measurement that says whether
+    # moving the patient record into the system message bought anything.
+    #
+    # Read defensively and reported as ABSENT rather than as 0 when no response
+    # carried it -- a stub (File 37), a fixture recorded before the field
+    # existed, and a provider that does not cache at all are three different
+    # facts, and only the last of them is a genuine zero.
+    #
+    # NOT A COST TERM. get_model_cost() prices input at one rate; cached input
+    # bills lower (PRICING_CONFIG's gpt-5.6-terra note records $0.20/1M against
+    # $2.00/1M) and that discount is deliberately NOT modelled here. Subtracting
+    # it would make estimated_cost_usd disagree with every historical row in the
+    # same column. This is a measurement for the validation run.
+    cached_input_tokens = 0
+    cached_input_reported = False
     # The model string the API ANSWERED with, as opposed to MATCHING_MODEL,
     # which is what was asked for. They differ whenever an alias resolves to a
     # dated snapshot (gpt-4o-2024-08-06 is one). Last writer wins across a split
@@ -1432,6 +1791,18 @@ CLINICAL TRIALS:
         if _reasoning is not None:
             reasoning_tokens += _reasoning
             reasoning_tokens_reported = True
+
+        # The cached half of the same reading. `prompt_tokens_details` is the
+        # input-side sibling of `completion_tokens_details` and carries
+        # `cached_tokens`; both getattrs are defensive for the same three
+        # reasons the block above lists. An int() coercion is deliberately NOT
+        # applied -- a non-numeric value would be a provider contract change and
+        # is better as a TypeError here than as a plausible number in a record.
+        _prompt_details = getattr(response.usage, "prompt_tokens_details", None)
+        _cached = getattr(_prompt_details, "cached_tokens", None)
+        if _cached is not None:
+            cached_input_tokens += _cached
+            cached_input_reported = True
 
         # The model that ANSWERED, checked against the one requested BEFORE its
         # verdicts are parsed or accumulated. Placed here rather than at logging
@@ -2537,6 +2908,36 @@ CLINICAL TRIALS:
         # accumulator above.
         "llm_classifier_reasoning_tokens": (reasoning_tokens if reasoning_tokens_reported
                                    else None),
+        # The cached share of llm_classifier_input_tokens, on the identical
+        # convention: a subset, never an addition, and None -- not 0 -- when no
+        # response reported it. See the accumulator.
+        "llm_classifier_cached_input_tokens": (cached_input_tokens
+                                               if cached_input_reported
+                                               else None),
+        # ── What the INPUT packer did ──────────────────────────────────────
+        #
+        # WRITTEN ON THE SUCCESS PATH ONLY, on the hallucinated_trials
+        # precedent rather than the truncation-counter one. The chunk list is a
+        # record of requests that were ISSUED; a run that died at its first
+        # call packed the same way and sent one of them, and publishing the
+        # full plan as though it had all been sent would be a partial count
+        # reported as a total. A key never written leaves state.get() at None
+        # and _pipeline_provenance turns that into "the packer's record does
+        # not describe this run".
+        #
+        # TWO KEYS RATHER THAN ONE, because they answer different questions and
+        # one of them is a scalar a query can group by. The count is the
+        # headline; the report is the detail behind it.
+        "llm_classifier_packed_chunks": len(packing_report["chunks"]),
+        "llm_classifier_packing": {
+            **packing_report,
+            # The identity of the prefix every one of those chunks shared. The
+            # SAME VALUE as llm_classifier_prompt_sha256 and the same variable,
+            # so the two cannot drift; it is repeated here because the packing
+            # record's whole claim is "these N requests had one prefix", and a
+            # record that does not name the prefix cannot support it.
+            "prefix_sha256": system_prompt_sha256,
+        },
         # The model that actually answered. File 14 logs this into
         # inferences.matching_model and prices against it, so the stored cost is
         # computed from the model that produced the tokens rather than from

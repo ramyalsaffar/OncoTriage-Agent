@@ -68,7 +68,7 @@ inputs rather than to the assembled output, and C6's presence in both Section 2
 variants of the system prompt -- with ten planted controls of its own. Those
 properties are not restated here. This file pins BYTES against a version; that
 file proves the properties hold for any input. Neither subsumes the other: a
-reworded ``PATIENT RECORD:`` heading, a dropped exclusion block or a reordered
+reworded ``CLINICAL TRIALS:`` heading, a dropped exclusion block or a reordered
 section moves nothing that file checks, and no digest can state a property that
 holds for inputs nobody rendered.
 
@@ -389,13 +389,19 @@ def _make_local_user_prompt_for(patient_summary):
     parameter, same annotation, same f-string. Section 3 asserts that; if it
     ever fails, THIS is the copy that is wrong until the comparison says
     otherwise.
+
+    IT NO LONGER CLOSES OVER `patient_summary`, and the factory keeps the
+    parameter anyway. PROMPT_VERSION 1.6.0 moved the patient record into the
+    SYSTEM message, so the user message carries this chunk's fenced trials and
+    nothing else -- production's closure stopped reading the name too, and
+    Section 3's unparse comparison is over the INNER function, so the factory's
+    signature is this file's business alone. Keeping it is what makes Section
+    4's new assertion a measurement rather than a tautology: a real record is
+    passed in, is in scope, and does not reach the rendered bytes.
     """
 
     def _user_prompt_for(chunk: List[Dict]) -> str:
         return f"""
-PATIENT RECORD:
-{patient_summary}
-
 CLINICAL TRIALS:
 {_build_trials_text(chunk)}
 """
@@ -475,11 +481,12 @@ check("the local copy is character-for-character production's template "
 
 # The template has to actually reach both moving parts, or "identical" is a
 # statement about two equally inert strings.
-check("the template interpolates the patient summary and calls "
-      "_build_trials_text (non-degeneracy on the comparison above)",
-      ("{patient_summary}" in (_PROD_TEMPLATE or ""),
-       "_build_trials_text(chunk)" in (_PROD_TEMPLATE or "")),
-      (True, True))
+check("the template calls _build_trials_text and does NOT interpolate the "
+      "patient summary (non-degeneracy on the comparison above, and the shape "
+      "PROMPT_VERSION 1.6.0 produced)",
+      ("_build_trials_text(chunk)" in (_PROD_TEMPLATE or ""),
+       "{patient_summary}" in (_PROD_TEMPLATE or "")),
+      (True, False))
 
 
 # ===========================================================================
@@ -548,12 +555,28 @@ check("the guarded surface is the whole-message digest, the whole-batch "
       len(_LIVE_DIGESTS), 2 + len(_TRIALS))
 check("every digest is a 64-character hex sha256",
       sorted({len(d) for d in _LIVE_DIGESTS.values()}), [64])
-check("the rendered user message is non-empty and carries both sections "
+check("the rendered user message is non-empty and carries the trials section "
       "(non-degeneracy: an empty render would still produce a digest)",
-      ("PATIENT RECORD:" in _LIVE_RENDERED["user_message"],
-       "CLINICAL TRIALS:" in _LIVE_RENDERED["user_message"],
+      ("CLINICAL TRIALS:" in _LIVE_RENDERED["user_message"],
+       "<<<TRIAL_DATA " in _LIVE_RENDERED["user_message"],
        len(_LIVE_RENDERED["user_message"]) > 500),
       (True, True, True))
+
+# ...AND THE PATIENT RECORD IS NOT IN IT, which is what PROMPT_VERSION 1.6.0
+# changed and is the one property of this message no digest can state on its
+# own. A real record is handed to the factory above precisely so this is a
+# measurement rather than a tautology: the value exists, it is in scope, and it
+# does not reach the bytes.
+check("the patient record does not appear in the user message (1.6.0 moved it "
+      "into the system message, which is the cached prefix)",
+      (_PATIENT_SUMMARY in _LIVE_RENDERED["user_message"],
+       "PATIENT RECORD:" in _LIVE_RENDERED["user_message"],
+       "Malignant neoplasm of breast" in _LIVE_RENDERED["user_message"]),
+      (False, False, False))
+check("...and the record this file passed in is non-degenerate, so the check "
+      "above is about a value that exists",
+      (len(_PATIENT_SUMMARY) > 100,
+       "Malignant neoplasm of breast" in _PATIENT_SUMMARY), (True, True))
 
 # Determinism, which is a stated property of this pipeline and is what makes a
 # stored digest meaningful at all.
@@ -781,8 +804,8 @@ check("7a  positive control: the live values against a snapshot of themselves "
 # and evaluate() rather than asserting on a hand-bent hex string.
 _mutated_rendered = dict(_LIVE_RENDERED)
 _mutated_rendered["user_message"] = (
-    _LIVE_RENDERED["user_message"].replace("PATIENT RECORD:",
-                                           "PATIENT RECORDS:", 1))
+    _LIVE_RENDERED["user_message"].replace("CLINICAL TRIALS:",
+                                           "CLINICAL TRIAL:", 1))
 check("7b  the one-character mutation actually changed the rendered text "
       "(non-degeneracy: a replace that matched nothing would make this "
       "control a no-op reporting success)",
@@ -836,7 +859,7 @@ check("7e  an artifact that disappeared from the guarded set is reported",
 _DIVERGED_SRC = (
     "def _make_local_user_prompt_for(patient_summary):\n"
     "    def _user_prompt_for(chunk: List[Dict]) -> str:\n"
-    "        return f'''\\nPATIENT RECORDS:\\n{patient_summary}\\n'''\n"
+    "        return f'''\\nCLINICAL TRIAL:\\n{_build_trials_text(chunk)}\\n'''\n"
     "    return _user_prompt_for\n"
 )
 _diverged_tree = ast.parse(_DIVERGED_SRC)
