@@ -466,6 +466,65 @@ class TrialMatchState(TypedDict):
     # amount on top of it. None when no response reported the breakdown; see
     # _pipeline_provenance() for why that is not 0.
     llm_classifier_reasoning_tokens: Optional[int]
+
+    # --- Stage 5 INPUT packing, and what the provider served from cache ------
+    #
+    # THESE FOUR MUST BE DECLARED HERE OR THEY DO NOT EXIST. A key a node
+    # returns and this TypedDict does not declare is not an error in LangGraph:
+    # it is DROPPED, silently, with no warning and no raise, because the schema
+    # is what defines the channels a node may write. The first three shipped at
+    # PROMPT_VERSION 1.6.0 written by node_llm_classifier_evaluation and read by
+    # _pipeline_provenance() and were undeclared, so every result carried NULL
+    # for all three -- and NULL is this project's "the measurement was not
+    # made", which is exactly what a genuinely unpacked run reports. The
+    # provenance was therefore indistinguishable from its own absence.
+    #
+    # Measured rather than reasoned about, on a StateGraph over this schema
+    # with the real nodes: the node returned packed_chunks=1, a full packing
+    # report and cached_tokens=1024, and the result carried None for all three
+    # while llm_classifier_reasoning_tokens -- one line above, same stub, same
+    # accumulate-and-return route, declared -- arrived intact.
+    # tests/test_agent_state_channel_coverage.py is the standing guard.
+    #
+    # ALL FOUR ARE Optional AND None IS NOT 0. Stage 5 writes them on its
+    # success return alone, so None means no Stage 5 run was completed (no
+    # candidates, an API failure, a refusal, an unparseable answer) rather than
+    # "one request of zero cached tokens". Same convention as
+    # hallucinated_trials above and llm_classifier_prompt_sha256 below.
+
+    # How many chunks the INPUT packer produced for this patient: the scalar a
+    # query groups by. 1 means it packed and needed one request; None means it
+    # did not run to completion. See oncotriage/config.py's
+    # MATCHING_INPUT_TOKEN_BUDGET block.
+    llm_classifier_packed_chunks: Optional[int]
+    # The packer's own record behind that count: the estimator named, the
+    # configured and effective budgets, the cap, the two degradation flags
+    # (cap_relaxed_budget, over_budget_chunk) and one entry per chunk carrying
+    # its trial count and estimated tokens.
+    llm_classifier_packing: Optional[Dict]
+    # The provider's report of how much of this request's prefix it served from
+    # cache, summed over the calls this stage made. A SUBSET of
+    # llm_classifier_input_tokens, exactly as reasoning is a subset of output,
+    # and never a costing term: get_model_cost() prices the whole input at the
+    # uncached rate deliberately, so stored costs stay comparable with every
+    # historical row.
+    llm_classifier_cached_input_tokens: Optional[int]
+    # ONE ENTRY PER CALL ACTUALLY ISSUED, in the order they were issued, never
+    # summed away. The three fields above are totals, and a total cannot answer
+    # the question packing exists to raise: whether the shared prefix is being
+    # served from cache on the SECOND and later chunks of the same patient. A
+    # single cached_tokens figure of 5,000 across three calls is consistent both
+    # with a cache that works and with one that never warms.
+    #
+    # A LIST IS NOT A COUNT, which is why this is written on the failure
+    # returns too where hallucinated_trials and the packing keys are not. Each
+    # element is a fact about a request that was made and billed; a short list
+    # understates nothing, it simply ends where the run ended. A failed run is
+    # exactly the run whose per-call token record is worth having, on the same
+    # argument _pipeline_provenance() makes for carrying the prompt hash out of
+    # the error paths.
+    llm_classifier_call_details: Optional[List[Dict]]
+
     # The model string the API answered with (response.model), which is not
     # necessarily MATCHING_MODEL: an alias can resolve to a dated snapshot.
     # This is what File 14 logs and prices against.

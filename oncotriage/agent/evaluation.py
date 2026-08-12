@@ -1728,6 +1728,24 @@ CLINICAL TRIALS:
     # same column. This is a measurement for the validation run.
     cached_input_tokens = 0
     cached_input_reported = False
+    # THE SAME READINGS, PER CALL, NOT SUMMED. The four accumulators above are
+    # totals over every request this stage made, and a total cannot answer the
+    # question INPUT packing exists to raise: whether the shared system prefix
+    # is served from cache on the SECOND and later chunks of one patient. One
+    # cached figure of 5,000 across three calls is equally consistent with a
+    # cache that warms after the first request and one that never warms at all,
+    # and those have opposite implications for what packing costs.
+    #
+    # Each entry also carries the chunk's split DEPTH, so a first-generation
+    # packed chunk (depth 0) is separable from a chunk the output splitters
+    # halved out of it. Without it a run with one packed chunk and two reactive
+    # splits is indistinguishable from a run the packer cut into three.
+    #
+    # Appended AFTER the usage reads and the answering-model check, so an entry
+    # exists only for a call whose response was accepted as this model's, and
+    # BEFORE the parse, so a call whose response was unusable is still recorded
+    # as having been made and billed.
+    call_details: List[Dict] = []
     # The model string the API ANSWERED with, as opposed to MATCHING_MODEL,
     # which is what was asked for. They differ whenever an alias resolves to a
     # dated snapshot (gpt-4o-2024-08-06 is one). Last writer wins across a split
@@ -1758,6 +1776,9 @@ CLINICAL TRIALS:
                       retry=retry_count + 1, error_type=type(e).__name__,
                       error_message=str(e))
             return {
+                # Calls ISSUED before this return, never summed. A list is not a
+                # count, so a short one understates nothing; see the accumulator.
+                "llm_classifier_call_details": call_details,
                 "evaluations": [],
                 "llm_classifier_retries": retry_count + 1,
                 "llm_classifier_truncation_splits": truncation_splits,
@@ -1819,6 +1840,29 @@ CLINICAL TRIALS:
 
         model_answered = _model_returned or model_answered
 
+        # ── One line in the per-call ledger ────────────────────────────────
+        #
+        # `_cached` and `_reasoning` are carried as read: None means THIS
+        # response reported no such breakdown, which is not zero and must not
+        # be rendered as zero. The accumulators above fold them into totals;
+        # this keeps the per-request fact the totals cannot reconstruct.
+        #
+        # `chunk_index` is the ordinal of the REQUEST, not of the packed chunk:
+        # the pending queue is a LIFO seeded in packing order, so calls 1..N of
+        # an unsplit run are packed chunks 1..N, and a split inserts its
+        # children immediately after their parent at depth+1. `depth` is what
+        # separates the two, so neither number has to be inferred.
+        call_details.append({
+            "call_index": calls_made,
+            "depth": depth,
+            "trials": len(chunk),
+            "prompt_tokens": response.usage.prompt_tokens,
+            "completion_tokens": response.usage.completion_tokens,
+            "cached_tokens": _cached,
+            "reasoning_tokens": _reasoning,
+            "finish_reason": getattr(choice, "finish_reason", None),
+        })
+
         # ── The model declined ─────────────────────────────────────────────
         #
         # Checked HERE: after the call is counted and the answering model is
@@ -1859,6 +1903,9 @@ CLINICAL TRIALS:
                       response_chars=len(_refusal))
             console.out(f"  [Stage 5] refusal: {_refusal[:_REFUSAL_PREVIEW_LEN]}")
             return {
+                # Calls ISSUED before this return, never summed. A list is not a
+                # count, so a short one understates nothing; see the accumulator.
+                "llm_classifier_call_details": call_details,
                 "evaluations": [],
                 # UNINCREMENTED, deliberately. See above.
                 "llm_classifier_retries": retry_count,
@@ -1970,6 +2017,9 @@ CLINICAL TRIALS:
             # transient and unindexed; the structured record is neither.
             console.out(f"  [Stage 5] response preview: {chunk_text[:300]}")
             return {
+                # Calls ISSUED before this return, never summed. A list is not a
+                # count, so a short one understates nothing; see the accumulator.
+                "llm_classifier_call_details": call_details,
                 "evaluations": [],
                 "llm_classifier_retries": retry_count + 1,
                 "llm_classifier_truncation_splits": truncation_splits,
@@ -2020,6 +2070,9 @@ CLINICAL TRIALS:
             # Same reasoning as the parse-error branch above.
             console.out(f"  [Stage 5] response preview: {chunk_text[:300]}")
             return {
+                # Calls ISSUED before this return, never summed. A list is not a
+                # count, so a short one understates nothing; see the accumulator.
+                "llm_classifier_call_details": call_details,
                 "evaluations": [],
                 "llm_classifier_retries": retry_count + 1,
                 "llm_classifier_truncation_splits": truncation_splits,
@@ -2914,6 +2967,10 @@ CLINICAL TRIALS:
         "llm_classifier_cached_input_tokens": (cached_input_tokens
                                                if cached_input_reported
                                                else None),
+        # The same four readings PER CALL, in the order the calls were issued.
+        # Written on every return of this node, not only here -- see the
+        # accumulator for why a list is not a count.
+        "llm_classifier_call_details": call_details,
         # ── What the INPUT packer did ──────────────────────────────────────
         #
         # WRITTEN ON THE SUCCESS PATH ONLY, on the hallucinated_trials

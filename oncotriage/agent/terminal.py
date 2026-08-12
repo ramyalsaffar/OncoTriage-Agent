@@ -266,6 +266,16 @@ def _pipeline_provenance(state) -> Dict:
         "llm_classifier_packing": state.get("llm_classifier_packing"),
         "llm_classifier_cached_input_tokens": state.get(
             "llm_classifier_cached_input_tokens"),
+        # The per-call ledger behind the two token totals above. Same no-default
+        # route, and for once the absence is rarer than the presence: Stage 5
+        # writes this on EVERY one of its returns, so None here means the node
+        # was never entered at all rather than that it failed part way.
+        #
+        # ALL FOUR OF THESE KEYS WERE DROPPED BY THE GRAPH UNTIL THEY WERE
+        # DECLARED IN TrialMatchState. Reading a key here is not enough to make
+        # it exist: LangGraph writes only the channels the schema declares and
+        # discards the rest in silence. See the block that declares them.
+        "llm_classifier_call_details": state.get("llm_classifier_call_details"),
 
         # --- Which Stage 5 system prompt produced this row ------------------
         #
