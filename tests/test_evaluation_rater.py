@@ -51,12 +51,27 @@ WHAT IS COVERED, AND WHY EACH SECTION EXISTS:
   6  Absent ``corrected_status`` on an agree rating. Added test-first: the
      behaviour it pins did not exist when the section was written.
 
+  7  ``lift_rubric``. The rater's rulebook is SLICED BY MARKER out of the
+     shipped Stage 5 prompt so that both models are judged against one text,
+     and until PROMPT_VERSION 1.7.0 nothing exercised the slicing at all. 1.7.0
+     edits that prompt, so section 7 is the standing answer to "do all five
+     spans still lift, is every marker still unique, and did the edit reach the
+     rubric" -- the last of which it answers NO, by assertion rather than by
+     claim, because both of 1.7.0's additions lie outside every span.
+
 NEGATIVE CONTROLS ARE INPUT-BASED, NOT PLANTED. Every function under test here
 is pure, or takes its collaborators as arguments, so the natural control is a
 different INPUT that must produce a different answer -- the shape
 ``tests/test_agent_patient_hash_coverage.py`` uses for the same reason. That
 also keeps this file out of ``_EXEC_ALLOWLIST``: it execs nothing, loads no
 module by location, and patches no shipped source.
+
+ONE CONTROL CANNOT BE INPUT-BASED AND SAYS SO. ``lift_rubric()`` takes no
+arguments, so the only way to drive its cross-probe invariance refusal is to
+make the renderer answer differently for one probe. Section 7j rebinds
+``rater.render_system_prompt`` inside a ``try``/``finally`` and asserts the
+restore BY IDENTITY. That is an attribute rebind, not a patched source: nothing
+is exec'd, nothing on disk is touched, and the claim above is unaffected.
 
 NO NETWORK, NO KEYS, NO SPEND, NO DATABASE, NO CORPUS, NO GIT HISTORY. Every
 decision, response and usage object in here is a literal built in this file.
@@ -807,6 +822,179 @@ check("6e  CONTROL: agree-omitted and disagree-omitted differ",
       parsed(_AGREE_NO_KEY)[0] != parsed(_DISAGREE_NO_KEY)[0], True)
 check("6e  CONTROL: agree-omitted is not simply always-accepted JSON",
       parsed('{"status_verdict":"agree"}')[0], "wrong_keys")
+
+
+# ===========================================================================
+# SECTION 7 -- THE RUBRIC LIFT
+# ===========================================================================
+#
+# ``lift_rubric()`` slices the rater's rulebook out of the SHIPPED Stage 5
+# prompt by marker, so the two models are judged against one text rather than
+# two that can drift. Nothing exercised it. That is the gap this section closes,
+# and it is the gap PROMPT_VERSION 1.7.0 made worth closing now: that bump edits
+# the prompt these markers slice, so from here on every prompt edit needs a
+# standing answer to "do all five spans still lift, and is every marker still
+# unique".
+#
+# WHAT 1.7.0 DID TO THE RUBRIC, ASSERTED RATHER THAN ASSUMED: nothing. Both of
+# its additions -- Section 5's pre-disqualification check and the extended FINAL
+# REMINDER -- lie OUTSIDE every lifted span, so the rubric text is unchanged.
+# That is correct rather than an oversight, and 7d is where it is written down:
+# the rater already receives RULE 4 inside `evaluation_rules` and C4 inside
+# `absolute_constraints`, and 1.7.0 restates them for the CLASSIFIER at the
+# moment it writes a rejecting status. Restating them again for a rater that
+# judges one criterion at a time, and is never shown a trial verdict, would be
+# telling it not to do something it cannot do.
+#
+# THIS SECTION EXECS NOTHING, so the file stays out of _EXEC_ALLOWLIST. Four of
+# its five controls are pure INPUT -- ``_slice_span`` takes the rendered text as
+# an argument, so a doctored string IS the control. The fifth has to reach
+# ``lift_rubric``, which takes none, so it rebinds one module attribute inside a
+# try/finally and asserts the restore by identity.
+
+print("\n" + "=" * 70)
+print("SECTION 7 -- lift_rubric slices the shipped Stage 5 prompt")
+print("=" * 70)
+
+_PROBE_RENDERS = [drive(R.render_system_prompt, **p) for p in R._RENDER_PROBES]
+check("7a  non-degeneracy: all three declared render probes produced a real "
+      "prompt (a raise here would make every span check below vacuous)",
+      sorted({isinstance(t, str) and len(t) > 1000 for t in _PROBE_RENDERS}),
+      [True])
+check("7a  ...and they are not all the same text, so 'invariant across probes' "
+      "is a claim about the spans rather than about one string",
+      len(set(_PROBE_RENDERS)), len(R._RENDER_PROBES))
+
+def lifted():
+    """(rubric, meta), or ("", {}) when lift_rubric refused.
+
+    A named absence rather than a raise or a string that later gets subscripted:
+    every control below drives lift_rubric into its refusal branch on purpose,
+    and a helper that let one escape would abort the file on exactly the runs
+    it owes a summary.
+    """
+    out = drive(R.lift_rubric)
+    return out if isinstance(out, tuple) and len(out) == 2 else ("", {})
+
+
+_LIFTED = drive(R.lift_rubric)
+check("7a  lift_rubric returns without refusing",
+      isinstance(_LIFTED, tuple) and len(_LIFTED) == 2, True)
+_RUBRIC, _META = lifted()
+
+check("7b  every declared span lifted, in order",
+      _META.get("span_order"), [n for n, _, _ in R._RUBRIC_SPANS])
+check("7b  ...each non-empty",
+      sorted({v > 0 for v in (_META.get("span_chars") or {"x": 0}).values()}),
+      [True])
+# `drive` around the slice, not a bare call: _slice_span REFUSES rather than
+# returning, and the refusal is what half this section provokes deliberately.
+_SPAN_BY_NAME = {n: (s, e) for n, s, e in R._RUBRIC_SPANS}
+check("7b  ...and each appears VERBATIM in all three probe renders, which is "
+      "what says the rubric is the prompt's own text and not a paraphrase",
+      sorted({name for name in (_META.get("span_order") or [])
+              for text in _PROBE_RENDERS
+              if drive(R._slice_span, text, *_SPAN_BY_NAME.get(name, ("", "")),
+                       name) not in text}),
+      [])
+
+# The property _slice_span refuses on, checked directly against every variant
+# the pipeline can send rather than only against the probe set.
+_MARKER_COUNTS = sorted({(text.count(m), m)
+                         for _n, start, end in R._RUBRIC_SPANS
+                         for m in (start, end)
+                         for text in _PROBE_RENDERS})
+check("7c  every rubric marker occurs exactly once in every probe render",
+      sorted({n for n, _m in _MARKER_COUNTS}), [1])
+check("7c  non-degeneracy: there are markers to count",
+      len({m for _n, m in _MARKER_COUNTS}) >= 2 * len(R._RUBRIC_SPANS) - 2, True)
+
+# 7d -- what 1.7.0 added is OUT, and what it restates is IN.
+_ONE = _PROBE_RENDERS[0] if _PROBE_RENDERS else ""
+_R17 = ('BEFORE YOU WRITE "not_met" OR "violated" ON ANY CRITERION',
+        "ACTIVITY (RULE 4).", "ISOLATION (C4).",
+        'A trial is never "not_eligible" because another trial in this message')
+check("7d  non-degeneracy: 1.7.0's reinforcement IS in the rendered prompt",
+      sorted({n in _ONE for n in _R17}), [True])
+check("7d  ...and NONE of it reaches the lifted rubric: both additions sit "
+      "outside every span",
+      sorted(n for n in _R17 if n in _RUBRIC), [])
+check("7d  ...while the rules it restates ARE in the rubric, which is why that "
+      "is acceptable rather than a loss",
+      ("If the criterion requires an active/current condition:" in _RUBRIC,
+       "C4 -- TRIAL ISOLATION" in _RUBRIC), (True, True))
+check("7d  ...and the rubric still carries RULE 4's reference date, surfaced "
+      "for the caller to check against the run under audit",
+      bool(_META.get("reference_date_in_rules")), True)
+
+check("7e  the meta digests one sha per span, keyed by the span names",
+      sorted(_META.get("span_sha256") or {}),
+      sorted(n for n, _, _ in R._RUBRIC_SPANS))
+check("7e  lifting twice produces the same rubric (it is a pure function of "
+      "the shipped template)",
+      lifted()[1].get("rubric_sha256"), _META.get("rubric_sha256"))
+
+# --- the controls ----------------------------------------------------------
+_START, _END = R._RUBRIC_SPANS[0][1], R._RUBRIC_SPANS[0][2]
+check("7f  CONTROL: a start marker occurring twice refuses",
+      raises(R._slice_span, _ONE + "\n" + _START, _START, _END, "probe"),
+      (True, "RaterRefusal"))
+check("7g  CONTROL: a marker occurring zero times refuses",
+      raises(R._slice_span, _ONE, "A MARKER NO TEMPLATE CONTAINS", _END,
+             "probe"),
+      (True, "RaterRefusal"))
+check("7h  CONTROL: an end marker before the start refuses",
+      raises(R._slice_span, _ONE, _END, _START, "probe"),
+      (True, "RaterRefusal"))
+# The lifted-empty branch is DEFENSIVE and the input that reaches it says so:
+# the slice starts AT the start marker, so it can only strip to nothing when
+# that marker is itself whitespace. No entry in _RUBRIC_SPANS is, and none
+# should be -- which is exactly why the branch needs a control rather than a
+# reader's assurance that it can never fire. The first version of this line
+# used "AAA"/"\nBBB" and did NOT refuse: the slice was "AAA", non-empty,
+# because the start marker is inside its own span. Measured, not reasoned.
+check("7i  CONTROL: a span that lifts empty refuses",
+      raises(R._slice_span, "X  Y", "  ", "Y", "probe"),
+      (True, "RaterRefusal"))
+check("7f-7i CONTROL: the same call on the real text does NOT refuse "
+      "(the other half of all four)",
+      raises(R._slice_span, _ONE, _START, _END, "probe"), (False, None))
+
+# 7j -- THE INVARIANCE REFUSAL, the one thing four input controls cannot reach.
+# lift_rubric takes no arguments, so the only way to make a lifted span differ
+# BETWEEN probes is to make the renderer answer differently for one of them.
+# That is the defect this refusal exists for: a future edit interpolating a
+# run-specific value inside a span would bake one probe patient's data into
+# every rater request for every criterion of every run.
+_saved_render = R.render_system_prompt
+_calls = {"n": 0}
+
+
+def _perturbing_render(**kwargs):
+    """The shipped renderer, with one lifted line altered on the SECOND probe."""
+    _calls["n"] += 1
+    text = _saved_render(**kwargs)
+    if _calls["n"] == 2:
+        text = text.replace("This rule has ZERO exceptions.",
+                            "This rule has ZERO exceptions (probe 2).", 1)
+    return text
+
+
+try:
+    R.render_system_prompt = _perturbing_render
+    _p7j = raises(R.lift_rubric)
+finally:
+    R.render_system_prompt = _saved_render
+check("7j  CONTROL: a span that is not invariant across the probes refuses",
+      _p7j, (True, "RaterRefusal"))
+check("7j  ...the perturbation was real: the needle it edits is in the rubric "
+      "exactly once (a replace that matched nothing would make 7j a no-op "
+      "reporting success)",
+      _RUBRIC.count("This rule has ZERO exceptions."), 1)
+check("7j  ...and the renderer was restored by identity",
+      R.render_system_prompt is _saved_render, True)
+check("7j  ...so the lift is clean again afterwards",
+      lifted()[1].get("rubric_sha256"), _META.get("rubric_sha256"))
 
 
 # ===========================================================================

@@ -183,7 +183,45 @@ from oncotriage.utils import get_age_reference_date
 #       candidate sets now share a system-prompt hash and are still told apart
 #       by candidates_evaluated and by the combined-prompt hash the fixtures
 #       record.
-PROMPT_VERSION = "1.6.0"
+# 1.7.0 REINFORCED RULE 4 AND C4 AT THE DISQUALIFICATION POINT, which is the
+# moment a rejecting status is written rather than the top of the message where
+# both rules already stood. Two additions, no deletion and no reordering:
+#
+#   (a) Section 5's inclusion_criteria/exclusion_criteria field block gained a
+#       two-item check that fires before "not_met" or "violated" is written --
+#       ACTIVITY (the evidence must show the condition active NOW; resolved,
+#       inactive or in-remission evidence yields "not_evaluable" for inclusion
+#       and "not_violated" for exclusion, which is RULE 4 unchanged) and
+#       ISOLATION (this status rests on this trial's own criterion text alone,
+#       which is C4 unchanged).
+#   (b) The FINAL REMINDER gained the temporal case and the anti-cascade case
+#       explicitly, where it previously stated only the quotable-evidence rule.
+#
+# WHY, IN ONE SENTENCE: forensic analysis of evaluation runs found trials
+# sharing one request HERD to one verdict -- when the first trial in a request
+# is rejected 91.7% of the remaining trials in that request are also rejected,
+# against 2.5% when it is accepted -- the observed mechanism being that the
+# model settles one reading of the patient (a 1997-resolved AML read as active)
+# and applies it to every trial in the message, which is what C4 already
+# forbids and RULE 4 already answers.
+#
+# MIDDLE NUMBER. Nothing here is a new rule and nothing contradicts an old one;
+# what changed is WHERE the model is told, and the whole finding is that
+# placement is what the model acts on. A restatement that moves behaviour is a
+# meaning change by this file's own rule, and a restatement that did not move
+# behaviour would not be worth shipping.
+#
+# WHAT DID NOT MOVE, because a bump is not licence to touch the contract: the
+# JSON template's field set, field order and example values; the section order;
+# every section heading and marker line; the response schema; Section 2's two
+# variants; the fenced patient-record block. Both additions lie OUTSIDE every
+# span oncotriage/evaluation/rater.py lifts into the rater's rubric
+# (_RUBRIC_SPANS), so the shared rulebook's TEXT is unchanged -- which is
+# correct rather than an oversight: the rater already receives RULE 4 inside
+# `evaluation_rules` and C4 inside `absolute_constraints`, and this edit
+# restates them for the classifier rather than adding anything the rater is
+# missing.
+PROMPT_VERSION = "1.7.0"
 
 
 def prompt_sha256(rendered_text: str) -> str:
@@ -517,6 +555,10 @@ inclusion_criteria and exclusion_criteria:
     For "not_evaluable" trials only: both arrays are empty.
     Every status MUST come from that criterion's own vocabulary (Section 1).
 
+    BEFORE YOU WRITE "not_met" OR "violated" ON ANY CRITERION, CHECK TWO THINGS:
+        ACTIVITY (RULE 4). If the criterion requires an ACTIVE or CURRENT condition, the patient evidence you are about to quote must show that condition active NOW. Evidence marked resolved, inactive, in remission, completed or otherwise not active does NOT support a disqualifying status: inclusion -> "not_evaluable", exclusion -> "not_violated", exactly as RULE 4 states.
+        ISOLATION (C4). This status rests ONLY on this trial's own criterion text against the patient record. A disqualification you recorded for another trial in this message is NEVER evidence here, and neither is the reading of the patient you formed while writing it. Derive this status again from the record; trials in one message share the patient and nothing else.
+
 patient_value: exact data point/s from patient record, OR "Not in patient record", OR "Not applicable -- [reason]". No interpretive statements.
 
 assessment is emitted BEFORE eligible, so you write it first and it determines the verdict. Reason in assessment, then conclude in eligible; do not decide the verdict first and describe it afterwards.
@@ -586,6 +628,10 @@ FINAL REMINDER
 =====================================================================
 
 A trial can ONLY be classified "not_eligible" if you can quote explicit patient evidence that contradicts a trial criterion. If the patient record does not contain that evidence, the criterion status MUST be "not_evaluable".
+
+Evidence that a condition is RESOLVED, inactive or in remission does not contradict a criterion requiring an active or current one. Under RULE 4 that criterion is "not_evaluable" (inclusion) or "not_violated" (exclusion), never a disqualifier.
+
+A trial is never "not_eligible" because another trial in this message was. Each verdict is reached from that trial's own criteria alone (C4).
 """
 
 

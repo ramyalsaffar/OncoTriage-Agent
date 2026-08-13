@@ -616,6 +616,186 @@ check("the two branches never render the same bytes",
 
 
 # ===========================================================================
+# SECTION 5b -- 1.7.0's REINFORCEMENT, AND THE HEADINGS STAY UNIQUE
+# ===========================================================================
+#
+# A DIGEST SAYS THE BYTES MOVED; IT CANNOT SAY WHAT THEY SAY. Section 4 would be
+# equally satisfied by a template whose 1.7.0 wording had been deleted and the
+# snapshot regenerated -- the version would still read 1.7.0, every digest would
+# still agree with the golden file, and the reinforcement this bump exists for
+# would be gone with nothing reporting it. So the wording is pinned by CONTENT
+# and by PLACE, in every variant.
+#
+# PLACE, not only presence, and that is the whole finding behind 1.7.0. RULE 4
+# and C4 were already in the message and were already being broken; what the
+# bump does is restate them at the moment a rejecting status is written. A check
+# that only asked "is this sentence somewhere in the prompt" would pass over an
+# edit that hoisted the block back up beside the rules it restates, which is
+# precisely the arrangement measured NOT to work.
+#
+# THE HEADINGS ARE DERIVED FROM THE RENDERED TEXT, never listed here. A section
+# added tomorrow is covered without an edit, and one removed cannot leave this
+# scan quietly covering less than it claims. Their uniqueness is not cosmetic:
+# oncotriage/evaluation/rater.py slices the rater's rubric out of this prompt by
+# marker and REFUSES on a marker that occurs twice, and
+# tests/test_agent_structured_outputs.py locates the JSON template the same way.
+
+print("\n" + "=" * 78)
+print("SECTION 5b -- the 1.7.0 reinforcement, and heading uniqueness")
+print("=" * 78)
+
+# Pinned as a literal, and the duplication with the snapshot is deliberate. The
+# snapshot records whatever version was current when somebody last regenerated
+# it, so it agrees with a careless regeneration by construction; a literal here
+# is a second place a human has to consent to a bump. It is the only line in
+# this file a future bump must edit, and that is the cost being paid on purpose.
+check("PROMPT_VERSION reads 1.7.0", PROMPT_VERSION, "1.7.0")
+
+# The five sentences 1.7.0 added, and the section each must land in. The section
+# is identified by the banner heading it follows, so "at the disqualification
+# point" is asserted rather than described.
+_REINFORCEMENT = (
+    ('BEFORE YOU WRITE "not_met" OR "violated" ON ANY CRITERION, CHECK TWO '
+     'THINGS:', "SECTION 5 -- OUTPUT FORMAT"),
+    ("ACTIVITY (RULE 4).", "SECTION 5 -- OUTPUT FORMAT"),
+    ("ISOLATION (C4).", "SECTION 5 -- OUTPUT FORMAT"),
+    ("Evidence that a condition is RESOLVED, inactive or in remission does not "
+     "contradict a criterion requiring an active or current one.",
+     "FINAL REMINDER"),
+    ('A trial is never "not_eligible" because another trial in this message '
+     'was.', "FINAL REMINDER"),
+)
+
+# A needle this file invented, which the template must NOT contain. Without it
+# "every needle is present" is also satisfied by a comparison that has stopped
+# looking -- an `in` test against a substring of itself, or a helper returning
+# True unconditionally.
+_ABSENT_NEEDLE = ("BEFORE YOU WRITE THIS SENTENCE THE TEMPLATE HAS STOPPED "
+                  "BEING THE SUBJECT OF THIS CHECK")
+
+
+def _placements(text: str) -> dict:
+    """{needle: heading it falls under} for every 1.7.0 needle in `text`.
+
+    ``"<absent>"`` when the needle is not there and ``"<before any heading>"``
+    when it precedes every banner, so a defect produces a readable value rather
+    than a KeyError or a -1 index quietly comparing equal to something.
+    """
+    heads = [(text.index(h), h) for h in _banner_headings(text) if h in text]
+    out = {}
+    for needle, _expected in _REINFORCEMENT:
+        if needle not in text:
+            out[needle] = "<absent>"
+            continue
+        at = text.index(needle)
+        prior = [h for pos, h in heads if pos < at]
+        out[needle] = prior[-1] if prior else "<before any heading>"
+    return out
+
+
+def _banner_headings(text: str) -> list:
+    """Every section banner heading, DERIVED: a line fenced by two '=' rules.
+
+    Returns them in document order. Written as a function of the rendered text
+    rather than as a constant so it cannot disagree with the template, and so
+    the non-degeneracy check below has something real to count.
+    """
+    lines = text.split("\n")
+    out = []
+    for i in range(1, len(lines) - 1):
+        prev, here, nxt = (lines[i - 1].strip(), lines[i].strip(),
+                           lines[i + 1].strip())
+        if (prev and set(prev) == {"="} and nxt and set(nxt) == {"="}
+                and here and set(here) != {"="}):
+            out.append(here)
+    return out
+
+
+def _reinforcement_findings(text: str) -> list:
+    """Every way `text` fails to carry 1.7.0's reinforcement. [] when it does."""
+    found = []
+    placed = _placements(text)
+    for needle, expected in _REINFORCEMENT:
+        n = text.count(needle)
+        if n != 1:
+            found.append(f"{needle[:40]!r} occurs {n} times, expected 1")
+        elif placed[needle] != expected:
+            found.append(f"{needle[:40]!r} is under {placed[needle]!r}, "
+                         f"expected {expected!r}")
+    return found
+
+
+def _duplicate_headings(text: str) -> list:
+    """Every banner heading that does not occur exactly once in `text`."""
+    return sorted({f"{h!r} x{text.count(h)}"
+                   for h in _banner_headings(text) if text.count(h) != 1})
+
+
+_ALL_RENDERS = {_variant_id(kw): _render(render_system_prompt, kw)
+                for kw in _matrix()}
+
+check("non-degeneracy: the heading scan found the banners at all, in every "
+      "variant (a derivation that found none would pass every uniqueness "
+      "check below for free)",
+      sorted({len(_banner_headings(t)) for t in _ALL_RENDERS.values()}), [10])
+check("...and the two Section 2 variants declare the SAME headings, so neither "
+      "branch carries a section the other lacks",
+      len({tuple(_banner_headings(t)) for t in _ALL_RENDERS.values()}), 1)
+
+check("no section heading occurs more than once in any rendered variant",
+      sorted({m for t in _ALL_RENDERS.values() for m in _duplicate_headings(t)}),
+      [])
+check("...and that scan can report a duplicate: one heading pasted twice into "
+      "a rendered copy is found",
+      _duplicate_headings(sorted(_ALL_RENDERS.values())[0]
+                          + "\n" + "=" * 69 + "\nFINAL REMINDER\n" + "=" * 69),
+      ["'FINAL REMINDER' x2"])
+
+check("1.7.0's reinforcement is present exactly once, and under the right "
+      "heading, in EVERY variant (both Section 2 branches)",
+      sorted({f for t in _ALL_RENDERS.values()
+              for f in _reinforcement_findings(t)}), [])
+check("...covering both branches rather than one of them (non-degeneracy on "
+      "the check above)",
+      (len(_ALL_RENDERS), len({kw["mesh_filter_applied"] for kw in _matrix()})),
+      (len(_matrix()), 2))
+check("non-degeneracy: a needle this file invented is NOT in the template, so "
+      "the presence test is a test",
+      sorted({_ABSENT_NEEDLE in t for t in _ALL_RENDERS.values()}), [False])
+check("...and _reinforcement_findings reports a MISSING needle rather than "
+      "returning empty for anything handed to it",
+      _reinforcement_findings("nothing here at all"),
+      [f"{n[:40]!r} occurs 0 times, expected 1" for n, _ in _REINFORCEMENT])
+# PLACEMENT IS SEPARABLE FROM PRESENCE, and this is what says so: the same five
+# sentences MOVED to the end of a rendered prompt are all present, exactly once
+# each, and all under the wrong heading. Without this, "at the disqualification
+# point" would be prose in a comment rather than a property under test.
+_ONE_RENDER = sorted(_ALL_RENDERS.values())[0]
+_STRIPPED = "\n".join(ln for ln in _ONE_RENDER.split("\n")
+                      if not any(n in ln for n, _ in _REINFORCEMENT))
+# NEITHER EXPRESSION MAY INDEX A LIST A DEFECT CAN SHORTEN. The first draft read
+# `_reinforcement_findings(_STRIPPED)[i]` over `range(5)` and split on a
+# separator only the "occurs" branch emits -- two IndexErrors at module level,
+# either of which would abort the file on exactly the run it owes a summary.
+# `split(sep, 1)[-1]` is total over any string, and the length is a value rather
+# than an index.
+_STRIP_FINDINGS = _reinforcement_findings(_STRIPPED)
+check("non-degeneracy: the five needles occupy five whole lines, so stripping "
+      "them removes five and nothing else",
+      (len(_ONE_RENDER.split("\n")) - len(_STRIPPED.split("\n")),
+       len(_STRIP_FINDINGS),
+       sorted({f.split(" occurs ", 1)[-1] for f in _STRIP_FINDINGS})),
+      (5, len(_REINFORCEMENT), ["0 times, expected 1"]))
+_HOISTED = (_STRIPPED + "\n" + "=" * 69 + "\nAPPENDED\n" + "=" * 69 + "\n"
+            + "\n".join(n for n, _ in _REINFORCEMENT))
+check("...and a needle in the wrong section is reported as misplaced, not as "
+      "present",
+      sorted(f.split(" is under ")[1] for f in _reinforcement_findings(_HOISTED)
+             if " is under " in f),
+      sorted(f"'APPENDED', expected {e!r}" for _, e in _REINFORCEMENT))
+
+
+# ===========================================================================
 # SECTION 6 -- THE CONTROLS
 # ===========================================================================
 #
@@ -739,6 +919,61 @@ check("6f  unpatched, the same comparison reports nothing (the other half of "
       "the control)",
       evaluate(PROMPT_VERSION, _SIG_PARAMS, _digests(render_system_prompt),
                _GOOD_SNAPSHOT), [])
+
+# --- 6g: THE TEMPLATE WITH 1.7.0's REINFORCEMENT REMOVED -------------------
+#
+# Section 5b's controls doctor a rendered STRING, which shows the scans
+# discriminate. This one shows their SUBJECT is right, the same way 6f does for
+# the digests: the five sentences are deleted from an in-memory copy of
+# prompts.py and every Section 5b finding must fire against the copy while the
+# shipped module still reports clean. Without it, Section 5b would pass against
+# a template it had been quietly disconnected from.
+#
+# The strip is LINE-BASED and its extent is asserted, because a needle that also
+# appeared in the changelog comment above PROMPT_VERSION would delete a line
+# this control did not choose -- and a control that removes the wrong thing
+# fails, which looks exactly like a control that is working.
+
+_STRIPPED_SRC = "\n".join(
+    line for line in _PROMPTS_SRC.split("\n")
+    if not any(needle in line for needle, _ in _REINFORCEMENT))
+check("6g  the strip removed exactly the five template lines and nothing else",
+      (len(_PROMPTS_SRC.split("\n")) - len(_STRIPPED_SRC.split("\n")),
+       _STRIPPED_SRC.count("PROMPT_VERSION = ")),
+      (5, _PROMPTS_SRC.count("PROMPT_VERSION = ")))
+
+_stripped_ns = {"__name__": "oncotriage.agent._prompts_stripped_copy",
+                "__file__": _PROMPTS_PATH}
+exec(compile(_STRIPPED_SRC, "<1.7.0-reinforcement-stripped copy of prompts.py>",
+             "exec"), _stripped_ns)
+_stripped_render = _stripped_ns["render_system_prompt"]
+
+_STRIPPED_RENDERS = [_render(_stripped_render, kw) for kw in _matrix()]
+check("6g  the stripped copy still renders (the control is a real prompt, not "
+      "a traceback)",
+      min(len(t) for t in _STRIPPED_RENDERS) > 1000, True)
+check("6g  ...and it is genuinely shorter than the shipped one, variant for "
+      "variant (non-degeneracy: an unchanged copy would make 6g vacuous)",
+      sorted({len(a) > len(b) for a, b in
+              zip([_ALL_RENDERS[_variant_id(kw)] for kw in _matrix()],
+                  _STRIPPED_RENDERS)}),
+      [True])
+check("6g  EVERY variant of the stripped copy is reported as missing all five "
+      "sentences",
+      sorted({len(_reinforcement_findings(t)) for t in _STRIPPED_RENDERS}),
+      [len(_REINFORCEMENT)])
+# The two scans are INDEPENDENT: deleting the reinforcement must not disturb the
+# heading structure, or a future failure could not be read as one thing or the
+# other.
+check("6g  ...while its headings are untouched and still unique",
+      sorted({m for t in _STRIPPED_RENDERS for m in _duplicate_headings(t)}),
+      [])
+check("6g  unstripped, the same scan reports nothing (the other half of the "
+      "control)",
+      sorted({f for kw in _matrix()
+              for f in _reinforcement_findings(
+                  _render(render_system_prompt, kw))}),
+      [])
 
 _SHA_AFTER = hashlib.sha256(
     open(_PROMPTS_PATH, encoding="utf-8").read().encode("utf-8")).hexdigest()

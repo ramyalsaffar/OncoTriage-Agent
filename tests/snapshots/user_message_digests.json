@@ -6,6 +6,6 @@
     "trials_text": "ebe7894db6cbb4d2da7ccdedad2cc292d89765ced62946f85629479849d40006",
     "user_message": "a08fed329b291ed0b291260556248f8c15badeae3a49b0e2353f59eea46d0b42"
   },
-  "prompt_version": "1.6.0",
+  "prompt_version": "1.7.0",
   "user_prompt_template": "def _user_prompt_for(chunk: List[Dict]) -> str:\n    return f'\\nCLINICAL TRIALS:\\n{_build_trials_text(chunk)}\\n'"
 }
