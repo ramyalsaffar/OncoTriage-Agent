@@ -734,6 +734,289 @@ _IRRELEVANT_MEDICATION_KEYWORDS: FrozenSet[str] = frozenset({
 })
 
 
+# ===========================================================================
+# PROCEDURE RENDERING RELEVANCE
+# ===========================================================================
+#
+# BUILT FROM WHAT THE CORPUS ACTUALLY CONTAINS, NOT FROM WHAT SOUNDS LIKELY.
+# 100 patients were drawn from the 1,000-bundle Synthea corpus with
+# ``random.Random(42).sample(sorted(glob(...)), 100)`` -- sorted first so the
+# population is deterministic, seeded so the draw is reproducible -- and every
+# distinct procedure display in them was enumerated: 317 of them. Every entry
+# below is one of those 317 or a family they belong to; nothing here is
+# invented. The 118 that match no layer and are kept by default are listed in
+# the pass report rather than here, because a list of things the code does not
+# act on is a list that rots.
+#
+# TWO ACCIDENTS THIS ENUMERATION CAUGHT, both by measurement and neither by
+# reading, and both are the substring hazard CLAUDE.md records for the
+# biomarker keywords ("ret" inside "retinopathy"):
+#
+#   "port"              matched "dental consultation and REPORT" -- in 100 of
+#                       100 patients. A keep keyword that protected a dental
+#                       line from the dental blacklist. Replaced by the
+#                       explicit central-line phrases below.
+#   "surgical procedure" matched "DENTAL SURGICAL PROCEDURE" in 96 of 100. Not
+#                       an accident of spelling but of breadth; deleted,
+#                       because a genuine surgery that matches no keyword is
+#                       kept by the default anyway.
+#
+# WHAT THE KEEP LAYERS ARE ACTUALLY FOR, stated because it is not obvious: the
+# default is KEEP, so these layers change nothing for a procedure the blacklist
+# does not name. Their whole job is to OVERRIDE the blacklist. That is why a
+# keyword whose only measured effect is to keep something already kept was
+# removed rather than left in for symmetry.
+
+_PROCEDURE_KEEP_SNOMED: FrozenSet[str] = frozenset({
+    # -- oncology diagnostic --------------------------------------------------
+    "122548005",     # Biopsy of breast
+    "65575008",      # Biopsy of prostate
+    "76164006",      # Biopsy of colon
+    "396487001",     # Sentinel lymph node biopsy
+    "443497002",     # Excision of sentinel lymph node
+    "234262008",     # Excision of axillary lymph node
+    "73761001",      # Colonoscopy
+    "274031008",     # Rectal polypectomy
+    "90226004",      # Cytopathology, smear, genital source (cervical cytology)
+    "434363004",     # HER2 gene detection by FISH
+    "433114000",     # HER2 gene detection by immunohistochemistry
+    # -- oncology therapeutic -------------------------------------------------
+    "367336001",     # Chemotherapy
+    "394894008",     # Pre-operative chemotherapy
+    "703423002",     # Combined chemotherapy and radiation therapy
+    "33195004",      # External beam radiation therapy
+    "1287742003",    # Radiotherapy
+    "447759004",     # Brachytherapy of breast
+    "113120007",     # Interstitial brachytherapy
+    "385798007",     # Radiation therapy care
+    # -- tumour resection -----------------------------------------------------
+    "43075005",      # Partial resection of colon
+    "90470006",      # Prostatectomy
+    "392021009",     # Lumpectomy of breast
+    "392023007",     # Excision of lesion of breast
+    "80146002",      # Excision of appendix
+    "45595009",      # Laparoscopic cholecystectomy
+    # -- marrow / stem cell / organ transplant --------------------------------
+    "58776007",      # Autologous bone marrow transplant
+    "70536003",      # Transplant of kidney
+    "711446003",     # Transplantation of kidney regime
+    "428830000",     # Pretransplant evaluation of kidney recipient
+    "306316000",     # Referral to transplant surgeon
+    # -- transfusion ----------------------------------------------------------
+    "71493000",      # Transfusion of packed red blood cells
+    "180207008",     # Intravenous blood transfusion of packed cells
+    "116861002",     # Transfusion of fresh frozen plasma
+    "12719002",      # Platelet transfusion
+    "116863004",     # Transfusion of red blood cells
+    # -- major surgery (trials carry recent-major-surgery windows) ------------
+    "232717009",     # Coronary artery bypass grafting
+    "418824004",     # Off-pump coronary artery bypass
+    "414088005",     # Emergency coronary artery bypass graft
+    "359672006",     # Median sternotomy
+    "63697000",      # Cardiopulmonary bypass operation
+    "26212005",      # Replacement of aortic valve
+    "773996000",     # Transcatheter aortic valve implantation
+    "232965003",     # Implantation of cardiac ventricular assist device
+    "11466000",      # Cesarean section
+    "699253003",     # Surgical manipulation of joint of knee
+    "387685009",     # Surgical manipulation of shoulder joint
+    "177765008",     # Opening of chest
+    "18286008",      # Catheter ablation of tissue of heart
+    # -- vascular access / lines ----------------------------------------------
+    "415070008",     # Percutaneous coronary intervention
+    "392247006",     # Insertion of catheter into artery
+    "65677008",      # Pulmonary catheterization with Swan-Ganz catheter
+    "42825003",      # Cannulation
+    "433112001",     # Percutaneous mechanical thrombectomy of portal vein
+    # -- imaging of tumour sites ----------------------------------------------
+    "71651007",      # Mammography
+    "241055006",     # Mammogram - symptomatic
+    "24623002",      # Screening mammography
+    "1571000087109",  # Ultrasonography of bilateral breasts
+    "241615005",     # MRI of breast
+    "418023006",     # CT of chest, abdomen and pelvis
+})
+
+
+# Display-keyword keep families. Substring matched, lower-cased, and every one
+# of them was checked against all 317 corpus displays for an accidental match --
+# which is how the two above were found.
+_PROCEDURE_KEEP_KEYWORDS: FrozenSet[str] = frozenset({
+    # Protective: anything naming the disease survives whatever follows it.
+    # This is what makes a future "lung cancer screening low-dose CT" safe from
+    # the routine-screening blacklist without anyone having to notice.
+    "cancer", "neoplasm", "tumor", "tumour", "oncolog", "malignan",
+    "carcinoma", "lymphoma", "leukemia", "leukaemia", "myeloma", "metasta",
+    # Oncology diagnostic
+    "biopsy", "cytopathology", "colonoscopy", "endoscopy", "mammogra",
+    "polypectomy", "sentinel lymph node",
+    "human epidermal growth factor receptor",
+    # Oncology therapeutic
+    "chemotherapy", "immunotherapy", "radiation therapy", "radiotherapy",
+    "brachytherapy", "antineoplastic",
+    # Marrow, stem cell, organ transplant
+    "transplant", "bone marrow", "stem cell",
+    # Transfusion
+    "transfusion",
+    # Major surgery. NOT the bare suffixes "-ectomy"/"-otomy"/"-plasty": their
+    # dominant corpus matches are "gingivectomy or gingivoplasty, per tooth"
+    # (96/100) and "episiotomy" (33/100), and a real surgery that matches
+    # nothing here is kept by the default in any case.
+    "excision", "resection", "amputation", "bypass", "graft",
+    "laparotomy", "laparoscop", "thoracotomy", "sternotomy", "craniotomy",
+    "cesarean", "surgical manipulation", "valve replacement",
+    # Vascular access and central lines. Spelled out rather than "port".
+    "catheter", "cannulation", "central venous", "implantable port",
+    "port-a-cath", "portacath", "vascular access device",
+    "peripherally inserted central",
+    # Imaging of tumour sites
+    "computed tomography", "magnetic resonance", "ultrasonography",
+    "positron emission",
+    # Functional / performance status. These are ASSESSMENTS, and the blacklist
+    # drops assessment instruments -- so without this line "assessment using
+    # New York Heart Association classification" would be dropped, and NYHA
+    # class is a cardiac gate several trials carry. Frailty likewise.
+    "performance status", "eastern cooperative oncology", "karnofsky",
+    "new york heart association", "frailty",
+    # Critical care. "admission to" is on the blacklist as encounter
+    # paperwork; an ICU admission is not paperwork.
+    "intensive care",
+})
+
+
+# == Layer 3: the blacklist -- the ONLY thing that can drop a procedure =======
+#
+# Same rule as _IRRELEVANT_CONDITION_KEYWORDS, one notch stricter. A missing
+# keyword here renders a useless line (tokens). A wrong keyword removes a
+# procedure from the record the model judges on, silently, with no line, no
+# count and no placeholder saying anything was removed. Only families where
+# accidentally excluding a trial-relevant procedure is essentially impossible.
+_IRRELEVANT_PROCEDURE_KEYWORDS: FrozenSet[str] = frozenset({
+    # -- dental / oral -- 15 distinct types in the sample, most in ~100% of
+    # patients, and the single largest contributor to the section's size.
+    "dental", "gingiv", "tooth", "teeth", "denture", "periodont",
+    "plaque and calculus", "oral health education", "oral examination",
+    "dentist", "orthodontic",
+    # -- routine immunisation. NOT the substring "immuno", which is inside
+    # "immunotherapy" and "immunohistochemistry".
+    "vaccine", "vaccination", "immunization", "immunisation",
+    "tetanus antitoxin",
+    # -- casts and splints for simple fractures
+    "bone immobilization", "application of cast", "splint",
+    # -- routine screening and psychosocial instruments. The keep layer's
+    # disease words run first, so an oncology screening is protected.
+    "screening", "assessment using", "assessment of substance use",
+    "assessment of anxiety", "assessment of health and social care needs",
+    "suicide risk assessment", "risk assessment", "diagnostic assessment",
+    "anticipatory guidance", "education", "counseling",
+    # -- administrative, documentation and encounter paperwork
+    "medication reconciliation", "history taking", "history and physical",
+    "patient discharge", "discharge from hospital", "discharge to ward",
+    "initial patient assessment", "pre-discharge assessment",
+    "individualized plan of care", "coordination of care",
+    "care regimes assessment", "review of systems", "notification",
+    "certification procedure", "scheduling", "documentation procedure",
+    "medical records review", "information gathering", "liaising",
+    "patient transfer", "transfer to", "admission to", "referral",
+    "consultation for treatment", "discussion about", "telemedicine",
+    "multidisciplinary", "ancillary services", "nursing care", "triage",
+    "vital signs", "physical examination", "general examination",
+    "evaluation procedure", "medication review", "measurement procedure",
+    "preparation of patient for procedure",
+    # -- specimen collection and routine lab administration. The RESULTS are
+    # rendered in the Relevant Lab Values section; these lines say only that a
+    # specimen was taken. Infectious serologies (HIV, HBV, HCV, TB, syphilis)
+    # are deliberately NOT here -- see the report.
+    "urinalysis", "urine culture", "urine specimen", "throat culture",
+    "sputum examination", "blood group typing", "complete blood count",
+    "hemogram", "metabolic panel", "peripheral blood smear",
+    "laboratory test",
+})
+
+
+# How many procedures this process rendered and how many it withheld.
+#
+# THE AGE_PARSE_FAILURES FOOTING: a module-level Counter, counts only, read by
+# whoever wants them and written by nobody else. NEVER a procedure name and
+# never any clinical text -- the whole point of the drop is that the text does
+# not travel, and a counter keyed by display would put it in a place with a
+# longer life than the prompt.
+#
+# NO PER-RENDER LOG EVENT, deliberately, and on this module's own convention:
+# _create_patient_summary logs nothing today, and it runs once per patient in
+# thousand-patient batch runs.
+#
+# WHAT THE UNITS ARE, because "procedures" is ambiguous here: these count
+# RENDER CANDIDATES -- the deduplicated procedure TYPES that
+# filter_relevant_procedures hands the renderer -- not raw FHIR procedure
+# resources, of which a patient has many more. A patient summarised twice
+# counts twice; this is a process-lifetime tally, not a per-patient field.
+PROCEDURE_RENDER_COUNTS = Counter()
+
+PROCEDURE_RENDER_KEPT = "kept"
+PROCEDURE_RENDER_DROPPED = "dropped"
+
+
+def _classify_procedure_relevance(procedure: Dict) -> str:
+    """Classify one procedure as worth rendering into the Stage 5 summary.
+
+    THE SAME ASYMMETRY AS ``_classify_condition_relevance``, AND FOR A SHARPER
+    REASON. The protective KEEP layers run FIRST, the drop decision is made ONLY
+    by a confident blacklist that is consulted when no keep layer matched, and a
+    procedure that matches nothing is KEPT. Read Layer 3's comment on the
+    condition side: a missing blacklist keyword wastes tokens, a wrong one
+    removes clinical evidence. Here the consequence is stronger than there --
+    a "background" condition is still SUMMARIZED into the prompt, while a
+    background procedure is not rendered at all -- so the default has to be
+    keep, and it is.
+
+    WHY A RENDERING FILTER AT ALL. Measured over 100 seeded-sample patients of
+    the Synthea corpus (see the report for the draw), the Procedures section is
+    40.2% to 62.9% of the summary's characters (median 50.8%), a median of 100
+    rendered lines per patient, and most of it is dental work, psychosocial
+    screening instruments, referrals and discharge paperwork. None of it can
+    decide an oncology eligibility criterion.
+
+    THE FHIR DATA AND THE PARSER OUTPUT ARE UNTOUCHED. This decides one thing:
+    whether a line is printed. ``patient_data["procedures"]`` still carries
+    every procedure, ``compute_patient_hash`` still hashes every one of them
+    (it reads the parsed list, never this text), and nothing downstream of the
+    prompt sees a different patient.
+
+    Args:
+        procedure: one dict from ``_parse_procedure`` -- ``code``, ``display``,
+            ``date``, ``status``. Passed whole rather than as a display string
+            because the keep decision reads the SNOMED code first.
+
+    Returns:
+        "relevant"   : render it (default, and the answer whenever nothing
+                       matched)
+        "background" : confidently irrelevant, do not render
+    """
+    display_lower = (procedure.get("display") or "").lower()
+
+    # Layer 1: SNOMED code. Checked before any text, because a code is stable
+    # and a display string is not.
+    code = (procedure.get("code") or "").strip()
+    if code and code in _PROCEDURE_KEEP_SNOMED:
+        return "relevant"
+
+    # Layer 2: keep-keyword families.
+    if display_lower:
+        for keyword in _PROCEDURE_KEEP_KEYWORDS:
+            if keyword in display_lower:
+                return "relevant"
+
+    # Layer 3: the blacklist, and ONLY here can a procedure be dropped.
+    if display_lower:
+        for keyword in _IRRELEVANT_PROCEDURE_KEYWORDS:
+            if keyword in display_lower:
+                return "background"
+
+    # Default: unknown means keep.
+    return "relevant"
+
+
 def _classify_medication_relevance(display: str) -> str:
     """
     Classify a medication as relevant or background for GPT-4o prompt.
@@ -1269,10 +1552,35 @@ def _create_patient_summary(patient_data: Dict) -> str:
         summary += "- No known allergies\n"
     
     # ── Procedures ────────────────────────────────────────────────────────
-    # All procedure types, deduplicated by display name, most recent date per type.
-    # Prior chemotherapy, radiation, and surgery are standard eligibility gates.
+    # Procedure types, deduplicated by display name, most recent date per type,
+    # MINUS the confidently irrelevant ones. Prior chemotherapy, radiation and
+    # surgery are standard eligibility gates; dental cleanings, depression
+    # screening questionnaires and discharge paperwork are not, and they were
+    # 40-63% of every patient's record text.
+    #
+    # A DROPPED PROCEDURE LEAVES NO TRACE IN THE TEXT, and that is a decision
+    # rather than an omission. A count line ("and 96 others") would spend
+    # tokens telling the model about evidence it cannot use and invite it to
+    # reason about what it cannot see; a placeholder would do the same for
+    # less. The record of what was withheld is PROCEDURE_RENDER_COUNTS, which
+    # is where a counter belongs, and the FHIR data is untouched.
+    #
+    # THE FILTER RUNS AFTER THE DEDUPLICATION, so it decides once per procedure
+    # TYPE rather than once per resource, and the counters count the same
+    # units the section renders.
     summary += "\nProcedures:\n"
-    relevant_procs = lab_registry.filter_relevant_procedures(procedures)
+    relevant_procs = []
+    for proc in lab_registry.filter_relevant_procedures(procedures):
+        if _classify_procedure_relevance(proc) == "background":
+            PROCEDURE_RENDER_COUNTS[PROCEDURE_RENDER_DROPPED] += 1
+            continue
+        PROCEDURE_RENDER_COUNTS[PROCEDURE_RENDER_KEPT] += 1
+        relevant_procs.append(proc)
+    # UNCHANGED FROM HERE DOWN, including the "- None" arm, which is now also
+    # what a patient whose every procedure was dropped renders. That is the
+    # right answer for the same reason it is right for a patient with no
+    # procedures at all: the section states what is worth stating, and there is
+    # nothing.
     if relevant_procs:
         for proc in relevant_procs:
             display  = proc.get("display") or "Unknown procedure"
