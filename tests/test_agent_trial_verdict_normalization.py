@@ -601,13 +601,29 @@ check("a MISSING verdict key becomes not_evaluable, not a rejection",
 
 # The values node_finalize's map has always known, which Stage 5 used to
 # destroy before that map could be reached.
-for _raw, _want in (("Eligible", TRIAL_VERDICT_ELIGIBLE),
-                    (True, TRIAL_VERDICT_ELIGIBLE),
-                    ("yes", TRIAL_VERDICT_ELIGIBLE),
-                    ("NOT_ELIGIBLE", TRIAL_VERDICT_NOT_ELIGIBLE)):
-    _res, _ = run_stage5([entry("NCT00000001", _raw, inclusion=[crit("met")])])
+#
+# THE REJECTION ROW CARRIES A DISQUALIFYING CRITERION AND THE OTHER THREE DO
+# NOT, and that is not cosmetic. `not_eligible` is the one recovered label
+# whose trial-level OUTCOME also depends on the evidence: a rejection with no
+# disqualifying row in either array is now corrected to not_evaluable (see
+# UNEVALUABLE_REJECTION_UNSUPPORTED and
+# tests/test_agent_unsupported_rejection.py), so a `crit("met")` payload here
+# would be testing that correction rather than the label recovery this loop is
+# about. The companion check below is what stops the disqualifier making the
+# row degenerate: Step 3 reaches not_eligible off that criterion whatever the
+# label said, so recovery is proved by the label NOT being reported unreadable.
+for _raw, _want, _crit in (("Eligible", TRIAL_VERDICT_ELIGIBLE, crit("met")),
+                           (True, TRIAL_VERDICT_ELIGIBLE, crit("met")),
+                           ("yes", TRIAL_VERDICT_ELIGIBLE, crit("met")),
+                           ("NOT_ELIGIBLE", TRIAL_VERDICT_NOT_ELIGIBLE,
+                            crit("not_met"))):
+    _res, _rec_err = run_stage5(
+        [entry("NCT00000001", _raw, inclusion=[_crit])])
     check(f"recoverable label {_raw!r} resolves to {_want}, not to a rejection",
           verdict_of(_res), _want)
+    check(f"...and {_raw!r} is never reported as an unreadable label",
+          [r for r in log_records(_rec_err, "not_evaluable")
+           if UNEVALUABLE_UNRECOGNIZED_VERDICT in (r.get("reason") or [])], [])
 
 # The zero-criteria branch, which rescued the verdict but recorded a label the
 # model never wrote: original_label read "not_eligible", the value the clobber
@@ -852,17 +868,33 @@ _control(
 # 7c. The audit append in the else branch, deleted. The verdict is still right;
 #     the trial simply stops being reported, which is the silent-recovery shape
 #     this project exists to remove.
+#     THE TARGET GAINED A SECOND ARM and this plant had to be re-anchored, not
+#     just re-pasted. The else branch now ends in an if/elif -- the second arm
+#     corrects a rejection its own criteria arrays do not support (see
+#     UNEVALUABLE_REJECTION_UNSUPPORTED and
+#     tests/test_agent_unsupported_rejection.py) -- so deleting the append
+#     alone would leave a dangling elif and the plant would fail to compile,
+#     which _control would report as a plant failure rather than as a caught
+#     defect. The `if False: pass` form deletes the append and keeps the branch
+#     structure, so what the control demonstrates is still this append and
+#     nothing else. Anchoring on the elif line also keeps the target unique:
+#     Step 2 carries a near-identical if-block whose elif tests `!=
+#     TRIAL_VERDICT_NOT_EVALUABLE`, and `str.replace(..., 1)` would otherwise
+#     take that one instead.
 _ELSE_APPEND = """            if verdict_unrecognized:
                 unevaluable_trials.append({
                     "nct_id": nct_id,
                     "original_label": repr(raw_verdict)[:_MALFORMED_ENTRY_PREVIEW_LEN],
                     "reason": UNEVALUABLE_UNRECOGNIZED_VERDICT,
                 })
-            _record_zero_score(eval_result, inc, exc)"""
+            elif eval_result["eligible"] == TRIAL_VERDICT_NOT_ELIGIBLE:"""
 _control(
     "7c. dropping the audit append leaves the trial unreported -- CAUGHT",
     _EVAL_SRC,
-    [(_ELSE_APPEND, "            _record_zero_score(eval_result, inc, exc)")],
+    [(_ELSE_APPEND,
+      "            if False:  # PLANTED: the audit append, dropped\n"
+      "                pass\n"
+      '            elif eval_result["eligible"] == TRIAL_VERDICT_NOT_ELIGIBLE:')],
     lambda m: len(log_records(run_stage5(
         [entry("NCT00000001", "elligible", inclusion=[crit("met")])],
         node=m.node_llm_classifier_evaluation)[1], "not_evaluable")),

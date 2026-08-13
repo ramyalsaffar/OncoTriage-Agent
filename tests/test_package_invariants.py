@@ -1142,7 +1142,24 @@ _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    # nothing -- which is exactly why they are controlled rather
                    # than argued. A git blob cannot supply them: the columns are
                    # AT HEAD, so the pre-change file has no INSERT to break.
-                   "tests/test_agent_emission_provenance.py"}
+                   "tests/test_agent_emission_provenance.py",
+                   # Plants into an in-memory copy of agent/evaluation.py to
+                   # bypass ONE arm of the Stage 5 fall-through branch: the
+                   # correction of a model-declared `not_eligible` that carries
+                   # no disqualifying row in either criteria array. `git show`
+                   # cannot supply that control. The arm is AT HEAD, so a blob
+                   # would compare the fixed module with itself -- the defect
+                   # tests/test_storage_query_layer.py had to learn -- and the
+                   # plant disables that arm ALONE while Step 0, Step 1, Step 3,
+                   # the sibling out-of-vocabulary branch, the absent-data
+                   # validator and the composition all keep running, so that the
+                   # control demonstrates this branch and not a generally broken
+                   # copy. No commit has ever had that state. The copy also
+                   # carries its OWN ASSESSMENT_COMPOSITION_ANOMALIES counter,
+                   # which is what lets the control show
+                   # ASSESSMENT_KEPT_NO_DISQUALIFIER firing without touching the
+                   # live counter the same file asserts is at zero.
+                   "tests/test_agent_unsupported_rejection.py"}
 
 
 def _repo_py_files():
@@ -3342,11 +3359,19 @@ _UNREAD_CONSTANT_EXEMPTIONS = {
     # shape above, exactly. Each names a value that exists so a reader can see
     # it, and deleting it would tell the next reader something false.
     #
-    #   _NOT_EVALUABLE_REASONS is the closed tuple of the three reasons Stage 5
-    #   can stamp; all three MEMBERS are read individually, and the tuple is
-    #   what says the list is closed. Naming two of three would read as "these
-    #   are the only two", which is false.
-    "oncotriage/agent/evaluation.py": ["_NOT_EVALUABLE_REASONS"],
+    #   _NOT_EVALUABLE_REASONS WAS EXEMPTED HERE AND ITS EXEMPTION IS GONE,
+    #   removed by the staleness guard below rather than by anyone noticing.
+    #   The tuple was the closed list of reasons Stage 5 can stamp into the
+    #   not_evaluable_reason FIELD, with every member read individually and the
+    #   tuple itself read by nothing -- the closed-vocabulary shape this block
+    #   is for. It has a real reader now:
+    #   tests/test_agent_unsupported_rejection.py section 1 asserts that
+    #   UNEVALUABLE_REJECTION_UNSUPPORTED is NOT a member of it, which is a
+    #   load-bearing property rather than a formality -- _unevaluable_entry
+    #   indexes a fixed explanation table with these values, so a reason string
+    #   added to that tuple is a KeyError waiting for its first caller. The
+    #   entry had to go: keeping an exemption for a constant something reads is
+    #   what the guard below calls stale, and it fired on exactly this.
     #   _HISTORICAL_MED_STATUSES is the documented COMPLEMENT of
     #   _ACTIVE_MED_STATUSES (which is read, at the medication sort key).
     #   Nothing tests membership in it because "not active and not excluded" is

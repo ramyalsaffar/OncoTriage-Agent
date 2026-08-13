@@ -679,6 +679,28 @@ def _partition_response_entries(parsed: List) -> Tuple[List[Dict], List]:
 # first caller who passed it.
 UNEVALUABLE_UNRECOGNIZED_VERDICT = "trial-level verdict label not recognised"
 
+# A REJECTION THAT ITS OWN CRITERIA ARRAYS DO NOT SUPPORT. The model wrote a
+# readable "not_eligible" and then wrote no row carrying a disqualifying status
+# -- no inclusion "not_met", no exclusion "violated" -- and no label remap
+# removed one, so there was never a disqualifier in the answer at all.
+#
+# THE SAME ARGUMENT AS THE OUT-OF-VOCABULARY BRANCH BESIDE IT, with the remap
+# taken out. There, the disqualifiers existed and Step 1 resolved them away;
+# here the model simply never wrote one. Either way the stored rejection would
+# rest on nothing a reader could quote, and a rejection is the most dangerous
+# output this pipeline produces: a false "eligible" is checked by a clinician
+# reading the criteria, while a false "not_eligible" silently removes a trial
+# from a patient's list and nobody ever looks at it again. Measured on real
+# evaluation runs, 6 of 54 rejections had this shape -- one of them citing a
+# 1963 tubal ligation as its support for a hypothyroidism diagnosis.
+#
+# Not "eligible": promoting it would assert a match the model never made. Not
+# left as "not_eligible": that is the fabrication. Not evaluated is what the
+# answer actually supports, and the arrays are kept untouched beside it so the
+# non-evidence is still there to read.
+UNEVALUABLE_REJECTION_UNSUPPORTED = (
+    "model rejection unsupported by its own criteria arrays")
+
 
 def estimate_output_tokens(trials: List[Dict]) -> int:
     """Estimate the evaluation response size for a batch, before sending it.
@@ -1275,6 +1297,17 @@ ASSESSMENT_CASES = (
 # Step 0 resolves every verdict into the three-member trial vocabulary. Counted
 # module-level, on the AGE_PARSE_FAILURES footing, because they would mean the
 # composition ran against a verdict the normalizer had not produced.
+#
+# THAT CLAIM WAS TRUE OF STEP 3's ASSIGNMENT AND FALSE OF THE NODE, until
+# UNEVALUABLE_REJECTION_UNSUPPORTED. Step 3 never WROTE an unsupported
+# `not_eligible` -- and the fall-through branch beneath it let the model's own
+# unsupported `not_eligible` PASS, which reached this composition as
+# KEPT_NO_DISQUALIFIER just the same. Measured on real runs at 6 of 54
+# rejections, so this counter was not a backstop against a state that could not
+# occur; it was the only thing recording one that did. The normalizer now
+# corrects that entry to `not_evaluable` before composition sees it, which is
+# what finally makes the sentence above true of the whole node. The counter
+# stays, unweakened, as the detector for whatever reintroduces it.
 ASSESSMENT_COMPOSITION_ANOMALIES = Counter()
 
 _ASSESSMENT_ANOMALY_CASES = (ASSESSMENT_KEPT_NO_DISQUALIFIER,
@@ -2683,18 +2716,45 @@ CLINICAL TRIALS:
             # no remap, or model-declared "not_evaluable" with criteria present,
             # or an UNRECOGNISED label whose criteria disqualify nobody.
             #
-            # The third is the fabricated rejection this branch used to receive
+            # The third was the fabricated rejection this branch used to receive
             # as a settled "not_eligible" from Step 0 and pass through untouched
             # under a comment reading "verdict left as the model wrote it" --
             # which was false of exactly that case, and only that case. It is
-            # the one arm here that changed anything, and it is recorded, with
-            # the label the model actually wrote.
+            # recorded, with the label the model actually wrote.
+            #
+            # THE FIRST IS NOW CORRECTED TOO, and it is the arm that reaches
+            # real model output most often: a readable rejection carrying no
+            # disqualifying row at all. See UNEVALUABLE_REJECTION_UNSUPPORTED.
+            #
+            # The two arms are DISJOINT by construction, which is why this is
+            # an elif rather than two independent tests: `verdict_unrecognized`
+            # means normalize_trial_verdict returned None, and Step 0 has
+            # already written not_evaluable for exactly that case, so an entry
+            # still reading not_eligible here had a label the normalizer could
+            # read. The elif says so; it is not an ordering preference.
             if verdict_unrecognized:
                 unevaluable_trials.append({
                     "nct_id": nct_id,
                     "original_label": repr(raw_verdict)[:_MALFORMED_ENTRY_PREVIEW_LEN],
                     "reason": UNEVALUABLE_UNRECOGNIZED_VERDICT,
                 })
+            elif eval_result["eligible"] == TRIAL_VERDICT_NOT_ELIGIBLE:
+                # `original_label` is the CANONICAL constant, not `raw_verdict`,
+                # and that matches the out-of-vocabulary branch above rather
+                # than the unrecognised one below-left. The model may have
+                # written "Not Eligible" or boolean False and had it recovered
+                # by normalize_trial_verdict; what this entry is about is the
+                # missing evidence, not the spelling, and a non-canonical
+                # spelling is already recorded in `verdict_normalizations` with
+                # its repr and its type. Two lists, two findings, no overlap.
+                unevaluable_trials.append({
+                    "nct_id": nct_id,
+                    "original_label": TRIAL_VERDICT_NOT_ELIGIBLE,
+                    "reason": UNEVALUABLE_REJECTION_UNSUPPORTED,
+                })
+                # The arrays are NOT touched. They are the evidence that there
+                # was no evidence, and criterion_details stores them verbatim.
+                eval_result["eligible"] = TRIAL_VERDICT_NOT_EVALUABLE
             _record_zero_score(eval_result, inc, exc)
 
     if label_remaps:
@@ -2964,10 +3024,12 @@ CLINICAL TRIALS:
              reason=sorted(k for k, v in _assessment_cases.items() if v))
     if _assessment_anomalies:
         # Unreachable if the normalizer above ran: Step 3 only writes
-        # not_eligible off a surviving disqualifying row, and Step 0 resolves
-        # every verdict into the three-member vocabulary. So this is not a
-        # degradation to absorb -- it says the composition saw a verdict the
-        # normalizer did not produce, and the trial kept the model's draft.
+        # not_eligible off a surviving disqualifying row, the fall-through
+        # branch now corrects an unsupported model-declared one to
+        # not_evaluable, and Step 0 resolves every verdict into the
+        # three-member vocabulary. So this is not a degradation to absorb -- it
+        # says the composition saw a verdict the normalizer did not produce,
+        # and the trial kept the model's draft.
         log.warning("kept the model's draft assessment: the verdict and the "
                     "criteria arrays could not support a composed one",
                     stage=5, event="assessment_composition_anomaly",

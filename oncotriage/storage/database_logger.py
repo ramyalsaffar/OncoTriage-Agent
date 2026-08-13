@@ -1629,8 +1629,23 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 # criterion / patient_value / status rows stored beside it in
                 # criterion_details, so the two can no longer contradict each
                 # other. For a "not_evaluable" trial it is still the model's own
-                # text, because that trial's arrays are empty by contract and
-                # there is nothing to compose from. The draft is NOT stored here
+                # text, because a trial the model declared not evaluable has
+                # empty arrays by contract and there is nothing to compose from.
+                #
+                # ONE not_evaluable POPULATION CARRIES FULL ARRAYS AND THE
+                # MODEL'S REJECTION PROSE, and a reader of this column has to
+                # know it exists: a rejection the model wrote with no
+                # disqualifying row to support it is corrected to
+                # "not_evaluable" by Stage 5 (see
+                # UNEVALUABLE_REJECTION_UNSUPPORTED) with both arrays kept as
+                # evidence. Its assessment still opens "Known disqualifier:",
+                # because that is the draft and this column stores the draft for
+                # every not_evaluable trial. The row is not self-contradictory
+                # by accident -- criterion_details beside it carries no
+                # disqualifying status, which is precisely why the verdict was
+                # corrected -- but the two do read against each other, and no
+                # column here names the correction. The Stage 5 log event
+                # "not_evaluable" does, by reason. The draft is NOT stored here
                 # and gets no column of its own; it survives in
                 # inferences.llm_classifier_raw_response only for a run that
                 # made ONE call, because that column is assigned per chunk
