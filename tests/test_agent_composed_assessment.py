@@ -106,6 +106,7 @@ from oncotriage.agent.evaluation import (
     ASSESSMENT_CASES,
     ASSESSMENT_COMPOSED_ELIGIBLE,
     ASSESSMENT_COMPOSED_NOT_ELIGIBLE,
+    ASSESSMENT_COMPOSED_UNSUPPORTED_REJECTION,
     ASSESSMENT_COMPOSITION_ANOMALIES,
     ASSESSMENT_ELIGIBLE_OPENING,
     ASSESSMENT_KEPT_NOT_EVALUABLE,
@@ -115,6 +116,8 @@ from oncotriage.agent.evaluation import (
     ASSESSMENT_NOT_EVALUABLE_OPENING,
     ASSESSMENT_UNDOCUMENTED_OPENING,
     ASSESSMENT_UNDOCUMENTED_PATIENT_VALUE,
+    ASSESSMENT_UNSUPPORTED_REJECTION_TEXT,
+    UNEVALUABLE_REJECTION_UNSUPPORTED,
     assessment_composition_case,
     compose_assessment,
     node_llm_classifier_evaluation,
@@ -259,6 +262,18 @@ V_REJECTION_WITHOUT_EVIDENCE = verdict(
     inclusion=[row("Age 18-75", "62", "met")],
     assessment="Known disqualifier: nothing in the arrays says so.")
 
+# THE CORRECTED REJECTION: not_evaluable, FULL arrays, none of them
+# disqualifying, and the marker Stage 5 writes at the correction site. It is
+# the one not_evaluable shape whose draft is a rejection, which is why it is
+# composed rather than kept. The draft below is deliberately the contradictory
+# text the correction exists to stop storing.
+V_CORRECTED_REJECTION = verdict(
+    TRIAL_VERDICT_NOT_EVALUABLE,
+    inclusion=[row("Age 18-75", "62", "met")],
+    exclusion=[row("Pregnancy", "Not applicable -- male", "not_violated")],
+    assessment="Known disqualifier: a 1963 tubal ligation.")
+V_CORRECTED_REJECTION["not_evaluable_reason"] = UNEVALUABLE_REJECTION_UNSUPPORTED
+
 V_UNKNOWN_VERDICT = verdict(
     "probably eligible",
     inclusion=[row("Age 18-75", "62", "met")],
@@ -266,6 +281,7 @@ V_UNKNOWN_VERDICT = verdict(
 
 ALL_VERDICTS = [V_NOT_ELIGIBLE, V_ELIGIBLE_WITH_UNDOCUMENTED,
                 V_ELIGIBLE_NO_UNDOCUMENTED, V_NOT_EVALUABLE,
+                V_CORRECTED_REJECTION,
                 V_REJECTION_WITHOUT_EVIDENCE, V_UNKNOWN_VERDICT]
 
 
@@ -277,13 +293,20 @@ print("\n" + "=" * 78)
 print("SECTION 1 -- compose_assessment over synthetic verdicts")
 print("=" * 78)
 
-check("the case vocabulary is closed and its five members are distinct",
-      (len(ASSESSMENT_CASES), len(set(ASSESSMENT_CASES))), (5, 5))
+check("the case vocabulary is closed and its six members are distinct",
+      (len(ASSESSMENT_CASES), len(set(ASSESSMENT_CASES))), (6, 6))
 check("...and every member is one this file drives",
       sorted(ASSESSMENT_CASES),
       sorted({ASSESSMENT_COMPOSED_ELIGIBLE, ASSESSMENT_COMPOSED_NOT_ELIGIBLE,
+              ASSESSMENT_COMPOSED_UNSUPPORTED_REJECTION,
               ASSESSMENT_KEPT_NOT_EVALUABLE, ASSESSMENT_KEPT_NO_DISQUALIFIER,
               ASSESSMENT_KEPT_UNKNOWN_VERDICT}))
+check("...and ASSESSMENT_COMPOSED_CASES is the composed subset of it, so the "
+      "`kept = total - composed` arithmetic cannot miss a new member",
+      (sorted(_evaluation_module.ASSESSMENT_COMPOSED_CASES),
+       set(_evaluation_module.ASSESSMENT_COMPOSED_CASES) <= set(ASSESSMENT_CASES)),
+      (sorted({ASSESSMENT_COMPOSED_ELIGIBLE, ASSESSMENT_COMPOSED_NOT_ELIGIBLE,
+               ASSESSMENT_COMPOSED_UNSUPPORTED_REJECTION}), True))
 
 check("1a  a rejection composes the not_eligible opening",
       case_of(V_NOT_ELIGIBLE), ASSESSMENT_COMPOSED_NOT_ELIGIBLE)
@@ -339,6 +362,52 @@ check("1d  ...non-degeneracy: that draft is the one the prompt mandates and "
           ASSESSMENT_NOT_EVALUABLE_OPENING),
        V_NOT_EVALUABLE["assessment"].startswith(ASSESSMENT_ELIGIBLE_OPENING)),
       (True, False))
+
+check("1d' a CORRECTED rejection composes fixed text instead of keeping its "
+      "draft", compose(V_CORRECTED_REJECTION),
+      ASSESSMENT_UNSUPPORTED_REJECTION_TEXT)
+check("1d' ...and reports the composed case, not a kept one and not an anomaly",
+      (case_of(V_CORRECTED_REJECTION),
+       case_of(V_CORRECTED_REJECTION)
+       in _evaluation_module.ASSESSMENT_COMPOSED_CASES,
+       case_of(V_CORRECTED_REJECTION)
+       in _evaluation_module._ASSESSMENT_ANOMALY_CASES),
+      (ASSESSMENT_COMPOSED_UNSUPPORTED_REJECTION, True, False))
+check("1d' ...opening with the mandated not-evaluable opening",
+      ASSESSMENT_UNSUPPORTED_REJECTION_TEXT.startswith(
+          ASSESSMENT_NOT_EVALUABLE_OPENING + " "), True)
+check("1d' ...saying what the model did and what the node did",
+      ("rejected this trial" in ASSESSMENT_UNSUPPORTED_REJECTION_TEXT,
+       "no disqualifying criterion" in ASSESSMENT_UNSUPPORTED_REJECTION_TEXT,
+       "corrected to not evaluable" in ASSESSMENT_UNSUPPORTED_REJECTION_TEXT),
+      (True, True, True))
+check("1d' ...and compose_assessment is still PURE: the draft on the verdict "
+      "it was handed is untouched",
+      V_CORRECTED_REJECTION["assessment"],
+      "Known disqualifier: a 1963 tubal ligation.")
+check("1d' non-degeneracy: the draft it REPLACED is the contradiction this "
+      "case exists for, and is not what is stored",
+      (V_CORRECTED_REJECTION["assessment"].startswith(
+          ASSESSMENT_NOT_ELIGIBLE_OPENING),
+       compose(V_CORRECTED_REJECTION) == V_CORRECTED_REJECTION["assessment"]),
+      (True, False))
+
+# THE MARKER IS WHAT SELECTS THE CASE, and only on a not_evaluable verdict.
+# Both halves are asserted, because a predicate reading only the marker would
+# compose this text over a rejection and one reading only the verdict would
+# compose it over every non-evaluation in the pipeline.
+_marked_eligible = verdict(TRIAL_VERDICT_ELIGIBLE,
+                           inclusion=[row("Age 18-75", "62", "met")])
+_marked_eligible["not_evaluable_reason"] = UNEVALUABLE_REJECTION_UNSUPPORTED
+check("1d' the marker alone does NOT compose it: the verdict must also be "
+      "not_evaluable", case_of(_marked_eligible), ASSESSMENT_COMPOSED_ELIGIBLE)
+_other_reason = verdict(TRIAL_VERDICT_NOT_EVALUABLE, assessment="Not evaluable: x")
+_other_reason["not_evaluable_reason"] = "omitted_from_model_response"
+check("1d' a not_evaluable carrying a DIFFERENT reason keeps its draft",
+      (case_of(_other_reason), compose(_other_reason)),
+      (ASSESSMENT_KEPT_NOT_EVALUABLE, "Not evaluable: x"))
+check("1d' ...and one carrying no reason key at all keeps its draft",
+      case_of(V_NOT_EVALUABLE), ASSESSMENT_KEPT_NOT_EVALUABLE)
 
 # EMPTY ARRAYS, on every verdict. The not_evaluable case is the contract; the
 # other two are the degenerate inputs a renderer must not crash on.
@@ -542,15 +611,14 @@ def disqualifier_violation(text, v, composed=None):
 
 _COMPOSED = [(v, compose(v)) for v in ALL_VERDICTS]
 _COMPOSED_ONLY = [(v, t) for v, t in _COMPOSED
-                  if case_of(v) in (ASSESSMENT_COMPOSED_ELIGIBLE,
-                                    ASSESSMENT_COMPOSED_NOT_ELIGIBLE)]
+                  if case_of(v) in _evaluation_module.ASSESSMENT_COMPOSED_CASES]
 
 check("3a  non-degeneracy: the battery really does compose text for both "
       "composed cases, and keeps a draft for the other three",
       sorted({case_of(v) for v in ALL_VERDICTS}), sorted(set(ASSESSMENT_CASES)))
-check("3a  ...and three of the six are composed, so the invariants below are "
+check("3a  ...and four of the seven are composed, so the invariants below are "
       "not passing over an empty list",
-      len(_COMPOSED_ONLY), 3)
+      len(_COMPOSED_ONLY), 4)
 
 check("3b  no composed assessment names an unsupported undocumented criterion",
       [(v["eligible"], undocumented_violations(t, v))
@@ -656,8 +724,7 @@ def unprovenanced_numbers(text, v):
 check("4a  no composed assessment carries a number its rows do not",
       [(v["eligible"], unprovenanced_numbers(t, v))
        for v, t in _COMPOSED
-       if case_of(v) in (ASSESSMENT_COMPOSED_ELIGIBLE,
-                         ASSESSMENT_COMPOSED_NOT_ELIGIBLE)
+       if case_of(v) in _evaluation_module.ASSESSMENT_COMPOSED_CASES
        and unprovenanced_numbers(t, v)], [])
 check("4a  non-degeneracy: the compositions checked DO contain numbers, so "
       "the check above is not passing over empty input",
@@ -667,6 +734,7 @@ check("4a  non-degeneracy: the compositions checked DO contain numbers, so "
 check("4b  the renderer's own scaffolding contributes no digits",
       numeric_tokens(ASSESSMENT_ELIGIBLE_OPENING
                      + ASSESSMENT_NOT_ELIGIBLE_OPENING
+                     + ASSESSMENT_UNSUPPORTED_REJECTION_TEXT
                      + ASSESSMENT_UNDOCUMENTED_OPENING
                      + 'Inclusion criterion "" not met; patient record: "".'
                      + 'Exclusion criterion "" violated; patient record: "".'),

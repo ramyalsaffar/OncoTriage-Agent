@@ -1185,6 +1185,17 @@ def build_deterministic_prefix(final_state: Dict,
                     # NOT_EVALUABLE_* constants for a trial that entered
                     # Stage 5 and left without one. This is what makes
                     # "no trial was lost" a diffed fact rather than a claim.
+                    #
+                    # IT CARRIES A FIFTH VALUE, and the wording above would
+                    # otherwise send a reader looking for a constant that is
+                    # deliberately not in that tuple. A model rejection that
+                    # cited no disqualifying criterion is corrected to
+                    # not_evaluable by the Stage 5 normalizer and stamped
+                    # UNEVALUABLE_REJECTION_UNSUPPORTED here -- a trial the
+                    # model DID answer for, unlike the four above, which is
+                    # why it is not one of them. Projecting it is right: it is
+                    # a per-verdict outcome, so a replay that stopped
+                    # correcting one of these would diff.
                     "not_evaluable_reason": e.get("not_evaluable_reason"),
                 }
                 for e in evaluations

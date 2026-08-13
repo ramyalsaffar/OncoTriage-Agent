@@ -543,9 +543,20 @@ TRIAL_MATCH_COLUMN_ADDITIONS = {
     # conflicting duplicates, or a trial the model never mentioned -- see
     # _unevaluable_entry, which sets both to None on purpose); or the result dict
     # was built outside the pipeline. The first is separable from the other two
-    # by the run's date; the second and third are not separable here, and
-    # trial_matches.eligible = 'not_evaluable' with a not_evaluable_reason in
-    # criterion_details is what distinguishes them.
+    # by the run's date; the second and third are not separable here.
+    #
+    # THE SENTENCE THAT USED TO END THIS PARAGRAPH WAS FALSE AND IS DELETED. It
+    # said the second and third were told apart by "a not_evaluable_reason in
+    # criterion_details". `not_evaluable_reason` is a key of the in-memory
+    # evaluation dict and NOT a column of this table and NOT a member of
+    # criterion_details, which json.dumps exactly two keys, "inclusion" and
+    # "exclusion" -- see criterion_json at the INSERT below. Nothing has ever
+    # written it to this database. What DOES distinguish a pipeline-constructed
+    # non-evaluation from a model-returned one is these two columns themselves,
+    # in the opposite direction to the paragraph above: the constructed ones are
+    # the NULL population. A model-returned entry corrected to not_evaluable by
+    # Stage 5 (see UNEVALUABLE_REJECTION_UNSUPPORTED) carries real integers here
+    # and is recognisable in the `assessment` column by its composed text.
     #
     # 0 IS A REAL POSITION AND MUST NOT BE READ AS ABSENT. The first entry of
     # the first call carries emission_index 0, so every reader has to test
@@ -1632,20 +1643,22 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 # text, because a trial the model declared not evaluable has
                 # empty arrays by contract and there is nothing to compose from.
                 #
-                # ONE not_evaluable POPULATION CARRIES FULL ARRAYS AND THE
-                # MODEL'S REJECTION PROSE, and a reader of this column has to
-                # know it exists: a rejection the model wrote with no
-                # disqualifying row to support it is corrected to
+                # ONE not_evaluable POPULATION IS COMPOSED, and a reader of this
+                # column has to know it exists: a rejection the model wrote with
+                # no disqualifying row to support it is corrected to
                 # "not_evaluable" by Stage 5 (see
                 # UNEVALUABLE_REJECTION_UNSUPPORTED) with both arrays kept as
-                # evidence. Its assessment still opens "Known disqualifier:",
-                # because that is the draft and this column stores the draft for
-                # every not_evaluable trial. The row is not self-contradictory
-                # by accident -- criterion_details beside it carries no
-                # disqualifying status, which is precisely why the verdict was
-                # corrected -- but the two do read against each other, and no
-                # column here names the correction. The Stage 5 log event
-                # "not_evaluable" does, by reason. The draft is NOT stored here
+                # evidence, and its assessment is
+                # ASSESSMENT_UNSUPPORTED_REJECTION_TEXT -- a fixed sentence
+                # opening "Not evaluable:" that says the model rejected the
+                # trial while citing no disqualifying criterion. It is the one
+                # value in this column that identifies the correction, since
+                # `not_evaluable_reason` is not a column here. Until that
+                # composition existed the row stored the model's rejection
+                # draft, opening "Known disqualifier:" beside a verdict that is
+                # not a rejection and criteria carrying none: a row that
+                # contradicted itself in the column a clinician reads. Rows
+                # written before it still do. The draft is NOT stored here
                 # and gets no column of its own; it survives in
                 # inferences.llm_classifier_raw_response only for a run that
                 # made ONE call, because that column is assigned per chunk

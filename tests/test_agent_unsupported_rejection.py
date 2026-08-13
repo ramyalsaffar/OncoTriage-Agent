@@ -89,15 +89,23 @@ from oncotriage.agent import deps
 from oncotriage.agent import evaluation as _evaluation_module
 from oncotriage.agent.evaluation import (
     ASSESSMENT_CASES,
+    ASSESSMENT_COMPOSED_CASES,
+    ASSESSMENT_COMPOSED_UNSUPPORTED_REJECTION,
     ASSESSMENT_COMPOSITION_ANOMALIES,
     ASSESSMENT_KEPT_NOT_EVALUABLE,
     ASSESSMENT_KEPT_NO_DISQUALIFIER,
     ASSESSMENT_NOT_ELIGIBLE_OPENING,
+    ASSESSMENT_NOT_EVALUABLE_OPENING,
+    ASSESSMENT_UNSUPPORTED_REJECTION_TEXT,
+    NOT_EVALUABLE_MODEL_OMITTED,
     UNEVALUABLE_REJECTION_UNSUPPORTED,
+    UNEVALUABLE_REMAP_NO_SURVIVOR,
     UNEVALUABLE_UNRECOGNIZED_VERDICT,
     assessment_composition_case,
+    compose_assessment,
     node_llm_classifier_evaluation,
 )
+from oncotriage.agent.response_schema import build_response_schema
 from oncotriage.agent.state import (
     TRIAL_VERDICT_ELIGIBLE,
     TRIAL_VERDICT_NOT_ELIGIBLE,
@@ -428,6 +436,39 @@ check("non-degeneracy: that vocabulary is non-empty, so the check above is "
       "not a test against an empty tuple",
       len(_evaluation_module._NOT_EVALUABLE_REASONS) > 0, True)
 
+# THE SIBLING REASON, REWORDED (Part 3). The old string asserted that the
+# remapped row WAS the trial's disqualifier, which is unknowable: it fired on
+# `remapped_here`, true for a remap on any row. The new one asserts only what
+# normalization observed.
+check("the sibling reason asserts only what normalization can know",
+      UNEVALUABLE_REMAP_NO_SURVIVOR,
+      "no disqualifying row survived label normalisation")
+check("...and it no longer claims a disqualifier existed",
+      ("disqualifier was" in UNEVALUABLE_REMAP_NO_SURVIVOR,
+       "sole" in UNEVALUABLE_REMAP_NO_SURVIVOR),
+      (False, False))
+check("...and it is distinct from the other two reasons",
+      len({UNEVALUABLE_REMAP_NO_SURVIVOR, UNEVALUABLE_REJECTION_UNSUPPORTED,
+           UNEVALUABLE_UNRECOGNIZED_VERDICT}), 3)
+
+# THE MARKER IS TRUSTWORTHY ONLY IF THE MODEL CANNOT WRITE IT. Stage 5 sends a
+# STRICT json_schema; strict mode requires `additionalProperties: false` and
+# enumerates the permitted keys, so `not_evaluable_reason` cannot arrive in a
+# model response and an entry carrying it was written by the node. Asserted
+# against the real schema rather than assumed, because the whole of Part 2
+# rests on it.
+_schema = build_response_schema()
+_trial_props = (_schema["properties"]["evaluations"]["items"])
+check("the response schema forbids extra keys on a trial entry",
+      _trial_props.get("additionalProperties"), False)
+check("...and not_evaluable_reason is not one of the keys it permits",
+      "not_evaluable_reason" in _trial_props["properties"], False)
+check("non-degeneracy: the schema really does enumerate properties, so the "
+      "check above is not reading an empty dict",
+      sorted(_trial_props["properties"]),
+      ["assessment", "eligible", "exclusion_criteria", "inclusion_criteria",
+       "match_score", "nct_id"])
+
 
 # ===========================================================================
 # SECTION 2 -- the correction fires, and what it writes
@@ -465,6 +506,12 @@ check("the correction is recorded in the not_evaluable audit",
 check("exactly one trial is recorded",
       field(_rec, "not_evaluable"), 1)
 
+# THE MARKER (Part 1). The audit list feeds a log line and nothing else, so
+# without this the correction left no machine-readable trace on the entry that
+# any downstream consumer -- including the composition below -- could read.
+check("the corrected entry carries the marker",
+      _e.get("not_evaluable_reason"), UNEVALUABLE_REJECTION_UNSUPPORTED)
+
 # It is NOT reported as a label defect: the label was perfectly readable.
 check("nothing is recorded in verdict_normalizations -- the LABEL was fine",
       len(log_records(_err, "verdict_normalization")), 0)
@@ -476,6 +523,9 @@ _clean, _clean_err = run_stage5(
     [entry("NCT00000001", "eligible", inclusion=[crit("met")])])
 check("non-degeneracy: a clean response emits no not_evaluable record",
       len(log_records(_clean_err, "not_evaluable")), 0)
+check("non-degeneracy: and its entry carries NO marker, so the marker check "
+      "above is about the correction rather than about every entry",
+      eval_of(_clean).get("not_evaluable_reason", "<no key>"), "<no key>")
 
 
 # ===========================================================================
@@ -511,16 +561,54 @@ for _label, _payload in _SURVIVING:
     check(f"{_label}: nothing is recorded as not evaluable",
           len(log_records(_rerr, "not_evaluable")), 0)
 
-# The sibling branch is untouched: a rejection whose only disqualifier was an
-# out-of-vocabulary label still resolves under its OWN reason, not this one.
-_remap, _remap_err = run_stage5(
-    [entry("NCT00000001", "not_eligible",
-           inclusion=[crit("violated", text="a cross-arm label")])])
-check("the sibling out-of-vocabulary branch still answers, under its own "
-      "reason", field(log_records(_remap_err, "not_evaluable"), "reason"),
-      ["sole disqualifier was an out-of-vocabulary label"])
-check("...and it still reaches not_evaluable", verdict_of(_remap),
-      TRIAL_VERDICT_NOT_EVALUABLE)
+# ---------------------------------------------------------------------------
+# PART 3: the sibling branch's reason, and that only the REASON moved
+# ---------------------------------------------------------------------------
+#
+# TWO REMAP SHAPES, and the old string was true of one of them and false of the
+# other while both got it. `remapped_here` is true when ANY row was remapped.
+_REMAP_DISQUALIFYING = [entry(
+    "NCT00000001", "not_eligible",
+    inclusion=[crit("violated", text="a cross-arm disqualifying label")])]
+_REMAP_INNOCENT = [entry(
+    "NCT00000001", "not_eligible",
+    inclusion=[crit("met", text="Age 18 or older"),
+               crit("mumble", text="a row that was never disqualifying")])]
+
+for _label, _payload in (("a remapped DISQUALIFYING label",
+                          _REMAP_DISQUALIFYING),
+                         ("a remapped row that was never disqualifying",
+                          _REMAP_INNOCENT)):
+    _r, _rerr = run_stage5(_payload)
+    check(f"{_label}: the reason asserts only what normalization knows",
+          field(log_records(_rerr, "not_evaluable"), "reason"),
+          [UNEVALUABLE_REMAP_NO_SURVIVOR])
+    check(f"{_label}: the verdict is not_evaluable", verdict_of(_r),
+          TRIAL_VERDICT_NOT_EVALUABLE)
+    # PART 3 IS AUDIT ACCURACY ONLY. Verdict and score must be exactly what
+    # they were, and this branch keeps the model's draft -- it does NOT get
+    # the marker, because a row the model wrote may have been a disqualifier
+    # spelled wrong and "cited no disqualifying criterion" would then be false.
+    check(f"{_label}: the score is unchanged -- zero by verdict",
+          (eval_of(_r).get("match_score"), eval_of(_r).get("score_confirmed"),
+           eval_of(_r).get("score_denominator")), (0.0, 0, 0))
+    check(f"{_label}: it does NOT get the unsupported-rejection marker",
+          eval_of(_r).get("not_evaluable_reason", "<no key>"), "<no key>")
+    check(f"{_label}: so it keeps the model's draft, composed by nobody",
+          (assessment_composition_case(eval_of(_r)),
+           eval_of(_r).get("assessment")),
+          (ASSESSMENT_KEPT_NOT_EVALUABLE,
+           eval_of(_r).get("assessment_draft")))
+
+# NON-DEGENERACY for the two shapes: they must actually differ in what they
+# remapped, or the loop above is one case run twice.
+check("non-degeneracy: the two remap shapes are genuinely different inputs",
+      (_REMAP_DISQUALIFYING[0]["inclusion_criteria"][0]["status"],
+       [c["status"] for c in _REMAP_INNOCENT[0]["inclusion_criteria"]]),
+      ("violated", ["met", "mumble"]))
+check("non-degeneracy: the innocent shape really did remap something -- "
+      "otherwise it would reach the correction branch instead",
+      len(log_records(run_stage5(_REMAP_INNOCENT)[1], "label_remap")), 1)
 
 
 # ===========================================================================
@@ -623,24 +711,95 @@ print("\n" + "=" * 75)
 print("SECTION 6 -- composition case and the backstop counter")
 print("=" * 75)
 
-check("the corrected trial composes as kept_draft_not_evaluable",
-      assessment_composition_case(_e), ASSESSMENT_KEPT_NOT_EVALUABLE)
-check("...which is NOT one of the two anomaly cases",
-      assessment_composition_case(_e) == ASSESSMENT_KEPT_NO_DISQUALIFIER,
-      False)
+check("the corrected trial composes under its OWN case",
+      assessment_composition_case(_e),
+      ASSESSMENT_COMPOSED_UNSUPPORTED_REJECTION)
+check("...which is a COMPOSED case, not a kept one",
+      (assessment_composition_case(_e) in ASSESSMENT_COMPOSED_CASES,
+       assessment_composition_case(_e) == ASSESSMENT_KEPT_NOT_EVALUABLE),
+      (True, False))
+check("...and NOT one of the two anomaly cases",
+      (assessment_composition_case(_e) == ASSESSMENT_KEPT_NO_DISQUALIFIER,
+       assessment_composition_case(_e)
+       in _evaluation_module._ASSESSMENT_ANOMALY_CASES),
+      (False, False))
 
-# WHAT A DATABASE READER SEES, asserted rather than described. The stored
-# assessment for a corrected trial is the model's own draft, opening "Known
-# disqualifier:" -- because this column stores the draft for every
-# not_evaluable trial, and nothing was composed. It is recorded here so the
-# next reader of trial_matches.assessment meets this in a test rather than in
-# a patient record.
-check("the STORED assessment is the model's draft, opening 'Known "
-      "disqualifier:'",
-      str(_e.get("assessment", "")).startswith(ASSESSMENT_NOT_ELIGIBLE_OPENING),
-      True)
-check("...and the draft is preserved beside it, unchanged",
-      _e.get("assessment_draft"), _e.get("assessment"))
+# WHAT IS STORED. The contradiction is gone: the composed text opens with the
+# mandated non-evaluation opening and says what happened, and the model's
+# rejection prose survives beside it under assessment_draft.
+check("the STORED assessment is the composed text",
+      _e.get("assessment"), ASSESSMENT_UNSUPPORTED_REJECTION_TEXT)
+check("...opening with the not-evaluable opening, not the rejection one",
+      (str(_e.get("assessment", "")).startswith(
+          ASSESSMENT_NOT_EVALUABLE_OPENING),
+       str(_e.get("assessment", "")).startswith(
+           ASSESSMENT_NOT_ELIGIBLE_OPENING)),
+      (True, False))
+check("the DRAFT is preserved, untouched, and is the model's rejection prose",
+      (_e.get("assessment_draft"),
+       str(_e.get("assessment_draft", "")).startswith(
+           ASSESSMENT_NOT_ELIGIBLE_OPENING)),
+      ("Known disqualifier: the model said so.", True))
+check("non-degeneracy: the stored text and the draft genuinely differ, so "
+      "'composed' is not a name for keeping the draft",
+      _e.get("assessment") == _e.get("assessment_draft"), False)
+
+# EVERY OTHER not_evaluable POPULATION KEEPS ITS DRAFT. Driven through the
+# node, not asserted on hand-built dicts, because placement is what this has to
+# prove: the composition runs LAST, over the complete list, including the
+# entries the node constructed in the reconciliation.
+_kept, _kept_err = run_stage5(
+    # NCT...0002 is sent and never answered for, so the reconciliation
+    # constructs an entry for it; NCT...0001 is a model-declared not_evaluable
+    # with the empty arrays the prompt's Section 1 mandates.
+    [entry("NCT00000001", "not_evaluable",
+           assessment="Not evaluable: the criteria text was unreadable.")],
+    nct_ids=("NCT00000001", "NCT00000002"))
+_declared = eval_of(_kept, "NCT00000001")
+_constructed = eval_of(_kept, "NCT00000002")
+check("a model-declared not_evaluable keeps its draft",
+      (assessment_composition_case(_declared), _declared.get("assessment")),
+      (ASSESSMENT_KEPT_NOT_EVALUABLE,
+       "Not evaluable: the criteria text was unreadable."))
+check("...and carries no marker",
+      _declared.get("not_evaluable_reason", "<no key>"), "<no key>")
+check("a CONSTRUCTED not_evaluable keeps its purpose-written text",
+      (assessment_composition_case(_constructed),
+       "no entry for this trial" in _constructed.get("assessment", "")),
+      (ASSESSMENT_KEPT_NOT_EVALUABLE, True))
+check("...under its own not_evaluable_reason, which is not the marker",
+      (_constructed.get("not_evaluable_reason"),
+       _constructed.get("not_evaluable_reason")
+       == UNEVALUABLE_REJECTION_UNSUPPORTED),
+      (NOT_EVALUABLE_MODEL_OMITTED, False))
+check("non-degeneracy: neither kept entry composed the new text",
+      [e.get("assessment") for e in (_declared, _constructed)
+       if e.get("assessment") == ASSESSMENT_UNSUPPORTED_REJECTION_TEXT], [])
+
+# ALL FOUR CONSTRUCTED REASONS, as a unit over compose_assessment, so the four
+# that no cheap node driver reaches are covered too.
+for _reason in _evaluation_module._NOT_EVALUABLE_REASONS:
+    _built = _evaluation_module._unevaluable_entry(
+        {"trial": trial("NCT00000009")}, _reason)
+    check(f"constructed {_reason!r} keeps its text",
+          (assessment_composition_case(_built),
+           compose_assessment(_built) == _built["assessment"]),
+          (ASSESSMENT_KEPT_NOT_EVALUABLE, True))
+
+# THE COUNTERS COUNT IT. `kept` is `total - composed`, so a composed case
+# missing from ASSESSMENT_COMPOSED_CASES would be counted as kept and the
+# arithmetic would still add up -- which is why both numbers are asserted.
+_comp = log_records(_err, "assessment_composition")
+check("the composition event counts the corrected trial as COMPOSED",
+      (field(_comp, "count"), field(_comp, "kept"), field(_comp, "total")),
+      (1, 0, 1))
+check("...and names the new case",
+      field(_comp, "reason"), [ASSESSMENT_COMPOSED_UNSUPPORTED_REJECTION])
+_comp_kept = log_records(_kept_err, "assessment_composition")
+check("non-degeneracy: the two kept entries are counted as KEPT, so the "
+      "composed count above is not what this event always reports",
+      (field(_comp_kept, "count"), field(_comp_kept, "kept"),
+       field(_comp_kept, "total")), (0, 2, 2))
 
 # The counter is the backstop, and it must read zero on the pipeline path.
 _anomaly_delta = {
@@ -782,14 +941,16 @@ try:
               [c["status"] for c in _parsed["inclusion"] + _parsed["exclusion"]
                if c["status"] in ("not_met", "violated")], [])
 
-        # AND THE ONE THING A READER MUST BE WARNED ABOUT. `assessment` stores
-        # the model's draft for every not_evaluable trial, so a corrected
-        # rejection's stored prose still opens "Known disqualifier:" beside a
-        # verdict that is not a rejection and criteria that carry none. No
-        # column names the correction; the Stage 5 log event does. Asserted
-        # here rather than described, so the next reader meets it in a test.
-        check("assessment still opens with the rejection opening",
-              str(_assess).startswith(ASSESSMENT_NOT_ELIGIBLE_OPENING), True)
+        # THE COLUMN THAT IDENTIFIES THE CORRECTION. `not_evaluable_reason` is
+        # not a column of this table, so the composed assessment is the only
+        # stored value that names what happened -- which is why the text is a
+        # fixed constant rather than a rendering: a reader can match on it.
+        check("assessment is the composed text, in the database",
+              _assess, ASSESSMENT_UNSUPPORTED_REJECTION_TEXT)
+        check("...so the stored row no longer contradicts its own verdict",
+              (str(_assess).startswith(ASSESSMENT_NOT_EVALUABLE_OPENING),
+               str(_assess).startswith(ASSESSMENT_NOT_ELIGIBLE_OPENING)),
+              (True, False))
 finally:
     shutil.rmtree(_db_dir, ignore_errors=True)
 
@@ -867,6 +1028,115 @@ if _pre_fix is not None:
               verdict_of(run_stage5(
                   _payload, node=_pre_fix.node_llm_classifier_evaluation)[0]),
               _want)
+
+
+# ---------------------------------------------------------------------------
+# Four more plants, one per new mechanism. Each disables ONE thing.
+# ---------------------------------------------------------------------------
+
+def _control(label, subs, probe, expected):
+    """Plant, probe the planted module, record. A raise IS an outcome."""
+    try:
+        module = _plant(_EVAL_SRC, f"planted_{label[:8]}", subs)
+    except _PlantFailed as exc:
+        check(f"{label}  [THE PLANT ITSELF FAILED: {exc}]", "plant-failed",
+              expected)
+        return
+    try:
+        actual = probe(module)
+    except Exception as exc:            # noqa: BLE001 - a raise IS an outcome
+        actual = f"raised {type(exc).__name__}"
+    check(label, actual, expected)
+
+
+def _stored(module, payload=None):
+    """(composition case, stored assessment) for the corrected trial."""
+    res, _ = run_stage5(payload or UNSUPPORTED,
+                        node=module.node_llm_classifier_evaluation)
+    ent = eval_of(res)
+    return (module.assessment_composition_case(ent), ent.get("assessment"))
+
+
+# C1. PART 1: the marker write, deleted. The verdict is still corrected, so a
+#     test that only checked the verdict would pass -- and the composition
+#     silently falls back to keeping the contradictory draft.
+_control(
+    "C1. dropping the marker write returns the contradictory draft -- CAUGHT",
+    [('                eval_result["not_evaluable_reason"] = (\n'
+      "                    UNEVALUABLE_REJECTION_UNSUPPORTED)",
+      "                pass  # PLANTED: the marker write, dropped")],
+    lambda m: _stored(m),
+    (ASSESSMENT_KEPT_NOT_EVALUABLE, "Known disqualifier: the model said so."),
+)
+
+# C2. PART 2: the case predicate, deleted. Same fallback, reached the other
+#     way -- which is why both halves are controlled rather than one standing
+#     in for the other.
+_control(
+    "C2. dropping the composition case returns the draft -- CAUGHT",
+    [('        if verdict.get("not_evaluable_reason") == UNEVALUABLE_REJECTION_UNSUPPORTED:\n'
+      "            return ASSESSMENT_COMPOSED_UNSUPPORTED_REJECTION",
+      "        if False:  # PLANTED: the composed case, bypassed\n"
+      "            return ASSESSMENT_COMPOSED_UNSUPPORTED_REJECTION")],
+    lambda m: _stored(m),
+    (ASSESSMENT_KEPT_NOT_EVALUABLE, "Known disqualifier: the model said so."),
+)
+
+# C3. PART 2: the new member dropped from ASSESSMENT_COMPOSED_CASES. THE TEXT
+#     IS STILL COMPOSED -- only the arithmetic moves, and it still adds up, so
+#     nothing but a check on both numbers can see it. This is the control for
+#     the counter assertion rather than for the composition.
+_control(
+    "C3. losing the case from ASSESSMENT_COMPOSED_CASES miscounts it as "
+    "kept -- CAUGHT",
+    [("ASSESSMENT_COMPOSED_CASES = (\n"
+      "    ASSESSMENT_COMPOSED_ELIGIBLE,\n"
+      "    ASSESSMENT_COMPOSED_NOT_ELIGIBLE,\n"
+      "    ASSESSMENT_COMPOSED_UNSUPPORTED_REJECTION,\n)",
+      "ASSESSMENT_COMPOSED_CASES = (\n"
+      "    ASSESSMENT_COMPOSED_ELIGIBLE,\n"
+      "    ASSESSMENT_COMPOSED_NOT_ELIGIBLE,\n)")],
+    lambda m: (lambda rec: (field(rec, "count"), field(rec, "kept")))(
+        log_records(run_stage5(
+            UNSUPPORTED, node=m.node_llm_classifier_evaluation)[1],
+            "assessment_composition")),
+    (0, 1),
+)
+
+# C4. PART 3: the reason reverted to the sentence that over-claimed. Probed on
+#     the INNOCENT remap shape -- the population the old string was false of.
+_control(
+    "C4. restoring the over-claiming sibling reason -- CAUGHT",
+    [('                "reason": UNEVALUABLE_REMAP_NO_SURVIVOR,',
+      '                "reason": "sole disqualifier was an '
+      'out-of-vocabulary label",')],
+    lambda m: field(log_records(run_stage5(
+        _REMAP_INNOCENT, node=m.node_llm_classifier_evaluation)[1],
+        "not_evaluable"), "reason"),
+    ["sole disqualifier was an out-of-vocabulary label"],
+)
+
+# C5. THE CONVERSE OF C4, and it is the one that stops Part 3 being a rename.
+#     If the sibling branch were given the marker as well, the innocent remap
+#     shape would compose "cited no disqualifying criterion" over a row the
+#     model may have written as a disqualifier and spelled wrong. The control
+#     shows that edit producing exactly that text.
+_control(
+    "C5. giving the sibling branch the marker composes a claim it cannot "
+    "support -- CAUGHT",
+    [('                "reason": UNEVALUABLE_REMAP_NO_SURVIVOR,\n'
+      "            })",
+      '                "reason": UNEVALUABLE_REMAP_NO_SURVIVOR,\n'
+      "            })\n"
+      '            eval_result["not_evaluable_reason"] = (\n'
+      "                UNEVALUABLE_REJECTION_UNSUPPORTED)  # PLANTED")],
+    lambda m: _stored(m, _REMAP_DISQUALIFYING)[1],
+    ASSESSMENT_UNSUPPORTED_REJECTION_TEXT,
+)
+check("C5 non-degeneracy: the SHIPPED module composes no such text for that "
+      "shape -- it keeps the draft",
+      _stored(_evaluation_module, _REMAP_DISQUALIFYING),
+      (ASSESSMENT_KEPT_NOT_EVALUABLE, "Known disqualifier: the model said so."))
 
 
 # ===========================================================================
