@@ -547,6 +547,22 @@ LOGGABLE_FIELDS = frozenset({
     # those a run saw, and only the second is a quality signal.
     "duplicate_identical_count", "duplicate_identical_nct_ids",
     "duplicate_conflicting_count", "duplicate_conflicting_nct_ids",
+    # Stage 5's temporal-conflict detector: {marker: count} for each of its two
+    # hand-authored word lists, one call's worth. THE KEYS ARE OUR OWN
+    # VOCABULARY -- members of _RESOLVED_STATE_MARKERS and
+    # _ACTIVE_REQUIREMENT_MARKERS in oncotriage/agent/evaluation.py -- so they
+    # are code identifiers, on exactly the footing that makes
+    # `degradation_totals` allowlistable while its counters' own KEYS are not.
+    # The values are cardinalities.
+    #
+    # WHAT IS DELIBERATELY NOT HERE, and this is the reason the detector reports
+    # markers rather than matches: the patient_value and the criterion text that
+    # co-occurred. Those are the model's clinical statement about this patient
+    # -- the same content that keeps `response_preview` off this list -- and the
+    # detector never passes them. Knowing that "remission" fired 14 times
+    # diagnoses the vocabulary; knowing WHICH remission does not, and the row
+    # itself is stored in trial_matches.criterion_details with its flag.
+    "temporal_conflict_resolved_markers", "temporal_conflict_active_markers",
 
     # --- identifiers of PUBLIC objects -------------------------------------
     # An NCT ID names a trial on a public registry. It is not patient data.

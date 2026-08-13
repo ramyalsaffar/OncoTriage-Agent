@@ -1159,7 +1159,30 @@ _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    # which is what lets the control show
                    # ASSESSMENT_KEPT_NO_DISQUALIFIER firing without touching the
                    # live counter the same file asserts is at zero.
-                   "tests/test_agent_unsupported_rejection.py"}
+                   "tests/test_agent_unsupported_rejection.py",
+                   # Plants into an in-memory copy of agent/evaluation.py for
+                   # the Stage 5 temporal-conflict detector -- the RULE 4 flag
+                   # that is COUNTED and never applied. `git show` can supply
+                   # none of its seven controls. The detector is AT HEAD and has
+                   # no prior revision, so a blob would compare the changed
+                   # module with itself, and five of the seven move ONE decision
+                   # while leaving the rest of the node correct: the status gate
+                   # removed, the criterion gate removed, the call relocated
+                   # ABOVE the absent-data validator, the marker vocabulary
+                   # emptied, and -- the sharpest one -- a status REWRITE added
+                   # to the detector, which is the state the measurement (0.57
+                   # precision) forbids and which no commit has ever had.
+                   #
+                   # The eighth copy is not a control at all: section 6 execs a
+                   # copy with the detector call bypassed to reconstruct the
+                   # pre-change node and compares its whole evaluation list,
+                   # at every depth, against the shipped one with the added key
+                   # stripped -- the equivalence proof that "detect only" is a
+                   # claim about every other field rather than only about the
+                   # verdicts. An exec'd copy of evaluation.py also binds the
+                   # LIVE observability module, which is what lets the log-event
+                   # controls observe a plant in evaluation.py alone.
+                   "tests/test_agent_temporal_conflict_flag.py"}
 
 
 def _repo_py_files():

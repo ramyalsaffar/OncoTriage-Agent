@@ -1523,6 +1523,227 @@ def compose_assessment(verdict: Dict) -> str:
     return draft if isinstance(draft, str) else str(draft)
 
 
+# ---------------------------------------------------------------------------
+# Suspect temporal conflicts (RULE 4): DETECTED AND COUNTED, NEVER REWRITTEN
+# ---------------------------------------------------------------------------
+#
+# WHAT THE MODEL IS SUPPOSED TO DO. The system prompt's RULE 4 is explicit:
+# where a criterion requires an ACTIVE or CURRENT condition and the record shows
+# that condition resolved, inactive or in remission, the status is
+# "not_evaluable" on an inclusion and "not_violated" on an exclusion -- never
+# "not_met" and never "violated". A resolved condition is not evidence that a
+# criterion about a current one was failed.
+#
+# WHAT IT SOMETIMES DOES INSTEAD, measured on real runs: an AML resolved in 1997
+# marked "not_met" against a newly-diagnosed-AML criterion; a terminated
+# pregnancy read as a current one; a concussion resolved in 2012 quoted to
+# disqualify on active CNS leukaemia. Each is a rejection resting on a fact the
+# record says is over.
+#
+# WHY THIS ONLY LOOKS. A simulation against an independent rater measured the
+# precision of REWRITING these rows at 0.57 -- so an automatic correction would
+# delete a correct rejection roughly two times in five. That is the same
+# fabrication the unsupported-rejection correction exists to prevent, pointing
+# the other way, and it is unacceptable at any volume. So this mechanism adds a
+# key and counts; it changes no status, no verdict, no score and no assessment.
+# tests/test_agent_temporal_conflict_flag.py proves that by running the node
+# with the detector bypassed and diffing everything but the key.
+#
+# THREE LIMITS, STATED HERE RATHER THAN DISCOVERED LATER:
+#
+#   1. The two marker lists are HAND-AUTHORED and are a FLOOR, not a complete
+#      family. "status post", "s/p", "no longer", "quiescent", "eradicated" and
+#      "cured" all express the same thing and are not here. A row this predicate
+#      does not match is not a row it has cleared.
+#   2. The flag is a SIGNAL TO LOOK, not a judgement that the row is wrong. It
+#      says two vocabularies co-occurred in one row, which is a correlation over
+#      free text, not a reading of the record.
+#   3. The independent rater ENDORSED some rows this predicate matches. A
+#      genuinely correct rejection can quote a resolved condition -- a criterion
+#      requiring an active infection is legitimately not met by a patient whose
+#      infection resolved, and "not_met" is arguably right when the criterion is
+#      phrased as a requirement rather than a question. That is precisely why
+#      limit 2 holds and why nothing here rewrites.
+
+TEMPORAL_CONFLICT_FIELD = "temporal_conflict_suspect"
+"""The key added to a suspect criterion row, with the value ``True``.
+
+ABSENT rather than ``False`` on every other row, which is this codebase's
+convention for a detector that found nothing (``not_evaluable_reason``,
+``emission_index``): a key that is always present says the detector ran on this
+row, and nothing here can promise that for a row written before it existed.
+Consumers must therefore read it with ``.get``.
+
+THE MODEL CANNOT FORGE IT. The Stage 5 response schema is strict, with
+``additionalProperties: false`` on the criterion object and a ``required`` list
+naming exactly ``criterion``, ``patient_value`` and ``status``, so a row that
+carries this key was written here. The test asserts that against the real schema
+rather than assuming it, the way the unsupported-rejection marker already is.
+"""
+
+# The RESOLVED-STATE family, matched against the row's patient_value. Close
+# inflections are enumerated rather than stemmed: a stemmer would also fold
+# words nobody chose, and the whole value of a hand-authored list is that every
+# member was argued for. Note what word boundaries buy for free -- "unresolved"
+# does NOT match "resolved", because there is no boundary between "n" and "r",
+# and "unresolved" means the opposite of every word in this tuple.
+_RESOLVED_STATE_MARKERS = (
+    "resolved", "resolve", "resolves", "resolving", "resolution",
+    "remission",
+    "inactive",
+    "terminated", "terminate", "terminates", "terminating", "termination",
+)
+
+# The ACTIVE-REQUIREMENT family, matched against the row's criterion text.
+# "inactive" does NOT match "active" here, for the same boundary reason, which
+# is the one collision between the two lists and the one that would have made
+# the predicate self-satisfying.
+_ACTIVE_REQUIREMENT_MARKERS = (
+    "active", "actively",
+    "current", "currently",
+    "newly diagnosed",
+    "ongoing", "undergoing",
+)
+
+
+def _marker_pattern(marker: str) -> "re.Pattern":
+    """One case-insensitive, word-boundary-anchored pattern for one marker.
+
+    Internal whitespace becomes ``\\s+`` so "newly  diagnosed" and a marker
+    broken across a line both match; the words themselves are escaped, so a
+    marker is a literal and never a pattern a future editor has to think about.
+    """
+    return re.compile(
+        r"\b" + r"\s+".join(re.escape(word) for word in marker.split()) + r"\b",
+        re.IGNORECASE)
+
+
+_RESOLVED_STATE_PATTERNS = tuple(
+    (marker, _marker_pattern(marker)) for marker in _RESOLVED_STATE_MARKERS)
+_ACTIVE_REQUIREMENT_PATTERNS = tuple(
+    (marker, _marker_pattern(marker)) for marker in _ACTIVE_REQUIREMENT_MARKERS)
+
+TEMPORAL_CONFLICT_RESOLVED_MARKERS = Counter()
+"""Which resolved-state markers fired, cumulative over the process.
+
+Keyed by OUR OWN vocabulary -- a member of ``_RESOLVED_STATE_MARKERS``, which is
+a code identifier in every sense that matters -- and never by the text it
+matched, which is model output about a patient. Same rule ``FIELD_DROPS``
+follows for the field names it withholds.
+
+DELIBERATELY NOT REGISTERED IN ``oncotriage/degradation.py``. Every counter in
+that registry means something went wrong with the run, and its report reads "N
+of M counters moved". This one moves on correct behaviour too -- limit 3 above
+-- so a clean run with three suspect rows would report a degradation that did
+not happen. It is an observation, not a degradation.
+
+A ROW CONTRIBUTES EVERY MARKER IT MATCHED, not the first, because the question
+these counters answer is which vocabulary members earn their place. So they sum
+to at least the number of flagged rows and usually to more, and neither of them
+is a row count. ``count`` in the log event is the row count.
+"""
+
+TEMPORAL_CONFLICT_ACTIVE_MARKERS = Counter()
+"""Which active-requirement markers fired, cumulative. See the counter above."""
+
+
+def _markers_in(text: str, patterns) -> List[str]:
+    """Every marker of one family present in one string, in vocabulary order."""
+    return [marker for marker, pattern in patterns if pattern.search(text)]
+
+
+def temporal_conflict_markers(row: Dict):
+    """``(resolved markers, active markers)`` for a suspect row, else ``None``.
+
+    PURE. It reads one dict and returns a tuple or None; it mutates nothing,
+    counts nothing and opens nothing, so it is unit-testable on a literal and
+    the caller owns both the flag and the recording.
+
+    All three conditions are required, and each is a separate gate the test
+    exercises on its own:
+
+      1. the status DISQUALIFIES -- ``not_met`` or ``violated``, read off
+         ``_DISQUALIFYING_STATUS_PHRASES`` rather than respelled, so the two
+         cannot drift. A ``not_evaluable`` row quoting a resolved condition is
+         RULE 4 being obeyed and is not a finding;
+      2. the patient_value carries a resolved-state marker;
+      3. the criterion text carries an active-requirement marker.
+
+    Both fields are read through ``_row_text``, so a non-string coerces rather
+    than raising -- this runs after ``_normalize_arm`` in the pipeline but must
+    be total over a hand-built dict in a test.
+    """
+    if not isinstance(row, dict):
+        return None
+    if row.get("status") not in _DISQUALIFYING_STATUS_PHRASES:
+        return None
+    resolved = _markers_in(_row_text(row, "patient_value"),
+                           _RESOLVED_STATE_PATTERNS)
+    if not resolved:
+        return None
+    active = _markers_in(_row_text(row, "criterion"),
+                         _ACTIVE_REQUIREMENT_PATTERNS)
+    if not active:
+        return None
+    return resolved, active
+
+
+def detect_temporal_conflicts(evaluations) -> List[Dict]:
+    """Flag every suspect criterion row. Returns the audit list.
+
+    THE ONLY MUTATION IS THE ADDED KEY. No status, verdict, score, assessment
+    or array membership is touched by this function or by anything it calls.
+
+    Returns one record per flagged row -- nct_id, arm, the status that was left
+    in place, and the markers of each family that fired. The records carry no
+    patient_value and no criterion text: they feed a log event, and the audit of
+    the text itself is ``criterion_details``, which stores the row with its flag.
+
+    NOT IDEMPOTENT ON THE COUNTERS, deliberately. Calling it twice over one
+    evaluation list re-flags rows that are already flagged (harmless, the key is
+    already True) and counts their markers again (not harmless). It is not
+    guarded, because a second call would be a defect and a guard would hide it;
+    the node calls it exactly once, and the test asserts that against the source.
+    """
+    suspects: List[Dict] = []
+    for evaluation in evaluations:
+        if not isinstance(evaluation, dict):
+            continue
+        nct_id = evaluation.get("nct_id", "")
+        for arm, row in _criteria_rows(evaluation):
+            found = temporal_conflict_markers(row)
+            if found is None:
+                continue
+            resolved, active = found
+            row[TEMPORAL_CONFLICT_FIELD] = True
+            for marker in resolved:
+                TEMPORAL_CONFLICT_RESOLVED_MARKERS[marker] += 1
+            for marker in active:
+                TEMPORAL_CONFLICT_ACTIVE_MARKERS[marker] += 1
+            suspects.append({
+                "nct_id": nct_id,
+                "arm": arm,
+                "status": row.get("status"),
+                "resolved_markers": resolved,
+                "active_markers": active,
+            })
+    return suspects
+
+
+def temporal_conflict_marker_counts(suspects: List[Dict]):
+    """``(resolved, active)`` ``{marker: count}`` over ONE node call's suspects.
+
+    Built from the returned audit list rather than read off the module counters,
+    which are cumulative over the process: a log event describing this call must
+    not report a total that includes the twenty patients before it.
+    """
+    resolved, active = Counter(), Counter()
+    for record in suspects:
+        resolved.update(record["resolved_markers"])
+        active.update(record["active_markers"])
+    return dict(sorted(resolved.items())), dict(sorted(active.items()))
+
+
 def node_llm_classifier_evaluation(state: TrialMatchState) -> dict:
     """
     Stage 5: LLM classifier, criterion-level evaluation.
@@ -3051,6 +3272,56 @@ CLINICAL TRIALS:
                  count=len(absent_data_corrections),
                  total=len({c["nct_id"] for c in absent_data_corrections}),
                  eligible=flipped_trials)
+
+    # ── Suspect temporal conflicts: flagged and counted, never rewritten ────
+    #
+    # HERE, AND THE POSITION IS THE WHOLE OF THE ORDERING GUARANTEE. Both
+    # rewriters have finished: Step 1 has coerced every criterion status into
+    # its arm's vocabulary, Step 3 has settled the trial verdict, and the
+    # absent-data validator immediately above has already turned a
+    # disqualification resting on an absent patient_value into `not_evaluable`.
+    # So the arrays this scan reads are the arrays that will be stored, and a
+    # row the validator corrected fails the status gate and is never flagged --
+    # which matters because the two predicates overlap on real text ("No record
+    # of infection; prior episode resolved 2012" satisfies both). Running this
+    # first would attach a suspect flag to a row whose status the next block
+    # then rewrote, leaving a contradiction in the stored record.
+    #
+    # BEFORE THE RECONCILIATION, and that costs nothing: the entries it appends
+    # are built by `_unevaluable_entry`, which declares no `inclusion_criteria`
+    # and no `exclusion_criteria` at all, so `_criteria_rows` yields nothing for
+    # them wherever this runs. Scanning the model-returned population is also
+    # what the finding is ABOUT -- the model disobeying RULE 4.
+    #
+    # See the block above `TEMPORAL_CONFLICT_FIELD` for why this only looks.
+    _temporal_suspects = detect_temporal_conflicts(evaluations)
+    if _temporal_suspects:
+        _resolved_counts, _active_counts = temporal_conflict_marker_counts(
+            _temporal_suspects)
+        # INFO, not WARNING, and deliberately: a suspect row is an expected
+        # observation at a measured rate rather than a fault, and every other
+        # Stage 5 audit event -- label_remap, not_evaluable, verdict_
+        # normalization, absent_data_correction -- reports at this level. The
+        # two events that warn (reconciliation, assessment_composition_anomaly)
+        # both name a state that should not occur.
+        #
+        # NOT ONE CLINICAL WORD IS IN THIS EVENT. `count` and `total` are
+        # cardinalities, `nct_ids` are public registry identifiers, and the two
+        # marker dicts are keyed by OUR OWN vocabulary. The quoted
+        # patient_value and the criterion text are not here and must never be:
+        # a criterion label beside a status is a clinical statement about this
+        # patient, which is the rule that already keeps `response_preview` off
+        # LOGGABLE_FIELDS. The text is auditable where it belongs -- in
+        # `criterion_details`, on the row, beside its flag.
+        log.info("criterion rows disqualify on a condition the record reports "
+                 "as resolved (RULE 4); flagged for audit, not rewritten",
+                 stage=5, event="temporal_conflict_suspect",
+                 count=len(_temporal_suspects),
+                 total=len({s["nct_id"] for s in _temporal_suspects}),
+                 nct_ids=sorted({s["nct_id"] for s in _temporal_suspects
+                                 if s["nct_id"]}),
+                 temporal_conflict_resolved_markers=_resolved_counts,
+                 temporal_conflict_active_markers=_active_counts)
 
     # ── Report not-applicable exclusions ────────────────────────────────────
     #
