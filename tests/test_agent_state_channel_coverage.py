@@ -47,6 +47,13 @@ WHAT THIS FILE HOLDS
     5. THE LEDGER SURVIVES THE FAILURE RETURNS. A run whose response is
        unparseable still reports the call it made and paid for. A list is not a
        count, so a short one understates nothing.
+    2e. THE SAME THREE FACTS FOR ``llm_classifier_patient_record_tokens``,
+       which a later pass added to the same node's returns and the same
+       ``_pipeline_provenance()`` read, and which is therefore exposed to the
+       identical silent drop. Its ARITHMETIC belongs to
+       tests/test_agent_patient_record_tokens.py; what is asked here is that
+       the channel exists, carries the node's value, and loses it when the one
+       annotation is removed.
     6. THE EVALUATION RECORD PERSISTS ALL FOUR. ``run_harness.build_record``
        copies the result verbatim except four named keys, so this is a property
        of that omission list rather than of an enumeration -- asserted here
@@ -164,6 +171,13 @@ PACKING_KEYS = (
     "llm_classifier_cached_input_tokens",
     "llm_classifier_call_details",
 )
+
+# Added later, by the patient-record-size measurement, and covered here for one
+# reason: it is written by the same node and read by the same
+# _pipeline_provenance(), so it is exposed to the identical silent-drop defect.
+# Its VALUE is tests/test_agent_patient_record_tokens.py's subject; what this
+# file owns is that the channel exists and carries it.
+RECORD_TOKENS_KEY = "llm_classifier_patient_record_tokens"
 
 
 #------------------------------------------------------------------------------
@@ -412,6 +426,8 @@ check("the scan actually saw return keys (non-degenerate)",
       _keys_seen >= 40, True)
 check("all four packing keys are declared",
       sorted(k for k in PACKING_KEYS if k in _DECLARED), sorted(PACKING_KEYS))
+check("the patient-record-token key is declared too",
+      RECORD_TOKENS_KEY in _DECLARED, True)
 
 print("\n  1b. NEGATIVE CONTROL -- a planted undeclared key is reported")
 _PLANT = '''
@@ -582,6 +598,47 @@ _graph_wrapped.add_node("stage5", _unannotated(node_llm_classifier_evaluation))
 _graph_wrapped.add_node("finalize", _unannotated(node_finalize))
 check("the wrapped node does not, which is what makes 2c a control",
       [k for k in PACKING_KEYS if k in _graph_wrapped.channels], [])
+
+print("\n  2e. the patient-record-token channel, same route, same control")
+#
+# ONE KEY, THE SAME THREE FACTS. It is produced non-degenerately by the node,
+# it reaches the result through the real channel layer, and the identical run
+# over a schema with THIS annotation removed loses it -- which is what says the
+# declaration is doing the work rather than the key surviving for some other
+# reason. Its arithmetic is not asked here; that is a different file's subject.
+check("the node produced a positive int for it",
+      isinstance(_returned.get(RECORD_TOKENS_KEY), int)
+      and not isinstance(_returned.get(RECORD_TOKENS_KEY), bool)
+      and _returned[RECORD_TOKENS_KEY] > 0, True)
+check("and the result carries exactly that value",
+      _result.get(RECORD_TOKENS_KEY), _returned.get(RECORD_TOKENS_KEY))
+
+_StateWithoutRecordTokens = TypedDict("_StateWithoutRecordTokens", {
+    k: v for k, v in TrialMatchState.__annotations__.items()
+    if k != RECORD_TOKENS_KEY
+})
+check("the control schema really is exactly one annotation smaller",
+      len(TrialMatchState.__annotations__)
+      - len(_StateWithoutRecordTokens.__annotations__), 1)
+check("the control schema declares its keys as channels (not inert)",
+      len(_StateWithoutRecordTokens.__required_keys__
+          | _StateWithoutRecordTokens.__optional_keys__),
+      len(_StateWithoutRecordTokens.__annotations__))
+
+deps.set_override(deps.OPENAI_CLIENT, _StubOpenAI(_NCTS, cached_sequence=(1024,)))
+_result_no_record_channel = drive(run_through_graph,
+                                  base_state([_trial(n) for n in _NCTS]),
+                                  schema=_StateWithoutRecordTokens)
+check("undeclared -> the result loses it entirely",
+      _result_no_record_channel.get(RECORD_TOKENS_KEY), None)
+# The control's own control, on 2c's precedent: a key declared in BOTH schemas
+# travels the same route from the same stub, so its survival says the run
+# happened and the None above is about the declaration.
+check("CONTROL the sha256 (declared in both) survives that run",
+      _result_no_record_channel.get("llm_classifier_prompt_sha256"),
+      _result.get("llm_classifier_prompt_sha256"))
+check("CONTROL the control arm produced verdicts",
+      len(_result_no_record_channel.get("matches") or []) >= 1, True)
 
 
 #------------------------------------------------------------------------------

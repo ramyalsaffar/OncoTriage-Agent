@@ -474,6 +474,41 @@ INFERENCE_COLUMN_ADDITIONS = {
     # a test on the version.
     "llm_classifier_prompt_version":         "TEXT",
     "llm_classifier_prompt_sha256":          "TEXT",
+
+    # --- How much of that prompt was the patient ----------------------------
+    #
+    # Estimated tokens of the PATIENT RECORD block's body inside the Stage 5
+    # system message, measured by the pipeline's own estimator
+    # (oncotriage/agent/evaluation.py:estimate_prompt_tokens, the
+    # characters/CHARS_PER_TOKEN proxy) over the NEUTRALIZED text that was
+    # actually interpolated. It is a MEASUREMENT, not a billed figure: the
+    # provider's own count for the whole request is
+    # llm_classifier_input_tokens, and these two must never be compared as if
+    # they measured the same thing.
+    #
+    # WHAT IT IS FOR. The system message is constant except for this block, so
+    # a run's fixed prefix is template + record. With this column a reader can
+    # say how much of a patient's spend was their own record and how much was
+    # instruction; without it the two are one number and the split is
+    # unrecoverable from any stored row.
+    #
+    # THE TEMPLATE'S SHARE IS DELIBERATELY NOT A COLUMN. It is the fixed
+    # prefix minus this value minus the user wrapper, and storing a derived
+    # quantity beside its inputs is how two copies of one fact start
+    # disagreeing. Derive it.
+    #
+    # ONE VALUE PER INFERENCE EVEN WHEN THE BATCH SPLIT, exactly as with
+    # llm_classifier_prompt_sha256: the record is rendered once, above the
+    # split loop, and every chunk of that patient carries the same bytes.
+    #
+    # NULL MEANS NO PROMPT WAS EVER RENDERED -- node_no_candidates, a failure
+    # upstream of Stage 5, a row written before this column existed, or a
+    # result dict that did not come from a pipeline terminal node. It is NOT
+    # "the record was empty": Stage 5 writes this on every one of its returns,
+    # including the failing ones, because the render precedes the first call.
+    # So it is NULL exactly when llm_classifier_prompt_sha256 is NULL, and 0
+    # would be a genuine reading of an empty record rather than an absence.
+    "llm_classifier_patient_record_tokens":  "INTEGER",
 }
 
 
@@ -1430,8 +1465,9 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 llm_classifier_truncation_splits, llm_classifier_output_tokens_estimated,
                 not_evaluable_truncated, llm_classifier_calls,
                 llm_classifier_reasoning_tokens,
-                llm_classifier_prompt_version, llm_classifier_prompt_sha256
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                llm_classifier_prompt_version, llm_classifier_prompt_sha256,
+                llm_classifier_patient_record_tokens
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             result["patient_id"],
             result["timestamp"],
@@ -1588,6 +1624,10 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
             # the migration comment above.
             result.get("llm_classifier_prompt_version"),
             result.get("llm_classifier_prompt_sha256"),
+            # No default, on the hash's argument and with the hash's meaning: a
+            # run that rendered no system message measured no record, and 0
+            # would be indistinguishable from a genuinely empty record.
+            result.get("llm_classifier_patient_record_tokens"),
         ))
         
         inference_id = cursor.lastrowid

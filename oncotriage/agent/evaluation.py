@@ -1876,6 +1876,46 @@ def node_llm_classifier_evaluation(state: TrialMatchState) -> dict:
     # from state that could disagree with it.
     system_prompt_sha256 = prompt_sha256(system_prompt)
 
+    # ── How much of the fixed prefix is THIS PATIENT ──────────────────────
+    #
+    # MEASUREMENT ONLY. Nothing below reads this value: it selects no chunk,
+    # moves no budget and changes no prompt byte. It is provenance, on exactly
+    # the footing of system_prompt_sha256 one line above, and it is computed
+    # here for the same two reasons -- it is a fact about the string this node
+    # actually built, and the string is built ONCE above the split loop, so a
+    # run that splits into N requests still has one patient record and reports
+    # one number for it.
+    #
+    # THE SUBJECT IS `patient_record`, THE NEUTRALIZED TEXT, and that is the
+    # whole point of measuring here rather than from `patient_summary`. The
+    # neutralized string is what render_system_prompt() interpolates and
+    # therefore what the model is charged for; on a summary carrying a fence
+    # marker the two differ in length, and a number taken from the raw text
+    # would describe a string that was never sent. The fence LINES themselves
+    # (<<<PATIENT_RECORD>>> and its closer) are template, not record, and are
+    # deliberately outside this measurement -- they are constant, so counting
+    # them here would make a per-patient figure carry a per-template constant.
+    #
+    # THROUGH THE PIPELINE'S OWN ESTIMATOR, never a second formula. This is the
+    # same characters/CHARS_PER_TOKEN proxy fixed_input_tokens below is built
+    # from, so "record tokens" and "fixed tokens" are commensurable and a reader
+    # can subtract one from the other. A private len()//4 here would be free to
+    # drift from the estimator the packer actually spends its budget with.
+    #
+    # THE TEMPLATE'S OWN SHARE IS NOT STORED, DELIBERATELY. It is
+    # fixed_input_tokens minus this value minus the user-message wrapper, all
+    # three of which a reader already has, and a second column carrying a
+    # derived quantity is a second copy of one fact that can go stale on its
+    # own. One measurement, one home.
+    #
+    # RE-ESTIMATING FROM A STORED RECORD MATCHES THIS FIELD EXACTLY WHEN
+    # _record_runs IS 0, which is every real patient to date: the run harness
+    # persists `patient_summary` (the PRE-neutralization text, see
+    # run_harness.build_record), and neutralization is the identity on a string
+    # with no bracket run. When it is not 0 the two legitimately differ, the
+    # warning above says so, and this field is the one that describes the send.
+    patient_record_tokens = estimate_prompt_tokens(patient_record)
+
 
 # ================================================================
 # USER MESSAGE
@@ -2138,6 +2178,10 @@ CLINICAL TRIALS:
                 # worth investigating. _pipeline_provenance() reads both off state.
                 "llm_classifier_prompt_version": PROMPT_VERSION,
                 "llm_classifier_prompt_sha256": system_prompt_sha256,
+                # Carried on the failure returns for the same reason the hash
+                # is: the record was measured BEFORE the first call, so it is a
+                # fact about this run whether or not the run answered.
+                "llm_classifier_patient_record_tokens": patient_record_tokens,
                 "stage_timings": {**state.get("stage_timings", {}), "llm_classifier_evaluation": round(prior_llm_classifier_time + elapsed, 3)}
             }
 
@@ -2287,6 +2331,10 @@ CLINICAL TRIALS:
                 "error": error_msg,
                 "llm_classifier_prompt_version": PROMPT_VERSION,
                 "llm_classifier_prompt_sha256": system_prompt_sha256,
+                # Carried on the failure returns for the same reason the hash
+                # is: the record was measured BEFORE the first call, so it is a
+                # fact about this run whether or not the run answered.
+                "llm_classifier_patient_record_tokens": patient_record_tokens,
                 "stage_timings": {**state.get("stage_timings", {}), "llm_classifier_evaluation": round(prior_llm_classifier_time + elapsed, 3)}
             }
 
@@ -2407,6 +2455,10 @@ CLINICAL TRIALS:
                 # worth investigating. _pipeline_provenance() reads both off state.
                 "llm_classifier_prompt_version": PROMPT_VERSION,
                 "llm_classifier_prompt_sha256": system_prompt_sha256,
+                # Carried on the failure returns for the same reason the hash
+                # is: the record was measured BEFORE the first call, so it is a
+                # fact about this run whether or not the run answered.
+                "llm_classifier_patient_record_tokens": patient_record_tokens,
                 "stage_timings": {**state.get("stage_timings", {}), "llm_classifier_evaluation": round(prior_llm_classifier_time + elapsed, 3)}
             }
 
@@ -2460,6 +2512,10 @@ CLINICAL TRIALS:
                 # worth investigating. _pipeline_provenance() reads both off state.
                 "llm_classifier_prompt_version": PROMPT_VERSION,
                 "llm_classifier_prompt_sha256": system_prompt_sha256,
+                # Carried on the failure returns for the same reason the hash
+                # is: the record was measured BEFORE the first call, so it is a
+                # fact about this run whether or not the run answered.
+                "llm_classifier_patient_record_tokens": patient_record_tokens,
                 "stage_timings": {**state.get("stage_timings", {}), "llm_classifier_evaluation": round(prior_llm_classifier_time + elapsed, 3)}
             }
 
@@ -3531,6 +3587,11 @@ CLINICAL TRIALS:
         # which is what puts them on the no-candidate and error paths too.
         "llm_classifier_prompt_version": PROMPT_VERSION,
         "llm_classifier_prompt_sha256": system_prompt_sha256,
+        # How many estimated tokens of the cached prefix were THIS PATIENT's
+        # record, measured on the neutralized bytes that were interpolated. See
+        # the render site for why it is measured there and why the template's
+        # own share is derivable rather than stored.
+        "llm_classifier_patient_record_tokens": patient_record_tokens,
         "stage_timings": {**state.get("stage_timings", {}), "llm_classifier_evaluation": round(prior_llm_classifier_time + elapsed, 3)}
     }
 

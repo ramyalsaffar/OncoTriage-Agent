@@ -299,6 +299,15 @@ def _pipeline_provenance(state) -> Dict:
         "llm_classifier_prompt_version": (state.get("llm_classifier_prompt_version")
                                           or PROMPT_VERSION),
         "llm_classifier_prompt_sha256": state.get("llm_classifier_prompt_sha256"),
+        # And how much of that rendered prompt was the patient's own record, in
+        # estimated tokens. Read off state with NO fallback, on the hash's
+        # convention and for the hash's reason: a run that rendered no prompt
+        # has no record size, and inventing one here (0, or a re-measurement
+        # from the patient dict) would report a measurement that was never
+        # taken. So NULL here reads exactly as NULL there -- "Stage 5 never
+        # rendered" -- and the two columns are never NULL independently.
+        "llm_classifier_patient_record_tokens":
+            state.get("llm_classifier_patient_record_tokens"),
         # Which stages were disabled for this run; {} = full pipeline. Copied
         # rather than aliased so the logged record cannot be mutated later.
         "ablation_flags": dict(state.get("ablation_flags") or {}),

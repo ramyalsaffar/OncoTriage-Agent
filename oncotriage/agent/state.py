@@ -460,6 +460,24 @@ class TrialMatchState(TypedDict):
     # happen.
     llm_classifier_prompt_version: str
     llm_classifier_prompt_sha256: Optional[str]
+    # How much of that rendered system message was the PATIENT RECORD, in the
+    # pipeline's own estimated tokens (evaluation.estimate_prompt_tokens over
+    # the NEUTRALIZED record text -- the bytes actually interpolated). The
+    # template is constant and the record is not, so this is what says how much
+    # of a run's fixed prefix was patient rather than instruction.
+    #
+    # DECLARED HERE OR IT DOES NOT EXIST. See the packing block below: an
+    # undeclared key a node returns is DROPPED by LangGraph silently, and this
+    # project has already shipped that defect once, on four keys at a time.
+    #
+    # Optional, and None is not 0. Stage 5 writes it on EVERY return -- the
+    # render precedes the first call, so a failed run has one too -- which
+    # makes None mean "no system prompt was ever rendered for this run", the
+    # same no-fallback convention as llm_classifier_prompt_sha256 above and the
+    # same population: node_no_candidates, or a failure upstream of Stage 5.
+    # A rendered prompt cannot report 0 here; an empty patient record would,
+    # and that is a measurement.
+    llm_classifier_patient_record_tokens: Optional[int]
     llm_classifier_input_tokens: int
     llm_classifier_output_tokens: int
     # The reasoning share OF llm_classifier_output_tokens on a reasoning model, not an
