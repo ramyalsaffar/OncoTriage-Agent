@@ -517,6 +517,42 @@ TRIAL_MATCH_COLUMN_ADDITIONS = {
     # is what separates a checked row from an unchecked one, which is the whole
     # question this column answers.
     "hallucinated":            "INTEGER",
+    # WHERE IN THE MODEL'S ANSWER THIS VERDICT STOOD. Both are stamped by
+    # oncotriage/agent/evaluation.py on the parsed response, before any entry is
+    # dropped and before the node's match_score sort, and they are the only
+    # record of the order the model WROTE its answers in -- trial_number beside
+    # them is the pipeline's own retrieval rank, which is a different fact and
+    # is what this column pair was mistaken for while it did not exist.
+    #
+    #   emission_index  0-based position in the array THAT CALL returned.
+    #                   GAPPY BY DESIGN: an entry the node dropped (a non-object,
+    #                   an out-of-set id, a duplicate) keeps its position out of
+    #                   the survivors' numbering rather than closing it up, so a
+    #                   missing index is evidence rather than an inconsistency.
+    #                   The count those positions are out of is NOT in this
+    #                   table -- it is llm_classifier_call_details.entries_emitted,
+    #                   which is per CALL and has no per-trial row to live on.
+    #   call_index      1-based ordinal of the billed call that returned it,
+    #                   joining that ledger by equality. 1-based because the
+    #                   ledger is, and two fields of one run named call_index
+    #                   disagreeing about their base is a silent off-by-one.
+    #
+    # NULL ON BOTH means one of three things and is never backfilled: the row
+    # predates these columns; the entry was CONSTRUCTED by the pipeline rather
+    # than returned by the model (a truncation floor, an exhausted split budget,
+    # conflicting duplicates, or a trial the model never mentioned -- see
+    # _unevaluable_entry, which sets both to None on purpose); or the result dict
+    # was built outside the pipeline. The first is separable from the other two
+    # by the run's date; the second and third are not separable here, and
+    # trial_matches.eligible = 'not_evaluable' with a not_evaluable_reason in
+    # criterion_details is what distinguishes them.
+    #
+    # 0 IS A REAL POSITION AND MUST NOT BE READ AS ABSENT. The first entry of
+    # the first call carries emission_index 0, so every reader has to test
+    # IS NULL rather than falsiness -- the same rule ECOG and the cached-token
+    # columns already carry.
+    "emission_index":          "INTEGER",
+    "call_index":              "INTEGER",
 }
 
 
@@ -1571,8 +1607,8 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                     trial_number, rerank_score, rerank_score_raw, mesh_boost, mesh_boost_tier,
                     match_score, eligible, assessment, criterion_details,
                     score_confirmed, score_denominator, criteria_not_applicable,
-                    hallucinated
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    hallucinated, emission_index, call_index
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 inference_id,
                 match.get("nct_id", ""),
@@ -1609,6 +1645,13 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 # 0 when Stage 5's out-of-set detector checked this row, NULL
                 # when it never ran. 1 is unreachable: see the migration note.
                 match.get("hallucinated"),
+                # NO DEFAULT ON EITHER, which is the whole point. A pipeline-
+                # constructed entry carries an explicit None and an entry from a
+                # result dict built outside the pipeline carries no key at all;
+                # both must reach the column as NULL. A `, 0` here would assert
+                # that every such trial stood first in the first call's answer.
+                match.get("emission_index"),
+                match.get("call_index"),
             ))
         
         conn.commit()

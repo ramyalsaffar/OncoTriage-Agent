@@ -460,9 +460,12 @@ python tests/test_agent_trial_verdict_normalization.py              # 161
 
 # The emission-provenance pass. Same shape, same directory. No network, no keys,
 # no spend, no git history, no corpus, and NOT in the collision matrix -- every
-# plant goes into an in-memory copy of oncotriage/agent/evaluation.py, with the
-# file hashed before any plant and compared at the end. ~1 s.
-python tests/test_agent_emission_provenance.py                      #  94
+# plant goes into an in-memory copy of oncotriage/agent/evaluation.py or
+# oncotriage/storage/database_logger.py, both hashed before any plant and
+# compared at the end, and every database write goes to a scratch file in a temp
+# directory that is asserted to differ from the production path, and removed at
+# the end. ~1 s.
+python tests/test_agent_emission_provenance.py                      # 162
 
 # The write-durability pass. Same shape, same directory. No network, no keys,
 # no spend, no git history, no corpus, NOT in the collision matrix, and it execs

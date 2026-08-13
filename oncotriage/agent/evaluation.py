@@ -1858,7 +1858,24 @@ CLINICAL TRIALS:
         # an unsplit run are packed chunks 1..N, and a split inserts its
         # children immediately after their parent at depth+1. `depth` is what
         # separates the two, so neither number has to be inferred.
-        call_details.append({
+        # `entries_emitted` is the DENOMINATOR the emission stamp needs and is
+        # deliberately born as None here, then written below once the response
+        # has parsed into a list. It cannot be filled at this line: this row is
+        # appended BEFORE the parse, on purpose, so that a call whose response
+        # was unusable is still recorded as having been made and billed.
+        #
+        # None therefore means "this call produced no parseable list", which is
+        # every failure shape at once and is exactly the project's convention --
+        # the mechanism did not run. A truncated response (finish_reason
+        # "length", which `continue`s into a split), a refusal, malformed JSON
+        # and a non-list body all leave it None, and none of them is a zero: a
+        # zero is a model that answered with an empty array, which IS a
+        # measurement and is recorded as 0.
+        #
+        # The row is held by reference rather than reached as `call_details[-1]`
+        # so that a future append between here and the parse cannot silently
+        # redirect the write onto another call's row.
+        _this_call = {
             "call_index": calls_made,
             "depth": depth,
             "trials": len(chunk),
@@ -1867,7 +1884,9 @@ CLINICAL TRIALS:
             "cached_tokens": _cached,
             "reasoning_tokens": _reasoning,
             "finish_reason": getattr(choice, "finish_reason", None),
-        })
+            "entries_emitted": None,
+        }
+        call_details.append(_this_call)
 
         # ── The model declined ─────────────────────────────────────────────
         #
@@ -2148,6 +2167,24 @@ CLINICAL TRIALS:
             if isinstance(_entry, dict):
                 _entry["emission_index"] = _emission_index
                 _entry["call_index"] = calls_made
+
+        # ── The denominator those positions are positions OUT OF ───────────
+        #
+        # WITHOUT THIS THE STAMP IS NOT INTERPRETABLE. Every filter below
+        # removes entries, so the surviving emission indices have GAPS, and
+        # `max(emission_index) + 1` is a lower bound rather than a count: an
+        # entry dropped from the END of the array leaves no trace in the
+        # survivors at all. This is the only place the length is known.
+        #
+        # It counts the PARSED LIST, so it includes the non-object entries the
+        # next block discards -- the question is "how many things did the model
+        # write", not "how many were usable" -- and it is therefore >= the
+        # number of stamped survivors, never <.
+        #
+        # Written onto the row this call already appended, so the ledger stays
+        # one row per billed call and this is a field of that row rather than a
+        # second parallel list to keep in step.
+        _this_call["entries_emitted"] = len(parsed)
 
         # ── The reasoning-first design, checked on the bytes ────────────────
         #

@@ -1131,6 +1131,17 @@ _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    # shipped one over five response shapes -- the equivalence
                    # proof that "provenance only" is a claim about every other
                    # field rather than only about the two new ones.
+                   #
+                   # IT PLANTS INTO A SECOND FILE TOO, storage/database_logger.py,
+                   # for the trial_matches columns: a default on the INSERT, the
+                   # two values transposed, and the columns dropped from the
+                   # migration table. All three are silent by construction -- the
+                   # first two store a plausible integer and the third is caught
+                   # by log_inference's own "logging failure must not break the
+                   # pipeline" handler, so the run reports success and stores
+                   # nothing -- which is exactly why they are controlled rather
+                   # than argued. A git blob cannot supply them: the columns are
+                   # AT HEAD, so the pre-change file has no INSERT to break.
                    "tests/test_agent_emission_provenance.py"}
 
 

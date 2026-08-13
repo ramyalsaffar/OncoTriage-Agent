@@ -660,6 +660,22 @@ check("prompt_tokens are recorded per call",
 check("finish_reason is recorded per call",
       {e.get("finish_reason") for e in _ledger}, {"stop"})
 
+# THE DENOMINATOR THE PER-ENTRY emission_index IS A POSITION OUT OF. Recorded
+# here rather than only in tests/test_agent_emission_provenance.py because this
+# file owns the ledger ROW's contract and drives the REAL graph, where that file
+# drives the node with a stub -- and because the count is taken at a different
+# point in the loop from every other field on the row, so "it is present" and
+# "it is right" are separate facts. The stub answers one entry per trial it was
+# asked about, so on this run the two columns must agree call for call.
+check("every entry records how many verdicts the model emitted",
+      [e.get("entries_emitted") for e in _ledger],
+      [e.get("trials") for e in _ledger])
+check("and it is an int on every call of a successful run",
+      sorted({type(e.get("entries_emitted")).__name__ for e in _ledger}),
+      ["int"])
+check("the emitted counts sum to the batch (non-degenerate)",
+      sum(e.get("entries_emitted") or 0 for e in _ledger), len(_FAT_NCTS))
+
 
 #------------------------------------------------------------------------------
 
@@ -723,6 +739,14 @@ check("and it records the call that was billed",
       len(_failed_ledger or []), 1)
 check("with its cached reading intact",
       at(_failed_ledger or [], 0, {}).get("cached_tokens"), 512)
+# ...AND WITH ITS DENOMINATOR ABSENT. entries_emitted is written only once a
+# response has parsed into a list, so a call that was billed and produced no
+# list carries None -- the mechanism did not run. NOT 0: zero is what a model
+# that answered with an empty array emitted, which is a measurement.
+check("but the emitted count is None: no list was ever parsed",
+      at(_failed_ledger or [], 0, {}).get("entries_emitted", "<absent>"), None)
+check("the key is present even so (a consumer never tests for it)",
+      "entries_emitted" in at(_failed_ledger or [], 0, {}), True)
 # The totals ARE absent on this path, by the node's own design, which is why the
 # ledger is the only record that money was spent here.
 check("the summed total is absent on the failure return",

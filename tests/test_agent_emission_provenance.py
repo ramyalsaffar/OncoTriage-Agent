@@ -68,7 +68,10 @@ import io
 import json
 import os
 import re
+import shutil
+import sqlite3
 import sys
+import tempfile
 import types
 
 try:
@@ -99,6 +102,13 @@ from oncotriage.agent.evaluation import (
     node_llm_classifier_evaluation,
 )
 from oncotriage.agent.terminal import node_finalize
+from oncotriage.storage import database_logger as _database_logger_module
+from oncotriage.storage.database_logger import (
+    TRIAL_MATCH_COLUMN_ADDITIONS,
+    initialize_database,
+    log_inference,
+    resolve_inference_db_path,
+)
 
 
 # ===========================================================================
@@ -127,6 +137,7 @@ def check(label: str, actual, expected) -> None:
 # test's directory, so a future move of either cannot silently point the plants
 # at a same-named copy.
 _EVAL_SRC = os.path.abspath(_evaluation_module.__file__)
+_DBLOG_SRC = os.path.abspath(_database_logger_module.__file__)
 
 
 def _sha256_of(path):
@@ -134,9 +145,9 @@ def _sha256_of(path):
         open(path, encoding="utf-8").read().encode()).hexdigest()
 
 
-# Taken before any plant runs, so the restore assertion in section 10 compares
+# Taken before any plant runs, so the restore assertion in section 12 compares
 # against a real baseline rather than against itself.
-_SHA_BEFORE = _sha256_of(_EVAL_SRC)
+_SHA_BEFORE = {p: _sha256_of(p) for p in (_EVAL_SRC, _DBLOG_SRC)}
 
 
 class _PlantFailed(Exception):
@@ -146,15 +157,21 @@ class _PlantFailed(Exception):
 _CONTROL_SEQ = [0]
 
 
-def _plant(subs):
-    """Exec an in-memory COPY of evaluation.py with `subs` applied.
+def _plant(subs, path=None):
+    """Exec an in-memory COPY of `path` (evaluation.py by default) with `subs`.
 
     Raises _PlantFailed -- never SyntaxError -- so a malformed plant is a
     RECORDED failure instead of a traceback hiding every check below it. The
     file on disk is hashed before and after and a modification raises.
+
+    Every substitution target is required to occur EXACTLY ONCE. A target that
+    has become ambiguous after a refactor would otherwise plant into whichever
+    occurrence came first, and a control that plants the wrong thing still
+    fails -- so it still looks like it is working.
     """
+    path = path or _EVAL_SRC
     _CONTROL_SEQ[0] += 1
-    source = open(_EVAL_SRC, encoding="utf-8").read()
+    source = open(path, encoding="utf-8").read()
     before = hashlib.sha256(source.encode()).hexdigest()
     try:
         for old, new in subs:
@@ -165,21 +182,23 @@ def _plant(subs):
                     f"plant target is not unique ({source.count(old)} hits): "
                     f"{old[:70]!r}...")
             source = source.replace(old, new, 1)
-        module = types.ModuleType(f"planted_evaluation_{_CONTROL_SEQ[0]}")
-        module.__file__ = _EVAL_SRC
-        exec(compile(source, _EVAL_SRC, "exec"), module.__dict__)
+        module = types.ModuleType(
+            f"planted_{os.path.basename(path)[:-3]}_{_CONTROL_SEQ[0]}")
+        module.__file__ = path
+        exec(compile(source, path, "exec"), module.__dict__)
     except _PlantFailed:
         raise
     except Exception as exc:            # noqa: BLE001 - reported, not raised
         raise _PlantFailed(f"{type(exc).__name__}: {exc}") from None
     finally:
-        after = _sha256_of(_EVAL_SRC)
+        after = _sha256_of(path)
         if before != after:
-            raise AssertionError(f"{_EVAL_SRC} was modified on disk by a plant")
+            raise AssertionError(f"{path} was modified on disk by a plant")
     return module
 
 
-def control(label, subs, probe, planted_expected):
+def control(label, subs, probe, planted_expected, path=None,
+            shipped_module=None):
     """Plant, run the probe through BOTH arms, record two facts.
 
     The probe is called once with the SHIPPED node and once with the planted
@@ -195,20 +214,20 @@ def control(label, subs, probe, planted_expected):
 
     A raise IS an outcome in either arm, never a reason to abort.
     """
-    def _run(node):
+    def _run(module):
         try:
-            return probe(node)
+            return probe(module)
         except Exception as exc:        # noqa: BLE001 - a raise IS an outcome
             return f"raised {type(exc).__name__}"
 
-    shipped = _run(node_llm_classifier_evaluation)
+    shipped = _run(shipped_module or _evaluation_module)
     try:
-        module = _plant(subs)
+        module = _plant(subs, path=path)
     except _PlantFailed as exc:
         check(f"{label}  [THE PLANT ITSELF FAILED: {exc}]", "plant-failed",
               planted_expected)
         return
-    planted = _run(module.node_llm_classifier_evaluation)
+    planted = _run(module)
     check(label, planted, planted_expected)
     check(f"{label}  -- and it differs from the shipped node",
           planted != shipped, True)
@@ -476,6 +495,7 @@ def ledger_calls(result):
 
 
 TRIALS_4 = ("NCT00000001", "NCT00000002", "NCT00000003", "NCT00000004")
+TRIALS_4_SORTED = sorted(TRIALS_4)
 
 
 # ===========================================================================
@@ -908,6 +928,349 @@ check("7f  neither name appears in the Structured Outputs schema module",
       [n for n in _NAMES if n in _schema_src], [])
 
 
+# ===========================================================================
+print("\n" + "=" * 75)
+print("SECTION 8 -- entries_emitted: the denominator those positions are OUT OF")
+print("=" * 75)
+# ===========================================================================
+
+# emission_index ALONE IS NOT INTERPRETABLE, and section 6 is what shows why:
+# the survivors' positions have gaps, so `max(emission_index) + 1` is a lower
+# bound rather than a count -- and an entry dropped from the END of the array
+# leaves no trace in the survivors at all. `entries_emitted` on the per-call
+# ledger row is the only record of how many things the model actually wrote.
+
+
+def emitted(result):
+    """[entries_emitted] per ledger row, in call order.
+
+    ``<absent>`` rather than a KeyError for a missing key: a plant that stops
+    the field being written is exactly what section 11 exercises, and it must
+    produce a recorded FAILURE with a readable value rather than an exception.
+    """
+    return [d.get("entries_emitted", "<absent>")
+            for d in result.get("llm_classifier_call_details") or []]
+
+
+# 8a  the ordinary case: one call, three entries, all three usable.
+check("8a  entries_emitted counts the parsed list", emitted(_r1), [3])
+check("8a2 it agrees with the survivors when nothing was dropped",
+      emitted(_r1), [len(_r1["evaluations"])])
+check("8a3 every ledger row carries the key",
+      all("entries_emitted" in d
+          for d in _r1["llm_classifier_call_details"]), True)
+
+# 8b  THE CASE THE FIELD EXISTS FOR. The section 6 response wrote FOUR things
+# and two survived. entries_emitted must report four -- it counts the parsed
+# list INCLUDING the non-object entry, because the question is "how many things
+# did the model write", not "how many were usable".
+check("8b  entries_emitted counts non-object entries too", emitted(_r6), [4])
+check("8b2 NON-DEGENERACY: it EXCEEDS the number of stamped survivors",
+      emitted(_r6)[0] > len(stamps(_r6)), True)
+check("8b3 and the survivor count alone would have said 2",
+      len(_r6["evaluations"]), 2)
+
+# 8c  A DROP FROM THE END, where the derived form is simply wrong. The last
+# thing the model wrote is fabricated and disappears, and nothing in the
+# survivors records that it was ever there. This is the case that makes the
+# field a recorded fact rather than a computable one.
+_r8c, _ = run_stage5(
+    [{"evaluations": [entry("NCT00000001"), entry("NCT00000002"),
+                      entry("NCT09999999")]}],          # last entry: dropped
+    nct_ids=TRIALS_4[:2])
+check("8c  a trailing drop leaves the survivors' positions unchanged",
+      sorted(st[0] for st in stamps(_r8c).values()), [0, 1])
+check("8c2 max(emission_index)+1 UNDERSTATES it -- 2, not 3",
+      max(st[0] for st in stamps(_r8c).values()) + 1, 2)
+check("8c3 entries_emitted gets it right", emitted(_r8c), [3])
+
+# 8d  PER CALL, not per run. The packed run of section 2b answered each chunk
+# separately, so each row carries its own count.
+check("8d  entries_emitted is recorded per call",
+      emitted(_r2b), [len(a) for a in _PACK_STUB.answered])
+check("8d2 NON-DEGENERACY: more than one row, and none of them absent",
+      len(emitted(_r2b)) > 1 and "<absent>" not in emitted(_r2b), True)
+check("8d3 the per-call counts sum to what the model wrote in total",
+      sum(emitted(_r2b)), 6)
+
+# 8e  ZERO IS A MEASUREMENT. A model that answers with an empty array emitted
+# nothing, which is not the same fact as a call that produced no list at all.
+_r8e, _ = run_stage5([{"evaluations": []}], nct_ids=TRIALS_4[:2])
+check("8e  an empty array is 0, not None", emitted(_r8e), [0])
+check("8e2 NON-DEGENERACY: 0 and None are distinguishable here",
+      emitted(_r8e)[0] is None, False)
+check("8e3 and every trial was reconciled as model-omitted",
+      sorted({e.get("not_evaluable_reason") for e in _r8e["evaluations"]}),
+      [NOT_EVALUABLE_MODEL_OMITTED])
+
+# ── The failure shapes: a row exists, and its denominator is None ──────────
+#
+# Four ways a call can be billed and produce no parseable list. Each is checked
+# separately rather than as a set, because they leave the loop by DIFFERENT
+# exits -- one `continue`s into a split and three `return` -- and a convention
+# applied at three of the four sites would look identical in aggregate.
+
+# 8f  malformed JSON (an early return).
+_r8f, _ = run_stage5(["this is not json at all {{"], nct_ids=TRIALS_4[:1])
+check("8f  a malformed-JSON call keeps its ledger row", len(emitted(_r8f)), 1)
+check("8f2 and its entries_emitted is None", emitted(_r8f), [None])
+check("8f3 NON-DEGENERACY: the parse really did fail",
+      "parse error" in (_r8f.get("error") or ""), True)
+
+# 8g  well-formed JSON that is neither a list nor the envelope.
+_r8g, _ = run_stage5([{"trials": [entry("NCT00000001")]}], nct_ids=TRIALS_4[:1])
+check("8g  a non-list response carries None", emitted(_r8g), [None])
+check("8g2 NON-DEGENERACY: it was recorded as the non-list error",
+      "non-list JSON" in (_r8g.get("error") or ""), True)
+
+# 8h  a TRUNCATED call, which is the interesting one: it does not end the run,
+# so ONE result carries a None row beside two integer rows. A convention applied
+# only on the return paths would show an absent key or a 0 here.
+check("8h  the truncated call's row is None, the retries' rows are ints",
+      emitted(_r2), [None, 2, 2])
+check("8h2 NON-DEGENERACY: that run mixes both, in one ledger",
+      (None in emitted(_r2)) and (2 in emitted(_r2)), True)
+
+# 8i  the TRUNCATION FLOOR: a single trial that cannot be split further.
+check("8i  a truncation-floor call carries None", emitted(_r4b), [None])
+
+# 8j  EVERY ledger row of EVERY run in this file carries the key, so no consumer
+# has to test for its presence -- the rule assessment_draft's setdefault and the
+# cached_tokens reading already follow.
+_ALL_RUNS = [_r1, _r1b, _r1c, _r2, _r2b, _r3, _r4a, _r4b, _r4c, _r4d, _r4e,
+             _r5, _r6, _r8c, _r8e, _r8f, _r8g]
+_ALL_ROWS = [(_r, _d) for _r in _ALL_RUNS
+             for _d in _r.get("llm_classifier_call_details") or []]
+check("8j  every ledger row in every run carries entries_emitted",
+      sorted({("entries_emitted" in _d) for _, _d in _ALL_ROWS}), [True])
+check("8j2 NON-DEGENERACY: that swept a real number of rows",
+      len(_ALL_ROWS) >= 20, True)
+check("8j3 it is an int or None, never anything else",
+      sorted({type(_d["entries_emitted"]).__name__ for _, _d in _ALL_ROWS}),
+      ["NoneType", "int"])
+
+# 8k  THE INVARIANT THAT TIES THE TWO FIELDS TOGETHER: a row's count is never
+# LESS than the number of entries stamped against that call. It cannot be, since
+# the count is taken before the drops -- so a violation means the two were taken
+# at different points, which is the defect the placement exists to prevent.
+_stamped_per_call = {}
+for _r in _ALL_RUNS:
+    for _e in _r.get("evaluations") or []:
+        _c = _e.get("call_index")
+        if _c is not None:
+            _key = (id(_r), _c)
+            _stamped_per_call[_key] = _stamped_per_call.get(_key, 0) + 1
+check("8k  entries_emitted >= the entries stamped against that call, always",
+      sorted({_d["entries_emitted"]
+              >= _stamped_per_call.get((id(_r), _d["call_index"]), 0)
+              for _r, _d in _ALL_ROWS if _d["entries_emitted"] is not None}),
+      [True])
+check("8k2 NON-DEGENERACY: at least one call is strictly greater",
+      any(_d["entries_emitted"]
+          > _stamped_per_call.get((id(_r), _d["call_index"]), 0)
+          for _r, _d in _ALL_ROWS if _d["entries_emitted"] is not None), True)
+
+
+# ===========================================================================
+print("\n" + "=" * 75)
+print("SECTION 9 -- the two columns reach trial_matches")
+print("=" * 75)
+# ===========================================================================
+
+# EVERY WRITE HERE GOES TO A SCRATCH DATABASE IN A TEMP DIRECTORY, passed
+# explicitly, and the production path is asserted to be a DIFFERENT file before
+# anything is written -- the discriminating check the five isolation tests in
+# this suite already carry, without which "it wrote to the scratch file" is
+# equally satisfied by a harness that wrote nowhere.
+
+_SCRATCH = tempfile.mkdtemp(prefix="oncotriage-emission-")
+_SCRATCH_DB = os.path.join(_SCRATCH, "inferences.db")
+
+check("9a  the production default is NOT this scratch path",
+      resolve_inference_db_path(None) == _SCRATCH_DB, False)
+check("9a2 NON-DEGENERACY: the production default resolves to a database",
+      isinstance(resolve_inference_db_path(None), str)
+      and resolve_inference_db_path(None).endswith(".db"), True)
+
+check("9b  both columns are declared in the migration table",
+      {k: v for k, v in TRIAL_MATCH_COLUMN_ADDITIONS.items() if k in _NAMES},
+      {"emission_index": "INTEGER", "call_index": "INTEGER"})
+
+initialize_database(_SCRATCH_DB)
+_cols = {r[1]: r[2] for r in sqlite3.connect(_SCRATCH_DB)
+         .execute("PRAGMA table_info(trial_matches)")}
+check("9c  a fresh database has both columns, typed INTEGER",
+      {k: _cols.get(k) for k in _NAMES},
+      {"emission_index": "INTEGER", "call_index": "INTEGER"})
+check("9c2 NON-DEGENERACY: the table really was built",
+      "nct_id" in _cols and "hallucinated" in _cols, True)
+
+# The result dict as node_finalize publishes it: model entries carrying their
+# stamps, one pipeline-constructed entry carrying None on both, and -- the third
+# case the column comment names -- an entry from a result dict built OUTSIDE the
+# pipeline, which carries neither key at all.
+_PATIENT = {"patient_id": "emission-db-patient",
+            "demographics": {"age": 62, "sex": "male"},
+            "conditions": [], "medications": [], "allergies": [],
+            "observations": [], "procedures": []}
+
+
+def _verdict(nct_id, **extra):
+    v = {"nct_id": nct_id, "title": "T", "phase": "Phase 2",
+         "eligible": "eligible", "match_score": 1.0, "trial_number": 1,
+         "assessment": "ok", "inclusion_criteria": [], "exclusion_criteria": [],
+         "score_confirmed": 1, "score_denominator": 1,
+         "criteria_not_applicable": 0, "hallucinated": 0}
+    v.update(extra)
+    return v
+
+
+# `timestamp` is here because log_inference SUBSCRIBES it bare
+# (database_logger.py:1426), alongside patient_id -- every other field it reads
+# goes through .get(). Found by running: without it the write failed with
+# KeyError('timestamp'), which the writer catches and reports as a non-critical
+# logging error, so the rows were simply absent rather than the run failing.
+_DB_RESULT = {
+    "patient_id": "emission-db-patient",
+    "timestamp": "2026-08-12T00:00:00",
+    "matches": [
+        _verdict("NCT00000001", emission_index=0, call_index=1),
+        _verdict("NCT00000002", emission_index=3, call_index=2),
+    ],
+    "near_misses": [
+        _verdict("NCT00000003", eligible="not_evaluable",
+                 emission_index=None, call_index=None),
+    ],
+    "not_evaluable": [
+        _verdict("NCT00000004", eligible="not_evaluable"),
+    ],
+}
+
+_write = log_inference(_DB_RESULT, _PATIENT, db_path=_SCRATCH_DB)
+check("9d  the write went to the scratch database", str(_write), _SCRATCH_DB)
+check("9d2 and it reported success", getattr(_write, "ok", "<no ok field>"),
+      True)
+
+_conn = sqlite3.connect(_SCRATCH_DB)
+_conn.row_factory = sqlite3.Row
+_rows = {r["nct_id"]: r for r in _conn.execute(
+    "SELECT nct_id, emission_index, call_index FROM trial_matches")}
+
+
+def stamped_row(nct_id):
+    """(emission_index, call_index) for one row, or a named absence.
+
+    NEVER ``_rows[nct_id][...]``. A defect that stops a row being written is
+    exactly what these checks exist to catch, and a bare index turns that into a
+    KeyError at module level -- the run then reports one traceback where it owed
+    every result below. Measured, not reasoned about: the first version of this
+    section did index bare, and a missing `timestamp` key in the fixture aborted
+    it here. tests/test_storage_query_layer.py,
+    tests/test_dashboard_reproducibility_tab.py,
+    tests/test_docker_qdrant_override_and_readiness.py and
+    tests/test_agent_trial_verdict_normalization.py each had to fix the same
+    shape.
+    """
+    row = _rows.get(nct_id)
+    if row is None:
+        return "<no such row>"
+    return (row["emission_index"], row["call_index"])
+check("9e  all four verdicts were written", sorted(_rows), TRIALS_4_SORTED)
+check("9f  a model entry's stamps round-trip",
+      stamped_row("NCT00000001"), (0, 1))
+check("9f2 including a non-zero pair",
+      stamped_row("NCT00000002"), (3, 2))
+check("9g  a pipeline-constructed entry is NULL on both",
+      stamped_row("NCT00000003"), (None, None))
+check("9g2 an entry that carries neither key is NULL on both",
+      stamped_row("NCT00000004"), (None, None))
+
+# 9h  THE RULE THAT MAKES THIS COLUMN PAIR READABLE. 0 is a real position -- the
+# first entry of the first call -- so a reader must test IS NULL and never
+# falsiness. Asserted in SQL, because SQL is where a reader will do it.
+check("9h  0 is stored as 0 and is NOT NULL in SQL",
+      _conn.execute("SELECT COUNT(*) FROM trial_matches "
+                    "WHERE emission_index = 0").fetchone()[0], 1)
+check("9h2 IS NULL finds exactly the two unstamped rows",
+      sorted(r[0] for r in _conn.execute(
+          "SELECT nct_id FROM trial_matches WHERE emission_index IS NULL")),
+      ["NCT00000003", "NCT00000004"])
+check("9h3 NON-DEGENERACY: a falsiness test finds only the genuine zero",
+      _conn.execute("SELECT COUNT(*) FROM trial_matches "
+                    "WHERE NOT emission_index").fetchone()[0], 1)
+_conn.close()
+
+# 9i  THE MIGRATION, driven for real: a database built with a PRE-CHANGE
+# trial_matches gains both columns and its existing rows read NULL. This is the
+# only path an operator with an existing database will take, and the additions
+# table is the whole mechanism.
+_OLD_DB = os.path.join(_SCRATCH, "old.db")
+_old = sqlite3.connect(_OLD_DB)
+_old.executescript(
+    "CREATE TABLE inferences (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+    "patient_id TEXT);"
+    "CREATE TABLE trial_matches (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+    "inference_id INTEGER, nct_id TEXT, match_score REAL);"
+    "INSERT INTO trial_matches (inference_id, nct_id, match_score) "
+    "VALUES (1, 'NCT00000009', 0.5);")
+_old.commit()
+_old.close()
+_pre = {r[1] for r in sqlite3.connect(_OLD_DB)
+        .execute("PRAGMA table_info(trial_matches)")}
+check("9i  NON-DEGENERACY: the old database has neither column",
+      sorted(n for n in _NAMES if n in _pre), [])
+
+initialize_database(_OLD_DB)
+_post_conn = sqlite3.connect(_OLD_DB)
+_post = {r[1] for r in _post_conn.execute("PRAGMA table_info(trial_matches)")}
+check("9i2 the migration added both", sorted(n for n in _NAMES if n in _post),
+      ["call_index", "emission_index"])
+check("9i3 and the pre-existing row reads NULL, not 0",
+      _post_conn.execute("SELECT emission_index, call_index FROM trial_matches "
+                         "WHERE nct_id = 'NCT00000009'").fetchone(),
+      (None, None))
+_post_conn.close()
+
+# 9j  IDEMPOTENCE. ALTER TABLE ADD COLUMN has no IF NOT EXISTS form, so the
+# PRAGMA check IS the guard; running it twice must not raise.
+try:
+    initialize_database(_OLD_DB)
+    initialize_database(_SCRATCH_DB)
+    _idempotent = "clean"
+except Exception as _exc:               # noqa: BLE001 - a raise IS an outcome
+    _idempotent = f"raised {type(_exc).__name__}"
+check("9j  re-running initialize_database is a no-op", _idempotent, "clean")
+
+# 9k  END TO END, through the real Stage 5 rather than a hand-built result: the
+# node stamps, node_finalize groups, log_inference writes, SQL reads it back.
+# Nothing between them is simulated, and the third trial -- which the model
+# never mentions -- is the reconciliation entry that must land as NULL.
+_E2E_DB = os.path.join(_SCRATCH, "e2e.db")
+_r9k, _ = run_stage5(
+    [{"evaluations": [entry("NCT00000001"), entry("NCT00000002")]}],
+    nct_ids=TRIALS_4[:3])
+_f9k = run_stage6(_r9k["evaluations"], nct_ids=TRIALS_4[:3])
+_f9k["patient_id"] = "emission-e2e-patient"
+_w9k = log_inference(_f9k, _PATIENT, db_path=_E2E_DB)
+check("9k  the end-to-end write went to its own scratch file",
+      str(_w9k), _E2E_DB)
+_e2e = sqlite3.connect(_E2E_DB)
+_e2e_rows = dict(_e2e.execute(
+    "SELECT nct_id, emission_index FROM trial_matches").fetchall())
+_e2e_calls = dict(_e2e.execute(
+    "SELECT nct_id, call_index FROM trial_matches").fetchall())
+check("9k2 the two answered trials carry their real positions",
+      {k: v for k, v in _e2e_rows.items() if k != "NCT00000003"},
+      {"NCT00000001": 0, "NCT00000002": 1})
+check("9k3 and their call_index is the billed call",
+      {k: v for k, v in _e2e_calls.items() if k != "NCT00000003"},
+      {"NCT00000001": 1, "NCT00000002": 1})
+check("9k4 the reconciled trial the model never mentioned is NULL",
+      _e2e_rows.get("NCT00000003", "<absent>"), None)
+check("9k5 NON-DEGENERACY: all three rows are present", len(_e2e_rows), 3)
+_e2e.close()
+
+
 # The exact source spans the plants below replace. Every one is asserted to
 # occur exactly once, so a reformat produces a RECORDED plant failure rather
 # than a control that silently stopped controlling.
@@ -918,12 +1281,13 @@ _STAMP = ('        for _emission_index, _entry in enumerate(parsed):\n'
 _UNEVAL = ('        "emission_index": None,\n'
            '        "call_index": None,\n')
 _EXTEND = '        evaluations.extend(_objects)\n'
+_EMITTED = '        _this_call["entries_emitted"] = len(parsed)\n'
 _AFTER_SORT = ('    elapsed = time.time() - start\n'
                '    log.info("Stage 5 evaluation complete"')
 
 # ===========================================================================
 print("\n" + "=" * 75)
-print("SECTION 8 -- equivalence: the run is otherwise byte-for-byte the same")
+print("SECTION 10 -- equivalence: the run is otherwise byte-for-byte the same")
 print("=" * 75)
 # ===========================================================================
 
@@ -975,30 +1339,30 @@ try:
     _pre_node = _pre_change.node_llm_classifier_evaluation
 except _PlantFailed as _exc:
     _pre_node = None
-    check(f"8   THE PRE-CHANGE COPY DID NOT BUILD: {_exc}", "plant-failed", "ok")
+    check(f"10  THE PRE-CHANGE COPY DID NOT BUILD: {_exc}", "plant-failed", "ok")
 
 if _pre_node is not None:
     for _name, _script, _ids in _EQUIV_SCRIPTS:
         _new, _ = run_stage5(_script, nct_ids=_ids)
         _old, _ = run_stage5(_script, nct_ids=_ids, node=_pre_node)
-        check(f"8   {_name}: identical once the two fields are removed",
+        check(f"10  {_name}: identical once the two fields are removed",
               _comparable(_new), _comparable(_old))
         # Non-degeneracy: the arms are not both empty, and the fields really
         # were present on the new side before they were stripped.
-        check(f"8   {_name}: non-degeneracy -- the run produced verdicts",
+        check(f"10  {_name}: non-degeneracy -- the run produced verdicts",
               len(_new.get("evaluations") or []) > 0, True)
-        check(f"8   {_name}: non-degeneracy -- the pre-change arm has neither "
+        check(f"10  {_name}: non-degeneracy -- the pre-change arm has neither "
               "field",
               any(n in e for e in (_old.get("evaluations") or []) for n in _NAMES),
               False)
-        check(f"8   {_name}: non-degeneracy -- the shipped arm has both",
+        check(f"10  {_name}: non-degeneracy -- the shipped arm has both",
               all(n in e for e in (_new.get("evaluations") or []) for n in _NAMES),
               True)
 
 
 # ===========================================================================
 print("\n" + "=" * 75)
-print("SECTION 9 -- controls: every assertion above is shown to FAIL")
+print("SECTION 11 -- controls: every assertion above is shown to FAIL")
 print("=" * 75)
 # ===========================================================================
 
@@ -1009,9 +1373,10 @@ _SIMPLE = _SHUFFLED
 
 
 def _probe_stamps(script, nct_ids):
-    """A probe that returns the stamp mapping produced by a given node."""
-    def probe(node):
-        result, _ = run_stage5(script, nct_ids=nct_ids, node=node)
+    """A probe that returns the stamp mapping produced by a given module."""
+    def probe(module):
+        result, _ = run_stage5(script, nct_ids=nct_ids,
+                               node=module.node_llm_classifier_evaluation)
         return stamps(result)
     return probe
 
@@ -1056,7 +1421,7 @@ control("c3  stamped after the sort -> emission_index is the sorted position",
 # c4  call_index MADE 0-BASED, which is what the brief literally asked for. The
 # join to llm_classifier_call_details then selects the wrong row -- silently,
 # because every value is still a plausible call ordinal.
-def _probe_join(node):
+def _probe_join(module):
     """What the ledger says about the call each entry claims to have come from.
 
     A truncated first call over FOUR trials splits into 2 + 2, and each of the
@@ -1074,7 +1439,7 @@ def _probe_join(node):
         [({"evaluations": []}, "length"),
          {"evaluations": [entry("NCT00000001"), entry("NCT00000002")]},
          {"evaluations": [entry("NCT00000003"), entry("NCT00000004")]}],
-        nct_ids=TRIALS_4, node=node)
+        nct_ids=TRIALS_4, node=module.node_llm_classifier_evaluation)
     by_call = {d["call_index"]: d for d in
                result.get("llm_classifier_call_details") or []}
     return sorted(str(by_call[c]["trials"]) if c in by_call
@@ -1115,31 +1480,180 @@ control("c6  a model-supplied value left in place -> the stamp is not ours",
 # rather than of the edit inside it.
 try:
     _unplanted = _plant([(_STAMP, _STAMP)])
-    _unplanted_stamps = _probe_stamps(_SIMPLE, TRIALS_4[:3])(
-        _unplanted.node_llm_classifier_evaluation)
+    _unplanted_stamps = _probe_stamps(_SIMPLE, TRIALS_4[:3])(_unplanted)
 except Exception as _exc:               # noqa: BLE001 - a raise IS an outcome
     _unplanted_stamps = f"raised {type(_exc).__name__}"
 check("c7  non-degeneracy: an UNPLANTED copy reproduces the shipped stamps",
       _unplanted_stamps,
-      _probe_stamps(_SIMPLE, TRIALS_4[:3])(node_llm_classifier_evaluation))
+      _probe_stamps(_SIMPLE, TRIALS_4[:3])(_evaluation_module))
 check("c7' non-degeneracy: and that mapping is the real one",
       _unplanted_stamps,
       {"NCT00000001": (0, 1), "NCT00000002": (1, 1), "NCT00000003": (2, 1)})
 
 
+
+# --- the denominator -------------------------------------------------------
+
+def _probe_emitted(script, nct_ids):
+    """A probe that returns the per-call entries_emitted from a given module."""
+    def probe(module):
+        result, _ = run_stage5(script, nct_ids=nct_ids,
+                               node=module.node_llm_classifier_evaluation)
+        return emitted(result)
+    return probe
+
+
+# The section 6 response: four things written, two survive. Any implementation
+# that counts anything other than the parsed list disagrees with 4 here.
+_DROPPY = [{"evaluations": ["NCT00000001", entry("NCT00000001"),
+                            entry("NCT09999999"), entry("NCT00000002")]}]
+
+# c8  THE FIELD NEVER FILLED. It stays at the None it is born with, so every
+# successful call looks like a call that produced no list -- the failure
+# signature, on the success path.
+control("c8  entries_emitted never written -> success looks like failure",
+        [(_EMITTED, "        pass\n")],
+        _probe_emitted(_DROPPY, TRIALS_4[:2]), [None])
+
+# c9  COUNTED AFTER THE DROPS, which is the mistake that makes the field agree
+# with the survivor count it exists to differ from.
+control("c9  counted after the drops -> the denominator understates by 2",
+        [(_EMITTED, "        pass\n"),
+         (_EXTEND, '        _this_call["entries_emitted"] = len(_objects)\n'
+                   + _EXTEND)],
+        _probe_emitted(_DROPPY, TRIALS_4[:2]), [2])
+
+# c10  BORN AS 0 RATHER THAN None. Every failure shape then reports that the
+# model emitted zero entries, which is a MEASUREMENT (an empty array) and not an
+# absence. Probed on the truncation run, where one row is a failure and two are
+# real counts, so the plant is visible beside the values it corrupts.
+control("c10 the row born as 0 -> a failed call claims it emitted nothing",
+        [('            "entries_emitted": None,\n',
+          '            "entries_emitted": 0,\n')],
+        _probe_emitted(
+            [({"evaluations": []}, "length"),
+             {"evaluations": [entry("NCT00000001"), entry("NCT00000002")]},
+             {"evaluations": [entry("NCT00000003"), entry("NCT00000004")]}],
+            TRIALS_4),
+        [0, 2, 2])
+
+
+# --- the database columns --------------------------------------------------
+
+_DB_SEQ = [0]
+
+
+def _probe_db(module):
+    """Write the section 9 result through `module` and read both columns back.
+
+    A fresh scratch file per call, so the planted and shipped arms cannot see
+    each other's rows.
+    """
+    _DB_SEQ[0] += 1
+    path = os.path.join(_SCRATCH, f"control_{_DB_SEQ[0]}.db")
+    module.initialize_database(path)
+    module.log_inference(_DB_RESULT, _PATIENT, db_path=path)
+    conn = sqlite3.connect(path)
+    try:
+        return {n: (e, c) for n, e, c in conn.execute(
+            "SELECT nct_id, emission_index, call_index FROM trial_matches")}
+    finally:
+        conn.close()
+
+
+_SHIPPED_DB_ROWS = {"NCT00000001": (0, 1), "NCT00000002": (3, 2),
+                    "NCT00000003": (None, None), "NCT00000004": (None, None)}
+
+check("9l  NON-DEGENERACY: the control probe reproduces section 9 on the "
+      "shipped writer",
+      _probe_db(_database_logger_module), _SHIPPED_DB_ROWS)
+
+# c11  A DEFAULT ON THE INSERT. Every pipeline-constructed entry, and every
+# entry from a result built outside the pipeline, then claims it stood FIRST in
+# the FIRST call -- a real position another trial occupies. Nothing raises and
+# every value is a plausible index, which is why this would never be noticed.
+control("c11 the insert defaulting to 0 -> unstamped rows claim position 0",
+        [('                match.get("emission_index"),\n'
+          '                match.get("call_index"),\n',
+          '                match.get("emission_index", 0),\n'
+          '                match.get("call_index", 0),\n')],
+        _probe_db,
+        {"NCT00000001": (0, 1), "NCT00000002": (3, 2),
+         "NCT00000003": (None, None), "NCT00000004": (0, 0)},
+        path=_DBLOG_SRC, shipped_module=_database_logger_module)
+
+# c12  THE TWO VALUES TRANSPOSED, which is the copy-paste this insert site
+# invites: eighteen positional parameters, and these two are adjacent, the same
+# type, and both plausible small integers.
+control("c12 the two columns transposed -> emission_index carries the call",
+        [('                match.get("emission_index"),\n'
+          '                match.get("call_index"),\n',
+          '                match.get("call_index"),\n'
+          '                match.get("emission_index"),\n')],
+        _probe_db,
+        {"NCT00000001": (1, 0), "NCT00000002": (2, 3),
+         "NCT00000003": (None, None), "NCT00000004": (None, None)},
+        path=_DBLOG_SRC, shipped_module=_database_logger_module)
+
+# c13  THE COLUMNS DROPPED FROM THE MIGRATION TABLE. The INSERT then names
+# columns that do not exist, sqlite raises, and log_inference CATCHES it as a
+# non-critical logging fault -- so the run reports success and stores nothing.
+# That is the loudest possible consequence and the quietest possible symptom,
+# which is why it is controlled rather than assumed.
+def _probe_db_rows(module):
+    """How many trial_matches rows the write actually left behind.
+
+    A ROW COUNT rather than the two columns, deliberately: the defect c13 plants
+    removes the columns, so a probe that SELECTed them would raise for its own
+    reasons and report an exception where the finding is "four rows became
+    zero". The claim is about the write, so the probe reads the write.
+    """
+    _DB_SEQ[0] += 1
+    path = os.path.join(_SCRATCH, f"control_rows_{_DB_SEQ[0]}.db")
+    module.initialize_database(path)
+    module.log_inference(_DB_RESULT, _PATIENT, db_path=path)
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM trial_matches").fetchone()[0]
+    finally:
+        conn.close()
+
+
+check("9m  NON-DEGENERACY: the shipped writer stores four rows",
+      _probe_db_rows(_database_logger_module), 4)
+
+control("c13 the columns removed from the additions table -> the INSERT names "
+        "columns that do not exist and the WHOLE write is lost, silently",
+        [('    "emission_index":          "INTEGER",\n'
+          '    "call_index":              "INTEGER",\n', "")],
+        _probe_db_rows, 0, path=_DBLOG_SRC,
+        shipped_module=_database_logger_module)
+
+
 # ===========================================================================
 print("\n" + "=" * 75)
-print("SECTION 10 -- every plant was in memory")
+print("SECTION 12 -- every plant was in memory")
 print("=" * 75)
 # ===========================================================================
 
-check("10a  evaluation.py is byte-identical to its pre-run state",
-      _sha256_of(_EVAL_SRC), _SHA_BEFORE)
-check("10b  non-degeneracy: the baseline hash is a real digest",
-      _SHA_BEFORE == hashlib.sha256(b"").hexdigest(), False)
-check("10c  non-degeneracy: eight in-memory copies were built "
-      "(the pre-change arm of section 8, six controls and one unplanted copy)",
-      _CONTROL_SEQ[0], 8)
+for _path, _sha in sorted(_SHA_BEFORE.items()):
+    check(f"12a  {os.path.basename(_path)} is byte-identical to its pre-run "
+          "state", _sha256_of(_path), _sha)
+check("12b  non-degeneracy: the two baselines are real and distinct",
+      len(set(_SHA_BEFORE.values())) == 2
+      and hashlib.sha256(b"").hexdigest() not in _SHA_BEFORE.values(), True)
+# The scratch tree goes, on tests/test_storage_write_durability.py's precedent:
+# every fact this file needed out of those databases was asserted while they
+# existed, and a test that leaves a directory per run behind is a test that
+# fills /tmp for anyone who runs it in a loop.
+shutil.rmtree(_SCRATCH, ignore_errors=True)
+check("12d  the scratch database tree was removed",
+      os.path.exists(_SCRATCH), False)
+
+check("12c  non-degeneracy: fourteen in-memory copies were built "
+      "(the pre-change arm of section 10, one unplanted copy, and twelve "
+      "controls across the two files)",
+      _CONTROL_SEQ[0], 14)
 
 
 # ===========================================================================
