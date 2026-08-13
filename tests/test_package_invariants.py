@@ -1113,7 +1113,25 @@ _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    # deliberately do NOT exec: streamlit's AppTest runs a
                    # script that IMPORTS a module by name, so those plants are
                    # written as an importable copy into a temp directory.
-                   "tests/test_clinical_use_framing.py"}
+                   "tests/test_clinical_use_framing.py",
+                   # Plants into in-memory copies of agent/evaluation.py for the
+                   # Stage 5 emission-provenance stamp (emission_index /
+                   # call_index). A patched copy is the only shape available:
+                   # the stamp is AT HEAD, so a git blob would compare the
+                   # changed module with itself -- the defect
+                   # tests/test_storage_query_layer.py had to learn -- and four
+                   # of the six controls move ONE decision while leaving the
+                   # rest correct (the stamp relocated below the drop filters,
+                   # the stamp relocated below the sort, call_index made
+                   # 0-based, _unevaluable_entry stamping 0 instead of None),
+                   # which is a state no commit has ever had. The eighth copy is
+                   # not a control at all: section 8 execs a copy with BOTH
+                   # write sites removed to reconstruct the pre-change node and
+                   # compares its whole result, field for field, against the
+                   # shipped one over five response shapes -- the equivalence
+                   # proof that "provenance only" is a claim about every other
+                   # field rather than only about the two new ones.
+                   "tests/test_agent_emission_provenance.py"}
 
 
 def _repo_py_files():

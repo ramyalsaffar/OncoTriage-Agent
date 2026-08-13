@@ -1138,6 +1138,12 @@ def _unevaluable_entry(trial_obj: Dict, reason: str) -> Dict:
         "score_denominator": 0,
         "criteria_not_applicable": 0,
         "criteria": [],
+        # None, never 0: this entry was BUILT here and never stood in a model
+        # response, so it has no emission position and no answering call. 0
+        # would name the first entry of the first call, which is a real place
+        # some other trial occupies. See the stamp in the parse loop.
+        "emission_index": None,
+        "call_index": None,
         "not_evaluable_reason": reason,
         "assessment": {
             NOT_EVALUABLE_TRUNCATION_FLOOR:
@@ -2100,6 +2106,48 @@ CLINICAL TRIALS:
             }
 
         parsed = _unwrapped
+
+        # ── Where in the model's answer this entry stood ────────────────────
+        #
+        # PROVENANCE ONLY. Nothing below reads these two fields, no verdict,
+        # score, drop or sort depends on them, and neither is asked of the
+        # model: the response schema is untouched and both values are computed
+        # HERE, from the parsed list, by this pipeline.
+        #
+        # THE PLACEMENT IS THE WHOLE MECHANISM. Every step between this line
+        # and `evaluations.extend(_objects)` REMOVES entries -- non-objects,
+        # out-of-set ids, duplicate ids -- and the sort at the end of the node
+        # reorders whatever survives. Stamping anywhere after a removal would
+        # renumber the survivors and report a position the model never emitted;
+        # stamping after the sort would report the pipeline's own ranking back
+        # as the model's emission order, which is the exact fact this exists to
+        # preserve. So it runs on the FULL parsed list, before the first drop.
+        #
+        # `emission_index` is 0-BASED: it is a position in a list and there is
+        # no prior art to disagree with.
+        #
+        # `call_index` is 1-BASED, and that asymmetry is deliberate rather than
+        # an oversight. `llm_classifier_call_details` -- appended above, in this
+        # same loop, and returned in this same result -- numbers its calls
+        # 1..N (`calls_made` is incremented before the append, and
+        # tests/test_agent_state_channel_coverage.py pins "call_index is 1..N in
+        # order"). Two fields of one result sharing a name and disagreeing about
+        # their origin is an off-by-one join waiting to be got wrong silently,
+        # so the ledger's numbering wins and an entry joins its own call record
+        # by equality.
+        #
+        # An entry that ARRIVED carrying either key is overwritten. The fields
+        # mean "where this pipeline saw this entry"; a model-supplied value
+        # would be a different claim under the same name. Strict Structured
+        # Outputs forbids additional properties, so this is defence against a
+        # bare-array response, not an expected case.
+        #
+        # Non-dict entries are skipped: there is nothing to stamp, and they are
+        # dropped and counted immediately below.
+        for _emission_index, _entry in enumerate(parsed):
+            if isinstance(_entry, dict):
+                _entry["emission_index"] = _emission_index
+                _entry["call_index"] = calls_made
 
         # ── The reasoning-first design, checked on the bytes ────────────────
         #
