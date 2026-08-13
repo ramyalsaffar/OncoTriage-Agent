@@ -32,9 +32,11 @@ import re
 from collections import Counter
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
+from dateutil.relativedelta import relativedelta
+
 from oncotriage.agent import deps
 from oncotriage.agent.state import GENOMIC_VARIANT_LOINC, _VARIANT_TEXT_PATTERN
-from oncotriage.config import MAX_VARIANT_TERMS
+from oncotriage.config import MAX_VARIANT_TERMS, STALE_LAB_AGE_DAYS
 from oncotriage.extraction.stage import (
     STAGE_NUMERALS,
     STAGE_SOURCE_CONDITION_DISPLAY,
@@ -44,7 +46,11 @@ from oncotriage.extraction.stage import (
     STAGE_SOURCES,
     extract_patient_stage_with_source,
 )
-from oncotriage.utils import deduplicate_by_display
+from oncotriage.utils import (
+    deduplicate_by_display,
+    get_age_reference_date,
+    parse_partial_date,
+)
 
 
 #------------------------------------------------------------------------------
@@ -957,6 +963,190 @@ PROCEDURE_RENDER_KEPT = "kept"
 PROCEDURE_RENDER_DROPPED = "dropped"
 
 
+# ---------------------------------------------------------------------------
+# Temporal rendering: date arithmetic done in code, not asked of the model
+# ---------------------------------------------------------------------------
+#
+# TWO MEASURED FAILURES, both of them arithmetic this renderer can do for free
+# and deterministically and the model demonstrably does not always do:
+#
+#   1. An AML the record marks ``resolved`` with a 1997 onset, read as current
+#      and quoted as failing a newly-diagnosed-AML criterion. A concussion the
+#      record marks ``resolved`` with a 2012 onset, quoted to disqualify on
+#      active CNS leukaemia. In both, the word "resolved" was already on the
+#      rendered line and the model treated the condition as active anyway.
+#   2. A 1997 ANC rendered under "Relevant Lab Values (most recent)" beside
+#      2026 values, separated from them by nothing but a date in parentheses.
+#
+# WHY THE INPUT RATHER THAN THE OUTPUT. oncotriage/agent/evaluation.py already
+# detects family 1 AFTER the call (TEMPORAL_CONFLICT_FIELD) and deliberately
+# never rewrites it, because a simulation against an independent rater measured
+# the precision of rewriting at 0.57 -- two correct rejections deleted in every
+# five. This is the same problem attacked from the other end, before the call,
+# where nothing is being overruled: it states a fact the record already carries
+# and edits no verdict, no status, no score and no assessment.
+#
+# WHAT MAY BE SAID, AND WHAT MAY NOT. oncotriage/fhir/parser.py extracts NO
+# abatement and NO resolution date for a condition -- ``_parse_condition`` reads
+# ``onsetDateTime``, then ``onsetPeriod.start``, then ``onsetPeriod.end``, and
+# nothing else, verified in the shipped parser. The ONLY date available is
+# therefore the onset, and every phrase built here is anchored to the onset and
+# names it as such. "resolved 29 years ago" would be a fabrication: the record
+# does not say when it resolved. "onset 29 years before reference date; not
+# active" is exactly what the record says and no more.
+#
+# NOTHING IS INFERRED FROM AGE. An old condition whose clinical status is
+# ``active`` is genuinely current -- a 1997 diabetes diagnosis is not stale --
+# and gets no marker of any kind. The elapsed time is rendered ONLY where the
+# record has independently stated that the condition is over.
+
+# The clinical statuses under which the record itself says the condition is not
+# current. A SUBSET of the parser's condition vocabulary, which is
+# ``_CONDITION_STATUS_PRIORITY`` in oncotriage/fhir/parser.py: active,
+# recurrence, relapse, remission, inactive, resolved, unknown. The four
+# non-members are excluded one reason each:
+#
+#   active / recurrence / relapse  the record says the condition IS current.
+#   unknown                        the record says nothing. RULE 4 of the system
+#                                  prompt already governs the undocumented case,
+#                                  and a marker here would add certainty the
+#                                  record does not carry -- which is the same
+#                                  fabrication as a wrong rewrite, pointing the
+#                                  other way.
+#
+# ``remission`` is a member because a criterion asking for active disease is not
+# met by a patient in remission, which is precisely what RULE 4 already says.
+_NOT_ACTIVE_CLINICAL_STATUSES = frozenset({"resolved", "inactive", "remission"})
+
+# The phrase itself, as a constant, so a test pins what the renderer emits
+# rather than a retyped copy of it.
+NOT_ACTIVE_PHRASE = "not active"
+
+# Dates that could not be used to anchor a temporal phrase.
+#
+# THE AGE_PARSE_FAILURES / PROCEDURE_RENDER_COUNTS FOOTING: a module-level
+# Counter, counts only, keyed by the FAILURE and never by any clinical text or
+# any raw date value. A process-lifetime tally, not a per-patient field --
+# adding a key to the Stage 5 result dict would move every characterization
+# fixture for something no stage reads.
+#
+# AN ABSENT DATE IS NOT COUNTED. A condition with no onset and a lab with no
+# date are ordinary records, not degradations: nothing failed, the phrase simply
+# degrades to the part that is still true. What IS counted is a date that is
+# PRESENT and cannot be used -- unreadable, or later than the run's reference
+# date, which means the corpus outran DATA_SNAPSHOT_DATE.
+TEMPORAL_RENDER_COUNTS = Counter()
+
+TEMPORAL_KEY_CONDITION_ONSET = "condition_onset"
+TEMPORAL_KEY_LAB_DATE = "lab_date"
+
+
+def _resolve_temporal_date(raw, reference, key_prefix: str):
+    """Parse a record date for temporal rendering, or say why it cannot be used.
+
+    Args:
+        raw:        The record's raw date field, in any shape parse_partial_date
+                    accepts, or the corpus's "unknown" sentinel, or absent.
+        reference:  The run's age reference date -- get_age_reference_date(),
+                    never the clock. Passed in rather than resolved here so one
+                    render cannot see two different reference dates.
+        key_prefix: Which field this is, for TEMPORAL_RENDER_COUNTS.
+
+    Returns:
+        A ``datetime.date`` no later than ``reference``, or None when no
+        truthful elapsed phrase can be built from this field. The three None
+        cases are distinguished in the counter, not in the return value: the
+        caller's behaviour is the same for all three, which is to say less.
+
+    Never raises. parse_partial_date never raises, and every other branch here
+    is a comparison.
+    """
+    # THE CORPUS'S OWN ABSENCE SENTINEL, tested the same way the surrounding
+    # renderer tests it (`onset and onset != "unknown"`). Without this, the
+    # literal string "unknown" reaches parse_partial_date, comes back
+    # "unparseable", and every undated condition in the cohort is counted as a
+    # data defect.
+    if not raw or raw == "unknown":
+        return None
+
+    parsed, precision = parse_partial_date(raw)
+    if parsed is None:
+        TEMPORAL_RENDER_COUNTS[f"{key_prefix}_unreadable:{precision}"] += 1
+        return None
+
+    # A date after the reference is not an elapsed time. Rendering one would
+    # produce a negative interval or, worse, a plausible-looking small one.
+    if parsed > reference:
+        TEMPORAL_RENDER_COUNTS[f"{key_prefix}_after_reference"] += 1
+        return None
+
+    return parsed
+
+
+def _elapsed_phrase(years: int) -> str:
+    """Completed years as English, with no bare zero and no false plural.
+
+    "0 years" reads as "at the same time", which is not what a completed-year
+    count of zero means. It means less than one year, and that is what it says.
+    """
+    if years <= 0:
+        return "less than 1 year"
+    if years == 1:
+        return "1 year"
+    return f"{years} years"
+
+
+def _not_active_marker(onset_raw, reference) -> str:
+    """The rendered marker for a condition the record says is not current.
+
+    One consistent format, degrading in one direction only:
+
+        not active; onset 29 years before reference date   -- onset usable
+        not active                                         -- onset absent,
+                                                              unreadable, or
+                                                              later than the
+                                                              reference date
+
+    The elapsed clause is ONSET-anchored and says so, because the onset is the
+    only date the parser extracts (see the block comment above). Nothing here
+    implies a known resolution date.
+    """
+    onset = _resolve_temporal_date(onset_raw, reference, TEMPORAL_KEY_CONDITION_ONSET)
+    if onset is None:
+        return NOT_ACTIVE_PHRASE
+    years = relativedelta(reference, onset).years
+    return f"{NOT_ACTIVE_PHRASE}; onset {_elapsed_phrase(years)} before reference date"
+
+
+def _lab_age_suffix(date_raw, reference) -> str:
+    """", N years old" for a stale lab reading, or "" for everything else.
+
+    Appended INSIDE the parentheses that already carry the date, so the row
+    reads "(1997-08-27, 29 years old)". The date is not replaced: an absolute
+    date and an age answer different questions and the row is short enough for
+    both.
+
+    THE THRESHOLD IS IN DAYS AND THE PHRASE IS IN YEARS, deliberately -- see
+    STALE_LAB_AGE_DAYS in oncotriage/config.py. The two cannot disagree in the
+    direction that would matter, and the reason is arithmetic rather than a
+    guard: a span of more than 365 days lands strictly past the anniversary
+    whether or not it contains a leap day, so the completed-year count is always
+    at least 1 and this cannot emit "0 years old" at the shipped threshold.
+    LOWERING STALE_LAB_AGE_DAYS BELOW 365 BREAKS THAT, which is why it is stated
+    here: a threshold of 30 would annotate a two-month-old reading as
+    "0 years old". _elapsed_phrase is NOT consulted on this path -- its wording
+    ("less than 1 year") belongs to the condition marker, where the elapsed time
+    is not gated by a threshold at all.
+    """
+    parsed = _resolve_temporal_date(date_raw, reference, TEMPORAL_KEY_LAB_DATE)
+    if parsed is None:
+        return ""
+    if (reference - parsed).days <= STALE_LAB_AGE_DAYS:
+        return ""
+    years = relativedelta(reference, parsed).years
+    return f", {years} year{'' if years == 1 else 's'} old"
+
+
 def _classify_procedure_relevance(procedure: Dict) -> str:
     """Classify one procedure as worth rendering into the Stage 5 summary.
 
@@ -1265,6 +1455,21 @@ def _create_patient_summary(patient_data: Dict) -> str:
     For each lab concept and procedure type, only the most recent value is
     included. Trial eligibility criteria evaluate current status, not history.
 
+    TEMPORAL STATUS IS COMPUTED, NOT ASKED FOR. Two of the sections above state
+    elapsed time in words rather than leaving the model to derive it from a
+    date, both anchored on get_age_reference_date() and never on the clock:
+
+      Conditions  a condition whose RENDERED clinical status is resolved,
+                  inactive or in remission carries a "not active" marker, plus
+                  an ONSET-anchored elapsed clause when the onset is usable.
+                  Nothing else is tagged, and no resolution date is implied --
+                  the parser extracts none.
+      Lab Values  a reading older than config.STALE_LAB_AGE_DAYS states its age
+                  inside the parentheses that already carry its date.
+
+    See the block comment at _NOT_ACTIVE_CLINICAL_STATUSES for what is
+    deliberately left untouched and why.
+
     The cancer registry, the MeSH filter and the lab registry come from
     oncotriage.agent.deps, resolved once at the top of this function.
     """
@@ -1277,6 +1482,15 @@ def _create_patient_summary(patient_data: Dict) -> str:
     cancer_registry = deps.get_cancer_registry()
     lab_registry = deps.get_lab_registry()
     mesh_filter = deps.get_mesh_filter()
+
+    # The run's fixed reference date, resolved ONCE per render for the same
+    # reason the registries are: two lines of one summary must not be able to
+    # measure against two different dates. Never datetime.now() -- a clock-
+    # derived elapsed time would change the prompt text while
+    # compute_patient_hash, which keys on the parsed record, could not see it.
+    # get_age_reference_date() raises on a malformed DATA_SNAPSHOT_DATE, which
+    # is a configuration defect and belongs at the caller.
+    reference_date = get_age_reference_date()
 
     demographics = patient_data["demographics"]
     conditions   = patient_data["conditions"]
@@ -1407,12 +1621,30 @@ def _create_patient_summary(patient_data: Dict) -> str:
         verification_status = cond.get("verification_status") or ""
 
         parts = [display]
+
+        # `status_rendered` is set ONLY in the branch that actually puts the
+        # clinical status on the line, and the marker below keys on it. That is
+        # not a shortcut for re-testing the two conditions separately -- it is
+        # what makes them impossible to drift apart. A marker saying "not
+        # active" on a line whose status part reads "unconfirmed" would be
+        # asserting a resolution the record does not confirm happened at all.
+        status_rendered = None
         if verification_status == "unconfirmed":
             parts.append("unconfirmed")
         elif clinical_status and clinical_status not in ("unknown", ""):
             parts.append(clinical_status)
+            status_rendered = clinical_status
         if year:
             parts.append(year)
+
+        # MECHANICAL, NOT INFERRED: the record has already said this condition
+        # is over. All this adds is the arithmetic, in words, so the model does
+        # not have to do it. See the block comment at
+        # _NOT_ACTIVE_CLINICAL_STATUSES for why `active`, `recurrence`,
+        # `relapse`, `unknown` and every unconfirmed condition are untouched.
+        if status_rendered in _NOT_ACTIVE_CLINICAL_STATUSES:
+            parts.append(_not_active_marker(onset, reference_date))
+
         parts.append(tag)
         return f"- {' | '.join(parts)}"
 
@@ -1604,7 +1836,13 @@ def _create_patient_summary(patient_data: Dict) -> str:
             date_str  = date[:10] if date and date != "unknown" else "date unknown"
             value, unit = _normalize_lab_unit(canonical, value, unit)
             unit_str  = f" {unit}" if unit else ""
-            summary += f"- {canonical}: {value}{unit_str} ({date_str})\n"
+            # "(most recent)" in the heading is per lab CONCEPT, not per
+            # patient: a lab drawn once in 1997 and never again is the most
+            # recent of its kind and sits beside this year's values. The age is
+            # stated for anything older than STALE_LAB_AGE_DAYS and nothing
+            # else; a recent or undated reading renders exactly as before.
+            age_str   = _lab_age_suffix(date, reference_date)
+            summary += f"- {canonical}: {value}{unit_str} ({date_str}{age_str})\n"
     else:
         summary += "- None\n"
 

@@ -1231,6 +1231,32 @@ MATCHING_MAX_INPUT_PACKED_CHUNKS = 5
 MAX_VARIANT_TERMS = 8
 
 
+# ---------------------------------------------------------------------------
+# Stage 5 patient record rendering
+# ---------------------------------------------------------------------------
+
+# How old a lab reading has to be before _create_patient_summary states its age
+# in words as well as its date.
+#
+# The section is headed "Relevant Lab Values (most recent)" and holds exactly
+# one row per lab concept, so a reading from 1997 sits in it beside readings
+# from 2026 with nothing to separate them but a date in parentheses. Whether
+# that date is stale is date arithmetic against DATA_SNAPSHOT_DATE, which the
+# renderer can do for free and deterministically and the model demonstrably
+# does not always do.
+#
+# 365 DAYS RATHER THAN A CALENDAR YEAR, and the difference is deliberate: the
+# comparison is on whole days so it cannot depend on which side of a leap day
+# the reading falls, while the PHRASE is in completed years, which is what a
+# reader wants. One year is the threshold because essentially every haematology
+# and organ-function bound in an oncology protocol is written against a current
+# value -- "within 14 days of registration" is the usual window -- so a reading
+# older than a year is never the current value whatever the exact cutoff, and a
+# tighter cutoff would start annotating readings that are merely a few months
+# old and say nothing useful by doing it.
+STALE_LAB_AGE_DAYS = 365
+
+
 #------------------------------------------------------------------------------
 
 
