@@ -88,13 +88,23 @@ deterministic prefix, the completeness checks, the three derivation recipes, the
 constructed retry fixture, the cohort scan, the selection and ``main()`` are the
 line slice of File 45 between its bootstrap and its ``__main__`` guard.
 
-**THE FIXTURE FORMAT IS AT v7.** v7 is one field's null convention:
+**THE FIXTURE FORMAT IS AT v8.** v8 widens the ``stage5`` VERDICT projection by
+four fields, in two pairs, each closing a blind spot the prefix had rather than
+recording a new fact: ``assessment`` and ``assessment_draft`` -- the composed
+assessment and the model draft it was composed from, so that a regression of
+the composition itself is a diffed fact instead of replaying clean -- and
+``emission_index`` and ``call_index``, the two emission-provenance stamps, so
+that where the model put an entry and which billed call answered for it are
+held by the harness and not only by a stubbed-model unit test. See the per-bump
+block at ``SCHEMA_VERSION``.
+
+v7 was one field's null convention:
 ``stage5.llm_classifier_combined_prompt_sha256`` records ``None`` when Stage 5
 rendered no prompt, where it used to record the sha256 of the empty string --
 a real-looking digest for a prompt that never existed, on the one fixture that
 terminates at ``node_no_candidates``. Its sibling
 ``llm_classifier_prompt_sha256`` has always used ``None`` for that case; there
-is one convention now. See the per-bump block at ``SCHEMA_VERSION``.
+is one convention now.
 
 **v6 WAS PROVENANCE, AND THREE SEPARATE CHANGES GOT IT THERE.** ``stage3``
 gained the two cross-encoder score lists
@@ -126,7 +136,12 @@ collection digest they pin at the M-category pass -- so none of those three
 bumps lost a working gate. The v6 re-capture cleared both. The v6 -> v7 move was
 then applied to the files IN PLACE by a migration rather than by re-capturing,
 because v7 changes one stored value on one fixture and a re-capture costs twelve
-live Stage 5 calls to reproduce eleven fixtures byte-for-byte.
+live Stage 5 calls to reproduce eleven fixtures byte-for-byte. **The v7 -> v8
+move was NOT migratable and was re-captured**: the four fields it adds are read
+off the evaluation entries of a run, and no migration can invent what the model
+emitted on a run whose entries were never stored -- ``assessment_draft`` has no
+database column, and ``emission_index`` / ``call_index`` are positions in a
+response array that only the run itself saw.
 
 Nothing here silently skips an unreadable fixture: ``fixture_replay.py`` prints
 every load failure and exits 2 for them, distinctly from the 1 it exits on a
@@ -434,7 +449,41 @@ def log_inference(*_args, **_kwargs):
 # Stage 5 -- a real difference, reported as a pipeline change that did not
 # happen -- and every OTHER fixture would compare equal, which is worse: it
 # would look like a verified set with one inexplicable outlier.
-SCHEMA_VERSION = 7
+# v8: the stage5 VERDICT projection gains four fields, in two pairs. Both pairs
+# are ADDITIONS to deterministic_prefix -- the first line of the rule at the top
+# of this block -- so the version moves for the reason the counter exists rather
+# than by judgement.
+#   - `assessment` and `assessment_draft`, copied as stored. Since
+#     PROMPT_VERSION 1.5.0 the STORED assessment of an `eligible` or
+#     `not_eligible` trial is COMPOSED, by this pipeline, from that trial's own
+#     criterion / patient_value / status rows, so that it cannot assert
+#     anything the arrays do not carry; the model's own prose is kept beside it
+#     as `assessment_draft`, in memory only, with no database column. The
+#     prefix projected NEITHER, so it was blind to the composition: a revert of
+#     compose_assessment() to returning the draft unchanged, or to returning
+#     the empty string, is a total regression of that mechanism and all twelve
+#     fixtures would still have replayed clean. Both are projected because only
+#     the PAIR is diagnostic -- the draft alone moves whenever the model's prose
+#     moves, which the recordings already pin, and the composed value alone
+#     cannot separate "the renderer changed" from "the draft it renders
+#     changed".
+#   - `emission_index` and `call_index`, copied as stored. Integers on a
+#     model-returned verdict -- where in the parsed array it stood, and which
+#     billed call returned it -- and None on a verdict this pipeline
+#     CONSTRUCTED (a truncation floor, an exhausted split budget, a model
+#     omission, conflicting duplicates), which never stood in a response at
+#     all. None is not 0: 0 names the first entry of the first call, a real
+#     place some other trial occupies. They are stamped on the FULL parsed list
+#     BEFORE the first drop, and survive every later filter and the sort, which
+#     is what makes them the only surviving record of the model's own emission
+#     order. tests/test_agent_emission_provenance.py holds them against a
+#     stubbed model; the fixture harness held nothing, so a stamp that moved to
+#     after the sort -- reporting this pipeline's own ranking back as the
+#     model's order -- was not a diffed fact on any of the twelve.
+# A v7 fixture read by v8 code answers None for all four, and a diff of None
+# against None is a gate that passes because it stopped looking -- which is the
+# exact failure this counter exists to prevent.
+SCHEMA_VERSION = 8
 
 # Branch cases the fixture set must cover. Values are stored in case_labels.
 CASE_NO_CANDIDATES = "no_candidates"        # a terminal node_no_candidates run
@@ -1197,6 +1246,62 @@ def build_deterministic_prefix(final_state: Dict,
                     # a per-verdict outcome, so a replay that stopped
                     # correcting one of these would diff.
                     "not_evaluable_reason": e.get("not_evaluable_reason"),
+                    # --- The composed assessment and the draft it was composed
+                    # from, both copied as stored (schema v8) ----------------
+                    #
+                    # `assessment` is what a reader of this trial's verdict is
+                    # shown, and since PROMPT_VERSION 1.5.0 it is COMPOSED by
+                    # this pipeline from that trial's own criterion /
+                    # patient_value / status rows rather than taken from the
+                    # model, so that it cannot assert anything the arrays do
+                    # not carry. `assessment_draft` is the model's own prose,
+                    # snapshotted before any validator touched it and kept in
+                    # memory only -- there is no database column for it, so
+                    # this fixture is the only durable record of it anywhere.
+                    #
+                    # BOTH, because only the pair is diagnostic. The draft
+                    # alone moves whenever the model's prose moves, which
+                    # `recordings.chat_completions` already pins; the composed
+                    # value alone cannot separate "the renderer changed" from
+                    # "the draft it renders changed". Projecting neither -- the
+                    # pre-v8 state -- left a revert of compose_assessment() to
+                    # returning the draft, or to returning "", replaying clean
+                    # on all twelve.
+                    #
+                    # Copied as stored and diffed with exact equality: a
+                    # not_evaluable trial's arrays are empty by contract, so
+                    # its assessment is the model's text or one of the fixed
+                    # strings _not_evaluable_entry() writes, and both are
+                    # deterministic given the recordings. Neither is hashed --
+                    # a digest of a composed sentence names no field when it
+                    # moves, and the whole point of the diff is that it names
+                    # the leaf.
+                    "assessment": e.get("assessment"),
+                    "assessment_draft": e.get("assessment_draft"),
+                    # --- Where this pipeline saw this entry (schema v8) ------
+                    #
+                    # `emission_index` is the 0-based position the entry held
+                    # in the array THAT CALL returned; `call_index` is the
+                    # 1-based ordinal of the billed call that returned it,
+                    # numbered to agree with `llm_classifier_call_details`.
+                    # Both are None -- never 0 -- on an entry this node
+                    # CONSTRUCTED (a truncation floor, an exhausted split
+                    # budget, a model omission, conflicting duplicates), which
+                    # never stood in a response: 0 would name the first entry
+                    # of the first call, a real place some other trial
+                    # occupies. Stored as-is, so None never compares equal to
+                    # 0 here either.
+                    #
+                    # They are stamped on the FULL parsed list before the first
+                    # drop and survive every later filter AND the sort, so they
+                    # are the only surviving record of the order the model
+                    # actually emitted in. That is precisely what a stamp moved
+                    # to after the sort would destroy -- it would report this
+                    # pipeline's own ranking back as the model's order, with
+                    # every count, score and verdict unchanged, so nothing else
+                    # in this prefix would move.
+                    "emission_index": e.get("emission_index"),
+                    "call_index": e.get("call_index"),
                 }
                 for e in evaluations
             ],
@@ -1320,7 +1425,10 @@ def load_fixture(path: str) -> Dict:
             f"renamed the combined system+user hash to "
             f"llm_classifier_combined_prompt_sha256; v6 -> v7 records that "
             f"combined hash as None rather than the sha256 of the empty string "
-            f"when Stage 5 rendered no prompt.)"
+            f"when Stage 5 rendered no prompt; v7 -> v8 projects four more "
+            f"fields onto every stage5 verdict — the composed assessment, the "
+            f"model's draft of it, and the two emission-provenance stamps "
+            f"emission_index and call_index.)"
         )
     return fixture
 
@@ -1437,7 +1545,8 @@ def read_recorded_donor_bundle(path: str) -> str:
         bump since has moved something else: v4 renamed nine stage5/environment
         keys, v5 put ``response_format`` inside the request digest, v6 added two
         stage3 lists and two stage5 identifiers and renamed one hash, v7 changed
-        one hash's null convention. None of them touched either key.
+        one hash's null convention, v8 added four fields to every stage5
+        verdict. None of them touched either key.
       - The read is ADVISORY. Its only effect is which cohort patient the NEXT
         capture derives from. It never enters a deterministic prefix, is never
         compared on replay, and is never stored as a recorded value. A wrong or
@@ -2459,6 +2568,109 @@ MALFORMED_MARKER = "  <<< TRUNCATED BY fixture_capture.py TO FORCE A JSON PARSE 
 # payload is recognisably the real one, short enough that it cannot close.
 MALFORMED_PREFIX_CHARS = 400
 
+# The base this fixture has historically been built from. It is a PREFERENCE,
+# not a requirement -- see choose_retry_base() for why the difference matters.
+RETRY_BASE_PREFERRED = "normal_1"
+
+# Closed vocabulary for choose_retry_base()'s second return value, so a caller
+# can branch on the outcome instead of matching on prose.
+RETRY_BASE_PREFERRED_OK = "preferred"      # the historical base still qualifies
+RETRY_BASE_SUBSTITUTED = "substituted"     # it did not; another normal run did
+RETRY_BASE_NONE = "none"                   # nothing in the set qualifies
+RETRY_BASE_OUTCOMES = (RETRY_BASE_PREFERRED_OK, RETRY_BASE_SUBSTITUTED,
+                       RETRY_BASE_NONE)
+
+
+def retry_base_disqualification(fixture: Dict) -> str:
+    """Why this fixture cannot be the retry fixture's base, or "" if it can.
+
+    Every condition here is one build_constructed_retry_fixture() ALREADY
+    refuses, or one the constructed fixture's own labelling depends on. Read it
+    as the machine-checkable statement of that function's preconditions,
+    evaluated before a base is chosen rather than after.
+    """
+    if fixture.get("fixture_kind") != FIXTURE_KIND_RECORDED:
+        return f"fixture_kind is {fixture.get('fixture_kind')!r}, not recorded"
+
+    calls = (fixture.get("recordings") or {}).get("chat_completions") or []
+    if len(calls) != 1:
+        # THE ONE THAT ACTUALLY FIRED. A Stage 5 run splits when its response
+        # hits the output ceiling, and whether it does is a property of the
+        # model and of that patient's filtered trial set on the day -- not of
+        # the patient. So no fixture id is a durable answer to "which run made
+        # exactly one call", which is precisely why this is measured.
+        return (f"recorded {len(calls)} Stage 5 call(s), not exactly one to "
+                f"splice a failing attempt in front of")
+
+    if list(fixture.get("case_labels") or []) != [CASE_NORMAL]:
+        # The constructed fixture stamps case_labels = [the retry case] and
+        # deepcopies everything else from its base. A base carrying another
+        # branch case therefore produces a fixture that exercises two branches
+        # while declaring one -- an ablation base would carry ablation_flags
+        # into a fixture whose labels say nothing about ablation.
+        return (f"case_labels are {fixture.get('case_labels')}, not "
+                f"[{CASE_NORMAL!r}]; the retry case must not be spliced onto "
+                f"another branch case")
+
+    return ""
+
+
+def choose_retry_base(fixtures: List[Dict]) -> tuple:
+    """Pick the recorded run the constructed retry fixture is spliced onto.
+
+    Returns ``(fixture_or_None, outcome, detail)`` where ``outcome`` is one of
+    RETRY_BASE_OUTCOMES and ``detail`` is a human-readable line naming what was
+    chosen and what was rejected.
+
+    WHY THIS EXISTS RATHER THAN A HARDCODED ``normal_1``
+    ----------------------------------------------------
+    build_constructed_retry_fixture() REQUIRES a shape -- one recorded Stage 5
+    call -- while main() used to select by NAME. Those are different questions,
+    and a capture measured the gap: ``normal_1`` came back having SPLIT into two
+    calls (its filtered trial set hit the model's output ceiling), the
+    constructor refused it, and eleven paid fixtures were written while the
+    twelfth was left stale on disk at the previous schema version. Splitting is
+    not a defect and not flakiness -- it is what the truncation path is for --
+    so no fixture id is a durable answer to "which run made exactly one call".
+
+    Selection is deterministic and it is ORDERED rather than arbitrary:
+
+      1. RETRY_BASE_PREFERRED, when it qualifies. Keeping the historical base
+         whenever it is usable is what stops the constructed fixture wandering
+         between patients on captures where nothing was wrong.
+      2. Otherwise the qualifying candidates sorted by fixture_id, first one
+         wins. Sorted, so two captures over the same set agree.
+
+    Returning None rather than raising is deliberate: the caller has already
+    spent money on eleven fixtures by the time this runs, and the useful thing
+    to do with that is report precisely what was rejected and why.
+    """
+    rejected = []
+    qualified = {}
+    for fixture in fixtures:
+        fixture_id = fixture.get("fixture_id")
+        reason = retry_base_disqualification(fixture)
+        if reason:
+            rejected.append(f"{fixture_id}: {reason}")
+        else:
+            qualified[fixture_id] = fixture
+
+    if RETRY_BASE_PREFERRED in qualified:
+        return (qualified[RETRY_BASE_PREFERRED], RETRY_BASE_PREFERRED_OK,
+                f"{RETRY_BASE_PREFERRED} qualifies (one recorded Stage 5 call)")
+
+    if qualified:
+        chosen_id = sorted(qualified)[0]
+        why_not = next((r for r in rejected
+                        if r.startswith(f"{RETRY_BASE_PREFERRED}:")),
+                       f"{RETRY_BASE_PREFERRED}: not in the captured set")
+        return (qualified[chosen_id], RETRY_BASE_SUBSTITUTED,
+                f"{chosen_id} substituted for {RETRY_BASE_PREFERRED} — {why_not}")
+
+    return (None, RETRY_BASE_NONE,
+            "no captured fixture qualifies as a retry base; rejected "
+            + "; ".join(rejected or ["nothing was offered"]))
+
 
 def build_constructed_retry_fixture(base: Dict, fixture_id: str) -> Dict:
     """Assemble the MAX_LLM_CLASSIFIER_RETRIES fixture from a recorded normal run.
@@ -2601,6 +2813,33 @@ def build_constructed_retry_fixture(base: Dict, fixture_id: str) -> Dict:
     # Stage 5's own counter resets when the router re-enters the node. The
     # sink-side llm_classifier_calls of 2 spans both invocations. The two disagreeing is
     # the signature of a retry, and is why both are recorded.
+    #
+    # THE VERDICTS ARE DELIBERATELY NOT RENUMBERED, AND THAT FOLLOWS FROM THE
+    # SAME RESET (schema v8). `call_index` on a verdict is Stage 5's own
+    # `calls_made` at the moment the response parsed, and the failing attempt
+    # is a SEPARATE node invocation reached round the cyclic edge -- so the
+    # successful attempt starts from zero and stamps 1, exactly as the base run
+    # did. Were the retry an inner loop instead, every verdict here would carry
+    # 2 while this fixture claimed 1, and the miss would surface at replay as a
+    # dozen unexplained per-verdict diffs rather than as a statement about the
+    # router. The assumption is asserted rather than left to that: the base is
+    # already required to have recorded exactly ONE Stage 5 call above, so the
+    # only call_index a model-returned verdict may carry is 1, and a
+    # pipeline-constructed one carries None.
+    _verdict_calls = {v.get("call_index")
+                      for v in stage5.get("verdicts", [])}
+    if not _verdict_calls <= {1, None}:
+        _unexpected = sorted(c for c in _verdict_calls if c not in (1, None))
+        raise ValueError(
+            f"{base['fixture_id']} recorded exactly one Stage 5 call, but its "
+            f"verdicts carry call_index values {_unexpected}. "
+            "A model-returned verdict of a single-call run can only be call 1 "
+            "(the ledger numbers calls 1..N) and a pipeline-constructed one "
+            "carries None. Either Stage 5's numbering moved or the retry stopped "
+            "being a fresh node invocation; in both cases the constructed "
+            "fixture's copied verdicts no longer describe what a replay will "
+            "produce."
+        )
 
     return fixture
 
@@ -3433,7 +3672,11 @@ def main() -> int:
         if entry["construction"]:
             console.out(f"  {'':<28} DERIVED BUNDLE from "
                   f"{entry['construction']['derived_from_bundle'][:40]}")
-    console.out(f"  {'llm_classifier_parse_retry_constructed':<28} constructed from normal_1")
+    # The base is not known yet and this line must not claim it is: it is
+    # chosen AFTER capture, from the runs that actually made one Stage 5 call.
+    console.out(f"  {'llm_classifier_parse_retry_constructed':<28} constructed after "
+                f"capture from a single-call normal run "
+                f"(preferring {RETRY_BASE_PREFERRED})")
 
     if args.scan_only:
         console.out("\n--scan-only: nothing captured.")
@@ -3447,7 +3690,6 @@ def main() -> int:
     graph = build_matching_graph()
 
     written = []
-    normal_1_fixture = None
 
     with CaffeinateSession("fixture capture"):
         for entry in plan:
@@ -3479,8 +3721,6 @@ def main() -> int:
             console.out(f"  -> {os.path.basename(path)} "
                   f"({os.path.getsize(path) / 1024:.0f} KB, "
                   f"terminal={fixture['deterministic_prefix']['terminal']['terminal_node']})")
-            if entry["fixture_id"] == "normal_1":
-                normal_1_fixture = fixture
 
     # Temporary derived bundles are a copy of a Synthea record each, hundreds
     # of megabytes. Schema v2 stores the recipe, so nothing needs them once the
@@ -3491,23 +3731,45 @@ def main() -> int:
             console.out(f"  removed temporary bundle for {entry['fixture_id']}")
 
     # --- The constructed retry fixture -------------------------------------
-    if normal_1_fixture is None:
-        existing = fixture_path("normal_1", root)
-        if os.path.exists(existing):
-            normal_1_fixture = load_fixture(existing)
+    #
+    # THE BASE IS CHOSEN BY SHAPE, NOT BY NAME. See choose_retry_base(): the
+    # constructor requires one recorded Stage 5 call, and whether a given
+    # patient's run makes one is a property of that run rather than of the
+    # patient. Candidates are the recorded fixtures written by THIS run, and on
+    # an --only run the ones already on disk, because there is nothing else to
+    # offer then.
+    retry_candidates = [f for f in written
+                        if f.get("fixture_kind") == FIXTURE_KIND_RECORDED]
+    if not retry_candidates:
+        for candidate_path in list_fixtures(root):
+            try:
+                candidate = load_fixture(candidate_path)
+            except (ValueError, json.JSONDecodeError) as exc:
+                # A stale-version file on disk is not a candidate and not a
+                # crash: it is named and skipped, because this branch exists
+                # precisely for the run that is replacing it.
+                console.out(f"  (not a retry-base candidate) {exc}")
+                continue
+            if candidate.get("fixture_kind") == FIXTURE_KIND_RECORDED:
+                retry_candidates.append(candidate)
 
-    if normal_1_fixture is not None and (
-            not args.only or "llm_classifier_parse_retry_constructed" in args.only):
-        retry_fixture = build_constructed_retry_fixture(
-            normal_1_fixture, "llm_classifier_parse_retry_constructed"
-        )
-        path = write_fixture(retry_fixture, root)
-        written.append(retry_fixture)
-        console.out(f"\n  -> {os.path.basename(path)} (constructed from "
-              f"{retry_fixture['construction']['derived_from']})")
-    elif normal_1_fixture is None:
-        console.out("\n  WARNING: normal_1 was not captured, so the constructed retry "
-              "fixture was not built.")
+    retry_incomplete = False
+    if not args.only or "llm_classifier_parse_retry_constructed" in args.only:
+        retry_base, retry_outcome, retry_detail = choose_retry_base(retry_candidates)
+        if retry_base is None:
+            retry_incomplete = True
+            console.out(f"\n  ERROR: the constructed retry fixture was NOT built. "
+                        f"{retry_detail}")
+        else:
+            if retry_outcome == RETRY_BASE_SUBSTITUTED:
+                console.out(f"\n  [retry base] {retry_detail}")
+            retry_fixture = build_constructed_retry_fixture(
+                retry_base, "llm_classifier_parse_retry_constructed"
+            )
+            path = write_fixture(retry_fixture, root)
+            written.append(retry_fixture)
+            console.out(f"\n  -> {os.path.basename(path)} (constructed from "
+                  f"{retry_fixture['construction']['derived_from']})")
 
     # --- Index -------------------------------------------------------------
     all_fixtures = []
@@ -3578,9 +3840,19 @@ def main() -> int:
     uncovered = sorted(set(ALL_BRANCH_CASES) - covered)
     if uncovered:
         console.out(f"Branch cases NOT covered: {uncovered}")
+    if retry_incomplete:
+        # NOT folded into `uncovered`, and the difference is the whole point.
+        # `covered` is read off the fixtures ON DISK, so a retry fixture left
+        # over from an earlier capture reports its case as covered while this
+        # run failed to rebuild it -- a stale file counted as a fresh one, which
+        # is the shape every version gate in this file exists to refuse. This
+        # flag is about what THIS run did.
+        console.out("The constructed retry fixture was not rebuilt by this run. "
+                    "Any file of that name in the directory is from an earlier "
+                    "capture and does not describe the pipeline as captured here.")
     console.out(f"{'=' * 78}\n")
 
-    return 0 if not uncovered else 1
+    return 0 if not uncovered and not retry_incomplete else 1
 #------------------------------------------------------------------------------
 
 
