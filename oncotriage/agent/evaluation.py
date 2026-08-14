@@ -725,9 +725,28 @@ UNEVALUABLE_REJECTION_UNSUPPORTED = (
 # So the reason asserts only what is known without guessing: labels were
 # normalised, and afterwards no disqualifying row is left. It does not say the
 # remapped row was the disqualifier, and it does not say there never was one.
-# This branch keeps the model's draft, unlike the one above: we cannot claim
-# the model cited nothing when a row it wrote may have been a disqualifier
-# spelled wrong.
+#
+# THIS BRANCH NO LONGER KEEPS THE MODEL'S DRAFT EITHER, and the paragraph that
+# stood here said it did. The reason it gave was sound and its conclusion was
+# not: keeping the draft avoided over-claiming, but the draft is a REJECTION --
+# "Known disqualifier: ..." -- stored in the column a clinician reads beside a
+# verdict of not_evaluable, which is the same self-contradicting row the case
+# above exists to remove, reached by the other route. The trade-off was between
+# over-claiming and contradicting; a text that does neither settles it, so this
+# branch is marked with the reason below and composes
+# ASSESSMENT_REMAP_NO_SURVIVOR_TEXT.
+#
+# WHAT THAT TEXT MAY NOT SAY is exactly what the paragraphs above establish, so
+# it is written to the same limit as this constant: it must not claim the model
+# cited no disqualifier (a row it wrote may have been one, spelled wrong), and
+# it must not claim the remapped rows WERE the disqualifiers (`remapped_here`
+# is true for a remap on any row -- and for a non-dict entry that was dropped
+# rather than relabelled, so it may not even claim a label was rewritten). It
+# says only that the model rejected the trial, that after label normalisation
+# no disqualifying row is left to support the rejection, and that the verdict
+# was therefore corrected. The two markers stay DISTINCT for the same reason
+# the two reasons do: composing the stronger sentence over this population is
+# the misclassification the paragraph above rules out.
 UNEVALUABLE_REMAP_NO_SURVIVOR = (
     "no disqualifying row survived label normalisation")
 
@@ -1315,6 +1334,12 @@ ASSESSMENT_COMPOSED_NOT_ELIGIBLE = "composed_not_eligible"
 # about it, which is the definition of composable here. See the text constant
 # below for why keeping the draft was not an option.
 ASSESSMENT_COMPOSED_UNSUPPORTED_REJECTION = "composed_unsupported_rejection"
+# The other corrected rejection -- the one whose disqualifying labels were out
+# of vocabulary. A SEPARATE member rather than a second marker routed to the
+# case above, because the two populations know different things about the
+# model's arrays and therefore store different sentences; folding them together
+# would make the log line report a correction it cannot distinguish.
+ASSESSMENT_COMPOSED_REMAP_NO_SURVIVOR = "composed_remap_no_survivor"
 ASSESSMENT_KEPT_NOT_EVALUABLE = "kept_draft_not_evaluable"
 ASSESSMENT_KEPT_NO_DISQUALIFIER = "kept_draft_no_disqualifying_row"
 ASSESSMENT_KEPT_UNKNOWN_VERDICT = "kept_draft_unknown_verdict"
@@ -1323,12 +1348,13 @@ ASSESSMENT_CASES = (
     ASSESSMENT_COMPOSED_ELIGIBLE,
     ASSESSMENT_COMPOSED_NOT_ELIGIBLE,
     ASSESSMENT_COMPOSED_UNSUPPORTED_REJECTION,
+    ASSESSMENT_COMPOSED_REMAP_NO_SURVIVOR,
     ASSESSMENT_KEPT_NOT_EVALUABLE,
     ASSESSMENT_KEPT_NO_DISQUALIFIER,
     ASSESSMENT_KEPT_UNKNOWN_VERDICT,
 )
 
-# The three that WRITE the stored assessment rather than keeping the model's
+# The four that WRITE the stored assessment rather than keeping the model's
 # draft. Named rather than spelled out at each site, because the composition
 # pass computes `kept` as `total - composed` and a member added to the
 # vocabulary without being added here would be silently counted as kept.
@@ -1336,6 +1362,7 @@ ASSESSMENT_COMPOSED_CASES = (
     ASSESSMENT_COMPOSED_ELIGIBLE,
     ASSESSMENT_COMPOSED_NOT_ELIGIBLE,
     ASSESSMENT_COMPOSED_UNSUPPORTED_REJECTION,
+    ASSESSMENT_COMPOSED_REMAP_NO_SURVIVOR,
 )
 
 # WHAT A CORRECTED REJECTION STORES. Fixed text, no interpolation, and every
@@ -1361,6 +1388,32 @@ ASSESSMENT_UNSUPPORTED_REJECTION_TEXT = (
     f"{ASSESSMENT_NOT_EVALUABLE_OPENING} The model rejected this trial but "
     "cited no disqualifying criterion in either criteria array, so the "
     "verdict was corrected to not evaluable."
+)
+
+# WHAT THE OTHER CORRECTED REJECTION STORES, and it is deliberately WEAKER than
+# the sentence above rather than a paraphrase of it. Same construction -- fixed
+# text, no interpolation, no digits, no clinical claim -- and the same opening,
+# so a reader scanning the column recognises a non-evaluation without learning
+# a fourth opening.
+#
+# THE DIFFERENCE IS THE ONLY THING THAT MATTERS HERE. This population's
+# disqualifying evidence, if there was any, was written in a label the arm's
+# vocabulary does not contain, and `_normalize_arm` refuses to guess what the
+# model meant by it. So this text may NOT say the model cited no disqualifying
+# criterion: that is the one claim the evidence cannot support, and it is the
+# claim the sentence above makes. It may not say the remapped rows were the
+# disqualifiers either -- `remapped_here` is true for a remap on any row, and
+# for a non-dict entry that was dropped rather than relabelled. It says what is
+# left: the rejection was made, nothing now supports it, the verdict moved.
+# See UNEVALUABLE_REMAP_NO_SURVIVOR for the argument in full.
+#
+# The arrays go on being stored verbatim in criterion_details, remapped
+# statuses included, so a reader who wants to know what the model wrote reads
+# them rather than this line.
+ASSESSMENT_REMAP_NO_SURVIVOR_TEXT = (
+    f"{ASSESSMENT_NOT_EVALUABLE_OPENING} The model rejected this trial, but "
+    "after label normalisation no row in either criteria array carried a "
+    "disqualifying status, so the verdict was corrected to not evaluable."
 )
 
 # The two that cannot happen if the node's own normalizer ran: Step 3 sets
@@ -1444,13 +1497,22 @@ def assessment_composition_case(verdict: Dict) -> str:
     """
     label = verdict.get("eligible")
     if label == TRIAL_VERDICT_NOT_EVALUABLE:
-        # BEFORE the kept-draft answer, and only for the marker this node
+        # BEFORE the kept-draft answer, and only for the two markers this node
         # writes itself. Every other not_evaluable entry -- model-declared with
         # empty arrays, or one of the four _unevaluable_entry constructs --
         # falls through to the line below and keeps its text, which is the
         # behaviour that was already correct for them.
-        if verdict.get("not_evaluable_reason") == UNEVALUABLE_REJECTION_UNSUPPORTED:
+        #
+        # TWO MARKERS, TWO CASES, ONE PER CORRECTED REJECTION. Both populations
+        # are a rejection whose stored verdict is not_evaluable and whose draft
+        # therefore contradicts it; they differ in what may be said about the
+        # arrays, so they cannot share a case without one of them storing a
+        # sentence its evidence does not support.
+        reason = verdict.get("not_evaluable_reason")
+        if reason == UNEVALUABLE_REJECTION_UNSUPPORTED:
             return ASSESSMENT_COMPOSED_UNSUPPORTED_REJECTION
+        if reason == UNEVALUABLE_REMAP_NO_SURVIVOR:
+            return ASSESSMENT_COMPOSED_REMAP_NO_SURVIVOR
         return ASSESSMENT_KEPT_NOT_EVALUABLE
     if label == TRIAL_VERDICT_ELIGIBLE:
         return ASSESSMENT_COMPOSED_ELIGIBLE
@@ -1492,6 +1554,13 @@ def compose_assessment(verdict: Dict) -> str:
         # row would be padding the text with criteria that had nothing to do
         # with the correction.
         return ASSESSMENT_UNSUPPORTED_REJECTION_TEXT
+
+    if case == ASSESSMENT_COMPOSED_REMAP_NO_SURVIVOR:
+        # A constant for the same reason, and one further one: the rows that
+        # WERE remapped are the only ones a rendering could plausibly quote,
+        # and quoting them would assert they carried the disqualification --
+        # the claim ASSESSMENT_REMAP_NO_SURVIVOR_TEXT exists to avoid making.
+        return ASSESSMENT_REMAP_NO_SURVIVOR_TEXT
 
     if case == ASSESSMENT_COMPOSED_NOT_ELIGIBLE:
         sentences = []
@@ -3070,7 +3139,23 @@ CLINICAL TRIALS:
                 "original_label": TRIAL_VERDICT_NOT_ELIGIBLE,
                 "reason": UNEVALUABLE_REMAP_NO_SURVIVOR,
             })
+            # The arrays are NOT touched, remapped statuses included: they are
+            # what a reader consults instead of the composed sentence, which
+            # deliberately says nothing about which row was rewritten.
             eval_result["eligible"] = TRIAL_VERDICT_NOT_EVALUABLE
+            # THE MARKER, on the same footing as the one in the branch below:
+            # the audit list feeds a log line and nothing else, so without this
+            # the correction left no machine-readable trace on the ENTRY, and
+            # compose_assessment kept a draft that reads "Known disqualifier:"
+            # beside a verdict of not_evaluable. Its own reason constant is
+            # reused rather than a new one minted -- the question this field
+            # answers is "why was this not evaluated", and that string is the
+            # answer already written for this branch. Like the other marker it
+            # is deliberately NOT in _NOT_EVALUABLE_REASONS, whose members
+            # index _unevaluable_entry's fixed explanation table, and the
+            # strict response schema cannot emit the key, so an entry carrying
+            # it was written here.
+            eval_result["not_evaluable_reason"] = UNEVALUABLE_REMAP_NO_SURVIVOR
             _record_zero_score(eval_result, inc, exc)
 
         else:

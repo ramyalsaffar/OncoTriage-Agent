@@ -586,19 +586,35 @@ for _label, _payload in (("a remapped DISQUALIFYING label",
     check(f"{_label}: the verdict is not_evaluable", verdict_of(_r),
           TRIAL_VERDICT_NOT_EVALUABLE)
     # PART 3 IS AUDIT ACCURACY ONLY. Verdict and score must be exactly what
-    # they were, and this branch keeps the model's draft -- it does NOT get
-    # the marker, because a row the model wrote may have been a disqualifier
-    # spelled wrong and "cited no disqualifying criterion" would then be false.
+    # they were, and the marker this file is about must stay off this branch:
+    # a row the model wrote may have been a disqualifier spelled wrong, so
+    # "cited no disqualifying criterion" would be false of it.
+    #
+    # THE SIBLING BRANCH NOW CARRIES A MARKER OF ITS OWN, and it composes the
+    # weaker sentence rather than keeping the draft. Asserted here only as the
+    # boundary of THIS file's subject -- the population, the text and the
+    # controls for that branch belong to
+    # tests/test_agent_remap_no_survivor.py. What matters here is that the two
+    # markers stay distinct, because collapsing them would put this file's
+    # stronger sentence over a trial that cannot support it.
     check(f"{_label}: the score is unchanged -- zero by verdict",
           (eval_of(_r).get("match_score"), eval_of(_r).get("score_confirmed"),
            eval_of(_r).get("score_denominator")), (0.0, 0, 0))
     check(f"{_label}: it does NOT get the unsupported-rejection marker",
-          eval_of(_r).get("not_evaluable_reason", "<no key>"), "<no key>")
-    check(f"{_label}: so it keeps the model's draft, composed by nobody",
-          (assessment_composition_case(eval_of(_r)),
-           eval_of(_r).get("assessment")),
-          (ASSESSMENT_KEPT_NOT_EVALUABLE,
-           eval_of(_r).get("assessment_draft")))
+          (eval_of(_r).get("not_evaluable_reason", "<no key>")
+           == UNEVALUABLE_REJECTION_UNSUPPORTED,
+           eval_of(_r).get("not_evaluable_reason", "<no key>")),
+          (False, UNEVALUABLE_REMAP_NO_SURVIVOR))
+    check(f"{_label}: so it does NOT compose this file's text",
+          (assessment_composition_case(eval_of(_r))
+           == ASSESSMENT_COMPOSED_UNSUPPORTED_REJECTION,
+           eval_of(_r).get("assessment")
+           == ASSESSMENT_UNSUPPORTED_REJECTION_TEXT),
+          (False, False))
+    check(f"{_label}: and the model's draft is preserved beside whatever it "
+          f"does compose",
+          eval_of(_r).get("assessment_draft"),
+          "Known disqualifier: the model said so.")
 
 # NON-DEGENERACY for the two shapes: they must actually differ in what they
 # remapped, or the loop above is one case run twice.
@@ -1074,7 +1090,7 @@ _control(
 #     in for the other.
 _control(
     "C2. dropping the composition case returns the draft -- CAUGHT",
-    [('        if verdict.get("not_evaluable_reason") == UNEVALUABLE_REJECTION_UNSUPPORTED:\n'
+    [("        if reason == UNEVALUABLE_REJECTION_UNSUPPORTED:\n"
       "            return ASSESSMENT_COMPOSED_UNSUPPORTED_REJECTION",
       "        if False:  # PLANTED: the composed case, bypassed\n"
       "            return ASSESSMENT_COMPOSED_UNSUPPORTED_REJECTION")],
@@ -1089,13 +1105,11 @@ _control(
 _control(
     "C3. losing the case from ASSESSMENT_COMPOSED_CASES miscounts it as "
     "kept -- CAUGHT",
-    [("ASSESSMENT_COMPOSED_CASES = (\n"
-      "    ASSESSMENT_COMPOSED_ELIGIBLE,\n"
+    [("    ASSESSMENT_COMPOSED_NOT_ELIGIBLE,\n"
+      "    ASSESSMENT_COMPOSED_UNSUPPORTED_REJECTION,\n"
+      "    ASSESSMENT_COMPOSED_REMAP_NO_SURVIVOR,\n)",
       "    ASSESSMENT_COMPOSED_NOT_ELIGIBLE,\n"
-      "    ASSESSMENT_COMPOSED_UNSUPPORTED_REJECTION,\n)",
-      "ASSESSMENT_COMPOSED_CASES = (\n"
-      "    ASSESSMENT_COMPOSED_ELIGIBLE,\n"
-      "    ASSESSMENT_COMPOSED_NOT_ELIGIBLE,\n)")],
+      "    ASSESSMENT_COMPOSED_REMAP_NO_SURVIVOR,\n)")],
     lambda m: (lambda rec: (field(rec, "count"), field(rec, "kept")))(
         log_records(run_stage5(
             UNSUPPORTED, node=m.node_llm_classifier_evaluation)[1],
@@ -1117,26 +1131,31 @@ _control(
 )
 
 # C5. THE CONVERSE OF C4, and it is the one that stops Part 3 being a rename.
-#     If the sibling branch were given the marker as well, the innocent remap
-#     shape would compose "cited no disqualifying criterion" over a row the
-#     model may have written as a disqualifier and spelled wrong. The control
-#     shows that edit producing exactly that text.
+#     The sibling branch carries a marker of its own now, so the edit to guard
+#     against is no longer "give it one" but "give it THIS one": pointing it at
+#     UNEVALUABLE_REJECTION_UNSUPPORTED makes the remap shape compose "cited no
+#     disqualifying criterion" over a row the model may have written as a
+#     disqualifier and spelled wrong. The control shows that edit producing
+#     exactly that text. It is the same guard as C4 in
+#     tests/test_agent_remap_no_survivor.py, kept here because each file has to
+#     defend its own sentence from the other's population.
 _control(
-    "C5. giving the sibling branch the marker composes a claim it cannot "
-    "support -- CAUGHT",
-    [('                "reason": UNEVALUABLE_REMAP_NO_SURVIVOR,\n'
-      "            })",
-      '                "reason": UNEVALUABLE_REMAP_NO_SURVIVOR,\n'
-      "            })\n"
-      '            eval_result["not_evaluable_reason"] = (\n'
-      "                UNEVALUABLE_REJECTION_UNSUPPORTED)  # PLANTED")],
+    "C5. pointing the sibling branch at THIS marker composes a claim it "
+    "cannot support -- CAUGHT",
+    [('            eval_result["not_evaluable_reason"] = '
+      "UNEVALUABLE_REMAP_NO_SURVIVOR\n",
+      '            eval_result["not_evaluable_reason"] = '
+      "UNEVALUABLE_REJECTION_UNSUPPORTED  # PLANTED\n")],
     lambda m: _stored(m, _REMAP_DISQUALIFYING)[1],
     ASSESSMENT_UNSUPPORTED_REJECTION_TEXT,
 )
 check("C5 non-degeneracy: the SHIPPED module composes no such text for that "
-      "shape -- it keeps the draft",
-      _stored(_evaluation_module, _REMAP_DISQUALIFYING),
-      (ASSESSMENT_KEPT_NOT_EVALUABLE, "Known disqualifier: the model said so."))
+      "shape -- it composes the weaker one, and the draft survives beside it",
+      (_stored(_evaluation_module, _REMAP_DISQUALIFYING)[1]
+       == ASSESSMENT_UNSUPPORTED_REJECTION_TEXT,
+       _stored(_evaluation_module, _REMAP_DISQUALIFYING)[0]
+       == ASSESSMENT_COMPOSED_UNSUPPORTED_REJECTION),
+      (False, False))
 
 
 # ===========================================================================

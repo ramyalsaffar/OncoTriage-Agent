@@ -106,6 +106,7 @@ from oncotriage.agent.evaluation import (
     ASSESSMENT_CASES,
     ASSESSMENT_COMPOSED_ELIGIBLE,
     ASSESSMENT_COMPOSED_NOT_ELIGIBLE,
+    ASSESSMENT_COMPOSED_REMAP_NO_SURVIVOR,
     ASSESSMENT_COMPOSED_UNSUPPORTED_REJECTION,
     ASSESSMENT_COMPOSITION_ANOMALIES,
     ASSESSMENT_ELIGIBLE_OPENING,
@@ -116,8 +117,10 @@ from oncotriage.agent.evaluation import (
     ASSESSMENT_NOT_EVALUABLE_OPENING,
     ASSESSMENT_UNDOCUMENTED_OPENING,
     ASSESSMENT_UNDOCUMENTED_PATIENT_VALUE,
+    ASSESSMENT_REMAP_NO_SURVIVOR_TEXT,
     ASSESSMENT_UNSUPPORTED_REJECTION_TEXT,
     UNEVALUABLE_REJECTION_UNSUPPORTED,
+    UNEVALUABLE_REMAP_NO_SURVIVOR,
     assessment_composition_case,
     compose_assessment,
     node_llm_classifier_evaluation,
@@ -274,6 +277,19 @@ V_CORRECTED_REJECTION = verdict(
     assessment="Known disqualifier: a 1963 tubal ligation.")
 V_CORRECTED_REJECTION["not_evaluable_reason"] = UNEVALUABLE_REJECTION_UNSUPPORTED
 
+# THE OTHER CORRECTED REJECTION: the one whose disqualifying labels were out of
+# their arm's vocabulary and did not survive normalisation. Same shape --
+# not_evaluable, full arrays, a rejection for a draft -- and a DIFFERENT marker,
+# because a remapped row may have been a real disqualifier the model spelled
+# wrong, so the sentence composed for it must be weaker. The inclusion row below
+# is what such a row looks like after _normalize_arm has resolved it.
+V_REMAP_NO_SURVIVOR = verdict(
+    TRIAL_VERDICT_NOT_EVALUABLE,
+    inclusion=[row("Age 18-75", "62", "met"),
+               row("Prior therapy", "none recorded", "not_evaluable")],
+    assessment="Known disqualifier: a label nobody can read.")
+V_REMAP_NO_SURVIVOR["not_evaluable_reason"] = UNEVALUABLE_REMAP_NO_SURVIVOR
+
 V_UNKNOWN_VERDICT = verdict(
     "probably eligible",
     inclusion=[row("Age 18-75", "62", "met")],
@@ -281,7 +297,7 @@ V_UNKNOWN_VERDICT = verdict(
 
 ALL_VERDICTS = [V_NOT_ELIGIBLE, V_ELIGIBLE_WITH_UNDOCUMENTED,
                 V_ELIGIBLE_NO_UNDOCUMENTED, V_NOT_EVALUABLE,
-                V_CORRECTED_REJECTION,
+                V_CORRECTED_REJECTION, V_REMAP_NO_SURVIVOR,
                 V_REJECTION_WITHOUT_EVIDENCE, V_UNKNOWN_VERDICT]
 
 
@@ -293,12 +309,13 @@ print("\n" + "=" * 78)
 print("SECTION 1 -- compose_assessment over synthetic verdicts")
 print("=" * 78)
 
-check("the case vocabulary is closed and its six members are distinct",
-      (len(ASSESSMENT_CASES), len(set(ASSESSMENT_CASES))), (6, 6))
+check("the case vocabulary is closed and its seven members are distinct",
+      (len(ASSESSMENT_CASES), len(set(ASSESSMENT_CASES))), (7, 7))
 check("...and every member is one this file drives",
       sorted(ASSESSMENT_CASES),
       sorted({ASSESSMENT_COMPOSED_ELIGIBLE, ASSESSMENT_COMPOSED_NOT_ELIGIBLE,
               ASSESSMENT_COMPOSED_UNSUPPORTED_REJECTION,
+              ASSESSMENT_COMPOSED_REMAP_NO_SURVIVOR,
               ASSESSMENT_KEPT_NOT_EVALUABLE, ASSESSMENT_KEPT_NO_DISQUALIFIER,
               ASSESSMENT_KEPT_UNKNOWN_VERDICT}))
 check("...and ASSESSMENT_COMPOSED_CASES is the composed subset of it, so the "
@@ -306,7 +323,8 @@ check("...and ASSESSMENT_COMPOSED_CASES is the composed subset of it, so the "
       (sorted(_evaluation_module.ASSESSMENT_COMPOSED_CASES),
        set(_evaluation_module.ASSESSMENT_COMPOSED_CASES) <= set(ASSESSMENT_CASES)),
       (sorted({ASSESSMENT_COMPOSED_ELIGIBLE, ASSESSMENT_COMPOSED_NOT_ELIGIBLE,
-               ASSESSMENT_COMPOSED_UNSUPPORTED_REJECTION}), True))
+               ASSESSMENT_COMPOSED_UNSUPPORTED_REJECTION,
+               ASSESSMENT_COMPOSED_REMAP_NO_SURVIVOR}), True))
 
 check("1a  a rejection composes the not_eligible opening",
       case_of(V_NOT_ELIGIBLE), ASSESSMENT_COMPOSED_NOT_ELIGIBLE)
@@ -408,6 +426,49 @@ check("1d' a not_evaluable carrying a DIFFERENT reason keeps its draft",
       (ASSESSMENT_KEPT_NOT_EVALUABLE, "Not evaluable: x"))
 check("1d' ...and one carrying no reason key at all keeps its draft",
       case_of(V_NOT_EVALUABLE), ASSESSMENT_KEPT_NOT_EVALUABLE)
+
+# THE SECOND CORRECTED REJECTION. Same construction as 1d', different marker,
+# different sentence -- and the difference is the point rather than a detail:
+# this population's disqualifying evidence may have been written in a label the
+# arm's vocabulary does not contain, so the text may not say the model cited no
+# disqualifying criterion. That sentence belongs to 1d' alone.
+check("1d\" a remap-corrected rejection composes its OWN fixed text",
+      compose(V_REMAP_NO_SURVIVOR), ASSESSMENT_REMAP_NO_SURVIVOR_TEXT)
+check("1d\" ...reporting its own composed case, not the sibling's and not an "
+      "anomaly",
+      (case_of(V_REMAP_NO_SURVIVOR),
+       case_of(V_REMAP_NO_SURVIVOR)
+       in _evaluation_module.ASSESSMENT_COMPOSED_CASES,
+       case_of(V_REMAP_NO_SURVIVOR)
+       in _evaluation_module._ASSESSMENT_ANOMALY_CASES),
+      (ASSESSMENT_COMPOSED_REMAP_NO_SURVIVOR, True, False))
+check("1d\" ...opening with the mandated not-evaluable opening",
+      (ASSESSMENT_REMAP_NO_SURVIVOR_TEXT.startswith(
+          ASSESSMENT_NOT_EVALUABLE_OPENING + " "),
+       ASSESSMENT_REMAP_NO_SURVIVOR_TEXT.startswith(
+           ASSESSMENT_NOT_ELIGIBLE_OPENING)),
+      (True, False))
+check("1d\" ...and it is WEAKER than the sibling's: it says what the model and "
+      "the node did, and does NOT say the model cited no disqualifier",
+      ("rejected this trial" in ASSESSMENT_REMAP_NO_SURVIVOR_TEXT,
+       "corrected to not evaluable" in ASSESSMENT_REMAP_NO_SURVIVOR_TEXT,
+       "no disqualifying criterion" in ASSESSMENT_REMAP_NO_SURVIVOR_TEXT),
+      (True, True, False))
+check("1d\" non-degeneracy: the sibling text DOES make that claim, so the "
+      "check above discriminates rather than passing on empty text",
+      "no disqualifying criterion" in ASSESSMENT_UNSUPPORTED_REJECTION_TEXT,
+      True)
+check("1d\" the two markers select different texts on the SAME verdict shape",
+      compose(dict(V_REMAP_NO_SURVIVOR,
+                   not_evaluable_reason=UNEVALUABLE_REJECTION_UNSUPPORTED))
+      == compose(V_REMAP_NO_SURVIVOR), False)
+check("1d\" ...and the marker alone does not compose it: the verdict must "
+      "also be not_evaluable",
+      case_of(dict(V_REMAP_NO_SURVIVOR, eligible=TRIAL_VERDICT_ELIGIBLE)),
+      ASSESSMENT_COMPOSED_ELIGIBLE)
+check("1d\" compose_assessment is still PURE: the draft it was handed is "
+      "untouched", V_REMAP_NO_SURVIVOR["assessment"],
+      "Known disqualifier: a label nobody can read.")
 
 # EMPTY ARRAYS, on every verdict. The not_evaluable case is the contract; the
 # other two are the degenerate inputs a renderer must not crash on.
@@ -613,12 +674,12 @@ _COMPOSED = [(v, compose(v)) for v in ALL_VERDICTS]
 _COMPOSED_ONLY = [(v, t) for v, t in _COMPOSED
                   if case_of(v) in _evaluation_module.ASSESSMENT_COMPOSED_CASES]
 
-check("3a  non-degeneracy: the battery really does compose text for both "
-      "composed cases, and keeps a draft for the other three",
+check("3a  non-degeneracy: the battery really does compose text for every "
+      "composed case, and keeps a draft for the other three",
       sorted({case_of(v) for v in ALL_VERDICTS}), sorted(set(ASSESSMENT_CASES)))
-check("3a  ...and four of the seven are composed, so the invariants below are "
+check("3a  ...and five of the eight are composed, so the invariants below are "
       "not passing over an empty list",
-      len(_COMPOSED_ONLY), 4)
+      len(_COMPOSED_ONLY), 5)
 
 check("3b  no composed assessment names an unsupported undocumented criterion",
       [(v["eligible"], undocumented_violations(t, v))
@@ -735,6 +796,7 @@ check("4b  the renderer's own scaffolding contributes no digits",
       numeric_tokens(ASSESSMENT_ELIGIBLE_OPENING
                      + ASSESSMENT_NOT_ELIGIBLE_OPENING
                      + ASSESSMENT_UNSUPPORTED_REJECTION_TEXT
+                     + ASSESSMENT_REMAP_NO_SURVIVOR_TEXT
                      + ASSESSMENT_UNDOCUMENTED_OPENING
                      + 'Inclusion criterion "" not met; patient record: "".'
                      + 'Exclusion criterion "" violated; patient record: "".'),

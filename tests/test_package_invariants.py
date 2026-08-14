@@ -1161,6 +1161,35 @@ _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    # live counter the same file asserts is at zero.
                    "tests/test_agent_unsupported_rejection.py",
                    # Plants into an in-memory copy of agent/evaluation.py for
+                   # the SIBLING arm of that same fall-through: a rejection
+                   # whose disqualifying labels were out of their arm's
+                   # vocabulary, corrected under UNEVALUABLE_REMAP_NO_SURVIVOR
+                   # and -- since this pass -- marked on the entry so the
+                   # composition writes a sentence of its own instead of
+                   # keeping a draft that reads "Known disqualifier:" beside a
+                   # verdict of not_evaluable.
+                   #
+                   # `git show` can supply none of its six controls. The marker
+                   # write, the composition case and the text are all AT HEAD,
+                   # so a blob would compare the changed module with itself --
+                   # the defect tests/test_storage_query_layer.py had to learn
+                   # -- and four of the six move ONE decision while leaving the
+                   # rest correct: the marker write deleted, the case bypassed,
+                   # the case dropped from ASSESSMENT_COMPOSED_CASES (which
+                   # changes only the arithmetic, and it still adds up), and
+                   # the branch pointed at the SIBLING's marker so it composes
+                   # the stronger sentence over a population that cannot
+                   # support it. None of those is a state any commit has had.
+                   #
+                   # The sixth is the sharpest and it is not a defect this pass
+                   # introduced: bypassing the branch ENTIRELY does not restore
+                   # the fabricated rejection, it hands the entry to the arm
+                   # below, which corrects it under the sibling's reason and
+                   # stores the sibling's claim. The branch's position above the
+                   # fall-through is the only thing preventing that, and no blob
+                   # expresses "this branch absent, everything else at HEAD".
+                   "tests/test_agent_remap_no_survivor.py",
+                   # Plants into an in-memory copy of agent/evaluation.py for
                    # the Stage 5 temporal-conflict detector -- the RULE 4 flag
                    # that is COUNTED and never applied. `git show` can supply
                    # none of its seven controls. The detector is AT HEAD and has
