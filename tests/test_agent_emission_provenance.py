@@ -602,24 +602,122 @@ check("2g  the truncated call is in the ledger and owns no entry",
 # before anything is sent, every call succeeds, and nothing is retried. Both
 # have to number correctly, and they reach `calls_made` by different code paths.
 #
-# The budget is lowered on the module under test so the packer divides a
-# six-trial batch, and the assertions are DERIVED from what the packer actually
-# did rather than pinned to a chunk shape -- a hardcoded split would silently
-# stop testing anything the first time the prompt text changed.
-_PACK_STUB = ChunkAwareStub(order="reversed")
+# THE PACKER DIVIDES A BATCH IN TWO DIFFERENT CASES AND THEY MEAN DIFFERENT
+# THINGS, so a multi-chunk scenario has to say which one it is standing in.
+# Under the CONFIGURED budget the division is the ordinary outcome the constant
+# was tuned for. When that budget would need more chunks than
+# MATCHING_MAX_INPUT_PACKED_CHUNKS allows, the packer raises the budget
+# uniformly and divides again -- `cap_relaxed_budget` records it, and the node
+# logs that run as `degraded=True`. This scenario is the ORDINARY one, matching
+# the paragraph above: packing as the normal way a run makes several calls.
+#
+# IT USED TO BE THE OTHER ONE, and nothing here said so. The budget was typed as
+# 4800 while the fixed prefix alone measures 5077 tokens for this patient, so
+# every trial exceeded the budget on its own, the greedy pass produced six
+# chunks against a cap of five, and the three chunks these assertions run over
+# were the RELAXED budget's division. The scenario passed, and it passed for a
+# reason its comments did not name: a regression confined to the plain-budget
+# path could not have failed it.
+#
+# THE BUDGET IS DERIVED, NOT TYPED, which is what stops that recurring. A typed
+# budget is a claim about the prompt text -- `fixed_tokens` is the system
+# message plus this patient's record -- so it goes stale the first time the
+# prompt changes, silently, exactly as it did here. A calibration run at no
+# effective limit reports what one chunk costs; the budget for the real run is
+# then computed to hold TWO trials, which divides six into three under the cap
+# with nothing relaxed. Same three chunks the scenario has always run over; the
+# difference is that they now come from the case it claims to be testing.
+_PACK_IDS = tuple("NCT0000000%d" % i for i in range(1, 7))
 _saved_budget = _evaluation_module.MATCHING_INPUT_TOKEN_BUDGET
-try:
-    _evaluation_module.MATCHING_INPUT_TOKEN_BUDGET = 4800
-    _r2b, _ = run_stage5(_PACK_STUB,
-                         nct_ids=tuple("NCT0000000%d" % i for i in range(1, 7)))
-finally:
-    _evaluation_module.MATCHING_INPUT_TOKEN_BUDGET = _saved_budget
+
+# Not "a big number": large enough that the packer cannot divide anything, so
+# the one chunk it reports is the whole batch's cost. The one-chunk result is
+# asserted below rather than assumed, so a prompt that outgrew even this would
+# fail the calibration instead of miscalibrating the run underneath it.
+_NO_LIMIT_BUDGET = 10 ** 9
+
+
+def packing_run(budget, stub, node=None, module=None):
+    """One Stage 5 run at `budget`, with the module constant restored after.
+
+    `module` is the module the constant lives on, which is the SHIPPED one for
+    every call here except a negative control probing a planted copy -- a copy
+    carries its own constant, and setting it on the shipped module would leave
+    the copy running at the default.
+    """
+    module = module or _evaluation_module
+    saved = module.MATCHING_INPUT_TOKEN_BUDGET
+    module.MATCHING_INPUT_TOKEN_BUDGET = budget
+    try:
+        return run_stage5(stub, nct_ids=_PACK_IDS, node=node)[0]
+    finally:
+        module.MATCHING_INPUT_TOKEN_BUDGET = saved
+
+
+def packing_of(result):
+    """The run's published packing provenance, or an empty dict."""
+    return result.get("llm_classifier_packing") or {}
+
+
+def chunk_trials(result):
+    """The per-chunk trial counts the packer reported."""
+    return [c["trials"] for c in packing_of(result).get("chunks", [])]
+
+
+# --- calibration ------------------------------------------------------------
+_cal = packing_of(packing_run(_NO_LIMIT_BUDGET, ChunkAwareStub()))
+check("2h0 CALIBRATION: at no effective limit the batch is ONE chunk, so the "
+      "cost below is the whole batch's and not a fragment of it",
+      len(_cal.get("chunks", [])), 1)
+_FIXED = _cal.get("fixed_tokens", 0)
+_BATCH = _cal["chunks"][0]["tokens_estimated"] if _cal.get("chunks") else 0
+_PER_TRIAL = (_BATCH - _FIXED) // len(_PACK_IDS) if _cal.get("chunks") else 0
+check("2h0 CALIBRATION: the six trials cost the same, so a budget computed "
+      "from the mean divides them evenly rather than approximately",
+      (_BATCH - _FIXED) % len(_PACK_IDS), 0)
+check("2h0 CALIBRATION: and a trial costs something, so the budget below is "
+      "not just the fixed prefix under another name", _PER_TRIAL > 0, True)
+
+# Room for the fixed prefix and TWO trials, and no more. Both bounds are the
+# case under test rather than arithmetic: at or above `_FIXED + _PER_TRIAL` no
+# single trial is unpackable, so nothing ships over budget; below `_BATCH` the
+# batch cannot fit in one chunk, so there is something to divide.
+_PACK_BUDGET = _FIXED + 2 * _PER_TRIAL
+check("2h0 CALIBRATION: the derived budget holds at least one trial beside "
+      "the fixed prefix, so no chunk can be over budget",
+      _PACK_BUDGET >= _FIXED + _PER_TRIAL, True)
+check("2h0 CALIBRATION: ...and cannot hold the whole batch, so there is "
+      "genuinely something to divide", _PACK_BUDGET < _BATCH, True)
+
+_PACK_STUB = ChunkAwareStub(order="reversed")
+_r2b = packing_run(_PACK_BUDGET, _PACK_STUB)
 
 _pack_ledger = ledger_calls(_r2b)
 check("2h  NON-DEGENERACY: packing divided the batch into several calls",
       len(_pack_ledger) > 1, True)
 check("2i  NON-DEGENERACY: and it did so WITHOUT a truncation split",
       _r2b.get("llm_classifier_truncation_splits"), 0)
+
+# WHICH CASE THIS IS, asserted rather than described. Without this the scenario
+# cannot tell the two divisions apart, and it spent its whole life standing in
+# the wrong one.
+check("2i' THE CASE UNDER TEST: the division came from the CONFIGURED budget "
+      "-- the cap was never relaxed",
+      packing_of(_r2b).get("cap_relaxed_budget"), False)
+check("2i' ...so the budget the packer divided by is the one it was given, "
+      "unraised",
+      (packing_of(_r2b).get("budget_tokens"),
+       packing_of(_r2b).get("budget_tokens_configured")),
+      (_PACK_BUDGET, _PACK_BUDGET))
+check("2i' ...and no chunk shipped over that budget, which is the other way a "
+      "division can mean something else",
+      packing_of(_r2b).get("over_budget_chunk"), False)
+check("2i' the division is two trials per chunk, which is what the derived "
+      "budget was built to produce",
+      chunk_trials(_r2b), [2] * (len(_PACK_IDS) // 2))
+check("2i' ...and it stayed inside the cap, so no relaxation was even "
+      "reachable",
+      len(chunk_trials(_r2b)) <= packing_of(_r2b).get("max_chunks", 0), True)
 check("2j  the ledger is 1..N in order", _pack_ledger,
       list(range(1, len(_pack_ledger) + 1)))
 check("2k  every trial came back", len(_r2b.get("evaluations") or []), 6)
@@ -645,6 +743,88 @@ check("2n  emission order is the order the model WROTE, not the order sent",
       {c: _PACK_STUB.answered[c - 1] for c in _by_call_2b})
 check("2o  NON-DEGENERACY: written and sent order really do differ",
       _PACK_STUB.answered != _PACK_STUB.sent, True)
+
+
+# --- 2p  THE RELAXED BUDGET, which is the case 2b used to be standing in -----
+#
+# The other division, and it was uncovered for THIS behaviour once 2b stopped
+# standing in it by accident. tests/test_agent_stage5_input_packing.py already
+# pins the relaxation itself -- what nothing covered is whether the emission
+# stamps are still right on a run the node reports as degraded, which is the one
+# kind of multi-chunk run a reader is most likely to be reading provenance off.
+#
+# Minimal on purpose: same batch, same stub class, same invariants, one budget.
+# Below the fixed prefix, so every trial exceeds the budget alone, the greedy
+# pass wants one chunk each -- six against a cap of five -- and the packer
+# raises the budget instead of shedding a trial. That is the setup 2b carried
+# before this pass, derived here rather than typed.
+#
+# THE PRECONDITION IS ASSERTED, because it is the one this scenario cannot see
+# failing. A budget below the fixed prefix makes the greedy pass want one chunk
+# per trial; that only EXCEEDS the cap while the batch is bigger than the cap.
+# Raise MATCHING_MAX_INPUT_PACKED_CHUNKS past six and nothing relaxes -- 2p
+# would quietly become a second copy of 2b rather than the other case.
+check("2p  PRECONDITION: the batch is larger than the chunk cap, which is what "
+      "makes a relaxation reachable at all",
+      len(_PACK_IDS) > _cal.get("max_chunks", 0), True)
+_RELAX_BUDGET = _FIXED - _PER_TRIAL
+_RELAX_STUB = ChunkAwareStub(order="reversed")
+_r2p = packing_run(_RELAX_BUDGET, _RELAX_STUB)
+
+check("2p  THE OTHER CASE: the configured budget could not fit the batch in "
+      "the cap, so it was raised",
+      packing_of(_r2p).get("cap_relaxed_budget"), True)
+check("2p  ...and the budget divided by is HIGHER than the one configured, "
+      "which is what a relaxation is",
+      (packing_of(_r2p).get("budget_tokens", 0)
+       > packing_of(_r2p).get("budget_tokens_configured", 0)), True)
+check("2p  NON-DEGENERACY: this really is a different setup from 2b, not the "
+      "same budget under another name", _RELAX_BUDGET == _PACK_BUDGET, False)
+check("2p  every trial still came back", len(_r2p.get("evaluations") or []), 6)
+check("2p  ...with no truncation split, so the several calls came from "
+      "packing", _r2p.get("llm_classifier_truncation_splits"), 0)
+
+_by_call_2p = {}
+for _e in _r2p["evaluations"]:
+    _by_call_2p.setdefault(_e.get("call_index"), []).append(_e)
+check("2p  the ledger is 1..N and every call_index is one of its ordinals",
+      (ledger_calls(_r2p), sorted(_by_call_2p)),
+      (list(range(1, len(ledger_calls(_r2p)) + 1)),
+       ledger_calls(_r2p)))
+check("2p  each call's emission indices are 0..k-1 with no gap",
+      {c: sorted(e["emission_index"] for e in es)
+       for c, es in _by_call_2p.items()},
+      {c: list(range(len(_RELAX_STUB.answered[c - 1]))) for c in _by_call_2p})
+check("2p  emission order is the order the model WROTE, on a degraded run too",
+      {c: [e["nct_id"] for e in sorted(es, key=lambda x: x["emission_index"])]
+       for c, es in _by_call_2p.items()},
+      {c: _RELAX_STUB.answered[c - 1] for c in _by_call_2p})
+check("2p  NON-DEGENERACY: written and sent order really do differ here too",
+      _RELAX_STUB.answered != _RELAX_STUB.sent, True)
+
+
+# --- 2q  THE CONTROL: 2i' catches a flip of the packing path -----------------
+#
+# THE FLAG IS ASSERTED, SO IT HAS TO BE SHOWN TO DISCRIMINATE. 2p is not that
+# demonstration: it changes the BUDGET, so a check that had quietly stopped
+# reading the flag and started reading the chunk shape would still look right.
+# This plant changes the path and NOTHING ELSE -- the relaxation branch is made
+# unconditional in an in-memory copy, and because `_minimum_budget_for` returns
+# the configured budget unchanged when it already fits inside the cap, the
+# copy divides the batch into exactly the same three chunks of two. Only the
+# flag moves. An assertion that passes on the planted arm is an assertion
+# reading the division rather than the case.
+control(
+    "2q  CONTROL: the relaxation branch made unconditional -> 2i' fails while "
+    "the chunk shape is untouched",
+    [("    if len(index_chunks) > max_chunks:\n",
+      "    if True:  # PLANTED: the relaxation branch, made unconditional\n")],
+    lambda m: (lambda r: (packing_of(r).get("cap_relaxed_budget"),
+                          chunk_trials(r)))(
+        packing_run(_PACK_BUDGET, ChunkAwareStub(order="reversed"),
+                    node=m.node_llm_classifier_evaluation, module=m)),
+    (True, [2] * (len(_PACK_IDS) // 2)),
+)
 
 
 # ===========================================================================
@@ -1650,10 +1830,10 @@ shutil.rmtree(_SCRATCH, ignore_errors=True)
 check("12d  the scratch database tree was removed",
       os.path.exists(_SCRATCH), False)
 
-check("12c  non-degeneracy: fourteen in-memory copies were built "
-      "(the pre-change arm of section 10, one unplanted copy, and twelve "
+check("12c  non-degeneracy: fifteen in-memory copies were built "
+      "(the pre-change arm of section 10, one unplanted copy, and thirteen "
       "controls across the two files)",
-      _CONTROL_SEQ[0], 14)
+      _CONTROL_SEQ[0], 15)
 
 
 # ===========================================================================
