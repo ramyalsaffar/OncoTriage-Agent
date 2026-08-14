@@ -639,12 +639,19 @@ control("c3  un-neutralized fence attributes let the data spell a fence [4d]",
 #      a body with no marker in it. A leak measured through the boundary it
 #      just defeated reads as no leak. The probe is the whole-render marker
 #      count, which nothing inside a block can make agree.
+#
+#      ITS NEEDLE MOVED WHEN THE ESCAPED-ENTITY DECODE WAS ADDED, and the plant
+#      machinery reported that honestly -- "plant-failed", not a pass -- which
+#      is why this is a retarget rather than a rediscovery. The criteria bodies
+#      now reach _neutralize_fence_markers from _decode_escaped_entities rather
+#      than straight from the trial dict, so the line this plants into is the
+#      neutralize call alone. What the control asserts is unchanged: with the
+#      body neutralization gone, TRIAL_SPOOF's own close marker survives into
+#      the render.
 control("c4  un-neutralized criteria let a trial close its own block [4c]",
         _EVAL_SRC,
-        [('        inclusion, hits_inc = _neutralize_fence_markers(\n'
-          '            str(trial["eligibility"]["inclusion_criteria"]))',
-          '        inclusion, hits_inc = str(\n'
-          '            trial["eligibility"]["inclusion_criteria"]), 0')],
+        [('        inclusion, hits_inc = _neutralize_fence_markers(inclusion)',
+          '        hits_inc = 0')],
         lambda m: _probe_render(m, [TRIAL_SPOOF], "marker_leaks"), True)
 
 # 5 -- THE STRONGEST ONE. The obvious implementation, str.replace on the

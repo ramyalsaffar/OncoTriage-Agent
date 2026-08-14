@@ -32,6 +32,7 @@ hands back an UNWRAPPED client -- capture would issue a real call and record
 nothing, replay would go to the network instead of serving its recording.
 """
 
+import html
 import json
 import re
 import time
@@ -87,6 +88,94 @@ log = get_logger(__name__)
 # the three-character substring. It is compiled once here rather than inside
 # the function because _build_trials_text runs once per trial per render.
 _FENCE_MARKER_RUN_RE = re.compile(r"<{3,}|>{3,}")
+
+
+# ONE ESCAPE CHAIN AS THE REGISTRY ACTUALLY WRITES ONE, matched whole: an
+# optional markdown backslash, then any number of "&amp;" wrappers, then one
+# SEMICOLON-TERMINATED named or numeric character reference. Compiled here
+# beside _FENCE_MARKER_RUN_RE and for the same reason -- _build_trials_text
+# runs once per trial per render.
+#
+# Measured over every trial in the 2026-08-10 corpus, and the measurement is
+# what fixes each choice below (09- Testing/Evaluation Runs/
+# criteria_quality_census_20260814/): 579 occurrences across 197 trials in the
+# two fields this stage renders, 140 of those trials putting one where a
+# numeric COMPARATOR belongs. Stage 5 was shown "INR \&lt; 1.2 and platelet
+# counts \&gt; 80,000/mm3" (NCT06923098) where the sponsor wrote "INR < 1.2 and
+# platelet counts > 80,000/mm3" -- a threshold whose direction is spelled as an
+# escaped entity. Nothing between the scrape and the prompt decoded it.
+#
+# THE SEMICOLON IS REQUIRED, AND THAT IS THE SAFETY PROPERTY RATHER THAN
+# PEDANTRY. html.unescape implements the HTML5 rule that a named reference need
+# not be terminated, so applied to a whole criteria string it rewrites
+# "tumor &lt 2cm" to "tumor < 2cm", "grade &notin 3" to "grade ¬in 3" and
+# "a &para b" to "a ¶ b" -- all three measured against the installed
+# interpreter. Criteria text is prose and carries bare ampersands, so the
+# whole-string form of this fix corrupts legitimate text. No string outside a
+# match of this pattern is ever handed to html.unescape.
+#
+# THE BACKSLASH IS OPTIONAL AND THE CORPUS DOES NOT NEED IT TO BE. All 579
+# measured occurrences carry exactly one backslash -- 579 of 579, and there is
+# not one bare entity in either rendered field -- so making it optional is a
+# provable no-op here rather than a guess: re-rendering all 14,324 trials with
+# the backslash required and with it optional gives byte-identical output. It
+# is optional so that the fix survives a future scrape that stops
+# markdown-escaping, which is the only thing standing between this corpus and
+# a bare "&lt;".
+_ESCAPED_ENTITY_CHAIN_RE = re.compile(
+    r"\\?&(?:amp;)*"
+    r"(?:[A-Za-z][A-Za-z0-9]{1,31}|#[0-9]{1,7}|#[Xx][0-9A-Fa-f]{1,6});")
+
+# Decode passes allowed WITHIN ONE MATCHED CHAIN. Measured passes to a fixed
+# point, over the same 579 occurrences: 1 (468), 2 (73), 3 (32), 4 (4) and
+# 11 (2) -- NCT02945579 stores
+# "\&amp;amp;amp;amp;amp;amp;amp;amp;amp;amp;lt;" for a single "<". A cap of
+# three, which the measured depth histogram was not yet available to rule out,
+# would leave residue on six of them.
+#
+# Termination does not rest on this number: every pass that changes anything
+# strictly shortens the string, since "&amp;" is five characters and "&" is
+# one, so a chain of length n reaches a fixed point in at most n/4 passes and
+# the loop cannot spin. The cap is a bound on pathological input, and 16 clears
+# the measured maximum by five.
+_ENTITY_DECODE_MAX_PASSES: int = 16
+
+# A chain this function REFUSED to substitute, keyed by reason and raw chain.
+# The text is then left EXACTLY as scraped: a partially decoded or damaged
+# chain is a byte string no sponsor wrote, and it reads to everything
+# downstream as though the decode had succeeded. Two reasons, both measured at
+# zero on this corpus and both reachable by a future one:
+#
+#   pass_cap          -- still not at a fixed point at _ENTITY_DECODE_MAX_PASSES.
+#   replacement_char  -- the reference names no character that belongs in
+#                        criteria prose. html.unescape follows the HTML5 rule
+#                        for an out-of-range, surrogate or zero code point and
+#                        returns U+FFFD, so "\&#0;", "\&#x0;", "\&#55296;" and
+#                        "\&#9999999;" all decode to the replacement character
+#                        -- all four measured against the installed
+#                        interpreter. Substituting would have this fix INJECT
+#                        the census's own replacement_char defect into text
+#                        that did not have one. A C0 control reference is
+#                        refused by the same rule: "\&#8;" decodes to the empty
+#                        string, and silently deleting a span of scraped text
+#                        is the worse half of the same failure.
+#
+# ONLY the refusals are counted, on M_CATEGORY_UNREADABLE's footing. A
+# successful decode is not a degradation -- it is this function working -- and
+# it is already reported per render by trial_escaped_entity_decoded, so
+# counting it here as well would put one entry per affected trial per render
+# into a counter whose whole purpose is to make the rare failure visible.
+ESCAPED_ENTITY_DECODE_UNRESOLVED: Dict[str, int] = Counter()
+
+# The two reasons above as named constants, because they are counter keys a
+# reader will filter on and a literal typed twice is a literal that drifts.
+ENTITY_REFUSED_PASS_CAP: str = "pass_cap"
+ENTITY_REFUSED_REPLACEMENT_CHAR: str = "replacement_char"
+
+# Matching _M_KEY_MAX_LEN's reasoning: long enough to see the shape of a real
+# chain (the deepest measured is 45 characters), short enough that a
+# pathological field cannot grow the key without bound.
+_ENTITY_KEY_MAX_LEN: int = 80
 
 
 #------------------------------------------------------------------------------
@@ -830,6 +919,122 @@ def _split_in_half(trials: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
     return trials[:midpoint], trials[midpoint:]
 
 
+def _decode_escaped_entities(text: str) -> Tuple[str, int, int]:
+    """Restore the characters a trial's criteria text spells as HTML entities.
+
+    THE SPONSOR'S WORDING IS RESTORED, NEVER REWRITTEN. This undoes an encoding
+    the text picked up somewhere between the sponsor's submission and this
+    repository's scrape; it does not paraphrase, normalise, reflow or repair
+    anything. The stored corpus and the Qdrant payload are untouched -- the
+    decode happens at render, so re-indexing is not a precondition for the
+    judge to read a threshold correctly and every future corpus gets it too.
+
+    WHAT IS ACTUALLY THERE, measured rather than described. The registry stores
+    "\\&lt;" where the author typed "<": the character was HTML-escaped to
+    "&lt;" and the ampersand of that escape was then markdown-escaped to "\\&".
+    Some rows went round that loop several times, so "\\&amp;amp;gt;" and, once,
+    "\\&amp;amp;amp;amp;amp;amp;amp;amp;amp;amp;lt;" also occur. See
+    _ESCAPED_ENTITY_CHAIN_RE for the counts and _ENTITY_DECODE_MAX_PASSES for
+    the depth histogram.
+
+    THE FIXED POINT IS TAKEN INSIDE ONE MATCH, NOT OVER THE WHOLE STRING, and
+    that is a correctness property rather than an optimisation. Re-scanning the
+    substituted text would let a "&" this function just produced bind to
+    whatever literal characters happen to follow it and be read as a second
+    reference on the next pass -- so "\\&amp;notin 3;" would decode to
+    "&notin 3;" and then, on a whole-string re-scan, to "¬in 3;", inventing a
+    character the sponsor never wrote out of two unrelated fragments. Each
+    matched chain is a closed, self-delimiting string; iterating within it
+    cannot reach a neighbouring character, and the substitution's output is
+    never re-examined.
+
+    A MATCH THAT IS NOT A REFERENCE IS LEFT EXACTLY AS IT WAS, backslash
+    included. The pattern recognises the SHAPE of a character reference, and
+    "\\&AB;" has that shape without being one; html.unescape returns it
+    unchanged, this function sees that nothing decoded and returns the original
+    match rather than a version with the backslash quietly removed. That is a
+    determinate answer -- there was nothing to decode -- so it is not counted as
+    a degradation, on the footing M_CATEGORY_UNREADABLE argues for cM0.
+
+    ONE ESCAPE IS REMOVED AND ONLY ONE: the backslash that was escaping the
+    ampersand of the reference this function decoded. The corpus's other 65,082
+    markdown escapes -- "\\>", "\\*", "\\[" and the rest, across 69% of trials --
+    are a separate finding with a separate blast radius and are not touched
+    here. Nothing in this function can see or alter a backslash that is not
+    immediately followed by a character reference.
+
+    Args:
+        text: the third-party criteria string about to be rendered.
+
+    Returns:
+        ``(decoded_text, chains_decoded, chains_refused)``. The first count is
+        of chains whose decode changed the text; the second is of chains left
+        exactly as scraped because substituting would have made things worse --
+        the cap was reached, or the reference names no character that belongs
+        in criteria prose. They are separate because a caller that reported
+        them as one number could not tell a trial this function fixed from a
+        trial it gave up on, which are opposite findings. The REASON for each
+        refusal is in ESCAPED_ENTITY_DECODE_UNRESOLVED's key rather than in
+        the return value, on AGE_PARSE_FAILURES' footing.
+    """
+    if not text:
+        return text, 0, 0
+
+    decoded_count = [0]
+    unresolved_count = [0]
+
+    def _refuse(reason: str, raw: str) -> None:
+        """Record a chain left as scraped, under the reason it was left."""
+        ESCAPED_ENTITY_DECODE_UNRESOLVED[
+            reason + ":" + raw[:_ENTITY_KEY_MAX_LEN]] += 1
+
+    def _decode(match: "re.Match") -> str:
+        raw = match.group(0)
+        body = raw[1:] if raw.startswith("\\") else raw
+
+        current = body
+        at_fixed_point = False
+        for _ in range(_ENTITY_DECODE_MAX_PASSES):
+            following = html.unescape(current)
+            if following == current:
+                at_fixed_point = True
+                break
+            current = following
+
+        if not at_fixed_point:
+            # THE CAP COUNTS DECODING PASSES, NOT LOOP ITERATIONS, and the
+            # difference is a real off-by-one rather than pedantry: a chain
+            # whose depth is exactly the cap has been decoded in full, and the
+            # loop above exits without ever having seen a pass that changed
+            # nothing. Reporting that as unresolved would leave the last
+            # decodable depth permanently unreachable, making a cap of N behave
+            # as N-1. The confirming call is made only here, so the common path
+            # pays nothing for it.
+            at_fixed_point = html.unescape(current) == current
+
+        if not at_fixed_point:
+            _refuse(ENTITY_REFUSED_PASS_CAP, raw)
+            unresolved_count[0] += 1
+            return raw
+
+        if current == body:
+            return raw
+
+        # THE DECODE IS REFUSED WHEN IT WOULD DAMAGE RATHER THAN RESTORE. See
+        # ESCAPED_ENTITY_DECODE_UNRESOLVED for the four measured references
+        # that reach the first branch and the one that reaches the second.
+        if "�" in current or not current:
+            _refuse(ENTITY_REFUSED_REPLACEMENT_CHAR, raw)
+            unresolved_count[0] += 1
+            return raw
+
+        decoded_count[0] += 1
+        return current
+
+    return (_ESCAPED_ENTITY_CHAIN_RE.sub(_decode, text),
+            decoded_count[0], unresolved_count[0])
+
+
 def _neutralize_fence_markers(text: str) -> Tuple[str, int]:
     """Spell out any fence marker inside third-party text so it cannot BE one.
 
@@ -881,9 +1086,19 @@ def _build_trials_text(trials: List[Dict]) -> str:
     indistinguishable from an instruction. The block is::
 
         <<<TRIAL_DATA nct_id=NCT01234567 phase=PHASE2>>>
-        ...inclusion criteria, exactly as scraped...
-        ...exclusion criteria, exactly as scraped...
+        ...inclusion criteria, as scraped but for the two rewrites below...
+        ...exclusion criteria, as scraped but for the two rewrites below...
         <<<END_TRIAL_DATA nct_id=NCT01234567>>>
+
+    THE CRITERIA BODIES ARE NO LONGER SENT BYTE-FOR-BYTE AS SCRAPED, and the
+    two rewrites that touch them are the only two: _decode_escaped_entities
+    restores the characters the registry stored as escaped HTML entities, and
+    _neutralize_fence_markers spells out any bracket run. In that order, for
+    the reason argued at the call site. Neither paraphrases: the first returns
+    a character the sponsor wrote and the escape was standing in for, the
+    second inserts spaces into a run that no real trial in the corpus contains.
+    Everything else -- wording, ordering, whitespace, the registry's own
+    markdown escaping of "\\>" and "\\*" -- is untouched.
 
     THE nct_id RIDES IN BOTH FENCE LINES. In the open line because the header
     that used to carry it is gone and Section 5 tells the model to copy the id
@@ -934,10 +1149,55 @@ def _build_trials_text(trials: List[Dict]) -> str:
         # a body change this pass does not make.
         nct_id, hits_id = _neutralize_fence_markers(str(trial["nct_id"]))
         phase, hits_phase = _neutralize_fence_markers(str(trial["phase"]))
-        inclusion, hits_inc = _neutralize_fence_markers(
+
+        # DECODE BEFORE NEUTRALIZE, AND THE ORDER IS THE WHOLE ARGUMENT. A
+        # decoded sequence must not be able to walk past the neutralizer: a
+        # trial storing "\&gt;\&gt;\&gt;" -- or "\&#62;" three times -- carries
+        # no bracket run while it is escaped, and decoding it produces ">>>",
+        # which is exactly what the fences are built from. Decoding after
+        # neutralization would hand the model a run this function had already
+        # declared safe. Neutralization stays last, over the decoded text, so
+        # what it inspects is the string that will actually be sent.
+        #
+        # The two fence ATTRIBUTE values above are deliberately not decoded.
+        # Zero entities were measured in either field, and not decoding them is
+        # the strictly safer half of the same argument -- an escaped bracket run
+        # in an nct_id stays escaped and can never become a fence.
+        inclusion, dec_inc, unres_inc = _decode_escaped_entities(
             str(trial["eligibility"]["inclusion_criteria"]))
-        exclusion, hits_exc = _neutralize_fence_markers(
+        exclusion, dec_exc, unres_exc = _decode_escaped_entities(
             str(trial["eligibility"]["exclusion_criteria"]))
+        inclusion, hits_inc = _neutralize_fence_markers(inclusion)
+        exclusion, hits_exc = _neutralize_fence_markers(exclusion)
+
+        decoded = dec_inc + dec_exc
+        if decoded:
+            # INFO rather than WARNING, which is where this parts company with
+            # the fence event below. A fence marker in scraped text is an
+            # anomaly worth waking someone for; an escaped entity is a routine
+            # registry artefact in 1.4% of the corpus, and a warning per render
+            # for 197 trials is noise that would train a reader to ignore the
+            # channel. It is still recorded on every render, because this is a
+            # modification of third-party text on its way to the judge and the
+            # record of what was sent has to say that it happened.
+            log.info("restored characters stored as escaped HTML entities "
+                     "in scraped trial text",
+                     stage=5, node="llm_classifier_evaluation",
+                     event="trial_escaped_entity_decoded",
+                     nct_id=nct_id, count=decoded)
+
+        unresolved = unres_inc + unres_exc
+        if unresolved:
+            # Its own event, not a field on the one above. This trial's text
+            # went out STILL ESCAPED, which is the defect rather than the fix,
+            # and a reader filtering on the decoded event must not be shown a
+            # line that says the opposite of what happened.
+            log.warning("left an escaped HTML entity as scraped: no fixed "
+                        "point within the decode pass cap",
+                        stage=5, node="llm_classifier_evaluation",
+                        event="trial_escaped_entity_unresolved",
+                        nct_id=nct_id, count=unresolved,
+                        depth=_ENTITY_DECODE_MAX_PASSES)
 
         neutralized = hits_id + hits_phase + hits_inc + hits_exc
         if neutralized:
