@@ -37,7 +37,7 @@ import json
 import re
 import time
 from collections import Counter
-from typing import Dict, List, Tuple
+from typing import Dict, FrozenSet, List, Tuple
 
 from oncotriage import config
 from oncotriage.agent import deps
@@ -176,6 +176,89 @@ ENTITY_REFUSED_REPLACEMENT_CHAR: str = "replacement_char"
 # chain (the deepest measured is 45 characters), short enough that a
 # pathological field cannot grow the key without bound.
 _ENTITY_KEY_MAX_LEN: int = 80
+
+
+# ---------------------------------------------------------------------------
+# The registry's markdown escaping
+# ---------------------------------------------------------------------------
+#
+# THE SECOND HALF OF THE SAME FINDING, and _decode_escaped_entities' docstring
+# scoped it out by name. ClinicalTrials.gov markdown-escapes the punctuation in
+# criteria text, so the judge reads "INR \> 1.2" where the sponsor wrote
+# "INR > 1.2" -- a threshold whose DIRECTION is spelled by the escaped
+# character. Measured over every trial in the 2026-08-14 corpus
+# (09- Testing/Evaluation Runs/markdown_escape_census_20260814/): 69,397
+# punctuation escapes across 10,108 trials (70.57%), of which 41,657 in 9,044
+# trials (63.14%) are a comparator.
+#
+# THE SET IS THE REGISTRY'S RULE, NOT THIS WEEK'S SAMPLE. Fifteen distinct
+# successors occur -- "# & ) * + - . < > [ ] ^ _ | ~" -- and every one of them
+# is inside CommonMark's escapable set while ZERO successors fall outside it.
+# CommonMark 0.31 section 2.4 is exactly "a backslash before ASCII punctuation
+# escapes it, a backslash before anything else is a literal backslash", which
+# is the property that makes removal provable rather than probable: the proof
+# is the rule, not the sample. Taking the whole set rather than the observed
+# fifteen is measured to be a NO-OP -- re-rendering all 28,399 render-path
+# fields both ways gives byte-identical output on every one -- and it is what
+# lets a sponsor who writes "!" at a line start be read correctly next week.
+# Same argument _ESCAPED_ENTITY_CHAIN_RE makes for its optional backslash.
+#
+# THREE CHARACTERS ARE THEN REMOVED FROM IT, and each removal is a refusal with
+# a name rather than a gap:
+#
+#   "\\"      class (c) below. The backslash is CONTENT, not markup.
+#   ";" "#"   the two characters a CHARACTER REFERENCE is built from. This
+#             decoder runs BEFORE _decode_escaped_entities, so a decoder able
+#             to supply a ";" could manufacture a chain for it out of text the
+#             sponsor wrote literally: "\\&gt\\;" is a sponsor who typed
+#             "&gt;", and stripping both escapes turns it into a reference that
+#             then decodes to ">". Measured against the installed interpreter.
+#             Cost: one occurrence of "\\#" in the whole corpus and zero of
+#             "\\;". The "&" it CAN still supply is safe, and that is a
+#             property rather than luck -- the chain regex's backslash is
+#             optional, so anything matching after "\\&" becomes "&" was
+#             already matching before.
+_MARKDOWN_ASCII_PUNCTUATION: str = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+_MARKDOWN_REFERENCE_SYNTAX_CHARS: str = "#;"
+_MARKDOWN_ESCAPE_DECODE_SET: FrozenSet[str] = frozenset(
+    _MARKDOWN_ASCII_PUNCTUATION) - frozenset(
+        _MARKDOWN_REFERENCE_SYNTAX_CHARS) - {"\\"}
+
+# A chain this decoder REFUSED to touch, keyed by reason and raw pair, on
+# ESCAPED_ENTITY_DECODE_UNRESOLVED's footing and for the same reason: the text
+# went to the judge still carrying the artefact, which is the defect rather
+# than the fix, and a reader has to be able to see it. Two reasons, both
+# reachable and both measured non-zero on this corpus:
+#
+#   escaped_backslash  -- "\\\\", CommonMark's escape for a LITERAL backslash,
+#                         and the only class in the render path where a
+#                         backslash is content. 14 occurrences in 11 trials:
+#                         the sponsor wrote "CLL\\SLL", "CRi/CRh\\^1",
+#                         "\\[200 IU/mL]". It is emitted VERBATIM rather than
+#                         collapsed to one backslash, and idempotence is why --
+#                         see _decode_markdown_escapes.
+#   reference_syntax   -- "\\#" or "\\;", refused so this decoder cannot build
+#                         a character reference for the one that runs after it.
+#                         1 occurrence ("\\# CLN1114", NCT06940518).
+#
+# A backslash before a character OUTSIDE the decode set and outside both
+# reasons -- a letter, a digit, a space, end of field -- is NOT counted. Under
+# CommonMark that is a literal backslash, so leaving it is a determinate answer
+# rather than a degradation, on the footing M_CATEGORY_UNREADABLE argues for
+# cM0 and _decode_escaped_entities argues for a match that is not a reference.
+# Measured zero in the render path, in any case: class (d) of the census is
+# empty, so every backslash in either field is an escape or the escaped member
+# of a pair.
+MARKDOWN_ESCAPE_DECODE_UNRESOLVED: Dict[str, int] = Counter()
+
+MARKDOWN_REFUSED_ESCAPED_BACKSLASH: str = "escaped_backslash"
+MARKDOWN_REFUSED_REFERENCE_SYNTAX: str = "reference_syntax"
+
+# The refusal key carries the pair and a little of what follows it, which is
+# enough to recognise the shape without letting a pathological field grow the
+# key. Shorter than _ENTITY_KEY_MAX_LEN because the subject is two characters
+# rather than a chain of up to 45.
+_MARKDOWN_KEY_MAX_LEN: int = 24
 
 
 #------------------------------------------------------------------------------
@@ -919,6 +1002,150 @@ def _split_in_half(trials: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
     return trials[:midpoint], trials[midpoint:]
 
 
+def _decode_markdown_escapes(text: str) -> Tuple[str, int, int]:
+    """Remove the backslashes ClinicalTrials.gov added to escape punctuation.
+
+    THE SPONSOR'S WORDING IS RESTORED, NEVER REWRITTEN. Like its sibling
+    _decode_escaped_entities this undoes an encoding the registry applied; it
+    does not paraphrase, reflow, normalise or repair. The stored corpus, the
+    Qdrant payload and split_inclusion_exclusion are all untouched -- the
+    decode happens at RENDER, which matters more here than it did for the
+    entities, because oncotriage/retrieval/indexer.py's _HEADING_LEAD_CHARS
+    DEPENDS on these backslashes: the corpus holds "\\<Exclusion Criteria\\>",
+    and a splitter reading unescaped text would stop finding those headings.
+    Nothing in this module is on the index-time path.
+
+    THE DECODE SET IS CLOSED AND IS A CHARACTER SET, not a pattern; see
+    _MARKDOWN_ESCAPE_DECODE_SET for how it was derived and for the three
+    characters removed from it. A backslash before anything outside it is left
+    exactly as scraped.
+
+    LEFT TO RIGHT, AND THE OUTPUT IS NEVER RE-EXAMINED. That is one rule with
+    two consequences, and both are correctness properties rather than
+    performance ones:
+
+      * A DOUBLE BACKSLASH RESOLVES BEFORE ITS SUCCESSOR. "\\\\\\>" is an
+        escaped backslash followed by an escaped ">", not an escaped backslash
+        followed by a bare ">", and only a left-to-right walk that consumes
+        "\\X" as ONE unit can tell those apart. A scan that keyed on every
+        backslash index would read the second member of the pair as an escape.
+      * A CHARACTER THIS FUNCTION EMITS CANNOT BE READ AS MARKUP by this
+        function. The sink is append-only and the cursor never moves backwards,
+        so nothing produced here is re-scanned -- the same rule
+        _decode_escaped_entities applies inside one match, applied here to the
+        whole pass. This is what makes the function idempotent: measured over
+        all 28,399 render-path fields, decoding the decoded output is the
+        identity on every one.
+
+    "\\\\" IS REFUSED RATHER THAN COLLAPSED TO "\\", AND IDEMPOTENCE IS THE
+    ARGUMENT. Collapsing is the "correct" markdown reading, and it is the one
+    thing this function could do that would EMIT a backslash -- whose successor
+    may itself be in the decode set, at which point the output is
+    indistinguishable from unprocessed input. Measured: "x\\\\\\[y" collapses
+    to "x\\[y" and a second pass gives "x[y", deleting a backslash the sponsor
+    wrote. Two real trials have that shape (NCT06773208, NCT07230639) and both
+    are non-idempotent under collapse and idempotent under refusal. So the pair
+    is emitted verbatim and recorded under MARKDOWN_REFUSED_ESCAPED_BACKSLASH.
+    Cost, stated: 14 occurrences in 11 trials reach the judge as "\\\\" where
+    the sponsor wrote "\\".
+
+    AN ENTITY CHAIN IS SKIPPED WHOLE, because it belongs to the other decoder.
+    _decode_escaped_entities owns exactly one escape per chain -- its own
+    docstring's invariant -- and a markdown decoder that stripped the backslash
+    off "\\&lt;" first would leave that function decoding a bare chain and
+    removing zero escapes, silently making its documented count mean something
+    else. Skipping the span keeps the two subjects DISJOINT, so neither can
+    double-handle the other's escape in either order; measured, 579 chains
+    decode under both orders. Only backslash-headed matches are collected: a
+    bare "&lt;" starts at "&", which this walk never visits as a unit start.
+
+    Args:
+        text: the third-party criteria string about to be rendered.
+
+    Returns:
+        ``(decoded_text, escapes_removed, escapes_refused)``. Separate counts
+        for the same reason the entity decoder keeps its two separate -- a
+        caller reporting them as one number could not tell a trial this
+        function fixed from a trial it declined to touch, which are opposite
+        findings. The REASON for each refusal is in
+        MARKDOWN_ESCAPE_DECODE_UNRESOLVED's key, on AGE_PARSE_FAILURES'
+        footing.
+    """
+    if not text or "\\" not in text:
+        return text, 0, 0
+
+    # The spans the other decoder owns. Computed with the SAME regex it uses;
+    # a second spelling here would be a second vocabulary, which is how the two
+    # scraper copies in this repository drifted apart.
+    chain_end = {}
+    for match in _ESCAPED_ENTITY_CHAIN_RE.finditer(text):
+        if match.group(0).startswith("\\"):
+            chain_end[match.start()] = match.end()
+
+    out = []
+    decoded = 0
+    refused = 0
+    index = 0
+    length = len(text)
+
+    def _refuse(reason: str, at: int) -> None:
+        MARKDOWN_ESCAPE_DECODE_UNRESOLVED[
+            reason + ":" + text[at:at + _MARKDOWN_KEY_MAX_LEN]] += 1
+
+    while index < length:
+        char = text[index]
+        if char != "\\":
+            out.append(char)
+            index += 1
+            continue
+
+        end = chain_end.get(index)
+        if end is not None:
+            # Verbatim, and the cursor jumps the whole chain: the other decoder
+            # reads it next, out of the string this one produced.
+            out.append(text[index:end])
+            index = end
+            continue
+
+        following = text[index + 1] if index + 1 < length else None
+
+        if following is None:
+            # A trailing backslash escapes nothing. Literal, determinate, not a
+            # degradation -- and measured zero in the render path.
+            out.append(char)
+            index += 1
+            continue
+
+        if following == "\\":
+            out.append("\\\\")
+            _refuse(MARKDOWN_REFUSED_ESCAPED_BACKSLASH, index)
+            refused += 1
+            index += 2
+            continue
+
+        if following in _MARKDOWN_REFERENCE_SYNTAX_CHARS:
+            out.append(char)
+            out.append(following)
+            _refuse(MARKDOWN_REFUSED_REFERENCE_SYNTAX, index)
+            refused += 1
+            index += 2
+            continue
+
+        if following in _MARKDOWN_ESCAPE_DECODE_SET:
+            out.append(following)
+            decoded += 1
+            index += 2
+            continue
+
+        # Outside the set: a literal backslash under CommonMark. Left as
+        # scraped, and deliberately NOT counted -- see
+        # MARKDOWN_ESCAPE_DECODE_UNRESOLVED.
+        out.append(char)
+        index += 1
+
+    return "".join(out), decoded, refused
+
+
 def _decode_escaped_entities(text: str) -> Tuple[str, int, int]:
     """Restore the characters a trial's criteria text spells as HTML entities.
 
@@ -957,11 +1184,20 @@ def _decode_escaped_entities(text: str) -> Tuple[str, int, int]:
     a degradation, on the footing M_CATEGORY_UNREADABLE argues for cM0.
 
     ONE ESCAPE IS REMOVED AND ONLY ONE: the backslash that was escaping the
-    ampersand of the reference this function decoded. The corpus's other 65,082
-    markdown escapes -- "\\>", "\\*", "\\[" and the rest, across 69% of trials --
-    are a separate finding with a separate blast radius and are not touched
-    here. Nothing in this function can see or alter a backslash that is not
-    immediately followed by a character reference.
+    ampersand of the reference this function decoded. Nothing in this function
+    can see or alter a backslash that is not immediately followed by a
+    character reference.
+
+    THAT INVARIANT SURVIVED THE MARKDOWN PASS, AND IT DID SO BY DESIGN. The
+    corpus's other markdown escapes -- "\\>", "\\*", "\\[" and the rest, 69,397
+    of them across 70.57% of trials -- were a separate finding when this
+    function shipped and are now _decode_markdown_escapes', which runs BEFORE
+    this one at the _build_trials_text call site. It would have taken the
+    backslash off "\\&lt;" and left this function decoding a bare chain and
+    removing zero escapes, quietly turning the sentence above into a falsehood;
+    instead it SKIPS a chain span whole, so the two subjects are disjoint and
+    each function's count still means what it says. Measured across both
+    orders: 579 chains, unchanged.
 
     Args:
         text: the third-party criteria string about to be rendered.
@@ -1091,14 +1327,17 @@ def _build_trials_text(trials: List[Dict]) -> str:
         <<<END_TRIAL_DATA nct_id=NCT01234567>>>
 
     THE CRITERIA BODIES ARE NO LONGER SENT BYTE-FOR-BYTE AS SCRAPED, and the
-    two rewrites that touch them are the only two: _decode_escaped_entities
-    restores the characters the registry stored as escaped HTML entities, and
-    _neutralize_fence_markers spells out any bracket run. In that order, for
-    the reason argued at the call site. Neither paraphrases: the first returns
-    a character the sponsor wrote and the escape was standing in for, the
-    second inserts spaces into a run that no real trial in the corpus contains.
-    Everything else -- wording, ordering, whitespace, the registry's own
-    markdown escaping of "\\>" and "\\*" -- is untouched.
+    three rewrites that touch them are the only three: _decode_markdown_escapes
+    removes the backslashes the registry added to escape punctuation,
+    _decode_escaped_entities restores the characters it stored as escaped HTML
+    entities, and _neutralize_fence_markers spells out any bracket run. In that
+    order, for the reason argued at the call site. None paraphrases: the first
+    two return a character the sponsor wrote and an encoding was standing in
+    for, the third inserts spaces into a run that no real trial in the corpus
+    contains. Everything else -- wording, ordering, whitespace, punctuation --
+    is untouched, and so is the STORED text: all three run at render, so
+    oncotriage/retrieval/indexer.py's splitter still reads the escaped
+    "\\<Exclusion Criteria\\>" its _HEADING_LEAD_CHARS depends on.
 
     THE nct_id RIDES IN BOTH FENCE LINES. In the open line because the header
     that used to carry it is gone and Section 5 tells the model to copy the id
@@ -1152,23 +1391,81 @@ def _build_trials_text(trials: List[Dict]) -> str:
 
         # DECODE BEFORE NEUTRALIZE, AND THE ORDER IS THE WHOLE ARGUMENT. A
         # decoded sequence must not be able to walk past the neutralizer: a
-        # trial storing "\&gt;\&gt;\&gt;" -- or "\&#62;" three times -- carries
-        # no bracket run while it is escaped, and decoding it produces ">>>",
-        # which is exactly what the fences are built from. Decoding after
-        # neutralization would hand the model a run this function had already
-        # declared safe. Neutralization stays last, over the decoded text, so
-        # what it inspects is the string that will actually be sent.
+        # trial storing "\&gt;\&gt;\&gt;" -- or "\>\>\>", or "\&#62;" three
+        # times -- carries no bracket run while it is escaped, and decoding it
+        # produces ">>>", which is exactly what the fences are built from.
+        # Decoding after neutralization would hand the model a run this
+        # function had already declared safe. Neutralization stays last, over
+        # the fully decoded text, so what it inspects is the string that will
+        # actually be sent. Measured over the whole corpus: zero trials acquire
+        # a run, so today this is a guard rather than a fix -- which is exactly
+        # when a guard has to be in the right place.
         #
-        # The two fence ATTRIBUTE values above are deliberately not decoded.
-        # Zero entities were measured in either field, and not decoding them is
-        # the strictly safer half of the same argument -- an escaped bracket run
-        # in an nct_id stays escaped and can never become a fence.
-        inclusion, dec_inc, unres_inc = _decode_escaped_entities(
+        # MARKDOWN BEFORE ENTITIES, AND BOTH DIRECTIONS WERE MEASURED BEFORE
+        # THE ORDER WAS PICKED. The two orders agree on all 28,399 render-path
+        # fields of this corpus, so the corpus does not decide it; constructed
+        # input does, and each order has a real invention hazard:
+        #
+        #   entities first -- a chain can decode TO a backslash ("\&#92;",
+        #       "&bsol;"), and a markdown decoder reading the result would take
+        #       that produced backslash for an escape and eat the character
+        #       after it. "5 \&#92;&gt; 3" becomes "5 > 3" instead of "5 \> 3":
+        #       a comparator invented out of two unrelated fragments, which is
+        #       the failure _decode_escaped_entities' "output is never
+        #       re-examined" rule exists to prevent, one level up.
+        #   markdown first -- stripping an escape can SUPPLY a character a
+        #       chain needs. "5 \&gt\; 3" is a sponsor who typed "&gt;".
+        #
+        # Neither is safe by construction, so both are closed rather than one
+        # being chosen and hoped for. The markdown decoder runs first, on raw
+        # scraped text only, so it can never read what the entity decoder
+        # produced; and ";" and "#" are outside its decode set, so it can never
+        # build a reference for the decoder that follows. It also skips any
+        # chain span whole, which keeps the two subjects disjoint and each
+        # function's count meaning what it says.
+        #
+        # The two fence ATTRIBUTE values above are deliberately not decoded, in
+        # either sense. Zero escapes and zero entities were measured in either
+        # field, and not decoding them is the strictly safer half of the same
+        # argument -- an escaped bracket run in an nct_id stays escaped and can
+        # never become a fence.
+        inclusion, esc_inc, ref_inc = _decode_markdown_escapes(
             str(trial["eligibility"]["inclusion_criteria"]))
-        exclusion, dec_exc, unres_exc = _decode_escaped_entities(
+        exclusion, esc_exc, ref_exc = _decode_markdown_escapes(
             str(trial["eligibility"]["exclusion_criteria"]))
+        inclusion, dec_inc, unres_inc = _decode_escaped_entities(inclusion)
+        exclusion, dec_exc, unres_exc = _decode_escaped_entities(exclusion)
         inclusion, hits_inc = _neutralize_fence_markers(inclusion)
         exclusion, hits_exc = _neutralize_fence_markers(exclusion)
+
+        escapes = esc_inc + esc_exc
+        if escapes:
+            # INFO, matching the entity event below rather than the fence
+            # warning above, and for the same reason: registry markdown
+            # escaping is a routine artefact and not an anomaly worth waking
+            # anyone for. THE VOLUME IS THE DIFFERENCE AND IT IS STATED RATHER
+            # THAN GLOSSED -- 70.57% of trials carry at least one escape,
+            # against 1.4% for entities, so this is roughly one line per trial
+            # per render. It is still recorded on every render, because this is
+            # a modification of third-party text on its way to the judge and
+            # the record of what was sent has to say that it happened; an
+            # operator who does not want it raises ONCOTRIAGE_LOG_LEVEL.
+            log.info("removed registry markdown escaping from scraped trial "
+                     "text", stage=5, node="llm_classifier_evaluation",
+                     event="trial_markdown_escape_decoded",
+                     nct_id=nct_id, count=escapes)
+
+        refused = ref_inc + ref_exc
+        if refused:
+            # Its own event, not a field on the one above: this text went out
+            # STILL ESCAPED, which is the opposite finding, and a reader
+            # filtering on the decoded event must not be shown a line that says
+            # the reverse of what happened. Same split as the entity pair.
+            log.warning("left registry markdown escaping as scraped: the "
+                        "escaped character is outside the decode set",
+                        stage=5, node="llm_classifier_evaluation",
+                        event="trial_markdown_escape_unresolved",
+                        nct_id=nct_id, count=refused)
 
         decoded = dec_inc + dec_exc
         if decoded:
