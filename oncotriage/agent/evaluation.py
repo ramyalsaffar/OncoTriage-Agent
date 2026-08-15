@@ -81,6 +81,66 @@ from oncotriage.observability import console, get_logger
 log = get_logger(__name__)
 
 
+class _SilentLog:
+    """A logger-shaped sink that emits nothing, for a render nobody sends.
+
+    WHY A SINK AND NOT SIX ``if log_events`` GUARDS. ``_build_trials_text``
+    emits five distinct events from six call sites, and the requirement on the
+    measurement path is that they are suppressed UNIFORMLY -- a reader who saw
+    a fence warning but no decode event from the same phantom render would be
+    told that third-party text was rewritten on its way to a judge that was
+    never asked. Six independent guards make that a property somebody has to
+    remember at each site and at every site added later; rebinding the name the
+    function logs through makes it a property of the function. There is no
+    ``log`` reference left inside the render for a new call site to reach, and
+    ``tests/test_agent_render_event_suppression.py`` asserts that by AST, so a
+    site added tomorrow is suppressed by construction or fails the scan.
+
+    IT IS NOT A LEVEL AND NOT A HANDLER. ``ONCOTRIAGE_LOG_LEVEL`` cannot reach
+    this and neither can a logging configuration: the question "is this render
+    going to be sent" is a fact about the CALLER, not about how verbose the
+    operator wants to be, and a suppression an operator could switch on would
+    reintroduce exactly the misattribution it exists to remove.
+
+    EVERY PUBLIC METHOD OF ``StructuredLogger`` IS IMPLEMENTED, including the
+    two the render does not currently call. A sink that is substitutable only
+    for the methods in use today fails with ``AttributeError`` the first time
+    somebody logs at a new level -- inside a render, where the exception would
+    surface as a Stage 5 failure rather than as a missing log line. The parity
+    is asserted rather than asserted-in-prose; see the same test.
+    """
+
+    __slots__ = ()
+
+    def debug(self, message, **fields):
+        """Discard."""
+
+    def info(self, message, **fields):
+        """Discard."""
+
+    def warning(self, message, **fields):
+        """Discard."""
+
+    def error(self, message, **fields):
+        """Discard."""
+
+    def exception(self, message, **fields):
+        """Discard."""
+
+    # ``StructuredLogger.std`` is a property returning its ``logging.Logger``.
+    # This is a plain class attribute rather than a property returning None,
+    # which is indistinguishable at every call site (``sink.std`` is None
+    # either way) and adds no DECORATED definition to the package. That last
+    # part is not a style preference: ``tests/test_package_invariants.py``
+    # section 2i pins the decorator inventory of the whole package by qualified
+    # name, and a ``@property`` here would have made a logging change edit that
+    # pin. Measured rather than guessed -- the property version failed 2i.
+    std = None
+
+
+_SILENT_LOG = _SilentLog()
+
+
 # A MAXIMAL RUN of three or more angle brackets, which is what the user
 # message's TRIAL_DATA fences are built from. Third-party text is rewritten
 # through this before it is interpolated into a block; see
@@ -1310,8 +1370,35 @@ def _neutralize_fence_markers(text: str) -> Tuple[str, int]:
     return _FENCE_MARKER_RUN_RE.sub(_space_out, text), hits[0]
 
 
-def _build_trials_text(trials: List[Dict]) -> str:
+def _build_trials_text(trials: List[Dict], *, log_events: bool = True) -> str:
     """Render one batch of trials for the user prompt, each inside a fence.
+
+    ``log_events=False`` renders identical text and emits NO render events. It
+    is for a caller that renders in order to MEASURE the result rather than to
+    send it -- today exactly one, ``_trial_input_tokens``, which renders a
+    trial to price its contribution to the input budget and throws the string
+    away. Every event this function emits reports a modification of third-party
+    text ON ITS WAY TO THE JUDGE; a render nobody sends made no such journey,
+    and logging one attributes a rewrite to a request that was never issued.
+    Measured before it was closed: on a 15-trial batch that path was 11 of the
+    13 remaining lines per patient.
+
+    KEYWORD-ONLY, so a second positional argument can never be read as the
+    flag, and DEFAULTING TO TRUE, so silence is something a caller asks for
+    explicitly and never something it gets by forgetting. The three send-like
+    callers -- the per-chunk render, the whole-batch stored-prompt render, and
+    ``oncotriage/evaluation/run_harness.py:build_contexts``, whose text IS
+    shown to a rater -- pass nothing and are unchanged.
+
+    COUNTERS ARE DELIBERATELY NOT SUPPRESSED. ``log_events`` governs the log
+    channel and nothing else: ``MARKDOWN_ESCAPE_DECODE_UNRESOLVED`` and
+    ``ESCAPED_ENTITY_DECODE_UNRESOLVED`` are incremented inside the decoders,
+    which this function calls identically either way, so a measurement render
+    still contributes to both. That is a known inflation rather than an
+    oversight -- both are refusal counters whose reading is "this shape exists
+    in the corpus", a statement about the corpus that a measurement render
+    observes as truly as a sent one. Changing it is a counter-semantics
+    decision, not a logging one.
 
     EVERY TRIAL IS WRAPPED IN AN EXPLICIT DATA DELIMITER, and Section 6's C6
     tells the model what a delimiter means. The trial text is third party --
@@ -1379,6 +1466,9 @@ def _build_trials_text(trials: List[Dict]) -> str:
     node_finalize assigns trial_number from the position in filtered_trials and
     trial_matches.trial_number records it.
     """
+    # EVERY event below goes through `emit`, never through `log`. See
+    # _SilentLog for why the suppression is a rebinding rather than six guards.
+    emit = log if log_events else _SILENT_LOG
     parts = []
     # The markdown decode is reported ONCE FOR THIS CALL, not once per trial.
     # See the aggregate below the loop for the measurement that forces it.
@@ -1462,10 +1552,10 @@ def _build_trials_text(trials: List[Dict]) -> str:
             # per render here. The argument that licensed the entity event does
             # not transfer, which is precisely why this one moved and that one
             # did not.
-            log.debug("removed registry markdown escaping from scraped trial "
-                      "text", stage=5, node="llm_classifier_evaluation",
-                      event="trial_markdown_escape_decoded_trial",
-                      nct_id=nct_id, count=escapes)
+            emit.debug("removed registry markdown escaping from scraped trial "
+                       "text", stage=5, node="llm_classifier_evaluation",
+                       event="trial_markdown_escape_decoded_trial",
+                       nct_id=nct_id, count=escapes)
 
         refused = ref_inc + ref_exc
         if refused:
@@ -1473,11 +1563,11 @@ def _build_trials_text(trials: List[Dict]) -> str:
             # STILL ESCAPED, which is the opposite finding, and a reader
             # filtering on the decoded event must not be shown a line that says
             # the reverse of what happened. Same split as the entity pair.
-            log.warning("left registry markdown escaping as scraped: the "
-                        "escaped character is outside the decode set",
-                        stage=5, node="llm_classifier_evaluation",
-                        event="trial_markdown_escape_unresolved",
-                        nct_id=nct_id, count=refused)
+            emit.warning("left registry markdown escaping as scraped: the "
+                         "escaped character is outside the decode set",
+                         stage=5, node="llm_classifier_evaluation",
+                         event="trial_markdown_escape_unresolved",
+                         nct_id=nct_id, count=refused)
 
         decoded = dec_inc + dec_exc
         if decoded:
@@ -1489,11 +1579,11 @@ def _build_trials_text(trials: List[Dict]) -> str:
             # channel. It is still recorded on every render, because this is a
             # modification of third-party text on its way to the judge and the
             # record of what was sent has to say that it happened.
-            log.info("restored characters stored as escaped HTML entities "
-                     "in scraped trial text",
-                     stage=5, node="llm_classifier_evaluation",
-                     event="trial_escaped_entity_decoded",
-                     nct_id=nct_id, count=decoded)
+            emit.info("restored characters stored as escaped HTML entities "
+                      "in scraped trial text",
+                      stage=5, node="llm_classifier_evaluation",
+                      event="trial_escaped_entity_decoded",
+                      nct_id=nct_id, count=decoded)
 
         unresolved = unres_inc + unres_exc
         if unresolved:
@@ -1501,12 +1591,12 @@ def _build_trials_text(trials: List[Dict]) -> str:
             # went out STILL ESCAPED, which is the defect rather than the fix,
             # and a reader filtering on the decoded event must not be shown a
             # line that says the opposite of what happened.
-            log.warning("left an escaped HTML entity as scraped: no fixed "
-                        "point within the decode pass cap",
-                        stage=5, node="llm_classifier_evaluation",
-                        event="trial_escaped_entity_unresolved",
-                        nct_id=nct_id, count=unresolved,
-                        depth=_ENTITY_DECODE_MAX_PASSES)
+            emit.warning("left an escaped HTML entity as scraped: no fixed "
+                         "point within the decode pass cap",
+                         stage=5, node="llm_classifier_evaluation",
+                         event="trial_escaped_entity_unresolved",
+                         nct_id=nct_id, count=unresolved,
+                         depth=_ENTITY_DECODE_MAX_PASSES)
 
         neutralized = hits_id + hits_phase + hits_inc + hits_exc
         if neutralized:
@@ -1516,10 +1606,10 @@ def _build_trials_text(trials: List[Dict]) -> str:
             # that splits reports it per chunk as well as for the whole-batch
             # render kept for logging -- that is a count of renders, not of
             # trials, and the event name says so.
-            log.warning("neutralized a fence marker inside scraped trial text",
-                        stage=5, node="llm_classifier_evaluation",
-                        event="trial_fence_marker_neutralized",
-                        nct_id=nct_id, count=neutralized)
+            emit.warning("neutralized a fence marker inside scraped trial text",
+                         stage=5, node="llm_classifier_evaluation",
+                         event="trial_fence_marker_neutralized",
+                         nct_id=nct_id, count=neutralized)
 
         parts.append(
             f"<<<TRIAL_DATA nct_id={nct_id} phase={phase}>>>\n"
@@ -1554,11 +1644,11 @@ def _build_trials_text(trials: List[Dict]) -> str:
     # in total, which is rarer than the entity event that keeps its per-trial
     # INFO, and the nct_id a refusal names is the actionable field.
     if md_sequences:
-        log.info("removed registry markdown escaping from scraped trial text",
-                 stage=5, node="llm_classifier_evaluation",
-                 event="trial_markdown_escape_decoded",
-                 total=md_rendered, trials_affected=md_trials_affected,
-                 count=md_sequences)
+        emit.info("removed registry markdown escaping from scraped trial text",
+                  stage=5, node="llm_classifier_evaluation",
+                  event="trial_markdown_escape_decoded",
+                  total=md_rendered, trials_affected=md_trials_affected,
+                  count=md_sequences)
 
     return "".join(parts)
 
@@ -1624,14 +1714,29 @@ def _trial_input_tokens(trial_obj: Dict) -> int:
     criteria plus a fence allowance" would be a second implementation of the
     renderer, free to drift from it silently.
 
-    THE COST IS ONE EXTRA RENDER PER TRIAL, and one consequence is worth naming:
-    a trial whose scraped text contains fence markers emits its
-    ``trial_fence_marker_neutralized`` warning once for this measurement as well
-    as once per chunk it is sent in. That is already the documented meaning of
-    the event -- ``_build_trials_text`` records that it counts RENDERS rather
-    than trials -- and no real trial in the corpus contains a bracket run.
+    THE COST IS ONE EXTRA RENDER PER TRIAL, AND IT IS SILENT. ``log_events`` is
+    False because this render is never sent: the string is measured and thrown
+    away, so every event the renderer emits -- the markdown aggregate, the
+    entity decode, both refusal warnings and the fence neutralization -- would
+    report a rewrite of third-party text on its way to a judge that was never
+    asked. Suppressed as a SET rather than one at a time, because a reader
+    shown a fence warning with no decode event beside it would draw exactly
+    the wrong conclusion about which render it came from.
+
+    This is the paragraph that used to accept the cost, and the acceptance was
+    already thin: it argued that the fence warning firing per measurement was
+    "the documented meaning of the event" and harmless because no real trial
+    contains a bracket run. True of the fence event, and false of the markdown
+    decode, which fires for 70.57% of the corpus -- measured on a 15-trial
+    batch, this path was 11 of the 13 lines a patient produced.
+
+    WHAT IS NOT SUPPRESSED IS THE COUNTERS. ``MARKDOWN_ESCAPE_DECODE_UNRESOLVED``
+    and ``ESCAPED_ENTITY_DECODE_UNRESOLVED`` live inside the decoders and are
+    still incremented here, so both carry a contribution from measurement
+    renders. See ``_build_trials_text``'s docstring for why that is left alone.
     """
-    return estimate_prompt_tokens(_build_trials_text([trial_obj]))
+    return estimate_prompt_tokens(
+        _build_trials_text([trial_obj], log_events=False))
 
 
 def _pack_greedy(costs: List[int], fixed_tokens: int,

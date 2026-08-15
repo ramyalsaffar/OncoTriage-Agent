@@ -666,10 +666,21 @@ control("c5  the str.replace form re-forms a marker from an odd run [3j]",
                    or ">>>" in m._neutralize_fence_markers(">" * 5)[0]), True)
 
 # 6 -- the event silenced. The neutralization still happens; nothing records it.
+#
+# THE RECEIVER IS `emit`, NOT `log`, AND THAT IS A CONSEQUENTIAL EDIT. The
+# render binds `emit = log if log_events else _SILENT_LOG` so that a render
+# nobody sends -- the packer's per-trial token measurement -- emits no render
+# events at all, and every one of the six event sites inside the function now
+# logs through `emit`. This plant's target moved with them.
+#
+# IT FAILED LOUDLY RATHER THAN SILENTLY, which is why this control is worth
+# having: `control()` reports THE PLANT ITSELF FAILED when its target occurs
+# other than exactly once, so the receiver rename surfaced as a named failure
+# instead of a control that quietly stopped planting anything and passed.
 control("c6  a silenced neutralization emits no event [3f]",
         _EVAL_SRC,
-        [('            log.warning("neutralized a fence marker inside scraped trial text",',
-          '            log.debug("neutralized a fence marker inside scraped trial text",')],
+        [('            emit.warning("neutralized a fence marker inside scraped trial text",',
+          '            emit.debug("neutralized a fence marker inside scraped trial text",')],
         lambda m: _probe_render(m, [TRIAL_SPOOF], "events"), 0)
 
 # 7 -- the count folded to a boolean. The event still fires and says nothing
