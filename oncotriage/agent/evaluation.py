@@ -1380,8 +1380,14 @@ def _build_trials_text(trials: List[Dict]) -> str:
     trial_matches.trial_number records it.
     """
     parts = []
+    # The markdown decode is reported ONCE FOR THIS CALL, not once per trial.
+    # See the aggregate below the loop for the measurement that forces it.
+    md_rendered = 0
+    md_trials_affected = 0
+    md_sequences = 0
     for trial_obj in trials:
         trial = trial_obj["trial"]
+        md_rendered += 1
         # str() rather than `or ""`: the values used to reach an f-string, so
         # this reproduces exactly what the f-string did with a None or a
         # non-string, including rendering it as "None". Changing that would be
@@ -1440,20 +1446,26 @@ def _build_trials_text(trials: List[Dict]) -> str:
 
         escapes = esc_inc + esc_exc
         if escapes:
-            # INFO, matching the entity event below rather than the fence
-            # warning above, and for the same reason: registry markdown
-            # escaping is a routine artefact and not an anomaly worth waking
-            # anyone for. THE VOLUME IS THE DIFFERENCE AND IT IS STATED RATHER
-            # THAN GLOSSED -- 70.57% of trials carry at least one escape,
-            # against 1.4% for entities, so this is roughly one line per trial
-            # per render. It is still recorded on every render, because this is
-            # a modification of third-party text on its way to the judge and
-            # the record of what was sent has to say that it happened; an
-            # operator who does not want it raises ONCOTRIAGE_LOG_LEVEL.
-            log.info("removed registry markdown escaping from scraped trial "
-                     "text", stage=5, node="llm_classifier_evaluation",
-                     event="trial_markdown_escape_decoded",
-                     nct_id=nct_id, count=escapes)
+            md_trials_affected += 1
+            md_sequences += escapes
+            # THE PER-TRIAL LINE IS DEBUG, AND THE AGGREGATE BELOW IS THE INFO.
+            # Nothing is lost by the split -- this line carries exactly what
+            # the INFO used to carry, nct_id and count, so an operator who
+            # wants the per-trial record sets ONCOTRIAGE_LOG_LEVEL=DEBUG and
+            # has it back verbatim. What changes is the DEFAULT volume, and
+            # only the default.
+            #
+            # The entity sibling below keeps its per-trial INFO and that is a
+            # measurement rather than an inconsistency: 1.4% of trials carry an
+            # entity against 70.57% carrying an escape, so one line per
+            # affected trial is 197 lines there and roughly one line per trial
+            # per render here. The argument that licensed the entity event does
+            # not transfer, which is precisely why this one moved and that one
+            # did not.
+            log.debug("removed registry markdown escaping from scraped trial "
+                      "text", stage=5, node="llm_classifier_evaluation",
+                      event="trial_markdown_escape_decoded_trial",
+                      nct_id=nct_id, count=escapes)
 
         refused = ref_inc + ref_exc
         if refused:
@@ -1515,6 +1527,39 @@ def _build_trials_text(trials: List[Dict]) -> str:
             f"{exclusion}\n"
             f"<<<END_TRIAL_DATA nct_id={nct_id}>>>\n\n"
         )
+
+    # ONE LINE PER RENDER, NOT ONE PER TRIAL, AND THE NUMBER IS WHY. Measured
+    # over the 14,324-trial corpus with the shipped decoder: 10,108 trials
+    # (70.57%) carry at least one escape, 69,396 sequences in all. The per-trial
+    # INFO this replaces therefore fired for roughly seven trials in ten of
+    # every render, and a batch is rendered more than once -- the whole batch
+    # for the stored prompt, then once per chunk that is actually sent, plus
+    # once per trial for _trial_input_tokens' packing measurement. The record
+    # the event exists to keep is "third-party text was modified on its way to
+    # the judge, and here is how much"; that is a statement about the render,
+    # and it is fully carried by the three cardinalities below.
+    #
+    # THE GUARD IS `if md_sequences`, MATCHING EVERY OTHER EVENT IN THIS
+    # FUNCTION. The fence, entity and refusal events are each guarded by their
+    # own count, so a render that changed nothing says nothing -- and without
+    # the guard the empty render at the _user_prompt_for([]) call site, which
+    # exists only to measure the wrapper's fixed token cost, would emit a line
+    # claiming a decode pass over no trials at all.
+    #
+    # REFUSALS ARE DELIBERATELY NOT A FIELD HERE. They keep their own per-trial
+    # WARNING in the loop above, unchanged, on the split this function argues: a
+    # reader filtering on the decoded event must not be shown a line that says
+    # the reverse of what happened. The volume argument does not reach them
+    # either -- measured on the same corpus, 12 trials (0.08%) and 15 sequences
+    # in total, which is rarer than the entity event that keeps its per-trial
+    # INFO, and the nct_id a refusal names is the actionable field.
+    if md_sequences:
+        log.info("removed registry markdown escaping from scraped trial text",
+                 stage=5, node="llm_classifier_evaluation",
+                 event="trial_markdown_escape_decoded",
+                 total=md_rendered, trials_affected=md_trials_affected,
+                 count=md_sequences)
+
     return "".join(parts)
 
 

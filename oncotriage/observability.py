@@ -513,6 +513,16 @@ LOGGABLE_FIELDS = frozenset({
     # the day. None of the four names a trial, a patient or a diagnosis.
     "quality_dropped_percentile", "quality_dropped_floor",
     "quality_dropped_floor_only", "medcpt_floor",
+    # How many of the trials a render pass covered were changed by it, beside
+    # `total` (how many it covered) and `count` (how many sequences it
+    # rewrote). Three numbers rather than one because they answer three
+    # different questions -- 1 sequence in 15 trials and 60 sequences in 15
+    # trials are the same `count`-free story and a very different one -- and
+    # none of them is derivable from the others. It is a CARDINALITY over
+    # public trial objects: no nct_id, no criteria text, nothing patient-side.
+    # See _build_trials_text in oncotriage/agent/evaluation.py, whose per-trial
+    # decode line moved to DEBUG when this aggregate replaced it.
+    "trials_affected",
 
     # --- retrieval and filtering shape ------------------------------------
     "channel", "channels", "degraded", "expansion_path", "mesh_resolution",

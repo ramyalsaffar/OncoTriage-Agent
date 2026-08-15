@@ -58,6 +58,7 @@ import contextlib
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import sys
@@ -93,6 +94,9 @@ from oncotriage.agent.evaluation import (                      # noqa: E402
     _decode_escaped_entities,
     _decode_markdown_escapes,
     _neutralize_fence_markers,
+)
+from oncotriage.observability import (                         # noqa: E402
+    LOGGABLE_FIELDS as _LOGGABLE_FIELDS,
 )
 
 
@@ -162,11 +166,40 @@ def render(inclusion, exclusion="", nct_id="NCT00000000", phase="PHASE2"):
                         "exclusion_criteria": exclusion}}}])
 
 
-def capture_records(fn):
-    """Every JSON log record ``fn`` emits on stderr."""
+def render_many(specs):
+    """A BATCH through the shipped renderer, raise-proofed.
+
+    ``specs`` is a list of ``(inclusion, exclusion)`` pairs; the nct_id is
+    derived from the position so every trial in the batch is distinguishable.
+    One call, many trials -- which is the only shape that can tell a per-render
+    event from a per-trial one.
+    """
+    return drive(_build_trials_text, [
+        {"trial": {"nct_id": f"NCT{index:08d}", "phase": "PHASE2",
+                   "eligibility": {"inclusion_criteria": inc,
+                                   "exclusion_criteria": exc}}}
+        for index, (inc, exc) in enumerate(specs)])
+
+
+def capture_records(fn, level=None):
+    """Every JSON log record ``fn`` emits on stderr.
+
+    ``level`` temporarily lowers the ``oncotriage`` logger's threshold, which is
+    what a DEBUG line needs to be observable at all: the shipped default is
+    INFO, and ``StructuredLogger._log`` returns without emitting when the level
+    is not enabled. Restored in a ``finally`` so one capture cannot change the
+    threshold every later check runs under.
+    """
     err = io.StringIO()
-    with contextlib.redirect_stderr(err):
-        fn()
+    _pkg_logger = logging.getLogger("oncotriage")
+    _saved_level = _pkg_logger.level
+    try:
+        if level is not None:
+            _pkg_logger.setLevel(level)
+        with contextlib.redirect_stderr(err):
+            fn()
+    finally:
+        _pkg_logger.setLevel(_saved_level)
     got = []
     for line in err.getvalue().splitlines():
         line = line.strip()
@@ -789,17 +822,24 @@ print("=" * 70)
 
 _recs = capture_records(lambda: render(r"Patients \>18 years", r"INR \< 1.2"))
 _decoded_ev = events(_recs, "trial_markdown_escape_decoded")
-check("9a     a decode emits exactly one INFO event per trial per render",
+check("9a     a decode emits exactly one INFO event per RENDER",
       len(_decoded_ev), 1)
 check("9b     ...at INFO, matching the entity sibling rather than the fence "
       "warning", at(_decoded_ev, 0, {}).get("level"), "INFO")
 check("9c     ...carrying the count of both fields",
       at(_decoded_ev, 0, {}).get("count"), 2)
-check("9d     ...and the nct_id and the stage/node",
-      (at(_decoded_ev, 0, {}).get("nct_id"),
-       at(_decoded_ev, 0, {}).get("stage"),
+check("9d     ...and the stage/node",
+      (at(_decoded_ev, 0, {}).get("stage"),
        at(_decoded_ev, 0, {}).get("node")),
-      ("NCT00000000", 5, "llm_classifier_evaluation"))
+      (5, "llm_classifier_evaluation"))
+# THE AGGREGATE NAMES NO TRIAL, and that is the shape rather than an omission:
+# it describes a render, and a render covers many trials. A stray nct_id would
+# be one arbitrary member of the batch presented as though it were the subject.
+check("9d(ii) ...and NOT an nct_id, because one line now covers the whole "
+      "render", "nct_id" in at(_decoded_ev, 0, {}), False)
+check("9d(iii) ...carrying the two render cardinalities instead",
+      (at(_decoded_ev, 0, {}).get("total"),
+       at(_decoded_ev, 0, {}).get("trials_affected")), (1, 1))
 
 _out = render(r"Patients \>18 years", r"INR \< 1.2")
 check("9e     the rendered block carries the restored comparators and no "
@@ -977,15 +1017,228 @@ MARKDOWN_ESCAPE_DECODE_UNRESOLVED.clear()
 
 
 # ===========================================================================
-# SECTION 11 -- hygiene
+# SECTION 11 -- the decode is reported ONCE PER RENDER, not once per trial
+# ===========================================================================
+#
+# WHY THE SHAPE CHANGED, AS A NUMBER. Measured over the shipped 14,324-trial
+# corpus: 10,108 trials (70.57%) carry at least one markdown escape. The event
+# this replaces fired once per affected trial per render, and a batch is
+# rendered more than once -- the whole batch for the stored prompt, once per
+# chunk sent, and once per trial for the packer's token measurement. The entity
+# sibling stays per-trial at 1.4%, which is the measurement that says the two
+# are different problems rather than an inconsistency.
+#
+# THE BATCH IS THE INSTRUMENT. Every check below renders MORE THAN ONE trial in
+# ONE call, because a single-trial render cannot distinguish "one event per
+# render" from "one event per trial" -- both produce exactly one line, and a
+# suite that only ever rendered one trial would pass either way. Section 9 is
+# the single-trial case and this is the one that discriminates.
+
+print()
+print("=" * 70)
+print("SECTION 11 -- one aggregate per render")
+print("=" * 70)
+
+# Four trials, THREE of them carrying escapes, with 2 + 1 + 3 = 6 sequences
+# between them. Every number below is distinct from every other -- 4 rendered,
+# 3 affected, 6 sequences -- so a check cannot pass by reading the wrong field.
+_BATCH = [(r"Patients \>18 years", r"INR \< 1.2"),      # 2
+          (r"ECOG \<= 2", ""),                          # 1
+          ("no escapes at all", "none here either"),    # 0
+          (r"WBC \> 3\.0", r"plt \< 100")]              # 3
+
+_b_recs = capture_records(lambda: render_many(_BATCH))
+_b_ev = events(_b_recs, "trial_markdown_escape_decoded")
+
+check("11a    a four-trial batch with three affected emits exactly ONE "
+      "aggregate INFO -- the check a single-trial render cannot make",
+      len(_b_ev), 1)
+check("11b    ...at INFO", at(_b_ev, 0, {}).get("level"), "INFO")
+check("11c    ...reporting every trial the call rendered, affected or not",
+      at(_b_ev, 0, {}).get("total"), 4)
+check("11d    ...how many of them were changed",
+      at(_b_ev, 0, {}).get("trials_affected"), 3)
+check("11e    ...and the total sequences decoded across the batch",
+      at(_b_ev, 0, {}).get("count"), 6)
+# NON-DEGENERACY. If the three numbers were equal, 11c/11d/11e would all pass
+# against an aggregate that carried one number under three names.
+check("11f    non-degeneracy: the three cardinalities are pairwise distinct, "
+      "so 11c-11e cannot pass by reading the wrong field",
+      len({4, 3, 6}), 3)
+
+# THE COUNTS ARE DERIVED FROM THE DECODER, NOT RETYPED. _BATCH's expected
+# numbers above are literals, and a literal that agrees with the code because
+# both were written by the same hand is the defect this project's rules name by
+# name. These come from _decode_markdown_escapes itself.
+_exp_seq = sum(md(inc)[1] + md(exc)[1] for inc, exc in _BATCH)
+_exp_aff = sum(1 for inc, exc in _BATCH if md(inc)[1] + md(exc)[1])
+check("11g    the aggregate agrees with the decoder run directly over the "
+      "same batch (sequences, affected)",
+      (at(_b_ev, 0, {}).get("count"), at(_b_ev, 0, {}).get("trials_affected")),
+      (_exp_seq, _exp_aff))
+check("11h    non-degeneracy: that independent derivation is not zero",
+      (_exp_seq > 0, _exp_aff > 0), (True, True))
+
+# ZERO-DECODE RENDERS SAY NOTHING, which is the convention every other event in
+# _build_trials_text already follows -- each is guarded by its own count.
+check("11i    a batch in which NOTHING decodes emits no aggregate",
+      len(events(capture_records(
+          lambda: render_many([("plain text", "also plain")] * 3)),
+          "trial_markdown_escape_decoded")), 0)
+# The empty render is real: _user_prompt_for([]) is called on every node run to
+# price the wrapper's fixed token cost. Without the guard it would emit a line
+# claiming a decode pass over no trials at all.
+check("11j    ...and neither does the empty render the packer prices the "
+      "wrapper with",
+      len(events(capture_records(lambda: render_many([])),
+                 "trial_markdown_escape_decoded")), 0)
+
+# THE PER-TRIAL RECORD IS NOT LOST, IT IS RE-LEVELLED. Everything the old INFO
+# carried -- nct_id and count -- is still emitted, at DEBUG, so an operator who
+# wants it sets ONCOTRIAGE_LOG_LEVEL=DEBUG and has it back verbatim.
+_dbg_recs = capture_records(lambda: render_many(_BATCH), level=logging.DEBUG)
+_dbg_ev = events(_dbg_recs, "trial_markdown_escape_decoded_trial")
+check("11k    at DEBUG the per-trial detail returns, one line per AFFECTED "
+      "trial", len(_dbg_ev), 3)
+check("11l    ...each naming its own trial, so the detail is still "
+      "attributable", sorted(r.get("nct_id") for r in _dbg_ev),
+      ["NCT00000000", "NCT00000001", "NCT00000003"])
+check("11m    ...at DEBUG, not INFO",
+      sorted({r.get("level") for r in _dbg_ev}), ["DEBUG"])
+# THE INVARIANT A READER ACTUALLY DEPENDS ON: the aggregate is the sum of the
+# detail. If these ever disagree, one of the two is lying about the render.
+check("11n    the aggregate's count is exactly the sum of the per-trial "
+      "counts", sum(r.get("count", 0) for r in _dbg_ev),
+      at(_b_ev, 0, {}).get("count"))
+check("11o    ...and the aggregate still appears exactly once alongside the "
+      "detail", len(events(_dbg_recs, "trial_markdown_escape_decoded")), 1)
+# AND IT IS OFF BY DEFAULT, which is the entire point of the pass. Without this
+# check the DEBUG line could be emitting at INFO and 11k would still pass.
+check("11p    at the shipped default level the per-trial detail is SILENT",
+      len(events(_b_recs, "trial_markdown_escape_decoded_trial")), 0)
+
+# REFUSALS ARE UNTOUCHED AND STAY PER-TRIAL. Measured on the same corpus: 12
+# trials (0.08%) and 15 sequences in total -- rarer than the entity event that
+# keeps its per-trial INFO -- so the volume argument that moved the decoded
+# event does not reach this one, and the nct_id it names is the actionable
+# field. It is also a WARNING, and folding it into the INFO aggregate would put
+# "this text went out still escaped" inside an event that says the reverse.
+MARKDOWN_ESCAPE_DECODE_UNRESOLVED.clear()
+_ref_recs = capture_records(lambda: render_many(
+    [(r"CLL\\ SLL", r"\# CLN1114"), (r"A\\B", "")]))
+_ref_ev = events(_ref_recs, "trial_markdown_escape_unresolved")
+check("11q    a refusal still emits one WARNING PER TRIAL, each naming its "
+      "own trial", (len(_ref_ev), sorted(r.get("nct_id") for r in _ref_ev)),
+      (2, ["NCT00000000", "NCT00000001"]))
+MARKDOWN_ESCAPE_DECODE_UNRESOLVED.clear()
+
+# THE AGGREGATE COUNTS DECODES ONLY, and this is asserted through the NUMBERS
+# rather than by looking for a field named "refused". The first version of this
+# check did the latter and was UNFALSIFIABLE: "refused", "unresolved" and
+# "refusals" are none of them on LOGGABLE_FIELDS, so the formatter would strip
+# any of them whatever the call site passed, and the check passed for a reason
+# that had nothing to do with the event's shape. Measured, not reasoned -- a
+# revert that folded `refused=0` into the aggregate left it green.
+#
+# A batch carrying BOTH is the instrument: if refusals were folded in, `count`
+# would be decoded+refused and `trials_affected` would count a trial that was
+# refused and never decoded.
+_MIXED = [(r"INR \< 1.2", r"CLL\\ SLL"),   # decodes, and refuses
+          (r"A\\B", ""),                    # refuses ONLY -- decodes nothing
+          (r"WBC \> 3\.0", "")]             # decodes only
+_mx_dec = sum(md(i)[1] + md(e)[1] for i, e in _MIXED)
+_mx_ref = sum(md(i)[2] + md(e)[2] for i, e in _MIXED)
+_mx_aff = sum(1 for i, e in _MIXED if md(i)[1] + md(e)[1])
+MARKDOWN_ESCAPE_DECODE_UNRESOLVED.clear()
+_mx_ev = events(capture_records(lambda: render_many(_MIXED)),
+                "trial_markdown_escape_decoded")
+check("11r    non-degeneracy: the mixed batch really does carry refusals AND "
+      "decodes, and one trial refuses without decoding",
+      (_mx_dec > 0, _mx_ref > 0, _mx_aff < len(_MIXED)), (True, True, True))
+check("11s    the aggregate's count is DECODED sequences only -- refusals are "
+      "not folded into the event that says the reverse",
+      at(_mx_ev, 0, {}).get("count"), _mx_dec)
+check("11t    ...and it is not the decoded+refused sum, which is what folding "
+      "them in would produce (this is what makes 11s falsifiable)",
+      at(_mx_ev, 0, {}).get("count") == _mx_dec + _mx_ref, False)
+check("11u    ...and trials_affected counts only trials that DECODED, not the "
+      "refuse-only one", at(_mx_ev, 0, {}).get("trials_affected"), _mx_aff)
+MARKDOWN_ESCAPE_DECODE_UNRESOLVED.clear()
+
+# THE FIELDS SURVIVE THE ALLOWLIST. oncotriage/observability.py DROPS any field
+# not on LOGGABLE_FIELDS and reports the key in `dropped_fields`. A new field
+# added to a log call and not to the list is silently absent -- which every
+# check above would read as a wrong value rather than as a redaction, so the
+# drop is asserted directly.
+check("11v    the aggregate's fields all survive the allowlist -- nothing was "
+      "dropped", at(_b_ev, 0, {}).get("dropped_fields"), None)
+check("11w    ...and trials_affected is on LOGGABLE_FIELDS by name",
+      "trials_affected" in _LOGGABLE_FIELDS, True)
+
+
+# ===========================================================================
+# SECTION 11b -- the control: a regression to per-trial INFO is DETECTED
+# ===========================================================================
+#
+# The plant is the shape this pass removed: the aggregate suppressed and the
+# per-trial line put back at INFO. It goes into a COPY of the render loop's
+# behaviour rather than the shipped file -- the module attribute
+# _decode_markdown_escapes is rebound to a counting stand-in that logs at INFO
+# per call, which is exactly what the pre-pass code did, and the shipped
+# function is restored in a finally.
+
+print()
+print("-" * 70)
+print("SECTION 11b -- control")
+print("-" * 70)
+
+_saved_md = evaluation._decode_markdown_escapes
+
+
+def _per_trial_info_md(text):
+    """The pre-pass shape: log at INFO on every affected field."""
+    decoded, removed, refused = _saved_md(text)
+    if removed:
+        evaluation.log.info("removed registry markdown escaping from scraped "
+                            "trial text", stage=5,
+                            node="llm_classifier_evaluation",
+                            event="trial_markdown_escape_decoded",
+                            count=removed)
+    return decoded, removed, refused
+
+
+try:
+    evaluation._decode_markdown_escapes = _per_trial_info_md
+    _ctl = events(capture_records(lambda: render_many(_BATCH)),
+                  "trial_markdown_escape_decoded")
+    # Six affected FIELDS across three trials, plus the real aggregate: seven.
+    # The assertion that matters is only that 11a's "exactly one" FAILS.
+    check("11x    CONTROL: with per-trial INFO logging restored, the render "
+          "emits more than one decoded event -- so 11a is not passing for "
+          "free", len(_ctl) > 1, True)
+    check("11y    CONTROL: ...and the extra lines are at INFO, i.e. visible "
+          "at the shipped default level",
+          "INFO" in {r.get("level") for r in _ctl}, True)
+finally:
+    evaluation._decode_markdown_escapes = _saved_md
+
+check("11z    the shipped decoder is restored",
+      evaluation._decode_markdown_escapes is _saved_md, True)
+check("11zz   ...and the render is back to exactly one aggregate",
+      len(events(capture_records(lambda: render_many(_BATCH)),
+                 "trial_markdown_escape_decoded")), 1)
+
+
+# ===========================================================================
+# SECTION 12 -- hygiene
 # ===========================================================================
 
 print()
 print("=" * 70)
-print("SECTION 11 -- hygiene")
+print("SECTION 12 -- hygiene")
 print("=" * 70)
 
-check("11a    the module-level counter is left empty for the next reader",
+check("12a    the module-level counter is left empty for the next reader",
       dict(MARKDOWN_ESCAPE_DECODE_UNRESOLVED), {})
 
 _EVAL_SRC = os.path.abspath(evaluation.__file__)
@@ -993,12 +1246,12 @@ with open(_EVAL_SRC, "rb") as _fh:
     _eval_sha = hashlib.sha256(_fh.read()).hexdigest()
 with open(_EVAL_SRC, "rb") as _fh:
     _eval_sha2 = hashlib.sha256(_fh.read()).hexdigest()
-check("11b    this file writes nothing: evaluation.py reads the same twice",
+check("12b    this file writes nothing: evaluation.py reads the same twice",
       _eval_sha2, _eval_sha)
-check("11c    ...and that is a real digest (non-degeneracy)",
+check("12c    ...and that is a real digest (non-degeneracy)",
       len(_eval_sha) == 64 and os.path.getsize(_EVAL_SRC) > 0, True)
 
-check("11d    every module attribute a control rebound is back to the "
+check("12d    every module attribute a control rebound is back to the "
       "shipped object",
       (evaluation._decode_markdown_escapes is _saved_fn,
        evaluation._MARKDOWN_ESCAPE_DECODE_SET is _saved_set,
