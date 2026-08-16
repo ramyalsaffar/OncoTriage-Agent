@@ -986,25 +986,62 @@ PROCEDURE_RENDER_DROPPED = "dropped"
 # where nothing is being overruled: it states a fact the record already carries
 # and edits no verdict, no status, no score and no assessment.
 #
+# EVERY DATE THE SUMMARY RENDERS NOW STATES ITS ELAPSED TIME (PROMPT_VERSION
+# 1.8.0), and the widening is the finding rather than a tidy-up. Until 1.8.0 the
+# arithmetic was done in exactly two places -- the not-active condition marker
+# and a lab reading past STALE_LAB_AGE_DAYS -- and every other date in the
+# record (procedure dates, medication start and end dates, the ECOG reading
+# date, biomarker and variant and metastasis observation dates, and the onset of
+# every condition the record does NOT say is over) reached the model raw. A
+# reject-direction adjudication then found a verdict-costing arithmetic error on
+# a date in that untreated majority -- a 1993 event judged as falling inside a
+# five-year window -- and the temporal-reasoning literature identifies duration
+# arithmetic as a documented weakness of these models rather than an accident of
+# one run. So the rule is now uniform: WHEREVER THIS RENDERER PRINTS A DATE, IT
+# PRINTS THE ELAPSED TIME BESIDE IT. A section that prints no date gains
+# nothing, because there is nothing to anchor to.
+#
+# THE RAW DATE IS NEVER REPLACED. An absolute date and an elapsed interval
+# answer different criteria -- "diagnosed after 2020" is a question about the
+# date, "within 6 months" is a question about the interval -- and dropping
+# either would trade one class of unanswerable criterion for another.
+#
 # WHAT MAY BE SAID, AND WHAT MAY NOT. oncotriage/fhir/parser.py extracts NO
 # abatement and NO resolution date for a condition -- ``_parse_condition`` reads
 # ``onsetDateTime``, then ``onsetPeriod.start``, then ``onsetPeriod.end``, and
 # nothing else, verified in the shipped parser. The ONLY date available is
-# therefore the onset, and every phrase built here is anchored to the onset and
-# names it as such. "resolved 29 years ago" would be a fabrication: the record
-# does not say when it resolved. "onset 29 years before reference date; not
-# active" is exactly what the record says and no more.
+# therefore the onset, and every condition phrase built here is anchored to the
+# onset and names it as such. "resolved 29 years ago" would be a fabrication:
+# the record does not say when it resolved. "onset 29 years before reference
+# date; not active" is exactly what the record says and no more. The same
+# discipline governs every other field: a procedure clause is anchored to the
+# procedure date, a lab clause to the reading date, a medication clause to the
+# start or the end date it sits beside. No phrase anywhere asserts currency,
+# resolution, or a date the record does not carry.
 #
-# NOTHING IS INFERRED FROM AGE. An old condition whose clinical status is
-# ``active`` is genuinely current -- a 1997 diabetes diagnosis is not stale --
-# and gets no marker of any kind. The elapsed time is rendered ONLY where the
-# record has independently stated that the condition is over.
+# NOTHING IS INFERRED FROM AGE, AND THE ELAPSED CLAUSE IS NOT A MARKER. An old
+# condition whose clinical status is ``active`` is genuinely current -- a 1997
+# diabetes diagnosis is not stale -- and it still gets NO marker of any kind.
+# What it now gets is the bare arithmetic of its own onset, which the record
+# already states as a date and which the model was previously left to compute.
+# The two are deliberately different things and are built by different helpers:
+# ``_onset_clause`` states an interval and implies nothing, and
+# ``_not_active_marker`` states that the record itself called the condition
+# over and then appends the same interval.
 
 # The clinical statuses under which the record itself says the condition is not
 # current. A SUBSET of the parser's condition vocabulary, which is
 # ``_CONDITION_STATUS_PRIORITY`` in oncotriage/fhir/parser.py: active,
-# recurrence, relapse, remission, inactive, resolved, unknown. The four
-# non-members are excluded one reason each:
+# recurrence, relapse, remission, inactive, resolved, unknown.
+#
+# THIS SET GOVERNS THE MARKER AND ONLY THE MARKER (1.8.0). It used to govern the
+# elapsed clause too, because the clause was only ever emitted as part of the
+# marker; those are now separate decisions and this set decides just the first
+# of them. EVERY condition with a usable onset carries an onset-anchored elapsed
+# clause whatever its status. Membership here adds the words "not active" in
+# front of it, and nothing else.
+#
+# The four non-members are excluded from THE MARKER one reason each:
 #
 #   active / recurrence / relapse  the record says the condition IS current.
 #   unknown                        the record says nothing. RULE 4 of the system
@@ -1018,11 +1055,37 @@ PROCEDURE_RENDER_DROPPED = "dropped"
 # met by a patient in remission, which is precisely what RULE 4 already says.
 _NOT_ACTIVE_CLINICAL_STATUSES = frozenset({"resolved", "inactive", "remission"})
 
-# The phrase itself, as a constant, so a test pins what the renderer emits
-# rather than a retyped copy of it.
+# Every phrase this module emits, as a constant, so a test pins what the
+# renderer actually produces rather than a retyped copy of it. NOT_ACTIVE_PHRASE
+# is the pre-1.8.0 member and the convention the rest follow.
 NOT_ACTIVE_PHRASE = "not active"
 
-# Dates that could not be used to anchor a temporal phrase.
+# The tail every event clause ends with. One spelling in one place: the model is
+# being taught to read a stated interval instead of computing one, and two
+# wordings for the same fact is two things to learn.
+BEFORE_REFERENCE_PHRASE = "before reference date"
+
+# What a condition's interval is anchored TO. Spelled out on every condition
+# line for the reason in the block above: the onset is the only condition date
+# the parser extracts, so an unlabelled interval on a resolved condition would
+# read as time since resolution.
+ONSET_CLAUSE_PREFIX = "onset"
+
+# The three sub-unit floors. Each says "shorter than the unit I am allowed to
+# speak in" and none of them is a zero: "0 years" reads as "at the same time",
+# which is not what a completed count of zero means.
+ELAPSED_UNDER_YEAR = "less than 1 year"
+ELAPSED_UNDER_MONTH = "less than 1 month"
+ELAPSED_UNDER_DAY = "less than 1 day"
+
+# The precision labels parse_partial_date returns for a date it could resolve.
+# Named here rather than written as literals because they are the cap on what
+# may be said, which is the one rule in this block that cannot be relaxed.
+_PRECISION_DAY = "day"
+_PRECISION_MONTH = "month"
+_PRECISION_YEAR = "year"
+
+# Dates that could not be used to anchor a temporal phrase, plus one census key.
 #
 # THE AGE_PARSE_FAILURES / PROCEDURE_RENDER_COUNTS FOOTING: a module-level
 # Counter, counts only, keyed by the FAILURE and never by any clinical text or
@@ -1037,8 +1100,30 @@ NOT_ACTIVE_PHRASE = "not active"
 # date, which means the corpus outran DATA_SNAPSHOT_DATE.
 TEMPORAL_RENDER_COUNTS = Counter()
 
+# One key prefix per RENDERED FIELD, not one for all of them. A single prefix
+# would report "142 unusable dates" and leave nobody able to say whether the
+# corpus has bad procedure dates or bad medication end dates, which are
+# different data problems with different owners.
 TEMPORAL_KEY_CONDITION_ONSET = "condition_onset"
 TEMPORAL_KEY_LAB_DATE = "lab_date"
+TEMPORAL_KEY_PROCEDURE_DATE = "procedure_date"
+TEMPORAL_KEY_MEDICATION_START = "medication_start"
+TEMPORAL_KEY_MEDICATION_END = "medication_end"
+TEMPORAL_KEY_ECOG_DATE = "ecog_date"
+TEMPORAL_KEY_METASTASIS_DATE = "metastasis_date"
+TEMPORAL_KEY_BIOMARKER_DATE = "biomarker_date"
+TEMPORAL_KEY_VARIANT_DATE = "variant_date"
+
+# NOT a degradation, and it is in this Counter rather than in a second one
+# because it is a fact about the same rendered dates. 1.8.0 removed
+# STALE_LAB_AGE_DAYS from the RENDERING decision -- every dated reading states
+# its age now, so there is no threshold left to cross before the age appears --
+# and the constant would otherwise have become a tunable that nothing reads,
+# which is the shape pass 20f-2 deleted BATCH_SIZE and EXPANSION_TEMPERATURE
+# for. It keeps its meaning ("older than this is stale") and its reader, as the
+# census of how many rendered readings a run priced as stale, and it decides no
+# rendered character.
+TEMPORAL_KEY_LAB_STALE = "lab_stale"
 
 
 def _resolve_temporal_date(raw, reference, key_prefix: str):
@@ -1053,10 +1138,22 @@ def _resolve_temporal_date(raw, reference, key_prefix: str):
         key_prefix: Which field this is, for TEMPORAL_RENDER_COUNTS.
 
     Returns:
-        A ``datetime.date`` no later than ``reference``, or None when no
-        truthful elapsed phrase can be built from this field. The three None
-        cases are distinguished in the counter, not in the return value: the
-        caller's behaviour is the same for all three, which is to say less.
+        ``(date, precision)`` -- a ``datetime.date`` no later than ``reference``
+        and the parse precision that produced it ("day", "month" or "year") --
+        or ``(None, None)`` when no truthful elapsed phrase can be built from
+        this field. The three None cases are distinguished in the counter, not
+        in the return value: the caller's behaviour is the same for all three,
+        which is to say less.
+
+        THE PRECISION IS RETURNED BECAUSE IT IS A CAP (1.8.0). This function
+        used to discard it, which was harmless while every phrase spoke in
+        completed years -- a year is the coarsest unit, so no imputation could
+        show through it. It is not harmless now: parse_partial_date imputes the
+        month and day of a "1997" onset from PARTIAL_DATE_ANCHOR_MONTH and
+        PARTIAL_DATE_ANCHOR_DAY, so a phrase reading "10,568 days before
+        reference date" would be stating an imputed anchor as a measurement.
+        Rendering finer than the record's own precision is fabrication; see
+        _elapsed_phrase, which is where the cap is applied.
 
     Never raises. parse_partial_date never raises, and every other branch here
     is a comparison.
@@ -1067,33 +1164,150 @@ def _resolve_temporal_date(raw, reference, key_prefix: str):
     # "unparseable", and every undated condition in the cohort is counted as a
     # data defect.
     if not raw or raw == "unknown":
-        return None
+        return None, None
 
     parsed, precision = parse_partial_date(raw)
     if parsed is None:
         TEMPORAL_RENDER_COUNTS[f"{key_prefix}_unreadable:{precision}"] += 1
-        return None
+        return None, None
 
     # A date after the reference is not an elapsed time. Rendering one would
     # produce a negative interval or, worse, a plausible-looking small one.
     if parsed > reference:
         TEMPORAL_RENDER_COUNTS[f"{key_prefix}_after_reference"] += 1
-        return None
+        return None, None
 
-    return parsed
+    return parsed, precision
 
 
-def _elapsed_phrase(years: int) -> str:
-    """Completed years as English, with no bare zero and no false plural.
+def _count_and_unit(count: int, unit: str) -> str:
+    """"1 day" / "33 days" -- a count with no false plural."""
+    return f"{count} {unit}" if count == 1 else f"{count} {unit}s"
 
-    "0 years" reads as "at the same time", which is not what a completed-year
-    count of zero means. It means less than one year, and that is what it says.
+
+def _elapsed_phrase(reference, parsed, precision: str) -> str:
+    """The elapsed interval, graded by size and capped by the record's precision.
+
+    THE MAGNITUDE ONLY -- no "before reference date", no "old". The two call
+    sites append their own tail, so there is one arithmetic and one vocabulary
+    behind both a condition clause and a lab age suffix.
+
+    GRADED, BECAUSE "less than 1 year" CANNOT ANSWER A WASHOUT WINDOW. Trials
+    gate on four-week and six-week and thirty-day windows, and the confirmed
+    arithmetic error this function exists to remove sits exactly there --
+    chemotherapy 33 days before the reference date, judged against a four-week
+    window. A phrase that collapses every sub-year interval to one bucket leaves
+    that criterion exactly as unanswerable as a bare date did.
+
+    CAPPED, BECAUSE FINER THAN THE RECORD IS FABRICATION. parse_partial_date
+    imputes the missing components of a partial date from fixed anchors, so a
+    "1997" onset resolves to a concrete day that the record never stated. The
+    cap is one rule per precision, and it is stated as the ladder rather than as
+    a guard so that no future unit can be added without choosing its floor:
+
+        year precision   years, or "less than 1 year"
+        month precision  years, months, or "less than 1 month"
+        day precision    years, days, or "less than 1 day"
+
+    Where the cap bites, the phrase renders at the cap and the RAW DATE is still
+    on the line for the model -- so precision is never invented and nothing that
+    was readable becomes unreadable.
+
+    WEEKS ARE DELIBERATELY NOT A UNIT, and days run all the way up to a
+    completed year at day precision. Every week phrase is a rounded day count,
+    and a rounded count at a washout boundary rounds TOWARD the window: "33
+    days" is outside a four-week window and "4 weeks" reads as though it were
+    on it. Days are exact, comparable to a window expressed in days or weeks by
+    integer comparison, and never round. Months are used only where the record
+    is month-precise and therefore carries no day to be exact about.
     """
-    if years <= 0:
-        return "less than 1 year"
-    if years == 1:
-        return "1 year"
-    return f"{years} years"
+    delta = relativedelta(reference, parsed)
+
+    # A completed year is the one unit every precision may speak in, so it is
+    # tested before the cap rather than inside it.
+    if delta.years >= 1:
+        return _count_and_unit(delta.years, "year")
+
+    if precision == _PRECISION_YEAR:
+        return ELAPSED_UNDER_YEAR
+
+    if precision == _PRECISION_MONTH:
+        # delta.years is 0 here, so delta.months is the whole interval.
+        if delta.months >= 1:
+            return _count_and_unit(delta.months, "month")
+        return ELAPSED_UNDER_MONTH
+
+    if precision == _PRECISION_DAY:
+        # Less than one completed year: the exact day count.
+        days = (reference - parsed).days
+        if days >= 1:
+            return _count_and_unit(days, "day")
+        return ELAPSED_UNDER_DAY
+
+    # NO PRECISION LABEL REACHES HERE TODAY -- parse_partial_date returns only
+    # "day", "month" or "year" alongside a date it resolved, and
+    # _resolve_temporal_date returns (None, None) for the other two. The branch
+    # is explicit rather than absent because the ALTERNATIVE to naming it is
+    # letting an unrecognised label fall through to the day arm, which is the
+    # finest claim this function can make and therefore the wrong direction for
+    # an unknown: a new coarse precision added upstream would start stating
+    # exact days computed from whatever anchor it imputed. The coarsest floor is
+    # the only safe answer to "I do not know how precise this is".
+    return ELAPSED_UNDER_YEAR
+
+
+def _event_clause(date_raw, reference, key_prefix: str) -> str:
+    """"33 days before reference date", or "" when the date cannot anchor one.
+
+    The general form, for a date that IS the event: a procedure date, a
+    medication start or end, an observation's reading date. A condition's onset
+    goes through _onset_clause instead, which names what it is anchored to.
+    """
+    parsed, precision = _resolve_temporal_date(date_raw, reference, key_prefix)
+    if parsed is None:
+        return ""
+    return f"{_elapsed_phrase(reference, parsed, precision)} {BEFORE_REFERENCE_PHRASE}"
+
+
+def _dated_suffix(date_raw, reference, key_prefix: str) -> str:
+    """", 33 days before reference date" -- appended inside an existing (date).
+
+    Every section that already prints its date in parentheses uses this, so the
+    interval sits inside the same bracket as the date it was computed from and
+    cannot be read as belonging to the field beside it.
+    """
+    clause = _event_clause(date_raw, reference, key_prefix)
+    return f", {clause}" if clause else ""
+
+
+def _dated_bracket(label, date_raw, reference, key_prefix: str) -> str:
+    """"start: 2026-05-01 (94 days before reference date)" -- a LABELLED date.
+
+    The medications section is the only one whose date parts are joined to each
+    other with ", ", so it is the only one where an interval appended after a
+    comma would be indistinguishable from the next field. Its interval is
+    bracketed instead. See the comment at the call site for the ambiguous
+    rendering this replaced and why RULE 2 makes it decide a verdict.
+
+    A module-level helper rather than a closure in the medication loop: the
+    first version defined it inside ``for med in unique_meds``, which builds a
+    function object per medication per patient -- 25 of them for the corpus
+    patient in the pass report, in a 1,000-patient batch -- for a body that
+    closes over nothing it cannot take as an argument.
+    """
+    clause = _event_clause(date_raw, reference, key_prefix)
+    return f"{label}: {date_raw[:10]}" + (f" ({clause})" if clause else "")
+
+
+def _onset_clause(onset_raw, reference) -> str:
+    """"onset 29 years before reference date", or "" when the onset is unusable.
+
+    ONSET-ANCHORED AND SAYS SO. The onset is the only condition date the parser
+    extracts, so an unlabelled interval beside a resolved condition would read
+    as time since resolution -- a date the record does not carry.
+    """
+    clause = _event_clause(onset_raw, reference, TEMPORAL_KEY_CONDITION_ONSET)
+    return f"{ONSET_CLAUSE_PREFIX} {clause}" if clause else ""
 
 
 def _not_active_marker(onset_raw, reference) -> str:
@@ -1107,44 +1321,44 @@ def _not_active_marker(onset_raw, reference) -> str:
                                                               later than the
                                                               reference date
 
-    The elapsed clause is ONSET-anchored and says so, because the onset is the
-    only date the parser extracts (see the block comment above). Nothing here
-    implies a known resolution date.
+    UNCHANGED IN SHAPE AT 1.8.0. What changed around it is that a condition the
+    record does NOT call over now carries the same elapsed clause without the
+    "not active" half, built by the same _onset_clause. The marker is the claim;
+    the clause is the arithmetic.
     """
-    onset = _resolve_temporal_date(onset_raw, reference, TEMPORAL_KEY_CONDITION_ONSET)
-    if onset is None:
+    clause = _onset_clause(onset_raw, reference)
+    if not clause:
         return NOT_ACTIVE_PHRASE
-    years = relativedelta(reference, onset).years
-    return f"{NOT_ACTIVE_PHRASE}; onset {_elapsed_phrase(years)} before reference date"
+    return f"{NOT_ACTIVE_PHRASE}; {clause}"
 
 
 def _lab_age_suffix(date_raw, reference) -> str:
-    """", N years old" for a stale lab reading, or "" for everything else.
+    """", 29 years old" for a dated lab reading, or "" when it has no usable date.
 
     Appended INSIDE the parentheses that already carry the date, so the row
     reads "(1997-08-27, 29 years old)". The date is not replaced: an absolute
     date and an age answer different questions and the row is short enough for
     both.
 
-    THE THRESHOLD IS IN DAYS AND THE PHRASE IS IN YEARS, deliberately -- see
-    STALE_LAB_AGE_DAYS in oncotriage/config.py. The two cannot disagree in the
-    direction that would matter, and the reason is arithmetic rather than a
-    guard: a span of more than 365 days lands strictly past the anniversary
-    whether or not it contains a leap day, so the completed-year count is always
-    at least 1 and this cannot emit "0 years old" at the shipped threshold.
-    LOWERING STALE_LAB_AGE_DAYS BELOW 365 BREAKS THAT, which is why it is stated
-    here: a threshold of 30 would annotate a two-month-old reading as
-    "0 years old". _elapsed_phrase is NOT consulted on this path -- its wording
-    ("less than 1 year") belongs to the condition marker, where the elapsed time
-    is not gated by a threshold at all.
+    NO THRESHOLD (1.8.0). Every dated reading states its age. The gate this used
+    to carry -- annotate only past STALE_LAB_AGE_DAYS -- was the same partial
+    treatment the whole 1.8.0 change removes: it left the model computing the
+    age of every reading inside the window, which is where the short criteria
+    live ("within 28 days of screening"). The old wording could not have been
+    used unthresholded, because a sub-year interval rendered as completed years
+    reads "0 years old"; _elapsed_phrase's graded ladder is what makes the gate
+    removable, and it is why the two were changed together.
+
+    STALE_LAB_AGE_DAYS SURVIVES AS A CENSUS and no longer decides a character of
+    output -- see TEMPORAL_KEY_LAB_STALE.
     """
-    parsed = _resolve_temporal_date(date_raw, reference, TEMPORAL_KEY_LAB_DATE)
+    parsed, precision = _resolve_temporal_date(date_raw, reference,
+                                               TEMPORAL_KEY_LAB_DATE)
     if parsed is None:
         return ""
-    if (reference - parsed).days <= STALE_LAB_AGE_DAYS:
-        return ""
-    years = relativedelta(reference, parsed).years
-    return f", {years} year{'' if years == 1 else 's'} old"
+    if (reference - parsed).days > STALE_LAB_AGE_DAYS:
+        TEMPORAL_RENDER_COUNTS[TEMPORAL_KEY_LAB_STALE] += 1
+    return f", {_elapsed_phrase(reference, parsed, precision)} old"
 
 
 def _classify_procedure_relevance(procedure: Dict) -> str:
@@ -1455,20 +1669,38 @@ def _create_patient_summary(patient_data: Dict) -> str:
     For each lab concept and procedure type, only the most recent value is
     included. Trial eligibility criteria evaluate current status, not history.
 
-    TEMPORAL STATUS IS COMPUTED, NOT ASKED FOR. Two of the sections above state
-    elapsed time in words rather than leaving the model to derive it from a
-    date, both anchored on get_age_reference_date() and never on the clock:
+    TEMPORAL STATUS IS COMPUTED, NOT ASKED FOR. EVERY date this function
+    renders states its elapsed time in words beside it, so the model never has
+    to derive a duration; all of them are anchored on get_age_reference_date()
+    and none on the clock. The raw date is always kept -- an absolute date and
+    an interval answer different criteria:
 
-      Conditions  a condition whose RENDERED clinical status is resolved,
-                  inactive or in remission carries a "not active" marker, plus
-                  an ONSET-anchored elapsed clause when the onset is usable.
-                  Nothing else is tagged, and no resolution date is implied --
-                  the parser extracts none.
-      Lab Values  a reading older than config.STALE_LAB_AGE_DAYS states its age
-                  inside the parentheses that already carry its date.
+      Performance Status  the ECOG reading date.
+      Conditions          every condition's ONSET, whatever its status. A
+                          condition whose RENDERED clinical status is resolved,
+                          inactive or in remission additionally carries the
+                          "not active" marker, unchanged in shape. Nothing else
+                          is marked, and no resolution date is implied -- the
+                          parser extracts none.
+      Medications         the start date and the end date, each annotated
+                          inside its own part.
+      Procedures          the most-recent date for the type.
+      Lab Values          every dated reading, ungated (config.STALE_LAB_AGE_DAYS
+                          no longer decides whether the age is printed; it
+                          survives as a census key).
+      Metastasis, Biomarkers, mCODE variants
+                          each observation's date.
+
+    Sections that render NO date gain nothing, because there is nothing to
+    anchor an interval to: Demographics (whose age is already an interval),
+    Cancer Stage (the tier is rendered, the observation date is not), Allergies
+    (the parser carries onset_date and this renderer has never printed it), and
+    the Tier C condition / background medication summary lines, which are names
+    only.
 
     See the block comment at _NOT_ACTIVE_CLINICAL_STATUSES for what is
-    deliberately left untouched and why.
+    deliberately left untouched and why, and _elapsed_phrase for why the
+    interval's granularity is graded and capped at the record's own precision.
 
     The cancer registry, the MeSH filter and the lab registry come from
     oncotriage.agent.deps, resolved once at the top of this function.
@@ -1536,7 +1768,10 @@ def _create_patient_summary(patient_data: Dict) -> str:
         excluded = ((ecog.get("observations_after_reference") or 0)
                     + (ecog.get("observations_undated") or 0))
 
-        detail = [date_str]
+        # The interval joins the DATE inside the first detail part, not the
+        # list, so "; most recent of 3" cannot be read as qualifying it.
+        detail = [date_str + _dated_suffix(ecog_date, reference_date,
+                                           TEMPORAL_KEY_ECOG_DATE)]
         if eligible > 1:
             detail.append(f"most recent of {eligible}")
         if excluded:
@@ -1637,13 +1872,26 @@ def _create_patient_summary(patient_data: Dict) -> str:
         if year:
             parts.append(year)
 
-        # MECHANICAL, NOT INFERRED: the record has already said this condition
-        # is over. All this adds is the arithmetic, in words, so the model does
-        # not have to do it. See the block comment at
-        # _NOT_ACTIVE_CLINICAL_STATUSES for why `active`, `recurrence`,
-        # `relapse`, `unknown` and every unconfirmed condition are untouched.
+        # MECHANICAL, NOT INFERRED, IN BOTH ARMS.
+        #
+        # The FIRST arm is the marker: the record has already said this
+        # condition is over, and all the marker adds is the arithmetic in words.
+        # See the block comment at _NOT_ACTIVE_CLINICAL_STATUSES for why
+        # `active`, `recurrence`, `relapse`, `unknown` and every unconfirmed
+        # condition get no marker.
+        #
+        # The SECOND arm is 1.8.0 and it is a bare fact, not a marker: the same
+        # onset-anchored interval, with no status implication whatsoever. It is
+        # an `else` rather than an unconditional append because the marker
+        # already ENDS with that clause -- appending both would print the same
+        # interval twice on one line. The two arms therefore emit exactly one
+        # onset clause each, from one helper.
         if status_rendered in _NOT_ACTIVE_CLINICAL_STATUSES:
             parts.append(_not_active_marker(onset, reference_date))
+        else:
+            onset_clause = _onset_clause(onset, reference_date)
+            if onset_clause:
+                parts.append(onset_clause)
 
         parts.append(tag)
         return f"- {' | '.join(parts)}"
@@ -1727,12 +1975,33 @@ def _create_patient_summary(patient_data: Dict) -> str:
         else:
             status_label = status  # completed, stopped, cancelled, etc.
 
-        # Build date string
+        # Build date string.
+        #
+        # EACH DATE CARRIES ITS OWN INTERVAL, inside its own part. RULE 2 of the
+        # system prompt sends the model to the END date for temporal reasoning
+        # about a completed therapy, and a washout window ("no platinum within 6
+        # months") is exactly the duration arithmetic 1.8.0 removes -- so a
+        # single interval covering both dates, or one attached to the wrong one,
+        # would be worse than none.
+        #
+        # THE INTERVAL IS BRACKETED HERE AND COMMA-JOINED EVERYWHERE ELSE, and
+        # that is forced rather than a style choice. This is the one section
+        # whose parts are themselves joined with ", ": the first draft rendered
+        #     start: 2026-05-01, 94 days before reference date, end: 2026-07-01,
+        #     33 days before reference date
+        # in which the separator BETWEEN the two dates is the same string as the
+        # separator INSIDE each one, so nothing in the line says which interval
+        # belongs to which date -- on the one field where RULE 2 makes that
+        # distinction decide the verdict. Every other section already prints its
+        # date inside parentheses, so the interval joins it there; here the
+        # parentheses have to be introduced.
         date_parts = []
         if start_date and start_date != "unknown":
-            date_parts.append(f"start: {start_date[:10]}")
+            date_parts.append(_dated_bracket("start", start_date, reference_date,
+                                             TEMPORAL_KEY_MEDICATION_START))
         if end_date and end_date != "unknown":
-            date_parts.append(f"end: {end_date[:10]}")
+            date_parts.append(_dated_bracket("end", end_date, reference_date,
+                                             TEMPORAL_KEY_MEDICATION_END))
         date_str = f" | {', '.join(date_parts)}" if date_parts else ""
 
         med_line = f"{display} | status: {status_label}{date_str}"
@@ -1818,7 +2087,14 @@ def _create_patient_summary(patient_data: Dict) -> str:
             display  = proc.get("display") or "Unknown procedure"
             date     = proc.get("date") or ""
             date_str = date[:10] if date and date != "unknown" else "date unknown"
-            summary += f"- {display} ({date_str})\n"
+            # "Prior surgery within 4 weeks" and "no radiotherapy in the last 6
+            # months" are the standard shape of a procedure criterion, and both
+            # are windows. This section is also the one whose date is a
+            # most-recent-per-TYPE date, so the interval is the age of the
+            # latest occurrence and of nothing else.
+            age_str  = _dated_suffix(date, reference_date,
+                                     TEMPORAL_KEY_PROCEDURE_DATE)
+            summary += f"- {display} ({date_str}{age_str})\n"
     else:
         summary += "- None\n"
 
@@ -1838,9 +2114,10 @@ def _create_patient_summary(patient_data: Dict) -> str:
             unit_str  = f" {unit}" if unit else ""
             # "(most recent)" in the heading is per lab CONCEPT, not per
             # patient: a lab drawn once in 1997 and never again is the most
-            # recent of its kind and sits beside this year's values. The age is
-            # stated for anything older than STALE_LAB_AGE_DAYS and nothing
-            # else; a recent or undated reading renders exactly as before.
+            # recent of its kind and sits beside this year's values. EVERY dated
+            # reading states its age as of 1.8.0 -- an undated one still cannot
+            # and renders exactly as before. The threshold that used to gate
+            # this is now a census key only; see _lab_age_suffix.
             age_str   = _lab_age_suffix(date, reference_date)
             summary += f"- {canonical}: {value}{unit_str} ({date_str}{age_str})\n"
     else:
@@ -1941,11 +2218,14 @@ def _create_patient_summary(patient_data: Dict) -> str:
                 break
 
         date_str = date[:10] if date and date != "unknown" else "date unknown"
+        # A biomarker result's age decides "tested within the last 12 months"
+        # criteria, which several precision-oncology trials carry.
+        age_str = _dated_suffix(date, reference_date, TEMPORAL_KEY_BIOMARKER_DATE)
 
         if value and str(value).strip():
-            biomarker_obs.append(f"- {display_clean}: {value} ({date_str})")
+            biomarker_obs.append(f"- {display_clean}: {value} ({date_str}{age_str})")
         else:
-            biomarker_obs.append(f"- {display_clean} ({date_str})")
+            biomarker_obs.append(f"- {display_clean} ({date_str}{age_str})")
 
     # mCODE structured genomic variants (LOINC 69548-6) — real EHR path.
     # These are parsed by _parse_mcode_genomic_variant in File 07 and
@@ -1959,7 +2239,8 @@ def _create_patient_summary(patient_data: Dict) -> str:
         display  = v.get('display') or 'Unknown variant'
         date     = v.get('date') or ''
         date_str = date[:10] if date and date != 'unknown' else 'date unknown'
-        mcode_lines.append(f"- {display} ({date_str})")
+        age_str  = _dated_suffix(date, reference_date, TEMPORAL_KEY_VARIANT_DATE)
+        mcode_lines.append(f"- {display} ({date_str}{age_str})")
 
     # ── Metastasis & Nodal Status ─────────────────────────────────────────
     #
@@ -1986,10 +2267,15 @@ def _create_patient_summary(patient_data: Dict) -> str:
             category = obs.get("metastasis_category") or "?"
             date     = obs.get("date") or ""
             date_str = date[:10] if date and date != "unknown" else "date unknown"
+            # When the spread was DOCUMENTED, which is what separates "known
+            # metastatic disease" from a staging observation the record has
+            # since superseded.
+            age_str  = _dated_suffix(date, reference_date,
+                                     TEMPORAL_KEY_METASTASIS_DATE)
             unit_str = f" {unit}" if unit else ""
             value_str = (f": {value}{unit_str}"
                          if value is not None and str(value).strip() else "")
-            summary += f"- [{category}] {display}{value_str} ({date_str})\n"
+            summary += f"- [{category}] {display}{value_str} ({date_str}{age_str})\n"
     else:
         summary += "- None on record\n"
 

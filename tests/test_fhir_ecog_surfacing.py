@@ -124,9 +124,12 @@ from oncotriage.utils import get_age_reference_date
 
 
 import ast
+import datetime
 import shutil
 import tempfile
 import textwrap
+
+from dateutil.relativedelta import relativedelta
 
 
 # Scratch corpus written by '04- FHIR Generate Data.py --output-dir ...'.
@@ -475,12 +478,38 @@ check("the section slice is non-degenerate",
 check("...and it excludes the section beneath it, which is what the old "
       "split(\"Conditions:\") slice did not",
       "Cancer Stage" in _performance_status_section(_sum_one), False)
-check("value on its own named line",
-      "- ECOG performance status: 1 (2021-03-03)" in _sum_one, True)
+# THE PARENTHESIS GAINED AN ELAPSED INTERVAL AT PROMPT_VERSION 1.8.0, and both
+# pins below are widened rather than loosened. The reading date is still the
+# first thing in the bracket and the value is still on its own named line --
+# which is all these two checks are about -- but the bracket now also carries
+# how long before the reference date that reading falls, because the model was
+# otherwise left to compute the age of the single most common gate in
+# interventional oncology from two dates in different sections.
+#
+# THE EXPECTED INTERVAL IS DERIVED FROM THE SAME REFERENCE DATE THE RENDERER
+# USES, not typed: a literal here would silently expire the next time
+# DATA_SNAPSHOT_DATE moved, which is the failure mode this file's own comment at
+# line 608 already records having been burned by.
+def _ecog_line(value, date_iso):
+    """The whole Performance Status line, interval included."""
+    _y = relativedelta(get_age_reference_date(),
+                       datetime.date.fromisoformat(date_iso)).years
+    _elapsed = f"{_y} year{'' if _y == 1 else 's'}"
+    return (f"- ECOG performance status: {value} "
+            f"({date_iso}, {_elapsed} before reference date)")
+
+
+check("the derived expectation is non-degenerate: both readings are years old, "
+      "so the sub-year forms are not what is being pinned here",
+      [relativedelta(get_age_reference_date(),
+                     datetime.date.fromisoformat(d)).years >= 1
+       for d in ("2021-03-03", "2019-01-01")], [True, True])
+check("value on its own named line, with its reading date and its age",
+      _ecog_line(1, "2021-03-03") in _sum_one, True)
 
 _sum_zero = _create_patient_summary(_p_zero)
 check("ECOG 0 is rendered as 0, not swallowed by a truthiness test",
-      "- ECOG performance status: 0 (2019-01-01)" in _sum_zero, True)
+      _ecog_line(0, "2019-01-01") in _sum_zero, True)
 check("ECOG 0 is not reported as missing",
       "not recorded" in _performance_status_section(_sum_zero), False)
 

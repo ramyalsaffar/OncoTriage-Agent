@@ -773,8 +773,30 @@ print("\n  6a. it is the pipeline's estimator, re-derived from the constant")
 check("the value is ceil(len(record) / CHARS_PER_TOKEN)",
       get(_returned, KEY),
       -(-len(_neutralize_fence_markers(_summary)[0]) // CHARS_PER_TOKEN))
-check("truncating division would give a DIFFERENT answer here (non-degenerate)",
-      len(_summary) % CHARS_PER_TOKEN != 0, True)
+
+# THE DISCRIMINATION USED TO RIDE ON THIS FIXTURE'S LENGTH AND NO LONGER DOES.
+# It read `len(_summary) % CHARS_PER_TOKEN != 0` -- true of the record this
+# patient happened to render, which is a one-in-CHARS_PER_TOKEN coincidence and
+# not a property of anything. PROMPT_VERSION 1.8.0 changed what the renderer
+# emits (an elapsed interval beside every date) and the length landed on a
+# multiple of 4, so the probe failed while the assertion above it was entirely
+# correct -- a test reporting a defect in a renderer it does not test.
+#
+# What replaces it cannot go stale, because it does not depend on any rendered
+# text: the SHIPPED estimator is driven over a string at every remainder, and
+# ceiling is required at each. A floor implementation agrees at remainder 0 and
+# disagrees at the other three, so this fails for a truncating estimator on any
+# day and for any record.
+_CEIL_PROBE = [(n, estimate_prompt_tokens("x" * n))
+               for n in range(CHARS_PER_TOKEN, 2 * CHARS_PER_TOKEN + 1)]
+check("the shipped estimator rounds UP at every remainder, so 6a is "
+      "discriminating whatever this patient's record happens to measure",
+      _CEIL_PROBE,
+      [(n, -(-n // CHARS_PER_TOKEN))
+       for n in range(CHARS_PER_TOKEN, 2 * CHARS_PER_TOKEN + 1)])
+check("...and a truncating estimator would disagree on at least one of them, "
+      "which is what makes the check above worth running",
+      [n for n, got in _CEIL_PROBE if got != n // CHARS_PER_TOKEN] != [], True)
 
 print("\n  6b. the record is a proper part of the fixed prefix")
 #

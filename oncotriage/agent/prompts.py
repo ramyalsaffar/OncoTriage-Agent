@@ -221,7 +221,50 @@ from oncotriage.utils import get_age_reference_date
 # `evaluation_rules` and C4 inside `absolute_constraints`, and this edit
 # restates them for the classifier rather than adding anything the rater is
 # missing.
-PROMPT_VERSION = "1.7.0"
+# 1.8.0 TOLD THE MODEL THAT ELAPSED TIME IS ALREADY IN THE RECORD, because as
+# of this version it is -- everywhere, rather than in the two places 1.7.0 had
+# it. oncotriage/agent/patient.py now prints an elapsed interval beside EVERY
+# date the patient record renders: every condition's onset (whatever its
+# clinical status), every procedure date, both medication dates, the ECOG
+# reading date, every lab reading date (ungated), and every metastasis,
+# biomarker and mCODE variant observation date.
+#
+# WHY THE TEMPLATE HAD TO MOVE WITH IT, and why this is not merely a record
+# change. RULE 4 said, in the imperative: "If event end date is known: calculate
+# elapsed time." That instructed the model to perform exactly the operation this
+# release removes the need for -- and a model told to calculate a duration will
+# calculate it, whatever else is on the page. A reject-direction adjudication
+# measured the cost of that instruction: a 1993 event judged as falling inside a
+# five-year window, a verdict the record's own arithmetic contradicts. Duration
+# arithmetic is a documented weakness of these models rather than an accident of
+# one run, so the fix is to state the answer and to say that the answer is
+# stated.
+#
+# THE ADDITION IS FOUR LINES AND ONE CLAUSE. A new paragraph under RULE 4's
+# reference date states that the intervals are there, that they are to be read
+# rather than recomputed, what each is anchored to, that none of them is a
+# resolution date, and what an ABSENT interval does and does not mean (nothing;
+# the GLOBAL INVARIANT already governs it, and a model that read a missing
+# interval as "recent" would have a new fabrication channel). The one clause is
+# the imperative above, which now prefers the stated interval and keeps
+# calculation as the fallback for a date that carries none.
+#
+# MIDDLE NUMBER. What the model is told to DO with a date changed, and the
+# record it reads changed under it. Both are meaning.
+#
+# THIS ONE IS INSIDE A LIFTED RUBRIC SPAN, unlike 1.7.0's two additions, and
+# that is correct rather than an oversight: RULE 4 rides inside
+# `evaluation_rules`, oncotriage/evaluation/rater.py hands the independent rater
+# the same patient record, and a rater told to compute a duration the record
+# already states would disagree with the classifier for a reason that is rubric
+# mismatch rather than decision quality -- the exact confound that harness
+# exists to remove.
+#
+# WHAT DID NOT MOVE: the JSON template's field set, field order and example
+# values; the section order; every section heading and marker line; the response
+# schema; Section 2's two variants; the fenced patient-record block; 1.7.0's
+# Section 5 check and FINAL REMINDER.
+PROMPT_VERSION = "1.8.0"
 
 
 def prompt_sha256(rendered_text: str) -> str:
@@ -488,8 +531,13 @@ RULE 4 -- TEMPORAL REASONING
 
 Reference date: {get_age_reference_date().isoformat()}
 
+ELAPSED TIME IS STATED FOR YOU. Wherever the patient record prints a date, it also prints how long before the reference date that date falls ("onset 29 years before reference date", "33 days before reference date", "2 years old"). Those intervals were computed from the record's own dates against the reference date above. Read them as given. Do not recompute one, and do not override a stated interval with your own arithmetic.
+    An interval is anchored to the date it is printed beside and to nothing else -- a condition's ONSET, a procedure's date, a medication's start or end, an observation's reading date.
+    It is never a resolution date. The record carries no date for when a condition ended, so no interval anywhere states one.
+    Where a date is absent, unreadable, or later than the reference date, no interval is printed. Absence of an interval is not evidence of anything; the GLOBAL INVARIANT governs.
+
 If the criterion contains a time window:
-    If event end date is known: calculate elapsed time.
+    If event end date is known: use the elapsed time the record states beside it, or calculate it if none is stated.
     If event end date is unknown: classification = "not_evaluable"
 
 If the criterion uses past-tense wording ("history of", "prior", "previous"):

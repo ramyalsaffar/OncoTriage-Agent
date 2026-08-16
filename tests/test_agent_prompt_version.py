@@ -649,7 +649,23 @@ print("=" * 78)
 # it, so it agrees with a careless regeneration by construction; a literal here
 # is a second place a human has to consent to a bump. It is the only line in
 # this file a future bump must edit, and that is the cost being paid on purpose.
-check("PROMPT_VERSION reads 1.7.0", PROMPT_VERSION, "1.7.0")
+check("PROMPT_VERSION reads 1.8.0", PROMPT_VERSION, "1.8.0")
+
+# 1.8.0 IS PINNED HERE TOO, AND ITS ADDITION IS INSIDE A DIFFERENT SECTION.
+# Section 5b's scan below is about 1.7.0's five sentences and where they landed;
+# 1.8.0's addition sits under RULE 4, inside SECTION 3, and the same
+# heading-uniqueness machinery is what makes that assertable. Its own
+# under-the-right-heading check lives in
+# tests/test_agent_summary_temporal_tagging.py section 12, beside the renderer
+# it describes -- the record and the rule are one change and are tested as one.
+_180_RENDERS = [_render(render_system_prompt, _kw) for _kw in _matrix()]
+check("1.8.0's RULE 4 addition is present exactly once in every variant",
+      sorted({t.count("ELAPSED TIME IS STATED FOR YOU.") for t in _180_RENDERS}),
+      [1])
+check("...and the imperative it replaced is gone from every variant",
+      sorted({"If event end date is known: calculate elapsed time." in t
+              for t in _180_RENDERS}), [False])
+check("...over a non-degenerate matrix", len(_180_RENDERS) > 1, True)
 
 # The five sentences 1.7.0 added, and the section each must land in. The section
 # is identified by the banner heading it follows, so "at the disqualification
