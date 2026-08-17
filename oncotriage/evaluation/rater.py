@@ -44,6 +44,17 @@ measured rather than assumed. It is reported separately and never folded into
 the headline; an inter-rater agreement rate cannot be read as a measurement of
 the pipeline beyond the precision the retest reports.
 
+``--include-keys FILE`` RATES A NAMED SUBSET, and it is not ``--limit``.
+``--limit`` picks a stratified smoke slice to prove the machinery works;
+``--include-keys`` names exactly which decisions to rate, one
+``patient_id|nct_id|arm|index`` per line -- the rater's own join key, the tuple
+every ``custom_id`` round-trips to. It exists so a question about one population
+(the time-window criteria, say) can be asked without paying for the other 84% of
+the run. Every failure is a REFUSAL: a key matching nothing, a duplicate, a
+malformed line, an empty file, or ``--limit`` alongside it. A subset request
+that silently rates fewer decisions than it names produces a smaller sample
+under the same headline and is indistinguishable from a clean run.
+
 WHY THE RULES ARE LIFTED RATHER THAN WRITTEN. If the rater judged under its own
 notion of eligibility, every disagreement would confound two things: a decision
 the pipeline got wrong, and a rubric the rater never agreed to. So the rule
@@ -991,6 +1002,202 @@ def choose_custom_id_form(decisions, reserve=0):
 
 
 #------------------------------------------------------------------------------
+# The include list: rate a NAMED subset of decisions, in the rater's own key
+#------------------------------------------------------------------------------
+
+
+# THE FILE HOLDS ``Decision.key``, NOT ``custom_id``, AND THAT IS THE WHOLE
+# DESIGN DECISION HERE.
+#
+# ``custom_id`` is the wire form of the join and it is NOT stable input: its
+# FORM (readable or compact) is chosen per batch by ``choose_custom_id_form``
+# from the decisions actually selected and the retest reserve, so the same
+# decision encodes to ``<uuid>_NCT06652672_exclusion_3`` in one invocation and
+# ``p1_06652672_e_3`` in another. A file of custom_ids would therefore be
+# readable by exactly the invocation that wrote it, and would silently miss
+# EVERY key under any other -- which is the failure this whole layer exists to
+# prevent, arriving through the front door.
+#
+# What ``custom_id`` losslessly joins ONTO is ``Decision.key`` --
+# ``(patient_id, nct_id, arm, index)`` -- asserted per request in
+# ``build_requests`` by round-tripping through ``decode_custom_id``. That tuple
+# is the rater's key vocabulary; this file is its text encoding, one key per
+# line, fields separated by "|":
+#
+#     37fdfb01-3b13-b8ff-e54f-2cd0eb23ac8a|NCT06652672|exclusion|3
+#
+# "|" is chosen BECAUSE it is outside the API's custom_id alphabet
+# ([a-zA-Z0-9_-]): no field can contain it, so the split cannot be ambiguous,
+# and a line accidentally holding a custom_id fails the four-field check loudly
+# instead of parsing as something else. "#" starts a comment and blank lines are
+# skipped, so a derivation script can stamp its own provenance into the file it
+# emits and the file stays the auditable artifact.
+#
+# EVERY FAILURE HERE IS A REFUSAL, NOT A SHRUG, and the reason is arithmetic
+# rather than taste: a subset request that silently rates FEWER decisions than
+# it names produces a smaller sample under the same headline and looks exactly
+# like a clean run. An empty intersection is the extreme case -- it rates
+# nothing, spends nothing, writes a summary of nothing, and exits 0.
+INCLUDE_KEY_SEPARATOR = "|"
+INCLUDE_KEY_FIELDS = ("patient_id", "nct_id", "arm", "index")
+
+# How many offenders a refusal names before it truncates. Naming one is not
+# enough to fix a derivation script in one pass; naming ten thousand is not a
+# message.
+_INCLUDE_REPORT_LIMIT = 10
+
+
+def parse_include_keys(text, source="<include-keys>"):
+    """Parse an include-list into ``Decision.key`` tuples, in file order.
+
+    Returns the keys as a list. Order is preserved for the manifest's record of
+    what was ASKED FOR; the selection itself re-orders onto the run's own order,
+    because request order is a property of the run and must not become a
+    property of however a derivation script happened to sort its output.
+
+    Refuses, each by name and with the offending line number:
+      * a line that is not exactly four "|"-separated fields;
+      * an empty patient_id or nct_id;
+      * an arm outside ``ARMS`` -- the vocabularies are disjoint and an
+        "inclusion_criteria" typo would match no decision at all;
+      * an index that is not a non-negative integer;
+      * the same key twice, naming both lines;
+      * a file that yields no keys.
+    """
+    keys = []
+    first_line_of = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split(INCLUDE_KEY_SEPARATOR)
+        if len(parts) != len(INCLUDE_KEY_FIELDS):
+            raise RaterRefusal(
+                f"{source}:{lineno}: expected "
+                f"{len(INCLUDE_KEY_FIELDS)} {INCLUDE_KEY_SEPARATOR!r}-separated "
+                f"fields {INCLUDE_KEY_FIELDS}, got {len(parts)}: {line!r}",
+                code="include_key_malformed")
+        patient_id, nct_id, arm, index_text = (p.strip() for p in parts)
+        if not patient_id or not nct_id:
+            raise RaterRefusal(
+                f"{source}:{lineno}: empty patient_id or nct_id in {line!r}",
+                code="include_key_malformed")
+        if arm not in ARMS:
+            raise RaterRefusal(
+                f"{source}:{lineno}: arm {arm!r} is not one of {ARMS}. The two "
+                f"arms carry disjoint status vocabularies, so a key naming "
+                f"neither would match no decision in any run.",
+                code="include_key_malformed")
+        try:
+            index = int(index_text)
+        except ValueError:
+            index = -1
+        if index < 0 or index_text != str(index):
+            raise RaterRefusal(
+                f"{source}:{lineno}: index {index_text!r} is not a "
+                f"non-negative integer. It is the decision's position within "
+                f"its arm's own array.",
+                code="include_key_malformed")
+        key = (patient_id, nct_id, arm, index)
+        if key in first_line_of:
+            raise RaterRefusal(
+                f"{source}:{lineno}: duplicate key {key!r}, first named on "
+                f"line {first_line_of[key]}. A duplicate makes the file's line "
+                f"count disagree with the number of decisions requested, and "
+                f"the reconciliation that count exists for would pass while "
+                f"measuring something else.",
+                code="include_key_duplicate")
+        first_line_of[key] = lineno
+        keys.append(key)
+
+    if not keys:
+        raise RaterRefusal(
+            f"{source} names no decision keys (every line is blank or a "
+            f"comment). An empty include list rates nothing, costs nothing and "
+            f"writes a summary of nothing -- which is indistinguishable from a "
+            f"clean run.",
+            code="include_keys_empty")
+    return keys
+
+
+def load_include_keys_file(path):
+    """``(keys, meta)`` from a file, with the file itself hashed.
+
+    The sha256 is over the file's RAW BYTES rather than over the parsed keys, so
+    the manifest records the artifact an auditor can re-read, and so a resume
+    can refuse a different file even if the two happen to name the same set.
+    """
+    path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(path):
+        raise RaterRefusal(
+            f"--include-keys names no file: {path!r}. A configuration defect "
+            f"must reach the operator before the spend, not after it.",
+            code="include_keys_absent")
+    with io.open(path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    keys = parse_include_keys(text, source=path)
+    return keys, {
+        "path": path,
+        "sha256": _sha256(text),
+        "keys_requested": len(keys),
+        "format": INCLUDE_KEY_SEPARATOR.join(INCLUDE_KEY_FIELDS),
+    }
+
+
+def select_included_decisions(decisions, keys):
+    """Exactly the named decisions, in the RUN's order, or a refusal.
+
+    The two failure directions are separated because they have different
+    owners. A key in the file that no decision carries is a defect in whatever
+    derived the file -- most often a key vocabulary that is not this one -- and
+    it is named. A decision matched twice means the run itself carries two
+    decisions under one key, which ``build_requests`` would later report as a
+    custom_id collision; catching it here says which key rather than which id.
+    """
+    by_key = {}
+    duplicated = []
+    for d in decisions:
+        if d.key in by_key:
+            duplicated.append(d.key)
+        else:
+            by_key[d.key] = d
+    wanted = set(keys)
+    if duplicated:
+        clash = sorted(k for k in duplicated if k in wanted)
+        if clash:
+            raise RaterRefusal(
+                f"{len(clash)} requested key(s) match more than one decision "
+                f"in this run, so the subset could not be built unambiguously: "
+                f"{clash[:_INCLUDE_REPORT_LIMIT]}",
+                code="include_key_ambiguous")
+
+    missing = [k for k in keys if k not in by_key]
+    if missing:
+        raise RaterRefusal(
+            f"{len(missing)} of {len(keys)} requested key(s) name no decision "
+            f"in this run. A partial intersection rates fewer decisions than "
+            f"it was asked to and reports success. First "
+            f"{min(len(missing), _INCLUDE_REPORT_LIMIT)}: "
+            + "; ".join(INCLUDE_KEY_SEPARATOR.join((p, n, a, str(i)))
+                        for p, n, a, i in missing[:_INCLUDE_REPORT_LIMIT])
+            + ". Derive the file against THIS run directory, or check that the "
+              "keys are (patient_id, nct_id, arm, index) rather than another "
+              "vocabulary.",
+            code="include_keys_unmatched")
+
+    picked = [d for d in decisions if d.key in wanted]
+    # Not an ``assert``: this file's refusals must survive ``python -O``, and a
+    # subset that has silently shrunk is the one thing the include list exists
+    # to make impossible.
+    if len(picked) != len(wanted):
+        raise RaterRefusal(
+            f"include-list bookkeeping disagrees: {len(wanted)} distinct keys "
+            f"requested, {len(picked)} decisions selected.",
+            code="include_bookkeeping")
+    return picked
+
+
+#------------------------------------------------------------------------------
 # Request construction
 #------------------------------------------------------------------------------
 
@@ -1154,13 +1361,17 @@ class RequestIndex(object):
 
     def __init__(self, requests, by_custom_id, form, system_prompt,
                  rubric_meta, mode=MODE_ANCHORED, retest_ids=(),
-                 retest_meta=None):
+                 retest_meta=None, include_keys_meta=None):
         self.requests = requests
         self.by_custom_id = by_custom_id      # custom_id -> Decision
         self.form = form
         self.system_prompt = system_prompt
         self.rubric_meta = rubric_meta
         self.mode = mode
+        # None when the whole run was selected. Never {} for that case: a
+        # reader asking "was this a subset run" must be able to tell "no" from
+        # "yes, and the metadata is missing".
+        self.include_keys_meta = include_keys_meta
         # The custom_ids that are retest duplicates. Kept as a set rather than
         # re-derived from the suffix at every read: the suffix is the wire
         # form, this is the harness's own record of what it asked twice.
@@ -1175,7 +1386,8 @@ class RequestIndex(object):
 def build_requests(run, system_prompt, rubric_meta, model, max_tokens,
                    temperature, cache_ttl, limit=0, mode=MODE_ANCHORED,
                    arm_definitions=None, retest_fraction=0.0,
-                   retest_seed=DEFAULT_RETEST_SEED):
+                   retest_seed=DEFAULT_RETEST_SEED, include_keys=None,
+                   include_keys_meta=None):
     """One request per criterion decision, in the run's deterministic order.
 
     THE MESSAGE IS SPLIT INTO TWO USER BLOCKS ON PURPOSE, and it is the single
@@ -1223,8 +1435,25 @@ def build_requests(run, system_prompt, rubric_meta, model, max_tokens,
             "is shown the answer, so asking twice measures how stable a "
             "confirmation is, not how stable a judgement is.",
             code="retest_requires_blind")
+    if include_keys is not None and limit:
+        # REFUSED RATHER THAN ORDERED. Both narrow the population and the two
+        # orders disagree: limit-then-include rates a subset of a stratified
+        # smoke slice (usually empty), include-then-limit re-stratifies the
+        # named subset and drops named keys to make room. Both produce a run
+        # that rated something other than what was asked for, and neither is
+        # the obviously-intended one, so there is no default worth guessing.
+        raise RaterRefusal(
+            "--include-keys and --limit both narrow the decisions to rate and "
+            "cannot be combined: --limit picks a stratified smoke slice, "
+            "--include-keys names an exact set, and either order silently "
+            "rates something neither flag asked for. Trim the include-list "
+            "file instead.",
+            code="include_keys_with_limit")
 
-    decisions = select_smoke_decisions(run.decisions, limit)
+    if include_keys is not None:
+        decisions = select_included_decisions(run.decisions, include_keys)
+    else:
+        decisions = select_smoke_decisions(run.decisions, limit)
     retest = (select_retest_decisions(decisions, retest_fraction, retest_seed)
               if retest_fraction else [])
     form = choose_custom_id_form(
@@ -1339,9 +1568,30 @@ def build_requests(run, system_prompt, rubric_meta, model, max_tokens,
             f"{len(retest_ids)} suffixed ids built, {len(retest_keys)} "
             f"distinct keys.", code="retest_bookkeeping")
 
+    include_meta = None
+    if include_keys is not None:
+        include_meta = dict(include_keys_meta or {})
+        include_meta.update({
+            "keys_requested": len(set(include_keys)),
+            "keys_in_file": len(include_keys),
+            "decisions_selected": len(decisions),
+            "decisions_in_run": len(run.decisions),
+            "patients_covered": len({d.patient_id for d in decisions}),
+            "share_of_run": _rate(len(decisions), len(run.decisions)),
+        })
+        # The reconciliation, asserted rather than reported. Everything above
+        # refuses on a mismatch already; this is the belt on the braces, and it
+        # is cheap next to a batch.
+        if include_meta["decisions_selected"] != include_meta["keys_requested"]:
+            raise RaterRefusal(
+                f"include-list reconciliation failed: "
+                f"{include_meta['keys_requested']} distinct keys requested, "
+                f"{include_meta['decisions_selected']} decisions selected.",
+                code="include_bookkeeping")
+
     return RequestIndex(requests, by_custom_id, form, system_prompt,
                         rubric_meta, mode=mode, retest_ids=retest_ids,
-                        retest_meta=retest_meta)
+                        retest_meta=retest_meta, include_keys_meta=include_meta)
 
 
 #------------------------------------------------------------------------------
@@ -2191,6 +2441,46 @@ def require_state_mode(state, mode, state_path):
             f"ones. Use --output-dir to keep the two apart, or delete that "
             f"file if the batches it names are finished with.",
             code="state_mode_mismatch")
+
+
+def include_keys_fingerprint(index):
+    """The subset identity a state file records: a sha256, or None for a full
+    run. ``None`` is the value an old state file's absent key already reads as,
+    so the guard below is backward compatible by construction rather than by a
+    special case."""
+    return (index.include_keys_meta or {}).get("sha256")
+
+
+def require_state_subset(state, index, state_path):
+    """Refuse a state file written against a DIFFERENT decision subset.
+
+    ``collect_results`` already refuses a returned custom_id that is not in the
+    rebuilt index, which covers one direction: resuming a subset batch against
+    a wider index would be caught. It does NOT cover the other, and that is the
+    likelier mistake -- resuming a SUBSET batch with ``--include-keys``
+    forgotten rebuilds the FULL run's index, every returned id IS in it, the
+    join succeeds, and the thousands of decisions that were never submitted are
+    reported as ``no_result``. The run then exits 3 with a summary whose
+    denominators are the whole run and whose numerators are the subset: a
+    coverage collapse that reads as a broken rater rather than a forgotten flag.
+    """
+    if not state:
+        return
+    found = state.get("include_keys_sha256")
+    want = include_keys_fingerprint(index)
+    if found == want:
+        return
+    describe = (lambda v: "the whole run (no --include-keys)"
+                if v is None else f"the include list sha256 {v[:12]}")
+    raise RaterRefusal(
+        f"the state file at {state_path!r} was written against "
+        f"{describe(found)} and this invocation names {describe(want)}. "
+        f"Resuming across a different subset joins the returned ratings onto a "
+        f"different population: the decisions that were never submitted come "
+        f"back as 'no_result' and every rate below them is computed over a "
+        f"denominator that was never asked. Repeat the flag the batch was "
+        f"submitted with, or use --output-dir to keep the two apart.",
+        code="state_subset_mismatch")
 
 
 def refuse_batch_from_other_mode(batch_ids, mode, out_dir, run_dir):
@@ -3151,7 +3441,45 @@ DEFAULT_MAX_TOKENS = 300
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_POLL_SECONDS = 45
 DEFAULT_POLL_TIMEOUT = 86400
-DEFAULT_CACHE_TTL = "1h"
+
+# 5m, AND THE SAVING IS 1.7% RATHER THAN THE 25% IT WAS CHANGED FOR. Both
+# figures are kept because the difference between them is the lesson.
+#
+# WHY IT WAS CHANGED. A cache WRITE is the most expensive token class, and batch
+# parallelism makes far more of them than the estimator's floor assumes: on the
+# 1.8.0 blind run (``rater_blind_1_8_0_20260816/cost_forensics.json``) the floor
+# assumed one write per distinct prefix -- ten patients, ten writes -- and the
+# API made 432. 2,463,401 write tokens at the 1h premium (2.0x base) was $7.39
+# of a $13.58 bill. Re-priced at the 5m premium (1.25x) that is $4.62, putting
+# the run at $10.81 under its $13.00 gate. That arithmetic is correct and it
+# holds the WRITE VOLUME FIXED, which is the assumption the forensics itself
+# declined to stand behind, in writing: "not a prediction: a 5m ttl can also
+# change the write VOLUME, since an entry that expires mid-batch is rewritten".
+#
+# WHAT ACTUALLY HAPPENED, measured on the 1.9.0 blind run
+# (``rater_blind_1_9_0_20260817/analysis.json :: section5.ttl_measurement``):
+#
+#     write rate      $3.0000 -> $1.8750 /Mtok    0.625x
+#     write volume     1,026  ->  1,648  tok/req  1.606x
+#     write COST       $7.3902 -> $7.2304         0.978x
+#     cache hit rate    94.3%  ->   80.3%
+#     wall time         369.6s ->   415.6s   -- BOTH outrun the 300s window
+#
+# The rate saving was eaten by the volume. A 5m entry that expires mid-batch is
+# rewritten, so tokens moved out of the read bucket ($0.15/Mtok) into the write
+# bucket ($1.875/Mtok) -- 12.5x dearer per token. Counterfactual, and it is an
+# assumption rather than a measurement because the only way to measure it is to
+# pay for the other arm: that run at 1h with the 1.8.0 run's per-request cache
+# behaviour is $13.13 against the $12.90 paid, so 5m saved $0.23, or 1.7%.
+#
+# SO THE DEFAULT STANDS ON A SMALL MEASURED SAVING, NOT A LARGE PREDICTED ONE,
+# and it is workload-dependent in a way worth stating: a batch that finishes
+# inside five minutes keeps the cheaper rate AND the hit rate, and gains the
+# full ~37%; a batch that outruns it trades most of that back. Both batches
+# measured so far outran it. ``--cache-ttl 1h`` is the right choice for a long
+# batch and is one flag away. Read ``measured_cache`` -- hit rate and write
+# count -- on every run rather than trusting either figure above.
+DEFAULT_CACHE_TTL = "5m"
 
 
 def _parse_args(argv=None):
@@ -3182,7 +3510,14 @@ def _parse_args(argv=None):
                         "which is required on models that reject non-default "
                         "sampling parameters")
     p.add_argument("--cache-ttl", choices=("5m", "1h"),
-                   default=DEFAULT_CACHE_TTL)
+                   default=DEFAULT_CACHE_TTL,
+                   help="prompt-cache lifetime. Default 5m: a cache WRITE is "
+                        "the most expensive token class and batch parallelism "
+                        "makes many of them, so the write premium (1.25x at "
+                        "5m, 2.0x at 1h) dominates. Use 1h for a batch "
+                        "expected to run longer than five minutes, where a 5m "
+                        "entry expiring mid-batch is rewritten rather than "
+                        "read.")
     p.add_argument("--no-cache", action="store_true",
                    help="omit cache_control; costs several times more")
     p.add_argument("--blind", action="store_true",
@@ -3200,6 +3535,12 @@ def _parse_args(argv=None):
                         "manifest so the selection can be recomputed")
     p.add_argument("--limit", type=int, default=0,
                    help="rate only the first N decisions (a cheap pilot)")
+    p.add_argument("--include-keys", metavar="FILE", default=None,
+                   help="rate ONLY the decisions named in FILE: one key per "
+                        "line as patient_id|nct_id|arm|index (the rater's own "
+                        "join key), '#' comments and blank lines allowed. Any "
+                        "key that names no decision in the run is a refusal, "
+                        "not a shrug. Cannot be combined with --limit.")
     p.add_argument("--poll-seconds", type=int, default=DEFAULT_POLL_SECONDS)
     p.add_argument("--poll-timeout", type=int, default=DEFAULT_POLL_TIMEOUT)
     p.add_argument("--count-tokens", action="store_true",
@@ -3222,6 +3563,26 @@ def _prepare(args):
             "shown the answer, so asking twice measures the stability of a "
             "confirmation rather than of a judgement.",
             code="retest_requires_blind")
+
+    # THE INCLUDE LIST IS RESOLVED IN TWO HALVES, AT TWO DIFFERENT POINTS, and
+    # the split is the ordering rule this function already follows for
+    # --retest-fraction: what can be decided from the flags alone is decided
+    # before a run directory is resolved, so the diagnosis names the flag
+    # rather than the corpus. A malformed line, a duplicate key, an empty file
+    # and the --limit collision are all properties of the arguments; only
+    # "this key names no decision" needs the run, and that half happens inside
+    # build_requests below.
+    include_path = getattr(args, "include_keys", None)
+    if include_path and getattr(args, "limit", 0):
+        raise RaterRefusal(
+            "--include-keys and --limit both narrow the decisions to rate and "
+            "cannot be combined: --limit picks a stratified smoke slice, "
+            "--include-keys names an exact set, and either order silently "
+            "rates something neither flag asked for. Trim the include-list "
+            "file instead.",
+            code="include_keys_with_limit")
+    include_keys, include_meta = (load_include_keys_file(include_path)
+                                  if include_path else (None, None))
 
     run_dir = args.run_dir or default_run_dir()
     run_dir = os.path.abspath(os.path.expanduser(run_dir))
@@ -3252,7 +3613,8 @@ def _prepare(args):
         run, system_prompt, rubric_meta, args.model, args.max_tokens,
         temperature, cache_ttl or "5m", limit=max(0, args.limit), mode=mode,
         arm_definitions=arm_definitions, retest_fraction=retest_fraction,
-        retest_seed=getattr(args, "retest_seed", DEFAULT_RETEST_SEED))
+        retest_seed=getattr(args, "retest_seed", DEFAULT_RETEST_SEED),
+        include_keys=include_keys, include_keys_meta=include_meta)
     if args.no_cache:
         for req in index.requests:
             for block in req["params"]["system"]:
@@ -3299,7 +3661,18 @@ def _report_plan(run, index, out_dir, args, cache_ttl, calibration=None):
     console.out(f"  patients           {len(run.summaries)}")
     console.out(f"  criterion decisions{len(run.decisions):>8}")
     console.out(f"  requests to send   {len(index.requests):>8}"
-                + ("   (--limit applied)" if args.limit else ""))
+                + ("   (--limit applied)" if args.limit else "")
+                + ("   (--include-keys applied)"
+                   if index.include_keys_meta else ""))
+    if index.include_keys_meta:
+        im = index.include_keys_meta
+        console.out(f"    include list     {im['keys_requested']:>8} keys "
+                    f"-> {im['decisions_selected']} decisions "
+                    f"({_fmt_rate(im['share_of_run']).strip()} of the run's "
+                    f"{im['decisions_in_run']}), over "
+                    f"{im['patients_covered']} patients")
+        console.out(f"                     sha {im['sha256'][:12]}  "
+                    f"{im['path']}")
     if index.retest_ids:
         rm = index.retest_meta
         console.out(f"    of which retest  {len(index.retest_ids):>8}"
@@ -3418,6 +3791,7 @@ def main(argv=None):
     state = read_state(state_path) or {}
     try:
         require_state_mode(state, index.mode, state_path)
+        require_state_subset(state, index, state_path)
     except RaterRefusal as exc:
         console.out(f"REFUSED: {exc}")
         log.error("rater.refused", stage="state", reason=exc.code)
@@ -3427,6 +3801,7 @@ def main(argv=None):
                   "custom_id_form": index.form,
                   "retest_requests": len(index.retest_ids),
                   "requests": len(index.requests),
+                  "include_keys_sha256": include_keys_fingerprint(index),
                   "rubric_sha256": index.rubric_meta["rubric_sha256"]})
 
     plan = None
@@ -3563,12 +3938,18 @@ def main(argv=None):
         "api_key_source": key_source,
         "mode": index.mode,
         "retest": index.retest_meta,
+        # None, not {}, when the whole run was rated -- so a reader can tell
+        # "this was a full run" from "this was a subset and the record of which
+        # subset is missing". Every rate in summary.json is over the SELECTED
+        # population, so this block is what says what that population was.
+        "include_keys": index.include_keys_meta,
         "request": {
             "max_tokens": args.max_tokens,
             "temperature": temperature,
             "cache_ttl": cache_ttl,
             "custom_id_form": index.form,
             "limit": args.limit or None,
+            "include_keys_file": (index.include_keys_meta or {}).get("path"),
         },
         "batch_ids": [b["id"] for b in state.get("batches", [])],
         "primary_batch_ids": batch_ids,

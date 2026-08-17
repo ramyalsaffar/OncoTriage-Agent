@@ -63,11 +63,16 @@ USAGE
     python rater_run.py --dry-run --blind --retest-fraction 0.05 --run-dir <run>
     python rater_run.py --submit  --blind --retest-fraction 0.05  # COSTS MONEY
 
+    # a named subset: one patient_id|nct_id|arm|index per line
+    python rater_run.py --dry-run --blind --include-keys keys.txt --run-dir <run>
+
 ``--resume`` REBUILDS THE REQUEST INDEX FROM THE RUN DIRECTORY, so a resumed
 session must repeat every flag that shaped it -- ``--blind``,
-``--retest-fraction``, ``--retest-seed``, ``--limit``, ``--run-dir``. Forgetting
-one does not mis-join silently: the returned custom_ids would not be in the
-rebuilt index and the join refuses by name.
+``--retest-fraction``, ``--retest-seed``, ``--limit``, ``--include-keys``,
+``--run-dir``. Forgetting one does not mis-join silently. Widening the index
+(resuming a subset batch WITHOUT the flag) is caught by the state file's
+recorded include-list sha256; narrowing it is caught by the join, because the
+returned custom_ids would not be in the rebuilt index.
 
 Exit codes:
     0 -- every decision was rated and the outputs were written

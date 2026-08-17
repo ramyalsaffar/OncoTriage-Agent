@@ -1928,6 +1928,563 @@ check("8q  --retest-fraction without --blind is refused, by its own slug, "
                                       "0.1"])),
       "retest_requires_blind")
 
+
+# ===========================================================================
+# SECTION 9 -- THE INCLUDE LIST (--include-keys)
+# ===========================================================================
+#
+# WHAT IS UNDER TEST. A file naming an exact set of decisions to rate, in the
+# rater's own join key ``patient_id|nct_id|arm|index``. The property that
+# matters is not "it selects fewer" -- it is that it selects EXACTLY what it was
+# asked for or refuses. A subset request that quietly rates a partial
+# intersection produces a smaller sample under the same headline and is
+# indistinguishable from a clean run, and an empty intersection rates nothing,
+# spends nothing and exits 0.
+#
+# HOW THE CONTROLS ARE BUILT. Almost everything here is a pure function of its
+# argument, so the natural control is a DIFFERENT INPUT rather than a mutated
+# copy of the module -- the same footing as
+# ``tests/test_agent_patient_hash_coverage.py``. Every "must refuse" is paired
+# with the neighbouring input that must NOT refuse, and every "must be
+# byte-identical" with the input that must differ; otherwise a check that had
+# stopped checking would pass by refusing everything or by agreeing with
+# everything.
+#
+# THE STRONGEST CHECK IN THIS SECTION IS ALREADY ABOVE IT. Section 8a pins the
+# serialized anchored request list against a sha measured before blind mode
+# existed. It still passes, which is what says this section's flag changed no
+# byte of a run that does not use it. 9a asserts the other half of that -- that
+# such a run reports NO subset metadata, rather than an empty dict a reader
+# would have to interpret.
+
+print("\n" + "=" * 70)
+print("SECTION 9 -- the include list: exactly what was asked, or a refusal")
+print("=" * 70)
+
+import os as _os9                                              # noqa: E402
+import shutil as _shutil9                                      # noqa: E402
+import tempfile as _tempfile9                                   # noqa: E402
+
+
+def _key_line(d):
+    """One include-list line for a Decision."""
+    return R.INCLUDE_KEY_SEPARATOR.join(
+        (d.patient_id, d.nct_id, d.arm, str(d.index)))
+
+
+def keyfile_text(decisions, header=True):
+    """The include-list text naming exactly these decisions."""
+    lines = ["# planted include list"] if header else []
+    lines.extend(_key_line(d) for d in decisions)
+    return "\n".join(lines) + "\n"
+
+
+def n_requests(index):
+    """The request count, or a named absence.
+
+    ``len(index.requests)`` aborts the whole file the moment a regression makes
+    ``build_requests`` refuse -- which is exactly when this file owes a
+    summary. The first version of 9i did precisely that: it passed ``limit=5``
+    to a planted run holding six (arm, status) cells, the smoke selector
+    refused as it should, and the run died with a traceback where it owed 46
+    results. Same shape as ``field`` and ``bucket`` above.
+    """
+    if not hasattr(index, "requests"):
+        return "<no requests: %r>" % (index,)
+    return len(index.requests)
+
+
+def meta_of(index, key):
+    """One field of an index's subset metadata, or a named absence."""
+    if not hasattr(index, "include_keys_meta"):
+        return "<no index: %r>" % (index,)
+    if not isinstance(index.include_keys_meta, dict):
+        return "<include_keys_meta is %r>" % (index.include_keys_meta,)
+    return index.include_keys_meta.get(key, "<field absent>")
+
+
+def keys_of(index):
+    """The selected decisions' keys in request order, or a named absence."""
+    if not hasattr(index, "requests"):
+        return "<no requests: %r>" % (index,)
+    return [index.by_custom_id[r["custom_id"]].key for r in index.requests]
+
+
+def dig(obj, *path):
+    """Walk a nested mapping that may be a named absence at any depth.
+
+    The general form of ``field`` / ``meta_of`` / ``rounded``. The revert
+    harness walked this file's guards outward one call site at a time -- a
+    marker reaching ``.requests``, then ``round()``, then an attribute read,
+    then a subscript -- which is the argument for having one of these rather
+    than four ad-hoc ones.
+    """
+    cur = obj
+    for step in path:
+        if isinstance(cur, dict):
+            if step not in cur:
+                return "<%r absent>" % (step,)
+            cur = cur[step]
+        else:
+            return "<not a mapping: %r>" % (cur,)
+    return cur
+
+
+def has(obj, *path):
+    """True/False for presence, or the marker explaining why it could not ask."""
+    got = dig(obj, *path)
+    if isinstance(got, str) and got.startswith("<not a mapping"):
+        return got
+    return not (isinstance(got, str) and got.endswith(" absent>"))
+
+
+def fingerprint_of(index):
+    """``include_keys_fingerprint`` on a value that may be a named absence.
+
+    The production function reads an attribute and must NOT be widened to
+    accept a non-index -- that would make it silently answer for a caller who
+    passed the wrong thing. So the tolerance lives here, at the call site,
+    which is where a marker can appear.
+    """
+    if not hasattr(index, "include_keys_meta"):
+        return "<no index: %r>" % (index,)
+    return R.include_keys_fingerprint(index)
+
+
+def rounded(value, digits):
+    """round() on a value that may be a named absence.
+
+    A guard that returns a marker STRING is only half the fix if the call site
+    then does arithmetic on it: the revert harness got past ``meta_of`` and died
+    on ``round("<include_keys_meta is None>", 4)``. The guard has to reach the
+    outermost operation, not the innermost read.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return value
+    return round(value, digits)
+
+
+def cids_of(index):
+    """The custom_ids in request order, or a named absence."""
+    if not hasattr(index, "requests"):
+        return "<no requests: %r>" % (index,)
+    return [r["custom_id"] for r in index.requests]
+
+
+def ttls_of(index):
+    """Every cache_control ttl on the wire, deduplicated and sorted.
+
+    Reads BOTH the system block and the user content blocks, because the two
+    are set from one variable and a change that reached only one of them would
+    otherwise pass.
+    """
+    if not hasattr(index, "requests"):
+        return "<no requests: %r>" % (index,)
+    return sorted({b["cache_control"]["ttl"] for r in index.requests
+                   for b in (r["params"]["system"]
+                             + r["params"]["messages"][0]["content"])
+                   if "cache_control" in b})
+
+
+def built_with(keys, mode=R.MODE_BLIND, run=None, meta=None, limit=0):
+    """A RequestIndex over the planted run with an include list, or a marker."""
+    rubric = _FIXED_RUBRIC
+    defs = (drive(R.lift_arm_status_definitions, rubric)
+            if mode == R.MODE_BLIND else None)
+    if isinstance(defs, str):
+        return defs
+    return drive(R.build_requests, run or planted_run(),
+                 drive(R.build_system_prompt, rubric, mode=mode),
+                 {"rubric_sha256": "x"}, _MODEL, 300, 0.0, "1h",
+                 mode=mode, arm_definitions=defs, limit=limit,
+                 include_keys=keys, include_keys_meta=meta)
+
+
+_ALL = planted_run().decisions
+# Three decisions spanning both arms and both patients, so the subset cannot be
+# satisfied by a prefix and cannot be a single patient -- the two degenerate
+# shapes a selection bug produces.
+_SUBSET = [_ALL[0], _ALL[2], _ALL[4]]
+_SUBSET_KEYS = [d.key for d in _SUBSET]
+
+# --- 9a -- NO FLAG, NO CHANGE, AND NO EMPTY DICT EITHER -------------------
+check("9a  a run with no include list reports include_keys_meta None, not {} "
+      "-- so 'full run' is distinguishable from 'subset, metadata lost'",
+      (built(R.MODE_ANCHORED).include_keys_meta,
+       built(R.MODE_BLIND).include_keys_meta), (None, None))
+check("9a  and the fingerprint a state file records is None for a full run, "
+      "which is what an old state file's absent key already reads as",
+      fingerprint_of(built(R.MODE_BLIND)), None)
+
+# --- 9b -- THE FULL SET THROUGH THE SUBSET PATH IS BYTE-IDENTICAL ---------
+# The equivalence that matters: naming EVERY key must produce the same wire
+# bytes as not passing the flag at all. If it does not, the subset path has
+# reordered or re-shaped requests and every subset run is measuring something
+# with a different request body from the full run it is compared against.
+_all_keys = [d.key for d in _ALL]
+check("9b  an include list naming every decision serialises byte-identically "
+      "to the same run with no flag (blind)",
+      blob(built_with(_all_keys)) == blob(built(R.MODE_BLIND)), True)
+check("9b  and anchored likewise",
+      blob(built_with(_all_keys, mode=R.MODE_ANCHORED))
+      == blob(built(R.MODE_ANCHORED)), True)
+# THE CONTROL. Without it, 9b would also pass for a filter that ignored its
+# argument and always selected everything -- which is the one bug that makes
+# every subset run silently rate the whole corpus and pay for it.
+check("9b  CONTROL: a proper subset does NOT serialise identically, so the "
+      "comparison above can fail",
+      blob(built_with(_SUBSET_KEYS)) == blob(built(R.MODE_BLIND)), False)
+
+# --- 9c -- THE REQUEST COUNT IS THE COUNT ASKED FOR ----------------------
+_sub = built_with(_SUBSET_KEYS)
+check("9c  the subset sends exactly one request per key",
+      n_requests(_sub), len(_SUBSET_KEYS))
+check("9c  and the run is bigger than the subset, so the count is not "
+      "trivially the whole run",
+      (len(_ALL) > len(_SUBSET_KEYS), len(_ALL)), (True, 7))
+check("9c  every request maps to a requested key and nothing else",
+      sorted(keys_of(_sub)), sorted(_SUBSET_KEYS))
+# Patients and arms are read off the guarded key list rather than off
+# ``_sub.requests``, so a revert that makes build_requests REFUSE (r5 makes the
+# reconciliation fire) records failures here instead of killing the file. The
+# revert harness caught this shape in the first version of this section.
+check("9c  the subset spans both patients and both arms, so a selection that "
+      "collapsed to one of either would be visible",
+      (len({k[0] for k in keys_of(_sub)}) if isinstance(keys_of(_sub), list)
+       else keys_of(_sub),
+       len({k[2] for k in keys_of(_sub)}) if isinstance(keys_of(_sub), list)
+       else keys_of(_sub)),
+      (2, 2))
+
+# --- 9d -- ORDER IS THE RUN'S, NEVER THE FILE'S --------------------------
+# Request order must be a property of the run. If it followed the file, two
+# derivation scripts sorting their output differently would produce different
+# cache locality and different bytes for the same measurement.
+_reversed_keys = list(reversed(_SUBSET_KEYS))
+check("9d  reversing the file's key order changes no byte of the request list",
+      blob(built_with(_reversed_keys)) == blob(built_with(_SUBSET_KEYS)), True)
+check("9d  CONTROL: the two key lists really are in different orders",
+      _reversed_keys != _SUBSET_KEYS, True)
+# THE EXPECTATION IS THE RUN'S OWN SEQUENCE, NOT A SORT OF IT, and the first
+# version of this line got that wrong: it re-derived the order with
+# ``load_run``'s (patient_index, nct, arm, index) sort key and failed, because
+# the planted run is deliberately NOT sorted -- ``planted_run`` returns the
+# literals in the order ``_PLANT`` lists them. Reading a real run would have
+# hidden the mistake, since there the two agree. The property ``build_requests``
+# actually promises in its own comment is weaker and better: selection owns the
+# order and the request loop preserves it, so the subset must be the
+# order-preserving SUBSEQUENCE of whatever the caller supplied.
+check("9d  and the selected order is the run's own sequence, preserved as a "
+      "subsequence rather than re-derived by a sort",
+      keys_of(_sub), [d.key for d in _ALL if d.key in set(_SUBSET_KEYS)])
+check("9d  CONTROL: that expectation is not the same as load_run's sort key, "
+      "so the check above is not satisfied by either order",
+      [d.key for d in _ALL if d.key in set(_SUBSET_KEYS)]
+      == sorted(_SUBSET_KEYS,
+                key=lambda k: (_ORDER[k[0]], k[1], k[2], k[3])), False)
+
+# --- 9e -- THE JOIN, ON THE SUBSET, LOSSLESSLY ---------------------------
+# The whole point of the key vocabulary. Every custom_id must decode back to
+# the decision it was built from, and the ids must be distinct.
+_by_ord = {v: k for k, v in _ORDER.items()}
+_sub_cids = cids_of(_sub)
+check("9e  every subset custom_id round-trips to its own key",
+      drive(lambda: [R.decode_custom_id(c, _sub.form, _by_ord)
+                     for c in _sub_cids]), keys_of(_sub))
+check("9e  and the ids are distinct",
+      len(set(_sub_cids)) if isinstance(_sub_cids, list) else _sub_cids,
+      n_requests(_sub))
+check("9e  a retest duplicate on a subset still joins onto its primary's key, "
+      "so the intra-rater pairing survives the filter",
+      drive(lambda: all(
+          R.decode_custom_id(R.encode_retest_custom_id(c), _sub.form, _by_ord)
+          == R.decode_custom_id(c, _sub.form, _by_ord)
+          for c in _sub_cids)), True)
+_sub_retest = drive(
+    R.build_requests, planted_run(),
+    drive(R.build_system_prompt, _FIXED_RUBRIC, mode=R.MODE_BLIND),
+    {"rubric_sha256": "x"}, _MODEL, 300, 0.0, "1h", mode=R.MODE_BLIND,
+    arm_definitions=drive(R.lift_arm_status_definitions, _FIXED_RUBRIC),
+    retest_fraction=1.0, include_keys=_SUBSET_KEYS)
+check("9e  --retest-fraction on a subset duplicates only subset decisions, "
+      "so the intra-rater measurement is over the population being rated",
+      (n_requests(_sub_retest), len(getattr(_sub_retest, "retest_ids", ())),
+       sorted({_sub_retest.by_custom_id[c].key
+               for c in getattr(_sub_retest, "retest_ids", ())})),
+      (len(_SUBSET_KEYS) * 2, len(_SUBSET_KEYS), sorted(_SUBSET_KEYS)))
+
+# --- 9f -- UNKNOWN KEYS ARE A REFUSAL, NOT A PARTIAL INTERSECTION --------
+_ghost = ("pZ", "NCT09999999", "inclusion", 0)
+check("9f  a key naming no decision in the run refuses by its own slug",
+      refusal_code(R.select_included_decisions, _ALL,
+                   _SUBSET_KEYS + [_ghost]), "include_keys_unmatched")
+check("9f  CONTROL: the same call without the ghost key does not refuse",
+      refusal_code(R.select_included_decisions, _ALL, _SUBSET_KEYS),
+      "<did not raise>")
+check("9f  an EMPTY intersection refuses too -- the case that would otherwise "
+      "rate nothing, spend nothing and exit 0",
+      refusal_code(R.select_included_decisions, _ALL, [_ghost]),
+      "include_keys_unmatched")
+check("9f  the message names the unmatched key and how many, so a derivation "
+      "script can be fixed in one pass",
+      all(part in str(drive(lambda: R.select_included_decisions(
+          _ALL, _SUBSET_KEYS + [_ghost])))
+          for part in ("1 of 4", "pZ", "NCT09999999")), True)
+# The near-miss that a looser matcher would swallow: the RIGHT patient, trial
+# and arm at the WRONG index. This is the shape a positional-vocabulary
+# mismatch produces, and it must refuse rather than silently rate a neighbour.
+_off_by_one = (_ALL[0].patient_id, _ALL[0].nct_id, _ALL[0].arm,
+               _ALL[0].index + 99)
+check("9f  the right (patient, trial, arm) at a wrong index refuses -- a "
+       "near-miss is not a match",
+      refusal_code(R.select_included_decisions, _ALL, [_off_by_one]),
+      "include_keys_unmatched")
+check("9f  an arm swapped for the other arm's name refuses, not matches the "
+      "same index in the other arm",
+      refusal_code(R.select_included_decisions, _ALL,
+                   [(_ALL[3].patient_id, _ALL[3].nct_id, "exclusion",
+                     _ALL[3].index)]),
+      "include_keys_unmatched")
+
+# --- 9g -- THE FILE FORMAT, AND EVERY WAY IT CAN BE WRONG ----------------
+_good = "%s|NCT00000001|inclusion|0" % _ALL[0].patient_id
+check("9g  one key per line, four pipe-separated fields",
+      drive(R.parse_include_keys, _good + "\n"),
+      [(_ALL[0].patient_id, "NCT00000001", "inclusion", 0)])
+check("9g  comments and blank lines are skipped, so a derivation script can "
+      "stamp its provenance into the artifact",
+      drive(R.parse_include_keys,
+            "# provenance: derived from tlib9.is_temporal\n"
+            "\n   \n" + _good + "   # trailing note\n"),
+      [(_ALL[0].patient_id, "NCT00000001", "inclusion", 0)])
+check("9g  file order is preserved in the parse (the manifest records what "
+      "was ASKED for; selection re-orders onto the run)",
+      drive(R.parse_include_keys,
+            "pB|NCT3|exclusion|1\npA|NCT1|inclusion|0\n"),
+      [("pB", "NCT3", "exclusion", 1), ("pA", "NCT1", "inclusion", 0)])
+for _label, _text, _slug in (
+        ("three fields", "pA|NCT1|inclusion\n", "include_key_malformed"),
+        ("five fields", "pA|NCT1|inclusion|0|extra\n",
+         "include_key_malformed"),
+        ("a custom_id instead of a key", "pA_NCT00000001_inclusion_0\n",
+         "include_key_malformed"),
+        ("empty patient_id", "|NCT1|inclusion|0\n", "include_key_malformed"),
+        ("empty nct_id", "pA||inclusion|0\n", "include_key_malformed"),
+        ("an arm outside the vocabulary", "pA|NCT1|inclusion_criteria|0\n",
+         "include_key_malformed"),
+        ("a capitalised arm", "pA|NCT1|Inclusion|0\n",
+         "include_key_malformed"),
+        ("a non-integer index", "pA|NCT1|inclusion|first\n",
+         "include_key_malformed"),
+        ("a negative index", "pA|NCT1|inclusion|-1\n",
+         "include_key_malformed"),
+        ("a float index", "pA|NCT1|inclusion|0.0\n",
+         "include_key_malformed"),
+        ("a padded index that is not its own str()",
+         "pA|NCT1|inclusion|00\n", "include_key_malformed"),
+        ("an empty file", "", "include_keys_empty"),
+        ("a file of only comments and blanks", "# nothing\n\n   \n",
+         "include_keys_empty"),
+        ("the same key twice", _good + "\n" + _good + "\n",
+         "include_key_duplicate")):
+    check(f"9g  refused: {_label}",
+          refusal_code(R.parse_include_keys, _text, "f"), _slug)
+check("9g  CONTROL: two DIFFERENT keys are not a duplicate",
+      len(drive(R.parse_include_keys,
+                "pA|NCT1|inclusion|0\npA|NCT1|inclusion|1\n")), 2)
+check("9g  the malformed message names the line number, so the file is "
+      "editable without re-deriving it",
+      "f:3" in str(drive(lambda: R.parse_include_keys(
+          "# c\n" + _good + "\npA|NCT1|inclusion\n", "f"))), True)
+check("9g  the duplicate message names BOTH lines",
+      all(w in str(drive(lambda: R.parse_include_keys(
+          _good + "\n" + _good + "\n", "f")))
+          for w in ("f:2", "line 1")), True)
+
+# --- 9h -- THE FILE ON DISK, ITS HASH, AND THE RECONCILIATION -----------
+_tmp9 = _tempfile9.mkdtemp(prefix="rater_include_")
+try:
+    _p_ok = _os9.path.join(_tmp9, "subset.txt")
+    with open(_p_ok, "w", encoding="utf-8") as _fh:
+        _fh.write(keyfile_text(_SUBSET))
+    _keys9, _meta9 = drive(R.load_include_keys_file, _p_ok)
+    check("9h  the file parses to the keys it names", _keys9, _SUBSET_KEYS)
+    check("9h  the metadata carries the absolute path, the requested count "
+          "and the format, so the manifest records a re-readable artifact",
+          (_meta9["path"], _meta9["keys_requested"], _meta9["format"]),
+          (_p_ok, 3, "patient_id|nct_id|arm|index"))
+    check("9h  the sha256 is over the file's raw bytes",
+          _meta9["sha256"], sha(keyfile_text(_SUBSET)))
+    # THE HASH IS OVER BYTES, NOT OVER THE PARSED KEY SET, and that is the
+    # point: a resume must refuse a file that has been re-derived even if the
+    # two happen to name the same decisions, because "same set" is exactly the
+    # thing the operator cannot check by eye.
+    _p_same = _os9.path.join(_tmp9, "subset_recomment.txt")
+    with open(_p_same, "w", encoding="utf-8") as _fh:
+        _fh.write(keyfile_text(_SUBSET, header=False))
+    check("9h  a file naming the same keys with different bytes hashes "
+          "differently, and still parses to the same keys",
+          (drive(R.load_include_keys_file, _p_same)[1]["sha256"]
+           == _meta9["sha256"],
+           drive(R.load_include_keys_file, _p_same)[0] == _keys9),
+          (False, True))
+    _p_missing = _os9.path.join(_tmp9, "not_there.txt")
+    check("9h  a nonexistent file refuses before anything is priced",
+          refusal_code(R.load_include_keys_file, _p_missing),
+          "include_keys_absent")
+    _p_empty = _os9.path.join(_tmp9, "empty.txt")
+    with open(_p_empty, "w", encoding="utf-8") as _fh:
+        _fh.write("# derived nothing\n")
+    check("9h  an empty file on disk refuses by the empty slug, not the "
+          "absent one",
+          refusal_code(R.load_include_keys_file, _p_empty),
+          "include_keys_empty")
+
+    _sub9 = built_with(_keys9, meta=_meta9)
+    check("9h  the index's subset metadata reconciles: keys requested == "
+          "decisions selected == requests sent",
+          (meta_of(_sub9, "keys_requested"),
+           meta_of(_sub9, "decisions_selected"),
+           n_requests(_sub9)), (3, 3, 3))
+    check("9h  and it records the run's own size and the share, so a reader "
+          "of summary.json knows what population the rates are over",
+          (meta_of(_sub9, "decisions_in_run"),
+           meta_of(_sub9, "patients_covered"),
+           rounded(meta_of(_sub9, "share_of_run"), 4)),
+          (7, 2, round(3 / 7.0, 4)))
+    check("9h  the fingerprint a state file records is the file's sha",
+          fingerprint_of(_sub9), _meta9["sha256"])
+finally:
+    _shutil9.rmtree(_tmp9, ignore_errors=True)
+check("9h  the temp directory is removed", _os9.path.exists(_tmp9), False)
+
+# --- 9i -- --limit AND --include-keys CANNOT BE COMBINED ----------------
+check("9i  build_requests refuses the combination by its own slug",
+      refusal_code(
+          R.build_requests, planted_run(),
+          drive(R.build_system_prompt, _FIXED_RUBRIC, mode=R.MODE_ANCHORED),
+          {"rubric_sha256": "x"}, _MODEL, 300, 0.0, "1h", limit=3,
+          include_keys=_SUBSET_KEYS), "include_keys_with_limit")
+check("9i  CONTROL: the same call with limit=0 does not refuse",
+      refusal_code(
+          R.build_requests, planted_run(),
+          drive(R.build_system_prompt, _FIXED_RUBRIC, mode=R.MODE_ANCHORED),
+          {"rubric_sha256": "x"}, _MODEL, 300, 0.0, "1h", limit=0,
+          include_keys=_SUBSET_KEYS), "<did not raise>")
+# limit=6, not 5: the planted run holds six (arm, status) cells and the smoke
+# selector rightly refuses a budget that cannot span them. The first version of
+# this line passed 5 and killed the run -- see ``n_requests`` above.
+check("9i  CONTROL: --limit alone still works, so the guard has not disabled "
+      "the smoke path",
+      n_requests(drive(R.build_requests, planted_run(),
+                       drive(R.build_system_prompt, _FIXED_RUBRIC,
+                             mode=R.MODE_ANCHORED),
+                       {"rubric_sha256": "x"}, _MODEL, 300, 0.0, "1h",
+                       limit=6)), 6)
+
+# --- 9j -- THE CLI, AND THE ORDERING OF ITS REFUSALS -------------------
+check("9j  --include-keys is a real argument and defaults off",
+      (drive(R._parse_args, ["--dry-run", "--include-keys", "k.txt"]
+             ).include_keys,
+       drive(R._parse_args, ["--dry-run"]).include_keys), ("k.txt", None))
+# The slug, not merely the raise, and for the reason section 8q states: on a
+# machine with no evaluation-run directory _prepare would raise
+# RaterRefusal("run_dir_invalid") anyway, so asserting only that it raised
+# would pass for the wrong reason and make this file depend on the corpus.
+check("9j  --include-keys with --limit is refused by _prepare BEFORE any run "
+      "directory is resolved",
+      refusal_code(R._prepare, drive(
+          R._parse_args, ["--dry-run", "--include-keys", "k.txt",
+                          "--limit", "5"])), "include_keys_with_limit")
+check("9j  a nonexistent include file is refused before any run directory is "
+      "resolved too",
+      refusal_code(R._prepare, drive(
+          R._parse_args, ["--dry-run", "--include-keys",
+                          "/nonexistent/rater-include-keys.txt"])),
+      "include_keys_absent")
+
+# --- 9k -- THE STATE FILE CANNOT BE READ ACROSS SUBSETS ----------------
+# collect_results already refuses a returned custom_id absent from the rebuilt
+# index, which catches resuming a subset batch against a WIDER index. The
+# reverse -- resuming a subset batch with the flag FORGOTTEN -- is not caught
+# there: every returned id IS in the full index, the join succeeds, and the
+# thousands never submitted come back as no_result. That is what this guard is.
+_full_idx = built(R.MODE_BLIND)
+_sub_idx = built_with(_SUBSET_KEYS)
+_SUB_SHA = "a" * 64
+check("9k  a subset state file resumed with the flag forgotten refuses",
+      refusal_code(R.require_state_subset, {"include_keys_sha256": _SUB_SHA},
+                   _full_idx, "/s"), "state_subset_mismatch")
+# Built ONCE and checked to be an index before it is used three times: under a
+# revert that makes build_requests refuse, ``_sub_sha_idx`` is a marker string
+# and require_state_subset would raise AttributeError instead of recording
+# three failures. The probe is what turns that into a named failure.
+_sub_sha_idx = built_with(_SUBSET_KEYS, meta={"sha256": _SUB_SHA})
+check("9k  the subset index under test really is an index (probe, so the three "
+      "checks below cannot pass or abort for the wrong reason)",
+      fingerprint_of(_sub_sha_idx), _SUB_SHA)
+check("9k  and a full-run state file resumed WITH a subset refuses",
+      refusal_code(R.require_state_subset, {"mode": "blind"},
+                   _sub_sha_idx, "/s"), "state_subset_mismatch")
+check("9k  and a DIFFERENT subset refuses",
+      refusal_code(R.require_state_subset, {"include_keys_sha256": "b" * 64},
+                   _sub_sha_idx, "/s"), "state_subset_mismatch")
+check("9k  CONTROL: the matching subset does not refuse",
+      refusal_code(R.require_state_subset, {"include_keys_sha256": _SUB_SHA},
+                   _sub_sha_idx, "/s"), "<did not raise>")
+# BACKWARD COMPATIBILITY, ASSERTED. Every state file on disk predates this flag
+# and carries no such key. .get() returns None, which is also what a full run
+# fingerprints to -- so an old file resumes rather than refusing. If that ever
+# stops holding, every existing rater_state.json becomes unresumable.
+check("9k  CONTROL: a state file predating the flag resumes a full run",
+      refusal_code(R.require_state_subset, {"mode": "blind",
+                                            "requests": 2401},
+                   _full_idx, "/s"), "<did not raise>")
+check("9k  CONTROL: no state file at all is not a refusal",
+      refusal_code(R.require_state_subset, {}, _sub_idx, "/s"),
+      "<did not raise>")
+check("9k  the message names both populations and the fix",
+      all(w in str(drive(lambda: R.require_state_subset(
+          {"include_keys_sha256": _SUB_SHA}, _full_idx, "/s")))
+          for w in ("whole run", _SUB_SHA[:12], "--output-dir")), True)
+
+# --- 9l -- THE CACHE TTL DEFAULT -------------------------------------
+# NOT A STYLE ASSERTION. The 1.8.0 blind run breached its $13.00 gate at
+# $13.5831, and 88.9% of the overrun was cache WRITE tokens at the 1h premium
+# (2.0x base against 1.25x at 5m): 2,463,401 write tokens cost $7.39 where 5m
+# would have cost $4.62, landing the run at $10.81 under the gate. The default
+# is the whole fix, so it is pinned with the reason beside it.
+check("9l  the default cache TTL is 5m", R.DEFAULT_CACHE_TTL, "5m")
+check("9l  and an unmodified invocation carries it onto the request",
+      drive(R._parse_args, ["--dry-run"]).cache_ttl, "5m")
+check("9l  1h is still reachable for a batch expected to run long",
+      drive(R._parse_args, ["--dry-run", "--cache-ttl", "1h"]).cache_ttl, "1h")
+check("9l  the ttl reaches every cache_control block on the wire, both the "
+      "system prompt and the patient record",
+      ttls_of(built_with(_SUBSET_KEYS)), ["1h"])
+_five = drive(
+    R.build_requests, planted_run(),
+    drive(R.build_system_prompt, _FIXED_RUBRIC, mode=R.MODE_ANCHORED),
+    {"rubric_sha256": "x"}, _MODEL, 300, 0.0, "5m")
+check("9l  CONTROL: built at 5m, every block says 5m -- so the check above "
+      "reads the argument rather than a constant",
+      ttls_of(_five), ["5m"])
+# The estimator prices a write into the ttl-specific bucket, and the two rates
+# differ. A default change that did not reach the estimate would leave every
+# dry run quoting the old premium.
+_est5 = drive(R.estimate_tokens, _five, planted_run(), 4.0, "5m")
+_est1 = drive(R.estimate_tokens, built_with(_SUBSET_KEYS), planted_run(),
+              4.0, "1h")
+check("9l  the estimate books cache writes into the ttl's own bucket",
+      (has(_est5, "full_cache", "cache_creation_5m"),
+       has(_est5, "full_cache", "cache_creation_1h"),
+       has(_est1, "full_cache", "cache_creation_1h")), (True, False, True))
+_rates9 = drive(R.rater_pricing, _MODEL)
+check("9l  and a 5m write really is cheaper than a 1h write at these rates, "
+      "which is the only reason the default moved",
+      drive(lambda: dig(_rates9, "cache_write_5m")
+            < dig(_rates9, "cache_write_1h")), True)
+
 print()
 print("=" * 70)
 print("SUMMARY")
