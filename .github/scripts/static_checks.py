@@ -44,6 +44,13 @@ construction site, no shadowed imports, no never-read names, the decorator
 inventory -- and that file is a collision-matrix member, so it runs in the
 serial job rather than here.
 
+AND IT DOES NOT WALK A VIRTUAL ENVIRONMENT. `_is_virtualenv` below argues that
+at length; the headline is that this gate's subject is code this project owns,
+a venv in the tree is code it does not, and the report says how many were
+skipped even when the answer is zero. That last part is the half that matters:
+this file's first line promises to report what is NOT checked, and a narrowing
+that printed nothing would make that promise false.
+
 Run from terminal:
     python .github/scripts/static_checks.py
 
@@ -60,6 +67,9 @@ import warnings
 _CODE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Mirrors what is not source: build artifacts, caches, and the VCS directory.
+# The two venv NAMES in here are a convenience, not the guarantee -- see
+# `_is_virtualenv` below, which is what actually keeps a third-party
+# environment out of this gate.
 _SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "build", "dist",
               ".mypy_cache", ".pytest_cache", ".ruff_cache"}
 
@@ -74,9 +84,77 @@ _MIN = (3, 10)
 _CONTAINER = (3, 11)
 
 
-def python_files(root):
+def _is_virtualenv(path):
+    """True when `path` is the root directory of a virtual environment.
+
+    A VENV IS IDENTIFIED BY ITS ``pyvenv.cfg`` MARKER, NOT BY ITS NAME, which
+    is what makes the two venv names in `_SKIP_DIRS` a convenience rather than
+    the guarantee. ``09- Testing/ragas-venv/`` is the live proof that a name
+    list rots: a real, deliberately un-pinned environment (see
+    ``oncotriage/evaluation/ragas_harness.py`` for why ragas is NOT a pipeline
+    dependency), untracked and self-ignored, matching neither ``venv`` nor
+    ``.venv``. ``python -m venv`` writes ``pyvenv.cfg`` at the root of every
+    environment it creates, so the marker is what the thing IS. Same rule, same
+    argument, as tests/test_package_invariants.py and
+    tests/test_extraction_stage_non_oncology_guard.py.
+
+    WHY THIS GATE MUST NOT WALK ONE, measured on the development machine on
+    2026-08-17 rather than argued: with that environment present this gate
+    compiled 38,517 files in 23.2s and EXITED 1, on
+    ``sknetwork/regression/diffusion.py`` -- an invalid escape sequence in a
+    third-party package this project does not own, cannot fix and does not
+    ship. Without it the same walk is 189 files in 0.2s. So the gate was RED on
+    every development machine and GREEN on GitHub, where no environment is ever
+    checked out, which is the worst of both: it reported a defect nobody could
+    act on, and it reported it only where nobody was watching. A gate whose red
+    is routinely ignored has stopped being a gate.
+
+    ``isfile`` rather than ``exists``: the marker is a FILE, and a directory
+    that happened to be named ``pyvenv.cfg`` is not a virtualenv.
+
+    DUPLICATED RATHER THAN SHARED with the two test files above. This file's
+    own docstring is the reason: it must run BEFORE anything is installed, so
+    it may not import from the package, and `.github/scripts/` is four
+    standalone scripts with no module to share a helper through.
+    """
+    return os.path.isfile(os.path.join(path, "pyvenv.cfg"))
+
+
+def python_files(root, pruned_out=None):
+    """Yield every .py under `root` that is this project's own source.
+
+    `pruned_out`, when a list is passed, receives the path of every virtual
+    environment this declined to walk into. IT IS COMPLETE ONLY ONCE THIS
+    GENERATOR IS EXHAUSTED -- the walk is lazy, so a caller reading the list
+    mid-iteration sees only what has been reached so far. `main()` reads it
+    after its loop has ended, which is what makes the report it prints true.
+
+    The prune is a NARROWING of the corpus, which is the direction this
+    project's scans are otherwise warned about: one that silently covers less
+    does not fail, it reports FEWER findings, which reads exactly like a clean
+    tree. Two things make it right here rather than merely convenient. The
+    files removed are not this repository's -- they are a third-party
+    environment that happens to sit inside it -- so compiling them was never
+    coverage of anything this gate makes a claim about. And the removal is
+    REPORTED, unconditionally and with a count, so it cannot be mistaken for a
+    tree that had nothing to skip.
+    """
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS)
+        keep = []
+        for name in sorted(dirnames):
+            if name in _SKIP_DIRS:
+                continue
+            child = os.path.join(dirpath, name)
+            if _is_virtualenv(child):
+                if pruned_out is not None:
+                    pruned_out.append(child)
+                continue
+            keep.append(name)
+        # In place, so os.walk does not descend into what was dropped. Sorted
+        # for the reason every walk in this project is: determinism is a stated
+        # property, and an unsorted walk makes the ORDER of a failure report
+        # depend on os.scandir.
+        dirnames[:] = keep
         for filename in sorted(filenames):
             if filename.endswith(".py"):
                 yield os.path.join(dirpath, filename)
@@ -109,8 +187,9 @@ def main():
 
     failures = []
     checked = 0
+    pruned = []
 
-    for path in python_files(_CODE_DIR):
+    for path in python_files(_CODE_DIR, pruned_out=pruned):
         rel = os.path.relpath(path, _CODE_DIR)
         try:
             with open(path, "rb") as fh:
@@ -139,6 +218,22 @@ def main():
                 failures.append((rel, f"ValueError: {exc}"))
                 continue
         checked += 1
+
+    # ALWAYS PRINTED, EVEN AT ZERO, and that is the point rather than noise. A
+    # count that appears only when it is non-zero is indistinguishable from a
+    # gate that has no prune at all -- the identical argument
+    # tests/test_package_invariants.py makes for printing its skip count
+    # unconditionally. On a hosted runner this reads 0 and the walk is the
+    # whole checkout; on a development machine it names what was left out, so
+    # the difference between the two runs is on the terminal rather than
+    # inferred.
+    print(f"NOT WALKED: {len(pruned)} virtual environment(s). A directory "
+          f"carrying a")
+    print("pyvenv.cfg marker is a third-party environment this project does")
+    print("not own, cannot fix and does not ship.")
+    for directory in sorted(pruned):
+        print(f"  {os.path.relpath(directory, _CODE_DIR)}{os.sep}")
+    print()
 
     print(f"Compiled {checked} file(s).")
     if failures:
