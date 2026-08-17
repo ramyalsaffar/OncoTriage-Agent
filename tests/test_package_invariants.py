@@ -301,6 +301,40 @@ def fail(label: str, detail: str) -> None:
     print(f"  FAIL  {label}")
 
 
+def _read_source(path, label):
+    """UTF-8 text of a source file, or None with the failure RECORDED.
+
+    EVERY CORPUS-FED READ IN THIS FILE GOES THROUGH ONE FUNCTION, and the
+    reason is a defect this helper's absence produced. The first version of the
+    venv fix hardened only the two readers fed by the WALK (_REPO_ALL_PY) and
+    left the readers fed by ``os.listdir(_code_dir)`` alone, on the reasoning
+    that pruning the venv removed the undecodable file from the corpus. That
+    reasoning is true and insufficient: the prune cannot reach a non-UTF-8 file
+    that is not in a venv at all, and a control that planted one at the
+    repository root still ABORTED the run at check 2h -- after 1c had correctly
+    reported it, which is the worst shape, because the run names the problem and
+    then dies before its summary. One entry point is what makes "which reads are
+    hardened" stop being a question anybody has to re-derive.
+
+    NOT A SILENT SKIP. The caller gets None and moves on, but the file is named
+    in a recorded failure first: a scan that quietly covers less reports FEWER
+    findings, which by this file's own doctrine reads exactly like a clean
+    repository.
+
+    ``fail`` rather than ``check`` so nothing is counted until there is
+    something to report -- an unconditional check() here would be a new
+    always-green assertion, and the counts this file's readers rely on would
+    move for a check that never fails.
+    """
+    try:
+        return open(path, encoding="utf-8").read()
+    except UnicodeDecodeError as exc:
+        fail(f"{label}  every file in the scan corpus decoded as UTF-8",
+             f"{os.path.relpath(path, _code_dir)}: "
+             f"{type(exc).__name__}: {exc}")
+        return None
+
+
 def skip(label: str, reason: str) -> None:
     """Record coverage that could NOT be exercised on this platform.
 
@@ -1214,6 +1248,53 @@ _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    "tests/test_agent_temporal_conflict_flag.py"}
 
 
+# What is not this project's source: caches, build artifacts, the VCS
+# directory. Mirrors .github/scripts/static_checks.py's _SKIP_DIRS, which is the
+# established shape, and adds that file's venv NAMES so the two agree.
+_SKIP_WALK_DIRS = frozenset({
+    "__pycache__", ".git", "build", "oncotriage.egg-info", ".vscode",
+    ".venv", "venv", "dist", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+})
+
+
+def _prune_walk_dirs(dirpath, dirnames):
+    """In-place prune of non-source directories, VIRTUAL ENVIRONMENTS included.
+
+    A VENV IS IDENTIFIED BY ITS ``pyvenv.cfg`` MARKER, NOT BY ITS NAME, and the
+    name list above is a convenience that the marker makes non-load-bearing.
+    ``09- Testing/ragas-venv/`` is the live proof that a name list rots: it is a
+    real, deliberately un-pinned virtualenv (see
+    ``oncotriage/evaluation/ragas_harness.py`` for why ragas is NOT a pipeline
+    dependency), it is untracked and self-ignored, and it matches neither
+    ``venv`` nor ``.venv``. ``python -m venv`` writes ``pyvenv.cfg`` at the root
+    of every environment it creates, so the marker is what the thing IS.
+
+    TWO SEPARATE HARMS, and the slow one is the one that outlives this fix.
+    The loud one: site-packages carries deliberately non-UTF-8 fixtures --
+    joblib ships ``test_func_inspect_special_encoding.py`` -- and reading one
+    with ``encoding="utf-8"`` raises UnicodeDecodeError, which is a ValueError
+    and so is caught by neither ``OSError`` nor ``SyntaxError``; before this
+    prune it ABORTED this file mid-run, printing a traceback and no summary.
+    The quiet one: a scan over 38,000 third-party files is slow and can only
+    ever produce findings about code this project does not own, so the prune
+    would be right even if every one of those files decoded cleanly.
+
+    NOT AN ABSOLUTE-PATH LIST. The directory being considered is stat'd for its
+    own marker, so a venv at any depth under any name is pruned, and this
+    machine's layout is not written into the check.
+
+    ``isfile`` rather than ``exists``: the marker is a FILE, and a directory
+    that happened to be named ``pyvenv.cfg`` is not a virtualenv. ``sorted``
+    for the reason static_checks.py sorts -- determinism is a stated property
+    of this project, and an unsorted walk makes the ORDER of a failure report
+    depend on ``os.scandir``.
+    """
+    dirnames[:] = [d for d in sorted(dirnames)
+                   if d not in _SKIP_WALK_DIRS
+                   and not os.path.isfile(
+                       os.path.join(dirpath, d, "pyvenv.cfg"))]
+
+
 def _repo_py_files():
     """Every .py in the repository: package, numbered scripts and tests alike.
 
@@ -1221,12 +1302,17 @@ def _repo_py_files():
     exactly the reason a one-level listing is always wrong here -- a corpus that
     silently covers less does not fail, it reports FEWER findings, which reads
     as a clean repository.
+
+    That doctrine is why the venv prune below is a NARROWING that has to be
+    argued rather than a free win: it removes files from the corpus, which is
+    the direction this docstring warns about. What makes it right is that those
+    files are not this repository's -- they are a third-party environment that
+    happens to sit inside the tree -- so covering them was never coverage of
+    anything this file makes a claim about.
     """
     out = []
     for dirpath, dirnames, filenames in os.walk(_code_dir.rstrip(os.sep)):
-        dirnames[:] = [d for d in dirnames
-                       if d not in ("__pycache__", ".git", "build",
-                                    "oncotriage.egg-info", ".vscode")]
+        _prune_walk_dirs(dirpath, dirnames)
         for name in sorted(filenames):
             if name.endswith(".py"):
                 out.append(os.path.join(dirpath, name))
@@ -1277,6 +1363,19 @@ def _chain_violations(paths, skip_strings_in=(), allowlist=_EXEC_ALLOWLIST):
             source = open(path, encoding="utf-8").read()
         except OSError as exc:                                    # noqa: PERF203
             found.append((rel, 0, "unreadable", str(exc)))
+            continue
+        except UnicodeDecodeError as exc:
+            # A SEPARATE ARM RATHER THAN A THIRD MEMBER OF THE TUPLE ABOVE, and
+            # deliberately not a bare `continue`. UnicodeDecodeError is a
+            # ValueError, so it is caught by neither the OSError arm nor the
+            # SyntaxError arm below -- before this it aborted the whole file.
+            # Folding it into either as a silent skip would trade a traceback
+            # for a corpus that quietly covers less, which by this section's own
+            # doctrine reads exactly like a clean repository. It is recorded as
+            # its own form so the failure says WHICH kind of unreadable it was:
+            # "unreadable" is the filesystem refusing, "undecodable" is a file
+            # that is not UTF-8 text.
+            found.append((rel, 0, "undecodable", str(exc)))
             continue
         try:
             tree = ast.parse(source)
@@ -3142,12 +3241,18 @@ _DOCKER_DIR = os.path.join(_code_dir, "docker")
 
 
 def _py_under(directory):
-    return sorted(
-        os.path.join(root, name)
-        for root, _dirs, files in os.walk(directory)
-        for name in files
-        if name.endswith(".py") and "__pycache__" not in root
-    )
+    # The same prune as _repo_py_files, for the same reason. It removes nothing
+    # from tests/ or docker/ today -- neither holds a virtualenv -- so the
+    # corpus and every count fed by it are unchanged; it is here so that a
+    # `tests/.venv` created tomorrow cannot silently enlarge this corpus with
+    # 38,000 third-party files and make the two checks fed by _REPO_PY report
+    # findings about code this project does not own.
+    out = []
+    for root, dirs, files in os.walk(directory):
+        _prune_walk_dirs(root, dirs)
+        out += [os.path.join(root, name) for name in files
+                if name.endswith(".py")]
+    return sorted(out)
 
 
 _TEST_PY = _py_under(_TESTS_DIR)
@@ -3244,8 +3349,11 @@ def _all_reads(paths, blob_exclude=()):
     """
     names, blobs = set(), []
     for path in paths:
+        src = _read_source(path, "2h")
+        if src is None:
+            continue
         try:
-            tree = ast.parse(open(path, encoding="utf-8").read(), path)
+            tree = ast.parse(src, path)
         except SyntaxError:
             continue
         collect_strings = os.path.abspath(path) not in blob_exclude
@@ -4054,8 +4162,14 @@ print("=" * 78)
 
 _WANTED = {}
 for _path in _REPO_ALL_PY:
+    # RECORDED, NOT SKIPPED: this scan asserts that every package import in the
+    # repository resolves, so a file it could not read is a claim it did not
+    # check.
+    _src = _read_source(_path, "5a")
+    if _src is None:
+        continue
     try:
-        _tree = ast.parse(open(_path, encoding="utf-8").read())
+        _tree = ast.parse(_src)
     except SyntaxError:
         continue
     for _node in ast.walk(_tree):
@@ -4162,7 +4276,9 @@ check("the numbered-file scan found the entry points",
 
 _REEXPORTERS = {}
 for _path in _NUMBERED_FILES:
-    _src = open(_path, encoding="utf-8").read()
+    _src = _read_source(_path, "5b")
+    if _src is None:
+        continue
     _tree = ast.parse(_src)
     _imported_at_module_scope = set()
     for _node in _tree.body:

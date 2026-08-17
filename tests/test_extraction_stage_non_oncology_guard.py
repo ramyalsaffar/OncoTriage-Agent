@@ -102,6 +102,21 @@ def check(label: str, actual, expected) -> None:
         print(f"          actual:   {actual}")
 
 
+def fail(label: str, detail: str) -> None:
+    """Record an outright failure that is not an equality comparison.
+
+    Mirrors tests/test_package_invariants.py's helper of the same name, and
+    exists for the same reason: section 4e's repository scan can meet a file it
+    cannot read, and that is a fact about coverage rather than a comparison of
+    two values. It increments nothing until it is called, so the file's pass
+    count is unchanged on a machine with nothing to report.
+    """
+    _RESULTS["failed"] += 1
+    _FAILURES.append(f"{label}\n          {detail}")
+    print(f"  FAIL  {label}")
+    print(f"          {detail}")
+
+
 _STAGE_SRC = os.path.abspath(_stage_module.__file__)
 _PKG_DIR = os.path.dirname(os.path.abspath(oncotriage.__file__))
 _CAPTURE_SRC = os.path.join(_PKG_DIR, "fixtures", "capture.py")
@@ -365,11 +380,52 @@ check("a clean cancer display increments nothing",
 
 # 4e. THE FINDING THAT LET THIS KEY BE ADDED, re-checked so it cannot rot.
 _repo = os.path.dirname(_PKG_DIR)
+
+# What is not this project's source: caches, build artifacts, the VCS
+# directory. Mirrors .github/scripts/static_checks.py's _SKIP_DIRS and
+# tests/test_package_invariants.py's _SKIP_WALK_DIRS, so the three agree.
+_SKIP_WALK_DIRS = frozenset({
+    "__pycache__", ".git", "build", "oncotriage.egg-info", ".vscode",
+    ".venv", "venv", "dist", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+})
+
+
+def _prune_walk_dirs(dirpath, dirnames):
+    """In-place prune of non-source directories, VIRTUAL ENVIRONMENTS included.
+
+    A VENV IS IDENTIFIED BY ITS ``pyvenv.cfg`` MARKER, NOT BY ITS NAME. The
+    name list above is a convenience the marker makes non-load-bearing, and
+    ``09- Testing/ragas-venv/`` is the live proof that a name list rots: a real,
+    deliberately un-pinned virtualenv (see ``oncotriage/evaluation/
+    ragas_harness.py`` for why ragas is NOT a pipeline dependency), untracked
+    and self-ignored, matching neither ``venv`` nor ``.venv``. ``python -m
+    venv`` writes ``pyvenv.cfg`` at the root of every environment it creates.
+
+    Duplicated verbatim from tests/test_package_invariants.py rather than
+    shared, on the standing precedent for this suite: every file here is a
+    self-contained script with no shared helper module, and `tests/` has no
+    ``__init__.py`` to import one from.
+
+    The prune is right independently of the decode arm below. This scan asks
+    what pins the key SET of _STAGE_EXTRACTION_COUNTS, a question only about
+    code this project owns; site-packages can only contribute false positives
+    and 38,000 files of latency to it.
+
+    ``isfile`` rather than ``exists``: the marker is a FILE, and a directory
+    that happened to be named ``pyvenv.cfg`` is not a virtualenv. ``sorted``
+    for the reason static_checks.py sorts -- determinism is a stated property
+    of this project, and an unsorted walk makes the ORDER of a failure report
+    depend on ``os.scandir``.
+    """
+    dirnames[:] = [d for d in sorted(dirnames)
+                   if d not in _SKIP_WALK_DIRS
+                   and not os.path.isfile(
+                       os.path.join(dirpath, d, "pyvenv.cfg"))]
+
+
 _pins = []
 for _dirpath, _dirnames, _filenames in os.walk(_repo):
-    _dirnames[:] = [d for d in _dirnames
-                    if d not in ("__pycache__", ".git", "build",
-                                 "oncotriage.egg-info", ".vscode")]
+    _prune_walk_dirs(_dirpath, _dirnames)
     for _name in sorted(_filenames):
         if not _name.endswith(".py"):
             continue
@@ -378,6 +434,19 @@ for _dirpath, _dirnames, _filenames in os.walk(_repo):
             continue
         try:
             _tree = ast.parse(open(_p, encoding="utf-8").read())
+        except UnicodeDecodeError as _exc:
+            # A SEPARATE ARM, NOT A THIRD MEMBER OF THE TUPLE BELOW.
+            # UnicodeDecodeError is a ValueError, so neither OSError nor
+            # SyntaxError catches it and it ABORTED this file mid-run --
+            # traceback, no summary, exit code from the crash rather than from
+            # the results. Adding it to that tuple would fix the abort by
+            # trading it for a silent skip, and a scan that quietly covers less
+            # reports FEWER pins, which reads exactly like a repository that
+            # pins nothing. Named finding instead.
+            fail("4e  every .py in the repository scan corpus decoded as UTF-8",
+                 f"{os.path.relpath(_p, _repo)}: "
+                 f"{type(_exc).__name__}: {_exc}")
+            continue
         except (OSError, SyntaxError):
             continue
         for _node in ast.walk(_tree):
