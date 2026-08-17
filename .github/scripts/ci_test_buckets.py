@@ -108,6 +108,16 @@ BUCKETS = {
         _A, None, "ran green in 8.3s; registries and clients replaced through deps"),
     "test_agent_age_units_and_sex_filter.py": (
         _A, None, "ran green in 1.8s; plants into in-memory copies, reads no git"),
+    "test_agent_composed_assessment.py": (
+        _A, None,
+        "ran green in 1.4s, 103 checks, against ONLY the directory skeleton, "
+        "and identical in a depth-1 clone: the stored assessment is a "
+        "rendering of the criteria arrays rather than the model's prose. "
+        "Every control is a different INPUT to a pure function, which is why "
+        "there is no exec and no `git show` anywhere in it -- no network, no "
+        "keys, no spend, no git history, no corpus, no database, no "
+        "subprocess. It writes nothing anywhere, so it is not in the "
+        "collision matrix"),
     "test_agent_degraded_run_and_reporting.py": (
         _A, None,
         "ran green in 2.6s, 118 checks, against ONLY the directory skeleton: "
@@ -122,6 +132,18 @@ BUCKETS = {
         "git, no corpus. It execs nothing: the controls feed different inputs "
         "to a pure function, create genuinely corrupt files, or rebind a "
         "module attribute inside try/finally"),
+    "test_agent_emission_provenance.py": (
+        _A, None,
+        "ran green in 1.7s, 184 checks, against ONLY the directory skeleton, "
+        "identical in a depth-1 clone: the Stage 5 emission-provenance stamp "
+        "and the two trial_matches columns. Every model response is a literal "
+        "served by a stub installed through oncotriage/agent/deps.py, every "
+        "plant goes into an in-memory copy of agent/evaluation.py or "
+        "storage/database_logger.py -- both hashed before any plant and "
+        "compared at the end -- and every database write goes to a scratch "
+        "file in a temp directory asserted to differ from the production "
+        "path and removed at the end. No network, no keys, no spend, no git "
+        "history, no corpus. An _EXEC_ALLOWLIST member, argued there"),
     "test_agent_mesh_boost_and_quality_gate.py": (
         _A, None, "ran green in 1.8s once the two vendored MeSH lookups are seeded"),
     "test_agent_out_of_set_detector.py": (
@@ -132,6 +154,27 @@ BUCKETS = {
         "through a deps stub, the database is a temp file every log_inference "
         "call is pointed at explicitly, and every plant goes into an in-memory "
         "copy -- no network, no keys, no spend, no git, no corpus"),
+    "test_agent_patient_record_tokens.py": (
+        _A, None,
+        "ran green in 1.9s, 68 checks, against ONLY the directory skeleton, "
+        "identical in a depth-1 clone: llm_classifier_patient_record_tokens "
+        "measures the patient record's own token count. Every control is a "
+        "different ARGUMENT to the shipped code -- a fence-carrying summary, "
+        "a state that never rendered, a result dict without the key, a decoy "
+        "database -- so it execs nothing and needs no _EXEC_ALLOWLIST entry. "
+        "The OpenAI client is a stand-in installed through "
+        "oncotriage/agent/deps.py and Qdrant and the cross-encoder are never "
+        "reached; every write goes to a scratch database in a temp directory "
+        "asserted to differ from the production one. No network, no keys, no "
+        "spend, no corpus, no git history"),
+    "test_agent_procedure_relevance.py": (
+        _A, None,
+        "ran green in 1.4s, 136 checks, against ONLY the directory skeleton, "
+        "identical in a depth-1 clone: _classify_procedure_relevance decides "
+        "which procedures reach the Stage 5 prompt. Every patient is a "
+        "literal dict and the classifier is a pure function of it -- no "
+        "network, no keys, no spend, no git history, no corpus, no database, "
+        "no subprocess"),
     "test_agent_prompt_version.py": (
         _A, None,
         "ran green in 0.74s wall (0.00s of checks) in a `git ls-files` checkout "
@@ -139,13 +182,62 @@ BUCKETS = {
         "strings and reads one committed JSON file -- no network, no keys, no "
         "spend, no database, no subprocess, no corpus, and NO GIT, which is the "
         "point of it (a commit recedes; the reference is the golden snapshot)"),
+    "test_agent_remap_no_survivor.py": (
+        _A, None,
+        "ran green in 1.6s, 121 checks, against ONLY the directory skeleton, "
+        "identical in a depth-1 clone: a rejection whose disqualifying labels "
+        "were out of their arm's vocabulary, corrected under "
+        "UNEVALUABLE_REMAP_NO_SURVIVOR and marked so the composition writes a "
+        "sentence of its own. Every plant goes into an in-memory copy of "
+        "agent/evaluation.py, hashed before any plant and compared at the end "
+        "-- no network, no keys, no spend, no git history, no corpus. An "
+        "_EXEC_ALLOWLIST member, argued there"),
+    "test_agent_render_event_suppression.py": (
+        _A, None,
+        "ran green in 1.8s, 55 checks, against ONLY the directory skeleton, "
+        "identical in a depth-1 clone: the packer's token-measurement path "
+        "must emit no render event, and the decode logging aggregates to one "
+        "event per render. Driven through the real observability logger with "
+        "the records captured in memory -- no network, no keys, no spend, no "
+        "git history, no corpus, no database"),
     "test_agent_retrieval_observability.py": (
         _A, None, "ran green in 3.5s; needs .env to EXIST, makes no live call"),
+    "test_agent_stage5_input_packing.py": (
+        _A, None,
+        "ran green in 1.8s, 109 checks, against ONLY the directory skeleton, "
+        "identical in a depth-1 clone: Stage 5 bounds the size of its "
+        "REQUESTS. Every response is a literal served by a stub installed "
+        "through oncotriage.agent.deps. No network, no keys, no spend, no "
+        "database, no subprocess, no fixture, no git history, no corpus, no "
+        "model call; it writes nothing in the repository, so it is not in the "
+        "collision matrix. An _EXEC_ALLOWLIST member -- section 6 execs a "
+        "copy with the packing branch disabled as the OTHER ARM of an "
+        "equivalence proof, not only as a control"),
+    "test_agent_state_channel_coverage.py": (
+        _A, None,
+        "ran green in 2.1s, 73 checks, against ONLY the directory skeleton, "
+        "identical in a depth-1 clone: a key a graph node returns that "
+        "TrialMatchState does not declare is dropped, so the declaration is "
+        "scanned against what the nodes actually return. Static analysis over "
+        "the package's own AST -- no network, no keys, no spend, no git "
+        "history, no corpus, no database, no subprocess"),
     "test_agent_summary_cancer_stage.py": (
         _A, None,
         "ran green in 2.0s, 53 checks; every patient is a literal dict, the "
         "plants go into an in-memory copy of oncotriage/agent/patient.py, and "
         "it reads no git, no corpus and no database"),
+    "test_agent_summary_temporal_tagging.py": (
+        _A, None,
+        "ran green in 1.4s, 216 checks, against ONLY the directory skeleton, "
+        "identical in a depth-1 clone: _create_patient_summary states elapsed "
+        "time beside EVERY date it renders. render_bare() shuts the three "
+        "doors every temporal phrase comes through, so the control needs "
+        "neither an exec nor a `git show` and the file runs in a tree with no "
+        ".git. The MeSH filter is overridden to None -- a documented "
+        "reachable state -- so no data file is read, and the cancer and lab "
+        "registries are the real ones, which read no files either. No "
+        "network, no keys, no spend, no corpus, and it writes nothing "
+        "anywhere"),
     "test_agent_structured_outputs.py": (
         _A, None,
         "ran green in 2.0s, 152 checks; the Stage 5 response schema, the reasoning-first field order and the "
@@ -153,6 +245,15 @@ BUCKETS = {
         "deps stub, every plant doctors a COPY of a dict the shipped builder "
         "returns or an in-memory AST, and it execs nothing -- no network, no "
         "keys, no spend, no git, no corpus, no database, no subprocess"),
+    "test_agent_temporal_conflict_flag.py": (
+        _A, None,
+        "ran green in 2.1s, 118 checks, against ONLY the directory skeleton, "
+        "identical in a depth-1 clone: the RULE 4 temporal-conflict flag that "
+        "is COUNTED and never applied. Every plant goes into an in-memory "
+        "copy of agent/evaluation.py or observability.py, both hashed before "
+        "any plant and compared at the end -- no network, no keys, no spend, "
+        "no git history, no corpus. An _EXEC_ALLOWLIST member; its eighth "
+        "copy is an equivalence proof rather than a control"),
     "test_agent_trial_data_fencing.py": (
         _A, None,
         "ran green in 0.02s of checks, 86 checks; the TRIAL_DATA fences in the "
@@ -164,6 +265,27 @@ BUCKETS = {
         "subprocess, no model call"),
     "test_agent_trial_verdict_normalization.py": (
         _A, None, "ran green in 1.9s; every model response is a literal via a deps stub"),
+    "test_agent_unsupported_rejection.py": (
+        _A, None,
+        "ran green in 1.3s, 133 checks, against ONLY the directory skeleton, "
+        "identical in a depth-1 clone: a model-declared not_eligible carrying "
+        "no disqualifying row in either criteria array is corrected rather "
+        "than stored as a rejection nobody made. Every plant goes into an "
+        "in-memory copy of agent/evaluation.py, and that copy carries its OWN "
+        "anomaly counter so a control can fire without touching the live one "
+        "this file asserts is at zero. No network, no keys, no spend, no git "
+        "history, no corpus. An _EXEC_ALLOWLIST member, argued there"),
+    "test_agent_user_message_snapshot.py": (
+        _A, None,
+        "ran green in 1.3s, 51 checks, against ONLY the directory skeleton, "
+        "identical in a depth-1 clone: the Stage 5 USER message cannot change "
+        "without somebody deciding it did. The reference is a committed "
+        "golden file regenerated ONLY through --update-snapshot, deliberately "
+        "NOT a `git show` -- a commit recedes, and three files in this suite "
+        "already abort in a tree with no .git. NO NETWORK, no keys, no spend, "
+        "no database, no subprocess, no fixture, no git history, no corpus, "
+        "no model call: it renders three trials into a string, hashes it, "
+        "parses two files and reads one JSON file"),
     "test_clinical_use_framing.py": (
         _A, None,
         "ran green in 2.3s, 71 checks, against ONLY the directory skeleton: "
@@ -190,6 +312,21 @@ BUCKETS = {
         "records element type 'vertical'; 1.46.0 emits 'flex_container'. That "
         "is a repository defect, not a CI one, and it is deliberately NOT "
         "suppressed here -- see the CI report."),
+    "test_evaluation_rater.py": (
+        _A, None,
+        "ran green in 1.1s, 311 checks, against ONLY the directory skeleton, "
+        "identical in a depth-1 clone: the blind rater harness. IT DOES NOT "
+        "NEED ragas INSTALLED -- measured, the interpreter that ran it green "
+        "has no ragas distribution at all; `09- Testing/ragas-venv/` is a "
+        "separate environment and nothing here imports out of it. One control "
+        "cannot be input-based and says so: section 7j rebinds "
+        "rater.render_system_prompt inside try/finally and asserts the "
+        "restore BY IDENTITY, which is an attribute rebind rather than a "
+        "patched source, so it execs nothing. The one thing it writes is a "
+        "fresh tempfile.mkdtemp holding two state files, removed in a finally "
+        "with the removal then ASSERTED -- nothing in the repository, so it "
+        "is not in the collision matrix. No network, no keys, no spend, no "
+        "corpus"),
     "test_evaluation_ragas_manifest.py": (
         _A, None,
         "ran green in 1.5s, 69 checks, against ONLY the directory skeleton "
@@ -209,6 +346,19 @@ BUCKETS = {
         _A, None, "ran green in 2.6s; no corpus, no git"),
     "test_fhir_birth_date_and_demographics.py": (
         _A, None, "ran green in 2.3s"),
+    "test_fixtures_harness_hardening.py": (
+        _A, None,
+        "ran green in 1.0s, 116 checks, against ONLY the directory skeleton, "
+        "identical in a depth-1 clone: the characterization fixture harness's "
+        "own refusals. Every file it writes is inside a fresh "
+        "tempfile.mkdtemp(), it patches no repository file, and the two "
+        "package modules it reads are written by neither of the suite's two "
+        "writers, so it is NOT in the collision matrix -- derived, not "
+        "assumed. It costs and needs nothing: no network, no keys, no spend, "
+        "no live Qdrant, no corpus, no git history, no Docker. NOTE the "
+        "separation from fixture_capture.py / fixture_replay.py themselves, "
+        "which are bucket D and C in NON_TEST_ENTRY_POINTS below: this file "
+        "exercises the harness's guards, never a capture or a replay"),
     "test_indexer_criteria_split_gate.py": (
         _A, None,
         "ran green in 0.78s, 109 checks, against ONLY the directory skeleton: "
@@ -278,6 +428,37 @@ BUCKETS = {
     "test_ablation_db_isolation.py": (
         _E, "the production ablation_results.db",
         "'the digest is a real one, not absent on both sides (non-degeneracy)' failed"),
+    # The two escape-decode files need the TRIAL corpus, which no entry above
+    # needed: `{data_trial_path}/trials_latest.json`, ~152 MB, written by
+    # `11- RAG Trial Indexer.py` from a live ClinicalTrials.gov scrape and not
+    # committed. Both census sections read it directly, and both files say in
+    # their own first check that a missing corpus is a FAILURE and never a
+    # silent skip -- which is what makes the bucket unambiguous.
+    "test_agent_escaped_entity_decode.py": (
+        _E, "the scraped trial corpus (trials_latest.json, ~152 MB, not committed)",
+        "'1a the trial corpus was readable (a missing corpus is a FAILURE "
+        "here, never a silent skip)' failed with FileNotFoundError on "
+        "trials_latest.json -- and the file then ABORTED at `max(_depths)` "
+        "over the empty census with 'ValueError: max() iterable argument is "
+        "empty', so it recorded 10 checks and then printed a traceback where "
+        "it owed a summary. (10 is what it reached before dying; 112 is what "
+        "the same file reports WITH the corpus, and the number it would owe "
+        "without one is neither of those -- which is the point, because a "
+        "run that dies has no total.) THAT ABORT IS A DEFECT IN THAT FILE, "
+        "not a "
+        "reason to classify it anywhere else, and it is left to its owner: "
+        "this table records what CI can run, and editing a test to fix its "
+        "reporting is not that. Bucket E rather than a repository defect is "
+        "MEASURED -- with the corpus present it is green, exit 0, 112 passed, "
+        "0 failed"),
+    "test_agent_markdown_escape_decode.py": (
+        _E, "the scraped trial corpus (trials_latest.json, as above)",
+        "'2a the trial corpus was readable (a missing corpus is a FAILURE "
+        "here, never a silent skip)' failed with FileNotFoundError on "
+        "trials_latest.json; 25 recorded failures and it ran to its own "
+        "summary rather than aborting, which is the difference from its "
+        "sibling above. With the corpus present it is green, exit 0, 176 "
+        "passed, 0 failed"),
     "test_agent_patient_hash_coverage.py": (
         _E, "the real patient corpus (sections 4 and 7 parse bundles read-only)",
         "2 failures, both corpus non-degeneracy guards"),
