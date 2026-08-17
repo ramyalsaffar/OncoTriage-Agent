@@ -975,6 +975,45 @@ check("7d  ...and the rubric still carries RULE 4's reference date, surfaced "
       "for the caller to check against the run under audit",
       bool(_META.get("reference_date_in_rules")), True)
 
+# 7d' -- 1.9.0 SPLITS ACROSS THE SPAN BOUNDARY, AND THE SPLIT IS THE POINT.
+#
+# The bump made two edits and they reach different audiences. RULE 4's
+# time-window branch rides INSIDE `evaluation_rules`, so the rater judges a time
+# window under the same rule the classifier does -- and that is not a nicety:
+# 1.9.0 requires the interval QUOTED INTO patient_value before it decides, so a
+# rater lifting a rubric without that instruction would score the classifier's
+# quoted-interval evidence against a rule that never asked for it, and disagree
+# for rubric mismatch rather than for decision quality. The FINAL REMINDER's line
+# lies OUTSIDE every span, exactly as 1.7.0's two do, and that is precedent
+# rather than a gap: the reminder restates a rule the rater already holds, for a
+# classifier about to emit a verdict the rater never emits.
+#
+# ASSERTED IN BOTH DIRECTIONS. "the rubric contains X" alone would be satisfied
+# by a span widened to swallow the whole prompt, and "the rubric omits Y" alone
+# by a lift that had stopped working; the pair pins the boundary itself.
+_R19_IN = ("Quote the record's stated interval for that event verbatim in "
+           "patient_value")
+_R19_OUT = ("For any time-window criterion: the record's stated interval, "
+            "quoted verbatim, decides it.")
+check("7d' non-degeneracy: both 1.9.0 sentences ARE in the rendered prompt, so "
+      "the two checks below are about the span boundary rather than about a "
+      "template that lost them",
+      (_R19_IN in _ONE, _R19_OUT in _ONE), (True, True))
+check("7d' 1.9.0's RULE 4 branch DOES reach the lifted rubric, so the rater "
+      "judges time windows under the classifier's own rule",
+      _R19_IN in _RUBRIC, True)
+check("7d' ...and its FINAL REMINDER line does NOT, on 1.7.0's precedent",
+      _R19_OUT in _RUBRIC, False)
+# WHICH span carries it, sliced per span rather than searched in the assembled
+# rubric: "somewhere in the rubric" would also be satisfied by a boundary that
+# had drifted and swept the branch into a neighbour, which would ship the rater a
+# rule under a heading that misdescribes it.
+_R19_SPANS = [n for n, (s, e) in _SPAN_BY_NAME.items()
+              if _R19_IN in str(drive(R._slice_span, _ONE, s, e, n))]
+check("7d' ...and the branch lands in `evaluation_rules` specifically, not in "
+      "some other span that drifted over it",
+      _R19_SPANS, ["evaluation_rules"])
+
 check("7e  the meta digests one sha per span, keyed by the span names",
       sorted(_META.get("span_sha256") or {}),
       sorted(n for n, _, _ in R._RUBRIC_SPANS))

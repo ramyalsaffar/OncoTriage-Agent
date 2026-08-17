@@ -1318,7 +1318,7 @@ check("the hash names none of the rendering machinery",
 
 print("\n12. PROMPT_VERSION and the RULE 4 wording move together")
 
-check("PROMPT_VERSION reads 1.8.0", PROMPT_VERSION, "1.8.0")
+check("PROMPT_VERSION reads 1.9.0", PROMPT_VERSION, "1.9.0")
 
 _RENDERED_PROMPT = drive(render_system_prompt, True, "applied",
                          "<probe: no patient record>")
@@ -1329,14 +1329,46 @@ for _label, _needle in (
     ("the no-resolution-date rule", "It is never a resolution date."),
     ("an absent interval means nothing",
      "Absence of an interval is not evidence of anything"),
-    ("the time-window clause prefers the stated interval",
-     "use the elapsed time the record states beside it"),
+    # 1.9.0. THE PAIRING THIS SECTION OWNS SURVIVED THE BUMP, AND SHARPENED.
+    # 1.8.0 said the renderer states the interval and the rule PREFERS it; 1.9.0
+    # says the rule QUOTES it into patient_value and classifies by comparing it,
+    # so the record's phrase now has to survive into the model's own output. That
+    # is a stronger dependency on this file's renderer than 1.8.0's was, not a
+    # weaker one, which is why the needle moved rather than being dropped.
+    ("the time-window clause quotes the stated interval into patient_value",
+     "Quote the record's stated interval for that event verbatim in "
+     "patient_value"),
+    ("...and classifies by comparing it to the window",
+     "classify by comparing that interval to the window"),
+    ("...with a stated fallback when no interval is printed, which is the "
+     "renderer's own documented case",
+     "If no interval is stated, or the stated one is too coarse"),
 ):
     check(f"12  {_label}", _needle in _RENDERED_PROMPT, True)
 
 check("the old unconditional imperative is gone",
       "If event end date is known: calculate elapsed time." in _RENDERED_PROMPT,
       False)
+# 1.8.0's OWN BRANCH IS GONE TOO. Without this, a template that carried both
+# 1.8.0's prefer-the-interval line and 1.9.0's quote-the-interval line would pass
+# every check above -- two instructions for one decision, keyed on different
+# facts, with the digest moved either way so no guard could tell them apart.
+check("...and so is 1.8.0's prefer-the-interval branch it replaced",
+      sorted(n for n in ("use the elapsed time the record states beside it",
+                         "If event end date is unknown:",
+                         "If event end date is known:")
+             if n in _RENDERED_PROMPT), [])
+check("...non-degeneracy: that scan finds those clauses when they ARE present",
+      sorted(n for n in ("use the elapsed time the record states beside it",
+                         "If event end date is unknown:",
+                         "If event end date is known:")
+             if n in _RENDERED_PROMPT
+             + "\n    If event end date is known: use the elapsed time the "
+               "record states beside it, or calculate it if none is stated."
+             + '\n    If event end date is unknown: classification = '
+               '"not_evaluable"'),
+      ["If event end date is known:", "If event end date is unknown:",
+       "use the elapsed time the record states beside it"])
 
 
 def pos(needle):

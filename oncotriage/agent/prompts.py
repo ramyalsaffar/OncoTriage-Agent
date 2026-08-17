@@ -264,7 +264,98 @@ from oncotriage.utils import get_age_reference_date
 # values; the section order; every section heading and marker line; the response
 # schema; Section 2's two variants; the fenced patient-record block; 1.7.0's
 # Section 5 check and FINAL REMINDER.
-PROMPT_VERSION = "1.8.0"
+#
+# 1.9.0 MADE THE MODEL QUOTE THE INTERVAL BEFORE IT JUDGES THE WINDOW. 1.8.0 put
+# the intervals in the record and told the model they were there; it did not say
+# what to DO with one at the moment a time window is decided, and that moment is
+# where this project has twice found the model actually acts.
+#
+# THE MEASURED CLASS. A blind rater run over 1.8.0 (artifacts:
+# rater_blind_1_8_0_20260816/, adjudicated in
+# reject_direction_adjudication_20260816/) found the model IGNORING a stated
+# elapsed interval on time-window criteria: at least two patients still wrongly
+# rejected on decades-old events, with the interval PRESENT in the evidence the
+# model itself quoted. So the failure is no longer "the model did the arithmetic
+# and got it wrong", which is what 1.8.0 addressed by removing the need for
+# arithmetic -- it is "the model had the answer in front of it and did not use
+# it". Telling it the interval EXISTS is not the same instruction as telling it
+# the interval DECIDES.
+#
+# THE MECHANISM IS QUOTE-BEFORE-JUDGE, and it is chosen rather than invented:
+# quote-first-then-answer is a large, replicated gain in grounded QA, and this
+# pipeline already has its own instance of it -- 1.5.0's composed assessment,
+# where making the stored text a function of the criterion rows stopped the
+# assessment asserting what the arrays do not carry. The same shape applies here.
+# The interval goes into patient_value VERBATIM and the classification is a
+# comparison of that quoted interval against the window, so the quoted evidence
+# and the verdict cannot come apart. A model that must write the interval down
+# before it classifies cannot classify around it.
+#
+# TWO EDITS, no deletion of any other rule and no reordering:
+#
+#   (a) RULE 4's time-window branch. The old branch keyed on whether the event's
+#       END DATE was known and offered the stated interval as a preference ("use
+#       the elapsed time the record states beside it, or calculate it if none is
+#       stated"). It now keys on the INTERVAL, requires it quoted into
+#       patient_value, and makes the classification a comparison against it. The
+#       fallback is stated rather than implied: no interval, or one too coarse to
+#       decide THIS window, means quote the raw date instead, and a date that
+#       cannot decide the window is "not_evaluable". NOTHING WIDENED -- the old
+#       branch already permitted reasoning from a date carrying no interval, and
+#       "cannot decide the window" is reached by every case the old "end date is
+#       unknown" reached, plus the coarse-interval case it had no answer for.
+#   (b) The FINAL REMINDER gained one line, beside 1.7.0's temporal line and for
+#       the same reason: the reminder is the last thing the model reads before it
+#       writes, and 1.7.0 measured that placement is what it acts on.
+#
+# MIDDLE NUMBER. What the model is told to do with a stated interval at the point
+# of classification changed, and the evidence it must write down changed with it.
+# Both are meaning.
+#
+# TWO INTERACTIONS, STATED HERE RATHER THAN LEFT TO BE REDISCOVERED:
+#
+#   (a) EDIT (a) PARTIALLY RESTATES 1.8.0's "ELAPSED TIME IS STATED FOR YOU"
+#       PARAGRAPH, which sits five lines above it under the same rule and already
+#       says "Do not recompute one". By this file's own rule a restatement that
+#       moves behaviour is a meaning change, and the justification is PLACEMENT,
+#       on the 1.7.0 precedent -- the paragraph is a standing fact about the
+#       record, the branch is an instruction at the decision point. The wording is
+#       therefore written to COMPLEMENT it rather than repeat it: the new material
+#       is the verbatim quote into patient_value, the comparison as the
+#       classification act, and the coarseness fallback. The one clause that does
+#       restate -- "Never compute an interval the record already states" -- is the
+#       anchor binding that standing fact to the act, and it is deliberately
+#       phrased in the paragraph's own noun.
+#   (b) THE TWO EDITS REACH DIFFERENT AUDIENCES, and that is correct rather than a
+#       gap. RULE 4 rides inside the `evaluation_rules` span
+#       (oncotriage/evaluation/rater.py:_RUBRIC_SPANS, "SECTION 3 -- CRITERION
+#       EVALUATION ORDER" to "SECTION 5 -- OUTPUT FORMAT"), so the independent
+#       rater receives edit (a) and judges under the same time-window rule the
+#       classifier does -- which is the rubric-mismatch confound that harness
+#       exists to remove. The FINAL REMINDER lies OUTSIDE every lifted span,
+#       exactly as 1.7.0's changelog records, so the rater does not receive edit
+#       (b). Precedent, not oversight: the rater already holds the rule, and the
+#       reminder restates it for a classifier about to emit a verdict, which is
+#       something the rater never emits.
+#
+# ONE VOCABULARY, AND ONE BEND FROM THE DRAFTED WORDING. The record prints
+# intervals and 1.8.0's paragraph calls them "intervals"; the drafted branch read
+# "Never compute a duration where one is stated", introducing a second noun for
+# the same object beside an ambiguous "one". "duration" appears nowhere in the
+# template -- only in this changelog, describing the operation being forbidden --
+# so the shipped text spells it "interval". The MECHANISM is the draft's
+# unchanged.
+#
+# WHAT DID NOT MOVE: the JSON template's field set, field order and example
+# values; the section order; every section heading and marker line; the response
+# schema; Section 2's two variants and the branch that selects them; the fenced
+# patient-record block; the GLOBAL INVARIANT and the disqualification proof
+# requirement; RULE 4's reference date, its 1.8.0 paragraph, its past-tense branch
+# and its active/current branch; 1.7.0's Section 5 check and both of its FINAL
+# REMINDER lines; every rubric span marker, so oncotriage/evaluation/rater.py
+# slices unchanged. The fixture SCHEMA_VERSION is untouched -- this is a prompt
+# edit, not a recording-format edit -- and no model call was made in this pass.
+PROMPT_VERSION = "1.9.0"
 
 
 def prompt_sha256(rendered_text: str) -> str:
@@ -537,8 +628,8 @@ ELAPSED TIME IS STATED FOR YOU. Wherever the patient record prints a date, it al
     Where a date is absent, unreadable, or later than the reference date, no interval is printed. Absence of an interval is not evidence of anything; the GLOBAL INVARIANT governs.
 
 If the criterion contains a time window:
-    If event end date is known: use the elapsed time the record states beside it, or calculate it if none is stated.
-    If event end date is unknown: classification = "not_evaluable"
+    Quote the record's stated interval for that event verbatim in patient_value, and classify by comparing that interval to the window. Never compute an interval the record already states.
+    If no interval is stated, or the stated one is too coarse to decide this window: quote the raw date instead; if the date cannot decide the window either, classification = "not_evaluable".
 
 If the criterion uses past-tense wording ("history of", "prior", "previous"):
     Any documented occurrence (past or present) satisfies the criterion.
@@ -678,6 +769,8 @@ FINAL REMINDER
 A trial can ONLY be classified "not_eligible" if you can quote explicit patient evidence that contradicts a trial criterion. If the patient record does not contain that evidence, the criterion status MUST be "not_evaluable".
 
 Evidence that a condition is RESOLVED, inactive or in remission does not contradict a criterion requiring an active or current one. Under RULE 4 that criterion is "not_evaluable" (inclusion) or "not_violated" (exclusion), never a disqualifier.
+
+For any time-window criterion: the record's stated interval, quoted verbatim, decides it. Never your own arithmetic.
 
 A trial is never "not_eligible" because another trial in this message was. Each verdict is reached from that trial's own criteria alone (C4).
 """

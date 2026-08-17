@@ -616,7 +616,7 @@ check("the two branches never render the same bytes",
 
 
 # ===========================================================================
-# SECTION 5b -- 1.7.0's REINFORCEMENT, AND THE HEADINGS STAY UNIQUE
+# SECTION 5b -- THE PINNED REINFORCEMENTS, AND THE HEADINGS STAY UNIQUE
 # ===========================================================================
 #
 # A DIGEST SAYS THE BYTES MOVED; IT CANNOT SAY WHAT THEY SAY. Section 4 would be
@@ -632,6 +632,17 @@ check("the two branches never render the same bytes",
 # that only asked "is this sentence somewhere in the prompt" would pass over an
 # edit that hoisted the block back up beside the rules it restates, which is
 # precisely the arrangement measured NOT to work.
+#
+# 1.9.0's TWO EDITS ARE PINNED BY THE SAME MACHINERY, and the tuple is what makes
+# that free rather than a second copy of these helpers: every check below --
+# present exactly once, under the right heading, in EVERY variant, plus the three
+# firing controls (a missing needle, a stripped needle, a hoisted needle) -- is a
+# function of `_REINFORCEMENT` and therefore covers each entry the moment it is
+# added. 1.9.0's finding is the same finding a third time: the model was told the
+# interval EXISTS (1.8.0, a standing fact under RULE 4) and still did not use it,
+# so the bump says the interval DECIDES, at the point of classification and again
+# in the last thing the model reads. Presence alone would pass over an edit that
+# demoted either back to prose somewhere else in the message.
 #
 # THE HEADINGS ARE DERIVED FROM THE RENDERED TEXT, never listed here. A section
 # added tomorrow is covered without an edit, and one removed cannot leave this
@@ -649,10 +660,10 @@ print("=" * 78)
 # it, so it agrees with a careless regeneration by construction; a literal here
 # is a second place a human has to consent to a bump. It is the only line in
 # this file a future bump must edit, and that is the cost being paid on purpose.
-check("PROMPT_VERSION reads 1.8.0", PROMPT_VERSION, "1.8.0")
+check("PROMPT_VERSION reads 1.9.0", PROMPT_VERSION, "1.9.0")
 
 # 1.8.0 IS PINNED HERE TOO, AND ITS ADDITION IS INSIDE A DIFFERENT SECTION.
-# Section 5b's scan below is about 1.7.0's five sentences and where they landed;
+# Section 5b's scan below is about the pinned sentences and where they landed;
 # 1.8.0's addition sits under RULE 4, inside SECTION 3, and the same
 # heading-uniqueness machinery is what makes that assertable. Its own
 # under-the-right-heading check lives in
@@ -667,10 +678,43 @@ check("...and the imperative it replaced is gone from every variant",
               for t in _180_RENDERS}), [False])
 check("...over a non-degenerate matrix", len(_180_RENDERS) > 1, True)
 
-# The five sentences 1.7.0 added, and the section each must land in. The section
-# is identified by the banner heading it follows, so "at the disqualification
-# point" is asserted rather than described.
+# EVERY SUPERSEDED TIME-WINDOW BRANCH, PINNED ABSENT. A template that carried BOTH
+# 1.8.0's branch and 1.9.0's would satisfy every presence check below and would
+# hand the model two instructions for one decision -- prefer-the-stated-interval
+# beside quote-the-stated-interval, keyed on different facts (the event's END
+# DATE versus the INTERVAL). That is not a hypothetical shape: it is what a merge
+# resolved the wrong way produces, and a digest cannot report it because the
+# digest moved for the addition either way. Both clauses of 1.8.0's branch are
+# named, not just the one 1.9.0's wording most resembles.
+_SUPERSEDED_TIME_WINDOW = (
+    "use the elapsed time the record states beside it",     # 1.8.0, first line
+    "If event end date is unknown:",                        # 1.8.0, second line
+    "If event end date is known:",                          # pre-1.8.0 and 1.8.0
+)
+check("every superseded time-window clause is gone from every variant",
+      sorted({n for t in _180_RENDERS for n in _SUPERSEDED_TIME_WINDOW
+              if n in t}), [])
+check("...and that scan can report one: 1.8.0's own branch text pasted back "
+      "into a rendered copy is found",
+      sorted({n for n in _SUPERSEDED_TIME_WINDOW
+              if n in _180_RENDERS[0]
+              + "\n    If event end date is known: use the elapsed time the "
+                "record states beside it, or calculate it if none is stated."
+              + "\n    If event end date is unknown: classification = "
+                '"not_evaluable"'}),
+      sorted(_SUPERSEDED_TIME_WINDOW))
+
+# The sentences a bump added BECAUSE OF WHERE THEY SIT, and the section each must
+# land in. The section is identified by the banner heading it follows, so "at the
+# disqualification point" is asserted rather than described.
+#
+# ONE TUPLE ACROSS VERSIONS, DELIBERATELY. Every check and every control below is
+# a function of this tuple, so an entry added here is covered by all of them at
+# once and none of them can quietly cover less than it claims. Each entry must
+# occupy A WHOLE LINE of the rendered template and no two may share a line -- the
+# strip control counts removed lines against len(_REINFORCEMENT).
 _REINFORCEMENT = (
+    # 1.7.0 -- RULE 4 and C4 restated at the moment a rejecting status is written.
     ('BEFORE YOU WRITE "not_met" OR "violated" ON ANY CRITERION, CHECK TWO '
      'THINGS:', "SECTION 5 -- OUTPUT FORMAT"),
     ("ACTIVITY (RULE 4).", "SECTION 5 -- OUTPUT FORMAT"),
@@ -680,6 +724,17 @@ _REINFORCEMENT = (
      "FINAL REMINDER"),
     ('A trial is never "not_eligible" because another trial in this message '
      'was.', "FINAL REMINDER"),
+    # 1.9.0 -- quote-before-judge. The first is the decision point itself: RULE 4
+    # rides under SECTION 3, which is also the span oncotriage/evaluation/rater.py
+    # lifts into the independent rater's rubric, so this entry is what says the
+    # rater judges time windows under the same rule the classifier does. The
+    # second is the last thing the model reads before it writes, and lies OUTSIDE
+    # every lifted span -- the asymmetry is 1.7.0's precedent, and
+    # tests/test_evaluation_rater.py section 7d is where it is asserted.
+    ("Quote the record's stated interval for that event verbatim in "
+     "patient_value", "SECTION 3 -- CRITERION EVALUATION ORDER"),
+    ("For any time-window criterion: the record's stated interval, quoted "
+     "verbatim, decides it.", "FINAL REMINDER"),
 )
 
 # A needle this file invented, which the template must NOT contain. Without it
@@ -691,7 +746,7 @@ _ABSENT_NEEDLE = ("BEFORE YOU WRITE THIS SENTENCE THE TEMPLATE HAS STOPPED "
 
 
 def _placements(text: str) -> dict:
-    """{needle: heading it falls under} for every 1.7.0 needle in `text`.
+    """{needle: heading it falls under} for every pinned needle in `text`.
 
     ``"<absent>"`` when the needle is not there and ``"<before any heading>"``
     when it precedes every banner, so a defect produces a readable value rather
@@ -728,7 +783,7 @@ def _banner_headings(text: str) -> list:
 
 
 def _reinforcement_findings(text: str) -> list:
-    """Every way `text` fails to carry 1.7.0's reinforcement. [] when it does."""
+    """Every way `text` fails to carry the pinned reinforcements. [] if it does."""
     found = []
     placed = _placements(text)
     for needle, expected in _REINFORCEMENT:
@@ -767,7 +822,7 @@ check("...and that scan can report a duplicate: one heading pasted twice into "
                           + "\n" + "=" * 69 + "\nFINAL REMINDER\n" + "=" * 69),
       ["'FINAL REMINDER' x2"])
 
-check("1.7.0's reinforcement is present exactly once, and under the right "
+check("every pinned sentence is present exactly once, and under the right "
       "heading, in EVERY variant (both Section 2 branches)",
       sorted({f for t in _ALL_RENDERS.values()
               for f in _reinforcement_findings(t)}), [])
@@ -796,12 +851,17 @@ _STRIPPED = "\n".join(ln for ln in _ONE_RENDER.split("\n")
 # `split(sep, 1)[-1]` is total over any string, and the length is a value rather
 # than an index.
 _STRIP_FINDINGS = _reinforcement_findings(_STRIPPED)
-check("non-degeneracy: the five needles occupy five whole lines, so stripping "
-      "them removes five and nothing else",
+# THE LINE COUNT IS DERIVED, NOT REMEMBERED. It read a literal 5 while the tuple
+# held five entries, so adding 1.9.0's two would have failed here for arithmetic
+# rather than for anything about the template. len(_REINFORCEMENT) is the same
+# assertion -- one whole line per needle, no two sharing a line -- and it cannot
+# go stale when the tuple grows.
+check("non-degeneracy: each needle occupies a whole line of its own, so "
+      "stripping them removes exactly len(_REINFORCEMENT) lines and nothing else",
       (len(_ONE_RENDER.split("\n")) - len(_STRIPPED.split("\n")),
        len(_STRIP_FINDINGS),
        sorted({f.split(" occurs ", 1)[-1] for f in _STRIP_FINDINGS})),
-      (5, len(_REINFORCEMENT), ["0 times, expected 1"]))
+      (len(_REINFORCEMENT), len(_REINFORCEMENT), ["0 times, expected 1"]))
 _HOISTED = (_STRIPPED + "\n" + "=" * 69 + "\nAPPENDED\n" + "=" * 69 + "\n"
             + "\n".join(n for n, _ in _REINFORCEMENT))
 check("...and a needle in the wrong section is reported as misplaced, not as "
@@ -936,11 +996,11 @@ check("6f  unpatched, the same comparison reports nothing (the other half of "
       evaluate(PROMPT_VERSION, _SIG_PARAMS, _digests(render_system_prompt),
                _GOOD_SNAPSHOT), [])
 
-# --- 6g: THE TEMPLATE WITH 1.7.0's REINFORCEMENT REMOVED -------------------
+# --- 6g: THE TEMPLATE WITH EVERY PINNED REINFORCEMENT REMOVED --------------
 #
 # Section 5b's controls doctor a rendered STRING, which shows the scans
 # discriminate. This one shows their SUBJECT is right, the same way 6f does for
-# the digests: the five sentences are deleted from an in-memory copy of
+# the digests: every pinned sentence is deleted from an in-memory copy of
 # prompts.py and every Section 5b finding must fire against the copy while the
 # shipped module still reports clean. Without it, Section 5b would pass against
 # a template it had been quietly disconnected from.
@@ -948,15 +1008,19 @@ check("6f  unpatched, the same comparison reports nothing (the other half of "
 # The strip is LINE-BASED and its extent is asserted, because a needle that also
 # appeared in the changelog comment above PROMPT_VERSION would delete a line
 # this control did not choose -- and a control that removes the wrong thing
-# fails, which looks exactly like a control that is working.
+# fails, which looks exactly like a control that is working. THAT IS A LIVE
+# CONSTRAINT ON THE CHANGELOG, not a hypothetical: 1.9.0's changelog argues about
+# both of its own additions at length, and this check is what forced it to argue
+# about them in different words than the template uses.
 
 _STRIPPED_SRC = "\n".join(
     line for line in _PROMPTS_SRC.split("\n")
     if not any(needle in line for needle, _ in _REINFORCEMENT))
-check("6g  the strip removed exactly the five template lines and nothing else",
+check("6g  the strip removed exactly one source line per pinned sentence and "
+      "nothing else",
       (len(_PROMPTS_SRC.split("\n")) - len(_STRIPPED_SRC.split("\n")),
        _STRIPPED_SRC.count("PROMPT_VERSION = ")),
-      (5, _PROMPTS_SRC.count("PROMPT_VERSION = ")))
+      (len(_REINFORCEMENT), _PROMPTS_SRC.count("PROMPT_VERSION = ")))
 
 _stripped_ns = {"__name__": "oncotriage.agent._prompts_stripped_copy",
                 "__file__": _PROMPTS_PATH}
@@ -974,8 +1038,8 @@ check("6g  ...and it is genuinely shorter than the shipped one, variant for "
               zip([_ALL_RENDERS[_variant_id(kw)] for kw in _matrix()],
                   _STRIPPED_RENDERS)}),
       [True])
-check("6g  EVERY variant of the stripped copy is reported as missing all five "
-      "sentences",
+check("6g  EVERY variant of the stripped copy is reported as missing every "
+      "pinned sentence",
       sorted({len(_reinforcement_findings(t)) for t in _STRIPPED_RENDERS}),
       [len(_REINFORCEMENT)])
 # The two scans are INDEPENDENT: deleting the reinforcement must not disturb the
