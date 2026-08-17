@@ -164,6 +164,57 @@ above and accepted. A future gate should be stated per verdict and computed afte
 excluding trials whose input text changed, which measures the model wandering
 rather than the fix working.
 
+### The two sets, by sha256 (amended 2026-08-16)
+
+**THE RECORD SHIPPED WITHOUT THE ONE FIELD THAT IDENTIFIES A FIXTURE FILE.**
+Every number above is re-derived from fixture *contents*; none of it says which
+BYTES those contents came out of, so a reader holding a `.json.gz` had no way to
+ask "is this the set that produced the table above". Both sides are recorded
+here rather than only the replaced one: a provenance note naming one side of a
+substitution can be used to verify neither — the old set to say what was
+replaced, the new set because it is what is on disk now and what a later replay
+result is a statement about.
+
+**The hash is meaningful because the writer zeroes the gzip mtime.**
+`oncotriage/fixtures/capture.py:1406` writes `gzip.GzipFile(path, "wb",
+compresslevel=9, mtime=0)`, so two captures of identical content produce
+identical bytes and sha256 is a function of content alone. Without that, every
+hash here would be a timestamp.
+
+Reproduce either column with `shasum -a 256 *.json.gz` in the directory
+concerned.
+
+| fixture | pre-recapture (1.7.0) | on disk now (1.8.0) |
+|---|---|---|
+| `ablation_bm25_only` | `4f65291ca2ca457bd161a8b6ff324b340b349343112bab688112d104bb6013dd` | `8da2d66bb1a50e302899937755d08a61cebf15709598cfb25157618aa63efde7` |
+| `ablation_no_cross_encoder` | `29f1f252ce26d635580c0a2e07a85a28a9df4a2cd7e1c3125515e870c4bf63f7` | `78156d32dbe0e173737f97e29266d167a4062226feedbe342350c2b24b32a6b9` |
+| `ablation_vector_only` | `be432a07345161905fc2a57d23fd694d263983f54989f7153bc61fe1976bb168` | `4e7de88ec3451cf215ecf15336bae7185b8713b0f9f218e6c4739ee02cffabc2` |
+| `llm_classifier_parse_retry_constructed` | `bed42d5b61584d8df3daffc5f319cef728727a5dd7bcefd469c57741b9a58324` | `61dca2b033e0a7ba55ed9c039f74b9523377854f84e3a4cfbec1cb91539ac8e1` |
+| `mcode_genomic_variant` | `54b6f9604c0a35c55368ff61929ed799982fc73e012c6ac7aac6aee46cb610e2` | `3cd66b88d46e0da3080b266f708ec34e3f2b58930c3b74585b17f863698f180c` |
+| `mesh_fallback_siteless_code` | `46e9a7a31fb65c11548990e90ec136d0c2c5fd5b4e9602709ae15509ee358309` | `b1bf34febaceb65682f3ddb9dc4eb0cd6562127e64280ab6dfb97657e5d5e009` |
+| `no_candidates_pediatric_age` | `57f76c0a542354e125965eaadb621d6c1e8d0829d3fe538303846b57298c1ede` | `6331a482cb3e1e8706db3c878574fa51e257638f2d562448073d89db6cdb6b9a` |
+| `normal_1` | `d3e12d7dfea11ed4520aab63e611439eeab7feb2cf1b6af496352463adfa12cc` | `d29f0fb754d8c2e5dcc857d8c499113771cadc034d2fa0a7744c586429f1c545` |
+| `normal_2` | `ea5982efb7cb499a1bf8b23bca71e981cae2f6b58c94e7e5196cdcd7d94c0243` | `e271c1589690f8019ea778a5d0529f4e940cf5837fe1d41b585148e7d930234c` |
+| `normal_3` | `e89d91f5e56028c62ac1d1afb75dda65bf18855f0fe35e8d9627c8c60d8f3927` | `cda425fbe55990e10bb66f7b93267045378be916dad850d632fda411a784c8d3` |
+| `truncation_split` | `ca1103f69055ab8427e3a2a5f6732c173d895d6e9239578ac8ccec176f70c362` | `7adb58d68f3c7d1d77a3c3c2cb37c54d5cf8ef6fe78d82e1039b9cfd7e4366de` |
+| `unknown_stage` | `15a70d72e958aae66287515b96cf501b47099bdc8436a2f8ef8482cb51812f1e` | `e690c43bc1bb9ee2fcea4da530f8cddc4d9388f2729dcafa480bae0b277d0f91` |
+
+**PROVENANCE OF THE OLD COLUMN, STATED BECAUSE IT IS WEAKER THAN THE NEW ONE.**
+The 1.7.0 files were overwritten in place by the recapture and are not in git.
+The column above was hashed from a copy taken by the capture session before it
+spent anything, which survived on disk at
+`/private/tmp/claude-501/…/ad145b6e-…/scratchpad/fixtures_before/`. **That is a
+session scratchpad and it is ephemeral** — the twelve hashes are recorded here
+precisely because the directory holding them will not last.
+
+It was checked to be the right set rather than assumed: all twelve carry
+`deterministic_prefix.stage5.llm_classifier_prompt_version == "1.7.0"` against
+the live set's `1.8.0`, `captured_at_utc` in the range
+`2026-08-13T21:10:23Z`–`21:34:14Z` (the 1.7.0 capture, one recapture cycle
+earlier), and all twelve differ byte-for-byte from the files on disk now — so
+the two columns above are 24 distinct hashes and not a table that would look the
+same if the backup had been a copy of the current set.
+
 ### Verification
 
 | check | result |

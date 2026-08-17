@@ -37,6 +37,13 @@ the eight modules that never had a number, several of which
 load-bearing code in the project. **Survivors were not renumbered:** gaps are
 cheaper than every note in the project resolving to the wrong file.
 
+**[`FIXTURE CAPTURE RECORD.md`](FIXTURE%20CAPTURE%20RECORD.md) is the provenance
+of the twelve characterization fixtures** — what each capture cost, which model,
+prompt version and Qdrant collection produced it, the per-file sha256 of the set
+on disk and of the set it replaced, and which verdicts moved. The fixtures live
+outside the repository and are not in git, so a capture leaves no commit and
+this file is the only place any of that lands.
+
 **FIVE SHIMS BECAME THIN ENTRY POINTS RATHER THAN BEING DELETED**, because each
 keeps a runnable `__main__`: `05- FHIR Clean Data.py` (the cohort deletion),
 `07- FHIR Parser.py` (a corpus smoke run), `09- MeSH Cancer Site Relevance
