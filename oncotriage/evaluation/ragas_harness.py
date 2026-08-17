@@ -42,6 +42,7 @@ import json
 import math
 import os
 import statistics
+import sys
 import time
 
 from oncotriage import config, paths
@@ -207,6 +208,157 @@ REPRODUCIBILITY_NOTE = (
 GENERATION_QUESTION_TEMPLATE = (
     "Is this patient eligible for trial {nct_id}? Assess the eligibility "
     "criteria against the patient record.")
+
+
+#------------------------------------------------------------------------------
+# The environment stamp
+#------------------------------------------------------------------------------
+# WHY IT EXISTS. Ragas is deliberately NOT a pipeline dependency and is not in
+# pyproject.toml -- installing it there would drag ``openai`` from 1.x to 2.x
+# and bump ``langgraph``, both of which the pipeline depends on -- so NOTHING IN
+# THIS REPOSITORY PINS THE ENVIRONMENT THIS HARNESS RUNS IN. A later run under a
+# different ragas, whose metric prompts, statement decomposition or defaults
+# have moved, would produce different scores, and that drift would be
+# indistinguishable from pipeline drift. REPRODUCIBILITY_NOTE already records
+# that faithfulness is not reproducible sample to sample at temperature 0; the
+# environment must not add a second, unrecorded source of variation on top of a
+# known one.
+#
+# THERE IS NO LOCKFILE IN THIS REPOSITORY, AND THAT IS WHY THIS EXISTS RATHER
+# THAN BEING REDUNDANT WITH ONE. The environment that produced the two
+# reference runs under ``09- Testing/Evaluation Runs/`` could not be found when
+# it was looked for: no ``pyvenv.cfg`` anywhere under the project root or the
+# home directory holds ragas, no conda environment has it, nothing in the pip
+# or uv caches names it, and the two manifests it wrote record a ragas version
+# and nothing else about it. So it could not be frozen, and freezing a fresh
+# environment instead would be a lockfile claiming a provenance it does not
+# have. A stamp taken by the run itself has the opposite property: it cannot
+# claim anything about a run it did not make. It is also what a truthful
+# lockfile needs first -- the next run records what it used, and THAT is a
+# thing that can honestly be pinned.
+#
+# A LOCKFILE CAN BE IGNORED; A RECORDED VERSION CANNOT BE ABSENT. When one is
+# added, the two stay independent on purpose: an operator who installs by hand,
+# or who edits the environment after creating it, still gets a truthful
+# manifest rather than the file's aspiration.
+#
+# READ THROUGH importlib.metadata RATHER THAN ``__version__``, AND NEVER AT
+# IMPORT. Three reasons, none of them "``__version__`` is missing" -- measured
+# on this machine, anthropic 0.72.0, openai 1.99.9 and langchain-core 1.5.3 all
+# expose one:
+#
+#   1. ASKING WOULD MEAN IMPORTING. ``__version__`` is an attribute of a loaded
+#      module, so reading it for ragas imports ragas -- which breaks this
+#      module's lazy-import discipline and is precisely what lets ``--help``
+#      and ``--dry-run`` run in an environment that has no ragas at all. There
+#      is no ``__version__`` to read for a distribution that is not installed,
+#      and "not installed" is a thing this stamp must be able to say.
+#   2. THE DISTRIBUTION NAME IS NOT THE MODULE NAME. ``langchain-core`` imports
+#      as ``langchain_core``. A ``__version__`` route needs a name-mapping
+#      table beside ENVIRONMENT_PACKAGES, which is a second declaration that
+#      can drift from the first; importlib.metadata takes the distribution name
+#      directly, which is also the name ``pip install`` and ``pip freeze`` use.
+#   3. IT IS THE THING A LOCKFILE REPRODUCES. A lockfile pins distributions,
+#      not module attributes, so the metadata reading is the one that answers
+#      "would reinstalling this give me the same code".
+#
+# importlib.metadata READS THE FILESYSTEM, which is why every call site here is
+# inside a function body: tests/test_package_invariants.py section 2 imports
+# every package module with ``builtins.open`` and ``io.open`` trapped to raise,
+# and a module-scope lookup would fire them.
+
+ENVIRONMENT_PACKAGES = ("ragas", "anthropic", "openai", "langchain-core")
+"""The distributions whose version decides what a score means.
+
+``ragas`` owns the metric prompts and the decomposition; ``anthropic`` and
+``openai`` are the two SDKs that carry the judge and the embedder;
+``langchain-core`` is ragas' own wrapper layer, whose message and callback
+shapes ragas builds its prompts on top of. Recorded whether or not it is
+installed -- "``langchain-core`` if present" is a statement about the
+environment, and ``absent`` states it.
+"""
+
+PACKAGE_ABSENT = "absent"
+"""Recorded for a distribution that is not installed.
+
+A FACT ABOUT THE ENVIRONMENT, NOT A FAILURE. The dry-run path returns before
+ragas is imported, so it legitimately runs in the project environment, where
+``absent`` is the correct record of the interpreter that produced the plan.
+"""
+
+PACKAGE_UNREADABLE_PREFIX = "unreadable: "
+"""Recorded when the metadata read failed for any reason OTHER than absence.
+
+The distinction is the point, and collapsing it is the defect. A bare
+``except Exception: return PACKAGE_ABSENT`` would record a corrupt
+``dist-info``, an unreadable site-packages or a broken importlib as "not
+installed" -- a false statement about the environment, in the one field that
+exists to be trusted, with nothing anywhere saying otherwise. It would also
+break this project's standing rule that no exception is caught without being
+re-raised or recorded: here the record IS the returned value, which is why
+nothing is counted beside it.
+"""
+
+
+def package_version(name, version_fn=None):
+    """The installed version of ``name``, or a truthful record of why not.
+
+    ``version_fn`` is the seam. The default is ``importlib.metadata.version``;
+    a test installs a stand-in so both the absent path and the unreadable path
+    can be driven without uninstalling anything or corrupting a real
+    ``dist-info``.
+    """
+    import importlib.metadata
+
+    lookup = version_fn if version_fn is not None else importlib.metadata.version
+    try:
+        return lookup(name)
+    except importlib.metadata.PackageNotFoundError:
+        return PACKAGE_ABSENT
+    except Exception as exc:                            # noqa: BLE001
+        # Recorded in the value rather than swallowed. The caller writing this
+        # into a manifest is the record.
+        return f"{PACKAGE_UNREADABLE_PREFIX}{type(exc).__name__}: {exc}"
+
+
+def environment_stamp(version_fn=None):
+    """What this process is actually running, recorded rather than assumed.
+
+    ``python_executable`` is here because of how the lockfile item started: the
+    environment that produced the two reference runs under
+    ``09- Testing/Evaluation Runs/`` could not be found afterwards -- no
+    ``pyvenv.cfg`` anywhere under the project root or the home directory holds
+    ragas -- so it could not be frozen, and the manifests it wrote recorded a
+    ragas version and nothing about where it lived. The interpreter path is one
+    string that makes the next environment findable.
+    """
+    return {
+        "python_version": sys.version,
+        "python_executable": sys.executable,
+        "packages": {name: package_version(name, version_fn)
+                     for name in ENVIRONMENT_PACKAGES},
+    }
+
+
+def print_environment(environment):
+    """Print the stamp. ONE renderer, so both paths describe it identically.
+
+    A separate formatter for the dry run could disagree with the one the real
+    run prints, and an operator comparing a plan against a run would be
+    comparing two descriptions rather than two environments.
+    """
+    console.out("environment:")
+    # 15 is one past the longest name in ENVIRONMENT_PACKAGES
+    # ("langchain-core"), so the column does not tear when the longest entry is
+    # printed. Derived rather than typed, so adding a longer name widens it.
+    width = max(len(n) for n in (("python", "executable")
+                                 + tuple(environment["packages"]))) + 1
+    first_line = (environment["python_version"].splitlines() or [""])[0]
+    console.out(f"    {'python':<{width}} {first_line}")
+    console.out(f"    {'executable':<{width}} "
+                f"{environment['python_executable']}")
+    for name, version in environment["packages"].items():
+        console.out(f"    {name:<{width}} {version}")
 
 
 #------------------------------------------------------------------------------
@@ -1187,10 +1339,21 @@ def print_summary(summary, cost, judge_model, embedding_model, wall_seconds,
     console.out("")
 
 
-def print_plan(plan, run, out_dir, active):
+def print_plan(plan, run, out_dir, active, environment):
     console.banner("RAGAS DRY RUN -- NOTHING WAS SUBMITTED")
     console.out(f"run dir:    {run.run_dir}")
     console.out(f"output dir: {out_dir}")
+    console.out("")
+    # THE SAME FIELDS THE MANIFEST STAMPS, THROUGH THE SAME RENDERER, AND THEY
+    # DESCRIBE THIS INTERPRETER TRUTHFULLY WHATEVER IT IS. The dry run returns
+    # before ``import ragas``, so it can legitimately be run from the project
+    # environment -- which does not have ragas, by design -- and ``ragas
+    # absent`` is then the CORRECT record of what produced this plan, not a
+    # defect and not a reason to refuse. A plan is arithmetic over recorded
+    # text; it needs no judge, no SDK and no metric implementation. What the
+    # line is for is the opposite mistake: reading a dry run's numbers as if
+    # they came from the environment the scoring run will use.
+    print_environment(environment)
     console.out("")
     if DATASET_RETRIEVAL in active:
         console.out(f"{DATASET_RETRIEVAL:<11} {len(run.retrieval):>5} samples "
@@ -1336,12 +1499,29 @@ def superseded_record(run_dir, out_dir, active):
 
 
 def build_manifest(run, summary, cost, args, wall_seconds, ragas_version,
-                   plan, active, supersedes=None):
+                   plan, active, supersedes=None, environment=None):
+    """The record of what ran, under what, at what cost.
+
+    ``environment`` defaults to a stamp taken here rather than to ``None``, so a
+    caller that forgets it writes a truthful record instead of a null field.
+    ``main()`` passes the same object it printed, so the plan an operator read
+    and the manifest they keep cannot describe different environments.
+    """
     return {
-        "schema_version": 1,
+        # SCHEMA 2 ADDS ``environment`` AND NOTHING ELSE. The two manifests
+        # already on disk under 09- Testing/Evaluation Runs/ are schema 1 and
+        # carry no environment block; they record a ragas version and nothing
+        # about the interpreter, the SDKs or where any of it lived. Bumping is
+        # what lets a reader tell "this run predates the stamp" from "this run
+        # was stamped and the block is missing". Nothing in this repository
+        # reads the field, so the bump costs nothing today; leaving two
+        # different field sets both claiming schema 1 would cost later.
+        "schema_version": 2,
         "generated_at_utc": _utc_now(),
         "run_dir": run.run_dir,
         "ragas_version": ragas_version,
+        "environment": (environment if environment is not None
+                        else environment_stamp()),
         "judge_model": args.judge_model,
         "judge_provider": "anthropic",
         "judge_temperature": args.temperature,
@@ -1436,6 +1616,47 @@ def snapshot_tree(root, exclude_dir=None):
             except OSError as exc:                      # noqa: PERF203
                 snapshot[os.path.relpath(full, root)] = f"unreadable: {exc}"
     return snapshot
+
+
+def ragas_version_disagreement(environment, imported_version):
+    """A failure string when the two readings of the ragas version disagree.
+
+    TWO READINGS OF ONE FACT, SO THEY ARE COMPARED RATHER THAN LEFT TO DRIFT.
+    ``ragas_version`` in the manifest is ``ragas.__version__`` -- the module
+    that actually scored the run -- and ``environment.packages['ragas']`` is
+    the version of the DISTRIBUTION on this path, which is the thing a
+    reinstall reproduces. They agree in any ordinary install and disagree when
+    a source checkout, a stale ``.pth`` or a second site-packages shadows the
+    installed distribution: exactly the state in which "recreate the
+    environment and re-run" would silently not reproduce these scores.
+    Recording both without comparing them would be two fields free to diverge
+    with nothing failing when they did.
+
+    A SEPARATE FUNCTION SO IT CAN BE EXERCISED WITHOUT A BILLED RUN. Every
+    other check in ``main()``'s failure block needs a scored run behind it,
+    which costs about $9 on the reference corpus; folding this one in beside
+    them would have made it the one assertion here that nothing ever runs.
+
+    Returns ``None`` when the two agree.
+    """
+    # ``.get``, not ``[...]``. The caller runs this AFTER scoring and after
+    # both output files are written, so a KeyError -- which is all it would
+    # take to drop "ragas" from ENVIRONMENT_PACKAGES -- would traceback out of
+    # a run that had already spent its money and produced correct output, and
+    # would take the whole failure summary with it.
+    stamped = environment["packages"].get("ragas")
+    if stamped is None:
+        return ("environment: the stamp carries no ragas entry, so the "
+                "version that scored this run could not be cross-checked "
+                "against the distribution on this path. ENVIRONMENT_PACKAGES "
+                "no longer names it.")
+    if stamped != imported_version:
+        return (f"environment: distribution metadata reports ragas "
+                f"{stamped!r} while the module that scored this run reports "
+                f"{imported_version!r}. Something on this path is shadowing "
+                f"the installed distribution, so reinstalling the recorded "
+                f"version would not reproduce these scores.")
+    return None
 
 
 def post_checks(run, scores, results_path, manifest_path, out_dir, active,
@@ -1569,8 +1790,13 @@ def main(argv=None):
         log.error("ragas_refused", extra={"reason": exc.code})
         return 1
 
+    # Taken ONCE, before either path diverges, and handed to whichever runs. A
+    # second call would be a second reading of the same fact, and two readings
+    # of a filesystem taken minutes apart can disagree.
+    environment = environment_stamp()
+
     if args.dry_run:
-        print_plan(plan, run, out_dir, active)
+        print_plan(plan, run, out_dir, active, environment)
         return 0
 
     parent = os.path.dirname(out_dir.rstrip(os.sep))
@@ -1610,6 +1836,12 @@ def main(argv=None):
         m for ms in active.values() for m in ms)
         + (" | embedder: none built (no selected metric needs one)"
            if not needs_embeddings else f" | embedder: {args.embedding_model}"))
+    # Printed here, before a cent is spent, and not only written into the
+    # manifest at the end: the manifest lands after the whole run -- 414 seconds
+    # and $9.29 on the reference run -- and an operator who is about to spend
+    # that wants to see which ragas is about to score it while stopping is still
+    # free.
+    print_environment(environment)
 
     # Snapshotted before a cent is spent and compared after writing, so
     # "the earlier outputs are untouched" is checked rather than asserted.
@@ -1628,7 +1860,8 @@ def main(argv=None):
     write_json(manifest_path,
                build_manifest(run, summary, cost, args, wall_seconds,
                               ragas.__version__, plan, active,
-                              superseded_record(run_dir, out_dir, active)))
+                              superseded_record(run_dir, out_dir, active),
+                              environment))
 
     print_summary(summary, cost, args.judge_model, args.embedding_model,
                   wall_seconds, args.temperature, active)
@@ -1641,6 +1874,21 @@ def main(argv=None):
         failures.append(
             f"vendor isolation: {tally.embedding_calls} embedding call(s) "
             f"were made although no selected metric needs an embedder")
+    # TWO READINGS OF ONE FACT, SO THEY ARE COMPARED RATHER THAN LEFT TO DRIFT.
+    # ``ragas_version`` is ``ragas.__version__`` -- the module that actually
+    # scored this run -- and ``environment.packages['ragas']`` is the version
+    # of the DISTRIBUTION on this path, which is the thing a lockfile installs
+    # and reproduces. They agree in any ordinary install and disagree when a
+    # source checkout, a stale ``.pth`` or a second site-packages shadows the
+    # installed distribution -- which is exactly the state in which
+    # "recreate the environment from the lockfile" would not reproduce these
+    # scores. Recording both without comparing them would be two fields that
+    # can silently diverge; this makes the divergence a named post-check
+    # failure. It is exit 3, not a refusal: the outputs are already written and
+    # nothing about them is wrong -- what is in doubt is their reproducibility.
+    disagreement = ragas_version_disagreement(environment, ragas.__version__)
+    if disagreement:
+        failures.append(disagreement)
     if failures:
         console.out("")
         console.out("POST-CHECKS FAILED:")

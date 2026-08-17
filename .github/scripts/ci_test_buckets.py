@@ -190,6 +190,17 @@ BUCKETS = {
         "records element type 'vertical'; 1.46.0 emits 'flex_container'. That "
         "is a repository defect, not a CI one, and it is deliberately NOT "
         "suppressed here -- see the CI report."),
+    "test_evaluation_ragas_manifest.py": (
+        _A, None,
+        "ran green in 1.5s, 69 checks, against ONLY the directory skeleton "
+        "this script provisions: it reads no evaluation run (the RunInput is "
+        "built from literal strings), writes nothing anywhere (the JSON "
+        "round-trip goes through json.dumps, never write_json), needs no git "
+        "history, and asks importlib.metadata about four distributions "
+        "whichever of them are installed -- the absent path is driven both "
+        "naturally and through a planted lookup, so the outcome does not "
+        "depend on what the runner happens to have. Section 7 spawns one "
+        "subprocess that imports the harness and takes a stamp"),
     "test_extraction_histology.py": (
         _A, None, "ran green in 0.1s, 133 checks, identical in a depth-1 clone"),
     "test_extraction_stage_m_category.py": (

@@ -37,7 +37,29 @@ into the project environment would drag ``openai`` from 1.x to 2.x and bump
 ``langgraph``, both of which the pipeline depends on. Run this file from an
 isolated environment that has ragas, anthropic and openai installed; the
 harness itself imports all three lazily, inside function bodies, so importing
-``oncotriage.evaluation.ragas_harness`` still loads none of them.
+``oncotriage.evaluation.ragas_harness`` loads neither ragas nor the Anthropic
+SDK -- which is what lets ``--help`` and ``--dry-run`` run in the project
+environment, where ragas is absent. It does load ``openai``, and this line used
+to say it loaded none of the three: ``oncotriage/config.py`` does a
+module-scope ``from openai import OpenAI`` and this harness imports ``config``
+at module scope, so ``openai`` has always arrived transitively. That costs
+nothing -- ``openai`` is a pipeline dependency and is present wherever this
+repository runs -- but the claim was wrong, and
+``tests/test_evaluation_ragas_manifest.py`` section 7 now pins the reading so
+it cannot drift back into being right by accident.
+
+EVERY RUN RECORDS THE ENVIRONMENT IT RAN UNDER, because nothing in this
+repository pins it. ``ragas_manifest.json`` carries an ``environment`` block --
+``sys.version``, ``sys.executable`` and the installed versions of ragas,
+anthropic, openai and langchain-core, each read from distribution metadata and
+recorded as ``absent`` when the distribution is not installed. ``--dry-run``
+prints the same block. A ragas whose metric prompts or statement decomposition
+have moved produces different scores, and without this the drift would be
+indistinguishable from pipeline drift; faithfulness is already documented as
+non-reproducible sample to sample, so the environment must not add a second
+unrecorded source on top of a known one. In the project environment -- which
+deliberately does NOT have ragas -- a dry run stamps ``ragas absent``, and that
+is the correct record of the interpreter that produced the plan.
 
 WHY THIS FILE IS NOT NUMBERED. Same reason as ``evaluation_run.py``,
 ``rater_run.py``, ``fixture_capture.py``, ``fixture_replay.py``,
