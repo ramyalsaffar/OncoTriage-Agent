@@ -59,12 +59,34 @@ WHAT IS COVERED, AND WHY EACH SECTION EXISTS:
      rubric" -- the last of which it answers NO, by assertion rather than by
      claim, because both of 1.7.0's additions lie outside every span.
 
+  8  BLIND MODE. The rater is no longer shown the recorded status; it assigns
+     its own and agreement is computed offline. Section 8 pins the anchored
+     request bodies against a hash MEASURED FROM THE PRE-BLIND MODULE, proves
+     the blind request is a function of everything except the answer (two runs
+     differing only in the recorded status serialize to identical bytes),
+     fires every new unrated reason, round-trips the retest custom_id through
+     both id forms, and computes the confusion counts and the intra-rater
+     figure by hand against a planted set. Its most valuable check is 8a's
+     ORDER assertion: the first version of the blind change re-sorted the
+     request list, which agreed with ``load_run``'s order on a real run and
+     silently reordered a planted one. Nothing else in this file would have
+     seen it.
+
 NEGATIVE CONTROLS ARE INPUT-BASED, NOT PLANTED. Every function under test here
 is pure, or takes its collaborators as arguments, so the natural control is a
 different INPUT that must produce a different answer -- the shape
 ``tests/test_agent_patient_hash_coverage.py`` uses for the same reason. That
 also keeps this file out of ``_EXEC_ALLOWLIST``: it execs nothing, loads no
 module by location, and patches no shipped source.
+
+ONE VALUE IN HERE COULD NOT BE DERIVED AND IS PINNED. Section 8a's hash was
+computed by loading ``git show HEAD:oncotriage/evaluation/rater.py`` into a
+throwaway module before blind mode existed. The shipped test reads no git: a
+commit recedes, and a check that re-derives its expectation from whatever HEAD
+happens to be agrees with the code by construction. It is built over a PLANTED
+rubric rather than the real one, so an edit to ``oncotriage/agent/prompts.py``
+cannot fail a check about whether blind mode disturbed anchored assembly --
+section 7 is what guards the rubric.
 
 ONE CONTROL CANNOT BE INPUT-BASED AND SAYS SO. ``lift_rubric()`` takes no
 arguments, so the only way to drive its cross-probe invariance refusal is to
@@ -77,8 +99,16 @@ NO NETWORK, NO KEYS, NO SPEND, NO DATABASE, NO CORPUS, NO GIT HISTORY. Every
 decision, response and usage object in here is a literal built in this file.
 The evaluation run directories are never read -- the harness's own
 ``default_run_dir()`` is never called -- so this file is unaffected by whether
-a run exists on disk. It writes nothing anywhere and is NOT in
-``tests/run_serial_tests.py``'s collision matrix.
+a run exists on disk.
+
+IT WRITES NOTHING IN THE REPOSITORY, and section 8p2 is the one place it writes
+anything at all: a fresh ``tempfile.mkdtemp`` holding two state files, removed
+in a ``finally`` with the removal then ASSERTED. That block cannot be
+in-memory -- ``refuse_batch_from_other_mode`` exists to read a state file off
+disk, and a control that faked one would be exercising a different function.
+This file is still NOT in ``tests/run_serial_tests.py``'s collision matrix:
+nothing it writes is in the repository, and the only repository file it reads
+is the module under test, which neither of the suite's two writers writes.
 
     python tests/test_evaluation_rater.py
 """
@@ -158,6 +188,24 @@ def raises(fn, *args, **kwargs):
         return False, None
     except Exception as exc:                                   # noqa: BLE001
         return True, type(exc).__name__
+
+
+def refusal_code(fn, *args, **kwargs):
+    """The ``code`` slug of a RaterRefusal, or a named absence.
+
+    A refusal that fires for the right reason and one that fires for the wrong
+    reason are the same ``(True, 'RaterRefusal')`` to ``raises``. The slug is
+    what tells them apart, and it is the slug the structured log records -- so
+    where two refusals are reachable from one call, this is the assertion that
+    means something.
+    """
+    try:
+        fn(*args, **kwargs)
+        return "<did not raise>"
+    except R.RaterRefusal as exc:
+        return exc.code
+    except Exception as exc:                                   # noqa: BLE001
+        return "<raised %s>" % type(exc).__name__
 
 
 def field(rating, key):
@@ -998,8 +1046,848 @@ check("7j  ...so the lift is clean again afterwards",
 
 
 # ===========================================================================
-# SUMMARY
+# SECTION 8 -- BLIND MODE
 # ===========================================================================
+#
+# Anchored rating shows the rater the recorded status and asks agree/disagree.
+# That leaks the answer, so every anchored agreement figure is an admitted
+# upper bound. Blind mode withholds the status: the rater assigns its own from
+# the arm's vocabulary and agreement is computed offline by comparison.
+#
+# THE CENTRAL CLAIM OF THIS SECTION IS AN INVARIANCE, NOT AN ABSENCE SCAN.
+# "the status does not appear in the request" is the obvious check and it is
+# the weak one: all five status words legitimately appear in a blind request,
+# because the rubric defines them and the decision block names the arm's
+# vocabulary. A scan for the word "met" would fire on every request ever built.
+# So 8c builds two requests that differ ONLY in the recorded status and
+# requires the serialized bytes to be EQUAL -- the request is a function of
+# everything except the status, which is the property, stated directly. The
+# sentinel scan in 8d is the second, independent form of the same question, and
+# both carry a control that fires by reintroducing the leak.
+#
+# 8a IS A PIN AND ITS VALUE WAS ESTABLISHED AGAINST THE PRE-CHANGE MODULE, not
+# against the module it now guards. It was computed by loading
+# ``git show HEAD:oncotriage/evaluation/rater.py`` into a throwaway module and
+# hashing the anchored request bodies it produced for the planted run below.
+# That measurement found a real defect in the blind change before it shipped:
+# the first version re-sorted the request list, which agreed with ``load_run``'s
+# own order on a real run and REORDERED a planted one. The bodies were
+# identical and the sequence was not; nothing else here would have seen it.
+#
+# THE PIN IS DELIBERATELY RUBRIC-INDEPENDENT. It is built over a planted
+# rubric string rather than ``lift_rubric()``, so an edit to
+# ``oncotriage/agent/prompts.py`` -- which legitimately changes every real
+# request -- does not fail a check about whether BLIND MODE disturbed anchored
+# assembly. Section 7 is what guards the rubric; this guards the envelope.
+#
+# NO NETWORK, NO KEYS, NO SPEND, NO DISK. Every decision, response and usage
+# object is a literal. The stub client from section 5 is reused.
+
+print("\n" + "=" * 70)
+print("SECTION 8 -- blind mode")
+print("=" * 70)
+
+# --- the planted run, shared by the whole section -------------------------
+# Shaped so that both arms, all five statuses and two patients are present:
+# the vocabulary checks below need every cell, and a single-patient plant would
+# make the retest stratification degenerate.
+_PLANT = [
+    ("pA", 0, "NCT00000001", "inclusion", 0, "Age >= 18 years",
+     "Age 61 years", "met", "matches"),
+    ("pA", 0, "NCT00000001", "inclusion", 1, "ECOG 0-1", "ECOG 1", "met",
+     "matches"),
+    ("pA", 0, "NCT00000001", "exclusion", 0, "Prior chemotherapy",
+     "Not in patient record", "not_evaluable", "matches"),
+    ("pA", 0, "NCT00000002", "inclusion", 0, "Stage IV disease", "Stage 4",
+     "not_met", "near_miss"),
+    ("pB", 1, "NCT00000003", "exclusion", 0, "Active infection",
+     "No active infection documented", "not_violated", "matches"),
+    ("pB", 1, "NCT00000003", "exclusion", 1, "Pregnancy",
+     "Female, no pregnancy recorded", "violated", "matches"),
+    ("pB", 1, "NCT00000003", "inclusion", 0, "Measurable disease",
+     "Not applicable -- no imaging", "not_evaluable", "matches"),
+]
+_SUMMARIES = {"pA": "PATIENT A\nAge 61 | Sex female | ECOG 1\nBreast cancer.",
+              "pB": "PATIENT B\nAge 47 | Sex male | ECOG 0\nColon cancer."}
+_ORDER = {"pA": 0, "pB": 1}
+
+# A rubric that is NOT the real one, carrying only the two markers
+# ``lift_arm_status_definitions`` slices on. Using a planted rubric is what
+# makes 8a independent of prompts.py; it also proves the arm-definition lift
+# works against text rather than against one specific prompt version.
+_FIXED_RUBRIC = (
+    "PLANTED RUBRIC -- not the real one.\n"
+    "INCLUSION CRITERIA use exactly one status:\n"
+    '"met" a\n"not_met" b\n"not_evaluable" c\n\n'
+    "EXCLUSION CRITERIA use exactly one status:\n"
+    '"not_violated" d\n"violated" e\n"not_evaluable" f\n\n'
+    "THE TWO VOCABULARIES ARE DISJOINT AND NON-INTERCHANGEABLE.\n")
+
+
+def planted_run(status_overrides=None):
+    """A RunInput built from literals. Nothing on disk is consulted.
+
+    ``status_overrides`` replaces the recorded status of every decision, which
+    is how 8c produces two runs differing in nothing else.
+    """
+    decisions = []
+    for (p, pi, n, a, i, c, v, s, g) in _PLANT:
+        if status_overrides:
+            s = status_overrides.get(a, s)
+        decisions.append(R.Decision(
+            patient_id=p, patient_index=pi, nct_id=n, arm=a, index=i,
+            criterion=c, patient_value=v, status=s, verdict_group=g))
+    return R.RunInput("/planted", {}, dict(_SUMMARIES), decisions,
+                      dict(_ORDER))
+
+
+def built(mode, run=None, retest_fraction=0.0, seed=42, rubric=None):
+    """A RequestIndex over the planted run, or a marker string on a raise."""
+    rubric = _FIXED_RUBRIC if rubric is None else rubric
+    defs = (drive(R.lift_arm_status_definitions, rubric)
+            if mode == R.MODE_BLIND else None)
+    if isinstance(defs, str):
+        return defs
+    return drive(R.build_requests, run or planted_run(),
+                 drive(R.build_system_prompt, rubric, mode=mode),
+                 {"rubric_sha256": "x"}, _MODEL, 300, 0.0, "1h",
+                 mode=mode, arm_definitions=defs,
+                 retest_fraction=retest_fraction, retest_seed=seed)
+
+
+def blob(index):
+    """The serialized request list, exactly as it would go on the wire."""
+    if not hasattr(index, "requests"):
+        return "<no requests: %r>" % (index,)
+    return json.dumps(index.requests, sort_keys=True, ensure_ascii=False)
+
+
+def sha(text):
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# --- 8a -- ANCHORED IS BYTE-IDENTICAL WITH THE FLAG OFF -------------------
+# The value was measured against git show HEAD: before the blind change
+# existed. See the section header.
+_ANCHORED_PIN = \
+    "bfab8d8257cfbbf4937cf275af4ba94b646a47edc54fcd7cbfda9a8ddeb15a5a"
+
+_anch = built(R.MODE_ANCHORED)
+check("8a  anchored request bodies hash to the value measured from the "
+      "PRE-BLIND module (git show HEAD:), so the flag being off is "
+      "byte-identical rather than merely similar",
+      sha(blob(_anch)), _ANCHORED_PIN)
+check("8a  non-degeneracy: the pin is over a real, non-empty request list",
+      len(_anch.requests) if hasattr(_anch, "requests") else 0, len(_PLANT))
+check("8a  ...and the ORDER is the run's own order, which is what the first "
+      "version of build_requests silently changed",
+      [r["custom_id"] for r in _anch.requests]
+      if hasattr(_anch, "requests") else [],
+      ["%s_%s_%s_%d" % (p, n, a, i)
+       for (p, _pi, n, a, i, _c, _v, _s, _g) in _PLANT])
+
+# CONTROL: the pin must be capable of failing. A one-field perturbation of the
+# same list must not hash to it.
+_perturbed = json.loads(blob(_anch))
+_perturbed[0]["params"]["max_tokens"] = 301
+check("8a  CONTROL: a single changed field breaks the pin",
+      sha(json.dumps(_perturbed, sort_keys=True, ensure_ascii=False))
+      != _ANCHORED_PIN, True)
+
+check("8b  build_system_prompt defaults to anchored: the no-mode call and the "
+      "explicit anchored call are the same string",
+      drive(R.build_system_prompt, _FIXED_RUBRIC)
+      == drive(R.build_system_prompt, _FIXED_RUBRIC,
+               mode=R.MODE_ANCHORED), True)
+check("8b  ...and the blind system prompt is a DIFFERENT string (a mode flag "
+      "that changed nothing would make every check below vacuous)",
+      drive(R.build_system_prompt, _FIXED_RUBRIC)
+      != drive(R.build_system_prompt, _FIXED_RUBRIC, mode=R.MODE_BLIND), True)
+check("8b  an unknown mode refuses rather than falling through to anchored",
+      raises(R.build_system_prompt, _FIXED_RUBRIC, mode="sideways"),
+      (True, "RaterRefusal"))
+
+# --- 8c -- THE CIRCULARITY PROOF -----------------------------------------
+# Two runs identical in every field except the recorded status. In blind mode
+# the serialized requests must be EQUAL; in anchored mode they must differ.
+_RUN_X = planted_run({"inclusion": "met", "exclusion": "violated"})
+_RUN_Y = planted_run({"inclusion": "not_evaluable",
+                      "exclusion": "not_evaluable"})
+check("8c  non-degeneracy: the two planted runs really do differ in their "
+      "recorded statuses (equal runs would make this pass for free)",
+      [d.status for d in _RUN_X.decisions]
+      != [d.status for d in _RUN_Y.decisions], True)
+check("8c  ...and differ in NOTHING else",
+      [(d.patient_id, d.nct_id, d.arm, d.index, d.criterion, d.patient_value)
+       for d in _RUN_X.decisions]
+      == [(d.patient_id, d.nct_id, d.arm, d.index, d.criterion,
+           d.patient_value) for d in _RUN_Y.decisions], True)
+check("8c  BLIND: the serialized request is byte-identical under two "
+      "different recorded statuses -- the request is a function of everything "
+      "EXCEPT the answer",
+      blob(built(R.MODE_BLIND, _RUN_X)) == blob(built(R.MODE_BLIND, _RUN_Y)),
+      True)
+check("8c  CONTROL: ANCHORED requests for the same two runs DIFFER, so the "
+      "comparison above can fail",
+      blob(built(R.MODE_ANCHORED, _RUN_X))
+      != blob(built(R.MODE_ANCHORED, _RUN_Y)), True)
+
+# --- 8d -- THE SENTINEL SCAN, an independent form of the same question ----
+# A status that cannot occur naturally, so any appearance in the serialized
+# request is the recorded status having reached it. Scanned over the whole
+# serialization rather than asked of the builder.
+_SENTINEL = "ZZ_SENTINEL_STATUS_ZZ"
+_RUN_S = R.RunInput("/planted", {}, dict(_SUMMARIES), [
+    R.Decision(patient_id="pA", patient_index=0, nct_id="NCT00000001",
+               arm="inclusion", index=0, criterion="Age >= 18 years",
+               patient_value="Age 61 years", status=_SENTINEL,
+               verdict_group="matches")], dict(_ORDER))
+check("8d  BLIND: the recorded status does not appear anywhere in the "
+      "serialized request",
+      _SENTINEL in blob(built(R.MODE_BLIND, _RUN_S)), False)
+check("8d  CONTROL: it DOES appear in the anchored request, so the scan is "
+      "capable of detecting a leak",
+      _SENTINEL in blob(built(R.MODE_ANCHORED, _RUN_S)), True)
+check("8d  BLIND: no field LABEL implying a recorded decision survives either",
+      any(needle in blob(built(R.MODE_BLIND, _RUN_S))
+          for needle in ("recorded_status", "recorded_patient_value",
+                         "RECORDED_DECISION")), False)
+check("8d  CONTROL: all three labels are present in the anchored request",
+      all(needle in blob(built(R.MODE_ANCHORED, _RUN_S))
+          for needle in ("recorded_status", "recorded_patient_value",
+                         "RECORDED_DECISION")), True)
+
+# The structural half: the builder cannot be handed a status at all.
+import inspect as _inspect                                    # noqa: E402
+check("8e  build_blind_decision_block takes no status parameter -- leaking one "
+      "is a TypeError at the call site, not a review comment",
+      "status" in _inspect.signature(
+          R.build_blind_decision_block).parameters, False)
+check("8e  ...and passing one raises",
+      raises(R.build_blind_decision_block, "inclusion", "c", "v", "defs",
+             "met")[0], True)
+check("8e  the blind block still names the arm's three allowed statuses",
+      all(f'"{s}"' in drive(R.build_blind_decision_block, "inclusion", "c",
+                            "v", "defs")
+          for s in R.ARM_STATUSES["inclusion"]), True)
+
+# --- 8f -- THE ARM DEFINITION LIFT ---------------------------------------
+_DEFS = drive(R.lift_arm_status_definitions, _FIXED_RUBRIC)
+check("8f  both arms lift a definition block",
+      sorted(_DEFS) if isinstance(_DEFS, dict) else _DEFS,
+      ["exclusion", "inclusion"])
+check("8f  the inclusion block defines the inclusion vocabulary and no "
+      "exclusive exclusion status",
+      isinstance(_DEFS, dict)
+      and all(f'"{s}"' in _DEFS["inclusion"] for s in ("met", "not_met",
+                                                       "not_evaluable"))
+      and not any(f'"{s}"' in _DEFS["inclusion"]
+                  for s in ("violated", "not_violated")), True)
+check("8f  the exclusion block does the same in reverse",
+      isinstance(_DEFS, dict)
+      and all(f'"{s}"' in _DEFS["exclusion"]
+              for s in ("violated", "not_violated", "not_evaluable"))
+      and not any(f'"{s}"' in _DEFS["exclusion"]
+                  for s in ("met", "not_met")), True)
+check("8f  CONTROL: a rubric whose inclusion block also defines an exclusion "
+      "status refuses rather than shipping it to a blind rater",
+      raises(R.lift_arm_status_definitions,
+             _FIXED_RUBRIC.replace('"not_met" b', '"violated" b', 1)),
+      (True, "RaterRefusal"))
+check("8f  CONTROL: a rubric missing a marker refuses",
+      raises(R.lift_arm_status_definitions,
+             _FIXED_RUBRIC.replace(
+                 "EXCLUSION CRITERIA use exactly one status:", "GONE", 1)),
+      (True, "RaterRefusal"))
+check("8f  ...and the real shipped rubric lifts cleanly (a planted-rubric-only "
+      "check would prove nothing about the prompt actually used)",
+      sorted(drive(R.lift_arm_status_definitions, _RUBRIC))
+      if _RUBRIC else "<no rubric>", ["exclusion", "inclusion"])
+
+# --- 8g -- THE BLIND PARSE, happy path per arm ---------------------------
+BLIND_OK = ('{"assigned_status":"%s","patient_value_support":"supported",'
+            '"rationale":"the record states it"}')
+
+
+def blind_parsed(text, arm="inclusion", recorded="met"):
+    out = drive(R.parse_rating, text, arm, recorded, mode=R.MODE_BLIND)
+    if isinstance(out, str):
+        return out, None
+    rating, reason = out
+    return reason, rating
+
+
+for _arm in R.ARMS:
+    for _status in R.ARM_STATUSES[_arm]:
+        _reason, _rating = blind_parsed(BLIND_OK % _status, _arm)
+        check(f"8g  {_arm}/{_status} parses cleanly", _reason, None)
+        check(f"8g  {_arm}/{_status} is carried through verbatim",
+              field(_rating, "assigned_status"), _status)
+
+_reason, _rating = blind_parsed("```json\n" + (BLIND_OK % "met") + "\n```")
+check("8g  a markdown fence is tolerated and RECORDED", (_reason,
+      field(_rating, "fenced")), (None, True))
+_reason, _rating = blind_parsed("Here you go: " + (BLIND_OK % "met") + " ok?")
+check("8g  a prose preamble is carved and RECORDED", (_reason,
+      field(_rating, "extracted")), (None, True))
+
+# --- 8h -- EVERY BLIND FAILURE MODE, each in its own named bucket ---------
+for _label, _text, _arm, _want in (
+        ("cross-arm: an exclusion status assigned to an inclusion criterion",
+         BLIND_OK % "violated", "inclusion",
+         "wrong_vocabulary_assigned_status"),
+        ("cross-arm: an inclusion status assigned to an exclusion criterion",
+         BLIND_OK % "not_met", "exclusion",
+         "wrong_vocabulary_assigned_status"),
+        ("a status that is not a status at all",
+         BLIND_OK % "eligible", "inclusion", "bad_assigned_status"),
+        ("an empty status", BLIND_OK % "", "inclusion", "bad_assigned_status"),
+        ("a null status",
+         '{"assigned_status":null,"patient_value_support":"supported",'
+         '"rationale":"r"}', "inclusion", "bad_assigned_status"),
+        ("a numeric status",
+         '{"assigned_status":3,"patient_value_support":"supported",'
+         '"rationale":"r"}', "inclusion", "bad_assigned_status"),
+        ("a missing assigned_status",
+         '{"patient_value_support":"supported","rationale":"r"}', "inclusion",
+         "wrong_keys"),
+        ("a missing rationale",
+         '{"assigned_status":"met","patient_value_support":"supported"}',
+         "inclusion", "wrong_keys"),
+        ("an extra key",
+         (BLIND_OK % "met")[:-1] + ',"confidence":0.9}', "inclusion",
+         "wrong_keys"),
+        ("an ANCHORED-shaped response returned in blind mode", OK, "inclusion",
+         "wrong_keys"),
+        ("support outside the vocabulary",
+         (BLIND_OK % "met").replace('"supported"', '"very_supported"', 1),
+         "inclusion", "bad_support_value"),
+        ("an empty rationale",
+         (BLIND_OK % "met").replace('"the record states it"', '"   "', 1),
+         "inclusion", "empty_rationale"),
+        ("a non-string rationale",
+         '{"assigned_status":"met","patient_value_support":"supported",'
+         '"rationale":7}', "inclusion", "empty_rationale"),
+        ("not JSON at all", "I cannot classify this.", "inclusion",
+         "unparseable_json"),
+        ("a JSON list, not an object", '[{"a":1}]', "inclusion",
+         "not_a_json_object"),
+):
+    check(f"8h  {_label} -> {_want}", blind_parsed(_text, _arm)[0], _want)
+
+check("8h  'not_evaluable' is legal on BOTH arms, so it can never be foreign",
+      (blind_parsed(BLIND_OK % "not_evaluable", "inclusion")[0],
+       blind_parsed(BLIND_OK % "not_evaluable", "exclusion")[0]), (None, None))
+check("8h  both new reasons are declared in UNRATED_REASONS",
+      all(r in R.UNRATED_REASONS for r in ("wrong_vocabulary_assigned_status",
+                                           "bad_assigned_status")), True)
+check("8h  both new reasons are retryable, like their anchored analogues",
+      all(r in R.RETRYABLE_REASONS
+          for r in ("wrong_vocabulary_assigned_status",
+                    "bad_assigned_status")), True)
+check("8h  a refusal is still NOT retryable (the additions did not widen the "
+      "non-retryable set)",
+      ("refusal" in R.RETRYABLE_REASONS,
+       "api_invalid_request" in R.RETRYABLE_REASONS), (False, False))
+check("8h  nothing is coerced: a cross-arm answer is unrated, never mapped "
+      "onto the nearest legal member",
+      blind_parsed(BLIND_OK % "violated", "inclusion")[1], None)
+
+# --- 8i -- THE BLIND PARSE DOES NOT CONSULT THE RECORDED STATUS -----------
+# The parameter exists so the two modes share one call site. If the blind
+# branch read it, the mode would be anchored at the parser instead of at the
+# prompt -- the same leak one layer down.
+_by_recorded = {}
+for _rec in list(R.ARM_STATUSES["inclusion"]) + ["not_violated", None, ""]:
+    _by_recorded[_rec] = blind_parsed(BLIND_OK % "not_met", "inclusion",
+                                      _rec)[1]
+check("8i  a blind parse returns the identical rating for EVERY possible "
+      "recorded status, including ones the arm cannot hold",
+      len({json.dumps(v, sort_keys=True) for v in _by_recorded.values()}), 1)
+check("8i  non-degeneracy: those parses actually produced a rating",
+      field(_by_recorded["met"], "assigned_status"), "not_met")
+check("8i  CONTROL: the ANCHORED parser DOES depend on the recorded status -- "
+      "the same response is rated against one and refused against another",
+      (parsed('{"patient_value_support":"supported",'
+              '"status_verdict":"disagree","corrected_status":"not_met",'
+              '"rationale":"r"}', "inclusion", "met")[0],
+       parsed('{"patient_value_support":"supported",'
+              '"status_verdict":"disagree","corrected_status":"not_met",'
+              '"rationale":"r"}', "inclusion", "not_met")[0]),
+      (None, "corrected_equals_recorded"))
+
+# --- 8j -- OFFLINE AGREEMENT ARITHMETIC ----------------------------------
+_agree = drive(R.apply_offline_agreement,
+               {"assigned_status": "met"}, "met")
+_disagree = drive(R.apply_offline_agreement,
+                  {"assigned_status": "not_met"}, "met")
+check("8j  assigned == recorded -> agree, no correction",
+      (field(_agree, "status_verdict"), field(_agree, "corrected_status"),
+       field(_agree, "agrees_with_recorded")), ("agree", None, True))
+check("8j  assigned != recorded -> disagree, correction is the assignment",
+      (field(_disagree, "status_verdict"),
+       field(_disagree, "corrected_status"),
+       field(_disagree, "agrees_with_recorded")),
+      ("disagree", "not_met", False))
+check("8j  every blind rating says its verdict is arithmetic, not a claim the "
+      "model made",
+      (field(_agree, "verdict_basis"), field(_disagree, "verdict_basis")),
+      ("offline_comparison", "offline_comparison"))
+check("8j  the model's own answer survives beside the derived pair",
+      (field(_agree, "assigned_status"), field(_disagree, "assigned_status")),
+      ("met", "not_met"))
+check("8j  rater_implied_status reads a derived blind rating the same way it "
+      "reads an anchored one, which is what lets summarize serve both",
+      (drive(R.rater_implied_status, "met", _agree),
+       drive(R.rater_implied_status, "met", _disagree)), ("met", "not_met"))
+
+# --- 8k -- THE RETEST CUSTOM_ID ROUND-TRIP -------------------------------
+_D = decision("p0", "NCT00000009", "inclusion", 3, "met")
+for _form in (R.CUSTOM_ID_FORM_READABLE, R.CUSTOM_ID_FORM_COMPACT):
+    _base = drive(R.encode_custom_id, _D, _form)
+    _rt = drive(R.encode_retest_custom_id, _base)
+    check(f"8k  {_form}: the retest id is the primary plus the stated suffix",
+          _rt, _base + R.RETEST_SUFFIX)
+    check(f"8k  {_form}: it is recognisable as a retest and the primary is not",
+          (drive(R.is_retest_custom_id, _rt),
+           drive(R.is_retest_custom_id, _base)), (True, False))
+    check(f"8k  {_form}: BOTH ids decode to the SAME original decision key",
+          (drive(R.decode_custom_id, _base, _form, {0: "p0"}),
+           drive(R.decode_custom_id, _rt, _form, {0: "p0"})),
+          (_D.key, _D.key))
+check("8k  the suffix is inside the API's [a-zA-Z0-9_-] alphabet",
+      bool(R._CUSTOM_ID_RE.match("x" + R.RETEST_SUFFIX)), True)
+check("8k  it uses '-' rather than '_': a '_' suffix would be eaten by the "
+      "rsplit('_', 3) both id forms decode with, shifting every field",
+      "_" in R.RETEST_SUFFIX, False)
+check("8k  CONTROL: a '_r2' suffix really would mis-decode, which is why the "
+      "character choice is load-bearing rather than cosmetic",
+      drive(R.decode_custom_id, "p0_NCT00000009_inclusion_3_r2",
+            R.CUSTOM_ID_FORM_READABLE, {0: "p0"}) == _D.key, False)
+# The reserve is not decoration: on the real 1.7.0 validation runs the longest
+# readable id is 61 characters and the suffix is 3, which lands EXACTLY on the
+# 64-character ceiling. A patient id one character longer overflows, and
+# without the reserve the overflow would be discovered after the form had been
+# chosen and recorded. The width below is measured rather than guessed: a
+# 38-character patient id gives a 62-character readable id, which fits alone
+# and does not fit with the suffix.
+_LONG = decision("p" + "x" * 37, "NCT00000009", "inclusion", 3, "met")
+check("8k  non-degeneracy: the probe id really does sit in the 2-character "
+      "window where the reserve is what decides",
+      len(drive(R.encode_custom_id, _LONG, R.CUSTOM_ID_FORM_READABLE)), 62)
+check("8k  the ceiling reserve is charged before the form is chosen: an id "
+      "that fits alone but not with a 3-character suffix falls back to "
+      "compact rather than overflowing later",
+      (drive(R.choose_custom_id_form, [_LONG]),
+       drive(R.choose_custom_id_form, [_LONG],
+             reserve=len(R.RETEST_SUFFIX))),
+      (R.CUSTOM_ID_FORM_READABLE, R.CUSTOM_ID_FORM_COMPACT))
+
+# --- 8l -- THE RETEST SUBSAMPLE ------------------------------------------
+_all = planted_run().decisions
+_sel1 = drive(R.select_retest_decisions, _all, 0.5, 42)
+_sel1b = drive(R.select_retest_decisions, _all, 0.5, 42)
+check("8l  the selection is deterministic: same seed, same decisions",
+      [d.key for d in _sel1], [d.key for d in _sel1b])
+check("8l  non-degeneracy: it selected something, and not everything",
+      0 < len(_sel1) < len(_all), True)
+
+# THE SEED CHECK IS OVER A RANGE, NOT A PAIR, and the first version of it was
+# a pair and FAILED -- on a 7-decision corpus the selection has only 18
+# possible outcomes, and seeds 42 and 7 happened to land on the same one. That
+# is not a defect in the seeding (it is read: 8 seeds produce 6 distinct
+# subsamples here), it is a two-sample test on a space too small to sample
+# twice. Asserting that the selection VARIES across a range says the thing
+# meant, and cannot fail on an unlucky pair.
+_across = {tuple(d.key for d in drive(R.select_retest_decisions, _all, 0.5, s))
+           for s in (42, 7, 1, 2, 3, 99, "alpha", "beta")}
+check("8l  the seed is read: a range of seeds produces several different "
+      "subsamples (a seed nothing consulted would produce exactly one)",
+      len(_across) > 1, True)
+check("8l  ...and a specific measured pair differs, so the property has a "
+      "concrete witness rather than only an aggregate one",
+      [d.key for d in _sel1]
+      != [d.key for d in drive(R.select_retest_decisions, _all, 0.5, 1)], True)
+check("8l  it is patient-stratified: every patient in the corpus contributes",
+      {d.patient_id for d in _sel1}, {d.patient_id for d in _all})
+check("8l  fraction 1.0 selects every decision",
+      len(drive(R.select_retest_decisions, _all, 1.0, 42)), len(_all))
+check("8l  fraction 0 selects none and does not raise",
+      drive(R.select_retest_decisions, _all, 0.0, 42), [])
+check("8l  a fraction outside (0, 1] refuses by name",
+      (raises(R.select_retest_decisions, _all, 1.5, 42),
+       raises(R.select_retest_decisions, _all, -0.2, 42)),
+      ((True, "RaterRefusal"), (True, "RaterRefusal")))
+check("8l  a tiny fraction still gives every patient at least one, which is "
+      "what stratification means",
+      {d.patient_id for d in drive(R.select_retest_decisions, _all, 0.01, 42)},
+      {d.patient_id for d in _all})
+
+# --- 8m -- TWO CUSTOM_IDS, ONE DECISION, LOSSLESSLY ----------------------
+_bi = built(R.MODE_BLIND, retest_fraction=0.5, seed=42)
+check("8m  the index carries more requests than decisions, by exactly the "
+      "retest count",
+      (len(_bi.requests), len(_bi.retest_ids),
+       len(_bi.requests) - len(_bi.retest_ids)),
+      (len(_PLANT) + len(_bi.retest_ids), len(_bi.retest_ids), len(_PLANT)))
+check("8m  primaries and retests partition the index exactly",
+      _bi.primary_ids & _bi.retest_ids, set())
+check("8m  ...and together cover it",
+      _bi.primary_ids | _bi.retest_ids, set(_bi.by_custom_id))
+check("8m  every retest id maps to the SAME Decision object as its primary "
+      "(the lossless join with two ids legally naming one decision)",
+      all(_bi.by_custom_id[c] is _bi.by_custom_id[R.strip_retest_suffix(c)[0]]
+          for c in _bi.retest_ids), True)
+check("8m  the primary request order is untouched by the retest pass",
+      [c for c in (r["custom_id"] for r in _bi.requests)
+       if not R.is_retest_custom_id(c)],
+      [r["custom_id"] for r in _anch.requests])
+check("8m  each retest sits immediately after the primary it duplicates, so "
+      "it is inside that patient's cache block",
+      all(_bi.requests[i - 1]["custom_id"]
+          == R.strip_retest_suffix(r["custom_id"])[0]
+          for i, r in enumerate(_bi.requests)
+          if R.is_retest_custom_id(r["custom_id"])), True)
+check("8m  a retest request is byte-identical to its primary apart from the "
+      "custom_id -- it is the same question, not a similar one",
+      all(_bi.by_custom_id[c] is not None
+          and json.dumps([r["params"] for r in _bi.requests
+                          if r["custom_id"] == c][0], sort_keys=True)
+          == json.dumps([r["params"] for r in _bi.requests
+                         if r["custom_id"]
+                         == R.strip_retest_suffix(c)[0]][0], sort_keys=True)
+          for c in _bi.retest_ids), True)
+check("8m  --retest-fraction is refused in anchored mode by name",
+      raises(R.build_requests, planted_run(), "sys", {}, _MODEL, 300, 0.0,
+             "1h", retest_fraction=0.5), (True, "RaterRefusal"))
+check("8m  blind mode without the arm definitions refuses rather than sending "
+      "a bare three-word vocabulary",
+      refusal_code(R.build_requests, planted_run(), "sys", {}, _MODEL, 300,
+                   0.0, "1h", mode=R.MODE_BLIND), "arm_definitions_absent")
+check("8m  ...and a PARTIAL mapping refuses too: one arm defined and the other "
+      "blank is a silent asymmetry in the instrument, not a KeyError to be "
+      "discovered in the request loop",
+      (refusal_code(R.build_requests, planted_run(), "sys", {}, _MODEL, 300,
+                    0.0, "1h", mode=R.MODE_BLIND,
+                    arm_definitions={"inclusion": "defs"}),
+       refusal_code(R.build_requests, planted_run(), "sys", {}, _MODEL, 300,
+                    0.0, "1h", mode=R.MODE_BLIND,
+                    arm_definitions={"inclusion": "defs", "exclusion": "  "})),
+      ("arm_definitions_absent", "arm_definitions_absent"))
+check("8m  an anchored index reports no retests, so every table below is the "
+      "identity on it",
+      (_anch.mode, _anch.retest_ids, _anch.primary_ids == set(
+          _anch.by_custom_id)), (R.MODE_ANCHORED, set(), True))
+
+# --- 8n -- COLLECTION AND THE OFFLINE CONFUSION ARITHMETIC ---------------
+# A planted response per request, with KNOWN assignments, so the confusion
+# counts and the agreement rate below are computed by hand and compared.
+#
+#   pA/NCT1/inclusion[0]  recorded met            -> assigned met         agree
+#   pA/NCT1/inclusion[1]  recorded met            -> assigned not_met  disagree
+#   pA/NCT1/exclusion[0]  recorded not_evaluable  -> assigned not_evaluable
+#   pA/NCT2/inclusion[0]  recorded not_met        -> assigned not_met      agree
+#   pB/NCT3/exclusion[0]  recorded not_violated   -> assigned violated  disagree
+#   pB/NCT3/exclusion[1]  recorded violated       -> assigned violated     agree
+#   pB/NCT3/inclusion[0]  recorded not_evaluable  -> assigned not_evaluable
+# 7 primaries, 5 agree, 2 disagree -> 5/7.
+_ASSIGNED = {
+    "pA_NCT00000001_inclusion_0": "met",
+    "pA_NCT00000001_inclusion_1": "not_met",
+    "pA_NCT00000001_exclusion_0": "not_evaluable",
+    "pA_NCT00000002_inclusion_0": "not_met",
+    "pB_NCT00000003_exclusion_0": "violated",
+    "pB_NCT00000003_exclusion_1": "violated",
+    "pB_NCT00000003_inclusion_0": "not_evaluable",
+}
+# The two retests: one repeats its primary's answer, one changes it. Chosen
+# explicitly rather than derived, so the intra-rater arithmetic below is a
+# hand-computed 1/2 rather than whatever the selection happened to produce.
+_bi2 = built(R.MODE_BLIND, retest_fraction=1.0, seed=42)
+_RETEST_ANSWER = dict(_ASSIGNED)
+_RETEST_ANSWER["pA_NCT00000001_inclusion_1"] = "met"      # changed its mind
+
+
+def _blind_plan(index, flip=()):
+    plan = []
+    for req in index.requests:
+        cid = req["custom_id"]
+        base, is_rt = R.strip_retest_suffix(cid)
+        status = (_RETEST_ANSWER if is_rt else _ASSIGNED)[base]
+        if base in flip and is_rt:
+            status = _ASSIGNED[base]
+        plan.append((cid, _ok(_message(BLIND_OK % status))))
+    return plan
+
+
+_collected = drive(R.collect_results, _StubClient(_blind_plan(_bi2)),
+                   "msgbatch_blind", _bi2, _MODEL)
+check("8n  every request came back rated, primaries and retests alike",
+      len(_collected["rated"]) if isinstance(_collected, dict) else _collected,
+      len(_bi2.requests))
+check("8n  collection stamped the offline comparison onto every blind rating",
+      isinstance(_collected, dict)
+      and {r["verdict_basis"] for r in _collected["rated"].values()},
+      {"offline_comparison"})
+check("8n  ...and marked which ratings are retests",
+      isinstance(_collected, dict)
+      and sum(1 for r in _collected["rated"].values() if r["is_retest"]),
+      len(_bi2.retest_ids))
+
+_summary = drive(R.summarize, _bi2, _collected["rated"], {}, planted_run())
+check("8n  the headline counts PRIMARIES ONLY -- a retested decision must not "
+      "vote twice",
+      (_summary["decisions_total"], _summary["decisions_rated"]),
+      (len(_PLANT), len(_PLANT)))
+check("8n  hand-computed agreement: 5 of 7 primaries agree",
+      (_summary["overall_agree"], _summary["overall_disagree"]), (5, 2))
+close("8n  ...so the rate is 5/7", _summary["overall_agreement_rate"], 5 / 7.0)
+check("8n  hand-computed per-arm, per-status confusion counts, DIAGONAL "
+      "INCLUDED",
+      _summary["confusion_counts"],
+      {"inclusion": {"met": {"met": 1, "not_met": 1},
+                     "not_met": {"not_met": 1},
+                     "not_evaluable": {"not_evaluable": 1}},
+       "exclusion": {"not_violated": {"violated": 1},
+                     "violated": {"violated": 1},
+                     "not_evaluable": {"not_evaluable": 1}}})
+check("8n  the summary says which mode produced it, and that a blind verdict "
+      "is arithmetic",
+      (_summary["mode"], "BLIND" in _summary["anchoring"]),
+      (R.MODE_BLIND, True))
+check("8n  the residual leaks are stated IN THE OUTPUT, not only in a design "
+      "note -- including the patient_value one",
+      "patient_value_is_the_judged_model_s_own_extract"
+      in _summary["circularity_limitations"], True)
+
+# --- the residual leak is MEASURED, not described -------------------------
+# Hand-computed over the plant: 1 extract begins "Not in patient record"
+# (recorded not_evaluable), 1 begins "Not applicable" (recorded
+# not_evaluable), and 5 are quoted data (met, met, not_met, not_violated,
+# violated -> most common is "met" at 2 of 5). A guesser seeing only the class
+# is right 1 + 1 + 2 = 4 of 7; the majority status over all 7 is "met" at 2,
+# tied with not_evaluable at 2 -- Counter.most_common breaks the tie by
+# insertion order, which is why the assertion below reads the rate rather than
+# the label.
+_leak = _summary["patient_value_leak_measured"]
+check("8l  the marker classes are bucketed by Stage 5's two documented "
+      "conventions, prefix-matched and case-folded",
+      (drive(R.patient_value_marker_class, "Not in patient record"),
+       drive(R.patient_value_marker_class, "not in patient record for this"),
+       drive(R.patient_value_marker_class, "Not applicable -- no imaging"),
+       drive(R.patient_value_marker_class, "ECOG 1"),
+       drive(R.patient_value_marker_class, None)),
+      ("MARKER: not in patient record", "MARKER: not in patient record",
+       "MARKER: not applicable", "quoted data", "quoted data"))
+check("8n  the leak measurement buckets the plant as hand-counted",
+      {k: v["decisions"] for k, v in _leak["marker_classes"].items()},
+      {"MARKER: not in patient record": 1, "MARKER: not applicable": 1,
+       "quoted data": 5})
+close("8n  ...and a guesser seeing ONLY the extract class scores 4/7",
+      _leak["status_predictable_from_marker_class"], 4 / 7.0)
+check("8n  the excess over the base rate is reported beside it, so a skewed "
+      "corpus cannot make the leak look small by itself",
+      _leak["excess_over_base_rate"] is not None
+      and abs(_leak["status_predictable_from_marker_class"]
+              - _leak["majority_status_base_rate"]
+              - _leak["excess_over_base_rate"]) < 1e-12, True)
+check("8n  the limitation prose quotes the measured size rather than only "
+      "asserting 'correlates strongly'",
+      "patient_value_leak_size_on_this_run"
+      in _summary["circularity_limitations"], True)
+check("8n  ...and the sentence names the leakiest class AND the excess, "
+      "because either alone misleads in a different direction",
+      all(s in _summary["circularity_limitations"][
+          "patient_value_leak_size_on_this_run"]
+          for s in ("100.0%", "not in patient record",
+                    "over always answering", "per-class shares")), True)
+# The tie-break is deterministic and meaningful, not dict order. Both marker
+# classes in the plant reach 1.0, and the first version of this ranking took
+# whichever came out of the dict first -- which on the REAL run named a class
+# covering 3% of decisions instead of the one covering 74%. Ranked by
+# confidence, then corpus share, then name.
+_TIED = [decision("p0", "NCT1", "inclusion", i, "met",
+                  value="Not applicable -- x") for i in range(2)] + \
+        [decision("p0", "NCT1", "exclusion", i, "not_evaluable",
+                  value="Not in patient record") for i in range(8)]
+check("8n  the leakiest-class tie-break prefers the class covering more of "
+      "the corpus, not whichever the dict yielded first",
+      "not in patient record" in drive(
+          R.blind_circularity_limitations,
+          drive(R.measure_patient_value_leak, _TIED)
+      )["patient_value_leak_size_on_this_run"], True)
+check("8n  CONTROL: reverse the sizes and the OTHER class is named, so the "
+      "tie-break is reading the shares rather than a fixed string",
+      "not applicable" in drive(
+          R.blind_circularity_limitations,
+          drive(R.measure_patient_value_leak,
+                [decision("p0", "NCT1", "inclusion", i, "met",
+                          value="Not applicable -- x") for i in range(8)]
+                + [decision("p0", "NCT1", "exclusion", i, "not_evaluable",
+                            value="Not in patient record")
+                   for i in range(2)])
+      )["patient_value_leak_size_on_this_run"], True)
+# The prose must not assert a SIZE it has not measured. The first version said
+# "the small excess" unconditionally -- false on any corpus where it is large.
+check("8n  the sentence makes no hardcoded claim that the excess is small",
+      "small" in _summary["circularity_limitations"][
+          "patient_value_leak_size_on_this_run"], False)
+check("8n  an empty decision list is reported as such rather than dividing by "
+      "zero",
+      drive(R.measure_patient_value_leak, [])["decisions"], 0)
+# CONTROL: a corpus where the marker carries NO information must not report a
+# perfect predictor. Without this, the check above would pass for a function
+# that hard-coded 1.0.
+_mixed = [decision("p0", "NCT1", "inclusion", i,
+                   ["met", "not_met"][i % 2], value="Not in patient record")
+          for i in range(10)]
+close("8n  CONTROL: when the marker class splits 50/50 across statuses the "
+      "measurement reports 0.5, not a perfect predictor",
+      drive(R.measure_patient_value_leak,
+            _mixed)["marker_classes"]["MARKER: not in patient record"][
+                "share_with_that_status"], 0.5)
+check("8n  CONTROL: the anchored summary carries neither the blind confusion "
+      "table nor the limitations block, so 8n is not passing on a field every "
+      "summary has",
+      ("confusion_counts" in _summary,
+       "confusion_counts" in drive(R.summarize, _anch, {}, {}, planted_run())),
+      (True, False))
+
+# --- 8o -- INTRA-RATER AGREEMENT -----------------------------------------
+_rt = _summary["retest"]
+check("8o  one pair per retested decision, both copies rated",
+      (_rt["duplicates_submitted"], _rt["pairs"]),
+      (len(_bi2.retest_ids), len(_bi2.retest_ids)))
+check("8o  hand-computed: 6 of 7 pairs identical, 1 changed",
+      (_rt["identical"], _rt["changed"]), (6, 1))
+close("8o  ...so intra-rater agreement is 6/7",
+      _rt["intra_rater_agreement_rate"], 6 / 7.0)
+check("8o  the decision that moved is named, with both answers",
+      [(c["arm"], c["index"], c["first_assigned"], c["second_assigned"])
+       for c in _rt["changed_decisions"]],
+      [("inclusion", 1, "not_met", "met")])
+check("8o  it is reported SEPARATELY: the headline agreement is unchanged by "
+      "the retest answers",
+      (_summary["overall_agree"], _summary["overall_disagree"]), (5, 2))
+check("8o  a pair whose primary failed to parse is NOT counted as unstable",
+      drive(R.retest_report, _bi2,
+            {c: v for c, v in _collected["rated"].items()
+             if c != "pA_NCT00000001_inclusion_1"})["pairs"],
+      len(_bi2.retest_ids) - 1)
+check("8o  ...and is reported as an incomplete pair instead",
+      drive(R.retest_report, _bi2,
+            {c: v for c, v in _collected["rated"].items()
+             if c != "pA_NCT00000001_inclusion_1"}
+            )["pairs_incomplete"]["only_retest_rated"], 1)
+check("8o  with no retest requested the block says so rather than reporting a "
+      "rate over zero pairs",
+      drive(R.retest_report, _anch, {})["pairs"], 0)
+
+# --- 8p -- THE STATE FILE CANNOT BE READ ACROSS MODES --------------------
+check("8p  the two modes name different state files by default",
+      drive(R.state_filename, R.MODE_BLIND)
+      != drive(R.state_filename, R.MODE_ANCHORED), True)
+check("8p  an anchored state file resumed as blind refuses by name",
+      raises(R.require_state_mode, {"mode": "anchored"}, R.MODE_BLIND, "/s"),
+      (True, "RaterRefusal"))
+check("8p  and the reverse",
+      raises(R.require_state_mode, {"mode": "blind"}, R.MODE_ANCHORED, "/s"),
+      (True, "RaterRefusal"))
+check("8p  a state file with NO mode predates blind mode and reads as "
+      "anchored, so an in-flight anchored resume is not broken",
+      (raises(R.require_state_mode, {"batches": []}, R.MODE_ANCHORED, "/s"),
+       raises(R.require_state_mode, {"batches": []}, R.MODE_BLIND, "/s")),
+      ((False, None), (True, "RaterRefusal")))
+check("8p  an absent state file is not a mismatch",
+      raises(R.require_state_mode, None, R.MODE_BLIND, "/s"), (False, None))
+# THE COMMONER MISTAKE IS NOT A STATE FILE READ ACROSS MODES, IT IS A
+# FORGOTTEN FLAG. Primary custom_ids are IDENTICAL in both modes, so resuming
+# a blind batch without --blind finds no state file (the default directories
+# differ), polls happily, and parses blind responses under the anchored
+# contract -- where every one of them is wrong_keys. 8p2 covers that.
+#
+# This is the ONE place in this file that touches a filesystem, and it touches
+# only a fresh temp directory: the guard reads state files, so a control that
+# faked them in memory would be testing a different function.
+import os as _osmod                                            # noqa: E402
+import shutil as _shutil                                       # noqa: E402
+import tempfile as _tempfile                                   # noqa: E402
+
+_tmp = _tempfile.mkdtemp(prefix="rater-resume-guard-")
+try:
+    _blind_dir = _osmod.path.join(_tmp, "rater_blind")
+    _osmod.makedirs(_blind_dir)
+    R.write_state(_osmod.path.join(_blind_dir, R.state_filename(R.MODE_BLIND)),
+                  {"mode": "blind",
+                   "batches": [{"id": "msgbatch_theblindone", "tag": "primary",
+                                "chunk": 0, "requests": 7}]})
+    check("8p2 resuming a BLIND batch without --blind is refused by name, "
+          "before anything is polled -- the failure it prevents is every "
+          "response bucketed wrong_keys, which reads as a broken rater rather "
+          "than as a forgotten flag",
+          refusal_code(R.refuse_batch_from_other_mode,
+                       ["msgbatch_theblindone"], R.MODE_ANCHORED,
+                       _osmod.path.join(_tmp, "rater"), _tmp),
+          "resume_mode_mismatch")
+    check("8p2 ...and the message says which flag to add",
+          "--blind" in str(drive(
+              lambda: R.refuse_batch_from_other_mode(
+                  ["msgbatch_theblindone"], R.MODE_ANCHORED,
+                  _osmod.path.join(_tmp, "rater"), _tmp))), True)
+    check("8p2 CONTROL: a batch id the other mode does NOT claim passes, so "
+          "the guard is reading the state file rather than refusing every "
+          "resume",
+          raises(R.refuse_batch_from_other_mode, ["msgbatch_unrelated"],
+                 R.MODE_ANCHORED, _osmod.path.join(_tmp, "rater"), _tmp),
+          (False, None))
+    check("8p2 CONTROL: the same id resumed in the mode that OWNS it passes",
+          raises(R.refuse_batch_from_other_mode, ["msgbatch_theblindone"],
+                 R.MODE_BLIND, _blind_dir, _tmp), (False, None))
+    check("8p2 an empty id list is not a mismatch",
+          raises(R.refuse_batch_from_other_mode, [], R.MODE_ANCHORED,
+                 _osmod.path.join(_tmp, "rater"), _tmp), (False, None))
+    check("8p2 a run directory with no state file anywhere is not a mismatch",
+          raises(R.refuse_batch_from_other_mode, ["msgbatch_theblindone"],
+                 R.MODE_ANCHORED, _osmod.path.join(_tmp, "nope"),
+                 _osmod.path.join(_tmp, "nope")), (False, None))
+finally:
+    _shutil.rmtree(_tmp, ignore_errors=True)
+check("8p2 the temp directory was removed", _osmod.path.isdir(_tmp),
+      False)
+
+check("8p  the refusal names the mismatch by slug rather than raising "
+      "generically",
+      refusal_code(R.require_state_mode, {"mode": "anchored"}, R.MODE_BLIND,
+                   "/s"), "state_mode_mismatch")
+check("8p  the message names both modes, so an operator is not left guessing "
+      "which file to move",
+      all(word in str(drive(lambda: R.require_state_mode(
+          {"mode": "anchored"}, R.MODE_BLIND, "/s")))
+          for word in ("anchored", "blind", "--output-dir")), True)
+
+# --- 8q -- THE MODE REACHES THE PLAN, AND THE OUTPUT DIRECTORIES DIFFER ---
+check("8q  --blind and --retest-fraction are real CLI arguments",
+      (drive(R._parse_args, ["--dry-run", "--blind"]).blind,
+       drive(R._parse_args, ["--dry-run", "--blind",
+                             "--retest-fraction", "0.1"]).retest_fraction),
+      (True, 0.1))
+check("8q  the flag defaults OFF, so an unmodified invocation is anchored",
+      drive(R._parse_args, ["--dry-run"]).blind, False)
+# The slug matters here rather than only the raise. _prepare refuses this
+# BEFORE it resolves a run directory, which is both the right ordering (a flag
+# combination is a configuration defect and cheap to detect) and what keeps
+# this file's "the evaluation run directories are never read" claim true. A
+# reordering that read the run first would still raise RaterRefusal -- with
+# code "run_dir_invalid" on a machine with no such directory -- so asserting
+# only that it raised would pass for the wrong reason and quietly make this
+# file depend on the corpus.
+check("8q  --retest-fraction without --blind is refused, by its own slug, "
+      "before any run directory is resolved",
+      refusal_code(R._prepare, drive(R._parse_args,
+                                     ["--dry-run", "--retest-fraction",
+                                      "0.1"])),
+      "retest_requires_blind")
 
 print()
 print("=" * 70)

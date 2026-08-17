@@ -20,10 +20,20 @@ recorded decision was made under -- the rule sections are sliced verbatim out
 of ``oncotriage/agent/prompts.py`` at run time -- so a disagreement is about the
 decision rather than about a rubric the rater never agreed to.
 
+ANCHORED BY DEFAULT, BLIND WITH ``--blind``. Anchored shows the rater the
+recorded status and asks agree/disagree, which leaks the answer and makes every
+anchored figure an admitted UPPER BOUND; it is the default because the earlier
+runs were rated that way and are comparable history. ``--blind`` withholds the
+status: the rater assigns its own and agreement is computed offline. Blind runs
+write to ``<run-dir>/rater_blind/`` and carry their own state file, so the two
+cannot overwrite or resume each other. What blind rating still does NOT remove
+-- chiefly that the quoted patient_value is the judged model's own extract -- is
+stated in every summary.json it writes.
+
 WHAT THE RATER IS NOT SHOWN. Trial title, trial phase, the trial-level verdict,
 the match score, the assessment text, any rank or retrieval score, and the name
-of the model that produced the decisions. One criterion decision per request, in
-isolation.
+of the model that produced the decisions -- and in blind mode, the recorded
+status itself. One criterion decision per request, in isolation.
 
 WHAT IT DOES NOT TOUCH. It calls no OpenAI endpoint, re-runs no pipeline stage,
 opens no database, reads no characterization fixture and writes nothing inside
@@ -47,6 +57,17 @@ USAGE
     python rater_run.py --resume msgbatch_...     # poll/retrieve, no new spend
     python rater_run.py --submit --limit 40       # a cheap pilot
     python rater_run.py --submit --output-dir <scratch>
+
+    # blind: the recorded status is withheld, agreement computed offline
+    python rater_run.py --dry-run --blind --run-dir <run>
+    python rater_run.py --dry-run --blind --retest-fraction 0.05 --run-dir <run>
+    python rater_run.py --submit  --blind --retest-fraction 0.05  # COSTS MONEY
+
+``--resume`` REBUILDS THE REQUEST INDEX FROM THE RUN DIRECTORY, so a resumed
+session must repeat every flag that shaped it -- ``--blind``,
+``--retest-fraction``, ``--retest-seed``, ``--limit``, ``--run-dir``. Forgetting
+one does not mis-join silently: the returned custom_ids would not be in the
+rebuilt index and the join refuses by name.
 
 Exit codes:
     0 -- every decision was rated and the outputs were written

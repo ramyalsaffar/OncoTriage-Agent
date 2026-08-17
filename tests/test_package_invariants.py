@@ -3720,6 +3720,14 @@ _DECORATOR_INVENTORY = {
     # four-field join key; it carries no behaviour and is pinned here because
     # this check pins every decorated definition, not because it is delicate.
     "oncotriage/evaluation/rater.py::Decision.key": ["property"],
+    # The blind pass. RequestIndex.primary_ids is the same shape as
+    # Decision.key above -- a read-only accessor, here over "every custom_id
+    # that is not a test-retest duplicate". It earns a property rather than a
+    # stored set because it must stay correct if retest_ids is ever adjusted
+    # after construction, and it is pinned here for the same reason
+    # Decision.key is: this check pins every decorated definition in the
+    # package, whether or not the decorator is delicate.
+    "oncotriage/evaluation/rater.py::RequestIndex.primary_ids": ["property"],
     # The Ragas harness, on exactly the same footing as Decision.key above:
     # each is a plain read-only accessor over that sample type's join key --
     # (patient_id,) for a retrieval sample, (patient_id, nct_id) for a
