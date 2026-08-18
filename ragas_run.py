@@ -72,6 +72,17 @@ mapping, the judge wiring, the ``top_p`` removal that Claude 4 models require,
 the usage seam that makes the reported cost measured rather than modelled, and
 what each persisted field is for.
 
+WHICH RECORDED TEXT IS SCORED (``--response-field``). At PROMPT_VERSION 1.5.0
+the stored ``assessment`` stopped being the model's prose and became text
+COMPOSED from the trial's own criterion rows, quoting both of the sample's
+contexts verbatim -- so faithfulness over it is expected near its ceiling and
+measures the RENDERER. The model's own prose survives in the run artifact as
+``assessment_draft``; scoring that measures the MODEL. The default does not
+move, both readings are wanted, the manifest records which was scored, and the
+outputs are NAMED after the field so two passes cannot overwrite each other. A
+verdict lacking the selected field is a refusal, never a fallback to the other
+one -- a mixture of the two under one metric name is a mean about nothing.
+
 USAGE
 -----
     python ragas_run.py --dry-run                # free: counts and a range
@@ -79,11 +90,15 @@ USAGE
     python ragas_run.py                          # COSTS MONEY: the full run
     python ragas_run.py --output-dir <scratch>
     python ragas_run.py --max-workers 8
+    python ragas_run.py --response-field assessment_draft   # score the model
+    python ragas_run.py --overwrite              # replace an existing result
 
 Exit codes:
     0 -- every (sample, metric) pair was scored and the outputs were written
     1 -- refused before spending anything (bad run dir, missing credentials,
-         an unpriced model, a judge that could not be wired safely)
+         an unpriced model, a judge that could not be wired safely, a verdict
+         missing the selected --response-field, or an existing output that
+         --overwrite was not given for)
     3 -- the run happened and some pairs are unscored, or a post-check failed;
          ragas_results.json names each unscored pair and why
 """

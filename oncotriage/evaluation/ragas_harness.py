@@ -211,6 +211,75 @@ GENERATION_QUESTION_TEMPLATE = (
 
 
 #------------------------------------------------------------------------------
+# WHICH RECORDED TEXT IS SCORED
+#------------------------------------------------------------------------------
+# WHY THIS IS AN OPTION RATHER THAN A CONSTANT. At PROMPT_VERSION 1.5.0 the
+# stored ``assessment`` of an eligible or not_eligible trial stopped being the
+# model's free-written reasoning: ``oncotriage/agent/evaluation.py:
+# compose_assessment`` builds it from that trial's own criterion /
+# patient_value / status rows, quoting the criterion text (which restates the
+# trial) and the patient value (which comes from the patient record) VERBATIM.
+# Both of a generation sample's two contexts are therefore the sources the
+# composed text was assembled from, so FAITHFULNESS OVER THE COMPOSED FIELD IS
+# EXPECTED NEAR ITS CEILING BY CONSTRUCTION -- it measures the renderer, and a
+# metric that cannot fail is not a measurement.
+#
+# The model's own prose survives beside it: ``collect_verdicts`` copies each
+# verdict verbatim, so a >=1.5.0 run artifact carries ``assessment_draft``,
+# which is held in memory only and has no database column. Scoring THAT is what
+# keeps faithfulness a statement about the MODEL. Both readings are wanted --
+# one prices the renderer, one prices the model -- so this is a selection, not
+# a replacement, and the manifest records which was scored.
+#
+# THE DEFAULT DOES NOT MOVE. Every figure published from this harness so far was
+# read over ``assessment``; changing what a bare invocation scores would make
+# two runs with identical command lines mean different things.
+
+RESPONSE_FIELD_ASSESSMENT = "assessment"
+RESPONSE_FIELD_DRAFT = "assessment_draft"
+
+RESPONSE_FIELDS = (RESPONSE_FIELD_ASSESSMENT, RESPONSE_FIELD_DRAFT)
+"""The closed set of recorded verdict fields this harness will score.
+
+Closed rather than "any key name", on ``deps.OVERRIDE_KEYS``' footing: an
+unrecognised field would be read as absent on every verdict and refuse, but the
+message would blame the artifact for a typo in the command line.
+"""
+
+DEFAULT_RESPONSE_FIELD = RESPONSE_FIELD_ASSESSMENT
+
+RESPONSE_FIELD_NOTES = {
+    RESPONSE_FIELD_ASSESSMENT: (
+        "response = the STORED assessment. At PROMPT_VERSION >= 1.5.0 this is "
+        "COMPOSED text, not the model's prose: it is built from the trial's "
+        "own criterion / patient_value / status rows, quoting the criterion "
+        "(which restates the trial text) and the patient value (which comes "
+        "from the patient record) verbatim. Both of this sample's contexts are "
+        "the sources it was assembled from, so faithfulness over this field is "
+        "EXPECTED NEAR ITS CEILING and measures the RENDERER rather than the "
+        "model. A high number here is the composition working, not a quality "
+        "finding."),
+    RESPONSE_FIELD_DRAFT: (
+        "response = assessment_draft, the model's OWN prose for this trial, "
+        "kept beside the composed assessment in memory and in the run artifact "
+        "with no database column. Faithfulness over this field measures the "
+        "MODEL: the draft was written before composition and is not quoted "
+        "from the contexts, so the metric can fail. Figures over this field "
+        "are NOT comparable with figures over `assessment` -- they are two "
+        "different subjects, not a before/after."),
+}
+
+RESPONSE_FIELD_MISSING_NOTE = (
+    "A verdict that does not CARRY the selected field is a refusal, never a "
+    "fallback to another field. Falling back would score a mixture -- some "
+    "samples the model's prose, some the renderer's -- under one metric name, "
+    "and the mean over that mixture is a number about nothing. An artifact "
+    "written before PROMPT_VERSION 1.5.0 has no `assessment_draft` key at all, "
+    "which is exactly the case that must refuse rather than quietly reporting "
+    "the composed figure under the draft's name.")
+
+
+#------------------------------------------------------------------------------
 # The environment stamp
 #------------------------------------------------------------------------------
 # WHY IT EXISTS. Ragas is deliberately NOT a pipeline dependency and is not in
@@ -380,13 +449,27 @@ def default_run_dir():
 class RetrievalSample(object):
     """One patient: the summary, the ranked contexts, the verdict listing."""
 
-    __slots__ = ("patient_id", "user_input", "retrieved_contexts", "response")
+    __slots__ = ("patient_id", "user_input", "retrieved_contexts", "response",
+                 "response_field", "matched_count")
 
-    def __init__(self, patient_id, user_input, retrieved_contexts, response):
+    def __init__(self, patient_id, user_input, retrieved_contexts, response,
+                 response_field=DEFAULT_RESPONSE_FIELD, matched_count=None):
         self.patient_id = patient_id
         self.user_input = user_input
         self.retrieved_contexts = retrieved_contexts
         self.response = response
+        # COUNTED WHERE THE RESPONSE IS BUILT, never re-derived from the text.
+        # The dry run used to recover it as ``len(response.splitlines())``,
+        # which is only true while no scored field contains a newline. That
+        # held for the composed ``assessment`` -- measured, 0 of 126 -- and
+        # ``assessment_draft`` is free model prose, so making the field
+        # selectable made a display that over-counts matches and under-counts
+        # "must earn it on content" reachable on real data.
+        self.matched_count = matched_count
+        # Carried on the SAMPLE, not only in args, so the post-check that every
+        # scored response really came from the declared field has something to
+        # read. A manifest field is a claim; this is what makes it checkable.
+        self.response_field = response_field
 
     @property
     def key(self):
@@ -400,10 +483,11 @@ class GenerationSample(object):
     """One verdicted trial: the fixed question, two contexts, the assessment."""
 
     __slots__ = ("patient_id", "nct_id", "user_input", "retrieved_contexts",
-                 "response", "eligible", "verdict_group")
+                 "response", "eligible", "verdict_group", "response_field")
 
     def __init__(self, patient_id, nct_id, user_input, retrieved_contexts,
-                 response, eligible, verdict_group):
+                 response, eligible, verdict_group,
+                 response_field=DEFAULT_RESPONSE_FIELD):
         self.patient_id = patient_id
         self.nct_id = nct_id
         self.user_input = user_input
@@ -411,6 +495,7 @@ class GenerationSample(object):
         self.response = response
         self.eligible = eligible
         self.verdict_group = verdict_group
+        self.response_field = response_field
 
     @property
     def key(self):
@@ -423,12 +508,17 @@ class GenerationSample(object):
 class RunInput(object):
     """Everything read out of an evaluation run directory."""
 
-    def __init__(self, run_dir, manifest, retrieval, generation, problems):
+    def __init__(self, run_dir, manifest, retrieval, generation, problems,
+                 response_field=DEFAULT_RESPONSE_FIELD, field_census=None):
         self.run_dir = run_dir
         self.manifest = manifest
         self.retrieval = retrieval
         self.generation = generation
         self.problems = problems
+        self.response_field = response_field
+        # Measured while reading, so the report's "the draft population is the
+        # differing one" is a harness measurement rather than a side script's.
+        self.field_census = field_census or {}
 
 
 ELIGIBLE_LABEL = "eligible"
@@ -437,8 +527,16 @@ NO_MATCH_RESPONSE = ("No matching trial was found for this patient. None of "
                      "the retrieved trials was assessed as eligible.")
 
 
-def _match_response(verdicts, problems=None, patient_id=None):
+def _match_response(verdicts, problems=None, patient_id=None,
+                    response_field=DEFAULT_RESPONSE_FIELD):
     """The retrieval-side ``response``: the clinical answer, not an ID roster.
+
+    ``response_field`` SELECTS THE SAME TEXT THE GENERATION DATASET SCORES, and
+    it applies here rather than being pinned to ``assessment`` so that a run's
+    single recorded ``response_field`` is true of everything in it. Pinning this
+    side would let a manifest stamped ``assessment_draft`` describe a retrieval
+    response built from the composed assessment -- one field name over two
+    different texts, which is the mixture this option exists to prevent.
 
     THE CIRCULARITY RULE THIS ENFORCES. A retrieved context must not be judged
     useful merely because its ID is echoed back in the response; a rejected
@@ -473,6 +571,10 @@ def _match_response(verdicts, problems=None, patient_id=None):
 
     Nothing is summarised or rephrased -- the assessment text is verbatim, so
     the metric scores the run rather than this harness's prose.
+
+    Returns ``(text, matched_count)``. The count is returned rather than left
+    to be recovered from the text, because a scored field containing a newline
+    would make ``len(text.splitlines())`` over-count the matches.
     """
     lines = []
     for verdict in verdicts:
@@ -491,14 +593,14 @@ def _match_response(verdicts, problems=None, patient_id=None):
             problems.append(f"{patient_id}/{nct_id}: eligible="
                             f"{verdict.get('eligible')!r} but verdict_group="
                             f"{group!r}; treated as a match on `eligible`")
-        assessment = (verdict.get("assessment") or "").strip()
+        assessment = (verdict.get(response_field) or "").strip()
         lines.append(f"{nct_id}: {assessment}" if assessment else f"{nct_id}")
     if not lines:
-        return NO_MATCH_RESPONSE
-    return "\n".join(lines)
+        return NO_MATCH_RESPONSE, 0
+    return "\n".join(lines), len(lines)
 
 
-def load_run(run_dir):
+def load_run(run_dir, response_field=DEFAULT_RESPONSE_FIELD):
     """Read a run directory into both datasets, in a deterministic order.
 
     Every path comes from the manifest's own ``runs`` table rather than from a
@@ -506,7 +608,24 @@ def load_run(run_dir):
     patient and a record the manifest names but which is missing is a recorded
     problem rather than a silently shorter dataset. Same shape as
     ``rater.load_run``, for the same reasons.
+
+    ``response_field`` NAMES THE RECORDED TEXT BOTH DATASETS SCORE, and a
+    verdict that does not CARRY that key is a refusal -- see
+    RESPONSE_FIELD_MISSING_NOTE. The distinction enforced here is between a key
+    that is ABSENT (the artifact predates the field: structural, refuse before
+    anything is priced or spent) and a key that is present but EMPTY (this one
+    trial has no text: recorded as a problem, no sample built, which is what
+    the harness already did for an empty assessment). Collapsing them would let
+    a whole pre-1.5.0 artifact read as "126 empty assessments" and score
+    nothing while exiting 0.
     """
+    if response_field not in RESPONSE_FIELDS:
+        raise RagasRefusal(
+            f"unknown response field {response_field!r}; this harness scores "
+            f"one of {', '.join(RESPONSE_FIELDS)}. Every verdict would read as "
+            f"missing and the refusal would blame the artifact.",
+            code="response_field_unknown")
+
     manifest_path = os.path.join(run_dir, "manifest.json")
     if not os.path.isfile(manifest_path):
         raise RagasRefusal(
@@ -523,6 +642,13 @@ def load_run(run_dir):
     retrieval = []
     generation = []
     problems = []
+    # The missing-key scan accumulates ACROSS patients and is raised once, at
+    # the end, naming the count and a bounded sample. Raising on the first hit
+    # would tell an operator that one trial lacks the field when the truth is
+    # that the whole artifact does, and they would fix it one verdict at a time.
+    missing_field = []
+    census = {"verdicts_seen": 0, "both_fields_present": 0,
+              "identical": 0, "differing": 0}
 
     for patient_id in sorted(runs.keys()):
         entry = runs[patient_id]
@@ -564,11 +690,15 @@ def load_run(run_dir):
 
         verdicts = record.get("verdicts") or []
         if contexts and verdicts:
+            match_text, matched_count = _match_response(
+                verdicts, problems, patient_id, response_field)
             retrieval.append(RetrievalSample(
                 patient_id=patient_id,
                 user_input=summary,
                 retrieved_contexts=[text for _, _, text in contexts],
-                response=_match_response(verdicts, problems, patient_id)))
+                response=match_text,
+                response_field=response_field,
+                matched_count=matched_count))
         else:
             problems.append(f"{patient_id}: no retrieval sample built "
                             f"({len(contexts)} contexts, {len(verdicts)} "
@@ -580,14 +710,35 @@ def load_run(run_dir):
             if not nct_id:
                 problems.append(f"{patient_id}: a verdict carries no nct_id")
                 continue
-            assessment = (verdict.get("assessment") or "").strip()
+            # A CENSUS OF THE TWO FIELDS, TAKEN WHILE THE RECORD IS OPEN. Read
+            # for every verdict whatever field is being scored, because "how
+            # many drafts are byte-identical to their composed assessment" is
+            # the population statement any draft-side figure has to be read
+            # over, and a figure whose denominator comes from a side script is
+            # a figure with two provenances.
+            census["verdicts_seen"] += 1
+            if (RESPONSE_FIELD_ASSESSMENT in verdict
+                    and RESPONSE_FIELD_DRAFT in verdict):
+                census["both_fields_present"] += 1
+                if (verdict.get(RESPONSE_FIELD_ASSESSMENT)
+                        == verdict.get(RESPONSE_FIELD_DRAFT)):
+                    census["identical"] += 1
+                else:
+                    census["differing"] += 1
+
+            if response_field not in verdict:
+                # ABSENT KEY: structural, and collected rather than raised
+                # here. Never falls back to the other field.
+                missing_field.append(f"{patient_id}/{nct_id}")
+                continue
+            assessment = (verdict.get(response_field) or "").strip()
             if not assessment:
                 # Stated scope: one sample per verdicted trial WITH a non-empty
-                # assessment. An empty one is recorded, never scored -- both
-                # metrics take the response as their subject and there is
+                # response field. An empty one is recorded, never scored --
+                # both metrics take the response as their subject and there is
                 # nothing here to be faithful or relevant.
-                problems.append(f"{patient_id}/{nct_id}: empty assessment; no "
-                                f"generation sample built")
+                problems.append(f"{patient_id}/{nct_id}: empty "
+                                f"{response_field}; no generation sample built")
                 continue
             trial_text = by_nct.get(nct_id)
             if not trial_text:
@@ -629,13 +780,28 @@ def load_run(run_dir):
                 # a measurement decision rather than an edit.
                 response=assessment,
                 eligible=verdict.get("eligible"),
-                verdict_group=verdict.get("verdict_group")))
+                verdict_group=verdict.get("verdict_group"),
+                response_field=response_field))
 
         declared = entry.get("verdicts")
         n_here = sum(1 for s in generation if s.patient_id == patient_id)
         if isinstance(declared, int) and declared != n_here:
             problems.append(f"{patient_id}: manifest declares {declared} "
                             f"verdicts, {n_here} generation samples were built")
+
+    # RAISED BEFORE the empty-datasets check, and before pricing, so an
+    # artifact that predates the requested field refuses with the reason it
+    # actually has rather than with "no samples read". Never a fallback: see
+    # RESPONSE_FIELD_MISSING_NOTE.
+    if missing_field:
+        shown = ", ".join(missing_field[:5])
+        more = ("" if len(missing_field) <= 5
+                else f" (and {len(missing_field) - 5} more)")
+        raise RagasRefusal(
+            f"{len(missing_field)} of {census['verdicts_seen']} verdict(s) in "
+            f"{run_dir!r} carry no {response_field!r} key: {shown}{more}. "
+            f"{RESPONSE_FIELD_MISSING_NOTE}",
+            code="response_field_missing")
 
     if not retrieval and not generation:
         raise RagasRefusal(
@@ -645,7 +811,8 @@ def load_run(run_dir):
 
     retrieval.sort(key=lambda s: s.key)
     generation.sort(key=lambda s: s.key)
-    return RunInput(run_dir, manifest, retrieval, generation, problems)
+    return RunInput(run_dir, manifest, retrieval, generation, problems,
+                    response_field, census)
 
 
 def apply_limit(run, limit):
@@ -658,7 +825,8 @@ def apply_limit(run, limit):
     if not limit or limit <= 0:
         return run
     return RunInput(run.run_dir, run.manifest, run.retrieval[:limit],
-                    run.generation[:limit], run.problems)
+                    run.generation[:limit], run.problems,
+                    run.response_field, run.field_census)
 
 
 #------------------------------------------------------------------------------
@@ -1269,10 +1437,12 @@ def _fmt(value):
 
 
 def print_summary(summary, cost, judge_model, embedding_model, wall_seconds,
-                  temperature, active):
+                  temperature, active, response_field=None):
     console.banner("RAGAS EVALUATION -- REFERENCE-FREE METRICS")
     console.out(f"judge:      {judge_model} (temperature "
                 f"{temperature}, non-batch rates)")
+    if response_field is not None:
+        console.out(f"response:   the recorded {response_field!r} field")
     selected = {m for ms in active.values() for m in ms}
     if METRIC_RESPONSE_RELEVANCY in selected:
         console.out(f"embeddings: {embedding_model} (response relevancy only)")
@@ -1324,6 +1494,9 @@ def print_summary(summary, cost, judge_model, embedding_model, wall_seconds,
     if METRIC_CONTEXT_PRECISION in selected:
         console.out(CIRCULARITY_RULE_NOTE)
         console.out("")
+    if response_field is not None:
+        console.out(RESPONSE_FIELD_NOTES[response_field])
+        console.out("")
     console.out(REPRODUCIBILITY_NOTE)
     console.out("")
     console.out(CONTEXT_RECALL_SCOPE_NOTE)
@@ -1343,6 +1516,17 @@ def print_plan(plan, run, out_dir, active, environment):
     console.banner("RAGAS DRY RUN -- NOTHING WAS SUBMITTED")
     console.out(f"run dir:    {run.run_dir}")
     console.out(f"output dir: {out_dir}")
+    results_path, manifest_path = output_paths(out_dir, run.response_field)
+    console.out(f"would write {os.path.basename(results_path)} and "
+                f"{os.path.basename(manifest_path)}")
+    console.out(f"response:   the recorded {run.response_field!r} field")
+    census = run.field_census or {}
+    if census.get("both_fields_present"):
+        console.out(f"            of {census['verdicts_seen']} verdict(s), "
+                    f"{census['both_fields_present']} carry both "
+                    f"{RESPONSE_FIELD_ASSESSMENT} and "
+                    f"{RESPONSE_FIELD_DRAFT}: {census['identical']} "
+                    f"byte-identical, {census['differing']} differing")
     console.out("")
     # THE SAME FIELDS THE MANIFEST STAMPS, THROUGH THE SAME RENDERER, AND THEY
     # DESCRIBE THIS INTERPRETER TRUTHFULLY WHATEVER IT IS. The dry run returns
@@ -1388,6 +1572,8 @@ def print_plan(plan, run, out_dir, active, environment):
     console.out("")
     console.out(plan["estimate_caveat"])
     console.out("")
+    console.out(RESPONSE_FIELD_NOTES[run.response_field])
+    console.out("")
     console.out(CONTEXT_RECALL_SCOPE_NOTE)
     console.out("")
     if run.problems:
@@ -1416,26 +1602,82 @@ def print_retrieval_response_shape(run):
     console.out(header)
     console.out("    " + "-" * (len(header) - 4))
     no_match = 0
+    uncounted = 0
     for sample in run.retrieval:
         text = sample.response
-        matched = 0 if text == NO_MATCH_RESPONSE else len(text.splitlines())
-        if text == NO_MATCH_RESPONSE:
-            no_match += 1
+        matched = sample.matched_count
+        if matched is None:
+            # NEVER RENDERED AS 0. A sample built without a count -- which only
+            # a caller constructing one by hand can produce -- is unknown, and
+            # printing an unknown as zero would report every trial as having to
+            # earn its verdict on content.
+            uncounted += 1
+            shown_matched, shown_rejected = "?", "?"
+        else:
+            if not matched:
+                no_match += 1
+            shown_matched = str(matched)
+            shown_rejected = str(len(sample.retrieved_contexts) - matched)
         first = text.splitlines()[0] if text else ""
         console.out(f"    {sample.patient_id[:10]:<12}"
-                    f"{len(sample.retrieved_contexts):>5}{matched:>9}"
-                    f"{len(sample.retrieved_contexts) - matched:>10}"
+                    f"{len(sample.retrieved_contexts):>5}{shown_matched:>9}"
+                    f"{shown_rejected:>10}"
                     f"{len(text):>8}  {first[:58]}")
     total_ctx = sum(len(s.retrieved_contexts) for s in run.retrieval)
-    total_matched = sum(0 if s.response == NO_MATCH_RESPONSE
-                        else len(s.response.splitlines())
-                        for s in run.retrieval)
+    total_matched = sum(s.matched_count for s in run.retrieval
+                        if s.matched_count is not None)
     console.out("")
     console.out(f"    {total_matched} of {total_ctx} retrieved trials appear "
                 f"in a response; the other {total_ctx - total_matched} must "
                 f"earn their relevance verdict on content.")
     console.out(f"    patients with no matching trial: {no_match}")
+    if uncounted:
+        console.out(f"    {uncounted} sample(s) carry no match count and are "
+                    f"excluded from both totals above.")
     console.out("")
+
+
+RESULTS_BASENAME = "ragas_results"
+MANIFEST_BASENAME = "ragas_manifest"
+
+
+def output_paths(out_dir, response_field=DEFAULT_RESPONSE_FIELD):
+    """(results, manifest) paths, NAMED AFTER THE FIELD THEY SCORE.
+
+    ``write_json`` replaces its target and the default output location is one
+    directory per run, so two passes over the same run with different response
+    fields would have written the second over the first -- same filenames, same
+    directory, no error, and the surviving file's manifest would be the only
+    thing distinguishing $3 of measurement from the $3 of measurement it had
+    just destroyed. The field is in the NAME, so they cannot collide even when
+    an operator points both at one directory.
+
+    THE DEFAULT FIELD KEEPS THE HISTORICAL NAMES, deliberately. Two schema-1
+    manifests already sit under ``09- Testing/Evaluation Runs/`` as
+    ``ragas_results.json``; ``superseded_record`` finds the earlier biased
+    precision output by that exact path, and renaming it would silently break
+    the provenance link rather than fail. So only a NON-default field takes a
+    suffix, and one function derives both names so they cannot disagree about
+    which pass they belong to.
+    """
+    suffix = ("" if response_field == DEFAULT_RESPONSE_FIELD
+              else f"__{response_field}")
+    return (os.path.join(out_dir, f"{RESULTS_BASENAME}{suffix}.json"),
+            os.path.join(out_dir, f"{MANIFEST_BASENAME}{suffix}.json"))
+
+
+def existing_outputs(out_dir, response_field=DEFAULT_RESPONSE_FIELD):
+    """Which of this pass's two target files are already on disk.
+
+    Field-aware naming stops two DIFFERENT passes colliding; it does nothing
+    about re-running the SAME pass, which still replaces a scored result with
+    another one. That is a real loss -- these files cost dollars and are not
+    reproducible sample to sample (REPRODUCIBILITY_NOTE), so the replaced run
+    cannot be recovered by re-running it. Reported to ``main``, which refuses
+    before spending unless ``--overwrite`` says the replacement is intended.
+    """
+    return [p for p in output_paths(out_dir, response_field)
+            if os.path.exists(p)]
 
 
 def write_json(path, payload):
@@ -1460,7 +1702,9 @@ def build_results(scores, run, active):
         "schema_version": 1,
         "generated_at_utc": _utc_now(),
         "run_dir": run.run_dir,
+        "response_field": run.response_field,
         "notes": {
+            "response_field": RESPONSE_FIELD_NOTES[run.response_field],
             "context_recall_scope": CONTEXT_RECALL_SCOPE_NOTE,
             **({"circularity_rule": CIRCULARITY_RULE_NOTE}
                if METRIC_CONTEXT_PRECISION in _selected(active) else {}),
@@ -1522,6 +1766,19 @@ def build_manifest(run, summary, cost, args, wall_seconds, ragas_version,
         "ragas_version": ragas_version,
         "environment": (environment if environment is not None
                         else environment_stamp()),
+        # WHICH RECORDED TEXT WAS SCORED. Read from the RunInput rather than
+        # from args, so this field reports what the samples were actually built
+        # from; an args value could be stamped onto a run whose loader had been
+        # handed something else.
+        "response_field": run.response_field,
+        "response_field_note": RESPONSE_FIELD_NOTES[run.response_field],
+        "response_field_missing_policy": RESPONSE_FIELD_MISSING_NOTE,
+        # The population any draft-side figure has to be read over: how many
+        # verdicts carry BOTH fields, and of those how many are byte-identical
+        # (a class whose composed text is the model's own text kept unchanged,
+        # for which the two figures cannot differ). Counted over the whole run
+        # before --limit is applied.
+        "response_field_census": run.field_census,
         "judge_model": args.judge_model,
         "judge_provider": "anthropic",
         "judge_temperature": args.temperature,
@@ -1563,7 +1820,8 @@ def build_manifest(run, summary, cost, args, wall_seconds, ragas_version,
                 "retrieved_contexts = that patient's fenced trial texts in "
                 "recorded rank order; response = THE CLINICAL ANSWER -- for "
                 "each trial the pipeline verdicted eligible, its nct_id "
-                "followed by that trial's assessment text verbatim, one per "
+                f"followed by that trial's recorded {run.response_field!r} "
+                "text verbatim, one per "
                 "line, or a plain statement that no matching trial was found. "
                 "Trials the pipeline rejected are absent from the response. "
                 "No prose is written by this harness."),
@@ -1577,8 +1835,8 @@ def build_manifest(run, summary, cost, args, wall_seconds, ragas_version,
                 "[patient summary, that trial's fenced text], because "
                 "faithfulness checks every statement against the contexts and "
                 "an assessment citing patient facts would otherwise be "
-                "unsupported by construction; response = the assessment "
-                "verbatim."),
+                f"unsupported by construction; response = the recorded "
+                f"{run.response_field!r} verbatim."),
         },
         "problems": run.problems,
     }
@@ -1679,6 +1937,20 @@ def post_checks(run, scores, results_path, manifest_path, out_dir, active,
         failures.append(f"accounting: {len(scores) - accounted} pair(s) are "
                         f"neither scored nor unscored")
 
+    # PROVENANCE. The manifest states one response_field for the whole run;
+    # this is what makes that a checked fact rather than a claim. A silent
+    # fallback -- the defect --response-field exists to prevent -- would show
+    # up here as a mixture, and a mean over a mixture is a number about
+    # nothing. The declared field is read off the RunInput, which is what the
+    # manifest also stamps, and the samples are read individually.
+    mismatched = [s for s in (run.retrieval + run.generation)
+                  if s.response_field != run.response_field]
+    if mismatched:
+        failures.append(
+            f"provenance: {len(mismatched)} sample(s) were built from a "
+            f"response field other than the declared {run.response_field!r}: "
+            f"{sorted({s.response_field for s in mismatched})}")
+
     try:
         with io.open(results_path, "r", encoding="utf-8") as fh:
             reloaded = json.load(fh)
@@ -1760,6 +2032,24 @@ def _parse_args(argv=None):
                         "embedder means no OpenAI client is built and "
                         "OPENAI_API_KEY is never read. Choices: "
                         + ", ".join(ALL_METRICS))
+    p.add_argument("--response-field", choices=RESPONSE_FIELDS,
+                   default=DEFAULT_RESPONSE_FIELD, metavar="FIELD",
+                   help=f"which recorded verdict text to score as the response "
+                        f"(default: {DEFAULT_RESPONSE_FIELD}). "
+                        f"{RESPONSE_FIELD_ASSESSMENT} is COMPOSED text at "
+                        f"PROMPT_VERSION >= 1.5.0 and faithfulness over it "
+                        f"measures the renderer near its ceiling; "
+                        f"{RESPONSE_FIELD_DRAFT} is the model's own prose and "
+                        f"measures the model. A verdict lacking the selected "
+                        f"field is a refusal, never a fallback. Outputs are "
+                        f"named after the field, so passes cannot overwrite "
+                        f"each other. Choices: " + ", ".join(RESPONSE_FIELDS))
+    p.add_argument("--overwrite", action="store_true",
+                   help="replace this pass's output files if they already "
+                        "exist. Without it an existing result is a refusal "
+                        "BEFORE anything is spent: these files cost money and "
+                        "are not reproducible sample to sample, so a replaced "
+                        "one cannot be recovered by re-running.")
     return p.parse_args(argv)
 
 
@@ -1781,7 +2071,7 @@ def main(argv=None):
         active = active_dataset_metrics(args.metrics)
         needs_embeddings = any(m in METRICS_NEEDING_EMBEDDINGS
                                for ms in active.values() for m in ms)
-        run = apply_limit(load_run(run_dir), args.limit)
+        run = apply_limit(load_run(run_dir, args.response_field), args.limit)
         # Priced before anything is built, so an unpriced model refuses before
         # a client is constructed rather than after the first billed call.
         plan = price_plan(run, args.judge_model, args.embedding_model, active)
@@ -1804,7 +2094,29 @@ def main(argv=None):
         console.out(f"REFUSED (output_parent_missing): {parent!r} does not "
                     f"exist, so --output-dir cannot be created there.")
         return 1
+
+    # BEFORE A CENT IS SPENT, and before the output directory is created: an
+    # existing result for THIS field is a refusal unless the replacement was
+    # asked for. Field-aware naming already stops two different passes
+    # colliding; this is the same-pass case, where the file being replaced cost
+    # real money and cannot be recovered by re-running (REPRODUCIBILITY_NOTE).
+    if not args.overwrite:
+        clash = existing_outputs(out_dir, args.response_field)
+        if clash:
+            console.out(f"REFUSED (output_exists): {len(clash)} output "
+                        f"file(s) for --response-field "
+                        f"{args.response_field} already exist and would be "
+                        f"replaced: {', '.join(clash)}. These cost money and "
+                        f"are not reproducible sample to sample. Pass "
+                        f"--overwrite to replace them, or --output-dir to "
+                        f"write elsewhere.")
+            log.error("ragas_refused", extra={"reason": "output_exists"})
+            return 1
     os.makedirs(out_dir, exist_ok=True)
+    # Derived ONCE, from the same function the guard above consulted, so what
+    # is announced before the spend and what is written after it cannot name
+    # different files.
+    results_path, manifest_path = output_paths(out_dir, run.response_field)
 
     try:
         import asyncio
@@ -1836,6 +2148,8 @@ def main(argv=None):
         m for ms in active.values() for m in ms)
         + (" | embedder: none built (no selected metric needs one)"
            if not needs_embeddings else f" | embedder: {args.embedding_model}"))
+    console.out(f"response field: {run.response_field} -> "
+                f"{os.path.basename(results_path)}")
     # Printed here, before a cent is spent, and not only written into the
     # manifest at the end: the manifest lands after the whole run -- 414 seconds
     # and $9.29 on the reference run -- and an operator who is about to spend
@@ -1854,8 +2168,6 @@ def main(argv=None):
     summary = summarize(scores, run, active)
     cost = tally.cost(args.judge_model, args.embedding_model)
 
-    results_path = os.path.join(out_dir, "ragas_results.json")
-    manifest_path = os.path.join(out_dir, "ragas_manifest.json")
     write_json(results_path, build_results(scores, run, active))
     write_json(manifest_path,
                build_manifest(run, summary, cost, args, wall_seconds,
@@ -1864,7 +2176,7 @@ def main(argv=None):
                               environment))
 
     print_summary(summary, cost, args.judge_model, args.embedding_model,
-                  wall_seconds, args.temperature, active)
+                  wall_seconds, args.temperature, active, run.response_field)
     console.out(f"wrote {results_path}")
     console.out(f"wrote {manifest_path}")
 

@@ -811,6 +811,388 @@ control("two identical versions are not reported as a disagreement",
 
 
 # ===========================================================================
+# SECTION 9: --response-field SELECTS THE TEXT, REFUSES, AND CANNOT COLLIDE
+# ===========================================================================
+# WHY THE OPTION EXISTS. At PROMPT_VERSION 1.5.0 the stored ``assessment``
+# became text COMPOSED from the trial's own criterion rows, quoting both of a
+# generation sample's contexts verbatim -- so faithfulness over it is near its
+# ceiling by construction and measures the RENDERER. ``assessment_draft`` is
+# the model's own prose and measures the MODEL. Both readings are wanted, so
+# the field is a selection whose three hazards are covered here:
+#
+#   a. a SILENT FALLBACK to the other field would score a mixture -- some
+#      samples the model, some the renderer -- under one metric name;
+#   b. ``write_json`` REPLACES, and the default output location is one
+#      directory per run, so two passes would have written over each other for
+#      dollars apiece with nothing raising;
+#   c. the manifest's ``response_field`` is a CLAIM unless something checks the
+#      samples were really built from it.
+#
+# Every run directory here is a literal dict passed to a temp-directory writer,
+# so no evaluation run is read. Section 9d writes ONLY inside a
+# ``tempfile.mkdtemp()`` tree and removes it; nothing in the repository or
+# under 09- Testing is touched, so this file stays out of the collision matrix.
+
+print()
+print("=" * 70)
+print("Section 9: --response-field -- selection, refusal, and collision")
+print("=" * 70)
+
+import shutil                                                    # noqa: E402
+import tempfile                                                  # noqa: E402
+
+
+_DROP = object()
+"""Sentinel: remove this key from the verdict entirely, rather than empty it.
+
+An ABSENT key and an EMPTY value are different facts about an artifact and the
+loader treats them differently -- absent refuses, empty is a recorded problem.
+A test that could only produce one of them would cover half the rule.
+"""
+
+
+def _verdict(nct_id, **overrides):
+    """One verdict carrying both fields, unless an override removes one."""
+    row = {"nct_id": nct_id, "eligible": "eligible",
+           "verdict_group": "matches",
+           "assessment": f"{nct_id} COMPOSED: criterion quoted verbatim.",
+           "assessment_draft": f"{nct_id} DRAFT: the model's own prose."}
+    row.update(overrides)
+    for key, value in list(row.items()):
+        if value is _DROP:
+            del row[key]
+    return row
+
+
+def _write_run(tmp, verdicts, patient_id="patient-1"):
+    """A minimal evaluation-run directory: manifest plus one record.
+
+    Creates its own directory, so a caller is one expression rather than a
+    makedirs whose return value has to be threaded through a conditional.
+    """
+    os.makedirs(tmp, exist_ok=True)
+    record = {
+        "patient_summary": {"text": "A 61-year-old with breast cancer."},
+        "contexts": [{"rank": i + 1, "nct_id": v["nct_id"],
+                      "trial_text": f"Trial {v['nct_id']} eligibility text."}
+                     for i, v in enumerate(verdicts)],
+        "verdicts": verdicts,
+    }
+    with io.open(os.path.join(tmp, f"{patient_id}.json"), "w",
+                 encoding="utf-8") as fh:
+        json.dump(record, fh)
+    with io.open(os.path.join(tmp, "manifest.json"), "w",
+                 encoding="utf-8") as fh:
+        json.dump({"runs": {patient_id: {"file": f"{patient_id}.json",
+                                         "verdicts": len(verdicts)}}}, fh)
+    return tmp
+
+
+_TMP = tempfile.mkdtemp(prefix="ragas_response_field_")
+try:
+    # --------------------------------------------------------------------
+    # 9a. THE FIELD SELECTS THE TEXT, ON BOTH DATASETS
+    # --------------------------------------------------------------------
+    _BOTH = _write_run(os.path.join(_TMP, "both"),
+                       [_verdict("NCT00000001")])
+
+    _AS_DEFAULT = drive(lambda: _rh.load_run(_BOTH))
+    _AS_DRAFT = drive(lambda: _rh.load_run(_BOTH, _rh.RESPONSE_FIELD_DRAFT))
+
+    def _generation_response(run):
+        return run.generation[0].response
+
+    check("the default scores the composed assessment",
+          drive(lambda: _generation_response(_AS_DEFAULT)),
+          "NCT00000001 COMPOSED: criterion quoted verbatim.")
+    check("--response-field assessment_draft scores the model's prose instead",
+          drive(lambda: _generation_response(_AS_DRAFT)),
+          "NCT00000001 DRAFT: the model's own prose.")
+
+    # THE RETRIEVAL SIDE MOVES WITH IT. Pinning this side to `assessment` while
+    # the manifest stamped `assessment_draft` would put one field name over two
+    # different texts -- the mixture this option exists to prevent, one level up.
+    check("...and the retrieval-side response follows the same field, so one "
+          "recorded response_field is true of the whole run",
+          drive(lambda: "DRAFT" in _AS_DRAFT.retrieval[0].response), True)
+    check("...while the default retrieval response is still the composed text",
+          drive(lambda: "COMPOSED" in _AS_DEFAULT.retrieval[0].response), True)
+
+    def _selects_draft(run):
+        return "DRAFT" in run.generation[0].response
+
+    control("a run loaded at the default is not reported as carrying drafts",
+            _selects_draft, _AS_DEFAULT)
+
+    check("the RunInput records which field it was built from",
+          (drive(lambda: _AS_DEFAULT.response_field),
+           drive(lambda: _AS_DRAFT.response_field)),
+          ("assessment", "assessment_draft"))
+
+    # --------------------------------------------------------------------
+    # 9b. A MISSING FIELD REFUSES. IT NEVER FALLS BACK.
+    # --------------------------------------------------------------------
+    # This is the whole safety argument: a pre-1.5.0 artifact has no
+    # `assessment_draft` key, and a fallback would report the COMPOSED figure
+    # -- which is near its ceiling by construction -- under the draft's name,
+    # as a finding about the model.
+    _PRE_1_5_0 = _write_run(
+        os.path.join(_TMP, "pre150"),
+        [_verdict("NCT00000001", assessment_draft=_DROP),
+         _verdict("NCT00000002", assessment_draft=_DROP)])
+
+    def _refusal_message(run_dir, field=_rh.RESPONSE_FIELD_DRAFT):
+        """The refusal's own text, or a marker saying it did not refuse.
+
+        NOT ``drive`` + ``contains``: ``drive`` wraps a raise as
+        ``"<raised ...>"`` and ``contains`` REJECTS that marker on purpose, so
+        every assertion about a refusal's wording would have come back False
+        whatever the message said -- five checks that can only fail. Measured:
+        the first version of this block did exactly that and reported four
+        failures against a message that carried every string it asked for.
+        """
+        try:
+            _rh.load_run(run_dir, field)
+        except _rh.RagasRefusal as exc:
+            return str(exc)
+        return "<did not refuse>"
+
+    _REFUSAL = drive(lambda: _refusal_message(_PRE_1_5_0))
+    check("an artifact with no assessment_draft REFUSES rather than falling "
+          "back to the composed assessment",
+          _REFUSAL != "<did not refuse>" and not raised(_REFUSAL), True)
+    check("...and the refusal names the field that was missing",
+          contains(_REFUSAL, "assessment_draft"), True)
+    check("...and how many verdicts lacked it, out of how many",
+          contains(_REFUSAL, "2 of 2 verdict(s)"), True)
+    check("...and names the offending verdicts rather than only counting them",
+          contains(_REFUSAL, "patient-1/NCT00000001"), True)
+    check("...and states the policy, so the reader is not left to infer that "
+          "a fallback would have been wrong",
+          contains(_REFUSAL, "never a fallback"), True)
+
+    # NON-DEGENERACY: the helper must be able to report "no refusal", or every
+    # assertion above would also hold for a loader that refuses nothing.
+    check("CONTROL: the same helper reports a NON-refusal as such",
+          drive(lambda: _refusal_message(_BOTH)), "<did not refuse>")
+
+    # CODED, so a caller can branch on it rather than matching prose.
+    def _refusal_code(run_dir):
+        try:
+            _rh.load_run(run_dir, _rh.RESPONSE_FIELD_DRAFT)
+        except _rh.RagasRefusal as exc:
+            return exc.code
+        return None
+
+    check("the refusal carries its own code",
+          drive(lambda: _refusal_code(_PRE_1_5_0)), "response_field_missing")
+
+    # THE CONTROL THAT MATTERS: the same artifact, at the default field, loads
+    # fine. Without it, "it refused" would also be satisfied by a loader that
+    # refuses everything.
+    _PRE_AT_DEFAULT = drive(lambda: _rh.load_run(_PRE_1_5_0))
+    check("CONTROL: the same artifact loads at the default field -- so the "
+          "refusal is about the missing key, not about the artifact",
+          drive(lambda: len(_PRE_AT_DEFAULT.generation)), 2)
+
+    # AN EMPTY VALUE IS NOT A MISSING KEY. It is one trial with no text: a
+    # recorded problem and no sample, which is what the harness already did.
+    # Collapsing the two would let a whole pre-1.5.0 artifact read as "126
+    # empty assessments", score nothing, and exit 0.
+    _EMPTY = _write_run(
+        os.path.join(_TMP, "empty"),
+        [_verdict("NCT00000001", assessment_draft="  "),
+         _verdict("NCT00000002")]
+    )
+    _EMPTY_RUN = drive(lambda: _rh.load_run(_EMPTY, _rh.RESPONSE_FIELD_DRAFT))
+    check("a field that is PRESENT but empty is a recorded problem, not a "
+          "refusal -- an absent key and an empty value are different facts",
+          drive(lambda: (raised(_EMPTY_RUN), len(_EMPTY_RUN.generation))),
+          (False, 1))
+    check("...and the problem names the field that was empty",
+          drive(lambda: any("empty assessment_draft" in p
+                            for p in _EMPTY_RUN.problems)), True)
+
+    # AN UNKNOWN FIELD BLAMES THE COMMAND LINE, NOT THE ARTIFACT. Without this
+    # a typo would read as absent on every verdict and refuse with a message
+    # accusing the run directory.
+    def _unknown_code(field):
+        try:
+            _rh.load_run(_BOTH, field)
+        except _rh.RagasRefusal as exc:
+            return exc.code
+        return None
+
+    check("an unknown response field is its own refusal, blaming the argument",
+          drive(lambda: _unknown_code("assesment")),  # sic: a typo
+          "response_field_unknown")
+    control("a real field is not reported as unknown", _unknown_code,
+            _rh.RESPONSE_FIELD_DRAFT)
+
+    # --------------------------------------------------------------------
+    # 9c. THE CENSUS: THE POPULATION A DRAFT FIGURE IS READ OVER
+    # --------------------------------------------------------------------
+    # A verdict whose composed assessment is byte-identical to its draft is a
+    # kept-text class, and the two figures cannot differ for it. Counted while
+    # the record is open so the denominator behind any draft-side claim has one
+    # provenance rather than coming from a side script.
+    _MIXED = _write_run(
+        os.path.join(_TMP, "mixed"),
+        [_verdict("NCT00000001"),
+         _verdict("NCT00000002", assessment_draft="NCT00000002 COMPOSED: "
+                                                  "criterion quoted verbatim.",
+                  assessment="NCT00000002 COMPOSED: criterion quoted "
+                             "verbatim."),
+         _verdict("NCT00000003")]
+    )
+    _CENSUS = drive(lambda: _rh.load_run(_MIXED).field_census)
+    check("the census counts verdicts carrying both fields, split into "
+          "byte-identical and differing",
+          _CENSUS, {"verdicts_seen": 3, "both_fields_present": 3,
+                    "identical": 1, "differing": 2})
+
+    def _census_is_degenerate(census):
+        return census.get("identical", 0) + census.get("differing", 0) == 0
+
+    control("a census that counted nothing is not accepted as a measurement",
+            _census_is_degenerate, _CENSUS)
+
+    check("...and it reaches the manifest, so the denominator travels with "
+          "the figure",
+          drive(lambda: _rh.build_manifest(
+              _rh.load_run(_MIXED), _SUMMARY, {}, _Args(), 0.0, "0.4.3",
+              _PLAN, _ACTIVE, None, _STAMP)["response_field_census"]),
+          {"verdicts_seen": 3, "both_fields_present": 3, "identical": 1,
+           "differing": 2})
+
+    # --------------------------------------------------------------------
+    # 9d. OUTPUTS ARE NAMED AFTER THE FIELD AND CANNOT OVERWRITE EACH OTHER
+    # --------------------------------------------------------------------
+    _OUT = os.path.join(_TMP, "out")
+    _DEFAULT_PATHS = drive(lambda: _rh.output_paths(_OUT))
+    _DRAFT_PATHS = drive(lambda: _rh.output_paths(_OUT,
+                                                  _rh.RESPONSE_FIELD_DRAFT))
+
+    check("the DEFAULT field keeps the historical filenames, so the two "
+          "schema-1 manifests already on disk and superseded_record's lookup "
+          "of ragas/ragas_results.json still resolve",
+          drive(lambda: [os.path.basename(p) for p in _DEFAULT_PATHS]),
+          ["ragas_results.json", "ragas_manifest.json"])
+    check("a non-default field takes a suffix naming it",
+          drive(lambda: [os.path.basename(p) for p in _DRAFT_PATHS]),
+          ["ragas_results__assessment_draft.json",
+           "ragas_manifest__assessment_draft.json"])
+
+    def _paths_are_distinct(pair):
+        """True when two passes share no output path, so neither can replace
+        the other. Phrased positively because ``control()`` requires the SAME
+        predicate to come back False on a broken input -- a detector returning
+        True on collision would make its own control read as a failure."""
+        return not (set(pair[0]) & set(pair[1]))
+
+    check("two passes over one directory therefore share NO output path -- "
+          "write_json replaces, so this is what stops one pass destroying the "
+          "other's measurement",
+          drive(lambda: _paths_are_distinct((_DEFAULT_PATHS, _DRAFT_PATHS))),
+          True)
+    control("two passes at the SAME field are not reported as distinct -- so "
+            "the check above is about the naming rule and not about set() "
+            "arithmetic that can never intersect",
+            _paths_are_distinct, (_DEFAULT_PATHS, _DEFAULT_PATHS))
+
+    # THE SAME-PASS CASE, which naming cannot solve: re-running a pass replaces
+    # a result that cost money and is not reproducible sample to sample.
+    os.makedirs(_OUT, exist_ok=True)
+    check("nothing on disk means nothing to refuse",
+          drive(lambda: _rh.existing_outputs(_OUT)), [])
+    with io.open(_DEFAULT_PATHS[0], "w", encoding="utf-8") as _fh:
+        _fh.write("{}")
+    check("an existing result for THIS field is reported so main() can refuse "
+          "before spending",
+          drive(lambda: [os.path.basename(p)
+                         for p in _rh.existing_outputs(_OUT)]),
+          ["ragas_results.json"])
+    check("CONTROL: the OTHER field is unaffected by it -- the draft pass is "
+          "not blocked by the assessment pass's output",
+          drive(lambda: _rh.existing_outputs(_OUT,
+                                             _rh.RESPONSE_FIELD_DRAFT)), [])
+
+    # --------------------------------------------------------------------
+    # 9e. THE MANIFEST'S response_field IS CHECKED, NOT MERELY CLAIMED
+    # --------------------------------------------------------------------
+    _DRAFT_MANIFEST = drive(lambda: _rh.build_manifest(
+        _AS_DRAFT, _SUMMARY, {}, _Args(), 0.0, "0.4.3", _PLAN, _ACTIVE, None,
+        _STAMP))
+    check("the manifest records the field the SAMPLES were built from",
+          field(_DRAFT_MANIFEST, "response_field"), "assessment_draft")
+    check("...and carries the note saying what a figure over it means",
+          contains(field(_DRAFT_MANIFEST, "response_field_note"),
+                   "measures the MODEL"), True)
+    check("...while the default's note says the opposite, so a reader cannot "
+          "mistake a renderer figure for a model figure",
+          contains(field(drive(lambda: _rh.build_manifest(
+              _AS_DEFAULT, _SUMMARY, {}, _Args(), 0.0, "0.4.3", _PLAN,
+              _ACTIVE, None, _STAMP)), "response_field_note"),
+              "measures the RENDERER"), True)
+
+    # THE POST-CHECK. A manifest field is a claim; this is what makes it a
+    # checked fact. A silent fallback would land here as a mixture.
+    def _provenance_failures(run):
+        return [f for f in _rh.post_checks(
+            run, [], _DEFAULT_PATHS[0], _DEFAULT_PATHS[1], _OUT, {})
+            if f.startswith("provenance:")]
+
+    check("a run whose samples all match the declared field raises no "
+          "provenance failure",
+          drive(lambda: _provenance_failures(_AS_DRAFT)), [])
+
+    _MIXTURE = drive(lambda: _rh.RunInput(
+        _AS_DRAFT.run_dir, {}, list(_AS_DRAFT.retrieval),
+        list(_AS_DRAFT.generation) + list(_AS_DEFAULT.generation), [],
+        _rh.RESPONSE_FIELD_DRAFT, {}))
+    _MIXED_FAILURES = drive(lambda: _provenance_failures(_MIXTURE))
+    check("a MIXTURE of the two fields under one declared name is a named "
+          "post-check failure -- this is the shape a silent fallback takes",
+          drive(lambda: len(_MIXED_FAILURES)), 1)
+    check("...and the failure names both the declared field and the intruder",
+          drive(lambda: ("assessment_draft" in _MIXED_FAILURES[0]
+                         and "'assessment'" in _MIXED_FAILURES[0])), True)
+
+    # --------------------------------------------------------------------
+    # 9f. THE MATCH COUNT IS NOT RECOVERED FROM THE TEXT
+    # --------------------------------------------------------------------
+    # The dry run used to derive it as len(response.splitlines()), true only
+    # while no scored field contains a newline. Measured on the real run: 0 of
+    # 126 assessments carry one -- and assessment_draft is free model prose, so
+    # making the field selectable made this reachable on real data.
+    _NEWLINE = _write_run(
+        os.path.join(_TMP, "newline"),
+        [_verdict("NCT00000001", assessment_draft="line one\nline two\nthree"),
+         _verdict("NCT00000002", eligible="not_eligible",
+                  verdict_group="near_misses")]
+    )
+    _NL_RUN = drive(lambda: _rh.load_run(_NEWLINE, _rh.RESPONSE_FIELD_DRAFT))
+    check("exactly one of the two trials was verdicted eligible, so the "
+          "match count is 1 however many newlines its text carries",
+          drive(lambda: _NL_RUN.retrieval[0].matched_count), 1)
+
+    def _count_from_text(run):
+        """The superseded derivation, run on the same sample."""
+        return len(run.retrieval[0].response.splitlines())
+
+    check("CONTROL: the superseded splitlines() derivation gets it wrong on "
+          "this very sample, which is why the count is carried rather than "
+          "recovered",
+          drive(lambda: _count_from_text(_NL_RUN)), 3)
+
+finally:
+    shutil.rmtree(_TMP, ignore_errors=True)
+
+check("the temporary tree this section wrote in was removed",
+      os.path.exists(_TMP), False)
+
+
+# ===========================================================================
 # SUMMARY
 # ===========================================================================
 

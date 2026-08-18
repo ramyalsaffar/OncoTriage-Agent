@@ -90,7 +90,22 @@ narwhals==2.24.0
 nest-asyncio==1.6.0
 networkx==3.6.1
 numpy==2.1.3
--e git+https://github.com/ramyalsaffar/03--Code.git@b481fde477bdf04c6967ff0b80e85135bd9e3c57#egg=oncotriage
+# oncotriage itself is installed EDITABLE from this repository and is
+# deliberately NOT pinned here. pip freeze wrote it as
+# `-e git+https://github.com/...@<commit>#egg=oncotriage`, which made
+# this file (a) go stale on every commit -- it named b481fde while the
+# venv held 336ec1a, so a freeze diff reported drift that was not a
+# dependency change -- and (b) uninstallable offline, since
+# `pip install -r` against it would clone from GitHub rather than use
+# the working tree. Recreate the environment with:
+#     python -m venv '09- Testing/ragas-venv'
+#     '09- Testing/ragas-venv/bin/pip' install -r requirements-ragas.lock.txt
+#     '09- Testing/ragas-venv/bin/pip' install -e .
+# The third-party pins below are what decides what a score MEANS; see
+# ENVIRONMENT_PACKAGES in oncotriage/evaluation/ragas_harness.py, and
+# note that every run stamps its own versions into ragas_manifest.json
+# independently of this file -- a lockfile can be ignored, a recorded
+# version cannot be absent.
 onnxruntime==1.28.0
 openai==1.99.9
 opentelemetry-api==1.44.0
