@@ -1117,11 +1117,68 @@ def build_metrics(llm, embeddings, selected=ALL_METRICS):
 # Only used by --dry-run, and only for the token figures it labels as
 # estimates. Nothing that is actually spent is computed from these.
 CHARS_PER_TOKEN = 3.6
+
+# CALIBRATED AGAINST TWO MEASURED RUNS OVER eval_run_20260817_195423 (1.9.0),
+# 2026-08-17. Before this, the dry run was wrong in the same direction on both
+# metrics and by enough to make a spend gate useless: context precision came in
+# at 1.30x its midpoint and faithfulness at 1.83x, over even the high bound of
+# its own range.
+#
+# THE INPUT MISS IS ONE CAUSE AND IT IS SHARED. The old estimate counted only
+# the text this harness supplies, and named what it was leaving out ("exclude
+# Ragas' prompt-template overhead and few-shot examples") without pricing it.
+# Measured, that omission is nearly the same size per call on two structurally
+# different metrics -- 2,062 tokens/call on context precision and 1,797 on
+# faithfulness -- because it is dominated by a fixed instruction block and
+# few-shot examples rather than by anything about the sample. So it is ONE
+# constant applied per judge call, not a per-metric fudge factor.
+PROMPT_TEMPLATE_TOKENS_PER_CALL = 1900
+"""Ragas' own instruction block and few-shot examples, per judge call.
+
+Measured at 2,062 (context precision) and 1,797 (faithfulness); 1900 sits
+between them. It is deliberately NOT tuned to reproduce either exactly -- one
+number that is slightly wrong for both is honest about being a constant, where
+two numbers fitted per metric would be a curve drawn through two points and read
+as precision this has not got.
+"""
+
+# THE OUTPUT MISS HAS TWO DIFFERENT CAUSES, so it has two different fixes.
+#
+# Context precision emits one {reason, verdict} per context and the reason is
+# short and roughly fixed, so a flat per-call constant is the RIGHT SHAPE and
+# only the number was wrong: 120 modelled against 201 measured.
+#
+# Faithfulness is the one that was structurally wrong. It emits the extracted
+# STATEMENTS on the first call and one {statement, reason, verdict} on the
+# second -- both proportional to how much text there is to decompose -- so a
+# flat per-call constant cannot track the response at all. That is not academic
+# here: the composed `assessment` and the model's `assessment_draft` over the
+# same run differ by 3.6x in length (142,358 vs 39,511 characters), and a flat
+# constant prices those two passes identically. See ESTIMATED_OUTPUT_PER_RESPONSE_TOKEN.
 ESTIMATED_OUTPUT_TOKENS = {
-    METRIC_CONTEXT_PRECISION: 120,   # a short reason plus a 0/1 verdict
-    METRIC_FAITHFULNESS: 400,        # statements, then a verdict per statement
-    METRIC_RESPONSE_RELEVANCY: 60,   # one question plus a flag
+    METRIC_CONTEXT_PRECISION: 201,   # a short reason plus a 0/1 verdict; MEASURED
+    METRIC_RESPONSE_RELEVANCY: 60,   # one question plus a flag; NOT calibrated --
+                                     # this metric has not been re-measured since
+                                     # the constants were first guessed, and it is
+                                     # named here rather than left to look measured
 }
+
+ESTIMATED_OUTPUT_PER_RESPONSE_TOKEN = {
+    METRIC_FAITHFULNESS: 5.221,
+}
+"""Output tokens per token of RESPONSE, for metrics that decompose the response.
+
+Calibrated from one run: 206,463 output tokens (measured, scaled from 237
+billed calls to the 252 planned) over 39,544 response tokens. The ratio exceeds
+1 because each extracted statement comes back a second time inside an NLI
+verdict object carrying a prose reason.
+
+ONE CALIBRATION POINT IS NOT A CURVE, and the estimate range around it
+(ESTIMATE_LOW/ESTIMATE_HIGH) is what carries that uncertainty. What the model
+buys over the flat constant is not precision, it is the right SHAPE: it moves
+when the scored text moves, which is the only reason the two faithfulness
+passes over one run get different prices.
+"""
 # The dry run reports a RANGE rather than a number, because the input estimate
 # is characters-per-token and the output estimate is a constant. Both bounds
 # are printed so nobody reads the midpoint as a measurement.
@@ -1203,9 +1260,33 @@ def estimate_tokens(run, active):
     per_metric[METRIC_RESPONSE_RELEVANCY] = sum(
         len(s.response) * RELEVANCY_STRICTNESS for s in run.generation)
 
+    # THE PROMPT TEMPLATE IS PART OF THE INPUT AND USED TO BE LEFT OUT. It is
+    # priced per JUDGE CALL rather than per sample, because that is the unit it
+    # is sent in -- context precision issues one call per context and
+    # faithfulness two per sample, so a per-sample overhead would be wrong by
+    # the fan-out factor on both.
+    plan = plan_calls(run, active)
     selected = {m for metrics in active.values() for m in metrics}
-    return {name: int(value / CHARS_PER_TOKEN)
+    return {name: int(value / CHARS_PER_TOKEN
+                      + plan[name]["judge_calls"]
+                      * PROMPT_TEMPLATE_TOKENS_PER_CALL)
             for name, value in per_metric.items() if name in selected}
+
+
+def estimate_output_tokens(metric, judge_calls, run):
+    """Estimated output tokens for one metric, by the shape that metric has.
+
+    Two shapes, and which one applies is a fact about the metric rather than a
+    tuning choice: a metric that emits a fixed-size object per call is priced
+    per call, and one that DECOMPOSES the response is priced against the
+    response. Faithfulness is the second kind, which is why the composed
+    assessment and the model's draft over the same run are not the same price.
+    """
+    per_response = ESTIMATED_OUTPUT_PER_RESPONSE_TOKEN.get(metric)
+    if per_response is not None:
+        response_chars = sum(len(s.response) for s in run.generation)
+        return int(per_response * response_chars / CHARS_PER_TOKEN)
+    return judge_calls * ESTIMATED_OUTPUT_TOKENS[metric]
 
 
 def price_plan(run, judge_model, embedding_model, active):
@@ -1222,7 +1303,7 @@ def price_plan(run, judge_model, embedding_model, active):
         if entry is None:
             continue
         tokens_in = input_tokens[name]
-        tokens_out = entry["judge_calls"] * ESTIMATED_OUTPUT_TOKENS[name]
+        tokens_out = estimate_output_tokens(name, entry["judge_calls"], run)
         usd = tokens_in * judge["input"] + tokens_out * judge["output"]
         # Relevancy embeds one question and `strictness` generated ones; the
         # generated text is not known before the run, so the embedded volume is
@@ -1257,10 +1338,18 @@ def price_plan(run, judge_model, embedding_model, active):
             "counted here (measured: 756 planned, 758 billed). Token figures "
             "are estimated at "
             f"{CHARS_PER_TOKEN} chars/token over the exact text to be sent, "
-            "exclude Ragas' prompt-template overhead and few-shot examples, "
-            "and use a constant for output length. Treat the range as an "
-            "order of magnitude, and the smoke run's MEASURED cost as the "
-            "number to project from."),
+            f"plus {PROMPT_TEMPLATE_TOKENS_PER_CALL} tokens per judge call for "
+            "Ragas' own instruction block and few-shot examples, which were "
+            "previously excluded and are the single largest term the estimate "
+            "used to miss. Output is priced per call for metrics that emit a "
+            "fixed-size object, and against the RESPONSE LENGTH for metrics "
+            "that decompose the response (faithfulness), so scoring a short "
+            "field and a long one over the same run are not priced the same. "
+            "All three constants are CALIBRATED FROM ONE RUN "
+            "(eval_run_20260817_195423, 2026-08-17); response relevancy's "
+            "output constant is NOT calibrated and is still the original "
+            "guess. Treat the range as an order of magnitude, and a completed "
+            "pass's MEASURED cost as the number to project from."),
     }
 
 

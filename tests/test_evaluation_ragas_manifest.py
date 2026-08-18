@@ -1193,6 +1193,218 @@ check("the temporary tree this section wrote in was removed",
 
 
 # ===========================================================================
+# SECTION 10: THE COST ESTIMATE HAS THE RIGHT SHAPE, NOT JUST THE RIGHT SIZE
+# ===========================================================================
+# WHY. A spend gate is set as a multiple of the dry-run estimate, so an
+# estimate that is wrong by a factor makes the gate arbitrary. Measured on
+# eval_run_20260817_195423: context precision came in at 1.30x its midpoint and
+# faithfulness at 1.83x -- over even the HIGH bound of its own printed range.
+#
+# TWO CAUSES, AND ONLY ONE OF THEM WAS A WRONG NUMBER.
+#
+#   a. INPUT, shared by every metric: Ragas' own instruction block and few-shot
+#      examples were named as excluded and never priced. Measured at 2,062
+#      tokens/call (context precision) and 1,797 (faithfulness) -- nearly equal
+#      across two structurally different metrics, which is what says it is a
+#      fixed template rather than anything about the sample.
+#   b. OUTPUT, faithfulness only, and this one was the wrong SHAPE. Faithfulness
+#      decomposes the response into statements and then emits a verdict object
+#      per statement, so its output tracks the RESPONSE LENGTH. A flat per-call
+#      constant cannot, and it prices `assessment` and `assessment_draft` over
+#      one run identically although they differ by 3.6x in length. That is the
+#      defect this section mainly exists to hold: the size error would show up
+#      as a bad estimate, but the SHAPE error shows up as two passes that are
+#      genuinely different prices being quoted the same.
+#
+# Everything below is arithmetic over literal samples. No run directory is
+# read, nothing is written, and no judge is called.
+
+print()
+print("=" * 70)
+print("Section 10: the cost estimate's shape")
+print("=" * 70)
+
+
+def _sample(response, contexts=("ctx-a", "ctx-b")):
+    return _rh.GenerationSample("p1", "NCT1", "question?", list(contexts),
+                                response, "eligible", "matches")
+
+
+def _run_with(response, n=4, contexts=("ctx-a", "ctx-b")):
+    """A RunInput whose generation set is n copies of one response."""
+    return _rh.RunInput("/nonexistent", {}, [],
+                        [_sample(response, contexts) for _ in range(n)], [])
+
+
+_SHORT = _run_with("x" * 360, n=4)      # 100 response tokens each
+_LONG = _run_with("x" * 3600, n=4)      # 1000 response tokens each
+
+# --------------------------------------------------------------------
+# 10a. FAITHFULNESS OUTPUT TRACKS THE RESPONSE, NOT THE CALL COUNT
+# --------------------------------------------------------------------
+_OUT_SHORT = drive(lambda: _rh.estimate_output_tokens(
+    _rh.METRIC_FAITHFULNESS, 8, _SHORT))
+_OUT_LONG = drive(lambda: _rh.estimate_output_tokens(
+    _rh.METRIC_FAITHFULNESS, 8, _LONG))
+
+check("faithfulness output is priced against the response length",
+      _OUT_SHORT, int(5.221 * 4 * 360 / _rh.CHARS_PER_TOKEN))
+check("...so a 10x longer response is ~10x the output estimate, at the SAME "
+      "call count -- the flat constant this replaced could not move at all",
+      drive(lambda: round(_OUT_LONG / _OUT_SHORT, 2)), 10.0)
+
+
+def _output_moves_with_response(pair):
+    """True when two runs differing ONLY in response length price differently."""
+    short, long_ = pair
+    return (_rh.estimate_output_tokens(_rh.METRIC_FAITHFULNESS, 8, short)
+            != _rh.estimate_output_tokens(_rh.METRIC_FAITHFULNESS, 8, long_))
+
+
+check("CONTROL-shaped positive: it does move for faithfulness",
+      drive(lambda: _output_moves_with_response((_SHORT, _LONG))), True)
+
+
+def _cp_output_moves_with_response(pair):
+    short, long_ = pair
+    return (_rh.estimate_output_tokens(_rh.METRIC_CONTEXT_PRECISION, 8, short)
+            != _rh.estimate_output_tokens(_rh.METRIC_CONTEXT_PRECISION, 8,
+                                          long_))
+
+
+# CONTEXT PRECISION MUST *NOT* MOVE WITH THE RESPONSE, and that is a fact about
+# the metric rather than an omission: it emits one short {reason, verdict} per
+# context whatever the answer says. Without this the section would read as
+# "response-proportional is always better".
+control("context precision output does NOT track the response -- it emits a "
+        "fixed-size object per call, so a flat constant is the right shape "
+        "there and was only the wrong number",
+        _cp_output_moves_with_response, (_SHORT, _LONG))
+
+check("context precision output is the flat per-call constant, at its "
+      "MEASURED value rather than the original guess of 120",
+      drive(lambda: _rh.estimate_output_tokens(
+          _rh.METRIC_CONTEXT_PRECISION, 8, _SHORT)),
+      8 * 201)
+check("...and that constant is what the table says it is",
+      field(_rh.ESTIMATED_OUTPUT_TOKENS, _rh.METRIC_CONTEXT_PRECISION), 201)
+
+# THE UNCALIBRATED ONE IS NAMED. response_relevancy was not re-measured, so its
+# constant is still the original guess; pinning it here means a future pass that
+# calibrates it has to come back and say so rather than leaving two constants
+# that look equally trustworthy.
+check("response relevancy's output constant is UNCHANGED and still the "
+      "original uncalibrated guess",
+      field(_rh.ESTIMATED_OUTPUT_TOKENS, _rh.METRIC_RESPONSE_RELEVANCY), 60)
+check("...and faithfulness is absent from the flat table entirely, so nothing "
+      "can quietly fall back to a per-call constant for it",
+      _rh.METRIC_FAITHFULNESS in _rh.ESTIMATED_OUTPUT_TOKENS, False)
+
+# --------------------------------------------------------------------
+# 10b. THE TEMPLATE OVERHEAD IS PRICED PER CALL, NOT PER SAMPLE
+# --------------------------------------------------------------------
+# The fan-out differs per metric -- context precision issues one call per
+# CONTEXT and faithfulness two per SAMPLE -- so a per-sample overhead would be
+# wrong by that factor on both.
+_FAITH_ACTIVE = _rh.active_dataset_metrics([_rh.METRIC_FAITHFULNESS])
+_IN = drive(lambda: _rh.estimate_tokens(_SHORT, _FAITH_ACTIVE))
+_TEXT_ONLY = int(sum(len(s.user_input) + len(s.response)
+                     + sum(len(c) for c in s.retrieved_contexts)
+                     for s in _SHORT.generation) / _rh.CHARS_PER_TOKEN)
+
+check("the input estimate now carries the template overhead, priced at "
+      "judge_calls x the constant (4 samples -> 8 faithfulness calls)",
+      field(_IN, _rh.METRIC_FAITHFULNESS),
+      _TEXT_ONLY + 8 * _rh.PROMPT_TEMPLATE_TOKENS_PER_CALL)
+
+
+def _includes_template(tokens):
+    """True when the estimate exceeds the bare text it is built from."""
+    return tokens.get(_rh.METRIC_FAITHFULNESS, 0) > _TEXT_ONLY
+
+
+control("an estimate of the bare text alone -- what shipped before -- is NOT "
+        "reported as carrying the overhead",
+        _includes_template, {_rh.METRIC_FAITHFULNESS: _TEXT_ONLY})
+
+# THE FAN-OUT CHECK. Context precision over 1 patient with 5 contexts is 5
+# calls, so its overhead is 5x the constant and NOT 1x. A per-sample model
+# would give 1x and pass every other check in this section.
+_CP_RUN = _rh.RunInput(
+    "/nonexistent", {},
+    [_rh.RetrievalSample("p1", "summary", ["c1", "c2", "c3", "c4", "c5"],
+                         "NCT1: assessed", matched_count=1)],
+    [], [])
+_CP_ACTIVE = _rh.active_dataset_metrics([_rh.METRIC_CONTEXT_PRECISION])
+_CP_IN = drive(lambda: _rh.estimate_tokens(_CP_RUN, _CP_ACTIVE))
+_CP_TEXT = int((len("summary") + len("NCT1: assessed")) * 5
+               + sum(len(c) for c in ["c1", "c2", "c3", "c4", "c5"]))
+check("context precision's overhead is priced over its CONTEXT fan-out (5 "
+      "calls for 1 sample), not once per sample",
+      field(_CP_IN, _rh.METRIC_CONTEXT_PRECISION),
+      int(_CP_TEXT / _rh.CHARS_PER_TOKEN)
+      + 5 * _rh.PROMPT_TEMPLATE_TOKENS_PER_CALL)
+
+
+def _overhead_is_per_sample(tokens):
+    """The per-SAMPLE model, which this check exists to exclude."""
+    return tokens.get(_rh.METRIC_CONTEXT_PRECISION) == (
+        int(_CP_TEXT / _rh.CHARS_PER_TOKEN)
+        + 1 * _rh.PROMPT_TEMPLATE_TOKENS_PER_CALL)
+
+
+control("a per-SAMPLE overhead is not what the estimator produces",
+        _overhead_is_per_sample, _CP_IN)
+
+# --------------------------------------------------------------------
+# 10c. THE POINT OF ALL OF IT: TWO FIELDS, TWO PRICES
+# --------------------------------------------------------------------
+# A run whose two candidate response fields differ in length must be priced
+# differently for faithfulness. Under the flat constant these two were
+# identical, which is what made the pass-3 budget wrong before it was measured.
+_COMPOSED = _run_with("c" * 3600, n=4)
+_DRAFT = _run_with("d" * 1000, n=4)
+
+
+def _prices_differ(pair):
+    a, b = pair
+    return (_rh.price_plan(a, "claude-sonnet-4-6", "text-embedding-3-small",
+                           _FAITH_ACTIVE)["estimated_usd_midpoint"]
+            != _rh.price_plan(b, "claude-sonnet-4-6",
+                              "text-embedding-3-small",
+                              _FAITH_ACTIVE)["estimated_usd_midpoint"])
+
+
+check("scoring a long field and a short field over one run are priced "
+      "DIFFERENTLY -- the whole reason the shape had to change",
+      drive(lambda: _prices_differ((_COMPOSED, _DRAFT))), True)
+control("two runs with the SAME response length are priced the same, so the "
+        "check above is about the response and not about run identity",
+        _prices_differ, (_COMPOSED, _run_with("z" * 3600, n=4)))
+
+_CAVEAT = drive(lambda: _rh.price_plan(
+    _COMPOSED, "claude-sonnet-4-6", "text-embedding-3-small",
+    _FAITH_ACTIVE)["estimate_caveat"])
+check("the printed caveat stops claiming the template overhead is excluded",
+      contains(_CAVEAT, "previously excluded"), True)
+# AND IT STATES THE NUMBER, NOT ONLY THAT THERE IS ONE. Measured, not assumed:
+# the first version of this block asserted only the prose above, and a revert
+# that replaced the interpolated constant with "plus nothing at all for" left
+# every check here passing -- a caveat contradicting itself in one sentence,
+# reported as correct. An operator reading a plan sets a spend gate off this
+# number, so the number is the part that has to be there.
+check("...and states the per-call figure it is now pricing, so the sentence "
+      "cannot contradict itself while still reading as fixed",
+      contains(_CAVEAT, f"plus {_rh.PROMPT_TEMPLATE_TOKENS_PER_CALL} tokens "
+                        f"per judge call"), True)
+check("...and says the constants are calibrated from ONE run",
+      contains(_CAVEAT, "CALIBRATED FROM ONE RUN"), True)
+check("...and names the metric whose constant is still a guess, so the two "
+      "are not read as equally trustworthy",
+      contains(_CAVEAT, "response relevancy's"), True)
+
+
+# ===========================================================================
 # SUMMARY
 # ===========================================================================
 
