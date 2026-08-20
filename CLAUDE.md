@@ -78,8 +78,8 @@ the same selector).
 
 **WHAT ENFORCES ALL OF THIS.** `tests/test_package_invariants.py` **section 1c**
 scans every `.py` in the repository for a call to `exec_chain`, a call to
-`exec()` outside a **closed five-member argued allowlist** (two exec git blobs,
-three exec a patched in-memory copy — see the rule below), or a by-location
+`exec()` outside a **closed argued allowlist** (some members exec git blobs,
+most exec a patched in-memory copy — see the rule below), or a by-location
 module load — **re-parsing string literals as Python** so that
 `ns["exec_chain"](...)` hidden in a subprocess probe is caught and so that prose
 about the exec chain is not. Six planted controls, each fired. **Section 5**
@@ -308,7 +308,7 @@ The rules, in force and enforced:
   **`oncotriage/fhir/explore.py` imports matplotlib, seaborn and pandas at module scope** and that is the one deliberate exception, with **`oncotriage/ablation/figures.py`** the second: seven of explore's twelve functions plot and all nine of figures' do, and section 2 pre-imports those three before arming its traps — the same allowance it makes for openai, qdrant_client, numpy and langgraph. **Pass 20f-4 moved the second exception out of `analysis.py`**, which was 1,976 lines with 24 top-level definitions of which nine touched `plt`; it is 1,503 lines and imports no plotting library now. That does **not** make importing `analysis` matplotlib-free — `main()` calls all nine, so `analysis` imports `figures` at module scope and check 1b forbids deferring it — it makes the exception 495 lines wide instead of 1,976, and it lets anything that wants the statistics without the figures import `ablation.common` and the statistics functions directly.
   The `glob` in `paths` was the one exception until pass 20c-2b, and pass 20c-2c found that the fix had a hole: `oncotriage/registries/mesh.py` still wrote `from oncotriage.paths import data_MeSH_path` at module scope, and a `from X import name` is an **attribute read**, so it fired the lazy resolver — meaning importing the *agent* globbed the whole sibling tree and raised on any machine without it. Check 2c now imports **every** package module in its own subprocess with the root pointed at a directory that does not exist. Note that no `open` trap could ever have caught this: `glob.glob` uses `os.scandir`.
   **The same trap applies to a numbered entry point's module scope**, which is why `07- FHIR Parser.py`, `09- MeSH Cancer Site Relevance Filter.py`, `13- LangGraph Agent.py` and `20- Drift Detection.py` import their lazy paths INSIDE the `__main__` guard.
-- **Nothing calls `exec_chain`, calls `exec()`, or loads a module by location.** `exec_chain` no longer exists. The allowed `exec()`s live in a **closed five-member allowlist**, each entry argued at `_EXEC_ALLOWLIST` in `tests/test_package_invariants.py` and each checked for staleness (an entry whose file no longer execs anything fails). **This note said "one" through three additions and was wrong by four**; the members are `tests/test_storage_query_layer.py` and `tests/test_indexer_admission_filters.py`, which unparse pre-fix code out of a **git blob** so their negative controls run what actually shipped, and `tests/test_observability_logging.py`, `tests/test_extraction_histology.py` and `tests/test_agent_age_units_and_sex_filter.py`, which exec a **patched in-memory copy** of a shipped module to plant a defect their controls then require to fire. The two shapes are not interchangeable: git is right for code that was REPLACED, and a patched copy is right for a fix that is AT HEAD, where a git blob would compare the fixed module with itself. Section 1c enforces all of it with six planted controls.
+- **Nothing calls `exec_chain`, calls `exec()`, or loads a module by location.** `exec_chain` no longer exists. The allowed `exec()`s live in a **closed allowlist**, each entry argued at `_EXEC_ALLOWLIST` in `tests/test_package_invariants.py` and each checked for staleness (an entry whose file no longer execs anything fails). **THE MEMBERSHIP IS NOT ENUMERATED HERE ANY MORE, AND THAT IS THE CORRECTION.** This note said "one", then "five", and was wrong by four the first time and by ten the second — a prose list of a set that grows every pass is a guaranteed staleness site, and it went stale three times. Read `_EXEC_ALLOWLIST` for the members and the argument beside each; it is the declaration the check actually enforces, so it cannot disagree with itself. Two shapes are in it: files that unparse pre-fix code out of a **git blob** so their negative controls run what actually shipped, and files that exec a **patched in-memory copy** of a shipped module to plant a defect their controls then require to fire. The two shapes are not interchangeable: git is right for code that was REPLACED, and a patched copy is right for a fix that is AT HEAD, where a git blob would compare the fixed module with itself. Section 1c enforces all of it with six planted controls.
 - **A numbered file must not import a package name at module scope that it never reads.** That is what a re-export IS, and it is the first half of rebuilding a shim. Section 5 scans for it with a planted control. One exemption, argued: `24- Airflow Manager.py` imports two names its byte-verbatim COMMENTED menu calls, and comments are invisible to an AST walk.
 - The three functions that used to read a value out of the shared namespace at call time — `get_model_cost`, `resolve_qdrant_collection`, `get_age_reference_date` — **took that value as an optional argument, and pass 20f-3 deleted all four parameters** (`pricing_config`, `client`, `collection_name`, `snapshot_date`). Re-measured by AST first: 29 call sites across the package, the entry points and the tests, not one passing any of them. **It is a behaviour change** — three public signatures narrowed, so an outside caller passing one now gets a `TypeError`. The one thing pass 20e said had to be settled first was `get_age_reference_date`'s docstring, which called its argument "the supported patch point"; it was not, and had not been since pass 20d-1 — `tests/test_fhir_birth_date_and_demographics.py` section 3 sets `config.DATA_SNAPSHOT_DATE`, which the function reads at **call** time. The private sentinel `_SNAPSHOT_NOT_SUPPLIED` went with the parameter.
 - `pip install -e .` from `03- Code/` makes the package importable from anywhere. Without it, each entry point's own six-line block puts the code directory on `sys.path` and prints that it did.
@@ -391,7 +391,7 @@ python tests/test_agent_mesh_boost_and_quality_gate.py             #  89 (was 54
 python tests/test_registries_mesh_pan_cancer_resolution.py         #  58
 python tests/test_registries_cancer_codes_and_stage_extraction.py  # 136
 python tests/test_agent_ablation_flag_passthrough.py               #  39
-python tests/test_storage_inference_logging_contract.py            #  79
+python tests/test_storage_inference_logging_contract.py            # 101 (was 79 when this line was written, then 98; the token-persistence pass added Test 2's three scoping/spread checks)
 python tests/test_agent_retrieval_observability.py                 # 103
 python tests/test_fhir_birth_date_and_demographics.py              # 172
 python tests/test_fhir_ecog_surfacing.py                           # 105; needs 04-'s scratch corpus
@@ -495,6 +495,25 @@ python tests/test_agent_patient_hash_coverage.py                    #  69
 # sys.modules['mlflow'], which drives the SHIPPED function because the import is
 # deferred into it. ~1.4 s.
 python tests/test_tracking_mlflow_index.py                          #  99
+
+# The token-persistence pass's BEHAVIOURAL half -- the structural half is
+# Test 2 of tests/test_storage_inference_logging_contract.py, and neither
+# replaces the other: an AST scan cannot see a value carried and then
+# serialized wrongly, and a round trip cannot see a return never written.
+# Same shape, same directory. No network, no keys, no spend, no live
+# Qdrant, no corpus, no git history, and NOT in the collision matrix (it
+# writes only inside a temp directory; the two package files it reads are
+# sha256-compared at the end). It DOES exec -- five controls plant into
+# in-memory copies of database_logger.py and evaluation.py, argued at
+# _EXEC_ALLOWLIST. Bucket A, <1 s against only the CI skeleton.
+python tests/test_storage_packing_and_cache_columns.py              # 124
+
+# Fixture state, CURRENT rather than as of any pass below: SCHEMA_VERSION
+# is 8, the twelve recordings on disk are v8, and `python fixture_replay.py`
+# is 12/12 clean with no recapture. Two accounts further down state
+# `SCHEMA_VERSION` is 3 and one states the recordings are unreadable; both
+# were true when written and are kept as written, per the rule that a
+# past-tense account keeps its wording.
 
 pip install -e .                                         # makes `oncotriage` importable anywhere
 ```
@@ -3428,6 +3447,15 @@ scrape-admission re-index (the same run that produced today's
 guard working. **Every pass that claims "12/12 clean without recapture" from
 here on has to re-capture first, or point the alias back.**
 
+> **CURRENT STATE, 2026-08-20 — that instruction has been discharged and is
+> left standing above as this pass's own conclusion rather than rewritten.**
+> The recapture happened. The twelve fixtures on disk are at the current
+> `SCHEMA_VERSION` and `python fixture_replay.py` is **12/12 clean, exit 0,
+> with no recapture**, measured on this date. A pass may claim it again —
+> and must, because that claim is what says the deterministic prefix did not
+> move. Read the fixture-state note in the test block near the top of this
+> file for the current schema number.
+
 What was proven instead, directly and without Qdrant: the **twelve fixture
 patients were looked up in the corpus by the patient_id stored on each
 fixture**, and Stage 4's `patient_stage` is **identical before and after for all
@@ -4133,6 +4161,16 @@ unreplayable for an unrelated reason (the alias moved past their pinned
 collection digest at the M-category pass), so no working gate was lost; the
 re-capture is scheduled separately and **no model call was made in this pass**.
 
+> **CURRENT STATE, 2026-08-20 — the scheduled re-capture happened, so the two
+> present-tense claims above ('the twelve recordings on disk are therefore
+> unreadable', 'the re-capture is scheduled separately') describe the tree as
+> this pass left it and not the tree today.** They are kept as written. The
+> recordings on disk are at the current `SCHEMA_VERSION`, `load_fixture()`
+> accepts them, and `python fixture_replay.py` is **12/12 clean, exit 0, with
+> no recapture**. The same applies to every earlier account that states
+> `SCHEMA_VERSION` is 3: true when written, superseded since, and left alone
+> because each is a premise of that pass's own byte-identity proof.
+
 **SIX HISTORICAL-RECORD SITES KEEP THE OLD NAME**, because renaming inside an
 account of a past defect makes it describe something that never happened. The
 rule applied: *a past-tense account keeps the old spelling when the thing it
@@ -4175,6 +4213,75 @@ either.
 `oncotriage/dashboard/` (thin entry point: `21- Streamlit Dashboard.py`) reads only from `inferences.db`, via the three `@st.cache_data(ttl=60)` loaders in `dashboard/data.py`. See "The dashboard (pass 20c-3c-1)" above.
 
 **Cost accounting fails loudly.** Costs come from `get_model_cost()` (`oncotriage/utils.py`) against `PRICING_CONFIG` in `oncotriage/config.py`, dated `last_updated`. A model absent from that table raises `UnknownModelPricingError` (a `RuntimeError` subclass — deliberately *not* a `KeyError`, so a stray `except KeyError` cannot eat it); it does not return 0.0, because a zero cost row is indistinguishable from a genuinely free run and every aggregate over the column silently under-reports. Both writers — `log_inference` (14) and `log_ablation_result` (26) — call it **before** their `try` block for exactly this reason: their broad `except` exists to keep a database failure from killing the pipeline, and an unpriced model is a config defect that must reach the caller instead. If you add a model, add its pricing first; never wrap `get_model_cost()` in a recovery path.
+
+**The Stage 5 packing and cache record — four columns, and NULL is never 0.**
+`llm_classifier_cached_input_tokens`, `llm_classifier_call_details`,
+`llm_classifier_packed_chunks` and `llm_classifier_packing` are written by
+Stage 5, carried by `_pipeline_provenance()` and stored through
+`INFERENCE_COLUMN_ADDITIONS`. They were measured and then **dropped at the
+write** for as long as the table declared no column for them — the writer
+stores the columns it declares and ignores the rest, silently, which is the
+same class of silent drop `TrialMatchState` has for undeclared channels.
+
+| column | NULL means | 0 / `[]` / `{}` means |
+|---|---|---|
+| `llm_classifier_cached_input_tokens` | no response of this run reported `prompt_tokens_details.cached_tokens` — a stub, a pre-field recording, a run that never reached Stage 5, or a run that ended at a failure return | a response DID report the field and reported zero: the provider cached nothing. That is the reading that says a prefix is not being reused |
+| `llm_classifier_call_details` | `node_llm_classifier_evaluation` was never entered. Stronger than the other three: Stage 5 writes this key on **every** return, failures included | `'[]'` — the node ran and no call produced a usage object (the first request raised). **An empty list is not a NULL**, which is why the INSERT tests `is not None` rather than truthiness |
+| `llm_classifier_packed_chunks` | the packer's record does not describe this run. Written on the **success return only**, on `hallucinated_trials`' convention: a chunk list is a plan, and a run that died at its first call must not publish the whole plan as though it had been sent | the packer ran and produced no chunk — an empty candidate set, not an absent packer |
+| `llm_classifier_packing` | as above | `'{}'` — a packer that reported nothing, which is not an absent packer |
+
+**`llm_classifier_cached_input_tokens` IS A SUBSET OF
+`llm_classifier_input_tokens` AND NEVER A COSTING TERM**, exactly as
+`llm_classifier_reasoning_tokens` is a subset of the output figure. Cached
+input bills lower and that discount is deliberately **not** modelled by
+`get_model_cost()`, so stored costs stay comparable with every historical row.
+Subtracting it, or pricing it separately, re-bases the whole series.
+
+**`llm_classifier_call_details` is the only column that can answer whether the
+cache warms.** A summed figure of 5,000 cached tokens across three calls is
+equally consistent with a cache that warms after the first request and one that
+never warms, and those have opposite implications for what packing costs. The
+ledger is one JSON object per request ISSUED, in order, carrying `call_index`
+(1-based), `depth`, `trials`, `prompt_tokens`, `completion_tokens`,
+`cached_tokens`, `reasoning_tokens`, `finish_reason` and `entries_emitted`.
+`trial_matches.call_index` joins to it by equality.
+
+**Stage 5's failure returns carry the tokens they were billed, and the figure is
+a FLOOR.** All four early returns used to end the node with no token figure, so
+`_pipeline_provenance()`'s `state.get(..., 0)` supplied a zero and the row said
+0 input and 0 output tokens against requests that had been issued and billed —
+six such rows are in the production database, each with
+`llm_classifier_retries = 3` beside two zeros. A refusal, a JSON parse failure
+and a non-list body now carry the accumulators, which are exact for that
+invocation because usage is read *before* the fence strip and the parse; so does
+an API error on a **later** chunk of a packed batch, where the earlier chunks'
+tokens are known. An API error on the **first** call carries nothing: no usage
+object was obtained, and an estimate from prompt length would put a number no
+provider reported into a measurement column. `llm_classifier_calls` is written
+on every return for the same reason, and it is what separates the two — `calls =
+0` with `llm_classifier_prompt_sha256 IS NOT NULL` is "Stage 5 ran and counted
+no usage", while a NULL hash is "Stage 5 never ran", where 0 is a measurement.
+
+**WHAT THE FLOOR STILL EXCLUDES, and neither term is recoverable from a stored
+row.** The accumulators are local to one invocation of the node and start at
+zero each time, while a parse failure routes the graph back *into* it — so a run
+with retries reports its LAST attempt only, and that is true of the success
+return as well. And the OpenAI SDK's own transport-layer retries are invisible
+to this process at every return. `run_harness.price_result` already states the
+first in its docstring and reports the consequence through `cost_complete`;
+nothing reports the second, because nothing can. **A consequence worth stating
+plainly: `estimated_cost_usd` on a failed row is no longer 0.00. The pricing
+CALCULATION did not change — its input stopped being a false zero.**
+
+**Two files cover this and neither replaces the other.**
+`tests/test_storage_inference_logging_contract.py` Test 2 is the STRUCTURAL
+half: by AST, every one of the node's own dict returns reports its billed tokens
+literally or through the `**_billed_so_far()` spread, with the walk scoped to
+stop at nested definitions and a probe asserting that scoping is doing work.
+`tests/test_storage_packing_and_cache_columns.py` is the BEHAVIOURAL half: the
+real migration, the real `log_inference` and the real node, read back out of
+SQLite. An AST scan cannot see a value that is carried and then serialized
+wrongly; a round trip cannot see a return that was never written.
 
 **Degradation record.** A run that lost a retrieval channel, fell back to the un-expanded query, or skipped the cancer site filter must be identifiable from its stored row alone. The relevant state keys are written by the stage that owns them, carried to all three terminal nodes by `_pipeline_provenance()` (file 13), and logged to `inferences.retrieval_channels` / `retrieval_degraded` / `retrieval_trials_lost` / `query_expansion_path` / `mesh_filter_applied` / `mesh_filter_skip_reason`. **NULL in these columns means the stage never reported and is not the same as a clean value** — never default them to 0 in a new writer or fold NULL into 0 in a reader. Stage 5's Section 2 is conditional on `mesh_filter_applied`: it only asserts to the model that disease relevance was confirmed when the filter actually ran.
 

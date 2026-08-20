@@ -1074,6 +1074,35 @@ _STRING_PREFILTER = ("exec", "spec_from_file_location", "SourceFileLoader",
 # and the file writes nothing in the repository except through an explicit
 # --update-snapshot flag.
 _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
+                   # Execs in-memory copies of storage/database_logger.py (four
+                   # plants) and agent/evaluation.py (one) for the Stage 5
+                   # packing/cache columns and the billed-token failure
+                   # returns. Neither a real condition nor a git blob can
+                   # supply any of the five. `_billed_so_far` is a function
+                   # NESTED inside node_llm_classifier_evaluation, created per
+                   # call, so there is no attribute to rebind and no argument
+                   # to vary -- which is why tests/test_storage_write_durability.py
+                   # can drive its own controls for real and this one cannot.
+                   # The four writer plants are one-token edits INSIDE a
+                   # function body -- `is not None` made truthy, a `.get()`
+                   # default added, a json.dumps guard removed, a migration
+                   # entry deleted -- to code that exists at HEAD and NOWHERE
+                   # ELSE, so a blob of the revision before it does not carry
+                   # an inverted guard, it carries no column at all. THE FIFTH
+                   # IS DIFFERENT AND THE DIFFERENCE IS RECORDED RATHER THAN
+                   # GLOSSED: once the token-persistence commit landed, a
+                   # DERIVED pre-fix revision could supply the `_billed_so_far`
+                   # control, because the whole feature is what that control
+                   # removes. It is deliberately not used. Sourcing one of five
+                   # controls from git would make this file abort in a tree
+                   # without `.git` -- a `git archive` export, a shallow or
+                   # squashed history -- which is an open defect in three
+                   # existing files here and is not worth reintroducing for a
+                   # control a patched copy already gives. The copies
+                   # are exec'd into a real ModuleType, because a function's
+                   # globals ARE the dict it was exec'd into and a throwaway
+                   # namespace would leave every module constant unread.
+                   "tests/test_storage_packing_and_cache_columns.py",
                    "tests/test_agent_prompt_version.py",
                    "tests/test_observability_logging.py",
                    "tests/test_indexer_admission_filters.py",
