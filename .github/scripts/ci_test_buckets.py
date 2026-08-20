@@ -359,6 +359,28 @@ BUCKETS = {
         "separation from fixture_capture.py / fixture_replay.py themselves, "
         "which are bucket D and C in NON_TEST_ENTRY_POINTS below: this file "
         "exercises the harness's guards, never a capture or a replay"),
+    "test_resume_capture_and_ragas.py": (
+        _A, None,
+        "ran green in 6.4s, 207 checks, against ONLY the directory skeleton: "
+        "both paid harnesses' resume mechanisms. fixture_capture.py's "
+        "--resume gate (all seven RESUME_OUTCOMES, and main()'s plan loop "
+        "DRIVEN end to end with the paid and networked seams replaced by "
+        "stand-ins, so the donor arithmetic, the temporary-bundle cleanup and "
+        "the retry-base selection are the shipped code rather than a second "
+        "implementation), and ragas_run.py's per-pair score journal (atomic "
+        "write, torn-write recovery, per-pair reuse by identity and input "
+        "fingerprint, the changed-environment refusal, and the merged set "
+        "passing post_checks). It costs and needs nothing: no network, no "
+        "keys, no spend, no live judge, no live Qdrant, no corpus, no git "
+        "history, no Docker. Every fixture it reads is one it wrote into a "
+        "fresh tempfile.mkdtemp(); paths.data_fhir_path is redirected through "
+        "paths._RESOLVED and restored; fixture_root() is never called, so the "
+        "twelve on-disk fixtures are never opened and a bug here cannot cost "
+        "a re-capture. NOT in the collision matrix -- derived, not assumed: it "
+        "patches no repository file, and the two package modules it reads "
+        "(oncotriage/fixtures/capture.py, oncotriage/evaluation/"
+        "ragas_harness.py) are written by neither of the suite's two writers; "
+        "both are sha256-compared in section 8"),
     "test_indexer_criteria_split_gate.py": (
         _A, None,
         "ran green in 0.78s, 109 checks, against ONLY the directory skeleton: "

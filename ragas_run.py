@@ -92,13 +92,28 @@ USAGE
     python ragas_run.py --max-workers 8
     python ragas_run.py --response-field assessment_draft   # score the model
     python ragas_run.py --overwrite              # replace an existing result
+    python ragas_run.py --resume                 # finish an interrupted run
+
+RESUME. Every completed (sample, metric) pair is written to
+``ragas_partial.json`` beside the outputs as it lands, atomically, so a kill
+loses only the pairs in flight. ``--resume`` carries those pairs forward instead
+of re-judging them -- provided the partial file's environment (the four package
+versions, judge model, temperature, max tokens, embedding model, response field
+and run directory) matches this run's, and provided each pair's own recorded
+input hash still matches the text the metric would be handed today. An
+environment difference is a REFUSAL naming what moved: scores from two
+environments are a mean about nothing. The partial file is deleted when a run
+completes cleanly and KEPT when a post-check fails, so fixing a post-check and
+re-running costs nothing. On a resumed run ``cost`` and ``wall_seconds`` in the
+manifest cover THIS invocation only, and ``cost_scope`` says so.
 
 Exit codes:
     0 -- every (sample, metric) pair was scored and the outputs were written
     1 -- refused before spending anything (bad run dir, missing credentials,
          an unpriced model, a judge that could not be wired safely, a verdict
-         missing the selected --response-field, or an existing output that
-         --overwrite was not given for)
+         missing the selected --response-field, an existing output that
+         --overwrite was not given for, or a --resume whose partial score file
+         was written under a different environment)
     3 -- the run happened and some pairs are unscored, or a post-check failed;
          ragas_results.json names each unscored pair and why
 """

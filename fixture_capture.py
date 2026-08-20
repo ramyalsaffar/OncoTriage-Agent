@@ -83,6 +83,16 @@ USAGE
     python fixture_capture.py --scan-only        # cohort scan + case report
     python fixture_capture.py --probe-limit 400  # widen the no-candidates hunt
     python fixture_capture.py --only normal_1 llm_classifier_parse_retry_constructed
+    python fixture_capture.py --resume           # finish an interrupted capture
+
+--resume SKIPS A FIXTURE ONLY IF IT WOULD BE CAPTURED THE SAME WAY TODAY: it
+must be on disk, load through the schema gate, and match this run's
+PROMPT_VERSION, MATCHING_MODEL, Qdrant collection NAME and collection DIGEST.
+Anything else is re-captured with the failing check printed, because a stale
+fixture counted as done is the defect every version gate in this file exists to
+refuse. It composes with --only (an entry runs only if it passes both), and the
+end-of-run spend line then prices what THIS run cost to FINISH the set rather
+than what the set cost.
 """
 
 import os

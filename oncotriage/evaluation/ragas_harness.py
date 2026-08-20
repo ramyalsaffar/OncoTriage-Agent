@@ -37,6 +37,7 @@ nothing.
 Entry point: ``ragas_run.py`` at the code root.
 """
 
+import hashlib
 import io
 import json
 import math
@@ -1382,6 +1383,378 @@ class Score(object):
         return row
 
 
+#------------------------------------------------------------------------------
+# Incremental persistence -- the partial score file that makes --resume possible
+#------------------------------------------------------------------------------
+
+PARTIAL_BASENAME = "ragas_partial"
+PARTIAL_SCHEMA_VERSION = 1
+PARTIAL_KIND = "ragas_partial_scores"
+
+# The facts whose change makes two scores incomparable. Compared as a whole
+# dict; every key is named here so a reader can see the closed list rather than
+# infer it from a comparison.
+#
+# WHY THESE AND NOT OTHERS. Each one changes what a judge RETURNS for identical
+# input text: the four package versions own the metric prompts, the statement
+# decomposition and both SDKs (see ENVIRONMENT_PACKAGES); the judge model,
+# temperature and max_tokens are the judge; the embedding model is what response
+# relevancy's cosine similarity is computed in; the response field decides which
+# recorded text is the response at all; and the run directory is the identity of
+# the evaluation run being scored.
+#
+# ``--limit`` and ``--metrics`` are deliberately NOT here. Neither changes what
+# a score MEANS -- they change which pairs are in the plan, and pair membership
+# is already decided per pair, by identity and fingerprint. Refusing on them
+# would forbid the two most useful resumes there are: finishing a run that was
+# started with a limit, and adding a metric to a set already scored for the
+# others.
+#
+# THE RUN DIRECTORY IS IN HERE AND IS STILL NOT SUFFICIENT, which is why
+# ``pair_fingerprint`` exists: a path is not the text at that path.
+RESUME_IDENTITY_KEYS = ("packages", "judge_model", "judge_temperature",
+                        "judge_max_tokens", "embedding_model",
+                        "response_field", "run_dir")
+
+
+def partial_path(out_dir, response_field=DEFAULT_RESPONSE_FIELD):
+    """Where this pass's partial scores live.
+
+    FIELD-AWARE, exactly as ``output_paths`` is and for the same reason: two
+    passes over one run with different ``--response-field`` values are two
+    different measurements, and a shared partial file would have the second
+    resume from the first's scores under one metric name.
+    """
+    suffix = ("" if response_field == DEFAULT_RESPONSE_FIELD
+              else f"__{response_field}")
+    return os.path.join(out_dir, f"{PARTIAL_BASENAME}{suffix}.json")
+
+
+def resume_identity(run, args, environment):
+    """The environment two runs must share before their scores may be merged."""
+    return {
+        "packages": dict(environment["packages"]),
+        "judge_model": args.judge_model,
+        "judge_temperature": args.temperature,
+        "judge_max_tokens": args.max_tokens,
+        "embedding_model": args.embedding_model,
+        "response_field": run.response_field,
+        "run_dir": os.path.realpath(run.run_dir),
+    }
+
+
+def identity_disagreement(recorded, current):
+    """What changed between a partial run's environment and this one's.
+
+    Returns a list of human-readable strings; empty means they agree. A missing
+    key in the recorded identity is a disagreement, never a pass: a partial file
+    that does not state what it ran under cannot be shown to have run under
+    this.
+    """
+    changed = []
+    for key in RESUME_IDENTITY_KEYS:
+        was = recorded.get(key, "<not recorded>") if isinstance(recorded, dict) \
+            else "<not recorded>"
+        now = current.get(key)
+        if was != now:
+            changed.append(f"{key}: {was!r} -> {now!r}")
+    return changed
+
+
+def journal_row(score, fingerprint):
+    """One journal row. The join is its own object rather than spread.
+
+    ``Score.as_row()`` spreads the join keys into the top level, which is right
+    for a results file a human reads and wrong here: reconstructing a Score from
+    it means GUESSING which top-level keys were join keys, and a guess that is
+    wrong by one key silently re-scores or mis-attributes.
+
+    A MODULE-LEVEL FUNCTION rather than a ``@staticmethod`` on ``ScoreJournal``.
+    It reads no instance state, every other transformation in this module is a
+    module-level function, and a decorated definition would enter
+    ``tests/test_package_invariants.py``'s pinned decorator inventory -- a pin
+    worth paying for a decorator that does something, and not for one that only
+    says "this method ignores self".
+    """
+    return {
+        "pair_key": pair_key(score.dataset, score.metric, score.join),
+        "dataset": score.dataset,
+        "metric": score.metric,
+        "join": dict(score.join),
+        "value": score.value,
+        "status": score.status,
+        "reason": score.reason,
+        "seconds": round(score.seconds, 3),
+        "inputs_sha256": fingerprint,
+    }
+
+
+class ScoreJournal(object):
+    """Scores written to disk as they complete, so a crash loses the in-flight.
+
+    ATOMIC ON EVERY WRITE, on ``oncotriage/batch/runner.py:save_checkpoint``'s
+    precedent: the whole file is serialised to ``<path>.partial-tmp`` and moved
+    over the target with ``os.replace``. A reader therefore sees the file before
+    a pair or after it, never during -- which matters because the file that
+    protects against a crash is the one file a crash must not be able to
+    corrupt.
+
+    THE TEMPORARY SUFFIX IS NOT ``.tmp``, and that is not cosmetic.
+    ``post_checks`` fails the run on any ``.tmp`` left in the output directory,
+    a check that exists to catch a torn ``write_json``. A journal temp file
+    racing that check would fail a run for a file the journal was about to
+    replace anyway, so it is named out of that namespace and cleaned up by the
+    same ``os.replace``.
+
+    THE COST IS A FULL REWRITE PER PAIR AND IT IS PAID DELIBERATELY. An append
+    log would be cheaper and is not atomic against a partial line; the reference
+    run is 738 pairs of a few hundred bytes, so the whole file is well under a
+    megabyte and the rewrite is milliseconds against judge calls measured in
+    seconds. Determinism and a file that can never be half-written beat the
+    micro-optimisation, and the batch runner made the same trade for the same
+    reason.
+    """
+
+    def __init__(self, path, identity, started_at_utc=None):
+        self.path = path
+        self.identity = identity
+        self.started_at_utc = started_at_utc or _utc_now()
+        self.rows = []
+        self.writes = 0
+        self.write_failures = {}
+
+    def record(self, score, fingerprint):
+        self.rows.append(journal_row(score, fingerprint))
+        self.flush()
+
+    def flush(self):
+        tmp = self.path + ".partial-tmp"
+        payload = {
+            "schema_version": PARTIAL_SCHEMA_VERSION,
+            "kind": PARTIAL_KIND,
+            "started_at_utc": self.started_at_utc,
+            "updated_at_utc": _utc_now(),
+            "identity": self.identity,
+            "note": ("Crash-recovery state for `ragas_run.py --resume`. It is "
+                     "NOT a result: it holds only the pairs completed so far, "
+                     "carries no summary and no post-checks, and is deleted "
+                     "when the run it belongs to completes. A pair is reused "
+                     "only if this file's `identity` matches the resuming run "
+                     "AND that pair's `inputs_sha256` still matches the text "
+                     "the metric would be handed today."),
+            "scores": self.rows,
+        }
+        try:
+            with io.open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=1, ensure_ascii=False)
+            os.replace(tmp, self.path)
+            self.writes += 1
+        except OSError as exc:
+            # COUNTED, NEVER SWALLOWED, AND NEVER FATAL. The run is mid-flight
+            # and every pair already scored has been PAID FOR; killing it over a
+            # failure to write the recovery file would destroy exactly what the
+            # file exists to protect. The count is reported at the end, so an
+            # operator learns that --resume will not have everything before they
+            # rely on it.
+            key = f"{type(exc).__name__}"
+            self.write_failures[key] = self.write_failures.get(key, 0) + 1
+            if len(self.write_failures) == 1 and self.write_failures[key] == 1:
+                console.out(f"  WARNING: the partial score file could not be "
+                            f"written ({type(exc).__name__}: {exc}). Scoring "
+                            f"continues; --resume will not see these pairs.")
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                # The temp file could not be removed either. Same argument, one
+                # level down; it is inside the output directory, is not named
+                # ``.tmp`` so it cannot fail post_checks, and the next flush
+                # replaces it.
+                self.write_failures["tmp_unlink"] = (
+                    self.write_failures.get("tmp_unlink", 0) + 1)
+
+    def discard(self):
+        """Remove the partial file. Called only after the run has COMPLETED.
+
+        A partial file left beside a finished result would let the next
+        ``--resume`` claim work it had not verified, and would sit in the output
+        directory looking like a deliverable. Removal failures are reported and
+        do not fail the run: the results and manifest are already written.
+        """
+        for target in (self.path, self.path + ".partial-tmp"):
+            try:
+                if os.path.exists(target):
+                    os.remove(target)
+            except OSError as exc:
+                console.out(f"  WARNING: could not remove {target} "
+                            f"({type(exc).__name__}: {exc}); a later --resume "
+                            f"would read a partial file for a completed run.")
+
+
+def load_partial(path):
+    """The partial file at ``path``, or ``(None, reason)`` if it is unusable.
+
+    Returns ``(payload, None)`` on success. Every failure is a reason string and
+    nothing raises: the caller decides whether an unusable partial is a refusal
+    (``--resume`` was asked for) or a note (it was not).
+    """
+    if not os.path.exists(path):
+        return None, "no partial score file"
+    try:
+        with io.open(path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except Exception as exc:                                # noqa: BLE001
+        return None, f"unreadable ({type(exc).__name__}: {exc})"
+    if not isinstance(payload, dict):
+        return None, f"malformed (top level is {type(payload).__name__})"
+    if payload.get("kind") != PARTIAL_KIND:
+        return None, f"not a partial score file (kind={payload.get('kind')!r})"
+    if payload.get("schema_version") != PARTIAL_SCHEMA_VERSION:
+        return None, (f"written at schema_version "
+                      f"{payload.get('schema_version')!r}; this code reads "
+                      f"{PARTIAL_SCHEMA_VERSION}")
+    if not isinstance(payload.get("scores"), list):
+        return None, "malformed (no scores list)"
+    return payload, None
+
+
+def reusable_scores(payload, run, active, identity):
+    """Which paid pairs in a partial file this run may keep.
+
+    Returns ``(by_pair_key, report)``. ``report`` counts every row and says what
+    happened to it, because a resume that quietly drops paid work is the same
+    defect as one that quietly keeps invalid work.
+
+    THREE WAYS A ROW IS NOT REUSED, and each is counted separately:
+
+      - ``not_in_plan``: the pair is not in this run's plan at all. That is the
+        ordinary consequence of resuming with a different ``--metrics`` or a
+        smaller ``--limit``, and it is not an error -- but it is money already
+        spent that this run's results will not contain, so it is reported.
+      - ``stale``: the pair IS in the plan and the text it was scored against
+        has changed. Re-scored.
+      - ``duplicate``: two rows for one pair key. The LAST wins, matching the
+        journal's append order, and the earlier one is counted.
+
+    An UNSCORED row is reused exactly like a scored one. It is a recorded
+    outcome -- ``_score_one`` never drops and never coerces to 0.0 -- and
+    re-running it would spend money to re-derive a result the harness already
+    holds. A user who believes an unscored pair was a transient fault deletes
+    the partial file, or the row, and re-runs.
+    """
+    samples_for = {DATASET_RETRIEVAL: run.retrieval,
+                   DATASET_GENERATION: run.generation}
+    planned = {}
+    plan_duplicates = 0
+    for dataset, metric_names in active.items():
+        for metric_name in metric_names:
+            for sample in samples_for[dataset]:
+                key = pair_key(dataset, metric_name, sample.as_join())
+                # TWO SAMPLES CAN SHARE A PAIR KEY, and ``load_run`` does not
+                # dedupe: a run artifact carrying two verdicts for one
+                # (patient, trial) builds two GenerationSamples with one join.
+                # That is already indistinguishable in ``ragas_results.json``,
+                # which keys its rows the same way -- but resume must not make
+                # it WORSE by handing both occurrences one paid score. Counted
+                # here, and consumed once in ``score_all``, so the second
+                # occurrence is re-scored rather than cloned.
+                if key in planned:
+                    plan_duplicates += 1
+                planned[key] = pair_fingerprint(metric_name, sample)
+
+    keep = {}
+    report = {"rows": 0, "reused": 0, "not_in_plan": 0, "stale": 0,
+              "duplicate": 0, "malformed": 0,
+              "plan_duplicate_keys": plan_duplicates,
+              "identity": dict(identity)}
+    for row in payload.get("scores") or []:
+        report["rows"] += 1
+        if not isinstance(row, dict) or not row.get("pair_key"):
+            report["malformed"] += 1
+            continue
+        key = row["pair_key"]
+        if key not in planned:
+            report["not_in_plan"] += 1
+            continue
+        if row.get("inputs_sha256") != planned[key]:
+            report["stale"] += 1
+            continue
+        if key in keep:
+            report["duplicate"] += 1
+        keep[key] = row
+    report["reused"] = len(keep)
+    return keep, report
+
+
+def score_from_row(row):
+    """Rebuild a ``Score`` from a journal row, so the merged set is one type.
+
+    Merging dicts into a list of Scores would make every consumer --
+    ``summarize``, ``build_results``, ``post_checks`` -- test which it had. One
+    type in means those three are byte-for-byte the code a single-pass run runs,
+    which is what "indistinguishable in shape from a single-pass run" has to
+    mean to be checkable.
+    """
+    return Score(row["dataset"], row["metric"], dict(row.get("join") or {}),
+                 row.get("value"), row.get("status"), row.get("reason"),
+                 float(row.get("seconds") or 0.0))
+
+
+#------------------------------------------------------------------------------
+
+
+def metric_kwargs(metric_name, sample):
+    """Exactly what this metric is handed for this sample.
+
+    ONE CONSTRUCTION SITE, and that is the whole reason it is a function.
+    ``_score_one`` calls it to score, and ``pair_fingerprint`` calls it to
+    decide whether an already-paid score is still about this sample. Two copies
+    would be two answers to "what does this metric read", and they would differ
+    in exactly the direction that costs money: a fingerprint over MORE than the
+    metric reads re-scores pairs that were still valid, and one over LESS
+    carries forward a score about text that has changed. Same argument as the
+    single BM25 construction site in ``oncotriage/embedding.py``.
+    """
+    kwargs = {"user_input": sample.user_input, "response": sample.response}
+    if metric_name != METRIC_RESPONSE_RELEVANCY:
+        # Response relevancy's ascore takes no contexts -- it compares the real
+        # question to questions generated from the response alone.
+        kwargs["retrieved_contexts"] = list(sample.retrieved_contexts)
+    return kwargs
+
+
+def pair_key(dataset, metric_name, join):
+    """The identity of one (sample, metric) pair, as one string.
+
+    Built from the JOIN KEYS rather than from a list index, because ``--limit``
+    and a re-read of the run directory both change positions while leaving
+    identities alone -- and a resume that matched on position would carry one
+    patient's score onto another patient.
+    """
+    return "|".join([dataset, metric_name]
+                    + [f"{k}={join[k]}" for k in sorted(join)])
+
+
+def pair_fingerprint(metric_name, sample):
+    """sha256 over exactly the text this metric will judge for this sample.
+
+    THIS IS WHAT MAKES RESUME SAFE ACROSS A CHANGED RUN DIRECTORY, and it is
+    strictly stronger than comparing the run directory's path. Two runs can
+    name the same directory and hold different text -- an evaluation run
+    re-generated in place, a ``--response-field`` whose verdicts were rewritten
+    -- and a score is about TEXT, not about a path. A path check would pass and
+    the mean would be over two different populations.
+
+    It is also what lets ``--limit`` and ``--metrics`` change between the
+    interrupted run and the resumed one without refusing: validity is decided
+    per pair, so a pair that is still in the plan and still about the same text
+    is reused whatever else moved around it.
+    """
+    payload = json.dumps(metric_kwargs(metric_name, sample),
+                         sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 async def _score_one(metric_name, metric, sample, dataset, semaphore):
     """Score one sample with one metric. Never raises; records instead.
 
@@ -1392,11 +1765,7 @@ async def _score_one(metric_name, metric, sample, dataset, semaphore):
     zero is a real score this scale can produce, and writing one for a sample
     that was never judged would move every aggregate over it.
     """
-    kwargs = {"user_input": sample.user_input, "response": sample.response}
-    if metric_name != METRIC_RESPONSE_RELEVANCY:
-        # Response relevancy's ascore takes no contexts -- it compares the real
-        # question to questions generated from the response alone.
-        kwargs["retrieved_contexts"] = list(sample.retrieved_contexts)
+    kwargs = metric_kwargs(metric_name, sample)
 
     started = time.monotonic()
     async with semaphore:
@@ -1415,7 +1784,8 @@ async def _score_one(metric_name, metric, sample, dataset, semaphore):
                  time.monotonic() - started)
 
 
-async def score_all(run, metrics, max_workers, active, progress=True):
+async def score_all(run, metrics, max_workers, active, progress=True,
+                    journal=None, reuse=None):
     """Every (sample, metric) pair, concurrently, in a deterministic order.
 
     Progress is reported as pairs COMPLETE rather than as they are dispatched.
@@ -1423,17 +1793,56 @@ async def score_all(run, metrics, max_workers, active, progress=True):
     tasks and takes tens of minutes; without a completion counter an operator
     cannot tell a slow run from a wedged one, and the only available response
     to either is to kill it and lose the spend.
+
+    ``reuse`` is a ``{pair_key: journal row}`` mapping of pairs already paid for
+    -- see ``reusable_scores``. Those pairs are NOT dispatched; they are rebuilt
+    as ``Score`` objects and returned alongside the newly scored ones, so what
+    comes back is one list of one type and every consumer downstream is the code
+    a single-pass run runs.
+
+    ``journal`` is a ``ScoreJournal``. Each completed pair is recorded and
+    flushed BEFORE the next one is reported, so a kill loses only the pairs
+    actually in flight. The flush is synchronous inside the coroutine and
+    therefore blocks the event loop for the length of one small file write --
+    milliseconds, against judge calls measured in seconds -- which is the price
+    of the guarantee that the file is never observed half-written.
+
+    REUSED PAIRS ARE RE-RECORDED INTO THE JOURNAL. The journal a resumed run
+    writes is therefore the whole set so far, not the increment, so a run
+    interrupted twice resumes from one file rather than needing every earlier
+    one.
     """
     import asyncio
 
     semaphore = asyncio.Semaphore(max_workers)
+    reuse = reuse or {}
+    remaining = dict(reuse)
     pending = []
+    carried = []
     samples_for = {DATASET_RETRIEVAL: run.retrieval,
                    DATASET_GENERATION: run.generation}
     for dataset, metric_names in active.items():
         for metric_name in metric_names:
             for sample in samples_for[dataset]:
+                key = pair_key(dataset, metric_name, sample.as_join())
+                if key in remaining:
+                    # POPPED, not read. Two samples sharing a pair key would
+                    # otherwise both carry the SAME paid score; the first takes
+                    # it and the second is scored for real, which costs at most
+                    # one pair and cannot attribute one sample's judgement to
+                    # another.
+                    row = remaining.pop(key)
+                    carried.append(score_from_row(row))
+                    if journal is not None:
+                        journal.rows.append(row)
+                    continue
                 pending.append((metric_name, sample, dataset))
+
+    if journal is not None and carried:
+        # One flush for the whole carried set rather than one per pair: none of
+        # it is new work, and the file must hold it before the first NEW pair is
+        # dispatched so that a crash on that pair does not lose the carry.
+        journal.flush()
 
     total = len(pending)
     started = time.monotonic()
@@ -1442,6 +1851,8 @@ async def score_all(run, metrics, max_workers, active, progress=True):
     async def run_one(metric_name, sample, dataset):
         score = await _score_one(metric_name, metrics[metric_name], sample,
                                  dataset, semaphore)
+        if journal is not None:
+            journal.record(score, pair_fingerprint(metric_name, sample))
         done["n"] += 1
         if progress:
             elapsed = time.monotonic() - started
@@ -1455,11 +1866,14 @@ async def score_all(run, metrics, max_workers, active, progress=True):
         return score
 
     if progress:
+        if carried:
+            console.out(f"  resuming: {len(carried)} pair(s) already scored and "
+                        f"carried forward, {total} left to score")
         console.out(f"  scoring {total} (sample, metric) pairs at "
                     f"{max_workers} concurrent...")
     scores = await asyncio.gather(
         *(run_one(name, sample, dataset) for name, sample, dataset in pending))
-    return list(scores)
+    return carried + list(scores)
 
 
 #------------------------------------------------------------------------------
@@ -1677,6 +2091,47 @@ def print_plan(plan, run, out_dir, active, environment):
 #------------------------------------------------------------------------------
 
 
+def print_resume_preview(run, args, active, out_dir, environment):
+    """What ``--resume`` would carry and what it would still have to judge.
+
+    Free, and callable with nothing built: it reads one JSON file and compares
+    hashes. Prints nothing at all when there is no partial file AND --resume was
+    not asked for, so an ordinary dry run is unchanged.
+    """
+    partial_file = partial_path(out_dir, run.response_field)
+    payload, why_not = load_partial(partial_file)
+    if payload is None and not args.resume:
+        return
+    console.out("")
+    console.out(f"resume: {partial_file}")
+    if payload is None:
+        console.out(f"    {why_not} -- --resume would score the whole plan")
+        return
+    identity = resume_identity(run, args, environment)
+    changed = identity_disagreement(payload.get("identity"), identity)
+    if changed:
+        console.out("    WOULD REFUSE: the partial file's environment differs")
+        for line in changed:
+            console.out(f"        {line}")
+        return
+    _, report = reusable_scores(payload, run, active, identity)
+    total = sum(len(metric_names)
+                * (len(run.retrieval) if dataset == DATASET_RETRIEVAL
+                   else len(run.generation))
+                for dataset, metric_names in active.items())
+    console.out(f"    environment matches; {report['reused']} of "
+                f"{report['rows']} recorded pair(s) are current")
+    console.out(f"    --resume would judge {total - report['reused']} of "
+                f"{total} pair(s) in this plan")
+    for label, count in (("not in this plan", report["not_in_plan"]),
+                         ("scored against text that has since changed",
+                          report["stale"]),
+                         ("duplicate pair keys", report["duplicate"]),
+                         ("malformed rows", report["malformed"])):
+        if count:
+            console.out(f"        {count} {label}")
+
+
 def print_retrieval_response_shape(run):
     """What the retrieval response now IS, per patient, before any spend.
 
@@ -1832,7 +2287,8 @@ def superseded_record(run_dir, out_dir, active):
 
 
 def build_manifest(run, summary, cost, args, wall_seconds, ragas_version,
-                   plan, active, supersedes=None, environment=None):
+                   plan, active, supersedes=None, environment=None,
+                   resumed_from=None, pairs_scored_here=None):
     """The record of what ran, under what, at what cost.
 
     ``environment`` defaults to a stamp taken here rather than to ``None``, so a
@@ -1898,6 +2354,26 @@ def build_manifest(run, summary, cost, args, wall_seconds, ragas_version,
         },
         "wall_seconds": round(wall_seconds, 3),
         "cost": cost,
+        # WHAT ``cost`` AND ``wall_seconds`` ARE ABOUT, stated as a field rather
+        # than left for a reader to assume. Both are measured by THIS process --
+        # ``UsageTally`` counts the calls this invocation made and the clock
+        # starts when this invocation starts -- so on a resumed run they are the
+        # cost and the time of FINISHING the set, not of the set. The
+        # interrupted run's spend is real, was billed, and is not recoverable
+        # from here: its own manifest was never written, which is exactly why it
+        # was interrupted. Same shape as ``fixture_capture.py``'s end-of-run
+        # summary pricing only what that run wrote.
+        "cost_scope": ("this invocation only; pairs carried forward by --resume "
+                       "were paid for by the interrupted run and are not in this "
+                       "figure"
+                       if resumed_from else "the whole run"),
+        # ON THE ABLATION RUNNER'S ``resumed=true`` PRECEDENT
+        # (oncotriage/ablation/study.py), and carrying more than a boolean: a
+        # reader asking "is this mean over 738 pairs one environment produced"
+        # needs to know how many were carried, how many were dropped and why.
+        "resumed": bool(resumed_from),
+        "resumed_from": resumed_from,
+        "pairs_scored_this_invocation": pairs_scored_here,
         "supersedes": supersedes,
         "circularity_rule_note": CIRCULARITY_RULE_NOTE,
         "context_recall_scope_note": CONTEXT_RECALL_SCOPE_NOTE,
@@ -1946,7 +2422,6 @@ def snapshot_tree(root, exclude_dir=None):
     records it read -- a read-only harness that quietly rewrote its own input
     would otherwise be indistinguishable from one that did not.
     """
-    import hashlib
 
     snapshot = {}
     exclude = os.path.realpath(exclude_dir) if exclude_dir else None
@@ -2133,6 +2608,20 @@ def _parse_args(argv=None):
                         f"field is a refusal, never a fallback. Outputs are "
                         f"named after the field, so passes cannot overwrite "
                         f"each other. Choices: " + ", ".join(RESPONSE_FIELDS))
+    p.add_argument("--resume", action="store_true",
+                   help="continue an interrupted run from its partial score "
+                        "file in the output directory. Pairs already scored "
+                        "are carried forward -- not re-judged and not re-paid "
+                        "-- provided the partial file's environment (ragas, "
+                        "anthropic, openai and langchain-core versions, judge "
+                        "model, temperature, max tokens, embedding model, "
+                        "response field and run directory) matches this run's, "
+                        "and provided the text each pair was scored against is "
+                        "unchanged. Any environment difference is a REFUSAL "
+                        "naming what moved: scores from two environments are a "
+                        "mean about nothing. The partial file is written after "
+                        "every pair whether or not --resume was given, and is "
+                        "deleted when a run completes.")
     p.add_argument("--overwrite", action="store_true",
                    help="replace this pass's output files if they already "
                         "exist. Without it an existing result is a refusal "
@@ -2176,6 +2665,14 @@ def main(argv=None):
 
     if args.dry_run:
         print_plan(plan, run, out_dir, active, environment)
+        # THE RESUME PREVIEW IS ON THE FREE PATH ON PURPOSE. The plan above
+        # prices the WHOLE set; an operator about to resume is going to pay for
+        # the remainder, and the difference between those two numbers is the
+        # decision they are making. Everything it needs -- the partial file, the
+        # identity comparison, the per-pair fingerprints -- is filesystem and
+        # arithmetic, so the preview costs nothing and calls nothing. It is also
+        # the only way to exercise the resume gate without a live judge.
+        print_resume_preview(run, args, active, out_dir, environment)
         return 0
 
     parent = os.path.dirname(out_dir.rstrip(os.sep))
@@ -2206,6 +2703,83 @@ def main(argv=None):
     # is announced before the spend and what is written after it cannot name
     # different files.
     results_path, manifest_path = output_paths(out_dir, run.response_field)
+
+    # --- Resume ------------------------------------------------------------
+    #
+    # DECIDED BEFORE A CLIENT IS BUILT AND BEFORE A CENT IS SPENT, on the same
+    # footing as the pricing refusal above: a partial file from another
+    # environment must stop the run while stopping is still free, not after the
+    # first billed pair has been merged into it.
+    identity = resume_identity(run, args, environment)
+    partial_file = partial_path(out_dir, run.response_field)
+    reuse, reuse_report = {}, None
+    resumed_from = None
+
+    payload, why_not = load_partial(partial_file)
+    if args.resume:
+        if payload is None:
+            # A --resume with nothing to resume from is not an error and is not
+            # silent. Scoring the whole plan is the correct behaviour and it is
+            # also what an operator who mistyped --output-dir is about to pay
+            # for, so the reason is named before the spend rather than inferred
+            # from a cost afterwards.
+            console.out(f"--resume: {os.path.basename(partial_file)} "
+                        f"{why_not}; scoring the whole plan.")
+        else:
+            changed = identity_disagreement(payload.get("identity"), identity)
+            if changed:
+                console.out(
+                    f"REFUSED (resume_environment_changed): "
+                    f"{os.path.basename(partial_file)} was written under a "
+                    f"different environment and its scores must not be merged "
+                    f"with this run's -- a mean over two environments is a mean "
+                    f"about nothing. What changed:")
+                for line in changed:
+                    console.out(f"    {line}")
+                console.out(
+                    "  Re-run without --resume to score the whole plan (which "
+                    "replaces the partial file), or point --output-dir "
+                    "elsewhere to keep it.")
+                log.error("ragas_refused",
+                          extra={"reason": "resume_environment_changed"})
+                return 1
+            reuse, reuse_report = reusable_scores(payload, run, active, identity)
+            resumed_from = {
+                "partial_path": partial_file,
+                "partial_started_at_utc": payload.get("started_at_utc"),
+                "partial_updated_at_utc": payload.get("updated_at_utc"),
+                "rows_in_partial": reuse_report["rows"],
+                "reused_pairs": reuse_report["reused"],
+                "dropped_not_in_plan": reuse_report["not_in_plan"],
+                "dropped_stale_inputs": reuse_report["stale"],
+                "dropped_duplicate": reuse_report["duplicate"],
+                "dropped_malformed": reuse_report["malformed"],
+            }
+            console.out(
+                f"--resume: {reuse_report['reused']} of "
+                f"{reuse_report['rows']} pair(s) in "
+                f"{os.path.basename(partial_file)} are current and will not be "
+                f"re-judged.")
+            for label, count in (("not in this run's plan",
+                                  reuse_report["not_in_plan"]),
+                                 ("scored against text that has since changed",
+                                  reuse_report["stale"]),
+                                 ("duplicate pair keys (last wins)",
+                                  reuse_report["duplicate"]),
+                                 ("malformed rows", reuse_report["malformed"])):
+                if count:
+                    console.out(f"    {count} {label}")
+    elif payload is not None:
+        # NOT AN AUTOMATIC RESUME. Reusing a paid score is a decision about
+        # money and about whether two runs are comparable, and it is the
+        # operator's, not a default triggered by a file being present.
+        console.out(
+            f"NOTE: {os.path.basename(partial_file)} holds "
+            f"{len(payload.get('scores') or [])} already-scored pair(s) from an "
+            f"earlier run. Without --resume they will be re-judged and re-paid, "
+            f"and this run replaces that file.")
+
+    journal = ScoreJournal(partial_file, identity)
 
     try:
         import asyncio
@@ -2251,7 +2825,8 @@ def main(argv=None):
     tree_before = snapshot_tree(run_dir, exclude_dir=out_dir)
 
     started = time.monotonic()
-    scores = asyncio.run(score_all(run, metrics, args.max_workers, active))
+    scores = asyncio.run(score_all(run, metrics, args.max_workers, active,
+                                   journal=journal, reuse=reuse))
     wall_seconds = time.monotonic() - started
 
     summary = summarize(scores, run, active)
@@ -2262,7 +2837,31 @@ def main(argv=None):
                build_manifest(run, summary, cost, args, wall_seconds,
                               ragas.__version__, plan, active,
                               superseded_record(run_dir, out_dir, active),
-                              environment))
+                              environment,
+                              resumed_from=resumed_from,
+                              # COUNTED, not `len(scores) - len(reuse)`. That
+                              # subtraction is off by one for every pair key the
+                              # plan holds twice, because only the first
+                              # occurrence consumes its carried row.
+                              pairs_scored_here=sum(
+                                  1 for s in scores
+                                  if pair_key(s.dataset, s.metric, s.join)
+                                  not in reuse)))
+
+    # THE PARTIAL FILE GOES ONLY NOW, once both outputs are on disk. Removing it
+    # earlier would leave a window in which a crash had destroyed the recovery
+    # state without having produced the thing that replaces it. Removing it
+    # never would leave a crash-recovery file beside a finished result, which
+    # the next --resume would read as work it may keep without having checked
+    # the result it belongs to.
+    if journal.write_failures:
+        # Reported at the end as well as at the first occurrence: the warning
+        # during a 400-second run scrolls away, and this is the line that says
+        # the recovery file was incomplete for anyone who resumes from it.
+        console.out(f"  NOTE: the partial score file failed to write "
+                    f"{sum(journal.write_failures.values())} time(s) "
+                    f"({journal.write_failures}); a --resume during this run "
+                    f"would have seen fewer pairs than were scored.")
 
     print_summary(summary, cost, args.judge_model, args.embedding_model,
                   wall_seconds, args.temperature, active, run.response_field)
@@ -2290,11 +2889,31 @@ def main(argv=None):
     disagreement = ragas_version_disagreement(environment, ragas.__version__)
     if disagreement:
         failures.append(disagreement)
+    # THE PARTIAL FILE GOES ONLY NOW, and only if the post-checks held.
+    #
+    # Removing it earlier would leave a window in which a crash had destroyed
+    # the recovery state without having produced the thing that replaces it.
+    # Removing it never would leave a crash-recovery file beside a finished
+    # result, which the next --resume would read as work it may keep without
+    # having checked the result it belongs to.
+    #
+    # KEEPING IT WHEN A POST-CHECK FAILED is the third case and it is worth the
+    # extra branch: the pairs are scored and paid for, the failure is about a
+    # property of the OUTPUT (a torn round trip, a tree that moved, a ragas
+    # version disagreement), and an operator fixing that and re-running should
+    # not be re-buying 738 judge calls to do it. `--resume --overwrite` then
+    # rewrites the outputs for nothing.
+    if not failures:
+        journal.discard()
     if failures:
         console.out("")
         console.out("POST-CHECKS FAILED:")
         for failure in failures:
             console.out(f"    {failure}")
+        console.out(f"    (the partial score file was KEPT at "
+                    f"{os.path.basename(partial_file)}: every pair in it is "
+                    f"paid for, and `--resume --overwrite` will rewrite the "
+                    f"outputs without re-judging anything)")
         return 3
     console.out(f"post-checks: accounting, round-trip, containment and "
                 f"tree integrity all held "

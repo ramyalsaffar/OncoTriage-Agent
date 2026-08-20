@@ -195,6 +195,7 @@ from oncotriage.agent.graph import build_initial_state, build_matching_graph
 from oncotriage.agent.filtering import node_rule_based_filter
 from oncotriage.agent.mesh_expansion import expand_query_from_mesh, resolve_patient_mesh
 from oncotriage.agent.patient import compute_patient_hash, extract_genomic_variant_terms
+from oncotriage.agent.prompts import PROMPT_VERSION
 from oncotriage.agent.retrieval import node_hybrid_retrieval, node_query_expansion
 from oncotriage.agent.state import (
     EXPANSION_PATH_FALLBACK,
@@ -1519,6 +1520,46 @@ def stage5_cost_summary(fixtures: List[Dict]) -> Dict:
     }
 
 
+def _fixture_cost_line(fixture: Dict) -> str:
+    """What ONE fixture's Stage 5 calls cost, as one line, priced now.
+
+    THE POINT IS THE MOMENT. The end-of-run summary is a total printed after
+    every call has been billed, so an operator watching a capture that is
+    pricing three times what they expected finds out when there is nothing left
+    to stop. This is the same arithmetic -- ``stage5_cost_summary`` over a
+    one-element list, never a second implementation -- printed as each fixture
+    lands.
+
+    ONE FIXTURE, SO EVERY PLURAL FIELD OF THE SUMMARY COLLAPSES, and each of
+    the three collapsed cases is named rather than printed as a bare number:
+
+      - copied recordings (the constructed retry fixture) price as $0 with the
+        fixture in ``excluded_fixture_ids``. Printing "$0.00000" for it would
+        say it was free when what is true is that its calls were already billed
+        to the fixture it was copied from.
+      - an unpriced model prices as $0 with ``cost_complete`` False. Same
+        defect item 38 removed from the cost query: a real 0.0 that every
+        aggregate absorbs.
+      - a run that made no Stage 5 call at all -- the terminal
+        ``node_no_candidates`` fixture -- genuinely costs nothing, and that is
+        a measurement rather than a gap.
+    """
+    spend = stage5_cost_summary([fixture])
+    if spend["excluded_fixture_ids"]:
+        return ("Stage 5 cost: not billed here -- this fixture's recordings are "
+                "copied from another fixture, which already paid for them")
+    calls = spend["calls_priced"] + spend["calls_unpriced"]
+    if not calls:
+        return "Stage 5 cost: $0.00000 (no Stage 5 call was made)"
+    line = (f"Stage 5 cost: ${spend['cost_usd']:.5f} over {calls} call(s), "
+            f"{spend['input_tokens']:,} in / {spend['output_tokens']:,} out")
+    if not spend["cost_complete"]:
+        line += (f"   <- A FLOOR: {spend['calls_unpriced']} call(s) on unpriced "
+                 f"model(s) {', '.join(spend['unpriced_models'])} contribute "
+                 f"nothing")
+    return line
+
+
 def read_recorded_donor_bundle(path: str) -> str:
     """The donor bundle filename a fixture records, read WITHOUT the version gate.
 
@@ -1644,6 +1685,190 @@ def list_fixtures(root: str = None) -> List[str]:
     """
     root = root or fixture_root()
     return sorted(glob.glob(os.path.join(root, "*" + FIXTURE_SUFFIX)))
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
+# THE --resume GATE
+# ===========================================================================
+
+# How resume_decision() answered. A CLOSED set, for the same reason
+# DONOR_OUTCOMES and agent.state.TRIAL_VERDICTS are closed: a caller may branch
+# on it exhaustively, and a new member is a change every caller has to see
+# rather than a string that falls silently through an if/elif chain.
+#
+# EVERY MEMBER BUT THE FIRST IS A RE-CAPTURE, and each names the one check that
+# refused. There is no "skip on a doubt" member and there deliberately is no
+# "skip because the file is there" member: a fixture counted as done because a
+# file of that name exists is the exact defect every version gate in this file
+# was written to refuse, and a resume that reintroduces it would do so at the
+# one moment nobody is looking -- after a crash, while re-running.
+RESUME_CURRENT = "current"                       # every check passed: SKIP
+RESUME_ABSENT = "absent"                         # nothing on disk
+RESUME_UNREADABLE = "unreadable"                 # load_fixture refused it
+RESUME_PROMPT_VERSION = "prompt_version"         # a different prompt built it
+RESUME_MATCHING_MODEL = "matching_model"         # a different model answered it
+RESUME_COLLECTION = "qdrant_collection"          # a different collection served it
+RESUME_COLLECTION_DIGEST = "collection_digest"   # the same collection, different contents
+RESUME_OUTCOMES = (RESUME_CURRENT, RESUME_ABSENT, RESUME_UNREADABLE,
+                   RESUME_PROMPT_VERSION, RESUME_MATCHING_MODEL,
+                   RESUME_COLLECTION, RESUME_COLLECTION_DIGEST)
+
+
+def _fixture_prompt_version(fixture: Dict):
+    """The PROMPT_VERSION recorded in a fixture's deterministic prefix.
+
+    Read from the PREFIX rather than from the environment block, and that is
+    forced rather than preferred: ``build_environment_block()`` does not carry
+    the prompt version at all. There is an open ledger item to put it there;
+    until it lands, the prefix is where the value exists, and reading it from
+    the place it exists is what makes this gate checkable today rather than
+    after that item.
+
+    ``_pipeline_provenance`` falls the version back to PROMPT_VERSION on every
+    path including the two terminal nodes, so this is a string on every fixture
+    the current writer produces. ``None`` comes back for a fixture whose prefix
+    predates the field, and the caller treats that as a mismatch rather than as
+    a pass -- an absent value is not evidence of agreement.
+    """
+    prefix = fixture.get("deterministic_prefix")
+    if not isinstance(prefix, dict):
+        return None
+    stage5 = prefix.get("stage5")
+    if not isinstance(stage5, dict):
+        return None
+    return stage5.get("llm_classifier_prompt_version")
+
+
+def resume_decision(fixture_id: str,
+                    environment: Dict,
+                    root: str = None,
+                    prompt_version: str = None,
+                    load=None) -> tuple:
+    """Whether ``--resume`` may skip this fixture. ``(skip, outcome, detail)``.
+
+    ``outcome`` is one of ``RESUME_OUTCOMES``; ``skip`` is True for exactly
+    ``RESUME_CURRENT``. ``detail`` names every check that refused, not only the
+    one in ``outcome``, because an operator reading a re-capture wants the whole
+    disagreement rather than the first line of it.
+
+    A FIXTURE IS SKIPPED ONLY IF IT WOULD BE CAPTURED THE SAME WAY TODAY, and
+    the four checks are the four things this file already knows can change the
+    answer without changing this file:
+
+      - the PROMPT VERSION that rendered the Stage 5 request. It is the one
+        input to a fixture that is neither a tunable nor a model nor an index,
+        and a prompt edit moves every verdict.
+      - the MATCHING MODEL that was asked. Note this is the model REQUESTED
+        (``environment.matching_model``), which is what a re-capture would ask
+        for; what answered is recorded per call and can legitimately be a dated
+        snapshot of the same alias.
+      - the QDRANT COLLECTION NAME, and
+      - the COLLECTION DIGEST -- what is IN it. The name alone is not enough:
+        ``11- RAG Trial Indexer.py --mode direct`` rebuilds in place, so a
+        collection can keep its name and change every point in it. This is the
+        same pair ``fixture_replay.py`` refuses on, in the same order, and for
+        the same reason.
+
+    THE DIGEST CHECK IS ALSO WHAT MAKES THE DONOR POOL DETERMINISTIC under
+    resume, which is a second job it does for free: the one skip that could
+    otherwise consume donors is ``no_candidates_pediatric_age``, whose recorded
+    donor is re-probed against the live index and falls into a 60-donor search
+    when the probe no longer empties the pool. A skipped fixture is by
+    definition one whose index is byte-identical to the one it was captured
+    against, so that probe would have succeeded and consumed nothing.
+
+    WHAT IS DELIBERATELY NOT CHECKED, and why each is safe to leave out. The
+    tunables block: ``fixture_replay.py:diff_tunables()`` already reports a
+    tunable change on every replay, and a run that changed one is a run whose
+    whole set is being re-captured on purpose rather than resumed. The
+    cross-encoder and BM25 model names: neither is compared by the replay, so a
+    change to either cannot make a fixture on disk disagree with one captured
+    today. The snapshot and age reference dates: both are pinned constants that
+    a re-capture of the remaining fixtures would carry identically, and both
+    already ride in the environment block of every file written.
+
+    PURE, AND CALLABLE WITHOUT A PAID CAPTURE. It reads the filesystem and
+    nothing else -- no client, no model, no network. ``load`` is the seam: it
+    defaults to ``load_fixture`` (version gate included, which is what turns a
+    stale-schema file into ``RESUME_UNREADABLE`` rather than into a skip), and a
+    test hands it a stand-in. ``prompt_version`` defaults to the live
+    ``PROMPT_VERSION``.
+    """
+    loader = load if load is not None else load_fixture
+    expected_version = (prompt_version if prompt_version is not None
+                        else PROMPT_VERSION)
+    path = fixture_path(fixture_id, root)
+
+    if not os.path.exists(path):
+        return False, RESUME_ABSENT, "no fixture of that id on disk"
+
+    try:
+        fixture = loader(path)
+    except Exception as exc:                                  # noqa: BLE001
+        # EVERY failure to read is a re-capture, never a crash and never a
+        # skip. load_fixture raises ValueError on a schema mismatch, and gzip
+        # or json raise their own on a file a killed capture left half-written
+        # -- which is precisely the file a resumed run meets first.
+        return False, RESUME_UNREADABLE, f"{type(exc).__name__}: {exc}"[:300]
+
+    recorded_env = fixture.get("environment")
+    if not isinstance(recorded_env, dict):
+        recorded_env = {}
+
+    failures = []
+    found_version = _fixture_prompt_version(fixture)
+    if found_version != expected_version:
+        failures.append((RESUME_PROMPT_VERSION,
+                         f"prompt_version {found_version!r} != {expected_version!r}"))
+
+    found_model = recorded_env.get("matching_model")
+    if found_model != environment.get("matching_model"):
+        failures.append((RESUME_MATCHING_MODEL,
+                         f"matching_model {found_model!r} != "
+                         f"{environment.get('matching_model')!r}"))
+
+    found_collection = recorded_env.get("qdrant_collection")
+    if found_collection != environment.get("qdrant_collection"):
+        failures.append((RESUME_COLLECTION,
+                         f"qdrant_collection {found_collection!r} != "
+                         f"{environment.get('qdrant_collection')!r}"))
+
+    # COMPARED AS A WHOLE OBJECT, not by one of its keys. The digest carries a
+    # point count, a distinct-NCT-id count and a sha256 over the ids; comparing
+    # only the sha256 would pass a collection whose ids are the same and whose
+    # point count is not, which is what a partially-failed re-index looks like.
+    found_digest = recorded_env.get("collection_digest")
+    if found_digest != environment.get("collection_digest"):
+        failures.append((RESUME_COLLECTION_DIGEST,
+                         f"collection_digest differs "
+                         f"({_digest_brief(found_digest)} != "
+                         f"{_digest_brief(environment.get('collection_digest'))})"))
+
+    if not failures:
+        return True, RESUME_CURRENT, (
+            f"prompt {expected_version}, model "
+            f"{environment.get('matching_model')}, collection "
+            f"{environment.get('qdrant_collection')}, digest "
+            f"{_digest_brief(environment.get('collection_digest'))}")
+    return False, failures[0][0], "; ".join(detail for _, detail in failures)
+
+
+def _digest_brief(digest) -> str:
+    """A collection digest in one short line, for a diagnostic.
+
+    ``None`` and a non-dict both answer a named string rather than raising:
+    this is only ever called to explain a mismatch, and a formatter that raises
+    while formatting the reason a run is re-capturing would replace the
+    diagnosis with a traceback.
+    """
+    if not isinstance(digest, dict):
+        return "<none>" if digest is None else f"<{type(digest).__name__}>"
+    return (f"{digest.get('point_count')}pts/"
+            f"{digest.get('distinct_nct_ids')}ncts/"
+            f"{str(digest.get('nct_id_sha256'))[:12]}")
 
 
 #------------------------------------------------------------------------------
@@ -3281,6 +3506,13 @@ def main() -> int:
                         help="Capture only these fixture ids.")
     parser.add_argument("--fixture-dir", default=None,
                         help="Override the fixture output directory.")
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip a fixture that is already on disk AND was "
+                             "captured under this run's prompt version, "
+                             "matching model, Qdrant collection and collection "
+                             "digest. Anything else is re-captured, with the "
+                             "failing check printed. Composes with --only: an "
+                             "entry runs only if it passes both filters.")
     args = parser.parse_args()
 
     root = args.fixture_dir or fixture_root()
@@ -3349,6 +3581,57 @@ def main() -> int:
         pointing at a different patient's record.
         """
         return not args.only or fixture_id in args.only
+
+    # THE ENVIRONMENT BLOCK IS BUILT AT MOST ONCE AND ONLY WHEN SOMETHING NEEDS
+    # IT. It was a straight-line call below `if args.scan_only: return 0`, and
+    # --resume needs it EARLIER -- the derived fixtures decide whether to
+    # derive while the plan is being built, and that decision reads the pinned
+    # collection and its digest. Hoisting the call unconditionally would have
+    # made --scan-only contact Qdrant for a digest it never uses, so it is
+    # lazy instead: with neither --resume nor a capture, nothing calls this and
+    # the behaviour is byte-for-byte what it was.
+    #
+    # ONCE, not once per caller: `compute_collection_digest` scrolls the whole
+    # collection, and two readings of a live index taken minutes apart can
+    # disagree -- which would put one collection's digest in the resume gate and
+    # another's in the fixtures the same run writes.
+    _environment_cache = {}
+
+    def _environment() -> Dict:
+        if "env" not in _environment_cache:
+            _environment_cache["env"] = build_environment_block()
+        return _environment_cache["env"]
+
+    # What --resume decided, per fixture id, so the decision is made once and
+    # can be read again afterwards. The retry-base selection below is the second
+    # reader and it is not optional -- see the comment there.
+    resume_skipped = []
+    _resume_seen = {}
+
+    def _resume_skip(fixture_id: str) -> bool:
+        """Whether --resume may skip this fixture. Prints the reason either way.
+
+        Memoized because the derived fixtures ask during plan building and the
+        capture loop asks again: two calls reading the filesystem at two moments
+        could answer differently, and the second answer would be applied to a
+        bundle the first had already decided not to derive.
+        """
+        if not args.resume or args.scan_only:
+            return False
+        if fixture_id in _resume_seen:
+            return _resume_seen[fixture_id]
+        skip, outcome, detail = resume_decision(fixture_id, _environment(), root)
+        _resume_seen[fixture_id] = skip
+        if skip:
+            resume_skipped.append(fixture_id)
+            console.out(f"  [Resume] SKIP     {fixture_id:<38} current ({detail})")
+        else:
+            console.out(f"  [Resume] CAPTURE  {fixture_id:<38} {outcome}: {detail}")
+        return skip
+
+    def _wanted_now(fixture_id: str) -> bool:
+        """--only AND --resume. An entry runs only if it passes both."""
+        return _wanted(fixture_id) and not _resume_skip(fixture_id)
 
     def _recorded_donor(derived_id: str) -> Dict:
         """The donor an already-captured derived fixture was built from.
@@ -3421,7 +3704,7 @@ def main() -> int:
     # --- no_candidates -----------------------------------------------------
     if selection.get(CASE_NO_CANDIDATES):
         _add("no_candidates", selection[CASE_NO_CANDIDATES], [CASE_NO_CANDIDATES])
-    elif not args.scan_only and _wanted(RECIPE_NO_CANDIDATES):
+    elif not args.scan_only and _wanted_now(RECIPE_NO_CANDIDATES):
         # Not reachable from this cohort — derive it. Every candidate is PROBED
         # against the live index before it is accepted, so the fixture is never
         # captured on an assumption about trial age windows.
@@ -3522,7 +3805,7 @@ def main() -> int:
     # --- mesh_fallback -----------------------------------------------------
     if selection.get(CASE_MESH_FALLBACK):
         _add("mesh_fallback", selection[CASE_MESH_FALLBACK], [CASE_MESH_FALLBACK])
-    elif not args.scan_only and _wanted(RECIPE_MESH_FALLBACK):
+    elif not args.scan_only and _wanted_now(RECIPE_MESH_FALLBACK):
         derived_id = RECIPE_MESH_FALLBACK
         _handle, out_path = tempfile.mkstemp(prefix=f"{derived_id}_",
                                              suffix=".bundle.json")
@@ -3569,7 +3852,7 @@ def main() -> int:
              })
 
     # --- mCODE genomic variant (always derived; the corpus has none) --------
-    if not args.scan_only and _wanted(RECIPE_MCODE_VARIANT):
+    if not args.scan_only and _wanted_now(RECIPE_MCODE_VARIANT):
         derived_id = RECIPE_MCODE_VARIANT
         _handle, out_path = tempfile.mkstemp(prefix=f"{derived_id}_",
                                              suffix=".bundle.json")
@@ -3625,7 +3908,30 @@ def main() -> int:
     # genuinely issues the two half-batch calls, and all three exchanges are
     # recorded — so the expected prefix is observed, not hand-derived. The
     # fixture is marked constructed because the truncation was injected.
-    if not args.scan_only and _wanted("truncation_split"):
+    # A SKIPPED truncation_split STILL RESERVES ITS DONOR, and it is the only
+    # fixture in the plan for which that sentence is not a no-op.
+    #
+    # The three recipe-derived fixtures take their remembered donor through
+    # `_recorded_donor()`, which searches the whole cohort and pops NOTHING, so
+    # skipping one leaves the pool exactly as deriving-from-memory would have.
+    # truncation_split takes its remembered donor through `choose_pool_donor()`,
+    # which POPS -- so skipping it silently leaves a donor in the pool that a
+    # completed run would have consumed. Nothing observes that today, because
+    # this is the last donor consumer in the plan; that is an argument from the
+    # ORDER OF THIS FUNCTION, and the next fixture appended below it would
+    # invalidate it without failing anything. The reservation makes the pool
+    # state after a skip identical to the pool state after a capture, whatever
+    # the order.
+    if (args.resume and not args.scan_only and _wanted("truncation_split")
+            and _resume_skip("truncation_split")):
+        _reserved, _outcome = choose_pool_donor(
+            read_recorded_donor_bundle(fixture_path("truncation_split", root)),
+            donors)
+        if _outcome == DONOR_FROM_MEMORY:
+            console.out(f"  [Donor] truncation_split: skipped, and its recorded "
+                        f"donor {_reserved['bundle'][:44]} is reserved out of "
+                        f"the pool so a later derivation cannot take it.")
+    if not args.scan_only and _wanted_now("truncation_split"):
         # Prefer the donor the existing fixture records, exactly as the three
         # recipe-derived fixtures above do. Without this it took _next_donor()
         # unconditionally and therefore rebound on EVERY capture -- and worse,
@@ -3685,7 +3991,7 @@ def main() -> int:
         return 0
 
     # --- Capture -----------------------------------------------------------
-    environment = build_environment_block()
+    environment = _environment()
     console.out(f"\n[Env] Pinned Qdrant collection: {environment['qdrant_collection']}"
           f"{'' if environment['alias_resolved'] else '  (alias fallback!)'}")
 
@@ -3695,7 +4001,11 @@ def main() -> int:
 
     with CaffeinateSession("fixture capture"):
         for entry in plan:
-            if args.only and entry["fixture_id"] not in args.only:
+            # BOTH FILTERS, AGAIN. The derived entries were already gated while
+            # the plan was built (so a skipped one costs no derivation and no
+            # temporary bundle); the cohort entries reach their first gate here.
+            # _resume_skip is memoized, so asking twice cannot answer twice.
+            if not _wanted_now(entry["fixture_id"]):
                 continue
             fixture = capture_fixture(
                 fixture_id=entry["fixture_id"],
@@ -3723,6 +4033,7 @@ def main() -> int:
             console.out(f"  -> {os.path.basename(path)} "
                   f"({os.path.getsize(path) / 1024:.0f} KB, "
                   f"terminal={fixture['deterministic_prefix']['terminal']['terminal_node']})")
+            console.out(f"     {_fixture_cost_line(fixture)}")
 
     # Temporary derived bundles are a copy of a Synthea record each, hundreds
     # of megabytes. Schema v2 stores the recipe, so nothing needs them once the
@@ -3742,6 +4053,37 @@ def main() -> int:
     # offer then.
     retry_candidates = [f for f in written
                         if f.get("fixture_kind") == FIXTURE_KIND_RECORDED]
+
+    # A FIXTURE --resume SKIPPED IS AS GOOD A BASE AS ONE THIS RUN WROTE, and
+    # leaving it out silently changes which patient the retry fixture is built
+    # from. `written` holds only what THIS invocation captured, so a resumed run
+    # that had already finished `normal_1` offered a candidate set that did not
+    # contain it -- `choose_retry_base()` would then report RETRY_BASE_SUBSTITUTED
+    # and construct the fixture from a different patient than a single-pass run
+    # produces. Nothing would fail: the fixture is written, it replays clean, and
+    # it describes a different run. Adding the skipped ones back restores the
+    # `RETRY_BASE_PREFERRED` preference and makes a resumed set identical to an
+    # unresumed one.
+    #
+    # THE FILES ARE READ THROUGH `load_fixture`, gate included. They were read
+    # through it already, by `resume_decision`, which is how they came to be
+    # skipped; reading them again here is one extra decompression and keeps this
+    # block's inputs the same shape as the `written` ones (whole fixtures, not
+    # ids), rather than threading a second cache through the capture loop.
+    for _skipped_id in resume_skipped:
+        try:
+            _skipped = load_fixture(fixture_path(_skipped_id, root))
+        except (ValueError, OSError, json.JSONDecodeError) as exc:
+            # Unreachable through resume_decision, which already loaded it
+            # cleanly -- so this is a file that changed underneath the run.
+            # Named, not swallowed, and not a crash: the base selection below
+            # simply has one candidate fewer.
+            console.out(f"  (skipped fixture {_skipped_id} became unreadable "
+                        f"after the resume decision: {exc})")
+            continue
+        if _skipped.get("fixture_kind") == FIXTURE_KIND_RECORDED:
+            retry_candidates.append(_skipped)
+
     if not retry_candidates:
         for candidate_path in list_fixtures(root):
             try:
@@ -3756,6 +4098,17 @@ def main() -> int:
                 retry_candidates.append(candidate)
 
     retry_incomplete = False
+    # --resume DOES NOT GATE THIS ONE, and the asymmetry is deliberate. Every
+    # other fixture is skipped because rebuilding it costs a live billed Stage 5
+    # call; this one costs nothing -- `build_constructed_retry_fixture` splices a
+    # synthetic failing attempt in front of a base fixture's RECORDED exchange
+    # and issues no request. What it does depend on is which base it is handed,
+    # and `choose_retry_base()` prefers `normal_1` deterministically, so a
+    # resumed run and a single-pass run over the same set hand it the same base
+    # and it writes the same fixture. Rebuilding it is therefore free AND is what
+    # keeps it in step with a set some of whose members this run replaced;
+    # skipping it would leave a fixture spliced onto a base that had since been
+    # re-captured, which is the stale-artifact defect resume exists to avoid.
     if not args.only or "llm_classifier_parse_retry_constructed" in args.only:
         retry_base, retry_outcome, retry_detail = choose_retry_base(retry_candidates)
         if retry_base is None:
@@ -3810,9 +4163,25 @@ def main() -> int:
     # the directory: `all_fixtures` includes fixtures an earlier capture left
     # there, and billing the operator for those would be a number that grows
     # every time --only is used.
+    #
+    # UNDER --resume THIS PRICES ONLY WHAT THIS RUN WROTE, which is not a new
+    # behaviour and not a caveat added for resume: `written` has always been the
+    # population, precisely so an --only run does not bill the operator for the
+    # fixtures an earlier capture left in the directory. Resume makes it visible
+    # rather than making it true -- a resumed run's total is the cost of
+    # FINISHING the set, and the cost of the whole set is that number plus what
+    # the interrupted run had already spent. The skipped count below is what
+    # says how much of the set this figure is not about.
     spend = stage5_cost_summary(written)
     console.out(f"\n{'=' * 78}")
     console.out(f"Wrote {len(written)} fixture(s); {len(all_fixtures)} in {root}")
+    if resume_skipped:
+        console.out(
+            f"--resume skipped {len(resume_skipped)} fixture(s) already current "
+            f"on disk: {', '.join(sorted(resume_skipped))}")
+        console.out(
+            "  The Stage 5 spend below is what THIS run cost to finish the set, "
+            "not what the set cost.")
     console.out(
         f"Stage 5 spend: ${spend['cost_usd']:.5f} over {spend['calls_priced']} "
         f"call(s), {spend['input_tokens']:,} in / {spend['output_tokens']:,} out"

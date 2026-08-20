@@ -1111,6 +1111,23 @@ _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    "tests/test_extraction_stage_m_category.py",
                    "tests/test_extraction_stage_non_oncology_guard.py",
                    "tests/test_agent_trial_verdict_normalization.py",
+                   # ONE exec, of an in-memory copy of fixtures/capture.py with
+                   # `--resume`'s gate reverted to "the file exists, skip it" --
+                   # the defect the gate was written to prevent, and the only
+                   # control that can show a resume skipping a fixture it has
+                   # not checked. `git show` cannot supply it: `resume_decision`
+                   # has no prior revision at all, so a blob of any earlier
+                   # commit does not carry a weaker gate, it carries no gate --
+                   # and a harness comparing "no --resume" against "--resume"
+                   # would be comparing two different features rather than a
+                   # fix against its absence. Every other control in that file
+                   # is a deliberately wrong INPUT to the shipped function (the
+                   # natural control for a pure decision) or a real condition
+                   # created for real (a torn write driven by an io.open that
+                   # dies mid-write), so this is the one place a copy is
+                   # needed. Nothing on disk is touched: the two package
+                   # modules it reads are sha256-compared in its section 8.
+                   "tests/test_resume_capture_and_ragas.py",
                    # Plants into in-memory copies of agent/evaluation.py and
                    # agent/terminal.py. `git show` cannot supply these
                    # controls: the out-of-set detector has no prior revision,

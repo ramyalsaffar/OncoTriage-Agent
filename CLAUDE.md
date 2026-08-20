@@ -367,7 +367,10 @@ python "28- Select Evaluation Sample.py" --output-db <scratch>/sample.db
 python "34- Cohort Selector Diff Read Only.py"       # LEGACY vs CURRENT selector, read only
 python fixture_capture.py --scan-only               # cohort scan + selection, captures nothing
 python fixture_capture.py                           # COSTS MONEY: 12 real end-to-end runs
+python fixture_capture.py --resume                  # finish an interrupted capture; re-pays for nothing already current
 python fixture_replay.py                            # free; exit 0 only if all 12 replay clean
+python ragas_run.py --dry-run                        # free: counts, prices and the --resume preview
+python ragas_run.py --resume                        # COSTS MONEY, but only for the pairs an interrupted run had not scored
 python "20- Drift Detection.py"                      # KS / PSI / z-score vs 30-day baseline
 python "06- FHIR Dataset Characterization.py"        # cohort tables + figures (item 9's source)
 python "07- FHIR Parser.py"                          # smoke run: parse the corpus, print the count
@@ -424,6 +427,13 @@ python tests/test_dashboard_reproducibility_tab.py --update-snapshot  # regenera
 # and no Docker daemon: every Qdrant client is a stand-in and section 1's
 # subprocesses import oncotriage.config only. Not in the collision matrix.
 python tests/test_docker_qdrant_override_and_readiness.py           # 122
+
+# The resume pass. Same shape, same directory. No network, no keys, no spend,
+# no live judge, no live Qdrant, no corpus, no git history, and NOT in the
+# collision matrix. It DOES exec -- one in-memory copy of
+# oncotriage/fixtures/capture.py with the --resume gate reverted to "the file
+# exists, skip it", argued at _EXEC_ALLOWLIST. Bucket A, ~6 s.
+python tests/test_resume_capture_and_ragas.py                       # 207
 
 # The MCP pass. Same shape, same directory. No keys and NO SPEND -- the judging
 # is stubbed through oncotriage/agent/deps.py. It is NOT offline: sections 4, 5
