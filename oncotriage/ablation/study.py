@@ -151,8 +151,10 @@ from oncotriage.fhir.parser import load_all_patients
 from oncotriage.utils import (
     CaffeinateSession,
     get_model_cost,
+    preserve_corrupt_file,
     resolve_qdrant_collection,
 )
+from oncotriage import run_fingerprint
 from oncotriage import tracking
 from oncotriage.observability import console, correlation_scope, get_logger
 
@@ -358,24 +360,172 @@ def _ablation_checkpoint_path(db_path=None) -> Path:
     return Path(paths.checkpoint_path) / ABLATION_CHECKPOINT_FILENAME
 
 
-def load_ablation_checkpoint(db_path=None) -> set:
-    """Load set of completed (config_name, patient_id) tuples for `db_path`."""
+CORRUPT_CHECKPOINT_SUFFIX = ".corrupt"
+"""Suffix a checkpoint that could not be read is COPIED to.
+
+Copied, never renamed, and ``oncotriage/utils.py:preserve_corrupt_file`` argues
+why: a renamed checkpoint is gone from its own path, so the refusal below would
+be loud once and silent afterwards -- the next invocation would find nothing,
+start fresh, and re-run every ``(config, patient)`` pair at a live Stage 5 call
+each. Copying leaves the refusal STICKY until an operator passes
+``--fresh-start``.
+"""
+
+CHECKPOINT_FAULTS = Counter()
+"""Ablation checkpoint faults, keyed ``{phase}:{detail}`` -- the same phases and
+the same shape as ``oncotriage/batch/runner.py:CHECKPOINT_FAULTS``, deliberately
+a SEPARATE counter because the two describe different files and a shared name
+would report a batch fault and a study fault as one number.
+
+    ``load:``      the file existed and could not be read back
+    ``shape:``     it parsed and was not a checkpoint
+    ``preserve:``  the unreadable file could not even be copied aside
+    ``refused:``   a readable checkpoint was REFUSED, keyed by the
+                   ``FP_OUTCOMES`` member that refused it
+"""
+
+
+def _checkpoint_remediation(db_path) -> tuple:
+    """The command that clears THIS database's refused checkpoint.
+
+    PER DATABASE, because the checkpoint is (pass 20f-3). A remediation naming
+    the production checkpoint while the operator is running ``--db scratch.db``
+    would send them to delete the wrong file -- and the production one is the
+    expensive one.
+
+    This entry point HAS argparse, so unlike the batch runner the remediation
+    is a flag on the documented command rather than a ``python -c``.
+    """
+    flag = "--fresh-start" + (f" --db {db_path}" if db_path is not None else "")
+    return (
+        f"The checkpoint this refers to is {_ablation_checkpoint_path(db_path)}",
+        "To start fresh (this DISCARDS the resume state and re-runs every "
+        "(config, patient) pair, at cost):",
+        f'    python "26- Ablation Study.py" {flag}',
+        "NOTHING HAS BEEN DELETED. The checkpoint is exactly as it was.",
+    )
+
+
+def load_ablation_checkpoint(db_path=None, fingerprint=None) -> set:
+    """Load set of completed (config_name, patient_id) tuples for `db_path`.
+
+    Args:
+        db_path: which database's resume state to read. Unchanged, and pass
+            20f-3's argument for it is unchanged with it.
+        fingerprint: the configuration to compare the stored stamp against.
+            ``None`` takes ``run_fingerprint.current()``, which asks Qdrant --
+            so a caller with no endpoint passes its own rather than being
+            refused for a reason that has nothing to do with its checkpoint.
+            ``main()`` passes the stamp it resolved before its pool existed.
+
+    Raises:
+        run_fingerprint.ResumeRefusal: the checkpoint exists and this run may
+            not continue it -- unreadable, or produced by a different
+            configuration, or by an unknown one.
+
+    WHAT IT USED TO DO SILENTLY, TWICE OVER. An unreadable checkpoint warned
+    and returned an empty set, which on a resume is a silent decision to re-run
+    every pair an earlier study completed -- up to 525 live Stage 5 calls. And
+    a checkpoint recorded WHAT was done and never what it was done UNDER, so a
+    study resumed after a prompt edit skipped the pairs the old prompt had
+    completed and ran the rest under the new one, into one
+    ``ablation_results.db`` -- and ``generate_summary`` averages per config, so
+    a config split across two prompts comes back with a plausible number
+    computed over two different pipelines.
+
+    THE PER-DATABASE ISOLATION PASS 20f-3 ESTABLISHED IS UNCHANGED AND IS WHAT
+    THE STAMP RIDES IN. The fingerprint goes inside ``db_path``'s own
+    checkpoint file, so a scratch study and a production study still do not see
+    each other in either direction -- and a scratch study run under a different
+    configuration now cannot silently continue a production one even if
+    somebody points ``--db`` at the same directory.
+    """
     cp = _ablation_checkpoint_path(db_path)
     if not cp.exists():
         return set()
+
     try:
         with open(cp, "r") as f:
             data = json.load(f)
-        completed = set(tuple(pair) for pair in data.get("completed", []))
-        console.out(f"[Checkpoint] Resuming: {len(completed)} patient-config pairs already completed.")
-        return completed
-    except (json.JSONDecodeError, KeyError) as e:
-        console.out(f"[Checkpoint] WARNING: Could not read checkpoint ({e}). Starting fresh.")
-        return set()
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+        _unreadable_checkpoint(cp, db_path, f"{type(e).__name__}: {e}",
+                               f"load:{type(e).__name__}")
+
+    if not isinstance(data, dict):
+        _unreadable_checkpoint(
+            cp, db_path, f"expected a JSON object, found {type(data).__name__}",
+            f"shape:{type(data).__name__}")
+    pairs = data.get("completed")
+    if not isinstance(pairs, list):
+        # NOT the same as an empty checkpoint. `data.get("completed", [])` used
+        # to turn this into "nothing completed", which is a silent full re-run
+        # wearing the clothes of a successful read.
+        _unreadable_checkpoint(
+            cp, db_path, f"'completed' is {type(pairs).__name__}, not a list",
+            f"shape:completed={type(pairs).__name__}")
+
+    outcome, detail = run_fingerprint.compare(
+        data.get("fingerprint"),
+        fingerprint if fingerprint is not None else run_fingerprint.current())
+    if outcome != run_fingerprint.FP_MATCH:
+        CHECKPOINT_FAULTS[f"refused:{outcome}"] += 1
+        log.error("ablation checkpoint refused", event="checkpoint_refused",
+                  status="error", error_type=outcome)
+        raise run_fingerprint.ResumeRefusal("\n".join(
+            run_fingerprint.refusal_lines(
+                outcome, detail, f"the ablation checkpoint at {cp}",
+                _checkpoint_remediation(db_path))),
+            outcome=outcome)
+
+    try:
+        completed = set(tuple(pair) for pair in pairs)
+    except TypeError as e:
+        # A "completed" list whose members are not iterable -- a list of ints,
+        # say. `tuple(3)` raises, and the pre-pass code did not catch it, so
+        # the study died with a TypeError instead of a diagnosis.
+        _unreadable_checkpoint(
+            cp, db_path, f"'completed' holds a member that is not a pair: {e}",
+            "shape:completed_member")
+
+    console.out(f"[Checkpoint] Resuming: {len(completed)} patient-config pairs already completed.")
+    console.out(f"[Checkpoint] Configuration matches: {detail}")
+    return completed
 
 
-def save_ablation_checkpoint(completed: set, db_path=None) -> None:
-    """Atomically persist completed set to `db_path`'s checkpoint file."""
+def _unreadable_checkpoint(cp, db_path, error: str, counter_key: str) -> None:
+    """Count, COPY aside, log, and raise. Always raises; never returns."""
+    CHECKPOINT_FAULTS[counter_key] += 1
+    preserved, preserve_error, preserve_key = preserve_corrupt_file(
+        cp, CORRUPT_CHECKPOINT_SUFFIX, keep_original=True)
+    if preserved:
+        where = f"A copy has been preserved as {preserved}."
+    else:
+        CHECKPOINT_FAULTS[f"preserve:{preserve_key}"] += 1
+        where = (f"It could NOT be copied aside ({preserve_error}), so the only "
+                 f"copy is the one still at {cp}.")
+
+    log.error("ablation checkpoint unreadable", event="checkpoint_unreadable",
+              status="error", error_message=error)
+    raise run_fingerprint.ResumeRefusal("\n".join(
+        [f"REFUSED (unreadable): the ablation checkpoint at {cp}",
+         f"    {error}",
+         f"    {where}",
+         "    Continuing would silently re-run every (config, patient) pair an "
+         "earlier study completed, at a live Stage 5 call each. THE CHECKPOINT "
+         "IS INTACT: nothing was deleted and no pair was re-run."]
+        + [f"    {line}" for line in _checkpoint_remediation(db_path)]),
+        outcome=run_fingerprint.FP_ABSENT)
+
+
+def save_ablation_checkpoint(completed: set, db_path=None,
+                             fingerprint: dict = None) -> None:
+    """Atomically persist completed set to `db_path`'s checkpoint file.
+
+    ``fingerprint`` defaults to ``run_fingerprint.current()`` -- what every
+    call site passes -- and is an argument at all so a test can write a
+    checkpoint stamped with a configuration it chooses rather than having
+    to reach into the resolver's cache to fabricate one.
+    """
     with _ablation_checkpoint_lock:
         cp = _ablation_checkpoint_path(db_path)
         tmp_path = cp.with_suffix(".tmp")
@@ -386,6 +536,17 @@ def save_ablation_checkpoint(completed: set, db_path=None) -> None:
                         "completed": list(completed),
                         "last_updated": datetime.now().isoformat(),
                         "count": len(completed),
+                        # WHAT PRODUCED THIS SET. `run_fingerprint.current()`
+                        # is resolved once per process and cached, so this is
+                        # free after the first call -- and the caching is a
+                        # correctness argument rather than a saving: a study is
+                        # ONE configuration, and a per-write stamp straddling
+                        # the weekly alias swap would put two collections into
+                        # one checkpoint and the file would then refuse itself.
+                        "fingerprint": (fingerprint if fingerprint is not None
+                                        else run_fingerprint.current()),
+                        "collection_identity":
+                            run_fingerprint.COLLECTION_IDENTITY,
                     },
                     f,
                     indent=2,
@@ -1275,6 +1436,19 @@ def parse_args():
     # documented command's behaviour. The summary JSON follows the database
     # into the same directory, which the help says out loud because a run that
     # quietly stopped updating ablation_summary.json would be a surprise.
+    # The configuration-fingerprint pass. load_ablation_checkpoint() REFUSES a
+    # checkpoint it cannot vouch for and deletes nothing, so this is the "yes,
+    # discard it" it names. It clears THIS --db's checkpoint and no other,
+    # because the checkpoint is per database (pass 20f-3) and a flag that
+    # cleared the production resume state while the operator was running an
+    # isolated study would be the very defect that pass removed.
+    parser.add_argument(
+        "--fresh-start", action="store_true",
+        help="Delete this database's checkpoint before running, discarding all "
+             "resume state so every (config, patient) pair runs again. The "
+             "remediation for a refused checkpoint -- and it re-bills every "
+             "pair, which is why it is a flag rather than a fallback."
+    )
     parser.add_argument(
         "--db", default=None, metavar="PATH",
         help="Write the study to this SQLite database instead of the "
@@ -1309,6 +1483,21 @@ def main():
         console.out(f"  Checkpoint (resume state): {_ablation_checkpoint_path(db_path)}")
         console.out()
 
+    # --- --fresh-start, before anything reads the checkpoint ---
+    # Above --summary-only deliberately: --summary-only reads the database and
+    # never the checkpoint, so combining the two would silently do nothing
+    # while looking like it had cleared something. Announced before it happens,
+    # because it is destructive and expensive and the operator should see the
+    # file named while there is still time to interrupt.
+    if args.fresh_start:
+        console.out(f"[--fresh-start] Discarding {_ablation_checkpoint_path(db_path)}. "
+                    f"Every (config, patient) pair will run again, at one live "
+                    f"Stage 5 call each.")
+        clear_ablation_checkpoint(db_path=db_path)
+        if args.summary_only:
+            console.out("[--fresh-start] NOTE: --summary-only was also given, "
+                        "so nothing will be re-run in this invocation.")
+
     # --- Summary-only mode ---
     # init_ablation_db() runs first even though nothing is written: the summary
     # query selects avg_match_score_all, which a database built before that
@@ -1329,6 +1518,11 @@ def main():
         configs = [c for c in ABLATION_CONFIGS if c["name"] in args.configs]
     else:
         configs = ABLATION_CONFIGS
+
+    # ONE CONFIGURATION PER STUDY, RESOLVED ONCE. Dropped here so a second
+    # main() in one process resolves again rather than stamping its checkpoint
+    # with the first study's collection.
+    run_fingerprint.clear_cache()
 
     with CaffeinateSession("Ablation Study"):
 
@@ -1358,7 +1552,33 @@ def main():
         sample = stratified_sample(all_patients, args.sample_size, ABLATION_SEED)
 
         # --- Step 3: Resume support ---
-        completed = load_ablation_checkpoint(db_path=db_path)
+        #
+        # THE CONFIGURATION STAMP IS TAKEN ON THIS THREAD, BEFORE THE POOL.
+        # save_ablation_checkpoint() is called from _on_done, a done-CALLBACK
+        # running on a WORKER thread, so without this MAX_WORKERS threads would
+        # reach an unwarmed resolver at once. It is also the value the gate one
+        # line below compares against, so what refuses a resume and what stamps
+        # the writes are one reading rather than two that can straddle an alias
+        # swap.
+        _fingerprint = run_fingerprint.current()
+        console.out(f"  Configuration: prompt "
+                    f"{_fingerprint['llm_classifier_prompt_version']}, model "
+                    f"{_fingerprint['matching_model_configured']}, collection "
+                    f"{_fingerprint['qdrant_collection']} "
+                    f"({_fingerprint['collection_points']} points), snapshot "
+                    f"{_fingerprint['data_snapshot_date']}")
+
+        # A REFUSAL HERE IS ABOVE tracking.start_run AND ABOVE THE FIRST BILLED
+        # CALL, so a checkpoint this study may not continue stops it having
+        # spent nothing, opened no tracking run and -- above all -- deleted
+        # nothing.
+        try:
+            completed = load_ablation_checkpoint(db_path=db_path,
+                                                 fingerprint=_fingerprint)
+        except run_fingerprint.ResumeRefusal as exc:
+            console.out()
+            console.out(str(exc))
+            sys.exit(1)
 
         # --- Step 3b: Open the parent tracking run (the tracking pass) ---
         # ONE PARENT PER STUDY, one nested child per configuration, and the

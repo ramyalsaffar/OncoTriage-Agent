@@ -118,7 +118,9 @@ from oncotriage.storage.database_logger import (
     log_inference,
     resolve_inference_db_path,
 )
-from oncotriage.utils import CaffeinateSession
+from oncotriage import utils
+from oncotriage.utils import CaffeinateSession, preserve_corrupt_file
+from oncotriage import run_fingerprint
 from oncotriage.observability import console, get_logger
 from oncotriage import degradation
 from oncotriage import tracking
@@ -252,7 +254,76 @@ def _results_path() -> Path:
     return Path(paths.checkpoint_path) / RESULTS_FILENAME
 
 
-def load_checkpoint() -> set:
+CORRUPT_CHECKPOINT_SUFFIX = ".corrupt"
+"""Suffix a checkpoint that could not be read is COPIED to.
+
+Copied, not renamed, and the difference is the whole point -- see
+``oncotriage/utils.py:preserve_corrupt_file``. A renamed checkpoint is gone
+from its own path, so the refusal below would be loud once and silent
+afterwards: the next invocation would find no checkpoint, start fresh, and
+re-bill the entire cohort. Copying leaves the refusal STICKY until an operator
+clears the checkpoint deliberately.
+"""
+
+CHECKPOINT_FAULTS = Counter()
+"""Checkpoint faults, keyed ``{phase}:{detail}``.
+
+Module-level, following ``RESULTS_FILE_FAILURES`` above and
+``CHECKPOINT_WRITE_FAILURES`` in ``oncotriage/ablation/study.py``, and NOT a
+column: the fault happens before the first patient of a resumed run, so there
+is no inference row it belongs to.
+
+Phases:
+    ``load:``      the file existed and could not be read back
+    ``shape:``     it parsed and was not a checkpoint (no dict, or no
+                   ``completed_stems`` list)
+    ``preserve:``  the unreadable file could not even be copied aside
+    ``refused:``   a readable checkpoint was REFUSED, keyed by the
+                   ``FP_OUTCOMES`` member that refused it
+"""
+
+degradation.register(
+    "CHECKPOINT_FAULTS", CHECKPOINT_FAULTS,
+    "the batch checkpoint could not be read, or was refused because the "
+    "configuration that produced it is not this one; NO patient was skipped "
+    "and NO patient was re-run -- the run stopped instead")
+
+
+def _checkpoint_remediation() -> tuple:
+    """The two commands that clear a refused checkpoint. One text, two printers.
+
+    WHY A COMMAND AND NOT A FLAG ON ``main()``. This module's ``main()`` takes
+    no arguments and its docstring pins that ("THE RETURN TYPE IS UNCHANGED,
+    deliberately"); an embedder calls it programmatically, and a ``main()`` that
+    started parsing ``sys.argv`` would exit(2) inside somebody else's process
+    the first time their flags did not match ours. So the flag lives in
+    ``25- Batch Runner.py``'s ``__main__`` guard -- exactly where
+    ``05- FHIR Clean Data.py`` puts ``--dry-run``, and for the reason recorded
+    there -- and the module-level function stays the mechanism it always was.
+    """
+    return (
+        "To start fresh (this DISCARDS the resume state and re-runs every "
+        "patient, at cost):",
+        "    python \"25- Batch Runner.py\" --fresh",
+        "or, equivalently, from anywhere:",
+        "    python -c \"from oncotriage.batch.runner import clear_checkpoint; "
+        "clear_checkpoint()\"",
+        "NOTHING HAS BEEN DELETED. The checkpoint is exactly as it was.",
+    )
+
+
+def _refuse_checkpoint(outcome: str, detail: str, cp) -> None:
+    """Count, log and raise. Never deletes, never skips, never re-runs."""
+    CHECKPOINT_FAULTS[f"refused:{outcome}"] += 1
+    lines = run_fingerprint.refusal_lines(
+        outcome, detail, f"the batch checkpoint at {cp}",
+        _checkpoint_remediation())
+    log.error("batch checkpoint refused", event="checkpoint_refused",
+              status="error", error_type=outcome)
+    raise run_fingerprint.ResumeRefusal("\n".join(lines), outcome=outcome)
+
+
+def load_checkpoint(fingerprint: dict = None) -> set:
     """
     Load set of already-completed filename stems from checkpoint file.
 
@@ -260,25 +331,129 @@ def load_checkpoint() -> set:
     e.g. "Firstname_Lastname_UUID". This is consistent with how pending_files
     and completed_files are filtered, avoiding UUID vs. stem mismatch bugs.
 
+    Args:
+        fingerprint: the configuration to compare the stored stamp against.
+            ``None`` -- what ``main()`` passes -- takes
+            ``run_fingerprint.current()``.
+
+            THIS ARGUMENT IS WHY THIS FUNCTION STILL WORKS OFFLINE, and it is
+            here because the first version of this pass did not have it and
+            widened a library contract by accident: resolving the current
+            stamp asks Qdrant, so ``load_checkpoint()`` and
+            ``save_checkpoint()`` -- which had touched no network in their
+            lives -- suddenly needed a live endpoint, and a caller without one
+            got FP_UNRESOLVED and a refusal for a reason that had nothing to
+            do with its checkpoint. ``main()`` is unaffected either way (it
+            resolves after ``build_bm25_index_from_qdrant()``, so Qdrant is
+            already proven live and the stamp is already cached), which is
+            exactly what made the widening invisible until a test that runs
+            with no keys was measured.
+
     Returns:
         Set of filename stem strings that have been successfully processed.
         Empty set if no checkpoint file exists.
+
+    Raises:
+        run_fingerprint.ResumeRefusal: the checkpoint exists and this run may
+            not continue it -- it could not be read, or it was produced by a
+            different configuration, or by an unknown one.
+
+    THE TWO THINGS THIS USED TO DO SILENTLY, AND WHAT EACH COST
+    -----------------------------------------------------------
+    1. AN UNREADABLE CHECKPOINT WARNED AND RETURNED AN EMPTY SET. On a resume
+       that is not a degraded read: it is a silent decision to re-run every
+       patient an earlier process completed, at ~$0.15 each. A truncated tail
+       on a 19,000-patient checkpoint cost about $2,850 and printed one WARNING
+       line above a bar that then looked like a normal fresh run.
+    2. A CHECKPOINT SAID WHAT WAS DONE AND NEVER WHAT IT WAS DONE UNDER. So a
+       resume after a prompt edit, a model change or an index rebuild skipped
+       every patient the OLD configuration had completed and ran the rest under
+       the new one, into ONE inferences table, with nothing anywhere saying the
+       run held two eras.
+
+    Both are refusals now, and a refusal DELETES NOTHING. That is the whole
+    contract: the operator is told, the state is intact, and the two things
+    that may not happen -- silently skipping and silently re-billing -- both
+    require an explicit command.
+
+    A CHECKPOINT WITH NO FINGERPRINT IS UNKNOWN PROVENANCE, NOT A PASS. Every
+    checkpoint written before this pass is in that class. It is refused with
+    that stated, rather than adopted: an artifact that does not say what
+    produced it cannot be shown to have been produced by this.
     """
     cp = _checkpoint_path()
     if not cp.exists():
         return set()
+
     try:
         with open(cp, "r") as f:
             data = json.load(f)
-        completed = set(data.get("completed_stems", []))
-        console.out(f"[Checkpoint] Resuming: {len(completed)} patients already completed.")
-        return completed
-    except (json.JSONDecodeError, KeyError) as e:
-        console.out(f"[Checkpoint] WARNING: Could not read checkpoint ({e}). Starting fresh.")
-        return set()
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+        _unreadable_checkpoint(cp, f"{type(e).__name__}: {e}",
+                               f"load:{type(e).__name__}")
+
+    # A payload that parses and is not a checkpoint. Separated from the decode
+    # failure, with its own phase key, because "truncated file" and "somebody
+    # wrote a different shape here" want different fixes -- load_results'
+    # arrangement. `data.get(...)` on a list raises AttributeError, which the
+    # pre-pass code did not catch at all.
+    if not isinstance(data, dict):
+        _unreadable_checkpoint(
+            cp, f"expected a JSON object, found {type(data).__name__}",
+            f"shape:{type(data).__name__}")
+    stems = data.get("completed_stems")
+    if not isinstance(stems, list):
+        # NOT the same as an empty checkpoint. `set(data.get(k, []))` used to
+        # turn this into "nothing completed", which is a silent full re-run
+        # wearing the clothes of a successful read.
+        _unreadable_checkpoint(
+            cp, f"'completed_stems' is {type(stems).__name__}, not a list",
+            f"shape:completed_stems={type(stems).__name__}")
+
+    outcome, detail = run_fingerprint.compare(
+        data.get("fingerprint"),
+        fingerprint if fingerprint is not None else run_fingerprint.current())
+    if outcome != run_fingerprint.FP_MATCH:
+        _refuse_checkpoint(outcome, detail, cp)
+
+    completed = set(stems)
+    console.out(f"[Checkpoint] Resuming: {len(completed)} patients already completed.")
+    console.out(f"[Checkpoint] Configuration matches: {detail}")
+    return completed
 
 
-def save_checkpoint(completed_stems: set) -> None:
+def _unreadable_checkpoint(cp, error: str, counter_key: str) -> None:
+    """Count, COPY aside, log, and raise. Always raises; never returns.
+
+    Shared by all three unreadable branches so the counter key is the only
+    thing that differs between them -- ``_unreadable_results``' arrangement,
+    and for its reason: three copies of this sequence is three chances for one
+    of them to stop preserving the file.
+    """
+    CHECKPOINT_FAULTS[counter_key] += 1
+    preserved, preserve_error, preserve_key = utils.preserve_corrupt_file(
+        cp, CORRUPT_CHECKPOINT_SUFFIX, keep_original=True)
+    if preserved:
+        where = f"A copy has been preserved as {preserved}."
+    else:
+        CHECKPOINT_FAULTS[f"preserve:{preserve_key}"] += 1
+        where = (f"It could NOT be copied aside ({preserve_error}), so the only "
+                 f"copy is the one still at {cp}.")
+
+    log.error("batch checkpoint unreadable", event="checkpoint_unreadable",
+              status="error", error_message=error)
+    raise run_fingerprint.ResumeRefusal("\n".join(
+        [f"REFUSED (unreadable): the batch checkpoint at {cp}",
+         f"    {error}",
+         f"    {where}",
+         "    Continuing would silently re-run every patient an earlier run "
+         "completed, at a live Stage 5 call each. THE CHECKPOINT IS INTACT: "
+         "nothing was deleted and no patient was re-run."]
+        + [f"    {line}" for line in _checkpoint_remediation()]),
+        outcome=run_fingerprint.FP_ABSENT)
+
+
+def save_checkpoint(completed_stems: set, fingerprint: dict = None) -> None:
     """
     Atomically persist completed filename stems to checkpoint file.
 
@@ -289,6 +464,13 @@ def save_checkpoint(completed_stems: set) -> None:
 
     Args:
         completed_stems: Full set of completed filename stem strings so far.
+        fingerprint: the configuration stamp to record. ``None`` -- what every
+            call site passes -- takes ``run_fingerprint.current()``, which is
+            resolved ONCE per process and cached. A stamp resolved per write
+            would be one live Qdrant round trip per patient, and worse than the
+            cost: a run is ONE configuration, so a per-write stamp that
+            straddled the weekly alias swap would put two collections into one
+            checkpoint and the file would then refuse itself.
     """
     with _checkpoint_lock:
         cp = _checkpoint_path()
@@ -300,6 +482,13 @@ def save_checkpoint(completed_stems: set) -> None:
                     "completed_stems": list(completed_stems),
                     "last_updated": datetime.now().isoformat(),
                     "count": len(completed_stems),
+                    # WHAT PRODUCED THIS SET. Last in the object rather than
+                    # first only because the three keys above are what File 25
+                    # has always written and a diff of two checkpoints should
+                    # read as an addition.
+                    "fingerprint": (fingerprint if fingerprint is not None
+                                    else run_fingerprint.current()),
+                    "collection_identity": run_fingerprint.COLLECTION_IDENTITY,
                 },
                 f,
                 indent=2,
@@ -411,21 +600,8 @@ class ResultsLoad(list):
         self.source_path = source_path
 
 
-_PRESERVE_EXHAUSTED = "SidecarNamesExhausted"
-"""Counter key for "1000 .corrupt sidecars already exist beside the results file".
-
-A NAMED CONSTANT rather than a slice of the message, because the message has no
-colon and the first draft keyed the counter on `error.split(':')[0]` -- which for
-this branch is the whole 80-character sentence. A counter key that is a sentence
-is a counter nobody can aggregate.
-"""
-
-
 def _preserve_corrupt_results(rp) -> tuple:
     """Rename an unreadable results file out of the way. Returns (path, error, key).
-
-    The third member is the COUNTER KEY for the failure, decided here rather
-    than derived from the message text at the call site.
 
     BEFORE ANY WRITE CAN REPLACE IT, which is the point. ``append_result`` does
     write-temp-then-``os.replace``, so the FIRST patient of a resumed run
@@ -433,31 +609,17 @@ def _preserve_corrupt_results(rp) -> tuple:
     patient's results were gone -- irrecoverably, silently, and while the run
     reported success.
 
-    THE SUFFIX IS NUMBERED WHEN IT COLLIDES. A fixed ``.corrupt`` would let the
-    second corruption destroy the copy taken at the first, which is the same
-    data loss one step removed. ``os.replace`` is deliberately not used to pick
-    the name -- it overwrites -- so the first free suffix is searched for and
-    ``os.rename`` onto it is guarded by that search.
-
-    A RENAME FAILURE IS RETURNED, NOT RAISED. Losing the prior results is bad;
-    failing the whole run because they could not be renamed is worse, and the
-    caller records it under the ``preserve:`` key precisely so the operator is
-    told the next write is about to destroy the file.
+    THE MECHANISM MOVED TO ``oncotriage/utils.py:preserve_corrupt_file`` and
+    this is the results file's name for it. It moved because the batch and
+    ablation CHECKPOINTS need the identical treatment for the identical reason
+    (``save_checkpoint`` also does temp-then-replace), and three copies of a
+    find-a-free-suffix-then-rename loop is two more chances for one of them to
+    stop preserving. What is left here is the suffix this file owns, so a
+    reader of the results path still finds the sidecar named where it is used.
+    The numbered-collision rule, the returned-not-raised rename failure and the
+    counter key are argued there.
     """
-    for suffix in range(0, 1000):
-        candidate = rp.with_name(
-            rp.name + CORRUPT_RESULTS_SUFFIX + (f".{suffix}" if suffix else ""))
-        if candidate.exists():
-            continue
-        try:
-            os.rename(rp, candidate)
-            return str(candidate), None, None
-        except OSError as exc:
-            return None, f"{type(exc).__name__}: {exc}", type(exc).__name__
-    return (None,
-            "1000 .corrupt sidecars already exist beside the results file; "
-            "refusing to guess a name",
-            _PRESERVE_EXHAUSTED)
+    return preserve_corrupt_file(rp, CORRUPT_RESULTS_SUFFIX)
 
 
 def load_results() -> ResultsLoad:
@@ -1688,6 +1850,13 @@ def main():
         one.
     """
     clear_write_ledger()
+    # ONE CONFIGURATION PER RUN, RESOLVED ONCE. Dropped here so a second
+    # main() in one process (a test, an embedder looping) resolves the
+    # collection again rather than stamping its checkpoint with the first
+    # run's -- clear_write_ledger()'s precedent, immediately above, and for
+    # the same reason: per-run state that survives into the next run is state
+    # that describes the wrong run.
+    run_fingerprint.clear_cache()
 
     with CaffeinateSession("Batch Runner"):
 
@@ -1753,7 +1922,33 @@ def main():
         # ------------------------------------------------------------------
         # 3. Load checkpoint and results (resume support)
         # ------------------------------------------------------------------
-        completed_ids = load_checkpoint()
+        # THE CONFIGURATION STAMP IS TAKEN ON THIS THREAD, BEFORE THE POOL.
+        # save_checkpoint() is called from _on_done, a done-CALLBACK, which
+        # runs on a WORKER thread -- so without this, MAX_WORKERS threads would
+        # reach an unwarmed cache at once on the first successful patient.
+        # run_fingerprint holds a lock for that, and this is the first line of
+        # defence: one resolution, on the main thread, before anything can
+        # race for it. It is also the value load_checkpoint compares against
+        # one line below, so what gates the resume and what stamps the writes
+        # are the same object rather than two readings that can straddle an
+        # alias swap.
+        _fingerprint = run_fingerprint.current()
+        console.out(f"[Config] prompt {_fingerprint['llm_classifier_prompt_version']}, "
+                    f"model {_fingerprint['matching_model_configured']}, "
+                    f"collection {_fingerprint['qdrant_collection']} "
+                    f"({_fingerprint['collection_points']} points), "
+                    f"snapshot {_fingerprint['data_snapshot_date']}")
+
+        # A REFUSAL HERE COSTS NOTHING AND IS THE POINT. It is above
+        # tracking.start_run and above the first billed call, so a checkpoint
+        # this run may not continue stops the process with no money spent, no
+        # tracking run opened and -- above all -- nothing deleted.
+        try:
+            completed_ids = load_checkpoint(fingerprint=_fingerprint)
+        except run_fingerprint.ResumeRefusal as exc:
+            console.out()
+            console.out(str(exc))
+            raise SystemExit(1)
         results_list = load_results()
 
         # ------------------------------------------------------------------

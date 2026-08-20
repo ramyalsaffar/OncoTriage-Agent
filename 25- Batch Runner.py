@@ -61,7 +61,11 @@ except ImportError:
         raise
     del _candidate, _how
 
-from oncotriage.batch.runner import main, reconciliation_exit_code
+from oncotriage.batch.runner import (
+    clear_checkpoint,
+    main,
+    reconciliation_exit_code,
+)
 
 
 # ===========================================================================
@@ -83,7 +87,53 @@ from oncotriage.batch.runner import main, reconciliation_exit_code
 # main() STILL RETURNS results_list and its return type is untouched; the
 # verdict is read off the module. See last_reconciliation() for why.
 
+# --fresh IS THE ONE FLAG, AND IT LIVES IN THIS GUARD ON PURPOSE
+# ---------------------------------------------------------------
+# The configuration-fingerprint pass made load_checkpoint() REFUSE a checkpoint
+# it cannot vouch for -- one written by a different prompt version, model,
+# collection or snapshot date, one written before fingerprinting existed, or
+# one that will not parse. A refusal deletes nothing, which is the contract,
+# and it therefore needs a way to say "yes, discard it".
+#
+# THE FLAG IS HERE AND NOT ON main(). runner.main() takes no arguments and its
+# own docstring pins the fact ("THE RETURN TYPE IS UNCHANGED, deliberately");
+# embedders call it programmatically, and a main() that started reading
+# sys.argv would SystemExit(2) inside somebody else's process the first time
+# their flags did not match ours. `05- FHIR Clean Data.py` puts --dry-run in
+# its guard for the same reason and CLAUDE.md records it: argparse inside the
+# __main__ block, so no name leaks and no library function grows a CLI.
+#
+# TWO CONTRACT CHANGES, BOTH STATED:
+#   * a BARE invocation is unchanged -- fresh defaults to False, main() is
+#     called with nothing, and the exit code is still the reconciliation's;
+#   * an UNRECOGNISED argument now exits 2 with a usage message. It used to be
+#     ignored, because nothing here read sys.argv at all -- so a mistyped flag
+#     silently started a full-corpus billed run.
+
 if __name__ == "__main__":
+    import argparse
+
+    _parser = argparse.ArgumentParser(
+        description="Run the full matching pipeline over every FHIR patient. "
+                    "COSTS MONEY: one live Stage 5 call per patient.")
+    _parser.add_argument(
+        "--fresh", action="store_true",
+        help="Delete the checkpoint before running, discarding all resume "
+             "state so every patient runs again. This is the remediation "
+             "load_checkpoint() names when it refuses a checkpoint written by "
+             "a different configuration -- and it re-bills the whole cohort, "
+             "which is why it is a flag rather than a fallback.")
+    _args = _parser.parse_args()
+
+    if _args.fresh:
+        # Announced before it happens, not after: this is a destructive,
+        # expensive request and the operator should see the file named while
+        # there is still time to interrupt. clear_checkpoint() prints
+        # "[Checkpoint] Cleared." itself, or nothing when there was none.
+        print("[--fresh] Discarding the batch checkpoint. Every patient will "
+              "run again, at one live Stage 5 call each.")
+        clear_checkpoint()
+
     main()
     sys.exit(reconciliation_exit_code())
 

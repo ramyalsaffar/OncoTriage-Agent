@@ -67,7 +67,9 @@ argument belongs in one.
 """
 
 import logging
+import os
 import re
+import shutil
 import time
 # `os` WAS IMPORTED HERE AND IS NOT ANY MORE (pass 20e). Its only reader was
 # exec_chain(), which resolved the caller's directory with os.path -- so
@@ -138,6 +140,97 @@ except Exception as _caffeine_exc:      # noqa: BLE001 - see above, not ImportEr
     del _caffeine_exc
 else:
     CAFFEINE_IMPORT_ERROR = None
+
+
+#------------------------------------------------------------------------------
+
+
+# Preserving a state file that could not be read
+#----------------------------------------------
+# THE PATTERN IS oncotriage/batch/runner.py's, LIFTED TO ONE SITE BECAUSE THREE
+# CALLERS NOW NEED IT. That module established it for the per-patient results
+# file: an unreadable state file is renamed out of the way BEFORE anything can
+# replace it, because every writer in this project does write-temp-then-replace
+# and the first write of the next run therefore destroys whatever it could not
+# parse -- irrecoverably, silently, and while the run reports success.
+#
+# The batch and ablation CHECKPOINTS need exactly the same treatment (a
+# checkpoint that cannot be read is a checkpoint about to be overwritten by
+# save_checkpoint's os.replace), and a second and third copy of a
+# find-a-free-suffix-then-rename loop is two more chances for one of them to
+# stop preserving. The suffix is the CALLER's argument rather than a constant
+# here, so "the results file's sidecar" and "the checkpoint's sidecar" stay
+# separable names at the call sites that mean them.
+
+
+def preserve_corrupt_file(path, suffix: str, limit: int = 1000,
+                          keep_original: bool = False) -> Tuple:
+    """Put an unreadable state file aside. ``(preserved_path, error, key)``.
+
+    Exactly one of the first two members is None. The third is a COUNTER KEY
+    for the failure, decided here rather than sliced out of the message at the
+    call site -- the batch runner's first version keyed on
+    ``error.split(':')[0]``, which for the exhausted branch is an
+    eighty-character sentence, and a counter key that is a sentence is a
+    counter nobody can aggregate.
+
+    THE SUFFIX IS NUMBERED WHEN IT COLLIDES. A fixed ``.corrupt`` would let the
+    second corruption destroy the copy taken at the first, which is the same
+    data loss one step removed. ``os.replace`` is deliberately NOT used to pick
+    the name -- it overwrites -- so the first free suffix is searched for and
+    ``os.rename`` onto it is guarded by that search.
+
+    A RENAME FAILURE IS RETURNED, NEVER RAISED. The caller decides what losing
+    the file costs; this function's job is to try and to say what happened.
+    The search is bounded so a directory somebody has filled with sidecars
+    produces a named refusal instead of an unbounded loop.
+
+    MOVE OR COPY IS THE CALLER'S DECISION AND IT IS NOT COSMETIC. A moved file
+    is GONE from its own path, so the next run finds nothing there. For the
+    per-patient RESULTS file that is right: it is a report, the checkpoint is
+    untouched, and the next run rebuilds the report.
+
+    For a CHECKPOINT it would be a disaster wearing the costume of a fix. A
+    checkpoint that is renamed aside and then refused makes the FIRST
+    invocation loud and the SECOND one silent: there is no checkpoint any more,
+    so the run starts fresh and re-bills the whole cohort with nothing to say
+    it did. ``keep_original=True`` copies instead, which leaves the refusal
+    STICKY -- every invocation refuses until an operator clears the checkpoint
+    deliberately -- while still putting the evidence somewhere that operator's
+    fix cannot destroy.
+
+    Args:
+        path:   the unreadable file, as anything ``os.rename`` accepts. Used as
+                a string, so a ``str`` and a ``pathlib.Path`` behave alike.
+        suffix: what to append before the numeric disambiguator.
+        limit:  how many suffixes to try before giving up.
+        keep_original: copy rather than move, leaving ``path`` where it is.
+    """
+    base = str(path)
+    for index in range(0, limit):
+        candidate = base + suffix + (f".{index}" if index else "")
+        if os.path.exists(candidate):
+            continue
+        try:
+            if keep_original:
+                shutil.copy2(base, candidate)
+            else:
+                os.rename(base, candidate)
+            return candidate, None, None
+        except OSError as exc:
+            return None, f"{type(exc).__name__}: {exc}", type(exc).__name__
+    return (None,
+            f"{limit} {suffix} sidecars already exist beside {base}; "
+            f"refusing to guess a name",
+            PRESERVE_EXHAUSTED)
+
+
+PRESERVE_EXHAUSTED = "SidecarNamesExhausted"
+"""Counter key for "the sidecar name search ran out of names".
+
+A NAMED CONSTANT rather than a slice of the message, for the reason
+``preserve_corrupt_file`` gives above.
+"""
 
 
 #------------------------------------------------------------------------------

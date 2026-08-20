@@ -41,10 +41,29 @@ USAGE
     python evaluation_run.py --only <patient-id> --output-dir <existing run dir>
     python evaluation_run.py --output-dir /some/other/place
 
+    # Finish an interrupted run. Skips patients already recorded as `ok` or
+    # `nothing_to_evaluate` whose record file is on disk, re-runs everything
+    # else, and prints the whole plan with a reason per patient before the
+    # first billed call. --output-dir is REQUIRED: the default destination is a
+    # new timestamped directory, which by construction holds nothing to resume.
+    python evaluation_run.py --resume --output-dir <existing run dir>
+    python evaluation_run.py --scan-only --resume --output-dir <dir>   # free
+
+    # Deliberately update a run under a DIFFERENT configuration. Without this
+    # flag an existing run whose recorded prompt version, matching model,
+    # backing Qdrant collection (name or point count) or data snapshot date
+    # differs from this one is REFUSED, with every differing field named and
+    # nothing written. With it, the stored environment is PRESERVED, the new
+    # one is appended to environment_history as a numbered era, and every
+    # record this invocation writes is stamped with that era.
+    python evaluation_run.py --resume --output-dir <dir> --allow-environment-change
+
 Exit codes:
     0 -- every selected patient produced a record and the post-check was clean
     1 -- refused before spending anything (no cohort, unusable index, unknown
-         --only id, an existing manifest that could not be read)
+         --only id, an existing manifest that could not be read, --resume with
+         no --output-dir, or an environment that does not match the one the
+         directory records)
     2 -- the run happened and something in it did not: a patient produced no
          record, or the post-check found a defect in what was written
 """

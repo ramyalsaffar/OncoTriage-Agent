@@ -78,6 +78,7 @@ from oncotriage import utils as _utils
 from oncotriage.registries import cancer_code_registry as _cancer_code_registry
 from oncotriage.registries import mesh as _mesh
 from oncotriage.storage import database_logger as _database_logger
+from oncotriage import run_fingerprint as _run_fingerprint
 from oncotriage import tracking as _tracking
 
 
@@ -151,6 +152,11 @@ _REGISTRY_SPEC = (
     ("EMIT_FAILURES", _observability.EMIT_FAILURES,
      "a console or log line could not be written; THIS REPORT IS ITSELF "
      "SUSPECT when this is non-zero"),
+    ("FINGERPRINT_DEGRADATIONS", _run_fingerprint.FINGERPRINT_DEGRADATIONS,
+     "this run's own configuration could not be established -- the backing "
+     "collection or its point count came back unknown -- so every resume gate "
+     "consulted afterwards REFUSED rather than skipping work it could not "
+     "vouch for"),
     # LAST, and after EMIT_FAILURES on purpose: it is the only counter here
     # that says nothing about the RUN. Every entry above it describes something
     # that happened to the pipeline; this one says the run was fine and its

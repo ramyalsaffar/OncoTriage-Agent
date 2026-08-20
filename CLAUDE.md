@@ -4101,6 +4101,211 @@ the index while every float column landed; (iii) a validation raise sat BELOW
 `mlflow.start_run`, which would have left an orphan run at RUNNING forever. All
 three are fixed and each has a check.
 
+### A resumed run knows what it is resuming FROM (the fingerprint pass)
+
+**THREE PAID HARNESSES PERSISTED PARTIAL STATE AND NONE OF THEM RECORDED WHAT
+IT WAS PRODUCED UNDER.** `oncotriage/evaluation/run_harness.py` (a manifest plus
+one JSON per patient), `oncotriage/batch/runner.py` (completed filename stems)
+and `oncotriage/ablation/study.py` (completed `(config, patient)` pairs) all
+recorded WHAT was done. So a resume after a prompt edit, a model change or an
+index rebuild skipped the work the OLD configuration had completed, ran the rest
+under the new one, and left ONE artifact holding two eras with nothing in it
+saying so. Every mean, rate and comparison over that artifact is a number about
+nothing.
+
+**`oncotriage/run_fingerprint.py` IS THE ONE STAMP AND THE ONE COMPARATOR**,
+beside `tracking.py` on the same layering argument (`config`, `utils`,
+`agent.prompts`, `agent.readiness`; imported by `batch`, `ablation` and
+`evaluation` alike, importing none of them). Five gated fields:
+`llm_classifier_prompt_version`, `matching_model_configured`,
+`qdrant_collection`, `collection_points`, `data_snapshot_date`. Three fields are
+deliberately recorded and NOT gated, each argued at the code: `collection_alias`
+(an alias may be repointed at the same backing collection, so gating it refuses
+a rename that changed nothing), `age_reference_date` (a pure function of the
+snapshot date, which IS gated — one fact counted twice otherwise) and
+`probe_state`.
+
+**THE MANIFEST'S `qdrant_collection` HELD THE ALIAS, AND THAT IS WHY THE FIELD
+HAD TO CHANGE MEANING.** `readiness.probe_index()` defaults to
+`config.COLLECTION_NAME`, so `manifest["environment"]["qdrant_collection"]` and
+`collection_alias` beside it were **the same string on every manifest ever
+written** — and an alias is a constant by design, so a gate on it is a gate that
+can never fire. It holds the RESOLVED backing collection now, which is what the
+per-record `run.qdrant_collection` has always held; the manifest and its own
+records stop disagreeing about one field name.
+
+**COLLECTION IDENTITY IS NAME PLUS POINT COUNT, AND IT IS WEAKER THAN THE
+FIXTURE HARNESS'S GATE — STATED, NOT GLOSSED.**
+`fixtures/capture.py:compute_collection_digest()` scrolls every `nct_id` and
+hashes the sorted set, catching a same-count content swap. This does not. The
+reason is layering rather than cost: two of the three consumers may not import
+the fixture harness (`batch` and `ablation` are production and experiment code;
+`fixtures.capture` imports the agent, the parser and the storage layer), and
+moving the digest to a neutral module is a refactor with its own equivalence
+proof — mixing a relocation into a gate pass is what makes an equivalence proof
+stop meaning anything. So the limit is written into `COLLECTION_IDENTITY`, which
+every consumer puts in its own artifact, and into every refusal that compared
+fields. **Recorded as the top follow-up:** move `compute_collection_digest` to
+`oncotriage/retrieval/`, prove it byte-identical, and raise all three gates.
+
+**FIVE CLOSED OUTCOMES, BECAUSE EACH NAMES A DIFFERENT REMEDIATION.** `FP_MATCH`
+resumes. `FP_CHANGED` is a field that genuinely differs. `FP_ABSENT` is unknown
+provenance — nothing recorded, or a stamp with no version, which is **every
+artifact written before this pass**. `FP_VERSION` is a different stamp SHAPE,
+asked before any field is compared so a field this version gates and that
+version never recorded is not reported as a configuration change. `FP_UNRESOLVED`
+is *this* run's own configuration failing to establish, asked **first**, because
+comparing against an UNKNOWN reports every field as changed and sends an
+operator to clear a perfectly good checkpoint when the fault is an unreachable
+endpoint. Clearing the artifact is right for three of the four refusals and
+wrong for that one, which is exactly why they are not one "mismatch" member.
+
+**THE LEGACY QUESTION HAS A MECHANICAL ANSWER, NOT A GUESS.** A stamp is
+distinguished from a legacy artifact by `fingerprint_version`: absent means
+"written before fingerprinting existed" and gets `FP_ABSENT` with that stated,
+rather than having its missing fields compared against live values and reported
+as a configuration change that never happened. A missing key is a DISAGREEMENT
+and never a pass —
+`ragas_harness.py:identity_disagreement`'s rule, adopted verbatim. **Nothing is
+ever silently upgraded**: a legacy environment block is carried into
+`environment_history` as era 0 exactly as found, unstamped, because writing
+today's identity onto records produced by an unknown one is the single thing
+this guard exists to prevent.
+
+**RESOLUTION IS CACHED PER PROCESS AND THAT IS A CORRECTNESS ARGUMENT.** The
+batch runner writes its checkpoint after every patient; a per-write stamp would
+be tens of thousands of round trips — but the reason is that a run is ONE
+configuration, and a per-write stamp straddling the weekly alias swap would put
+two collections into one checkpoint and the file would then refuse itself. The
+cache is behind an `RLock` (`deps._resolve`'s shape) because both consumers save
+their checkpoint from a done-CALLBACK, which runs on a WORKER thread; the first
+line of defence is that both `main()`s warm it on the main thread before their
+pool exists, which is also what makes the value that gates the resume and the
+value that stamps the writes ONE reading. The point count is taken of the
+RESOLVED name (`probe_index(collection=resolved)`), closing the window in which
+an alias swap between two round trips stamps collection A with B's count —
+`tracking.configuration_params` records that exact defect, found by running.
+
+**TASK 1 — `evaluation_run.py`.** `main()` OVERWROTE `manifest["environment"]`
+unconditionally, `--only` re-runs into an existing directory included. It now
+COMPARES first and writes nothing on a refusal.
+`--allow-environment-change` admits a deliberate cross-era update and is not a
+way to silence the guard: the stored environment is **preserved**, the new one
+is APPENDED to `environment_history` as a numbered era, the invocation records
+the override and the outcome that would have refused, and every record the
+invocation writes carries its `environment_era`. A second invocation under the
+same overridden configuration REUSES that era rather than appending a duplicate.
+The override deliberately does **not** cover `FP_UNRESOLVED`: its contract is
+that the new configuration is recorded, and an era whose identity is `unknown`
+is what makes a mixed manifest unreadable.
+
+  **A LIMIT WORTH KNOWING BEFORE USING THE OVERRIDE, and it is a finding rather
+  than a defect of this pass:** neither downstream consumer reads the era.
+  `evaluation/rater.py` and `evaluation/ragas_harness.py` both iterate
+  `manifest["runs"]` whole (verified by reading both), so an overridden manifest
+  is honest about its mix and will still be CONSUMED as one population until
+  those two are taught to filter. The field they would read now exists.
+
+**`--resume` SKIPS ON THREE FACTS AT ONCE**, never one: a manifest entry, a
+status in `RESUME_SKIP_STATUSES`, AND the record file it names present on disk.
+The third is what stops this becoming the defect every version gate here was
+written to refuse — a patient counted as done because a table says so while the
+artifact a downstream harness would read is missing. `ok` and
+`nothing_to_evaluate` skip; `failed` and **`pipeline_error`** re-run. The last is
+the one that could be argued either way and the argument is at the constants: a
+`pipeline_error` record carries no verdicts, contributes nothing to either
+evaluator and is reported by the post-check as a defect, so an operator resuming
+after fixing it wants it retried — and the re-run is NAMED IN THE PLAN before
+the first billed call rather than inferred from the bill afterwards. The two
+lists must PARTITION `RUN_STATUSES`, enforced by a `RuntimeError` at import (not
+an `assert`; `python -O` deletes those).
+
+**`--resume` WITHOUT `--output-dir` IS A REFUSAL**, on this file's own "`--only`
+with no ids" precedent: the default destination is a new timestamped directory,
+so the flag can only ever run the whole slice at full price while looking like a
+resume. `--resume` against a directory with no manifest is NOT an error and is
+NOT silent — ragas' precedent — it names the reason and runs everything.
+`--scan-only --resume` prints the whole plan for free and states that the
+environment guard was not evaluated, because that needs the index probe.
+
+**TASK 2 — THE BATCH CHECKPOINT, AND WHERE THE BRIEF'S OWN INSTRUCTION WAS
+WRONG.** The brief said to preserve an unreadable checkpoint by RENAME, on
+`CORRUPT_RESULTS_SUFFIX`'s pattern. Applied literally that produces the outcome
+the brief forbids: a renamed checkpoint is GONE from its own path, so invocation
+1 refuses loudly and invocation 2 finds nothing, starts fresh and **silently
+re-bills the whole cohort**. It is COPIED instead (`preserve_corrupt_file(...,
+keep_original=True)`), which leaves the refusal STICKY — every invocation
+refuses until an operator clears it deliberately — while still putting the
+evidence where that operator's fix cannot destroy it. The rename remains correct
+for the RESULTS file and is unchanged there: that is a report, the checkpoint is
+untouched, and the next run rebuilds it.
+
+Three unreadable classes, each with its own phase key: a decode/OS failure
+(`load:`), a payload that parses and is not an object (`shape:`), and a
+`completed_stems` that is not a list (`shape:`). The last was previously
+`set(data.get("completed_stems", []))` — a silent full re-run wearing the
+clothes of a successful read. A non-dict payload used to raise `AttributeError`
+uncaught.
+
+**THE REMEDIATION FITS A NO-ARGUMENT ENTRY POINT WITHOUT CHANGING `main()`.**
+`runner.main()` takes no arguments and its own docstring pins that; an embedder
+calls it programmatically, and a `main()` that started reading `sys.argv` would
+`SystemExit(2)` inside somebody else's process. So `--fresh` lives in
+`25- Batch Runner.py`'s `__main__` guard — exactly where `05- FHIR Clean
+Data.py` puts `--dry-run`, and for the reason recorded there. **Two contract
+changes, stated:** a bare invocation is unchanged; an UNRECOGNISED argument now
+exits 2 with usage, where it used to be ignored because nothing read `sys.argv`
+at all — so a mistyped flag silently started a full-corpus billed run.
+
+**TASK 3 — THE ABLATION CHECKPOINT** takes the same stamp with the same
+semantics, inside each database's own checkpoint file, so pass 20f-3's
+per-database isolation is untouched and now covers configuration as well as
+destination. `--fresh-start` is the remediation and this entry point has
+argparse, so the refusal names the flag with the operator's own `--db` rather
+than a `python -c`. It sits ABOVE `--summary-only` deliberately: that mode reads
+the database and never the checkpoint, so combining the two would otherwise look
+like it had cleared something.
+
+**A DEFECT IN THIS PASS'S OWN WORK, FOUND BY RUNNING RATHER THAN READING.**
+Stamping the checkpoint gave `load_checkpoint()` and `save_checkpoint()` — which
+had touched no network in their lives — a live Qdrant dependency, because the
+default stamp resolves. `main()` hid it completely (it resolves after
+`build_bm25_index_from_qdrant()`, so Qdrant is proven live and the stamp is
+cached), and it surfaced only when a bucket-A test that runs with no keys was
+measured: a caller without an endpoint got `FP_UNRESOLVED` and a refusal about
+nothing to do with its checkpoint. Both loaders take `fingerprint=` now, the two
+existing tests pass a literal stamp, and the new test asserts the seam with the
+resolver made to RAISE — plus the non-degeneracy control that OMITTING the
+argument does resolve, without which those checks would pass against a function
+that never consults the resolver at all.
+
+**WHAT WAS NOT CHANGED, AND WHY.** The resample pass and the write ledger are
+untouched: derived, not assumed — `run_resample` never calls `save_checkpoint`
+(its own comment records that resample entries are supplemental), the ledger
+records `log_inference` CALLS and no checkpoint code path reaches it, and
+`reconcile_writes` reads only the ledger and the database. The manifest's
+`schema_version` is deliberately NOT bumped: it is shared with the per-record
+version, records did not change shape, and bumping it would make `post_check`
+refuse every record already written. The stamp carries its own
+`fingerprint_version`, which is the right granularity.
+
+```bash
+# The fingerprint pass. Same shape, same directory. No network, no keys, no
+# spend, no live Qdrant, no live server, no corpus, no git history, no
+# database, and NOT in the collision matrix. It EXECS NOTHING -- every control
+# is a different INPUT to a pure function or an attribute rebind inside
+# try/finally with the restore asserted BY IDENTITY -- so it needs no
+# _EXEC_ALLOWLIST entry. ~2 s.
+python tests/test_resume_configuration_fingerprint.py            # 331
+```
+
+**TEST COUNTS.** `tests/test_agent_degraded_run_and_reporting.py` **118 → 118**
+and `tests/test_ablation_db_isolation.py` **72 → 72** — both were edited (their
+checkpoint fabrication now passes an explicit stamp) and neither moved, which is
+the point: the edit kept them offline rather than changing what they assert.
+`tests/test_package_invariants.py` is unchanged at **247/0/0**. Every other file
+reports exactly what it reported before.
+
 ### A SKIP IS NOT A PASS (commit `ec2033a`)
 
 `tests/test_package_invariants.py` has a third counter. `skip(label, reason)`

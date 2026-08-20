@@ -65,6 +65,42 @@ downstream render failed would be the most expensive possible way to fail.
 DETERMINISM. Selection is a pure function of the scan rows: candidates are
 ordered by bundle filename and every tie breaks on that name, so the same cohort
 selects the same patients on every run and a subset can be re-run by patient id.
+
+WHAT CONFIGURATION A DIRECTORY BELONGS TO (the fingerprint pass)
+---------------------------------------------------------------
+A manifest is the record of a PAID run, and every invocation that writes into
+one has to answer a question this file used to skip: is this the same pipeline
+that produced what is already there? ``main()`` overwrote
+``manifest["environment"]`` unconditionally -- on ``--only`` re-runs too -- so a
+directory could hold records from two prompt versions, two models or two Qdrant
+collections while its environment block described only the last writer, and
+every mean a downstream harness took over it was a mean across pipelines
+presented as one.
+
+So the stored environment is now COMPARED before anything is written, against
+``oncotriage/run_fingerprint.py`` -- the same five gated facts the batch and
+ablation checkpoints are stamped with. A disagreement REFUSES, naming every
+field and both values, having written nothing.
+``--allow-environment-change`` admits a deliberate cross-era update and is not
+a way to silence the guard: the stored environment is preserved, the new one is
+APPENDED to ``environment_history`` as a numbered era, and every record the
+invocation writes carries its ``environment_era``. A mixed manifest is
+therefore legible instead of merely permitted.
+
+  A LIMIT WORTH KNOWING BEFORE USING THE OVERRIDE: neither downstream harness
+  reads the era. ``oncotriage/evaluation/rater.py`` and
+  ``oncotriage/evaluation/ragas_harness.py`` both iterate ``manifest["runs"]``
+  whole. So an overridden manifest is honest about its mix and will still be
+  CONSUMED as one population until those two are taught to filter. Recorded
+  here as an open item rather than half-built, because the field they would
+  read now exists.
+
+``--resume`` skips a patient only when its manifest entry carries a status in
+``RESUME_SKIP_STATUSES`` AND the record file it names is on disk -- see the
+argument at those constants for why ``pipeline_error`` re-runs. The plan is
+printed in full, per patient with its reason, BEFORE the first billed call, and
+it lands in the invocations table so the terminal is not the only place that
+account ever existed.
 """
 
 import argparse
@@ -91,6 +127,7 @@ from oncotriage.config import (
     Project_Name,
 )
 from oncotriage.fhir.parser import parse_fhir_bundle
+from oncotriage import run_fingerprint
 from oncotriage.fixtures.capture import scan_cohort
 from oncotriage.observability import console, correlation_scope, get_logger
 from oncotriage.utils import (
@@ -167,6 +204,61 @@ STATUS_PIPELINE_ERROR = "pipeline_error"             # node_error_handler: the g
 STATUS_FAILED = "failed"                # an exception escaped graph.invoke
 RUN_STATUSES = (STATUS_OK, STATUS_NOTHING_TO_EVALUATE,
                 STATUS_PIPELINE_ERROR, STATUS_FAILED)
+
+# WHICH STATUSES --resume SKIPS AND WHICH IT RE-RUNS.
+#
+# The partition is over RUN_STATUSES and it is CLOSED IN BOTH DIRECTIONS: the
+# guard below fails at import if a status is in neither list or in both, so a
+# status invented at a new call site cannot be silently treated as a re-run
+# (which re-bills) or as a skip (which loses a patient) by falling through.
+#
+#   ok                    a terminal result was produced and persisted. Done.
+#   nothing_to_evaluate   node_no_candidates: a VALID, complete outcome with a
+#                         record on disk. It is skipped rather than re-run
+#                         because it is not a failure -- the pipeline answered,
+#                         and the answer was "no candidates". Re-running it
+#                         would also be nearly free (that terminal makes no
+#                         Stage 5 call), which is exactly why the decision has
+#                         to be made on what it MEANS rather than on what it
+#                         costs.
+#   failed                nothing was produced: no record, no terminal node.
+#                         Re-run.
+#   pipeline_error        node_error_handler answered. A record EXISTS and may
+#                         have cost a live Stage 5 call, so this is the one
+#                         that could be argued either way -- and it RE-RUNS.
+#                         The reasoning: --resume exists to finish a run that
+#                         did not finish, and a pipeline_error record carries
+#                         no verdicts, contributes nothing to either downstream
+#                         harness, and is reported by the post-check as a
+#                         defect. An operator resuming after fixing whatever
+#                         broke wants it retried; an operator who has not fixed
+#                         it pays again for the same failure, which is why the
+#                         re-run is NAMED IN THE PLAN before the first billed
+#                         call rather than inferred from the bill afterwards.
+RESUME_SKIP_STATUSES = (STATUS_OK, STATUS_NOTHING_TO_EVALUATE)
+RESUME_RERUN_STATUSES = (STATUS_PIPELINE_ERROR, STATUS_FAILED)
+
+if (set(RESUME_SKIP_STATUSES) | set(RESUME_RERUN_STATUSES)) != set(RUN_STATUSES) \
+        or set(RESUME_SKIP_STATUSES) & set(RESUME_RERUN_STATUSES):
+    # A RuntimeError and not an `assert`: this guard's whole job is to survive
+    # to the moment somebody adds a status, and `python -O` deletes asserts.
+    # Same reasoning as the MATCH_TIERS/PATIENT_OUTCOME_LABELS guard in
+    # oncotriage/dashboard/tiers.py.
+    raise RuntimeError(
+        f"RESUME_SKIP_STATUSES + RESUME_RERUN_STATUSES must partition "
+        f"RUN_STATUSES exactly. skip={RESUME_SKIP_STATUSES}, "
+        f"rerun={RESUME_RERUN_STATUSES}, all={RUN_STATUSES}")
+
+# What --resume decided for one patient. `skip` is the only one that does not
+# spend money, and every other member is a REASON to spend it -- named, so the
+# plan printed before the run says why each patient is being paid for again.
+ACTION_SKIP = "skip"
+ACTION_RUN_NEW = "run:no_prior_entry"
+ACTION_RUN_STATUS = "run:status"
+ACTION_RUN_RECORD_MISSING = "run:record_missing"
+ACTION_RUN_NOT_RESUMING = "run:not_resuming"
+RESUME_ACTIONS = (ACTION_SKIP, ACTION_RUN_NEW, ACTION_RUN_STATUS,
+                  ACTION_RUN_RECORD_MISSING, ACTION_RUN_NOT_RESUMING)
 
 # Why each patient is in the selection. Closed for the same reason.
 REASON_FALLBACK = "expansion_path_fallback"
@@ -842,6 +934,287 @@ def write_manifest(output_dir: str, manifest: Dict) -> List[str]:
     return write_json(os.path.join(output_dir, MANIFEST_FILENAME), manifest)
 
 
+# ===========================================================================
+# THE ENVIRONMENT BLOCK, AND THE GUARD OVER IT
+# ===========================================================================
+
+def build_environment(fingerprint: Dict, probe: Dict) -> Dict:
+    """The manifest's record of what this run is being executed under.
+
+    ``fingerprint`` is ``run_fingerprint.current()`` -- the five GATED facts
+    plus the stamp version. Everything else here is recorded and NOT gated,
+    each for a stated reason:
+
+      collection_alias      an alias may be repointed at the SAME backing
+                            collection, in which case the two runs are
+                            comparable; the resolved name in the fingerprint is
+                            the fact, and gating the alias would refuse a
+                            rename that changed nothing.
+      age_reference_date    a pure function of ``data_snapshot_date``, which IS
+                            gated. Gating both would be one fact counted twice.
+      probe_state           what the spend gate saw. A diagnostic; the run
+                            cannot proceed unless it is `populated`, so gating
+                            it would gate a constant.
+      collection_identity   NOT a fact about this run at all -- it is the
+                            statement of what the collection comparison
+                            compares, written into the artifact so a reader of
+                            a refusal or of a manifest knows the gate's limit
+                            without reading this module.
+
+    ``qdrant_collection`` NOW HOLDS THE RESOLVED BACKING COLLECTION, AND IT USED
+    TO HOLD THE ALIAS. That is a change to what an existing field MEANS and it
+    is the reason the environment gate can work at all: ``probe_index()``
+    defaults to ``config.COLLECTION_NAME``, so this field and
+    ``collection_alias`` beside it were the same string on every manifest ever
+    written -- and an alias is a constant by design, so a gate on it is a gate
+    that can never fire. The per-record ``run.qdrant_collection`` has always
+    held the resolved name (it goes through ``resolve_qdrant_collection()``), so
+    this also ends a manifest and its own records disagreeing about what one
+    field name means.
+    """
+    environment = dict(fingerprint)
+    environment.update({
+        "collection_alias": COLLECTION_NAME,
+        "age_reference_date": get_age_reference_date().isoformat(),
+        "probe_state": probe["state"],
+        "collection_identity": run_fingerprint.COLLECTION_IDENTITY,
+    })
+    return environment
+
+
+def era_of(manifest: Dict, fingerprint: Dict):
+    """Which recorded era this configuration IS, or None if it is a new one.
+
+    An era is an environment this manifest has already admitted. Returning the
+    existing index rather than always appending is what stops a manifest
+    updated three times under one overridden configuration from recording three
+    identical eras and reporting a mix that is really a pair.
+
+    Era 0 is ``manifest["environment"]`` -- always, including on a manifest
+    written before this pass, whose environment carries no fingerprint at all
+    and therefore matches nothing. That is correct: an unstamped era is a real
+    era whose identity is unknown, and it must not be silently identified with
+    any other.
+    """
+    for index, entry in enumerate(manifest.get("environment_history") or []):
+        recorded = (entry or {}).get("environment")
+        outcome, _ = run_fingerprint.compare(recorded, fingerprint)
+        if outcome == run_fingerprint.FP_MATCH:
+            return index
+    return None
+
+
+def environment_gate(manifest, fingerprint: Dict) -> Tuple:
+    """``(outcome, detail)`` -- may this run write into that manifest?
+
+    ``outcome`` is a ``run_fingerprint.FP_OUTCOMES`` member and only
+    ``FP_MATCH`` permits an un-overridden write. A manifest of None (a fresh
+    directory) is ``FP_MATCH`` with a detail saying so: there is nothing to
+    disagree with, and inventing a refusal for the ordinary first run would
+    make the flag mandatory.
+
+    THE COMPARISON TARGET IS ``manifest["environment"]``, THE MANIFEST'S
+    DECLARED IDENTITY, and never the most recent era. The rule this enforces is
+    "never overwrite the stored environment of a paid run with a different
+    one", so the stored one is what every later invocation is measured against
+    and every admitted deviation is recorded as a deviation FROM IT rather than
+    quietly becoming the new baseline. A manifest whose baseline drifted one
+    override at a time would end up describing a configuration no record in it
+    was ever produced under.
+    """
+    if manifest is None:
+        return run_fingerprint.FP_MATCH, "no existing manifest; this is a new run"
+    return run_fingerprint.compare(manifest.get("environment"), fingerprint)
+
+
+def environment_refusal_lines(outcome: str, detail: str, output_dir: str,
+                              overridable: bool) -> List[str]:
+    """The refusal, with this harness's own remediation."""
+    remediation = [
+        "Point --output-dir at a new directory to run this configuration "
+        "separately (the recommended fix: two configurations are two runs).",
+    ]
+    if overridable:
+        remediation.append(
+            "Or pass --allow-environment-change to write into this run anyway. "
+            "It preserves the stored environment, records the new one as a "
+            "separate era in environment_history, and stamps every record it "
+            "writes with that era -- so the manifest states the mix instead of "
+            "hiding it.")
+    else:
+        remediation.append(
+            "--allow-environment-change does NOT cover this outcome: it admits "
+            "a configuration change that is KNOWN and can be recorded, and "
+            "this run's own configuration could not be established at all. "
+            "There is nothing to write into the era.")
+    remediation.append("NOTHING HAS BEEN WRITTEN. The manifest and every "
+                       "record beside it are exactly as they were.")
+    return run_fingerprint.refusal_lines(
+        outcome, detail, f"{os.path.join(output_dir, MANIFEST_FILENAME)}",
+        remediation)
+
+
+# Which refusals --allow-environment-change may admit. FP_UNRESOLVED is
+# deliberately absent and that is not an oversight: the override's contract is
+# that the new configuration is RECORDED as an era, and an era whose identity
+# is `unknown` is exactly what makes a mixed manifest unreadable. The operator
+# who cannot resolve their own collection has a broken endpoint, not a
+# configuration decision to make -- and the index spend gate above this would
+# have refused the run anyway.
+OVERRIDABLE_OUTCOMES = (run_fingerprint.FP_CHANGED, run_fingerprint.FP_ABSENT,
+                        run_fingerprint.FP_VERSION)
+
+
+def record_environment(manifest: Dict, environment: Dict, outcome: str,
+                       fingerprint: Dict, override_used: bool) -> int:
+    """Put this run's environment into the manifest and return its era index.
+
+    THE STORED ENVIRONMENT IS NEVER OVERWRITTEN once it exists. On a fresh
+    manifest this writes era 0 and seeds the history with it. On a matching
+    resume it writes NOTHING -- the stored block is left byte-identical, which
+    is what "an --only re-run into a matching directory preserves the
+    environment" means and is checkable by comparing the file's bytes. On an
+    admitted change it APPENDS an era and leaves era 0 alone.
+
+    A LEGACY MANIFEST'S ENVIRONMENT BECOMES ERA 0 UNCHANGED. It is copied into
+    the history exactly as it was found, unstamped, so the history is complete
+    and the manifest never claims a provenance for records it does not have
+    one for. It is deliberately NOT upgraded with today's fingerprint: that
+    would be writing this configuration's identity onto records produced by an
+    unknown one, which is the single thing this whole guard exists to prevent.
+    """
+    history = manifest.get("environment_history")
+    if not isinstance(history, list):
+        history = []
+    if "environment" not in manifest:
+        manifest["environment"] = environment
+    if not history:
+        history = [{
+            "era": 0,
+            "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+            "environment": manifest["environment"],
+            "override": False,
+            "outcome": run_fingerprint.FP_MATCH,
+            "differing_fields": [],
+        }]
+        manifest["environment_history"] = history
+
+    existing = era_of(manifest, fingerprint)
+    if existing is not None:
+        return existing
+
+    if not override_used:
+        # Unreachable through main(): a non-matching environment without the
+        # override has already returned EXIT_PRECONDITION. Stated as a
+        # RuntimeError rather than left implicit so a future caller that skips
+        # the gate cannot append an era silently.
+        raise RuntimeError(
+            f"record_environment was asked to add a new era with outcome "
+            f"{outcome!r} and no override; that would be exactly the silent "
+            f"rewrite the environment guard exists to prevent")
+
+    history.append({
+        "era": len(history),
+        "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+        "environment": environment,
+        "override": True,
+        "outcome": outcome,
+        "differing_fields": run_fingerprint.disagreements(
+            manifest.get("environment"), fingerprint),
+    })
+    manifest["environment_history"] = history
+    return len(history) - 1
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
+# THE --resume PLAN
+# ===========================================================================
+
+def resume_actions(to_run: List[Dict], manifest, output_dir: str,
+                   resume: bool) -> List[Dict]:
+    """One decision per selected patient. Pure: filesystem reads only, no spend.
+
+    Returns ``[{"entry", "patient_id", "action", "reason"}]`` in the order the
+    patients would run.
+
+    A SKIP REQUIRES THREE THINGS TO BE TRUE AT ONCE, not one. A manifest entry,
+    a status in ``RESUME_SKIP_STATUSES``, AND the record file it names present
+    on disk. The third is what stops this becoming the defect every version
+    gate in this project was written to refuse: a patient counted as done
+    because a table says so while the artifact a downstream harness would read
+    is not there. ``oncotriage/evaluation/rater.py`` and ``ragas_harness.py``
+    both treat a manifest entry naming a missing file as a problem, so a skip
+    on that entry would hand them one.
+    """
+    actions = []
+    runs = (manifest or {}).get("runs") or {}
+    for entry in to_run:
+        patient_id = entry["row"]["patient_id"]
+        stored = runs.get(patient_id) or {}
+        if not resume:
+            action, reason = ACTION_RUN_NOT_RESUMING, "--resume was not given"
+        elif not stored:
+            action, reason = ACTION_RUN_NEW, "no manifest entry for this patient"
+        elif stored.get("status") not in RESUME_SKIP_STATUSES:
+            action = ACTION_RUN_STATUS
+            reason = (f"status {stored.get('status')!r} is a re-run status "
+                      f"({', '.join(RESUME_RERUN_STATUSES)})")
+            if stored.get("error"):
+                reason += f": {str(stored['error'])[:120]}"
+        elif not stored.get("file"):
+            action = ACTION_RUN_RECORD_MISSING
+            reason = f"status {stored['status']!r} but the entry names no file"
+        elif not os.path.exists(os.path.join(output_dir, stored["file"])):
+            action = ACTION_RUN_RECORD_MISSING
+            reason = (f"status {stored['status']!r} but {stored['file']} is not "
+                      f"in the output directory")
+        else:
+            action = ACTION_SKIP
+            reason = (f"status {stored['status']!r}, {stored['file']} present, "
+                      f"{stored.get('criterion_decisions') or 0} criterion "
+                      f"decision(s)")
+        assert action in RESUME_ACTIONS, f"unknown resume action {action!r}"
+        actions.append({"entry": entry, "patient_id": patient_id,
+                        "action": action, "reason": reason})
+    return actions
+
+
+def print_resume_plan(actions: List[Dict], resume: bool,
+                      environment_checked: bool) -> None:
+    """What the invocation will actually do, printed BEFORE the first spend.
+
+    Printed whether or not ``--resume`` was given, because "every selected
+    patient will run" is also a plan and an operator about to spend money is
+    owed the same sentence either way.
+    """
+    running = [a for a in actions if a["action"] != ACTION_SKIP]
+    skipping = [a for a in actions if a["action"] == ACTION_SKIP]
+
+    console.out(f"\n{'-' * 78}\nPLAN ({len(running)} to run, "
+                f"{len(skipping)} to skip)\n{'-' * 78}")
+    if resume:
+        console.out("  --resume: an entry is skipped only when its status is "
+                    f"one of {RESUME_SKIP_STATUSES} AND the record it names is "
+                    f"on disk.")
+    for action in actions:
+        verb = "SKIP" if action["action"] == ACTION_SKIP else "RUN "
+        console.out(f"  {verb} {action['patient_id']}")
+        console.out(f"         {action['action']}: {action['reason']}")
+    console.out(f"\n  will run  : {len(running)} patient(s), one live Stage 5 "
+                f"call each")
+    console.out(f"  will skip : {len(skipping)} patient(s), no call, no charge")
+    if not environment_checked:
+        console.out("  NOTE: the environment guard has NOT been evaluated -- it "
+                    "needs the index probe, which this mode does not run. A "
+                    "real run may refuse this directory.")
+
+
+#------------------------------------------------------------------------------
+
+
 def summarise(manifest: Dict) -> Dict:
     """Totals over whatever the manifest currently holds.
 
@@ -1015,6 +1388,21 @@ def _parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--output-dir", default=None,
                         help="Where to write. Default: a new timestamped "
                              "directory under the project's Testing tree.")
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip patients whose manifest entry already "
+                             f"carries one of {RESUME_SKIP_STATUSES} AND whose "
+                             "record file is on disk; re-run the rest. "
+                             "Requires --output-dir: the default is a new "
+                             "timestamped directory, which by construction "
+                             "holds nothing to resume.")
+    parser.add_argument("--allow-environment-change", action="store_true",
+                        help="Write into an existing run whose recorded "
+                             "environment differs from this one. It overwrites "
+                             "nothing: the stored environment is preserved, "
+                             "the new one is appended to environment_history, "
+                             "and every record this invocation writes is "
+                             "stamped with its era. Use it only when a mixed "
+                             "run is what you actually want.")
     return parser.parse_args(argv)
 
 
@@ -1023,6 +1411,19 @@ def main(argv=None) -> int:
 
     if args.select < 1:
         console.out("[FATAL] --select must be at least 1.")
+        return EXIT_PRECONDITION
+
+    # --resume WITHOUT --output-dir CANNOT DO ANYTHING, so it is a refusal and
+    # not a no-op, on this file's own `--only with no ids` precedent. The
+    # default destination is a NEW timestamped directory: there is no manifest
+    # in it, every patient would be a run, and the operator who typed --resume
+    # would pay the full slice for a flag that silently did nothing.
+    if args.resume and not args.output_dir:
+        console.out("\n[FATAL] --resume needs --output-dir. Without it the "
+                    "destination is a new timestamped directory, which holds "
+                    "no manifest and therefore nothing to resume -- the whole "
+                    "selection would run, at a live Stage 5 call each. Name "
+                    "the run directory to resume. Nothing was run.")
         return EXIT_PRECONDITION
 
     started_utc = datetime.now(timezone.utc)
@@ -1093,9 +1494,36 @@ def main(argv=None) -> int:
         # same ids run them in the same sequence.
         to_run = [e for e in selection if e["row"]["patient_id"] in set(wanted)]
 
+    # --- the manifest is read BEFORE anything else needs it ---------------
+    #
+    # Free (a filesystem read), and moved above the index probe because two
+    # things now depend on it: the resume plan, which --scan-only prints, and
+    # the environment guard, which must refuse before os.makedirs rather than
+    # after. read_manifest() returns None for a directory that does not exist
+    # yet, so no order-of-creation question arises.
+    try:
+        manifest = read_manifest(output_dir)
+    except Exception as exc:                         # noqa: BLE001 -- fatal by design
+        console.out(f"[FATAL] {os.path.join(output_dir, MANIFEST_FILENAME)} "
+                    f"exists and could not be read ({type(exc).__name__}: {exc}). "
+                    f"It is the record of a paid run; refusing to overwrite it.")
+        return EXIT_PRECONDITION
+
+    if args.resume and manifest is None:
+        # NOT an error and NOT silent -- ragas_run.py's `--resume with nothing
+        # to resume from` precedent. The whole selection is about to be paid
+        # for, and an operator who mistyped --output-dir should read the reason
+        # here rather than infer it from the bill.
+        console.out(f"\n[--resume] No {MANIFEST_FILENAME} in {output_dir}; "
+                    f"there is nothing to resume and the whole selection will "
+                    f"run.")
+
+    actions = resume_actions(to_run, manifest, output_dir, args.resume)
+
     if args.scan_only:
-        console.out(f"\n[Scan-only] {len(to_run)} patient(s) would run. "
-                    f"Nothing was executed and nothing was written.")
+        print_resume_plan(actions, args.resume, environment_checked=False)
+        console.out(f"\n[Scan-only] Nothing was executed and nothing was "
+                    f"written.")
         return EXIT_OK
 
     # --- refuse to spend against an index that cannot answer ----------------
@@ -1117,16 +1545,46 @@ def main(argv=None) -> int:
                     f"{probe['state']!r}. Nothing was run.")
         return EXIT_PRECONDITION
 
-    # --- an existing manifest is read before it is replaced -----------------
-    os.makedirs(output_dir, exist_ok=True)
-    try:
-        manifest = read_manifest(output_dir)
-    except Exception as exc:                         # noqa: BLE001 -- fatal by design
-        console.out(f"[FATAL] {os.path.join(output_dir, MANIFEST_FILENAME)} "
-                    f"exists and could not be read ({type(exc).__name__}: {exc}). "
-                    f"It is the record of a paid run; refusing to overwrite it.")
-        return EXIT_PRECONDITION
+    # --- THE ENVIRONMENT GUARD -------------------------------------------
+    #
+    # BEFORE os.makedirs, BEFORE the manifest is touched and before a cent is
+    # spent. The defect it closes is not hypothetical: main() used to overwrite
+    # manifest["environment"] unconditionally on every invocation, including an
+    # --only re-run into an existing directory, so a manifest could hold records
+    # from two configurations while its environment block described only the
+    # last one to write. Every downstream mean is then a mean over two
+    # pipelines presented as one.
+    run_fingerprint.clear_cache()
+    fingerprint = run_fingerprint.current()
+    environment = build_environment(fingerprint, probe)
+    # NAMED env_outcome AND NOT outcome. The per-patient loop below binds a
+    # local called `outcome` from run_one_patient(), and the invocation record
+    # written AFTER that loop needs this one -- so sharing the name would have
+    # recorded the last patient's pipeline status as the environment gate's
+    # verdict. A shadowing bug that would have shown up in an artifact rather
+    # than in a traceback.
+    env_outcome, env_detail = environment_gate(manifest, fingerprint)
 
+    if env_outcome != run_fingerprint.FP_MATCH:
+        overridable = env_outcome in OVERRIDABLE_OUTCOMES
+        if not (overridable and args.allow_environment_change):
+            console.out("")
+            for line in environment_refusal_lines(env_outcome, env_detail,
+                                                  output_dir, overridable):
+                console.out(line)
+            log.error("evaluation run refused",
+                      event="evaluation_environment_refused",
+                      status="error", error_type=env_outcome)
+            return EXIT_PRECONDITION
+        console.out(f"\n[--allow-environment-change] {env_outcome}: {env_detail}")
+        console.out("  The stored environment is preserved; this "
+                    "configuration is recorded as a separate era and every "
+                    "record written by this invocation is stamped with it.")
+
+    override_used = (env_outcome != run_fingerprint.FP_MATCH
+                     and args.allow_environment_change)
+
+    os.makedirs(output_dir, exist_ok=True)
     if manifest is None:
         manifest = {
             "schema_version": RECORD_SCHEMA_VERSION,
@@ -1146,15 +1604,12 @@ def main(argv=None) -> int:
         "deviations": deviations,
         "patients": table,
     }
-    manifest["environment"] = {
-        "qdrant_collection": probe["collection"],
-        "collection_alias": COLLECTION_NAME,
-        "collection_points": probe["points"],
-        "matching_model_configured": MATCHING_MODEL,
-        "llm_classifier_prompt_version": PROMPT_VERSION,
-        "data_snapshot_date": DATA_SNAPSHOT_DATE,
-        "age_reference_date": get_age_reference_date().isoformat(),
-    }
+    # NOT AN ASSIGNMENT. record_environment writes the block only when there
+    # is not one already, and otherwise leaves the stored bytes untouched --
+    # which is what makes "an --only re-run into a matching directory preserves
+    # the environment" a property of the code rather than a hope.
+    era = record_environment(manifest, environment, env_outcome, fingerprint,
+                             override_used)
     manifest.setdefault("runs", {})
     manifest.setdefault("invocations", [])
 
@@ -1163,12 +1618,26 @@ def main(argv=None) -> int:
     taken = {entry["file"] for entry in manifest["runs"].values()
              if entry.get("file")}
 
+    # --- what this invocation will actually do, BEFORE the first spend -----
+    print_resume_plan(actions, args.resume, environment_checked=True)
+    skipped = [a for a in actions if a["action"] == ACTION_SKIP]
+    to_run = [a["entry"] for a in actions if a["action"] != ACTION_SKIP]
+
+    if not to_run:
+        # Every selected patient was skipped. NOT a failure and not a silent
+        # zero-patient run: the manifest is still updated with the invocation
+        # (so "we asked and there was nothing to do" is on the record), the
+        # post-check still runs over what is on disk, and the exit code is
+        # whatever that post-check finds.
+        console.out(f"\n[--resume] Every selected patient is already current. "
+                    f"No Stage 5 call will be made.")
+
     console.out(f"\n{'=' * 78}")
     console.out(f"PAID RUN: {len(to_run)} patient(s), one live Stage 5 call each")
     console.out(f"{'=' * 78}")
 
     log.info("evaluation run started", event="evaluation_run_started",
-             count=len(to_run), collection=probe["collection"])
+             count=len(to_run), collection=fingerprint["qdrant_collection"])
 
     failures = []
     with CaffeinateSession("evaluation run"):
@@ -1192,6 +1661,14 @@ def main(argv=None) -> int:
                 manifest["runs"][row["patient_id"]] = {
                     "status": STATUS_FAILED,
                     "bundle": row["bundle"],
+                    # WHICH CONFIGURATION THIS ENTRY WAS PRODUCED UNDER, as an
+                    # index into environment_history. On every un-overridden
+                    # run it is 0 and says nothing new; on a manifest that has
+                    # admitted a second era it is the only thing that says
+                    # which records belong to which, and a mean taken over the
+                    # whole table without reading it is a mean over two
+                    # pipelines.
+                    "environment_era": era,
                     # Carried forward, not blanked. The file is still there and
                     # is still a real paid run; what is now true of it is that
                     # a later attempt failed, which `stale_record` says.
@@ -1219,6 +1696,7 @@ def main(argv=None) -> int:
             run_entry = {
                 "status": outcome["status"],
                 "bundle": row["bundle"],
+                "environment_era": era,
                 "file": name,
                 "terminal_node": outcome["terminal_node"],
                 "error": outcome["error"],
@@ -1257,6 +1735,22 @@ def main(argv=None) -> int:
         "select": args.select,
         "only": list(args.only) if args.only is not None else None,
         "patients_run": [e["row"]["patient_id"] for e in to_run],
+        # WHAT THIS INVOCATION RESUMED, AND WHAT IT DID NOT DO.
+        #
+        # patients_run alone cannot answer "why is this run shorter than the
+        # selection" -- --only, --resume and a cohort that shrank all produce
+        # the same short list. The skip table names each one and the reason the
+        # plan printed, so the manifest carries the same account the terminal
+        # did rather than the terminal being the only place it ever existed.
+        "resume": bool(args.resume),
+        "patients_skipped": [a["patient_id"] for a in skipped],
+        "skip_reasons": {a["patient_id"]: a["reason"] for a in skipped},
+        "run_reasons": {a["patient_id"]: f"{a['action']}: {a['reason']}"
+                        for a in actions if a["action"] != ACTION_SKIP},
+        "environment_era": era,
+        "environment_outcome": env_outcome,
+        "environment_override": override_used,
+        "environment_detail": env_detail,
     })
     write_manifest(output_dir, manifest)
 
@@ -1269,6 +1763,14 @@ def main(argv=None) -> int:
                   if (manifest["runs"].get(e["row"]["patient_id"]) or {})
                   .get("terminal_node"))
     console.out(f"  terminal node reached : {reached}/{len(to_run)}")
+    if skipped:
+        console.out(f"  skipped (--resume)    : {len(skipped)} "
+                    f"(already current; no Stage 5 call, no charge)")
+    if override_used:
+        console.out(f"  ENVIRONMENT ERA       : {era}  <- THIS MANIFEST HOLDS "
+                    f"MORE THAN ONE CONFIGURATION")
+        console.out(f"                          see environment_history; "
+                    f"records are stamped with environment_era")
     for status, count in totals["by_status"].items():
         console.out(f"    {status:<22} {count}")
     for node, count in totals["by_terminal_node"].items():

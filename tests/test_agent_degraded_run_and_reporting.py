@@ -99,6 +99,7 @@ from oncotriage.agent.terminal import (
     node_finalize,
     node_no_candidates,
 )
+from oncotriage import run_fingerprint as _run_fingerprint
 from oncotriage.batch import runner as _runner
 from oncotriage.config import MAX_LLM_CLASSIFIER_RETRIES
 from oncotriage.storage.database_logger import (
@@ -972,13 +973,29 @@ try:
         os.chmod(_RESULTS_SCRATCH, _mode_was)
 
     # --- (h) THE CHECKPOINT IS UNTOUCHED, asserted rather than claimed -----
-    _runner.save_checkpoint({"patient-a", "patient-b"})
+    # THE EXPLICIT STAMP KEEPS THIS FILE OFFLINE. The configuration-fingerprint
+    # pass made the checkpoint carry what produced it, and the default stamp is
+    # run_fingerprint.current() -- two live Qdrant round trips. Passing one is
+    # the documented seam for a caller with no endpoint; its VALUE is
+    # irrelevant here, only that both sides are handed the same one, because
+    # this check is about the RESULTS file not disturbing the checkpoint.
+    _ckpt_stamp = {
+        "fingerprint_version": _run_fingerprint.FINGERPRINT_VERSION,
+        "llm_classifier_prompt_version": "test-prompt",
+        "matching_model_configured": "test-model",
+        "qdrant_collection": "test_collection",
+        "collection_points": 1,
+        "data_snapshot_date": "2026-01-01",
+    }
+    _runner.save_checkpoint({"patient-a", "patient-b"},
+                            fingerprint=_ckpt_stamp)
     with open(_rp, "w") as _fh:
         _fh.write("still not json")
     quiet(_runner.load_results)
     check("a corrupt results file leaves the checkpoint intact, so nothing "
           "is re-run because of it",
-          _runner.load_checkpoint(), {"patient-a", "patient-b"})
+          _runner.load_checkpoint(fingerprint=_ckpt_stamp),
+          {"patient-a", "patient-b"})
 finally:
     if _paths_had:
         paths._RESOLVED["checkpoint_path"] = _paths_was

@@ -92,6 +92,7 @@ import tempfile
 from pathlib import Path
 
 from oncotriage.agent import deps as _deps
+from oncotriage import run_fingerprint as _run_fingerprint
 from oncotriage.ablation import study as _study
 
 
@@ -524,13 +525,31 @@ check("...named after it, so two scratch databases in one directory do not "
 # reads or writes the real checkpoint at all. NO exec(), no source patching:
 # tests/test_storage_query_layer.py holds the repository's one argued exec()
 # allowance and this file has no business joining it.
+# A LITERAL CONFIGURATION STAMP, so this file stays offline. The
+# configuration-fingerprint pass made a checkpoint carry what produced it, and
+# save/load default to run_fingerprint.current(), which resolves the backing
+# Qdrant collection and counts its points -- two live round trips. Passing the
+# stamp explicitly is the documented seam for a caller with no endpoint. Its
+# VALUE is irrelevant to every check below; that both sides are handed the SAME
+# one is what matters, because this section is about which FILE is read and
+# never about which configuration wrote it.
+_STAMP = {
+    "fingerprint_version": _run_fingerprint.FINGERPRINT_VERSION,
+    "llm_classifier_prompt_version": "test-prompt",
+    "matching_model_configured": "test-model",
+    "qdrant_collection": "test_collection",
+    "collection_points": 1,
+    "data_snapshot_date": "2026-01-01",
+}
+
 _ISO_DIR = os.path.join(_TMP, "resume-isolation")
 os.makedirs(_ISO_DIR)
 _DB_A = os.path.join(_ISO_DIR, "stands_in_for_production.db")
 _DB_B = os.path.join(_ISO_DIR, "scratch.db")
 _CKPT_A = _study._ablation_checkpoint_path(_DB_A)
 
-_study.save_ablation_checkpoint({("full_pipeline", "already-done")}, db_path=_DB_A)
+_study.save_ablation_checkpoint({("full_pipeline", "already-done")},
+                                db_path=_DB_A, fingerprint=_STAMP)
 check("A's checkpoint was written (non-degeneracy: the defect below needs "
       "something to be wrongly inherited)", _CKPT_A.exists(), True)
 
@@ -541,15 +560,18 @@ try:
     check("PRE-20f-3: a run told to write to B reads A's resume state -- it "
           "would skip those pairs and write nothing for them into B, then "
           "print COMPLETE. THIS IS THE DEFECT.",
-          _study.load_ablation_checkpoint(db_path=_DB_B),
+          _study.load_ablation_checkpoint(db_path=_DB_B,
+                                    fingerprint=_STAMP),
           {("full_pipeline", "already-done")})
 finally:
     _study._ablation_checkpoint_path = _saved_ckpt_fn
 
 check("...while the SHIPPED function gives B its own, empty, resume state",
-      _study.load_ablation_checkpoint(db_path=_DB_B), set())
+      _study.load_ablation_checkpoint(db_path=_DB_B,
+                                    fingerprint=_STAMP), set())
 check("...and A's is still A's, so the fix isolates rather than disabling "
-      "resume", _study.load_ablation_checkpoint(db_path=_DB_A),
+      "resume", _study.load_ablation_checkpoint(db_path=_DB_A,
+                                    fingerprint=_STAMP),
       {("full_pipeline", "already-done")})
 check("...and the two are different files (non-degeneracy)",
       _study._ablation_checkpoint_path(_DB_A)
@@ -559,11 +581,13 @@ check("...and the two are different files (non-degeneracy)",
 _prod_ckpt_before = (_PROD_CKPT.exists(),
                      _PROD_CKPT.read_bytes() if _PROD_CKPT.exists() else None)
 
-_study.save_ablation_checkpoint({("full_pipeline", "iso-1")}, db_path=_SCRATCH_DB)
+_study.save_ablation_checkpoint({("full_pipeline", "iso-1")},
+                                db_path=_SCRATCH_DB, fingerprint=_STAMP)
 check("save_ablation_checkpoint() wrote the scratch checkpoint",
       _SCRATCH_CKPT.exists(), True)
 check("...and load_ablation_checkpoint() reads it back",
-      _study.load_ablation_checkpoint(db_path=_SCRATCH_DB),
+      _study.load_ablation_checkpoint(db_path=_SCRATCH_DB,
+                                    fingerprint=_STAMP),
       {("full_pipeline", "iso-1")})
 _study.clear_ablation_checkpoint(db_path=_SCRATCH_DB)
 check("...and clear_ablation_checkpoint() removes THAT one",
@@ -641,7 +665,8 @@ _saved_path_fn = _study._ablation_checkpoint_path
 # two OSError handlers and not about which checkpoint is chosen.
 _study._ablation_checkpoint_path = lambda db_path=None: _CHECKPOINT
 try:
-    _study.save_ablation_checkpoint({("full_pipeline", "p1")})
+    _study.save_ablation_checkpoint({("full_pipeline", "p1")},
+                                    fingerprint=_STAMP)
     check("a healthy write produces the checkpoint file (non-degeneracy)",
           _CHECKPOINT.exists(), True)
     check("...and records no degradation",
@@ -655,7 +680,8 @@ try:
     os.makedirs(_blocker)
 
     _type6, _message6 = raises(
-        lambda: _study.save_ablation_checkpoint({("full_pipeline", "p2")}))
+        lambda: _study.save_ablation_checkpoint({("full_pipeline", "p2")},
+                                                fingerprint=_STAMP))
     check("the failing write still returns normally -- the recovery is "
           "unchanged", (_type6, _message6), (None, ""))
 

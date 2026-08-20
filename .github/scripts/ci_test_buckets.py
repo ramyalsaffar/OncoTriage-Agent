@@ -381,6 +381,29 @@ BUCKETS = {
         "(oncotriage/fixtures/capture.py, oncotriage/evaluation/"
         "ragas_harness.py) are written by neither of the suite's two writers; "
         "both are sha256-compared in section 8"),
+    "test_resume_configuration_fingerprint.py": (
+        _A, None,
+        "ran green in 2.0s, 331 checks, against ONLY the directory skeleton: "
+        "the configuration fingerprint and the three resume gates built on "
+        "it. run_harness.main() is DRIVEN end to end -- the fresh run, the "
+        "--only, the --resume skip/re-run, four environment refusals and the "
+        "override -- with run_one_patient replaced by a stand-in whose "
+        "installation is asserted BY IDENTITY before each scenario, so a "
+        "stand-in that failed to take fails here rather than reaching the "
+        "OpenAI endpoint. The only live Qdrant work in the whole pass is "
+        "run_fingerprint._resolve_collection, replaced by a two-line "
+        "stand-in; the shipped current()/compare()/refusal path runs for "
+        "real. It costs and needs nothing: no network, no keys, no spend, no "
+        "live Qdrant, no live server, no corpus, no git history, no Docker, "
+        "no database. It EXECS NOTHING -- every control is either a different "
+        "INPUT to a pure function or an attribute rebind inside try/finally "
+        "with the restore asserted by identity -- so it needs no "
+        "_EXEC_ALLOWLIST entry. NOT in the collision matrix, derived: "
+        "everything it writes is inside one tempfile.mkdtemp() that it "
+        "removes and then asserts gone, it parses no source, and the two "
+        "files the suite's writers touch are neither read nor written "
+        "(config.MATCHING_MODEL and config.DATA_SNAPSHOT_DATE are rebound as "
+        "in-memory ATTRIBUTES and restored, which touches no file)"),
     "test_indexer_criteria_split_gate.py": (
         _A, None,
         "ran green in 0.78s, 109 checks, against ONLY the directory skeleton: "
