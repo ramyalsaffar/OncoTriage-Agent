@@ -13,8 +13,14 @@ none of it. A corpus whose observations all postdate DATA_SNAPSHOT_DATE would
 resolve to all_after_reference_date for every patient, match systematically
 worse, and leave nothing in inferences.db to explain it.
 
-Three nullable columns now carry it: ecog_value, ecog_selection,
-ecog_observations_found.
+Four nullable columns now carry it: ecog_value, ecog_selection,
+ecog_observations_found, ecog_date.
+
+ecog_date is HOW OLD the score is -- the effective date of the observation that
+was used. Measured over this cohort the median selected observation is roughly
+17.7 years old, so a performance status that gates nearly every interventional
+trial is routinely read off a reading older than the disease, and until this
+column existed no query, dashboard or drift metric could see it.
 
 THE NULL CONVENTION, which is what most of this file is about:
 
@@ -36,6 +42,23 @@ THE NULL CONVENTION, which is what most of this file is about:
     And ecog_value = 0 is a real, fully-active patient -- the most eligible
     score there is -- so it must never be read as missing either.
 
+    ecog_date IS NULL                   no observation was used, OR one was
+                                        used and carried no date at all. The
+                                        second case is ecog_selection =
+                                        'undated_single', and it is the one row
+                                        shape where a NULL date sits beside a
+                                        NON-NULL score -- the pair is what
+                                        identifies it. So ecog_date is NOT a
+                                        second marker of presence; selection
+                                        remains the only one.
+
+    The parser's stand-in for an undated observation is the literal
+    UNKNOWN_DATE, and it reaches the writer for real down the undated_single
+    path. It is mapped to NULL rather than stored, because SQLite compares TEXT
+    lexically and "unknown" sorts after every ISO digit -- so stored, the one
+    reading with NO date would rank as the NEWEST of all, in the column whose
+    only purpose is measuring staleness. Section 5b plants exactly that.
+
 Covers:
     1. _pipeline_provenance (File 13) reads ECOG off state["patient_data"] --
        the same route birth_date_precision takes -- so nothing is duplicated
@@ -45,8 +68,13 @@ Covers:
     3. A fresh database gets the three columns from CREATE TABLE; a
        pre-existing database gets them from the ALTER TABLE migration, and the
        rows written before it keep NULL in all three.
-    4. log_inference writes all three, including the two values a truthiness
+    4. log_inference writes all four, including the two values a truthiness
        test would destroy: ECOG 0 and observations_found 0.
+    5b. ecog_date round-trips down BOTH routes -- the result-side one that
+       _pipeline_provenance fills and the patient-dict fallback -- stores NULL
+       for a patient with no usable observation, and stores NULL rather than a
+       non-date for the undated_single edge. With a negative control shown to
+       fire against the shipped writer.
     5. Absence, present-but-unusable, and never-reported are three
        distinguishable states in the stored row.
     6. ablation_results gains none of these columns -- ECOG is a patient-level
@@ -114,8 +142,10 @@ from oncotriage.agent.terminal import (
     node_no_candidates,
 )
 from oncotriage.config import DATA_SNAPSHOT_DATE
+from oncotriage.constants import UNKNOWN_DATE
 from oncotriage.fhir.parser import parse_fhir_bundle
 from oncotriage.paths import data_patient_path, inferences_path
+from oncotriage.storage import database_logger as _database_logger
 from oncotriage.storage.database_logger import (
     INFERENCE_COLUMN_ADDITIONS,
     initialize_database,
@@ -142,6 +172,66 @@ _SCRATCH_FHIR_DIR = data_patient_path + "scratch_ecog/fhir/"
 
 _RESULTS = {"passed": 0, "failed": 0}
 _FAILURES = []
+
+
+ABSENT = "<the key/column does not exist>"
+NO_ROW = "<no row was written>"
+
+
+def field(container, key):
+    """Read a key a BROKEN FIX may have removed, as a value rather than a raise.
+
+    Every check below reads provenance keys out of a dict and columns out of a
+    sqlite3.Row. Both raise when the thing is missing -- KeyError from the dict,
+    IndexError from the Row -- and a raise at module level takes the whole file
+    down with it, so a run that owes forty recorded failures reports one
+    traceback instead. This project has shipped that defect four times; the
+    revert harness for this column found it here twice more (a dropped
+    provenance key, a dropped column declaration) before it was fixed.
+
+    A missing container is its own answer: log_inference() swallows a
+    sqlite3.Error by design, so a broken INSERT writes no row at all and the
+    caller gets None. That must read as "nothing was written", not as a crash.
+    """
+    if container is None:
+        return NO_ROW
+    try:
+        return container[key]
+    except (KeyError, IndexError, TypeError):
+        return ABSENT
+
+
+NO_MATCH = "<the query matched no row>"
+
+
+def one(cursor_row, index=0):
+    """First column of a fetchone(), as a value rather than a raise.
+
+    ``fetchone()`` returns None when nothing matched, and subscripting that
+    aborts the file. A broken ecog_date write makes exactly that happen -- no
+    row is stored, so every scoped query below matches nothing -- which is the
+    case these checks exist to catch, so it must be recorded, not raised.
+    """
+    if cursor_row is None:
+        return NO_MATCH
+    return cursor_row[index]
+
+
+NO_COLUMN = "<the query names a column that does not exist>"
+
+
+def scalar(conn, sql, params=()):
+    """First column of the first row, with BOTH ways this can blow up handled.
+
+    A dropped column declaration makes every query naming it raise
+    OperationalError, and a dropped INSERT column makes the row absent so the
+    query matches nothing. Both are exactly what the staleness checks below
+    exist to catch, so both must come back as a recorded value.
+    """
+    try:
+        return one(conn.execute(sql, params).fetchone())
+    except sqlite3.OperationalError:
+        return NO_COLUMN
 
 
 def check(label: str, actual, expected) -> None:
@@ -247,6 +337,16 @@ ECOG_SCORED_ZERO = make_ecog(value=0, selection="most_recent_on_or_before_refere
 ECOG_ABSENT = make_ecog()                                   # none_recorded, found 0
 ECOG_UNUSABLE = make_ecog(selection="all_after_reference_date", found=2, after=2)
 
+# THE undated_single EDGE, and it is not hypothetical: the parser writes
+# UNKNOWN_DATE into any ECOG Observation carrying neither effectiveDateTime nor
+# effectivePeriod.start, and _select_ecog_performance_status USES such an
+# observation when it is the only one. So a real score arrives with a date that
+# is not a date. The date= argument is the parser's own sentinel rather than a
+# retyped "unknown", so this fixture cannot drift away from the value the
+# writer branches on.
+ECOG_UNDATED_SINGLE = make_ecog(value=2, selection="undated_single",
+                                found=1, undated=1, date=UNKNOWN_DATE)
+
 
 def make_patient(ecog=None, patient_id="ecog-logging-patient"):
     """Parsed-patient dict of the shape File 07 returns."""
@@ -310,7 +410,8 @@ TERMINAL_NODES = {
     "node_error_handler": node_error_handler,
 }
 
-ECOG_KEYS = ("ecog_value", "ecog_selection", "ecog_observations_found")
+ECOG_KEYS = ("ecog_value", "ecog_selection", "ecog_observations_found",
+             "ecog_date")
 
 
 def logged_row(result, patient, patient_id):
@@ -352,34 +453,104 @@ print("1. _pipeline_provenance reaches ECOG through state['patient_data']")
 print("=" * 70)
 
 _prov_scored = _pipeline_provenance(make_terminal_state(make_patient(ECOG_SCORED_ONE)))
-check("value carried", _prov_scored["ecog_value"], 1)
-check("selection carried", _prov_scored["ecog_selection"],
+check("value carried", field(_prov_scored, "ecog_value"), 1)
+check("selection carried", field(_prov_scored, "ecog_selection"),
       "most_recent_on_or_before_reference_date")
-check("count carried", _prov_scored["ecog_observations_found"], 1)
+check("count carried", field(_prov_scored, "ecog_observations_found"), 1)
+check("date carried", field(_prov_scored, "ecog_date"), "2024-06-15")
 
 # ECOG 0 is the value a truthiness test destroys, and it is the most eligible
 # score a patient can have.
 _prov_zero = _pipeline_provenance(make_terminal_state(make_patient(ECOG_SCORED_ZERO)))
-check("ECOG 0 survives provenance as 0", _prov_zero["ecog_value"], 0)
-check("and is not None", _prov_zero["ecog_value"] is None, False)
+check("ECOG 0 survives provenance as 0", field(_prov_zero, "ecog_value"), 0)
+check("and is not None", field(_prov_zero, "ecog_value") is None, False)
 
 _prov_absent = _pipeline_provenance(make_terminal_state(make_patient(ECOG_ABSENT)))
-check("absent patient: value None", _prov_absent["ecog_value"], None)
-check("absent patient: selection says so", _prov_absent["ecog_selection"], "none_recorded")
-check("absent patient: count 0 not None", _prov_absent["ecog_observations_found"], 0)
+check("absent patient: value None", field(_prov_absent, "ecog_value"), None)
+check("absent patient: selection says so", field(_prov_absent, "ecog_selection"), "none_recorded")
+check("absent patient: count 0 not None", field(_prov_absent, "ecog_observations_found"), 0)
 
 _prov_unusable = _pipeline_provenance(make_terminal_state(make_patient(ECOG_UNUSABLE)))
-check("unusable: value None", _prov_unusable["ecog_value"], None)
+check("unusable: value None", field(_prov_unusable, "ecog_value"), None)
 check("unusable: selection names the reason",
-      _prov_unusable["ecog_selection"], "all_after_reference_date")
-check("unusable: count is non-zero", _prov_unusable["ecog_observations_found"], 2)
+      field(_prov_unusable, "ecog_selection"), "all_after_reference_date")
+check("unusable: count is non-zero", field(_prov_unusable, "ecog_observations_found"), 2)
+check("unusable: no observation was used, so no date", field(_prov_unusable, "ecog_date"), None)
+check("absent patient: no date either", field(_prov_absent, "ecog_date"), None)
+
+# CARRIED VERBATIM at this layer. The result dict is the faithful mirror of the
+# parsed field, and the parser genuinely says UNKNOWN_DATE here; mapping it to
+# NULL is the STORAGE layer's decision and is made at the write. If this ever
+# starts returning None, the normalisation has migrated into the agent and
+# section 5b's control is testing something that no longer happens.
+_prov_undated = _pipeline_provenance(make_terminal_state(make_patient(ECOG_UNDATED_SINGLE)))
+check("undated_single: the score is real", field(_prov_undated, "ecog_value"), 2)
+check("undated_single: provenance carries the parser sentinel unchanged",
+      field(_prov_undated, "ecog_date"), UNKNOWN_DATE)
+check("...which is not a date, and not None either (non-degeneracy)",
+      field(_prov_undated, "ecog_date") is None, False)
+
+
+# --- THE SENTINEL IS BOUND TO WHAT THE PARSER ACTUALLY EMITS ---------------
+# WITHOUT THIS BLOCK THE WHOLE ecog_date CONTRACT IS SELF-REFERENTIAL, and the
+# revert harness proved it rather than the point being argued: changing the
+# parser's default from UNKNOWN_DATE to a different literal left this file at
+# 148 passed / 0 failed. Every fixture above builds its undated case by reading
+# the CONSTANT, and the writer branches on the CONSTANT, so the two agree by
+# construction however the parser drifts -- while a real dateless bundle would
+# then store a non-date and nothing would say so.
+#
+# So the real parser is run, on a real bundle, through the public entry point:
+# an ECOG Observation carrying neither effectiveDateTime nor
+# effectivePeriod.start. That exercises _parse_ecog_observation's default AND
+# _select_ecog_performance_status's undated_single path, which is also the only
+# thing establishing that ECOG_UNDATED_SINGLE above describes a state the
+# pipeline can actually reach.
+_UNDATED_BUNDLE = {
+    "resourceType": "Bundle",
+    "entry": [
+        {"resource": {"resourceType": "Patient", "id": "undated-ecog-probe",
+                      "gender": "female", "birthDate": "1960-05-04"}},
+        {"resource": {
+            "resourceType": "Observation", "status": "final",
+            "code": {"coding": [{"system": "http://loinc.org",
+                                 "code": "89247-1",
+                                 "display": "ECOG performance status"}]},
+            "valueInteger": 2,
+            # NO effectiveDateTime and NO effectivePeriod. That absence is the
+            # whole subject of this block.
+        }},
+    ],
+}
+_parsed_undated = parse_fhir_bundle(_UNDATED_BUNDLE)
+_parsed_ecog = _parsed_undated.get("ecog_performance_status") or {}
+check("the probe bundle really did produce one ECOG observation "
+      "(non-degeneracy: an unparsed bundle would leave every check below "
+      "comparing None with None)",
+      _parsed_ecog.get("observations_found"), 1)
+check("...and its score was USED, down the undated_single path",
+      _parsed_ecog.get("selection"), "undated_single")
+check("...with a real score beside it", _parsed_ecog.get("value"), 2)
+check("THE PARSER'S ABSENT-DATE DEFAULT IS UNKNOWN_DATE, which is the value "
+      "the writer branches on -- if this drifts, ecog_date silently stores a "
+      "non-date",
+      _parsed_ecog.get("date"), UNKNOWN_DATE)
+
+# And end to end: the same real bundle, logged, must reach NULL.
+_probe_result = node_finalize(make_terminal_state(_parsed_undated))["result"]
+_row_probe = logged_row(_probe_result, _parsed_undated, "row-parser-probe")
+check("a REAL dateless bundle stores NULL in ecog_date",
+      field(_row_probe, "ecog_date"), None)
+check("...while its score and selection still record that it was used",
+      (field(_row_probe, "ecog_value"), field(_row_probe, "ecog_selection")),
+      (2, "undated_single"))
 
 # A hand-built patient dict with no ECOG key at all -- never reported.
 _prov_missing = _pipeline_provenance(make_terminal_state(make_patient(None)))
 for _k in ECOG_KEYS:
-    check(f"patient dict without the field: {_k} is None", _prov_missing[_k], None)
+    check(f"patient dict without the field: {_k} is None", field(_prov_missing, _k), None)
 check("never-reported is distinguishable from none_recorded",
-      _prov_missing["ecog_selection"] == _prov_absent["ecog_selection"], False)
+      field(_prov_missing, "ecog_selection") == field(_prov_absent, "ecog_selection"), False)
 
 # Reading state["patient_data"] rather than a copied-onto-state value is what
 # makes the error path work: no node has to remember to propagate it.
@@ -428,8 +599,8 @@ _terminal_results = {name: fn(_state)["result"] for name, fn in TERMINAL_NODES.i
 for _name, _res in _terminal_results.items():
     for _k in ECOG_KEYS:
         check(f"{_name}: declares {_k}", _k in _res, True)
-    check(f"{_name}: value is the parsed score", _res["ecog_value"], 1)
-    check(f"{_name}: selection is the parsed path", _res["ecog_selection"],
+    check(f"{_name}: value is the parsed score", field(_res, "ecog_value"), 1)
+    check(f"{_name}: selection is the parsed path", field(_res, "ecog_selection"),
           "most_recent_on_or_before_reference_date")
 
 # The contract File 36 guards, restated for the keys added here: no terminal
@@ -494,12 +665,12 @@ _legacy.row_factory = sqlite3.Row
 _pre = _legacy.execute(
     "SELECT * FROM inferences WHERE patient_id = 'pre-migration'").fetchone()
 for _k in ECOG_KEYS:
-    check(f"pre-migration row keeps NULL in {_k}", _pre[_k], None)
+    check(f"pre-migration row keeps NULL in {_k}", field(_pre, _k), None)
 _legacy.close()
 
 check("declared SQL types",
-      [INFERENCE_COLUMN_ADDITIONS[k] for k in ECOG_KEYS],
-      ["INTEGER", "TEXT", "INTEGER"])
+      [INFERENCE_COLUMN_ADDITIONS.get(k, ABSENT) for k in ECOG_KEYS],
+      ["INTEGER", "TEXT", "INTEGER", "TEXT"])
 
 
 # ===========================================================================
@@ -512,44 +683,44 @@ print("=" * 70)
 
 _row_scored = logged_row(_terminal_results["node_finalize"],
                          make_patient(ECOG_SCORED_ONE), "row-scored")
-check("logged ecog_value", _row_scored["ecog_value"], 1)
-check("logged ecog_selection", _row_scored["ecog_selection"],
+check("logged ecog_value", field(_row_scored, "ecog_value"), 1)
+check("logged ecog_selection", field(_row_scored, "ecog_selection"),
       "most_recent_on_or_before_reference_date")
-check("logged ecog_observations_found", _row_scored["ecog_observations_found"], 1)
+check("logged ecog_observations_found", field(_row_scored, "ecog_observations_found"), 1)
 
 # ECOG 0 and count 0 are both falsy and both real. An `or` chain anywhere on
 # this path would turn them into NULL.
 _zero_result = node_finalize(make_terminal_state(make_patient(ECOG_SCORED_ZERO)))["result"]
 _row_zero = logged_row(_zero_result, make_patient(ECOG_SCORED_ZERO), "row-zero")
-check("ECOG 0 is stored as 0, not NULL", _row_zero["ecog_value"], 0)
-check("and is not NULL", _row_zero["ecog_value"] is None, False)
+check("ECOG 0 is stored as 0, not NULL", field(_row_zero, "ecog_value"), 0)
+check("and is not NULL", field(_row_zero, "ecog_value") is None, False)
 
 _absent_result = node_finalize(make_terminal_state(make_patient(ECOG_ABSENT)))["result"]
 _row_absent = logged_row(_absent_result, make_patient(ECOG_ABSENT), "row-absent")
-check("absent patient: value NULL", _row_absent["ecog_value"], None)
+check("absent patient: value NULL", field(_row_absent, "ecog_value"), None)
 check("absent patient: selection is none_recorded",
-      _row_absent["ecog_selection"], "none_recorded")
+      field(_row_absent, "ecog_selection"), "none_recorded")
 check("absent patient: count stored as 0, not NULL",
-      _row_absent["ecog_observations_found"], 0)
+      field(_row_absent, "ecog_observations_found"), 0)
 
 _unusable_result = node_finalize(make_terminal_state(make_patient(ECOG_UNUSABLE)))["result"]
 _row_unusable = logged_row(_unusable_result, make_patient(ECOG_UNUSABLE), "row-unusable")
-check("unusable: value NULL", _row_unusable["ecog_value"], None)
+check("unusable: value NULL", field(_row_unusable, "ecog_value"), None)
 check("unusable: selection names the reason",
-      _row_unusable["ecog_selection"], "all_after_reference_date")
-check("unusable: count survives", _row_unusable["ecog_observations_found"], 2)
+      field(_row_unusable, "ecog_selection"), "all_after_reference_date")
+check("unusable: count survives", field(_row_unusable, "ecog_observations_found"), 2)
 
 # A result that never came from a terminal node, logged against a patient dict
 # with no ECOG field: nothing is known, so all three stay NULL.
 _row_unreported = logged_row({"stage_timings": {}}, make_patient(None), "row-unreported")
 for _k in ECOG_KEYS:
-    check(f"never-reported row stores NULL in {_k}", _row_unreported[_k], None)
+    check(f"never-reported row stores NULL in {_k}", field(_row_unreported, _k), None)
 
 # Fallback: a result dict without the keys, but a patient dict that has them.
 _row_fallback = logged_row({"stage_timings": {}},
                            make_patient(ECOG_SCORED_ONE), "row-fallback")
-check("falls back to the patient dict for value", _row_fallback["ecog_value"], 1)
-check("falls back for selection", _row_fallback["ecog_selection"],
+check("falls back to the patient dict for value", field(_row_fallback, "ecog_value"), 1)
+check("falls back for selection", field(_row_fallback, "ecog_selection"),
       "most_recent_on_or_before_reference_date")
 
 
@@ -562,11 +733,11 @@ print("5. Absence, unusable and never-reported are distinguishable")
 print("=" * 70)
 
 check("all three have ecog_value NULL",
-      [_row_absent["ecog_value"], _row_unusable["ecog_value"],
-       _row_unreported["ecog_value"]], [None, None, None])
+      [field(_row_absent, "ecog_value"), field(_row_unusable, "ecog_value"),
+       field(_row_unreported, "ecog_value")], [None, None, None])
 check("but ecog_selection separates them",
-      len({_row_absent["ecog_selection"], _row_unusable["ecog_selection"],
-           _row_unreported["ecog_selection"]}), 3)
+      len({field(_row_absent, "ecog_selection"), field(_row_unusable, "ecog_selection"),
+           field(_row_unreported, "ecog_selection")}), 3)
 
 # The query the convention prescribes, run against exactly the four rows written
 # above -- scoped by patient_id so later sections cannot shift the counts.
@@ -598,6 +769,133 @@ check("counting it by selection = 'none_recorded' is exact", _genuinely_absent, 
 check("never-reported is its own state", _never_reported, 1)
 check("ECOG 0 is counted as scored, not as missing",
       _scored, 2)                           # row-scored (1) + row-zero (0)
+
+
+# ===========================================================================
+# 5b. ecog_date -- BOTH ROUTES, THE NULL CASES, AND THE undated_single EDGE
+# ===========================================================================
+#
+# This is the column the staleness question is asked of, so what it must prove
+# is narrower than "a value came back": a date must survive BOTH population
+# routes, absence must be NULL, and the one value that is neither -- the
+# parser's UNKNOWN_DATE -- must become NULL rather than a string that outranks
+# every real date under the comparison a staleness query actually uses.
+
+print("\n" + "=" * 70)
+print("5b. ecog_date: both routes, the NULL cases, and the undated edge")
+print("=" * 70)
+
+# --- the result-side route, which _pipeline_provenance fills ----------------
+check("dated observation round-trips down the RESULT route",
+      field(_row_scored, "ecog_date"), "2024-06-15")
+check("a second dated patient carries its OWN date, not the first one's "
+      "(non-degeneracy: a constant would satisfy the check above)",
+      field(_row_zero, "ecog_date"), "2023-01-09")
+
+# --- the patient-dict fallback route ---------------------------------------
+# _row_fallback was logged from a result dict with no ECOG keys at all, so the
+# writer took the else branch. Same date, different source.
+check("dated observation round-trips down the FALLBACK route",
+      field(_row_fallback, "ecog_date"), "2024-06-15")
+check("...and the fallback row really did take the fallback branch "
+      "(non-degeneracy: its result dict carried no ecog_selection)",
+      "ecog_selection" in {"stage_timings": {}}, False)
+
+# --- the NULL cases ---------------------------------------------------------
+check("no observation recorded: date NULL", field(_row_absent, "ecog_date"), None)
+check("observations existed but none usable: date NULL",
+      field(_row_unusable, "ecog_date"), None)
+check("never reported at all: date NULL", field(_row_unreported, "ecog_date"), None)
+
+# --- the undated_single edge, down both routes ------------------------------
+_undated_result = node_finalize(
+    make_terminal_state(make_patient(ECOG_UNDATED_SINGLE)))["result"]
+_row_undated = logged_row(_undated_result, make_patient(ECOG_UNDATED_SINGLE),
+                          "row-undated")
+check("undated_single: the score is stored, so the observation WAS used",
+      field(_row_undated, "ecog_value"), 2)
+check("undated_single: selection records that it was used",
+      field(_row_undated, "ecog_selection"), "undated_single")
+check("undated_single: the count survives", field(_row_undated, "ecog_observations_found"), 1)
+check("undated_single: the date column is NULL, not the parser sentinel",
+      field(_row_undated, "ecog_date"), None)
+check("...and specifically it is not the string itself",
+      field(_row_undated, "ecog_date") == UNKNOWN_DATE, False)
+
+# The same edge down the FALLBACK route, because the normalisation is applied
+# once after the source is chosen rather than inside one branch -- and a
+# normalisation living in only one branch is exactly the defect that shape
+# prevents.
+_row_undated_fb = logged_row({"stage_timings": {}},
+                             make_patient(ECOG_UNDATED_SINGLE), "row-undated-fb")
+check("undated_single: NULL down the fallback route too",
+      field(_row_undated_fb, "ecog_date"), None)
+check("...and that row really did fall back (its score came from the patient)",
+      field(_row_undated_fb, "ecog_value"), 2)
+
+# --- ecog_date IS NOT A PRESENCE MARKER ------------------------------------
+# The row shape the convention turns on: a NULL date beside a NON-NULL score.
+check("a used-but-undated observation is a NULL date beside a real score",
+      (field(_row_undated, "ecog_date"), field(_row_undated, "ecog_value")), (None, 2))
+check("...which is indistinguishable from 'no observation' on the date alone",
+      field(_row_undated, "ecog_date") == field(_row_absent, "ecog_date"), True)
+check("...and IS distinguished by ecog_selection, which stays the only marker",
+      field(_row_undated, "ecog_selection") == field(_row_absent, "ecog_selection"), False)
+
+# --- THE STALENESS QUERY THE COLUMN EXISTS FOR ------------------------------
+# Scoped by patient_id so later sections cannot shift it. Only the two dated
+# rows may answer; the four dateless ones must be invisible to it.
+_DATED_ROWS = ("row-scored", "row-zero", "row-absent", "row-unusable",
+               "row-unreported", "row-undated", "row-undated-fb")
+_dph = ",".join("?" * len(_DATED_ROWS))
+_conn = sqlite3.connect(inferences_path)
+_oldest = scalar(_conn,
+    f"SELECT patient_id FROM inferences WHERE patient_id IN ({_dph}) "
+    f"AND ecog_date IS NOT NULL ORDER BY ecog_date ASC LIMIT 1", _DATED_ROWS)
+_newest = scalar(_conn,
+    f"SELECT patient_id FROM inferences WHERE patient_id IN ({_dph}) "
+    f"AND ecog_date IS NOT NULL ORDER BY ecog_date DESC LIMIT 1", _DATED_ROWS)
+_n_dated = scalar(_conn,
+    f"SELECT COUNT(*) FROM inferences WHERE patient_id IN ({_dph}) "
+    f"AND ecog_date IS NOT NULL", _DATED_ROWS)
+_conn.close()
+check("exactly the two dated rows are visible to a staleness query", _n_dated, 2)
+check("the oldest reading is the 2023 one", _oldest, "row-zero")
+check("the newest reading is the 2024 one", _newest, "row-scored")
+
+# --- NEGATIVE CONTROL: the sentinel guard is load-bearing, and shown to fire -
+# The guard is driven THROUGH THE SHIPPED WRITER by rebinding the constant it
+# compares against, inside a try/finally -- no source is patched and nothing is
+# exec'd, so this file needs no _EXEC_ALLOWLIST entry. Rebinding the module
+# global is what the shipped `if ecog_date == UNKNOWN_DATE` reads, so a writer
+# that had stopped consulting it would leave the control PASSING, which is the
+# outcome that would mean the constant had become decorative.
+_control_before = _database_logger.UNKNOWN_DATE
+_database_logger.UNKNOWN_DATE = "\x00 a value the parser can never produce"
+try:
+    _row_control = logged_row({"stage_timings": {}},
+                              make_patient(ECOG_UNDATED_SINGLE), "row-control")
+finally:
+    _database_logger.UNKNOWN_DATE = _control_before
+check("the rebind was undone", _database_logger.UNKNOWN_DATE, UNKNOWN_DATE)
+check("CONTROL: with the sentinel unmatched, the writer stores the non-date",
+      field(_row_control, "ecog_date"), UNKNOWN_DATE)
+check("...so the guard is what produces the NULL, not an accident of the data",
+      field(_row_undated, "ecog_date") != field(_row_control, "ecog_date"), True)
+
+# AND THE HARM THE GUARD PREVENTS, measured rather than asserted: under the
+# lexical comparison a staleness query uses, "unknown" beats every ISO date, so
+# the one reading with NO date ranks as the most recent of all.
+_conn = sqlite3.connect(inferences_path)
+_ctl_newest = scalar(_conn,
+    "SELECT patient_id FROM inferences WHERE patient_id IN "
+    "('row-scored','row-zero','row-control') AND ecog_date IS NOT NULL "
+    "ORDER BY ecog_date DESC LIMIT 1")
+_conn.close()
+check("CONTROL: the stored non-date ranks as the NEWEST reading of all",
+      _ctl_newest, "row-control")
+check("...where with the guard in place the newest is a real date",
+      _newest, "row-scored")
 
 
 # ===========================================================================
@@ -701,23 +999,23 @@ else:
 
         _row = logged_row(_real_result, _real_scored, "real-scored")
         check("real patient: value round-trips through the database",
-              _row["ecog_value"], _real_status["value"])
+              field(_row, "ecog_value"), _real_status["value"])
         check("real patient: selection round-trips",
-              _row["ecog_selection"], _real_status["selection"])
+              field(_row, "ecog_selection"), _real_status["selection"])
         check("real patient: count round-trips",
-              _row["ecog_observations_found"], _real_status["observations_found"])
+              field(_row, "ecog_observations_found"), _real_status["observations_found"])
         check("real patient: the stored value is an int in 0-4",
-              isinstance(_row["ecog_value"], int) and 0 <= _row["ecog_value"] <= 4,
+              isinstance(field(_row, "ecog_value"), int) and 0 <= field(_row, "ecog_value") <= 4,
               True)
 
     if _real_unscored is not None:
         _un_result = node_finalize(make_terminal_state(_real_unscored))["result"]
         _un_row = logged_row(_un_result, _real_unscored, "real-unscored")
         check("real unscored patient: selection is none_recorded",
-              _un_row["ecog_selection"], "none_recorded")
-        check("real unscored patient: value NULL", _un_row["ecog_value"], None)
+              field(_un_row, "ecog_selection"), "none_recorded")
+        check("real unscored patient: value NULL", field(_un_row, "ecog_value"), None)
         check("real unscored patient: count 0",
-              _un_row["ecog_observations_found"], 0)
+              field(_un_row, "ecog_observations_found"), 0)
 
     # The error path must carry ECOG too -- it is the path where a run failed
     # and the operator most needs to know what the model was told.
@@ -726,9 +1024,9 @@ else:
             _real_scored, error="stubbed failure"))["result"]
         _err_row = logged_row(_err, _real_scored, "real-error-path")
         check("error path: value still logged",
-              _err_row["ecog_value"], _real_scored["ecog_performance_status"]["value"])
+              field(_err_row, "ecog_value"), _real_scored["ecog_performance_status"]["value"])
         check("error path: selection still logged",
-              _err_row["ecog_selection"],
+              field(_err_row, "ecog_selection"),
               _real_scored["ecog_performance_status"]["selection"])
 
 

@@ -95,6 +95,7 @@ from oncotriage.constants import (
     LOINC_AJCC_CLINICAL_M,
     SYSTEM_KEY_ABSENT,
     SYSTEM_KEY_UNRECOGNIZED,
+    UNKNOWN_DATE,
 )
 from oncotriage.utils import (
     deduplicate_by_display,
@@ -1011,10 +1012,17 @@ def _parse_ecog_observation(obs_resource: Dict) -> Dict:
                     indistinguishable from a fully active one -- which is the
                     single distinction this field exists to preserve.
     """
+    # UNKNOWN_DATE, not the bare literal that stands at the module's other date
+    # sites: oncotriage/storage/database_logger.py compares the SELECTED
+    # observation's date against this exact value to decide whether
+    # inferences.ecog_date takes a date or NULL, so this is the one date default
+    # in the parser with a cross-module reader. Two spellings that can drift
+    # would make that comparison stop firing silently. The VALUE is unchanged --
+    # this is a name for the string that was already here.
     date = (
         obs_resource.get('effectiveDateTime')
         or obs_resource.get('effectivePeriod', {}).get('start')
-        or 'unknown'
+        or UNKNOWN_DATE
     )
 
     if 'valueInteger' in obs_resource:

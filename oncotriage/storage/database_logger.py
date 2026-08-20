@@ -99,6 +99,7 @@ from oncotriage.config import (
     SQLITE_WRITE_MAX_ATTEMPTS,
     SQLITE_WRITE_RETRY_BASE_DELAY,
 )
+from oncotriage.constants import UNKNOWN_DATE
 from oncotriage.registries.primary_cancer import _resolve_primary_cancer
 from oncotriage.utils import deduplicate_by_display, get_model_cost
 from oncotriage.observability import console, get_logger
@@ -379,6 +380,74 @@ INFERENCE_COLUMN_ADDITIONS = {
     "ecog_value":                   "INTEGER",
     "ecog_selection":               "TEXT",
     "ecog_observations_found":      "INTEGER",
+    #
+    # ecog_date is HOW OLD the score is: the effective date of the observation
+    # that was actually used. Nothing else in the row carries it, and it is not
+    # a detail -- measured over this cohort the median selected observation is
+    # roughly 17.7 years old, so a performance status that gates nearly every
+    # trial is routinely being read off a reading older than the disease.
+    #
+    # IT IS A DATE OR IT IS NULL, and it follows ecog_value's convention rather
+    # than inventing a second one: NULL is ambiguous on its own and
+    # ecog_selection is what resolves it.
+    #
+    #   ecog_selection IS NULL          the row predates this migration, or the
+    #                                   result never came from a terminal node.
+    #   ecog_selection = 'none_recorded'
+    #                   or 'all_after_reference_date'
+    #                   or 'undated_ambiguous'
+    #                                   no observation was used, so there is no
+    #                                   date to report. ecog_value is NULL too.
+    #   ecog_selection = 'undated_single'
+    #                                   AN OBSERVATION WAS USED AND HAD NO DATE.
+    #                                   ecog_value is a real score; ecog_date is
+    #                                   NULL because the source carried nothing
+    #                                   datelike. This is the one row shape
+    #                                   where a NULL date sits beside a
+    #                                   non-NULL score, and the pair is exactly
+    #                                   what identifies it.
+    #   ecog_selection = 'most_recent_on_or_before_reference_date'
+    #                                   a dated observation was used and this is
+    #                                   its date.
+    #
+    # WHY THE PARSER'S UNKNOWN_DATE IS NOT STORED. The parser writes that
+    # literal into an Observation with neither effectiveDateTime nor
+    # effectivePeriod.start, and the undated_single path can select such an
+    # observation, so the value genuinely reaches this writer. Storing it would
+    # put a non-date in a date column, and not harmlessly: SQLite compares TEXT
+    # lexically, "unknown" sorts after every ISO digit, so `ORDER BY ecog_date
+    # DESC` and every `ecog_date > '2020'` would rank the one reading with NO
+    # date as the NEWEST of all -- the exact opposite of the truth, in the one
+    # column whose entire purpose is measuring staleness. date(ecog_date) and
+    # julianday(ecog_date) would meanwhile return NULL for it without comment.
+    # So it is mapped to NULL here and the fact that an observation WAS used
+    # survives in ecog_selection, which is where this column set has always kept
+    # that distinction.
+    #
+    # THE STRING IS STORED AS THE SOURCE WROTE IT and is not reformatted: FHIR
+    # dateTime is legally YYYY, YYYY-MM, YYYY-MM-DD or a full offset-bearing
+    # instant, and this corpus carries the last of those. Normalising to a day
+    # would impute precision the record does not have -- the same reason
+    # birth_date_precision exists a few columns up. A reader wanting a day
+    # should use SQLite's date(), which reads the leading YYYY-MM-DD and
+    # returns NULL for a year-only or month-only value rather than guessing.
+    #
+    # THE ONE VALUE THIS COLUMN CAN HOLD THAT IS NEITHER A DATE NOR NULL, stated
+    # rather than papered over. UNKNOWN_DATE is the only non-date the PARSER can
+    # produce for this field; anything else arriving here came from a source
+    # Observation whose effectiveDateTime violates the FHIR dateTime type
+    # ("N/A", a free-text note). Such a value is unparseable, so
+    # _select_ecog_performance_status treats the observation as undated and can
+    # still select it down the undated_single path -- and it is then stored
+    # VERBATIM rather than nulled, deliberately: this column's contract is "the
+    # date as the source wrote it", and silently discarding malformed source
+    # data would hide a data-quality fault instead of recording one, which is
+    # the defect this project exists to remove. It is not silent in the row
+    # either -- ecog_selection reads 'undated_single', which is what tells a
+    # reader the value cannot be a real date. Giving it a proper degradation
+    # counter is a recorded follow-up rather than a silent fix, and this corpus
+    # produces zero of them: Synthea writes ISO instants.
+    "ecog_date":                    "TEXT",
 
     # --- Stage 5 truncation control (item 19c) -----------------------------
     #
@@ -1504,10 +1573,28 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
             ecog_value              = result.get("ecog_value")
             ecog_selection          = result.get("ecog_selection")
             ecog_observations_found = result.get("ecog_observations_found")
+            ecog_date               = result.get("ecog_date")
         else:
             ecog_value              = _patient_ecog.get("value")
             ecog_selection          = _patient_ecog.get("selection")
             ecog_observations_found = _patient_ecog.get("observations_found")
+            ecog_date               = _patient_ecog.get("date")
+
+        # The parser's stand-in for an Observation carrying no date at all. It
+        # reaches this writer for real -- the undated_single selection path uses
+        # such an observation -- and it must not be stored: see the ecog_date
+        # entry in INFERENCE_COLUMN_ADDITIONS for why a non-date in this column
+        # would sort as the NEWEST reading rather than as no reading.
+        #
+        # Applied AFTER the source is chosen, not inside either branch, so both
+        # routes get the identical treatment. Compared against the constant
+        # rather than re-parsed with parse_partial_date(): that function
+        # increments PARTIAL_DATE_DEGRADATIONS on an out-of-range component, and
+        # the selected observation has already been through it once at parse
+        # time, so re-parsing here would double-count a real data-quality signal
+        # in the one process that runs both.
+        if ecog_date == UNKNOWN_DATE:
+            ecog_date = None
 
         # Sum of stage durations only — excludes LangGraph routing overhead (~50-200ms)
         total_time = sum(timings.values())
@@ -1542,7 +1629,7 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 sex_filter_applied, sex_filter_skip_reason,
                 degraded_run,
                 age_reference_date, birth_date_precision,
-                ecog_value, ecog_selection, ecog_observations_found,
+                ecog_value, ecog_selection, ecog_observations_found, ecog_date,
                 llm_classifier_truncation_splits, llm_classifier_output_tokens_estimated,
                 not_evaluable_truncated, llm_classifier_calls,
                 llm_classifier_reasoning_tokens,
@@ -1550,7 +1637,7 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 llm_classifier_patient_record_tokens,
                 llm_classifier_cached_input_tokens, llm_classifier_call_details,
                 llm_classifier_packed_chunks, llm_classifier_packing
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             result["patient_id"],
             result["timestamp"],
@@ -1685,6 +1772,7 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
             ecog_value,
             ecog_selection,
             ecog_observations_found,
+            ecog_date,
             # Stage 5 truncation record. The three counts default to 0 because
             # a run that ended before Stage 5 genuinely performed zero splits
             # and lost zero trials to truncation; the ESTIMATE has no default,

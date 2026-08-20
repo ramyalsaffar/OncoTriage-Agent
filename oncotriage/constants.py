@@ -52,6 +52,36 @@ SYSTEM_KEY_ABSENT = "unknown"
 SYSTEM_KEY_UNRECOGNIZED = "unmapped"
 
 
+# The absent-date stand-in
+#-------------------------
+#
+# What 'oncotriage/fhir/parser.py' writes into a record's date field when the
+# source resource carries no date at all -- for ECOG, when an Observation has
+# neither effectiveDateTime nor effectivePeriod.start.
+#
+# IT IS NOT SYSTEM_KEY_ABSENT AND MUST NOT BE MERGED WITH IT, despite the two
+# spelling the same six characters. That one is a statement about Coding.system;
+# this one is a statement about a date. They are equal today by coincidence, and
+# a reader who folded them together would make a change to either one silently
+# change the other -- the collapse the comment above records the cost of.
+#
+# IT HAS A CROSS-MODULE READER, which is the whole reason it is a name rather
+# than a literal. 'oncotriage/storage/database_logger.py' compares the selected
+# ECOG observation's date against it to decide whether inferences.ecog_date
+# gets a date or NULL; see the schema comment there. Two literals that must
+# agree and can drift make that comparison silently stop firing, and the column
+# would then hold the string "unknown" where a reader expects a date -- which
+# sorts AFTER every ISO date, so the oldest possible reading would rank as the
+# newest. Same failure shape as the cross-encoder checkpoint literal.
+#
+# THE PARSER SPELLS THIS LITERALLY AT ITS OTHER DATE SITES (medication
+# start_date, condition onset_date) and those are deliberately left alone: none
+# of them has a reader that branches on the value, so none of them can drift
+# into a wrong answer. Converting them is a sweep with no test able to see it,
+# and it is recorded as a follow-up rather than done here.
+UNKNOWN_DATE = "unknown"
+
+
 #------------------------------------------------------------------------------
 
 

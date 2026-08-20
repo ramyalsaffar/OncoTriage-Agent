@@ -394,6 +394,28 @@ def _pipeline_provenance(state) -> Dict:
         "ecog_value": _ecog.get("value"),
         "ecog_selection": _ecog.get("selection"),
         "ecog_observations_found": _ecog.get("observations_found"),
+
+        # The effective date of the observation that was USED, so it says how
+        # old the score is. Measured over this cohort the median selected
+        # observation is roughly 17.7 years old, which is a fact no consumer
+        # could reach from the three keys above: they say what the score is and
+        # how it was chosen, and nothing at all about whether it is current.
+        #
+        # CARRIED VERBATIM, exactly like the three keys above. The parser's
+        # stand-in for an observation with no effectiveDateTime is the literal
+        # UNKNOWN_DATE, and the undated_single path can select such an
+        # observation -- so this key is legitimately a non-date string, and it
+        # is left that way here rather than normalised. The result dict is the
+        # faithful mirror of the parsed field; deciding what a date COLUMN may
+        # hold is the storage layer's business and it does it at the write, in
+        # log_inference(). Normalising here would put a schema concern in the
+        # agent and would erase from the API response and the evaluation record
+        # a distinction the parser took trouble to make.
+        #
+        # IT IS NOT A SECOND MARKER OF PRESENCE. ecog_selection remains the only
+        # one -- a used observation can have no date, and an unused one leaves
+        # this None, so None here means "no date to report" and never "no ECOG".
+        "ecog_date": _ecog.get("date"),
     }
 
 
