@@ -257,11 +257,16 @@ def _pipeline_provenance(state) -> Dict:
         # prices the whole input at the uncached rate, deliberately, so the
         # stored cost stays comparable with every historical row.
         #
-        # NEITHER PACKING KEY HAS A DATABASE COLUMN. They reach the API response
-        # and any in-process consumer; File 14 writes the columns it declares and
-        # ignores the rest. That is stated rather than left to be discovered:
-        # the validation run reads these off the result, and persisting them is
-        # a schema decision this pass does not make.
+        # ALL FOUR NOW HAVE A DATABASE COLUMN. They used to have none -- the
+        # comment here recorded that as a deferred schema decision, and while
+        # it stood these four were measured by Stage 5, carried through this
+        # function and then dropped at the write, because File 14 writes the
+        # columns it declares and ignores the rest. The decision was made:
+        # inferences.llm_classifier_cached_input_tokens / _call_details /
+        # _packed_chunks / _packing, added through INFERENCE_COLUMN_ADDITIONS.
+        # The NULL/0 convention per column is argued there, and it is this
+        # block's convention -- no default, because each is a measurement a run
+        # either made or did not.
         "llm_classifier_packed_chunks": state.get("llm_classifier_packed_chunks"),
         "llm_classifier_packing": state.get("llm_classifier_packing"),
         "llm_classifier_cached_input_tokens": state.get(

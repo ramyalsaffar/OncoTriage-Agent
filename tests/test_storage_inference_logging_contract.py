@@ -549,16 +549,55 @@ _EVALUATION_SOURCE = os.path.abspath(_agent_evaluation.__file__)
 with open(_EVALUATION_SOURCE, encoding="utf-8") as _fh:
     _tree = ast.parse(_fh.read())
 
-_llm_classifier_returns = []
-for _fn in ast.walk(_tree):
-    if isinstance(_fn, ast.FunctionDef) and _fn.name == "node_llm_classifier_evaluation":
-        for _node in ast.walk(_fn):
-            if isinstance(_node, ast.Return) and isinstance(_node.value, ast.Dict):
-                _llm_classifier_returns.append((
-                    _node.lineno,
-                    {k.value for k in _node.value.keys
-                     if isinstance(k, ast.Constant) and isinstance(k.value, str)},
-                ))
+def _dict_return_keys(node):
+    """(lineno, {string keys}) for a `return {...}`."""
+    return (node.lineno,
+            {k.value for k in node.value.keys
+             if isinstance(k, ast.Constant) and isinstance(k.value, str)})
+
+
+def _own_dict_returns(fn):
+    """The dict returns of `fn` ITSELF, never of a function nested inside it.
+
+    THE SUBJECT OF THIS TEST IS THE NODE'S OWN RETURNS. ``ast.walk`` descends
+    into nested definitions, so a helper defined inside the node that happens
+    to return a dict was collected as though it were one of the node's exits.
+    It is not: it cannot end the node, and nothing it produces reaches the
+    graph except by being spread into one of the node's own returns -- which
+    the check below already reads, because ``**helper()`` contributes no
+    ast.Constant key and the literal keys beside it are still there.
+
+    MEASURED, NOT REASONED ABOUT. Stage 5 grew a nested ``_billed_so_far()``
+    that returns the token figure for the failure returns, and the unscoped
+    walk reported ITS dict as a return of the node missing
+    ``llm_classifier_retries`` -- a failure that was true of the scan and
+    false of the code. The scoping below is what that measurement bought, and
+    the probe underneath it is what says the scoping is doing work rather than
+    silently matching the old behaviour.
+    """
+    found, stack = [], list(fn.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue                      # a nested definition is not this one
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict):
+            found.append(_dict_return_keys(node))
+        stack.extend(ast.iter_child_nodes(node))
+    return found
+
+
+_llm_classifier_fn = next(
+    (n for n in ast.walk(_tree)
+     if isinstance(n, ast.FunctionDef) and n.name == "node_llm_classifier_evaluation"),
+    None)
+_llm_classifier_returns = (
+    _own_dict_returns(_llm_classifier_fn) if _llm_classifier_fn else [])
+
+# What the unscoped walk would have collected, kept only so the probe below can
+# compare the two. Never asserted on directly.
+_llm_classifier_returns_unscoped = [
+    _dict_return_keys(n) for n in ast.walk(_llm_classifier_fn or ast.Module(body=[], type_ignores=[]))
+    if isinstance(n, ast.Return) and isinstance(n.value, ast.Dict)]
 
 # NON-DEGENERATE FIRST. "no return omits llm_classifier_retries" is vacuously true for a
 # function that was never found, which is exactly what a stale filename gives.
@@ -566,8 +605,54 @@ check("the parsed source actually defines node_llm_classifier_evaluation",
       any(isinstance(n, ast.FunctionDef) and n.name == "node_llm_classifier_evaluation"
           for n in ast.walk(_tree)), True)
 check("found node_llm_classifier_evaluation's dict returns", len(_llm_classifier_returns) >= 2, True)
+# THE SCOPING IS DOING WORK. If the node ever stops nesting a dict-returning
+# helper this probe fails and the scoping can be reconsidered deliberately,
+# rather than the scan quietly reverting to a walk whose breadth nobody
+# rechecked. It is asserted as an inequality on the COUNT rather than on a
+# name, so it survives the helper being renamed.
+check("the nested-definition scoping excludes at least one dict return",
+      len(_llm_classifier_returns_unscoped) > len(_llm_classifier_returns), True)
 check("every return declares llm_classifier_retries",
       sorted(ln for ln, keys in _llm_classifier_returns if "llm_classifier_retries" not in keys),
+      [])
+# THE FAILURE RETURNS CARRY WHAT THEY WERE BILLED.
+#
+# Every one of the node's own exits must report the tokens this invocation was
+# charged for. It is asserted as a DISJUNCTION because the node states the fact
+# two ways and both are correct: the success return writes the two keys as
+# literals, and each early return spreads `**_billed_so_far()`, which is a
+# single helper so that four copies of the same guard cannot drift. An
+# ast.Dict key of None IS a `**` entry, which is how the spread is recognised.
+#
+# WHAT FAILS IT is a return that carries neither -- which is what all four
+# early returns did until this pass. _pipeline_provenance()'s
+# `state.get(..., 0)` then supplied a zero, so the row recorded 0 input and 0
+# output tokens against requests that had been issued and billed. Six such rows
+# are in the production database, each with llm_classifier_retries = 3 beside
+# two zeros.
+_TOKEN_KEYS = {"llm_classifier_input_tokens", "llm_classifier_output_tokens"}
+_own_returns_full = []
+_stack = list(_llm_classifier_fn.body)
+while _stack:
+    _n = _stack.pop()
+    if isinstance(_n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        continue
+    if isinstance(_n, ast.Return) and isinstance(_n.value, ast.Dict):
+        _own_returns_full.append((
+            _n.lineno,
+            {k.value for k in _n.value.keys
+             if isinstance(k, ast.Constant) and isinstance(k.value, str)},
+            any(k is None for k in _n.value.keys),      # a ** spread
+        ))
+    _stack.extend(ast.iter_child_nodes(_n))
+
+check("non-degenerate: both shapes are present in the node",
+      (sum(1 for _, keys, _sp in _own_returns_full if _TOKEN_KEYS <= keys) >= 1,
+       sum(1 for _, _keys, _sp in _own_returns_full if _sp) >= 1),
+      (True, True))
+check("every return reports its billed tokens (literally or by spread)",
+      sorted(ln for ln, keys, spread in _own_returns_full
+             if not (_TOKEN_KEYS <= keys or spread)),
       [])
 
 # The logger must not reach for a retrieval constant: that was the bug --

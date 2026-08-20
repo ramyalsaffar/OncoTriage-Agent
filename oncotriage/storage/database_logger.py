@@ -509,6 +509,87 @@ INFERENCE_COLUMN_ADDITIONS = {
     # So it is NULL exactly when llm_classifier_prompt_sha256 is NULL, and 0
     # would be a genuine reading of an empty record rather than an absence.
     "llm_classifier_patient_record_tokens":  "INTEGER",
+
+    # --- What the INPUT packer did, and what the provider served from cache -
+    #
+    # THESE FOUR WERE MEASURED AND THEN THROWN AWAY AT THIS WRITE. Stage 5
+    # computed all four, TrialMatchState declared them and
+    # _pipeline_provenance() carried them onto every result dict; this table
+    # declared no column, so File 14 wrote the columns it knew about and
+    # dropped the rest in silence. The comment beside them in
+    # oncotriage/agent/terminal.py recorded that as a deferred schema decision.
+    # This is that decision.
+    #
+    # NULL IS "NOT MEASURED" ON ALL FOUR, AND 0 IS A MEASUREMENT. The
+    # populations differ per column and are spelled out below, because they are
+    # not the same population and a reader who assumes they are will read a
+    # packing report of an unpacked run.
+    #
+    # NONE OF THE FOUR IS A COSTING TERM, and one of them looks like one.
+    # llm_classifier_cached_input_tokens is a SUBSET of
+    # llm_classifier_input_tokens -- the provider's report of how much of this
+    # request's prefix it served from cache -- exactly as
+    # llm_classifier_reasoning_tokens is a subset of the output figure. Cached
+    # input bills at a lower rate (PRICING_CONFIG's gpt-5.6-terra note records
+    # $0.20/1M against $2.00/1M) and that discount is deliberately NOT modelled
+    # by get_model_cost(), so that estimated_cost_usd stays comparable with
+    # every historical row in the same column. Subtracting this from the input
+    # figure, or pricing it separately, silently re-bases the whole cost series.
+    #
+    #   cached  NULL = no response of this run reported prompt_tokens_details
+    #                  .cached_tokens: a stub, a recording made before the
+    #                  field existed, a run that never reached Stage 5, or a
+    #                  run that ended at a failure return (the totals are not
+    #                  carried out of those -- the per-call ledger is, and it
+    #                  is where a failed run's cache reading lives).
+    #           0    = a response DID report the field and reported zero: the
+    #                  provider cached nothing. That is the reading this column
+    #                  exists to distinguish from the absence above, and it is
+    #                  the reading that says a prefix is not being reused.
+    #
+    # llm_classifier_call_details IS THE ONLY COLUMN THAT CAN ANSWER WHETHER
+    # THE CACHE WARMS. The summed figure above cannot: 5,000 cached tokens
+    # across three calls is equally consistent with a cache that warms after
+    # the first request and one that never warms at all, and those have
+    # opposite implications for what packing costs. This is the per-call
+    # ledger, JSON, one object per request ISSUED in the order they were
+    # issued, each carrying call_index (1-based), depth, trials,
+    # prompt_tokens, completion_tokens, cached_tokens, reasoning_tokens,
+    # finish_reason and entries_emitted. trial_matches.call_index joins to it
+    # by equality.
+    #
+    #   details NULL = node_llm_classifier_evaluation was never entered. Stage 5
+    #                  writes this key on EVERY one of its returns, including
+    #                  the failing ones, so its absence is stronger than the
+    #                  other three: it means no attempt was made at all.
+    #           '[]' = the node WAS entered and no call produced a usage
+    #                  object -- the first request raised before any response
+    #                  arrived. AN EMPTY LIST IS NOT NULL HERE and the INSERT
+    #                  tests `is not None` rather than truthiness for exactly
+    #                  this reason; see the value expression.
+    #
+    #   packed_chunks / packing  NULL = the packer's record does not describe
+    #                  this run. Stage 5 writes both on its SUCCESS return only
+    #                  (hallucinated_trials' convention, not the truncation
+    #                  counters'): the chunk list is a plan, and a run that died
+    #                  at its first call would otherwise publish the whole plan
+    #                  as though every request in it had been sent.
+    #                  0 chunks is reachable and is a measurement: the packer
+    #                  ran and produced no chunk, which is an empty candidate
+    #                  set, not an absent packer.
+    #
+    # packing is the report BEHIND the count and the count is the scalar a
+    # query groups by; both are stored because a JSON blob cannot be grouped on
+    # and a scalar cannot be audited. The report carries the estimator named,
+    # the configured and effective budgets, the cap, the two degradation flags
+    # (cap_relaxed_budget, over_budget_chunk), one entry per chunk, and
+    # prefix_sha256 -- the same value as llm_classifier_prompt_sha256, repeated
+    # there because the record's whole claim is "these N requests shared one
+    # prefix".
+    "llm_classifier_cached_input_tokens":    "INTEGER",
+    "llm_classifier_call_details":           "TEXT",
+    "llm_classifier_packed_chunks":          "INTEGER",
+    "llm_classifier_packing":                "TEXT",
 }
 
 
@@ -1466,8 +1547,10 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 not_evaluable_truncated, llm_classifier_calls,
                 llm_classifier_reasoning_tokens,
                 llm_classifier_prompt_version, llm_classifier_prompt_sha256,
-                llm_classifier_patient_record_tokens
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                llm_classifier_patient_record_tokens,
+                llm_classifier_cached_input_tokens, llm_classifier_call_details,
+                llm_classifier_packed_chunks, llm_classifier_packing
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             result["patient_id"],
             result["timestamp"],
@@ -1628,6 +1711,37 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
             # run that rendered no system message measured no record, and 0
             # would be indistinguishable from a genuinely empty record.
             result.get("llm_classifier_patient_record_tokens"),
+            # --- The Stage 5 packing and cache record ----------------------
+            #
+            # NO DEFAULT ON ANY OF THE FOUR. Each is a MEASUREMENT that this
+            # run either made or did not, and the migration comment above says
+            # what NULL means per column. A default of 0 would assert one
+            # request that cached nothing on a run that made no request, and a
+            # default of {} would assert a packing report that describes no
+            # run.
+            #
+            # THE CACHED FIGURE IS NOT SUBTRACTED FROM THE INPUT FIGURE AND IS
+            # NOT PRICED. It is a subset of llm_classifier_input_tokens, which
+            # get_model_cost() above already charged in full at the uncached
+            # rate, deliberately -- see the migration comment. Anyone folding
+            # this into a cost expression is re-basing the whole series.
+            result.get("llm_classifier_cached_input_tokens"),
+            # `is not None`, NOT truthiness, and the difference is the whole
+            # point of the column. retrieval_channels above tests truthiness
+            # because {} and None mean the same thing there -- Stage 2 either
+            # reported per-channel status or it did not. Here they do not: []
+            # is "the node ran and no call produced a usage object", which is
+            # a fact about a run that was attempted, and None is "the node was
+            # never entered". json.dumps(None) is the string 'null', which is
+            # neither, and is the specific trap this expression avoids.
+            (json.dumps(result["llm_classifier_call_details"])
+             if result.get("llm_classifier_call_details") is not None else None),
+            result.get("llm_classifier_packed_chunks"),
+            # Same rule. A packing report is a dict and an empty one would be
+            # a packer that reported nothing rather than an absent packer, so
+            # the test is on presence and never on emptiness.
+            (json.dumps(result["llm_classifier_packing"])
+             if result.get("llm_classifier_packing") is not None else None),
         ))
         
         inference_id = cursor.lastrowid

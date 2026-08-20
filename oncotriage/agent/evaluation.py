@@ -2921,6 +2921,84 @@ CLINICAL TRIALS:
     # Once per run, not once per chunk. See the guard below the parse.
     _reasoning_order_warned = False
 
+    def _billed_so_far() -> Dict:
+        """The tokens this node has already been billed for, for a FAILURE return.
+
+        WHY THIS EXISTS. Every early return below ends the node without a
+        verdict, and every one of them used to end it without a token figure
+        too -- so ``_pipeline_provenance()``'s ``state.get(..., 0)`` supplied a
+        zero and the row recorded 0 input and 0 output tokens against requests
+        that had been issued and billed. Six such rows are in the production
+        database, each carrying ``llm_classifier_retries = 3`` beside two
+        zeros. The accumulators above hold the true figure at every one of
+        those returns; nothing was missing except the two lines that carry it.
+
+        THE FIGURE IS NOT A PARTIAL TOTAL OF SOMETHING ELSE. It is the exact
+        count of what this invocation was billed before it stopped, which is
+        the only honest number available and is strictly better than a zero
+        that asserts no spend.
+
+        ``calls_made`` IS THE PRESENCE MARKER AND THE GUARD IS THE POINT.
+        It is incremented immediately after a response is returned and
+        immediately before ``response.usage`` is read, so ``calls_made == 0``
+        means no usage object was ever obtained by this invocation -- the very
+        first request raised before any response arrived. The tokens that
+        request may have been billed are unknown TO THIS PROCESS and are not
+        recoverable from anywhere inside it, so the keys are left ABSENT rather
+        than written as 0. What the caller then stores is a 0 supplied by
+        ``_pipeline_provenance()``, not by a measurement here; the two are
+        separable in the row because ``llm_classifier_calls`` is written on
+        every return now and reads 0 while ``llm_classifier_prompt_sha256`` is
+        non-NULL, which is the signature of "Stage 5 ran and no call was
+        counted". Estimating from prompt length instead would put a number in
+        a measurement column that no provider ever reported.
+
+        ``llm_classifier_calls`` IS CARRIED FOR THE SAME REASON THE TOKENS ARE.
+        It was written on the success return only, so a refusal after a real
+        billed call logged zero calls -- the identical defect one column over,
+        and the column a reader needs in order to interpret the token figure
+        beside it.
+
+        ``matching_model`` IS NOT RETURNED BY THIS HELPER and is written at the
+        API-error return instead, beside the spread. That is not tidiness: the
+        other three failure returns already carry it with their own arguments
+        for doing so, and returning it here would put a second, silent writer
+        behind three keys that already have one. It had to be added to the
+        API-error return by this change, though, and the reason is this
+        change: a row carrying non-zero Stage 5 tokens with a NULL
+        matching_model is the one shape File 16's Query 10, the dashboard cost
+        tab and ``run_harness.price_result`` all single out as unpriceable, and
+        that return was the one failure path not already naming the answering
+        model. A model that answered an earlier chunk of this batch did answer
+        this run.
+
+        THE CACHED AND REASONING TOTALS ARE DELIBERATELY NOT CARRIED. Both are
+        subsets of the two figures above and both are recorded PER CALL in
+        ``llm_classifier_call_details``, which every failure return already
+        carries and which now has a database column of its own. Adding the
+        summed forms here would duplicate a fact the ledger holds more
+        precisely, and section 5 of tests/test_agent_state_channel_coverage.py
+        pins their absence on exactly this path as the node's own design.
+
+        WHAT IT STILL DOES NOT COVER, stated rather than glossed:
+          * The failing request itself, when it raised before a response.
+          * Transport-layer retries inside the OpenAI SDK, which are invisible
+            to this process at every return, success included.
+          * Earlier INVOCATIONS of this node. ``retry_count`` routes the graph
+            back in here and every accumulator restarts at zero, so a run that
+            spent three attempts reports the last one's tokens. That is the
+            pre-existing behaviour of the SUCCESS return too and is documented
+            at ``run_harness.price_result``; it is not introduced or worsened
+            here, and it is why the stored total is a floor.
+        """
+        if not calls_made:
+            return {}
+        return {
+            "llm_classifier_input_tokens": input_tokens,
+            "llm_classifier_output_tokens": output_tokens,
+            "llm_classifier_calls": calls_made,
+        }
+
     while pending:
         chunk, depth = pending.pop()
 
@@ -2945,6 +3023,18 @@ CLINICAL TRIALS:
                 "llm_classifier_truncation_splits": truncation_splits,
                 "llm_classifier_output_tokens_estimated": estimated_output,
                 "llm_classifier_raw_response": "",
+                # What the calls that DID return were billed. Empty when this
+                # was the first request and no usage object ever arrived; see
+                # _billed_so_far for why absent rather than zero.
+                **_billed_so_far(),
+                # The model that answered the earlier chunks of this batch, if
+                # any. None when the first call raised, which is the same value
+                # this key had before and reads as "Stage 5 obtained no
+                # response". Carried because the tokens above are now non-zero
+                # on this path and a token figure with no model beside it is
+                # the one shape every cost reader in this project refuses to
+                # price.
+                "matching_model": model_answered,
                 "error": error_msg,
                 # The prompt WAS rendered before this return -- every one of Stage
                 # 5's early returns sits below the render call -- so the hash is a
@@ -3104,6 +3194,10 @@ CLINICAL TRIALS:
                 # A model DID answer -- by declining -- so the run is not
                 # anonymous, on the same argument as the parse-error path.
                 "matching_model": model_answered,
+                # A refusal is a completed, billed exchange: usage was read for
+                # every call before this one AND for the refusing call itself,
+                # above. Recording zeros here was the defect.
+                **_billed_so_far(),
                 "error": error_msg,
                 "llm_classifier_prompt_version": PROMPT_VERSION,
                 "llm_classifier_prompt_sha256": system_prompt_sha256,
@@ -3217,11 +3311,17 @@ CLINICAL TRIALS:
                 # run is not anonymous. Carried so that a patient whose retries
                 # all end in malformed JSON still logs which model produced
                 # them instead of a NULL that reads as "Stage 5 never ran".
-                # The token counters are deliberately not carried: they are not
-                # accumulated on this path at all (a pre-existing gap), and
-                # reporting a reasoning subtotal against a zero output total
-                # would be arithmetically incoherent.
                 "matching_model": model_answered,
+                # THE SENTENCE THAT USED TO STAND HERE WAS FALSE AND IS
+                # DELETED. It said the token counters "are not accumulated on
+                # this path at all". They are: `input_tokens +=
+                # response.usage.prompt_tokens` runs for every response, above,
+                # and the parse is reached only after it -- so at this return
+                # the accumulators hold the exact billed figure for this
+                # invocation and the response that would not parse is itself
+                # inside it. Writing zeros was not a gap in the accumulation,
+                # it was a gap in the return.
+                **_billed_so_far(),
                 "error": error_msg,
                 # The prompt WAS rendered before this return -- every one of Stage
                 # 5's early returns sits below the render call -- so the hash is a
@@ -3274,11 +3374,17 @@ CLINICAL TRIALS:
                 # run is not anonymous. Carried so that a patient whose retries
                 # all end in malformed JSON still logs which model produced
                 # them instead of a NULL that reads as "Stage 5 never ran".
-                # The token counters are deliberately not carried: they are not
-                # accumulated on this path at all (a pre-existing gap), and
-                # reporting a reasoning subtotal against a zero output total
-                # would be arithmetically incoherent.
                 "matching_model": model_answered,
+                # THE SENTENCE THAT USED TO STAND HERE WAS FALSE AND IS
+                # DELETED. It said the token counters "are not accumulated on
+                # this path at all". They are: `input_tokens +=
+                # response.usage.prompt_tokens` runs for every response, above,
+                # and the parse is reached only after it -- so at this return
+                # the accumulators hold the exact billed figure for this
+                # invocation and the response that would not parse is itself
+                # inside it. Writing zeros was not a gap in the accumulation,
+                # it was a gap in the return.
+                **_billed_so_far(),
                 "error": error_msg,
                 # The prompt WAS rendered before this return -- every one of Stage
                 # 5's early returns sits below the render call -- so the hash is a
