@@ -134,9 +134,12 @@ def node_query_expansion(state: dict) -> dict:
       - expansion_output_tokens: int — always 0 (no LLM)
     """
     # MedCPT was trained on 2-10 word PubMed queries. Cap R2 to prevent
-    # wasting the cross-encoder's 512-token budget on long EHR display texts
-    # (real-world EHRs can have 20+ word diagnosis strings with staging,
-    # receptor status, laterality, etc.).
+    # wasting the cross-encoder's sequence budget (config.CROSS_ENCODER_MAX_LENGTH)
+    # on long EHR display texts (real-world EHRs can have 20+ word diagnosis
+    # strings with staging, receptor status, laterality, etc.). The number is
+    # NOT restated here: a comment carrying a copy of a constant is the next
+    # stale site, which is the rule /pipeline/info's stage lines follow for
+    # MATCHING_MODEL.
     RERANK_QUERY_MAX_WORDS = 8
 
     start = time.time()
@@ -1177,8 +1180,20 @@ def node_cross_encoder_rerank(state: dict) -> dict:
     trial_texts = []
     for trial_obj in trials:
         trial = trial_obj["trial"]
-        # MedCPT max 512 tokens. With 3-8 token queries, ~500 tokens for
-        # trial text ≈ 1850 chars. Keep 1600 char cap for safety margin.
+        # THE 1600-CHAR CAP IS DERIVED FROM config.CROSS_ENCODER_MAX_LENGTH AND
+        # IS NOT COMPUTED FROM IT, deliberately. The derivation, against the 512
+        # that constant has always held: 3-8 token queries leave ~500 tokens for
+        # the trial text, which is roughly 1850 characters, and 1600 keeps a
+        # safety margin under that.
+        #
+        # It stays a literal because it is FIXTURE-VISIBLE: this string is what
+        # score_pairs is handed, so changing it changes every recorded
+        # cross-encoder digest and the twelve characterization fixtures would
+        # have to be recaptured, which costs money. Computing it from the
+        # constant would silently couple a paid artefact to a config edit.
+        # Whoever moves CROSS_ENCODER_MAX_LENGTH has to re-derive this by hand
+        # and pay for the recapture -- which is the same bill that constant's
+        # own comment already names.
         trial_text = (
             f"{trial['title']} {trial['eligibility']['criteria_text'][:1600]}"
         )

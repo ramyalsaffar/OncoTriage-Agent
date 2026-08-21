@@ -513,6 +513,14 @@ LOGGABLE_FIELDS = frozenset({
     # the day. None of the four names a trial, a patient or a diagnosis.
     "quality_dropped_percentile", "quality_dropped_floor",
     "quality_dropped_floor_only", "medcpt_floor",
+    # The cross-encoder's sequence limit, both sides of the comparison plus
+    # WHICH declaration was consulted. All three are model geometry -- a token
+    # count and an attribute path -- and none of them can carry a patient, a
+    # trial or a diagnosis. They are here rather than folded into the message
+    # because 6c of tests/test_observability_logging.py forbids interpolating
+    # data into a message, and because "unverified" is only actionable when the
+    # record says which half was unverified and against what number.
+    "max_length_configured", "max_length_declared", "max_length_source",
     # How many of the trials a render pass covered were changed by it, beside
     # `total` (how many it covered) and `count` (how many sequences it
     # rewrote). Three numbers rather than one because they answer three

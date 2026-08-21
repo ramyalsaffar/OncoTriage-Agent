@@ -2980,6 +2980,201 @@ finally:
 
 
 # ===========================================================================
+# 2f(iii). THE CROSS-ENCODER'S SEQUENCE LIMIT IS THE CHECKPOINT'S, NOT A LITERAL
+# ===========================================================================
+
+print("\n" + "=" * 78)
+print("2f(iii). the cross-encoder sequence limit has one owner")
+print("=" * 78)
+
+# WHY THIS IS ITS OWN SECTION RATHER THAN FOUR MORE CHECKS INSIDE 2f(ii).
+# 2f(ii) answers one question -- "is the checkpoint NAME written down once" --
+# and every helper and every control in it is keyed on _MEDCPT_FRAGMENT. This
+# answers a different question about a different fact (an integer, not a
+# string), needs a different detector (a keyword argument, not a literal scan),
+# and must be able to fail with its own message: folding it in would give a
+# reader of a failure line no way to tell "somebody re-hardcoded the model name"
+# from "somebody re-hardcoded the sequence limit", which are different edits
+# with different fixes. It sits directly under 2f(ii) because the two facts are
+# a pair -- CROSS_ENCODER_MAX_LENGTH is a property OF CROSS_ENCODER_MODEL -- and
+# a reader who has just read one should read the other.
+#
+# THE HAZARD, which is 2f(ii)'s one level down. Every tokenizer call in this
+# project passes `truncation=True`, so transformers cuts to whatever `max_length`
+# says and raises nothing. A limit that stops matching its checkpoint therefore
+# produces scores, a ranking and a Stage 4 gate exactly as before, and the only
+# symptom is that the cross-encoder read less of every trial than it could.
+# oncotriage/agent/deps.py verifies it at load; this is the STRUCTURAL half,
+# and neither replaces the other -- an AST scan cannot see a verifier that has
+# stopped verifying, and a runtime check cannot see a second literal that was
+# never routed through it.
+
+_MODELS_PY = os.path.join(_PKG_DIR, "agent", "models.py")
+_VALIDATOR_PY = os.path.join(_PKG_DIR, "retrieval", "index_validator.py")
+
+
+def _max_length_arguments(path):
+    """(lineno, how `max_length=` is written) for every call in `path` that passes it.
+
+    All three reference forms Python has for reaching a name are recognised --
+    the bare name, the attribute form and the from-import binding (which reads
+    as the bare name at the call site) -- because a check that named one would
+    pass silently over the other two. A literal is reported as its repr, so a
+    regression names itself in the failure line rather than only being counted.
+    """
+    tree = ast.parse(open(path, encoding="utf-8").read(), path)
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        for kw in node.keywords:
+            if kw.arg != "max_length":
+                continue
+            value = kw.value
+            if isinstance(value, ast.Name):
+                out.append((node.lineno, value.id))
+            elif isinstance(value, ast.Attribute):
+                out.append((node.lineno, value.attr))
+            elif isinstance(value, ast.Constant):
+                out.append((node.lineno, repr(value.value)))
+            else:
+                out.append((node.lineno, f"<{type(value).__name__}>"))
+    return out
+
+
+# THE CONSTANT EXISTS, IS AN INT, AND SITS BESIDE THE MODEL NAME. "Beside" is
+# asserted as a real adjacency rather than left to prose: the two assignments
+# must be the two nearest module-level statements to each other in config.py,
+# because the argument for keeping them together is that a checkpoint edit
+# should not be able to miss the limit, and a reader who has to search for the
+# second one has already lost that.
+_config_tree = ast.parse(open(_CONFIG_PY, encoding="utf-8").read(), _CONFIG_PY)
+_config_assigns = {}
+for _i, _node in enumerate(_config_tree.body):
+    if isinstance(_node, ast.Assign):
+        for _t in _node.targets:
+            if isinstance(_t, ast.Name):
+                _config_assigns[_t.id] = (_i, _node)
+
+check("config declares CROSS_ENCODER_MAX_LENGTH at module scope",
+      "CROSS_ENCODER_MAX_LENGTH" in _config_assigns, True)
+
+_limit_node = _config_assigns.get("CROSS_ENCODER_MAX_LENGTH", (None, None))[1]
+_limit_value = (_limit_node.value.value
+                if isinstance(getattr(_limit_node, "value", None), ast.Constant)
+                else None)
+check("...and it is a plain positive integer literal, not an expression that "
+      "could be derived from something that moves",
+      isinstance(_limit_value, int) and not isinstance(_limit_value, bool)
+      and _limit_value > 0, True)
+
+_model_index = _config_assigns.get("CROSS_ENCODER_MODEL", (None, None))[0]
+_limit_index = _config_assigns.get("CROSS_ENCODER_MAX_LENGTH", (None, None))[0]
+check("...and it is the module-level statement IMMEDIATELY after "
+      "CROSS_ENCODER_MODEL, so a checkpoint edit cannot miss it",
+      (_model_index is not None and _limit_index is not None
+       and _limit_index == _model_index + 1), True)
+
+# EVERY TOKENIZER CALL IN THE PACKAGE IS HANDED THAT NAME. Two sites today --
+# the Stage 3 scorer and the validator's smoke test -- and the second is the
+# one this pass found: it carried its own bare 512, which is the shape pass
+# 20c-3a removed when this same module carried its own BM25 encoder. A
+# validator holding a private copy of a pipeline constant cannot detect the
+# drift it exists to catch.
+_max_length_sites = {}
+for _f in _PKG_FILES:
+    _hits = _max_length_arguments(_f)
+    if _hits:
+        _max_length_sites[os.path.relpath(_f, _code_dir)] = _hits
+
+check("exactly these package files pass max_length= at all",
+      sorted(_max_length_sites),
+      ["oncotriage/agent/models.py", "oncotriage/retrieval/index_validator.py"])
+
+_max_length_names = sorted(
+    name for _hits in _max_length_sites.values() for _ln, name in _hits)
+check("...and every one of them is handed CROSS_ENCODER_MAX_LENGTH, so no bare "
+      "512 survives at a tokenizer call",
+      _max_length_names,
+      ["CROSS_ENCODER_MAX_LENGTH", "CROSS_ENCODER_MAX_LENGTH"])
+
+check("...and there are exactly two, so a third tokenizer call cannot appear "
+      "unnamed (non-degeneracy: an empty scan satisfies the list check above "
+      "only if the list is empty, which it is not -- say so anyway)",
+      sum(len(_h) for _h in _max_length_sites.values()), 2)
+
+# AND THE VERIFIER IS WIRED TO BOTH FACTORIES. Without this, the two checks
+# above would pass over a package whose runtime check had been deleted -- the
+# structural half proving the literal is gone while nothing compared it to
+# anything.
+_deps_tree = ast.parse(open(_DEPS_PY, encoding="utf-8").read(), _DEPS_PY)
+_verify_callers = sorted(
+    _fn.name
+    for _fn in ast.walk(_deps_tree)
+    if isinstance(_fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+    for _c in ast.walk(_fn)
+    if isinstance(_c, ast.Call) and isinstance(_c.func, ast.Name)
+    and _c.func.id == "_verify_cross_encoder_sequence_limit")
+check("both MedCPT factories call the sequence-limit verifier",
+      _verify_callers, ["_build_medcpt_model", "_build_medcpt_tokenizer"])
+
+# --- NEGATIVE CONTROLS, one per reference form, each planted and each fired ---
+_LIMIT_PLANT_ROOT = tempfile.mkdtemp(prefix="oncotriage_maxlen_")
+try:
+    _LIMIT_PROBE = os.path.join(_LIMIT_PLANT_ROOT, "probe.py")
+    for _label, (_code, _expected) in {
+        "a bare 512 is REPORTED AS THE LITERAL, so the shape this pass "
+        "removed from BOTH tokenizer call sites names itself": ('tok(pairs, truncation=True, max_length=512)\n',
+                         [(1, "512")]),
+        "the BARE-NAME reference form is recognised -- the one the validator "
+        "uses, because a function-local `config` forbids the attribute form "
+        "there (check 2g)":
+            ('tok(pairs, max_length=CROSS_ENCODER_MAX_LENGTH)\n',
+             [(1, "CROSS_ENCODER_MAX_LENGTH")]),
+        "the ATTRIBUTE reference form is recognised -- the one models.py uses":
+            ('tok(pairs, max_length=config.CROSS_ENCODER_MAX_LENGTH)\n',
+             [(1, "CROSS_ENCODER_MAX_LENGTH")]),
+        "a call with no max_length at all is not reported, so the scan is not "
+        "simply matching every call": ('tok(pairs, truncation=True)\n', []),
+    }.items():
+        with open(_LIMIT_PROBE, "w", encoding="utf-8") as _fh:
+            _fh.write(_code)
+        check(f"max_length scan: {_label}",
+              _max_length_arguments(_LIMIT_PROBE), _expected)
+
+    # THE PLANT THE BRIEF ASKS FOR, IN A COPY OF THE REAL FILE: restore the
+    # literal in models.py and require the scan to report it. This is what says
+    # the two package-wide checks above are the reason they pass, rather than a
+    # detector that would report the same list against any file at all.
+    shutil.copytree(_PKG_DIR, os.path.join(_LIMIT_PLANT_ROOT, "oncotriage"))
+    _PLANTED_MODELS = os.path.join(_LIMIT_PLANT_ROOT, "oncotriage", "agent",
+                                   "models.py")
+    _planted_src = open(_PLANTED_MODELS, encoding="utf-8").read()
+    _needle = "max_length=config.CROSS_ENCODER_MAX_LENGTH,"
+    if _planted_src.count(_needle) != 1:
+        fail("2f(iii) plant: the needle is not in the shipped models.py exactly "
+             "once", f"found {_planted_src.count(_needle)} occurrences of "
+                     f"{_needle!r}; the plant below would test nothing")
+    else:
+        with open(_PLANTED_MODELS, "w", encoding="utf-8") as _fh:
+            _fh.write(_planted_src.replace(_needle, "max_length=512,", 1))
+        # The expected line number is DERIVED from the shipped file's own
+        # site, never typed here: a hardcoded lineno rots on the next comment
+        # anyone adds above it, and a control that fails for that reason is a
+        # control people delete.
+        _shipped_site = _max_length_arguments(_MODELS_PY)
+        check("...and the shipped models.py has exactly one max_length site to "
+              "derive the plant's location from (non-degeneracy)",
+              len(_shipped_site), 1)
+        check("...CATCHES the literal restored in a COPY of models.py, and "
+              "names it",
+              _max_length_arguments(_PLANTED_MODELS),
+              [(_shipped_site[0][0], "512")] if _shipped_site else ["<no site>"])
+finally:
+    shutil.rmtree(_LIMIT_PLANT_ROOT, ignore_errors=True)
+
+
+# ===========================================================================
 # 2g. NO FUNCTION-LOCAL SHADOWS A MODULE-LEVEL IMPORT
 # ===========================================================================
 

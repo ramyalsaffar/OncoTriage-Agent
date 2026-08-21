@@ -118,6 +118,21 @@ BUCKETS = {
         "keys, no spend, no git history, no corpus, no database, no "
         "subprocess. It writes nothing anywhere, so it is not in the "
         "collision matrix"),
+    "test_agent_cross_encoder_sequence_limit.py": (
+        _A, None,
+        "ran green in 1.1s, 42 checks, against ONLY the directory skeleton: "
+        "config.CROSS_ENCODER_MAX_LENGTH and the load-time verifier in "
+        "oncotriage/agent/deps.py that compares it with what the checkpoint "
+        "declares. NO MODEL IS LOADED -- ONCOTRIAGE_DEFER_LOCAL_MODELS is set "
+        "above the imports and section 4 asserts torch and transformers never "
+        "entered sys.modules -- so no network, no keys, no spend, no model "
+        "download, no live Qdrant, no corpus, no database, no git history. "
+        "Every control is a different INPUT to a pure function, plus one "
+        "override installed inside try/finally and asserted removed, so it "
+        "execs nothing and needs no _EXEC_ALLOWLIST entry. It writes nothing "
+        "anywhere and is NOT in the collision matrix -- the one repository "
+        "file it reads, oncotriage/agent/deps.py, is written by neither of "
+        "the suite's two writers"),
     "test_agent_degraded_run_and_reporting.py": (
         _A, None,
         "ran green in 2.6s, 118 checks, against ONLY the directory skeleton: "

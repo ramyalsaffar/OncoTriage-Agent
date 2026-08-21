@@ -174,6 +174,7 @@ value that must not change mid-process. An override always wins over it.
 
 import os
 import threading
+from collections import Counter
 
 from oncotriage import config, embedding
 from oncotriage.observability import get_logger
@@ -562,6 +563,194 @@ class _DeferredLocalModel:
 
 
 # ---------------------------------------------------------------------------
+# The cross-encoder's sequence limit, verified against the checkpoint
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS. config.CROSS_ENCODER_MAX_LENGTH is a property OF
+# config.CROSS_ENCODER_MODEL -- MedCPT is BERT-shaped and carries 512 learned
+# position embeddings -- and the two are separate lines that can be edited
+# apart. The failure that produces is the one this whole module is about: every
+# tokenizer call passes `truncation=True`, so transformers does exactly what the
+# number says and raises nothing, Stage 3 keeps returning scores, the Stage 4
+# quality gate keeps cutting, and the only symptom of a limit that has stopped
+# matching its checkpoint is that the ranking got worse. The same sentence, one
+# level down, as the tokenizer/weights hazard argued at _build_medcpt_tokenizer.
+#
+# WHAT EACH HALF ACTUALLY DECLARES, MEASURED 2026-08-21 against the cached
+# ncbi/MedCPT-Cross-Encoder rather than assumed. This is the decisive fact and
+# it is why there are two call sites rather than one:
+#
+#   tokenizer.model_max_length          1000000000000000019884624838656
+#                                       == transformers.VERY_LARGE_INTEGER,
+#                                       i.e. NO declared limit
+#   model.config.max_position_embeddings 512
+#
+# So a check written only against the tokenizer -- the obvious place, since the
+# tokenizer is what takes `max_length` -- would take the "undeclared" branch on
+# every load of the shipped checkpoint and verify NOTHING, forever. It would be
+# a check that has stopped checking while looking exactly like one that passes.
+# The WEIGHTS are what verify this number; the tokenizer half is kept because a
+# checkpoint that DOES declare a model_max_length is then covered too, and a
+# tokenizer whose declared limit contradicts the weights' is a real defect.
+#
+# UNDECLARED IS NOT A MISMATCH, and the distinction is the reason this is not
+# one `!=`. A placeholder means "this checkpoint does not state a limit", which
+# is a different fact from "this checkpoint states a different limit" and has a
+# different remedy: nobody can make a vendor declare one, so raising would make
+# the pipeline unrunnable against a whole class of perfectly good checkpoints.
+# It is COUNTED, on the AGE_PARSE_FAILURES footing -- third-party DATA counts,
+# configuration raises (item 11a) -- and never silent.
+#
+# A DECLARED MISMATCH RAISES, in BOTH directions, and that is a decision rather
+# than an oversight:
+#
+#   configured > declared   the model is handed positions it has no embedding
+#                           for. Loud but LATE: an IndexError out of the
+#                           embedding lookup, per patient, thirty frames inside
+#                           Stage 3, after Stage 2 has already spent its
+#                           embedding call.
+#   configured < declared   silent. Every pair is cut shorter than the model
+#                           could read and only the ranking says so.
+#
+# Raising covers both at the one moment a process can still be fixed cheaply --
+# first model load, before Stage 3 scores anything and before Stage 5 spends a
+# cent -- and it costs one run rather than one class of runs. A deliberately
+# smaller budget is a SECOND named constant in config with its own measurement
+# (the RRF_K precedent), not a quiet inequality here.
+#
+# IT IS A RuntimeError SUBCLASS AND DELIBERATELY NOT A ValueError, on the
+# UnknownModelPricingError / IndexVerificationError precedent: a stray
+# `except ValueError` around a model load must not be able to eat it.
+#
+# NOTHING HERE ADDS A LOAD TO A DEFERRED PATH. Both callers run BELOW their own
+# _DEFER_LOCAL_MODELS early return, so a deferred process never reaches this
+# function; and an installed override short-circuits the factory in _resolve
+# above, so a harness that supplies its own tokenizer never reaches it either.
+# The verifier reads an attribute off an object the caller already built and
+# imports nothing.
+
+
+class CrossEncoderLimitMismatchError(RuntimeError):
+    """config.CROSS_ENCODER_MAX_LENGTH contradicts the loaded checkpoint."""
+
+
+CROSS_ENCODER_LIMIT_DEGRADATIONS = Counter()
+"""Times the cross-encoder's sequence limit could not be VERIFIED, by cause.
+
+A non-zero count is not a mismatch -- a mismatch raises. It means the loaded
+object declined to state a limit (`undeclared_placeholder`, which is what the
+shipped MedCPT tokenizer does on every load) or stated one this code could not
+read (`unreadable:<type>`), so config.CROSS_ENCODER_MAX_LENGTH went unchecked
+against that half. Keyed by cause and the source attribute, never by a value.
+
+WHEN ONLY `undeclared_*` KEYS ARE PRESENT AND BOTH HALVES ARE IN THEM, nothing
+in the process verified the limit at all. That is the state worth noticing in
+the run-end report, and it is why the two sources are separate keys.
+"""
+
+# transformers signals "no limit declared" with VERY_LARGE_INTEGER, int(1e30).
+# The test is a FLOOR rather than an equality against that exact value: the
+# vendor may change the sentinel, and no transformer's positional budget is
+# within nine orders of magnitude of this, so a floor cannot be reached by a
+# genuine limit while surviving a sentinel that moves.
+_UNDECLARED_LIMIT_FLOOR = 10 ** 12
+
+LIMIT_VERIFIED = "verified"
+LIMIT_UNDECLARED = "undeclared"
+LIMIT_UNREADABLE = "unreadable"
+
+LIMIT_VERIFICATION_STATES = (LIMIT_VERIFIED, LIMIT_UNDECLARED, LIMIT_UNREADABLE)
+"""Every value _verify_cross_encoder_sequence_limit can RETURN.
+
+Closed, so a caller may branch on it exhaustively, and declared here rather
+than left implicit for the same reason RESOLUTION_STATES is -- a vocabulary
+nobody can enumerate is one nobody can be sure they have handled.
+A fourth outcome is not in it: a declared mismatch RAISES.
+"""
+
+
+def _verify_cross_encoder_sequence_limit(declared, source, checkpoint):
+    """Check one declaration against config.CROSS_ENCODER_MAX_LENGTH.
+
+    `declared` is whatever the loaded object says its sequence budget is --
+    `tokenizer.model_max_length` or `model.config.max_position_embeddings` --
+    and `source` names which, so a counter key and a message say WHICH half
+    could not be verified rather than only that something could not.
+
+    Returns one of LIMIT_VERIFICATION_STATES. Raises
+    CrossEncoderLimitMismatchError when the checkpoint declares a limit and it
+    is not the configured one; the full argument is in the block above.
+
+    `bool` is rejected with the non-integers on purpose: True == 1 in Python, so
+    a tokenizer attribute that had somehow become a flag would otherwise be
+    compared as the number 1 and reported as a mismatch against 512, which
+    names the wrong defect.
+    """
+    configured = config.CROSS_ENCODER_MAX_LENGTH
+
+    if declared is None:
+        CROSS_ENCODER_LIMIT_DEGRADATIONS[f"undeclared_missing:{source}"] += 1
+        log.warning("the cross-encoder checkpoint declares no sequence limit "
+                    "here, so the configured one went unverified against it",
+                    event="cross_encoder_limit_unverified",
+                    status=LIMIT_UNDECLARED, model=checkpoint,
+                    max_length_source=source,
+                    max_length_configured=configured,
+                    reason="attribute absent")
+        return LIMIT_UNDECLARED
+
+    if isinstance(declared, bool) or not isinstance(declared, int):
+        CROSS_ENCODER_LIMIT_DEGRADATIONS[
+            f"unreadable:{source}:{type(declared).__name__}"] += 1
+        log.warning("the cross-encoder checkpoint declared a sequence limit "
+                    "this code could not read, so the configured one went "
+                    "unverified against it",
+                    event="cross_encoder_limit_unverified",
+                    status=LIMIT_UNREADABLE, model=checkpoint,
+                    max_length_source=source,
+                    max_length_configured=configured,
+                    reason=type(declared).__name__)
+        return LIMIT_UNREADABLE
+
+    if declared >= _UNDECLARED_LIMIT_FLOOR:
+        CROSS_ENCODER_LIMIT_DEGRADATIONS[f"undeclared_placeholder:{source}"] += 1
+        log.warning("the cross-encoder checkpoint declares no sequence limit "
+                    "here -- the transformers placeholder -- so the configured "
+                    "one went unverified against it",
+                    event="cross_encoder_limit_unverified",
+                    status=LIMIT_UNDECLARED, model=checkpoint,
+                    max_length_source=source,
+                    max_length_configured=configured,
+                    reason="transformers placeholder")
+        return LIMIT_UNDECLARED
+
+    if declared != configured:
+        raise CrossEncoderLimitMismatchError(
+            f"config.CROSS_ENCODER_MAX_LENGTH is {configured}, but the loaded "
+            f"checkpoint {checkpoint!r} declares {declared} at {source}. Those "
+            f"two constants are one fact: CROSS_ENCODER_MAX_LENGTH is the "
+            f"sequence budget OF CROSS_ENCODER_MODEL, so a checkpoint change "
+            f"has to move both. Nothing downstream would report this -- every "
+            f"tokenizer call passes truncation=True, so a configured limit "
+            f"below the checkpoint's silently feeds the cross-encoder less of "
+            f"every trial and only the ranking degrades, and one above it "
+            f"fails later, per patient, inside Stage 3. Fix the constant in "
+            f"oncotriage/config.py; if a smaller budget is wanted on purpose, "
+            f"add a second named constant there with the measurement that "
+            f"justifies it rather than lowering this one."
+        )
+
+    log.info("the cross-encoder sequence limit matches the checkpoint",
+             event="cross_encoder_limit_verified", status=LIMIT_VERIFIED,
+             model=checkpoint, max_length_source=source,
+             max_length_configured=configured, max_length_declared=declared)
+    return LIMIT_VERIFIED
+
+
+#------------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
 # Factories
 # ---------------------------------------------------------------------------
 #
@@ -600,6 +789,20 @@ def _build_medcpt_tokenizer():
     tokenizer = AutoTokenizer.from_pretrained(config.CROSS_ENCODER_MODEL)
     log.info("MedCPT cross-encoder tokenizer loaded",
              event="local_model_load_finished", model=config.CROSS_ENCODER_MODEL)
+
+    # AND THE SEQUENCE LIMIT, against what this tokenizer declares. Below the
+    # deferral return above on purpose, and unreachable when an override is
+    # installed because _resolve never calls this factory then.
+    #
+    # THE SHIPPED CHECKPOINT REPORTS THE PLACEHOLDER HERE, measured, so this
+    # call is expected to return LIMIT_UNDECLARED and the load-bearing check is
+    # the one in _build_medcpt_model below. It is kept anyway: a tokenizer that
+    # DOES declare a limit is then covered, and one whose declared limit
+    # contradicts the weights' is a real defect that nothing else would see.
+    _verify_cross_encoder_sequence_limit(
+        getattr(tokenizer, "model_max_length", None),
+        "tokenizer.model_max_length",
+        config.CROSS_ENCODER_MODEL)
     return tokenizer
 
 
@@ -626,6 +829,16 @@ def _build_medcpt_model():
     model.eval()
     log.info("MedCPT cross-encoder weights loaded",
              event="local_model_load_finished", model=config.CROSS_ENCODER_MODEL)
+
+    # THIS IS THE CALL THAT VERIFIES config.CROSS_ENCODER_MAX_LENGTH. The
+    # weights are what the limit is a property OF -- a BERT with N learned
+    # position embeddings cannot accept position N -- and, measured, they are
+    # the half of this checkpoint that declares a number at all. Reading an
+    # attribute off a model that has just been built adds no load to any path.
+    _verify_cross_encoder_sequence_limit(
+        getattr(getattr(model, "config", None), "max_position_embeddings", None),
+        "weights.config.max_position_embeddings",
+        config.CROSS_ENCODER_MODEL)
     return model
 
 

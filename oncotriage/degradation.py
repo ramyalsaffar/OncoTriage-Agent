@@ -67,6 +67,7 @@ the reader then reports zero forever.
 from collections import Counter
 from typing import Dict, List, Optional
 
+from oncotriage.agent import deps as _agent_deps
 from oncotriage.agent import evaluation as _agent_evaluation
 from oncotriage.agent import filtering as _agent_filtering
 from oncotriage.agent import patient as _agent_patient
@@ -118,6 +119,13 @@ _REGISTRY_SPEC = (
     ("LAB_UNIT_DEGRADATIONS", _agent_patient.LAB_UNIT_DEGRADATIONS,
      "a lab value was not unit-converted; 'unconverted:' keys are the ones "
      "that want a new row in _LAB_UNIT_CONVERSIONS"),
+    ("CROSS_ENCODER_LIMIT_DEGRADATIONS",
+     _agent_deps.CROSS_ENCODER_LIMIT_DEGRADATIONS,
+     "the loaded cross-encoder did not declare a sequence limit this code "
+     "could compare, so config.CROSS_ENCODER_MAX_LENGTH went UNVERIFIED "
+     "against that half; a genuine mismatch raises rather than counting, and "
+     "the shipped MedCPT tokenizer reports undeclared_placeholder on every "
+     "load"),
     ("QDRANT_RETRIES", _utils.QDRANT_RETRIES,
      "a Qdrant call failed and was retried; the run survived it, keyed by "
      "the function that was retried"),

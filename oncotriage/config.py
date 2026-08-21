@@ -209,6 +209,57 @@ MATCHING_MODEL = "gpt-5.6-terra"  # For criterion-level evaluation
 # recordings.cross_encoder and would have to be recaptured -- which costs money.
 CROSS_ENCODER_MODEL = "ncbi/MedCPT-Cross-Encoder"
 
+# CROSS_ENCODER_MAX_LENGTH is the sequence limit every tokenizer call in this
+# project passes as `max_length`, and it belongs TO THE CHECKPOINT NAMED
+# DIRECTLY ABOVE. MedCPT is BERT-shaped: its weights carry 512 learned position
+# embeddings and there is no position 512. So these two constants change
+# TOGETHER OR NOT AT ALL -- a checkpoint edit that leaves this number behind is
+# the defect this pairing exists to prevent, one level below the tokenizer /
+# weights pairing argued above.
+#
+# TRUNCATION AT THIS LIMIT IS REQUESTED BEHAVIOUR, WHICH IS WHY THE DRIFT IS
+# SILENT. Every call site passes `truncation=True` beside it, so transformers
+# does exactly what it was told: it cuts the pair to this many tokens and
+# returns. Set it BELOW the checkpoint's real budget and nothing raises, no
+# counter moves, the cross-encoder keeps scoring and keeps ranking -- it is
+# simply reading less of every trial than it could, and the only symptom is
+# that Stage 3's ordering is worse. That is the same absence-of-any-error the
+# comment above records for a mismatched tokenizer/weights pair, and the same
+# one oncotriage/embedding.py exists for on the BM25 side. Set it ABOVE and the
+# failure is loud but late -- an IndexError out of the embedding lookup, per
+# patient, thirty frames inside Stage 3.
+#
+# WHAT VERIFIES IT, AND WHAT THE CHECKPOINT ACTUALLY DECLARES. Both MedCPT
+# factories in oncotriage/agent/deps.py call
+# _verify_cross_encoder_sequence_limit() on whatever the loaded object declares,
+# and a declared value that DIFFERS from this constant raises
+# CrossEncoderLimitMismatchError. Measured against the cached checkpoint on
+# 2026-08-21 rather than assumed, because it decides which half is load-bearing:
+#
+#   tokenizer_config.json  "model_max_length": 1000000000000000019884624838656
+#                          -- transformers' VERY_LARGE_INTEGER, i.e. the
+#                          tokenizer declares NO limit at all
+#   config.json            "max_position_embeddings": 512
+#                          -- the weights declare 512, and this is the fact
+#                          that makes 512 correct
+#
+# So the WEIGHTS are what verify this number and the tokenizer half is expected
+# to report "undeclared" on this checkpoint. That asymmetry is recorded at the
+# verifier, and "undeclared" is COUNTED rather than raised on
+# (CROSS_ENCODER_LIMIT_DEGRADATIONS) because a checkpoint that declines to
+# declare a limit is not a checkpoint that contradicts one.
+#
+# IF A DELIBERATELY SMALLER BUDGET IS EVER WANTED -- truncating harder than the
+# model allows, for latency -- that is a SECOND named constant here with the
+# measurement that justifies it, on the RRF_K precedent below. Do not lower this
+# one: its declared contract is that it IS the checkpoint's limit, and the
+# verifier enforces that.
+#
+# CHANGING IT CHANGES EVERY RANKING, exactly as CROSS_ENCODER_MODEL does, so the
+# twelve characterization fixtures would replay as misses on
+# recordings.cross_encoder and would have to be recaptured, which costs money.
+CROSS_ENCODER_MAX_LENGTH = 512
+
 # Matching parameters
 TOP_K_CANDIDATES = 40  # Top N of trials to evaluate initially with cross encoder
 BM25_RETRIEVAL_SIZE = 75  # Trials from BM25 search

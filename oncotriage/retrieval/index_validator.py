@@ -73,6 +73,7 @@ from qdrant_client.models import SparseVector
 from oncotriage.agent import deps
 from oncotriage.config import (
     COLLECTION_NAME,
+    CROSS_ENCODER_MAX_LENGTH,
     EMBEDDING_DIM,
     EMBEDDING_MODEL,
     Project_Name,
@@ -442,7 +443,16 @@ def stage2_retrieval_tests() -> list:
             [[sample_query, sample_doc]],
             return_tensors="pt",
             truncation=True,
-            max_length=512,
+            # THE SAME LIMIT THE PIPELINE USES, from the same owner. This was a
+            # second bare 512 -- the identical hazard pass 20c-3a removed when
+            # this module carried its own SparseTextEmbedding: a validator that
+            # holds its own copy of a pipeline constant cannot detect the drift
+            # it exists to catch, because both halves of the comparison move
+            # with the copy. It is the BARE NAME rather than `config.X` because
+            # stage1_index_health() binds a local named `config`, which would
+            # make every module-attribute read in that function an
+            # UnboundLocalError -- check 2g of tests/test_package_invariants.py.
+            max_length=CROSS_ENCODER_MAX_LENGTH,
             padding=True,
         )
         with torch.no_grad():

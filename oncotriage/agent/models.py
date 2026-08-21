@@ -77,7 +77,13 @@ def medcpt_score_pairs(query: str, trial_texts: List[str]) -> "np.ndarray":
             truncation=True,
             padding=True,
             return_tensors="pt",
-            max_length=512,
+            # THE LIMIT IS THE CHECKPOINT'S, so it is config's and not a
+            # literal here (see config.CROSS_ENCODER_MAX_LENGTH). `truncation`
+            # above means transformers will do exactly what this number says
+            # without complaint, so a number that stopped matching the
+            # checkpoint would quietly feed the cross-encoder less of every
+            # trial and only the ranking would say so.
+            max_length=config.CROSS_ENCODER_MAX_LENGTH,
         )
         return (
             medcpt_model(**encoded)

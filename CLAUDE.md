@@ -405,7 +405,7 @@ python tests/test_monitoring_ecog_availability_drift.py            # 111 (was 11
 python tests/test_registries_cancer_code_claims_audit.py           # 197
 python tests/test_registries_cancer_code_claims_audit_control.py   #  16; 14 planted, 14 caught
 python tests/test_config_snapshot_date_rot.py                      #  10; 6 subprocess runs, ~6 min
-python tests/test_package_invariants.py                            # 247/0/0 on macOS; 245/2/2 on Linux (was 234/6 there before commit ec2033a gave it a SKIP mechanism). No network, no keys, no corpus. NOT in CI — see below
+python tests/test_package_invariants.py                            # 260/0/0 on macOS (was 247 before section 2f(iii)); 245/2/2 on Linux was measured at 247 and has not been re-measured there (was 234/6 there before commit ec2033a gave it a SKIP mechanism). No network, no keys, no corpus. NOT in CI — see below
 python tests/test_degraded_dependencies.py                         # 174 (was 172 in this note, and 170 before pass 20e; the 172 was never true of the file). Item 11a
 python tests/test_storage_query_layer.py                           # 194; item 38, temp SQLite only
 
@@ -548,6 +548,17 @@ python tests/test_dockerignore_exclusions.py                        #  36 passed
 # neither of the suite's two writers. It EXECS NOTHING, so it needs no
 # _EXEC_ALLOWLIST entry. ~0.8 s.
 python tests/test_agent_rrf_config_ownership.py                     #  31
+
+# The cross-encoder sequence-limit pass. Same shape, same directory. NO MODEL
+# IS LOADED -- ONCOTRIAGE_DEFER_LOCAL_MODELS is set above the imports and
+# section 4 asserts torch and transformers never entered sys.modules -- so no
+# model download, no network, no keys, no spend, no live Qdrant, no corpus, no
+# database, no git history, and NOT in the collision matrix (the one repository
+# file it reads, oncotriage/agent/deps.py, is written by neither of the suite's
+# two writers). It EXECS NOTHING: every control is a different INPUT to a pure
+# function, plus one override installed inside try/finally and asserted
+# removed. ~1.1 s.
+python tests/test_agent_cross_encoder_sequence_limit.py             #  42
 
 # The harness-budget pass. Same shape, same directory. No network, no keys, no
 # spend, NO LIVE SERVER and no live Qdrant -- it starts nothing and issues no
@@ -4841,6 +4852,175 @@ criterion. Redeploying writes outside the repository and is one command:
 section 4b). The 175 in the admission pass's own account further up is left as
 written, per the rule that a past-tense account keeps its wording; the run block
 is the current-state owner.
+
+### The cross-encoder's sequence limit belongs to its checkpoint (the sequence-limit pass)
+
+**`512` WAS A BARE LITERAL AT TWO TOKENIZER CALL SITES AND NOTHING TIED IT TO
+THE CHECKPOINT.** `config.CROSS_ENCODER_MAX_LENGTH` is that number now, declared
+as the module-level statement **immediately after** `CROSS_ENCODER_MODEL`,
+because it is a property OF that checkpoint: MedCPT is BERT-shaped and its
+weights carry 512 learned position embeddings. **Value-preserving** — 512 stays
+512, `python fixture_replay.py` is **12/12 clean, exit 0, no recapture and zero
+`CONFIG MOVED` lines** — and no model was downloaded, no network call billed,
+nothing spent.
+
+**THE SECOND CALL SITE WAS NOT IN THE BRIEF AND IS THE MORE INTERESTING ONE.**
+A repo-wide grep found `max_length=512` in `oncotriage/agent/models.py` (the
+Stage 3 scorer, the one everybody knows about) **and in
+`oncotriage/retrieval/index_validator.py`'s check 9 cross-encoder smoke test**.
+That is the exact shape pass 20c-3a removed when this same module carried its
+own `SparseTextEmbedding`: **a validator holding a private copy of a pipeline
+constant cannot detect the drift it exists to catch**, because both halves of
+its comparison move with the copy. It reads `CROSS_ENCODER_MAX_LENGTH` now, as
+the **bare name** rather than `config.X`, because `stage1_index_health()` binds
+a function-local called `config` — check 2g's trap, hit for the third time in
+this project and avoided by checking rather than by reasoning.
+
+**WHY DRIFT HERE IS SILENT, which is the whole argument for the pairing.** Every
+tokenizer call passes `truncation=True`, so transformers does exactly what the
+number says and raises nothing. Set the limit **below** the checkpoint's real
+budget and Stage 3 keeps scoring, `node_cross_encoder_rerank` keeps sorting, the
+Stage 4 quality gate keeps cutting — the cross-encoder is simply reading less of
+every trial than it could, and the only symptom is a worse ranking. Set it
+**above** and the failure is loud but late: an `IndexError` out of the embedding
+lookup, per patient, thirty frames inside Stage 3. Same absence-of-any-error as
+the tokenizer/weights hazard pass 20f-2 closed, one level down.
+
+**THE BRIEF SAID TO CHECK `tokenizer.model_max_length`, AND MEASURING THE
+CHECKPOINT SAYS THAT CHECK WOULD BE PERMANENTLY VACUOUS.** Read off the cached
+`ncbi/MedCPT-Cross-Encoder` on 2026-08-21, from the files on disk, and then
+confirmed by loading the tokenizer offline:
+
+| declaration | value |
+|---|---|
+| `tokenizer_config.json` → `model_max_length` | `1000000000000000019884624838656` — transformers' `VERY_LARGE_INTEGER`, i.e. **no limit declared at all** |
+| `config.json` → `max_position_embeddings` | **512** — the fact that makes 512 correct |
+
+So a tokenizer-only check takes the "undeclared" branch on **every load of the
+shipped checkpoint** and verifies nothing, forever, while looking exactly like a
+check that passes. **The WEIGHTS are what verify this number.**
+`_verify_cross_encoder_sequence_limit()` is therefore called from **both**
+MedCPT factories — the tokenizer half is kept so a checkpoint that *does*
+declare a limit is covered, and so that a tokenizer contradicting its own
+weights is caught — and `tests/test_agent_cross_encoder_sequence_limit.py`
+section 3 pins the asymmetry so nobody later deletes the load-bearing half.
+
+**UNDECLARED IS NOT A MISMATCH, and that distinction is why this is not one
+`!=`.** A placeholder means "this checkpoint states no limit", which has a
+different remedy from "it states a different one" — nobody can make a vendor
+declare one — so it is **counted** in `CROSS_ENCODER_LIMIT_DEGRADATIONS` (item
+11a's line: third-party data counts, configuration raises) and never silent. A
+missing attribute and a non-integer get their own keys, and a **`bool` is
+`unreadable` rather than the integer 1**, because `True == 1` would otherwise be
+reported as a mismatch against 512 and send an operator to the wrong constant.
+
+**A DECLARED MISMATCH RAISES, IN BOTH DIRECTIONS.**
+`CrossEncoderLimitMismatchError` is a `RuntimeError` subclass and deliberately
+not a `ValueError`, on the `UnknownModelPricingError` / `IndexVerificationError`
+precedent, so a stray `except ValueError` around a model load cannot eat it. It
+fires at first model load — before Stage 3 scores anything and before Stage 5
+spends a cent — so it costs one run and fixes the class. A deliberately smaller
+budget is a **second named constant** with its own measurement, on the `RRF_K`
+precedent, not a quiet inequality.
+
+**NOTHING WAS ADDED TO A DEFERRED PATH.** Both calls sit **below** their
+factory's `_DEFER_LOCAL_MODELS` early return, and an installed override
+short-circuits the factory in `_resolve` before it runs. **That last fact is
+also why the brief's suggested test harness could not work**: `deps.set_override
+(deps.MEDCPT_TOKENIZER, stub)` can never reach a check that lives inside the
+factory. The verifier is a pure function of its argument and is driven directly,
+which is the natural control for a pure function; section 5 of the test installs
+a stub carrying a deliberately wrong `model_max_length` and **proves** the
+override never reaches the check rather than assuming it.
+
+**THE 1600-CHARACTER TRIAL-TEXT CAP IS DERIVED FROM 512 AND STAYS A LITERAL,
+argued rather than left as an oversight.** `agent/retrieval.py` builds each
+`trial_text` as `title + criteria_text[:1600]`, a number derived against 512
+(3–8 token queries leave ~500 tokens ≈ 1850 chars, 1600 for margin). Computing
+it from the constant would silently couple a **paid artefact** to a config edit:
+that string is what `score_pairs` is handed, so changing it changes every
+recorded cross-encoder digest and all twelve fixtures would need recapturing.
+Whoever moves `CROSS_ENCODER_MAX_LENGTH` re-derives it by hand and pays that
+bill — which is the same bill the constant's own comment already names. The two
+prose restatements of "512" in that file now name the constant instead of the
+number, on `/pipeline/info`'s `MATCHING_MODEL` precedent.
+
+**THE LIMIT IS RECORDED IN FUTURE FIXTURE CAPTURES**, on
+`fixtures/capture.py`'s own stated doctrine: only what is in `tunables` is
+compared by `diff_tunables()`, and this constant changes every ranking, so
+without it an edit would reach a replay as an unexplained `cross_encoder`
+difference with no cause attached. **Future captures only** — `diff_tunables()`
+iterates the keys the FIXTURE recorded, not the keys the dict declares — so
+nothing on disk moved, which is what the 12/12-without-recapture result above
+measures. **Stop condition checked before it was relied on:** no fixture field
+records a sequence limit under any name, so this pass could not have invalidated
+one.
+
+**THE STANDING GUARDS ARE TWO AND NEITHER REPLACES THE OTHER.**
+`tests/test_package_invariants.py` **section 2f(iii)** (13 checks; **247 →
+260**) is the structural half — the constant exists, is a positive int literal,
+is the statement immediately after the checkpoint name, every `max_length=` in
+the package is handed it in either reference form, there are exactly two of
+them, and both factories call the verifier. It is its own section rather than
+four more checks inside 2f(ii) **so a failure line can distinguish "somebody
+re-hardcoded the model name" from "somebody re-hardcoded the sequence limit"**,
+which are different edits with different fixes.
+`tests/test_agent_cross_encoder_sequence_limit.py` (**42 checks, ~1.1 s**) is
+the behavioural half. An AST scan cannot see a verifier that has stopped
+verifying; a runtime check cannot see a second literal never routed through it.
+
+**NINE REVERTS, NINE CAUGHT, every one a RECORDED failure with a summary rather
+than a traceback**, each applied to a `copytree`'d copy with `PYTHONPATH`
+pointed at it, a realpath preflight asserting the COPY is what imports and
+`PYTHONDONTWRITEBYTECODE=1` set; both shipped files sha256-unchanged afterwards.
+The literal restored in `models.py` (2 failures) and in the validator (2), each
+factory's verifier call deleted (1 + 1 each file), the mismatch counted instead
+of raised (7), the placeholder compared blindly (4), the `bool` guard removed
+(2), the constant moved away from the checkpoint name (2), and the counter
+unregistered from the run-end report (4).
+
+**THE HARNESS FOUND THREE DEFECTS THAT READING DID NOT, and two of them are in
+this pass's own test file.**
+
+- **`2q` aborted the whole file** with `TypeError: '<' not supported between
+  instances of 'tuple' and 'str'`. `verify()` returns a string for the three
+  states and a TUPLE for a raise, and `sorted()` over a set holding both raises
+  — **exactly when a defect makes an arm raise that should not**, i.e. precisely
+  when the file owes recorded failures. **The eighth time this project has
+  shipped that shape.** `marker()` and `at()` are the fix; R6 now reports 4
+  failures and a summary instead of one traceback.
+- **Section 6 indexed `degradation._REGISTRY[...]` and `_snap[...]` directly**,
+  which raises `KeyError` in the one state 6a exists to catch. `.get` now.
+- **`2q`'s first draft expected 3 distinct outcomes and there are 4** — a
+  mismatch is a fourth OUTCOME, not a fourth spelling of one of the three return
+  values, which is the distinction the section exists to hold. Recorded rather
+  than quietly corrected: it is how a non-degeneracy probe fails when its author
+  counts the vocabulary instead of the arms.
+
+**AND ONE IN THE REVERT HARNESS ITSELF, worth recording because it produced a
+false green in the honest direction.** Its first version copied only
+`oncotriage/` and `tests/`, and `test_package_invariants.py` walks the WHOLE
+tree — section 5 over every `.py`, check 2h's corpus including `docker/` and the
+numbered entry points — so all five invariants reverts aborted with no summary
+and read as "the check did not fire". They fire; the tree was truncated. A
+revert reporting MISSED can mean the check is weak **or** that the revert never
+ran, and those are not the same finding — pass 20f-1's lesson, met again.
+
+**THREE FIELDS WERE ADDED TO `LOGGABLE_FIELDS`** —
+`max_length_configured`, `max_length_declared`, `max_length_source`. All three
+are model geometry (a token count, an attribute path) and none can carry a
+patient, a trial or a diagnosis; they are fields rather than message text
+because section 6c of `tests/test_observability_logging.py` forbids
+interpolating data into a message, and because "unverified" is only actionable
+when the record says *which* half was unverified and against what number.
+`CROSS_ENCODER_LIMIT_DEGRADATIONS` is the **twentieth** counter in
+`oncotriage/degradation.py`'s run-end registry.
+
+**VERIFIED BY RUNNING**, against the real checkpoint loaded from the local HF
+cache with `HF_HUB_OFFLINE=1` (no download): the tokenizer half reports
+`undeclared` and counts, the weights half reports **`verified`**, and
+`score_pairs` returns `[8.8584, -15.9533]` for a relevant and an irrelevant
+trial. The production `inferences.db` sha256 is unchanged.
 
 ## Persistence and observability
 

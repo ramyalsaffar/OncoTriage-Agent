@@ -206,6 +206,7 @@ from oncotriage.config import (
     BM25_RETRIEVAL_SIZE,
     CHARS_PER_TOKEN,
     COLLECTION_NAME,
+    CROSS_ENCODER_MAX_LENGTH,
     CROSS_ENCODER_MODEL,
     DATA_SNAPSHOT_DATE,
     EMBEDDING_MODEL,
@@ -2056,6 +2057,19 @@ def build_environment_block() -> Dict:
             "RRF_WEIGHT_CONDITIONS": RRF_WEIGHT_CONDITIONS,
             "RRF_WEIGHT_CRITERIA": RRF_WEIGHT_CRITERIA,
             "RRF_WEIGHT_DENSE": RRF_WEIGHT_DENSE,
+            # The cross-encoder's sequence limit, on this dict's own doctrine
+            # and for the same reason the five RRF entries above are here: it
+            # decides how much of every trial text Stage 3 actually reads, so
+            # editing it changes every ranking -- and every tokenizer call
+            # passes truncation=True, so nothing anywhere would raise. Without
+            # it recorded, that edit reaches a replay as an unexplained
+            # cross_encoder difference with no cause attached.
+            #
+            # FUTURE CAPTURES ONLY, exactly as the RRF block above records:
+            # diff_tunables() iterates the keys the FIXTURE recorded, not the
+            # keys this dict declares, so adding this cannot move, invalidate
+            # or re-report any fixture already on disk.
+            "CROSS_ENCODER_MAX_LENGTH": CROSS_ENCODER_MAX_LENGTH,
             "TOP_K_CANDIDATES": TOP_K_CANDIDATES,
             "MAX_TRIALS_FOR_EVALUATION": MAX_TRIALS_FOR_EVALUATION,
             # Was RERANK_SCORE_THRESHOLD, a floor on the fused RRF score that
