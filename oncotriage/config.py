@@ -1223,6 +1223,194 @@ MATCHING_OUTPUT_SPLIT_FRACTION = 0.90
 # takes a 15-trial batch to 2 trials.
 MAX_TRUNCATION_SPLITS = 3
 
+# ---------------------------------------------------------------------------
+# The serving endpoint, and the harness client's budget for talking to it
+# ---------------------------------------------------------------------------
+#
+# THESE ARE NOT PIPELINE TUNABLES. Everything above this block describes what
+# the pipeline does; this block describes how something OUTSIDE the pipeline
+# reaches it over HTTP. It is here rather than in the entry points for the
+# reason every other constant in this file is here: a number written out at
+# three call sites is three numbers that can disagree, and these three did.
+
+
+# The TCP port the API binds and every local client targets.
+#
+# ONE OWNER FOR A VALUE THAT WAS WRITTEN OUT THREE TIMES: "17- FastAPI
+# Server.py"'s uvicorn.run(), and the BASE_URL literal in each of
+# "18- FastAPI Server Test.py" and "19- FastAPI Server Batch Test.py". The
+# value does not change -- 8000 was and is the port -- so nothing about how
+# this project is run moves; what changes is that a future port change is one
+# edit rather than three, and a harness pointed at the wrong port becomes
+# impossible rather than merely unlikely.
+#
+# DOCKER CANNOT READ THIS AND IS NOT EXPECTED TO. docker-compose.yml names
+# 8000 in a port mapping, in the uvicorn argument vector and in the healthcheck
+# URL, and a YAML file cannot import a Python module. Those literals agree with
+# this constant BY DISCIPLINE, and the compose file's own comments are where a
+# reader is told so. The precedent for closing that gap exists -- APP_VERSION
+# arrives in the image as a build ARG derived by docker/app_version.py, with a
+# `RUN --check` failing the build on disagreement -- and applying it to the
+# port is a follow-up, not this block's job. NOTE that the container does not
+# run this file's uvicorn.run() at all: its command is an explicit
+# `uvicorn ... --port 8000` argument vector, so changing this constant changes
+# the LOCAL `python "17- FastAPI Server.py"` bind and the two harnesses, and
+# leaves the container exactly where it was.
+API_PORT = 8000
+
+
+# How long the harness waits for the CONNECT phase of a request, in seconds.
+#
+# THE FIRST TIER OF A TWO-TIER BUDGET, and it exists because the second tier is
+# necessarily long. "The server is not there" and "the server is working and
+# has not finished" are different failures, and a single scalar timeout cannot
+# tell a harness which one it met: pointed at a port nothing is listening on,
+# a one-number budget waits out the whole read allowance to learn something the
+# kernel knew in microseconds.
+#
+# requests takes (connect, read) as a tuple, so the split costs nothing. This
+# is the same argument _structured_timeout() makes above about httpx, reached
+# from the client side: a host that cannot be reached should fail in seconds,
+# and nothing about this pipeline justifies waiting longer to learn that.
+#
+# 5.0 rather than a value read off the SDK. get_sdk_default_connect_timeout_
+# seconds() is the analogous number for the OpenAI client and it is deliberately
+# not reused: reading it CONSTRUCTS a throwaway OpenAI client and therefore
+# resolves the credentials, and a harness that POSTs to localhost must not need
+# an OpenAI key to decide how long to wait for a TCP handshake. 5.0 is the value
+# that SDK ships, transcribed with the reason stated, and the loopback
+# connections these harnesses actually make either succeed or are refused
+# immediately -- this tier is a guard against a misconfigured host, not a
+# latency budget.
+HARNESS_CONNECT_TIMEOUT_SECONDS = 5.0
+
+
+# Wall-clock allowance for ONE Stage 5 request as observed, in seconds.
+#
+# NOT A TIMEOUT AND NOT MATCHING_REQUEST_TIMEOUT_SECONDS. That constant bounds
+# a STALLED request and is 3.2x the worst call ever measured, deliberately.
+# This one is an estimate of what a WORKING call costs, and it is summed
+# fifteen times below -- so using the stall bound here would multiply 300 by 15
+# and produce a number describing nothing.
+#
+# 95 is one second above the worst single call in the item 29a bake-off
+# (median 66.5s, max 94.6s over 27 single-call runs at the shipped
+# configuration; the figures and their provenance are beside
+# MATCHING_REQUEST_TIMEOUT_SECONDS above). Using the observed MAX rather than
+# the median is deliberate: it is summed, and a per-draw upper bound makes the
+# sum a genuine bound rather than an expectation. RE-DERIVE IT WHENEVER
+# MATCHING_REASONING_EFFORT OR MATCHING_MODEL CHANGES -- it is a measurement of
+# one judge at one effort, and the same sentence is written above the numbers
+# it comes from.
+HARNESS_MATCHING_CALL_ALLOWANCE_SECONDS = 95
+
+
+# Wall-clock allowance for everything in one request that is NOT Stage 5.
+#
+# MEASURED, over the 1,106 rows in the production inferences.db on 2026-08-20,
+# as total_time minus the Stage 5 evaluation time:
+#
+#     median 204.3s    p95 295.3s    p99 327.6s    max 356.1s
+#
+# 420 is above the observed maximum with roughly 18% of headroom. THOSE ROWS
+# ARE BATCH-RUNNER ROWS, twelve threads deep, so they are contended harder than
+# a single API request: the one measured single request through the container
+# (DOCKER CLEAN BRING-UP.md) was 159.0s end to end. Using the contended figure
+# is the conservative direction and is chosen on purpose, because the API also
+# serves concurrently -- POST /match runs the graph on the event loop's thread
+# pool, so two overlapping requests contend exactly the way two batch threads do.
+#
+# WHAT IT DOES NOT COVER, stated rather than left to be discovered: the ONE-TIME
+# cold load of MedCPT (~110 MB) and FastEmbed on the first retrieval after a
+# server start. No measured row contains it -- every row above came from a
+# process whose models were already resident -- so putting a number on it here
+# would be an invention. The symptom if it bites is a single timeout on the
+# first POST of a freshly started server, which is loud, one-off, and correctly
+# diagnosed by the operator who just started the server.
+HARNESS_NON_LLM_ALLOWANCE_SECONDS = 420
+
+
+# The READ tier: how long the harness waits for a server that has accepted the
+# connection, in seconds. DERIVED, and the derivation is the point of this
+# block.
+#
+# THE VALUE IT REPLACES WAS 180, AND 180 WAS WRONG BY MEASUREMENT RATHER THAN BY
+# TASTE. It sat below MATCHING_REQUEST_TIMEOUT_SECONDS -- so a single Stage 5
+# call allowed to run its full budget outlived the client waiting for it -- and
+# it sat below the MEDIAN of every request this pipeline has ever recorded
+# (total_time median 281.3s over those same 1,106 rows). More than half of a
+# measured population would have been reported by the harness as a TIMEOUT
+# against a server that was working correctly, after the money for that patient
+# had already been spent and the row already written. The comment above it
+# argued for a Stage 5 bound and the number was not one; this block is that
+# argument finally agreeing with its value.
+#
+# WHAT THIS BUDGET COVERS: a server doing REAL WORK, to the deepest legitimate
+# extent this configuration allows. That is the truncation path -- a batch
+# halved to depth MAX_TRUNCATION_SPLITS issues 1 + 2 + 4 + 8 requests, which is
+# 2**(MAX_TRUNCATION_SPLITS + 1) - 1, and every one of them SUCCEEDS. The
+# expression below is written over MAX_TRUNCATION_SPLITS rather than the
+# number 15 so that raising the split depth moves the client budget with it.
+#
+# WHAT IT DELIBERATELY DOES NOT COVER, and this is the whole design decision:
+# the STUCK-ENDPOINT case. The reconciliation beside MAX_LLM_CLASSIFIER_RETRIES
+# above computes that ceiling exactly --
+#
+#     MAX_LLM_CLASSIFIER_RETRIES x (1 + OPENAI_SDK_MAX_RETRIES)
+#         x MATCHING_REQUEST_TIMEOUT_SECONDS = 3 x 2 x 300 = 1,800s = 30 minutes
+#
+# -- and covering it here as well would take this constant to 1,800 + 420 =
+# 2,220s, 37 minutes of silence per POST. It is not covered for a reason this
+# file already states about itself: two budgets covering the SAME failure is
+# what item 29d removed from the embedding call. The server ALREADY bounds the
+# stuck-endpoint case, at 30 minutes, on purpose. A client that also bounds it
+# is the second budget, and the only thing it buys by waiting the extra seven
+# minutes is the server's own error-shaped 200 -- which says "this failed",
+# which is precisely what the client's timeout says, sooner, with the same
+# actionable content and the same exit code.
+#
+# So the line is drawn at "is the server doing real work or is it stuck", the
+# client owns the first and the server owns the second, and neither duplicates
+# the other. The honest cost of that line is stated rather than hidden: a
+# server stuck against a broken model endpoint is abandoned by the harness at
+# the budget below instead of answering later, and the harness reports a
+# timeout rather than the server's own error body.
+#
+#     (2**(3 + 1) - 1) x 95 + 420 = 15 x 95 + 420 = 1,845s = 30.75 minutes
+#
+# THAT IS STILL A LONG WAIT AND IT IS NOT AN OVERSIGHT. It is what a server
+# permitted to issue fifteen successive model calls on one connection costs,
+# and the two files that pay it POST two patients each, by hand, while a human
+# watches. The asymmetry is the one this file already ruled on beside
+# MATCHING_REQUEST_TIMEOUT_SECONDS: "the cost of being too tight is a failed
+# patient, while the cost of being too loose is only that a stall takes longer
+# to surface." Too tight here is worse still, because the patient is failed
+# AFTER it has been paid for.
+HARNESS_POST_READ_TIMEOUT_SECONDS = (
+    (2 ** (MAX_TRUNCATION_SPLITS + 1) - 1) * HARNESS_MATCHING_CALL_ALLOWANCE_SECONDS
+    + HARNESS_NON_LLM_ALLOWANCE_SECONDS
+)
+
+
+# What a harness actually passes to requests.post(timeout=...). The two tiers
+# above, as the (connect, read) tuple requests expects. Assembled here so that
+# no call site can pass one tier and forget the other, which is the mistake a
+# pair of loose scalars invites.
+HARNESS_POST_TIMEOUT = (HARNESS_CONNECT_TIMEOUT_SECONDS,
+                        HARNESS_POST_READ_TIMEOUT_SECONDS)
+
+
+# The same two tiers for a GET that does not run the pipeline. /health touches
+# nothing and /pipeline/info makes one Qdrant metadata call, so neither has any
+# reason to approach the POST budget; 30 is the value "18- FastAPI Server
+# Test.py" has always used and it is transcribed rather than re-derived, since
+# nothing measured says it is wrong. It gains the connect tier for the same
+# reason the POST budget does.
+HARNESS_GET_TIMEOUT_SECONDS = 30
+HARNESS_GET_TIMEOUT = (HARNESS_CONNECT_TIMEOUT_SECONDS,
+                       HARNESS_GET_TIMEOUT_SECONDS)
+
+
 # Characters per token. ONE OWNER, READ BY BOTH USERS: the Stage 5 input packer
 # in oncotriage/agent/evaluation.py and the embedding batch sizer in
 # oncotriage/retrieval/indexer.py, which held its own local copy of this value

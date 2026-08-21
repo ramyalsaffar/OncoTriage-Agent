@@ -83,6 +83,22 @@ import uvicorn
 # different servers.
 from oncotriage.api.server import app
 
+# The port this file binds. ONE OWNER (oncotriage/config.py:API_PORT), because
+# the same number is also the target of "18- FastAPI Server Test.py" and
+# "19- FastAPI Server Batch Test.py"; it was written out at all three sites and
+# is now written once. The value is unchanged.
+#
+# THE CONTAINER DOES NOT COME THROUGH HERE. docker-compose.yml runs
+# `uvicorn "17- FastAPI Server:app" --host 0.0.0.0 --port 8000` -- an argument
+# vector that imports `app` from this module and never reaches the __main__
+# block below. So this constant governs `python "17- FastAPI Server.py"` and the
+# two harnesses; the compose literals agree with it by discipline, and the
+# argument for that is at API_PORT itself.
+#
+# Importing config here opens no client, reads no file and resolves no path:
+# every factory in that module is lazy and API_PORT is a plain assignment.
+from oncotriage.config import API_PORT
+
 
 # ===========================================================================
 # MAIN
@@ -90,7 +106,7 @@ from oncotriage.api.server import app
 
 if __name__ == "__main__":
     # Run from terminal — NOT Spyder.
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=API_PORT)
 
 
 #------------------------------------------------------------------------------

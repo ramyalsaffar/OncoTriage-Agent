@@ -33,17 +33,52 @@ the production database on 2026-08-05: about $0.13 to $0.17 per patient, so
 roughly $0.30 for one full run of this file. Nothing here is stubbed and nothing
 is replayed; "fixture_replay.py" is the file that costs nothing.
 
-BOTH POSTS CARRY A TIMEOUT, AND THE VALUE IS NOT ARBITRARY. POST_TIMEOUT_SECONDS
-is 180, the same value "19- FastAPI Server Batch Test.py" has always passed to
-the same endpoint, and it is a STAGE 5 BOUND: one POST runs all six stages on
-the server and the fifth is a live model call that the server itself retries up
-to MAX_LLM_CLASSIFIER_RETRIES (3) times, so the ceiling has to cover a full pipeline run
-plus those retries rather than a single round trip. Before pass 20f these two
-POSTs had no timeout at all, so a server that accepted the connection and then
-hung left this script waiting forever with no output and no verdict. The two
-GETs carry the shorter GET_TIMEOUT_SECONDS: /health touches nothing and
-/pipeline/info makes one Qdrant metadata call, so neither has any reason to
-approach the POST bound.
+BOTH POSTS CARRY A TIMEOUT, AND IT IS NOW DERIVED RATHER THAN ASSERTED. The
+budget is config.HARNESS_POST_TIMEOUT, a (connect, read) pair, and the whole
+derivation lives beside it in oncotriage/config.py. This file no longer owns a
+number.
+
+    THE PARAGRAPH THAT USED TO BE HERE ARGUED FOR A BOUND THE VALUE WAS NOT.
+    It said POST_TIMEOUT_SECONDS "is a STAGE 5 BOUND ... the ceiling has to
+    cover a full pipeline run plus those retries", and the value beneath it was
+    180 -- BELOW MATCHING_REQUEST_TIMEOUT_SECONDS (300), which bounds ONE Stage 5
+    attempt. So a single model call allowed to run its own configured budget
+    already outlived the client waiting for it, and the file said the opposite in
+    prose. Worse, and measured rather than reasoned: over the 1,106 rows in the
+    production inferences.db the MEDIAN total_time is 281.3s, so more than half
+    of every request this pipeline has ever recorded would have been reported
+    here as a TIMEOUT against a server that was working correctly -- after that
+    patient had been paid for and its row written. The reasoning was right and
+    the number contradicted it; config.HARNESS_POST_READ_TIMEOUT_SECONDS is the
+    number that reasoning implies.
+
+    WHAT THE NEW BUDGET COVERS AND WHAT IT DOES NOT. It covers a server doing
+    real work to the deepest extent this configuration permits -- the truncation
+    path, 2**(MAX_TRUNCATION_SPLITS + 1) - 1 successful model calls on one
+    connection -- plus a measured allowance for the five non-LLM stages. It
+    deliberately does NOT cover the stuck-endpoint case, which the server
+    already bounds at 30 minutes through MAX_LLM_CLASSIFIER_RETRIES and
+    OPENAI_SDK_MAX_RETRIES; the argument for not carrying a second budget over
+    the same failure is written out at the constant. The consequence for a
+    reader of this file: a READ-tier timeout here means the server stopped
+    doing work it could account for, not that this script gave up early on a
+    healthy one. A CONNECT-tier timeout means the opposite -- nothing was
+    listening -- and the two are distinguishable because
+    requests.exceptions.ConnectTimeout names itself in the traceback the
+    wrapper below prints. (File 19 has to separate them explicitly, because it
+    catches Timeout by name and ConnectTimeout SUBCLASSES it; this file catches
+    nothing narrower than Exception, so it cannot conflate them.)
+
+THE CONNECT TIER IS THE OTHER HALF, and it is why a long read budget is safe.
+Pointed at a port nothing is listening on, a single scalar timeout waits out the
+entire read allowance to learn what the kernel refused immediately. The pair
+fails in seconds on an absent server and waits properly on a present one.
+Before pass 20f these two POSTs had no timeout at all, so a server that accepted
+the connection and then hung left this script waiting forever with no output and
+no verdict. The two GETs carry config.HARNESS_GET_TIMEOUT, the same connect tier
+against a much shorter read tier: /health touches nothing and /pipeline/info
+makes one Qdrant metadata call, so neither has any reason to approach the POST
+bound.
 
 A NON-200 IS REPORTED, NOT RAISED, ON EVERY ONE OF THE FOUR CALL SITES. Each
 response goes through _json_or_report(), which prints the status, prints the
@@ -177,13 +212,30 @@ except ImportError:
 #------------------------------------------------------------------------------
 
 
-BASE_URL = "http://localhost:8000"
+# THE PORT AND THE TWO TIMEOUT BUDGETS ARE OWNED BY oncotriage/config.py, and
+# this file reads them. All three used to be literals here and in
+# "19- FastAPI Server Batch Test.py", which is three sites for two facts.
+#
+# IMPORTING config AT MODULE SCOPE IS SAFE, and it is the one package import
+# this file makes before main(). Unlike oncotriage.paths -- whose PEP 562
+# module __getattr__ resolves the sibling data tree on any attribute read, which
+# is why data_fhir_path and inferences_path are imported INSIDE main() -- every
+# name below is a plain module-level assignment in config, and importing config
+# opens no client, loads no model, reads no file and resolves no path.
+from oncotriage.config import (API_PORT, HARNESS_GET_TIMEOUT,
+                               HARNESS_POST_READ_TIMEOUT_SECONDS,
+                               HARNESS_POST_TIMEOUT)
 
-# See the docstring: 180 is a Stage 5 bound and it is File 19's existing value
-# for the same endpoint, so the two files agree rather than each guessing. The
-# GET bound is separate because neither GET runs the pipeline.
-POST_TIMEOUT_SECONDS = 180
-GET_TIMEOUT_SECONDS = 30
+BASE_URL = f"http://localhost:{API_PORT}"
+
+# The two budgets, as requests wants them: (connect, read) pairs. The read tier
+# is derived in config from the server's own truncation depth and a measured
+# non-LLM allowance; see the docstring above for what it does and does not
+# cover. HARNESS_POST_READ_TIMEOUT_SECONDS is imported separately only so the
+# diagnostics below can name the number a human cares about rather than print
+# a tuple.
+POST_TIMEOUT = HARNESS_POST_TIMEOUT
+GET_TIMEOUT = HARNESS_GET_TIMEOUT
 
 
 # ===========================================================================
@@ -427,13 +479,25 @@ def main():
           "set, this run will write into that file and this script will fail at "
           "the end.")
 
+    # The budget is printed rather than left implicit. A POST here can legitimately
+    # take many minutes -- see the docstring -- and an operator watching a silent
+    # terminal has no way to tell "still working" from "hung" without knowing when
+    # this script will give up. Naming the read tier rather than the tuple because
+    # the connect tier is a handshake guard, not a wait anybody sits through.
+    print(f"[Budget] Each POST will wait up to "
+          f"{HARNESS_POST_READ_TIMEOUT_SECONDS}s "
+          f"({HARNESS_POST_READ_TIMEOUT_SECONDS / 60:.1f} min) for a response, "
+          f"after a {POST_TIMEOUT[0]}s connect tier "
+          f"(oncotriage/config.py: HARNESS_POST_TIMEOUT).")
+
     # WHY THE TESTS ARE WRAPPED. The verdict below has to run even when a test
     # blows up, and pass 20f gave both POSTs a timeout, which creates exactly
     # that case: a server that accepts the request, processes it, writes its row
-    # and answers after POST_TIMEOUT_SECONDS raises requests.Timeout here. An
-    # unwrapped raise would take the process out before the AFTER count was ever
-    # read, so the one run most likely to have written a production row would be
-    # the one run that never checked. Recorded and re-reported, never swallowed:
+    # and answers after the read tier of POST_TIMEOUT expires raises
+    # requests.Timeout here. An unwrapped raise would take the process out
+    # before the AFTER count was ever read, so the one run most likely to have
+    # written a production row would be the one run that never checked.
+    # Recorded and re-reported, never swallowed:
     # the traceback is printed, the failure is named in the summary, and the
     # exit code is 1.
     failures = []
@@ -447,7 +511,7 @@ def main():
         print("Test 1: GET /health")
         print("=" * 60)
 
-        r = requests.get(f"{BASE_URL}/health", timeout=GET_TIMEOUT_SECONDS)
+        r = requests.get(f"{BASE_URL}/health", timeout=GET_TIMEOUT)
         health = _json_or_report(r)
         if health is None:
             failures.append("Test 1: GET /health")
@@ -463,7 +527,7 @@ def main():
         print("=" * 60)
 
         r = requests.get(f"{BASE_URL}/pipeline/info",
-                         timeout=GET_TIMEOUT_SECONDS)
+                         timeout=GET_TIMEOUT)
         info = _json_or_report(r)
         if info is None:
             failures.append("Test 2: GET /pipeline/info")
@@ -495,7 +559,7 @@ def main():
             r = requests.post(
                 f"{BASE_URL}/match",
                 json={"fhir_bundle": bundle},
-                timeout=POST_TIMEOUT_SECONDS
+                timeout=POST_TIMEOUT
             )
 
             result = _json_or_report(r)
@@ -577,7 +641,7 @@ def main():
                     f"{BASE_URL}/match/file",
                     files={"file": (filepath.split('/')[-1], f,
                                     "application/json")},
-                    timeout=POST_TIMEOUT_SECONDS
+                    timeout=POST_TIMEOUT
                 )
 
             result = _json_or_report(r)

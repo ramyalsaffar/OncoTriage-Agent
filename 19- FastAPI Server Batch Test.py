@@ -77,13 +77,40 @@ exactly the runs that had two things wrong instead of one. The guard's own
 verdict is still the last thing on the terminal and still returns 1 on its own
 finding, whatever the batch did.
 
-THE POST TIMEOUT IS A STAGE 5 BOUND. POST_TIMEOUT_SECONDS is 180, which is the
-value this file has always passed to this endpoint; pass 20f only gave it a name
-so the number is written once instead of three times, and gave File 18 the same
-constant. One POST runs all six stages on the server and the fifth is a live
-model call the server retries up to MAX_LLM_CLASSIFIER_RETRIES (3) times, so the ceiling
-has to cover a full pipeline run plus those retries rather than a single round
-trip.
+THE POST TIMEOUT IS DERIVED, IN config, AND IT IS NO LONGER 180. The budget is
+config.HARNESS_POST_TIMEOUT, a (connect, read) pair; the derivation lives beside
+it in oncotriage/config.py and File 18 reads the same pair.
+
+    WHAT 180 WAS. The paragraph that used to be here called it "a Stage 5
+    bound ... the ceiling has to cover a full pipeline run plus those retries",
+    and the value was BELOW MATCHING_REQUEST_TIMEOUT_SECONDS (300), which bounds
+    ONE Stage 5 attempt -- so one model call running its own configured budget
+    outlived this client. Measured against the 1,106 rows in the production
+    inferences.db, whose median total_time is 281.3s, more than half of every
+    request this pipeline has recorded would have been counted here as a TIMEOUT
+    error against a server that was working correctly. In THIS file that is
+    worse than a wrong line on a terminal: error_count feeds the exit code
+    (pass 20g), so a healthy server would have produced a red batch run.
+
+    THE NEW BUDGET covers a server doing real work to the deepest extent this
+    configuration permits -- the truncation path, 2**(MAX_TRUNCATION_SPLITS + 1)
+    - 1 successful model calls on one connection -- plus a measured allowance
+    for the five non-LLM stages. It deliberately does NOT cover the
+    stuck-endpoint case, which the server already bounds at 30 minutes; the
+    argument for not carrying a second budget over the same failure is at the
+    constant. So a TIMEOUT reported below now means the server stopped
+    accounting for its work, not that this file gave up early.
+
+    THE CONNECT TIER makes the long read tier safe: pointed at a port nothing is
+    listening on, a single scalar budget would wait out the whole read allowance
+    to learn what the kernel refused immediately.
+
+    THE COST IS REAL AND IS STATED. This loop is serial, so a run in which every
+    POST times out now takes len(fhir_files) x the read tier rather than
+    len(fhir_files) x 180. At the shipped slice of two patients that is the
+    difference between six minutes and one hour, and it is the price of not
+    reporting a working server as broken. Anyone widening the slice (see above)
+    is widening that too.
 
 AND IT WRITES TO WHATEVER DATABASE THE SERVER IS POINTED AT. That is not this
 script's decision to make: "17- FastAPI Server.py" calls log_inference with no
@@ -170,11 +197,25 @@ from oncotriage.utils import CaffeinateSession  # noqa: E402
 #------------------------------------------------------------------------------
 
 
-BASE_URL = "http://localhost:8000"
+# THE PORT AND THE POST BUDGET ARE OWNED BY oncotriage/config.py, and this file
+# reads them. Both used to be literals here and in "18- FastAPI Server Test.py",
+# which is two sites for each of two facts.
+#
+# IMPORTING config AT MODULE SCOPE IS SAFE, and it is the one package import
+# this file makes outside main(). Unlike oncotriage.paths -- whose PEP 562
+# module __getattr__ resolves the sibling data tree on any attribute read, which
+# is why the path names are imported INSIDE main() -- every name below is a
+# plain module-level assignment in config, and importing config opens no client,
+# loads no model, reads no file and resolves no path.
+from oncotriage.config import (API_PORT, HARNESS_POST_READ_TIMEOUT_SECONDS,
+                               HARNESS_POST_TIMEOUT)
 
-# See the docstring: 180 is a Stage 5 bound, it is the value this file has
-# always used, and File 18 now carries the same constant for the same endpoint.
-POST_TIMEOUT_SECONDS = 180
+BASE_URL = f"http://localhost:{API_PORT}"
+
+# The budget as requests wants it: a (connect, read) pair. The read tier is
+# imported separately so the two diagnostics below can name the number a human
+# reads rather than print a tuple.
+POST_TIMEOUT = HARNESS_POST_TIMEOUT
 
 
 # ===========================================================================
@@ -413,6 +454,17 @@ def main():
             f"selection was empty: {corpus_count} bundle(s) matched "
             f"{fhir_pattern}, slice [{_SLICE.start}:{_SLICE.stop}] selected 0")
 
+    # The budget is printed rather than left implicit, and in THIS file it also
+    # states the worst case for the whole loop, which is what an operator needs
+    # before walking away: the loop is serial, so a run in which every POST
+    # times out costs len(fhir_files) x the read tier.
+    print(f"[Budget] Each POST waits up to {HARNESS_POST_READ_TIMEOUT_SECONDS}s "
+          f"({HARNESS_POST_READ_TIMEOUT_SECONDS / 60:.1f} min) after a "
+          f"{POST_TIMEOUT[0]}s connect tier "
+          f"(oncotriage/config.py: HARNESS_POST_TIMEOUT); "
+          f"worst case for {len(fhir_files)} serial POST(s) is "
+          f"{len(fhir_files) * HARNESS_POST_READ_TIMEOUT_SECONDS / 60:.1f} min.")
+
     success_count = 0
     error_count = 0
     start_time = time.time()
@@ -430,7 +482,7 @@ def main():
                 response = requests.post(
                     f"{BASE_URL}/match",
                     json={"fhir_bundle": bundle},
-                    timeout=POST_TIMEOUT_SECONDS
+                    timeout=POST_TIMEOUT
                 )
 
                 if response.status_code == 200:
@@ -448,12 +500,33 @@ def main():
                         f"[{idx}/{len(fhir_files)}] {bundle_name}: "
                         f"HTTP {response.status_code}")
 
+            # CONNECT BEFORE READ, AND THE ORDER IS LOAD-BEARING.
+            # requests.exceptions.ConnectTimeout SUBCLASSES Timeout (its MRO is
+            # ConnectTimeout -> ConnectionError -> Timeout), so a single
+            # `except Timeout` catches both tiers of the pair passed above and
+            # would report a five-second handshake failure as "TIMEOUT after
+            # 1845s" -- a false statement about a run that never reached the
+            # server. That mis-report did not exist while the budget was one
+            # scalar; the two-tier budget is what created it, so the split is
+            # part of the same change rather than an unrelated tidy-up.
+            except requests.exceptions.ConnectTimeout:
+                error_count += 1
+                print(f"[{idx}/{len(fhir_files)}] NO CONNECTION "
+                      f"(connect tier {POST_TIMEOUT[0]}s expired)")
+                print(f"    Nothing accepted a connection at {BASE_URL}. "
+                      f"Start the server, or check oncotriage/config.py:"
+                      f"API_PORT against what it is bound to.")
+                failures.append(
+                    f"[{idx}/{len(fhir_files)}] {bundle_name}: connect timeout "
+                    f"after {POST_TIMEOUT[0]}s to {BASE_URL}")
+
             except requests.exceptions.Timeout:
                 error_count += 1
-                print(f"[{idx}/{len(fhir_files)}] TIMEOUT (>{POST_TIMEOUT_SECONDS}s)")
+                print(f"[{idx}/{len(fhir_files)}] TIMEOUT "
+                      f"(>{HARNESS_POST_READ_TIMEOUT_SECONDS}s)")
                 failures.append(
                     f"[{idx}/{len(fhir_files)}] {bundle_name}: timeout after "
-                    f"{POST_TIMEOUT_SECONDS}s")
+                    f"{HARNESS_POST_READ_TIMEOUT_SECONDS}s")
             except Exception as e:
                 error_count += 1
                 print(f"[{idx}/{len(fhir_files)}] ERROR: {e}")
