@@ -24,7 +24,25 @@ WHAT IS IN THE STAMP, AND WHY EACH FIELD IS THERE
 -------------------------------------------------
     llm_classifier_prompt_version   a prompt edit moves every Stage 5 verdict.
                                     It is the one input that is neither a
-                                    tunable, a model nor an index.
+                                    tunable, a model nor an index. HAND-
+                                    MAINTAINED, and therefore capable of being
+                                    wrong -- which is what the field below it
+                                    exists for.
+    llm_classifier_renderer_digest  the identity of the CODE that renders the
+                                    Stage 5 prompt, derived from its source
+                                    rather than declared by a person. The
+                                    convention is that a renderer change bumps
+                                    PROMPT_VERSION; nothing enforced the
+                                    convention, so an edit to
+                                    ``_create_patient_summary``, to a temporal
+                                    helper or to the stage extractor that
+                                    forgot the bump changed every rendered
+                                    prompt while this gate saw nothing and the
+                                    resumed run mixed two eras. See
+                                    RENDERER_MODULES for what is hashed,
+                                    RENDERER_DIGEST_ALGORITHM for how, and
+                                    RENDERER_COVERAGE for what it does NOT
+                                    cover.
     matching_model_configured       the model REQUESTED. What answered is
                                     recorded per call and can legitimately be a
                                     dated snapshot of the same alias; what was
@@ -79,6 +97,13 @@ SO THE LIMITATION IS STATED WHEREVER THE GATE'S ANSWER IS: in
 in the refusal text. A weaker gate that says it is weaker is a gate; a weaker
 gate that does not is a claim.
 
+``llm_classifier_renderer_digest`` HAS A COVERAGE BOUNDARY OF ITS OWN and it is
+stated the same way, in ``RENDERER_COVERAGE`` and on the same refusals: it
+hashes the executable source of five package modules and it does NOT see the
+registries reached through ``agent.deps`` -- their code, their four MeSH JSON
+lookups or the ``icd10-cm`` release -- nor the ``python-dateutil`` pin behind
+every rendered interval.
+
 RESOLUTION IS CACHED FOR THE PROCESS, AND THAT IS A CORRECTNESS ARGUMENT
 ------------------------------------------------------------------------
 ``current()`` resolves the collection and counts its points ONCE and caches the
@@ -103,6 +128,9 @@ WHAT IMPORTING THIS MODULE DOES. Nothing: no client, no model, no path
 resolution, no network. Every resolution is inside ``current()``.
 """
 
+import ast
+import hashlib
+import os
 import threading
 from collections import Counter
 
@@ -123,8 +151,23 @@ log = get_logger(__name__)
 # CONSTANTS
 # ===========================================================================
 
-FINGERPRINT_VERSION = 1
+FINGERPRINT_VERSION = 2
 """Bumped when the FIELD SET changes, never when a field's value changes.
+
+    1 -> 2  added ``llm_classifier_renderer_digest``. EVERY ARTIFACT STAMPED AT
+            1 THEREFORE ANSWERS FP_VERSION UNTIL AN OPERATOR CLEARS IT ONCE.
+            That is this constant's designed semantics for a shape change, not
+            a defect and not an accident: a version-1 stamp records five facts
+            and this version gates on six, so the sixth would compare
+            ``<not recorded>`` against a live digest and report a renderer
+            change that may never have happened -- a true refusal for a false
+            reason. The remediation is the consumer's own, printed on the
+            refusal: clear the batch checkpoint, pass ``--fresh-start`` to the
+            ablation study, or point ``--output-dir`` at a new directory (the
+            evaluation harness additionally accepts
+            ``--allow-environment-change``, which RECORDS the new era rather
+            than discarding the old one).
+
 
 It is what separates "this artifact was stamped by a writer that recorded
 fewer facts than this one gates on" from "these two configurations differ".
@@ -147,6 +190,158 @@ writes into its own artifact. See COLLECTION IDENTITY in the module docstring.
 Read by every consumer and by the refusal text, so it cannot go stale silently.
 """
 
+RENDERER_MODULES = (
+    "agent/patient.py",
+    "agent/prompts.py",
+    "constants.py",
+    "extraction/stage.py",
+    "utils.py",
+)
+"""The modules whose EXECUTABLE SOURCE is hashed into
+``llm_classifier_renderer_digest``, package-relative and sorted.
+
+WHY A DIGEST AT ALL. ``llm_classifier_prompt_version`` is hand-maintained --
+``oncotriage/agent/prompts.py`` says so in as many words, and says the
+judgement is the point. A hand-maintained field is capable of being wrong, and
+for the STORED-COLUMN consumers that is recoverable (``prompt_sha256`` records
+the bytes per call, so a version that did not move beside a hash that did is
+visible in the record). A RESUME GATE has no such second reading: it sees the
+version and nothing else. So an edit to ``_create_patient_summary``, to a
+temporal helper, or to the stage extractor that forgets the bump changes every
+rendered prompt while this gate reports FP_MATCH, and the resumed run mixes two
+eras into one artifact. This field is the mechanical half of that pair, at the
+granularity a resume needs.
+
+WHY EACH MODULE IS IN THE SET. Derived, not asserted: a static closure from
+``patient._create_patient_summary`` and ``prompts.render_system_prompt`` over
+every module-level name each reaches, transitively, reaches exactly these five
+plus the two in ``RENDERER_MODULES_EXCLUDED`` and nothing else.
+``tests/test_resume_configuration_fingerprint.py`` section 1b re-derives that
+closure and fails if it reaches a module that is in neither tuple -- so a
+helper moved to a new module cannot silently escape the digest, which is the
+one rot a hand-written module list is prone to.
+
+    agent/patient.py      ``_create_patient_summary`` and every helper that
+                          shapes a character of it -- the three relevance
+                          classifiers, the nine temporal helpers, the lab unit
+                          normaliser, the stage-source phrase table.
+    agent/prompts.py      ``render_system_prompt``. The Stage 5 prompt is the
+                          template AND the record, and the template's version
+                          is hand-maintained for exactly the same reason and
+                          with exactly the same exposure.
+    extraction/stage.py   the "Cancer Stage:" line. Not hypothetical: the CKD
+                          guard pass changed this module and moved the rendered
+                          stage of 244 of 1,000 patients without touching
+                          patient.py at all.
+    constants.py          ``LOINC_AJCC_CLINICAL_M``, which selects the M
+                          category tier stage.py renders from.
+    utils.py              ``deduplicate_by_display`` (which conditions render),
+                          ``parse_partial_date`` (every interval) and
+                          ``get_age_reference_date`` (what they are measured
+                          against).
+
+THE GRANULARITY IS THE MODULE, NOT THE FUNCTION, AND THAT IS DELIBERATE. A
+per-definition closure would hash exactly the render path and nothing else, and
+its failure mode is SILENT UNDER-COVERAGE: a bug in the closure walker drops a
+helper from the digest and nothing ever says so. A module hash is a strict
+SUPERSET of the render path, so its failure mode is over-refusal -- an edit to
+``utils.get_model_cost`` refuses a resume it did not need to. That is the
+direction this project accepts: a refusal costs one deliberate clear, and an
+artifact holding two eras costs every number computed over it.
+"""
+
+RENDERER_MODULES_EXCLUDED = (
+    "agent/deps.py",
+    "config.py",
+)
+"""Reached by the render-path closure and deliberately NOT hashed.
+
+Declared rather than merely absent, so the round trip in section 1b is CLOSED:
+a module the closure reaches must be in one tuple or the other, and a new one
+forces a decision instead of falling through.
+
+    agent/deps.py   the dependency SEAM, not a renderer. Its whole contract is
+                    that it returns an object which may be an override, so a
+                    hash of the resolver describes neither the default nor what
+                    was installed. What it hands back is the real uncovered
+                    contributor -- see RENDERER_COVERAGE.
+    config.py       its two render-relevant facts are ALREADY GATED as fields
+                    of their own (``data_snapshot_date``, which
+                    ``get_age_reference_date`` reads, and
+                    ``matching_model_configured``). Hashing the module would
+                    make this field a de-facto gate on every tunable, which the
+                    module docstring explicitly declines to build, and it is
+                    rewritten in place by ``tests/test_config_snapshot_date_
+                    rot.py``. The one other config value the closure reaches,
+                    ``STALE_LAB_AGE_DAYS``, was checked rather than assumed:
+                    since 1.8.0 it keys ``TEMPORAL_KEY_LAB_STALE`` and decides
+                    no character of output (``patient._lab_age_suffix``).
+
+Neither is DESCENDED INTO by the closure either, which is what keeps
+``tests/test_resume_configuration_fingerprint.py`` out of the collision matrix:
+excluding a module excludes its subtree, so ``config.py`` -- a file one of the
+suite's two writers rewrites -- is never opened by the derivation.
+"""
+
+RENDERER_DIGEST_ALGORITHM = "ast-normalized-sha256-v1"
+"""How the source is reduced before it is hashed, hashed INTO the digest so a
+change to the normalisation moves every digest rather than silently re-basing
+comparability.
+
+AST-NORMALIZED WITH DOCSTRINGS STRIPPED, NOT RAW BYTES, and the reason is that
+raw bytes over-refuse in the one direction that would make this gate useless. A
+comment cannot change rendered text, and this project writes its arguments AT
+the code -- a raw-byte digest would refuse a resume for a documentation pass,
+every time, and a gate that refuses for reasons the operator knows are spurious
+is a gate the operator learns to clear without reading. Two modules with the
+same normalised text are behaviourally identical, so what is excluded is
+exactly what provably cannot move a character of output. (Docstrings are
+stripped on the checked premise that nothing on the render path reads a
+``__doc__``; section 1b asserts it rather than assuming it.)
+
+THE ONE COST, STATED: ``ast.unparse`` is the interpreter's, so the digest is a
+function of the source AND of the Python that read it, and a resume across two
+Python versions refuses even with the source unchanged. That is over-refusal in
+a case that is arguably real coverage -- a different interpreter IS a different
+configuration -- and it is named here rather than discovered.
+"""
+
+RENDERER_COVERAGE = ("the executable source of " + str(len(RENDERER_MODULES))
+                     + " package modules; NOT registry data")
+"""What the renderer digest actually covers, as one clause a refusal can print.
+
+``COLLECTION_IDENTITY``'s argument applied to this field: a weaker gate that
+says it is weaker is a gate, and one that does not is a claim. WHAT IS NOT
+COVERED, each measured rather than guessed:
+
+    the registries reached through ``agent.deps``  -- the cancer code registry
+        (which condition is Tier A / B / C, and therefore which conditions
+        render in full and which collapse into one "Other conditions" line),
+        the oncology lab registry (which observations, procedures and mCODE
+        variants render at all) and the MeSH filter (the ``[neoplasm]`` versus
+        ``[neoplasm-unverified]`` tag). Their CODE is excluded with
+        ``agent/deps.py``'s argument; their DATA -- the four MeSH JSON lookups
+        and the ``icd10-cm`` release -- is outside the repository entirely and
+        could not be hashed from source at any granularity.
+        PARTIALLY guarded elsewhere and only partially:
+        ``tests/test_registries_cancer_code_claims_audit.py`` audits that every
+        code in the registry still means what its comment claims, which catches
+        a wrong entry and NOT a right one that was added or removed between two
+        runs. Closing this properly is the same widening
+        ``COLLECTION_IDENTITY`` names for the collection, and it is a follow-up
+        rather than a half-measure taken here.
+    ``python-dateutil``  -- ``relativedelta`` does the interval arithmetic every
+        rendered date carries. A pin change moves rendered text and is not
+        visible here.
+
+It is NOT written into any consumer's artifact, and that asymmetry with
+``COLLECTION_IDENTITY`` is deliberate: this string is a property of
+FINGERPRINT_VERSION, which every stamp already carries, so a reader of an
+artifact can look it up, whereas the collection identity qualifies a value the
+artifact records and had nowhere else to live.
+"""
+
+
 # The gated fields, in the order a refusal lists them. CLOSED: `current()`
 # produces exactly these keys and `compare()` walks exactly these keys, so a
 # field added to one and not the other fails the round trip rather than being
@@ -154,6 +349,7 @@ Read by every consumer and by the refusal text, so it cannot go stale silently.
 # gating on less than it records.
 FINGERPRINT_FIELDS = (
     "llm_classifier_prompt_version",
+    "llm_classifier_renderer_digest",
     "matching_model_configured",
     "qdrant_collection",
     "collection_points",
@@ -220,6 +416,105 @@ this cache on its main thread before its pool exists."""
 # ===========================================================================
 # TAKING THE STAMP
 # ===========================================================================
+
+def _package_dir() -> str:
+    """The directory holding this module -- i.e. the ``oncotriage`` package.
+
+    Derived from ``__file__`` rather than from ``oncotriage.paths``, and that is
+    a requirement rather than a shortcut: every path in ``paths`` resolves the
+    SIBLING DATA TREE by glob, and the renderer digest is a fact about the code
+    this process imported. It is also what makes the digest correct inside a
+    copied tree -- a package copied to a scratch directory hashes its own
+    modules, which is exactly what a revert harness needs.
+
+    Computed on call rather than at import, so importing this module still
+    resolves nothing.
+    """
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _strip_docstrings(node) -> None:
+    """Remove the docstring from every module, function and class, in place.
+
+    A body reduced to nothing gains ``pass``, because ``ast.unparse`` of an
+    empty body is not valid Python and this function's output is compared as
+    text.
+    """
+    for child in ast.walk(node):
+        if not isinstance(child, (ast.Module, ast.FunctionDef,
+                                  ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        body = child.body
+        if (body and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            body.pop(0)
+        if not body and not isinstance(child, ast.Module):
+            body.append(ast.Pass())
+
+
+def normalized_module_source(path: str) -> str:
+    """One module's source with comments, docstrings and formatting removed.
+
+    ``ast.unparse`` of the parsed module, so two files with the same output are
+    behaviourally identical and two that differ differ executably. See
+    ``RENDERER_DIGEST_ALGORITHM`` for why that is the right reduction and what
+    it costs. Raises whatever the read or the parse raises; the caller counts.
+    """
+    with open(path, "r", encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    _strip_docstrings(tree)
+    return ast.unparse(tree)
+
+
+def renderer_module_digests() -> dict:
+    """``{package-relative path: sha256 hex}`` for every RENDERER_MODULES entry.
+
+    The primitive ``renderer_digest()`` is built from, and the reason it is
+    public: a refusal says the digest moved, and this says WHICH MODULE moved,
+    which is the difference between "somebody edited the renderer" and a
+    diagnosis. Raises on an unreadable or unparseable module -- the caller is
+    the one that decides what an unestablished digest means.
+    """
+    root = _package_dir()
+    return {rel: hashlib.sha256(
+                normalized_module_source(
+                    os.path.join(root, *rel.split("/"))).encode("utf-8")
+            ).hexdigest()
+            for rel in RENDERER_MODULES}
+
+
+def renderer_digest() -> str:
+    """One hex digest over every RENDERER_MODULES entry, or ``UNKNOWN``.
+
+    THE PATH IS HASHED BESIDE THE SOURCE, so moving a module moves the digest
+    even if its text is untouched, and the ALGORITHM TAG is hashed first, so a
+    change to the normalisation cannot silently re-base what two runs are
+    comparing. The per-module digests go in as ``path:hex`` lines rather than as
+    concatenated source, so no module's text can be arranged to look like the
+    start of the next one's entry.
+
+    NEVER RAISES. A module that cannot be read or parsed is counted in
+    FINGERPRINT_DEGRADATIONS and answers UNKNOWN, which ``is_resolved`` then
+    reads and ``compare()`` answers FP_UNRESOLVED for -- the module-wide rule
+    that a diagnostic which raises replaces the finding with a traceback.
+    """
+    try:
+        per_module = renderer_module_digests()
+    except Exception as exc:                                   # noqa: BLE001
+        FINGERPRINT_DEGRADATIONS[
+            f"llm_classifier_renderer_digest:{type(exc).__name__}"] += 1
+        log.warning("a renderer module could not be read; this run's rendering "
+                    "code cannot be fingerprinted",
+                    event="fingerprint_degraded", status="degraded",
+                    error_type=type(exc).__name__)
+        return UNKNOWN
+
+    payload = "\n".join([RENDERER_DIGEST_ALGORITHM]
+                        + [f"{rel}:{per_module[rel]}"
+                           for rel in RENDERER_MODULES])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
 
 def clear_cache() -> None:
     """Drop the cached stamp so the next ``current()`` resolves again.
@@ -303,6 +598,7 @@ def current(refresh: bool = False) -> dict:
             _RESOLVED["fingerprint"] = {
                 "fingerprint_version": FINGERPRINT_VERSION,
                 "llm_classifier_prompt_version": PROMPT_VERSION,
+                "llm_classifier_renderer_digest": renderer_digest(),
                 "matching_model_configured": config.MATCHING_MODEL,
                 "qdrant_collection": name,
                 "collection_points": points,
@@ -314,14 +610,56 @@ def current(refresh: bool = False) -> dict:
         return dict(_RESOLVED["fingerprint"])
 
 
+def summary(fingerprint: dict) -> str:
+    """One line naming every gated field of a stamp. One text, three callers.
+
+    THIS SENTENCE WAS WRITTEN THREE TIMES -- ``compare()``'s FP_MATCH detail,
+    ``batch/runner.py:main``'s ``[Config]`` banner and
+    ``ablation/study.py:main``'s ``Configuration:`` line -- and the renderer
+    digest is what made that cost visible: adding a gated field left both
+    banners naming five of six, so an operator who then met a refusal saying
+    the renderer digest moved had never been shown the value it moved from.
+    ``refusal_lines``' argument, applied one level down: three harnesses must
+    not come to describe one configuration three ways.
+
+    THE DIGEST IS ABBREVIATED TO 12 HEX CHARACTERS and the full value is in the
+    artifact. A banner is read by a person deciding whether this is the run
+    they meant; 64 characters of hex on a console line is not that, and the
+    comparison is never made by eye.
+
+    Every read is a ``.get``: this formats a diagnosis, and the whole point of
+    a diagnosis is that it survives the state it is diagnosing.
+    """
+    get = fingerprint.get
+    digest = str(get("llm_classifier_renderer_digest", NOT_RECORDED))
+    return (f"prompt {get('llm_classifier_prompt_version', NOT_RECORDED)} "
+            f"(renderer {digest[:12]}), "
+            f"model {get('matching_model_configured', NOT_RECORDED)}, "
+            f"collection {get('qdrant_collection', NOT_RECORDED)} "
+            f"({get('collection_points', NOT_RECORDED)} points), "
+            f"snapshot {get('data_snapshot_date', NOT_RECORDED)}")
+
+
 def is_resolved(fingerprint: dict) -> bool:
     """Whether every gated field of this stamp was established.
 
     A stamp carrying UNKNOWN is written down anyway -- the artifact should
     record what was known -- but it can never be shown to AGREE with anything,
     which is what ``compare()`` reads this for.
+
+    A MISSING field counts as unestablished, not as absent-and-therefore-fine.
+    ``current()`` never omits one, so the only way to get here with a field
+    missing is a hand-built stamp -- a test fixture, or a caller that predates
+    a field. The default used to be ``.get(f)``, which returns None, which is
+    not UNKNOWN, so such a stamp reported RESOLVED; ``disagreements()`` then
+    compared NOT_RECORDED with NOT_RECORDED, found them equal, and
+    ``compare()`` answered FP_MATCH -- a hand-built stamp missing the very
+    field a version bump added would have been reported as AGREEING with a run
+    that has it. The version gate catches that particular case first, and a
+    guard that depends on another guard running first is not a guard.
     """
-    return all(fingerprint.get(f) != UNKNOWN for f in FINGERPRINT_FIELDS)
+    return all(fingerprint.get(f, UNKNOWN) != UNKNOWN
+               for f in FINGERPRINT_FIELDS)
 
 
 #------------------------------------------------------------------------------
@@ -382,7 +720,7 @@ def compare(recorded, current_fp: dict) -> tuple:
     """
     if not is_resolved(current_fp):
         unknown = [f for f in FINGERPRINT_FIELDS
-                   if current_fp.get(f) == UNKNOWN]
+                   if current_fp.get(f, UNKNOWN) == UNKNOWN]
         outcome, detail = FP_UNRESOLVED, (
             "this run's own configuration could not be established ("
             + ", ".join(f"{f}={UNKNOWN}" for f in unknown)
@@ -407,12 +745,7 @@ def compare(recorded, current_fp: dict) -> tuple:
         if changed:
             outcome, detail = FP_CHANGED, "; ".join(changed)
         else:
-            outcome, detail = FP_MATCH, (
-                f"prompt {current_fp['llm_classifier_prompt_version']}, model "
-                f"{current_fp['matching_model_configured']}, collection "
-                f"{current_fp['qdrant_collection']} "
-                f"({current_fp['collection_points']} points), snapshot "
-                f"{current_fp['data_snapshot_date']}")
+            outcome, detail = FP_MATCH, summary(current_fp)
 
     assert outcome in FP_OUTCOMES, f"unknown fingerprint outcome {outcome!r}"
     return outcome, detail
@@ -446,13 +779,19 @@ def refusal_lines(outcome: str, detail: str, artifact: str,
     commands and only the caller knows which. Everything ABOVE it is shared, so
     three harnesses cannot come to describe the same refusal three ways.
 
-    THE COLLECTION LIMITATION IS PRINTED ON EVERY REFUSAL THAT COMPARED
+    THE TWO COVERAGE LIMITATIONS ARE PRINTED ON EVERY REFUSAL THAT COMPARED
     FIELDS, and only on those. FP_CHANGED is the only outcome that got as far
-    as comparing a collection: FP_ABSENT and FP_UNRESOLVED never reached the
-    fields, FP_VERSION refuses BEFORE them, and FP_MATCH is not a refusal at
-    all -- no caller passes it here, which is why it is not in the test below.
-    Stating the limits of a comparison that did not run would be noise
-    pretending to be rigour.
+    as comparing a collection or a renderer digest: FP_ABSENT and FP_UNRESOLVED
+    never reached the fields, FP_VERSION refuses BEFORE them, and FP_MATCH is
+    not a refusal at all -- no caller passes it here, which is why it is not in
+    the test below. Stating the limits of a comparison that did not run would
+    be noise pretending to be rigour.
+
+    FP_VERSION GETS A CLAUSE OF ITS OWN, for the opposite reason: it is the one
+    refusal whose cause may be nothing at all. A version bump makes every
+    existing artifact answer it exactly once, and an operator meeting that
+    without being told reads a shape change as a configuration change and goes
+    looking for an edit that did not happen.
     """
     lines = [f"REFUSED ({outcome}): {artifact}", f"    {detail}"]
     if outcome == FP_CHANGED:
@@ -460,6 +799,19 @@ def refusal_lines(outcome: str, detail: str, artifact: str,
                      f"{COLLECTION_IDENTITY}: a collection rebuilt in place to "
                      f"the same point count with different contents would not "
                      f"be detected here")
+        lines.append(f"    renderer identity compared as "
+                     f"{RENDERER_COVERAGE}: an edit to the cancer / lab / MeSH "
+                     f"registries or to their data changes rendered text and "
+                     f"would not be detected here either")
+    if outcome == FP_VERSION:
+        lines.append(f"    this is the stamp SHAPE changing, not necessarily "
+                     f"the configuration: fingerprint_version "
+                     f"{FINGERPRINT_VERSION} gates "
+                     f"{len(FINGERPRINT_FIELDS)} facts and the stored state "
+                     f"records a different set, so the two cannot be compared "
+                     f"field by field. Clearing the artifact once is the whole "
+                     f"remediation and it is expected on first contact after a "
+                     f"version bump")
     lines.extend(f"    {line}" for line in
                  (remediation if isinstance(remediation, (list, tuple))
                   else [remediation]))

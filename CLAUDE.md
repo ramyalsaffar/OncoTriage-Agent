@@ -4361,7 +4361,7 @@ refuse every record already written. The stamp carries its own
 # is a different INPUT to a pure function or an attribute rebind inside
 # try/finally with the restore asserted BY IDENTITY -- so it needs no
 # _EXEC_ALLOWLIST entry. ~2 s.
-python tests/test_resume_configuration_fingerprint.py            # 331
+python tests/test_resume_configuration_fingerprint.py            # 404 (was 331; the renderer-digest pass added section 1b)
 ```
 
 **TEST COUNTS.** `tests/test_agent_degraded_run_and_reporting.py` **118 → 118**
@@ -4370,6 +4370,217 @@ checkpoint fabrication now passes an explicit stamp) and neither moved, which is
 the point: the edit kept them offline rather than changing what they assert.
 `tests/test_package_invariants.py` is unchanged at **247/0/0**. Every other file
 reports exactly what it reported before.
+
+### The fingerprint gates the code that renders the prompt (the renderer-digest pass)
+
+**`llm_classifier_prompt_version` IS HAND-MAINTAINED AND
+`oncotriage/agent/prompts.py` SAYS SO IN AS MANY WORDS.** The convention is
+that a renderer change bumps it; nothing enforced the convention. For the
+stored-column consumers that is recoverable — `prompt_sha256` records the bytes
+per call, so a version that did not move beside a hash that did is visible in
+the record. **A RESUME GATE HAS NO SECOND READING.** So an edit to
+`_create_patient_summary`, to a temporal helper or to the stage extractor that
+forgot the bump changed every rendered prompt while `run_fingerprint.compare()`
+answered FP_MATCH, and the resumed batch, ablation or evaluation run mixed two
+eras into one artifact. `oncotriage/run_fingerprint.py` gates a sixth field,
+**`llm_classifier_renderer_digest`**, derived from source rather than declared
+by a person.
+
+**FREE, AND THE PIPELINE PATH IS UNTOUCHED BY CONSTRUCTION RATHER THAN BY
+ASSERTION.** No network, no model call, no spend. `python fixture_replay.py` is
+**12/12 clean, exit 0, no recapture** — and the stronger statement is the diff:
+**not one of the five hashed modules is modified by this pass**, `oncotriage/
+fixtures/` contains no reference to `run_fingerprint` or to either checkpoint
+writer (grepped, not assumed), and the production `inferences.db` sha256 is
+unchanged. The renderer digest is a fact *about* `patient.py`; nothing in it is
+a fact *in* `patient.py`.
+
+**THE ONE BEHAVIOUR CHANGE, STATED AS ONE.** `FINGERPRINT_VERSION` is **2**, so
+**every artifact stamped at 1 answers FP_VERSION until an operator clears it
+once** — the checkpoint, the `--fresh-start`, or a new `--output-dir` (the
+evaluation harness additionally takes `--allow-environment-change`, which
+RECORDS the new era instead of discarding the old one). That is the constant's
+designed semantics for a shape change, not a defect: a version-1 stamp records
+five facts and this version gates six, so comparing the sixth would put
+`<not recorded>` against a live digest and report a renderer change that may
+never have happened — a true refusal for a false reason. **The refusal now says
+so**, in a clause printed for FP_VERSION and only for it, because it is the one
+outcome whose cause may be nothing at all.
+
+**WHAT SHAPES RENDERED TEXT, ENUMERATED BEFORE A MECHANISM WAS CHOSEN.** A
+static closure from `patient._create_patient_summary` and
+`prompts.render_system_prompt` over every module-level name each reaches,
+transitively, reaches **exactly seven** package modules and nothing else:
+`agent/patient.py`, `agent/prompts.py`, `constants.py`, `extraction/stage.py`,
+`utils.py` — and `config.py` and `agent/deps.py`. Beyond the closure sit the
+objects `deps` hands back (the cancer code registry, the oncology lab registry,
+the MeSH filter) with their DATA, and `python-dateutil`, whose `relativedelta`
+does the arithmetic behind every rendered interval.
+
+| | |
+|---|---|
+| `RENDERER_MODULES` (hashed) | the five above |
+| `RENDERER_MODULES_EXCLUDED` (reached, argued, **not** hashed) | `config.py` — its two render-relevant facts are ALREADY gated as fields of their own, and hashing it would make this a de-facto gate on every tunable, which the module explicitly declines to build. Its one other reachable value, `STALE_LAB_AGE_DAYS`, was **checked rather than assumed**: since 1.8.0 it keys a census counter and decides no character of output. `agent/deps.py` — the SEAM, whose contract is that it returns an object which may be an override, so a hash of the resolver describes neither the default nor what was installed |
+| outside the closure entirely, named in `RENDERER_COVERAGE` | the registries' code **and data** (the four MeSH JSON lookups and the `icd10-cm` release are outside the repository and could not be hashed at any granularity), and `python-dateutil` |
+
+**THE ROUND TRIP OVER THE MODULE SET IS CLOSED, WHICH IS WHAT A HAND-WRITTEN
+LIST CANNOT DO ON ITS OWN.** `tests/test_resume_configuration_fingerprint.py`
+section 1b re-derives the closure and requires every module it reaches to be in
+one tuple or the other — so a helper moved to a new module fails with a name
+rather than silently escaping the digest — **and requires every hashed module to
+be one the closure reaches**, so a module in the tuple that nothing renders
+through is a digest that refuses for no reason. The closure records an excluded
+module by name from the import statement and **never descends into it**, which
+is what keeps `oncotriage/config.py` — a file one of the collision matrix's two
+writers rewrites in place — unopened, and this test out of the matrix.
+
+**AST-NORMALIZED WITH DOCSTRINGS STRIPPED, NOT RAW BYTES, AND THE ARGUMENT IS
+ABOUT WHICH OVER-REFUSAL IS TOLERABLE.** A comment cannot change rendered text,
+and this project writes its arguments AT the code — a raw-byte digest would
+refuse every resume for every documentation pass, and **a gate that refuses for
+reasons the operator knows are spurious is a gate the operator learns to clear
+without reading**. Two modules with the same `ast.unparse` output are
+behaviourally identical, so what is excluded is exactly what provably cannot
+move a character. Docstring stripping rests on a premise that is **asserted
+rather than assumed**: no hashed module reads a `__doc__`, checked by AST over
+the set. **The stated cost:** `ast.unparse` is the interpreter's, so a resume
+across two Python versions refuses with the source unchanged — over-refusal in a
+case that is arguably real coverage, named here rather than discovered.
+
+**THE GRANULARITY IS THE MODULE, AND THAT IS THE WHOLE DESIGN.** A
+per-definition closure would hash exactly the render path, and its failure mode
+is **silent under-coverage**: a bug in the walker drops a helper and nothing
+says so. A module hash is a strict SUPERSET, so its failure mode is
+over-refusal — an edit to `utils.get_model_cost` refuses a resume it did not
+need to. A refusal costs one deliberate clear; an artifact holding two eras
+costs every number computed over it.
+
+**MECHANISM (b), THE PROBE RENDER, WAS ANALYZED AND REJECTED, and three of the
+four reasons are not about cost.** Hashing the rendered output of a fabricated
+probe patient moves exactly when behaviour moves and would cover the registry
+data this does not. But it would (i) make the resume gate load the ICD-10-CM
+release and read the four MeSH JSON files, so a gate would stop being
+computable on a machine `ONCOTRIAGE_ALLOW_DEGRADED_REGISTRIES` exists for, (ii)
+**pollute `PROCEDURE_RENDER_COUNTS`, `TEMPORAL_RENDER_COUNTS` and
+`LAB_UNIT_DEGRADATIONS`** — census counters reported at run end — with a render
+no patient asked for, (iii) put the deps seam and the registries inside a module
+whose docstring promises that importing it does nothing, and (iv) make the
+probe patient a **hand-maintained** artifact that rots exactly the way
+`PROMPT_VERSION` does, which is the trust this pass exists to remove. Stop
+condition 9 applies and (a) is what shipped.
+
+**THE BEFORE ARM WAS RUN, NOT REASONED ABOUT, AND IT IS THE WHOLE POINT.** In a
+copied tree with `PYTHONPATH` pointed at it and a realpath preflight asserting
+the COPY is what imports, the identical one-character renderer edit
+(`"\nAllergies:\n"` → `"\nallergies:\n"` in `_create_patient_summary`) with no
+`PROMPT_VERSION` bump, against **`git show HEAD:oncotriage/run_fingerprint.py`**
+— the five-field gate as it shipped:
+
+| | outcome | differing gated fields |
+|---|---|---|
+| the pre-pass five-field gate | **`match`** — the resume proceeds and the artifact holds two eras | `[]` |
+| this pass's six-field gate | **`configuration_changed`**, naming the field | `['llm_classifier_renderer_digest']` |
+
+`llm_classifier_prompt_version` reads `1.9.0` in all four cells.
+
+**THE GAP IS DEMONSTRATED IN THE COMMITTED TEST TOO, NOT ONLY OUT OF BAND.** Section 1b copies the five hashed
+modules to a scratch directory, points `_package_dir()` at the copy — first
+proving the untouched copy reproduces the digest **exactly**, so the change
+cannot be the copy rather than the edit — and then makes a ONE-CHARACTER edit
+in the copied renderer (`"\nProcedures:\n"` → `"\nprocedures:\n"`, with the
+marker's occurrence count pinned so an edit that matched nothing cannot look
+like a gate that failed to fire). The digest moves; **`llm_classifier_prompt_
+version` does not**; the list of gated fields that differ is exactly
+`["llm_classifier_renderer_digest"]`; `compare()` answers FP_CHANGED naming it;
+`renderer_module_digests()` says WHICH module moved and **only that one**; and a
+comment-only edit to the same file moves nothing. Every hashed module's sha256
+in the repository is compared before and after.
+
+**THREE DEFECTS WERE FOUND BY RUNNING, AND TWO OF THEM ARE IN CODE THIS PASS DID
+NOT WRITE.**
+
+- **`is_resolved` READ A MISSING FIELD AS ESTABLISHED.** It was
+  `fingerprint.get(f) != UNKNOWN`; `None` is not `UNKNOWN`, so a stamp missing a
+  gated field reported RESOLVED, `disagreements()` then compared `NOT_RECORDED`
+  with `NOT_RECORDED`, found them equal, and `compare()` answered **FP_MATCH** —
+  a hand-built stamp missing the very field a version bump added would have been
+  reported as AGREEING with a run that has it. The version gate catches that
+  particular case first, **and a guard that depends on another guard running
+  first is not a guard**. Now `get(f, UNKNOWN)`.
+- **`compare()`'s FP_MATCH DETAIL COULD RAISE WHILE FORMATTING A SUCCESS.** It
+  indexed `current_fp['...']` directly, so the same missing-field stamp produced
+  a `KeyError` out of an f-string on the path that PERMITS a resume. That is the
+  defect `disagreements()`' own docstring warns about, one branch over. Every
+  read is a `.get` now. Surfaced by two existing tests, not by reading.
+- **THE TWO CONSUMER BANNERS ENUMERATED THE FIELD LIST.**
+  `batch/runner.py:main` and `ablation/study.py:main` each hand-wrote the same
+  sentence `compare()` builds, so adding a gated field left both naming five of
+  six — an operator who then met a refusal about the renderer digest had never
+  been shown the value it moved from. `run_fingerprint.summary(fingerprint)` is
+  that sentence's one owner and all three call it. **This is the answer to "no
+  consumer should need to change": none needed to for CORRECTNESS** — `run_
+  harness.build_environment` spreads `dict(fingerprint)` and both checkpoint
+  writers store the stamp whole — **and two needed to for HONESTY.**
+
+**THE THREE PERSISTERS WERE ENUMERATED BEFORE THE VERSION WAS BUMPED** (stop
+condition 10), by grepping every `run_fingerprint.current()` call and every
+serialization of a `fingerprint` or `environment` key in the tree:
+`batch/runner.py:save_checkpoint` → `batch_runner_checkpoint.json`,
+`ablation/study.py:save_ablation_checkpoint` → `<db>_checkpoint.json`, and
+`evaluation/run_harness.py:build_environment` → `manifest["environment"]` and
+each `environment_history[].environment`. **`oncotriage/fixtures/` and
+`oncotriage/evaluation/ragas_harness.py` carry `environment` blocks of their
+own that have nothing to do with this module** — checked, not assumed — and
+`evaluation/rater.py` reads `manifest["environment"]` without enumerating a
+field of it. No writer is outside this pass's reach.
+
+**NOTHING ON DISK WAS WRITTEN.** The v1 refusal happens at the NEXT resume, not
+now: the production `inferences.db`, `08- Checkpoint/batch_runner_checkpoint.
+json`, `batch_runner_results.json`, `04- Results/02- Ablation/ablation_results.
+db` and all 27 evaluation-run `manifest.json` files were sha256'd before and
+after and are byte-identical.
+
+**TWELVE REVERTS, TWELVE CAUGHT**, each applied to a `copytree`'d copy with
+`PYTHONPATH` pointed at it, a realpath preflight asserting the COPY is what
+imports, and `PYTHONDONTWRITEBYTECODE=1` set; every plant is asserted to have an
+exact occurrence count, so a plant that matched nothing is a named
+`PLANT-FAILED` rather than a revert reported as MISSED. The four repository
+files this pass touches are sha256-compared before and after the harness.
+
+**FOUR DEFECTS IN THIS PASS'S OWN TEST CODE, THREE OF THEM FOUND BY THE FIRST
+RUN OF THE REVERT HARNESS AND NONE BY READING.**
+
+- **TWO REVERTS ABORTED THE FILE INSTEAD OF FAILING IT.** R2 (the digest absent
+  from the stamp) hit a bare `stamp["llm_classifier_renderer_digest"]` inside a
+  `check(...)` argument list; R6 (an unreadable module raising instead of
+  degrading) hit a bare `_fp.current()`. Both raised while the argument was
+  being EVALUATED, so the run printed one traceback where it owed a summary and
+  twenty-two recorded failures. **That is the ninth time this project has
+  shipped that shape.** `at(stamp, key)` and `stamp_now()` are the fix; the same
+  two reverts now report **22** and **6** failing checks and run to the summary.
+- **R7 WAS MISSED ENTIRELY**, and that is what found the `is_resolved` defect
+  above: the hardening had no check behind it, so reverting it changed nothing.
+  Section (f2) is what was missing, and it now reports 3 failures on that
+  revert.
+- **THE ALGORITHM-TAG CHECK ENDED `... or True`** — a tautology that could not
+  fail. Two checks replace it: recompute the digest with the tag perturbed and
+  with the paths perturbed, and require both to differ. **A check with an `or
+  True` in it is not a weak check, it is not a check.**
+- **AND ONE BAD PLANT, recorded because a bad plant is worse than no plant.**
+  R10's first version cut the words after "version bump" while the phrase the
+  check searches for, "first contact", sits earlier in the same string — so it
+  reported MISSED against a check that works. The rule pass 20f-1 wrote down
+  again: a revert reporting MISSED can mean the check is weak **or** that the
+  revert never took effect, and those are not the same finding.
+
+**FOUR TEST FILES HAD ENUMERATED LITERAL STAMPS AND ALL FOUR ARE NOW DERIVED
+FROM `FINGERPRINT_FIELDS`.** `tests/test_resume_configuration_fingerprint.py`
+(two of them), `tests/test_ablation_db_isolation.py` and
+`tests/test_agent_degraded_run_and_reporting.py` each hand-wrote a six-key
+offline stamp whose VALUES are irrelevant — and a stamp short of a newly gated
+field is FP_UNRESOLVED, so the bump made them fail for a reason that had nothing
+to do with what they assert. Their keys come from the tuple now, so the next
+bump costs them nothing.
 
 ### A SKIP IS NOT A PASS (commit `ec2033a`)
 

@@ -425,9 +425,13 @@ BUCKETS = {
         "both are sha256-compared in section 8"),
     "test_resume_configuration_fingerprint.py": (
         _A, None,
-        "ran green in 2.0s, 331 checks, against ONLY the directory skeleton: "
+        "ran green in 3.0s, 404 checks, against ONLY the directory skeleton: "
         "the configuration fingerprint and the three resume gates built on "
-        "it. run_harness.main() is DRIVEN end to end -- the fresh run, the "
+        "it. Section 1b covers llm_classifier_renderer_digest -- the hashed "
+        "module set re-derived by a static closure over the render path, the "
+        "AST normalisation shown to see an executable edit and not a comment, "
+        "and a one-character renderer edit made in a COPY of the package shown "
+        "to move the digest and answer FP_CHANGED with PROMPT_VERSION unmoved. run_harness.main() is DRIVEN end to end -- the fresh run, the "
         "--only, the --resume skip/re-run, four environment refusals and the "
         "override -- with run_one_patient replaced by a stand-in whose "
         "installation is asserted BY IDENTITY before each scenario, so a "
@@ -442,10 +446,13 @@ BUCKETS = {
         "with the restore asserted by identity -- so it needs no "
         "_EXEC_ALLOWLIST entry. NOT in the collision matrix, derived: "
         "everything it writes is inside one tempfile.mkdtemp() that it "
-        "removes and then asserts gone, it parses no source, and the two "
-        "files the suite's writers touch are neither read nor written "
-        "(config.MATCHING_MODEL and config.DATA_SNAPSHOT_DATE are rebound as "
-        "in-memory ATTRIBUTES and restored, which touches no file)"),
+        "removes and then asserts gone, and the source it DOES parse (section "
+        "1b, exactly run_fingerprint.RENDERER_MODULES plus the two consumer "
+        "banners) is written by neither of the suite's two writers -- "
+        "oncotriage/config.py is recorded by the closure as an excluded "
+        "module and never opened, and config.MATCHING_MODEL and "
+        "config.DATA_SNAPSHOT_DATE are rebound as in-memory ATTRIBUTES and "
+        "restored, which touches no file)"),
     "test_dockerignore_exclusions.py": (
         _A, None,
         "ran green in 0.04s, 36 checks / 0 skipped, against ONLY the directory "

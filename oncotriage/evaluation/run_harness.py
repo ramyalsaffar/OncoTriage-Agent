@@ -78,7 +78,7 @@ every mean a downstream harness took over it was a mean across pipelines
 presented as one.
 
 So the stored environment is now COMPARED before anything is written, against
-``oncotriage/run_fingerprint.py`` -- the same five gated facts the batch and
+``oncotriage/run_fingerprint.py`` -- the same gated facts the batch and
 ablation checkpoints are stamped with. A disagreement REFUSES, naming every
 field and both values, having written nothing.
 ``--allow-environment-change`` admits a deliberate cross-era update and is not
@@ -950,9 +950,12 @@ def write_manifest(output_dir: str, manifest: Dict) -> List[str]:
 def build_environment(fingerprint: Dict, probe: Dict) -> Dict:
     """The manifest's record of what this run is being executed under.
 
-    ``fingerprint`` is ``run_fingerprint.current()`` -- the five GATED facts
-    plus the stamp version. Everything else here is recorded and NOT gated,
-    each for a stated reason:
+    ``fingerprint`` is ``run_fingerprint.current()`` -- exactly
+    ``run_fingerprint.FINGERPRINT_FIELDS`` plus the stamp version, spread with
+    ``dict(fingerprint)`` and never enumerated here: a field added there has to
+    land in the manifest without an edit in this file, or the artifact records
+    less than the gate compares. Everything else here is recorded and NOT
+    gated, each for a stated reason:
 
       collection_alias      an alias may be repointed at the SAME backing
                             collection, in which case the two runs are

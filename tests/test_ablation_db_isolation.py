@@ -533,14 +533,15 @@ check("...named after it, so two scratch databases in one directory do not "
 # VALUE is irrelevant to every check below; that both sides are handed the SAME
 # one is what matters, because this section is about which FILE is read and
 # never about which configuration wrote it.
-_STAMP = {
-    "fingerprint_version": _run_fingerprint.FINGERPRINT_VERSION,
-    "llm_classifier_prompt_version": "test-prompt",
-    "matching_model_configured": "test-model",
-    "qdrant_collection": "test_collection",
-    "collection_points": 1,
-    "data_snapshot_date": "2026-01-01",
-}
+# The KEYS are DERIVED from FINGERPRINT_FIELDS rather than enumerated, so a
+# field added to the gate lands here without an edit. Enumerating them meant a
+# version bump silently left this stamp short of a gated field, which
+# `compare()` answers FP_UNRESOLVED for -- a refusal in a section that is not
+# about refusals at all.
+_STAMP = dict(
+    {_f: f"test-{_f}" for _f in _run_fingerprint.FINGERPRINT_FIELDS},
+    fingerprint_version=_run_fingerprint.FINGERPRINT_VERSION,
+)
 
 _ISO_DIR = os.path.join(_TMP, "resume-isolation")
 os.makedirs(_ISO_DIR)

@@ -24,6 +24,11 @@ WHAT THIS FILE HOLDS
 --------------------
     1. ``oncotriage/run_fingerprint.py``: the stamp's shape, its cache, and
        every one of the five ``FP_OUTCOMES`` driven to its own answer.
+    1b. ``llm_classifier_renderer_digest``: the module set DERIVED by a static
+       closure rather than trusted, what the AST normalisation does and does
+       not see, and the gap itself closed -- a one-character renderer edit with
+       NO ``PROMPT_VERSION`` bump, made in a COPY of the package, shown to move
+       the digest and to produce FP_CHANGED naming that field.
     2. ``utils.preserve_corrupt_file``: numbering, exhaustion, and the MOVE vs
        COPY distinction -- which is the difference between a refusal that
        sticks and one that is loud once and silent afterwards.
@@ -54,13 +59,22 @@ the restore asserted BY IDENTITY -- ``tests/test_evaluation_rater.py`` section
 7j's shape. So it needs no ``_EXEC_ALLOWLIST`` entry.
 
 NOT IN THE COLLISION MATRIX, derived rather than assumed: everything it writes
-is inside a fresh ``tempfile.mkdtemp()``, it patches no file in the repository,
-and the repository files it READS are none -- no source is parsed. The two
-files the suite's writers touch
+is inside a fresh ``tempfile.mkdtemp()`` and it patches no file in the
+repository. SECTION 1b DOES READ REPOSITORY SOURCE -- that sentence read "the
+repository files it READS are none" until the renderer-digest pass, and it is
+corrected rather than left standing. What it reads is exactly
+``run_fingerprint.RENDERER_MODULES`` (``oncotriage/agent/patient.py``,
+``oncotriage/agent/prompts.py``, ``oncotriage/constants.py``,
+``oncotriage/extraction/stage.py``, ``oncotriage/utils.py``) plus the two
+consumer banners, and NOT ``oncotriage/config.py``: the closure records an
+excluded module by name from the import statement and never descends into it,
+so neither of the two files the suite's writers touch
 (``oncotriage/registries/cancer_code_registry.py``, ``oncotriage/config.py``)
-are neither read nor written here; ``config.MATCHING_MODEL`` and
-``config.DATA_SNAPSHOT_DATE`` are rebound as ATTRIBUTES in memory and restored,
-which touches no file at all.
+is opened. ``config.MATCHING_MODEL`` and ``config.DATA_SNAPSHOT_DATE`` are
+rebound as ATTRIBUTES in memory and restored, which touches no file at all. The
+renderer edit in 1b goes into a ``shutil.copy2`` COPY under the scratch
+directory reached through ``_package_dir()``, and every hashed module's sha256
+is compared before and after to say so.
 
 Run from terminal:
     python tests/test_resume_configuration_fingerprint.py
@@ -423,6 +437,520 @@ check_true("...nor for FP_UNRESOLVED",
                    in _fp.refusal_lines(_fp.FP_UNRESOLVED, "d", "a", ["r"])))
 
 
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
+# SECTION 1b  the renderer digest
+# ===========================================================================
+#
+# THE GAP THIS CLOSES. `llm_classifier_prompt_version` is hand-maintained and
+# oncotriage/agent/prompts.py says so; the convention is that a renderer change
+# bumps it, and nothing enforced the convention. An edit to
+# `_create_patient_summary`, to a temporal helper or to the stage extractor that
+# forgot the bump changed every rendered prompt while the resume gate reported
+# FP_MATCH, and the resumed batch / ablation / evaluation run mixed two eras
+# into one artifact.
+#
+# THIS SECTION READS REPOSITORY SOURCE, WHICH THE REST OF THIS FILE DOES NOT.
+# The five modules it reads are oncotriage/run_fingerprint.py's RENDERER_MODULES
+# and none of them is written by either of the suite's two writers
+# (oncotriage/registries/cancer_code_registry.py, oncotriage/config.py), so the
+# collision-matrix derivation is unchanged -- and the closure below DOES NOT
+# DESCEND into an excluded module, which is what keeps oncotriage/config.py
+# unopened rather than merely unhashed.
+
+print()
+print("=" * 70)
+print("SECTION 1b  llm_classifier_renderer_digest")
+print("=" * 70)
+
+import ast as _ast                                            # noqa: E402
+
+_PKG_ROOT = os.path.dirname(os.path.abspath(_fp.__file__))
+_DIGEST = "llm_classifier_renderer_digest"
+
+
+def _rel_path(rel):
+    return os.path.join(_PKG_ROOT, *rel.split("/"))
+
+
+def at(mapping, key=_DIGEST):
+    """``mapping[key]``, or a marker naming the absence. NEVER raises.
+
+    EVERY read of the digest out of a stamp in this section goes through this.
+    A bare ``stamp["llm_classifier_renderer_digest"]`` raises KeyError while
+    ``check()``'s argument is being EVALUATED when the field is gone -- which
+    is exactly the defect the section exists to catch -- so the run reported
+    one traceback where it owed a summary and eight recorded failures. This
+    project has shipped that shape eight times; the revert harness caught it
+    here on the FIRST plant, which is the argument for controls restated as an
+    event.
+    """
+    if not isinstance(mapping, dict) or key not in mapping:
+        return f"<no {key}>"
+    return mapping[key]
+
+
+def stamp_now(refresh=False):
+    """``current()``, or a marker naming what it raised. NEVER raises.
+
+    ``current()`` reads five files. A revert that makes an unreadable renderer
+    module RAISE instead of degrading is precisely what section (g) asserts
+    against, and a bare call there killed the run instead of recording it.
+    """
+    return drive(lambda: _fp.current(refresh=refresh), default="<current raised>")
+
+
+# --- (a) the field is in the stamp and in the gate ------------------------
+_fp.clear_cache()
+_now = _fp.current()
+
+check_true("the renderer digest is a GATED field, not merely a recorded one",
+           "llm_classifier_renderer_digest" in _fp.FINGERPRINT_FIELDS)
+check("...and current() carries it", type(at(_now)), str)
+check("...as a full sha256 hex digest",
+      (len(str(at(_now))),
+       set(str(at(_now))) <= set("0123456789abcdef")),
+      (64, True))
+check("...and it is NOT the UNKNOWN sentinel (non-degeneracy: an unreadable "
+      "module answers UNKNOWN, and every check below would then be comparing "
+      "one sentinel with another)",
+      at(_now) == _fp.UNKNOWN, False)
+check("the stamp's version says this field set is version 2",
+      _fp.FINGERPRINT_VERSION, 2)
+
+# --- (b) the module set is DERIVED, not trusted ---------------------------
+# A static closure from the two render entry points over every module-level
+# name each reaches, transitively. A module it reaches must be in
+# RENDERER_MODULES or in RENDERER_MODULES_EXCLUDED -- the round trip is CLOSED,
+# so a helper moved to a new module fails here rather than silently escaping
+# the digest, which is the one rot a hand-written module list is prone to.
+
+
+def _package_module_exists(dotted):
+    return os.path.exists(os.path.join(
+        os.path.dirname(_PKG_ROOT), *dotted.split(".")) + ".py")
+
+
+def _dotted_to_rel(dotted):
+    return dotted[len("oncotriage."):].replace(".", "/") + ".py"
+
+
+_INDEX_CACHE = {}
+
+
+def _index(rel):
+    """Module-level defs, constants, from-imported names and module aliases."""
+    if rel in _INDEX_CACHE:
+        return _INDEX_CACHE[rel]
+    with io.open(_rel_path(rel), "r", encoding="utf-8") as fh:
+        tree = _ast.parse(fh.read())
+    defs, consts, names, mods = {}, {}, {}, {}
+    for node in tree.body:
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef,
+                             _ast.ClassDef)):
+            defs[node.name] = node
+        elif isinstance(node, _ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, _ast.Name):
+                    consts[tgt.id] = node
+        elif isinstance(node, _ast.AnnAssign) and isinstance(node.target,
+                                                             _ast.Name):
+            consts[node.target.id] = node
+        elif isinstance(node, _ast.ImportFrom) and node.module \
+                and node.module.startswith("oncotriage"):
+            for alias in node.names:
+                # `from oncotriage.agent import deps` binds a MODULE, not a
+                # name in oncotriage/agent.py -- which does not exist. Told
+                # apart by asking the filesystem, not by guessing from the
+                # spelling.
+                sub = f"{node.module}.{alias.name}"
+                if _package_module_exists(sub):
+                    mods[alias.asname or alias.name] = sub
+                else:
+                    names[alias.asname or alias.name] = (node.module, alias.name)
+        elif isinstance(node, _ast.Import):
+            for alias in node.names:
+                if alias.name.startswith("oncotriage") \
+                        and _package_module_exists(alias.name):
+                    mods[alias.asname or alias.name.split(".")[-1]] = alias.name
+    _INDEX_CACHE[rel] = (defs, consts, names, mods)
+    return _INDEX_CACHE[rel]
+
+
+_reached = set()
+_walked = set()
+
+
+def _walk(dotted, name):
+    rel = _dotted_to_rel(dotted)
+    _reached.add(rel)
+    if rel not in _fp.RENDERER_MODULES:
+        # Record it, do not descend. Excluding a module excludes its subtree --
+        # which is what keeps oncotriage/config.py, a file one of the suite's
+        # two writers rewrites in place, from being opened by this test at all.
+        return
+    if (rel, name) in _walked:
+        return
+    _walked.add((rel, name))
+    defs, consts, names, mods = _index(rel)
+    node = defs.get(name) or consts.get(name)
+    if node is None:
+        return
+    for sub in _ast.walk(node):
+        if isinstance(sub, _ast.Attribute) and isinstance(sub.value, _ast.Name) \
+                and sub.value.id in mods:
+            _walk(mods[sub.value.id], sub.attr)
+        elif isinstance(sub, _ast.Name) and isinstance(sub.ctx, _ast.Load):
+            if sub.id in defs or sub.id in consts:
+                _walk(dotted, sub.id)
+            elif sub.id in names:
+                _walk(*names[sub.id])
+            elif sub.id in mods:
+                _reached.add(_dotted_to_rel(mods[sub.id]))
+
+
+_walk("oncotriage.agent.patient", "_create_patient_summary")
+_walk("oncotriage.agent.prompts", "render_system_prompt")
+
+check_true("the closure is non-degenerate: it walked into more than one "
+           "definition (a walker that resolved nothing would satisfy every "
+           "check below for free)", len(_walked) > 30)
+check("every module the render-path closure reaches is DECLARED -- hashed or "
+      "argued-excluded, never neither",
+      sorted(_reached - set(_fp.RENDERER_MODULES)
+             - set(_fp.RENDERER_MODULES_EXCLUDED)), [])
+check("...and every HASHED module is one the closure actually reaches "
+      "(non-degeneracy the other way: a module in the tuple that nothing on "
+      "the render path touches is a digest that refuses for no reason)",
+      sorted(set(_fp.RENDERER_MODULES) - _reached), [])
+check("...and the two tuples are disjoint",
+      sorted(set(_fp.RENDERER_MODULES) & set(_fp.RENDERER_MODULES_EXCLUDED)),
+      [])
+check("the closure reaches exactly the declared set, both tuples",
+      sorted(_reached),
+      sorted(set(_fp.RENDERER_MODULES) | set(_fp.RENDERER_MODULES_EXCLUDED)))
+check_true("...and oncotriage/config.py is excluded rather than hashed, so "
+           "the collision-matrix derivation for this file still holds",
+           "config.py" in _fp.RENDERER_MODULES_EXCLUDED
+           and "config.py" not in _fp.RENDERER_MODULES)
+
+# The premise that lets docstrings be stripped: nothing on the render path
+# reads a __doc__. Asserted rather than assumed, over the hashed set.
+_doc_readers = sorted(
+    rel for rel in _fp.RENDERER_MODULES
+    if any(isinstance(n, _ast.Attribute) and n.attr == "__doc__"
+           for n in _ast.walk(_ast.parse(
+               io.open(_rel_path(rel), encoding="utf-8").read()))))
+check("no hashed module reads a __doc__, which is what makes stripping "
+      "docstrings from the digest input a reduction and not a hole",
+      _doc_readers, [])
+
+# --- (c) what the digest does and does not see ----------------------------
+_probe_dir = tempfile.mkdtemp(dir=_SCRATCH)
+_probe = os.path.join(_probe_dir, "probe.py")
+
+
+def _normalized(text):
+    with io.open(_probe, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    return _fp.normalized_module_source(_probe)
+
+
+_BASE_SRC = ('"""A docstring."""\n'
+             'X = 1          # a comment\n'
+             'def f(a):\n'
+             '    """Another docstring."""\n'
+             '    return a + X\n')
+check("a COMMENT-only edit does not change the normalized source -- which is "
+      "why a documentation pass over patient.py does not refuse every resume",
+      _normalized(_BASE_SRC),
+      _normalized(_BASE_SRC.replace("# a comment", "# a different comment")))
+check("...nor does a DOCSTRING edit",
+      _normalized(_BASE_SRC),
+      _normalized(_BASE_SRC.replace("Another docstring", "Rewritten entirely")))
+check("...nor does reformatting",
+      _normalized(_BASE_SRC), _normalized(_BASE_SRC.replace("X = 1  ", "X=1")))
+check_true("...but a one-character EXECUTABLE edit does",
+           _normalized(_BASE_SRC)
+           != _normalized(_BASE_SRC.replace("a + X", "a - X")))
+check_true("...and so does a string LITERAL edit, which is how every section "
+           "heading in the summary is spelled",
+           _normalized(_BASE_SRC)
+           != _normalized(_BASE_SRC.replace("X = 1", 'X = "1"')))
+check("a function whose body is only a docstring still unparses",
+      _normalized('def g():\n    """only this."""\n'), "def g():\n    pass")
+
+# --- (d) the digest itself ------------------------------------------------
+_d1 = _fp.renderer_digest()
+check("renderer_digest() is deterministic within a process",
+      _d1, _fp.renderer_digest())
+_per = _fp.renderer_module_digests()
+check("renderer_module_digests() covers exactly RENDERER_MODULES",
+      sorted(_per), sorted(_fp.RENDERER_MODULES))
+check_true("...and every per-module digest is distinct (non-degeneracy: five "
+           "equal digests would mean the reader is not reading five files)",
+           len(set(_per.values())) == len(_fp.RENDERER_MODULES))
+check("the stamp's digest IS renderer_digest()", at(_now), _d1)
+# The digest is a pure function of (algorithm tag, path, normalized source) --
+# demonstrated by recomputing it here from the parts and requiring agreement.
+_recomputed = hashlib.sha256("\n".join(
+    [_fp.RENDERER_DIGEST_ALGORITHM]
+    + [f"{rel}:{_per[rel]}" for rel in _fp.RENDERER_MODULES]
+).encode("utf-8")).hexdigest()
+check("the digest is exactly sha256 over the tag and the path:hex lines, in "
+      "RENDERER_MODULES order", _d1, _recomputed)
+check_true("...and the path is part of it, so moving a module moves the digest "
+           "even with its text untouched",
+           hashlib.sha256("\n".join(
+               [_fp.RENDERER_DIGEST_ALGORITHM]
+               + [f"moved/{rel}:{_per[rel]}" for rel in _fp.RENDERER_MODULES]
+           ).encode("utf-8")).hexdigest() != _d1)
+check_true("...and so is the ALGORITHM TAG, so a change to the normalisation "
+           "cannot silently re-base what two runs are comparing",
+           hashlib.sha256("\n".join(
+               [_fp.RENDERER_DIGEST_ALGORITHM + "-changed"]
+               + [f"{rel}:{_per[rel]}" for rel in _fp.RENDERER_MODULES]
+           ).encode("utf-8")).hexdigest() != _d1)
+check_true("...and the ORDER is RENDERER_MODULES', not an accident of dict "
+           "iteration", tuple(_per) == tuple(_fp.RENDERER_MODULES))
+
+# --- (e) THE GAP, CLOSED: a renderer edit with NO version bump ------------
+# The whole pass in one check. The seam is _package_dir(): pointing it at a
+# COPY of the package makes the shipped renderer_digest() read the copy, so
+# nothing in the repository is written and the real modules are never touched.
+_copy_root = os.path.join(tempfile.mkdtemp(dir=_SCRATCH), "oncotriage")
+os.makedirs(_copy_root)
+for _rel in _fp.RENDERER_MODULES:
+    _dst = os.path.join(_copy_root, *_rel.split("/"))
+    os.makedirs(os.path.dirname(_dst), exist_ok=True)
+    shutil.copy2(_rel_path(_rel), _dst)
+
+_REPO_HASHES_BEFORE = {rel: digest(_rel_path(rel))
+                       for rel in _fp.RENDERER_MODULES}
+
+with rebound(_fp, "_package_dir", lambda: _copy_root):
+    check("pointing _package_dir at an untouched COPY reproduces the digest "
+          "exactly (non-degeneracy: without this, the change below could be "
+          "the copy rather than the edit)", _fp.renderer_digest(), _d1)
+
+    _fp.clear_cache()
+    _pre_edit_stamp = stamp_now()
+
+    # ONE CHARACTER, in the renderer, with no PROMPT_VERSION bump: the "- None"
+    # a patient with no procedures renders becomes "- none".
+    _patient_copy = os.path.join(_copy_root, "agent", "patient.py")
+    _txt = io.open(_patient_copy, encoding="utf-8").read()
+    check("the marker this edit moves occurs exactly where expected "
+          "(non-degeneracy: an edit that matched nothing would leave the "
+          "digest equal and look like a gate that failed to fire)",
+          _txt.count('summary += "\\nProcedures:\\n"'), 1)
+    io.open(_patient_copy, "w", encoding="utf-8").write(
+        _txt.replace('summary += "\\nProcedures:\\n"',
+                     'summary += "\\nprocedures:\\n"'))
+
+    _fp.clear_cache()
+    _post_edit_stamp = stamp_now()
+
+    check_true("A ONE-CHARACTER RENDERER EDIT WITH NO VERSION BUMP MOVES THE "
+               "DIGEST -- the gap this field exists to close",
+               at(_post_edit_stamp) != at(_pre_edit_stamp))
+    check("...while llm_classifier_prompt_version is UNCHANGED, which is "
+          "precisely the case the old five-field gate could not see",
+          at(_post_edit_stamp, "llm_classifier_prompt_version"),
+          at(_pre_edit_stamp, "llm_classifier_prompt_version"))
+    check("...and every other gated field is unchanged too, so the refusal "
+          "cannot be blamed on anything else",
+          [f for f in _fp.FINGERPRINT_FIELDS
+           if at(_post_edit_stamp, f) != at(_pre_edit_stamp, f)],
+          [_DIGEST])
+
+    _outcome, _detail = _fp.compare(_pre_edit_stamp, _post_edit_stamp)
+    check("compare() against the pre-edit stamp answers FP_CHANGED",
+          _outcome, _fp.FP_CHANGED)
+    check_true("...and NAMES the field", "llm_classifier_renderer_digest"
+               in _detail)
+    check_true("...and the refusal states what the renderer gate does not "
+               "cover, on COLLECTION_IDENTITY's argument",
+               any(_fp.RENDERER_COVERAGE in line for line in
+                   _fp.refusal_lines(_outcome, _detail, "an artifact", ["fix"])))
+    check_true("...and renderer_module_digests() says WHICH module moved",
+               _fp.renderer_module_digests()["agent/patient.py"]
+               != _per["agent/patient.py"])
+    check("...and only that one",
+          sorted(rel for rel in _fp.RENDERER_MODULES
+                 if _fp.renderer_module_digests()[rel] != _per[rel]),
+          ["agent/patient.py"])
+
+    # A comment-only edit to the SAME copied module must NOT move it.
+    io.open(_patient_copy, "w", encoding="utf-8").write(_txt)      # restore
+    _fp.clear_cache()
+    check("restoring the copy restores the digest",
+          at(stamp_now()), at(_pre_edit_stamp))
+    io.open(_patient_copy, "w", encoding="utf-8").write(
+        _txt.replace("# ── Procedures ─",
+                     "# ── Procedures (a documentation pass) ─"))
+    _fp.clear_cache()
+    check("a comment-only edit to the real renderer does NOT move the digest, "
+          "so a documentation pass does not refuse every resume",
+          at(stamp_now()), at(_pre_edit_stamp))
+
+_fp.clear_cache()
+check("the repository's own renderer modules were never written",
+      {rel: digest(_rel_path(rel)) for rel in _fp.RENDERER_MODULES},
+      _REPO_HASHES_BEFORE)
+check("...and the shipped digest is back to what it was before the copy",
+      at(stamp_now()), _d1)
+
+# --- (f) a version-1 stamp is FP_VERSION, never FP_CHANGED ----------------
+# The one behaviour change this pass ships, driven rather than described.
+_v1 = {k: v for k, v in _now.items() if k != "llm_classifier_renderer_digest"}
+_v1["fingerprint_version"] = 1
+_v1_outcome, _v1_detail = _fp.compare(_v1, _now)
+check("EVERY ARTIFACT STAMPED AT VERSION 1 ANSWERS FP_VERSION -- the shape "
+      "changed, and a field it never recorded must not be reported as a "
+      "configuration that changed", _v1_outcome, _fp.FP_VERSION)
+check_true("...and it is NOT FP_CHANGED", _v1_outcome != _fp.FP_CHANGED)
+check_true("...and the detail names both versions",
+           "1" in _v1_detail and str(_fp.FINGERPRINT_VERSION) in _v1_detail)
+check_true("...and the refusal tells an operator this is expected once after a "
+           "bump, rather than leaving them hunting an edit that never happened",
+           any("first contact" in line for line in
+               _fp.refusal_lines(_v1_outcome, _v1_detail, "an artifact",
+                                 ["clear it"])))
+check_true("...and that clause is NOT printed for FP_CHANGED, which is a real "
+           "configuration difference",
+           not any("first contact" in line for line in
+                   _fp.refusal_lines(_fp.FP_CHANGED, "d", "a", ["r"])))
+
+# A v1 stamp that ALSO differs in a field is still FP_VERSION: the shape is
+# asked before any field, so the answer cannot be a field diff computed across
+# two different field sets.
+check("a version-1 stamp that also differs in a gated field is STILL "
+      "FP_VERSION, because the shape is asked first",
+      _fp.compare(dict(_v1, matching_model_configured="something-else"),
+                  _now)[0], _fp.FP_VERSION)
+
+# --- (f2) A STAMP SHORT OF A GATED FIELD IS NOT A STAMP THAT AGREES -------
+# Found by the revert harness rather than by reading, and it is a property of
+# is_resolved() rather than of the digest -- the digest is only what surfaced
+# it. `is_resolved` used to ask `.get(f) != UNKNOWN`; None is not UNKNOWN, so a
+# stamp missing a gated field reported RESOLVED, `disagreements()` then
+# compared NOT_RECORDED with NOT_RECORDED, found them EQUAL, and `compare()`
+# answered FP_MATCH. A hand-built stamp missing exactly the field a version
+# bump added would have been reported as AGREEING with a run that has it. The
+# version gate catches that particular case one branch earlier, and a guard
+# that depends on another guard running first is not a guard.
+_short = {k: v for k, v in _now.items() if k != _DIGEST}
+check_true("a stamp MISSING a gated field is NOT resolved -- absent is not "
+           "established", not _fp.is_resolved(_short))
+check_true("...non-degeneracy: the same stamp WITH the field is resolved",
+           _fp.is_resolved(_now))
+check("...and as THIS run's stamp it answers FP_UNRESOLVED, never FP_MATCH",
+      drive(lambda: _fp.compare(_now, _short)[0]), _fp.FP_UNRESOLVED)
+check_true("...naming the field that was never established",
+           _DIGEST in str(drive(lambda: _fp.compare(_now, _short)[1])))
+check("...and two stamps that are BOTH short do not agree with each other "
+      "either, which is the case that used to come back FP_MATCH",
+      drive(lambda: _fp.compare(_short, _short)[0]), _fp.FP_UNRESOLVED)
+check("...and nothing raises while formatting any of it",
+      drive(lambda: _fp.compare(_short, _short)[1] is not None), True)
+
+# --- (g) an unreadable renderer module degrades, and does not raise -------
+_fp.FINGERPRINT_DEGRADATIONS.clear()
+with rebound(_fp, "_package_dir", lambda: os.path.join(_SCRATCH, "no-such-pkg")):
+    _fp.clear_cache()
+    _missing = stamp_now()
+    check("a renderer module that cannot be read answers UNKNOWN rather than "
+          "raising", at(_missing), _fp.UNKNOWN)
+    check("...and is counted under the field and the exception type",
+          dict(_fp.FINGERPRINT_DEGRADATIONS),
+          {"llm_classifier_renderer_digest:FileNotFoundError": 1})
+    check("...and compare() then answers FP_UNRESOLVED, whose remediation is "
+          "not 'clear the artifact' at all",
+          drive(lambda: _fp.compare(_now, _missing)[0]), _fp.FP_UNRESOLVED)
+    check_true("...naming the field that could not be established",
+               _DIGEST in str(drive(lambda: _fp.compare(_now, _missing)[1])))
+_fp.FINGERPRINT_DEGRADATIONS.clear()
+_fp.clear_cache()
+
+_bad_syntax_dir = os.path.join(tempfile.mkdtemp(dir=_SCRATCH), "oncotriage")
+for _rel in _fp.RENDERER_MODULES:
+    _dst = os.path.join(_bad_syntax_dir, *_rel.split("/"))
+    os.makedirs(os.path.dirname(_dst), exist_ok=True)
+    shutil.copy2(_rel_path(_rel), _dst)
+with io.open(os.path.join(_bad_syntax_dir, "constants.py"), "a",
+             encoding="utf-8") as _fh:
+    _fh.write("\ndef (:\n")
+with rebound(_fp, "_package_dir", lambda: _bad_syntax_dir):
+    _fp.clear_cache()
+    check("a renderer module that cannot be PARSED degrades the same way",
+          at(stamp_now()), _fp.UNKNOWN)
+    check("...counted under the parse failure's own type",
+          dict(_fp.FINGERPRINT_DEGRADATIONS),
+          {"llm_classifier_renderer_digest:SyntaxError": 1})
+_fp.FINGERPRINT_DEGRADATIONS.clear()
+_fp.clear_cache()
+
+# --- (h) the resolve-once cache still holds, with a file read in it -------
+# The digest reads five files. It has to be inside the SAME cached resolution
+# as the collection, or a run whose source is edited mid-flight would stamp two
+# checkpoints differently and the file would then refuse itself.
+_fp.clear_cache()
+_cached = stamp_now()
+with rebound(_fp, "renderer_digest", lambda: "0" * 64):
+    check("the digest is resolved ONCE per process: a resolver that changed "
+          "mid-run does not move the cached stamp",
+          at(stamp_now()), at(_cached))
+    check("...and refresh=True does read it again (non-degeneracy: without "
+          "this the check above would pass against a stamp that never "
+          "consulted the resolver at all)",
+          at(stamp_now(refresh=True)), "0" * 64)
+_fp.clear_cache()
+check("...and clear_cache() puts the real one back", at(stamp_now()), _d1)
+
+# --- (i) the summary sentence has ONE owner -------------------------------
+check_true("summary() names the renderer digest, so the banner an operator "
+           "sees at startup carries the value a later refusal would name",
+           _fp.summary(_now).startswith("prompt ")
+           and str(at(_now))[:12] in _fp.summary(_now))
+check("...and compare()'s FP_MATCH detail IS that sentence, not a sixth copy "
+      "of it", _fp.compare(_now, _now)[1], _fp.summary(_now))
+check("summary() over a stamp missing every field formats rather than raising "
+      "-- a diagnosis must survive the state it is diagnosing",
+      drive(lambda: _fp.NOT_RECORDED in _fp.summary({})), True)
+
+# summary() spells its six fields out, because "prompt 1.9.0, model X,
+# collection Y (N points)" is a sentence a person reads and a derived
+# "field=value; ..." join is not. The cost of a hand-written sentence is that
+# it can fall behind the tuple -- which is the defect this pass just fixed one
+# level up, in the two banners -- so the round trip is CLOSED here instead: a
+# seventh gated field fails this until summary() names it.
+_sentinels = {f: f"SENTINEL{i}VALUE" for i, f in enumerate(_fp.FINGERPRINT_FIELDS)}
+_summ = _fp.summary(_sentinels)
+check("summary() names the VALUE of every gated field, so a field added to the "
+      "tuple cannot leave the banner and the FP_MATCH detail naming one fewer "
+      "fact than the gate compares",
+      sorted(f for f, v in _sentinels.items() if v[:12] not in _summ), [])
+check_true("...non-degeneracy: a value NOT in the stamp is not in the sentence "
+           "either, so the check above is not satisfied by a formatter that "
+           "prints everything", "SENTINEL99VALUE"[:12] not in _summ)
+
+_banner_sources = "\n".join(
+    io.open(os.path.join(_PKG_ROOT, rel), encoding="utf-8").read()
+    for rel in ("batch/runner.py", "ablation/study.py"))
+check("neither consumer banner enumerates the gated fields any more: they "
+      "call run_fingerprint.summary(), so a field added to the gate cannot "
+      "leave a banner naming one fewer fact than the gate compares",
+      _banner_sources.count("_fingerprint['llm_classifier_prompt_version']"), 0)
+check_true("...and both do call it (non-degeneracy for the check above, which "
+           "a deleted banner would also satisfy)",
+           _banner_sources.count("run_fingerprint.summary(_fingerprint)") == 2)
+
+
 #------------------------------------------------------------------------------
 
 
@@ -518,12 +1046,23 @@ try:
     # refusal for a reason that had nothing to do with its checkpoint. The
     # resolver is made to RAISE for the duration, so a resolution that did
     # happen could not be mistaken for a lucky one.
-    _OFFLINE = {"fingerprint_version": _fp.FINGERPRINT_VERSION,
-                "llm_classifier_prompt_version": "offline-prompt",
-                "matching_model_configured": "offline-model",
-                "qdrant_collection": "offline_collection",
-                "collection_points": 7,
-                "data_snapshot_date": "2026-01-01"}
+    # DERIVED FROM FINGERPRINT_FIELDS, NOT ENUMERATED. This was six literal
+    # keys, and the renderer-digest pass is what proved that shape wrong: a
+    # stamp missing a newly gated field is not a stamp with one field missing,
+    # it is a stamp `compare()` cannot establish -- so the two checks below
+    # failed for a reason that had nothing to do with what they assert. The
+    # VALUES are irrelevant here and only that both sides are handed the SAME
+    # object matters; deriving the KEYS is what keeps that true across the next
+    # bump.
+    _OFFLINE = dict(
+        {_f: f"offline-{_f}" for _f in _fp.FINGERPRINT_FIELDS},
+        fingerprint_version=_fp.FINGERPRINT_VERSION)
+    check("the offline stamp carries exactly what the gate compares "
+          "(non-degeneracy: a stamp short of a field is FP_UNRESOLVED, not a "
+          "match, so a stale literal here would fail the two checks below for "
+          "the wrong reason)",
+          sorted(_OFFLINE),
+          sorted(("fingerprint_version",) + _fp.FINGERPRINT_FIELDS))
 
 
     def _must_not_resolve():
@@ -750,25 +1289,19 @@ check("...and B, which was never written, is still a clean empty resume",
       _study.load_ablation_checkpoint(db_path=_DB_B), set())
 
 _fp.clear_cache()
+# ONE derived stamp handed to both sides. It was two enumerated literals, which
+# is two chances to be short of a gated field after a version bump -- and a
+# stamp short of one is FP_UNRESOLVED, so the refusal names the digest and says
+# nothing about the isolation this section is testing.
+_ABL_OFFLINE = dict({_f: f"offline-{_f}" for _f in _fp.FINGERPRINT_FIELDS},
+                    fingerprint_version=_fp.FINGERPRINT_VERSION)
 with rebound(_fp, "_resolve_collection",
              lambda: (_ for _ in ()).throw(AssertionError("resolver called"))):
     _study.save_ablation_checkpoint({("full_pipeline", "off")}, db_path=_DB_B,
-                                    fingerprint={
-                                        "fingerprint_version": _fp.FINGERPRINT_VERSION,
-                                        "llm_classifier_prompt_version": "p",
-                                        "matching_model_configured": "m",
-                                        "qdrant_collection": "c",
-                                        "collection_points": 1,
-                                        "data_snapshot_date": "2026-01-01"})
+                                    fingerprint=_ABL_OFFLINE)
     check("the ablation loader honours an explicit stamp offline too",
           drive(lambda: _study.load_ablation_checkpoint(
-              db_path=_DB_B,
-              fingerprint={"fingerprint_version": _fp.FINGERPRINT_VERSION,
-                           "llm_classifier_prompt_version": "p",
-                           "matching_model_configured": "m",
-                           "qdrant_collection": "c",
-                           "collection_points": 1,
-                           "data_snapshot_date": "2026-01-01"})),
+              db_path=_DB_B, fingerprint=_ABL_OFFLINE)),
           {("full_pipeline", "off")})
 _study.clear_ablation_checkpoint(db_path=_DB_B)
 _fp.clear_cache()

@@ -1570,12 +1570,9 @@ def main():
         # the writes are one reading rather than two that can straddle an alias
         # swap.
         _fingerprint = run_fingerprint.current()
-        console.out(f"  Configuration: prompt "
-                    f"{_fingerprint['llm_classifier_prompt_version']}, model "
-                    f"{_fingerprint['matching_model_configured']}, collection "
-                    f"{_fingerprint['qdrant_collection']} "
-                    f"({_fingerprint['collection_points']} points), snapshot "
-                    f"{_fingerprint['data_snapshot_date']}")
+        # run_fingerprint owns this sentence; see the same call in
+        # oncotriage/batch/runner.py:main for why it is not written out here.
+        console.out(f"  Configuration: {run_fingerprint.summary(_fingerprint)}")
 
         # A REFUSAL HERE IS ABOVE tracking.start_run AND ABOVE THE FIRST BILLED
         # CALL, so a checkpoint this study may not continue stops it having

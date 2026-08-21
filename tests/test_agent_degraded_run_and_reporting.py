@@ -979,14 +979,14 @@ try:
     # the documented seam for a caller with no endpoint; its VALUE is
     # irrelevant here, only that both sides are handed the same one, because
     # this check is about the RESULTS file not disturbing the checkpoint.
-    _ckpt_stamp = {
-        "fingerprint_version": _run_fingerprint.FINGERPRINT_VERSION,
-        "llm_classifier_prompt_version": "test-prompt",
-        "matching_model_configured": "test-model",
-        "qdrant_collection": "test_collection",
-        "collection_points": 1,
-        "data_snapshot_date": "2026-01-01",
-    }
+    # The KEYS are DERIVED from FINGERPRINT_FIELDS, never enumerated: a stamp
+    # short of a gated field is FP_UNRESOLVED, so an enumerated literal turns
+    # the next version bump into a refusal inside a check about something else.
+    _ckpt_stamp = dict(
+        {_f: f"test-{_f}"
+         for _f in _run_fingerprint.FINGERPRINT_FIELDS},
+        fingerprint_version=_run_fingerprint.FINGERPRINT_VERSION,
+    )
     _runner.save_checkpoint({"patient-a", "patient-b"},
                             fingerprint=_ckpt_stamp)
     with open(_rp, "w") as _fh:

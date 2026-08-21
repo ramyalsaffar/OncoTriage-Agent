@@ -1933,11 +1933,11 @@ def main():
         # are the same object rather than two readings that can straddle an
         # alias swap.
         _fingerprint = run_fingerprint.current()
-        console.out(f"[Config] prompt {_fingerprint['llm_classifier_prompt_version']}, "
-                    f"model {_fingerprint['matching_model_configured']}, "
-                    f"collection {_fingerprint['qdrant_collection']} "
-                    f"({_fingerprint['collection_points']} points), "
-                    f"snapshot {_fingerprint['data_snapshot_date']}")
+        # THE SENTENCE IS run_fingerprint's, NOT THIS FILE'S. It used to be
+        # five hand-written fields here, a sixth copy in the ablation study and
+        # a seventh inside compare(); a field added to the gate then left every
+        # banner naming one fewer fact than the gate compares.
+        console.out(f"[Config] {run_fingerprint.summary(_fingerprint)}")
 
         # A REFUSAL HERE COSTS NOTHING AND IS THE POINT. It is above
         # tracking.start_run and above the first billed call, so a checkpoint
