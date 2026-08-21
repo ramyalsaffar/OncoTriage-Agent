@@ -92,3 +92,65 @@ CVE-2026-5241    # HIGH   fixed 5.5.0
 # these two, because they were never the copies being upgraded.
 CVE-2025-47273         # HIGH  setuptools 70.3.0 vendored in pip  fixed 78.1.1
 GHSA-6v7p-g79w-8964    # HIGH  msgpack 1.1.2 vendored in pip      fixed 1.2.1
+
+# --- BASE-LAG: Debian HAS fixed it; no published base image carries the fix ---
+#
+# A FIFTH CLASS, and the only TEMPORARY one in this file. Every entry above is
+# blocked by a constraint that needs a DECISION to lift — a pin cap, a model
+# risk, an upstream re-vendoring. These four are blocked only by the calendar,
+# and they are not a surprise: they are the alarm the Dockerfile's two FROM
+# lines are designed to raise. The gate is `--ignore-unfixed`, so it fires
+# precisely when Debian ships a fix, and a pinned digest cannot receive one.
+#
+# THE CONSTRAINT, MEASURED 2026-08-20 — the fix exists and there is nowhere to
+# take it from:
+#
+#     Debian fixed util-linux in 2.41.5-0+deb13u1  (DSA-6442-1, 2026-08-14).
+#
+#     pinned base    python:3.11-slim@sha256:94c50be2...  ->  util-linux 2.41-5
+#     NEWEST PUBLISHED              @sha256:9c900dea...  ->  util-linux 2.41-5
+#
+# 9c900dea is what BOTH the `3.11-slim` and `3.11-slim-trixie` tags resolve to
+# today; its image config is dated 2026-08-13, ONE DAY BEFORE the DSA. The two
+# versions were read out of /var/lib/dpkg/status inside each image's layers on
+# linux/amd64 — the arch CI scans — rather than inferred from a tag date. So
+# re-pinning the digest, which is the one supported way in, has no target.
+#
+# THE OTHER WAY IN IS `apt-get upgrade`, AND IT STAYS REVERTED. Its removal is
+# argued with a measurement at STAGE 2 of the Dockerfile: it cleared zero
+# findings and it destroys the only reproducibility guarantee the image has.
+# "It would clear something today" does not reopen that argument — a build that
+# takes whatever Debian published this morning makes two builds of one commit
+# differ, which is the property the digest pin exists to provide.
+#
+# REMOVAL CONDITION, mechanical rather than a judgement call. When Docker Hub
+# publishes a python:3.11-slim whose util-linux is >= 2.41.5-0+deb13u1:
+#     1. re-pin BOTH FROM lines to that digest, in one commit;
+#     2. run `docker run --rm <image> python --version` and confirm 3.11.x,
+#        which the Dockerfile demands after ANY digest change;
+#     3. DELETE ALL FOUR LINES BELOW, and this block with them.
+# They are accepted findings with an expiry, not suppressions. Nothing else in
+# this file has a removal condition that can be checked by a script; this one
+# can, and leaving it here after the digest moves is the failure mode.
+#
+# CVE-2026-53615 IS IN THE LIST AND IS NOT IN THE DSA. Checked per id rather
+# than assumed from the advisory text: the Debian tracker records trixie as
+# vulnerable at 2.41-5 and trixie-security as fixed at 2.41.5-0+deb13u1 — the
+# same upload — so it clears with the same digest move as the other three.
+#
+# NOT LISTED HERE, DELIBERATELY: CVE-2026-13595 and CVE-2026-27456, the other
+# two ids in DSA-6442-1. Both ARE present in this image and both clear with the
+# same digest move, but Trivy 0.73.0 rates them MEDIUM, so the gate's
+# `--severity HIGH,CRITICAL` never sees them. An entry would suppress nothing
+# today while silently swallowing a future re-rating to HIGH — which is exactly
+# the alarm this file must not disarm. The non-gating FULL scan prints them.
+#
+# THE FOUR IDS SPAN NINE BINARY PACKAGES built from the util-linux source —
+# bsdutils, libblkid1, liblastlog2-2, libmount1, libsmartcols1, libuuid1,
+# login, mount, util-linux — which is 36 gate rows from four ids. They are
+# listed by id and not by package, per this file's rule: a NEW util-linux CVE
+# must still fail the gate.
+CVE-2026-53612   # HIGH   fixed 2.41.5-0+deb13u1   accepted 2026-08-20
+CVE-2026-53613   # HIGH   fixed 2.41.5-0+deb13u1   accepted 2026-08-20
+CVE-2026-53614   # HIGH   fixed 2.41.5-0+deb13u1   accepted 2026-08-20
+CVE-2026-53615   # HIGH   fixed 2.41.5-0+deb13u1   accepted 2026-08-20
