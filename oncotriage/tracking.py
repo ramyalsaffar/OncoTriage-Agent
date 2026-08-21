@@ -330,6 +330,16 @@ CONFIGURATION_PARAM_NAMES = (
     "BM25_RETRIEVAL_SIZE",
     "VECTOR_RETRIEVAL_SIZE",
     "RRF_POOL_SIZE",
+    # The fusion itself. RRF_K is listed under Stage 2 and is read by Stage 3
+    # too -- one constant, one parameter, rather than the same number logged
+    # twice under two names. The four weights are Stage 2 only. Without them a
+    # reviewer diffing two runs sees identical retrieval sizes and no reason
+    # for a different candidate pool.
+    "RRF_K",
+    "RRF_WEIGHT_TITLE",
+    "RRF_WEIGHT_CONDITIONS",
+    "RRF_WEIGHT_CRITERIA",
+    "RRF_WEIGHT_DENSE",
     # --- re-ranking (Stage 3) ----------------------------------------------
     "CROSS_ENCODER_MODEL",
     "TOP_K_CANDIDATES",

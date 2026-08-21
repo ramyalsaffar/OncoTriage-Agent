@@ -172,6 +172,42 @@ BM25_RETRIEVAL_SIZE = 75  # Trials from BM25 search
 VECTOR_RETRIEVAL_SIZE = 100  # Trials from vector search
 RRF_POOL_SIZE = 100 # Maximum candidates passed from RRF fusion to cross-encoder input
 
+# --- Reciprocal Rank Fusion: the one owner of every fusion constant ---------
+#
+# RRF_K is read by BOTH fusion sites, and that single ownership is the point of
+# moving it here. Stage 2 (`node_hybrid_retrieval`) fuses four retrieval
+# CHANNELS; Stage 3 (`node_cross_encoder_rerank`) fuses the per-query rankings
+# of three RERANK QUERIES. Both are RRF over rank lists, both used 60, and the
+# module-level constant in `oncotriage/agent/retrieval.py` carried a comment
+# asserting it was "same as Stage 2 hybrid retrieval" -- a claim two independent
+# literals could only keep by hand. One name makes it true by construction.
+#
+# IF THE TWO STAGES EVER NEED TO DIVERGE, add a second NAMED constant here with
+# the measurement that justifies it (a rank-fusion k governs how fast the
+# contribution of a lower-ranked item decays, and the two stages fuse different
+# numbers of lists over different pool sizes, so a divergence is arguable). Do
+# not reintroduce a literal at either call site: that is the state this block
+# replaced.
+#
+# CHANGING ANY OF THESE CHANGES EVERY RANKING and therefore every downstream
+# verdict. Nothing on disk is invalidated -- fusion happens at query time and
+# writes no vectors -- but the twelve characterization fixtures would replay
+# with a different Stage 2 pool, so they would have to be recaptured, which
+# costs money. They are recorded in each fixture's environment "tunables" block
+# for exactly that reason: a replay difference caused by editing one of these is
+# reported as CONFIG MOVED SINCE CAPTURE rather than hunted as a refactor bug.
+RRF_K = 60  # Rank-fusion constant, both stages (Cormack et al. 2009)
+
+# Per-channel multipliers on the Stage 2 RRF contribution. Title and conditions
+# are weighted higher because a disease-name match in those fields is the
+# strongest relevance signal a trial record carries; criteria and the dense
+# vector are the broader, noisier channels and stay at parity. These four are
+# Stage 2 only -- Stage 3 fuses queries, not fields, and weights none of them.
+RRF_WEIGHT_TITLE      = 2.0   # title-bm25       (disease query)
+RRF_WEIGHT_CONDITIONS = 1.5   # conditions-bm25  (disease query)
+RRF_WEIGHT_CRITERIA   = 1.0   # criteria-bm25    (full expanded query)
+RRF_WEIGHT_DENSE      = 1.0   # dense vector     (full expanded query)
+
 # Temperature settings
 #
 # MATCHING_TEMPERATURE is None because gpt-5.6-terra REJECTS the parameter.

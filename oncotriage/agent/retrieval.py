@@ -71,7 +71,12 @@ from oncotriage.config import (
     MESH_BOOST_PAN_FLOOR,
     MESH_BOOST_PAN_FRACTION,
     QUALITY_THRESHOLD_PERCENTILE,
+    RRF_K,
     RRF_POOL_SIZE,
+    RRF_WEIGHT_CONDITIONS,
+    RRF_WEIGHT_CRITERIA,
+    RRF_WEIGHT_DENSE,
+    RRF_WEIGHT_TITLE,
     TOP_K_CANDIDATES,
     VECTOR_RETRIEVAL_SIZE,
 )
@@ -340,19 +345,24 @@ def node_hybrid_retrieval(state: TrialMatchState) -> dict:
       title-bm25:      Searched with disease query (R1).
                         Highest-weight signal. A disease name in the trial
                         title is the strongest relevance indicator.
-                        Weight: 2.0x in RRF fusion.
+                        Weight: config.RRF_WEIGHT_TITLE.
 
       conditions-bm25:  Searched with disease query (R1).
                         MeSH conditions + keywords + interventions.
-                        Weight: 1.5x in RRF fusion.
+                        Weight: config.RRF_WEIGHT_CONDITIONS.
 
       criteria-bm25:    Searched with full expanded query.
                         Contains gene names, biomarkers, staging.
-                        Weight: 1.0x in RRF fusion.
+                        Weight: config.RRF_WEIGHT_CRITERIA.
 
       dense vector:     Searched with full expanded query.
                         Semantic similarity via OpenAI embeddings.
-                        Weight: 1.0x in RRF fusion.
+                        Weight: config.RRF_WEIGHT_DENSE.
+
+    The four weights and the fusion constant config.RRF_K are cited by NAME
+    rather than restated as numerals: prose that repeats a value is a second
+    place the value lives, and it goes stale silently the first time the
+    constant is tuned.
 
     All 4 Qdrant queries run in parallel via ThreadPoolExecutor.
     Total latency = max(single query time), not sum.
@@ -408,14 +418,11 @@ def node_hybrid_retrieval(state: TrialMatchState) -> dict:
     _retrieval_mode = _ablation.get("retrieval_mode", "hybrid")
 
     # --- RRF weights per retrieval channel ---
-    # Title and conditions get higher weight because disease name match
-    # in these fields is the strongest relevance signal.
-    # Weights are applied as multipliers on the RRF contribution.
-    WEIGHT_TITLE      = 2.0
-    WEIGHT_CONDITIONS  = 1.5
-    WEIGHT_CRITERIA    = 1.0
-    WEIGHT_DENSE       = 1.0
-    RRF_K              = 60
+    # The five constants this fusion is a function of -- RRF_K and the four
+    # channel weights -- were function-local literals here and are owned by
+    # oncotriage/config.py now. The argument for the weighting moved with them.
+    # RRF_K is the SAME name Stage 3 reads, which is what makes "same k as
+    # Stage 2" a fact rather than a comment somebody has to maintain.
 
     # ------------------------------------------------------------------
     # Helper: run a single Qdrant sparse BM25 query
@@ -588,13 +595,13 @@ def node_hybrid_retrieval(state: TrialMatchState) -> dict:
     for nct_id in all_nct_ids:
         score = 0.0
         if nct_id in title_ranks:
-            score += WEIGHT_TITLE * (1.0 / (RRF_K + title_ranks[nct_id]))
+            score += RRF_WEIGHT_TITLE * (1.0 / (RRF_K + title_ranks[nct_id]))
         if nct_id in conditions_ranks:
-            score += WEIGHT_CONDITIONS * (1.0 / (RRF_K + conditions_ranks[nct_id]))
+            score += RRF_WEIGHT_CONDITIONS * (1.0 / (RRF_K + conditions_ranks[nct_id]))
         if nct_id in criteria_ranks:
-            score += WEIGHT_CRITERIA * (1.0 / (RRF_K + criteria_ranks[nct_id]))
+            score += RRF_WEIGHT_CRITERIA * (1.0 / (RRF_K + criteria_ranks[nct_id]))
         if nct_id in vector_ranks:
-            score += WEIGHT_DENSE * (1.0 / (RRF_K + vector_ranks[nct_id]))
+            score += RRF_WEIGHT_DENSE * (1.0 / (RRF_K + vector_ranks[nct_id]))
         fusion_scores[nct_id] = score
 
     ranked_nct_ids = sorted(
@@ -756,10 +763,6 @@ def node_hybrid_retrieval(state: TrialMatchState) -> dict:
             "hybrid_retrieval": round(elapsed, 3),
         },
     }
-
-
-# RRF constant for cross-encoder fusion (same as Stage 2 hybrid retrieval)
-RERANK_RRF_K = 60
 
 
 # Shape of the boost report when no boost pass ran at all. 'path' names which
@@ -1249,8 +1252,11 @@ def node_cross_encoder_rerank(state: dict) -> dict:
     # -----------------------------------------------------------------
     rrf_scores = {}
     for trial_idx, ranks in per_query_ranks.items():
+        # config.RRF_K, the same constant Stage 2's channel fusion reads.
+        # RERANK_RRF_K was a second literal 60 here whose comment claimed the
+        # two were equal; one owner makes that true by construction.
         rrf_scores[trial_idx] = sum(
-            1.0 / (RERANK_RRF_K + rank) for rank in ranks
+            1.0 / (RRF_K + rank) for rank in ranks
         )
 
     # Sort by fused RRF score, keep top-K

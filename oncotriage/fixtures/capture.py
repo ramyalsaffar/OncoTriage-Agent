@@ -227,7 +227,12 @@ from oncotriage.config import (
     MESH_BOOST_PAN_FRACTION,
     Project_Name,
     QUALITY_THRESHOLD_PERCENTILE,
+    RRF_K,
     RRF_POOL_SIZE,
+    RRF_WEIGHT_CONDITIONS,
+    RRF_WEIGHT_CRITERIA,
+    RRF_WEIGHT_DENSE,
+    RRF_WEIGHT_TITLE,
     TOP_K_CANDIDATES,
     VECTOR_RETRIEVAL_SIZE,
 )
@@ -2032,6 +2037,25 @@ def build_environment_block() -> Dict:
             "BM25_RETRIEVAL_SIZE": BM25_RETRIEVAL_SIZE,
             "VECTOR_RETRIEVAL_SIZE": VECTOR_RETRIEVAL_SIZE,
             "RRF_POOL_SIZE": RRF_POOL_SIZE,
+            # The RRF fusion constants themselves, per this dict's own
+            # doctrine: only what is recorded HERE is compared by File 46's
+            # diff_tunables(), so a fusion-weight edit would otherwise move
+            # every Stage 2 pool and be reported as a prefix difference with no
+            # cause attached -- an afternoon spent hunting a refactor bug for a
+            # one-line config change. RRF_K is one entry, not two, because both
+            # fusion sites read the one constant.
+            #
+            # FUTURE CAPTURES ONLY. diff_tunables() iterates the keys the
+            # FIXTURE recorded, not the keys this dict declares, so adding
+            # these cannot move, invalidate or re-report any of the twelve
+            # fixtures already on disk -- they replay clean, unchanged and
+            # without recapture. The five entries begin describing captures
+            # taken after this change.
+            "RRF_K": RRF_K,
+            "RRF_WEIGHT_TITLE": RRF_WEIGHT_TITLE,
+            "RRF_WEIGHT_CONDITIONS": RRF_WEIGHT_CONDITIONS,
+            "RRF_WEIGHT_CRITERIA": RRF_WEIGHT_CRITERIA,
+            "RRF_WEIGHT_DENSE": RRF_WEIGHT_DENSE,
             "TOP_K_CANDIDATES": TOP_K_CANDIDATES,
             "MAX_TRIALS_FOR_EVALUATION": MAX_TRIALS_FOR_EVALUATION,
             # Was RERANK_SCORE_THRESHOLD, a floor on the fused RRF score that

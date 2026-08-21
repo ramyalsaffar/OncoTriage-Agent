@@ -92,7 +92,6 @@ except ImportError:
 
 from oncotriage.agent.filtering import node_rule_based_filter
 from oncotriage.agent.retrieval import (
-    RERANK_RRF_K,
     apply_mesh_relevance_boost,
     apply_quality_gate,
     unboosted_score,
@@ -104,6 +103,12 @@ from oncotriage.config import (
     MESH_BOOST_PAN_FLOOR,
     MESH_BOOST_PAN_FRACTION,
     QUALITY_THRESHOLD_PERCENTILE,
+    # Was `RERANK_RRF_K` out of oncotriage.agent.retrieval. That module-level
+    # literal is deleted: both fusion sites read config.RRF_K now, and this
+    # simulation has to build its pool from the SAME constant the code under
+    # test fuses with, or the "realistic Stage 3 distribution" it claims to
+    # reproduce becomes a distribution of its own.
+    RRF_K,
 )
 
 
@@ -218,13 +223,14 @@ def make_candidate(nct_id: str, score: float, kind: str = "unmapped",
 def realistic_rrf_pool():
     """40 trials on a realistic Stage 3 RRF distribution.
 
-    RRF over 3 queries with k=60 puts the top trial near 3/60 and the last
-    near 3/99, which is the range the original simulation used. Eighteen
-    trials are unmappable — the population the boosted gate was cutting.
+    RRF over 3 queries at config.RRF_K puts the top trial near 3/RRF_K and
+    the last near 3/(RRF_K+39), which is the range the original simulation
+    used. Eighteen trials are unmappable — the population the boosted gate
+    was cutting.
     """
     pool = []
     for rank in range(40):
-        score = sum(1.0 / (RERANK_RRF_K + rank) for _ in range(3))
+        score = sum(1.0 / (RRF_K + rank) for _ in range(3))
         # Interleave so the MeSH kinds are not correlated with rank order:
         # every third trial is unmappable, the rest alternate direct/pan/other.
         kind = ["direct", "unmapped", "pan", "other", "unmapped"][rank % 5]
