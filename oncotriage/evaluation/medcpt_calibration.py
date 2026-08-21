@@ -109,6 +109,15 @@ REPORTED_PERCENTILES = (0, 1, 5, 10, 25, 50, 75, 90, 95, 99, 100)
 
 PATIENTS_PER_CANCER = 10
 
+# The total this measurement draws, derived from the two constants that produce
+# it -- select_patients() takes one group per CANCER_TYPES key. It is here for
+# the same reason sampling.SAMPLE_TOTAL is there: --help used to render
+# "(default 10, so 30 total)" with the 30 retyped, so raising the per-group
+# count would have left the flag's own help stating a total the run does not
+# draw. CANCER_TYPES is the sampler's, imported above, so a fourth group moves
+# this number too.
+SAMPLE_TOTAL = PATIENTS_PER_CANCER * len(CANCER_TYPES)
+
 
 #------------------------------------------------------------------------------
 
@@ -549,7 +558,8 @@ def main(argv=None) -> int:
     parser.add_argument("--patients-per-cancer", type=int,
                         default=PATIENTS_PER_CANCER,
                         help="how many of each of breast/colon/lung "
-                             f"(default {PATIENTS_PER_CANCER}, so 30 total)")
+                             f"(default {PATIENTS_PER_CANCER}, so "
+                             f"{SAMPLE_TOTAL} total)")
     parser.add_argument("--seed", type=int, default=SEED,
                         help=f"sampling seed (default {SEED})")
     parser.add_argument("--floor", type=float, default=None,

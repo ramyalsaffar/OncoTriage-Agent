@@ -349,6 +349,22 @@ BUCKETS = {
         "naturally and through a planted lookup, so the outcome does not "
         "depend on what the runner happens to have. Section 7 spawns one "
         "subprocess that imports the harness and takes a stamp"),
+    "test_evaluation_sample_naming.py": (
+        _A, None,
+        "ran green in 1.0s, 72 checks, against ONLY the directory skeleton "
+        "this script provisions -- and in fact against no data tree at all: "
+        "paths._RESOLVED is seeded with a scratch results root, so no glob "
+        "fires and default_output_db() never reaches the sibling tree. No "
+        "network, no keys, no spend, no live Qdrant, no model, no corpus, no "
+        "database, no git history and no subprocess. It EXECS NOTHING -- the "
+        "four plants are ast walks over in-memory copies -- and it writes "
+        "nothing outside a tempfile.mkdtemp it removes, so it is not in the "
+        "collision matrix either: the three files it READS are "
+        "oncotriage/evaluation/sampling.py, 28- Select Evaluation Sample.py "
+        "and oncotriage/evaluation/medcpt_calibration.py, written by none of "
+        "the matrix's two writers. It IMPORTS medcpt_calibration (section 7), "
+        "which reaches langgraph transitively -- inert at import, which "
+        "tests/test_package_invariants.py section 2 is what proves"),
     "test_extraction_histology.py": (
         _A, None, "ran green in 0.1s, 133 checks, identical in a depth-1 clone"),
     "test_extraction_stage_m_category.py": (

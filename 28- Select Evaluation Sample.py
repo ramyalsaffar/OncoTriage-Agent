@@ -86,6 +86,9 @@ except ImportError:
 import argparse
 
 from oncotriage.evaluation.sampling import (
+    SAMPLE_DB_FILENAME,
+    SAMPLE_DB_SUBDIR,
+    SAMPLE_TOTAL,
     default_output_db,
     default_source_db,
     select_samples,
@@ -98,10 +101,29 @@ from oncotriage.evaluation.sampling import (
 def _parse_args(argv=None):
     """Both paths default to None so the historical locations are resolved
     INSIDE the guard rather than while the parser is built -- they are lazy
-    globs over the sibling tree, and `--help` must not fire them."""
+    globs over the sibling tree, and `--help` must not fire them.
+
+    THE RENDERED NUMBERS COME FROM THE SAMPLER, NOT FROM THIS FILE. The
+    description used to say "30-patient" and the --output-db help used to quote
+    "03- 30 Samples db/inferences_sample_30.db", both retyped -- three literals
+    describing a default this file does not own, in the same file whose own
+    RENAME (pass 20e, from "28- Select 30 Samples.py") was argued on exactly
+    that ground. Widening the draw would have left the help advertising a
+    destination the program no longer writes to, and `--help` is the one place
+    a reader checks before overriding it. SAMPLE_DB_SUBDIR and
+    SAMPLE_DB_FILENAME are the same two strings default_output_db() joins onto
+    results_path, so the help cannot disagree with the default.
+
+    IMPORTING THEM RESOLVES NOTHING. All three are computed from
+    PATIENTS_PER_CANCER and CANCER_TYPES at the sampler's import -- one int and
+    two strings, no filesystem -- and the lazy glob is in default_output_db(),
+    which is still called only inside the guard. The {results_path}
+    placeholder is kept verbatim for that reason -- rendering the real
+    directory here would fire the glob while the parser is built.
+    """
     parser = argparse.ArgumentParser(
-        description="Extract a seeded, stratified 30-patient sample of "
-                    "inferences.db into its own database."
+        description=f"Extract a seeded, stratified {SAMPLE_TOTAL}-patient "
+                    "sample of inferences.db into its own database."
     )
     parser.add_argument(
         "--source-db", default=None,
@@ -110,7 +132,7 @@ def _parse_args(argv=None):
     parser.add_argument(
         "--output-db", default=None,
         help="Destination. REMOVED AND REBUILT if it exists. Default: "
-             "{results_path}/03- 30 Samples db/inferences_sample_30.db",
+             f"{{results_path}}/{SAMPLE_DB_SUBDIR}/{SAMPLE_DB_FILENAME}",
     )
     return parser.parse_args(argv)
 

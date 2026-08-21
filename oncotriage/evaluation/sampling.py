@@ -82,11 +82,77 @@ CANCER_TYPES = {
     "lung":   ["lung", "small cell", "non-small cell", "nsclc", "sclc"],
 }
 
+# THE SAMPLE TOTAL IS DERIVED FROM THE TWO CONSTANTS THAT PRODUCE IT: one group
+# per CANCER_TYPES key, PATIENTS_PER_CANCER drawn from each. select_samples()
+# computes the same product independently as `expected_total` and asserts the
+# output database matches it, so this is the number the draw actually produces
+# rather than a second declaration of it.
+SAMPLE_TOTAL = PATIENTS_PER_CANCER * len(CANCER_TYPES)
+
 # The historical output location, relative to results_path. File 28 spelled the
 # whole thing out from main_path; results_path is the glob-resolved parent, so a
 # renumbering of "04- Results" follows here as it does everywhere else.
-SAMPLE_DB_SUBDIR = "03- 30 Samples db"
-SAMPLE_DB_FILENAME = "inferences_sample_30.db"
+#
+# THE COUNT IN BOTH NAMES IS DERIVED, AND PASS 20e ARGUED THIS DOCTRINE FOR THE
+# ENTRY POINT'S FILENAME WHILE THESE TWO CONSTANTS WENT ON CARRYING THE NUMBER.
+# "28- Select 30 Samples.py" was renamed because "the old name baked the SAMPLE
+# SIZE into a filename, which is the one thing about this file most likely to
+# change" -- and then `03- 30 Samples db` and `inferences_sample_30.db` were
+# left stating the same fact as two more literals nothing checks. Widening the
+# draw to 20 per group would have written 60 patients into a file called
+# `inferences_sample_30.db`, silently, because a filename is not asserted by
+# anything. AT TODAY'S CONSTANTS BOTH DERIVED STRINGS ARE BYTE-IDENTICAL TO THE
+# HISTORICAL ONES (10 x 3 = 30), which is the acceptance criterion, and
+# tests/test_evaluation_sample_naming.py asserts that equivalence as a standing
+# check rather than as a one-off measurement.
+#
+# THE "03- " PREFIX IS NOT PART OF THE COUNT and stays a literal. It is sibling
+# tree POSITIONAL numbering, the same kind that names "04- Results" and "02-
+# Data"; deriving it from anything here would be inventing a relationship that
+# does not exist.
+#
+# ONE CONSTRUCTION SITE EACH: the two format strings below are the owners, the
+# two builders are the only things that interpolate them, and the two module
+# constants are the builders' output at SAMPLE_TOTAL. A caller drawing a
+# different size asks the builders; nothing re-spells either name.
+_SAMPLE_DB_SUBDIR_FORMAT = "03- {total} Samples db"
+_SAMPLE_DB_FILENAME_FORMAT = "inferences_sample_{total}.db"
+
+
+def _resolve_total(total) -> int:
+    """`None` means the module's own derivation. Anything else is coerced to int.
+
+    A float or a numeric string reaching a FILENAME would produce
+    ``inferences_sample_30.0.db`` -- a truthful-looking name for a file nothing
+    else would ever find again -- so the coercion is explicit and a value that
+    will not coerce raises here, naming this argument, rather than at the
+    ``os.path.join`` two frames down.
+    """
+    if total is None:
+        return SAMPLE_TOTAL
+    try:
+        return int(total)
+    except (TypeError, ValueError) as exc:
+        # Re-raised, never swallowed. int()'s own message names the VALUE and
+        # not the argument, and two frames further down the same bad value is
+        # an unreadable os.path.join failure.
+        raise ValueError(
+            f"sample total must be an integer count of patients; "
+            f"got {total!r} ({type(total).__name__})") from exc
+
+
+def sample_db_subdir(total=None) -> str:
+    """The results-relative subdirectory for a draw of ``total`` patients."""
+    return _SAMPLE_DB_SUBDIR_FORMAT.format(total=_resolve_total(total))
+
+
+def sample_db_filename(total=None) -> str:
+    """The database filename for a draw of ``total`` patients."""
+    return _SAMPLE_DB_FILENAME_FORMAT.format(total=_resolve_total(total))
+
+
+SAMPLE_DB_SUBDIR = sample_db_subdir()
+SAMPLE_DB_FILENAME = sample_db_filename()
 
 # The three tables copied into the output database, in the order File 28 read
 # them out of sqlite_master (ORDER BY name). drift_metrics is created empty and
@@ -130,13 +196,45 @@ def default_source_db() -> str:
         return _RESOLVED["source_db"]
 
 
-def default_output_db() -> str:
-    """Where the 30-patient extract has historically been written. Creates nothing."""
+def default_output_db(total=None) -> str:
+    """Where the extract goes. Creates nothing.
+
+    ``total=None`` is the historical location --
+    ``{results_path}/{SAMPLE_DB_SUBDIR}/{SAMPLE_DB_FILENAME}``, the two names
+    derived at SAMPLE_TOTAL -- and is what the entry point passes with no
+    flags. The constants are named here rather than their current values
+    written out, so this docstring cannot become the next stale spelling of
+    the count.
+
+    THE COUNT IS A PARAMETER BECAUSE THE DRAW SIZE IS ONE.
+    ``select_samples(..., patients_per_cancer=N)`` beside a bare
+    ``default_output_db()`` writes 3N patients into a file whose name says
+    SAMPLE_TOTAL, and nothing raises: the assertions at the end of ``select_samples`` check
+    the CONTENTS against ``patients_per_cancer``, never the name. A caller
+    drawing a different size passes that size here and gets a destination that
+    says what is in it.
+
+    THE CACHE IS KEYED ON THE COUNT, NOT ON A FIXED STRING. It used to key on
+    the literal ``"output_db"``, which is correct for a function taking no
+    argument and silently wrong for one that does: the first caller's answer
+    would be served to every later caller whatever count they asked for, so
+    ``default_output_db(2 * SAMPLE_TOTAL)`` after ``default_output_db()`` would
+    hand back the default-count path -- a plausible-looking destination that
+    ``select_samples`` then ``os.remove``s. Keying on the resolved int gives one entry per count
+    and keeps the property the cache exists for: ``paths.results_path`` is a
+    lazy glob over the sibling tree and is resolved once per process however
+    many counts are asked about. Bypassing the cache for non-default counts
+    would also be correct and was rejected -- it makes the fast path a special
+    case, and the failure it invites (a later edit "simplifying" the two
+    branches back into one) is exactly the defect above.
+    """
+    key = ("output_db", _resolve_total(total))
     with _RESOLVE_LOCK:
-        if "output_db" not in _RESOLVED:
-            _RESOLVED["output_db"] = os.path.join(
-                paths.results_path, SAMPLE_DB_SUBDIR, SAMPLE_DB_FILENAME)
-        return _RESOLVED["output_db"]
+        if key not in _RESOLVED:
+            _RESOLVED[key] = os.path.join(
+                paths.results_path,
+                sample_db_subdir(key[1]), sample_db_filename(key[1]))
+        return _RESOLVED[key]
 
 
 #------------------------------------------------------------------------------

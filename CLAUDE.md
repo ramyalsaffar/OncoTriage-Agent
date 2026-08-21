@@ -560,6 +560,18 @@ python tests/test_agent_rrf_config_ownership.py                     #  31
 # ~0.9 s.
 python tests/test_harness_endpoint_budget.py                        #  38
 
+# The sample-naming pass. Same shape, same directory. No network, no keys, no
+# spend, no live Qdrant, no model, no corpus, no database, no git history --
+# and no sibling data tree either: paths._RESOLVED is seeded with a scratch
+# results root, so no glob fires and default_output_db() never reaches it. NOT
+# in the collision matrix -- it writes nothing outside a tempfile.mkdtemp it
+# removes and then asserts gone, and the three repository files it reads
+# (oncotriage/evaluation/sampling.py, oncotriage/evaluation/medcpt_calibration.py
+# and "28- Select Evaluation Sample.py") are written by neither of the suite's
+# two writers. It EXECS NOTHING -- the five plants are `ast` walks over
+# in-memory copies -- so it needs no _EXEC_ALLOWLIST entry. ~1.0 s.
+python tests/test_evaluation_sample_naming.py                       #  72
+
 # Fixture state, CURRENT rather than as of any pass below: SCHEMA_VERSION
 # is 8, the twelve recordings on disk are v8, and `python fixture_replay.py`
 # is 12/12 clean with no recapture. Two accounts further down state
