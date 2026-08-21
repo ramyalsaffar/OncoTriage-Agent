@@ -442,6 +442,32 @@ BUCKETS = {
         "not in the collision matrix"),
     "test_storage_query_layer.py": (
         _A, None, "ran green in 2.6s, 191 checks, identical in a depth-1 clone"),
+    "test_trivyignore_staleness.py": (
+        _A, None,
+        "ran green in 0.85s, 173 checks, against ONLY the directory skeleton "
+        "-- and identically with ONCOTRIAGE_MAIN_PATH pointed at a directory "
+        "that does not exist, because it imports nothing from the package: "
+        "its subject is .github/scripts/trivyignore_staleness.py, a "
+        "standalone script that must run before anything is installed. Every "
+        "scenario DRIVES THAT SCRIPT AS A SUBPROCESS (sys.executable + its "
+        "path) with cwd set to the temp directory, which is also what "
+        "measures the script's claim that its defaults resolve off __file__ "
+        "rather than off the working directory. The Trivy report is a "
+        "miniature literal in the test file whose ADEQUACY is derived by AST "
+        "from the script (every data/result/vuln key the script reads must be "
+        "present), so a field it starts reading fails there rather than being "
+        "silently absent. It execs nothing and imports nothing from the "
+        "script, so section 1c of tests/test_package_invariants.py has "
+        "nothing to see and it needs no _EXEC_ALLOWLIST entry. No network, no "
+        "keys, no spend, no Docker daemon, no live Qdrant, no corpus, no "
+        "database, and no git history -- verified by running it green in a "
+        "four-file copy of the repository carrying no .git at all. NOT in the "
+        "collision matrix, derived: it writes NO repository file, everything "
+        "it writes is inside one tempfile.mkdtemp() it removes and then "
+        "asserts gone, and the three files it READS (the script, "
+        ".trivyignore, .github/workflows/ci.yml) are written by neither of "
+        "the suite's two writers -- all three sha256-compared in its section "
+        "15"),
     "test_tracking_mlflow_index.py": (
         _A, None,
         "ran green in 1.4s, 99 checks, against ONLY the directory skeleton: the "

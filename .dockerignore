@@ -23,6 +23,32 @@ ENV/
 .venv/
 venv.bak/
 
+# THE FIVE NAMES ABOVE ARE A NAME LIST, AND A NAME LIST ROTS. Docker matches
+# .dockerignore with Go's `filepath.Match` against the path relative to the
+# context root, where `*` does not cross a `/` -- so every one of them matches
+# a directory called `venv` AT THE ROOT and nothing at any depth. There is no
+# marker-based form: `.dockerignore` cannot be told "any directory carrying a
+# pyvenv.cfg", which is what `_is_virtualenv` in .github/scripts/static_checks.py
+# uses and is the reason that gate survives a venv this file could not name.
+#
+# `09- Testing/` is that gap, measured rather than argued. It holds nothing but
+# `ragas-venv/` -- a real, deliberately UNPINNED environment (see
+# oncotriage/evaluation/ragas_harness.py for why ragas is not a pipeline
+# dependency), 1.7 GB and 92,649 files -- plus a nested `.DS_Store`. It is
+# invisible to git (the venv writes its own `.gitignore` holding `*`), which is
+# why `git status` never mentioned it and why nothing here caught it either.
+# Docker does not read `.gitignore`, so `COPY . /app/` shipped all of it: the
+# image built on 2026-08-20 carried `/app/09- Testing` at 1.8 GB against 7 MB
+# for the whole of the rest of /app, and the build context was 1.65 GB.
+#
+# The WHOLE directory is excluded rather than the venv inside it, because
+# nothing in it is needed at runtime -- checked, not assumed: those two entries
+# are its entire contents, and the project-root sibling `09- Testing/` that
+# holds the characterization fixtures and evaluation runs is OUTSIDE this build
+# context and is unaffected. Named explicitly for the reason above: there is no
+# pattern that would have caught it.
+09- Testing/
+
 # Secrets and API Keys (CRITICAL - never bake into image)
 # ----------------------------------------------------------------------------
 .env
