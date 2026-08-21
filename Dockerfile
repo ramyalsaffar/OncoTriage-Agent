@@ -76,8 +76,29 @@
 # The fixable-only Trivy gate in .github/workflows/ci.yml is what makes that
 # non-optional rather than a chore somebody remembers: it fails on any HIGH or
 # CRITICAL that Debian HAS released a fix for, so the day a fix lands, CI goes
-# red and stays red until the digest moves. Today it is green with 208 OS
-# findings outstanding because Debian has fixed none of them.
+# red and stays red until the digest moves.
+#
+# THAT HAS NOW HAPPENED ONCE, AND THIS PARAGRAPH USED TO SAY IT NEVER HAD. It
+# read "Today it is green with 208 OS findings outstanding because Debian has
+# fixed none of them" — true when written, and false in both halves now.
+# RE-MEASURED 2026-08-20, Trivy 0.73.0, the FULL non-gating scan of the image
+# `make build` produces:
+#
+#     all OS findings          248   (98 LOW, 88 MEDIUM, 58 HIGH, 4 CRITICAL)
+#     OS findings WITH a fix    63   (9 LOW, 18 MEDIUM, 36 HIGH, 0 CRITICAL)
+#     what the GATE sees        36   (fixable, HIGH or CRITICAL)
+#     of those, unaccepted       0
+#
+# All 36 are the four util-linux ids of DSA-6442-1 spread across nine binary
+# packages. Debian HAS fixed them, the gate turned RED exactly as this argument
+# says it would, and it is green again only because those four ids are accepted
+# TEMPORARILY in `.trivyignore` — no published base image carries the fix yet,
+# measured there per digest. So "green" here now means "green with an expiry":
+# `.github/scripts/trivyignore_staleness.py` fails CI the day an accepted id
+# stops appearing in the scan, which is the day the acceptance is a lie.
+#
+# The four CRITICALs are still perl-base and Debian has still released no fix
+# for any of them, which is what `--ignore-unfixed` is for.
 #
 # ANY DIGEST CHANGE MUST BE FOLLOWED BY RUNNING THE IMAGE AND READING THE
 # INTERPRETER VERSION BACK:
@@ -309,6 +330,20 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # not released a fix for, the four CRITICALs among them all perl-base
 # (CVE-2026-13221, CVE-2026-42496, CVE-2026-57433, CVE-2026-8376), none with a
 # fixed version in the Debian tracker. There was nothing for the line to take.
+#
+# ADDENDUM 2026-08-20, AND IT DOES NOT REOPEN THE ARGUMENT ABOVE. The
+# measurement is left exactly as it was recorded — it is the evidence for the
+# revert and rewording it would make it describe an experiment nobody ran — but
+# read today one clause of it has stopped being true of the CURRENT scan, and a
+# present tense left alone becomes a claim. Re-measured on the same image with
+# the same Trivy 0.73.0: 248 OS findings, of which 63 DO have a fix (36 of them
+# HIGH, all four util-linux ids of DSA-6442-1, published 2026-08-14). The four
+# CRITICALs are unchanged: still perl-base, still unfixed.
+#
+# WHAT THAT DOES NOT MEAN. It is not "the upgrade would clear something today,
+# so put it back" — the paragraph below is the answer to exactly that, and the
+# route for these four is the digest, with a temporary acceptance in
+# `.trivyignore` while no published base image carries the fix.
 #
 # WHAT IT COST, WHICH IS WHY "IT CLEARS NOTHING TODAY" IS NOT NEUTRAL. Both
 # stages pin the base by sha256 digest. `apt-get upgrade` reaches the network

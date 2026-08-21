@@ -61,7 +61,11 @@
 #              staleness check would have failed on them otherwise.
 #   Trivy      fails on a fixable HIGH/CRITICAL that is not in `.trivyignore`.
 #              A second, non-gating step prints every severity including the
-#              unfixable ones.
+#              unfixable ones, and writes them as JSON. A third step reads that
+#              JSON and fails when an accepted `.trivyignore` id has STOPPED
+#              appearing — the staleness check pip-audit's gate already had,
+#              which matters most for the BASE-LAG entries, whose whole point is
+#              that they expire.
 #   gitleaks   fails on any finding not fingerprinted in `.gitleaksignore`,
 #              which holds exactly one entry, argued.
 #
@@ -410,10 +414,25 @@ jobs:
         # fixed by the digest pin and changing it is out of scope. Gating on
         # those would be a permanently-red check no commit can turn green.
         #
-        # What IS actionable is anything Debian has already patched, and the
-        # Dockerfile now runs `apt-get upgrade` so those are taken at build time
-        # rather than reported forever. The pairing is the point: the upgrade
-        # clears the fixable OS findings and this gate fails if any return.
+        # What IS actionable is anything Debian has already patched, and there
+        # is no `apt-get upgrade` in the Dockerfile taking those at build time.
+        # There was one; it is reverted, argued at STAGE 2 with the measurement
+        # that it cleared nothing and the reason it is not neutral (it reaches
+        # the network at build time, so two builds of one commit differ). THE
+        # ABSENCE IS THE MECHANISM, not a gap in it: a fixable OS finding has
+        # nowhere to go at build time, so this gate turns red the day Debian
+        # publishes a fix, and the only two ways out are
+        #
+        #   1. re-pin the digest on BOTH FROM lines to a base image that
+        #      carries the fix — the supported route, and the one this gate
+        #      exists to force; or
+        #   2. when no published base image carries it yet, accept the ids in
+        #      `.trivyignore` TEMPORARILY, with the removal condition written
+        #      beside them. That is what the BASE-LAG block there is.
+        #
+        # Route 2 is a delay, not a decision, and it is the reason for the
+        # `.trivyignore` staleness step below: the acceptance dies on its own
+        # the moment the finding stops appearing.
         #
         # `--ignorefile` points at the repository's `.trivyignore`, which lists
         # accepted findings ONE CVE AT A TIME with the constraint that blocks
@@ -450,18 +469,79 @@ jobs:
         # NO `--ignorefile` HERE, deliberately: this step's whole job is to show
         # the accepted findings too. Shares $RUNNER_TEMP/trivy-cache with the
         # gate, so the vulnerability database is downloaded once.
+        #
+        # IT WRITES JSON AND THEN RENDERS THE TABLE FROM THAT SAME FILE. There
+        # is no second scan: `trivy convert` re-renders a report it is handed,
+        # and the step after this one reads the JSON to check `.trivyignore`
+        # for stale entries. This scan is the only one that can answer that
+        # question, because it is the only one with no `--ignorefile`, every
+        # severity, and unfixed findings included — an accepted id is exactly
+        # what the gate is told not to show.
+        #
+        # THE TABLE IS UNCHANGED, AND THAT WAS MEASURED RATHER THAN ASSUMED:
+        # rendered through `convert` it is BYTE-IDENTICAL to what this step
+        # printed before (sha256 46776b55…, 2,503 lines, arm64 local image).
+        # `--severity` is repeated on the convert because without it the Total
+        # lines gain a `UNKNOWN: 0` column that the scan-time filter removes —
+        # two lines of difference, and the reason the flag is there.
         if: always()
         run: |
+          mkdir -p "$RUNNER_TEMP/trivy-cache" "$RUNNER_TEMP/trivy-reports"
+          # Removed BEFORE the scan, not after: if this scan fails, the step
+          # below must say "no report" rather than read a previous one. Hosted
+          # runners give each job a fresh RUNNER_TEMP and this is a no-op
+          # there; a self-hosted runner is where it earns its keep.
+          rm -f "$RUNNER_TEMP/trivy-reports/trivy-full.json"
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            -v "$RUNNER_TEMP/trivy-reports:/reports" \
             aquasec/trivy:0.73.0 image \
               --scanners vuln \
               --severity LOW,MEDIUM,HIGH,CRITICAL \
               --exit-code 0 \
               --timeout 20m \
               --no-progress \
+              --format json \
+              --output /reports/trivy-full.json \
               clinical-trial-patient-match:latest
+          docker run --rm \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            -v "$RUNNER_TEMP/trivy-reports:/reports" \
+            aquasec/trivy:0.73.0 convert \
+              --format table \
+              --scanners vuln \
+              --severity LOW,MEDIUM,HIGH,CRITICAL \
+              /reports/trivy-full.json
+
+      - name: .trivyignore staleness — an accepted id must still appear
+        # THE SAME CHECK THE pip-audit GATE ALREADY HAS, FOR THE OTHER SCANNER.
+        # `.github/scripts/audit_gate.py` exits 2 when an id in its accepted
+        # table has stopped appearing, on the argument that a dead exemption is
+        # re-read by the next person as a live constraint. `.trivyignore` had
+        # no such check, and it now holds entries whose whole point is that they
+        # EXPIRE — the BASE-LAG block, four util-linux ids that clear the moment
+        # a base image carrying Debian's fix is published. That block's own
+        # removal condition says leaving it there afterwards is the failure
+        # mode. This is what notices.
+        #
+        # IT FAILS THE JOB ON EXIT 2, WHICH IS THE POINT. It gates on the
+        # hygiene of the accepted table, never on vulnerabilities: it cannot
+        # make the Trivy gate greener and it never reads severity to decide
+        # anything. Exit 1 means the report was missing or unreadable and the
+        # comparison could not be made — including when the FULL step above
+        # failed, which is an honest cascade rather than a silent pass.
+        #
+        # `always()` for the same reason the FULL step has it: a red gate is
+        # exactly when a stale acceptance most needs to surface, and without it
+        # a gate failure would hide this one until the gate went green.
+        #
+        # No install: the script is stdlib-only, and the Python on PATH here is
+        # the one set up for the Makefile's version derivation.
+        if: always()
+        run: |
+          python .github/scripts/trivyignore_staleness.py \
+            --report "$RUNNER_TEMP/trivy-reports/trivy-full.json"
 
   # =========================================================================
   # SECRET SCAN — the full history, not the working tree
