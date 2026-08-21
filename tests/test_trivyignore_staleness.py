@@ -192,9 +192,17 @@ class Run:
 
 
 def run(ignorefile=None, report=None, workflow=None, gate_severity=None,
-        extra=None):
-    """Drive the shipped script. Absolute paths only, cwd deliberately elsewhere."""
-    argv = [sys.executable, _SCRIPT]
+        extra=None, script=None):
+    """Drive the shipped script. Absolute paths only, cwd deliberately elsewhere.
+
+    `script` points the run at a DIFFERENT copy of the script, which is how the
+    one control in this file that needs pre-fix behaviour gets it: a copy in
+    the temp directory with one line reverted. A copy is driven as a
+    subprocess exactly as the shipped one is -- nothing is exec'd, nothing is
+    imported, and the shipped file is never written -- so the mutated-copy rule
+    and the "no _EXEC_ALLOWLIST entry" property both hold.
+    """
+    argv = [sys.executable, script or _SCRIPT]
     if ignorefile is not None:
         argv += ["--ignorefile", ignorefile]
     if report is not None:
@@ -1157,17 +1165,65 @@ check_true("13f two ids on one line is reported as a trailing token rather "
            in (sect(_bad_shapes.out, "UNREADABLE LINES") or ""))
 check("13g ...and it exits 2", _bad_shapes.rc, 2)
 
-# A hyphenated lower-case word IS admitted by `_ID_RE`, and that is recorded
-# here as a measured property rather than left for someone to discover. It errs
-# toward reading a line as an entry, which then reports STALE -- so the
-# `13e` direction has a boundary, and this is where it is.
+# THIS CHECK USED TO PIN THE OPPOSITE, AND THAT IS THE POINT OF IT. `_ID_RE`
+# began `[A-Za-z]`, so a hyphenated LOWER-CASE phrase -- which is what a
+# half-written note looks like -- satisfied it, became an ENTRY, matched
+# nothing in the scan and was reported STALE. 13h recorded that as a measured
+# looseness rather than a desire. The regex now requires the first group to be
+# `[A-Z][A-Z0-9]*`, so such a line is UNREADABLE: it names itself and is fixed
+# in one edit, instead of sending a human to delete a line that was never an
+# entry. That is the direction the script's own comment says it must err in,
+# and 13e above is the general form of it.
 _LOOKS_LIKE_ID = "not-an-id"
 LOOSE_IGN, _ = ignore_file("loose.trivyignore", [_LOOKS_LIKE_ID])
 _loose = run(LOOSE_IGN, REPORT, WORKFLOW)
-check_true("13h MEASURED, NOT DESIRED: a hyphenated lower-case word satisfies "
-           "_ID_RE and is read as an id, so it is reported STALE rather than "
-           "UNREADABLE. Recorded so the boundary of 13e is known",
-           _LOOKS_LIKE_ID in (sect(_loose.out, "STALE ACCEPTED ENTRIES") or ""))
+check("13h a hyphenated lower-case phrase is UNREADABLE, not a phantom entry",
+      header_line(_loose.out, "UNREADABLE LINES"), "UNREADABLE LINES: 1")
+check_true("13h(ii) ...named as not-a-vulnerability-id rather than half-read",
+           f"{_LOOKS_LIKE_ID!r} is not a vulnerability id"
+           in (sect(_loose.out, "UNREADABLE LINES") or ""))
+check("13h(iii) ...and it is NOT reported stale, so nobody is told to delete a "
+      "line that was never an entry",
+      sect(_loose.out, "STALE ACCEPTED ENTRIES"), None)
+check("13h(iv) ...and the run exits 2, because an unreadable line is invisible "
+      "to staleness forever", _loose.rc, 2)
+
+# CONTROL: the same input against a COPY of the script with the first group
+# widened back to `[A-Za-z]`. Without it, 13h is satisfied by any script that
+# reports something unreadable, and the tightening it exists to hold could be
+# reverted without a failure. The plant is a RECORDED failure rather than an
+# exception, so a needle that stops matching fails here instead of killing the
+# file -- the rule this project restates every time a control aborts a run.
+_SCRIPT_SRC = open(_SCRIPT, encoding="utf-8").read()
+_TIGHT = 'r"^(?:[A-Z][A-Z0-9]*(?:-[A-Za-z0-9.]+)+"'
+_LOOSE_SRC = 'r"^(?:[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9.]+)+"'
+check("13h(v) CONTROL PRECONDITION: the shipped script carries the tightened "
+      "first group exactly once", _SCRIPT_SRC.count(_TIGHT), 1)
+if _SCRIPT_SRC.count(_TIGHT) == 1:
+    LOOSE_SCRIPT = write("reverted_id_re_staleness.py",
+                         _SCRIPT_SRC.replace(_TIGHT, _LOOSE_SRC))
+    _reverted = run(LOOSE_IGN, REPORT, WORKFLOW, script=LOOSE_SCRIPT)
+    check_true("13h(vi) CONTROL: with the first group widened back to "
+               "[A-Za-z], the same line becomes a phantom entry and is "
+               "reported STALE",
+               _LOOKS_LIKE_ID in (sect(_reverted.out,
+                                       "STALE ACCEPTED ENTRIES") or ""))
+    check("13h(vii) CONTROL: ...and is NOT reported unreadable there, so 13h "
+          "is discriminating between the two regexes rather than restating "
+          "something true of both",
+          sect(_reverted.out, "UNREADABLE LINES"), None)
+    check_true("13h(viii) CONTROL: the two runs genuinely disagree about this "
+               "line, which is what makes 13h a test of the tightening",
+               (sect(_loose.out, "UNREADABLE LINES") or "")
+               != (sect(_reverted.out, "UNREADABLE LINES") or ""))
+    check_true("13h(ix) ...and a REAL id parses identically under both, so the "
+               "control changed only the case rule and not the id shape",
+               run(CLEAN_IGN, REPORT, WORKFLOW, script=LOOSE_SCRIPT).rc
+               == _clean.rc == 0)
+else:
+    check("13h(vi-ix) CONTROL COULD NOT BE BUILT: the tightened first group "
+          "was not found in the shipped script, so four controls did not run",
+          "unplantable", "planted")
 
 
 # ===========================================================================

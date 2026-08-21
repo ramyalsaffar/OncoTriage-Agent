@@ -151,9 +151,32 @@ _FALLBACK_GATE_SEVERITY = "HIGH,CRITICAL"
 # itself and is fixed in one edit, whereas a line quietly read as an id would
 # be reported as STALE and tell a human to delete something that was never an
 # entry.
+#
+# THE FIRST GROUP IS UPPER-CASE, AND IT USED TO BE `[A-Za-z]`, WHICH ERRED THE
+# OTHER WAY. `not-an-id` — any hyphenated lower-case phrase, which is what a
+# half-written note looks like — satisfied the old pattern, became an ENTRY,
+# matched nothing in the scan and was reported STALE. That is precisely the
+# outcome the paragraph above says this must not produce: a human sent to
+# delete a line that was never an entry, on a report that named it as one.
+# Measured, not argued: `tests/test_trivyignore_staleness.py` check 13h pinned
+# that behaviour as a known looseness before it was closed, and now pins the
+# closure with the old regex driven as its control.
+#
+# ONLY THE FIRST GROUP TIGHTENS. Later groups keep `[A-Za-z0-9.]` because they
+# have to: GHSA ids are lower-case after the prefix (`GHSA-6v7p-g79w-8964`),
+# and requiring capitals there would reject a real id — the failure this
+# pattern is a SHAPE rather than a prefix list in order to avoid. Every id
+# class this project has met begins with capitals: CVE, GHSA, PYSEC, RUSTSEC,
+# DLA, DSA, TEMP, GO, RHSA, ALAS, ELSA, WS.
+#
+# THE RESIDUAL IS STATED RATHER THAN GLOSSED: an id whose PREFIX is genuinely
+# lower-case would now be reported UNREADABLE. That is the direction this file
+# chooses — it names itself, it is one edit to fix, and the fix is to widen
+# this pattern deliberately rather than to discover a phantom STALE entry and
+# delete a live exemption.
 _ID_RE = re.compile(
-    r"^(?:[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9.]+)+"    # hyphenated
-    r"|[A-Z][A-Z0-9]*[0-9][A-Z0-9]*)$"                # compact, e.g. DS002
+    r"^(?:[A-Z][A-Z0-9]*(?:-[A-Za-z0-9.]+)+"         # hyphenated
+    r"|[A-Z][A-Z0-9]*[0-9][A-Z0-9]*)$"               # compact, e.g. DS002
 )
 
 # Trivy's plain-text ignore format allows an optional expiry on the same line:

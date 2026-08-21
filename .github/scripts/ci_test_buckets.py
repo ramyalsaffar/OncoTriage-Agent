@@ -404,6 +404,30 @@ BUCKETS = {
         "files the suite's writers touch are neither read nor written "
         "(config.MATCHING_MODEL and config.DATA_SNAPSHOT_DATE are rebound as "
         "in-memory ATTRIBUTES and restored, which touches no file)"),
+    "test_dockerignore_exclusions.py": (
+        _A, None,
+        "ran green in 0.04s, 36 checks / 0 skipped, against ONLY the directory "
+        "skeleton -- and identically with ONCOTRIAGE_MAIN_PATH pointed at a "
+        "directory that does not exist, because it imports nothing from the "
+        "package: its subject is .dockerignore. It holds two things nothing "
+        "else in the repository does -- that every directory carrying a "
+        "pyvenv.cfg is named in .dockerignore (marker-based, so a renumber of "
+        "`09- Testing/` fails here instead of silently returning 1.7 GB to "
+        "the build context), and that the exclusion is not DEAD. IT CARRIES A "
+        "SKIP MECHANISM AND THAT IS LOAD-BEARING FOR CI: the only venv this "
+        "project has is untracked and self-ignored, so no hosted runner has "
+        "one, and the tree-dependent half records 2 SKIPS there rather than "
+        "failing -- a skip is not a pass and the count is printed even at "
+        "zero. Everything that reads the committed .dockerignore, and every "
+        "control, still runs on a runner, because the controls drive pure "
+        "functions with fabricated inputs. No network, no keys, no spend, no "
+        "Docker daemon, no live Qdrant, no corpus, no database, no git "
+        "history, no subprocess, and it execs nothing. NOT in the collision "
+        "matrix, derived: it writes no repository file, everything it writes "
+        "is four marker files inside one tempfile.mkdtemp() it removes and "
+        "then asserts gone, and .dockerignore -- the only repository file it "
+        "reads -- is written by neither of the suite's two writers and is "
+        "sha256-compared in its section 6"),
     "test_indexer_criteria_split_gate.py": (
         _A, None,
         "ran green in 0.78s, 109 checks, against ONLY the directory skeleton: "
@@ -444,7 +468,7 @@ BUCKETS = {
         _A, None, "ran green in 2.6s, 191 checks, identical in a depth-1 clone"),
     "test_trivyignore_staleness.py": (
         _A, None,
-        "ran green in 0.85s, 173 checks, against ONLY the directory skeleton "
+        "ran green in 0.9s, 181 checks, against ONLY the directory skeleton "
         "-- and identically with ONCOTRIAGE_MAIN_PATH pointed at a directory "
         "that does not exist, because it imports nothing from the package: "
         "its subject is .github/scripts/trivyignore_staleness.py, a "

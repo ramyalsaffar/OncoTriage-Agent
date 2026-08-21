@@ -518,6 +518,25 @@ python tests/test_tracking_mlflow_index.py                          #  99
 # _EXEC_ALLOWLIST. Bucket A, <1 s against only the CI skeleton.
 python tests/test_storage_packing_and_cache_columns.py              # 124
 
+# The CI-hygiene pair. Same shape, same directory. Neither imports anything
+# from the package -- their subjects are `.github/scripts/` and
+# `.dockerignore` -- so neither needs the corpus, a key, a database, a live
+# Qdrant, a Docker daemon or git history, and neither is in the collision
+# matrix. Bucket A.
+#
+# The staleness one DRIVES THE REAL SCRIPT AS A SUBPROCESS rather than
+# importing or exec'ing it, so the exit code (0/1/2, three different
+# instructions to a human) is what is asserted and no _EXEC_ALLOWLIST entry
+# is needed. ~0.9 s.
+python tests/test_trivyignore_staleness.py                          # 181 (was 173; the cleanup pass split 13h into four checks and five controls when _ID_RE was tightened)
+#
+# The .dockerignore one CARRIES A SKIP COUNTER, and that is load-bearing
+# rather than decoration: the only virtualenv this project has is untracked
+# and self-ignored, so no hosted runner has one and the tree-dependent half
+# records 2 SKIPS there instead of failing. Every control still runs on a
+# runner -- they drive pure functions with fabricated inputs. ~0.04 s.
+python tests/test_dockerignore_exclusions.py                        #  36 passed / 0 skipped here; 33 / 2 on a checkout with no virtualenv
+
 # Fixture state, CURRENT rather than as of any pass below: SCHEMA_VERSION
 # is 8, the twelve recordings on disk are v8, and `python fixture_replay.py`
 # is 12/12 clean with no recapture. Two accounts further down state
@@ -4416,6 +4435,240 @@ reported `max_gpt4o_retries`. `result["gpt4o_retries_exhausted"]` —
 `node_error_handler`'s deliberate alias for an external consumer — became
 `llm_classifier_retries_exhausted` with it. No caller in this repository reads
 either.
+
+### The accepted table gets a staleness gate (the trivyignore pass)
+
+**`.trivyignore` HAD NO CHECK, AND `audit_gate.py` ALREADY REFUSED THE SAME
+THING FOR pip-audit.** An id that has stopped appearing in the scan describes
+nothing and is re-read by the next person as a live constraint; Trivy is
+perfectly happy to be handed a file full of them and says so nowhere. The
+BASE-LAG block had made that concrete — four util-linux ids whose whole point
+is that they EXPIRE the moment a base image carrying Debian's fix is published,
+with a removal condition its own comment says "can be checked by a script".
+
+`.github/scripts/trivyignore_staleness.py` is that script. **It is not a second
+gate on vulnerabilities** — it never reads severity to decide anything and it
+cannot make the Trivy gate greener. It gates the HYGIENE of the accepted table,
+which is the axis the gate itself cannot see.
+
+**IT READS THE FULL, NON-GATING SCAN, AND ALL THREE OF THAT SCAN'S PROPERTIES
+ARE LOAD-BEARING** — every severity, fixed AND unfixed, and **no
+`--ignorefile`**. Read the GATE's output instead and every accepted entry looks
+stale, always, because the gate suppresses these ids by construction; the check
+would then demand the file delete itself.
+
+**THREE EXIT CODES, THREE DIFFERENT INSTRUCTIONS.** 0 is clean. **2** is "the
+accepted table needs a human" — a stale entry, a line the parser cannot read,
+or a duplicated id. **1** is "the comparison could not be made" — the report is
+missing, unreadable, not a Trivy report, or carries no vulnerability rows at
+all. The 1/2 split is the design rather than a detail: a run that could not
+read the scan has established nothing about the table, and exiting 2 there
+would send somebody to delete a live exemption on the strength of a scan of
+nothing. A degenerate report is the state the whole guard exists to catch, and
+the workflow has already lost an image to a `docker builder prune` once.
+
+**"NO LONGER APPEARS" IS THE WEAKEST TEST THAT IS STILL TRUE.** An entry that
+suppresses nothing at the gate TODAY — currently MEDIUM, or currently unfixed —
+is **INERT**, printed and never gated on: it is one vendor re-rating from
+mattering again, and deleting the entry deletes the argument with it.
+
+**THE COMMENT CORRECTIONS SHIPPED IN THE SAME COMMIT** (`6ab6d17`): a stale
+apt-upgrade note and a stale finding-count note, both describing a Dockerfile
+that had moved underneath them.
+
+### The ragas venv was inside every image, and the suite could not have said so
+
+**`03- Code/09- Testing/ragas-venv/` — 1.7 GB, 92,649 files — WAS IN `/app`.**
+Measured on the image built 2026-08-20: `/app` was **1.8 GB**, of which the
+whole of the rest of the project was **7 MB**. It matched none of the five venv
+patterns in `.dockerignore` because those are root-level names and it is
+nested, and `.dockerignore` has no marker-based form — it cannot be told "any
+directory carrying a `pyvenv.cfg`", which is what `_is_virtualenv` in
+`.github/scripts/static_checks.py` uses and is why that gate survived a venv
+this file could not name.
+
+**IT WAS INVISIBLE TO GIT, WHICH IS WHY NOTHING EVER MENTIONED IT.** The
+environment writes its own `.gitignore` holding `*`, so `git status` never
+reported it — and Docker does not read `.gitignore`.
+
+**Measured with a `--no-cache` probe that `du`s the context inside the
+container, because BuildKit's printed `transferring context` line is
+INCREMENTAL and not comparable across builds** — the second build printed
+16 kB, a delta, not a total:
+
+| | context bytes | files | `/app` | image |
+|---|---|---|---|---|
+| before | 1,676,935,983 | 92,890 | 1.8 G | 1,053,343,840 |
+| after | 7,256,315 | 241 | 7.5 M | 607,072,438 |
+
+The whole directory is excluded rather than the venv inside it: those two
+entries — `ragas-venv/` and a nested `.DS_Store` — are its entire contents.
+**The project-root sibling `09- Testing/`** (the characterization fixtures, the
+evaluation runs) **is outside this build context and is unaffected.**
+
+**AND THE STALENESS GATE GOT ITS OWN STANDING TESTS** in the same pass, as
+`tests/test_trivyignore_staleness.py` — 173 checks at the time. Every scenario
+**drives the real script as a subprocess** (`sys.executable` plus its path)
+rather than importing or exec'ing it, so section 1c of
+`tests/test_package_invariants.py` has nothing to see and no `_EXEC_ALLOWLIST`
+entry is needed — and so the thing asserted is the **exit code**, which is the
+script's contract and is precisely what an in-process call does not produce.
+Every run sets `cwd` to the temp directory, which is what turns the script's
+claim that its defaults resolve off `__file__` rather than off the working
+directory into a measurement.
+
+**THE MINIATURE TRIVY REPORT IS A LITERAL IN THE TEST FILE AND ITS ADEQUACY IS
+DERIVED, NOT ASSERTED.** The author of a fixture is the author of the
+assertions, so "it has the right fields" cannot be a list retyped there: the
+test parses the shipped script with `ast` and collects every key it reads out
+of a report (`data.get(...)`, `result.get(...)`, `vuln.get(...)`, and the
+`"Results" not in data` guard), then requires the miniature to carry all of
+them at the right nesting, with a non-degeneracy pin on the counts so a walk
+that matched nothing cannot pass for free.
+
+**FIFTEEN REVERTS, FIFTEEN CAUGHT**, each planted into a four-file copy of the
+repository with a realpath preflight asserting the COPY is what runs.
+
+**THE BRIEF THIS WAS BUILT FROM WAS WRONG ABOUT ONE EXIT CODE AND THE TEST IS
+WRITTEN TO THE CODE.** It asked for "unreadable lines exit 2 even alongside a
+degenerate report". Measured: the exit is **1** — `main()` returns from the
+degenerate-report guard above the final status check — and the UNREADABLE
+section is still printed, above the FATAL. That is the right behaviour for the
+1/2 reason above, and section 6b of the test argues it in place rather than
+asserting the brief.
+
+**THREE DEFECTS IN THE TEST'S OWN CODE WERE FOUND BY RUNNING, NOT BY READING**,
+and the second is the instructive one:
+
+- a positional argument bound to the wrong parameter **aborted the file** at
+  section 12 with no summary — the abort class this project has now shipped six
+  times, closed here by hardening every raise-capable expression (two
+  `header_line(...).startswith(...)` and a pair of `str.index()` calls would
+  each have raised on precisely the defect they test for);
+- the `--help` default-path assertion **passed for the wrong reason**: argparse
+  wraps long words MID-TOKEN, and collapsing whitespace to single spaces held
+  against the real repository only because its path happens to wrap at a space.
+  It failed against a byte-identical copy under a temp directory. **An
+  assertion that holds because of where a line happened to break has not been
+  tested**;
+- the test derived its root with `abspath` while the script derives its own
+  with `Path.resolve()`, which follows symlinks. Three checks failed in that
+  same copy for that reason alone (macOS `/var` -> `/private/var`).
+
+### Two depth patterns, a marker-based exclusion guard, and one tightened regex (the CI-hygiene cleanup pass)
+
+Four riders off the two passes above, each of which had recorded them as
+follow-ups it could not take. **No pipeline code, no gate weakened, and the
+only image content change is the two exclusions.** `fixture_replay.py` is
+**12/12 clean without recapture**, `tests/test_package_invariants.py` is
+unchanged at **247**, and the production `inferences.db` sha256 is unchanged.
+
+**1. `__pycache__` AND `.DS_Store` WERE STILL SHIPPING, FOR THE IDENTICAL
+REASON.** Both patterns were in `.dockerignore` and both matched at the context
+root only — and this project has neither at the root, so for the whole life of
+the file they excluded **nothing at all**. Measured inside the image: **18
+`__pycache__` directories holding 94 `.pyc` files, and 3 nested `.DS_Store`.**
+`**/__pycache__` and `**/.DS_Store` are added beside the root forms, which are
+kept.
+
+**THE `**` FORM IS DOCKER'S DOCUMENTED EXTENSION TO `filepath.Match`, NOT A
+COUNTEREXAMPLE TO THE NOTE ALREADY IN THE FILE.** Docker does not hand the
+pattern to `filepath.Match` unaltered; it defines `**` itself, matching any
+number of directories including none, precisely because that function's `*`
+cannot cross a `/`. So the "Test Files" note is still exactly right about a
+bare name or a `*` pattern.
+
+**AND THE DOCUMENTATION IS NOT WHAT THE LINE IS TRUSTED ON.** `**` handling has
+had real bugs in real build engines, and a pattern that silently matches
+nothing looks identical to a tree with nothing to exclude — which is how the
+root-level lines survived this long. It is trusted because the context was
+**exported and diffed**: 241 files -> 144, **exactly 97 removed** (94 `.pyc` +
+3 `.DS_Store`), **zero added, and zero removals outside those two classes** —
+and because the rebuilt image measures **0** `__pycache__` directories and
+**0** `.DS_Store` under `/app`. `/app` 7.5 M -> **4.6 M**; image 607,072,438 ->
+**605,890,086**.
+
+**2. THE EXCLUSION NOW HAS TO KEEP DESCRIBING SOMETHING**, in
+`tests/test_dockerignore_exclusions.py` — a **separate file** from the
+staleness one, argued there: same doctrine, different subject, different
+failure owner (a Docker-context change must not turn red a file named for the
+Trivy gate), and its evidence string, collision-matrix derivation and hygiene
+list each enumerate the three files it reads by name.
+
+**THE LOAD-BEARING CHECK IS MARKER-BASED, BECAUSE "THE LINE IS PRESENT" IS
+ITSELF A NAME THAT ROTS.** Renumber `09- Testing/` to `10- Testing/` and the
+line is still there, still true-looking, and 1.7 GB is silently back in the
+context. So the invariant held is: **every directory in the context carrying a
+`pyvenv.cfg` must have itself or an ancestor written out as a literal line in
+`.dockerignore`** — the same marker `_is_virtualenv` uses, for the same reason
+(the marker is what the thing IS; the name is what somebody called it). A
+rename then fails in **two voices**: the moved venv is undeclared (naming the
+venv) and the line covers nothing (naming the line).
+
+**IT DOES NOT REIMPLEMENT `.dockerignore` MATCHING**, deliberately. A second
+implementation of `filepath.Match` plus `**` would agree with Docker exactly
+until the day it did not. The check asks a strictly simpler question — is this
+path, or a directory above it, written out as a **literal** line — which is an
+UNDER-approximation (a venv excluded by a glob would read as undeclared) and is
+the right direction to be wrong in, because the repair is to name it, which is
+what the file's own comment asks for.
+
+**THE OBVIOUS FORM OF THIS CHECK IS RED IN CI FOREVER, AND THAT WAS MEASURED
+BEFORE IT WAS WRITTEN.** "Assert a `pyvenv.cfg` exists under the excluded path"
+cannot stand: `09- Testing/` is untracked and self-ignored, `git ls-files`
+returns nothing for it, and **no hosted runner will ever have it** — so that
+check passes on the author's machine and fails everywhere else, which is the
+shape `static_checks.py` records for the gate it had to narrow. The
+tree-dependent half is a **SKIP** when there is no environment to talk about,
+counted separately and **printed even at zero** on
+`tests/test_package_invariants.py`'s precedent. Everything reading the
+committed `.dockerignore` still runs in CI, and so does **every control**,
+because the controls drive pure functions with fabricated inputs rather than
+the filesystem. Six out-of-band scenarios, all six behaving as required: line
+deleted -> fails naming the path and the line; directory renamed -> fails in
+both voices; **no venv at all -> exit 0 with 2 SKIPS, not a pass and not a
+failure**; each depth pattern and each root pattern held independently.
+
+**3. `_ID_RE` ERRED IN THE DIRECTION ITS OWN COMMENT FORBIDS.** The first group
+was `[A-Za-z]`, so `not-an-id` — any hyphenated lower-case phrase, which is
+what a half-written note looks like — satisfied it, became an ENTRY, matched
+nothing in the scan and was reported **STALE**: a human sent to delete a line
+that was never an entry. It is `[A-Z][A-Z0-9]*` now, and such a line is
+UNREADABLE, which names itself and is one edit to fix.
+
+**ONLY THE FIRST GROUP TIGHTENS.** Later groups keep `[A-Za-z0-9.]` because
+they must: GHSA ids are lower-case after the prefix (`GHSA-6v7p-g79w-8964`).
+Verified rather than assumed — **all 21 entries in the committed `.trivyignore`
+parse, 0 unreadable**, and `CVE`, `GHSA`, `PYSEC`, `RUSTSEC`, `DLA`, `DSA`,
+`TEMP`, `GO`, `ALAS`, `ELSA`, `WS`, the compact `DS002` form and the
+`exp:YYYY-MM-DD` tail all still parse. **The set that changes class is exactly
+"first group contains a lower-case letter"** — that follows from the diff
+between the two patterns rather than from a sample, and no id class this
+project has met is in it.
+
+**THE RESIDUAL IS STATED RATHER THAN GLOSSED:** an id whose prefix is genuinely
+lower-case would now be UNREADABLE. **A pre-existing limit that this did NOT
+introduce and did not fix:** an id containing a colon (`RHSA-2024:0123`) was
+rejected before and is rejected now — `[A-Za-z0-9.]` has never admitted one.
+
+**Check 13h USED TO PIN THE OPPOSITE, and that is the point of it.** It
+recorded the looseness as measured-not-desired; it now pins the closure, in
+four checks, with **the old regex driven as its control** — a copy of the
+script in the temp directory with the one group widened back, run as a
+subprocess exactly as the shipped one is, so nothing is exec'd and the shipped
+file is never written. `tests/test_trivyignore_staleness.py` is **181** checks,
+was 173.
+
+**4. THE TWO PASSES ABOVE COULD NOT RECORD THEMSELVES**, because each brief
+constrained its own diff to the files it touched. This section and the two
+before it are that record, written now.
+
+**A DEFECT IN THE NEW TEST'S OWN CODE, FOUND BY RUNNING.** Its nested-
+`__pycache__` counter was a bare `os.walk`, which descends into
+`09- Testing/ragas-venv` and counted **4,521** — the venv's own caches, which
+are not in the build context at all and are not this project's. The answer
+about the context is **20**. A count that walks somewhere its subject does not
+is not a smaller number, it is a different question.
 
 ## Persistence and observability
 
