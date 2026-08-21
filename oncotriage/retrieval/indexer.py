@@ -89,10 +89,14 @@ from tqdm import tqdm
 
 from oncotriage import paths
 from oncotriage.config import (
+    CHARS_PER_TOKEN,
     COLLECTION_NAME,
+    EMBED_MAX_INPUTS_PER_REQUEST,
+    EMBED_TARGET_TOKENS_PER_REQUEST,
     EMBEDDING_DIM,
     EMBEDDING_MODEL,
     Project_Name,
+    QDRANT_UPSERT_BATCH_SIZE,
     get_openai_client,
     get_qdrant_client,
     trial_dict,
@@ -1243,12 +1247,13 @@ def get_embeddings_batch(texts: List[str]) -> List[List[float]]:
         )
         # WHAT THE API SAYS IT BILLED, recorded rather than discarded.
         #
-        # The batch size is derived from a chars/4 token PROXY, so this module
-        # has never known what an index build actually cost -- only what it
-        # guessed. An estimate that is never compared with a bill is a number
-        # nobody can be wrong about. Counted per call and reported by
-        # index_trials(); a response without usage is counted apart rather than
-        # treated as zero, because zero is also what a free call looks like.
+        # The batch size is derived from a characters/CHARS_PER_TOKEN token
+        # PROXY, so this module has never known what an index build actually
+        # cost -- only what it guessed. An estimate that is never compared with
+        # a bill is a number nobody can be wrong about. Counted per call and
+        # reported by index_trials(); a response without usage is counted apart
+        # rather than treated as zero, because zero is also what a free call
+        # looks like.
         usage = getattr(response, "usage", None)
         if usage is not None and getattr(usage, "prompt_tokens", None) is not None:
             EMBEDDING_USAGE["prompt_tokens"] += usage.prompt_tokens
@@ -1498,13 +1503,27 @@ class EmbeddingBudgetExceeded(RuntimeError):
     """
 
 
+# What the FALLBACK estimate was measured with, derived from the divisor rather
+# than typed beside it. Same construction and same reason as
+# PACKING_METHOD_CHARS in oncotriage/agent/evaluation.py: the label a consumer
+# reads and the arithmetic it describes are one declaration, so a change to
+# CHARS_PER_TOKEN cannot leave the label describing the previous divisor.
+ESTIMATE_METHOD_CHARS = f"chars/{CHARS_PER_TOKEN}"
+
+
 def estimate_embedding_cost(trials: List[Dict]) -> dict:
     """Exact token count and cost for embedding `trials`. Calls no API.
 
     Uses tiktoken when available -- the real encoder for the configured model,
     so the number is what will be billed rather than a proxy. Falls back to the
-    chars/4 heuristic the batch sizer uses, and SAYS WHICH, because a estimate
-    presented without its method invites the reader to trust the wrong digits.
+    characters/CHARS_PER_TOKEN heuristic the batch sizer uses, and SAYS WHICH,
+    because a estimate presented without its method invites the reader to trust
+    the wrong digits. The reported method string is DERIVED from the constant
+    the arithmetic divides by, on PACKING_METHOD_CHARS's precedent in
+    oncotriage/agent/evaluation.py: a method label typed out separately is a
+    second declaration of the same fact, and the two drift the first time the
+    constant moves -- silently, since the label is prose to every reader and to
+    every consumer of this dict.
 
     The import is inside the function on the project's standing exemption for
     third-party imports in function bodies: hoisting it would make importing
@@ -1518,8 +1537,8 @@ def estimate_embedding_cost(trials: List[Dict]) -> dict:
         method = "tiktoken"
     except Exception as exc:  # noqa: BLE001 - recorded, never silent
         EMBEDDING_USAGE[f"estimate_fallback:{type(exc).__name__}"] += 1
-        tokens = sum(len(t) for t in texts) // 4
-        method = "chars/4 (tiktoken unavailable)"
+        tokens = sum(len(t) for t in texts) // CHARS_PER_TOKEN
+        method = f"{ESTIMATE_METHOD_CHARS} (tiktoken unavailable)"
     return {"tokens": tokens, "method": method, "trials": len(trials),
             "cost_usd": get_model_cost(EMBEDDING_MODEL, tokens, 0)}
 
@@ -1530,7 +1549,10 @@ def index_trials(trials: List[Dict], collection_name: str):
 
     Embedding is batched dynamically: batch size is computed from the
     average text length of the actual trials so the per-request token
-    budget stays safely under the TARGET_TOKENS limit regardless of text length.
+    budget stays safely under config.EMBED_TARGET_TOKENS_PER_REQUEST
+    regardless of text length, and the input count under
+    config.EMBED_MAX_INPUTS_PER_REQUEST. Points are upserted to Qdrant in
+    fixed batches of config.QDRANT_UPSERT_BATCH_SIZE.
 
     Checkpoints progress by nct_id so interrupted runs resume without
     re-embedding already-indexed trials.
@@ -1635,26 +1657,43 @@ def index_trials(trials: List[Dict], collection_name: str):
         return
 
     # ------------------------------------------------------------------
-    # Dynamic embedding batch size.
-    # Uses character count as a token proxy (~4 chars per token).
-    # Targets 800K tokens per API request, capped at 2048 inputs.
-    # Computed from a sample of the first 50 trials.
+    # Dynamic embedding batch size, from config-owned bounds.
+    #
+    # Character count is the token proxy, at config.CHARS_PER_TOKEN characters
+    # per token -- the same constant the Stage 5 packer divides by, so the two
+    # estimators cannot drift apart. The average is taken over a sample of the
+    # first 50 trials rather than the whole corpus, because this only has to be
+    # roughly right: it sizes a request, it does not price one
+    # (estimate_embedding_cost() does that, exactly, with tiktoken).
+    #
+    # The batch is then the SMALLER of the two config bounds --
+    # EMBED_TARGET_TOKENS_PER_REQUEST divided by the per-trial estimate, and
+    # EMBED_MAX_INPUTS_PER_REQUEST outright -- so a corpus of short trials is
+    # capped by the input count and a corpus of long ones by the token budget,
+    # with a floor of one input so an implausibly long trial still ships.
+    #
+    # THE COMMENT THAT WAS HERE NAMED THREE NUMBERS AND WAS WRONG ABOUT ALL
+    # THREE: it claimed 800K tokens per request, a 2048-input cap and "~4 chars
+    # per token", over code that at that moment was reading 100,000, 750 and a
+    # local 4. Those three figures are a dated record of what was here and not a
+    # statement about what the constants hold now -- read config for that. Prose
+    # restating a live value is a hardcoding site with no compiler to catch it,
+    # which is why this comment names the constants instead.
     # ------------------------------------------------------------------
-    CHARS_PER_TOKEN   = 4
-    TARGET_TOKENS     = 100_000
-    MAX_INPUTS        = 750
-    QDRANT_BATCH_SIZE = 100
-
     sample_texts     = [create_trial_embedding_text(t) for t in remaining[:min(50, len(remaining))]]
     avg_chars        = sum(len(t) for t in sample_texts) / len(sample_texts)
     avg_tokens       = avg_chars / CHARS_PER_TOKEN
-    embed_batch_size = max(1, min(int(TARGET_TOKENS // avg_tokens), MAX_INPUTS))
+    embed_batch_size = max(1, min(int(EMBED_TARGET_TOKENS_PER_REQUEST // avg_tokens),
+                                  EMBED_MAX_INPUTS_PER_REQUEST))
 
     console.out(f"Dynamic embedding batch size: {embed_batch_size} "
-          f"(avg ~{avg_tokens:.0f} tokens/trial, target {TARGET_TOKENS:,} tokens/request)")
+          f"(avg ~{avg_tokens:.0f} tokens/trial, "
+          f"target {EMBED_TARGET_TOKENS_PER_REQUEST:,} tokens/request, "
+          f"cap {EMBED_MAX_INPUTS_PER_REQUEST:,} inputs/request)")
 
     # ------------------------------------------------------------------
-    # Embed in dynamic batches, upsert to Qdrant in fixed batches of 100.
+    # Embed in dynamic batches, upsert to Qdrant in fixed batches of
+    # config.QDRANT_UPSERT_BATCH_SIZE points.
     # nct_ids confirmed only AFTER successful upsert — no desync possible.
     # Checkpoint saved after each Qdrant upsert.
     # ------------------------------------------------------------------
@@ -1748,7 +1787,7 @@ def index_trials(trials: List[Dict], collection_name: str):
                 }
             ))
             batch_nct_ids.append(nct_id)
-            if len(points_batch) >= QDRANT_BATCH_SIZE:
+            if len(points_batch) >= QDRANT_UPSERT_BATCH_SIZE:
                 _flush_qdrant_batch()
 
         pbar.update(len(embed_buffer))
@@ -2055,10 +2094,11 @@ class IncompleteScrapeError(RuntimeError):
 EMBEDDING_USAGE = Counter()
 """What the embedding API reported it billed, across this process.
 
-`prompt_tokens` is the API's own number, not the chars/4 proxy the batch size
-is derived from. `calls_without_usage` counts responses that carried no usage
-block at all -- kept apart from a genuine zero, because an estimate compared
-against a silently-missing bill is worse than no comparison.
+`prompt_tokens` is the API's own number, not the characters/CHARS_PER_TOKEN
+proxy the batch size is derived from. `calls_without_usage` counts responses
+that carried no usage block at all -- kept apart from a genuine zero, because
+an estimate compared against a silently-missing bill is worse than no
+comparison.
 """
 
 CLEANUP_FAILURES = Counter()

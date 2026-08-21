@@ -43,11 +43,23 @@ carry controls built by mutating an ``ast`` COPY of the shipped source in
 memory -- nothing is exec'd, nothing on disk is touched, and this file needs no
 ``_EXEC_ALLOWLIST`` entry.
 
+A SECOND SUBJECT, ADDED LATER AND DECLARED HERE RATHER THAN BURIED
+--------------------------------------------------------------------
+Section 9 is not about ``criteria_split``. It holds the embedding batch
+block's ownership: that ``index_trials()`` sizes an embedding request and a
+Qdrant upsert from ``oncotriage/config.py`` constants rather than from
+literals in its own body, and that the fallback estimator divides by
+``CHARS_PER_TOKEN`` and derives its reported method label from that same
+constant. It lives here because it is the same shape as sections 4 and 8 --
+an ``ast`` scan of the shipped ``indexer.py`` with controls built by mutating
+a copy in memory -- and because the only other indexer test is bucket E for a
+lookup this needs nothing of. Its scope narrowing is argued at the section.
+
 BUCKET A. No network, no keys, no spend, no live Qdrant, no git history, no
 corpus, no database, no subprocess. It writes nothing anywhere and is not in
-the collision matrix: the only repository file it reads is
-``oncotriage/retrieval/indexer.py``, which neither of the suite's two writers
-writes.
+the collision matrix: the only repository files it reads are
+``oncotriage/retrieval/indexer.py`` and ``oncotriage/config.py`` (section 9,
+by import only), neither of which is written by the suite's two writers.
 """
 
 import ast
@@ -752,6 +764,285 @@ check("every reported field is on the log allowlist",
       sorted(_logged - set(LOGGABLE_FIELDS)), [])
 check_true("...and that comparison is non-degenerate", len(_logged) == 14)
 
+
+# ===========================================================================
+# SECTION 9 -- THE EMBEDDING BATCH BLOCK NAMES ITS CONSTANTS
+# ===========================================================================
+section("SECTION 9 -- the batch sizer names config, and holds no literals")
+
+# WHAT THIS SECTION IS ABOUT. index_trials() sized every embedding request and
+# every Qdrant upsert from four literals declared in its own body --
+# CHARS_PER_TOKEN = 4, TARGET_TOKENS = 100_000, MAX_INPUTS = 750,
+# QDRANT_BATCH_SIZE = 100 -- under a comment claiming 800K tokens, a 2048-input
+# cap and "~4 chars per token", which described none of them. The first of the
+# four was a second copy of config.CHARS_PER_TOKEN, the divisor the Stage 5
+# packer reads: two estimators agreeing by coincidence, with nothing that fails
+# when they stop.
+#
+# THE SCOPE IS DELIBERATELY NARROW, and the narrowing is stated rather than
+# implied. This does NOT scan index_trials() for numeric literals -- that
+# function is 300 lines and legitimately full of them (page sizes, retry
+# counts, percentages). It scans exactly the four statements that compute or
+# apply a batch bound, located by the name each assigns rather than by line
+# number, and it fails if any of the four cannot be found, so a rename is a
+# named failure instead of a scan that quietly covers nothing.
+#
+# LITERALS ARE JUDGED BY SYNTACTIC ROLE, NOT BY VALUE. Two numbers in those
+# statements are structural and must stay: max()'s floor of 1 (a batch of zero
+# inputs is not a smaller request, it is an empty one) and min()'s sample cap
+# of 50 (how many trials the average is taken over -- a measurement decision,
+# not a request bound). Pinning the literal SET to {1, 50} instead would pass
+# vacuously the day a bound is set to 50; pinning the role catches a literal
+# substituted for a config name wherever it lands.
+
+from oncotriage import config as _config  # noqa: E402
+
+_BOUND_NAMES = ("CHARS_PER_TOKEN", "EMBED_TARGET_TOKENS_PER_REQUEST",
+                "EMBED_MAX_INPUTS_PER_REQUEST", "QDRANT_UPSERT_BATCH_SIZE")
+
+
+def _assign(fn, target):
+    """The single Assign in `fn` whose sole target is Name `target`, or None."""
+    if fn is None:
+        return None
+    for node in ast.walk(fn):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == target):
+            return node
+    return None
+
+
+def _points_batch_test(fn):
+    """The `len(points_batch) >= <bound>` comparison, or None. NEVER raises."""
+    if fn is None:
+        return None
+    for node in ast.walk(fn):
+        if (isinstance(node, ast.Compare)
+                and "len(points_batch)" in ast.unparse(node)):
+            return node
+    return None
+
+
+def _batch_statements(tree):
+    """The four scanned nodes, by role. A missing one is None, never an abort."""
+    fn = _fn(tree, "index_trials")
+    return {
+        "sample_texts": _assign(fn, "sample_texts"),
+        "avg_tokens": _assign(fn, "avg_tokens"),
+        "embed_batch_size": _assign(fn, "embed_batch_size"),
+        "qdrant_flush": _points_batch_test(fn),
+    }
+
+
+def _names_in(node):
+    return set() if node is None else {
+        n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+
+def _numeric_roles(node):
+    """[(value, role)] for every numeric literal under `node`.
+
+    `role` is "<func>#<argument index>" when the literal is a direct positional
+    argument of a call, and "unbounded" otherwise -- which is what a literal
+    substituted into an arithmetic expression looks like, and is never allowed.
+    """
+    if node is None:
+        return []
+    roles = {}
+    for call in ast.walk(node):
+        if not isinstance(call, ast.Call):
+            continue
+        func = ast.unparse(call.func)
+        for i, arg in enumerate(call.args):
+            if isinstance(arg, ast.Constant) and isinstance(
+                    arg.value, (int, float)) and not isinstance(arg.value, bool):
+                roles[id(arg)] = (arg.value, f"{func}#{i}")
+    out = []
+    for lit in ast.walk(node):
+        if (isinstance(lit, ast.Constant) and isinstance(lit.value, (int, float))
+                and not isinstance(lit.value, bool)):
+            out.append(roles.get(id(lit), (lit.value, "unbounded")))
+    return sorted(out, key=lambda p: (str(p[0]), p[1]))
+
+
+def _block_roles(tree):
+    out = []
+    for node in _batch_statements(tree).values():
+        out.extend(_numeric_roles(node))
+    return sorted(out, key=lambda p: (str(p[0]), p[1]))
+
+
+_stmts = _batch_statements(_tree)
+for _role, _node in _stmts.items():
+    check_true(f"the {_role} statement is still findable", _node is not None)
+
+check("the token proxy is the config constant",
+      sorted(_names_in(_stmts["avg_tokens"]) & set(_BOUND_NAMES)),
+      ["CHARS_PER_TOKEN"])
+check("the batch size is bounded by the two config constants",
+      sorted(_names_in(_stmts["embed_batch_size"]) & set(_BOUND_NAMES)),
+      ["EMBED_MAX_INPUTS_PER_REQUEST", "EMBED_TARGET_TOKENS_PER_REQUEST"])
+check("the upsert threshold is the config constant",
+      sorted(_names_in(_stmts["qdrant_flush"]) & set(_BOUND_NAMES)),
+      ["QDRANT_UPSERT_BATCH_SIZE"])
+
+# The literal inventory, by role. Both survivors are argued above.
+check("the only numeric literals in the block are the two structural ones",
+      _block_roles(_tree), [(1, "max#0"), (50, "min#0")])
+
+# Nothing in index_trials() re-declares a bound locally, which is what the
+# deleted block WAS. A shadowing assignment would satisfy every name check
+# above while restoring the exact defect.
+_local_redeclares = sorted(
+    n for n in _BOUND_NAMES if _assign(_fn(_tree, "index_trials"), n) is not None)
+check("no bound is re-declared inside index_trials", _local_redeclares, [])
+
+# THE NAMES ARRIVE BY from-import, WHICH IS ALSO THE PATCH POINT. A check or a
+# harness that reached for oncotriage.config.EMBED_MAX_INPUTS_PER_REQUEST would
+# be patching a binding this module does not read -- the lesson
+# tests/test_agent_rrf_config_ownership.py exists to hold.
+_imported_from_config = set()
+for _node in ast.walk(_tree):
+    if isinstance(_node, ast.ImportFrom) and _node.module == "oncotriage.config":
+        _imported_from_config |= {a.name for a in _node.names}
+check("all four bounds are imported from oncotriage.config at module scope",
+      sorted(set(_BOUND_NAMES) - _imported_from_config), [])
+for _name in _BOUND_NAMES:
+    check_true(f"...and indexer.{_name} IS config's object",
+               getattr(indexer, _name) is getattr(_config, _name))
+
+# VALUE-PRESERVING, pinned. This pass moved four values and changed none.
+check("the four bounds still hold the values the local block held",
+      [_config.CHARS_PER_TOKEN, _config.EMBED_TARGET_TOKENS_PER_REQUEST,
+       _config.EMBED_MAX_INPUTS_PER_REQUEST, _config.QDRANT_UPSERT_BATCH_SIZE],
+      [4, 100_000, 750, 100])
+
+# The estimator's fallback: one divisor, and a method label derived from it.
+_est_fn = _fn(_tree, "estimate_embedding_cost")
+_fallback = None
+for _node in ast.walk(_est_fn) if _est_fn else []:
+    if isinstance(_node, ast.ExceptHandler):
+        _fallback = _node
+check_true("estimate_embedding_cost still has its tiktoken fallback",
+           _fallback is not None)
+# SCOPED TO THE `tokens = ...` ASSIGNMENT, not to the whole handler: the
+# handler also holds `EMBEDDING_USAGE[...] += 1`, a counter increment whose 1
+# is structural, and a check that banned it would be a ban on counting.
+_fallback_tokens = _assign(_fallback, "tokens") if _fallback else None
+check_true("...whose token count is computed in a findable assignment",
+           _fallback_tokens is not None)
+check_true("...which divides by CHARS_PER_TOKEN, not by a literal",
+           _fallback_tokens is not None
+           and "CHARS_PER_TOKEN" in ast.unparse(_fallback_tokens)
+           and _numeric_roles(_fallback_tokens) == [])
+check_true("...and reports a method DERIVED from that constant",
+           _fallback is not None
+           and "ESTIMATE_METHOD_CHARS" in ast.unparse(_fallback))
+_method_src = ast.unparse(_assign(_tree, "ESTIMATE_METHOD_CHARS") or ast.parse("x=0"))
+check_true("ESTIMATE_METHOD_CHARS is an f-string over the constant, not a "
+           "typed-out label", "CHARS_PER_TOKEN" in _method_src)
+check("...and the label it produces is the string it has always produced",
+      indexer.ESTIMATE_METHOD_CHARS, "chars/4")
+
+# CONTROLS, on mutated COPIES of the tree. Nothing is exec'd, nothing on disk
+# is touched, and each plant is the exact hardcoding this section forbids.
+class _Hardcode(ast.NodeTransformer):
+    def __init__(self, name, value):
+        self.name, self.value = name, value
+
+    def visit_Name(self, node):
+        if isinstance(node.ctx, ast.Load) and node.id == self.name:
+            return ast.copy_location(ast.Constant(value=self.value), node)
+        return node
+
+
+def _planted(name, value):
+    copy = ast.parse(_indexer_src)
+    fn = _fn(copy, "index_trials")
+    _Hardcode(name, value).visit(fn)
+    ast.fix_missing_locations(copy)
+    return copy
+
+
+_p_inputs = _planted("EMBED_MAX_INPUTS_PER_REQUEST", 750)
+check_true("CONTROL: the plant really substituted the name",
+           "EMBED_MAX_INPUTS_PER_REQUEST"
+           not in _names_in(_batch_statements(_p_inputs)["embed_batch_size"]))
+check_true("CONTROL: a literal 750 back in the batch size FAILS the name check",
+           sorted(_names_in(_batch_statements(_p_inputs)["embed_batch_size"])
+                  & set(_BOUND_NAMES)) != ["EMBED_MAX_INPUTS_PER_REQUEST",
+                                           "EMBED_TARGET_TOKENS_PER_REQUEST"])
+check("CONTROL: ...and appears in the literal inventory under its call role",
+      [r for r in _block_roles(_p_inputs) if r[0] == 750], [(750, "min#1")])
+
+_p_tokens = _planted("EMBED_TARGET_TOKENS_PER_REQUEST", 100_000)
+check_true("CONTROL: a literal 100_000 FAILS the literal inventory",
+           _block_roles(_p_tokens) != [(1, "max#0"), (50, "min#0")])
+
+_p_cpt = _planted("CHARS_PER_TOKEN", 4)
+check("CONTROL: a literal 4 for the proxy is caught as an unbounded literal",
+      [r for r in _block_roles(_p_cpt) if r[0] == 4], [(4, "unbounded")])
+check_true("CONTROL: ...and FAILS the proxy name check",
+           "CHARS_PER_TOKEN"
+           not in _names_in(_batch_statements(_p_cpt)["avg_tokens"]))
+
+_p_qdrant = _planted("QDRANT_UPSERT_BATCH_SIZE", 100)
+check("CONTROL: a literal 100 for the upsert threshold is caught",
+      [r for r in _block_roles(_p_qdrant) if r[0] == 100], [(100, "unbounded")])
+
+# A re-declared local, the shape of the deleted block itself.
+_p_local = ast.parse(_indexer_src)
+_p_local_fn = _fn(_p_local, "index_trials")
+_p_local_fn.body.insert(
+    0, ast.parse("EMBED_MAX_INPUTS_PER_REQUEST = 750").body[0])
+ast.fix_missing_locations(_p_local)
+check("CONTROL: a local re-declaration is reported",
+      sorted(n for n in _BOUND_NAMES
+             if _assign(_fn(_p_local, "index_trials"), n) is not None),
+      ["EMBED_MAX_INPUTS_PER_REQUEST"])
+
+# The from-import check, against a copy whose config import lost two names.
+_p_import = ast.parse(_indexer_src)
+for _node in ast.walk(_p_import):
+    if isinstance(_node, ast.ImportFrom) and _node.module == "oncotriage.config":
+        _node.names = [a for a in _node.names
+                       if a.name not in ("CHARS_PER_TOKEN",
+                                         "QDRANT_UPSERT_BATCH_SIZE")]
+_p_import_names = set()
+for _node in ast.walk(_p_import):
+    if isinstance(_node, ast.ImportFrom) and _node.module == "oncotriage.config":
+        _p_import_names |= {a.name for a in _node.names}
+check("CONTROL: a config import missing two bounds is reported, by name",
+      sorted(set(_BOUND_NAMES) - _p_import_names),
+      ["CHARS_PER_TOKEN", "QDRANT_UPSERT_BATCH_SIZE"])
+
+# The estimator's two checks, each against its own plant.
+_p_est = ast.parse(_indexer_src)
+_Hardcode("CHARS_PER_TOKEN", 4).visit(_fn(_p_est, "estimate_embedding_cost"))
+ast.fix_missing_locations(_p_est)
+_p_est_handler = None
+for _node in ast.walk(_fn(_p_est, "estimate_embedding_cost")):
+    if isinstance(_node, ast.ExceptHandler):
+        _p_est_handler = _node
+_p_est_tokens = _assign(_p_est_handler, "tokens")
+check("CONTROL: a re-hardcoded divisor in the fallback is caught",
+      _numeric_roles(_p_est_tokens), [(4, "unbounded")])
+check_true("CONTROL: ...and the plant really removed the name",
+           "CHARS_PER_TOKEN" not in ast.unparse(_p_est_tokens))
+
+_p_label = ast.parse(_indexer_src)
+_p_label_assign = _assign(_p_label, "ESTIMATE_METHOD_CHARS")
+_p_label_assign.value = ast.Constant(value="chars/4")
+ast.fix_missing_locations(_p_label)
+check_true("CONTROL: a typed-out method label FAILS the derivation check",
+           "CHARS_PER_TOKEN" not in ast.unparse(
+               _assign(_p_label, "ESTIMATE_METHOD_CHARS")))
+
+# A structural literal must NOT be reported, or the check is a ban on numbers.
+check_true("CONTROL: the shipped block passes the inventory it is judged by, "
+           "so the two structural literals are not false positives",
+           _block_roles(_tree) == [(1, "max#0"), (50, "min#0")])
 
 # ===========================================================================
 section("SUMMARY")

@@ -441,11 +441,13 @@ BUCKETS = {
         "sha256-compared in its section 6"),
     "test_indexer_criteria_split_gate.py": (
         _A, None,
-        "ran green in 0.78s, 109 checks, against ONLY the directory skeleton: "
-        "the criteria_split ingestion gate inside verify_collection. The "
-        "decision is a pure function of a counted distribution and every "
+        "ran green in 0.97s, 153 checks, against ONLY the directory skeleton: "
+        "the criteria_split ingestion gate inside verify_collection, plus "
+        "section 9's embedding-batch config ownership (declared in the file's "
+        "own docstring as a second subject). The gate decision is a pure "
+        "function of a counted distribution and every "
         "input here is a literal dict; the Qdrant scroll is driven against a "
-        "paging stand-in and the three structural checks mutate an ast COPY "
+        "paging stand-in and every structural check mutates an ast COPY "
         "in memory. No network, no keys, no spend, no live Qdrant, no git, no "
         "corpus, no database, no subprocess, and it execs nothing. NOTE the "
         "separation from test_indexer_admission_filters.py, which is bucket E "

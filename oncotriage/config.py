@@ -106,6 +106,49 @@ EMBEDDING_MODEL = "text-embedding-3-small"
 # Embedding dimensionality
 EMBEDDING_DIM = 1536
 
+# --- Index-build throughput: how an index build is CHUNKED -----------------
+#
+# These three bound the SIZE OF A REQUEST, and nothing else. They were
+# function-local literals in oncotriage/retrieval/indexer.py:index_trials()
+# under a comment describing values none of them had; the values here are the
+# ones that code has actually been running.
+#
+# THEY CHANGE HOW LONG AN INDEX BUILD TAKES AND NOT ONE VECTOR IT WRITES.
+# Embedding is per-text, so the same trial text embeds to the same vector
+# whether it arrived in a request of 1 input or 750, and Qdrant stores the same
+# point whether it was upserted alone or with 99 others. That is why they are
+# DELIBERATELY ABSENT from tracking.CONFIGURATION_PARAM_NAMES and from the
+# fixture tunables block in oncotriage/fixtures/capture.py, on those two
+# declarations' own doctrine: a parameter that cannot explain a difference
+# between two results is noise in a comparison of them. Do not "fix" either
+# omission -- MAX_WORKERS and the SQLite tunables are excluded for the same
+# reason and are named in tracking.py's argument.
+#
+# WHAT EACH BOUNDS. The batch sizer takes the smaller of the two embedding
+# bounds, so whichever binds first is the one in force:
+#   * EMBED_TARGET_TOKENS_PER_REQUEST -- the token budget per embeddings
+#     request, measured with the CHARS_PER_TOKEN proxy below over a sample of
+#     the corpus. Deliberately conservative, because the proxy is an estimate
+#     and the cost of over-shooting is a request the endpoint rejects part-way
+#     through a build.
+#   * EMBED_MAX_INPUTS_PER_REQUEST -- the cap on inputs in one request, which
+#     binds instead of the token budget whenever the corpus's trials are short.
+#
+#     NEITHER NUMBER IS A VENDOR LIMIT QUOTED HERE, and that is deliberate:
+#     both are OUR request policy, they are the values this code has been
+#     running, and this pass moved them without re-deriving them. The comment
+#     they replaced quoted an OpenAI ceiling ("800K tokens", "2048 inputs")
+#     that the code beneath it had not matched for as long as anyone can tell.
+#     Whoever raises one of these should check the endpoint's current limits
+#     themselves rather than trusting a figure written down in a config file.
+#   * QDRANT_UPSERT_BATCH_SIZE -- points per upsert call. This is Qdrant
+#     sizing, not OpenAI: it bounds one HTTP body and one checkpoint interval,
+#     because index_trials() confirms nct_ids and saves its checkpoint only
+#     after a successful upsert. Raising it makes a crash cost more re-embedding.
+EMBED_TARGET_TOKENS_PER_REQUEST = 100_000
+EMBED_MAX_INPUTS_PER_REQUEST = 750
+QDRANT_UPSERT_BATCH_SIZE = 100
+
 # LLM models
 #
 # MATCHING_MODEL is the string SENT to the API and the key looked up in
@@ -1180,10 +1223,17 @@ MATCHING_OUTPUT_SPLIT_FRACTION = 0.90
 # takes a 15-trial batch to 2 trials.
 MAX_TRUNCATION_SPLITS = 3
 
-# Characters per token. The same crude proxy File 11 uses for its embedding
-# batch sizing; kept identical so the two agree, and kept crude on purpose —
-# tiktoken would be a dependency and an import cost for an estimate whose job
-# is to be roughly right before a call that is about to measure it exactly.
+# Characters per token. ONE OWNER, READ BY BOTH USERS: the Stage 5 input packer
+# in oncotriage/agent/evaluation.py and the embedding batch sizer in
+# oncotriage/retrieval/indexer.py, which held its own local copy of this value
+# until the two were joined here. "Kept identical so the two agree" was the old
+# arrangement and it agreed by coincidence; an import agrees by construction.
+# Kept crude on purpose — tiktoken would be a dependency and an import cost for
+# an estimate whose job is to be roughly right before a call that is about to
+# measure it exactly. (The indexer's estimate_embedding_cost() DOES use tiktoken
+# when it is importable, because that number gates spend; this proxy is its
+# fallback, and the method it reports is derived from this constant so the two
+# cannot disagree.)
 #
 # IT IS ALSO THE INPUT-PACKING DIVISOR (see MATCHING_INPUT_TOKEN_BUDGET below),
 # and there it is deliberately CONSERVATIVE rather than accurate. Measured on
