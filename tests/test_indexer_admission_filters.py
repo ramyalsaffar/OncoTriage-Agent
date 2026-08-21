@@ -39,6 +39,7 @@ written by ``tests/test_registries_cancer_code_claims_audit_control.py`` or by
 """
 
 import ast
+import collections
 import os
 import re
 import subprocess
@@ -63,6 +64,7 @@ except ImportError:
 # it read a same-named copy.
 _CODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(oncotriage.__file__)))
 
+from oncotriage import config
 from oncotriage.registries import mesh as _mesh
 from oncotriage.retrieval import indexer
 
@@ -1276,22 +1278,118 @@ _DropNormalize().visit(_st_node)
 check_true("CONTROL: with the call stripped, the wiring check FAILS",
            "renormalize_criteria_derived_fields" not in _called_names(_st_node))
 
-# The generated DAG must not have moved by one byte, and must still carry no
-# splitter of its own -- the recompute belongs to index_trials, which the DAG
-# calls, so putting it in the DAG would be the second copy this avoids.
+# The generated DAG must still carry no splitter of its own -- the recompute
+# belongs to index_trials, which the DAG calls, so putting it in the DAG would
+# be the second copy this avoids.
+#
+# THE BYTE PIN AGAINST `git show HEAD:` IS REPLACED BY A LINE-SCOPED
+# EQUIVALENCE PROOF, AND THE REASON IS ARGUED HERE RATHER THAN THE CHECK BEING
+# QUIETLY DELETED. `_dag3d == _dag3d_head` was the criteria-split pass's
+# one-time claim that IT had not moved the DAG, hardened into a standing check
+# -- and pinning generated output to whatever HEAD happens to be has both
+# failure modes at once. It cannot fail after any change is committed (HEAD
+# then carries it, so the comparison agrees with the code by construction, the
+# defect this file's own revision selectors exist to avoid), and it fails in
+# the working tree of ANY deliberate DAG change, naming nothing about what
+# moved. The staging-name derivation is exactly such a change: the DAG built
+# `"trial_criteria_" + timestamp` while swapping onto `cfg["COLLECTION_NAME"]`,
+# so the two could name different families and the cleanup call below -- which
+# enumerates the ALIAS family -- would then have deleted from a family this
+# task never built.
+#
+# What replaces it says what the pin was for: the DAG differs from the
+# pre-change one ONLY in that derivation, every other differing line being a
+# comment. That is strictly more informative than a boolean, and unlike the
+# pin it survives the commit.
+import difflib  # noqa: E402
 from oncotriage.orchestration.dag_generator import build_dag_content  # noqa: E402
 
 _dag3d = build_dag_content(code_path="/x/code/", keys_path="/x/keys/",
                            data_trial_path="/x/data/")
-_dag3d_head = None
-_blob3d = _git("show", "HEAD:oncotriage/orchestration/dag_generator.py")
-if _blob3d.returncode == 0 and _blob3d.stdout:
-    _ns3d = {}
-    exec(compile(_blob3d.stdout, "<HEAD-dag>", "exec"), _ns3d)
-    _dag3d_head = _ns3d["build_dag_content"](
-        code_path="/x/code/", keys_path="/x/keys/", data_trial_path="/x/data/")
-check_true("the generated DAG is byte-identical to HEAD's",
-           _dag3d_head is not None and _dag3d == _dag3d_head)
+
+
+def _revision_with_literal_staging_name():
+    """Newest revision whose GENERATED DAG builds staging_name from a literal.
+
+    DERIVED BY AST OVER THE GENERATED TEXT, never by substring over the
+    generator. The current generator's own comment records the deleted literal,
+    so a substring search selects THIS commit and every control below then
+    tests the fix against itself -- the defect
+    tests/test_storage_query_layer.py had to learn.
+
+    The blob is exec'd rather than parsed for the template, because the
+    generator holds three %-formatted pieces that do not parse individually.
+    """
+    log = _git("log", "--format=%H", "--",
+               "oncotriage/orchestration/dag_generator.py")
+    if log.returncode != 0:
+        return None, None
+    for rev in log.stdout.split():
+        blob = _git("show", f"{rev}:oncotriage/orchestration/dag_generator.py")
+        if blob.returncode != 0 or not blob.stdout:
+            continue
+        try:
+            _ns = {}
+            exec(compile(blob.stdout, f"<dag-{rev[:7]}>", "exec"), _ns)
+            _text = _ns["build_dag_content"](code_path="/x/code/",
+                                             keys_path="/x/keys/",
+                                             data_trial_path="/x/data/")
+            _tree = ast.parse(_text)
+        except Exception:                                     # noqa: BLE001
+            continue
+        for _n in ast.walk(_tree):
+            if (isinstance(_n, ast.Assign)
+                    and any(getattr(t, "id", "") == "staging_name"
+                            for t in _n.targets)
+                    and any(isinstance(c, ast.Constant)
+                            and isinstance(c.value, str)
+                            and "trial_criteria" in c.value
+                            for c in ast.walk(_n.value))):
+                return rev, _text
+    return None, None
+
+
+_DAG_PRE_REV, _dag3d_pre = _revision_with_literal_staging_name()
+check_true("a pre-change revision of the DAG generator was located",
+           _dag3d_pre is not None)
+print(f"    DAG control revision: {(_DAG_PRE_REV or '?')[:12]}")
+
+
+def _staging_assignments(text):
+    """Every `staging_name = ...` line in a generated DAG, unparsed."""
+    return [ast.unparse(n) for n in ast.walk(ast.parse(text))
+            if isinstance(n, ast.Assign)
+            and any(getattr(t, "id", "") == "staging_name" for t in n.targets)]
+
+
+_pre_assign = _staging_assignments(_dag3d_pre or "pass")
+_now_assign = _staging_assignments(_dag3d)
+check("CONTROL: the pre-change DAG built the staging name from a LITERAL",
+      _pre_assign,
+      ["staging_name = 'trial_criteria_' + datetime.now()"
+       ".strftime('%Y%m%d_%H%M%S')"])
+check("FIXED: it is derived from the alias this task swaps onto",
+      _now_assign,
+      ["staging_name = alias + '_' + datetime.now()"
+       ".strftime('%Y%m%d_%H%M%S')"])
+_dag3d_consts = [n.value for n in ast.walk(ast.parse(_dag3d))
+                 if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                 and "trial_criteria" in n.value]
+check("no string literal anywhere in the generated DAG names the collection "
+      "family", _dag3d_consts, [])
+_diff = [ln for ln in difflib.unified_diff(
+             (_dag3d_pre or "").splitlines(), _dag3d.splitlines(),
+             lineterm="", n=0)
+         if ln[:1] in "+-" and not ln.startswith(("+++", "---"))]
+_diff_code = [ln[1:].strip() for ln in _diff
+              if ln[1:].strip() and not ln[1:].strip().startswith("#")]
+check("the generated DAG differs from the pre-change one ONLY in that "
+      "derivation -- every other differing line is a comment",
+      _diff_code,
+      ['staging_name = "trial_criteria_" + datetime.now().strftime("%Y%m%d_%H%M%S")',
+       'staging_name = alias + "_" + datetime.now().strftime("%Y%m%d_%H%M%S")'])
+check_true("...and the diff walk saw the comment lines too (non-degeneracy)",
+           len(_diff) > len(_diff_code))
 check_true("...and is non-degenerate", len(_dag3d) > 10_000)
 _dag3d_tree = ast.parse(_dag3d)
 check_true("the DAG's rebuild task reaches index_trials",
@@ -1514,6 +1612,335 @@ check_true("...and a poll interval smaller than the wait",
 # The wait loop must exit on green, or a green collection would still spin.
 check_true("the wait loop is conditioned on yellow, not on 'not green'",
            'while "yellow" in status' in _verify_src)
+
+
+
+# ===========================================================================
+# SECTION 4b -- ONE KNOB NAMES THE FAMILY AND THE PROTECTED TARGET
+# ===========================================================================
+section("SECTION 4b -- cleanup selects and protects the SAME collection family")
+
+# THE DEFECT THIS COVERS IS DESTRUCTIVE RATHER THAN INERT. The candidate filter
+# hardcoded the family prefix `"trial_criteria_"` while the protection half
+# honoured the `alias_name` PARAMETER, so a caller passing any other alias
+# enumerated ONE family and protected a target from ANOTHER. The deletion loop
+# then removed members of a family it was never asked about, and left the
+# family it WAS asked about untouched -- two wrongs at once, neither of which
+# raises, and both of which look like a successful cleanup in the log.
+#
+# It is invisible on the default path by construction, which is why nothing
+# caught it: config.COLLECTION_NAME is "trial_criteria", so the literal and the
+# parameter agreed for every call site in this repository.
+
+_FAM_A = _ORDERED                                     # the config-alias family
+_FAM_B = ["scratch_index_20260101_000000",
+          "scratch_index_20260201_000000",
+          "scratch_index_20260301_000000",
+          "scratch_index_20260401_000000"]
+_ALIAS_A = config.COLLECTION_NAME
+_ALIAS_B = "scratch_index"
+
+check("the fixture's two families are disjoint (non-degeneracy)",
+      sorted(set(_FAM_A) & set(_FAM_B)), [])
+check_true("...and the second alias is genuinely not the configured one",
+           _ALIAS_B != _ALIAS_A and _ALIAS_A == "trial_criteria")
+
+
+def _both_families(alias_targets):
+    """A recording client holding BOTH families and BOTH aliases."""
+    return _RecordingClient(_FAM_A + _FAM_B, alias_targets)
+
+
+# --- the PRE-CHANGE cleanup, reproduced exactly ----------------------------
+#
+# Family filter hardcoded, protection parameterised: the shipped shape before
+# this change. Reproduced here for readability, and then CHECKED against a real
+# AST-patched copy of the shipped function below -- a retyped control tests the
+# retyping, so it is not trusted on its own.
+def _prechange_cleanup(client, keep_recent=2, alias_name="trial_criteria"):
+    if keep_recent < 2:
+        keep_recent = 2
+    timestamped = [c.name for c in client.get_collections().collections
+                   if c.name.startswith("trial_criteria_")
+                   and c.name != "trial_criteria"]
+    timestamped.sort(reverse=True)
+    live = next((a.collection_name for a in client.get_aliases().aliases
+                 if a.alias_name == alias_name), None)
+    to_keep = timestamped[:keep_recent]
+    to_delete = [n for n in timestamped[keep_recent:] if n != live]
+    if live and live not in to_keep:
+        to_keep = to_keep + [live]
+    for name in to_delete:
+        client.delete_collection(collection_name=name)
+    return to_keep
+
+
+# --- an AST-patched copy of the SHIPPED function, with the fix reverted -----
+#
+# The only control that can show the shipped code's behaviour ON THE DEFAULT
+# PATH is unchanged AND its behaviour on a non-default alias is not: `git show`
+# cannot supply it once this work is committed, and the reverted state is a
+# one-token edit inside a function body, so there is no attribute to rebind.
+# The copy is exec'd into a namespace carrying the module's real collaborators.
+def _reverted_cleanup_factory():
+    """cleanup_old_collections with the family derivation reverted to a literal."""
+    fn = next((n for n in ast.walk(_indexer_tree)
+               if isinstance(n, ast.FunctionDef)
+               and n.name == "cleanup_old_collections"), None)
+    if fn is None:
+        return None, "cleanup_old_collections was not found in the shipped AST"
+    src = ast.get_source_segment(_indexer_src, fn) or ""
+    if "prefix = staging_prefix(alias_name)" not in src:
+        return None, "the shipped source no longer derives the prefix from the parameter"
+    planted = src.replace("prefix = staging_prefix(alias_name)",
+                          'prefix = "trial_criteria_"', 1)
+    planted = planted.replace("c.name.startswith(prefix) and c.name != alias_name",
+                              'c.name.startswith(prefix) and c.name != "trial_criteria"', 1)
+    if planted == src:
+        return None, "the plant changed nothing"
+    # A REAL Counter, not a stand-in: `CLEANUP_FAILURES[k] += 1` resolves
+    # __getitem__ on the TYPE, so a SimpleNamespace carrying the dunders as
+    # INSTANCE attributes answers nothing and the copy would raise from inside
+    # the handler that exists to record a delete failure. A fresh Counter also
+    # keeps the copy from mutating the shipped module's own counter.
+    ns = {"console": indexer.console, "log": indexer.log,
+          "CLEANUP_FAILURES": collections.Counter(),
+          "COLLECTION_NAME": config.COLLECTION_NAME,
+          "staging_prefix": indexer.staging_prefix,
+          "get_qdrant_client": lambda: _REVERTED_CLIENT[0],
+          "resolve_alias_target": lambda a: next(
+              (x.collection_name for x in _REVERTED_CLIENT[0].get_aliases().aliases
+               if x.alias_name == a), None)}
+    exec(compile(ast.parse(planted), "<reverted-cleanup>", "exec"), ns)
+    return ns["cleanup_old_collections"], None
+
+
+_REVERTED_CLIENT = [None]
+_reverted_cleanup, _revert_problem = _reverted_cleanup_factory()
+check_true("a reverted copy of the shipped cleanup was built "
+           f"({_revert_problem or 'ok'})", _reverted_cleanup is not None)
+
+
+def _run_reverted(client, **kw):
+    """Drive the reverted copy; return None, or a NAMED ABSENCE never a raise.
+
+    A CONTROL THAT ABORTS IS NOT A CONTROL. The plant's anchor is the very line
+    the shipped fix introduced, so the one edit this section exists to catch --
+    reverting the derivation in the shipped file -- is also the edit that makes
+    the copy unbuildable. Calling `None(**kw)` there raises TypeError at module
+    level and takes every check below it down with it -- MEASURED, not
+    predicted: the revert harness reported one traceback where the run owed
+    ELEVEN failures, the shape this project has now shipped seven times. The
+    marker is returned so `check()` FAILS and names what was missing.
+    """
+    if _reverted_cleanup is None:
+        return f"<no reverted copy: {_revert_problem or 'unknown'}>"
+    _REVERTED_CLIENT[0] = client
+    try:
+        _reverted_cleanup(**kw)
+    except Exception as exc:                                  # noqa: BLE001
+        return f"<the reverted copy raised {type(exc).__name__}: {exc}>"
+    finally:
+        _REVERTED_CLIENT[0] = None
+    return None
+
+
+# --- 1. THE DEFAULT PATH IS UNCHANGED, three ways --------------------------
+_c_ship = _both_families({_ALIAS_A: _FAM_A[-1], _ALIAS_B: _FAM_B[-1]})
+_with_client(_c_ship, lambda: indexer.cleanup_old_collections())
+
+_c_pre = _both_families({_ALIAS_A: _FAM_A[-1], _ALIAS_B: _FAM_B[-1]})
+_prechange_cleanup(_c_pre, keep_recent=2, alias_name=_ALIAS_A)
+
+_c_rev = _both_families({_ALIAS_A: _FAM_A[-1], _ALIAS_B: _FAM_B[-1]})
+_rev_absent = _run_reverted(_c_rev, keep_recent=2, alias_name=_ALIAS_A)
+
+check("VALUE-PRESERVING: the shipped cleanup on the default alias deletes "
+      "exactly what the PRE-CHANGE logic deleted",
+      sorted(_c_ship.deleted), sorted(_c_pre.deleted))
+check("VALUE-PRESERVING: ...and exactly what the AST-REVERTED shipped "
+      "function deletes, which is the control that does not depend on the "
+      "reproduction above being faithful",
+      _rev_absent or sorted(_c_rev.deleted), sorted(_c_ship.deleted))
+check("...and that set is the two oldest of the configured family",
+      sorted(_c_ship.deleted), sorted(_FAM_A[:-2]))
+check_true("...and it is non-empty, so the agreement is not vacuous",
+           len(_c_ship.deleted) > 0)
+check("...and the OTHER family is untouched on the default path",
+      [n for n in _c_ship.deleted if n in _FAM_B], [])
+
+# --- 2. A NON-DEFAULT ALIAS: selection and protection agree ----------------
+_c_ship2 = _both_families({_ALIAS_A: _FAM_A[-1], _ALIAS_B: _FAM_B[-1]})
+_with_client(_c_ship2, lambda: indexer.cleanup_old_collections(
+    keep_recent=2, alias_name=_ALIAS_B))
+
+check("FIXED: a non-default alias deletes from ITS OWN family",
+      sorted(_c_ship2.deleted), sorted(_FAM_B[:-2]))
+check("FIXED: ...and deletes NOTHING from the family it was not asked about",
+      [n for n in _c_ship2.deleted if n in _FAM_A], [])
+check_true("FIXED: the alias target survives",
+           _FAM_B[-1] not in _c_ship2.deleted)
+check_true("FIXED: ...and so does the rollback target beside it",
+           _FAM_B[-2] not in _c_ship2.deleted)
+
+# CONTROL: the same call against the pre-change logic deletes the WRONG family.
+_c_pre2 = _both_families({_ALIAS_A: _FAM_A[-1], _ALIAS_B: _FAM_B[-1]})
+_prechange_cleanup(_c_pre2, keep_recent=2, alias_name=_ALIAS_B)
+check("CONTROL: the PRE-CHANGE logic deletes members of the family it was NOT "
+      "asked about (cross-family deletion)",
+      sorted(_c_pre2.deleted), sorted(_FAM_A[:-2]))
+check("CONTROL: ...and deletes nothing at all from the family it WAS asked "
+      "about, so the cleanup it was asked for never happened",
+      [n for n in _c_pre2.deleted if n in _FAM_B], [])
+
+# CONTROL, from the real function rather than the reproduction: the AST-patched
+# copy of the SHIPPED source, with only the derivation reverted.
+_c_rev2 = _both_families({_ALIAS_A: _FAM_A[-1], _ALIAS_B: _FAM_B[-1]})
+_rev_absent2 = _run_reverted(_c_rev2, keep_recent=2, alias_name=_ALIAS_B)
+check("CONTROL: the AST-REVERTED shipped function does the same cross-family "
+      "deletion, so the reproduction above is faithful",
+      _rev_absent2 or sorted(_c_rev2.deleted), sorted(_FAM_A[:-2]))
+check_true("CONTROL: ...and the shipped function and the reverted one "
+           "genuinely disagree here (non-degeneracy)",
+           sorted(_c_ship2.deleted) != sorted(_c_rev2.deleted))
+
+# --- 3. THE OUT-OF-WINDOW WARNING STILL FIRES, on a non-default alias ------
+#
+# The alias points at the OLDEST member of its own family, which is what a
+# failed or skipped swap leaves behind. It must be kept AND reported.
+class _ConsoleRecorder:
+    def __init__(self):
+        self.lines = []
+
+    def out(self, *args, **kwargs):
+        self.lines.append(" ".join(str(a) for a in args))
+
+    def banner(self, *args, **kwargs):
+        self.out(*args)
+
+
+def _with_console(recorder, fn):
+    original = indexer.console
+    indexer.console = recorder
+    try:
+        return fn()
+    finally:
+        indexer.console = original
+
+
+_rec = _ConsoleRecorder()
+_c_warn = _both_families({_ALIAS_A: _FAM_A[-1], _ALIAS_B: _FAM_B[0]})
+_with_console(_rec, lambda: _with_client(
+    _c_warn, lambda: indexer.cleanup_old_collections(
+        keep_recent=2, alias_name=_ALIAS_B)))
+
+check_true("the live collection is kept even when it sorts oldest, under a "
+           "non-default alias", _FAM_B[0] not in _c_warn.deleted)
+_warnings = [ln for ln in _rec.lines if "NOT in the" in ln and "WARNING" in ln]
+check("the out-of-keep-window WARNING fired exactly once", len(_warnings), 1)
+check_true("...and it names the alias it was asked about",
+           _ALIAS_B in (_warnings[0] if _warnings else ""))
+check_true("...and names the collection the alias points at",
+           _FAM_B[0] in (_warnings[0] if _warnings else ""))
+check_true("...and the recorder captured output at all (non-degeneracy)",
+           len(_rec.lines) > 1)
+check("...and still nothing from the other family was deleted",
+      [n for n in _c_warn.deleted if n in _FAM_A], [])
+
+# --- 4. THE keep_recent FLOOR STILL APPLIES, on a non-default alias --------
+_c_floor = _both_families({_ALIAS_A: _FAM_A[-1], _ALIAS_B: _FAM_B[-1]})
+_with_client(_c_floor, lambda: indexer.cleanup_old_collections(
+    keep_recent=1, alias_name=_ALIAS_B))
+check_true("keep_recent=1 is still floored to 2 under a non-default alias",
+           _FAM_B[-2] not in _c_floor.deleted)
+check("...and the floored run deletes exactly the two oldest of that family",
+      sorted(_c_floor.deleted), sorted(_FAM_B[:-2]))
+
+# --- 5. NOTHING TO DO IS NOT AN ERROR --------------------------------------
+_c_none = _RecordingClient(_FAM_A, {_ALIAS_A: _FAM_A[-1]})
+_with_client(_c_none, lambda: indexer.cleanup_old_collections(
+    keep_recent=2, alias_name="an_alias_with_no_family"))
+check("an alias whose family is absent deletes nothing", _c_none.deleted, [])
+
+# --- 6. THE STRUCTURAL ANCHOR ----------------------------------------------
+#
+# Sections 1-5 are behavioural and would all still pass if someone reverted the
+# derivation and the fixture happened not to reach it. This asserts the shape.
+_cleanup_fn = next((n for n in ast.walk(_indexer_tree)
+                    if isinstance(n, ast.FunctionDef)
+                    and n.name == "cleanup_old_collections"), None)
+check_true("cleanup_old_collections was located in the shipped AST",
+           _cleanup_fn is not None)
+_cleanup_src = ast.get_source_segment(_indexer_src, _cleanup_fn) or ""
+_cleanup_strings = sorted({n.value for n in ast.walk(_cleanup_fn)
+                           if isinstance(n, ast.Constant)
+                           and isinstance(n.value, str)
+                           and n is not (_cleanup_fn.body[0].value
+                                         if _cleanup_fn.body else None)})
+check("no string literal in cleanup_old_collections names the collection "
+      "family", [t for t in _cleanup_strings if "trial_criteria" in t], [])
+check_true("...and the string walk found literals (non-degeneracy)",
+           len(_cleanup_strings) > 0)
+check_true("the candidate filter reads the alias_name PARAMETER",
+           "startswith(prefix)" in _cleanup_src
+           and "prefix = staging_prefix(alias_name)" in _cleanup_src)
+def _default(fn, index):
+    """fn's positional default at `index`, or a named absence.
+
+    Indexing __defaults__ directly raises IndexError exactly when the
+    signature has lost a default -- one of the things these two checks are
+    for -- so the read is converted into a value check() can fail on.
+    """
+    defaults = getattr(fn, "__defaults__", None) or ()
+    if index >= len(defaults):
+        return f"<no positional default at index {index}: {defaults!r}>"
+    return defaults[index]
+
+
+check("the signature default is the config constant, not a literal",
+      _default(indexer.cleanup_old_collections, 1), config.COLLECTION_NAME)
+check("...and the keep_recent default is still 2",
+      _default(indexer.cleanup_old_collections, 0), 2)
+
+# staging_prefix is the ONE owner: main() and cleanup both go through it, and
+# nothing else in the module builds the family name.
+check_true("staging_prefix exists and is a function",
+           callable(getattr(indexer, "staging_prefix", None)))
+check("staging_prefix derives the family from its argument",
+      indexer.staging_prefix("anything"), "anything_")
+check("...and from the config alias it produces the historical prefix, so no "
+      "collection name on the server changes",
+      indexer.staging_prefix(config.COLLECTION_NAME), "trial_criteria_")
+
+_main_calls_prefix = [ast.unparse(n) for n in ast.walk(_main)
+                      if isinstance(n, ast.Call)
+                      and ast.unparse(n.func) == "staging_prefix"]
+check("main() builds the staging name through staging_prefix",
+      _main_calls_prefix, ["staging_prefix(COLLECTION_NAME)"])
+_prefix_calls = [ast.unparse(n) for n in ast.walk(_indexer_tree)
+                 if isinstance(n, ast.Call)
+                 and ast.unparse(n.func) == "staging_prefix"]
+check("...and the whole module has exactly the two call sites (main and "
+      "cleanup), so there is one owner rather than three",
+      sorted(_prefix_calls),
+      ["staging_prefix(COLLECTION_NAME)", "staging_prefix(alias_name)"])
+
+# COLLECTION_NAME must be a from-import binding, not a re-typed module local:
+# the patch-point lesson this project has paid for twice.
+_cfg_imported = set()
+for _n in ast.walk(_indexer_tree):
+    if isinstance(_n, ast.ImportFrom) and _n.module == "oncotriage.config":
+        _cfg_imported |= {a.asname or a.name for a in _n.names}
+check_true("COLLECTION_NAME comes from oncotriage.config",
+           "COLLECTION_NAME" in _cfg_imported)
+check("...and is never re-assigned in the module (a function-local would "
+      "shadow it for the whole function)",
+      [t.id for _n in ast.walk(_indexer_tree)
+       if isinstance(_n, ast.Assign)
+       for t in ast.walk(_n.targets[0])
+       if isinstance(t, ast.Name) and t.id == "COLLECTION_NAME"], [])
+check("indexer's bound COLLECTION_NAME IS config's",
+      indexer.COLLECTION_NAME, config.COLLECTION_NAME)
 
 
 # ===========================================================================

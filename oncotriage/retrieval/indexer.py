@@ -89,6 +89,7 @@ from tqdm import tqdm
 
 from oncotriage import paths
 from oncotriage.config import (
+    COLLECTION_NAME,
     EMBEDDING_DIM,
     EMBEDDING_MODEL,
     Project_Name,
@@ -1538,7 +1539,7 @@ def index_trials(trials: List[Dict], collection_name: str):
     - Staging mode: collection_name changes every run (timestamp).
       A mismatch means the old Qdrant staging collection is gone.
       Checkpoint is discarded and all trials are re-embedded fresh.
-    - Direct mode: collection_name is fixed ('trial_criteria').
+    - Direct mode: collection_name is fixed (config.COLLECTION_NAME).
       Checkpoint is valid and resume skips already-indexed trials.
 
     Args:
@@ -1839,6 +1840,37 @@ def save_trials_to_disk(trials: List[Dict], output_path: str):
         console.out("Continuing to indexing step — trials are still in memory.")
         
 
+def staging_prefix(alias_name: str) -> str:
+    """The staging-collection family prefix belonging to `alias_name`.
+
+    ONE OWNER FOR A DERIVATION THAT WAS SPELLED OUT IN THREE INDEPENDENT
+    PLACES -- here, `cleanup_old_collections()`, and the generated Airflow DAG's
+    `rebuild_index` task. (Thirteen string constants in this module named the
+    alias or its family in executable code; two of them were the family prefix.
+    Counted by AST with docstrings stripped, which is why the number is not the
+    eleven a definition-level list gives: two sit inside console f-strings.)
+
+    The alias and its timestamped staging collections are one family --
+    `main()` builds `{alias}_{timestamp}` and `cleanup_old_collections()`
+    enumerates everything that starts with `{alias}_` -- and both halves used to
+    spell the family out as the literal `"trial_criteria_"`. Two independent
+    literals for one fact can disagree, and the way they disagree here is
+    destructive rather than inert: a cleanup that enumerates a family the swap
+    did not build deletes collections it was never asked about.
+
+    IT IS A FUNCTION OF THE ALIAS RATHER THAN A MODULE CONSTANT, and that is
+    the whole point. `cleanup_old_collections(alias_name=...)` is a parameter,
+    so a module constant would let the selection half and the protection half
+    read different knobs -- which is exactly the defect this replaces. Passing
+    the caller's own alias through makes selection and protection agree by
+    construction; there is no argument a caller can pass that separates them.
+
+    The default alias is `config.COLLECTION_NAME`, and every call site in this
+    module passes either that constant or its own `alias_name` parameter.
+    """
+    return alias_name + "_"
+
+
 def swap_alias_atomic(new_collection: str, alias_name: str):
     """
     Atomically swap alias to point to new collection (zero downtime).
@@ -1849,7 +1881,8 @@ def swap_alias_atomic(new_collection: str, alias_name: str):
 
     Args:
         new_collection: Staging collection to point the alias to
-        alias_name:     Alias name (e.g., 'trial_criteria')
+        alias_name:     Alias name -- config.COLLECTION_NAME for every
+                        call site in this module
     """
     # Pre-check whether the alias exists so we never rely on
     # fragile error-message string matching for flow control.
@@ -2783,7 +2816,8 @@ def resolve_alias_target(alias_name: str):
     return None
 
 
-def cleanup_old_collections(keep_recent: int = 2, alias_name: str = "trial_criteria"):
+def cleanup_old_collections(keep_recent: int = 2,
+                            alias_name: str = COLLECTION_NAME):
     """
     Delete old timestamped staging collections, keep N most recent.
 
@@ -2801,19 +2835,38 @@ def cleanup_old_collections(keep_recent: int = 2, alias_name: str = "trial_crite
     collection actually serving traffic was the one sorted out of the keep
     window.
 
+    ONE KNOB NAMES THE FAMILY AND THE PROTECTED TARGET. `alias_name` decides
+    BOTH which collections are candidates for deletion (`{alias}_*`, via
+    staging_prefix) and which one must survive. They used to be decided
+    separately -- the candidate filter by a hardcoded `"trial_criteria_"`, the
+    protection by this parameter -- so any caller passing a different alias
+    deleted from a family it had not asked about while leaving the family it
+    HAD asked about untouched. That is a behaviour change for a non-default
+    `alias_name` and for nothing else: `config.COLLECTION_NAME` is
+    "trial_criteria", so every call site in this repository is unaffected.
+
     Args:
         keep_recent: Number of recent timestamped collections to keep (min 2)
-        alias_name:  Alias whose target must survive regardless
+        alias_name:  Alias whose target must survive, and whose name defines
+                     the `{alias}_*` family this cleans up
     """
     if keep_recent < 2:
         console.out(f"WARNING: keep_recent={keep_recent} would leave no rollback "
                     f"target. Using 2.")
         keep_recent = 2
 
+    # THE FAMILY IS DERIVED FROM THE PARAMETER, NOT FROM A LITERAL. This
+    # filter used to hardcode `"trial_criteria_"` while the protection half
+    # below honoured `alias_name`, so a caller passing any other alias
+    # enumerated ONE family and protected a target from ANOTHER -- and the
+    # deletion loop then removed members of a family it was never asked about
+    # while leaving the family it WAS asked about untouched. Selection and
+    # protection now read the same knob by construction.
+    prefix = staging_prefix(alias_name)
     collections = get_qdrant_client().get_collections().collections
     timestamped = [
         c.name for c in collections
-        if c.name.startswith("trial_criteria_") and c.name != "trial_criteria"
+        if c.name.startswith(prefix) and c.name != alias_name
     ]
 
     # Sort descending: newest first (YYYYMMDD_HHMMSS format sorts correctly)
@@ -2923,11 +2976,12 @@ def main(use_staging: bool = True, compare_to: str = None,
 
         if use_staging:
             console.out("\n=== STAGING REBUILD (ZERO DOWNTIME) ===\n")
-            staging_name = f"trial_criteria_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            staging_name = (staging_prefix(COLLECTION_NAME)
+                            + datetime.now().strftime('%Y%m%d_%H%M%S'))
 
             # What the alias points at BEFORE anything moves, so the rollback
             # target can be named in the report rather than inferred later.
-            previous = resolve_alias_target("trial_criteria")
+            previous = resolve_alias_target(COLLECTION_NAME)
 
             # The size floor's baseline. Named explicitly when the alias target
             # is not trustworthy; see this function's docstring.
@@ -2970,37 +3024,40 @@ def main(use_staging: bool = True, compare_to: str = None,
             verify_collection(staging_name, expected_count=len(trials),
                               compare_to=baseline)
 
-            swap_alias_atomic(staging_name, "trial_criteria")
+            swap_alias_atomic(staging_name, COLLECTION_NAME)
 
             # keep_recent=2 so `previous` survives as the rollback target.
             if run_cleanup:
-                cleanup_old_collections(keep_recent=2, alias_name="trial_criteria")
+                cleanup_old_collections(keep_recent=2,
+                                        alias_name=COLLECTION_NAME)
             else:
                 console.out("Cleanup SKIPPED (run_cleanup=False): every existing "
                             "collection is retained.")
                 log.info("cleanup skipped by request", mode="no_cleanup")
 
             console.out(f"\n✓ Staging rebuild complete")
-            console.out(f"✓ Alias 'trial_criteria' now points to '{staging_name}'")
+            console.out(f"✓ Alias '{COLLECTION_NAME}' now points to "
+                        f"'{staging_name}'")
             console.out(f"✓ FastAPI experienced zero downtime")
             if previous:
                 console.out(f"✓ ROLLBACK TARGET RETAINED: '{previous}'")
                 console.out(f"    to roll back, point the alias back at it with "
-                            f"swap_alias_atomic('{previous}', 'trial_criteria')\n")
+                            f"swap_alias_atomic('{previous}', "
+                            f"'{COLLECTION_NAME}')\n")
             else:
                 console.out("")
 
         else:
             console.out("\n=== DIRECT REBUILD (CAUSES DOWNTIME) ===\n")
-            create_qdrant_collection("trial_criteria", delete_if_exists=True)
-            index_trials(trials, collection_name="trial_criteria")
-            create_payload_indexes("trial_criteria")
+            create_qdrant_collection(COLLECTION_NAME, delete_if_exists=True)
+            index_trials(trials, collection_name=COLLECTION_NAME)
+            create_payload_indexes(COLLECTION_NAME)
             # Verified AFTER the fact here, because direct mode has already
             # replaced production by the time there is anything to verify.
             # That is what "causes downtime" means and it is why staging is the
             # default; the check still runs so a bad direct build is at least
             # LOUD rather than silent.
-            verify_collection("trial_criteria", expected_count=len(trials))
+            verify_collection(COLLECTION_NAME, expected_count=len(trials))
             console.out(f"\n✓ Direct rebuild complete\n")
 
         console.out("=== Indexing Complete ===")

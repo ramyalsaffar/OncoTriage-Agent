@@ -416,7 +416,16 @@ def trial_refresh_weekly():
             trials = json.load(f)
 
         previous = indexer.resolve_alias_target(alias)
-        staging_name = "trial_criteria_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # The staging name is derived from the alias this task will SWAP ONTO,
+        # never from a literal. It used to read "trial_criteria_" + timestamp
+        # while `alias` came from cfg["COLLECTION_NAME"], so the two could name
+        # different families -- and the cleanup call below enumerates the alias
+        # family, which would then have left every collection this task built
+        # behind while deleting members of a family it did not build. Deriving
+        # it here also keeps the DAG free of a config import for a fact it
+        # already holds.
+        staging_name = alias + "_" + datetime.now().strftime("%Y%m%d_%H%M%S")
 
         indexer.create_qdrant_collection(staging_name, delete_if_exists=False)
         indexer.index_trials(trials, collection_name=staging_name)

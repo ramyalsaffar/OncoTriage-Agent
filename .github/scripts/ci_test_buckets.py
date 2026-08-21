@@ -200,6 +200,17 @@ BUCKETS = {
         "event per render. Driven through the real observability logger with "
         "the records captured in memory -- no network, no keys, no spend, no "
         "git history, no corpus, no database"),
+    "test_agent_rrf_config_ownership.py": (
+        _A, None,
+        "ran green in 0.8s, 31 checks, against ONLY the directory skeleton and "
+        "again in a tree with NO .git at all -- the five RRF fusion constants "
+        "are config's and agent/retrieval.py READS them. Its fixture is a "
+        "fabricated rank table, so no Qdrant, no model, no keys, no spend, no "
+        "corpus, no database and no git history; the one plant goes into an "
+        "in-memory ast copy, so it writes nothing anywhere and is NOT in the "
+        "collision matrix -- the one repository file it reads, "
+        "oncotriage/agent/retrieval.py, is written by neither of the suite's "
+        "two writers. It execs nothing, so it needs no _EXEC_ALLOWLIST entry"),
     "test_agent_retrieval_observability.py": (
         _A, None, "ran green in 3.5s; needs .env to EXIST, makes no live call"),
     "test_agent_stage5_input_packing.py": (

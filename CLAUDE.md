@@ -397,8 +397,8 @@ python tests/test_agent_ablation_flag_passthrough.py               #  39
 python tests/test_storage_inference_logging_contract.py            # 101 (was 79 when this line was written, then 98; the token-persistence pass added Test 2's three scoping/spread checks)
 python tests/test_agent_retrieval_observability.py                 # 103
 python tests/test_fhir_birth_date_and_demographics.py              # 172
-python tests/test_fhir_ecog_surfacing.py                           # 105; needs 04-'s scratch corpus
-python tests/test_storage_ecog_logging.py                          # 104
+python tests/test_fhir_ecog_surfacing.py                           # 108 (this line said 105, and the file has not reported that since the ECOG-surfacing checks were extended; MEASURED 2026-08-20); needs 04-'s scratch corpus
+python tests/test_storage_ecog_logging.py                          # 155 (this line said 104 and was stale by 51; MEASURED 2026-08-20). Needs 04-'s scratch corpus too
 python tests/test_monitoring_ecog_availability_drift.py            # 111 (was 112; see pass 20e)
 
 # The rest of the suite (pass 20d-2). Same shape, same directory.
@@ -450,9 +450,12 @@ python tests/test_observability_logging.py                          #  82
 # The scrape-admission pass. Same shape, same directory. No network, no keys, no
 # spend, not in the collision matrix -- but it DOES need git history, and in a
 # tree without `.git` it aborts rather than failing (see its own section below).
-# This line is new: the file has existed since the admission pass with its count
-# recorded only in prose, so an operator working from this block never ran it.
-python tests/test_indexer_admission_filters.py                      # 175
+# It also needs the UMLS-derived mesh_non_oncology_lookup.json, which is
+# deliberately not vendored, so it is bucket E in ci_test_buckets.py.
+# THIS COUNT WAS STALE BY 228 and the line above it said the opposite -- the
+# file has grown with the criteria-split gate, the cross-encoder pass and the
+# alias-ownership pass since 175 was measured. MEASURED 2026-08-20.
+python tests/test_indexer_admission_filters.py                      # 403 (was 175 in this line, then 359 before section 4b)
 
 # The promotion pass. Same shape, same directory. No network, no keys, no spend,
 # no git history, and NOT in the collision matrix (it writes nothing anywhere --
@@ -536,6 +539,15 @@ python tests/test_trivyignore_staleness.py                          # 181 (was 1
 # records 2 SKIPS there instead of failing. Every control still runs on a
 # runner -- they drive pure functions with fabricated inputs. ~0.04 s.
 python tests/test_dockerignore_exclusions.py                        #  36 passed / 0 skipped here; 33 / 2 on a checkout with no virtualenv
+
+# The RRF ownership pass. Same shape, same directory. No network, no keys, no
+# spend, no live Qdrant, no model, no corpus, no database, NO GIT HISTORY (run
+# green in a tree with no `.git` at all), and NOT in the collision matrix -- it
+# writes nothing anywhere, its one plant goes into an in-memory `ast` copy, and
+# the one repository file it reads, oncotriage/agent/retrieval.py, is written by
+# neither of the suite's two writers. It EXECS NOTHING, so it needs no
+# _EXEC_ALLOWLIST entry. ~0.8 s.
+python tests/test_agent_rrf_config_ownership.py                     #  31
 
 # Fixture state, CURRENT rather than as of any pass below: SCHEMA_VERSION
 # is 8, the twelve recordings on disk are v8, and `python fixture_replay.py`
@@ -4669,6 +4681,143 @@ before it are that record, written now.
 are not in the build context at all and are not this project's. The answer
 about the context is **20**. A count that walks somewhere its subject does not
 is not a smaller number, it is a different question.
+
+### One owner for the alias and its staging family (the alias-ownership pass)
+
+**THE ALIAS AND ITS STAGING FAMILY WERE WRITTEN OUT THIRTEEN TIMES IN
+`oncotriage/retrieval/indexer.py` AND ONCE MORE IN THE GENERATED DAG.**
+Re-enumerated by AST rather than taken from the brief, which said eleven: the
+scan strips docstrings and reports every remaining string CONSTANT, so it also
+catches the two inside console f-strings that a definition-level list misses.
+Thirteen in the indexer — the `cleanup_old_collections` signature default, the
+two in its family filter, `main()`'s staging name, the `resolve_alias_target`
+read, the `swap_alias_atomic` call, the `cleanup_old_collections` call, the two
+console lines, and the four in the direct-rebuild branch — plus
+`dag_generator.py`'s `rebuild_index`, which is the twelfth SITE and the
+fourteenth literal.
+
+**IT IS VALUE-PRESERVING FOR EVERY CURRENT CALLER AND THAT IS MEASURED, NOT
+CLAIMED.** `config.COLLECTION_NAME` is `"trial_criteria"`, so every rewritten
+site evaluates to the byte-identical string it evaluated to before — including
+both console lines, whose emitted text is unchanged. `python fixture_replay.py`
+is **12/12 clean, exit 0, with no recapture and zero `CONFIG MOVED` lines**,
+which is what says the pinned-collection refusal did not fire and the
+deterministic prefix did not move.
+
+**`staging_prefix(alias_name)` IS THE ONE OWNER, AND IT IS A FUNCTION OF THE
+ALIAS RATHER THAN A MODULE CONSTANT.** That is the whole point rather than a
+style choice: `cleanup_old_collections(alias_name=...)` is a PARAMETER, so a
+module constant would let the selection half and the protection half read
+different knobs — which is exactly the defect below. Two call sites,
+`staging_prefix(COLLECTION_NAME)` in `main()` and `staging_prefix(alias_name)`
+in the cleanup, and the test pins that there are exactly two.
+
+**THE LOGIC DEFECT: THE CLEANUP ENUMERATED ONE FAMILY AND PROTECTED A TARGET
+FROM ANOTHER.** The candidate filter hardcoded `"trial_criteria_"` while the
+protection half honoured `alias_name`, so a caller passing any other alias got
+**two wrongs at once**: the deletion loop removed members of a family it was
+never asked about, and left the family it WAS asked about untouched. Nothing
+raises, the log reads like a successful cleanup, and the only symptom is
+collections gone. It is invisible on the default path by construction, which
+is why nothing caught it — the literal and the parameter agreed for every call
+site in this repository. **That is the one intended behaviour change, and it is
+confined to a non-default `alias_name`.**
+
+**THE DAG'S SPLIT WAS THE SAME DEFECT ONE LEVEL OUT.** `rebuild_index` already
+held `alias = cfg["COLLECTION_NAME"]` and swapped onto it, while building
+`staging_name` from the literal — and it calls `cleanup_old_collections(
+alias_name=alias)`, which enumerates the ALIAS family. Repoint the alias and
+the task would have built into one family, swapped onto another, and then
+cleaned up a third thing. `staging_name = alias + "_" + timestamp` closes it
+and keeps the DAG free of a config import for a fact it already holds.
+
+**`tests/test_indexer_admission_filters.py` GREW SECTION 4b, 359 → 403 checks.**
+Two disjoint families and two aliases through the existing `_RecordingClient`
+stand-in, patched at `indexer.get_qdrant_client` — the from-import binding, not
+`oncotriage.config`, which is this project's recorded namespace lesson. It runs
+the default path three ways and requires all three to agree: the shipped
+function, a reproduction of the pre-change logic, and an **AST-patched copy of
+the shipped source** with only the derivation reverted. The third is what makes
+the second trustworthy; a retyped control tests the retyping.
+
+**THE DAG BYTE PIN AGAINST `git show HEAD:` WAS REPLACED, ARGUED IN PLACE
+RATHER THAN DELETED.** `_dag3d == _dag3d_head` was the criteria-split pass's
+one-time claim that IT had not moved the DAG, hardened into a standing check —
+and pinning generated output to whatever HEAD happens to be has both failure
+modes at once. It cannot fail once any change is committed (HEAD then carries
+it, so it agrees with the code by construction, the defect this file's own
+revision selectors exist to avoid), and it fails in the working tree of ANY
+deliberate DAG change while naming nothing about what moved. What replaces it
+derives the pre-change revision **by AST over the GENERATED text** — never by
+substring over the generator, whose new comment records the deleted literal and
+would select this commit — and requires the two generated DAGs to differ ONLY
+in that one assignment, every other differing line being a comment. It survives
+the commit, and it says what moved.
+
+**THE REVERT HARNESS FOUND A DEFECT IN THIS PASS'S OWN TEST CODE THAT READING
+DID NOT.** The plant's anchor is the very line the fix introduced, so the one
+edit section 4b exists to catch is also the edit that makes the reverted copy
+unbuildable — and `None(**kw)` raised `TypeError` at module level, reporting one
+traceback where the run owed eleven failures. **That is the seventh time this
+project has shipped that shape.** `_run_reverted` returns a named absence now
+and `check()` fails on it; the same revert reports 392 passed / 11 failed and
+runs to its summary. Two other raise-capable reads were hardened with it: the
+`__defaults__` indexing, which raises `IndexError` exactly when a signature
+loses a default — one of the things those two checks are for.
+
+**EIGHT REVERTS, EIGHT CAUGHT**, each applied to a `copytree`'d copy with a
+realpath preflight asserting the COPY is what imports and
+`PYTHONDONTWRITEBYTECODE=1` set; `.git` is symlinked in, read-only, so the
+file's git-derived controls resolve. R1 the family filter (11 failures), R2 the
+signature default (1), R3 `main()`'s staging name (2), R4 the DAG's (3), R5 a
+re-hardcoded RRF weight (4), R6 a re-hardcoded `RRF_K` (2), R7 a reintroduced
+`RERANK_RRF_K` (1), R8 `RRF_WEIGHT_TITLE` renamed in config. **R8 is the one
+whose failure mode is an ImportError rather than a recorded check**, and it is
+inherent rather than a weakness left unaddressed: removing the name from config
+makes `agent/retrieval.py` — the module under test — unimportable, so there is
+no process in which a check could run. The traceback names the missing constant.
+
+**`tests/test_agent_rrf_config_ownership.py` — 31 checks, ~0.8 s**, the control
+the RRF-promotion commit (`09436e0`) left uncommitted at a scratchpad. **THE
+PATCH POINT IS ITS REASON FOR EXISTING**: `retrieval.py` does
+`from oncotriage.config import RRF_WEIGHT_TITLE`, which BINDS the value into
+retrieval's own namespace, so a check written against
+`oncotriage.config.RRF_WEIGHT_TITLE` reaches NOTHING and would pass forever.
+Section 2 fires that wrong patch point deliberately and requires it to change
+nothing; section 3 patches retrieval's own namespace and requires the fusion
+order to MOVE. The fabricated rank fixture is built so it CAN flip — all four
+ranks are 0, so the k term is identical on both sides and only the weights
+decide, 3.0/k against 2.5/k — because a fixture that cannot flip is a vacuous
+control. Section 6 closes the gap that sections 1–5 leave (they exercise a
+re-derivation, not the shipped node) by requiring the four `score +=` terms
+INSIDE `node_hybrid_retrieval` to name their config weight and `RRF_K`, with
+the RRF numerator 1.0 the only numeric literal left in any of them, and
+`RERANK_RRF_K` absent as a Name AND as a string. **No network, no keys, no
+spend, no Qdrant, no model, no corpus, no database and NO GIT** — run green in a
+tree with no `.git` at all. It **execs nothing**, so it needs no
+`_EXEC_ALLOWLIST` entry, and it writes nothing, so it is not in the collision
+matrix (derived: the one repository file it reads,
+`oncotriage/agent/retrieval.py`, is written by neither of the suite's two
+writers).
+
+**THE DEPLOYED AIRFLOW DAG IS STALE AND WAS DELIBERATELY NOT REWRITTEN.**
+`{airflow_path}/dags/trial_refresh_weekly.py` is 14,480 bytes /
+`6e3c8fdaf44a…` and still carries the literal. The new text was proved valid
+without deploying it: generated into a temporary AIRFLOW_HOME and parsed by
+**Airflow 3.3.0's own `DagBag`** — `import_errors == {}`, `trial_refresh_weekly`
+registered, all three tasks (`scrape_and_save`, `rebuild_index`,
+`verify_index`), tags `['production','trialmatch']`, `NullTimetable`
+(`AIRFLOW_DAG_SCHEDULE = None`) — **15,049 bytes, sha256
+`32003ba494de1ef5…`**, a NEW sha256, which is pass 20f-3 item 8's acceptance
+criterion. Redeploying writes outside the repository and is one command:
+`rm "{airflow_path}/dags/trial_refresh_weekly.py" && python "23- Airflow DAG.py"`.
+
+**THREE STALE COUNTS IN THE RUN BLOCK WERE CORRECTED, EACH RE-MEASURED**:
+`test_fhir_ecog_surfacing.py` 105 → **108**, `test_storage_ecog_logging.py`
+104 → **155**, `test_indexer_admission_filters.py` 175 → **403** (359 before
+section 4b). The 175 in the admission pass's own account further up is left as
+written, per the rule that a past-tense account keeps its wording; the run block
+is the current-state owner.
 
 ## Persistence and observability
 
