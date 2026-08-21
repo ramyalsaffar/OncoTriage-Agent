@@ -439,6 +439,27 @@ BUCKETS = {
         "then asserts gone, and .dockerignore -- the only repository file it "
         "reads -- is written by neither of the suite's two writers and is "
         "sha256-compared in its section 6"),
+    "test_harness_endpoint_budget.py": (
+        _A, None,
+        "ran green in 0.9s, 38 checks, against ONLY the directory skeleton: "
+        "the derived POST read budget (value AND shape), its inequality "
+        "against MATCHING_REQUEST_TIMEOUT_SECONDS, File 19's "
+        "ConnectTimeout-before-Timeout handler order, and the config-owned GET "
+        "budget with the assertion that NO requests call in either harness "
+        "lacks an explicit timeout=. IT STARTS NO SERVER, ISSUES NO REQUEST "
+        "AND IMPORTS NO `requests`: both harnesses are read as TEXT and "
+        "parsed, which is also why it cannot spend a cent against files that "
+        "are bucket D when run. Every plant goes into an in-memory ast copy "
+        "and both harness files are re-read and compared at the end, so it "
+        "writes nothing anywhere. No network, no keys, no spend, no live "
+        "server, no live Qdrant, no corpus, no database, no git history, no "
+        "subprocess, and it execs nothing (section 1 evaluates ONE arithmetic "
+        "expression node through eval, which is not exec and loads no "
+        "module), so it needs no _EXEC_ALLOWLIST entry. NOT in the collision "
+        "matrix: it reads oncotriage/config.py, which "
+        "tests/test_config_snapshot_date_rot.py writes -- but that writer "
+        "rewrites only the DATA_SNAPSHOT_DATE literal and restores it "
+        "byte-identically, and touches no HARNESS_* line this file asserts on"),
     "test_indexer_criteria_split_gate.py": (
         _A, None,
         "ran green in 0.97s, 153 checks, against ONLY the directory skeleton: "

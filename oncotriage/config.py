@@ -1815,6 +1815,89 @@ COHORT_MANIFEST_FILENAME = "cohort_deletion_manifest.json"
 COHORT_MANIFEST_FLUSH_EVERY = 100
 
 
+# The maximum number of alive cancer patients the cohort is capped at.
+#
+# THIS IS THE SIZE EVERY PUBLISHED NUMBER IS COMPUTED OVER. File 05 deletes
+# non-cancer patients, then deceased cancer patients, then samples this many of
+# the survivors to KEEP and unlinks the rest -- irreversibly, in place. So a
+# reader asking "how large was the cohort" and a reviewer asking "what did the
+# ablation study draw from" are asking about this number, and it lived as a
+# module-level literal in oncotriage/fhir/clean.py where neither could see it
+# and where oncotriage/tracking.py could not log it.
+#
+# The value is unchanged at 1,000. The manifest File 05 writes records it under
+# `cap`, and the per-file deletion reason it writes still reads
+# "alive cancer patient beyond CAP=1000 (seed=42)" -- the manifest is a
+# historical record format and its strings are byte-identical for an unchanged
+# value, which is why the reason string keeps the word CAP even though the
+# identifier it once named now lives here under a different one.
+COHORT_CAP = 1000
+
+# Seed for the reproducible down-sample to COHORT_CAP patients.
+#
+# NOT File 04's Synthea seed and NOT the ablation study's: this one decides
+# WHICH alive cancer patients survive the cap, so two corpora generated from
+# one Synthea seed still differ if this moves. clean.py seeds a local
+# random.Random instance with it rather than random.seed(), so it shifts no
+# other consumer of `random` in the same session.
+#
+# It is not CLI-overridable -- "05- FHIR Clean Data.py" takes only --dry-run --
+# which is why it, and COHORT_CAP, are in tracking.CONFIGURATION_PARAM_NAMES
+# while the two sample sizes below are not.
+COHORT_SELECTION_SEED = 42
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
+# ABLATION STUDY CONFIGURATION (File 26)
+# ===========================================================================
+
+# Default patient count for one ablation study, before --sample-size.
+#
+# NAMED WITH ITS PREFIX RATHER THAN AS A BARE `SAMPLE_SIZE_DEFAULT`, which is
+# what it was called inside oncotriage/ablation/study.py. This file is one flat
+# namespace shared by every module in the project, and three unrelated things
+# here sample: the cohort cap above, the evaluation slice below, and this. A
+# bare name that reads unambiguously inside one module reads as "the" sample
+# size here, and the next person to want one takes the name.
+#
+# IT IS DELIBERATELY ABSENT FROM tracking.CONFIGURATION_PARAM_NAMES. See the
+# argument written at that tuple: `--sample-size` overrides it, and logging a
+# default the run did not use is a false record.
+ABLATION_SAMPLE_SIZE_DEFAULT = 75
+
+# Seed for the ablation study's stratified draw.
+#
+# It is IN tracking.CONFIGURATION_PARAM_NAMES, because no flag overrides it --
+# "26- Ablation Study.py" has --sample-size, --summary-only, --configs,
+# --fresh-start and --db, and no --seed. If a --seed flag is ever added, this
+# constant must LEAVE that tuple on the same day, for the same reason
+# ABLATION_SAMPLE_SIZE_DEFAULT is not in it.
+ABLATION_SEED = 42
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
+# EVALUATION RUN CONFIGURATION (evaluation_run.py)
+# ===========================================================================
+
+# Default patient count for one evaluation slice, before --select.
+#
+# Prefixed for the same reason ABLATION_SAMPLE_SIZE_DEFAULT is: it was
+# `DEFAULT_SELECTION_SIZE` inside oncotriage/evaluation/run_harness.py, which
+# is unambiguous in that module and says nothing at all here.
+#
+# ALSO DELIBERATELY ABSENT FROM tracking.CONFIGURATION_PARAM_NAMES: --select
+# overrides it. (The evaluation harness does not open a tracking run today; the
+# omission is stated so that adding one cannot quietly make this a false
+# record.)
+EVALUATION_SELECTION_SIZE_DEFAULT = 10
+
+
 #------------------------------------------------------------------------------
 
 
@@ -1918,6 +2001,22 @@ ABLATION_POWER_TARGET = 0.80
 # baseline is excluded from the test family. Exclusions are reported, never
 # silent.
 ABLATION_MIN_PAIRED = 10
+
+
+# Seed for the percentile-bootstrap confidence intervals in the comparison
+# table.
+#
+# ONLY THE SEED MOVES HERE. The 1,000 resamples and the 2.5/97.5 percentile
+# pair stay local to oncotriage/ablation/analysis.py: they are statistical
+# convention (a two-sided 95% percentile interval), not knobs an operator
+# tunes, and promoting them would invite exactly the tuning that makes an
+# interval mean nothing. The seed is different in kind -- it is the reason two
+# runs of the analysis over one database produce byte-identical intervals, so
+# it is a reproducibility fact and belongs where a reviewer can read it.
+#
+# It is in tracking.CONFIGURATION_PARAM_NAMES: nothing overrides it, and
+# "27- Ablation Analysis.py" has no seed flag.
+ABLATION_BOOTSTRAP_SEED = 42
 
 
 #------------------------------------------------------------------------------

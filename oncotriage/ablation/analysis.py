@@ -72,6 +72,7 @@ from oncotriage.ablation.common import (
     output_dir,
 )
 from oncotriage.config import (
+    ABLATION_BOOTSTRAP_SEED,
     ABLATION_DESCRIPTIVE_METRICS,
     ABLATION_FDR_ALPHA,
     ABLATION_MIN_PAIRED,
@@ -265,8 +266,14 @@ def build_comparison_table(df: pd.DataFrame) -> pd.DataFrame:
     # and its size varies by configuration. {col}_ci_n records the number of
     # values actually resampled and is printed with every interval; an interval
     # whose n differs from n_patients is decorating a mean it does not describe.
+    # N_BOOT AND THE 2.5/97.5 PAIR STAY LOCAL, DELIBERATELY. They are the
+    # definition of a two-sided 95% percentile bootstrap, not knobs an operator
+    # tunes, and an interval whose coverage can be edited from a config file is
+    # an interval that means nothing. Only the SEED moved: it is the reason two
+    # runs of this analysis over one database produce byte-identical bounds,
+    # which is a reproducibility fact a reviewer is entitled to read off the
+    # configuration rather than out of this function body.
     N_BOOT = 1000
-    BOOT_SEED = 42
     ci_cols = ["eligible_count", "avg_match_score_all", "has_match",
                "estimated_cost_usd", "total_time"]
     for config in CONFIG_ORDER:
@@ -276,7 +283,7 @@ def build_comparison_table(df: pd.DataFrame) -> pd.DataFrame:
             continue
         idx = idx_rows[0]
 
-        rng = np.random.default_rng(BOOT_SEED)
+        rng = np.random.default_rng(ABLATION_BOOTSTRAP_SEED)
         for col in ci_cols:
             vals = config_data[col].dropna().values
             table.loc[idx, f"{col}_ci_n"] = len(vals)

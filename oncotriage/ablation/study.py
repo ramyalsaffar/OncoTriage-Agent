@@ -146,7 +146,8 @@ from oncotriage.agent.graph import build_matching_graph
 from oncotriage.agent.patient import compute_patient_hash
 from oncotriage.agent.retrieval import build_bm25_index_from_qdrant
 from oncotriage.agent.state import CHANNEL_ABLATED, CHANNEL_OK
-from oncotriage.config import MATCHING_MODEL, MAX_WORKERS, Project_Name
+from oncotriage.config import (ABLATION_SAMPLE_SIZE_DEFAULT, ABLATION_SEED,
+                              MATCHING_MODEL, MAX_WORKERS, Project_Name)
 from oncotriage.fhir.parser import load_all_patients
 from oncotriage.utils import (
     CaffeinateSession,
@@ -267,8 +268,16 @@ _ablation_checkpoint_lock = threading.Lock()
 # CONSTANTS
 # ===========================================================================
 
-SAMPLE_SIZE_DEFAULT = 75
-ABLATION_SEED = 42
+# SAMPLE_SIZE_DEFAULT and ABLATION_SEED were literals here. Both are
+# oncotriage/config.py's now, imported above and unchanged in value, and the
+# first was renamed ABLATION_SAMPLE_SIZE_DEFAULT on the way: config is one flat
+# namespace and a bare `SAMPLE_SIZE_DEFAULT` there reads as "the" sample size
+# for a project that has three unrelated samplers in it.
+#
+# ONLY ONE OF THE TWO IS TRACKED, and the asymmetry is the point.
+# oncotriage/tracking.py logs ABLATION_SEED, because nothing overrides it, and
+# does NOT log the default sample size, because --sample-size does and a
+# default the run did not use is a false record. See CONFIGURATION_PARAM_NAMES.
 # File 26 built its two output Paths here, over the lazy
 # result_ablation_path. They are the two accessors above.
 ABLATION_CHECKPOINT_FILENAME = "ablation_checkpoint.json"
@@ -1421,8 +1430,8 @@ def parse_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="OncoMatch Ablation Study")
     parser.add_argument(
-        "--sample-size", type=int, default=SAMPLE_SIZE_DEFAULT,
-        help=f"Number of patients to sample (default: {SAMPLE_SIZE_DEFAULT})"
+        "--sample-size", type=int, default=ABLATION_SAMPLE_SIZE_DEFAULT,
+        help=f"Number of patients to sample (default: {ABLATION_SAMPLE_SIZE_DEFAULT})"
     )
     parser.add_argument(
         "--summary-only", action="store_true",
@@ -1598,9 +1607,20 @@ def main():
         # the last future has been waited on.
         tracking.start_run(
             kind="ablation",
+            # `seed` IS NOT PASSED HERE ANY MORE, and its absence is the
+            # promotion working rather than an omission. ABLATION_SEED became
+            # a config constant, so tracking.CONFIGURATION_PARAM_NAMES logs it
+            # by name on every run; passing it here as well would put one
+            # number into the store twice under two keys, which is exactly what
+            # that tuple's RRF_K note argues against. The collision check in
+            # start_run would NOT have caught it -- it compares keys, and
+            # "seed" and "ABLATION_SEED" are different keys.
+            #
+            # If a --seed flag is ever added to this file, this line comes back
+            # AND ABLATION_SEED leaves the enumeration, on the same day: from
+            # that day the constant is a default the run may not have used.
             params={
                 "sample_size": args.sample_size,
-                "seed": ABLATION_SEED,
                 "configs": ",".join(c["name"] for c in configs),
                 "db_path": str(ablation_db(db_path)),
             },
@@ -1885,8 +1905,7 @@ def main():
                     tracking.start_run(
                         kind="ablation",
                         params={"configs": _record["config_name"],
-                                "sample_size": args.sample_size,
-                                "seed": ABLATION_SEED},
+                                "sample_size": args.sample_size},
                         run_name=_record["config_name"],
                         nested=True,
                     )

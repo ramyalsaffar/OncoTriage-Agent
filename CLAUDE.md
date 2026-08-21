@@ -549,6 +549,17 @@ python tests/test_dockerignore_exclusions.py                        #  36 passed
 # _EXEC_ALLOWLIST entry. ~0.8 s.
 python tests/test_agent_rrf_config_ownership.py                     #  31
 
+# The harness-budget pass. Same shape, same directory. No network, no keys, no
+# spend, NO LIVE SERVER and no live Qdrant -- it starts nothing and issues no
+# request; Files 18 and 19 are read as TEXT and parsed, which is why a test
+# whose subject is two bucket-D files is itself bucket A. No corpus, no
+# database, no git history. NOT in the collision matrix: every plant goes into
+# an in-memory ast copy and both harness files are re-read and compared at the
+# end. It execs nothing (section 1 evaluates ONE arithmetic expression node
+# through eval, which is not exec), so it needs no _EXEC_ALLOWLIST entry.
+# ~0.9 s.
+python tests/test_harness_endpoint_budget.py                        #  38
+
 # Fixture state, CURRENT rather than as of any pass below: SCHEMA_VERSION
 # is 8, the twelve recordings on disk are v8, and `python fixture_replay.py`
 # is 12/12 clean with no recapture. Two accounts further down state

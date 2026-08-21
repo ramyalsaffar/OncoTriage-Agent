@@ -123,6 +123,7 @@ from oncotriage.agent.state import EXPANSION_PATH_FALLBACK
 from oncotriage.config import (
     COLLECTION_NAME,
     DATA_SNAPSHOT_DATE,
+    EVALUATION_SELECTION_SIZE_DEFAULT,
     MATCHING_MODEL,
     Project_Name,
 )
@@ -157,7 +158,15 @@ RECORD_SCHEMA_VERSION = 1
 
 MANIFEST_FILENAME = "manifest.json"
 OUTPUT_DIR_PREFIX = "eval_run_"
-DEFAULT_SELECTION_SIZE = 10
+
+# DEFAULT_SELECTION_SIZE was a literal here and is
+# config.EVALUATION_SELECTION_SIZE_DEFAULT now, imported above and unchanged in
+# value. Renamed on the way because config is one flat namespace: a bare
+# `DEFAULT_SELECTION_SIZE` is unambiguous inside this module and says nothing
+# at all beside the cohort cap and the ablation sample size.
+#
+# It is NOT in tracking.CONFIGURATION_PARAM_NAMES: --select overrides it, and
+# logging a default the run did not use is a false record.
 
 # The three groups node_finalize splits `evaluations` into, in the order a
 # reader wants them. Kept as a tuple rather than written out at each use so the
@@ -1378,10 +1387,10 @@ def _parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--scan-only", action="store_true",
                         help="Classify the cohort, print the selection, run "
                              "nothing. Free.")
-    parser.add_argument("--select", type=int, default=DEFAULT_SELECTION_SIZE,
+    parser.add_argument("--select", type=int, default=EVALUATION_SELECTION_SIZE_DEFAULT,
                         metavar="N",
                         help=f"How many patients to select "
-                             f"(default {DEFAULT_SELECTION_SIZE}).")
+                             f"(default {EVALUATION_SELECTION_SIZE_DEFAULT}).")
     parser.add_argument("--only", nargs="*", default=None, metavar="PATIENT_ID",
                         help="Run only these patient ids out of the selection. "
                              "Pair it with --output-dir to update an existing run.")

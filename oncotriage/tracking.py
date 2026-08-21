@@ -354,13 +354,44 @@ CONFIGURATION_PARAM_NAMES = (
     "MAX_TRIALS_FOR_EVALUATION",
     # --- the corpus the ages are computed against --------------------------
     "DATA_SNAPSHOT_DATE",
+    # --- the corpus itself: which patients every number is computed over ----
+    # File 05's cap and the seed for its down-sample. They decide WHICH
+    # patients survive into the cohort, so two runs of identical pipeline
+    # configuration over corpora built with different values here are not
+    # comparable and nothing else in this enumeration would say so. Neither is
+    # CLI-overridable: "05- FHIR Clean Data.py" takes only --dry-run.
+    "COHORT_CAP",
+    "COHORT_SELECTION_SEED",
+    # --- the two ablation seeds --------------------------------------------
+    # ABLATION_SEED draws the study's stratified sample;
+    # ABLATION_BOOTSTRAP_SEED is why two runs of File 27 over one database
+    # produce byte-identical confidence intervals. Neither has a flag.
+    "ABLATION_SEED",
+    "ABLATION_BOOTSTRAP_SEED",
 )
 """Attribute names read off ``oncotriage.config`` and logged verbatim.
 
 Read through ``getattr(config, name)`` at call time rather than imported at
 module scope, so a test that sets ``config.DATA_SNAPSHOT_DATE`` -- this
 project's supported patch point for it -- is reflected here the way it is
-reflected in ``get_age_reference_date()``."""
+reflected in ``get_age_reference_date()``.
+
+WHAT IS DELIBERATELY *NOT* HERE, SO THAT NOBODY "FIXES" THE OMISSION.
+``ABLATION_SAMPLE_SIZE_DEFAULT`` and ``EVALUATION_SELECTION_SIZE_DEFAULT`` are
+config constants of exactly the same kind as the two seeds above and they are
+excluded on purpose: ``--sample-size`` and ``--select`` override them. This
+enumeration logs the value of a CONSTANT, not the value the run used, so a
+default the run overrode would be logged as though it had been in force -- a
+false record, and worse than no record, because it is indistinguishable from a
+true one. Both numbers DO reach the store, from the caller, as the
+``sample_size`` and ``patient_count`` members of ``CALLER_PARAM_KEYS``, which
+carry what the run actually did.
+
+The rule this states: a constant belongs here IF AND ONLY IF nothing at the
+command line can override it. When a flag is added for one of these, the
+constant leaves this tuple in the same commit -- see the note at the ablation
+study's ``start_run``, which is where ``seed`` used to be passed as a caller
+parameter and no longer is."""
 
 
 CALLER_PARAM_KEYS = frozenset({
@@ -381,9 +412,19 @@ constants only" is a rule that has to be enforced somewhere, and a convention
 enforced by nothing is a convention that holds until the first hurried caller.
 
 The members are the run-shape facts a constant cannot carry because they come
-from the command line: the ablation study's ``--sample-size`` and seed, its
-``--configs`` selection, both databases' ``--db`` redirect, and the batch
-runner's corpus size and resample settings."""
+from the command line: the ablation study's ``--sample-size``, its ``--configs``
+selection, both databases' ``--db`` redirect, and the batch runner's corpus size
+and resample settings.
+
+``seed`` IS A MEMBER THAT NOTHING IN THIS REPOSITORY PASSES TODAY, and that is
+recorded rather than left to be rediscovered. This docstring used to name "the
+ablation study's ``--sample-size`` and seed" together, which was wrong about the
+second half and always had been: no ``--seed`` flag has ever existed, the study
+passed the constant, and once that constant moved into ``oncotriage/config.py``
+it became loggable by name and the caller key became a duplicate. The door is
+kept open -- a caller-supplied seed is a legitimate thing for a future flag to
+supply -- and it is exercised by
+``tests/test_tracking_mlflow_index.py``."""
 
 
 _PROMPT_PROBE = {

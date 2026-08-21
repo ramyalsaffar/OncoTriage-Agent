@@ -95,7 +95,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from oncotriage import paths, settings
-from oncotriage.config import COHORT_MANIFEST_FILENAME, COHORT_MANIFEST_FLUSH_EVERY
+from oncotriage.config import (COHORT_CAP, COHORT_MANIFEST_FILENAME,
+                              COHORT_MANIFEST_FLUSH_EVERY,
+                              COHORT_SELECTION_SEED)
 from oncotriage.fhir.parser import _select_best_coding
 from oncotriage.registries.cancer_code_registry import load_registry
 from oncotriage.observability import console
@@ -106,12 +108,20 @@ from oncotriage.observability import console
 
 # Configuration
 #--------------
-
-# The max number of patients with cancer
-CAP = 1000
-
-# Seed for the reproducible down-sample to CAP patients
-RANDOM_SEED = 42
+#
+# `CAP` and `RANDOM_SEED` were module-level literals here. They are
+# oncotriage/config.py's COHORT_CAP and COHORT_SELECTION_SEED now, imported
+# above and unchanged in value: they are the two numbers that decide which
+# patients every published figure in this project is computed over, so
+# oncotriage/tracking.py logs them per run -- and it can only log what config
+# owns.
+#
+# THREE EMITTED STRINGS BELOW STILL SPELL THE BARE WORD C-A-P AND MUST KEEP
+# DOING SO. The deletion manifest is a historical record format; the per-file
+# reason it stores, and the two console lines beside it, are byte-identical
+# for an unchanged value. The word there names the manifest's own `cap` field,
+# not a Python identifier -- which is why the rename deliberately stopped at
+# the quote marks.
 
 
 # _EXCLUDE_VERIFICATION is NOT redefined here. The cancer code registry owns it
@@ -587,7 +597,7 @@ def patient_death_status(bundle_data):
 
 def filter_cancer_patients_inplace(dry_run=False):
     """
-    Delete non-cancer patients, then deceased cancer patients, then cap at CAP
+    Delete non-cancer patients, then deceased cancer patients, then cap at COHORT_CAP
     (in-place filtering).
 
     Args:
@@ -620,11 +630,11 @@ def filter_cancer_patients_inplace(dry_run=False):
 
         non_cancer  no primary cancer condition (has_cancer_diagnosis)
         deceased    has cancer, but Patient.deceased[x] says they are dead
-        over_cap    alive cancer patients beyond CAP, seeded sample
+        over_cap    alive cancer patients beyond COHORT_CAP, seeded sample
 
     The deceased phase runs BEFORE the cap so the cap samples from alive
     patients only; capping first would spend cohort slots on the dead and then
-    delete them, leaving well under CAP. Vital status is read in the same scan
+    delete them, leaving well under COHORT_CAP. Vital status is read in the same scan
     pass as the cancer check, from the same parsed bundle -- see
     patient_death_status().
 
@@ -775,8 +785,8 @@ def filter_cancer_patients_inplace(dry_run=False):
     manifest = {
         'created_utc':          datetime.now(timezone.utc).isoformat(),
         'directory':            str(patients_path),
-        'cap':                  CAP,
-        'random_seed':          RANDOM_SEED,
+        'cap':                  COHORT_CAP,
+        'random_seed':          COHORT_SELECTION_SEED,
         'selector':             '_select_best_coding("condition") + '
                                 'CancerCodeRegistry.is_primary_cancer(codings=...)',
         'scanned':              len(patient_files),
@@ -852,7 +862,7 @@ def filter_cancer_patients_inplace(dry_run=False):
     #
     # BEFORE the cap, so the cap samples from alive patients only. Capping
     # first would spend cohort slots on the dead and then delete them, leaving
-    # far fewer than CAP.
+    # far fewer than COHORT_CAP.
     deceased_deleted = 0
     deceased_would_delete = 0
 
@@ -920,7 +930,7 @@ def filter_cancer_patients_inplace(dry_run=False):
         console.out("  (checked; recorded in the manifest as a zero-count phase)")
         console.out()
 
-    # STEP 3: Cap at CAP patients (if needed)
+    # STEP 3: Cap at COHORT_CAP patients (if needed)
     #
     # The sampling pool is the ALIVE confirmed-cancer list, not a re-glob of the
     # directory: a re-glob also picks up the bundles that failed to parse and
@@ -936,29 +946,29 @@ def filter_cancer_patients_inplace(dry_run=False):
               f"excluded from the cap pool (listed in the manifest).")
         console.out()
 
-    if len(remaining_files) > CAP:
+    if len(remaining_files) > COHORT_CAP:
         console.out("="*80)
-        console.out(f"STEP 3: CAP DATASET AT {CAP} PATIENTS")
+        console.out(f"STEP 3: CAP DATASET AT {COHORT_CAP} PATIENTS")
         console.out("="*80)
         console.out()
         console.out(f"Current alive cancer patients: {len(remaining_files)}")
-        console.out(f"Target: {CAP} patients")
-        console.out(f"Need to remove: {len(remaining_files) - CAP} patients")
+        console.out(f"Target: {COHORT_CAP} patients")
+        console.out(f"Need to remove: {len(remaining_files) - COHORT_CAP} patients")
         console.out()
 
         # Reproducible random sampling. Local Random instance rather than
         # random.seed(): seeding the process-wide state would shift the draw
         # of every other consumer of `random` in the same session.
-        rng = random.Random(RANDOM_SEED)
+        rng = random.Random(COHORT_SELECTION_SEED)
 
-        # Randomly select CAP to KEEP
-        patients_to_keep = rng.sample(remaining_files, CAP)
+        # Randomly select COHORT_CAP to KEEP
+        patients_to_keep = rng.sample(remaining_files, COHORT_CAP)
         patients_to_keep_set = set(patients_to_keep)
 
         # Delete the rest
         patients_to_remove = [f for f in remaining_files if f not in patients_to_keep_set]
 
-        console.out(f"Randomly selecting {CAP} patients to keep (seed={RANDOM_SEED})...")
+        console.out(f"Randomly selecting {COHORT_CAP} patients to keep (seed={COHORT_SELECTION_SEED})...")
         console.out(f"{'Would delete' if dry_run else 'Deleting'} "
               f"{len(patients_to_remove)} extra cancer patients...")
         console.out()
@@ -967,7 +977,8 @@ def filter_cancer_patients_inplace(dry_run=False):
             manifest,
             phase_key='over_cap',
             files=patients_to_remove,
-            reason=f'alive cancer patient beyond CAP={CAP} (seed={RANDOM_SEED})',
+            reason=f'alive cancer patient beyond CAP={COHORT_CAP} '
+                   f'(seed={COHORT_SELECTION_SEED})',
             progress_every=100,
             dry_run=dry_run,
             manifest_target=manifest_target,
@@ -988,14 +999,14 @@ def filter_cancer_patients_inplace(dry_run=False):
     else:
         # Under-cap is a REPORTED outcome, not a quiet one: it means
         # POPULATION_SIZE (04- FHIR Generate Data.py) was sized too low for the
-        # alive-cancer yield, and the corpus is smaller than CAP asked for.
+        # alive-cancer yield, and the corpus is smaller than COHORT_CAP asked for.
         console.out("="*80)
-        console.out(f"STEP 3: ALREADY AT OR BELOW {CAP} PATIENTS")
+        console.out(f"STEP 3: ALREADY AT OR BELOW {COHORT_CAP} PATIENTS")
         console.out("="*80)
         console.out()
-        if len(remaining_files) < CAP:
+        if len(remaining_files) < COHORT_CAP:
             console.out(f"! Only {len(remaining_files)} alive cancer patients available, "
-                  f"CAP is {CAP}. The cohort is {CAP - len(remaining_files)} short.")
+                  f"CAP is {COHORT_CAP}. The cohort is {COHORT_CAP - len(remaining_files)} short.")
             console.out("  Raise POPULATION_SIZE in '04- FHIR Generate Data.py' and "
                   "regenerate; this run cannot be topped up (Synthea appends).")
             console.out()
