@@ -5346,8 +5346,13 @@ else:
     # about a copy that was never modified. It has to move whenever a site is
     # added -- which is exactly what makes it catch a site added and NOT reached
     # by the control.
-    check("the control actually removed the lock (all five sites)",
-          _payload.get("locks_stripped"), 5)
+    # 5 -> 6 AT THE HEALTH-PERSISTENCE PASS, which added flush_run_metrics --
+    # a database statement, and therefore under the same lock. Its sibling
+    # `_note_run_metric_shape` guards a SET and deliberately takes
+    # `_ANNOUNCE_LOCK` instead, precisely so this number keeps counting one
+    # thing.
+    check("the control actually removed the lock (all six sites)",
+          _payload.get("locks_stripped"), 6)
 
     # SCENARIO A, reported honestly: the lock does NOT change this path.
     check("steady state, WITH the lock: every row lands",

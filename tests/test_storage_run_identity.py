@@ -391,8 +391,13 @@ print()
 _FRESH = os.path.join(_TMP, "fresh.db")
 silence(_dl.initialize_database, _FRESH)
 
-check("a fresh database carries all four tables",
-      tables_of(_FRESH), ["drift_metrics", "inferences", "runs", "trial_matches"])
+# FIVE AT THE HEALTH-PERSISTENCE PASS, which added `run_metrics`. The set is
+# kept EXACT rather than widened to a subset test, for the reason the bedrock
+# adapter's copy of this assertion states: exact is what makes it fail when a
+# table is introduced under any name.
+check("a fresh database carries all five tables",
+      tables_of(_FRESH),
+      ["drift_metrics", "inferences", "run_metrics", "runs", "trial_matches"])
 
 check("...and `runs` carries exactly RUN_COLUMNS plus its id",
       sorted(columns_of(_FRESH, "runs")),

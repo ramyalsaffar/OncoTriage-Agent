@@ -115,7 +115,9 @@ from oncotriage.config import (
 from oncotriage.agent.evaluation import MatchingModelMismatchError
 from oncotriage.fhir.parser import parse_fhir_bundle
 from oncotriage.storage.database_logger import (
+    RUN_METRICS_FLUSH_FAILURES,
     finalize_run_record,
+    flush_run_metrics,
     log_inference,
     resolve_inference_db_path,
     start_run_record,
@@ -764,6 +766,122 @@ def append_result(results_list: list, entry: dict) -> None:
 
 
 # ===========================================================================
+# THE HEALTH FLUSH (the health-persistence pass)
+# ===========================================================================
+#
+# WHAT IT IS FOR. oncotriage/degradation.py's counters are per-PROCESS and are
+# read in exactly one place -- the block main() prints at the end. So a campaign
+# that CRASHES prints nothing, and the health record of everything it did before
+# it died dies with it; and nothing outside the process can ask a LIVE run how
+# it is going. Persisting the totals per run turns both of those into a query.
+#
+# WHERE IT IS HOSTED, AND WHY NOT WHERE THE BRIEF SUGGESTED. The natural-looking
+# host is save_checkpoint() in _on_done -- it is already the per-patient
+# completion point. It is the wrong one, and measurably so: save_checkpoint is
+# inside `if entry["status"] == "success":`, so a pass in which every patient
+# ERRORED would flush nothing at all. Errors are exactly when REFUSALS_OBSERVED,
+# MALFORMED_EVALUATION_ENTRIES and INFERENCE_WRITE_FAILURES move, so hanging the
+# health record off the success branch would make it emptiest precisely when it
+# matters most -- silence looking like health, which is the defect the whole
+# feature exists to remove. It is called from _on_done for BOTH outcomes
+# instead, immediately after the entry is recorded.
+#
+# EVERY PATIENT, NOT EVERY N. MEASURED rather than assumed, on this machine,
+# against a scratch database in the production database's own directory (so the
+# filesystem and the WAL behaviour are the real ones), with all 24 counters
+# non-zero and a 50,000-row history for the DELETE to scan past:
+#
+#     0.492 ms per flush, mean over 300     with idx_run_metrics_run_id
+#     1.212 ms per flush, mean over 200     with the index dropped
+#
+# 0.492 ms against a per-patient pipeline whose measured median is ~68 seconds
+# of Stage 5 alone is seven parts in a million. save_checkpoint() already writes
+# a JSON file on the same path for the same patients and costs more than this
+# does. A cadence knob was considered and rejected: its only safe value is 1,
+# and a knob whose other values silently reduce the fidelity of a crash record
+# is a way to lose the record.
+#
+# WHAT IT DOES NOT COVER, stated: _on_done's two early returns. A callback that
+# fails at future.result() -- a MatchingModelMismatchError, or any other
+# exception escaping the worker -- returns before this line, so a run in which
+# EVERY patient failed that way flushes nothing until main()'s final flush. That
+# final flush always runs, on the success path and on the crash path alike, so
+# nothing is lost; only the liveness of the record is.
+
+
+def flush_health(run_id, snapshot=None, db_path=None) -> bool:
+    """Persist the degradation registry's totals for ``run_id``. Never raises.
+
+    Args:
+        run_id:   the ``runs.id`` this run is recorded under. ``None`` is
+                  tolerated and counted by the writer -- a caller driving a pass
+                  outside main() has no run row, and a health flush must not be
+                  the thing that stops it.
+        snapshot: ``degradation.snapshot()``'s dict, or ``None`` to take one
+                  now. THE ARGUMENT IS THE WHOLE POINT AT THE END OF A RUN: the
+                  final flush, the printed report and the logged summary must
+                  describe one instant, and the only way to guarantee that is
+                  for one snapshot to be taken once and handed to all three --
+                  exactly as the reconciliation dict already is.
+        db_path:  which database. ``None`` resolves the configured one, which is
+                  what ``log_inference`` does from the same worker threads; the
+                  two therefore name one file by construction.
+
+    THE TOTALS, NEVER THE SNAPSHOT. ``degradation.totals()`` is
+    ``{counter name: int}``; ``snapshot()`` is the nested form and its KEYS carry
+    clinical and third-party text -- a patient's recorded sex, a capped copy of
+    an observation display -- which must not reach a durable, run-keyed table.
+    The writer refuses the nested form rather than trusting this call site; see
+    ``_run_metric_rows``.
+
+    ``len(registered_names())`` IS THE SECOND ARGUMENT, and it is what makes a
+    clean run distinguishable in SQL from a run that never flushed. ``totals()``
+    drops every zero counter, so a healthy run contributes no `degradation` rows
+    at all -- which is what "nothing was ever wired up" also looks like.
+
+    WHAT CONCURRENCY GUARANTEES HERE, AND WHAT IT DOES NOT -- stated rather than
+    left for a reader to assume. The WRITE is atomic: ``_WRITE_LOCK`` plus one
+    transaction means a reader sees the previous flush or this one and never a
+    mixture, and two workers cannot duplicate or half-erase a run's rows. The
+    SNAPSHOT is taken HERE, outside that lock, so the freshness is weaker: two
+    workers can snapshot at 5 and 6 events and land in the other order, leaving
+    the table reading 5 for as long as it takes the next patient to finish
+    (~68 seconds at this pipeline's measured median). It self-heals on the next
+    flush, and main()'s final flush is authoritative.
+    That is a bounded staleness, not a corruption, and it is the deliberate
+    trade for not holding a database lock across a registry read that every
+    worker thread is writing to. A reader that needs to know how current a row
+    is has ``run_metrics.written_at`` for exactly that.
+    """
+    # THE REGISTRY READ IS INSIDE THE GUARD TOO, and that is not padding.
+    # flush_run_metrics never raises by contract, but the two calls that build
+    # its arguments are OUTSIDE it -- and this whole function runs in a
+    # done-callback on a worker thread, where an exception is swallowed by
+    # concurrent.futures and logged to a logger nothing in this project reads.
+    # "The flush never raises" has to mean the call site, not one frame of it.
+    #
+    # IT COUNTS INTO THE STORAGE LAYER'S COUNTER RATHER THAN A NEW ONE OF ITS
+    # OWN, deliberately: the fact an operator acts on is "this run's health
+    # record did not land", and splitting it across two counters by which half
+    # of the call failed would put one event in two places on the report. The
+    # KEY says which half.
+    try:
+        snap = degradation.snapshot() if snapshot is None else snapshot
+        totals = degradation.totals(snap)
+        registered = len(degradation.registered_names())
+    except Exception as exc:                                   # noqa: BLE001
+        RUN_METRICS_FLUSH_FAILURES[f"flush:registry_read:{type(exc).__name__}"] += 1
+        log.error("the degradation registry could not be read, so this run's "
+                  "health record was not updated",
+                  event="run_metrics_registry_read_failed",
+                  inference_run_id=run_id,
+                  error_type=type(exc).__name__, error_message=str(exc))
+        return False
+
+    return flush_run_metrics(run_id, totals, registered, db_path=db_path)
+
+
+# ===========================================================================
 # CORE: PROCESS A SINGLE PATIENT
 # ===========================================================================
 
@@ -1123,6 +1241,16 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
         else:
             batch_error += 1
 
+        # THE HEALTH FLUSH, OUTSIDE THE SUCCESS BRANCH ON PURPOSE. See
+        # flush_health: hanging it off save_checkpoint() would leave a pass in
+        # which every patient errored with no persisted health record, and the
+        # error path is exactly where the counters move. It never raises -- an
+        # exception here would be swallowed by concurrent.futures and logged
+        # where nothing in this project reads it -- and it runs on MAX_WORKERS
+        # threads at once, which _WRITE_LOCK inside the writer is what makes
+        # safe.
+        flush_health(run_id)
+
         progress.set_postfix(ok=batch_success, err=batch_error)
         
         progress.update(1)
@@ -1308,6 +1436,13 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
             resample_success += 1
         else:
             resample_error += 1
+
+        # Same call, same position and the same reasoning as run_batch's --
+        # written out once, at flush_health. Note the counters are CUMULATIVE
+        # across both passes and are never cleared between them, so what this
+        # writes includes everything the main pass moved; that is the same
+        # property degradation.clear_all()'s docstring forbids breaking.
+        flush_health(run_id)
 
         progress.set_postfix(ok=resample_success, err=resample_error)
         progress.update(1)
@@ -2162,6 +2297,26 @@ def main():
             # two halves disagree about their own subject.
             degradation_snapshot = degradation.snapshot()
             degradation.log_summary(degradation_snapshot)
+            # THE FINAL FLUSH, FROM THAT SAME SNAPSHOT. Three outputs describe
+            # one instant: the persisted rows, the structured event above and
+            # the printed block below. Taking a fresh snapshot here instead
+            # would let the table and the report disagree about their own
+            # subject -- and they would disagree exactly when something moved
+            # between the two calls, which is when a reader most needs them to
+            # agree.
+            #
+            # AFTER log_summary AND BEFORE print_summary is not arbitrary
+            # either: emitting the event can itself move EMIT_FAILURES, and a
+            # flush taken before it would omit that. Neither ordering is
+            # perfect -- a counter moved by the flush cannot be in the flush --
+            # and this one puts the more likely mover first.
+            #
+            # It cannot raise. A failure lands in RUN_METRICS_FLUSH_FAILURES,
+            # which this run's own block has not printed yet at this line, so
+            # the console report still names it; the TABLE cannot, for the
+            # reason written at that counter.
+            flush_health(_run_record_id, snapshot=degradation_snapshot,
+                         db_path=_reconcile_db)
 
             print_summary(results_list, total_wall_time,
                           reconciliation=reconciliation,
@@ -2286,6 +2441,20 @@ def main():
             # finalize_run_record does not raise, so it cannot displace the
             # exception on its way out; `raise` re-raises the original,
             # unchanged, exactly as before this pass.
+            #
+            # THE HEALTH RECORD IS FLUSHED FIRST, AND THIS IS THE PATH THE
+            # WHOLE FEATURE IS FOR. A crashed campaign prints no degradation
+            # block, so before this pass everything its counters held was lost
+            # at exit. The periodic flushes already left a record that is at
+            # most one patient stale; this one closes the gap, so the row set
+            # is current at the moment the run is marked KILLED rather than at
+            # the last patient that completed.
+            #
+            # IT TAKES ITS OWN SNAPSHOT, and no "same instant" promise is
+            # broken by that: there is no printed report on this path for it to
+            # disagree with. It cannot raise, so it cannot displace the
+            # exception either.
+            flush_health(_run_record_id, db_path=_reconcile_db)
             finalize_run_record(_run_record_id, "KILLED", db_path=_reconcile_db)
             tracking.end_run(status="FAILED")
             raise

@@ -91,6 +91,108 @@ log = get_logger(__name__)
 
 
 # ===========================================================================
+# READING THE REGISTRY WHILE THE RUN IS STILL WRITING TO IT
+# ===========================================================================
+#
+# UNTIL THE HEALTH-PERSISTENCE PASS, ``snapshot()`` HAD EXACTLY ONE CALLER AND
+# IT RAN AFTER BOTH THREAD POOLS HAD BEEN JOINED. It is now also called once per
+# completed patient, from ``_on_done`` -- a done-CALLBACK, so on a WORKER
+# thread, while MAX_WORKERS-1 other workers are still incrementing the very
+# counters it is copying.
+#
+# WHAT THAT ACTUALLY RISKS, stated narrowly rather than gestured at. CPython's
+# dict iterator compares the dict's size before and after each step and raises
+# ``RuntimeError: dictionary changed size during iteration`` when it changed. A
+# ``Counter[k] += 1`` on a key that is ALREADY THERE rebinds a value and does
+# not change the size, so the common case is safe. A key that is NEW does -- a
+# lab unit nobody had a conversion for yet, an exception type not seen before,
+# a Qdrant function retried for the first time. Rare per patient, and a
+# 22,000-patient run takes that gamble 22,000 times.
+#
+# WHY NOT A LOCK. The fix "take a lock" belongs on the WRITE side, and the write
+# side is ~22 counters incremented from the hot path of every stage in the
+# package. Putting a lock in front of ``AGE_PARSE_FAILURES[key] += 1`` to make a
+# once-per-patient read tidy is the wrong trade by orders of magnitude, and it
+# would be a change to every module that owns a counter rather than to this one.
+#
+# SO: ONE C-LEVEL COPY, THEN FILTER THE COPY. ``dict.copy(counter)`` is a single
+# call into CPython's ``PyDict_Copy``; no Python bytecode runs inside it, so no
+# other thread can be scheduled part-way through and the copy cannot observe a
+# resize. Everything after it reads a dict nothing else has a reference to.
+#
+# THE ORIGINAL VERSION OF THIS FUNCTION WAS A DICT COMPREHENSION OVER
+# ``counter.items()`` AND THAT IS PRECISELY THE THING THAT IS NOT SAFE: a
+# comprehension executes Python bytecode per item, so the interpreter can switch
+# threads between two of them, and a key inserted in that window raises. It was
+# not reasoned out -- ``tests/test_storage_run_metrics_flush.py`` section 7 was
+# written first, with a thread inserting a new key in a tight loop, and the
+# first implementation ABANDONED a counter on the first run. The retry below
+# alone was not enough for it either.
+#
+# THE BOUNDED RETRY IS KEPT AS A SECOND LINE OF DEFENCE, not as the mechanism.
+# The atomicity above is a CPython implementation property rather than a
+# language guarantee, so a runtime that does not share it degrades to the retry;
+# and when even that fails, the counter is OMITTED from that snapshot and the
+# omission is counted under ``:abandoned``, which is itself on this report. A
+# silent partial snapshot -- one counter quietly missing from a health record
+# that looks complete -- is the exact defect this module exists to remove, one
+# level up.
+#
+# THE RUN-END SNAPSHOT CANNOT HIT ANY OF THIS. It is taken on the main thread
+# after both pools are joined, so there is no writer to race.
+
+SNAPSHOT_CONTENTION = Counter()
+"""Registry reads that met a concurrent write, keyed ``{counter name}:{outcome}``.
+
+``:retry`` is benign and is recorded anyway, because a rising retry count is the
+only evidence that the retry is load-bearing rather than dead code. ``:abandoned``
+is a counter genuinely missing from one flush's rows.
+
+THE KEYS ARE COUNTER NAMES, which are code identifiers -- the same property that
+makes ``totals()`` safe to persist. Nothing here carries a counter's own KEYS.
+"""
+
+_SNAPSHOT_COPY_ATTEMPTS = 4
+"""How many times a contended counter copy is retaken before it is abandoned.
+
+Four rather than two so that the ``:abandoned`` key means something has gone
+genuinely wrong rather than "two threads were unlucky once". On CPython the
+retry is not expected to be reached at all -- see the block above -- so a
+non-zero ``:retry`` count is itself worth reading as a fact about the runtime.
+"""
+
+
+def _copy_counter(name, counter):
+    """A plain ``{key: count}`` copy of ``counter``, or ``None`` if contended out.
+
+    See the block above. Returns ``None`` rather than a partial dict: a copy that
+    lost half its keys to a concurrent write would be reported as a set of
+    totals, and a total that is wrong is worse than a total that is absent and
+    says so.
+    """
+    for attempt in range(_SNAPSHOT_COPY_ATTEMPTS):
+        try:
+            # ONE C-level copy of the live counter -- see the block above for
+            # why this and not a comprehension over `counter.items()`.
+            raw = dict.copy(counter)
+        except RuntimeError:
+            # "dictionary changed size during iteration" -- a new key appeared
+            # under us. Anything else with this type re-raises below.
+            SNAPSHOT_CONTENTION[f"{name}:retry"] += 1
+            if attempt == _SNAPSHOT_COPY_ATTEMPTS - 1:
+                SNAPSHOT_CONTENTION[f"{name}:abandoned"] += 1
+                return None
+            continue
+        # The zero filter runs on `raw`, which nothing else holds a reference
+        # to, so it cannot race however long it takes.
+        return {k: v for k, v in raw.items() if v}
+    return None
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
 # THE REGISTRY
 # ===========================================================================
 #
@@ -166,6 +268,13 @@ _REGISTRY_SPEC = (
      "RUNNING with a NULL finished_at -- the rows it produced are fine and "
      "the record of the run that produced them is not. There is no start-side "
      "key here because start_run_record RAISES rather than counting"),
+    ("RUN_METRICS_FLUSH_FAILURES", _database_logger.RUN_METRICS_FLUSH_FAILURES,
+     "a run's HEALTH RECORD could not be written to `run_metrics`, so the "
+     "persisted copy of this block is stale by at least one flush and a "
+     "crashed campaign's would be stale by whatever moved after the last one "
+     "that landed. THE COUNTER IS READ HERE AND NOT FROM THAT TABLE, "
+     "necessarily: a row recording that the flush failed could only be written "
+     "by the flush that just failed"),
     ("JOURNAL_MODE_DEGRADATIONS", _database_logger.JOURNAL_MODE_DEGRADATIONS,
      "the database is not in the journal mode SQLITE_JOURNAL_MODE asked for; "
      "keyed requested->actual"),
@@ -175,6 +284,11 @@ _REGISTRY_SPEC = (
     ("EMIT_FAILURES", _observability.EMIT_FAILURES,
      "a console or log line could not be written; THIS REPORT IS ITSELF "
      "SUSPECT when this is non-zero"),
+    ("SNAPSHOT_CONTENTION", SNAPSHOT_CONTENTION,
+     "a counter was being written by one thread while another was reading this "
+     "registry, keyed by counter name; ':retry' means the copy was retaken and "
+     "the reading is sound, ':abandoned' means it was not and THAT COUNTER IS "
+     "MISSING from the snapshot that flush wrote"),
     ("FINGERPRINT_DEGRADATIONS", _run_fingerprint.FINGERPRINT_DEGRADATIONS,
      "this run's own configuration could not be established -- the backing "
      "collection or its point count came back unknown -- so every resume gate "
@@ -242,8 +356,12 @@ def snapshot() -> Dict[str, Dict[str, int]]:
     heading that means "these fired" is a lie about which is which.
     """
     out: Dict[str, Dict[str, int]] = {}
-    for name, counter in _REGISTRY.items():
-        live = {k: v for k, v in counter.items() if v}
+    # list() FIRST, because register() can insert into _REGISTRY at import time
+    # and this loop is now reached from worker threads. Copying each counter is
+    # _copy_counter's job -- see the block at the top of this module for why a
+    # bare comprehension over a live Counter is not safe here any more.
+    for name, counter in list(_REGISTRY.items()):
+        live = _copy_counter(name, counter)
         if live:
             out[name] = dict(sorted(live.items()))
     return out

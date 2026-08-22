@@ -1191,6 +1191,145 @@ creation failure stops the run rather than being counted and continued past.
 #------------------------------------------------------------------------------
 
 
+# ===========================================================================
+# RUN METRICS: THE HEALTH RECORD, WRITTEN WHILE THE RUN IS STILL ALIVE
+# ===========================================================================
+#
+# THE GAP. ``oncotriage/degradation.py`` reads twenty-odd module-level counters
+# at the END of a run and prints them. That block is the only reader, so the
+# whole health record of a campaign lives in one process's memory until the
+# moment it exits -- and a campaign that CRASHES prints nothing, which means a
+# 22,000-patient run that died at patient 19,000 leaves no record of what
+# degraded on the way. The `runs` row it leaves behind says RUNNING with a NULL
+# `finished_at` and nothing else. Nor can anything watch a live run: the numbers
+# exist, and there is no way to ask for them from outside the process.
+#
+# `run_metrics` is that record, on disk, refreshed as the run proceeds.
+#
+# NARROW, ON `drift_metrics`' PRECEDENT. (run_id, category, name, value) plus
+# when it was written. The alternative -- one column per counter -- would mean a
+# schema migration every time a counter joins the registry, which is exactly the
+# trade `drift_metrics` already declined for metric names that grow the same way.
+#
+# WHAT MAY GO IN IT, AND THE LINE IS NOT A CONVENTION -- IT IS ENFORCED BELOW.
+# Counter NAMES and TOTALS only, which is ``degradation.totals()``'s output and
+# deliberately NOT ``degradation.snapshot()``'s. That module's own docstring is
+# the authority: counter KEYS carry third-party and clinical text --
+# SEX_UNKNOWN_KEPT is keyed by the patient's recorded sex, M_CATEGORY_UNREADABLE
+# by a capped copy of an observation's display text -- and this table is a
+# DURABLE, run-keyed record, which is precisely what LOGGABLE_FIELDS exists to
+# keep that text out of. The detail keeps going to the console, which is
+# transient and unindexed.
+#
+# `_run_metric_rows` refuses a mapping that is not name->int, and it identifies
+# a name by ``str.isidentifier()`` -- counter names are Python module-level
+# variable names by construction, and no key this project produces is one
+# ("unconverted:Sodium mmol/L" is not). That is the mechanical guarantee, rather
+# than an instruction in a docstring that a future caller reads or does not.
+
+
+RUN_METRIC_CATEGORY_DEGRADATION = "degradation"
+"""``run_metrics.category`` for a row that IS one of the registry's counters."""
+
+RUN_METRIC_CATEGORY_META = "meta"
+"""``run_metrics.category`` for a row ABOUT the flush rather than about the run.
+
+SEPARATE FROM THE COUNTERS, so ``WHERE category = 'degradation'`` is the set of
+things that actually degraded and nothing else. A meta row under the same
+category would be summed by every aggregate over that column.
+"""
+
+RUN_METRIC_CATEGORIES = (RUN_METRIC_CATEGORY_DEGRADATION,
+                         RUN_METRIC_CATEGORY_META)
+"""Every value ``run_metrics.category`` may hold. CLOSED, on
+``RUN_RECORD_STATUSES``' footing: a reader may branch on it exhaustively, and a
+category outside it is a row no ``WHERE category = ...`` will return.
+"""
+
+
+RUN_METRIC_META_COUNTERS_REGISTERED = "counters_registered"
+"""How many counters were CONSULTED, whatever they read.
+
+THE ROW THAT MAKES SILENCE READABLE, and it is the reason a clean run writes
+anything at all. ``totals()`` drops every zero counter, so a run that degraded
+in no way contributes no `degradation` rows -- and "no rows" is exactly what a
+run whose flushing was never wired up looks like, and what a run that crashed
+before its first flush looks like. With this row:
+
+    no run_metrics rows for a run_id        nothing ever flushed for it
+    counters_registered = N, no others      N counters were read and all N were
+                                            zero -- a MEASUREMENT of health
+    counters_registered = N, plus rows      those are what moved
+
+Same argument, one layer down, as ``degradation.report_lines`` printing "all N
+counters are zero" rather than printing nothing.
+"""
+
+RUN_METRIC_META_COUNTERS_NONZERO = "counters_nonzero"
+"""How many of the consulted counters were non-zero at this flush.
+
+Derivable by counting the `degradation` rows, and stored anyway: it is the one
+value that lets ``WHERE category='meta'`` alone answer "was this run clean",
+without a second query whose empty result has two possible meanings.
+"""
+
+RUN_METRIC_META_NAMES = (RUN_METRIC_META_COUNTERS_REGISTERED,
+                         RUN_METRIC_META_COUNTERS_NONZERO)
+"""Every ``name`` written under ``RUN_METRIC_CATEGORY_META``. CLOSED."""
+
+
+RUN_METRICS_FLUSH_FAILURES = Counter()
+"""Health flushes that did not land, keyed by what went wrong.
+
+MODULE-LEVEL, AND THE REQUIREMENT IS SHARPER HERE THAN FOR ITS NEIGHBOURS: this
+counter records the failure of the mechanism that persists counters, so a row in
+`run_metrics` recording it could only be written by the thing that just failed.
+It is registered in ``oncotriage/degradation.py``'s ``_REGISTRY_SPEC`` and read
+by the run-end block, which needs no database at all.
+
+Keys are ``flush:no_run_id``, ``flush:not_a_mapping:{type}``,
+``flush:bad_registered_count:{type}``, ``flush:non_integer_value``,
+``flush:nested_value`` (the ``snapshot()``-instead-of-``totals()`` mistake, which
+is the one that would carry clinical text), ``flush:non_identifier_name`` and
+``flush:{ExceptionType}``.
+
+THE TWO SHAPE KEYS DELIBERATELY CARRY NO OFFENDING VALUE. Every other counter in
+this project keys by the thing that went wrong; this one may not, because the
+thing that went wrong here IS the text this table exists to exclude. The value
+goes to the console -- once per process per reason, `_apply_journal_mode`'s
+"loud, once" shape -- where it is transient.
+
+IT IS ALWAYS ONE FLUSH BEHIND ITSELF, stated rather than discovered: a failure
+counted during flush N is written to the table by flush N+1, and a failure in
+the LAST flush of a run never reaches the table at all. That is inherent -- see
+the first paragraph -- and it is why the run-end degradation block, not this
+table, is the authority on it.
+"""
+
+_RUN_METRIC_SHAPE_ANNOUNCED = set()
+"""Reasons a malformed flush has already been announced on the console.
+
+The flush runs once per patient, so a caller passing the wrong mapping would
+otherwise print the same line 22,000 times. The COUNTER still increments every
+time, so the total is honest; only the console line is deduplicated.
+"""
+
+_ANNOUNCE_LOCK = threading.Lock()
+"""Guards ``_RUN_METRIC_SHAPE_ANNOUNCED``'s check-then-act.
+
+A LOCK OF ITS OWN RATHER THAN ``_WRITE_LOCK``, deliberately. That lock's
+invariant -- and the thing ``tests/test_package_invariants.py`` section 5e's
+control counts by stripping -- is "every DATABASE STATEMENT in this file is
+issued under ``_WRITE_LOCK``". This guards a set, not a statement, and
+borrowing the write lock for it would make that count mean two things at once.
+
+A plain ``Lock``, not an ``RLock``: nothing taken under it re-enters.
+"""
+
+
+#------------------------------------------------------------------------------
+
+
 # Who calls initialize_database(), and when.
 #
 # Both, deliberately:
@@ -1519,7 +1658,14 @@ _WRITE_LOCK = threading.RLock()
 
 
 def initialize_database(db_path):
-    """Create the three tables at db_path and apply the additive migrations.
+    """Create the five tables at db_path and apply the additive migrations.
+
+    THE COUNT IN THAT SENTENCE IS THE ONE THING IN THIS DOCSTRING THAT CAN ROT,
+    and it had already: it read "three" through the run-identity pass, which
+    added `runs`. It is five now -- runs, inferences, trial_matches,
+    drift_metrics, run_metrics -- and
+    ``tests/test_storage_run_metrics_flush.py`` pins the set by name so the
+    next addition fails a check rather than leaving a stale number here.
 
     Idempotent: every CREATE is IF NOT EXISTS and every ALTER is guarded by a
     PRAGMA table_info check, so calling this on an existing database adds only
@@ -1762,6 +1908,67 @@ CREATE TABLE IF NOT EXISTS drift_metrics (
     notes TEXT
 )
 ''')
+
+
+    # Run metrics table (the health-persistence pass)
+    #
+    # CREATED LAST AND THAT IS DELIBERATE, on the same rule the `runs` comment
+    # states: a table's creation must not precede the table it references. It
+    # only has to come after `runs`, and appending it leaves the four existing
+    # tables' positions in `sqlite_master` exactly where they were -- which is
+    # the order `empty_database` deletes in.
+    #
+    # `run_id` IS UNENFORCED, for the four reasons written out at `runs`. Note
+    # the fourth applies here more strongly rather than less: every row this
+    # table holds is written by `flush_run_metrics`, which is handed the id the
+    # same process obtained from `start_run_record` minutes earlier, into the
+    # same file, under the same lock.
+    #
+    # `value` IS INTEGER, NOT REAL. `drift_metrics.metric_value` is REAL because
+    # a KS statistic is; every value here is a `Counter` total or a count of
+    # counters, and both are whole. Declaring REAL would render every total as
+    # `412.0` to a reader and invite an average over a column of event counts.
+    #
+    # NO UNIQUE CONSTRAINT, AND THE FLUSH IS DELETE-AND-INSERT RATHER THAN AN
+    # UPSERT. Three reasons, in the order they decided it:
+    #
+    #   1. THE TWO ARE NOT EQUIVALENT AND DELETE-AND-INSERT IS THE CORRECT ONE.
+    #      An upsert keyed on (run_id, name) replaces the counters the new flush
+    #      CARRIES and leaves behind any row whose counter is no longer in the
+    #      set. That never happens during a run -- the counters are cumulative
+    #      and `totals()` drops zeros, so the name set only grows -- but it
+    #      happens the moment anything clears a counter (`degradation.clear_all`
+    #      exists and a harness uses it), and the residue would be a stale
+    #      non-zero total presented as current. Replacing the run's whole
+    #      picture cannot leave residue by construction.
+    #   2. IT IS ONE TRANSACTION, so a concurrent reader on another connection
+    #      sees the previous flush or this one, never a half-replaced mixture of
+    #      the two. That is what makes "a dashboard can read health live" a safe
+    #      thing to offer.
+    #   3. THERE IS NO UNIQUE CONSTRAINT ANYWHERE IN THIS SCHEMA and adding the
+    #      first one to enable `ON CONFLICT` would make an IntegrityError
+    #      reachable on the write path -- which `_is_retryable` classes as
+    #      TERMINAL, so a row that today lands would instead be given up on.
+    #
+    # THE INDEX IS NOT DECORATION. That DELETE runs once per completed patient,
+    # against a table that accumulates across every run the database has ever
+    # held; without it each flush of a 22,000-patient run scans the whole
+    # history. It is IF NOT EXISTS for the same idempotence reason every CREATE
+    # here is.
+    cursor.execute('''
+CREATE TABLE IF NOT EXISTS run_metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    category TEXT NOT NULL,
+    name TEXT NOT NULL,
+    value INTEGER,
+    written_at TEXT NOT NULL
+)
+''')
+
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_run_metrics_run_id "
+        "ON run_metrics(run_id)")
 
 
     conn.commit()
@@ -2029,6 +2236,270 @@ def finalize_run_record(run_id, status, db_path=None):
                   "RUNNING with a NULL finished_at",
                   event="run_record_finalize_failed",
                   inference_run_id=run_id, status=str(status),
+                  error_type=type(exc).__name__, error_message=str(exc))
+        return False
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
+# THE HEALTH FLUSH
+# ===========================================================================
+
+
+def _note_run_metric_shape(reason, detail):
+    """Count a malformed-flush reason; announce it on the console ONCE.
+
+    ``reason`` is a fixed identifier and goes into the counter. ``detail`` is
+    whatever the caller handed over that should not have been -- possibly the
+    third-party or clinical text this table exists to exclude -- so it reaches
+    the CONSOLE, which is transient and unindexed, and nothing else. Not the
+    counter, whose totals are written to the very table in question; not the
+    structured log, which is durable and correlation-keyed.
+
+    ONCE PER REASON PER PROCESS, on ``_apply_journal_mode``'s footing: the flush
+    runs once per completed patient, and a caller passing the wrong mapping
+    would otherwise print an identical line for every patient of the run.
+
+    RETURNS NOTHING. It was written returning False, and every caller then read
+    ``return _note_run_metric_shape(...) and None`` -- which is ``False``, not
+    ``None``, so the refusal sentinel the caller tests for was never produced
+    and the malformed rows reached the insert loop as a bool. Caught by running.
+    """
+    RUN_METRICS_FLUSH_FAILURES[f"flush:{reason}"] += 1
+    with _ANNOUNCE_LOCK:
+        first = reason not in _RUN_METRIC_SHAPE_ANNOUNCED
+        _RUN_METRIC_SHAPE_ANNOUNCED.add(reason)
+    if first:
+        console.out(
+            f"⚠ run_metrics: a health flush was refused -- {reason}. "
+            f"Offending value (console only, deliberately not stored): "
+            f"{detail!r}\n"
+            f"    flush_run_metrics() takes degradation.totals(), which is "
+            f"{{counter name: int}}. degradation.snapshot() is the nested form "
+            f"and its KEYS carry clinical and third-party text; it must not "
+            f"reach a durable table. This will not be printed again this "
+            f"process; RUN_METRICS_FLUSH_FAILURES keeps counting.")
+
+
+def _run_metric_rows(totals, counters_registered):
+    """``(category, name, value)`` triples for one flush, or ``None`` to refuse.
+
+    THE WHOLE FLUSH IS REFUSED ON ANY BAD MEMBER rather than the bad member
+    being skipped, and that is the deliberate choice. A name that is not an
+    identifier or a value that is not an int means this mapping did not come
+    from ``degradation.totals()`` -- so every OTHER member of it is suspect too,
+    and writing them would produce a partial record that reads as a complete
+    one. Refusing is loud (a counter on the run-end report, and one console
+    line) where a partial write is silent.
+
+    ``str.isidentifier()`` IS THE TEST FOR A COUNTER NAME. Registry names are
+    module-level Python variable names by construction, so every legitimate one
+    passes; every key any counter in this project produces fails it, because
+    they are built from exception types, units, statuses and observation text
+    with separators in them. It is a mechanical guarantee rather than a promise.
+
+    ``bool`` IS NOT AN INT HERE -- ``isinstance(True, int)`` is True, and a
+    total of 1 that was really a True is a number nobody counted. Same trap, and
+    the same exclusion, as ``RUN_FINGERPRINT_INTEGER_COLUMNS``.
+    """
+    if isinstance(counters_registered, bool) or not isinstance(counters_registered, int):
+        _note_run_metric_shape(
+            f"bad_registered_count:{type(counters_registered).__name__}",
+            counters_registered)
+        return None
+    if counters_registered < 0:
+        _note_run_metric_shape("bad_registered_count:negative",
+                               counters_registered)
+        return None
+    if not isinstance(totals, dict):
+        _note_run_metric_shape(f"not_a_mapping:{type(totals).__name__}",
+                               type(totals).__name__)
+        return None
+
+    rows = []
+    for name, value in totals.items():
+        if not isinstance(name, str) or not name.isidentifier():
+            _note_run_metric_shape("non_identifier_name", name)
+            return None
+        # NESTED FIRST, because it is the ONE malformed shape that would carry
+        # clinical text -- a caller who passed snapshot() instead of totals().
+        # Reported under its own key so that mistake is diagnosable rather than
+        # arriving as a generic "not an integer".
+        if isinstance(value, (dict, list, tuple, set)):
+            _note_run_metric_shape("nested_value", name)
+            return None
+        if isinstance(value, bool) or not isinstance(value, int):
+            _note_run_metric_shape("non_integer_value", name)
+            return None
+        rows.append((RUN_METRIC_CATEGORY_DEGRADATION, name, value))
+
+    # THE META ROWS GO LAST so the insert order matches the read order a human
+    # would want, and they are built from the SAME two facts the caller just
+    # supplied -- `counters_nonzero` is len(rows) rather than a second count of
+    # the same mapping, so the two cannot disagree.
+    rows.append((RUN_METRIC_CATEGORY_META,
+                 RUN_METRIC_META_COUNTERS_REGISTERED, counters_registered))
+    rows.append((RUN_METRIC_CATEGORY_META,
+                 RUN_METRIC_META_COUNTERS_NONZERO, len(rows) - 1))
+    return rows
+
+
+def flush_run_metrics(run_id, totals, counters_registered, db_path=None):
+    """Replace ``run_id``'s health rows with ``totals``. NEVER RAISES.
+
+    Args:
+        run_id: what ``start_run_record`` returned. ``None`` is tolerated and
+            counted, exactly as ``finalize_run_record`` tolerates it: a caller
+            with no run row has nothing to attach metrics to, and making that an
+            exception would turn a missing index entry into a crash inside a
+            worker thread's done-callback.
+        totals: ``{counter name: int}`` -- ``oncotriage/degradation.py``'s
+            ``totals()``, and NOT its ``snapshot()``. See ``_run_metric_rows``
+            for what is checked and why the check is mechanical.
+
+            TAKEN AS AN ARGUMENT AND NOT READ HERE, for two reasons and either
+            would be sufficient. The layering one: ``oncotriage.degradation``
+            imports THIS module, so this module cannot import it back. The
+            correctness one, which is the reason that would matter even without
+            it: the run-end flush must describe the SAME instant as the printed
+            report and the logged summary, and the only way to guarantee that is
+            for one snapshot to be taken once and handed to all three.
+        counters_registered: how many counters were consulted to produce
+            ``totals``. REQUIRED, with no default, on
+            ``empty_database(db_path, flag)``'s precedent -- a default would
+            write a number nobody measured into the one row whose job is to say
+            how much was measured.
+        db_path: which database. ``None`` means the configured production one,
+            through the same resolver ``log_inference`` uses.
+
+    Returns:
+        True if the rows landed. False on every failure, so a caller that wants
+        to know can ask; the shipped callers do not, because
+        ``RUN_METRICS_FLUSH_FAILURES`` and the log line are what an operator
+        reads.
+
+    IT MAY NOT RAISE, AND THE REASONING IS ``finalize_run_record``'s VERBATIM
+    rather than by analogy. It is called from ``_on_done``, a done-callback on a
+    worker thread, once per completed patient -- so by the time it runs, that
+    patient has cost a live Stage 5 call, and an exception there would be
+    swallowed by ``concurrent.futures`` and logged to somebody else's logger
+    where nothing in this project reads it. A health record that can destroy the
+    run it describes is worse than no health record.
+
+    "NEVER RAISES" MEANS ``except Exception``, so what escapes is what is not an
+    ``Exception`` subclass -- ``KeyboardInterrupt``, ``SystemExit`` and
+    ``GeneratorExit`` -- exactly as it escapes ``_write_inference_row`` and
+    ``finalize_run_record``. A flush that swallowed a Ctrl-C would leave an
+    operator holding a key down against a run that will not stop.
+
+    NOTE THE CORRECTION, because the sentence above is copied from
+    ``finalize_run_record``'s docstring and that one names ``MemoryError`` as a
+    thing that escapes. It does not: ``issubclass(MemoryError, Exception)`` is
+    True, so this handler catches it. Measured rather than repeated. The
+    neighbouring docstring is a REPORTED FINDING of this pass and is left as
+    written, because correcting a claim in a function this pass does not
+    otherwise touch is a separate edit.
+
+    PATH RESOLUTION IS INSIDE THE TRY, which is ``finalize_run_record``'s
+    knowing deviation repeated here for its reason. Everywhere else in this
+    module it happens outside, so a configuration defect --
+    ``resolve_inferences_db`` raises when the variable names a path whose parent
+    is absent -- reaches the operator instead of being swallowed as a logging
+    fault. The deviation is forced by the contract: this may not raise, full
+    stop. It costs nothing in practice, because ``start_run_record`` resolved
+    the same way before the run began and would have failed first, and the
+    defect is not hidden -- it is counted under its exception type and logged at
+    ERROR.
+
+    THREAD SAFETY IS ``_WRITE_LOCK``, the same one every other statement in this
+    module is issued under -- and what it buys is stated as MEASURED rather than
+    as argued, because the two are not the same here.
+
+    MEASURED: a revert harness stripped this lock and drove MAX_WORKERS threads
+    through the flush behind a barrier, and NOTHING WAS LOST OR DUPLICATED. That
+    is the same honest finding ``tests/test_package_invariants.py`` section 5e
+    records for the steady-state INSERT path, and it has the same cause: with
+    ``sqlite3``'s default isolation level the DELETE opens a transaction that
+    the executemany and the commit finish, and SQLite's own file locking already
+    refuses a second write transaction while one is open.
+
+    SO WHY IT IS TAKEN, in the order the reasons decided it. First, the module's
+    invariant is "every database statement in this file is issued under
+    ``_WRITE_LOCK``", and an invariant with a documented exception is a
+    convention -- ``start_run_record`` takes it for the same reason on a path
+    that is main-thread-only. Second, it converts contention from MAX_WORKERS
+    threads busy-waiting on SQLite's ``busy_timeout`` into an uncontended
+    in-process queue. Third, and this is the one that would bite: the atomicity
+    above is a property of the DEFAULT isolation level. Set
+    ``isolation_level=None`` on ``_open_connection`` -- one keyword, and
+    autocommit is a plausible future edit -- and the DELETE and the INSERTs
+    become separate transactions, at which point two flushes really can
+    interleave and the loser's rows really are wiped after they were written.
+    The lock is what makes that edit safe instead of silently destructive.
+
+    The single transaction is what makes it atomic with respect to READERS on
+    other connections, which is the half a lock cannot provide at all.
+
+    THE DELETE IS SCOPED TO ONE ``run_id``. Rows belonging to other runs -- and
+    every historical run in the same file -- are untouched.
+    """
+    try:
+        if run_id is None:
+            RUN_METRICS_FLUSH_FAILURES["flush:no_run_id"] += 1
+            log.warning("a health flush was asked for with no run id; nothing "
+                        "was written",
+                        event="run_metrics_flush_skipped",
+                        count=len(totals) if isinstance(totals, dict) else 0)
+            return False
+
+        rows = _run_metric_rows(totals, counters_registered)
+        if rows is None:
+            # Already counted and announced by _note_run_metric_shape. Logged
+            # here with the COUNT only -- never a name, never a value.
+            log.error("a health flush was refused because its totals were not "
+                      "the {name: int} form; nothing was written",
+                      event="run_metrics_flush_refused",
+                      inference_run_id=run_id,
+                      count=len(totals) if isinstance(totals, dict) else 0)
+            return False
+
+        db_path = resolve_inference_db_path(db_path)
+        written_at = datetime.now().isoformat()
+
+        with _WRITE_LOCK:
+            _ensure_database(db_path)
+            conn = _open_connection(db_path)
+            try:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM run_metrics WHERE run_id = ?",
+                               (run_id,))
+                cursor.executemany(
+                    "INSERT INTO run_metrics "
+                    "(run_id, category, name, value, written_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    [(run_id, category, name, value, written_at)
+                     for category, name, value in rows])
+                conn.commit()
+            finally:
+                conn.close()
+
+        # DEBUG, NOT INFO. This fires once per completed patient; at INFO a
+        # 22,000-patient run would put 22,000 identical records into the
+        # structured stream for a fact whose current value is already in the
+        # table. The failure paths above stay at WARNING and ERROR.
+        log.debug("run health flushed", event="run_metrics_flushed",
+                  inference_run_id=run_id, count=len(rows),
+                  db_path=str(db_path))
+        return True
+
+    except Exception as exc:                                   # noqa: BLE001
+        RUN_METRICS_FLUSH_FAILURES[f"flush:{type(exc).__name__}"] += 1
+        log.error("a health flush failed; this run's persisted degradation "
+                  "record is stale by at least one flush",
+                  event="run_metrics_flush_failed",
+                  inference_run_id=run_id,
                   error_type=type(exc).__name__, error_message=str(exc))
         return False
 

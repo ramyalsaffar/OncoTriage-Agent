@@ -533,6 +533,18 @@ python tests/test_storage_packing_and_cache_columns.py              # 124
 # _EXEC_ALLOWLIST. Bucket A, ~2.5 s.
 python tests/test_storage_provenance_persistence.py                 # 126
 
+# The health-persistence pass. Same shape, same directory. No network, no keys,
+# no spend, no live Qdrant, no model load, no corpus, no git history, and NOT in
+# the collision matrix -- every database is a temp file, paths._RESOLVED is
+# seeded so nothing can resolve to the production tree, and the three package
+# files it reads (storage/database_logger.py, batch/runner.py,
+# evaluation/sampling.py) are written by neither of the suite's two writers. It
+# EXECS NOTHING: every control is a real failing condition created on disk, an
+# alternative implementation written out for comparison, or an ast walk over a
+# parsed source file. Bucket A, ~12 s (section 7 drives MAX_WORKERS threads
+# through the flush behind a barrier while another inserts counter keys).
+python tests/test_storage_run_metrics_flush.py                      # 123
+
 # The run-identity pass. Same shape, same directory. No network, no keys, no
 # spend, no live Qdrant, no model load, no corpus, no git history, and NOT in
 # the collision matrix -- every database is a temp file, paths._RESOLVED is
@@ -4820,6 +4832,143 @@ Stage 5 call per patient — so the run lifecycle is proved by driving what
 "success" entry makes `_on_done` call `save_checkpoint()`, which with no
 fingerprint argument resolves `run_fingerprint.current()` — a live Qdrant round
 trip, in a file that is bucket A.
+
+
+### A run's health record survives the process (the health-persistence pass)
+
+**`oncotriage/degradation.py`'s TWENTY-ODD COUNTERS HAD EXACTLY ONE READER —
+THE BLOCK `main()` PRINTS WHEN A RUN FINISHES.** So the whole health record of a
+campaign lived in one process's memory until it exited, with two consequences: a
+campaign that CRASHED printed nothing, and everything its counters held about
+the 19,000 patients it did complete died with it; and nothing outside the
+process could ask a LIVE run how it was going. `run_metrics` is that record on
+disk, refreshed as the run proceeds.
+
+**NARROW, ON `drift_metrics`' PRECEDENT** — `(run_id, category, name, value,
+written_at)` — because one column per counter would mean a schema migration
+every time a counter joins the registry, which is the trade `drift_metrics`
+already declined. `value` is INTEGER, not REAL: every value is a `Counter` total
+or a count of counters, and REAL would render `412.0` and invite an average over
+a column of event counts.
+
+**COUNTER NAMES AND TOTALS ONLY, AND IT IS ENFORCED RATHER THAN CONVENED.**
+`snapshot()`'s KEYS carry third-party and clinical text — SEX_UNKNOWN_KEPT is
+keyed by the patient's recorded sex, M_CATEGORY_UNREADABLE by a capped
+observation display — and this is a DURABLE, run-keyed table, which is what
+LOGGABLE_FIELDS exists to keep that text out of. `_run_metric_rows` refuses any
+mapping that is not `{name: int}` and identifies a name by **`str.isidentifier()`**:
+counter names are module-level Python variable names by construction and no key
+this project produces is one. **The whole flush is refused on any bad member**,
+not the member skipped — a name that is not an identifier means the mapping did
+not come from `totals()`, so the rest of it is suspect too, and a partial write
+reads as a complete one.
+
+**DELETE-AND-INSERT, NOT AN UPSERT, and the two are not equivalent.** An upsert
+keyed on (run_id, name) replaces the names the new flush carries and leaves
+behind any counter that has LEFT the set — which never happens while counters
+are cumulative, and happens the moment anything clears one, leaving a stale
+non-zero total presented as current. One transaction also means a reader sees
+the previous flush or this one, never a mixture. And there is no UNIQUE
+constraint anywhere in this schema; adding the first one to enable `ON CONFLICT`
+would make `IntegrityError` reachable on a write path where `_is_retryable`
+classes it TERMINAL.
+
+**THE META ROW IS WHAT MAKES SILENCE READABLE.** `totals()` drops every zero
+counter, so a clean run contributes no `degradation` rows — which is also what a
+run whose flushing was never wired contributes. `meta/counters_registered` and
+`meta/counters_nonzero` separate the three states in one query: no rows at all is
+"nothing ever flushed", `counters_nonzero = 0` is a MEASUREMENT of health.
+
+**IT IS HOSTED IN `_on_done` AND DELIBERATELY NOT ON `save_checkpoint()`.** That
+call is the obvious per-patient completion point and it sits inside
+`if entry["status"] == "success":` — so a pass in which every patient ERRORED
+would flush nothing, and errors are exactly when REFUSALS_OBSERVED,
+MALFORMED_EVALUATION_ENTRIES and INFERENCE_WRITE_FAILURES move. **EVERY PATIENT,
+MEASURED**: 0.492 ms per flush with the `run_id` index and a 50,000-row history,
+1.212 ms without it, against a ~68-second per-patient median. A cadence knob was
+rejected — its only safe value is 1.
+
+**THE FINAL FLUSH USES `main()`'s ONE SNAPSHOT**, the same object
+`degradation.log_summary` and `print_summary` are handed, so the rows, the
+structured event and the printed block describe one instant. The crash handler
+flushes too, BEFORE `finalize_run_record(..., "KILLED")`, so the record is
+current at the moment the run is marked killed.
+
+**`snapshot()` HAD NEVER BEEN CALLED WHILE A WORKER WAS WRITING, and this pass
+is what made that happen.** Its dict comprehension over `counter.items()`
+executes Python bytecode per item, so a key inserted by another thread in that
+window raises `RuntimeError: dictionary changed size during iteration`. It is
+`dict.copy(counter)` now — one call into `PyDict_Copy`, no Python bytecode
+inside it — with the zero filter applied to the private copy, a bounded retry
+kept as a second line of defence and `SNAPSHOT_CONTENTION` registered so a retry
+or an abandonment is on the report rather than silent. **Found by running**: the
+first implementation abandoned a counter on the test's first run.
+
+**WHAT THE LOCK ACTUALLY BUYS, MEASURED RATHER THAN ARGUED.** Stripping
+`_WRITE_LOCK` from the flush and driving MAX_WORKERS threads through it loses
+NOTHING — with sqlite3's default isolation level the DELETE opens a transaction
+the commit finishes, and SQLite's own file locking refuses a second write
+transaction meanwhile. That is section 5e's honest finding about the
+steady-state insert path, again. The lock is taken anyway: the module's
+invariant is "every database statement in this file is under `_WRITE_LOCK`", it
+converts busy-waiting into an in-process queue, and it is what makes
+`isolation_level=None` — one keyword, a plausible future edit — a safe change
+instead of a silently destructive one. **`_note_run_metric_shape` takes its own
+`_ANNOUNCE_LOCK`**, because it guards a set rather than a statement and
+borrowing the write lock would make section 5e's count mean two things at once.
+That count moves **5 → 6**; `tests/test_storage_write_durability.py` reads it
+out of that file by AST, so it needed no edit.
+
+**FRESHNESS IS WEAKER THAN ATOMICITY AND IS STATED AS SUCH.** The snapshot is
+taken in `flush_health`, outside the writer's lock, so two workers can snapshot
+at 5 and 6 events and land in the other order — the table reads 5 until the next
+patient finishes. Bounded by one patient, self-healing, and `written_at` is what
+a reader consults. Not a corruption, and not fixed by holding a database lock
+across a registry read every worker is writing to.
+
+**`RUN_METRICS_FLUSH_FAILURES` IS ON THE RUN-END REPORT AND CANNOT BE ON THE
+TABLE** — a row recording that the flush failed could only be written by the
+flush that just failed. It is always one flush behind itself, and the last
+flush's failure never reaches the table at all; that is inherent, and the
+console block is the authority. `flush_health` guards the registry READ too and
+counts into the same counter under `flush:registry_read:{Type}`: the fact an
+operator acts on is "this run's health record did not land", and splitting it in
+two by which half failed would put one event in two places on the report.
+
+**THE SAMPLE DATABASE GETS THE SCHEMA AND NOT THE ROWS** — the `drift_metrics`
+treatment, and a decision. A `runs` row holds a CONFIGURATION, equally true of
+any subset of a campaign's patients; a `run_metrics` row holds a COUNT
+aggregated over a population a 30-patient extract does not contain, and the
+narrow shape has no column that could carry the denominator to contradict
+"this sample had 412 age-unit assumptions".
+
+**VERIFIED BY RUNNING.** `tests/test_storage_run_metrics_flush.py` is **123
+checks, bucket A, ~12 s**, with **FIFTEEN REVERTS, FIFTEEN CAUGHT** (each
+applied to a `copytree`'d copy with a realpath preflight and
+`PYTHONDONTWRITEBYTECODE=1`; every plant asserted to have an exact occurrence
+count, so a plant that matched nothing is a named PLANT-FAILED). **Three of the
+fifteen were MISSED on the first run and each was a real gap in the checks
+rather than a weak revert** — the `isidentifier` guard had no test that could
+see it removed (`totals()` produces identifier names, so no assertion about the
+TABLE can), the lock had no behavioural subject (see above; it is pinned
+structurally now), and the racy comprehension was recovered by the retry often
+enough that the thread pool did not catch it (a counter that mutates itself
+while its `items()` view is walked catches it deterministically).
+Bucket A **52/52**, the serial runner **5/5** with `oncotriage/config.py` and
+`oncotriage/registries/cancer_code_registry.py` confirmed restored,
+`tests/test_package_invariants.py` **260/0/0**, `python fixture_replay.py`
+**12/12 clean, exit 0, with no recapture**, and the production `inferences.db`
+sha256 **unchanged** — `ab1403e3…`, 90,185,728 bytes, before and after. **No
+money was spent and no migration was run against the production database**: the
+`run_metrics` table appears there on the next run that opens it, which is what
+`CREATE TABLE IF NOT EXISTS` in the shared initialize path is for.
+
+**ONE PRE-EXISTING DEFECT REPORTED AND NOT FIXED.**
+`finalize_run_record`'s docstring says `KeyboardInterrupt` and `MemoryError` are
+"not `Exception` subclasses" and therefore escape. `issubclass(MemoryError,
+Exception)` is **True**, so that handler catches it; the same sentence appears at
+`_write_inference_row`. Measured, corrected in the new function's own docstring,
+and left as written in the two this pass does not otherwise touch.
 
 
 ### Three Stage 5 corrections became queryable (the provenance-persistence pass)

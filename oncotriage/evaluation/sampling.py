@@ -171,7 +171,33 @@ SAMPLE_DB_FILENAME = sample_db_filename()
 # A SOURCE DATABASE WITHOUT THE TABLE DEGRADES SILENTLY AND CORRECTLY. The
 # schema query is `name IN (...)`, so a pre-migration source simply yields one
 # row fewer and the row copy below finds no run ids to fetch.
-COPIED_TABLES = ("inferences", "trial_matches", "drift_metrics", "runs")
+#
+# `run_metrics` JOINED AT THE HEALTH-PERSISTENCE PASS, SCHEMA ONLY -- THE
+# drift_metrics TREATMENT, AND THE DECISION IS DELIBERATE RATHER THAN AN
+# OVERSIGHT. It hangs off `run_id` exactly as `runs` does, so the obvious move
+# is to copy the rows for the same run ids. It is the wrong move, and the reason
+# is what the two tables HOLD:
+#
+#   * a `runs` row holds a CONFIGURATION -- a prompt version, a renderer digest,
+#     a collection, a snapshot date. A configuration is equally true of any
+#     subset of the run's patients, so copying it beside 30 of them says nothing
+#     false.
+#   * a `run_metrics` row holds a COUNT, aggregated over every patient of the
+#     campaign. Copied beside a 30-patient extract of a 22,000-patient run it
+#     invites exactly one reading -- "this sample had 412 age-unit assumptions"
+#     -- and there is no column in the narrow shape that could carry the
+#     denominator to contradict it. Sampling an aggregate does not scale it, and
+#     a number that cannot be scaled must not travel with the subset.
+#
+# So the SCHEMA is copied, on the sentence above that put drift_metrics here: a
+# sample database that silently lacked the table would not open in a tool built
+# against the production schema, and `JOIN run_metrics` is a query somebody
+# building on `runs` will write. The table is present and empty, which is a
+# readable "this extract carries no campaign aggregates" rather than a wrong
+# number. The campaign's real health record stays queryable where it is honest
+# -- in the source database, joined to the whole run.
+COPIED_TABLES = ("inferences", "trial_matches", "drift_metrics", "runs",
+                 "run_metrics")
 
 
 #------------------------------------------------------------------------------

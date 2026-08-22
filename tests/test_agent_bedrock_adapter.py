@@ -1155,8 +1155,13 @@ check("matching_provider is TEXT in the real schema",
 # remains a plain string on `inferences`. The assertion is kept EXACT rather
 # than narrowed to "no table whose name mentions provider", because exact is
 # what makes it fail when a lookup table IS introduced under any name.
+# `run_metrics` JOINED AT THE HEALTH-PERSISTENCE PASS and is no more a lookup
+# table for this column than `runs` is: it holds one row per degradation counter
+# per campaign, keyed by `run_id`, and `matching_provider` remains a plain
+# string on `inferences`.
 check("...and no lookup table was introduced for it",
-      sorted(_tables), ["drift_metrics", "inferences", "runs", "trial_matches"])
+      sorted(_tables),
+      ["drift_metrics", "inferences", "run_metrics", "runs", "trial_matches"])
 check("...beside matching_model, which is TEXT for the same reason",
       at(_decl, "matching_model"), "TEXT")
 

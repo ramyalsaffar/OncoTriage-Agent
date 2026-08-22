@@ -704,6 +704,22 @@ BUCKETS = {
     "test_storage_wipe_all_tables.py": (
         _E, "the production inferences.db (it reads its real schema)",
         "'the production schema was read and is non-degenerate' failed"),
+    "test_storage_run_metrics_flush.py": (
+        _A, None,
+        "ran green in ~10s, 109 checks, against ONLY the directory skeleton: "
+        "the `run_metrics` table through the real initialize_database, the "
+        "real flush_run_metrics and the real runner.flush_health, plus "
+        "run_batch and run_resample driven with an erroring stand-in for "
+        "process_patient. Every database is a temp file, paths._RESOLVED is "
+        "seeded so nothing can resolve to the production tree, and "
+        "ONCOTRIAGE_INFERENCES_DB is cleared so an exported one cannot make "
+        "the isolation checks compare two scratch paths -- no network, no "
+        "keys, no spend, no live Qdrant, no model load, no corpus, no git. It "
+        "execs nothing: every control is a real failing condition created on "
+        "disk, an alternative implementation written out for comparison, or an "
+        "ast walk over a parsed source file. The ~10s is section 7's "
+        "MAX_WORKERS threads flushing behind a barrier while another inserts "
+        "counter keys under them"),
     "test_storage_run_identity.py": (
         _A, None,
         "ran green in ~1s, 119 checks, against ONLY the directory skeleton: the "
