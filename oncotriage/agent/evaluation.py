@@ -3349,6 +3349,12 @@ CLINICAL TRIALS:
                 "llm_classifier_retries": retry_count + 1,
                 "llm_classifier_truncation_splits": truncation_splits,
                 "llm_classifier_output_tokens_estimated": estimated_output,
+                # The two denominators the estimate above is read against,
+                # carried for its own reason: measured BEFORE the first call, so
+                # true of this run whether or not it answered. Argued in full at
+                # the success return.
+                "llm_classifier_output_split_threshold": split_threshold,
+                "llm_classifier_output_ceiling": MATCHING_MAX_TOKENS,
                 "llm_classifier_raw_response": "",
                 # What the calls that DID return were billed. Empty when this
                 # was the first request and no usage object ever arrived; see
@@ -3527,6 +3533,12 @@ CLINICAL TRIALS:
                 "llm_classifier_refusal": _refusal[:_REFUSAL_PREVIEW_LEN],
                 "llm_classifier_truncation_splits": truncation_splits,
                 "llm_classifier_output_tokens_estimated": estimated_output,
+                # The two denominators the estimate above is read against,
+                # carried for its own reason: measured BEFORE the first call, so
+                # true of this run whether or not it answered. Argued in full at
+                # the success return.
+                "llm_classifier_output_split_threshold": split_threshold,
+                "llm_classifier_output_ceiling": MATCHING_MAX_TOKENS,
                 # The refusal text is the whole of what the model returned, so
                 # it IS the raw response for this run. Capped by the same rule
                 # as the error string.
@@ -3646,6 +3658,12 @@ CLINICAL TRIALS:
                 "llm_classifier_retries": retry_count + 1,
                 "llm_classifier_truncation_splits": truncation_splits,
                 "llm_classifier_output_tokens_estimated": estimated_output,
+                # The two denominators the estimate above is read against,
+                # carried for its own reason: measured BEFORE the first call, so
+                # true of this run whether or not it answered. Argued in full at
+                # the success return.
+                "llm_classifier_output_split_threshold": split_threshold,
+                "llm_classifier_output_ceiling": MATCHING_MAX_TOKENS,
                 "llm_classifier_raw_response": chunk_text,
                 # A model DID answer here -- badly, but it answered -- so the
                 # run is not anonymous. Carried so that a patient whose retries
@@ -3709,6 +3727,12 @@ CLINICAL TRIALS:
                 "llm_classifier_retries": retry_count + 1,
                 "llm_classifier_truncation_splits": truncation_splits,
                 "llm_classifier_output_tokens_estimated": estimated_output,
+                # The two denominators the estimate above is read against,
+                # carried for its own reason: measured BEFORE the first call, so
+                # true of this run whether or not it answered. Argued in full at
+                # the success return.
+                "llm_classifier_output_split_threshold": split_threshold,
+                "llm_classifier_output_ceiling": MATCHING_MAX_TOKENS,
                 "llm_classifier_raw_response": chunk_text,
                 # A model DID answer here -- badly, but it answered -- so the
                 # run is not anonymous. Carried so that a patient whose retries
@@ -4782,6 +4806,30 @@ CLINICAL TRIALS:
         # patient that hit a single parse error and then needed two splits.
         "llm_classifier_truncation_splits": truncation_splits,
         "llm_classifier_output_tokens_estimated": estimated_output,
+        # ── What that estimate was judged against ──────────────────────
+        #
+        # THE SPLIT-PRESSURE MEASUREMENT, and it is stored rather than
+        # recomputed for the reason oncotriage/config.py already gives
+        # about this splitter: at MAX_TRIALS_FOR_EVALUATION = 15 the
+        # largest estimate this node can produce is 20,625 against a
+        # threshold of 28,800, so the proactive guard CANNOT FIRE and its
+        # counter will read zero forever. A guard that never fires and a
+        # guard that fires often are the same zero unless the headroom is
+        # on the row, and both constants behind these numbers have moved
+        # once already (the ceiling was 16,000 under GPT-4o).
+        #
+        # ON EVERY RETURN, NOT ONLY THIS ONE. Both are computed above the
+        # send loop, before any request is issued, so they are facts about
+        # this run whether or not it answered -- exactly the argument
+        # llm_classifier_patient_record_tokens and the prompt hash are
+        # carried on the failure paths by, and NOT hallucinated_trials'
+        # argument, which is about a check that may not have completed.
+        #
+        # THE INPUT GUARD IS ABSENT HERE ON PURPOSE: its estimate and both
+        # of its budgets are already inside llm_classifier_packing below,
+        # and a number derivable from a stored column is not stored twice.
+        "llm_classifier_output_split_threshold": split_threshold,
+        "llm_classifier_output_ceiling": MATCHING_MAX_TOKENS,
         "not_evaluable_truncated": not_evaluable_truncated,
         # How many entries the model returned for a trial that is in NO sent
         # set of this run -- FABRICATED ONLY. A cross-chunk repeat is dropped

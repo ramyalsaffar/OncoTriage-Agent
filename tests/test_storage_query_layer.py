@@ -136,6 +136,7 @@ is why the four that MUTATE are the four that are serialized.
 import ast
 import hashlib
 import io
+import json
 import os
 import re
 import shutil
@@ -549,6 +550,68 @@ _BASE_ROW = {
     "not_evaluable_truncated": 0, "llm_classifier_output_tokens_estimated": 5000,
 }
 
+# --- STAGE 5 SPLIT PRESSURE: the shapes the two pressure queries read ------
+#
+# BUILT HERE RATHER THAN IMPORTED. These two blobs stand in for what a database
+# written months ago holds, exactly as `cross_encoder_model` above does, so they
+# are literals of this file and not a call into the writer that produces them.
+# What DOES have to agree with the writer is the KEY SET, and that is asserted
+# in section 2c against oncotriage/agent/evaluation.py's own report rather than
+# claimed here.
+#
+# THE VALUES ARE CHOSEN SO NO PRESSURE READING CAN PASS DEGENERATELY. A seed in
+# which every chunk sits at the same fraction of its budget satisfies "the query
+# returned a number" while proving nothing about which number: peak, mean and
+# the two bucket counters would all agree for the wrong reason. So the rows
+# below span the whole range the guards can be in -- one run tight against both
+# budgets with a relaxed cap and an over-budget chunk, one comfortably clear,
+# one whose packer never published, and a large population carrying NULL in
+# every one of these columns.
+
+def _packing_blob(budget, chunks, *, relaxed=False, configured=20000,
+                  fixed=4000, max_chunks=4):
+    """A `llm_classifier_packing` value, in the writer's own shape.
+
+    ``chunks`` is a list of ``(trials, tokens_estimated, over_budget)``.
+    ``budget`` is the EFFECTIVE budget -- the one a relaxed run was raised to,
+    which is the denominator every pressure reading uses.
+    """
+    return json.dumps({
+        "enabled": True, "method": "chars", "fixed_tokens": fixed,
+        "budget_tokens_configured": configured, "budget_tokens": budget,
+        "max_chunks": max_chunks, "cap_relaxed_budget": relaxed,
+        "over_budget_chunk": any(o for _, _, o in chunks),
+        "trials": sum(t for t, _, _ in chunks),
+        "chunks": [{"trials": t, "tokens_estimated": e, "over_budget": o}
+                   for t, e, o in chunks],
+        "prefix_sha256": "0" * 64,
+    })
+
+
+def _call_details_blob(*completions):
+    """A `llm_classifier_call_details` value: one entry per call issued.
+
+    Only ``completion_tokens`` is read by the output-pressure query, but every
+    key the writer emits is present -- a fixture carrying a SUBSET would let a
+    query that reached for a missing sibling key pass by returning NULL.
+    """
+    return json.dumps([
+        {"call_index": _i + 1, "depth": 0, "trials": 5,
+         "prompt_tokens": 9000, "completion_tokens": _c,
+         "cached_tokens": None, "reasoning_tokens": None,
+         "finish_reason": "stop", "entries_emitted": 5}
+        for _i, _c in enumerate(completions)])
+
+
+# The configured pair for the two eras the seed spans. The first is what
+# oncotriage/config.py holds today (32,000 x 0.90); the second stands in for the
+# GPT-4o era, whose ceiling was 16,000 -- which is the whole reason the
+# threshold is a stored column and not a constant a reader looks up. A campaign
+# spanning both must report min != max rather than one averaged number.
+_THRESHOLD_NOW, _CEILING_NOW = 28800, 32000
+_THRESHOLD_OLD, _CEILING_OLD = 14400, 16000
+
+
 # (label, overrides). The consistency expectation for each is asserted in
 # section 4 by patient_id, so the seed and the expectation are one table rather
 # than two lists that can drift apart.
@@ -563,7 +626,14 @@ _SEED_ROWS = [
         total_time=130.0, age=61,
         candidates_retrieved=100, candidates_reranked=40,
         candidates_filtered=15, candidates_evaluated=15,
-        eligible_matches=5, near_misses=8, not_evaluable_trials=2)),
+        eligible_matches=5, near_misses=8, not_evaluable_trials=2,
+        llm_classifier_packing=_packing_blob(
+            20000, [(8, 19600, False), (7, 12000, False)]),
+        llm_classifier_packed_chunks=2,
+        llm_classifier_output_split_threshold=_THRESHOLD_NOW,
+        llm_classifier_output_ceiling=_CEILING_NOW,
+        llm_classifier_output_tokens_estimated=20625,
+        llm_classifier_call_details=_call_details_blob(9000, 7000))),
     # Consistent: 3 + 12 + 0 == 15. Same candidates_evaluated as the row above,
     # which is what satisfies `llm_classifier_efficiency_by_trial_count`'s HAVING >= 2,
     # and >4000 output tokens, which is what makes `verbose_output` non-empty.
@@ -573,7 +643,13 @@ _SEED_ROWS = [
         estimated_cost_usd=0.095, age=72, sex="female", medication_count=60,
         candidates_retrieved=87, candidates_reranked=40,
         candidates_filtered=15, candidates_evaluated=15,
-        eligible_matches=3, near_misses=12, not_evaluable_trials=0)),
+        eligible_matches=3, near_misses=12, not_evaluable_trials=0,
+        llm_classifier_packing=_packing_blob(20000, [(15, 9000, False)]),
+        llm_classifier_packed_chunks=1,
+        llm_classifier_output_split_threshold=_THRESHOLD_NOW,
+        llm_classifier_output_ceiling=_CEILING_NOW,
+        llm_classifier_output_tokens_estimated=16500,
+        llm_classifier_call_details=_call_details_blob(15900))),
     # THE ALL-NULL GROUP. Its own model, every token column and the stored cost
     # NULL. Beside the two rows above this is what makes the aggregate columns
     # float64 and turns `int(x or 0)` into a ValueError.
@@ -586,7 +662,13 @@ _SEED_ROWS = [
         retrieval_trials_lost=2,
         candidates_retrieved=100, candidates_reranked=40,
         candidates_filtered=10, candidates_evaluated=10,
-        eligible_matches=2, near_misses=7, not_evaluable_trials=1)),
+        eligible_matches=2, near_misses=7, not_evaluable_trials=1,
+        llm_classifier_packing=None,
+        llm_classifier_packed_chunks=None,
+        llm_classifier_output_split_threshold=_THRESHOLD_NOW,
+        llm_classifier_output_ceiling=_CEILING_NOW,
+        llm_classifier_output_tokens_estimated=16500,
+        llm_classifier_call_details="[]")),
     # NULL model, no tokens. A no-candidates run.
     ("P-NOMODEL-CLEAN", dict(
         matching_model=None, llm_classifier_input_tokens=0, llm_classifier_output_tokens=0,
@@ -611,7 +693,15 @@ _SEED_ROWS = [
         estimated_cost_usd=0.06, age=50, sex="female",
         candidates_retrieved=100, candidates_reranked=40,
         candidates_filtered=15, candidates_evaluated=15,
-        eligible_matches=5, near_misses=3, not_evaluable_trials=2)),
+        eligible_matches=5, near_misses=3, not_evaluable_trials=2,
+        llm_classifier_packing=_packing_blob(
+            24000, [(9, 23900, True), (6, 21000, False)], relaxed=True),
+        llm_classifier_packed_chunks=2,
+        llm_classifier_output_split_threshold=_THRESHOLD_OLD,
+        llm_classifier_output_ceiling=_CEILING_OLD,
+        llm_classifier_output_tokens_estimated=15000,
+        llm_classifier_truncation_splits=1,
+        llm_classifier_call_details=_call_details_blob(15900, 4000))),
     # One past the fusion-pool cap. Counts otherwise consistent, so this row can
     # only be flagged for the reason it is here for.
     ("P-CAP-RETRIEVAL", dict(
@@ -1186,9 +1276,17 @@ check("...and lacks inferences.run_id too, which is the state a database "
                    _legacy_conn.execute("PRAGMA table_info(inferences)")},
       False)
 
+# THE TWO PRESSURE QUERIES ARE HERE TOO AND DECLARE NO TABLE. They read
+# `inferences` alone, so nothing on this list is a table for them -- what makes
+# them unavailable is `inferences.run_id`, the same absent column run_summary
+# names, which is why they appear beside two queries that need whole tables. It
+# is also why the non-degeneracy count below cannot be `sum(1 for q if
+# q.requires)`: that expression counted TABLE requirements and would silently
+# stop describing this list the moment a column-only query joined it.
 check("a database with no run tables reports every run query as unavailable",
       sorted(queries.unavailable(_legacy_conn)),
-      ["run_attribution_coverage", "run_degradation_breakdown", "run_summary"])
+      ["run_attribution_coverage", "run_degradation_breakdown", "run_summary",
+       "stage5_input_packing_pressure", "stage5_output_split_pressure"])
 # BOTH ABSENT TABLES AND THE ABSENT COLUMN, and the column is named even
 # though `runs` is missing too, because `inferences` IS present and its column
 # genuinely is not there. One action -- let a writer open the database -- fixes
@@ -1202,7 +1300,21 @@ check("...and the query that needs no column names only the tables",
 check("...and no OTHER query is reported unavailable (non-degeneracy: a check "
       "that reported everything would pass the line above too)",
       len(queries.unavailable(_legacy_conn)),
-      sum(1 for q in queries.QUERIES if q.requires))
+      sum(1 for q in queries.QUERIES if q.requires or q.requires_columns))
+check("...and the count is not the whole registry, which is what the line "
+      "above would also satisfy if `unavailable` had stopped discriminating",
+      len(queries.unavailable(_legacy_conn)) < len(queries.QUERIES), True)
+# A COLUMN-ONLY DECLARATION IS REPORTED AS THE COLUMN AND NEVER AS A TABLE.
+# `inferences` is present on this database, so a query naming only columns of
+# it must come back with column names alone -- the shape that tells an operator
+# to let a writer open the file rather than to go looking for a missing table.
+check("a query declaring only columns names only columns",
+      queries.unavailable(_legacy_conn)["stage5_input_packing_pressure"],
+      ("inferences.run_id",))
+check("...and the output query names every additive column it reads, in "
+      "declaration order",
+      queries.unavailable(_legacy_conn)["stage5_output_split_pressure"],
+      ("inferences.run_id",))
 check("run() on such a database RAISES MissingTableError rather than returning "
       "an empty frame that reads as 'this run tracking recorded nothing'",
       type(check_raises("  (legacy db)", queries.MissingTableError,
@@ -1295,6 +1407,341 @@ _column_conn.close()
 
 _legacy_conn.close()
 
+
+
+# ===========================================================================
+# SECTION 2c -- STAGE 5 SPLIT PRESSURE
+# ===========================================================================
+#
+# THE MEASUREMENT IS A JOIN OF TWO HALVES AND ONLY ONE OF THEM IS A COLUMN.
+# The INPUT half is derived, in SQL, out of the packing blob the writer already
+# stores; the OUTPUT half needs two denominators that are CONFIGURATION and are
+# therefore stored. So this section has to prove two different things: that the
+# derivation reads the writer's own key names, and that the two new columns
+# behave like every other measurement column in this schema -- additive, NULL
+# where nothing was measured, and never defaulted.
+
+print()
+print("=" * 78)
+class _AbsentGroup:
+    """A run group the query did not produce, as a VALUE rather than a KeyError.
+
+    ``_grp(_ip, run)`` and ``_grp(_op, run)`` are the natural way to read a per-run frame
+    and the wrong way to read one INSIDE a check(): a defect that makes a group
+    vanish -- which is exactly what dropping the unmeasured population does --
+    raises while check()'s argument is being evaluated, so the run reports one
+    traceback where it owed a summary and every check below it. Every attribute
+    of this object is a marker string, so the comparison FAILS and names the
+    absence instead.
+    """
+
+    def __getattr__(self, name):
+        return f"<no such run group: .{name} unreachable>"
+
+
+_ABSENT_GROUP = _AbsentGroup()
+
+
+def _grp(frame_map, key):
+    """One run's row out of a per-run frame, or a named absence."""
+    return frame_map.get(key, _ABSENT_GROUP)
+
+
+def _num(value, ndigits=None):
+    """float(value), optionally rounded -- or a named absence. Never raises.
+
+    A pressure column reads NULL whenever its denominator was not recorded, and
+    pandas hands that back as None or NaN. ``float(None)`` raises TypeError, and
+    inside a check() argument that is an abort rather than a failure -- so the
+    one revert this file exists to catch (a query that stopped measuring) would
+    take the whole run down instead of reporting eleven failures.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return f"<not a number: {value!r}>"
+    if number != number:
+        return "<nan>"
+    return round(number, ndigits) if ndigits is not None else number
+
+
+def _by_run(conn, key):
+    """``{run: row}`` for a per-run query, or an EMPTY map when it raised.
+
+    run() raises MissingTableError against a database that cannot answer, which
+    is correct and is precisely what a defect removing the two columns from
+    INFERENCE_COLUMN_ADDITIONS produces. At module level that raise is an ABORT:
+    the file reports one traceback where it owes this section's failures and
+    every section after it. An empty map instead makes every _grp() below return
+    the named absence, so each check FAILS and says which reading was lost.
+    """
+    try:
+        return {row.run: row for row in queries.run(conn, key).itertuples()}
+    except Exception as exc:                       # noqa: BLE001 - reported
+        print(f"  (frame unavailable for {key}: "
+              f"{type(exc).__name__}: {str(exc)[:120]})")
+        return {}
+
+
+def _is_null(value) -> bool:
+    """True for SQL NULL as pandas renders it: None or NaN. Never raises."""
+    return value is None or (isinstance(value, float) and value != value)
+
+
+print("SECTION 2c -- Stage 5 split pressure: input derived, output stored")
+print("=" * 78)
+
+# --- (a) the derivation reads the WRITER's key names -----------------------
+#
+# BY AST OVER THE SHIPPED PACKER, NOT BY IMPORTING IT. Importing
+# oncotriage.agent.evaluation would pull openai, qdrant_client and langgraph
+# into a file that needs none of them and is bucket A precisely because it does
+# not. What is asked is narrow and static: every JSON key the input query
+# extracts is a key the packer's report literal actually writes. A reader and a
+# writer that disagree about one of these names produce no error at all --
+# json_extract returns NULL, every pressure reads NULL, and the query reports a
+# campaign with no measurable pressure.
+_PACKER_SRC = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "oncotriage", "agent", "evaluation.py")
+check_true("the packer's source is where this file expects it (a wrong path "
+           "would make every key check below pass over an empty set)",
+           os.path.exists(_PACKER_SRC))
+
+_packer_fn = None
+for _node in ast.walk(ast.parse(io.open(_PACKER_SRC, encoding="utf-8").read())):
+    if (isinstance(_node, ast.FunctionDef)
+            and _node.name == "pack_trials_by_input_tokens"):
+        _packer_fn = _node
+check_true("pack_trials_by_input_tokens is still the packer's name",
+           _packer_fn is not None)
+_packer_keys = {k.value for _n in ast.walk(_packer_fn or ast.Module(body=[], type_ignores=[]))
+                if isinstance(_n, ast.Dict)
+                for k in _n.keys
+                if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+check_true("the packer writes a non-degenerate set of report keys",
+           len(_packer_keys) > 8)
+
+# The keys the SQL names, read out of the SQL rather than retyped, so a query
+# edit that reaches for a new key is covered without touching this list.
+_SQL_KEYS = set(re.findall(r"\$\.([A-Za-z_]+)",
+                          queries.QUERIES_BY_KEY[
+                              "stage5_input_packing_pressure"].sql))
+check_true("the input-pressure SQL names a non-degenerate set of JSON keys",
+           len(_SQL_KEYS) >= 4)
+check("every JSON key the input-pressure query extracts is one the packer "
+      "writes -- a name the two disagree about returns NULL and reads as "
+      "'no pressure', not as an error",
+      sorted(_SQL_KEYS - _packer_keys), [])
+check_true("...and the check discriminates: a key the packer does not write is "
+           "reported (negative control)",
+           bool({"tokens_estimated_typo"} - _packer_keys))
+
+# --- (b) the two columns are additive, and their absence is declared -------
+#
+# THE PRE-THIS-PASS PRODUCTION SHAPE. run_id present, the two pressure columns
+# absent -- which is every database written before this pass and, on this
+# machine, the production one. The output query SELECTS both, so without the
+# declaration it raises `no such column`, report() dies at it and every query
+# after it stops executing: item 38's defect, one column granularity down.
+_PRESSURE_DB = os.path.join(_TMP_DIR, "no_pressure_cols.db")
+with quiet():
+    initialize_database(_PRESSURE_DB)
+_pressure_conn = sqlite3.connect(_PRESSURE_DB)
+check("the two pressure columns are created by initialize_database, which is "
+      "what makes them additive rather than a migration",
+      sorted(c for c in ("llm_classifier_output_ceiling",
+                         "llm_classifier_output_split_threshold")
+             if c in queries.table_columns(_pressure_conn, "inferences")),
+      ["llm_classifier_output_ceiling",
+       "llm_classifier_output_split_threshold"])
+# DROPPED ONLY IF PRESENT, and that guard is not defensive clutter: a defect
+# that removes them from INFERENCE_COLUMN_ADDITIONS is one this section exists
+# to catch, and a bare ALTER ... DROP COLUMN on a column that is not there
+# raises OperationalError at module level -- so the run would report one
+# traceback where it owes the failure above plus everything below it.
+for _drop in ("llm_classifier_output_split_threshold",
+              "llm_classifier_output_ceiling"):
+    if _drop in queries.table_columns(_pressure_conn, "inferences"):
+        _pressure_conn.execute(
+            f"ALTER TABLE inferences DROP COLUMN {_drop}")
+_pressure_conn.commit()
+check("...and dropping them leaves run_id and both run tables in place "
+      "(non-degeneracy: this must be a COLUMN case, not the earlier one)",
+      ("run_id" in queries.table_columns(_pressure_conn, "inferences")
+       and set(queries.RUN_TABLES) <= queries.available_tables(_pressure_conn)),
+      True)
+check("a database without them reports the OUTPUT query unavailable, naming "
+      "both columns",
+      queries.unavailable(_pressure_conn).get("stage5_output_split_pressure"),
+      ("inferences.llm_classifier_output_split_threshold",
+       "inferences.llm_classifier_output_ceiling"))
+check("...and the INPUT query, which reads neither, is still answerable -- the "
+      "skip is surgical rather than blanket",
+      "stage5_input_packing_pressure" in queries.unavailable(_pressure_conn),
+      False)
+check("run() on it raises MissingTableError rather than the raw sqlite error",
+      type(check_raises("  (no pressure cols)", queries.MissingTableError,
+                        queries.run, _pressure_conn,
+                        "stage5_output_split_pressure")).__name__,
+      "MissingTableError")
+check_does_not_raise(
+    "report() on it reaches the end rather than dying at the output query",
+    queries.report, _pressure_conn, out=lambda _line: None)
+_pressure_conn.close()
+
+# --- (c) the input distribution, per run, against the seed -----------------
+#
+# EVERY EXPECTATION IS THE ARITHMETIC WRITTEN OUT, not a value read back from
+# the frame under test. The seed's chunk estimates and budgets are literals a
+# few hundred lines up; the numbers below are what they imply.
+_ip = _by_run(_conn, "stage5_input_packing_pressure")
+_RUN_CLEAN = str(_RUN_IDS["RUN-CLEAN"])
+_RUN_DEGRADED = str(_RUN_IDS["RUN-DEGRADED"])
+_RUN_CRASHED = str(_RUN_IDS["RUN-CRASHED"])
+
+check_true("the input-pressure frame covers every run AND the run-less rows "
+           "(non-degeneracy: a frame with one group would satisfy most of "
+           "what follows)",
+           {_RUN_CLEAN, _RUN_DEGRADED, _RUN_CRASHED,
+            queries.NO_RUN_LABEL} <= set(_ip))
+
+# RUN-CLEAN: P-CONSISTENT-A packed 19,600 and 12,000 into a 20,000 budget,
+# P-CONSISTENT-B packed 9,000, and P-NULL-TOKENS published no packing record.
+check("chunks are counted per REQUEST, not per patient", _num(_grp(_ip, _RUN_CLEAN).chunks), 3)
+check("...over three inference rows", _num(_grp(_ip, _RUN_CLEAN).inferences), 3)
+check("...one of which published no packing record and is counted as such "
+      "rather than dropped", _num(_grp(_ip, _RUN_CLEAN).unpacked_inferences), 1)
+check("peak pressure is the tightest chunk over its own budget: 19600/20000",
+      _num(_grp(_ip, _RUN_CLEAN).peak_pressure, 4), 0.98)
+check("mean pressure averages the CHUNKS, not the patients: "
+      "(19600 + 12000 + 9000) / 3 / 20000",
+      _num(_grp(_ip, _RUN_CLEAN).mean_pressure, 4),
+      round((19600 + 12000 + 9000) / 3 / 20000, 4))
+check("headroom is stated in tokens, tightest first: 20000 - 19600",
+      _num(_grp(_ip, _RUN_CLEAN).min_headroom_tokens), 400)
+check("the 90% bucket counts only the chunk that reached it",
+      _num(_grp(_ip, _RUN_CLEAN).chunks_at_90pct), 1)
+check("...and the 75% bucket is a SUPERSET of it, never a disjoint band",
+      _num(_grp(_ip, _RUN_CLEAN).chunks_at_75pct), 1)
+check("a clean run reports no over-budget chunk and no relaxed cap",
+      (_num(_grp(_ip, _RUN_CLEAN).over_budget_chunks),
+       _num(_grp(_ip, _RUN_CLEAN).relaxed_inferences)), (0, 0))
+
+# RUN-DEGRADED: the cap was relaxed to 24,000 and one chunk shipped over it.
+check("a relaxed run measures against the EFFECTIVE budget it was raised to, "
+      "not the configured one: 23900/24000",
+      _num(_grp(_ip, _RUN_DEGRADED).peak_pressure, 4),
+      round(23900 / 24000, 4))
+check("...and the effective budget is what the frame reports",
+      (_num(_grp(_ip, _RUN_DEGRADED).budget_min), _num(_grp(_ip, _RUN_DEGRADED).budget_max)),
+      (24000, 24000))
+check("...with the relaxation counted per INFERENCE and the over-budget chunk "
+      "per CHUNK -- the guard firing, not approaching",
+      (_num(_grp(_ip, _RUN_DEGRADED).relaxed_inferences),
+       _num(_grp(_ip, _RUN_DEGRADED).over_budget_chunks)), (1, 1))
+check("...and both of its chunks are past 75% while only one is past 90%",
+      (_num(_grp(_ip, _RUN_DEGRADED).chunks_at_75pct),
+       _num(_grp(_ip, _RUN_DEGRADED).chunks_at_90pct)), (2, 1))
+
+# RUN-CRASHED: two inference rows, neither carrying a packing record. This is
+# the NULL-heavy legacy population, and it must appear rather than vanish.
+check("a run whose rows carry no packing record is a ROW in the frame, with "
+      "its unmeasured population named -- an omission would read as an "
+      "absence of pressure",
+      (_num(_grp(_ip, _RUN_CRASHED).inferences),
+       _num(_grp(_ip, _RUN_CRASHED).unpacked_inferences),
+       _num(_grp(_ip, _RUN_CRASHED).chunks)), (2, 2, 0))
+check("...and every pressure reading for it is NULL rather than 0, which "
+      "would assert a measured floor",
+      [_is_null(_v)
+       for _v in (_grp(_ip, _RUN_CRASHED).peak_pressure,
+                  _grp(_ip, _RUN_CRASHED).mean_pressure,
+                  _grp(_ip, _RUN_CRASHED).min_headroom_tokens,
+                  _grp(_ip, _RUN_CRASHED).budget_min)],
+      [True, True, True, True])
+check("the run-less rows are the bulk legacy population and are reported, not "
+      "filtered away",
+      _num(_grp(_ip, queries.NO_RUN_LABEL).inferences)
+      == _num(_grp(_ip, queries.NO_RUN_LABEL).unpacked_inferences)
+      and _num(_grp(_ip, queries.NO_RUN_LABEL).inferences) > 10, True)
+
+# --- (d) the output distribution, per run ----------------------------------
+_op = _by_run(_conn, "stage5_output_split_pressure")
+check_true("the output-pressure frame covers the same four groups",
+           {_RUN_CLEAN, _RUN_DEGRADED, _RUN_CRASHED,
+            queries.NO_RUN_LABEL} <= set(_op))
+check("split pressure is the batch estimate over the threshold THAT RAN: "
+      "20625/28800, which is the config comment's own arithmetic",
+      _num(_grp(_op, _RUN_CLEAN).peak_split_pressure, 4),
+      round(20625 / 28800, 4))
+check("...and the headroom beside it is the 8,175 tokens that note states",
+      _num(_grp(_op, _RUN_CLEAN).min_split_headroom_tokens), 28800 - 20625)
+check("a run under the threshold reports no inference over it",
+      _num(_grp(_op, _RUN_CLEAN).inferences_over_threshold), 0)
+check("ceiling pressure comes from the LARGEST SINGLE response, out of the "
+      "per-call ledger: 15900/32000",
+      _num(_grp(_op, _RUN_CLEAN).peak_call_output_tokens, 4)
+      == 15900.0
+      and _num(_grp(_op, _RUN_CLEAN).peak_ceiling_pressure, 4)
+      == round(15900 / 32000, 4), True)
+check("...which is NOT the summed output column, whose value for that run "
+      "would give a different answer (non-degeneracy)",
+      _num(_grp(_op, _RUN_CLEAN).peak_call_output_tokens)
+      == _num(_conn.execute(
+          "SELECT MAX(llm_classifier_output_tokens) FROM inferences "
+          "WHERE run_id = ?", (_RUN_IDS["RUN-CLEAN"],)).fetchone()[0]),
+      False)
+check("a run at the OLD ceiling reports its own threshold, not today's",
+      (_num(_grp(_op, _RUN_DEGRADED).split_threshold_min),
+       _num(_grp(_op, _RUN_DEGRADED).output_ceiling_max)),
+      (_THRESHOLD_OLD, _CEILING_OLD))
+check("...and its estimate is OVER that threshold, so the headroom is "
+      "negative and the row is counted",
+      (_num(_grp(_op, _RUN_DEGRADED).peak_split_pressure, 4),
+       _num(_grp(_op, _RUN_DEGRADED).min_split_headroom_tokens),
+       _num(_grp(_op, _RUN_DEGRADED).inferences_over_threshold)),
+      (round(15000 / 14400, 4), 14400 - 15000, 1))
+check("...and its worst response came within 100 tokens of the ceiling",
+      _num(_grp(_op, _RUN_DEGRADED).min_ceiling_headroom_tokens), 16000 - 15900)
+check("the splits actually spent are carried beside the pressure that "
+      "predicts them", _num(_grp(_op, _RUN_DEGRADED).splits_spent), 1)
+check("a run that never measured reports its whole population as unmeasured "
+      "-- which is not the same as low pressure",
+      (_num(_grp(_op, _RUN_CRASHED).inferences), _num(_grp(_op, _RUN_CRASHED).unmeasured)),
+      (2, 2))
+check("...and every pressure reading for it is NULL, not 0",
+      [_is_null(_v)
+       for _v in (_grp(_op, _RUN_CRASHED).peak_split_pressure,
+                  _grp(_op, _RUN_CRASHED).peak_ceiling_pressure,
+                  _grp(_op, _RUN_CRASHED).split_threshold_min,
+                  _grp(_op, _RUN_CRASHED).peak_call_output_tokens)],
+      [True, True, True, True])
+check("a campaign spanning ONE configuration reports min == max, which is what "
+      "makes a min != max readable as a config change rather than as noise",
+      (_num(_grp(_op, _RUN_CLEAN).split_threshold_min)
+       == _num(_grp(_op, _RUN_CLEAN).split_threshold_max) == _THRESHOLD_NOW), True)
+check("...and the two runs disagree about the threshold, so the pair of "
+      "columns is doing work (non-degeneracy)",
+      _num(_grp(_op, _RUN_CLEAN).split_threshold_min)
+      != _num(_grp(_op, _RUN_DEGRADED).split_threshold_min), True)
+
+# --- (e) neither query is stored twice -------------------------------------
+#
+# THE RULE THIS PASS WAS BUILT UNDER, made checkable. The input side derives
+# everything from llm_classifier_packing, so no input quantity may have acquired
+# a column of its own; the output side stores exactly two, and both are
+# denominators rather than measurements.
+_INF_COLS = set(dblog.INFERENCE_COLUMN_ADDITIONS)
+check("no INPUT pressure quantity was given a column: the packing blob is the "
+      "one home for the estimate and both budgets",
+      sorted(c for c in _INF_COLS
+             if "input" in c and ("budget" in c or "pressure" in c)), [])
+check("...and the output side added exactly the two denominators",
+      sorted(c for c in _INF_COLS if "output_split_threshold" in c
+             or "output_ceiling" in c),
+      ["llm_classifier_output_ceiling",
+       "llm_classifier_output_split_threshold"])
 
 
 # ===========================================================================

@@ -425,6 +425,40 @@ class TrialMatchState(TypedDict):
     # The pre-call estimate, logged beside the actual so the calibration in
     # 03- Config.py can be re-derived from measured data rather than re-guessed.
     llm_classifier_output_tokens_estimated: int
+    # ── The denominators those estimates are read against ─────────────────
+    #
+    # THE SPLIT-PRESSURE MEASUREMENT. The estimate one line above says how big
+    # this batch was expected to be; on its own it says nothing about how close
+    # the run came to a guard, because both guards are configuration and both
+    # have moved -- MATCHING_MAX_TOKENS was 16,000 under GPT-4o and is 32,000
+    # now. So the thresholds in force are recorded per run beside the estimate
+    # they judge, and a campaign can then state its own headroom instead of
+    # having it recomputed later from constants that may no longer be the ones
+    # that ran.
+    #
+    #   llm_classifier_output_split_threshold
+    #       int(MATCHING_MAX_TOKENS x MATCHING_OUTPUT_SPLIT_FRACTION). The
+    #       PROACTIVE guard: the batch is halved before the first request when
+    #       llm_classifier_output_tokens_estimated exceeds this.
+    #   llm_classifier_output_ceiling
+    #       MATCHING_MAX_TOKENS. The REACTIVE guard: a response that reaches it
+    #       returns finish_reason 'length' and the chunk is halved. Its
+    #       numerator is llm_classifier_call_details[].completion_tokens, PER
+    #       CALL -- never llm_classifier_output_tokens, which is summed across
+    #       chunks and cannot be compared with a per-request ceiling.
+    #
+    # NEITHER IS Optional-BY-CONVENTION IN THE WAY hallucinated_trials IS:
+    # both are computed unconditionally above the send loop, so Stage 5 carries
+    # them out of every one of its five returns, the four failing ones
+    # included. They are typed Optional because a run that never entered the
+    # node has no value for them and _pipeline_provenance() must be able to
+    # report that as NULL rather than as a ceiling of zero.
+    #
+    # THE INPUT GUARD HAS NO CHANNEL HERE and needs none: its estimate, its
+    # configured budget, its effective budget and its two degradation flags all
+    # travel inside llm_classifier_packing below.
+    llm_classifier_output_split_threshold: Optional[int]
+    llm_classifier_output_ceiling: Optional[int]
     # Trials that entered Stage 5 and left it with no verdict because of
     # truncation (the floor, or the split budget). Distinct from
     # not_evaluable_trials, which counts trials the model assessed and could

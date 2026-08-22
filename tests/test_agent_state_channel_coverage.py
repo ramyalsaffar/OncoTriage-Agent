@@ -852,6 +852,180 @@ check("the persisted ledger is non-empty",
 
 
 # ===========================================================================
+# SECTION 7 -- the split-pressure denominators, on every return
+# ===========================================================================
+#
+# WHAT THIS SECTION IS FOR, AND WHY IT IS NOT SECTION 2 AGAIN. Section 2 asks
+# whether a key SURVIVES the graph; this asks whether the node WRITES it on the
+# paths that measured it. The two guard denominators are unlike every other
+# provenance key in this node: they are not measurements of what happened, they
+# are the CONFIGURATION the run was judged against, computed above the send loop
+# before a single request goes out. So they are true of a run that failed at its
+# first call in exactly the way they are true of one that succeeded -- and a
+# failed run is the run whose headroom is most worth knowing, because the
+# question "was this batch near a guard" is the first one asked of it.
+#
+# A DEFAULT WOULD DESTROY THE MEASUREMENT, WHICH IS THE OTHER HALF. If the node
+# omitted them on a failure return, _pipeline_provenance()'s state.get() would
+# yield None and the column would say "unmeasured" about a run that measured
+# them. If instead anything defaulted them to 0, the row would assert a
+# configured ceiling of zero -- and every pressure ratio computed off it would
+# be a division by zero or an infinity, in a column whose whole purpose is a
+# ratio. Both halves are checked here.
+
+print()
+print("=" * 70)
+print("SECTION 7 -- output guard denominators on the success and failure paths")
+print("=" * 70)
+
+from oncotriage.config import (                                    # noqa: E402
+    MATCHING_MAX_TOKENS,
+    MATCHING_OUTPUT_SPLIT_FRACTION,
+)
+
+PRESSURE_KEYS = ("llm_classifier_output_split_threshold",
+                 "llm_classifier_output_ceiling")
+
+# THE EXPECTED THRESHOLD IS RECOMPUTED FROM THE TWO CONSTANTS, not retyped as a
+# number. Retyping 28800 here would pin the test to today's configuration and
+# turn a deliberate config change into a failure of this file; recomputing pins
+# the RELATION, which is the thing that must not drift. int(), not round():
+# the node truncates, and a fraction that produced a .5 would otherwise
+# disagree by one token in a comparison that has to be exact.
+_EXPECTED_THRESHOLD = int(MATCHING_MAX_TOKENS * MATCHING_OUTPUT_SPLIT_FRACTION)
+check("the two constants are non-degenerate: a ceiling of 0 or a fraction of 0 "
+      "would make every comparison below pass against a node that wrote "
+      "nothing at all",
+      MATCHING_MAX_TOKENS > 0 and 0 < MATCHING_OUTPUT_SPLIT_FRACTION <= 1, True)
+check("...and the threshold is strictly below the ceiling, which is what makes "
+      "them two facts rather than one stored twice",
+      _EXPECTED_THRESHOLD < MATCHING_MAX_TOKENS, True)
+
+check("both keys are declared in TrialMatchState -- an undeclared one is "
+      "DISCARDED by LangGraph with no error, which is what this whole file "
+      "exists to catch",
+      sorted(k for k in PRESSURE_KEYS
+             if k in TrialMatchState.__annotations__),
+      sorted(PRESSURE_KEYS))
+
+# --- the success path, through the REAL graph ------------------------------
+deps.set_override(deps.OPENAI_CLIENT, _StubOpenAI(_NCTS, cached_sequence=(64,)))
+_ok = drive(run_through_graph, base_state([_trial(n) for n in _NCTS]))
+# run_through_graph returns node_finalize's `result`, so success is read the way
+# a stored row reads it: no error, and trials actually judged.
+check("the success run really succeeded (non-degenerate)",
+      (not _ok.get("error")) and int(_ok.get("candidates_evaluated") or 0) > 0,
+      True)
+check("the threshold arrives at the terminal node with the value the config "
+      "implies", _ok.get("llm_classifier_output_split_threshold"),
+      _EXPECTED_THRESHOLD)
+check("...and the ceiling is MATCHING_MAX_TOKENS itself",
+      _ok.get("llm_classifier_output_ceiling"), MATCHING_MAX_TOKENS)
+check("...beside the estimate they are the denominators of, so a reader has a "
+      "complete ratio from one row",
+      isinstance(_ok.get("llm_classifier_output_tokens_estimated"), int), True)
+
+# --- all four failure returns ----------------------------------------------
+#
+# DRIVEN ONE AT A TIME AND NAMED, because the four are separate `return`
+# statements with separately-written key lists: a pass that added the pair to
+# three of them would leave the fourth reporting NULL for a run that measured,
+# and no aggregate check over "a failure" could tell which.
+
+
+class _RaisingOpenAI:
+    """Every request raises, so the very first call takes the API-error path."""
+
+    def __init__(self):
+        class _completions:
+            @staticmethod
+            def create(**kwargs):
+                raise RuntimeError("stub transport failure")
+
+        class _chat:
+            completions = _completions
+
+        self.chat = _chat
+
+
+class _RefusingOpenAI(_StubOpenAI):
+    """A response whose message carries a `refusal`, not content."""
+
+    def _completion(self, kwargs, cached):
+        class _Msg:
+            content = None
+            refusal = "I cannot help with that."
+
+        class _Choice:
+            message = _Msg()
+            finish_reason = "stop"
+
+        class _Completion:
+            choices = [_Choice()]
+            usage = _Usage(cached)
+            model = None
+
+        return _Completion()
+
+
+_FAILURE_ARMS = (
+    ("API error before any response", _RaisingOpenAI()),
+    ("the model refused", _RefusingOpenAI(_NCTS, cached_sequence=(0,))),
+    ("the answer was not JSON",
+     _StubOpenAI(_NCTS, cached_sequence=(0,), body="not json at all {{")),
+    ("the answer was JSON but not a list",
+     _StubOpenAI(_NCTS, cached_sequence=(0,), body='{"unexpected": "object"}')),
+)
+
+for _label, _client in _FAILURE_ARMS:
+    deps.set_override(deps.OPENAI_CLIENT, _client)
+    _out = drive(node_llm_classifier_evaluation,
+                 base_state([_trial(n) for n in _NCTS]))
+    check(f"[{_label}] the run really failed (non-degenerate: a success here "
+          f"would make the two checks below meaningless)",
+          bool(_out.get("error")), True)
+    check(f"[{_label}] the threshold is carried out of the failure return",
+          _out.get("llm_classifier_output_split_threshold"),
+          _EXPECTED_THRESHOLD)
+    check(f"[{_label}] ...and so is the ceiling",
+          _out.get("llm_classifier_output_ceiling"), MATCHING_MAX_TOKENS)
+    check(f"[{_label}] ...and neither is 0, which would assert a configured "
+          f"ceiling of zero and make every pressure ratio infinite",
+          [_out.get(k) == 0 for k in PRESSURE_KEYS], [False, False])
+
+check("all four failure arms were distinct clients (non-degeneracy: two arms "
+      "sharing one stub would test one path twice)",
+      len({id(c) for _, c in _FAILURE_ARMS}), 4)
+
+# --- the paths that measured NOTHING ---------------------------------------
+#
+# A run that never entered the node has no value for either, and the writer must
+# report that as NULL rather than as a ceiling. Driven through the two terminal
+# nodes that produce a row without Stage 5.
+from oncotriage.agent.terminal import node_no_candidates              # noqa: E402
+
+# node_no_candidates returns {"result": ...}: the terminal nodes publish the
+# stored row under that one channel, which is what _pipeline_provenance() fills.
+_none = (drive(node_no_candidates,
+               {"patient_data": dict(PATIENT), "filtered_trials": [],
+                "stage_timings": {}}) or {}).get("result") or {}
+check("the no-candidates node really produced a well-formed row "
+      "(non-degeneracy: an empty dict would satisfy every None below)",
+      isinstance(_none.get("patient_id"), str) and len(_none) > 20, True)
+check("a run that never reached Stage 5 reports both as None, never as 0",
+      [_none.get(k, "<absent>") for k in PRESSURE_KEYS], [None, None])
+check("...and the estimate beside them is None too, which is the convention "
+      "these two follow",
+      _none.get("llm_classifier_output_tokens_estimated", "<absent>"), None)
+
+for _k in list(deps.OVERRIDE_KEYS):
+    deps.clear_override(_k)
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
 # SUMMARY
 # ===========================================================================
 

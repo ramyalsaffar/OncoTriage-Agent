@@ -661,6 +661,70 @@ INFERENCE_COLUMN_ADDITIONS = {
     "llm_classifier_call_details":           "TEXT",
     "llm_classifier_packed_chunks":          "INTEGER",
     "llm_classifier_packing":                "TEXT",
+
+    # --- How close this run came to the two OUTPUT guards -------------------
+    #
+    # READ THIS BEFORE COMPUTING A RATIO OFF EITHER COLUMN.
+    #
+    # Stage 5 has three guards and this pair supplies the denominators for two
+    # of them. The third -- the INPUT packing budget -- needs no column here:
+    # its estimate, its configured budget, its effective budget and its two
+    # degradation flags are all inside llm_classifier_packing above, and a
+    # value derivable from an existing column is not stored a second time.
+    #
+    #   llm_classifier_output_split_threshold
+    #       The PROACTIVE splitter's threshold, in tokens, as it stood when
+    #       this run was sent: int(MATCHING_MAX_TOKENS x
+    #       MATCHING_OUTPUT_SPLIT_FRACTION). The batch is halved before the
+    #       first request when llm_classifier_output_tokens_estimated exceeds
+    #       it. It is stored BESIDE that estimate because the estimate alone
+    #       cannot be read: a ratio against a threshold nobody recorded is
+    #       uninterpretable the moment either constant behind it moves, and
+    #       both have moved once already (the GPT-4o ceiling was 16,000).
+    #
+    #   llm_classifier_output_ceiling
+    #       MATCHING_MAX_TOKENS in force -- the per-request output ceiling sent
+    #       as max_completion_tokens, and the REACTIVE guard's trigger: a
+    #       response that reaches it comes back with finish_reason 'length' and
+    #       the batch is halved. The per-call figure it is the denominator FOR
+    #       is llm_classifier_call_details[].completion_tokens, not
+    #       llm_classifier_output_tokens, which is summed across chunks and so
+    #       cannot be compared with a per-request ceiling.
+    #
+    # NEITHER IS DERIVABLE FROM THE OTHER, which is why both are here and this
+    # is not one number stored twice. The threshold is a TRUNCATED product of
+    # the ceiling and a fraction that is not stored, so the ceiling cannot be
+    # recovered from it; and the fraction is unknown in the other direction
+    # too. A run at (32000, 0.90) and a run at (28800, 1.00) record the same
+    # threshold and have completely different reactive headroom -- with only
+    # one column that difference is invisible, which is the exact failure this
+    # pair exists to prevent.
+    #
+    # WHY THE FRACTION ITSELF IS NOT A COLUMN: it is derivable to within the
+    # int() truncation from the two that are, it is not what any comparison is
+    # made against, and a third column carrying a quantity a reader can compute
+    # is a third thing that can go stale on its own.
+    #
+    #   NULL on both = Stage 5 never ran for this row (node_no_candidates, or a
+    #                  failure upstream of the node), or the row predates these
+    #                  columns. Both are computed unconditionally ABOVE the
+    #                  send loop, so every one of the node's five returns
+    #                  carries them -- the four failure returns included, on
+    #                  llm_classifier_output_tokens_estimated's own convention:
+    #                  they are facts measured BEFORE the first call, so they
+    #                  are true of a run whether or not it answered.
+    #   0            = not reachable from a configured pipeline and is NOT
+    #                  defended against here. MATCHING_MAX_TOKENS is a positive
+    #                  ceiling; a 0 in either column means somebody configured
+    #                  one, and reading it as "unmeasured" would hide that.
+    #
+    # NOT COSTING TERMS AND NOT MEASUREMENTS OF THIS RUN'S OUTPUT. They are the
+    # CONFIGURATION the run was judged against, recorded per row because that
+    # is the only place a later reader can find what was in force at the time.
+    # Averaging them across a campaign that spans a config change is
+    # meaningless; grouping by them is what such a campaign supports.
+    "llm_classifier_output_split_threshold": "INTEGER",
+    "llm_classifier_output_ceiling":         "INTEGER",
     # --- Which provider served Stage 5 -------------------------------------
     #
     # "openai" or "bedrock", exactly -- config.MATCHING_PROVIDER's value, read
@@ -2901,10 +2965,12 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 llm_classifier_patient_record_tokens,
                 llm_classifier_cached_input_tokens, llm_classifier_call_details,
                 llm_classifier_packed_chunks, llm_classifier_packing,
+                llm_classifier_output_split_threshold,
+                llm_classifier_output_ceiling,
                 matching_provider,
                 verdict_normalizations, remapped_trials,
                 run_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             result["patient_id"],
             result["timestamp"],
@@ -3097,6 +3163,18 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
             # the test is on presence and never on emptiness.
             (json.dumps(result["llm_classifier_packing"])
              if result.get("llm_classifier_packing") is not None else None),
+            # ── The two OUTPUT guard denominators ──────────────────────
+            #
+            # PLAIN `.get()` WITH NO DEFAULT, which is
+            # llm_classifier_output_tokens_estimated's rule immediately above
+            # and not the truncation counters'. Both are CONFIGURATION the run
+            # was judged against rather than work that either happened or did
+            # not, so a run that never entered Stage 5 has no value for them and
+            # a 0 supplied here would assert a ceiling of zero. Stage 5 writes
+            # both on every one of its five returns, so a NULL pair means the
+            # node was never entered -- or the row predates these columns.
+            result.get("llm_classifier_output_split_threshold"),
+            result.get("llm_classifier_output_ceiling"),
             # FROM CONFIG, NOT FROM `result` -- see the column's note in
             # INFERENCE_COLUMN_ADDITIONS. Reading it here rather than off the
             # result dict is what makes it unconditional: every row this writer

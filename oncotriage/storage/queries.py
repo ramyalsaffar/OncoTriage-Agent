@@ -751,6 +751,102 @@ _RUN_ATTRIBUTION_CASE_SQL = f"""        CASE
 """The one reading of "does this row belong to a recorded run"."""
 
 
+NO_RUN_LABEL = "(no run)"
+"""The GROUP key the two pressure queries use where inferences.run_id is NULL.
+
+DELIBERATELY NOT ``RUN_ATTRIBUTION_NO_RUN``, which says the same thing in a
+sentence. That constant is a member of ``RUN_ATTRIBUTION_STATES``, a CLOSED
+vocabulary the dashboard branches on, so borrowing it would make a future
+rewording of the census's own labels silently change how these two tables group
+-- and its sentence is the width of the terminal, which is fine for a census of
+three rows and not for a key column beside twelve numeric ones. A NULL run_id
+means the same thing here as it does there and is not a defect: the API writes
+one per request on purpose, and every row predating run tracking has one.
+"""
+
+
+# ---------------------------------------------------------------------------
+# STAGE 5 SPLIT PRESSURE -- how near the three guards a campaign ran
+# ---------------------------------------------------------------------------
+#
+# WHAT IS DERIVED HERE RATHER THAN STORED, AND THE RULE THAT DECIDES IT. A
+# quantity a reader can compute from a column already on the row is not given a
+# column of its own; it is computed here, once, in the one place that owns the
+# reading. So the whole INPUT side of this measurement is derivation: the
+# per-chunk estimate, the configured budget, the EFFECTIVE budget (which the
+# packer raises when the chunk cap binds) and the two degradation flags are all
+# inside `inferences.llm_classifier_packing`, and nothing was added to the
+# schema for them. What the OUTPUT side needed was the two DENOMINATORS -- see
+# INFERENCE_COLUMN_ADDITIONS' note on
+# llm_classifier_output_split_threshold / llm_classifier_output_ceiling -- and
+# those are configuration, not a derivable function of any stored measurement.
+#
+# NO DASHBOARD PANEL IN THIS PASS, DELIBERATELY. The Run Health tab's declared
+# scope is the DEGRADATION counters -- run_metrics' two categories and the
+# health_record reading over them -- and split pressure is neither a
+# degradation nor a counter: a run at 40% of its input budget is perfectly
+# healthy and has nothing to report there. Rendering it would either widen that
+# tab's subject without saying so or add a tenth-and-a-half panel with no
+# vocabulary of its own. A pressure panel is its own decision, with its own
+# question about which quantile a clinician-facing page should show; it is a
+# recorded follow-up rather than a silent extension. These two queries are the
+# whole reader for now, and `python "16- Database Query.py"` is where they run.
+#
+# THESE FRAGMENTS ARE NAMED FOR THE REASON _RUN_HEALTH_CASE_SQL IS: the ratio
+# below is written into a MAX, an AVG and two bucket counters in one query, and
+# four hand-copied arithmetic expressions are four things that can disagree
+# about what "pressure" means while every one of them keeps returning a number.
+
+_PACK_JSON_SQL = ("CASE WHEN json_valid(i.llm_classifier_packing) "
+                  "THEN i.llm_classifier_packing ELSE '{}' END")
+"""The packing blob, or an empty object when the column is NULL or not JSON.
+
+json_each() RAISES on malformed text, and a raise inside report() is the defect
+item 38 removed -- one bad row would stop every query registered after this one.
+The writer json.dumps() this column so a malformed value should be impossible;
+"should be impossible" is not a reason to let one row end the report. NULL is
+already safe (json_each(NULL) yields no rows) and passes through this CASE as
+'{}', which yields none either."""
+
+def _pack_field_sql(field: str) -> str:
+    """One field of the packing blob, read through the validity guard above.
+
+    A function rather than three constants because json_extract RAISES on
+    malformed text exactly as json_each does -- measured, not assumed -- so
+    every read of this column has to go through the same CASE, and three
+    hand-written copies of it are three places to forget one.
+
+    It builds a SQL FRAGMENT and touches no database, so calling it at module
+    scope opens nothing -- the property section 2 of
+    tests/test_package_invariants.py holds over every module in the package.
+    """
+    return f"json_extract({_PACK_JSON_SQL}, '$.{field}')"
+
+_PACK_BUDGET_SQL = _pack_field_sql("budget_tokens")
+"""The EFFECTIVE input budget of THIS inference, not the configured one.
+
+The packer raises the budget uniformly when the chunk cap binds
+(`cap_relaxed_budget`), so two inferences of one run can legitimately have been
+packed against different numbers. Every ratio below is therefore per chunk
+against its OWN inference's effective budget; a run-level MAX of the budget
+divided into a run-level MAX of the estimate would be a ratio between two
+different requests. NULL when the packer did not run, which makes every
+expression built on it NULL rather than a division by zero."""
+
+_PACK_CHUNK_TOKENS_SQL = "json_extract(c.value, '$.tokens_estimated')"
+"""One chunk's estimated INPUT tokens: the fixed prefix PLUS that chunk's own
+trials. It is the number the budget is a budget ON -- see the packer, which
+charges `fixed_tokens` to every chunk because the model reads one whole
+prompt."""
+
+_INPUT_PRESSURE_SQL = (f"({_PACK_CHUNK_TOKENS_SQL} * 1.0 / {_PACK_BUDGET_SQL})")
+"""One chunk's input pressure: 1.0 is exactly at the effective budget.
+
+`* 1.0` because both operands are integers and SQLite would otherwise do
+integer division -- every pressure under the budget would read 0 and the whole
+measurement would report a campaign with infinite headroom."""
+
+
 RUN_TABLES = ("runs", "run_metrics")
 """The two tables the run queries need, and which a database may not have.
 
@@ -1757,6 +1853,165 @@ QUERIES = (
     ORDER BY inference_rows DESC, attribution
 """,
     ),
+    # ── Stage 5 split pressure (this pass) ─────────────────────────────────
+    #
+    # THESE TWO ARE THE WHOLE READER, AND THERE IS DELIBERATELY NO DASHBOARD
+    # PANEL. The Run Health tab's declared subject is the DEGRADATION counters
+    # -- run_metrics' two categories and the health_record reading over them --
+    # and split pressure is neither a degradation nor a counter: a run at 40% of
+    # its input budget is perfectly healthy and has nothing to say there.
+    # Rendering it would either widen that tab's subject without saying so or
+    # add a panel with no vocabulary of its own, and it would have to answer a
+    # question this pass does not: which quantile a page a person reads should
+    # show, when the honest headline is a MAX over chunks. A pressure panel is
+    # its own decision and is a recorded follow-up; `python "16- Database
+    # Query.py"` is where these run today.
+    #
+    # BOTH DECLARE requires_columns AND NEITHER DECLARES requires. They read
+    # `inferences` alone -- run_id is a COLUMN of it, so no run TABLE is
+    # touched and a database that has the columns can answer them whether or
+    # not the run-identity pass has ever opened it. Every column named in the
+    # two `requires_columns` lists below is an INFERENCE_COLUMN_ADDITIONS entry
+    # -- a column a writer adds on open and which the production database on
+    # this machine, last written before these passes, does not have. Selecting
+    # one that is absent raises `no such column`, and report() runs its
+    # registry with the first raise taking the process down; see
+    # Query.requires_columns for why that is a declaration and not a shrug.
+    Query(
+        key='stage5_input_packing_pressure',
+        heading='=== STAGE 5: INPUT PACKING PRESSURE, PER RUN ===',
+        render='to_string',
+        blank_after=True,
+        requires_columns=(("inferences", "run_id"),
+                          ("inferences", "llm_classifier_packing")),
+        notes=(
+            "ONE ROW PER CHUNK feeds this, not one per patient: the packer's",
+            "budget is spent per REQUEST, and a patient sent as three chunks",
+            "has three separate distances from the guard.",
+            "",
+            "pressure is estimated input tokens / the EFFECTIVE budget of that",
+            "chunk's own inference. 1.0 is exactly at the budget. The effective",
+            "budget is not always the configured one -- the packer raises it",
+            "when the chunk cap binds -- which is why relaxed_inferences is",
+            "beside it and why the ratio is never taken across inferences.",
+            "",
+            "headroom is in TOKENS and is the tightest chunk of the run. It is",
+            "stated beside the ratio because a ratio alone cannot say whether",
+            "0.98 was 200 tokens of slack or 20.",
+            "",
+            "unpacked_inferences is the population this query CANNOT measure:",
+            "rows whose packer did not run to completion, which is every Stage",
+            "5 failure return (the chunk list is a plan, and Stage 5 publishes",
+            "it on the success return only) plus every row written before the",
+            "packer existed. It is counted rather than filtered away, because",
+            "an omission reads as an absence of pressure.",
+            "",
+            "over_budget_chunks counts chunks that could not be made to fit by",
+            "any amount of packing -- a single trial larger than the whole",
+            "allowance. That is the guard FIRING, not approaching.",
+        ),
+        sql=f"""
+    SELECT
+        COALESCE(CAST(i.run_id AS TEXT), '{NO_RUN_LABEL}')  AS run,
+        COUNT(DISTINCT i.id)                                  AS inferences,
+        COUNT(DISTINCT CASE WHEN {_PACK_BUDGET_SQL} IS NULL
+                            THEN i.id END)                    AS unpacked_inferences,
+        SUM(CASE WHEN c.value IS NOT NULL THEN 1 ELSE 0 END)   AS chunks,
+        MIN({_PACK_BUDGET_SQL})                               AS budget_min,
+        MAX({_PACK_BUDGET_SQL})                               AS budget_max,
+        MAX({_PACK_CHUNK_TOKENS_SQL})                         AS peak_chunk_tokens,
+        ROUND(MAX({_INPUT_PRESSURE_SQL}), 4)                  AS peak_pressure,
+        ROUND(AVG({_INPUT_PRESSURE_SQL}), 4)                  AS mean_pressure,
+        MIN({_PACK_BUDGET_SQL} - {_PACK_CHUNK_TOKENS_SQL})    AS min_headroom_tokens,
+        SUM(CASE WHEN {_INPUT_PRESSURE_SQL} >= 0.75
+                 THEN 1 ELSE 0 END)                           AS chunks_at_75pct,
+        SUM(CASE WHEN {_INPUT_PRESSURE_SQL} >= 0.90
+                 THEN 1 ELSE 0 END)                           AS chunks_at_90pct,
+        SUM(CASE WHEN json_extract(c.value, '$.over_budget')
+                 THEN 1 ELSE 0 END)                           AS over_budget_chunks,
+        COUNT(DISTINCT CASE WHEN {_pack_field_sql('cap_relaxed_budget')}
+                            THEN i.id END)                    AS relaxed_inferences
+    FROM inferences i
+    LEFT JOIN json_each({_PACK_JSON_SQL}, '$.chunks') c
+    GROUP BY run
+    ORDER BY peak_pressure DESC, run
+""",
+    ),
+    Query(
+        key='stage5_output_split_pressure',
+        heading='=== STAGE 5: OUTPUT SPLIT PRESSURE, PER RUN ===',
+        render='to_string',
+        blank_after=True,
+        requires_columns=(
+            ("inferences", "run_id"),
+            ("inferences", "llm_classifier_output_split_threshold"),
+            ("inferences", "llm_classifier_output_ceiling"),
+            ("inferences", "llm_classifier_output_tokens_estimated"),
+            ("inferences", "llm_classifier_call_details"),
+            ("inferences", "llm_classifier_truncation_splits"),
+        ),
+        notes=(
+            "TWO GUARDS, TWO RATIOS, AND THEY ARE NOT INTERCHANGEABLE.",
+            "",
+            "split_pressure is the PROACTIVE guard: the whole batch's",
+            "pre-call output estimate over the threshold that was in force.",
+            "At 1.0 the batch is halved before the first request. The",
+            "threshold is on the row rather than recomputed, because both",
+            "constants behind it have moved once already and a ratio against",
+            "an unrecorded threshold is uninterpretable afterwards.",
+            "",
+            "ceiling_pressure is the REACTIVE guard: the LARGEST SINGLE",
+            "response of the run over the per-request output ceiling. Its",
+            "numerator comes from llm_classifier_call_details, per call --",
+            "NOT from llm_classifier_output_tokens, which is summed across",
+            "chunks and cannot be compared with a per-request ceiling. At 1.0",
+            "a response is cut off, comes back finish_reason 'length' and the",
+            "chunk is halved.",
+            "",
+            "A threshold column that is the same in every row of a run is the",
+            "expected reading; min and max are both shown so a campaign that",
+            "spanned a config change says so rather than averaging across it.",
+            "",
+            "unmeasured is rows that never entered Stage 5 (no candidates, or",
+            "a failure upstream of it) or that predate these columns. The",
+            "pressures above are over the measured rows only -- SQL",
+            "aggregates skip NULL -- so a run reading unmeasured = inferences",
+            "has no pressure to report, which is not the same as low pressure.",
+        ),
+        sql=f"""
+    SELECT
+        run,
+        COUNT(*)                                              AS inferences,
+        SUM(CASE WHEN threshold IS NULL THEN 1 ELSE 0 END)    AS unmeasured,
+        MIN(threshold)                                        AS split_threshold_min,
+        MAX(threshold)                                        AS split_threshold_max,
+        MIN(ceiling)                                          AS output_ceiling_min,
+        MAX(ceiling)                                          AS output_ceiling_max,
+        MAX(estimate)                                         AS peak_estimate,
+        ROUND(MAX(estimate * 1.0 / threshold), 4)             AS peak_split_pressure,
+        MIN(threshold - estimate)                             AS min_split_headroom_tokens,
+        SUM(CASE WHEN estimate > threshold THEN 1 ELSE 0 END) AS inferences_over_threshold,
+        SUM(COALESCE(splits, 0))                              AS splits_spent,
+        MAX(peak_call)                                        AS peak_call_output_tokens,
+        ROUND(MAX(peak_call * 1.0 / ceiling), 4)              AS peak_ceiling_pressure,
+        MIN(ceiling - peak_call)                              AS min_ceiling_headroom_tokens
+    FROM (
+        SELECT
+            COALESCE(CAST(i.run_id AS TEXT), '{NO_RUN_LABEL}') AS run,
+            i.llm_classifier_output_split_threshold           AS threshold,
+            i.llm_classifier_output_ceiling                   AS ceiling,
+            i.llm_classifier_output_tokens_estimated          AS estimate,
+            i.llm_classifier_truncation_splits                AS splits,
+            (SELECT MAX(json_extract(d.value, '$.completion_tokens'))
+               FROM json_each(CASE WHEN json_valid(i.llm_classifier_call_details)
+                                   THEN i.llm_classifier_call_details
+                                   ELSE '[]' END) d)          AS peak_call
+        FROM inferences i
+    ) x
+    GROUP BY run
+    ORDER BY peak_split_pressure DESC, peak_ceiling_pressure DESC, run
+""",
+    ),
 )
 
 
@@ -1916,13 +2171,24 @@ def missing_table_message(key, absent) -> str:
     ONE OWNER, because ``report()`` prints it and ``run()`` raises it and a
     reader who meets it in a log and in a traceback should meet the same words.
     """
+    # THE EXPLANATION NAMES NO PARTICULAR TABLE ANY MORE, and that is a
+    # correction rather than a generalisation for its own sake. It read
+    # "`runs` and `run_metrics` are created by ... so a database last written
+    # before the run-identity pass does not carry them" -- true of the only two
+    # consumers it had when it was written, and FALSE the moment a query
+    # declared a column instead: the split-pressure pair would have been
+    # reported with a sentence naming two tables that are not what is missing
+    # and a pass that has nothing to do with them. The mechanism is the same for
+    # every additive name in this schema, so the sentence describes the
+    # mechanism and lets the first clause name what is actually absent.
     return (
         f"query {key!r} needs {', '.join(absent)}, which this database "
-        f"does not have. `runs` and `run_metrics` are created by "
-        f"oncotriage.storage.database_logger.initialize_database, so a database "
-        f"last written before the run-identity pass does not carry them; the "
-        f"next writer to open it adds them. Nothing is wrong with the rows that "
-        f"are there."
+        f"does not have. Every table and column this registry can declare is "
+        f"ADDITIVE: "
+        f"oncotriage.storage.database_logger.initialize_database creates it, so "
+        f"a database last written before it was introduced does not carry it "
+        f"and the next writer to open the file adds it. Nothing is wrong with "
+        f"the rows that are there."
     )
 
 
