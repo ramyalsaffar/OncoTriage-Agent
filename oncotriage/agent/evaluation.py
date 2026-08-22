@@ -1536,35 +1536,68 @@ def _neutralize_fence_markers(text: str) -> Tuple[str, int]:
     return _FENCE_MARKER_RUN_RE.sub(_space_out, text), hits[0]
 
 
-def _build_trials_text(trials: List[Dict], *, log_events: bool = True) -> str:
-    """Render one batch of trials for the user prompt, each inside a fence.
+def _render_trial_blocks(trials: List[Dict], *,
+                         log_events: bool = True) -> List[str]:
+    """Render one batch of trials, ONE SELF-CONTAINED BLOCK PER TRIAL.
+
+    A LIST, NOT A JOINED STRING, AND THAT IS THE WHOLE POINT OF THE SPLIT.
+    ``parts[i]`` depends on ``trials[i]`` and on nothing else -- no cross-trial
+    state reaches it; the three ``md_*`` accumulators below feed the aggregate
+    LOG line and never a block -- so the blocks of a whole-batch render are
+    byte-identical to the blocks any sub-batch render would produce, and
+    ``"".join`` of any sub-list is exactly what that sub-batch would have been
+    sent as. That makes a per-trial MEASUREMENT sliceable out of one render
+    instead of costing a render of its own, which is what the Stage 5 packer
+    now does. ``tests/test_agent_stage5_render_slice_equality.py`` proves the
+    identity over trials carrying every tricky class rather than over clean
+    text, because the three rewrites below are exactly what a naive
+    "sum of the parts" would get wrong.
+
+    THE PACKER USED TO RE-RENDER EVERY TRIAL, and the cost was not the CPU.
+    ``_trial_input_tokens`` called this function once per trial with
+    ``log_events=False``, so each trial was rendered THREE times per patient --
+    the whole-batch stored-prompt render, the packer's measurement, and the
+    chunk actually sent -- and the two refusal counters below, which are inside
+    the decoders and were never suppressed, read 1.5x their true value on a
+    patient whose batch did not split. Measured, not inferred. The measurement
+    render is gone; the two that remain are both sends.
 
     ``log_events=False`` renders identical text and emits NO render events. It
     is for a caller that renders in order to MEASURE the result rather than to
-    send it -- today exactly one, ``_trial_input_tokens``, which renders a
-    trial to price its contribution to the input budget and throws the string
-    away. Every event this function emits reports a modification of third-party
-    text ON ITS WAY TO THE JUDGE; a render nobody sends made no such journey,
-    and logging one attributes a rewrite to a request that was never issued.
-    Measured before it was closed: on a 15-trial batch that path was 11 of the
-    13 remaining lines per patient.
+    send it. Every event this function emits reports a modification of
+    third-party text ON ITS WAY TO THE JUDGE; a render nobody sends made no
+    such journey, and logging one attributes a rewrite to a request that was
+    never issued. Measured before it was closed: on a 15-trial batch the
+    packer's measurement path was 11 of the 13 remaining lines per patient.
 
     KEYWORD-ONLY, so a second positional argument can never be read as the
     flag, and DEFAULTING TO TRUE, so silence is something a caller asks for
-    explicitly and never something it gets by forgetting. The three send-like
-    callers -- the per-chunk render, the whole-batch stored-prompt render, and
+    explicitly and never something it gets by forgetting. The send-like callers
+    -- the per-chunk render, the whole-batch stored-prompt render, and
     ``oncotriage/evaluation/run_harness.py:build_contexts``, whose text IS
     shown to a rater -- pass nothing and are unchanged.
 
-    COUNTERS ARE DELIBERATELY NOT SUPPRESSED. ``log_events`` governs the log
-    channel and nothing else: ``MARKDOWN_ESCAPE_DECODE_UNRESOLVED`` and
+    THE ONE CALLER THAT STILL ASKS FOR SILENCE is the node's wrapper pricing,
+    ``_user_prompt_for([], log_events=False)``, which renders the user message
+    with no trials in it purely to charge its fixed token cost to every chunk.
+    It renders zero trials, so today it would emit nothing whatever the flag
+    said; it passes the flag because it is a MEASUREMENT render and the flag
+    states which kind of render it is, not which lines happened to be reachable
+    this week. Keeping one real caller is also what stops this parameter and
+    ``_SilentLog`` becoming a mechanism with no subject -- the shape this
+    project deletes rather than leaves declared.
+
+    COUNTERS ARE DELIBERATELY NOT SUPPRESSED, AND THAT DECISION IS UNCHANGED.
+    ``log_events`` governs the log channel and nothing else:
+    ``MARKDOWN_ESCAPE_DECODE_UNRESOLVED`` and
     ``ESCAPED_ENTITY_DECODE_UNRESOLVED`` are incremented inside the decoders,
-    which this function calls identically either way, so a measurement render
-    still contributes to both. That is a known inflation rather than an
-    oversight -- both are refusal counters whose reading is "this shape exists
-    in the corpus", a statement about the corpus that a measurement render
-    observes as truly as a sent one. Changing it is a counter-semantics
-    decision, not a logging one.
+    which this function calls identically either way. What changed is not the
+    flag's contract but the CALL GRAPH: there is no longer a measurement render
+    over real trials for it to inflate. Suppressing the counts would have made
+    one flag govern two unrelated things -- what is logged, and what is
+    counted -- and would have left the redundant render in place; removing the
+    render fixes the counter, the wasted work and the residual log volume at
+    once, and leaves counter semantics exactly where they were.
 
     EVERY TRIAL IS WRAPPED IN AN EXPLICIT DATA DELIMITER, and Section 6's C6
     tells the model what a delimiter means. The trial text is third party --
@@ -1789,18 +1822,22 @@ def _build_trials_text(trials: List[Dict], *, log_events: bool = True) -> str:
     # (70.57%) carry at least one escape, 69,396 sequences in all. The per-trial
     # INFO this replaces therefore fired for roughly seven trials in ten of
     # every render, and a batch is rendered more than once -- the whole batch
-    # for the stored prompt, then once per chunk that is actually sent, plus
-    # once per trial for _trial_input_tokens' packing measurement. The record
-    # the event exists to keep is "third-party text was modified on its way to
-    # the judge, and here is how much"; that is a statement about the render,
-    # and it is fully carried by the three cardinalities below.
+    # for the stored prompt, then once per chunk that is actually sent. (It was
+    # rendered a THIRD time, once per trial, for the packer's measurement; that
+    # render is gone -- the packer slices the whole-batch blocks instead.) The
+    # record the event exists to keep is "third-party text was modified on its
+    # way to the judge, and here is how much"; that is a statement about the
+    # render, and it is fully carried by the three cardinalities below.
     #
     # THE GUARD IS `if md_sequences`, MATCHING EVERY OTHER EVENT IN THIS
     # FUNCTION. The fence, entity and refusal events are each guarded by their
     # own count, so a render that changed nothing says nothing -- and without
     # the guard the empty render at the _user_prompt_for([]) call site, which
     # exists only to measure the wrapper's fixed token cost, would emit a line
-    # claiming a decode pass over no trials at all.
+    # claiming a decode pass over no trials at all. That site ALSO passes
+    # log_events=False now, so the guard and the flag cover it independently;
+    # neither was made redundant by the other, because the guard is about a
+    # batch with nothing to report and the flag is about a render nobody sends.
     #
     # REFUSALS ARE DELIBERATELY NOT A FIELD HERE. They keep their own per-trial
     # WARNING in the loop above, unchanged, on the split this function argues: a
@@ -1816,7 +1853,32 @@ def _build_trials_text(trials: List[Dict], *, log_events: bool = True) -> str:
                   total=md_rendered, trials_affected=md_trials_affected,
                   count=md_sequences)
 
-    return "".join(parts)
+    return parts
+
+
+def _build_trials_text(trials: List[Dict], *, log_events: bool = True) -> str:
+    """The rendered batch as ONE string: the blocks, joined with no separator.
+
+    THE JOIN IS THE WHOLE BODY, and that is the property the packer's
+    arithmetic rests on. ``_render_trial_blocks`` emits one self-contained
+    block per trial and nothing between them, so ``len`` of this string is the
+    sum of the per-block lengths exactly, and a per-trial measurement taken off
+    a block is a measurement of bytes that will really be sent. Anything else
+    here -- a separator, a header, a sort -- would silently make the packer's
+    sum describe a string nobody sends.
+
+    IT KEEPS ITS NAME, ITS SIGNATURE AND ITS RETURN TYPE, deliberately. Three
+    callers read it as a plain ``str``: the node's per-chunk render, the node's
+    wrapper pricing, and ``oncotriage/evaluation/run_harness.py:build_contexts``
+    -- which is in another module and was not touched by this change. Splitting
+    the render out from under it rather than changing what it returns is what
+    kept that promise.
+
+    ``log_events`` is forwarded unchanged; see ``_render_trial_blocks`` for
+    what it does, what it deliberately does NOT do (the two refusal counters),
+    and which caller still asks for silence.
+    """
+    return "".join(_render_trial_blocks(trials, log_events=log_events))
 
 
 # ---------------------------------------------------------------------------
@@ -1846,6 +1908,24 @@ def _build_trials_text(trials: List[Dict], *, log_events: bool = True) -> str:
 PACKING_METHOD_CHARS = f"characters/{CHARS_PER_TOKEN}"
 
 
+class PackingBlockMismatchError(RuntimeError):
+    """``pack_trials_by_input_tokens`` was handed blocks that are not its trials.
+
+    A ``RuntimeError`` SUBCLASS AND DELIBERATELY NOT A ``ValueError``, on the
+    footing ``UnknownModelPricingError``, ``IndexVerificationError`` and
+    ``CrossEncoderLimitMismatchError`` already argue in this project: a stray
+    ``except ValueError`` around a Stage 5 call must not be able to eat it.
+
+    IT RAISES BECAUSE THE ALTERNATIVE IS SILENT AND WRONG. The packer indexes
+    ``blocks`` and ``trials`` in parallel, so if their lengths disagree then
+    ``costs[i]`` prices a different trial than ``trials[i]`` -- and the packer
+    would go on to produce a perfectly well-formed partition, sized by the
+    wrong bytes, with no error, no counter and no symptom anywhere downstream
+    except worse chunking. That is precisely the class of failure this project
+    exists to remove, so it is a refusal rather than a warning.
+    """
+
+
 def estimate_prompt_tokens(text: str) -> int:
     """Estimated tokens for a piece of prompt text.
 
@@ -1868,41 +1948,42 @@ def estimate_prompt_tokens(text: str) -> int:
     return -(-len(text) // CHARS_PER_TOKEN)
 
 
-def _trial_input_tokens(trial_obj: Dict) -> int:
-    """Estimated request tokens contributed by one trial's rendered block.
+def _trial_input_tokens(block: str) -> int:
+    """Estimated request tokens contributed by ONE trial's rendered block.
 
-    MEASURED THROUGH THE SHIPPED RENDERER, never through a second formula.
-    ``_build_trials_text`` concatenates one self-contained block per trial with
-    no separator, so ``len(_build_trials_text(chunk))`` equals the sum of the
-    per-trial lengths exactly -- which makes a per-trial measurement additive
-    and makes the packer's arithmetic a statement about the bytes that will be
-    sent rather than about a model of them. A hand-written "length of the
-    criteria plus a fence allowance" would be a second implementation of the
-    renderer, free to drift from it silently.
+    MEASURED THROUGH THE SHIPPED RENDERER, never through a second formula, and
+    that is unchanged -- what changed is WHERE the render comes from. This used
+    to take a trial object and call ``_build_trials_text([trial_obj],
+    log_events=False)`` itself, so the packer rendered every trial a second
+    time purely to price it. It now takes a block that a render already
+    produced, which is the same bytes by construction:
+    ``_render_trial_blocks`` builds ``parts[i]`` from ``trials[i]`` alone, so
+    the block a whole-batch render produced for a trial IS the block a
+    one-trial render would have produced for it. Proven rather than asserted,
+    over trials carrying escapes, entity chains and fence markers, in
+    ``tests/test_agent_stage5_render_slice_equality.py``.
 
-    THE COST IS ONE EXTRA RENDER PER TRIAL, AND IT IS SILENT. ``log_events`` is
-    False because this render is never sent: the string is measured and thrown
-    away, so every event the renderer emits -- the markdown aggregate, the
-    entity decode, both refusal warnings and the fence neutralization -- would
-    report a rewrite of third-party text on its way to a judge that was never
-    asked. Suppressed as a SET rather than one at a time, because a reader
-    shown a fence warning with no decode event beside it would draw exactly
-    the wrong conclusion about which render it came from.
+    WHY THAT MATTERED, AND IT WAS NOT THE CPU. The two refusal counters live
+    inside the decoders and are deliberately not suppressed by
+    ``log_events=False`` (see ``_render_trial_blocks``), so the extra render
+    counted every refusal a second time. Three renders per trial per patient
+    became two, and the counters stopped reading 1.5x on a batch that does not
+    split.
 
-    This is the paragraph that used to accept the cost, and the acceptance was
-    already thin: it argued that the fence warning firing per measurement was
-    "the documented meaning of the event" and harmless because no real trial
-    contains a bracket run. True of the fence event, and false of the markdown
-    decode, which fires for 70.57% of the corpus -- measured on a 15-trial
-    batch, this path was 11 of the 13 lines a patient produced.
+    A ONE-LINE BODY IS THE POINT, NOT AN ARGUMENT FOR DELETING IT. The name is
+    where "a trial's input cost is the token estimate of its rendered block"
+    is written down; inlining ``estimate_prompt_tokens`` at the packer would
+    leave that sentence in nobody's keeping, which is how the two scraper
+    copies in this repository drifted apart.
 
-    WHAT IS NOT SUPPRESSED IS THE COUNTERS. ``MARKDOWN_ESCAPE_DECODE_UNRESOLVED``
-    and ``ESCAPED_ENTITY_DECODE_UNRESOLVED`` live inside the decoders and are
-    still incremented here, so both carry a contribution from measurement
-    renders. See ``_build_trials_text``'s docstring for why that is left alone.
+    Args:
+        block: one element of ``_render_trial_blocks``'s return value.
+
+    Returns:
+        The token estimate for that block, by the same
+        characters/CHARS_PER_TOKEN proxy every other input figure uses.
     """
-    return estimate_prompt_tokens(
-        _build_trials_text([trial_obj], log_events=False))
+    return estimate_prompt_tokens(block)
 
 
 def _pack_greedy(costs: List[int], fixed_tokens: int,
@@ -1976,8 +2057,8 @@ def _minimum_budget_for(costs: List[int], fixed_tokens: int, lower: int,
 
 
 def pack_trials_by_input_tokens(trials: List[Dict], fixed_tokens: int,
-                                budget: int,
-                                max_chunks: int) -> Tuple[List[List[Dict]], Dict]:
+                                budget: int, max_chunks: int, *,
+                                blocks: List[str]) -> Tuple[List[List[Dict]], Dict]:
     """Split a batch into chunks whose estimated INPUT stays under ``budget``.
 
     Args:
@@ -1989,6 +2070,21 @@ def pack_trials_by_input_tokens(trials: List[Dict], fixed_tokens: int,
             would not be a budget.
         budget: MATCHING_INPUT_TOKEN_BUDGET, or whatever the caller passes.
         max_chunks: MATCHING_MAX_INPUT_PACKED_CHUNKS.
+        blocks: ``_render_trial_blocks(trials)``, positionally parallel to
+            ``trials``. REQUIRED, KEYWORD-ONLY AND WITHOUT A DEFAULT, and all
+            three are deliberate. Required with no default because the obvious
+            default -- render them here when the caller does not supply them --
+            is the defect this argument exists to remove: it would let a
+            caller silently reinstate a second render of every trial, which
+            double-counts the two refusal counters inside the decoders and
+            shows up nowhere. Keyword-only so a fifth positional argument can
+            never be read as one of the three integers above. Same footing as
+            ``empty_database(db_path, flag)``: a plausible thing to type must
+            not quietly do the harmful thing.
+
+    Raises:
+        PackingBlockMismatchError: ``blocks`` is not positionally parallel to
+            ``trials``.
 
     Returns:
         ``(chunks, report)``. ``chunks`` is a partition of ``trials`` -- every
@@ -2032,6 +2128,16 @@ def pack_trials_by_input_tokens(trials: List[Dict], fixed_tokens: int,
         "trials": len(trials),
         "chunks": [],
     }
+    # BEFORE THE EMPTY-BATCH RETURN, so a caller that hands [] trials and a
+    # non-empty blocks list is refused rather than being told there was nothing
+    # to pack. The two disagreeing is the same defect whichever side is empty.
+    if len(blocks) != len(trials):
+        raise PackingBlockMismatchError(
+            f"pack_trials_by_input_tokens was given {len(trials)} trials and "
+            f"{len(blocks)} rendered blocks. They index in parallel, so this "
+            f"would have priced each trial with another trial's bytes. Pass "
+            f"_render_trial_blocks(trials) for the SAME list of trials.")
+
     if not trials:
         # A zero-trial batch is a real state -- Stage 4 can empty the pool and
         # the graph routes elsewhere, but this node must not depend on that.
@@ -2039,7 +2145,23 @@ def pack_trials_by_input_tokens(trials: List[Dict], fixed_tokens: int,
         # is the truthful answer and the caller's loop handles it.
         return [], report
 
-    costs = [_trial_input_tokens(t) for t in trials]
+    # SLICED OUT OF THE CALLER'S ONE RENDER, never re-rendered here. This read
+    # `[_trial_input_tokens(t) for t in trials]`, where that function rendered
+    # each trial itself -- a whole extra render of the batch, whose only
+    # visible effect was that the decoders' two refusal counters counted every
+    # refusal a second time. The estimator is unchanged; only its input is.
+    #
+    # PAIRED ONCE, AND EVERYTHING BELOW READS THE PAIRS. Two parallel lists
+    # walked by a shared index is a correspondence that any later edit can
+    # break without changing a length -- reorder `trials`, filter it, and
+    # `costs[i]` prices some other trial with no error and no symptom except a
+    # worse partition. The length check above cannot see a PERMUTATION, so the
+    # correspondence is not maintained, it is CONSUMED: a trial and its cost
+    # are zipped here and travel together from this line on. `trials` is not
+    # indexed again anywhere below.
+    priced = [(trial_obj, _trial_input_tokens(block))
+              for trial_obj, block in zip(trials, blocks)]
+    costs = [cost for _, cost in priced]
 
     effective = budget
     index_chunks = _pack_greedy(costs, fixed_tokens, effective)
@@ -2060,7 +2182,7 @@ def pack_trials_by_input_tokens(trials: List[Dict], fixed_tokens: int,
             "tokens_estimated": tokens,
             "over_budget": over,
         })
-        chunks.append([trials[i] for i in indexes])
+        chunks.append([priced[i][0] for i in indexes])
     return chunks, report
 
 
@@ -2869,11 +2991,43 @@ def node_llm_classifier_evaluation(state: TrialMatchState) -> dict:
     # the cached prefix. The `CLINICAL TRIALS:` heading stays: it is a
     # structural label rather than patient data, and it is the anchor the
     # dashboard's stored-prompt reader already keys on.
-    def _user_prompt_for(chunk: List[Dict]) -> str:
+    def _wrap_trials(trials_text: str) -> str:
+        """The user message around an ALREADY-RENDERED trials block.
+
+        Split out of ``_user_prompt_for`` so the stored prompt below can be
+        assembled from the one render this node makes instead of provoking a
+        second one. The template is unchanged to the byte -- that is what makes
+        ``_wrap_trials("".join(blocks))`` and the old
+        ``_user_prompt_for(trials)`` the same string, which is asserted in
+        tests/test_agent_stage5_render_slice_equality.py rather than assumed.
+        """
         return f"""
 CLINICAL TRIALS:
-{_build_trials_text(chunk)}
+{trials_text}
 """
+
+    def _user_prompt_for(chunk: List[Dict], *,
+                         log_events: bool = True) -> str:
+        """Render ``chunk`` and wrap it. The send path, unchanged.
+
+        ``log_events`` is forwarded so the wrapper-pricing call below can state
+        that it is a MEASUREMENT render. It defaults to True, so the sent
+        render -- the only other caller -- is loud exactly as before.
+        """
+        return _wrap_trials(_build_trials_text(chunk, log_events=log_events))
+
+    # ── The ONE render of this batch ──────────────────────────────────────
+    # Every trial in the batch, rendered once, LOUDLY: this is the text the
+    # stored prompt is made of, so its events and its two refusal counts are a
+    # true record of third-party text on its way to the judge.
+    #
+    # IT FEEDS TWO CONSUMERS AND USED TO FEED ONE. The stored prompt below, and
+    # the packer's per-trial cost measurement, which used to render every trial
+    # AGAIN. Blocks are a pure function of their trial (see
+    # _render_trial_blocks), so slicing is exact rather than approximate, and
+    # the packer's arithmetic is still a statement about bytes that will be
+    # sent.
+    trial_blocks = _render_trial_blocks(trials)
 
     # ── Store full prompt for DB logging (system + user combined) ──────────
     # The WHOLE batch, not the chunk that happened to be sent last. When a run
@@ -2892,14 +3046,21 @@ CLINICAL TRIALS:
     # PATIENT RECORD block carries its own <<<PATIENT_RECORD>>> /
     # <<<END_PATIENT_RECORD>>> delimiters precisely so that reader does not have
     # to guess where it ends.
-    prompt = f"[SYSTEM]\n{system_prompt}\n\n[USER]\n{_user_prompt_for(trials)}"
+    prompt = (f"[SYSTEM]\n{system_prompt}\n\n[USER]\n"
+              f"{_wrap_trials(''.join(trial_blocks))}")
 
     # Everything a request carries whatever chunk is in it: the system message
     # in full, and the user message's wrapper with no trials in it. Measured
     # rather than approximated -- _user_prompt_for([]) IS the wrapper, so this
     # cannot drift from the template the way a hand-counted allowance would.
+    # log_events=False because this render exists to be MEASURED and is never
+    # sent. It renders zero trials, so it emits nothing and counts nothing
+    # whatever the flag says; passing it states which KIND of render this is
+    # rather than which lines happened to be reachable, and it is what keeps
+    # the flag and _SilentLog a mechanism with a live subject.
     fixed_input_tokens = (estimate_prompt_tokens(system_prompt)
-                          + estimate_prompt_tokens(_user_prompt_for([])))
+                          + estimate_prompt_tokens(
+                              _user_prompt_for([], log_events=False)))
 
     # ------------------------------------------------------------------
     # Packing: bound the INPUT before the output splitters see the batch
@@ -2920,7 +3081,7 @@ CLINICAL TRIALS:
     if MATCHING_INPUT_PACKING_ENABLED:
         initial_chunks, packing_report = pack_trials_by_input_tokens(
             trials, fixed_input_tokens, MATCHING_INPUT_TOKEN_BUDGET,
-            MATCHING_MAX_INPUT_PACKED_CHUNKS)
+            MATCHING_MAX_INPUT_PACKED_CHUNKS, blocks=trial_blocks)
         # tokens_estimated IS THE WHOLE BATCH'S INPUT, not the fixed overhead.
         # It is the number the threshold beside it is a threshold ON, and a
         # reader comparing the two is asking "how far over was this patient" --

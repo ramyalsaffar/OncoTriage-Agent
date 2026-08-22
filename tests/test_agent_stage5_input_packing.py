@@ -107,9 +107,11 @@ from oncotriage.agent import evaluation as _evaluation
 from oncotriage.agent import prompts as _prompts
 from oncotriage.agent.evaluation import (
     PACKING_METHOD_CHARS,
+    PackingBlockMismatchError,
     _build_trials_text,
     _minimum_budget_for,
     _pack_greedy,
+    _render_trial_blocks,
     estimate_prompt_tokens,
     node_llm_classifier_evaluation,
     pack_trials_by_input_tokens,
@@ -233,6 +235,152 @@ def trial(index, criteria_chars=400, nct_id=None):
     }
 
 
+def pack_in(module, trials, fixed, budget, max_chunks):
+    """``module``'s packer, handed the blocks production hands it.
+
+    THE BLOCKS ARGUMENT IS REQUIRED AND HAS NO DEFAULT, so every call site in
+    this file has to say where the render came from -- which is the whole point
+    of the render-slice pass. Before it, the packer rendered every trial a
+    second time to price it, and the two refusal counters inside the decoders,
+    which ``log_events=False`` deliberately does not suppress, read 1.5x on a
+    patient whose batch did not split.
+
+    IT TAKES THE MODULE so the negative controls below, which run a MUTATED
+    COPY of evaluation.py, render through the copy's own renderer rather than
+    through the shipped one. A control that priced its plant with the shipped
+    module's bytes would be testing the wrong pair of functions.
+
+    This helper deliberately does NOT default ``blocks`` itself: it renders
+    from ``trials`` unconditionally, so it can never disagree with them, and
+    section 2h drives the mismatch refusal directly instead.
+    """
+    return module.pack_trials_by_input_tokens(
+        trials, fixed, budget, max_chunks,
+        blocks=module._render_trial_blocks(trials))
+
+
+def pack(trials, fixed, budget, max_chunks):
+    """The shipped packer, blocks and all. See ``pack_in``."""
+    return pack_in(_evaluation, trials, fixed, budget, max_chunks)
+
+
+def unpack(result):
+    """``(chunks, report)`` from a drive() result, safe when it raised.
+
+    ``drive`` turns an exception into a "<RAISED ...>" STRING, and
+    ``a, b = <string>`` raises ValueError unless the string happens to be two
+    characters long -- an ABORT at module level, which replaces the whole
+    file's summary with one traceback exactly when a defect is present. Found
+    by a revert harness: reverting the renderer to return a joined string made
+    every packer call raise, and this file died instead of recording failures.
+    """
+    if isinstance(result, tuple) and len(result) == 2:
+        return result
+    return [], _RaisedReport(result)
+
+
+class _Absent:
+    """A value that stands in for a report field that does not exist.
+
+    TOTAL, AND EVERY ONE OF THESE FIVE PROTOCOLS WAS EARNED BY AN ABORT rather
+    than added for tidiness. The checks in this file do three different things
+    with a report field -- compare it, ITERATE it (``for c in
+    _report["chunks"]``) and index into what the iteration yields -- so a
+    stand-in that answers only ``==`` moves the abort one line down.
+
+    Two earlier versions of this did exactly that, each found by a revert
+    harness and neither by reading:
+      * ``{}``   -> KeyError at module level on ``_report["cap_relaxed_budget"]``
+      * a STRING -> iterating it yields CHARACTERS, so ``c["tokens_estimated"]``
+                    raised TypeError. Worse than the KeyError, because a
+                    one-character report field is the shape a check could
+                    silently compare against and report a confident False.
+
+    Iterating yields nothing, indexing yields this again, and the repr names
+    the raise -- so a check FAILS and says why, which is the whole point.
+    """
+
+    __slots__ = ("_why",)
+
+    def __init__(self, why):
+        self._why = why
+
+    def __iter__(self):
+        return iter(())
+
+    def __getitem__(self, key):
+        return self
+
+    def __len__(self):
+        return 0
+
+    def __bool__(self):
+        return False
+
+    def __eq__(self, other):
+        return isinstance(other, _Absent)
+
+    def __hash__(self):
+        return hash("<absent>")
+
+    # ARITHMETIC AND ORDERING, and this is the THIRD protocol an abort taught
+    # this class. Some checks do `_report["budget_tokens"] - 1` and some
+    # compare a field with `>`; without these, `_Absent - 1` is a TypeError at
+    # module level -- the same abort again, one operator further along. Every
+    # operation yields absence, and every ordering is False, so a check that
+    # reaches one FAILS and prints the reason instead of killing the file.
+    def __sub__(self, other):
+        return self
+
+    def __rsub__(self, other):
+        return self
+
+    def __add__(self, other):
+        return self
+
+    def __radd__(self, other):
+        return self
+
+    def __lt__(self, other):
+        return False
+
+    def __gt__(self, other):
+        return False
+
+    def __le__(self, other):
+        return False
+
+    def __ge__(self, other):
+        return False
+
+    def __repr__(self):
+        return f"<no report: {self._why}>"
+
+    # THE RESIDUAL, STATED RATHER THAN GLOSSED: two absent values compare
+    # EQUAL, so a check comparing one absent report field with another would
+    # pass. Every check in this file compares a field with a LITERAL
+    # expectation, where absence never equals it -- and reflexive equality is
+    # what keeps this usable in a set or an `in`. If a field-to-field
+    # comparison is ever added, it needs its own non-degeneracy probe.
+
+
+class _RaisedReport(dict):
+    """A report stand-in that answers ANY key with _Absent, never KeyError.
+
+    A plain ``{}`` here would move the abort one line down: the checks index
+    the report directly (``_report["cap_relaxed_budget"]``), so a missing key
+    is a KeyError at module level -- the same abort, wearing a different name.
+    Measured, not predicted.
+    """
+
+    def __init__(self, raised):
+        super().__init__()
+        self._raised = raised
+
+    def __missing__(self, key):
+        return _Absent(self._raised)
+
+
 def nct_ids_of(chunks):
     """[[nct_id, ...], ...] for a list of chunks."""
     return [[t["trial"]["nct_id"] for t in c] for c in chunks]
@@ -290,8 +438,8 @@ _FIXED = 1000
 
 # --- 2b: fits in one ------------------------------------------------------
 _ten = [trial(i) for i in range(10)]
-_chunks, _report = drive(pack_trials_by_input_tokens, _ten, _FIXED,
-                         _FIXED + 10 * _UNIT, 5)
+_chunks, _report = unpack(drive(pack, _ten, _FIXED,
+                         _FIXED + 10 * _UNIT, 5))
 check("2b  a batch that fits under the budget stays ONE chunk",
       nct_ids_of(_chunks), [[t["trial"]["nct_id"] for t in _ten]])
 check("2b  ...and nothing is flagged",
@@ -305,12 +453,12 @@ check("2b  ...and the report states the chunk's token estimate, which is the "
 # --- 2c: the greedy boundary ----------------------------------------------
 # One token below the ten-trial cost, so the tenth trial must not fit. The
 # boundary is arithmetic, not a guess: the budget names exactly where it falls.
-_chunks, _report = drive(pack_trials_by_input_tokens, _ten, _FIXED,
-                         _FIXED + 10 * _UNIT - 1, 5)
+_chunks, _report = unpack(drive(pack, _ten, _FIXED,
+                         _FIXED + 10 * _UNIT - 1, 5))
 check("2c  one token short of the whole batch splits it 9 + 1",
       [len(c) for c in _chunks], [9, 1])
-_chunks, _report = drive(pack_trials_by_input_tokens, _ten, _FIXED,
-                         _FIXED + 4 * _UNIT, 5)
+_chunks, _report = unpack(drive(pack, _ten, _FIXED,
+                         _FIXED + 4 * _UNIT, 5))
 check("2c  ...and a budget for four trials packs 4 + 4 + 2, in order",
       nct_ids_of(_chunks),
       [["NCT00000000", "NCT00000001", "NCT00000002", "NCT00000003"],
@@ -326,8 +474,8 @@ check("2c  ...and the fixed overhead is charged to EVERY chunk, not once "
 # three. The answer is not "three chunks somehow" but a specific number: the
 # least budget at which greedy packing fits in three, which is four trials per
 # chunk (4 + 4 + 2).
-_chunks, _report = drive(pack_trials_by_input_tokens, _ten, _FIXED,
-                         _FIXED + _UNIT, 3)
+_chunks, _report = unpack(drive(pack, _ten, _FIXED,
+                         _FIXED + _UNIT, 3))
 check("2d  a batch that would exceed the chunk cap is packed within it",
       len(_chunks), 3)
 check("2d  ...by RAISING the budget, and the flag says so",
@@ -347,8 +495,8 @@ check("2d  ...and NOT ONE TRIAL WAS DROPPED, which is the whole reason the "
 
 # --- 2e: the oversized single trial ----------------------------------------
 _huge = [trial(0, 400), trial(1, 200_000), trial(2, 400)]
-_chunks, _report = drive(pack_trials_by_input_tokens, _huge, _FIXED,
-                         _FIXED + 2 * _UNIT, 5)
+_chunks, _report = unpack(drive(pack, _huge, _FIXED,
+                         _FIXED + 2 * _UNIT, 5))
 check("2e  a trial too large for any chunk ships in a chunk of its own",
       [len(c) for c in _chunks], [1, 1, 1])
 check("2e  ...flagged, not dropped",
@@ -363,12 +511,24 @@ check("2e  ...and every trial is still present",
       ["NCT00000000", "NCT00000001", "NCT00000002"])
 
 # --- 2f: determinism -------------------------------------------------------
-_a = pack_trials_by_input_tokens(_ten, _FIXED, _FIXED + 3 * _UNIT, 5)
-_b = pack_trials_by_input_tokens(_ten, _FIXED, _FIXED + 3 * _UNIT, 5)
+# THROUGH drive() AND unpack(), like every other pack call here. A bare
+# `pack(...)` raises at module level, which is an ABORT where a recorded
+# failure is owed -- found by a revert harness that made every pack raise.
+_a = unpack(drive(pack, _ten, _FIXED, _FIXED + 3 * _UNIT, 5))
+_b = unpack(drive(pack, _ten, _FIXED, _FIXED + 3 * _UNIT, 5))
 check("2f  two packs of one input agree, chunk for chunk",
       nct_ids_of(_a[0]), nct_ids_of(_b[0]))
 check("2f  ...and their reports agree too",
-      json.dumps(_a[1], sort_keys=True), json.dumps(_b[1], sort_keys=True))
+      json.dumps(_a[1], sort_keys=True, default=repr),
+      json.dumps(_b[1], sort_keys=True, default=repr))
+# NON-DEGENERACY, and it is NOT decoration: if both packs raised, both sides
+# of 2f are the same stand-in and the check passes for the wrong reason. This
+# is the one place in this file where two DERIVED values are compared rather
+# than one value against a literal.
+check("2f  ...and both packs actually returned a partition, so the two "
+      "comparisons above are not two copies of the same failure",
+      (isinstance(_a[0], list) and len(_a[0]) > 0,
+       isinstance(_b[0], list) and len(_b[0]) > 0), (True, True))
 
 # --- 2g: THE INVARIANT, over a spread of budgets ---------------------------
 # Every input nct_id in EXACTLY ONE chunk, order preserved, no chunk empty. Run
@@ -379,7 +539,7 @@ _expected_ids = [t["trial"]["nct_id"] for t in _mixed]
 _partition_failures = []
 _shapes = set()
 for _budget in range(_FIXED, _FIXED + 20 * _UNIT, max(1, _UNIT // 3)):
-    _c, _r = pack_trials_by_input_tokens(_mixed, _FIXED, _budget, 5)
+    _c, _r = unpack(drive(pack, _mixed, _FIXED, _budget, 5))
     _flat = [i for c in nct_ids_of(_c) for i in c]
     _shapes.add(tuple(len(c) for c in _c))
     if _flat != _expected_ids:
@@ -398,7 +558,7 @@ check("2g  ...and the sweep was non-degenerate: it produced more than one "
 # --- 2h: the empty batch ---------------------------------------------------
 check("2h  a zero-trial batch packs to no chunks at all (one empty chunk would "
       "issue a billed request about nothing)",
-      drive(pack_trials_by_input_tokens, [], _FIXED, 12000, 5)[0], [])
+      unpack(drive(pack, [], _FIXED, 12000, 5))[0], [])
 
 
 # ===========================================================================
@@ -829,6 +989,91 @@ check("5h  every request in the composed run still shared one system message",
 # disabled, and the shipped node with the packing branch removed entirely from
 # an in-memory COPY -- which is what the node was before this pass.
 
+# ===========================================================================
+# SECTION 5b -- PACKING COSTS NO EXTRA RENDER OF ANY TRIAL
+# ===========================================================================
+#
+# THE ONLY CHECK IN THIS PROJECT THAT MEASURES THE PRODUCTION RENDER COUNT.
+# Everything else about the render-slice pass is measured on the functions;
+# this drives the real node with the client replaced through deps, and counts
+# what the decoders' two REFUSAL COUNTERS -- which log_events deliberately does
+# not suppress -- were left holding.
+#
+# THE ASSERTION IS SELF-NORMALISING AND THAT IS THE DESIGN. Packing ON and
+# packing OFF are compared against each other rather than against a constant,
+# so there is no magic number to go stale when the node's render count changes
+# for some unrelated reason. Packing OFF never calls the packer at all, so it
+# renders each trial exactly twice -- the whole-batch stored prompt and the one
+# chunk sent. Packing ON must therefore leave the SAME totals: the packer is
+# handed the blocks the stored-prompt render already produced.
+#
+# BEFORE THE RENDER-SLICE PASS THIS WOULD HAVE FAILED, and by exactly the ratio
+# the pass is about: packing ON rendered every trial a third time to price it,
+# so ON read 3 renders' worth against OFF's 2. Control c12 in section 7 puts
+# that render back and requires this to fire.
+section("SECTION 5b -- packing adds no render, measured through the node")
+
+
+def _refusal_trial(index):
+    """A trial whose criteria carry BOTH classes of decoder refusal.
+
+    ``escaped_backslash`` ("CLL\\SLL", 14 occurrences in 11 real trials) and
+    ``reference_syntax`` ("\\#", 1 occurrence) move the markdown counter; an
+    entity reference that decodes to no usable character moves the entity one.
+    Refusals rather than DECODES on purpose: a decode is reported by an event
+    and counted nowhere, so it could not measure a render at all.
+    """
+    t = trial(index)
+    t["trial"]["eligibility"]["inclusion_criteria"] = (
+        r"Inclusion Criteria:" "\n" r"- CLL\\SLL and \# CLN%d" % index)
+    t["trial"]["eligibility"]["exclusion_criteria"] = (
+        r"Exclusion Criteria:" "\n" r"- code \&#0; and \&#55296; here")
+    return t
+
+
+def _refusal_totals():
+    return (sum(_evaluation.MARKDOWN_ESCAPE_DECODE_UNRESOLVED.values()),
+            sum(_evaluation.ESCAPED_ENTITY_DECODE_UNRESOLVED.values()))
+
+
+def _clear_refusals():
+    _evaluation.MARKDOWN_ESCAPE_DECODE_UNRESOLVED.clear()
+    _evaluation.ESCAPED_ENTITY_DECODE_UNRESOLVED.clear()
+
+
+def _node_refusal_totals(trials, **kw):
+    """Counter totals a single node run leaves, with the client stubbed."""
+    _clear_refusals()
+    run_node(trials, **kw)
+    out = _refusal_totals()
+    _clear_refusals()
+    return out
+
+
+_REFUSAL_BATCH = [_refusal_trial(i) for i in range(6)]
+
+_clear_refusals()
+drive(_render_trial_blocks, _REFUSAL_BATCH)
+_ONE_RENDER = _refusal_totals()
+_clear_refusals()
+check("5b(a) non-degeneracy: one render of this batch moves BOTH refusal "
+      "counters, so every total below is arithmetic between real numbers",
+      tuple(n > 0 for n in _ONE_RENDER), (True, True))
+
+# A budget big enough that the batch never splits: the no-split patient, which
+# is where the 1.5x was measured.
+_ON = _node_refusal_totals(_REFUSAL_BATCH, packing=True, budget=1_000_000)
+_OFF = _node_refusal_totals(_REFUSAL_BATCH, packing=False)
+check("5b(b) PACKING ON LEAVES EXACTLY WHAT PACKING OFF LEAVES. The packer "
+      "renders nothing: it is handed the blocks the stored-prompt render "
+      "already produced", _ON, _OFF)
+check("5b(c) ...and that is TWO renders' worth -- the stored prompt and the "
+      "one chunk sent, both of them sends", _ON,
+      tuple(2 * n for n in _ONE_RENDER))
+check("5b(d) ...and strictly less than the three renders' worth the packer "
+      "used to add, which is the 1.5x this pass removed",
+      sum(_ON) < 3 * sum(_ONE_RENDER), True)
+
 section("SECTION 6 -- packing OFF is byte-equivalent to the pre-packing node")
 
 _EVAL_SRC = open(_EVALUATION_PATH, encoding="utf-8").read()
@@ -971,8 +1216,7 @@ control(
       "            used = 0")],
     lambda m: sorted(
         t["trial"]["nct_id"]
-        for c in m.pack_trials_by_input_tokens(_huge, _FIXED,
-                                               _FIXED + 2 * _UNIT, 5)[0]
+        for c in pack_in(m, _huge, _FIXED, _FIXED + 2 * _UNIT, 5)[0]
         for t in c),
     ["NCT00000000", "NCT00000002"],
 )
@@ -984,8 +1228,8 @@ control(
     [("        effective = _minimum_budget_for(costs, fixed_tokens, budget, max_chunks)\n"
       "        index_chunks = _pack_greedy(costs, fixed_tokens, effective)",
       "        index_chunks = index_chunks[:max_chunks]")],
-    lambda m: sum(len(c) for c in m.pack_trials_by_input_tokens(
-        _ten, _FIXED, _FIXED + _UNIT, 3)[0]),
+    lambda m: sum(len(c) for c in pack_in(
+        m, _ten, _FIXED, _FIXED + _UNIT, 3)[0]),
     3,
 )
 
@@ -995,8 +1239,7 @@ control(
     _EVAL_SRC,
     [("        effective = _minimum_budget_for(costs, fixed_tokens, budget, max_chunks)",
       "        effective = fixed_tokens + sum(costs)")],
-    lambda m: len(m.pack_trials_by_input_tokens(_ten, _FIXED,
-                                                _FIXED + _UNIT, 3)[0]),
+    lambda m: len(pack_in(m, _ten, _FIXED, _FIXED + _UNIT, 3)[0]),
     1,
 )
 
@@ -1008,8 +1251,8 @@ control(
     _EVAL_SRC,
     [("        if current and fixed_tokens + used + cost > budget:",
       "        if current and used + cost > budget:")],
-    lambda m: [len(c) for c in m.pack_trials_by_input_tokens(
-        _ten, _FIXED, _FIXED + 4 * _UNIT, 5)[0]],
+    lambda m: [len(c) for c in pack_in(
+        m, _ten, _FIXED, _FIXED + 4 * _UNIT, 5)[0]],
     [10],
 )
 
@@ -1017,12 +1260,18 @@ control(
 control(
     "c5  a packer that sorts its input is CAUGHT [2g]",
     _EVAL_SRC,
-    [("    costs = [_trial_input_tokens(t) for t in trials]",
+    # THE ANCHOR MOVED WITH THE RENDER-SLICE PASS. The line this used to plant
+    # against, `costs = [_trial_input_tokens(t) for t in trials]`, is gone: the
+    # packer is handed rendered blocks and pairs each trial with its own cost
+    # once. The sort is planted immediately ABOVE that pairing, which is the
+    # only place a reorder can still reach the partition -- below it there is
+    # no separate `trials` list left to sort, which is the point of pairing.
+    [("    priced = [(trial_obj, _trial_input_tokens(block))",
       "    trials = sorted(trials, key=lambda t: -len(str(t)))\n"
-      "    costs = [_trial_input_tokens(t) for t in trials]")],
+      "    priced = [(trial_obj, _trial_input_tokens(block))")],
     lambda m: [t["trial"]["nct_id"]
-               for c in m.pack_trials_by_input_tokens(
-                   _mixed, _FIXED, _FIXED + 3 * _UNIT, 5)[0] for t in c]
+               for c in pack_in(
+                   m, _mixed, _FIXED, _FIXED + 3 * _UNIT, 5)[0] for t in c]
     == _expected_ids,
     False,
 )
@@ -1057,15 +1306,22 @@ control(
 control(
     "c8  a patient record re-interpolated into the user message is CAUGHT [4c]",
     _EVAL_SRC,
-    [('    def _user_prompt_for(chunk: List[Dict]) -> str:\n'
-      '        return f"""\n'
-      'CLINICAL TRIALS:',
-      '    def _user_prompt_for(chunk: List[Dict]) -> str:\n'
+    # THE TEMPLATE MOVED TO `_wrap_trials` in the render-slice pass -- same
+    # bytes, one function further in -- so the plant follows it. Anchoring on
+    # `_user_prompt_for` here would have applied to nothing, and a plant that
+    # applies to nothing reports the control as MISSED while the check it
+    # guards is perfectly sound.
+    [('    def _wrap_trials(trials_text: str) -> str:\n'
+      '        """',
+      '    def _wrap_trials(trials_text: str) -> str:\n'
       '        return f"""\n'
       'PATIENT RECORD:\n'
       '{patient_summary}\n'
       '\n'
-      'CLINICAL TRIALS:')],
+      'CLINICAL TRIALS:\n'
+      '{trials_text}\n'
+      '"""\n'
+      '        """')],
     lambda m: any("PATIENT RECORD:" in r["messages"][1]["content"]
                   for r in run_node(_SIX, budget=1,
                                     node=m.node_llm_classifier_evaluation)[1].requests),
@@ -1228,6 +1484,60 @@ check("c15 non-degeneracy: the controls above actually ran",
 # ===========================================================================
 # SECTION 8 -- NOTHING ON DISK WAS WRITTEN
 # ===========================================================================
+
+def _control_render_ratio(module):
+    """``ON:OFF`` renders per trial, in the given module, as a reduced ratio.
+
+    Expressed as a RATIO rather than as two totals so the control states the
+    thing the pass is about -- three renders against two -- instead of two
+    numbers that depend on how many refusals the batch happens to carry.
+    """
+    def _clear():
+        module.MARKDOWN_ESCAPE_DECODE_UNRESOLVED.clear()
+        module.ESCAPED_ENTITY_DECODE_UNRESOLVED.clear()
+
+    def _totals():
+        return (sum(module.MARKDOWN_ESCAPE_DECODE_UNRESOLVED.values())
+                + sum(module.ESCAPED_ENTITY_DECODE_UNRESOLVED.values()))
+
+    _clear()
+    module._render_trial_blocks(_REFUSAL_BATCH)
+    one = _totals()
+    _clear()
+    run_node(_REFUSAL_BATCH, packing=True, budget=1_000_000,
+             node=module.node_llm_classifier_evaluation)
+    on = _totals()
+    _clear()
+    run_node(_REFUSAL_BATCH, packing=False,
+             node=module.node_llm_classifier_evaluation)
+    off = _totals()
+    _clear()
+    if not one:
+        return "<no refusal in the batch: the ratio would be 0:0>"
+    return f"{on // one}:{off // one}"
+
+
+# --- c12: the packer renders every trial again to price it ------------------
+# THE ORIGINAL DEFECT, planted back. This is the only control in the project
+# that reaches the production render count, so it is driven through the real
+# node against the mutated module rather than against a function.
+control(
+    "c17 a packer that RE-RENDERS every trial to price it is CAUGHT [5b]",
+    _EVAL_SRC,
+    [("    return estimate_prompt_tokens(block)",
+      "    return estimate_prompt_tokens("
+      "_build_trials_text([block], log_events=False))"),
+     ("    priced = [(trial_obj, _trial_input_tokens(block))\n"
+      "              for trial_obj, block in zip(trials, blocks)]",
+      "    priced = [(trial_obj, _trial_input_tokens(trial_obj))\n"
+      "              for trial_obj, block in zip(trials, blocks)]")],
+    # THE COUNTERS ARE THE MUTATED MODULE'S, NOT THE SHIPPED ONE'S. exec'ing a
+    # copy of evaluation.py gives it its own Counter objects, so reading the
+    # shipped module's here would report zero however loudly the copy counted.
+    lambda m: _control_render_ratio(m),
+    "3:2",
+)
+
 
 section("SECTION 8 -- no repository file was written")
 

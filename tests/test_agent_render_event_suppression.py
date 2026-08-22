@@ -10,22 +10,40 @@ one of them reports a MODIFICATION OF THIRD-PARTY TEXT ON ITS WAY TO THE JUDGE:
 the markdown-escape aggregate, its per-trial DEBUG detail, the markdown refusal,
 the entity decode, the entity refusal and the fence neutralization.
 
-FOUR CALLERS, AND ONLY ONE OF THEM IS NOT A SEND:
+THREE CALLERS NOW, AND ALL THREE ARE SENDS. It was four, and the one that was
+not a send is gone:
 
   1. the per-chunk render of what is actually sent to the model
      (``oncotriage/agent/evaluation.py``, ``_user_prompt_for(chunk)``)
-  2. the whole-batch stored-prompt render kept for the database
-     (the same helper, called with the whole batch)
-  3. ``_trial_input_tokens`` -- renders ONE trial at a time purely to price its
-     contribution to the input budget, then throws the string away
-  4. ``oncotriage/evaluation/run_harness.py:build_contexts`` -- renders one
+  2. the whole-batch render, which IS the stored prompt kept for the database
+     (``_render_trial_blocks(trials)`` in the node)
+  3. ``oncotriage/evaluation/run_harness.py:build_contexts`` -- renders one
      trial at a time for the offline rater, and that text IS consumed. SEND-LIKE
      and deliberately OUT OF SCOPE; section 7 asserts it still logs.
 
-Path 3 dominated the residual volume. Measured on a seeded 15-trial sample from
-the shipped corpus: 11 of the 13 remaining lines per patient came from it, and a
-``trial_fence_marker_neutralized`` warning from a render nobody sent tells a
-reader that a rewrite reached a judge that was never asked.
+  RETIRED. ``_trial_input_tokens`` used to render ONE trial at a time purely to
+  price its contribution to the input budget and then throw the string away.
+  It dominated the residual volume -- measured on a seeded 15-trial sample from
+  the shipped corpus, 11 of the 13 remaining lines per patient came from it --
+  and silencing it was this file's original subject. The render-slice pass
+  removed the render instead: the packer is handed the blocks the whole-batch
+  render already produced, and ``_trial_input_tokens`` now prices a block
+  rather than making one.
+
+WHY THE RENDER WAS REMOVED RATHER THAN LEFT SILENT, which is what section 4 is
+now about. Silencing the log channel never touched the two REFUSAL COUNTERS
+inside the decoders, and those are totals rather than sets: a phantom render
+makes them a count of renders, not of refusals. Every trial was rendered three
+times per patient -- stored prompt, packer measurement, chunk sent -- so both
+counters read exactly 1.5x on a batch that did not split. Two renders remain
+and both are sends.
+
+THE ONE CALLER THAT STILL ASKS FOR SILENCE is the node's wrapper pricing,
+``_user_prompt_for([], log_events=False)``, which renders the user message with
+no trials in it to charge its fixed cost to every chunk. It renders zero trials,
+so it would emit nothing whatever the flag said; it passes the flag because it
+IS a measurement render, and because a flag with no caller is a mechanism with
+no subject.
 
 THE SUPPRESSION IS UNIFORM BY CONSTRUCTION, NOT BY SIX GUARDS. The render binds
 ``emit = log if log_events else _SILENT_LOG`` and logs through ``emit``; there
@@ -37,11 +55,19 @@ collapses a nested ``&amp;`` run in a single pass, so no input reaches it -- it
 is 0 across all 14,324 trials. Proving that site structurally is stronger than
 omitting it, and the test says which of the two it did.
 
-COUNTERS ARE OUT OF SCOPE AND ASSERTED UNCHANGED. ``log_events`` governs the log
-channel only; ``MARKDOWN_ESCAPE_DECODE_UNRESOLVED`` and
-``ESCAPED_ENTITY_DECODE_UNRESOLVED`` live inside the decoders and still count on
-the measurement path. Section 4 proves the change is logging-only by driving a
-planted batch both ways and requiring the counters to land identically.
+THE FLAG IS STILL LOGGING-ONLY AND THE COUNTERS ARE STILL NOT SUPPRESSED.
+``MARKDOWN_ESCAPE_DECODE_UNRESOLVED`` and ``ESCAPED_ENTITY_DECODE_UNRESOLVED``
+live inside the decoders, which the render calls identically either way, so a
+silent render lands the same counts key for key as a loud one -- section 4's 4a
+and 4d, unchanged and still passing. What section 4 no longer asserts is that a
+MEASUREMENT render adds a third set of them; 4c used to pin that as deliberate
+and now measures its absence, driving the sequence a no-split patient produces
+and requiring exactly two renders' worth. The argument for the change, and for
+why suppression would have been the wrong fix, is written at 4's header.
+
+THE RENDER IS ``_render_trial_blocks`` AND THIS FILE'S AST CHECKS FOLLOW IT
+THERE. ``_build_trials_text`` is the join over the blocks and holds no event
+site at all, so section 5 pointed at it would pass over an empty body.
 
 NO NETWORK, NO KEYS, NO SPEND, NO MODEL CALL, NO GIT HISTORY, NO CORPUS. It
 EXECS NOTHING: every control rebinds a module attribute inside ``try``/
@@ -86,8 +112,10 @@ from oncotriage.agent.evaluation import (                      # noqa: E402
     _SilentLog,
     _build_trials_text,
     _decode_markdown_escapes,
+    _render_trial_blocks,
     _trial_input_tokens,
     estimate_prompt_tokens,
+    pack_trials_by_input_tokens,
 )
 from oncotriage.observability import StructuredLogger          # noqa: E402
 
@@ -230,20 +258,34 @@ except Exception as _exc:                                      # noqa: BLE001
 _EVAL_SHA_BEFORE = hashlib.sha256(_EVAL_SRC.encode()).hexdigest()
 
 
-def render_function_node():
-    """The ``_build_trials_text`` FunctionDef out of the shipped source."""
+def function_node(name):
+    """The named FunctionDef out of the shipped source, or None."""
     try:
         tree = ast.parse(_EVAL_SRC, _EVAL_PATH)
     except SyntaxError:
         return None
     for node in ast.walk(tree):
-        if (isinstance(node, ast.FunctionDef)
-                and node.name == "_build_trials_text"):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
             return node
     return None
 
 
+def render_function_node():
+    """The RENDER's FunctionDef -- ``_render_trial_blocks``.
+
+    THE RENDER MOVED OUT FROM UNDER ``_build_trials_text`` and this file's
+    subject moved with it. The render-slice pass split the per-trial loop --
+    the six event sites, the ``emit`` binding, the two decoder calls -- into
+    ``_render_trial_blocks``, which returns the blocks; ``_build_trials_text``
+    is now the join over them and holds no event site at all. Section 5 asserts
+    that separation rather than assuming it, so pointing this at the joiner
+    would make every check in that section pass over an empty function body.
+    """
+    return function_node("_render_trial_blocks")
+
+
 _RENDER_NODE = render_function_node()
+_JOIN_NODE = function_node("_build_trials_text")
 
 
 def logger_calls(node, receiver):
@@ -267,8 +309,8 @@ print("SECTION 1 -- the four callers, read off the shipped source")
 print("=" * 70)
 
 
-def call_kwargs(source, path_label):
-    """Every ``_build_trials_text(...)`` call in ``source``, as kwarg-name sets."""
+def call_kwargs(source, path_label, name="_build_trials_text"):
+    """Every ``name(...)`` call in ``source``, as kwarg-name sets."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -277,7 +319,7 @@ def call_kwargs(source, path_label):
     for node in ast.walk(tree):
         if (isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
-                and node.func.id == "_build_trials_text"):
+                and node.func.id == name):
             out.append(frozenset(kw.arg for kw in node.keywords))
     return out
 
@@ -295,15 +337,38 @@ check("1a     the shipped evaluation.py was read and parsed (non-degeneracy)",
 # and a check counting sites as though they were paths reports 2 where it
 # expected 3. The distinction matters beyond arithmetic: one edit to
 # `_user_prompt_for` moves the send and the stored prompt together.
-check("1b     evaluation.py holds exactly TWO renderer call sites -- the "
-      "shared _user_prompt_for site (paths 1 and 2) and the measurement",
-      len(_EVAL_CALLS) if isinstance(_EVAL_CALLS, list) else _EVAL_CALLS, 2)
-check("1c     ...and exactly ONE of the two passes log_events",
-      sorted(len(k) for k in _EVAL_CALLS) if isinstance(_EVAL_CALLS, list)
-      else _EVAL_CALLS, [0, 1])
-check("1d     ...and the one that does names log_events, not something else",
+check("1b     evaluation.py holds exactly ONE _build_trials_text call site -- "
+      "inside _user_prompt_for, which serves both the sent chunk and the "
+      "wrapper pricing",
+      len(_EVAL_CALLS) if isinstance(_EVAL_CALLS, list) else _EVAL_CALLS, 1)
+check("1c     ...and it FORWARDS log_events rather than fixing it, which is "
+      "what lets one helper serve a loud caller and a silent one",
       sorted(set().union(*_EVAL_CALLS)) if isinstance(_EVAL_CALLS, list)
       else _EVAL_CALLS, ["log_events"])
+
+# THE BLOCK RENDERER IS THE OTHER ENTRY POINT AND IT IS THE ONE THAT MATTERS.
+# _build_trials_text is a join over it, so counting only _build_trials_text
+# calls would now miss the node's single whole-batch render entirely -- the
+# render this file exists to be about.
+_BLOCK_CALLS = call_kwargs(_EVAL_SRC, "evaluation.py",
+                           name="_render_trial_blocks")
+check("1b(ii) ...and TWO _render_trial_blocks call sites: the joiner, which "
+      "forwards the flag and is a PASS-THROUGH rather than a render of its "
+      "own, and the node's single whole-batch render, which feeds BOTH the "
+      "stored prompt and the packer's per-trial costs",
+      len(_BLOCK_CALLS) if isinstance(_BLOCK_CALLS, list) else _BLOCK_CALLS, 2)
+check("1b(iii) ...and exactly one of the two forwards log_events while the "
+      "other passes none -- the node's render IS the stored prompt, so it is "
+      "a send and is loud by not asking otherwise",
+      sorted((sorted(k) for k in _BLOCK_CALLS), key=len)
+      if isinstance(_BLOCK_CALLS, list) else _BLOCK_CALLS,
+      [[], ["log_events"]])
+check("1d     the joiner forwards the flag to the render and does nothing "
+      "else -- one call, and it is the render",
+      [n.func.id
+       for n in (ast.walk(_JOIN_NODE) if _JOIN_NODE else [])
+       if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)],
+      ["_render_trial_blocks"])
 def _upf_call_args():
     """The argument spelling of every real ``_user_prompt_for(...)`` CALL.
 
@@ -325,24 +390,84 @@ def _upf_call_args():
     return sorted(out)
 
 
-check("1d(ii) paths 1 and 2 really do share ONE renderer site: the node calls "
-      "_user_prompt_for three times -- the chunk being sent, the whole batch "
-      "for the stored prompt, and [] to price the wrapper",
-      _upf_call_args(), ["[]", "chunk", "trials"])
+check("1d(ii) the node calls _user_prompt_for TWICE now -- the chunk being "
+      "sent and [] to price the wrapper. The third call, `_user_prompt_for("
+      "trials)` for the stored prompt, is gone: the stored prompt is assembled "
+      "from the one render the node already makes, which is the whole fix",
+      _upf_call_args(), ["[]", "chunk"])
 
-# PATH 3 IS THE ONE THAT PASSES IT, checked by name rather than by counting.
+# PATH 3 WAS THE MEASUREMENT RENDER AND IT NO LONGER EXISTS. What is checked
+# here is its ABSENCE: _trial_input_tokens used to render a trial to price it,
+# which made every trial's refusals count a third time. It now prices a block
+# the node's one render already produced.
+_TIT_NODE = function_node("_trial_input_tokens")
 _TIT_SRC = ""
-if _RENDER_NODE is not None:
+_TIT_BODY = ""
+if _TIT_NODE is not None:
     try:
-        _tree = ast.parse(_EVAL_SRC, _EVAL_PATH)
-        for _n in ast.walk(_tree):
-            if (isinstance(_n, ast.FunctionDef)
-                    and _n.name == "_trial_input_tokens"):
-                _TIT_SRC = ast.unparse(_n)
+        _TIT_SRC = ast.unparse(_TIT_NODE)
+        # THE DOCSTRING IS STRIPPED BEFORE ANY SUBSTRING TEST. It argues at
+        # length about the render this function no longer does, naming
+        # _build_trials_text, _render_trial_blocks and log_events -- so a test
+        # over the whole unparse would read the argument as the defect.
+        _body = [n for n in _TIT_NODE.body
+                 if not (isinstance(n, ast.Expr)
+                         and isinstance(n.value, ast.Constant)
+                         and isinstance(n.value.value, str))]
+        _TIT_BODY = "\n".join(ast.unparse(n) for n in _body)
     except Exception as _exc:                                  # noqa: BLE001
         _TIT_SRC = f"<RAISED {type(_exc).__name__}: {_exc}>"
-check("1e     _trial_input_tokens is the caller that silences the render",
-      "log_events=False" in _TIT_SRC, True)
+        _TIT_BODY = _TIT_SRC
+check("1e(0)  _trial_input_tokens was located and unparsed (non-degeneracy: "
+      "an absent function would satisfy every `not in` below for free)",
+      (_TIT_NODE is not None, _TIT_SRC.startswith("<RAISED")), (True, False))
+
+
+def _silencing_call_args():
+    """First positional argument of every call passing ``log_events=False``.
+
+    ACROSS THE WHOLE MODULE, not inside one function, because the question is
+    "who in this file asks for a silent render" and the answer must not depend
+    on which helper the asking happens to go through.
+    """
+    try:
+        tree = ast.parse(_EVAL_SRC, _EVAL_PATH)
+    except SyntaxError:
+        return ["<UNPARSEABLE>"]
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        for kw in node.keywords:
+            if (kw.arg == "log_events" and isinstance(kw.value, ast.Constant)
+                    and kw.value.value is False):
+                out.append(ast.unparse(node.args[0]) if node.args else "<none>")
+    return out
+check("1e     _trial_input_tokens NO LONGER RENDERS AT ALL -- it prices a "
+      "block somebody else rendered, so it cannot ask for silence and cannot "
+      "add a phantom refusal count. READ OFF THE BODY WITH THE DOCSTRING "
+      "STRIPPED: the docstring names all three of these while explaining that "
+      "they are gone, so a substring test over the whole unparse would report "
+      "the explanation as the defect",
+      ("log_events" in _TIT_BODY, "_build_trials_text" in _TIT_BODY,
+       "_render_trial_blocks" in _TIT_BODY),
+      (False, False, False))
+check("1e(i)  non-degeneracy: that body is a real statement, not an empty "
+      "string left behind by the docstring strip",
+      len(_TIT_BODY) > 10 and "estimate_prompt_tokens" in _TIT_BODY, True)
+check("1e(ii-a) ...and it takes ONE parameter, a rendered BLOCK, so there is "
+      "no trial object left for it to render",
+      [a.arg for a in (_TIT_NODE.args.args if _TIT_NODE else [])], ["block"])
+check("1e(ii) ...and it is a pure call to the ONE estimator, so no second "
+      "formula was introduced when the render was taken away from it",
+      [n.func.id for n in (ast.walk(_TIT_NODE) if _TIT_NODE else [])
+       if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)],
+      ["estimate_prompt_tokens"])
+check("1e(iii) THE ONE CALLER THAT STILL ASKS FOR SILENCE is the wrapper "
+      "pricing -- a render that is measured and never sent, which is exactly "
+      "what the flag is for. Without it the flag and _SilentLog would be a "
+      "mechanism with no subject",
+      sorted(_silencing_call_args()), ["[]"])
 
 # PATH 4 lives in another module and must NOT have been touched.
 _HARNESS_PATH = os.path.join(
@@ -359,9 +484,14 @@ check("1f     run_harness.py was read (non-degeneracy)",
 check("1g     path 4 (build_contexts) calls the renderer and passes NO "
       "log_events -- send-like, deliberately out of scope",
       _HARNESS_CALLS, [frozenset()])
-check("1h     THREE call sites in the package and no fourth -- two in\n"
-      "       evaluation.py, one in run_harness.py, serving the four paths",
-      len(_EVAL_CALLS) + len(_HARNESS_CALLS), 3)
+check("1h     FOUR renderer call sites in the package and no fifth -- the\n"
+      "       joiner's own call, the joiner site inside _user_prompt_for, the\n"
+      "       node's whole-batch render, and run_harness.py's. It was three,\n"
+      "       and the arithmetic is not a regression: the joiner's call is a\n"
+      "       PASS-THROUGH reached only from _build_trials_text's own callers,\n"
+      "       so the number of times a trial is RENDERED went DOWN by one --\n"
+      "       which is the whole change, and 4c measures it",
+      len(_EVAL_CALLS) + len(_BLOCK_CALLS) + len(_HARNESS_CALLS), 4)
 
 
 print()
@@ -369,11 +499,17 @@ print("=" * 70)
 print("SECTION 2 -- the measurement path is silent, and otherwise identical")
 print("=" * 70)
 
+# THE MEASUREMENT PATH IS THE SILENT RENDER ITSELF NOW. It used to be
+# `_trial_input_tokens(trial)`, which rendered; that function no longer
+# renders, so driving it here would emit nothing for a reason that has nothing
+# to do with the flag -- a check passing because its subject is gone. What is
+# still real, and still the flag's whole job, is a render asked to be silent.
 clear_counters()
-_measure_recs = records(lambda: [drive(_trial_input_tokens, t) for t in _BATCH],
-                        level=logging.DEBUG)
-check("2a     the measurement path emits ZERO render events AT DEBUG -- the "
-      "strictest level, so no per-trial detail hides under the default",
+_measure_recs = records(
+    lambda: drive(_build_trials_text, _BATCH, log_events=False),
+    level=logging.DEBUG)
+check("2a     a render asked for silence emits ZERO render events AT DEBUG -- "
+      "the strictest level, so no per-trial detail hides under the default",
       len(render_events(_measure_recs)), 0)
 check("2b     ...and zero records of any kind from this module",
       [r for r in _measure_recs
@@ -398,13 +534,33 @@ check("2e     the rendered text is byte-identical with and without logging",
       _texts_quiet, _texts_loud)
 check("2f     non-degeneracy: that text is not empty",
       all(isinstance(t, str) and len(t) > 50 for t in _texts_loud), True)
-check("2g     the token count the packer reads is identical to pricing the "
-      "loud render", [drive(_trial_input_tokens, t) for t in _BATCH],
+# THE PACKER'S FIGURE IS SLICED OUT OF ONE RENDER AND MUST STILL BE THE PRICE
+# OF THE BYTES THAT GET SENT. This is the behavioural half of the render-slice
+# pass; the exhaustive version, over every tricky content class and over
+# batches rather than this file's four trials, is
+# tests/test_agent_stage5_render_slice_equality.py. It is repeated here in one
+# line because THIS file is the one that would go green if somebody
+# "simplified" the packer back into re-rendering.
+_blocks_batch = drive(_render_trial_blocks, _BATCH)
+check("2g     the token count the packer reads -- sliced out of ONE whole-"
+      "batch render -- is identical to pricing each trial's own loud render",
+      [drive(_trial_input_tokens, b) for b in _blocks_batch],
       [estimate_prompt_tokens(t) for t in _texts_loud])
+# `n > 0` ON A DRIVE RESULT IS A RAISE WAITING TO HAPPEN. drive() turns an
+# exception into a "<RAISED ...>" STRING, and `str > int` is a TypeError that
+# escapes while check()'s argument list is being evaluated -- killing the run
+# and reporting one traceback where it owes a summary. Found by the revert
+# harness, not by reading: reverting _trial_input_tokens to render again makes
+# every one of these a string. This project has shipped that shape nine times.
+_tok_2h = [drive(_trial_input_tokens, b) for b in _blocks_batch]
 check("2h     non-degeneracy: those token counts are non-zero and differ "
       "between trials",
-      (all(n > 0 for n in [drive(_trial_input_tokens, t) for t in _BATCH]),
-       len({drive(_trial_input_tokens, t) for t in _BATCH}) > 1), (True, True))
+      (all(isinstance(n, int) and n > 0 for n in _tok_2h),
+       len(set(_tok_2h)) > 1),
+      (True, True))
+check("2h(ii) ...and the batch render produced one block per trial, so 2g is "
+      "not comparing two lists that happen to be the same length by accident",
+      len(_blocks_batch), len(_BATCH))
 
 
 print()
@@ -467,8 +623,42 @@ check("3g     trial_escaped_entity_unresolved cannot be triggered by any "
 
 print()
 print("=" * 70)
-print("SECTION 4 -- counters are untouched: the change is logging-only")
+print("SECTION 4 -- the flag is logging-only, and the phantom counts are gone")
 print("=" * 70)
+
+# WHAT THIS SECTION USED TO ASSERT, AND WHY IT WAS RIGHT UNTIL IT WAS NOT.
+#
+# 4a and 4d are UNCHANGED and still say the thing the flag promises: it governs
+# the log channel and nothing else, so a silent render lands exactly the same
+# refusal counts, key for key, as a loud one. That was true before the
+# render-slice pass and it is true after it -- the flag's contract did not
+# move.
+#
+# 4c DID move, and it is the only check in this file that had to. It read:
+#
+#     "the MEASUREMENT path still increments them -- the documented
+#      inflation, asserted rather than left to prose"
+#
+# ...and it drove `_trial_input_tokens(trial)`, which rendered the trial a
+# second time to price it. The counters really did land a second set of counts,
+# the check really did assert it, and the docstring on the renderer really did
+# argue for it as "a known inflation rather than an oversight" on the ground
+# that a refusal is a fact about the CORPUS, which a measurement render
+# observes as truly as a sent one.
+#
+# THAT ARGUMENT WAS TRUE ABOUT ONE RENDER AND FALSE ABOUT THE COUNTER. The
+# counter is a total, not a set: it does not record "this shape exists", it
+# records HOW MANY TIMES a refusal happened, and a phantom render makes that
+# number a count of renders rather than of refusals. Measured on a no-split
+# patient, every trial was rendered three times -- the whole-batch stored
+# prompt, the packer's measurement, the chunk actually sent -- so both counters
+# read exactly 1.5x what two send renders would have left.
+#
+# THE FIX WAS TO REMOVE THE RENDER, NOT TO SUPPRESS THE COUNT. Suppressing
+# would have made one flag govern two unrelated things -- what is logged and
+# what is counted -- and would have left the redundant work and the residual
+# log volume in place. So the flag's semantics are untouched (4a, 4d) and the
+# call graph is what changed (4c, below).
 
 clear_counters()
 for _t in _BATCH:
@@ -485,13 +675,78 @@ check("4a     both refusal counters land identically with and without logging",
 check("4b     non-degeneracy: at least one counter actually moved, so 4a is "
       "not comparing two zeroes", sum(_counts_loud) > 0, True)
 
-clear_counters()
-for _t in _BATCH:
-    drive(_trial_input_tokens, _t)
-_counts_measure = counter_totals()
-check("4c     the MEASUREMENT path still increments them -- the documented "
-      "inflation, asserted rather than left to prose",
-      _counts_measure, _counts_loud)
+# --- 4c: THE PHANTOM COUNTS ARE GONE, MEASURED AS A PRODUCTION SEQUENCE -----
+#
+# Driven as the sequence a real patient produces rather than as one function
+# call, because the defect was never in a function -- it was in how many times
+# the node reached the renderer. A no-split patient is:
+#
+#   BEFORE   the whole-batch stored-prompt render
+#            + one render PER TRIAL for the packer's measurement
+#            + the render of the single chunk that is sent          = 3
+#   AFTER    the whole-batch render, which now feeds the stored prompt AND
+#            the packer
+#            + the render of the single chunk that is sent          = 2
+#
+# The wrapper pricing is in both arms and contributes nothing: it renders zero
+# trials.
+def _one_render_counts():
+    clear_counters()
+    drive(_render_trial_blocks, _BATCH)
+    return counter_totals()
+
+
+def _no_split_patient_counts():
+    """The counter totals a no-split patient leaves, as the node produces them."""
+    clear_counters()
+    _blocks = drive(_render_trial_blocks, _BATCH)          # THE one render
+    drive(_build_trials_text, [], log_events=False)        # wrapper pricing
+    drive(pack_trials_by_input_tokens, _BATCH, 500, 12000, 5, blocks=_blocks)
+    drive(_build_trials_text, _BATCH)                      # the chunk sent
+    return counter_totals()
+
+
+_TRUTH = _one_render_counts()
+_NO_SPLIT = _no_split_patient_counts()
+
+# NON-DEGENERACY, AND IT IS ABOUT ONE COUNTER RATHER THAN BOTH -- MEASURED,
+# NOT ASSUMED. _BATCH moves the MARKDOWN refusal counter (the "CLL\\ SLL"
+# trial) and cannot move the ENTITY refusal counter: section 3g establishes
+# that trial_escaped_entity_unresolved is unreachable from any input this
+# renderer can be handed, because html.unescape collapses a nested chain in a
+# single pass. So the entity component of every tuple below is 0 == 2 * 0,
+# which is TRUE and says nothing; the markdown component is what carries the
+# arithmetic, and this check is what stops the pair reading as though both did.
+check("4b(ii) non-degeneracy: one render of this batch leaves a real, "
+      "non-zero MARKDOWN refusal count, so the identity below is not two "
+      "zeroes -- and the entity counter is 0 by 3g's structural finding",
+      (at(_TRUTH, 0, 0) > 0, at(_TRUTH, 1, -1)), (True, 0))
+check("4c     A NO-SPLIT PATIENT NOW LEAVES EXACTLY TWO RENDERS' WORTH OF "
+      "REFUSAL COUNTS, NOT THREE. Both remaining renders are SENDS -- the "
+      "stored prompt and the chunk -- so the counters count refusals that "
+      "reached a judge, and nothing else",
+      _NO_SPLIT, tuple(2 * n for n in _TRUTH))
+check("4c(ii) ...and that is strictly less than the three renders' worth the "
+      "packer used to add, which is the defect this pass removed. Compared as "
+      "a SUM because only one of the two counters is reachable from this "
+      "batch; per-counter equality is 4c above",
+      sum(_NO_SPLIT) < 3 * sum(_TRUTH), True)
+check("4c(iv) ...and the ratio is exactly 2/3 -- the 1.5x phantom removed, "
+      "stated as the number rather than as an inequality",
+      (sum(_NO_SPLIT), 3 * sum(_TRUTH)),
+      (2 * sum(_TRUTH), 3 * sum(_TRUTH)))
+def _render_then_pack_counts():
+    """Counters after ONE render followed by a pack over its blocks."""
+    clear_counters()
+    _blocks = drive(_render_trial_blocks, _BATCH)
+    drive(pack_trials_by_input_tokens, _BATCH, 500, 12000, 5, blocks=_blocks)
+    return counter_totals()
+
+
+check("4c(iii) THE PACKER ITSELF NOW COUNTS NOTHING. Handed the blocks it "
+      "renders nothing at all, so a render followed by a pack leaves exactly "
+      "what the render alone left -- the single fact the whole change rests on",
+      _render_then_pack_counts(), _TRUTH)
 
 clear_counters()
 _keys_loud = None
@@ -629,7 +884,11 @@ print("=" * 70)
 _saved_sink = evaluation._SILENT_LOG
 try:
     evaluation._SILENT_LOG = evaluation.log
-    _ctl = records(lambda: [drive(_trial_input_tokens, t) for t in _BATCH],
+    # DRIVEN THROUGH A SILENT RENDER, not through _trial_input_tokens: that
+    # function no longer renders, so it would emit nothing whether the sink
+    # were rebound or not and this control would report the regression as
+    # absent while proving nothing.
+    _ctl = records(lambda: drive(_build_trials_text, _BATCH, log_events=False),
                    level=logging.DEBUG)
     check("8a     CONTROL: with the sink rebound to the real logger, the "
           "measurement path is loud again -- so 2a is not passing for free",
@@ -642,9 +901,9 @@ finally:
 check("8c     the shipped sink is restored",
       evaluation._SILENT_LOG is _saved_sink, True)
 clear_counters()
-check("8d     ...and the measurement path is silent again",
+check("8d     ...and the silent render is silent again",
       len(render_events(records(
-          lambda: [drive(_trial_input_tokens, t) for t in _BATCH],
+          lambda: drive(_build_trials_text, _BATCH, log_events=False),
           level=logging.DEBUG))), 0)
 
 # THE OTHER DIRECTION: a caller that forgets the flag gets logging. This is what

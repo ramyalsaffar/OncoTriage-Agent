@@ -233,6 +233,16 @@ BUCKETS = {
         "event per render. Driven through the real observability logger with "
         "the records captured in memory -- no network, no keys, no spend, no "
         "git history, no corpus, no database"),
+    "test_agent_stage5_render_slice_equality.py": (
+        _A, None,
+        "ran green in 1.1s, 47 checks, against ONLY the directory skeleton and "
+        "in a tree with NO .git at all, with ONCOTRIAGE_MAIN_PATH pointed at a "
+        "directory that does not exist: the Stage 5 packer prices each trial "
+        "off a block the node's ONE whole-batch render already produced, and "
+        "that block is byte-identical to the one a one-trial render makes. "
+        "Every fixture is a literal dict and every control is a different "
+        "INPUT to a pure function -- no network, no keys, no spend, no model "
+        "call, no live Qdrant, no corpus, no database, no git history"),
     "test_agent_rrf_config_ownership.py": (
         _A, None,
         "ran green in 0.8s, 31 checks, against ONLY the directory skeleton and "

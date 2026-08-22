@@ -400,11 +400,15 @@ def _make_local_user_prompt_for(patient_summary):
     passed in, is in scope, and does not reach the rendered bytes.
     """
 
-    def _user_prompt_for(chunk: List[Dict]) -> str:
+    def _wrap_trials(trials_text: str) -> str:
         return f"""
 CLINICAL TRIALS:
-{_build_trials_text(chunk)}
+{trials_text}
 """
+
+    def _user_prompt_for(chunk: List[Dict], *,
+                         log_events: bool = True) -> str:
+        return _wrap_trials(_build_trials_text(chunk, log_events=log_events))
 
     return _user_prompt_for
 
@@ -459,10 +463,34 @@ def _extract_named_function(path: str, name: str):
         return None, f"could not unparse {path}:{name}: {type(exc).__name__}: {exc}"
 
 
-_PROD_TEMPLATE, _PROD_ERR = _extract_named_function(
-    _EVALUATION_PATH, "_user_prompt_for")
-_LOCAL_TEMPLATE, _LOCAL_ERR = _extract_named_function(
-    _SELF_PATH, "_user_prompt_for")
+# TWO FUNCTIONS NOW, NOT ONE, AND THE TEMPLATE IS IN THE SECOND OF THEM.
+# The render-slice pass split the literal wrapper out of `_user_prompt_for`
+# into `_wrap_trials` so the node could assemble the stored prompt from the one
+# render it already makes instead of provoking a second one. THE TEMPLATE DID
+# NOT MOVE A BYTE -- which is why the digests below still match the golden
+# snapshot with no regeneration, and why regenerating would have been the wrong
+# response to this section failing. A golden file refreshed to accommodate a
+# change makes whatever the code does correct by definition.
+#
+# Both halves are compared, and the pair is concatenated into _PROD_TEMPLATE so
+# every consumer below -- 7d's mode control, the mode's own reporting -- covers
+# the whole wrapper rather than whichever half holds the literal this month.
+def _extract_pair(path: str):
+    """Both wrapper functions of ``path``, unparsed and joined, or an error."""
+    parts, errs = [], []
+    for _name in ("_user_prompt_for", "_wrap_trials"):
+        _text, _err = _extract_named_function(path, _name)
+        if _err:
+            errs.append(_err)
+        else:
+            parts.append(_text)
+    if errs:
+        return None, "; ".join(errs)
+    return chr(10).join(parts), None
+
+
+_PROD_TEMPLATE, _PROD_ERR = _extract_pair(_EVALUATION_PATH)
+_LOCAL_TEMPLATE, _LOCAL_ERR = _extract_pair(_SELF_PATH)
 
 if _PROD_ERR:
     fail("production's _user_prompt_for was located by AST", _PROD_ERR)
@@ -484,9 +512,15 @@ check("the local copy is character-for-character production's template "
 check("the template calls _build_trials_text and does NOT interpolate the "
       "patient summary (non-degeneracy on the comparison above, and the shape "
       "PROMPT_VERSION 1.6.0 produced)",
-      ("_build_trials_text(chunk)" in (_PROD_TEMPLATE or ""),
+      ("_build_trials_text(chunk" in (_PROD_TEMPLATE or ""),
        "{patient_summary}" in (_PROD_TEMPLATE or "")),
       (True, False))
+check("...and the CLINICAL TRIALS literal is still inside the pair, so the "
+      "concatenation above did not quietly stop covering the template",
+      "CLINICAL TRIALS:" in (_PROD_TEMPLATE or ""), True)
+check("...and the pair really is two functions rather than one found twice "
+      "(non-degeneracy on _extract_pair)",
+      (_PROD_TEMPLATE or "").count("def "), 2)
 
 
 # ===========================================================================
@@ -856,21 +890,32 @@ check("7e  an artifact that disappeared from the guarded set is reported",
 # Section 3 compares two unparsings. This proves that comparison discriminates,
 # without editing either file: the same helper is run against a source string
 # whose closure body differs by one character.
+# THE CONTROL IS ON `_wrap_trials` NOW, because that is where the literal
+# lives after the render-slice pass. One character of the heading is changed,
+# and the comparison Section 3 runs must reject it. The test is MEMBERSHIP in
+# the concatenated pair rather than equality with it: _PROD_TEMPLATE is two
+# functions now, and one edited half can never equal both, so an equality
+# test would pass for the wrong reason -- it would reject the concatenation
+# rather than the edit.
 _DIVERGED_SRC = (
     "def _make_local_user_prompt_for(patient_summary):\n"
-    "    def _user_prompt_for(chunk: List[Dict]) -> str:\n"
-    "        return f'''\\nCLINICAL TRIAL:\\n{_build_trials_text(chunk)}\\n'''\n"
-    "    return _user_prompt_for\n"
+    "    def _wrap_trials(trials_text: str) -> str:\n"
+    "        return f'''\\nCLINICAL TRIAL:\\n{trials_text}\\n'''\n"
+    "    return _wrap_trials\n"
 )
 _diverged_tree = ast.parse(_DIVERGED_SRC)
 _diverged = [n for n in ast.walk(_diverged_tree)
-             if isinstance(n, ast.FunctionDef) and n.name == "_user_prompt_for"]
+             if isinstance(n, ast.FunctionDef) and n.name == "_wrap_trials"]
 check("7f  the divergence control parsed to exactly one closure "
       "(non-degeneracy)", len(_diverged), 1)
 check("7f  a one-word divergence between the two copies is caught by the same "
       "unparse comparison Section 3 runs",
-      (ast.unparse(_diverged[0]) == _PROD_TEMPLATE) if _diverged else None,
-      False)
+      (ast.unparse(_diverged[0]) in (_PROD_TEMPLATE or ""))
+      if _diverged else None, False)
+check("7f  ...and the UNEDITED half IS in that pair, so the check above is "
+      "rejecting the edit rather than the membership test (non-degeneracy)",
+      _extract_named_function(_SELF_PATH, "_wrap_trials")[0]
+      in (_PROD_TEMPLATE or ""), True)
 
 # --- 7g: THE RENDERING ITSELF, with the neutralization disabled -------------
 #

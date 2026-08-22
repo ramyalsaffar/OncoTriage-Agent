@@ -7,5 +7,5 @@
     "user_message": "a08fed329b291ed0b291260556248f8c15badeae3a49b0e2353f59eea46d0b42"
   },
   "prompt_version": "1.9.0",
-  "user_prompt_template": "def _user_prompt_for(chunk: List[Dict]) -> str:\n    return f'\\nCLINICAL TRIALS:\\n{_build_trials_text(chunk)}\\n'"
+  "user_prompt_template": "def _user_prompt_for(chunk: List[Dict], *, log_events: bool=True) -> str:\n    return _wrap_trials(_build_trials_text(chunk, log_events=log_events))\ndef _wrap_trials(trials_text: str) -> str:\n    return f'\\nCLINICAL TRIALS:\\n{trials_text}\\n'"
 }
