@@ -103,6 +103,30 @@ ask the boolean and qualify their totals with it. The priced VALUE is
 deliberately unchanged: NaN would propagate into every aggregate and produce no
 number at all, which is worse than a number that says it is partial.
 
+A QUERY MAY DECLARE THE TABLES IT NEEDS (the run-reader pass)
+--------------------------------------------------------------
+``Query.requires`` names tables a database may legitimately not have. Two
+queries use it -- ``run_summary`` and ``run_degradation_breakdown``, over the
+``runs`` and ``run_metrics`` tables added by the run-identity and
+health-persistence passes.
+
+THIS IS THE ITEM-38 PROPERTY DEFENDED, NOT A CONVENIENCE. Those two tables are
+ADDITIVE: ``initialize_database`` creates them, so they appear in a database the
+first time a writer opens it after those passes, and the production
+``inferences.db`` on this machine does NOT have them (measured -- it holds
+drift_metrics, inferences, sqlite_sequence and trial_matches). A query naming an
+absent table raises ``no such table``, and ``report()`` runs the registry with
+the first raise taking the process down. So registering the first ``runs`` query
+without this field would have made ``python "16- Database Query.py"`` die
+partway through and every query after it stop executing -- which is precisely
+what ``expansion_token_efficiency`` did for the life of File 16.
+
+``report()`` asks ``unavailable(conn)`` ONCE, before anything runs, PRINTS which
+queries it is skipping and which tables are absent, and skips them. ``run()``
+raises ``MissingTableError`` rather than returning an empty frame, because "this
+database cannot answer that yet" and "the answer is no rows" are different
+findings and an empty frame is the second.
+
 WHAT IMPORTING THIS MODULE DOES
 -------------------------------
 Nothing. No connection is opened, no path is resolved, no query is executed. The
@@ -118,6 +142,28 @@ import pandas as pd
 from oncotriage import paths
 from oncotriage.config import PRICING_CONFIG, RRF_POOL_SIZE, TOP_K_CANDIDATES
 from oncotriage.observability import console
+# THE RUN-TABLE VOCABULARY IS THE WRITER'S AND IS IMPORTED, NEVER RETYPED.
+#
+# `run_metrics.category` and the two `meta` row names are values
+# `oncotriage/storage/database_logger.py` WRITES; the two queries below select on
+# them. Written out as string literals here they would be the CROSS_ENCODER_MODEL
+# shape one layer down -- two copies of one fact, no error when they disagree,
+# and the only symptom a health panel that reports every run as clean because
+# `WHERE category = 'degredation'` matches nothing. Same argument as
+# `_PIPELINE_CONSISTENCY_SQL` interpolating RRF_POOL_SIZE rather than 100.
+#
+# THE EDGE IS SAFE AND WAS CHECKED RATHER THAN ASSUMED: database_logger imports
+# paths, config, utils and registries.primary_cancer and does NOT import this
+# module, so there is no cycle; and importing it opens nothing, which
+# tests/test_package_invariants.py section 2 already proves for every module in
+# the package.
+from oncotriage.storage.database_logger import (
+    RUN_METRIC_CATEGORY_DEGRADATION,
+    RUN_METRIC_CATEGORY_META,
+    RUN_METRIC_META_COUNTERS_NONZERO,
+    RUN_METRIC_META_COUNTERS_REGISTERED,
+    RUN_RECORD_STATUS_RUNNING,
+)
 from oncotriage.utils import get_model_cost
 
 
@@ -158,18 +204,65 @@ class Query:
                      Not cosmetic here -- it is part of what "output identical
                      before and after" means.
         notes:       Extra lines printed between the heading and the frame.
+        requires:    Table names this query's SQL names and which a database may
+                     legitimately not have yet. Default ``()`` -- every query
+                     written before the run-tracking pass reads `inferences`,
+                     `trial_matches` or `drift_metrics`, all three of which
+                     ``initialize_database`` has created for the whole life of
+                     the project, so there is nothing for those to declare.
+
+                     WHY THIS EXISTS AT ALL, AND IT IS NOT A STYLE CHOICE. The
+                     `runs` and `run_metrics` tables are ADDITIVE: they appear in
+                     a database the first time a writer opens it after the
+                     run-identity pass, and the production `inferences.db` on
+                     this machine does not have them (measured -- its tables are
+                     drift_metrics, inferences, sqlite_sequence, trial_matches).
+                     A query naming an absent table raises
+                     ``no such table``, and ``report()`` runs its registry with
+                     the first raise taking the process down. So without this
+                     field, adding the first `runs` query would have made
+                     ``python "16- Database Query.py"`` die partway and every
+                     query registered after it stop executing -- REINSTATING,
+                     exactly, the defect item 38 removed.
+
+        requires_columns:
+                     ``(table, column)`` pairs the query names and which a
+                     database may legitimately not have. Default ``()``.
+
+                     A SEPARATE FIELD FROM ``requires`` BECAUSE MOST MISSING
+                     COLUMNS ARE NOT A REASON TO SKIP ANYTHING. The
+                     ``INFERENCE_COLUMN_ADDITIONS`` case -- a column the writer
+                     adds on open -- is handled by every existing query
+                     projecting NULL and by readers that separate NULL from
+                     zero, and declaring those here would skip whole queries
+                     over a column the queries already read correctly as absent.
+                     What belongs here is a column whose ABSENCE MAKES THE SQL
+                     UNPARSEABLE: ``run_attribution_coverage`` joins ON
+                     ``i.run_id``, so without that column it raises ``no such
+                     column`` and ``report()`` dies at it.
+
+                     IT IS NOT DERIVABLE FROM ``requires``. ``inferences.run_id``
+                     and the two run tables are created by ONE
+                     ``initialize_database`` call today, so "runs exists"
+                     implies "run_id exists" -- in a database this project
+                     wrote. That is a coupling, not an invariant, and resting a
+                     guard on it would mean the one shape it cannot survive is
+                     the one it was written for.
     """
 
-    __slots__ = ("key", "sql", "heading", "render", "blank_after", "notes")
+    __slots__ = ("key", "sql", "heading", "render", "blank_after", "notes",
+                 "requires", "requires_columns")
 
     def __init__(self, key, sql, heading=None, render="to_string",
-                 blank_after=True, notes=()):
+                 blank_after=True, notes=(), requires=(), requires_columns=()):
         self.key = key
         self.sql = sql
         self.heading = heading
         self.render = render
         self.blank_after = blank_after
         self.notes = tuple(notes)
+        self.requires = tuple(requires)
+        self.requires_columns = tuple(tuple(pair) for pair in requires_columns)
 
     def __repr__(self):
         return f"<Query {self.key!r} render={self.render!r}>"
@@ -449,6 +542,220 @@ listing cannot answer and had been silently declining to.
 therefore unique in the result. Its second term is not a tiebreaker of last
 resort -- with two categories at the same count, `n DESC` alone would leave the
 order to SQLite, and this frame is printed."""
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
+# THE RUN TABLES (the run-reader pass)
+# ===========================================================================
+#
+# `runs` and `run_metrics` were written by the run-identity and
+# health-persistence passes and READ BY NOTHING. A table nobody reads rots: the
+# writer keeps writing it, no consumer ever contradicts it, and the first person
+# to look discovers that a column has meant something else since a pass nobody
+# connected to it. These two queries are the reader.
+#
+# WHAT MAKES THIS HARDER THAN A JOIN, and it is the reason for the fragments
+# below rather than two self-contained SQL bodies:
+#
+#   * A RUN WITH NO PATIENTS AND A RUN WITH NO DEGRADATIONS MUST STILL APPEAR.
+#     Both are real states -- a campaign killed before its first patient, and a
+#     campaign that ran clean -- and an INNER JOIN reports each as a run that
+#     does not exist. Every join below is LEFT and driven from `runs`.
+#
+#   * "NO DEGRADATION ROWS" HAS TWO MEANINGS AND THEY ARE OPPOSITE. `totals()`
+#     drops every zero counter, so a run that degraded in no way contributes no
+#     `degradation` rows -- and so does a run whose flushing was never wired up,
+#     and so does a run that died before its first flush. The `meta` row
+#     ``counters_registered`` is what separates them, which is the entire reason
+#     `flush_run_metrics` writes it. ``_RUN_HEALTH_CASE_SQL`` is that reading,
+#     written ONCE.
+#
+#   * BOTH QUERIES NEED THE SAME READING. Two copies of a CASE that must agree
+#     is the shape `pipeline_consistency` and `pipeline_consistency_totals`
+#     already declined; they interpolate one `_CONSISTENCY_CASE_SQL` for exactly
+#     this reason and these two follow it.
+#
+# THE SUBQUERIES ARE PRE-AGGREGATED AND THAT IS NOT COSMETIC. `runs` LEFT JOIN
+# `inferences` LEFT JOIN `run_metrics` in one FROM clause multiplies: a run with
+# 20 patients and 3 counters produces 60 rows, and SUM(value) over it reports
+# twenty times the degradation events. Each child is grouped to one row per
+# run_id BEFORE it is joined.
+
+RUN_HEALTH_NEVER_FLUSHED = "no health record"
+"""``health_record`` for a run with no ``meta`` row: nothing ever flushed for it.
+
+Says nothing about whether the run degraded. It is the absence of a measurement,
+and it is the state every run written before the health-persistence pass is in,
+plus any run that died before its first patient completed."""
+
+RUN_HEALTH_MEASURED_CLEAN = "measured clean"
+"""``health_record`` for a run whose counters were consulted and none moved.
+
+THE ROW THIS WHOLE MECHANISM EXISTS FOR. It is a MEASUREMENT of health, not the
+absence of one, and rendering it identically to ``RUN_HEALTH_NEVER_FLUSHED``
+would throw away the only distinction the `meta` row buys."""
+
+RUN_HEALTH_DEGRADED = "degraded"
+"""``health_record`` for a run with at least one non-zero counter."""
+
+RUN_HEALTH_NO_COUNTER_LABEL = "(none moved)"
+"""The ``counter`` cell for a run that contributed no ``degradation`` row.
+
+A LABEL, NOT A NULL, and the distinction is the point of the breakdown query.
+A NULL there is read by every consumer as "this cell was not filled in";
+"(none moved)" is a statement. Which of the two states produced it -- clean, or
+never flushed -- is in ``health_record`` on the same row."""
+
+RUN_HEALTH_STATES = (RUN_HEALTH_NEVER_FLUSHED, RUN_HEALTH_MEASURED_CLEAN,
+                     RUN_HEALTH_DEGRADED)
+"""Every value ``health_record`` can take. CLOSED, on ``RUN_METRIC_CATEGORIES``'
+footing: a consumer may branch on it exhaustively, and the dashboard's Run Health
+tab does."""
+
+
+RUN_FINALIZATION_FINALIZED = "finalized"
+"""``finalization`` for a run whose ``finished_at`` is set."""
+
+RUN_FINALIZATION_LIVE_OR_DIED = "RUNNING, no finished_at -- live or died"
+"""``finalization`` for a RUNNING row with no ``finished_at``.
+
+DELIBERATELY ONE STATE AND NOT TWO. From the database alone a live campaign and
+a campaign whose process was killed are the same row -- neither has a
+``finished_at`` and both say RUNNING -- and there is no pid, no heartbeat and no
+lease to tell them apart. Reporting it as "crashed" would be an invention;
+reporting it as "running" would hide every crash. It is named for the ambiguity
+it actually is, and ``started_at`` beside it is what a reader uses: a RUNNING row
+from three weeks ago is not live."""
+
+RUN_FINALIZATION_NOT_STAMPED = "terminal status, no finished_at -- finalize did not land"
+"""``finalization`` for a row that reached a terminal status with no timestamp.
+
+Unambiguous, and it is a defect rather than an ambiguity: ``finalize_run_record``
+writes ``status`` and ``finished_at`` in one UPDATE, so this shape means the row
+was written by something other than that function."""
+
+RUN_FINALIZATION_STATES = (RUN_FINALIZATION_FINALIZED,
+                           RUN_FINALIZATION_LIVE_OR_DIED,
+                           RUN_FINALIZATION_NOT_STAMPED)
+"""Every value ``finalization`` can take. CLOSED, and the dashboard branches on
+it exhaustively."""
+
+
+# The `meta` rows, one row per run. MAX(CASE ...) rather than two correlated
+# subqueries: one pass over the index, and a run with no meta rows contributes
+# no row at all, which is what makes the LEFT JOIN's NULL mean "never flushed".
+_RUN_HEALTH_META_SQL = f"""
+        SELECT run_id,
+               MAX(CASE WHEN name = '{RUN_METRIC_META_COUNTERS_REGISTERED}'
+                        THEN value END) AS counters_registered,
+               MAX(CASE WHEN name = '{RUN_METRIC_META_COUNTERS_NONZERO}'
+                        THEN value END) AS counters_nonzero
+        FROM run_metrics
+        WHERE category = '{RUN_METRIC_CATEGORY_META}'
+        GROUP BY run_id"""
+
+# The `degradation` rows, one row per run. `counters_moved` is a COUNT of
+# counters and `degradation_events` a SUM of their totals; they are different
+# numbers -- four events on one counter and one event on each of four give the
+# same SUM -- and the per-run panel renders both, the same distinction
+# `criterion_remap_incidence` already draws between trials and events.
+_RUN_HEALTH_DEGRADATION_SQL = f"""
+        SELECT run_id,
+               COUNT(*)   AS counters_moved,
+               SUM(value) AS degradation_events
+        FROM run_metrics
+        WHERE category = '{RUN_METRIC_CATEGORY_DEGRADATION}'
+        GROUP BY run_id"""
+
+# The patient rollup. `run_id IS NOT NULL` is not a filter that could drop a
+# run's rows -- a row with a NULL run_id belongs to no run by definition (the API
+# writes one per request, and every row written before the run-identity pass has
+# one) -- it is there so the grouping cannot produce a NULL key that a LEFT JOIN
+# would then try to match against `runs.id`.
+#
+# `cost_usd` is a SUM over COALESCE(...,0) and `rows_with_no_cost` is beside it,
+# on `cost_complete`'s footing: an unpriced row contributes a real 0.0, so the
+# total under-reports by exactly the unpriced spend and carries nothing in the
+# number to say so. The count is what says so.
+_RUN_HEALTH_PATIENTS_SQL = """
+        SELECT run_id,
+               COUNT(*)                                          AS patients,
+               SUM(CASE WHEN error IS NOT NULL AND error != ''
+                        THEN 1 ELSE 0 END)                       AS errored,
+               ROUND(SUM(COALESCE(estimated_cost_usd, 0)), 4)    AS cost_usd,
+               SUM(CASE WHEN estimated_cost_usd IS NULL
+                        THEN 1 ELSE 0 END)                       AS rows_with_no_cost,
+               MIN(timestamp)                                    AS first_patient_at,
+               MAX(timestamp)                                    AS last_patient_at
+        FROM inferences
+        WHERE run_id IS NOT NULL
+        GROUP BY run_id"""
+
+_RUN_HEALTH_CASE_SQL = f"""        CASE
+            WHEN m.counters_registered IS NULL
+                 THEN '{RUN_HEALTH_NEVER_FLUSHED}'
+            WHEN COALESCE(d.counters_moved, 0) = 0
+                 THEN '{RUN_HEALTH_MEASURED_CLEAN}'
+            ELSE '{RUN_HEALTH_DEGRADED}'
+        END"""
+"""The one reading of "what does this run's health record say". Interpolated by
+both run queries below, so there is no second copy to forget."""
+
+_RUN_FINALIZATION_CASE_SQL = f"""        CASE
+            WHEN r.finished_at IS NOT NULL THEN '{RUN_FINALIZATION_FINALIZED}'
+            WHEN r.status = '{RUN_RECORD_STATUS_RUNNING}'
+                 THEN '{RUN_FINALIZATION_LIVE_OR_DIED}'
+            ELSE '{RUN_FINALIZATION_NOT_STAMPED}'
+        END"""
+"""The one reading of "did this run finish". Interpolated by both queries."""
+
+
+RUN_ATTRIBUTION_NO_RUN = "(no run_id -- before run tracking, or written outside a run)"
+"""``attribution`` for an inference row whose ``run_id`` is NULL.
+
+TWO POPULATIONS UNDER ONE LABEL, AND THE LABEL SAYS SO. Every row written before
+the run-identity pass has a NULL here, and so does every row
+``oncotriage/api/server.py`` writes -- deliberately, because a request is not a
+campaign and a `runs` row per POST would put one row in that table per request.
+The database cannot separate them and this label does not pretend to. What it
+must not do is read as "the run is unknown", which is a third thing and is what
+an unlabelled NULL reads as."""
+
+RUN_ATTRIBUTION_DANGLING = "(run_id set, but no such run row)"
+"""``attribution`` for a row pointing at a `runs` id that is not there.
+
+THIS STATE IS REACHABLE, which is why it is a label rather than an assumption.
+``inferences.run_id`` carries NO enforced foreign key -- argued at the `runs`
+CREATE TABLE, in four points, of which the operative one here is that
+``empty_database`` deletes every table in ``sqlite_master`` order and would raise
+partway through with the constraint on. So a wipe, a partial restore or a
+hand-edited database can leave one, and an aggregate that quietly counted it as
+attributed would be the only thing that could ever notice."""
+
+RUN_ATTRIBUTION_ATTRIBUTED = "attributed to a run"
+"""``attribution`` for a row whose ``run_id`` resolves to a `runs` row."""
+
+RUN_ATTRIBUTION_STATES = (RUN_ATTRIBUTION_ATTRIBUTED, RUN_ATTRIBUTION_DANGLING,
+                          RUN_ATTRIBUTION_NO_RUN)
+"""Every value ``attribution`` can take. CLOSED; the dashboard branches on it."""
+
+
+_RUN_ATTRIBUTION_CASE_SQL = f"""        CASE
+            WHEN i.run_id IS NULL THEN '{RUN_ATTRIBUTION_NO_RUN}'
+            WHEN r.id IS NULL     THEN '{RUN_ATTRIBUTION_DANGLING}'
+            ELSE '{RUN_ATTRIBUTION_ATTRIBUTED}'
+        END"""
+"""The one reading of "does this row belong to a recorded run"."""
+
+
+RUN_TABLES = ("runs", "run_metrics")
+"""The two tables the run queries need, and which a database may not have.
+
+Named once so a `requires=` declaration and any consumer asking "can this
+database answer the run questions" cannot disagree about the list."""
 
 
 #------------------------------------------------------------------------------
@@ -1310,6 +1617,146 @@ QUERIES = (
     LIMIT 25
 """,
     ),
+    # ── The run tables (the run-reader pass) ───────────────────────────────
+    #
+    # BOTH DECLARE `requires`, and that is what keeps report() running to the
+    # end against a database that predates the run-identity pass -- which the
+    # production one on this machine does. See Query.requires.
+    Query(
+        key='run_summary',
+        heading='=== RUNS: ONE ROW PER CAMPAIGN ===',
+        render='to_string',
+        blank_after=True,
+        requires=RUN_TABLES,
+        # ITS PATIENT ROLLUP JOINS ON inferences.run_id, so the column is a
+        # requirement here too. This was MISSED on the first draft, which
+        # declared the column only on run_attribution_coverage on the reasoning
+        # that it was "the only query that joins on an additive column" -- and
+        # the control that exercises the column-only shape is what found it,
+        # not reading. See tests/test_storage_query_layer.py section 2b.
+        requires_columns=(("inferences", "run_id"),),
+        notes=(
+            "patients / errored / cost_usd are 0 for a run no inference row",
+            "references -- that is a measured zero, because a LEFT JOIN with no",
+            "match here means no patient claimed the run.",
+            "",
+            "degradation_events is NOT defaulted to 0, because 'no counter",
+            "moved' and 'nothing was ever flushed' would then be the same",
+            "number. health_record is the column that separates them.",
+            "",
+            "NOT CAPPED. There is one row per campaign, not one per patient.",
+        ),
+        sql=f"""
+    SELECT
+        r.id                                            AS run_id,
+        r.invocation_source,
+        r.status,
+{_RUN_FINALIZATION_CASE_SQL}                                    AS finalization,
+        r.started_at,
+        r.finished_at,
+        COALESCE(p.patients, 0)                         AS patients,
+        COALESCE(p.errored, 0)                          AS errored,
+        COALESCE(p.cost_usd, 0.0)                       AS cost_usd,
+        COALESCE(p.rows_with_no_cost, 0)                AS rows_with_no_cost,
+        p.first_patient_at,
+        p.last_patient_at,
+{_RUN_HEALTH_CASE_SQL}                                    AS health_record,
+        m.counters_registered,
+        m.counters_nonzero,
+        d.counters_moved,
+        d.degradation_events,
+        r.fingerprint_version,
+        r.llm_classifier_prompt_version,
+        r.llm_classifier_renderer_digest,
+        r.matching_model_configured,
+        r.qdrant_collection,
+        r.collection_points,
+        r.data_snapshot_date
+    FROM runs r
+    LEFT JOIN ({_RUN_HEALTH_PATIENTS_SQL}
+    ) p ON p.run_id = r.id
+    LEFT JOIN ({_RUN_HEALTH_DEGRADATION_SQL}
+    ) d ON d.run_id = r.id
+    LEFT JOIN ({_RUN_HEALTH_META_SQL}
+    ) m ON m.run_id = r.id
+    ORDER BY r.id DESC
+""",
+    ),
+    Query(
+        key='run_degradation_breakdown',
+        heading='=== RUNS: DEGRADATION BY COUNTER ===',
+        render='to_string',
+        blank_after=True,
+        requires=RUN_TABLES,
+        notes=(
+            "DRIVEN FROM `runs`, so a clean run is a row here too -- with",
+            f"counter '{RUN_HEALTH_NO_COUNTER_LABEL}' and health_record",
+            f"'{RUN_HEALTH_MEASURED_CLEAN}'. A breakdown driven from",
+            "run_metrics would omit exactly the runs a reader most wants",
+            "confirmed, and an omission reads as an absence of evidence.",
+            "",
+            "events is a SUM of one counter's keys, not a count of keys: a",
+            "counter keyed by 12 distinct units with one hit each and a counter",
+            "keyed by one unit hit 12 times both read 12 here. The keys",
+            "themselves are deliberately not in this table -- they carry",
+            "third-party and clinical text. See run_metrics' CREATE TABLE.",
+        ),
+        sql=f"""
+    SELECT
+        r.id                                            AS run_id,
+        r.invocation_source,
+        r.status,
+{_RUN_HEALTH_CASE_SQL}                                    AS health_record,
+        COALESCE(rm.name, '{RUN_HEALTH_NO_COUNTER_LABEL}') AS counter,
+        rm.value                                        AS events,
+        rm.written_at,
+        m.counters_registered
+    FROM runs r
+    LEFT JOIN run_metrics rm
+           ON rm.run_id = r.id
+          AND rm.category = '{RUN_METRIC_CATEGORY_DEGRADATION}'
+    LEFT JOIN ({_RUN_HEALTH_DEGRADATION_SQL}
+    ) d ON d.run_id = r.id
+    LEFT JOIN ({_RUN_HEALTH_META_SQL}
+    ) m ON m.run_id = r.id
+    ORDER BY r.id DESC, rm.value DESC, rm.name
+""",
+    ),
+    Query(
+        key='run_attribution_coverage',
+        heading='=== INFERENCE ROWS BY RUN ATTRIBUTION ===',
+        render='to_string',
+        blank_after=True,
+        requires=RUN_TABLES,
+        # It JOINS on inferences.run_id, so the column is a requirement --
+        # where a query merely SELECTing a missing column would be the
+        # INFERENCE_COLUMN_ADDITIONS case the rest of the registry already
+        # handles by projecting NULL. run_summary carries the same declaration
+        # for the same reason; run_degradation_breakdown does not, because it
+        # touches only `runs` and `run_metrics`.
+        requires_columns=(("inferences", "run_id"),),
+        notes=(
+            "A NULL run_id is a VALUE, not a legacy. The API writes one per",
+            "request on purpose. So this is a census, not a defect list -- with",
+            "one exception, the dangling row, which IS a defect and is the only",
+            "thing that can ever report one.",
+        ),
+        sql=f"""
+    SELECT
+{_RUN_ATTRIBUTION_CASE_SQL}                                    AS attribution,
+        COUNT(*)                                        AS inference_rows,
+        COUNT(DISTINCT i.run_id)                        AS distinct_run_ids,
+        MIN(i.timestamp)                                AS first_at,
+        MAX(i.timestamp)                                AS last_at,
+        ROUND(SUM(COALESCE(i.estimated_cost_usd, 0)), 4) AS cost_usd,
+        SUM(CASE WHEN i.estimated_cost_usd IS NULL
+                 THEN 1 ELSE 0 END)                     AS rows_with_no_cost
+    FROM inferences i
+    LEFT JOIN runs r ON r.id = i.run_id
+    GROUP BY attribution
+    ORDER BY inference_rows DESC, attribution
+""",
+    ),
 )
 
 
@@ -1367,6 +1814,118 @@ def connect(db_path=None):
 #------------------------------------------------------------------------------
 
 
+class MissingTableError(RuntimeError):
+    """A query was asked of a database that does not have a table it names.
+
+    A ``RuntimeError`` subclass and deliberately NOT a ``ValueError`` or a
+    ``sqlite3.Error``, on ``UnknownModelPricingError``'s precedent: a caller with
+    a broad ``except sqlite3.Error`` around its reads -- the shape every writer
+    in this project has -- would swallow this and report an empty result, which
+    is the one answer that must not be produced. "This database cannot answer
+    that question yet" and "the answer is nothing" are different findings.
+    """
+
+
+def available_tables(conn) -> frozenset:
+    """Every table name in the database this connection is open on.
+
+    One ``sqlite_master`` read, so a caller checking many queries pays for it
+    once. ``table_names(conn)`` already asks the same question and is left alone:
+    it returns raw one-tuples because File 16 PRINTED them, and changing its
+    shape would change ``report()``'s output.
+    """
+    return frozenset(row[0] for row in fetch_raw(conn, TABLE_LIST_SQL))
+
+
+def table_columns(conn, table) -> frozenset:
+    """Every column name on `table`, or an empty set when the table is absent.
+
+    ``PRAGMA table_info`` on a table that does not exist returns no rows rather
+    than raising, which is why the caller must ask about the TABLE first: an
+    empty set here means "no such table" and "a table with no columns" alike,
+    and only the first is possible in SQLite.
+    """
+    return frozenset(row[1] for row in
+                     fetch_raw(conn, f"PRAGMA table_info({table})"))
+
+
+def missing_requirements(conn, key, present=None) -> tuple:
+    """What `key` needs and this database does not have.
+
+    Args:
+        conn:    an open connection.
+        key:     a registry key.
+        present: an ``available_tables()`` result to reuse. Supplied by
+                 ``report()``, which asks once for the whole registry.
+
+    Returns absent table names and absent ``'table.column'`` names, tables
+    first, each in declaration order; ``()`` when the database can answer. A
+    query declaring neither requirement returns ``()`` without touching the
+    database when `present` is supplied.
+
+    A COLUMN ON AN ABSENT TABLE IS REPORTED ONCE, AS THE TABLE. Naming both
+    would tell an operator to add a column to a table that is not there, and the
+    one action -- let a writer open the database -- fixes both.
+    """
+    if key not in QUERIES_BY_KEY:
+        raise KeyError(
+            f"unknown query key {key!r}; valid keys are "
+            f"{', '.join(QUERY_KEYS)}"
+        )
+    query = QUERIES_BY_KEY[key]
+    if not query.requires and not query.requires_columns:
+        return ()
+    if present is None:
+        present = available_tables(conn)
+
+    absent = [t for t in query.requires if t not in present]
+
+    seen = {}
+    for table, column in query.requires_columns:
+        if table not in present:
+            if table not in absent:
+                absent.append(table)
+            continue
+        if table not in seen:
+            seen[table] = table_columns(conn, table)
+        if column not in seen[table]:
+            absent.append(f"{table}.{column}")
+
+    return tuple(absent)
+
+
+def unavailable(conn) -> Dict:
+    """``{key: (absent table, ...)}`` for every query this database cannot answer.
+
+    THE PUBLIC WAY TO ASK BEFORE RUNNING, so a consumer does not have to catch an
+    exception to find out. ``report()`` uses it; the dashboard's Run Health tab
+    asks the same question of its own connection.
+    """
+    present = available_tables(conn)
+    out = {}
+    for query in QUERIES:
+        absent = missing_requirements(conn, query.key, present=present)
+        if absent:
+            out[query.key] = absent
+    return out
+
+
+def missing_table_message(key, absent) -> str:
+    """The one sentence printed and raised when a table is not there.
+
+    ONE OWNER, because ``report()`` prints it and ``run()`` raises it and a
+    reader who meets it in a log and in a traceback should meet the same words.
+    """
+    return (
+        f"query {key!r} needs {', '.join(absent)}, which this database "
+        f"does not have. `runs` and `run_metrics` are created by "
+        f"oncotriage.storage.database_logger.initialize_database, so a database "
+        f"last written before the run-identity pass does not carry them; the "
+        f"next writer to open it adds them. Nothing is wrong with the rows that "
+        f"are there."
+    )
+
+
 def run(conn, key) -> pd.DataFrame:
     """Execute one query by key and return its DataFrame. Prints nothing.
 
@@ -1374,12 +1933,22 @@ def run(conn, key) -> pd.DataFrame:
     returning an empty frame -- a typo'd key that answered with no rows would be
     indistinguishable from a database with no matching rows, which is the exact
     confusion this project treats as a defect.
+
+    Raises ``MissingTableError`` when the database does not have a table the
+    query declares in ``requires``, for the same reason and with the same shape:
+    an empty frame there would say "this run tracking recorded nothing" about a
+    database that has never been asked. The check costs one ``sqlite_master``
+    read and ONLY for a query that declares a requirement, so the forty-three
+    queries that declare none are unaffected.
     """
     if key not in QUERIES_BY_KEY:
         raise KeyError(
             f"unknown query key {key!r}; valid keys are "
             f"{', '.join(QUERY_KEYS)}"
         )
+    absent = missing_requirements(conn, key)
+    if absent:
+        raise MissingTableError(missing_table_message(key, absent))
     return pd.read_sql_query(QUERIES_BY_KEY[key].sql, conn)
 
 
@@ -1945,6 +2514,14 @@ def report(conn, out=console.out) -> Dict:
     Returns:
         {key: DataFrame} for every query that completed before the run ended.
 
+        A QUERY SKIPPED FOR A MISSING TABLE IS ABSENT FROM THE DICT, not present
+        with an empty frame. A caller doing ``report(conn)["run_summary"]``
+        against a database that predates the run tables gets a KeyError naming
+        the key, which is a question it can answer, rather than a frame with no
+        rows, which is an answer about the runs that is not true. The skip is
+        printed above the report, and ``unavailable(conn)`` is how to ask
+        without running anything.
+
     IT RUNS TO THE END NOW (item 38). It used to die at
     ``expansion_token_efficiency``, which selected two columns that do not
     exist, so nothing after that query in the registry had ever executed in any
@@ -1961,12 +2538,38 @@ def report(conn, out=console.out) -> Dict:
     # call every wide frame below prints truncated. See apply_display_options.
     apply_display_options()
 
+    # WHICH QUESTIONS THIS DATABASE CANNOT ANSWER, ASKED ONCE, BEFORE ANYTHING
+    # RUNS -- and ANNOUNCED, not silently skipped.
+    #
+    # This is the guard that keeps the item-38 property. `runs` and `run_metrics`
+    # are additive tables; the production inferences.db does not have them until
+    # a writer next opens it. Without this block the first run query would raise
+    # `no such table`, take the process down, and every query registered after it
+    # would never execute -- exactly what `expansion_token_efficiency` did.
+    #
+    # A SKIP IS PRINTED, LOUDLY, AND NAMES THE TABLES AND THE KEYS. A report that
+    # quietly covers less than its registry is a report that reads as complete.
+    # Same reasoning as `pipeline_consistency_totals` printing the count beside a
+    # capped listing.
+    skipped = unavailable(conn)
+
     # The three raw-cursor sections and the two frames File 16 printed before its
     # first numbered query, in the order it printed them.
     out(table_names(conn))
     out(fetch_raw(conn, RAW_INFERENCES_SQL))
 
+    if skipped:
+        _absent = sorted({t for tables in skipped.values() for t in tables})
+        out(f"=== {len(skipped)} QUERY/QUERIES SKIPPED: TABLE(S) OR COLUMN(S) "
+            f"NOT IN THIS DATABASE ===")
+        out(f"absent: {', '.join(_absent)}")
+        out(f"skipped: {', '.join(sorted(skipped))}")
+        out(missing_table_message(sorted(skipped)[0], _absent))
+        out("\n")
+
     for query in QUERIES:
+        if query.key in skipped:
+            continue
         if query.render == "custom":
             renderer = _CUSTOM_RENDERERS.get(query.key)
             if renderer is None:

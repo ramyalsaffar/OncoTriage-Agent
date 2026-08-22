@@ -348,6 +348,27 @@ BUCKETS = {
         "writes, because GET /pipeline/info reports which source supplied the "
         "Qdrant endpoint -- the same precondition "
         "test_agent_retrieval_observability.py carries"),
+    "test_dashboard_run_health.py": (
+        _A, None,
+        "ran green in 0.9s, 155 checks, against ONLY the directory skeleton: "
+        "the Run Health tab and the four run loaders. No network (measured -- "
+        "every render runs with socket.connect/connect_ex/create_connection/"
+        "getaddrinfo replaced by a recorder that RAISES, with a control that "
+        "makes a real call), no keys, no spend, no live Qdrant, no model load, "
+        "no corpus, no git history. Six scratch databases are built by the "
+        "project's own initialize_database() inside a tempfile.mkdtemp it "
+        "removes, and paths._RESOLVED is repointed at them and restored, so "
+        "the production database is never opened -- asserted behaviourally by "
+        "recording sqlite3.connect, with a DECOY control that shows the "
+        "assertion failing. Its eight planted defects go into COPIES of the "
+        "tab written to that temp directory and imported from there, so it "
+        "execs nothing and needs no _EXEC_ALLOWLIST entry, and the two "
+        "repository files it reads (dashboard/tabs/run_health.py, "
+        "dashboard/data.py) are written by neither of the suite's two writers "
+        "-- so it is NOT in the collision matrix. UNLIKE "
+        "test_dashboard_reproducibility_tab.py it has no golden snapshot and "
+        "so is not pinned to a streamlit version's element vocabulary; it "
+        "asserts values derived from its own seed"),
     "test_dashboard_reproducibility_tab.py": (
         _A, None,
         "parallel-safe and needs no external data (green in 7.2s on streamlit "

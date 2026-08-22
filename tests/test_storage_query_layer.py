@@ -174,6 +174,7 @@ import pandas as pd
 
 from oncotriage.config import RRF_POOL_SIZE, TOP_K_CANDIDATES
 from oncotriage.storage import queries
+from oncotriage.storage import database_logger as dblog
 from oncotriage.storage.database_logger import initialize_database
 from oncotriage.utils import UnknownModelPricingError, get_model_cost
 
@@ -809,6 +810,82 @@ for _i, (_cat, _name, _value, _alert) in enumerate([
         (f"2026-08-0{_i + 1} 09:00:00", _cat, _name, _value, _value * 0.9,
          _value * 0.1, 0.03, 2.4 - _i, 3.0, _alert, 30, 7, "seeded"))
 
+# THE RUN TABLES. Four runs, chosen so that every branch of the two run queries'
+# shared CASE fragments is exercised by a row -- a registry that returns a frame
+# for the wrong reason is what section 2's non-emptiness check cannot see.
+#
+#   RUN-CLEAN    FINISHED, finalized, has patients, meta rows say 22 counters
+#                consulted and 0 moved  -> 'measured clean'
+#   RUN-CRASHED  RUNNING with a NULL finished_at and no meta row at all -- the
+#                shape a killed process leaves. -> 'RUNNING, no finished_at' and
+#                'no health record'
+#   RUN-EMPTY    KILLED and finalized, and NO inference row references it. This
+#                is the row an INNER JOIN would delete, so it is what makes the
+#                LEFT JOIN in `run_summary` load-bearing rather than incidental.
+#   RUN-DEGRADED FINISHED with two non-zero counters -> 'degraded', and the only
+#                run that contributes a row to the breakdown's non-NULL arm.
+#
+# A FIFTH SHAPE IS DELIBERATELY PRESENT AND IS NOT A RUN: the eleven-plus
+# inference rows seeded above keep their NULL run_id, which is what every row
+# written before the run-identity pass has. `run_summary` must not invent a run
+# for them, and section 2b asserts it does not.
+_RUN_ROWS = [
+    # label, status, finished_at, invocation_source
+    ("RUN-CLEAN",    "FINISHED", "2026-08-20T11:04:00", "batch_runner"),
+    ("RUN-CRASHED",  "RUNNING",  None,                  "batch_runner"),
+    ("RUN-EMPTY",    "KILLED",   "2026-08-18T10:05:00", "batch_runner"),
+    ("RUN-DEGRADED", "FINISHED", "2026-08-17T11:00:00", "batch_runner"),
+]
+_RUN_IDS = {}
+for _i, (_label, _status, _finished, _source) in enumerate(_RUN_ROWS):
+    _cursor.execute(
+        "INSERT INTO runs (started_at, finished_at, status, invocation_source, "
+        "fingerprint_version, llm_classifier_prompt_version, "
+        "llm_classifier_renderer_digest, matching_model_configured, "
+        "qdrant_collection, collection_points, data_snapshot_date) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (f"2026-08-{20 - _i}T10:00:00", _finished, _status, _source,
+         2, "1.9.0", f"digest-{_i}", "gpt-5.6-terra",
+         "trial_criteria_20260807_111807", 12067, "2026-02-26"))
+    _RUN_IDS[_label] = _cursor.lastrowid
+
+# Which seeded patients belong to which run. Chosen off the named rows above so
+# the expected patient counts and costs are written here rather than read back
+# out of the query being checked.
+_RUN_MEMBERSHIP = {
+    "RUN-CLEAN":    ["P-CONSISTENT-A", "P-CONSISTENT-B", "P-NULL-TOKENS"],
+    "RUN-CRASHED":  ["P-ERROR", "P-NOMODEL-CLEAN"],
+    "RUN-DEGRADED": ["P-COUNT-MISMATCH"],
+    # RUN-EMPTY intentionally absent -- see above.
+}
+for _label, _patients in _RUN_MEMBERSHIP.items():
+    for _patient in _patients:
+        _cursor.execute("UPDATE inferences SET run_id = ? WHERE patient_id = ?",
+                        (_RUN_IDS[_label], _patient))
+
+# THE COUNTER NAMES ARE REAL REGISTERED ONES, not invented strings: a breakdown
+# rendering a name no counter has ever had would look identical to one rendering
+# a real name, and the point of the column is that an operator recognises it.
+_RUN_METRIC_ROWS = [
+    ("RUN-CLEAN",    dblog.RUN_METRIC_CATEGORY_META,
+     dblog.RUN_METRIC_META_COUNTERS_REGISTERED, 22),
+    ("RUN-CLEAN",    dblog.RUN_METRIC_CATEGORY_META,
+     dblog.RUN_METRIC_META_COUNTERS_NONZERO, 0),
+    ("RUN-DEGRADED", dblog.RUN_METRIC_CATEGORY_META,
+     dblog.RUN_METRIC_META_COUNTERS_REGISTERED, 22),
+    ("RUN-DEGRADED", dblog.RUN_METRIC_CATEGORY_META,
+     dblog.RUN_METRIC_META_COUNTERS_NONZERO, 2),
+    ("RUN-DEGRADED", dblog.RUN_METRIC_CATEGORY_DEGRADATION,
+     "AGE_PARSE_FAILURES", 412),
+    ("RUN-DEGRADED", dblog.RUN_METRIC_CATEGORY_DEGRADATION,
+     "QDRANT_RETRIES", 3),
+]
+for _label, _category, _name, _value in _RUN_METRIC_ROWS:
+    _cursor.execute(
+        "INSERT INTO run_metrics (run_id, category, name, value, written_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (_RUN_IDS[_label], _category, _name, _value, "2026-08-20T11:04:00"))
+
 _conn.commit()
 
 check("the seed wrote every inference row",
@@ -870,6 +947,354 @@ for _expected in ("=== PIPELINE CONSISTENCY ISSUES ===",
                   "=== EXPANSION (STAGE 1) STATS ===",
                   "=== LATEST DRIFT RUN ==="):
     check_true(f"report() reached {_expected!r}", _expected in _report_text)
+
+
+# ===========================================================================
+# SECTION 2b -- THE RUN TABLES (the run-reader pass)
+# ===========================================================================
+#
+# Section 2 above proves the two run queries EXECUTE and come back non-empty.
+# That is necessary and it is not enough: a `run_summary` that dropped its LEFT
+# JOINs, or multiplied its aggregates across three children, or read
+# `counters_registered` as "clean", satisfies it exactly. This section asserts
+# the VALUES, computed here from the seed rather than read out of the query.
+
+print()
+print("=" * 78)
+print("SECTION 2b -- runs and run_metrics")
+print("=" * 78)
+
+_summary = queries.run(_conn, "run_summary")
+_summary_by_id = {int(r.run_id): r for r in _summary.itertuples()}
+
+check("run_summary returns exactly one row per run, and no more",
+      len(_summary), len(_RUN_ROWS))
+check("...keyed by every seeded run id",
+      sorted(_summary_by_id), sorted(_RUN_IDS.values()))
+check("...newest first, which is what ORDER BY r.id DESC means",
+      list(_summary["run_id"]), sorted(_RUN_IDS.values(), reverse=True))
+
+# --- THE ROW AN INNER JOIN WOULD DELETE -----------------------------------
+_empty_run = _summary_by_id[_RUN_IDS["RUN-EMPTY"]]
+check("a run NO inference row references is still in run_summary "
+      "(this is what the LEFT JOIN buys)",
+      int(_empty_run.run_id), _RUN_IDS["RUN-EMPTY"])
+check("...with patients 0 -- a measured zero, not a NULL", int(_empty_run.patients), 0)
+check("...and cost 0.0", float(_empty_run.cost_usd), 0.0)
+
+# --- PATIENT ROLLUP, COUNTED FROM THE SEED --------------------------------
+for _label, _patients in _RUN_MEMBERSHIP.items():
+    _row = _summary_by_id[_RUN_IDS[_label]]
+    check(f"{_label}: patients counted from the seed, not from the join",
+          int(_row.patients), len(_patients))
+    # THE MULTIPLICATION CONTROL. RUN-DEGRADED carries two degradation rows and
+    # a meta pair; a naive three-way join would report its patient count
+    # multiplied by four. A run with one patient makes that visible as 4.
+    _expected_cost = round(sum(
+        _conn.execute("SELECT COALESCE(estimated_cost_usd, 0) FROM inferences "
+                      "WHERE patient_id = ?", (_p,)).fetchone()[0]
+        for _p in _patients), 4)
+    check(f"{_label}: cost_usd is the sum over its patients and nothing else",
+          round(float(_row.cost_usd), 4), _expected_cost)
+
+check_true("the patient counts are non-degenerate -- the three runs with "
+           "patients do not all have the same number, so a multiplied or "
+           "constant answer could not pass the checks above",
+           len({len(v) for v in _RUN_MEMBERSHIP.values()}) > 1)
+
+# P-NULL-TOKENS is in RUN-CLEAN and carries a NULL estimated_cost_usd, so the
+# floor and the count that qualifies it must both be right.
+_clean_row = _summary_by_id[_RUN_IDS["RUN-CLEAN"]]
+check("an unpriced patient is counted, not silently folded into the total "
+      "(cost_complete's rule, one table up)",
+      int(_clean_row.rows_with_no_cost), 1)
+check("...and the errored count is the seeded one",
+      int(_clean_row.errored),
+      _conn.execute(
+          "SELECT COUNT(*) FROM inferences WHERE run_id = ? "
+          "AND error IS NOT NULL AND error != ''",
+          (_RUN_IDS["RUN-CLEAN"],)).fetchone()[0])
+
+# --- health_record: THE THREE STATES, AND THEY ARE NOT THE SAME -----------
+_expected_health = {
+    "RUN-CLEAN":    queries.RUN_HEALTH_MEASURED_CLEAN,
+    "RUN-CRASHED":  queries.RUN_HEALTH_NEVER_FLUSHED,
+    "RUN-EMPTY":    queries.RUN_HEALTH_NEVER_FLUSHED,
+    "RUN-DEGRADED": queries.RUN_HEALTH_DEGRADED,
+}
+for _label, _expected in _expected_health.items():
+    check(f"{_label}: health_record",
+          _summary_by_id[_RUN_IDS[_label]].health_record, _expected)
+
+check_true("the three health_record states are all exercised (non-degeneracy: "
+           "a CASE stuck on one arm would satisfy every check above that "
+           "expects that arm)",
+           set(_expected_health.values()) == set(queries.RUN_HEALTH_STATES))
+
+check("a measured-clean run reports counters_nonzero = 0, which is the "
+      "MEASUREMENT that separates it from a run that never flushed",
+      int(_clean_row.counters_nonzero), 0)
+check("...and a run that never flushed reports it as NULL, not 0",
+      bool(pd.isna(_summary_by_id[_RUN_IDS["RUN-CRASHED"]].counters_nonzero)),
+      True)
+
+# --- finalization: the crashed shape is FLAGGED, not hidden ---------------
+_expected_final = {
+    "RUN-CLEAN":    queries.RUN_FINALIZATION_FINALIZED,
+    "RUN-CRASHED":  queries.RUN_FINALIZATION_LIVE_OR_DIED,
+    "RUN-EMPTY":    queries.RUN_FINALIZATION_FINALIZED,
+    "RUN-DEGRADED": queries.RUN_FINALIZATION_FINALIZED,
+}
+for _label, _expected in _expected_final.items():
+    check(f"{_label}: finalization", 
+          _summary_by_id[_RUN_IDS[_label]].finalization, _expected)
+
+# THE THIRD FINALIZATION STATE HAS NO SEEDED RUN, because a terminal status
+# with a NULL finished_at is a shape finalize_run_record cannot produce. It is
+# driven here directly rather than left unexercised -- an arm of a closed
+# vocabulary that no test reaches is an arm nobody has ever seen fire.
+_cursor.execute(
+    "INSERT INTO runs (started_at, finished_at, status, invocation_source) "
+    "VALUES (?, ?, ?, ?)",
+    ("2026-08-10T10:00:00", None, "FAILED", "batch_runner"))
+_UNSTAMPED_RUN = _cursor.lastrowid
+_conn.commit()
+_summary2 = queries.run(_conn, "run_summary")
+_unstamped = _summary2[_summary2["run_id"] == _UNSTAMPED_RUN]
+check("a terminal status with no finished_at is named as its own state, not "
+      "folded into 'RUNNING or died'",
+      list(_unstamped["finalization"]), [queries.RUN_FINALIZATION_NOT_STAMPED])
+check_true("...so all three finalization states are exercised",
+           set(_expected_final.values()) | {queries.RUN_FINALIZATION_NOT_STAMPED}
+           == set(queries.RUN_FINALIZATION_STATES))
+_cursor.execute("DELETE FROM runs WHERE id = ?", (_UNSTAMPED_RUN,))
+_conn.commit()
+check("...and the probe row is removed, so every later check sees the seed",
+      len(queries.run(_conn, "run_summary")), len(_RUN_ROWS))
+
+# --- ROWS WITH NO RUN ARE NOT INVENTED INTO ONE ---------------------------
+_orphan_rows = _conn.execute(
+    "SELECT COUNT(*) FROM inferences WHERE run_id IS NULL").fetchone()[0]
+check_true("the seed has inference rows with a NULL run_id (non-degeneracy: "
+           "without them the next check passes for free)", _orphan_rows > 0)
+check("run_summary attributes no patient to a run that does not exist -- the "
+      "sum over its patients column is the count of rows that DO carry a run_id",
+      int(_summary["patients"].sum()),
+      _conn.execute("SELECT COUNT(*) FROM inferences "
+                    "WHERE run_id IS NOT NULL").fetchone()[0])
+
+# --- THE BREAKDOWN --------------------------------------------------------
+_break = queries.run(_conn, "run_degradation_breakdown")
+_break_by_run = {}
+for _r in _break.itertuples():
+    _break_by_run.setdefault(int(_r.run_id), []).append((_r.counter, _r.events))
+
+check("run_degradation_breakdown has a row for EVERY run, clean ones included",
+      sorted(_break_by_run), sorted(_RUN_IDS.values()))
+check("a clean run appears with the named no-counter label rather than being "
+      "omitted",
+      [_c for _c, _e in _break_by_run[_RUN_IDS["RUN-CLEAN"]]],
+      [queries.RUN_HEALTH_NO_COUNTER_LABEL])
+# pd.isna, NOT `is None`. The column holds numbers for other runs, so pandas
+# makes it float64 and a SQL NULL arrives as nan -- which is TRUTHY and is not
+# equal to None. That is the same trap this file's section 5 exists for, met in
+# a new column, and the first version of this check compared against None.
+check("...and its events cell is NULL, because no counter reported a number",
+      [bool(pd.isna(_e)) for _c, _e in _break_by_run[_RUN_IDS["RUN-CLEAN"]]],
+      [True])
+check("the degraded run's counters come back worst-first, with the seeded "
+      "totals",
+      [(_c, int(_e)) for _c, _e in _break_by_run[_RUN_IDS["RUN-DEGRADED"]]],
+      [("AGE_PARSE_FAILURES", 412), ("QDRANT_RETRIES", 3)])
+check("the breakdown's per-run event total matches run_summary's, which are "
+      "two different SQL shapes over the same rows",
+      int(sum(int(_e) for _c, _e in _break_by_run[_RUN_IDS["RUN-DEGRADED"]])),
+      int(_summary_by_id[_RUN_IDS["RUN-DEGRADED"]].degradation_events))
+
+# --- ATTRIBUTION COVERAGE -------------------------------------------------
+_cover = queries.run(_conn, "run_attribution_coverage")
+_cover_by_label = {r.attribution: r for r in _cover.itertuples()}
+
+check("the coverage census reports the two attributions the seed has",
+      sorted(_cover_by_label),
+      sorted([queries.RUN_ATTRIBUTION_ATTRIBUTED,
+              queries.RUN_ATTRIBUTION_NO_RUN]))
+check("...counting every row with a run_id",
+      int(_cover_by_label[queries.RUN_ATTRIBUTION_ATTRIBUTED].inference_rows),
+      sum(len(v) for v in _RUN_MEMBERSHIP.values()))
+check("...and every row without one, which is the population requirement 3 is "
+      "about",
+      int(_cover_by_label[queries.RUN_ATTRIBUTION_NO_RUN].inference_rows),
+      _orphan_rows)
+check("...so the census covers the whole table and drops nothing",
+      int(_cover["inference_rows"].sum()),
+      _conn.execute("SELECT COUNT(*) FROM inferences").fetchone()[0])
+check("a run-less row contributes no distinct run id",
+      int(_cover_by_label[queries.RUN_ATTRIBUTION_NO_RUN].distinct_run_ids), 0)
+
+# THE DANGLING ROW. The foreign key is unenforced by design, so this state is
+# reachable, and nothing else in the project can report it. Driven for real by
+# pointing a row at a runs id that is not there.
+_cursor.execute("UPDATE inferences SET run_id = ? WHERE patient_id = ?",
+                (999999, "P-CAP-RETRIEVAL"))
+_conn.commit()
+_cover2 = {r.attribution: r for r in
+           queries.run(_conn, "run_attribution_coverage").itertuples()}
+check("a row pointing at a runs id that does not exist is named as its own "
+      "state, not counted as attributed",
+      int(_cover2[queries.RUN_ATTRIBUTION_DANGLING].inference_rows), 1)
+check("...and run_summary still attributes no patient to it",
+      int(queries.run(_conn, "run_summary")["patients"].sum()),
+      sum(len(v) for v in _RUN_MEMBERSHIP.values()))
+check_true("...so all three attribution states are exercised (non-degeneracy)",
+           set(_cover2) == set(queries.RUN_ATTRIBUTION_STATES))
+_cursor.execute("UPDATE inferences SET run_id = NULL WHERE patient_id = ?",
+                ("P-CAP-RETRIEVAL",))
+_conn.commit()
+check("...and the probe is undone, so later sections see the seed",
+      sorted(r.attribution for r in
+             queries.run(_conn, "run_attribution_coverage").itertuples()),
+      sorted([queries.RUN_ATTRIBUTION_ATTRIBUTED,
+              queries.RUN_ATTRIBUTION_NO_RUN]))
+
+# --- THE MISSING-TABLE GUARD ----------------------------------------------
+#
+# THE CHECK THAT KEEPS ITEM 38's PROPERTY. Without `requires`, these two queries
+# raise `no such table` against any database written before the run-identity
+# pass -- which the production one is -- and report() would die there and stop
+# executing everything after them in the registry.
+#
+# THE LEGACY DATABASE IS THE REAL SCHEMA WITH THE RUN TABLES REMOVED, not three
+# stub CREATE TABLEs. A stub would make every OTHER query raise `no such column`,
+# so `report()` would die for a reason that has nothing to do with what this
+# block tests -- which is exactly what the first version of it did.
+_LEGACY_DB = os.path.join(_TMP_DIR, "legacy.db")
+with quiet():
+    initialize_database(_LEGACY_DB)
+_legacy_conn = sqlite3.connect(_LEGACY_DB)
+_legacy_conn.execute("DROP TABLE runs")
+_legacy_conn.execute("DROP TABLE run_metrics")
+_legacy_conn.execute("ALTER TABLE inferences DROP COLUMN run_id")
+_legacy_conn.commit()
+check("the legacy database really lacks the run tables (non-degeneracy: with "
+      "them present every check below passes for the wrong reason)",
+      sorted(t for t in ("runs", "run_metrics")
+             if t in queries.available_tables(_legacy_conn)), [])
+check("...and lacks inferences.run_id too, which is the state a database "
+      "written before the run-identity pass is actually in",
+      "run_id" in {r[1] for r in
+                   _legacy_conn.execute("PRAGMA table_info(inferences)")},
+      False)
+
+check("a database with no run tables reports every run query as unavailable",
+      sorted(queries.unavailable(_legacy_conn)),
+      ["run_attribution_coverage", "run_degradation_breakdown", "run_summary"])
+# BOTH ABSENT TABLES AND THE ABSENT COLUMN, and the column is named even
+# though `runs` is missing too, because `inferences` IS present and its column
+# genuinely is not there. One action -- let a writer open the database -- fixes
+# all three, which is why they are reported together rather than in stages.
+check("...naming the tables AND the column it does not have",
+      queries.unavailable(_legacy_conn)["run_summary"],
+      queries.RUN_TABLES + ("inferences.run_id",))
+check("...and the query that needs no column names only the tables",
+      queries.unavailable(_legacy_conn)["run_degradation_breakdown"],
+      queries.RUN_TABLES)
+check("...and no OTHER query is reported unavailable (non-degeneracy: a check "
+      "that reported everything would pass the line above too)",
+      len(queries.unavailable(_legacy_conn)),
+      sum(1 for q in queries.QUERIES if q.requires))
+check("run() on such a database RAISES MissingTableError rather than returning "
+      "an empty frame that reads as 'this run tracking recorded nothing'",
+      type(check_raises("  (legacy db)", queries.MissingTableError,
+                        queries.run, _legacy_conn, "run_summary")).__name__,
+      "MissingTableError")
+check("...and the seeded database, which HAS the tables, reports none "
+      "unavailable (the control: a guard that always fires proves nothing)",
+      queries.unavailable(_conn), {})
+
+_legacy_lines = []
+_legacy_result = check_does_not_raise(
+    "report() on a database with no run tables RUNS rather than dying at the "
+    "first one -- item 38's property, defended",
+    queries.report, _legacy_conn, out=_legacy_lines.append)
+_legacy_text = "\n".join(str(line) for line in _legacy_lines)
+check_true("...and it SAYS which queries it skipped, rather than quietly "
+           "covering less than its registry",
+           "run_summary" in _legacy_text and "run_metrics" in _legacy_text)
+check("...and the skipped keys are absent from the returned dict, not present "
+      "with an empty frame",
+      sorted(k for k in queries.QUERY_KEYS
+             if queries.QUERIES_BY_KEY[k].requires
+             and k in (_legacy_result or {})),
+      [])
+
+# THE COLUMN-ONLY SHAPE, which the `requires` tuple alone cannot survive. Both
+# run tables present and `inferences.run_id` absent: the coverage query JOINS on
+# that column, so without `requires_columns` it raises `no such column`, takes
+# report() down, and everything registered after it stops executing -- the exact
+# defect the whole mechanism exists to prevent, one granularity off.
+#
+# initialize_database creates the column and the tables in ONE call, so this
+# shape is not producible by the pipeline today. That is a COUPLING, not an
+# invariant, and a guard resting on it would fail in precisely the case it was
+# written for.
+_COLUMN_DB = os.path.join(_TMP_DIR, "no_run_id.db")
+with quiet():
+    initialize_database(_COLUMN_DB)
+_column_conn = sqlite3.connect(_COLUMN_DB)
+_column_conn.execute("ALTER TABLE inferences DROP COLUMN run_id")
+_column_conn.commit()
+
+check("the column-only database HAS both run tables (non-degeneracy: with them "
+      "missing this would be the previous case again)",
+      sorted(t for t in queries.RUN_TABLES
+             if t in queries.available_tables(_column_conn)),
+      sorted(queries.RUN_TABLES))
+check("...and does not have inferences.run_id",
+      "run_id" in queries.table_columns(_column_conn, "inferences"), False)
+# THE EXPECTATION IS DERIVED FROM THE DECLARATIONS, not retyped: exactly the
+# queries declaring the column are unavailable, and the one that declares only
+# the tables is still answerable. Written this way because the first version of
+# this check named ONE key from a reading of the SQL and was wrong --
+# run_summary's patient rollup joins on the same column, and the failure of this
+# section is what found it.
+_expects_run_id = sorted(
+    q.key for q in queries.QUERIES
+    if ("inferences", "run_id") in q.requires_columns)
+check_true("more than one query declares inferences.run_id, and at least one "
+           "run query does not (non-degeneracy: an all-or-nothing set would "
+           "make the check below indistinguishable from a blanket skip)",
+           len(_expects_run_id) >= 2
+           and any(q.requires and ("inferences", "run_id") not in q.requires_columns
+                   for q in queries.QUERIES))
+check("exactly the queries that JOIN on the absent column are unavailable -- "
+      "the run query that does not is still answerable",
+      sorted(queries.unavailable(_column_conn)), _expects_run_id)
+check("...and the absence is reported as the COLUMN, named table.column, "
+      "rather than as a missing table nobody can add",
+      sorted({v for tup in queries.unavailable(_column_conn).values()
+              for v in tup}),
+      ["inferences.run_id"])
+check("run() on it raises MissingTableError rather than the raw sqlite error "
+      "that would have escaped report()'s handler",
+      type(check_raises("  (no run_id)", queries.MissingTableError,
+                        queries.run, _column_conn,
+                        "run_attribution_coverage")).__name__,
+      "MissingTableError")
+_column_lines = []
+check_does_not_raise(
+    "report() on it still runs the two run queries it CAN answer and reaches "
+    "the end",
+    queries.report, _column_conn, out=_column_lines.append)
+check_true("...having reached the degradation breakdown, which needs neither "
+           "`inferences` nor the absent column -- which is what says the skip "
+           "was surgical rather than blanket",
+           any("RUNS: DEGRADATION BY COUNTER" in str(line)
+               for line in _column_lines))
+_column_conn.close()
+
+_legacy_conn.close()
+
 
 
 # ===========================================================================

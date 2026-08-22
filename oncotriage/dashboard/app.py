@@ -1,8 +1,19 @@
 """
 The dashboard's top-level render call.
 
-``main()`` -- the page config, the sidebar, and the nine tabs -- moved verbatim
-out of "21- Streamlit Dashboard.py" in pass 20c-3c-1.
+``main()`` -- the page config, the sidebar, and the tabs -- moved verbatim out
+of "21- Streamlit Dashboard.py" in pass 20c-3c-1. It rendered NINE tabs then;
+the run-reader pass added a tenth, Run Health, over the ``runs`` and
+``run_metrics`` tables.
+
+THE TENTH TAB IS THE ONE THAT DOES NOT HONOUR THE SIDEBAR, and it is handed
+``filtered_df`` anyway. Every other tab reports a per-patient figure, which a
+filter narrows correctly; Run Health reports per-CAMPAIGN figures, which a filter
+would turn into subtotals printed under a total's heading. So it reads its own
+frames from the database unfiltered, uses ``filtered_df`` only to state how much
+of the current selection belongs to a run, and says both things on screen. It
+takes the argument rather than none so that the nine calls below stay one
+shape.
 
 ``st.set_page_config`` STAYS INSIDE ``main()``, where File 21 always had it,
 rather than moving up to the entry point. Streamlit requires it to be the first
@@ -26,6 +37,7 @@ from oncotriage.dashboard.tabs.overview import render_overview_tab
 from oncotriage.dashboard.tabs.patient_explorer import render_patient_explorer_tab
 from oncotriage.dashboard.tabs.performance import render_performance_tab
 from oncotriage.dashboard.tabs.reproducibility import render_reproducibility_tab
+from oncotriage.dashboard.tabs.run_health import render_run_health_tab
 from oncotriage.dashboard.tabs.trial_explorer import render_trial_explorer_tab
 from oncotriage.dashboard.tiers import enrich_match_tiers
 
@@ -93,7 +105,7 @@ def main():
     """, unsafe_allow_html=True)
     
     # Tab navigation
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
         "📊  Overview",
         "🔍  Match Quality",
         "🔎  Patient Explorer",
@@ -102,7 +114,8 @@ def main():
         "⚡  Performance",
         "💰  Cost & Tokens",
         "🔬  Drift Detection",
-        "🔁  Reproducibility"
+        "🔁  Reproducibility",
+        "🩺  Run Health"
     ])
     
     with tab1:
@@ -131,6 +144,9 @@ def main():
 
     with tab9:
         render_reproducibility_tab(filtered_df)
+
+    with tab10:
+        render_run_health_tab(filtered_df)
 
 
 #------------------------------------------------------------------------------

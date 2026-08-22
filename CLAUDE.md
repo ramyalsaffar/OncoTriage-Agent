@@ -408,7 +408,7 @@ python tests/test_registries_cancer_code_claims_audit_control.py   #  16; 14 pla
 python tests/test_config_snapshot_date_rot.py                      #  10; 6 subprocess runs, ~6 min
 python tests/test_package_invariants.py                            # 260/0/0 on macOS (was 247 before section 2f(iii)); 245/2/2 on Linux was measured at 247 and has not been re-measured there (was 234/6 there before commit ec2033a gave it a SKIP mechanism). No network, no keys, no corpus. NOT in CI — see below
 python tests/test_degraded_dependencies.py                         # 174 (was 172 in this note, and 170 before pass 20e; the 172 was never true of the file). Item 11a
-python tests/test_storage_query_layer.py                           # 194; item 38, temp SQLite only
+python tests/test_storage_query_layer.py                           # 260 (was 194; the run-reader pass added section 2b over `runs` / `run_metrics`); item 38, temp SQLite only
 
 # The four added by pass 20f-1. Same shape, same directory, no network, no keys,
 # no spend, and none of them writes anything in the repository.
@@ -423,6 +423,21 @@ python tests/test_ablation_db_isolation.py                         #  72 (was 43
 # writes nothing in the repository, and is not in the collision matrix.
 python tests/test_dashboard_reproducibility_tab.py                 # 200 (was 163; pass 20f-6 added the template-pool controls, the offline guard and the enrichment-divergence check); ~1.7 s
 python tests/test_dashboard_reproducibility_tab.py --update-snapshot  # regenerate the golden snapshot ON PURPOSE
+
+# The run-reader pass. Same shape, same directory. No network (MEASURED: every
+# render runs with socket.connect/connect_ex/create_connection/getaddrinfo
+# replaced by a recorder that RAISES, with a control that makes a real call),
+# no keys, no spend, no live Qdrant, no model load, no corpus, no git history,
+# and NOT in the collision matrix -- six scratch databases inside a
+# tempfile.mkdtemp it removes, paths._RESOLVED repointed and restored, and the
+# two package files it reads (dashboard/tabs/run_health.py, dashboard/data.py)
+# are written by neither of the suite's two writers. It EXECS NOTHING: its
+# eight plants are COPIES written to that temp directory and imported from
+# there. UNLIKE the reproducibility tab's test it has NO GOLDEN SNAPSHOT and is
+# therefore not pinned to a streamlit version's element vocabulary -- see its
+# docstring for why a snapshot recorded on day one of a NEW tab would be the
+# "correct by definition" shape that file's own rule forbids. ~0.9 s.
+python tests/test_dashboard_run_health.py                          # 155
 
 # The Docker pass. Same shape, same directory. No network, no keys, no spend,
 # and no Docker daemon: every Qdrant client is a stand-in and section 1's
@@ -5075,6 +5090,189 @@ of-count plant and an events-instead-of-trials plant both agree with the shipped
 code on a body where every affected trial carries exactly ONE remap, so both are
 now driven on a body with **two remaps on one trial**, where events = 2 and
 trials = 1 and the two answers separate.
+
+### The run tables have readers (the run-reader pass)
+
+**`runs` AND `run_metrics` WERE WRITTEN BY TWO PASSES AND READ BY NOTHING.** A
+table nobody reads rots: the writer keeps writing it, no consumer ever
+contradicts it, and the first person to look discovers that a column has meant
+something else since a pass nobody connected to it. Three registered queries and
+a tenth dashboard tab are the readers. **Read-only throughout: no schema edit,
+no writer edit, and the dashboard's new loaders open the database through a
+`mode=ro` URI.**
+
+**THE PRODUCTION DATABASE DOES NOT HAVE THOSE TABLES, AND THAT FACT DECIDED THE
+DESIGN.** Measured before anything was written: `inferences.db` holds
+`drift_metrics`, `inferences`, `sqlite_sequence`, `trial_matches` and **no
+`runs`, no `run_metrics` and no `inferences.run_id`** — they are additive, and
+the next writer to open the file adds them. A query naming an absent table
+raises `no such table`, and `report()` runs its registry with the first raise
+taking the process down. **So registering the first `runs` query without a guard
+would have reinstated, exactly, the defect item 38 removed** —
+`python "16- Database Query.py"` dying partway with everything after it never
+executing.
+
+`Query.requires` is that guard: a tuple of table names, empty for the
+forty-three queries written before this pass. `report()` asks
+`unavailable(conn)` **once**, before anything runs, **PRINTS** which queries it
+is skipping and which tables are absent, and skips them; a report that quietly
+covers less than its registry is a report that reads as complete.
+`run()` raises **`MissingTableError`** — a `RuntimeError` subclass, on
+`UnknownModelPricingError`'s precedent, so a broad `except sqlite3.Error`
+cannot eat it — rather than returning an empty frame, because "this database
+cannot answer that yet" and "the answer is no rows" are different findings and
+an empty frame is the second. A skipped key is **absent from `report()`'s
+returned dict**, so a caller indexing it gets a KeyError it can act on rather
+than a frame of zeros about runs that were never asked.
+
+**`requires` NAMES TABLES AND `requires_columns` NAMES COLUMNS, AND THE SECOND
+IS NOT DERIVABLE FROM THE FIRST.** `inferences.run_id` is additive too, and two
+of the three run queries JOIN on it — without it their SQL does not parse, which
+is a different case from the ordinary `INFERENCE_COLUMN_ADDITIONS` one every
+other query already handles by projecting NULL. "The tables exist, so the column
+exists" is true of a database this project wrote, because
+`initialize_database` creates all three in one call — **that is a coupling, not
+an invariant, and a guard resting on it fails in exactly the shape it was
+written for.**
+
+**A CONTROL FOUND A DEFECT IN THIS PASS'S OWN WORK, AND READING DID NOT.** The
+first draft declared the column on `run_attribution_coverage` only, under a
+comment calling it "the only query that JOINS on an additive column".
+`run_summary`'s patient rollup joins on the same column. The section that builds
+a database with **both run tables and no `run_id`** is what reported it; the
+expectation there is now **derived from the declarations** rather than retyped,
+so the same mistake cannot be made silently a second time. The dashboard had the
+same defect one layer up and it is fixed with it: that shape is
+`RUN_TRACKING_PARTIAL`, not `present`, because reporting it as present sent the
+tab down its normal path where two refused queries rendered as "the run tables
+hold no rows" — a statement about a pipeline that has not run, made about a
+database whose queries could not be asked.
+
+**THREE QUERIES, AND THE JOINS ARE LEFT FOR TWO NAMED REASONS.**
+`run_summary` (one row per campaign), `run_degradation_breakdown` (per counter,
+**driven from `runs` so a clean run is a row too**) and
+`run_attribution_coverage` (the inference-row census). A run with **no
+patients** — killed before its first — and a run with **no degradations** are
+both real states that an INNER JOIN reports as runs that do not exist. Each
+child is **pre-aggregated to one row per `run_id` before it is joined**: a run
+with 20 patients and 3 counters in one flat FROM clause produces 60 rows and
+`SUM(value)` reports twenty times the events.
+
+**"NO DEGRADATION ROWS" HAS TWO OPPOSITE MEANINGS AND ONE COLUMN SEPARATES
+THEM.** `degradation.totals()` drops every zero counter, so a run that degraded
+in no way contributes no rows — and so does a run whose flushing was never wired
+up, and so does one that died before its first flush. `run_metrics`'
+`counters_registered` meta row is what tells them apart, which is the entire
+reason `flush_run_metrics` writes it. `health_record` is that reading, as a
+closed three-member vocabulary (`measured clean` / `degraded` /
+`no health record`) written **ONCE** as `_RUN_HEALTH_CASE_SQL` and interpolated
+by both run queries — `_CONSISTENCY_CASE_SQL`'s precedent, so there is no second
+copy to forget. `degradation_events` is deliberately **NOT** COALESCE'd to 0;
+`patients`, `errored` and `cost_usd` are, because a LEFT JOIN with no match
+there means no patient claimed the run, which is a measured zero.
+
+**THE CRASHED SHAPE IS NAMED FOR THE AMBIGUITY IT ACTUALLY IS.** A `RUNNING` row
+with a NULL `finished_at` is **either a live campaign or one whose process was
+killed** — the schema has no pid, no heartbeat and no lease, so the two are the
+same row. Calling it "crashed" would be an invention and calling it "running"
+would hide every crash; `finalization` reports it as one state that says so,
+with `started_at` beside it, which is what a reader actually uses. A **terminal**
+status with a NULL `finished_at` is a separate and unambiguous state:
+`finalize_run_record` writes both in one UPDATE, so that row was written by
+something else.
+
+**THE `run_metrics` CATEGORY AND META NAMES ARE IMPORTED FROM THE WRITER, NEVER
+RETYPED.** `queries.py` imports `RUN_METRIC_CATEGORY_*` and
+`RUN_METRIC_META_*` from `oncotriage/storage/database_logger.py`. Written out as
+literals they would be the `CROSS_ENCODER_MODEL` shape one layer down: two
+copies of one fact, no error when they disagree, and the only symptom a health
+panel reporting every run as clean because `WHERE category = 'degredation'`
+matches nothing. The edge was checked rather than assumed — `database_logger`
+does not import `queries`, so there is no cycle.
+
+**A NULL `run_id` IS A VALUE, NOT A LEGACY, AND THE LABEL SAYS SO.**
+`17- FastAPI Server.py` writes one per request **on purpose** (a request is not
+a campaign; a `runs` row per POST would put one row in that table per request),
+and every row written before the run-identity pass has one too. The database
+cannot separate those two populations and `RUN_ATTRIBUTION_NO_RUN` does not
+pretend to. What it must not do is read as "the run is unknown", which is a
+third thing and is what an unlabelled NULL reads as. `RUN_ATTRIBUTION_DANGLING`
+is the third state — a `run_id` with no matching `runs` row, reachable because
+that foreign key is **unenforced by design** (argued at the `runs` CREATE TABLE)
+— and this census is **the only thing in the project that can report one**.
+
+**THE TENTH TAB DOES NOT HONOUR THE SIDEBAR, AND IT SAYS SO ON SCREEN.**
+`oncotriage/dashboard/tabs/run_health.py` is handed `filtered_df` like the other
+nine, and uses it for exactly one thing: stating how much of the **current
+selection** carries a run id. Every run figure comes from the database
+unfiltered, because a run's patient count and cost are properties OF THE RUN and
+a filtered subtotal under a total's heading is `print_cost_by_model`'s
+"<- A FLOOR, NOT A TOTAL" defect, which item 38 had to fix rather than explain.
+The tab **carries no SQL**: every frame comes from the query layer through four
+`@st.cache_data(ttl=60)` loaders in `oncotriage/dashboard/data.py`, so its
+questions and File 16's cannot drift — the direction the cost tab established
+when it stopped carrying its own per-model arithmetic. A run with no health
+record is **not plotted at zero** on the run-over-run chart; it is excluded and
+the exclusion is counted in prose, because a zero bar would state that nothing
+degraded, which is exactly what is not known about it.
+
+**THE FOUR RUN LOADERS OPEN READ-ONLY AND THE THREE ORIGINAL ONES DELIBERATELY
+DO NOT.** `sqlite3.connect(path)` on a path that does not exist **CREATES** an
+empty database, and this tab's whole subject is "what does this database have" —
+a loader that answered by bringing a database into existence would be File 41's
+guard-that-creates-its-own-evidence defect. The three original loaders keep
+`sqlite3.connect` because changing them is a behaviour change to eight tabs in a
+pass that owes one.
+
+**`tests/test_dashboard_run_health.py` — 155 checks, bucket A, ~0.9 s, and it
+has NO GOLDEN SNAPSHOT ON PURPOSE.** It follows
+`tests/test_dashboard_reproducibility_tab.py` point for point — `AppTest`
+driving one module and one function, `initialize_database()` building the
+scratch schema, `paths._RESOLVED` as the redirect seam, `sqlite3.connect`
+recorded with a **DECOY** control showing the isolation assertion FAILING, an
+offline guard that raises and records with a control showing it firing, plants
+into copies in a temp directory — **except for the reference**, and that
+exception is forced by that file's own stated rule: *a golden file refreshed to
+accommodate a change makes whatever the code does correct by definition*. That
+file could take a snapshot because it had a BEFORE. This tab is NEW, so a
+snapshot recorded on day one is a photograph of whatever the pass happened to
+write and would pass forever against a tab reporting a crashed run as finished.
+**The reference is the SEED**: every expected value is computed from the rows
+inserted, never read back out of the frame under test. It is also therefore not
+pinned to a streamlit version's element vocabulary, which is what put the
+reproducibility test's bucket-A entry in a state its own note calls "a
+repository defect". Six scenarios (four runs / all-clean / tables-present-no-rows
+/ no-tables / partial / dangling) and **eight planted defects, eight caught**,
+each paired with the shipped module's opposite answer as its control.
+
+**ONE DEFECT IN THIS PASS'S OWN CODE WAS FOUND BY RUNNING, NOT BY READING**, and
+it was found by an existing check rather than a new one:
+`tests/test_package_invariants.py` **2h** reported
+`RUN_TRACKING_NO_DATABASE` imported into the tab and never read. The cause was a
+bare `else:` catch-all handling that state, which would have rendered an
+unrecognised availability value as "the file is not there" and sent an operator
+to look for a file sitting where it should be. Every member of the closed
+vocabulary is named now and the `else` reports the loader defect it actually is.
+
+**FOUR PINS MOVED, EACH ARGUED IN PLACE**, all in
+`tests/test_package_invariants.py`: the decorator inventory (five entries — four
+loaders and the tab's `@st.fragment`, whose loss is what pass 20c-3c-1 shipped
+silently), its `st.fragment` non-degeneracy list (four → five), the dashboard
+module count (15 → 16) and `data.py`'s loader-decorator dict, which stays EXACT
+and now declares the two private helpers with an empty list **because they must
+not be cached** — `_readonly_connection` returns a live connection a later rerun
+would find closed.
+
+**VERIFIED BY RUNNING.** `python fixture_replay.py` **12/12 clean, exit 0, no
+recapture**; `tests/run_serial_tests.py` **5/5** with `oncotriage/config.py` and
+`oncotriage/registries/cancer_code_registry.py` confirmed restored;
+`tests/test_package_invariants.py` **260/0/0**; CI bucket A **53/53**; and the
+production `inferences.db` sha256 **unchanged** — `ab1403e3…` before and after.
+The whole ten-tab dashboard was rendered end to end through `main()` with
+`AppTest` (no exceptions, all ten headers present), and the new tab was rendered
+against the **real production database** read-only, where it correctly reports
+"no run tracking yet". **No money was spent and no migration was run.**
+
 
 ### A SKIP IS NOT A PASS (commit `ec2033a`)
 

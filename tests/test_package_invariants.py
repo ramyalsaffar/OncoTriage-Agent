@@ -4090,12 +4090,30 @@ _DECORATOR_INVENTORY = {
         ["st.cache_data(ttl=60)"],
     "oncotriage/dashboard/data.py::load_drift_metrics_data":
         ["st.cache_data(ttl=60)"],
+    # ---- The run-reader pass ---------------------------------------------
+    # The four loaders over `runs` / `run_metrics`. Added to the pin rather
+    # than exempted from it: this inventory is EXACT on purpose, so a new
+    # decorated definition has to be declared here, which is the moment
+    # somebody reads what decorator it carries and what TTL it names.
+    "oncotriage/dashboard/data.py::load_run_tracking_availability":
+        ["st.cache_data(ttl=60)"],
+    "oncotriage/dashboard/data.py::load_run_summary_data":
+        ["st.cache_data(ttl=60)"],
+    "oncotriage/dashboard/data.py::load_run_degradation_data":
+        ["st.cache_data(ttl=60)"],
+    "oncotriage/dashboard/data.py::load_run_attribution_data":
+        ["st.cache_data(ttl=60)"],
     # The four that pass 20c-3c-1 dropped and its equivalence proof recovered.
     "oncotriage/dashboard/tabs/drift.py::render_drift_detection_tab":
         ["st.fragment"],
     "oncotriage/dashboard/tabs/patient_explorer.py::render_patient_explorer_tab":
         ["st.fragment"],
     "oncotriage/dashboard/tabs/reproducibility.py::render_reproducibility_tab":
+        ["st.fragment"],
+    # ...and the fifth, the run-reader pass's Run Health tab. Without
+    # @st.fragment every interaction in it re-runs the whole app, which is the
+    # loss pass 20c-3c-1 shipped silently and this dict exists to prevent.
+    "oncotriage/dashboard/tabs/run_health.py::render_run_health_tab":
         ["st.fragment"],
     "oncotriage/dashboard/tabs/trial_explorer.py::render_trial_explorer_tab":
         ["st.fragment"],
@@ -4196,11 +4214,12 @@ check("the decorator inventory of the package is exactly what it was after the "
       "conversion passes -- same definitions, same decorators, at every depth",
       _found_decorators, _DECORATOR_INVENTORY)
 check("...and it is non-degenerate: the four @st.fragment tabs pass 20c-3c-1 "
-      "silently dropped are in it",
+      "silently dropped are in it, and so is the run-reader pass's fifth",
       sorted(k for k, v in _found_decorators.items() if v == ["st.fragment"]),
       ["oncotriage/dashboard/tabs/drift.py::render_drift_detection_tab",
        "oncotriage/dashboard/tabs/patient_explorer.py::render_patient_explorer_tab",
        "oncotriage/dashboard/tabs/reproducibility.py::render_reproducibility_tab",
+       "oncotriage/dashboard/tabs/run_health.py::render_run_health_tab",
        "oncotriage/dashboard/tabs/trial_explorer.py::render_trial_explorer_tab"])
 check("...and it reaches definitions NESTED inside a function, which a "
       "top-level walk cannot see -- the four api/server.py endpoints live "
@@ -5468,9 +5487,15 @@ _DASH_FILES = sorted(
     for name in files
     if name.endswith(".py") and "__pycache__" not in root
 )
-check("the dashboard has the fifteen modules this pass created "
-      "(non-degeneracy: a scan over an empty file list proves nothing)",
-      len(_DASH_FILES), 15)
+# FIFTEEN AFTER PASS 20c-3c-1, SIXTEEN AFTER THE RUN-READER PASS added
+# tabs/run_health.py. The number moves whenever a module joins, and it is a
+# NON-DEGENERACY PROBE rather than a claim about the right number of modules --
+# its job is to say the walk below found files at all, so a scan that silently
+# covered nothing cannot report "[] mutations" and pass.
+check("the dashboard has the sixteen modules the conversion and run-reader "
+      "passes created (non-degeneracy: a scan over an empty file list proves "
+      "nothing)",
+      len(_DASH_FILES), 16)
 
 _TIER_NAMES = ("MATCH_TIERS", "MATCH_TIER_COLORS")
 check("nothing in the dashboard mutates MATCH_TIERS or MATCH_TIER_COLORS, "
@@ -5566,11 +5591,26 @@ _decorated = {
     node.name: [ast.unparse(d) for d in node.decorator_list]
     for node in _data_tree.body if isinstance(node, ast.FunctionDef)
 }
-check("all three loaders carry @st.cache_data(ttl=60), unchanged",
+# THE DICT IS EXACT AND STAYS EXACT. It is a whole-module inventory rather than
+# three lookups, so a loader added without the decorator fails here -- the case
+# that matters, since an uncached loader reads the database on every widget
+# interaction and nothing else in the project would notice. The two entries with
+# an EMPTY list are private helpers, declared rather than filtered out: they must
+# NOT be cached. `_readonly_connection` returns a live sqlite3.Connection, and a
+# cached one would be handed to a later rerun after the first caller closed it;
+# `_load_run_query` is the uncached body the four cached loaders wrap.
+check("every loader in data.py carries @st.cache_data(ttl=60), and the two "
+      "private helpers deliberately carry nothing",
       _decorated,
       {"load_inferences_data": ["st.cache_data(ttl=60)"],
        "load_trial_matches_data": ["st.cache_data(ttl=60)"],
-       "load_drift_metrics_data": ["st.cache_data(ttl=60)"]})
+       "load_drift_metrics_data": ["st.cache_data(ttl=60)"],
+       "_readonly_connection": [],
+       "load_run_tracking_availability": ["st.cache_data(ttl=60)"],
+       "_load_run_query": [],
+       "load_run_summary_data": ["st.cache_data(ttl=60)"],
+       "load_run_degradation_data": ["st.cache_data(ttl=60)"],
+       "load_run_attribution_data": ["st.cache_data(ttl=60)"]})
 
 # THE REFRESH BUTTON STILL REACHES THE LOADERS, WHICH NOW LIVE IN ANOTHER
 # MODULE. st.cache_data.clear() is a CACHE-wide clear, not a per-function one --
