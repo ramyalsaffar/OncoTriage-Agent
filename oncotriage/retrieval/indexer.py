@@ -54,6 +54,7 @@ asserted for all fifteen top-level definitions and every difference is one of
 the three above.
 """
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -2951,6 +2952,83 @@ def cleanup_old_collections(keep_recent: int = 2,
 #------------------------------------------------------------------------------
 
 
+def report_cleanup_failures(out=None) -> bool:
+    """CLEANUP_FAILURES' end-of-build reader. True when it had something to say.
+
+    WHY THE READER IS HERE AND NOT IN ``oncotriage/degradation.py``. That
+    module's docstring excludes this file's eight counters by name and says
+    why: they are index-time rather than run-time, and importing the indexer
+    into the degradation registry would put a scrape module in every batch
+    run's import graph. An exclusion from THAT report is not a licence to have
+    NO report, so this is the indexer's own equivalent of it -- the same place
+    the other seven counters in this file are read. Until the counter-reader
+    audit, CLEANUP_FAILURES was the one of the eight with no reader anywhere,
+    and ``degradation.py`` carried it as a recorded finding rather than a fix.
+
+    THREE DIFFERENT FAULTS SHARE THIS COUNTER AND THE KEY SAYS WHICH, because
+    the remedies differ. A bare exception type is a collection that would not
+    DELETE -- storage cost and nothing else, though note the retained rollback
+    target may be one of them. ``compare_count:`` and ``previous_count:`` are
+    DIAGNOSTIC READS that failed, which means the size floor did not run: a
+    rebuild that printed nothing about its baseline was verified against one
+    fewer check than it looks like, and that is the half a reader must not miss.
+
+    A FUNCTION RATHER THAN FOUR LINES INSIDE ``main()``, and ``out`` is
+    injectable, for the reason ``degradation.print_report`` gives for its own:
+    a test needs the text without the terminal, and ``main()`` cannot be driven
+    without a scrape and a live Qdrant. A reader nothing can exercise is how a
+    reader comes to be wrong.
+
+    PRINTS ONLY WHEN NON-ZERO, matching CRITERIA_RENORMALIZED above and the
+    ablation study's checkpoint line: a zero line on every run trains a reader
+    to skip the place the real one will appear. The RETURN VALUE is what lets a
+    caller -- or a test -- tell "nothing to report" from "not called".
+    """
+    if not CLEANUP_FAILURES:
+        return False
+    emit = out or console.out
+    total = sum(CLEANUP_FAILURES.values())
+    emit(f"\n  WARNING: {total} cleanup/compare operation(s) FAILED this "
+         f"build: {dict(sorted(CLEANUP_FAILURES.items()))}")
+    emit("    A bare exception type is an old collection that was NOT DELETED "
+         "(storage only). A 'compare_count:' or 'previous_count:' key means a "
+         "size-floor read failed, so THAT CHECK DID NOT RUN.")
+    log.warning("collection cleanup or comparison failed",
+                event="cleanup_failures", total=total,
+                count=len(CLEANUP_FAILURES))
+    return True
+
+
+@contextlib.contextmanager
+def cleanup_failures_reported():
+    """Run ``report_cleanup_failures`` however the build ends, raise included.
+
+    WHY A CONTEXT MANAGER AND NOT A CALL AT THE END OF ``main()``. A call at the
+    end is skipped by exactly the build that most needs the report:
+    ``verify_collection`` increments CLEANUP_FAILURES under ``compare_count:``
+    and then RAISES ``IndexVerificationError``, so the one shape where the size
+    floor did not run is the one shape where nothing would summarise it. The
+    individual ``_fail`` line is printed when it happens, thousands of lines up;
+    this is what puts the tally at the end where a reader looks.
+
+    AND NOT A ``try``/``finally`` AROUND THE BUILD, which is the obvious form.
+    That needs the whole staging/direct fork re-indented by four spaces -- ~86
+    lines carrying many multi-line f-strings -- and this project has already
+    paid for that once: the run-identity pass's first attempt at the same
+    operation silently indented the CONTINUATION LINES of two nested
+    docstrings, which no reading caught and an AST comparison did. One line in
+    a ``with`` header costs nothing and moves no other line.
+
+    IT DOES NOT SUPPRESS. The generator body re-raises by construction -- there
+    is no ``except`` here -- so an ``IndexVerificationError`` still leaves the
+    alias where it was and still reaches the caller.
+    """
+    try:
+        yield
+    finally:
+        report_cleanup_failures()
+
+
 def main(use_staging: bool = True, compare_to: str = None,
          run_cleanup: bool = True, max_cost_usd: float = None):
     """
@@ -2979,7 +3057,7 @@ def main(use_staging: bool = True, compare_to: str = None,
     name is logged as an override so the run says what it measured against
     rather than leaving a reader to infer it.
     """
-    with CaffeinateSession("RAG Indexing"):
+    with CaffeinateSession("RAG Indexing"), cleanup_failures_reported():
         console.out(f"=== {Project_Name}: Clinical Trial RAG Indexer ===\n")
 
         trials = scrape_clinicaltrials_gov()

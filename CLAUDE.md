@@ -439,6 +439,18 @@ python tests/test_dashboard_reproducibility_tab.py --update-snapshot  # regenera
 # "correct by definition" shape that file's own rule forbids. ~0.9 s.
 python tests/test_dashboard_run_health.py                          # 155
 
+# The counter-reader pass. Same shape, same directory. No network, no keys, no
+# spend, no live Qdrant, no model load, no corpus, no git history, and NOT in
+# the collision matrix -- it writes nothing outside a tempfile.mkdtemp it
+# removes and asserts gone, and the four package files it reads
+# (degradation.py, retrieval/indexer.py, ablation/study.py, batch/runner.py)
+# are sha256-compared at the end and are written by neither of the suite's two
+# writers. It EXECS NOTHING: every control is a different INPUT to a function
+# of its argument -- including a control MODULE written to that temp directory
+# and PARSED, never imported -- an ast walk, or a registry entry removed inside
+# try/finally with the restore asserted. Bucket A, ~3 s.
+python tests/test_degradation_counter_readers.py                    # 138
+
 # The Docker pass. Same shape, same directory. No network, no keys, no spend,
 # and no Docker daemon: every Qdrant client is a stand-in and section 1's
 # subprocesses import oncotriage.config only. Not in the collision matrix.
@@ -6413,6 +6425,137 @@ The scan walks to any depth now, and its negative control plants a
 package *three* deep — because a control planted at the top level
 would have fired against the old scan too and proved nothing about
 what changed.
+
+### Every counter has a production reader (the counter-reader pass)
+
+**`oncotriage/degradation.py` EXISTS BECAUSE SIXTEEN COUNTERS HAD NO READER,
+AND NOTHING IT BUILT COULD SEE THE SEVENTEENTH.** That pass added the registry
+and the run-end block; it added no check that would notice the NEXT counter
+declared without one, and by this pass there were **nine** more — two of them
+(`MARKDOWN_ESCAPE_DECODE_UNRESOLVED`, `ESCAPED_ENTITY_DECODE_UNRESOLVED`)
+added by the pass immediately before it.
+
+**WHY NO EXISTING CHECK COULD SEE THEM, and the obvious answer is wrong.**
+`tests/test_package_invariants.py` check 2h reports a module-level name that is
+declared and never READ — but `C[key] += 1` binds the `ast.Name` in **LOAD**
+context (the Store sits on the enclosing `Subscript`), so every increment reads
+as a read and a write-only counter satisfies 2h on its first use. Widening 2h
+is the wrong fix: its subject is dead declarations and this one's is live
+declarations with a dead audience.
+
+**THE AUDIT, AND IT IS REPRODUCIBLE FROM `HEAD`.** Every module-level
+`Counter()` in the package plus the one at the repository root, in **both
+declaration forms** — `NAME = Counter()` and `NAME: Dict[str, int] = Counter()`
+— classified by an AST load/store walk covering all three reference forms.
+**48 in the package, 9 write-only, and test files are not readers**: both decode
+counters had four test files reading them and still nothing an operator could
+see.
+
+| counter | was | now |
+|---|---|---|
+| `MARKDOWN_ESCAPE_DECODE_UNRESOLVED` | write-only | `_REGISTRY_SPEC` |
+| `ESCAPED_ENTITY_DECODE_UNRESOLVED` | write-only | `_REGISTRY_SPEC` |
+| `ASSESSMENT_COMPOSITION_ANOMALIES` | write-only | `_REGISTRY_SPEC` |
+| `retrieval/indexer.py:CLEANUP_FAILURES` | write-only | `report_cleanup_failures()`, at the indexer |
+| `ablation/study.py:CHECKPOINT_FAULTS` | write-only | `report_checkpoint_faults()`, at the study |
+| `PROCEDURE_RENDER_COUNTS` | write-only | `_CENSUS_SPEC` |
+| `TEMPORAL_RENDER_COUNTS` | write-only | `_CENSUS_SPEC` |
+| `TEMPORAL_CONFLICT_RESOLVED_MARKERS` | write-only | `_CENSUS_SPEC` |
+| `TEMPORAL_CONFLICT_ACTIVE_MARKERS` | write-only | `_CENSUS_SPEC` |
+
+**THE EXCLUSIONS WERE TREATED AS RULINGS, WHICH IS WHY THERE ARE THREE ANSWERS
+AND NOT ONE.** `degradation.py` excludes the indexer's eight (index-time;
+importing the indexer would put a scrape module in every batch run's import
+graph) and the ablation study's (importing it would drag the graph, the
+fixtures and the thread pool into `25- Batch Runner.py`). Those two got readers
+**at their own entry points**, which is what the exclusion asked for. And
+`TEMPORAL_CONFLICT_RESOLVED_MARKERS` argues at its own declaration that it is
+"an observation, not a degradation" — a run that flags three suspect rows
+correctly must not report a degradation that did not happen.
+
+**SO THE FOURTH ANSWER IS A SECOND REGISTRY.** `_CENSUS_SPEC`,
+`census_snapshot()`, `census_report_lines()`, `print_census_report()` — a
+separate block, printed **above** the degradation block in `print_summary`
+(severity ascending, verdict last), stating in its own heading that its
+contents are NOT degradations. `_copy_counter` is reused rather than
+reimplemented: it took a threaded test to get right and a second copy is a
+second thing to get wrong. **An exclusion from ONE report is not a licence to
+have NO report.**
+
+**THEY ARE DELIBERATELY NOT IN `run_metrics`.** `RUN_METRIC_CATEGORIES` is
+CLOSED at two members, and the three `runs` queries plus the dashboard's Run
+Health tab derive `health_record` from `counters_registered` /
+`counters_nonzero`. A census row would need a third category those shipped
+consumers do not know, or would inflate the field that separates "measured
+clean" from "no health record".
+
+**`TEMPORAL_RENDER_COUNTS` IS A MIXED COUNTER AND THAT DECIDED ITS HOME.** It
+holds genuine degradation keys (`*_unreadable:*`, `*_after_reference` — the
+second means the corpus outran `DATA_SNAPSHOT_DATE`) **and** `lab_stale`, which
+its own declaration argues is not a degradation and argues for keeping in the
+same Counter. Registering it whole would put a census key in the degradation
+report; splitting it would overrule a ruling. It goes to the census entire.
+
+**THE INDEXER'S READER RUNS HOWEVER THE BUILD ENDS, and that gap was found by
+reading the code rather than by the brief.** `verify_collection` increments
+`CLEANUP_FAILURES` under `compare_count:` and then **RAISES**, so a call at the
+end of `main()` is skipped by exactly the build whose size floor did not run.
+`cleanup_failures_reported()` is a context manager on `main()`'s outermost
+`with` — **one line**, where the obvious `try`/`finally` needs the whole
+staging/direct fork re-indented by four spaces across ~86 lines carrying many
+multi-line f-strings, which is the operation that silently indented the
+CONTINUATION LINES of two nested docstrings in the run-identity pass. Every
+pre-existing string constant in the module was compared before and after: 908
+→ 909, all 908 byte-identical, the one addition the new docstring.
+
+**BOTH NEW READERS TAKE AN INJECTABLE `out`**, on `degradation.print_report`'s
+argument: neither `main()` can be driven — one needs a scrape and a live
+Qdrant, the other a paid Stage 5 call per patient — and a reader nothing can
+exercise is how a reader comes to be wrong.
+
+**TWO STALE CLAIMS IN `degradation.py`'s OWN DOCSTRING WERE FOUND BY THE
+AUDIT.** Its exclusion list said the indexer had "eight" and named **seven** —
+`CRITERIA_RENORMALIZED` was missing, so the one thing a reader would use that
+list for would have reported a registered, read counter as unaccounted. And it
+recorded `CLEANUP_FAILURES` as a reported finding, which this pass closed.
+
+**`tests/test_degradation_counter_readers.py` — 138 checks, bucket A, ~3 s.**
+Section 1 is the standing invariant: every module-level `Counter` in the
+package **and at the repository root** is registered, census-registered, or in
+a CLOSED exemption table that **names its production reader** — and that reader
+is then checked by AST to contain a genuine READ, so an exemption whose reader
+was deleted or renamed FAILS and the table cannot rot into a permission slip.
+`CHECKPOINT_FAULTS` is handled outside the table because it is the one name
+owned by TWO modules, and a table keyed by name cannot say "one is registered
+and the other is exempt" — which is exactly the conflation the first version of
+the audit script made, crediting the batch runner's reader to the study's
+counter.
+
+**TWENTY REVERTS, TWENTY CAUGHT, and four defects in this pass's own work were
+found by running rather than by reading.** (i) Two reverts ABORTED the file
+instead of failing it — a bare `_REGISTRY.pop(name)` raises `KeyError` exactly
+when the registration under test has been removed, the abort shape this project
+has now shipped ten times; `.pop(name, None)` plus a check is the fix. (ii) The
+classifier carried an `ast.AugAssign` branch that was **unreachable**: `C[k] +=
+1` gives the Subscript `ctx=Store`, measured, so the live branch already caught
+it — found by deleting the branch and watching nothing fail. (iii) The control
+covered only the dangerous direction of the subscript branch; scoring a read as
+a WRITE is the safe direction (it under-counts readers, producing a false
+alarm) and went uncaught because every exempted counter has several reads and
+the check asks for one. (iv) The import-time disjointness guard could only be
+exercised by breaking the module and then failing to import it, so it became
+`assert_registries_disjoint(registry, census)` with both arguments overridable.
+
+**VERIFIED BY RUNNING.** All 69 non-serial test files green at their documented
+counts; `tests/test_package_invariants.py` **260/0/0** (check 2i is an
+exact-equality decorator pin, so the new `@contextlib.contextmanager` had to be
+DECLARED — the serial run caught it, which is that pin working);
+`tests/run_serial_tests.py` **5/5** with `oncotriage/config.py` and
+`oncotriage/registries/cancer_code_registry.py` confirmed restored;
+`python fixture_replay.py` **12/12 clean, exit 0, with no recapture**; and the
+production `inferences.db` sha256 **unchanged** — `ab1403e3…`. **No money was
+spent, no schema changed and no migration was run.** Re-running the audit that
+found the nine now reports **zero**.
 
 Data and keys live outside this folder. Never write an
 absolute path. The one exception already exists and is

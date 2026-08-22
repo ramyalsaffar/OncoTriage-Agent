@@ -1856,7 +1856,8 @@ def tracking_metrics(results_list: list, total_wall_time: float,
 
 def print_summary(results_list: list, total_wall_time: float, db_path=None,
                   reconciliation: dict = None,
-                  degradation_snapshot: dict = None) -> None:
+                  degradation_snapshot: dict = None,
+                  census_snapshot: dict = None) -> None:
     """
     Print a concise final summary report for the entire batch run.
 
@@ -1890,6 +1891,17 @@ def print_summary(results_list: list, total_wall_time: float, db_path=None,
                           {} is a REAL VALUE and is not None: it means every
                           counter was read and every one was zero, and the block
                           says so. None means nobody asked.
+        census_snapshot:  What oncotriage/degradation.py:census_snapshot()
+                          returned, or None to skip the block. Same
+                          taken-by-the-caller rule and same {}-is-a-value rule
+                          as degradation_snapshot above.
+
+                          A SECOND PARAMETER RATHER THAN A SECOND KEY IN THE
+                          FIRST. The two registries are separate because a
+                          census counter moving is not a fault, and merging
+                          them here would put the reader one dict lookup away
+                          from re-conflating exactly what the split exists to
+                          keep apart.
     """
     main_results = [r for r in results_list if not r.get("is_resample")]
     resample_results = [r for r in results_list if r.get("is_resample")]
@@ -1966,6 +1978,15 @@ def print_summary(results_list: list, total_wall_time: float, db_path=None,
     # ordering argument: the thing a reader looks for is the bottom of the
     # output, so the statement about whether the data is whole belongs there
     # rather than above the per-pass statistics it qualifies.
+    # THE CENSUS SITS ABOVE THE DEGRADATION BLOCK, which sits above the
+    # reconciliation. Severity ascending, verdict last: observations about what
+    # this run rendered and flagged, then the faults, then whether the data is
+    # whole. A reader scanning UP from the bottom -- which is how the tail of a
+    # long run is read -- meets the conclusion, then the reasoning, then the
+    # background.
+    if census_snapshot is not None:
+        degradation.print_census_report(census_snapshot)
+
     # THE DEGRADATION BLOCK SITS ABOVE THE RECONCILIATION, and the order is
     # argued rather than arbitrary. The reconciliation is the run's VERDICT and
     # File 19's rule puts a verdict last; this is evidence, and one of its
@@ -2296,6 +2317,13 @@ def main():
             # event shows up in the NEXT run's report rather than making this one's
             # two halves disagree about their own subject.
             degradation_snapshot = degradation.snapshot()
+            # THE CENSUS SNAPSHOT IS TAKEN HERE TOO, and immediately after the
+            # degradation one so the two blocks describe the same instant --
+            # both pools are joined by this line, so no worker can move a
+            # counter between them. It is NOT logged and NOT flushed: see
+            # print_census_report and the block above _CENSUS_SPEC for why a
+            # census stays on the console channel and out of `run_metrics`.
+            census_snapshot = degradation.census_snapshot()
             degradation.log_summary(degradation_snapshot)
             # THE FINAL FLUSH, FROM THAT SAME SNAPSHOT. Three outputs describe
             # one instant: the persisted rows, the structured event above and
@@ -2320,7 +2348,8 @@ def main():
 
             print_summary(results_list, total_wall_time,
                           reconciliation=reconciliation,
-                          degradation_snapshot=degradation_snapshot)
+                          degradation_snapshot=degradation_snapshot,
+                          census_snapshot=census_snapshot)
 
             # ------------------------------------------------------------------
             # 7. Clean up checkpoint only if all main-pass patients succeeded

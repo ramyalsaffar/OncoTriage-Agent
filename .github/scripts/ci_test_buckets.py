@@ -653,6 +653,27 @@ BUCKETS = {
     "test_registries_cancer_code_claims_audit_control.py": (
         _B, "UMLS MRCONSO*.RRF (it runs the audit above as its baseline)",
         "'File 42 exited 1 with NO defect planted, so a non-zero exit proves nothing'"),
+    "test_degradation_counter_readers.py": (
+        _A, None,
+        "ran green in 3s, 138 checks, against ONLY the directory skeleton: "
+        "every module-level Counter in the package and at the repository root "
+        "is registered in oncotriage/degradation.py, census-registered there, "
+        "or exempted with a named production reader that is then CHECKED by "
+        "ast to contain a genuine read. No network, no keys, no spend, no "
+        "live Qdrant, no model load, no corpus, no git history. The one "
+        "database is a temp file built by the project's own "
+        "initialize_database() inside a tempfile.mkdtemp it removes and then "
+        "asserts gone, with paths._RESOLVED seeded so nothing can resolve to "
+        "the production tree. It EXECS NOTHING -- every control is a "
+        "different INPUT to a function of its argument (including a control "
+        "MODULE written to that temp directory and parsed, never imported), "
+        "an ast walk, or a registry entry removed inside try/finally with the "
+        "restore asserted -- so it needs no _EXEC_ALLOWLIST entry. It writes "
+        "nothing in the repository and the four package files it reads "
+        "(degradation.py, retrieval/indexer.py, ablation/study.py, "
+        "batch/runner.py) are sha256-compared at the end and are written by "
+        "neither of the suite's two writers, so it is NOT in the collision "
+        "matrix"),
     "test_degraded_dependencies.py": (
         _B, "the real Synthea patient corpus",
         "148 passed, 1 failed on the skeleton: 'there are real bundles to "

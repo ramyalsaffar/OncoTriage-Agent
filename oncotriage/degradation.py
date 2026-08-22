@@ -30,17 +30,29 @@ itself.
 
 OUT, each for a stated reason rather than by omission:
 
-  * ``retrieval/indexer.py``'s eight (ADMISSION_SCREEN, CRITERIA_SPLIT_METHODS,
-    SCRAPE_RETRIES, SCRAPE_INTERRUPTIONS, EMBEDDING_USAGE, CLEANUP_FAILURES,
-    ADMISSION_DROPPED_CATEGORIES). Index-time, not run-time; seven of the eight
-    are already printed by the indexer's own end-of-build block, and importing
-    the indexer here would put a scrape module in every batch run's import
-    graph. CLEANUP_FAILURES is the exception and it is a REPORTED FINDING of
-    this pass, not something fixed by adding it here -- see the final report.
-  * ``ablation/study.py:CHECKPOINT_WRITE_FAILURES``. Already read at the end of
-    the study's own ``main()``, which is that entry point's equivalent of this
-    module. Importing ``ablation.study`` here would drag the whole study --
-    graph, fixtures, thread pool -- into ``25- Batch Runner.py``.
+  * ``retrieval/indexer.py``'s EIGHT: ADMISSION_SCREEN,
+    ADMISSION_DROPPED_CATEGORIES, CRITERIA_SPLIT_METHODS, CRITERIA_RENORMALIZED,
+    SCRAPE_RETRIES, SCRAPE_INTERRUPTIONS, EMBEDDING_USAGE and CLEANUP_FAILURES.
+    (This list said "eight" and named SEVEN until the counter-reader audit
+    walked the module: CRITERIA_RENORMALIZED was missing from it, so the one
+    thing a reader would use this list for -- checking that a counter is
+    accounted for -- would have reported a registered, read counter as
+    unaccounted.) Index-time, not run-time, and importing the indexer here
+    would put a scrape module in every batch run's import graph. ALL EIGHT now
+    have a reader inside that module -- at the end of the scrape, of the embed
+    or of the build, whichever phase owns them, which is why this says "its own
+    blocks" and not "its own block". CLEANUP_FAILURES was the one this module
+    recorded as a reported finding rather than a fix, and the counter-reader
+    audit closed it AT THE INDEXER, which is what this exclusion asked for.
+  * ``ablation/study.py:CHECKPOINT_WRITE_FAILURES`` and that module's own
+    ``CHECKPOINT_FAULTS``. Both read at the end of the study's own ``main()``,
+    which is that entry point's equivalent of this module. Importing
+    ``ablation.study`` here would drag the whole study -- graph, fixtures,
+    thread pool -- into ``25- Batch Runner.py``. Note ``CHECKPOINT_FAULTS`` is
+    a SEPARATE OBJECT from the batch runner's counter of the same name, which
+    IS registered here through ``register()``: the two describe different
+    files, and the name being taken is a second reason this one could not join
+    even if the import graph allowed it.
   * ``mcp/server.py:TOOL_FAILURES``. Already has ``tool_failure_summary()``,
     and an MCP server is a long-lived process rather than a run: there is no
     end for a run-end report to attach to.
@@ -50,6 +62,13 @@ OUT, each for a stated reason rather than by omission:
     increments one of them, so "non-zero" is the normal state and printing them
     in a degradation report would bury the signal under a census. They are
     already printed by ``load_all_patients()``.
+  * the four counters in ``_CENSUS_SPEC`` further down this file
+    (PROCEDURE_RENDER_COUNTS, TEMPORAL_RENDER_COUNTS and the two
+    TEMPORAL_CONFLICT_*_MARKERS). Same reason as the parser's four -- they move
+    on correct behaviour -- but UNLIKE the parser's four they had no reader
+    anywhere, so this module grew a second registry and a second block for
+    them rather than leaving the exclusion to mean "no report at all". The
+    argument is written out above ``_CENSUS_SPEC``.
 
 HOW A COUNTER JOINS. Either name it in ``_REGISTRY_SPEC`` below, or -- when the
 owning module imports THIS one and so cannot be imported BY it -- call
@@ -244,9 +263,28 @@ _REGISTRY_SPEC = (
     ("SEX_UNKNOWN_KEPT", _agent_filtering.SEX_UNKNOWN_KEPT,
      "sex-specific trials were KEPT because the patient's sex was not "
      "comparable; that requirement was never tested"),
+    # STAGE 5 STARTS BEFORE THE CALL. Both decoders run in the RENDER path, on
+    # the criteria text this process is about to put in front of the judge, so
+    # they sit above the counters that describe what came back.
+    ("MARKDOWN_ESCAPE_DECODE_UNRESOLVED",
+     _agent_evaluation.MARKDOWN_ESCAPE_DECODE_UNRESOLVED,
+     "a registry markdown escape was left as scraped rather than decoded, so "
+     "the judge read the backslash; keyed reason:text, and the reasons are "
+     "MARKDOWN_REFUSED_ESCAPED_BACKSLASH / MARKDOWN_REFUSED_REFERENCE_SYNTAX"),
+    ("ESCAPED_ENTITY_DECODE_UNRESOLVED",
+     _agent_evaluation.ESCAPED_ENTITY_DECODE_UNRESOLVED,
+     "an escaped character reference was left as scraped rather than decoded, "
+     "so the judge read the entity; keyed reason:text, and the reasons are "
+     "ENTITY_REFUSED_PASS_CAP / ENTITY_REFUSED_REPLACEMENT_CHAR"),
     ("MALFORMED_EVALUATION_ENTRIES", _agent_evaluation.MALFORMED_EVALUATION_ENTRIES,
      "Stage 5 returned a top-level entry that was not an object; it was "
      "dropped and reached no verdict"),
+    ("ASSESSMENT_COMPOSITION_ANOMALIES",
+     _agent_evaluation.ASSESSMENT_COMPOSITION_ANOMALIES,
+     "the stored assessment was composed from a verdict the normalizer should "
+     "not have been able to hand it -- a rejection with no surviving "
+     "disqualifier, or a trial-level label outside the three-member "
+     "vocabulary; the assessment for that trial is the weakest of its cases"),
     ("REFUSALS_OBSERVED", _agent_evaluation.REFUSALS_OBSERVED,
      "the model DECLINED to answer; that patient ended at the error handler"),
     ("BEDROCK_ADAPTER_DEGRADATIONS",
@@ -470,6 +508,221 @@ def log_summary(snap: Optional[Dict[str, Dict[str, int]]] = None) -> Dict[str, i
         log.info("run degradation summary", event="degradation_summary",
                  status="clean", total=0, count=0, degradation_totals={})
     return counts
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
+# THE CENSUS REGISTRY -- SEPARATE, AND THE SEPARATION IS THE POINT
+# ===========================================================================
+#
+# FOUR COUNTERS IN THE AGENT MOVE ON CORRECT BEHAVIOUR, so they cannot join the
+# registry above without making its headline sentence false. That block reads
+# "N of M counters moved" and every entry in it means something went wrong; a
+# run that rendered two hundred procedures and dropped eighty of them by design
+# would report a degradation that did not happen.
+#
+# THAT EXCLUSION IS A RULING, NOT AN OVERSIGHT, and two of the four argue it at
+# their own declaration -- see TEMPORAL_CONFLICT_RESOLVED_MARKERS in
+# oncotriage/agent/evaluation.py ("It is an observation, not a degradation").
+# What was missing is the other half: an exclusion from ONE report is not a
+# licence to have NO report, and all four were write-only in production. A
+# counter with no reader looks like coverage, which is the sentence this whole
+# module opens with.
+#
+# SO: A SECOND REGISTRY, A SECOND BLOCK, THE SAME MACHINERY. `_copy_counter`
+# above is reused rather than reimplemented -- it took a threaded test to get
+# right (see the block at the top of this file) and a second copy of it is a
+# second thing to get wrong. The two registries share no name, enforced below.
+#
+# WHY THESE ARE NOT IN `run_metrics`. The persisted health record's `category`
+# vocabulary (RUN_METRIC_CATEGORIES) is CLOSED at two members, and
+# `run_metrics`' three registered queries plus the dashboard's Run Health tab
+# read `category = 'degradation'` and derive `health_record` from
+# `counters_registered` / `counters_nonzero`. Putting a census row in that
+# table would either need a third category -- which those readers do not know,
+# and teaching them is a change to a shipped consumer rather than to this
+# module -- or would inflate `counters_nonzero`, which is the field that
+# separates "measured clean" from "no health record". A census is a fact about
+# what a run RENDERED; the health record is a fact about what went WRONG with
+# it, and merging them costs the second its meaning.
+#
+# WHAT IS DELIBERATELY NOT HERE. `oncotriage/fhir/parser.py`'s four
+# characterization counters, which are the same KIND of thing and already have
+# a reader -- `load_all_patients()` prints them at the end of its own pass.
+# Registering them here would print them twice on a batch run, and the parser's
+# pass has an end of its own where this module's does not.
+_CENSUS_SPEC = (
+    ("PROCEDURE_RENDER_COUNTS", _agent_patient.PROCEDURE_RENDER_COUNTS,
+     "procedure render candidates kept vs withheld from the Stage 5 summary; "
+     "a run whose 'dropped' dwarfs its 'kept' is a relevance filter to look "
+     "at, and neither number is a fault"),
+    ("TEMPORAL_RENDER_COUNTS", _agent_patient.TEMPORAL_RENDER_COUNTS,
+     "record dates that were PRESENT and could not anchor an elapsed phrase "
+     "('*_unreadable:*', '*_after_reference' -- the second means the corpus "
+     "outran DATA_SNAPSHOT_DATE), plus the 'lab_stale' census key, which its "
+     "declaration argues is NOT a degradation; the mixture is why the whole "
+     "counter is here rather than in the block above"),
+    ("TEMPORAL_CONFLICT_RESOLVED_MARKERS",
+     _agent_evaluation.TEMPORAL_CONFLICT_RESOLVED_MARKERS,
+     "which resolved-state markers fired across the run; a member at zero is "
+     "a candidate for deletion from the vocabulary and a member dominating "
+     "the rest is a candidate for review. NOT a row count -- a row "
+     "contributes every marker it matched"),
+    ("TEMPORAL_CONFLICT_ACTIVE_MARKERS",
+     _agent_evaluation.TEMPORAL_CONFLICT_ACTIVE_MARKERS,
+     "which active-requirement markers fired across the run; see the counter "
+     "above, including that it is not a row count"),
+)
+
+_CENSUS: Dict[str, Counter] = {name: c for name, c, _ in _CENSUS_SPEC}
+_CENSUS_MEANINGS: Dict[str, str] = {name: m for name, _, m in _CENSUS_SPEC}
+
+def assert_registries_disjoint(registry=None, census=None) -> None:
+    """Raise if any name is in BOTH registries. Called at import, below.
+
+    A NAME IN BOTH WOULD REPORT TWICE UNDER TWO DIFFERENT HEADINGS -- once as a
+    fault and once as an observation -- which is ``register()``'s duplicate-name
+    failure wearing a second costume, and worse, because the two blocks
+    disagree about what it MEANS.
+
+    RuntimeError rather than ``assert``: ``python -O`` deletes asserts, and this
+    is a structural claim about the module rather than a debugging aid.
+
+    BOTH ARGUMENTS DEFAULT TO THE LIVE REGISTRIES AND ARE OVERRIDABLE, which is
+    what makes this checkable at all. The import-time form is one statement
+    against two dicts that are correct today, so a test can only exercise it by
+    breaking the module and then failing to import it -- an abort, not a
+    recorded failure. Handed a colliding pair it raises on demand, which is the
+    same reason ``print_report`` takes ``out``.
+    """
+    registry = _REGISTRY if registry is None else registry
+    census = _CENSUS if census is None else census
+    colliding = sorted(set(registry) & set(census))
+    if colliding:
+        raise RuntimeError(
+            f"degradation: {colliding} is in BOTH the degradation registry and "
+            f"the census registry. One counter reported under two headings is "
+            f"the defect register() exists to prevent, one registry out.")
+
+
+assert_registries_disjoint()
+
+
+def census_names() -> List[str]:
+    """Every registered census counter name, in declaration order."""
+    return list(_CENSUS)
+
+
+def census_snapshot() -> Dict[str, Dict[str, int]]:
+    """Every NON-ZERO census counter as ``{name: {key: count}}``.
+
+    ``snapshot()``'s twin, sharing ``_copy_counter`` -- so it is safe to call
+    from a worker thread for the same reason and with the same ``:retry`` /
+    ``:abandoned`` accounting, which lands in ``SNAPSHOT_CONTENTION`` and is
+    therefore reported by the DEGRADATION block. That is the right side: a
+    census that could not be copied is a fault, even though what it counts is
+    not.
+    """
+    out: Dict[str, Dict[str, int]] = {}
+    for name, counter in list(_CENSUS.items()):
+        live = _copy_counter(name, counter)
+        if live:
+            out[name] = dict(sorted(live.items()))
+    return out
+
+
+def census_totals(snap: Optional[Dict[str, Dict[str, int]]] = None) -> Dict[str, int]:
+    """``{counter name: sum of its values}`` for the non-zero census counters.
+
+    Counter NAMES only, on ``totals()``'s reasoning -- but note that a census
+    total is much less useful than a degradation total, because the interesting
+    thing about these counters is the SPLIT between their keys. 'kept' against
+    'dropped' is the whole content of PROCEDURE_RENDER_COUNTS and their sum is
+    just how many procedures a run saw. Provided for symmetry and for a caller
+    that wants one number; the block below prints the keys.
+    """
+    if snap is None:
+        snap = census_snapshot()
+    return {name: sum(keys.values()) for name, keys in snap.items()}
+
+
+def census_report_lines(
+        snap: Optional[Dict[str, Dict[str, int]]] = None) -> List[str]:
+    """The census block, as lines. Never empty.
+
+    ALL-ZERO PRODUCES A STATEMENT, on ``report_lines``' argument: a run that
+    prints nothing here is indistinguishable from a run whose census reporting
+    was never wired up, which is what every run before this pass looked like.
+
+    IT DOES NOT SAY "CLEAN" AND IT DOES NOT SAY "DEGRADED". Zero here means
+    nothing was rendered or nothing was flagged -- on a run that matched
+    patients that is itself worth looking at, and on a run that matched none it
+    is expected. The wording says what was counted and leaves the verdict to
+    the reader, because there is no verdict a census can carry.
+    """
+    if snap is None:
+        snap = census_snapshot()
+
+    lines = ["--- RENDER AND MARKER CENSUS (observations, NOT degradations) ---"]
+    if not snap:
+        lines.append(f"  All {len(_CENSUS)} census counters are zero for this "
+                     f"process: nothing was rendered and nothing was flagged.")
+        lines.append("      Every counter was read. On a run that matched "
+                     "patients this is a finding, not a clean bill.")
+        lines.append("")
+        return lines
+
+    sums = census_totals(snap)
+    lines.append(f"  {len(snap)} of {len(_CENSUS)} census counters have "
+                 f"something to report, {sum(sums.values())} observation(s) "
+                 f"in total.")
+    lines.append("")
+    for name, keys in snap.items():
+        lines.append(f"  {name}  ({sums[name]})")
+        lines.append(f"      {_CENSUS_MEANINGS[name]}")
+        for key, count in keys.items():
+            lines.append(f"        {count:>8}  {key}")
+    lines.append("")
+    lines.append("      PER-PROCESS totals. None of these is a fault; the "
+                 "faults are in the DEGRADATION COUNTERS block.")
+    lines.append("")
+    return lines
+
+
+def print_census_report(snap: Optional[Dict[str, Dict[str, int]]] = None,
+                        out=None) -> None:
+    """Write ``census_report_lines`` to the console channel.
+
+    CONSOLE ONLY, and there is no ``log_summary`` twin. A census is what the
+    console channel is for -- a human reading a run's tail -- and its keys are
+    a mixture this module would rather not put in a durable, correlation-keyed
+    record: PROCEDURE_RENDER_COUNTS and the two marker counters are keyed by
+    our own vocabulary, but TEMPORAL_RENDER_COUNTS' keys carry a
+    ``parse_partial_date`` precision string from third-party data. One rule for
+    the whole block beats a per-counter exemption nobody will maintain.
+    """
+    emit = out or console.out
+    for line in census_report_lines(snap):
+        emit(line)
+
+
+def clear_census() -> None:
+    """Zero every registered CENSUS counter. For a harness, never for a run.
+
+    SEPARATE FROM ``clear_all()`` RATHER THAN FOLDED INTO IT. Every existing
+    caller of ``clear_all()`` saves and restores ``_REGISTRY`` around it and
+    nothing else, so widening it would silently zero four counters those
+    harnesses never put back -- a harness quietly destroying state it did not
+    declare, which is the shape ``run_serial_tests.py`` locks against one level
+    up.
+    """
+    for counter in _CENSUS.values():
+        counter.clear()
+
+
+#------------------------------------------------------------------------------
 
 
 def clear_all() -> None:

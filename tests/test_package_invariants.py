@@ -4197,6 +4197,15 @@ _DECORATOR_INVENTORY = {
     "oncotriage/observability.py::correlation_scope":
         ["contextlib.contextmanager"],
     "oncotriage/observability.py::StructuredLogger.std": ["property"],
+    # The counter-reader pass. CLEANUP_FAILURES' reader has to run however the
+    # build ends -- verify_collection increments it under `compare_count:` and
+    # then RAISES, so a call at the end of main() is skipped by exactly the
+    # build whose size floor did not run. A context manager on main()'s
+    # outermost `with` is one line; the try/finally that would do the same job
+    # needs the whole staging/direct fork re-indented, which is the operation
+    # that silently damaged two nested docstrings in the run-identity pass.
+    "oncotriage/retrieval/indexer.py::cleanup_failures_reported":
+        ["contextlib.contextmanager"],
     "oncotriage/retrieval/indexer.py::get_embeddings_batch._call": [
         "retry(reraise=True, stop=stop_after_attempt(5), "
         "wait=wait_exponential(multiplier=1, min=2, max=60), "

@@ -394,6 +394,41 @@ would report a batch fault and a study fault as one number.
 """
 
 
+def report_checkpoint_faults(out=None) -> bool:
+    """CHECKPOINT_FAULTS' end-of-study reader. True when it had something to say.
+
+    THE READ SIDE OF THE FILE ``CHECKPOINT_WRITE_FAILURES`` REPORTS THE WRITE
+    SIDE OF, and it had no reader anywhere until the counter-reader audit. Its
+    home is this module rather than ``oncotriage/degradation.py`` for the
+    reason that module's docstring gives for its neighbour: importing
+    ``ablation.study`` into the registry would drag the whole study -- graph,
+    fixtures, thread pool -- into ``25- Batch Runner.py``. The batch runner's
+    identically-named counter DOES go there, through ``register()``, and the
+    name already being taken is a second, independent reason this one could not
+    join even if the import graph allowed it.
+
+    REPORTING AFTER THE FACT IS NOT REDUNDANT. A ``refused:`` fault already
+    printed a loud refusal with a remediation command at the TOP of the run,
+    thousands of lines of scrollback ago, and a ``load:`` / ``shape:`` /
+    ``preserve:`` fault printed a warning and carried on. This puts it beside
+    the numbers it qualifies, because "Status: COMPLETE" over a study that
+    silently began from scratch is the reading this counter exists to prevent.
+
+    ``out`` is injectable and this is a function rather than four lines inside
+    ``main()`` on ``degradation.print_report``'s argument: ``main()`` cannot be
+    driven without a live graph and a paid Stage 5 call per patient, and a
+    reader nothing can exercise is how a reader comes to be wrong.
+    """
+    if not CHECKPOINT_FAULTS:
+        return False
+    emit = out or console.out
+    emit(f"  Ckpt faults:     {sum(CHECKPOINT_FAULTS.values())} read/refusal "
+         f"fault(s) {dict(sorted(CHECKPOINT_FAULTS.items()))} -- a 'refused:' "
+         f"key means the resume was DECLINED and this run covers ONLY what it "
+         f"executed itself")
+    return True
+
+
 def _checkpoint_remediation(db_path) -> tuple:
     """The command that clears THIS database's refused checkpoint.
 
@@ -1861,6 +1896,8 @@ def main():
                   f"{sum(CHECKPOINT_WRITE_FAILURES.values())} write "
                   f"degradation(s) {dict(CHECKPOINT_WRITE_FAILURES)} -- resume "
                   f"state may be behind the rows already in the database")
+
+            report_checkpoint_faults()
 
             if interrupted:
                 console.out(f"  Status:          INTERRUPTED (resume with same command)")
