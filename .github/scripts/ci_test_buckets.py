@@ -106,6 +106,24 @@ BUCKETS = {
     # ---- A: verified green with only the directory skeleton ---------------
     "test_agent_ablation_flag_passthrough.py": (
         _A, None, "ran green in 8.3s; registries and clients replaced through deps"),
+    "test_agent_bedrock_adapter.py": (
+        _A, None,
+        "ran green in 2.4s, 273 checks, against ONLY the directory skeleton: "
+        "the Stage 5 Bedrock adapter behind config.MATCHING_PROVIDER, which "
+        "ships OFF. Every client is a stand-in installed through "
+        "oncotriage/agent/deps.py and every model response is a literal dict, "
+        "so no network, no keys, no spend, no live Qdrant and no model load "
+        "(ONCOTRIAGE_DEFER_LOCAL_MODELS is set above the imports). No corpus "
+        "and no git history -- the nine controls are in-memory copies of "
+        "oncotriage/agent/bedrock_adapter.py, argued at _EXEC_ALLOWLIST in "
+        "tests/test_package_invariants.py, because the module has no prior "
+        "revision for `git show` to serve. run_fingerprint.current() is "
+        "deliberately NOT called: it probes the index over the network, and "
+        "the gated field is asserted by AST plus the pure functions instead. "
+        "It writes only inside a tempfile.mkdtemp it removes and asserts gone, "
+        "and the three repository files it reads (bedrock_adapter.py, "
+        "evaluation.py, database_logger.py) are written by neither of the "
+        "suite's two writers, so it is NOT in the collision matrix"),
     "test_agent_age_units_and_sex_filter.py": (
         _A, None, "ran green in 1.8s; plants into in-memory copies, reads no git"),
     "test_agent_composed_assessment.py": (

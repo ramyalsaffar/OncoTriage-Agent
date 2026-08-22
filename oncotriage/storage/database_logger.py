@@ -90,6 +90,7 @@ from typing import Dict
 
 from oncotriage import paths
 from oncotriage import settings
+from oncotriage import config as _config
 from oncotriage.config import (
     CROSS_ENCODER_MODEL,
     MATCHING_MODEL,
@@ -659,6 +660,38 @@ INFERENCE_COLUMN_ADDITIONS = {
     "llm_classifier_call_details":           "TEXT",
     "llm_classifier_packed_chunks":          "INTEGER",
     "llm_classifier_packing":                "TEXT",
+    # --- Which provider served Stage 5 -------------------------------------
+    #
+    # "openai" or "bedrock", exactly -- config.MATCHING_PROVIDER's value, read
+    # here at INSERT time.
+    #
+    # A PLAIN STRING, DELIBERATELY NOT A LOOKUP-TABLE KEY, and the schema's own
+    # precedent is two columns away: matching_model and ecog_selection are both
+    # free TEXT carrying a closed vocabulary, and this project has never
+    # normalised one into a side table. SQLite has no enum, a CHECK constraint
+    # cannot be added by the ALTER-only migration mechanism this dict IS, and a
+    # lookup table would put a join in front of every cost query for a column
+    # with two values. AT THE POSTGRES MIGRATION it becomes TEXT with a CHECK
+    # constraint naming the two values -- which is the point at which the
+    # vocabulary can be enforced by the database rather than by the writer.
+    #
+    # READ FROM CONFIG, NOT FROM THE RESULT DICT, and that is what makes it
+    # unconditional. CROSS_ENCODER_MODEL two lines below is written the same
+    # way and for the same reason: the value is a fact about the PROCESS, not
+    # about how far the pipeline got, so it lands on every row this writer
+    # produces -- a no-candidates row, an error-handler row and a Stage 5
+    # failure return alike. Routing it through the result dict would have made
+    # it NULL on exactly the rows a migration investigation cares about most.
+    # Note the asymmetry with matching_model, which is read off the RESPONSE:
+    # which provider was ASKED and which model ANSWERED are different facts,
+    # and only the second can surprise you.
+    #
+    # NULL MEANS THE ROW PREDATES THIS COLUMN, and such a row is provably
+    # OpenAI: the Bedrock path did not exist when it was written. NOTHING IS
+    # BACKFILLED. A backfilled value is indistinguishable from a measured one,
+    # and the whole reason this column exists is that a stored row should not
+    # have to be dated to be interpreted.
+    "matching_provider":                     "TEXT",
 }
 
 
@@ -1636,8 +1669,9 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 llm_classifier_prompt_version, llm_classifier_prompt_sha256,
                 llm_classifier_patient_record_tokens,
                 llm_classifier_cached_input_tokens, llm_classifier_call_details,
-                llm_classifier_packed_chunks, llm_classifier_packing
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                llm_classifier_packed_chunks, llm_classifier_packing,
+                matching_provider
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             result["patient_id"],
             result["timestamp"],
@@ -1830,6 +1864,24 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
             # the test is on presence and never on emptiness.
             (json.dumps(result["llm_classifier_packing"])
              if result.get("llm_classifier_packing") is not None else None),
+            # FROM CONFIG, NOT FROM `result` -- see the column's note in
+            # INFERENCE_COLUMN_ADDITIONS. Reading it here rather than off the
+            # result dict is what makes it unconditional: every row this writer
+            # produces carries it, including the no-candidates rows and the
+            # Stage 5 failure returns, which are exactly the rows a provider
+            # migration needs to be able to attribute.
+            # READ LIVE OFF THE MODULE, NOT AS A BOUND NAME. A
+            # `from oncotriage.config import MATCHING_PROVIDER` at the top of
+            # this file BINDS the value into this module's namespace at import,
+            # so a caller that later sets `config.MATCHING_PROVIDER` -- the go-
+            # live probe, a test, an operator flipping it in a REPL -- would
+            # reach nothing and every row would record the value the process
+            # started with. That is the patch-point defect
+            # tests/test_agent_rrf_config_ownership.py exists for, and it
+            # applies to any constant that can move WITHIN a process. The other
+            # config names imported above cannot: CROSS_ENCODER_MODEL and
+            # MATCHING_MODEL identify models that are fixed for a run.
+            _config.MATCHING_PROVIDER,
         ))
         
         inference_id = cursor.lastrowid

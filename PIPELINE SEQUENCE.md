@@ -95,6 +95,7 @@ part of any suite, and capture costs money.
 | 3 `node_cross_encoder_rerank` | `agent/retrieval.py` | MedCPT cross-encoder, multi-query RRF across queries, stable argsort for determinism. |
 | 4 `node_rule_based_filter` | `agent/filtering.py` | MeSH site relevance, stage ordinal, histology, age, sex, dynamic quality threshold, cost cap at 15 trials. |
 | 5 `node_llm_classifier_evaluation` | `agent/evaluation.py` | One call producing per-criterion verdicts. JSON-parse failures loop back, up to 3 attempts. |
+| ^ its provider | `agent/bedrock_adapter.py` | The Amazon Bedrock translation of that same call, behind `config.MATCHING_PROVIDER`, which ships `"openai"`. Unreachable under the default. |
 | 6 `node_finalize` | `agent/terminal.py` | Splits eligible / not_eligible / not_evaluable and normalizes labels. |
 
 `node_no_candidates` and `node_error_handler` are the other two terminal nodes,

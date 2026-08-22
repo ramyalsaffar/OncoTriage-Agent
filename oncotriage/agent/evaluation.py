@@ -40,6 +40,7 @@ from collections import Counter
 from typing import Dict, FrozenSet, List, Tuple
 
 from oncotriage import config
+from oncotriage.agent import bedrock_adapter
 from oncotriage.agent import deps
 from oncotriage.agent.patient import _create_patient_summary
 from oncotriage.agent.prompts import (
@@ -369,14 +370,25 @@ class MatchingModelMismatchError(RuntimeError):
     def __init__(self, requested: str, returned: str):
         self.requested = requested
         self.returned = returned
+        # WHICH CONSTANT TO EDIT DEPENDS ON THE PROVIDER, and naming the wrong
+        # one is a wrong instruction in the message that stops a run. Under
+        # Bedrock the string that was SENT comes from BEDROCK_MATCHING_MODEL,
+        # and editing MATCHING_MODEL there would change the priced identity
+        # while leaving the wire id untouched -- so the run would raise again,
+        # identically, having also broken the pricing key.
+        self.provider = config.MATCHING_PROVIDER
+        constant = ("BEDROCK_MATCHING_MODEL"
+                    if self.provider == config.MATCHING_PROVIDER_BEDROCK
+                    else "MATCHING_MODEL")
         super().__init__(
             f"Stage 5 requested model {requested!r} but the API answered as "
-            f"{returned!r}. The configured model resolved to something other "
+            f"{returned!r} (provider: {self.provider}). The configured model "
+            f"resolved to something other "
             f"than what was configured -- almost certainly an alias that now "
             f"points at a dated snapshot. Every verdict from this point on "
             f"would come from a different judge than the rows already in "
             f"inferences.db, so the run is stopped rather than continued and "
-            f"logged. After reviewing what changed, set MATCHING_MODEL in "
+            f"logged. After reviewing what changed, set {constant} in "
             f"'oncotriage/config.py' to {returned!r}, add it to PRICING_CONFIG if it "
             f"is not there, and re-baseline; do not accept it silently."
         )
@@ -481,6 +493,33 @@ def call_matching_model(system_prompt: str, user_prompt: str):
     #     harness.
     #
     # So the retry budget is client-wide by necessity, and File 03 says so.
+    #
+    # ── THE PROVIDER DISPATCH, AND WHY IT IS HERE AND NOT LOWER ───────────
+    #
+    # This function is the single point where the pipeline talks to the
+    # matching model -- which is what lets the fixture harnesses capture and
+    # replay one exchange -- so it is also the only place a second provider can
+    # be introduced without giving those harnesses a second seam to know about.
+    #
+    # WITH THE FLAG AT ITS DEFAULT THIS COSTS TWO STRING COMPARISONS AND
+    # CHANGES NOTHING. The `return` below is byte-identical to the one that
+    # stood here before the adapter existed: same client, same kwargs, same
+    # order, same object. That is what the twelve characterization fixtures
+    # replaying clean WITHOUT recapture measures, and what
+    # tests/test_agent_bedrock_adapter.py section 1 asserts structurally.
+    #
+    # AN UNRECOGNISED PROVIDER RAISES rather than falling through to OpenAI.
+    # "not bedrock, therefore openai" would let a typo in MATCHING_PROVIDER
+    # keep billing the incumbent while an operator believed they had migrated,
+    # which is the silent-wrong-provider failure the closed vocabulary in
+    # config exists to prevent.
+    _provider = config.MATCHING_PROVIDER
+    if _provider == config.MATCHING_PROVIDER_BEDROCK:
+        return bedrock_adapter.call_matching_model_bedrock(
+            system_prompt, user_prompt)
+    if _provider != config.MATCHING_PROVIDER_OPENAI:
+        config.validate_matching_provider_config()   # raises, naming the constant
+
     return deps.get_openai_client().chat.completions.create(
         model=MATCHING_MODEL,
         messages=[
@@ -3089,9 +3128,22 @@ CLINICAL TRIALS:
         # None means the response carried no model field (a stub, or a
         # pre-migration recording). That is a different condition and falls
         # through to the existing NULL handling untouched.
+        #
+        # COMPARED AGAINST THE WIRE MODEL, NOT `MATCHING_MODEL`, and the two
+        # are the SAME STRING whenever MATCHING_PROVIDER is "openai" --
+        # config.matching_wire_model() returns MATCHING_MODEL on that branch,
+        # so nothing about this check moves under the default. On Bedrock the
+        # id that was SENT is a cross-Region inference profile
+        # ("us.openai.gpt-5.6-terra"), so comparing the echo against
+        # MATCHING_MODEL would raise on every well-behaved response. The
+        # alternative -- having the adapter present MATCHING_MODEL as the echo
+        # -- was rejected: it would make every stored row name a model that did
+        # not serve it, which is the exact misattribution this check exists to
+        # prevent, pointed the other way.
+        _model_expected = config.matching_wire_model()
         _model_returned = getattr(response, "model", None)
-        if _model_returned is not None and _model_returned != MATCHING_MODEL:
-            raise MatchingModelMismatchError(MATCHING_MODEL, _model_returned)
+        if _model_returned is not None and _model_returned != _model_expected:
+            raise MatchingModelMismatchError(_model_expected, _model_returned)
 
         model_answered = _model_returned or model_answered
 

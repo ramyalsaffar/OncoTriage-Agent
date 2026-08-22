@@ -966,6 +966,56 @@ def assert_hooks_reach_the_agent(expected: dict, what: str) -> None:
         )
 
 
+class UnsupportedMatchingProviderError(RuntimeError):
+    """The fixture harness was asked to run against a provider it cannot hook.
+
+    THE HARNESS HOOKS ``deps.OPENAI_CLIENT`` AND WRAPS ``chat.completions
+    .create``. With ``config.MATCHING_PROVIDER`` set to "bedrock", Stage 5
+    reaches ``deps.BEDROCK_CLIENT`` and calls ``responses.create`` instead --
+    a seam and a method neither proxy covers. The two failures that produces
+    are the two this whole seam exists to prevent:
+
+      * CAPTURE would issue REAL, BILLED Stage 5 calls and record none of
+        them, and ``assert_hooks_reach_the_agent`` would still pass, because
+        it asserts by identity on OPENAI_CLIENT -- which IS the harness's
+        object. The fixture would be written, with an empty Stage 5 exchange,
+        looking exactly like a successful capture.
+      * REPLAY would bypass the OpenAI tripwire entirely and send every one of
+        the twelve fixtures' Stage 5 prompts to the live Bedrock endpoint, be
+        billed for all of them, and print that they replayed clean. Nothing
+        would raise. That is verbatim the regression pass 20c-2c wrote the
+        seam to make impossible, reintroduced through a second provider.
+
+    So the harness REFUSES rather than being taught to guess. Extending
+    ``OpenAIProxy`` to wrap ``responses.create`` on a second seam is the fix,
+    and it is a fixture-format question (the recorded request block is
+    chat-shaped) rather than a one-line one, which is why it is a refusal here
+    and a recorded follow-up rather than an inline patch.
+
+    A RuntimeError subclass, deliberately not a ValueError, on the
+    ``UnknownModelPricingError`` precedent.
+    """
+
+    def __init__(self, what: str):
+        super().__init__(
+            f"{what}: config.MATCHING_PROVIDER is "
+            f"{config.MATCHING_PROVIDER!r}, and this harness can only hook the "
+            f"{config.MATCHING_PROVIDER_OPENAI!r} provider -- it wraps "
+            f"chat.completions.create on deps.OPENAI_CLIENT, and Stage 5 would "
+            f"reach responses.create on deps.BEDROCK_CLIENT instead. Every "
+            f"Stage 5 call would be REAL and BILLED while the run reported it "
+            f"had made none. Set MATCHING_PROVIDER back to "
+            f"{config.MATCHING_PROVIDER_OPENAI!r} in oncotriage/config.py, or "
+            f"teach the proxies the Bedrock seam first."
+        )
+
+
+def assert_provider_is_hookable(what: str) -> None:
+    """Refuse to install hooks for a provider the proxies do not cover."""
+    if config.MATCHING_PROVIDER != config.MATCHING_PROVIDER_OPENAI:
+        raise UnsupportedMatchingProviderError(what)
+
+
 def install_recording_hooks(sink: RecordingSink,
                             truncate_first_call: bool = False) -> dict:
     """Redirect all four seams to recorders. Returns the saved override state.
@@ -973,7 +1023,13 @@ def install_recording_hooks(sink: RecordingSink,
     The return value goes to restore_hooks(), which is deps.restore_overrides()
     -- so a seam that had no override before is CLEARED rather than pinned to
     whatever it happened to resolve to.
+
+    Raises:
+        UnsupportedMatchingProviderError: before ANY client is touched, when
+            MATCHING_PROVIDER names a provider these proxies do not cover.
     """
+    assert_provider_is_hookable("install_recording_hooks")
+
     proxies = {
         deps.OPENAI_CLIENT: OpenAIProxy(
             deps.get_openai_client(),
@@ -2095,6 +2151,30 @@ def build_environment_block() -> Dict:
             # difference that a one-line config edit caused.
             "MATCHING_REASONING_EFFORT": MATCHING_REASONING_EFFORT,
             "MATCHING_MAX_TOKENS": MATCHING_MAX_TOKENS,
+            # WHICH PROVIDER SERVED STAGE 5. On this dict's own doctrine: a
+            # provider flip changes the endpoint, the request FORM (Responses
+            # rather than Chat Completions), the wire model id and -- because
+            # `seed` is not expressible on the Responses API -- the
+            # determinism of the answer. Without it recorded, that reaches a
+            # replay as an unexplained Stage 5 difference with no cause
+            # attached, which is the afternoon this dict exists to save.
+            #
+            # FUTURE CAPTURES ONLY, exactly as the RRF and
+            # CROSS_ENCODER_MAX_LENGTH blocks above record: diff_tunables()
+            # iterates the keys the FIXTURE recorded, not the keys this dict
+            # declares, so adding this cannot move, invalidate or re-report any
+            # of the twelve fixtures already on disk. They replay clean,
+            # unchanged and without recapture.
+            # READ OFF THE MODULE rather than from the name imported at the
+            # top of this file, and it is the ONLY entry here that is. Every
+            # other tunable in this dict is fixed for the life of a process;
+            # this one is not -- `bedrock_probe.py` sets it on the config
+            # module for its own run, and a test may -- so a bound copy would
+            # record the value this file was IMPORTED with rather than the one
+            # that served the capture. A fixture whose environment block
+            # disagrees with the run it describes is worse than one that omits
+            # the field.
+            "MATCHING_PROVIDER": config.MATCHING_PROVIDER,
             "MAX_VARIANT_TERMS": MAX_VARIANT_TERMS,
             "CHARS_PER_TOKEN": CHARS_PER_TOKEN,
         },

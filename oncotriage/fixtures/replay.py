@@ -143,6 +143,7 @@ from oncotriage.agent.graph import build_initial_state, build_matching_graph
 from oncotriage.agent.patient import compute_patient_hash
 from oncotriage.config import COLLECTION_NAME, Project_Name
 from oncotriage.fhir.parser import parse_fhir_bundle
+from oncotriage.fixtures import capture as _capture
 from oncotriage.fixtures.capture import (
     BUNDLE_DERIVED,
     BUNDLE_IN_COHORT,
@@ -513,7 +514,17 @@ def install_replay_hooks(fixture: Dict, sink) -> tuple:
     a recorded output. That is why this file cannot be run with all egress
     blocked, and why the OpenAI side gets a tripwire instead -- see
     _OpenAITripwire.
+
+    Raises:
+        capture.UnsupportedMatchingProviderError: before any hook is installed,
+            when MATCHING_PROVIDER names a provider these proxies do not cover.
+            A replay under that flag would bypass the tripwire and send all
+            twelve fixtures' Stage 5 prompts to a live, billed endpoint while
+            reporting that it made no calls -- the exact regression the seam
+            was built to prevent, reintroduced through a second provider.
     """
+    _capture.assert_provider_is_hookable("install_replay_hooks")
+
     state = _ReplayState(fixture, sink)
 
     proxies = {

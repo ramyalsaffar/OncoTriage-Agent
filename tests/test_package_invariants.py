@@ -1111,6 +1111,29 @@ _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    "tests/test_extraction_stage_m_category.py",
                    "tests/test_extraction_stage_non_oncology_guard.py",
                    "tests/test_agent_trial_verdict_normalization.py",
+                   # NINE execs, each an in-memory copy of
+                   # oncotriage/agent/bedrock_adapter.py with ONE mapping
+                   # broken: max_output_tokens deleted, `store` no longer sent,
+                   # `strict` dropped from the structured-output format, the
+                   # reasoning effort no longer carried, a truncated response
+                   # reported as a complete one, the input and output token
+                   # counts swapped, the refusal part unrecognised, the system
+                   # role reverted to chat's "system", and the dropped-seed
+                   # counter silenced. A `git show` control is impossible for
+                   # EVERY one of them and the reason is not incidental: the
+                   # module has no prior revision at all -- it is new -- so
+                   # there is no blob carrying a version with one mapping
+                   # missing. Nor can a real condition supply them: each is a
+                   # one-token edit INSIDE a function body, to a pure
+                   # translation whose only input is a prompt pair or a
+                   # response dict, and varying THOSE is what the file already
+                   # does for the checks that do not need a plant. The copies
+                   # are exec'd into a real ModuleType, because a function's
+                   # globals ARE the dict it was exec'd into. The shipped file
+                   # is sha256'd before the first plant and compared at the
+                   # end, and a plant that matched nothing raises rather than
+                   # producing a control that quietly agrees with the code.
+                   "tests/test_agent_bedrock_adapter.py",
                    # ONE exec, of an in-memory copy of fixtures/capture.py with
                    # `--resume`'s gate reverted to "the file exists, skip it" --
                    # the defect the gate was written to prevent, and the only
@@ -2519,6 +2542,11 @@ except KeyError:
 saved = deps.set_overrides(sentinels)
 accessors = {
     "openai_client":    deps.get_openai_client,
+    # The Stage 5 judge's SECOND client, added with config.MATCHING_PROVIDER.
+    # It is a separate key from openai_client because both are live at once
+    # when the flag is on -- Stage 2 still embeds through OpenAI -- so one key
+    # could not redirect the judge without also redirecting the embeddings.
+    "bedrock_client":   deps.get_bedrock_client,
     "qdrant_client":    deps.get_qdrant_client,
     "bm25_query_model": deps.get_bm25_query_model,
     "medcpt_tokenizer": deps.get_medcpt_tokenizer,
@@ -4987,6 +5015,7 @@ def make_factory(key):
 
 ACCESSORS = {
     deps.OPENAI_CLIENT:    ("get_openai_client", "_OPENAI"),
+    deps.BEDROCK_CLIENT:   ("get_bedrock_client", "_BEDROCK"),
     deps.QDRANT_CLIENT:    ("get_qdrant_client", "_QDRANT"),
     deps.BM25_QUERY_MODEL: ("get_bm25_query_model", "_BM25"),
     deps.MEDCPT_TOKENIZER: ("get_medcpt_tokenizer", "_TOK"),
@@ -5047,13 +5076,17 @@ else:
     # with zero keys, or if every worker silently died.
     check("it ran with MAX_WORKERS threads, and MAX_WORKERS is more than one",
           (_payload.get("workers") or 0) > 1, True)
-    check("every accessor key was exercised", len(_keys), 8)
+    # NINE SINCE deps.BEDROCK_CLIENT JOINED THE SEAM. Written as a literal
+    # rather than as len(ACCESSORS), because ACCESSORS lives in the SUBPROCESS
+    # source below: deriving the expectation from the thing under test is how a
+    # table that quietly stopped covering a key passes anyway.
+    check("every accessor key was exercised", len(_keys), 9)
     check("every key was observed by every worker (no worker died silently)",
           _payload.get("observations_per_key"), [_payload.get("workers")])
 
     check("every key handed the same object to all MAX_WORKERS threads",
           _payload.get("keys_with_more_than_one_object"), [])
-    check("...for every one of the eight keys, not just the ones that happened "
+    check("...for every one of the nine keys, not just the ones that happened "
           "to be fast", sorted(_payload.get("keys_with_one_object") or []),
           sorted(_keys))
     check("each factory ran EXACTLY ONCE, so 'same object' is not twelve builds "

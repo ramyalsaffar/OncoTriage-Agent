@@ -583,6 +583,7 @@ AIRFLOW_DAG_SCHEDULE = None
 
 _KEYS_CACHE = None
 _OPENAI_CLIENT_CACHE = None
+_BEDROCK_CLIENT_CACHE = None
 _QDRANT_CLIENT_CACHE = None
 _SDK_DEFAULT_TIMEOUT_CACHE = None
 _MATCHING_REQUEST_TIMEOUT_CACHE = None
@@ -1016,6 +1017,385 @@ MATCHING_MAX_TOKENS = 32000
 # MATCHING_TEMPERATURE). Stage 5 is therefore best-effort reproducible and no
 # longer exactly reproducible. Stages 1-4 are unchanged and still exact.
 MATCHING_SEED = 42
+
+
+# ---------------------------------------------------------------------------
+# WHICH PROVIDER SERVES STAGE 5
+# ---------------------------------------------------------------------------
+#
+# THE DEFAULT IS "openai" AND FLIPPING IT IS THE ONLY THING THAT CHANGES ANY
+# BEHAVIOUR IN THIS FILE. With MATCHING_PROVIDER == "openai" every accessor
+# below is unreachable, no Bedrock client is constructed, no Bedrock module is
+# imported for its side effects, and `call_matching_model` issues byte-for-byte
+# the request it issued before the adapter existed. That is asserted three ways
+# by tests/test_agent_bedrock_adapter.py -- structurally (the dispatch is one
+# `if` above the unchanged return), behaviourally (the kwargs the OpenAI client
+# is handed are compared field by field against a pinned expectation), and by
+# the twelve characterization fixtures replaying clean without recapture.
+#
+# ONE FLAG, TWO NAMES, AND THE PROVENANCE COLUMN. `MATCHING_MODEL` above stays
+# the PRICED and CONFIGURED identity of the judge; `BEDROCK_MATCHING_MODEL`
+# below is the string that goes on the wire when the provider is Bedrock, and
+# `matching_wire_model()` is the one function that answers "what will actually
+# be sent". `inferences.matching_provider` records which of the two branches a
+# row was produced by, so no stored row has to be dated to be interpreted.
+
+MATCHING_PROVIDER_OPENAI = "openai"
+MATCHING_PROVIDER_BEDROCK = "bedrock"
+
+MATCHING_PROVIDERS = (MATCHING_PROVIDER_OPENAI, MATCHING_PROVIDER_BEDROCK)
+"""The closed vocabulary. `deps.OVERRIDE_KEYS`' shape and for the same reason:
+a provider name nobody recognises must raise rather than being read as "not
+bedrock, so openai" -- a typo that silently keeps billing the incumbent while
+an operator believes they have migrated is the failure this tuple prevents."""
+
+MATCHING_PROVIDER = MATCHING_PROVIDER_OPENAI
+"""Which provider Stage 5 calls. THE FLAG. Values: MATCHING_PROVIDERS."""
+
+
+# --- The Bedrock endpoint ---------------------------------------------------
+#
+# TWO ENDPOINTS SERVE THE SAME OpenAI-COMPATIBLE APIs AND THIS PROJECT CANNOT
+# YET KNOW WHICH ONE ITS QUOTA WILL LAND ON, which is why the endpoint is
+# configuration rather than a constant folded into a URL. Measured against the
+# live documentation on 2026-08-21:
+#
+#   bedrock-runtime  https://bedrock-runtime.{region}.amazonaws.com/openai/v1
+#                    AWS's recommended endpoint. Responses + Chat Completions +
+#                    Converse + InvokeModel + Anthropic Messages. Cross-Region
+#                    inference profiles ONLY for the GPT-5.6 family -- in-Region
+#                    inference is "Not supported" on this endpoint for Terra, so
+#                    the model MUST be named `us.openai.gpt-5.6-terra` or
+#                    `global.openai.gpt-5.6-terra`.
+#                    (model-card-openai-gpt-56-terra.html, "Programmatic Access")
+#
+#   bedrock-mantle   https://bedrock-mantle.{region}.api.aws/openai/v1
+#                    Responses + Chat Completions + Anthropic Messages. In-Region
+#                    only; the model is the bare `openai.gpt-5.6-terra`.
+#
+# NOTE THE PATH, BECAUSE TWO AWS PAGES DISAGREE AND THE MODEL CARD IS THE ONE
+# THAT IS RIGHT FOR THIS MODEL. `bedrock-mantle.html` gives the mantle base URL
+# as `.../api.aws/v1`; the GPT-5.6 Terra model card carries an explicit
+# footnote -- "On bedrock-mantle, this model is served at /openai/v1/responses,
+# not the default /v1/responses" -- and its own Programmatic Access table gives
+# `https://bedrock-mantle.{region}.api.aws/openai/v1`. The model card wins
+# because it is the page about this model. If a mantle call 404s, this is the
+# first line to look at.
+
+BEDROCK_ENDPOINT_RUNTIME = "bedrock-runtime"
+BEDROCK_ENDPOINT_MANTLE = "bedrock-mantle"
+
+BEDROCK_BASE_URL_TEMPLATES = {
+    BEDROCK_ENDPOINT_RUNTIME: "https://bedrock-runtime.{region}.amazonaws.com/openai/v1",
+    BEDROCK_ENDPOINT_MANTLE: "https://bedrock-mantle.{region}.api.aws/openai/v1",
+}
+"""Base URL per endpoint. The keys ARE the closed vocabulary of
+BEDROCK_ENDPOINT -- one declaration rather than a tuple beside a dict that can
+disagree with it."""
+
+BEDROCK_ENDPOINT = BEDROCK_ENDPOINT_RUNTIME
+"""Which of the two endpoints to call. Values: BEDROCK_BASE_URL_TEMPLATES keys."""
+
+BEDROCK_REGION = "us-east-1"
+"""The AWS Region in the base URL. NOT gated by the resume fingerprint -- see
+the note at `matching_wire_model()`."""
+
+BEDROCK_RUNTIME_PROFILE_PREFIXES = ("us.", "global.", "in.", "us-gov.")
+"""Cross-Region inference profile prefixes accepted on `bedrock-runtime`.
+
+A GPT-5.6 model named on that endpoint WITHOUT one of these is rejected: the
+model card's Programmatic Access table reads "Not supported" in the In-Region
+column for bedrock-runtime, and its note reads "This model is not available for
+in-Region inference on that endpoint." Checked locally by
+`validate_matching_provider_config()` so the failure names the constant to edit
+rather than arriving as a 400 from a request that has already been signed."""
+
+BEDROCK_MATCHING_MODEL = "us.openai.gpt-5.6-terra"
+"""The model id SENT when MATCHING_PROVIDER is "bedrock".
+
+`us.` is the geographic profile: it routes within the US geography, which is a
+data-residency property rather than a performance one. `global.` routes to any
+commercial Region and is ~10% cheaper per token (model card, Pricing). Both are
+priced in PRICING_CONFIG; whichever is set here is the key that will be looked
+up, because `inferences.matching_model` records the model that ANSWERED."""
+
+
+# --- Request-shape knobs that exist only for Bedrock ------------------------
+#
+# EVERY ONE OF THESE IS A ONE-LINE GO-LIVE EDIT, and that is why each is a
+# constant rather than a literal in the adapter. The Responses API translation
+# is built from documentation that no call has yet confirmed; the adapter's
+# VERIFY-AT-GO-LIVE list names the probe check behind each of them.
+
+BEDROCK_SYSTEM_ROLES = ("developer", "system")
+BEDROCK_SYSTEM_ROLE = "developer"
+"""Which role carries the Stage 5 system prompt in the Responses `input` array.
+
+THE CHAT CALL SENDS "system" AND THIS SENDS "developer", which is a real
+difference and is chosen rather than inherited. AWS's own GPT-5.6 Responses
+examples use `"role": "developer"` (prompt-caching.html, and the explicit
+prompt-caching blog post), and for the GPT-5 family `developer` is the
+successor of `system`. Set this to "system" if the probe shows the two are not
+equivalent for this prompt; it is one edit, which is the whole reason it is
+here."""
+
+BEDROCK_SERVICE_TIERS_ALLOWED = (None, "default")
+BEDROCK_SERVICE_TIER = None
+"""Service tier. None means OMIT the field, which is Standard.
+
+TERRA SUPPORTS STANDARD ONLY. The model card's Service Tiers table marks
+Priority, Flex and Reserved "not supported", and its pricing note reads
+"Pricing shown is for the Standard tier. Priority and Flex tiers are not
+supported for this model." So "priority" and "flex" are refused locally by
+`validate_matching_provider_config()` rather than sent and 400'd."""
+
+BEDROCK_STORE = False
+"""`store` on the Responses request. FALSE, and the default it overrides is TRUE.
+
+THIS IS A DATA-RETENTION DECISION AND IT IS NOT THE VENDOR DEFAULT. AWS:
+"When `store` is `true` (the default), Amazon Bedrock retains the response,
+including the input and output, for 30 days." The Stage 5 input is a rendered
+patient record -- conditions, medications, labs, stage, ECOG. Retaining that
+server-side for 30 days is a decision nobody in this project has made, and a
+default is not a decision. `store=False` costs nothing here: the only feature
+it disables is `previous_response_id` multi-turn chaining, and Stage 5 is
+single-turn by construction.
+
+Set it True only with an explicit retention argument written beside it."""
+
+BEDROCK_PROMPT_CACHE_KEY = None
+"""Optional `prompt_cache_key`. None means omit.
+
+CACHING IS DELIBERATELY LEFT AT THE VENDOR DEFAULT (implicit) FOR THE FIRST
+RUN. Implicit mode places an automatic breakpoint and costs nothing extra;
+explicit mode DISABLES the automatic breakpoint, so a mistake there means a
+run with no caching at all and a 90% discount silently not taken. The Stage 5
+prefix is already stable by construction (the packer's whole claim is that N
+requests share one prefix), so implicit mode should hit it. Measure with the
+probe, then turn on explicit mode if the numbers say so."""
+
+BEDROCK_PROMPT_CACHE_MODES = (None, "implicit", "explicit")
+BEDROCK_PROMPT_CACHE_MODE = None
+"""`prompt_cache_options.mode`. None means omit the whole object.
+
+Sent through `extra_body`, because the installed OpenAI SDK has no such
+parameter -- AWS's own example does the same."""
+
+BEDROCK_SEND_SEED_IN_EXTRA_BODY = False
+"""Whether to smuggle MATCHING_SEED into the Responses request via extra_body.
+
+FALSE, AND THE FLAG EXISTS SO THE ANSWER IS ONE EDIT RATHER THAN A GUESS. The
+Responses API has no `seed` parameter: it is absent from the installed OpenAI
+SDK's `responses.create` signature (openai 1.99.9, measured) while present on
+`chat.completions.create`. Sending it anyway through extra_body is a bet that
+Bedrock ignores an unknown field rather than rejecting the request with a 400 --
+and a 400 here fails EVERY Stage 5 call of the run. So the default is to drop
+it, RECORD the drop (bedrock_adapter.BEDROCK_ADAPTER_DEGRADATIONS carries
+`seed_not_expressible`, which reaches the run-end degradation report), and let
+the go-live probe settle it."""
+
+
+def validate_matching_provider_config():
+    """Refuse a provider configuration that cannot work, naming the constant.
+
+    Pure, cheap, and called at the TOP of every Bedrock request rather than at
+    import: this module promises that importing it resolves nothing, and a
+    validation that ran at import would need the provider decided before the
+    file finished loading.
+
+    Raises:
+        RuntimeError: naming the constant to edit and the documented rule it
+            violates. RuntimeError rather than ValueError, on the
+            `UnknownModelPricingError` / `IndexVerificationError` /
+            `CrossEncoderLimitMismatchError` precedent -- a stray
+            ``except ValueError`` around a model call must not eat it.
+    """
+    if MATCHING_PROVIDER not in MATCHING_PROVIDERS:
+        raise RuntimeError(
+            f"MATCHING_PROVIDER is {MATCHING_PROVIDER!r}, which is not a "
+            f"provider this pipeline knows. Accepted: "
+            f"{', '.join(MATCHING_PROVIDERS)}. Edit MATCHING_PROVIDER in "
+            f"oncotriage/config.py.")
+
+    if MATCHING_PROVIDER != MATCHING_PROVIDER_BEDROCK:
+        return
+
+    if BEDROCK_ENDPOINT not in BEDROCK_BASE_URL_TEMPLATES:
+        raise RuntimeError(
+            f"BEDROCK_ENDPOINT is {BEDROCK_ENDPOINT!r}. Accepted: "
+            f"{', '.join(sorted(BEDROCK_BASE_URL_TEMPLATES))}. Edit "
+            f"BEDROCK_ENDPOINT in oncotriage/config.py.")
+
+    if not BEDROCK_REGION or not str(BEDROCK_REGION).strip():
+        raise RuntimeError(
+            "BEDROCK_REGION is empty. It is interpolated into "
+            "BEDROCK_BASE_URL_TEMPLATES and an empty value produces a URL "
+            "that resolves nowhere. Edit BEDROCK_REGION in "
+            "oncotriage/config.py.")
+
+    if not BEDROCK_MATCHING_MODEL or not str(BEDROCK_MATCHING_MODEL).strip():
+        raise RuntimeError(
+            "BEDROCK_MATCHING_MODEL is empty. Edit it in "
+            "oncotriage/config.py.")
+
+    if BEDROCK_ENDPOINT == BEDROCK_ENDPOINT_RUNTIME and not any(
+            BEDROCK_MATCHING_MODEL.startswith(p)
+            for p in BEDROCK_RUNTIME_PROFILE_PREFIXES):
+        raise RuntimeError(
+            f"BEDROCK_MATCHING_MODEL is {BEDROCK_MATCHING_MODEL!r}, which "
+            f"names no cross-Region inference profile, and BEDROCK_ENDPOINT "
+            f"is {BEDROCK_ENDPOINT_RUNTIME!r}. The GPT-5.6 models are not "
+            f"available for in-Region inference on that endpoint: the request "
+            f"would be rejected. Prefix it with one of "
+            f"{', '.join(BEDROCK_RUNTIME_PROFILE_PREFIXES)} (for example "
+            f"'us.{BEDROCK_MATCHING_MODEL}'), or set BEDROCK_ENDPOINT to "
+            f"{BEDROCK_ENDPOINT_MANTLE!r}, where the bare model id is correct.")
+
+    if BEDROCK_SERVICE_TIER not in BEDROCK_SERVICE_TIERS_ALLOWED:
+        raise RuntimeError(
+            f"BEDROCK_SERVICE_TIER is {BEDROCK_SERVICE_TIER!r}. gpt-5.6-terra "
+            f"supports the Standard tier only -- Priority, Flex and Reserved "
+            f"are marked not supported on its model card. Accepted here: "
+            f"{BEDROCK_SERVICE_TIERS_ALLOWED} (None omits the field, which IS "
+            f"Standard). Edit BEDROCK_SERVICE_TIER in oncotriage/config.py.")
+
+    if BEDROCK_SYSTEM_ROLE not in BEDROCK_SYSTEM_ROLES:
+        raise RuntimeError(
+            f"BEDROCK_SYSTEM_ROLE is {BEDROCK_SYSTEM_ROLE!r}. Accepted: "
+            f"{', '.join(BEDROCK_SYSTEM_ROLES)}. Edit it in "
+            f"oncotriage/config.py.")
+
+    if BEDROCK_PROMPT_CACHE_MODE not in BEDROCK_PROMPT_CACHE_MODES:
+        raise RuntimeError(
+            f"BEDROCK_PROMPT_CACHE_MODE is {BEDROCK_PROMPT_CACHE_MODE!r}. "
+            f"Accepted: {BEDROCK_PROMPT_CACHE_MODES} (None omits the object). "
+            f"Edit it in oncotriage/config.py.")
+
+
+def matching_wire_model():
+    """The model id Stage 5 will actually SEND, for the configured provider.
+
+    THE ONE FUNCTION THAT ANSWERS THAT QUESTION, and it is what
+    `oncotriage/run_fingerprint.py` stamps as `matching_model_configured`.
+
+    WHY THE FINGERPRINT READS THIS RATHER THAN `MATCHING_MODEL`. That field is
+    GATED: a resume whose value differs refuses. `MATCHING_MODEL` does not move
+    when the provider flips -- it is the priced identity of the judge and
+    "gpt-5.6-terra" is the same judge on either provider -- so a checkpoint
+    written against OpenAI would have been resumed against Bedrock with the gate
+    answering FP_MATCH, and one artifact would hold two providers' rows with
+    nothing in it saying so. Reading the WIRE id closes that with no
+    FINGERPRINT_VERSION bump and therefore no blast radius: with the flag off
+    this returns `MATCHING_MODEL` exactly, so every v2 stamp already on disk
+    still matches.
+
+    WHAT IS STILL NOT GATED, stated rather than glossed: BEDROCK_ENDPOINT and
+    BEDROCK_REGION. Two runs against `us.openai.gpt-5.6-terra` in different
+    Regions, or one against mantle and one against runtime with the same model
+    id, are indistinguishable to the resume gate. Closing that means a seventh
+    gated field and a FINGERPRINT_VERSION bump, whose cost is that every
+    v2-stamped artifact refuses once. Recorded as a follow-up rather than taken
+    here.
+
+    Raises:
+        RuntimeError: through `validate_matching_provider_config()`, on an
+            unrecognised provider. Never returns a default for one.
+    """
+    if MATCHING_PROVIDER == MATCHING_PROVIDER_BEDROCK:
+        return BEDROCK_MATCHING_MODEL
+    if MATCHING_PROVIDER == MATCHING_PROVIDER_OPENAI:
+        return MATCHING_MODEL
+    validate_matching_provider_config()          # raises, naming the constant
+    raise RuntimeError(                          # unreachable; belt and braces
+        f"MATCHING_PROVIDER is {MATCHING_PROVIDER!r}")
+
+
+def get_bedrock_api_key():
+    """The Bedrock API key, from the settings tiers. Raises when absent.
+
+    Two tiers, first match wins, reported by SOURCE and never by value:
+    ONCOTRIAGE_BEDROCK_API_KEY, then AWS's own AWS_BEARER_TOKEN_BEDROCK. See
+    `oncotriage/settings.py:resolve_bedrock_api_key` for why the second is
+    read at all and why it loses.
+
+    Raises:
+        RuntimeError: naming both variables and the console page that mints a
+            key. Deliberately not a silent empty string: an empty api_key sends
+            `Authorization: Bearer ` and gets a 401 that names nothing.
+    """
+    key, source = settings.resolve_bedrock_api_key()
+    if key is None:
+        raise RuntimeError(
+            f"MATCHING_PROVIDER is {MATCHING_PROVIDER_BEDROCK!r} but no "
+            f"Bedrock API key is set.\n"
+            f"  Set {settings.ENV_BEDROCK_API_KEY} (this project's name, which "
+            f"wins) or {settings.ENV_AWS_BEARER_TOKEN_BEDROCK} (AWS's own).\n"
+            f"  Mint one in the Bedrock console under 'API keys'. A short-term "
+            f"key lasts at most 12 hours.")
+    return key, source
+
+
+def get_bedrock_base_url():
+    """The base URL for the configured endpoint and Region. Pure."""
+    return BEDROCK_BASE_URL_TEMPLATES[BEDROCK_ENDPOINT].format(
+        region=BEDROCK_REGION)
+
+
+def get_bedrock_client() -> OpenAI:
+    """The one Bedrock client this process uses. Built on first call, cached.
+
+    `get_openai_client()`'s precedent in every respect that matters, and the
+    three arguments it carries are inherited rather than re-decided:
+
+      max_retries   OPENAI_SDK_MAX_RETRIES, the TRANSPORT budget. The same
+                    number for the same reason -- anything that fails twice in
+                    a row is not transient. Note it is what makes a Bedrock 429
+                    or 5xx retried in-SDK exactly as an OpenAI one is.
+      timeout       get_matching_request_timeout(), the STRUCTURED httpx
+                    Timeout. A bare float here would flatten the connect phase
+                    from the SDK's 5 seconds to 300, which is the regression
+                    _structured_timeout() exists to prevent; an unreachable
+                    Bedrock endpoint must fail in seconds.
+      api_key       the settings-tier key. Sent as `Authorization: Bearer`,
+                    which is exactly what Bedrock's OpenAI-compatible surface
+                    accepts.
+
+    NOT RESETTABLE, and not resolved at import -- both for the reasons written
+    above the cache globals.
+
+    Constructing this opens no socket. Reaching it at all is gated on
+    MATCHING_PROVIDER: with the flag off nothing in the package calls it.
+    """
+    global _BEDROCK_CLIENT_CACHE
+    if _BEDROCK_CLIENT_CACHE is None:
+        # REFUSES WHILE THE FLAG IS OFF, and that is a guarantee rather than a
+        # tidiness. "With MATCHING_PROVIDER = 'openai' no Bedrock client is
+        # constructed and no Bedrock credential is resolved" is otherwise a
+        # property of the CALL GRAPH -- true today because
+        # `evaluation.call_matching_model` dispatches above the call, and
+        # untrue the moment anything else reaches this function. Here it is a
+        # property of the function, so no future caller can break it silently.
+        if MATCHING_PROVIDER != MATCHING_PROVIDER_BEDROCK:
+            raise RuntimeError(
+                f"get_bedrock_client() was called while MATCHING_PROVIDER is "
+                f"{MATCHING_PROVIDER!r}. Building this client resolves a "
+                f"Bedrock credential and opens a second endpoint, and nothing "
+                f"in the pipeline should reach it unless Stage 5 is configured "
+                f"to use it. Set MATCHING_PROVIDER to "
+                f"{MATCHING_PROVIDER_BEDROCK!r} in oncotriage/config.py, or "
+                f"install a stand-in through "
+                f"oncotriage.agent.deps.set_override(deps.BEDROCK_CLIENT, ...) "
+                f"if this is a test.")
+        validate_matching_provider_config()
+        key, source = get_bedrock_api_key()
+        base_url = get_bedrock_base_url()
+        console.out(f"🔐 Bedrock endpoint: {base_url}")
+        console.out(f"🔐 Bedrock API key from: {source}")
+        _BEDROCK_CLIENT_CACHE = OpenAI(api_key=key,
+                                       base_url=base_url,
+                                       max_retries=OPENAI_SDK_MAX_RETRIES,
+                                       timeout=get_matching_request_timeout())
+    return _BEDROCK_CLIENT_CACHE
 
 # Wall-clock ceiling on ONE Stage 5 request, in seconds.
 #
@@ -1620,6 +2000,55 @@ PRICING_CONFIG = {
         # token input. Both would need adding if MAX_TRIALS_FOR_EVALUATION grew
         # by ~15x or prompt caching were turned on.
         "gpt-5.6-terra": {
+            "input": 2.00,
+            "output": 12.00
+        },
+        # ---- The same judge, served by Amazon Bedrock (MATCHING_PROVIDER) ---
+        #
+        # THREE KEYS BECAUSE THE WIRE MODEL ID IS THE PRICING KEY, and it is
+        # the wire id that reaches here: inferences.matching_model records the
+        # model that ANSWERED, read off the response, and get_model_cost() is
+        # called with that value. So a Bedrock run prices against whichever of
+        # these its BEDROCK_MATCHING_MODEL named. An id absent from this table
+        # raises UnknownModelPricingError before a row is written, which is the
+        # loud failure this project requires of an unpriced model -- it is not
+        # a defect to be worked around by adding a fallback.
+        #
+        # RATES READ 2026-08-21 from the GPT-5.6 Terra model card
+        # (docs.aws.amazon.com/bedrock/latest/userguide/
+        #  model-card-openai-gpt-56-terra.html), Pricing section, per 1M tokens,
+        # STANDARD tier -- the only tier this model supports. The card lists two
+        # context-window bands and TWO ROUTING OPTIONS, and the choice of row is
+        # argued rather than assumed:
+        #
+        #   * SHORT CONTEXT (272K) is what applies. A 15-trial Stage 5 prompt
+        #     runs ~20k input tokens; MATCHING_INPUT_TOKEN_BUDGET is the packer's
+        #     ceiling and is far below 272,000. The Long Context (1M) band --
+        #     $4.40/$19.80 in-Region, $4.00/$18.00 global -- would apply to a
+        #     request over the 272K threshold and IS NOT MODELLED, exactly as
+        #     the note above records OpenAI's own 272K cliff not being modelled.
+        #   * IN-REGION and GEO CRIS are the same price ($2.20/$13.20); GLOBAL
+        #     CRIS is ~10% cheaper ($2.00/$12.00) because it may route anywhere.
+        #
+        # NOT MODELLED, for the same reason as the OpenAI row above: cache
+        # reads bill at $0.22/1M (geo) and cache WRITES at 1.25x input, and
+        # get_model_cost() takes an {input, output} pair with no cached term.
+        # Turning explicit prompt caching on (BEDROCK_PROMPT_CACHE_MODE) makes
+        # estimated_cost_usd an OVER-estimate rather than a wrong number, which
+        # is the safe direction, but it stops being exact.
+        #
+        # bedrock-mantle, in-Region: the bare model id.
+        "openai.gpt-5.6-terra": {
+            "input": 2.20,
+            "output": 13.20
+        },
+        # bedrock-runtime, geographic cross-Region profile.
+        "us.openai.gpt-5.6-terra": {
+            "input": 2.20,
+            "output": 13.20
+        },
+        # bedrock-runtime, global cross-Region profile.
+        "global.openai.gpt-5.6-terra": {
             "input": 2.00,
             "output": 12.00
         },

@@ -577,6 +577,36 @@ def _resolve_collection():
     return name, probe["points"]
 
 
+def _wire_model() -> str:
+    """``config.matching_wire_model()``, degraded to UNKNOWN rather than raised.
+
+    THIS MODULE'S CONTRACT IS THAT ``current()`` NEVER RAISES -- its own
+    docstring says so, and both consumers call it from a ``main()`` that is
+    about to spend money, where an exception out of the STAMP would abort a run
+    the stamp exists to describe. ``matching_wire_model()`` raises on an
+    unrecognised ``MATCHING_PROVIDER``, which is right at the call site that is
+    about to build a request and wrong here.
+
+    An UNKNOWN in a gated field makes the stamp UNRESOLVED, so ``compare()``
+    answers FP_UNRESOLVED -- "this run's own configuration did not establish"
+    -- which is the outcome that already exists for exactly this situation and
+    the one that does NOT send an operator to clear a perfectly good
+    checkpoint. The reason is counted, keyed by exception type, on the pattern
+    the collection resolvers two functions up already use.
+    """
+    try:
+        return config.matching_wire_model()
+    except Exception as exc:                                   # noqa: BLE001
+        FINGERPRINT_DEGRADATIONS[
+            f"matching_model_configured:{type(exc).__name__}"] += 1
+        log.warning("the configured matching provider did not resolve to a "
+                    "model id; the run fingerprint records it as unknown",
+                    event="fingerprint_wire_model_unresolved",
+                    error_type=type(exc).__name__, error_message=str(exc),
+                    degraded=True)
+        return UNKNOWN
+
+
 def current(refresh: bool = False) -> dict:
     """This run's configuration stamp. Resolved once per process, then cached.
 
@@ -599,7 +629,30 @@ def current(refresh: bool = False) -> dict:
                 "fingerprint_version": FINGERPRINT_VERSION,
                 "llm_classifier_prompt_version": PROMPT_VERSION,
                 "llm_classifier_renderer_digest": renderer_digest(),
-                "matching_model_configured": config.MATCHING_MODEL,
+                # THE WIRE MODEL, NOT `MATCHING_MODEL`, AND WITH THE PROVIDER
+                # FLAG AT ITS DEFAULT THE TWO ARE THE SAME STRING -- so every
+                # v2 stamp already on disk still matches and no
+                # FINGERPRINT_VERSION bump is owed.
+                #
+                # WHAT IT CLOSES. This field is GATED, and `MATCHING_MODEL`
+                # does NOT move when MATCHING_PROVIDER flips: it is the priced
+                # identity of the judge, and "gpt-5.6-terra" is the same judge
+                # on either provider. So a checkpoint written against OpenAI
+                # would have been resumed against Bedrock with this gate
+                # answering FP_MATCH, and one artifact would hold two
+                # providers' rows -- different endpoint, different request
+                # form, and no `seed` on the Responses side -- with nothing in
+                # it saying so. The wire id differs by construction
+                # ("gpt-5.6-terra" against "us.openai.gpt-5.6-terra"), so the
+                # flip now reads as FP_CHANGED naming this field.
+                #
+                # WHAT IS STILL NOT GATED: BEDROCK_ENDPOINT and BEDROCK_REGION.
+                # Same profile id in two Regions, or mantle against runtime
+                # with the same id, are indistinguishable here. Closing that
+                # needs a seventh gated field and a FINGERPRINT_VERSION bump,
+                # whose cost is that every v2-stamped artifact refuses once --
+                # recorded as a follow-up rather than taken silently.
+                "matching_model_configured": _wire_model(),
                 "qdrant_collection": name,
                 "collection_points": points,
                 "data_snapshot_date": config.DATA_SNAPSHOT_DATE,

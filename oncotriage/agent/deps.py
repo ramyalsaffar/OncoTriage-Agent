@@ -104,6 +104,12 @@ to replay unless it fails.
 WHAT IS OVERRIDABLE, and why each one is on the list
 ----------------------------------------------------
     OPENAI_CLIENT      Stage 2's embedding call and Stage 5's chat call.
+    BEDROCK_CLIENT     Stage 5's Responses call when MATCHING_PROVIDER is
+                       "bedrock". A SEPARATE key from OPENAI_CLIENT because
+                       both are live in that configuration -- Stage 2 still
+                       embeds through OpenAI -- so one key could not redirect
+                       the judge without also redirecting the embeddings.
+                       Unreachable with the flag at its default.
     QDRANT_CLIENT      every retrieval query and both scroll paths.
     BM25_QUERY_MODEL   the FastEmbed sparse query encoder. As of pass 3a its
                        default is NOT built here — it comes from
@@ -196,6 +202,7 @@ log = get_logger(__name__)
 # rejects any key not in OVERRIDE_KEYS.
 
 OPENAI_CLIENT = "openai_client"
+BEDROCK_CLIENT = "bedrock_client"
 QDRANT_CLIENT = "qdrant_client"
 BM25_QUERY_MODEL = "bm25_query_model"
 MEDCPT_TOKENIZER = "medcpt_tokenizer"
@@ -207,6 +214,7 @@ MESH_FILTER = "mesh_filter"
 
 OVERRIDE_KEYS = (
     OPENAI_CLIENT,
+    BEDROCK_CLIENT,
     QDRANT_CLIENT,
     BM25_QUERY_MODEL,
     MEDCPT_TOKENIZER,
@@ -882,6 +890,27 @@ def _build_bm25_query_model():
 def get_openai_client():
     """The OpenAI client Stage 2's embedding and Stage 5's chat call use."""
     return _resolve(OPENAI_CLIENT, config.get_openai_client)
+
+
+def get_bedrock_client():
+    """The Amazon Bedrock client Stage 5 uses when MATCHING_PROVIDER is bedrock.
+
+    A SECOND CLIENT RATHER THAN A REDIRECT OF THE FIRST, and the reason is the
+    same one that gave `MEDCPT_SCORER` its own key: the two are reachable at
+    once. `get_openai_client()` still serves Stage 2's embedding call whichever
+    provider Stage 5 uses -- there is no Bedrock embedding path here -- so a
+    run under MATCHING_PROVIDER="bedrock" holds BOTH clients, pointed at
+    different hosts with different credentials. Overloading OPENAI_CLIENT would
+    mean a harness that stubbed Stage 5's judge silently stubbed Stage 2's
+    embeddings too, and the object identity assertions both fixture harnesses
+    make would stop distinguishing them.
+
+    NOT REACHED AT ALL WITH THE FLAG OFF. `oncotriage/agent/evaluation.py`
+    dispatches on `config.MATCHING_PROVIDER` above the call, so under the
+    default no factory here runs, no client is constructed and no Bedrock
+    credential is resolved.
+    """
+    return _resolve(BEDROCK_CLIENT, config.get_bedrock_client)
 
 
 def get_qdrant_client():

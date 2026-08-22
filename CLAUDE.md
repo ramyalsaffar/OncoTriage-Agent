@@ -158,7 +158,8 @@ Verified rather than assumed. It is the same object as
 | `oncotriage/agent/mesh_expansion.py` | Stage 1's MeSH walk | `registries.mesh` |
 | `oncotriage/agent/retrieval.py` | Stages 1–3 + `build_bm25_index_from_qdrant` | `agent.{deps,models,mesh_expansion,patient,state,text}`, `config`, `registries.mesh`, `utils` |
 | `oncotriage/agent/filtering.py` | Stage 4 | `agent.{deps,retrieval,state}`, `config`, `extraction.*` |
-| `oncotriage/agent/evaluation.py` | Stage 5 | `agent.{deps,patient,state}`, `config`, `utils` |
+| `oncotriage/agent/evaluation.py` | Stage 5 | `agent.{bedrock_adapter,deps,patient,state}`, `config`, `utils` |
+| `oncotriage/agent/bedrock_adapter.py` | Stage 5's Amazon Bedrock translation, behind `config.MATCHING_PROVIDER` (OFF) — the Responses-API request, the ChatCompletion-shaped reply, the error taxonomy, the VERIFY-AT-GO-LIVE list | `config`, `agent.{deps,response_schema}`, `observability` |
 | `oncotriage/agent/terminal.py` | the three terminal nodes + `_pipeline_provenance` | `agent.state`, `registries.primary_cancer`, `utils` |
 | `oncotriage/agent/graph.py` | `build_matching_graph`, `match_patient_to_trials` | every stage module |
 | `oncotriage/agent/display.py` | console rendering | `config` |
@@ -476,7 +477,7 @@ python tests/test_extraction_stage_non_oncology_guard.py            #  80
 # spend -- every model response is a literal served by a stub installed through
 # oncotriage/agent/deps.py -- no git history, no corpus, and NOT in the
 # collision matrix. ~25 s.
-python tests/test_agent_trial_verdict_normalization.py              # 161
+python tests/test_agent_trial_verdict_normalization.py              # 165 (this line said 161 and was stale by 4; MEASURED 2026-08-21)
 
 # The emission-provenance pass. Same shape, same directory. No network, no keys,
 # no spend, no git history, no corpus, and NOT in the collision matrix -- every
@@ -485,7 +486,7 @@ python tests/test_agent_trial_verdict_normalization.py              # 161
 # compared at the end, and every database write goes to a scratch file in a temp
 # directory that is asserted to differ from the production path, and removed at
 # the end. ~1 s.
-python tests/test_agent_emission_provenance.py                      # 162
+python tests/test_agent_emission_provenance.py                      # 184 (this line said 162 and was stale by 22; MEASURED 2026-08-21)
 
 # The write-durability pass. Same shape, same directory. No network, no keys,
 # no spend, no git history, no corpus, NOT in the collision matrix, and it execs
@@ -582,6 +583,25 @@ python tests/test_harness_endpoint_budget.py                        #  38
 # two writers. It EXECS NOTHING -- the five plants are `ast` walks over
 # in-memory copies -- so it needs no _EXEC_ALLOWLIST entry. ~1.0 s.
 python tests/test_evaluation_sample_naming.py                       #  72
+
+# The Bedrock-adapter pass. Same shape, same directory. NO AWS CALL AND NO
+# BILLED CALL OF ANY KIND -- every client is a stand-in installed through
+# oncotriage/agent/deps.py and every model response is a literal dict. No
+# network (run_fingerprint.current() is deliberately NOT called: it probes the
+# index over the wire), no keys, no spend, no live Qdrant, no model load, no
+# corpus, no git history. NOT in the collision matrix -- it writes only inside
+# a tempfile.mkdtemp it removes and asserts gone. It DOES exec: nine in-memory
+# copies of oncotriage/agent/bedrock_adapter.py, one mapping broken in each,
+# argued at _EXEC_ALLOWLIST (the module is new, so `git show` has no revision
+# carrying a version with one mapping missing). ~2 s.
+python tests/test_agent_bedrock_adapter.py                          # 273
+
+# The Bedrock go-live probe. NOT a test, NOT in tests/, NOT in any bucket, and
+# it REFUSES to do anything without its flag (exit 2, nothing called, nothing
+# billed). It is day one's first command.
+python bedrock_probe.py                                  # prints the refusal, exit 2
+python bedrock_probe.py --i-understand-this-bills        # COSTS MONEY: 2 live calls
+python bedrock_probe.py --i-understand-this-bills --probe-seed   # + 1 more
 
 # Fixture state, CURRENT rather than as of any pass below: SCHEMA_VERSION
 # is 8, the twelve recordings on disk are v8, and `python fixture_replay.py`
@@ -5232,6 +5252,175 @@ cache with `HF_HUB_OFFLINE=1` (no download): the tokenizer half reports
 `undeclared` and counts, the weights half reports **`verified`**, and
 `score_pairs` returns `[8.8584, -15.9533]` for a relevant and an irrelevant
 trial. The production `inferences.db` sha256 is unchanged.
+
+### Stage 5 can be served by Amazon Bedrock, and the flag is OFF (the Bedrock pass)
+
+**NOTHING IN THIS PASS RUNS.** `config.MATCHING_PROVIDER` is `"openai"`, and
+under that default `oncotriage/agent/evaluation.py:call_matching_model` costs
+two string comparisons and issues the byte-identical request it always did:
+same client object, same seven kwargs, same values. **No AWS call and no billed
+call of any kind was made building it** — every verification is stubs, literal
+response dicts and the twelve recorded fixtures, which replay **12/12 clean
+without recapture** before and after.
+
+**THE ADAPTER IS `oncotriage/agent/bedrock_adapter.py` AND ITS DOCSTRING IS THE
+SPEC.** Every field of the Stage 5 request is mapped explicitly with the AWS
+page it was read from (2026-08-21), and the mapping is pinned field by field by
+`tests/test_agent_bedrock_adapter.py`.
+
+**THE RESPONSES API IS THE PRIMARY FORM, and the reason is measured rather than
+stylistic.** Bedrock serves Chat Completions on both endpoints, so a literal
+translation would have been no translation at all — and it is the wrong target
+twice over. **Prompt caching for this model is Responses-only**: the GPT-5.6
+Terra model card lists "Prompt caching (Responses API only)" under what
+`bedrock-runtime` supports, and the prompt-caching page opens "OpenAI models on
+Amazon Bedrock support prompt caching through the Responses API". Stage 5's
+whole packing design rests on N requests sharing one prefix, so the API that
+cannot cache that prefix throws away a 90% input discount. And Responses is the
+one shape both endpoints agree on, which matters because **which endpoint the
+quota lands on is not yet known** — so `BEDROCK_ENDPOINT` is configuration.
+
+| chat today | Responses, when the flag is on |
+|---|---|
+| `model=MATCHING_MODEL` | `model=config.matching_wire_model()` — a cross-Region profile (`us.openai.gpt-5.6-terra`) on `bedrock-runtime`, the bare id on `bedrock-mantle` |
+| `messages=[system, user]` | `input=[{"type":"message","role":BEDROCK_SYSTEM_ROLE,"content":[{"type":"input_text",...}]}, ...]` — **an input item, not `instructions=`**, because every documented cache breakpoint hangs off an `input_text` block |
+| `max_completion_tokens` | `max_output_tokens`, value unchanged |
+| `reasoning_effort` | `reasoning={"effort": ...}` |
+| `seed` | **DROPPED, COUNTED, LOGGED** — there is no `seed` on the Responses API |
+| `response_format={"type":...,"json_schema":{name,strict,schema}}` | `text={"format":{"type":...,name,strict,schema}}` — flattened, and the schema is **unwrapped from the chat builder rather than rebuilt** |
+| `temperature` | still not sent |
+| — | `store=False`, **overriding the vendor default of `True`** |
+
+**`seed` IS THE ONE THING THE RESPONSES API CANNOT EXPRESS, and it is measured
+rather than inferred**: absent from the installed SDK's `responses.create`
+signature, present on `chat.completions.create` (openai 1.99.9). The drop lands
+in `BEDROCK_ADAPTER_DEGRADATIONS["seed_not_expressible"]`, which is the
+twenty-first counter in `oncotriage/degradation.py`'s run-end registry, plus one
+WARNING per process. Config already recorded that the seed is "best-effort
+only" and that the model returns no `system_fingerprint`, so Stage 5 was already
+only best-effort reproducible — this widens it, and it is why k=3 agreement
+across a provider flip cannot be read as a pure provider difference.
+`BEDROCK_SEND_SEED_IN_EXTRA_BODY` turns it back on in one edit once the probe
+says the field is tolerated; it defaults False because a 400 on an unknown field
+fails **every** Stage 5 call of a run.
+
+**`store=False` IS A DATA-RETENTION DECISION, NOT A DEFAULT.** AWS: "When
+`store` is `true` (the default), Amazon Bedrock retains the response, including
+the input and output, for 30 days." The Stage 5 input is a rendered patient
+record. A default is not a decision, so the field is sent explicitly.
+
+**THE MODEL ECHO IS NOT REWRITTEN.** It would have been one line to present
+`MATCHING_MODEL` as the echo and keep `MatchingModelMismatchError` quiet, and it
+would have made every stored row name a model that did not serve it — the exact
+misattribution that check exists to prevent, pointed the other way. Instead
+`evaluation.py` compares the echo against **`config.matching_wire_model()`**,
+which returns `MATCHING_MODEL` exactly when the flag is off, and
+`inferences.matching_model` stores what answered. `PRICING_CONFIG` therefore
+gained rows for the three Bedrock wire ids, quoted from the model card's
+**Standard tier, short-context (272K)** band with the routing option named per
+row; an id absent from it raises `UnknownModelPricingError` before a row is
+written, which is the loud failure this project requires of an unpriced model.
+
+**`inferences.matching_provider` IS THE PROVENANCE COLUMN**, `"openai"` or
+`"bedrock"`, **read live off `config` at INSERT time** rather than from the
+result dict — which is what makes it unconditional: it lands on the
+no-candidates rows, the error-handler rows and the Stage 5 failure returns
+alike. A plain TEXT column on `matching_model`'s and `ecog_selection`'s
+precedent; at the Postgres migration it becomes TEXT with a CHECK constraint.
+**NULL means the row predates the column, and such a row is provably OpenAI.
+Nothing is backfilled.**
+
+**A `from oncotriage.config import MATCHING_PROVIDER` WAS THE FIRST DRAFT AND IT
+WAS A DEFECT** — a from-import BINDS the value at import, so flipping
+`config.MATCHING_PROVIDER` in a process (the probe does; a test does) reached
+nothing and every row recorded the value the process started with. Caught by
+running, not by reading. It is `_config.MATCHING_PROVIDER` now, and
+`oncotriage/fixtures/capture.py`'s tunable entry is the same shape for the same
+reason. This is `tests/test_agent_rrf_config_ownership.py`'s patch-point lesson
+met again, one layer down.
+
+**THE RESUME FINGERPRINT NEEDED THE FLAG AND COST NO VERSION BUMP.**
+`matching_model_configured` is GATED, and `MATCHING_MODEL` does **not** move
+when the provider flips — it is the priced identity of the judge, and
+"gpt-5.6-terra" is the same judge on either provider — so a checkpoint written
+against OpenAI would have been resumed against Bedrock with the gate answering
+FP_MATCH, and one artifact would have held two providers' rows with nothing in
+it saying so. The field now reads `config.matching_wire_model()`, which returns
+`MATCHING_MODEL` byte-identically with the flag off, so **`FINGERPRINT_VERSION`
+stays at 2 and no v2-stamped artifact refuses**. The alternative — a seventh
+gated field and a bump — was rejected on that blast radius alone.
+**STILL NOT GATED, stated rather than glossed:** `BEDROCK_ENDPOINT` and
+`BEDROCK_REGION`. Same profile id in two Regions, or mantle against runtime with
+the same id, are indistinguishable to the gate. Closing that IS the bump, and it
+is a recorded follow-up.
+
+**THE SEAM IS A SECOND KEY, NOT A REDIRECT OF THE FIRST.** `deps.BEDROCK_CLIENT`
+joins the closed `OVERRIDE_KEYS`. It has to be separate: with the flag on, Stage
+2 still embeds through **OpenAI**, so both clients are live at once and one key
+could not redirect the judge without also redirecting the embeddings — and the
+identity assertions both fixture harnesses make would stop distinguishing them.
+
+**THE CREDENTIAL HAS TWO TIERS AND NEITHER IS IN THE .env.**
+`ONCOTRIAGE_BEDROCK_API_KEY` wins; AWS's own `AWS_BEARER_TOKEN_BEDROCK` is read
+second (it is set on purpose by an operator following AWS's getting-started
+page, unlike `QDRANT_URL`, which is the recorded ACCIDENT). Neither goes through
+`_from_env` — fifth victim of that helper's trailing separator, after the
+airflow password, the inferences DB, the degraded flag and the log level. The
+resolver reports the **source**, never the value. It is not a fourth line in
+`05- Keys/.env` because `load_env_keys()` validates that all three of its names
+are present, and a fourth would fail every process that has no Bedrock key.
+
+**`bedrock_probe.py` IS DAY ONE'S FIRST COMMAND AND IT REFUSES WITHOUT ITS
+FLAG** (`--i-understand-this-bills`; exit 2, nothing called, nothing billed).
+Not a prompt — a prompt is answered by somebody who has stopped reading. It
+forces the provider in its own process, prints the base URL, the key SOURCE, the
+whole usage block, `response.text` and `response.reasoning`, validates the
+output against the real Stage 5 schema with a self-contained walker, issues two
+identical calls to see whether the cache warms, and prices itself from
+PRICING_CONFIG.
+
+**TEN VERIFY-AT-GO-LIVE ITEMS ARE ENUMERATED IN THE ADAPTER'S DOCSTRING**, each
+naming the probe check that settles it and the edit if it differs. **The one to
+read first is (3): structured output.** Terra's model card lists "Structured
+outputs" under NOT SUPPORTED on `bedrock-runtime` — but that link points at
+`structured-output.html`, which is the Bedrock-NATIVE feature
+(`outputConfig.textFormat` on Converse, `output_config.format` / `response_
+format` on InvokeModel), whose own supported-API table names Converse,
+InvokeModel, cross-Region and batch inference and **does not mention the
+OpenAI-compatible Responses API at all** — and the same card lists Invoke as
+unsupported, which is consistent with the row being about the native feature. So
+the card does not settle it either way and **no AWS page states whether
+`text.format` is honoured on this surface.** The dangerous outcome is
+"accepted, no error, silently not enforced", which is why the probe checks the
+echo as well as the parse.
+
+**TWO OF THE BRIEF'S "VERIFIED FACTS" WERE WRONG AGAINST THE LIVE DOCS**, and
+both are recorded rather than quietly corrected: `bedrock-mantle` serves
+**Responses AND Chat Completions AND the Anthropic Messages API**, not Responses
+only; and its base URL is `/v1` on the general endpoint page while **the Terra
+model card carries an explicit footnote that this model is served at
+`/openai/v1/responses`** — the model card wins because it is the page about this
+model, and `BEDROCK_BASE_URL_TEMPLATES` uses `/openai/v1` for both endpoints
+with that argument written beside it. The 272K-vs-1M context claim is neither: it
+is Terra's two **pricing bands**, both real, and nothing here hardcodes a window.
+
+**THE FIXTURE HARNESSES DO NOT COVER BEDROCK, AND THEY NOW REFUSE RATHER THAN
+DISCOVERING IT AT THE BILL.** `capture.py`'s `OpenAIProxy` wraps
+`chat.completions.create` on the OPENAI seam. With the flag on, Stage 5 reaches
+`responses.create` on the BEDROCK seam — a method and a seam neither proxy
+covers — and the two outcomes are the two the seam exists to prevent: a CAPTURE
+that issues real billed calls, records none of them, and still passes
+`assert_hooks_reach_the_agent` (which asserts by identity on `OPENAI_CLIENT`,
+and that object IS the harness's); and a REPLAY that bypasses the OpenAI
+tripwire, sends all twelve fixtures' Stage 5 prompts to a live endpoint, is
+billed for every one, and prints that they replayed clean. Verbatim the pass
+20c-2c regression, reintroduced through a second provider.
+`capture.assert_provider_is_hookable()` is called at the top of BOTH
+`install_recording_hooks` and `install_replay_hooks`, before any client is
+touched, and raises `UnsupportedMatchingProviderError` naming the constant.
+**Teaching `OpenAIProxy` the Bedrock seam is the top-ranked follow-up** — it is
+a fixture-FORMAT question (the recorded request block is chat-shaped), not a
+one-line one, which is why this pass refuses instead of guessing.
 
 ## Persistence and observability
 

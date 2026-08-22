@@ -539,6 +539,14 @@ LOGGABLE_FIELDS = frozenset({
     "threshold",
 
     # --- model and cost ----------------------------------------------------
+    # WHICH PROVIDER SERVED THE CALL -- "openai" or "bedrock",
+    # config.MATCHING_PROVIDER's value and nothing else. It is infrastructure,
+    # the same kind of fact as `endpoint` above, and it cannot carry a patient,
+    # a trial or a diagnosis. It is a FIELD rather than message text because
+    # section 6c of tests/test_observability_logging.py forbids interpolating
+    # data into a message, and because a Bedrock degradation line is only
+    # actionable when the record says which provider produced it.
+    "provider",
     "model", "tokens_in", "tokens_out", "tokens_estimated", "tokens_actual",
     "finish_reason", "retry", "max_retries", "truncations", "cost_usd",
     "tokens_reasoning", "estimate_ratio", "calls",

@@ -67,6 +67,7 @@ the reader then reports zero forever.
 from collections import Counter
 from typing import Dict, List, Optional
 
+from oncotriage.agent import bedrock_adapter as _bedrock_adapter
 from oncotriage.agent import deps as _agent_deps
 from oncotriage.agent import evaluation as _agent_evaluation
 from oncotriage.agent import filtering as _agent_filtering
@@ -146,6 +147,15 @@ _REGISTRY_SPEC = (
      "dropped and reached no verdict"),
     ("REFUSALS_OBSERVED", _agent_evaluation.REFUSALS_OBSERVED,
      "the model DECLINED to answer; that patient ended at the error handler"),
+    ("BEDROCK_ADAPTER_DEGRADATIONS",
+     _bedrock_adapter.BEDROCK_ADAPTER_DEGRADATIONS,
+     "Stage 5 ran on Amazon Bedrock and the request or the response was not "
+     "what the adapter was built against -- a parameter that could not be "
+     "expressed (seed), a response shape that had to be interpreted, or an "
+     "error class the taxonomy does not name. Every key is a VERIFY-AT-GO-LIVE "
+     "item in oncotriage/agent/bedrock_adapter.py that did not hold. STAYS AT "
+     "ZERO WHILE MATCHING_PROVIDER IS 'openai', because nothing in that "
+     "configuration reaches the adapter at all"),
     ("INFERENCE_WRITE_RETRIES", _database_logger.INFERENCE_WRITE_RETRIES,
      "a database write was retried and survived; contention, not loss"),
     ("INFERENCE_WRITE_FAILURES", _database_logger.INFERENCE_WRITE_FAILURES,

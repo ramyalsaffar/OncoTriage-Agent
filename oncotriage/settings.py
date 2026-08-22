@@ -726,6 +726,86 @@ def resolve_log_level():
 #------------------------------------------------------------------------------
 
 
+ENV_BEDROCK_API_KEY = "ONCOTRIAGE_BEDROCK_API_KEY"
+"""Amazon Bedrock API key for the Stage 5 judge when MATCHING_PROVIDER is
+"bedrock".
+
+NOT A PATH, and a credential besides, so it is resolved by its own function
+below rather than by ``_from_env``: that helper runs every value through
+``with_trailing_sep``, and a bearer token with a slash appended authenticates
+nowhere while the server's 401 says nothing about a trailing separator. Fifth
+victim of that helper after ENV_AIRFLOW_PASSWORD, ENV_INFERENCES_DB,
+ENV_ALLOW_DEGRADED_REGISTRIES and ENV_LOG_LEVEL.
+
+WHY IT IS NOT A FOURTH LINE IN ``05- Keys/.env``. ``paths.load_env_keys()``
+reads exactly three names and validates that all three are present; a fourth
+would make every process that has no Bedrock key fail to start, including every
+process running the default OpenAI provider. The credential is therefore an
+environment variable, which is also what AWS's own documentation assumes -- see
+ENV_AWS_BEARER_TOKEN_BEDROCK below.
+
+A SHORT-TERM BEDROCK API KEY EXPIRES IN AT MOST 12 HOURS (AWS, "API keys",
+docs.aws.amazon.com/bedrock/latest/userguide/api-keys.html, read 2026-08-21),
+which is shorter than a full-corpus batch run. Nothing here refreshes it: the
+resolver is called once per process, on first client construction, exactly as
+the OpenAI key is. A run longer than the key's life fails mid-run with a 401
+naming the endpoint. The documented fix is either a long-term key or the
+``aws-bedrock-token-generator`` refresh loop, and wiring that in is a change to
+the client's auth path rather than to this resolver -- recorded in
+``oncotriage/agent/bedrock_adapter.py``'s VERIFY-AT-GO-LIVE list.
+"""
+
+ENV_AWS_BEARER_TOKEN_BEDROCK = "AWS_BEARER_TOKEN_BEDROCK"
+"""AWS's OWN documented variable for a Bedrock API key, consulted second.
+
+This is the one name in this module that is not project-prefixed, and that is
+deliberate rather than an oversight. Every other ``ONCOTRIAGE_*`` name exists
+because an unprefixed variable could be set by ACCIDENT -- ``QDRANT_URL`` is the
+recorded case, and ``paths.load_env_keys()`` pops it for that reason. This one
+is different in kind: ``AWS_BEARER_TOKEN_BEDROCK`` is set on purpose, by an
+operator following AWS's own getting-started page, and it names exactly the
+credential this project wants. Refusing to read it would mean an operator whose
+`aws` tooling already works has to copy the same secret into a second variable.
+
+IT LOSES TO THE PROJECT-PREFIXED NAME, on the ENV_QDRANT_URL precedent: a
+project-prefixed variable is a DECISION and beats a shared one. The resolver
+reports WHICH of the two answered, and no caller ever prints the value.
+"""
+
+
+def resolve_bedrock_api_key():
+    """Resolve the Bedrock API key from the environment. Two tiers, in order.
+
+    DELIBERATELY NOT ``_from_env`` -- see ENV_BEDROCK_API_KEY.
+
+    Returns:
+        ``(key, source)`` where source is ENV_BEDROCK_API_KEY or
+        ENV_AWS_BEARER_TOKEN_BEDROCK, or ``(None, None)`` when neither is set
+        to a non-empty value. The caller decides what to do with "not set":
+        unlike a path there is no fallback that could be right, so this
+        function does not invent one, and ``oncotriage.config`` raises naming
+        both variables.
+
+    Whitespace is stripped and a whitespace-only value counts as unset, for the
+    reason ``resolve_airflow_password`` records: ``export VAR=$(cat file)``
+    carries the file's trailing newline, and sending that newline to the auth
+    endpoint gets a 401 that names nothing.
+
+    NEVER RETURNS THE VALUE IN AN EXCEPTION MESSAGE OR A LOG LINE. Callers
+    print the SOURCE. AWS's own note is that API keys are passed as
+    authorization headers and are not logged by CloudTrail; this project must
+    not be the thing that logs them.
+    """
+    for var in (ENV_BEDROCK_API_KEY, ENV_AWS_BEARER_TOKEN_BEDROCK):
+        raw = os.environ.get(var)
+        if raw is not None and raw.strip() != "":
+            return raw.strip(), var
+    return None, None
+
+
+#------------------------------------------------------------------------------
+
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
