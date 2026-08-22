@@ -217,6 +217,32 @@ def _pipeline_provenance(state) -> Dict:
         # so None here means the detector did not run and File 14 stores NULL.
         "hallucinated_trials": state.get("hallucinated_trials"),
 
+        # --- What Stage 5's normalizer corrected, per run ------------------
+        #
+        # THE SAME NO-DEFAULT ROUTE, and for hallucinated_trials' reason rather
+        # than the truncation counters'. Both describe a CHECK: 0 asserts that
+        # the normalizer read every returned entry's trial-level label and every
+        # trial's criteria arrays and found nothing outside their vocabularies.
+        # A run that ended at node_no_candidates, at an API failure, at a
+        # refusal or at an unparseable answer never made that comparison, and
+        # writing 0 there would report a clean audit that was never performed.
+        #
+        # WHY THEY ARE HERE AT ALL, when both are derivable by joining
+        # trial_matches: a COUNT over the child table cannot distinguish
+        # "measured none" from "these rows predate the columns" from "no Stage 5
+        # ran". That is the same argument hallucinated_trials makes one line up,
+        # and it is why the per-row markers do not make these redundant.
+        #
+        # NOTE THE ASYMMETRY WITH cross_vocab_remaps, which is written a few
+        # lines away in every terminal result as `state.get(..., 0)` and as a
+        # literal 0 by node_no_candidates. That column therefore says "0 remaps"
+        # for a run whose normalizer never ran. It is a pre-existing defect of
+        # that column and it is NOT corrected here: narrowing an existing
+        # column's meaning is a behaviour change to every reader of it, and this
+        # pass promises none. These two are honest from their first row.
+        "verdict_normalizations": state.get("verdict_normalizations"),
+        "remapped_trials": state.get("remapped_trials"),
+
         # --- Which model answered, and what it spent thinking ---------------
         #
         # BOTH BELONG HERE RATHER THAN ON node_finalize. File 14 reads them on

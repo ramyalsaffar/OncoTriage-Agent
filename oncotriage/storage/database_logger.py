@@ -692,6 +692,56 @@ INFERENCE_COLUMN_ADDITIONS = {
     # and the whole reason this column exists is that a stored row should not
     # have to be dated to be interpreted.
     "matching_provider":                     "TEXT",
+    # --- What Stage 5's normalizer corrected, per run ----------------------
+    #
+    # THREE ARTIFACTS ARE PRODUCED BY THAT NORMALIZER AND UNTIL THIS PASS TWO OF
+    # THEM REACHED NO STORED BYTE. `not_evaluable_reason` was stamped on the
+    # entry and dropped at the trial_matches INSERT; `verdict_normalizations`
+    # was a local list read by one log line; `label_remaps` survived only as its
+    # own LENGTH, in `cross_vocab_remaps` beside these two.
+    #
+    # WHAT EACH OF THESE ANSWERS THAT cross_vocab_remaps CANNOT.
+    #
+    #   verdict_normalizations  How many trial-level verdicts the model wrote in
+    #                           a spelling outside TRIAL_VERDICTS -- boolean
+    #                           True, "Eligible", a null, a nested object. A
+    #                           DIFFERENT ARTIFACT from a criterion remap, not a
+    #                           subset of one: an entry counted here may have
+    #                           ended eligible, not_eligible or not_evaluable.
+    #                           The per-row breakdown is
+    #                           trial_matches.verdict_source /
+    #                           verdict_original_type, which is what the
+    #                           "from what original types" question groups by.
+    #
+    #   remapped_trials         How many TRIALS carried at least one criterion
+    #                           remap. cross_vocab_remaps counts remap EVENTS,
+    #                           so four remaps on one trial and one remap on
+    #                           each of four trials are the same number there
+    #                           and different findings here.
+    #
+    # NULL = STAGE 5's NORMALIZER DID NOT REPORT, 0 = IT REPORTED NONE, and the
+    # distinction is the whole reason these are stored rather than derived. Both
+    # are recoverable by joining trial_matches -- but a COUNT over a child table
+    # returns 0 for "measured none", for "these rows predate the columns" and
+    # for "no Stage 5 ran" alike. That is exactly the argument
+    # hallucinated_trials makes beside trial_matches.hallucinated, and this pass
+    # adopts it rather than inventing it.
+    #
+    # A PRE-EXISTING DEFECT IN THE NEIGHBOUR IS RECORDED AND NOT FIXED HERE.
+    # `cross_vocab_remaps` is written by _pipeline_provenance as
+    # `state.get(..., 0)` and as a literal 0 by node_no_candidates, so it reads
+    # 0 on runs whose normalizer never ran and its NULL population is only rows
+    # that predate it. Narrowing it now would change what an existing column
+    # means for every reader; these two are honest from their first row and the
+    # asymmetry is stated at both ends.
+    #
+    # PER-REASON AND PER-TYPE BREAKDOWNS ARE DELIBERATELY NOT STORED HERE. They
+    # are GROUP BYs over trial_matches, which is plain SQL over scalar columns;
+    # storing them would mean either a JSON blob (which no query can group on)
+    # or one column per constant (a schema that migrates whenever a reason is
+    # added).
+    "verdict_normalizations":                "INTEGER",
+    "remapped_trials":                       "INTEGER",
 }
 
 
@@ -763,18 +813,21 @@ TRIAL_MATCH_COLUMN_ADDITIONS = {
     # was built outside the pipeline. The first is separable from the other two
     # by the run's date; the second and third are not separable here.
     #
-    # THE SENTENCE THAT USED TO END THIS PARAGRAPH WAS FALSE AND IS DELETED. It
+    # THE SENTENCE THAT USED TO END THIS PARAGRAPH WAS FALSE AND WAS DELETED. It
     # said the second and third were told apart by "a not_evaluable_reason in
-    # criterion_details". `not_evaluable_reason` is a key of the in-memory
-    # evaluation dict and NOT a column of this table and NOT a member of
-    # criterion_details, which json.dumps exactly two keys, "inclusion" and
-    # "exclusion" -- see criterion_json at the INSERT below. Nothing has ever
-    # written it to this database. What DOES distinguish a pipeline-constructed
+    # criterion_details". `not_evaluable_reason` was a key of the in-memory
+    # evaluation dict and was NOT a column of this table and is still NOT a
+    # member of criterion_details, which json.dumps exactly two keys,
+    # "inclusion" and "exclusion" -- see criterion_json at the INSERT below.
+    # HALF OF THAT IS NOW OUT OF DATE AND IS CORRECTED RATHER THAN LEFT: it IS a
+    # column of this table as of the provenance pass, declared below, and it is
+    # still not in criterion_details. What distinguishes a pipeline-constructed
     # non-evaluation from a model-returned one is these two columns themselves,
     # in the opposite direction to the paragraph above: the constructed ones are
-    # the NULL population. A model-returned entry corrected to not_evaluable by
-    # Stage 5 (see UNEVALUABLE_REJECTION_UNSUPPORTED) carries real integers here
-    # and is recognisable in the `assessment` column by its composed text.
+    # the NULL population, and `verdict_source` below selects exactly the same
+    # population for the same reason, which is what lets a reader cross-check
+    # all three. A model-returned entry corrected to not_evaluable by Stage 5
+    # (see UNEVALUABLE_REJECTION_UNSUPPORTED) carries real integers here.
     #
     # 0 IS A REAL POSITION AND MUST NOT BE READ AS ABSENT. The first entry of
     # the first call carries emission_index 0, so every reader has to test
@@ -782,6 +835,149 @@ TRIAL_MATCH_COLUMN_ADDITIONS = {
     # columns already carry.
     "emission_index":          "INTEGER",
     "call_index":              "INTEGER",
+    # =======================================================================
+    # WHAT STAGE 5's NORMALIZER DID TO THIS TRIAL
+    # =======================================================================
+    #
+    # Five columns, one question each, all of them per patient-trial pair. Every
+    # value is stamped by oncotriage/agent/evaluation.py at the line where the
+    # correction is DECIDED, so the record and the behaviour cannot disagree,
+    # and none of the five can be forged by the model: the Stage 5 response
+    # schema is strict with `additionalProperties: false` and a complete
+    # `required` list, and no name below is in TRIAL_FIELDS or CRITERION_FIELDS.
+    #
+    # --- not_evaluable_reason ----------------------------------------------
+    #
+    # WHY THIS TRIAL WAS RECORDED AS NOT EVALUATED. It has existed on the
+    # in-memory entry since the reconciliation pass and was DROPPED HERE: the
+    # INSERT below named nineteen columns and none of them was it, and
+    # `criterion_details` json.dumps exactly "inclusion" and "exclusion". The
+    # field was present on the dict at the line that wrote the row. The
+    # paragraph above `emission_index` records that this column did not exist;
+    # it does now, and that paragraph's warning about what `criterion_details`
+    # does NOT contain still holds -- this is a column, not a JSON key.
+    #
+    # SIX VALUES ARE REACHABLE, in two families that a reader must not conflate:
+    #   CONSTRUCTED by the pipeline, the trial never having been answered --
+    #     'truncation_floor', 'truncation_split_budget_exhausted',
+    #     'omitted_from_model_response', 'conflicting_duplicate_answers'
+    #   CORRECTED from a rejection the model DID write --
+    #     'model rejection unsupported by its own criteria arrays'
+    #     'no disqualifying row survived label normalisation'
+    #   The two families are separable without reading the strings, by
+    #   verdict_source below: a constructed entry never carried a model-written
+    #   label, so its verdict_source is NULL.
+    #
+    # NULL means the entry carried no such key, which is three populations and
+    # each is separable from the columns beside it:
+    #   an ordinary verdict              eligible <> 'not_evaluable'
+    #   a model-DECLARED not_evaluable   eligible  = 'not_evaluable'
+    #                                    AND verdict_source IS NOT NULL
+    #   a row predating this column      verdict_source IS NULL, and dated
+    # NEVER '' -- an empty string would be a reason of zero characters, which is
+    # not a reading of anything.
+    #
+    # ONE not_evaluable POPULATION HAS A REASON THAT THIS COLUMN DOES NOT CARRY,
+    # AND IT IS STATED RATHER THAN DISCOVERED. Stage 5's Step 2 -- a trial the
+    # model returned with NO criteria at all -- records its reason
+    # ('trial-level verdict label not recognised', or 'model returned no
+    # criteria') into the `unevaluable_trials` AUDIT LIST only. It does not
+    # stamp the entry, so the column is NULL for those rows. That is a
+    # pre-existing asymmetry between Step 2 and the two corrections, and it was
+    # deliberately NOT closed by the provenance pass: `not_evaluable_reason` is
+    # one of the ten per-verdict keys the twelve characterization fixtures
+    # compare, so writing it where it was not written before is a change to a
+    # fixture-compared field and costs a re-capture at live model prices.
+    #
+    # The population is still IDENTIFIABLE from the columns beside it without
+    # reading prose, which is why the gap is tolerable rather than fatal:
+    #     eligible = 'not_evaluable'
+    #     AND verdict_source IS NOT NULL          -- the model answered for it
+    #     AND not_evaluable_reason IS NULL
+    #     AND criterion_details = '{"inclusion": [], "exclusion": []}'
+    # and `verdict_source` then separates its two sub-cases: 'unrecognized' is
+    # the unreadable-label one, 'canonical' / 'normalized' the no-criteria one.
+    # Dropping the last term instead selects that population plus the
+    # model-DECLARED not_evaluable trials, whose arrays are non-empty.
+    "not_evaluable_reason":    "TEXT",
+    # --- verdict_source / verdict_original_label / verdict_original_type ---
+    #
+    # HOW THE MODEL'S TRIAL-LEVEL LABEL WAS READ. `normalize_trial_verdict`
+    # resolves a written label into the three-member vocabulary and reports HOW;
+    # before this pass that report reached one log line and nothing else, so a
+    # stored 'eligible' could not be told from a stored 'eligible' recovered
+    # from boolean `True`.
+    #
+    # verdict_source IS WRITTEN ON EVERY MODEL-RETURNED ROW, INCLUDING THE
+    # ORDINARY ONE, and that is the design rather than an oversight:
+    #   'canonical'    the label was read and needed no recovery. A MEASUREMENT,
+    #                  on exactly the footing `hallucinated = 0` is one.
+    #   'normalized'   case, whitespace or one of the four synonyms recovered it.
+    #   'unrecognized' it could not be resolved at all; the branch chain then
+    #                  decided what to record, which is why an 'unrecognized'
+    #                  row can still carry any of the three verdicts.
+    #   NULL           NO NORMALIZER RAN FOR THIS ROW. True of every entry the
+    #                  pipeline CONSTRUCTED (a truncation floor, an exhausted
+    #                  split budget, a model omission, conflicting duplicates --
+    #                  they are appended after the normalizer loop and never had
+    #                  a model-written label), of a result dict built outside the
+    #                  pipeline, and of a row written before this column.
+    #                  NULL here and NULL on emission_index/call_index select the
+    #                  same population for the same reason.
+    #
+    # THE OTHER TWO ARE NULL WHENEVER THE LABEL WAS CANONICAL, because for a
+    # canonical label the "original" IS `eligible`, stored two columns away, and
+    # a repr of it would be a second copy of a value that cannot disagree with
+    # itself. They are also NULL when verdict_source is.
+    #
+    #   verdict_original_label  repr() of what the model wrote, capped. repr and
+    #                           not the value: it is output of unknown type and
+    #                           unknown length, and '' and None must not read
+    #                           alike. Kept off the structured LOG deliberately
+    #                           (it is not on LOGGABLE_FIELDS) and stored HERE
+    #                           deliberately -- this table already holds every
+    #                           criterion string in criterion_details and the
+    #                           whole response in
+    #                           inferences.llm_classifier_raw_response, so a
+    #                           capped verdict label is strictly inside what it
+    #                           carries, and it is the only thing that makes the
+    #                           normalisation auditable per row.
+    #   verdict_original_type   type(raw).__name__ -- 'bool', 'NoneType',
+    #                           'dict', 'str'. This is what the campaign's
+    #                           "from what original types" question groups by,
+    #                           and it carries no content at all.
+    "verdict_source":          "TEXT",
+    "verdict_original_label":  "TEXT",
+    "verdict_original_type":   "TEXT",
+    # --- criterion_remaps ---------------------------------------------------
+    #
+    # HOW MANY OF THIS TRIAL'S CRITERION LABELS WERE OUTSIDE THEIR ARM'S
+    # VOCABULARY. `inferences.cross_vocab_remaps` has always carried the RUN's
+    # event total; which trial each event belonged to was lost, so "how many
+    # trials were affected" -- a different number, and the one that matters for
+    # a per-trial finding -- was unanswerable.
+    #
+    #   0     the normalizer read this trial's arrays and rewrote nothing.
+    #         MEASURED, exactly like `hallucinated = 0`.
+    #   n>0   n remap EVENTS on this trial.
+    #   NULL  no normalizer ran for this row -- the same population as
+    #         verdict_source IS NULL.
+    #
+    # THE SUM OF THIS COLUMN OVER ONE INFERENCE'S ROWS EQUALS THAT INFERENCE'S
+    # cross_vocab_remaps, and that invariant is checkable in one query. It holds
+    # because both come from the same list, counted at the same line.
+    #
+    # EVENTS, NOT STORED ROWS. A criterion entry that was not an object at all
+    # is DROPPED rather than relabelled, so it counts here and leaves nothing in
+    # criterion_details -- meaning this number can exceed the number of rows in
+    # that JSON carrying `remapped_from_status`, and the difference IS the
+    # number dropped.
+    #
+    # IT DOES NOT COUNT THE ABSENT-DATA VALIDATOR'S REWRITES, which also produce
+    # 'not_evaluable' statuses and are a different finding with their own audit
+    # list and their own log event. Folding them in would make one column mean
+    # two things and would break the sum above.
+    "criterion_remaps":        "INTEGER",
 }
 
 
@@ -1670,8 +1866,9 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 llm_classifier_patient_record_tokens,
                 llm_classifier_cached_input_tokens, llm_classifier_call_details,
                 llm_classifier_packed_chunks, llm_classifier_packing,
-                matching_provider
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                matching_provider,
+                verdict_normalizations, remapped_trials
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             result["patient_id"],
             result["timestamp"],
@@ -1882,6 +2079,22 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
             # config names imported above cannot: CROSS_ENCODER_MODEL and
             # MATCHING_MODEL identify models that are fixed for a run.
             _config.MATCHING_PROVIDER,
+            # --- What Stage 5's normalizer corrected, per run ---------------
+            #
+            # NO DEFAULT ON EITHER, which is hallucinated_trials' rule two lines
+            # of this tuple away and not the truncation counters'. Both describe
+            # a CHECK, so 0 is a claim only a completed normalizer is entitled
+            # to make; a run that ended at node_no_candidates, at an API
+            # failure, at a refusal or at an unparseable answer carries no key
+            # and must reach the column as NULL. A `, 0` here would report a
+            # clean audit that was never performed.
+            #
+            # FROM `result`, NOT FROM CONFIG, and the asymmetry with
+            # matching_provider immediately above is the point: that is a fact
+            # about the PROCESS and lands on every row, these are facts about
+            # HOW FAR THIS RUN GOT and must not.
+            result.get("verdict_normalizations"),
+            result.get("remapped_trials"),
         ))
         
         inference_id = cursor.lastrowid
@@ -1901,6 +2114,15 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
             exclusion = match.get("exclusion_criteria", [])
             inclusion = inclusion if isinstance(inclusion, list) else []
             exclusion = exclusion if isinstance(exclusion, list) else []
+            # STILL EXACTLY TWO KEYS. What changed at this pass is inside the
+            # arrays, not here: a criterion whose status Stage 5 rewrote now
+            # carries `remapped_from_status` beside its corrected `status`,
+            # written by _normalize_arm at the line that rewrites it. The model
+            # cannot supply that key -- CRITERION_FIELDS is (criterion,
+            # patient_value, status) with additionalProperties: false -- so a
+            # row carrying it was rewritten here, and a row without it was not.
+            # Absent rather than empty on every other row, which is
+            # TEMPORAL_CONFLICT_FIELD's convention in the same arrays.
             criterion_json = json.dumps({
                 "inclusion":       inclusion,
                 "exclusion":       exclusion,
@@ -1912,8 +2134,11 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                     trial_number, rerank_score, rerank_score_raw, mesh_boost, mesh_boost_tier,
                     match_score, eligible, assessment, criterion_details,
                     score_confirmed, score_denominator, criteria_not_applicable,
-                    hallucinated, emission_index, call_index
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    hallucinated, emission_index, call_index,
+                    not_evaluable_reason, verdict_source,
+                    verdict_original_label, verdict_original_type,
+                    criterion_remaps
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 inference_id,
                 match.get("nct_id", ""),
@@ -1945,9 +2170,12 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 # evidence, and its assessment is
                 # ASSESSMENT_UNSUPPORTED_REJECTION_TEXT -- a fixed sentence
                 # opening "Not evaluable:" that says the model rejected the
-                # trial while citing no disqualifying criterion. It is the one
-                # value in this column that identifies the correction, since
-                # `not_evaluable_reason` is not a column here. Until that
+                # trial while citing no disqualifying criterion. It USED TO BE
+                # the one value in this column that identifies the correction,
+                # because `not_evaluable_reason` was not a column here; as of
+                # the provenance pass that column exists and carries the reason
+                # directly, so a reader identifies the correction by
+                # `not_evaluable_reason` and no longer by matching prose. Until
                 # composition existed the row stored the model's rejection
                 # draft, opening "Known disqualifier:" beside a verdict that is
                 # not a rejection and criteria carrying none: a row that
@@ -1974,6 +2202,27 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 # that every such trial stood first in the first call's answer.
                 match.get("emission_index"),
                 match.get("call_index"),
+                # --- What Stage 5's normalizer did to THIS trial ------------
+                #
+                # NO DEFAULT ON ANY OF THE FIVE, for emission_index's reason
+                # immediately above. An entry the pipeline CONSTRUCTED carries
+                # none of them and an entry from a result dict built outside the
+                # pipeline carries none either; both must reach their columns as
+                # NULL. A `, 0` on criterion_remaps would assert that the
+                # normalizer read a trial it never saw and found it clean, and a
+                # `, ''` on the two label columns would store a reason and an
+                # original of zero characters, neither of which is a reading.
+                #
+                # verdict_source IS PRESENT ON EVERY MODEL-RETURNED ROW,
+                # 'canonical' included, so NULL here selects exactly the
+                # constructed / out-of-pipeline / pre-migration population --
+                # the same one emission_index and call_index select, which is
+                # what lets a reader cross-check the three.
+                match.get("not_evaluable_reason"),
+                match.get("verdict_source"),
+                match.get("verdict_original_label"),
+                match.get("verdict_original_type"),
+                match.get("criterion_remaps"),
             ))
         
         conn.commit()

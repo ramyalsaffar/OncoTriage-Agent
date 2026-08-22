@@ -522,6 +522,17 @@ python tests/test_tracking_mlflow_index.py                          #  99
 # _EXEC_ALLOWLIST. Bucket A, <1 s against only the CI skeleton.
 python tests/test_storage_packing_and_cache_columns.py              # 124
 
+# The provenance-persistence pass. Same shape, same directory. No network, no
+# keys, no spend, no live Qdrant, no model load, no corpus, no git history, and
+# NOT in the collision matrix -- it writes only inside a tempfile.mkdtemp it
+# removes and asserts gone, and the four package files it reads
+# (storage/database_logger.py, agent/evaluation.py, agent/response_schema.py,
+# fixtures/capture.py) are sha256-compared at the end and are written by
+# neither of the suite's two writers. It DOES exec: five controls plant into
+# in-memory copies of database_logger.py and evaluation.py, argued at
+# _EXEC_ALLOWLIST. Bucket A, ~2.5 s.
+python tests/test_storage_provenance_persistence.py                 # 126
+
 # The CI-hygiene pair. Same shape, same directory. Neither imports anything
 # from the package -- their subjects are `.github/scripts/` and
 # `.dockerignore` -- so neither needs the corpus, a key, a database, a live
@@ -4601,6 +4612,111 @@ offline stamp whose VALUES are irrelevant — and a stamp short of a newly gated
 field is FP_UNRESOLVED, so the bump made them fail for a reason that had nothing
 to do with what they assert. Their keys come from the tuple now, so the next
 bump costs them nothing.
+
+### Three Stage 5 corrections became queryable (the provenance-persistence pass)
+
+**THE NORMALIZER IN `oncotriage/agent/evaluation.py` MAKES THREE CORRECTIONS AND
+TWO OF THEM REACHED NO STORED BYTE.** Traced before anything was edited:
+
+| artifact | where it died |
+|---|---|
+| `not_evaluable_reason` | stamped on the ENTRY and **dropped at the write** — the `trial_matches` INSERT named nineteen columns and none of them was it, and `criterion_details` json.dumps exactly `"inclusion"` and `"exclusion"`. The field was present on the dict at the line that wrote the row, and `database_logger.py` already said so in a correction to an earlier comment |
+| `verdict_normalizations` | a local list read by **one log line** and discarded. Not on the entry, not in the node's return, not a state channel, not a column |
+| `label_remaps` | **half of it survived** — `len(label_remaps)` is `cross_vocab_remaps`, a count of remap EVENTS for the whole run. Which trial each belonged to, how many TRIALS carried one, and what each row's status was BEFORE the rewrite were lost; `_normalize_arm` rewrites `c["status"]` **in place** |
+
+**THE DO-NOTHING-AND-QUERY-THE-JSON OPTION WAS BEATEN ON AVAILABILITY, NOT
+ERGONOMICS.** B reaches no column and no JSON. C's original status is overwritten
+before `criterion_details` is built, so that blob is not even a lossy record of
+it. A is in no JSON either — `assessment` is a PROXY for six of the reasons
+through six fixed sentences, which means recovering a machine field by `LIKE`
+over English prose, breaking on any rewording, blind to the ABSENT case, and
+wrong for every row written before PROMPT_VERSION 1.5.0 (which carries the
+model's free-written draft in that column instead).
+
+**SEVEN COLUMNS AND ONE JSON KEY.** `trial_matches` gains
+`not_evaluable_reason`, `verdict_source`, `verdict_original_label`,
+`verdict_original_type` and `criterion_remaps`; `inferences` gains
+`verdict_normalizations` and `remapped_trials`; and a criterion row Stage 5
+relabelled now carries **`remapped_from_status`** inside the existing
+`criterion_details`, which still json.dumps exactly two keys.
+
+**THREE PLACES THE SHIPPED DESIGN DIFFERS FROM THE OBVIOUS ONE, each argued at
+the code.**
+
+- **`verdict_source` is written on EVERY model-returned row, `'canonical'`
+  included.** "NULL when the label was canonical" would conflate "the normalizer
+  read this label and it was already canonical" with "no normalizer ran for this
+  row". `canonical` is the `hallucinated = 0` of this column, and NULL then
+  selects exactly the population `emission_index` / `call_index` select — the
+  four `_unevaluable_entry` CONSTRUCTS, which are appended AFTER the normalizer
+  loop and never carried a model-written label.
+- **A per-trial COUNT, not a flag.** "at least one" is `> 0`, so the flag is
+  derivable from the count and not the reverse; and the counts of a run's rows
+  **sum to that run's `cross_vocab_remaps`**, an invariant one query checks. It
+  is free: `len(label_remaps) - remaps_before`, at the line that already computed
+  `remapped_here` from those two numbers.
+- **Two run-level scalars and no stored breakdowns.** Per-reason and per-type are
+  GROUP BYs over the child table; storing them would mean JSON (which no query
+  groups on) or one column per constant. The two that ARE stored are the two a
+  JOIN cannot express: `COUNT(*) ... WHERE verdict_source <> 'canonical'` returns
+  0 for "measured none", for "these rows predate the columns" and for "no Stage 5
+  ran" alike. That is `inferences.hallucinated_trials`' own argument beside
+  `trial_matches.hallucinated`, adopted rather than invented.
+
+**THE MODEL CANNOT FORGE ANY OF THE FIVE MARKERS**, and the test asserts it
+against the REAL schema rather than assuming it: `agent/response_schema.py` sets
+`additionalProperties: False` with a complete `required` list at every level, and
+no name is in `TRIAL_FIELDS` or `CRITERION_FIELDS`. Same argument
+`not_evaluable_reason` and `TEMPORAL_CONFLICT_FIELD` already carry.
+
+**NO FIXTURE-COMPARED FIELD MOVED, AND THAT IS WHY.**
+`build_deterministic_prefix` is a CLOSED enumeration: its `stage5.verdicts[]`
+projects ten named keys and the criteria arrays are not among them, so a new
+result key and a new match key are invisible to it, and `compose_assessment` —
+whose output IS projected — reads only named keys. Proved by AST in the test.
+`python fixture_replay.py` is **12/12 clean, exit 0, no recapture**, and the
+production `inferences.db` sha256 is unchanged.
+
+**ONE GAP IS STATED RATHER THAN CLOSED, AND THE STOP CONDITION IS WHY.** Stage
+5's **Step 2** — a trial the model returned with NO criteria — records its reason
+(`trial-level verdict label not recognised`, or `model returned no criteria`)
+into the audit list only and does not stamp the entry, so the column is NULL for
+that population. `not_evaluable_reason` is one of the ten keys the twelve
+fixtures compare, so writing it where it was not written before is a change to a
+fixture-compared field and costs a re-capture at live model prices. The
+population stays IDENTIFIABLE without prose —
+`eligible = 'not_evaluable' AND verdict_source IS NOT NULL AND
+not_evaluable_reason IS NULL AND criterion_details = '{"inclusion": [], "exclusion": []}'`,
+with `verdict_source` separating its two sub-cases — and the column note says so.
+
+**A PRE-EXISTING DEFECT IN THE NEIGHBOURING COLUMN IS RECORDED AND NOT FIXED.**
+`cross_vocab_remaps` is written as `state.get(..., 0)` by `_pipeline_provenance`
+and as a literal `0` by `node_no_candidates`, so it reads **0 on runs whose
+normalizer never ran**. Narrowing it now changes what an existing column means
+for every reader; the two new counters are honest from their first row and the
+asymmetry is stated at both ends.
+
+**FOUR QUERIES, ONE PER CAMPAIGN QUESTION, NONE OF THEM PARSING JSON** —
+`not_evaluable_reasons`, `verdict_normalization_sources`,
+`criterion_remap_incidence`, `run_normalizer_provenance`. Every one groups on a
+COALESCE label that NAMES the absence rather than dropping the row, because a
+`COUNT(*)` with the NULLs dropped reports a clean audit over a population that
+was never audited. `tests/test_storage_query_layer.py` stays at **194** and its
+four `trial_matches` rows were widened to carry a measured value on every new
+column, so those queries can no longer be satisfied by the all-NULL bucket.
+
+**`tests/test_storage_provenance_persistence.py` — 126 checks, bucket A,
+~2.5 s.** Both migrations fresh and pre-migration; the round trip for measured /
+measured-zero / absent-key / explicit-None on all seven columns with NULL and 0
+shown distinguishable IN SQL; the stamps driven through the real Stage 5 node and
+the real `node_finalize` on a StateGraph over the real `TrialMatchState`, with
+the reduced-schema control that loses both counters; the failure returns; the sum
+invariant; and **five planted controls, all five shown to fire**. Two of them
+were rewritten mid-pass because they passed for the wrong reason: a flag-instead-
+of-count plant and an events-instead-of-trials plant both agree with the shipped
+code on a body where every affected trial carries exactly ONE remap, so both are
+now driven on a body with **two remaps on one trial**, where events = 2 and
+trials = 1 and the two answers separate.
 
 ### A SKIP IS NOT A PASS (commit `ec2033a`)
 

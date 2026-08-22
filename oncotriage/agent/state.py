@@ -551,6 +551,29 @@ class TrialMatchState(TypedDict):
                                                 # because the model used the other arm's
                                                 # vocabulary (or returned a non-object entry)
 
+    # --- Stage 5's two run-level provenance counters ------------------------
+    #
+    # DECLARED HERE OR SILENTLY DROPPED. LangGraph writes only the channels this
+    # schema names; an undeclared key returned by a node is not an error, not a
+    # warning and not a raise -- the update is discarded, and the value arrives
+    # at every terminal node as None, which is this project's "not measured".
+    # That is exactly how the four Stage 5 packing keys shipped broken, and
+    # tests/test_agent_state_channel_coverage.py is the standing guard.
+    #
+    # Optional, and None is NOT 0. Stage 5 writes both on its success return
+    # alone, so None means no normalizer completed (no candidates, an API
+    # failure, a refusal, an unparseable answer) rather than "it ran and found
+    # none" -- the same convention as hallucinated_trials above.
+    #
+    # NOT FOLDED INTO cross_vocab_remaps, which counts remap EVENTS. Four remaps
+    # on one trial and one remap on each of four trials give the same event
+    # count and different answers to "how many trials were affected", and a
+    # non-canonical VERDICT label is a third artifact that count cannot see at
+    # all.
+    verdict_normalizations: Optional[int]       # trial verdicts whose label was
+                                                # not written canonically
+    remapped_trials: Optional[int]              # trials carrying >= 1 criterion remap
+
     # --- Stage 6: Final Output ---
     result: Dict                                # Complete pipeline output
     

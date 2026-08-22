@@ -1175,6 +1175,141 @@ QUERIES = (
     ORDER BY n DESC
 """,
     ),
+    # ── Stage 5 normalizer provenance (the provenance-persistence pass) ─────
+    #
+    # FOUR QUERIES, ONE PER CAMPAIGN QUESTION, AND NOT ONE OF THEM PARSES JSON.
+    # Every artifact each reads was computed by Stage 5 and, before that pass,
+    # either dropped at the write (`not_evaluable_reason`), discarded after a
+    # log line (`verdict_normalizations`) or reduced to a run-level event count
+    # (`label_remaps`, as `cross_vocab_remaps`). They are scalar columns
+    # precisely so these are GROUP BYs rather than blob scans.
+    #
+    # NULL IS PROJECTED, NEVER FOLDED. Each groups on a COALESCE label that
+    # names the absence -- '(not reported)' -- rather than dropping the row or
+    # counting it as a measured zero, because the whole point of the columns is
+    # that "the normalizer found none" and "no normalizer ran" are different
+    # findings. A COUNT(*) with the NULL rows dropped would report a clean audit
+    # over a population that was never audited.
+    Query(
+        key='not_evaluable_reasons',
+        heading='=== NOT-EVALUABLE TRIALS BY REASON ===',
+        render='to_string',
+        blank_after=True,
+        notes=(
+            "NULL reason on a not_evaluable row is not 'no reason'. It is a",
+            "trial the model returned with no criteria (Stage 5 Step 2, whose",
+            "reason reaches the log and not the row), a model-DECLARED",
+            "not_evaluable, or a row written before the column existed --",
+            "separated by verdict_source and by whether criterion_details is",
+            "empty. See TRIAL_MATCH_COLUMN_ADDITIONS.",
+        ),
+        sql="""
+    SELECT
+        COALESCE(tm.not_evaluable_reason, '(not reported)') AS not_evaluable_reason,
+        CASE
+            WHEN tm.not_evaluable_reason IN ('truncation_floor',
+                                             'truncation_split_budget_exhausted',
+                                             'omitted_from_model_response',
+                                             'conflicting_duplicate_answers')
+                 THEN 'constructed by the pipeline'
+            WHEN tm.not_evaluable_reason IS NULL THEN '(not reported)'
+            ELSE 'corrected from a model verdict'
+        END                                                 AS family,
+        COUNT(*)                                            AS trials,
+        COUNT(DISTINCT tm.inference_id)                     AS runs,
+        SUM(CASE WHEN tm.verdict_source IS NULL THEN 1 ELSE 0 END)
+                                                            AS never_had_a_model_label
+    FROM trial_matches tm
+    WHERE tm.eligible = 'not_evaluable'
+    GROUP BY tm.not_evaluable_reason
+    ORDER BY trials DESC, not_evaluable_reason
+""",
+    ),
+    Query(
+        key='verdict_normalization_sources',
+        heading='=== TRIAL VERDICT LABELS: HOW EACH WAS READ ===',
+        render='to_string',
+        blank_after=True,
+        notes=(
+            "'canonical' is a MEASUREMENT -- the label was read and needed no",
+            "recovery. '(not checked)' is the entries Stage 5 CONSTRUCTED,",
+            "which never carried a model-written label, plus rows written",
+            "before the column existed.",
+        ),
+        sql="""
+    SELECT
+        COALESCE(tm.verdict_source, '(not checked)')       AS verdict_source,
+        COALESCE(tm.verdict_original_type, '(n/a)')        AS original_type,
+        COUNT(*)                                           AS trials,
+        COUNT(DISTINCT tm.inference_id)                    AS runs,
+        SUM(CASE WHEN tm.eligible = 'eligible' THEN 1 ELSE 0 END)      AS ended_eligible,
+        SUM(CASE WHEN tm.eligible = 'not_eligible' THEN 1 ELSE 0 END)  AS ended_not_eligible,
+        SUM(CASE WHEN tm.eligible = 'not_evaluable' THEN 1 ELSE 0 END) AS ended_not_evaluable
+    FROM trial_matches tm
+    GROUP BY tm.verdict_source, tm.verdict_original_type
+    ORDER BY trials DESC, verdict_source, original_type
+""",
+    ),
+    Query(
+        key='criterion_remap_incidence',
+        heading='=== CRITERION LABEL REMAPS: TRIALS AND RUNS ===',
+        render='to_string',
+        blank_after=True,
+        notes=(
+            "remap EVENTS and remapped TRIALS are different numbers: four",
+            "remaps on one trial and one on each of four trials give the same",
+            "event total. inferences.cross_vocab_remaps carries the event",
+            "total; the per-trial column is what makes the second countable.",
+        ),
+        sql="""
+    SELECT
+        COUNT(*)                                                        AS trial_rows,
+        SUM(CASE WHEN tm.criterion_remaps IS NULL THEN 1 ELSE 0 END)    AS not_checked,
+        SUM(CASE WHEN tm.criterion_remaps = 0 THEN 1 ELSE 0 END)        AS checked_clean,
+        SUM(CASE WHEN tm.criterion_remaps > 0 THEN 1 ELSE 0 END)        AS trials_with_a_remap,
+        COUNT(DISTINCT CASE WHEN tm.criterion_remaps > 0
+                            THEN tm.inference_id END)                   AS runs_with_a_remap,
+        SUM(COALESCE(tm.criterion_remaps, 0))                           AS remap_events
+    FROM trial_matches tm
+""",
+    ),
+    Query(
+        key='run_normalizer_provenance',
+        heading='=== PER-RUN NORMALIZER PROVENANCE (worst first) ===',
+        render='to_string',
+        blank_after=True,
+        notes=(
+            "remap_events_stored is inferences.cross_vocab_remaps and",
+            "remap_events_summed is the sum of the per-trial column. They are",
+            "the same list counted at the same line, so a row where they",
+            "disagree is a defect in the carry rather than a finding about the",
+            "model. The check is only meaningful where the per-trial column is",
+            "populated, which is why remap_rows_checked is beside it.",
+        ),
+        sql="""
+    SELECT
+        i.id, i.patient_id, i.timestamp,
+        i.candidates_evaluated,
+        i.verdict_normalizations,
+        i.remapped_trials,
+        i.cross_vocab_remaps                                  AS remap_events_stored,
+        SUM(COALESCE(tm.criterion_remaps, 0))                 AS remap_events_summed,
+        SUM(CASE WHEN tm.criterion_remaps IS NOT NULL THEN 1 ELSE 0 END)
+                                                              AS remap_rows_checked,
+        SUM(CASE WHEN tm.eligible = 'not_evaluable' THEN 1 ELSE 0 END)
+                                                              AS not_evaluable_rows
+    FROM inferences i
+    LEFT JOIN trial_matches tm ON tm.inference_id = i.id
+    GROUP BY i.id
+    HAVING COALESCE(i.verdict_normalizations, 0) > 0
+        OR COALESCE(i.remapped_trials, 0) > 0
+        OR not_evaluable_rows > 0
+    ORDER BY COALESCE(i.verdict_normalizations, 0)
+             + COALESCE(i.remapped_trials, 0) DESC,
+             i.id
+    LIMIT 25
+""",
+    ),
 )
 
 

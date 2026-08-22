@@ -539,6 +539,24 @@ BUCKETS = {
         _A, None, "ran green in 0.2s"),
     "test_storage_inference_logging_contract.py": (
         _A, None, "ran green in 1.8s; temp SQLite only"),
+    "test_storage_provenance_persistence.py": (
+        _A, None,
+        "ran green in ~7s, 126 checks, against ONLY the directory skeleton: "
+        "the seven Stage 5 normalizer-provenance columns through the real "
+        "migration and the real log_inference, and the stamps through the real "
+        "Stage 5 node and the real node_finalize on a StateGraph over the real "
+        "TrialMatchState. Every database is a temp file every call is pointed "
+        "at explicitly, every patient and trial is a literal dict, and the "
+        "OpenAI client is a stand-in installed through oncotriage/agent/deps.py "
+        "with the SCOPED deps.override -- no network, no keys, no spend, no "
+        "live Qdrant, no git, no corpus. It DOES exec: five controls plant into "
+        "in-memory copies of database_logger.py and evaluation.py, argued at "
+        "_EXEC_ALLOWLIST in tests/test_package_invariants.py. It writes nothing "
+        "in the repository and is not in the collision matrix -- the four "
+        "package files it reads (storage/database_logger.py, "
+        "agent/evaluation.py, agent/response_schema.py, fixtures/capture.py) "
+        "are written by neither of the suite's two writers, and all four are "
+        "sha256-compared at the end."),
     "test_storage_packing_and_cache_columns.py": (
         _A, None,
         "ran green in <1s, 124 checks, against ONLY the directory skeleton: "

@@ -1022,6 +1022,133 @@ UNEVALUABLE_REMAP_NO_SURVIVOR = (
     "no disqualifying row survived label normalisation")
 
 
+# ---------------------------------------------------------------------------
+# The provenance markers this node stamps onto what it corrected
+# ---------------------------------------------------------------------------
+#
+# THREE CORRECTIONS ARE MADE IN THIS FILE AND UNTIL THIS PASS TWO OF THEM LEFT
+# NO MACHINE-READABLE TRACE ANYWHERE A QUERY COULD REACH.
+#
+#   `not_evaluable_reason`  was already stamped on the ENTRY -- and dropped at
+#                           the write, because the trial_matches INSERT names
+#                           nineteen columns and none of them was it, and
+#                           `criterion_details` json.dumps exactly "inclusion"
+#                           and "exclusion". The field existed on the dict at
+#                           the line that wrote the row.
+#   `verdict_normalizations` was a local list read by ONE log line and then
+#                           discarded. Not on the entry, not in the return, not
+#                           a state channel.
+#   `label_remaps`          was a local list whose LENGTH survives as
+#                           `cross_vocab_remaps` -- a count of remap EVENTS for
+#                           the whole run. Which trial each belonged to, how
+#                           many TRIALS carried one, and what each row's status
+#                           was BEFORE the rewrite were all lost; `_normalize_arm`
+#                           rewrites `c["status"]` in place, so `criterion_details`
+#                           records the corrected value and nothing else.
+#
+# The keys below close that. Each is stamped where the correction is DECIDED,
+# never re-derived later, so the record and the behaviour cannot disagree.
+#
+# THE MODEL CANNOT FORGE ANY OF THEM. `oncotriage/agent/response_schema.py` sets
+# `additionalProperties: False` with a complete `required` list at every level:
+# TRIAL_FIELDS is (assessment, eligible, exclusion_criteria, inclusion_criteria,
+# match_score, nct_id) and CRITERION_FIELDS is (criterion, patient_value,
+# status). None of these names is in either, so an entry or a row carrying one
+# was written here. tests/test_storage_provenance_persistence.py asserts that
+# against the REAL schema rather than assuming it, the way the two existing
+# markers (`not_evaluable_reason`, TEMPORAL_CONFLICT_FIELD) already are.
+
+VERDICT_SOURCE_FIELD = "verdict_source"
+"""The entry key carrying how Step 0 read this trial's model-written label.
+
+One of ``VERDICT_SOURCES`` -- canonical | normalized | unrecognized -- on every
+entry the MODEL returned, including the ones whose label was already canonical.
+
+PRESENT-ON-EVERY-CHECKED-ENTRY, NOT PRESENT-ONLY-WHEN-IT-MOVED, and that is the
+one place this differs from the sibling markers. ``canonical`` is a MEASUREMENT:
+it says the normalizer read this label and found nothing to recover. Absence
+says no normalizer ran for this entry, which is true of the four
+``_unevaluable_entry`` CONSTRUCTS -- they are appended after this loop and never
+carried a model-written label at all. That is exactly the argument
+``trial_matches.hallucinated`` already makes for 0 against NULL, and it is why
+this key is not simply omitted when the label was fine.
+"""
+
+VERDICT_ORIGINAL_LABEL_FIELD = "verdict_original_label"
+"""``repr`` of the label the model wrote, capped -- absent when it was canonical.
+
+``repr`` and not the value: the label is model output of unknown type and
+unknown length, and ``""`` and ``None`` must not read alike. Capped at
+``_MALFORMED_ENTRY_PREVIEW_LEN``, the same cap the audit list uses.
+
+IT IS STORED IN THE DATABASE AND STILL KEPT OFF THE LOG, and the two are not in
+conflict. ``verdict_normalizations``' own comment says the label TEXT stays out
+of the RECORD because ``original_label`` is not on ``LOGGABLE_FIELDS`` -- that
+is the structured LOG, which is shipped, indexed and retained. The database
+already holds the entire model response verbatim in
+``inferences.llm_classifier_raw_response`` and every criterion string in
+``trial_matches.criterion_details``; a capped repr of one verdict label is
+strictly inside what that table already carries, and it is the only thing that
+makes the normalisation auditable per row.
+"""
+
+VERDICT_ORIGINAL_TYPE_FIELD = "verdict_original_type"
+"""``type(raw).__name__`` of the label the model wrote -- absent when canonical.
+
+The campaign question is "from what original types", so this is the column it
+groups by. It is also the half that diagnoses the defect -- a bool where a
+string was asked for, a null, a nested object -- and it carries no content.
+"""
+
+CRITERION_REMAPS_FIELD = "criterion_remaps"
+"""How many remap EVENTS this trial's criteria produced. 0 is a measurement.
+
+A COUNT AND NOT A FLAG. "at least one" is ``> 0``, so the flag is derivable from
+the count and the count is not derivable from the flag; and the counts of a
+run's rows sum to ``inferences.cross_vocab_remaps``, which is an invariant a
+query can check. It costs nothing: it is ``len(label_remaps) - remaps_before``
+at the line that already computes ``remapped_here`` from those two numbers.
+
+EVENTS, NOT ROWS, and the difference is stated because it is observable. A
+non-object criterion entry is DROPPED by ``_normalize_arm`` rather than
+relabelled, so it contributes to this count and leaves no row in
+``criterion_details`` -- meaning this number can exceed the number of stored
+rows carrying ``LABEL_REMAP_FIELD``, and the difference IS the number dropped.
+
+IT DOES NOT COUNT THE ABSENT-DATA VALIDATOR'S REWRITES. That pass also turns a
+criterion status into ``not_evaluable``, and it is a different finding with its
+own audit list (``absent_data_corrections``) and its own log event
+(``absent_data_correction``). Folding the two together would make one column
+mean two things and would break the sum against ``cross_vocab_remaps``.
+"""
+
+LABEL_REMAP_FIELD = "remapped_from_status"
+"""The key added to a RELABELLED criterion row, carrying the status the model wrote.
+
+ABSENT rather than empty on every other row -- ``TEMPORAL_CONFLICT_FIELD``'s
+convention, and for its reason: a key that is always present would claim the
+detector ran on this row, and nothing can promise that for a row written before
+it existed. Consumers must read it with ``.get``.
+
+ON THE ROW, NOT IN A SIDE LIST. ``_normalize_arm`` rewrites ``c["status"]`` in
+place, so before this pass the stored row said ``not_evaluable`` and what it had
+said was gone. The criterion row is the owner of everything about that
+criterion; a parallel column carrying criterion text plus its old status would
+be a SECOND store of the same clinical string, able to disagree with the first.
+
+NOT WRITTEN ON A DROPPED ENTRY, because a dropped entry has no row to write it
+on. See ``CRITERION_REMAPS_FIELD`` for how many that is.
+
+THE VALUE IS THE ONE ``label_remaps`` RECORDS AS ``original_status``, taken from
+the same expression at the same line, so the row and the audit list cannot
+disagree. That means an empty string when the model wrote no ``status`` key at
+all -- which the strict schema forbids and a non-structured response does not --
+and it is stored as the empty string rather than as ``None`` for exactly that
+reason: absence of the KEY means "not remapped", so absence could not also be
+made to mean "remapped from nothing".
+"""
+
+
 def estimate_output_tokens(trials: List[Dict]) -> int:
     """Estimate the evaluation response size for a batch, before sending it.
 
@@ -3869,6 +3996,13 @@ CLINICAL TRIALS:
                     "corrected_status": "not_evaluable",
                     "reason": f"status not in {arm} vocabulary",
                 })
+                # THE ROW'S OWN RECORD OF WHAT IT SAID, written BEFORE the
+                # rewrite below destroys it. `criterion_details` stores these
+                # arrays verbatim, so this is what makes a stored
+                # "not_evaluable" row distinguishable from one the model wrote
+                # that way. Absent on every row that was not relabelled -- see
+                # LABEL_REMAP_FIELD.
+                c[LABEL_REMAP_FIELD] = status
                 c["status"] = "not_evaluable"
 
             cleaned.append(c)
@@ -3921,6 +4055,22 @@ CLINICAL TRIALS:
                 "resolved_to": verdict or TRIAL_VERDICT_NOT_EVALUABLE,
                 "source": verdict_source,
             })
+            # THE SAME TWO FACTS ON THE ENTRY, so they reach trial_matches.
+            # The audit list above feeds one log line and is then discarded;
+            # everything a query needs per trial has to be on the entry, which
+            # is the only thing that survives to the writer. Written only on the
+            # non-canonical branch: for a canonical label the "original" IS
+            # `eligible`, already stored one column away, and a repr of it would
+            # be a second copy of a value that cannot disagree with itself.
+            eval_result[VERDICT_ORIGINAL_LABEL_FIELD] = (
+                repr(raw_verdict)[:_MALFORMED_ENTRY_PREVIEW_LEN])
+            eval_result[VERDICT_ORIGINAL_TYPE_FIELD] = type(raw_verdict).__name__
+        # UNCONDITIONAL, INCLUDING THE CANONICAL CASE, and that is deliberate.
+        # `canonical` says this label was READ and needed no recovery; absence
+        # says no normalizer ran for this entry, which is true of the four
+        # _unevaluable_entry constructs appended after this loop. See
+        # VERDICT_SOURCE_FIELD.
+        eval_result[VERDICT_SOURCE_FIELD] = verdict_source
         eval_result["eligible"] = (
             verdict if verdict is not None else TRIAL_VERDICT_NOT_EVALUABLE
         )
@@ -3939,7 +4089,13 @@ CLINICAL TRIALS:
         exc = _normalize_arm(exc, _EXCLUSION_STATUSES, "exclusion", nct_id)
         eval_result["inclusion_criteria"] = inc
         eval_result["exclusion_criteria"] = exc
-        remapped_here = len(label_remaps) > remaps_before
+        # ONE SUBTRACTION, TWO CONSUMERS. `remapped_here` is derived from the
+        # count rather than computed beside it, so the branch that corrects a
+        # rejection and the number stored in trial_matches.criterion_remaps can
+        # never disagree about whether this trial was remapped.
+        remaps_here = len(label_remaps) - remaps_before
+        eval_result[CRITERION_REMAPS_FIELD] = remaps_here
+        remapped_here = remaps_here > 0
 
         total = len(inc) + len(exc)
 
@@ -4529,6 +4685,36 @@ CLINICAL TRIALS:
         # whatever MATCHING_MODEL happens to say at read time.
         "matching_model": model_answered,
         "cross_vocab_remaps": len(label_remaps),
+        # ── The two run-level provenance counters (this pass) ───────────────
+        #
+        # WRITTEN ON THE SUCCESS RETURN ONLY, which is hallucinated_trials'
+        # convention and not the truncation counters'. Both describe a CHECK
+        # rather than work that either happened or did not: 0 asserts that the
+        # normalizer read every returned entry's label and every trial's
+        # criteria arrays and found nothing to correct, which is a claim no run
+        # that ended before this line is entitled to make. A key that is never
+        # written leaves state.get() at None and _pipeline_provenance turns that
+        # into a NULL column meaning "the normalizer did not report".
+        #
+        # NEITHER IS DERIVABLE FROM cross_vocab_remaps, which is a count of
+        # remap EVENTS for the whole run.
+        #
+        #   verdict_normalizations  how many trial verdicts arrived in a
+        #                           non-canonical spelling. A different artifact
+        #                           entirely: it reached NO storage before this
+        #                           pass, only one log line.
+        #   remapped_trials         how many TRIALS carried at least one
+        #                           criterion remap. Four remaps on one trial
+        #                           and four trials with one each are the same
+        #                           cross_vocab_remaps and different findings.
+        #
+        # BOTH ARE ALSO DERIVABLE BY JOINING trial_matches, and they are stored
+        # anyway for the reason inferences.hallucinated_trials is: a COUNT over
+        # a child table returns 0 for "measured none", for "these rows predate
+        # the column" and for "no Stage 5 ran" alike, and those are the three
+        # states this project's NULL convention exists to keep apart.
+        "verdict_normalizations": len(verdict_normalizations),
+        "remapped_trials": len({r["nct_id"] for r in label_remaps}),
         "error": "",  # Clear error on success
         # What was intended, and what was sent. PROMPT_VERSION is a module
         # constant rather than a state read because the render happened in

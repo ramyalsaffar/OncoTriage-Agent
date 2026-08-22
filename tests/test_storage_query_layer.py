@@ -749,18 +749,53 @@ _unknown_seed_columns = [c for c in _unknown_seed_columns
 check("every column the seed writes exists in the real schema",
       _unknown_seed_columns, [])
 
-for _i, (_nct, _phase, _eligible, _score) in enumerate([
-        ("NCT00000001", "Phase 2", "eligible", 0.91),
-        ("NCT00000002", "Phase 3", "not_eligible", 0.42),
-        ("NCT00000003", "Phase 1", "not_evaluable", 0.55),
-        ("NCT00000001", "Phase 2", "eligible", 0.88)]):
+# THE FOUR ROWS ALSO CARRY THE STAGE 5 NORMALIZER PROVENANCE, AND THE VALUES
+# ARE CHOSEN SO THE FOUR QUERIES OVER THEM CANNOT PASS FOR THE WRONG REASON.
+# Every one of those queries groups on a COALESCE label that names the absence,
+# so a seed leaving all five columns NULL would put every row in the
+# "(not reported)" / "(not checked)" bucket and the non-empty check in section 2
+# would be satisfied without a single measured branch ever being exercised.
+# Row 0 is canonical and clean, row 1 is a recovered boolean label with two
+# criterion remaps, row 2 is an entry the pipeline CONSTRUCTED (every column
+# NULL, which is the population the reader has to be able to select), and row 3
+# is an unreadable label that still ended eligible off its criteria.
+_TRIAL_MATCH_ROWS = [
+    # nct, phase, eligible, score, ne_reason, v_source, v_label, v_type, remaps
+    ("NCT00000001", "Phase 2", "eligible", 0.91,
+     None, "canonical", None, None, 0),
+    ("NCT00000002", "Phase 3", "not_eligible", 0.42,
+     None, "normalized", "True", "bool", 2),
+    ("NCT00000003", "Phase 1", "not_evaluable", 0.55,
+     "truncation_floor", None, None, None, None),
+    ("NCT00000001", "Phase 2", "eligible", 0.88,
+     None, "unrecognized", "'MAYBE'", "str", 0),
+]
+
+for _i, (_nct, _phase, _eligible, _score, _ne_reason, _v_source,
+         _v_label, _v_type, _remaps) in enumerate(_TRIAL_MATCH_ROWS):
     _cursor.execute(
         "INSERT INTO trial_matches (inference_id, nct_id, trial_title, "
         "trial_phase, trial_number, rerank_score, match_score, eligible, "
-        "assessment, criterion_details) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "assessment, criterion_details, not_evaluable_reason, verdict_source, "
+        "verdict_original_label, verdict_original_type, criterion_remaps) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (_INFERENCE_IDS["P-CONSISTENT-A" if _i < 2 else "P-CONSISTENT-B"],
          _nct, f"Trial {_nct}", _phase, _i + 1, 3.5 - _i * 0.1, _score,
-         _eligible, "because", '{"inclusion": [], "exclusion": []}'))
+         _eligible, "because", '{"inclusion": [], "exclusion": []}',
+         _ne_reason, _v_source, _v_label, _v_type, _remaps))
+
+# ...and the two run-level counters on the inferences the rows hang off, so
+# `run_normalizer_provenance` has a row whose HAVING is satisfied by a measured
+# count rather than only by the presence of a not_evaluable child. The remap
+# EVENT total on P-CONSISTENT-B is deliberately left at the _BASE_ROW's 0 while
+# its child rows sum to 0 as well (rows 2 and 3 carry NULL and 0), so the
+# consistency column that query renders agrees on the seeded data.
+_cursor.execute(
+    "UPDATE inferences SET verdict_normalizations = ?, remapped_trials = ?, "
+    "cross_vocab_remaps = ? WHERE patient_id = ?", (1, 1, 2, "P-CONSISTENT-A"))
+_cursor.execute(
+    "UPDATE inferences SET verdict_normalizations = ?, remapped_trials = ? "
+    "WHERE patient_id = ?", (1, 0, "P-CONSISTENT-B"))
 
 for _i, (_cat, _name, _value, _alert) in enumerate([
         ("performance", "total_time", 64.2, 0),

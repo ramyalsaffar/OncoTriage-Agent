@@ -1103,6 +1103,26 @@ _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    # globals ARE the dict it was exec'd into and a throwaway
                    # namespace would leave every module constant unread.
                    "tests/test_storage_packing_and_cache_columns.py",
+                   # FIVE execs, each an in-memory copy of
+                   # storage/database_logger.py (three plants) or
+                   # agent/evaluation.py (two) for the Stage 5 normalizer
+                   # provenance columns: the trial_matches value expression
+                   # replaced by None, a `, 0` default added to a run-level
+                   # counter, a TRIAL_MATCH_COLUMN_ADDITIONS entry deleted, the
+                   # per-trial verdict_source stamp removed, and the criterion
+                   # row's record of its own original status removed. Every one
+                   # is a one-token edit INSIDE a function body to code that
+                   # exists at HEAD AND NOWHERE ELSE, so a blob of the revision
+                   # before it does not carry an inverted guard -- it carries no
+                   # column at all, and the control would then be testing the
+                   # absence of a feature rather than the presence of a check.
+                   # A real condition cannot supply them either: there is no
+                   # input that makes a correctly wired writer stop naming a
+                   # column. The copies are exec'd into a real ModuleType,
+                   # because a function's globals ARE the dict it was exec'd
+                   # into and a throwaway namespace would leave every module
+                   # constant unread.
+                   "tests/test_storage_provenance_persistence.py",
                    "tests/test_agent_prompt_version.py",
                    "tests/test_observability_logging.py",
                    "tests/test_indexer_admission_filters.py",
