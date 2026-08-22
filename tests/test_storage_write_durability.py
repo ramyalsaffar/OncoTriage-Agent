@@ -663,18 +663,57 @@ check("5b  ...nothing was created at the bad path (non-degeneracy)",
       os.path.exists(_DB5_BAD), False)
 _dl.INFERENCE_WRITE_FAILURES.clear()
 
-# Section 5e of the invariants test must still HAVE a subject: exactly three
-# `with _WRITE_LOCK:` sites, which is the number it asserts. The retry loop is
-# inside one of them rather than around it.
+# Section 5e of the invariants test must still HAVE a subject: the
+# `with _WRITE_LOCK:` sites its control strips, and the number it asserts having
+# stripped. The retry loop is inside one of them rather than around it.
+#
+# THE EXPECTED NUMBER IS READ OUT OF THAT FILE RATHER THAN RETYPED HERE, and
+# that is a correction rather than a refinement. It WAS the literal 3, so the
+# run-identity pass -- which added start_run_record and finalize_run_record,
+# both of which take the lock -- had to change the same number in two files, and
+# the second one failed as a mystery about a lock it had nothing to do with. Two
+# declarations of one fact is the shape this project removes everywhere else;
+# this is the one that shipped.
+def _expected_lock_sites():
+    """The count `test_package_invariants.py` section 5e asserts, by AST.
+
+    Returns a NAMED absence rather than a number when the assertion cannot be
+    found, so a rename over there fails here with a message instead of silently
+    comparing against None.
+    """
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "test_package_invariants.py")
+    if not os.path.exists(src):
+        return "<test_package_invariants.py not found>"
+    for node in ast.walk(ast.parse(Path(src).read_text(encoding="utf-8"))):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "check" and len(node.args) == 3):
+            continue
+        probe = node.args[1]
+        if (isinstance(probe, ast.Call)
+                and isinstance(probe.func, ast.Attribute)
+                and probe.func.attr == "get"
+                and probe.args
+                and isinstance(probe.args[0], ast.Constant)
+                and probe.args[0].value == "locks_stripped"
+                and isinstance(node.args[2], ast.Constant)):
+            return node.args[2].value
+    return "<no locks_stripped assertion found>"
+
+
 _lock_withs = [
     node for node in ast.walk(_dl_tree)
     if isinstance(node, ast.With)
     and any(isinstance(i.context_expr, ast.Name)
             and i.context_expr.id == "_WRITE_LOCK" for i in node.items)
 ]
-check("5c  there are still exactly three `with _WRITE_LOCK:` sites, which is "
-      "what test_package_invariants.py section 5e asserts",
-      len(_lock_withs), 3)
+_EXPECTED_LOCK_SITES = _expected_lock_sites()
+check("5c  the `with _WRITE_LOCK:` site count is what "
+      "test_package_invariants.py section 5e asserts its control stripped",
+      len(_lock_withs), _EXPECTED_LOCK_SITES)
+check("5c  ...and that number was actually READ from that file, not defaulted "
+      "(a check comparing two absences would pass for free)",
+      isinstance(_EXPECTED_LOCK_SITES, int) and _EXPECTED_LOCK_SITES >= 1, True)
 
 
 #------------------------------------------------------------------------------

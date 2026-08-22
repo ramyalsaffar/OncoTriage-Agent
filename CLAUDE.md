@@ -493,7 +493,7 @@ python tests/test_agent_emission_provenance.py                      # 184 (this 
 # nothing -- every control is driven through the real shipped module by creating
 # the failing condition for real (an exclusive lock from a second connection, an
 # unwritable path, a deleted row). ~4 s, most of it deliberate lock contention.
-python tests/test_storage_write_durability.py                       #  99
+python tests/test_storage_write_durability.py                       # 100 (was 99; the run-identity pass split section 5c's lock-site pin into the comparison and its own non-degeneracy probe when the expected number stopped being retyped there)
 
 # The reproducibility-hash pass. Same shape, same directory. No network, no
 # keys, no spend, no git history, not in the collision matrix, and it execs
@@ -532,6 +532,16 @@ python tests/test_storage_packing_and_cache_columns.py              # 124
 # in-memory copies of database_logger.py and evaluation.py, argued at
 # _EXEC_ALLOWLIST. Bucket A, ~2.5 s.
 python tests/test_storage_provenance_persistence.py                 # 126
+
+# The run-identity pass. Same shape, same directory. No network, no keys, no
+# spend, no live Qdrant, no model load, no corpus, no git history, and NOT in
+# the collision matrix -- every database is a temp file, paths._RESOLVED is
+# seeded so nothing can resolve to the production tree, and the two package
+# files it reads (storage/database_logger.py, batch/runner.py) are written by
+# neither of the suite's two writers. It EXECS NOTHING: every control is a
+# different INPUT to a pure function, a real failing condition created on disk,
+# or an ast walk over an in-memory copy. Bucket A, ~1.5 s.
+python tests/test_storage_run_identity.py                           # 121
 
 # The CI-hygiene pair. Same shape, same directory. Neither imports anything
 # from the package -- their subjects are `.github/scripts/` and
@@ -4612,6 +4622,205 @@ offline stamp whose VALUES are irrelevant — and a stamp short of a newly gated
 field is FP_UNRESOLVED, so the bump made them fail for a reason that had nothing
 to do with what they assert. Their keys come from the tuple now, so the next
 bump costs them nothing.
+
+### A run is a row now, not a gap between timestamps (the run-identity pass)
+
+**`inferences` AND `trial_matches` ARE PER-PATIENT RECORDS AND NOTHING CARRIED
+THE CAMPAIGN.** "Which rows belong to one batch run" was recovered by looking
+for gaps between consecutive `timestamp` values, which is wrong in four ways
+and silent in all of them: a RESUMED run reads as two campaigns (the gap is the
+interruption); two campaigns started back to back read as one; an API row
+written by `17- FastAPI Server.py` during a batch run is indistinguishable from
+a batch row, because both land in the same file; and no gap between timestamps
+says anything about the CONFIGURATION, which is what a run-level number has to
+be attributed to.
+
+**`runs` IS THE THING TO ATTACH TO**, created in `initialize_database` on the
+existing `CREATE TABLE IF NOT EXISTS` footing, and `inferences.run_id` is an
+additive `INTEGER` through `INFERENCE_COLUMN_ADDITIONS`. The batch runner opens
+one row before its first patient and finalizes it after its last.
+
+| column | holds |
+|---|---|
+| `id` / `started_at` / `finished_at` / `status` | the run. `finished_at` is NULLABLE and that is the whole crashed-run shape |
+| `invocation_source` | which entry point ran. **REQUIRED, no default** (`empty_database(db_path, flag)`'s precedent), and the one place this module declines a closed vocabulary — a status is a fact it produces, a caller is not |
+| `fingerprint_version` + the six `FINGERPRINT_FIELDS` | the configuration stamp, **as seven individual columns and not a JSON blob** |
+
+**THE STAMP COLUMNS ARE RESTATED IN THE STORAGE LAYER AND A TEST CLOSES THE
+ROUND TRIP, because the import is not available.** `oncotriage.run_fingerprint`
+imports `agent.prompts` AND `agent.readiness`, and readiness builds a Qdrant
+client; `oncotriage.tracking` imports `agent.prompts`. A storage module
+importing either would put the agent — and a network probe's import graph —
+behind `import oncotriage.storage.database_logger`, which is the edge pass
+20c-2c moved `_resolve_primary_cancer` out of that module to remove. So
+`RUN_FINGERPRINT_COLUMNS` and `RUN_RECORD_TERMINAL_STATUSES` are declared there
+and `tests/test_storage_run_identity.py` requires them to equal
+`("fingerprint_version",) + FINGERPRINT_FIELDS` and `tracking.RUN_STATUSES`
+exactly. A test may import all three because a test is in nobody's import graph.
+
+**THE STATUSES ARE `tracking.RUN_STATUSES` PLUS `RUNNING`.** That tuple excludes
+`RUNNING` on the argument written beside it — passing it to `end_run` would
+leave a finished run looking live forever — and that argument is about the END
+of a run. This table records the start of one as well, so it needs the value
+that tuple omits. `FINISHED` / `FAILED` on the success path is the MAIN PASS's
+verdict, the same fact the checkpoint decision and `tracking.end_run` are made
+on; **`KILLED` is the crash handler's and is a different finding** — "ran to
+the end and some patients errored" is not "the process did not get to the end",
+and only the second has patients that were never attempted.
+
+**`collection_points` NULLs AN UNRESOLVED COUNT, AND THAT IS THE `ecog_date`
+TRAP ONE COLUMN TYPE OVER.** `run_fingerprint` degrades an unresolvable field to
+the STRING `"unknown"`; the five TEXT columns store it verbatim, which is right
+for them. SQLite keeps a non-numeric string as TEXT whatever the declared
+affinity and orders every TEXT value ABOVE every INTEGER — so
+`WHERE collection_points > 1000` would return exactly the rows where the count
+could not be established and `ORDER BY ... DESC` would rank them as the largest
+collections there are. A `bool` is excluded from the int test too, because
+`isinstance(True, int)` is True and a `collection_points` of 1 that was really a
+`True` is a number nobody measured. **Nothing is lost:**
+`fingerprint_version IS NULL` is "no stamp was recorded" and
+`fingerprint_version IS NOT NULL AND collection_points IS NULL` is "a stamp was
+recorded and the count was not established", with `qdrant_collection` reading
+`'unknown'` when even the name did not resolve.
+
+**NULL `run_id` IS A VALUE, NOT A LEGACY.** Three callers write it on purpose:
+`17- FastAPI Server.py` (a request is not a campaign — it has no start, no end
+and no configuration stamp, and a run per POST would put one `runs` row in the
+table for every request), every direct `log_inference`, and every historical row.
+So `run_id IS NULL` means "not part of a recorded batch run", never "the run is
+unknown", and the campaign query is a JOIN rather than a timestamp window.
+
+**THERE IS NO MODULE-LEVEL "CURRENT RUN", AND THAT ABSENCE IS THE MECHANISM.**
+The id is a LOCAL of `main()`, threaded into `run_batch`, `run_resample`,
+`process_patient` and `log_inference` as an argument. `clear_write_ledger()` and
+`run_fingerprint.clear_cache()` at the top of `main()` exist because their state
+IS module-level and both are one forgotten line away from describing the wrong
+run; threading the id is the version of that rule that cannot be forgotten,
+because there is nothing to clear. A second `main()` in one process therefore
+creates a new row by construction. The test asserts it both ways — two
+`start_run_record` calls give two ids and two rows, and an AST walk requires the
+name to be a local, requires `main()` to declare no `global` at all, and scans
+both modules for a module-level current-run global.
+
+**`start_run_record` RAISES AND `finalize_run_record` NEVER DOES**, and the line
+between them is item 11a's. Creation is before the first billed call, where a
+failure costs nothing and where continuing would produce a whole campaign of
+rows that cannot be attributed — `tracking.start_run` raises at the same point
+in the same `main()` and is the precedent. Finalization runs after one live
+Stage 5 call per patient has been paid for, so it counts into
+`RUN_RECORD_FAILURES` (the twenty-second counter in `oncotriage/degradation.py`)
+and returns False. "Never raises" means what it means everywhere else in that
+module: `except Exception`, so `KeyboardInterrupt` and `MemoryError` still
+escape exactly as they escape `_write_inference_row` — a finalizer that
+swallowed a Ctrl-C would leave an operator holding a key down against a process
+that will not stop. **There is no `start:` key in that counter and the absence
+is not an omission.**
+
+**THE ROW COUNT IS READ.** `UPDATE ... WHERE id = ?` against an id that is not
+there SUCCEEDS and updates nothing; SQLite reports no error. A finalizer that
+did not check `rowcount` would report success for a run row that was never
+written — the "reported success, wrote nothing" shape the write-durability pass
+removed one function down. An unrecognised status is replaced by `FAILED` and
+counted, never by `FINISHED`, which is `tracking.end_run`'s rule adopted
+verbatim; `RUNNING` is unrecognised HERE even though it is a member of
+`RUN_RECORD_STATUSES`.
+
+**THE SUCCESS-PATH FINALIZE IS THE LAST STATEMENT OF `main()`'s `try`, AND THE
+POSITION IS A CORRECTNESS PROPERTY.** Every other statement in that block can
+raise — `tracking_metrics` walks the results list, `_results_path` resolves a
+path, `report_lines` formats a snapshot — and the handler finalizes to `KILLED`.
+With the finalize anywhere ABOVE them a raise in between would OVERWRITE a
+FINISHED row with KILLED and report a completed campaign as a crashed one. Being
+last makes the two paths mutually exclusive by construction, which is stronger
+than a "have I finalized yet" flag somebody has to remember to set. The cost is
+stated: `finished_at` now includes the seconds the tracking store spent
+attaching artifacts. **`tests/test_storage_run_identity.py` pins the ordering
+and carries a control that reorders an AST copy.**
+
+**`tracking.start_run` IS WRAPPED, because the run row is already open by that
+line.** It raises when tracking is unavailable — which is its design — and
+between the two there was no handler, so an unwrapped raise would leave a `runs`
+row at RUNNING with a NULL `finished_at` forever, describing a campaign that
+never started. **Reordering does not fix it and makes it worse:** MLflow's
+atexit hook closes an open run as FINISHED, so a tracking run orphaned by a
+failure below it is indexed as a campaign that COMPLETED. Moving it into the
+main `try` does not fix it either — that handler calls `tracking.end_run`, which
+with no active run counts `end_run:NoActiveRun`, a degradation that did not
+happen reported by the code meant to report the one that did.
+
+**THE FOREIGN KEY IS UNENFORCED, LIKE `trial_matches.inference_id`, AND FOUR
+REASONS DECIDED IT** (argued at the `CREATE TABLE`): `PRAGMA foreign_keys` is
+per CONNECTION and this module opens only some of them — `storage/queries.py`,
+`storage/maintenance.py`, `monitoring/drift.py`, `dashboard/data.py`,
+`evaluation/sampling.py` and every test open their own, so a constraint honoured
+by one writer and ignored by six other openers of the same file reads like an
+invariant and is not one; it would BREAK `empty_database`, which `DELETE FROM`s
+every table in `sqlite_master` order, parents first, and would raise having
+deleted nothing; a violation arrives as `sqlite3.IntegrityError`, which
+`_is_retryable` classes as TERMINAL, so a row that today lands with a dangling
+id would instead be GIVEN UP ON; and NULL is legitimate here while the only
+non-NULL values are written by the process that created the row moments earlier.
+
+**`oncotriage/evaluation/sampling.py` COPIES THE `runs` TABLE**, on the sentence
+`COPIED_TABLES` already carried — "a sample database that silently lacked the
+table would not open in a tool built against the production schema". Unlike
+`drift_metrics` it is POPULATED, with the run rows the copied inferences
+actually reference and no others; copying every run of the whole database would
+describe campaigns the sample contains no patients from. A pre-migration source
+degrades silently and correctly: the schema query is `name IN (...)`, so it
+yields one row fewer and the row copy finds no ids.
+
+**`inference_run_id` IS A NEW LOGGABLE FIELD AND IT IS DELIBERATELY NOT
+`run_id`.** `oncotriage/observability.py` already records that `run_id` means
+the ABLATION database's integer run id and that `tracking_run_id` was named
+separately to avoid conflating two keys under one field name. Three id spaces
+exist now and each has its own field.
+
+**TWO PINNED EXPECTATIONS IN THE EXISTING SUITE MOVED, both argued in place.**
+`tests/test_package_invariants.py` section 5e's `locks_stripped` goes **3 → 5**
+— `start_run_record` and `finalize_run_record` take `_WRITE_LOCK` too, because
+that module's invariant is "every database statement in this file is issued
+under `_WRITE_LOCK`" and an invariant with an exception is a convention; the
+assertion is a NON-DEGENERACY probe whose job is to say the control really did
+strip something, so it has to move whenever a site is added. **And
+`tests/test_storage_write_durability.py` section 5c stopped RETYPING that
+number**: it was the literal `3` in a second file, so this pass had to change
+one fact in two places and the second failed as a mystery about a lock it had
+nothing to do with. It reads the expectation out of
+`test_package_invariants.py` by AST now, with its own probe that the number was
+actually found. `tests/test_agent_bedrock_adapter.py`'s table-set pin gains
+`runs` and stays EXACT, because exact is what makes it fail when a lookup table
+IS introduced under any name.
+
+**`tests/test_tracking_mlflow_index.py`'s `_guard_shape` SELECTS BY WHAT THE
+HANDLER CALLS, not by being the first one.** It took the first
+`except BaseException` in the file, which was the tracking guard when that check
+was written and stopped being it here; a positional selector reported the new
+`tracking.start_run` wrapper as a tracking guard that closes no run. Its count
+is unchanged at **99**.
+
+**VERIFIED BY RUNNING.** Bucket A **51/51**, the serial runner **5/5** with
+`oncotriage/config.py` and `oncotriage/registries/cancer_code_registry.py`
+confirmed restored, `tests/test_package_invariants.py` **260/0/0**, every
+bucket C/E file on this machine green (`test_storage_write_durability` 100,
+`test_storage_ecog_logging` 155, `test_indexer_admission_filters` 403,
+`test_mcp_server_stdio_contract` 142, and the rest at their documented counts),
+`python fixture_replay.py` **12/12 clean, exit 0, with no recapture**, and the
+production `inferences.db` sha256 **unchanged** — `ab1403e3…`, 90,185,728 bytes,
+before and after. **No money was spent and no migration was run against the
+production database**: the `runs` table and `inferences.run_id` appear there on
+the next run that opens it, which is what the additive mechanism is for.
+
+**WHAT WAS NOT DONE, STATED.** `main()` itself is not driven end to end — it
+builds a BM25 index from a live Qdrant, compiles the graph and makes one billed
+Stage 5 call per patient — so the run lifecycle is proved by driving what
+`main()` does once per invocation plus an AST walk over `main()` itself, and
+`run_batch` / `run_resample` are driven for real with a recording stand-in for
+`process_patient`. The stand-in returns `status="error"` deliberately: a
+"success" entry makes `_on_done` call `save_checkpoint()`, which with no
+fingerprint argument resolves `run_fingerprint.current()` — a live Qdrant round
+trip, in a file that is bucket A.
+
 
 ### Three Stage 5 corrections became queryable (the provenance-persistence pass)
 

@@ -154,12 +154,24 @@ def sample_db_filename(total=None) -> str:
 SAMPLE_DB_SUBDIR = sample_db_subdir()
 SAMPLE_DB_FILENAME = sample_db_filename()
 
-# The three tables copied into the output database, in the order File 28 read
-# them out of sqlite_master (ORDER BY name). drift_metrics is created empty and
-# never populated -- File 28 copied the schema of all three and rows from two,
-# and that is preserved: a sample database that silently lacked the table would
-# not open in a tool built against the production schema.
-COPIED_TABLES = ("inferences", "trial_matches", "drift_metrics")
+# The tables copied into the output database, in the order File 28 read them
+# out of sqlite_master (ORDER BY name). drift_metrics is created empty and never
+# populated -- File 28 copied the schema of all three and rows from two, and
+# that is preserved: a sample database that silently lacked the table would not
+# open in a tool built against the production schema.
+#
+# `runs` JOINED AT THE RUN-IDENTITY PASS, on exactly that sentence. Every copied
+# `inferences` row carries a `run_id`, and without the table the join it exists
+# for does not resolve in the sample -- a tool built against the production
+# schema would fail on `JOIN runs`, and a reader would see an integer pointing
+# at nothing. UNLIKE drift_metrics IT IS POPULATED, with the run rows the copied
+# inferences actually reference and no others: copying every run of the whole
+# database would describe campaigns this sample contains no patients from.
+#
+# A SOURCE DATABASE WITHOUT THE TABLE DEGRADES SILENTLY AND CORRECTLY. The
+# schema query is `name IN (...)`, so a pre-migration source simply yields one
+# row fewer and the row copy below finds no run ids to fetch.
+COPIED_TABLES = ("inferences", "trial_matches", "drift_metrics", "runs")
 
 
 #------------------------------------------------------------------------------
@@ -389,6 +401,27 @@ def select_samples(source_db, output_db, seed=SEED,
                 f"INSERT INTO inferences VALUES ({','.join('?' * col_count)})",
                 [tuple(r) for r in inf_rows]
             )
+
+        # Copy the `runs` rows the copied inferences point at (the run-identity
+        # pass). Read off the rows already fetched rather than with a second
+        # query, so the set cannot drift from what was copied; NULLs -- rows
+        # written outside a recorded batch run -- are dropped by the `is not
+        # None` test rather than becoming a `WHERE id IS NULL` that matches
+        # nothing but looks like it might.
+        _run_ids = sorted({r["run_id"] for r in inf_rows
+                           if "run_id" in r.keys() and r["run_id"] is not None})
+        if _run_ids:
+            run_rows = conn.execute(
+                f"SELECT * FROM runs WHERE id IN "
+                f"({','.join('?' * len(_run_ids))})", _run_ids
+            ).fetchall()
+            if run_rows:
+                out_cursor.executemany(
+                    f"INSERT INTO runs VALUES "
+                    f"({','.join('?' * len(run_rows[0]))})",
+                    [tuple(r) for r in run_rows]
+                )
+                console.out(f"Copied {len(run_rows)} run record(s).")
 
         # Copy trial_matches
         tm_rows = conn.execute(

@@ -704,6 +704,19 @@ BUCKETS = {
     "test_storage_wipe_all_tables.py": (
         _E, "the production inferences.db (it reads its real schema)",
         "'the production schema was read and is non-degenerate' failed"),
+    "test_storage_run_identity.py": (
+        _A, None,
+        "ran green in ~1s, 119 checks, against ONLY the directory skeleton: the "
+        "`runs` table and the `inferences.run_id` reference through the real "
+        "initialize_database and the real log_inference, plus run_batch and "
+        "run_resample driven with a recording stand-in for process_patient. "
+        "Every database is a temp file, paths._RESOLVED is seeded so nothing "
+        "can resolve to the production tree, and ONCOTRIAGE_INFERENCES_DB is "
+        "cleared so an exported one cannot make the isolation checks compare "
+        "two scratch paths -- no network, no keys, no spend, no live Qdrant, no "
+        "model load, no corpus, no git. It execs nothing: every control is a "
+        "different INPUT to a pure function, a real failing condition created "
+        "on disk, or an ast walk over an in-memory copy"),
     "test_storage_write_durability.py": (
         _E, "the production inferences.db",
         "'9c ...and it was readable, so that comparison is not None == None' failed"),

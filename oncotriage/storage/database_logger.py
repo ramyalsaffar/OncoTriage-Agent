@@ -86,6 +86,7 @@ import sqlite3
 import threading
 import time
 from collections import Counter
+from datetime import datetime
 from typing import Dict
 
 from oncotriage import paths
@@ -742,6 +743,44 @@ INFERENCE_COLUMN_ADDITIONS = {
     # added).
     "verdict_normalizations":                "INTEGER",
     "remapped_trials":                       "INTEGER",
+
+    # --- WHICH RECORDED RUN PRODUCED THIS ROW (the run-identity pass) -------
+    #
+    # `runs.id`, or NULL. Additive like every column above it, so every row
+    # already in a database keeps NULL, which is the honest value: those rows
+    # were written before there was a run to attach them to.
+    #
+    # NULL IS A FIRST-CLASS VALUE HERE AND NOT ONLY A LEGACY ONE, which makes
+    # it unlike `hallucinated_trials` and unlike the two normalizer counters
+    # directly above. Three live callers write NULL on purpose:
+    #
+    #   oncotriage/api/server.py   a request is not a campaign. It has no
+    #                              start, no end and no configuration stamp of
+    #                              its own, so there is nothing for it to point
+    #                              at and inventing a run per request would put
+    #                              one row in `runs` for every POST.
+    #   a direct log_inference     a test, a notebook, an embedder.
+    #   the batch runner, IF the run row could not be created -- which cannot
+    #                              happen silently: start_run_record RAISES, so
+    #                              a batch run either has its id or has stopped.
+    #
+    # So `run_id IS NULL` means "not part of a recorded batch run", NEVER "the
+    # run is unknown". THE QUERY FOR ONE CAMPAIGN IS THEREFORE A JOIN, not a
+    # timestamp window:
+    #
+    #     SELECT i.* FROM inferences i JOIN runs r ON r.id = i.run_id
+    #     WHERE r.id = ?
+    #
+    # which is the whole point of the pass: the timestamp-gap heuristic it
+    # replaces cannot tell a resumed campaign from two campaigns, cannot tell a
+    # batch row from an API row written in the same minute, and has no way at
+    # all to attribute a row to the configuration that produced it.
+    #
+    # THE REFERENCE IS UNENFORCED. See the `runs` CREATE TABLE for the decision
+    # and the four reasons; the short version is that `PRAGMA foreign_keys` is
+    # per CONNECTION and this module opens only some of the connections that
+    # touch this file.
+    "run_id":                                "INTEGER",
 }
 
 
@@ -979,6 +1018,174 @@ TRIAL_MATCH_COLUMN_ADDITIONS = {
     # two things and would break the sum above.
     "criterion_remaps":        "INTEGER",
 }
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
+# RUN IDENTITY (the run-identity pass)
+# ===========================================================================
+#
+# WHAT WAS MISSING. `inferences` and `trial_matches` are per-PATIENT records.
+# Neither carries anything about the CAMPAIGN that produced them, so "which
+# rows belong to one batch run" was recovered by looking for gaps between
+# consecutive `timestamp` values -- a heuristic that is wrong in four separate
+# ways and silent in all of them:
+#
+#   * a RESUMED run reads as two campaigns, because the gap is the interruption;
+#   * two campaigns started back to back read as one, because there is no gap;
+#   * an API row written by "17- FastAPI Server.py" during a batch run is
+#     indistinguishable from a batch row, because both land in the same file;
+#   * and no gap between timestamps says anything about the CONFIGURATION,
+#     which is what a run-level number actually needs to be attributed to.
+#
+# `runs` is a real thing to attach to. The batch runner creates one row before
+# its first patient and finalizes it at the end; every write that run makes
+# carries its id.
+#
+# WHY IT IS HERE AND NOT IN oncotriage/tracking.py. That module indexes runs
+# for a HUMAN comparing campaigns, in a store that is not this database, and it
+# is optional -- `TRACKING_DEGRADATIONS` exists precisely because an index
+# failure must not take the run with it. This is a JOIN KEY inside the database
+# the rows are in, and a query that needs it cannot reach across to an MLflow
+# file store. They answer different questions and both are kept.
+
+
+RUN_RECORD_STATUS_RUNNING = "RUNNING"
+"""The status a run row carries between creation and finalization.
+
+DELIBERATELY NOT IN ``oncotriage/tracking.py``'s ``RUN_STATUSES``, which is
+``("FINISHED", "FAILED", "KILLED")`` and excludes ``RUNNING`` on the argument
+written there: passing ``RUNNING`` to ``end_run`` would leave a finished run
+looking live forever. That argument is about the END of a run. This table
+records the START of one as well, so it needs the live value that tuple omits.
+"""
+
+RUN_RECORD_TERMINAL_STATUSES = ("FINISHED", "FAILED", "KILLED")
+"""How a run ENDED. Value-identical to ``oncotriage/tracking.py:RUN_STATUSES``.
+
+RESTATED RATHER THAN IMPORTED, and the reason is layering, not taste:
+``oncotriage.tracking`` imports ``oncotriage.agent.prompts``, so a
+``from oncotriage.tracking import RUN_STATUSES`` here would make the STORAGE
+layer depend on the AGENT layer -- the edge pass 20c-2c moved
+``_resolve_primary_cancer`` out of this module to remove.
+
+A RESTATED CONSTANT IS A CONSTANT THAT CAN DRIFT, so the alignment is checked
+rather than promised: ``tests/test_storage_run_identity.py`` imports both and
+requires this tuple to equal ``tracking.RUN_STATUSES`` exactly. A test may
+import both because a test is not in the import graph either module ships.
+"""
+
+RUN_RECORD_STATUSES = (RUN_RECORD_STATUS_RUNNING,) + RUN_RECORD_TERMINAL_STATUSES
+"""Every value ``runs.status`` may hold. CLOSED.
+
+Closed for ``deps.OVERRIDE_KEYS``' reason: a caller may branch on it
+exhaustively, and a status outside it is a run that no ``WHERE status = ...``
+will ever return.
+"""
+
+
+RUN_FINGERPRINT_COLUMNS = (
+    "fingerprint_version",
+    "llm_classifier_prompt_version",
+    "llm_classifier_renderer_digest",
+    "matching_model_configured",
+    "qdrant_collection",
+    "collection_points",
+    "data_snapshot_date",
+)
+"""The configuration stamp, as columns, in ``run_fingerprint``'s own order.
+
+INDIVIDUAL COLUMNS AND NOT A JSON BLOB. Plain-SQL queryability is the standing
+precedent in this schema -- `mesh_resolution`, `query_expansion_path` and the
+four `*_filter_applied` pairs are all scalars for the same reason -- and the
+question these exist to answer is "every run whose renderer digest was X", or
+"...whose collection had fewer than N points", which `json_extract` over a blob
+answers only for a reader who knows the blob's shape.
+
+THE NAMES ARE ``("fingerprint_version",) + run_fingerprint.FINGERPRINT_FIELDS``
+AND THEY ARE RESTATED HERE FOR THE LAYERING REASON ABOVE, one level worse:
+``oncotriage.run_fingerprint`` imports ``oncotriage.agent.prompts`` AND
+``oncotriage.agent.readiness``, and readiness builds a Qdrant client. A storage
+module that imported it would put the agent, and a network probe's import
+graph, behind ``import oncotriage.storage.database_logger``.
+
+So the round trip is CLOSED BY A TEST, not by an import:
+``tests/test_storage_run_identity.py`` requires this tuple to equal
+``("fingerprint_version",) + FINGERPRINT_FIELDS`` exactly, in order. A field
+added to the stamp and not to this tuple fails there with a name, rather than
+being recorded in the stamp and silently absent from every run row.
+"""
+
+RUN_FINGERPRINT_INTEGER_COLUMNS = frozenset({
+    "fingerprint_version",
+    "collection_points",
+})
+"""Which stamp fields are stored as numbers, and therefore NULLed when unknown.
+
+WHY THIS IS NOT COSMETIC. ``run_fingerprint`` degrades an unresolvable field to
+the STRING ``"unknown"`` -- `UNKNOWN` in that module -- and the five TEXT
+columns store that verbatim, which is exactly right for them. Storing it in an
+INTEGER-affinity column is the ``ecog_date`` trap, one column type over: SQLite
+keeps a non-numeric string as TEXT whatever the declared affinity, and it orders
+every TEXT value ABOVE every INTEGER, so
+
+    WHERE collection_points > 1000
+
+would return the rows where the count could not be established, and
+``ORDER BY collection_points DESC`` would rank them as the largest collections
+there are. That is the opposite of the truth in the one column whose purpose is
+saying how much was indexed.
+
+So a non-int reaches these columns as NULL, and the fact is not lost: the two
+questions are answered by two different predicates.
+
+    fingerprint_version IS NULL                        no stamp was recorded
+    fingerprint_version IS NOT NULL
+      AND collection_points IS NULL                    a stamp was recorded and
+                                                       the count was not
+                                                       established -- read
+                                                       qdrant_collection, which
+                                                       is TEXT and says
+                                                       'unknown' when even the
+                                                       NAME did not resolve
+
+A STAMP CARRYING NO ``fingerprint_version`` IS TREATED AS NO STAMP, which is
+``run_fingerprint``'s own FP_ABSENT rule ("nothing recorded, or a stamp with no
+version") applied at the write. ``bool`` is excluded from the int test because
+``isinstance(True, int)`` is True and ``collection_points = 1`` would be a
+plausible-looking lie.
+"""
+
+RUN_COLUMNS = ("started_at", "finished_at", "status",
+               "invocation_source") + RUN_FINGERPRINT_COLUMNS
+"""Every column ``start_run_record`` writes, in the CREATE TABLE's order.
+
+ONE DECLARATION. The INSERT's column list and its placeholder count are both
+built from this tuple, so they cannot disagree with each other the way a
+hand-written positional VALUES tuple can -- which is a live risk in this module:
+the ``inferences`` INSERT names 85 columns positionally and its comment says in
+as many words that a loop there would put the column order in two places. That
+argument is about a tuple whose values are hand-picked per column. This one's
+values are looked up BY NAME out of a dict, so deriving the list removes a
+failure mode instead of hiding one.
+"""
+
+
+RUN_RECORD_FAILURES = Counter()
+"""Run rows that could not be created or finalized, keyed by what went wrong.
+
+Module-level, following ``INFERENCE_WRITE_FAILURES`` immediately below rather
+than becoming a column -- for that counter's reason, sharpened: a column
+recording that the run row could not be written would have to live on the run
+row that does not exist.
+
+Keys are ``finalize:{ExceptionType}``, ``finalize:no_run_id``,
+``finalize:row_not_found`` and ``finalize:unknown_status:{status}``. THERE IS NO
+``start:`` KEY AND THAT IS NOT AN OMISSION: ``start_run_record`` raises, so a
+creation failure stops the run rather than being counted and continued past.
+"""
 
 
 #------------------------------------------------------------------------------
@@ -1353,6 +1560,89 @@ def _initialize_database_locked(db_path):
     # Create cursor
     cursor = conn.cursor()
 
+    # Runs table (the run-identity pass)
+    #
+    # CREATED FIRST, BEFORE `inferences`, because `inferences.run_id` points at
+    # it. Nothing enforces that ordering today -- see the foreign-key decision
+    # below -- but a schema whose creation order contradicts its own references
+    # is a schema that cannot have the constraint turned on later without being
+    # reordered first.
+    #
+    # ------------------------------------------------------------------------
+    # THE FOREIGN-KEY DECISION, AND IT IS A DECISION RATHER THAN AN OVERSIGHT.
+    # ------------------------------------------------------------------------
+    # `run_id` IS AN UNENFORCED REFERENCE, exactly like `trial_matches`'
+    # FOREIGN KEY on `inferences(id)` directly below, and `PRAGMA foreign_keys`
+    # is NOT turned on. Four reasons, in the order they decided it:
+    #
+    #   1. ENFORCEMENT IS PER CONNECTION AND THIS MODULE OPENS ONLY SOME OF
+    #      THEM. SQLite defaults `foreign_keys` OFF and the pragma has to be
+    #      issued on every connection. `_open_connection` is this module's one
+    #      connection site -- but `oncotriage/storage/queries.py`,
+    #      `oncotriage/storage/maintenance.py`, `oncotriage/monitoring/drift.py`,
+    #      `oncotriage/dashboard/data.py`, `oncotriage/evaluation/sampling.py`
+    #      and every test open their own. A constraint honoured by one writer
+    #      and ignored by six other openers of the same file is not an
+    #      invariant; it is a property of which module happened to open it,
+    #      which is worse than no constraint because it reads like one.
+    #
+    #   2. IT WOULD BREAK `empty_database` (oncotriage/storage/maintenance.py),
+    #      which issues `DELETE FROM` over every table `sqlite_master` reports,
+    #      in that catalogue's order -- i.e. creation order, parents first. With
+    #      enforcement on, deleting `runs` while `inferences` rows still point
+    #      at it raises a constraint violation and the wipe fails, having
+    #      deleted nothing (the raise lands before the commit). That is a real
+    #      regression in a shipped tool, traded for a constraint nothing needs.
+    #
+    #   3. IT WOULD CONVERT A RECOVERABLE STATE INTO A LOST ROW. A violation
+    #      arrives as `sqlite3.IntegrityError`, which `_is_retryable` classes as
+    #      TERMINAL -- so a row that today lands with a dangling id would
+    #      instead be given up on, counted in INFERENCE_WRITE_FAILURES, and
+    #      gone. This module's whole write-durability design is about not losing
+    #      rows to database bookkeeping.
+    #
+    #   4. THE VALUE IS SMALL. NULL is legitimate and expected here (the API
+    #      server, every direct call), and the only non-NULL values are written
+    #      by the same process that created the run row moments earlier, into
+    #      the same file, under the same lock. There is no path that produces a
+    #      dangling id by accident -- the one that produces it ON PURPOSE is
+    #      `oncotriage/evaluation/sampling.py`, which copies a SUBSET of
+    #      `inferences` into a second database, and which this pass teaches to
+    #      copy the referenced `runs` rows with them.
+    #
+    # TURNING IT ON IS A ONE-PLACE DECISION THAT MUST BE TAKEN IN SEVEN: every
+    # connection site above, together, plus a wipe that deletes children before
+    # parents. Recorded here so that whoever wants it has the list.
+    cursor.execute('''
+CREATE TABLE IF NOT EXISTS runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    status TEXT NOT NULL,
+    invocation_source TEXT NOT NULL,
+    fingerprint_version INTEGER,
+    llm_classifier_prompt_version TEXT,
+    llm_classifier_renderer_digest TEXT,
+    matching_model_configured TEXT,
+    qdrant_collection TEXT,
+    collection_points INTEGER,
+    data_snapshot_date TEXT
+)
+''')
+
+    # NO `RUN_COLUMN_ADDITIONS` DICT, AND THE ABSENCE IS ARGUED.
+    #
+    # The two tables below each carry one because they PREDATE their own later
+    # columns; this table is new, so such a dict would be empty, and a `for
+    # _column in {}:` loop iterates nothing and passes for free. That is the
+    # shape pass 20f-3 deleted `_REEXPORT_EXEMPTIONS` for rather than emptying
+    # it: a check that has stopped checking looks exactly like one that works.
+    #
+    # A COLUMN ADDED TO THIS TABLE LATER GETS THE DICT AND THE LOOP, copied from
+    # the two below, in the same commit that adds the column -- at which point
+    # the loop has something to do. Until then the CREATE above is the whole
+    # declaration and `CREATE TABLE IF NOT EXISTS` is the whole idempotence.
+
     # Inferences table
     # candidates_filtered INTEGER is for trials sent to GPT-4o (after quality threshold + cost cap)
     cursor.execute('''
@@ -1500,6 +1790,252 @@ def _ensure_database(db_path):
 #------------------------------------------------------------------------------
 
 
+# ===========================================================================
+# THE RUN ROW: CREATE IT BEFORE THE FIRST PATIENT, FINALIZE IT AFTER THE LAST
+# ===========================================================================
+
+
+def _run_fingerprint_value(column, fingerprint):
+    """One stamp field, coerced for the column it is going into.
+
+    Returns the value to bind. ``None`` for anything the column cannot honestly
+    hold -- see ``RUN_FINGERPRINT_INTEGER_COLUMNS`` for why an unresolved count
+    may not be stored as the string ``"unknown"`` in a numeric column.
+
+    A ``fingerprint`` of ``None`` -- a caller that had no stamp to give --
+    leaves every one of these columns NULL, which is exactly the "no stamp was
+    recorded" state ``fingerprint_version IS NULL`` selects.
+    """
+    if not isinstance(fingerprint, dict):
+        return None
+    raw = fingerprint.get(column)
+    if raw is None:
+        return None
+    if column in RUN_FINGERPRINT_INTEGER_COLUMNS:
+        # `bool` first: isinstance(True, int) is True, and a `collection_points`
+        # of 1 that was really a True is a number nobody measured.
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            return None
+        return raw
+    return str(raw)
+
+
+def start_run_record(invocation_source, db_path=None, fingerprint=None):
+    """Open a run row at db_path and return its ``runs.id``.
+
+    Args:
+        invocation_source: which entry point is running. REQUIRED, with no
+            default, on ``empty_database(db_path, flag)``'s precedent: a default
+            of "unknown" would be a row that names no caller, and this column
+            exists to name one. A non-string or an empty one raises.
+
+            THE VOCABULARY IS OPEN, and that is the one place this module
+            declines the closed-set convention it follows for
+            ``RUN_RECORD_STATUSES``. A status is a fact this module produces and
+            can therefore enumerate; an invocation source is a fact about the
+            caller, and the set of callers grows outside this file. What is
+            enforced instead is that one was GIVEN.
+        db_path: where to write. ``None`` means the configured production
+            database -- ``resolve_inference_db_path``'s three tiers, the same
+            ones ``log_inference`` uses, so a caller that lets both resolve gets
+            one file by construction rather than by coincidence.
+        fingerprint: this run's configuration stamp, normally
+            ``oncotriage.run_fingerprint.current()``. ``None`` writes NULL to
+            every stamp column.
+
+            TAKEN AS AN ARGUMENT AND NOT RESOLVED HERE. This module may not
+            import ``run_fingerprint`` (see ``RUN_FINGERPRINT_COLUMNS`` for the
+            layering), and it should not want to: the caller has already
+            resolved the stamp once, on its main thread, and that ONE reading is
+            what gates its resume and stamps its checkpoint. A second resolution
+            here would be a second Qdrant round trip that can disagree with the
+            first across an alias swap -- the defect
+            ``oncotriage/tracking.py:configuration_params`` records finding by
+            running.
+
+    Returns:
+        The integer ``runs.id``. Never ``None``.
+
+    RAISES, AND THAT IS THE DESIGN. Every other write in this module refuses to
+    kill the pipeline, because those writes happen AFTER a live Stage 5 call has
+    been paid for. This one happens before the first patient, where a failure
+    costs nothing, and where continuing would produce a whole campaign of rows
+    that cannot be attributed to anything -- the exact condition the run row
+    exists to remove. ``oncotriage/tracking.py:start_run`` raises for the same
+    reason, at the same point in the same ``main()``, and is the precedent.
+
+    ``started_at`` IS ``datetime.now().isoformat()``, NAIVE AND LOCAL, matching
+    ``inferences.timestamp`` exactly. Both are read off the same clock and a
+    reader will compare them ("which patients ran inside this run's window");
+    making one UTC and the other local would put a silent offset between two
+    columns that are meant to be compared. If this project ever moves to UTC it
+    moves both, together.
+    """
+    if not isinstance(invocation_source, str) or not invocation_source.strip():
+        raise ValueError(
+            f"start_run_record: invocation_source must be a non-empty string "
+            f"naming the entry point that is running; got "
+            f"{invocation_source!r}. It has no default on purpose -- see this "
+            f"function's docstring.")
+
+    db_path = resolve_inference_db_path(db_path)
+
+    values = {
+        "started_at":        datetime.now().isoformat(),
+        # NULL until finalize_run_record fills it. A row whose finished_at is
+        # still NULL is the honest record of a process that did not get to
+        # finalize -- see finalize_run_record for the shape and the query.
+        "finished_at":       None,
+        "status":            RUN_RECORD_STATUS_RUNNING,
+        "invocation_source": invocation_source.strip(),
+    }
+    for column in RUN_FINGERPRINT_COLUMNS:
+        values[column] = _run_fingerprint_value(column, fingerprint)
+
+    columns = ", ".join(RUN_COLUMNS)
+    placeholders = ", ".join("?" * len(RUN_COLUMNS))
+
+    # UNDER THE WRITE LOCK, like every other statement this module issues.
+    # The two shipped call sites are main-thread-only -- this one runs before
+    # the pool is created and finalize_run_record after it has been joined --
+    # so the lock is uncontended in practice. It is taken anyway because the
+    # module's invariant is "every database statement in this file is issued
+    # under _WRITE_LOCK", and an invariant with a documented exception is a
+    # convention. _ensure_database takes it again; that is why it is an RLock.
+    with _WRITE_LOCK:
+        _ensure_database(db_path)
+        conn = _open_connection(db_path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"INSERT INTO runs ({columns}) VALUES ({placeholders})",
+                tuple(values[c] for c in RUN_COLUMNS))
+            run_id = cursor.lastrowid
+            conn.commit()
+        finally:
+            conn.close()
+
+    console.out(f"[Run] Opened run {run_id} ({invocation_source}) in {db_path}")
+    log.info("run record opened", event="run_record_opened",
+             inference_run_id=run_id, mode=invocation_source.strip(),
+             status=RUN_RECORD_STATUS_RUNNING, db_path=str(db_path))
+    return run_id
+
+
+def finalize_run_record(run_id, status, db_path=None):
+    """Stamp ``finished_at`` and ``status`` on a run row. NEVER RAISES.
+
+    Args:
+        run_id:  what ``start_run_record`` returned. ``None`` is tolerated and
+                 counted -- a caller whose run row was never opened has nothing
+                 to finalize, and making that an exception would turn a missing
+                 index entry into a crash at the end of a paid campaign.
+        status:  one of ``RUN_RECORD_TERMINAL_STATUSES``. An unrecognised value
+                 is replaced by ``FAILED`` and counted, never by ``FINISHED`` --
+                 ``oncotriage/tracking.py:end_run``'s rule, adopted verbatim,
+                 for its reason: a run whose ending could not be described is
+                 not a run that ended well. ``RUNNING`` is unrecognised HERE
+                 even though it is a member of ``RUN_RECORD_STATUSES``, because
+                 finalizing a run to "still going" is the one thing the end of a
+                 run must not do.
+        db_path: the database the run row is in. Must resolve to the same file
+                 ``start_run_record`` wrote to; ``None`` means the configured
+                 production database.
+
+    Returns:
+        True if exactly one row was updated. False on every failure, so a caller
+        that wants to know can ask -- and both shipped callers do not, because
+        the counter and the log line are what an operator reads.
+
+    IT RUNS AFTER THE MONEY IS SPENT, which is the whole reason it may not
+    raise: by this line the campaign has made one live Stage 5 call per patient
+    and written its rows, and an index failure must not take those with it. That
+    is ``log_run_metrics``'s argument and ``log_inference``'s, and the failure is
+    reported the way both report theirs -- a console line, a structured record
+    and ``RUN_RECORD_FAILURES``.
+
+    "NEVER RAISES" MEANS WHAT IT MEANS EVERYWHERE ELSE IN THIS MODULE:
+    ``except Exception``, so ``KeyboardInterrupt`` and ``MemoryError`` -- which
+    are not ``Exception`` subclasses -- still escape, exactly as they escape
+    ``_write_inference_row``. A finalizer that swallowed a Ctrl-C would leave an
+    operator holding a key down against a process that will not stop.
+
+    THE ROW COUNT IS CHECKED. ``UPDATE ... WHERE id = ?`` against an id that is
+    not there succeeds and updates nothing; SQLite reports no error for it. A
+    finalizer that did not read ``rowcount`` would report success for a run row
+    that was never written, which is the "reported success, wrote nothing"
+    shape the write-durability pass removed one function down.
+
+    PATH RESOLUTION IS INSIDE THE TRY HERE, AND THAT IS A KNOWING DEVIATION.
+    Everywhere else in this module -- ``log_inference``, and ``start_run_record``
+    above -- it happens outside, so a configuration defect (``resolve_inferences_db``
+    raises when the variable names a path whose parent is absent) reaches the
+    operator instead of being swallowed as a logging fault. The deviation is
+    forced by the contract: this function may not raise, full stop, because the
+    money is already spent. It costs nothing in practice -- every write of the
+    run this is finalizing resolved the same way and would have failed first --
+    and the defect is not hidden, it is counted under its exception type and
+    logged at ERROR.
+    """
+    try:
+        if run_id is None:
+            RUN_RECORD_FAILURES["finalize:no_run_id"] += 1
+            log.warning("finalize_run_record was called with no run id; "
+                        "nothing was finalized",
+                        event="run_record_finalize_skipped", status=str(status))
+            return False
+
+        if status not in RUN_RECORD_TERMINAL_STATUSES:
+            RUN_RECORD_FAILURES[f"finalize:unknown_status:{status}"] += 1
+            log.warning("an unrecognised run status was replaced by FAILED",
+                        event="run_record_status_unknown",
+                        inference_run_id=run_id, status=str(status))
+            status = "FAILED"
+
+        db_path = resolve_inference_db_path(db_path)
+
+        with _WRITE_LOCK:
+            conn = _open_connection(db_path)
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE runs SET finished_at = ?, status = ? WHERE id = ?",
+                    (datetime.now().isoformat(), status, run_id))
+                updated = cursor.rowcount
+                conn.commit()
+            finally:
+                conn.close()
+
+        if updated != 1:
+            RUN_RECORD_FAILURES["finalize:row_not_found"] += 1
+            console.out(f"⚠ Run {run_id} could not be finalized: "
+                        f"{updated} rows matched in {db_path}")
+            log.error("the run row to finalize was not found",
+                      event="run_record_finalize_missing",
+                      inference_run_id=run_id, status=status,
+                      count=updated, db_path=str(db_path))
+            return False
+
+        console.out(f"[Run] Closed run {run_id}: {status}")
+        log.info("run record closed", event="run_record_closed",
+                 inference_run_id=run_id, status=status, db_path=str(db_path))
+        return True
+
+    except Exception as exc:                                   # noqa: BLE001
+        RUN_RECORD_FAILURES[f"finalize:{type(exc).__name__}"] += 1
+        console.out(f"⚠ Run {run_id} could not be finalized (non-critical): "
+                    f"{type(exc).__name__}: {exc}")
+        log.error("the run record could not be finalized; it will read as "
+                  "RUNNING with a NULL finished_at",
+                  event="run_record_finalize_failed",
+                  inference_run_id=run_id, status=str(status),
+                  error_type=type(exc).__name__, error_message=str(exc))
+        return False
+
+
+#------------------------------------------------------------------------------
+
+
 # _resolve_primary_cancer MOVED OUT in pass 20c-2c.
 #
 # It lives in oncotriage/registries/primary_cancer.py now and is imported at the
@@ -1522,7 +2058,8 @@ def _ensure_database(db_path):
 
 
 # Logging function
-def log_inference(result: Dict, patient_data: Dict, db_path=None):
+def log_inference(result: Dict, patient_data: Dict, db_path=None,
+                  run_id=None):
     """
     Log inference result to SQLite database.
 
@@ -1545,6 +2082,24 @@ def log_inference(result: Dict, patient_data: Dict, db_path=None):
                       Files 36, 37, 38, 40 and 45 pass a temporary path; before
                       pass 20c-2b they rebound a global instead, which a module
                       function cannot see.
+        run_id:       The ``runs.id`` this write belongs to, or None.
+
+                      DEFAULTS TO None, WHICH IS A VALUE AND NOT A FALLBACK.
+                      NULL in the column means "not part of a recorded batch
+                      run", and it is what "17- FastAPI Server.py" and every
+                      direct caller write on purpose -- a request is not a
+                      campaign. See the column's note in
+                      INFERENCE_COLUMN_ADDITIONS.
+
+                      IT IS PASSED, NEVER LOOKED UP. There is deliberately no
+                      module-level "current run" that this function could read:
+                      such a state survives into the next run in the same
+                      process and would attribute the second campaign's rows to
+                      the first one's run row. That is the argument
+                      ``oncotriage/batch/runner.py:clear_write_ledger`` and
+                      ``run_fingerprint.clear_cache()`` are both written from,
+                      and threading the id as an argument is the version of it
+                      that cannot be forgotten -- there is nothing to clear.
 
     Returns:
         The database path this call actually used, so a caller can ASSERT where
@@ -1624,16 +2179,23 @@ def log_inference(result: Dict, patient_data: Dict, db_path=None):
     # `with` would bury the actual change of this pass in a whitespace diff
     # nobody can review. The guarantee is identical.
     #
-    # STILL EXACTLY THREE `with _WRITE_LOCK:` SITES IN THIS MODULE, and the
-    # retry loop is INSIDE this one rather than around it. Two reasons, both
-    # load-bearing: a retry that released and re-took the lock would let a
-    # second thread interleave between attempts, which is the interleaving the
-    # lock exists to forbid; and section 5e of tests/test_package_invariants.py
-    # asserts `locks_stripped == 3`, so a fourth site would fail a check that is
-    # measuring the lock rather than this pass.
+    # FIVE `with _WRITE_LOCK:` SITES IN THIS MODULE AS OF THE RUN-IDENTITY
+    # PASS -- initialize_database, _ensure_database, here, start_run_record and
+    # finalize_run_record -- and the retry loop is INSIDE this one rather than
+    # around it. Two reasons for the nesting, both load-bearing: a retry that
+    # released and re-took the lock would let a second thread interleave between
+    # attempts, which is the interleaving the lock exists to forbid; and section
+    # 5e of tests/test_package_invariants.py asserts on the number of sites its
+    # control STRIPPED, so a site added without updating that number fails a
+    # check that is measuring the lock rather than measuring this pass. The
+    # count moved 3 -> 5 there, deliberately and in the same commit: the
+    # assertion's job is non-degeneracy (the control really did remove
+    # something), and the two new sites are two more places the control must
+    # reach.
     with _WRITE_LOCK:
         outcome = _write_inference_row_with_retry(
-            result, patient_data, db_path, matching_model_used, total_cost)
+            result, patient_data, db_path, matching_model_used, total_cost,
+            run_id)
 
     # AFTER the finally inside _write_inference_row, not inside it. A return
     # inside a finally block SWALLOWS any exception propagating out of the try
@@ -1657,7 +2219,8 @@ def log_inference(result: Dict, patient_data: Dict, db_path=None):
 
 
 def _write_inference_row_with_retry(result: Dict, patient_data: Dict, db_path,
-                                    matching_model_used, total_cost):
+                                    matching_model_used, total_cost,
+                                    run_id=None):
     """Attempt the write up to ``SQLITE_WRITE_MAX_ATTEMPTS`` times.
 
     CALLERS HOLD ``_WRITE_LOCK``; see log_inference for why the loop is inside
@@ -1684,7 +2247,8 @@ def _write_inference_row_with_retry(result: Dict, patient_data: Dict, db_path,
     while attempts < max_attempts:
         attempts += 1
         outcome = _write_inference_row(result, patient_data, db_path,
-                                       matching_model_used, total_cost)
+                                       matching_model_used, total_cost,
+                                       run_id)
         outcome["attempts"] = attempts
 
         if outcome["ok"]:
@@ -1733,7 +2297,7 @@ def _write_inference_row_with_retry(result: Dict, patient_data: Dict, db_path,
 
 
 def _write_inference_row(result: Dict, patient_data: Dict, db_path,
-                         matching_model_used, total_cost):
+                         matching_model_used, total_cost, run_id=None):
     """The database half of log_inference. CALLERS HOLD ``_WRITE_LOCK``.
 
     Split out of log_inference in pass 20c-3b so the lock could be taken with a
@@ -1867,8 +2431,9 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 llm_classifier_cached_input_tokens, llm_classifier_call_details,
                 llm_classifier_packed_chunks, llm_classifier_packing,
                 matching_provider,
-                verdict_normalizations, remapped_trials
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                verdict_normalizations, remapped_trials,
+                run_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             result["patient_id"],
             result["timestamp"],
@@ -2095,6 +2660,16 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
             # HOW FAR THIS RUN GOT and must not.
             result.get("verdict_normalizations"),
             result.get("remapped_trials"),
+            # --- WHICH RECORDED RUN THIS ROW BELONGS TO --------------------
+            #
+            # FROM THE ARGUMENT, NOT FROM `result`, and the asymmetry with the
+            # two lines above is the same one `matching_provider` already
+            # carries a few lines up: those are facts about how far THIS
+            # PATIENT'S run got and are read off the result dict; this is a
+            # fact about the PROCESS that is writing, and the pipeline result
+            # knows nothing about it. Reading it off `result` would also let a
+            # model response, a fixture or a hand-built dict set it.
+            run_id,
         ))
         
         inference_id = cursor.lastrowid

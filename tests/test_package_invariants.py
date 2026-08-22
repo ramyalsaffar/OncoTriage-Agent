@@ -5334,8 +5334,20 @@ else:
     check("...writing more than one row", (_expected or 0) > 1, True)
     check("...over more than one trial, because a race is not deterministic",
           (_trials or 0) > 1, True)
-    check("the control actually removed the lock (all three sites)",
-          _payload.get("locks_stripped"), 3)
+    # 3 -> 5 AT THE RUN-IDENTITY PASS, which added start_run_record and
+    # finalize_run_record -- both of which issue statements against the same
+    # file and both of which therefore take the same lock, because that module's
+    # invariant is "every database statement in this file is under _WRITE_LOCK"
+    # and an invariant with an exception is a convention.
+    #
+    # THE NUMBER IS NOT THE SUBJECT. This assertion is a NON-DEGENERACY probe:
+    # its job is to say the control really did strip something, so that
+    # "unlocked lost rows" is a statement about an unlocked module rather than
+    # about a copy that was never modified. It has to move whenever a site is
+    # added -- which is exactly what makes it catch a site added and NOT reached
+    # by the control.
+    check("the control actually removed the lock (all five sites)",
+          _payload.get("locks_stripped"), 5)
 
     # SCENARIO A, reported honestly: the lock does NOT change this path.
     check("steady state, WITH the lock: every row lands",

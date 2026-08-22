@@ -666,6 +666,18 @@ LOGGABLE_FIELDS = frozenset({
     # is already here but means "the retry index" at the OpenAI call sites, and
     # a write that succeeded first time has made zero retries and one attempt.
     "attempts",
+    # The `inferences.db` run row's integer id -- the join key between a log
+    # line and the `runs` table, exactly as `patient_id` joins a line to
+    # `inferences`.
+    #
+    # DELIBERATELY NOT `run_id`, for the reason stated at `tracking_run_id`
+    # below and with the same force: `run_id` ALREADY MEANS the ablation
+    # database's integer run id (oncotriage/ablation/study.py passes it under
+    # that name), and two different integer keys under one field name is a log
+    # an aggregator cannot group. Three id spaces now exist and each has its
+    # own field: `run_id` (ablation), `tracking_run_id` (MLflow),
+    # `inference_run_id` (inferences.db).
+    "inference_run_id",
 
     # --- the run-to-configuration index (the tracking pass) ----------------
     # tracking_run_id is MLflow's run id: a random 32-hex identifier of an

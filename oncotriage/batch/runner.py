@@ -115,8 +115,10 @@ from oncotriage.config import (
 from oncotriage.agent.evaluation import MatchingModelMismatchError
 from oncotriage.fhir.parser import parse_fhir_bundle
 from oncotriage.storage.database_logger import (
+    finalize_run_record,
     log_inference,
     resolve_inference_db_path,
+    start_run_record,
 )
 from oncotriage import utils
 from oncotriage.utils import CaffeinateSession, preserve_corrupt_file
@@ -193,6 +195,17 @@ _checkpoint_lock = threading.Lock()
 # ONCOTRIAGE_INFERENCES_DB set. The delta is still reported, because it is the
 # cheap cross-check File 19 uses and because a discrepancy between it and the
 # ledger is itself informative; it just does not decide the verdict.
+INVOCATION_SOURCE = "batch_runner"
+"""What this module records in ``runs.invocation_source``.
+
+A CONSTANT AND NOT A LITERAL AT THE CALL SITE, so a query grouping campaigns by
+their entry point can be written against a name rather than against a string
+somebody may retype. The value is the MODULE, not the numbered file: "25- Batch
+Runner.py" is one way in and ``runner.main()`` is directly callable by an
+embedder, and both are this runner.
+"""
+
+
 _write_ledger_lock = threading.Lock()
 
 _WRITE_LEDGER = []
@@ -758,6 +771,7 @@ def process_patient(
     fhir_path: str,
     graph: object,
     is_resample: bool = False,
+    run_id=None,
 ) -> dict:
     """
     Run the full pipeline for one patient file.
@@ -769,6 +783,16 @@ def process_patient(
         fhir_path:   Absolute path to patient FHIR JSON bundle file.
         graph:       Compiled LangGraph StateGraph (shared, read-only).
         is_resample: True when this is a resample re-run of an existing patient.
+        run_id:      The `runs.id` main() opened for THIS invocation, threaded
+                     down as an argument and never read off a module global.
+
+                     A DEFAULT OF None IS A REAL CASE, not a convenience: a
+                     caller driving one patient outside a campaign has no run
+                     to attach to, and NULL in the column says exactly that.
+                     What the default must NOT become is a fallback that looks
+                     one up -- see log_inference's `run_id` docstring for why a
+                     module-level "current run" would attribute a second
+                     campaign's rows to the first one's row.
 
     Returns:
         Dict with keys: patient_id, status, eligible_matches, near_misses,
@@ -822,7 +846,11 @@ def process_patient(
         # Stage 5 call -- so the outcome it reports is the only channel by which
         # the loss leaves this worker thread. record_write puts it in the ledger
         # that reconcile_writes reads at the end of the run.
-        write_result = log_inference(result, patient_data)
+        # run_id ties this row to the `runs` record main() opened. It is
+        # forwarded, never resolved here, and db_path is still left to
+        # log_inference so the row and the reconciliation read the same
+        # resolution.
+        write_result = log_inference(result, patient_data, run_id=run_id)
         record_write(patient_id, write_result, is_resample)
 
         # DELIBERATELY NOT FOLDED INTO `status`. A lost row means the DATABASE is
@@ -1003,7 +1031,7 @@ class _DriftAnnouncer:
 # ===========================================================================
 
 
-def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object, completed_ids: set, results_list: list,) -> tuple:
+def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object, completed_ids: set, results_list: list, run_id=None,) -> tuple:
     """
     Process all patients not already in completed_ids using concurrent threads.
 
@@ -1018,6 +1046,9 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
         graph:         Compiled LangGraph StateGraph (read-only, shared).
         completed_ids: Set of already-completed filename stem strings (mutated).
         results_list:  In-memory results list (mutated via append_result).
+        run_id:        The `runs.id` this pass's writes belong to, forwarded to
+                       every worker. None means the writes carry NULL, which is
+                       what a caller driving this function outside main() gets.
 
     Returns:
         Tuple of (completed_ids, main_pass_complete).
@@ -1156,6 +1187,7 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
                     fhir_path=fhir_path,
                     graph=graph,
                     is_resample=False,
+                    run_id=run_id,
                 )
                 future.add_done_callback(lambda f, fp=fhir_path: _on_done(f, fp))
                 futures.append(future)
@@ -1187,7 +1219,7 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
 # ===========================================================================
 
 
-def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_ids: list, graph: object, results_list: list,) -> None:
+def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_ids: list, graph: object, results_list: list, run_id=None,) -> None:
     """
     Re-run a random subset of already-processed patients using concurrent threads.
 
@@ -1197,6 +1229,13 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
 
     Does NOT update the checkpoint (resample entries are supplemental,
     not required for resume logic).
+
+    ``run_id`` is the ``runs.id`` main() opened, forwarded to every worker so a
+    resample row is attributed to the SAME run as the main-pass row for that
+    patient. That is deliberate and it is what makes the ledger's design read
+    correctly at the SQL level too: a resample re-run is a second `inferences`
+    row of one campaign, not a second campaign, so `COUNT(*) ... WHERE run_id =
+    ?` is rows-of-this-run and never patients-of-this-run.
 
     Args:
         fhir_files:    Full list of FHIR file path strings.
@@ -1287,6 +1326,7 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
                     fhir_path=fhir_path,
                     graph=graph,
                     is_resample=True,
+                    run_id=run_id,
                 )
                 future.add_done_callback(lambda f: _on_done(f))
                 futures.append(future)
@@ -1952,7 +1992,50 @@ def main():
         results_list = load_results()
 
         # ------------------------------------------------------------------
-        # 3b. Open the tracking run (the tracking pass)
+        # 3b. Open the RUN ROW (the run-identity pass)
+        # ------------------------------------------------------------------
+        # BEFORE THE FIRST PATIENT, so a process that dies mid-campaign leaves
+        # a row whose finished_at is NULL and whose status still reads RUNNING.
+        # That row is the honest record of a crash and it is queryable as one:
+        #
+        #     SELECT * FROM runs WHERE finished_at IS NULL AND status='RUNNING'
+        #
+        # Creating it at the END instead would mean a crashed campaign left no
+        # trace at all and its rows' run_id pointed at nothing -- which is the
+        # state this pass exists to remove, arrived at from the other side.
+        #
+        # IT IS A LOCAL OF THIS FUNCTION AND IS THREADED DOWN AS AN ARGUMENT.
+        # There is no module-level "current run", and that is the whole
+        # mechanism behind "a second main() in one process creates a new run
+        # row": there is no state to survive into the next call and therefore
+        # nothing to clear. Compare clear_write_ledger() and
+        # run_fingerprint.clear_cache() at the top of this function -- both
+        # exist because their state IS module-level, and both are one forgotten
+        # line away from describing the wrong run.
+        #
+        # IT RAISES, like tracking.start_run below it and for the same reason:
+        # this is before the first billed call, so a run that could not be
+        # recorded stops here having cost nothing. Every alternative is worse --
+        # a whole campaign of rows carrying NULL run_id is indistinguishable
+        # from API traffic, which is precisely what the timestamp heuristic
+        # could not separate.
+        #
+        # THE STAMP IS THE ONE _fingerprint RESOLVED ABOVE, on this thread,
+        # which also gated the resume and stamps the checkpoint. One reading,
+        # three consumers; a second resolution here could straddle an alias
+        # swap and record a configuration this run never had.
+        #
+        # db_path IS PASSED EXPLICITLY, and it is the same string
+        # reconcile_writes reads, so the run row and the reconciliation cannot
+        # end up describing two different files.
+        _run_record_id = start_run_record(
+            INVOCATION_SOURCE,
+            db_path=_reconcile_db,
+            fingerprint=_fingerprint,
+        )
+
+        # ------------------------------------------------------------------
+        # 3c. Open the tracking run (the tracking pass)
         # ------------------------------------------------------------------
         # WHY HERE AND NOT HIGHER. It is after every preflight -- the BM25
         # index, the graph, the corpus, the baseline row count and now the
@@ -1979,15 +2062,39 @@ def main():
         # the only tracking calls in this module, and all three run before the
         # pool is created or after it has been joined; no worker touches
         # oncotriage/tracking.py.
-        tracking.start_run(
-            kind="batch",
-            params={
-                "patient_count": len(fhir_files),
-                "resample_count": RESAMPLE_COUNT,
-                "resample_seed": RESAMPLE_SEED,
-            },
-            tags={"resumed": "true" if completed_ids else "false"},
-        )
+        #
+        # WRAPPED, BECAUSE THE RUN ROW IS ALREADY OPEN BY THIS LINE. start_run
+        # raises when tracking is unavailable -- which is the design -- and
+        # between step 3b and the `try` below there is no handler, so an
+        # unwrapped raise here would leave a `runs` row at RUNNING with a NULL
+        # finished_at forever, describing a campaign that never started. That is
+        # the one shape this pass reserves for a process that was killed outright
+        # and it must not be produced by an ordinary configuration failure.
+        #
+        # NOT SOLVED BY REORDERING. Putting start_run FIRST moves the orphan to
+        # the other side and makes it worse: MLflow's atexit hook closes an open
+        # run as FINISHED, so a tracking run orphaned by a failure below it is
+        # indexed as a campaign that COMPLETED. A NULL finished_at at least reads
+        # as unfinished.
+        #
+        # NOT SOLVED BY MOVING IT INTO THE `try` EITHER: that handler calls
+        # tracking.end_run, which with no active run counts
+        # `end_run:NoActiveRun` into TRACKING_DEGRADATIONS -- a degradation that
+        # did not happen, reported by the code that was meant to report the one
+        # that did.
+        try:
+            tracking.start_run(
+                kind="batch",
+                params={
+                    "patient_count": len(fhir_files),
+                    "resample_count": RESAMPLE_COUNT,
+                    "resample_seed": RESAMPLE_SEED,
+                },
+                tags={"resumed": "true" if completed_ids else "false"},
+            )
+        except BaseException:
+            finalize_run_record(_run_record_id, "KILLED", db_path=_reconcile_db)
+            raise
 
         # THE RUN IS CLOSED ON EVERY EXIT PATH, and this try exists only for
         # that. MEASURED, not assumed: a process that opens an MLflow run and
@@ -2017,6 +2124,7 @@ def main():
                 graph=graph,
                 completed_ids=completed_ids,
                 results_list=results_list,
+                run_id=_run_record_id,
             )
 
             # ------------------------------------------------------------------
@@ -2033,6 +2141,7 @@ def main():
                     nct_ids=nct_ids,
                     graph=graph,
                     results_list=results_list,
+                    run_id=_run_record_id,
                 )
             else:
                 console.out("[Resample] Skipped: no successfully completed patients.")
@@ -2110,8 +2219,74 @@ def main():
                      "\n".join(degradation.report_lines(degradation_snapshot))),
                 ])
 
+            # ------------------------------------------------------------------
+            # 9. Close the run row (the run-identity pass)
+            # ------------------------------------------------------------------
+            # THE STATUS IS THE MAIN PASS'S, the same fact the checkpoint
+            # decision and tracking.end_run above are both made on -- one run,
+            # one verdict, stated once. It is deliberately NOT the
+            # reconciliation's: a campaign whose patients all succeeded and
+            # whose rows were lost is FINISHED here and incomplete there, and
+            # collapsing the two would delete the distinction the
+            # write-durability pass exists to surface.
+            #
+            # LAST, AND THE POSITION IS LOAD-BEARING RATHER THAN TIDY. Every
+            # other statement in this `try` can raise -- tracking_metrics walks
+            # the results list, _results_path resolves a path, report_lines
+            # formats a snapshot -- and the handler below finalizes to KILLED.
+            # With this call anywhere ABOVE them, a raise in between would
+            # OVERWRITE a FINISHED row with KILLED and report a completed
+            # campaign as a crashed one. Being the last statement makes the two
+            # finalize paths mutually exclusive by construction, which is
+            # stronger than a "have I finalized yet" flag somebody has to
+            # remember to set.
+            #
+            # THE COST IS STATED: finished_at now includes the seconds the
+            # tracking store spent attaching artifacts. That is the honest end
+            # of the run rather than the end of its patients, and
+            # `inferences.timestamp` is what bounds the patients.
+            #
+            # IT CANNOT RAISE. By this line the run has spent one live Stage 5
+            # call per patient and written its rows; a bookkeeping failure must
+            # not take those with it. A failure lands in RUN_RECORD_FAILURES,
+            # which the NEXT run's degradation block reports -- this one has
+            # already printed, exactly as the tracking calls above already
+            # accept.
+            finalize_run_record(
+                _run_record_id,
+                "FINISHED" if not main_errors else "FAILED",
+                db_path=_reconcile_db,
+            )
+
             return results_list
         except BaseException:
+            # KILLED, NOT FAILED, AND THE TWO ARE DIFFERENT FINDINGS. FAILED on
+            # the success path above means "the campaign ran to the end and some
+            # patients errored"; KILLED here means "the process did not get to
+            # the end" -- an unhandled exception, a Ctrl-C, a SystemExit. An
+            # operator reading `runs` needs to tell a campaign that finished
+            # badly from one that stopped, because only the second has patients
+            # that were never attempted.
+            #
+            # tracking.end_run stays FAILED because MLflow's vocabulary is what
+            # it is and this module does not get to widen it; the divergence is
+            # stated rather than smoothed over.
+            #
+            # THIS IS REACHABLE ONLY WHEN THE SUCCESS-PATH FINALIZE DID NOT
+            # RUN, because that call is the LAST statement of the `try`. So the
+            # two never both fire and this one can never overwrite a FINISHED
+            # row -- see the note there.
+            #
+            # A FINALIZED KILLED IS BETTER THAN AN UNFINALIZED ROW, which is
+            # why this is attempted at all rather than left to the NULL. The
+            # NULL shape survives for what it is actually for: a process that
+            # had no chance to run any handler -- SIGKILL, a power loss, an OOM
+            # kill. Both are queryable and they are not the same event.
+            #
+            # finalize_run_record does not raise, so it cannot displace the
+            # exception on its way out; `raise` re-raises the original,
+            # unchanged, exactly as before this pass.
+            finalize_run_record(_run_record_id, "KILLED", db_path=_reconcile_db)
             tracking.end_run(status="FAILED")
             raise
 

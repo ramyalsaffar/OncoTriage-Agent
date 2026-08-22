@@ -1150,8 +1150,13 @@ _tables = [r[0] for r in _conn.execute(
 _conn.close()
 check("matching_provider is TEXT in the real schema",
       at(_decl, "matching_provider"), "TEXT")
+# `runs` JOINED THE LIST AT THE RUN-IDENTITY PASS and is NOT a lookup table for
+# this column: it holds one row per batch campaign, and `matching_provider`
+# remains a plain string on `inferences`. The assertion is kept EXACT rather
+# than narrowed to "no table whose name mentions provider", because exact is
+# what makes it fail when a lookup table IS introduced under any name.
 check("...and no lookup table was introduced for it",
-      sorted(_tables), ["drift_metrics", "inferences", "trial_matches"])
+      sorted(_tables), ["drift_metrics", "inferences", "runs", "trial_matches"])
 check("...beside matching_model, which is TEXT for the same reason",
       at(_decl, "matching_model"), "TEXT")
 

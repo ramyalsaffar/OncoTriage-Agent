@@ -1111,7 +1111,22 @@ def _calls(source, dotted):
 # and a count that did not include it would pass with the guard deleted.
 def _guard_shape(source):
     """``(exception name, the tracking function called, whether it re-raises)``
-    for the crash guard, or a marker triple when there is no such handler."""
+    for the crash guard, or a marker triple when there is no such handler.
+
+    THE HANDLER IS SELECTED BY WHAT IT CALLS, NOT BY BEING THE FIRST ONE.
+    The first version took the first ``except BaseException`` in the file, which
+    was the tracking guard when this check was written and stopped being it at
+    the run-identity pass: ``oncotriage/batch/runner.py`` now wraps
+    ``tracking.start_run`` in its own ``except BaseException`` that finalizes the
+    already-open ``runs`` row and re-raises. That handler is correct and has
+    nothing to do with this assertion, and a positional selector reported it as
+    a tracking guard that closes no run.
+
+    So the subject is stated rather than assumed: the handler that CLOSES THE
+    TRACKING RUN. A file with no such handler still returns the marker triple
+    and still fails, which is what the check is for.
+    """
+    fallback = None
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.Try):
             continue
@@ -1125,8 +1140,11 @@ def _guard_shape(source):
                       and n.func.value.id == "tracking"]
             reraises = any(isinstance(n, ast.Raise) and n.exc is None
                            for n in ast.walk(h))
-            return (h.type.id, called[0] if called else "<none>", reraises)
-    return ("<no BaseException handler>", "<none>", False)
+            if called:
+                return (h.type.id, called[0], reraises)
+            if fallback is None:
+                fallback = (h.type.id, "<none>", reraises)
+    return fallback or ("<no BaseException handler>", "<none>", False)
 
 check("10i  the batch runner opens one run, logs once, and closes it on BOTH "
       "exit paths (the normal one and the crash guard)",

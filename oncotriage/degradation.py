@@ -161,6 +161,11 @@ _REGISTRY_SPEC = (
     ("INFERENCE_WRITE_FAILURES", _database_logger.INFERENCE_WRITE_FAILURES,
      "a database write was GIVEN UP ON -- the row is lost; the reconciliation "
      "block above is the authority on which"),
+    ("RUN_RECORD_FAILURES", _database_logger.RUN_RECORD_FAILURES,
+     "a batch run's `runs` row could not be FINALIZED, so it still reads "
+     "RUNNING with a NULL finished_at -- the rows it produced are fine and "
+     "the record of the run that produced them is not. There is no start-side "
+     "key here because start_run_record RAISES rather than counting"),
     ("JOURNAL_MODE_DEGRADATIONS", _database_logger.JOURNAL_MODE_DEGRADATIONS,
      "the database is not in the journal mode SQLITE_JOURNAL_MODE asked for; "
      "keyed requested->actual"),
