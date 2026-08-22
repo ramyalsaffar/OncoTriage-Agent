@@ -480,11 +480,20 @@ COPY --from=builder --chown=appuser:appuser /opt/venv /opt/venv
 # airflow_home/dags and airflow_home/logs are not in _DOCKER_PATHS and do not
 # need to be: `write_dag_file()` does `dag_dir.mkdir(parents=True,
 # exist_ok=True)` before writing, and Airflow creates its own log tree.
+#
+# /app/testing IS THE FIFTH, added by the portability pass. It is the container
+# side of `testing_path` -- the Characterization Fixtures and Evaluation Runs
+# trees, which used to be resolved by two private globs that INVENTED a
+# directory when nothing matched. docker-compose.yml mounts the `app_testing`
+# named volume here, for the reason every other volume exists: a containerised
+# `python fixture_capture.py` is twelve real billed runs, and without a volume
+# its output dies with the container.
 RUN mkdir -p \
     /app/data \
     /app/results \
     /app/checkpoint \
     /app/airflow_home \
+    /app/testing \
     && chown -R appuser:appuser /app
 
 # Copy application code

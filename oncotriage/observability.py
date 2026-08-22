@@ -547,6 +547,15 @@ LOGGABLE_FIELDS = frozenset({
     # data into a message, and because a Bedrock degradation line is only
     # actionable when the record says which provider produced it.
     "provider",
+    # WHICH DECIDED THE MODEL-CACHE ROOT -- "environment" or "project", the two
+    # members of oncotriage/paths.py:MODEL_CACHE_SOURCES and nothing else. The
+    # PATH ITSELF IS NOT HERE AND MUST NOT BE: an operator-set HF_HOME is very
+    # often under their home directory and therefore carries a username, which
+    # is exactly the kind of value this allowlist exists to keep out of a
+    # durable record. The path goes to the console channel instead, which is
+    # transient and unindexed -- the same split `password_source()` makes when
+    # it reports which tier answered without returning the secret.
+    "model_cache_source",
     "model", "tokens_in", "tokens_out", "tokens_estimated", "tokens_actual",
     "finish_reason", "retry", "max_retries", "truncations", "cost_usd",
     "tokens_reasoning", "estimate_ratio", "calls",

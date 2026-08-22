@@ -51,7 +51,7 @@ Run from terminal:
     python .github/scripts/provision_ci_paths.py --root /path/to/ci-root
 
 Exit codes:
-    0 -- the skeleton is present and all fourteen path variables resolve
+    0 -- the skeleton is present and all eighteen path variables resolve
     1 -- a directory could not be created, or a path still does not resolve
 """
 
@@ -77,6 +77,7 @@ _CODE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 def _skeleton(root):
     data = os.path.join(root, "02- Data")
     results = os.path.join(root, "04- Results")
+    testing = os.path.join(root, "09- Testing")
     return {
         "data_path":                data + os.sep,
         "data_patient_path":        os.path.join(data, "01- Patients") + os.sep,
@@ -96,6 +97,24 @@ def _skeleton(root):
         "keys_path":                os.path.join(root, "05- Keys") + os.sep,
         "airflow_path":             os.path.join(root, "06- Airflow") + os.sep,
         "checkpoint_path":          os.path.join(root, "08- Checkpoint") + os.sep,
+        # THE TESTING TREE (the portability pass). `testing_fixture_path` and
+        # `testing_evaluation_path` were resolved by two private globs in
+        # oncotriage/fixtures/capture.py and
+        # oncotriage/evaluation/run_harness.py, each of which INVENTED
+        # "{root}/09- Testing" when nothing matched. They are ordinary path
+        # variables now, which means they raise like every other one -- so CI
+        # needs the directories, and it needs them EMPTY: a fixture is a real
+        # billed capture and an evaluation run is a paid campaign, and this
+        # file fabricates neither.
+        "testing_path":             testing + os.sep,
+        "testing_fixture_path":     os.path.join(testing, "Characterization Fixtures") + os.sep,
+        "testing_evaluation_path":  os.path.join(testing, "Evaluation Runs") + os.sep,
+        # The local model cache. A DIRECTORY and nothing else -- no checkpoint
+        # is downloaded here. Nothing in bucket A loads a model
+        # (ONCOTRIAGE_DEFER_LOCAL_MODELS, and every client is replaced through
+        # oncotriage/agent/deps.py), so this exists so that the path RESOLVES,
+        # which is what the verification below asks of every name.
+        "model_cache_path":         os.path.join(data, "07- Model Cache") + os.sep,
         # code_path globs `{root}/*Code/`. The checkout supplies it; the
         # workflow checks the repository out INTO the root under a matching
         # name. Listed so the PATH_NAMES cross-check below is exhaustive.
@@ -147,7 +166,7 @@ def main(argv=None):
     #
     # `oncotriage/paths.py` sets
     # `IS_DOCKER = os.path.exists('/.dockerenv') or DOCKER_CONTAINER == 'true'`,
-    # and under it `_RESOLVERS` becomes `_DOCKER_PATHS` -- fourteen literal
+    # and under it `_RESOLVERS` becomes `_DOCKER_PATHS` -- eighteen literal
     # `/app/...` strings. Those resolve without globbing anything, so the
     # verification at the end of this function passes whatever this function
     # created, `ONCOTRIAGE_MAIN_PATH` is ignored entirely, and the tests then

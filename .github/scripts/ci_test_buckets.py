@@ -565,7 +565,25 @@ BUCKETS = {
     "test_observability_logging.py": (
         _A, None, "ran green in 9.2s; all six stages driven with deps stand-ins"),
     "test_paths_glob_determinism.py": (
-        _A, None, "ran green in 0.1s against the skeleton; asserts 14 resolvers"),
+        _A, None, "ran green in 0.1s against the skeleton; asserts 18 resolvers"),
+    "test_paths_portability_roots.py": (
+        _A, None,
+        "ran green in 2.6s, 101 checks, against ONLY the directory skeleton: "
+        "the two Testing roots and the model cache promoted into PATH_NAMES, "
+        "and the three load sites that pin the model caches. No network, no "
+        "keys, no spend, no live Qdrant, no corpus, no database and no git "
+        "history; NO MODEL IS LOADED -- ONCOTRIAGE_DEFER_LOCAL_MODELS is set "
+        "above the imports and section 8p asserts torch and transformers never "
+        "entered sys.modules. Every root it resolves is FABRICATED under a "
+        "tempfile.mkdtemp it removes and asserts gone, reached by seeding "
+        "paths._RESOLVED and restoring it, so nothing outside that directory "
+        "is written. It EXECS NOTHING -- every control is a different INPUT to "
+        "a function, an ast walk over an in-memory copy, or an attribute "
+        "rebound inside try/finally with the restore asserted -- and the five "
+        "repository files it reads (paths.py, fixtures/capture.py, "
+        "evaluation/run_harness.py, agent/deps.py, embedding.py) are written "
+        "by neither of the suite's two writers, so it is NOT in the collision "
+        "matrix"),
     "test_registries_cancer_codes_and_stage_extraction.py": (
         _A, None, "ran green in 0.2s"),
     "test_storage_inference_logging_contract.py": (

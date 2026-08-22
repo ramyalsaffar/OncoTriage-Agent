@@ -383,6 +383,55 @@ _DOCKER_PATHS = {
     # is not touched by this or any commit. Nothing resolves to it any more.
     "data_MeSH_path":           "/app/data/mesh/",
     "checkpoint_path":          "/app/checkpoint/",
+
+    # ---- the Testing tree (the portability pass) --------------------------
+    #
+    # These three were NOT in this table and NOT in the local one. Both roots
+    # were resolved by a private `sorted(glob.glob(main_path + "/*Testing"))`
+    # -- one copy in `oncotriage/fixtures/capture.py:fixture_root()` and a
+    # second in `oncotriage/evaluation/run_harness.py:evaluation_root()` --
+    # and BOTH fell back to `os.path.join(main_path, "09- Testing")` when the
+    # glob matched nothing. That fallback is the defect: it INVENTS a path
+    # rather than raising, so a wrong or unset root sent twelve captured
+    # fixtures, or a paid evaluation campaign's manifest and per-patient
+    # records, into a directory nobody was looking at, and every one of those
+    # runs reported success. Neither had an ambiguity guard either, so two
+    # `*Testing` siblings resolved by filesystem order -- the exact
+    # nondeterminism pass 20f-1 removed from every other path in this module.
+    #
+    # `testing_path` exists because both leaves hang off it. Without it each
+    # leaf would carry its own copy of the `*Testing/` pattern, which is two
+    # copies of one fact and the shape this module removes everywhere else.
+    # It is read by the two resolvers below and by nothing outside this file,
+    # which is the same standing `results_path` had before the ablation and
+    # tracking trees were added under it.
+    "testing_path":             "/app/testing/",
+    "testing_fixture_path":     "/app/testing/characterization_fixtures/",
+    "testing_evaluation_path":  "/app/testing/evaluation_runs/",
+
+    # ---- the model cache (the portability pass) ---------------------------
+    #
+    # WHERE THE TWO LOCAL MODEL CACHES GO, and until this pass neither was in
+    # the project tree at all: the MedCPT cross-encoder (836 MB on disk,
+    # MEASURED -- see the block above pin_model_cache) landed in
+    # huggingface_hub's default under the user's HOME, and the FastEmbed BM25
+    # model landed in `tempfile.gettempdir()/fastembed_cache`, which on macOS
+    # is under /var/folders and is PURGEABLE -- so a long campaign could lose
+    # its BM25 encoder mid-run and silently re-download it.
+    #
+    # THE CONTAINER VALUE IS NOT /app/... AND THAT IS DELIBERATE. The
+    # Dockerfile already sets HF_HOME=/opt/models/huggingface and
+    # FASTEMBED_CACHE_PATH=/opt/models/fastembed and docker-compose.yml already
+    # mounts the `model_cache` named volume at /opt/models. This entry
+    # DESCRIBES that arrangement rather than moving it: the cache has a
+    # different lifecycle from the application data (it is regenerable, it is
+    # large, and it must survive `down -v` of the data volumes independently),
+    # which is why it has its own volume and its own root there.
+    #
+    # The name has no `data_` prefix for the same reason: the local branch puts
+    # it under the data tree and the container does not, so a prefix naming one
+    # of the two would be false in the other.
+    "model_cache_path":         "/opt/models/",
 }
 
 
@@ -425,6 +474,28 @@ _LOCAL_PATHS = {
         lambda: _glob_one(_root() + "/*Airflow/", "Airflow"),
     "checkpoint_path":
         lambda: _glob_one(_root() + "/*Checkpoint/", "checkpoint"),
+    # See the Docker table above for what these four replace and why. The
+    # patterns are suffix globs like every other entry here, so the Testing
+    # tree and its two subdirectories can be renumbered but not renamed past
+    # their suffix -- and a missing one now RAISES naming the pattern, which
+    # is what the two private resolvers refused to do.
+    "testing_path":
+        lambda: _glob_one(_root() + "/*Testing/", "testing"),
+    "testing_fixture_path":
+        lambda: _glob_one(_resolve("testing_path") + "/*Characterization Fixtures/",
+                          "characterization fixtures"),
+    "testing_evaluation_path":
+        lambda: _glob_one(_resolve("testing_path") + "/*Evaluation Runs/",
+                          "evaluation runs"),
+    # UNDER THE DATA TREE RATHER THAN AS A NEW ROOT-LEVEL SIBLING, on this
+    # module's own argument for `result_tracking_path`: a root-level glob is
+    # one more way `_glob_one` can fail on a machine that has everything else.
+    # The data tree is already where every downloaded third-party artefact
+    # lives -- the trial corpus, the MeSH release, the Synthea bundles -- and a
+    # model checkpoint is one more of those.
+    "model_cache_path":
+        lambda: _glob_one(_resolve("data_path") + "/*Model Cache/",
+                          "model cache"),
 }
 
 
@@ -434,7 +505,7 @@ _RESOLVERS.update(
     if IS_DOCKER else _LOCAL_PATHS
 )
 
-# Both branches must expose the SAME fourteen names — that is the defect item
+# Both branches must expose the SAME eighteen names — that is the defect item
 # 20a found in code_path, restated as a check now that the two branches are two
 # dicts rather than two halves of an if. Checked at import because it costs one
 # set comparison and catches a name added to one table and not the other.
@@ -475,6 +546,235 @@ def __dir__():
     """The eager names plus the lazy ones, so dir() and tab completion agree
     with what getattr() will actually serve."""
     return sorted(set(globals()) | set(_RESOLVERS))
+
+
+#------------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# The local model caches
+# ---------------------------------------------------------------------------
+#
+# TWO MODELS ARE DOWNLOADED AT RUN TIME AND NEITHER USED TO LAND IN THE PROJECT
+# TREE. `oncotriage/agent/deps.py` loads `ncbi/MedCPT-Cross-Encoder` through
+# transformers, which caches under huggingface_hub's default -- the user's
+# HOME. MEASURED ON 2026-08-22 AT 836 MB on disk, not the ~110 MB this project
+# has been repeating since item 21: the repository serves the weights in two
+# formats and huggingface_hub fetches what transformers asks for. The old
+# figure is left as written wherever it appears in a past-tense account; it is
+# wrong, and the number that matters here is that this is the largest single
+# thing the pipeline puts anywhere. `oncotriage/embedding.py` builds the FastEmbed `Qdrant/bm25`
+# encoder, and fastembed's default is
+# `os.path.join(tempfile.gettempdir(), "fastembed_cache")` -- read out of
+# fastembed/common/utils.py:define_cache_dir, not assumed. On macOS that is
+# under /var/folders, which the operating system may PURGE at any time; a purge
+# during a campaign is a silent re-download inside a run that is otherwise
+# spending money per patient.
+#
+# THE ENVIRONMENT VARIABLE IS NOT THE MECHANISM FOR HUGGINGFACE, AND THAT WAS
+# MEASURED RATHER THAN ASSUMED. huggingface_hub reads HF_HOME ONCE, at its own
+# import, into module constants, and in THIS project huggingface_hub is
+# already imported before any pipeline code runs: `qdrant_client` imports
+# `fastembed` at module scope and `fastembed` imports `huggingface_hub` at
+# module scope, so `import oncotriage.agent.deps` alone puts both in
+# sys.modules. Measured on 2026-08-22, in that order:
+#
+#     hf_hub HF_HUB_CACHE at its import : ~/.cache/huggingface/hub
+#     os.environ["HF_HOME"] = "/tmp/..."
+#     transformers TRANSFORMERS_CACHE   : ~/.cache/huggingface/hub   <- UNMOVED
+#
+# So a pass that only exported HF_HOME would have reported a pinned cache,
+# changed nothing, and gone on downloading into the user's home -- the silent
+# false report this project treats as worse than a failure. The mechanism is
+# therefore the `cache_dir=` ARGUMENT, which transformers resolves at CALL time
+# and which outranks every variable. `huggingface_cache_dir()` and
+# `fastembed_cache_dir()` below are what the three load sites pass.
+#
+# THE VARIABLE IS STILL SET, and it is not decoration: it is what a SUBPROCESS
+# inherits, it is what a library reached by a path this module does not know
+# about will read, and it keeps the host arrangement identical in shape to the
+# container's (HF_HOME=/opt/models/huggingface,
+# FASTEMBED_CACHE_PATH=/opt/models/fastembed, set in the Dockerfile). The value
+# it is set to and the value handed to `cache_dir=` agree by construction:
+# huggingface_hub's own rule is HF_HUB_CACHE = HF_HOME + "/hub", and that is
+# exactly what `huggingface_cache_dir()` returns.
+#
+# THE ENVIRONMENT WINS, ALWAYS. An operator who has exported HF_HOME -- or
+# HF_HUB_CACHE, which is honoured and never written -- has said where their
+# model cache is, very often a shared cache holding several projects'
+# checkpoints, and moving it out from under them would re-download gigabytes
+# and orphan what is there. Only the DEFAULT moves. When the environment
+# answered, `*_cache_dir()` returns None and the library's own resolution is
+# left completely alone rather than being second-guessed with a path this
+# module computed. That is also what keeps the Docker branch untouched (its
+# variables are set in the image) and it is the escape hatch for a machine with
+# no `*Model Cache/` directory: set the variable and nothing here resolves a
+# path at all.
+#
+# WHAT AN EMPTY VALUE MEANS. `HF_HOME=""` is treated as UNSET rather than as an
+# explicit choice: an empty cache root is not a location, and honouring it would
+# hand huggingface_hub a path that resolves relative to the working directory.
+# Same treatment `oncotriage/settings.py` gives every ONCOTRIAGE_* variable.
+#
+# WHY THE ANSWER IS CACHED. `pin_model_cache()` writes into os.environ, so a
+# second call would read its OWN write back and report the source as
+# "environment" -- a true statement about os.environ and a false one about who
+# decided. The first answer per variable is recorded and returned forever,
+# which is also what makes the call idempotent for the three load sites.
+
+MODEL_CACHE_ENV_HF = "HF_HOME"
+"""huggingface_hub's cache HOME. Read at ITS import; see the block above for
+why that makes it a mirror rather than the mechanism."""
+
+MODEL_CACHE_ENV_HF_HUB = "HF_HUB_CACHE"
+"""huggingface_hub's cache directory proper. HONOURED AND NEVER WRITTEN: it
+outranks HF_HOME in huggingface_hub's own resolution, so an operator who set it
+has decided, and this module must not compute a `cache_dir=` that overrides
+them."""
+
+MODEL_CACHE_ENV_FASTEMBED = "FASTEMBED_CACHE_PATH"
+"""fastembed's cache root, read in define_cache_dir() on every construction."""
+
+MODEL_CACHE_SUBDIRS = {
+    MODEL_CACHE_ENV_HF: "huggingface",
+    MODEL_CACHE_ENV_FASTEMBED: "fastembed",
+}
+"""Variable -> subdirectory of ``model_cache_path``. The two names are the
+Dockerfile's, character for character, so a cache written on the host and one
+written in the container have the same shape."""
+
+MODEL_CACHE_ALSO_HONOURED = {
+    MODEL_CACHE_ENV_HF: (MODEL_CACHE_ENV_HF_HUB,),
+    MODEL_CACHE_ENV_FASTEMBED: (),
+}
+"""Other variables that mean "the operator has decided" for a given cache. The
+value is checked, never written."""
+
+MODEL_CACHE_ENV_VARS = tuple(MODEL_CACHE_SUBDIRS)
+"""The closed set this module knows how to pin. An unknown name raises."""
+
+MODEL_CACHE_HUB_SUBDIR = "hub"
+"""huggingface_hub's own rule: the hub cache is HF_HOME + "/hub". Named because
+`huggingface_cache_dir()` has to reproduce it exactly -- a `cache_dir=` that
+disagreed with the exported HF_HOME would put one process's download in a
+different place from the next one's."""
+
+MODEL_CACHE_SOURCE_ENVIRONMENT = "environment"
+MODEL_CACHE_SOURCE_PROJECT = "project"
+MODEL_CACHE_SOURCES = (MODEL_CACHE_SOURCE_ENVIRONMENT, MODEL_CACHE_SOURCE_PROJECT)
+"""Closed, so a caller may branch on it exhaustively."""
+
+_MODEL_CACHE_PINS = {}
+
+
+def pin_model_cache(variable):
+    """Decide where `variable`'s model cache is. Returns (name, value, source).
+
+    `name` is the environment variable that ANSWERED -- `variable` itself when
+    this module decided, and possibly one of ``MODEL_CACHE_ALSO_HONOURED`` when
+    the operator did. Three members rather than two because the honoured
+    siblings do not all mean the same thing: HF_HOME is a home and HF_HUB_CACHE
+    is the cache directory itself, so a report that named only the value would
+    be ambiguous about which it was showing.
+
+    `source` is drawn from ``MODEL_CACHE_SOURCES``. Idempotent: the first answer
+    for a variable is recorded and returned unchanged thereafter, so the source
+    stays a statement about who decided rather than about what os.environ
+    currently holds -- this function writes into os.environ.
+
+    Raises:
+        KeyError: `variable` is not one of ``MODEL_CACHE_ENV_VARS``.
+        RuntimeError: the environment named nothing and ``model_cache_path``
+            does not resolve -- the ordinary `_glob_one` diagnosis, naming the
+            pattern.
+        OSError: the cache subdirectory could not be created.
+    """
+    if variable not in MODEL_CACHE_SUBDIRS:
+        raise KeyError(
+            f"{variable!r} is not a model-cache variable this module knows how "
+            f"to pin; the closed set is {MODEL_CACHE_ENV_VARS}"
+        )
+
+    # Same lock the path cache uses, and re-entrant for the same reason: the
+    # resolve below re-enters _resolve(). Double-checked outside it because a
+    # recorded pin is a dict read.
+    if variable in _MODEL_CACHE_PINS:
+        return _MODEL_CACHE_PINS[variable]
+
+    with _RESOLVE_LOCK:
+        if variable in _MODEL_CACHE_PINS:
+            return _MODEL_CACHE_PINS[variable]
+
+        answer = None
+        for name in (variable,) + MODEL_CACHE_ALSO_HONOURED[variable]:
+            existing = (os.environ.get(name) or "").strip()
+            if existing:
+                answer = (name, existing, MODEL_CACHE_SOURCE_ENVIRONMENT)
+                break
+
+        if answer is None:
+            target = os.path.join(_resolve("model_cache_path"),
+                                  MODEL_CACHE_SUBDIRS[variable])
+            # Both libraries create their own cache tree, so this is not
+            # required for them to work. It is here so that the directory a
+            # report names is a directory that exists, and so that an
+            # unwritable cache root fails HERE -- naming the variable and the
+            # path -- rather than thirty frames inside a download.
+            os.makedirs(target, exist_ok=True)
+            os.environ[variable] = target
+            answer = (variable, target, MODEL_CACHE_SOURCE_PROJECT)
+
+        _MODEL_CACHE_PINS[variable] = answer
+        return answer
+
+
+def huggingface_cache_dir():
+    """The ``cache_dir=`` to hand ``from_pretrained``, or None.
+
+    None means "the environment decided, leave huggingface_hub's own resolution
+    alone". A string is this project's hub cache, which is HF_HOME + "/hub" by
+    huggingface_hub's own rule so that the argument and the exported variable
+    name one location rather than two.
+
+    THIS IS THE MECHANISM, not the exported variable: see the block above for
+    the measurement showing that HF_HOME set after huggingface_hub's import
+    moves nothing, and that in this project huggingface_hub is always already
+    imported (qdrant_client -> fastembed -> huggingface_hub).
+    """
+    _name, value, source = pin_model_cache(MODEL_CACHE_ENV_HF)
+    if source == MODEL_CACHE_SOURCE_ENVIRONMENT:
+        return None
+    return os.path.join(value, MODEL_CACHE_HUB_SUBDIR)
+
+
+def fastembed_cache_dir():
+    """The ``cache_dir=`` to hand ``SparseTextEmbedding``, or None.
+
+    None means the environment decided. fastembed's `cache_dir` argument and
+    its FASTEMBED_CACHE_PATH variable name the same thing -- `define_cache_dir`
+    uses the argument when it is not None and the variable otherwise -- so
+    unlike the HuggingFace side there is no "/hub" to append.
+
+    The argument is passed anyway, rather than relying on the variable that
+    would work here, because the two caches are pinned the same way on purpose:
+    a rule that holds for one library and not the other is a rule the next
+    person applies to the wrong one.
+    """
+    _name, value, source = pin_model_cache(MODEL_CACHE_ENV_FASTEMBED)
+    if source == MODEL_CACHE_SOURCE_ENVIRONMENT:
+        return None
+    return value
+
+
+def model_cache_pins():
+    """A copy of every pin decided so far. Diagnostic; decides nothing.
+
+    A copy rather than the dict, on ``deps.cached_keys()``'s footing: a reader
+    that could mutate the record could make a later call report a decision that
+    was never taken.
+    """
+    with _RESOLVE_LOCK:
+        return dict(_MODEL_CACHE_PINS)
 
 
 #------------------------------------------------------------------------------

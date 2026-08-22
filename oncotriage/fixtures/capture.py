@@ -298,14 +298,36 @@ FIXTURE_INDEX_FILENAME = "index.json"
 
 
 def fixture_root() -> str:
-    """Where fixtures live. Resolved on first call, cached. CREATES NOTHING."""
+    """Where fixtures live. Reads ``paths.testing_fixture_path``. CREATES NOTHING.
+
+    THE PRIVATE GLOB IS GONE (the portability pass) AND THE FALLBACK WITH IT.
+    This function used to carry its own
+    ``sorted(glob.glob(main_path + "/*Testing"))`` and, when that matched
+    nothing, INVENT ``main_path + "/09- Testing"``. Two things followed from
+    that, both silent:
+
+      * a wrong or unset project root sent twelve captured fixtures -- each one
+        a real, billed end-to-end run -- into a directory nobody was looking
+        at, and the capture reported success;
+      * two ``*Testing`` siblings resolved by ``sorted()[0]`` with no
+        ambiguity guard, which is the nondeterminism pass 20f-1 removed from
+        every other path in this project.
+
+    ``testing_fixture_path`` is a first-class path name now: it is in
+    ``_LOCAL_PATHS``, in ``_DOCKER_PATHS`` and in the CI skeleton, and a
+    missing directory RAISES naming the pattern like every other path.
+
+    The name and the "creates nothing" contract are unchanged --
+    ``oncotriage/fixtures/replay.py`` imports this function, and ``main()``
+    still owns the one ``os.makedirs``.
+
+    The cache is kept because it is what the function's own docstring
+    promises about repeated calls; ``paths`` caches too, so this is a dict hit
+    over a dict hit.
+    """
     with _RESOLVE_LOCK:
         if "fixture_root" not in _RESOLVED:
-            matches = sorted(glob.glob(os.path.join(paths.main_path, "*Testing")))
-            testing_dir = matches[0] if matches else os.path.join(
-                paths.main_path, "09- Testing")
-            _RESOLVED["fixture_root"] = os.path.join(
-                testing_dir, "Characterization Fixtures")
+            _RESOLVED["fixture_root"] = paths.testing_fixture_path
         return _RESOLVED["fixture_root"]
 
 
@@ -2872,11 +2894,74 @@ def apply_derivation(recipe: str, donor_path: str, out_path: str,
     )
 
 
-def rebuild_derived_bundle(fixture: Dict) -> str:
+# ===========================================================================
+# WHERE A DERIVED BUNDLE IS BUILT
+# ===========================================================================
+#
+# THE FOUR mkstemp CALLS USED TO TAKE tempfile's DEFAULT, which is TMPDIR --
+# on macOS a per-user directory under /var/folders that the operating system
+# may purge, and on every platform a location outside the project root. A
+# derived bundle is a rewritten copy of a Synthea record: it is HUNDREDS OF
+# MEGABYTES, it is the exact input a captured fixture claims to have been
+# produced from, and it is written by a capture that costs real money per
+# patient. Three things follow from it being outside the tree:
+#
+#   * staging the project root does not capture it, so a capture cannot be
+#     reproduced from a copy of the project;
+#   * a crash leaves it where nobody looks, and the next `du` on the project
+#     shows nothing;
+#   * on a small root volume a full TMPDIR fails a paid run at the last step.
+#
+# WHERE IT GOES INSTEAD: the fixture directory in use -- `fixture_root()`, or
+# whatever `--fixture-dir` named. That is the natural in-root location for
+# three reasons, and each of them is about this directory rather than about
+# convenience:
+#
+#   * it is the directory this bundle EXISTS FOR. The file is alive only
+#     between deriving it and capturing the run on it, and the fixture that
+#     run writes lands here.
+#   * `main()` already creates it (`os.makedirs(root, exist_ok=True)`) before
+#     anything is derived, so no new creation site is introduced.
+#   * `list_fixtures()` matches on FIXTURE_SUFFIX (".json.gz") rather than on
+#     "*.json", STRUCTURALLY excluding a ".bundle.json" left beside the
+#     fixtures. That filter's own docstring records that schema v1 wrote
+#     derived bundles here, so the exclusion is not a new assumption -- it is
+#     the property that filter was written to have.
+#
+# THE COST, STATED: a crashed capture now leaves a large .bundle.json in the
+# fixture directory instead of in a directory the OS eventually reaps. That is
+# the trade this project makes everywhere else -- a visible artefact beats an
+# invisible one -- and `list_fixtures` cannot mistake it for a fixture.
+
+
+def _derived_bundle_dir(root: str = None) -> str:
+    """The directory a derived bundle is written into. Creates it if needed.
+
+    `root` is the fixture directory in use. `None` means ``fixture_root()``,
+    which since the portability pass reads ``paths.testing_fixture_path`` and
+    RAISES if the Testing tree is absent rather than inventing one.
+
+    It creates the directory because `rebuild_derived_bundle` is reached from
+    ``fixture_replay.py``, which deliberately creates nothing at import and has
+    no `os.makedirs` of its own -- a replay of a derived fixture against a
+    fixture directory that exists is the only way in, so this is a no-op in
+    practice and a named OSError rather than a bare FileNotFoundError out of
+    mkstemp if it is ever not.
+    """
+    directory = root or fixture_root()
+    os.makedirs(directory, exist_ok=True)
+    return directory
+
+
+def rebuild_derived_bundle(fixture: Dict, root: str = None) -> str:
     """Rebuild a derived fixture's input bundle into a temporary file.
 
     Returns the path. The caller owns it and must delete it — it is a copy of
     a Synthea record and those run to hundreds of megabytes.
+
+    `root` is the directory the temporary file is created IN, defaulting to
+    ``fixture_root()``. See the block above ``_derived_bundle_dir`` for why it
+    is no longer the system temporary directory.
     """
     derivation = fixture["derivation"]
     donor_path = os.path.join(paths.data_fhir_path, derivation["donor_bundle"])
@@ -2889,7 +2974,8 @@ def rebuild_derived_bundle(fixture: Dict) -> str:
         )
 
     handle, out_path = tempfile.mkstemp(
-        prefix=f"{fixture['fixture_id']}_", suffix=".bundle.json"
+        prefix=f"{fixture['fixture_id']}_", suffix=".bundle.json",
+        dir=_derived_bundle_dir(root)
     )
     os.close(handle)
     apply_derivation(
@@ -3830,7 +3916,8 @@ def main() -> int:
         # Temporary: schema v2 stores the recipe, not the bundle. This file is
         # only alive between deriving it and capturing the run on it.
         _handle, out_path = tempfile.mkstemp(prefix=f"{derived_id}_",
-                                             suffix=".bundle.json")
+                                             suffix=".bundle.json",
+                                             dir=_derived_bundle_dir(root))
         os.close(_handle)
         accepted = None
         tried = 0
@@ -3926,7 +4013,8 @@ def main() -> int:
     elif not args.scan_only and _wanted_now(RECIPE_MESH_FALLBACK):
         derived_id = RECIPE_MESH_FALLBACK
         _handle, out_path = tempfile.mkstemp(prefix=f"{derived_id}_",
-                                             suffix=".bundle.json")
+                                             suffix=".bundle.json",
+                                             dir=_derived_bundle_dir(root))
         os.close(_handle)
         # The donor the existing fixture names wins over a fresh pick, so
         # re-running this file regenerates the same bundle instead of
@@ -3973,7 +4061,8 @@ def main() -> int:
     if not args.scan_only and _wanted_now(RECIPE_MCODE_VARIANT):
         derived_id = RECIPE_MCODE_VARIANT
         _handle, out_path = tempfile.mkstemp(prefix=f"{derived_id}_",
-                                             suffix=".bundle.json")
+                                             suffix=".bundle.json",
+                                             dir=_derived_bundle_dir(root))
         os.close(_handle)
         donor = _recorded_donor(derived_id) or _next_donor()
         console.out(f"\n[Derive] {derived_id}: no cohort bundle carries LOINC "

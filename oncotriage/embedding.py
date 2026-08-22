@@ -51,7 +51,14 @@ which changes both sides together, which is the entire point.
 
 WHAT IMPORTING THIS MODULE DOES
 -------------------------------
-Nothing. ``from fastembed import SparseTextEmbedding`` is inside the accessor,
+Nothing on the filesystem and nothing on the network. It imports
+``oncotriage.paths`` at module scope (the portability pass), which resolves no
+directory: every path there is lazy behind a PEP 562 ``__getattr__``, and this
+module reads ``model_cache_path`` only inside the accessor below. That import
+is what lets the accessor pin FastEmbed's cache inside the project tree instead
+of leaving it in ``tempfile.gettempdir()``.
+
+``from fastembed import SparseTextEmbedding`` is inside the accessor,
 the same deliberate exemption from the no-deferred-import rule that
 ``deps._build_medcpt_model`` and ``_build_icd10_cancer_sets`` carry: the rule
 covers oncotriage-to-oncotriage edges, and hoisting this one would make
@@ -59,7 +66,11 @@ importing the indexer pull in onnxruntime and a tokenizer.
 """
 
 import threading
-from oncotriage.observability import console
+
+from oncotriage import paths
+from oncotriage.observability import console, get_logger
+
+log = get_logger(__name__)
 
 
 #------------------------------------------------------------------------------
@@ -100,10 +111,33 @@ def get_bm25_sparse_model():
     global _MODEL
     with _LOCK:
         if _MODEL is None:
+            # THE CACHE DIRECTORY IS AN ARGUMENT, NOT ONLY A VARIABLE.
+            # fastembed reads FASTEMBED_CACHE_PATH inside define_cache_dir()
+            # on every construction, so the variable alone would work HERE --
+            # unlike the HuggingFace side, where it is provably too late (see
+            # the block above `pin_model_cache` in oncotriage/paths.py). The
+            # argument is passed anyway so that the two caches are pinned by
+            # one rule: a rule that holds for one library and not the other is
+            # a rule the next person applies to the wrong one.
+            #
+            # Its default is `tempfile.gettempdir()/fastembed_cache`, which on
+            # macOS is a purgeable /var/folders directory: a purge mid-campaign
+            # is a silent re-download inside a run that is paying per patient.
+            _name, _value, _source = paths.pin_model_cache(
+                paths.MODEL_CACHE_ENV_FASTEMBED)
+            _cache_dir = paths.fastembed_cache_dir()
+            log.info("model cache root pinned", event="model_cache_pinned",
+                     model=BM25_SPARSE_MODEL_NAME, model_cache_source=_source)
+            console.out(f"[Model cache] {_name}={_value} (source: {_source})")
+
             from fastembed import SparseTextEmbedding
 
             console.out("Loading BM25 sparse embedding model (FastEmbed)...")
-            _MODEL = SparseTextEmbedding(model_name=BM25_SPARSE_MODEL_NAME)
+            # An empty kwargs dict means the operator's FASTEMBED_CACHE_PATH
+            # decided and fastembed's own resolution is left alone.
+            _MODEL = SparseTextEmbedding(
+                model_name=BM25_SPARSE_MODEL_NAME,
+                **({} if _cache_dir is None else {"cache_dir": _cache_dir}))
             console.out("BM25 sparse model loaded.\n")
         return _MODEL
 

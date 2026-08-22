@@ -256,6 +256,20 @@ x-app-volumes: &app-volumes
   - app_results:/app/results
   - app_checkpoint:/app/checkpoint
 
+  # THE TESTING TREE (the portability pass). `testing_path` and its two
+  # subdirectories -- Characterization Fixtures and Evaluation Runs -- became
+  # ordinary path variables in this pass; before it, two private globs in
+  # oncotriage/fixtures/capture.py and oncotriage/evaluation/run_harness.py
+  # resolved them and INVENTED a directory when nothing matched.
+  #
+  # It gets its own volume rather than a subdirectory of app_data for the
+  # reason the host layout keeps them apart: these are OUTPUTS OF PAID RUNS. A
+  # capture is twelve real billed end-to-end runs and an evaluation campaign is
+  # one Stage 5 call per patient; without a volume both die with the container,
+  # and folding them into app_data would tie them to the lifecycle of a corpus
+  # that is deliberately `down -v`-able.
+  - app_testing:/app/testing
+
   # MedCPT (~110 MB) and the FastEmbed BM25 model, cached across restarts.
   # HF_HOME and FASTEMBED_CACHE_PATH point here (see the Dockerfile). Without
   # this volume every recreated container re-downloads both, on the first
@@ -653,5 +667,7 @@ volumes:
     name: Clinical-Trial-Patient-Match-app-results
   app_checkpoint:
     name: Clinical-Trial-Patient-Match-app-checkpoint
+  app_testing:
+    name: Clinical-Trial-Patient-Match-app-testing
   model_cache:
     name: Clinical-Trial-Patient-Match-model-cache

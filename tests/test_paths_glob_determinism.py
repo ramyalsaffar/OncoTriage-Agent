@@ -17,7 +17,7 @@ WHAT THIS FILE HOLDS
        branch makes is recorded with the number of directories it matched, and
        every one of them must match exactly one. On the machine pass 20f-1 was
        written on, all fourteen matched exactly one, which is what made the
-       raise below free to add.
+       raise below free to add; it is eighteen since the portability pass.
     2. One match resolves, and the value is the directory.
     3. MORE THAN ONE MATCH RAISES, naming the pattern, the label, EVERY
        candidate, and which one the pre-20f-1 code would have returned. The
@@ -180,16 +180,20 @@ else:
     # once" and "every path resolved", both of which an EMPTY observation list
     # satisfies for free -- and an empty list is exactly what a spy installed
     # after the cache was warm would produce.
-    # FOURTEEN. It was thirteen from pass 20f-3, which deleted `requirements_path`
-    # from both path tables -- a variable no code had ever read -- and it is
-    # fourteen again since the tracking pass added `result_tracking_path`, which
-    # oncotriage/tracking.py reads. The number is the count of LOCAL RESOLVERS,
-    # so it moves with the table by construction; what it is guarding is that the
-    # spy saw every one of them, and a spy installed after the cache was warm
-    # would see none.
+    # EIGHTEEN. It was thirteen from pass 20f-3, which deleted
+    # `requirements_path` from both path tables -- a variable no code had ever
+    # read -- fourteen when the tracking pass added `result_tracking_path`, and
+    # eighteen since the portability pass promoted `testing_path`,
+    # `testing_fixture_path`, `testing_evaluation_path` and `model_cache_path`
+    # out of two private globs in oncotriage/fixtures/capture.py and
+    # oncotriage/evaluation/run_harness.py, each of which INVENTED a directory
+    # when nothing matched. The number is the count of LOCAL RESOLVERS, so it
+    # moves with the table by construction; what it is guarding is that the spy
+    # saw every one of them, and a spy installed after the cache was warm would
+    # see none.
     check("the spy observed one _glob_one call per local path resolver "
           "(non-degeneracy)",
-          len(_observed), 14)
+          len(_observed), 18)
 
     _ambiguous = [f"{_label}: {_n} matches for {_pattern}"
                   for _label, _pattern, _n in _observed if _n != 1]

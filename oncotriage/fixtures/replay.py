@@ -637,7 +637,7 @@ def diff_tunables(fixture: Dict) -> List[Dict]:
 # ONE FIXTURE
 # ===========================================================================
 
-def obtain_bundle(fixture: Dict) -> tuple:
+def obtain_bundle(fixture: Dict, root: str = None) -> tuple:
     """Get the fixture's input bundle. Returns (path, is_temporary).
 
     A cohort fixture names a file in paths.data_fhir_path. A derived fixture names a
@@ -653,12 +653,18 @@ def obtain_bundle(fixture: Dict) -> tuple:
     location = identity.get("source_bundle_location", BUNDLE_IN_COHORT)
 
     if location == BUNDLE_DERIVED:
-        return rebuild_derived_bundle(fixture), True
+        # `root` is the fixture directory this replay is working in, threaded
+        # from main() so that `--fixture-dir` is self-contained: the rebuilt
+        # bundle lands beside the fixtures it is being replayed against rather
+        # than in the system temporary directory (the portability pass) and
+        # rather than in the DEFAULT fixture directory, which is not the one
+        # this run was pointed at.
+        return rebuild_derived_bundle(fixture, root), True
 
     return os.path.join(paths.data_fhir_path, identity["source_bundle"]), False
 
 
-def replay_fixture(fixture: Dict, graph: object) -> Dict:
+def replay_fixture(fixture: Dict, graph: object, root: str = None) -> Dict:
     """Replay one fixture and return its report."""
     fixture_id = fixture["fixture_id"]
     console.out(f"\n{'-' * 78}\n{fixture_id}  [{', '.join(fixture['case_labels'])}]"
@@ -680,7 +686,7 @@ def replay_fixture(fixture: Dict, graph: object) -> Dict:
     # --- Obtain and re-parse the source bundle -----------------------------
     temporary = False
     try:
-        bundle_path, temporary = obtain_bundle(fixture)
+        bundle_path, temporary = obtain_bundle(fixture, root)
     except Exception as exc:
         report["fatal"] = (f"could not obtain the source bundle: "
                            f"{type(exc).__name__}: {exc}")
@@ -1106,7 +1112,7 @@ def main() -> int:
     reports = []
     with CaffeinateSession("fixture replay"):
         for fixture in sorted(fixtures, key=lambda f: f["fixture_id"]):
-            report = replay_fixture(fixture, graph)
+            report = replay_fixture(fixture, graph, root)
             print_report(report, args.max_diffs)
             reports.append(report)
 

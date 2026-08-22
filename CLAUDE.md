@@ -112,7 +112,7 @@ Verified rather than assumed. It is the same object as
 | `oncotriage/config.py` | every tunable, `PRICING_CONFIG`, `DATA_SNAPSHOT_DATE`, lazy client factories | `paths` |
 | `oncotriage/tracking.py` | **the run-to-configuration index** — `start_run` / `log_run_metrics` / `end_run`, the parameter enumeration, `TRACKING_DEGRADATIONS`. **The one module that imports `mlflow`, and it imports it inside the function bodies** | `config`, `paths`, `utils`, `agent.prompts`, `observability` |
 | `oncotriage/utils.py` | `get_model_cost`, `qdrant_retry`, `resolve_qdrant_collection`, `parse_partial_date`, `get_age_reference_date`, `CaffeinateSession`. **`exec_chain` was here and is deleted (pass 20e)** | `config` |
-| `oncotriage/embedding.py` | **the one** `SparseTextEmbedding("Qdrant/bm25")` construction site — `get_bm25_sparse_model`, `BM25_SPARSE_MODEL_NAME` | nothing from the project |
+| `oncotriage/embedding.py` | **the one** `SparseTextEmbedding("Qdrant/bm25")` construction site — `get_bm25_sparse_model`, `BM25_SPARSE_MODEL_NAME` | `paths`, `observability` (the portability pass; it was `nothing from the project`, and the import is what lets the accessor pin FastEmbed's cache inside the tree) |
 | `oncotriage/registries/cancer_code_registry.py` | File 08 whole — `CancerCodeRegistry`, `OncologyLabRegistry`, `load_registry`, `load_lab_registry`, `REGISTRY_DEGRADATIONS` | `constants`, `settings` |
 | `oncotriage/registries/mesh.py` | File 09's filter half — `MeSHCancerFilter`, `load_mesh_filter`, `specific_cancer_trees`, `MESH_FILTER_DEGRADATIONS` | `paths`, `settings` |
 | `oncotriage/registries/mesh_crosswalk_build.py` | File 09's five offline builders | nothing from the project |
@@ -416,6 +416,20 @@ python tests/test_paths_glob_determinism.py                        #  25
 python tests/test_storage_wipe_all_tables.py                       #  22
 python tests/test_fhir_parser_dict_input.py                        #  29
 python tests/test_ablation_db_isolation.py                         #  72 (was 43; pass 20f-3 added section 5b for the --db parent guard and the checkpoint)
+
+# The portability pass. Same shape, same directory. No network, no keys, no
+# spend, no live Qdrant, no corpus, no database, no git history -- and NO MODEL
+# IS LOADED: ONCOTRIAGE_DEFER_LOCAL_MODELS is set above the imports and section
+# 8p asserts torch and transformers never entered sys.modules (fastembed and
+# huggingface_hub deliberately are NOT on that list -- qdrant_client imports
+# both at module scope, which is the fact section 8 exists to measure). NOT in
+# the collision matrix: every project root it resolves is FABRICATED under a
+# tempfile.mkdtemp it removes and asserts gone, reached by seeding
+# paths._RESOLVED and restoring it, and the five repository files it reads
+# (paths.py, fixtures/capture.py, evaluation/run_harness.py, agent/deps.py,
+# embedding.py) are written by neither of the suite's two writers. It EXECS
+# NOTHING. Bucket A, ~2.6 s.
+python tests/test_paths_portability_roots.py                       # 103
 
 # The render-snapshot test (pass 20f-5, extended by 20f-6). Same shape, same
 # directory, no keys, no spend, and "no network" is now MEASURED rather than
@@ -783,6 +797,10 @@ Only `03- Code/` is version-controlled. Sibling directories under the project ro
 | `keys_path` | `05- Keys/.env` | `OPENAI_API_KEY`, `QDRANT_URL`, `QDRANT_API_KEY` |
 | `checkpoint_path` | `08- Checkpoint/` | batch runner resume state |
 | `result_tracking_path` | `04- Results/06- MLflow Tracking/` | the MLflow file-backed tracking store (the tracking pass) |
+| `testing_path` | `09- Testing/` | the parent of the two below; read by their resolvers and by nothing outside `paths.py` (the portability pass) |
+| `testing_fixture_path` | `09- Testing/Characterization Fixtures/` | the twelve characterization fixtures. **Was a private glob in `oncotriage/fixtures/capture.py` that INVENTED `{root}/09- Testing` when nothing matched** |
+| `testing_evaluation_path` | `09- Testing/Evaluation Runs/` | one timestamped directory per evaluation campaign. **Was the same private glob, in `oncotriage/evaluation/run_harness.py`** |
+| `model_cache_path` | `02- Data/07- Model Cache/` | the MedCPT (836 MB, MEASURED) and FastEmbed caches. Under the DATA tree locally and `/opt/models/` in the container, which is why the name has no `data_` prefix |
 | ~~`requirements_path`~~ | `07- Requirements/` | **DELETED (pass 20f-3)**, from both path tables, with the in-repo `requirements/` directory. It was read by no code, ever; `pyproject.toml` is the one dependency list. The stale sibling outside the repository is untouched and nothing resolves to it any more |
 
 `ONCOTRIAGE_ALLOW_DEGRADED_REGISTRIES` permits a run to continue with the MeSH

@@ -296,32 +296,40 @@ _RESOLVE_LOCK = threading.RLock()
 # ===========================================================================
 
 def evaluation_root() -> str:
-    """Where evaluation runs live. Resolved on first call, cached. CREATES NOTHING.
+    """Where evaluation runs live. Reads ``paths.testing_evaluation_path``.
 
-    THE PROJECT ROOT ITSELF WOULD HAVE BEEN THE WRONG ANSWER, and this is the
-    one place this module departs from the letter of its brief. That root is a
-    numbered directory tree (``01- Project Blueprint`` ... ``15- Code Copies``)
-    and dropping ``eval_run_20260811_120000`` beside them breaks the one
-    convention the whole layout has. ``oncotriage/fixtures/capture.py``'s
-    ``fixture_root()`` had the same choice and answered it by globbing
-    ``*Testing`` -- which is what "outside the repo, like the fixture directory"
-    actually points at -- so this resolves the same directory and takes a
-    subdirectory of it. ``--output-dir`` overrides, and the manifest records the
-    absolute path either way.
+    CREATES NOTHING.
 
-    The glob is ``sorted()[0]`` rather than ``paths._glob_one``: this is a
-    DESTINATION, and a project root carrying two ``*Testing`` directories should
-    put an evaluation run in the first one deterministically rather than refuse
-    to run. ``_glob_one`` raises on ambiguity because its callers RESOLVE INPUTS
-    -- reading the wrong corpus, or deleting bundles out of it.
+    THE PROJECT ROOT ITSELF WOULD HAVE BEEN THE WRONG ANSWER, and this is where
+    this module departs from the letter of its brief. That root is a numbered
+    directory tree (``01- Project Blueprint`` ... ``15- Code Copies``) and
+    dropping ``eval_run_20260811_120000`` beside them breaks the one convention
+    the whole layout has. The Testing tree is what "outside the repo, like the
+    fixture directory" actually points at.
+
+    THE PRIVATE GLOB IS GONE (the portability pass). This function used to
+    carry its own ``sorted(glob.glob(main_path + "/*Testing"))[0]`` with a
+    fallback that INVENTED ``main_path + "/09- Testing"`` when nothing
+    matched -- so a wrong or unset root sent a PAID evaluation campaign's
+    manifest and every per-patient record into a directory nobody was looking
+    at, and the run reported success.
+
+    ITS OLD COMMENT ARGUED AGAINST `_glob_one` AND THAT ARGUMENT IS WITHDRAWN,
+    rather than quietly dropped. It said a DESTINATION should resolve the first
+    of two ambiguous ``*Testing`` siblings deterministically rather than refuse
+    to run, because `_glob_one`'s callers resolve INPUTS. The premise is wrong
+    in the way that matters: ``--resume`` and ``--allow-environment-change``
+    read this directory back as an input -- the manifest, its
+    ``environment_history`` and every record file already on disk -- and
+    ``post_check`` reads it too. A destination that is read back is an input,
+    and picking one of two candidates silently is how a resume comes to skip
+    patients recorded in the OTHER tree. It raises now, like every other path.
+    ``--output-dir`` still overrides and the manifest records the absolute path
+    either way.
     """
     with _RESOLVE_LOCK:
         if "evaluation_root" not in _RESOLVED:
-            matches = sorted(glob.glob(os.path.join(paths.main_path, "*Testing")))
-            testing_dir = matches[0] if matches else os.path.join(
-                paths.main_path, "09- Testing")
-            _RESOLVED["evaluation_root"] = os.path.join(
-                testing_dir, "Evaluation Runs")
+            _RESOLVED["evaluation_root"] = paths.testing_evaluation_path
         return _RESOLVED["evaluation_root"]
 
 

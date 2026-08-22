@@ -181,7 +181,27 @@ dependencies = [
     "qdrant-client==1.18.0",
 
     # --- Embeddings and NLP -------------------------------------------------
-    "sentence-transformers==5.2.2",
+    # `sentence-transformers` STOOD HERE AND IS DELETED (the portability pass).
+    # NO MODULE IN THIS PROJECT HAS EVER IMPORTED IT -- measured across the
+    # whole tree, both spellings, and the only three hits are prose: a comment
+    # in oncotriage/agent/deps.py:_build_medcpt_model recording why the
+    # CrossEncoder WRAPPER is deliberately NOT used (it applies a default
+    # sigmoid that squashes MedCPT's raw -25..25 range, and MedCPT's official
+    # usage is AutoModelForSequenceClassification), and two guard lists in
+    # tests/ that assert `sentence_transformers` is NOT in sys.modules after a
+    # package import. Those guards are unaffected: they name a module, not a
+    # distribution, and they pass whether or not it is installed.
+    #
+    # Nothing else in the resolved environment requires it either -- checked
+    # with importlib.metadata over every installed distribution, and the only
+    # requirer was `oncotriage` itself. It contributed no accepted finding to
+    # .trivyignore or .github/scripts/audit_gate.py, so removing it leaves no
+    # stale id behind (audit_gate.py fails on one).
+    #
+    # It is ~2 GB of transitive install that no code path can reach, in an
+    # image this project has twice had to shrink, and a declared dependency
+    # nothing imports is the packaging form of the dead declaration check 2h
+    # exists to report.
     "transformers==4.57.1",
     "torch==2.9.0",
     # The Qdrant/bm25 sparse encoder. See the note above; it is a hard

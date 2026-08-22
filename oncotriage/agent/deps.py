@@ -182,8 +182,8 @@ import os
 import threading
 from collections import Counter
 
-from oncotriage import config, embedding
-from oncotriage.observability import get_logger
+from oncotriage import config, embedding, paths
+from oncotriage.observability import console, get_logger
 from oncotriage.registries.cancer_code_registry import load_lab_registry, load_registry
 from oncotriage.registries.mesh import load_mesh_filter
 
@@ -773,6 +773,38 @@ def _verify_cross_encoder_sequence_limit(declared, source, checkpoint):
 # `import icd10` inside _build_icd10_cancer_sets().
 
 
+def _huggingface_cache_kwargs():
+    """``{"cache_dir": ...}`` for from_pretrained, or ``{}``.
+
+    Called from BOTH MedCPT factories, below each one's `_DEFER_LOCAL_MODELS`
+    return so a replay resolves no path, and unreachable when an override is
+    installed because `_resolve` never calls a factory then.
+
+    THE ARGUMENT IS THE MECHANISM AND THE VARIABLE IS NOT. huggingface_hub
+    reads HF_HOME once, at its own import, and in this project it is ALWAYS
+    already imported by the time a factory runs -- `qdrant_client` imports
+    `fastembed` at module scope and `fastembed` imports `huggingface_hub` at
+    module scope, so `import oncotriage.agent.deps` alone puts both in
+    sys.modules. Measured, not reasoned about; see the block above
+    `pin_model_cache` in oncotriage/paths.py. `cache_dir=` is resolved by
+    transformers at CALL time and outranks every variable.
+
+    An empty dict means the operator's HF_HOME or HF_HUB_CACHE decided and
+    huggingface_hub's own resolution is left completely alone.
+
+    THE PATH GOES TO THE CONSOLE AND THE SOURCE GOES TO THE LOG. An
+    operator-set HF_HOME is usually under their home directory; see the note
+    beside `model_cache_source` in oncotriage/observability.py.
+    """
+    name, value, source = paths.pin_model_cache(paths.MODEL_CACHE_ENV_HF)
+    cache_dir = paths.huggingface_cache_dir()
+    log.info("model cache root pinned", event="model_cache_pinned",
+             model=config.CROSS_ENCODER_MODEL, model_cache_source=source)
+    console.out(f"[Model cache] {name}={value} (source: {source}; "
+                f"cache_dir={cache_dir if cache_dir else 'library default'})")
+    return {} if cache_dir is None else {"cache_dir": cache_dir}
+
+
 def _build_medcpt_tokenizer():
     if _DEFER_LOCAL_MODELS:
         log.info("skipping the MedCPT tokenizer load",
@@ -780,6 +812,7 @@ def _build_medcpt_tokenizer():
                  reason=f"{DEFER_LOCAL_MODELS_ENV}=1")
         return _DeferredLocalModel("MedCPT tokenizer")
 
+    _cache_kwargs = _huggingface_cache_kwargs()
     from transformers import AutoTokenizer
 
     # THE CHECKPOINT NAME IS config.CROSS_ENCODER_MODEL AND MUST STAY THAT WAY
@@ -794,7 +827,8 @@ def _build_medcpt_tokenizer():
     # itself appears exactly once in the package.
     log.info("loading the MedCPT cross-encoder tokenizer",
              event="local_model_load_started", model=config.CROSS_ENCODER_MODEL)
-    tokenizer = AutoTokenizer.from_pretrained(config.CROSS_ENCODER_MODEL)
+    tokenizer = AutoTokenizer.from_pretrained(config.CROSS_ENCODER_MODEL,
+                                              **_cache_kwargs)
     log.info("MedCPT cross-encoder tokenizer loaded",
              event="local_model_load_finished", model=config.CROSS_ENCODER_MODEL)
 
@@ -821,6 +855,7 @@ def _build_medcpt_model():
                  reason=f"{DEFER_LOCAL_MODELS_ENV}=1")
         return _DeferredLocalModel("MedCPT cross-encoder")
 
+    _cache_kwargs = _huggingface_cache_kwargs()
     from transformers import AutoModelForSequenceClassification
 
     # Using transformers directly instead of the sentence-transformers
@@ -833,7 +868,7 @@ def _build_medcpt_model():
     log.info("loading the MedCPT cross-encoder weights",
              event="local_model_load_started", model=config.CROSS_ENCODER_MODEL)
     model = AutoModelForSequenceClassification.from_pretrained(
-        config.CROSS_ENCODER_MODEL)
+        config.CROSS_ENCODER_MODEL, **_cache_kwargs)
     model.eval()
     log.info("MedCPT cross-encoder weights loaded",
              event="local_model_load_finished", model=config.CROSS_ENCODER_MODEL)
