@@ -295,6 +295,18 @@ _REGISTRY_SPEC = (
      "MAX_LLM_CLASSIFIER_RETRIES instead. STAYS AT ZERO WHILE "
      "MATCHING_PER_TRIAL_CALLS_ENABLED IS False, because nothing in that "
      "configuration reaches the branch that increments it"),
+    ("PER_TRIAL_WARMUP_DEGRADATIONS",
+     _agent_evaluation.PER_TRIAL_WARMUP_DEGRADATIONS,
+     "the Stage 5 PER-TRIAL cache warmup did not do its job. A "
+     "`minimal_output_rejected` or `prompt_cache_key_rejected` key means the "
+     "provider refused the warmup's request SHAPE and the patient completed "
+     "on the retired one-then-rest schedule -- the remedy is "
+     "MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS or "
+     "MATCHING_PER_TRIAL_PROMPT_CACHE_KEY_ENABLED. A `failed:{Type}` key means "
+     "the cache could not be established at all, NO trial call was issued and "
+     "the patient was failed deliberately so that MAX_LLM_CLASSIFIER_RETRIES "
+     "and the batch checkpoint see it. STAYS AT ZERO WHILE "
+     "MATCHING_PER_TRIAL_CALLS_ENABLED IS False"),
     ("BEDROCK_ADAPTER_DEGRADATIONS",
      _bedrock_adapter.BEDROCK_ADAPTER_DEGRADATIONS,
      "Stage 5 ran on Amazon Bedrock and the request or the response was not "

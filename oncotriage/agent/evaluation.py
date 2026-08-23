@@ -39,7 +39,7 @@ import re
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, FrozenSet, List, Tuple
+from typing import Dict, FrozenSet, List, Optional, Tuple
 
 from oncotriage import config
 from oncotriage.agent import bedrock_adapter
@@ -399,7 +399,8 @@ class MatchingModelMismatchError(RuntimeError):
 # the truncation thresholds calibrated against the first of them.
 
 
-def call_matching_model(system_prompt: str, user_prompt: str):
+def call_matching_model(system_prompt: str, user_prompt: str, *,
+                        prompt_cache_key: Optional[str] = None):
     """Issue the Stage 5 evaluation request and return the raw API response.
 
     Lifted out of node_llm_classifier_evaluation unchanged. It is the single point where
@@ -516,6 +517,35 @@ def call_matching_model(system_prompt: str, user_prompt: str):
     # keep billing the incumbent while an operator believed they had migrated,
     # which is the silent-wrong-provider failure the closed vocabulary in
     # config exists to prevent.
+    # ── THE CACHE-ROUTING HINT, AND WHY IT IS AN EXPANSION ────────────────
+    #
+    # `prompt_cache_key` does not enable caching -- automatic prefix caching is
+    # on by default -- it asks the provider to route requests carrying the same
+    # key to the same machine. That is load-bearing for per-trial mode and for
+    # nothing else: N requests of one patient go out AT ONCE behind the warmup,
+    # and without a routing hint they can land on N machines of which only one
+    # holds the warm prefix.
+    #
+    # PASSED THROUGH `**_extra_kwargs` RATHER THAN AS A NAMED KEYWORD, and the
+    # reason is the OFF arm. `openai.NOT_GIVEN` would be equivalent ON THE
+    # WIRE, but oncotriage/fixtures/capture.py records this call's kwargs dict
+    # verbatim and oncotriage/fixtures/replay.py looks a recording up by a
+    # digest OF THAT DICT -- so a key that is always present, whatever its
+    # value, changes the digest of every grouped-mode request and costs a
+    # re-capture of all twelve characterization fixtures at live model prices.
+    # An empty expansion adds nothing to the dict the SDK is handed, so grouped
+    # mode's request is byte-identical to the one that shipped.
+    #
+    # ON BEDROCK THE ADAPTER OWNS IT and this argument is deliberately not
+    # forwarded: `build_bedrock_request` already sends
+    # config.BEDROCK_PROMPT_CACHE_KEY, that endpoint's caching is governed by
+    # BEDROCK_PROMPT_CACHE_MODE as well, and wiring a second source of the same
+    # field from here would give one request two owners. Per-trial mode against
+    # Bedrock is an unbuilt branch either way -- see the warmup below.
+    _extra_kwargs = {}
+    if prompt_cache_key is not None:
+        _extra_kwargs["prompt_cache_key"] = prompt_cache_key
+
     _provider = config.MATCHING_PROVIDER
     if _provider == config.MATCHING_PROVIDER_BEDROCK:
         return bedrock_adapter.call_matching_model_bedrock(
@@ -546,7 +576,283 @@ def call_matching_model(system_prompt: str, user_prompt: str):
         # because building it constructs a throwaway OpenAI client to read the
         # SDK's default connect phase.
         timeout=config.get_matching_request_timeout(),
+        **_extra_kwargs,
     )
+
+
+# ---------------------------------------------------------------------------
+# The per-trial cache warmup
+# ---------------------------------------------------------------------------
+#
+# CACHE-OR-NOTHING. Per-trial mode issues one request per trial and is only
+# affordable because all of them share one byte-identical system message --
+# instructions plus the whole patient record -- which the provider bills at the
+# cached rate once it has SEEN it. The mode originally made the first REAL
+# trial call the cache writer and held the rest behind it; that entangled one
+# trial's failure semantics with the scheduling of every other trial, and left
+# a cost leak nothing recorded: a first call that exhausted its transport
+# retries sent the remaining N-1 against a cache nothing had written, at full
+# input price, and the run reported a perfectly ordinary patient.
+#
+# So the cache is written by a request that is NOT a trial: a warmup carrying
+# the identical system message and the smallest user message and output budget
+# the provider permits. No trial call is issued until it has returned. If it
+# cannot be established the patient fails cleanly through the existing zero-
+# success floor, so the batch checkpoint resumes it rather than recording a
+# cohort of trials nobody judged.
+
+
+class PerTrialProviderUnsupportedError(RuntimeError):
+    """Per-trial mode is on and this provider has no cache warmup.
+
+    A ``RuntimeError`` subclass on this file's standing footing: a stray
+    ``except ValueError`` around a Stage 5 call must not be able to eat it.
+
+    IT NAMES BOTH CONSTANTS, because either one is a legitimate fix and the
+    operator is the only one who can say which they meant.
+    """
+
+    def __init__(self, provider):
+        super().__init__(
+            "per-trial mode's cache warmup is not built for "
+            f"MATCHING_PROVIDER={provider!r}. Set "
+            "MATCHING_PER_TRIAL_CALLS_ENABLED = False to run this provider in "
+            "grouped mode, which is fully supported, or set MATCHING_PROVIDER "
+            f"to {config.MATCHING_PROVIDER_OPENAI!r}.")
+        self.provider = provider
+
+
+def assert_per_trial_provider_supported() -> None:
+    """Refuse per-trial mode on a provider whose warmup is not built.
+
+    ONE OWNER, TWO CALL SITES, and the second is not redundant.
+    ``node_llm_classifier_evaluation`` calls this BEFORE anything is rendered
+    or spent, because a refusal there costs nothing and names the constant --
+    the footing ``PerTrialParallelismError`` already stands on. Without it the
+    warmup's own refusal would be caught by the dispatch's ``except``,
+    classified as a transport failure and retried
+    ``MAX_LLM_CLASSIFIER_RETRIES`` times, so a configuration defect would
+    arrive as three identical failed patients rather than as one named error.
+    ``call_matching_model_warmup`` calls it too, because it is a public
+    function and a direct caller must not reach the OpenAI client under a
+    provider it did not select.
+    """
+    _provider = config.MATCHING_PROVIDER
+    if _provider != config.MATCHING_PROVIDER_OPENAI:
+        raise PerTrialProviderUnsupportedError(_provider)
+
+
+class _WarmupUserMessageError(RuntimeError):
+    """The warmup user message is unusable. Should be unreachable.
+
+    ``oncotriage/config.py`` refuses an empty
+    ``MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE`` at import, so this fires only
+    when something rebound the constant WITHIN a process -- a test, a REPL, a
+    probe. It raises rather than substituting a default because a warmup that
+    quietly sent something other than the configured message would write a
+    cache under a request nobody can reproduce.
+
+    A ``RuntimeError`` subclass on this file's standing footing: a stray
+    ``except ValueError`` around a Stage 5 call must not be able to eat it.
+    """
+
+
+# ── Which failures mean "this request SHAPE is refused" ───────────────────
+#
+# A closed two-member vocabulary. Both mean the warmup can never succeed under
+# this configuration however many times it is retried, so retrying is spending
+# money to collect the same 400; and both are recoverable, because the shipped
+# one-then-rest schedule needs neither the minimal output budget nor the
+# routing hint. Everything else -- a timeout, a 429, a 500, an auth failure --
+# is a TRANSPORT failure that a retry may well fix, and is deliberately NOT in
+# here: those fail the patient, which is what makes the resume correct.
+WARMUP_REJECTED_MINIMAL_OUTPUT = "minimal_output_rejected"
+WARMUP_REJECTED_CACHE_KEY = "prompt_cache_key_rejected"
+WARMUP_REJECTIONS = (WARMUP_REJECTED_MINIMAL_OUTPUT, WARMUP_REJECTED_CACHE_KEY)
+
+# The parameter names a 400 must NAME for this to be read as a refusal of the
+# request shape rather than as a failure of the request. Both spellings of the
+# output ceiling are here because the Bedrock adapter's Responses request calls
+# it `max_output_tokens` while the Chat Completions request calls it
+# `max_completion_tokens`, and the bare `max_tokens` because a provider
+# rejecting the value often names the legacy field in its message.
+_WARMUP_OUTPUT_PARAM_NAMES = ("max_completion_tokens", "max_output_tokens",
+                              "max_tokens")
+_WARMUP_CACHE_PARAM_NAME = "prompt_cache_key"
+
+
+def _http_status_of(exc: BaseException) -> Optional[int]:
+    """The HTTP status behind an SDK exception, or None.
+
+    READ FROM TWO PLACES because the OpenAI SDK carries it on the exception
+    (``APIStatusError.status_code``) while several other clients -- and the
+    stand-ins this project's tests install -- carry it on a ``response``
+    object. Neither is asserted to exist: this runs on a failure path and must
+    not raise a second, unrelated exception while classifying the first.
+    """
+    for _candidate in (getattr(exc, "status_code", None),
+                       getattr(getattr(exc, "response", None), "status_code",
+                               None)):
+        if isinstance(_candidate, int) and not isinstance(_candidate, bool):
+            return _candidate
+    return None
+
+
+def classify_warmup_rejection(exc: BaseException) -> Optional[str]:
+    """Is this the provider REFUSING the warmup's request shape?
+
+    Returns one of ``WARMUP_REJECTIONS``, or None for everything else.
+
+    DETECTED, NOT ASSUMED, which is the whole reason this function exists.
+    ``MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS`` is 1 because that is the
+    smallest answer a provider can be asked for, and a reasoning model that
+    bills its reasoning against the same ceiling may refuse a value that small
+    outright. Nobody here can read that provider's validation rules, and a
+    design that assumed either answer would be wrong on half the providers.
+
+    TWO CONDITIONS, BOTH REQUIRED, and the conjunction is the point. A 400
+    alone is not enough: a context-length overflow and an invalid schema are
+    also 400s, they are statements about the CONTENT of this patient's request
+    rather than about the warmup's shape, and they will fail every trial call
+    too -- so falling back for them would replace a clean patient failure with
+    fifteen identical ones. The message must NAME the parameter. And the
+    parameter name alone is not enough either: a 500 whose body happens to
+    quote the request is not a refusal.
+
+    IT NEVER RAISES. It runs while another exception is being handled, and an
+    exception raised here would replace a named transport failure with an
+    unrelated AttributeError.
+    """
+    if _http_status_of(exc) != 400:
+        return None
+    _message = str(exc).lower()
+    if _WARMUP_CACHE_PARAM_NAME in _message:
+        # ASKED FIRST, because a request carrying both an unrecognised routing
+        # hint and a minimal ceiling is refused for whichever the provider
+        # validates first -- and only this branch tells the caller to stop
+        # sending the hint. Reading it as a ceiling refusal would leave the key
+        # attached to the fallback's calls, which would then be refused too,
+        # and the patient would fail for a reason one flag would have fixed.
+        return WARMUP_REJECTED_CACHE_KEY
+    if any(_name in _message for _name in _WARMUP_OUTPUT_PARAM_NAMES):
+        return WARMUP_REJECTED_MINIMAL_OUTPUT
+    return None
+
+
+def call_matching_model_warmup(system_prompt: str, *,
+                               prompt_cache_key: Optional[str] = None):
+    """Write the shared prefix into the provider's cache. Evaluates nothing.
+
+    The response is NEVER PARSED. Two things are read off it and nothing else:
+    the usage block, so the warmup's own tokens are billed honestly rather than
+    hidden, and the answering-model echo, so a mismatched judge fails the
+    patient for the price of one one-token request instead of after fifteen
+    real ones.
+
+    WHAT IS IDENTICAL TO A TRIAL CALL, AND IT IS THE PART THAT MATTERS. The
+    system message, byte for byte -- that IS the shared prefix, and prefix
+    caching matches on the leading token sequence of the messages. Everything
+    that differs sits AFTER it: the user message, and the output ceiling.
+
+    ``response_format`` IS DELIBERATELY NOT SENT, and it is the one asymmetry
+    worth arguing. Nothing parses this answer, so a strict schema buys nothing;
+    a json_schema demand against a one-token ceiling is a combination a
+    provider may well refuse, and every constraint dropped here is one fewer
+    reason for the warmup to be rejected and the whole schedule to degrade. It
+    costs nothing on the axis that matters because a response schema adds no
+    tokens to the prompt -- the cached prefix is the MESSAGE prefix.
+      VERIFY AT GO-LIVE: if this provider's cache key turns out to include the
+      response format, the warmup would warm a prefix the trial calls do not
+      share and every wave call would report cached_tokens = 0. That figure is
+      recorded per call in ``llm_classifier_call_details``, so the measurement
+      that settles it is already in the record; send ``response_format`` here
+      too if it says so.
+
+    ``reasoning_effort`` IS SENT, at whatever ``MATCHING_REASONING_EFFORT``
+    holds, because a warmup that asked for a different effort than the wave is
+    a different request to the provider's router. THE CONSEQUENCE IS STATED:
+    reasoning tokens bill against the same ceiling this call sets to 1, so
+    raising that constant may require raising
+    ``MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS`` with it. If it does not,
+    the provider's 400 is classified by ``classify_warmup_rejection`` and the
+    patient degrades to the one-then-rest schedule with a named counter rather
+    than failing.
+
+    THE CONSTANTS ARE READ THROUGH ``config``, NOT THROUGH BOUND NAMES, on
+    ``matching_call_mode()``'s footing: a constant that can move WITHIN a
+    process must not be reached through a from-import, or a probe that sets it
+    on the module moves nothing.
+
+    Raises:
+        Whatever the client raises. The caller owns error handling, exactly as
+        it does for ``call_matching_model``.
+    """
+    _user = config.MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE
+    if not _user:
+        raise _WarmupUserMessageError(
+            "MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE must be a non-empty "
+            f"string; it is {_user!r}")
+
+    # ── THE ADAPTER SEAM, LEFT EXPLICIT AND UNBUILT ───────────────────────
+    #
+    # NOT a silent fall-through to the OpenAI client, which would send this
+    # patient's record to the incumbent provider while the operator believed
+    # they had migrated -- the failure `call_matching_model`'s own
+    # unrecognised-provider branch exists to refuse.
+    #
+    # The Responses API's warmup is not this request with two fields renamed.
+    # Amazon Bedrock serves OpenAI models on that surface and owns its own
+    # caching controls (BEDROCK_PROMPT_CACHE_MODE, BEDROCK_PROMPT_CACHE_KEY),
+    # and a future Anthropic branch warms its cache the other documented way
+    # entirely: a placeholder user message with an explicit `cache_control`
+    # breakpoint on the system block, because that provider's caching is
+    # explicit rather than automatic. Building either from documentation alone
+    # is how a mode that has never run acquires a second untested path; both
+    # belong to the pass that runs the go-live probe against them.
+    assert_per_trial_provider_supported()
+
+    _extra_kwargs = {}
+    if prompt_cache_key is not None:
+        _extra_kwargs["prompt_cache_key"] = prompt_cache_key
+
+    return deps.get_openai_client().chat.completions.create(
+        model=MATCHING_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": _user},
+        ],
+        max_completion_tokens=config.MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS,
+        reasoning_effort=MATCHING_REASONING_EFFORT,
+        seed=MATCHING_SEED,
+        timeout=config.get_matching_request_timeout(),
+        **_extra_kwargs,
+    )
+
+
+def per_trial_prompt_cache_key(system_prompt_sha256: str) -> Optional[str]:
+    """The routing hint for one patient's warmup and wave, or None.
+
+    DERIVED FROM THE PREFIX ITSELF rather than from a patient id or a run id,
+    and that is what makes it correct by construction: the key's whole job is
+    to route requests that SHARE A PREFIX to one machine, so two requests get
+    the same key exactly when they have the same prefix to share. A patient id
+    would collide across a prompt-version bump -- the same patient before and
+    after a PROMPT_VERSION change would ask to be routed together while sharing
+    nothing -- and a random per-run key would separate a resumed campaign's
+    requests from the ones it is resuming.
+
+    NAMESPACED, because this key is sent to a provider account this project
+    does not own exclusively. An unprefixed hex digest is a value another
+    workload could plausibly send too, and two unrelated workloads asking to be
+    routed together is the one way a routing hint can make cache behaviour
+    WORSE than sending nothing.
+
+    None WHEN THE HINT IS SWITCHED OFF, so the caller passes it straight
+    through and ``call_matching_model``'s expansion stays empty.
+    """
+    if not config.MATCHING_PER_TRIAL_PROMPT_CACHE_KEY_ENABLED:
+        return None
+    return f"oncotriage-stage5-{system_prompt_sha256}"
 
 
 # ---------------------------------------------------------------------------
@@ -629,6 +935,40 @@ STAYS AT ZERO WHILE MATCHING_PER_TRIAL_CALLS_ENABLED IS False, because nothing
 in that configuration can reach the branch that increments it. Same shape as
 BEDROCK_ADAPTER_DEGRADATIONS under MATCHING_PROVIDER "openai".
 """
+
+
+PER_TRIAL_WARMUP_DEGRADATIONS = Counter()
+"""The per-trial cache warmup did not do its job, keyed by what happened.
+
+TWO KEY FAMILIES AND THEY MEAN OPPOSITE THINGS FOR THE PATIENT:
+
+  * ``minimal_output_rejected`` / ``prompt_cache_key_rejected`` -- the provider
+    refused the warmup's request SHAPE. The patient COMPLETED, on the retired
+    one-then-rest schedule, which needs neither the minimal ceiling nor the
+    routing hint. The remedy is a constant:
+    MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS or
+    MATCHING_PER_TRIAL_PROMPT_CACHE_KEY_ENABLED.
+  * ``failed:{ExceptionType}`` -- the warmup could not be established at all
+    and NO trial call was issued. The patient FAILED, deliberately, so that
+    MAX_LLM_CLASSIFIER_RETRIES sees it and the batch checkpoint resumes it.
+
+MODULE-LEVEL, NOT A KEY IN THE STAGE 5 RESULT, on PER_TRIAL_CALL_FAILURES'
+footing: the twelve characterization fixtures diff that dict field by field, so
+a new key there costs a re-capture at live model prices for a number no stage
+reads. Registered in ``oncotriage/degradation.py`` so it reaches the run-end
+report.
+
+INCREMENTED ON THE NODE THREAD ONLY, and here that is true by construction
+rather than by discipline: the warmup is awaited before any executor exists.
+
+STAYS AT ZERO WHILE MATCHING_PER_TRIAL_CALLS_ENABLED IS False, because nothing
+in that configuration reaches the branch that increments it.
+"""
+
+# The prefix under which a warmup TRANSPORT failure is counted, as opposed to a
+# refusal of the request shape. Written once here rather than at the increment
+# so the reader of the counter and the writer of it cannot drift.
+WARMUP_FAILURE_KEY_PREFIX = "failed:"
 
 
 class PerTrialParallelismError(RuntimeError):
@@ -2891,7 +3231,10 @@ def node_llm_classifier_evaluation(state: TrialMatchState) -> dict:
     over now:
 
       * ``MATCHING_PER_TRIAL_CALLS_ENABLED`` (default False) makes it ONE
-        request per trial, bypassing the packer;
+        request per trial, bypassing the packer, behind a dedicated cache
+        warmup that is awaited alone -- no trial call is ever issued without a
+        warm shared prefix ahead of it, and a warmup that cannot be
+        established fails the patient rather than sending the wave uncached;
       * otherwise ``MATCHING_INPUT_PACKING_ENABLED`` (default True) groups
         trials into chunks under an input-token ceiling;
       * with both off it is the single whole-batch call it originally was.
@@ -3186,6 +3529,12 @@ CLINICAL TRIALS:
     _per_trial_calls = (config.matching_call_mode()
                         == MATCHING_CALL_MODE_PER_TRIAL)
     _parallel_bound = config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS
+    # THE PROVIDER IS VALIDATED HERE FOR THE SAME REASON THE BOUND IS: before
+    # the first request of the patient, where a refusal costs nothing and names
+    # the constant. Per-trial mode's cache warmup is built for the OpenAI
+    # surface only; see assert_per_trial_provider_supported.
+    if _per_trial_calls:
+        assert_per_trial_provider_supported()
     if _per_trial_calls and _parallel_bound < 1:
         raise PerTrialParallelismError(
             "MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS must be >= 1 when "
@@ -3252,8 +3601,12 @@ CLINICAL TRIALS:
                  total=len(trials),
                  # The bound this patient will actually use, not the constant:
                  # a patient with three trials never reaches four in flight.
-                 parallel=min(_parallel_bound,
-                              max(0, len(initial_chunks) - 1)))
+                 # NO LONGER `len - 1`: the cache is written by a dedicated
+                 # warmup and no trial call is held back, so the whole wave is
+                 # eligible for the pool. A patient that falls back to the
+                 # one-then-rest schedule reaches one fewer, and the
+                 # per_trial_warmup_rejected event beside it is what says so.
+                 parallel=min(_parallel_bound, len(initial_chunks)))
     elif MATCHING_INPUT_PACKING_ENABLED:
         initial_chunks, packing_report = pack_trials_by_input_tokens(
             trials, fixed_input_tokens, MATCHING_INPUT_TOKEN_BUDGET,
@@ -3495,6 +3848,13 @@ CLINICAL TRIALS:
         ``_account_unconsumed()`` folds those into these accumulators at each
         of those three returns, BEFORE this helper is called, so the figure it
         reports is still the exact billed total rather than a prefix of it.
+
+        AND THE CACHE WARMUP, which is a billed request that evaluates
+        nothing. It is accounted on the node thread before the wave is
+        dispatched, so it is inside these accumulators at every return below
+        including the ones that fire before a single trial call was made. That
+        is why this helper can be non-empty on a path where no trial was
+        judged at all.
           * Earlier INVOCATIONS of this node. ``retry_count`` routes the graph
             back in here and every accumulator restarts at zero, so a run that
             spent three attempts reports the last one's tokens. That is the
@@ -3511,34 +3871,59 @@ CLINICAL TRIALS:
         }
 
     # ------------------------------------------------------------------
-    # Cache-aware dispatch: one call, then the rest in parallel
+    # The warmup, then the wave
     # ------------------------------------------------------------------
     #
-    # GROUPED MODE DOES NOT ENTER THIS BLOCK AT ALL. `_prefetched` stays None,
-    # `_obtain` below falls through to the identical `call_matching_model(...)`
-    # the loop has always made, no thread is created and no executor exists.
-    # That is what makes the OFF arm byte-equivalent rather than merely
-    # equivalent, and section 6 of tests/test_agent_stage5_per_trial_calls.py
-    # compares the two request streams field for field to say so.
+    # THE RULE IS CACHE-OR-NOTHING. `_prefetched` stays None in grouped mode
+    # and nothing below runs at all; `_obtain` falls through to the identical
+    # `call_matching_model(...)` the loop has always made, no thread is
+    # created and no executor exists. That is what makes the OFF arm
+    # byte-equivalent rather than merely equivalent.
     #
-    # WHY ONE FIRST, THEN THE REST. The whole economics of per-trial mode is
-    # the cached prefix: PROMPT_VERSION 1.6.0 put the patient record in the
-    # SYSTEM message so all N requests of one patient share byte-identical
-    # bytes, and the provider bills those at the cached rate FROM THE SECOND
-    # REQUEST ON. Firing all N at once races every one of them against a cold
-    # cache, so the discount the mode exists to rely on would land on none of
-    # them. The first call is therefore issued alone and AWAITED; the executor
-    # that runs the rest is not even constructed until it has returned.
+    # WHAT REPLACED WHAT. Per-trial mode shipped awaiting the FIRST REAL TRIAL
+    # CALL alone so that it would write the shared prefix into the provider's
+    # cache, then firing the remaining N-1 behind it. Two things were wrong
+    # with that and only one of them is about money:
     #
-    # WHETHER THE DISCOUNT ACTUALLY LANDS IS MEASURED, NOT ASSUMED. Every call
-    # records the provider's own `prompt_tokens_details.cached_tokens` into
-    # `llm_classifier_call_details`, per call, and the patient-level total
-    # continues into `inferences.llm_classifier_cached_input_tokens`. If the
-    # cache never warms, that column says so and this scheduling has cost
-    # nothing but a serialized first request.
+    #   * IF THAT FIRST CALL EXHAUSTED ITS TRANSPORT RETRIES the remaining N-1
+    #     went out against a cache nothing had written, at full input price,
+    #     and nothing in the record distinguished that from a provider that
+    #     does not cache. A cost leak that reports as an ordinary patient.
+    #   * A REAL TRIAL DOUBLED AS CACHE INFRASTRUCTURE, so "this trial could
+    #     not be evaluated" and "the cache was never established" were one
+    #     event with one remedy, when they are two findings with two.
     #
-    # THE RESULT OF EACH CALL IS AN OUTCOME, NEVER A RAISE. A worker that let
-    # an exception escape would surface it at `future.result()` on the node
+    # So a DEDICATED WARMUP writes the cache (see call_matching_model_warmup):
+    # the identical system message, the smallest user message and output
+    # budget the provider permits, no trial in it. It is awaited alone. Only
+    # then does the wave go out -- ALL of the trial calls, none held back,
+    # bounded by MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS.
+    #
+    # AND IF IT CANNOT BE ESTABLISHED, NO TRIAL CALL IS ISSUED. There is no
+    # uncached fallback anywhere: the patient fails through the existing
+    # zero-success floor below, `_billed_so_far()` carries whatever the warmup
+    # itself was billed, MAX_LLM_CLASSIFIER_RETRIES sees it and the batch
+    # checkpoint resumes it. Fifteen full-price requests are worse than one
+    # patient re-run.
+    #
+    # THE RETRY BUDGET IS THE EXISTING ONE, IN BOTH ITS LAYERS, AND NO THIRD
+    # ONE IS INVENTED HERE. `OPENAI_SDK_MAX_RETRIES` is applied on the client
+    # in oncotriage/config.py and covers this call inside the SDK, with the
+    # SDK's own backoff honouring Retry-After -- that is the "retries" a
+    # warmup exhausts before it is seen here at all. Above it,
+    # `MAX_LLM_CLASSIFIER_RETRIES` is the node-level budget: the API-error
+    # result this returns routes the graph back into this node through
+    # `route_after_llm_classifier`, which re-runs the warmup. A third loop
+    # around this call would be a fourth number in a file that already
+    # reconciles three, and its wall time would not appear in the arithmetic
+    # oncotriage/config.py works out beside those constants.
+    #
+    # WHETHER THE DISCOUNT ACTUALLY LANDS IS MEASURED, NOT ASSUMED. Every
+    # call records the provider's own `prompt_tokens_details.cached_tokens`
+    # into `llm_classifier_call_details`, per call, warmup included.
+    #
+    # THE RESULT OF EACH WAVE CALL IS AN OUTCOME, NEVER A RAISE. A worker that
+    # let an exception escape would surface it at `future.result()` on the node
     # thread, in an order decided by the executor, and one trial's transport
     # failure would end the patient. Each outcome is carried back as a tagged
     # pair and interpreted BY THE SEND LOOP, in trial order, on the node
@@ -3578,10 +3963,20 @@ CLINICAL TRIALS:
         return tuple(t["trial"]["nct_id"] for t in chunk_)
 
     _prefetched = None
+    # The warmup's transport failure, when there was one. Not a boolean: the
+    # floor below names the exception type and message in the error string it
+    # hands the retry router, exactly as the grouped path does for a raised
+    # first call, so an operator reading a failed row sees the endpoint's own
+    # diagnosis rather than "the warmup failed".
+    _warmup_error = None
+    # The routing hint for this patient's warmup AND its wave, or None. ONE
+    # READING, used twice, so the two requests cannot ask to be routed apart.
+    _cache_key = (per_trial_prompt_cache_key(system_prompt_sha256)
+                  if _per_trial_calls else None)
     if _per_trial_calls:
         # The order the send loop will consume in. Derived from `pending`
-        # rather than from `initial_chunks` so the priming call is provably the
-        # first call the loop makes: `pending` is a LIFO seeded reversed, so
+        # rather than from `initial_chunks` so the dispatch order is provably
+        # the order the loop pops in: `pending` is a LIFO seeded reversed, so
         # reversing it back gives pop order. Reading `initial_chunks` instead
         # would be a second statement of the same fact, free to disagree with
         # the seeding line above it.
@@ -3591,10 +3986,11 @@ CLINICAL TRIALS:
         _dispatch_pairs = [(c, d) for c, d in reversed(pending)]
         _dispatch_order = [c for c, _ in _dispatch_pairs]
 
-        def _issue(chunk_, prompt_):
+        def _issue(chunk_, prompt_, cache_key_):
             """One request, as an OUTCOME. Runs on a worker thread."""
             try:
-                return ("ok", call_matching_model(system_prompt, prompt_))
+                return ("ok", call_matching_model(
+                    system_prompt, prompt_, prompt_cache_key=cache_key_))
             except Exception as exc:              # noqa: BLE001 -- see above
                 return ("error", exc)
 
@@ -3620,34 +4016,178 @@ CLINICAL TRIALS:
                     f"{_chunk_key(_c)}")
             _prompts[_chunk_key(_c)] = _wrap_trials(trial_blocks[_i])
 
+        def _account_warmup(response_) -> None:
+            """Fold the warmup into the record, on the node thread.
+
+            THE SAME SEQUENCE THE SEND LOOP USES, in the same order and for the
+            same reasons: count the call, accumulate the four usage figures,
+            CHECK THE ANSWERING MODEL, then append the ledger row.
+
+            WHY THE MODEL CHECK RUNS ON THE WARMUP AT ALL, which is the one
+            thing here that is not simply "mirror the loop". A mismatched judge
+            is a fact about the endpoint, not about a trial, and it is the same
+            fact on every one of this patient's requests. Discovering it on the
+            warmup fails the patient BEFORE the wave, for the price of one
+            one-token request; discovering it in the loop fails it after
+            fifteen full-price ones have already been issued and billed. The
+            check is free to move earlier precisely because it does not depend
+            on anything a trial call carries.
+
+            THE ROW IS MARKED AND CANNOT BE MISTAKEN FOR A TRIAL. `warmup` is
+            present on this row and on no other -- the absent-rather-than-empty
+            convention `unconsumed` already follows in this ledger -- `trials`
+            is 0 because it carried none, and `entries_emitted` stays None
+            because nothing parsed it. So per-trial accounting that groups on
+            `trials` or reads `entries_emitted` excludes it by construction,
+            while every token it was billed is visible and is inside the
+            patient's totals.
+
+            `depth` IS None, NOT 0. Zero is a real split depth -- it is the
+            depth every first-generation chunk carries -- and the warmup has no
+            place in that tree at all.
+            """
+            nonlocal calls_made, input_tokens, output_tokens
+            nonlocal reasoning_tokens, reasoning_tokens_reported
+            nonlocal cached_input_tokens, cached_input_reported, model_answered
+            _u = getattr(response_, "usage", None)
+            _pt = getattr(_u, "prompt_tokens", None)
+            _ct = getattr(_u, "completion_tokens", None)
+            calls_made += 1
+            if isinstance(_pt, int) and not isinstance(_pt, bool):
+                input_tokens += _pt
+            if isinstance(_ct, int) and not isinstance(_ct, bool):
+                output_tokens += _ct
+            _rt = getattr(getattr(_u, "completion_tokens_details", None),
+                          "reasoning_tokens", None)
+            if _rt is not None:
+                reasoning_tokens += _rt
+                reasoning_tokens_reported = True
+            _cd = getattr(getattr(_u, "prompt_tokens_details", None),
+                          "cached_tokens", None)
+            if _cd is not None:
+                cached_input_tokens += _cd
+                cached_input_reported = True
+            _expected = config.matching_wire_model()
+            _returned = getattr(response_, "model", None)
+            if _returned is not None and _returned != _expected:
+                raise MatchingModelMismatchError(_expected, _returned)
+            model_answered = _returned or model_answered
+            _choices = getattr(response_, "choices", None) or []
+            call_details.append({
+                "call_index": calls_made,
+                "depth": None,
+                "trials": 0,
+                "prompt_tokens": _pt,
+                "completion_tokens": _ct,
+                "cached_tokens": _cd,
+                "reasoning_tokens": _rt,
+                "finish_reason": (getattr(_choices[0], "finish_reason", None)
+                                  if _choices else None),
+                "entries_emitted": None,
+                "warmup": True,
+            })
+
         _prefetched = {}
         if _dispatch_pairs:
-            _first, _first_depth = _dispatch_pairs[0]
-            _prefetched[_chunk_key(_first)] = _issue(
-                _first, _prompts[_chunk_key(_first)]) + (_first_depth,)
-            _rest = _dispatch_pairs[1:]
-            if _rest:
-                _bound = min(_parallel_bound, len(_rest))
-                # CONTEXT PROPAGATION IS NOT OPTIONAL HERE. The correlation ID
-                # is a contextvars.ContextVar (oncotriage/observability.py), and
-                # a thread starts with an EMPTY context -- so every line a
-                # worker logged would carry NO_CORRELATION and be unjoinable to
-                # the patient that paid for it. One FRESH copy per task, taken
-                # on THIS thread: a single Context object cannot be entered
-                # concurrently, so sharing one across the pool would raise.
-                with ThreadPoolExecutor(max_workers=_bound,
-                                        thread_name_prefix="stage5") as _ex:
-                    _futures = []
-                    for _c, _d in _rest:
-                        _ctx = contextvars.copy_context()
-                        _futures.append((_c, _d, _ex.submit(
-                            _ctx.run, _issue, _c, _prompts[_chunk_key(_c)])))
-                    for _c, _d, _fut in _futures:
-                        # `.result()` cannot raise here: `_issue` returns its
-                        # exception rather than propagating it, and the only
-                        # other way a future raises is cancellation, which
-                        # nothing cancels.
-                        _prefetched[_chunk_key(_c)] = _fut.result() + (_d,)
+            # ── The warmup ────────────────────────────────────────────────
+            #
+            # HOLDING THE FIRST TRIAL CALL BACK IS THE FALLBACK, NOT THE
+            # DESIGN. `_hold_first` is False unless the provider REFUSES the
+            # warmup's request shape, in which case the retired one-then-rest
+            # schedule is the best remaining approximation of a warm cache and
+            # is taken deliberately, with a named counter, rather than
+            # silently.
+            _hold_first = False
+            try:
+                _warmup_response = call_matching_model_warmup(
+                    system_prompt, prompt_cache_key=_cache_key)
+            except Exception as _wu_exc:          # noqa: BLE001 -- classified
+                _rejection = classify_warmup_rejection(_wu_exc)
+                if _rejection is None:
+                    # A TRANSPORT FAILURE. `pending` is emptied so the send
+                    # loop cannot issue a single trial call -- `_obtain`'s
+                    # live-call path is a real path and would otherwise send
+                    # every one of them uncached, which is the exact leak this
+                    # design removes. The floor below turns the empty run into
+                    # the API-error result.
+                    PER_TRIAL_WARMUP_DEGRADATIONS[
+                        f"{WARMUP_FAILURE_KEY_PREFIX}"
+                        f"{type(_wu_exc).__name__}"] += 1
+                    _warmup_error = _wu_exc
+                    pending.clear()
+                    log.error(
+                        "the Stage 5 per-trial cache warmup failed; no trial "
+                        "call was issued and the patient is failed so the "
+                        "retry budget and the checkpoint see it, rather than "
+                        "sending every trial against a cold cache", stage=5,
+                        status="error", event="per_trial_warmup_failed",
+                        retry=retry_count + 1,
+                        error_type=type(_wu_exc).__name__,
+                        error_message=str(_wu_exc), count=len(_dispatch_pairs),
+                        degraded=True)
+                else:
+                    PER_TRIAL_WARMUP_DEGRADATIONS[_rejection] += 1
+                    _hold_first = True
+                    if _rejection == WARMUP_REJECTED_CACHE_KEY:
+                        # DROPPED FOR THE WAVE TOO. The provider refused this
+                        # parameter, so carrying it into the fallback's calls
+                        # would refuse every one of them and turn a recoverable
+                        # configuration finding into a failed patient.
+                        _cache_key = None
+                    log.warning(
+                        "the provider refused the Stage 5 per-trial cache "
+                        "warmup's request shape; falling back to the "
+                        "one-then-rest schedule for this patient, which holds "
+                        "the first trial call back as the cache writer",
+                        stage=5, event="per_trial_warmup_rejected",
+                        reason=_rejection, retry=retry_count + 1,
+                        error_type=type(_wu_exc).__name__,
+                        error_message=str(_wu_exc), degraded=True)
+            else:
+                # ACCOUNTED BEFORE ANY TRIAL CALL IS ISSUED, which is what
+                # makes `_account_unconsumed()` below provably unaffected by
+                # the warmup: it folds what is left in `_prefetched`, and the
+                # warmup never enters it.
+                _account_warmup(_warmup_response)
+                log.info("Stage 5 warmed the shared prefix before dispatching "
+                         "the per-trial wave", stage=5,
+                         event="per_trial_warmup",
+                         count=len(_dispatch_pairs),
+                         parallel=min(_parallel_bound, len(_dispatch_pairs)))
+
+            if _warmup_error is None:
+                if _hold_first:
+                    _first, _first_depth = _dispatch_pairs[0]
+                    _prefetched[_chunk_key(_first)] = _issue(
+                        _first, _prompts[_chunk_key(_first)],
+                        _cache_key) + (_first_depth,)
+                    _rest = _dispatch_pairs[1:]
+                else:
+                    _rest = _dispatch_pairs
+                if _rest:
+                    _bound = min(_parallel_bound, len(_rest))
+                    # CONTEXT PROPAGATION IS NOT OPTIONAL HERE. The correlation
+                    # ID is a contextvars.ContextVar
+                    # (oncotriage/observability.py), and a thread starts with an
+                    # EMPTY context -- so every line a worker logged would carry
+                    # NO_CORRELATION and be unjoinable to the patient that paid
+                    # for it. One FRESH copy per task, taken on THIS thread: a
+                    # single Context object cannot be entered concurrently, so
+                    # sharing one across the pool would raise.
+                    with ThreadPoolExecutor(max_workers=_bound,
+                                            thread_name_prefix="stage5") as _ex:
+                        _futures = []
+                        for _c, _d in _rest:
+                            _ctx = contextvars.copy_context()
+                            _futures.append((_c, _d, _ex.submit(
+                                _ctx.run, _issue, _c,
+                                _prompts[_chunk_key(_c)], _cache_key)))
+                        for _c, _d, _fut in _futures:
+                            # `.result()` cannot raise here: `_issue` returns
+                            # its exception rather than propagating it, and the
+                            # only other way a future raises is cancellation,
+                            # which nothing cancels.
+                            _prefetched[_chunk_key(_c)] = _fut.result() + (_d,)
 
     def _obtain(chunk):
         """The API response for `chunk`, prefetched or issued now.
@@ -3700,6 +4240,12 @@ CLINICAL TRIALS:
         fold it in the same sequence and the ledger's tail is reproducible.
         ``sorted()`` materialises the keys before the loop pops, so the
         mutation is safe.
+
+        THE WARMUP IS NEVER IN HERE, and that is by construction rather than
+        by a filter: it is consumed -- read, accounted and ledgered -- on the
+        node thread BEFORE `_prefetched` is populated, so it cannot be an
+        abandoned response. tests/test_agent_stage5_per_trial_calls.py section
+        3 asserts that rather than leaving it as reasoning.
 
         IT NEVER RAISES, AND THE MODEL CHECK IS DELIBERATELY NOT REPEATED HERE.
         This runs on a path that is already failing and already has a
@@ -3782,6 +4328,17 @@ CLINICAL TRIALS:
     # about the process.
     per_trial_failed_calls = 0
     per_trial_last_error = None
+    # TRIAL calls that returned a response, which is NOT `calls_made`. The
+    # warmup is a billed call and is counted in `calls_made` -- correctly, it
+    # is real money -- but it evaluates nothing, so a floor that tested
+    # `calls_made` would be satisfied by a successful warmup and would STOP
+    # FIRING for the case it exists to catch: every trial call failing while
+    # the warmup succeeded, which is exactly what a total outage that begins
+    # after the first request looks like. That patient would be recorded as a
+    # cohort of not-evaluable trials with no error, which is the failure this
+    # project exists to remove. So the floor asks about verdicts, and this is
+    # the counter that answers.
+    per_trial_succeeded = 0
 
     while pending:
         chunk, depth = pending.pop()
@@ -3890,6 +4447,9 @@ CLINICAL TRIALS:
             }
 
         calls_made += 1
+        if _per_trial_calls:
+            # A TRIAL call that produced a response. See the declaration.
+            per_trial_succeeded += 1
         input_tokens += response.usage.prompt_tokens
         output_tokens += response.usage.completion_tokens
         response_text = chunk_text
@@ -4489,7 +5049,7 @@ CLINICAL TRIALS:
 
         evaluations.extend(_objects)
 
-    # ── Per-trial mode: every call failed ─────────────────────────────────
+    # ── Per-trial mode: no trial was judged ───────────────────────────────
     #
     # ISOLATION HAS A FLOOR, AND THIS IS IT. Recording every trial as not
     # evaluable and returning success would turn an unreachable endpoint, an
@@ -4497,32 +5057,61 @@ CLINICAL TRIALS:
     # and a clean-looking row -- the failure this project exists to remove,
     # manufactured by the mechanism that isolates a single bad call.
     #
-    # `calls_made` IS THE TEST AND NOT `per_trial_failed_calls`, because the
-    # question is whether ANY response was obtained rather than how many were
-    # lost. One survivor out of fifteen is a bad run that still produced a real
-    # verdict for a real trial, and discarding it to re-bill fourteen more is
-    # the wrong trade; zero survivors produced nothing to keep.
+    # TWO WAYS IN, ONE RETURN. Either the warmup could not be established, in
+    # which case NO trial call was issued at all and `pending` was emptied
+    # above; or every trial call that WAS issued failed. Both mean the same
+    # thing to every consumer -- this patient produced no verdict and must be
+    # re-run -- and giving them two returns would be two shapes for the retry
+    # router to agree about. They differ only in the error string, which is
+    # what an operator reads.
+    #
+    # `per_trial_succeeded` IS THE TEST AND NOT `calls_made`, and that is a
+    # correction rather than a detail: the warmup is a billed call and is
+    # counted in `calls_made`, so testing `calls_made` would leave this floor
+    # satisfied by a successful warmup and silently unable to fire for the
+    # total-outage case it exists for. Nor is it `per_trial_failed_calls`: the
+    # question is whether ANY trial was judged, not how many were lost. One
+    # survivor out of fifteen is a bad run that still produced a real verdict
+    # for a real trial, and discarding it to re-bill fourteen more is the wrong
+    # trade; zero survivors produced nothing to keep.
     #
     # IT RETURNS THE API-ERROR RESULT, SHAPE FOR SHAPE, so the retry router
     # sees exactly what grouped mode's raised first call gives it and
-    # MAX_LLM_CLASSIFIER_RETRIES covers the outage identically. `_billed_so_far`
-    # returns {} here by construction -- `calls_made` is 0 -- which is the same
-    # honest absence that path already writes when no usage object was ever
-    # obtained.
-    if _per_trial_calls and per_trial_failed_calls and not calls_made:
+    # MAX_LLM_CLASSIFIER_RETRIES covers the outage identically.
+    # `_billed_so_far()` is NOT empty on the warmup arm and that is the point:
+    # a warmup that answered and then a wave that never went out is one billed
+    # call, and the record says one rather than none. On the every-call-failed
+    # arm it carries the warmup plus nothing, which is again the exact billed
+    # total rather than an invented zero.
+    if _per_trial_calls and not per_trial_succeeded and (
+            _warmup_error is not None or per_trial_failed_calls):
         elapsed = time.time() - start
-        error_msg = (f"Stage 5 per-trial API error (attempt "
-                     f"{retry_count + 1}): all {per_trial_failed_calls} "
-                     f"per-trial calls failed; last: "
-                     f"{type(per_trial_last_error).__name__}: "
-                     f"{per_trial_last_error}")
-        log.error("every per-trial Stage 5 call failed; failing the patient "
-                  "so the retry budget sees it rather than reporting a run of "
-                  "not-evaluable trials as a success", stage=5, status="error",
-                  event="per_trial_all_calls_failed",
-                  retry=retry_count + 1, count=per_trial_failed_calls,
-                  error_type=type(per_trial_last_error).__name__,
-                  error_message=str(per_trial_last_error))
+        if _warmup_error is not None:
+            error_msg = (f"Stage 5 per-trial cache warmup error (attempt "
+                         f"{retry_count + 1}): the shared prefix could not be "
+                         f"warmed, so no trial call was issued; "
+                         f"{type(_warmup_error).__name__}: {_warmup_error}")
+            log.error("the Stage 5 per-trial cache warmup failed and no trial "
+                      "call was issued; failing the patient so the retry "
+                      "budget and the checkpoint see it", stage=5,
+                      status="error", event="per_trial_warmup_floor",
+                      retry=retry_count + 1, count=len(trials),
+                      error_type=type(_warmup_error).__name__,
+                      error_message=str(_warmup_error))
+        else:
+            error_msg = (f"Stage 5 per-trial API error (attempt "
+                         f"{retry_count + 1}): all {per_trial_failed_calls} "
+                         f"per-trial calls failed; last: "
+                         f"{type(per_trial_last_error).__name__}: "
+                         f"{per_trial_last_error}")
+            log.error("every per-trial Stage 5 call failed; failing the "
+                      "patient so the retry budget sees it rather than "
+                      "reporting a run of not-evaluable trials as a success",
+                      stage=5, status="error",
+                      event="per_trial_all_calls_failed",
+                      retry=retry_count + 1, count=per_trial_failed_calls,
+                      error_type=type(per_trial_last_error).__name__,
+                      error_message=str(per_trial_last_error))
         return {
             "llm_classifier_call_details": call_details,
             "evaluations": [],

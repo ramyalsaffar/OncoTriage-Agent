@@ -147,8 +147,16 @@ from oncotriage.agent.evaluation import (
     NOT_EVALUABLE_CALL_FAILED,
     NOT_EVALUABLE_MODEL_OMITTED,
     PER_TRIAL_CALL_FAILURES,
+    PER_TRIAL_WARMUP_DEGRADATIONS,
+    WARMUP_FAILURE_KEY_PREFIX,
+    WARMUP_REJECTED_CACHE_KEY,
+    WARMUP_REJECTED_MINIMAL_OUTPUT,
+    MatchingModelMismatchError,
     PackingBlockMismatchError,
     PerTrialParallelismError,
+    PerTrialProviderUnsupportedError,
+    assert_per_trial_provider_supported,
+    classify_warmup_rejection,
     node_llm_classifier_evaluation,
 )
 
@@ -320,19 +328,58 @@ def _eligible_body(nct_ids):
         for i in nct_ids]})
 
 
+# ── THE WARMUP IS A REQUEST WITH NO TRIAL IN IT ──────────────────────────
+#
+# Recognised by its USER MESSAGE, which the node reads from
+# `config.MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE`, rather than by "the first
+# request" or "a request the id regex found nothing in". Both of those are
+# properties of the schedule, and the schedule is what is under test: a defect
+# that stopped sending the warmup would make request 0 a trial call, and a test
+# that DEFINED request 0 as the warmup could not see it.
+
+
+def is_warmup(request):
+    """Is this recorded request the cache warmup?"""
+    return (request["messages"][1]["content"]
+            == config.MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE)
+
+
+class _WarmupRefused(Exception):
+    """A provider 400 that NAMES a parameter, as the SDK presents one.
+
+    ``status_code`` on the exception is the OpenAI SDK's own shape
+    (``APIStatusError``); the message is what
+    ``evaluation.classify_warmup_rejection`` matches a parameter name in. Built
+    here rather than imported from openai because the classifier is documented
+    to key on the SHAPE of an exception and not on its class, and a control
+    that used the real class would leave that claim untested.
+    """
+
+    def __init__(self, message, status_code=400):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class _Stub:
     """Answers the trials it was ASKED about, and records the call order.
 
     ``answer`` overrides the body per nct_id; ``fail_for`` raises for the named
-    trials; ``barrier_size`` makes every non-priming call wait for that many
+    trials; ``barrier_size`` makes every post-warmup call wait for that many
     peers, which a sequential dispatcher cannot satisfy and which therefore
     proves the parallelism rather than assuming it.
+
+    ``warmup_raise`` is the exception the WARMUP call raises -- a transport
+    failure when it is an ordinary Exception, a refusal of the request shape
+    when it is a ``_WarmupRefused``. ``warmup_model`` overrides the answering
+    model on the warmup response only, which is what separates "the wrong judge
+    answered" from "a trial call went wrong".
     """
 
     def __init__(self, *, cached=None, fail_for=(), answer=None,
                  barrier_size=None, delay=0.0, cached_first_only=False,
                  barrier_all=False, barrier_timeout=15.0, refuse_for=(),
-                 bad_json_for=()):
+                 bad_json_for=(), warmup_raise=None, warmup_model=None,
+                 warmup_cached=None, warmup_prompt_tokens=None):
         self.requests = []          # arrival order
         self.events = []            # ("enter"|"exit", call_no, ticket)
         self.cached = cached
@@ -345,6 +392,10 @@ class _Stub:
         self.refuse_for = set(refuse_for)
         self.bad_json_for = set(bad_json_for)
         self.answer = answer or {}
+        self.warmup_raise = warmup_raise
+        self.warmup_model = warmup_model
+        self.warmup_cached = warmup_cached
+        self.warmup_prompt_tokens = warmup_prompt_tokens
         self.delay = delay
         self.in_flight = 0
         self.max_in_flight = 0
@@ -368,6 +419,7 @@ class _Stub:
     def create(self, **kwargs):
         ids = re.findall(r"<<<TRIAL_DATA nct_id=(\S+) ",
                          kwargs["messages"][1]["content"])
+        warmup = is_warmup(kwargs)
         with self._lock:
             call_no = len(self.requests)
             self.requests.append(kwargs)
@@ -375,6 +427,23 @@ class _Stub:
             self.in_flight += 1
             self.max_in_flight = max(self.max_in_flight, self.in_flight)
         try:
+            # THE WARMUP IS ANSWERED BEFORE THE BARRIER, and it has to be: the
+            # node awaits it alone, so a warmup that joined a barrier sized for
+            # the wave would deadlock every scenario rather than measure one.
+            if warmup:
+                if self.warmup_raise is not None:
+                    raise self.warmup_raise
+                _resp = _StubResponse(
+                    "", cached=(self.warmup_cached
+                                if self.warmup_cached is not None
+                                else self.cached),
+                    prompt_tokens=(self.warmup_prompt_tokens
+                                   if self.warmup_prompt_tokens is not None
+                                   else 1000))
+                _resp.choices[0].finish_reason = "length"
+                if self.warmup_model is not None:
+                    _resp.model = self.warmup_model
+                return _resp
             if self._barrier is not None and (self.barrier_all or call_no > 0):
                 try:
                     self._barrier.wait(timeout=self.barrier_timeout)
@@ -417,6 +486,25 @@ class _Stub:
     def ids_by_call(self):
         return [ids_in(r) for r in self.requests]
 
+    # THE THREE READINGS BELOW SPLIT THE RECORD RATHER THAN FILTERING IT
+    # QUIETLY. `requests` stays every request the node made, warmup included,
+    # so a check that means "the node issued N requests in total" can still say
+    # so; these name the two populations explicitly, so a check that means "the
+    # node issued one request per trial" cannot accidentally be satisfied by an
+    # infrastructure call.
+    def warmup_requests(self):
+        return [r for r in self.requests if is_warmup(r)]
+
+    def wave_requests(self):
+        return [r for r in self.requests if not is_warmup(r)]
+
+    def wave_ids(self):
+        return [ids_in(r) for r in self.wave_requests()]
+
+    def wave_call_nos(self):
+        """The ``call_no`` of every non-warmup request, in arrival order."""
+        return [n for n, r in enumerate(self.requests) if not is_warmup(r)]
+
     def enter_ticket(self, call_no):
         for kind, n, t in self.events:
             if kind == "enter" and n == call_no:
@@ -456,27 +544,33 @@ class _Stub:
 
 
 class _OrderedStub(_Stub):
-    """Completes the non-priming calls in an EXPLICIT order.
+    """Completes the TRIAL calls in an EXPLICIT order.
 
-    Every non-priming call first joins a barrier -- so they are provably all in
+    Every trial call first joins a barrier -- so they are provably all in
     flight together, which is what makes a reordering possible at all -- and
     then waits for its turn on a condition. Turn `i` is handed to the id at
     `order[i]`, so the completion sequence is decided here rather than by the
     scheduler.
+
+    ``order`` NOW COVERS EVERY TRIAL, where it once covered every trial but the
+    priming one. That is the schedule change stated in the harness: no trial
+    call is awaited alone any more, so there is no trial the hand-off has to
+    exclude. The WARMUP is excluded, and by its own shape rather than by name --
+    ``_Stub.create`` answers it above the barrier, and ``_delay_for`` never
+    sees a request with no ids in the hand-off.
     """
 
-    def __init__(self, priming_id, order, **kw):
+    def __init__(self, order, **kw):
         super().__init__(barrier_size=len(order), **kw)
-        self._priming_id = priming_id
         self._order = list(order)
         self._cond = threading.Condition()
         self._turn = 0
         self.order_timed_out = False
 
     def _delay_for(self, ids):
-        # The priming call is not part of the hand-off: it has already
-        # completed before any of these exist.
-        if not ids or ids[0] == self._priming_id:
+        # The warmup is not part of the hand-off: it has already completed
+        # before any of these exist, and it carries no trial to rank.
+        if not ids:
             return 0.0
         try:
             rank = self._order.index(ids[0])
@@ -586,10 +680,141 @@ check("1d  ...and it was restored", config.MATCHING_PER_TRIAL_CALLS_ENABLED,
 
 # THE SEAM ITSELF. Without this, every ON-arm assertion below could be
 # exercising the shipped default and reporting success.
+#
+# SEVEN, NOT SIX: one cache warmup and then six trial calls. Counting total
+# requests here rather than wave requests is deliberate -- this check exists to
+# say the flag reaches the node at all, and the total is the coarsest reading
+# that can say it.
 check("1e  setting the flag on `config` genuinely reaches the node: ON over "
-      "six trials issues six requests, OFF issues one",
+      "six trials issues a warmup plus six trial requests, OFF issues one",
       (len(run_node(_SIX, per_trial=True)[1].requests),
-       len(run_node(_SIX, per_trial=False)[1].requests)), (6, 1))
+       len(run_node(_SIX, per_trial=False)[1].requests)), (7, 1))
+
+# The three warmup constants, on the same footing as 1a/1b: a value the mode
+# cannot work with is a configuration defect, and config refuses it at import.
+check("1f  the warmup output ceiling is a usable integer >= 1",
+      (isinstance(config.MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS, int),
+       not isinstance(config.MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS, bool),
+       config.MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS >= 1),
+      (True, True, True))
+check("1f  ...and it is 1, the smallest answer a provider can be asked for",
+      config.MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS, 1)
+check("1f  ...and the warmup user message is a non-empty string",
+      (isinstance(config.MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE, str),
+       bool(config.MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE)), (True, True))
+check("1f  ...and the cache-routing hint is a bool",
+      isinstance(config.MATCHING_PER_TRIAL_PROMPT_CACHE_KEY_ENABLED, bool),
+      True)
+
+# The routing key is a pure function of the prefix digest, both directions.
+_saved_key_flag = config.MATCHING_PER_TRIAL_PROMPT_CACHE_KEY_ENABLED
+try:
+    config.MATCHING_PER_TRIAL_PROMPT_CACHE_KEY_ENABLED = True
+    _key_on = _evaluation.per_trial_prompt_cache_key("aabbcc")
+    _key_on_2 = _evaluation.per_trial_prompt_cache_key("aabbcc")
+    _key_other = _evaluation.per_trial_prompt_cache_key("ddeeff")
+    config.MATCHING_PER_TRIAL_PROMPT_CACHE_KEY_ENABLED = False
+    _key_off = _evaluation.per_trial_prompt_cache_key("aabbcc")
+finally:
+    config.MATCHING_PER_TRIAL_PROMPT_CACHE_KEY_ENABLED = _saved_key_flag
+check("1g  the routing key is stable for one prefix and different for another "
+      "-- which is the whole property, since two requests are routed together "
+      "exactly when they have a prefix to share",
+      (_key_on == _key_on_2, _key_on == _key_other,
+       _key_on is None), (True, False, False))
+check("1g  ...it is namespaced rather than a bare digest, so an unrelated "
+      "workload on the same account cannot ask to be routed with us",
+      _key_on.startswith("oncotriage-"), True)
+check("1g  ...and the flag switches it off to None, which is what makes the "
+      "kwarg expansion empty", _key_off, None)
+check("1g  ...and the flag was restored",
+      config.MATCHING_PER_TRIAL_PROMPT_CACHE_KEY_ENABLED, _saved_key_flag)
+
+# The rejection vocabulary is closed and both members are the named constants.
+check("1h  the warmup rejection vocabulary is closed and its two members are "
+      "the two named constants",
+      (_evaluation.WARMUP_REJECTIONS,
+       len(set(_evaluation.WARMUP_REJECTIONS))),
+      ((_evaluation.WARMUP_REJECTED_MINIMAL_OUTPUT,
+        _evaluation.WARMUP_REJECTED_CACHE_KEY), 2))
+
+# THE PROVIDER GUARD FIRES BEFORE A CENT IS SPENT, which is what makes a
+# misconfiguration one named error rather than MAX_LLM_CLASSIFIER_RETRIES
+# identical failed patients. Driven on `config` because that is the seam the
+# node reads, and restored.
+_saved_provider = config.MATCHING_PROVIDER
+try:
+    config.MATCHING_PROVIDER = config.MATCHING_PROVIDER_BEDROCK
+    _prov_raised = drive(assert_per_trial_provider_supported)
+    _prov_node, _prov_stub = run_node(_SIX, per_trial=True)
+    config.MATCHING_PROVIDER = config.MATCHING_PROVIDER_OPENAI
+    _prov_ok = drive(assert_per_trial_provider_supported)
+finally:
+    config.MATCHING_PROVIDER = _saved_provider
+check("1i  per-trial mode on a provider whose warmup is not built is REFUSED "
+      "by name, and NOTHING is sent -- not the warmup and not a trial call",
+      (PerTrialProviderUnsupportedError.__name__ in repr(_prov_raised),
+       PerTrialProviderUnsupportedError.__name__ in repr(_prov_node),
+       len(_prov_stub.requests)), (True, True, 0))
+check("1i  ...and the refusal names BOTH constants, because either is a "
+      "legitimate fix and only the operator knows which they meant",
+      ("MATCHING_PER_TRIAL_CALLS_ENABLED" in repr(_prov_node),
+       "MATCHING_PROVIDER" in repr(_prov_node)), (True, True))
+check("1i  ...it is a RuntimeError subclass, deliberately not a ValueError, "
+      "so a stray `except ValueError` cannot eat it",
+      (issubclass(PerTrialProviderUnsupportedError, RuntimeError),
+       issubclass(PerTrialProviderUnsupportedError, ValueError)),
+      (True, False))
+check("1i  ...non-degeneracy: on the shipped provider it does not fire, so "
+      "the rows above are a measurement rather than a guard that always raises",
+      _prov_ok, None)
+check("1i  ...and the provider was restored",
+      config.MATCHING_PROVIDER, _saved_provider)
+
+# NO THIRD RETRY BUDGET WAS INVENTED, ASSERTED STRUCTURALLY. The warmup's
+# retry coverage is the two budgets this project already reconciles:
+# OPENAI_SDK_MAX_RETRIES inside the SDK, with the SDK's own backoff honouring
+# Retry-After, and MAX_LLM_CLASSIFIER_RETRIES above the node, which re-enters
+# it through route_after_llm_classifier when the API-error result is returned.
+# A loop around the warmup would be a fourth number in a file that already
+# works out the worst-case wall time from three, and its cost would not appear
+# in that arithmetic.
+# Parsed HERE rather than reusing `_eval_tree`, which is built further down
+# this section: a check that depended on a name defined below it would work
+# only for as long as nobody moved either line.
+_eval_tree_1k = ast.parse(_EVAL_SRC)
+_warmup_calls = [n for n in ast.walk(_eval_tree_1k)
+                 if isinstance(n, ast.Call)
+                 and ast.unparse(n.func).endswith("call_matching_model_warmup")]
+_loops = [n for n in ast.walk(_eval_tree_1k)
+          if isinstance(n, (ast.For, ast.While, ast.AsyncFor))]
+_in_a_loop = any(c in set(ast.walk(loop))
+                 for loop in _loops for c in _warmup_calls)
+check("1k  the warmup is issued from exactly ONE call site and that site is "
+      "not inside any loop -- the retry budget is the existing one, not a "
+      "third one invented here",
+      (len(_warmup_calls), _in_a_loop), (1, False))
+check("1k  ...non-degeneracy: the walk really does find loops in this module, "
+      "so `not in a loop` is a finding rather than a walk that matched "
+      "nothing", len(_loops) > 5, True)
+
+# THE UNREACHABLE GUARD IS STILL DRIVEN. config refuses an empty warmup message
+# at import, so this fires only when something rebound the constant WITHIN a
+# process -- which is exactly what a probe or a REPL does, and is why it raises
+# rather than substituting a default nobody can reproduce.
+_saved_msg = config.MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE
+try:
+    config.MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE = ""
+    _msg_raised = drive(_evaluation.call_matching_model_warmup, "SYS")
+finally:
+    config.MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE = _saved_msg
+check("1k  an empty warmup message is REFUSED rather than defaulted, so a "
+      "warmup can never write a cache under a request nobody can reproduce",
+      ("_WarmupUserMessageError" in repr(_msg_raised),
+       "MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE" in repr(_msg_raised)),
+      (True, True))
+check("1k  ...and the message was restored",
+      config.MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE, _saved_msg)
 
 # ONE OWNER, TWO CONSUMERS -- asserted BY AST against both files, because the
 # whole value of the function is that neither side re-reads the constant.
@@ -725,23 +950,45 @@ check("1m  ...non-degeneracy: the same walk finds the PROVIDER guard in both, "
 section("SECTION 2 -- one request per trial, and the packer is bypassed")
 
 _R2, _S2 = run_node(_SIX, per_trial=True)
-_ids2 = _S2.ids_by_call()
+_ids2 = _S2.wave_ids()
 
-check("2a  six trials produce six requests", len(_S2.requests), 6)
-check("2b  ...each carrying exactly one trial",
+check("2a  six trials produce six TRIAL requests, plus exactly one warmup",
+      (len(_ids2), len(_S2.warmup_requests())), (6, 1))
+check("2b  ...each trial request carrying exactly one trial",
       sorted({len(i) for i in _ids2}), [1])
 check("2c  ...the union is the whole batch, once each",
       sorted(i for call in _ids2 for i in call),
       sorted(t["trial"]["nct_id"] for t in _SIX))
-# ARRIVAL ORDER IS NOT TRIAL ORDER AND MUST NOT BE ASSERTED TO BE. Five of
-# these six requests are issued concurrently, so `stub.requests` is ordered by
-# whichever worker got the lock first -- a fact about the pool. The one thing
-# that IS deterministic about arrival is the priming call, which is awaited
-# alone; section 4 owns everything the node PUBLISHES, which is where trial
-# order is a promise.
-check("2d  the FIRST request to arrive is the first trial -- the priming call "
-      "is the only arrival-order fact this mode guarantees",
-      _ids2[0], [_SIX[0]["trial"]["nct_id"]])
+# ARRIVAL ORDER IS NOT TRIAL ORDER AND MUST NOT BE ASSERTED TO BE. All six of
+# these trial requests are issued concurrently, so `stub.requests` is ordered
+# by whichever worker got the lock first -- a fact about the pool. The one
+# thing that IS deterministic about arrival is that the WARMUP came first,
+# which is section 3's subject; section 4 owns everything the node PUBLISHES,
+# which is where trial order is a promise.
+check("2d  the FIRST request to arrive is the warmup, and it carries no trial "
+      "at all -- which is what makes it infrastructure rather than a trial "
+      "call doubling as one",
+      (is_warmup(_S2.requests[0]), _S2.ids_by_call()[0]), (True, []))
+check("2d  ...and the warmup's user message is the configured one, byte for "
+      "byte, rather than anything this node invented",
+      _S2.requests[0]["messages"][1]["content"],
+      config.MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE)
+check("2d  ...its output ceiling is the configured minimum, not the batch "
+      "ceiling -- the whole reason a warmup is affordable",
+      (_S2.requests[0].get("max_completion_tokens"),
+       config.MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS
+       != config.MATCHING_MAX_TOKENS),
+      (config.MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS, True))
+check("2d  ...and it asks for no response_format, which is the one asymmetry "
+      "with a trial call and is argued at call_matching_model_warmup",
+      ("response_format" in _S2.requests[0],
+       all("response_format" in r for r in _S2.wave_requests())),
+      (False, True))
+check("2d  ...while every request of the patient, warmup included, carries "
+      "the SAME routing key -- a warmup routed apart from its wave would warm "
+      "a machine the wave never reaches",
+      (len({r.get("prompt_cache_key") for r in _S2.requests}),
+       _S2.requests[0].get("prompt_cache_key") is not None), (1, True))
 check("2e  every trial got a verdict; nothing was lost or duplicated",
       sorted(e.get("nct_id") for e in at(_R2, "evaluations")),
       sorted(t["trial"]["nct_id"] for t in _SIX))
@@ -776,14 +1023,18 @@ check("2k  each per-trial user message is byte-identical to the message a "
       "one-trial render would have built (the slice identity the dispatch "
       "depends on, measured through the node). Keyed by nct_id, because the "
       "requests arrive in pool order and this is a claim about CONTENT",
-      {ids_in(r)[0]: r["messages"][1]["content"] for r in _S2.requests},
+      {ids_in(r)[0]: r["messages"][1]["content"]
+       for r in _S2.wave_requests()},
       _expected_user)
 check("2k  ...non-degeneracy: those messages are real, distinct and non-empty",
       (len(_expected_user), len(set(_expected_user.values())),
        min(len(v) for v in _expected_user.values()) > 100), (6, 6, True))
 check("2l  ...and every request carried the SAME system message, which is the "
-      "shared prefix the whole mode is priced on",
-      len({r["messages"][0]["content"] for r in _S2.requests}), 1)
+      "shared prefix the whole mode is priced on. THE WARMUP IS IN THIS SET: "
+      "a warmup carrying a different prefix would warm a cache the wave cannot "
+      "use, which is the one way this design fails silently",
+      (len({r["messages"][0]["content"] for r in _S2.requests}),
+       len(_S2.requests)), (1, 7))
 
 
 # ===========================================================================
@@ -796,50 +1047,56 @@ check("2l  ...and every request carried the SAME system message, which is the "
 # is true or false regardless of how fast the machine is. A sleep-based version
 # would pass on an idle laptop and fail under load while testing nothing.
 
-section("SECTION 3 -- one call first, then the rest, bounded")
+section("SECTION 3 -- the warmup first, then the whole wave, bounded")
 
-_R3, _S3 = run_node(_SIX, per_trial=True, parallel=4)
-_first_exit = _S3.exit_ticket(0)
-_other_enters = [_S3.enter_ticket(n) for n in range(1, len(_S3.requests))]
+_R3, _S3 = run_node(_SIX, per_trial=True, parallel=6)
+_warm_exit = _S3.exit_ticket(0)
+_wave_enters = [_S3.enter_ticket(n) for n in _S3.wave_call_nos()]
 
-check("3a  the priming call took ticket 1 -- it is the first request issued",
-      _S3.enter_ticket(0), 1)
-check("3b  ...and it had COMPLETED before any other call was ISSUED. This is "
-      "the cache-aware half of the design: the shared prefix cannot be served "
-      "from cache until one request has written it",
-      all(_first_exit < e for e in _other_enters), True)
-check("3b  ...non-degeneracy: there ARE other calls to have been held back "
+check("3a  the warmup took ticket 1 -- it is the first request issued, and it "
+      "is not a trial call",
+      (_S3.enter_ticket(0), is_warmup(_S3.requests[0])), (1, True))
+check("3b  ...and it had COMPLETED before ANY trial call was ISSUED. This is "
+      "the cache-or-nothing rule stated as an integer comparison over tickets "
+      "the stub itself issued: no trial request is ever sent against a cold "
+      "prefix",
+      all(_warm_exit < e for e in _wave_enters), True)
+check("3b  ...non-degeneracy: there ARE trial calls to have been held back "
       "(the same assertion over an empty set is vacuously true)",
-      len(_other_enters), 5)
-check("3c  ...and the priming call ran alone: nothing was in flight beside it",
+      len(_wave_enters), 6)
+check("3c  ...and the warmup ran alone: nothing was in flight beside it",
       _S3.exit_ticket(0), 2)
 
-# LIVENESS. With exactly `bound` calls left after the priming one, a barrier of
-# that size can only be passed if all of them are genuinely in flight together.
-# A sequential dispatcher makes the first waiter time out and BREAK the
-# barrier, which is what this measures.
-_R3b, _S3b = run_node([trial(i) for i in range(5)], per_trial=True, parallel=4,
+# LIVENESS. With `bound` trial calls and a barrier of that size, the barrier
+# can only be passed if all of them are genuinely in flight together. A
+# sequential dispatcher makes the first waiter time out and BREAK the barrier,
+# which is what this measures. FOUR TRIALS AND A BARRIER OF FOUR: under the
+# retired schedule one of them was the priming call and could not join, so this
+# scenario is also the direct measurement that none is held back now.
+_R3b, _S3b = run_node([trial(i) for i in range(4)], per_trial=True, parallel=4,
                       stub=_Stub(barrier_size=4))
-check("3d  the four non-priming calls really do overlap: all four reach a "
-      "4-party barrier. A sequential implementation cannot, and would break it",
+check("3d  all four trial calls really do overlap: all four reach a 4-party "
+      "barrier. A sequential implementation cannot, and neither could a "
+      "schedule that held one of the four back to write the cache",
       (_S3b.barrier_broken, _S3b.max_in_flight), (False, 4))
-check("3d  ...and all five requests were still issued and answered",
-      (len(_S3b.requests), len(at(_R3b, "evaluations"))), (5, 5))
+check("3d  ...and a warmup plus four trial requests were issued and answered",
+      (len(_S3b.requests), len(_S3b.wave_requests()),
+       len(at(_R3b, "evaluations"))), (5, 4, 4))
 
-# SAFETY, AND IT IS FORCED RATHER THAN OBSERVED. Six non-priming calls against
-# a bound of 2, with a barrier that ALL SIX would have to reach: under the
+# SAFETY, AND IT IS FORCED RATHER THAN OBSERVED. Seven trial calls against a
+# bound of 2, with a barrier that ALL SEVEN would have to reach: under the
 # bound only two can ever be waiting, so the barrier times out and BREAKS --
 # which is a fact about the ceiling, not about how fast the machine is. The
 # `max_in_flight <= 2` reading beside it is the direct measurement; the barrier
 # is what makes control c4 below able to disagree.
 _R3c, _S3c = run_node([trial(i) for i in range(7)], per_trial=True, parallel=2,
-                      stub=_Stub(barrier_size=6, barrier_timeout=1.0))
-check("3e  the in-flight bound is a CEILING: with a bound of 2 and six "
-      "non-priming calls, never more than two were in flight, and a six-party "
+                      stub=_Stub(barrier_size=7, barrier_timeout=1.0))
+check("3e  the in-flight bound is a CEILING: with a bound of 2 and seven "
+      "trial calls, never more than two were in flight, and a seven-party "
       "barrier could not be satisfied",
       (_S3c.max_in_flight <= 2, _S3c.barrier_broken), (True, True))
 check("3e  ...non-degeneracy: calls were made at all, and all seven answered",
-      (len(_S3c.requests), len(at(_R3c, "evaluations"))), (7, 7))
+      (len(_S3c.wave_requests()), len(at(_R3c, "evaluations"))), (7, 7))
 
 # A bound of 1 is the honest way to say "sequential" without leaving the mode.
 _R3d, _S3d = run_node([trial(i) for i in range(4)], per_trial=True, parallel=1,
@@ -848,11 +1105,35 @@ check("3f  a bound of 1 means sequential: never two in flight, and all four "
       "trials still evaluated",
       (_S3d.max_in_flight, len(at(_R3d, "evaluations"))), (1, 4))
 
-# ONE TRIAL: no executor is needed and none may be required.
+# ONE TRIAL: the warmup still runs -- a patient with one trial is exactly the
+# patient for whom a shared prefix buys the least, and issuing the warmup
+# anyway is the cost of a rule that has no exceptions to reason about.
 _R3e, _S3e = run_node([trial(0)], per_trial=True, parallel=4)
-check("3g  a single-trial patient issues one call and needs no pool",
-      (len(_S3e.requests), _S3e.max_in_flight,
-       len(at(_R3e, "evaluations"))), (1, 1, 1))
+check("3g  a single-trial patient issues a warmup and one trial call, and "
+       "never has two in flight",
+      (len(_S3e.requests), len(_S3e.wave_requests()), _S3e.max_in_flight,
+       len(at(_R3e, "evaluations"))), (2, 1, 1, 1))
+
+# THE WARMUP IS CONSUMED BEFORE DISPATCH, WHICH IS WHAT MAKES
+# `_account_unconsumed()` PROVABLY UNAFFECTED BY IT. Asserted rather than
+# reasoned: a refusal on the first trial abandons every other wave response and
+# folds them as `unconsumed`, so if the warmup could ever land in `_prefetched`
+# it would appear there. It does not, and the warmup's own row is present and
+# is NOT marked unconsumed.
+_R3h, _S3h = run_node(_SIX, per_trial=True, parallel=6,
+                      stub=_Stub(refuse_for=[_SIX[0]["trial"]["nct_id"]]))
+_details3h = at(_R3h, "llm_classifier_call_details") or []
+_warm_rows3h = [d for d in _details3h if d.get("warmup")]
+check("3j  a refusal abandons the rest of the wave and folds it as unconsumed "
+      "-- and the warmup row is NOT among the folded ones, because it was "
+      "consumed on the node thread before any of them was issued",
+      (len(_warm_rows3h),
+       [d.get("unconsumed") for d in _warm_rows3h],
+       sum(1 for d in _details3h if d.get("unconsumed"))),
+      (1, [None], 5))
+check("3j  ...non-degeneracy: the run really did refuse and really did abandon "
+      "responses, so the zero above is a finding",
+      (bool(at(_R3h, "llm_classifier_refusal")), len(_details3h)), (True, 7))
 
 # WHAT RUNS ON A WORKER, AS A STRUCTURAL CLAIM. Every increment of
 # MARKDOWN_ESCAPE_DECODE_UNRESOLVED and ESCAPED_ENTITY_DECODE_UNRESOLVED
@@ -888,6 +1169,205 @@ check("3h  grouped mode issues one call and never has two in flight",
 
 
 # ===========================================================================
+# SECTION 3b -- CACHE-OR-NOTHING: WHAT HAPPENS WHEN THE WARMUP DOES NOT
+# ===========================================================================
+#
+# THE RULE HAS EXACTLY THREE OUTCOMES AND EACH IS MEASURED HERE.
+#
+#   * the warmup ANSWERS  -> the whole wave goes out behind it (section 3)
+#   * the warmup FAILS    -> NO trial call is issued at all and the patient is
+#                            failed through the existing zero-success floor, so
+#                            MAX_LLM_CLASSIFIER_RETRIES sees it and the batch
+#                            checkpoint resumes it. There is no uncached
+#                            fallback anywhere.
+#   * the warmup is REFUSED for its SHAPE -> the provider will refuse it again
+#                            however many times it is retried, so the patient
+#                            degrades to the retired one-then-rest schedule
+#                            with a named counter rather than being failed over
+#                            an infrastructure request.
+#
+# The third is the one that must be DETECTED rather than assumed: nobody here
+# can read this provider's validation rules for a one-token ceiling, and a
+# design that assumed either answer would be wrong on half of them.
+
+section("SECTION 3b -- the warmup fails, and no trial call is issued")
+
+_FOUR = [trial(i) for i in range(4)]
+
+_before_wu = dict(PER_TRIAL_WARMUP_DEGRADATIONS)
+_before_wu_calls = dict(PER_TRIAL_CALL_FAILURES)
+_R3w, _S3w = run_node(_FOUR, per_trial=True, parallel=4,
+                      stub=_Stub(warmup_raise=RuntimeError("endpoint down")))
+_after_wu = dict(PER_TRIAL_WARMUP_DEGRADATIONS)
+_after_wu_calls = dict(PER_TRIAL_CALL_FAILURES)
+
+check("3w(a) a warmup that fails issues ZERO trial calls -- the whole point "
+      "of cache-or-nothing: fifteen full-price requests against a cold prefix "
+      "are worse than one patient re-run",
+      (len(_S3w.wave_requests()), len(_S3w.warmup_requests()),
+       len(_S3w.requests)), (0, 1, 1))
+check("3w(b) ...and the node returns the API-error result, through the same "
+      "floor a total outage takes, so the retry router sees one shape",
+      (at(_R3w, "evaluations"), at(_R3w, "llm_classifier_retries"),
+       bool(at(_R3w, "error"))), ([], 1, True))
+check("3w(c) ...and the error names the WARMUP and the endpoint's own "
+      "diagnosis, so an operator is not sent looking at the judge or at a "
+      "trial",
+      ("warmup" in str(at(_R3w, "error")).lower(),
+       "endpoint down" in str(at(_R3w, "error")),
+       "RuntimeError" in str(at(_R3w, "error"))), (True, True, True))
+check("3w(d) ...it carries the provenance every failure return carries, so "
+      "the row is not anonymous",
+      (at(_R3w, "llm_classifier_prompt_version") is not None,
+       isinstance(at(_R3w, "llm_classifier_prompt_sha256"), str),
+       at(_R3w, "llm_classifier_output_ceiling")
+       == config.MATCHING_MAX_TOKENS), (True, True, True))
+check("3w(e) ...and it reports NO tokens and an EMPTY ledger, because the "
+      "warmup raised before any usage object existed -- absent rather than a "
+      "zero nobody measured",
+      ("llm_classifier_input_tokens" in _R3w
+       if isinstance(_R3w, dict) else _Absent("no result"),
+       at(_R3w, "llm_classifier_call_details")), (False, []))
+check("3w(f) FAILURE IS NOT SILENCE: the counter moved by exactly one, under "
+      "a key that names the exception type and separates a transport failure "
+      "from a refusal of the request shape",
+      (sum(_after_wu.values()) - sum(_before_wu.values()),
+       _after_wu.get(f"{WARMUP_FAILURE_KEY_PREFIX}RuntimeError", 0)
+       - _before_wu.get(f"{WARMUP_FAILURE_KEY_PREFIX}RuntimeError", 0)),
+      (1, 1))
+check("3w(g) ...and NOT under the per-trial CALL counter, which would report "
+      "four trials that were never sent as four failed calls",
+      sum(_after_wu_calls.values()) - sum(_before_wu_calls.values()), 0)
+
+# THE WARMUP TOKENS ARE BILLED WHEN THERE WERE ANY. `_billed_so_far()` is empty
+# above because the warmup RAISED; the meaningful case is a warmup that
+# answered and a wave that then failed entirely, which is section 5's 5i --
+# repeated here in its own terms because it is the half of requirement "the
+# warmup's billed tokens are carried" that a raise cannot demonstrate.
+_R3x, _S3x = run_node(_FOUR, per_trial=True, parallel=4,
+                      stub=_Stub(fail_for=[t["trial"]["nct_id"]
+                                           for t in _FOUR]))
+check("3w(h) a warmup that ANSWERED and a wave that then failed entirely "
+      "still bills the warmup, and the floor still fires -- which is only "
+      "true because the floor asks about verdicts rather than about calls",
+      (at(_R3x, "llm_classifier_calls"),
+       at(_R3x, "llm_classifier_input_tokens"), bool(at(_R3x, "error")),
+       at(_R3x, "evaluations")), (1, 1000, True, []))
+
+# ── THE MODEL CHECK RUNS ON THE WARMUP, WHICH IS WHY IT IS CHEAP ───────────
+_R3y, _S3y = run_node(_FOUR, per_trial=True, parallel=4,
+                      stub=_Stub(warmup_model="some-other-judge"))
+check("3w(i) a mismatched answering model raises on the WARMUP, before the "
+      "wave -- one one-token request rather than four full-price ones",
+      (isinstance(_R3y, _Absent),
+       MatchingModelMismatchError.__name__ in repr(_R3y),
+       len(_S3y.wave_requests())), (True, True, 0))
+check("3w(i) ...non-degeneracy: the run really did reach the provider, so the "
+      "zero above is a finding rather than a node that never dispatched",
+      len(_S3y.warmup_requests()), 1)
+
+# ── THE PROVIDER REFUSES THE SHAPE: FALL BACK, DO NOT FAIL ────────────────
+#
+# THE FALLBACK IS THE RETIRED SCHEDULE, AND IT IS PROVEN BY THE BARRIER RATHER
+# THAN BY A LOG LINE. Four trials and a four-party barrier: one-then-rest
+# awaits the first alone, so it waits for peers that cannot come and BREAKS the
+# barrier -- exactly the reading section 3d uses to prove the shipped schedule
+# holds nothing back, run in reverse.
+_before_rej = dict(PER_TRIAL_WARMUP_DEGRADATIONS)
+_R3z, _S3z = run_node(
+    _FOUR, per_trial=True, parallel=4,
+    stub=_Stub(barrier_size=4, barrier_timeout=1.0,
+               warmup_raise=_WarmupRefused(
+                   "Invalid value for 'max_completion_tokens': must be >= 16")))
+_after_rej = dict(PER_TRIAL_WARMUP_DEGRADATIONS)
+
+check("3w(j) a provider that REFUSES the minimal-output request shape does "
+      "not fail the patient: every trial is still evaluated",
+      (bool(at(_R3z, "error")),
+       sorted(e.get("nct_id") for e in at(_R3z, "evaluations"))),
+      (False, sorted(t["trial"]["nct_id"] for t in _FOUR)))
+check("3w(k) ...and the schedule that runs is ONE-THEN-REST: a four-party "
+      "barrier over four trial calls is BROKEN, because one of them is awaited "
+      "alone as the cache writer. A wave with nothing held back satisfies it, "
+      "which is what 3d measures on the shipped path",
+      (_S3z.barrier_broken, len(_S3z.wave_requests())), (True, 4))
+check("3w(l) ...the fallback SAYS SO: the counter carries the reason, under "
+      "the rejection key rather than the transport-failure key",
+      ({k: _after_rej.get(k, 0) - _before_rej.get(k, 0) for k in _after_rej
+        if _after_rej.get(k, 0) != _before_rej.get(k, 0)}),
+      {WARMUP_REJECTED_MINIMAL_OUTPUT: 1})
+check("3w(m) ...and the warmup contributes no ledger row, because it raised: "
+      "four billed calls for four trials",
+      (at(_R3z, "llm_classifier_calls"),
+       [c.get("warmup")
+        for c in at(_R3z, "llm_classifier_call_details")]),
+      (4, [None, None, None, None]))
+
+# THE OTHER REJECTION, and its one extra consequence: the routing hint is
+# dropped for the wave too. Carrying a parameter the provider has just refused
+# into the fallback's calls would refuse every one of them and turn a
+# recoverable configuration finding into a failed patient.
+_before_key = dict(PER_TRIAL_WARMUP_DEGRADATIONS)
+_R3k, _S3k = run_node(
+    _FOUR, per_trial=True, parallel=4,
+    stub=_Stub(warmup_raise=_WarmupRefused(
+        "Unrecognized request argument supplied: prompt_cache_key")))
+_after_key = dict(PER_TRIAL_WARMUP_DEGRADATIONS)
+check("3w(n) a refused ROUTING HINT is its own reason, and the patient still "
+      "completes",
+      ({k: _after_key.get(k, 0) - _before_key.get(k, 0) for k in _after_key
+        if _after_key.get(k, 0) != _before_key.get(k, 0)},
+       len(at(_R3k, "evaluations"))), ({WARMUP_REJECTED_CACHE_KEY: 1}, 4))
+check("3w(o) ...and the hint is DROPPED for the wave, so the fallback's calls "
+      "cannot be refused for the parameter that was just refused",
+      sorted({r.get("prompt_cache_key") for r in _S3k.wave_requests()},
+             key=lambda v: (v is not None, v or "")), [None])
+check("3w(o) ...non-degeneracy: the shipped path DOES send it, so the None "
+      "above is the drop working rather than a hint nothing ever sends",
+      sorted({r.get("prompt_cache_key") is not None
+              for r in _S3w.warmup_requests()}), [True])
+
+# ── THE CLASSIFIER IS NARROW, AND BOTH HALVES OF THE CONJUNCTION MATTER ───
+check("3w(p) a 400 that names the output parameter is a refusal of the shape",
+      classify_warmup_rejection(
+          _WarmupRefused("unsupported max_completion_tokens")),
+      WARMUP_REJECTED_MINIMAL_OUTPUT)
+check("3w(p) ...a 400 that names the routing hint is the other one, and it is "
+      "asked FIRST so a request refused for both stops sending the hint",
+      (classify_warmup_rejection(
+          _WarmupRefused("unknown argument prompt_cache_key")),
+       classify_warmup_rejection(_WarmupRefused(
+           "prompt_cache_key and max_completion_tokens are both invalid"))),
+      (WARMUP_REJECTED_CACHE_KEY, WARMUP_REJECTED_CACHE_KEY))
+check("3w(q) ...a 400 that names NEITHER is not a refusal of the shape: a "
+      "context overflow and an invalid schema are 400s about this patient's "
+      "request and will fail every trial call too, so falling back for them "
+      "would replace one clean failure with N identical ones",
+      classify_warmup_rejection(
+          _WarmupRefused("context_length_exceeded")), None)
+check("3w(r) ...and the parameter name ALONE is not enough: a 500 whose body "
+      "quotes the request is a transport failure, not a refusal",
+      (classify_warmup_rejection(
+          _WarmupRefused("max_completion_tokens", status_code=500)),
+       classify_warmup_rejection(RuntimeError("max_completion_tokens"))),
+      (None, None))
+check("3w(s) ...and it reads a status carried on a `response` object too, "
+      "which is the shape several clients use",
+      classify_warmup_rejection(
+          type("_E", (Exception,), {})(
+              "bad max_completion_tokens")) is None, True)
+_resp_shaped = RuntimeError("bad max_completion_tokens")
+_resp_shaped.response = type("_R", (), {"status_code": 400})()
+check("3w(s) ...positively: an exception carrying the status on `response` is "
+      "classified, which is what makes the reading above a finding",
+      classify_warmup_rejection(_resp_shaped),
+      WARMUP_REJECTED_MINIMAL_OUTPUT)
+check("3w(t) ...and it never raises on an exception carrying neither, which "
+      "would replace a named transport failure with an AttributeError",
+      drive(classify_warmup_rejection, KeyboardInterrupt()), None)
+
+
+# ===========================================================================
 # SECTION 4 -- DETERMINISTIC MERGE, IN TRIAL ORDER
 # ===========================================================================
 #
@@ -915,65 +1395,85 @@ def _merge_shape(result, stub):
 
 
 _TEN = [trial(i) for i in range(10)]
-_TEN_REST = [t["trial"]["nct_id"] for t in _TEN[1:]]
+_TEN_IDS = [t["trial"]["nct_id"] for t in _TEN]
+
+# THE CALL INDEX OF TRIAL i. The warmup is call 1 -- it is a billed request and
+# is numbered like one -- so the first trial is call 2. Written as an
+# expression rather than as a literal range so a future change to what precedes
+# the wave moves one line here instead of four expectations.
+_WARMUP_CALLS = 1
+
+
+def _trial_call_index(i):
+    return _WARMUP_CALLS + 1 + i
+
 
 # THE TWO RUNS COMPLETE IN OPPOSITE ORDERS, ON PURPOSE. `_OrderedStub` (defined
-# below, used here) holds every non-priming call at a barrier and then hands
-# out completion turns in a sequence this file chooses, so "the pool answered
-# them in a different order" is a fact rather than a hope. A pair of runs with
-# a sleep in them would be the same assertion decided by the scheduler, which
-# is what CI bucket A -- 61 test processes at once -- turns into a flake.
+# below, used here) holds every trial call at a barrier and then hands out
+# completion turns in a sequence this file chooses, so "the pool answered them
+# in a different order" is a fact rather than a hope. A pair of runs with a
+# sleep in them would be the same assertion decided by the scheduler, which is
+# what CI bucket A -- 61 test processes at once -- turns into a flake.
 _R4a, _S4a = run_node(_TEN, per_trial=True, parallel=16,
-                      stub=_OrderedStub(_TEN[0]["trial"]["nct_id"], _TEN_REST))
+                      stub=_OrderedStub(_TEN_IDS))
 _R4b, _S4b = run_node(_TEN, per_trial=True, parallel=16,
-                      stub=_OrderedStub(_TEN[0]["trial"]["nct_id"],
-                                        list(reversed(_TEN_REST))))
+                      stub=_OrderedStub(list(reversed(_TEN_IDS))))
 
 check("4a  two runs of the same batch publish the IDENTICAL merge shape, "
       "though their responses completed in OPPOSITE orders",
       _merge_shape(_R4a, _S4a), _merge_shape(_R4b, _S4b))
 check("4a  ...non-degeneracy: the completion orders really were opposite, and "
       "neither run's forced hand-off timed out or broke its barrier",
-      ([i[0] for i in _S4a.completion_order() if i][1:]
-       == list(reversed([i[0] for i in _S4b.completion_order() if i][1:])),
+      ([i[0] for i in _S4a.completion_order() if i]
+       == list(reversed([i[0] for i in _S4b.completion_order() if i])),
        _S4a.order_timed_out, _S4b.order_timed_out,
        _S4a.barrier_broken, _S4b.barrier_broken),
       (True, False, False, False, False))
 check("4b  call_details is numbered 1..N with no gaps, which is the join key "
-      "trial_matches.call_index uses",
+      "trial_matches.call_index uses. N is 11: one warmup and ten trials",
       [c.get("call_index")
        for c in at(_R4a, "llm_classifier_call_details")],
-      list(range(1, 11)))
-check("4c  ...and every call carried exactly one trial",
-      sorted({c.get("trials")
-              for c in at(_R4a, "llm_classifier_call_details")}), [1])
+      list(range(1, 12)))
+check("4c  ...and every TRIAL call carried exactly one trial, while the "
+      "warmup carried none -- which is what excludes it from any per-trial "
+      "accounting that groups on this field",
+      (sorted({c.get("trials")
+               for c in at(_R4a, "llm_classifier_call_details")
+               if not c.get("warmup")}),
+       [c.get("trials") for c in at(_R4a, "llm_classifier_call_details")
+        if c.get("warmup")]), ([1], [0]))
 check("4d  each trial's entry names the call that answered for it, and the "
-      "assignment is trial order: trial i was answered by call i+1",
+      "assignment is trial order: trial i was answered by call i+2, the "
+      "warmup having taken call 1",
       [_merge_shape(_R4a, _S4a)["call_index_by_trial"][t["trial"]["nct_id"]]
        for t in _TEN],
-      list(range(1, 11)))
-check("4e  ...and llm_classifier_calls agrees with the ledger's length",
+      [_trial_call_index(i) for i in range(10)])
+check("4e  ...and llm_classifier_calls agrees with the ledger's length, "
+      "warmup included: it is a billed call and is counted as one",
       (at(_R4a, "llm_classifier_calls"),
-       len(at(_R4a, "llm_classifier_call_details"))), (10, 10))
+       len(at(_R4a, "llm_classifier_call_details"))), (11, 11))
+check("4e  ...and no evaluation was ever attributed to the warmup's call "
+      "index, which would be a verdict credited to a request that carried no "
+      "trial",
+      sorted(set(_merge_shape(_R4a, _S4a)["call_index_by_trial"].values())
+             & {1}), [])
 
-# A BOUND WIDE ENOUGH FOR EVERY NON-PRIMING CALL TO START AT ONCE, which the
-# hand-off below requires: nine calls must all be in flight before any of them
-# may be told to finish.
-_REST_IDS = [t["trial"]["nct_id"] for t in _TEN[1:]]
+# A BOUND WIDE ENOUGH FOR EVERY TRIAL CALL TO START AT ONCE, which the hand-off
+# below requires: ten calls must all be in flight before any of them may be
+# told to finish.
 _R4c, _S4c = run_node(_TEN, per_trial=True, parallel=16,
-                      stub=_OrderedStub(_TEN[0]["trial"]["nct_id"],
-                                        list(reversed(_REST_IDS))))
+                      stub=_OrderedStub(list(reversed(_TEN_IDS))))
 _completion = [ids[0] for ids in _S4c.completion_order() if ids]
-check("4f  the last trial's response arrived before several earlier ones, and "
+check("4f  the last trial's response arrived before every earlier one, and "
       "the merge is STILL in trial order",
       _merge_shape(_R4c, _S4c)["call_index_by_trial"],
-      {t["trial"]["nct_id"]: i + 1 for i, t in enumerate(_TEN)})
+      {t["trial"]["nct_id"]: _trial_call_index(i)
+       for i, t in enumerate(_TEN)})
 check("4f  ...non-degeneracy: the responses really did complete in REVERSE "
       "batch order -- forced, not hoped for, so 4f is a measurement and not a "
       "queue that happened to stay sorted",
       (_S4c.barrier_broken, _S4c.order_timed_out,
-       _completion), (False, False,
-                      [_TEN[0]["trial"]["nct_id"]] + list(reversed(_REST_IDS))))
+       _completion), (False, False, list(reversed(_TEN_IDS))))
 
 
 # ===========================================================================
@@ -1010,9 +1510,12 @@ check("5d  the other four were evaluated normally",
       sorted(i for i, e in _by_id5.items() if e.get("eligible") == "eligible"),
       sorted(t["trial"]["nct_id"] for t in _FIVE
              if t["trial"]["nct_id"] != _VICTIM))
-check("5e  the four surviving calls were still billed and are in the ledger",
+check("5e  the four surviving calls were still billed and are in the ledger, "
+      "with the warmup beside them -- five billed requests for four verdicts",
       (at(_R5, "llm_classifier_calls"),
-       len(at(_R5, "llm_classifier_call_details"))), (4, 4))
+       len(at(_R5, "llm_classifier_call_details")),
+       sum(1 for d in at(_R5, "llm_classifier_call_details")
+           if d.get("warmup"))), (5, 5, 1))
 check("5f  ISOLATION IS NOT SILENCE: the module counter moved by exactly one, "
       "keyed by the exception type",
       (sum(_after.values()) - sum(_before.values()),
@@ -1036,11 +1539,18 @@ check("5h  ...and it carries the provenance every failure return carries, so "
        isinstance(at(_R5g, "llm_classifier_prompt_sha256"), str),
        at(_R5g, "llm_classifier_output_ceiling")
        == config.MATCHING_MAX_TOKENS), (True, True, True))
-check("5i  ...and reports NO tokens, because no usage object was ever "
-      "obtained -- absent rather than a zero nobody measured",
-      ("llm_classifier_input_tokens" in _R5g
-       if isinstance(_R5g, dict) else _Absent("no result"),
-       at(_R5g, "llm_classifier_call_details")), (False, []))
+check("5i  ...and the tokens it reports are the WARMUP's and only the "
+      "warmup's: every trial call raised, so no trial produced a usage object "
+      "and none is invented. One ledger row, marked warmup, no trials on it",
+      (at(_R5g, "llm_classifier_calls"),
+       [d.get("warmup") for d in at(_R5g, "llm_classifier_call_details")],
+       [d.get("trials") for d in at(_R5g, "llm_classifier_call_details")],
+       at(_R5g, "llm_classifier_input_tokens")), (1, [True], [0], 1000))
+check("5i  ...which is the floor working through `calls_made` NOT being the "
+      "test any more: a successful warmup makes calls_made non-zero, and a "
+      "floor that asked it would have reported this outage as a clean patient",
+      (at(_R5g, "llm_classifier_calls") > 0, bool(at(_R5g, "error"))),
+      (True, True))
 
 # GROUPED MODE IS UNCHANGED: one raised call is still the whole patient.
 _R5j, _S5j = run_node(_FIVE, per_trial=False,
@@ -1051,16 +1561,25 @@ check("5j  grouped mode still fails the patient on a raised call -- the "
       (at(_R5j, "evaluations"), at(_R5j, "llm_classifier_retries"),
        bool(at(_R5j, "error"))), ([], 1, True))
 
-# THE PRIMING CALL IS NOT SPECIAL WHEN IT FAILS.
+# NO TRIAL CALL IS SPECIAL ANY MORE, WHICH IS THE POINT OF THE CHANGE. Under
+# the retired schedule the FIRST trial call was also the cache writer, so its
+# failure had a second meaning; now it is one trial among N and this is the
+# check that says so.
 _R5k, _S5k = run_node(_FIVE, per_trial=True, parallel=4,
                       stub=_Stub(fail_for=[_FIVE[0]["trial"]["nct_id"]]))
-check("5k  a failed PRIMING call does not stop the rest: the remaining four "
-      "are still issued and evaluated, and only the first is lost",
-      (len(_S5k.requests), at(_R5k, "llm_classifier_calls"),
+check("5k  a failed FIRST trial call does not stop the rest: the remaining "
+      "four are still issued and evaluated, and only the first is lost",
+      (len(_S5k.wave_requests()), at(_R5k, "llm_classifier_calls"),
        {e.get("nct_id"): e.get("not_evaluable_reason")
         for e in at(_R5k, "evaluations")
         if e.get("not_evaluable_reason")}),
-      (5, 4, {_FIVE[0]["trial"]["nct_id"]: NOT_EVALUABLE_CALL_FAILED}))
+      (5, 5, {_FIVE[0]["trial"]["nct_id"]: NOT_EVALUABLE_CALL_FAILED}))
+check("5k  ...and the cache was written by the warmup rather than by that "
+      "call, so the other four did NOT go out against a cold prefix -- which "
+      "is the cost leak the retired schedule had and this one does not",
+      (len(_S5k.warmup_requests()),
+       all(_S5k.exit_ticket(0) < _S5k.enter_ticket(n)
+           for n in _S5k.wave_call_nos())), (1, True))
 
 
 # ===========================================================================
@@ -1089,25 +1608,30 @@ check("5b(a) a refusal on the FIRST trial still ends the node -- the premise "
       "shares",
       (at(_R5b, "evaluations"), bool(at(_R5b, "llm_classifier_refusal"))),
       ([], True))
-check("5b(b) ...and all five requests were issued, because per-trial mode "
-      "dispatches before it reads",
-      len(_S5b.requests), 5)
-check("5b(c) ...and ALL FIVE are in the ledger: one read, four folded in as "
-      "unconsumed, none dropped",
+check("5b(b) ...and all five trial requests were issued behind the warmup, "
+      "because per-trial mode dispatches before it reads",
+      (len(_S5b.wave_requests()), len(_S5b.warmup_requests())), (5, 1))
+check("5b(c) ...and ALL SIX are in the ledger: the warmup, one trial call "
+      "read, four folded in as unconsumed, none dropped",
       (len(at(_R5b, "llm_classifier_call_details")),
-       at(_R5b, "llm_classifier_calls")), (5, 5))
-check("5b(d) ...with the token total covering every one of them, not a prefix",
+       at(_R5b, "llm_classifier_calls")), (6, 6))
+check("5b(d) ...with the token total covering every one of them, warmup "
+      "included, not a prefix",
       (at(_R5b, "llm_classifier_input_tokens"),
-       at(_R5b, "llm_classifier_output_tokens")), (5000, 500))
-check("5b(e) ...the four folded rows say so, and the one that was read does "
-      "not -- 'the node stopped before reading this' and 'this response was "
-      "unusable' are different facts",
-      sorted(bool(c.get("unconsumed"))
-             for c in at(_R5b, "llm_classifier_call_details")),
-      [False, True, True, True, True])
+       at(_R5b, "llm_classifier_output_tokens")), (6000, 600))
+check("5b(e) ...the four folded rows say so, and neither the one that was "
+      "read nor the warmup does -- 'the node stopped before reading this', "
+      "'this response was unusable' and 'this was never a trial call' are "
+      "three different facts",
+      (sorted(bool(c.get("unconsumed"))
+              for c in at(_R5b, "llm_classifier_call_details")),
+       [bool(c.get("unconsumed"))
+        for c in at(_R5b, "llm_classifier_call_details")
+        if c.get("warmup")]),
+      ([False, False, True, True, True, True], [False]))
 check("5b(f) ...the ledger is still numbered 1..N with no gaps",
       [c.get("call_index")
-       for c in at(_R5b, "llm_classifier_call_details")], [1, 2, 3, 4, 5])
+       for c in at(_R5b, "llm_classifier_call_details")], [1, 2, 3, 4, 5, 6])
 check("5b(g) ...and none of the folded rows claims to have emitted entries",
       sorted({c.get("entries_emitted")
               for c in at(_R5b, "llm_classifier_call_details")
@@ -1120,7 +1644,7 @@ check("5b(h) the same holds for an unparseable answer, which is the second "
       "return that abandons a queue that was already sent",
       (len(at(_R5h, "llm_classifier_call_details")),
        at(_R5h, "llm_classifier_input_tokens"),
-       bool(at(_R5h, "error"))), (5, 5000, True))
+       bool(at(_R5h, "error"))), (6, 6000, True))
 
 # DETERMINISM. The fold happens on the node thread in nct_id order, so two runs
 # that abandon the same set produce the identical tail.
@@ -1148,11 +1672,12 @@ _R5k2, _ = run_node(_FIVE, per_trial=True, parallel=4,
                                fail_for=[_FIVE[4]["trial"]["nct_id"]]))
 _after5b = dict(PER_TRIAL_CALL_FAILURES)
 check("5b(k) an abandoned call that RAISED is counted under its own key and "
-      "contributes no tokens -- there was no usage object to fold",
+      "contributes no tokens -- there was no usage object to fold. 5000 is "
+      "the warmup plus the three abandoned answers plus the refusal itself",
       ({k: _after5b.get(k, 0) - _before5b.get(k, 0)
         for k in _after5b if _after5b.get(k, 0) != _before5b.get(k, 0)},
        at(_R5k2, "llm_classifier_input_tokens")),
-      ({"abandoned:RuntimeError": 1}, 4000))
+      ({"abandoned:RuntimeError": 1}, 5000))
 
 
 # ===========================================================================
@@ -1181,9 +1706,10 @@ check("6b  ...and nothing is lost: that trial's own call answered it, so all "
       "five have exactly one verdict",
       sorted(e.get("nct_id") for e in at(_R6, "evaluations")),
       sorted(t["trial"]["nct_id"] for t in _FIVE))
-check("6c  ...and B's verdict is attributed to B's OWN call, not to A's",
+check("6c  ...and B's verdict is attributed to B's OWN call, not to A's. "
+      "Call 1 is the warmup, so A is 2 and B is 3",
       {e.get("nct_id"): e.get("call_index")
-       for e in at(_R6, "evaluations")}.get(_B), 2)
+       for e in at(_R6, "evaluations")}.get(_B), _trial_call_index(1))
 
 # An id that is in no sent set of this run at all.
 _R6d, _S6d = run_node(_FIVE, per_trial=True, parallel=4,
@@ -1215,24 +1741,41 @@ check("6e  a call that answered only for someone else leaves its own trial to "
 
 section("SECTION 7 -- the provider's cached-token report, per call")
 
-_R7, _S7 = run_node(_FIVE, per_trial=True, parallel=4, stub=_Stub(cached=700))
-check("7a  every call records the provider's own cached figure",
-      [c.get("cached_tokens")
-       for c in at(_R7, "llm_classifier_call_details")], [700] * 5)
-check("7b  ...and the patient-level total continues into the existing column",
+# THE SHAPE A WORKING WARMUP PRODUCES, which is the whole point of the design
+# and is therefore what the stub simulates here: the warmup pays full price for
+# the prefix (cached 0, because nothing had written it) and every trial call
+# behind it is served from cache. If the accounting path for cached tokens were
+# only PRESENT rather than exercised, this is the run it would be wrong about.
+_R7, _S7 = run_node(_FIVE, per_trial=True, parallel=4,
+                    stub=_Stub(cached=700, warmup_cached=0))
+_rows7 = at(_R7, "llm_classifier_call_details")
+check("7a  every call records the provider's own cached figure: the warmup "
+      "reports 0 because it wrote the prefix, and every trial call behind it "
+      "reports the cached figure the provider served",
+      ([c.get("cached_tokens") for c in _rows7 if c.get("warmup")],
+       [c.get("cached_tokens") for c in _rows7 if not c.get("warmup")]),
+      ([0], [700] * 5))
+check("7b  ...and the patient-level total continues into the existing column: "
+      "0 from the warmup plus 700 from each of five trial calls",
       at(_R7, "llm_classifier_cached_input_tokens"), 3500)
+check("7b  ...non-degeneracy: the warmup's 0 is a MEASURED zero and not an "
+      "absence, so the total above is a sum over six real readings",
+      ([c.get("cached_tokens") for c in _rows7 if c.get("warmup")] == [0],
+       len(_rows7)), (True, 6))
 
-# The reading that per-trial mode exists to make: the prefix warms after the
-# first call and not before. A total alone cannot separate this from a cache
-# that never warmed.
+# THE PATHOLOGY THE PER-CALL FIGURES EXIST TO EXPOSE: a warmup that reported a
+# figure while no trial call behind it did. That is "the warmup warmed a prefix
+# the wave does not share" -- the one way this design fails silently -- and a
+# summed total cannot separate it from a cache that warmed normally.
 _R7c, _S7c = run_node(_FIVE, per_trial=True, parallel=4,
                       stub=_Stub(cached=700, cached_first_only=True))
-check("7c  a cache that reports on ONE call only is visible per call, which "
-      "is exactly what a summed total cannot show",
+check("7c  a cache that reports on the WARMUP only is visible per call, which "
+      "is exactly what a summed total cannot show -- and is the reading that "
+      "would say the warmup is warming the wrong prefix",
       sorted((c.get("cached_tokens")
               for c in at(_R7c, "llm_classifier_call_details")),
              key=lambda v: (v is not None, v or 0)),
-      [None, None, None, None, 700])
+      [None, None, None, None, None, 700])
 
 _R7d, _S7d = run_node(_FIVE, per_trial=True, parallel=4, stub=_Stub())
 check("7d  a provider that reports NO cached figure is carried as absent, "
@@ -1241,11 +1784,26 @@ check("7d  a provider that reports NO cached figure is carried as absent, "
       ([c.get("cached_tokens")
         for c in at(_R7d, "llm_classifier_call_details")],
        at(_R7d, "llm_classifier_cached_input_tokens")),
-      ([None] * 5, None))
+      ([None] * 6, None))
 check("7e  ...and a genuine ZERO is kept as a zero, which is the reading that "
       "says the provider cached nothing",
       at(run_node(_FIVE, per_trial=True, stub=_Stub(cached=0))[0],
          "llm_classifier_cached_input_tokens"), 0)
+
+# THE ACCOUNTING PATH IS EXERCISED, NOT MERELY PRESENT. The two figures below
+# come out of DIFFERENT code paths in the node -- the wave's rows are written
+# by the send loop, the warmup's by `_account_warmup` on the node thread -- and
+# a defect in either would leave the other intact, so they are asserted apart.
+check("7f  the wave's cached figures are the stub's own simulated marker, "
+      "per call, on every trial call and on no other row",
+      ([c.get("cached_tokens") for c in _rows7 if not c.get("warmup")],
+       sum(c.get("cached_tokens") or 0 for c in _rows7
+           if not c.get("warmup"))), ([700] * 5, 3500))
+check("7f  ...and a run whose wave reports a DIFFERENT figure moves the "
+      "column with it, so 7b is a measurement rather than a constant",
+      at(run_node(_FIVE, per_trial=True, parallel=4,
+                  stub=_Stub(cached=100, warmup_cached=0))[0],
+         "llm_classifier_cached_input_tokens"), 500)
 
 
 # ===========================================================================
@@ -1359,6 +1917,38 @@ check("8j  ...and both report the packer as not having run, with nothing "
 check("8k  ...and the packing switch was restored",
       _evaluation.MATCHING_INPUT_PACKING_ENABLED, _saved_pack)
 
+# ── THE SEAM ITSELF, NOT ONLY THE NODE ────────────────────────────────────
+#
+# `call_matching_model` gained an optional routing hint, and the OFF arm's
+# guarantee is that this changed NOTHING about the request it builds.
+# `openai.NOT_GIVEN` would have been equivalent on the wire and is NOT what is
+# used, because oncotriage/fixtures/capture.py records this call's kwargs DICT
+# and oncotriage/fixtures/replay.py looks a recording up by a digest of it -- a
+# key that is always present, whatever its value, would change that digest for
+# every grouped-mode request and cost a re-capture of all twelve
+# characterization fixtures at live model prices.
+_S8l = _Stub()
+deps.set_override(deps.OPENAI_CLIENT, _S8l)
+try:
+    drive(_evaluation.call_matching_model, "SYS", "USR")
+    drive(_evaluation.call_matching_model, "SYS", "USR",
+          prompt_cache_key="k-1")
+finally:
+    deps.clear_override(deps.OPENAI_CLIENT)
+check("8l  with no routing hint the client is handed the SAME keyword set it "
+      "always was, with no prompt_cache_key key present at all -- an empty "
+      "expansion, not a sentinel value",
+      ("prompt_cache_key" in _S8l.requests[0],
+       sorted(_S8l.requests[0])),
+      (False, sorted(["model", "messages", "max_completion_tokens",
+                      "reasoning_effort", "seed", "response_format",
+                      "timeout"])))
+check("8m  ...and WITH one it is present and carries the value, so 8l is a "
+      "measurement rather than a parameter nothing ever sends",
+      (_S8l.requests[1].get("prompt_cache_key"),
+       sorted(set(_S8l.requests[1]) - set(_S8l.requests[0]))),
+      ("k-1", ["prompt_cache_key"]))
+
 
 # ===========================================================================
 # SECTION 9 -- THE CONTROLS
@@ -1458,9 +2048,10 @@ control(
      ("            _prompts[_chunk_key(_c)] = _wrap_trials(trial_blocks[_i])",
       "            _prompts[_chunk_key(_c)] = _user_prompt_for(_c)")],
     lambda m: (len(run_node(_SIX, per_trial=True,
-                            node=node_of(m))[1].requests),
+                            node=node_of(m))[1].wave_requests()),
                sorted({len(ids_in(r)) for r in run_node(
-                   _SIX, per_trial=True, node=node_of(m))[1].requests})),
+                   _SIX, per_trial=True,
+                   node=node_of(m))[1].wave_requests()})),
     (3, [2]),
 )
 
@@ -1477,30 +2068,34 @@ control(
     False,
 )
 
-# --- c3: the priming call is not awaited ------------------------------------
-# THE CONTROL IS A BARRIER EVERY CALL MUST REACH. The shipped scheduler awaits
-# the first call alone, so it waits for peers that cannot come and BREAKS the
-# barrier; a dispatcher that fired all N at once satisfies it. That is the
-# cache-aware property stated as something a stub can observe.
-_R9c, _S9c = run_node([trial(i) for i in range(4)], per_trial=True, parallel=4,
-                      stub=_Stub(barrier_size=4, barrier_all=True,
-                                 barrier_timeout=1.0))
-check("c3  SHIPPED: a barrier that ALL four calls must reach is BROKEN, "
-      "because the first is awaited alone [3b]", _S9c.barrier_broken, True)
+# --- c3: a REAL TRIAL doubles as the cache writer ---------------------------
+# THE RETIRED DESIGN, PLANTED BACK. This is the exact shape this pass removed:
+# the cache is written by the first TRIAL call rather than by a dedicated
+# warmup, so a trial's request is also infrastructure and its failure is also a
+# scheduling event. The plant swaps the warmup's call for the first trial's,
+# leaving everything else -- the awaiting, the accounting, the ledger row -- in
+# place, so what changes is only WHAT the first request carries.
 control(
-    "c3  ...and a dispatcher that fires everything at once satisfies it, so "
-    "3b is a measurement rather than a property of the stub",
-    [("            _first, _first_depth = _dispatch_pairs[0]\n"
-      "            _prefetched[_chunk_key(_first)] = _issue(\n"
-      "                _first, _prompts[_chunk_key(_first)]) + (_first_depth,)\n"
-      "            _rest = _dispatch_pairs[1:]",
-      "            _rest = _dispatch_pairs[:]")],
-    lambda m: run_node([trial(i) for i in range(4)], per_trial=True,
-                       parallel=4, node=node_of(m),
-                       stub=_Stub(barrier_size=4, barrier_all=True,
-                                  barrier_timeout=1.0))[1].barrier_broken,
-    False,
+    "c3  a first TRIAL call doing the cache warmup's job is CAUGHT [2d/3a] -- "
+    "the entanglement this pass exists to remove",
+    [("                _warmup_response = call_matching_model_warmup(\n"
+      "                    system_prompt, prompt_cache_key=_cache_key)",
+      "                _warmup_response = _issue(\n"
+      "                    _dispatch_pairs[0][0],\n"
+      "                    _prompts[_chunk_key(_dispatch_pairs[0][0])],\n"
+      "                    _cache_key)[1]")],
+    lambda m: (lambda st: (len(st.warmup_requests()),
+                           is_warmup(st.requests[0])))(
+        run_node([trial(i) for i in range(4)], per_trial=True, parallel=4,
+                 node=node_of(m))[1]),
+    (0, False),
 )
+# ...and the SHIPPED node says the opposite on the identical probe, which is
+# what makes the row above a measurement rather than a statement about the stub.
+check("c3  SHIPPED: the first request carries no trial and is the warmup [3a]",
+      (lambda st: (len(st.warmup_requests()), is_warmup(st.requests[0])))(
+          run_node([trial(i) for i in range(4)], per_trial=True,
+                   parallel=4)[1]), (1, True))
 
 # --- c4: the in-flight bound is ignored -------------------------------------
 control(
@@ -1511,7 +2106,7 @@ control(
     lambda m: (lambda st: (st.max_in_flight <= 2, st.barrier_broken))(
         run_node([trial(i) for i in range(7)], per_trial=True, parallel=2,
                  node=node_of(m),
-                 stub=_Stub(barrier_size=6, barrier_timeout=15.0))[1]),
+                 stub=_Stub(barrier_size=7, barrier_timeout=15.0))[1]),
     (False, False),
 )
 
@@ -1551,7 +2146,9 @@ control(
                            node=node_of(m))[0]["evaluations"]}[
             t["trial"]["nct_id"]]
         for t in _TEN],
-    list(range(10, 0, -1)),
+    # 11 down to 2: the warmup still takes call 1, and the ten trials are
+    # consumed in reverse batch order behind it.
+    list(range(11, 1, -1)),
 )
 
 # --- c6: a failed call is not isolated --------------------------------------
@@ -1571,7 +2168,8 @@ control(
 control(
     "c7  a total outage reported as a clean run of not-evaluable trials is "
     "CAUGHT [5g] -- the failure the isolation would otherwise manufacture",
-    [("    if _per_trial_calls and per_trial_failed_calls and not calls_made:",
+    [("    if _per_trial_calls and not per_trial_succeeded and (\n"
+      "            _warmup_error is not None or per_trial_failed_calls):",
       "    if False:")],
     lambda m: (len(run_node(_FIVE, per_trial=True, node=node_of(m),
                             stub=_Stub(fail_for=[t["trial"]["nct_id"]
@@ -1623,9 +2221,10 @@ control(
     "CAUGHT [2a] -- every trial billed twice",
     [("            outcome = _prefetched.pop(_chunk_key(chunk), None)",
       "            outcome = None")],
-    lambda m: len(run_node(_SIX, per_trial=True,
-                           node=node_of(m))[1].requests),
-    12,
+    lambda m: (lambda st: (len(st.wave_requests()),
+                           len(st.warmup_requests())))(
+        run_node(_SIX, per_trial=True, node=node_of(m))[1]),
+    (12, 1),
 )
 
 # --- c11: the cached figure stops being recorded per call -------------------
@@ -1635,8 +2234,9 @@ control(
     [('            "cached_tokens": _cached,', '            "cached_tokens": None,')],
     lambda m: [c.get("cached_tokens") for c in
                run_node(_FIVE, per_trial=True, node=node_of(m),
-                        stub=_Stub(cached=700))[0]
-               ["llm_classifier_call_details"]],
+                        stub=_Stub(cached=700, warmup_cached=0))[0]
+               ["llm_classifier_call_details"]
+               if not c.get("warmup")],
     [None] * 5,
 )
 
@@ -1648,16 +2248,18 @@ control(
       "    _per_trial_calls = True")],
     lambda m: len(run_node(_SIX, per_trial=False,
                            node=node_of(m))[1].requests),
-    6,
+    7,
 )
 
 # --- c13: the render moves onto the worker ----------------------------------
 control(
     "c13 a worker that renders its own prompt is CAUGHT [3i] -- the shape "
     "that would lose increments from the two decode counters",
-    [('                return ("ok", call_matching_model(system_prompt, prompt_))',
+    [('                return ("ok", call_matching_model(\n'
+      '                    system_prompt, prompt_, prompt_cache_key=cache_key_))',
       '                return ("ok", call_matching_model(\n'
-      '                    system_prompt, _user_prompt_for(chunk_)))')],
+      '                    system_prompt, _user_prompt_for(chunk_),\n'
+      '                    prompt_cache_key=cache_key_))')],
     _worker_names,
     ["_user_prompt_for"],
 )
@@ -1704,7 +2306,7 @@ control(
                run_node(_FIVE, per_trial=True, parallel=4, node=node_of(m),
                         stub=_Stub(refuse_for=[_FIRST_ID]))[0]
                ["llm_classifier_input_tokens"]),
-    (1, 1000),
+    (2, 2000),
 )
 
 # --- c16: the folded rows stop saying what they are -------------------------
@@ -1717,7 +2319,7 @@ control(
                      run_node(_FIVE, per_trial=True, parallel=4, node=node_of(m),
                               stub=_Stub(refuse_for=[_FIRST_ID]))[0]
                      ["llm_classifier_call_details"]),
-    [False] * 5,
+    [False] * 6,
 )
 
 # --- c17: a raised abandoned call is folded as though it had usage ----------
@@ -1732,9 +2334,215 @@ control(
                        stub=_Stub(refuse_for=[_FIRST_ID],
                                   fail_for=[_FIVE[4]["trial"]["nct_id"]]))[0]
     ["llm_classifier_calls"],
-    5,
+    6,
 )
 
+
+# --- c18: the warmup failure does not stop the wave -------------------------
+# THE DEFECT THE WHOLE PASS EXISTS TO PREVENT, planted back: a warmup that
+# could not be established, and the trial calls going out anyway -- every one
+# of them against a prefix nothing wrote, at full input price, with the patient
+# reported as an ordinary success. `pending.clear()` is the one line that makes
+# "there is no uncached fallback anywhere" true.
+control(
+    "c18 a warmup failure that still lets the wave go out is CAUGHT [3w(a)] "
+    "-- N full-price requests against a cold prefix, reported as a clean "
+    "patient",
+    [("                    _warmup_error = _wu_exc\n"
+      "                    pending.clear()",
+      "                    _warmup_error = None")],
+    lambda m: (lambda r: (len(r[1].wave_requests()),
+                          bool(at(r[0], "error"))))(
+        run_node(_FOUR, per_trial=True, parallel=4, node=node_of(m),
+                 stub=_Stub(warmup_raise=RuntimeError("endpoint down")))),
+    (4, False),
+)
+
+# --- c19: every failure read as a refusal of the request shape --------------
+# The classifier's conjunction is what keeps a transport failure from being
+# read as "the provider refuses this shape". Remove it and an unreachable
+# endpoint degrades to the retired schedule and sends the wave anyway.
+control(
+    "c19 a classifier that reads EVERY failure as a refusal of the request "
+    "shape is CAUGHT [3w(a)/3w(f)] -- an outage would silently become a "
+    "schedule change",
+    [("    if _http_status_of(exc) != 400:\n        return None",
+      "    if False:\n        return None")],
+    lambda m: (lambda r: (len(r[1].wave_requests()),
+                          bool(at(r[0], "error"))))(
+        run_node(_FOUR, per_trial=True, parallel=4, node=node_of(m),
+                 stub=_Stub(warmup_raise=RuntimeError(
+                     "connection reset while sending max_completion_tokens")))),
+    (4, False),
+)
+
+# --- c20: the warmup row stops being marked ---------------------------------
+control(
+    "c20 a warmup row indistinguishable from a trial call is CAUGHT [4c] -- "
+    "any per-trial accounting that groups on `trials` would fold an "
+    "infrastructure call into the per-trial figures",
+    [('                "entries_emitted": None,\n                "warmup": True,',
+      '                "entries_emitted": None,')],
+    lambda m: [c.get("warmup") for c in
+               run_node(_FIVE, per_trial=True, parallel=4, node=node_of(m))[0]
+               ["llm_classifier_call_details"]],
+    [None] * 6,
+)
+control(
+    "c20 ...and a warmup row claiming to have carried a trial is CAUGHT [4c] "
+    "-- it carried none, and 1 would put it in the per-trial denominator",
+    [('                "depth": None,\n                "trials": 0,',
+      '                "depth": 0,\n                "trials": 1,')],
+    lambda m: sorted({c.get("trials") for c in
+                      run_node(_FIVE, per_trial=True, parallel=4,
+                               node=node_of(m))[0]
+                      ["llm_classifier_call_details"]}),
+    [1],
+)
+
+# --- c21: the floor asks about CALLS rather than about VERDICTS -------------
+# THE CORRECTION THIS PASS HAD TO MAKE, planted back. Counting the warmup in
+# `calls_made` is right -- it is billed -- but it makes `calls_made` non-zero
+# for every patient that got as far as dispatching, so a floor that tested it
+# would stop firing for the total outage it exists to catch.
+control(
+    "c21 a zero-success floor that tests `calls_made` rather than verdicts is "
+    "CAUGHT [3w(h)/5g] -- a successful warmup would satisfy it and a total "
+    "outage would be reported as a patient with no matches and no error",
+    [("    if _per_trial_calls and not per_trial_succeeded and (\n"
+      "            _warmup_error is not None or per_trial_failed_calls):",
+      "    if _per_trial_calls and not calls_made and (\n"
+      "            _warmup_error is not None or per_trial_failed_calls):")],
+    lambda m: (lambda r: (len(at(r, "evaluations")), bool(at(r, "error"))))(
+        run_node(_FIVE, per_trial=True, parallel=4, node=node_of(m),
+                 stub=_Stub(fail_for=[t["trial"]["nct_id"]
+                                      for t in _FIVE]))[0]),
+    (5, False),
+)
+
+# --- c22: the answering model is not checked on the warmup ------------------
+control(
+    "c22 a mismatched judge discovered only in the send loop is CAUGHT "
+    "[3w(i)] -- the wave would already have been issued and billed before "
+    "anything raised",
+    [("            _expected = config.matching_wire_model()\n"
+      "            _returned = getattr(response_, \"model\", None)\n"
+      "            if _returned is not None and _returned != _expected:\n"
+      "                raise MatchingModelMismatchError(_expected, _returned)",
+      "            _returned = getattr(response_, \"model\", None)")],
+    lambda m: len(run_node(_FOUR, per_trial=True, parallel=4, node=node_of(m),
+                           stub=_Stub(warmup_model="some-other-judge"))[1]
+                  .wave_requests()),
+    4,
+)
+
+# --- c23: the warmup asks for the batch's output ceiling --------------------
+control(
+    "c23 a warmup that asks for the full output ceiling is CAUGHT [2d] -- it "
+    "would be an ordinary-priced request that evaluates nothing",
+    [("        max_completion_tokens=config."
+      "MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS,",
+      "        max_completion_tokens=MATCHING_MAX_TOKENS,")],
+    lambda m: (lambda st: st.requests[0].get("max_completion_tokens"))(
+        run_node(_FOUR, per_trial=True, parallel=4, node=node_of(m))[1]),
+    config.MATCHING_MAX_TOKENS,
+)
+
+# --- c24: the warmup and the wave are routed apart --------------------------
+# A ROUTING HINT THAT DIFFERS BETWEEN THE WARMUP AND ITS WAVE IS WORSE THAN NO
+# HINT: it asks the provider to put the request that WRITES the prefix on one
+# machine and every request that would READ it on another.
+control(
+    "c24 a warmup routed apart from its own wave is CAUGHT [2d] -- the hint "
+    "would send the writer and the readers to different machines",
+    [("                _warmup_response = call_matching_model_warmup(\n"
+      "                    system_prompt, prompt_cache_key=_cache_key)",
+      "                _warmup_response = call_matching_model_warmup(\n"
+      "                    system_prompt,\n"
+      "                    prompt_cache_key=(_cache_key or \"\") + \"-warmup\")")],
+    lambda m: (lambda st: len({r.get("prompt_cache_key")
+                               for r in st.requests}))(
+        run_node(_FOUR, per_trial=True, parallel=4, node=node_of(m))[1]),
+    2,
+)
+
+# --- c25: the fallback keeps a hint the provider has just refused -----------
+control(
+    "c25 a cache-key rejection that leaves the hint on the wave is CAUGHT "
+    "[3w(o)] -- every fallback call would be refused for the parameter that "
+    "was just refused, and a recoverable finding would fail the patient",
+    [("                    if _rejection == WARMUP_REJECTED_CACHE_KEY:\n"
+      "                        # DROPPED FOR THE WAVE TOO. The provider refused this\n"
+      "                        # parameter, so carrying it into the fallback's calls\n"
+      "                        # would refuse every one of them and turn a recoverable\n"
+      "                        # configuration finding into a failed patient.\n"
+      "                        _cache_key = None",
+      "                    if False:\n"
+      "                        _cache_key = None")],
+    lambda m: sorted(
+        {r.get("prompt_cache_key") is not None
+         for r in run_node(_FOUR, per_trial=True, parallel=4, node=node_of(m),
+                           stub=_Stub(warmup_raise=_WarmupRefused(
+                               "Unrecognized request argument supplied: "
+                               "prompt_cache_key")))[1].wave_requests()}),
+    [True],
+)
+
+# --- c26: the warmup is folded as an abandoned response ---------------------
+# `_account_unconsumed()` is unaffected by the warmup because the warmup is
+# consumed before `_prefetched` is populated. Planting it INTO `_prefetched`
+# is what makes 3j a measurement rather than an argument about ordering.
+control(
+    "c26 a warmup filed among the prefetched responses is CAUGHT [3j] -- it "
+    "would be folded as an abandoned trial response on every failure return",
+    [("        _prefetched = {}\n        if _dispatch_pairs:",
+      "        _prefetched = {(\"__warmup__\",): (\"ok\", None, 0)}\n"
+      "        if _dispatch_pairs:")],
+    lambda m: sum(1 for d in run_node(
+        _SIX, per_trial=True, parallel=6, node=node_of(m),
+        stub=_Stub(refuse_for=[_SIX[0]["trial"]["nct_id"]]))[0]
+        ["llm_classifier_call_details"] if d.get("unconsumed")),
+    6,
+)
+
+
+# --- c27: the provider guard is not consulted -------------------------------
+# Without it the warmup's own refusal is caught by the dispatch's `except`,
+# classified as a transport failure and retried MAX_LLM_CLASSIFIER_RETRIES
+# times -- so a configuration defect arrives as three identical failed patients
+# rather than as one named error, and the operator is sent to the endpoint.
+def _c27(module):
+    saved = config.MATCHING_PROVIDER
+    try:
+        config.MATCHING_PROVIDER = config.MATCHING_PROVIDER_BEDROCK
+        result, stub = run_node(_FOUR, per_trial=True, parallel=4,
+                                node=node_of(module))
+        # A RAISE versus a RETURNED FAILURE is the whole distinction, and the
+        # first version of this probe missed it: the exception's NAME appears
+        # in the returned error string either way, because the floor
+        # interpolates `type(...).__name__`. What changes is whether the node
+        # refused before spending anything or spent a retry on it.
+        return (isinstance(result, _Absent), bool(at(result, "error")),
+                len(stub.requests))
+    finally:
+        config.MATCHING_PROVIDER = saved
+
+
+control(
+    "c27 a node that does not check the provider before dispatching is CAUGHT "
+    "[1i] -- the refusal degrades into a retried transport failure instead of "
+    "a raise, so MAX_LLM_CLASSIFIER_RETRIES spends three patients on it",
+    [("    if _per_trial_calls:\n"
+      "        assert_per_trial_provider_supported()",
+      "    if False:\n"
+      "        assert_per_trial_provider_supported()")],
+    _c27,
+    # 0 requests either way: the warmup's own guard raises before the client is
+    # reached, so what the plant changes is WHERE the refusal surfaces -- a
+    # returned failure the retry router will spend a budget on, rather than a
+    # raise the operator sees once.
+    (False, True, 0),
+)
 
 # ===========================================================================
 # SECTION 9b -- THE COLUMN, ROUND TRIP

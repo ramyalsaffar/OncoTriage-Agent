@@ -1983,15 +1983,17 @@ MATCHING_MAX_INPUT_PACKED_CHUNKS = 5
 MATCHING_PER_TRIAL_CALLS_ENABLED = False
 
 # How many per-trial requests of ONE patient may be in flight at once, AFTER
-# the first one has completed. Read only when the switch above is True.
+# the warmup call has completed. Read only when the switch above is True.
 #
-# THE ONE-THEN-N SHAPE IS THE WHOLE POINT AND IT IS NOT A PERFORMANCE TWEAK.
-# The prefix discount exists only once a prefix has been SEEN, so firing all
-# fifteen requests simultaneously would race every one of them against an empty
-# cache and pay full input price on all fifteen -- the exact cost this mode is
-# only viable because of. The first call is therefore issued alone and awaited;
-# the rest go out bounded by this number. Whether the discount then lands is
-# recorded per call rather than assumed.
+# THE WARMUP-THEN-WAVE SHAPE IS THE WHOLE POINT AND IT IS NOT A PERFORMANCE
+# TWEAK. The prefix discount exists only once a prefix has been SEEN, so firing
+# all fifteen requests simultaneously would race every one of them against an
+# empty cache and pay full input price on all fifteen -- the exact cost this
+# mode is only viable because of. A dedicated warmup request (see
+# MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS below) is therefore issued alone
+# and awaited; ALL of the trial calls then go out behind it, bounded by this
+# number, with none of them held back as a cache writer. Whether the discount
+# then lands is recorded per call rather than assumed.
 #
 # THE PRODUCT WITH MAX_WORKERS IS THE NUMBER THAT MATTERS, because the node
 # runs inside oncotriage/batch/runner.py's pool of MAX_WORKERS = 12 patients:
@@ -2003,9 +2005,12 @@ MATCHING_PER_TRIAL_CALLS_ENABLED = False
 # MAX_TRIALS_FOR_EVALUATION (15) whatever this constant is; what this constant
 # decides is only how fast a patient gets through its fifteen, and therefore
 # the request RATE. At a 15-second single-trial call -- see the honest note on
-# that figure below -- a patient completes 1 + ceil(14/4) = 5 waves in ~75s, so
-# a full pool sustains 12 x 15 / 75 = 2.4 requests per second, about 144 per
-# minute. That is an order of magnitude under the requests-per-minute allowance
+# that figure below -- a patient completes a warmup plus ceil(15/4) = 4 waves.
+# The warmup asks for ONE output token, so it is far cheaper in wall time than
+# a trial call; taking it at a full 15s as the pessimistic bound gives 5 waves
+# in ~75s, which is exactly what the retired 1 + ceil(14/4) schedule produced,
+# so a full pool still sustains 12 x 16 / 75 = 2.6 requests per second, about
+# 154 per minute. That is an order of magnitude under the requests-per-minute allowance
 # of any paid tier, and the binding limit on a paid tier is tokens per minute
 # rather than requests -- which per-trial mode moves far LESS than 15x, because
 # the shared prefix is the bulk of every request and is billed at the cached
@@ -2034,6 +2039,111 @@ MATCHING_PER_TRIAL_CALLS_ENABLED = False
 # configuration defect and raises at the node rather than silently meaning one
 # of the two.
 MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS = 4
+
+
+# ---------------------------------------------------------------------------
+# The per-trial cache warmup
+# ---------------------------------------------------------------------------
+#
+# WHAT REPLACED WHAT, AND WHY THE FIRST DESIGN WAS NOT GOOD ENOUGH. Per-trial
+# mode shipped with a one-then-rest schedule: the first REAL trial call was
+# awaited alone so that it would write the shared prefix into the provider's
+# cache, and the remaining N-1 went out in parallel behind it. That made one
+# trial's request double as cache infrastructure, and it has two consequences
+# neither of which is acceptable once the mode is actually run:
+#
+#   * IF THE FIRST TRIAL CALL FAILS ITS TRANSPORT RETRIES, the remaining N-1
+#     fire against a cache nothing ever wrote. Every one of them pays full
+#     input price for a prefix the mode exists to have discounted, and nothing
+#     in the record says the discount was lost for a scheduling reason rather
+#     than because the provider does not cache. A cost leak that reports as a
+#     successful patient.
+#   * THE FAILURE SEMANTICS OF ONE TRIAL AND THE SCHEDULING OF ALL OF THEM ARE
+#     ENTANGLED. "this trial could not be evaluated" and "the cache was never
+#     established" are different findings with different remedies, and the old
+#     design made them the same event.
+#
+# THE RULE NOW IS CACHE-OR-NOTHING: no trial call is ever issued without a warm
+# cache ahead of it, and if the cache cannot be established the patient fails
+# cleanly so that the checkpoint resumes it. A dedicated warmup request carries
+# the identical system message -- the shared prefix, instructions plus patient
+# record, byte for byte -- and the smallest user message and output budget the
+# provider permits, so it writes the cache for a few cents of a cent and
+# evaluates nothing.
+#
+# THE OUTPUT BUDGET IS 1 AND THAT IS A REQUEST FOR THE SMALLEST ANSWER, NOT A
+# PARSE TARGET. The warmup's response is never parsed: only its usage block and
+# its answering-model echo are read. The reply will almost certainly stop at
+# the ceiling with finish_reason "length", which is the intended outcome and
+# not a truncation this pipeline has to recover from -- the reactive splitter
+# never sees it.
+#
+# 1 IS A FLOOR THE PROVIDER MAY REFUSE, AND THAT IS DETECTED RATHER THAN
+# ASSUMED. Reasoning models bill reasoning tokens against this same ceiling and
+# some providers therefore refuse a value this small outright with a 400.
+# oncotriage/agent/evaluation.py classifies exactly that rejection and falls
+# back to the one-then-rest schedule for the patient, recording the reason in
+# PER_TRIAL_WARMUP_DEGRADATIONS -- which reaches the run-end degradation report
+# -- rather than failing the patient over an infrastructure request. Raise this
+# number if the probe says the floor is higher; it is the whole cost of the
+# warmup and every token of it is billed at the uncached rate.
+MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS = 1
+
+# The warmup's user message. The SHARED PREFIX IS THE SYSTEM MESSAGE, so this
+# string is everything the warmup does NOT share with a trial call, and the
+# only requirement on it is that it be non-empty -- an empty content field is
+# rejected by more than one provider. One character is the smallest thing that
+# satisfies that.
+#
+# IT IS DELIBERATELY NOT A PROMPT. Nothing reads the answer, so anything that
+# reads as an instruction would be a request for work this pipeline then throws
+# away.
+MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE = "."
+
+# Whether per-trial mode sends the provider's cache-ROUTING hint.
+#
+# WHAT IT IS AND WHAT IT IS NOT. `prompt_cache_key` does not turn caching on --
+# automatic prefix caching is on by default and needs nothing -- it asks the
+# provider to route requests carrying the same key to the same machine, which
+# is what raises the hit rate when N requests of one patient go out at once.
+# The value is derived per patient from the system prompt's sha256 by
+# oncotriage/agent/evaluation.py, so two patients never share a key and the
+# same patient's warmup and wave always do.
+#
+# SENT ONLY IN PER-TRIAL MODE, and that is a correctness constraint rather than
+# a preference: grouped mode's request is the one the twelve characterization
+# fixtures recorded field for field, and a new kwarg there is a fixture diff
+# and a re-capture at live model prices for a routing hint a single-request
+# patient cannot use.
+#
+# TRUE, WITH THE PRECEDENT FOR THAT DEFAULT NAMED. BEDROCK_SEND_SEED_IN_EXTRA_
+# BODY defaults False because it smuggles a field the installed SDK does not
+# declare, and an unknown field is a 400 that fails every call of a run. This
+# is the opposite case, measured rather than assumed: `prompt_cache_key` IS a
+# declared parameter of `chat.completions.create` in the installed SDK (openai
+# 1.99.9). A provider that still refuses it is detected -- evaluation.py
+# classifies a 400 naming this parameter, drops the key for the rest of the
+# patient and records `prompt_cache_key_rejected` -- so the failure mode is a
+# recorded degradation rather than a dead run. Set False to stop sending it in
+# one edit.
+MATCHING_PER_TRIAL_PROMPT_CACHE_KEY_ENABLED = True
+
+# A ceiling below 1 is not a smaller request, it is a request for no answer at
+# all, and providers differ on whether that is a 400 or an empty completion. A
+# RuntimeError AND NOT AN `assert`, on this file's own standing rule: `python
+# -O` deletes assert statements, and this is the only thing between a mistyped
+# constant and a warmup that fails every patient of a campaign.
+if (not isinstance(MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS, int)
+        or isinstance(MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS, bool)
+        or MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS < 1):
+    raise RuntimeError(
+        "MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS must be an int >= 1; it "
+        f"is {MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS!r}")
+
+if not MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE:
+    raise RuntimeError(
+        "MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE must be a non-empty string; "
+        f"it is {MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE!r}")
 
 
 # ---------------------------------------------------------------------------

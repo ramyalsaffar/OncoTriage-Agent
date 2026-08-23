@@ -398,13 +398,38 @@ _PINNED_KWARGS = {
     "timeout": "config.get_matching_request_timeout()",
 }
 
-_actual_kwargs = ({kw.arg: ast.unparse(kw.value) for kw in _chat_calls[0].keywords}
-                  if _chat_calls else {})
+# A `**expansion` HAS NO `kw.arg`, so it is separated from the named keywords
+# rather than sorted alongside them -- `sorted()` over a list holding None and
+# strings raises, and an ABORT here would hide every check below the one it was
+# meant to report. (The first version of this line did exactly that when the
+# per-trial warmup pass added the expansion.)
+_named_kwargs = ({kw.arg: ast.unparse(kw.value)
+                  for kw in _chat_calls[0].keywords if kw.arg is not None}
+                 if _chat_calls else {})
+_expansions = ([ast.unparse(kw.value)
+                for kw in _chat_calls[0].keywords if kw.arg is None]
+               if _chat_calls else [])
 check("the OpenAI call's keyword NAMES are exactly the seven it always sent",
-      sorted(_actual_kwargs), sorted(_PINNED_KWARGS))
+      sorted(_named_kwargs), sorted(_PINNED_KWARGS))
 for _name, _expr in sorted(_PINNED_KWARGS.items()):
     check(f"...and {_name} is still built from {_expr}",
-          at(_actual_kwargs, _name), _expr)
+          at(_named_kwargs, _name), _expr)
+# THE EIGHTH ENTRY IS AN EXPANSION AND IT IS EMPTY UNLESS A ROUTING KEY WAS
+# PASSED, which is what keeps the grouped-mode request byte-identical: the
+# fixture harnesses record this call's kwargs DICT and look a recording up by a
+# digest of it, so a key that were always present -- even carrying the SDK's
+# NOT_GIVEN sentinel -- would change that digest for every recorded request.
+check("...and the only other entry is one `**` expansion, of the per-trial "
+      "cache-routing hint",
+      _expansions, ["_extra_kwargs"])
+check("...which is populated by exactly one guarded assignment, so it is "
+      "empty whenever no routing key was given",
+      sorted(ast.unparse(n) for n in ast.walk(_call_fn or ast.Module(
+          body=[], type_ignores=[]))
+          if isinstance(n, ast.Assign)
+          and ast.unparse(n.targets[0]).startswith("_extra_kwargs")),
+      ["_extra_kwargs = {}", "_extra_kwargs['prompt_cache_key'] = "
+       "prompt_cache_key"])
 
 check("the OpenAI call still reads its client from deps.get_openai_client()",
       "deps.get_openai_client()" in ast.unparse(_chat_calls[0].func)

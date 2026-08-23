@@ -680,25 +680,25 @@ python tests/test_agent_rrf_config_ownership.py                     #  31
 # removed. ~1.1 s.
 python tests/test_agent_cross_encoder_sequence_limit.py             #  42
 
-# The per-trial-call pass. Same shape, same directory. Stage 5 can send ONE
-# billed call per patient-trial pair, and MATCHING_PER_TRIAL_CALLS_ENABLED
-# ships False -- this pass builds the arm and the campaign decision between
-# modes is a later MEASUREMENT. No network, no keys, NO SPEND (every response
-# is a literal served by a stub installed through oncotriage.agent.deps), no
-# subprocess, no fixture, no git history, no corpus, no model, no live server.
-# The scheduling assertion -- the first call has COMPLETED before any parallel
-# call is ISSUED -- is an integer comparison over tickets the stub itself
-# issued, never a measurement of elapsed time, so it does not depend on runner
-# speed. It DOES open SQLite, in section 9b only, to round-trip the additive
+# The per-trial-call pass, extended by the cache-warmup pass. Same shape, same
+# directory. Stage 5 can send ONE billed call per patient-trial pair, and
+# MATCHING_PER_TRIAL_CALLS_ENABLED ships False -- this pass builds the arm and
+# the campaign decision between modes is a later MEASUREMENT. No network, no
+# keys, NO SPEND (every response is a literal served by a stub installed
+# through oncotriage.agent.deps), no subprocess, no fixture, no git history, no
+# corpus, no model, no live server.
+# The scheduling assertion -- the WARMUP has COMPLETED before any trial call is
+# ISSUED -- is an integer comparison over tickets the stub itself issued, never
+# a measurement of elapsed time, so it does not depend on runner speed. It DOES open SQLite, in section 9b only, to round-trip the additive
 # inferences.matching_call_mode column through the real writer; every database
 # is a scratch file inside a tempfile.mkdtemp asserted to differ from the
 # production path, removed at the end and asserted gone. NOT in the collision
 # matrix -- it writes nothing in the repository, and the two files it reads
 # (agent/evaluation.py, storage/database_logger.py) are written by neither of
 # the suite's two writers and are sha256-compared at the end. It DOES exec:
-# fourteen in-memory copies of agent/evaluation.py, one plant each, argued at
-# _EXEC_ALLOWLIST. Bucket A, ~2.8 s.
-python tests/test_agent_stage5_per_trial_calls.py                   # 139
+# twenty-four in-memory copies of agent/evaluation.py, one plant each, argued
+# at _EXEC_ALLOWLIST. Bucket A, ~4 s.
+python tests/test_agent_stage5_per_trial_calls.py                   # 206 (was 139; the cache-warmup pass added section 3b and controls c18-c27)
 
 # The harness-budget pass. Same shape, same directory. No network, no keys, no
 # spend, NO LIVE SERVER and no live Qdrant -- it starts nothing and issues no
@@ -733,7 +733,7 @@ python tests/test_evaluation_sample_naming.py                       #  72
 # copies of oncotriage/agent/bedrock_adapter.py, one mapping broken in each,
 # argued at _EXEC_ALLOWLIST (the module is new, so `git show` has no revision
 # carrying a version with one mapping missing). ~2 s.
-python tests/test_agent_bedrock_adapter.py                          # 273
+python tests/test_agent_bedrock_adapter.py                          # 275 (was 273; the cache-warmup pass added the `**` expansion pin)
 
 # The Bedrock go-live probe. NOT a test, NOT in tests/, NOT in any bucket, and
 # it REFUSES to do anything without its flag (exit 2, nothing called, nothing
@@ -6263,6 +6263,107 @@ cache with `HF_HUB_OFFLINE=1` (no download): the tokenizer half reports
 `undeclared` and counts, the weights half reports **`verified`**, and
 `score_pairs` returns `[8.8584, -15.9533]` for a relevant and an irrelevant
 trial. The production `inferences.db` sha256 is unchanged.
+
+### A dedicated warmup writes the cache, and nothing is sent without one (the cache-warmup pass)
+
+**PER-TRIAL MODE SHIPPED WITH A ONE-THEN-REST SCHEDULE AND THE FIRST REAL
+TRIAL CALL WAS THE CACHE WRITER.** Two things were wrong with that and only one
+of them is about money. **If that first call exhausted its transport retries
+the remaining N-1 went out against a cache nothing had written**, at full input
+price, and nothing in the record separated that from a provider that does not
+cache — a cost leak reported as an ordinary patient. And **a real trial doubled
+as cache infrastructure**, so "this trial could not be evaluated" and "the
+cache was never established" were one event with one remedy when they are two
+findings with two.
+
+**THE RULE IS CACHE-OR-NOTHING.** `call_matching_model_warmup` carries the
+identical system message — the shared prefix, byte for byte — with the smallest
+user message and output budget the provider permits
+(`MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE`,
+`MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS = 1`). It is awaited alone; then
+**ALL** the trial calls dispatch through the executor under
+`MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS`, **none held back**. LIFO consumption
+and the node-thread merge are unchanged.
+
+**A WARMUP THAT CANNOT BE ESTABLISHED ISSUES NO TRIAL CALL AT ALL.**
+`pending.clear()` is the one line that makes "there is no uncached fallback
+anywhere" true, and the patient fails through the existing zero-success floor
+so `MAX_LLM_CLASSIFIER_RETRIES` sees it and the batch checkpoint resumes it.
+
+**THE FLOOR HAD TO STOP TESTING `calls_made`, AND THAT IS A CORRECTION RATHER
+THAN A DETAIL.** The warmup is a billed call and is counted in `calls_made` —
+correctly — so a floor that tested it would be satisfied by a successful warmup
+and would **stop firing for the total outage it exists to catch**: every trial
+call failing after the warmup answered would have been recorded as a patient
+with no matches and no error. `per_trial_succeeded` counts TRIAL calls that
+returned a response, and that is what the floor asks. Control c21 plants the
+old test back.
+
+**NO THIRD RETRY BUDGET WAS INVENTED.** The warmup's coverage is
+`OPENAI_SDK_MAX_RETRIES` inside the SDK, with the SDK's own backoff honouring
+Retry-After, and `MAX_LLM_CLASSIFIER_RETRIES` above the node, which re-enters
+it through `route_after_llm_classifier`. Check 1k asserts by AST that the
+warmup has exactly one call site and that it is inside no loop.
+
+**THE PROVIDER'S REFUSAL OF THE REQUEST SHAPE IS DETECTED, NOT ASSUMED.**
+A reasoning model bills reasoning against the same ceiling this call sets to 1
+and may refuse a value that small. `classify_warmup_rejection` requires **both**
+a 400 **and** a message naming the parameter — a context overflow is also a 400
+and will fail every trial call too, so falling back for it would replace one
+clean failure with N identical ones. Two members
+(`minimal_output_rejected`, `prompt_cache_key_rejected`); both fall back to the
+retired one-then-rest schedule and record the reason in
+`PER_TRIAL_WARMUP_DEGRADATIONS`, which reaches the run-end degradation report.
+The cache-key case additionally **drops the hint for the wave**, or every
+fallback call would be refused for the parameter that was just refused.
+
+**THE ROUTING HINT IS SENT IN PER-TRIAL MODE ONLY.** `prompt_cache_key` is a
+declared parameter of `chat.completions.create` in the installed SDK (openai
+1.99.9, measured) and does not enable caching — it asks the provider to route
+requests sharing a prefix to one machine, which is what N simultaneous requests
+need. `per_trial_prompt_cache_key()` derives it from the system prompt's
+sha256, namespaced, so the warmup and its wave always share a key and two
+patients never do. It reaches `call_matching_model` through a
+**`**_extra_kwargs` expansion that is empty when no key is given** — NOT
+`openai.NOT_GIVEN`, which is equivalent on the wire and would still change the
+kwargs dict `oncotriage/fixtures/capture.py` records and
+`oncotriage/fixtures/replay.py` digests, costing a re-capture of all twelve
+fixtures.
+
+**THE WARMUP'S LEDGER ROW IS MARKED AND CANNOT BE MISTAKEN FOR A TRIAL.**
+`warmup: True` (present on that row and no other, the absent-rather-than-empty
+convention `unconsumed` already follows), `trials: 0`, `entries_emitted: None`,
+`depth: None` — zero is a real split depth and the warmup has no place in that
+tree. Its tokens are visible and inside the patient's totals; the answering-
+model check runs on it, so **a mismatched judge fails the patient before the
+wave for the price of one one-token request**. `_account_unconsumed()` is
+provably unaffected: the warmup is consumed on the node thread before
+`_prefetched` is populated, asserted by check 3j and controlled by c26.
+
+**PER-TRIAL MODE AGAINST A PROVIDER WHOSE WARMUP IS NOT BUILT IS REFUSED BY
+NAME, BEFORE ANYTHING IS RENDERED OR SPENT.**
+`assert_per_trial_provider_supported()` has one owner and two call sites — the
+node top, on `PerTrialParallelismError`'s footing, and the warmup itself, which
+is public. Without the first, the warmup's own refusal is caught by the
+dispatch's `except`, classified as a transport failure and retried
+`MAX_LLM_CLASSIFIER_RETRIES` times, so a configuration defect arrives as three
+identical failed patients (control c27). The Bedrock and Anthropic branches are
+**left explicit and unbuilt**: Bedrock owns its own caching controls, and
+Anthropic warms its cache the other documented way entirely — a placeholder
+message with an explicit `cache_control` breakpoint.
+
+**VERIFIED BY RUNNING.** `tests/test_agent_stage5_per_trial_calls.py`
+**206/0** (was 139), with **ten new controls (c18-c27) all firing**;
+`tests/test_agent_bedrock_adapter.py` **275** (was 273);
+`tests/test_package_invariants.py` **260/0/0**;
+`tests/test_degradation_counter_readers.py` **138**; CI bucket A **61/61**;
+`tests/run_serial_tests.py` **5/5** with `oncotriage/config.py` and
+`oncotriage/registries/cancer_code_registry.py` confirmed byte-identical
+afterwards; `python fixture_replay.py` **12/12 clean, exit 0, with no recapture
+and zero CONFIG MOVED lines**; and the production `inferences.db` sha256
+**unchanged** — `ab1403e3…`, 90,185,728 bytes. **No money was spent and no
+migration was run.**
+
 
 ### Stage 5 can be served by Amazon Bedrock, and the flag is OFF (the Bedrock pass)
 
