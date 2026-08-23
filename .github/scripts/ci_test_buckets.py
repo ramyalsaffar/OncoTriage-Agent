@@ -360,7 +360,17 @@ BUCKETS = {
         "test_agent_retrieval_observability.py carries"),
     "test_dashboard_run_health.py": (
         _A, None,
-        "ran green in 0.9s, 155 checks, against ONLY the directory skeleton: "
+        # RE-READ OFF A REAL RUN (this pass), and the string it replaces was
+        # not: it claimed 155 checks green "against ONLY the directory
+        # skeleton", and on a skeleton this file has NEVER been green -- 154
+        # passed / 1 failed, from its first and only commit, measured by
+        # running that commit. The recorded run was against the developer tree,
+        # which has a production inferences.db; only the count was true of it.
+        # The probe that failed is now GATED -- see section 7 of the file for
+        # the ruling and its five controls.
+        "ran green in 0.8s (2.4s wall), 167 checks -- 166 passed, 0 failed and "
+        "1 SKIPPED -- against ONLY the directory skeleton, and 167/0/0 against "
+        "the developer tree: "
         "the Run Health tab and the four run loaders. No network (measured -- "
         "every render runs with socket.connect/connect_ex/create_connection/"
         "getaddrinfo replaced by a recorder that RAISES, with a control that "
@@ -374,11 +384,22 @@ BUCKETS = {
         "tab written to that temp directory and imported from there, so it "
         "execs nothing and needs no _EXEC_ALLOWLIST entry, and the two "
         "repository files it reads (dashboard/tabs/run_health.py, "
-        "dashboard/data.py) are written by neither of the suite's two writers "
-        "-- so it is NOT in the collision matrix. UNLIKE "
+        "dashboard/data.py) are written by neither of the suite's two writers; "
+        "the third file it reads is ITS OWN SOURCE, for the AST pins on the "
+        "gate call site and on skip()'s accounting -- so it is NOT in the "
+        "collision matrix. UNLIKE "
         "test_dashboard_reproducibility_tab.py it has no golden snapshot and "
         "so is not pinned to a streamlit version's element vocabulary; it "
-        "asserts values derived from its own seed"),
+        "asserts values derived from its own seed. THE ONE SKIP is the "
+        "non-degeneracy probe on the 'the production database is byte-identical' "
+        "hygiene check: it needs a READABLE production database and "
+        "provision_ci_paths.py deliberately creates the parent directory and "
+        "not the file. The hygiene check itself is NEVER gated, so a run that "
+        "CREATED a production database still fails here ('absent' != <hash>); "
+        "the gate is keyed on os.path.exists rather than on the digest the "
+        "probe asserts about, so the fault the probe catches cannot satisfy "
+        "the gate, and five controls plus an AST pin on the call site keep the "
+        "skip path from becoming the only path"),
     "test_dashboard_reproducibility_tab.py": (
         _A, None,
         "parallel-safe and needs no external data (green in 7.2s on streamlit "
@@ -792,7 +813,17 @@ BUCKETS = {
         "counter keys under them"),
     "test_storage_run_identity.py": (
         _A, None,
-        "ran green in ~1s, 119 checks, against ONLY the directory skeleton: the "
+        # RE-READ OFF A REAL RUN (this pass). The string it replaces was wrong
+        # twice: "119 checks" was true of no run ever -- the file reported 121
+        # at the commit that introduced it, measured by checking that commit
+        # out and running it -- and "green against ONLY the directory skeleton"
+        # was read off the developer tree, which has a production
+        # inferences.db. On a skeleton it was 120 passed / 1 failed from day
+        # one. The probe that failed is now GATED -- see section 10 of the file
+        # for the ruling and its five controls.
+        "ran green in ~1.0s, 133 checks -- 132 passed, 0 failed and 1 SKIPPED "
+        "-- against ONLY the directory skeleton, and 133/0/0 against the "
+        "developer tree: the "
         "`runs` table and the `inferences.run_id` reference through the real "
         "initialize_database and the real log_inference, plus run_batch and "
         "run_resample driven with a recording stand-in for process_patient. "
@@ -802,7 +833,18 @@ BUCKETS = {
         "two scratch paths -- no network, no keys, no spend, no live Qdrant, no "
         "model load, no corpus, no git. It execs nothing: every control is a "
         "different INPUT to a pure function, a real failing condition created "
-        "on disk, or an ast walk over an in-memory copy"),
+        "on disk, or an ast walk over an in-memory copy -- one of them over ITS "
+        "OWN SOURCE, for the AST pins on the gate call site and on skip()'s "
+        "accounting. THE ONE SKIP is the "
+        "non-degeneracy probe on the 'the production database is "
+        "byte-identical' hygiene check: it needs a READABLE production database "
+        "and provision_ci_paths.py deliberately creates the parent directory "
+        "and not the file. The hygiene check itself is NEVER gated, so a run "
+        "that CREATED a production database still fails here ('absent' != "
+        "<hash>); the gate is keyed on os.path.exists rather than on the sha "
+        "the probe asserts about, so the fault the probe catches cannot satisfy "
+        "the gate, and five controls plus an AST pin on the call site keep the "
+        "skip path from becoming the only path"),
     "test_storage_write_durability.py": (
         _E, "the production inferences.db",
         "'9c ...and it was readable, so that comparison is not None == None' failed"),

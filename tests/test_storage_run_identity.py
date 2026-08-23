@@ -128,8 +128,9 @@ from oncotriage.storage import database_logger as _dl
 # MINIMAL ASSERTION HARNESS
 # ===========================================================================
 
-_RESULTS = {"passed": 0, "failed": 0}
+_RESULTS = {"passed": 0, "failed": 0, "skipped": 0}
 _FAILURES = []
+_SKIPS = []
 
 
 def check(label, actual, expected):
@@ -152,6 +153,25 @@ def fail(label, detail):
     _FAILURES.append(f"{label}\n          {detail}")
     print(f"  FAIL  {label}")
     print(f"          {detail}")
+
+
+def skip(label, reason):
+    """Record coverage that could NOT be exercised in THIS environment.
+
+    A SKIP IS NOT A PASS AND IS NEVER COUNTED AS ONE. The mechanism and the
+    argument are this project's existing ones, adopted rather than invented:
+    ``tests/test_package_invariants.py``'s ``skip`` (the macOS-only ``caffeine``
+    guard) and ``tests/test_dockerignore_exclusions.py``'s (the untracked,
+    self-ignored virtualenv that no hosted runner has). Its own counter, its own
+    list, and a summary line PRINTED EVEN AT ZERO -- a skip count that appears
+    only when it is non-zero is indistinguishable from a file that has no skip
+    mechanism at all. It does not touch the exit code: the thing skipped is not
+    broken, it is absent.
+    """
+    _RESULTS["skipped"] += 1
+    _SKIPS.append(f"{label}\n          {reason}")
+    print(f"  SKIP  {label}")
+    print(f"          {reason}")
 
 
 def guarded(fn, *args, **kwargs):
@@ -191,10 +211,149 @@ def loud(fn, *args, **kwargs):
 
 
 def digest(path):
-    """sha256 of a file, or the string 'absent'."""
+    """sha256 of a file, or a NAMED non-reading -- never a raise.
+
+    'absent'          the path is not there
+    'unreadable: X'   it is there and could not be read (a directory, a
+                      permission, an I/O error)
+
+    THE RAISE IS THE POINT OF THE SECOND CASE. This is called at module scope,
+    before any check has run, so an OSError here turns a run that owes a
+    summary and 130-odd results into one traceback -- the abort shape this
+    project has shipped ten times, and which `guarded()` twenty lines up exists
+    to prevent everywhere else. The marker travels into the probe below, which
+    asks is_real_digest() and therefore reports it as a recorded failure.
+    """
     if not os.path.exists(path):
         return "absent"
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError as exc:
+        return f"unreadable: {type(exc).__name__}"
+
+
+def reading_of(path):
+    """``digest(path)``, turning ANY raise into a value ``check`` fails on.
+
+    THE CONTROL BELOW CANNOT SURVIVE THE REVERT IT TESTS WITHOUT THIS, and the
+    revert harness is what found it rather than reading. Strip the ``try`` out
+    of ``digest`` and the very call inside that control's argument list
+    raises, the exception escapes while the argument is being evaluated, and
+    the run reports ONE TRACEBACK where it owed a summary and every result --
+    the abort shape this project has now shipped ten times, reproduced inside
+    the control written to prevent it. Measured: with the raise restored the
+    file exited 1 having recorded ZERO failures; with this wrapper it records a
+    named one.
+
+    It also removes the last abort at module scope: a production database that
+    exists and cannot be read now becomes a reading the probe REPORTS rather
+    than an exception before the first check.
+    """
+    try:
+        return digest(path)
+    except BaseException as exc:                       # noqa: BLE001 -- reported
+        return f"raised: {type(exc).__name__}: {exc}"
+
+
+def is_real_digest(reading):
+    """True only for a real sha256 -- 64 lower-case hex characters.
+
+    THE PROBE ASKS THIS, NOT ``!= "absent"``, AND THE DIFFERENCE IS A SECOND
+    SENTINEL. The reading can fail to be a digest in two ways: the file is not
+    there ('absent') and the file is there but could not be read
+    ('unreadable: ...'). A predicate written against the first string alone
+    would report the second as a real reading and pass -- the vacuous pass the
+    probe exists to prevent, one sentinel over.
+    """
+    return (isinstance(reading, str) and len(reading) == 64
+            and all(c in "0123456789abcdef" for c in reading))
+
+
+_PROBE_RUN = "run"
+_PROBE_SKIP = "skip"
+
+
+def production_probe_disposition(production_existed):
+    """Whether the production-database non-degeneracy probe has a subject.
+
+    THE GATE READS THE FILESYSTEM; THE PROBE READS THE DIGEST, AND THE TWO
+    READINGS BEING INDEPENDENT IS THE WHOLE DESIGN. The probe this gates
+    asserts that ``_PRODUCTION_SHA_BEFORE`` is not the string ``'absent'``. A
+    gate keyed on that same string would therefore be satisfied by exactly the
+    fault the probe exists to catch -- a digest reading that comes back
+    ``'absent'`` for a file that is really there, through a broken reader or a
+    wrong path -- and the skip path would quietly become the only path.
+    ``os.path.exists`` decides whether the probe runs; the digest decides what
+    it reports.
+
+    Pure, so its controls are different ARGUMENTS rather than a mutated file on
+    disk -- which is what this file's own header already claims of every
+    control in it.
+    """
+    return _PROBE_RUN if production_existed else _PROBE_SKIP
+
+
+def production_probe_verdict(sha_before):
+    """The ``(actual, expected)`` pair the probe hands to ``check``.
+
+    ONE implementation, driven by the live call site and by every control, so a
+    control cannot agree with a probe that has stopped checking.
+    """
+    return (not is_real_digest(sha_before), False)
+
+
+def gate_call_sites(source_path):
+    """Every ``if`` whose ELSE branch calls ``skip()``, as the set of names
+    its TEST reads. AT ANY NESTING DEPTH, deliberately: a top-level walk is
+    what hid ``api/server.py``'s four endpoints from the first version of
+    test_package_invariants.py's decorator scan, and a gate moved inside a
+    helper must not escape this pin by moving.
+
+    THE CONTROLS ON THE TWO PURE FUNCTIONS ABOVE CANNOT SEE A WRONG CALL SITE,
+    and that gap is why this exists. Rewriting the gate's `if` to read the
+    digest instead of the existence flag leaves both functions correct, leaves
+    every control green, and quietly turns the one state the probe exists to
+    catch -- a file that is there whose reading says 'absent' -- into a SKIP.
+    An AST pin on the call site is the only thing that reports it.
+    """
+    tree = ast.parse(Path(source_path).read_text(encoding="utf-8"))
+    sites = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        calls_skip = any(
+            isinstance(inner, ast.Call) and getattr(inner.func, "id", "") == "skip"
+            for stmt in node.orelse for inner in ast.walk(stmt))
+        if calls_skip:
+            sites.append({n.id for n in ast.walk(node.test)
+                          if isinstance(n, ast.Name)})
+    return sites
+
+
+def skip_accounting_keys(source_path):
+    """Which ``_RESULTS`` counters ``skip()`` writes, read off this file by AST.
+
+    A SKIP THAT INCREMENTS ``passed`` IS THE FAILURE MODE THIS WHOLE PASS EXISTS
+    TO AVOID -- coverage that could not run, reported as coverage that did. No
+    behavioural control can see it (the counter it corrupts is the counter every
+    other check moves), so it is pinned structurally.
+    """
+    tree = ast.parse(Path(source_path).read_text(encoding="utf-8"))
+    keys = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.FunctionDef) and node.name == "skip"):
+            continue
+        for inner in ast.walk(node):
+            target = None
+            if isinstance(inner, ast.AugAssign):
+                target = inner.target
+            elif isinstance(inner, ast.Assign) and len(inner.targets) == 1:
+                target = inner.targets[0]
+            if (isinstance(target, ast.Subscript)
+                    and getattr(target.value, "id", "") == "_RESULTS"
+                    and isinstance(target.slice, ast.Constant)):
+                keys.add(target.slice.value)
+    return sorted(keys)
 
 
 def at(mapping, key, default="<absent>"):
@@ -274,7 +433,13 @@ def one(db, sql, params=()):
 _ENV_WAS = os.environ.pop("ONCOTRIAGE_INFERENCES_DB", None)
 
 _PRODUCTION_DB = _paths.inferences_path
-_PRODUCTION_SHA_BEFORE = digest(_PRODUCTION_DB)
+_PRODUCTION_SHA_BEFORE = reading_of(_PRODUCTION_DB)
+# Taken HERE, beside the sha and before this file has written anything, because
+# the question the gate in section 10 answers is "did this machine have a
+# production database for the byte-identity check to be exercised against" --
+# not "is there one now". A run that CREATED one is caught by that check itself
+# ('absent' != <hash>), which stays live and ungated in every environment.
+_PRODUCTION_EXISTED_BEFORE = os.path.exists(_PRODUCTION_DB)
 
 _TMP = tempfile.mkdtemp(prefix="oncotriage-run-identity-")
 _SCRATCH_DB = os.path.join(_TMP, "inferences.db")
@@ -1250,8 +1415,99 @@ if _ENV_WAS is not None:
 
 check("the production database is byte-identical",
       digest(_PRODUCTION_DB), _PRODUCTION_SHA_BEFORE)
-check("...and it was READABLE, so that comparison is not 'absent' == 'absent'",
-      _PRODUCTION_SHA_BEFORE == "absent", False)
+
+# ---------------------------------------------------------------------------
+# THE NON-DEGENERACY PROBE IS GATED ON THE ENVIRONMENT, AND THE RULING IS HERE
+# ---------------------------------------------------------------------------
+# The probe below needs a READABLE production database, and CI never has one:
+# `.github/scripts/provision_ci_paths.py` creates the PARENT of
+# `inferences_path` and deliberately not the file, and its own header calls
+# fabricating inputs "the exact defect this project's non-degeneracy rule
+# exists to catch". That provisioning decision is a ruling and is untouched.
+#
+# TWO SHAPES WERE AVAILABLE AND GATING WON.
+#
+#   reclassify to bucket E   the tests/test_storage_write_durability.py
+#                            precedent, whose entry is the IDENTICAL single
+#                            probe. Simpler, and it removes this whole file --
+#                            126 checks, the only standing coverage of the
+#                            `runs` table, the run_id thread and the two
+#                            finalization paths -- from CI to preserve one.
+#   gate the probe alone     keeps all of them, and loses one probe on a
+#                            machine where that probe HAS NO SUBJECT. With no
+#                            production database, "that comparison is not
+#                            'absent' == 'absent'" is not a weaker question; it
+#                            is a question about a file that does not exist.
+#                            That is what `skip` means here, and what it must
+#                            never be allowed to mean is "the check was
+#                            inconvenient".
+#
+# NOTHING THE PROBE ASSERTS IS WEAKENED. Where a production database exists the
+# probe runs unchanged, against the same sha, with the same expectation. The
+# byte-identity check above is never gated, so the dangerous CI case -- a stray
+# writer CREATING the production database, before='absent' and after=<hash> --
+# still fails there.
+_STANDIN = os.path.join(_TMP, "production-probe-standin.bin")
+Path(_STANDIN).write_bytes(b"not a database: a file that exists")
+_STANDIN_SHA = digest(_STANDIN)
+
+check("control: a file that exists digests to a real sha256 rather than "
+      "'absent' (non-degeneracy: every control below would be vacuous "
+      "otherwise)", len(_STANDIN_SHA), 64)
+check("control: with no production database on disk the probe is SKIPPED",
+      production_probe_disposition(False), _PROBE_SKIP)
+check("control: with a production database on disk the probe is RUN",
+      production_probe_disposition(os.path.exists(_STANDIN)), _PROBE_RUN)
+
+_HONEST_ACTUAL, _HONEST_EXPECTED = production_probe_verdict(_STANDIN_SHA)
+check("control: RUN plus an honest reading of a file that exists -- the probe "
+      "passes", _HONEST_ACTUAL == _HONEST_EXPECTED, True)
+
+# THE FIRING CONTROL, and requirement 3 of this pass. The plant is the state
+# the gate must not be able to absorb: the file IS there (so the gate says RUN)
+# and the sha reading claims 'absent'. The probe must report a FAILURE, or the
+# skip path has quietly become the only path.
+for _sentinel in ("absent", "unreadable: IsADirectoryError"):
+    _PLANTED_ACTUAL, _PLANTED_EXPECTED = production_probe_verdict(_sentinel)
+    check(f"control: RUN plus a present file read as {_sentinel!r} -- the probe "
+          f"FIRES, so a non-reading cannot pass as a skip",
+          _PLANTED_ACTUAL == _PLANTED_EXPECTED, False)
+
+# A DIRECTORY, not a chmod: `chmod 000` is bypassed by root, so a control built
+# on it passes vacuously on any runner that runs as root. Path.read_bytes on a
+# directory raises IsADirectoryError -- an OSError -- for every user there is.
+check("control: an existing path that cannot be READ digests to a named marker "
+      "rather than raising (a raise here aborts the file before its first "
+      "check)", reading_of(_TMP).startswith("unreadable: "), True)
+check("control: ...and that marker is not mistaken for a reading",
+      is_real_digest(reading_of(_TMP)), False)
+
+_GATE_SITES = gate_call_sites(os.path.abspath(__file__))
+check("control: skip() writes ONLY the skipped counter -- a skip that "
+      "increments passed would report unavailable coverage as coverage",
+      skip_accounting_keys(os.path.abspath(__file__)), ["skipped"])
+check("control: exactly one gated call site is present (non-degeneracy -- a "
+      "walk that matched nothing would satisfy the two assertions below for "
+      "free)", len(_GATE_SITES), 1)
+check("control: the gate is decided by the EXISTENCE reading",
+      "_PRODUCTION_EXISTED_BEFORE" in at(_GATE_SITES, 0, set()), True)
+check("control: ...and NOT by the sha reading the probe itself asserts on -- a "
+      "gate keyed on that string is satisfied by the exact fault the probe "
+      "catches",
+      "_PRODUCTION_SHA_BEFORE" in at(_GATE_SITES, 0, set()), False)
+
+_PROBE_LABEL = ("...and it was READABLE, so that comparison is not two "
+                "sentinels -- 'absent' == 'absent' or "
+                "'unreadable' == 'unreadable'")
+if production_probe_disposition(_PRODUCTION_EXISTED_BEFORE) == _PROBE_RUN:
+    check(_PROBE_LABEL, *production_probe_verdict(_PRODUCTION_SHA_BEFORE))
+else:
+    skip(_PROBE_LABEL,
+         f"no production database at {_PRODUCTION_DB}, so the byte-identity "
+         f"check above had nothing to be exercised against. That check stayed "
+         f"LIVE and would still have caught this run creating one. Expected on "
+         f"a CI runner: provision_ci_paths.py creates the parent directory and "
+         f"deliberately not the file.")
 check("oncotriage/storage/database_logger.py is byte-identical",
       digest(_DL_SRC), _DL_SHA_BEFORE)
 check("oncotriage/batch/runner.py is byte-identical",
@@ -1281,6 +1537,15 @@ print("SUMMARY")
 print("=" * 78)
 print(f"  passed: {_RESULTS['passed']}")
 print(f"  failed: {_RESULTS['failed']}")
+# PRINTED EVEN AT ZERO. A skip count that appears only when it is non-zero is
+# indistinguishable from a file that has no skip mechanism at all.
+print(f"  skipped: {_RESULTS['skipped']}   (a skip is NOT a pass and is not "
+      f"counted as one)")
+if _SKIPS:
+    print()
+    print("SKIPPED:")
+    for _s in _SKIPS:
+        print(f"  - {_s}")
 if _FAILURES:
     print()
     print("FAILURES:")
