@@ -828,6 +828,25 @@ BUCKETS = {
         "ast walk over a parsed source file. The ~10s is section 7's "
         "MAX_WORKERS threads flushing behind a barrier while another inserts "
         "counter keys under them"),
+    "test_storage_schema_guards.py": (
+        _A, None,
+        # DERIVED BY RUNNING against a skeleton provisioned by
+        # provision_ci_paths.py, not from its imports.
+        "ran green in ~1.6s, 84 checks -- 84 passed, 0 failed, 0 skipped -- "
+        "against ONLY the directory skeleton, and identically against the "
+        "developer tree: the requires_columns derivation over the whole query "
+        "registry, the rename record against a real fresh database, the "
+        "trial_matches child-lookup index by EXPLAIN QUERY PLAN on a seeded "
+        "database with an unindexed one as the control, PRAGMA user_version "
+        "stamped/preserved/bumped/never-lowered, and report() driven end to "
+        "end against a PRE-MIGRATION database. No network, no keys, no spend, "
+        "no live Qdrant, no model load, no corpus, no git history and no live "
+        "server. THE PRODUCTION DATABASE IS NEVER OPENED, not even read-only: "
+        "the pre-migration shape is built from database_logger's own constants "
+        "by renaming and dropping columns on a fresh database, which is why "
+        "the skeleton and the developer tree give the same number. Every "
+        "database is inside a tempfile.mkdtemp it removes and asserts gone, "
+        "and the two package files it reads are sha256-compared at the end"),
     "test_storage_run_identity.py": (
         _A, None,
         # RE-READ OFF A REAL RUN (this pass). The string it replaces was wrong

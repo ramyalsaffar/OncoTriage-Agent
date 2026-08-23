@@ -198,6 +198,41 @@ def resolve_inference_db_path(db_path=None):
 #------------------------------------------------------------------------------
 
 
+# THE SCHEMA ERA THIS CODE CREATES, STAMPED INTO EVERY DATABASE IT OPENS.
+#
+# SQLite carries a caller-owned 32-bit integer in its file header, readable with
+# `PRAGMA user_version` and costing no table, no row and no migration. It was 0
+# on every database this project has ever written -- the default -- so no tool
+# could ask a FILE which schema era it held; the only way to find out was to
+# read `PRAGMA table_info` on three tables and compare the result against a
+# reading of this module. That is a derivation a person does, and it is why the
+# gpt4o rename could leave sixteen queries pointing at columns nobody noticed
+# were gone.
+#
+# THE RULE, AND IT IS THE WHOLE VALUE OF THE NUMBER: BUMP THIS IN THE SAME
+# COMMIT THAT CHANGES THE SCHEMA. An entry added to INFERENCE_COLUMN_ADDITIONS,
+# TRIAL_MATCH_COLUMN_ADDITIONS or RUN_COLUMN_ADDITIONS, a new table, a new
+# index, a rename -- each is a new era. A stamp that lags the schema is worse
+# than no stamp, because a reader acts on it.
+#
+# IT STARTS AT 1 AND NOT AT 0. Zero is what SQLite writes into a file nobody
+# has stamped, so `user_version = 0` has to keep meaning "unstamped, era
+# unknown, ask table_info" -- and it does: that is what every database written
+# before this constant existed reports, including the production file. Numbering
+# eras from 1 leaves that reading unambiguous.
+#
+# WHAT IT IS NOT. It is not a migration ledger and nothing branches on it: the
+# migrations here are idempotent and presence-driven (`IF NOT EXISTS`, a
+# `PRAGMA table_info` check before each ALTER), so they do not need to know
+# where they started. It answers one question -- which era is this file -- for
+# a human, a support script, or a future tool that must refuse a database it
+# does not understand.
+SCHEMA_USER_VERSION = 1
+
+
+#------------------------------------------------------------------------------
+
+
 # Schema migration for the inferences table.
 #
 # CREATE TABLE IF NOT EXISTS is a no-op once the table exists, so columns added
@@ -845,6 +880,53 @@ INFERENCE_COLUMN_ADDITIONS = {
     # per CONNECTION and this module opens only some of the connections that
     # touch this file.
     "run_id":                                "INTEGER",
+}
+
+
+#------------------------------------------------------------------------------
+
+
+# WHAT THE gpt4o -> llm_classifier RENAME LEFT ON DISK.
+#
+# The naming pass renamed nine columns of `inferences` in place in the CREATE
+# TABLE and in every reader. A database written before it carries the OLD name
+# and nothing added the new one -- `ALTER TABLE ... RENAME COLUMN` is not
+# expressible through INFERENCE_COLUMN_ADDITIONS, which can only ADD, and the
+# pass recorded that decision rather than writing a migration: the production
+# database is disposable and every published number comes from a fresh run.
+#
+# SO A RENAMED COLUMN IS ADDITIVE-SHAPED FROM THE READER'S SIDE and is not in
+# the additions dict. That gap is what this constant closes. A query naming
+# `llm_classifier_evaluation_time` against a pre-rename database raises
+# `no such column` exactly as one naming a genuinely new column does, and
+# oncotriage/storage/queries.py must be able to derive both classes from one
+# set. Measured, not asserted: `report()` against the production database died
+# at its SECOND query on that error, having printed eight lines.
+#
+# ALL NINE ARE HERE, INCLUDING THE FOUR THAT ARE ALSO IN
+# INFERENCE_COLUMN_ADDITIONS. Those four were added after the rename under the
+# new name, so a pre-rename database lacks them for two independent reasons and
+# either declaration would do. Listing only the five that are not in that dict
+# would make this a set defined by what another dict happens to contain, which
+# is the shape that goes stale silently; listing all nine makes it a complete
+# record of the rename, and the union the guard takes is the same either way.
+#
+# THE VALUES ARE NOT READ BY ANY MIGRATION and there is deliberately no code
+# that renames anything. They are here because the guard's staleness check in
+# tests/test_storage_schema_guards.py asserts that no old name is a column of a
+# freshly created database -- which is what says the rename actually happened
+# and that this record is not describing a state that no longer exists.
+RENAMED_INFERENCE_COLUMNS = {
+    # current name                              pre-rename name
+    "llm_classifier_evaluation_time":           "gpt4o_evaluation_time",
+    "llm_classifier_prompt":                    "gpt4o_prompt",
+    "llm_classifier_input_tokens":              "gpt4o_input_tokens",
+    "llm_classifier_output_tokens":             "gpt4o_output_tokens",
+    "llm_classifier_retries":                   "gpt4o_retries",
+    "llm_classifier_truncation_splits":         "gpt4o_truncation_splits",
+    "llm_classifier_output_tokens_estimated":   "gpt4o_output_tokens_estimated",
+    "llm_classifier_calls":                     "gpt4o_calls",
+    "llm_classifier_reasoning_tokens":          "gpt4o_reasoning_tokens",
 }
 
 
@@ -1952,6 +2034,30 @@ CREATE TABLE IF NOT EXISTS trial_matches (
             cursor.execute(f"ALTER TABLE trial_matches ADD COLUMN {_column} {_sql_type}")
             console.out(f"Schema migration: added trial_matches.{_column}")
 
+    # THE CHILD LOOKUP IS THE ONLY ACCESS PATH THIS TABLE HAS, and until this
+    # line it had no index at all -- so every one of them was a full scan of
+    # every trial row the database has ever held, across every run.
+    #
+    # MEASURED, at 22,000-patient scale (~330,000 child rows): fetching one
+    # inference's trials took 169 ms without the index and 0.02 ms with it.
+    # `trial_matches` is written 15-ish rows per patient and read by
+    # `run_normalizer_provenance`, the four provenance queries, the dashboard's
+    # per-patient drill-down and every JOIN in this registry, all of them on
+    # `inference_id`.
+    #
+    # AND THE INDEX THAT IS NOT HERE IS A RULING, NOT AN OVERSIGHT. An index on
+    # `nct_id` was measured HARMFUL -- 32% slower -- because the queries that
+    # group by it read the whole table anyway, so the planner gains nothing and
+    # every insert pays to maintain a second B-tree. Do not add one. If a future
+    # access path seems to want it, re-measure first and record the number.
+    #
+    # IT IS `IF NOT EXISTS` for the same idempotence reason every CREATE in this
+    # function is, and it is placed AFTER the column migrations so a database
+    # arriving with neither gets its columns and its index in one open.
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_trial_matches_inference_id "
+        "ON trial_matches(inference_id)")
+
 
     # Drift metrics table
     cursor.execute('''
@@ -2034,6 +2140,52 @@ CREATE TABLE IF NOT EXISTS run_metrics (
         "CREATE INDEX IF NOT EXISTS idx_run_metrics_run_id "
         "ON run_metrics(run_id)")
 
+
+    # ------------------------------------------------------------------
+    # STAMP THE SCHEMA ERA -- LAST, AND THE POSITION IS THE POINT
+    # ------------------------------------------------------------------
+    # Every CREATE and every ALTER above has run by this line, so the stamp is
+    # written only over a file that HAS the era it claims. Stamping first would
+    # label a database that a raise in the middle then left half-migrated --
+    # and a wrong era is worse than no era, because a reader acts on it while
+    # `0` sends them to `PRAGMA table_info`.
+    #
+    # It is inside the same transaction as the migrations, so a failure takes
+    # the stamp with the columns rather than leaving one without the other.
+    #
+    # THE VALUE IS INTERPOLATED, NOT BOUND. `PRAGMA user_version = ?` is a
+    # syntax error in SQLite -- pragmas take no parameters -- so the f-string is
+    # forced. It is safe because SCHEMA_USER_VERSION is a module constant this
+    # file owns; the int() is what keeps that true if someone ever makes it a
+    # string.
+    #
+    # IT NEVER LOWERS AN EXISTING STAMP, and that is a correctness rule rather
+    # than caution. This schema is strictly additive -- nothing here drops a
+    # column, a table or an index -- so a file stamped 7 that this era-1 code
+    # then opens still HAS everything era 7 gave it, plus whatever era 1 just
+    # ensured. Writing 1 over the 7 would erase a true statement and replace it
+    # with a false one. The reverse case (a newer writer meeting an older file)
+    # needs no rule: it migrates the file forward and then stamps forward.
+    #
+    # The refusal is ANNOUNCED on the same channel every other thing this
+    # function says goes to. A silent no-op here would be indistinguishable
+    # from a stamp that worked.
+    _found_version = cursor.execute("PRAGMA user_version").fetchone()[0]
+    if _found_version > SCHEMA_USER_VERSION:
+        console.out(
+            f"Schema stamp: LEFT AT {_found_version}, not lowered to "
+            f"{SCHEMA_USER_VERSION}. This database was last migrated by a "
+            f"NEWER version of oncotriage.storage.database_logger; this one "
+            f"has added only what it knows about. Nothing is wrong with the "
+            f"rows that are there."
+        )
+    else:
+        cursor.execute(f"PRAGMA user_version = {int(SCHEMA_USER_VERSION)}")
+        if _found_version != SCHEMA_USER_VERSION:
+            console.out(
+                f"Schema stamp: user_version {_found_version} -> "
+                f"{SCHEMA_USER_VERSION}"
+            )
 
     conn.commit()
     conn.close()

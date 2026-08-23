@@ -134,6 +134,7 @@ registry is a tuple of strings. ``connect()`` is a function and ``report()``
 needs a connection handed to it.
 """
 
+import re
 import sqlite3
 from typing import Dict, List
 
@@ -158,11 +159,14 @@ from oncotriage.observability import console
 # tests/test_package_invariants.py section 2 already proves for every module in
 # the package.
 from oncotriage.storage.database_logger import (
+    INFERENCE_COLUMN_ADDITIONS,
+    RENAMED_INFERENCE_COLUMNS,
     RUN_METRIC_CATEGORY_DEGRADATION,
     RUN_METRIC_CATEGORY_META,
     RUN_METRIC_META_COUNTERS_NONZERO,
     RUN_METRIC_META_COUNTERS_REGISTERED,
     RUN_RECORD_STATUS_RUNNING,
+    TRIAL_MATCH_COLUMN_ADDITIONS,
 )
 from oncotriage.utils import get_model_cost
 
@@ -872,6 +876,8 @@ QUERIES = (
         heading=None,
         render='describe',
         blank_after=False,
+        requires_columns=(("inferences", "llm_classifier_evaluation_time"),
+                          ("inferences", "llm_classifier_output_tokens"),),
         sql='SELECT total_time, llm_classifier_evaluation_time, llm_classifier_output_tokens FROM inferences',
     ),
     # File 16 line 88, `df_timeout`
@@ -880,6 +886,9 @@ QUERIES = (
         heading=None,
         render='repr',
         blank_after=False,
+        requires_columns=(("inferences", "llm_classifier_evaluation_time"),
+                          ("inferences", "llm_classifier_input_tokens"),
+                          ("inferences", "llm_classifier_output_tokens"),),
         sql="""
     SELECT patient_id, age, condition_count, medication_count, 
            candidates_evaluated, total_time, llm_classifier_evaluation_time, 
@@ -895,6 +904,9 @@ QUERIES = (
         heading='=== PERFORMANCE DISTRIBUTION ===',
         render='describe',
         blank_after=True,
+        requires_columns=(("inferences", "llm_classifier_evaluation_time"),
+                          ("inferences", "llm_classifier_input_tokens"),
+                          ("inferences", "llm_classifier_output_tokens"),),
         sql="""
     SELECT 
         total_time,
@@ -914,6 +926,9 @@ QUERIES = (
         heading='=== TOP 10 SLOWEST PATIENTS ===',
         render='to_string',
         blank_after=True,
+        requires_columns=(("inferences", "llm_classifier_evaluation_time"),
+                          ("inferences", "llm_classifier_input_tokens"),
+                          ("inferences", "llm_classifier_output_tokens"),),
         sql="""
     SELECT 
         patient_id,
@@ -938,6 +953,7 @@ QUERIES = (
         heading='=== PATIENTS WITH OUTPUT > 4000 TOKENS ===',
         render='to_string',
         blank_after=True,
+        requires_columns=(("inferences", "llm_classifier_output_tokens"),),
         sql="""
     SELECT 
         patient_id,
@@ -971,6 +987,8 @@ QUERIES = (
         heading=None,
         render='custom',
         blank_after=False,
+        requires_columns=(("inferences", "llm_classifier_output_tokens"),
+                          ("inferences", "llm_classifier_prompt"),),
         sql="""
     SELECT 
         patient_id,
@@ -988,6 +1006,7 @@ QUERIES = (
         heading='=== STAGE-LEVEL BOTTLENECKS ===',
         render='transpose',
         blank_after=True,
+        requires_columns=(("inferences", "llm_classifier_evaluation_time"),),
         sql="""
     SELECT 
         AVG(query_expansion_time) as avg_expansion,
@@ -1029,6 +1048,8 @@ QUERIES = (
         heading='=== TOKEN EFFICIENCY BY PATIENT COMPLEXITY ===',
         render='to_string',
         blank_after=True,
+        requires_columns=(("inferences", "llm_classifier_input_tokens"),
+                          ("inferences", "llm_classifier_output_tokens"),),
         sql="""
     SELECT 
         condition_count,
@@ -1053,6 +1074,7 @@ QUERIES = (
         blank_after=True,
         notes=('Stage 1 is rule-based and calls no LLM, so there are no expansion token columns to report.',
                'Item 38 deleted `expansion_token_efficiency`, which asked for them; this query is the answerable version.'),
+        requires_columns=(("inferences", "query_expansion_path"),),
         sql="""
     SELECT
         COUNT(*)                    as rows_n,
@@ -1069,6 +1091,9 @@ QUERIES = (
         heading=None,
         render='custom',
         blank_after=False,
+        requires_columns=(("inferences", "llm_classifier_input_tokens"),
+                          ("inferences", "llm_classifier_output_tokens"),
+                          ("inferences", "llm_classifier_reasoning_tokens"),),
         sql="""
     SELECT
         matching_model,
@@ -1143,6 +1168,7 @@ QUERIES = (
         heading='=== EXTREME CASES / ANOMALIES ===',
         render='to_string',
         blank_after=True,
+        requires_columns=(("inferences", "llm_classifier_output_tokens"),),
         sql="""
     SELECT 
         patient_id,
@@ -1192,6 +1218,7 @@ QUERIES = (
         heading='=== MEDICATION DUPLICATION SUSPECTS ===',
         render='to_string',
         blank_after=True,
+        requires_columns=(("inferences", "llm_classifier_input_tokens"),),
         sql="""
     SELECT 
         patient_id,
@@ -1231,6 +1258,8 @@ QUERIES = (
         heading='=== GPT-4O EFFICIENCY BY TRIAL COUNT ===',
         render='to_string',
         blank_after=True,
+        requires_columns=(("inferences", "llm_classifier_evaluation_time"),
+                          ("inferences", "llm_classifier_output_tokens"),),
         sql="""
     SELECT 
         candidates_evaluated as trial_count,
@@ -1302,6 +1331,7 @@ QUERIES = (
         notes=(f'Counted over every row, with no limit. The listing below is a '
                f'SAMPLE capped at {CONSISTENCY_LISTING_LIMIT} rows, ordered by '
                f'(issue, patient_id, id).',),
+        requires_columns=(("inferences", "not_evaluable_trials"),),
         sql=_PIPELINE_CONSISTENCY_SUMMARY_SQL,
     ),
     # File 16 line 579, `df_consistency`. SQL and its full argument at
@@ -1311,6 +1341,7 @@ QUERIES = (
         heading='=== PIPELINE CONSISTENCY ISSUES ===',
         render='empty_or_to_string',
         blank_after=True,
+        requires_columns=(("inferences", "not_evaluable_trials"),),
         sql=_PIPELINE_CONSISTENCY_SQL,
     ),
     # File 16 line 608, `df_med_issue`
@@ -1507,6 +1538,8 @@ QUERIES = (
         heading='=== RETRIEVAL DEGRADATION ===',
         render='to_string',
         blank_after=True,
+        requires_columns=(("inferences", "retrieval_degraded"),
+                          ("inferences", "retrieval_trials_lost"),),
         sql="""
     SELECT
         COUNT(*)                                                   AS rows_total,
@@ -1525,6 +1558,11 @@ QUERIES = (
         heading='=== MOST RECENT DEGRADED RETRIEVALS ===',
         render='to_string',
         blank_after=True,
+        requires_columns=(("inferences", "retrieval_channels"),
+                          ("inferences", "retrieval_channels_expected"),
+                          ("inferences", "retrieval_channels_ok"),
+                          ("inferences", "retrieval_degraded"),
+                          ("inferences", "retrieval_trials_lost"),),
         sql="""
     SELECT
         timestamp, patient_id,
@@ -1543,6 +1581,8 @@ QUERIES = (
         heading='=== QUERY EXPANSION PATH x MESH RESOLUTION ===',
         render='to_string',
         blank_after=True,
+        requires_columns=(("inferences", "mesh_resolution"),
+                          ("inferences", "query_expansion_path"),),
         sql="""
     SELECT
         COALESCE(query_expansion_path, '(not reported)') AS query_expansion_path,
@@ -1561,6 +1601,8 @@ QUERIES = (
         heading='=== CANCER SITE FILTER: RAN vs ASSERTED ===',
         render='to_string',
         blank_after=True,
+        requires_columns=(("inferences", "mesh_filter_applied"),
+                          ("inferences", "mesh_filter_skip_reason"),),
         sql="""
     SELECT
         CASE mesh_filter_applied
@@ -1606,6 +1648,8 @@ QUERIES = (
             "separated by verdict_source and by whether criterion_details is",
             "empty. See TRIAL_MATCH_COLUMN_ADDITIONS.",
         ),
+        requires_columns=(("trial_matches", "not_evaluable_reason"),
+                          ("trial_matches", "verdict_source"),),
         sql="""
     SELECT
         COALESCE(tm.not_evaluable_reason, '(not reported)') AS not_evaluable_reason,
@@ -1639,6 +1683,8 @@ QUERIES = (
             "which never carried a model-written label, plus rows written",
             "before the column existed.",
         ),
+        requires_columns=(("trial_matches", "verdict_original_type"),
+                          ("trial_matches", "verdict_source"),),
         sql="""
     SELECT
         COALESCE(tm.verdict_source, '(not checked)')       AS verdict_source,
@@ -1664,6 +1710,7 @@ QUERIES = (
             "event total. inferences.cross_vocab_remaps carries the event",
             "total; the per-trial column is what makes the second countable.",
         ),
+        requires_columns=(("trial_matches", "criterion_remaps"),),
         sql="""
     SELECT
         COUNT(*)                                                        AS trial_rows,
@@ -1689,6 +1736,10 @@ QUERIES = (
             "model. The check is only meaningful where the per-trial column is",
             "populated, which is why remap_rows_checked is beside it.",
         ),
+        requires_columns=(("inferences", "cross_vocab_remaps"),
+                          ("inferences", "remapped_trials"),
+                          ("inferences", "verdict_normalizations"),
+                          ("trial_matches", "criterion_remaps"),),
         sql="""
     SELECT
         i.id, i.patient_id, i.timestamp,
@@ -2104,6 +2155,203 @@ def table_columns(conn, table) -> frozenset:
                      fetch_raw(conn, f"PRAGMA table_info({table})"))
 
 
+# ---------------------------------------------------------------------------
+# WHICH ADDITIVE COLUMNS A QUERY NAMES, DERIVED FROM ITS OWN SQL
+# ---------------------------------------------------------------------------
+#
+# `requires_columns` STAYS HAND-WRITTEN ON THE Query RECORD. This is the
+# CHECKER, not the source: tests/test_storage_schema_guards.py asserts that
+# every registered query's declaration equals what this derives, so a query can
+# no longer ship naming an additive column it forgot to declare. The ruling in
+# Query.requires_columns -- that a column requirement is NOT derivable from a
+# table requirement -- is untouched and is a different statement; that one is
+# about `runs` existing not implying `inferences.run_id` existing, and this is
+# about reading the SQL.
+#
+# WHY IT HAD TO EXIST. The guard was built for ADDITIVE absence and worked. Then
+# the gpt4o -> llm_classifier rename renamed nine columns in place, and every
+# older query naming one became a query against a column the production database
+# does not have -- with no declaration, because nobody re-read forty-eight
+# queries. MEASURED: `report()` against the production database died at its
+# SECOND query on `no such column: llm_classifier_evaluation_time`, having
+# printed eight lines of forty-eight queries' worth of report. Twenty-one
+# queries were affected. A rule kept by hand across a registry this size is a
+# rule that is already broken.
+#
+# THE DERIVATION, and every step of it is there because a simpler version was
+# wrong on this registry:
+#
+#   1. Strip `--` comments and single-quoted literals. `WHERE eligible =
+#      'not_evaluable'` must not make `not_evaluable` an identifier, and
+#      `not_evaluable_reason` IS an additive column of trial_matches.
+#   2. Bind table aliases from FROM/JOIN. `FROM runs r` binds r -> runs.
+#      A subquery alias (`) p ON ...`) binds NOTHING, which is the safe answer:
+#      `p.patients` then resolves to no base table and derives nothing.
+#   3. A pair (table, column) is derived only if the query REFERENCES that
+#      table. Without this, `run_degradation_breakdown` -- which reads `runs`
+#      and `run_metrics` and never touches `inferences` -- derives
+#      `inferences.run_id` from the bare `run_id` that is a column of
+#      run_metrics, and the query gets skipped on databases that can answer it.
+#   4. A QUALIFIED reference wins over a bare one. `run_summary` selects
+#      `r.llm_classifier_prompt_version` where r is `runs`, and that column name
+#      is ALSO in INFERENCE_COLUMN_ADDITIONS -- a bare-name match derives
+#      `inferences.llm_classifier_prompt_version`, which that query does not
+#      read, and skips it on every pre-migration database for a column it never
+#      names. This is handled by step 6's stripping and NOT by a special branch:
+#      a first version carried an explicit "every qualifier names another table,
+#      so skip" test, and a revert harness showed that DELETING it changes the
+#      answer for no query in the registry and for no shape this function is
+#      written against. The one input where the two differ -- a name that is
+#      both foreign-qualified AND bare -- is SQL that SQLite itself rejects
+#      ("ambiguous column name"), so the branch could only ever have guarded a
+#      query that cannot run. It was deleted rather than kept with a control
+#      nothing could fire.
+#   5. `AS <name>` is stripped before the bare search, so `COUNT(*) AS run_id`
+#      is not a reference. It is stripped rather than subtracted, so
+#      `COALESCE(query_expansion_path, '(not reported)') AS query_expansion_path`
+#      -- where the same token is both a real read and an output name -- still
+#      derives, correctly.
+#   6. Every `<qualifier>.<name>` occurrence is stripped before the bare search
+#      too, so a column reached ONLY through another table's alias leaves no
+#      bare token behind and derives nothing. That is what makes step 4 true.
+#
+# Steps 3, 4 and 5 each removed a FALSE POSITIVE measured on this registry, not
+# a hypothetical one. The first version of this function reported 25 mismatches;
+# two of them were queries that read no such column.
+#
+# WHAT IT DOES NOT DO, STATED. It is a lexical reader, not a SQL parser.
+#   - A bare additive name in a query that references its table is derived even
+#     if it belongs to another table also referenced there. That is an
+#     OVER-derivation, so its cost is a query skipped on a database that could
+#     have answered it -- never a crash. Deliberately the safe direction.
+#   - A column reached through a name this module cannot see (a `WITH` clause
+#     aliasing a base table, a quoted `"identifier"`, a name built by string
+#     concatenation) is not derived. The registry uses none of those, and the
+#     standing test is what says so: it compares ALL forty-eight declarations,
+#     so a query written in a shape this cannot read fails as a mismatch rather
+#     than passing quietly.
+
+# The additive columns of each table, by table. THE UNION IS THE POINT: an
+# INFERENCE_COLUMN_ADDITIONS entry and a RENAMED_INFERENCE_COLUMNS key fail
+# identically against an old database -- `no such column` -- so the guard has no
+# reason to tell them apart, and taking the union here is what lets one
+# derivation cover both classes.
+#
+# `runs` and `run_metrics` are absent from this map ON PURPOSE: both tables are
+# wholly additive and are declared through `requires`, so no column of either
+# can be individually absent from a database that has the table.
+# database_logger records that a column added to `runs` later gets a
+# RUN_COLUMN_ADDITIONS dict; the standing test fails the day that dict appears
+# and this map has not gained the entry.
+ADDITIVE_COLUMNS = {
+    "inferences": frozenset(INFERENCE_COLUMN_ADDITIONS)
+                  | frozenset(RENAMED_INFERENCE_COLUMNS),
+    "trial_matches": frozenset(TRIAL_MATCH_COLUMN_ADDITIONS),
+}
+
+_SQL_STRING = re.compile(r"'(?:[^']|'')*'")
+_SQL_COMMENT = re.compile(r"--[^\n]*")
+_SQL_TABLE_REF = re.compile(
+    r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)\s*"
+    r"(?:(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?", re.IGNORECASE)
+
+# One more `, <table> [alias]` in a comma-separated FROM list, anchored at the
+# end of the previous item so it cannot match a SELECT-list comma.
+_SQL_FROM_LIST_ITEM = re.compile(
+    r"\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*"
+    r"(?:(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?")
+
+# Words that can follow a table name without being an alias. Not a complete SQL
+# keyword list and does not need to be: a wrongly-bound alias can only make a
+# QUALIFIED reference resolve to the wrong table, and every qualified reference
+# in this registry uses an alias that is bound here.
+_NOT_AN_ALIAS = frozenset({
+    "where", "group", "order", "on", "and", "or", "left", "right", "inner",
+    "outer", "cross", "full", "join", "by", "as", "having", "limit", "union",
+    "when", "then", "else", "end", "using", "natural", "select",
+})
+
+
+def _strip_sql_noise(sql) -> str:
+    """`sql` with comments and string literals replaced by whitespace.
+
+    The literal becomes `' '` rather than nothing so two identifiers either side
+    of one cannot be fused into a third that appears in neither.
+    """
+    return _SQL_COMMENT.sub(" ", _SQL_STRING.sub(" ' ' ", sql))
+
+
+def sql_table_aliases(sql) -> Dict:
+    """`{name: table}` for every base table and alias `sql` binds in FROM/JOIN.
+
+    A table binds itself, so `inferences.x` and `i.x` both resolve when the
+    query wrote `FROM inferences i`. Subquery aliases are absent by
+    construction: the pattern anchors on an identifier after FROM/JOIN, and a
+    subquery opens with `(`.
+    """
+    text = _strip_sql_noise(sql)
+    bound = {}
+    for match in _SQL_TABLE_REF.finditer(text):
+        table, alias = match.group(1), match.group(2)
+        bound[table] = table
+        if alias and alias.lower() not in _NOT_AN_ALIAS:
+            bound[alias] = table
+        # THE COMMA-SEPARATED FROM LIST, continued from where the match ended.
+        # `FROM inferences, trial_matches` binds BOTH; without this it bound the
+        # first and silently lost the second, and losing one is the DANGEROUS
+        # direction -- a table nothing binds derives no column for that table,
+        # the query then declares nothing, and the standing test agrees with it
+        # because both halves missed the same thing. It ends in a crash inside
+        # report() rather than a skip.
+        #
+        # It is a loop from the match END rather than a `,` alternative in the
+        # pattern itself, because `,` alone would match every separator in a
+        # SELECT list and bind selected columns as tables.
+        #
+        # NO REGISTRY QUERY USES THIS FORM TODAY -- measured -- so this is a
+        # guard against the next one, and section 2 pins it.
+        position = match.end()
+        while True:
+            more = _SQL_FROM_LIST_ITEM.match(text, position)
+            if not more:
+                break
+            bound[more.group(1)] = more.group(1)
+            if more.group(2) and more.group(2).lower() not in _NOT_AN_ALIAS:
+                bound[more.group(2)] = more.group(1)
+            position = more.end()
+    return bound
+
+
+def derive_requires_columns(sql) -> tuple:
+    """The `(table, column)` additive pairs `sql` names, in declaration order.
+
+    THE ORDER IS `ADDITIVE_COLUMNS` KEY ORDER THEN COLUMN ORDER WITHIN A TABLE,
+    not order of appearance in the SQL, so the value is a function of the schema
+    rather than of how a query happens to be laid out -- which is what makes a
+    declaration comparable against it without either side sorting.
+    """
+    text = _strip_sql_noise(sql)
+    bound = sql_table_aliases(sql)
+    derived = []
+    for table, columns in ADDITIVE_COLUMNS.items():
+        if table not in bound.values():
+            continue
+        for column in sorted(columns):
+            escaped = re.escape(column)
+            qualifiers = {m.group(1) for m in re.finditer(
+                r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*" + escaped + r"\b", text)}
+            if any(bound.get(q) == table for q in qualifiers):
+                derived.append((table, column))
+                continue
+            bare = re.sub(r"\bAS\s+" + escaped + r"\b", " ", text,
+                          flags=re.IGNORECASE)
+            bare = re.sub(r"\b[A-Za-z_][A-Za-z0-9_]*\s*\.\s*" + escaped + r"\b",
+                          " ", bare)
+            if re.search(r"\b" + escaped + r"\b", bare):
+                derived.append((table, column))
+    return tuple(derived)
+
+
 def missing_requirements(conn, key, present=None) -> tuple:
     """What `key` needs and this database does not have.
 
@@ -2165,6 +2413,76 @@ def unavailable(conn) -> Dict:
     return out
 
 
+# The half of the skip message that names nothing in particular. HOISTED OUT OF
+# ``missing_table_message`` so ``report()`` can print it ONCE above a list of
+# skipped queries instead of once per query -- twenty-one repetitions of the
+# same paragraph is a wall a reader skips, and the names are the part they need.
+# ``run()`` still gets the whole sentence, because a caller meeting a single
+# MissingTableError in a traceback has no list to read it above.
+SCHEMA_ERA_EXPLANATION = (
+    "Most of what this registry can declare is ADDITIVE: "
+    "oncotriage.storage.database_logger.initialize_database creates it, so a "
+    "database last written before it was introduced does not carry it and the "
+    "next writer to open the file adds it. Nothing is wrong with the rows that "
+    "are there."
+)
+
+
+# THE SECOND CLASS, AND IT NEEDS ITS OWN SENTENCE BECAUSE THE FIRST ONE'S
+# ADVICE DOES NOT WORK ON IT.
+#
+# The paragraph above used to be the whole message and it ended "the next writer
+# to open the file adds it". That is TRUE of an INFERENCE_COLUMN_ADDITIONS entry
+# and FALSE of a renamed one -- MEASURED, by renaming a column back on a fresh
+# database and running the real initialize_database over it: the new name did
+# not appear, the old one stayed, and nothing was reported. The migration loop
+# can only ADD, and the CREATE TABLE above it is IF NOT EXISTS, so there is no
+# code path that renames anything.
+#
+# So an operator meeting a renamed column was told to do the one thing that
+# cannot help, would watch it change nothing, and would have no next step. On
+# the production database that was TWELVE of twenty-one skipped queries -- the
+# majority -- which is why this is a separate sentence rather than a hedge in
+# the first.
+RENAME_ERA_EXPLANATION = (
+    "A RENAMED COLUMN IS DIFFERENT AND NO WRITER WILL REPAIR IT: the "
+    "gpt4o -> llm_classifier pass renamed these in place, and the migration "
+    "loop can only ADD columns, so opening this database with a writer will "
+    "NOT produce them. The data is present under the pre-rename name shown "
+    "beside each. These queries can only run against a database written since "
+    "the rename."
+)
+
+
+def renamed_predecessor(absent):
+    """The pre-rename spelling of `absent`, or ``None`` when it is not a rename.
+
+    `absent` is one entry as ``missing_requirements`` reports it: a bare table
+    name, or ``'table.column'``. A table is never a rename, and only
+    ``inferences`` was renamed, so both fall through to ``None``.
+    """
+    if "." not in absent:
+        return None
+    table, _, column = absent.partition(".")
+    if table != "inferences":
+        return None
+    return RENAMED_INFERENCE_COLUMNS.get(column)
+
+
+def rename_note(absent) -> str:
+    """``'new (was old), ...'`` for the renamed entries in `absent`, else ``''``.
+
+    ONE OWNER, because ``report()`` prints it under a skip list and
+    ``missing_table_message`` appends it to a single raise, and a reader meeting
+    a column in a log and in a traceback must be told the same thing about it.
+    """
+    pairs = [(name, renamed_predecessor(name)) for name in absent]
+    renamed = [f"{name} (was {old})" for name, old in pairs if old]
+    if not renamed:
+        return ""
+    return f" {RENAME_ERA_EXPLANATION} Affected here: {', '.join(renamed)}."
+
+
 def missing_table_message(key, absent) -> str:
     """The one sentence printed and raised when a table is not there.
 
@@ -2181,15 +2499,8 @@ def missing_table_message(key, absent) -> str:
     # and a pass that has nothing to do with them. The mechanism is the same for
     # every additive name in this schema, so the sentence describes the
     # mechanism and lets the first clause name what is actually absent.
-    return (
-        f"query {key!r} needs {', '.join(absent)}, which this database "
-        f"does not have. Every table and column this registry can declare is "
-        f"ADDITIVE: "
-        f"oncotriage.storage.database_logger.initialize_database creates it, so "
-        f"a database last written before it was introduced does not carry it "
-        f"and the next writer to open the file adds it. Nothing is wrong with "
-        f"the rows that are there."
-    )
+    return (f"query {key!r} needs {', '.join(absent)}, which this database "
+            f"does not have. {SCHEMA_ERA_EXPLANATION}{rename_note(absent)}")
 
 
 def run(conn, key) -> pd.DataFrame:
@@ -2825,12 +3136,36 @@ def report(conn, out=console.out) -> Dict:
     out(fetch_raw(conn, RAW_INFERENCES_SQL))
 
     if skipped:
+        # THE SKIP LIST NAMES, PER QUERY, WHAT THAT QUERY IS MISSING.
+        #
+        # It used to print one union of every absent name and one sentence
+        # naming the ALPHABETICALLY FIRST skipped key -- so the sentence read
+        # "query 'run_attribution_coverage' needs <twenty names>", attributing
+        # to one query nineteen columns it does not read. That was survivable
+        # while three queries were ever skipped together and the union was
+        # nearly one query's worth. It is not survivable now: against the
+        # production database twenty-one queries skip on sixteen distinct
+        # absent names, and an operator's next question is always "which
+        # query lost what", which the union cannot answer.
+        #
+        # The aggregate lines are KEPT above the per-query ones. The counts are
+        # what says the report covers less than its registry, and a reader
+        # scanning for "is anything missing" should not have to total a list.
         _absent = sorted({t for tables in skipped.values() for t in tables})
         out(f"=== {len(skipped)} QUERY/QUERIES SKIPPED: TABLE(S) OR COLUMN(S) "
             f"NOT IN THIS DATABASE ===")
-        out(f"absent: {', '.join(_absent)}")
-        out(f"skipped: {', '.join(sorted(skipped))}")
-        out(missing_table_message(sorted(skipped)[0], _absent))
+        out(f"absent ({len(_absent)}): {', '.join(_absent)}")
+        out(f"skipped ({len(skipped)} of {len(QUERIES)}): "
+            f"{', '.join(sorted(skipped))}")
+        out(SCHEMA_ERA_EXPLANATION)
+        # THE RENAME CLASS, ONCE, ABOVE THE LIST. Printed only when one is
+        # actually absent, so a database whose skips are purely additive is not
+        # told about a mechanism that did not affect it.
+        _rename_note = rename_note(_absent)
+        if _rename_note:
+            out(_rename_note.strip())
+        for _key in sorted(skipped):
+            out(f"  {_key}: {', '.join(skipped[_key])}")
         out("\n")
 
     for query in QUERIES:

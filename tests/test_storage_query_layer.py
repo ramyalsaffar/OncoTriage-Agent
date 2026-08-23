@@ -1297,10 +1297,29 @@ check("...naming the tables AND the column it does not have",
 check("...and the query that needs no column names only the tables",
       queries.unavailable(_legacy_conn)["run_degradation_breakdown"],
       queries.RUN_TABLES)
-check("...and no OTHER query is reported unavailable (non-degeneracy: a check "
-      "that reported everything would pass the line above too)",
-      len(queries.unavailable(_legacy_conn)),
-      sum(1 for q in queries.QUERIES if q.requires or q.requires_columns))
+# THIS ASKS "IS EVERY UNAVAILABLE QUERY ONE THAT DECLARED SOMETHING", NOT "ARE
+# THE TWO COUNTS EQUAL", and the difference is what the schema-guards pass had
+# to correct here. The count identity held only while the ONLY declarations in
+# the registry were ones this particular database happens to violate -- a
+# coincidence, not an invariant. It stopped holding the moment the gpt4o rename
+# was declared: this database is a CURRENT one with the run tables and `run_id`
+# removed, so it HAS every `llm_classifier_*` column, and 28 queries now declare
+# while 5 are unavailable. The comment above already records the author fixing
+# an earlier version of the same coincidence (`sum(1 for q if q.requires)`);
+# this is the same lesson one step further. A subset test is the property the
+# label claims and it cannot go stale as the registry grows.
+check("...and no query WITHOUT a declaration is reported unavailable "
+      "(non-degeneracy: a check that reported everything would pass the line "
+      "above too)",
+      sorted(k for k in queries.unavailable(_legacy_conn)
+             if not (queries.QUERIES_BY_KEY[k].requires
+                     or queries.QUERIES_BY_KEY[k].requires_columns)),
+      [])
+check("...and strictly more queries declare a requirement than this database "
+      "violates, so the line above is a real subset rather than an identity",
+      len(queries.unavailable(_legacy_conn))
+      < sum(1 for q in queries.QUERIES if q.requires or q.requires_columns),
+      True)
 check("...and the count is not the whole registry, which is what the line "
       "above would also satisfy if `unavailable` had stopped discriminating",
       len(queries.unavailable(_legacy_conn)) < len(queries.QUERIES), True)

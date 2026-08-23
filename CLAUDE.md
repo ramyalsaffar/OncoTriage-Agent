@@ -408,7 +408,7 @@ python tests/test_registries_cancer_code_claims_audit_control.py   #  16; 14 pla
 python tests/test_config_snapshot_date_rot.py                      #  10; 6 subprocess runs, ~6 min
 python tests/test_package_invariants.py                            # 260/0/0 on macOS (was 247 before section 2f(iii)); 245/2/2 on Linux was measured at 247 and has not been re-measured there (was 234/6 there before commit ec2033a gave it a SKIP mechanism). No network, no keys, no corpus. NOT in CI — see below
 python tests/test_degraded_dependencies.py                         # 174 (was 172 in this note, and 170 before pass 20e; the 172 was never true of the file). Item 11a
-python tests/test_storage_query_layer.py                           # 260 (was 194; the run-reader pass added section 2b over `runs` / `run_metrics`); item 38, temp SQLite only
+python tests/test_storage_query_layer.py                           # 310 (this line said 260 and was stale by 50 before the schema-guards pass touched it; MEASURED 2026-08-23. The +1 that pass added is the non-degeneracy split described below); item 38, temp SQLite only
 
 # The four added by pass 20f-1. Same shape, same directory, no network, no keys,
 # no spend, and none of them writes anything in the repository.
@@ -595,6 +595,21 @@ python tests/test_storage_run_metrics_flush.py                      # 123
 # different INPUT to a pure function, a real failing condition created on disk,
 # or an ast walk over an in-memory copy. Bucket A, ~1.5 s.
 python tests/test_storage_run_identity.py                           # 121
+
+# The schema-guards pass. Same shape, same directory. No network, no keys, no
+# spend, no live Qdrant, no model load, no corpus, no git history, no live
+# server, and NOT in the collision matrix -- every database is inside a
+# tempfile.mkdtemp it removes and asserts gone, and the two package files it
+# reads (storage/queries.py, storage/database_logger.py) are written by neither
+# of the suite's two writers and are sha256-compared at the end. THE PRODUCTION
+# DATABASE IS NEVER OPENED, not even read-only: the pre-migration shape section
+# 6 drives report() against is BUILT from database_logger's own constants by
+# renaming and dropping columns on a fresh database, which is why the CI
+# skeleton and the developer tree give the same number. It EXECS NOTHING: every
+# control is a different INPUT to a pure function, a real database built into a
+# real failing shape, or a module constant rebound inside try/finally with the
+# restore asserted. Bucket A, ~1.6 s.
+python tests/test_storage_schema_guards.py                          #  84
 
 # The CI-hygiene pair. Same shape, same directory. Neither imports anything
 # from the package -- their subjects are `.github/scripts/` and
