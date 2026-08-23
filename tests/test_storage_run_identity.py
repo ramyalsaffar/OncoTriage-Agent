@@ -391,12 +391,48 @@ def tables_of(db):
         conn.close()
 
 
+class _Row(dict):
+    """A result row whose MISSING key is a named absence, not a KeyError.
+
+    THE FIX BELONGS HERE AND NOT AT THE TWELVE CALL SITES. Callers read columns
+    as `r["patient_id"]`, and when a planted defect makes a query fail or return
+    a different shape, every one of those subscripts raises -- aborting the file
+    at the moment it owes a summary. Guarding `rows()` alone was not enough: it
+    made the FETCH safe and left the DERIVED read raising one line later, which
+    a revert harness measured twice.
+
+    The absence NAMES the columns that did come back, so a failure reads as
+    "this query returned {...}" rather than as a bare key name.
+    """
+
+    def __missing__(self, key):
+        return f"<no column {key!r}; row has {sorted(self)}>"
+
+
 def rows(db, sql, params=()):
-    """Every row of `sql` as a list of dicts. Read-only."""
-    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    """Every row of `sql` as a list of dicts. Read-only. NEVER RAISES.
+
+    THE GUARD IS NOT PADDING AND IT WAS ADDED FROM A MEASURED ABORT. `one()`
+    below returns a NAMED ABSENCE dict when a query finds nothing, which is
+    correct for a `check()` comparison and fatal when that value is then BOUND
+    as a parameter to the next query -- sqlite3 raises `type 'dict' is not
+    supported`. A revert harness that broke the `runs` migration produced
+    exactly that: no run row was created, the absence dict was bound, and this
+    file reported ONE TRACEBACK where it owed a summary and 133 results.
+
+    A failure is returned as a single named row so it reaches a `check()` and
+    is REPORTED, rather than either aborting or -- worse -- coming back as an
+    empty list that reads like "the query ran and found nothing".
+    """
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except BaseException as exc:                       # noqa: BLE001 -- reported
+        return [{"__query_failed__": f"connect: {type(exc).__name__}: {exc}"}]
     conn.row_factory = sqlite3.Row
     try:
-        return [dict(r) for r in conn.execute(sql, params)]
+        return [_Row(r) for r in conn.execute(sql, params)]
+    except BaseException as exc:                       # noqa: BLE001 -- reported
+        return [_Row({"__query_failed__": f"{type(exc).__name__}: {exc}"})]
     finally:
         conn.close()
 
@@ -519,10 +555,18 @@ check("RUN_RECORD_STATUSES is the terminal set plus RUNNING, and nothing else",
       sorted(set(_dl.RUN_RECORD_TERMINAL_STATUSES) |
              {_dl.RUN_RECORD_STATUS_RUNNING}))
 
-check("RUN_COLUMNS is the four run facts followed by the stamp columns",
+# THE ADDITIONS ARE PART OF THE EXPECTATION AND ARE DERIVED LIKE THE REST.
+# `runs` gained its first ALTER-added column with `resumed`; the INSERT binds
+# positionally against this tuple, so the ORDER is what matters -- base facts,
+# then the stamp, then the additions in dict order, which is the order ALTER
+# TABLE appends them in.
+check("RUN_COLUMNS is the four run facts, the stamp columns, then the additions",
       list(_dl.RUN_COLUMNS),
       ["started_at", "finished_at", "status", "invocation_source"] +
-      list(_dl.RUN_FINGERPRINT_COLUMNS))
+      list(_dl.RUN_FINGERPRINT_COLUMNS) + list(_dl.RUN_COLUMN_ADDITIONS))
+check("...and the additions really contribute (non-degeneracy: with an empty "
+      "dict the line above is the pre-additions check wearing a new label)",
+      len(_dl.RUN_COLUMN_ADDITIONS) > 0, True)
 
 check("the integer columns are named and are a SUBSET of the stamp columns",
       sorted(_dl.RUN_FINGERPRINT_INTEGER_COLUMNS),
@@ -1181,9 +1225,15 @@ _SEEN = []
 
 
 def _recording_process_patient(fhir_path=None, graph=None, is_resample=False,
-                              run_id=None):
+                              run_id=None, db_path=None):
+    # `db_path` IS AN EXPLICIT PARAMETER, NOT **kwargs, and it is recorded.
+    # The path-unification pass added it to the real process_patient, and this
+    # stand-in's fixed signature is what turned that into a loud failure here
+    # rather than a silent divergence -- which is the property worth keeping, so
+    # the parameter is named rather than absorbed. Recording it is what lets
+    # section 11 assert that every worker was handed the SAME destination.
     _SEEN.append({"stem": Path(fhir_path).stem, "is_resample": is_resample,
-                  "run_id": run_id})
+                  "run_id": run_id, "db_path": db_path})
     return {"patient_id": Path(fhir_path).stem, "status": "error",
             "eligible_matches": 0, "near_misses": 0, "not_evaluable": 0,
             "total_time": 0.01, "timestamp": "2026-08-21T12:00:00",

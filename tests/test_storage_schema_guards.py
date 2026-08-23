@@ -254,6 +254,21 @@ def quiet():
         yield buf
 
 
+def sql_one(conn, statement, params=()):
+    """One row, or a named absence. NEVER RAISES.
+
+    `SELECT resumed FROM runs` raises OperationalError when the column is not
+    there -- which is precisely the state these checks exist to catch -- so a
+    bare call aborts the file at the moment it owes a summary. A revert harness
+    proved it: removing the column or the migration loop aborted this file
+    rather than failing it.
+    """
+    try:
+        return conn.execute(statement, params).fetchone()
+    except BaseException as exc:                       # noqa: BLE001 -- reported
+        return f"<raised {type(exc).__name__}: {exc}>"
+
+
 def fresh_db(path, version=None):
     """A real database through the real ``initialize_database``.
 
@@ -289,6 +304,14 @@ def sha256(path):
     with open(path, "rb") as handle:
         return hashlib.sha256(handle.read()).hexdigest()
 
+
+# THE ERA AS THIS PROCESS FOUND IT. Section 5 rebinds the constant to simulate a
+# later era and must put it back; the restoration check compares against THIS,
+# never against a literal. A literal would make every legitimate bump fail a test
+# whose subject is not the number -- and the constant's own rule is that it gets
+# bumped, so a test that breaks on a bump is a test people learn to edit rather
+# than read.
+_ERA_AT_IMPORT = _dl.SCHEMA_USER_VERSION
 
 _TMP = tempfile.mkdtemp(prefix="oncotriage_schema_guards_")
 
@@ -415,10 +438,21 @@ check("2c a column qualified with an alias for ANOTHER table is not this "
           "SELECT r.llm_classifier_prompt_version FROM runs r "
           "LEFT JOIN inferences i ON i.run_id = r.id"),
       (("inferences", "run_id"),))
-check("2d ...and the real registry case agrees: run_summary declares run_id "
-      "and NOT llm_classifier_prompt_version",
-      sorted(c for (t, c) in _q.QUERIES_BY_KEY["run_summary"].requires_columns),
-      ["run_id"])
+# THE PROPERTY IS ONE NAME'S ABSENCE, NOT THE WHOLE SET. The first version
+# pinned `== ["run_id"]`, which broke the moment run_summary legitimately gained
+# `runs.resumed` -- a pin that fails on a correct change teaches people to edit
+# the test. What must stay true is that the column reached only through `r.`
+# (an alias for `runs`) is not attributed to `inferences`.
+check("2d ...and the real registry case agrees: run_summary does NOT declare "
+      "llm_classifier_prompt_version, which it reads only as `r.<name>` where "
+      "r is `runs`",
+      [c for (t, c) in _q.QUERIES_BY_KEY["run_summary"].requires_columns
+       if c == "llm_classifier_prompt_version"],
+      [])
+check("2d-i ...and it DOES declare the column it reads bare off `inferences` "
+      "(non-degeneracy: a query declaring nothing would satisfy 2d too)",
+      ("inferences", "run_id")
+      in _q.QUERIES_BY_KEY["run_summary"].requires_columns, True)
 
 # (c) `AS <name>` IS AN OUTPUT NAME, NOT A READ.
 check("2e a bare `<expr> AS <additive name>` is not a reference",
@@ -563,6 +597,151 @@ check("3i no run table is in the additive map, and this fails the day "
       hasattr(_dl, "RUN_COLUMN_ADDITIONS")
       and "runs" not in _q.ADDITIVE_COLUMNS,
       False)
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
+# 3b. THE `runs` MIGRATION -- THE FIRST COLUMN EVER ADDED TO THAT TABLE
+# ===========================================================================
+#
+# The table's schema comment carried an argued ABSENCE: no dict and no loop
+# while there was nothing to migrate, because an empty loop passes for free.
+# `resumed` is the first entry, so the dict and the loop exist now and this is
+# what says they work on a database that predates them.
+
+print("\n=== 3b. the runs migration ===")
+
+check_true("3b-a RUN_COLUMN_ADDITIONS is non-empty, so the loop has something "
+           "to do (the argued reason it did not exist before)",
+           len(_dl.RUN_COLUMN_ADDITIONS) > 0)
+check("3b-b every added column is on a fresh `runs` table",
+      sorted(c for c in _dl.RUN_COLUMN_ADDITIONS
+             if c not in frozenset(
+                 r[1] for r in _FRESH_CONN.execute("PRAGMA table_info(runs)"))),
+      [])
+check("3b-c ...and every one is written by start_run_record, so a column can "
+      "not be added to the schema and left unwritten",
+      sorted(c for c in _dl.RUN_COLUMN_ADDITIONS
+             if c not in _dl.RUN_COLUMNS),
+      [])
+check("3b-d ...in the order ALTER TABLE appends them, which is what the "
+      "positional INSERT binds against",
+      list(_dl.RUN_COLUMNS[-len(_dl.RUN_COLUMN_ADDITIONS):]),
+      list(_dl.RUN_COLUMN_ADDITIONS))
+
+# A DECLARED COLUMN WITH NO VALUE FAILS BY NAME. 3b-c is the standing structural
+# check; this is the runtime diagnosis behind it, because the two catch the same
+# defect at different moments and only one of them runs in production.
+_UNSET_DB = os.path.join(_TMP, "unset_column.db")
+fresh_db(_UNSET_DB)
+_real_run_columns = _dl.RUN_COLUMNS
+try:
+    _dl.RUN_COLUMNS = _real_run_columns + ("a_column_nothing_sets",)
+    with quiet():
+        _unset_result = guarded(_dl.start_run_record, "batch",
+                                db_path=_UNSET_DB, resumed=True)
+finally:
+    _dl.RUN_COLUMNS = _real_run_columns
+check("3b-d-i a column RUN_COLUMNS declares and start_run_record does not set "
+      "raises by NAME, rather than a bare KeyError from inside the bind",
+      isinstance(_unset_result, Raised)
+      and "a_column_nothing_sets" in _unset_result.text
+      and _unset_result.text.startswith("RuntimeError"), True)
+check("3b-d-ii ...and RUN_COLUMNS was restored",
+      _dl.RUN_COLUMNS is _real_run_columns, True)
+
+# THE MIGRATION, DRIVEN FOR REAL against a database in the pre-`resumed` shape.
+# Built by dropping the column off a fresh one and resetting the stamp, so the
+# shape comes from this module's own constants rather than from a fixture.
+_PRE_RUNS = os.path.join(_TMP, "pre_resumed.db")
+fresh_db(_PRE_RUNS)
+_pre_conn = sqlite3.connect(_PRE_RUNS)
+_pre_run_id = guarded(_dl.start_run_record, "batch", db_path=_PRE_RUNS,
+                      resumed=True)
+# THE DROP IS GUARDED. With the migration loop reverted no database ever gains
+# these columns, so the DROP raises `no such column` -- in the setup for the
+# section written to catch that revert. Measured, not anticipated: it aborted
+# the file. Check 3b-e below asserts the columns really are absent afterwards,
+# so tolerating a failed DROP cannot make the arm silently identical.
+for _column in _dl.RUN_COLUMN_ADDITIONS:
+    try:
+        _pre_conn.execute(f"ALTER TABLE runs DROP COLUMN {_column}")
+    except BaseException:                              # noqa: BLE001 -- 3b-e reports
+        pass
+_pre_conn.execute("PRAGMA user_version = 1")
+_pre_conn.commit()
+
+check("3b-e the pre-migration database really lacks the added columns "
+      "(non-degeneracy: with them present the migration below proves nothing)",
+      sorted(c for c in _dl.RUN_COLUMN_ADDITIONS
+             if c in frozenset(r[1] for r in
+                               _pre_conn.execute("PRAGMA table_info(runs)"))),
+      [])
+check("3b-f ...and carries the earlier era", user_version(_PRE_RUNS), 1)
+check_true("3b-g ...and holds a run row written before the column existed",
+           _pre_conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1)
+
+_PRE_LOG = fresh_db(_PRE_RUNS)
+_pre_conn2 = sqlite3.connect(_PRE_RUNS)
+check("3b-h a writer opening it adds every column",
+      sorted(c for c in _dl.RUN_COLUMN_ADDITIONS
+             if c not in frozenset(r[1] for r in
+                                   _pre_conn2.execute("PRAGMA table_info(runs)"))),
+      [])
+check("3b-i ...and ANNOUNCES each, so the migration is not silent",
+      all(f"runs.{c}" in _PRE_LOG for c in _dl.RUN_COLUMN_ADDITIONS), True)
+check("3b-j ...and the existing row keeps NULL rather than being given a value "
+      "nobody recorded -- a run that predates the column did not measure 0",
+      sql_one(_pre_conn2, "SELECT resumed FROM runs"), (None,))
+check("3b-k ...and the era moved with the schema, in one open",
+      user_version(_PRE_RUNS), _dl.SCHEMA_USER_VERSION)
+_pre_conn.close()
+_pre_conn2.close()
+
+# THE THREE VALUES ROUND-TRIP, and the two that are not NULL are INTEGERS.
+# `collection_points` next door records what a non-integer in an
+# INTEGER-affinity column costs: SQLite keeps TEXT as TEXT and orders it above
+# every integer, so `WHERE resumed = 1` would silently miss it.
+_RESUMED_DB = os.path.join(_TMP, "resumed.db")
+fresh_db(_RESUMED_DB)
+# GUARDED. With the `runs` migration reverted the INSERT names a column the
+# table does not have and this raises -- in the setup for the section that
+# exists to catch that revert. `guarded` turns it into a value the checks below
+# fail on, so the file reaches its summary. Measured, not anticipated.
+with quiet():
+    _r_yes = guarded(_dl.start_run_record, "batch", db_path=_RESUMED_DB,
+                     resumed=True)
+    _r_no = guarded(_dl.start_run_record, "batch", db_path=_RESUMED_DB,
+                    resumed=False)
+    _r_unset = guarded(_dl.start_run_record, "batch", db_path=_RESUMED_DB)
+_resumed_conn = sqlite3.connect(_RESUMED_DB)
+check("3b-l resumed=True is stored as the INTEGER 1",
+      sql_one(_resumed_conn,
+              "SELECT resumed, typeof(resumed) FROM runs WHERE id = ?",
+              (_r_yes,)), (1, "integer"))
+check("3b-m resumed=False is stored as the INTEGER 0, which is a MEASURED "
+      "'not a resume' and not an absence",
+      sql_one(_resumed_conn,
+              "SELECT resumed, typeof(resumed) FROM runs WHERE id = ?",
+              (_r_no,)), (0, "integer"))
+check("3b-n an unset resumed is NULL, which is 'not recorded' -- a third "
+      "reading, and the one every historical row has",
+      sql_one(_resumed_conn,
+              "SELECT resumed, typeof(resumed) FROM runs WHERE id = ?",
+              (_r_unset,)), (None, "null"))
+check("3b-o ...so 0 and NULL are separable IN SQL, which is the whole reason "
+      "the third value exists",
+      sql_one(_resumed_conn,
+              "SELECT COUNT(*) FROM runs WHERE resumed = 0"), (1,))
+check("3b-p ...and a truthy non-bool is coerced rather than stored as itself",
+      sql_one(_resumed_conn,
+              "SELECT typeof(resumed) FROM runs WHERE id = ?",
+              (guarded(_dl.start_run_record, "batch", db_path=_RESUMED_DB,
+                       resumed="yes"),)),
+      ("integer",))
+_resumed_conn.close()
 
 
 #------------------------------------------------------------------------------
@@ -718,7 +897,7 @@ check_true("5g ...and the transition is announced with both numbers",
            "Schema stamp" in _BUMPED_LOG
            and str(_dl.SCHEMA_USER_VERSION + 1) in _BUMPED_LOG)
 check("5h ...and the rebinding was restored, so no later check is reading a "
-      "patched constant", _dl.SCHEMA_USER_VERSION, 1)
+      "patched constant", _dl.SCHEMA_USER_VERSION, _ERA_AT_IMPORT)
 
 # NEVER LOWERED. The database is now at era N+1 and this code is era N. Because
 # this schema is strictly additive -- nothing here drops a column, a table or an

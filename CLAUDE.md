@@ -408,7 +408,7 @@ python tests/test_registries_cancer_code_claims_audit_control.py   #  16; 14 pla
 python tests/test_config_snapshot_date_rot.py                      #  10; 6 subprocess runs, ~6 min
 python tests/test_package_invariants.py                            # 260/0/0 on macOS (was 247 before section 2f(iii)); 245/2/2 on Linux was measured at 247 and has not been re-measured there (was 234/6 there before commit ec2033a gave it a SKIP mechanism). No network, no keys, no corpus. NOT in CI — see below
 python tests/test_degraded_dependencies.py                         # 174 (was 172 in this note, and 170 before pass 20e; the 172 was never true of the file). Item 11a
-python tests/test_storage_query_layer.py                           # 310 (this line said 260 and was stale by 50 before the schema-guards pass touched it; MEASURED 2026-08-23. The +1 that pass added is the non-degeneracy split described below); item 38, temp SQLite only
+python tests/test_storage_query_layer.py                           # 317 (this line said 260 and was stale by 50 before the schema-guards pass; the crash-record pass added the dangling-reference audit's seeding and checks; MEASURED 2026-08-23); item 38, temp SQLite only
 
 # The four added by pass 20f-1. Same shape, same directory, no network, no keys,
 # no spend, and none of them writes anything in the repository.
@@ -594,7 +594,7 @@ python tests/test_storage_run_metrics_flush.py                      # 123
 # neither of the suite's two writers. It EXECS NOTHING: every control is a
 # different INPUT to a pure function, a real failing condition created on disk,
 # or an ast walk over an in-memory copy. Bucket A, ~1.5 s.
-python tests/test_storage_run_identity.py                           # 121
+python tests/test_storage_run_identity.py                           # 134 (was 121; the `resumed` column added the additions-order check and its non-degeneracy probe)
 
 # The schema-guards pass. Same shape, same directory. No network, no keys, no
 # spend, no live Qdrant, no model load, no corpus, no git history, no live
@@ -609,7 +609,22 @@ python tests/test_storage_run_identity.py                           # 121
 # control is a different INPUT to a pure function, a real database built into a
 # real failing shape, or a module constant rebound inside try/finally with the
 # restore asserted. Bucket A, ~1.6 s.
-python tests/test_storage_schema_guards.py                          #  84
+python tests/test_storage_schema_guards.py                          # 101 (was 84; the crash-record pass added section 3b over the `runs` migration)
+
+# The crash-record / path-unification pass. Same shape, same directory. No
+# network, no keys, NO SPEND, no live Qdrant, no model load, no corpus, no git
+# history, no live server, and NOT in the collision matrix -- every database and
+# FHIR file is inside a tempfile.mkdtemp it removes and asserts gone, and the
+# two package files it reads (batch/runner.py, storage/database_logger.py) are
+# written by neither of the suite's two writers and are sha256-compared at the
+# end. It DRIVES THE REAL main() four times: a planted mid-batch crash, a clean
+# run, a mid-run ONCOTRIAGE_INFERENCES_DB hijack and a fresh/resumed pair. The
+# BM25 index, the graph, the tracking module and process_patient are stand-ins
+# and THE GRAPH IS NEVER INVOKED, so no billed call is reachable; run_batch,
+# _on_done, flush_health, start_run_record, finalize_run_record,
+# reconcile_writes, print_summary and both crash handlers are the real thing.
+# It EXECS NOTHING. Bucket A, ~11 s (two real thread pools per drive).
+python tests/test_runner_crash_record_and_db_unification.py         #  65
 
 # The CI-hygiene pair. Same shape, same directory. Neither imports anything
 # from the package -- their subjects are `.github/scripts/` and

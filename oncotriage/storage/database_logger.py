@@ -227,7 +227,9 @@ def resolve_inference_db_path(db_path=None):
 # where they started. It answers one question -- which era is this file -- for
 # a human, a support script, or a future tool that must refuse a database it
 # does not understand.
-SCHEMA_USER_VERSION = 1
+# ERA 2: `runs.resumed`, added with RUN_COLUMN_ADDITIONS and its migration loop.
+# ERA 1: the constant's own introduction -- the schema as it stood then.
+SCHEMA_USER_VERSION = 2
 
 
 #------------------------------------------------------------------------------
@@ -886,6 +888,49 @@ INFERENCE_COLUMN_ADDITIONS = {
 #------------------------------------------------------------------------------
 
 
+# Schema migration for the runs table.
+#
+# THE FIRST ENTRY CREATED THIS DICT, which is what the schema comment at the
+# `runs` CREATE TABLE instructed: the table was new when it was written, so an
+# empty dict would have been a loop iterating nothing and passing for free --
+# the shape pass 20f-3 deleted `_REEXPORT_EXEMPTIONS` for rather than emptying.
+# It has something to do now.
+#
+# `resumed` -- WAS THIS CAMPAIGN A RESUME. 1 when the checkpoint handed main()
+# a non-empty completed set, 0 when it did not, NULL on every row written before
+# this column existed. Three values and all three are readings:
+#
+#   NULL  this run predates the column. NOT "we did not check" and not 0 --
+#         a run that was not a resume is a MEASURED 0, and collapsing the two
+#         would make every historical row assert something nobody recorded.
+#         Same rule as `hallucinated` and `collection_points` next door.
+#   0     the checkpoint was empty or absent: this campaign started from
+#         nothing.
+#   1     the checkpoint named at least one completed patient, so some of the
+#         rows this run is attributed to were written by an EARLIER process.
+#
+# WHY IT IS WORTH A COLUMN. A resumed run's `runs` row already lies about two
+# things by construction, and only this column says so: its `started_at` is when
+# the LAST process started, not when the campaign did, and its patient count
+# through `inferences.run_id` covers only the patients THIS process wrote --
+# every patient the earlier process completed carries the EARLIER run's id.
+# So `patients` on a resumed row is a fragment of the campaign, and a reader
+# with no way to tell a resumed run from a fresh one reads that fragment as
+# the whole.
+#
+# IT IS WRITTEN FROM THE SAME FACT THE MLflow TAG READS -- the truthiness of
+# the checkpoint-derived completed set, at the same point in main(), passed as
+# one argument. Two records of one fact that are computed twice are two records
+# that can disagree; oncotriage/batch/runner.py takes the boolean once and hands
+# it to both.
+RUN_COLUMN_ADDITIONS = {
+    "resumed": "INTEGER",
+}
+
+
+#------------------------------------------------------------------------------
+
+
 # WHAT THE gpt4o -> llm_classifier RENAME LEFT ON DISK.
 #
 # The naming pass renamed nine columns of `inferences` in place in the CREATE
@@ -1305,7 +1350,8 @@ plausible-looking lie.
 """
 
 RUN_COLUMNS = ("started_at", "finished_at", "status",
-               "invocation_source") + RUN_FINGERPRINT_COLUMNS
+               "invocation_source") + RUN_FINGERPRINT_COLUMNS \
+              + tuple(RUN_COLUMN_ADDITIONS)
 """Every column ``start_run_record`` writes, in the CREATE TABLE's order.
 
 ONE DECLARATION. The INSERT's column list and its placeholder count are both
@@ -1316,6 +1362,17 @@ as many words that a loop there would put the column order in two places. That
 argument is about a tuple whose values are hand-picked per column. This one's
 values are looked up BY NAME out of a dict, so deriving the list removes a
 failure mode instead of hiding one.
+
+RUN_COLUMN_ADDITIONS IS APPENDED RATHER THAN LISTED, so an entry added to that
+dict is written by this INSERT without a second edit here. The order matches the
+migration's: base columns in CREATE TABLE order, then additions in dict order,
+which is the order ALTER TABLE appends them in -- so the tuple describes the
+real column order of a migrated table rather than a plausible one.
+
+A COLUMN IN THAT DICT MUST THEREFORE HAVE A KEY IN start_run_record's `values`,
+and a KeyError at the INSERT is what says it does not. That is the intended
+failure: silent is the alternative, and a column added to the schema and never
+written is the shape this project treats as a defect.
 """
 
 
@@ -1922,18 +1979,19 @@ CREATE TABLE IF NOT EXISTS runs (
 )
 ''')
 
-    # NO `RUN_COLUMN_ADDITIONS` DICT, AND THE ABSENCE IS ARGUED.
-    #
-    # The two tables below each carry one because they PREDATE their own later
-    # columns; this table is new, so such a dict would be empty, and a `for
-    # _column in {}:` loop iterates nothing and passes for free. That is the
-    # shape pass 20f-3 deleted `_REEXPORT_EXEMPTIONS` for rather than emptying
-    # it: a check that has stopped checking looks exactly like one that works.
-    #
-    # A COLUMN ADDED TO THIS TABLE LATER GETS THE DICT AND THE LOOP, copied from
-    # the two below, in the same commit that adds the column -- at which point
-    # the loop has something to do. Until then the CREATE above is the whole
-    # declaration and `CREATE TABLE IF NOT EXISTS` is the whole idempotence.
+    # THE DICT AND THE LOOP EXIST NOW, on the instruction the comment they
+    # replace gave: "a column added to this table later gets the dict and the
+    # loop, copied from the two below, in the same commit that adds the column
+    # -- at which point the loop has something to do." `resumed` is that column
+    # and this is that commit. The shape below is copied from the two migrations
+    # further down, not re-derived.
+    _existing_run_columns = {
+        row[1] for row in cursor.execute("PRAGMA table_info(runs)")
+    }
+    for _column, _sql_type in RUN_COLUMN_ADDITIONS.items():
+        if _column not in _existing_run_columns:
+            cursor.execute(f"ALTER TABLE runs ADD COLUMN {_column} {_sql_type}")
+            console.out(f"Schema migration: added runs.{_column}")
 
     # Inferences table
     # candidates_filtered INTEGER is for trials sent to GPT-4o (after quality threshold + cost cap)
@@ -2243,7 +2301,8 @@ def _run_fingerprint_value(column, fingerprint):
     return str(raw)
 
 
-def start_run_record(invocation_source, db_path=None, fingerprint=None):
+def start_run_record(invocation_source, db_path=None, fingerprint=None,
+                     resumed=None):
     """Open a run row at db_path and return its ``runs.id``.
 
     Args:
@@ -2314,6 +2373,43 @@ def start_run_record(invocation_source, db_path=None, fingerprint=None):
     }
     for column in RUN_FINGERPRINT_COLUMNS:
         values[column] = _run_fingerprint_value(column, fingerprint)
+
+    # WAS THIS A RESUME. Three values, and the coercion is what keeps the
+    # column readable:
+    #
+    #   None -> NULL, meaning NOT RECORDED. Two callers reach it -- a row
+    #           written before this column existed, and a caller with no
+    #           checkpoint concept to report. Both are "nobody measured this",
+    #           which is a different fact from a measured 0, exactly as
+    #           `hallucinated`'s NULL is different from its 0.
+    #   else -> `int(bool(...))`, so the column holds 0 or 1 and NOTHING ELSE.
+    #           Not the caller's object, and not `True`/`False` left to
+    #           sqlite3's own adaptation: `collection_points` next door records
+    #           what a non-integer in an INTEGER-affinity column costs -- SQLite
+    #           keeps a TEXT value as TEXT whatever the declared affinity and
+    #           orders every TEXT above every INTEGER, so `WHERE resumed = 1`
+    #           would silently miss it.
+    values["resumed"] = None if resumed is None else int(bool(resumed))
+
+    # EVERY DECLARED COLUMN HAS A VALUE, CHECKED BEFORE THE INSERT.
+    #
+    # `RUN_COLUMNS` is derived from `RUN_COLUMN_ADDITIONS`, so adding an entry
+    # to that dict adds a column to this INSERT -- and if nothing here sets it,
+    # the bind below raises a bare `KeyError: 'the_name'` from inside a
+    # generator expression, thirty frames from the dict that caused it. The
+    # failure is correct (a column added to the schema and never written is the
+    # shape this project treats as a defect) and the diagnosis is not.
+    #
+    # It is a RuntimeError rather than an assert: `python -O` deletes asserts,
+    # and this is a schema-consistency guard rather than a debugging aid.
+    _unset = [c for c in RUN_COLUMNS if c not in values]
+    if _unset:
+        raise RuntimeError(
+            f"start_run_record has no value for {', '.join(_unset)}, which "
+            f"RUN_COLUMNS declares. A column added to RUN_COLUMN_ADDITIONS is "
+            f"written by this INSERT and must be given a value here, in the "
+            f"same commit -- see RUN_COLUMNS."
+        )
 
     columns = ", ".join(RUN_COLUMNS)
     placeholders = ", ".join("?" * len(RUN_COLUMNS))

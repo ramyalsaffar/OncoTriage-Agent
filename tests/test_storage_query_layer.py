@@ -273,6 +273,167 @@ def check_does_not_raise(label: str, fn, *args, **kwargs):
     return value
 
 
+class _RaisedFrame:
+    """What `_frame_or_raise` returns instead of a DataFrame. NEVER equal.
+
+    A PLAIN STRING WAS THE FIRST VERSION AND IT MOVED THE ABORT ONE LINE. The
+    consumers here call `.itertuples()`, `len()` and `frame["col"]` on the
+    result, so a string turned `MissingTableError` into
+    `AttributeError: 'str' object has no attribute 'itertuples'` -- a different
+    traceback in the same place. Measured by a revert harness, twice.
+
+    It answers those three operations emptily so the file reaches its summary,
+    and `__eq__` is ALWAYS False so no comparison can accidentally succeed
+    against an expected empty value -- which is what an empty DataFrame would
+    have allowed, and is the "no rows" / "could not ask" conflation this project
+    treats as a defect.
+    """
+
+    __slots__ = ("text",)
+
+    def __init__(self, text):
+        self.text = text
+
+    def itertuples(self, *a, **k):
+        return iter(())
+
+    def __len__(self):
+        return 0
+
+    def __iter__(self):
+        return iter(())
+
+    def __getitem__(self, key):
+        # PROPAGATES rather than collapsing to a list. These frames are indexed
+        # in CHAINS -- `frame[frame["col"] == v]["other"]` -- and returning `[]`
+        # made the SECOND index a TypeError, moving the abort one step along the
+        # chain instead of removing it. Returning self means every step of any
+        # chain stays a marker, `list(...)` of it is empty, and the comparison
+        # at the end FAILS and prints what raised.
+        return self
+
+    def __getattr__(self, name):
+        # ANY method call on a marker returns the marker. These frames are used
+        # as `frame["col"].sum()`, `.mean()`, `.itertuples()` -- a chain that has
+        # to terminate somewhere, and enumerating the methods meant finding the
+        # next one each time a revert harness ran. This terminates all of them
+        # at once. `_safe_int`/`_safe_float` are what turn the marker into a
+        # recorded FAILURE at the comparison.
+        def _still_the_marker(*args, **kwargs):
+            return self
+        return _still_the_marker
+
+    # THE ORDERING OPERATORS ARE SPELLED OUT, and this project already records
+    # why: CPython looks an implicit special method up on the TYPE, never
+    # through `__getattr__`, so the catch-all above does NOT answer `>`, `<`,
+    # `int()` or `len()`. A revert harness found each of those in turn. They
+    # return False so a comparison against a marker FAILS rather than raising --
+    # which is the difference between a recorded failure and an aborted file.
+    def __eq__(self, other):
+        return False
+
+    def __lt__(self, other):
+        return False
+
+    def __le__(self, other):
+        return False
+
+    def __gt__(self, other):
+        return False
+
+    def __ge__(self, other):
+        return False
+
+    def __hash__(self):
+        return hash(self.text)
+
+    def __repr__(self):
+        return f"<raised {self.text}>"
+
+
+class _NoRow:
+    """A named absence standing in for a run_summary row that is not there.
+
+    Every attribute read answers with a string NAMING what was wanted, and no
+    comparison can succeed -- so a check fails and prints the absence instead of
+    aborting.
+    """
+
+    def __getattr__(self, name):
+        return f"<no run_summary row: {name}>"
+
+    def __eq__(self, other):
+        return False
+
+    def __hash__(self):
+        return 0
+
+
+class _RowIndex(dict):
+    """`{run_id: row}` whose MISSING key yields `_NoRow` rather than KeyError.
+
+    THE FIX IS AT THE SOURCE AND NOT AT THE SUBSCRIPTS. This index is DERIVED
+    from a frame `_frame_or_raise` may have replaced with a marker, so when a
+    planted defect makes `run_summary` unanswerable the dict is empty and every
+    `_summary_by_id[...]` in the file raises. Guarding the fetch was not enough,
+    and neither was guarding one subscript: a revert harness found the next one
+    two lines down, then the conversion after that. Fixing the container fixes
+    all of them at once and cannot be forgotten at a new call site.
+    """
+
+    def __missing__(self, key):
+        return _NoRow()
+
+
+def _summary_patients(frame):
+    """`frame["patients"].sum()`, or the marker. NEVER RAISES.
+
+    A `_RaisedFrame` indexes to itself and has no `.sum()`, so the chain has to
+    stop somewhere -- here, at the one call site that sums a column.
+    """
+    try:
+        return frame["patients"].sum()
+    except BaseException as exc:                       # noqa: BLE001 -- reported
+        return f"<no patients column: {type(exc).__name__}>"
+
+
+def _safe_int(value):
+    """`int(value)` or the value itself, so a marker FAILS rather than aborts."""
+    try:
+        return int(value)
+    except BaseException:                              # noqa: BLE001 -- reported
+        return value
+
+
+def _safe_float(value, digits=None):
+    """`float(value)` (optionally rounded) or the value itself.
+
+    Same reason as `_safe_int`. A named-absence marker is a STRING, and
+    `float("<no ... >")` raises ValueError -- which moves the abort from the
+    lookup to the conversion, which is exactly where a revert harness found it
+    next. The marker is returned unchanged instead, so the comparison FAILS and
+    prints what was missing.
+    """
+    try:
+        return float(value) if digits is None else round(float(value), digits)
+    except BaseException:                              # noqa: BLE001 -- reported
+        return value
+
+
+def _frame_or_raise(key, conn=None):
+    """`queries.run` for a key that may legitimately be refused. NEVER RAISES.
+
+    A query declaring `requires_columns` raises `MissingTableError` on a
+    database that does not have them -- correct behaviour, and exactly what a
+    broken migration produces. A bare call would abort this file at the moment
+    it owes a summary.
+    """
+    try:
+        return queries.run(conn if conn is not None else _conn, key)
+    except BaseException as exc:                       # noqa: BLE001 -- reported
+        return _RaisedFrame(f"{type(exc).__name__}: {exc}")
+
+
 def after(text, marker):
     """Everything in `text` after `marker`, or "" when the marker is absent.
 
@@ -615,7 +776,33 @@ _THRESHOLD_OLD, _CEILING_OLD = 14400, 16000
 # (label, overrides). The consistency expectation for each is asserted in
 # section 4 by patient_id, so the seed and the expectation are one table rather
 # than two lists that can drift apart.
+# The dangling run id. A literal far outside anything `runs` AUTOINCREMENT will
+# reach in this file, asserted absent from `runs` after the seed.
+_DANGLING_RUN_ID = 999_999
+_DANGLING_COST = 0.1234
+
 _SEED_ROWS = [
+    # THE DANGLING ROW: ordinary in every respect except that its `run_id` names
+    # a `runs` row that does not exist. That state is reachable because the
+    # foreign key is declared and deliberately unenforced, and
+    # `dangling_run_references` is the only thing in the project that reports
+    # WHICH ids are in it -- so the seed has to contain one, or that query's
+    # non-empty case would ship exercised by nothing.
+    #
+    # ITS COUNTERS ARE CONSISTENT (5 + 8 + 2 == 15) ON PURPOSE. A first attempt
+    # left them NULL and `pipeline_consistency` promptly classified it as
+    # "Counters not reported", putting a row about run attribution into three
+    # expectations about something else. A seeded defect must be a defect in
+    # exactly one dimension.
+    ("P-DANGLING", dict(
+        run_id=_DANGLING_RUN_ID,
+        matching_model=_MODEL_A, llm_classifier_input_tokens=1000,
+        llm_classifier_output_tokens=500, llm_classifier_reasoning_tokens=None,
+        estimated_cost_usd=_DANGLING_COST, medication_count=4,
+        condition_count=3, total_time=9.0, age=55,
+        candidates_retrieved=90, candidates_reranked=30,
+        candidates_filtered=15, candidates_evaluated=15,
+        eligible_matches=5, near_misses=8, not_evaluable_trials=2)),
     # Consistent: 5 + 8 + 2 == 15. Slow and drug-heavy, which is what makes
     # `extreme_cases`, `medication_duplication_suspects` and `slowest_prompt`
     # non-empty.
@@ -953,6 +1140,20 @@ for _label, _patients in _RUN_MEMBERSHIP.items():
         _cursor.execute("UPDATE inferences SET run_id = ? WHERE patient_id = ?",
                         (_RUN_IDS[_label], _patient))
 
+# THE DANGLING ROW IS SEEDED IN `_SEED_ROWS` (search P-DANGLING), not inserted
+# here. Two earlier attempts inserted it after the fact and both disturbed
+# expectations that are DERIVED by iterating `_SEED_ROWS` -- the per-model token
+# sums, the row count, the consistency classification -- because a row the seed
+# list does not know about is a row those derivations cannot account for. Being
+# in the list is what makes it ordinary everywhere except in the one respect it
+# is about.
+if _conn.execute("SELECT COUNT(*) FROM runs WHERE id = ?",
+                 (_DANGLING_RUN_ID,)).fetchone()[0]:
+    raise SystemExit("seed error: the dangling run id names a real run row")
+if _conn.execute("SELECT COUNT(*) FROM inferences WHERE run_id = ?",
+                 (_DANGLING_RUN_ID,)).fetchone()[0] != 1:
+    raise SystemExit("seed error: the dangling inference row was not seeded")
+
 # THE COUNTER NAMES ARE REAL REGISTERED ONES, not invented strings: a breakdown
 # rendering a name no counter has ever had would look identical to one rendering
 # a real name, and the point of the column is that an operator recognises it.
@@ -1054,8 +1255,13 @@ print("=" * 78)
 print("SECTION 2b -- runs and run_metrics")
 print("=" * 78)
 
-_summary = queries.run(_conn, "run_summary")
-_summary_by_id = {int(r.run_id): r for r in _summary.itertuples()}
+# THROUGH THE GUARD. `run_summary` declares `runs.resumed`, so on a database
+# missing it `queries.run` raises MissingTableError BY DESIGN -- which is the
+# state a broken migration produces and which this file must REPORT rather than
+# abort on. Measured: reverting the `runs` migration aborted this file here.
+_summary = _frame_or_raise("run_summary")
+_summary_by_id = _RowIndex((int(r.run_id), r)
+                           for r in _summary.itertuples())
 
 check("run_summary returns exactly one row per run, and no more",
       len(_summary), len(_RUN_ROWS))
@@ -1068,15 +1274,16 @@ check("...newest first, which is what ORDER BY r.id DESC means",
 _empty_run = _summary_by_id[_RUN_IDS["RUN-EMPTY"]]
 check("a run NO inference row references is still in run_summary "
       "(this is what the LEFT JOIN buys)",
-      int(_empty_run.run_id), _RUN_IDS["RUN-EMPTY"])
-check("...with patients 0 -- a measured zero, not a NULL", int(_empty_run.patients), 0)
-check("...and cost 0.0", float(_empty_run.cost_usd), 0.0)
+      _safe_int(_empty_run.run_id), _RUN_IDS["RUN-EMPTY"])
+check("...with patients 0 -- a measured zero, not a NULL",
+      _safe_int(_empty_run.patients), 0)
+check("...and cost 0.0", _safe_float(_empty_run.cost_usd), 0.0)
 
 # --- PATIENT ROLLUP, COUNTED FROM THE SEED --------------------------------
 for _label, _patients in _RUN_MEMBERSHIP.items():
     _row = _summary_by_id[_RUN_IDS[_label]]
     check(f"{_label}: patients counted from the seed, not from the join",
-          int(_row.patients), len(_patients))
+          _safe_int(_row.patients), len(_patients))
     # THE MULTIPLICATION CONTROL. RUN-DEGRADED carries two degradation rows and
     # a meta pair; a naive three-way join would report its patient count
     # multiplied by four. A run with one patient makes that visible as 4.
@@ -1085,7 +1292,7 @@ for _label, _patients in _RUN_MEMBERSHIP.items():
                       "WHERE patient_id = ?", (_p,)).fetchone()[0]
         for _p in _patients), 4)
     check(f"{_label}: cost_usd is the sum over its patients and nothing else",
-          round(float(_row.cost_usd), 4), _expected_cost)
+          _safe_float(_row.cost_usd, 4), _expected_cost)
 
 check_true("the patient counts are non-degenerate -- the three runs with "
            "patients do not all have the same number, so a multiplied or "
@@ -1097,9 +1304,9 @@ check_true("the patient counts are non-degenerate -- the three runs with "
 _clean_row = _summary_by_id[_RUN_IDS["RUN-CLEAN"]]
 check("an unpriced patient is counted, not silently folded into the total "
       "(cost_complete's rule, one table up)",
-      int(_clean_row.rows_with_no_cost), 1)
+      _safe_int(_clean_row.rows_with_no_cost), 1)
 check("...and the errored count is the seeded one",
-      int(_clean_row.errored),
+      _safe_int(_clean_row.errored),
       _conn.execute(
           "SELECT COUNT(*) FROM inferences WHERE run_id = ? "
           "AND error IS NOT NULL AND error != ''",
@@ -1123,7 +1330,7 @@ check_true("the three health_record states are all exercised (non-degeneracy: "
 
 check("a measured-clean run reports counters_nonzero = 0, which is the "
       "MEASUREMENT that separates it from a run that never flushed",
-      int(_clean_row.counters_nonzero), 0)
+      _safe_int(_clean_row.counters_nonzero), 0)
 check("...and a run that never flushed reports it as NULL, not 0",
       bool(pd.isna(_summary_by_id[_RUN_IDS["RUN-CRASHED"]].counters_nonzero)),
       True)
@@ -1149,7 +1356,7 @@ _cursor.execute(
     ("2026-08-10T10:00:00", None, "FAILED", "batch_runner"))
 _UNSTAMPED_RUN = _cursor.lastrowid
 _conn.commit()
-_summary2 = queries.run(_conn, "run_summary")
+_summary2 = _frame_or_raise("run_summary")
 _unstamped = _summary2[_summary2["run_id"] == _UNSTAMPED_RUN]
 check("a terminal status with no finished_at is named as its own state, not "
       "folded into 'RUNNING or died'",
@@ -1160,21 +1367,36 @@ check_true("...so all three finalization states are exercised",
 _cursor.execute("DELETE FROM runs WHERE id = ?", (_UNSTAMPED_RUN,))
 _conn.commit()
 check("...and the probe row is removed, so every later check sees the seed",
-      len(queries.run(_conn, "run_summary")), len(_RUN_ROWS))
+      len(_frame_or_raise("run_summary")), len(_RUN_ROWS))
 
 # --- ROWS WITH NO RUN ARE NOT INVENTED INTO ONE ---------------------------
 _orphan_rows = _conn.execute(
     "SELECT COUNT(*) FROM inferences WHERE run_id IS NULL").fetchone()[0]
 check_true("the seed has inference rows with a NULL run_id (non-degeneracy: "
            "without them the next check passes for free)", _orphan_rows > 0)
+# THE EXPECTATION IS "ROWS WHOSE run_id NAMES A RUN THAT EXISTS", NOT "ROWS
+# THAT CARRY A run_id", AND THE TWO USED TO BE THE SAME NUMBER.
+#
+# Before the seed carried a dangling row, every non-NULL run_id named a real
+# run, so `WHERE run_id IS NOT NULL` and "attributable" counted the same rows
+# and the check could not tell a correct run_summary from one that counted any
+# non-NULL id. The dangling row separates them: it carries a run_id and must NOT
+# be attributed, so this now fails against a run_summary that dropped its JOIN.
 check("run_summary attributes no patient to a run that does not exist -- the "
-      "sum over its patients column is the count of rows that DO carry a run_id",
-      int(_summary["patients"].sum()),
-      _conn.execute("SELECT COUNT(*) FROM inferences "
-                    "WHERE run_id IS NOT NULL").fetchone()[0])
+      "sum over its patients column is the count of rows whose run_id names a "
+      "run that EXISTS, which the dangling row makes a smaller number than the "
+      "count of rows carrying one",
+      _safe_int(_summary["patients"].sum()),
+      _conn.execute("SELECT COUNT(*) FROM inferences i "
+                    "JOIN runs r ON r.id = i.run_id").fetchone()[0])
+check_true("...and the two counts really do differ, so the line above is not "
+           "the pre-dangling check wearing a new expression",
+           _conn.execute("SELECT COUNT(*) FROM inferences "
+                         "WHERE run_id IS NOT NULL").fetchone()[0]
+           > _safe_int(_summary["patients"].sum()))
 
 # --- THE BREAKDOWN --------------------------------------------------------
-_break = queries.run(_conn, "run_degradation_breakdown")
+_break = _frame_or_raise("run_degradation_breakdown")
 _break_by_run = {}
 for _r in _break.itertuples():
     _break_by_run.setdefault(int(_r.run_id), []).append((_r.counter, _r.events))
@@ -1199,16 +1421,15 @@ check("the degraded run's counters come back worst-first, with the seeded "
 check("the breakdown's per-run event total matches run_summary's, which are "
       "two different SQL shapes over the same rows",
       int(sum(int(_e) for _c, _e in _break_by_run[_RUN_IDS["RUN-DEGRADED"]])),
-      int(_summary_by_id[_RUN_IDS["RUN-DEGRADED"]].degradation_events))
+      _safe_int(_summary_by_id[_RUN_IDS["RUN-DEGRADED"]].degradation_events))
 
 # --- ATTRIBUTION COVERAGE -------------------------------------------------
-_cover = queries.run(_conn, "run_attribution_coverage")
+_cover = _frame_or_raise("run_attribution_coverage")
 _cover_by_label = {r.attribution: r for r in _cover.itertuples()}
 
-check("the coverage census reports the two attributions the seed has",
+check("the coverage census reports the three attributions the seed has",
       sorted(_cover_by_label),
-      sorted([queries.RUN_ATTRIBUTION_ATTRIBUTED,
-              queries.RUN_ATTRIBUTION_NO_RUN]))
+      sorted(queries.RUN_ATTRIBUTION_STATES))
 check("...counting every row with a run_id",
       int(_cover_by_label[queries.RUN_ATTRIBUTION_ATTRIBUTED].inference_rows),
       sum(len(v) for v in _RUN_MEMBERSHIP.values()))
@@ -1223,29 +1444,78 @@ check("a run-less row contributes no distinct run id",
       int(_cover_by_label[queries.RUN_ATTRIBUTION_NO_RUN].distinct_run_ids), 0)
 
 # THE DANGLING ROW. The foreign key is unenforced by design, so this state is
-# reachable, and nothing else in the project can report it. Driven for real by
-# pointing a row at a runs id that is not there.
-_cursor.execute("UPDATE inferences SET run_id = ? WHERE patient_id = ?",
-                (999999, "P-CAP-RETRIEVAL"))
-_conn.commit()
+# reachable and nothing but `dangling_run_references` can report WHICH ids are
+# in it.
+#
+# IT IS IN THE SEED NOW RATHER THAN SET AND UNDONE HERE. The probe this replaces
+# pointed a named patient at a missing run, asserted, and put it back -- which
+# left the state exercised for four checks and absent for the rest of the file,
+# including the registry-wide "every query returns a non-empty frame" contract
+# that `dangling_run_references` has to meet. A permanently seeded row exercises
+# all three attribution states for every check in the file and mutates nothing
+# mid-run.
 _cover2 = {r.attribution: r for r in
-           queries.run(_conn, "run_attribution_coverage").itertuples()}
+           _frame_or_raise("run_attribution_coverage").itertuples()}
 check("a row pointing at a runs id that does not exist is named as its own "
       "state, not counted as attributed",
       int(_cover2[queries.RUN_ATTRIBUTION_DANGLING].inference_rows), 1)
-check("...and run_summary still attributes no patient to it",
-      int(queries.run(_conn, "run_summary")["patients"].sum()),
+check("...and run_summary attributes no patient to it",
+      _safe_int(_summary_patients(_frame_or_raise("run_summary"))),
       sum(len(v) for v in _RUN_MEMBERSHIP.values()))
 check_true("...so all three attribution states are exercised (non-degeneracy)",
            set(_cover2) == set(queries.RUN_ATTRIBUTION_STATES))
-_cursor.execute("UPDATE inferences SET run_id = NULL WHERE patient_id = ?",
-                ("P-CAP-RETRIEVAL",))
-_conn.commit()
-check("...and the probe is undone, so later sections see the seed",
-      sorted(r.attribution for r in
-             queries.run(_conn, "run_attribution_coverage").itertuples()),
-      sorted([queries.RUN_ATTRIBUTION_ATTRIBUTED,
-              queries.RUN_ATTRIBUTION_NO_RUN]))
+
+# --- THE AUDIT QUERY NAMES THE ID, WHICH THE CENSUS CANNOT -----------------
+#
+# THE FRAME IS FETCHED THROUGH A GUARD. `queries.run` raises KeyError for an
+# unregistered key -- which is EXACTLY the defect these checks exist to catch --
+# so a bare call here would abort the file and report one traceback where it
+# owed a summary and ten results. A revert harness proved it: unregistering the
+# query aborted this file rather than failing it.
+def _frame(key):
+    return _frame_or_raise(key)
+
+
+def _col(frame, name, cast=int):
+    """One column as a list, or a named absence. Never raises."""
+    try:
+        return [cast(v) for v in frame[name]]
+    except BaseException as exc:                       # noqa: BLE001 -- reported
+        return f"<no column {name}: {type(exc).__name__}>"
+
+
+_dangling = _frame("dangling_run_references")
+check("the audit lists exactly the dangling run ids, which is the question the "
+      "census's count cannot answer",
+      _col(_dangling, "run_id"), [_DANGLING_RUN_ID])
+check("...with the rows attached to each",
+      _col(_dangling, "inference_rows"), [1])
+check("...and its patient count, so an operator can find them",
+      _col(_dangling, "distinct_patients"), [1])
+check("...and the spend those rows carry, which is what makes a dangling id "
+      "worth chasing rather than deleting",
+      _col(_dangling, "cost_usd", lambda v: round(float(v), 4)),
+      [_DANGLING_COST])
+# A NULL run_id IS NOT A DEFECT and must not be audited: every API request
+# writes one, and so did every row written before run tracking existed.
+#
+# THE FIRST VERSION OF THIS CHECK CONTAINED `_DANGLING_RUN_ID not in (None,)`,
+# which is true for every possible value -- a tautology inside an `and` chain,
+# so the check could only ever have failed on the two clauses around it. Written
+# out as two checks now, each of which can fail on its own.
+check_true("the seed really has NULL-run_id rows (non-degeneracy: with none, "
+           "the check below cannot distinguish a correct audit from one that "
+           "reports nothing)",
+           _conn.execute("SELECT COUNT(*) FROM inferences "
+                         "WHERE run_id IS NULL").fetchone()[0] > 0)
+check("...and the audit reports exactly one id -- the dangling one -- so it "
+      "picked up neither the NULL rows nor the attributed ones",
+      len(_dangling), 1)
+_attributed_ids = {int(v) for v in _RUN_IDS.values()}
+check("...and neither is a row whose run_id names a run that exists",
+      sorted(_attributed_ids & set(_col(_dangling, "run_id")
+                             if isinstance(_col(_dangling, "run_id"), list)
+                             else [])), [])
 
 # --- THE MISSING-TABLE GUARD ----------------------------------------------
 #
@@ -1285,7 +1555,8 @@ check("...and lacks inferences.run_id too, which is the state a database "
 # stop describing this list the moment a column-only query joined it.
 check("a database with no run tables reports every run query as unavailable",
       sorted(queries.unavailable(_legacy_conn)),
-      ["run_attribution_coverage", "run_degradation_breakdown", "run_summary",
+      ["dangling_run_references", "run_attribution_coverage",
+       "run_degradation_breakdown", "run_summary",
        "stage5_input_packing_pressure", "stage5_output_split_pressure"])
 # BOTH ABSENT TABLES AND THE ABSENT COLUMN, and the column is named even
 # though `runs` is missing too, because `inferences` IS present and its column

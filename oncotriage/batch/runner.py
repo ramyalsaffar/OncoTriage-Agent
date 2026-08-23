@@ -890,6 +890,7 @@ def process_patient(
     graph: object,
     is_resample: bool = False,
     run_id=None,
+    db_path=None,
 ) -> dict:
     """
     Run the full pipeline for one patient file.
@@ -964,11 +965,24 @@ def process_patient(
         # Stage 5 call -- so the outcome it reports is the only channel by which
         # the loss leaves this worker thread. record_write puts it in the ledger
         # that reconcile_writes reads at the end of the run.
-        # run_id ties this row to the `runs` record main() opened. It is
-        # forwarded, never resolved here, and db_path is still left to
-        # log_inference so the row and the reconciliation read the same
-        # resolution.
-        write_result = log_inference(result, patient_data, run_id=run_id)
+        # run_id AND db_path are both forwarded and NEITHER is resolved here.
+        #
+        # THE COMMENT THIS REPLACES CLAIMED THE PROPERTY IT BROKE. It read
+        # "db_path is still left to log_inference so the row and the
+        # reconciliation read the same resolution" -- and leaving it to
+        # log_inference is exactly what made that false. `resolve_inference_db_path`
+        # consults ONCOTRIAGE_INFERENCES_DB at CALL time, so this call resolved
+        # once per patient while main() resolved once at the top; change the
+        # variable mid-run and the patient rows land in one file, the `runs` row
+        # and the health flushes in another, and every `run_id` in the new file
+        # names a run that is not there. The reconciliation would then report
+        # every row of the run as lost, which is a true statement about the file
+        # it read and a false one about the work.
+        #
+        # `dangling_run_references` in oncotriage/storage/queries.py is the
+        # standing detector for the rows a run in that state leaves behind.
+        write_result = log_inference(result, patient_data, run_id=run_id,
+                                     db_path=db_path)
         record_write(patient_id, write_result, is_resample)
 
         # DELIBERATELY NOT FOLDED INTO `status`. A lost row means the DATABASE is
@@ -1149,7 +1163,7 @@ class _DriftAnnouncer:
 # ===========================================================================
 
 
-def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object, completed_ids: set, results_list: list, run_id=None,) -> tuple:
+def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object, completed_ids: set, results_list: list, run_id=None, db_path=None,) -> tuple:
     """
     Process all patients not already in completed_ids using concurrent threads.
 
@@ -1249,7 +1263,12 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
         # where nothing in this project reads it -- and it runs on MAX_WORKERS
         # threads at once, which _WRITE_LOCK inside the writer is what makes
         # safe.
-        flush_health(run_id)
+        #
+        # db_path IS FORWARDED, for the reason written at process_patient's
+        # log_inference call: this runs once per completed patient, so a
+        # per-call resolution here is the one that can split a run's health
+        # record across two files WHILE IT IS BEING WRITTEN.
+        flush_health(run_id, db_path=db_path)
 
         progress.set_postfix(ok=batch_success, err=batch_error)
         
@@ -1316,6 +1335,7 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
                     graph=graph,
                     is_resample=False,
                     run_id=run_id,
+                    db_path=db_path,
                 )
                 future.add_done_callback(lambda f, fp=fhir_path: _on_done(f, fp))
                 futures.append(future)
@@ -1347,7 +1367,7 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
 # ===========================================================================
 
 
-def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_ids: list, graph: object, results_list: list, run_id=None,) -> None:
+def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_ids: list, graph: object, results_list: list, run_id=None, db_path=None,) -> None:
     """
     Re-run a random subset of already-processed patients using concurrent threads.
 
@@ -1442,7 +1462,8 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
         # across both passes and are never cleared between them, so what this
         # writes includes everything the main pass moved; that is the same
         # property degradation.clear_all()'s docstring forbids breaking.
-        flush_health(run_id)
+        # db_path is forwarded here too; see run_batch's _on_done.
+        flush_health(run_id, db_path=db_path)
 
         progress.set_postfix(ok=resample_success, err=resample_error)
         progress.update(1)
@@ -1462,6 +1483,7 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
                     graph=graph,
                     is_resample=True,
                     run_id=run_id,
+                    db_path=db_path,
                 )
                 future.add_done_callback(lambda f: _on_done(f))
                 futures.append(future)
@@ -1510,6 +1532,82 @@ def inference_row_count(db_path):
             conn.close()
     except sqlite3.Error:
         return None
+
+
+def print_crash_record(where="crash") -> None:
+    """Print the census and degradation blocks on a path that is about to die.
+
+    WHAT WAS LOST WITHOUT IT. Both of ``main()``'s ``except BaseException``
+    handlers finalize the run row and re-raise, and neither printed anything. So
+    a campaign that crashed at patient 19,000 left NO console record at all --
+    every counter it had moved went out with the process. The periodic health
+    flushes cover part of that: ``run_metrics`` holds the DEGRADATION totals as
+    of the last completed patient. They do not cover the CENSUS, which is
+    excluded from ``run_metrics`` by a closed-category ruling (see
+    ``degradation._CENSUS_SPEC``), so on a crash the census survived NOWHERE.
+    This is the only place it can.
+
+    FRESH SNAPSHOTS, AND THAT BREAKS NO PROMISE. The success path takes one
+    snapshot and hands it to three consumers precisely so the rows, the logged
+    event and the printed block describe one instant. There is no such
+    obligation here, and the reason is written at the crash handler's own health
+    flush: nothing else printed on this path, so there is no second report for
+    these to disagree with. Taking them fresh makes them as late as possible,
+    which is what a reader of a crash wants.
+
+    CENSUS ABOVE DEGRADATION, the same order ``print_summary`` uses and for its
+    reason -- severity ascending. The reconciliation is deliberately absent:
+    it is a VERDICT about whether the data is whole, it needs a baseline count
+    and a completed ledger, and on a crash the ledger describes an unfinished
+    run. A verdict computed over a partial run would be a false one.
+
+    IT NEVER RAISES, WHICH IS THE WHOLE CONTRACT. It runs while an exception is
+    in flight, and anything escaping here would REPLACE that exception with one
+    about printing -- destroying the diagnosis the operator actually needs and
+    the traceback that names where the run died.
+
+    THE TWO BLOCKS HAVE SEPARATE GUARDS, so a formatting failure in one still
+    lets the other print. One guard around both would let the census take the
+    degradation block with it, which is the more valuable of the two.
+
+    IT CATCHES ``BaseException``, AND THAT DIVERGES FROM THIS MODULE'S USUAL
+    RULE ON PURPOSE. ``finalize_run_record`` catches ``Exception`` so a Ctrl-C
+    still escapes -- correct there, because a finalizer that swallowed one would
+    leave an operator holding a key down against a process that will not stop.
+    Here the goal is the opposite and is stated in the contract above: a
+    KeyboardInterrupt arriving during these few lines must not become the
+    exception that propagates, because it would displace the original. The
+    window is two print calls wide and the original ``raise`` follows
+    immediately.
+    """
+    try:
+        degradation.print_census_report(degradation.census_snapshot())
+    except BaseException as exc:                       # noqa: BLE001 -- noted
+        _crash_record_note("census", where, exc)
+    try:
+        degradation.print_report(degradation.snapshot())
+    except BaseException as exc:                       # noqa: BLE001 -- noted
+        _crash_record_note("degradation", where, exc)
+
+
+def _crash_record_note(block, where, exc) -> None:
+    """One line saying a crash-path block could not be printed. Never raises.
+
+    A SILENT FAILURE HERE IS INDISTINGUISHABLE FROM A RUN THAT HAD NOTHING TO
+    REPORT, which on a crash path is the reading that costs the most. The note
+    names the block so a reader knows which one is missing rather than wondering
+    whether the run was clean.
+
+    The bare guard around the note itself is the end of the line: if the console
+    channel cannot take one line, there is nowhere left to report that, and
+    raising would displace the exception this whole function exists not to
+    displace.
+    """
+    try:
+        console.out(f"[{where}] The {block} block could not be printed: "
+                    f"{type(exc).__name__}: {exc}")
+    except BaseException:                              # noqa: BLE001, S110
+        pass
 
 
 def reconcile_writes(db_path=None, rows_before=None) -> dict:
@@ -2105,6 +2203,46 @@ def main():
         # written rather than a global that happened to be nearby.
         #
         # It is a CROSS-CHECK and not the verdict. See reconcile_writes.
+        # ONE RESOLUTION, HERE, THREADED EVERYWHERE. THE NAME IS NOW TOO
+        # NARROW AND IS KEPT, because it is what the reconciliation reads and
+        # renaming it would touch every line below for no behaviour.
+        #
+        # WHAT IT FIXES. `resolve_inference_db_path` consults
+        # ONCOTRIAGE_INFERENCES_DB at CALL time, and FIVE call sites used to
+        # resolve independently: `log_inference` once per patient, `flush_health`
+        # once per completed patient in each of the two pools,
+        # `reconcile_writes` at the end, and `print_summary`'s reported path.
+        # Change the variable while a 22,000-patient run is in flight and those
+        # five answer differently from this one -- so the `runs` row is in file
+        # A, the patient rows in file B, every `run_id` in B names a run that is
+        # not there, the health record is split across both, and the
+        # reconciliation reads whichever it resolved and reports the other
+        # file's rows as lost. Nothing raises; the run reports a verdict about a
+        # file it did not write.
+        #
+        # WHY ONE RESOLUTION RATHER THAN PER-CALL EVERYWHERE, which was the
+        # other option. Three reasons, in the order they decided it:
+        #
+        #   1. THE CODEBASE ALREADY MADE THIS CHOICE FOR THE SAME CALL. `run_id`
+        #      is threaded down through run_batch -> process_patient ->
+        #      log_inference as an argument, and its docstring says in as many
+        #      words that it is "threaded down as an argument and never read off
+        #      a module global". `db_path` rides the same three functions to the
+        #      same call. Two arguments to one call resolved two different ways
+        #      is the inconsistency, not the fix.
+        #   2. THE RECONCILIATION REQUIRES IT. `reconcile_writes` asks whether
+        #      the specific ids the ledger recorded are present. That question
+        #      is only meaningful against the file they were written to, so
+        #      per-call resolution does not merely risk a split -- it makes the
+        #      run's own verdict unanswerable.
+        #   3. IT IS THE `run_fingerprint` ARGUMENT, one layer down. That module
+        #      caches its stamp per process on the reasoning that a run is ONE
+        #      configuration, and a stamp taken per write could straddle a
+        #      change. A run is one DESTINATION for the same reason.
+        #
+        # The cost is stated: a deliberate mid-run redirect is no longer
+        # possible. Nothing wants one -- it would split a campaign across two
+        # files, which is the defect above, not a feature.
         _reconcile_db = resolve_inference_db_path(None)
         rows_before = inference_row_count(_reconcile_db)
         console.out(f"[Guard] Inference rows before this run: "
@@ -2147,6 +2285,30 @@ def main():
             raise SystemExit(1)
         results_list = load_results()
 
+        # WAS THIS A RESUME. ONE BOOLEAN, TAKEN ONCE, HANDED TO BOTH RECORDS.
+        #
+        # Two things record this fact: the `runs.resumed` column and the MLflow
+        # tag below. The tag read `completed_ids` directly and the column could
+        # have done the same -- and TODAY THE TWO READS WOULD AGREE, because
+        # both sit above `run_batch`. That is stated plainly rather than dressed
+        # up as a bug that exists: nothing is currently wrong.
+        #
+        # WHAT IS WRONG IS THAT THE AGREEMENT IS POSITIONAL AND NOTHING ENFORCES
+        # IT. `completed_ids` is MUTATED by the run -- `_on_done` adds every
+        # completed stem to it -- so it stops meaning "what the checkpoint
+        # handed us" the moment the first patient finishes. Two reads of it are
+        # equal only while both stay above that line, and the edit that breaks
+        # it is an ordinary one: moving the tag to `end_run`, or recording
+        # `resumed` at finalize time beside `finished_at`. Either would make a
+        # FRESH campaign report `resumed=0` in the column and `resumed=true` in
+        # the index, from the same variable, with nothing to say which is right
+        # and no test asking.
+        #
+        # Taking the boolean HERE -- the last point at which the set means only
+        # what the checkpoint returned -- removes the positional dependence
+        # instead of documenting it.
+        _resumed = bool(completed_ids)
+
         # ------------------------------------------------------------------
         # 3b. Open the RUN ROW (the run-identity pass)
         # ------------------------------------------------------------------
@@ -2188,6 +2350,7 @@ def main():
             INVOCATION_SOURCE,
             db_path=_reconcile_db,
             fingerprint=_fingerprint,
+            resumed=_resumed,
         )
 
         # ------------------------------------------------------------------
@@ -2246,9 +2409,25 @@ def main():
                     "resample_count": RESAMPLE_COUNT,
                     "resample_seed": RESAMPLE_SEED,
                 },
-                tags={"resumed": "true" if completed_ids else "false"},
+                # THE SAME BOOLEAN THE `runs.resumed` COLUMN WAS WRITTEN
+                # FROM. `completed_ids` is still untouched at this line, so a
+                # direct read would give the same answer today -- and would
+                # stop doing so the moment this tag moved below `run_batch`,
+                # which mutates it. See `_resumed`.
+                tags={"resumed": "true" if _resumed else "false"},
             )
         except BaseException:
+            # THE CONSOLE RECORD FIRST, then the row, then re-raise.
+            #
+            # THIS HANDLER GETS IT TOO, and that is a decision rather than a
+            # copy. It fires before the pool exists, so no patient has been
+            # billed -- but the counters are NOT empty by then: the BM25 index
+            # build, the graph compile, the corpus load, the index probe and the
+            # checkpoint have all run and each can move one. Nothing else will
+            # ever print them, because this path does not reach print_summary
+            # and -- unlike the handler below -- it does not flush health
+            # either, so the console is the ONLY record this failure can leave.
+            print_crash_record(where="crash/tracking")
             finalize_run_record(_run_record_id, "KILLED", db_path=_reconcile_db)
             raise
 
@@ -2281,6 +2460,7 @@ def main():
                 completed_ids=completed_ids,
                 results_list=results_list,
                 run_id=_run_record_id,
+                db_path=_reconcile_db,
             )
 
             # ------------------------------------------------------------------
@@ -2298,6 +2478,7 @@ def main():
                     graph=graph,
                     results_list=results_list,
                     run_id=_run_record_id,
+                    db_path=_reconcile_db,
                 )
             else:
                 console.out("[Resample] Skipped: no successfully completed patients.")
@@ -2306,7 +2487,8 @@ def main():
             # 6. Reconcile the writes, then the final summary
             # ------------------------------------------------------------------
             total_wall_time = time.time() - run_start
-            reconciliation = reconcile_writes(rows_before=rows_before)
+            reconciliation = reconcile_writes(db_path=_reconcile_db,
+                                              rows_before=rows_before)
             _publish_reconciliation(reconciliation)
 
             # ONE SNAPSHOT, TWO CONSUMERS, exactly as the reconciliation above is
@@ -2347,6 +2529,7 @@ def main():
                          db_path=_reconcile_db)
 
             print_summary(results_list, total_wall_time,
+                          db_path=_reconcile_db,
                           reconciliation=reconciliation,
                           degradation_snapshot=degradation_snapshot,
                           census_snapshot=census_snapshot)
@@ -2484,6 +2667,19 @@ def main():
             # disagree with. It cannot raise, so it cannot displace the
             # exception either.
             flush_health(_run_record_id, db_path=_reconcile_db)
+            # THE CONSOLE RECORD, AND THE CENSUS HALF OF IT SURVIVES NOWHERE
+            # ELSE. The flush above persists the DEGRADATION totals into
+            # `run_metrics`; the census is excluded from that table by a closed
+            # -category ruling, so on a crash this print is the only place its
+            # counts have ever existed.
+            #
+            # AFTER the flush, so a formatting failure cannot cost the persisted
+            # record -- the durable write is the one worth protecting, and the
+            # ordering is what makes that true rather than the guard alone.
+            #
+            # It cannot raise and cannot displace the exception; see
+            # print_crash_record. The `raise` below is still the original.
+            print_crash_record(where="crash")
             finalize_run_record(_run_record_id, "KILLED", db_path=_reconcile_db)
             tracking.end_run(status="FAILED")
             raise

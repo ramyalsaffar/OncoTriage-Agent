@@ -1221,7 +1221,7 @@ _SEEN = []
 
 
 def _erroring_process_patient(fhir_path=None, graph=None, is_resample=False,
-                              run_id=None):
+                              run_id=None, db_path=None):
     """Every patient fails. Also moves a counter, so there is health to record.
 
     THE STAND-IN RETURNS status="error" FOR TWO REASONS. It is the case the

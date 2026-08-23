@@ -161,6 +161,7 @@ from oncotriage.observability import console
 from oncotriage.storage.database_logger import (
     INFERENCE_COLUMN_ADDITIONS,
     RENAMED_INFERENCE_COLUMNS,
+    RUN_COLUMN_ADDITIONS,
     RUN_METRIC_CATEGORY_DEGRADATION,
     RUN_METRIC_CATEGORY_META,
     RUN_METRIC_META_COUNTERS_NONZERO,
@@ -255,10 +256,11 @@ class Query:
     """
 
     __slots__ = ("key", "sql", "heading", "render", "blank_after", "notes",
-                 "requires", "requires_columns")
+                 "requires", "requires_columns", "clean_message")
 
     def __init__(self, key, sql, heading=None, render="to_string",
-                 blank_after=True, notes=(), requires=(), requires_columns=()):
+                 blank_after=True, notes=(), requires=(), requires_columns=(),
+                 clean_message=None):
         self.key = key
         self.sql = sql
         self.heading = heading
@@ -267,6 +269,19 @@ class Query:
         self.notes = tuple(notes)
         self.requires = tuple(requires)
         self.requires_columns = tuple(tuple(pair) for pair in requires_columns)
+        # What ``render='empty_or_to_string'`` prints INSTEAD of an empty frame.
+        # ``None`` keeps CONSISTENCY_CLEAN_MESSAGE, which is what the one
+        # pre-existing user of that mode has always printed, so no existing
+        # query's output moves.
+        #
+        # IT EXISTS BECAUSE THE MODE WAS SINGLE-USE BY ACCIDENT. The message was
+        # a module constant read directly by the renderer, so the second query
+        # wanting "print the rows, or say plainly that there are none" would
+        # have had to either announce that the PIPELINE is consistent -- a claim
+        # about something else entirely -- or become a custom renderer. A
+        # per-query message makes an existing mode general instead of adding a
+        # third way to print a frame.
+        self.clean_message = clean_message
 
     def __repr__(self):
         return f"<Query {self.key!r} render={self.render!r}>"
@@ -1781,7 +1796,13 @@ QUERIES = (
         # that it was "the only query that joins on an additive column" -- and
         # the control that exercises the column-only shape is what found it,
         # not reading. See tests/test_storage_query_layer.py section 2b.
-        requires_columns=(("inferences", "run_id"),),
+        #
+        # `runs.resumed` IS THE SECOND, AND IT IS A COLUMN OF A TABLE THIS QUERY
+        # ALREADY DECLARES WHOLE. `requires` says "this database has a `runs`
+        # table"; a database written between the run-identity pass and the
+        # resumed column has one AND lacks the column, which is precisely the
+        # distinction `requires` cannot draw and `requires_columns` exists for.
+        requires_columns=(("inferences", "run_id"), ("runs", "resumed")),
         notes=(
             "patients / errored / cost_usd are 0 for a run no inference row",
             "references -- that is a measured zero, because a LEFT JOIN with no",
@@ -1812,6 +1833,16 @@ QUERIES = (
         m.counters_nonzero,
         d.counters_moved,
         d.degradation_events,
+        -- WAS THIS CAMPAIGN A RESUME, and it qualifies two columns above it.
+        -- A resumed row's `started_at` is when the LAST process started, not
+        -- when the campaign did, and its `patients` count covers only the
+        -- patients THIS process wrote -- every patient an earlier process
+        -- completed carries the EARLIER run's id. So on a resumed row both are
+        -- fragments, and this is the only column that says so. NULL means not
+        -- recorded (a row written before the column existed), which is why it
+        -- is not COALESCEd to 0: a measured "not a resume" and an unrecorded
+        -- one are different facts.
+        r.resumed,
         r.fingerprint_version,
         r.llm_classifier_prompt_version,
         r.llm_classifier_renderer_digest,
@@ -1902,6 +1933,75 @@ QUERIES = (
     LEFT JOIN runs r ON r.id = i.run_id
     GROUP BY attribution
     ORDER BY inference_rows DESC, attribution
+""",
+    ),
+    # THE AUDIT SIDE OF AN UNENFORCED FOREIGN KEY.
+    #
+    # `inferences.run_id` REFERENCES `runs(id)` in the CREATE TABLE and the
+    # constraint is deliberately NOT enforced -- four reasons are argued at that
+    # table in oncotriage/storage/database_logger.py, of which the operative one
+    # is that `PRAGMA foreign_keys` is per CONNECTION and this project opens the
+    # file from seven modules that do not set it. A ruling that a constraint
+    # will not be enforced is a ruling that something else has to be able to
+    # find its violations; this is that something.
+    #
+    # WHY IT IS NOT THE CENSUS ABOVE. That query COUNTS the dangling rows, as
+    # one bucket of three, and a count is where an operator's question starts:
+    # the next one is always WHICH run ids, and no aggregate can answer it. This
+    # names them, with the rows and the spend attached to each, which is what
+    # turns "3 rows are dangling" into something a person can act on.
+    #
+    # HOW A DANGLING ROW HAPPENS, so the output can be read. A run row and its
+    # patient rows are written to the SAME resolved database -- main() resolves
+    # once and threads it -- so the ordinary path cannot produce one. What can:
+    # a `runs` row deleted by hand or by "15- Database Wipe All Tables.py",
+    # which DELETEs every table with no cascade and in sqlite_master order; two
+    # databases merged; or a patient row written by a process whose run row went
+    # somewhere else, which is the exact failure the path-unification pass
+    # closed and which this query is the standing detector for.
+    #
+    # `empty_or_to_string` WITH ITS OWN CLEAN MESSAGE, not `skip_if_empty`. A
+    # clean audit must SAY it is clean: silence cannot be told apart from an
+    # audit that did not run, and this one is skipped entirely on a database
+    # with no `runs` table, where silence would be exactly the wrong reading.
+    Query(
+        key='dangling_run_references',
+        heading='=== INFERENCE ROWS WHOSE run_id NAMES NO RUN ===',
+        render='empty_or_to_string',
+        blank_after=True,
+        clean_message=(
+            "No dangling run_id values - every inference row that names a run "
+            "names one that exists"
+        ),
+        # `runs` ALONE, not RUN_TABLES. This query never reads `run_metrics`, so
+        # declaring it would skip the audit on a database that can answer it --
+        # and the database most likely to hold a dangling reference is exactly
+        # the damaged one an over-declaration would refuse to examine.
+        requires=("runs",),
+        requires_columns=(("inferences", "run_id"),),
+        notes=(
+            "A row here is a real defect, not a census bucket: its run_id names",
+            "a `runs` row that is not in this database. The foreign key is",
+            "declared and deliberately unenforced, so nothing prevented it.",
+            "",
+            "run_id IS NULL is NOT reported here and is not a defect -- it means",
+            "the row was written outside a batch run (every API request is one)",
+            "or before run tracking existed. The census above counts those.",
+        ),
+        sql="""
+    SELECT
+        i.run_id,
+        COUNT(*)                                         AS inference_rows,
+        MIN(i.timestamp)                                 AS first_at,
+        MAX(i.timestamp)                                 AS last_at,
+        COUNT(DISTINCT i.patient_id)                     AS distinct_patients,
+        ROUND(SUM(COALESCE(i.estimated_cost_usd, 0)), 4) AS cost_usd
+    FROM inferences i
+    LEFT JOIN runs r ON r.id = i.run_id
+    WHERE i.run_id IS NOT NULL
+      AND r.id IS NULL
+    GROUP BY i.run_id
+    ORDER BY inference_rows DESC, i.run_id
 """,
     ),
     # ── Stage 5 split pressure (this pass) ─────────────────────────────────
@@ -2237,16 +2337,29 @@ def table_columns(conn, table) -> frozenset:
 # reason to tell them apart, and taking the union here is what lets one
 # derivation cover both classes.
 #
-# `runs` and `run_metrics` are absent from this map ON PURPOSE: both tables are
-# wholly additive and are declared through `requires`, so no column of either
-# can be individually absent from a database that has the table.
-# database_logger records that a column added to `runs` later gets a
-# RUN_COLUMN_ADDITIONS dict; the standing test fails the day that dict appears
-# and this map has not gained the entry.
+# `run_metrics` IS ABSENT ON PURPOSE and `runs` IS NOT, and the difference is
+# the whole reason this map is per-table rather than a flat set of names.
+#
+# `run_metrics` is wholly additive: it arrived complete, nothing has been added
+# to it, so no column of it can be individually absent from a database that has
+# the table and `requires` covers it entirely.
+#
+# `runs` ARRIVED THE SAME WAY AND HAS SINCE GAINED A COLUMN. `resumed` is an
+# ALTER on an existing table, so a database written between the run-identity
+# pass and this one HAS `runs` and does NOT have `resumed` -- the two facts
+# `requires` cannot separate, because it answers about the table. That is
+# exactly the shape `requires_columns` exists for, and the entry below is what
+# the schema-guards test's check 3i has been waiting to demand: it fails the day
+# RUN_COLUMN_ADDITIONS appears without this line.
+#
+# THERE IS NO RENAME SET FOR `runs`. The gpt4o pass renamed columns of
+# `inferences` only -- measured, and the schema-guards test asserts it of
+# `trial_matches` too -- so the union here has one term.
 ADDITIVE_COLUMNS = {
     "inferences": frozenset(INFERENCE_COLUMN_ADDITIONS)
                   | frozenset(RENAMED_INFERENCE_COLUMNS),
     "trial_matches": frozenset(TRIAL_MATCH_COLUMN_ADDITIONS),
+    "runs": frozenset(RUN_COLUMN_ADDITIONS),
 }
 
 _SQL_STRING = re.compile(r"'(?:[^']|'')*'")
@@ -3063,7 +3176,7 @@ def _render(df, query, out):
         out(df.to_string(index=False))
     elif query.render == "empty_or_to_string":
         if df.empty:
-            out(CONSISTENCY_CLEAN_MESSAGE)
+            out(query.clean_message or CONSISTENCY_CLEAN_MESSAGE)
         else:
             out(df.to_string(index=False))
     else:

@@ -832,7 +832,7 @@ BUCKETS = {
         _A, None,
         # DERIVED BY RUNNING against a skeleton provisioned by
         # provision_ci_paths.py, not from its imports.
-        "ran green in ~1.6s, 84 checks -- 84 passed, 0 failed, 0 skipped -- "
+        "ran green in ~1.4s, 101 checks -- 101 passed, 0 failed, 0 skipped -- "
         "against ONLY the directory skeleton, and identically against the "
         "developer tree: the requires_columns derivation over the whole query "
         "registry, the rename record against a real fresh database, the "
@@ -847,6 +847,27 @@ BUCKETS = {
         "the skeleton and the developer tree give the same number. Every "
         "database is inside a tempfile.mkdtemp it removes and asserts gone, "
         "and the two package files it reads are sha256-compared at the end"),
+    "test_runner_crash_record_and_db_unification.py": (
+        _A, None,
+        # DERIVED BY RUNNING against a skeleton provisioned by
+        # provision_ci_paths.py, not from its imports.
+        "ran green in ~11s, 65 checks -- 65 passed, 0 failed, 0 skipped -- "
+        "against ONLY the directory skeleton: print_crash_record driven "
+        "directly including its never-raises contract, an ast walk over main() "
+        "placing the call in both BaseException handlers and on neither "
+        "success path, and main() DRIVEN END TO END four times -- a planted "
+        "mid-batch crash, a clean run, a mid-run ONCOTRIAGE_INFERENCES_DB "
+        "hijack, and a fresh/resumed pair. The BM25 index, the graph, the "
+        "tracking module and process_patient are stand-ins and THE GRAPH IS "
+        "NEVER INVOKED, so no billed call is reachable; everything else -- "
+        "run_batch, _on_done, flush_health, start_run_record, "
+        "finalize_run_record, reconcile_writes, print_summary and both crash "
+        "handlers -- is the real thing. No network, no keys, no spend, no live "
+        "Qdrant, no model load, no corpus, no git history, no live server. The "
+        "~11s is two real ThreadPoolExecutor passes per drive. Every database "
+        "and FHIR file is inside a tempfile.mkdtemp it removes and asserts "
+        "gone; the two package files it reads are sha256-compared at the end",
+    ),
     "test_storage_run_identity.py": (
         _A, None,
         # RE-READ OFF A REAL RUN (this pass). The string it replaces was wrong
