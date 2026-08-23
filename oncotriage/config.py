@@ -2500,6 +2500,53 @@ ABLATION_BOOTSTRAP_SEED = 42
 
 
 #------------------------------------------------------------------------------
+# S3 STAGING
+#------------------------------------------------------------------------------
+# The four knobs the staging pass reads. They are here rather than beside the
+# code that reads them because this file is where CLAUDE.md tells an operator
+# every tunable lives, and because the two prices are the kind of number that
+# goes stale on a vendor's schedule rather than on this project's.
+
+
+# The target region. us-east-1, per the brief.
+#
+# NOT DERIVED FROM THE AMBIENT AWS CONFIGURATION, deliberately. boto3 will
+# happily take a region from ~/.aws/config or AWS_DEFAULT_REGION, so a bucket
+# created without an explicit region lands wherever the operator's shell
+# happened to point -- and a bucket's region is fixed for its lifetime. The
+# staging preflight compares the resolved session region against this constant
+# and refuses a mismatch rather than creating a bucket in the wrong continent.
+S3_STAGING_REGION = "us-east-1"
+
+
+# How much of each file the secrets scan reads.
+#
+# 64 KiB. THIS IS A STATED LIMIT AND NOT A GUARANTEE: a key pasted 100 KB into
+# a 21 MB FHIR bundle is not seen. The bound is what makes a scan of ~60 GB
+# take seconds rather than an hour, and it is here so the trade can be changed
+# without editing oncotriage/staging/secrets_scan.py. Raising it to 0 would
+# mean "read the whole file" and is the honest setting for a paranoid run over
+# a small tree.
+S3_STAGING_SCAN_PREFIX_BYTES = 65536
+
+
+# S3 Standard storage, us-east-1, first 50 TB. USD per GB-month.
+#
+# QUOTED, NOT COMPUTED, and dated for the same reason PRICING_CONFIG carries a
+# `last_updated`: a cost estimate whose inputs nobody can date is a number
+# somebody trusts a year later. Read 2026-08-22 from the AWS S3 pricing page.
+S3_STANDARD_USD_PER_GB_MONTH = 0.023
+
+
+# PUT / COPY / POST / LIST requests, USD per 1,000. Same page, same date.
+#
+# Every object costs one PUT on the first sync. This is a ONE-TIME charge and
+# the report labels it as such -- folding it into a monthly figure would report
+# a recurring cost that does not recur.
+S3_PUT_USD_PER_1000 = 0.005
+
+
+#------------------------------------------------------------------------------
 
 
 #!/usr/bin/env python3

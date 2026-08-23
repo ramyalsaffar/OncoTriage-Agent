@@ -380,6 +380,27 @@ dependencies = [
 
     # --- Retry / progress ---------------------------------------------------
     "tenacity==9.0.0",
+
+    # --- AWS, for the S3 staging tool -------------------------------------
+    # boto3 RATHER THAN THE AWS CLI, and the reason is the secrets refusal.
+    # `aws s3 sync --exclude` takes glob patterns, which can express "skip this
+    # path" and cannot express "read a bounded prefix of every candidate file,
+    # look for nine credential shapes, and refuse the WHOLE run on one hit".
+    # That scan has to sit inside the upload path, between the walk and the
+    # first PUT, which means the upload has to be a library call.
+    #
+    # Three lesser reasons, each real: the CLI's exit codes do not distinguish
+    # "credential found" from "network failed"; shelling out means parsing
+    # human-readable progress output to report transfer stats; and the CLI is a
+    # second thing to install and version beside pyproject.toml, which pass
+    # 20f-2 spent a whole item making the ONE dependency list.
+    #
+    # NOTHING IMPORTS IT AT MODULE SCOPE. oncotriage/staging/s3_sync.py defers
+    # the import into the functions that need it, so the dry run -- the half
+    # that runs today -- works with boto3 absent. That is the same third-party
+    # in-a-function-body exemption `import icd10` and `import torch` carry.
+    "boto3==1.40.14",
+
     "tqdm==4.67.1",
 ]
 
@@ -526,6 +547,11 @@ packages = [
     "oncotriage.ablation",
     "oncotriage.evaluation",
     "oncotriage.fixtures",
+    # The S3 staging pass: the rulings, the secrets refusal, the walk and the
+    # AWS half. Listed because setuptools does not recurse into a listed
+    # package -- an undeclared subpackage is present in an editable install and
+    # ABSENT from a built wheel, and nothing surfaces until somebody builds one.
+    "oncotriage.staging",
     # The MCP pass: the stdio Model Context Protocol server. Named
     # `oncotriage.mcp` beside the third-party `mcp` it imports, which is safe
     # because Python 3 resolves imports absolutely; the argument and the check

@@ -1,0 +1,192 @@
+{
+  "schema_version": 1,
+  "_comment": [
+    "THE STAGING RULINGS. This file is DATA, not code: flipping a ruling is an",
+    "edit here and no edit anywhere else, which is the whole point of it being",
+    "a manifest. oncotriage/staging/exclusions.py reads it, validates it, and",
+    "REFUSES on any defect -- item 11a's line, a configuration fault that one",
+    "edit fixes raises rather than degrading.",
+    "",
+    "LAYERING, stated because it decides what a stale entry costs. The path",
+    "rules below are POLICY and PERFORMANCE: they record what an operator",
+    "decided and they stop the walk descending into 180 GB nobody wants. They",
+    "are NOT the secrets guarantee. The guarantee is the content-and-filename",
+    "scan in oncotriage/staging/secrets_scan.py, which runs over the SURVIVING",
+    "set on every invocation and refuses the whole run on a single hit. So a",
+    "path rule that goes stale under a rename degrades performance and record",
+    "keeping; it does not open a hole.",
+    "",
+    "Paths are relative to the PROJECT ROOT (oncotriage.paths.main_path), use",
+    "forward slashes, are case-sensitive, and match on whole path components --",
+    "'02- Data/04- MeSH' does not match '02- Data/04- MeSHX'."
+  ],
+  "staged": [
+    {
+      "path": "02- Data",
+      "reason": "the campaign's scientific input: the Synthea patient cohort, the trial corpus and the inference database. STAGED DESPITE BEING NOMINALLY REGENERABLE -- Synthea regeneration is not bit-identical across JAR versions, so the cohort is an input rather than an artifact."
+    },
+    {
+      "path": "03- Code",
+      "reason": "the pipeline source, the only version-controlled directory in the tree."
+    },
+    {
+      "path": "04- Results",
+      "reason": "campaign outputs: ablation tables and figures, FHIR characterisation, the MLflow file-backed tracking store."
+    },
+    {
+      "path": "06- Airflow",
+      "reason": "orchestration source and the metadata database. The regenerable half is pruned below."
+    },
+    {
+      "path": "08- Checkpoint",
+      "reason": "batch runner resume state; without it an interrupted campaign restarts from zero and re-bills every patient."
+    },
+    {
+      "path": "09- Testing",
+      "reason": "OPERATOR RULING CORRECTED HERE, and the correction is recorded rather than applied silently. The brief listed 'Fixture Backups' and 'The 42 Patients' as excluded and located them 'inside 03- Code'; they are at the PROJECT ROOT, in this directory, and 03- Code/09- Testing holds only the ragas venv. Excluding two children of a directory that is itself unstaged would be a no-op, and the two SURVIVING children are load-bearing: 'Characterization Fixtures' holds the twelve recordings that pin the Qdrant collection digest (the brief's own requirement 5 calls that pin the thing the snapshot makes recoverable) and 'Evaluation Runs' holds the paid evaluation campaign manifests. Both are 'data the campaign consumes' and 'results' under the brief's own staging rationale, so the parent is staged and the two ruled-disposable children are pruned below."
+    },
+    {
+      "path": ".gitignore",
+      "reason": "NOT IN THE BRIEF, found by the unruled report. The project root's own .gitignore, 77 bytes. Staged because it is the only record of what the non-versioned tree deliberately ignores, and because a root-level file with no ruling is dropped in silence -- which is the failure this manifest exists to prevent."
+    }
+  ],
+  "excluded": [
+    {
+      "path": "05- Keys",
+      "kind": "secrets",
+      "reason": "the credentials directory. Holds a live .env (OPENAI_API_KEY, QDRANT_API_KEY, ANTHROPIC_API_KEY) and a Keys.txt carrying the same values as PROSE rather than as assignments."
+    },
+    {
+      "path": "06- Airflow/simple_auth_manager_passwords.json.generated",
+      "kind": "secrets",
+      "reason": "NOT IN THE BRIEF AND FOUND BY READING THE TREE. A live generated Airflow admin password, {\"admin\": \"<16 opaque chars>\"}, 30 bytes. It is excluded by path AND the filename detector catches it, because 16 opaque characters under a key spelled 'admin' is below every content heuristic that would otherwise fire -- a value-shape scan alone would have uploaded it. Regenerated on the target by 22- Airflow Database.py."
+    },
+    {
+      "path": "01- Project Blueprint",
+      "kind": "operator-ruled",
+      "reason": "operator ruling: not staged."
+    },
+    {
+      "path": "10- Old",
+      "kind": "operator-ruled",
+      "reason": "operator ruling: superseded."
+    },
+    {
+      "path": "11- System Prompts",
+      "kind": "operator-ruled",
+      "reason": "operator ruling: not staged."
+    },
+    {
+      "path": "12- Improvements",
+      "kind": "operator-ruled",
+      "reason": "operator ruling: not staged."
+    },
+    {
+      "path": "13- Backup 2026-08-03 Regeneration",
+      "kind": "superseded",
+      "reason": "a dated pre-regeneration snapshot, superseded by this staging. ~10 GB."
+    },
+    {
+      "path": "14- Backup 2026-08-03 Item18b Pre-Regeneration",
+      "kind": "superseded",
+      "reason": "a dated pre-regeneration snapshot, superseded by this staging. ~35 GB."
+    },
+    {
+      "path": "15- Code Copies",
+      "kind": "superseded",
+      "reason": "operator ruling: superseded by 03- Code."
+    },
+    {
+      "path": "99- GitHub",
+      "kind": "superseded",
+      "reason": "four full historical copies of the whole project, ~68 GB and 311,875 files. EACH CARRIES ITS OWN 05- Keys/.env: V01, V02, V03 and V05 Final. Excluding only the top-level 05- Keys would have uploaded four live credential files, which is the measurement that turned the brief's 'scan, not filter' instruction from a preference into a requirement."
+    },
+    {
+      "path": "02- Data/04- MeSH",
+      "kind": "regenerable",
+      "reason": "NLM MeSH desc2026.xml and the 1.5 GB UMLS MRCONSO release plus the JSON lookups built from them. ~2.4 GB, re-downloadable, and 09- MeSH Cancer Site Relevance Filter.py rebuilds the lookups."
+    },
+    {
+      "path": "02- Data/05- TREC 2019",
+      "kind": "regenerable",
+      "reason": "a public benchmark corpus, ~8.3 GB, re-downloadable."
+    },
+    {
+      "path": "02- Data/07- Model Cache",
+      "kind": "regenerable",
+      "reason": "the MedCPT (836 MB measured) and FastEmbed caches. Re-downloaded on first use through oncotriage/agent/deps.py and oncotriage/embedding.py."
+    },
+    {
+      "path": "03- Code/09- Testing/ragas-venv",
+      "kind": "regenerable",
+      "reason": "a throwaway virtualenv, ~1.7 GB and 92,648 files, regenerable from pyproject.toml. It is also what .dockerignore had to learn to exclude, for the same reason."
+    },
+    {
+      "path": "03- Code/oncotriage.egg-info",
+      "kind": "regenerable",
+      "reason": "editable-install artifact, rebuilt by pip install -e ."
+    },
+    {
+      "path": "03- Code/build",
+      "kind": "regenerable",
+      "reason": "editable-install artifact. Absent today; declared so a stale build/ tree cannot be staged if one reappears."
+    },
+    {
+      "path": "03- Code/dist",
+      "kind": "regenerable",
+      "reason": "build artifact. Absent today; declared for the same reason as build/."
+    },
+    {
+      "path": "09- Testing/Fixture Backups",
+      "kind": "operator-ruled",
+      "reason": "operator-ruled disposable. Located at the PROJECT ROOT, not inside 03- Code as the brief placed it."
+    },
+    {
+      "path": "09- Testing/The 42 Patients",
+      "kind": "operator-ruled",
+      "reason": "operator-ruled disposable. Located at the PROJECT ROOT, not inside 03- Code as the brief placed it."
+    },
+    {
+      "path": "06- Airflow/airflow.cfg",
+      "kind": "regenerable",
+      "reason": "regenerated on the target by 22- Airflow Database.py, which rewrites it. The audit ruled it must be regenerated rather than staged."
+    },
+    {
+      "path": "06- Airflow/dags",
+      "kind": "regenerable",
+      "reason": "the DEPLOYED DAG. It is generated output -- oncotriage/orchestration/dag_generator.py builds the text and 23- Airflow DAG.py writes it -- so the generator is staged and the deployment is not. The audit ruled it must be regenerated on the target."
+    },
+    {
+      "path": "07- Requirements",
+      "kind": "superseded",
+      "reason": "NOT IN THE BRIEF, found by the unruled report. The stale requirements sibling. Pass 20f-3 deleted both the in-repo requirements/ directory and the requirements_path variable that named this one, and pyproject.toml has been the single dependency list since pass 20f-2; CLAUDE.md records this sibling as untouched and resolved-to-by-nothing. Superseded, so excluded rather than staged."
+    }
+  ],
+  "noise": [
+    {
+      "pattern": ".DS_Store",
+      "reason": "macOS Finder metadata. NOT IN THE BRIEF: added under the brief's own 'regenerable for free' rationale, and declared here so it is one edit to stage them if that is wrong."
+    },
+    {
+      "pattern": "__pycache__",
+      "reason": "CPython bytecode caches, regenerated on import. NOT IN THE BRIEF, added under the same rationale."
+    },
+    {
+      "pattern": ".pytest_cache",
+      "reason": "regenerable test cache. NOT IN THE BRIEF, added under the same rationale."
+    }
+  ],
+  "path_names_non_paths": [
+    {
+      "name": "_main_path_source",
+      "reason": "oncotriage.paths.PATH_NAMES has 20 members and this one is NOT a path -- it resolves to the string 'fallback' or 'environment', recording where the project root came from. It is declared here rather than skipped by a heuristic so that a future non-path member fails the cross-check instead of being silently classified as an unstaged directory."
+    }
+  ],
+  "secret_scan_allowlist": [
+    {
+      "path": "03- Code/tests/test_tracking_mlflow_index.py",
+      "sha256": "891ca7589ae914baca4264361e3787967024155dbf81140771e09ceb4d9ffceb",
+      "reason": "A DELIBERATE TEST SENTINEL, NOT A CREDENTIAL. The file assigns a constant named _SENTINEL carrying an 'sk-' prefixed literal into OPENAI_API_KEY and then requires it to appear in no MLflow parameter key and no value -- the tracking pass's proof that a credential cannot reach the tracking store. The shape is genuine, so the scanner is RIGHT to flag it and must keep flagging that shape; this is the escape hatch rather than a detector change. THIS REASON DELIBERATELY DOES NOT QUOTE THE MATCHED VALUE, and the first draft did: quoting it made THIS MANIFEST credential-shaped, the next dry run flagged s3_staging_exclusions.json itself, and the fix would have been a second allowlist entry quoting the first. An allowlist that describes what it excuses stays out of its own scan. THE COST, STATED: the key includes the file's sha256, so any edit to that test expires the excuse and the next staging run refuses until a human re-reads the finding and re-allowlists. That is the intended direction -- an excuse that survived edits would be a permanent hole under a path somebody later reuses."
+    }
+  ]
+}

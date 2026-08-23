@@ -609,6 +609,23 @@ BUCKETS = {
         _A, None, "ran green in 0.2s"),
     "test_storage_inference_logging_contract.py": (
         _A, None, "ran green in 1.8s; temp SQLite only"),
+    "test_staging_exclusions.py": (
+        _A, None,
+        "ran green in 1.1s, 117 checks, against ONLY the provisioned CI "
+        "skeleton (verified by running it under ONCOTRIAGE_MAIN_PATH pointed "
+        "at a fresh provision_ci_paths.py root, not assumed): the S3 staging "
+        "exclusion rulings and the secrets refusal. NO NETWORK AND NO AWS SDK "
+        "-- section 5 drives preflight() with a stand-in session_factory and "
+        "section 5g asserts boto3 never entered sys.modules, which is what "
+        "makes 'no network' a measurement. No keys, no spend, no live Qdrant, "
+        "no model load, no corpus, no database, no git history and no "
+        "subprocess. It EXECS NOTHING -- every control is a different INPUT to "
+        "a function, or a manifest fabricated inside a tempfile.mkdtemp it "
+        "removes and asserts gone -- so it needs no _EXEC_ALLOWLIST entry. NOT "
+        "in the collision matrix: the one repository file it reads, "
+        "s3_staging_exclusions.json, is written by neither of the suite's two "
+        "writers, and section 4b-control additionally scans the test file "
+        "itself and requires zero credential shapes in it"),
     "test_storage_provenance_persistence.py": (
         _A, None,
         "ran green in ~7s, 126 checks, against ONLY the directory skeleton: "

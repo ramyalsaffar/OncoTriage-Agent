@@ -704,6 +704,13 @@ check("the tree has the subpackages this pass expects (non-degeneracy)",
       # third-party `mcp` it imports, which is safe because Python 3 resolves
       # imports absolutely; tests/test_mcp_server_stdio_contract.py section 1
       # fires that rather than arguing it.
+      # oncotriage.staging is the S3 staging pass: the exclusion rulings, the
+      # secrets refusal, the walk and the AWS half. It is the first subpackage
+      # whose modules are reached only from an UNNUMBERED entry point
+      # (s3_stage.py, on the fixture_capture.py precedent), and none of its
+      # four modules imports boto3 at module scope -- section 2 imports every
+      # package module with twelve traps armed, and an AWS SDK at module scope
+      # would open a socket the moment the dry run was imported.
       ["oncotriage.ablation", "oncotriage.agent", "oncotriage.api",
        "oncotriage.batch",
        "oncotriage.dashboard", "oncotriage.dashboard.tabs",
@@ -711,6 +718,7 @@ check("the tree has the subpackages this pass expects (non-degeneracy)",
        "oncotriage.fixtures", "oncotriage.mcp",
        "oncotriage.monitoring", "oncotriage.orchestration",
        "oncotriage.registries", "oncotriage.retrieval",
+       "oncotriage.staging",
        "oncotriage.storage"])
 check("the scan reaches NESTED subpackages, not just the top level -- "
       "oncotriage.dashboard.tabs is two deep and setuptools does not recurse "
