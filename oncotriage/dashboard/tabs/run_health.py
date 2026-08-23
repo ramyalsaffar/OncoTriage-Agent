@@ -49,10 +49,18 @@ from oncotriage.dashboard.data import (
     RUN_TRACKING_PARTIAL,
     RUN_TRACKING_PRESENT,
     load_run_attribution_data,
+    load_run_campaign_data,
     load_run_degradation_data,
     load_run_summary_data,
     load_run_tracking_availability,
 )
+from oncotriage.dashboard.nullsafe import (
+    as_float,
+    as_int,
+    as_text,
+    optional_int_text,
+)
+from oncotriage.storage.database_logger import RUN_FINGERPRINT_COLUMNS
 from oncotriage.storage.queries import (
     RUN_ATTRIBUTION_ATTRIBUTED,
     RUN_ATTRIBUTION_DANGLING,
@@ -109,48 +117,17 @@ FINALIZATION_HELP = (
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
-
-
-def _as_int(value, default=0):
-    """An int, or `default` when the cell is NULL.
-
-    ``pd.isna`` and not ``is None``: a column holding numbers for some rows and
-    SQL NULL for others is float64, so a NULL arrives as ``nan``, which is
-    TRUTHY and is not equal to ``None``. That is the trap item 38 had to fix in
-    the cost arithmetic, and it is live in every column here that a LEFT JOIN
-    can leave unmatched.
-    """
-    if value is None or pd.isna(value):
-        return default
-    return int(value)
-
-
-def _as_float(value, default=0.0):
-    """A float, or `default` when the cell is NULL. Same ``pd.isna`` rule."""
-    if value is None or pd.isna(value):
-        return default
-    return float(value)
-
-
-def _as_text(value, default="(not recorded)"):
-    """A display string, or `default` when the cell is NULL."""
-    if value is None or (not isinstance(value, str) and pd.isna(value)):
-        return default
-    return str(value)
-
-
-def _optional_int_text(value, default="—"):
-    """An integer rendered as text, or `default` when the cell is NULL.
-
-    A SEPARATE HELPER FROM ``_as_int`` BECAUSE THE DEFAULT MUST NOT BE A NUMBER.
-    ``counters_registered`` and ``degradation_events`` are exactly the two
-    columns whose NULL means "never measured", so rendering either as 0 would
-    print the measured-clean answer for a run that was never asked -- the one
-    confusion this whole tab exists to remove. The cell says so instead.
-    """
-    if value is None or pd.isna(value):
-        return default
-    return str(int(value))
+#
+# THE FOUR NULL-SAFE READERS THAT USED TO LIVE HERE ARE IN
+# `oncotriage/dashboard/nullsafe.py` (the campaign pass) AND THE MOVE IS NOT
+# COSMETIC. They were written here because this was the first tab that had to
+# separate "the cell holds nothing" from "the cell holds zero"; it is not the
+# only one. `tabs/patient_explorer.py` was reaching for bare `int()` on nine
+# columns any of which can be NULL, and giving it a second copy of these four
+# would have been two implementations of one reading -- which is the shape that
+# ends with one tab rendering an em dash and another rendering 0 for the same
+# database cell. The defaults are still chosen HERE, at each call site, because
+# what an absence MEANS is a fact about the column and not about the helper.
 
 
 def _health_icon(health_record):
@@ -166,8 +143,8 @@ def _health_icon(health_record):
 
 def _run_label(row):
     """The selectbox label for one run row: enough to pick it without guessing."""
-    return (f"#{_as_int(row.run_id)} · {_as_text(row.status)} · "
-            f"{_as_text(row.started_at)} · {_as_text(row.invocation_source)}")
+    return (f"#{as_int(row.run_id)} · {as_text(row.status)} · "
+            f"{as_text(row.started_at)} · {as_text(row.invocation_source)}")
 
 
 def _build_run_table(summary):
@@ -179,23 +156,23 @@ def _build_run_table(summary):
             # THE CRASHED SHAPE IS A COLUMN, NOT A FOOTNOTE. It is the first
             # column so it cannot be scrolled off a wide table.
             "": "" if finalized else "⚠️",
-            "run": _as_int(row.run_id),
-            "source": _as_text(row.invocation_source),
-            "status": _as_text(row.status),
-            "finalization": _as_text(row.finalization),
-            "started": _as_text(row.started_at),
-            "finished": _as_text(row.finished_at, "—"),
-            "patients": _as_int(row.patients),
-            "errored": _as_int(row.errored),
-            "cost $": round(_as_float(row.cost_usd), 4),
-            "unpriced rows": _as_int(row.rows_with_no_cost),
+            "run": as_int(row.run_id),
+            "source": as_text(row.invocation_source),
+            "status": as_text(row.status),
+            "finalization": as_text(row.finalization),
+            "started": as_text(row.started_at),
+            "finished": as_text(row.finished_at, "—"),
+            "patients": as_int(row.patients),
+            "errored": as_int(row.errored),
+            "cost $": round(as_float(row.cost_usd), 4),
+            "unpriced rows": as_int(row.rows_with_no_cost),
             "health": f"{_health_icon(row.health_record)} "
-                      f"{_as_text(row.health_record)}",
-            "counters consulted": _optional_int_text(row.counters_registered),
-            "degradation events": _optional_int_text(row.degradation_events),
-            "prompt": _as_text(row.llm_classifier_prompt_version, "—"),
-            "model": _as_text(row.matching_model_configured, "—"),
-            "collection": _as_text(row.qdrant_collection, "—"),
+                      f"{as_text(row.health_record)}",
+            "counters consulted": optional_int_text(row.counters_registered),
+            "degradation events": optional_int_text(row.degradation_events),
+            "prompt": as_text(row.llm_classifier_prompt_version, "—"),
+            "model": as_text(row.matching_model_configured, "—"),
+            "collection": as_text(row.qdrant_collection, "—"),
         })
     return pd.DataFrame(rows)
 
@@ -241,10 +218,75 @@ def _comparison_frame(summary, value_column, label):
     """
     kept = summary[summary[value_column].notna()]
     return pd.DataFrame({
-        "run": [f"#{_as_int(v)}" for v in kept["run_id"]],
+        "run": [f"#{as_int(v)}" for v in kept["run_id"]],
         label: [float(v) for v in kept[value_column]],
         "health": list(kept["health_record"]),
     }).iloc[::-1].reset_index(drop=True)
+
+
+CAMPAIGN_CAPTION = (
+    "A `runs` row is a PROCESS, not a campaign. A batch run that crashes "
+    "leaves a KILLED row and the next invocation opens a SECOND row, so one "
+    "campaign that crashed twice is three rows above — each reporting a "
+    "FRAGMENT of the patient count and a `started_at` that is when the LAST "
+    "process started. This table stitches them back together: a run whose "
+    "`resumed` flag is set continues the nearest preceding crashed run whose "
+    "**configuration fingerprint is identical**, transitively. A configuration "
+    "change breaks the chain and starts a new campaign, because fragments "
+    "produced under different configurations must not sum."
+)
+
+CAMPAIGN_SINGLE_STATEMENT = (
+    "Every campaign here is a campaign of ONE run — nothing in this database "
+    "was resumed, or nothing that was resumed matched a preceding crashed run "
+    "on all {fields} fingerprint columns. The table above and this one "
+    "therefore carry the same rows, which is the ordinary state of a database "
+    "in which no campaign has crashed."
+)
+
+CAMPAIGN_OPEN_HELP = (
+    "`last finished` is the end of the SPAN, not necessarily the end of the "
+    "campaign: a campaign with an unfinalized fragment is open at that end and "
+    "is flagged ⚠️. It is deliberately not extrapolated to `now`."
+)
+
+
+def _build_campaign_table(campaigns):
+    """The campaign list, as a display frame. Pure: a frame in, a frame out."""
+    rows = []
+    for row in campaigns.itertuples():
+        stitched = as_int(row.stitched) == 1
+        open_span = as_int(row.unfinalized_runs) > 0
+        rows.append({
+            # STITCHED IS THE FIRST COLUMN because it is the one fact that
+            # changes how every number to its right must be read, and a first
+            # column cannot be scrolled off a wide table.
+            "": ("🔗" if stitched else "") + ("⚠️" if open_span else ""),
+            "campaign": as_int(row.campaign_id),
+            "runs": as_int(row.runs),
+            "run ids": as_text(row.run_ids, "—"),
+            "statuses": as_text(row.statuses, "—"),
+            "mixed status": "yes" if as_int(row.mixed_status) == 1 else "no",
+            "patients": as_int(row.total_patients),
+            "first started": as_text(row.first_started_at, "—"),
+            "last finished": as_text(row.last_finished_at, "—"),
+            "open fragments": as_int(row.unfinalized_runs),
+            "cost $": round(as_float(row.total_cost_usd), 4),
+            "unpriced rows": as_int(row.rows_with_no_cost),
+            "source": as_text(row.invocation_source, "—"),
+            "prompt": as_text(row.llm_classifier_prompt_version, "—"),
+            "model": as_text(row.matching_model_configured, "—"),
+            "collection": as_text(row.qdrant_collection, "—"),
+        })
+    return pd.DataFrame(rows)
+
+
+def _campaign_counts(campaigns):
+    """``(campaigns, stitched, mixed status, open)`` over the whole frame."""
+    stitched = int((campaigns["stitched"] == 1).sum())
+    mixed = int((campaigns["mixed_status"] == 1).sum())
+    open_spans = int((campaigns["unfinalized_runs"].fillna(0) > 0).sum())
+    return (len(campaigns), stitched, mixed, open_spans)
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +331,8 @@ def render_run_health_tab(df):
         return
 
     _render_run_overview(summary)
+    st.markdown("---")
+    _render_campaigns(summary)
     st.markdown("---")
     _render_attribution(df)
     st.markdown("---")
@@ -403,6 +447,79 @@ def _render_run_overview(summary):
         )
 
 
+def _render_campaigns(summary):
+    """Campaigns: the fragments of one run, stitched back together.
+
+    WHY IT IS BESIDE THE RUN LIST AND NOT INSTEAD OF IT. Both are true and they
+    answer different questions. "Which PROCESS wrote these rows" is what the run
+    list answers and is what an operator debugging a crash needs; "what did this
+    CAMPAIGN cost and how many patients did it actually cover" is this one, and
+    it is the only one a reviewer can attribute a published number to. Replacing
+    the run list with this would hide the crash; replacing this with the run list
+    is what the tab did before, and it reported a three-process campaign as
+    three campaigns with a third of the cohort each.
+    """
+    st.subheader("Campaigns")
+    st.caption(CAMPAIGN_CAPTION)
+
+    campaigns = load_run_campaign_data()
+
+    if campaigns.empty:
+        # NOT AN "empty is fine" BRANCH. This function is only reached when
+        # `summary` had rows, and the campaign query is driven from `runs` too,
+        # so an empty frame here means the query could not be answered -- on
+        # this path, almost always `runs.resumed` absent from a database written
+        # between the run-identity pass and the resumed column. The loader has
+        # already surfaced any exception; this says what the silence means.
+        st.warning(
+            "The campaign view came back with no rows while the run list has "
+            "some. Both are driven from `runs`, so this is not a fact about "
+            "the database — the usual cause is a `runs` table without the "
+            "`resumed` column, which the campaign query declares and which a "
+            "database written before that column does not have. The next "
+            "writer to open it adds the column."
+        )
+        return
+
+    total, stitched, mixed, open_spans = _campaign_counts(campaigns)
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Campaigns", total,
+                  help="One row per campaign. Fewer than the run count above "
+                       "exactly when something was resumed.")
+    with col2:
+        st.metric("Stitched from >1 run", stitched,
+                  help="Campaigns whose patient count and wall span span more "
+                       "than one process.")
+    with col3:
+        st.metric("Mixed status", mixed,
+                  help="Campaigns whose fragments did not all end the same "
+                       "way — the ordinary shape of a crash-and-resume.")
+    with col4:
+        st.metric("Open at the end", open_spans, help=CAMPAIGN_OPEN_HELP)
+
+    st.dataframe(_build_campaign_table(campaigns), use_container_width=True,
+                 hide_index=True)
+
+    if stitched:
+        st.info(
+            f"🔗 {stitched} campaign(s) were assembled from more than one "
+            f"`runs` row. For those, **the per-run patients and cost in the "
+            f"table above are fragments** — every patient an earlier process "
+            f"completed carries the EARLIER run id — and the figures here are "
+            f"the campaign totals."
+        )
+    else:
+        st.success(
+            "✅ " + CAMPAIGN_SINGLE_STATEMENT.format(
+                fields=len(RUN_FINGERPRINT_COLUMNS)))
+
+    if open_spans:
+        st.warning(f"⚠️ {open_spans} campaign(s) contain a fragment with no "
+                   f"`finished_at`. " + CAMPAIGN_OPEN_HELP)
+
+
 def _render_attribution(df):
     """Requirement 3: rows with no run id are grouped and counted, never dropped."""
     st.subheader("Inference rows by run attribution")
@@ -474,18 +591,18 @@ def _render_selected_run(summary):
     except ValueError:
         position = 0
     row = summary.iloc[position]
-    run_id = _as_int(row["run_id"])
+    run_id = as_int(row["run_id"])
 
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric("Health", f"{_health_icon(row['health_record'])} "
-                            f"{_as_text(row['health_record'])}")
+                            f"{as_text(row['health_record'])}")
     with col2:
         st.metric("Counters consulted",
-                  _optional_int_text(row["counters_registered"]))
+                  optional_int_text(row["counters_registered"]))
     with col3:
         st.metric("Degradation events",
-                  _optional_int_text(row["degradation_events"]))
+                  optional_int_text(row["degradation_events"]))
 
     breakdown = load_run_degradation_data()
     if breakdown.empty:
@@ -501,7 +618,7 @@ def _render_selected_run(summary):
 
     if row["health_record"] == RUN_HEALTH_MEASURED_CLEAN:
         st.success(CLEAN_STATEMENT.format(
-            registered=_as_int(row["counters_registered"])))
+            registered=as_int(row["counters_registered"])))
     elif row["health_record"] == RUN_HEALTH_NEVER_FLUSHED:
         st.warning(NEVER_FLUSHED_STATEMENT)
 

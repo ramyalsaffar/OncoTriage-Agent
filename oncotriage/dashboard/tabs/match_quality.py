@@ -381,7 +381,16 @@ def render_match_quality_tab(df):
                 top.columns = ['NCT ID', 'Trial', 'Match Count', 'Avg Score', 'Unconfirmed']
                 top = top.sort_values('Match Count', ascending=False).head(10)
 
-                top['Avg Score'] = (top['Avg Score'] * 100).round(0).astype(int)
+                # `.astype(int)` RAISED HERE on a group whose every
+                # `match_score` is NULL -- pandas refuses "Cannot convert
+                # non-finite values (NA or inf) to integer", and a trial
+                # written by a Stage 5 failure return is exactly that
+                # group. The nullable 'Int64' dtype carries <NA> to the
+                # renderer as an empty cell; `.fillna(0)` would print 0%
+                # for an average nobody could compute.
+                top['Avg Score'] = (
+                    pd.to_numeric(top['Avg Score'], errors='coerce') * 100
+                ).round(0).astype('Int64')
                 top = top.reset_index(drop=True)
                 top.index = top.index + 1
                 top.index.name = "Row"

@@ -3,12 +3,16 @@ Trial Explorer tab. Moved verbatim out of "21- Streamlit Dashboard.py"
 (pass 20c-3c-1).
 """
 
+import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
 from oncotriage.dashboard.data import load_trial_matches_data
-from oncotriage.dashboard.tiers import TRIAL_STATUS_PARTIAL, TRIAL_STATUS_REJECTED, TRIAL_STATUS_UNCONFIRMED, classify_trial_score
+from oncotriage.dashboard.nullsafe import is_absent
+from oncotriage.dashboard.tiers import (TRIAL_STATUS_NO_SCORE, TRIAL_STATUS_PARTIAL,
+                                        TRIAL_STATUS_REJECTED, TRIAL_STATUS_UNCONFIRMED,
+                                        classify_trial_score)
 
 
 @st.fragment
@@ -145,6 +149,12 @@ def render_trial_explorer_tab(df):
     def classify_trial_status(row):
         if row['eligible'] != 'eligible':
             return TRIAL_STATUS_REJECTED
+        # ABSENCE FIRST. `match_score` is a nullable REAL and
+        # `classify_trial_score` RAISES on None -- with no handler anywhere
+        # between here and main(), so one such row rendered a traceback where
+        # the whole dashboard should be. See TRIAL_STATUS_NO_SCORE in tiers.py.
+        if is_absent(row.get('match_score')):
+            return TRIAL_STATUS_NO_SCORE
         tier = classify_trial_score(row['match_score'])
         if tier == 'Full Match':
             return '✅ Eligible'
@@ -153,12 +163,18 @@ def render_trial_explorer_tab(df):
         return TRIAL_STATUS_UNCONFIRMED
 
     patient_details['Status'] = patient_details.apply(classify_trial_status, axis=1)
-    patient_details['Match Score'] = (patient_details['match_score'] * 100).round(0).astype(int)
+    # `.astype(int)` RAISED on a NULL score: pandas refuses "Cannot convert
+    # non-finite values (NA or inf) to integer". The nullable 'Int64' dtype
+    # carries <NA> to the renderer as an empty cell, which is the honest
+    # rendering; `.fillna(0)` would print 0% for a score nobody recorded.
+    patient_details['Match Score'] = (
+        pd.to_numeric(patient_details['match_score'], errors='coerce') * 100
+    ).round(0).astype('Int64')
 
     status_filter = st.selectbox(
         "Filter by Status",
         ["All", "✅ Eligible", TRIAL_STATUS_PARTIAL, TRIAL_STATUS_UNCONFIRMED,
-         TRIAL_STATUS_REJECTED],
+         TRIAL_STATUS_REJECTED, TRIAL_STATUS_NO_SCORE],
         key="trial_explorer_status_filter"
     )
     

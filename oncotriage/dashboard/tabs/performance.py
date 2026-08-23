@@ -11,7 +11,9 @@ import streamlit as st
 
 from oncotriage.config import MAX_TRIALS_FOR_EVALUATION
 from oncotriage.dashboard.data import load_trial_matches_data
-from oncotriage.dashboard.tiers import MATCH_TIER_COLORS, classify_trial_score
+from oncotriage.dashboard.nullsafe import is_absent
+from oncotriage.dashboard.tiers import (MATCH_TIER_COLORS, TRIAL_STATUS_NO_SCORE,
+                                        classify_trial_score)
 # THE RATE IS NOT REIMPLEMENTED HERE. oncotriage/monitoring/drift.py already
 # owns the definition -- numerator, denominator and the three exclusions -- and
 # it is the definition the drift alert fires on. A second copy in the dashboard
@@ -22,6 +24,65 @@ from oncotriage.monitoring.drift import (
     ECOG_UNAVAILABLE_RATE_THRESHOLD,
     ecog_unavailable_rate,
 )
+
+
+# ===========================================================================
+# THE SCORE-DENSITY CURVE
+# ===========================================================================
+
+
+def _kde_curve(scores):
+    """(x, y) for a Gaussian KDE over `scores`, or ``None`` when it has none.
+
+    HOISTED OUT OF ``render_performance_tab`` (the campaign pass). It closed
+    over nothing and took two arguments -- `color` and `name` -- that its body
+    never read, so nesting it bought nothing and cost the only thing that
+    matters here: it could not be driven, and therefore could not be shown to
+    survive the input that crashed it.
+
+    ``None`` MEANS "THERE IS NO CURVE TO DRAW", AND THERE ARE TWO WAYS TO GET
+    THERE. The caller skips the trace either way; the difference is only in
+    which one used to take the whole page down.
+
+      * FEWER THAN THREE POINTS. Guarded since the tab was written -- a KDE
+        over one or two observations is not a density estimate.
+
+      * ZERO VARIANCE, WHICH WAS NOT GUARDED AND IS NOT RARE. ``gaussian_kde``
+        raises ``numpy.linalg.LinAlgError`` ("the data appears to lie in a
+        lower-dimensional subspace ... singular data covariance matrix") on any
+        input whose values are all identical, and this is a REACHABLE state
+        rather than a pathological one: `rerank_score` is NULL for every trial
+        of a run that fell back to BM25-only, so the frame is filled with one
+        value; a cohort with two trials in one arm scoring identically does it
+        too. The raise happens inside ``render_performance_tab``, which
+        ``main()`` calls with no handler, so ONE such arm took out ALL TEN TABS
+        before the reader saw anything.
+
+    THE TEST IS ``ptp() == 0`` AND NOT ``std() == 0``, and the difference is
+    real. ``std`` of three identical values is a float computed through a sum
+    of squares and can come back as a denormal rather than an exact zero, so a
+    ``== 0`` on it can be False for input the estimator still refuses; the peak
+    to peak of identical values is exactly ``0`` by construction. It is also
+    the cheaper of the two.
+
+    A NON-FINITE VALUE IS REFUSED FOR THE SAME REASON. ``np.ptp`` over an array
+    holding ``inf`` returns ``nan``, which compares False against ``0`` and
+    would slip past a bare equality test straight into the estimator; and
+    ``np.linspace`` around an infinity produces no usable range even when the
+    estimator does not raise.
+    """
+    scores = np.asarray(scores, dtype=float)
+    if scores.size < 3:
+        return None
+    if not np.all(np.isfinite(scores)):
+        return None
+    if np.ptp(scores) == 0:
+        return None
+    from scipy.stats import gaussian_kde
+    kde = gaussian_kde(scores, bw_method='scott')
+    x_range = np.linspace(scores.min() - 0.05, scores.max() + 0.05, 300)
+    y_range = kde(x_range)
+    return x_range, y_range
 
 
 # ===========================================================================
@@ -551,10 +612,35 @@ def render_performance_tab(df):
             def classify_match(row):
                 if row['eligible'] != 'eligible':
                     return 'Not Eligible'
+                # ABSENCE FIRST -- see TRIAL_STATUS_NO_SCORE in tiers.py.
+                # `classify_trial_score` RAISES TypeError on a None
+                # `match_score`, with no handler between here and main(), so a
+                # single such row took every tab down.
+                if is_absent(row.get('match_score')):
+                    return TRIAL_STATUS_NO_SCORE
                 tier = classify_trial_score(row['match_score'])
                 return 'Eligible' if tier == 'Full Match' else tier
 
             tm_perf['match_status'] = tm_perf.apply(classify_match, axis=1)
+            # UNSCORED TRIALS ARE EXCLUDED FROM THIS PANEL AND COUNTED, NOT
+            # GIVEN A COLOUR. Every chart below relates the cross-encoder score
+            # to the OUTCOME -- recall against a threshold, density by outcome,
+            # recall against a top-N cap -- and a trial with no outcome score
+            # has no outcome to relate; plotting it as a fifth series would put
+            # a band on the recall curve that no denominator accounts for. The
+            # exclusion is stated in the caption rather than made silently,
+            # which is the same ruling `_comparison_frame` makes in the Run
+            # Health tab for a run with no degradation total.
+            _unscored = int((tm_perf['match_status'] == TRIAL_STATUS_NO_SCORE).sum())
+            if _unscored:
+                tm_perf = tm_perf[tm_perf['match_status'] != TRIAL_STATUS_NO_SCORE]
+                st.caption(
+                    f"⚠️ {_unscored} trial row(s) in the current selection carry "
+                    f"no `match_score` and are EXCLUDED from every chart in this "
+                    f"panel — a trial with no recorded outcome cannot contribute "
+                    f"to a recall or a density by outcome. They are not counted "
+                    f"as not-eligible."
+                )
             tm_perf = tm_perf.dropna(subset=['rerank_score'])
 
             color_map = {
@@ -878,20 +964,11 @@ def render_performance_tab(df):
 
                 fig_kde = go.Figure()
 
-                def _kde_curve(scores, color, name):
-                    if len(scores) < 3:
-                        return None
-                    from scipy.stats import gaussian_kde
-                    kde = gaussian_kde(scores, bw_method='scott')
-                    x_range = np.linspace(scores.min() - 0.05, scores.max() + 0.05, 300)
-                    y_range = kde(x_range)
-                    return x_range, y_range
-
                 for scores, color, fill_color, name in [
                     (eligible_scores,     '#2ca02c', 'rgba(44,160,44,0.15)',  'Eligible / Partial'),
                     (not_eligible_scores, '#d62728', 'rgba(214,39,40,0.15)',  'Not Eligible'),
                 ]:
-                    result = _kde_curve(scores, color, name)
+                    result = _kde_curve(scores)
                     if result is None:
                         continue
                     x_range, y_range = result

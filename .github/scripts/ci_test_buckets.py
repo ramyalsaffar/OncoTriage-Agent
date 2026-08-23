@@ -358,6 +358,25 @@ BUCKETS = {
         "writes, because GET /pipeline/info reports which source supplied the "
         "Qdrant endpoint -- the same precondition "
         "test_agent_retrieval_observability.py carries"),
+    "test_dashboard_app_integration.py": (
+        _A, None,
+        "ran green in 2.0s, 110 checks -- 110 passed, 0 failed, 0 skipped -- "
+        "against the developer tree, and its one gated probe records a SKIP "
+        "on a checkout with no production inferences.db (the byte-identity "
+        "check it guards stays LIVE either way). Renders "
+        "oncotriage.dashboard.app:main() end to end plus five tab functions "
+        "against ONE seeded scratch database inside a tempfile.mkdtemp it "
+        "removes, with paths._RESOLVED repointed at it and restored. No "
+        "network (measured -- every render runs with socket.connect/"
+        "connect_ex/create_connection/getaddrinfo replaced by a recorder that "
+        "RAISES, with a control that makes a real call and is named in the "
+        "record), no keys, no spend, no live Qdrant, no model load, no corpus, "
+        "no git history, no live server. NOT in the collision matrix: it "
+        "writes only inside its temp directory, and the six repository files "
+        "it READS -- dashboard/app.py, dashboard/nullsafe.py and four tab "
+        "modules -- are written by neither of the suite's two writers and are "
+        "sha256-compared at the end. It EXECS NOTHING: every plant is a COPY "
+        "written to the temp directory and imported from there"),
     "test_dashboard_run_health.py": (
         _A, None,
         # RE-READ OFF A REAL RUN (this pass), and the string it replaces was

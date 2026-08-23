@@ -1555,8 +1555,8 @@ check("...and lacks inferences.run_id too, which is the state a database "
 # stop describing this list the moment a column-only query joined it.
 check("a database with no run tables reports every run query as unavailable",
       sorted(queries.unavailable(_legacy_conn)),
-      ["dangling_run_references", "run_attribution_coverage",
-       "run_degradation_breakdown", "run_summary",
+      ["campaign_summary", "dangling_run_references",
+       "run_attribution_coverage", "run_degradation_breakdown", "run_summary",
        "stage5_input_packing_pressure", "stage5_output_split_pressure"])
 # BOTH ABSENT TABLES AND THE ABSENT COLUMN, and the column is named even
 # though `runs` is missing too, because `inferences` IS present and its column
@@ -3090,6 +3090,284 @@ if _PRE_FIX_SRC:
 check_true("the queries module says instead that report() completes",
            "runs to the end" in _queries_doc.lower()
            or "completes" in _queries_doc.lower())
+
+
+# ===========================================================================
+# SECTION 8b -- CAMPAIGNS: THE FRAGMENTS OF ONE RUN, STITCHED
+# ===========================================================================
+#
+# ITS OWN SCRATCH DATABASE, AND THAT IS A DECISION RATHER THAN CONVENIENCE. The
+# seed above is depended on by roughly forty checks that count its runs, sum its
+# patients and pin its ordering; adding six campaign runs to it would move every
+# one of those numbers, and a section that has to renumber its neighbours to
+# exist is a section that will be got wrong. What the main seed DOES contribute
+# is the ordinary case: its four runs carry no `resumed` value at all, so
+# `campaign_summary` must report four campaigns of one -- which section 2 has
+# already established is non-empty, and check 8b-a states explicitly.
+#
+# THE SHAPES, and each one is a different arm of the stitch rule:
+#
+#   CHAIN-1 KILLED   ─┐
+#   CHAIN-2 KILLED  resumed=1, same fingerprint  ─┐  one campaign of three
+#   CHAIN-3 FINISHED resumed=1, same fingerprint  ─┘  (transitive)
+#   SOLO    FINISHED resumed=0                       a campaign of one
+#   FPCRASH KILLED   fingerprint A                   its own campaign
+#   FPRESUME FINISHED resumed=1, fingerprint B       MUST NOT STITCH
+#   LEGACY  KILLED   resumed NULL, no fingerprint    its own campaign
+#
+# The last one is the shape every `runs` row written before those columns
+# existed has, and it is here because null-safe equality (`IS`) makes two
+# all-NULL fingerprints compare EQUAL -- so without the "a stamp was recorded"
+# guard, two unrelated legacy runs would stitch into one campaign on the
+# strength of both being unknown.
+
+print()
+print("=" * 78)
+print("SECTION 8b -- campaign_summary")
+print("=" * 78)
+
+_CAMPAIGN_DB = os.path.join(_TMP_DIR, "campaigns.db")
+with quiet():
+    initialize_database(_CAMPAIGN_DB)
+_camp_conn = sqlite3.connect(_CAMPAIGN_DB)
+_camp_cur = _camp_conn.cursor()
+
+# (label, status, resumed, fingerprint key, started_at, finished_at)
+_CAMPAIGN_RUNS = [
+    ("CHAIN-1",  "KILLED",   0,    "A", "2026-08-01T10:00:00", "2026-08-01T11:00:00"),
+    ("CHAIN-2",  "KILLED",   1,    "A", "2026-08-01T12:00:00", "2026-08-01T13:00:00"),
+    ("CHAIN-3",  "FINISHED", 1,    "A", "2026-08-01T14:00:00", "2026-08-01T15:00:00"),
+    ("SOLO",     "FINISHED", 0,    "A", "2026-08-02T10:00:00", "2026-08-02T11:00:00"),
+    ("FPCRASH",  "KILLED",   0,    "A", "2026-08-03T10:00:00", "2026-08-03T11:00:00"),
+    ("FPRESUME", "FINISHED", 1,    "B", "2026-08-03T12:00:00", "2026-08-03T13:00:00"),
+    ("LEGACY",   "KILLED",   None, None, "2026-07-01T10:00:00", "2026-07-01T11:00:00"),
+]
+# Which patients each fragment wrote. THE POINT OF THE WHOLE QUERY is that these
+# sum across a campaign, so the three CHAIN fragments deliberately carry
+# different counts -- a query that reported any one fragment's number, or a
+# constant, could not pass.
+_CAMPAIGN_PATIENTS = {
+    "CHAIN-1": [("C1-a", 0.10), ("C1-b", 0.10), ("C1-c", 0.10)],
+    "CHAIN-2": [("C2-a", 0.20), ("C2-b", 0.20)],
+    "CHAIN-3": [("C3-a", None)],
+    "SOLO":    [("S-a", 0.50)],
+    "FPCRASH": [("F1-a", 0.10)],
+    "FPRESUME": [("F2-a", 0.10)],
+}
+_CAMPAIGN_IDS = {}
+for _label, _status, _resumed, _fp, _started, _finished in _CAMPAIGN_RUNS:
+    if _fp is None:
+        _camp_cur.execute(
+            "INSERT INTO runs (started_at, finished_at, status, "
+            "invocation_source, resumed) VALUES (?, ?, ?, ?, ?)",
+            (_started, _finished, _status, "batch_runner", _resumed))
+    else:
+        _camp_cur.execute(
+            "INSERT INTO runs (started_at, finished_at, status, "
+            "invocation_source, resumed, fingerprint_version, "
+            "llm_classifier_prompt_version, llm_classifier_renderer_digest, "
+            "matching_model_configured, qdrant_collection, collection_points, "
+            "data_snapshot_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (_started, _finished, _status, "batch_runner", _resumed, 2,
+             f"1.9.0-{_fp}", f"digest-{_fp}", "gpt-5.6-terra",
+             f"trial_criteria_{_fp}", 12067, "2026-02-26"))
+    _CAMPAIGN_IDS[_label] = _camp_cur.lastrowid
+for _label, _rows in _CAMPAIGN_PATIENTS.items():
+    for _pid, _cost in _rows:
+        _camp_cur.execute(
+            "INSERT INTO inferences (patient_id, timestamp, run_id, "
+            "estimated_cost_usd, error, age, sex) "
+            "VALUES (?, ?, ?, ?, '', 60, 'male')",
+            (_pid, "2026-08-20 10:00:00", _CAMPAIGN_IDS[_label], _cost))
+_camp_conn.commit()
+
+check_true("8b-seed: the seven campaign runs were written with distinct ids "
+           "(non-degeneracy: every expectation below is keyed by one)",
+           len(set(_CAMPAIGN_IDS.values())) == len(_CAMPAIGN_RUNS))
+check("8b-seed: the resumed column really carries 1 on the three rows the "
+      "stitch rule is supposed to act on, and NULL on the legacy row -- "
+      "without this the whole section is vacuous",
+      [_camp_conn.execute("SELECT resumed FROM runs WHERE id = ?",
+                          (_CAMPAIGN_IDS[_l],)).fetchone()[0]
+       for _l in ("CHAIN-2", "CHAIN-3", "FPRESUME", "SOLO", "LEGACY")],
+      [1, 1, 1, 0, None])
+
+_campaigns = queries.run(_camp_conn, "campaign_summary")
+_camp_by_id = {int(r.campaign_id): r for r in _campaigns.itertuples()}
+
+# --- THE THREE-FRAGMENT CAMPAIGN ------------------------------------------
+_ROOT = _CAMPAIGN_IDS["CHAIN-1"]
+_chain = _camp_by_id.get(_ROOT)
+check("8b-a: the three fragments are ONE campaign, rooted at the first",
+      None if _chain is None else _safe_int(_chain.runs), 3)
+check("8b-a: ...with its run ids in ascending order, which is what makes the "
+      "chain readable rather than a set",
+      None if _chain is None else _chain.run_ids,
+      " -> ".join(str(_CAMPAIGN_IDS[_l])
+                  for _l in ("CHAIN-1", "CHAIN-2", "CHAIN-3")))
+check("8b-a: ...and the statuses in the same order",
+      None if _chain is None else _chain.statuses,
+      "KILLED -> KILLED -> FINISHED")
+check("8b-a: ...and the campaign is flagged as stitched",
+      None if _chain is None else _safe_int(_chain.stitched), 1)
+check("8b-a: ...and as mixed-status, because its fragments did not all end "
+      "the same way",
+      None if _chain is None else _safe_int(_chain.mixed_status), 1)
+
+_EXPECTED_CHAIN_PATIENTS = sum(
+    len(_CAMPAIGN_PATIENTS[_l]) for _l in ("CHAIN-1", "CHAIN-2", "CHAIN-3"))
+check("8b-b: total_patients is SUMMED across the fragments -- this is the "
+      "number run_summary cannot give, because each of its rows carries only "
+      "the patients ITS process wrote",
+      None if _chain is None else _safe_int(_chain.total_patients),
+      _EXPECTED_CHAIN_PATIENTS)
+check_true("8b-b: ...and the fragments carry different counts, so a query "
+           "reporting any ONE of them, or a constant, could not pass",
+           len({len(_CAMPAIGN_PATIENTS[_l])
+                for _l in ("CHAIN-1", "CHAIN-2", "CHAIN-3")}) == 3)
+check("8b-b: ...and the largest single fragment is smaller than the total, "
+      "which is what says the sum happened",
+      None if _chain is None
+      else _safe_int(_chain.total_patients) > max(
+          len(_CAMPAIGN_PATIENTS[_l])
+          for _l in ("CHAIN-1", "CHAIN-2", "CHAIN-3")), True)
+
+check("8b-c: the wall span runs from the FIRST fragment's start to the LAST "
+      "fragment's finish",
+      None if _chain is None else (_chain.first_started_at,
+                                   _chain.last_finished_at),
+      ("2026-08-01T10:00:00", "2026-08-01T15:00:00"))
+check("8b-c: ...and no fragment is open, so the span is closed",
+      None if _chain is None else _safe_int(_chain.unfinalized_runs), 0)
+check("8b-c: ...and the cost is summed with the unpriced row COUNTED rather "
+      "than silently contributing a zero nobody can see",
+      None if _chain is None else (round(_safe_float(_chain.total_cost_usd), 4),
+                                   _safe_int(_chain.rows_with_no_cost)),
+      (0.7, 1))
+
+# --- THE FINGERPRINT BREAK ------------------------------------------------
+#
+# THE CHECK THE WHOLE QUERY EXISTS FOR. A resumed run whose configuration
+# differs from the crashed run before it must NOT be added to that campaign's
+# total, because "which configuration produced this number" is the question a
+# campaign total is asked.
+check("8b-d: a resume whose fingerprint differs does NOT stitch -- the "
+      "crashed run before it stays a campaign of one",
+      _safe_int(_camp_by_id[_CAMPAIGN_IDS["FPCRASH"]].runs), 1)
+check("8b-d: ...and the resume is its own campaign, reported as a fragment "
+      "rather than silently added to a total it does not belong in",
+      (_safe_int(_camp_by_id[_CAMPAIGN_IDS["FPRESUME"]].runs),
+       _safe_int(_camp_by_id[_CAMPAIGN_IDS["FPRESUME"]].stitched)), (1, 0))
+check("8b-d: ...and their patients are NOT summed together",
+      (_safe_int(_camp_by_id[_CAMPAIGN_IDS["FPCRASH"]].total_patients),
+       _safe_int(_camp_by_id[_CAMPAIGN_IDS["FPRESUME"]].total_patients)),
+      (1, 1))
+check_true("8b-d: ...and the two really do differ only in the fingerprint -- "
+           "same resumed flag, same adjacency, same statuses as the chain "
+           "above, so nothing but the fingerprint can explain the difference",
+           _camp_conn.execute(
+               "SELECT COUNT(*) FROM runs a, runs b WHERE a.id = ? AND b.id = ? "
+               "AND b.resumed = 1 AND a.status = 'KILLED' AND b.id = a.id + 1 "
+               "AND a.llm_classifier_renderer_digest != "
+               "b.llm_classifier_renderer_digest",
+               (_CAMPAIGN_IDS["FPCRASH"], _CAMPAIGN_IDS["FPRESUME"])
+           ).fetchone()[0] == 1)
+
+# --- THE UNSTITCHED SHAPES ------------------------------------------------
+check("8b-e: a run that was never resumed onto is a campaign of one, not "
+      "stitched, not mixed",
+      (_safe_int(_camp_by_id[_CAMPAIGN_IDS["SOLO"]].runs),
+       _safe_int(_camp_by_id[_CAMPAIGN_IDS["SOLO"]].stitched),
+       _safe_int(_camp_by_id[_CAMPAIGN_IDS["SOLO"]].mixed_status)),
+      (1, 0, 0))
+check("8b-f: a LEGACY run -- resumed NULL and no fingerprint at all -- is its "
+      "own campaign. Null-safe equality makes two unrecorded fingerprints "
+      "compare EQUAL, so without the 'a stamp was recorded' guard two "
+      "unrelated legacy runs would stitch on the strength of both being "
+      "unknown",
+      _safe_int(_camp_by_id[_CAMPAIGN_IDS["LEGACY"]].runs), 1)
+
+check("8b-g: every run appears in exactly one campaign and none is lost -- "
+      "the query is driven from `runs`, so the members must partition it",
+      sum(_safe_int(r.runs) for r in _campaigns.itertuples()),
+      len(_CAMPAIGN_RUNS))
+check("8b-g: ...so there are five campaigns over seven runs",
+      len(_campaigns), 5)
+check("8b-g: ...newest campaign first, which is what ORDER BY campaign_id "
+      "DESC means and is the same ordering run_summary uses",
+      list(_campaigns["campaign_id"]),
+      sorted(_camp_by_id, reverse=True))
+
+check("8b-h: the campaign carries the ROOT fragment's configuration, which "
+      "every member matched transitively -- so a reviewer can attribute the "
+      "total without opening a second query",
+      None if _chain is None else (_chain.llm_classifier_prompt_version,
+                                   _chain.qdrant_collection),
+      ("1.9.0-A", "trial_criteria_A"))
+
+# --- A CAMPAIGN THAT IS STILL OPEN ----------------------------------------
+#
+# `last_finished_at` is MAX(finished_at), which IGNORES NULLs -- so a campaign
+# whose final fragment has not finished would otherwise report the PREVIOUS
+# fragment's finish time as the end of the campaign, with nothing saying the
+# span is open. `unfinalized_runs` is what says it.
+_camp_cur.execute(
+    "INSERT INTO runs (started_at, finished_at, status, invocation_source, "
+    "resumed, fingerprint_version, llm_classifier_prompt_version, "
+    "llm_classifier_renderer_digest, matching_model_configured, "
+    "qdrant_collection, collection_points, data_snapshot_date) "
+    "VALUES (?, NULL, 'RUNNING', 'batch_runner', 1, 2, '1.9.0-A', "
+    "'digest-A', 'gpt-5.6-terra', 'trial_criteria_A', 12067, '2026-02-26')",
+    ("2026-08-04T10:00:00",))
+_OPEN_RUN = _camp_cur.lastrowid
+_camp_conn.commit()
+_open_campaigns = queries.run(_camp_conn, "campaign_summary")
+_open_by_id = {int(r.campaign_id): r for r in _open_campaigns.itertuples()}
+_open_chain = _open_by_id.get(_CAMPAIGN_IDS["FPCRASH"])
+check("8b-i: a RUNNING fragment with no finished_at joins the nearest "
+      "preceding crashed run of the same configuration",
+      None if _open_chain is None else _safe_int(_open_chain.runs), 2)
+check("8b-i: ...and the campaign reports its open fragment rather than "
+      "presenting the earlier fragment's finish as the end of the campaign",
+      None if _open_chain is None else _safe_int(_open_chain.unfinalized_runs),
+      1)
+check("8b-i: ...with last_finished_at still the newest finish that EXISTS, "
+      "never extrapolated to now",
+      None if _open_chain is None else _open_chain.last_finished_at,
+      "2026-08-03T11:00:00")
+_camp_cur.execute("DELETE FROM runs WHERE id = ?", (_OPEN_RUN,))
+_camp_conn.commit()
+check("8b-i: ...and the probe row is removed",
+      len(queries.run(_camp_conn, "campaign_summary")), 5)
+
+# --- THE STITCH PREDICATE IS GENERATED, NOT RETYPED -----------------------
+check("8b-j: the fingerprint match is built from the writer's own column "
+      "tuple, so a newly gated field tightens the stitch by itself rather "
+      "than leaving one axis along which two configurations merge silently",
+      sorted(c for c in dblog.RUN_FINGERPRINT_COLUMNS
+             if f"prev.{c} IS r.{c}" not in queries._CAMPAIGN_EDGE_SQL), [])
+check("8b-j: ...and every one of them is really in the registered SQL "
+      "(non-degeneracy: an empty tuple would satisfy the line above)",
+      len(dblog.RUN_FINGERPRINT_COLUMNS) >= 7, True)
+check("8b-j: ...and the stamp column the guard tests for NOT NULL is one of "
+      "them", queries.CAMPAIGN_STAMP_COLUMN in dblog.RUN_FINGERPRINT_COLUMNS,
+      True)
+check("8b-j: ...and the resumable statuses are a PROPER subset of the "
+      "terminal ones -- FINISHED must not be resumable, or a re-run of a "
+      "completed cohort would be glued onto it",
+      (set(queries.CAMPAIGN_RESUMABLE_STATUSES)
+       < set(dblog.RUN_RECORD_TERMINAL_STATUSES),
+       "FINISHED" in queries.CAMPAIGN_RESUMABLE_STATUSES), (True, False))
+
+# --- THE MAIN SEED, WHICH HAS NO RESUMES ----------------------------------
+check("8b-k: on the main seed -- four runs, none of them a resume -- every "
+      "campaign is a campaign of one, so the ordinary database is unaffected "
+      "by any of this",
+      sorted(_safe_int(r.runs)
+             for r in _frame_or_raise("campaign_summary").itertuples()),
+      [1] * len(_RUN_ROWS))
+
+_camp_conn.close()
 
 
 # ===========================================================================

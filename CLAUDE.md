@@ -408,7 +408,7 @@ python tests/test_registries_cancer_code_claims_audit_control.py   #  16; 14 pla
 python tests/test_config_snapshot_date_rot.py                      #  10; 6 subprocess runs, ~6 min
 python tests/test_package_invariants.py                            # 260/0/0 on macOS (was 247 before section 2f(iii)); 245/2/2 on Linux was measured at 247 and has not been re-measured there (was 234/6 there before commit ec2033a gave it a SKIP mechanism). No network, no keys, no corpus. NOT in CI — see below
 python tests/test_degraded_dependencies.py                         # 174 (was 172 in this note, and 170 before pass 20e; the 172 was never true of the file). Item 11a
-python tests/test_storage_query_layer.py                           # 317 (this line said 260 and was stale by 50 before the schema-guards pass; the crash-record pass added the dangling-reference audit's seeding and checks; MEASURED 2026-08-23); item 38, temp SQLite only
+python tests/test_storage_query_layer.py                           # 349 (was 317; the campaign pass added section 8b over `campaign_summary`. MEASURED 2026-08-23); item 38, temp SQLite only
 
 # The four added by pass 20f-1. Same shape, same directory, no network, no keys,
 # no spend, and none of them writes anything in the repository.
@@ -451,7 +451,22 @@ python tests/test_dashboard_reproducibility_tab.py --update-snapshot  # regenera
 # therefore not pinned to a streamlit version's element vocabulary -- see its
 # docstring for why a snapshot recorded on day one of a NEW tab would be the
 # "correct by definition" shape that file's own rule forbids. ~0.9 s.
-python tests/test_dashboard_run_health.py                          # 155
+python tests/test_dashboard_run_health.py                          # 192
+
+# The campaign pass. Same shape, same directory. It is the ONLY thing in this
+# project that renders oncotriage.dashboard.app:main() -- the ten-tab wiring
+# had no test at all, so a tab dropped or renamed failed nothing -- and it is
+# also where the null-resilience of the tabs is measured, because both are
+# answered by rendering and one seeded database serves both. No network
+# (MEASURED: every render runs with socket.connect / connect_ex /
+# create_connection / getaddrinfo replaced by a recorder that RAISES, with a
+# control that makes a real call and is NAMED in the record), no keys, no
+# spend, no live Qdrant, no model load, no corpus, no git history, no live
+# server. NOT in the collision matrix -- it writes only inside a
+# tempfile.mkdtemp it removes, and the six repository files it reads are
+# written by neither of the suite's two writers and are sha256-compared at the
+# end. It EXECS NOTHING: every plant is a COPY in that temp directory. ~2 s.
+python tests/test_dashboard_app_integration.py                     # 110 (this line said 155 and was stale by 12 before the campaign pass, which added section 8 over the campaigns panel and its two plants; MEASURED 2026-08-23)
 
 # The counter-reader pass. Same shape, same directory. No network, no keys, no
 # spend, no live Qdrant, no model load, no corpus, no git history, and NOT in
@@ -5332,6 +5347,250 @@ The whole ten-tab dashboard was rendered end to end through `main()` with
 `AppTest` (no exceptions, all ten headers present), and the new tab was rendered
 against the **real production database** read-only, where it correctly reports
 "no run tracking yet". **No money was spent and no migration was run.**
+
+
+### A campaign is a row now, and one sparse row no longer takes the page down (the campaign pass)
+
+**FIVE ITEMS, ALL IN THE DASHBOARD AND THE QUERY LAYER, AND TWO OF THEM ARE
+CRASHES THAT WERE LIVE.** No schema change, no migration, no billed call:
+`python fixture_replay.py` is **12/12 clean, exit 0, with no recapture**, and
+the production `inferences.db` sha256 is unchanged.
+
+**1. `oncotriage/dashboard/tabs/patient_explorer.py` CONVERTED EVERY NUMERIC
+CELL WITH A BARE `int()`, AND MOST OF THE COLUMNS IT READS ARE NULLABLE.**
+`int(nan)` raises `ValueError`, `int(None)` and `round(None, 2)` raise
+`TypeError`, `f"{None:.2f}"` raises `TypeError`, `pd.NaT.strftime(...)` raises
+`ValueError`, and `.astype(int)` over a column with one NaN raises. None of
+them is caught: `oncotriage/dashboard/app.py` calls the tab inside `main()`
+with no handler, so **one row cost all ten tabs, for every reader**. Measured
+against the pre-fix module out of `git show HEAD:`, not reasoned about — it
+raises, and the shipped one renders.
+
+**THE SWEEP FOUND MORE THAN THE TWO COLUMNS THE ITEM NAMED**, and the census is
+the finding. By AST over the pre-fix file: **41 conversion sites — 29 `int()`,
+6 format-specs, 3 `round()`, 2 `strftime` and 1 `.astype(int)`** — across the
+demographics tiles, the match-result tiles, the CSV export, the funnel (ten of
+them), the rule-filter drop line, the trial table, the four performance tiles
+and the two token tiles. Not `candidates_retrieved` and `mesh_dropped` alone.
+**Three remain, and each is argued**: one `round()` INSIDE the CSV helper (its
+argument has already been tested for absence), one over a mean the accessor
+guarantees is a float, and the `.astype('Int64')` that is the fix rather than a
+survivor.
+
+**AND IT FOUND FOUR MORE TABS WITH THE SAME SHAPE, WHICH IS BEYOND THE LETTER
+OF THE ITEM AND IS WHY IT WAS DONE ANYWAY.** The ten-tab render in item 2 is
+the forcing function: a test that says "the dashboard survives a sparse
+database" cannot pass while another tab takes it down.
+
+**WHICH OF THEM WERE LIVE THROUGH `main()` IS MEASURED, NOT CLAIMED.** Each fix
+was reverted in a `copytree`d copy with `PYTHONPATH` pointed at it and `main()`
+rendered against the seed:
+
+| reverted | `main()` on the seed |
+|---|---|
+| `patient_explorer.py` | **raises** `Cannot convert non-finite values (NA or inf) to integer` |
+| `match_quality.py` | **raises** the same |
+| `performance.py` | **raises** `LinAlgError` out of `gaussian_kde` |
+| `trial_explorer.py` | renders clean |
+| `demographics.py` | renders clean |
+
+The last two are guards against states `main()` does not reach TODAY, and they
+are kept and driven directly rather than dropped: the trial explorer renders the
+SELECTED trial only and its selector is ordered by patient count, so the
+unscored trial is never the default; and the sidebar drops NULL-`age` rows
+before the demographics tab sees them. Both tab functions are public and take
+whatever frame they are handed, so both have a subject — checks 4f and 4g drive
+them against a database and a frame that reach the guard, each with a plant that
+fires. **Recording which were live is the difference between a fix and a claim.**
+
+| tab | what raised | fix |
+|---|---|---|
+| `trial_explorer.py` | `classify_trial_score(None)`, and `.astype(int)` on a NULL score | absence tested first; nullable `Int64` |
+| `performance.py` | `classify_trial_score(None)` | absence tested first; unscored trials EXCLUDED from the panel and the exclusion stated on screen |
+| `match_quality.py` | `.astype(int)` on a group whose every `match_score` is NULL, so `mean()` is NaN | nullable `Int64` |
+| `demographics.py` | `(NaN // 10) * 10` then `.astype(int)` on a NULL age | rows with no age excluded from the age panel and COUNTED on screen |
+
+**`classify_trial_score` ITSELF IS UNCHANGED, DELIBERATELY.** It is a pure
+partition of a score into three, and "there is no score" is not a fourth bucket
+of it — it RAISES on `None` and answers `'Unconfirmed Match'` on `nan`, which is
+a real verdict about a measurement nobody made. `TRIAL_STATUS_NO_SCORE` is in
+`oncotriage/dashboard/tiers.py` with the other three per-trial statuses, because
+all three tabs that classify a trial need it and a status string typed out in
+three files is what pass 20f-3 had to come back and fix for `'✅ Full Match'`.
+
+**`oncotriage/dashboard/nullsafe.py` IS THE ONE OWNER OF "RENDER A CELL THAT MAY
+BE NULL"**, and it exists because `tabs/run_health.py` already carried four
+private readers of exactly that shape. Giving the Patient Explorer a second copy
+would be two implementations of one reading, which ends with one tab rendering
+an em dash and another rendering `0` for the same database cell. The four moved;
+`run_health.py` imports them; **the run-health test's P6 plant was retargeted at
+the CALL SITE rather than the helper**, which is the stronger control anyway
+(the defect it models is "somebody used the wrong reader here", a decision taken
+at the call site).
+
+**WHICH helper is the judgement and it is made per column**, never once:
+`optional_int_text` where NULL means "never measured" (its default must not be a
+number — that is the whole reason it is a separate function); `as_int` where the
+value feeds a CHART, which has no third state; `None` in the CSV export, because
+an em dash in a numeric CSV column makes it a text column to every tool that
+opens it. **A bar cannot draw "unknown", so the funnel NAMES the stages it drew
+at zero underneath itself.** A stage a row never recorded is otherwise
+indistinguishable at zero from one that genuinely passed nothing on — the
+confusion `run_metrics`' meta row exists to remove, one layer up.
+
+**2. NOTHING IN THE PROJECT HAD EVER CALLED `main()`.**
+`tests/test_dashboard_run_health.py` and
+`tests/test_dashboard_reproducibility_tab.py` each drive ONE tab function,
+deliberately, and neither can see the wiring above them — so a tab dropped from
+the strip, a tab renamed, or a `with tabN:` block deleted failed NOTHING.
+`tests/test_dashboard_app_integration.py` renders it. **The expected tab set is
+read out of `app.py` BY AST**, so the check is "the strip renders what the
+source declares" rather than "the strip renders what it rendered last time" —
+and `st.tabs` and the `render_*_tab` calls are pinned SEPARATELY, because a tab
+added to one and not the other renders an empty panel that no assertion about
+LABELS can see.
+
+**3. `_kde_curve` GUARDED `len(scores) < 3` AND NOT ZERO VARIANCE**, and
+`gaussian_kde` raises `numpy.linalg.LinAlgError` on a constant distribution —
+which a BM25-only fallback run produces, since every `rerank_score` is then
+unset. It is HOISTED to module scope (it closed over nothing and took two
+arguments its body never read, so nesting bought nothing and cost the only thing
+that matters: it could not be driven).
+
+**THE RAISE IS VALUE-DEPENDENT, AND THAT WAS MEASURED RATHER THAN ASSUMED.**
+Whether the estimator raises depends on the VALUE, because the covariance it
+inverts is computed by subtracting a mean: for a constant that is exactly
+representable in binary the residuals are exactly zero and the matrix is exactly
+singular, and for one that is not they are denormal-but-non-zero and the
+inversion SUCCEEDS. Measured on scipy 1.15.3:
+
+    [0.5]*4  -> LinAlgError        [0.42]*6 -> no raise, a curve
+    [0.0]*5  -> LinAlgError        [0.42]*3 -> no raise, a curve
+    [1.0]*6  -> LinAlgError
+
+So the unguarded function had two failure modes and only one of them was loud;
+the other renders an enormously peaked curve over an interval of width zero. The
+guard covers both, the test's seed uses **0.5** because 0.42 would have reported
+the planted defect as UNCAUGHT, and check 4f records the silent half so a reader
+does not come away believing it does not exist. The test is `np.ptp(...) == 0`
+and not `std() == 0`: a sum-of-squares can come back denormal rather than an
+exact zero, while the peak-to-peak of identical values is exactly 0 by
+construction.
+
+**4. `campaign_summary` IS THE READER FOR RUNS THAT CRASHED AND RESUMED.** A
+`runs` row is a PROCESS: a batch run that dies leaves a KILLED row and the next
+invocation opens a SECOND one, so one campaign that crashed twice is three rows
+— each reporting a FRAGMENT of the cohort and a `started_at` that is when the
+LAST process started. It is DERIVED, not stored: nothing was added to the
+schema, and `resumed` plus the seven fingerprint columns are what make the
+derivation possible.
+
+**THE STITCH RULE, AND WHY EACH HALF IS THERE.** A run with `resumed = 1`
+continues the campaign of the nearest PRECEDING run whose status is KILLED or
+FAILED **and** whose fingerprint columns are identical; chains stitch
+transitively. `resumed IS NULL` — a row written before that column — is NOT a
+resume, because `NULL = 1` is NULL. A FINISHED predecessor is excluded because a
+completed campaign has nothing to resume, and gluing a re-run onto one would
+turn a repeat into a continuation. **The identical fingerprint is the reason the
+query exists at all**: a prompt bump, a renderer edit, a re-index or a model
+change between the crash and the resume breaks the chain, and the resumed run
+becomes its own campaign — because "which configuration produced this number" is
+the question a campaign total is asked, and mixed-configuration fragments must
+not sum.
+
+**THE PREDICATE IS GENERATED FROM `RUN_FINGERPRINT_COLUMNS`, NEVER RETYPED.**
+Hand-listing six of the seven would leave one axis along which two
+configurations merge into one campaign with nothing saying so, and a hand-written
+list does not grow when the next field is gated. Generated, it does — and
+`tests/test_storage_query_layer.py` section 8b-j re-derives that from the
+writer's own tuple.
+
+**SQLite's `IS` IS NULL-SAFE EQUALITY AND THAT CUTS BOTH WAYS.** A field that
+degraded to NULL on both sides compares equal, which is right; two runs with NO
+STAMP AT ALL would also compare equal on all seven, which is not. Both sides are
+therefore additionally required to carry a `fingerprint_version` — an unknown
+configuration is not a matching configuration, and `run_fingerprint` itself keys
+FP_ABSENT on exactly that column.
+
+**FOUR THINGS THE QUERY DELIBERATELY DOES NOT DO, stated at the code rather than
+discovered later**: it reads run order off `runs.id`, which is AUTOINCREMENT and
+therefore monotone in creation order within one database (`started_at` is a TEXT
+two rows can share); "nearest preceding" is nearest among runs satisfying BOTH
+halves, which is the literal reading — so a resume CAN attach across an
+intervening crashed run of a different configuration, producing two campaigns
+whose wall spans overlap, which is a reporting artifact and not a
+misattribution, and `run_ids` is emitted in order so the gap is visible (the
+other reading would report a genuine resume as a whole campaign, which IS a
+misattribution); `last_finished_at` is `MAX(finished_at)`, so `unfinalized_runs`
+is what says the span is open at that end and it is never extrapolated to `now`;
+and it cannot see a campaign that was never recorded, which is every row the API
+writes.
+
+**THE ORDERED RUN-ID LIST IS BUILT BY RECURSION AND NOT BY `group_concat`.**
+That function leaves its order arbitrary, and an `ORDER BY` inside it needs
+SQLite 3.44+, which a CI runner's system SQLite may not be. Determinism is a
+stated property of this project, so the string is assembled one member at a time
+in ascending id order — guaranteed on every version.
+
+**5. THE RUN HEALTH TAB GAINED A CAMPAIGNS PANEL**, beside the run list and not
+instead of it. Both are true and they answer different questions: "which PROCESS
+wrote these rows" is what an operator debugging a crash needs, and "what did
+this CAMPAIGN cost and how many patients did it actually cover" is the only one
+a reviewer can attribute a published number to. The tab still carries NO SQL —
+the frame comes through `load_run_campaign_data()`, the eighth
+`@st.cache_data(ttl=60)` loader.
+
+**A DEFECT IN `_strip_sql_noise` WAS FOUND BY THE NEW QUERY AND IS FIXED.** It
+was one regex substitution nested inside another — string literals masked
+FIRST, comments second — so an APOSTROPHE INSIDE A `--` COMMENT was read as the
+start of a string literal and swallowed everything up to the next quote anywhere
+in the query. **Two ordinary English comments were enough to hide a whole CTE,
+and the CTE hidden was the one naming `i.run_id`.** The failure is silent and in
+the DANGEROUS direction: the query derives fewer additive columns than it names,
+so a new query that declares nothing agrees with a derivation that found
+nothing, `tests/test_storage_schema_guards.py` check 1a passes, and `report()`
+dies on `no such column` against an older database — the exact defect item 38
+removed from File 16. Measured: `campaign_summary` derived
+`(('runs', 'resumed'),)` under the old implementation and
+`(('inferences', 'run_id'), ('runs', 'resumed'))` under the scanner that
+replaces it. Reversing the two passes would only move the hazard (a `--` inside
+a string literal would then be read as a comment), so it is one left-to-right
+scanner that knows both forms, and SQL's doubled-quote escape falls out of it
+for free. The two now-dead regexes were DELETED rather than left standing, and
+purged from the prose as well — check 2h counts a name inside any string literal
+as a read.
+
+**A SECOND DEFECT WAS FOUND BY THE CAMPAIGNS PANEL AND IS FIXED IN THE TEST.**
+`tests/test_dashboard_run_health.py` selected rendered frames POSITIONALLY —
+`dataframe_objects[0]`, `[1]`, `[2]` — so inserting one panel above the
+attribution census silently re-pointed three checks at the wrong table, and the
+first of them ABORTED the whole file on a `KeyError` rather than failing. **That
+is the tenth time this project has shipped that shape.** Frames are selected by
+the COLUMNS they carry now, which is also what those checks are actually about.
+
+**WHAT WAS MEASURED BY RUNNING.** CI bucket A **60/60** (including all three
+dashboard tests), `tests/test_package_invariants.py` **260/0/0**,
+`tests/test_storage_query_layer.py` **349** (was 317),
+`tests/test_dashboard_run_health.py` **192** (was 167; the run block said 155
+and was stale), `tests/test_dashboard_app_integration.py` **110**, the serial
+runner **5/5** with `oncotriage/config.py` and
+`oncotriage/registries/cancer_code_registry.py` confirmed restored,
+`python fixture_replay.py` **12/12 clean, exit 0, no recapture**, and the
+production `inferences.db` sha256 **unchanged**. **No money was spent and no
+migration was run.**
+
+**FOUR PINS MOVED, EACH ARGUED IN PLACE**, all in
+`tests/test_package_invariants.py`: the decorator inventory (the eighth loader),
+the dashboard module count (16 → 17, `nullsafe.py`), `data.py`'s loader
+decorator dict, and the dashboard-purity probe's import list — which was also
+missing `tabs/run_health.py` and now has it.
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.** The remaining six
+tabs were not swept for the same shape; only the four that a sparse row actually
+took down were fixed, and the ten-tab render is what would report the next one.
+`classify_trial_score` is still called unguarded by nothing — all three call
+sites now test for absence first — but the underlying function still raises on a
+`None`, which is deliberate and is argued at `TRIAL_STATUS_NO_SCORE`.
 
 
 ### A SKIP IS NOT A PASS (commit `ec2033a`)

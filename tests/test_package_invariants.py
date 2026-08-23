@@ -4109,6 +4109,12 @@ _DECORATOR_INVENTORY = {
         ["st.cache_data(ttl=60)"],
     "oncotriage/dashboard/data.py::load_run_degradation_data":
         ["st.cache_data(ttl=60)"],
+    # The campaign reader (the campaign pass). Same TTL as the other seven, and
+    # declared here rather than exempted for the reason this dict is EXACT: a
+    # loader added WITHOUT the decorator reads the database on every widget
+    # interaction and nothing else in the project would notice.
+    "oncotriage/dashboard/data.py::load_run_campaign_data":
+        ["st.cache_data(ttl=60)"],
     "oncotriage/dashboard/data.py::load_run_attribution_data":
         ["st.cache_data(ttl=60)"],
     # The four that pass 20c-3c-1 dropped and its equivalence proof recovered.
@@ -5505,14 +5511,18 @@ _DASH_FILES = sorted(
     if name.endswith(".py") and "__pycache__" not in root
 )
 # FIFTEEN AFTER PASS 20c-3c-1, SIXTEEN AFTER THE RUN-READER PASS added
-# tabs/run_health.py. The number moves whenever a module joins, and it is a
-# NON-DEGENERACY PROBE rather than a claim about the right number of modules --
-# its job is to say the walk below found files at all, so a scan that silently
-# covered nothing cannot report "[] mutations" and pass.
-check("the dashboard has the sixteen modules the conversion and run-reader "
-      "passes created (non-degeneracy: a scan over an empty file list proves "
-      "nothing)",
-      len(_DASH_FILES), 16)
+# tabs/run_health.py, SEVENTEEN AFTER THE CAMPAIGN PASS added nullsafe.py --
+# the one owner of "render a cell that may be NULL", which exists because
+# tabs/run_health.py and tabs/patient_explorer.py would otherwise carry two
+# copies of the same four readers and could disagree about whether an absent
+# count renders as an em dash or as 0. The number moves whenever a module joins,
+# and it is a NON-DEGENERACY PROBE rather than a claim about the right number of
+# modules -- its job is to say the walk below found files at all, so a scan that
+# silently covered nothing cannot report "[] mutations" and pass.
+check("the dashboard has the seventeen modules the conversion, run-reader and "
+      "campaign passes created (non-degeneracy: a scan over an empty file list "
+      "proves nothing)",
+      len(_DASH_FILES), 17)
 
 _TIER_NAMES = ("MATCH_TIERS", "MATCH_TIER_COLORS")
 check("nothing in the dashboard mutates MATCH_TIERS or MATCH_TIER_COLORS, "
@@ -5627,6 +5637,7 @@ check("every loader in data.py carries @st.cache_data(ttl=60), and the two "
        "_load_run_query": [],
        "load_run_summary_data": ["st.cache_data(ttl=60)"],
        "load_run_degradation_data": ["st.cache_data(ttl=60)"],
+       "load_run_campaign_data": ["st.cache_data(ttl=60)"],
        "load_run_attribution_data": ["st.cache_data(ttl=60)"]})
 
 # THE REFRESH BUTTON STILL REACHES THE LOADERS, WHICH NOW LIVE IN ANOTHER
@@ -5725,6 +5736,8 @@ import oncotriage.dashboard.tabs.match_quality
 import oncotriage.dashboard.tabs.trial_explorer
 import oncotriage.dashboard.tabs.drift
 import oncotriage.dashboard.tabs.reproducibility
+import oncotriage.dashboard.tabs.run_health
+import oncotriage.dashboard.nullsafe
 
 heavy = [m for m in ("torch", "transformers", "sentence_transformers", "icd10")
          if m in sys.modules]

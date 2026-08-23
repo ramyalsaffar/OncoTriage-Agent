@@ -59,8 +59,27 @@ def render_patient_demographics_tab(df):
     
     with col1:
         df_age = df.copy()
+        # ROWS WITH NO AGE ARE EXCLUDED AND COUNTED, NOT BUCKETED.
+        # `(NaN // 10) * 10` is NaN and `.astype(int)` then RAISES "Cannot
+        # convert non-finite values (NA or inf) to integer", which took the
+        # whole page down -- `inferences.age` is nullable and an error-handler
+        # row carries none. Dropping them is the only honest option here: there
+        # is no decade to put an unknown age in, and a 'nans' bucket beside
+        # '60s' reads as an age group.
+        _no_age = int(df_age['age'].isna().sum()) if 'age' in df_age.columns else len(df_age)
+        if 'age' in df_age.columns:
+            df_age = df_age[df_age['age'].notna()].copy()
+        else:
+            df_age = df_age.iloc[0:0].copy()
         df_age['age_group'] = (df_age['age'] // 10) * 10
         df_age['age_label'] = df_age['age_group'].astype(int).astype(str) + 's'
+        if _no_age:
+            st.caption(
+                f"⚠️ {_no_age} patient row(s) in the current selection carry no "
+                f"`age` and are EXCLUDED from the age panel — there is no "
+                f"decade to place an unknown age in. They are still counted "
+                f"everywhere else on this tab."
+            )
         age_stats = df_age.groupby('age_label').agg(
             patient_count=('patient_id', 'count'),
             avg_matches=('eligible_matches', 'mean'),

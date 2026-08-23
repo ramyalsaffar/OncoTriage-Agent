@@ -1,6 +1,49 @@
 """
 Patient Explorer tab. Moved verbatim out of "21- Streamlit Dashboard.py"
 (pass 20c-3c-1).
+
+ONE SPARSE ROW USED TO TAKE THE WHOLE PAGE DOWN (the campaign pass)
+-------------------------------------------------------------------
+Every numeric cell this tab renders went through a bare ``int()``, ``round()``
+or f-string format, and most of the columns it reads are legitimately NULL:
+
+  * ``INFERENCE_COLUMN_ADDITIONS`` columns are absent on any row written before
+    they existed, and arrive as NULL from a database that has since been
+    migrated;
+  * an error-handler row and a no-candidates row record almost none of the
+    funnel;
+  * ``full_match_count`` / ``partial_match_count`` / ``unconfirmed_match_count``
+    are not columns at all -- ``enrich_match_tiers`` computes them in ``main()``
+    and leaves them NaN for a patient with no ``trial_matches`` rows.
+
+``int(nan)`` raises ``ValueError``, ``int(None)`` and ``round(None, 2)`` raise
+``TypeError``, ``f"{None:.2f}"`` raises ``TypeError``, ``pd.NaT.strftime(...)``
+raises ``ValueError``, and ``.astype(int)`` over a column with one NaN raises.
+NONE of those is caught anywhere: ``oncotriage/dashboard/app.py`` calls this
+inside ``main()`` with no handler, so the raise propagates out of the script run
+and streamlit renders a traceback WHERE THE ENTIRE DASHBOARD SHOULD BE -- all
+ten tabs, for every reader, because of one cell.
+
+Every conversion in this file now goes through ``oncotriage/dashboard/nullsafe``
+and renders the absence instead. WHICH helper is the judgement, and it is made
+per column rather than once:
+
+  ``optional_int_text``  where NULL means "never measured" -- a count that was
+                         not recorded must not print as 0, which is the
+                         MEASURED answer.
+  ``as_int``             where the value feeds a chart, which cannot draw an
+                         unknown. The funnel does this and then NAMES the
+                         stages it drew at zero underneath, so a bar at zero is
+                         never silently a bar for a missing number.
+  ``None``               in the CSV export, which is what an empty cell in a
+                         numeric column means to every consumer of a CSV. A
+                         dash there would make the column text.
+
+A trial whose ``match_score`` is NULL gets ``TRIAL_STATUS_NO_SCORE`` rather than
+being handed to ``classify_trial_score``, which raises on ``None`` and answers
+'Unconfirmed Match' -- a real verdict -- on ``nan``. The constant is in
+``tiers.py`` with the other three, because two other tabs need it for the same
+reason.
 """
 
 import json
@@ -10,7 +53,68 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from oncotriage.dashboard.data import load_trial_matches_data
-from oncotriage.dashboard.tiers import TRIAL_STATUS_PARTIAL, TRIAL_STATUS_REJECTED, TRIAL_STATUS_UNCONFIRMED, classify_trial_score
+from oncotriage.dashboard.nullsafe import (
+    ABSENT_TEXT,
+    as_float,
+    as_int,
+    as_text,
+    format_number,
+    format_timestamp,
+    is_absent,
+    optional_int_text,
+)
+from oncotriage.dashboard.tiers import (TRIAL_STATUS_NO_SCORE, TRIAL_STATUS_PARTIAL,
+                                        TRIAL_STATUS_REJECTED, TRIAL_STATUS_UNCONFIRMED,
+                                        classify_trial_score)
+
+
+
+
+def _seconds_text(value):
+    """`value` as "12.34s", or the absent marker. Never "nans" and never "—s"."""
+    if is_absent(value):
+        return ABSENT_TEXT
+    return format_number(value, ".2f") + "s"
+
+
+def _dollars_text(value):
+    """`value` as "$0.1234", or the absent marker."""
+    if is_absent(value):
+        return ABSENT_TEXT
+    return "$" + format_number(value, ".4f")
+
+
+def _csv_int(value):
+    """An int for the CSV export, or ``None`` -- which pandas writes as blank.
+
+    NOT the em dash the screen uses. A CSV column holding "—" for its missing
+    rows is a TEXT column to every tool that opens it, so summing it silently
+    fails or silently coerces; an empty cell is what every consumer of a CSV
+    already reads as missing.
+    """
+    return as_int(value, default=None)
+
+
+def _csv_round(value, digits):
+    """A rounded float for the CSV export, or ``None``. Same reasoning."""
+    if is_absent(value):
+        return None
+    return round(as_float(value), digits)
+
+
+def _column_mean(frame, column):
+    """The population mean of `column`, or 0.0 when it is absent or all-NULL.
+
+    ``frame[column]`` RAISES KeyError when the column is not there at all, which
+    is the shape a database predating an additive column has, and ``.mean()``
+    over an all-NULL column returns ``nan`` -- which then propagates through
+    ``max()`` into a plotly axis range of ``[0, nan]`` and renders an empty
+    chart with no error anywhere. Both come back as 0.0, and the caller says
+    which stages that happened to.
+    """
+    if column not in frame.columns:
+        return 0.0
+    return as_float(frame[column].mean(), 0.0)
 
 
 @st.fragment
@@ -31,7 +135,7 @@ def render_patient_explorer_tab(df):
     
     if len(patient_rows) > 1:
         inference_options = [
-            f"#{i+1} — {row['timestamp'].strftime('%Y-%m-%d %H:%M')}"
+            f"#{i+1} — {format_timestamp(row['timestamp'])}"
             for i, (_, row) in enumerate(patient_rows.iterrows())
         ]
         selected_inf_idx = st.selectbox(
@@ -49,28 +153,28 @@ def render_patient_explorer_tab(df):
     
     with col1:
         st.markdown("**Demographics**")
-        st.metric("Age", patient_df['age'], help="Patient age at time of inference")
-        st.metric("Sex", patient_df['sex'], help="Biological sex from FHIR record")
-        st.metric("Race", patient_df['race'], help="Race from FHIR demographics")
-        st.metric("Ethnicity", patient_df['ethnicity'], help="Ethnicity from FHIR demographics")
+        st.metric("Age", format_number(patient_df.get('age')), help="Patient age at time of inference")
+        st.metric("Sex", as_text(patient_df.get('sex'), ABSENT_TEXT), help="Biological sex from FHIR record")
+        st.metric("Race", as_text(patient_df.get('race'), ABSENT_TEXT), help="Race from FHIR demographics")
+        st.metric("Ethnicity", as_text(patient_df.get('ethnicity'), ABSENT_TEXT), help="Ethnicity from FHIR demographics")
     
     with col2:
         st.markdown("**Clinical Profile**")
-        condition_text = str(patient_df['primary_condition']) if pd.notna(patient_df['primary_condition']) else "Unknown"
+        condition_text = as_text(patient_df.get('primary_condition'), "Unknown")
         st.markdown(
             f"""<div style="font-size:14px; color:#555; margin-bottom:2px;">Primary Condition</div>
             <div style="font-size:16px; font-weight:600; word-wrap:break-word; white-space:normal; margin-bottom:16px;">{condition_text}</div>""",
             unsafe_allow_html=True,
         )
-        st.metric("Conditions", int(patient_df['condition_count']), help="Total active conditions in FHIR record")
-        st.metric("Medications", int(patient_df['medication_count']), help="Total active medications in FHIR record")
+        st.metric("Conditions", optional_int_text(patient_df.get('condition_count')), help="Total active conditions in FHIR record")
+        st.metric("Medications", optional_int_text(patient_df.get('medication_count')), help="Total active medications in FHIR record")
     
     with col3:
         st.markdown("**Match Results**")
-        st.metric("✅ Full Matches", int(patient_df['full_match_count']), help="Trials where ALL criteria were confirmed met (100% score)")
-        st.metric("🟡 Partial Matches", int(patient_df['partial_match_count']), help="Trials eligible with SOME criteria confirmed but not all (0% < score < 100%)")
-        st.metric("🔶 Unconfirmed", int(patient_df['unconfirmed_match_count']), help="Trials eligible but scoring 0% — no disqualifier found and no criterion confirmed either")
-        st.metric("Match Tier", patient_df['match_tier'], help="Overall patient classification: Full Match > Partial Match > Unconfirmed Match > No Match")
+        st.metric("✅ Full Matches", optional_int_text(patient_df.get('full_match_count')), help="Trials where ALL criteria were confirmed met (100% score)")
+        st.metric("🟡 Partial Matches", optional_int_text(patient_df.get('partial_match_count')), help="Trials eligible with SOME criteria confirmed but not all (0% < score < 100%)")
+        st.metric("🔶 Unconfirmed", optional_int_text(patient_df.get('unconfirmed_match_count')), help="Trials eligible but scoring 0% — no disqualifier found and no criterion confirmed either")
+        st.metric("Match Tier", as_text(patient_df.get('match_tier'), ABSENT_TEXT), help="Overall patient classification: Full Match > Partial Match > Unconfirmed Match > No Match")
     
     st.markdown("---")
     
@@ -91,26 +195,32 @@ def render_patient_explorer_tab(df):
     export_rows.append({
         'Section':          'Patient Summary',
         'Patient ID':       selected_patient,
-        'Age':              patient_df['age'],
-        'Sex':              patient_df['sex'],
-        'Race':             patient_df['race'],
-        'Ethnicity':        patient_df['ethnicity'],
-        'Primary Condition': patient_df['primary_condition'],
-        'Conditions':       int(patient_df['condition_count']),
-        'Medications':      int(patient_df['medication_count']),
-        'Full Matches':     int(patient_df['full_match_count']),
-        'Partial Matches':  int(patient_df['partial_match_count']),
-        'Unconfirmed Matches': int(patient_df['unconfirmed_match_count']),
-        'Match Tier':       patient_df['match_tier'],
-        'Total Time (s)':   round(patient_df['total_time'], 2),
-        'Cost (USD)':       round(patient_df['estimated_cost_usd'], 4),
-        'Timestamp':        patient_df['timestamp'],
+        'Age':              patient_df.get('age'),
+        'Sex':              patient_df.get('sex'),
+        'Race':             patient_df.get('race'),
+        'Ethnicity':        patient_df.get('ethnicity'),
+        'Primary Condition': patient_df.get('primary_condition'),
+        'Conditions':       _csv_int(patient_df.get('condition_count')),
+        'Medications':      _csv_int(patient_df.get('medication_count')),
+        'Full Matches':     _csv_int(patient_df.get('full_match_count')),
+        'Partial Matches':  _csv_int(patient_df.get('partial_match_count')),
+        'Unconfirmed Matches': _csv_int(patient_df.get('unconfirmed_match_count')),
+        'Match Tier':       patient_df.get('match_tier'),
+        'Total Time (s)':   _csv_round(patient_df.get('total_time'), 2),
+        'Cost (USD)':       _csv_round(patient_df.get('estimated_cost_usd'), 4),
+        'Timestamp':        patient_df.get('timestamp'),
     })
     
     # Trial match rows
     if not patient_trials_export.empty:
         for _, t in patient_trials_export.iterrows():
-            if t['eligible'] == 'eligible':
+            if is_absent(t.get('match_score')):
+                # SAME RULE AS THE TABLE BELOW: a trial with no recorded score
+                # is not an unconfirmed match, and calling classify_trial_score
+                # on it either raises (None) or answers 'Unconfirmed Match'
+                # (NaN) about a measurement nobody made.
+                status = TRIAL_STATUS_NO_SCORE
+            elif t['eligible'] == 'eligible':
                 status = classify_trial_score(t['match_score'])
             else:
                 status = 'Not Eligible'
@@ -120,7 +230,8 @@ def render_patient_explorer_tab(df):
                 'Trial Title': t.get('trial_title', ''),
                 'Phase':       t.get('trial_phase', ''),
                 'Status':      status,
-                'Match Score':  f"{t['match_score'] * 100:.0f}%",
+                'Match Score':  (ABSENT_TEXT if is_absent(t.get('match_score'))
+                                 else format_number(as_float(t['match_score']) * 100, ".0f") + "%"),
                 'Assessment': t.get('assessment', ''),
             })
     
@@ -130,7 +241,8 @@ def render_patient_explorer_tab(df):
     st.download_button(
         label="📥 Export Patient Report (CSV)",
         data=csv_data,
-        file_name=f"oncomatch_patient_{selected_patient}_{patient_df['timestamp'].strftime('%Y%m%d_%H%M')}.csv",
+        file_name=f"oncomatch_patient_{selected_patient}_"
+                  f"{format_timestamp(patient_df.get('timestamp'), '%Y%m%d_%H%M', 'no-timestamp')}.csv",
         mime="text/csv",
         help="Download patient demographics, trial matches, and pipeline metrics as CSV"
     )
@@ -140,34 +252,50 @@ def render_patient_explorer_tab(df):
     # --- Patient Pipeline Funnel ---
     st.subheader("Pipeline Funnel")
 
-    # Patient's values
-    patient_stages = {
-        'Retrieved':           int(patient_df['candidates_retrieved']),
-        'Reranked':            int(patient_df['candidates_reranked']),
-        'Rule Filter':         int(patient_df['candidates_after_rule_filter']) if 'candidates_after_rule_filter' in patient_df.index else int(patient_df['candidates_filtered']),
-        'Quality Filter':      int(patient_df['candidates_after_quality_filter']),
-        'Cost Cap':            int(patient_df['candidates_filtered']),
-        'Evaluated':           int(patient_df['candidates_evaluated']),
-        'Eligible (Any)':      int(patient_df['eligible_matches']),
-        '  Full Match':        int(patient_df['full_match_count']),
-        '  Partial':           int(patient_df['partial_match_count']),
-        '  Unconfirmed':       int(patient_df['unconfirmed_match_count'])
-    }
-    
-    # Population averages
-    avg_stages = {
-        'Retrieved':           df['candidates_retrieved'].mean(),
-        'Reranked':            df['candidates_reranked'].mean(),
-        'Rule Filter':         df['candidates_after_rule_filter'].mean() if 'candidates_after_rule_filter' in df.columns else df['candidates_filtered'].mean(),
-        'Quality Filter':      df['candidates_after_quality_filter'].mean(),
-        'Cost Cap':            df['candidates_filtered'].mean(),
-        'Evaluated':           df['candidates_evaluated'].mean(),
-        'Eligible (Any)':      df['eligible_matches'].mean(),
-        '  Full Match':        df['full_match_count'].mean(),
-        '  Partial':           df['partial_match_count'].mean(),
-        '  Unconfirmed':       df['unconfirmed_match_count'].mean()
-    }
-        
+    # THE STAGE -> COLUMN MAP, WRITTEN ONCE. It was two dict literals, the
+    # patient's and the population's, listing the same ten stages in the same
+    # order with the same fallback spelled out twice -- so a column renamed in
+    # one and not the other would have plotted a patient against a different
+    # stage's average with nothing saying so.
+    #
+    # 'Rule Filter' carries a FALLBACK column and the others do not:
+    # `candidates_after_rule_filter` is additive and a row written before it
+    # existed records only `candidates_filtered`, which is the post-cost-cap
+    # count -- a worse answer, and the one this tab has always used there.
+    _FUNNEL = (
+        ('Retrieved',      ('candidates_retrieved',)),
+        ('Reranked',       ('candidates_reranked',)),
+        ('Rule Filter',    ('candidates_after_rule_filter', 'candidates_filtered')),
+        ('Quality Filter', ('candidates_after_quality_filter',)),
+        ('Cost Cap',       ('candidates_filtered',)),
+        ('Evaluated',      ('candidates_evaluated',)),
+        ('Eligible (Any)', ('eligible_matches',)),
+        ('  Full Match',   ('full_match_count',)),
+        ('  Partial',      ('partial_match_count',)),
+        ('  Unconfirmed',  ('unconfirmed_match_count',)),
+    )
+
+    def _patient_stage(columns):
+        """(value, was it recorded) for one funnel stage of this patient."""
+        for column in columns:
+            if column in patient_df.index and not is_absent(patient_df[column]):
+                return as_int(patient_df[column]), True
+        return 0, False
+
+    patient_stages = {}
+    unrecorded_stages = []
+    for _stage, _columns in _FUNNEL:
+        _value, _recorded = _patient_stage(_columns)
+        patient_stages[_stage] = _value
+        if not _recorded:
+            unrecorded_stages.append(_stage.strip())
+
+    # Population averages, over whichever of the two columns the frame carries.
+    avg_stages = {}
+    for _stage, _columns in _FUNNEL:
+        _present = [c for c in _columns if c in df.columns]
+        avg_stages[_stage] = _column_mean(df, _present[0]) if _present else 0.0
+
     stage_names = list(patient_stages.keys())
     patient_vals = list(patient_stages.values())
     avg_vals = [round(v, 1) for v in avg_stages.values()]
@@ -235,11 +363,26 @@ def render_patient_explorer_tab(df):
         "Colored bars show this patient's candidates at each pipeline stage. "
         "Gray bars show the population average for comparison."
     )
+
+    # A BAR CANNOT DRAW "UNKNOWN", SO THE CAPTION SAYS WHICH BARS ARE NOT
+    # MEASUREMENTS. Every stage above is plotted as an integer because a chart
+    # has no third state, and a stage this row never recorded is therefore
+    # indistinguishable at zero from a stage that genuinely passed nothing on --
+    # which is the confusion the run tables were given a meta row to remove, one
+    # layer up. Naming them is what keeps the chart honest; dropping the stage
+    # instead would silently shorten the funnel.
+    if unrecorded_stages:
+        st.caption(
+            f"⚠️ Not recorded for this patient and therefore **drawn at zero, "
+            f"not measured as zero**: {', '.join(unrecorded_stages)}. A row "
+            f"written before one of these columns existed, or an inference "
+            f"that ended at the error handler, carries no value for them."
+        )
     
     # Rule filter drop breakdown (columns may not exist in older runs)
-    mesh_dropped = int(patient_df.get('mesh_dropped', 0)) if 'mesh_dropped' in patient_df.index else 0
-    stage_dropped = int(patient_df.get('stage_dropped', 0)) if 'stage_dropped' in patient_df.index else 0
-    histology_dropped = int(patient_df.get('histology_dropped', 0)) if 'histology_dropped' in patient_df.index else 0
+    mesh_dropped = as_int(patient_df.get('mesh_dropped'))
+    stage_dropped = as_int(patient_df.get('stage_dropped'))
+    histology_dropped = as_int(patient_df.get('histology_dropped'))
     total_dropped = mesh_dropped + stage_dropped + histology_dropped
     
     if total_dropped > 0:
@@ -267,6 +410,8 @@ def render_patient_explorer_tab(df):
             def classify_status(row):
                 if row['eligible'] != 'eligible':
                     return TRIAL_STATUS_REJECTED
+                if is_absent(row.get('match_score')):
+                    return TRIAL_STATUS_NO_SCORE
                 tier = classify_trial_score(row['match_score'])
                 if tier == 'Full Match':
                     return '✅ Eligible'
@@ -297,12 +442,31 @@ def render_patient_explorer_tab(df):
                 'assessment': 'Assessment'
             })
             
-            # Convert match score to percentage
-            display_df['Match Score'] = (display_df['Match Score'] * 100).round(0).astype(int)
+            # Convert match score to percentage.
+            #
+            # `.astype(int)` RAISED HERE. pandas refuses "Cannot convert
+            # non-finite values (NA or inf) to integer", so one trial row with
+            # a NULL match_score took the whole page down -- and
+            # `trial_matches.match_score` is a nullable REAL that a Stage 5
+            # failure return leaves unset. `to_numeric(errors='coerce')` turns
+            # a non-numeric cell into NaN rather than raising, and the nullable
+            # 'Int64' dtype carries <NA> through to the renderer, which draws it
+            # as an empty cell. NOT `.fillna(0)`: a blank score rendered as 0%
+            # is a measurement nobody made.
+            display_df['Match Score'] = (
+                pd.to_numeric(display_df['Match Score'], errors='coerce') * 100
+            ).round(0).astype('Int64')
             
             # Default sort: eligible first, then by match score descending
             status_order = {'✅ Eligible': 0, TRIAL_STATUS_PARTIAL: 1,
-                            TRIAL_STATUS_UNCONFIRMED: 2, TRIAL_STATUS_REJECTED: 3}
+                            TRIAL_STATUS_UNCONFIRMED: 2, TRIAL_STATUS_REJECTED: 3,
+                            # LAST, and it has to be IN this map: `_sort` is
+                            # `.map(status_order)`, which yields NaN for an
+                            # unlisted status, and `sort_values` puts NaN last
+                            # only by accident of its default -- while the
+                            # rendered order would then depend on a default
+                            # nothing here states.
+                            TRIAL_STATUS_NO_SCORE: 4}
             display_df['_sort'] = display_df['Status'].map(status_order)
             
             display_df = display_df.sort_values(
@@ -328,13 +492,19 @@ def render_patient_explorer_tab(df):
             partial_count = (patient_matches['Status'] == TRIAL_STATUS_PARTIAL).sum()
             unconfirmed_count = (patient_matches['Status'] == TRIAL_STATUS_UNCONFIRMED).sum()
             not_eligible_count = (patient_matches['Status'] == TRIAL_STATUS_REJECTED).sum()
+            no_score_count = (patient_matches['Status'] == TRIAL_STATUS_NO_SCORE).sum()
 
             st.caption(
                 f"{eligible_count} eligible · "
                 f"{partial_count} partial matches · "
                 f"{unconfirmed_count} unconfirmed (eligible, 0% of criteria confirmed) · "
                 f"{not_eligible_count} not eligible · "
-                f"{len(patient_matches)} total"
+                # PRINTED EVEN AT ZERO would be noise on the ordinary row, so
+                # this term appears only when there IS such a trial -- and the
+                # counts above already sum to the total when it is absent, so a
+                # reader can tell the difference without being told.
+                + (f"{no_score_count} with no recorded score · " if no_score_count else "")
+                + f"{len(patient_matches)} total"
             )
             
             # --- Criterion-Level Breakdown ---
@@ -457,13 +627,13 @@ def render_patient_explorer_tab(df):
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        st.metric("Total Time", f"{patient_df['total_time']:.2f}s", help="End-to-end pipeline latency for this patient")
+        st.metric("Total Time", _seconds_text(patient_df.get('total_time')), help="End-to-end pipeline latency for this patient")
     with col2:
-        st.metric("Retrieved", int(patient_df['candidates_retrieved']), help="Trials retrieved from hybrid search")
+        st.metric("Retrieved", optional_int_text(patient_df.get('candidates_retrieved')), help="Trials retrieved from hybrid search")
     with col3:
-        st.metric("Evaluated", int(patient_df['candidates_evaluated']), help="Trials sent to GPT-4o for eligibility evaluation")
+        st.metric("Evaluated", optional_int_text(patient_df.get('candidates_evaluated')), help="Trials sent to GPT-4o for eligibility evaluation")
     with col4:
-        st.metric("Cost", f"${patient_df['estimated_cost_usd']:.4f}", help="Estimated API cost for this patient")
+        st.metric("Cost", _dollars_text(patient_df.get('estimated_cost_usd')), help="Estimated API cost for this patient")
     
     # Labelled with the model THIS row was judged by, read from the row rather
     # than from MATCHING_MODEL. A patient evaluated by GPT-4o must not be
@@ -474,10 +644,10 @@ def render_patient_explorer_tab(df):
     col1, col2, col3 = st.columns(3)
 
     with col1:
-        st.metric(f"{_judge} Input Tokens", f"{int(patient_df['llm_classifier_input_tokens']):,}",
+        st.metric(f"{_judge} Input Tokens", format_number(patient_df.get('llm_classifier_input_tokens'), ",.0f"),
                   help=f"Tokens sent to {_judge} (prompt + trial criteria + patient data)")
     with col2:
-        st.metric(f"{_judge} Output Tokens", f"{int(patient_df['llm_classifier_output_tokens']):,}",
+        st.metric(f"{_judge} Output Tokens", format_number(patient_df.get('llm_classifier_output_tokens'), ",.0f"),
                   help=f"Tokens generated by {_judge}, INCLUDING any reasoning "
                        f"tokens — the two are one billed total, not two.")
     with col3:
@@ -487,14 +657,19 @@ def render_patient_explorer_tab(df):
         _reasoning = patient_df.get('llm_classifier_reasoning_tokens')
         st.metric(
             "…of which reasoning",
-            "n/a" if pd.isna(_reasoning) else f"{int(_reasoning):,}",
+            # "n/a" AND NOT THE EM DASH THE REST OF THIS FILE USES, kept as
+            # shipped: this cell has always said n/a and its help text below
+            # explains that exact string. The reading is the same one
+            # `optional_int_text` makes everywhere else -- NULL is not 0.
+            format_number(_reasoning, ",.0f", default="n/a"),
             help="Reasoning tokens are a SUBSET of the output tokens above, "
                  "billed at the output rate and never shown to the reader. "
                  "'n/a' means this response reported no reasoning breakdown.",
         )
 
-    if pd.notna(patient_df['error']) and patient_df['error'] != '':
-        st.error(f"Error: {patient_df['error']}")
+    _error = patient_df.get('error')
+    if not is_absent(_error) and str(_error) != '':
+        st.error(f"Error: {_error}")
 
 
 #------------------------------------------------------------------------------

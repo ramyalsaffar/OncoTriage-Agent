@@ -300,6 +300,24 @@ def load_run_degradation_data():
 
 
 @st.cache_data(ttl=60)
+def load_run_campaign_data():
+    """One row per CAMPAIGN -- runs stitched across crash and resume.
+
+    Cached for 60 seconds. See ``queries.campaign_summary``, where the stitch
+    rule and everything it deliberately does not do are argued.
+
+    IT DECLARES ``runs`` AND NOT ``RUN_TABLES``, so it can be answered on a
+    database that has `runs` and no `run_metrics` -- and the tab therefore has
+    to be prepared for an EMPTY frame in a state where ``load_run_summary_data``
+    returned rows, which is the same shape ``_render_selected_run`` already
+    handles for the breakdown. An empty frame here on a database that HAS runs
+    is a defect in the query, not a fact about the database: the query is driven
+    from `runs`, so every run is in exactly one campaign.
+    """
+    return _load_run_query("campaign_summary")
+
+
+@st.cache_data(ttl=60)
 def load_run_attribution_data():
     """The inference-row census by run attribution. Cached for 60 seconds.
 

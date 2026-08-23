@@ -716,6 +716,27 @@ def _joined(capture, *keys):
     return "\n".join(out)
 
 
+def _frame_with(capture, *columns):
+    """The first rendered frame carrying every named column, or an empty one.
+
+    BY COLUMN AND NOT BY POSITION, AND THE POSITIONAL VERSION IS WHAT BROKE.
+    This file indexed `dataframe_objects[0]`, `[1]` and `[2]`, so the campaign
+    pass inserting one panel ABOVE the attribution census silently re-pointed
+    three checks at the wrong table -- and the first of them aborted the whole
+    file on a KeyError rather than failing, which is the shape this project has
+    now shipped ten times. A frame is identified by what it CONTAINS, which is
+    also the thing the checks below are actually about.
+
+    An empty frame rather than a raise when nothing matches, so a defect that
+    stops a panel rendering is a recorded failure with a name.
+    """
+    for frame in capture.get("dataframe_objects", []):
+        if isinstance(frame, pd.DataFrame) and all(c in frame.columns
+                                                   for c in columns):
+            return frame
+    return pd.DataFrame()
+
+
 def _metric(capture, label):
     """One metric's value by label, or a named absence."""
     for name, value in capture["metrics"]:
@@ -771,7 +792,7 @@ check_true("2e  ...and the 'every run was finalized' success is NOT shown "
            "Every recorded run was finalized" not in _full_text)
 
 # --- THE RUN TABLE, VALUE FOR VALUE ---------------------------------------
-_run_table = at_(_full["dataframe_objects"], 0)
+_run_table = _frame_with(_full, "run", "health", "counters consulted")
 check_true("2f  the run list rendered as a frame", isinstance(_run_table,
                                                               pd.DataFrame))
 if isinstance(_run_table, pd.DataFrame):
@@ -811,7 +832,7 @@ if isinstance(_run_table, pd.DataFrame):
           sum(1 for _p, c, _e in _PATIENT_SEED["CLEAN"] if c is None))
 
 # --- THE ATTRIBUTION CENSUS (requirement 3) --------------------------------
-_attr = at_(_full["dataframe_objects"], 1)
+_attr = _frame_with(_full, "attribution", "inference_rows")
 check_true("2g  the attribution census rendered as a frame",
            isinstance(_attr, pd.DataFrame))
 if isinstance(_attr, pd.DataFrame):
@@ -849,7 +870,7 @@ check("2i  the selected run's degradation events come from run_metrics",
       str(sum(v for c, _n, v in _METRIC_SEED["DEGRADED"]
               if c == "degradation")))
 
-_degr_table = at_(_full["dataframe_objects"], 2)
+_degr_table = _frame_with(_full, "counter", "events")
 check_true("2i  the per-counter breakdown rendered", isinstance(_degr_table,
                                                                 pd.DataFrame))
 if isinstance(_degr_table, pd.DataFrame):
@@ -1137,7 +1158,7 @@ _p1 = _plant_and_render(
     "P1 never-flushed rendered as clean",
     "    RUN_HEALTH_NEVER_FLUSHED: \"❔\",",
     "    RUN_HEALTH_NEVER_FLUSHED: \"✅\",")
-_p1_table = at_(_p1["dataframe_objects"], 0)
+_p1_table = _frame_with(_p1, "run", "health")
 check("6a  P1 is caught: a run with no health record no longer renders "
       "distinguishably from a measured-clean one",
       isinstance(_p1_table, pd.DataFrame)
@@ -1205,11 +1226,21 @@ check_true("6e  ...and the shipped module reports the seeded number",
            f"and {len(_ORPHAN_SEED)} without" in _joined(_full, "caption"))
 
 # P6 -- "never measured" rendered as a measured zero.
+# P6 -- "never measured" rendered as a measured zero.
+#
+# IT PLANTS THE CALL SITE, NOT THE HELPER, AND THAT CHANGED IN THE CAMPAIGN
+# PASS. The four null-safe readers moved to oncotriage/dashboard/nullsafe.py so
+# that tabs/patient_explorer.py could stop growing a second copy of them, and a
+# plant into THIS file's copy can no longer reach a function that lives in
+# another module. Planting the call site is the stronger control anyway: the
+# defect it models is "somebody used the wrong reader here", which is a decision
+# taken at the call site, and the helper's own default is pinned directly by
+# tests/test_dashboard_app_integration.py section 5e.
 _p6 = _plant_and_render(
     "P6 an unmeasured counter count renders as 0",
-    "def _optional_int_text(value, default=\"—\"):",
-    "def _optional_int_text(value, default=\"0\"):")
-_p6_table = at_(_p6["dataframe_objects"], 0)
+    '"counters consulted": optional_int_text(row.counters_registered),',
+    '"counters consulted": as_int(row.counters_registered),')
+_p6_table = _frame_with(_p6, "run", "counters consulted")
 check("6f  P6 is caught: a run that never flushed now claims 0 counters were "
       "consulted, which is the measured-clean answer",
       isinstance(_p6_table, pd.DataFrame)
@@ -1239,7 +1270,7 @@ _p8 = _plant_and_render(
     "        attribution = attribution[attribution[\"attribution\"] != "
     "RUN_ATTRIBUTION_NO_RUN]\n"
     "        st.dataframe(attribution, use_container_width=True, hide_index=True)")
-_p8_attr = at_(_p8["dataframe_objects"], 1)
+_p8_attr = _frame_with(_p8, "attribution", "inference_rows")
 check("6h  P8 is caught: the run-less rows disappear from the census, which "
       "is the silent exclusion requirement 3 forbids",
       isinstance(_p8_attr, pd.DataFrame)
@@ -1251,6 +1282,169 @@ check_true("6h  ...and the shipped module keeps them",
 
 
 # ===========================================================================
+# SECTION 8: THE CAMPAIGNS PANEL
+# ===========================================================================
+#
+# A `runs` ROW IS A PROCESS. The four scenarios above carry no `resumed` value,
+# so every one of their campaigns is a campaign of one -- which is the ordinary
+# state and is asserted first, because a panel that reported every database as
+# "nothing was stitched" would satisfy nothing else here. The stitched shapes
+# get their own database, seeded the way the crash-and-resume path really
+# writes: a KILLED row, then a second process whose `resumed` flag is set and
+# whose configuration fingerprint is identical.
+
+print()
+print("=" * 70)
+print("Section 8: campaigns, stitched and not")
+print("=" * 70)
+
+check_true("8a  the campaigns panel renders on the ordinary scenario",
+           any("Campaigns" in str(v) for v in _full["subheader"]))
+check("8a  ...and reports one campaign per run, because nothing in that "
+      "database was resumed", _metric(_full, "Campaigns"), str(len(_RUN_SEED)))
+check("8a  ...none of them stitched", _metric(_full, "Stitched from >1 run"),
+      "0")
+check_true("8a  ...and says so as a statement rather than an empty panel",
+           "campaign of ONE run" in _joined(_full, "success"))
+
+
+def _build_campaigns(path):
+    """A database whose fragments really were written by separate processes."""
+    _quiet_initialize(path)
+    conn = sqlite3.connect(path)
+    cur = conn.cursor()
+    ids = {}
+    # (label, status, resumed, fingerprint key, started, finished)
+    rows = [
+        ("CHAIN-1",  "KILLED",   0, "A", "2026-08-01T10:00:00", "2026-08-01T11:00:00"),
+        ("CHAIN-2",  "KILLED",   1, "A", "2026-08-01T12:00:00", "2026-08-01T13:00:00"),
+        ("CHAIN-3",  "FINISHED", 1, "A", "2026-08-01T14:00:00", "2026-08-01T15:00:00"),
+        ("FPCRASH",  "KILLED",   0, "A", "2026-08-03T10:00:00", "2026-08-03T11:00:00"),
+        # THE ONE THAT MUST NOT STITCH: same adjacency, same resumed flag, a
+        # different configuration.
+        ("FPRESUME", "FINISHED", 1, "B", "2026-08-03T12:00:00", "2026-08-03T13:00:00"),
+    ]
+    for label, status, resumed, fp, started, finished in rows:
+        cur.execute(
+            "INSERT INTO runs (started_at, finished_at, status, "
+            "invocation_source, resumed, fingerprint_version, "
+            "llm_classifier_prompt_version, llm_classifier_renderer_digest, "
+            "matching_model_configured, qdrant_collection, collection_points, "
+            "data_snapshot_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (started, finished, status, "batch_runner", resumed, 2,
+             f"1.9.0-{fp}", f"digest-{fp}", "gpt-5.6-terra",
+             f"trial_criteria_{fp}", 12067, "2026-02-26"))
+        ids[label] = cur.lastrowid
+    # Deliberately different counts per fragment, so a panel reporting any ONE
+    # of them -- or a constant -- could not pass the total below.
+    patients = {"CHAIN-1": 3, "CHAIN-2": 2, "CHAIN-3": 1,
+                "FPCRASH": 1, "FPRESUME": 1}
+    for label, count in patients.items():
+        for index in range(count):
+            cur.execute(
+                "INSERT INTO inferences (patient_id, timestamp, run_id, "
+                "estimated_cost_usd, error, age, sex) "
+                "VALUES (?, ?, ?, 0.1, '', 60, 'male')",
+                (f"{label}-{index}", "2026-08-20 10:00:00", ids[label]))
+    conn.commit()
+    conn.close()
+    return ids, patients
+
+
+_SCRATCH["campaigns"] = os.path.join(_TMP, "campaigns.db")
+_CAMP_IDS, _CAMP_PATIENTS = _build_campaigns(_SCRATCH["campaigns"])
+_camp, _camp_paths, _camp_net = _render(_SCRATCH["campaigns"])
+
+check("8b  the campaigns panel renders the stitched database without raising",
+      _camp["exception"], [])
+check("8b  five `runs` rows become THREE campaigns", _metric(_camp, "Campaigns"),
+      "3")
+check("8b  ...of which one was assembled from more than one process",
+      _metric(_camp, "Stitched from >1 run"), "1")
+check("8b  ...and the run list above still shows all five, because both are "
+      "true and they answer different questions",
+      _metric(_camp, "Runs recorded"), "5")
+
+_camp_table = _frame_with(_camp, "campaign", "run ids", "patients")
+check_true("8c  the campaign table rendered (non-degeneracy: every check below "
+           "reads it)", not _camp_table.empty)
+_camp_rows = {int(r["campaign"]): r for _, r in _camp_table.iterrows()}
+
+_ROOT = _CAMP_IDS["CHAIN-1"]
+check("8c  the three fragments are one row, with their ids in order",
+      str(at_(_camp_rows, _ROOT, {}).get("run ids")),
+      " -> ".join(str(_CAMP_IDS[l]) for l in ("CHAIN-1", "CHAIN-2", "CHAIN-3")))
+check("8c  ...and its patient count is the SUM across them -- the number the "
+      "run list above cannot give, because each of its rows carries only the "
+      "patients its own process wrote",
+      at_(_camp_rows, _ROOT, {}).get("patients"),
+      sum(_CAMP_PATIENTS[l] for l in ("CHAIN-1", "CHAIN-2", "CHAIN-3")))
+check("8c  ...and its wall span runs from the first start to the last finish",
+      (str(at_(_camp_rows, _ROOT, {}).get("first started")),
+       str(at_(_camp_rows, _ROOT, {}).get("last finished"))),
+      ("2026-08-01T10:00:00", "2026-08-01T15:00:00"))
+check("8c  ...and it is marked mixed-status, which is the ordinary shape of a "
+      "crash and resume", str(at_(_camp_rows, _ROOT, {}).get("mixed status")),
+      "yes")
+check("8c  ...and carries the 🔗 marker in the first column, which is what "
+      "distinguishes a stitched campaign from a single run at a glance",
+      "🔗" in str(at_(_camp_rows, _ROOT, {}).get("", "")), True)
+
+check("8d  THE FINGERPRINT BREAK: a resume under a different configuration is "
+      "NOT added to the crashed campaign before it",
+      at_(_camp_rows, _CAMP_IDS["FPCRASH"], {}).get("runs"), 1)
+check("8d  ...and is its own campaign, reported as one run",
+      at_(_camp_rows, _CAMP_IDS["FPRESUME"], {}).get("runs"), 1)
+check("8d  ...so their patients are not summed",
+      (at_(_camp_rows, _CAMP_IDS["FPCRASH"], {}).get("patients"),
+       at_(_camp_rows, _CAMP_IDS["FPRESUME"], {}).get("patients")), (1, 1))
+check("8d  ...and neither carries the stitched marker",
+      sorted({str(at_(_camp_rows, _CAMP_IDS[l], {}).get("", ""))
+              for l in ("FPCRASH", "FPRESUME")}), [""])
+
+check_true("8e  the panel says the per-run figures above are fragments, "
+           "which is the sentence that keeps the run list from being misread",
+           "fragments" in _joined(_camp, "info"))
+
+# --- PLANTED DEFECTS ------------------------------------------------------
+
+# P9 -- the campaign totals report a fragment instead of the sum.
+_p9 = _plant_and_render(
+    "P9 the campaign patient total reports one fragment",
+    '"patients": as_int(row.total_patients),',
+    '"patients": as_int(row.runs),',
+    db=_SCRATCH["campaigns"])
+_p9_table = _frame_with(_p9, "campaign", "run ids", "patients")
+check("8f  P9 is caught: the stitched campaign no longer reports the summed "
+      "cohort size",
+      (not _p9_table.empty)
+      and {int(r["campaign"]): r for _, r in _p9_table.iterrows()}[_ROOT][
+          "patients"] == sum(_CAMP_PATIENTS[l]
+                             for l in ("CHAIN-1", "CHAIN-2", "CHAIN-3")),
+      False)
+check("8f  ...and the shipped module does (the control)",
+      at_(_camp_rows, _ROOT, {}).get("patients"),
+      sum(_CAMP_PATIENTS[l] for l in ("CHAIN-1", "CHAIN-2", "CHAIN-3")))
+
+# P10 -- the stitched marker disappears, so a campaign of three reads like a
+# campaign of one.
+_p10 = _plant_and_render(
+    "P10 the stitched marker is dropped",
+    '        stitched = as_int(row.stitched) == 1',
+    '        stitched = False',
+    db=_SCRATCH["campaigns"])
+_p10_table = _frame_with(_p10, "campaign", "run ids", "patients")
+check("8g  P10 is caught: nothing in the row says its numbers span three "
+      "processes",
+      (not _p10_table.empty)
+      and "🔗" in str({int(r["campaign"]): r
+                       for _, r in _p10_table.iterrows()}[_ROOT].get("", "")),
+      False)
+check_true("8g  ...and the shipped module marks it (the control)",
+           "🔗" in str(at_(_camp_rows, _ROOT, {}).get("", "")))
+
+
+# ===========================================================================
 # SECTION 7: HYGIENE
 # ===========================================================================
 
@@ -1259,8 +1453,12 @@ print("=" * 70)
 print("Section 7: nothing in the repository was written")
 print("=" * 70)
 
-check("7a  eight defects were planted (non-degeneracy: a section that planted "
-      "none would report no failures and look identical)", _PLANT_SEQ[0], 8)
+# EIGHT IN SECTION 6 AND TWO IN SECTION 8 (the campaign pass). The number is a
+# NON-DEGENERACY PROBE and not a claim about the right number of plants: its job
+# is to say that the sections above really planted, so a harness that silently
+# stopped planting cannot report "no defects escaped" and pass.
+check("7a  ten defects were planted (non-degeneracy: a section that planted "
+      "none would report no failures and look identical)", _PLANT_SEQ[0], 10)
 check("7b  the tab module is byte-identical", digest_file(_TAB_FILE),
       _TAB_DIGEST_BEFORE)
 check("7b  the data module is byte-identical", digest_file(_DATA_FILE),

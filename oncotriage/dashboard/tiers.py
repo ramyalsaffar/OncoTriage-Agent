@@ -51,6 +51,27 @@ TRIAL_STATUS_PARTIAL     = '🟡 Partial Match'
 TRIAL_STATUS_UNCONFIRMED = '🔶 Unconfirmed'
 TRIAL_STATUS_REJECTED    = '❌ Not Eligible'
 
+# THERE ARE FOUR AGAIN, AND THE FOURTH IS NOT A BUCKET OF `classify_trial_score`
+# (the campaign pass). That function partitions a SCORE into three; this names
+# the state in which THERE IS NO SCORE TO PARTITION, which it cannot express
+# and must not be asked to:
+#
+#   `match_score` is a nullable REAL. A trial row written by one of Stage 5's
+#   failure returns carries no score, and so does every row written before the
+#   column was populated. `classify_trial_score(None)` RAISES TypeError on its
+#   first comparison -- taking the whole page down, since no tab call site has a
+#   handler -- and `classify_trial_score(nan)` returns 'Unconfirmed Match',
+#   which is a real verdict about a measurement nobody made. Neither is a
+#   rendering of "unknown", so the three tabs that classify a trial test for
+#   absence FIRST and use this.
+#
+# IT LIVES HERE RATHER THAN IN ONE TAB because all three of them need it --
+# patient_explorer, trial_explorer and performance -- and a status string typed
+# out in three files is the shape pass 20f-3 had to come back and fix for
+# '✅ Full Match'. `classify_trial_score` itself is deliberately UNCHANGED: it
+# is a pure function of a score and stays a partition of one.
+TRIAL_STATUS_NO_SCORE    = '❔ No Score Recorded'
+
 
 # Per-PATIENT outcome labels: the display form of each `match_tier` value that
 # `enrich_match_tiers()` assigns below.

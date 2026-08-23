@@ -166,7 +166,9 @@ from oncotriage.storage.database_logger import (
     RUN_METRIC_CATEGORY_META,
     RUN_METRIC_META_COUNTERS_NONZERO,
     RUN_METRIC_META_COUNTERS_REGISTERED,
+    RUN_FINGERPRINT_COLUMNS,
     RUN_RECORD_STATUS_RUNNING,
+    RUN_RECORD_TERMINAL_STATUSES,
     TRIAL_MATCH_COLUMN_ADDITIONS,
 )
 from oncotriage.utils import get_model_cost
@@ -871,6 +873,160 @@ RUN_TABLES = ("runs", "run_metrics")
 
 Named once so a `requires=` declaration and any consumer asking "can this
 database answer the run questions" cannot disagree about the list."""
+
+
+# ---------------------------------------------------------------------------
+# CAMPAIGNS -- THE FRAGMENTS OF ONE RUN, STITCHED BACK TOGETHER
+# ---------------------------------------------------------------------------
+#
+# A `runs` ROW IS A PROCESS, NOT A CAMPAIGN, AND THE DIFFERENCE IS INVISIBLE IN
+# EVERY QUERY ABOVE. `oncotriage/batch/runner.py` opens one row before its first
+# patient and finalizes it after its last; a process that dies leaves that row
+# KILLED (or FAILED), and the NEXT invocation reads the checkpoint, opens a
+# SECOND row, and writes the remaining patients under the SECOND id. So one
+# campaign that crashed twice is three rows, and `run_summary` reports each of
+# them as a run:
+#
+#   * its `patients` count is a FRAGMENT -- every patient an earlier process
+#     completed carries the EARLIER run's id, which is exactly what the
+#     `resumed` column was added to say;
+#   * its `started_at` is when the LAST process started, not when the campaign
+#     did;
+#   * and its status is the status of a process, so a campaign that finished
+#     has KILLED rows in it.
+#
+# This query is the reader that puts them back together. It is DERIVED, not
+# stored: nothing was added to the schema, and `resumed` plus the seven
+# fingerprint columns are what make the derivation possible.
+#
+# THE STITCH RULE, AND WHY EACH HALF OF IT IS THERE
+# ------------------------------------------------
+# A run with `resumed = 1` continues the campaign of the nearest PRECEDING run
+# whose status is KILLED or FAILED **and** whose fingerprint columns are
+# identical. Chains stitch transitively, so three fragments are one campaign.
+#
+#   `resumed = 1`         The writer's own record that this process started from
+#                         a non-empty checkpoint. NULL (a row written before that
+#                         column existed) is NOT a resume: `NULL = 1` is NULL, so
+#                         such a row is its own campaign, which is the honest
+#                         reading of "nobody recorded whether this was a resume".
+#
+#   KILLED or FAILED      A campaign that FINISHED has nothing left to resume.
+#                         Requiring the predecessor to have ended badly is what
+#                         stops an ordinary re-run of a completed cohort being
+#                         glued onto it.
+#
+#   IDENTICAL FINGERPRINT THE REASON THIS QUERY EXISTS AT ALL. A reviewer's
+#                         question is always "which configuration produced this
+#                         number", so fragments produced under different
+#                         configurations MUST NOT SUM. A prompt-version bump, a
+#                         renderer edit, a re-index or a model change between the
+#                         crash and the resume breaks the chain, and the resumed
+#                         run becomes its own campaign -- which is a fragment,
+#                         and is reported as one run rather than silently added
+#                         to a total it does not belong in.
+#
+# THE PREDICATE IS BUILT FROM `RUN_FINGERPRINT_COLUMNS`, NEVER RETYPED. That
+# tuple is `("fingerprint_version",) + run_fingerprint.FINGERPRINT_FIELDS`, and
+# the whole point of a gated field is that a run under a different value of it is
+# a different configuration. Hand-listing six of the seven here would leave one
+# axis along which two configurations stitch into one campaign with nothing
+# saying so -- and a hand-written list does not grow when the next field is
+# gated. Generated, it does.
+#
+# WHAT `IS` BUYS AND WHAT IT COSTS. SQLite's `IS` is null-safe equality, so a
+# field that degraded to NULL on both sides (an unresolvable `collection_points`)
+# compares equal rather than making every comparison NULL and refusing every
+# stitch. The cost is that two runs with NO STAMP AT ALL would compare equal on
+# all seven, so both sides are additionally required to carry a
+# `fingerprint_version`: an unknown configuration is not a matching
+# configuration, and `run_fingerprint` itself keys FP_ABSENT on exactly that
+# column.
+#
+# WHAT THIS DOES NOT DO, STATED RATHER THAN DISCOVERED:
+#
+#   * It reads the ORDER of runs off `runs.id`, which is AUTOINCREMENT and
+#     therefore monotone in creation order within one database. `started_at` is a
+#     TEXT the writer stamps and two rows can share one; the primary key cannot.
+#     Two databases merged by hand would break that assumption, and so would
+#     every other query here that reads an id.
+#   * "Nearest preceding" is nearest among runs satisfying BOTH halves of the
+#     rule, which is the literal reading of it. So a resume CAN attach across an
+#     intervening crashed run of a different configuration -- two campaigns run
+#     alternately produce two chains whose wall spans overlap. That is a
+#     reporting artifact and not a misattribution: `run_ids` is emitted in order
+#     so the gap is visible. The alternative reading -- refuse to stitch when the
+#     immediately preceding crashed run has a different fingerprint -- would
+#     report a genuine resume as a whole campaign, which IS a misattribution.
+#   * It cannot see a campaign that was never recorded. A `runs` row is written
+#     by `oncotriage/batch/runner.py` and `oncotriage/ablation/study.py`; the API
+#     writes none, on purpose, so nothing it produces appears here at all.
+
+CAMPAIGN_RESUMABLE_STATUSES = ("KILLED", "FAILED")
+"""The statuses a resumed run may attach to. `RUN_RECORD_TERMINAL_STATUSES`
+minus FINISHED, and a strict subset of it by construction -- see the guard
+below. A FINISHED run has nothing left to resume, so gluing a later invocation
+onto one would turn a re-run into a continuation."""
+
+CAMPAIGN_STAMP_COLUMN = "fingerprint_version"
+"""The `runs` column whose presence says a configuration stamp was recorded.
+
+NAMED RATHER THAN INDEXED OUT OF ``RUN_FINGERPRINT_COLUMNS[0]``: a positional
+read of a tuple whose order is the stamp's own field order would silently start
+testing a different column the day that order changes. The guard below is what
+keeps the name honest."""
+
+if CAMPAIGN_STAMP_COLUMN not in RUN_FINGERPRINT_COLUMNS:
+    raise RuntimeError(
+        f"CAMPAIGN_STAMP_COLUMN {CAMPAIGN_STAMP_COLUMN!r} is not one of "
+        f"RUN_FINGERPRINT_COLUMNS {RUN_FINGERPRINT_COLUMNS!r}. The campaign "
+        f"stitch tests it for NOT NULL to establish that a configuration was "
+        f"recorded at all; a name that is not a column of `runs` makes that "
+        f"test raise `no such column` inside report()."
+    )
+
+if not set(CAMPAIGN_RESUMABLE_STATUSES) < set(RUN_RECORD_TERMINAL_STATUSES):
+    raise RuntimeError(
+        f"CAMPAIGN_RESUMABLE_STATUSES {CAMPAIGN_RESUMABLE_STATUSES!r} must be a "
+        f"PROPER subset of RUN_RECORD_TERMINAL_STATUSES "
+        f"{RUN_RECORD_TERMINAL_STATUSES!r}. Equal would mean a FINISHED run can "
+        f"be resumed onto, which turns a re-run into a continuation; a value "
+        f"outside it is a status no `runs` row can hold, so no stitch would "
+        f"ever be made."
+    )
+# A RuntimeError and not an `assert`: `python -O` deletes assert statements, and
+# a guard that vanishes under an optimisation flag is not a guard. Same shape,
+# same reason, as RESUME_SKIP_STATUSES' partition check in
+# oncotriage/evaluation/run_harness.py.
+
+_CAMPAIGN_STATUS_LIST_SQL = ", ".join(
+    f"'{status}'" for status in CAMPAIGN_RESUMABLE_STATUSES)
+
+_CAMPAIGN_FINGERPRINT_MATCH_SQL = "\n".join(
+    f"                      AND prev.{column} IS r.{column}"
+    for column in RUN_FINGERPRINT_COLUMNS)
+"""One null-safe equality per gated fingerprint column, generated from the
+writer's own tuple. Grows by itself when a field is gated."""
+
+_CAMPAIGN_EDGE_SQL = f"""    edge AS (
+        SELECT r.id AS edge_run_id,
+               CASE WHEN r.resumed = 1 THEN (
+                   SELECT MAX(prev.id)
+                     FROM runs prev
+                    WHERE prev.id < r.id
+                      AND prev.status IN ({_CAMPAIGN_STATUS_LIST_SQL})
+                      AND prev.{CAMPAIGN_STAMP_COLUMN} IS NOT NULL
+{_CAMPAIGN_FINGERPRINT_MATCH_SQL}
+               ) END AS parent_id
+          FROM runs r
+    )"""
+"""Each run and the run it continues, or NULL.
+
+The alias is `prev` rather than `p` DELIBERATELY. `p` is bound to a different
+subquery in the same statement, and while SQL scoping keeps them apart,
+``sql_table_aliases`` is a lexical reader that would bind the name once for the
+whole string -- an over-derivation, whose cost is a query skipped on a database
+that could have answered it. Costing nothing to avoid, it is avoided."""
 
 
 #------------------------------------------------------------------------------
@@ -1935,6 +2091,161 @@ QUERIES = (
     ORDER BY inference_rows DESC, attribution
 """,
     ),
+    # ── CAMPAIGNS: the fragments of one run, stitched (the campaign pass) ──
+    #
+    # The rule, its three halves and everything it deliberately does not do are
+    # argued at CAMPAIGN_RESUMABLE_STATUSES above, beside the fragments this SQL
+    # interpolates. What is worth repeating HERE is the acceptance criterion:
+    # fragments produced under DIFFERENT configurations must not sum, because
+    # "which configuration produced this number" is the question a campaign
+    # total exists to answer.
+    Query(
+        key='campaign_summary',
+        heading='=== CAMPAIGNS: RUNS STITCHED ACROSS CRASH AND RESUME ===',
+        render='to_string',
+        blank_after=True,
+        # `runs` ALONE, and NOT RUN_TABLES. This query never reads
+        # `run_metrics`, so declaring it would skip the campaign view on a
+        # database that can answer it -- `dangling_run_references`' ruling, for
+        # the same reason.
+        requires=("runs",),
+        # BOTH ARE JOIN/PREDICATE COLUMNS, not projected ones: `inferences.run_id`
+        # is what the patient rollup groups on and `runs.resumed` is the whole
+        # stitch predicate, so their absence makes the SQL unparseable rather
+        # than merely NULL. The declaration is checked against
+        # derive_requires_columns by tests/test_storage_schema_guards.py
+        # section 1, which is why it is written in ADDITIVE_COLUMNS key order.
+        requires_columns=(("inferences", "run_id"), ("runs", "resumed")),
+        notes=(
+            "One row per CAMPAIGN, not per run. A campaign that never crashed",
+            "is a campaign of one, and `stitched` is 0 for it -- which is what",
+            "makes 'this total covers three processes' a visible fact rather",
+            "than an invisible one.",
+            "",
+            "total_patients is summed across the fragments, so it is the",
+            "campaign's real cohort size. run_summary's per-run count is a",
+            "fragment of it whenever `resumed` is 1.",
+            "",
+            "last_finished_at IS THE END OF THE SPAN, NOT NECESSARILY THE END",
+            "OF THE CAMPAIGN: unfinalized_runs > 0 means at least one fragment",
+            "carries no finished_at (live, or killed without a stamp), so the",
+            "span is open at that end. It is NOT defaulted to `now`.",
+            "",
+            "The fingerprint columns are the ROOT fragment's. Every member",
+            "matched its parent on all seven, transitively, so one campaign has",
+            "one configuration by construction -- that is the invariant the",
+            "stitch enforces, and reporting it here is what lets a reviewer",
+            "attribute the total without opening another query.",
+            "",
+            "NOT CAPPED. There is one row per campaign.",
+        ),
+        sql=f"""
+WITH RECURSIVE
+{_CAMPAIGN_EDGE_SQL},
+    -- WALK UP FROM EVERY RUN TO ITS ROOT. `parent_id` is strictly less than
+    -- `edge_run_id` by construction (the subquery above takes MAX(prev.id)
+    -- WHERE prev.id < r.id), so this terminates and cannot cycle -- which is
+    -- the property that makes an unbounded recursive CTE safe here.
+    walk(walk_run_id, cursor_id) AS (
+        SELECT edge_run_id, edge_run_id FROM edge
+        UNION ALL
+        SELECT w.walk_run_id, e.parent_id
+          FROM walk w
+          JOIN edge e ON e.edge_run_id = w.cursor_id
+         WHERE e.parent_id IS NOT NULL
+    ),
+    -- The campaign a run belongs to IS the smallest id its walk reached, which
+    -- is the root. Every member's chain ends at that root and ids only
+    -- decrease along a chain, so the root is also the smallest MEMBER id --
+    -- which is what lets the ordered path below start from `campaign_id`.
+    member AS (
+        SELECT walk_run_id AS member_run_id, MIN(cursor_id) AS campaign_id
+          FROM walk GROUP BY walk_run_id
+    ),
+    -- Pre-aggregated per RUN before it is joined, for the reason
+    -- _RUN_HEALTH_PATIENTS_SQL records: a run with 20 patients joined
+    -- unaggregated multiplies every other child of the same row.
+    patients AS (
+        SELECT i.run_id AS patient_run_id,
+               COUNT(*) AS n_patients,
+               SUM(COALESCE(i.estimated_cost_usd, 0)) AS cost,
+               SUM(CASE WHEN i.estimated_cost_usd IS NULL
+                        THEN 1 ELSE 0 END) AS unpriced
+          FROM inferences i
+         WHERE i.run_id IS NOT NULL
+         GROUP BY i.run_id
+    ),
+    stats AS (
+        SELECT m.campaign_id                                AS campaign_id,
+               COUNT(*)                                     AS runs,
+               MAX(m.member_run_id)                         AS last_run_id,
+               MIN(r.started_at)                            AS first_started_at,
+               MAX(r.finished_at)                           AS last_finished_at,
+               SUM(CASE WHEN r.finished_at IS NULL
+                        THEN 1 ELSE 0 END)                  AS unfinalized_runs,
+               COUNT(DISTINCT r.status)                     AS distinct_statuses,
+               COALESCE(SUM(p2.n_patients), 0)              AS total_patients,
+               ROUND(COALESCE(SUM(p2.cost), 0), 4)          AS total_cost_usd,
+               COALESCE(SUM(p2.unpriced), 0)                AS rows_with_no_cost
+          FROM member m
+          JOIN runs r ON r.id = m.member_run_id
+          LEFT JOIN patients p2 ON p2.patient_run_id = m.member_run_id
+         GROUP BY m.campaign_id
+    ),
+    -- THE ORDERED LIST, BUILT BY RECURSION RATHER THAN BY group_concat.
+    -- SQLite's group_concat leaves its order arbitrary, and an ORDER BY inside
+    -- it needs 3.44+, which a CI runner's system SQLite may not be. Determinism
+    -- is a stated property of this project, so the string is assembled one
+    -- member at a time in ascending id order, which is guaranteed on every
+    -- version.
+    path AS (
+        SELECT root.id                     AS campaign_id,
+               root.id                     AS at_run,
+               CAST(root.id AS TEXT)       AS run_ids,
+               root.status                 AS statuses
+          FROM runs root
+         WHERE root.id IN (SELECT campaign_id FROM member)
+        UNION ALL
+        SELECT pth.campaign_id,
+               nxt.id,
+               pth.run_ids || ' -> ' || nxt.id,
+               pth.statuses || ' -> ' || nxt.status
+          FROM path pth
+          JOIN runs nxt
+            ON nxt.id = (SELECT MIN(m2.member_run_id) FROM member m2
+                          WHERE m2.campaign_id = pth.campaign_id
+                            AND m2.member_run_id > pth.at_run)
+    )
+SELECT s.campaign_id,
+       pa.run_ids,
+       s.runs,
+       CASE WHEN s.runs > 1 THEN 1 ELSE 0 END              AS stitched,
+       pa.statuses,
+       CASE WHEN s.distinct_statuses > 1 THEN 1 ELSE 0 END AS mixed_status,
+       s.total_patients,
+       s.first_started_at,
+       s.last_finished_at,
+       s.unfinalized_runs,
+       s.total_cost_usd,
+       s.rows_with_no_cost,
+       head.invocation_source,
+       head.fingerprint_version,
+       head.llm_classifier_prompt_version,
+       head.llm_classifier_renderer_digest,
+       head.matching_model_configured,
+       head.qdrant_collection,
+       head.collection_points,
+       head.data_snapshot_date
+  FROM stats s
+  -- `pa.at_run = s.last_run_id` picks the COMPLETE path row: the recursion
+  -- emits one row per prefix, and the prefix that ends at the campaign's
+  -- highest member id is the whole list.
+  JOIN path pa ON pa.campaign_id = s.campaign_id
+              AND pa.at_run = s.last_run_id
+  JOIN runs head ON head.id = s.campaign_id
+ ORDER BY s.campaign_id DESC
+""",
+    ),
     # THE AUDIT SIDE OF AN UNENFORCED FOREIGN KEY.
     #
     # `inferences.run_id` REFERENCES `runs(id)` in the CREATE TABLE and the
@@ -2362,8 +2673,6 @@ ADDITIVE_COLUMNS = {
     "runs": frozenset(RUN_COLUMN_ADDITIONS),
 }
 
-_SQL_STRING = re.compile(r"'(?:[^']|'')*'")
-_SQL_COMMENT = re.compile(r"--[^\n]*")
 _SQL_TABLE_REF = re.compile(
     r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)\s*"
     r"(?:(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?", re.IGNORECASE)
@@ -2389,9 +2698,72 @@ def _strip_sql_noise(sql) -> str:
     """`sql` with comments and string literals replaced by whitespace.
 
     The literal becomes `' '` rather than nothing so two identifiers either side
-    of one cannot be fused into a third that appears in neither.
+    of one cannot be fused into a third that appears in neither. A `--` comment
+    becomes spaces up to its newline, and the newline is kept.
+
+    A LEFT-TO-RIGHT SCANNER AND NOT TWO REGEX PASSES, AND THE DIFFERENCE IS A
+    SHIPPED DEFECT THIS REPLACES. It was one regex substitution nested inside
+    another -- string literals masked FIRST, comments second -- so an
+    APOSTROPHE INSIDE A `--` COMMENT was read as the start of a string literal
+    and swallowed everything up to the next quote anywhere in the query,
+    comments and code alike.
+
+    Two ordinary English comments (``every member's chain``, ``SQLite's
+    group_concat``) were enough to hide a whole CTE, and the CTE hidden was the
+    one naming ``i.run_id``. The failure is SILENT AND IN THE DANGEROUS
+    DIRECTION: the query derives fewer additive columns than it names, so a new
+    query that declares nothing agrees with a derivation that found nothing,
+    ``tests/test_storage_schema_guards.py`` check 1a passes, and ``report()``
+    dies on ``no such column`` against a database that predates the column --
+    which is the exact defect item 38 removed from File 16. Measured, not
+    reasoned about: ``campaign_summary`` derived ``(('runs', 'resumed'),)``
+    under the old implementation and ``(('inferences', 'run_id'), ('runs',
+    'resumed'))`` under this one.
+
+    Reversing the two passes would only move the hazard: a ``--`` inside a
+    string literal would then be read as a comment. One scanner that knows both
+    forms is the only version that is right about both, and SQL's doubled-quote
+    escape (``'it''s'``) falls out of it for free.
     """
-    return _SQL_COMMENT.sub(" ", _SQL_STRING.sub(" ' ' ", sql))
+    out = []
+    i = 0
+    n = len(sql)
+    while i < n:
+        char = sql[i]
+        if char == "'":
+            # A STRING LITERAL. '' inside one is an escaped quote and does not
+            # end it, which is why this cannot be a non-greedy regex either.
+            j = i + 1
+            while j < n:
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'":
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            else:
+                # UNTERMINATED. SQLite would refuse this SQL outright, so the
+                # only question is what a lexical reader should do with it. It
+                # masks to the end rather than treating the quote as ordinary
+                # text: a name recovered from inside a broken literal is a
+                # derivation from something that is not code.
+                j = n
+            out.append(" ' ' ")
+            i = j
+            continue
+        if char == "-" and i + 1 < n and sql[i + 1] == "-":
+            j = sql.find("\n", i)
+            if j == -1:
+                out.append(" " * (n - i))
+                i = n
+            else:
+                out.append(" " * (j - i))
+                i = j
+            continue
+        out.append(char)
+        i += 1
+    return "".join(out)
 
 
 def sql_table_aliases(sql) -> Dict:
