@@ -267,6 +267,27 @@ BUCKETS = {
         "collision matrix. An _EXEC_ALLOWLIST member -- section 6 execs a "
         "copy with the packing branch disabled as the OTHER ARM of an "
         "equivalence proof, not only as a control"),
+    "test_agent_stage5_per_trial_calls.py": (
+        _A, None,
+        "ran green in 3.4s, 139 checks: Stage 5's flag-gated PER-TRIAL call "
+        "mode -- one billed call per patient-trial pair, the priming call "
+        "awaited alone so the shared prefix can warm, the rest dispatched "
+        "under an in-flight bound, and the merge in TRIAL order however the "
+        "pool answers. Every response is a literal served by a stub installed "
+        "through oncotriage.agent.deps, and the scheduling assertion is an "
+        "integer comparison over tickets the stub issued rather than a "
+        "measurement of elapsed time, so it does not depend on runner speed. "
+        "No network, no keys, no spend, no subprocess, no fixture, no git "
+        "history, no corpus, no model call, no live server. It DOES open "
+        "SQLite, in section 9b only, to round-trip the additive "
+        "inferences.matching_call_mode column through the real writer -- "
+        "every database is a scratch file inside a tempfile.mkdtemp that is "
+        "asserted to differ from the production path, removed at the end and "
+        "asserted gone -- so it writes nothing in the repository and is NOT "
+        "in the collision matrix. An _EXEC_ALLOWLIST member: fourteen "
+        "controls each exec an in-memory copy of "
+        "oncotriage/agent/evaluation.py with one part of the mechanism "
+        "broken"),
     "test_agent_state_channel_coverage.py": (
         _A, None,
         "ran green in 2.1s, 73 checks, against ONLY the directory skeleton, "

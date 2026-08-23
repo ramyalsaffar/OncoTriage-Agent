@@ -1038,6 +1038,60 @@ def assert_provider_is_hookable(what: str) -> None:
         raise UnsupportedMatchingProviderError(what)
 
 
+class UnsupportedCallModeError(RuntimeError):
+    """The fixture harness was asked to run with per-trial Stage 5 calls.
+
+    THE SINK NUMBERS ITS RECORDINGS BY ARRIVAL, AND PER-TRIAL MODE ISSUES THEM
+    CONCURRENTLY. ``RecordingSink.add`` stamps ``call_index = len(bucket)``
+    under its lock, so the index is the order responses HAPPENED TO ARRIVE in
+    -- deterministic while Stage 5 is sequential, and decided by the scheduler
+    the moment it is not. ``build_deterministic_prefix`` then projects
+    ``request_sha256_by_call`` and ``finish_reasons`` as LISTS in that order.
+
+    So a capture taken under ``MATCHING_PER_TRIAL_CALLS_ENABLED`` would write a
+    fixture whose deterministic prefix is NOT deterministic: two captures of one
+    patient could differ in those two lists with nothing about the pipeline
+    having changed, and a replay of such a fixture would report a difference
+    that is a permutation. Nothing would raise. That is the class of silent
+    fault the whole prefix exists to detect, manufactured by the harness.
+
+    So the harness REFUSES rather than guessing. Making the sink order Stage 5
+    by TRIAL rather than by arrival is the fix, and it is a fixture-format
+    question -- ``call_index`` is stamped by a generic bucket appender shared
+    with three other seams, and the node's own ``call_index`` numbering would
+    have to agree with it -- rather than a one-line one, which is why this is a
+    refusal and a recorded follow-up.
+
+    A RuntimeError subclass, deliberately not a ValueError, on the
+    ``UnknownModelPricingError`` precedent.
+    """
+
+    def __init__(self, what: str):
+        super().__init__(
+            f"{what}: config.MATCHING_PER_TRIAL_CALLS_ENABLED is True, and "
+            f"this harness records Stage 5 exchanges in ARRIVAL order. "
+            f"Per-trial mode issues them concurrently, so "
+            f"request_sha256_by_call and finish_reasons in the deterministic "
+            f"prefix would be ordered by the thread scheduler and two captures "
+            f"of one patient could disagree. Set "
+            f"MATCHING_PER_TRIAL_CALLS_ENABLED = False in oncotriage/config.py "
+            f"to capture or replay, or teach RecordingSink a trial-stable "
+            f"ordering for the chat_completions bucket first."
+        )
+
+
+def assert_call_mode_is_hookable(what: str) -> None:
+    """Refuse to install hooks for a Stage 5 call mode the sink cannot order.
+
+    READ LIVE OFF THE CONFIG MODULE, exactly as ``assert_provider_is_hookable``
+    reads MATCHING_PROVIDER: a bound name taken at import would record the
+    value this file was imported with rather than the one that is about to
+    serve the run.
+    """
+    if config.MATCHING_PER_TRIAL_CALLS_ENABLED:
+        raise UnsupportedCallModeError(what)
+
+
 def install_recording_hooks(sink: RecordingSink,
                             truncate_first_call: bool = False) -> dict:
     """Redirect all four seams to recorders. Returns the saved override state.
@@ -1051,6 +1105,7 @@ def install_recording_hooks(sink: RecordingSink,
             MATCHING_PROVIDER names a provider these proxies do not cover.
     """
     assert_provider_is_hookable("install_recording_hooks")
+    assert_call_mode_is_hookable("install_recording_hooks")
 
     proxies = {
         deps.OPENAI_CLIENT: OpenAIProxy(

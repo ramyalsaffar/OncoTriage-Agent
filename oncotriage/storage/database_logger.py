@@ -227,9 +227,13 @@ def resolve_inference_db_path(db_path=None):
 # where they started. It answers one question -- which era is this file -- for
 # a human, a support script, or a future tool that must refuse a database it
 # does not understand.
+# ERA 3: `inferences.matching_call_mode`, added with INFERENCE_COLUMN_ADDITIONS
+#        and its migration loop. It records whether Stage 5 sent one trial per
+#        request or several, which llm_classifier_packing cannot state on its
+#        own once per-trial mode can bypass the packer.
 # ERA 2: `runs.resumed`, added with RUN_COLUMN_ADDITIONS and its migration loop.
 # ERA 1: the constant's own introduction -- the schema as it stood then.
-SCHEMA_USER_VERSION = 2
+SCHEMA_USER_VERSION = 3
 
 
 #------------------------------------------------------------------------------
@@ -794,6 +798,43 @@ INFERENCE_COLUMN_ADDITIONS = {
     # and the whole reason this column exists is that a stored row should not
     # have to be dated to be interpreted.
     "matching_provider":                     "TEXT",
+    # --- HOW STAGE 5 PARTITIONED ITS WORK ----------------------------------
+    #
+    # "grouped" or "per_trial", exactly -- config.matching_call_mode()'s value,
+    # read here at INSERT time.
+    #
+    # WHAT IT SEPARATES THAT NOTHING ELSE CAN. llm_classifier_packing.enabled
+    # reads False on a run where the packing switch was off AND on a run where
+    # per-trial mode bypassed the packer, and those two ran different request
+    # shapes against the same patient. The measured reason per-trial mode
+    # exists -- reasoning leaking between trials that share one prompt -- makes
+    # them capable of producing different VERDICTS, so a campaign that mixed
+    # them and could not tell them apart afterwards would be uninterpretable.
+    #
+    # A PLAIN STRING ON matching_provider's PRECEDENT two lines up, for the
+    # identical reasons: SQLite has no enum, a CHECK constraint cannot be added
+    # by the ALTER-only mechanism this dict IS, and a lookup table would put a
+    # join in front of every query for a column with two values. AT THE
+    # POSTGRES MIGRATION it becomes TEXT with a CHECK naming both members of
+    # config.MATCHING_CALL_MODES.
+    #
+    # READ FROM CONFIG, NOT FROM THE RESULT DICT, which is what makes it
+    # unconditional: it lands on the no-candidates rows, the error-handler rows
+    # and every Stage 5 failure return, which are exactly the rows a mode
+    # comparison must be able to attribute. A run that died before Stage 5 was
+    # still CONFIGURED in a mode, and that is what this column claims.
+    #
+    # THROUGH ONE OWNER, config.matching_call_mode(), rather than by reading
+    # the flag here. oncotriage/agent/evaluation.py decides how to partition
+    # from the same function, so the row cannot name a mode the node did not
+    # run -- the divergence a second reader of the same constant would make
+    # possible. matching_wire_model() is the same shape for the same reason.
+    #
+    # NULL MEANS THE ROW PREDATES THIS COLUMN, and such a row is provably
+    # grouped: per-trial mode did not exist when it was written. NOTHING IS
+    # BACKFILLED, on matching_provider's argument -- a backfilled value is
+    # indistinguishable from a measured one.
+    "matching_call_mode":                    "TEXT",
     # --- What Stage 5's normalizer corrected, per run ----------------------
     #
     # THREE ARTIFACTS ARE PRODUCED BY THAT NORMALIZER AND UNTIL THIS PASS TWO OF
@@ -3215,10 +3256,10 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 llm_classifier_packed_chunks, llm_classifier_packing,
                 llm_classifier_output_split_threshold,
                 llm_classifier_output_ceiling,
-                matching_provider,
+                matching_provider, matching_call_mode,
                 verdict_normalizations, remapped_trials,
                 run_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             result["patient_id"],
             result["timestamp"],
@@ -3441,6 +3482,16 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
             # config names imported above cannot: CROSS_ENCODER_MODEL and
             # MATCHING_MODEL identify models that are fixed for a run.
             _config.MATCHING_PROVIDER,
+            # SAME SEAM, ONE STEP FURTHER: a FUNCTION on the config module
+            # rather than a constant read off it. matching_call_mode() is the
+            # single owner of "which mode is this", and
+            # oncotriage/agent/evaluation.py partitions the batch from that
+            # same function -- so this column and the node cannot disagree
+            # about the run they are both describing. Reading
+            # MATCHING_PER_TRIAL_CALLS_ENABLED here instead would be a second
+            # interpretation of one constant, free to drift from the first the
+            # moment the vocabulary gains a member.
+            _config.matching_call_mode(),
             # --- What Stage 5's normalizer corrected, per run ---------------
             #
             # NO DEFAULT ON EITHER, which is hallucinated_trials' rule two lines

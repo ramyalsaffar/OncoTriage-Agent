@@ -513,6 +513,15 @@ LOGGABLE_FIELDS = frozenset({
     # the day. None of the four names a trial, a patient or a diagnosis.
     "quality_dropped_percentile", "quality_dropped_floor",
     "quality_dropped_floor_only", "medcpt_floor",
+    # How many Stage 5 requests of ONE patient this run will hold in flight at
+    # once, after the priming call. A concurrency bound -- an integer derived
+    # from config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS and the size of the
+    # batch -- so it can carry no patient, trial or diagnosis. It is a FIELD
+    # rather than a number interpolated into the message because section 6c of
+    # tests/test_observability_logging.py forbids the latter, and because the
+    # bound is the one thing a reader comparing two per-trial campaigns has to
+    # group by.
+    "parallel",
     # The cross-encoder's sequence limit, both sides of the comparison plus
     # WHICH declaration was consulted. All three are model geometry -- a token
     # count and an attribute path -- and none of them can carry a patient, a

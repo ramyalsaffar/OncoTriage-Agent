@@ -1924,6 +1924,179 @@ MATCHING_INPUT_TOKEN_BUDGET = 12000
 # bounded number of billed calls rather than one per trial.
 MATCHING_MAX_INPUT_PACKED_CHUNKS = 5
 
+# ---------------------------------------------------------------------------
+# Stage 5 PER-TRIAL calls
+# ---------------------------------------------------------------------------
+#
+# A THIRD AXIS, AND IT IS THE LIMIT OF THE PACKER RATHER THAN A COMPETITOR TO
+# IT. Packing bounds how big a request may get; it does not stop two trials
+# sharing one prompt, and sharing a prompt is where the measured fault lives:
+# the input-packing block above records that "reasoning demonstrably leaks
+# between trials inside one prompt, which is the thing constraint C4 asks the
+# model not to do and cannot enforce". A budget cannot remove that. Only a
+# partition of one trial per request can, and the reason it was not the first
+# answer is price -- fifteen requests per patient re-send the whole system
+# message fifteen times.
+#
+# WHAT CHANGED IS THE PRICE, NOT THE ARGUMENT. PROMPT_VERSION 1.6.0 moved the
+# patient record INTO the system message, so every request of one patient now
+# shares a byte-identical prefix and the provider discounts it from the second
+# request on -- PRICING_CONFIG's gpt-5.6-terra note records cached input at
+# $0.20/1M against $2.00/1M. Whether that discount actually lands is not
+# assumed here: it is measured, per call, in
+# ``inferences.llm_classifier_call_details[].cached_tokens``, and the
+# scheduling below exists to give the cache a chance to warm before it is
+# leaned on.
+#
+# THIS PASS BUILDS THE ARM. IT DOES NOT DECIDE THE CAMPAIGN. Which mode a
+# published number is computed under is a measurement -- verdict agreement,
+# omission rate, cost per patient, all of them comparable only if both arms
+# exist -- and the switch below is what makes both arms runnable from one
+# build.
+
+# Master switch, and it is a SWITCH rather than a threshold for the reason
+# MATCHING_INPUT_PACKING_ENABLED already gives about itself: the validation run
+# needs both arms, and "one call per trial" and "the packer happened to emit
+# one trial per chunk" are different facts that the provenance record has to be
+# able to state apart -- which is what inferences.matching_call_mode is for.
+#
+# OFF REPRODUCES TODAY'S BEHAVIOUR EXACTLY, and that is a stronger promise than
+# "equivalently": with this False the node takes the identical branch it took
+# before this constant existed, issues the identical requests field for field,
+# spawns no thread, and creates no executor.
+# tests/test_agent_stage5_per_trial_calls.py section 6 compares the two arms
+# request by request against a copy of the module with the per-trial branch
+# compiled out, and section 7's control shows that comparison failing.
+#
+# ON, the packer is BYPASSED rather than reconfigured: initial_chunks becomes
+# one single-trial chunk per trial and llm_classifier_packing records
+# enabled=False with bypassed_by naming this mode. Setting
+# MATCHING_INPUT_TOKEN_BUDGET to 1 would produce nearly the same partition and
+# would be the wrong mechanism -- it would report a packer that ran, and it
+# would still group two trials whenever one trial alone exceeded the budget.
+#
+# THE OUTPUT SPLITTERS STAY ARMED. A single trial can still overflow the output
+# ceiling, and when it does the reactive splitter finds len(chunk) == 1 and
+# records NOT_EVALUABLE_TRUNCATION_FLOOR -- which is the correct, already-built
+# handling. Nothing about that machinery is disabled by this switch; it simply
+# has no halving left to do.
+MATCHING_PER_TRIAL_CALLS_ENABLED = False
+
+# How many per-trial requests of ONE patient may be in flight at once, AFTER
+# the first one has completed. Read only when the switch above is True.
+#
+# THE ONE-THEN-N SHAPE IS THE WHOLE POINT AND IT IS NOT A PERFORMANCE TWEAK.
+# The prefix discount exists only once a prefix has been SEEN, so firing all
+# fifteen requests simultaneously would race every one of them against an empty
+# cache and pay full input price on all fifteen -- the exact cost this mode is
+# only viable because of. The first call is therefore issued alone and awaited;
+# the rest go out bounded by this number. Whether the discount then lands is
+# recorded per call rather than assumed.
+#
+# THE PRODUCT WITH MAX_WORKERS IS THE NUMBER THAT MATTERS, because the node
+# runs inside oncotriage/batch/runner.py's pool of MAX_WORKERS = 12 patients:
+#
+#     12 patients x 4 in-node = 48 Stage 5 requests in flight at peak
+#
+# WHY 48 IS NOT EXPECTED TO TRIP A PROVIDER LIMIT, stated as arithmetic rather
+# than as reassurance. Per-trial mode multiplies the number of requests by
+# MAX_TRIALS_FOR_EVALUATION (15) whatever this constant is; what this constant
+# decides is only how fast a patient gets through its fifteen, and therefore
+# the request RATE. At a 15-second single-trial call -- see the honest note on
+# that figure below -- a patient completes 1 + ceil(14/4) = 5 waves in ~75s, so
+# a full pool sustains 12 x 15 / 75 = 2.4 requests per second, about 144 per
+# minute. That is an order of magnitude under the requests-per-minute allowance
+# of any paid tier, and the binding limit on a paid tier is tokens per minute
+# rather than requests -- which per-trial mode moves far LESS than 15x, because
+# the shared prefix is the bulk of every request and is billed at the cached
+# rate from the second call of each patient on.
+#
+# AND THE FALLBACK IS THE SDK'S, NOT A GUESS. A 429 is retried inside the
+# OpenAI SDK honouring Retry-After (OPENAI_SDK_MAX_RETRIES, argued at length in
+# the request-shape section above), so a burst that does clip a limit degrades
+# to a slower campaign rather than to failed patients. That is why the number
+# below can be chosen from wall time rather than from a limit nobody here can
+# read.
+#
+# 4 IS AN UNCALIBRATED HOLDING VALUE AND IS LABELLED ONE, on the footing
+# ECOG_SCORE_DISTRIBUTION and MESH_BOOST_DIRECT_FRACTION are: it is derived
+# from an ESTIMATED single-trial latency of ~15s, and per-trial mode has never
+# been run, so that latency is not measured. It was chosen as the smallest
+# value at which a per-patient wall time (~75s) does not regress against the
+# grouped mode's measured ~68s median, so that turning the mode on does not by
+# itself make a campaign take longer. RE-DERIVE IT FROM
+# inferences.llm_classifier_call_details AFTER THE FIRST REAL PER-TRIAL RUN --
+# that column carries one row per call and is the measurement this number is
+# missing.
+#
+# 1 IS LEGAL AND MEANS "SEQUENTIAL", which is the honest way to turn the
+# scheduling off without turning the mode off. 0 or a negative value is a
+# configuration defect and raises at the node rather than silently meaning one
+# of the two.
+MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS = 4
+
+
+# ---------------------------------------------------------------------------
+# How Stage 5 partitioned its work, as ONE scalar
+# ---------------------------------------------------------------------------
+#
+# WHAT THIS EXISTS TO SEPARATE. With per-trial mode ON the packer does not run,
+# so llm_classifier_packing.enabled is False -- and it is ALSO False when the
+# packing switch alone is off. Those are different runs with different request
+# shapes and, if the leakage measurement is right, different verdicts. This is
+# the column that tells them apart, and it is the reason a boolean was not
+# enough.
+#
+# A CLOSED TWO-MEMBER VOCABULARY, deliberately not three. It records ONE fact
+# -- whether a request carried one trial or several -- and says nothing about
+# packing, which llm_classifier_packing already reports in full beside it.
+# Folding both knobs into one scalar would make a value like "packed" a
+# statement about two constants at once and would lose the third combination
+# entirely.
+MATCHING_CALL_MODE_PER_TRIAL = "per_trial"
+MATCHING_CALL_MODE_GROUPED = "grouped"
+MATCHING_CALL_MODES = (MATCHING_CALL_MODE_GROUPED, MATCHING_CALL_MODE_PER_TRIAL)
+
+# THE TUPLE AND THE CONSTANTS MUST CORRESPOND, checked at import on the footing
+# oncotriage/dashboard/tiers.py already uses for PATIENT_OUTCOME_LABELS: a
+# closed vocabulary written twice -- once as named constants a caller branches
+# on, once as a tuple a reader iterates -- is two statements of one fact, and
+# the failure mode of their disagreeing is silent. A member missing from the
+# tuple is a value inferences.matching_call_mode can hold that no consumer
+# enumerating the vocabulary will ever look for.
+#
+# A RuntimeError AND NOT AN `assert`: `python -O` deletes assert statements,
+# and this is the only thing standing between a mistyped constant and a column
+# whose stored values are outside its own documented vocabulary.
+if set(MATCHING_CALL_MODES) != {MATCHING_CALL_MODE_GROUPED,
+                                MATCHING_CALL_MODE_PER_TRIAL} or \
+        len(MATCHING_CALL_MODES) != 2:
+    raise RuntimeError(
+        "MATCHING_CALL_MODES must hold exactly MATCHING_CALL_MODE_GROUPED and "
+        f"MATCHING_CALL_MODE_PER_TRIAL; it holds {MATCHING_CALL_MODES!r}")
+
+
+def matching_call_mode() -> str:
+    """Which call mode Stage 5 runs in, read LIVE off this module.
+
+    ONE OWNER, TWO CONSUMERS, WHICH IS THE WHOLE REASON THIS IS A FUNCTION.
+    ``oncotriage/agent/evaluation.py`` decides how to partition the batch and
+    ``oncotriage/storage/database_logger.py`` writes
+    ``inferences.matching_call_mode`` on every row; if each read the constant
+    for itself they could disagree, and the row would name a mode the node did
+    not run. ``config.matching_wire_model()`` is the same shape for the same
+    reason, and ``matching_provider``'s note in INFERENCE_COLUMN_ADDITIONS
+    argues the general case: a constant that can move WITHIN a process must not
+    be reached through a bound name.
+
+    READ AT CALL TIME, NEVER CACHED. The writer calls it once per row and the
+    node once per patient; both are far off any hot path, and caching would
+    reintroduce exactly the staleness the function removes.
+    """
+    return (MATCHING_CALL_MODE_PER_TRIAL if MATCHING_PER_TRIAL_CALLS_ENABLED
+            else MATCHING_CALL_MODE_GROUPED)
+
+
 
 # ---------------------------------------------------------------------------
 # Stage 1 query expansion

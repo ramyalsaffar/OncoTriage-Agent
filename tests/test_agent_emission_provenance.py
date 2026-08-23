@@ -1707,9 +1707,22 @@ control("c9  counted after the drops -> the denominator understates by 2",
 # model emitted zero entries, which is a MEASUREMENT (an empty array) and not an
 # absence. Probed on the truncation run, where one row is a failure and two are
 # real counts, so the plant is visible beside the values it corrupts.
+#
+# THE NEEDLE CARRIES THE LINE ABOVE IT, and that is not decoration. `str.count`
+# matches ANYWHERE, so a bare `'            "entries_emitted": None,\n'` also
+# matches a MORE deeply indented occurrence -- the leading twelve spaces of the
+# needle line up with the last twelve of a sixteen-space line. The per-trial
+# pass added exactly such a row (the ledger entry for a call that was issued
+# and billed and then never read), the plant went from one hit to two, and
+# `control` reported PLANT-FAILED rather than quietly splicing into the wrong
+# dict. Anchoring on the preceding `finish_reason` line, which differs between
+# the two, pins it to the row this control is about.
+_C10_ANCHOR = ('            "finish_reason": getattr(choice, "finish_reason", None),\n'
+               '            "entries_emitted": None,\n')
 control("c10 the row born as 0 -> a failed call claims it emitted nothing",
-        [('            "entries_emitted": None,\n',
-          '            "entries_emitted": 0,\n')],
+        [(_C10_ANCHOR,
+          _C10_ANCHOR.replace('"entries_emitted": None,',
+                              '"entries_emitted": 0,'))],
         _probe_emitted(
             [({"evaluations": []}, "length"),
              {"evaluations": [entry("NCT00000001"), entry("NCT00000002")]},

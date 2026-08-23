@@ -287,6 +287,14 @@ _REGISTRY_SPEC = (
      "vocabulary; the assessment for that trial is the weakest of its cases"),
     ("REFUSALS_OBSERVED", _agent_evaluation.REFUSALS_OBSERVED,
      "the model DECLINED to answer; that patient ended at the error handler"),
+    ("PER_TRIAL_CALL_FAILURES", _agent_evaluation.PER_TRIAL_CALL_FAILURES,
+     "a Stage 5 PER-TRIAL request raised and was isolated to its own trial, "
+     "which is recorded as not evaluable while the rest of the patient "
+     "completed; keyed by exception type. A patient whose calls ALL failed is "
+     "NOT here -- it returns the API-error result and is covered by "
+     "MAX_LLM_CLASSIFIER_RETRIES instead. STAYS AT ZERO WHILE "
+     "MATCHING_PER_TRIAL_CALLS_ENABLED IS False, because nothing in that "
+     "configuration reaches the branch that increments it"),
     ("BEDROCK_ADAPTER_DEGRADATIONS",
      _bedrock_adapter.BEDROCK_ADAPTER_DEGRADATIONS,
      "Stage 5 ran on Amazon Bedrock and the request or the response was not "

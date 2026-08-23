@@ -1139,6 +1139,33 @@ _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    "tests/test_extraction_stage_m_category.py",
                    "tests/test_extraction_stage_non_oncology_guard.py",
                    "tests/test_agent_trial_verdict_normalization.py",
+                   # SEVENTEEN execs, each an in-memory copy of
+                   # oncotriage/agent/evaluation.py with one part of Stage 5's
+                   # PER-TRIAL call mode broken: the partition, the bypass
+                   # record, the awaited priming call, the in-flight bound, the
+                   # dispatch order, the per-call failure isolation, its
+                   # all-failed floor, the reason it stamps, the counter it
+                   # moves, the consumption of a prefetched response, the
+                   # per-call cached-token record, the switch itself, the
+                   # worker's purity, the block-to-chunk pairing, and the
+                   # three parts of the record it writes for calls that were
+                   # issued and billed and then never read. `git
+                   # show` can supply NONE of them: every one of those branches
+                   # is new, so no blob carries a version with one of them
+                   # broken -- and four of the controls RELAX A GUARD while
+                   # leaving the rest of the module correct, which is a state
+                   # no commit has ever had. Nor can a real condition supply
+                   # them: they are one-line edits to a scheduling decision
+                   # whose only inputs are a trial list and a stub client, and
+                   # varying THOSE is what the file already does for every
+                   # check that needs no plant. The copies are exec'd into a
+                   # real ModuleType, because a function's globals ARE the dict
+                   # it was exec'd into. A plant whose needle does not appear
+                   # exactly once is a NAMED failure rather than a control that
+                   # quietly agrees with the code, and both files it reads are
+                   # sha256'd before the first plant and compared in its
+                   # section 10.
+                   "tests/test_agent_stage5_per_trial_calls.py",
                    # NINE execs, each an in-memory copy of
                    # oncotriage/agent/bedrock_adapter.py with ONE mapping
                    # broken: max_output_tokens deleted, `store` no longer sent,

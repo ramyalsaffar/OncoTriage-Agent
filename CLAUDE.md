@@ -680,6 +680,26 @@ python tests/test_agent_rrf_config_ownership.py                     #  31
 # removed. ~1.1 s.
 python tests/test_agent_cross_encoder_sequence_limit.py             #  42
 
+# The per-trial-call pass. Same shape, same directory. Stage 5 can send ONE
+# billed call per patient-trial pair, and MATCHING_PER_TRIAL_CALLS_ENABLED
+# ships False -- this pass builds the arm and the campaign decision between
+# modes is a later MEASUREMENT. No network, no keys, NO SPEND (every response
+# is a literal served by a stub installed through oncotriage.agent.deps), no
+# subprocess, no fixture, no git history, no corpus, no model, no live server.
+# The scheduling assertion -- the first call has COMPLETED before any parallel
+# call is ISSUED -- is an integer comparison over tickets the stub itself
+# issued, never a measurement of elapsed time, so it does not depend on runner
+# speed. It DOES open SQLite, in section 9b only, to round-trip the additive
+# inferences.matching_call_mode column through the real writer; every database
+# is a scratch file inside a tempfile.mkdtemp asserted to differ from the
+# production path, removed at the end and asserted gone. NOT in the collision
+# matrix -- it writes nothing in the repository, and the two files it reads
+# (agent/evaluation.py, storage/database_logger.py) are written by neither of
+# the suite's two writers and are sha256-compared at the end. It DOES exec:
+# fourteen in-memory copies of agent/evaluation.py, one plant each, argued at
+# _EXEC_ALLOWLIST. Bucket A, ~2.8 s.
+python tests/test_agent_stage5_per_trial_calls.py                   # 139
+
 # The harness-budget pass. Same shape, same directory. No network, no keys, no
 # spend, NO LIVE SERVER and no live Qdrant -- it starts nothing and issues no
 # request; Files 18 and 19 are read as TEXT and parsed, which is why a test

@@ -524,6 +524,7 @@ def install_replay_hooks(fixture: Dict, sink) -> tuple:
             was built to prevent, reintroduced through a second provider.
     """
     _capture.assert_provider_is_hookable("install_replay_hooks")
+    _capture.assert_call_mode_is_hookable("install_replay_hooks")
 
     state = _ReplayState(fixture, sink)
 

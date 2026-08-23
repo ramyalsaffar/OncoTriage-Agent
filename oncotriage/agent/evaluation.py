@@ -32,11 +32,13 @@ hands back an UNWRAPPED client -- capture would issue a real call and record
 nothing, replay would go to the network instead of serving its recording.
 """
 
+import contextvars
 import html
 import json
 import re
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, FrozenSet, List, Tuple
 
 from oncotriage import config
@@ -63,6 +65,7 @@ from oncotriage.agent.state import (
 )
 from oncotriage.config import (
     CHARS_PER_TOKEN,
+    MATCHING_CALL_MODE_PER_TRIAL,
     MATCHING_INPUT_PACKING_ENABLED,
     MATCHING_INPUT_TOKEN_BUDGET,
     MATCHING_MAX_INPUT_PACKED_CHUNKS,
@@ -569,13 +572,80 @@ NOT_EVALUABLE_CONFLICTING_DUPLICATES = "conflicting_duplicate_answers"
 #   the verdict. Distinct from every reason above: the model answered, more than
 #   once, and contradicted itself. See _collapse_duplicate_entries for why that
 #   is a non-evaluation rather than a choice between the answers.
+NOT_EVALUABLE_CALL_FAILED = "per_trial_call_failed"
+# ^ PER-TRIAL MODE ONLY. The request for this trial raised -- a timeout, a
+#   connection reset, a 5xx that survived the SDK's own retry -- so no response
+#   for it was ever obtained.
+#
+#   IT IS NOT NOT_EVALUABLE_MODEL_OMITTED AND THE DIFFERENCE IS THE POINT. That
+#   reason means a call SUCCEEDED, parsed, and simply carried no entry for this
+#   trial, which is a statement about the model's answer. This one means there
+#   was no answer to read. Reusing the omission reason would attribute a
+#   transport failure to the judge, and the two have different owners and
+#   different fixes.
+#
+#   IT EXISTS ONLY BECAUSE ONE TRIAL PER CALL MAKES ISOLATION POSSIBLE. In
+#   grouped mode a raised call is the whole batch, there is nothing to isolate
+#   it from, and the node returns the API-error result so the retry budget sees
+#   it -- unchanged by this pass. See the except branch in the send loop.
+#
+#   THERE IS NO SIBLING CONSTANT FOR "EVERY CALL FAILED", and its absence is a
+#   decision. When per-trial mode loses ALL of its calls the node does NOT
+#   record fifteen not-evaluable trials and report success -- that would turn a
+#   total outage into a patient with no matches and no error. It returns the
+#   API-error result instead, so MAX_LLM_CLASSIFIER_RETRIES covers the outage
+#   exactly as it does in grouped mode, and no trial is stamped at all.
 
 _NOT_EVALUABLE_REASONS = (
     NOT_EVALUABLE_TRUNCATION_FLOOR,
     NOT_EVALUABLE_SPLIT_BUDGET,
     NOT_EVALUABLE_MODEL_OMITTED,
     NOT_EVALUABLE_CONFLICTING_DUPLICATES,
+    NOT_EVALUABLE_CALL_FAILED,
 )
+
+
+# ---------------------------------------------------------------------------
+# Per-trial call failures
+# ---------------------------------------------------------------------------
+
+PER_TRIAL_CALL_FAILURES = Counter()
+"""Per-trial requests that raised, keyed by exception type name.
+
+MODULE-LEVEL, NOT A KEY IN THE STAGE 5 RESULT, on AGE_PARSE_FAILURES' footing:
+the twelve characterization fixtures diff the Stage 5 result field by field, so
+a new key there costs a re-capture at live model prices for a number no stage
+reads. Registered in ``oncotriage/degradation.py`` so it reaches the run-end
+report, which is what makes a partial loss visible without a query.
+
+INCREMENTED ON THE NODE THREAD ONLY. The requests are issued concurrently, but
+``Counter[k] += 1`` is a load-add-store that the interpreter may switch threads
+inside, so two workers incrementing the same key can lose one of them --
+``oncotriage/degradation.py`` records the same hazard from the reading side.
+Every increment here happens in the send loop, after the merge, on the thread
+that owns the node.
+
+STAYS AT ZERO WHILE MATCHING_PER_TRIAL_CALLS_ENABLED IS False, because nothing
+in that configuration can reach the branch that increments it. Same shape as
+BEDROCK_ADAPTER_DEGRADATIONS under MATCHING_PROVIDER "openai".
+"""
+
+
+class PerTrialParallelismError(RuntimeError):
+    """``MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS`` is not a usable bound.
+
+    A ``RuntimeError`` SUBCLASS AND DELIBERATELY NOT A ``ValueError``, on the
+    footing ``UnknownModelPricingError``, ``PackingBlockMismatchError`` and
+    ``CrossEncoderLimitMismatchError`` already argue in this project: a stray
+    ``except ValueError`` around a Stage 5 call must not be able to eat it.
+
+    IT RAISES RATHER THAN CLAMPING. 0 and -1 are each equally readable as "no
+    parallelism, run sequentially" and as "the operator meant something else
+    and typed it wrong", and clamping to 1 would silently run a whole campaign
+    at a concurrency nobody chose. 1 IS legal and IS the sequential setting, so
+    there is a spelling for that intent and this is not it. It fires before the
+    first request of the patient, where it costs nothing.
+    """
 
 # Finish reason the API returns when it stopped because it hit max_tokens.
 FINISH_REASON_LENGTH = "length"
@@ -2225,6 +2295,9 @@ def _unevaluable_entry(trial_obj: Dict, reason: str) -> Dict:
             NOT_EVALUABLE_CONFLICTING_DUPLICATES:
                 "The model returned more than one evaluation for this trial "
                 "and they disagreed on the verdict. Not assessed.",
+            NOT_EVALUABLE_CALL_FAILED:
+                "The request carrying this trial did not produce a response, "
+                "so the model never answered for it. Not assessed.",
         }[reason],
     }
 
@@ -2812,12 +2885,27 @@ def node_llm_classifier_evaluation(state: TrialMatchState) -> dict:
     """
     Stage 5: LLM classifier, criterion-level evaluation.
 
-    Sends ALL filtered trials to the classifier in a SINGLE call. Which model
-    that is comes from ``config.MATCHING_MODEL`` and is NOT named here: this
-    node was called ``node_gpt4o_evaluation`` while the judge was gpt-4o, the
-    judge became gpt-5.6-terra on 2026-08-04, and the name went stale in place.
-    The classifier evaluates every inclusion/exclusion criterion for each trial
-    and returns structured JSON with match scores and explanations.
+    HOW THE BATCH IS PARTITIONED IS CONFIGURED, in three layers, and the
+    sentence that stood here -- "sends ALL filtered trials to the classifier in
+    a SINGLE call" -- has been false since input packing and is false twice
+    over now:
+
+      * ``MATCHING_PER_TRIAL_CALLS_ENABLED`` (default False) makes it ONE
+        request per trial, bypassing the packer;
+      * otherwise ``MATCHING_INPUT_PACKING_ENABLED`` (default True) groups
+        trials into chunks under an input-token ceiling;
+      * with both off it is the single whole-batch call it originally was.
+
+    The two OUTPUT splitters -- the pre-split on an output estimate and the
+    reactive halving on ``finish_reason == "length"`` -- are armed in all three
+    and compose with whichever produced the first generation of chunks.
+
+    Which model answers comes from ``config.MATCHING_MODEL`` and is NOT named
+    here: this node was called ``node_gpt4o_evaluation`` while the judge was
+    gpt-4o, the judge became gpt-5.6-terra on 2026-08-04, and the name went
+    stale in place. The classifier evaluates every inclusion/exclusion
+    criterion for each trial and returns structured JSON with match scores and
+    explanations.
 
     On JSON parse failure or API error, sets error flag so the retry
     router (conditional edge) can loop back for another attempt.
@@ -3063,6 +3151,49 @@ CLINICAL TRIALS:
                               _user_prompt_for([], log_events=False)))
 
     # ------------------------------------------------------------------
+    # Which call mode this patient runs in
+    # ------------------------------------------------------------------
+    #
+    # READ ONCE, HERE, INTO A LOCAL, AND EVERY BRANCH BELOW READS THE LOCAL.
+    # The constant cannot change during one patient, and a single read is what
+    # makes that true of the code as well as of the configuration: a node that
+    # asked the module again at the send loop could partition one way and
+    # dispatch the other if anything rebound it in between.
+    #
+    # THE BOUND IS VALIDATED HERE AND ONLY WHEN IT WILL BE USED, before the
+    # first request of the patient, where a refusal costs nothing. Validating
+    # it in grouped mode would let a typo in a constant this mode never reads
+    # fail a campaign that does not use it.
+    #
+    # THROUGH config.matching_call_mode() AND NOT THROUGH A from-IMPORT, which
+    # is the ONE place this pass departs from MATCHING_INPUT_PACKING_ENABLED's
+    # precedent, deliberately and for a reason that constant does not have.
+    # `inferences.matching_call_mode` is written by
+    # oncotriage/storage/database_logger.py from the SAME function, so the row
+    # and the node cannot name different modes. A `from oncotriage.config
+    # import MATCHING_PER_TRIAL_CALLS_ENABLED` here would BIND the value at
+    # import, so anything that set it on the config module within a process --
+    # a probe, a test, an operator in a REPL -- would move the column and not
+    # the node, and every row of that run would describe a partition that never
+    # happened. That is precisely the patch-point defect
+    # tests/test_agent_rrf_config_ownership.py exists for, and
+    # matching_provider's note in INFERENCE_COLUMN_ADDITIONS states the general
+    # rule: a constant that can move WITHIN a process must not be reached
+    # through a bound name.
+    #
+    # The bound is read live for the same reason and at the same moment, so a
+    # patient's partition and its dispatch are decided from one reading.
+    _per_trial_calls = (config.matching_call_mode()
+                        == MATCHING_CALL_MODE_PER_TRIAL)
+    _parallel_bound = config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS
+    if _per_trial_calls and _parallel_bound < 1:
+        raise PerTrialParallelismError(
+            "MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS must be >= 1 when "
+            "MATCHING_PER_TRIAL_CALLS_ENABLED is True; it is "
+            f"{_parallel_bound!r}. Use 1 for sequential "
+            "per-trial calls, or set MATCHING_PER_TRIAL_CALLS_ENABLED = False.")
+
+    # ------------------------------------------------------------------
     # Packing: bound the INPUT before the output splitters see the batch
     # ------------------------------------------------------------------
     #
@@ -3078,7 +3209,52 @@ CLINICAL TRIALS:
     # OFF REPRODUCES THE OLD BEHAVIOUR EXACTLY: initial_chunks is [trials], the
     # single-element list the pre-split loop has always started from, and every
     # branch below is the code that was already here.
-    if MATCHING_INPUT_PACKING_ENABLED:
+    #
+    # ── PER-TRIAL MODE TAKES PRECEDENCE OVER THE PACKER ────────────────────
+    #
+    # AND IT BYPASSES IT RATHER THAN CONFIGURING IT. A budget of one token
+    # would produce nearly this partition and would be the wrong mechanism
+    # twice over: llm_classifier_packing would report a packer that RAN, which
+    # is the fact the provenance has to be able to deny, and the packer's own
+    # invariant -- never drop a trial -- means a single trial larger than the
+    # budget still ships in a chunk with its neighbour rather than alone.
+    # Bypassing is what makes "one trial per request" true by construction.
+    #
+    # THE ORDER OF THE THREE BRANCHES IS THE PRECEDENCE. `elif` rather than a
+    # second `if`, so packing cannot re-partition what this branch decided, and
+    # so the two existing branches are reached under exactly the condition they
+    # were reached under before -- which is what section 6 of
+    # tests/test_agent_stage5_per_trial_calls.py compares as bytes.
+    if _per_trial_calls:
+        initial_chunks = [[t] for t in trials]
+        # NOT `enabled: True` WITH ONE TRIAL PER CHUNK. The packer did not run;
+        # its budget selected nothing and its cap relaxed nothing, so every
+        # numeric field it would have filled is None here for the same reason
+        # the packing-OFF branch below leaves them None.
+        #
+        # `bypassed_by` IS PRESENT ONLY ON THIS BRANCH, which is the project's
+        # absent-rather-than-empty convention (TEMPORAL_CONFLICT_FIELD's, in
+        # the criteria arrays). Its absence on the other two branches means
+        # "nothing bypassed the packer", and adding a `None` there would have
+        # changed the stored JSON of every OFF-arm row for a fact those rows
+        # already state by omission -- and would have broken this pass's own
+        # byte-equivalence promise.
+        packing_report = {"enabled": False, "method": PACKING_METHOD_CHARS,
+                          "fixed_tokens": fixed_input_tokens,
+                          "budget_tokens_configured": MATCHING_INPUT_TOKEN_BUDGET,
+                          "budget_tokens": None, "max_chunks": None,
+                          "cap_relaxed_budget": False,
+                          "over_budget_chunk": False,
+                          "trials": len(trials), "chunks": [],
+                          "bypassed_by": MATCHING_CALL_MODE_PER_TRIAL}
+        log.info("Stage 5 is issuing one request per trial", stage=5,
+                 event="per_trial_calls", chunks=len(initial_chunks),
+                 total=len(trials),
+                 # The bound this patient will actually use, not the constant:
+                 # a patient with three trials never reaches four in flight.
+                 parallel=min(_parallel_bound,
+                              max(0, len(initial_chunks) - 1)))
+    elif MATCHING_INPUT_PACKING_ENABLED:
         initial_chunks, packing_report = pack_trials_by_input_tokens(
             trials, fixed_input_tokens, MATCHING_INPUT_TOKEN_BUDGET,
             MATCHING_MAX_INPUT_PACKED_CHUNKS, blocks=trial_blocks)
@@ -3311,6 +3487,14 @@ CLINICAL TRIALS:
           * The failing request itself, when it raised before a response.
           * Transport-layer retries inside the OpenAI SDK, which are invisible
             to this process at every return, success included.
+
+        WHAT IT NOW DOES COVER, and did not before per-trial dispatch existed:
+        requests this node ISSUED and then never read. In per-trial mode every
+        call is issued before the loop begins, so a refusal or an unparseable
+        answer on the first trial abandons N-1 responses that were paid for.
+        ``_account_unconsumed()`` folds those into these accumulators at each
+        of those three returns, BEFORE this helper is called, so the figure it
+        reports is still the exact billed total rather than a prefix of it.
           * Earlier INVOCATIONS of this node. ``retry_count`` routes the graph
             back in here and every accumulator restarts at zero, so a run that
             spent three attempts reports the last one's tokens. That is the
@@ -3326,16 +3510,337 @@ CLINICAL TRIALS:
             "llm_classifier_calls": calls_made,
         }
 
+    # ------------------------------------------------------------------
+    # Cache-aware dispatch: one call, then the rest in parallel
+    # ------------------------------------------------------------------
+    #
+    # GROUPED MODE DOES NOT ENTER THIS BLOCK AT ALL. `_prefetched` stays None,
+    # `_obtain` below falls through to the identical `call_matching_model(...)`
+    # the loop has always made, no thread is created and no executor exists.
+    # That is what makes the OFF arm byte-equivalent rather than merely
+    # equivalent, and section 6 of tests/test_agent_stage5_per_trial_calls.py
+    # compares the two request streams field for field to say so.
+    #
+    # WHY ONE FIRST, THEN THE REST. The whole economics of per-trial mode is
+    # the cached prefix: PROMPT_VERSION 1.6.0 put the patient record in the
+    # SYSTEM message so all N requests of one patient share byte-identical
+    # bytes, and the provider bills those at the cached rate FROM THE SECOND
+    # REQUEST ON. Firing all N at once races every one of them against a cold
+    # cache, so the discount the mode exists to rely on would land on none of
+    # them. The first call is therefore issued alone and AWAITED; the executor
+    # that runs the rest is not even constructed until it has returned.
+    #
+    # WHETHER THE DISCOUNT ACTUALLY LANDS IS MEASURED, NOT ASSUMED. Every call
+    # records the provider's own `prompt_tokens_details.cached_tokens` into
+    # `llm_classifier_call_details`, per call, and the patient-level total
+    # continues into `inferences.llm_classifier_cached_input_tokens`. If the
+    # cache never warms, that column says so and this scheduling has cost
+    # nothing but a serialized first request.
+    #
+    # THE RESULT OF EACH CALL IS AN OUTCOME, NEVER A RAISE. A worker that let
+    # an exception escape would surface it at `future.result()` on the node
+    # thread, in an order decided by the executor, and one trial's transport
+    # failure would end the patient. Each outcome is carried back as a tagged
+    # pair and interpreted BY THE SEND LOOP, in trial order, on the node
+    # thread -- which is what makes the merge deterministic.
+    #
+    # NOTHING BUT THE HTTP CALL RUNS ON A WORKER. The user message for every
+    # chunk is rendered HERE, before dispatch, for two reasons that are both
+    # correctness rather than tidiness: `_render_trial_blocks` increments
+    # MARKDOWN_ESCAPE_DECODE_UNRESOLVED and ESCAPED_ENTITY_DECODE_UNRESOLVED
+    # inside its decoders, and `Counter[k] += 1` is a load-add-store the
+    # interpreter may switch threads inside, so rendering concurrently would
+    # silently lose increments from the two counters that report third-party
+    # text reaching the judge; and the render emits log events that belong to
+    # this patient in this order.
+    #
+    # THE BLOCKS ARE SLICED, NOT RE-RENDERED. `trial_blocks[i]` is the block
+    # `_render_trial_blocks` already produced for `trials[i]` above, and blocks
+    # are a pure function of their trial -- the identity
+    # tests/test_agent_stage5_render_slice_equality.py proves and the packer
+    # already depends on. Calling `_user_prompt_for([t])` here instead would
+    # render every trial a SECOND time and inflate both decode counters by
+    # exactly the factor the render-slice pass removed.
+    def _chunk_key(chunk_):
+        """The identity a prefetched response is filed under.
+
+        THE NCT IDS, NOT ``id(chunk)``. A chunk is a list built in this
+        function, and an identity key would be correct only for as long as no
+        later mechanism produced an equal chunk as a different object -- which
+        is exactly what the reactive splitter does. Keyed by content, a chunk
+        the splitter invented has a key nothing filed and falls through to a
+        live call, which is the right answer for it.
+
+        DEFINED UNCONDITIONALLY even though only per-trial mode files anything,
+        because ``_obtain`` below calls it and a helper that exists only on one
+        branch is a NameError waiting for the first edit that widens the other.
+        """
+        return tuple(t["trial"]["nct_id"] for t in chunk_)
+
+    _prefetched = None
+    if _per_trial_calls:
+        # The order the send loop will consume in. Derived from `pending`
+        # rather than from `initial_chunks` so the priming call is provably the
+        # first call the loop makes: `pending` is a LIFO seeded reversed, so
+        # reversing it back gives pop order. Reading `initial_chunks` instead
+        # would be a second statement of the same fact, free to disagree with
+        # the seeding line above it.
+        # THE DEPTH TRAVELS WITH THE CHUNK. An unconsumed prefetched call has
+        # to be able to name the split depth it was issued at, and reading it
+        # back off `pending` after the loop has drained it is not possible.
+        _dispatch_pairs = [(c, d) for c, d in reversed(pending)]
+        _dispatch_order = [c for c, _ in _dispatch_pairs]
+
+        def _issue(chunk_, prompt_):
+            """One request, as an OUTCOME. Runs on a worker thread."""
+            try:
+                return ("ok", call_matching_model(system_prompt, prompt_))
+            except Exception as exc:              # noqa: BLE001 -- see above
+                return ("error", exc)
+
+        # THE ALIGNMENT IS ASSERTED, NOT ASSUMED, and `zip` is exactly why: it
+        # truncates silently, so a `_dispatch_order` that had stopped being
+        # positionally parallel to `trial_blocks` would send trial i's prompt
+        # under trial j's key with nothing raising, and the model would answer
+        # about a trial nobody asked for. That is the hazard
+        # PackingBlockMismatchError already exists for, one mechanism over, so
+        # it is the exception raised here.
+        if len(_dispatch_order) != len(trial_blocks):
+            raise PackingBlockMismatchError(
+                f"per-trial dispatch has {len(_dispatch_order)} chunks against "
+                f"{len(trial_blocks)} rendered blocks; they must be "
+                "positionally parallel")
+        _prompts = {}
+        for _i, _c in enumerate(_dispatch_order):
+            if _chunk_key(_c) != (trials[_i]["trial"]["nct_id"],):
+                raise PackingBlockMismatchError(
+                    "per-trial dispatch expected chunk "
+                    f"{_i} to hold exactly trials[{_i}] "
+                    f"({trials[_i]['trial']['nct_id']}); it holds "
+                    f"{_chunk_key(_c)}")
+            _prompts[_chunk_key(_c)] = _wrap_trials(trial_blocks[_i])
+
+        _prefetched = {}
+        if _dispatch_pairs:
+            _first, _first_depth = _dispatch_pairs[0]
+            _prefetched[_chunk_key(_first)] = _issue(
+                _first, _prompts[_chunk_key(_first)]) + (_first_depth,)
+            _rest = _dispatch_pairs[1:]
+            if _rest:
+                _bound = min(_parallel_bound, len(_rest))
+                # CONTEXT PROPAGATION IS NOT OPTIONAL HERE. The correlation ID
+                # is a contextvars.ContextVar (oncotriage/observability.py), and
+                # a thread starts with an EMPTY context -- so every line a
+                # worker logged would carry NO_CORRELATION and be unjoinable to
+                # the patient that paid for it. One FRESH copy per task, taken
+                # on THIS thread: a single Context object cannot be entered
+                # concurrently, so sharing one across the pool would raise.
+                with ThreadPoolExecutor(max_workers=_bound,
+                                        thread_name_prefix="stage5") as _ex:
+                    _futures = []
+                    for _c, _d in _rest:
+                        _ctx = contextvars.copy_context()
+                        _futures.append((_c, _d, _ex.submit(
+                            _ctx.run, _issue, _c, _prompts[_chunk_key(_c)])))
+                    for _c, _d, _fut in _futures:
+                        # `.result()` cannot raise here: `_issue` returns its
+                        # exception rather than propagating it, and the only
+                        # other way a future raises is cancellation, which
+                        # nothing cancels.
+                        _prefetched[_chunk_key(_c)] = _fut.result() + (_d,)
+
+    def _obtain(chunk):
+        """The API response for `chunk`, prefetched or issued now.
+
+        THE ONE LINE THE SEND LOOP CHANGED. In grouped mode `_prefetched` is
+        None and this is the identical call the loop always made, with the
+        identical arguments; the extra frame is the whole of the difference.
+
+        A PREFETCHED OUTCOME IS CONSUMED ONCE. It is popped rather than read,
+        so a chunk that somehow reached the loop twice issues a real second
+        call instead of silently replaying one response as two -- which would
+        double-count tokens against a request nobody made.
+
+        A CHUNK WITH NO PREFETCHED ENTRY IS CALLED LIVE, and that is the
+        composition promise rather than a fallback nobody expects to take: the
+        reactive splitter builds new chunks after dispatch, and they are
+        supposed to be sent.
+        """
+        if _prefetched is not None:
+            outcome = _prefetched.pop(_chunk_key(chunk), None)
+            if outcome is not None:
+                status, payload, _ = outcome
+                if status == "error":
+                    raise payload
+                return payload
+        return call_matching_model(system_prompt, _user_prompt_for(chunk))
+
+    def _account_unconsumed() -> int:
+        """Fold prefetched calls the send loop never reached into the record.
+
+        WHY THIS EXISTS, AND IT IS THE DEFECT PER-TRIAL DISPATCH INTRODUCES.
+        In grouped mode the pending queue is UNISSUED when an early return
+        fires: a refusal, a parse failure or a non-list body on chunk k ends
+        the node with chunks k+1..N never sent and therefore never billed, so
+        ``_billed_so_far()`` is exact. Per-trial mode issues every call BEFORE
+        the loop starts, so the same three returns abandon N-k responses that
+        have already been paid for -- and the record would carry only the first
+        k. That is the "reported a token figure no provider produced" shape
+        this file removed from four failure returns once already, reintroduced
+        from the other direction: not a false zero, a false TOTAL.
+
+        SO IT IS A MEASUREMENT, NOT AN ESTIMATE. Every folded row carries the
+        provider's own usage object for a request the provider really answered.
+        Calls that RAISED are counted under ``abandoned:`` in
+        PER_TRIAL_CALL_FAILURES and contribute no tokens -- they produced no
+        usage object, and inventing one is the thing ``_billed_so_far``'s
+        ``calls_made`` guard already refuses to do.
+
+        DETERMINISTIC ORDER, by nct_id, so two runs that abandon the same set
+        fold it in the same sequence and the ledger's tail is reproducible.
+        ``sorted()`` materialises the keys before the loop pops, so the
+        mutation is safe.
+
+        IT NEVER RAISES, AND THE MODEL CHECK IS DELIBERATELY NOT REPEATED HERE.
+        This runs on a path that is already failing and already has a
+        diagnosis; raising ``MatchingModelMismatchError`` from inside it would
+        replace a named failure with an unrelated one and lose the record it
+        was called to write. A mismatch on a CONSUMED call still raises, in the
+        loop, exactly as before.
+
+        ``unconsumed`` MARKS THE ROW because "no entry list was parsed" already
+        has two meanings in this ledger -- the response was unusable, or the
+        node stopped before reading it -- and only the second is free of any
+        judgement about the model. ``entries_emitted`` stays None either way.
+        """
+        nonlocal calls_made, input_tokens, output_tokens
+        nonlocal reasoning_tokens, reasoning_tokens_reported
+        nonlocal cached_input_tokens, cached_input_reported, model_answered
+        if not _prefetched:
+            return 0
+        folded = 0
+        abandoned_errors = 0
+        for _key in sorted(_prefetched):
+            _status, _payload, _depth = _prefetched.pop(_key)
+            if _status == "error":
+                PER_TRIAL_CALL_FAILURES[
+                    f"abandoned:{type(_payload).__name__}"] += 1
+                abandoned_errors += 1
+                continue
+            _u = getattr(_payload, "usage", None)
+            _pt = getattr(_u, "prompt_tokens", None)
+            _ct = getattr(_u, "completion_tokens", None)
+            if isinstance(_pt, int) and not isinstance(_pt, bool):
+                input_tokens += _pt
+            if isinstance(_ct, int) and not isinstance(_ct, bool):
+                output_tokens += _ct
+            _rt = getattr(getattr(_u, "completion_tokens_details", None),
+                          "reasoning_tokens", None)
+            if _rt is not None:
+                reasoning_tokens += _rt
+                reasoning_tokens_reported = True
+            _cd = getattr(getattr(_u, "prompt_tokens_details", None),
+                          "cached_tokens", None)
+            if _cd is not None:
+                cached_input_tokens += _cd
+                cached_input_reported = True
+            calls_made += 1
+            _choices = getattr(_payload, "choices", None) or []
+            call_details.append({
+                "call_index": calls_made,
+                "depth": _depth,
+                "trials": len(_key),
+                "prompt_tokens": _pt,
+                "completion_tokens": _ct,
+                "cached_tokens": _cd,
+                "reasoning_tokens": _rt,
+                "finish_reason": (getattr(_choices[0], "finish_reason", None)
+                                  if _choices else None),
+                "entries_emitted": None,
+                "unconsumed": True,
+            })
+            model_answered = getattr(_payload, "model", None) or model_answered
+            folded += 1
+        # `or abandoned_errors` IS NOT REDUNDANT, and the disjunct that WOULD
+        # have been is worth naming: an earlier draft tested `folded or
+        # _prefetched`, and `_prefetched` is empty by then because the loop
+        # above pops every key -- a dead branch that reads like a guard. A run
+        # whose abandoned calls ALL raised folds nothing and still has
+        # something to report, which is the case this arm covers.
+        if folded or abandoned_errors:
+            log.warning("Stage 5 stopped before reading every per-trial "
+                        "response; the abandoned calls were still issued and "
+                        "billed, and are recorded as unconsumed rather than "
+                        "dropped from the ledger", stage=5,
+                        event="per_trial_calls_abandoned", count=folded,
+                        lost=abandoned_errors, degraded=True)
+        return folded
+
+    # Per-trial calls that raised, isolated to their own trial. Counted here as
+    # well as in PER_TRIAL_CALL_FAILURES because the all-failed guard below is
+    # a question about THIS PATIENT and a module-level counter is a question
+    # about the process.
+    per_trial_failed_calls = 0
+    per_trial_last_error = None
+
     while pending:
         chunk, depth = pending.pop()
 
         try:
-            response = call_matching_model(system_prompt, _user_prompt_for(chunk))
+            response = _obtain(chunk)
             choice = response.choices[0]
             chunk_text = (choice.message.content or "").strip()
         except Exception as e:
             # API-level failure (timeout, rate limit, network error). This is
             # the parse/API budget, not the split budget.
+            #
+            # ── PER-TRIAL MODE ISOLATES IT TO THE TRIAL ────────────────────
+            #
+            # A chunk is one trial here, so "this call failed" and "this trial
+            # could not be evaluated" are the same statement -- and failing the
+            # whole patient would discard the N-1 calls that already succeeded
+            # AND already cost money. The trial is recorded with its own
+            # reason, which is what keeps a transport failure separable from
+            # the model omitting an entry, and the reconciliation at the end of
+            # the node still guarantees every trial is accounted for exactly
+            # once.
+            #
+            # ISOLATION IS NOT SILENCE, AND IT IS NOT UNBOUNDED. The counter
+            # below reaches the run-end degradation report, this logs at ERROR
+            # per failure, and a patient whose calls ALL failed does not
+            # continue: the guard under the loop returns the API-error result
+            # so MAX_LLM_CLASSIFIER_RETRIES still covers a total outage exactly
+            # as it does in grouped mode. Without that guard an unreachable
+            # endpoint would produce a run of not-evaluable trials reported as
+            # a success, which is a worse failure than the one being isolated.
+            #
+            # ONLY THIS SHAPE IS ISOLATED. A refusal, malformed JSON and a
+            # non-list body all still end the node, unchanged, because all
+            # three are decided by the SYSTEM message and the response format,
+            # which are byte-identical on every call of this patient -- so they
+            # are statements about the request this pipeline built rather than
+            # about one trial, and re-sending is the right response to them.
+            # The cost of that decision under per-trial mode is stated rather
+            # than hidden: one malformed answer re-bills the whole patient's
+            # N calls. A per-trial parse budget is a separate mechanism with
+            # its own argument and is deliberately not invented here.
+            if _per_trial_calls:
+                PER_TRIAL_CALL_FAILURES[type(e).__name__] += 1
+                per_trial_failed_calls += 1
+                per_trial_last_error = e
+                log.error("a per-trial Stage 5 call failed; recording that "
+                          "trial as not evaluable and continuing with the "
+                          "rest of the patient", stage=5, status="error",
+                          event="per_trial_call_failed",
+                          retry=retry_count + 1,
+                          error_type=type(e).__name__, error_message=str(e),
+                          count=len(chunk),
+                          nct_ids=[t["trial"]["nct_id"] for t in chunk])
+                unevaluable.extend(
+                    _unevaluable_entry(t, NOT_EVALUABLE_CALL_FAILED)
+                    for t in chunk
+                )
+                continue
             elapsed = time.time() - start
             error_msg = f"GPT-4o API error (attempt {retry_count + 1}): {str(e)}"
             log.error("Stage 5 API call failed", stage=5, status="error",
@@ -3506,6 +4011,11 @@ CLINICAL TRIALS:
         # times.
         _refusal = _refusal_text(choice.message)
         if _refusal:
+            # EVERY PREFETCHED CALL WAS ALREADY ISSUED AND BILLED, so
+            # abandoning the queue here must not abandon the record of
+            # what it cost. A no-op in grouped mode, where nothing is
+            # prefetched and the queue is genuinely unissued.
+            _account_unconsumed()
             elapsed = time.time() - start
             REFUSALS_OBSERVED[MATCHING_MODEL] += 1
             error_msg = (f"{REFUSAL_ERROR_PREFIX}: the model declined to "
@@ -3637,6 +4147,11 @@ CLINICAL TRIALS:
             # JSON parse failure: set error for the retry router. Separate
             # budget from the splits above -- a malformed answer is not a long
             # one, and re-sending is the right response to it.
+            # EVERY PREFETCHED CALL WAS ALREADY ISSUED AND BILLED, so
+            # abandoning the queue here must not abandon the record of
+            # what it cost. A no-op in grouped mode, where nothing is
+            # prefetched and the queue is genuinely unissued.
+            _account_unconsumed()
             elapsed = time.time() - start
             error_msg = f"GPT-4o JSON parse error (attempt {retry_count + 1}): {str(e)}"
             log.error("Stage 5 response was not valid JSON", stage=5,
@@ -3711,6 +4226,11 @@ CLINICAL TRIALS:
         # message is the only diagnosis this path produces.
         _unwrapped = _unwrap_evaluations(parsed)
         if not isinstance(_unwrapped, list):
+            # EVERY PREFETCHED CALL WAS ALREADY ISSUED AND BILLED, so
+            # abandoning the queue here must not abandon the record of
+            # what it cost. A no-op in grouped mode, where nothing is
+            # prefetched and the queue is genuinely unissued.
+            _account_unconsumed()
             elapsed = time.time() - start
             error_msg = f"GPT-4o returned non-list JSON (type={type(parsed).__name__})"
             log.error("Stage 5 returned JSON that is not a list", stage=5,
@@ -3968,6 +4488,69 @@ CLINICAL TRIALS:
                         duplicate_conflicting_nct_ids=_conflicting)
 
         evaluations.extend(_objects)
+
+    # ── Per-trial mode: every call failed ─────────────────────────────────
+    #
+    # ISOLATION HAS A FLOOR, AND THIS IS IT. Recording every trial as not
+    # evaluable and returning success would turn an unreachable endpoint, an
+    # expired key or a total outage into a patient with no matches, no error
+    # and a clean-looking row -- the failure this project exists to remove,
+    # manufactured by the mechanism that isolates a single bad call.
+    #
+    # `calls_made` IS THE TEST AND NOT `per_trial_failed_calls`, because the
+    # question is whether ANY response was obtained rather than how many were
+    # lost. One survivor out of fifteen is a bad run that still produced a real
+    # verdict for a real trial, and discarding it to re-bill fourteen more is
+    # the wrong trade; zero survivors produced nothing to keep.
+    #
+    # IT RETURNS THE API-ERROR RESULT, SHAPE FOR SHAPE, so the retry router
+    # sees exactly what grouped mode's raised first call gives it and
+    # MAX_LLM_CLASSIFIER_RETRIES covers the outage identically. `_billed_so_far`
+    # returns {} here by construction -- `calls_made` is 0 -- which is the same
+    # honest absence that path already writes when no usage object was ever
+    # obtained.
+    if _per_trial_calls and per_trial_failed_calls and not calls_made:
+        elapsed = time.time() - start
+        error_msg = (f"Stage 5 per-trial API error (attempt "
+                     f"{retry_count + 1}): all {per_trial_failed_calls} "
+                     f"per-trial calls failed; last: "
+                     f"{type(per_trial_last_error).__name__}: "
+                     f"{per_trial_last_error}")
+        log.error("every per-trial Stage 5 call failed; failing the patient "
+                  "so the retry budget sees it rather than reporting a run of "
+                  "not-evaluable trials as a success", stage=5, status="error",
+                  event="per_trial_all_calls_failed",
+                  retry=retry_count + 1, count=per_trial_failed_calls,
+                  error_type=type(per_trial_last_error).__name__,
+                  error_message=str(per_trial_last_error))
+        return {
+            "llm_classifier_call_details": call_details,
+            "evaluations": [],
+            "llm_classifier_retries": retry_count + 1,
+            "llm_classifier_truncation_splits": truncation_splits,
+            "llm_classifier_output_tokens_estimated": estimated_output,
+            "llm_classifier_output_split_threshold": split_threshold,
+            "llm_classifier_output_ceiling": MATCHING_MAX_TOKENS,
+            "llm_classifier_raw_response": "",
+            **_billed_so_far(),
+            "matching_model": model_answered,
+            "error": error_msg,
+            "llm_classifier_prompt_version": PROMPT_VERSION,
+            "llm_classifier_prompt_sha256": system_prompt_sha256,
+            "llm_classifier_patient_record_tokens": patient_record_tokens,
+            "stage_timings": {**state.get("stage_timings", {}), "llm_classifier_evaluation": round(prior_llm_classifier_time + elapsed, 3)}
+        }
+
+    if per_trial_failed_calls:
+        # SOME failed and at least one did not. Reported at WARNING because the
+        # patient completed with a hole in it: the trials below reached no
+        # judge at all, and the count is what separates "the model omitted
+        # them" from "we never got an answer to omit".
+        log.warning("some per-trial Stage 5 calls failed; those trials are "
+                    "recorded as not evaluable and the patient completed",
+                    stage=5, event="per_trial_calls_lost",
+                    count=per_trial_failed_calls, total=calls_made,
+                    degraded=True)
 
     if truncations_observed:
         log.info("responses hit the output ceiling", stage=5,

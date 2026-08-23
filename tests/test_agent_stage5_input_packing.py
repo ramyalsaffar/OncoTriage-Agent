@@ -1101,14 +1101,21 @@ def _module_from(source, name):
 # The pre-packing node: seed the pending queue from the whole batch, with no
 # packing branch at all. This is the code that shipped before this pass, and the
 # substitution is asserted to have applied.
-_PRE_PACK_NEEDLE = """    if MATCHING_INPUT_PACKING_ENABLED:
+# THE NEEDLE GAINED ITS `elif` WITH THE PER-TRIAL PASS, and the non-degeneracy
+# check below is what said so rather than a reader: per-trial mode takes
+# precedence over the packer, so its branch was inserted ABOVE this one and
+# this `if` became an `elif`. Nothing about what the branch does moved; the
+# substitution below still compiles out the packer and nothing else, because
+# `elif False:` is `if False:` with a preceding branch that is also False on
+# every arm this section drives.
+_PRE_PACK_NEEDLE = """    elif MATCHING_INPUT_PACKING_ENABLED:
         initial_chunks, packing_report = pack_trials_by_input_tokens("""
 check("6a  the packing branch is present in the shipped source (non-degeneracy: "
       "a needle that matched nothing would make this whole section vacuous)",
       _EVAL_SRC.count(_PRE_PACK_NEEDLE), 1)
 
 _PRE_PACK_SRC = _EVAL_SRC.replace(
-    "    if MATCHING_INPUT_PACKING_ENABLED:", "    if False:", 1)
+    "    elif MATCHING_INPUT_PACKING_ENABLED:", "    elif False:", 1)
 check("6a  ...and the pre-packing copy differs from it",
       _PRE_PACK_SRC != _EVAL_SRC, True)
 
@@ -1335,10 +1342,15 @@ control(
 control(
     "c9  a system message rendered per chunk is CAUGHT [4c]",
     _EVAL_SRC,
-    [("            response = call_matching_model(system_prompt, _user_prompt_for(chunk))",
-      "            response = call_matching_model(\n"
-      "                system_prompt + chunk[0]['trial']['nct_id'],\n"
-      "                _user_prompt_for(chunk))")],
+    # THE ANCHOR MOVED WITH THE PER-TRIAL PASS. The send loop's call is
+    # `_obtain(chunk)` now, and `_obtain`'s own fallback -- the line grouped
+    # mode always takes, with `_prefetched` None -- is where the system prompt
+    # is handed over. Planting there is the same defect in the same place: the
+    # prefix stops being shared across the chunks of one patient.
+    [("        return call_matching_model(system_prompt, _user_prompt_for(chunk))",
+      "        return call_matching_model(\n"
+      "            system_prompt + chunk[0]['trial']['nct_id'],\n"
+      "            _user_prompt_for(chunk))")],
     lambda m: len({r["messages"][0]["content"]
                    for r in run_node(_SIX, budget=1,
                                      node=m.node_llm_classifier_evaluation)[1].requests}),
