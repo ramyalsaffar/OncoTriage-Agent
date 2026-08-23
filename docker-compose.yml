@@ -270,7 +270,15 @@ x-app-volumes: &app-volumes
   # that is deliberately `down -v`-able.
   - app_testing:/app/testing
 
-  # MedCPT (~110 MB) and the FastEmbed BM25 model, cached across restarts.
+  # MedCPT (836.3 MiB) and the FastEmbed BM25 model (27 KB), cached across
+  # restarts -- 876,997,657 bytes in this volume after one cold load, MEASURED
+  # in a fresh container. Not the ~110 MB this project repeated from item 21
+  # until the portability pass: the checkpoint ships its weights in two formats
+  # under two snapshot revisions and one `from_pretrained` pulls both. The
+  # argument is at oncotriage/paths.py above `pin_model_cache`, and the
+  # Dockerfile's ENV block carries the same figures beside the variables that
+  # place them.
+  #
   # HF_HOME and FASTEMBED_CACHE_PATH point here (see the Dockerfile). Without
   # this volume every recreated container re-downloads both, on the first
   # request, inside that request.

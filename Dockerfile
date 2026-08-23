@@ -422,11 +422,42 @@ RUN groupadd -r appuser && \
 # works.
 #
 # The caches go in /opt/models rather than under $HOME because docker-compose.yml
-# mounts a named volume there. MedCPT is ~110 MB and the FastEmbed BM25 model is
-# fetched too; without a volume they would be re-downloaded on every
-# `docker compose up` that recreates a container, on the first request, inside
-# the request. HOME is still created and set — libraries other than these two
-# reach for it, and a user without one produces failures far from their cause.
+# mounts a named volume there.
+#
+# HOW BIG, MEASURED rather than repeated. One cold load of both models in a
+# fresh container leaves 876,997,657 bytes in /opt/models across 60 files:
+# 876,969,919 of MedCPT (836.3 MiB) and 27,738 of FastEmbed BM25 (27 KB).
+# Effectively all of it is the cross-encoder. That is NOT the ~110 MB this
+# project carried from item 21 until the portability pass.
+#
+# WHY IT IS EIGHT TIMES THE OLD FIGURE, established by listing the blobs in a
+# running container rather than inferred: the checkpoint publishes its weights
+# in TWO formats under two snapshot revisions -- pytorch_model.bin
+# (437,998,062 B) and model.safetensors (437,955,572 B) -- and one
+# `from_pretrained` pulls both. Both blobs are present at those exact sizes in
+# the host cache too, so the figure is a property of the checkpoint and not of
+# either machine.
+#
+# QUOTE CONTENT BYTES, NEVER `du`. `du -sh` reports the FastEmbed cache as 84K
+# on APFS and 104K on the container's overlay because it is 38 files of a few
+# hundred bytes each and du counts allocated blocks. The first draft of this
+# comment said "84 KB" for that reason and was wrong by 3x against the 27,738
+# bytes both caches actually hold.
+#
+# WHAT THE VOLUME SAVES, MEASURED ON THIS MACHINE and stated as one machine's
+# number because it is a function of the network: the cold load took 19.5 s
+# (tokenizer 2.27 s, weights 15.78 s, BM25 0.78 s) and the same load after a
+# container recreate took 2.71 s with the weights at 0.38 s -- a 41x difference
+# on the weights, and it is paid INSIDE the first request. On a slower link the
+# 837 MB is minutes rather than seconds; that end has not been measured here.
+#
+# The measurement and its argument live at oncotriage/paths.py, above
+# `pin_model_cache`; this comment names the numbers because a Dockerfile cannot
+# read a Python constant, and it names that owner so the two cannot drift
+# silently.
+#
+# HOME is still created and set — libraries other than these two reach for it,
+# and a user without one produces failures far from their cause.
 ENV HOME=/home/appuser \
     HF_HOME=/opt/models/huggingface \
     FASTEMBED_CACHE_PATH=/opt/models/fastembed
