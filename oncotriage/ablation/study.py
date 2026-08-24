@@ -118,16 +118,22 @@ accessors that build on first call.
 """
 
 import argparse
+import contextlib
+import fcntl
+import getpass
+import hashlib
 import json
 import os
 import random
+import socket
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import traceback
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -141,7 +147,11 @@ from oncotriage.ablation.common import (
     _require_writable_parent,
 )
 from oncotriage.agent import deps
-from oncotriage.agent.evaluation import MatchingModelMismatchError
+from oncotriage.agent.evaluation import (
+    MatchingModelMismatchError,
+    clear_stage5_shutdown,
+    request_stage5_shutdown,
+)
 from oncotriage.agent.graph import build_matching_graph
 from oncotriage.agent.patient import compute_patient_hash
 from oncotriage.agent.retrieval import build_bm25_index_from_qdrant
@@ -631,6 +641,654 @@ def clear_ablation_checkpoint(db_path=None) -> None:
 
 
 # ===========================================================================
+# THE STUDY RUN LOCK
+# ===========================================================================
+#
+# TWO STUDIES AGAINST ONE STATE DIRECTORY IS THE BATCH RUNNER'S SILENT DOUBLE
+# BILL, WITH A LARGER MULTIPLIER. oncotriage/batch/runner.py's THE RUN LOCK
+# section measured it for a batch pass: both invocations read the same
+# checkpoint at start, both process the same units at one live Stage 5 call
+# each, and the loser's completions vanish from the checkpoint when the winner
+# next writes it -- so a third run re-bills those too. Every word of that
+# transfers here, and one thing is worse: a study's unit is a (config, patient)
+# PAIR, so the same patient is paid for once per configuration, and two studies
+# overlapping across seven configurations duplicate up to 7 x sample_size calls
+# rather than sample_size.
+#
+# IT ALSO CORRUPTS THE COMPARISON, WHICH THE BATCH CASE CANNOT. generate_summary
+# reports the LATEST ablation_runs row per config, joined to its results by
+# run_id. Two studies interleaved produce two rows per config with the sample
+# SPLIT arbitrarily between them, so the row that wins is an average over
+# whichever subset that process happened to run -- and the configs are then
+# compared against each other over different patient sets, which is the one
+# thing an ablation study may not do.
+#
+# THE KEY IS THE CHECKPOINT FILE, NOT ITS DIRECTORY, AND THAT DIVERGES FROM THE
+# BATCH RUNNER DELIBERATELY. That file keys on the checkpoint DIRECTORY because
+# it has exactly one checkpoint. This one's checkpoint follows --db (pass
+# 20f-3): two scratch databases in one directory have two checkpoints, on the
+# argument that "already written" is a statement about A DATABASE. The lock
+# protects that same state, so it has to be as fine-grained as the state is --
+# keyed on the directory, two independent --db studies in /tmp would refuse
+# each other for nothing.
+#
+# AND THE FILENAME PREFIX IS DIFFERENT FROM THE BATCH RUNNER'S, WHICH IS NOT
+# COSMETIC. With no --db the study's state directory IS paths.checkpoint_path,
+# the same directory the batch runner locks. A shared lock file would make a
+# batch run and an ablation study block each other -- two harnesses that write
+# different databases, read different checkpoints and have nothing to say to
+# one another. The digest is of the same string; the prefix is what keeps the
+# two namespaces apart.
+#
+# THE MECHANISM IS UNCHANGED AND IS NOT RE-ARGUED HERE: flock(LOCK_EX |
+# LOCK_NB) on a file in the system temp directory, held for the process's life,
+# released BY THE KERNEL however it exits. Read THE RUN LOCK in
+# oncotriage/batch/runner.py for why it is not a pid file and why the lock file
+# is never unlinked.
+
+EXIT_LOCKED = 3
+"""Exit code when another study holds the lock.
+
+3, matching oncotriage/batch/runner.py and tests/run_serial_tests.py. It does
+not collide with anything this entry point already returns: 1 is a refusal
+(unknown config, a refused checkpoint, a stale sentinel), 130 is Ctrl-C and 143
+is SIGTERM.
+"""
+
+
+def ablation_run_lock_path(db_path=None) -> str:
+    """Where the run lock for this study's state lives.
+
+    OUTSIDE THE STATE DIRECTORY, for the two reasons the batch runner's
+    ``run_lock_path`` records: the directory's other files are resumable state
+    an operator reads a listing of, and it may be a network share where flock is
+    advisory at best. The system temp directory is local by construction.
+    """
+    key = os.path.abspath(str(_ablation_checkpoint_path(db_path)))
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return os.path.join(tempfile.gettempdir(),
+                        f"oncotriage-ablation-run-{digest[:16]}.lock")
+
+
+class AlreadyRunning(RuntimeError):
+    """Another process holds the study lock. Carries its record.
+
+    A ``RuntimeError`` subclass and deliberately not an ``OSError``, on
+    ``StaleAblationStopSwitch``'s footing below and for its reason: a stray
+    ``except OSError`` around a path check must not be able to eat a refusal.
+
+    A SEPARATE CLASS FROM ``oncotriage/batch/runner.py``'s OF THE SAME NAME, and
+    that is deliberate rather than an oversight. Importing the runner's would
+    put the whole batch module -- its checkpoint, its ledger, its stop switch --
+    into the import graph of every study, and the two refusals are raised by
+    different programs, caught in different entry points and remediated with
+    different commands. Neither entry point catches the other's.
+    """
+
+    def __init__(self, path, holder):
+        self.path = path
+        self.holder = holder
+        super().__init__(f"{path} is held by {holder}")
+
+
+@contextlib.contextmanager
+def exclusive_run_lock(path=None, db_path=None):
+    """Hold an exclusive, non-blocking flock for the duration of the block.
+
+    Yields the lock file's path. Raises ``AlreadyRunning`` IMMEDIATELY rather
+    than waiting: a study that queued behind another would still run, hours
+    later, against a checkpoint the first has by then completed, and an operator
+    who started it by accident would rather be told now.
+
+    THE RECORD IS WRITTEN ONLY AFTER THE LOCK IS HELD, so a refused study cannot
+    overwrite the holder's identity with its own on the way to being told no.
+    NOTHING HERE DELETES THE FILE -- the lock is the flock on the INODE, and
+    removing it would let a second process create a new inode and lock that
+    while a third still held the old one.
+    """
+    if path is None:
+        path = ablation_run_lock_path(db_path)
+    # WHAT WAS ACTUALLY LOCKED IS WHAT THE RECORD NAMES. The batch runner's
+    # first version read its directory a second time when writing the record,
+    # so a caller passing an explicit path got a holder record naming a
+    # directory it had nothing to do with -- worse than no record, because an
+    # operator acts on it. Resolved once, here.
+    try:
+        state = os.path.abspath(str(_ablation_checkpoint_path(db_path)))
+    except Exception as exc:                                    # noqa: BLE001
+        state = f"<unresolved: {type(exc).__name__}: {exc}>"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.lseek(fd, 0, os.SEEK_SET)
+            raw = os.read(fd, 4096).decode("utf-8", "replace").strip()
+            try:
+                holder = json.loads(raw) if raw else {}
+            except ValueError:
+                holder = {"record": raw}
+            raise AlreadyRunning(path, holder) from None
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, json.dumps({
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "user": getpass.getuser(),
+            "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "checkpoint": state,
+        }).encode("utf-8"))
+        os.fsync(fd)
+        yield path
+    finally:
+        os.close(fd)          # releases the flock
+
+
+def run_lock_refusal_lines(exc) -> list:
+    """The refusal, as the lines the entry point prints. One text, one caller.
+
+    A FUNCTION RATHER THAN A BLOCK IN THE GUARD so it can be driven by a test
+    without starting two processes, and so the entry point's ``__main__`` block
+    stays what this project's rule says it is.
+    """
+    lines = ["[Ablation] REFUSING TO RUN: another ablation study holds the "
+             "lock.",
+             f"        lock file: {exc.path}"]
+    for key in ("pid", "host", "user", "started", "checkpoint", "record"):
+        if key in exc.holder:
+            lines.append(f"        {key:12s} {exc.holder[key]}")
+    lines.extend([
+        "",
+        "        Two studies against one checkpoint both read the same resume",
+        "        state at start, so both run the SAME (config, patient) pairs at",
+        "        one live Stage 5 call each -- and the loser's completions are",
+        "        then dropped from the checkpoint by the winner's next write, so",
+        "        a third run re-bills those too.",
+        "",
+        "        Worse, generate_summary() reports the LATEST run per config: two",
+        "        interleaved studies split each config's sample between two rows,",
+        "        so the configs end up compared over different patient sets.",
+        "",
+        "        Wait for the other study, or stop it cleanly:",
+        f"            touch {describe_ablation_stop_switch_path(None)}",
+        "",
+        "        NOTHING HAS BEEN RUN AND NOTHING HAS BEEN BILLED.",
+    ])
+    return lines
+
+
+# ===========================================================================
+# THE OPERATOR STOP SWITCH
+# ===========================================================================
+#
+# WHY A STUDY NEEDS ONE AT ALL. 7 configs x 75 patients is 525 live Stage 5
+# calls and 3-5 hours; "stop cleanly, I will resume" is an ordinary operational
+# request and the two ways to make it were both wrong for the reasons
+# oncotriage/batch/runner.py's own STOP SWITCH section records -- Ctrl-C needs a
+# terminal the process is attached to, and SIGTERM is deliberately abrupt.
+#
+# IT IS HONOURED AT TWO GRANULARITIES, AND BETWEEN-CONFIGS ALONE WOULD BE A
+# USELESS SWITCH. A configuration at the default sample size is 75 live calls
+# and roughly half an hour; at the documented full size it is one seventh of a
+# 3-5 hour study. An operator who stops a study to rebuild the index, or because
+# the model is being repointed, is asking for the run to stop -- not to keep
+# spending for another half hour and then stop. So the switch is polled BETWEEN
+# PATIENTS, at the same cadence the checkpoint is written, exactly as the batch
+# runner polls between patients; the between-configs check above the loop is
+# what turns a stop noticed during config 3 into "configs 4-7 are not started"
+# rather than seven more banners.
+#
+# THE SENTINEL IS PER DATABASE, DERIVED FROM THE CHECKPOINT PATH, and both
+# halves matter:
+#
+#   * PER DATABASE, because the checkpoint is (pass 20f-3). A --db study and a
+#     production study share a directory by default but not a resume state, and
+#     a stop asked of one must not stop the other -- nor leave a stale sentinel
+#     that refuses it.
+#   * DERIVED, so the sentinel and the state it stops cannot drift apart. There
+#     is one owner of where a study's state lives and this reads it.
+#
+# AND ITS NAME IS NOT `STOP`. With no --db this directory IS the batch runner's
+# checkpoint directory, whose sentinel is `STOP`. Sharing the name would make
+# `touch STOP` stop both harnesses -- which sounds like a feature and is two
+# defects: the batch runner's stale-sentinel refusal would fire for a request
+# made of a different program and name `25- Batch Runner.py --clear-stop` as the
+# fix, and an operator resuming a batch run with --clear-stop would silently
+# withdraw an ablation stop nobody had withdrawn. One fact, two owners, no error
+# when they disagree.
+
+ABLATION_STOP_SUFFIX = "_STOP"
+"""Appended to the checkpoint's stem to name the sentinel.
+
+Upper case so a directory listing says which file is state and which is a
+control, and no extension for the same reason. With no --db this is
+``ablation_checkpoint_STOP``; with ``--db /tmp/x/foo.db`` it is
+``/tmp/x/foo_checkpoint_STOP``.
+"""
+
+
+def ablation_stop_switch_path(db_path=None) -> Path:
+    """THE ONE OWNER of where this study's stop sentinel lives.
+
+    ``_ablation_checkpoint_path``'s shape and derived from it, for a sharper
+    version of that function's reason: an operator creates this file BY HAND,
+    and every message that tells them where to put it -- the run banner, the
+    lock refusal, the stale-sentinel refusal, the stop announcement, --help --
+    has to name the same path. Two expressions of it is an operator writing a
+    file the study never reads, which looks exactly like a switch that does not
+    work.
+    """
+    cp = _ablation_checkpoint_path(db_path)
+    return cp.with_name(cp.stem + ABLATION_STOP_SUFFIX)
+
+
+def describe_ablation_stop_switch_path(db_path=None) -> str:
+    """The sentinel's path as a string, or a description when it cannot resolve.
+
+    A RENDERER OVER ``ablation_stop_switch_path()``, NOT A SECOND EXPRESSION OF
+    IT -- the path still has one owner; this only decides what to PRINT when
+    asking the owner would raise.
+
+    IT EXISTS BECAUSE TWO OF ITS CALLERS ARE ON SHUTDOWN PATHS. With no --db the
+    path resolves ``paths.checkpoint_path``, which globs the sibling data tree
+    on first read and RAISES on a machine that does not have it -- so an
+    interrupt arriving before anything had resolved a path would have had this
+    message raise INSIDE the handler that was trying to explain the interrupt.
+    An exception in an exception handler on a shutdown path is the one place a
+    helpful message must not be able to fire from.
+    """
+    try:
+        return str(ablation_stop_switch_path(db_path))
+    except Exception as exc:                                    # noqa: BLE001
+        return (f"<the {ABLATION_STOP_SUFFIX.lstrip('_')} file beside this "
+                f"study's checkpoint; its path could not be resolved here: "
+                f"{type(exc).__name__}>")
+
+
+STOP_SWITCH_FAULTS = Counter()
+"""Stop-switch faults, keyed ``{phase}:{ExceptionType}``.
+
+Module-level, following ``CHECKPOINT_WRITE_FAILURES`` and ``CHECKPOINT_FAULTS``
+above rather than becoming a column: this is a property of the STUDY's control
+files, and an ablation_results row is the wrong place for it.
+
+A SEPARATE COUNTER from the batch runner's of the same name, for
+``CHECKPOINT_FAULTS``' stated reason: the two describe different files, and one
+number covering both would report a batch fault and a study fault as one
+finding.
+
+Phases:
+    ``poll:``      the existence check itself raised. The switch is NOT tripped
+                   by one of these -- see ``_AblationStopSwitch.poll``.
+    ``message:``   the file existed and its text could not be read. The switch
+                   IS tripped; only the note is lost.
+    ``preflight:`` the start-of-study check could not be made.
+    ``clear:``     ``--clear-stop`` could not remove it.
+"""
+
+STOP_MESSAGE_MAX_CHARS = 1000
+"""How much of the sentinel's text is kept. A CAP, NOT A TRUNCATION BUG.
+
+The file is operator-written, so it can be anything -- an accidental `cat` of a
+log into it, a stray binary. The note is a courtesy for the study's closing
+block and is not worth an unbounded read on a shutdown path. What is kept is the
+first N characters and the fact that it was cut is stated in the same line.
+"""
+
+
+class StaleAblationStopSwitch(RuntimeError):
+    """The stop sentinel was already present before the study began.
+
+    A ``RuntimeError`` subclass and deliberately not a ``ValueError`` or an
+    ``OSError``, on ``UnknownModelPricingError``'s and
+    ``IndexVerificationError``'s precedent: a stray ``except OSError`` around a
+    path check must not be able to eat a refusal.
+    """
+
+
+STOP_CLEAR_REMOVED = "removed"
+STOP_CLEAR_ABSENT = "absent"
+STOP_CLEAR_FAILED = "failed"
+
+STOP_CLEAR_OUTCOMES = (STOP_CLEAR_REMOVED, STOP_CLEAR_ABSENT, STOP_CLEAR_FAILED)
+"""What ``clear_ablation_stop_switch`` can answer. Closed, and a caller may
+branch on it exhaustively.
+
+THREE MEMBERS AND NOT A BOOL, for the reason
+``oncotriage/batch/runner.py:STOP_CLEAR_OUTCOMES`` argues at length: the
+preflight is deliberately SKIPPED when ``--clear-stop`` is given, so a failed
+clear reported as "there was nothing to clear" would start the study with the
+sentinel still in place -- and it would then stop again at the first completed
+patient, after billing that patient, for a request the operator had just
+withdrawn.
+"""
+
+
+class _AblationStopSwitch:
+    """Has an operator asked this study to stop? Latching, thread-safe, one object.
+
+    ``oncotriage/batch/runner.py:_StopSwitch``'s semantics, with one structural
+    difference: THE PATH IS BOUND AT ``arm()`` RATHER THAN RESOLVED PER POLL,
+    because this sentinel's location depends on ``--db`` and the poll runs on
+    MAX_WORKERS done-callbacks. ``main()`` has already resolved it for the
+    banner, so binding it there means the path an operator was TOLD to write and
+    the path the study watches are one reading rather than two.
+
+    LATCHING IS THE WHOLE SEMANTICS. Once seen, this answers True for the rest
+    of the study whatever happens to the file, because the answer is acted on by
+    CANCELLING QUEUED WORK -- which is not reversible -- and because deleting
+    the sentinel is exactly what an operator does to make the NEXT study start,
+    which they must be able to do while this one is still finishing.
+
+    IT IS POLLED, NOT WATCHED: one ``os.path.exists`` per completed (config,
+    patient) pair, against a pair that takes tens of seconds, and skipped
+    entirely once tripped.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.requested = False
+        self.message = None
+        self.detected_in = None
+        self.path = None
+        self._armed_path = None
+
+    def reset(self) -> None:
+        """Forget any stop seen by an earlier study in this process.
+
+        ``main()`` calls this beside ``run_fingerprint.clear_cache()`` and
+        ``clear_stage5_shutdown()`` for the reason those two record: module
+        state that survives into the next study describes the wrong study, and
+        here it would make every remaining pair be cancelled without a request
+        having been made.
+        """
+        with self._lock:
+            self.requested = False
+            self.message = None
+            self.detected_in = None
+            self.path = None
+            self._armed_path = None
+
+    def arm(self, path) -> None:
+        """Bind the sentinel this study watches. Called once, from ``main()``."""
+        with self._lock:
+            self._armed_path = None if path is None else Path(path)
+
+    def poll(self, where: str = "study") -> bool:
+        """Is a stop requested? Reads the disk at most once per process.
+
+        A POLL THAT RAISES DOES NOT TRIP THE SWITCH, and that direction is
+        chosen rather than defaulted. ``Path.exists`` already answers False for
+        every ordinary "not there" case, so a raise here is something else --
+        an unreadable directory, a filesystem gone -- and reading that as a stop
+        request would cancel a paid study because a mount hiccuped. It is
+        counted and the study continues.
+
+        AN UNARMED SWITCH NEVER TRIPS, and that is not a silent skip: ``main()``
+        arms it before the first billed call and the entry point's preflight has
+        already resolved the same path, so an unarmed switch here means a caller
+        that is not ``main()`` -- a test driving one function -- for which "no
+        operator has asked this to stop" is the true answer.
+        """
+        with self._lock:
+            if self.requested:
+                return True
+            if self._armed_path is None:
+                return False
+            try:
+                present = self._armed_path.exists()
+            except Exception as exc:                            # noqa: BLE001
+                STOP_SWITCH_FAULTS[f"poll:{type(exc).__name__}"] += 1
+                return False
+            if not present:
+                return False
+            self.requested = True
+            self.detected_in = where
+            self.path = str(self._armed_path)
+            self.message = _read_stop_message(self._armed_path)
+
+        # OUTSIDE THE LOCK, because console.out and log.warning both take locks
+        # of their own and this is called from MAX_WORKERS done-callbacks at
+        # once. Holding a lock across a write to a bar-aware writer is how a
+        # shutdown path deadlocks.
+        console.out()
+        console.out("=" * 70)
+        console.out(f"[STOP] Stop requested by {self.path}")
+        if self.message:
+            console.out(f"[STOP] Note from the operator: {self.message}")
+        console.out(f"[STOP] Noticed {where}. No further (config, patient) pair "
+                    f"will be STARTED; those already running will finish and be "
+                    f"written, the checkpoint is current, and this study will be "
+                    f"recorded STOPPED.")
+        console.out("=" * 70)
+        log.warning("an operator stop was requested",
+                    event="stop_switch_tripped", status="stopped",
+                    mode=where, reason=self.message or "<no note>")
+        return True
+
+
+def _read_stop_message(path) -> str:
+    """The operator's note, capped, or None. NEVER RAISES.
+
+    An unreadable sentinel is still a sentinel: the switch has already tripped
+    by the time this is called, and refusing to stop because a note could not be
+    decoded would be the worst available outcome. Counted under ``message:`` --
+    a phase distinct from ``poll:`` precisely so an operator can tell "the study
+    may have missed a stop" from "the study stopped and lost the note".
+    """
+    try:
+        # A BOUNDED READ, NOT A READ-THEN-TRUNCATE: read_text() would pull the
+        # whole file into memory before the cap could apply. One extra
+        # character, so "was it longer than the cap" needs no second stat.
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            raw = handle.read(STOP_MESSAGE_MAX_CHARS + 1)
+    except Exception as exc:                                    # noqa: BLE001
+        STOP_SWITCH_FAULTS[f"message:{type(exc).__name__}"] += 1
+        return None
+    text = raw.strip()
+    if not text:
+        # AN EMPTY FILE IS FULLY VALID AND IS THE EXPECTED CASE. `touch` is the
+        # documented gesture; None means "no note", not "no stop".
+        return None
+    if len(raw) > STOP_MESSAGE_MAX_CHARS:
+        return (text[:STOP_MESSAGE_MAX_CHARS]
+                + f"... [truncated at {STOP_MESSAGE_MAX_CHARS} characters]")
+    return text
+
+
+STOP_SWITCH = _AblationStopSwitch()
+"""The one instance. See ``_AblationStopSwitch`` for why it is module-level."""
+
+
+def clear_ablation_stop_switch(db_path=None) -> str:
+    """Delete the sentinel. Returns a ``STOP_CLEAR_*`` member. Used by --clear-stop.
+
+    A SEPARATE GESTURE FROM ``--fresh-start`` AND NOT FOLDED INTO IT, because
+    the two clear opposite things: ``--fresh-start`` discards the RESUME STATE
+    and re-bills every (config, patient) pair, and this discards a CONTROL FILE
+    and costs nothing. An operator resuming a stopped study wants exactly this
+    and must not be within one flag of the other.
+
+    IT NEVER RAISES. ``unlink`` on a state directory the study can read and
+    cannot write raises ``PermissionError``, and ``ablation_stop_switch_path``
+    itself raises when the sibling data tree cannot be globbed. Both would
+    otherwise reach the operator as a traceback printed INSTEAD of the study
+    they asked for.
+    """
+    try:
+        path = ablation_stop_switch_path(db_path)
+        if not path.exists():
+            return STOP_CLEAR_ABSENT
+        path.unlink()
+    except Exception as exc:                                    # noqa: BLE001
+        STOP_SWITCH_FAULTS[f"clear:{type(exc).__name__}"] += 1
+        # THE PATH IS RE-DESCRIBED RATHER THAN REFERENCED: the failure may be
+        # the resolution itself, in which case `path` was never bound.
+        console.out(f"[STOP] COULD NOT CLEAR the stop sentinel: "
+                    f"{type(exc).__name__}: {exc}")
+        console.out(f"[STOP]   sentinel: "
+                    f"{describe_ablation_stop_switch_path(db_path)}")
+        console.out("[STOP]   The study would trip on it at its first completed "
+                    "pair and stop again -- after billing that pair -- for a "
+                    "request you have just withdrawn.")
+        console.out("[STOP]   Remove it by hand and start again:")
+        console.out(f"[STOP]       rm "
+                    f"{describe_ablation_stop_switch_path(db_path)}")
+        console.out("[STOP]   A permission error here usually means the state "
+                    "directory is read-only or owned by another user; `ls -ld` "
+                    "it.")
+        return STOP_CLEAR_FAILED
+    console.out(f"[STOP] Cleared {path}")
+    return STOP_CLEAR_REMOVED
+
+
+def report_stop_switch_faults(out=None) -> bool:
+    """STOP_SWITCH_FAULTS' end-of-study reader. True when it had something to say.
+
+    `report_checkpoint_faults`' shape and its reason: this module's counters are
+    excluded from `oncotriage/degradation.py`'s registry by name, so the
+    registry's rule -- every counter has a production reader -- is met here, at
+    the end of the study's own `main()`.
+
+    THE PHASES ARE REPORTED SEPARATELY BECAUSE THEY POINT OPPOSITE WAYS. A
+    `poll:` key means the study MAY HAVE KEPT GOING through a stop request; a
+    `clear:` key means an operator asked to RESUME and the sentinel is still
+    there. Summing them into one number would give an operator a count with no
+    direction.
+    """
+    emit = console.out if out is None else out
+    if not STOP_SWITCH_FAULTS:
+        return False
+    emit(f"  Stop switch:     {sum(STOP_SWITCH_FAULTS.values())} fault(s) "
+         f"{dict(STOP_SWITCH_FAULTS)}")
+    if any(k.startswith("poll:") or k.startswith("preflight:")
+           for k in STOP_SWITCH_FAULTS):
+        emit("                   a poll:/preflight: key means the sentinel "
+             "could not be READ, so this")
+        emit("                   study may have run through a stop somebody "
+             "asked for")
+    if any(k.startswith("clear:") for k in STOP_SWITCH_FAULTS):
+        emit("                   a clear: key means --clear-stop could not "
+             "REMOVE it, so the next")
+        emit("                   study will refuse to start until it is "
+             "deleted by hand")
+    if any(k.startswith("message:") for k in STOP_SWITCH_FAULTS):
+        emit("                   a message: key means only the operator's "
+             "note was lost; the stop")
+        emit("                   itself was honoured")
+    return True
+
+
+def assert_no_stale_ablation_stop_switch(db_path=None) -> None:
+    """Refuse to start while the sentinel is already there.
+
+    Raises:
+        StaleAblationStopSwitch: it is present.
+
+    WHY THIS IS A REFUSAL AND NOT A NO-OP. Without it the switch is a trap that
+    fires once and then silently every time: the study that honoured it leaves
+    the file behind (deliberately -- see ``clear_ablation_stop_switch``), so the
+    NEXT invocation would trip on its first completed pair, cancel the rest, and
+    report a study that stopped for a reason nobody asked for that day. On a
+    cron entry or a restart loop that is a comparison that never completes while
+    every run reports success.
+
+    Stopping BEFORE the first pair rather than after one is what makes the
+    message actionable: nothing has been billed, nothing has been written, and
+    the fix is one ``rm``.
+
+    A CHECK THAT RAISES IS NOT COUNTED AS A STOP -- ``_AblationStopSwitch.poll``'s
+    direction, for its reason -- with the failure counted under ``preflight:``.
+    """
+    try:
+        path = ablation_stop_switch_path(db_path)
+        present = path.exists()
+    except Exception as exc:                                    # noqa: BLE001
+        STOP_SWITCH_FAULTS[f"preflight:{type(exc).__name__}"] += 1
+        console.out(f"[STOP] WARNING: the stop switch could not be checked "
+                    f"({type(exc).__name__}: {exc}). Continuing.")
+        return
+    if not present:
+        return
+
+    note = _read_stop_message(path)
+    _db_arg = "" if db_path is None else f" --db {db_path}"
+    raise StaleAblationStopSwitch("\n".join(
+        [f"REFUSED (stop switch present): {path}",
+         "    A stop sentinel is already beside this study's checkpoint, so "
+         "this run would stop again at its first completed (config, patient) "
+         "pair -- for a request that was made before it started.",
+         f"    Note in the file: {note}" if note else
+         "    The file is empty, which is the ordinary `touch` form.",
+         "    NOTHING HAS BEEN RUN AND NOTHING HAS BEEN BILLED.",
+         "    To run: delete it and start again.",
+         f"        rm {path}",
+         f"        python \"26- Ablation Study.py\"{_db_arg}",
+         "    or, in one command:",
+         f"        python \"26- Ablation Study.py\" --clear-stop{_db_arg}"]))
+
+
+class _PairCancelled(RuntimeError):
+    """A (config, patient) pair was never started because the switch tripped.
+
+    ``oncotriage/batch/runner.py`` raises ``concurrent.futures.CancelledError``
+    at the equivalent point; THIS FILE MAY NOT, and the difference is forced by
+    ``_on_done``. That callback catches ``Exception`` and counts what it catches
+    as a run ERROR -- and ``CancelledError`` is a ``BaseException`` subclass in
+    Python 3.8+, so it would travel straight PAST the callback's handler, out of
+    ``future.result()`` in the drain loop, and end the study by exception with
+    the parent tracking run recorded FAILED. A pair nobody ran is not a study
+    that failed.
+
+    So it is an ``Exception``, and ``_on_done`` is taught to recognise it and
+    count it as CANCELLED rather than as an error -- which is the same
+    distinction the batch runner's ``_on_done`` already draws, arrived at from
+    the other side.
+    """
+
+
+def _run_pair_unless_stopped(_process, **kwargs):
+    """The submitted callable. Refuses to begin work once the switch has tripped.
+
+    WHY THIS EXISTS WHEN CANCELLATION ALREADY DOES THE JOB. Cancellation is a
+    sweep and a sweep has an edge: the switch latches inside a done-callback on
+    a WORKER thread while the submit loop on the MAIN thread polls once per
+    pair, so between the latch and the loop's next poll exactly ONE more future
+    can be submitted -- after the sweep that would have cancelled it. A worker
+    picking it up in that window starts a pair, and one live billed Stage 5
+    call, after the operator asked the study to stop.
+
+    ONE PAIR IS A SMALL BOUND AND IT IS NOT THE POINT. "No further pair is
+    started" is the contract this switch is documented by, and a contract with
+    an unstated edge is the class of defect this project exists to remove.
+
+    ``STOP_SWITCH.requested`` AND NOT ``poll()``: a plain attribute read, so
+    this adds no filesystem call to the hot path, and it cannot miss a stop that
+    matters -- the value it reads is set by the sweep already cancelling this
+    future's siblings.
+    """
+    if STOP_SWITCH.requested:
+        raise _PairCancelled(
+            "the operator stop switch tripped before this pair started")
+    return _process(**kwargs)
+
+
+def _cancel_queued(futures) -> int:
+    """Cancel every future that has not started. Returns how many were cancelled.
+
+    ``Future.cancel()`` RETURNS FALSE FOR A RUNNING FUTURE and leaves it alone,
+    which is exactly the contract needed: pairs in flight are already paid for
+    and their rows are worth having, so they finish. A cancelled future never
+    calls the pipeline, so it costs nothing -- which is what makes "no further
+    pair is started" a statement about MONEY and not only about scheduling.
+
+    A SNAPSHOT IS ITERATED, because this runs on a worker thread while the
+    submit loop on the main thread may still be appending.
+    """
+    return sum(1 for future in list(futures) if future.cancel())
+
+
+# ===========================================================================
 # ABLATION CONFIGURATIONS
 # ===========================================================================
 # Each dict is passed into the LangGraph initial state as 'ablation_flags'.
@@ -840,6 +1498,77 @@ def stratified_sample(patients, sample_size, seed):
 # DATABASE
 # ===========================================================================
 
+# ===========================================================================
+# THE PER-CONFIGURATION RUN STATUS
+# ===========================================================================
+#
+# `ablation_runs` HAD NO STATUS COLUMN AND NO STATUS CONVENTION AT ALL, and
+# that was measured before this was written rather than assumed: the table is
+# (id, run_timestamp, config_name, config_description, sample_size,
+# total_time_seconds) and `_finalize_run` set the last of those and nothing
+# else. So the brief's "per the ablation database's own status conventions"
+# named something that did not exist, and this is it -- built on the one this
+# project already has, `oncotriage/storage/database_logger.py`'s
+# RUN_RECORD_TERMINAL_STATUSES.
+#
+# WHY A STATUS IS LOAD-BEARING HERE AND NOT MERELY TIDY. generate_summary()
+# reports the LATEST ablation_runs row per config_name and joins its results by
+# run_id. A configuration cut short -- by a stop, by Ctrl-C, by SIGTERM --
+# leaves a row that IS the latest for that config and whose results are a
+# PREFIX of the sample. Every average computed over it is an average over
+# however many patients happened to run before the operator stopped, presented
+# beside the other configurations' full-sample averages as though the two were
+# comparable. That is precisely what STOPPED means in
+# `oncotriage/batch/runner.py`: "this covers a PREFIX of the cohort, so no rate
+# computed over it is a rate about the cohort". Without the column the database
+# cannot say which rows those are.
+#
+# THE VOCABULARY IS CLOSED AND A CALLER MAY BRANCH ON IT EXHAUSTIVELY.
+
+RUN_STATUS_RUNNING = "RUNNING"
+RUN_STATUS_COMPLETE = "COMPLETE"
+RUN_STATUS_STOPPED = "STOPPED"
+RUN_STATUS_KILLED = "KILLED"
+
+RUN_STATUSES = (RUN_STATUS_RUNNING, RUN_STATUS_COMPLETE, RUN_STATUS_STOPPED,
+                RUN_STATUS_KILLED)
+"""Every value `ablation_runs.status` can hold. NULL is not a member.
+
+    RUNNING   `_create_run` wrote it and nothing has finalized it. A row left
+              this way is a configuration whose process did not get to run a
+              handler -- SIGKILL, a power loss, a `docker kill`. It is the
+              same shape, and the same admission, as a `runs` row left RUNNING
+              with a NULL finished_at in `oncotriage/storage/database_logger.py`.
+    COMPLETE  every pending pair of this configuration ran.
+    STOPPED   the operator stop sentinel cut it short. The results under this
+              run_id are a PREFIX of the sample.
+    KILLED    Ctrl-C or SIGTERM cut it short. Same prefix warning, different
+              gesture -- and, unlike STOPPED, the pairs in flight were failed
+              rather than finished, because both abrupt paths ask Stage 5 to
+              stop issuing requests.
+
+NULL MEANS THE ROW PREDATES THIS COLUMN, and nothing is backfilled. Writing
+COMPLETE into historical rows would assert that every one of them finished,
+which is false of any study that was ever interrupted -- and those are exactly
+the rows a reader most needs to distrust. `_summary_status_warning` reports NULL
+as "not recorded", separately from the three it can read.
+
+`STOPPED` AND `KILLED` ARE BOTH PREFIXES AND ARE STILL SEPARATE MEMBERS,
+because the operator's next command differs: a stop is resumed by deleting the
+sentinel, an interrupt by running the same command again. That is the argument
+`oncotriage/batch/runner.py` makes for keeping the two apart in `runs.status`,
+and the argument `readiness.probe_index` makes for `empty` vs `absent`.
+"""
+
+RUN_STATUSES_PARTIAL = (RUN_STATUS_RUNNING, RUN_STATUS_STOPPED,
+                        RUN_STATUS_KILLED)
+"""The members whose results are NOT a whole sample. Derived from the tuple
+above rather than retyped, one line down, so a member added to one and not the
+other fails `tests/test_ablation_stop_and_lock.py` rather than silently being
+treated as complete.
+"""
+
+
 def init_ablation_db(db_path=None):
     """Create ablation database tables (idempotent).
 
@@ -860,6 +1589,28 @@ def init_ablation_db(db_path=None):
             total_time_seconds  REAL
         )
     """)
+
+    # `status` IS AN ADDITIVE COLUMN AND IS DELIBERATELY NOT IN THE CREATE
+    # TABLE ABOVE, on the precedent `oncotriage/storage/database_logger.py`
+    # sets for `runs.matching_call_mode`: a column named in both places is
+    # added twice to a fresh database and reports `duplicate column name` at
+    # the first INSERT of every new study. Named once, in the migration, so a
+    # fresh database and a migrated one end up with the identical physical
+    # column order -- which is what makes the two indistinguishable to every
+    # reader.
+    #
+    # NO DEFAULT, AND NOT `NOT NULL`. A DEFAULT would fill every historical row
+    # with a status nobody measured; NOT NULL cannot be added to a populated
+    # table by ALTER at all. NULL is the honest value for a row written before
+    # the column existed, and `_summary_status_warning` reads it as exactly
+    # that.
+    _run_columns = {row[1] for row in c.execute("PRAGMA table_info(ablation_runs)")}
+    if "status" not in _run_columns:
+        c.execute("ALTER TABLE ablation_runs ADD COLUMN status TEXT")
+        console.out("Schema migration: added ablation_runs.status")
+        console.out("  Existing rows left NULL (not measured, not COMPLETE): "
+                    "a study that was interrupted before this column existed "
+                    "is exactly the row a reader must not be told finished")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS ablation_results (
@@ -976,34 +1727,146 @@ def init_ablation_db(db_path=None):
     console.out(f"Ablation database: {ablation_db(db_path)}")
 
 
+RUN_RECORD_FAILURES = Counter()
+"""`ablation_runs` bookkeeping writes that did not land, keyed
+``{phase}:{ExceptionType}`` -- ``finalize:`` only, today.
+
+WHY `_finalize_run` STOPPED RAISING, WHICH IS A BEHAVIOUR CHANGE STATED AS ONE.
+It ran the study's LAST database write before the summary, so a raise out of it
+propagated to `main()`'s `except BaseException`, recorded the parent tracking
+run FAILED and re-raised -- destroying the summary, the JSON export and the
+checkpoint clear, AFTER every live Stage 5 call of the configuration had already
+been paid for. The column it writes is read by nothing that decides anything
+(`total_time_seconds` appears in no query; `status` is a warning line), so
+crashing a finished study over it buys nothing and costs the artifacts the study
+exists to produce.
+
+IT IS ALSO A CORRECTNESS REQUIREMENT ON THE SHUTDOWN PATHS. The stop and the
+interrupt both finalize the configuration they cut short, and both run inside a
+handler whose job is to leave a record. A raise there would replace the record
+with a traceback -- an exception inside an exception handler on a shutdown path,
+which `describe_ablation_stop_switch_path` exists one function up to prevent.
+
+`oncotriage/storage/database_logger.py:finalize_run_record` is the precedent,
+including "never raises" meaning `except Exception` -- so `KeyboardInterrupt`
+and a second SIGTERM still escape, exactly as they escape `_write_inference_row`.
+A finalizer that swallowed a Ctrl-C would leave an operator holding the key down
+against a process that will not stop.
+
+THERE IS NO `create:` KEY AND ITS ABSENCE IS NOT AN OMISSION. `_create_run`
+raises: it runs BEFORE the configuration's first billed call, so a failure there
+costs nothing and continuing would produce a whole configuration of results rows
+whose run_id points at no run. `oncotriage/storage/database_logger.py` draws the
+line in the same place and for the same reason.
+"""
+
+
+def report_run_record_failures(out=None) -> bool:
+    """RUN_RECORD_FAILURES' end-of-study reader. True when it had something to say.
+
+    The study's counters are excluded from `oncotriage/degradation.py`'s
+    registry by name -- importing this module there would drag the graph, the
+    fixtures and the thread pool into every batch run -- so the registry's
+    contract ("every counter has a reader") is met HERE, at the end of the
+    study's own `main()`, which is this entry point's equivalent of that report.
+    `report_checkpoint_faults` is the pattern and this is the third of its kind.
+
+    `out` IS INJECTABLE for that function's reason: `main()` cannot be driven
+    without a live Qdrant and a paid Stage 5 call per pair, so a reader nothing
+    can exercise is how a reader comes to be wrong.
+    """
+    emit = console.out if out is None else out
+    if not RUN_RECORD_FAILURES:
+        return False
+    emit(f"  Run records:     {sum(RUN_RECORD_FAILURES.values())} "
+         f"bookkeeping write(s) did not land {dict(RUN_RECORD_FAILURES)} -- "
+         f"a configuration's row may read RUNNING or carry no elapsed time "
+         f"even though it finished; the RESULTS rows are unaffected")
+    return True
+
+
 def _create_run(config_name, config_description, sample_size, db_path=None):
-    """Insert a new ablation_runs row, return run_id."""
+    """Insert a new ablation_runs row, return run_id.
+
+    The row opens `RUNNING`. It is finalized by `_finalize_run`, and a row still
+    reading RUNNING when a study is over is a configuration whose process had no
+    chance to run a handler -- see `RUN_STATUSES`.
+    """
     with _ablation_db_lock:
         conn = sqlite3.connect(str(ablation_db(db_path)))
         c = conn.cursor()
         c.execute(
             "INSERT INTO ablation_runs "
-            "(run_timestamp, config_name, config_description, sample_size) "
-            "VALUES (?, ?, ?, ?)",
-            (datetime.now().isoformat(), config_name, config_description, sample_size),
+            "(run_timestamp, config_name, config_description, sample_size, "
+            " status) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (datetime.now().isoformat(), config_name, config_description,
+             sample_size, RUN_STATUS_RUNNING),
         )
         run_id = c.lastrowid
         conn.commit()
         conn.close()
         return run_id
-    
 
-def _finalize_run(run_id, elapsed_seconds, db_path=None):
-    """Update run with total elapsed time."""
-    with _ablation_db_lock:
-        conn = sqlite3.connect(str(ablation_db(db_path)))
-        conn.execute(
-            "UPDATE ablation_runs SET total_time_seconds = ? WHERE id = ?",
-            (round(elapsed_seconds, 2), run_id),
-        )
-        conn.commit()
-        conn.close()
-        
+
+def _finalize_run(run_id, elapsed_seconds, status, db_path=None) -> bool:
+    """Record how long the configuration took and how it ended. Never raises.
+
+    Args:
+        status: a `RUN_STATUSES` member. REQUIRED, WITH NO DEFAULT, on
+            `empty_database(db_path, flag)`'s precedent: every plausible default
+            is a claim. `COMPLETE` would let a caller that forgot record a
+            stopped configuration as a finished one, which is the single thing
+            this column exists to make impossible.
+
+    Returns:
+        True when the row was updated. False when it was not, which is counted.
+
+    THE ROW COUNT IS READ. `UPDATE ... WHERE id = ?` against an id that is not
+    there SUCCEEDS and updates nothing, and SQLite reports no error -- so a
+    finalizer that did not check `rowcount` would report success for a run row
+    that was never written. That is the "reported success, wrote nothing" shape
+    the write-durability pass removed from `log_inference`, and this is the same
+    check for the same reason.
+
+    AN UNRECOGNISED STATUS IS REFUSED RATHER THAN STORED. A typo would put a
+    value outside the closed vocabulary into a column readers branch on, and
+    silently -- so it is counted and the write is skipped, leaving the row
+    RUNNING, which is at least a member and at least true of a study that did
+    not record how it ended. `tracking.end_run`'s substitution rule, with the
+    conservative direction chosen.
+    """
+    if status not in RUN_STATUSES:
+        RUN_RECORD_FAILURES[f"finalize:UnknownStatus({status!r})"] += 1
+        console.out(f"  [Run record] refusing to store an unrecognised status "
+                    f"{status!r} for run {run_id}; the row stays "
+                    f"{RUN_STATUS_RUNNING}")
+        return False
+    try:
+        with _ablation_db_lock:
+            conn = sqlite3.connect(str(ablation_db(db_path)))
+            try:
+                cur = conn.execute(
+                    "UPDATE ablation_runs "
+                    "SET total_time_seconds = ?, status = ? WHERE id = ?",
+                    (round(elapsed_seconds, 2), status, run_id),
+                )
+                updated = cur.rowcount
+                conn.commit()
+            finally:
+                conn.close()
+    except Exception as exc:                                    # noqa: BLE001
+        RUN_RECORD_FAILURES[f"finalize:{type(exc).__name__}"] += 1
+        console.out(f"  [Run record] could not finalize run {run_id} as "
+                    f"{status}: {type(exc).__name__}: {exc}")
+        return False
+    if updated != 1:
+        RUN_RECORD_FAILURES[f"finalize:NoSuchRun({updated})"] += 1
+        console.out(f"  [Run record] finalizing run {run_id} as {status} "
+                    f"matched {updated} rows, not 1")
+        return False
+    return True
+
 
 def log_ablation_result(run_id, config_name, patient_data, result,
                         ablation_flags, db_path=None):
@@ -1317,6 +2180,95 @@ def match_patient_ablation(patient_data, bm25_index, nct_ids, graph, ablation_fl
 # SUMMARY REPORTING
 # ===========================================================================
 
+def _summary_status_warning(conn) -> list:
+    """Lines naming any configuration whose LATEST run was not COMPLETE.
+
+    Returns [] when every latest run is COMPLETE, which is the ordinary case and
+    prints nothing at all -- a clean line every study trains a reader to skip it,
+    which is the argument `report_checkpoint_faults` already makes.
+
+    WHY THIS QUALIFIES THE TABLE RATHER THAN CHANGING IT. `generate_summary`
+    selects the latest run per config and averages its results. A configuration
+    cut short leaves the latest row covering a PREFIX of the sample, so its
+    averages are over however many patients ran before the stop -- printed
+    beside the other configurations' full-sample averages as if comparable.
+
+    THE FIX IS TO NAME IT, NOT TO FILTER IT, and that is a decision with two
+    halves. Filtering would change WHICH rows every historical comparison rests
+    on -- silently, for every reader of this table since the study existed --
+    and it would answer a partial configuration with nothing at all, which is
+    strictly less information than a partial number that says it is partial.
+    `oncotriage/storage/queries.py:print_cost_by_model` reached the same answer
+    for the same reason and marks its total `<- A FLOOR, NOT A TOTAL`; this is
+    that, for a mean.
+
+    NULL IS ITS OWN BUCKET AND IS NOT READ AS A FAILURE. A row written before
+    `ablation_runs.status` existed records nothing about how it ended -- which
+    is not the same as ending badly, and not the same as COMPLETE either. It is
+    reported as "not recorded" so a reader knows the question was not asked
+    rather than answered.
+
+    A PRE-EXISTING DEFECT THIS DOES NOT FIX, AND NAMES: a RESUMED configuration
+    also reports on a subset. The resume creates a NEW ablation_runs row and
+    logs only the pairs it actually ran, so `n` is the size of the REMAINDER
+    rather than of the sample. That is a fact about `generate_summary`'s
+    run_id join and it predates every control in this pass; closing it means
+    changing which rows the table is built from, which is the redesign this
+    function's own docstring declines. `n` is in the printed table, so a reader
+    comparing it against `sample_size` can see it.
+    """
+    try:
+        rows = conn.execute("""
+            SELECT config_name, status
+            FROM ablation_runs
+            WHERE (config_name, run_timestamp) IN (
+                SELECT config_name, MAX(run_timestamp)
+                FROM ablation_runs
+                GROUP BY config_name
+            )
+            ORDER BY config_name
+        """).fetchall()
+    except sqlite3.Error as exc:                                # noqa: BLE001
+        # A DATABASE THAT PREDATES THE COLUMN CANNOT ANSWER, and that is not a
+        # study failure: `no such column: status` is exactly what an
+        # un-migrated file says. Reported as itself rather than swallowed --
+        # the standing rule -- and never as "every configuration is complete".
+        return [f"  [Status] could not be read from ablation_runs "
+                f"({type(exc).__name__}: {exc}); this table says nothing about "
+                f"whether any configuration was cut short"]
+
+    partial = [(name, status) for name, status in rows
+               if status in RUN_STATUSES_PARTIAL]
+    unrecorded = [name for name, status in rows if status is None]
+    if not partial and not unrecorded:
+        return []
+
+    lines = ["", "  " + "!" * 76]
+    if partial:
+        lines.append("  [Status] THESE CONFIGURATIONS' NUMBERS ARE OVER A "
+                     "PREFIX OF THE SAMPLE, NOT THE SAMPLE:")
+        for name, status in partial:
+            lines.append(f"           {name:25s} latest run: {status}")
+        lines.append("           A run that was stopped, interrupted or killed "
+                     "logged results for")
+        lines.append("           only the pairs it reached. Every mean above "
+                     "for these configurations")
+        lines.append("           is a mean over that prefix, and the deltas "
+                     "against the baseline")
+        lines.append("           difference two different patient sets. Resume "
+                     "the study and re-run")
+        lines.append("           this summary before reading them as a "
+                     "comparison.")
+    if unrecorded:
+        lines.append("  [Status] These configurations' latest run predates "
+                     "ablation_runs.status, so")
+        lines.append("           whether it finished is NOT RECORDED -- which "
+                     "is not the same as")
+        lines.append("           COMPLETE: " + ", ".join(unrecorded))
+    lines.append("  " + "!" * 76)
+    return lines
+
+
 def generate_summary(db_path=None):
     """
     Query ablation database and produce summary table + deltas + JSON export.
@@ -1389,6 +2341,19 @@ def generate_summary(db_path=None):
         console.out("No ablation results found.")
         return None
 
+    # A SECOND, SHORT-LIVED CONNECTION rather than widening the one above.
+    # That one is scoped to the single `read_sql_query` and closed in a
+    # `finally` on purpose; holding one open across the whole printed report --
+    # pandas formatting, a dozen console writes -- would keep a reader on the
+    # study's own database for no reason while workers may still be writing it.
+    # SO THE LINES ARE COMPUTED HERE AND PRINTED LATER: what crosses the report
+    # is a list of strings, not a connection.
+    _status_conn = sqlite3.connect(str(ablation_db(db_path)))
+    try:
+        _status_lines = _summary_status_warning(_status_conn)
+    finally:
+        _status_conn.close()
+
     # Reorder to match ABLATION_CONFIGS
     order = {c["name"]: i for i, c in enumerate(ABLATION_CONFIGS)}
     df["_sort"] = df["config_name"].map(order).fillna(999)
@@ -1408,6 +2373,14 @@ def generate_summary(db_path=None):
         "\n                   so this column is NOT comparable across configs on "
         "its own."
     )
+
+    # THE QUALIFICATION IS PRINTED BETWEEN THE TABLE AND THE DELTAS, and the
+    # position is chosen rather than convenient: a reader who stops at the table
+    # has already seen it, and a reader who goes on to the deltas -- which
+    # difference two configurations directly and are the number most likely to
+    # be quoted -- reads it immediately above them.
+    for _line in _status_lines:
+        console.out(_line)
 
     # --- Deltas vs baseline ---
     bl_rows = df[df["config_name"] == "full_pipeline"]
@@ -1464,6 +2437,136 @@ def generate_summary(db_path=None):
 # MAIN
 # ===========================================================================
 
+STUDY_STATUS_COMPLETE = "COMPLETE"
+STUDY_STATUS_STOPPED = "STOPPED"
+STUDY_STATUS_INTERRUPTED = "INTERRUPTED"
+STUDY_STATUS_CRASHED = "CRASHED"
+
+STUDY_STATUSES = (STUDY_STATUS_COMPLETE, STUDY_STATUS_STOPPED,
+                  STUDY_STATUS_INTERRUPTED, STUDY_STATUS_CRASHED)
+"""How the STUDY ended, which is not the same question as how a CONFIGURATION
+ended (`RUN_STATUSES`, stored in ablation_runs.status).
+
+They are separate vocabularies because the two facts can differ: a study whose
+last configuration was STOPPED is itself STOPPED, but a study that ran every
+configuration to COMPLETE is COMPLETE and its rows say nothing about it. This
+one is printed and never stored -- a study is not a row in this schema -- so
+the two cannot be confused by a reader of the database.
+
+`INTERRUPTED` RATHER THAN `KILLED`, and the wording is deliberate: this is the
+line an operator reads on their own terminal immediately after pressing Ctrl-C,
+and "KILLED" reads as something that happened TO the study. The stored
+per-configuration status IS `KILLED`, because there it sits beside `runs.status`
+values written by the batch runner and has to agree with them.
+
+`CRASHED` IS SEPARATE FROM `INTERRUPTED` AND THAT IS THE POINT OF HAVING IT.
+Both reach the closing block through the same `except BaseException`, and both
+leave the same per-configuration `KILLED` row -- but one is a shutdown the
+operator asked for and the other is a defect. Printing "INTERRUPTED" over a
+`MatchingModelMismatchError` would tell an operator their own Ctrl-C stopped a
+study that in fact fell over, and printing "CRASHED" over a `docker stop` would
+send them hunting a bug that is not there.
+"""
+
+
+def print_study_close(status, study_elapsed, run_success, run_error,
+                      run_cancelled, db_path=None, out=None) -> None:
+    """The study's closing block. ONE TEXT, TWO CALLERS.
+
+    Called from the normal path and from the Ctrl-C handler, which re-raises
+    and therefore never reaches the normal one. `oncotriage/batch/runner.py`
+    accepts the same duplication and argues it -- "the wording is the summary
+    line's, deliberately, so an operator reading a scrolled-back log sees the
+    same numbers in the same shape whether the pass ended or was interrupted" --
+    and a function is that argument with the duplication removed.
+
+    IT IS WHERE THE STUDY'S THREE COUNTERS ARE READ, and that is a contract
+    rather than a convenience. `oncotriage/degradation.py` excludes this
+    module's counters from its registry by name (importing the study there would
+    drag the graph, the fixtures and the thread pool into every batch run), so
+    the registry's rule -- every counter has a production reader -- is met at
+    the end of this file's own `main()`. Before this function existed the
+    Ctrl-C path skipped that block entirely, so an interrupted study reported
+    none of its degradations.
+
+    `out` IS INJECTABLE on `report_checkpoint_faults`' precedent: `main()`
+    cannot be driven without a live Qdrant and a live billed call per pair, so a
+    reader nothing can exercise is how a reader comes to be wrong.
+    """
+    emit = console.out if out is None else out
+    # AN UNRECOGNISED STATUS IS NAMED RATHER THAN FALLING THROUGH THE CHAIN
+    # BELOW INTO SILENCE. Without this a status outside the closed vocabulary
+    # -- a typo, a member added without a branch -- prints the whole block with
+    # NO `Status:` line at all, which reads as a study that ended in a way
+    # nobody thought to describe. `_finalize_run` applies the same rule to
+    # `RUN_STATUSES` one table over, and this is what gives `STUDY_STATUSES` a
+    # reader rather than leaving it the dead declaration check 2h of
+    # tests/test_package_invariants.py exists to report.
+    if status not in STUDY_STATUSES:
+        status = STUDY_STATUS_CRASHED
+        emit(f"  [Study] an unrecognised study status was passed to the "
+             f"closing block; reporting it as {STUDY_STATUS_CRASHED}")
+    emit()
+    emit("=" * 70)
+    emit(f"{Project_Name}: ABLATION STUDY SUMMARY")
+    emit("=" * 70)
+    emit(f"  Wall time:       {study_elapsed / 60:.1f} min")
+    emit(f"  Completed:       {run_success + run_error}")
+    emit(f"  Success:         {run_success}")
+    emit(f"  Errors:          {run_error}")
+    # NAMED ONLY WHEN NON-ZERO, so a clean study's block is byte-identical to
+    # what it has always printed and a stopped one cannot report pairs nobody
+    # ran as pairs that failed.
+    if run_cancelled:
+        emit(f"  Cancelled:       {run_cancelled} (never started, never billed)")
+    emit(f"  Database:        {ablation_db(db_path)}")
+
+    # Checkpoint degradations, reported here rather than left in the
+    # scrollback (pass 20f-1, item 11a's shape). Printed only when there
+    # were any, matching INDEX_AGE_PARSE_FAILURES in
+    # oncotriage/retrieval/indexer.py -- a zero line every run trains a
+    # reader to skip it.
+    if CHECKPOINT_WRITE_FAILURES:
+        emit(f"  Checkpoint:      "
+             f"{sum(CHECKPOINT_WRITE_FAILURES.values())} write "
+             f"degradation(s) {dict(CHECKPOINT_WRITE_FAILURES)} -- resume "
+             f"state may be behind the rows already in the database")
+
+    report_checkpoint_faults(out=emit)
+    report_stop_switch_faults(out=emit)
+    report_run_record_failures(out=emit)
+
+    if status == STUDY_STATUS_STOPPED:
+        emit("  Status:          STOPPED (an operator asked for it)")
+        emit(f"                   sentinel: "
+             f"{describe_ablation_stop_switch_path(db_path)}")
+        emit("                   The sentinel is NOT deleted by the study that "
+             "honoured it, and")
+        emit("                   the next study refuses to start while it is "
+             "there. To resume:")
+        emit(f"                       rm "
+             f"{describe_ablation_stop_switch_path(db_path)}")
+        emit("                   or, in one command: python "
+             "\"26- Ablation Study.py\" --clear-stop")
+        emit("                   NO SUMMARY WAS GENERATED and the checkpoint "
+             "was KEPT: this study")
+        emit("                   covers a PREFIX of its configurations, so no "
+             "mean over it is a")
+        emit("                   mean over the sample.")
+    elif status == STUDY_STATUS_INTERRUPTED:
+        emit("  Status:          INTERRUPTED (resume with same command)")
+        emit("                   NO SUMMARY WAS GENERATED and the checkpoint "
+             "was KEPT.")
+    elif status == STUDY_STATUS_CRASHED:
+        emit("  Status:          CRASHED (see the traceback below)")
+        emit("                   NO SUMMARY WAS GENERATED and the checkpoint "
+             "was KEPT, so a")
+        emit("                   resume after the fix costs nothing for what "
+             "already ran.")
+    # COMPLETE prints its own two lines at the call site, because they name the
+    # summary file the caller has just written and this function does not write.
+
+
 def parse_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="OncoMatch Ablation Study")
@@ -1495,6 +2598,33 @@ def parse_args():
              "resume state so every (config, patient) pair runs again. The "
              "remediation for a refused checkpoint -- and it re-bills every "
              "pair, which is why it is a flag rather than a fallback."
+    )
+    # --clear-stop IS THE RESUME GESTURE AFTER A STOP, AND IT IS A SEPARATE
+    # FLAG FROM --fresh-start ON PURPOSE. They are opposites: --fresh-start
+    # DISCARDS the resume state and re-bills every (config, patient) pair, this
+    # discards a CONTROL FILE and costs nothing. An operator resuming a stopped
+    # study wants exactly this and must not be one keystroke from the other,
+    # which is also why the two have no combined form.
+    #
+    # It is a flag rather than the study deleting the sentinel itself: see
+    # assert_no_stale_ablation_stop_switch for why a self-clearing switch would
+    # let a restart loop honour a stop nobody asked for and report success each
+    # time.
+    #
+    # THE PATH IS NOT INTERPOLATED INTO THE HELP. ablation_stop_switch_path()
+    # reads paths.checkpoint_path, which resolves the sibling data tree by glob
+    # on first read and RAISES on a machine that does not have it -- so a
+    # resolved path here would make `--help` fail on exactly the checkout where
+    # somebody is reading it to find out what the flag does. The run banner
+    # prints the resolved path, where resolving it is already unavoidable.
+    parser.add_argument(
+        "--clear-stop", action="store_true",
+        help="Delete this study's operator stop sentinel (the _STOP file "
+             "beside its checkpoint -- the run banner prints its absolute "
+             "path) before running. This is how a study that was STOPPED is "
+             "resumed: the sentinel is left in place by the run that honoured "
+             "it, and a study refuses to start while it is there. It discards "
+             "no results and re-bills nothing."
     )
     parser.add_argument(
         "--db", default=None, metavar="PATH",
@@ -1529,6 +2659,71 @@ def main():
         # that it is not the production one.
         console.out(f"  Checkpoint (resume state): {_ablation_checkpoint_path(db_path)}")
         console.out()
+
+    # ══ STEP 0: THE CONTROL FILES, ABOVE EVERY DESTRUCTIVE FLAG ════════════
+    #
+    # ORDERING IS THE WHOLE OF THIS BLOCK, and it is the defect the
+    # pre-migration pass had to fix in oncotriage/batch/runner.py. That file's
+    # preflight lived INSIDE main(), below the flag handling -- so an operator
+    # who typed the destructive flag while a sentinel was still present got the
+    # resume state DELETED and then a refusal whose own last line reads
+    # "NOTHING HAS BEEN RUN AND NOTHING HAS BEEN BILLED": true of the billing
+    # and false of the resume state, which was gone, and the next invocation
+    # re-ran everything. Here the flag is --fresh-start and the state is up to
+    # 525 live Stage 5 calls.
+    #
+    # --clear-stop SATISFIES THE PREFLIGHT RATHER THAN BEING BLOCKED BY IT, and
+    # that is the rule's other half rather than an exception to it. The
+    # refusal's own remediation names that flag, so a preflight that refused the
+    # command it tells the operator to run would be a loop with no exit. The
+    # asymmetry is exactly the destructive/non-destructive line: --clear-stop
+    # deletes a CONTROL FILE and re-bills nothing, --fresh-start deletes the
+    # RESUME STATE and re-bills every pair.
+    if args.clear_stop:
+        # ALL THREE OUTCOMES ARE BRANCHED ON, and the third is why the return
+        # is not a bool. This SKIPS the preflight below, so a clear that FAILED
+        # and was reported as "nothing to clear" would start the study with the
+        # sentinel still there -- and it would stop again at the first completed
+        # pair, after billing that pair, for a request just withdrawn.
+        _cleared = clear_ablation_stop_switch(db_path=db_path)
+        if _cleared == STOP_CLEAR_ABSENT:
+            console.out(f"[--clear-stop] No stop sentinel at "
+                        f"{describe_ablation_stop_switch_path(db_path)}; "
+                        f"nothing to clear.")
+        elif _cleared == STOP_CLEAR_FAILED:
+            console.out("[--clear-stop] REFUSING TO RUN: the sentinel is still "
+                        "there. NOTHING HAS BEEN RUN AND NOTHING HAS BEEN "
+                        "BILLED.")
+            sys.exit(1)
+    elif not (args.summary_only and not args.fresh_start):
+        # ── THE PREFLIGHT, AND THE ONE INVOCATION IT DOES NOT APPLY TO ─────
+        #
+        # A PURELY READ-ONLY INVOCATION IS EXEMPT, and the exemption is as
+        # narrow as it can be: `--summary-only` WITHOUT `--fresh-start`. That
+        # mode reads the database, writes ablation_summary.json, runs nothing
+        # and bills nothing -- so the refusal's own premise ("this run would
+        # stop again at its first completed pair") is false of it, and its own
+        # remediation ("delete the sentinel") would tell an operator to
+        # withdraw a stop they had not withdrawn just to LOOK at what the
+        # stopped study produced. Refusing there would make the natural next
+        # command after a stop the one command that un-stops the next study.
+        #
+        # `--fresh-start` PUTS IT BACK, even combined with --summary-only,
+        # because that flag DELETES THE RESUME STATE whatever else the
+        # invocation does -- which is exactly the destructive act the preflight
+        # is ordered above.
+        #
+        # KEPT HERE AS WELL AS IN THE ENTRY POINT'S GUARD, AND IT IS NOT
+        # REDUNDANT: main() is directly callable by an embedder that never sees
+        # that guard, and the check is one stat call. On the entry-point path
+        # the guard has NOT already run this -- it owns the lock and the signal
+        # disposition and nothing else -- so this is the only place it fires.
+        try:
+            assert_no_stale_ablation_stop_switch(db_path=db_path)
+        except StaleAblationStopSwitch as _stale:
+            console.out()
+            console.out(str(_stale))
+            sys.exit(1)
 
     # --- --fresh-start, before anything reads the checkpoint ---
     # Above --summary-only deliberately: --summary-only reads the database and
@@ -1571,10 +2766,46 @@ def main():
     # with the first study's collection.
     run_fingerprint.clear_cache()
 
+    # ── THE OTHER TWO PIECES OF PER-RUN MODULE STATE ───────────────────────
+    #
+    # Both for the reason the line above records and `clear_write_ledger` /
+    # `STOP_SWITCH.reset` record in oncotriage/batch/runner.py's main(): module
+    # state that survives into the next study describes the WRONG study. Here
+    # each has a specific cost. A stop inherited from a previous main() in this
+    # process would cancel every pair of this one without an operator having
+    # asked; a Stage 5 shutdown flag inherited from one would make every pair
+    # FAIL without a request being sent, and the study would report a whole
+    # cohort of errors for a Ctrl-C somebody pressed in an earlier run.
+    STOP_SWITCH.reset()
+    clear_stage5_shutdown()
+
+
     with CaffeinateSession("Ablation Study"):
 
         # --- Step 1: Initialize ---
         init_ablation_db(db_path=db_path)
+
+        # ── ARM THE STOP SWITCH, AND SAY WHERE IT IS ───────────────────────
+        #
+        # ARMED HERE RATHER THAN RESOLVED PER POLL, which is where this
+        # diverges from oncotriage/batch/runner.py's switch: that one has a
+        # single sentinel and resolves it inside poll(); this one's location
+        # depends on --db, and the poll runs on MAX_WORKERS done-callbacks.
+        # Binding it once, on this thread, means the path an operator is TOLD
+        # to write and the path the study watches are ONE reading rather than
+        # two that could disagree.
+        #
+        # THE BANNER IS UNCONDITIONAL, unlike the --db lines above it. An
+        # operator can only use a switch whose path they have been given, and
+        # asking them to derive it from a checkpoint filename is how a stop
+        # gets written to a file nothing reads -- which looks exactly like a
+        # switch that does not work. This is the same reason
+        # oncotriage/batch/runner.py prints its sentinel path on every run.
+        STOP_SWITCH.arm(ablation_stop_switch_path(db_path))
+        console.out(f"  Stop switch:     touch "
+                    f"{describe_ablation_stop_switch_path(db_path)}")
+        console.out( "                   (stops cleanly between pairs; the "
+                     "checkpoint stays current and a resume skips what ran)")
 
         console.out("\n[Step 1] Building BM25 index...")
         bm25_index, nct_ids = build_bm25_index_from_qdrant()
@@ -1669,13 +2900,68 @@ def main():
         # ends the parent as KILLED; what this catches is everything else -- a
         # raise from generate_summary(), from the checkpoint clear, or from the
         # pool.
+        # ── THE COUNTERS AND THE OPEN RUN ID LIVE ABOVE THE OUTER `try` ────
+        #
+        # The `except BaseException` guard at the bottom now FINALIZES the open
+        # configuration and PRINTS the closing block, so every name it reads has
+        # to be bound before the `try` is entered -- otherwise an exception
+        # raised in the first few statements (tqdm's constructor is one) would
+        # meet an unbound local and replace the study's diagnosis with a
+        # NameError about a counter, on the one path whose job is to leave a
+        # record.
+        run_success = 0
+        run_error = 0
+        run_cancelled = 0
+        # THE CONFIGURATION CURRENTLY OPEN, so the shutdown paths can finalize
+        # it. A plain local rather than module state, for the reason
+        # oncotriage/batch/runner.py gives for threading its run_id through:
+        # there is nothing to forget, so a second main() in one process cannot
+        # inherit the first study's open configuration.
+        #
+        # THERE IS NO `interrupted` FLAG. It existed to carry "Ctrl-C happened"
+        # past the handler down to Step 5; the handler re-raises now, so Step 5
+        # is unreachable from that path and a flag read there would be dead.
+        # What replaced it is `STOP_SWITCH.requested`, which is a fact about the
+        # run rather than a variable somebody has to remember to set.
+        open_run_id = None
+        study_start = time.time()
+        # ── "WAS EVERYTHING COVERED", NOT "WAS A SENTINEL SEEN" ────────────
+        #
+        # THE PRE-MIGRATION PASS HAD TO FIX EXACTLY THIS IN THE BATCH RUNNER
+        # AND THE NAIVE PORT REPRODUCES IT. `main()` there read
+        # `STOP_SWITCH.requested` at four sites, which is a question about
+        # whether a sentinel was SEEN and not about whether the work was DONE
+        # -- so a stop written while the last pass was already finishing
+        # recorded a run STOPPED, "whose entire meaning is 'this campaign
+        # covers a PREFIX'", over a cohort that had been covered in full.
+        #
+        # A STUDY MEETS THE SAME CASE IN TWO PLACES. A stop can arrive while
+        # every pair of the current configuration is ALREADY IN FLIGHT -- they
+        # all finish, nothing is cancelled, nothing goes unsubmitted, and that
+        # configuration's results are the WHOLE sample rather than a prefix.
+        # And if that configuration is the last one, the STUDY covered its work
+        # too.
+        #
+        # SO THE ANSWER IS THE ONE THE BATCH RUNNER ARRIVED AT: the only two
+        # ways a unit can be left unattempted are "never submitted" and
+        # "cancelled before it started", and this flag is set False when either
+        # happens -- or when a whole configuration is never started at all.
+        # `STOP_SWITCH.requested` still decides what is ANNOUNCED; this decides
+        # what is RECORDED.
+        #
+        # IT MATTERS BEYOND A LABEL. A configuration wrongly recorded STOPPED
+        # is the LATEST row for its config_name, and a resume SKIPS a
+        # configuration whose pairs are all checkpointed -- so it never gets a
+        # COMPLETE row, and `_summary_status_warning` warns about a prefix that
+        # is not one, permanently.
+        study_covered = True
+
         try:
             # --- Step 4: Run each config ---
             total_configs = len(configs)
             total_runs = total_configs * len(sample)
             already_done = len(completed)
             remaining = total_runs - already_done
-            study_start = time.time()
 
             console.out(f"\n  Total runs:     {total_runs} ({total_configs} configs × {len(sample)} patients)")
             console.out(f"  Already done:   {already_done}")
@@ -1695,9 +2981,6 @@ def main():
                 smoothing=0.1,
             )
 
-            run_success = 0
-            run_error = 0
-            interrupted = False
 
             # THE builtins.print MONKEY-PATCH USED TO BE HERE, AND IT IS DELETED.
             # See oncotriage/batch/runner.py for what it did to every print(end=),
@@ -1796,9 +3079,51 @@ def main():
                     config_name = config["name"]
                     ablation_flags = config["flags"]
 
+                    # ── THE SWITCH, BETWEEN CONFIGURATIONS ─────────────────
+                    #
+                    # THIS IS THE COARSE HALF AND IT IS NOT THE SWITCH. On its
+                    # own it would be a useless granularity: one configuration
+                    # is `sample_size` live Stage 5 calls -- 75 at the default,
+                    # roughly half an hour, one seventh of a 3-5 hour study --
+                    # so an operator who asked a study to stop would keep paying
+                    # for all of it. The switch that matters is polled BETWEEN
+                    # PAIRS, in the submit loop and in _on_done below, at the
+                    # checkpoint's own cadence.
+                    #
+                    # WHAT THIS ONE BUYS is that a stop noticed during
+                    # configuration 3 of 7 leaves configurations 4-7 UNSTARTED
+                    # rather than opening four more ablation_runs rows, printing
+                    # four more banners and creating four more empty
+                    # configurations for generate_summary to average over. A
+                    # `_create_run` row with no results is the shape
+                    # `_summary_status_warning` then has to explain.
+                    if STOP_SWITCH.poll(where="between configurations"):
+                        _unstarted = total_configs - config_idx + 1
+                        study_covered = False
+                        console.out(f"[STOP] {_unstarted} "
+                                    f"configuration(s) were never started.")
+                        # THE BAR IS RESIZED TO WHAT WAS ACTUALLY ACCOUNTED
+                        # FOR, and `progress.n` is exact HERE and only here:
+                        # the previous configuration's executor was shut down
+                        # with wait=True, which joins every worker, and a
+                        # done-callback runs on the worker that completed the
+                        # item (or, for a cancelled one, inside shutdown on this
+                        # thread) -- so nothing can still be counting.
+                        #
+                        # ASSIGNED RATHER THAN DECREMENTED BY
+                        # `unstarted * len(sample)`, which is the
+                        # arithmetic that looks right and is wrong: the bar was
+                        # created with `initial=already_done`, a figure that
+                        # already includes pairs completed in the configurations
+                        # this stop never reached, so subtracting their whole
+                        # sample would double-count those.
+                        progress.total = progress.n
+                        progress.refresh()
+                        break
+
                     # Skip entirely completed configs
                     config_pairs = {(config_name, p["patient_id"]) for p in sample}
-                
+
                     if config_pairs.issubset(completed):
                         console.out(f"\n  [SKIP] Config '{config_name}' already completed.")
                         progress.update(len(config_pairs))
@@ -1812,6 +3137,7 @@ def main():
 
                     run_id = _create_run(config_name, config["description"],
                                          len(sample), db_path=db_path)
+                    open_run_id = run_id
                     config_start = time.time()
 
                     # Filter to pending patients for this config
@@ -1824,10 +3150,44 @@ def main():
                     if already_done_in_config > 0:
                         progress.update(already_done_in_config)
 
-                    def _on_done(future, _config_name=config_name):
-                        nonlocal run_success, run_error
+                    futures = []
+                    # PER CONFIGURATION, and separate from the study-wide
+                    # `run_cancelled` on purpose: the status written to THIS
+                    # configuration's row is a statement about THIS
+                    # configuration's sample, and a study-wide total would
+                    # mark a fully-covered configuration as a prefix because a
+                    # LATER one was cut short.
+                    config_cancelled = [0]
+
+                    def _on_done(future, _config_name=config_name,
+                                 _futures=futures, _cxl=config_cancelled):
+                        nonlocal run_success, run_error, run_cancelled
                         try:
                             pid, result = future.result()
+                        except CancelledError:
+                            # A FUTURE THE SWEEP BELOW CANCELLED. Never started,
+                            # never billed, and NOT an error: counting it as one
+                            # would report work nobody ran as work that failed,
+                            # and a stopped study's closing block would read like
+                            # a study that broke.
+                            run_cancelled += 1
+                            _cxl[0] += 1
+                            progress.set_postfix(ok=run_success, err=run_error,
+                                                 cxl=run_cancelled)
+                            progress.update(1)
+                            return
+                        except _PairCancelled:
+                            # THE SWEEP'S EDGE, closed by _run_pair_unless_stopped:
+                            # a pair submitted between the switch latching and the
+                            # submit loop's next poll is cancelled by nothing, so
+                            # the callable itself refuses. Same accounting as a
+                            # cancelled future, because it is the same event.
+                            run_cancelled += 1
+                            _cxl[0] += 1
+                            progress.set_postfix(ok=run_success, err=run_error,
+                                                 cxl=run_cancelled)
+                            progress.update(1)
+                            return
                         except Exception as e:
                             run_error += 1
                             progress.set_postfix(ok=run_success, err=run_error)
@@ -1843,13 +3203,75 @@ def main():
                         completed.add((_config_name, pid))
                         save_ablation_checkpoint(completed, db_path=db_path)
 
+                        # ── THE SWITCH, BETWEEN PAIRS ─────────────────────
+                        #
+                        # POLLED AFTER THE CHECKPOINT IS WRITTEN, so a stop
+                        # noticed here is a stop taken against state that is
+                        # already current: every pair this study has finished is
+                        # in the file, and a resume skips exactly those.
+                        #
+                        # THE SWEEP CANCELS WHAT HAS NOT STARTED. Future.cancel()
+                        # returns False for a running future and leaves it alone,
+                        # which is the contract wanted: pairs in flight are
+                        # already paid for and their rows are worth having.
+                        if STOP_SWITCH.poll(where="during a configuration"):
+                            _n = _cancel_queued(_futures)
+                            if _n:
+                                console.out(f"[STOP] {_n} queued (config, "
+                                            f"patient) pair(s) cancelled before "
+                                            f"they could be started.")
+
                         progress.set_postfix(ok=run_success, err=run_error)
                         progress.update(1)
 
-                    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                        futures = []
-                        for patient_data in pending_patients:
+                    # ── THE EXECUTOR IS NOT A CONTEXT MANAGER ──────────────
+                    #
+                    # `with ThreadPoolExecutor(...) as executor:` calls
+                    # shutdown(wait=True) -- WITHOUT cancel_futures -- from
+                    # __exit__, which runs BEFORE any `except` clause below it.
+                    # Every future is submitted up front by the loop below, so
+                    # __exit__ DRAINS THE WHOLE REMAINING CONFIGURATION at one
+                    # live billed Stage 5 call each, and only then is the
+                    # handler entered. This is the identical defect the
+                    # pre-migration pass removed from
+                    # oncotriage/batch/runner.py:run_batch, measured there at
+                    # 20 of 20 queued tasks completing under the `with` form
+                    # against 2 of 20 under this one.
+                    #
+                    # THE MULTIPLIER HERE IS LARGER. A batch run's queue is the
+                    # rest of the corpus once; this file's `with` block is
+                    # INSIDE the configuration loop, so an interrupt drained
+                    # the rest of THIS configuration and then -- because the
+                    # KeyboardInterrupt was caught and not re-raised -- the loop
+                    # carried on to the next configuration and did it again.
+                    #
+                    # THE `finally` SHUTDOWN IS WHAT MAKES IT TOTAL: it covers
+                    # the SystemExit the entry point's SIGTERM handler raises
+                    # and any ordinary exception, not only KeyboardInterrupt. On
+                    # the NORMAL path every future has completed by the time it
+                    # runs, so cancel_futures=True cancels nothing and the
+                    # behaviour is byte-identical to the `with` form.
+                    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+                    pairs_unsubmitted = 0
+                    try:
+                        for _index, patient_data in enumerate(pending_patients):
+                            # THE SUBMIT LOOP HONOURS THE SWITCH TOO, and this
+                            # is not redundant with the sweep in _on_done.
+                            # Submitting `sample_size` futures takes
+                            # milliseconds, so in production the loop is long
+                            # finished before any pair completes and this never
+                            # fires. It fires on a SMALL sample, a slow
+                            # filesystem or a loaded machine -- exactly the
+                            # conditions a test runs under -- and without it a
+                            # pair submitted after the sweep would be neither
+                            # cancelled nor accounted for, and would run and
+                            # bill after the stop was announced.
+                            if STOP_SWITCH.poll(where="while submitting"):
+                                pairs_unsubmitted = (len(pending_patients)
+                                                     - _index)
+                                break
                             future = executor.submit(
+                                _run_pair_unless_stopped,
                                 _process_one,
                                 patient_data=patient_data,
                                 config_name=config_name,
@@ -1859,51 +3281,184 @@ def main():
                             future.add_done_callback(_on_done)
                             futures.append(future)
 
+                        if pairs_unsubmitted:
+                            # THE BAR IS RESIZED TO WHAT WILL BE ACCOUNTED FOR.
+                            # _on_done advances it once per future, cancelled
+                            # ones included, and a pair that was never submitted
+                            # has no future and no callback -- so a bar still
+                            # sized to the whole sample stops short and reads as
+                            # a study that hung at the moment it was shutting
+                            # down cleanly.
+                            progress.total -= pairs_unsubmitted
+                            progress.refresh()
+                            console.out(f"[STOP] {pairs_unsubmitted} (config, "
+                                        f"patient) pair(s) in '{config_name}' "
+                                        f"were never submitted.")
+
                         # Wait for all to complete (callbacks handle progress)
                         for future in futures:
-                            future.result()
+                            try:
+                                future.result()
+                            except (CancelledError, _PairCancelled):
+                                # NOT AN ERROR AND IT MUST NOT ESCAPE HERE.
+                                # Reachable only on the stop path: the switch
+                                # cancels while this loop is still draining, and
+                                # an escape would leave the config loop by
+                                # exception -- into main()'s
+                                # `except BaseException`, which records the
+                                # parent tracking run FAILED. A clean operator
+                                # stop would then be indistinguishable from a
+                                # crash, which is the one thing the new status
+                                # exists to distinguish. _on_done has already
+                                # counted it.
+                                continue
+                    finally:
+                        # SHUTDOWN FIRST, before anything below reads the
+                        # counters, so no worker is still writing when they are
+                        # read. Idempotent: on the interrupt path the handler
+                        # below has already shut it down and this is a no-op.
+                        executor.shutdown(wait=True, cancel_futures=True)
 
                     config_elapsed = time.time() - config_start
-                    _finalize_run(run_id, config_elapsed, db_path=db_path)
-                    console.out(f"\n  Config '{config_name}' done: {config_elapsed / 60:.1f} min")
+                    # THE STATUS IS A STATEMENT ABOUT COVERAGE, NOT ABOUT THE
+                    # SWITCH. A configuration whose pairs were all already in
+                    # flight when the stop arrived finishes every one of them:
+                    # nothing was cancelled, nothing went unsubmitted, and its
+                    # results are the WHOLE sample. Recording that STOPPED
+                    # would assert a prefix that does not exist -- and, because
+                    # a resume SKIPS a configuration whose pairs are all
+                    # checkpointed, that row would stay the latest for its
+                    # config_name forever. See `study_covered`.
+                    _config_covered = (pairs_unsubmitted == 0
+                                       and config_cancelled[0] == 0)
+                    if not _config_covered:
+                        study_covered = False
+                    _config_status = (RUN_STATUS_COMPLETE if _config_covered
+                                      else RUN_STATUS_STOPPED)
+                    _finalize_run(run_id, config_elapsed, _config_status,
+                                  db_path=db_path)
+                    open_run_id = None
+                    console.out(f"\n  Config '{config_name}' "
+                                f"{'done' if _config_covered else 'stopped'}"
+                                f": {config_elapsed / 60:.1f} min")
+                    # THERE IS DELIBERATELY NO `break` HERE. Falling through to
+                    # the top-of-loop poll is what COUNTS the configurations
+                    # that were never started -- the poll sets
+                    # `_unstarted` and prints it, and a break here would
+                    # leave that at 0 and tell a stopped operator nothing about
+                    # how much of the study remains. The poll is above
+                    # `_create_run`, so nothing is opened on the way out; the
+                    # first draft of this block carried the break as "belt and
+                    # braces" and it was strictly worse.
 
             except KeyboardInterrupt:
-                interrupted = True
+                # ── THE FIRST STATEMENT, BEFORE ANYTHING IS PRINTED ────────
+                #
+                # THE RAISE ALONE DOES NOT REACH STAGE 5. CPython delivers a
+                # signal to the MAIN thread; the pipeline runs on WORKER threads
+                # of the pool above. So the KeyboardInterrupt lands here, the
+                # executor's `finally` cancels QUEUED pairs, and every pair
+                # already in flight then finishes its WHOLE Stage 5 exchange --
+                # in the grouped arm every remaining chunk of the packer's plan,
+                # in the per-trial arm ceil(MAX_TRIALS_FOR_EVALUATION /
+                # MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS) rounds -- each bounded
+                # only by MATCHING_REQUEST_TIMEOUT_SECONDS and the SDK's own
+                # retries, while shutdown(wait=True) blocks. Every one of those
+                # is a live billed request issued AFTER the operator pressed
+                # Ctrl-C.
+                #
+                # Setting the flag bounds the wait at ONE in-flight request per
+                # worker: what is already in the air cannot be interrupted, and
+                # every queued or subsequent call returns immediately without
+                # being sent. The pairs affected FAIL rather than completing
+                # partially, so none of them is checkpointed and a resume
+                # re-runs them whole -- which is the c33 argument, and the
+                # reason a shutdown is not isolated to a chunk.
+                request_stage5_shutdown("Ctrl-C during the ablation study")
                 console.out("\n[INTERRUPTED] Waiting for active threads to finish...")
-                # ThreadPoolExecutor's with-block handles shutdown
+                console.out("[INTERRUPTED] Checkpoint saved: every completed "
+                            "(config, patient) pair is in it and a resume will "
+                            "skip them.")
+                # ── THE CONFIGURATION IN FLIGHT IS RECORDED AS KILLED ──────
+                #
+                # WITHOUT THIS ITS ROW STAYS `RUNNING` FOREVER, which is the
+                # shape reserved for a process that had no chance to run a
+                # handler -- and this one did. The results under it are a PREFIX
+                # of the sample, and `_summary_status_warning` is what tells a
+                # later reader so; a row that never says how it ended cannot be
+                # distinguished from one whose study is still going.
+                #
+                # `_finalize_run` NEVER RAISES, which is what makes this safe to
+                # put in a handler. See RUN_RECORD_FAILURES.
+                # THE FINALIZE AND THE CLOSING BLOCK ARE THE OUTER GUARD'S,
+                # NOT THIS HANDLER'S, and moving them there is what closed a
+                # real gap: SIGTERM raises SystemExit, which this `except
+                # KeyboardInterrupt` does NOT catch, so a `docker stop` left
+                # the open configuration reading RUNNING forever and printed
+                # no closing block at all. Measured, before the move: exit
+                # 143, and the ablation_runs row still RUNNING. One handler
+                # for all three abrupt paths is the fix; this one keeps only
+                # what is specific to Ctrl-C.
+                # THE INTERRUPT IS RE-RAISED, AND IT USED TO BE SWALLOWED. The
+                # old handler set a flag and RETURNED NORMALLY -- so the study
+                # carried on to the NEXT CONFIGURATION, and, worse, the `with
+                # ThreadPoolExecutor` form above had already drained the rest of
+                # THIS one at a live billed call each on its way out. Both costs
+                # are exactly the batch runner's, which the stop-switch pass
+                # measured and re-raised for.
+                #
+                # WHAT IT REACHES: `except BaseException` below closes the
+                # parent tracking run FAILED and re-raises, which is the same
+                # thing oncotriage/batch/runner.py:main() does with a Ctrl-C --
+                # MLflow's three-member vocabulary has no STOPPED and no
+                # INTERRUPTED, and FAILED is the closest true statement it can
+                # carry for a study that did not finish.
+                #
+                # THE CHECKPOINT IS INTACT AND NOTHING HERE DELETES ANYTHING.
+                # Every completed pair was checkpointed by _on_done as it
+                # finished, and a cancelled one was never added.
+                raise
 
             finally:
                 progress.close()
                 console.detach_bar(_bar_token)
 
             # --- Step 5: Summary ---
+            #
+            # REACHED BY THE NORMAL PATH AND BY A STOP, AND NOT BY Ctrl-C, which
+            # re-raises above after printing the same block itself.
             study_elapsed = time.time() - study_start
+            # NOT `STOP_SWITCH.requested`. A stop that arrives while the LAST
+            # configuration's pairs are all in flight leaves nothing
+            # unattempted -- every configuration ran its whole sample -- and
+            # such a study has covered its work. Recording it STOPPED would
+            # withhold the summary and keep a checkpoint over a study with
+            # nothing left to resume, which is the batch runner's scenario C
+            # correction applied here. The stop is still ANNOUNCED either way,
+            # by the switch's own console block; what this decides is which of
+            # the two things it is reported as having cut short.
+            stopped = not study_covered
 
-            console.out()
-            console.out("=" * 70)
-            console.out(f"{Project_Name}: ABLATION STUDY SUMMARY")
-            console.out("=" * 70)
-            console.out(f"  Wall time:       {study_elapsed / 60:.1f} min")
-            console.out(f"  Completed:       {run_success + run_error}")
-            console.out(f"  Success:         {run_success}")
-            console.out(f"  Errors:          {run_error}")
-            console.out(f"  Database:        {ablation_db(db_path)}")
+            print_study_close(
+                STUDY_STATUS_STOPPED if stopped else STUDY_STATUS_COMPLETE,
+                study_elapsed, run_success, run_error, run_cancelled,
+                db_path=db_path)
 
-            # Checkpoint degradations, reported here rather than left in the
-            # scrollback (pass 20f-1, item 11a's shape). Printed only when there
-            # were any, matching INDEX_AGE_PARSE_FAILURES in
-            # oncotriage/retrieval/indexer.py -- a zero line every run trains a
-            # reader to skip it.
-            if CHECKPOINT_WRITE_FAILURES:
-                console.out(f"  Checkpoint:      "
-                  f"{sum(CHECKPOINT_WRITE_FAILURES.values())} write "
-                  f"degradation(s) {dict(CHECKPOINT_WRITE_FAILURES)} -- resume "
-                  f"state may be behind the rows already in the database")
-
-            report_checkpoint_faults()
-
-            if interrupted:
-                console.out(f"  Status:          INTERRUPTED (resume with same command)")
+            if stopped:
+                # NEITHER THE SUMMARY NOR THE CHECKPOINT CLEAR RUNS, and the
+                # second is the one that would cost money. clear_ablation_
+                # checkpoint() deletes the resume state, so on a stopped study
+                # it would throw away every completed (config, patient) pair and
+                # the next run would re-bill all of them -- at one live Stage 5
+                # call each. The summary is withheld for the reason
+                # print_study_close states: a stopped study covers a PREFIX of
+                # its configurations, and generate_summary() would overwrite
+                # ablation_summary.json with means computed over it.
+                #
+                # `--summary-only` REMAINS AVAILABLE and is the deliberate way
+                # to look at a prefix on purpose: it prints the table with
+                # _summary_status_warning's qualification above the deltas.
+                pass
             else:
                 summary_df = generate_summary(db_path=db_path)
                 clear_ablation_checkpoint(db_path=db_path)
@@ -1930,7 +3485,25 @@ def main():
             # the honest record: generate_summary() was not called, so there are no
             # per-config numbers to index, and inventing them from a partial
             # database would be the metric invention this pass forbids.
-            if interrupted:
+            # A STOPPED STUDY GETS NO CHILDREN AND A `KILLED` PARENT. That is
+            # the honest record: generate_summary() was not called, so there are
+            # no per-configuration numbers to index, and inventing them from a
+            # partial database would be the metric invention this pass forbids.
+            #
+            # `KILLED` AND NOT `STOPPED`, and the substitution is deliberate
+            # rather than a shortcut. tracking.RUN_STATUSES is MLflow's
+            # three-member vocabulary (FINISHED / FAILED / KILLED) and has no
+            # STOPPED; passing one would be silently replaced by FAILED, which
+            # reads as a study that broke. KILLED is MLflow's own "run killed by
+            # user" and is the closest true statement available.
+            # `oncotriage/batch/runner.py` makes exactly this substitution for
+            # exactly this reason, and records STOPPED in its own table where
+            # the vocabulary is this project's -- which here is
+            # ablation_runs.status.
+            #
+            # THE Ctrl-C PATH DOES NOT REACH THIS LINE: it re-raises above and
+            # the parent is closed FAILED by the `except BaseException` guard.
+            if stopped:
                 tracking.end_run(status="KILLED")
             else:
                 _summary_records = ([] if summary_df is None
@@ -1963,7 +3536,44 @@ def main():
 
             console.out("=" * 70)
             console.out()
-        except BaseException:
+        except BaseException as _exc:
+            # ══ THE ONE HANDLER FOR ALL THREE ABRUPT PATHS ═════════════════
+            #
+            # Ctrl-C (KeyboardInterrupt, re-raised by the handler above),
+            # SIGTERM (SystemExit, raised by the entry point's handler) and an
+            # ordinary crash all arrive here, and all three owe the same two
+            # things: a per-configuration row that says how it ended, and the
+            # closing block with the study's three degradation counters in it.
+            #
+            # IT USED TO OWE NEITHER TO SIGTERM. `except KeyboardInterrupt`
+            # does not catch SystemExit, so a `docker stop` exited 143 with the
+            # open configuration still reading RUNNING and no closing block --
+            # measured, which is what moved both here.
+            #
+            # STEP 5 IS NOT IN A `finally`, so nothing below the `try` runs on
+            # any of these paths. That is deliberate: Step 5 GENERATES THE
+            # SUMMARY and CLEARS THE CHECKPOINT, and doing either after a crash
+            # would overwrite ablation_summary.json with means over a prefix
+            # and then delete the resume state that makes the retry free.
+            #
+            # NOTHING HERE RAISES. `_finalize_run` never does (see
+            # RUN_RECORD_FAILURES), `print_study_close` only formats, and
+            # `tracking.end_run` swallows and counts -- so the exception that
+            # brought us here reaches the operator rather than being replaced
+            # by a failure in the code that was trying to explain it.
+            if open_run_id is not None:
+                _finalize_run(open_run_id, time.time() - study_start,
+                              RUN_STATUS_KILLED, db_path=db_path)
+                open_run_id = None
+            print_study_close(
+                STUDY_STATUS_INTERRUPTED
+                if isinstance(_exc, (KeyboardInterrupt, SystemExit))
+                else STUDY_STATUS_CRASHED,
+                time.time() - study_start,
+                run_success, run_error, run_cancelled, db_path=db_path)
+            # `FAILED` IS THE CLOSEST TRUE STATEMENT MLflow'S THREE-MEMBER
+            # VOCABULARY CAN CARRY for a study that did not finish, and it is
+            # what oncotriage/batch/runner.py:main() records for a Ctrl-C.
             tracking.end_run(status="FAILED")
             raise
 

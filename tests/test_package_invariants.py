@@ -4254,6 +4254,17 @@ _DECORATOR_INVENTORY = {
     # only when somebody runs one. Here it fails in bucket A.
     "oncotriage/batch/runner.py::exclusive_run_lock":
         ["contextlib.contextmanager"],
+    # The operator-control pass gave the ABLATION STUDY a lock of its own, for
+    # the reason the batch runner's has one and with a larger multiplier: a
+    # study's unit is a (config, patient) PAIR, so two overlapping studies pay
+    # for the same patient once per configuration. A SEPARATE definition rather
+    # than an import of the runner's -- importing it would put the whole batch
+    # module in every study's import graph, and the two refusals are raised by
+    # different programs and remediated with different commands. This entry
+    # makes the DECORATOR's loss visible in bucket A rather than as an
+    # AttributeError on a generator at the top of a paid study.
+    "oncotriage/ablation/study.py::exclusive_run_lock":
+        ["contextlib.contextmanager"],
     "oncotriage/retrieval/indexer.py::get_embeddings_batch._call": [
         "retry(reraise=True, stop=stop_after_attempt(5), "
         "wait=wait_exponential(multiplier=1, min=2, max=60), "

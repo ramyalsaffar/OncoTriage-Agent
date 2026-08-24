@@ -799,6 +799,39 @@ BUCKETS = {
         "sections 4-6 make real Qdrant round trips; died resolving a bundle path"),
 
     # ---- E: needs uncommitted data ----------------------------------------
+    "test_ablation_stop_and_lock.py": (
+        _A, None,
+        # DERIVED BY RUNNING against a skeleton provisioned by
+        # provision_ci_paths.py, not from its imports.
+        "ran green in ~70s, 107 checks: the ablation study's run lock, stop "
+        "switch, ablation_runs.status vocabulary, executor lifecycle and both "
+        "signal dispositions. THE ENTRY POINT IS DRIVEN AS A REAL SUBPROCESS "
+        "-- the subprocess IS `python \"26- Ablation Study.py\"`, so the "
+        "__main__ guard that takes the lock and installs the SIGTERM handler "
+        "is the shipped one -- with REAL SIGINT and SIGTERM and TWO REAL "
+        "CONCURRENT invocations for the lock, because a signal cannot be "
+        "delivered to the process asserting about it and a lock held by one "
+        "process cannot be observed from inside it. The four stand-ins arrive "
+        "through a usercustomize hook rather than runpy or exec, which section "
+        "1c of test_package_invariants.py forbids. No network, no keys, NO "
+        "SPEND, no live Qdrant, no model load (ONCOTRIAGE_DEFER_LOCAL_MODELS "
+        "is set above the imports and in every subprocess environment), no "
+        "corpus -- the sample is fabricated by a stand-in stratified_sample -- "
+        "no git history and no live server. match_patient_ablation is a "
+        "stand-in that PARKS and THE GRAPH IS NEVER INVOKED, so no billed call "
+        "is reachable; main(), the configuration loop, _on_done, _create_run, "
+        "_finalize_run, log_ablation_result, save/load_ablation_checkpoint, "
+        "generate_summary and both shutdown handlers are the real thing. Every "
+        "subprocess is additionally handed ONCOTRIAGE_QDRANT_URL pointed at a "
+        "closed port, so even an unstubbed run cannot bill. THE SIGINT "
+        "DISPOSITION IS RESTORED IN THE CHILD AND ASSERTED: a shell that "
+        "backgrounds a job hands its children SIG_IGN and CPython keeps it, so "
+        "without that the Ctrl-C scenario would silently measure nothing. NOT "
+        "in the collision matrix: every database, checkpoint, sentinel and "
+        "control file is inside a tempfile.mkdtemp it removes and asserts "
+        "gone, and the two repository files it reads (ablation/study.py, "
+        "26- Ablation Study.py) are written by neither of the suite's two "
+        "writers and are sha256-compared at the end. IT EXECS NOTHING"),
     "test_ablation_db_isolation.py": (
         _E, "the production ablation_results.db",
         "'the digest is a real one, not absent on both sides (non-degeneracy)' failed"),

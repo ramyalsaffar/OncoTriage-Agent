@@ -1176,6 +1176,34 @@ be worse.
 # "we stopped in the middle of this patient" by which prefix is there.
 SHUTDOWN_SKIP_WARMUP_KEY_PREFIX = "warmup:"
 SHUTDOWN_SKIP_WAVE_KEY_PREFIX = "wave:"
+SHUTDOWN_SKIP_SEND_KEY_PREFIX = "send:"
+"""A request the SEND LOOP declined to issue. The third phase, and the one that
+covers the arm that ships.
+
+IT IS NOT ``wave:``. ``wave:`` is a per-trial worker declining a task that was
+already SUBMITTED to the wave's pool -- N of them at once, off the node thread.
+This is the node's own thread declining the next SEQUENTIAL call of a patient,
+which is what grouped mode does exclusively and what per-trial mode does only
+for a chunk the reactive splitter built after dispatch. The two answer different
+operator questions: how much of an in-flight wave was saved, against how many
+further chunks a patient never sent -- and an operator reading a stopped run's
+report should not have to know which arm was configured to read the number.
+
+THE THREE PREFIXES PARTITION THE PLACES A STAGE 5 REQUEST CAN BE DECLINED, and
+``SHUTDOWN_SKIP_KEY_PREFIXES`` below is what makes that statement checkable
+rather than a comment.
+"""
+
+SHUTDOWN_SKIP_KEY_PREFIXES = (SHUTDOWN_SKIP_WARMUP_KEY_PREFIX,
+                              SHUTDOWN_SKIP_WAVE_KEY_PREFIX,
+                              SHUTDOWN_SKIP_SEND_KEY_PREFIX)
+"""Every phase ``STAGE5_SHUTDOWN_SKIPS`` can be keyed by. Closed.
+
+A reader that groups this counter by phase may branch on it exhaustively, and a
+fourth gate added without a member here fails
+``tests/test_agent_stage5_per_trial_calls.py`` rather than arriving in an
+operator's report as an unclassified key.
+"""
 
 
 class PerTrialParallelismError(RuntimeError):
@@ -4685,6 +4713,44 @@ CLINICAL TRIALS:
         composition promise rather than a fallback nobody expects to take: the
         reactive splitter builds new chunks after dispatch, and they are
         supposed to be sent.
+
+        ── THE SHUTDOWN GATE, AND WHY IT IS HERE AND NOT AT THE LOOP TOP ──
+
+        THE GAP THIS CLOSES IS THE ARM THAT SHIPS. Until this existed the flag
+        bounded the per-trial WAVE and nothing else, and
+        ``MATCHING_PER_TRIAL_CALLS_ENABLED`` is False -- so a batch run stopped
+        by Ctrl-C or SIGTERM had its grouped patients carry on issuing every
+        REMAINING chunk of the packer's plan, sequentially, each bounded only by
+        ``MATCHING_REQUEST_TIMEOUT_SECONDS`` and the SDK's own retries. One
+        chunk is the common case and it is not the bound: the proactive packer
+        splits on the input budget and the reactive splitter halves on a
+        ``length`` finish, so a patient can hold several unsent chunks at the
+        moment an operator stops the run. Every one of them was full price.
+
+        IT GATES THE ISSUE, NOT THE ITERATION. A gate at the top of the send
+        loop would decline chunks whose responses are ALREADY IN
+        ``_prefetched`` -- paid for, sitting in memory, waiting to be read --
+        and throwing those away is the opposite of what a shutdown is for. Here
+        the prefetched branch above has already returned, so only a call that
+        would really reach the provider is declined. In grouped mode
+        ``_prefetched`` is None and every call comes through this line, so the
+        gate is total there.
+
+        IT IS READ AS A MODULE GLOBAL for ``_issue``'s reason: the value is set
+        on another thread, or in a signal handler, while this node is already
+        running, so it has to be read at the moment the request would go out.
+
+        WHAT THE CALLER DOES WITH IT IS THE c33 LESSON, UNCHANGED AND NOW
+        SHARED. ``Stage5ShutdownRequested`` is the one exception the send
+        loop's ``except`` may not isolate to its chunk: isolating it records the
+        un-issued trials as not evaluable and lets the patient COMPLETE, and
+        ``_on_done`` checkpoints a completed patient -- so a resume would skip
+        it forever with part of its cohort never judged. In grouped mode that
+        isolation branch is unreachable anyway (it is guarded by
+        ``_per_trial_calls``), so the raise falls straight through to the
+        API-error return and the patient fails honestly. Which is the same
+        outcome per-trial mode reaches, by the same exception, for the same
+        reason.
         """
         if _prefetched is not None:
             outcome = _prefetched.pop(_chunk_key(chunk), None)
@@ -4693,6 +4759,17 @@ CLINICAL TRIALS:
                 if status == "error":
                     raise payload
                 return payload
+        if _SHUTDOWN_REQUESTED:
+            STAGE5_SHUTDOWN_SKIPS[
+                f"{SHUTDOWN_SKIP_SEND_KEY_PREFIX}"
+                f"{_SHUTDOWN_REASON or 'unspecified'}"] += 1
+            log.warning("a Stage 5 request was not issued because a shutdown "
+                        "was requested", stage=5, status="stopped",
+                        event="stage5_send_declined",
+                        reason=_SHUTDOWN_REASON, count=len(chunk),
+                        degraded=True)
+            raise Stage5ShutdownRequested(
+                f"the request was not issued: {_SHUTDOWN_REASON}")
         return call_matching_model(system_prompt, _user_prompt_for(chunk))
 
     def _account_unconsumed() -> int:

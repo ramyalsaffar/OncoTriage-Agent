@@ -537,13 +537,81 @@ try:
     check("1m-f ...and the owner was restored by identity",
           _runner.stop_switch_path is _saved_owner, True)
 
-    check("1n  clear_stop_switch() removes it and reports that there was one",
+    # THE RETURN IS A CLOSED THREE-MEMBER VOCABULARY, NOT A BOOL (the
+    # operator-control pass). `False` used to mean "there was nothing to
+    # clear" -- and once the unlink could FAIL rather than raise uncaught, it
+    # would have meant that AND "there is one and I could not remove it", with
+    # one line of entry-point output covering both. The second is the dangerous
+    # one: `--clear-stop` deliberately SKIPS the stale-sentinel preflight, so a
+    # failed clear reported as "nothing to clear" starts the run with the
+    # sentinel in place, trips it at the first completed patient, and stops
+    # again -- after billing that patient -- for a request just withdrawn.
+    check("1n  clear_stop_switch() removes it and reports that there WAS one",
           (drive_call(_runner.clear_stop_switch), os.path.exists(_stop_path)),
-          (True, False))
-    check("1n-b ...and reports False when there was nothing to clear, which is "
-          "what lets the entry point say so rather than implying it deleted "
+          (_runner.STOP_CLEAR_REMOVED, False))
+    check("1n-b ...and reports ABSENT when there was nothing to clear, which "
+          "is what lets the entry point say so rather than implying it deleted "
           "something",
-          drive_call(_runner.clear_stop_switch), False)
+          drive_call(_runner.clear_stop_switch), _runner.STOP_CLEAR_ABSENT)
+    check("1n-b-i the vocabulary is closed and its members are distinct, so a "
+          "caller may branch on it exhaustively",
+          (_runner.STOP_CLEAR_OUTCOMES,
+           len(set(_runner.STOP_CLEAR_OUTCOMES))),
+          ((_runner.STOP_CLEAR_REMOVED, _runner.STOP_CLEAR_ABSENT,
+            _runner.STOP_CLEAR_FAILED), 3))
+
+    # ── A DIRECTORY THE RUN CAN READ AND CANNOT WRITE ──────────────────────
+    #
+    # DRIVEN FOR REAL rather than by patching `unlink` to raise: the condition
+    # is created on disk with `chmod`, so what is measured is the shipped
+    # function meeting a real PermissionError. This is the defect the pass was
+    # asked to close -- `path.unlink()` raised uncaught, and the operator's
+    # diagnosis was a traceback ending in Errno 13, printed INSTEAD of the run
+    # they asked for.
+    #
+    # SKIPPED WHEN RUNNING AS ROOT, and that is not a convenience: root ignores
+    # the mode bits, so the unlink SUCCEEDS and the scenario cannot be built at
+    # all. Reporting that as a pass would be a check that has stopped checking.
+    _ro_dir = os.path.join(_TMP, "readonly-cp")
+    os.makedirs(_ro_dir, exist_ok=True)
+    _ro_stop = os.path.join(_ro_dir, _runner.STOP_FILENAME)
+    with open(_ro_stop, "w", encoding="utf-8") as _fh:
+        _fh.write("stopping for the index rebuild")
+    _paths._RESOLVED["checkpoint_path"] = _ro_dir + os.sep
+    os.chmod(_ro_dir, 0o500)
+    try:
+        _probe = os.path.join(_ro_dir, ".probe")
+        try:
+            open(_probe, "w").close()
+            os.unlink(_probe)
+            _readonly_real = False
+        except OSError:
+            _readonly_real = True
+        check("1n-d the directory really is unwritable (non-degeneracy: as "
+              "root the mode bits are ignored and the whole scenario below "
+              "would measure nothing)", _readonly_real, True)
+        if _readonly_real:
+            _faults_before = dict(_runner.STOP_SWITCH_FAULTS)
+            _outcome = drive_call(_runner.clear_stop_switch)
+            check("1n-e clear_stop_switch() REPORTS the failure instead of "
+                  "raising, so the operator gets a diagnosis rather than a "
+                  "traceback printed instead of their run",
+                  _outcome, _runner.STOP_CLEAR_FAILED)
+            check("1n-f ...and the sentinel is still there, which is why the "
+                  "outcome may not be reported as ABSENT",
+                  os.path.exists(_ro_stop), True)
+            _new_keys = {k: v for k, v in _runner.STOP_SWITCH_FAULTS.items()
+                         if v != _faults_before.get(k)}
+            check("1n-g ...and it is counted under its OWN `clear:` phase. "
+                  "`poll:` means the run may have kept going THROUGH a stop; "
+                  "this means an operator asked to RESUME and the sentinel is "
+                  "still there -- opposite directions, different fixes",
+                  (sorted(_new_keys), all(k.startswith("clear:")
+                                          for k in _new_keys)),
+                  (["clear:PermissionError"], True))
+    finally:
+        os.chmod(_ro_dir, 0o700)
+        _paths._RESOLVED["checkpoint_path"] = _CP_DIR + os.sep
     check("1n-c ...and it does NOT touch the checkpoint or the results file: "
           "clearing a control file and discarding a run's resume state are "
           "opposite operations and must not be one flag apart",

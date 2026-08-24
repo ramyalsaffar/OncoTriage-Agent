@@ -122,6 +122,8 @@ from oncotriage.agent.evaluation import request_stage5_shutdown
 from oncotriage.batch.runner import (
     AlreadyRunning,
     EXIT_LOCKED,
+    STOP_CLEAR_ABSENT,
+    STOP_CLEAR_FAILED,
     StaleStopSwitch,
     assert_no_stale_stop_switch,
     clear_checkpoint,
@@ -510,9 +512,28 @@ if __name__ == "__main__":
             # trap the SIGTERM handler above documents having MEASURED, which
             # is why it uses a raw os.write.
             if _args.clear_stop:
-                if not clear_stop_switch():
+                # ALL THREE OUTCOMES ARE BRANCHED ON, and the third is why the
+                # return stopped being a bool. `--clear-stop` SKIPS the stale
+                # sentinel preflight above -- deliberately; it is the gesture
+                # that refusal names -- so a clear that FAILED and was reported
+                # as "nothing to clear" would start the run with the sentinel
+                # still there. It would then trip at the first completed
+                # patient and stop again, after billing that patient, for a
+                # request the operator had just withdrawn.
+                #
+                # SO A FAILED CLEAR REFUSES, with the same exit code and the
+                # same "nothing has been billed" standing as the preflight it
+                # stood in for. clear_stop_switch() has already printed the
+                # diagnosis and the `rm`; this only decides not to run.
+                _cleared = clear_stop_switch()
+                if _cleared == STOP_CLEAR_ABSENT:
                     console.out(f"[--clear-stop] No stop sentinel at "
                                 f"{stop_switch_path()}; nothing to clear.")
+                elif _cleared == STOP_CLEAR_FAILED:
+                    console.out("[--clear-stop] REFUSING TO RUN: the sentinel "
+                                "is still there. NOTHING HAS BEEN RUN AND "
+                                "NOTHING HAS BEEN BILLED.")
+                    sys.exit(1)
 
             if _args.fresh:
                 # Announced before it happens, not after: this is a

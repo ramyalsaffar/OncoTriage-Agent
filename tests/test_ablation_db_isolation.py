@@ -216,7 +216,13 @@ def _drive_writers(db_path):
         run_id = _study._create_run("full_pipeline", "probe", 1)
         _study.log_ablation_result(run_id, "full_pipeline", _PATIENT, _RESULT,
                                    _FLAGS)
-        _study._finalize_run(run_id, 1.0)
+        # `status` IS REQUIRED AND HAS NO DEFAULT (the operator-control pass):
+        # every plausible default is a claim, and COMPLETE would let a caller
+        # that forgot record a STOPPED configuration as a finished one, which is
+        # the single thing ablation_runs.status exists to make impossible. Both
+        # arms pass the same member, so the two still differ in exactly the
+        # thing under test.
+        _study._finalize_run(run_id, 1.0, _study.RUN_STATUS_COMPLETE)
         _study.generate_summary()
     else:
         _study.init_ablation_db(db_path=db_path)
@@ -224,7 +230,8 @@ def _drive_writers(db_path):
                                     db_path=db_path)
         _study.log_ablation_result(run_id, "full_pipeline", _PATIENT, _RESULT,
                                    _FLAGS, db_path=db_path)
-        _study._finalize_run(run_id, 1.0, db_path=db_path)
+        _study._finalize_run(run_id, 1.0, _study.RUN_STATUS_COMPLETE,
+                             db_path=db_path)
         _study.generate_summary(db_path=db_path)
 
 

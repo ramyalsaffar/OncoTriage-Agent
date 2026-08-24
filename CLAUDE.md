@@ -579,7 +579,7 @@ python tests/test_dashboard_app_integration.py                     # 110 (this l
 # of its argument -- including a control MODULE written to that temp directory
 # and PARSED, never imported -- an ast walk, or a registry entry removed inside
 # try/finally with the restore asserted. Bucket A, ~3 s.
-python tests/test_degradation_counter_readers.py                    # 138
+python tests/test_degradation_counter_readers.py                    # 152 (was 138; the operator-control pass added the two new dual-owned counters and replaced the adjacency pin on report_checkpoint_faults with a transitive call-graph walk)
 
 # The Docker pass. Same shape, same directory. No network, no keys, no spend,
 # and no Docker daemon: every Qdrant client is a stand-in and section 1's
@@ -772,7 +772,7 @@ python tests/test_runner_sigterm_shutdown.py                        #  86 (was 7
 # unreachable and the money case cannot be measured), and a successful patient
 # makes the real save_checkpoint resolve the stamp over the wire. NOT in the
 # collision matrix. It EXECS NOTHING. Bucket A, ~14 s.
-python tests/test_runner_stop_switch.py                             # 133 (was 122; the pre-migration pass reversed scenario C -- a stop that lands in the RESAMPLE pass is FINISHED, not STOPPED -- and added section 5b, its control)
+python tests/test_runner_stop_switch.py                             # 138 (was 133; the operator-control pass added the read-only-directory diagnosis and the three-member clear vocabulary. Before that 122; the pre-migration pass reversed scenario C -- a stop that lands in the RESAMPLE pass is FINISHED, not STOPPED -- and added section 5b, its control)
 
 # The pre-migration pass. Same shape, same directory. No network, no keys, NO
 # SPEND, no live Qdrant, no model load, no corpus, no git history, no live
@@ -843,7 +843,7 @@ python tests/test_agent_cross_encoder_sequence_limit.py             #  42
 # the suite's two writers and are sha256-compared at the end. It DOES exec:
 # twenty-four in-memory copies of agent/evaluation.py, one plant each, argued
 # at _EXEC_ALLOWLIST. Bucket A, ~4 s.
-python tests/test_agent_stage5_per_trial_calls.py                   # 276 (was 255; the pre-migration pass added section 8B over the Stage 5 shutdown flag and controls c32-c35. ~10 s: section 3d parks two workers for a bounded grace on each of its two arms)
+python tests/test_agent_stage5_per_trial_calls.py                   # 283 (was 276; the operator-control pass rewrote 8b-r from a pinned limit to the grouped gate's contract and added c36. Before that 255; the pre-migration pass added section 8B over the Stage 5 shutdown flag and controls c32-c35. ~10 s: section 3d parks two workers for a bounded grace on each of its two arms)
 
 # The harness-budget pass. Same shape, same directory. No network, no keys, no
 # spend, NO LIVE SERVER and no live Qdrant -- it starts nothing and issues no
@@ -6783,6 +6783,221 @@ to a pass that can measure it. And an interrupt still discards the responses
 already resolved into `_prefetched` — nothing catches KeyboardInterrupt, which
 is correct, and writing a ledger from a signal handler is a separate decision.
 
+
+### The operator controls reach the ablation study and the grouped arm (the operator-control pass)
+
+**TWO SURFACES ROUND THREE LEFT UNCOVERED, AND ONE OF THEM IS THE HARNESS THE
+THREE-ARM MIGRATION MEASUREMENT RUNS THROUGH.** `oncotriage/ablation/study.py`
+had none of the controls `25- Batch Runner.py` has -- no run lock, no stop
+switch, a `with ThreadPoolExecutor` that DRAINED the rest of a configuration on
+any exception, a `KeyboardInterrupt` that was caught and NOT re-raised so the
+loop carried on to the NEXT configuration, and no SIGTERM disposition at all --
+and the GROUPED send arm, which is the one that ships
+(`MATCHING_PER_TRIAL_CALLS_ENABLED` is False), consulted the Stage 5 shutdown
+flag nowhere.
+
+**NO BILLED CALL WAS MADE.** `python fixture_replay.py` is **12/12 clean, exit
+0, with no recapture**, the production `inferences.db` sha256 is unchanged, and
+the production `ablation_results.db` sha256 is unchanged -- the new
+`ablation_runs.status` column appears there on the next run that opens it,
+which is what the additive mechanism is for.
+
+**1. THE GROUPED ARM IS GATED, AND THE DRAIN IT LEFT OPEN WAS MEASURED RATHER
+THAN ARGUED.** The gate is in `_obtain`, immediately above the live call and
+BELOW the prefetched branch -- so only a request that would really reach the
+provider is declined, and a per-trial response already paid for and sitting in
+`_prefetched` is still consumed. Driven through the real node with a stub
+client at `MAX_TRIALS_FOR_EVALUATION = 15`:
+
+| criteria chars/trial | 1000 | 2000 | 4000 | 6000 | 8000 | 12000 |
+|---|---|---|---|---|---|---|
+| chunks per patient | 1 | 2 | 3 | 4 | 5 | 5 |
+
+so a grouped patient in flight when an operator pressed Ctrl-C carried on
+issuing **up to four further full-price requests**, and was then published as a
+SUCCESS carrying all fifteen verdicts. Measured both arms at 15 trials of 8000
+characters: **4 further requests before the gate and 0 after it**, with the
+patient failing honestly instead. `_on_done` checkpoints a success, so the
+published-partial shape is the c33 defect reached from the arm that ships -- a
+resume would skip that patient forever.
+
+**`SHUTDOWN_SKIP_SEND_KEY_PREFIX` IS A THIRD PHASE AND NOT A REUSE OF `wave:`.**
+`wave:` is a per-trial worker declining an already-SUBMITTED task, N at once,
+off the node thread; `send:` is the node's own thread declining the next
+SEQUENTIAL call. `SHUTDOWN_SKIP_KEY_PREFIXES` is the closed tuple that makes
+"these three partition the places a request can be declined" checkable.
+
+**CHECK 8b-r WAS REWRITTEN FROM A PINNED LIMIT TO THE NEW CONTRACT**, and the
+note it carried is kept at the check as the record of what changed. It read
+"GROUPED MODE IS NOT GATED, and that is a stated limit rather than an
+oversight". The limit was real and it covered the arm that ships. Four checks
+replace it (8b-r/s/t/u), plus **8b-v, the non-degeneracy probe without which
+`len(requests) == 0` would also be satisfied by a node that raised before its
+first call**, and control **c36**, which plants the gate out of an in-memory
+copy and requires all `_BASE_CHUNKS` requests to go out and the patient to be
+published as a success.
+
+**THE `docker-compose.yml` ARITHMETIC COMMENT WAS WRONG IN A WAY THE
+MEASUREMENT EXPOSED, and correcting it is worth more than the gate.** It said
+`stop_grace_period: 620s` "COVERS THE GROUPED ARM ... one request per patient,
+so one in-flight call". Grouped mode is one request per **chunk**, so a
+`docker stop` on `fastapi` can SIGKILL it with up to four further full-price
+requests still to issue -- 2400 s of drain against a 620 s grace. **The number
+is NOT raised**, because this service has no shutdown gate at all and giving it
+one is the fix; the arithmetic is now written down beside the follow-up it
+already was. The comment's OTHER claim -- that the batch runner's handler bounds
+its drain "whichever arm it is on" -- was false before this pass and is true
+after it.
+
+**2. THE ABLATION STUDY HAS THE FIVE CONTROLS, ADAPTED RATHER THAN COPIED.**
+
+| control | how it differs from the batch runner's, and why |
+|---|---|
+| **the run lock** | keyed on the **checkpoint FILE**, not its directory. The batch runner has one checkpoint so its key is the directory; this one's checkpoint follows `--db` (pass 20f-3), so two independent `--db` studies in `/tmp` must not refuse each other. And the lock **filename prefix** differs -- with no `--db` the study's state directory IS `paths.checkpoint_path`, so a shared lock file would make a batch run and an ablation study block each other |
+| **the stop sentinel** | **DERIVED from the checkpoint path** (`<stem>_STOP`), so it is per database exactly as the checkpoint is, and **deliberately not named `STOP`**: sharing the batch runner's name would make each harness's stale-sentinel refusal fire for a request made of the other program and name the wrong `--clear-stop` |
+| **the granularity** | polled between **configurations** AND between **pairs**. Between-configurations alone would be useless: one configuration is `sample_size` live calls, ~30 minutes at the default and one seventh of a full study. The coarse poll's job is that a stop in config 3 of 7 leaves 4-7 with no `ablation_runs` row to explain later |
+| **the terminal state** | `ablation_runs` **had no status column and no status convention at all** -- the brief's "per the ablation database's own status conventions" named something that did not exist. `RUN_STATUSES` is `RUNNING / COMPLETE / STOPPED / KILLED`, additive, NULL for pre-migration rows and never backfilled |
+| **`_finalize_run`** | takes `status` as a **required** argument with no default (`empty_database(db_path, flag)`'s precedent), **reads `rowcount`** (an `UPDATE` against an absent id succeeds and updates nothing), **refuses an unrecognised status rather than storing it**, and **never raises** -- it runs inside two shutdown handlers whose job is to leave a record |
+
+**WHY THE STATUS IS LOAD-BEARING RATHER THAN TIDY.** `generate_summary()`
+reports the LATEST `ablation_runs` row per config and joins its results by
+`run_id`. A configuration cut short IS the latest for its config and its
+results are a PREFIX of the sample -- so every mean over it was printed beside
+the other configurations' full-sample means as though comparable, with nothing
+in the database able to say which rows those were.
+`_summary_status_warning` names them **between the table and the deltas**;
+it does **not** filter them, on `print_cost_by_model`'s "<- A FLOOR, NOT A
+TOTAL" precedent: filtering would change which rows every historical comparison
+rests on, silently, and would answer a partial configuration with nothing at all.
+
+**"A STOP WAS SEEN" IS NOT "THIS CONFIGURATION WAS CUT SHORT", AND THE NAIVE
+PORT REPRODUCED A DEFECT THIS PROJECT HAD ALREADY FIXED ONCE.** The first
+version wrote `RUN_STATUS_STOPPED if STOP_SWITCH.requested`. That is the
+question the pre-migration pass had to remove from `oncotriage/batch/runner.py`
+-- whether a sentinel was SEEN, rather than whether the work was COVERED. A
+stop arriving while every pair of a configuration is already IN FLIGHT lets all
+of them finish: nothing cancelled, nothing unsubmitted, results the WHOLE
+sample. **Found by running**: the resume scenario reported `full_pipeline`
+STOPPED and could never repair it, because a resume SKIPS a configuration whose
+pairs are all checkpointed and therefore never writes a COMPLETE row for it --
+so `_summary_status_warning` would have warned about a prefix that did not
+exist, permanently. The status is now `pairs_unsubmitted == 0 and
+config_cancelled == 0`, and the STUDY-level `stopped` is `not study_covered`
+for the same reason.
+
+**3. ONE HANDLER FOR ALL THREE ABRUPT PATHS, AND THAT WAS ALSO FOUND BY
+RUNNING.** The first version put the finalize and the closing block in the
+`except KeyboardInterrupt`. **`except KeyboardInterrupt` does not catch
+`SystemExit`**, which is what the entry point's SIGTERM handler raises -- so a
+`docker stop` exited 143 with the open configuration still reading `RUNNING`
+and printed no closing block at all. Measured, then moved: the outer
+`except BaseException` finalizes the open configuration KILLED, prints the
+block, closes the tracking run FAILED and re-raises. `STUDY_STATUS_CRASHED` is
+separate from `STUDY_STATUS_INTERRUPTED` because both reach that handler and
+only one is a defect.
+
+**THE COUNTERS ARE HOISTED ABOVE THE OUTER `try`** precisely because that
+handler now reads them: an exception in the first few statements (tqdm's
+constructor is one) would otherwise meet an unbound local and replace the
+study's diagnosis with a `NameError` about a counter.
+
+**`print_study_close` IS ONE TEXT WITH TWO CALLERS**, and it is where the
+study's three counters are read. Before it existed the Ctrl-C path skipped the
+closing block entirely, so an interrupted study reported **none of its
+degradations** -- which is the whole reason those counters have a reader in
+that file at all (`oncotriage/degradation.py` excludes them by name).
+
+**`--summary-only` IS EXEMPT FROM THE STALE-SENTINEL REFUSAL, and the exemption
+is as narrow as it can be.** That mode runs nothing and bills nothing, so the
+refusal's premise is false of it -- and its remediation would tell an operator
+to delete a sentinel they had not withdrawn just to LOOK at what the stopped
+study produced, making the natural next command after a stop the one command
+that un-stops the next study. **`--fresh-start` puts the refusal back** even
+combined with it, because that flag deletes the resume state whatever else the
+invocation does.
+
+**THE ENTRY POINT CALLS `parse_args()` TWICE, AND IT IS ARGUED.** The lock key
+depends on `--db` and the lock must be held before `main()` runs its preflight
+and its `--fresh-start`, but `main()` owns its own parser (unlike the batch
+runner, whose guard does). argparse is a pure function of argv, so the second
+parse cannot disagree with the first, and a bad argv exits 2 having touched
+nothing. Hoisting the whole parser into the guard would change `main()`'s
+signature, which is a redesign of a file whose contract is that it takes none.
+
+**4. `clear_stop_switch` NO LONGER RAISES, AND ITS RETURN STOPPED BEING A
+BOOL.** `path.unlink()` on a checkpoint directory the run can read and cannot
+write raises `PermissionError`, uncaught -- the operator's diagnosis was a
+traceback ending in `Errno 13`, printed INSTEAD of the run they asked for. It
+catches `Exception` and not `OSError`, and the difference is a real case:
+`stop_switch_path()` reads `paths.checkpoint_path`, which globs the sibling
+tree and raises a plain `RuntimeError` when it matches nothing or several.
+
+**THE BOOL WAS THE DANGEROUS HALF.** `False` meant "there was nothing to
+clear", and once the unlink could fail it would have meant that AND "there is
+one and I could not remove it" -- with one line of entry-point output covering
+both. `--clear-stop` deliberately SKIPS the stale-sentinel preflight, so a
+failed clear reported as "nothing to clear" starts the run with the sentinel in
+place, trips it at the first completed patient, and stops again after billing
+that patient. `STOP_CLEAR_OUTCOMES` is the closed three-member vocabulary and
+both entry points **refuse to run** on `STOP_CLEAR_FAILED`.
+
+**5. A COUNTER-REGISTRY CONFLATION WAS FOUND BY READING, NOT BY A FAILING
+TEST.** The study's new `STOP_SWITCH_FAULTS` and `RUN_RECORD_FAILURES` share
+names with counters already registered by `oncotriage/batch/runner.py` and
+`oncotriage/storage/database_logger.py`, and
+`tests/test_degradation_counter_readers.py` section 1 short-circuits on
+`_name in _registered` -- so **the section passed with two brand-new
+write-only counters in the package**, crediting another module's registration
+to them. That is exactly the conflation `_DUAL_OWNED` exists to prevent,
+arrived at twice; both are in it now, and the follow-up checks are **driven
+from the table** rather than written out per name, so a fourth dual-owned
+counter cannot be added without being subjected to them.
+
+**AND ONE PINNED CHECK WENT STALE FOR A REFACTOR THAT PRESERVED ITS PROPERTY.**
+That file required `report_checkpoint_faults` to be a DIRECT statement of
+`main()`; the reader moved one frame down into `print_study_close`. The
+property is that the reader RUNS WHEN A STUDY ENDS, and which function contains
+the call is an implementation detail -- so the check is a **transitive
+call-graph walk** over the module's own top-level functions now, with controls
+in both directions.
+
+```bash
+# The operator-control pass. Same shape, same directory. No network, no keys,
+# NO SPEND, no live Qdrant, no model load, no corpus, no git history, no live
+# server -- match_patient_ablation, the BM25 index, the graph, the tracking
+# module and run_fingerprint.current are stand-ins and THE GRAPH IS NEVER
+# INVOKED; every subprocess is additionally handed ONCOTRIAGE_QDRANT_URL
+# pointed at a closed port. It uses REAL SUBPROCESSES, REAL SIGNALS and TWO
+# REAL CONCURRENT invocations, because a signal cannot be delivered to the
+# process asserting about it and a lock held by one process cannot be observed
+# from inside it. NOT in the collision matrix. It EXECS NOTHING. Bucket A,
+# ~55 s.
+python tests/test_ablation_stop_and_lock.py                       # 107
+```
+
+**THE FOREGROUND-SIGNAL LESSON IS CLOSED IN CODE RATHER THAN BY A CONVENTION,
+and it is written down here because it was not written down anywhere.** A shell
+that backgrounds a job sets SIGINT to `SIG_IGN` for it, children INHERIT that
+disposition, and **CPython does not override an inherited `SIG_IGN` at
+startup**. So a signal-driving test launched in the background starts children
+that are DEAF to SIGINT: the scenario delivers a signal that does nothing, the
+run completes, and the shipped fix is reported as broken. "Do not background
+it" is an unenforced convention; the `usercustomize` hook restores
+`default_int_handler` in the child and **check 6b asserts the disposition it
+ended up with**, so a scenario that cannot be built is a recorded failure and
+never a pass.
+
+**THREE DEFECTS IN THIS PASS'S OWN TEST CODE WERE FOUND BY RUNNING, NOT BY
+READING.** (i) The harness waited for a shutdown handler's log marker BEFORE
+releasing the parked workers -- but both handlers print only once those workers
+have returned, so the wait timed out and a working handler was reported as one
+that never ran. (ii) A `return` inside the `try` ran the `finally`, which
+**killed the very process the lock scenario was meant to hold** -- the holder's
+log was empty and its `poll()` was already an integer, so the refusal it was
+supposed to measure could not happen. (iii) The two lock invocations shared a
+state directory AND their control files, so the second wrote the `release` flag
+the first was parked on, freed the holder, and then took the lock it was
+supposed to be refused.
 
 ### Seven pre-migration findings (the pre-migration pass)
 

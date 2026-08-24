@@ -375,8 +375,22 @@ _READER_EXEMPTIONS = {
 # registered and the other is exempt", and the audit script that produced this
 # file got exactly that wrong on its first run and credited the batch runner's
 # reader to the study's counter.
+#
+# THE OPERATOR-CONTROL PASS ADDED TWO MORE, AND IT FOUND THEM BY READING RATHER
+# THAN BY FAILING. `oncotriage/ablation/study.py` grew a STOP_SWITCH_FAULTS and
+# a RUN_RECORD_FAILURES of its own; both names were ALREADY in the registry --
+# the first from `oncotriage/batch/runner.py`, the second from
+# `oncotriage/storage/database_logger.py` -- so the `_name in _registered`
+# branch below credited another module's registration to the study's counter and
+# this section PASSED with two brand-new write-only counters in the package.
+# That is the exact conflation this table exists to prevent, arrived at twice.
 _DUAL_OWNED = {"CHECKPOINT_FAULTS": {"oncotriage/batch/runner.py": "registered",
-                                     "oncotriage/ablation/study.py": "exempt"}}
+                                     "oncotriage/ablation/study.py": "exempt"},
+               "STOP_SWITCH_FAULTS": {"oncotriage/batch/runner.py": "registered",
+                                      "oncotriage/ablation/study.py": "exempt"},
+               "RUN_RECORD_FAILURES": {
+                   "oncotriage/storage/database_logger.py": "registered",
+                   "oncotriage/ablation/study.py": "exempt"}}
 
 _SCRIPTS = [f for f in top_level_scripts(_ROOT)
             if os.path.basename(f) not in ("setup.py",)]
@@ -422,15 +436,32 @@ for _name, (_owner, _reader, _why) in sorted(_READER_EXEMPTIONS.items()):
                f"({_why})",
                isinstance(_counts, dict) and _counts.get("READ", 0) >= 1)
 
-# --- and neither is the dual-owned one --------------------------------------
-check_true("CHECKPOINT_FAULTS: the batch runner's copy IS registered",
-           "CHECKPOINT_FAULTS" in _registered)
-_study_reads = refs_in(os.path.join(_ROOT, "oncotriage/ablation/study.py"),
-                       "CHECKPOINT_FAULTS")
-check_true("CHECKPOINT_FAULTS: the ablation study's copy is READ in its own "
-           "module", _study_reads["READ"] >= 1)
-check_true("...and it is genuinely a second OBJECT, not the same one imported",
-           _study.CHECKPOINT_FAULTS is not _runner.CHECKPOINT_FAULTS)
+# --- and neither are the dual-owned ones ------------------------------------
+#
+# DRIVEN FROM THE TABLE rather than written out per name, so a fourth
+# dual-owned counter cannot be added to `_DUAL_OWNED` -- which would silence
+# the completeness check above for it -- without also being subjected to these
+# three. `_DUAL_OWNED` is otherwise exactly the permission slip the exemption
+# table is careful not to be.
+_STUDY_PATH = os.path.join(_ROOT, "oncotriage/ablation/study.py")
+_DUAL_OTHER = {"STOP_SWITCH_FAULTS": _runner,
+               "RUN_RECORD_FAILURES": _dl,
+               "CHECKPOINT_FAULTS": _runner}
+for _dual, _owners in sorted(_DUAL_OWNED.items()):
+    _registrar = [f for f, role in _owners.items() if role == "registered"]
+    check(f"{_dual}: exactly one owner is the registered one",
+          len(_registrar), 1)
+    check_true(f"{_dual}: ...and that copy IS in the registry",
+               _dual in _registered)
+    _study_reads = drive(refs_in, _STUDY_PATH, _dual)
+    check_true(f"{_dual}: the ablation study's copy is READ in its own module",
+               isinstance(_study_reads, dict)
+               and _study_reads.get("READ", 0) >= 1)
+    check_true(f"{_dual}: ...and it is genuinely a second OBJECT, not the same "
+               "one imported -- without this the exemption would be satisfied "
+               "by a module that merely re-exported the registered counter",
+               getattr(_study, _dual)
+               is not getattr(_DUAL_OTHER[_dual], _dual))
 
 # --- CONTROL: the classifier does not call an increment a read ---------------
 # Without this the whole section passes for free: every counter is incremented
@@ -907,10 +938,69 @@ try:
                      if isinstance(n, ast.FunctionDef) and n.name == "main"),
                     None)
     check_true("study.main() was found (non-degeneracy)", _st_main is not None)
-    _st_calls = [n for n in ast.walk(_st_main)
-                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-                 and n.func.id == "report_checkpoint_faults"] if _st_main else []
-    check("study.main() calls it exactly once", len(_st_calls), 1)
+
+    # ── REACHABILITY, NOT ADJACENCY (the operator-control pass) ────────────
+    #
+    # THIS CHECK USED TO REQUIRE THE CALL TO BE A DIRECT STATEMENT OF main(),
+    # and it went stale the first time the reader was moved one frame down --
+    # into `print_study_close`, the block main() calls on both its exit paths.
+    # The property it exists to hold is that THE READER RUNS WHEN A STUDY ENDS;
+    # which function literally contains the call is an implementation detail,
+    # and pinning it made a refactor that PRESERVED the property look like one
+    # that broke it.
+    #
+    # A NAME LIST WOULD ROT THE SAME WAY, one move later, so the frame is
+    # DERIVED: a transitive walk over the module's own top-level functions.
+    # `main -> print_study_close -> report_checkpoint_faults` resolves, and so
+    # would the old direct shape, and so will the next one.
+    #
+    # THE WALK IS BOUNDED BY THE MODULE. A call to something this module does
+    # not define is not followed -- there is nothing to follow it into -- which
+    # is what keeps it finite without a depth limit, and `seen` is what makes
+    # recursion terminate.
+    _st_funcs = {n.name: n for n in _st_tree.body
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+    def _calls_of(node):
+        return {c.func.id for c in ast.walk(node)
+                if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+
+    def _reaches(root, target):
+        """Does `root` call `target`, directly or through this module?"""
+        seen, stack = set(), [root]
+        while stack:
+            name = stack.pop()
+            if name in seen or name not in _st_funcs:
+                continue
+            seen.add(name)
+            called = _calls_of(_st_funcs[name])
+            if target in called:
+                return True
+            stack.extend(called)
+        return False
+
+    check_true("the module-level function table is non-degenerate (a walk that "
+               "found no functions would make every reachability answer below "
+               "False for the wrong reason)", len(_st_funcs) >= 10)
+    check_true("...and it holds both frames this path runs through",
+               "main" in _st_funcs and "print_study_close" in _st_funcs)
+    check("study.main() REACHES report_checkpoint_faults",
+          _reaches("main", "report_checkpoint_faults"), True)
+    check("...and reaches the other two study counters' readers too, so an "
+          "interrupted or stopped study reports its degradations rather than "
+          "only a finished one",
+          [_reaches("main", _r) for _r in ("report_stop_switch_faults",
+                                           "report_run_record_failures")],
+          [True, True])
+    # CONTROLS: the walk must be able to answer False, and must not answer True
+    # by finding a name that is merely mentioned.
+    check("CONTROL: a reader nothing calls is NOT reachable",
+          _reaches("main", "report_checkpoint_faults_that_does_not_exist"),
+          False)
+    check("CONTROL: ...and a function that is defined but never called from "
+          "main() is not reachable either, so the walk is following edges "
+          "rather than scanning the file",
+          _reaches("report_checkpoint_faults", "main"), False)
 finally:
     _study.CHECKPOINT_FAULTS.clear()
     _study.CHECKPOINT_FAULTS.update(_saved_faults)

@@ -449,24 +449,53 @@ services:
     # finalized `runs` row, which are database writes measured in
     # milliseconds. 620s is 600 + 20 of margin for those.
     #
-    # THIS COVERS THE GROUPED ARM, WHICH IS WHAT SHIPS
-    # (`MATCHING_PER_TRIAL_CALLS_ENABLED` is False): one request per patient,
-    # so one in-flight call. THE PER-TRIAL ARM IS FOUR TIMES LARGER and this
-    # value does NOT cover it:
+    # ONE IN-FLIGHT CALL IS WHAT 620s BUYS, AND THIS COMMENT USED TO CLAIM
+    # THAT WAS A WHOLE GROUPED PATIENT. IT IS NOT, AND THE CORRECTION IS
+    # MEASURED RATHER THAN REASONED. The old text read: "THIS COVERS THE
+    # GROUPED ARM, WHICH IS WHAT SHIPS (`MATCHING_PER_TRIAL_CALLS_ENABLED` is
+    # False): one request per patient, so one in-flight call."
+    #
+    # GROUPED MODE IS ONE REQUEST PER *CHUNK*, NOT PER PATIENT. The packer
+    # splits a patient's trials against the input-token budget, so the number
+    # of sequential requests depends on how long the trials' eligibility text
+    # is. Driven through the real Stage 5 node with a stub client at
+    # MAX_TRIALS_FOR_EVALUATION = 15 (the operator-control pass; no billed
+    # call):
+    #
+    #     criteria chars/trial   1000  2000  4000  6000  8000  12000
+    #     chunks per patient        1     2     3     4     5      5
+    #
+    # So a `docker stop` on this service can SIGKILL it with up to FOUR
+    # further full-price requests still to be issued -- worst case
+    # 4 x 600 = 2400 s of drain against a 620 s grace period. The number is
+    # NOT raised here, because raising it to 2400 s to cover a case that
+    # should not exist is the wrong repair: THIS SERVICE HAS NO SHUTDOWN GATE,
+    # and giving it one is the fix. That is recorded as the follow-up it
+    # already was, now with the arithmetic that makes it concrete.
+    #
+    # THE PER-TRIAL ARM IS LARGER STILL and this value does not cover it
+    # either:
     #
     #     rounds per patient = ceil(MAX_TRIALS_FOR_EVALUATION / parallel)
     #                        = ceil(15 / 4) = 4
     #     worst case         = 4 x 600 = 2400 s = 40 minutes
     #
-    # That number is what must be raised to -- or the API given a shutdown
-    # gate of its own -- BEFORE the per-trial flag is turned on for a
-    # deployment behind an orchestrator. It is stated here rather than
-    # discovered then. The BATCH RUNNER already has such a gate: its SIGTERM
-    # handler asks Stage 5 to stop issuing queued requests, which bounds its
-    # drain at ONE in-flight round (600 s) whichever arm it is on. See
-    # `request_stage5_shutdown` in oncotriage/agent/evaluation.py, and
-    # THE STAGE 5 SHUTDOWN FLAG above it for why the wave's own
+    # THE BATCH RUNNER IS THE ONE THAT IS COVERED, AND AS OF THE
+    # OPERATOR-CONTROL PASS IT IS COVERED IN BOTH ARMS -- which is what this
+    # comment already claimed and what was, until that pass, true only of
+    # per-trial mode. Its SIGTERM handler asks Stage 5 to stop issuing
+    # requests; the flag gated the per-trial WAVE and nothing else, so a
+    # grouped patient carried on sending every remaining chunk. Measured, both
+    # arms, at 15 trials of 8000 characters: 4 further requests before the gate
+    # existed and 0 after it, with the patient failing honestly rather than
+    # being published as a success a resume would then skip forever. See
+    # `_obtain` in oncotriage/agent/evaluation.py, and THE STAGE 5 SHUTDOWN
+    # FLAG above `request_stage5_shutdown` for why the wave's own
     # `cancel_futures=True` cannot do this from a real signal.
+    #
+    # `26- Ablation Study.py` HAS THE SAME GATE as of that pass, for the same
+    # reason: it is also not a compose service, and an operator running it
+    # under systemd needs TimeoutStopSec=620 exactly as the batch runner does.
     #
     # THE COST OF THE NUMBER IS STATED: a container that is genuinely wedged
     # now takes up to 620 s to die rather than 10. That is the trade for not

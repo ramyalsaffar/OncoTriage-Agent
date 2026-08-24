@@ -44,15 +44,29 @@ OUT, each for a stated reason rather than by omission:
     blocks" and not "its own block". CLEANUP_FAILURES was the one this module
     recorded as a reported finding rather than a fix, and the counter-reader
     audit closed it AT THE INDEXER, which is what this exclusion asked for.
-  * ``ablation/study.py:CHECKPOINT_WRITE_FAILURES`` and that module's own
-    ``CHECKPOINT_FAULTS``. Both read at the end of the study's own ``main()``,
-    which is that entry point's equivalent of this module. Importing
-    ``ablation.study`` here would drag the whole study -- graph, fixtures,
-    thread pool -- into ``25- Batch Runner.py``. Note ``CHECKPOINT_FAULTS`` is
-    a SEPARATE OBJECT from the batch runner's counter of the same name, which
-    IS registered here through ``register()``: the two describe different
-    files, and the name being taken is a second reason this one could not join
-    even if the import graph allowed it.
+  * ``ablation/study.py``'s FOUR: ``CHECKPOINT_WRITE_FAILURES``,
+    ``CHECKPOINT_FAULTS``, ``STOP_SWITCH_FAULTS`` and ``RUN_RECORD_FAILURES``.
+    (This list named TWO until the operator-control pass gave that file a stop
+    switch and a per-configuration run record; leaving it at two would have
+    made the one thing a reader uses it for -- checking that a counter is
+    accounted for -- report two live, read counters as unaccounted.) All four
+    are read at the end of the study's own ``main()``, through
+    ``print_study_close``, which is that entry point's equivalent of this
+    module. Importing ``ablation.study`` here would drag the whole study --
+    graph, fixtures, thread pool -- into ``25- Batch Runner.py``.
+
+    THREE OF THE FOUR ARE SEPARATE OBJECTS SHARING A NAME WITH SOMETHING
+    REGISTERED HERE: ``CHECKPOINT_FAULTS`` and ``STOP_SWITCH_FAULTS`` with
+    ``batch/runner.py``'s, ``RUN_RECORD_FAILURES`` with
+    ``storage/database_logger.py``'s. Each pair describes DIFFERENT FILES, so
+    one number covering both would report a batch fault and a study fault as
+    one finding -- and the name being taken is a second reason none of them
+    could join even if the import graph allowed it, because ``register()``
+    raises on a duplicate. ``tests/test_degradation_counter_readers.py``'s
+    ``_DUAL_OWNED`` is what stops the shared name being read as coverage: the
+    scan's ``_name in _registered`` branch credited the registered copy to the
+    study's for both of the two added here, and this section passed with two
+    brand-new write-only counters in the package until that table caught up.
   * ``mcp/server.py:TOOL_FAILURES``. Already has ``tool_failure_summary()``,
     and an MCP server is a long-lived process rather than a run: there is no
     end for a run-end report to attach to.

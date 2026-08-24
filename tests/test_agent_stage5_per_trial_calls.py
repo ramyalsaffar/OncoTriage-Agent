@@ -2828,26 +2828,76 @@ check("8b-q ...and every member is named in the floor, by AST rather than by "
       ["WARMUP_SOURCE_FALLBACK_WRITER", "WARMUP_SOURCE_SHUTDOWN",
        "WARMUP_SOURCE_WARMUP"])
 
-# THE LIMIT, MEASURED AND RECORDED RATHER THAN DISCOVERED LATER. The flag
-# bounds the per-trial WAVE and nothing else. Grouped mode issues one request
-# per chunk from the node's own thread, sequentially, and this pass does not
-# gate it -- a wider gate would change the failure mode of the grouped send
-# loop, which is a separate decision with its own blast radius. Asserted so the
-# gap is a stated property with a test behind it.
+# ── GROUPED MODE IS GATED TOO (the operator-control pass) ──────────────────
+#
+# THIS CHECK USED TO PIN THE OPPOSITE, and the note it carried is kept here as
+# the record of what changed rather than deleted. It read: "GROUPED MODE IS NOT
+# GATED, and that is a stated limit rather than an oversight: its calls are
+# issued sequentially from the node's own thread, and widening the gate would
+# change the grouped send loop's failure mode."
+#
+# THE LIMIT WAS REAL AND IT COVERED THE ARM THAT SHIPS.
+# MATCHING_PER_TRIAL_CALLS_ENABLED is False, so every batch run stopped by
+# Ctrl-C or SIGTERM had its in-flight patients carry on issuing every REMAINING
+# chunk of the packer's plan at full price. One chunk is the common case and it
+# is not the bound: the proactive packer splits on the input budget and the
+# reactive splitter halves on a `length` finish.
+#
+# THE FAILURE MODE DID CHANGE, WHICH IS WHAT THE OLD NOTE WARNED ABOUT, AND IT
+# CHANGED TO THE ONE PER-TRIAL MODE ALREADY HAD. The raise is
+# Stage5ShutdownRequested, the send loop's isolation branch is guarded by
+# `_per_trial_calls` and therefore unreachable in grouped mode, so it falls
+# straight through to the API-error return: the patient FAILS rather than
+# publishing a partial success. That is the c33 lesson applied identically --
+# `_on_done` checkpoints a success, so a partial patient would be skipped by
+# every resume forever.
 _SKIPS_BEFORE = dict(_evaluation.STAGE5_SHUTDOWN_SKIPS)
 _evaluation.request_stage5_shutdown("SIGTERM (signal 15)")
 _R_GRP, _S_GRP = _with_clean_flag(
     lambda: run_node(_SIX, per_trial=False))
-check("8b-r GROUPED MODE IS NOT GATED, and that is a stated limit rather than "
-      "an oversight: its calls are issued sequentially from the node's own "
-      "thread, and widening the gate would change the grouped send loop's "
-      "failure mode. A grouped run interrupted mid-call still finishes that "
-      "call, exactly as it did before this pass",
-      (len(_S_GRP.requests) > 0,
-       {k: v - _SKIPS_BEFORE.get(k, 0)
-        for k, v in _evaluation.STAGE5_SHUTDOWN_SKIPS.items()
-        if v - _SKIPS_BEFORE.get(k, 0)}),
-      (True, {}))
+_GRP_SKIPS = {k: v - _SKIPS_BEFORE.get(k, 0)
+              for k, v in _evaluation.STAGE5_SHUTDOWN_SKIPS.items()
+              if v - _SKIPS_BEFORE.get(k, 0)}
+check("8b-r GROUPED MODE ISSUES NO REQUEST once a shutdown is asked for. The "
+      "stub counts what actually reached a provider, so this is a statement "
+      "about money and not about a code path",
+      len(_S_GRP.requests), 0)
+check("8b-s ...and the decline is COUNTED under its own `send:` phase, which "
+      "is neither `warmup:` (the patient sent nothing at all) nor `wave:` (a "
+      "per-trial worker declining an already-submitted task). An operator "
+      "reading a stopped run's report should not have to know which arm was "
+      "configured to read the number",
+      (sorted(_GRP_SKIPS), sum(_GRP_SKIPS.values()) > 0),
+      ([f"{_evaluation.SHUTDOWN_SKIP_SEND_KEY_PREFIX}SIGTERM (signal 15)"],
+       True))
+check("8b-t ...and the patient FAILS rather than publishing a partial "
+      "success. A grouped patient that returned `evaluations` for the chunks "
+      "it had already sent would be checkpointed by _on_done and skipped by "
+      "every resume forever -- the c33 argument, reached from the arm that "
+      "ships",
+      (bool(at(_R_GRP, "error")), at(_R_GRP, "evaluations")),
+      (True, []))
+check("8b-u the three phase prefixes are CLOSED and partition the places a "
+      "Stage 5 request can be declined, so a fourth gate added without a "
+      "member fails here rather than arriving in a report as an "
+      "unclassified key",
+      (_evaluation.SHUTDOWN_SKIP_KEY_PREFIXES,
+       len(set(_evaluation.SHUTDOWN_SKIP_KEY_PREFIXES))),
+      ((_evaluation.SHUTDOWN_SKIP_WARMUP_KEY_PREFIX,
+        _evaluation.SHUTDOWN_SKIP_WAVE_KEY_PREFIX,
+        _evaluation.SHUTDOWN_SKIP_SEND_KEY_PREFIX), 3))
+# THE NON-DEGENERACY PROBE, WITHOUT WHICH 8b-r WOULD PASS AGAINST A NODE THAT
+# NEVER RUNS. A stub with zero requests is also what a node that raised before
+# its first call produces, so the SAME node and the SAME trials are driven with
+# the flag CLEAR and required to send.
+_R_GRP_OK, _S_GRP_OK = _with_clean_flag(
+    lambda: run_node(_SIX, per_trial=False))
+check("8b-v ...and with no shutdown asked for the identical drive DOES send "
+      "and DOES publish verdicts, so 8b-r is measuring the gate rather than a "
+      "node that could not run",
+      (len(_S_GRP_OK.requests) > 0, len(at(_R_GRP_OK, "evaluations")) > 0,
+       bool(at(_R_GRP_OK, "error"))),
+      (True, True, False))
 
 
 # ===========================================================================
@@ -3785,6 +3835,65 @@ control(
         k for k in m.PER_TRIAL_CALL_FAILURES if k.startswith("abandoned:")))(
         _shutdown_probe(m)),
     ["abandoned:Stage5ShutdownRequested"],
+)
+
+
+# --- c36: the grouped send gate, which is the ARM THAT SHIPS ----------------
+#
+# Until the operator-control pass the flag bounded the per-trial WAVE and
+# nothing else, and MATCHING_PER_TRIAL_CALLS_ENABLED is False -- so every
+# grouped patient in flight when an operator pressed Ctrl-C carried on issuing
+# every REMAINING chunk of the packer's plan at full price.
+#
+# THE PROBE REUSES `_ShutdownStub` AT after=1, which is deterministic in
+# grouped mode for a sharper reason than in per-trial mode: grouped chunks are
+# issued SEQUENTIALLY from the node's own thread, so there is no pool and no
+# ordering to depend on. The gate reads the flag BEFORE handing the request to
+# the stub, so call 1 goes out, the stub sets the flag, and call 2 is where the
+# gate is measured.
+
+# ENOUGH TRIALS, AND LONG ENOUGH CRITERIA, THAT THE PACKER MAKES SEVERAL
+# CHUNKS. With one chunk there is no second request to decline and the control
+# would pass for free -- a plant that is not a behaviour change is not a test
+# of the harness (pass 20c-3d's rule, restated as a precondition).
+_MANY = [trial(i, criteria_chars=8000) for i in range(15)]
+_BASE_CHUNKS = len(run_node(_MANY, per_trial=False)[1].requests)
+check("9-pre THE PACKER REALLY MAKES SEVERAL CHUNKS for this input, so there "
+      "IS a later request for the gate to decline",
+      _BASE_CHUNKS >= 3, True)
+
+
+def _grouped_probe(module):
+    """(requests issued, was the patient failed, verdicts published)."""
+    stub = _ShutdownStub(module=module, after=1,
+                         reason="Ctrl-C during the main batch pass")
+    try:
+        result, stub = run_node(_MANY, per_trial=False, node=node_of(module),
+                                stub=stub)
+        return (len(stub.requests), bool(at(result, "error")),
+                len(at(result, "evaluations") or []))
+    finally:
+        module.clear_stage5_shutdown()
+
+
+check("9-pre-b ...and the SHIPPED node issues exactly ONE and then declines "
+      "the rest, failing the patient rather than publishing a partial success",
+      drive(_grouped_probe, _evaluation), (1, True, 0))
+
+control(
+    "c36 *** A GROUPED SEND LOOP THAT DOES NOT CONSULT THE FLAG IS CAUGHT "
+    "[8b-r]. *** Every remaining chunk of the packer's plan goes out at full "
+    "price after the operator asked the run to stop -- and the patient is then "
+    "published as a SUCCESS carrying all its verdicts, so `_on_done` "
+    "checkpoints it and a resume skips it forever",
+    [('        if _SHUTDOWN_REQUESTED:\n'
+      '            STAGE5_SHUTDOWN_SKIPS[\n'
+      '                f"{SHUTDOWN_SKIP_SEND_KEY_PREFIX}"',
+      '        if False:\n'
+      '            STAGE5_SHUTDOWN_SKIPS[\n'
+      '                f"{SHUTDOWN_SKIP_SEND_KEY_PREFIX}"')],
+    _grouped_probe,
+    (_BASE_CHUNKS, False, 15),
 )
 
 

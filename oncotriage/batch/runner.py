@@ -1156,21 +1156,88 @@ STOP_SWITCH = _StopSwitch()
 """The one instance. See ``_StopSwitch`` for why it is module-level and reset."""
 
 
-def clear_stop_switch() -> bool:
-    """Delete the sentinel. Returns whether there was one. Used by --clear-stop.
+STOP_CLEAR_REMOVED = "removed"
+STOP_CLEAR_ABSENT = "absent"
+STOP_CLEAR_FAILED = "failed"
+
+STOP_CLEAR_OUTCOMES = (STOP_CLEAR_REMOVED, STOP_CLEAR_ABSENT, STOP_CLEAR_FAILED)
+"""What ``clear_stop_switch`` can answer. Closed, and a caller may branch on it
+exhaustively.
+
+IT USED TO BE A ``bool`` AND THAT CONFLATED TWO OPPOSITE FINDINGS. ``False``
+meant "there was no sentinel to clear", and the entry point printed exactly
+that -- so the moment the ``unlink`` could fail rather than return, ``False``
+would have meant "there was none" AND "there is one and I could not remove it"
+with one line of output covering both. The second is the dangerous one: the
+preflight is deliberately SKIPPED when ``--clear-stop`` is given (it is the
+gesture the refusal names), so a failed clear that reported "nothing to clear"
+would start the run with the sentinel still in place, trip it at the first
+completed patient, and stop again -- after billing one patient -- for a request
+the operator had just withdrawn.
+
+Three members rather than two because the remediations differ: nothing to do,
+nothing to do, and `chmod`/`sudo rm`. That is ``FP_OUTCOMES``' and
+``WARMUP_SOURCES``' argument, one mechanism over.
+"""
+
+
+def clear_stop_switch() -> str:
+    """Delete the sentinel. Returns a ``STOP_CLEAR_*`` member. Used by --clear-stop.
 
     A SEPARATE FUNCTION FROM ``clear_checkpoint`` AND NOT FOLDED INTO
     ``clear_all``, because the two clear opposite things: ``clear_all`` discards
     a run's RESULTS and re-bills the cohort, and this discards a CONTROL FILE
     and costs nothing. An operator who wants to resume after a stop wants
     exactly this and must not be within one flag of the other.
+
+    IT NEVER RAISES, AND BEFORE THIS IT RAISED UNCAUGHT. ``path.unlink()`` on a
+    checkpoint directory the run can read and cannot write -- a directory owned
+    by another user, a read-only mount, a volume remounted `ro` -- raises
+    ``PermissionError``, and nothing between here and the interpreter caught it.
+    The operator's diagnosis was a traceback ending in ``Errno 13`` over a path
+    they then had to read out of the stack, printed INSTEAD of the run they
+    asked for. Every other entry point into this switch already refuses to do
+    that: ``poll``, ``_read_stop_message`` and ``assert_no_stale_stop_switch``
+    each catch, count and carry on.
+
+    ``Exception`` AND NOT ``OSError``, and the difference is a real case rather
+    than defensiveness. ``PermissionError`` IS an ``OSError`` subclass, so the
+    pair named in the brief is one clause -- but ``stop_switch_path()`` reads
+    ``paths.checkpoint_path``, which resolves the sibling data tree BY GLOB on
+    first read and raises a plain ``RuntimeError`` when it matches nothing or
+    matches several. An ``OSError``-only clause would leave ``--clear-stop`` as
+    the one gesture in this module that tracebacks on an unresolvable path,
+    which is the shape ``describe_stop_switch_path`` exists to prevent one
+    function up.
+
+    THE COUNTER PHASE IS ``clear:`` AND IT IS ITS OWN, not folded into
+    ``poll:``. ``poll:`` means "the run may have kept going through a stop
+    request"; this means "an operator asked to resume and the sentinel is still
+    there". Opposite directions, different fixes.
     """
-    path = stop_switch_path()
-    if not path.exists():
-        return False
-    path.unlink()
+    try:
+        path = stop_switch_path()
+        if not path.exists():
+            return STOP_CLEAR_ABSENT
+        path.unlink()
+    except Exception as exc:                                    # noqa: BLE001
+        STOP_SWITCH_FAULTS[f"clear:{type(exc).__name__}"] += 1
+        # THE PATH IS RE-DESCRIBED RATHER THAN REFERENCED, because the failure
+        # may be the resolution itself, in which case `path` was never bound.
+        console.out(f"[STOP] COULD NOT CLEAR the stop sentinel: "
+                    f"{type(exc).__name__}: {exc}")
+        console.out(f"[STOP]   sentinel: {describe_stop_switch_path()}")
+        console.out("[STOP]   The run would trip on it at its first completed "
+                    "patient and stop again -- after billing that patient -- "
+                    "for a request you have just withdrawn.")
+        console.out("[STOP]   Remove it by hand and start again:")
+        console.out(f"[STOP]       rm {describe_stop_switch_path()}")
+        console.out("[STOP]   A permission error here usually means the "
+                    "checkpoint directory is read-only or owned by another "
+                    "user; `ls -ld` it.")
+        return STOP_CLEAR_FAILED
     console.out(f"[STOP] Cleared {path}")
-    return True
+    return STOP_CLEAR_REMOVED
 
 
 def assert_no_stale_stop_switch() -> None:
