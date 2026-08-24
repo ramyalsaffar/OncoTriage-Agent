@@ -854,6 +854,20 @@ divided into a run-level MAX of the estimate would be a ratio between two
 different requests. NULL when the packer did not run, which makes every
 expression built on it NULL rather than a division by zero."""
 
+_PACK_BYPASSED_SQL = _pack_field_sql("bypassed_by")
+"""WHAT bypassed the packer on this inference, or NULL if nothing did.
+
+Present on the bypass branch of node_llm_classifier_evaluation and on no other
+-- the absent-rather-than-empty convention, argued there -- so `IS NOT NULL` is
+the whole test and there is no sentinel to keep in step. Its value is a
+MATCHING_CALL_MODE_* constant today; the column is not compared against one,
+because a second mechanism that bypasses the packer tomorrow should land in the
+same bucket rather than silently rejoin the unpacked population.
+
+A bypassed row has no budget, so it is NULL under _PACK_BUDGET_SQL exactly as a
+row whose packer never ran to completion is -- which is why the pressure query
+cannot separate the two by the budget alone and reads this instead."""
+
 _PACK_CHUNK_TOKENS_SQL = "json_extract(c.value, '$.tokens_estimated')"
 """One chunk's estimated INPUT tokens: the fixed prefix PLUS that chunk's own
 trials. It is the number the budget is a budget ON -- see the packer, which
@@ -2566,12 +2580,24 @@ SELECT s.campaign_id,
             "stated beside the ratio because a ratio alone cannot say whether",
             "0.98 was 200 tokens of slack or 20.",
             "",
-            "unpacked_inferences is the population this query CANNOT measure:",
-            "rows whose packer did not run to completion, which is every Stage",
-            "5 failure return (the chunk list is a plan, and Stage 5 publishes",
-            "it on the success return only) plus every row written before the",
-            "packer existed. It is counted rather than filtered away, because",
-            "an omission reads as an absence of pressure.",
+            "unpacked_inferences is one of the two populations this query",
+            "CANNOT measure: rows whose packer did not run to completion,",
+            "which is every Stage 5 failure return (the chunk list is a plan,",
+            "and Stage 5 publishes it on the success return only) plus every",
+            "row written before the packer existed. It is counted rather than",
+            "filtered away, because an omission reads as an absence of",
+            "pressure.",
+            "",
+            "bypassed_inferences is the OTHER one, and it is split out because",
+            "it is not the same finding. These rows are healthy: something",
+            "partitioned the batch instead of the packer -- per-trial call",
+            "mode does -- so there is no budget to be under and no pressure to",
+            "report, rather than a measurement that went missing. Folded into",
+            "unpacked_inferences they read as failures. The two together are",
+            "the rows the ratios above say nothing about; a run whose",
+            "inferences are all bypassed has no packing pressure BECAUSE IT",
+            "DID NOT PACK, which is a different sentence from low pressure and",
+            "from a lost measurement alike.",
             "",
             "over_budget_chunks counts chunks that could not be made to fit by",
             "any amount of packing -- a single trial larger than the whole",
@@ -2582,7 +2608,10 @@ SELECT s.campaign_id,
         COALESCE(CAST(i.run_id AS TEXT), '{NO_RUN_LABEL}')  AS run,
         COUNT(DISTINCT i.id)                                  AS inferences,
         COUNT(DISTINCT CASE WHEN {_PACK_BUDGET_SQL} IS NULL
+                             AND {_PACK_BYPASSED_SQL} IS NULL
                             THEN i.id END)                    AS unpacked_inferences,
+        COUNT(DISTINCT CASE WHEN {_PACK_BYPASSED_SQL} IS NOT NULL
+                            THEN i.id END)                    AS bypassed_inferences,
         SUM(CASE WHEN c.value IS NOT NULL THEN 1 ELSE 0 END)   AS chunks,
         MIN({_PACK_BUDGET_SQL})                               AS budget_min,
         MAX({_PACK_BUDGET_SQL})                               AS budget_max,

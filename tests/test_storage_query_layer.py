@@ -762,6 +762,31 @@ def _packing_blob(budget, chunks, *, relaxed=False, configured=20000,
     })
 
 
+def _bypass_packing_blob(trials, *, configured=20000, fixed=4000,
+                         bypassed_by=MATCHING_CALL_MODE_PER_TRIAL):
+    """A `llm_classifier_packing` value written by a BYPASSED packer.
+
+    The node writes this itself on its per-trial branch rather than getting it
+    from `pack_trials_by_input_tokens`: `enabled` false, every number the packer
+    would have selected None or False, no chunk, and `bypassed_by` naming what
+    partitioned the batch instead. It is the only shape in which
+    `llm_classifier_packing` is NOT NULL while
+    `llm_classifier_packed_chunks` is.
+
+    THE KEY SET IS COMPARED AGAINST THE WRITER'S OWN LITERAL in section 2c(a),
+    by AST, so a fixture that drifted from the node could not go on satisfying
+    the bucket checks below by accident.
+    """
+    return json.dumps({
+        "enabled": False, "method": "chars", "fixed_tokens": fixed,
+        "budget_tokens_configured": configured, "budget_tokens": None,
+        "max_chunks": None, "cap_relaxed_budget": False,
+        "over_budget_chunk": False, "trials": trials, "chunks": [],
+        "bypassed_by": bypassed_by,
+        "prefix_sha256": "0" * 64,
+    })
+
+
 def _call_details_blob(*completions):
     """A `llm_classifier_call_details` value: one entry per call issued.
 
@@ -853,6 +878,32 @@ _SEED_ROWS = [
         llm_classifier_output_ceiling=_CEILING_NOW,
         llm_classifier_output_tokens_estimated=16500,
         llm_classifier_call_details=_call_details_blob(15900))),
+    # THE BYPASSED ROW. Consistent (4 + 2 + 0 == 6), priced, per-trial arm --
+    # ordinary in every respect except the one it is here for: its packer was
+    # BYPASSED rather than absent, so `llm_classifier_packing` is present and
+    # names what bypassed it while `llm_classifier_packed_chunks` is NULL.
+    # It sits in RUN-CLEAN beside P-NULL-TOKENS, whose packer left no record at
+    # all, so one group carries both populations and the pressure query has to
+    # separate them rather than merely count one of them.
+    ("P-BYPASSED", dict(
+        matching_model=_MODEL_A, llm_classifier_input_tokens=12000,
+        llm_classifier_output_tokens=3000, llm_classifier_reasoning_tokens=None,
+        matching_call_mode=MATCHING_CALL_MODE_PER_TRIAL,
+        estimated_cost_usd=0.055, age=68, sex="female", medication_count=9,
+        condition_count=3, total_time=95.0,
+        candidates_retrieved=90, candidates_reranked=40,
+        candidates_filtered=6, candidates_evaluated=6,
+        eligible_matches=4, near_misses=2, not_evaluable_trials=0,
+        llm_classifier_packing=_bypass_packing_blob(6),
+        # NULL, NOT 0: the packer did not run, so it has no chunk count. 0 is
+        # reserved for a packer that ran and produced none, i.e. an empty
+        # candidate set -- and this patient sent six requests.
+        llm_classifier_packed_chunks=None,
+        llm_classifier_output_split_threshold=_THRESHOLD_NOW,
+        llm_classifier_output_ceiling=_CEILING_NOW,
+        llm_classifier_output_tokens_estimated=6600,
+        llm_classifier_call_details=_call_details_blob(500, 500, 500,
+                                                       500, 500, 500))),
     # THE ALL-NULL GROUP. Its own model, every token column and the stored cost
     # NULL. Beside the two rows above this is what makes the aggregate columns
     # float64 and turns `int(x or 0)` into a ValueError.
@@ -1175,7 +1226,8 @@ for _i, (_label, _status, _finished, _source, _arm) in enumerate(_RUN_ROWS):
 # the expected patient counts and costs are written here rather than read back
 # out of the query being checked.
 _RUN_MEMBERSHIP = {
-    "RUN-CLEAN":    ["P-CONSISTENT-A", "P-CONSISTENT-B", "P-NULL-TOKENS"],
+    "RUN-CLEAN":    ["P-CONSISTENT-A", "P-CONSISTENT-B", "P-NULL-TOKENS",
+                     "P-BYPASSED"],
     "RUN-CRASHED":  ["P-ERROR", "P-NOMODEL-CLEAN"],
     "RUN-DEGRADED": ["P-COUNT-MISMATCH"],
     # RUN-EMPTY intentionally absent -- see above.
@@ -1787,6 +1839,36 @@ def _grp(frame_map, key):
     return frame_map.get(key, _ABSENT_GROUP)
 
 
+def _cell(row, column):
+    """One column of a per-run row, or a named absence. Never raises.
+
+    ``_grp`` already answers the missing-ROW case; this is the missing-COLUMN
+    one, and it is a separate hazard. A pandas ``itertuples`` row is a namedtuple
+    whose fields are the columns the query actually returned, so a defect that
+    DROPS a column -- exactly the revert a bucket check exists to catch -- makes
+    every read of it an AttributeError at module level: one traceback where the
+    section owes its failures. Measured, not predicted: reverting the
+    bypassed_inferences bucket aborted this file before this helper existed.
+    """
+    return getattr(row, column, f"<no column: {column}>")
+
+
+def _addn(*values):
+    """Sum readings that may be named absences, without raising.
+
+    `_num` answers a STRING when a column is missing or NULL, and `float + str`
+    is a TypeError inside a check() argument -- an abort in place of the very
+    failure a bucket check owes when a defect drops one of its columns.
+    Measured: reverting the bypassed_inferences bucket aborted this file here
+    even after `_cell` had closed the attribute half of the same hazard.
+    """
+    numbers = [v for v in values if isinstance(v, (int, float))
+               and not isinstance(v, bool)]
+    if len(numbers) != len(values):
+        return f"<not all numbers: {values!r}>"
+    return sum(numbers)
+
+
 def _num(value, ndigits=None):
     """float(value), optionally rounded -- or a named absence. Never raises.
 
@@ -1862,6 +1944,55 @@ _packer_keys = {k.value for _n in ast.walk(_packer_fn or ast.Module(body=[], typ
 check_true("the packer writes a non-degenerate set of report keys",
            len(_packer_keys) > 8)
 
+# THE PACKER IS NOT THE ONLY WRITER OF THIS BLOB, and reading only its function
+# body is what made this check fail the moment the query learned to read
+# `bypassed_by`. `llm_classifier_packing` is also written directly by
+# node_llm_classifier_evaluation on its two non-packing branches -- the
+# packing-OFF report and the per-trial BYPASS report -- and the bypass one is
+# the only writer of `bypassed_by` anywhere.
+#
+# FOUND BY MARKER, NOT BY FUNCTION NAME OR LINE. Every literal that IS one of
+# these reports carries `over_budget_chunk`; a report literal moved to another
+# function, or a fourth branch added tomorrow, is picked up without editing
+# this file, and a dict that is not a packing report cannot contribute a key to
+# the corpus by accident. The union is what the property is actually about: the
+# SQL may read any key SOME writer of this column emits.
+_REPORT_MARKER = "over_budget_chunk"
+_report_literals = []
+for _n in ast.walk(ast.parse(io.open(_PACKER_SRC, encoding="utf-8").read())):
+    if isinstance(_n, ast.Dict):
+        _ks = {k.value for k in _n.keys
+               if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+        if _REPORT_MARKER in _ks:
+            _report_literals.append(_ks)
+check_true("the marker finds every packing-report literal in the module -- the "
+           "packer's own plus the node's packing-OFF and per-trial-bypass "
+           "reports. Fewer than three means a branch stopped being found and "
+           "the key corpus below silently shrank",
+           len(_report_literals) >= 3)
+_writer_keys = _packer_keys.union(*_report_literals) if _report_literals \
+    else _packer_keys
+check_true("...and widening the corpus to those literals really added "
+           "something the packer's own body does not write, which is the "
+           "whole reason this is a union (non-degeneracy)",
+           "bypassed_by" in _writer_keys and "bypassed_by" not in _packer_keys)
+
+# THE FIXTURE IS COMPARED WITH THE WRITER, not merely used. `_bypass_packing_blob`
+# is hand-written here because this file may not import the agent (bucket A: no
+# openai, no qdrant_client, no langgraph), and a hand-written fixture is exactly
+# the thing that drifts. The bucket checks further down would go on passing
+# against a fixture that had stopped resembling the node -- json_extract returns
+# NULL for a key nobody writes, and NULL is a legal bucket answer.
+_bypass_literal = [_ks for _ks in _report_literals if "bypassed_by" in _ks]
+check_true("exactly one packing-report literal names a bypass (more than one "
+           "would mean the corpus below is a union of two shapes)",
+           len(_bypass_literal) == 1)
+check("...and this file's bypass fixture carries exactly the keys that "
+      "literal writes, so a shipped key added or renamed fails here rather "
+      "than reading as a NULL bucket",
+      sorted(set(json.loads(_bypass_packing_blob(6))) - {"prefix_sha256"}),
+      sorted(_bypass_literal[0]) if _bypass_literal else ["<no literal>"])
+
 # The keys the SQL names, read out of the SQL rather than retyped, so a query
 # edit that reaches for a new key is covered without touching this list.
 _SQL_KEYS = set(re.findall(r"\$\.([A-Za-z_]+)",
@@ -1869,13 +2000,17 @@ _SQL_KEYS = set(re.findall(r"\$\.([A-Za-z_]+)",
                               "stage5_input_packing_pressure"].sql))
 check_true("the input-pressure SQL names a non-degenerate set of JSON keys",
            len(_SQL_KEYS) >= 4)
-check("every JSON key the input-pressure query extracts is one the packer "
-      "writes -- a name the two disagree about returns NULL and reads as "
-      "'no pressure', not as an error",
-      sorted(_SQL_KEYS - _packer_keys), [])
-check_true("...and the check discriminates: a key the packer does not write is "
-           "reported (negative control)",
-           bool({"tokens_estimated_typo"} - _packer_keys))
+check("every JSON key the input-pressure query extracts is one SOME writer of "
+      "llm_classifier_packing emits -- a name the two disagree about returns "
+      "NULL and reads as 'no pressure', not as an error",
+      sorted(_SQL_KEYS - _writer_keys), [])
+check_true("...and the check discriminates: a key no writer emits is reported "
+           "(negative control)",
+           bool({"tokens_estimated_typo"} - _writer_keys))
+check_true("...and the query really does read the bypass key, so the "
+           "bypassed_inferences bucket is derived from the blob rather than "
+           "from a column that does not exist",
+           "bypassed_by" in _SQL_KEYS)
 
 # --- (b) the two columns are additive, and their absence is declared -------
 #
@@ -1949,9 +2084,48 @@ check_true("the input-pressure frame covers every run AND the run-less rows "
 # RUN-CLEAN: P-CONSISTENT-A packed 19,600 and 12,000 into a 20,000 budget,
 # P-CONSISTENT-B packed 9,000, and P-NULL-TOKENS published no packing record.
 check("chunks are counted per REQUEST, not per patient", _num(_grp(_ip, _RUN_CLEAN).chunks), 3)
-check("...over three inference rows", _num(_grp(_ip, _RUN_CLEAN).inferences), 3)
+check("...over four inference rows", _num(_grp(_ip, _RUN_CLEAN).inferences), 4)
+
+# ── THE TWO UNMEASURED POPULATIONS ARE DIFFERENT FINDINGS ──────────────────
+#
+# RUN-CLEAN carries one of each. P-NULL-TOKENS published no packing record at
+# all -- a failure return or a pre-packer row, the population this query cannot
+# measure and should say so about. P-BYPASSED is HEALTHY: it sent six requests,
+# and something other than the packer partitioned them, so there is no budget to
+# be under. Folded together they read as two lost measurements, and a run whose
+# every row is per-trial would report itself as entirely broken.
 check("...one of which published no packing record and is counted as such "
-      "rather than dropped", _num(_grp(_ip, _RUN_CLEAN).unpacked_inferences), 1)
+      "rather than dropped", _num(_cell(_grp(_ip, _RUN_CLEAN), "unpacked_inferences")), 1)
+check("...and the BYPASSED row is its own bucket, not folded into that one: "
+      "its packer did not run because something else partitioned the batch, "
+      "which is a healthy row rather than a lost measurement",
+      _num(_cell(_grp(_ip, _RUN_CLEAN), "bypassed_inferences")), 1)
+check("...the two buckets are DISJOINT and neither swallowed the other -- "
+      "which is the whole split, and is what a single `budget IS NULL` bucket "
+      "could not say (it would report 2 and name neither)",
+      (_num(_cell(_grp(_ip, _RUN_CLEAN), "unpacked_inferences")),
+       _num(_cell(_grp(_ip, _RUN_CLEAN), "bypassed_inferences")),
+       _addn(_num(_cell(_grp(_ip, _RUN_CLEAN), "unpacked_inferences")),
+             _num(_cell(_grp(_ip, _RUN_CLEAN), "bypassed_inferences")))),
+      (1, 1, 2))
+# STATED AS A SUM RATHER THAN A SUBTRACTION. Subtracting a named absence is the
+# same abort one operator over, and "4 rows, 2 of them unmeasured for two
+# different reasons" is the sentence the check is actually making.
+check("...and together they are exactly the rows the ratios say nothing "
+      "about: 4 inferences, 2 measured, 2 unmeasured for two different "
+      "reasons",
+      (_num(_cell(_grp(_ip, _RUN_CLEAN), "inferences")),
+       _addn(_num(_cell(_grp(_ip, _RUN_CLEAN), "unpacked_inferences")),
+             _num(_cell(_grp(_ip, _RUN_CLEAN), "bypassed_inferences")))),
+      (4, 2))
+check("a bypassed row contributes no CHUNK to the run, so it moves no "
+      "pressure reading -- the peak, the mean and the headroom below are over "
+      "the two packed rows exactly as they were before it was seeded",
+      _num(_grp(_ip, _RUN_CLEAN).chunks), 3)
+check("...and a run with no bypassed row reports 0 there rather than NULL, so "
+      "the bucket is a measurement everywhere and not only where it fires",
+      (_num(_cell(_grp(_ip, _RUN_DEGRADED), "bypassed_inferences")),
+       _num(_cell(_grp(_ip, _RUN_CRASHED), "bypassed_inferences"))), (0, 0))
 check("peak pressure is the tightest chunk over its own budget: 19600/20000",
       _num(_grp(_ip, _RUN_CLEAN).peak_pressure, 4), 0.98)
 check("mean pressure averages the CHUNKS, not the patients: "
@@ -1990,7 +2164,7 @@ check("a run whose rows carry no packing record is a ROW in the frame, with "
       "its unmeasured population named -- an omission would read as an "
       "absence of pressure",
       (_num(_grp(_ip, _RUN_CRASHED).inferences),
-       _num(_grp(_ip, _RUN_CRASHED).unpacked_inferences),
+       _num(_cell(_grp(_ip, _RUN_CRASHED), "unpacked_inferences")),
        _num(_grp(_ip, _RUN_CRASHED).chunks)), (2, 2, 0))
 check("...and every pressure reading for it is NULL rather than 0, which "
       "would assert a measured floor",
@@ -2003,8 +2177,241 @@ check("...and every pressure reading for it is NULL rather than 0, which "
 check("the run-less rows are the bulk legacy population and are reported, not "
       "filtered away",
       _num(_grp(_ip, queries.NO_RUN_LABEL).inferences)
-      == _num(_grp(_ip, queries.NO_RUN_LABEL).unpacked_inferences)
+      == _num(_cell(_grp(_ip, queries.NO_RUN_LABEL), "unpacked_inferences"))
       and _num(_grp(_ip, queries.NO_RUN_LABEL).inferences) > 10, True)
+check("...and none of them is a BYPASS: a legacy row predates the bypass and "
+      "carries no such record, so the split did not reclassify the legacy "
+      "population as healthy",
+      _num(_cell(_grp(_ip, queries.NO_RUN_LABEL), "bypassed_inferences")), 0)
+
+# THE BUCKETS PARTITION THE TABLE. Without this every check above is satisfied
+# by a query that counted some rows twice or dropped some entirely.
+_ip_total = _addn(*[_num(_cell(_r, "inferences")) for _r in _ip.values()])
+_ip_bypassed = _addn(*[_num(_cell(_r, "bypassed_inferences"))
+                       for _r in _ip.values()])
+_ip_unpacked = _addn(*[_num(_cell(_r, "unpacked_inferences"))
+                       for _r in _ip.values()])
+check("across every group, inferences totals the table and the two unmeasured "
+      "buckets are subsets of it that do not overlap",
+      (_ip_total,
+       _conn.execute("SELECT COUNT(*) FROM inferences").fetchone()[0],
+       isinstance(_addn(_ip_bypassed, _ip_unpacked), (int, float))
+       and isinstance(_ip_total, (int, float))
+       and _ip_bypassed + _ip_unpacked <= _ip_total), 
+      (_conn.execute("SELECT COUNT(*) FROM inferences").fetchone()[0],
+       _conn.execute("SELECT COUNT(*) FROM inferences").fetchone()[0], True))
+check("...and the bypassed total is exactly the rows whose blob names a "
+      "bypass, counted independently of the query under test",
+      _ip_bypassed,
+      _conn.execute(
+          "SELECT COUNT(*) FROM inferences WHERE llm_classifier_packing "
+          "IS NOT NULL AND json_valid(llm_classifier_packing) "
+          "AND json_extract(llm_classifier_packing, '$.bypassed_by') "
+          "IS NOT NULL").fetchone()[0])
+check("...(non-degeneracy: that independent count is not zero, so the "
+      "agreement above is between two real numbers)",
+      isinstance(_ip_bypassed, (int, float)) and _ip_bypassed >= 1, True)
+
+# --- (c2) THE THREE ARMS IN ONE DATABASE, AND THE WHOLE REGISTRY OVER IT ---
+#
+# WHY A SECOND DATABASE AND NOT MORE SEED ROWS. The three shapes below have to
+# sit in ONE run to be compared, and the main seed's runs are already load
+# bearing for a dozen other expectations. This one holds exactly three rows and
+# nothing else, so every number is the arithmetic of three literals.
+#
+# The arms:
+#   grouped              -- the packer ran; packed_chunks an integer; the
+#                           provider reported a cached figure.
+#   per_trial healthy    -- the packer was BYPASSED; packed_chunks NULL; the
+#                           wave reported a cached figure.
+#   per_trial silent wave -- the same, except that no wave call reported the
+#                           field at all, so the cached column is NULL. This is
+#                           the row the warmup used to turn into a 0.
+#
+# WHAT IS BEING ASKED: nothing in the registry may crash on those NULLs, and
+# nothing may misclassify the bypassed rows as unmeasured or the silent wave as
+# "cached nothing".
+_ARMS_DB = os.path.join(_TMP_DIR, "three_arms.db")
+with quiet():
+    initialize_database(_ARMS_DB)
+_arms_conn = sqlite3.connect(_ARMS_DB)
+_arms_cur = _arms_conn.cursor()
+_arms_cur.execute(
+    "INSERT INTO runs (started_at, finished_at, status, invocation_source, "
+    "resumed, fingerprint_version, llm_classifier_renderer_digest, "
+    "matching_model_configured, matching_call_mode, qdrant_collection, "
+    "collection_points, data_snapshot_date) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ("2026-08-22T09:00:00", "2026-08-22T10:00:00", "FINISHED", "batch_runner",
+     0, 2, "digest-arms", "gpt-5.6-terra", MATCHING_CALL_MODE_PER_TRIAL,
+     "trial_criteria_20260807_111807", 12067, "2026-02-26"))
+_ARMS_RUN = _arms_cur.lastrowid
+
+_ARM_ROWS = [
+    # (patient, call mode, packing blob, packed_chunks, cached tokens)
+    ("A-GROUPED", MATCHING_CALL_MODE_GROUPED,
+     _packing_blob(20000, [(10, 18000, False)]), 1, 4096),
+    ("A-PERTRIAL-CACHED", MATCHING_CALL_MODE_PER_TRIAL,
+     _bypass_packing_blob(6), None, 3500),
+    ("A-PERTRIAL-SILENT", MATCHING_CALL_MODE_PER_TRIAL,
+     _bypass_packing_blob(6), None, None),
+]
+for _pid, _mode, _blob, _chunks, _cached in _ARM_ROWS:
+    _arms_cur.execute(
+        "INSERT INTO inferences (patient_id, timestamp, run_id, "
+        "matching_model, matching_call_mode, llm_classifier_input_tokens, "
+        "llm_classifier_output_tokens, llm_classifier_cached_input_tokens, "
+        "estimated_cost_usd, llm_classifier_packing, "
+        "llm_classifier_packed_chunks, llm_classifier_output_split_threshold, "
+        "llm_classifier_output_ceiling, "
+        "llm_classifier_output_tokens_estimated, "
+        "llm_classifier_call_details, candidates_retrieved, "
+        "candidates_reranked, candidates_filtered, candidates_evaluated, "
+        "eligible_matches, near_misses, not_evaluable_trials, total_time) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+        "?, ?, ?)",
+        (_pid, "2026-08-22T09:30:00", _ARMS_RUN, _MODEL_A, _mode, 12000, 3000,
+         _cached, 0.06, _blob, _chunks, _THRESHOLD_NOW, _CEILING_NOW, 6600,
+         _call_details_blob(500, 500, 500), 90, 40, 6, 6, 4, 2, 0, 90.0))
+_arms_conn.commit()
+
+check("(c2) the three-arm database really holds the three shapes it is named "
+      "for -- one integer packed_chunks, two NULLs, one NULL cached figure "
+      "and two measured ones (non-degeneracy: without this every check below "
+      "could be reading a database that failed to seed)",
+      _arms_conn.execute(
+          "SELECT COUNT(*), "
+          "SUM(llm_classifier_packed_chunks IS NULL), "
+          "SUM(llm_classifier_cached_input_tokens IS NULL), "
+          "SUM(json_extract(llm_classifier_packing, '$.bypassed_by') "
+          "    IS NOT NULL) FROM inferences").fetchone(), (3, 2, 1, 2))
+
+# THE WHOLE REGISTRY, not the three queries this pass touched. A NULL shape that
+# crashes some other query is the same defect one report away.
+check_does_not_raise(
+    "(c2) report() runs the entire registry over the three arms and reaches "
+    "the end -- no NULL shape introduced by this pass takes the process down",
+    queries.report, _arms_conn, out=lambda _line: None)
+_arms_unavailable = queries.unavailable(_arms_conn)
+check("(c2) ...and it skipped nothing: a fresh database has every additive "
+      "column, so the run above really executed every query rather than "
+      "passing by declining most of them",
+      sorted(_arms_unavailable), [])
+
+_arms_ip = _by_run(_arms_conn, "stage5_input_packing_pressure")
+_arms_row = _grp(_arms_ip, str(_ARMS_RUN))
+check("(c2) the pressure query classifies the arms: three inferences, one "
+      "packed chunk from the grouped row, two BYPASSED and none unmeasured",
+      (_num(_cell(_arms_row, "inferences")), _num(_cell(_arms_row, "chunks")),
+       _num(_cell(_arms_row, "bypassed_inferences")),
+       _num(_cell(_arms_row, "unpacked_inferences"))), (3, 1, 2, 0))
+check("(c2) ...and the pressure it reports is the grouped row's alone: "
+      "18000/20000, undisturbed by two rows that packed nothing",
+      (_num(_cell(_arms_row, "peak_pressure"), 4), _num(_cell(_arms_row, "mean_pressure"), 4),
+       _num(_cell(_arms_row, "min_headroom_tokens"))), (0.9, 0.9, 2000))
+# A RUN OF ONLY BYPASSED ROWS. Without it the readings above are all carried by
+# the one grouped row, and a query that reported 0 for a bypassed-only run --
+# a measured floor asserted about a run that measured nothing -- would pass.
+_arms_cur.execute(
+    "INSERT INTO runs (started_at, finished_at, status, invocation_source, "
+    "resumed, fingerprint_version, matching_call_mode) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+    ("2026-08-22T11:00:00", "2026-08-22T11:30:00", "FINISHED", "batch_runner",
+     0, 2, MATCHING_CALL_MODE_PER_TRIAL))
+_ARMS_RUN_ALLBYPASS = _arms_cur.lastrowid
+for _pid in ("A-ONLY-BYPASS-1", "A-ONLY-BYPASS-2"):
+    _arms_cur.execute(
+        "INSERT INTO inferences (patient_id, timestamp, run_id, "
+        "matching_model, matching_call_mode, llm_classifier_input_tokens, "
+        "llm_classifier_output_tokens, estimated_cost_usd, "
+        "llm_classifier_packing, llm_classifier_packed_chunks) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (_pid, "2026-08-22T11:10:00", _ARMS_RUN_ALLBYPASS, _MODEL_A,
+         MATCHING_CALL_MODE_PER_TRIAL, 12000, 3000, 0.06,
+         _bypass_packing_blob(6), None))
+_arms_conn.commit()
+_arms_ip2 = _by_run(_arms_conn, "stage5_input_packing_pressure")
+_all_bypass = _grp(_arms_ip2, str(_ARMS_RUN_ALLBYPASS))
+check("(c2) a run of ONLY bypassed rows is REPORTED, with both of them in the "
+      "bypassed bucket and none in the unmeasured one -- a per-trial campaign "
+      "must not read as a campaign whose measurements were lost",
+      (_num(_cell(_all_bypass, "inferences")), _num(_cell(_all_bypass, "bypassed_inferences")),
+       _num(_cell(_all_bypass, "unpacked_inferences")), _num(_cell(_all_bypass, "chunks"))),
+      (2, 2, 0, 0))
+check("(c2) ...and every pressure reading for it is NULL rather than 0, which "
+      "would assert a measured floor about a run that packed nothing",
+      [_is_null(_v) for _v in (_cell(_all_bypass, "peak_pressure"),
+                               _cell(_all_bypass, "mean_pressure"),
+                               _cell(_all_bypass, "min_headroom_tokens"),
+                               _cell(_all_bypass, "budget_min"))],
+      [True, True, True, True])
+check("(c2) ...(non-degeneracy: the group really exists in the frame, so the "
+      "four NULLs above are a row's readings and not a missing row)",
+      str(_ARMS_RUN_ALLBYPASS) in _arms_ip2, True)
+
+_arms_op = _by_run(_arms_conn, "stage5_output_split_pressure")
+check("(c2) the OUTPUT pressure query is untouched by the arm: all three rows "
+      "are measured there, because its inputs are stored columns the bypass "
+      "does not write",
+      (_num(_grp(_arms_op, str(_ARMS_RUN)).inferences),
+       _num(_grp(_arms_op, str(_ARMS_RUN)).unmeasured)), (3, 0))
+
+# THE PRICED FRAME, not the raw GROUP BY: `cost_complete` is added by
+# price_model_groups and is the field a consumer asks, so reading the raw query
+# would have tested the half of the cost path this pass cannot reach.
+_arms_cost_df = queries.cost_by_model(_arms_conn)
+_arms_cost = {str(_r.matching_model): _r
+              for _r in _arms_cost_df.itertuples()}
+
+
+def _cost_field(model, field):
+    """One field of a priced cost row, or a named absence. Never raises.
+
+    A bare attribute read here ABORTS the file when a defect drops the column
+    or the group -- which is precisely when this section owes a failure. This
+    file has had to close that shape twice already.
+    """
+    _row = _arms_cost.get(model)
+    if _row is None:
+        return f"<no cost row: {model}>"
+    return getattr(_row, field, f"<no cost field: {field}>")
+
+
+check("(c2) the cost query prices all five rows as one model group and is not "
+      "disturbed by either NULL: 5 x 0.06 stored, and the recomputed figure "
+      "is reported COMPLETE rather than qualified",
+      (_MODEL_A in _arms_cost,
+       round(float(_cost_field(_MODEL_A, "stored_cost")), 4)
+       if _MODEL_A in _arms_cost else _cost_field(_MODEL_A, "stored_cost"),
+       bool(_cost_field(_MODEL_A, "cost_complete"))
+       if _MODEL_A in _arms_cost else _cost_field(_MODEL_A, "cost_complete")),
+      (True, 0.3, True))
+check("(c2) ...(non-degeneracy: `cost_complete` is a real field of the priced "
+      "frame, so the True above is a reading rather than a truthy absence)",
+      "cost_complete" in _arms_cost_df.columns, True)
+
+_arms_modes = list(
+    queries.run(_arms_conn, "call_mode_comparison").itertuples())
+check("(c2) the call-mode comparison still separates the arms on this "
+      "database, so a reader can attribute every NULL-packed row: four "
+      "per-trial rows across the two runs, one grouped",
+      (sorted({str(_r.row_mode) for _r in _arms_modes}),
+       sum(_safe_int(_r.patients) for _r in _arms_modes
+           if str(_r.row_mode) == MATCHING_CALL_MODE_PER_TRIAL),
+       sum(_safe_int(_r.patients) for _r in _arms_modes
+           if str(_r.row_mode) == MATCHING_CALL_MODE_GROUPED)),
+      (sorted({MATCHING_CALL_MODE_GROUPED, MATCHING_CALL_MODE_PER_TRIAL}),
+       4, 1))
+# THE WHOLE REGISTRY AGAIN, over the FINAL shape -- five rows, two runs, one of
+# them entirely bypassed. The first report() above ran before those rows
+# existed, so without this the bypassed-only run (the shape whose every
+# pressure reading is NULL) never passes through report()'s renderers at all.
+check_does_not_raise(
+    "(c2) ...and report() still reaches the end with a run whose every "
+    "packing reading is NULL -- the renderers, not only the SQL",
+    queries.report, _arms_conn, out=lambda _line: None)
+_arms_conn.close()
+
 
 # --- (d) the output distribution, per run ----------------------------------
 _op = _by_run(_conn, "stage5_output_split_pressure")
@@ -3556,15 +3963,27 @@ check("8c-c: ...and a row whose arm was never recorded is its own bucket, "
 # --- THE THREE NUMBERS, AGAINST THE SEED RATHER THAN THE FRAME -------------
 #
 # EXPECTATIONS ARE WRITTEN FROM THE SEED, never read back out of the query under
-# test. P-CONSISTENT-B is the only per_trial row in RUN-CLEAN and its stored cost
-# is 0.095.
+# test. RUN-CLEAN's per_trial arm is P-CONSISTENT-B (0.095) and P-BYPASSED
+# (0.055) -- the second is per_trial because a bypassed packer IS per-trial
+# mode, and putting it on the grouped arm to keep this number at one patient
+# would be a seed that lies about the arm to protect an expectation.
 _CLEAN = str(_RUN_IDS["RUN-CLEAN"])
+_CLEAN_PER_TRIAL = ["P-CONSISTENT-B", "P-BYPASSED"]
+check("8c-d-pre: the seed really puts exactly those two patients on "
+      "RUN-CLEAN's per-trial arm (non-degeneracy: the two numbers below are "
+      "written from this list, so a list that had drifted would make them "
+      "agree with the wrong seed)",
+      sorted(_r for _r, _v in _SEED_ROWS
+             if _r in _RUN_MEMBERSHIP["RUN-CLEAN"]
+             and _v.get("matching_call_mode") == MATCHING_CALL_MODE_PER_TRIAL),
+      sorted(_CLEAN_PER_TRIAL))
 _per_trial_row = _mode_rows.get((_CLEAN, MATCHING_CALL_MODE_PER_TRIAL))
-check("8c-d: the per-trial arm of RUN-CLEAN is exactly the one patient seeded "
-      "into it", None if _per_trial_row is None else _safe_int(_per_trial_row.patients), 1)
-check("8c-e: ...with that patient's stored cost, not the run's total",
+check("8c-d: the per-trial arm of RUN-CLEAN is exactly the patients seeded "
+      "into it", None if _per_trial_row is None else _safe_int(_per_trial_row.patients),
+      len(_CLEAN_PER_TRIAL))
+check("8c-e: ...with those patients' stored costs summed, not the run's total",
       None if _per_trial_row is None else round(float(_per_trial_row.cost_usd), 3),
-      0.095)
+      round(0.095 + 0.055, 3))
 
 _grouped_row = _mode_rows.get((_CLEAN, MATCHING_CALL_MODE_GROUPED))
 check("8c-f: ...and the grouped arm of the SAME run is a SEPARATE row, so one "

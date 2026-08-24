@@ -1036,8 +1036,30 @@ check("2h  ...with no budget and no cap selected, because none was applied",
       (at(_packing2, "budget_tokens"), at(_packing2, "max_chunks"),
        at(_packing2, "cap_relaxed_budget"), at(_packing2, "over_budget_chunk")),
       (None, None, False, False))
-check("2i  ...and packed_chunks is 0, not 6: no chunk came from the packer",
-      at(_R2, "llm_classifier_packed_chunks"), 0)
+# ── packed_chunks IS NULL ON A BYPASS, AND 0 WOULD HAVE BEEN A LIE ─────────
+#
+# The column's documented tri-state (oncotriage/storage/database_logger.py)
+# reserves 0 for "the packer RAN and produced no chunk" -- an empty candidate
+# set. This patient sent SIX requests. Storing 0 made it read identically to a
+# patient with no candidates at all, in a column whose whole job is to say what
+# the packer did, and the NULL branch of the same tri-state ("the packer's
+# record does not describe this run") is a true statement about a bypass.
+check("2i  ...and packed_chunks is NULL, not 0 and not 6: the packer did not "
+      "run, so it has no chunk count -- and 0 is reserved for a packer that "
+      "RAN and produced none, which is an empty candidate set",
+      at(_R2, "llm_classifier_packed_chunks"), None)
+check("2i  ...non-degeneracy: this NULL is about a patient that really did "
+      "send six requests, which is what makes 0 the wrong value rather than "
+      "an equivalent one",
+      (len(_S2.wave_requests()), at(_R2, "llm_classifier_calls")), (6, 7))
+check("2i  ...and the REASON survives beside it: the scalar is NULL and the "
+      "blob still carries the bypass record, so the pair says 'bypassed' and "
+      "not 'unmeasured' -- packing NOT NULL with packed_chunks NULL IS the "
+      "bypass, which both-NULL (a failure return) is not",
+      (at(_R2, "llm_classifier_packing") is None,
+       at(at(_R2, "llm_classifier_packing"), "bypassed_by"),
+       at(at(_R2, "llm_classifier_packing"), "enabled")),
+      (False, config.MATCHING_CALL_MODE_PER_TRIAL, False))
 
 _R2off, _ = run_node(_SIX, per_trial=False)
 check("2j  the OTHER arm says the opposite, so 2f/2g are measurements: the "
@@ -1045,6 +1067,30 @@ check("2j  the OTHER arm says the opposite, so 2f/2g are measurements: the "
       ((at(_R2off, "llm_classifier_packing") or {}).get("enabled"),
        "bypassed_by" in (at(_R2off, "llm_classifier_packing") or {})),
       (True, False))
+# `>=` IS NOT WRITTEN BARE HERE. The value under test is now legitimately None
+# on one branch, and `None >= 1` raises inside check()'s argument list -- an
+# abort in place of the failure this very check owes. Measured: an over-broad
+# revert (packed_chunks always None) aborted this file before the guard.
+_off_chunks = at(_R2off, "llm_classifier_packed_chunks")
+check("2j  ...and its packed_chunks is an INTEGER, not the bypass NULL -- so "
+      "2i is a measurement of the branch rather than of the column being "
+      "unwritten everywhere. The default packing switch is ON, so this is the "
+      "shipped OFF-arm reading and it did not move",
+      (isinstance(_off_chunks, int),
+       isinstance(_off_chunks, int) and _off_chunks >= 1), (True, True))
+
+# THE 0 CASE IS STILL A 0, driven rather than argued. The packer is handed an
+# empty candidate set directly -- the node routes such a patient to
+# node_no_candidates, so this is the packer's own reading of the population the
+# column reserves 0 for -- and it must be distinguishable from the bypass above.
+_pk_empty_chunks, _pk_empty = _evaluation.pack_trials_by_input_tokens(
+    [], 100, config.MATCHING_INPUT_TOKEN_BUDGET,
+    config.MATCHING_MAX_INPUT_PACKED_CHUNKS, blocks=[])
+check("2i  ...while the packer's own empty-candidate-set reading is still 0 "
+      "and NOT the bypass NULL: it RAN (enabled), it named no bypass, and it "
+      "produced no chunk. That is the reading the tri-state reserves 0 for",
+      (_pk_empty["enabled"], "bypassed_by" in _pk_empty,
+       len(_pk_empty["chunks"]), _pk_empty_chunks), (True, False, 0, []))
 
 # The request bytes are the ones a single-trial render would have produced.
 # This is what says the block slice used for dispatch is the send text and not
@@ -2131,6 +2177,46 @@ check("5b(g) ...and none of the folded rows claims to have emitted entries",
               for c in at(_R5b, "llm_classifier_call_details")
               if c.get("unconsumed")}), [None])
 
+# ── THE CACHED FIGURE ON A FAILURE RETURN: LEDGER YES, TOTAL NO ────────────
+#
+# THE COLUMN'S OWN CONTRACT, pinned here because this is the only arm that can
+# state it. oncotriage/storage/database_logger.py documents
+# llm_classifier_cached_input_tokens as NULL for "a run that ended at a failure
+# return -- the totals are not carried out of those, the per-call ledger is,
+# and it is where a failed run's cache reading lives". `_billed_so_far()`
+# carries input, output and calls and deliberately NOT this, so the reading
+# survives per call and nowhere else.
+#
+# A CONSEQUENCE WORTH KNOWING, and it is why a revert that stopped
+# `_account_unconsumed` accumulating this figure was MEASURED to change nothing
+# at all: those writes reach no return of this node. They are the run's true
+# state and would become observable the day `_billed_so_far()` carries the
+# field; today they are unobservable, and the ledger below is the whole record.
+# THE KEY'S ABSENCE IS THE ASSERTION, tested on the dict rather than through
+# `at()`: a _Absent compares on its MESSAGE, so an equality against one would
+# pin an exception string rather than the contract.
+check("5b(g2) the failure return carries NO cached TOTAL, which is the "
+      "column's documented reading for a run that did not finish -- a number "
+      "here would be a partial sum presented as the run's. NULL is what "
+      "_pipeline_provenance() then stores",
+      ("llm_classifier_cached_input_tokens" in _R5b,
+       "llm_classifier_input_tokens" in _R5b), (False, True))
+check("5b(g2) ...while the LEDGER carries every one of the six readings, "
+      "abandoned rows included: the record of what was paid for survives the "
+      "abandonment even though the total does not",
+      [c.get("cached_tokens")
+       for c in at(_R5b, "llm_classifier_call_details")], [300] * 6)
+# `sorted` WITH A TOTAL KEY. A defect that drops the figure leaves this list
+# full of Nones, and `sorted` over them raises -- an abort on exactly the input
+# the check exists to reject. Measured: the plant that empties this field
+# aborted the file before the key was added.
+check("5b(g2) ...and the four FOLDED rows are among them, which is what says "
+      "`_account_unconsumed` records the figure rather than dropping it",
+      sorted((c.get("cached_tokens")
+              for c in at(_R5b, "llm_classifier_call_details")
+              if c.get("unconsumed")),
+             key=lambda v: (v is None, v or 0)), [300] * 4)
+
 # The identical property on the OTHER return that abandons a paid queue.
 _R5h, _S5h = run_node(_FIVE, per_trial=True, parallel=4,
                       stub=_Stub(bad_json_for=[_FIRST_ID]))
@@ -2249,13 +2335,19 @@ check("7a  every call records the provider's own cached figure: the warmup "
       ([c.get("cached_tokens") for c in _rows7 if c.get("warmup")],
        [c.get("cached_tokens") for c in _rows7 if not c.get("warmup")]),
       ([0], [700] * 5))
-check("7b  ...and the patient-level total continues into the existing column: "
-      "0 from the warmup plus 700 from each of five trial calls",
+check("7b  ...and the patient-level total is the WAVE's: 700 from each of "
+      "five trial calls, with the warmup's own figure excluded",
       at(_R7, "llm_classifier_cached_input_tokens"), 3500)
 check("7b  ...non-degeneracy: the warmup's 0 is a MEASURED zero and not an "
-      "absence, so the total above is a sum over six real readings",
+      "absence -- it is present in the ledger and simply not summed, which is "
+      "what makes 7c's NULL a decision rather than a missing reading",
       ([c.get("cached_tokens") for c in _rows7 if c.get("warmup")] == [0],
        len(_rows7)), (True, 6))
+check("7b  ...and the total is EXACTLY the wave's sum, so the warmup is "
+      "excluded by arithmetic rather than by having happened to be zero",
+      (at(_R7, "llm_classifier_cached_input_tokens"),
+       sum(c["cached_tokens"] for c in _rows7 if not c.get("warmup"))),
+      (3500, 3500))
 
 # THE PATHOLOGY THE PER-CALL FIGURES EXIST TO EXPOSE: a warmup that reported a
 # figure while no trial call behind it did. That is "the warmup warmed a prefix
@@ -2270,6 +2362,36 @@ check("7c  a cache that reports on the WARMUP only is visible per call, which "
               for c in at(_R7c, "llm_classifier_call_details")),
              key=lambda v: (v is not None, v or 0)),
       [None, None, None, None, None, 700])
+# THE DEFECT THIS EXCLUSION EXISTS FOR, driven end to end. The warmup reports a
+# figure and the WAVE says nothing at all. Folding the warmup in made the column
+# non-NULL, which is the column asserting "responses of this run reported the
+# field" about a wave that reported nothing -- and it is the same value a wave
+# that HAD reported would produce, so the two readings the column exists to
+# separate collapsed into one.
+check("7c  ...and the patient column stays NULL, because NO WAVE CALL "
+      "reported the field. A number here would be the warmup's, presented as "
+      "the run's, and would say the provider answered about caching when it "
+      "did not",
+      at(_R7c, "llm_classifier_cached_input_tokens"), None)
+check("7c  ...non-degeneracy: the warmup DID report, so this NULL is an "
+      "exclusion and not an absence of any reading anywhere",
+      [c.get("cached_tokens")
+       for c in at(_R7c, "llm_classifier_call_details") if c.get("warmup")],
+      [700])
+
+# THE OTHER HALF, and without it 7c would also pass against a node that had
+# stopped accumulating cached tokens altogether: a warmup reporting 0 (the
+# healthy shape) beside a wave that DOES report must give the wave's sum, not
+# NULL and not the warmup's zero.
+_R7c2, _ = run_node(_FIVE, per_trial=True, parallel=4,
+                    stub=_Stub(cached=300, warmup_cached=0))
+check("7c  ...while a warmup reporting 0 beside a wave that DOES report gives "
+      "the wave's sum -- so the exclusion removes the warmup's reading and "
+      "not the accumulator",
+      (at(_R7c2, "llm_classifier_cached_input_tokens"),
+       [c.get("cached_tokens")
+        for c in at(_R7c2, "llm_classifier_call_details")
+        if c.get("warmup")]), (1500, [0]))
 
 _R7d, _S7d = run_node(_FIVE, per_trial=True, parallel=4, stub=_Stub())
 check("7d  a provider that reports NO cached figure is carried as absent, "
@@ -2298,6 +2420,55 @@ check("7f  ...and a run whose wave reports a DIFFERENT figure moves the "
       at(run_node(_FIVE, per_trial=True, parallel=4,
                   stub=_Stub(cached=100, warmup_cached=0))[0],
          "llm_classifier_cached_input_tokens"), 500)
+# THE WARMUP'S FIGURE MOVES AND THE COLUMN DOES NOT. Every check above holds a
+# warmup at 0, where "excluded" and "added" are indistinguishable. This is the
+# one reading that separates them.
+_R7g, _ = run_node(_FIVE, per_trial=True, parallel=4,
+                   stub=_Stub(cached=100, warmup_cached=9999))
+check("7g  a warmup reporting a LARGE figure changes the column by nothing: "
+      "it is the wave's 5 x 100 and not 10,499. Without this, every check "
+      "above is satisfied by a node that still folds the warmup in, because "
+      "each of them holds the warmup at zero",
+      (at(_R7g, "llm_classifier_cached_input_tokens"),
+       [c.get("cached_tokens")
+        for c in at(_R7g, "llm_classifier_call_details") if c.get("warmup")]),
+      (500, [9999]))
+check("7g  ...and the ledger is the place that figure survives, untouched -- "
+      "the sum of every ROW still includes it, so nothing was discarded",
+      sum(c.get("cached_tokens") or 0
+          for c in at(_R7g, "llm_classifier_call_details")), 10499)
+
+# THE FALLBACK'S CACHE WRITER IS A TRIAL CALL AND ITS FIGURE COUNTS. When the
+# provider refuses the DEDICATED warmup's shape the node degrades to the
+# retired one-then-rest schedule, where the prefix is written by the first
+# TRIAL call -- there is no warmup row at all, so every reading of that run is
+# the wave's and the exclusion has nothing to remove. An exclusion keyed on
+# "the first call" rather than on the warmup would silently drop a real trial's
+# figure here, which is why this arm is asserted rather than assumed.
+_R7i, _S7i = run_node(
+    _FIVE, per_trial=True, parallel=4,
+    stub=_Stub(cached=200, warmup_raise=_WarmupRefused(
+        "Unrecognized request argument supplied: prompt_cache_key")))
+check("7i  on the fallback schedule there is no warmup row, and the column is "
+      "the sum over all five trial calls -- the writer among them included, "
+      "because it IS a trial call",
+      (at(_R7i, "llm_classifier_cached_input_tokens"),
+       [c.get("warmup") for c in at(_R7i, "llm_classifier_call_details")],
+       len(_S7i.wave_requests())), (1000, [None] * 5, 5))
+
+# GROUPED MODE IS UNTOUCHED. There is no warmup on that arm, so the exclusion
+# must be invisible there -- and a change that removed the accumulator instead
+# of the warmup's contribution would show up here and nowhere else.
+_R7h, _S7h = run_node(_FIVE, per_trial=False, stub=_Stub(cached=440))
+check("7h  grouped mode is unchanged: no warmup exists on that arm and the "
+      "single batched call's cached figure is the column",
+      (at(_R7h, "llm_classifier_cached_input_tokens"), len(_S7h.requests),
+       [c.get("warmup") for c in at(_R7h, "llm_classifier_call_details")]),
+      (440, 1, [None]))
+check("7h  ...and a grouped run whose provider reports nothing is still NULL, "
+      "never 0",
+      at(run_node(_FIVE, per_trial=False, stub=_Stub())[0],
+         "llm_classifier_cached_input_tokens"), None)
 
 
 # ===========================================================================

@@ -4125,7 +4125,39 @@ CLINICAL TRIALS:
             because nothing parsed it. So per-trial accounting that groups on
             `trials` or reads `entries_emitted` excludes it by construction,
             while every token it was billed is visible and is inside the
-            patient's totals.
+            patient's cost figures.
+
+            ITS CACHED FIGURE IS THE ONE READING THAT DOES NOT JOIN THE
+            PATIENT TOTAL, and that is the same convention one column over
+            rather than an exception to it. `llm_classifier_cached_input_tokens`
+            is documented as NULL = "no response of this run reported the
+            field" and 0 = "responses reported and the provider cached
+            nothing" -- and 0 is the reading that says a prefix is NOT being
+            reused. The warmup is the request that WRITES the prefix, so it
+            reports 0 on a perfectly healthy run: folding it in flipped the
+            column from NULL to 0 whenever the wave itself reported nothing,
+            and a wave that has gone silent about caching then looked
+            identical to a wave that reported no cache hits. Those are the two
+            readings the column exists to separate. So the wave owns the
+            total, exactly as it owns `trials` and `entries_emitted`, and the
+            warmup's own figure stays in the per-call ledger below where it is
+            attributable -- which is where section 7 of
+            tests/test_agent_stage5_per_trial_calls.py reads it, and the only
+            place it can answer "did the warmup write the prefix or find it
+            already warm".
+
+            THE COST FIGURES ARE UNAFFECTED AND MUST BE. `input_tokens` and
+            `output_tokens` still carry the warmup: it is a billed call, and
+            estimated_cost_usd is priced off those. The cached figure is not a
+            cost term (get_model_cost() prices no cache discount), so removing
+            it from the total moves no money and no historical comparison. The
+            one property it does weaken is stated rather than glossed: the
+            cached total is now a subset of the WAVE's input tokens rather
+            than of `llm_classifier_input_tokens`, which is still an upper
+            bound on it, so "cached <= input" holds and "cached / input" is a
+            slight under-estimate on the per-trial arm by the warmup's own
+            prompt. The per-call ledger is exact for anyone who needs the
+            other number.
 
             `depth` IS None, NOT 0. Zero is a real split depth -- it is the
             depth every first-generation chunk carries -- and the warmup has no
@@ -4133,7 +4165,7 @@ CLINICAL TRIALS:
             """
             nonlocal calls_made, input_tokens, output_tokens
             nonlocal reasoning_tokens, reasoning_tokens_reported
-            nonlocal cached_input_tokens, cached_input_reported, model_answered
+            nonlocal model_answered
             _u = getattr(response_, "usage", None)
             _pt = getattr(_u, "prompt_tokens", None)
             _ct = getattr(_u, "completion_tokens", None)
@@ -4147,11 +4179,17 @@ CLINICAL TRIALS:
             if _rt is not None:
                 reasoning_tokens += _rt
                 reasoning_tokens_reported = True
+            # READ AND RECORDED, DELIBERATELY NOT ACCUMULATED. See the
+            # docstring: the patient-level cached column is the WAVE's
+            # reading, and the warmup's belongs to the ledger row below.
+            # `cached_input_tokens` / `cached_input_reported` are therefore
+            # not declared nonlocal here, which is a guard and not a tidy-up:
+            # an accumulation added back by accident makes both names LOCAL to
+            # this function and raises UnboundLocalError on the first warmup
+            # (measured, not assumed), rather than silently re-joining the
+            # total the way a `nonlocal` left in place would.
             _cd = getattr(getattr(_u, "prompt_tokens_details", None),
                           "cached_tokens", None)
-            if _cd is not None:
-                cached_input_tokens += _cd
-                cached_input_reported = True
             _expected = config.matching_wire_model()
             _returned = getattr(response_, "model", None)
             if _returned is not None and _returned != _expected:
@@ -6248,7 +6286,31 @@ CLINICAL TRIALS:
         # TWO KEYS RATHER THAN ONE, because they answer different questions and
         # one of them is a scalar a query can group by. The count is the
         # headline; the report is the detail behind it.
-        "llm_classifier_packed_chunks": len(packing_report["chunks"]),
+        #
+        # AND A BYPASSED RUN GETS None RATHER THAN 0, which is the column's own
+        # tri-state applied honestly rather than an exception to it. 0 is
+        # documented in oncotriage/storage/database_logger.py as "the packer
+        # RAN and produced no chunk" -- an empty candidate set -- so per-trial
+        # mode storing 0 on a healthy six-trial patient made a row carrying six
+        # requests indistinguishable from a row carrying none. NULL's
+        # documented meaning is "the packer's record does not describe this
+        # run", and that is exactly true here: the packer did not run, its
+        # budget selected nothing, and the chunks that WERE sent came from the
+        # per-trial partition rather than from it. The count would have been a
+        # measurement of the packer, and there is no packer to measure.
+        #
+        # DERIVED FROM THE BLOB, never from a second flag. `bypassed_by` is
+        # present on the bypass branch and on no other (the
+        # absent-rather-than-empty convention argued at that branch), so the
+        # scalar and the report cannot come to disagree about whether the
+        # packer ran -- which is the one way a two-column record of one fact
+        # fails. `llm_classifier_packing` is unchanged and still carries the
+        # bypass record with its reason, so nothing is lost: a reader wanting
+        # "how many requests did this patient send" reads
+        # llm_classifier_calls, which counts them all.
+        "llm_classifier_packed_chunks": (
+            None if "bypassed_by" in packing_report
+            else len(packing_report["chunks"])),
         "llm_classifier_packing": {
             **packing_report,
             # The identity of the prefix every one of those chunks shared. The

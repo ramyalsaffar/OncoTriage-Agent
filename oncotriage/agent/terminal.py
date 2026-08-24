@@ -292,7 +292,16 @@ def _pipeline_provenance(state) -> Dict:
         # llm_classifier_cached_input_tokens is a SUBSET of
         # llm_classifier_input_tokens and never a costing term -- get_model_cost
         # prices the whole input at the uncached rate, deliberately, so the
-        # stored cost stays comparable with every historical row.
+        # stored cost stays comparable with every historical row. On the
+        # per-trial arm it is the WAVE's figure and excludes the cache warmup,
+        # which reports 0 by design and would otherwise flip the column from
+        # NULL to 0 on every such row; the exclusion is argued at
+        # _account_warmup and its consequences at the column.
+        #
+        # llm_classifier_packed_chunks is NULL rather than 0 whenever something
+        # BYPASSED the packer -- per-trial call mode does -- because 0 means
+        # "the packer ran and produced no chunk", i.e. an empty candidate set.
+        # The bypass is stated in llm_classifier_packing.bypassed_by instead.
         #
         # ALL FOUR NOW HAVE A DATABASE COLUMN. They used to have none -- the
         # comment here recorded that as a deferred schema decision, and while

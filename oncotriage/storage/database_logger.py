@@ -666,6 +666,26 @@ INFERENCE_COLUMN_ADDITIONS = {
     #                  exists to distinguish from the absence above, and it is
     #                  the reading that says a prefix is not being reused.
     #
+    #   THE PER-TRIAL CACHE WARMUP IS NOT IN THIS FIGURE, and that exclusion is
+    #   what keeps the two readings above apart on that arm. The warmup is the
+    #   request that WRITES the shared prefix, so it reports 0 on a completely
+    #   healthy run; folding it in turned every per-trial row into a 0 and made
+    #   "the wave said nothing about caching" indistinguishable from "the wave
+    #   reported and nothing was cached" -- the exact pair of readings this
+    #   column is for. So on the per-trial arm this is the WAVE's total: NULL
+    #   means no trial call reported the field, 0 means trial calls reported it
+    #   and the provider served nothing from cache. It is the same convention
+    #   the ledger's `trials` and `entries_emitted` already apply to that row.
+    #   The warmup's own figure is untouched in llm_classifier_call_details,
+    #   on the row carrying `warmup`, which is the only place it can answer
+    #   whether the warmup wrote the prefix or found it already warm.
+    #
+    #   CONSEQUENCE, STATED: on the per-trial arm this is a subset of the
+    #   WAVE's input tokens rather than of llm_classifier_input_tokens, which
+    #   still carries the warmup and is therefore still an upper bound -- so
+    #   "cached <= input" holds and a cached/input ratio under-reads by the
+    #   warmup's own prompt. Nothing is re-based: this was never a cost term.
+    #
     # llm_classifier_call_details IS THE ONLY COLUMN THAT CAN ANSWER WHETHER
     # THE CACHE WARMS. The summed figure above cannot: 5,000 cached tokens
     # across three calls is equally consistent with a cache that warms after
@@ -687,15 +707,54 @@ INFERENCE_COLUMN_ADDITIONS = {
     #                  tests `is not None` rather than truthiness for exactly
     #                  this reason; see the value expression.
     #
-    #   packed_chunks / packing  NULL = the packer's record does not describe
-    #                  this run. Stage 5 writes both on its SUCCESS return only
-    #                  (hallucinated_trials' convention, not the truncation
-    #                  counters'): the chunk list is a plan, and a run that died
-    #                  at its first call would otherwise publish the whole plan
-    #                  as though every request in it had been sent.
-    #                  0 chunks is reachable and is a measurement: the packer
-    #                  ran and produced no chunk, which is an empty candidate
-    #                  set, not an absent packer.
+    #   packed_chunks  NULL = the packer's record does not describe this run.
+    #                  TWO POPULATIONS, and they share the NULL because they
+    #                  are the same statement:
+    #                    (a) the run did not reach the success return. Stage 5
+    #                        writes this on its SUCCESS return only
+    #                        (hallucinated_trials' convention, not the
+    #                        truncation counters'): the chunk list is a plan,
+    #                        and a run that died at its first call would
+    #                        otherwise publish the whole plan as though every
+    #                        request in it had been sent.
+    #                    (b) SOMETHING BYPASSED THE PACKER. Per-trial call mode
+    #                        partitions the batch itself and the packer never
+    #                        runs, so there is no chunk count to report -- the
+    #                        requests that went out came from the mode, not
+    #                        from a budget. The bypass is NOT invisible: it is
+    #                        named in llm_classifier_packing.bypassed_by, which
+    #                        is present on that branch and on no other, and
+    #                        stage5_input_packing_pressure counts those rows in
+    #                        `bypassed_inferences` rather than folding them into
+    #                        `unpacked_inferences`.
+    #
+    #                  0 chunks is reachable and is a measurement, and it has
+    #                  TWO producers, separated by packing.enabled rather than
+    #                  by this scalar -- stated here because a reader who takes
+    #                  0 to mean only the first will misread the second:
+    #                    enabled = true  -- the packer RAN and produced no
+    #                        chunk, i.e. an empty candidate set.
+    #                    enabled = false -- MATCHING_INPUT_PACKING_ENABLED was
+    #                        off, so the batch went out as one unpacked
+    #                        request. This is the pre-packer node's behaviour
+    #                        preserved deliberately; it is NOT the bypass, and
+    #                        it is NOT rewritten to NULL, because
+    #                        `enabled = false` with no bypassed_by already says
+    #                        it and section 6e of
+    #                        tests/test_agent_stage5_input_packing.py is the
+    #                        standing contract that it does.
+    #                  What 0 is NOT is a bypassed run: a per-trial row storing
+    #                  0 here would be a six-request patient reading identically
+    #                  to a patient with no candidates at all, which is why (b)
+    #                  above is a NULL. Use llm_classifier_calls for "how many
+    #                  requests did this patient send"; this column counts the
+    #                  PACKER's chunks.
+    #
+    #   packing        NULL on (a) for the same reason, and NEVER on (b): the
+    #                  bypass record IS the blob, carrying enabled = false, no
+    #                  budget, no cap and bypassed_by. So the pair is not
+    #                  redundant -- packing NOT NULL with packed_chunks NULL is
+    #                  exactly the bypass, and both NULL is the failure return.
     #
     # packing is the report BEHIND the count and the count is the scalar a
     # query groups by; both are stored because a JSON blob cannot be grouped on

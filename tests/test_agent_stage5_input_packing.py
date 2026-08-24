@@ -932,9 +932,15 @@ _ids5 = [re.findall(r"<<<TRIAL_DATA nct_id=(\S+) ", r["messages"][1]["content"])
          for r in _stub5.requests]
 check("5b  packing capped the first generation at the chunk cap...",
       _result5.get("llm_classifier_packed_chunks"), 2)
+# NOT A BARE `>`. `llm_classifier_packed_chunks` is legitimately None on a run
+# whose packer was BYPASSED (per-trial call mode), so `int > None` raises --
+# inside a check() argument that is an abort in place of a failure. This arm
+# never bypasses, which is exactly why the comparison has to say so rather than
+# assume it.
+_chunks5 = _result5.get("llm_classifier_packed_chunks")
 check("5c  ...and the output pre-split then halved those, so MORE requests "
       "were issued than the packer produced chunks",
-      len(_stub5.requests) > _result5.get("llm_classifier_packed_chunks"), True)
+      isinstance(_chunks5, int) and len(_stub5.requests) > _chunks5, True)
 check("5d  the pre-split's own counter moved, so the two mechanisms are "
       "counted apart rather than folded together",
       _result5.get("llm_classifier_truncation_splits") > 0, True)
