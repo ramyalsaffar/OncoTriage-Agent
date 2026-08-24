@@ -108,8 +108,11 @@ except ImportError:
 from oncotriage.agent.evaluation import request_stage5_shutdown
 from oncotriage.ablation.study import (
     AlreadyRunning,
+    EXIT_LOCK_UNAVAILABLE,
     EXIT_LOCKED,
+    LockUnavailable,
     exclusive_run_lock,
+    lock_unavailable_lines,
     main,
     parse_args,
     run_lock_refusal_lines,
@@ -309,6 +312,22 @@ if __name__ == "__main__":
         for _line in run_lock_refusal_lines(_held):
             console.out(_line)
         sys.exit(EXIT_LOCKED)
+
+    except LockUnavailable as _lock_error:
+        # THE LOCK COULD NOT BE ATTEMPTED, WHICH IS A DIFFERENT FINDING FROM
+        # "another study holds it" AND EXITS DIFFERENTLY. Before this clause the
+        # only outcome was an uncaught OSError traceback -- no diagnosis, no
+        # path, no statement that nothing had been billed.
+        #
+        # `except LockUnavailable` AND NOT `except OSError`: main() runs INSIDE
+        # the `with` above, so an OSError clause here would catch every OSError
+        # a multi-hour study can raise and report it as a lock problem while
+        # discarding the study's real diagnosis. The conversion happens at the
+        # acquisition site, where the only OSError reachable is the lock's own.
+        console.out()
+        for _line in lock_unavailable_lines(_lock_error):
+            console.out(_line)
+        sys.exit(EXIT_LOCK_UNAVAILABLE)
 
 
 #------------------------------------------------------------------------------

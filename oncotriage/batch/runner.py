@@ -126,6 +126,7 @@ on first call rather than at import.
 """
 
 import contextlib
+import errno
 import getpass
 import glob
 import hashlib
@@ -134,6 +135,7 @@ import os
 import random
 import socket
 import sqlite3
+import stat
 import tempfile
 import threading
 import time
@@ -752,6 +754,125 @@ already running" from "rows were lost" without parsing output.
 """
 
 
+EXIT_LOCK_UNAVAILABLE = 1
+"""The entry point's exit code when the lock could not be ATTEMPTED at all.
+
+DELIBERATELY NOT ``EXIT_LOCKED``. 3 means "another copy of this program is
+already running", which a supervisor may reasonably treat as benign and retry
+later; this means "the lock file could not be opened", which no amount of
+waiting fixes and which needs a person. 1 is what every other refusal in this
+entry point returns -- the stale sentinel, the failed ``--clear-stop`` -- and
+it carries the same standing: nothing has been run and nothing has been billed.
+
+THE RESIDUAL AMBIGUITY IS STATED RATHER THAN GLOSSED: 1 is ALSO the
+reconciliation verdict's "rows were lost", so a supervisor reading the exit code
+alone cannot tell "the lock would not open" from "a campaign ran and lost rows".
+That collision is not introduced here -- the stale-sentinel refusal and the
+failed ``--clear-stop`` already exit 1 -- and giving THIS refusal a fourth code
+while leaving those two on 1 would make the vocabulary less legible, not more.
+Separating "refused before running" from "ran and something was wrong" across
+all three is a contract change with its own argument; the console line is
+unambiguous either way.
+"""
+
+
+LOCK_DIRECTORY_MODE = 0o700
+"""Owner-only, on the directory the lock files live in. See ``lock_directory``."""
+
+LOCK_FILE_MODE = 0o600
+"""Owner-only, on the lock file itself, at CREATION.
+
+A mode argument to ``os.open`` applies only when the file is created, so this
+does not repair a lock file that already exists with wider permissions. It does
+not need to: the file lives inside a 0700 directory, which is what actually
+excludes another user, and the record inside it is a pid, a host and a
+username -- not a secret. What the narrow mode buys is that a lock file
+inherited from a previous release, or copied about by a backup tool, does not
+become the one world-writable thing in the tree.
+"""
+
+
+def lock_directory() -> str:
+    """Where this user's lock files live. PURE -- it creates nothing.
+
+    ``ensure_lock_directory()`` is the one that creates, and the split is the
+    ``output_dir()`` / ``ensure_output_dir()`` lesson this project already
+    recorded once: a caller who only wants to PRINT the path -- ``--help``, a
+    diagnostic, a test -- must not bring a directory into existence by asking.
+
+    A PER-USER SUBDIRECTORY RATHER THAN THE BARE TEMP DIRECTORY, and the reason
+    is a real attack rather than tidiness. ``tempfile.gettempdir()`` is
+    world-writable and sticky, and the lock file's name is a SHA-256 of a path
+    -- derivable by anybody who can guess the deployment's checkpoint
+    directory. Before this, a different user on the same host could pre-create
+    ``{tmp}/oncotriage-batch-run-<digest>.lock`` as a SYMLINK to any file this
+    user can write, and the first run to start would ``O_CREAT`` through it and
+    then ``ftruncate`` the target to zero. The sticky bit does not help: it
+    stops one user deleting another's file, not creating a new one at a name
+    nobody has claimed yet. A 0700 directory means the name cannot be claimed
+    by anyone else in the first place, and ``O_NOFOLLOW`` in
+    ``exclusive_run_lock`` closes the residual case where this user's own
+    directory somehow holds a symlink.
+
+    THE DIRECTORY IS NAMED BY THE UID AND NOT BY THE LOGIN NAME, which is a
+    deliberate departure from the obvious form. ``getpass.getuser()`` consults
+    ``LOGNAME``, ``USER``, ``LNAME`` and ``USERNAME`` BEFORE the password
+    database -- all four settable by the very process asking -- so a login-name
+    directory would split one real user's lock namespace in two the moment
+    those variables differed between two invocations (a cron entry with a bare
+    environment beside an interactive shell is the ordinary way that happens).
+    Two namespaces means two locks for one checkpoint directory, which is
+    exactly the silent double bill THE RUN LOCK exists to prevent. The uid is
+    the identity the ownership check below compares against, so the name and
+    the check are one fact. The login name is still recorded IN the lock file,
+    which is where an operator reads it.
+    """
+    return os.path.join(tempfile.gettempdir(), f"oncotriage-{os.getuid()}")
+
+
+def ensure_lock_directory() -> str:
+    """Create the lock directory if absent, verify it, and return it.
+
+    RAISES ``OSError``. Every caller in this module is inside
+    ``exclusive_run_lock``, which converts it to ``LockUnavailable`` so an
+    entry point can print a diagnosis instead of a traceback.
+
+    ``exist_ok=True`` DOES NOT CHMOD AN EXISTING DIRECTORY, so creating it 0700
+    is only half the guarantee -- a directory already sitting there with wider
+    permissions, or owned by somebody else, would be used exactly as if this
+    function had made it. The three checks below are the other half, and each
+    names a distinct failure:
+
+    * ``lstat``, never ``stat``: the thing at this path being a SYMLINK is one
+      of the states this whole function exists to refuse, and ``stat`` would
+      follow it and report on the target.
+    * owned by this uid: another user's directory, however permissive, is not
+      ours to write locks into.
+    * not group- or other-writable: a 0777 directory pre-created by anybody
+      re-opens the symlink substitution the per-user directory closes.
+
+    It refuses rather than repairing. ``chmod``-ing somebody else's directory
+    is not this program's business, and silently narrowing a directory that
+    another tool deliberately shared would be a surprise landing in a batch
+    run's first second.
+    """
+    root = lock_directory()
+    os.makedirs(root, mode=LOCK_DIRECTORY_MODE, exist_ok=True)
+    info = os.lstat(root)
+    if not stat.S_ISDIR(info.st_mode):
+        raise OSError(errno.ENOTDIR,
+                      "the run-lock directory is not a directory", root)
+    if info.st_uid != os.getuid():
+        raise OSError(errno.EPERM,
+                      f"the run-lock directory is owned by uid {info.st_uid}, "
+                      f"not by this process (uid {os.getuid()})", root)
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise OSError(errno.EPERM,
+                      f"the run-lock directory is writable by group or other "
+                      f"(mode {stat.S_IMODE(info.st_mode):04o})", root)
+    return root
+
+
 def run_lock_path(checkpoint_dir=None) -> str:
     """Where the run lock for ``checkpoint_dir`` lives.
 
@@ -772,12 +893,32 @@ def run_lock_path(checkpoint_dir=None) -> str:
     ``paths.checkpoint_path`` is read as a MODULE ATTRIBUTE for the reason
     ``stop_switch_path`` records: a from-import fires the lazy resolver at
     import and globs the sibling data tree just to load this module.
+
+    THE KEY IS ``realpath`` AND NOT ``abspath``, AND THE DIFFERENCE IS A SECOND
+    LOCK FOR ONE DIRECTORY. ``abspath`` normalizes ``.``, ``..`` and the
+    working directory and STOPS THERE -- it does not resolve symlinks -- so two
+    invocations naming one checkpoint directory through different links hashed
+    to two different digests, took two different lock files, and both ran. Not
+    hypothetical in any of the three ways this project is deployed: Docker bind
+    mounts, ``ONCOTRIAGE_MAIN_PATH`` pointed at a symlinked deployment, and
+    macOS, where ``tempfile.gettempdir()`` is ``/var/folders/...`` and ``/var``
+    is itself a link to ``/private/var``. ``realpath`` collapses every one of
+    those to the same string, which is the only thing that makes "one
+    checkpoint directory, one lock" true.
+
+    It keeps the two properties the old form had and the tests pin: it is
+    deterministic (``realpath`` is a pure function of the filesystem at the
+    moment of the call), and a trailing separator makes no difference, because
+    ``realpath`` normalizes it away exactly as ``abspath`` did. It resolves a
+    path that does not exist yet without raising -- the unresolvable tail is
+    returned as given -- which matters because the checkpoint directory may not
+    have been created when the first run starts.
     """
     root = (checkpoint_dir if checkpoint_dir is not None
             else paths.checkpoint_path)
     digest = hashlib.sha256(
-        os.path.abspath(str(root)).encode("utf-8")).hexdigest()
-    return os.path.join(tempfile.gettempdir(),
+        os.path.realpath(str(root)).encode("utf-8")).hexdigest()
+    return os.path.join(lock_directory(),
                         f"oncotriage-batch-run-{digest[:16]}.lock")
 
 
@@ -793,6 +934,82 @@ class AlreadyRunning(RuntimeError):
         self.path = path
         self.holder = holder
         super().__init__(f"{path} is held by {holder}")
+
+
+class LockUnavailable(RuntimeError):
+    """The lock could not be ATTEMPTED. Carries the path and the errno.
+
+    A DIFFERENT FINDING FROM ``AlreadyRunning`` AND NOT A SUBCLASS OF IT. That
+    one means another copy of this program holds the lock, which is benign and
+    self-clearing; this means the lock file could not be opened at all -- a
+    read-only temp directory, a full filesystem, a symlink where the lock file
+    should be, a directory owned by somebody else -- and no amount of waiting
+    fixes it. They exit differently for that reason.
+
+    A ``RuntimeError`` AND NOT AN ``OSError``, WHICH IS THE WHOLE POINT OF THE
+    CLASS. The obvious form of this fix is ``except OSError`` in the entry
+    point's guard -- and ``main()`` runs INSIDE that guard's ``with`` block, so
+    the clause would swallow every ``OSError`` the pipeline can raise in hours
+    of running (an unwritable checkpoint, a full disk mid-campaign, a socket
+    error) and report it as "the lock could not be taken", with the campaign's
+    real diagnosis discarded. ``AlreadyRunning``'s own docstring makes the same
+    argument in the other direction: the refusal must be a type no ordinary
+    path check can produce or eat. So the conversion happens at the ACQUISITION
+    site, where the only ``OSError`` reachable is the lock's own.
+    """
+
+    def __init__(self, path, cause):
+        self.path = path
+        self.cause = cause
+        self.errno = getattr(cause, "errno", None)
+        self.strerror = getattr(cause, "strerror", None) or str(cause)
+        self.filename = getattr(cause, "filename", None)
+        super().__init__(f"{path}: {type(cause).__name__}: {cause}")
+
+
+def lock_unavailable_lines(exc) -> list:
+    """The diagnosis, as the lines the entry point prints. One text, one caller.
+
+    A FUNCTION RATHER THAN A BLOCK IN THE GUARD, on ``run_lock_refusal_lines``'
+    footing: it can be driven by a test without arranging an unopenable path in
+    a subprocess, and the entry point's ``__main__`` block stays a guard.
+
+    IT NAMES THE ERRNO SYMBOLICALLY AS WELL AS NUMERICALLY. ``13`` is a number
+    an operator has to look up; ``EACCES`` is the thing they already know, and
+    the two together survive being pasted into a search or an issue.
+    """
+    code = getattr(exc, "errno", None)
+    named = errno.errorcode.get(code, "?") if code is not None else "?"
+    lines = [
+        "[Batch] REFUSING TO RUN: the run lock could not be taken.",
+        f"        lock file: {exc.path}",
+        f"        error:     errno {code} ({named}): {exc.strerror}",
+    ]
+    if getattr(exc, "filename", None) and exc.filename != exc.path:
+        lines.append(f"        at:        {exc.filename}")
+    lines.extend([
+        "",
+        "        This is NOT 'another run holds the lock' -- that is a "
+        "different",
+        "        refusal with a different exit code. The lock file could not "
+        "be",
+        "        opened at all, so this run cannot establish that it is the "
+        "only",
+        "        one, and running without that guarantee is how two campaigns",
+        "        bill the same cohort twice.",
+        "",
+        "        Usual causes, in the order they are worth checking:",
+        f"            - {lock_directory()} is not writable, or is owned by "
+        f"another user",
+        "            - the temp filesystem is full or mounted read-only",
+        "            - something has left a SYMLINK where the lock file goes "
+        "(ELOOP);",
+        "              the lock is opened O_NOFOLLOW and will not write "
+        "through one",
+        "",
+        "        NOTHING HAS BEEN RUN AND NOTHING HAS BEEN BILLED.",
+    ])
+    return lines
 
 
 @contextlib.contextmanager
@@ -821,11 +1038,29 @@ def exclusive_run_lock(path=None, checkpoint_dir=None):
     # -- a test, a second deployment -- got a holder record naming a directory
     # it had nothing to do with. A lock record that names the wrong directory
     # is worse than one that names none: an operator acts on it.
-    if path is None:
+    derived = path is None
+    if derived:
         if checkpoint_dir is None:
             checkpoint_dir = paths.checkpoint_path
         path = run_lock_path(checkpoint_dir)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        # ONLY WHEN WE DERIVED THE PATH. A caller who named the lock file
+        # directly owns its directory -- creating one under a path this
+        # function was handed would be a side effect nobody asked for, and the
+        # in-process tests name files inside directories they made themselves.
+        if derived:
+            ensure_lock_directory()
+        # O_NOFOLLOW IS THE HALF OF THE SYMLINK FIX THAT DOES NOT DEPEND ON THE
+        # DIRECTORY. The 0700 directory is what stops another user claiming the
+        # name; this is what stops the open following a link that is there
+        # anyway -- a stale one from before this change, one left by a restore,
+        # or one this user made themselves. Without it, O_CREAT on an existing
+        # symlink opens the TARGET and the ftruncate below zeroes it. It costs
+        # nothing on the ordinary path: a regular file is not a symlink.
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                     LOCK_FILE_MODE)
+    except OSError as exc:
+        raise LockUnavailable(path, exc) from exc
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -843,9 +1078,22 @@ def exclusive_run_lock(path=None, checkpoint_dir=None):
             "pid": os.getpid(),
             "host": socket.gethostname(),
             "user": getpass.getuser(),
-            "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+            # UTC WITH AN EXPLICIT MARKER, on oncotriage/observability.py's
+            # precedent and for its reason: this string is read by an operator
+            # deciding whether the holder is stuck, and quite possibly on a
+            # different machine from the one that wrote it. A bare local time
+            # is wrong by the writer's UTC offset with nothing in the string
+            # saying so -- which on a container built in one region and run in
+            # another is the difference between "started four minutes ago" and
+            # "started nine hours ago". `Z` is only honest because of gmtime.
+            "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "checkpoint_dir": (
-                os.path.abspath(str(checkpoint_dir))
+                # ``realpath``, matching the KEY. The lock is keyed on the
+                # resolved path, so a record naming the unresolved one could
+                # show an operator a different string from the one the refused
+                # run derived its digest from -- two names for the one thing
+                # this refusal is about.
+                os.path.realpath(str(checkpoint_dir))
                 if checkpoint_dir is not None
                 else "<not supplied: the lock file was named directly>"),
         }).encode("utf-8"))
@@ -1006,6 +1254,33 @@ log field. What is kept is the first N characters and the fact that it was cut
 is stated in the same line.
 """
 
+STOP_MESSAGE_TAIL_PROBE_CHARS = 4096
+"""How far past the cap the reader looks to answer "was anything LOST".
+
+IT EXISTS BECAUSE THE OBVIOUS FIX TO THE TRUNCATION GUARD TRADES A FALSE
+POSITIVE FOR A FALSE NEGATIVE. The read is bounded at CAP + 1 characters, so
+``len(raw) > CAP`` was the only evidence available -- and it called a note of
+exactly the cap followed by a NEWLINE truncated, which is what every editor and
+every ``echo`` writes. Testing the STRIPPED length instead fixes that case and
+opens the opposite one: a file whose character at the cap boundary happens to be
+whitespace, with real content after it, strips to CAP characters and would be
+reported WHOLE while everything past the boundary was dropped -- silently, in
+the closing block, which is the only place the note is ever read.
+
+SO THE READER LOOKS PAST THE BOUNDARY, AND ONLY WHEN IT HAS TO. The probe runs
+exclusively when the first read came back capped, it continues the SAME handle
+rather than re-opening, and it is itself bounded: the total this shutdown path
+can ever allocate is CAP + 1 + this + 1 characters, about 5 KB, against the
+megabytes an unbounded ``read_text()`` pulls in when somebody redirects a log
+into the sentinel by accident.
+
+THE RESIDUAL IS CONSERVATIVE AND IS STATED: a file with MORE than this many
+whitespace characters after the note, and content after that, is reported
+truncated when arguably nothing was lost. That is the safe direction -- it
+over-reports a cut rather than hiding one -- and it is the direction the old
+guard erred in for EVERY note rather than for a file nobody writes.
+"""
+
 
 class StaleStopSwitch(RuntimeError):
     """The stop sentinel was already present before the run began.
@@ -1137,16 +1412,53 @@ def _read_stop_message(path) -> str:
         # "was it longer than the cap" is answerable without a second stat.
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
             raw = handle.read(STOP_MESSAGE_MAX_CHARS + 1)
+            # THE TAIL PROBE, ON THE SAME HANDLE AND ONLY WHEN THE FIRST READ
+            # CAME BACK CAPPED. It is what makes "nothing was lost" a
+            # measurement rather than an assumption; see
+            # STOP_MESSAGE_TAIL_PROBE_CHARS for why the stripped-length test
+            # alone would trade one false report for its opposite.
+            tail = (handle.read(STOP_MESSAGE_TAIL_PROBE_CHARS + 1)
+                    if len(raw) > STOP_MESSAGE_MAX_CHARS else "")
     except Exception as exc:                                    # noqa: BLE001
         STOP_SWITCH_FAULTS[f"message:{type(exc).__name__}"] += 1
         return None
     text = raw.strip()
-    if not text:
+    # WAS ANYTHING BEYOND WHAT WE ARE RETURNING? Two ways yes: the probe saw a
+    # non-whitespace character past the boundary, or the probe ITSELF came back
+    # capped, which means there is more we could not look at. The second is
+    # deliberately read as "truncated": an unknown remainder must not be
+    # reported as an intact note.
+    more_follows = bool(tail.strip()) or len(tail) > STOP_MESSAGE_TAIL_PROBE_CHARS
+    if not text and not more_follows:
         # AN EMPTY FILE IS FULLY VALID AND IS THE EXPECTED CASE. `touch STOP` is
         # the documented gesture; None here means "no note", not "no stop".
         # A file of nothing but whitespace lands here too, correctly.
+        #
+        # `and not more_follows` IS NOT DEFENSIVENESS: a file whose first
+        # CAP + 1 characters are all whitespace and which then carries a real
+        # note would otherwise be reported as having none, which is the same
+        # silent loss the probe exists to prevent, at the other end of the
+        # file. It falls through to the truncation branch instead, which
+        # returns the marker alone -- honest about there being a note and
+        # about not being able to show it.
         return None
-    if len(raw) > STOP_MESSAGE_MAX_CHARS:
+    # THE TEST IS ON THE STRIPPED TEXT, NOT ON THE RAW READ, and the two
+    # disagree on the ordinary case. The read above takes CAP + 1 characters so
+    # "was there more" is answerable without a second stat -- but a note written
+    # by an editor, by `echo`, or by any of the shell forms an operator actually
+    # uses ends in a newline, so a note of exactly CAP characters arrives as
+    # CAP + 1 RAW and was reported truncated while nothing had been lost: the
+    # operator's note was returned one character short with "... [truncated at
+    # 1000 characters]" welded onto it, in the run's closing block, saying a
+    # message was cut that was not. Trailing whitespace is not content; the
+    # length that decides is the length of what is actually being returned.
+    #
+    # AND IT CANNOT UNDER-REPORT EITHER, WHICH THE STRIPPED TEST ALONE COULD
+    # NOT PROMISE. `len(text) > CAP` covers the case where every read character
+    # survived the strip; `more_follows` covers the case it opens -- whitespace
+    # sitting exactly at the boundary with content after it, which strips to
+    # CAP and would otherwise be handed back as a whole note.
+    if len(text) > STOP_MESSAGE_MAX_CHARS or more_follows:
         return (text[:STOP_MESSAGE_MAX_CHARS]
                 + f"... [truncated at {STOP_MESSAGE_MAX_CHARS} characters]")
     return text

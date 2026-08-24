@@ -121,7 +121,9 @@ except ImportError:
 from oncotriage.agent.evaluation import request_stage5_shutdown
 from oncotriage.batch.runner import (
     AlreadyRunning,
+    EXIT_LOCK_UNAVAILABLE,
     EXIT_LOCKED,
+    LockUnavailable,
     STOP_CLEAR_ABSENT,
     STOP_CLEAR_FAILED,
     StaleStopSwitch,
@@ -130,6 +132,7 @@ from oncotriage.batch.runner import (
     clear_stop_switch,
     describe_stop_switch_path,
     exclusive_run_lock,
+    lock_unavailable_lines,
     main,
     reconciliation_exit_code,
     run_lock_refusal_lines,
@@ -597,6 +600,28 @@ if __name__ == "__main__":
         for _line in run_lock_refusal_lines(_held):
             console.out(_line)
         sys.exit(EXIT_LOCKED)
+
+    except LockUnavailable as _lock_error:
+        # THE LOCK COULD NOT BE ATTEMPTED, WHICH IS A DIFFERENT FINDING FROM
+        # "another run holds it" AND EXITS DIFFERENTLY. Before this clause the
+        # only outcome was an uncaught OSError traceback, printed by CPython
+        # above nothing -- no diagnosis, no path, no statement that nothing had
+        # been billed, and a supervisor reading only the exit code (1, from the
+        # default handler) could not tell it from an ordinary refusal it had a
+        # remediation for.
+        #
+        # `except LockUnavailable` AND NOT `except OSError`, AND THAT IS THE
+        # WHOLE OF WHY THE CLASS EXISTS. main() runs INSIDE the `with` block
+        # above, so an OSError clause here would catch every OSError the
+        # pipeline can raise across hours of running -- an unwritable
+        # checkpoint directory, a full disk, a socket teardown -- and report
+        # each of them as a lock problem while discarding the campaign's real
+        # diagnosis. The conversion happens at the acquisition site instead,
+        # where the only OSError reachable is the lock's own.
+        console.out()
+        for _line in lock_unavailable_lines(_lock_error):
+            console.out(_line)
+        sys.exit(EXIT_LOCK_UNAVAILABLE)
 
 
 #------------------------------------------------------------------------------

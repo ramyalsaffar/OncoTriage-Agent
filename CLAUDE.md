@@ -784,7 +784,7 @@ python tests/test_runner_stop_switch.py                             # 138 (was 1
 # inside a tempfile.mkdtemp it removes and asserts gone, and the two repository
 # files it reads (batch/runner.py, "25- Batch Runner.py") are sha256-compared at
 # the end. It EXECS NOTHING. Bucket A, ~18 s alone / ~30 s under bucket-A load.
-python tests/test_runner_preflight_and_state_faults.py              #  76
+python tests/test_runner_preflight_and_state_faults.py              # 116 (was 76; the lock-hardening pass added section 8 -- the symlink substitution, the unopenable lock, the UTC record and the stripped truncation guard -- and the symlinked two-process drive in section 5)
 
 # The CI-hygiene pair. Same shape, same directory. Neither imports anything
 # from the package -- their subjects are `.github/scripts/` and
@@ -6986,7 +6986,7 @@ in both directions.
 # process asserting about it and a lock held by one process cannot be observed
 # from inside it. NOT in the collision matrix. It EXECS NOTHING. Bucket A,
 # ~55 s.
-python tests/test_ablation_stop_and_lock.py                       # 107
+python tests/test_ablation_stop_and_lock.py                       # 142 (was 107; the lock-hardening pass added the symlink-resolved key, the per-user lock directory, the substitution refusal, the UTC record, the stripped truncation guard and a symlinked second real invocation)
 ```
 
 **THE FOREGROUND-SIGNAL LESSON IS CLOSED IN CODE RATHER THAN BY A CONVENTION,

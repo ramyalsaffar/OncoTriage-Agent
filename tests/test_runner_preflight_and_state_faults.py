@@ -104,6 +104,7 @@ except ImportError:
     del _candidate, _how
 
 import ast
+import calendar
 import hashlib
 import json
 import shutil
@@ -230,9 +231,53 @@ check("1b  it lives OUTSIDE the checkpoint directory and outside the "
       (os.path.abspath(_PATH_A).startswith(os.path.abspath(_L1)),
        os.path.abspath(_PATH_A).startswith(os.path.abspath(_REPO))),
       (False, False))
-check("1b-b ...specifically in the system temp directory",
-      os.path.dirname(os.path.abspath(_PATH_A)),
-      os.path.abspath(tempfile.gettempdir()))
+check("1b-b ...specifically in a PER-USER subdirectory of the system temp "
+      "directory. The bare temp directory is world-writable and this file's "
+      "name is a sha256 of a guessable path, so another user could pre-create "
+      "it as a symlink to something this user can write and the first run to "
+      "start would O_CREAT through it and ftruncate the target to zero. The "
+      "sticky bit does not help: it stops one user DELETING another's file, "
+      "not creating one at an unclaimed name",
+      (os.path.dirname(os.path.abspath(_PATH_A)), _runner.lock_directory()),
+      (_runner.lock_directory(),
+       os.path.join(tempfile.gettempdir(), f"oncotriage-{os.getuid()}")))
+def _creating_calls(module_src, function_name):
+    """The directory-creating calls in one top-level function, by name."""
+    node = next((n for n in ast.walk(ast.parse(module_src))
+                 if isinstance(n, ast.FunctionDef)
+                 and n.name == function_name), None)
+    if node is None:
+        return ["<function not found>"]
+    return sorted({getattr(c.func, "attr", getattr(c.func, "id", None))
+                   for c in ast.walk(node) if isinstance(c, ast.Call)}
+                  & {"makedirs", "mkdir", "ensure_lock_directory"})
+
+
+check("1b-c ...and lock_directory() is PURE -- asking for the path creates "
+      "nothing, while ensure_lock_directory() is the one that creates. That "
+      "is the output_dir()/ensure_output_dir() split this project already "
+      "records: a caller who only wants to PRINT the path -- a diagnostic, a "
+      "refusal line, a test -- must not bring a directory into existence by "
+      "asking. The second half is the non-degeneracy probe: without it a walk "
+      "that found nothing anywhere would pass",
+      (_creating_calls(_RUNNER_SRC, "lock_directory"),
+       _creating_calls(_RUNNER_SRC, "ensure_lock_directory")),
+      ([], ["makedirs"]))
+check("1b-c2 ...and exclusive_run_lock DOES ensure it, or the first run on a "
+      "fresh machine would meet ENOENT rather than a lock",
+      _creating_calls(_RUNNER_SRC, "exclusive_run_lock"),
+      ["ensure_lock_directory"])
+check("1b-d ...and the directory is named by the UID rather than by the login "
+      "name. getpass.getuser() reads LOGNAME/USER/LNAME/USERNAME before the "
+      "password database, all four settable by the process asking -- so a "
+      "login-name directory would split one real user's lock namespace in two "
+      "whenever those differed between invocations (a cron entry beside an "
+      "interactive shell), and two namespaces for one checkpoint directory is "
+      "the double bill this lock exists to prevent",
+      (os.path.basename(_runner.lock_directory()),
+       os.environ.get("USER", "") in os.path.basename(
+           _runner.lock_directory()) and bool(os.environ.get("USER"))),
+      (f"oncotriage-{os.getuid()}", False))
 check("1c  a trailing separator does not make a different lock -- "
       "paths.checkpoint_path resolves WITH one and a caller may pass either",
       _runner.run_lock_path(_L1 + os.sep), _PATH_A)
@@ -275,7 +320,16 @@ with _runner.exclusive_run_lock(checkpoint_dir=_L1) as _keyed_path:
           "it, which is the form main()'s guard uses",
           (_keyed_path,
            _keyed.get("checkpoint_dir") if isinstance(_keyed, dict) else None),
-          (_PATH_A, os.path.abspath(_L1)))
+          (_PATH_A, os.path.realpath(_L1)))
+    check("1e-e ...and it names the RESOLVED path, matching the KEY. The lock "
+          "is keyed on the realpath, so a record naming the unresolved one "
+          "could show an operator a different string from the one the refused "
+          "run hashed -- two names for the one thing the refusal is about. "
+          "Non-degenerate on this machine: macOS puts the temp tree under "
+          "/var, which is a link to /private/var",
+          (_keyed.get("checkpoint_dir") if isinstance(_keyed, dict) else None,
+           os.path.realpath(_L1) != os.path.abspath(_L1)),
+          (os.path.realpath(_L1), True))
 
 def _reacquire(path):
     """Take and release the lock, reporting whether it was free."""
@@ -724,6 +778,23 @@ _HOLDER = Run(os.path.join(_TMP, "holderroot"), tag="holder", park=True,
               patients=4).start()
 _HOLDER_SATURATED = _HOLDER.wait_saturated()
 _ELSEWHERE = run_once(_OTHER_ROOT, tag="elsewhere", park=False, patients=4)
+
+# --- THE SAME directory, reached through a SYMLINK ------------------------
+#
+# THE OTHER OTHER HALF, AND IT IS THE ONE THAT WAS BROKEN. The key was
+# `os.path.abspath`, which normalizes `.`, `..` and the working directory and
+# does NOT resolve symlinks -- so this run and the holder above named ONE
+# checkpoint directory, hashed to TWO digests, took TWO lock files, and both
+# ran. That is the silent double bill the lock exists to prevent, reached
+# through the ordinary deployment shapes: a Docker bind mount, a symlinked
+# ONCOTRIAGE_MAIN_PATH, and macOS's own /var -> /private/var.
+_LINKED_CP = os.path.join(_TMP, "holder-cp-link")
+if not os.path.lexists(_LINKED_CP):
+    os.symlink(_HOLDER.cp, _LINKED_CP)
+_VIA_LINK = run_once(os.path.join(_TMP, "vialink"), tag="vialink", park=False,
+                     patients=4, corpus=_HOLDER.corpus, cp=_LINKED_CP,
+                     db=_HOLDER.db)
+
 _HOLDER.let_go()
 _HOLDER.join()
 
@@ -735,6 +806,33 @@ check("5b  a run against a DIFFERENT checkpoint directory is not refused",
 check("5c  ...and the two locked different files",
       _runner.run_lock_path(_HOLDER.cp) == _runner.run_lock_path(_ELSEWHERE.cp),
       False)
+check("5e  the symlinked path resolves to the SAME lock file as the directory "
+      "it points at, which is the whole of F1: `abspath` does not resolve "
+      "symlinks, so one directory named two ways produced two locks",
+      _runner.run_lock_path(_LINKED_CP) == _runner.run_lock_path(_HOLDER.cp),
+      True)
+check("5e-b ...and the fixture is non-degenerate: the two path STRINGS really "
+      "do differ, so 5e is about resolution rather than about being handed "
+      "the same argument twice",
+      (_LINKED_CP != _HOLDER.cp, os.path.islink(_LINKED_CP)), (True, True))
+check("5e-c NEGATIVE CONTROL: the pre-fix key, recomputed here, gives the two "
+      "paths DIFFERENT lock files -- which is what says 5e measures the fix "
+      "and not a property the old code already had",
+      (hashlib.sha256(os.path.abspath(_LINKED_CP).encode("utf-8")).hexdigest()
+       == hashlib.sha256(
+           os.path.abspath(_HOLDER.cp).encode("utf-8")).hexdigest()),
+      False)
+check("5f  *** AND A REAL RUN THROUGH THE SYMLINK IS REFUSED WITH EXIT 3 "
+      "WHILE THE HOLDER IS LIVE. *** Driven as a second process against the "
+      "first, which is the only form in which the flock is the thing being "
+      "measured",
+      _VIA_LINK.exit, _runner.EXIT_LOCKED)
+check("5f-b *** AND IT STARTED NO PATIENT. *** The cost proof: before this, "
+      "both processes ran the same cohort at one live Stage 5 call each",
+      len(_VIA_LINK.started_patients), 0)
+check("5f-c ...and the refusal names the holder's pid, so an operator meeting "
+      "it can act rather than guess",
+      f"{_HOLDER.proc.pid}" in _VIA_LINK.out, True)
 check("5d  --help takes NO lock, so a reader can ask what the flags do while "
       "a campaign is running. argparse exits before the lock is acquired",
       subprocess.run([sys.executable, _ENTRY_PATH, "--help"],
@@ -1068,27 +1166,340 @@ check("7g  the preflight is called in the guard AND left in main(): the guard "
 
 
 # ===========================================================================
-# 8. NOTHING IN THE REPOSITORY WAS TOUCHED
+# 8. THE LOCK FILE CANNOT BE SUBSTITUTED, AND ONE THAT WILL NOT OPEN IS
+#    DIAGNOSED RATHER THAN THROWN
+# ===========================================================================
+#
+# TWO DEFECTS, BOTH IN THE FIRST SECOND OF A CAMPAIGN AND BOTH SILENT IN THEIR
+# OWN WAY.
+#
+#   THE LOCK FILE WAS OPENED `O_RDWR | O_CREAT` WITH MODE 0644 IN THE BARE
+#   SYSTEM TEMP DIRECTORY. That directory is world-writable, and the lock
+#   file's name is a sha256 of a path -- derivable by anybody who can guess the
+#   deployment's checkpoint directory. So a different user on the same host
+#   could pre-create it as a SYMLINK to any file this user can write, and the
+#   first run to start would open THROUGH the link and `ftruncate` the target
+#   to zero. The sticky bit does not help: it stops one user deleting another's
+#   file, not creating one at a name nobody has claimed. Two changes close it,
+#   and both are needed -- a 0700 per-user directory so the name cannot be
+#   claimed, and `O_NOFOLLOW` so a link that is there anyway is refused rather
+#   than followed.
+#
+#   AN UNOPENABLE LOCK PATH WAS AN UNCAUGHT `OSError`. A read-only temp
+#   filesystem, a full disk, a lock directory owned by somebody else, or the
+#   symlink above -- every one of them reached the operator as a CPython
+#   traceback: no diagnosis, no path, no remediation, and no statement that
+#   nothing had been billed. The exit code was 1 from the default handler,
+#   indistinguishable from the ordinary refusals that have a fix.
+
+print("\n=== 8. substitution, and an unopenable lock ===")
+
+_SUB = os.path.join(_TMP, "substitution")
+os.makedirs(_SUB, exist_ok=True)
+
+# --- the symlink substitution, refused, victim intact ---------------------
+_VICTIM = os.path.join(_SUB, "victim.txt")
+with open(_VICTIM, "w", encoding="utf-8") as _fh:
+    _fh.write("PRECIOUS")
+_CLAIMED = os.path.join(_SUB, "claimed.lock")
+os.symlink(_VICTIM, _CLAIMED)
+
+_subbed = drive_call(lambda: _runner.exclusive_run_lock(_CLAIMED).__enter__())
+check("8a  *** A LOCK FILE THAT IS A SYMLINK IS REFUSED, NOT FOLLOWED. *** "
+      "O_NOFOLLOW makes the open fail with ELOOP instead of opening the "
+      "target and truncating it",
+      (at(_subbed, 0), at(_subbed, 1)), ("<raised>", "LockUnavailable"))
+check("8a-b *** AND THE VICTIM FILE IS UNTOUCHED. *** That is the finding in "
+      "one read: before this, the ftruncate below the open zeroed whatever the "
+      "link pointed at",
+      open(_VICTIM, encoding="utf-8").read(), "PRECIOUS")
+
+# NEGATIVE CONTROL: the pre-fix open form, run here against the same link. It
+# has to be shown to clobber, or 8a-b passes for a tree in which nothing was
+# ever at risk.
+_fd_ctl = os.open(_CLAIMED, os.O_RDWR | os.O_CREAT, 0o644)
+os.ftruncate(_fd_ctl, 0)
+os.close(_fd_ctl)
+check("8a-c NEGATIVE CONTROL: the pre-fix open (no O_NOFOLLOW, mode 0644) "
+      "against the SAME link writes through it and empties the victim -- "
+      "which is what says 8a-b measures the fix rather than an absent hazard",
+      open(_VICTIM, encoding="utf-8").read(), "")
+
+# --- the two refusals are different findings ------------------------------
+check("8b  LockUnavailable is NOT an OSError, and that is the whole reason "
+      "the class exists. main() runs INSIDE the entry point's `with`, so an "
+      "`except OSError` there would swallow every OSError the pipeline can "
+      "raise across hours of running -- an unwritable checkpoint, a full "
+      "disk, a socket teardown -- and report each as a lock problem while "
+      "discarding the campaign's real diagnosis",
+      (issubclass(_runner.LockUnavailable, RuntimeError),
+       issubclass(_runner.LockUnavailable, OSError),
+       issubclass(_runner.LockUnavailable, _runner.AlreadyRunning),
+       issubclass(_runner.AlreadyRunning, _runner.LockUnavailable)),
+      (True, False, False, False))
+check("8b-b ...and the two exit codes stay distinct: 3 means another copy is "
+      "running, which a supervisor may wait out; 1 means the lock could not "
+      "be opened, which waiting never fixes",
+      (_runner.EXIT_LOCKED, _runner.EXIT_LOCK_UNAVAILABLE,
+       _runner.EXIT_LOCKED == _runner.EXIT_LOCK_UNAVAILABLE),
+      (3, 1, False))
+
+# --- an unopenable directory, in process ----------------------------------
+_RO = os.path.join(_SUB, "readonly")
+os.makedirs(_RO, exist_ok=True)
+os.chmod(_RO, 0o500)
+try:
+    _ro_result = drive_call(
+        lambda: _runner.exclusive_run_lock(os.path.join(_RO, "x.lock"))
+        .__enter__())
+finally:
+    os.chmod(_RO, 0o700)
+check("8c  an unopenable lock path raises LockUnavailable rather than an "
+      "uncaught OSError",
+      (at(_ro_result, 0), at(_ro_result, 1)), ("<raised>", "LockUnavailable"))
+
+_diag = _runner.lock_unavailable_lines(
+    _runner.LockUnavailable("/tmp/x.lock",
+                            PermissionError(13, "Permission denied",
+                                            "/tmp/x.lock")))
+_diag_text = "\n".join(_diag)
+check("8c-b the diagnosis names the path, the errno NUMERICALLY AND "
+      "SYMBOLICALLY (13 is a number an operator looks up; EACCES is the thing "
+      "they already know), a remediation, and the standing that nothing was "
+      "billed",
+      ("/tmp/x.lock" in _diag_text, "13" in _diag_text,
+       "EACCES" in _diag_text,
+       _runner.lock_directory() in _diag_text,
+       "NOTHING HAS BEEN RUN AND NOTHING HAS BEEN BILLED" in _diag_text),
+      (True, True, True, True, True))
+check("8c-c ...and it says in as many words that this is NOT 'another run "
+      "holds the lock', because the two refusals are one sentence apart on a "
+      "terminal and have opposite remediations",
+      "NOT" in _diag_text and "another run holds the lock" in _diag_text, True)
+
+# --- the ownership and permission checks on the directory ------------------
+check("8d  ensure_lock_directory REFUSES a lock directory that is group- or "
+      "other-writable rather than repairing it: a 0777 directory pre-created "
+      "by anybody re-opens the substitution the per-user directory closes, "
+      "and chmod-ing somebody else's directory is not this program's business",
+      sorted({n.func.attr for n in ast.walk(next(
+          n for n in ast.walk(ast.parse(_RUNNER_SRC))
+          if isinstance(n, ast.FunctionDef)
+          and n.name == "ensure_lock_directory"))
+          if isinstance(n, ast.Call) and getattr(n.func, "attr", None)
+          in ("chmod", "lstat", "stat", "makedirs")}),
+      ["lstat", "makedirs"])
+
+# --- driven END TO END: the real entry point against a substituted lock ----
+#
+# THE SUBSTITUTION IS PLANTED AT THE PATH THE ENTRY POINT WILL ACTUALLY
+# DERIVE, so the whole chain runs for real: ensure_lock_directory, the derived
+# name, the O_NOFOLLOW open, the conversion, the guard's clause, the exit code.
+_E2E = Run(os.path.join(_TMP, "e2e"), tag="e2e", park=False, patients=4)
+_E2E_LOCK = _runner.run_lock_path(_E2E.cp)
+_E2E_VICTIM = os.path.join(_SUB, "e2e-victim.txt")
+with open(_E2E_VICTIM, "w", encoding="utf-8") as _fh:
+    _fh.write("ALSO PRECIOUS")
+try:
+    if os.path.lexists(_E2E_LOCK):
+        os.remove(_E2E_LOCK)
+    os.symlink(_E2E_VICTIM, _E2E_LOCK)
+    _E2E.start()
+    _E2E.let_go()
+    _E2E.join(timeout=180)
+finally:
+    if os.path.islink(_E2E_LOCK):
+        os.remove(_E2E_LOCK)
+
+check("8e  *** THE REAL ENTRY POINT REFUSES WITH A DIAGNOSIS AND EXIT 1, NOT "
+      "A TRACEBACK. *** Before this clause the operator got CPython's default "
+      "handler: no path, no errno, no remediation and no statement that "
+      "nothing had been billed",
+      _E2E.exit, _runner.EXIT_LOCK_UNAVAILABLE)
+check("8e-b ...and it started NO patient, so the refusal is free",
+      len(_E2E.started_patients), 0)
+check("8e-c ...and the console carries the diagnosis rather than a traceback",
+      ("REFUSING TO RUN: the run lock could not be taken" in _E2E.out,
+       "Traceback (most recent call last)" in _E2E.out,
+       "NOTHING HAS BEEN RUN AND NOTHING HAS BEEN BILLED" in _E2E.out),
+      (True, False, True))
+check("8e-d ...and the victim it was pointed at is untouched",
+      open(_E2E_VICTIM, encoding="utf-8").read(), "ALSO PRECIOUS")
+
+# --- the guard catches the named class, not OSError ------------------------
+_GUARD_HANDLERS = sorted({
+    getattr(h.type, "id", None)
+    for n in ast.walk(ast.parse(_ENTRY_SRC)) if isinstance(n, ast.Try)
+    for h in n.handlers
+    if getattr(h.type, "id", None) in ("OSError", "LockUnavailable",
+                                       "AlreadyRunning", "Exception")})
+check("8f  the entry point's guard catches LockUnavailable and NEVER a bare "
+      "OSError or Exception -- main() runs inside that `with`, so a broad "
+      "clause would report the campaign's own faults as lock faults",
+      _GUARD_HANDLERS, ["AlreadyRunning", "LockUnavailable"])
+
+# --- F4: the record's timestamp is UTC and says so ------------------------
+_UTC_PATH = os.path.join(_SUB, "utc.lock")
+with _runner.exclusive_run_lock(_UTC_PATH):
+    _utc_record = drive_call(
+        lambda: json.load(open(_UTC_PATH, encoding="utf-8")))
+_started = (_utc_record.get("started")
+            if isinstance(_utc_record, dict) else "<absent>")
+_parsed = drive_call(
+    lambda: time.strptime(_started, "%Y-%m-%dT%H:%M:%SZ"))
+check("8g  the record's start time is UTC WITH AN EXPLICIT MARKER, on "
+      "oncotriage/observability.py's precedent. An operator reads this string "
+      "to decide whether the holder is stuck, quite possibly from a different "
+      "machine; a bare local time is wrong by the writer's offset with "
+      "nothing in the string saying so, which on a container built in one "
+      "region and run in another is 'started four minutes ago' against "
+      "'started nine hours ago'",
+      (_started.endswith("Z"), isinstance(_parsed, time.struct_time)),
+      (True, True))
+check("8g-b ...and the stamp really is close to now when read as UTC, which "
+      "is what says the format string and the clock agree",
+      (isinstance(_parsed, time.struct_time)
+       and abs(calendar.timegm(_parsed) - time.time()) < 120), True)
+check("8g-c ...and the clock it is taken from is gmtime, asserted at the "
+      "source rather than inferred from a comparison this machine's own "
+      "timezone could make vacuous. `Z` is only honest because of that call: "
+      "a local time suffixed Z parses cleanly, sorts cleanly, and is wrong by "
+      "the writer's offset -- which is worse than no timezone at all. The "
+      "second half is the non-degeneracy probe, because a walk that found no "
+      "strftime at all would otherwise report an empty set as clean",
+      sorted({ast.unparse(a) for n in ast.walk(next(
+          x for x in ast.walk(ast.parse(_RUNNER_SRC))
+          if isinstance(x, ast.FunctionDef)
+          and x.name == "exclusive_run_lock"))
+          if isinstance(n, ast.Call)
+          and getattr(n.func, "attr", None) == "strftime"
+          for a in n.args}),
+      ["'%Y-%m-%dT%H:%M:%SZ'", "time.gmtime()"])
+
+# --- F13: the truncation guard tests the STRIPPED text --------------------
+_CAP = _runner.STOP_MESSAGE_MAX_CHARS
+
+
+def _stop_note(content):
+    """Write a sentinel with this content and read it back through production."""
+    target = os.path.join(_SUB, "STOPNOTE")
+    with open(target, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    return _runner._read_stop_message(target)
+
+
+_faults_before_notes = dict(_runner.STOP_SWITCH_FAULTS)
+_note_exact = _stop_note("a" * _CAP)
+_note_newline = _stop_note("a" * _CAP + "\n")
+_note_three = _stop_note("a" * _CAP + "\n\n\n")
+_note_over = _stop_note("b" * (_CAP + 1))
+_note_short = _stop_note("  a short note\n")
+
+check("8h  *** A NOTE OF EXACTLY THE CAP FOLLOWED BY A NEWLINE IS NOT "
+      "TRUNCATED. *** The read takes CAP + 1 characters so 'was there more' "
+      "needs no second stat -- and the guard tested that RAW length, so every "
+      "note written by an editor or by `echo` (both of which end in a "
+      "newline) came back one character short with '... [truncated at 1000 "
+      "characters]' welded on, in the run's closing block, saying a message "
+      "had been cut that had not",
+      (len(_note_newline), "[truncated" in _note_newline),
+      (_CAP, False))
+check("8h-b ...and so is one followed by three newlines, which is the same "
+      "defect the bounded read merely hides: it can only ever see CAP + 1",
+      (len(_note_three), "[truncated" in _note_three), (_CAP, False))
+check("8h-c ...while a note of exactly the cap with NO trailing whitespace is "
+      "unchanged, which is the case that already worked and must stay working",
+      (len(_note_exact), "[truncated" in _note_exact), (_CAP, False))
+check("8h-d *** AND A NOTE THAT REALLY IS LONGER STILL REPORTS TRUNCATION. *** "
+      "Without this the fix would be indistinguishable from deleting the "
+      "guard: `text` is a strip of at most CAP + 1 characters, so "
+      "`len(text) > CAP` holds exactly when all CAP + 1 survived the strip",
+      (_note_over.startswith("b" * _CAP), "[truncated at " in _note_over),
+      (True, True))
+check("8h-e ...and an ordinary short note is returned stripped and whole, "
+      "with no marker",
+      _note_short, "a short note")
+check("8h-f ...and none of the five reads counted a fault, so 8h..8h-e are "
+      "about the guard rather than about a read that failed",
+      dict(_runner.STOP_SWITCH_FAULTS), _faults_before_notes)
+check("8h-g NEGATIVE CONTROL: the pre-fix predicate, evaluated here on the "
+      "same inputs, calls the newline case truncated and the cap case not -- "
+      "which is what says 8h measures a change of behaviour",
+      (len("a" * _CAP + "\n") > _CAP, len("a" * _CAP) > _CAP),
+      (True, False))
+
+# --- and the OPPOSITE error, which the obvious fix would have introduced ---
+#
+# TESTING THE STRIPPED LENGTH ALONE TRADES A FALSE POSITIVE FOR A FALSE
+# NEGATIVE. The read is bounded at CAP + 1, so a file whose character at the
+# boundary happens to be whitespace strips to CAP characters -- and would then
+# be handed back as a WHOLE note while everything after the boundary was
+# dropped, silently, in the closing block, which is the only place the note is
+# ever read. That is a worse defect than the one being fixed: over-reporting a
+# cut is noise, hiding one is a lost operator instruction.
+_PROBE = _runner.STOP_MESSAGE_TAIL_PROBE_CHARS
+_n_boundary = _stop_note("c" * _CAP + " " + "d" * 50)
+_n_ws_tail = _stop_note("e" * _CAP + " " * (_PROBE // 2))
+_n_ws_past = _stop_note("f" * _CAP + " " * (_PROBE + 50))
+_n_late = _stop_note(" " * (_CAP + 5) + "the note")
+_n_huge = _stop_note("y" * 200_000)
+
+check("8h-h *** WHITESPACE AT THE BOUNDARY WITH CONTENT AFTER IT IS STILL "
+      "REPORTED TRUNCATED. *** The tail probe is what makes 'nothing was "
+      "lost' a measurement rather than an assumption",
+      ("[truncated at " in _n_boundary, _n_boundary.startswith("c" * _CAP)),
+      (True, True))
+check("8h-h2 NEGATIVE CONTROL: the stripped-length test ALONE, evaluated here "
+      "on that same input, calls it whole -- which is the false negative the "
+      "probe exists to close, and what says 8h-h is not free",
+      len(("c" * _CAP + " " + "d" * 50)[:_CAP + 1].strip()) > _CAP, False)
+check("8h-i ...while a note followed by NOTHING BUT WHITESPACE is not "
+      "truncated, which is what says the probe distinguishes content from "
+      "padding rather than reporting every capped read as a cut",
+      ("[truncated" in _n_ws_tail, len(_n_ws_tail)), (False, _CAP))
+check("8h-j ...and whitespace running PAST the probe window is reported "
+      "truncated, conservatively: an unknown remainder must not be handed "
+      "back as an intact note",
+      "[truncated at " in _n_ws_past, True)
+check("8h-k a note that begins past the cap is not reported as ABSENT. "
+      "Returning None there would be the same silent loss at the other end of "
+      "the file, so it falls through to the marker instead",
+      (_n_late is not None, "[truncated at " in (_n_late or "")),
+      (True, True))
+check("8h-l AND THE READ IS STILL BOUNDED. The probe continues the SAME "
+      "handle and is itself capped, so the most this shutdown path can "
+      "allocate is CAP + 1 + PROBE + 1 characters -- about 5 KB against the "
+      "200 KB written here, and against the megabytes `read_text()` would "
+      "pull in when somebody redirects a log into the sentinel",
+      (len(_n_huge) < _CAP + _PROBE, "[truncated at " in _n_huge),
+      (True, True))
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
+# 9. NOTHING IN THE REPOSITORY WAS TOUCHED
 # ===========================================================================
 
-print("\n=== 8. the repository is unchanged ===")
+print("\n=== 9. the repository is unchanged ===")
 
 _SHA_RUNNER_AFTER = sha_or_absent(_RUNNER_PATH)
 _SHA_ENTRY_AFTER = sha_or_absent(_ENTRY_PATH)
-check("8a  oncotriage/batch/runner.py is byte-identical",
+check("9a  oncotriage/batch/runner.py is byte-identical",
       _SHA_RUNNER_AFTER, _SHA_RUNNER_BEFORE)
-check("8b  25- Batch Runner.py is byte-identical",
+check("9b  25- Batch Runner.py is byte-identical",
       _SHA_ENTRY_AFTER, _SHA_ENTRY_BEFORE)
-check("8c  ...and those comparisons are not tautologies: both files are "
+check("9c  ...and those comparisons are not tautologies: both files are "
       "non-empty and differ from each other",
       (len(_RUNNER_SRC) > 1000, len(_ENTRY_SRC) > 1000,
        _SHA_RUNNER_BEFORE != _SHA_ENTRY_BEFORE), (True, True, True))
-check("8d  the production inferences path was never resolved in this process, "
+check("9d  the production inferences path was never resolved in this process, "
       "so no scenario could have written to it",
       "inferences_path" in _paths._RESOLVED, False)
 
 shutil.rmtree(_TMP, ignore_errors=True)
-check("8e  the scratch tree was removed", os.path.exists(_TMP), False)
+check("9e  the scratch tree was removed", os.path.exists(_TMP), False)
 
 
 #------------------------------------------------------------------------------
