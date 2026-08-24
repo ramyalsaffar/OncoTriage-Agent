@@ -970,6 +970,39 @@ in that configuration reaches the branch that increments it.
 # so the reader of the counter and the writer of it cannot drift.
 WARMUP_FAILURE_KEY_PREFIX = "failed:"
 
+# ...and the prefix for the OTHER writer, the one the FALLBACK schedule uses.
+#
+# A SEPARATE PREFIX RATHER THAN THE ONE ABOVE, because the two name different
+# events with different remedies. `failed:` is "the dedicated warmup could not
+# reach the endpoint"; this is "the provider refused the warmup's SHAPE, the
+# patient degraded to the retired one-then-rest schedule, and then the trial
+# call that schedule holds back as the cache writer ALSO failed". Folding them
+# would make a run that never even attempted the fallback indistinguishable
+# from one that attempted it and lost, and only the second says the rejection
+# classification is worth revisiting.
+#
+# THE RULE IT ENFORCES IS THE SAME ONE, WHICH IS THE POINT. Cache-or-nothing is
+# not a property of the dedicated warmup, it is a property of the node: a wave
+# is issued only behind a request that provably wrote the shared prefix. The
+# fallback has such a request -- the held-back first trial call -- so it is
+# subject to the identical rule, and before this prefix existed it was not:
+# the writer's outcome was filed and never inspected, and N-1 full-price
+# requests went out behind a writer that had raised.
+WARMUP_FALLBACK_WRITER_FAILURE_KEY_PREFIX = "fallback_writer_failed:"
+
+# WHICH request failed to write the cache. A closed two-member vocabulary, read
+# by the zero-success floor and by nothing else, because the two states differ
+# only in what an operator is told: both fail the patient, both take the same
+# return, and both are resumed the same way.
+#
+# IT EXISTS SO THE FLOOR'S SENTENCE CANNOT LIE. That sentence reads "no trial
+# call was issued", which is exactly true when the dedicated warmup failed and
+# exactly false when the fallback's held-back writer did -- one trial call was
+# issued and billed then, and telling an operator otherwise about a request
+# that reached the provider is the class of report this file exists to remove.
+WARMUP_SOURCE_WARMUP = "warmup"
+WARMUP_SOURCE_FALLBACK_WRITER = "fallback_writer"
+
 
 class PerTrialParallelismError(RuntimeError):
     """``MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS`` is not a usable bound.
@@ -3969,6 +4002,10 @@ CLINICAL TRIALS:
     # first call, so an operator reading a failed row sees the endpoint's own
     # diagnosis rather than "the warmup failed".
     _warmup_error = None
+    # WHICH of the two cache writers produced it; see the constants. Read only
+    # when `_warmup_error` is not None, and pre-set to the dedicated warmup
+    # because that is the only writer on the shipped path.
+    _warmup_error_source = WARMUP_SOURCE_WARMUP
     # The routing hint for this patient's warmup AND its wave, or None. ONE
     # READING, used twice, so the two requests cannot ask to be routed apart.
     _cache_key = (per_trial_prompt_cache_key(system_prompt_sha256)
@@ -4006,6 +4043,54 @@ CLINICAL TRIALS:
                 f"per-trial dispatch has {len(_dispatch_order)} chunks against "
                 f"{len(trial_blocks)} rendered blocks; they must be "
                 "positionally parallel")
+
+        # THE KEY MUST BE UNIQUE, AND THE PER-INDEX GUARD BELOW CANNOT SAY SO.
+        #
+        # `_prompts` and `_prefetched` are both keyed by `_chunk_key`, which is
+        # the chunk's nct_ids. Two chunks with the SAME key are one key, and the
+        # per-index guard passes for both of them -- it asks whether chunk i
+        # holds trials[i], which is true when `filtered_trials` itself carries
+        # one nct_id twice. What happens then is three separate faults at once,
+        # none of which raises:
+        #
+        #   * SILENT CONTENT SUBSTITUTION. `_prompts` is fully built before any
+        #     dispatch, so the second write wins and BOTH requests carry the
+        #     second trial's rendered block. The first trial's criteria text is
+        #     never sent to the judge, and the verdict is filed against it.
+        #   * AN EXTRA BILLED CALL. Both requests are issued and both are filed
+        #     under one `_prefetched` key, so the second overwrites the first.
+        #     The send loop pops two chunks, the second finds nothing, and
+        #     `_obtain` issues a live -- uncached, unbounded by the pool --
+        #     request for a response that was already paid for.
+        #   * AN UNDER-REPORTED LEDGER. The overwritten response is never
+        #     accounted anywhere: `_account_unconsumed` folds what is LEFT in
+        #     `_prefetched`, and an overwritten value was never left.
+        #
+        # UNREACHABLE TODAY IS NOT THE SAME AS IMPOSSIBLE. Stage 2 de-duplicates
+        # by nct_id, so `filtered_trials` does not carry a repeat -- which is a
+        # property of a stage three modules away, held by no assertion this file
+        # can see, and is exactly the kind of premise this project has watched
+        # expire. The guard costs one Counter over N 1-tuples and turns a silent
+        # three-way fault into a named refusal before a cent is spent.
+        #
+        # IT IS ALSO WHAT MAKES THE SPLITTER'S LIVE PATH UNREACHABLE HERE. With
+        # keys unique, every dispatched chunk is filed and popped exactly once,
+        # and every per-trial chunk is a SINGLETON -- which the reactive
+        # splitter refuses to halve (`len(chunk) == 1` is its floor, above the
+        # split). So no chunk `_obtain` has not already got a response for can
+        # ever reach it in this mode. tests/test_agent_stage5_per_trial_calls.py
+        # section 2b asserts that rather than leaving it as reasoning.
+        _dispatch_keys = [_chunk_key(_c) for _c in _dispatch_order]
+        if len(set(_dispatch_keys)) != len(_dispatch_keys):
+            _dupes = sorted(_id for _k, _n in Counter(_dispatch_keys).items()
+                            if _n > 1 for _id in _k)
+            raise PackingBlockMismatchError(
+                f"per-trial dispatch has {len(_dispatch_order)} chunks under "
+                f"only {len(set(_dispatch_keys))} distinct keys; the repeated "
+                f"trial ids are {_dupes}. Each chunk is filed and consumed by "
+                "its nct_ids, so a repeat would substitute one trial's prompt "
+                "for another's, issue an extra billed call and lose a paid "
+                "response from the ledger")
         _prompts = {}
         for _i, _c in enumerate(_dispatch_order):
             if _chunk_key(_c) != (trials[_i]["trial"]["nct_id"],):
@@ -4157,11 +4242,68 @@ CLINICAL TRIALS:
 
             if _warmup_error is None:
                 if _hold_first:
+                    # ── The fallback's cache writer, and its OUTCOME ───────
+                    #
+                    # THE FALLBACK OBEYS CACHE-OR-NOTHING TOO, and until this
+                    # branch existed it did not. The held-back call was issued,
+                    # its outcome was FILED, and the rest of the wave went out
+                    # regardless -- so a writer that exhausted its transport
+                    # retries released N-1 full-price requests against a prefix
+                    # nothing had written, which is the exact leak the warmup
+                    # design exists to prevent, reached through the door the
+                    # design opened for a provider that refuses its shape. The
+                    # only trace was one isolated per-trial failure among N-1
+                    # ordinary-looking successes; nothing said the wave had run
+                    # cold, and the patient was reported as a clean run.
+                    #
+                    # THE READING IS `_writer[0]`, NOT AN EXCEPTION HANDLER.
+                    # `_issue` returns its exception rather than raising -- that
+                    # is the whole contract that makes the wave's merge
+                    # deterministic -- so "the writer failed" is a tag on a
+                    # value here, not something a `try` around this line could
+                    # ever see.
                     _first, _first_depth = _dispatch_pairs[0]
-                    _prefetched[_chunk_key(_first)] = _issue(
-                        _first, _prompts[_chunk_key(_first)],
-                        _cache_key) + (_first_depth,)
-                    _rest = _dispatch_pairs[1:]
+                    _writer = _issue(_first, _prompts[_chunk_key(_first)],
+                                     _cache_key)
+                    if _writer[0] == "error":
+                        # SAME STATE, SAME FLOOR, SAME RESUME. `_warmup_error`
+                        # is the mechanism rather than a second flag: the
+                        # zero-success floor below already turns it into the
+                        # API-error result, which is the shape the retry router
+                        # and MAX_LLM_CLASSIFIER_RETRIES already handle and the
+                        # batch checkpoint already resumes. A second failure
+                        # shape here would be a second thing for every consumer
+                        # to agree about, for one event that means what the
+                        # first one means.
+                        _warmup_error = _writer[1]
+                        _warmup_error_source = WARMUP_SOURCE_FALLBACK_WRITER
+                        # NOT FILED. Leaving the failed outcome in `_prefetched`
+                        # would have `_account_unconsumed` count it a second
+                        # time under `abandoned:` -- one request reported as two
+                        # findings -- and it is not abandoned: it was read, here,
+                        # and is the reason the patient is failing.
+                        pending.clear()
+                        _rest = []
+                        PER_TRIAL_WARMUP_DEGRADATIONS[
+                            f"{WARMUP_FALLBACK_WRITER_FAILURE_KEY_PREFIX}"
+                            f"{type(_writer[1]).__name__}"] += 1
+                        log.error(
+                            "the Stage 5 per-trial fallback's cache writer "
+                            "failed after the provider refused the dedicated "
+                            "warmup; no further trial call was issued and the "
+                            "patient is failed so the retry budget and the "
+                            "checkpoint see it, rather than sending the rest "
+                            "of the wave against a cold prefix", stage=5,
+                            status="error",
+                            event="per_trial_fallback_writer_failed",
+                            retry=retry_count + 1,
+                            error_type=type(_writer[1]).__name__,
+                            error_message=str(_writer[1]),
+                            count=len(_dispatch_pairs) - 1, degraded=True)
+                    else:
+                        _prefetched[_chunk_key(_first)] = (_writer
+                                                           + (_first_depth,))
+                        _rest = _dispatch_pairs[1:]
                 else:
                     _rest = _dispatch_pairs
                 if _rest:
@@ -4174,8 +4316,41 @@ CLINICAL TRIALS:
                     # for it. One FRESH copy per task, taken on THIS thread: a
                     # single Context object cannot be entered concurrently, so
                     # sharing one across the pool would raise.
-                    with ThreadPoolExecutor(max_workers=_bound,
-                                            thread_name_prefix="stage5") as _ex:
+                    #
+                    # AN EXPLICIT SHUTDOWN, NOT A `with`. `ThreadPoolExecutor`
+                    # as a context manager calls `shutdown(wait=True)` with
+                    # `cancel_futures` defaulting to FALSE -- so an exception
+                    # out of the result loop, KeyboardInterrupt included, let
+                    # every QUEUED call run to completion before the exception
+                    # surfaced. An operator pressing Ctrl-C mid-wave got minutes
+                    # of continued billing that read as a hang: the process is
+                    # not stopping, and the reason is that it is still buying
+                    # responses nobody will ever read.
+                    #
+                    # WHAT THE LIMIT IS, STATED RATHER THAN IMPLIED: an HTTP
+                    # request already in flight is NOT interruptible. Python
+                    # cannot abort a worker blocked in the SDK's socket read, so
+                    # `cancel_futures=True` cancels only the tasks that have not
+                    # STARTED, and `wait=True` then blocks for the at most
+                    # `_bound` calls that have. That is a bounded wait -- one
+                    # request's duration, not the whole queue's -- and it is
+                    # what makes "no worker thread outlives this node" true.
+                    # `wait=False` would return sooner and buy nothing:
+                    # `concurrent.futures.thread` registers an atexit hook that
+                    # joins every worker anyway, so the same wait would happen
+                    # at interpreter shutdown with no traceback to explain it.
+                    #
+                    # A CANCELLED CALL WAS NEVER ISSUED, so it is billed by
+                    # nobody and appears in no ledger -- and it cannot be
+                    # misread as abandoned either, because only a RESOLVED
+                    # future is filed into `_prefetched` and `_account_unconsumed`
+                    # folds what is in there. Nothing is being suppressed on this
+                    # path: the exception that reached the `finally` is re-raised
+                    # unchanged and leaves the node, which is what an interrupt
+                    # is for.
+                    _ex = ThreadPoolExecutor(max_workers=_bound,
+                                             thread_name_prefix="stage5")
+                    try:
                         _futures = []
                         for _c, _d in _rest:
                             _ctx = contextvars.copy_context()
@@ -4183,11 +4358,16 @@ CLINICAL TRIALS:
                                 _ctx.run, _issue, _c,
                                 _prompts[_chunk_key(_c)], _cache_key)))
                         for _c, _d, _fut in _futures:
-                            # `.result()` cannot raise here: `_issue` returns
-                            # its exception rather than propagating it, and the
-                            # only other way a future raises is cancellation,
-                            # which nothing cancels.
+                            # `.result()` raises here only for a BaseException
+                            # that is not an Exception -- KeyboardInterrupt,
+                            # SystemExit -- which `_issue`'s `except Exception`
+                            # deliberately does not catch. It cannot raise
+                            # `CancelledError`: the only cancellation is in the
+                            # `finally` below, which runs after this loop has
+                            # been left for good.
                             _prefetched[_chunk_key(_c)] = _fut.result() + (_d,)
+                    finally:
+                        _ex.shutdown(wait=True, cancel_futures=True)
 
     def _obtain(chunk):
         """The API response for `chunk`, prefetched or issued now.
@@ -5087,15 +5267,33 @@ CLINICAL TRIALS:
             _warmup_error is not None or per_trial_failed_calls):
         elapsed = time.time() - start
         if _warmup_error is not None:
+            # THE TWO WRITERS GET TWO SENTENCES AND ONE RETURN. What differs is
+            # only how many requests reached the provider before the wave was
+            # stopped -- none for the dedicated warmup, one for the fallback's
+            # held-back trial call -- and that is a fact an operator reading a
+            # failed row acts on, so it is not rounded off into a shared phrase.
+            if _warmup_error_source == WARMUP_SOURCE_FALLBACK_WRITER:
+                _what = ("the provider refused the dedicated warmup's shape "
+                         "and the fallback's cache writer then failed, so the "
+                         "rest of the wave was not issued")
+            else:
+                _what = ("the shared prefix could not be warmed, so no trial "
+                         "call was issued")
             error_msg = (f"Stage 5 per-trial cache warmup error (attempt "
-                         f"{retry_count + 1}): the shared prefix could not be "
-                         f"warmed, so no trial call was issued; "
+                         f"{retry_count + 1}): {_what}; "
                          f"{type(_warmup_error).__name__}: {_warmup_error}")
-            log.error("the Stage 5 per-trial cache warmup failed and no trial "
-                      "call was issued; failing the patient so the retry "
-                      "budget and the checkpoint see it", stage=5,
+            log.error("the Stage 5 per-trial cache could not be established "
+                      "and the wave was not issued; failing the patient so the "
+                      "retry budget and the checkpoint see it", stage=5,
                       status="error", event="per_trial_warmup_floor",
                       retry=retry_count + 1, count=len(trials),
+                      # `reason` RATHER THAN A NEW FIELD NAME: it is
+                      # already the allowlisted low-cardinality "which
+                      # of a closed set" field this node logs the
+                      # warmup REJECTION under, and a second name for
+                      # the same kind of fact would need
+                      # LOGGABLE_FIELDS widened for nothing.
+                      reason=_warmup_error_source,
                       error_type=type(_warmup_error).__name__,
                       error_message=str(_warmup_error))
         else:

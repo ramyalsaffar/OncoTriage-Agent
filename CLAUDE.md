@@ -698,7 +698,7 @@ python tests/test_agent_cross_encoder_sequence_limit.py             #  42
 # the suite's two writers and are sha256-compared at the end. It DOES exec:
 # twenty-four in-memory copies of agent/evaluation.py, one plant each, argued
 # at _EXEC_ALLOWLIST. Bucket A, ~4 s.
-python tests/test_agent_stage5_per_trial_calls.py                   # 206 (was 139; the cache-warmup pass added section 3b and controls c18-c27)
+python tests/test_agent_stage5_per_trial_calls.py                   # 239 (was 206; the dispatch-hardening pass added sections 2b, 3c and 3d and controls c28-c31. ~10 s now: section 3d parks two workers for a bounded grace on each of its two arms)
 
 # The harness-budget pass. Same shape, same directory. No network, no keys, no
 # spend, NO LIVE SERVER and no live Qdrant -- it starts nothing and issues no
@@ -6485,6 +6485,158 @@ afterwards; `python fixture_replay.py` **12/12 clean, exit 0, with no recapture
 and zero CONFIG MOVED lines**; and the production `inferences.db` sha256
 **unchanged** — `ab1403e3…`, 90,185,728 bytes. **No money was spent and no
 migration was run.**
+
+
+### The per-trial dispatch layer stops leaking money on its failure paths (the dispatch-hardening pass)
+
+**THREE DEFECTS IN `oncotriage/agent/evaluation.py`'s PER-TRIAL DISPATCH, ALL
+THREE ON PATHS THE HAPPY CASE NEVER TOUCHES, AND NONE OF THEM RAISED.** No
+schema change, no migration, no billed call: `python fixture_replay.py` is
+**12/12 clean, exit 0, with no recapture**, and grouped mode AND the healthy
+per-trial path are **byte-identical to `git show HEAD:`** — the same request
+dicts, field for field, and the same published result. **The per-trial arm is
+compared as a canonically-ordered SET and that is not a weakening**: a recording
+stub appends as calls ENTER, and with a 4-way pool that order is the pool's
+rather than the node's, so comparing arrival sequences would be comparing the
+scheduler. Stable across three processes: grouped `8ad2b29dc646`, per-trial
+`8941d5e7111a`, both arms equal in every one.
+
+**1. THE FALLBACK'S CACHE WRITER WAS ISSUED AND NEVER READ.** Cache-or-nothing
+is a property of the NODE, not of the dedicated warmup: a wave may go out only
+behind a request that provably wrote the shared prefix. When the provider
+refuses the warmup's SHAPE the patient degrades to the retired one-then-rest
+schedule, which has a writer of its own — the first trial call, held back and
+awaited alone — and that writer's outcome was filed into `_prefetched` and
+never inspected. A writer that exhausted its transport retries therefore
+released **N-1 full-price requests against a prefix nothing had written**, the
+exact leak the warmup design exists to prevent, reached through the door the
+design opened. The only trace was one isolated per-trial failure among N-1
+ordinary successes, which is what an unlucky trial looks like; no counter
+moved, no error was returned, and the patient was recorded as a clean run.
+
+`_writer[0] == "error"` is now read — a TAG ON A VALUE, not something a `try`
+could see, because `_issue` returns its exception rather than raising, which is
+the contract that makes the wave's merge deterministic. On error the node
+clears `pending`, sets `_warmup_error`, empties `_rest`, and counts
+`PER_TRIAL_WARMUP_DEGRADATIONS` under
+`WARMUP_FALLBACK_WRITER_FAILURE_KEY_PREFIX` + the exception type. **A SEPARATE
+PREFIX FROM `failed:`, argued at the constant**: a run that never attempted the
+fallback and one that attempted it and lost are different findings, and only
+the second says the rejection classification is worth revisiting.
+
+**THE FAILED OUTCOME IS NOT FILED, and that is not tidiness.** Left in
+`_prefetched` it would be folded a second time by `_account_unconsumed` under
+`abandoned:` — one request reported as two findings — and it is not abandoned:
+it was read, here, and is the reason the patient is failing.
+
+**THE FLOOR'S SENTENCE HAD TO STOP LYING.** `_warmup_error` is deliberately the
+mechanism (same state, same floor, same API-error return, same resume) rather
+than a second failure shape for every consumer to agree about — but the
+existing message reads "no trial call was issued", which is exactly false when
+the writer failed: one trial call was issued and reached the provider.
+`WARMUP_SOURCE_WARMUP` / `WARMUP_SOURCE_FALLBACK_WRITER` is a closed
+two-member vocabulary read by the floor and by nothing else, and it is logged
+under the already-allowlisted `reason` field rather than widening
+`LOGGABLE_FIELDS` for a second name for the same kind of fact.
+
+**2. TWO CHUNKS COULD SHARE ONE DISPATCH KEY.** `_prompts` and `_prefetched`
+are keyed by `_chunk_key` — the chunk's nct_ids — and a repeat in
+`filtered_trials` is three faults at once, none of which raises: the second
+`_prompts` write wins, so **both** requests carry the second trial's rendered
+block and the first trial's criteria are never sent while its verdict is filed
+anyway; the second `_prefetched` write wins, so the send loop's second pop finds
+nothing and `_obtain` issues a **live, uncached, unbounded-by-the-pool** request
+for a response already paid for; and the overwritten response is folded by
+nobody, because `_account_unconsumed` folds what is LEFT in `_prefetched`.
+**The per-INDEX guard cannot see it** — it asks whether chunk *i* holds
+`trials[i]`, which is TRUE for both members of a repeat.
+
+Unreachable today (Stage 2 de-duplicates by nct_id) is **not** impossible: that
+is a property of a stage three modules away that nothing here holds. The guard
+is one `Counter` over N 1-tuples, raises `PackingBlockMismatchError` **naming
+the repeated ids**, and fires before the warmup — so a repeat costs nothing at
+all rather than one infrastructure call plus an extra billed trial call.
+
+**AND IT IS WHAT CLOSES `_obtain`'s LIVE PATH IN THIS MODE, which is now
+ASSERTED RATHER THAN REASONED.** With keys unique every dispatched chunk is
+filed and popped exactly once, and every per-trial chunk is a SINGLETON — which
+the reactive splitter refuses to halve, because `len(chunk) == 1` is its floor,
+above the split. Measured by driving every response to
+`finish_reason == "length"`: four trials, four wave calls, **zero** truncation
+splits, every trial at the truncation floor. And structurally, so an edit that
+moved the floor below the split fails even on a run in which nothing truncates
+— the check is **scoped to the reactive branch**, because the node calls
+`_split_in_half` TWICE and the other call is the proactive splitter, which
+per-trial mode replaces outright.
+
+**3. Ctrl-C MID-WAVE KEPT BUYING RESPONSES.** `ThreadPoolExecutor` as a context
+manager calls `shutdown(wait=True)` with `cancel_futures` defaulting to FALSE,
+so an exception out of the result loop — KeyboardInterrupt included — let every
+QUEUED call run to completion before the exception surfaced. Minutes of
+continued billing that read as a hang. The executor is now shut down explicitly
+in a `finally` with `cancel_futures=True`.
+
+**THE LIMIT IS STATED AT THE CODE RATHER THAN IMPLIED**: an HTTP request already
+in flight is NOT interruptible, so this cancels only what has not STARTED and
+`wait=True` then blocks for at most `_bound` calls — one request's duration, not
+the whole queue's. `wait=False` would return sooner and buy nothing:
+`concurrent.futures.thread` registers an atexit hook that joins every worker
+anyway, at interpreter shutdown, with no traceback to explain it.
+
+**A CANCELLED CALL IS BILLED BY NOBODY AND CANNOT BE MISCLASSIFIED**, by
+construction rather than by a filter: only a RESOLVED future is filed into
+`_prefetched`, and the node publishes no result at all on this path, so there is
+no ledger and no token total that could carry a request that was never issued.
+The interrupt is re-raised unchanged, which is what an interrupt is for.
+
+**`tests/test_agent_stage5_per_trial_calls.py` — 206 -> 239 checks, ~10 s**,
+still bucket A, still no network, no keys, **no spend**. Three new sections (2b,
+3c, 3d) and four new controls (c28-c31). **FOUR REVERTS, FOUR CAUGHT**, each in
+a `copytree`'d copy with `PYTHONPATH` pointed at it, a realpath preflight
+asserting the COPY is what imports and `PYTHONDONTWRITEBYTECODE=1` set: the
+un-inspected writer (9 recorded failures), the removed uniqueness guard (3), the
+removed `cancel_futures` (2) and the `with`-form executor (3). Every one ran to
+its own summary; none aborted.
+
+**THE INTERRUPT IS RAISED INSIDE A WORKER, NOT AS A REAL SIGNAL, and the reason
+is not squeamishness.** `_issue` catches `Exception`, so a BaseException that is
+not an Exception travels out of the worker, into the future, and is re-raised on
+the node thread at `future.result()` — byte for byte the propagation a real
+SIGINT produces there. A real `os.kill(..., SIGINT)` in a process that also runs
+sixty other test files in CI bucket A is a way to abort the run rather than
+measure it.
+
+**AND THE REVERT HARNESS FOUND A DEFECT IN THIS PASS'S OWN TEST CODE THAT
+READING DID NOT.** The interrupt probe first used `run_node`, which clears the
+dependency override in its `finally` the instant the node returns. Under the
+`with`-form revert — the very defect shape the section exists to catch — worker
+threads are still running at that moment, and their next
+`deps.get_openai_client()` resolves to **whatever is installed next**: the
+following scenario's stub, whose request count they corrupt (control c1 failed
+for that reason and for no other), or, with nothing installed, a **REAL client
+built from the real credentials file**. A test that can make a billed call when
+the code under test regresses is not a stub-only test. The probe now drives the
+node itself, MEASURES the leak at the moment the node returned, and only then
+joins the survivors and clears the override — with `deps.peek(OPENAI_CLIENT) is
+UNSET` asserted afterwards as the no-spend tripwire, because a real client that
+had been built would be cached there.
+
+**VERIFIED BY RUNNING.** `tests/test_agent_stage5_per_trial_calls.py`
+**239/0**; `tests/test_package_invariants.py` **260/0/0**; CI bucket A
+**61/61**; `tests/run_serial_tests.py` **5/5** with `oncotriage/config.py` and
+`oncotriage/registries/cancer_code_registry.py` confirmed restored;
+`python fixture_replay.py` **12/12 clean, exit 0, no recapture**; grouped mode
+and the healthy per-trial path byte-identical to `git show HEAD:`; and the
+production `inferences.db` sha256 **unchanged** — `ab1403e3…`, 90,185,728 bytes.
+**No money was spent and no migration was run.**
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.** There is still no
+PROCESS MEMO of a warmup rejection: every patient re-discovers it, paying one
+refused warmup each. A memo is a behaviour change with its own argument (a
+transient 400 would disable the warmup for the life of the process) and belongs
+to a pass that can measure it. And an interrupt still discards the responses
+already resolved into `_prefetched` — nothing catches KeyboardInterrupt, which
+is correct, and writing a ledger from a signal handler is a separate decision.
 
 
 ### Stage 5 can be served by Amazon Bedrock, and the flag is OFF (the Bedrock pass)

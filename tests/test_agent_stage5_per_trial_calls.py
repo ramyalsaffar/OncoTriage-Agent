@@ -146,9 +146,11 @@ from oncotriage.storage import database_logger as _dl
 from oncotriage.agent.evaluation import (
     NOT_EVALUABLE_CALL_FAILED,
     NOT_EVALUABLE_MODEL_OMITTED,
+    NOT_EVALUABLE_TRUNCATION_FLOOR,
     PER_TRIAL_CALL_FAILURES,
     PER_TRIAL_WARMUP_DEGRADATIONS,
     WARMUP_FAILURE_KEY_PREFIX,
+    WARMUP_FALLBACK_WRITER_FAILURE_KEY_PREFIX,
     WARMUP_REJECTED_CACHE_KEY,
     WARMUP_REJECTED_MINIMAL_OUTPUT,
     MatchingModelMismatchError,
@@ -379,7 +381,8 @@ class _Stub:
                  barrier_size=None, delay=0.0, cached_first_only=False,
                  barrier_all=False, barrier_timeout=15.0, refuse_for=(),
                  bad_json_for=(), warmup_raise=None, warmup_model=None,
-                 warmup_cached=None, warmup_prompt_tokens=None):
+                 warmup_cached=None, warmup_prompt_tokens=None,
+                 truncate_for=(), interrupt_for=(), hold=None):
         self.requests = []          # arrival order
         self.events = []            # ("enter"|"exit", call_no, ticket)
         self.cached = cached
@@ -391,6 +394,26 @@ class _Stub:
         # responses are already paid for and sitting unread.
         self.refuse_for = set(refuse_for)
         self.bad_json_for = set(bad_json_for)
+        # A TRUNCATED RESPONSE is a third such shape: the request succeeded and
+        # was billed, and `finish_reason == "length"` is the API stating that it
+        # ran out of room. It is what section 2b drives the reactive splitter
+        # with, because that branch is read from finish_reason and is reached
+        # BEFORE the body is parsed.
+        self.truncate_for = set(truncate_for)
+        # A KeyboardInterrupt RAISED INSIDE A WORKER, which is exactly the
+        # propagation shape a real SIGINT produces at `future.result()`:
+        # `_issue` catches `Exception`, so a BaseException that is not an
+        # Exception travels out of the worker, into the future, and is re-raised
+        # on the node thread. A REAL signal is deliberately not used -- this
+        # file runs beside sixty others in CI bucket A and a stray SIGINT
+        # delivered a moment early or late aborts the run instead of measuring
+        # it, which is the abort class this file's `_Absent` exists to prevent.
+        self.interrupt_for = set(interrupt_for)
+        self.interrupt_raised = threading.Event()
+        # A gate every OTHER trial call parks on, so the pool's workers are
+        # provably occupied and cannot drain the queue while the node is
+        # cancelling it. Released by the scenario's own watchdog; see section 2c.
+        self.hold = hold
         self.answer = answer or {}
         self.warmup_raise = warmup_raise
         self.warmup_model = warmup_model
@@ -449,6 +472,14 @@ class _Stub:
                     self._barrier.wait(timeout=self.barrier_timeout)
                 except threading.BrokenBarrierError:
                     self.barrier_broken = True
+            if self.interrupt_for and set(ids) & self.interrupt_for:
+                # RECORDED BEFORE IT IS RAISED, so a watchdog can key on the
+                # event rather than on a wall-clock guess about when the node
+                # got here.
+                self.interrupt_raised.set()
+                raise KeyboardInterrupt("simulated operator interrupt")
+            if self.hold is not None:
+                self.hold.wait(timeout=30.0)
             _d = self._delay_for(ids)
             if _d:
                 time.sleep(_d)
@@ -463,6 +494,8 @@ class _Stub:
             if cached is not None and self.cached_first_only and call_no > 0:
                 cached = None
             resp = _StubResponse(body, cached=cached)
+            if set(ids) & self.truncate_for:
+                resp.choices[0].finish_reason = "length"
             if set(ids) & self.refuse_for:
                 resp.choices[0].message.content = None
                 resp.choices[0].message.refusal = "I cannot help with that."
@@ -1038,6 +1071,200 @@ check("2l  ...and every request carried the SAME system message, which is the "
 
 
 # ===========================================================================
+# SECTION 2b -- THE DISPATCH KEY IS UNIQUE, AND THAT IS WHAT CLOSES THE
+#               SPLITTER'S LIVE-CALL PATH
+# ===========================================================================
+#
+# `_prompts` and `_prefetched` are keyed by `_chunk_key` -- the chunk's nct_ids.
+# TWO CHUNKS UNDER ONE KEY ARE THREE FAULTS AT ONCE AND NONE OF THEM RAISES:
+# the second `_prompts` write wins, so both requests carry the second trial's
+# rendered block and the first trial's criteria are never sent; the second
+# `_prefetched` write wins, so the send loop's second pop finds nothing and
+# `_obtain` issues a live request for a response that was already paid for; and
+# the overwritten response is folded by nobody, because `_account_unconsumed`
+# folds what is LEFT in `_prefetched` and an overwritten value was never left.
+#
+# The per-INDEX guard cannot see it. It asks whether chunk i holds trials[i],
+# which is TRUE for both members of a repeat -- the repeat is in `trials`.
+#
+# UNREACHABLE TODAY IS NOT IMPOSSIBLE, and that is the whole argument for the
+# guard: Stage 2 de-duplicates by nct_id, which is a property of a stage three
+# modules away that nothing here can hold.
+#
+# AND THE PAYOFF IS THE SECOND HALF OF THIS SECTION. With keys unique, every
+# dispatched chunk is filed and popped exactly once, and every per-trial chunk
+# is a SINGLETON -- which the reactive splitter refuses to halve. So `_obtain`'s
+# live-call path, which is a real and deliberate path in grouped mode, cannot be
+# reached in per-trial mode at all. That is asserted here, twice: by driving
+# every response to `finish_reason == "length"` and counting requests, and
+# structurally, so an edit that moved the floor below the split fails even if no
+# scenario happened to cover it.
+
+section("SECTION 2b -- duplicate keys are refused, and the splitter cannot fire")
+
+
+def _marked_trial(nct_id, marker):
+    """A trial whose rendered block is identifiable by its criteria text.
+
+    THE TITLE IS NOT RENDERED -- `_render_trial_blocks` emits the nct_id, the
+    phase and the two criteria bodies and nothing else, measured rather than
+    assumed -- so a marker in the criteria is the only way to say WHICH of two
+    trials sharing an nct_id reached the provider.
+    """
+    return {"trial": {"nct_id": nct_id, "title": f"marked {marker}",
+                      "phase": "PHASE2",
+                      "eligibility": {
+                          "inclusion_criteria": f"Inclusion Criteria:\n- {marker}",
+                          "exclusion_criteria": f"Exclusion Criteria:\n- {marker}"}}}
+
+
+_DUP_ID = "NCT09999001"
+_DUP_A = "AAAAAAAAAAAA"
+_DUP_B = "BBBBBBBBBBBB"
+# TWO ENTRIES SHARING ONE nct_id, with different criteria, plus one ordinary
+# trial so the batch is not degenerately all-duplicates.
+_DUP = [_marked_trial(_DUP_ID, _DUP_A), _marked_trial(_DUP_ID, _DUP_B),
+        trial(7)]
+
+_R2d, _S2d = run_node(_DUP, per_trial=True, parallel=4)
+
+check("2b(a) a batch carrying one nct_id twice is REFUSED, and the refusal is "
+      "PackingBlockMismatchError -- the exception this file already raises for "
+      "a dispatch that has stopped being positionally parallel, one mechanism "
+      "over",
+      (isinstance(_R2d, _Absent),
+       PackingBlockMismatchError.__name__ in repr(_R2d)), (True, True))
+check("2b(b) ...BEFORE ANY REQUEST IS ISSUED, the warmup included: the guard "
+      "sits above the dispatch, so a repeat costs nothing at all rather than "
+      "one infrastructure call plus an extra billed trial call",
+      (len(_S2d.requests), len(_S2d.warmup_requests()),
+       len(_S2d.wave_requests())), (0, 0, 0))
+check("2b(c) ...and the message NAMES the repeated id, so the fix is not a "
+      "hunt through the batch",
+      _DUP_ID in repr(_R2d), True)
+check("2b(d) ...non-degeneracy: the SAME three trials with distinct ids run "
+      "clean, so the refusal is about the repeat and not about the shape of "
+      "these trial objects",
+      (lambda r: (isinstance(r[0], dict), len(at(r[0], "evaluations")),
+                  len(r[1].wave_requests())))(
+          run_node([_marked_trial("NCT09999001", _DUP_A),
+                    _marked_trial("NCT09999002", _DUP_B), trial(7)],
+                   per_trial=True, parallel=4)),
+      (True, 3, 3))
+
+# ── THE SPLITTER'S LIVE-CALL PATH IS UNREACHABLE HERE ─────────────────────
+#
+# Every trial call answers `finish_reason == "length"`. In GROUPED mode that is
+# the reactive splitter's trigger: halve the chunk and send both halves, which
+# is where `_obtain`'s live path exists for. In per-trial mode every chunk holds
+# one trial, so the floor above the split fires instead and the trial is
+# recorded rather than re-sent. Nothing is halved, nothing new is queued, and
+# every request the node makes is one it already prefetched.
+_TRUNC4 = [trial(i) for i in range(4)]
+_R2t, _S2t = run_node(_TRUNC4, per_trial=True, parallel=4,
+                      stub=_Stub(truncate_for=[t["trial"]["nct_id"]
+                                               for t in _TRUNC4]))
+
+check("2b(e) every response truncating produces NO extra request: four trials, "
+      "four wave calls and one warmup -- the splitter cannot halve a singleton, "
+      "so no chunk `_obtain` has no response for can ever reach it",
+      (len(_S2t.wave_requests()), len(_S2t.warmup_requests()),
+       at(_R2t, "llm_classifier_truncation_splits")), (4, 1, 0))
+check("2b(f) ...and every trial is recorded at the truncation FLOOR rather "
+      "than dropped or retried, which is what the singleton branch does "
+      "instead of splitting",
+      sorted({e.get("not_evaluable_reason")
+              for e in at(_R2t, "evaluations")}),
+      [NOT_EVALUABLE_TRUNCATION_FLOOR])
+check("2b(f) ...non-degeneracy: all four trials came back, so the reading "
+      "above is over a full batch rather than an empty set",
+      len(at(_R2t, "evaluations")), 4)
+
+# STRUCTURALLY, so an edit that moved the floor below the split is caught even
+# by a run in which nothing truncates.
+_node_fns = [n for n in ast.walk(_eval_tree) if isinstance(n, ast.FunctionDef)
+             and n.name == "node_llm_classifier_evaluation"]
+_length_branches = [
+    n for f in _node_fns for n in ast.walk(f)
+    if isinstance(n, ast.If)
+    and "FINISH_REASON_LENGTH" in {x.id for x in ast.walk(n.test)
+                                   if isinstance(x, ast.Name)}]
+
+
+def _singleton_floor(branch):
+    """(lineno, ends_in_continue) of the ``len(chunk) == 1`` guard, or (None, False)."""
+    for st in branch.body:
+        if not isinstance(st, ast.If):
+            continue
+        calls = {n.func.id for n in ast.walk(st.test)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        names = {n.id for n in ast.walk(st.test) if isinstance(n, ast.Name)}
+        # `n.value == 1` alone would also match `True`, which is not the same
+        # statement; bools are excluded explicitly.
+        ones = [n for n in ast.walk(st.test) if isinstance(n, ast.Constant)
+                and n.value == 1 and not isinstance(n.value, bool)]
+        if "len" in calls and "chunk" in names and ones:
+            return st.lineno, isinstance(st.body[-1], ast.Continue)
+    return None, False
+
+
+def _first_before(lineno, linenos):
+    """Is `lineno` strictly above every member of `linenos`, in source order?
+
+    FALSE, NEVER A RAISE, when either side is missing. `min()` over an empty
+    list raises ValueError and `_Absent` has no ordering, and BOTH would raise
+    on exactly the defect these checks exist to catch -- the floor deleted, or
+    the splitter call gone -- so the run would print one traceback where it owes
+    named failures. The non-degeneracy checks beside these say which side was
+    empty.
+    """
+    try:
+        return bool(linenos) and isinstance(lineno, int) and lineno < min(linenos)
+    except Exception:                                             # noqa: BLE001
+        return False
+
+
+_floor_line, _floor_continues = (_singleton_floor(_length_branches[0])
+                                 if _length_branches else (None, False))
+# SCOPED TO THE REACTIVE BRANCH, and that scoping is the point rather than a
+# convenience: the node calls `_split_in_half` TWICE. The other call is the
+# PROACTIVE splitter, which runs before dispatch and shapes `initial_chunks` in
+# grouped mode only -- per-trial mode replaces that whole computation with
+# `[[t] for t in trials]`. Counting both would have this check comparing the
+# floor against a call that cannot run in this mode at all.
+_split_lines = [n.lineno for n in ast.walk(_length_branches[0])
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                and n.func.id == "_split_in_half"] if _length_branches else []
+_split_lines_all = [n.lineno for f in _node_fns for n in ast.walk(f)
+                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                    and n.func.id == "_split_in_half"]
+
+check("2b(g) there is exactly one truncation branch, exactly one call to the "
+      "splitter inside it, and the `len(chunk) == 1` floor is ABOVE that call "
+      "and ends in `continue` -- so a singleton is recorded and never halved",
+      (len(_length_branches), len(_split_lines), _floor_continues,
+       _floor_line is not None and bool(_split_lines)
+       and _first_before(_floor_line, _split_lines)),
+      (1, 1, True, True))
+check("2b(g) ...non-degeneracy: both line numbers were really found, so the "
+      "comparison above is not two Nones agreeing",
+      (isinstance(_floor_line, int), all(isinstance(n, int)
+                                         for n in _split_lines)),
+      (True, True))
+check("2b(g) ...and the node's OTHER call to the splitter is accounted for: "
+      "two in total, one reactive and one proactive, so the scoping above is "
+      "excluding a known second call rather than silently missing one",
+      # `ast.walk` yields breadth-first, so the list is NOT in source order and
+      # is compared as a SET of line numbers rather than as a sequence. `min()`
+      # over an empty list RAISES, and it would raise on exactly the defect
+      # this check exists to catch -- the abort class this file's `_Absent`
+      # exists to prevent -- so both are read through `_lo`.
+      (len(_split_lines_all), set(_split_lines) <= set(_split_lines_all),
+       _first_before(min(_split_lines_all) if _split_lines_all else None,
+                     _split_lines)), (2, True, True))
+
+
+# ===========================================================================
 # SECTION 3 -- THE SCHEDULING SHAPE, PROVEN BY ORDER
 # ===========================================================================
 #
@@ -1365,6 +1592,273 @@ check("3w(s) ...positively: an exception carrying the status on `response` is "
 check("3w(t) ...and it never raises on an exception carrying neither, which "
       "would replace a named transport failure with an AttributeError",
       drive(classify_warmup_rejection, KeyboardInterrupt()), None)
+
+
+# ===========================================================================
+# SECTION 3c -- THE FALLBACK'S CACHE WRITER OBEYS THE SAME RULE
+# ===========================================================================
+#
+# CACHE-OR-NOTHING IS A PROPERTY OF THE NODE, NOT OF THE DEDICATED WARMUP. When
+# the provider refuses the warmup's SHAPE the patient degrades to the retired
+# one-then-rest schedule, which has a cache writer of its own: the first trial
+# call, held back and awaited alone. Until this section existed that writer's
+# outcome was FILED AND NEVER READ -- so a writer that exhausted its transport
+# retries released N-1 full-price requests against a prefix nothing had written,
+# with no counter, no error and a patient reported as a clean run. The only
+# trace was one isolated per-trial failure among N-1 ordinary successes, which
+# is what an unlucky trial looks like.
+#
+# THE REMEDY IS THE ONE ALREADY BUILT. `pending.clear()`, the warmup-error
+# state, the existing zero-success floor, the existing API-error return: the
+# retry router and the batch checkpoint already handle that shape, and a second
+# failure shape for one event would be a second thing for every consumer to
+# agree about.
+
+section("SECTION 3c -- the fallback's held-back writer is inspected")
+
+_FB_REJECT = _WarmupRefused(
+    "Invalid value for 'max_completion_tokens': must be >= 16")
+# THE WRITER IS THE FIRST TRIAL IN DISPATCH ORDER, which is the batch's first.
+_FB_WRITER_ID = _FOUR[0]["trial"]["nct_id"]
+
+_before_fb = dict(PER_TRIAL_WARMUP_DEGRADATIONS)
+_before_fb_calls = dict(PER_TRIAL_CALL_FAILURES)
+_R3f, _S3fb = run_node(
+    _FOUR, per_trial=True, parallel=4,
+    stub=_Stub(warmup_raise=_FB_REJECT, fail_for=[_FB_WRITER_ID]))
+_after_fb = dict(PER_TRIAL_WARMUP_DEGRADATIONS)
+_after_fb_calls = dict(PER_TRIAL_CALL_FAILURES)
+
+check("3fw(a) a fallback whose cache writer FAILS issues no further trial "
+      "call: exactly ONE trial request, the writer, and not the three "
+      "full-price uncached ones the un-inspected outcome released. The warmup "
+      "request is counted too -- the provider REFUSED it, which means it "
+      "reached the provider",
+      (len(_S3fb.wave_requests()), len(_S3fb.warmup_requests()),
+       len(_S3fb.requests)), (1, 1, 2))
+check("3fw(b) ...and the one request that WAS issued is the writer, so the "
+      "count above is the held-back call rather than an arbitrary survivor",
+      _S3fb.wave_ids(), [[_FB_WRITER_ID]])
+check("3fw(c) ...the patient is failed through the SAME floor a warmup "
+      "failure takes, so the retry router and the checkpoint see one shape",
+      (at(_R3f, "evaluations"), at(_R3f, "llm_classifier_retries"),
+       bool(at(_R3f, "error"))), ([], 1, True))
+check("3fw(d) ...and the error says which writer failed rather than claiming "
+      "no trial call was issued, which would be false about a request the "
+      "provider really answered for",
+      ("fallback" in str(at(_R3f, "error")).lower(),
+       "no trial call was issued" in str(at(_R3f, "error")),
+       "stub failure" in str(at(_R3f, "error"))), (True, False, True))
+check("3fw(e) FAILURE IS NOT SILENCE: the counter moved under a key that "
+      "names the FALLBACK writer and the exception type, separately from the "
+      "dedicated warmup's transport-failure key -- only this one says the "
+      "rejection classification is worth revisiting",
+      ({k: _after_fb.get(k, 0) - _before_fb.get(k, 0) for k in _after_fb
+        if _after_fb.get(k, 0) != _before_fb.get(k, 0)}),
+      {WARMUP_REJECTED_MINIMAL_OUTPUT: 1,
+       f"{WARMUP_FALLBACK_WRITER_FAILURE_KEY_PREFIX}RuntimeError": 1})
+check("3fw(f) ...and the writer is NOT also counted as a per-trial call "
+      "failure or folded as an abandoned response: one request, one finding",
+      (sum(_after_fb_calls.values()) - sum(_before_fb_calls.values()),
+       at(_R3f, "llm_classifier_call_details")), (0, []))
+check("3fw(g) ...and no token figure is invented for it: the writer raised, so "
+      "no usage object ever existed and the keys are ABSENT rather than zero",
+      ("llm_classifier_input_tokens" in _R3f
+       if isinstance(_R3f, dict) else _Absent("no result"),
+       "llm_classifier_calls" in _R3f
+       if isinstance(_R3f, dict) else _Absent("no result")), (False, False))
+
+# THE HEALTHY FALLBACK IS UNCHANGED, which is the other half of the claim: the
+# inspection must not turn a working degraded schedule into a failed patient.
+_before_ok = dict(PER_TRIAL_WARMUP_DEGRADATIONS)
+_R3g, _S3g = run_node(_FOUR, per_trial=True, parallel=4,
+                      stub=_Stub(warmup_raise=_WarmupRefused(
+                          "Invalid value for 'max_completion_tokens': "
+                          "must be >= 16")))
+_after_ok = dict(PER_TRIAL_WARMUP_DEGRADATIONS)
+check("3fw(h) a fallback whose writer SUCCEEDS is untouched: all four trials "
+      "evaluated, four wave calls, no error",
+      (bool(at(_R3g, "error")), len(_S3g.wave_requests()),
+       sorted(e.get("nct_id") for e in at(_R3g, "evaluations"))),
+      (False, 4, sorted(t["trial"]["nct_id"] for t in _FOUR)))
+check("3fw(i) ...and it records ONLY the rejection -- no fallback-writer key, "
+      "so the counter separates 'degraded and worked' from 'degraded and "
+      "lost'",
+      ({k: _after_ok.get(k, 0) - _before_ok.get(k, 0) for k in _after_ok
+        if _after_ok.get(k, 0) != _before_ok.get(k, 0)}),
+      {WARMUP_REJECTED_MINIMAL_OUTPUT: 1})
+check("3fw(j) ...and the writer's own response is CONSUMED rather than "
+      "re-issued: four billed calls for four trials, each answering once",
+      (at(_R3g, "llm_classifier_calls"),
+       sorted(len(ids) for ids in _S3g.wave_ids())), (4, [1, 1, 1, 1]))
+
+
+# ===========================================================================
+# SECTION 3d -- AN INTERRUPT MID-WAVE CANCELS WHAT HAS NOT STARTED
+# ===========================================================================
+#
+# `ThreadPoolExecutor` AS A CONTEXT MANAGER CALLS `shutdown(wait=True)` WITH
+# `cancel_futures` DEFAULTING TO FALSE. So an exception out of the result loop
+# -- KeyboardInterrupt included -- let every QUEUED call run to completion
+# before the exception surfaced. An operator pressing Ctrl-C mid-wave got
+# minutes of continued billing that reads as a hang: the process is not
+# stopping, and the reason is that it is still buying responses nobody will
+# read.
+#
+# THE INTERRUPT IS RAISED INSIDE A WORKER, NOT AS A REAL SIGNAL. `_issue`
+# catches `Exception`, so a BaseException that is not an Exception travels out
+# of the worker, into the future, and is re-raised on the node thread at
+# `future.result()` -- byte for byte the propagation a real SIGINT produces
+# there. A real `os.kill(..., SIGINT)` in a process that also runs sixty other
+# test files in CI bucket A is a way to abort the run rather than measure it.
+#
+# THE WORKERS ARE PARKED, WHICH IS WHAT MAKES "QUEUED CALLS NEVER FIRE"
+# MEASURABLE. With a bound of 2 and eight trials, the two workers are held on
+# an Event while six tasks sit in the queue; the interrupt fires, the node
+# cancels the queue, and only the tasks that had already STARTED can ever have
+# reached the stub. The watchdog releases the Event a grace period after the
+# stub itself recorded the interrupt, so the wait is bounded and the control
+# below is fast rather than draining a queue at full speed.
+
+section("SECTION 3d -- Ctrl-C mid-wave stops buying responses")
+
+_EIGHT = [trial(i) for i in range(8)]
+_INT_ID = _EIGHT[0]["trial"]["nct_id"]
+# Generous relative to the critical path it has to cover -- a future that is
+# already done being read on the node thread, then `shutdown(...)`. It is not
+# the mechanism, only the ceiling on how long the parked workers hold.
+_INT_GRACE = 3.0
+
+
+def _release_after_interrupt(stub, hold, grace):
+    stub.interrupt_raised.wait(timeout=30.0)
+    time.sleep(grace)
+    hold.set()
+
+
+def _stage5_threads():
+    return [t.name for t in threading.enumerate()
+            if t.name.startswith("stage5")]
+
+
+def _interrupt_probe(node=None):
+    """Drive one interrupted wave; return (result, stub, leaked_thread_names).
+
+    IT DRIVES THE NODE ITSELF RATHER THAN CALLING ``run_node``, and the reason
+    is a hazard this file's revert harness found rather than a preference.
+    ``run_node`` clears the dependency override in its ``finally``, the instant
+    the node returns. On a node whose executor is NOT joined before the
+    exception leaves it -- which is exactly the defect shape section 3d exists
+    to catch -- worker threads are still running at that moment, and their next
+    ``deps.get_openai_client()`` therefore resolves to WHATEVER IS INSTALLED
+    NEXT: the following scenario's stub, whose request count they then corrupt,
+    or, if nothing is installed, a REAL client built from the real credentials
+    file. A test that can make a billed call when the code under test regresses
+    is not a stub-only test.
+    So the override is held until every worker is gone, and the leak is
+    MEASURED first -- at the moment the node returned, which is what the
+    assertion is about -- rather than being waited away before it is read.
+    """
+    hold = threading.Event()
+    stub = _Stub(interrupt_for=[_INT_ID], hold=hold)
+    watcher = threading.Thread(target=_release_after_interrupt,
+                               args=(stub, hold, _INT_GRACE), daemon=True)
+    watcher.start()
+    node = node or node_llm_classifier_evaluation
+    saved = (config.MATCHING_PER_TRIAL_CALLS_ENABLED,
+             config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS)
+    deps.set_override(deps.OPENAI_CLIENT, stub)
+    # Bound BEFORE the try so the return below cannot NameError if anything in
+    # it goes wrong -- `drive` catches BaseException today, and a helper that
+    # depends on that staying true is one edit from an abort.
+    result, leaked = _Absent("the probe body did not run"), []
+    try:
+        config.MATCHING_PER_TRIAL_CALLS_ENABLED = True
+        config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS = 2
+        result = drive(node, {
+            "patient_data": PATIENT, "filtered_trials": _EIGHT,
+            "llm_classifier_retries": 0, "mesh_filter_applied": True,
+            "mesh_filter_skip_reason": "applied", "stage_timings": {}})
+        leaked = _stage5_threads()
+    finally:
+        hold.set()
+        watcher.join(timeout=30.0)
+        _deadline = time.monotonic() + 30.0
+        while _stage5_threads() and time.monotonic() < _deadline:
+            time.sleep(0.02)
+        (config.MATCHING_PER_TRIAL_CALLS_ENABLED,
+         config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS) = saved
+        deps.clear_override(deps.OPENAI_CLIENT)
+    return result, stub, leaked
+
+
+_R3i, _S3i, _int_threads = _interrupt_probe()
+_int_seen = {ids[0] for ids in _S3i.wave_ids() if ids}
+_int_never = [t["trial"]["nct_id"] for t in _EIGHT
+              if t["trial"]["nct_id"] not in _int_seen]
+
+check("3int(a) the interrupt SURFACES rather than being swallowed: the node "
+      "raises KeyboardInterrupt out to its caller, which is what an interrupt "
+      "is for -- it is not converted into a failure return and not absorbed "
+      "by `_issue`'s `except Exception`",
+      (isinstance(_R3i, _Absent), "KeyboardInterrupt" in repr(_R3i)),
+      (True, True))
+check("3int(b) QUEUED CALLS NEVER FIRE: with a bound of 2 over eight trials, "
+      "at most the bound plus the interrupter can ever have reached the "
+      "provider, and at least five were cancelled before being issued",
+      (len(_S3i.wave_requests()) <= 3, len(_int_never) >= 5), (True, True))
+check("3int(c) ...non-degeneracy: the warmup ran and the interrupting call "
+      "really did reach the provider, so the cancellations above are a "
+      "finding rather than a node that never dispatched",
+      (len(_S3i.warmup_requests()), _INT_ID in _int_seen), (1, True))
+check("3int(d) A CANCELLED CALL IS BILLED BY NOBODY AND APPEARS IN NO LEDGER: "
+      "the node published no result at all, so there is no `call_details` and "
+      "no token total that could carry a request that was never issued -- and "
+      "`_account_unconsumed` cannot misclassify one, because only a RESOLVED "
+      "future is ever filed into `_prefetched`",
+      isinstance(_R3i, dict), False)
+check("3int(e) NO THREAD LEAKS: the explicit shutdown joins every worker "
+      "before the exception leaves the node, so an in-flight request is "
+      "waited for exactly once and none outlives the patient. Measured AT the "
+      "moment the node returned, not after a wait",
+      _int_threads, [])
+# THE ACCOUNTING CLAIM, DIRECTLY. 3int(d) says it by consequence -- there is no
+# published result, so there is no ledger to misclassify anything into. This
+# says it about the CODE: the only statement that files anything into
+# `_prefetched` inside the executor block is the one that reads a future's
+# `.result()`, so a future that was cancelled rather than resolved cannot enter
+# the dict `_account_unconsumed` folds. It is structural because there is no
+# scenario in which a cancelled future is BOTH filed and observable: the node
+# raises on every path that cancels one.
+_fut_loops = [n for f in _node_fns for n in ast.walk(f) if isinstance(n, ast.For)
+              and isinstance(n.iter, ast.Name) and n.iter.id == "_futures"]
+_prefetched_stores = [
+    n for f in _node_fns for n in ast.walk(f)
+    if isinstance(n, ast.Assign)
+    and any(isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name)
+            and t.value.id == "_prefetched" for t in n.targets)]
+_stores_in_loop = [n for lp in _fut_loops for n in ast.walk(lp)
+                   if n in _prefetched_stores]
+_result_reads = [n for lp in _fut_loops for n in ast.walk(lp)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                 and n.func.attr == "result"]
+
+check("3int(g) A CANCELLED FUTURE CANNOT BE FILED, structurally: there is one "
+      "loop over `_futures`, every `_prefetched` store inside the executor "
+      "block is in it, and it reaches the dict only through `.result()` -- so "
+      "only a RESOLVED future is ever recorded and `_account_unconsumed` "
+      "cannot see a call that was never issued",
+      (len(_fut_loops), len(_stores_in_loop), len(_result_reads) >= 1),
+      (1, 1, True))
+check("3int(g) ...non-degeneracy: the node really does file into `_prefetched` "
+      "elsewhere too (the fallback writer), so the count above is a scoping "
+      "finding rather than a walk that matched nothing",
+      len(_prefetched_stores) > len(_stores_in_loop), True)
+check("3int(f) ...and NO REAL CLIENT WAS EVER BUILT: `peek` is UNSET, so no "
+      "worker resolved the seam after the override came off. This is the "
+      "no-spend guarantee stated as a measurement -- a leaked worker is one "
+      "`deps.get_openai_client()` away from a real, billed request",
+      deps.peek(deps.OPENAI_CLIENT) is deps.UNSET, True)
 
 
 # ===========================================================================
@@ -2543,6 +3037,124 @@ control(
     # raise the operator sees once.
     (False, True, 0),
 )
+
+# --- c28: the fallback's cache writer is issued and never read --------------
+# THE PRE-FIX CODE PATH, PLANTED BACK. The held-back writer's outcome was filed
+# into `_prefetched` and the wave went out regardless, so a writer that raised
+# released N-1 full-price requests against a prefix nothing had written -- the
+# exact leak the dedicated warmup exists to prevent, reached through the door
+# opened for a provider that refuses the warmup's shape.
+control(
+    "c28 a fallback writer whose outcome is never inspected is CAUGHT "
+    "[3fw(a)/3fw(c)] -- three uncached full-price requests behind a writer "
+    "that raised, and a patient reported as a clean run",
+    [('                    if _writer[0] == "error":', "                    if False:")],
+    lambda m: (lambda r: (len(r[1].wave_requests()), bool(at(r[0], "error")),
+                          len(at(r[0], "evaluations"))))(
+        run_node(_FOUR, per_trial=True, parallel=4, node=node_of(m),
+                 stub=_Stub(warmup_raise=_WarmupRefused(
+                     "Invalid value for 'max_completion_tokens': must be >= 16"),
+                     fail_for=[_FB_WRITER_ID]))),
+    # Four requests, no error, four verdicts -- three of them bought against a
+    # cold prefix and one of them the writer's own isolated failure, which is
+    # indistinguishable from an unlucky trial.
+    (4, False, 4),
+)
+# ...and the COUNTER, separately: without the inspection there is nothing to
+# count, so a run that lost its fallback writer is invisible to the run-end
+# degradation report.
+def _c28_counter(module):
+    before = dict(PER_TRIAL_WARMUP_DEGRADATIONS)
+    run_node(_FOUR, per_trial=True, parallel=4, node=node_of(module),
+             stub=_Stub(warmup_raise=_WarmupRefused(
+                 "Invalid value for 'max_completion_tokens': must be >= 16"),
+                 fail_for=[_FB_WRITER_ID]))
+    after = dict(PER_TRIAL_WARMUP_DEGRADATIONS)
+    return sum(v for k, v in after.items()
+               if k.startswith(WARMUP_FALLBACK_WRITER_FAILURE_KEY_PREFIX)) - \
+        sum(v for k, v in before.items()
+            if k.startswith(WARMUP_FALLBACK_WRITER_FAILURE_KEY_PREFIX))
+
+
+control(
+    "c28 ...and the fallback-writer counter stops moving [3fw(e)] -- "
+    "recovery without a record is the silent recovery this project removes",
+    [('                    if _writer[0] == "error":', "                    if False:")],
+    _c28_counter,
+    0,
+)
+
+# --- c29: the duplicate-key guard is removed --------------------------------
+control(
+    "c29 a batch carrying one nct_id twice, with the uniqueness guard "
+    "removed, is CAUGHT [2b(a)/2b(b)] -- three dispatched calls collapse onto "
+    "two keys and the send loop's second pop buys a fourth",
+    [("        if len(set(_dispatch_keys)) != len(_dispatch_keys):",
+      "        if False:")],
+    lambda m: (lambda st: (len(st.wave_requests()),
+                           sum(1 for r in st.requests
+                               if _DUP_A in r["messages"][1]["content"]),
+                           sum(1 for r in st.requests
+                               if _DUP_B in r["messages"][1]["content"])))(
+        run_node(_DUP, per_trial=True, parallel=4, node=node_of(m))[1]),
+    # FOUR wave calls for three trials -- the extra one is the live request
+    # `_obtain` makes for a key the collision already consumed. And the first
+    # trial's criteria reach the provider ZERO times: `_prompts` is fully built
+    # before dispatch, so the second write won and BOTH calls under that key
+    # carried the second trial's block.
+    (4, 0, 3),
+)
+
+# --- c30: the splitter's live path, shown to be reachable when chunks are ---
+#          not singletons -----------------------------------------------------
+# THE PAYOFF STATED AS A CONTROL. 2b(e) says a truncated response produces no
+# extra request; that is only true because every chunk is a singleton. Partition
+# into PAIRS -- with the two dispatch guards relaxed so the broken node is
+# otherwise coherent -- and the same responses drive the splitter, which queues
+# chunks nothing prefetched and `_obtain` calls them live.
+control(
+    "c30 a partition that is not one trial per chunk makes `_obtain`'s "
+    "live-call path REACHABLE again [2b(e)] -- the splitter halves the pair, "
+    "and each half is a chunk no dispatch ever filed",
+    [("        initial_chunks = [[t] for t in trials]",
+      "        initial_chunks = [trials[i:i + 2]\n"
+      "                          for i in range(0, len(trials), 2)]"),
+     ("        if len(_dispatch_order) != len(trial_blocks):",
+      "        if False:"),
+     ('            if _chunk_key(_c) != (trials[_i]["trial"]["nct_id"],):',
+      "            if False:"),
+     ("            _prompts[_chunk_key(_c)] = _wrap_trials(trial_blocks[_i])",
+      "            _prompts[_chunk_key(_c)] = _user_prompt_for(_c)")],
+    lambda m: (lambda r: (len(r[1].wave_requests()),
+                          at(r[0], "llm_classifier_truncation_splits")))(
+        run_node(_TRUNC4, per_trial=True, parallel=4, node=node_of(m),
+                 stub=_Stub(truncate_for=[t["trial"]["nct_id"]
+                                          for t in _TRUNC4]))),
+    # Two dispatched pair-calls, two splits, four live singleton calls behind
+    # them: six requests where the shipped node makes four.
+    (6, 2),
+)
+
+# --- c31: the executor is shut down without cancelling the queue ------------
+# THE `with` FORM, PLANTED BACK AS ITS EXACT EQUIVALENT: `shutdown(wait=True)`
+# with `cancel_futures` at its default. Everything queued runs.
+control(
+    "c31 an executor shut down without cancelling its queue is CAUGHT "
+    "[3int(b)] -- all eight calls are bought after the interrupt, which is "
+    "the 'hang' an operator sees after pressing Ctrl-C",
+    [("                        _ex.shutdown(wait=True, cancel_futures=True)",
+      "                        _ex.shutdown(wait=True)")],
+    lambda m: (lambda r: (len(r[1].wave_requests()),
+                          isinstance(r[0], _Absent),
+                          "KeyboardInterrupt" in repr(r[0]),
+                          r[2]))(
+        _interrupt_probe(node=node_of(m))),
+    # The plant moves the REQUEST COUNT and moves nothing else: `wait=True` is
+    # on both sides, so the empty leak list is what says 3int(e) measures the
+    # join rather than the cancellation.
+    (8, True, True, []),
+)
+
 
 # ===========================================================================
 # SECTION 9b -- THE COLUMN, ROUND TRIP

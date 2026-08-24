@@ -269,7 +269,8 @@ BUCKETS = {
         "equivalence proof, not only as a control"),
     "test_agent_stage5_per_trial_calls.py": (
         _A, None,
-        "ran green in 3.4s, 139 checks: Stage 5's flag-gated PER-TRIAL call "
+        "ran green in 10.0s, 239 checks (this line read 139 and was stale "
+        "by 100 across two passes): Stage 5's flag-gated PER-TRIAL call "
         "mode -- one billed call per patient-trial pair, the priming call "
         "awaited alone so the shared prefix can warm, the rest dispatched "
         "under an in-flight bound, and the merge in TRIAL order however the "
