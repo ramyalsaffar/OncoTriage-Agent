@@ -408,7 +408,7 @@ python tests/test_registries_cancer_code_claims_audit_control.py   #  16; 14 pla
 python tests/test_config_snapshot_date_rot.py                      #  10; 6 subprocess runs, ~6 min
 python tests/test_package_invariants.py                            # 260/0/0 on macOS (was 247 before section 2f(iii)); 245/2/2 on Linux was measured at 247 and has not been re-measured there (was 234/6 there before commit ec2033a gave it a SKIP mechanism). No network, no keys, no corpus. NOT in CI — see below
 python tests/test_degraded_dependencies.py                         # 174 (was 172 in this note, and 170 before pass 20e; the 172 was never true of the file). Item 11a
-python tests/test_storage_query_layer.py                           # 376 (was 349; the call-mode pass added section 8c over `call_mode_comparison`, the arm pair to section 8b's seed and an omission row to the trial_matches seed. MEASURED 2026-08-23); item 38, temp SQLite only
+python tests/test_storage_query_layer.py                           # 427 (this line said 376 and was stale by 28 before the round-two pass, which added section 2d over `stage5_cache_effectiveness` and the three ledgers its seed needed. MEASURED 2026-08-23); item 38, temp SQLite only
 
 # The four added by pass 20f-1. Same shape, same directory, no network, no keys,
 # no spend, and none of them writes anything in the repository.
@@ -698,7 +698,7 @@ python tests/test_agent_cross_encoder_sequence_limit.py             #  42
 # the suite's two writers and are sha256-compared at the end. It DOES exec:
 # twenty-four in-memory copies of agent/evaluation.py, one plant each, argued
 # at _EXEC_ALLOWLIST. Bucket A, ~4 s.
-python tests/test_agent_stage5_per_trial_calls.py                   # 239 (was 206; the dispatch-hardening pass added sections 2b, 3c and 3d and controls c28-c31. ~10 s now: section 3d parks two workers for a bounded grace on each of its two arms)
+python tests/test_agent_stage5_per_trial_calls.py                   # 255 (this line said 239 and was stale by 16; MEASURED 2026-08-23. ~10 s: section 3d parks two workers for a bounded grace on each of its two arms)
 
 # The harness-budget pass. Same shape, same directory. No network, no keys, no
 # spend, NO LIVE SERVER and no live Qdrant -- it starts nothing and issues no
@@ -6638,6 +6638,170 @@ to a pass that can measure it. And an interrupt still discards the responses
 already resolved into `_prefetched` — nothing catches KeyboardInterrupt, which
 is correct, and writing a ledger from a signal handler is a separate decision.
 
+
+### The prompt cache has a reader, and per-trial mode was verified as a whole (the cache-reader pass)
+
+**THE MEASUREMENT PER-TRIAL MODE IS ONLY VIABLE ON HAD NO READER.** The mode
+multiplies Stage 5 requests by `MAX_TRIALS_FOR_EVALUATION` and pays for itself
+only if the shared prefix is billed at the cached rate from the second call of a
+patient on. `inferences.llm_classifier_call_details` has carried the per-call
+evidence since the packing pass and **not one of the 51 registered queries named
+it for caching**, so "is the discount landing" was answerable only by parsing
+JSON by hand. `stage5_cache_effectiveness` is that reader — the 52nd query.
+
+**IT GROUPS ON (run, arm) EXACTLY AS `call_mode_comparison` DOES**, so a reader
+can put cost beside hit rate row for row. That is what `MODE_NOT_RECORDED_LABEL`
+is for: the label was written out twice as a literal inside
+`call_mode_comparison` and this query needs the identical bucket, which is the
+`CROSS_ENCODER_MODEL` shape one layer down — nothing raises when two copies
+disagree, and the only symptom is two tables that will not join. **The
+extraction is value-preserving and that was measured rather than claimed: zero
+of the 51 pre-existing queries' RENDERED SQL moved**, compared against
+`git show HEAD:` byte for byte.
+
+**NULL AND 0 ARE THE WHOLE DESIGN AND THAT IS WHY IT IS NOT ONE NUMBER.** A
+`cached_tokens` of NULL means the response carried no
+`prompt_tokens_details.cached_tokens` **at all**; 0 means it reported and the
+provider cached nothing. Averaging them lets a provider that has gone SILENT
+read as a provider that is NOT CACHING, and only the second is a reason to turn
+the mode off. So the rate is computed over **reporting calls only**, both
+numerator and denominator, and `wave_calls_silent` sits beside it — a run where
+those two are equal has **no** hit rate, which is not a hit rate of zero.
+
+**THE WARMUP IS REPORTED BESIDE THE WAVE AND NEVER INSIDE IT.** It is the
+request that WRITES the prefix, so it reports 0 cached on a perfectly healthy
+patient; folding it in drags every arm's rate down by one call's prompt and
+makes a healthy warmup read as a cache miss. Measured on the seed: 15,600/27,000
+= 0.5778 with the warmup out, 15,600/35,000 with it in.
+
+**A CHECK THIS PASS WROTE FOUND A DEFECT IN THE SAME PASS'S OWN NOTES.** The
+first draft said a HIGH `warmup_cache_hit_rate` "should be impossible —
+investigate", and it is not impossible: a **parse retry** re-enters the node and
+issues a FRESH warmup against a prefix the failed attempt's own wave has
+already written N times over (driven, and the two warmups carry the *identical*
+cache key), and **the same patient re-run** — a resample row, a resumed patient
+— asks to be routed to the machine that already holds its prefix. Both are the
+key working. An operator meeting that reading on an ordinary retried patient
+would have gone hunting a leak that is not there. The notes name all three
+causes now and keep the warning for the third.
+
+**IT DECLARES FOUR COLUMNS AND NO TABLE.** The arm is on the inference row, so
+the query answers on a database with no run tables at all —
+`dangling_run_references`' ruling. All four declarations make the SQL
+unparseable when absent, and `derive_requires_columns` agrees with the hand
+declaration exactly. On a pre-era database `report()` **runs to the end** and
+says which key it skipped; a direct `run()` raises `MissingTableError` rather
+than returning an empty frame, because "this database cannot answer" and "the
+answer is no rows" are different findings.
+
+**EIGHT PLANTED REVERTS, EIGHT CAUGHT, none of them an abort**, each into a
+`copytree`'d copy with `PYTHONPATH` pointed at it and all three touched files
+sha256-unchanged afterwards: the warmup folded into the wave rate (8 failures),
+the silent calls counted in the denominator (5), an absent rate reported as 0
+(5), the warmup uncounted (6), the unrecorded mode read as `grouped` (7), the
+`run_id` declaration dropped (1, in the schema-guards file), `requires=("runs",)`
+added (6), and the warmup rows counted as wave calls (7).
+
+**WHAT THE ROUND-TWO VERIFICATION ESTABLISHED, DRIVEN RATHER THAN READ.** The
+F1–F8 fixes were verified TOGETHER through the **real `main()`** — real
+`run_batch`, real `_on_done`, real `process_patient`, real
+`match_patient_to_trials`, real Stage 5 node, real `node_finalize`, real
+`log_inference`, real `flush_health`, real `start_run_record` /
+`finalize_run_record`, real reconciliation — with four patients of mixed
+outcome (healthy, warmup-failed, fallback-writer-failed, partial wave) against
+a stub client installed through `oncotriage/agent/deps.py`. **No billed call is
+reachable**: Stages 1–4 are replaced by seeding `filtered_trials` and the graph
+is never a real graph. 33/33.
+
+| what was asked | what was measured |
+|---|---|
+| the checkpoint holds the failed patients | the two successes only; the two failures are re-attempted, and the stamp on it names the arm |
+| `run_metrics` carries the warmup counters | `PER_TRIAL_WARMUP_DEGRADATIONS` = 3 and `PER_TRIAL_CALL_FAILURES` = 1, persisted |
+| the run row and the rows agree on the mode | one run row, `per_trial`, and all four inference rows name it and that run |
+| the run-end report prints the new counters | both named in the printed block |
+| the crash blocks print under a mid-campaign kill | both, the run row `KILLED`, and the crash-path flush persisted the warmup counter |
+| F1's own prefix separates the two writers | `failed:` vs `fallback_writer_failed:` on the same run |
+| F8's wave-only cached total | the row column equals the sum over the **non-warmup** ledger rows |
+| F5/F6 | `llm_classifier_packed_chunks` NULL, `llm_classifier_packing` naming `bypassed_by: per_trial` |
+
+**THE RESUME MATRIX, END TO END (20/20).** A grouped checkpoint under a
+per-trial run is refused by `load_checkpoint` naming the field AND both modes,
+with the checkpoint **byte-unchanged** on disk and `--fresh` named as the
+remedy; the same-mode checkpoint resumes; `--fresh` clears it, driven as a
+subprocess against the shipped entry point. **Campaign stitching refuses to
+stitch across the mode change**: a per-trial KILLED run followed by a per-trial
+resume stitches into one campaign (`1 -> 2`), and a per-trial KILLED run
+followed by a **grouped** resume produces two campaigns of one — so a mixed-arm
+total is impossible by construction.
+
+**THE MIXED-ERA DATABASE (20/20).** Pre-provenance rows (no `run_id`, no mode,
+no ledger), grouped rows, and all four per-trial shapes in one file: every
+registered query runs, `report()` returns every key, the per-trial arm's wave
+rate excludes both the warmups and the silent calls, and the omission count is 1.
+On the pre-era database `report()` reaches the end, names the skipped key, and
+the skipped key is **absent from the returned dict** rather than present with an
+empty frame.
+
+**SIX NEW FAILURE MODES WERE PROBED AND EACH HAS A VERDICT.** See the ranked
+list in the round-two report; the ones that changed how this file reads are:
+
+- **SIGTERM IS NOT COVERED BY THE INTERRUPT FIX, AND THAT IS MEASURED.** Driven
+  with real signals against a real process holding a real wave: SIGINT reaches
+  the node as `KeyboardInterrupt`, the `finally` runs, `cancel_futures=True`
+  fires and the queued calls are cancelled. **SIGTERM runs nothing** — no
+  handler, no exception, no `finally`, exit `-15` — so in-flight requests are
+  abandoned mid-read while still billed and no ledger row records them. The
+  `runs` row is left at RUNNING with a NULL `finished_at`, which is the
+  documented shape for a process that had no chance to run a handler. **SIGTERM
+  is what `docker stop`, `kubectl delete pod` and systemd send FIRST.**
+- **THE PROMPT CACHE'S INACTIVITY CLOCK IS BOUNDED BY ONE CALL, NOT BY THE
+  WAVE.** All N tasks are submitted up front to a `max_workers=_bound` pool, so
+  workers pull continuously and the largest inter-request gap is a small
+  multiple of one call's latency — measured, with a stalled call shown NOT to
+  open a proportional gap at `parallel > 1`. **What is written down nowhere is
+  the arithmetic relating `MATCHING_REQUEST_TIMEOUT_SECONDS = 300` (exactly five
+  minutes of read phase, twice that across the SDK's one retry) to the
+  provider's eviction window.** At `MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS = 1`,
+  documented as legal, the gap between requests IS one call's latency and the
+  two constants can collide.
+- **A PARSE RETRY COSTS 2 × (1 + N) REQUESTS AND STORES A LEDGER OF (1 + N).**
+  At `MAX_LLM_CLASSIFIER_RETRIES = 3` and 15 trials that is **up to 64 requests
+  for one patient against a stored ledger of 16**. Nothing in the record says
+  the earlier attempts happened; `llm_classifier_retries` is the only tell and
+  it does not carry their tokens.
+- **PER-TRIAL MODE CANNOT MEASURE ITS OWN INPUT PRESSURE.** The packer is
+  bypassed, so `llm_classifier_packing` carries no chunk list and
+  `stage5_input_packing_pressure` reports NULL — correct, and it means an
+  over-budget single request is invisible to every registered query. Driven: one
+  trial estimated at **50,005 input tokens against a 12,000-token budget** is
+  sent anyway, because the reactive splitter's floor is `len(chunk) == 1`.
+- **A ZERO-TRIAL PATIENT ISSUES NO WARMUP.** No pointless billing; the ledger is
+  `[]` (the node ran and no call produced usage) rather than NULL.
+- **THE EXECUTOR ACCUMULATES NOTHING.** 60 consecutive per-trial patients leave
+  the thread count and the descriptor count exactly where they found them, no
+  `stage5` worker outlives the node, and the pool really reached its configured
+  bound — measured from INSIDE the wave, which is the only place it is
+  observable. The first version of that check sampled BETWEEN patients, read the
+  base every time, and its own non-degeneracy probe is what caught it.
+- **THE DASHBOARD DOES NOT CRASH ON PER-TRIAL ROWS.** All ten tabs render
+  against a database whose every row is per-trial, including the sparse
+  warmup-failed row and an unscored `trial_matches` child — 48 markdown, 91
+  metrics, 11 dataframes, no exception. F9's deferral is confirmed as a
+  **mislabel and not a crash**: ten rendered labels change meaning between the
+  arms (`Avg Cost/Patient`, `Avg Tokens/Trial`, `Avg Input Tokens`, …) and
+  **nothing on the page names the call mode**.
+- **THE REJECTION-MEMO GAP IS A NUMBER NOW.** A provider that refuses the
+  warmup's shape is re-discovered by every patient: **1,000 refused warmups,
+  $0** (a 400 is refused before generation and the fallback still issues exactly
+  N trial calls), **one extra serialised full-price call per patient**, and
+  ~1,000 WARNING lines — about **22 minutes** added to a 1,000-patient campaign
+  at `MAX_WORKERS = 12`. The argument AGAINST the memo is measured too: a
+  **transient** 400 is retried by the next patient today, and a process-wide
+  memo would have disabled the warmup for the whole campaign on one hiccup.
+
+**TWO STALE COUNTS IN THE RUN BLOCK WERE CORRECTED, EACH RE-MEASURED**:
+`test_storage_query_layer.py` 376 → **427** and
+`test_agent_stage5_per_trial_calls.py` 239 → **255**.
 
 ### Stage 5 can be served by Amazon Bedrock, and the flag is OFF (the Bedrock pass)
 

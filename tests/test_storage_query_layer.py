@@ -802,6 +802,51 @@ def _call_details_blob(*completions):
         for _i, _c in enumerate(completions)])
 
 
+def _per_trial_details_blob(warmup, *wave):
+    """A per-trial ledger: ONE warmup row, then one row per trial call.
+
+    ``warmup`` and each ``wave`` member are ``(prompt_tokens, cached_tokens)``;
+    a ``cached_tokens`` of ``None`` is a response that carried no
+    ``prompt_tokens_details.cached_tokens`` AT ALL, which is a different reading
+    from 0 and is what `stage5_cache_effectiveness` has to keep out of both
+    halves of its rate.
+
+    THE WARMUP ROW IS SHAPED AS THE WRITER SHAPES IT and not as a trial row with
+    a flag bolted on: ``warmup`` present (and present on no other row -- the
+    absent-rather-than-empty convention the ledger already follows for
+    ``unconsumed``), ``trials`` 0, ``depth`` None because 0 is a real split
+    depth, ``entries_emitted`` None because nothing parsed it, and
+    ``finish_reason`` "length" because a one-token ceiling is what it asks for.
+    A fixture that got any of those wrong would let a query keying on the wrong
+    one pass here and mis-read every real row.
+    """
+    rows = [{"call_index": 1, "depth": None, "trials": 0,
+             "prompt_tokens": warmup[0], "completion_tokens": 1,
+             "cached_tokens": warmup[1], "reasoning_tokens": None,
+             "finish_reason": "length", "entries_emitted": None,
+             "warmup": True}]
+    for _i, (_p, _c) in enumerate(wave):
+        rows.append({"call_index": _i + 2, "depth": 0, "trials": 1,
+                     "prompt_tokens": _p, "completion_tokens": 500,
+                     "cached_tokens": _c, "reasoning_tokens": None,
+                     "finish_reason": "stop", "entries_emitted": 1})
+    return json.dumps(rows)
+
+
+def _grouped_details_blob(*calls):
+    """A grouped ledger: one row per packed chunk, no warmup row at all.
+
+    Grouped mode issues no warmup, so a fixture carrying one would make the
+    "warmup_calls is 0 in grouped mode by construction" reading untestable.
+    """
+    return json.dumps([
+        {"call_index": _i + 1, "depth": 0, "trials": 5,
+         "prompt_tokens": _p, "completion_tokens": 500, "cached_tokens": _c,
+         "reasoning_tokens": None, "finish_reason": "stop",
+         "entries_emitted": 5}
+        for _i, (_p, _c) in enumerate(calls)])
+
+
 # The configured pair for the two eras the seed spans. The first is what
 # oncotriage/config.py holds today (32,000 x 0.90); the second stands in for the
 # GPT-4o era, whose ceiling was 16,000 -- which is the whole reason the
@@ -1655,7 +1700,8 @@ check("a database with no run tables reports every run query as unavailable",
       sorted(queries.unavailable(_legacy_conn)),
       ["call_mode_comparison", "campaign_summary", "dangling_run_references",
        "run_attribution_coverage", "run_degradation_breakdown", "run_summary",
-       "stage5_input_packing_pressure", "stage5_output_split_pressure"])
+       "stage5_cache_effectiveness", "stage5_input_packing_pressure",
+       "stage5_output_split_pressure"])
 check("...including the call-mode comparison, which is the one that would "
       "otherwise die on `runs` AND on two additive columns -- and killing "
       "report() on a legacy database is exactly the defect item 38 removed",
@@ -2247,16 +2293,40 @@ _arms_cur.execute(
      "trial_criteria_20260807_111807", 12067, "2026-02-26"))
 _ARMS_RUN = _arms_cur.lastrowid
 
+# THE THREE LEDGERS ARE HAND-CHOSEN SO EVERY COLUMN OF
+# `stage5_cache_effectiveness` IS NON-DEGENERATE, and section 8d recomputes each
+# rate from these numbers rather than reading it back out of the frame.
+#
+#   A-GROUPED           two chunk calls, 20,000 prompt each, the second one
+#                       finding 18,000 cached. No warmup row: grouped mode
+#                       issues none, which is what makes "warmup_calls is 0 by
+#                       construction" a measurement rather than a claim.
+#   A-PERTRIAL-CACHED   a warmup that found NOTHING cached (0, not NULL -- it is
+#                       the request that WRITES the prefix) and three wave calls
+#                       of which the first is also cold and the next two warm.
+#                       That is the designed shape, and the wave rate below is
+#                       what it produces.
+#   A-PERTRIAL-SILENT   the same schedule with cached_tokens absent on every
+#                       row. Its calls must be counted and must appear in
+#                       NEITHER half of either rate; a query folding them in
+#                       would report a silent provider as one that is not
+#                       caching, which are opposite findings.
+_WARMUP_PROMPT = 8000
 _ARM_ROWS = [
-    # (patient, call mode, packing blob, packed_chunks, cached tokens)
+    # (patient, call mode, packing blob, packed_chunks, cached tokens, ledger)
     ("A-GROUPED", MATCHING_CALL_MODE_GROUPED,
-     _packing_blob(20000, [(10, 18000, False)]), 1, 4096),
+     _packing_blob(20000, [(10, 18000, False)]), 1, 18000,
+     _grouped_details_blob((20000, 0), (20000, 18000))),
     ("A-PERTRIAL-CACHED", MATCHING_CALL_MODE_PER_TRIAL,
-     _bypass_packing_blob(6), None, 3500),
+     _bypass_packing_blob(6), None, 15600,
+     _per_trial_details_blob((_WARMUP_PROMPT, 0),
+                             (9000, 0), (9000, 7800), (9000, 7800))),
     ("A-PERTRIAL-SILENT", MATCHING_CALL_MODE_PER_TRIAL,
-     _bypass_packing_blob(6), None, None),
+     _bypass_packing_blob(6), None, None,
+     _per_trial_details_blob((_WARMUP_PROMPT, None),
+                             (9000, None), (9000, None))),
 ]
-for _pid, _mode, _blob, _chunks, _cached in _ARM_ROWS:
+for _pid, _mode, _blob, _chunks, _cached, _ledger in _ARM_ROWS:
     _arms_cur.execute(
         "INSERT INTO inferences (patient_id, timestamp, run_id, "
         "matching_model, matching_call_mode, llm_classifier_input_tokens, "
@@ -2272,7 +2342,7 @@ for _pid, _mode, _blob, _chunks, _cached in _ARM_ROWS:
         "?, ?, ?)",
         (_pid, "2026-08-22T09:30:00", _ARMS_RUN, _MODEL_A, _mode, 12000, 3000,
          _cached, 0.06, _blob, _chunks, _THRESHOLD_NOW, _CEILING_NOW, 6600,
-         _call_details_blob(500, 500, 500), 90, 40, 6, 6, 4, 2, 0, 90.0))
+         _ledger, 90, 40, 6, 6, 4, 2, 0, 90.0))
 _arms_conn.commit()
 
 check("(c2) the three-arm database really holds the three shapes it is named "
@@ -2410,6 +2480,173 @@ check_does_not_raise(
     "(c2) ...and report() still reaches the end with a run whose every "
     "packing reading is NULL -- the renderers, not only the SQL",
     queries.report, _arms_conn, out=lambda _line: None)
+
+
+# ===========================================================================
+# SECTION 2d -- stage5_cache_effectiveness
+# ===========================================================================
+#
+# THE MEASUREMENT PER-TRIAL MODE IS ONLY VIABLE ON. The mode multiplies Stage 5
+# requests by MAX_TRIALS_FOR_EVALUATION and pays for itself only if the shared
+# prefix is billed at the cached rate from the second call of a patient on.
+# `llm_classifier_call_details` has carried the per-call evidence since the
+# packing pass and NOTHING REGISTERED READ IT, so "is the discount landing" was
+# answerable only by parsing JSON by hand.
+#
+# EVERY EXPECTATION BELOW IS RECOMPUTED FROM THE SEEDED NUMBERS, never read back
+# out of the frame under test. The three ledgers are declared at `_ARM_ROWS`
+# above with the reasoning for each.
+#
+# IT RUNS AGAINST THE THREE-ARM DATABASE and not the main seed, because the
+# three shapes it has to separate -- a grouped ledger with no warmup, a
+# per-trial ledger whose warmup found nothing cached, and a per-trial ledger
+# SILENT on caching -- are exactly the three that database was built to hold.
+print("\nSECTION 2d -- stage5_cache_effectiveness")
+
+_cache_rows = {(str(_r.run), str(_r.call_mode)): _r
+               for _r in _frame_or_raise("stage5_cache_effectiveness",
+                                         conn=_arms_conn).itertuples()}
+_RUN_TXT = str(_ARMS_RUN)
+_GR = _cache_rows.get((_RUN_TXT, MATCHING_CALL_MODE_GROUPED))
+_PT = _cache_rows.get((_RUN_TXT, MATCHING_CALL_MODE_PER_TRIAL))
+
+_BYPASS_TXT = str(_ARMS_RUN_ALLBYPASS)
+_NOLEDGER = _cache_rows.get((_BYPASS_TXT, MATCHING_CALL_MODE_PER_TRIAL))
+
+check("2d-a the frame is one row per (run, arm): both arms of the mixed run "
+      "and the per-trial run that has no ledger at all (non-degeneracy: every "
+      "check below reads one of these three)",
+      sorted(_cache_rows),
+      sorted([(_RUN_TXT, MATCHING_CALL_MODE_GROUPED),
+              (_RUN_TXT, MATCHING_CALL_MODE_PER_TRIAL),
+              (_BYPASS_TXT, MATCHING_CALL_MODE_PER_TRIAL)]))
+
+# --- the warmup is counted, and only in the arm that issues one -----------
+check("2d-b the per-trial arm's TWO warmup calls are counted",
+      None if _PT is None else _safe_int(_PT.warmup_calls), 2)
+check("2d-c ...and the grouped arm's is 0 BY CONSTRUCTION -- grouped mode "
+      "issues no warmup, so a non-zero reading there is a flag that moved "
+      "mid-patient rather than a rounding artefact",
+      None if _GR is None else _safe_int(_GR.warmup_calls), 0)
+
+# --- the wave, and what is EXCLUDED from it ------------------------------
+check("2d-d the per-trial arm's wave calls are counted across both rows "
+      "(3 + 2), warmups excluded",
+      None if _PT is None else _safe_int(_PT.wave_calls), 5)
+check("2d-e ...of which the two SILENT ones are named, so a provider that "
+      "reported nothing is separable from one that cached nothing",
+      None if _PT is None else _safe_int(_PT.wave_calls_silent), 2)
+check("2d-f ...and the rate's DENOMINATOR is the reporting calls only "
+      "(3 x 9,000), not all five -- folding the silent pair in would report a "
+      "silent provider as a provider that is not caching",
+      None if _PT is None else _safe_int(_PT.wave_prompt_tokens), 27000)
+check("2d-g ...and its NUMERATOR is those same calls' cached figures "
+      "(0 + 7,800 + 7,800)",
+      None if _PT is None else _safe_int(_PT.wave_cached_tokens), 15600)
+check("2d-h ...so the hit rate is 15,600 / 27,000, recomputed here rather "
+      "than read back out of the frame",
+      None if _PT is None else _num(_PT.wave_cache_hit_rate, 4),
+      round(15600 / 27000, 4))
+
+# --- the warmup's own reading, BESIDE the wave and never inside it -------
+check("2d-i the warmup's cached figure is 0 -- REPORTED and zero, which is "
+      "the healthy reading: it is the request that WRITES the prefix",
+      None if _PT is None else _safe_int(_PT.warmup_cached_tokens), 0)
+check("2d-j ...over the ONE warmup that reported; the silent row's warmup is "
+      "excluded from this denominator too",
+      None if _PT is None else _safe_int(_PT.warmup_prompt_tokens),
+      _WARMUP_PROMPT)
+check("2d-k ...giving a warmup hit rate of 0.0, which must not be confused "
+      "with the NULL a warmup that reported nothing produces",
+      None if _PT is None else _num(_PT.warmup_cache_hit_rate, 4), 0.0)
+check("2d-l THE SEPARATION IS THE POINT: the warmup's 8,000 prompt tokens are "
+      "in NEITHER half of the wave rate. Folded in, the rate would be "
+      "15,600/35,000 and a healthy warmup would read as a cache miss",
+      (None if _PT is None else _safe_int(_PT.wave_prompt_tokens)) == 27000
+      and _num(_PT.wave_cache_hit_rate, 4) != round(15600 / 35000, 4), True)
+
+# --- the grouped baseline the per-trial arm has to beat -------------------
+check("2d-m the grouped arm reports its own rate (18,000 / 40,000), so the "
+      "comparison has a baseline rather than one arm and a blank",
+      (None if _GR is None else (_safe_int(_GR.wave_calls),
+                                 _safe_int(_GR.wave_prompt_tokens),
+                                 _num(_GR.wave_cache_hit_rate, 4))),
+      (2, 40000, round(18000 / 40000, 4)))
+check("2d-n ...and NULL warmup readings, never 0 -- there was no warmup to "
+      "report a figure for, which is not 'the warmup found nothing'",
+      (None if _GR is None else (_GR.warmup_prompt_tokens is None
+                                 or _num(_GR.warmup_prompt_tokens) != _GR.warmup_prompt_tokens
+                                 or str(_GR.warmup_prompt_tokens) == "nan",
+                                 str(_GR.warmup_cache_hit_rate))),
+      (True, "nan"))
+
+# --- the ROW column, and its three-way split -----------------------------
+check("2d-o the per-trial arm holds one row SILENT on caching and one "
+      "reporting it, and the two are counted apart",
+      (None if _PT is None else (_safe_int(_PT.rows_silent_on_cache),
+                                 _safe_int(_PT.rows_reporting_cache),
+                                 _safe_int(_PT.rows_reporting_no_cache))),
+      (1, 1, 0))
+check("2d-p ...and the grouped row reports a figure",
+      (None if _GR is None else (_safe_int(_GR.rows_silent_on_cache),
+                                 _safe_int(_GR.rows_reporting_cache))),
+      (0, 1))
+
+# --- A RUN WITH NO LEDGER AT ALL IS REPORTED AND MEASURES NOTHING ---------
+#
+# The two all-bypass rows carry neither `llm_classifier_call_details` nor
+# `llm_classifier_cached_input_tokens`. Every reading for that run must be a 0
+# COUNT or a NULL RATE -- never a 0 rate, which would assert that the provider
+# was asked and cached nothing when it was never asked at all. This is the same
+# distinction the pressure query's own bypassed-run check makes one section up.
+check("2d-u a per-trial run whose rows carry no ledger is REPORTED (it is a "
+      "real run and dropping it would hide a whole campaign), with zero calls "
+      "on both sides",
+      (None if _NOLEDGER is None else (_safe_int(_NOLEDGER.inferences),
+                                       _safe_int(_NOLEDGER.warmup_calls),
+                                       _safe_int(_NOLEDGER.wave_calls))),
+      (2, 0, 0))
+check("2d-v ...and BOTH hit rates are NULL rather than 0 -- a rate of 0 would "
+      "state that the provider reported and cached nothing, which is the one "
+      "reading this query exists to keep separate from 'nobody asked'",
+      [_is_null(_v) for _v in
+       ((_NOLEDGER.wave_cache_hit_rate, _NOLEDGER.warmup_cache_hit_rate,
+         _NOLEDGER.wave_prompt_tokens, _NOLEDGER.wave_cached_tokens)
+        if _NOLEDGER is not None else (0, 0, 0, 0))],
+      [True, True, True, True])
+check("2d-w ...and both its rows are counted as silent on the row column, "
+      "which is what says the absence was measured rather than skipped",
+      None if _NOLEDGER is None else _safe_int(_NOLEDGER.rows_silent_on_cache),
+      2)
+
+# --- the query survives a database that predates the columns -------------
+check("2d-q the query declares the four columns whose absence makes its SQL "
+      "unparseable, and the derivation checker agrees with the declaration "
+      "(the standing guard is section 1 of test_storage_schema_guards.py; this "
+      "is the non-degeneracy half -- an empty declaration would satisfy that "
+      "one too)",
+      (queries.QUERIES_BY_KEY["stage5_cache_effectiveness"].requires_columns,
+       len(queries.QUERIES_BY_KEY[
+           "stage5_cache_effectiveness"].requires_columns) >= 4),
+      (queries.derive_requires_columns(
+          queries.QUERIES_BY_KEY["stage5_cache_effectiveness"].sql), True))
+check("2d-r ...and declares NO table, so it still answers on a database with "
+      "no run tables at all -- the arm is on the inference row and this query "
+      "never joins `runs`",
+      queries.QUERIES_BY_KEY["stage5_cache_effectiveness"].requires, ())
+
+# --- the shared label constant ------------------------------------------
+check("2d-s the two arm-grouped queries bucket an unrecorded mode under ONE "
+      "label, so a reader can put cost beside hit rate row for row",
+      (queries.MODE_NOT_RECORDED_LABEL
+       in queries.QUERIES_BY_KEY["stage5_cache_effectiveness"].sql,
+       queries.MODE_NOT_RECORDED_LABEL
+       in queries.QUERIES_BY_KEY["call_mode_comparison"].sql), (True, True))
+check("2d-t ...and it is NOT the grouped mode's name: a NULL is a row written "
+      "before the column existed, and reading it as the default arm would "
+      "attribute every pre-era row to an arm nobody measured",
+      queries.MODE_NOT_RECORDED_LABEL == MATCHING_CALL_MODE_GROUPED, False)
+
 _arms_conn.close()
 
 

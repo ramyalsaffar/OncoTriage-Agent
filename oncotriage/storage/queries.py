@@ -786,6 +786,40 @@ one per request on purpose, and every row predating run tracking has one.
 """
 
 
+MODE_NOT_RECORDED_LABEL = "(not recorded)"
+"""The GROUP key a call-mode column carries where it is NULL.
+
+WHY THIS IS A CONSTANT AND WAS TWO LITERALS. ``call_mode_comparison`` coalesced
+``runs.matching_call_mode`` and ``inferences.matching_call_mode`` to this string
+in two places, and ``stage5_cache_effectiveness`` needs the identical bucket --
+the two queries are read side by side, and a reader comparing "the per-trial
+arm's cache hit rate" with "the per-trial arm's cost" has to be able to line the
+GROUP keys up. Three copies of one label is the shape this project removes
+(CROSS_ENCODER_MODEL, BM25_SPARSE_MODEL_NAME, ABLATION_DB_FILENAME): nothing
+raises when they disagree, and the only symptom is two tables that will not join.
+
+IT IS NOT 'grouped', AND THAT IS THE WHOLE REASON IT HAS A NAME RATHER THAN
+BEING FOLDED AWAY. A NULL here is a row or a run written BEFORE its column
+existed -- ``matching_call_mode`` is additive on both tables -- so the mode it
+ran in is not recorded anywhere and cannot be inferred. Reading it as the
+default arm would attribute every pre-era-3 row to grouped mode, which is
+probably true and is not MEASURED, and a three-arm comparison that quietly
+adopts an unmeasured majority is the class of report this file exists to remove.
+"""
+
+
+# The ledger, guarded, as `json_each` needs it. NULL and a non-JSON value both
+# become an empty array, so a row with no ledger contributes no calls rather
+# than raising -- which is what lets this read a pre-era row beside a current
+# one. Written ONCE because `stage5_cache_effectiveness` interpolates it eight
+# times and eight copies of a guard is eight chances for one of them to lose it;
+# `stage5_output_split_pressure` writes the same expression inline because it
+# has exactly one use of it.
+_LEDGER_JSON_SQL = ("""CASE WHEN json_valid(i.llm_classifier_call_details)
+                            THEN i.llm_classifier_call_details
+                            ELSE '[]' END""")
+
+
 # ---------------------------------------------------------------------------
 # STAGE 5 SPLIT PRESSURE -- how near the three guards a campaign ran
 # ---------------------------------------------------------------------------
@@ -2425,8 +2459,8 @@ SELECT s.campaign_id,
     SELECT
         COALESCE(CAST(i.run_id AS TEXT), '(no run)')        AS run_id,
         COALESCE(r.invocation_source, '(no run)')           AS invocation_source,
-        COALESCE(r.matching_call_mode, '(not recorded)')    AS run_mode,
-        COALESCE(i.matching_call_mode, '(not recorded)')    AS row_mode,
+        COALESCE(r.matching_call_mode, '{MODE_NOT_RECORDED_LABEL}')    AS run_mode,
+        COALESCE(i.matching_call_mode, '{MODE_NOT_RECORDED_LABEL}')    AS row_mode,
         CASE
             WHEN i.run_id IS NULL                THEN 'no run to compare with'
             -- THE DANGLING CASE, NAMED RATHER THAN FOLDED INTO THE ONE BELOW.
@@ -2706,6 +2740,210 @@ SELECT s.campaign_id,
     ) x
     GROUP BY run
     ORDER BY peak_split_pressure DESC, peak_ceiling_pressure DESC, run
+""",
+    ),
+    # ── DID THE SHARED PREFIX ACTUALLY GET REUSED ─────────────────────────
+    #
+    # THE MEASUREMENT PER-TRIAL MODE IS ONLY VIABLE ON, AND IT HAD NO READER.
+    # Per-trial mode multiplies the number of Stage 5 requests by
+    # MAX_TRIALS_FOR_EVALUATION and is affordable only because the system
+    # message -- instructions plus the whole patient record, the bulk of every
+    # request -- is billed at the CACHED rate from the second call of a patient
+    # on. `oncotriage/agent/evaluation.py` issues a dedicated warmup whose only
+    # job is to write that prefix, and records what every request was billed in
+    # `llm_classifier_call_details`. Nothing registered read it, so the one
+    # question the mode has to answer before a campaign -- IS THE DISCOUNT
+    # LANDING -- was answerable only by parsing JSON by hand.
+    #
+    # THE ROW COLUMN AND THE LEDGER ANSWER DIFFERENT QUESTIONS AND BOTH ARE
+    # HERE. `inferences.llm_classifier_cached_input_tokens` is one scalar per
+    # patient and cannot say WHEN the cache warmed: 5,000 cached tokens over
+    # three calls is equally consistent with a cache that warmed after the first
+    # request and one that never warmed, and those have opposite implications
+    # for what the mode costs. The ledger is one row per request ISSUED, so the
+    # rate below is over calls rather than over patients.
+    #
+    # NULL AND 0 ARE DIFFERENT READINGS AND THE COLUMNS SAY SO, which is the
+    # whole reason this is not one hit-rate number. `cached_tokens` NULL means
+    # the response carried no `prompt_tokens_details.cached_tokens` at all --
+    # a stub, a pre-field recording, a provider that does not report it -- and 0
+    # means the response DID report and the provider cached nothing. Averaging
+    # them would let a provider that has gone silent read as a provider that is
+    # not caching, and only the second is a reason to turn the mode off. So the
+    # rate is computed over REPORTING calls only, both numerator and
+    # denominator, and the silent calls are counted beside it. A run whose
+    # `wave_calls_silent` equals `wave_calls` has no hit rate, which is not the
+    # same as a hit rate of zero.
+    #
+    # THE WARMUP IS REPORTED BESIDE THE WAVE, NEVER INSIDE IT. It is the request
+    # that WRITES the prefix, so it reports 0 cached on a perfectly healthy
+    # patient -- and folding it in would drag every arm's rate down by one
+    # call's worth of prompt and make a healthy warmup look like a cache miss.
+    # Read the two columns together: `warmup_cache_hit_rate` near 0 with
+    # `wave_cache_hit_rate` high is the DESIGNED outcome (the warmup paid full
+    # price for the prefix and the wave got it discounted); both near 0 is a
+    # provider that is not caching; a HIGH warmup rate means the prefix was
+    # already warm when the warmup ran, which on a per-patient key should not
+    # happen and is worth investigating.
+    #
+    # GROUPED MODE IS IN THE TABLE ON PURPOSE. It issues one request per patient
+    # (or one per packed chunk), so its prefix is reused only across chunks and
+    # its rate is expected to be low or absent. That is the BASELINE the
+    # per-trial arm has to beat for the mode to pay for itself, and a
+    # comparison with the baseline missing is not a comparison.
+    #
+    # `stage5_cache_effectiveness` AND `call_mode_comparison` GROUP THE SAME WAY
+    # ON PURPOSE -- (run, mode), both bucketing an unrecorded mode under
+    # MODE_NOT_RECORDED_LABEL -- so a reader can put cost beside hit rate row
+    # for row. That is what the shared constant is for.
+    #
+    # IT DECLARES `inferences.run_id` AND `matching_call_mode` AND NOT `runs`.
+    # It never joins the run table: the arm is on the inference row, written by
+    # the same `config.matching_call_mode()` the node reads, so this query
+    # answers on a database that has no run tables at all. Declaring `runs`
+    # would skip it on exactly the databases it can still measure --
+    # `dangling_run_references`' ruling.
+    Query(
+        key='stage5_cache_effectiveness',
+        heading='=== STAGE 5: PROMPT-CACHE EFFECTIVENESS, PER RUN AND ARM ===',
+        render='to_string',
+        blank_after=True,
+        # ADDITIVE_COLUMNS key order, then column order within a table, which is
+        # what derive_requires_columns produces and what
+        # tests/test_storage_schema_guards.py section 1 compares against.
+        # ALL FOUR MAKE THE SQL UNPARSEABLE WHEN ABSENT -- they are projected,
+        # grouped on or read inside json_each, not merely selected -- so a
+        # database predating any one of them must skip this query rather than
+        # take report() down at it, which is the defect item 38 removed.
+        requires_columns=(
+            ("inferences", "llm_classifier_cached_input_tokens"),
+            ("inferences", "llm_classifier_call_details"),
+            ("inferences", "matching_call_mode"),
+            ("inferences", "run_id"),
+        ),
+        notes=(
+            "ONE ROW PER (run, arm). Read it beside call_mode_comparison,",
+            "which groups the same way: that one has the cost, this one has",
+            "the reason the cost is what it is.",
+            "",
+            "THE RATES ARE OVER REPORTING CALLS ONLY. A call whose response",
+            "carried no cached_tokens field is in wave_calls_silent and in",
+            "NEITHER the numerator nor the denominator. wave_calls_silent ==",
+            "wave_calls means there is no hit rate to read -- which is not a",
+            "hit rate of zero, and the two must never be folded together.",
+            "",
+            "wave_cache_hit_rate IS cached/prompt OVER THE WAVE, so it is",
+            "bounded by the share of a request that IS the shared prefix. It",
+            "cannot reach 1.0: the trial block and the response schema are",
+            "never cached. A per-trial run in which it is near zero while",
+            "warmup_calls is non-zero means the warmup is not writing the",
+            "prefix, and the mode is paying full price N times per patient.",
+            "",
+            "warmup_cache_hit_rate NEAR 0 IS THE HEALTHY READING, not a",
+            "defect: the warmup is the request that writes the prefix. A HIGH",
+            "one means it found the prefix ALREADY WARM, and there are three",
+            "causes -- two of them benign and neither of them a defect:",
+            "  * A PARSE RETRY. A malformed body ends the node and the graph",
+            "    re-enters it, issuing a FRESH warmup against a prefix the",
+            "    failed attempt's own wave has already written N times.",
+            "    inferences.llm_classifier_retries > 0 is the tell, and the",
+            "    stored ledger describes only the LAST attempt -- so the",
+            "    earlier attempts' calls are billed and are not in it.",
+            "  * THE SAME PATIENT RE-RUN. The cache key is derived from the",
+            "    system prompt, so a resample row, a resumed patient or a",
+            "    re-scored one asks to be routed to the machine that already",
+            "    holds its prefix. That is the key working.",
+            "  * ANYTHING ELSE is worth investigating before the wave rate",
+            "    beside it is trusted, because it means two patients shared a",
+            "    prefix that was supposed to be per-patient.",
+            "The rate alone cannot tell the three apart. Read it beside",
+            "llm_classifier_retries and beside whether the patient has more",
+            "than one row.",
+            "",
+            "warmup_calls IS 0 IN GROUPED MODE BY CONSTRUCTION. A grouped run",
+            "reporting a non-zero one is a row written by a process whose flag",
+            "moved mid-patient; see call_mode_comparison's mode_agreement.",
+            "",
+            "rows_silent_on_cache COUNTS PATIENTS, the three columns beside it",
+            "partition the same population: NULL (no response of that run",
+            "reported the field), 0 (reported and nothing was cached) and > 0.",
+            "A pre-era row is NULL for a third reason -- the column did not",
+            "exist -- and this query cannot tell those apart; the ledger",
+            "columns can, because a row with no ledger has no calls either.",
+            "",
+            "NOT CAPPED. There is one row per run per observed arm.",
+        ),
+        sql=f"""
+    WITH per_row AS (
+        SELECT
+            i.run_id                                            AS run_key,
+            COALESCE(CAST(i.run_id AS TEXT), '{NO_RUN_LABEL}')  AS run,
+            COALESCE(i.matching_call_mode,
+                     '{MODE_NOT_RECORDED_LABEL}')               AS call_mode,
+            i.llm_classifier_cached_input_tokens                AS row_cached,
+            -- THE WARMUP FLAG IS READ FOR TRUTH, NOT FOR PRESENCE. The writer
+            -- emits `warmup: True` on that row and the key on no other, so
+            -- `IS NOT NULL` would be equivalent today -- and would also class a
+            -- future `warmup: false` as a warmup. COALESCE to 0 reads the value.
+            (SELECT COUNT(*) FROM json_each({_LEDGER_JSON_SQL}) d
+              WHERE COALESCE(json_extract(d.value, '$.warmup'), 0))
+                                                                AS warmups,
+            (SELECT COUNT(*) FROM json_each({_LEDGER_JSON_SQL}) d
+              WHERE NOT COALESCE(json_extract(d.value, '$.warmup'), 0))
+                                                                AS waves,
+            (SELECT COUNT(*) FROM json_each({_LEDGER_JSON_SQL}) d
+              WHERE NOT COALESCE(json_extract(d.value, '$.warmup'), 0)
+                AND json_extract(d.value, '$.cached_tokens') IS NOT NULL)
+                                                                AS waves_reporting,
+            (SELECT SUM(json_extract(d.value, '$.cached_tokens'))
+               FROM json_each({_LEDGER_JSON_SQL}) d
+              WHERE NOT COALESCE(json_extract(d.value, '$.warmup'), 0)
+                AND json_extract(d.value, '$.cached_tokens') IS NOT NULL)
+                                                                AS wave_cached,
+            (SELECT SUM(json_extract(d.value, '$.prompt_tokens'))
+               FROM json_each({_LEDGER_JSON_SQL}) d
+              WHERE NOT COALESCE(json_extract(d.value, '$.warmup'), 0)
+                AND json_extract(d.value, '$.cached_tokens') IS NOT NULL)
+                                                                AS wave_prompt,
+            (SELECT SUM(json_extract(d.value, '$.cached_tokens'))
+               FROM json_each({_LEDGER_JSON_SQL}) d
+              WHERE COALESCE(json_extract(d.value, '$.warmup'), 0)
+                AND json_extract(d.value, '$.cached_tokens') IS NOT NULL)
+                                                                AS warmup_cached,
+            (SELECT SUM(json_extract(d.value, '$.prompt_tokens'))
+               FROM json_each({_LEDGER_JSON_SQL}) d
+              WHERE COALESCE(json_extract(d.value, '$.warmup'), 0)
+                AND json_extract(d.value, '$.cached_tokens') IS NOT NULL)
+                                                                AS warmup_prompt
+        FROM inferences i
+    )
+    SELECT
+        run,
+        call_mode,
+        COUNT(*)                                             AS inferences,
+        SUM(CASE WHEN row_cached IS NULL THEN 1 ELSE 0 END)  AS rows_silent_on_cache,
+        SUM(CASE WHEN row_cached = 0 THEN 1 ELSE 0 END)      AS rows_reporting_no_cache,
+        SUM(CASE WHEN row_cached > 0 THEN 1 ELSE 0 END)      AS rows_reporting_cache,
+        SUM(warmups)                                         AS warmup_calls,
+        SUM(waves)                                           AS wave_calls,
+        SUM(waves) - SUM(waves_reporting)                    AS wave_calls_silent,
+        SUM(wave_prompt)                                     AS wave_prompt_tokens,
+        SUM(wave_cached)                                     AS wave_cached_tokens,
+        ROUND(SUM(wave_cached) * 1.0 / NULLIF(SUM(wave_prompt), 0), 4)
+                                                             AS wave_cache_hit_rate,
+        SUM(warmup_prompt)                                   AS warmup_prompt_tokens,
+        SUM(warmup_cached)                                   AS warmup_cached_tokens,
+        ROUND(SUM(warmup_cached) * 1.0 / NULLIF(SUM(warmup_prompt), 0), 4)
+                                                             AS warmup_cache_hit_rate
+    FROM per_row
+    GROUP BY run_key, call_mode
+    -- ORDERED ON THE INTEGER `run_key`, NOT ON THE PROJECTED `run`. That alias
+    -- is CAST(... AS TEXT) so a bare `run` here would put run 10 before run 2 --
+    -- deterministic and wrong, which is the worse of the two ways an ordering
+    -- can be wrong. `run_key IS NULL` ahead of it puts the no-run bucket last on
+    -- both SQLite orderings rather than relying on where NULLs happen to fall.
+    -- call_mode_comparison orders the same way for the same reason.
+    ORDER BY call_mode, run_key IS NULL, run_key
 """,
     ),
 )
