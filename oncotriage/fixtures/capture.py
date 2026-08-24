@@ -1039,7 +1039,7 @@ def assert_provider_is_hookable(what: str) -> None:
 
 
 class UnsupportedCallModeError(RuntimeError):
-    """The fixture harness was asked to run with per-trial Stage 5 calls.
+    """Hooks were asked for in a process that will run per-trial Stage 5 calls.
 
     THE SINK NUMBERS ITS RECORDINGS BY ARRIVAL, AND PER-TRIAL MODE ISSUES THEM
     CONCURRENTLY. ``RecordingSink.add`` stamps ``call_index = len(bucket)``
@@ -1048,19 +1048,30 @@ class UnsupportedCallModeError(RuntimeError):
     the moment it is not. ``build_deterministic_prefix`` then projects
     ``request_sha256_by_call`` and ``finish_reasons`` as LISTS in that order.
 
-    So a capture taken under ``MATCHING_PER_TRIAL_CALLS_ENABLED`` would write a
-    fixture whose deterministic prefix is NOT deterministic: two captures of one
-    patient could differ in those two lists with nothing about the pipeline
+    So a capture taken with Stage 5 partitioning per trial would write a
+    fixture whose deterministic prefix is NOT deterministic: two captures of
+    one patient could differ in those two lists with nothing about the pipeline
     having changed, and a replay of such a fixture would report a difference
     that is a permutation. Nothing would raise. That is the class of silent
     fault the whole prefix exists to detect, manufactured by the harness.
 
-    So the harness REFUSES rather than guessing. Making the sink order Stage 5
-    by TRIAL rather than by arrival is the fix, and it is a fixture-format
-    question -- ``call_index`` is stamped by a generic bucket appender shared
-    with three other seams, and the node's own ``call_index`` numbering would
-    have to agree with it -- rather than a one-line one, which is why this is a
-    refusal and a recorded follow-up.
+    THIS USED TO BE THE HARNESS'S WHOLE ANSWER AND IS NOW ITS FALLBACK. While
+    grouped was the default, refusing per-trial mode outright cost nothing --
+    an operator who had turned the arm on for a campaign turned it off to
+    capture. The day the DEFAULT flips, the same refusal takes the free
+    twelve-fixture replay gate out of service at exactly the moment a large
+    behaviour change lands, which is the moment that gate is worth the most.
+    So ``fixture_capture.py`` and ``fixture_replay.py`` now PIN the mode to
+    grouped for their own process, through ``config.pin_matching_call_mode``,
+    and say so loudly; see ``pin_call_mode_for_fixture_process``. This error is
+    what is left: it fires for any OTHER path that installs these hooks in a
+    per-trial process -- a test, a script, a future caller, or a harness whose
+    pin has been deleted or moved below the first hook install.
+
+    IT ASKS THE ONE QUESTION THAT MATTERS -- what will the node actually do --
+    through ``config.matching_call_mode()``, so it is not defeated by pinning
+    per-trial either: a process that pins the arm the sink cannot order is
+    refused exactly like one that inherits it from the constant.
 
     A RuntimeError subclass, deliberately not a ValueError, on the
     ``UnknownModelPricingError`` precedent.
@@ -1068,28 +1079,132 @@ class UnsupportedCallModeError(RuntimeError):
 
     def __init__(self, what: str):
         super().__init__(
-            f"{what}: config.MATCHING_PER_TRIAL_CALLS_ENABLED is True, and "
-            f"this harness records Stage 5 exchanges in ARRIVAL order. "
-            f"Per-trial mode issues them concurrently, so "
-            f"request_sha256_by_call and finish_reasons in the deterministic "
-            f"prefix would be ordered by the thread scheduler and two captures "
-            f"of one patient could disagree. Set "
-            f"MATCHING_PER_TRIAL_CALLS_ENABLED = False in oncotriage/config.py "
-            f"to capture or replay, or teach RecordingSink a trial-stable "
-            f"ordering for the chat_completions bucket first."
+            f"{what}: config.matching_call_mode() is "
+            f"{config.matching_call_mode()!r} (from "
+            f"MATCHING_PER_TRIAL_CALLS_ENABLED="
+            f"{config.MATCHING_PER_TRIAL_CALLS_ENABLED!r}, pin="
+            f"{config.matching_call_mode_pin()!r}), and this harness records "
+            f"Stage 5 exchanges in ARRIVAL order. Per-trial mode issues them "
+            f"concurrently, so request_sha256_by_call and finish_reasons in "
+            f"the deterministic prefix would be ordered by the thread "
+            f"scheduler and two captures of one patient could disagree. Call "
+            f"oncotriage.fixtures.capture.pin_call_mode_for_fixture_process() "
+            f"before installing hooks -- fixture_capture.py and "
+            f"fixture_replay.py do it as the first statement of main() -- or "
+            f"teach RecordingSink a trial-stable ordering for the "
+            f"chat_completions bucket first."
         )
 
 
 def assert_call_mode_is_hookable(what: str) -> None:
     """Refuse to install hooks for a Stage 5 call mode the sink cannot order.
 
-    READ LIVE OFF THE CONFIG MODULE, exactly as ``assert_provider_is_hookable``
-    reads MATCHING_PROVIDER: a bound name taken at import would record the
-    value this file was imported with rather than the one that is about to
-    serve the run.
+    READ THROUGH ``config.matching_call_mode()``, THE ONE OWNER, and not off
+    ``MATCHING_PER_TRIAL_CALLS_ENABLED``. Two reasons, and the second is why it
+    changed:
+
+      * the constant is one of TWO things that decide the arm now, and a guard
+        that reads one of them answers a question the node does not ask. The
+        node reads the owner; so must anything claiming to predict it.
+      * reading the owner is what makes the harness's pin work at all, without
+        a second `if` here that would have to be kept in step with it.
+
+    A bound name taken at import would record the value this file was imported
+    with rather than the one about to serve the run -- the same argument
+    ``assert_provider_is_hookable`` makes for MATCHING_PROVIDER.
     """
-    if config.MATCHING_PER_TRIAL_CALLS_ENABLED:
+    if config.matching_call_mode() != config.MATCHING_CALL_MODE_GROUPED:
         raise UnsupportedCallModeError(what)
+
+
+# The line the harness prints. A module constant rather than an f-string at the
+# call site because BOTH entry points print it and a reader comparing a capture
+# log with a replay log must not have to decide whether two differently-worded
+# statements mean the same thing.
+FIXTURE_CALL_MODE_NOTICE = (
+    "These fixtures characterize the GROUPED Stage 5 arm, and can "
+    "characterize no other today: RecordingSink numbers recordings by "
+    "ARRIVAL, so a per-trial capture's 'deterministic' prefix would be "
+    "ordered by the thread scheduler. PER-TRIAL FIXTURES ARE A PENDING "
+    "MIGRATION ITEM -- it needs a trial-stable ordering for the "
+    "chat_completions bucket, which is a fixture-FORMAT change."
+)
+
+
+def pin_call_mode_for_fixture_process(what: str, out=None) -> str:
+    """Pin Stage 5 to the grouped arm for this whole process, loudly.
+
+    Returns the mode now in force, which is always
+    ``config.MATCHING_CALL_MODE_GROUPED``.
+
+    WHY A PIN RATHER THAN A REFUSAL. See ``UnsupportedCallModeError``: the
+    refusal was the whole answer while grouped was the default and becomes a
+    self-inflicted outage of the free replay gate the day the default flips.
+    Pinning keeps the gate running across that flip and keeps it HONEST, because
+    everything downstream reads the same owner -- a capture taken here records
+    the grouped arm and says so, rather than recording a per-trial run it could
+    not have ordered.
+
+    WHY IT IS NOT SILENT WHEN THE DEFAULT IS ALREADY GROUPED. The line prints
+    unconditionally, and it prints the default it found. A notice that appeared
+    only when it had something to override would be absent from every log taken
+    before the flip and present afterwards, so the reader most likely to be
+    confused -- somebody comparing a fixture captured under one default with a
+    replay run under the other -- is exactly the reader it would fail. Printing
+    the default alongside the pin is also the only thing in either log that says
+    which arm the project was CONFIGURED for at capture time.
+
+    WHY IT IS CALLED FIRST, in both entry points, before argument-dependent
+    work. Anything that reads ``config.matching_call_mode()`` before this line
+    reads the unpinned value: Stage 5's partition, the guard in
+    ``install_recording_hooks`` / ``install_replay_hooks``, and -- the reason it
+    matters most -- a fixture's own environment block. Being the first statement
+    of ``main()`` makes "nothing ran before it" true by inspection rather than
+    by a survey of everything that might.
+
+    THIS FUNCTION DOES NOT REPLACE THE GUARD and must not be read as doing so.
+    It makes the guard pass on this path; the guard still runs, still reads the
+    owner, and still refuses every path that did not come through here.
+
+    ``out`` is injectable on ``degradation.print_report``'s footing, and the
+    reason is asymmetric rather than uniform, which is worth stating because
+    the obvious version of this sentence is FALSE.
+    ``tests/test_resume_capture_and_ragas.py`` DOES drive this module's
+    ``main()`` for real, with the paid and networked seams replaced by
+    stand-ins. What cannot be driven is ``oncotriage/fixtures/replay.py``'s
+    ``main()`` -- it needs a live Qdrant, a collection digest and the twelve
+    fixtures, none of which a bucket-A test has -- so the one line both entry
+    points depend on has to be exercisable on its own, without either.
+
+    A CONSEQUENCE OF THAT FIRST FACT, RECORDED RATHER THAN LEFT TO BE FOUND:
+    a test that drives ``capture.main()`` installs this PROCESS-GLOBAL pin and
+    does not clear it. That is inert today and correct after a default flip --
+    a process driving the capture harness should be pinned to the arm the
+    harness can record -- but it is a real cross-check side effect, and a test
+    that needs the unpinned mode afterwards must call
+    ``config.clear_matching_call_mode_pin()`` itself.
+    """
+    emit = out if out is not None else console.out
+    was = config.matching_call_mode()
+    previous_pin = config.pin_matching_call_mode(config.MATCHING_CALL_MODE_GROUPED)
+    now = config.matching_call_mode()
+
+    emit(f"  Stage 5 call mode: PINNED to {now!r} for this process by {what}")
+    emit(f"      unpinned, this process would have run {was!r} "
+         f"(MATCHING_PER_TRIAL_CALLS_ENABLED="
+         f"{config.MATCHING_PER_TRIAL_CALLS_ENABLED!r}"
+         + (f", previous pin {previous_pin!r}" if previous_pin is not None else "")
+         + ")")
+    emit(f"      {FIXTURE_CALL_MODE_NOTICE}")
+
+    # A pin that did not take is worse than no pin: everything below would
+    # believe the arm is grouped while the node partitioned per trial, and the
+    # first thing to notice would be a fixture whose prefix cannot reproduce.
+    # config.pin_matching_call_mode raises on an unrecognised mode, so this can
+    # only fire if the owner itself stopped honouring the pin.
+    if now != config.MATCHING_CALL_MODE_GROUPED:
+        raise UnsupportedCallModeError(f"{what} (the pin did not take)")
+    return now
 
 
 def install_recording_hooks(sink: RecordingSink,
@@ -2134,6 +2249,30 @@ def build_environment_block() -> Dict:
         "matching_max_tokens": MATCHING_MAX_TOKENS,
         "matching_reasoning_effort": MATCHING_REASONING_EFFORT,
         "matching_seed": MATCHING_SEED,
+        # WHICH STAGE 5 ARM PRODUCED THIS FIXTURE, read through the ONE
+        # owner so it names the arm that RAN rather than the arm the project
+        # is configured for -- fixture_capture.py pins the mode for its own
+        # process (see pin_call_mode_for_fixture_process) and the two can
+        # therefore differ. This is the durable form of the notice that pin
+        # prints: a fixture read back months later says on its face that it
+        # characterizes the grouped arm.
+        #
+        # DELIBERATELY NOT IN "tunables", AND THE REASON IS A TRAP RATHER THAN
+        # a taxonomy. File 46's diff_tunables() resolves every recorded key
+        # with getattr(config, name) -- so a key must be the NAME OF A MODULE
+        # ATTRIBUTE. "MATCHING_CALL_MODE" is not one (the owner is a function),
+        # so it would be reported "<no longer defined>" on every future
+        # fixture, forever; and "MATCHING_PER_TRIAL_CALLS_ENABLED" is one but
+        # is the wrong fact -- under the pin it can read True on a run that was
+        # grouped, which is precisely the contradiction the pin exists to keep
+        # out of the record.
+        #
+        # FUTURE CAPTURES ONLY, on this block's standing doctrine: nothing
+        # reads this field, and File 46 touches fixture["environment"] for
+        # exactly three keys ("tunables", "qdrant_collection",
+        # "collection_digest"), so the twelve fixtures on disk are unmoved,
+        # unaffected and replay clean without recapture.
+        "matching_call_mode": config.matching_call_mode(),
         # BOTH WERE LITERALS UNTIL PASS 20f-2, and both are now the constants
         # the pipeline actually loads: config.CROSS_ENCODER_MODEL is what
         # oncotriage/agent/deps.py hands from_pretrained, and
@@ -3773,6 +3912,16 @@ def main() -> int:
                              "failing check printed. Composes with --only: an "
                              "entry runs only if it passes both filters.")
     args = parser.parse_args()
+
+    # BEFORE ANYTHING ELSE, and before a single bundle is read: pin Stage 5 to
+    # the GROUPED arm for this process and say so. It is the first statement
+    # after argument parsing on purpose -- everything that reads
+    # config.matching_call_mode() below is downstream of it, including
+    # install_recording_hooks' own guard and the environment block every
+    # fixture written by this run carries. See
+    # pin_call_mode_for_fixture_process for why this is a pin rather than the
+    # refusal it replaces, and why it prints even when it changed nothing.
+    pin_call_mode_for_fixture_process("fixture_capture.py")
 
     root = args.fixture_dir or fixture_root()
     os.makedirs(root, exist_ok=True)

@@ -900,7 +900,7 @@ check("1k  ...and grouped mode does NOT read it, so a bad bound cannot fail a "
       len(run_node(_SIX, per_trial=False, parallel=0)[1].requests), 1)
 
 
-# ── THE FIXTURE HARNESS REFUSES THIS MODE, AND THE REFUSAL IS EXERCISED ─────
+# ── THE FIXTURE HARNESS REFUSES AN UNPINNED PER-TRIAL PROCESS ───────────────
 #
 # ``RecordingSink.add`` stamps ``call_index = len(bucket)`` under its lock, so
 # a Stage 5 recording's index is its ARRIVAL ordinal -- deterministic while the
@@ -908,13 +908,23 @@ check("1k  ...and grouped mode does NOT read it, so a bad bound cannot fail a "
 # deterministic prefix then projects ``request_sha256_by_call`` and
 # ``finish_reasons`` as LISTS in that order, so a capture taken under this mode
 # would write a fixture whose "deterministic" prefix is not, and a replay would
-# report a permutation as a difference. Nothing would raise. So both harnesses
-# refuse, on the ``assert_provider_is_hookable`` precedent, and the refusal is
-# driven here rather than asserted about.
+# report a permutation as a difference. Nothing would raise.
+#
+# THE REFUSAL IS NO LONGER THE HARNESS'S WHOLE ANSWER, and this block is scoped
+# accordingly. ``fixture_capture.py`` and ``fixture_replay.py`` now PIN the mode
+# to grouped for their own process through ``config.pin_matching_call_mode`` --
+# a flat refusal would have taken the free twelve-fixture replay gate out of
+# service the day the default flips, which is the day it is worth the most.
+# What is checked HERE is what is left: the guard still exists, still reads the
+# ONE owner ``config.matching_call_mode()``, and still bites for every path
+# that did not come through that pin. The pin itself, the loud line and all
+# four (pin x constant) combinations are
+# ``tests/test_fixture_call_mode_pin.py``'s subject.
 #
 # NO HOOKS ARE INSTALLED AND NO CLIENT IS TOUCHED: the guard is a pure function
 # of the config module and is called BEFORE any seam is reached, which is what
-# lets this file exercise it without a network, a key or a fixture.
+# lets this file exercise it without a network, a key or a fixture. No pin is
+# installed either, so the arm below is the unpinned one.
 _saved1b = config.MATCHING_PER_TRIAL_CALLS_ENABLED
 try:
     config.MATCHING_PER_TRIAL_CALLS_ENABLED = True
@@ -928,8 +938,10 @@ check("1l  the fixture harness REFUSES to hook per-trial mode",
       _capture.UnsupportedCallModeError.__name__ in repr(_refused), True)
 check("1l  ...and does NOT refuse grouped mode, so 1l is a measurement rather "
       "than a guard that raises unconditionally", _allowed, None)
-check("1l  ...and the refusal names the constant an operator has to change",
-      "MATCHING_PER_TRIAL_CALLS_ENABLED" in str(_refused), True)
+check("1l  ...and the refusal names BOTH inputs to the owner it read, so a "
+      "reader can tell an inherited default from a deliberate pin",
+      ("MATCHING_PER_TRIAL_CALLS_ENABLED" in str(_refused),
+       "pin=" in str(_refused)), (True, True))
 check("1l  ...and it is a RuntimeError subclass, deliberately not a "
       "ValueError, so a stray `except ValueError` cannot eat it",
       (issubclass(_capture.UnsupportedCallModeError, RuntimeError),

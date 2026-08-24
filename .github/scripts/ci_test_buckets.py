@@ -506,6 +506,29 @@ BUCKETS = {
         _A, None, "ran green in 2.6s; no corpus, no git"),
     "test_fhir_birth_date_and_demographics.py": (
         _A, None, "ran green in 2.3s"),
+    "test_fixture_call_mode_pin.py": (
+        _A, None,
+        "ran green in 4.8s, 81 checks: the fixture harness PINS the Stage 5 "
+        "call mode to the grouped arm for its own process, through the ONE "
+        "owner config.matching_call_mode(), rather than refusing per-trial "
+        "outright -- a flat refusal would take the free twelve-fixture replay "
+        "gate out of service the day the default flips. All four (pin x "
+        "constant) combinations are driven; the refusal is required to survive "
+        "for every path that did not come through the pin, including one that "
+        "pins PER-TRIAL. No network, no keys, no spend, no live Qdrant, no "
+        "model load (ONCOTRIAGE_DEFER_LOCAL_MODELS above the imports, asserted "
+        "in-process and in every subprocess), no corpus, no database, no git "
+        "history, no live server. It DOES use four subprocesses -- "
+        "oncotriage/fixtures/replay.py sets ONCOTRIAGE_DEFER_LOCAL_MODELS at "
+        "module scope, so importing it in-process would change the "
+        "environment for every check after it, and a pin is process-global by "
+        "design -- each handed ONCOTRIAGE_QDRANT_URL pointed at a closed port. "
+        "It EXECS NOTHING and writes nothing anywhere, so it needs no "
+        "_EXEC_ALLOWLIST entry and is NOT in the collision matrix; it reads "
+        "oncotriage/config.py, which tests/test_config_snapshot_date_rot.py "
+        "rewrites, so all three files it reads are sha256-compared at the end "
+        "(check 6e) and an interleaved serial run is visible rather than "
+        "silent"),
     "test_fixtures_harness_hardening.py": (
         _A, None,
         "ran green in 1.0s, 116 checks, against ONLY the directory skeleton, "

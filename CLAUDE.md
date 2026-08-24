@@ -868,6 +868,20 @@ python tests/test_harness_endpoint_budget.py                        #  38
 # in-memory copies -- so it needs no _EXEC_ALLOWLIST entry. ~1.0 s.
 python tests/test_evaluation_sample_naming.py                       #  72
 
+# The call-mode-pin pass. Same shape, same directory. No network, no keys, NO
+# SPEND, no live Qdrant, NO MODEL LOAD (ONCOTRIAGE_DEFER_LOCAL_MODELS above the
+# imports; torch and transformers asserted absent in-process AND in every
+# subprocess), no corpus, no database, no git history, no live server. It DOES
+# use four subprocesses -- oncotriage/fixtures/replay.py sets that variable at
+# module scope, so importing it in-process would change the environment for
+# every check after it, and a pin is process-global by design -- each handed
+# ONCOTRIAGE_QDRANT_URL pointed at a closed port. It EXECS NOTHING and writes
+# nothing anywhere, so it needs no _EXEC_ALLOWLIST entry and is NOT in the
+# collision matrix; it DOES read oncotriage/config.py, which
+# tests/test_config_snapshot_date_rot.py rewrites, so all three files it reads
+# are sha256-compared at the end. Bucket A, ~4.8 s.
+python tests/test_fixture_call_mode_pin.py                          #  81
+
 # The Bedrock-adapter pass. Same shape, same directory. NO AWS CALL AND NO
 # BILLED CALL OF ANY KIND -- every client is a stand-in installed through
 # oncotriage/agent/deps.py and every model response is a literal dict. No
@@ -7456,6 +7470,230 @@ touched, and raises `UnsupportedMatchingProviderError` naming the constant.
 **Teaching `OpenAIProxy` the Bedrock seam is the top-ranked follow-up** — it is
 a fixture-FORMAT question (the recorded request block is chat-shaped), not a
 one-line one, which is why this pass refuses instead of guessing.
+
+### The fixture gate survives the default flip (the call-mode-pin pass)
+
+**THE HARNESS'S REFUSAL WAS RIGHT AND ITS EXPIRY DATE WAS ALREADY SET.**
+`oncotriage/fixtures/capture.py`'s `RecordingSink.add` stamps
+`call_index = len(bucket)` under its lock, so a Stage 5 recording's index is
+its ARRIVAL ordinal — deterministic while the stage is sequential, decided by
+the thread scheduler the moment it is not — and `build_deterministic_prefix`
+projects `request_sha256_by_call` and `finish_reasons` as LISTS in that order.
+So both harnesses raised `UnsupportedCallModeError` before any hook was
+installed whenever `MATCHING_PER_TRIAL_CALLS_ENABLED` was True. Free while
+grouped was the default; **the day the default flips it takes the free
+twelve-fixture replay gate out of service at exactly the moment a large
+behaviour change lands.** Measured rather than predicted — see the
+counterfactual below.
+
+**THE DEFAULT DID NOT MOVE IN THIS PASS.**
+`MATCHING_PER_TRIAL_CALLS_ENABLED` is still `False`. What changed is the
+semantics of the harness's answer.
+
+**THE PIN GOES THROUGH THE ONE OWNER, WHICH IS THE WHOLE DESIGN.**
+`oncotriage/config.py` gained a private `_MATCHING_CALL_MODE_PIN` and three
+functions beside `matching_call_mode()`: `pin_matching_call_mode(mode)`
+(returns the previous pin), `clear_matching_call_mode_pin()` and the
+diagnostic `matching_call_mode_pin()`. `matching_call_mode()` resolves
+**pin, then constant**, so all four existing consumers —
+`agent/evaluation.py`'s partition, `storage/database_logger.py`'s
+`inferences.matching_call_mode`, `run_fingerprint._call_mode` and
+`tracking.configuration_params` — follow it with no edit. That ordering is the
+only one that can be correct: a process that has pinned an arm is going to RUN
+that arm, so every consumer reporting on it must name the arm that ran.
+
+**WHY NOT JUST SET THE CONSTANT FOR THE PROCESS.** The harness could do
+`config.MATCHING_PER_TRIAL_CALLS_ENABLED = False` on the module and every
+consumer would follow, because they all read through the owner. That is the
+shape this project keeps removing: a second WRITER of a declared configuration
+value, indistinguishable afterwards from the declaration itself, so
+`config.MATCHING_PER_TRIAL_CALLS_ENABLED` read anywhere later — a report, a log
+line, a future reader — would say the campaign was configured grouped when it
+was configured per-trial and overridden. The pin keeps the two facts apart:
+**the constant says what the project is configured to do, the pin says what
+this process was forced to do**, and the owner resolves them in one place with
+one rule. Measured both ways — behaviourally (check 1c: the constant is
+unchanged across a pin, with a non-degeneracy probe that the two disagreed) and
+structurally (check 4b: neither fixture module contains an assignment to that
+name, with `config.py`'s own declaration as the non-degeneracy probe).
+
+**IT IS NOT AN ENVIRONMENT VARIABLE.** Every `ONCOTRIAGE_*` name in
+`oncotriage/settings.py` is a deployment knob an operator sets; this is a
+declaration a PROGRAM makes about itself, and exporting it would let it leak
+into a batch run that never asked for it — the campaign-corrupting direction.
+
+**THE REFUSAL REMAINS, AND IT NOW ASKS THE RIGHT QUESTION.**
+`assert_call_mode_is_hookable` read `config.MATCHING_PER_TRIAL_CALLS_ENABLED`;
+it reads `config.matching_call_mode()`. Two consequences, and the second is not
+obvious:
+
+* it is what makes the pin work at all, without a second copy of the pin rule
+  here to keep in step with `config.py` by hand;
+* **pinning PER-TRIAL is refused exactly like inheriting it.** The guard asks
+  what the node will actually DO, so the pin is not a way around it. All four
+  (pin × constant) combinations are driven in
+  `tests/test_fixture_call_mode_pin.py` section 2 and again, in subprocesses,
+  in section 5.
+
+The refusal fires for every path that did not come through the pin — a test, a
+script, a future caller, or a harness whose pin has been deleted or moved below
+the first hook install — and its message now names the owner, **both** inputs
+to it (`MATCHING_PER_TRIAL_CALLS_ENABLED=…, pin=…`) and the remedy by name.
+
+**LOUD, AND LOUD EVEN WHEN IT OVERRODE NOTHING.**
+`pin_call_mode_for_fixture_process(what, out=None)` prints three lines: what was
+pinned and by whom, what the process WOULD have run and the constant it read,
+and `FIXTURE_CALL_MODE_NOTICE` — one module constant, printed verbatim by both
+entry points, stating that the fixtures characterize the GROUPED arm and that
+per-trial fixtures are a PENDING MIGRATION ITEM. **A notice that appeared only
+when it had something to override would be absent from every log taken before
+the flip and present afterwards**, so the reader most likely to be confused —
+somebody comparing a fixture captured under one default with a replay run under
+the other — is exactly the reader it would fail. Printing the default alongside
+the pin is also the only thing in either log that says which arm the project was
+configured for at capture time. `out` is injectable on
+`degradation.print_report`'s footing: neither `main()` can be driven in a test
+(one costs money, the other needs a live Qdrant and twelve fixtures), so the one
+line they both depend on has to be exercisable on its own.
+
+**IT IS THE FIRST STATEMENT OF EACH `main()` AFTER `parse_args`**, and that is a
+correctness property rather than tidiness: anything above it reads the UNPINNED
+mode — the guard, Stage 5's partition, and a fixture's own environment block.
+Section 4a asserts the position by AST, relative to `parse_args` rather than as
+a literal index, **with a control that swaps it down one statement and must
+fail**.
+
+**A FIXTURE NOW SAYS ON ITS FACE WHICH ARM PRODUCED IT.**
+`build_environment_block` records `"matching_call_mode": config.matching_call_
+mode()` — the durable form of the printed notice. **Deliberately NOT in
+`tunables`, and the reason is a trap rather than a taxonomy:** File 46's
+`diff_tunables()` resolves every recorded key with `getattr(config, name)`, so a
+key must be the NAME OF A MODULE ATTRIBUTE. `MATCHING_CALL_MODE` is not one (the
+owner is a function), so it would be reported `<no longer defined>` on every
+future fixture forever; and `MATCHING_PER_TRIAL_CALLS_ENABLED` is one but is the
+wrong fact — under the pin it can read True on a run that was grouped. Check 6c
+turns that into a standing invariant for the whole dict: **every recorded
+tunable must resolve as a config attribute**, with the two rejected spellings as
+its control. **FUTURE CAPTURES ONLY**, on this block's standing doctrine, so the
+twelve fixtures on disk are unmoved.
+
+**WHAT WAS MEASURED BY RUNNING, both arms.** The "default flipped" arm is a
+`usercustomize.py` on `PYTHONPATH` that sets the constant True at interpreter
+startup — no repository file edited, so the fixtures and the tree are untouched.
+
+| arm | `python fixture_replay.py` |
+|---|---|
+| shipped default (grouped) | **12/12 clean, exit 0**, no recapture |
+| default forced per-trial | **12/12 clean, exit 0**, no recapture |
+| default forced per-trial, **pin reverted in a copy** | **exit 1**, an uncaught `UnsupportedCallModeError` traceback at the first fixture |
+
+The third row is the outage this pass exists to prevent, and it is worse than a
+clean refusal: the guard raises inside `replay_fixture` → `install_replay_hooks`,
+which nothing catches, so the gate dies with a traceback rather than a report.
+All twelve fixture files are byte-identical by sha256 before and after, and the
+production `inferences.db` sha256 is unchanged — `ab1403e3…`, 90,185,728 bytes.
+
+**`tests/test_fixture_call_mode_pin.py` — 81 checks, bucket A, ~4.8 s (MEASURED).** No
+network, no keys, **no spend**, no live Qdrant, no model load
+(`ONCOTRIAGE_DEFER_LOCAL_MODELS` above the imports, asserted in-process and in
+every subprocess), no corpus, no database, no git history, no live server. It
+uses four subprocesses, for two reasons that are not convenience:
+`oncotriage/fixtures/replay.py` sets `ONCOTRIAGE_DEFER_LOCAL_MODELS` at module
+scope — the one deliberate import-time side effect in the package — so importing
+it in-process would change the environment for every check after it; and **a pin
+is process-global by design**, so exercising the "default is per-trial" arm
+in-process would leave this file's own later sections running under a state they
+did not ask for. Each subprocess is handed `ONCOTRIAGE_QDRANT_URL` pointed at a
+closed port. It **execs nothing**, so it needs no `_EXEC_ALLOWLIST` entry, and
+it writes nothing anywhere, so it is not in the collision matrix — but it READS
+`oncotriage/config.py`, which `tests/test_config_snapshot_date_rot.py` rewrites
+in place, so all three files it reads are sha256-compared at the end (check 6e)
+and an interleaved serial run is visible rather than silent.
+
+**THIRTEEN REVERTS, THIRTEEN CAUGHT**, each applied to a `copytree`'d copy with
+`PYTHONPATH` pointed at it, a realpath preflight asserting the COPY is what
+imports, `PYTHONDONTWRITEBYTECODE=1` set, and every plant asserted to have an
+exact occurrence count so a plant that matched nothing is a named
+`PLANT-FAILED`: the owner ignoring the pin (25 recorded failures), the guard
+reading the constant (6), the harness writing the constant instead of pinning
+(10), each entry point's pin deleted (2 each), the pin moved down one statement
+(1), the notice printed only when it overrode something (9), the pin validation
+removed (4), the guard dropped from `install_recording_hooks` (1), the
+environment key removed (1), the arm recorded as a tunable (2), the
+pin-did-not-take branch deleted (2) and `clear_matching_call_mode_pin` not
+clearing (8). All three shipped files byte-identical afterwards.
+
+**THREE DEFECTS IN THIS PASS'S OWN TEST CODE WERE FOUND BY RUNNING, NOT BY
+READING, AND TWO OF THEM ARE THIS PROJECT'S RECURRING SHAPES.**
+
+* **A DOCSTRING SATISFIED A SUBSTRING SCAN.** Check 2g asked whether the guard
+  still reads `MATCHING_PER_TRIAL_CALLS_ENABLED` by looking for that text in
+  `ast.unparse(guard)` — and the guard's own PROSE, arguing why it stopped
+  reading that constant, contains it. **The argument was reported as the thing
+  it argues against.** It walks NAME LOADS with the docstring stripped now, with
+  the constant's genuine appearance inside `UnsupportedCallModeError.__init__`
+  as the non-degeneracy probe. Same lesson as the Docker pass's "a file that
+  argues about its own settings cannot be grepped for them", one directory over.
+* **A SUBSTRING IS NOT A NAME.** Check 6c filtered the tunables on
+  `"PER_TRIAL" in n` and reported `MATCHING_OUTPUT_TOKENS_PER_TRIAL` — a real,
+  correct, unrelated tunable. It intersects an explicit set of five spellings
+  now.
+* **THREE REVERTS ABORTED THE FILE INSTEAD OF FAILING IT**, and each abort was
+  triggered by exactly the defect its check exists to catch: `_main_of(None)`
+  walked `None` when a revert DELETED the pin the control tries to move, and
+  `len(absence or [])` raised when a revert made a subprocess die before it
+  could report. **That is the twelfth time this project has shipped that
+  shape.** `_Absent` is falsy now and `size()` / `joined()` are the fix; the same
+  three reverts report 25, 2 and 2 recorded failures and run to their summaries.
+
+**AND THREE MORE FOUND BY RE-READING THIS PASS'S OWN CODE AFTER IT WAS GREEN,
+which is why "it passes" is not the end of a pass.**
+
+* **A DOCSTRING ASSERTED SOMETHING FALSE ABOUT THE SUITE.**
+  `pin_call_mode_for_fixture_process` argued its injectable `out` on "neither
+  entry point's `main()` can be driven in a test". `tests/test_resume_capture_
+  and_ragas.py` drives `capture.main()` for real. The argument is asymmetric —
+  it is the REPLAY `main()` that cannot be driven — and it now says so, with
+  the consequence recorded beside it: **a test that drives `capture.main()`
+  installs this process-global pin and does not clear it.** Inert today,
+  correct after a flip, and a real cross-check side effect a reader is entitled
+  to know about.
+* **THREE ANNOTATIONS SAID `-> str` FOR FUNCTIONS THAT RETURN `None`.**
+  `pin_matching_call_mode` returns the previous pin, `clear_matching_call_mode_
+  pin` returns what it cleared, and `matching_call_mode_pin` answers "nothing
+  is pinned" — all three by returning `None`. Quoted `"str | None"` now, and
+  quoted deliberately: `config.py` is imported by every entry point in the
+  project and must not become the one file that refuses to import on an older
+  interpreter.
+* **THE NEW TEST HARD-CODED TODAY'S DEFAULT.** Check 1a asserted
+  `MATCHING_PER_TRIAL_CALLS_ENABLED == False`, which would have made the file
+  whose entire subject is that the gate SURVIVES the flip the first thing to
+  fail when the default flips. It derives the expected mode from the constant
+  now. **A test that fails on the change it exists to protect is a landmine,
+  not a tripwire** — and every other default-dependent check in the file forces
+  the constant itself, so this was the only one.
+
+**VERIFIED BY RUNNING.** `tests/test_package_invariants.py` **260/0/0**,
+unchanged; `tests/test_agent_stage5_per_trial_calls.py` **283/0**, unchanged
+(its section 1l block was rewritten to say what it now checks — the guard, not
+the whole answer — and one label that promised the refusal "names the constant
+an operator has to change" was corrected, since the operator's remedy is now the
+pin); CI bucket A green; the serial runner **5/5** with `oncotriage/config.py`
+and `oncotriage/registries/cancer_code_registry.py` confirmed restored;
+`python fixture_replay.py` **12/12 clean under BOTH defaults, exit 0, no
+recapture**; twelve fixtures byte-identical; production `inferences.db` sha256
+unchanged. **No money was spent and no migration was run.**
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.** The migration
+itself: `RecordingSink` still orders the `chat_completions` bucket by arrival,
+so per-trial fixtures remain impossible and a per-trial campaign has no
+characterization gate of its own. `call_index` is stamped by a generic bucket
+appender shared with three other seams and the node's own `call_index`
+numbering would have to agree with it, which makes it a fixture-FORMAT change
+with a `SCHEMA_VERSION` bump and a paid recapture — the reason this pass pins
+instead of guessing. Until it lands, **the twelve fixtures characterize the
+grouped arm and say so on their face**, and a per-trial campaign's Stage 5
+behaviour is covered by `tests/test_agent_stage5_per_trial_calls.py` alone.
 
 ## Persistence and observability
 

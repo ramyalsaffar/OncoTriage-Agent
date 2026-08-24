@@ -892,7 +892,20 @@ def main() -> int:
                         help="Differences printed per fixture.")
     args = parser.parse_args()
 
-    # BEFORE ANYTHING ELSE, and before a single fixture is read: the deferral
+    # BEFORE ANYTHING ELSE, and before a single fixture is read: pin Stage 5
+    # to the GROUPED arm for this process and say so. The twelve fixtures
+    # characterize that arm and can characterize no other until RecordingSink
+    # learns a trial-stable ordering, so a replay run in a per-trial process
+    # would diff a grouped recording against a per-trial run and report the
+    # partition as a pipeline regression. This used to be a REFUSAL, which
+    # would have taken this free gate out of service the day the default
+    # flips; see oncotriage.fixtures.capture.pin_call_mode_for_fixture_process.
+    #
+    # FIRST, so that nothing reads the mode before it: install_replay_hooks'
+    # own guard, and Stage 5's partition on every fixture below.
+    _capture.pin_call_mode_for_fixture_process("fixture_replay.py")
+
+    # And before a single fixture is read: the deferral
     # this module's import block installs has to have actually reached
     # oncotriage.agent.deps. If it did not, MedCPT and FastEmbed load for real
     # on the first rerank and the run below still prints "Local models: not

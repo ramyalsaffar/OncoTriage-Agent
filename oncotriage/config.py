@@ -2186,6 +2186,45 @@ if set(MATCHING_CALL_MODES) != {MATCHING_CALL_MODE_GROUPED,
         f"MATCHING_CALL_MODE_PER_TRIAL; it holds {MATCHING_CALL_MODES!r}")
 
 
+# THE PROCESS PIN, AND WHY IT LIVES HERE RATHER THAN AT ITS CALLER.
+#
+# `None` means "no pin: follow MATCHING_PER_TRIAL_CALLS_ENABLED", which is
+# every ordinary process. A member of MATCHING_CALL_MODES means some caller has
+# declared that THIS process runs that arm whatever the constant says.
+#
+# THE ONE CALLER TODAY IS THE FIXTURE HARNESS, and its need is not a
+# preference. oncotriage/fixtures/capture.py's RecordingSink stamps
+# `call_index = len(bucket)` under its lock, so a Stage 5 recording's index is
+# its ARRIVAL ordinal -- deterministic while the stage is sequential and
+# decided by the thread scheduler the moment it is not. The twelve
+# characterization fixtures therefore characterize the GROUPED arm and can
+# characterize no other, until the sink learns a trial-stable ordering. Before
+# this pin the harness REFUSED per-trial mode outright, which was right while
+# grouped was the default and becomes a self-inflicted outage the day the
+# default flips: the free twelve-fixture replay gate -- the one thing that says
+# the pipeline still does what it did -- would stop running at exactly the
+# moment a large behaviour change landed.
+#
+# WHY THE PIN IS A NAME IN THIS MODULE AND NOT A WRITE TO THE CONSTANT. The
+# harness could set MATCHING_PER_TRIAL_CALLS_ENABLED = False on this module for
+# its own process and every consumer would follow, because they all read
+# through matching_call_mode(). That is the shape this project keeps removing:
+# a second writer of a declared configuration value, indistinguishable
+# afterwards from the declaration itself, so `config.MATCHING_PER_TRIAL_CALLS_
+# ENABLED` read anywhere -- a report, a log line, a future reader of this file
+# -- would say the campaign was configured grouped when it was configured
+# per-trial and overridden. The pin keeps the two facts apart: the constant
+# still says what the project is configured to do, the pin says what this
+# process was forced to do, and matching_call_mode() -- the ONE owner both
+# consumers already read -- resolves them in one place with one rule.
+#
+# NOT AN ENVIRONMENT VARIABLE. Every ONCOTRIAGE_* name in oncotriage/settings.py
+# is a deployment knob an operator sets; this is a declaration a PROGRAM makes
+# about itself, and exporting it would let it leak into a batch run that never
+# asked for it -- which is the campaign-corrupting direction.
+_MATCHING_CALL_MODE_PIN = None
+
+
 def matching_call_mode() -> str:
     """Which call mode Stage 5 runs in, read LIVE off this module.
 
@@ -2202,9 +2241,83 @@ def matching_call_mode() -> str:
     READ AT CALL TIME, NEVER CACHED. The writer calls it once per row and the
     node once per patient; both are far off any hot path, and caching would
     reintroduce exactly the staleness the function removes.
+
+    THE PIN OUTRANKS THE CONSTANT, and that ordering is the only one that can
+    be correct: a process that has pinned an arm is going to RUN that arm, so
+    every consumer reporting on it -- the node's partition, the stored
+    ``inferences.matching_call_mode``, the resume fingerprint, the tracking
+    parameter -- must name the arm that ran and not the one that was
+    configured. See ``pin_matching_call_mode``.
     """
+    if _MATCHING_CALL_MODE_PIN is not None:
+        return _MATCHING_CALL_MODE_PIN
     return (MATCHING_CALL_MODE_PER_TRIAL if MATCHING_PER_TRIAL_CALLS_ENABLED
             else MATCHING_CALL_MODE_GROUPED)
+
+
+def pin_matching_call_mode(mode: str) -> "str | None":
+    """Force ``matching_call_mode()`` for the rest of THIS process.
+
+    Returns the pin that was in force before, so a caller can restore it --
+    ``None`` when there was none, which is why the annotation admits it. (A
+    QUOTED annotation and not a bare ``str | None``: this module declares
+    ``requires-python = ">=3.10"``, where PEP 604 holds, but a quoted form
+    costs nothing and cannot become the one line in config.py that refuses to
+    import on an older interpreter -- and this file is imported by every entry
+    point in the project.) The fixture harness never restores it: it
+    pins once, for the life of the process, before anything reads the mode.
+
+    RAISES ON AN UNRECOGNISED MODE rather than storing it. A pin is the one
+    value in this module that no import-time check can validate -- it is set at
+    run time by a caller -- and a typo stored here would put a string outside
+    the closed vocabulary into ``inferences.matching_call_mode``, into the
+    resume fingerprint and into the tracking index at once, where every
+    consumer that enumerates ``MATCHING_CALL_MODES`` would silently fail to
+    match it. A RuntimeError and not a ValueError, on the
+    ``UnknownModelPricingError`` precedent, so a stray ``except ValueError``
+    around a pipeline call cannot eat it.
+
+    NOT THREAD-SAFE AND DELIBERATELY NOT LOCKED. A pin is a statement about a
+    whole process, made once before its work starts -- the fixture harness
+    calls this as the first statement of ``main()``. A lock here would suggest
+    it is safe to flip mid-run, and it is not: the node reads the mode once per
+    patient, so a flip between two patients of one campaign would put two arms
+    into one artifact with nothing in it saying so. That is the fault the
+    resume fingerprint's ``matching_call_mode`` field exists to catch BETWEEN
+    runs, and nothing catches it within one.
+    """
+    global _MATCHING_CALL_MODE_PIN
+    if mode not in MATCHING_CALL_MODES:
+        raise RuntimeError(
+            f"pin_matching_call_mode: {mode!r} is not a Stage 5 call mode. "
+            f"MATCHING_CALL_MODES is {MATCHING_CALL_MODES!r}.")
+    previous = _MATCHING_CALL_MODE_PIN
+    _MATCHING_CALL_MODE_PIN = mode
+    return previous
+
+
+def clear_matching_call_mode_pin() -> "str | None":
+    """Drop the pin, returning what it was (``None`` when there was none).
+
+    Exists so a caller that pinned can put the process back -- a test does,
+    inside ``try``/``finally``. Nothing in the pipeline calls it.
+    """
+    global _MATCHING_CALL_MODE_PIN
+    previous = _MATCHING_CALL_MODE_PIN
+    _MATCHING_CALL_MODE_PIN = None
+    return previous
+
+
+def matching_call_mode_pin() -> "str | None":
+    """What is pinned right now, or ``None``. A DIAGNOSTIC, not an access path.
+
+    ``matching_call_mode()`` is what a consumer reads. This answers the
+    different question a REPORT asks -- "was the mode chosen or forced" -- which
+    ``matching_call_mode()`` cannot, because it deliberately returns the same
+    two strings either way. ``deps.peek`` is the same distinction one module
+    over.
+    """
+    return _MATCHING_CALL_MODE_PIN
 
 
 
