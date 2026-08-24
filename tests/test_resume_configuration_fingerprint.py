@@ -837,6 +837,117 @@ check("a version-1 stamp that also differs in a gated field is STILL "
       _fp.compare(dict(_v1, matching_model_configured="something-else"),
                   _now)[0], _fp.FP_VERSION)
 
+# --- (f-newer) A STAMP FROM THE FUTURE IS THE OPPOSITE REMEDY -------------
+#
+# BOTH DIRECTIONS OF THE SAME OUTCOME, DRIVEN. Until this pass every
+# version mismatch got one message, and that message told an operator to clear
+# the artifact -- correct for an OLDER stamp, and exactly wrong for a NEWER
+# one, where the artifact is fine and THIS BUILD IS BEHIND IT. A checkout
+# rolled back one commit, a container running last week's image against this
+# week's checkpoint, two machines at different revisions sharing a volume: all
+# three land here, and `--fresh` would discard hours of paid work a newer build
+# can still continue.
+#
+# THE OUTCOME IS STILL FP_VERSION, deliberately. The fields are equally
+# uncomparable in both directions, and a sixth member of a closed vocabulary
+# that `_refuse_checkpoint` keys a counter on and `run_harness` branches on
+# would be a change every consumer has to learn for a difference that is
+# entirely in the remedy. THE STORAGE LAYER MAKES THE SAME CALL one layer down:
+# `initialize_database` refuses to LOWER a `PRAGMA user_version` it finds ahead
+# of its own and says so, leaving the file alone.
+_newer = dict(_now)
+_newer["fingerprint_version"] = _fp.FINGERPRINT_VERSION + 1
+_nw_outcome, _nw_detail = _fp.compare(_newer, _now)
+check("A STAMP FROM A NEWER BUILD IS FP_VERSION, exactly as an older one is: "
+      "the fields cannot be compared in either direction",
+      _nw_outcome, _fp.FP_VERSION)
+check_true("...and the detail says NEWER, in as many words, so the direction "
+           "is in the first line an operator reads",
+           "NEWER" in _nw_detail)
+check_true("...and names the remedy as checking out the version that wrote it",
+           "Check out the version that wrote it" in _nw_detail)
+check_true("...and says NOT to discard the artifact, which is what every "
+           "caller's own remediation below it would do",
+           "do NOT discard" in _nw_detail
+           or "DO NOT" in _nw_detail.upper())
+check_true("...and states that nothing is wrong with the artifact -- the "
+           "storage layer's own sentence for the same situation",
+           "NOTHING IS WRONG WITH THE ARTIFACT" in _nw_detail)
+# THE OTHER DIRECTION, ON THE SAME PROBE, so this is a measurement rather than
+# a statement about one string: an OLDER stamp must NOT get any of it.
+check_true("an OLDER stamp gets none of that: it says neither NEWER nor "
+           "'check out'",
+           not any(s in _v1_detail for s in ("NEWER", "Check out")))
+check_true("...and the older direction still tells the operator that clearing "
+           "once is the whole remediation",
+           any("first contact" in line for line in
+               _fp.refusal_lines(_v1_outcome, _v1_detail, "an artifact",
+                                 ["clear it"], recorded=_v1)))
+
+# THE REFUSAL WARNS ABOVE THE CALLER'S OWN REMEDIATION, which is the half the
+# detail cannot do: those lines are the caller's -- "--fresh",
+# "--fresh-start", "point --output-dir elsewhere" -- and `refusal_lines`
+# appends them. Passing the stored stamp is what lets the warning be printed
+# first.
+_nw_lines = _fp.refusal_lines(_nw_outcome, _nw_detail, "the checkpoint",
+                              ["    python \"25- Batch Runner.py\" --fresh"],
+                              recorded=_newer)
+check_true("the refusal tells the operator NOT to run the commands below it",
+           any("DO NOT RUN THE COMMANDS BELOW" in line for line in _nw_lines))
+def _line_index(lines, needle):
+    """Where `needle` first appears, or None. NEVER RAISES.
+
+    A bare `[...][0]` raises IndexError EXACTLY when the warning is missing --
+    which is the defect the check exists to catch -- so the file would print one
+    traceback where it owes a named failure. Measured: reverting the branch in a
+    copy aborted this file until this existed.
+    """
+    for index, line in enumerate(lines):
+        if needle in line:
+            return index
+    return None
+
+
+_I_WARN = _line_index(_nw_lines, "DO NOT RUN THE COMMANDS BELOW")
+_I_REM = _line_index(_nw_lines, "--fresh")
+check("...and that warning is printed ABOVE them, not after",
+      (None not in (_I_WARN, _I_REM)) and _I_WARN < _I_REM,
+      True)
+check_true("...and the 'clearing once is the whole remediation' clause is NOT "
+           "printed for a newer stamp, because it is false of one",
+           not any("first contact" in line for line in _nw_lines))
+check_true("...and WITHOUT the stored stamp the older-direction clause is used "
+           "-- the pre-existing behaviour, kept as the default so no caller "
+           "that does not know the direction is broken",
+           any("first contact" in line for line in
+               _fp.refusal_lines(_nw_outcome, _nw_detail, "the checkpoint",
+                                 ["x"])))
+
+# THE COMPARISON IS GUARDED, because the version comes out of a JSON file a
+# corrupt write or another tool may have produced. `"4" > 3` is a TypeError
+# raised out of the one function whose job is to decide whether a refusal is
+# safe.
+check("a non-integer version is NOT read as newer; it falls through to the "
+      "ordinary mismatch, which is true of any unreadable value",
+      [_fp.recorded_version_is_newer(dict(_now, fingerprint_version=v))
+       for v in ("4", [4], 4.5, None, True, _fp.FINGERPRINT_VERSION,
+                 _fp.FINGERPRINT_VERSION - 1, _fp.FINGERPRINT_VERSION + 1)],
+      [False, False, False, False, False, False, False, True])
+check("...and compare() answers FP_VERSION without RAISING for every one of "
+      "them, which is the property the guard exists for: an unreadable version "
+      "must not turn a refusal into a TypeError out of the function deciding "
+      "whether the refusal is safe",
+      sorted({drive(lambda v=v: _fp.compare(
+                  dict(_now, fingerprint_version=v), _now)[0])
+              for v in ("4", [4], 4.5, True, 99)}),
+      [_fp.FP_VERSION])
+check("a non-dict `recorded` is not newer either -- refusal_lines is called "
+      "with whatever the caller had, including None",
+      [_fp.recorded_version_is_newer(x)
+       for x in (None, "", [], 3, {"fingerprint_version": 3})],
+      [False, False, False, False, False])
+
+
 # --- (f2) A STAMP SHORT OF A GATED FIELD IS NOT A STAMP THAT AGREES -------
 # Found by the revert harness rather than by reading, and it is a property of
 # is_resolved() rather than of the digest -- the digest is only what surfaced

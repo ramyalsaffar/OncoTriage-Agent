@@ -60,11 +60,35 @@ patient before finalizing the run FINISHED. They re-raise now. This file's job
 is only to turn the resulting KeyboardInterrupt into exit 130 without a
 traceback -- the SIGINT half of what the SIGTERM handler already does.
 
+ONE RUN AT A TIME, PER CHECKPOINT DIRECTORY (the pre-migration pass). The
+guard below takes an exclusive `flock` keyed on the checkpoint directory and
+holds it for the process's life; a second invocation against the same directory
+exits 3 naming the holder's pid, host, user and start time, having touched
+nothing. Two concurrent runs both read the same resume state at start and both
+paid for the SAME patients -- measured, and silent. See THE RUN LOCK in
+oncotriage/batch/runner.py.
+
+THE SENTINEL PREFLIGHT RUNS ABOVE --fresh (the pre-migration pass). It used to
+live only inside main(), which is called after --fresh has already deleted the
+checkpoint -- so `--fresh` with a stale sentinel present deleted the resume
+state and THEN refused, printing "NOTHING HAS BEEN RUN AND NOTHING HAS BEEN
+BILLED" over a cohort the next run would re-bill in full. `--clear-stop`
+satisfies the preflight rather than being blocked by it: it is the resume
+gesture the refusal itself names.
+
 Run from terminal:
     cd ".../03- Code"
     python "25- Batch Runner.py"
     python "25- Batch Runner.py" --clear-stop      # resume after a STOP
     python "25- Batch Runner.py" --fresh           # discard resume state (COSTS)
+
+Exit codes:
+    0    every inference this run produced is in the database
+    1    rows were lost, or a stale stop sentinel refused the run
+    2    main() never reached the reconciliation
+    3    another batch run holds the lock for this checkpoint directory
+    130  Ctrl-C
+    143  SIGTERM
 """
 
 import os
@@ -94,14 +118,22 @@ except ImportError:
         raise
     del _candidate, _how
 
+from oncotriage.agent.evaluation import request_stage5_shutdown
 from oncotriage.batch.runner import (
+    AlreadyRunning,
+    EXIT_LOCKED,
+    StaleStopSwitch,
+    assert_no_stale_stop_switch,
     clear_checkpoint,
     clear_stop_switch,
     describe_stop_switch_path,
+    exclusive_run_lock,
     main,
     reconciliation_exit_code,
+    run_lock_refusal_lines,
     stop_switch_path,
 )
+from oncotriage.observability import console
 
 
 # ===========================================================================
@@ -329,6 +361,34 @@ if __name__ == "__main__":
         mid-redraw; that is cosmetic, once, at shutdown.
         """
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        # ── ASK STAGE 5 TO STOP ISSUING REQUESTS, BEFORE THE RAISE ────────
+        #
+        # THE RAISE ALONE DOES NOT REACH THE WAVE, and that is measurable
+        # rather than arguable. CPython delivers a signal to the MAIN thread;
+        # in a batch run the Stage 5 node executes on a WORKER thread of the
+        # pool. So the SystemExit lands in `future.result()` here, the pool's
+        # `finally` cancels QUEUED PATIENTS, and every patient already in
+        # flight then finishes its WHOLE per-trial wave -- ceil(N / parallel)
+        # rounds of live billed requests, each bounded only by
+        # MATCHING_REQUEST_TIMEOUT_SECONDS and the SDK's own retries -- while
+        # `shutdown(wait=True)` blocks. The wave's own `cancel_futures=True` is
+        # correct and, from a real signal in a batch run, unreachable: it is in
+        # the node's `finally`, on the worker thread, which nothing has
+        # interrupted.
+        #
+        # That is minutes, against a `docker stop` grace period whose default
+        # is TEN SECONDS -- so the orchestrator SIGKILLs partway through and
+        # the run leaves NO crash record, NO finalized row and a set of
+        # in-flight requests billed and abandoned mid-read. This one call is
+        # what turns that into "one in-flight round, then exit 143 with the run
+        # recorded KILLED".
+        #
+        # IT IS SIGNAL-SAFE, and that decided its implementation rather than
+        # its placement: `request_stage5_shutdown` assigns two module globals
+        # and takes no lock, for the same reason the `os.write` below is not a
+        # `print`. A `threading.Event` here could deadlock against a lock the
+        # main thread already holds.
+        request_stage5_shutdown(f"SIGTERM (signal {_signum})")
         os.write(2, (f"\n[SIGTERM] Termination requested (signal {_signum}). "
                      f"Cancelling queued patients, finishing those in flight, "
                      f"and recording the run as KILLED. Send it again to give "
@@ -374,55 +434,148 @@ if __name__ == "__main__":
              "re-bills nothing.")
     _args = _parser.parse_args()
 
-    if _args.clear_stop:
-        if not clear_stop_switch():
-            print(f"[--clear-stop] No stop sentinel at {stop_switch_path()}; "
-                  f"nothing to clear.")
-
-    if _args.fresh:
-        # Announced before it happens, not after: this is a destructive,
-        # expensive request and the operator should see the file named while
-        # there is still time to interrupt. clear_checkpoint() prints
-        # "[Checkpoint] Cleared." itself, or nothing when there was none.
-        print("[--fresh] Discarding the batch checkpoint. Every patient will "
-              "run again, at one live Stage 5 call each.")
-        clear_checkpoint()
-
-    # Ctrl-C EXITS 130 WITH NO TRACEBACK, AND THAT IS THIS GUARD'S JOB RATHER
-    # THAN main()'s -- --fresh's precedent and the SIGTERM handler's, for the
-    # same reason: a disposition belongs to an entry point, not to a callable an
-    # embedder may have its own shutdown contract for.
+    # ── THE RUN LOCK, BEFORE ANYTHING BELOW IT TOUCHES STATE ────────────────
     #
-    # WHY IT IS NEEDED AT ALL, AND IT IS NEW. Both pool handlers used to SWALLOW
-    # the KeyboardInterrupt -- see the note at run_batch's -- so a Ctrl-C
-    # returned normally, ran the resample pass at one billed call per patient
-    # and exited through sys.exit(reconciliation_exit_code()) below with the run
-    # recorded FINISHED. They re-raise now, so the interrupt travels through
-    # main()'s `except BaseException` (health flushed, both crash blocks
-    # printed, `runs` row KILLED, tracking run FAILED) and then out of main().
-    # Left uncaught it would reach CPython's default handler, which prints a
-    # traceback -- a report of a fault, for a shutdown the operator asked for.
-    # The SIGTERM handler already refuses to do that for the same reason and
-    # this is the SIGINT half of it.
+    # MEASURED, NOT ARGUED: two real invocations of this file launched
+    # concurrently against one checkpoint directory both read the same resume
+    # state at start, both processed the SAME patients at one live Stage 5 call
+    # each, and neither reported anything wrong. The checkpoint is written
+    # atomically, so it is never corrupt -- it just ends up as the LAST
+    # writer's view, and the loser's completions vanish from it, so a third run
+    # re-bills those too.
     #
-    # 128 + SIGINT = 130, the shell convention, and NOT the reconciliation
-    # verdict (0/1/2), which is a statement about database completeness and has
-    # nothing to say about an interrupt. Same argument as SIGTERM's 143.
+    # IT IS FIRST, ABOVE THE SENTINEL PREFLIGHT AND ABOVE BOTH FLAGS, because
+    # everything below it either mutates state (--fresh deletes the checkpoint,
+    # --clear-stop deletes the sentinel) or reads state another run is writing.
+    # A refusal here has therefore touched nothing.
     #
-    # THE RECORD IS ALREADY WRITTEN BY THE TIME THIS RUNS. main()'s crash
-    # handler completed before the exception reached here, so nothing is lost by
-    # not re-raising: the row, the health flush and both console blocks are on
-    # disk and on the terminal.
-    _EXIT_SIGINT = 128 + int(signal.SIGINT)
+    # The mechanism, the key, and why it is not a pid file are argued at
+    # oncotriage/batch/runner.py's THE RUN LOCK section. The lock is released
+    # by the kernel when this process exits, however it exits.
     try:
-        main()
-    except KeyboardInterrupt:
-        print(f"\n[INTERRUPTED] Stopped by Ctrl-C. The run was recorded "
-              f"KILLED and the checkpoint is intact -- run again to resume. "
-              f"For a stop that records itself as STOPPED and needs no "
-              f"terminal, use: touch {describe_stop_switch_path()}")
-        sys.exit(_EXIT_SIGINT)
-    sys.exit(reconciliation_exit_code())
+        with exclusive_run_lock() as _lock_file:
+            console.out(f"[Lock] Held for this run: {_lock_file}")
+
+            # ── THE STALE-SENTINEL PREFLIGHT, ABOVE THE DESTRUCTIVE FLAG ────
+            #
+            # THIS RUNS BEFORE --fresh IS PROCESSED, AND THAT ORDERING IS THE
+            # WHOLE OF THIS BLOCK. main() has always carried this same refusal
+            # as its step 0 -- and step 0 is inside main(), which is called
+            # AFTER --fresh has already deleted the checkpoint. So an operator
+            # who typed `--fresh` while a sentinel was still there got: the
+            # checkpoint DELETED, then a refusal whose own final line reads
+            # "NOTHING HAS BEEN RUN AND NOTHING HAS BEEN BILLED" -- true of the
+            # billing and false of the resume state, which was gone. The next
+            # invocation then re-ran the entire cohort. Driven, before it was
+            # fixed: checkpoint present, `--fresh` typed, refusal printed,
+            # checkpoint file absent.
+            #
+            # `--clear-stop` SATISFIES IT RATHER THAN BEING BLOCKED BY IT, and
+            # that is not an exception to the rule but the rule's other half.
+            # The refusal's own remediation names that flag, in as many words
+            # ("or, in one command: python \"25- Batch Runner.py\"
+            # --clear-stop"), and CLAUDE.md documents it as THE resume gesture
+            # after a stop. A preflight that refused the command it tells the
+            # operator to run would be a loop with no exit. The asymmetry is
+            # exactly the destructive/non-destructive line: --clear-stop
+            # deletes a CONTROL FILE and re-bills nothing, --fresh deletes the
+            # RESUME STATE and re-bills the cohort, and only the second may not
+            # happen before the run has decided it is allowed to start.
+            #
+            # main()'s own step 0 IS KEPT AND IS NOT REDUNDANT: main() is
+            # directly callable by an embedder that never sees this guard, and
+            # the check is one stat call. On this path it never fires -- this
+            # block has already exited the process -- so nothing is printed
+            # twice.
+            if not _args.clear_stop:
+                try:
+                    assert_no_stale_stop_switch()
+                except StaleStopSwitch as _stale:
+                    console.out()
+                    console.out(str(_stale))
+                    sys.exit(1)
+
+            # ── THE TWO FLAGS, ANNOUNCED ON THE CONSOLE CHANNEL ─────────────
+            #
+            # `console.out` AND NOT `print`, and this is a real defect rather
+            # than a style edit. Everything else this run emits -- every
+            # console line and every structured log record -- goes to STDERR
+            # through oncotriage/observability.py, flushed per line. `print`
+            # goes to STDOUT, which Python BLOCK-BUFFERS when it is not a tty.
+            # So in the ordinary captured form, `python "25- Batch Runner.py"
+            # --fresh > run.log 2>&1`, these two lines sat in a buffer while
+            # hours of stderr went past them and surfaced at interpreter exit
+            # -- putting "[--fresh] Discarding the batch checkpoint" at the
+            # BOTTOM of the log, after the summary. That is the same buffering
+            # trap the SIGTERM handler above documents having MEASURED, which
+            # is why it uses a raw os.write.
+            if _args.clear_stop:
+                if not clear_stop_switch():
+                    console.out(f"[--clear-stop] No stop sentinel at "
+                                f"{stop_switch_path()}; nothing to clear.")
+
+            if _args.fresh:
+                # Announced before it happens, not after: this is a
+                # destructive, expensive request and the operator should see
+                # the file named while there is still time to interrupt.
+                # clear_checkpoint() prints "[Checkpoint] Cleared." itself, or
+                # nothing when there was none.
+                console.out("[--fresh] Discarding the batch checkpoint. Every "
+                            "patient will run again, at one live Stage 5 call "
+                            "each.")
+                clear_checkpoint()
+
+            # Ctrl-C EXITS 130 WITH NO TRACEBACK, AND THAT IS THIS GUARD'S JOB RATHER
+            # THAN main()'s -- --fresh's precedent and the SIGTERM handler's, for the
+            # same reason: a disposition belongs to an entry point, not to a callable an
+            # embedder may have its own shutdown contract for.
+            #
+            # WHY IT IS NEEDED AT ALL, AND IT IS NEW. Both pool handlers used to SWALLOW
+            # the KeyboardInterrupt -- see the note at run_batch's -- so a Ctrl-C
+            # returned normally, ran the resample pass at one billed call per patient
+            # and exited through sys.exit(reconciliation_exit_code()) below with the run
+            # recorded FINISHED. They re-raise now, so the interrupt travels through
+            # main()'s `except BaseException` (health flushed, both crash blocks
+            # printed, `runs` row KILLED, tracking run FAILED) and then out of main().
+            # Left uncaught it would reach CPython's default handler, which prints a
+            # traceback -- a report of a fault, for a shutdown the operator asked for.
+            # The SIGTERM handler already refuses to do that for the same reason and
+            # this is the SIGINT half of it.
+            #
+            # 128 + SIGINT = 130, the shell convention, and NOT the reconciliation
+            # verdict (0/1/2), which is a statement about database completeness and has
+            # nothing to say about an interrupt. Same argument as SIGTERM's 143.
+            #
+            # THE RECORD IS ALREADY WRITTEN BY THE TIME THIS RUNS. main()'s crash
+            # handler completed before the exception reached here, so nothing is lost by
+            # not re-raising: the row, the health flush and both console blocks are on
+            # disk and on the terminal.
+            _EXIT_SIGINT = 128 + int(signal.SIGINT)
+            try:
+                main()
+            except KeyboardInterrupt:
+                # `console.out` FOR THE TWO FLAG ANNOUNCEMENTS' REASON, and here
+                # it bites harder: this is the LAST thing an interrupted run says,
+                # and on stdout it would be block-buffered behind hours of stderr
+                # and surface only at interpreter exit -- below the crash blocks it
+                # is meant to conclude.
+                console.out(f"\n[INTERRUPTED] Stopped by Ctrl-C. The run was "
+                            f"recorded KILLED and the checkpoint is intact -- run "
+                            f"again to resume. For a stop that records itself as "
+                            f"STOPPED and needs no terminal, use: "
+                            f"touch {describe_stop_switch_path()}")
+                sys.exit(_EXIT_SIGINT)
+            sys.exit(reconciliation_exit_code())
+
+    except AlreadyRunning as _held:
+        # THE REFUSAL, ON THE SAME CHANNEL EVERYTHING ELSE THIS FILE SAYS GOES
+        # TO. It names the holder's pid, host, user and start time so an
+        # operator can act on it -- kill that process, or wait for it -- rather
+        # than being told only that something is in the way.
+        console.out()
+        for _line in run_lock_refusal_lines(_held):
+            console.out(_line)
+        sys.exit(EXIT_LOCKED)
 
 
 #------------------------------------------------------------------------------

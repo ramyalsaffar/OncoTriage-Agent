@@ -1003,6 +1003,180 @@ WARMUP_FALLBACK_WRITER_FAILURE_KEY_PREFIX = "fallback_writer_failed:"
 WARMUP_SOURCE_WARMUP = "warmup"
 WARMUP_SOURCE_FALLBACK_WRITER = "fallback_writer"
 
+# ...and the third, which is not a failure of either writer at all: an operator
+# asked the RUN to stop while this patient's wave was still being assembled, so
+# no cache writer was ever attempted. It shares the floor's return because the
+# consequence for the patient is identical -- no verdict, not checkpointed,
+# re-run on resume -- and it needs its own member for the same reason the two
+# above need theirs: the floor's sentence must not tell an operator that a
+# warmup failed when nothing was sent.
+WARMUP_SOURCE_SHUTDOWN = "operator_shutdown"
+
+# The closed set, so a reader can branch on it exhaustively and a fourth member
+# added without a floor branch fails a check rather than falling through to the
+# `warmup` wording.
+WARMUP_SOURCES = (WARMUP_SOURCE_WARMUP, WARMUP_SOURCE_FALLBACK_WRITER,
+                  WARMUP_SOURCE_SHUTDOWN)
+
+
+# ---------------------------------------------------------------------------
+# THE STAGE 5 SHUTDOWN FLAG  (the bounded-drain pass)
+# ---------------------------------------------------------------------------
+#
+# WHAT IT IS FOR, MEASURED RATHER THAN ARGUED. In a batch run the Stage 5 node
+# executes on a WORKER thread of `oncotriage/batch/runner.py`'s pool, and
+# CPython delivers a signal only to the MAIN thread. So SIGTERM raises
+# SystemExit where the main thread is -- inside `future.result()` -- and the
+# wave's own `finally`, whose `cancel_futures=True` is what cancels queued
+# requests, IS NEVER REACHED BY A REAL SIGNAL IN A BATCH RUN. It is reachable
+# only when the node itself is the main thread, which is a test or a direct
+# embedder. The dispatch-hardening pass's `cancel_futures=True` is therefore
+# correct and, on the path an operator actually meets, inert.
+#
+# THE COST OF THAT, ARITHMETIC RATHER THAN ADJECTIVES. Without this flag every
+# in-flight patient finishes its WHOLE wave after the operator has asked the
+# run to stop:
+#
+#     rounds per patient = ceil(MAX_TRIALS_FOR_EVALUATION
+#                               / MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS)
+#     worst case drain    = rounds
+#                           x MATCHING_REQUEST_TIMEOUT_SECONDS
+#                           x (1 + OPENAI_SDK_MAX_RETRIES)
+#
+# At the shipped constants that is minutes, against a `docker stop` grace
+# period whose default is TEN SECONDS -- so the orchestrator SIGKILLs partway
+# through, the in-flight requests are billed and abandoned mid-read, no rows
+# are written, no checkpoint entry is made and the `runs` row is left at
+# RUNNING with a NULL finished_at. The flag converts that into "one in-flight
+# round, then a recorded KILLED run and exit 143".
+#
+# A PLAIN MODULE-LEVEL BOOLEAN, NOT A threading.Event, AND THAT IS SIGNAL
+# SAFETY RATHER THAN MINIMALISM. `Event.set()` acquires a lock; a signal
+# handler that acquires a lock the main thread may already hold is how a
+# shutdown path deadlocks, which is the same reason
+# `25- Batch Runner.py`'s SIGTERM handler writes with `os.write` instead of
+# `print`. An assignment to a module global takes no lock, and a read of one is
+# atomic in CPython -- exactly the trade
+# `oncotriage/batch/runner.py:_start_patient_unless_stopped` already makes when
+# it reads `STOP_SWITCH.requested` rather than polling.
+#
+# THE REASON IS ASSIGNED BEFORE THE FLAG, so any reader that observes the flag
+# observes a reason with it. The reverse order has a window in which the wave
+# reports a shutdown with no cause.
+#
+# THE OPERATOR STOP SWITCH DELIBERATELY DOES **NOT** SET THIS, and that is the
+# one place this mechanism refuses to be used. `STOP` promises that patients
+# already in flight RUN TO COMPLETION and are written -- it is the gentle stop,
+# with no deadline attached -- and setting this flag would break that promise
+# AND COST MORE MONEY, not less: an in-flight patient's already-paid round is
+# discarded, the patient fails, it is not checkpointed, and a resume re-bills
+# the whole of it. Only the two gestures that are already abrupt, and already
+# record the run KILLED, set it.
+_SHUTDOWN_REQUESTED = False
+_SHUTDOWN_REASON = None
+
+
+def request_stage5_shutdown(reason: str) -> None:
+    """Ask Stage 5 to stop issuing requests. Idempotent; safe in a handler.
+
+    The FIRST reason wins, so a second SIGTERM arriving during teardown cannot
+    overwrite the diagnosis of the first with its own.
+
+    Called from three places and no others:
+    ``25- Batch Runner.py``'s SIGTERM handler, and
+    ``oncotriage/batch/runner.py``'s two ``except KeyboardInterrupt`` clauses.
+    """
+    global _SHUTDOWN_REQUESTED, _SHUTDOWN_REASON
+    if not _SHUTDOWN_REQUESTED:
+        _SHUTDOWN_REASON = reason
+    _SHUTDOWN_REQUESTED = True
+
+
+def stage5_shutdown_requested() -> bool:
+    """Has a shutdown been asked for? A plain read; never raises."""
+    return _SHUTDOWN_REQUESTED
+
+
+def stage5_shutdown_reason():
+    """The reason recorded with the first request, or None."""
+    return _SHUTDOWN_REASON
+
+
+def clear_stage5_shutdown() -> None:
+    """Forget a shutdown asked of an earlier run in this process.
+
+    ``oncotriage/batch/runner.py:main()`` calls this beside
+    ``clear_write_ledger()``, ``run_fingerprint.clear_cache()`` and
+    ``STOP_SWITCH.reset()`` -- the fourth piece of per-run module state, for
+    the reason the other three record: state that survives into the next run
+    describes the wrong run, and here it would make every patient of that run
+    fail without a request being sent.
+    """
+    global _SHUTDOWN_REQUESTED, _SHUTDOWN_REASON
+    _SHUTDOWN_REQUESTED = False
+    _SHUTDOWN_REASON = None
+
+
+class Stage5ShutdownRequested(RuntimeError):
+    """A Stage 5 request was NOT issued because a shutdown was requested.
+
+    A ``RuntimeError`` subclass and deliberately NOT a ``ValueError``, on the
+    footing ``UnknownModelPricingError``, ``PerTrialParallelismError`` and
+    ``PackingBlockMismatchError`` already argue here: a stray ``except
+    ValueError`` around a Stage 5 call must not be able to eat it.
+
+    IT IS NOT ISOLATED TO ITS TRIAL, unlike every other exception the send loop
+    meets in per-trial mode, and that is the whole of its handling. A transport
+    failure is a statement about ONE request, so recording that trial as not
+    evaluable and completing the patient is right. A shutdown is a statement
+    about the RUN: the remaining trials were not judged badly, they were not
+    judged at all. Isolating it would produce a patient recorded SUCCESS with a
+    handful of verdicts and the rest marked not evaluable -- and
+    ``_on_done`` checkpoints a success, so a resume would SKIP that patient
+    forever. The whole cohort would then carry a silent hole shaped like
+    whenever somebody pressed Ctrl-C.
+    """
+
+
+STAGE5_SHUTDOWN_SKIPS = Counter()
+"""Stage 5 requests NOT issued because a shutdown was requested.
+
+Keyed ``{phase}:{reason}`` -- ``warmup:`` when the gate fired before the cache
+writer, so the patient sent NOTHING; ``wave:`` for each queued trial request a
+worker declined to send.
+
+MONEY NOT SPENT, RECORDED ANYWAY. Every other counter in the degradation
+registry names something that went wrong; this names something that went right,
+and it is here rather than in the census because it is the CAUSE of the error
+rows a stopped run leaves behind. An operator reading "12 patients errored" on a
+run they killed needs "and 47 Stage 5 requests were never sent" beside it, or
+the errors read as a fault.
+
+MODULE-LEVEL, NOT A KEY IN THE STAGE 5 RESULT, on ``PER_TRIAL_CALL_FAILURES``'
+footing: the twelve characterization fixtures diff that dict field by field, so
+a new key there costs a re-capture at live model prices.
+
+INCREMENTED FROM WORKER THREADS, which the two counters above are careful not
+to be. ``Counter[k] += 1`` is a load-add-store and two workers can lose one of
+each other's increments, so this total is a FLOOR under contention -- and that
+is acceptable here precisely because it is a count of things that did NOT
+happen: a floor understates how much was saved, and no decision is made on it.
+The alternative, a lock on the one path whose job is to return instantly, would
+be worse.
+"""
+
+# The two phases, written once here rather than at the increments so the reader
+# of the counter and the writers of it cannot drift -- WARMUP_FAILURE_KEY_PREFIX's
+# arrangement, one mechanism over.
+#
+# THEY ARE NOT INTERCHANGEABLE. `warmup:` means the gate fired BEFORE the cache
+# writer, so that patient sent NOTHING and cost nothing; `wave:` means requests
+# were already in the air and only the queued ones were declined. An operator
+# reading a stopped run's report tells "we stopped before this patient" from
+# "we stopped in the middle of this patient" by which prefix is there.
+SHUTDOWN_SKIP_WARMUP_KEY_PREFIX = "warmup:"
+SHUTDOWN_SKIP_WAVE_KEY_PREFIX = "wave:"
+
 
 class PerTrialParallelismError(RuntimeError):
     """``MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS`` is not a usable bound.
@@ -4024,7 +4198,28 @@ CLINICAL TRIALS:
         _dispatch_order = [c for c, _ in _dispatch_pairs]
 
         def _issue(chunk_, prompt_, cache_key_):
-            """One request, as an OUTCOME. Runs on a worker thread."""
+            """One request, as an OUTCOME. Runs on a worker thread.
+
+            THE SHUTDOWN CHECK IS THE FIRST STATEMENT AND IT IS WHAT BOUNDS
+            THE DRAIN. Every request of this patient's wave is SUBMITTED
+            before any of them is read, so a queued task that starts after an
+            operator asked the run to stop would otherwise be a full-price
+            request nobody will look at. Checking here rather than at submit
+            time is what makes the bound "one in-flight round": the tasks
+            already running cannot be interrupted, and every task that has not
+            yet begun returns immediately.
+
+            READ AS A MODULE GLOBAL, not through the accessor, and not
+            captured into a local: the value is set on another thread (or in a
+            signal handler) while these workers are already running, so it has
+            to be read at the moment the work would start.
+            """
+            if _SHUTDOWN_REQUESTED:
+                STAGE5_SHUTDOWN_SKIPS[
+                    f"{SHUTDOWN_SKIP_WAVE_KEY_PREFIX}"
+                    f"{_SHUTDOWN_REASON or 'unspecified'}"] += 1
+                return ("error", Stage5ShutdownRequested(
+                    f"the request was not issued: {_SHUTDOWN_REASON}"))
             try:
                 return ("ok", call_matching_model(
                     system_prompt, prompt_, prompt_cache_key=cache_key_))
@@ -4221,62 +4416,107 @@ CLINICAL TRIALS:
             # is taken deliberately, with a named counter, rather than
             # silently.
             _hold_first = False
-            try:
-                _warmup_response = call_matching_model_warmup(
-                    system_prompt, prompt_cache_key=_cache_key)
-            except Exception as _wu_exc:          # noqa: BLE001 -- classified
-                _rejection = classify_warmup_rejection(_wu_exc)
-                if _rejection is None:
-                    # A TRANSPORT FAILURE. `pending` is emptied so the send
-                    # loop cannot issue a single trial call -- `_obtain`'s
-                    # live-call path is a real path and would otherwise send
-                    # every one of them uncached, which is the exact leak this
-                    # design removes. The floor below turns the empty run into
-                    # the API-error result.
-                    PER_TRIAL_WARMUP_DEGRADATIONS[
-                        f"{WARMUP_FAILURE_KEY_PREFIX}"
-                        f"{type(_wu_exc).__name__}"] += 1
-                    _warmup_error = _wu_exc
-                    pending.clear()
-                    log.error(
-                        "the Stage 5 per-trial cache warmup failed; no trial "
-                        "call was issued and the patient is failed so the "
-                        "retry budget and the checkpoint see it, rather than "
-                        "sending every trial against a cold cache", stage=5,
-                        status="error", event="per_trial_warmup_failed",
-                        retry=retry_count + 1,
-                        error_type=type(_wu_exc).__name__,
-                        error_message=str(_wu_exc), count=len(_dispatch_pairs),
-                        degraded=True)
-                else:
-                    PER_TRIAL_WARMUP_DEGRADATIONS[_rejection] += 1
-                    _hold_first = True
-                    if _rejection == WARMUP_REJECTED_CACHE_KEY:
-                        # DROPPED FOR THE WAVE TOO. The provider refused this
-                        # parameter, so carrying it into the fallback's calls
-                        # would refuse every one of them and turn a recoverable
-                        # configuration finding into a failed patient.
-                        _cache_key = None
-                    log.warning(
-                        "the provider refused the Stage 5 per-trial cache "
-                        "warmup's request shape; falling back to the "
-                        "one-then-rest schedule for this patient, which holds "
-                        "the first trial call back as the cache writer",
-                        stage=5, event="per_trial_warmup_rejected",
-                        reason=_rejection, retry=retry_count + 1,
-                        error_type=type(_wu_exc).__name__,
-                        error_message=str(_wu_exc), degraded=True)
+            # ── THE SHUTDOWN GATE, ABOVE THE CACHE WRITER ─────────────────
+            #
+            # THE BIGGEST SINGLE SAVING IN THE MECHANISM, and it is the one a
+            # per-call check inside `_issue` cannot make: a patient whose node
+            # is entered AFTER an operator asked the run to stop sends ZERO
+            # requests -- not the warmup, and therefore not the wave either.
+            # Without it every such patient pays for one warmup to establish a
+            # prefix no trial request will ever use, once per retry.
+            #
+            # IT REUSES `_warmup_error` RATHER THAN INVENTING A SECOND SHAPE,
+            # exactly as the fallback writer's failure does and for the reason
+            # written there: the zero-success floor below already turns this
+            # state into the API-error result, which is the shape the retry
+            # router, MAX_LLM_CLASSIFIER_RETRIES and the batch checkpoint all
+            # already handle. What differs is only the sentence an operator
+            # reads, and that is what `_warmup_error_source` carries.
+            #
+            # THE RETRY BUDGET IS SPENT, CHEAPLY AND DELIBERATELY. The router
+            # re-enters this node up to MAX_LLM_CLASSIFIER_RETRIES times; each
+            # re-entry meets this same gate, issues nothing and returns. Three
+            # free passes and then the error handler is the right shape -- a
+            # shutdown that bypassed the router would be a second terminal path
+            # for every consumer to learn, for no gain.
+            #
+            # `pending` IS CLEARED for the reason the transport-failure arm
+            # clears it: `_obtain`'s live-call path is real, and a send loop
+            # left with chunks would send every one of them uncached.
+            if _SHUTDOWN_REQUESTED:
+                STAGE5_SHUTDOWN_SKIPS[
+                    f"{SHUTDOWN_SKIP_WARMUP_KEY_PREFIX}"
+                    f"{_SHUTDOWN_REASON or 'unspecified'}"] += 1
+                _warmup_error = Stage5ShutdownRequested(
+                    f"no Stage 5 request was issued for this patient: "
+                    f"{_SHUTDOWN_REASON}")
+                _warmup_error_source = WARMUP_SOURCE_SHUTDOWN
+                pending.clear()
+                log.warning(
+                    "a shutdown was requested before this patient's Stage 5 "
+                    "wave was dispatched, so no request was issued at all; "
+                    "the patient is failed deliberately so the checkpoint "
+                    "does not record it as done", stage=5, status="error",
+                    event="per_trial_shutdown_before_warmup",
+                    retry=retry_count + 1, count=len(_dispatch_pairs),
+                    reason=_SHUTDOWN_REASON, degraded=True)
             else:
-                # ACCOUNTED BEFORE ANY TRIAL CALL IS ISSUED, which is what
-                # makes `_account_unconsumed()` below provably unaffected by
-                # the warmup: it folds what is left in `_prefetched`, and the
-                # warmup never enters it.
-                _account_warmup(_warmup_response)
-                log.info("Stage 5 warmed the shared prefix before dispatching "
-                         "the per-trial wave", stage=5,
-                         event="per_trial_warmup",
-                         count=len(_dispatch_pairs),
-                         parallel=min(_parallel_bound, len(_dispatch_pairs)))
+                try:
+                    _warmup_response = call_matching_model_warmup(
+                        system_prompt, prompt_cache_key=_cache_key)
+                except Exception as _wu_exc:          # noqa: BLE001 -- classified
+                    _rejection = classify_warmup_rejection(_wu_exc)
+                    if _rejection is None:
+                        # A TRANSPORT FAILURE. `pending` is emptied so the send
+                        # loop cannot issue a single trial call -- `_obtain`'s
+                        # live-call path is a real path and would otherwise send
+                        # every one of them uncached, which is the exact leak this
+                        # design removes. The floor below turns the empty run into
+                        # the API-error result.
+                        PER_TRIAL_WARMUP_DEGRADATIONS[
+                            f"{WARMUP_FAILURE_KEY_PREFIX}"
+                            f"{type(_wu_exc).__name__}"] += 1
+                        _warmup_error = _wu_exc
+                        pending.clear()
+                        log.error(
+                            "the Stage 5 per-trial cache warmup failed; no trial "
+                            "call was issued and the patient is failed so the "
+                            "retry budget and the checkpoint see it, rather than "
+                            "sending every trial against a cold cache", stage=5,
+                            status="error", event="per_trial_warmup_failed",
+                            retry=retry_count + 1,
+                            error_type=type(_wu_exc).__name__,
+                            error_message=str(_wu_exc), count=len(_dispatch_pairs),
+                            degraded=True)
+                    else:
+                        PER_TRIAL_WARMUP_DEGRADATIONS[_rejection] += 1
+                        _hold_first = True
+                        if _rejection == WARMUP_REJECTED_CACHE_KEY:
+                            # DROPPED FOR THE WAVE TOO. The provider refused this
+                            # parameter, so carrying it into the fallback's calls
+                            # would refuse every one of them and turn a recoverable
+                            # configuration finding into a failed patient.
+                            _cache_key = None
+                        log.warning(
+                            "the provider refused the Stage 5 per-trial cache "
+                            "warmup's request shape; falling back to the "
+                            "one-then-rest schedule for this patient, which holds "
+                            "the first trial call back as the cache writer",
+                            stage=5, event="per_trial_warmup_rejected",
+                            reason=_rejection, retry=retry_count + 1,
+                            error_type=type(_wu_exc).__name__,
+                            error_message=str(_wu_exc), degraded=True)
+                else:
+                    # ACCOUNTED BEFORE ANY TRIAL CALL IS ISSUED, which is what
+                    # makes `_account_unconsumed()` below provably unaffected by
+                    # the warmup: it folds what is left in `_prefetched`, and the
+                    # warmup never enters it.
+                    _account_warmup(_warmup_response)
+                    log.info("Stage 5 warmed the shared prefix before dispatching "
+                             "the per-trial wave", stage=5,
+                             event="per_trial_warmup",
+                             count=len(_dispatch_pairs),
+                             parallel=min(_parallel_bound, len(_dispatch_pairs)))
 
             if _warmup_error is None:
                 if _hold_first:
@@ -4358,12 +4598,31 @@ CLINICAL TRIALS:
                     # AN EXPLICIT SHUTDOWN, NOT A `with`. `ThreadPoolExecutor`
                     # as a context manager calls `shutdown(wait=True)` with
                     # `cancel_futures` defaulting to FALSE -- so an exception
-                    # out of the result loop, KeyboardInterrupt included, let
-                    # every QUEUED call run to completion before the exception
-                    # surfaced. An operator pressing Ctrl-C mid-wave got minutes
-                    # of continued billing that read as a hang: the process is
-                    # not stopping, and the reason is that it is still buying
-                    # responses nobody will ever read.
+                    # out of the result loop lets every QUEUED call run to
+                    # completion before the exception surfaces.
+                    #
+                    # WHOSE EXCEPTION, AND THE ORIGINAL NOTE WAS WRONG ABOUT
+                    # IT. It said "KeyboardInterrupt included" and named "an
+                    # operator pressing Ctrl-C mid-wave" as the case this
+                    # closes. IT IS NOT REACHABLE FROM A REAL SIGNAL IN A BATCH
+                    # RUN, and that is a fact about CPython rather than about
+                    # this code: signals are delivered to the MAIN thread, and
+                    # in a batch run this node executes on a WORKER thread of
+                    # `oncotriage/batch/runner.py`'s pool. A real Ctrl-C or
+                    # SIGTERM therefore raises where the MAIN thread is --
+                    # inside `future.result()` -- and this `finally` is on a
+                    # thread nothing has interrupted. It runs when the node
+                    # itself is the main thread (a test, a direct embedder) or
+                    # when something inside the loop raises.
+                    #
+                    # SO THIS IS CORRECT AND IT IS NOT THE OPERATOR-INTERRUPT
+                    # FIX. That is the module-level shutdown flag `_issue`
+                    # consults -- set by the SIGTERM handler and by both pool
+                    # handlers -- which bounds the drain at one in-flight round
+                    # from a thread the signal CAN reach. MEASURED, both arms,
+                    # against the real entry point under a real SIGTERM with
+                    # twelve waves in flight: with the flag, 0 further requests
+                    # were issued; with `_issue`'s check removed, 156.
                     #
                     # WHAT THE LIMIT IS, STATED RATHER THAN IMPLIED: an HTTP
                     # request already in flight is NOT interruptible. Python
@@ -4385,7 +4644,10 @@ CLINICAL TRIALS:
                     # folds what is in there. Nothing is being suppressed on this
                     # path: the exception that reached the `finally` is re-raised
                     # unchanged and leaves the node, which is what an interrupt
-                    # is for.
+                    # is for. A call the SHUTDOWN FLAG declined is different in
+                    # one respect and one only: it IS filed, as an error
+                    # outcome, because the send loop has to meet it in order to
+                    # fail the patient rather than complete it with a hole.
                     _ex = ThreadPoolExecutor(max_workers=_bound,
                                              thread_name_prefix="stage5")
                     try:
@@ -4487,6 +4749,16 @@ CLINICAL TRIALS:
         for _key in sorted(_prefetched):
             _status, _payload, _depth = _prefetched.pop(_key)
             if _status == "error":
+                # A SHUTDOWN SKIP WAS NEVER ISSUED, SO IT IS NOT ABANDONED.
+                # `abandoned:` means "paid for and not read", which is what
+                # makes it worth a counter at all; a request a worker declined
+                # to send is neither paid for nor read, and it is already
+                # counted -- once, at the moment it was declined -- in
+                # STAGE5_SHUTDOWN_SKIPS. Counting it here too would report one
+                # non-event as two findings and inflate a transport-failure
+                # counter with the consequences of an operator pressing Ctrl-C.
+                if isinstance(_payload, Stage5ShutdownRequested):
+                    continue
                 PER_TRIAL_CALL_FAILURES[
                     f"abandoned:{type(_payload).__name__}"] += 1
                 abandoned_errors += 1
@@ -4599,7 +4871,19 @@ CLINICAL TRIALS:
             # than hidden: one malformed answer re-bills the whole patient's
             # N calls. A per-trial parse budget is a separate mechanism with
             # its own argument and is deliberately not invented here.
-            if _per_trial_calls:
+            #
+            # ── EXCEPT A SHUTDOWN, WHICH IS ABOUT THE RUN AND NOT THE TRIAL ─
+            #
+            # `Stage5ShutdownRequested` is the one exception this branch must
+            # NOT isolate, and the reason is the checkpoint. Isolating it
+            # records the un-issued trials as not evaluable and lets the
+            # patient COMPLETE -- and `_on_done` checkpoints a completed
+            # patient, so a resume would skip it forever with two thirds of
+            # its trials never judged. Falling through to the API-error return
+            # below fails the patient instead, which is what the batch
+            # checkpoint, the retry router and `runs.status` already know how
+            # to handle. See the exception's own docstring.
+            if _per_trial_calls and not isinstance(e, Stage5ShutdownRequested):
                 PER_TRIAL_CALL_FAILURES[type(e).__name__] += 1
                 per_trial_failed_calls += 1
                 per_trial_last_error = e
@@ -4616,6 +4900,28 @@ CLINICAL TRIALS:
                     for t in chunk
                 )
                 continue
+            # WHAT IS LEFT IN `_prefetched` IS FOLDED BEFORE THIS RETURN, and
+            # this line is new with the shutdown fall-through above. Until it
+            # existed this return was GROUPED-ONLY -- per-trial mode always
+            # `continue`d -- so `_prefetched` was None here and there was
+            # nothing to account.
+            #
+            # WHAT IT ACTUALLY FOLDS TODAY, MEASURED RATHER THAN CLAIMED: only
+            # skips, which carry no usage object and contribute no tokens. Pop
+            # order IS dispatch order in this mode (`pending` is a LIFO seeded
+            # reversed, and a singleton chunk cannot split), and a shutdown
+            # declines a SUFFIX of the dispatch order -- so every PAID response
+            # has already been popped and counted by the loop before the first
+            # declined one is reached. The fold is not therefore decoration:
+            # `_account_unconsumed` is what decides those entries contribute
+            # nothing, and without the call they would simply be dropped -- the
+            # same outcome by accident rather than by decision, and one that
+            # stops being the same outcome the moment anything reorders the
+            # queue. `tests/test_agent_stage5_per_trial_calls.py` control c32
+            # is what proves the call is reached at all.
+            #
+            # It is a no-op in grouped mode, where `_prefetched` is None.
+            _account_unconsumed()
             elapsed = time.time() - start
             error_msg = f"GPT-4o API error (attempt {retry_count + 1}): {str(e)}"
             log.error("Stage 5 API call failed", stage=5, status="error",
@@ -5310,7 +5616,14 @@ CLINICAL TRIALS:
             # stopped -- none for the dedicated warmup, one for the fallback's
             # held-back trial call -- and that is a fact an operator reading a
             # failed row acts on, so it is not rounded off into a shared phrase.
-            if _warmup_error_source == WARMUP_SOURCE_FALLBACK_WRITER:
+            if _warmup_error_source == WARMUP_SOURCE_SHUTDOWN:
+                # NOT A FAILURE OF ANYTHING, and the sentence says so. Reading
+                # "the shared prefix could not be warmed" on a row an operator
+                # produced by pressing Ctrl-C sends them looking for an
+                # endpoint fault that never happened.
+                _what = ("a shutdown was requested before this patient's wave "
+                         "was dispatched, so no request was issued at all")
+            elif _warmup_error_source == WARMUP_SOURCE_FALLBACK_WRITER:
                 _what = ("the provider refused the dedicated warmup's shape "
                          "and the fallback's cache writer then failed, so the "
                          "rest of the wave was not issued")

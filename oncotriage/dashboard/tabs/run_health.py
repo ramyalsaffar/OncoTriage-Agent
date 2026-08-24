@@ -267,7 +267,14 @@ def _build_campaign_table(campaigns):
             "run ids": as_text(row.run_ids, "—"),
             "statuses": as_text(row.statuses, "—"),
             "mixed status": "yes" if as_int(row.mixed_status) == 1 else "no",
+            # PATIENTS AND ROWS, BOTH, and the second is not redundant: every
+            # money column to the right is summed over the ROWS, so a reader
+            # dividing `cost $` by `patients` gets a per-patient figure that is
+            # too high by exactly the resample pass. They are equal on a
+            # campaign with no repeats, which is what makes their difference
+            # legible rather than noise.
             "patients": as_int(row.total_patients),
+            "rows": as_int(row.inference_rows),
             "first started": as_text(row.first_started_at, "—"),
             "last finished": as_text(row.last_finished_at, "—"),
             "open fragments": as_int(row.unfinalized_runs),

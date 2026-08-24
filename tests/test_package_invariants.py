@@ -4247,6 +4247,13 @@ _DECORATOR_INVENTORY = {
     # that silently damaged two nested docstrings in the run-identity pass.
     "oncotriage/retrieval/indexer.py::cleanup_failures_reported":
         ["contextlib.contextmanager"],
+    # The pre-migration pass's run lock. A context manager for the reason
+    # tests/run_serial_tests.py's is one, and this entry is what makes its LOSS
+    # visible: strip the decorator and `with exclusive_run_lock():` raises
+    # AttributeError on a generator, at the top of a batch run -- loudly, but
+    # only when somebody runs one. Here it fails in bucket A.
+    "oncotriage/batch/runner.py::exclusive_run_lock":
+        ["contextlib.contextmanager"],
     "oncotriage/retrieval/indexer.py::get_embeddings_batch._call": [
         "retry(reraise=True, stop=stop_after_attempt(5), "
         "wait=wait_exponential(multiplier=1, min=2, max=60), "

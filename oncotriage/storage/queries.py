@@ -2238,9 +2238,14 @@ QUERIES = (
             "makes 'this total covers three processes' a visible fact rather",
             "than an invisible one.",
             "",
-            "total_patients is summed across the fragments, so it is the",
-            "campaign's real cohort size. run_summary's per-run count is a",
-            "fragment of it whenever `resumed` is 1.",
+            "total_patients is DISTINCT patients across the whole campaign;",
+            "inference_rows is the rows they produced. THEY DIFFER ON EVERY",
+            "REAL CAMPAIGN: the resample pass writes a SECOND row for each of",
+            "RESAMPLE_COUNT already-processed patients, and a patient whose",
+            "attempt errored is re-run by the resume, so it has a row in two",
+            "fragments. Costs and counts elsewhere in this row are summed over",
+            "the ROWS. run_summary's per-run `patients` is also a row count and",
+            "is a fragment of inference_rows whenever `resumed` is 1.",
             "",
             "last_finished_at IS THE END OF THE SPAN, NOT NECESSARILY THE END",
             "OF THE CAMPAIGN: unfinalized_runs > 0 means at least one fragment",
@@ -2281,15 +2286,45 @@ WITH RECURSIVE
     -- Pre-aggregated per RUN before it is joined, for the reason
     -- _RUN_HEALTH_PATIENTS_SQL records: a run with 20 patients joined
     -- unaggregated multiplies every other child of the same row.
+    --
+    -- `n_rows` IS ROWS AND IT IS NOT THE COHORT SIZE. It was called
+    -- `n_patients` and summed into a column called `total_patients`, which was
+    -- wrong on every campaign this runner has ever produced: the RESAMPLE pass
+    -- re-runs a seeded subset of already-processed patients (RESAMPLE_COUNT is
+    -- 100) and each re-run writes ANOTHER inference row. So a 1,000-patient
+    -- campaign reported 1,100 patients, and a reviewer reading "total_patients
+    -- is the campaign's real cohort size" divided by a number 10% too large.
+    -- The rows are still worth reporting -- they are what every cost and count
+    -- in this table is summed over -- so they keep a column of their own under
+    -- an honest name.
     patients AS (
         SELECT i.run_id AS patient_run_id,
-               COUNT(*) AS n_patients,
+               COUNT(*) AS n_rows,
                SUM(COALESCE(i.estimated_cost_usd, 0)) AS cost,
                SUM(CASE WHEN i.estimated_cost_usd IS NULL
                         THEN 1 ELSE 0 END) AS unpriced
           FROM inferences i
          WHERE i.run_id IS NOT NULL
          GROUP BY i.run_id
+    ),
+    -- THE COHORT, COUNTED ACROSS THE WHOLE CAMPAIGN AND NOT PER FRAGMENT.
+    --
+    -- A per-run DISTINCT summed would be right only if fragments never shared
+    -- a patient, and they do: a patient whose main-pass attempt ERRORED is not
+    -- checkpointed, so the resume re-runs it and BOTH fragments carry a row
+    -- for it. Counting distinct over the campaign's whole membership is the
+    -- literal reading of the question -- how many patients did this campaign
+    -- cover -- and it is the only form that survives both the resample overlap
+    -- within a fragment and the retry overlap between fragments.
+    --
+    -- It joins `member` rather than re-deriving the walk, so there is one
+    -- statement of what a campaign contains.
+    cohort AS (
+        SELECT mc.campaign_id AS cohort_campaign_id,
+               COUNT(DISTINCT ic.patient_id) AS n_patients
+          FROM member mc
+          JOIN inferences ic ON ic.run_id = mc.member_run_id
+         GROUP BY mc.campaign_id
     ),
     stats AS (
         SELECT m.campaign_id                                AS campaign_id,
@@ -2300,7 +2335,7 @@ WITH RECURSIVE
                SUM(CASE WHEN r.finished_at IS NULL
                         THEN 1 ELSE 0 END)                  AS unfinalized_runs,
                COUNT(DISTINCT r.status)                     AS distinct_statuses,
-               COALESCE(SUM(p2.n_patients), 0)              AS total_patients,
+               COALESCE(SUM(p2.n_rows), 0)                  AS inference_rows,
                ROUND(COALESCE(SUM(p2.cost), 0), 4)          AS total_cost_usd,
                COALESCE(SUM(p2.unpriced), 0)                AS rows_with_no_cost
           FROM member m
@@ -2338,7 +2373,13 @@ SELECT s.campaign_id,
        CASE WHEN s.runs > 1 THEN 1 ELSE 0 END              AS stitched,
        pa.statuses,
        CASE WHEN s.distinct_statuses > 1 THEN 1 ELSE 0 END AS mixed_status,
-       s.total_patients,
+       -- DISTINCT PATIENTS, then the rows those patients produced. Both are
+       -- projected because a reader needs both: the first is the cohort the
+       -- campaign covered, the second is what every cost in this row is summed
+       -- over. Their difference is the resample pass plus any patient a
+       -- fragment retried.
+       COALESCE(c.n_patients, 0)                           AS total_patients,
+       s.inference_rows,
        s.first_started_at,
        s.last_finished_at,
        s.unfinalized_runs,
@@ -2364,6 +2405,11 @@ SELECT s.campaign_id,
   JOIN path pa ON pa.campaign_id = s.campaign_id
               AND pa.at_run = s.last_run_id
   JOIN runs head ON head.id = s.campaign_id
+  -- LEFT, not INNER: a campaign whose every fragment was killed before its
+  -- first patient has no inference row at all and must still be a row here,
+  -- with total_patients 0. An INNER JOIN would delete exactly the campaigns
+  -- worth looking at.
+  LEFT JOIN cohort c ON c.cohort_campaign_id = s.campaign_id
  ORDER BY s.campaign_id DESC
 """,
     ),

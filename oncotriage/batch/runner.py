@@ -125,17 +125,32 @@ functions in File 25 and stay functions, so ``paths.checkpoint_path`` resolves
 on first call rather than at import.
 """
 
+import contextlib
+import getpass
 import glob
+import hashlib
 import json
 import os
 import random
+import socket
 import sqlite3
+import tempfile
 import threading
 import time
 from collections import Counter
 from concurrent.futures import CancelledError, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+
+# fcntl IS REQUIRED, AND ITS ABSENCE IS A REFUSAL RATHER THAN A DEGRADATION.
+# tests/run_serial_tests.py imports it at module scope for exactly this reason
+# and states it: it is POSIX-only, so this module fails to import on Windows --
+# where every documented command in this project already fails, since the
+# numbered filenames contain spaces and `make` is assumed. Running a
+# 22,000-patient billed campaign UNLOCKED because the locking primitive was
+# missing would be precisely the failure the lock exists to prevent, and it
+# would be silent. At module scope the failure is at import, not four hours in.
+import fcntl
 
 from tqdm import tqdm
 
@@ -150,7 +165,11 @@ from oncotriage.config import (
     RESAMPLE_SEED,
     RESULTS_FILENAME,
 )
-from oncotriage.agent.evaluation import MatchingModelMismatchError
+from oncotriage.agent.evaluation import (
+    MatchingModelMismatchError,
+    clear_stage5_shutdown,
+    request_stage5_shutdown,
+)
 from oncotriage.fhir.parser import parse_fhir_bundle
 from oncotriage.storage.database_logger import (
     RUN_METRICS_FLUSH_FAILURES,
@@ -333,6 +352,14 @@ Phases:
     ``preserve:``  the unreadable file could not even be copied aside
     ``refused:``   a readable checkpoint was REFUSED, keyed by the
                    ``FP_OUTCOMES`` member that refused it
+    ``write:``     the checkpoint could not be WRITTEN. The most expensive key
+                   here and the last to be added: it fires once per completed
+                   patient for as long as the condition lasts, and every one of
+                   them is a patient the next invocation will re-bill. See
+                   ``checkpoint_write_failures()``, which the closing block
+                   reads so it cannot claim a checkpoint was kept when the
+                   writes failed.
+    ``tmp_unlink:`` a failed write left its temporary file behind
 """
 
 degradation.register(
@@ -365,12 +392,19 @@ def _checkpoint_remediation() -> tuple:
     )
 
 
-def _refuse_checkpoint(outcome: str, detail: str, cp) -> None:
-    """Count, log and raise. Never deletes, never skips, never re-runs."""
+def _refuse_checkpoint(outcome: str, detail: str, cp, recorded=None) -> None:
+    """Count, log and raise. Never deletes, never skips, never re-runs.
+
+    ``recorded`` IS THE STORED STAMP, forwarded so ``refusal_lines`` can tell
+    which DIRECTION a version mismatch runs in. Without it a checkpoint written
+    by a NEWER build is refused with this file's own remediation -- `--fresh` --
+    printed underneath it, which would discard an artifact that build can still
+    continue.
+    """
     CHECKPOINT_FAULTS[f"refused:{outcome}"] += 1
     lines = run_fingerprint.refusal_lines(
         outcome, detail, f"the batch checkpoint at {cp}",
-        _checkpoint_remediation())
+        _checkpoint_remediation(), recorded=recorded)
     log.error("batch checkpoint refused", event="checkpoint_refused",
               status="error", error_type=outcome)
     raise run_fingerprint.ResumeRefusal("\n".join(lines), outcome=outcome)
@@ -467,7 +501,7 @@ def load_checkpoint(fingerprint: dict = None) -> set:
         data.get("fingerprint"),
         fingerprint if fingerprint is not None else run_fingerprint.current())
     if outcome != run_fingerprint.FP_MATCH:
-        _refuse_checkpoint(outcome, detail, cp)
+        _refuse_checkpoint(outcome, detail, cp, recorded=data.get("fingerprint"))
 
     completed = set(stems)
     console.out(f"[Checkpoint] Resuming: {len(completed)} patients already completed.")
@@ -548,12 +582,91 @@ def save_checkpoint(completed_stems: set, fingerprint: dict = None) -> None:
                 )
             os.replace(tmp_path, cp)
         except OSError as e:
+            # COUNTED, NOT ONLY PRINTED, and until this line existed it was
+            # only printed. A read-only checkpoint directory -- a filled disk,
+            # a remounted share, a permission change -- makes EVERY write here
+            # fail, once per completed patient, and the run then finished with
+            # the degradation block reporting CLEAN and the closing line
+            # claiming the checkpoint had been kept. The next invocation
+            # re-billed every patient this one had already paid for. The
+            # counter is registered, so it reaches the run-end block AND
+            # `run_metrics` for free.
+            #
+            # `write:` IS THE PHASE KEY, following the four this counter
+            # already documents and `CHECKPOINT_WRITE_FAILURES` in
+            # oncotriage/ablation/study.py, which is the same fault in the same
+            # shape one module over.
+            CHECKPOINT_FAULTS[f"write:{type(e).__name__}"] += 1
             console.out(f"[Checkpoint] WARNING: Could not write checkpoint ({e}). Continuing.")
             if tmp_path.exists():
                 try:
                     tmp_path.unlink()
-                except OSError:
-                    pass
+                except OSError as unlink_exc:
+                    # COUNTED TOO, on the ablation study's precedent and for
+                    # its stated reason: a `tmp_unlink:` can only follow a
+                    # `write:`, so a count of the second without the first is
+                    # uninterpretable -- and the leftover .tmp file is a real
+                    # thing an operator finds and wonders about.
+                    CHECKPOINT_FAULTS[
+                        f"tmp_unlink:{type(unlink_exc).__name__}"] += 1
+                    console.out(f"[Checkpoint] WARNING: the temporary file "
+                                f"{tmp_path} could not be removed "
+                                f"({unlink_exc}).")
+
+
+def checkpoint_write_failures() -> int:
+    """How many checkpoint WRITES failed this process. A reader, not a counter.
+
+    Sums the ``write:`` keys of ``CHECKPOINT_FAULTS`` and nothing else --
+    ``load:``, ``shape:``, ``preserve:`` and ``refused:`` all describe a
+    checkpoint that could not be READ, which is a different finding with a
+    different remedy and which stops the run before it starts.
+
+    IT EXISTS BECAUSE THE CLOSING BLOCK MADE A CLAIM IT COULD NOT CHECK. "the
+    checkpoint is kept; the next run resumes from it" is exactly false when
+    every write failed, and that is precisely the run in which an operator most
+    needs to be told: the file on disk is either absent or stale at whatever
+    the last successful write left, so a resume re-runs -- and re-bills --
+    every patient completed since.
+
+    A PREFIX MATCH RATHER THAN AN EXACT KEY, because the key carries the
+    exception type; ``write:PermissionError`` and ``write:OSError`` are the
+    same finding for this purpose.
+    """
+    return sum(count for key, count in CHECKPOINT_FAULTS.items()
+               if key.startswith("write:"))
+
+
+def describe_checkpoint_state(kept_reason: str) -> str:
+    """One line saying what the checkpoint on disk is actually worth.
+
+    ``kept_reason`` is the caller's sentence for the ordinary case, so the two
+    places that report a kept checkpoint keep their own wording and share only
+    the correction.
+
+    THE FILE'S EXISTENCE AND THE WRITE FAILURES ARE BOTH READ, because they are
+    two different bad outcomes: no file at all (every write failed and there
+    was nothing there before), and a file that is real but STALE (the writes
+    started failing partway). Telling them apart is what decides whether a
+    resume re-runs everything or only the tail.
+    """
+    failures = checkpoint_write_failures()
+    if not failures:
+        return kept_reason
+    try:
+        present = _checkpoint_path().exists()
+    except Exception as exc:                                    # noqa: BLE001
+        return (f"UNKNOWN: {failures} checkpoint write(s) FAILED and the path "
+                f"could not even be checked ({type(exc).__name__}: {exc}). "
+                f"Treat the resume state as untrustworthy.")
+    if not present:
+        return (f"ABSENT: all {failures} checkpoint write(s) FAILED and no "
+                f"checkpoint exists. THE NEXT RUN RE-RUNS AND RE-BILLS EVERY "
+                f"PATIENT. Fix the checkpoint directory before re-running.")
+    return (f"STALE: {failures} checkpoint write(s) FAILED, so the file on "
+            f"disk is whatever the last successful write left. The next run "
+            f"RE-RUNS AND RE-BILLS every patient completed after that point. "
+            f"Fix the checkpoint directory before re-running.")
 
 
 def clear_checkpoint() -> None:
@@ -577,6 +690,197 @@ def clear_all() -> None:
     clear_checkpoint()
     clear_results()
     console.out("[State] All batch runner state cleared. Ready for fresh run.")
+
+
+# ===========================================================================
+# THE RUN LOCK  (the pre-migration pass)
+# ===========================================================================
+#
+# TWO BATCH RUNS AGAINST ONE CHECKPOINT DIRECTORY IS A SILENT DOUBLE BILL, AND
+# NOTHING STOPPED IT. Measured by driving two real invocations of
+# `25- Batch Runner.py` concurrently against one directory: both read the same
+# checkpoint at start, so both saw the same "already completed" set and both
+# processed the SAME patients -- one live Stage 5 call each, twice, for a
+# cohort that needed one. Neither run reported anything wrong. The checkpoint
+# itself is written atomically (temp file + os.replace), so it is never
+# corrupt; it is simply the LAST writer's view, and the loser's completions
+# vanish from it, which then makes a third invocation re-bill THOSE too.
+#
+# THE SHAPE IS tests/run_serial_tests.py's, DELIBERATELY AND VERBATIM, down to
+# the exit code. That file solved the identical problem one layer up -- two
+# copies of a suite that rewrites source in place -- and its argument transfers
+# without amendment:
+#
+#   `flock(LOCK_EX | LOCK_NB)` on a file outside the repository, held for the
+#   whole run, RELEASED BY THE KERNEL when this process exits, however it
+#   exits: a clean return, an uncaught exception, SIGKILL, a panic, a laptop
+#   lid. That property is what rules out the alternative shape. A pid file
+#   written and deleted by this program leaves a stale lock behind every time
+#   it dies badly -- which for a batch runner is every SIGKILL after a `docker
+#   stop` grace period -- and the "is that pid still alive" repair
+#   re-introduces a check-then-act race of its own, on a pid the OS may already
+#   have recycled.
+#
+# TWO TERMINALS IS THE OBVIOUS WAY IN AND IT IS NOT THE LIKELY ONE. A cron
+# entry whose previous run has not finished, a systemd unit with Restart=,
+# a container restarted by an orchestrator that could not read its health
+# check, a re-run started because the first "looked stuck" during a 20-minute
+# index build -- none of those involves anybody deciding to overlap.
+#
+# THE KEY IS THE CHECKPOINT DIRECTORY AND NOT THE CODE DIRECTORY, which is
+# where this diverges from the serial runner and it is the whole of the
+# divergence. That file protects a source tree, so its key is the tree. This
+# protects a RUN's state, and the checkpoint directory is what identifies it:
+# two checkouts pointed at one deployment must block each other, and one
+# checkout driven at two deployments (ONCOTRIAGE_MAIN_PATH moved) must not.
+#
+# IT IS TAKEN IN `25- Batch Runner.py`'s __main__ GUARD AND NOT IN `main()`, on
+# --fresh's and the SIGTERM handler's precedent and for a sharper version of
+# their reason: `main()` is directly callable and an embedder driving several
+# configurations in one process, or a test driving two passes, would be
+# refusing itself. A process-wide exclusion belongs to the process's entry
+# point.
+
+
+EXIT_LOCKED = 3
+"""The entry point's exit code when another run holds the lock.
+
+3, matching ``tests/run_serial_tests.py``, and it does not collide with
+anything this runner already returns: 0/1/2 are the reconciliation verdict, 130
+is Ctrl-C and 143 is SIGTERM. A supervisor can therefore tell "another copy is
+already running" from "rows were lost" without parsing output.
+"""
+
+
+def run_lock_path(checkpoint_dir=None) -> str:
+    """Where the run lock for ``checkpoint_dir`` lives.
+
+    OUTSIDE THE CHECKPOINT DIRECTORY, and that is two decisions rather than
+    one. The directory's other three files are this run's resumable state and
+    an operator reads a listing of it to answer "what is here"; a fourth file
+    that is neither state nor a control would be noise in exactly the place
+    noise is expensive. And the checkpoint directory may be a network share --
+    the stop switch's own docstring says a shared filesystem is the point of it
+    -- where flock is advisory at best and lies at worst. The system temp
+    directory is local by construction.
+
+    The digest is truncated for a readable name. A collision between two
+    checkpoint directories on one machine costs a spurious refusal WITH THE
+    HOLDER'S OWN PATH PRINTED, which is diagnosable in one line; the untruncated
+    alternative buys nothing an operator can use.
+
+    ``paths.checkpoint_path`` is read as a MODULE ATTRIBUTE for the reason
+    ``stop_switch_path`` records: a from-import fires the lazy resolver at
+    import and globs the sibling data tree just to load this module.
+    """
+    root = (checkpoint_dir if checkpoint_dir is not None
+            else paths.checkpoint_path)
+    digest = hashlib.sha256(
+        os.path.abspath(str(root)).encode("utf-8")).hexdigest()
+    return os.path.join(tempfile.gettempdir(),
+                        f"oncotriage-batch-run-{digest[:16]}.lock")
+
+
+class AlreadyRunning(RuntimeError):
+    """Another process holds the run lock. Carries its record.
+
+    A ``RuntimeError`` subclass and deliberately not an ``OSError``, on
+    ``StaleStopSwitch``'s footing immediately below and for its reason: a stray
+    ``except OSError`` around a path check must not be able to eat a refusal.
+    """
+
+    def __init__(self, path, holder):
+        self.path = path
+        self.holder = holder
+        super().__init__(f"{path} is held by {holder}")
+
+
+@contextlib.contextmanager
+def exclusive_run_lock(path=None, checkpoint_dir=None):
+    """Hold an exclusive, non-blocking flock for the duration of the block.
+
+    Yields the lock file's path. Raises ``AlreadyRunning`` IMMEDIATELY -- never
+    waits -- because a second run that queued behind the first would still run,
+    just later, against a cohort the first has by then finished, and an
+    operator who started it by accident would rather be told than have it
+    happen four hours from now.
+
+    NOTHING IN HERE DELETES THE FILE, and that is deliberate rather than
+    untidy: the lock is the flock on the INODE, not the file's existence.
+    Removing it on the way out would let a second process create a NEW inode
+    and lock that instead while a third still held the old one -- two runs,
+    both holding "the" lock. An empty lock file is 0 bytes.
+
+    THE RECORD IS WRITTEN ONLY AFTER THE LOCK IS HELD, so a refused run cannot
+    overwrite the holder's own identity with its own on the way to being told
+    no.
+    """
+    # THE DIRECTORY IS RESOLVED ONCE AND THE RECORD IS BUILT FROM WHAT WAS
+    # ACTUALLY LOCKED. The first version read `paths.checkpoint_path` a SECOND
+    # time when writing the record, so a caller that passed an explicit `path`
+    # -- a test, a second deployment -- got a holder record naming a directory
+    # it had nothing to do with. A lock record that names the wrong directory
+    # is worse than one that names none: an operator acts on it.
+    if path is None:
+        if checkpoint_dir is None:
+            checkpoint_dir = paths.checkpoint_path
+        path = run_lock_path(checkpoint_dir)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.lseek(fd, 0, os.SEEK_SET)
+            raw = os.read(fd, 4096).decode("utf-8", "replace").strip()
+            try:
+                holder = json.loads(raw) if raw else {}
+            except ValueError:
+                holder = {"record": raw}
+            raise AlreadyRunning(path, holder) from None
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, json.dumps({
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "user": getpass.getuser(),
+            "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "checkpoint_dir": (
+                os.path.abspath(str(checkpoint_dir))
+                if checkpoint_dir is not None
+                else "<not supplied: the lock file was named directly>"),
+        }).encode("utf-8"))
+        os.fsync(fd)
+        yield path
+    finally:
+        os.close(fd)          # releases the flock
+
+
+def run_lock_refusal_lines(exc) -> list:
+    """The refusal, as the lines the entry point prints. One text, one caller.
+
+    A FUNCTION RATHER THAN A BLOCK IN THE GUARD so it can be driven by a test
+    without starting two processes, and so the entry point's ``__main__`` block
+    stays what this project's rule says it is.
+    """
+    lines = ["[Batch] REFUSING TO RUN: another batch run holds the lock.",
+             f"        lock file: {exc.path}"]
+    for key in ("pid", "host", "user", "started", "checkpoint_dir", "record"):
+        if key in exc.holder:
+            lines.append(f"        {key:15s} {exc.holder[key]}")
+    lines.extend([
+        "",
+        "        Two runs against one checkpoint directory both read the same",
+        "        resume state at start, so both process the SAME patients at one",
+        "        live Stage 5 call each -- and the loser's completions are then",
+        "        dropped from the checkpoint by the winner's next write, so a",
+        "        third run re-bills those too. Nothing reports it.",
+        "",
+        "        Wait for the other run, or stop it cleanly:",
+        f"            touch {describe_stop_switch_path()}",
+        "",
+        "        NOTHING HAS BEEN RUN AND NOTHING HAS BEEN BILLED.",
+    ])
+    return lines
 
 
 # ===========================================================================
@@ -997,6 +1301,10 @@ Phases:
     ``shape:``     it parsed, and was not a JSON array
     ``preserve:``  the unreadable file could not be renamed out of the way, so
                    the next write WILL destroy it. The most serious key here.
+    ``write:``     the results file could not be WRITTEN, so the report on disk
+                   and the artifact ``tracking.end_run`` attaches are stale or
+                   absent. Fires once per patient while the condition lasts.
+    ``tmp_unlink:`` a failed write left its temporary file behind
 """
 
 CORRUPT_RESULTS_SUFFIX = ".corrupt"
@@ -1194,13 +1502,24 @@ def append_result(results_list: list, entry: dict) -> None:
                 json.dump(results_list, f, indent=2)
             os.replace(tmp_path, rp)
         except OSError as e:
+            # COUNTED, NOT ONLY PRINTED. The results file is the run's own
+            # report and `tracking.end_run` attaches it as an artifact, so a
+            # run whose every write failed indexes an artifact that is stale or
+            # absent while reporting nothing wrong. Same phase key as the
+            # checkpoint's, for the same reason: one convention across the two
+            # state files this module owns.
+            RESULTS_FILE_FAILURES[f"write:{type(e).__name__}"] += 1
             console.out(f"[Results] WARNING: Could not write results file ({e}). Continuing.")
             # Clean up temp file if it was created
             if tmp_path.exists():
                 try:
                     tmp_path.unlink()
-                except OSError:
-                    pass
+                except OSError as unlink_exc:
+                    RESULTS_FILE_FAILURES[
+                        f"tmp_unlink:{type(unlink_exc).__name__}"] += 1
+                    console.out(f"[Results] WARNING: the temporary file "
+                                f"{tmp_path} could not be removed "
+                                f"({unlink_exc}).")
 
 
 # ===========================================================================
@@ -1960,6 +2279,24 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
         # THE MESSAGE STOPPED CLAIMING THE RUN CONTINUES. "Safe to resume" was
         # true and "Checkpoint saved." was true; what the pair implied -- that
         # this was a tidy pause the run would carry on from -- was not.
+        # ── THE FIRST STATEMENT, BEFORE THE POOL IS EVEN TOUCHED ────────
+        #
+        # `executor.shutdown(wait=True)` below blocks until every RUNNING
+        # patient returns, and in per-trial mode a running patient is a whole
+        # Stage 5 wave: ceil(MAX_TRIALS_FOR_EVALUATION /
+        # MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS) rounds of live requests, each
+        # bounded only by MATCHING_REQUEST_TIMEOUT_SECONDS and the SDK's own
+        # retries. Every one of those is issued AFTER the operator pressed
+        # Ctrl-C. The wave's own `finally` cannot help: it runs on the WORKER
+        # thread, and the KeyboardInterrupt was delivered to the main thread --
+        # which is this one.
+        #
+        # Setting the flag here bounds the wait at ONE in-flight round: the
+        # requests already in the air cannot be interrupted, and every queued
+        # one returns immediately without being sent. The patients affected are
+        # failed rather than partially completed, so none of them is
+        # checkpointed and a resume re-runs them whole.
+        request_stage5_shutdown("Ctrl-C during the main batch pass")
         console.out("\n[INTERRUPTED] Waiting for active threads to finish...")
         executor.shutdown(wait=True, cancel_futures=True)
         console.out("[INTERRUPTED] Checkpoint saved: every completed patient "
@@ -2008,19 +2345,33 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
     console.out("=" * 80)
     console.out()
 
-    # THE SECOND MEMBER IS `main_pass_complete` AND IT IS NOW HONEST. It was a
-    # literal `True` on every path, which was defensible while the only way out
-    # of this function was "every patient ran" or "the process died": a returned
-    # False had no producer. The stop switch is a third way out -- the function
-    # returns NORMALLY having deliberately not run part of the cohort -- so the
-    # literal would now be a false statement rather than an unreachable one.
+    # THE SECOND MEMBER IS `main_pass_complete`, AND IT ASKS ABOUT THE COHORT
+    # RATHER THAN ABOUT THE SWITCH.
     #
-    # main() still discards it (`completed_ids, _ = run_batch(...)`), reading
-    # STOP_SWITCH directly because the RESAMPLE pass has to make the same
-    # decision and is not called from here. It is corrected anyway: a caller
-    # embedding this function reads the tuple, and a tuple that says a pass
-    # completed when it did not is the shape this whole item is about.
-    return completed_ids, not STOP_SWITCH.requested
+    # It was a literal `True` on every path, which was defensible while the only
+    # way out of this function was "every patient ran" or "the process died".
+    # The stop switch made that a false statement, and the first correction --
+    # `not STOP_SWITCH.requested` -- replaced it with a DIFFERENT false
+    # statement, measured rather than reasoned about: drive a 40-patient corpus
+    # to completion and then write the sentinel while the RESAMPLE pass is
+    # running, and the switch latches; but this pass had already covered every
+    # patient. `not STOP_SWITCH.requested` reads False, main() records the run
+    # STOPPED, the checkpoint is KEPT "because patients remain" -- and none do.
+    # A reviewer then reads a STOPPED row as a campaign covering a PREFIX of the
+    # cohort, which is what that status means, about a campaign that covered all
+    # of it.
+    #
+    # THE HONEST TEST IS WHAT THIS PASS ACTUALLY DID: was every pending patient
+    # submitted, and was none of them cancelled. Those two counts are the only
+    # ways a patient can be left unattempted here, they are maintained by the
+    # submit loop and by `_on_done` respectively, and they are both zero on a
+    # stop that arrived after the last patient completed -- which is exactly the
+    # case the switch alone gets wrong.
+    #
+    # It is deliberately NOT "no patient errored": an errored patient WAS
+    # attempted, and main() reads that separately off the results list to decide
+    # FINISHED against FAILED. Two different questions, two different readers.
+    return completed_ids, (stop_unsubmitted == 0 and batch_cancelled == 0)
 
 
 # ===========================================================================
@@ -2233,6 +2584,12 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
         # resample pass is the last thing main() runs before its summary, so
         # what it bought was a finalization of FINISHED on a run the operator
         # had interrupted, rather than a further ~100 billed calls.
+        # run_batch's first statement, second instance. The argument is
+        # written there and applies unchanged: this handler is on the main
+        # thread, the waves are on worker threads, and without this the
+        # shutdown below waits for every one of them to finish buying
+        # responses nobody will read.
+        request_stage5_shutdown("Ctrl-C during the resample pass")
         console.out("\n[INTERRUPTED] Waiting for active threads to finish...")
         executor.shutdown(wait=True, cancel_futures=True)
         console.out(f"[INTERRUPTED] RESAMPLE INTERRUPTED: {resample_success} "
@@ -2910,6 +3267,11 @@ def main():
     # describes THAT run, and inheriting it would make the next one cancel its
     # cohort at the first completed patient having been asked nothing.
     STOP_SWITCH.reset()
+    # THE FOURTH PIECE OF PER-RUN MODULE STATE, cleared here for the reason the
+    # three above it are. A shutdown asked of an EARLIER main() in this process
+    # would make every patient of this one fail with no request sent -- the
+    # loudest possible version of "state that describes the wrong run".
+    clear_stage5_shutdown()
 
     with CaffeinateSession("Batch Runner"):
 
@@ -3235,7 +3597,12 @@ def main():
             # ------------------------------------------------------------------
             # 4. Main batch pass
             # ------------------------------------------------------------------
-            completed_ids, _ = run_batch(
+            # THE SECOND MEMBER IS READ NOW, and it used to be discarded.
+            # See run_batch's return: it answers "did this pass attempt every
+            # patient", which `STOP_SWITCH.requested` cannot -- a stop that
+            # lands during the RESAMPLE pass latches the switch over a cohort
+            # the main pass had already covered.
+            completed_ids, _main_pass_complete = run_batch(
                 fhir_files=fhir_files,
                 bm25_index=bm25_index,
                 nct_ids=nct_ids,
@@ -3279,6 +3646,42 @@ def main():
                 )
             else:
                 console.out("[Resample] Skipped: no successfully completed patients.")
+
+            # ── WHAT A STOP ACTUALLY COST THIS CAMPAIGN ────────────────────
+            #
+            # ONE BOOLEAN, TAKEN ONCE, READ BY FOUR CONSUMERS: the checkpoint
+            # decision, the closing console block, `tracking.end_run` and
+            # `runs.status`. They were four independent reads of
+            # `STOP_SWITCH.requested`, which is a question about whether a
+            # sentinel was seen and not about whether the cohort was covered.
+            #
+            # STOPPED MEANS THE CAMPAIGN COVERS A PREFIX OF THE COHORT. That is
+            # the whole reason the status exists and the whole reason a
+            # reviewer must not sum rates over it. A stop that arrives during
+            # the RESAMPLE pass costs the resample pass and nothing else: every
+            # patient ran, every row is written, the checkpoint is complete.
+            # Recording that as STOPPED is a claim about coverage that is not
+            # true, and it is not a cosmetic one -- `campaign_summary` and
+            # every reader of `runs.status` act on it. Driven end to end: a
+            # 40-patient cohort covered in full, the sentinel written during
+            # the resample pass, the run recorded STOPPED and the checkpoint
+            # KEPT "because patients remain" with none remaining.
+            #
+            # HERE, AFTER THE RESAMPLE PASS, AND NOT AT run_batch's RETURN.
+            # The two are equivalent in VALUE -- an incomplete main pass
+            # implies the switch had already latched, and a complete one makes
+            # this False whatever the switch says later -- and they are NOT
+            # equivalent as a place to stand: this is where the four reads it
+            # replaces were, so a revert of this one line reproduces exactly
+            # the behaviour that shipped. Computed three blocks higher, the
+            # obvious revert reproduces nothing, because the switch has not
+            # latched yet at that point. `tests/test_runner_stop_switch.py`
+            # section 5b is that control, and it is what found this.
+            #
+            # A STOP IS STILL ANNOUNCED EITHER WAY. What changes is only which
+            # of the two things it is reported as having cut short.
+            _stopped_mid_cohort = (STOP_SWITCH.requested
+                                   and not _main_pass_complete)
 
             # ------------------------------------------------------------------
             # 6. Reconcile the writes, then the final summary
@@ -3349,14 +3752,27 @@ def main():
             # An empty `main_errors` means "nothing that ran failed", which is
             # not "everything ran". Only a run that was not stopped can conclude
             # the second from the first.
-            if STOP_SWITCH.requested:
-                console.out("[Checkpoint] KEPT: the run was stopped, so "
-                            "patients remain. The next run resumes from it.")
+            if _stopped_mid_cohort:
+                console.out("[Checkpoint] " + describe_checkpoint_state(
+                    "KEPT: the run was stopped, so patients remain. The next "
+                    "run resumes from it."))
             elif not main_errors:
                 clear_checkpoint()
-                console.out("[Checkpoint] Cleared for next fresh run.")
+                # THROUGH THE SAME READER AS THE OTHER TWO BRANCHES. On a
+                # healthy run the sentence passes through unchanged; on a run
+                # whose writes failed, "Cleared for next fresh run" is a claim
+                # about a file that was never written, and the operator is
+                # entitled to know their next invocation re-bills the cohort.
+                console.out("[Checkpoint] " + describe_checkpoint_state(
+                    "Cleared for next fresh run."))
             else:
-                console.out(f"[Checkpoint] Kept: {len(main_errors)} patients errored. Re-run to retry failures.")
+                # SAME READER, AND THIS BRANCH NEEDED IT MOST OF THE THREE:
+                # "Re-run to retry failures" promises a re-run that retries the
+                # FAILURES, and with the checkpoint stale or absent a re-run
+                # retries everything, at a live Stage 5 call each.
+                console.out("[Checkpoint] " + describe_checkpoint_state(
+                    f"Kept: {len(main_errors)} patients errored. Re-run to "
+                    f"retry failures."))
 
             # ------------------------------------------------------------------
             # 8. Close the tracking run (the tracking pass)
@@ -3398,7 +3814,11 @@ def main():
             # "STOPPED" straight through would have indexed every stopped
             # campaign as a failure -- true of nothing, and worse than KILLED.
             tracking.end_run(
-                status=("KILLED" if STOP_SWITCH.requested
+                # `_stopped_mid_cohort` AND NOT `STOP_SWITCH.requested`. A stop
+                # that only cut the resample pass short left a campaign that
+                # covered its cohort, and indexing it KILLED would tell every
+                # later reader the numbers cover a prefix. See the boolean.
+                status=("KILLED" if _stopped_mid_cohort
                         else "FINISHED" if not main_errors else "FAILED"),
                 artifacts=[
                     # The results file, as it stands on disk after this run.
@@ -3459,7 +3879,35 @@ def main():
             # Printed first, a failure here leaves the row UNFINALIZED and the
             # crash handler finalizes it KILLED -- which is then the truth: the
             # run did die, in the reporting.
-            if STOP_SWITCH.requested:
+            if STOP_SWITCH.requested and not _stopped_mid_cohort:
+                # THE STOP LANDED AFTER THE COHORT WAS COVERED. It is still
+                # announced -- an operator asked for something and got it, and
+                # the resample pass really was skipped -- but the run is NOT
+                # recorded STOPPED, and this block says so in as many words
+                # rather than leaving the console and the row disagreeing.
+                console.out()
+                console.out("=" * 80)
+                console.out("STOP REQUESTED AFTER THE COHORT WAS COVERED.")
+                console.out(f"  requested by   {STOP_SWITCH.path}")
+                if STOP_SWITCH.message:
+                    console.out(f"  note           {STOP_SWITCH.message}")
+                console.out(f"  noticed in     the {STOP_SWITCH.detected_in}")
+                console.out("  main pass      COMPLETE: every patient was "
+                            "attempted, none was cancelled and none was left "
+                            "unsubmitted")
+                console.out("  what it cost   the RESAMPLE pass, and nothing "
+                            "else")
+                console.out("  run row        "
+                            + ("FINISHED" if not main_errors else "FAILED")
+                            + " -- NOT STOPPED, because STOPPED means the "
+                              "campaign covers a PREFIX of the cohort and this "
+                              "one does not")
+                console.out("  sentinel       still present; delete it before "
+                            "the next run:")
+                console.out(f"      rm {STOP_SWITCH.path}")
+                console.out("=" * 80)
+
+            if _stopped_mid_cohort:
                 console.out()
                 console.out("=" * 80)
                 console.out("RUN STOPPED AT THE OPERATOR'S REQUEST.")
@@ -3469,8 +3917,11 @@ def main():
                 console.out(f"  noticed in     the {STOP_SWITCH.detected_in}")
                 console.out("  run row        STOPPED (not KILLED, not "
                             "FINISHED)")
-                console.out("  checkpoint     kept; the next run resumes from "
-                            "it")
+                # NOT A LITERAL "kept". See describe_checkpoint_state: with the
+                # checkpoint directory unwritable this line used to promise a
+                # resume that would have re-billed the whole cohort.
+                console.out("  checkpoint     " + describe_checkpoint_state(
+                    "kept; the next run resumes from it"))
                 console.out("  TO RESUME      delete the sentinel and run "
                             "again:")
                 console.out(f"      rm {STOP_SWITCH.path}")
@@ -3492,7 +3943,7 @@ def main():
             # rate about the cohort.
             finalize_run_record(
                 _run_record_id,
-                ("STOPPED" if STOP_SWITCH.requested
+                ("STOPPED" if _stopped_mid_cohort
                  else "FINISHED" if not main_errors else "FAILED"),
                 db_path=_reconcile_db,
             )

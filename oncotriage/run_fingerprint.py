@@ -831,6 +831,30 @@ def disagreements(recorded, current_fp: dict) -> list:
     return changed
 
 
+def recorded_version_is_newer(recorded) -> bool:
+    """Was this stamp written by a LATER version of this module?
+
+    THE COMPARISON IS GUARDED BECAUSE THE VALUE IS THIRD-PARTY DATA. A stamp is
+    read out of a JSON file an operator, another build, or a corrupted write may
+    have produced, so ``recorded["fingerprint_version"]`` can be a string, a
+    list or None -- and ``"4" > 3`` is a TypeError, raised out of the one
+    function whose job is to decide whether a refusal is safe. Anything that is
+    not a plain int answers False and falls through to the ordinary
+    version-mismatch branch, which says "a different set of facts" and is true
+    of any unreadable value.
+
+    ``bool`` IS EXCLUDED even though it is an int subclass, for the reason this
+    project excludes it everywhere else: ``True > 0`` is True, and a stamp whose
+    version is ``True`` is a corrupted stamp rather than version 1.
+    """
+    if not isinstance(recorded, dict):
+        return False
+    version = recorded.get("fingerprint_version")
+    if isinstance(version, bool) or not isinstance(version, int):
+        return False
+    return version > FINGERPRINT_VERSION
+
+
 def compare(recorded, current_fp: dict) -> tuple:
     """``(outcome, detail)`` -- may this run continue ``recorded``'s artifact?
 
@@ -854,7 +878,11 @@ def compare(recorded, current_fp: dict) -> tuple:
          silent about which fields moved.
       3. a different stamp SHAPE -> FP_VERSION, before any field is compared,
          so a field this version gates and that version never recorded is not
-         reported as a configuration change.
+         reported as a configuration change. A NEWER stamp is asked first
+         within that step and gets its own message: the outcome is the same
+         because the fields are equally uncomparable, and the REMEDY is the
+         opposite -- this build is behind the artifact, so clearing the
+         artifact is exactly the wrong thing to do.
       4. fields -> FP_CHANGED or FP_MATCH.
     """
     if not is_resolved(current_fp):
@@ -873,7 +901,41 @@ def compare(recorded, current_fp: dict) -> tuple:
             "the stored state carries no fingerprint_version: it was written "
             "before configuration fingerprinting existed, so what produced it "
             "is unknown")
+    elif recorded_version_is_newer(recorded):
+        # ── THE STAMP IS FROM THE FUTURE, AND THE REMEDY IS THE OPPOSITE ────
+        #
+        # FP_VERSION EITHER WAY -- the fields still cannot be compared, and a
+        # sixth outcome would widen a closed vocabulary that `_refuse_checkpoint`
+        # keys a counter on and `run_harness` branches on -- but the REMEDY
+        # inverts, and it is the remedy an operator acts on. An older stamp is
+        # cleared once and forgotten; a NEWER one means THIS BUILD IS BEHIND,
+        # the artifact is perfectly good, and `--fresh` would discard hours of
+        # paid work that the build which wrote it can still continue.
+        #
+        # THE STORAGE LAYER ALREADY MAKES THIS CALL, one layer down:
+        # `initialize_database` refuses to LOWER a `PRAGMA user_version` it
+        # finds ahead of its own, saying so on the console and leaving the file
+        # alone -- "Nothing is wrong with the rows that are there." The
+        # difference is what follows, and it is stated rather than glossed:
+        # that schema is strictly ADDITIVE, so the older writer can carry on
+        # against a newer file. A fingerprint is not additive -- it is a set of
+        # facts to be compared, and a set this code does not know is a set it
+        # cannot compare -- so this still REFUSES. What it borrows is the
+        # direction: never lower, never discard, name the newer artifact as the
+        # thing that is right.
+        outcome, detail = FP_VERSION, (
+            f"fingerprint_version {recorded.get('fingerprint_version')!r} is "
+            f"NEWER than this code's {FINGERPRINT_VERSION!r}: the stored state "
+            f"was written by a LATER version of oncotriage, which gates facts "
+            f"this one does not know, so the two cannot be compared field by "
+            f"field. NOTHING IS WRONG WITH THE ARTIFACT -- this build is behind "
+            f"it. Check out the version that wrote it and resume with that; do "
+            f"NOT discard the artifact, which would throw away paid work a "
+            f"newer build can still continue")
     elif recorded.get("fingerprint_version") != FINGERPRINT_VERSION:
+        # Reached only for an OLDER stamp, or one whose version is not a plain
+        # int at all -- the branch above has already taken every readable newer
+        # value. Both are cleared the same way, which is why they share it.
         outcome, detail = FP_VERSION, (
             f"fingerprint_version {recorded.get('fingerprint_version')!r} != "
             f"{FINGERPRINT_VERSION!r}: the stored state records a different set "
@@ -910,7 +972,7 @@ class ResumeRefusal(RuntimeError):
 
 
 def refusal_lines(outcome: str, detail: str, artifact: str,
-                  remediation) -> list:
+                  remediation, recorded=None) -> list:
     """The refusal, as the lines every consumer prints. One text, three callers.
 
     ``remediation`` is the caller's -- clearing a checkpoint, pointing
@@ -931,6 +993,14 @@ def refusal_lines(outcome: str, detail: str, artifact: str,
     existing artifact answer it exactly once, and an operator meeting that
     without being told reads a shape change as a configuration change and goes
     looking for an edit that did not happen.
+
+    ``recorded`` IS OPTIONAL AND IS WHAT SPLITS THAT CLAUSE IN TWO. A stamp
+    from a NEWER build gets the opposite advice -- the artifact is right and
+    this checkout is behind -- and the caller's own remediation lines, which
+    this function appends and does not own, say "--fresh" or "--fresh-start"
+    and would destroy it. Passing the stamp lets the warning be printed ABOVE
+    them. Omitted, the older-direction clause is used, which is the pre-existing
+    behaviour and is correct whenever the direction is not known.
     """
     lines = [f"REFUSED ({outcome}): {artifact}", f"    {detail}"]
     if outcome == FP_CHANGED:
@@ -942,7 +1012,26 @@ def refusal_lines(outcome: str, detail: str, artifact: str,
                      f"{RENDERER_COVERAGE}: an edit to the cancer / lab / MeSH "
                      f"registries or to their data changes rendered text and "
                      f"would not be detected here either")
-    if outcome == FP_VERSION:
+    if outcome == FP_VERSION and recorded_version_is_newer(recorded):
+        # THE REMEDIATION LINES BELOW ARE THE WRONG REMEDY FOR THIS ONE, and
+        # they are the caller's rather than this module's -- "--fresh",
+        # "--fresh-start", "point --output-dir elsewhere" -- so they cannot be
+        # suppressed from here without every caller growing a branch. Warning
+        # ABOVE them, in the one place that can tell which direction the
+        # mismatch runs, is what stops an operator following the first
+        # instruction they see and discarding hours of paid work because this
+        # checkout is behind the artifact.
+        lines.append(f"    this is the stamp SHAPE changing, and it changed in "
+                     f"the direction that means THIS BUILD IS BEHIND: "
+                     f"fingerprint_version {FINGERPRINT_VERSION} gates "
+                     f"{len(FINGERPRINT_FIELDS)} facts and the stored state "
+                     f"records a LATER set")
+        lines.append("    DO NOT RUN THE COMMANDS BELOW. They discard the "
+                     "artifact, and the artifact is the thing that is right "
+                     "here. Check out the version of oncotriage that wrote it "
+                     "and resume with that; they are listed only because this "
+                     "refusal shares its shape with every other one")
+    elif outcome == FP_VERSION:
         lines.append(f"    this is the stamp SHAPE changing, not necessarily "
                      f"the configuration: fingerprint_version "
                      f"{FINGERPRINT_VERSION} gates "

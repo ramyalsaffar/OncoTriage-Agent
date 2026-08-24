@@ -916,6 +916,38 @@ BUCKETS = {
         "gone, and the two repository files it reads (batch/runner.py, "
         "25- Batch Runner.py) are written by neither of the suite's two writers "
         "and are sha256-compared at the end"),
+    "test_runner_preflight_and_state_faults.py": (
+        _A, None,
+        # DERIVED BY RUNNING against a skeleton provisioned by
+        # provision_ci_paths.py, not from its imports.
+        "ran green in ~18s, 76 checks: the run lock, the write-failure "
+        "counters and the sentinel preflight. THE LOCK IS DRIVEN WITH REAL "
+        "CONCURRENT SUBPROCESSES -- one run parks its pool, a second is "
+        "launched against the same checkpoint directory and is refused with "
+        "exit 3 having started no patient, and a SIGKILLed holder is shown to "
+        "leave the lock free for a successor, which is the property a pid file "
+        "cannot have. The counters are driven against a checkpoint directory "
+        "made read-only while the pool is parked, so every state-file write "
+        "fails and the run-end block is measured DEGRADED rather than CLEAN. "
+        "The preflight is driven end to end: --fresh beside a stale sentinel "
+        "refuses with the checkpoint BYTE-IDENTICAL. No network, no keys, NO "
+        "SPEND, no live Qdrant, no model load (ONCOTRIAGE_DEFER_LOCAL_MODELS "
+        "is set above the imports and in every subprocess environment), no "
+        "corpus -- every FHIR file is a two-key literal in a temp directory -- "
+        "no git history, no live server. process_patient, the BM25 index, the "
+        "graph, the tracking module and run_fingerprint.current are stand-ins "
+        "and THE GRAPH IS NEVER INVOKED, so no billed call is reachable; "
+        "main(), run_batch, run_resample, _on_done, save_checkpoint, "
+        "load_checkpoint, flush_health, start_run_record, "
+        "finalize_run_record, reconcile_writes and the real __main__ guard "
+        "are the real thing. IT USES SUBPROCESSES AND A REAL SIGKILL on "
+        "purpose: a lock released by the kernel cannot be observed from "
+        "inside the process that held it. NOT in the collision matrix: every "
+        "database, checkpoint, sentinel and FHIR file is inside a "
+        "tempfile.mkdtemp it removes and asserts gone, and the two repository "
+        "files it reads (batch/runner.py, 25- Batch Runner.py) are written by "
+        "neither of the suite's two writers and are sha256-compared at the "
+        "end. IT EXECS NOTHING"),
     "test_runner_stop_switch.py": (
         _A, None,
         # DERIVED BY RUNNING against a skeleton provisioned by

@@ -1048,8 +1048,15 @@ def environment_gate(manifest, fingerprint: Dict) -> Tuple:
 
 
 def environment_refusal_lines(outcome: str, detail: str, output_dir: str,
-                              overridable: bool) -> List[str]:
-    """The refusal, with this harness's own remediation."""
+                              overridable: bool, recorded=None) -> List[str]:
+    """The refusal, with this harness's own remediation.
+
+    ``recorded`` is the manifest's stored environment block, forwarded so
+    ``refusal_lines`` can tell which direction a version mismatch runs in: a
+    manifest written by a NEWER build must not be answered with "point
+    --output-dir somewhere else and run it again", which pays for the whole
+    slice a second time.
+    """
     remediation = [
         "Point --output-dir at a new directory to run this configuration "
         "separately (the recommended fix: two configurations are two runs).",
@@ -1071,7 +1078,7 @@ def environment_refusal_lines(outcome: str, detail: str, output_dir: str,
                        "record beside it are exactly as they were.")
     return run_fingerprint.refusal_lines(
         outcome, detail, f"{os.path.join(output_dir, MANIFEST_FILENAME)}",
-        remediation)
+        remediation, recorded=recorded)
 
 
 # Which refusals --allow-environment-change may admit. FP_UNRESOLVED is
@@ -1589,8 +1596,9 @@ def main(argv=None) -> int:
         overridable = env_outcome in OVERRIDABLE_OUTCOMES
         if not (overridable and args.allow_environment_change):
             console.out("")
-            for line in environment_refusal_lines(env_outcome, env_detail,
-                                                  output_dir, overridable):
+            for line in environment_refusal_lines(
+                    env_outcome, env_detail, output_dir, overridable,
+                    recorded=(manifest or {}).get("environment")):
                 console.out(line)
             log.error("evaluation run refused",
                       event="evaluation_environment_refused",

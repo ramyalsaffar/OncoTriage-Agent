@@ -429,6 +429,58 @@ services:
       # 15s was optimistic: startup imports torch, transformers and langgraph
       # before the lifespan handler compiles the graph.
       start_period: 90s
+    # ======================================================================
+    # THE SHUTDOWN GRACE PERIOD, AND THE ARITHMETIC BEHIND THE NUMBER
+    # ======================================================================
+    # DOCKER'S DEFAULT IS 10 SECONDS. `docker stop` sends SIGTERM, waits that
+    # long, then SIGKILLs. A container SIGKILLed mid-request abandons an
+    # in-flight Stage 5 call that has ALREADY BEEN BILLED, writes no inference
+    # row for it, and leaves nothing in the database saying it happened -- so
+    # ten seconds is not a grace period for this service, it is a guarantee of
+    # loss under any orderly restart.
+    #
+    # WHAT ONE IN-FLIGHT STAGE 5 CALL CAN COST, from the shipped constants:
+    #
+    #     MATCHING_REQUEST_TIMEOUT_SECONDS  = 300   (oncotriage/config.py)
+    #     OPENAI_SDK_MAX_RETRIES            = 1
+    #     one call, worst case              = 300 x (1 + 1) = 600 s
+    #
+    # Plus the crash record: the health flush, both console blocks and the
+    # finalized `runs` row, which are database writes measured in
+    # milliseconds. 620s is 600 + 20 of margin for those.
+    #
+    # THIS COVERS THE GROUPED ARM, WHICH IS WHAT SHIPS
+    # (`MATCHING_PER_TRIAL_CALLS_ENABLED` is False): one request per patient,
+    # so one in-flight call. THE PER-TRIAL ARM IS FOUR TIMES LARGER and this
+    # value does NOT cover it:
+    #
+    #     rounds per patient = ceil(MAX_TRIALS_FOR_EVALUATION / parallel)
+    #                        = ceil(15 / 4) = 4
+    #     worst case         = 4 x 600 = 2400 s = 40 minutes
+    #
+    # That number is what must be raised to -- or the API given a shutdown
+    # gate of its own -- BEFORE the per-trial flag is turned on for a
+    # deployment behind an orchestrator. It is stated here rather than
+    # discovered then. The BATCH RUNNER already has such a gate: its SIGTERM
+    # handler asks Stage 5 to stop issuing queued requests, which bounds its
+    # drain at ONE in-flight round (600 s) whichever arm it is on. See
+    # `request_stage5_shutdown` in oncotriage/agent/evaluation.py, and
+    # THE STAGE 5 SHUTDOWN FLAG above it for why the wave's own
+    # `cancel_futures=True` cannot do this from a real signal.
+    #
+    # THE COST OF THE NUMBER IS STATED: a container that is genuinely wedged
+    # now takes up to 620 s to die rather than 10. That is the trade for not
+    # abandoning paid work, and an operator who wants the old behaviour has
+    # `docker kill`.
+    #
+    # NOT SET ON `streamlit`, `qdrant` OR THE THREE AIRFLOW SERVICES: none of
+    # them holds an in-flight billed request, so the default is right for
+    # them and a blanket value would slow every restart for nothing.
+    #
+    # THE BATCH RUNNER IS NOT A COMPOSE SERVICE, so nothing here reaches it.
+    # An operator running `25- Batch Runner.py` under systemd or `docker run`
+    # needs the same allowance -- TimeoutStopSec=620 -- for the same reason.
+    stop_grace_period: 620s
     networks:
       - Clinical-Trial-Patient-Match
 

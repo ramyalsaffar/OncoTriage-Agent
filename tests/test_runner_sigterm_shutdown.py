@@ -547,6 +547,7 @@ import os, sys, threading, time
 # The repo is on PYTHONPATH beside this hook, so this import is an ordinary one.
 from oncotriage.batch import runner as R
 from oncotriage import paths as P
+from oncotriage.agent import evaluation as E
 
 assert os.path.realpath(R.__file__).startswith(
     os.path.realpath(os.environ["ONC_REPO"])), (
@@ -606,6 +607,18 @@ def _patient(fhir_path=None, graph=None, is_resample=False, run_id=None,
     _deadline = time.time() + _CAP
     while not os.path.exists(_RELEASE) and time.time() < _deadline:
         time.sleep(0.01)
+    # ── WAS STAGE 5 TOLD TO STOP WHILE THIS WORKER WAS STILL ALIVE ────────
+    #
+    # THE ONLY MOMENT THE QUESTION CAN BE ASKED. This stand-in stands where
+    # `match_patient_to_trials` would, on the same worker thread, at the same
+    # point in the run -- so the flag's value HERE is the value Stage 5's wave
+    # would have read. Asking after the process has exited proves nothing (the
+    # flag dies with it); asking from the test process proves nothing (a
+    # module global is per process).
+    with _lock:
+        with open(os.environ["ONC_SHUTDOWN_LOG"], "a") as fh:
+            fh.write("%s\t%s\t%s\n" % (name, E.stage5_shutdown_requested(),
+                                        E.stage5_shutdown_reason()))
     return {"patient_id": name, "status": "error", "eligible_matches": 0,
             "near_misses": 0, "not_evaluable": 0, "total_time": 0.01,
             "timestamp": "2026-08-23T00:00:00",
@@ -681,6 +694,9 @@ def drive(name, *, sig, repo=None, patients=40, timeout=180, double=False):
     cp = os.path.join(root, "cp")
     os.makedirs(cp, exist_ok=True)
     started = os.path.join(root, "started.txt")
+    # One line per parked worker at the moment it was RELEASED, recording
+    # whether Stage 5 had been told to stop by then. See the hook.
+    shutdown_log = os.path.join(root, "stage5_shutdown.txt")
     ready = os.path.join(root, "ready.txt")
     release = os.path.join(root, "release.txt")
     log = os.path.join(root, "console.log")
@@ -693,6 +709,7 @@ def drive(name, *, sig, repo=None, patients=40, timeout=180, double=False):
         "ONC_DB": db,
         "ONC_CP": cp,
         "ONC_STARTED": started,
+        "ONC_SHUTDOWN_LOG": shutdown_log,
         "ONC_READY": ready,
         "ONC_RELEASE": release,
         "ONC_CAP": "120",
@@ -803,10 +820,19 @@ def drive(name, *, sig, repo=None, patients=40, timeout=180, double=False):
     else:
         metrics = "<no database>"
 
+    shutdown_seen = []
+    if os.path.exists(shutdown_log):
+        with open(shutdown_log, encoding="utf-8") as handle:
+            shutdown_seen = [line.rstrip("\n").split("\t")
+                             for line in handle if line.strip()]
+
     return {"exit": proc.returncode, "out": out, "signalled": signalled,
             "hook": os.path.exists(hook_marker),
             "saturated": saturated, "handler_entered": handler_entered,
             "started": [n for n in started_names if n],
+            # (patient, "True"/"False", reason) per parked worker, read at the
+            # moment it was released -- see the hook.
+            "stage5_shutdown": shutdown_seen,
             "runs": runs, "metrics": metrics, "patients": patients, "db": db}
 
 
@@ -1087,6 +1113,131 @@ check("3f-d ...and the normal-path summary line is correspondingly ABSENT, so "
 check("3f-e no patient was started beyond the pool's own saturation -- so "
       "nothing was called after the interrupt was raised",
       _STARTED_INT, min(MAX_WORKERS, _INT["patients"]))
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
+# 3B. THE STAGE 5 SHUTDOWN FLAG, READ FROM INSIDE A LIVE WORKER
+# ===========================================================================
+#
+# WHAT THE POOL'S `cancel_futures=True` CANNOT DO, and why this exists. It
+# cancels QUEUED PATIENTS. It does not reach inside a patient that is already
+# running -- and in per-trial mode a running patient is a whole Stage 5 wave:
+# ceil(MAX_TRIALS_FOR_EVALUATION / MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS)
+# rounds of live billed requests, each bounded only by
+# MATCHING_REQUEST_TIMEOUT_SECONDS and the SDK's own retries. The wave has a
+# `finally` of its own that cancels ITS queue, and a real signal never reaches
+# it: CPython delivers signals to the MAIN thread, and the node runs on a
+# WORKER. So the wave's cancellation is correct and, from `docker stop`,
+# unreachable.
+#
+# THE FLAG IS THE REAL FIX and it has to be set BEFORE the in-flight patients
+# are joined -- which is what this section measures, from the one place the
+# question can be asked: inside a worker, at the point the Stage 5 node would
+# be running, in the same process. A module-level flag is per process, so
+# asking from the test process would answer about the test process; and asking
+# after the run has exited would ask about a flag that no longer exists.
+#
+# THE MECHANISM ITSELF -- the wave declining its queued calls, the gate above
+# the warmup, and the patient being FAILED rather than half-completed -- is
+# tests/test_agent_stage5_per_trial_calls.py section 8B. This file's subject is
+# only that the two operator gestures REACH it.
+
+print("\n=== 3b. the Stage 5 shutdown flag reaches a live worker ===")
+
+# THE UNINTERRUPTED ARM, and it is not decoration: without it every check below
+# is satisfied by a flag that is simply always set, which would fail every
+# patient of every ordinary run with no request sent. Four patients rather than
+# forty because nothing here is about cancellation -- the corpus only has to be
+# non-empty so the readings exist.
+_CLEAN = drive("clean-nosignal", sig=None, patients=4)
+check("3b-0 the uninterrupted arm ran to completion with the stand-in hook "
+      "installed", (_CLEAN["hook"], len(_CLEAN["started"])), (True, 4))
+
+
+def _shutdown_readings(run):
+    """(any set, all set, first reason) over the parked workers' readings."""
+    rows = run.get("stage5_shutdown") or []
+    flags = [r[1] for r in rows if len(r) >= 2]
+    reasons = [r[2] for r in rows if len(r) >= 3 and r[2] not in ("None", "")]
+    return (bool(flags) and "True" in flags,
+            bool(flags) and all(f == "True" for f in flags),
+            reasons[0] if reasons else None)
+
+
+_TERM_FLAG = _shutdown_readings(_TERM)
+_INT_FLAG = _shutdown_readings(_INT)
+_CLEAN_FLAG = _shutdown_readings(_CLEAN)
+
+check("3b-a the SIGTERM handler asked Stage 5 to stop, and every in-flight "
+      "worker could see it -- so a wave in that patient would have declined "
+      "its queued requests instead of buying them while shutdown(wait=True) "
+      "blocked",
+      _TERM_FLAG[:2], (True, True))
+check("3b-b ...and the reason names the signal, which is what an operator "
+      "reads on the failed rows the shutdown produced",
+      "SIGTERM" in (_TERM_FLAG[2] or ""), True)
+check("3b-c the Ctrl-C path does the same. It is set in run_batch's own "
+      "`except KeyboardInterrupt`, before the shutdown call that joins the "
+      "workers -- the earliest reachable point, since SIGINT deliberately has "
+      "no handler of its own",
+      _INT_FLAG[:2], (True, True))
+check("3b-d ...and names Ctrl-C rather than the signal number",
+      "Ctrl-C" in (_INT_FLAG[2] or ""), True)
+check("3b-e *** THE NON-DEGENERACY ARM: AN UNINTERRUPTED RUN LEAVES IT "
+      "CLEAR. *** Without this the two above would be satisfied by a flag "
+      "that is simply always set -- which would make every patient of every "
+      "ordinary run fail with no request sent",
+      _CLEAN_FLAG[:2], (False, False))
+check("3b-f ...and that arm really did run patients, so its readings are "
+      "measurements rather than an empty list",
+      (len(_CLEAN["stage5_shutdown"]) > 0,
+       len(_CLEAN["stage5_shutdown"]) == len(_CLEAN["started"])),
+      (True, True))
+
+# THE WIRING, STRUCTURALLY, so a handler that stops calling it fails here even
+# on a machine where the behavioural arm above is flaky under load.
+_ENTRY_TREE = ast.parse(_ENTRY_SRC)
+_RUNNER_TREE = ast.parse(_RUNNER_SRC)
+
+
+def _calls_named(tree, name):
+    return [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+            and getattr(n.func, "id", None) == name]
+
+
+check("3b-g the SIGTERM handler calls request_stage5_shutdown, and does it "
+      "BEFORE raising -- after the raise it would never run at all",
+      [n.name for n in ast.walk(_ENTRY_TREE)
+       if isinstance(n, ast.FunctionDef)
+       and _calls_named(n, "request_stage5_shutdown")],
+      ["_terminate_on_sigterm"])
+check("3b-h both pool handlers call it, and no other function in the runner "
+      "does -- a third caller would be a fourth way to stop a run that "
+      "nothing documents",
+      sorted(n.name for n in ast.walk(_RUNNER_TREE)
+             if isinstance(n, ast.FunctionDef)
+             and _calls_named(n, "request_stage5_shutdown")),
+      ["run_batch", "run_resample"])
+check("3b-i ...and main() CLEARS it, so a second main() in one process does "
+      "not inherit a stop asked of the first",
+      sorted(n.name for n in ast.walk(_RUNNER_TREE)
+             if isinstance(n, ast.FunctionDef)
+             and _calls_named(n, "clear_stage5_shutdown")),
+      ["main"])
+check("3b-j the OPERATOR STOP SENTINEL deliberately does NOT set it. STOP "
+      "promises in-flight patients run to completion, and truncating them "
+      "would break that AND cost more -- their paid round is discarded and "
+      "the resume re-bills the whole patient. Pinned so the third gesture "
+      "cannot acquire the flag by a later edit that looks tidy",
+      [n.name for n in ast.walk(_RUNNER_TREE)
+       if isinstance(n, ast.FunctionDef)
+       and n.name in ("poll", "_start_patient_unless_stopped",
+                      "assert_no_stale_stop_switch", "_cancel_queued")
+       and _calls_named(n, "request_stage5_shutdown")],
+      [])
 
 
 #------------------------------------------------------------------------------

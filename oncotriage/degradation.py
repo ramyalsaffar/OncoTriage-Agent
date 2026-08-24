@@ -307,6 +307,18 @@ _REGISTRY_SPEC = (
      "the patient was failed deliberately so that MAX_LLM_CLASSIFIER_RETRIES "
      "and the batch checkpoint see it. STAYS AT ZERO WHILE "
      "MATCHING_PER_TRIAL_CALLS_ENABLED IS False"),
+    ("STAGE5_SHUTDOWN_SKIPS", _agent_evaluation.STAGE5_SHUTDOWN_SKIPS,
+     "Stage 5 requests that were NOT issued because an operator asked the run "
+     "to stop -- SIGTERM or Ctrl-C, never the STOP sentinel, which promises "
+     "in-flight patients complete. A `warmup:` key means the gate fired before "
+     "the cache writer and that patient sent NOTHING; a `wave:` key means "
+     "requests were already in the air and only the queued ones were declined. "
+     "IT NAMES MONEY NOT SPENT, and it is in this report rather than the "
+     "census because it is the CAUSE of the error rows a stopped run leaves: "
+     "without it, patients that were never judged read as patients that "
+     "failed. Every such patient is failed deliberately and is NOT "
+     "checkpointed, so a resume re-runs it. The total is a FLOOR -- it is "
+     "incremented from worker threads without a lock; see the counter"),
     ("BEDROCK_ADAPTER_DEGRADATIONS",
      _bedrock_adapter.BEDROCK_ADAPTER_DEGRADATIONS,
      "Stage 5 ran on Amazon Bedrock and the request or the response was not "

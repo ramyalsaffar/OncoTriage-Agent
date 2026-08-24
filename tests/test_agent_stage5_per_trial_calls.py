@@ -140,6 +140,7 @@ import types
 
 from oncotriage import config
 from oncotriage.agent import deps
+from oncotriage import degradation as _degradation
 from oncotriage.agent import evaluation as _evaluation
 from oncotriage.fixtures import capture as _capture
 from oncotriage.storage import database_logger as _dl
@@ -2616,6 +2617,240 @@ check("8m  ...and WITH one it is present and carries the value, so 8l is a "
 
 
 # ===========================================================================
+# SECTION 8B -- THE SHUTDOWN FLAG AND THE BOUNDED DRAIN
+# ===========================================================================
+#
+# WHAT IT IS FOR, AND WHY THE WAVE'S OWN `cancel_futures=True` IS NOT IT. In a
+# batch run the Stage 5 node executes on a WORKER thread of
+# `oncotriage/batch/runner.py`'s pool, and CPython delivers a signal only to
+# the MAIN thread. So a real SIGTERM raises SystemExit where the main thread is
+# -- inside `future.result()` -- and the wave's `finally`, which is where
+# `cancel_futures=True` lives, is on a thread nothing has interrupted. Every
+# in-flight patient then finishes its WHOLE wave: ceil(N / parallel) rounds of
+# live billed requests, each bounded only by MATCHING_REQUEST_TIMEOUT_SECONDS
+# and the SDK's own retries, while `shutdown(wait=True)` blocks. Against a
+# `docker stop` grace period whose default is TEN SECONDS the orchestrator
+# SIGKILLs partway through and the run leaves no crash record, no finalized row
+# and a set of requests billed and abandoned mid-read.
+#
+# THE FLAG IS THE REAL FIX and this section is what says it works: `_issue`
+# checks it before each queued call, the gate above the warmup makes a patient
+# entered after the request send NOTHING at all, and -- the half that is not
+# about money -- the patient FAILS rather than completing with a hole in it.
+#
+# WHY FAILING IS THE POINT. Every other exception the send loop meets in
+# per-trial mode is ISOLATED to its trial: that trial is recorded not evaluable
+# and the patient completes. Isolating a shutdown the same way would produce a
+# patient recorded SUCCESS with four verdicts and eleven "not evaluable" -- and
+# `_on_done` CHECKPOINTS a success, so a resume would skip that patient
+# forever. The cohort would carry a silent hole shaped like whenever somebody
+# pressed Ctrl-C. c30 plants exactly that.
+#
+# THE OPERATOR STOP SENTINEL DELIBERATELY DOES NOT SET THIS. See the flag's own
+# note: STOP promises in-flight patients run to completion, and truncating them
+# would both break that and COST MORE -- their paid round is discarded and the
+# resume re-bills the whole patient.
+
+section("SECTION 8B -- the shutdown flag bounds the drain, and fails the "
+        "patient rather than half-completing it")
+
+
+class _ShutdownStub(_Stub):
+    """A stub that asks for a shutdown while the wave is in flight.
+
+    ``after`` is how many WAVE calls are allowed through before the flag is
+    set; the warmup never counts. The flag is set on ``module`` so a control
+    copy sets its OWN global rather than the shipped module's.
+
+    DETERMINISTIC BY CONSTRUCTION, NOT BY TIMING. Driven at ``parallel=1`` the
+    wave's pool has one worker, so the calls are issued one at a time in
+    dispatch order and "the flag was set during call k" is a fact about the
+    sequence rather than about how fast this machine happens to be. No sleep,
+    no barrier, no clock.
+    """
+
+    def __init__(self, *, module, after=1, reason="test shutdown", **kw):
+        super().__init__(**kw)
+        self._module = module
+        self._after = after
+        self._reason = reason
+        self.set_at = None
+
+    def create(self, **kwargs):
+        if not is_warmup(kwargs):
+            with self._lock:
+                seen = sum(1 for r in self.requests if not is_warmup(r))
+            if seen == self._after - 1 and self.set_at is None:
+                self.set_at = seen + 1
+                self._module.request_stage5_shutdown(self._reason)
+        return super().create(**kwargs)
+
+
+def _with_clean_flag(fn, module=_evaluation):
+    """Run `fn`, then clear the flag on `module` whatever happened.
+
+    THE `finally` IS LOAD-BEARING RATHER THAN TIDY: this flag is module-level
+    and every later scenario in this file, and every other test file sharing
+    the process under `pytest`, would see a run they never asked to stop.
+    """
+    try:
+        return drive(fn)
+    finally:
+        module.clear_stage5_shutdown()
+
+
+# ── the accessors, and the reset main() depends on ─────────────────────────
+
+check("8b-a the flag ships CLEAR, so nothing above this line has left one set",
+      (_evaluation.stage5_shutdown_requested(),
+       _evaluation.stage5_shutdown_reason()),
+      (False, None))
+_evaluation.request_stage5_shutdown("first reason")
+_evaluation.request_stage5_shutdown("second reason")
+check("8b-b a request sets the flag and keeps the FIRST reason, so a second "
+      "signal arriving during teardown cannot overwrite the diagnosis of the "
+      "one that is being acted on",
+      (_evaluation.stage5_shutdown_requested(),
+       _evaluation.stage5_shutdown_reason()),
+      (True, "first reason"))
+_evaluation.clear_stage5_shutdown()
+check("8b-c clear_stage5_shutdown() resets BOTH, which is what main() calls "
+      "beside clear_write_ledger() so a second run in one process does not "
+      "inherit the first one's stop",
+      (_evaluation.stage5_shutdown_requested(),
+       _evaluation.stage5_shutdown_reason()),
+      (False, None))
+# ── set BEFORE the node: not one request, not even the warmup ──────────────
+
+_SKIPS_BEFORE = dict(_evaluation.STAGE5_SHUTDOWN_SKIPS)
+_evaluation.request_stage5_shutdown("SIGTERM (signal 15)")
+_R_PRE, _S_PRE = _with_clean_flag(
+    lambda: run_node(_SIX, per_trial=True, parallel=4))
+_SKIPS_PRE = {k: v - _SKIPS_BEFORE.get(k, 0)
+              for k, v in _evaluation.STAGE5_SHUTDOWN_SKIPS.items()
+              if v - _SKIPS_BEFORE.get(k, 0)}
+
+check("8b-e a patient whose node is entered AFTER the shutdown was requested "
+      "sends NOTHING -- not the wave, and not the warmup either. This is the "
+      "largest single saving in the mechanism and a per-call check inside "
+      "`_issue` cannot make it: the warmup is issued before any queued call "
+      "exists",
+      len(_S_PRE.requests), 0)
+check("8b-f ...and the patient FAILS, so the batch checkpoint does not record "
+      "it as done and a resume runs it whole",
+      (bool(at(_R_PRE, "error")), at(_R_PRE, "evaluations")),
+      (True, []))
+check("8b-g ...with the floor's sentence saying a shutdown was requested and "
+      "NOT that a warmup failed. An operator reading a row they produced by "
+      "pressing Ctrl-C must not be sent looking for an endpoint fault",
+      ("shutdown was requested" in str(at(_R_PRE, "error")),
+       "could not be warmed" in str(at(_R_PRE, "error"))),
+      (True, False))
+check("8b-h the skip is counted under the `warmup:` phase, which is what "
+      "separates 'we stopped before this patient' from 'we stopped in the "
+      "middle of it'",
+      (sorted(_SKIPS_PRE), sum(_SKIPS_PRE.values())),
+      ([_evaluation.SHUTDOWN_SKIP_WARMUP_KEY_PREFIX + "SIGTERM (signal 15)"], 1))
+check("8b-i ...and the counter is REGISTERED, so it reaches the run-end "
+      "degradation block and `run_metrics` without a second wiring step",
+      "STAGE5_SHUTDOWN_SKIPS" in _degradation.registered_names(), True)
+
+
+# ── set DURING the wave: one in-flight round, and no partial success ───────
+
+_SKIPS_BEFORE = dict(_evaluation.STAGE5_SHUTDOWN_SKIPS)
+_FAIL_BEFORE = dict(_evaluation.PER_TRIAL_CALL_FAILURES)
+_MID_STUB = _ShutdownStub(module=_evaluation, after=1,
+                          reason="Ctrl-C during the main batch pass")
+_R_MID, _ = _with_clean_flag(
+    lambda: run_node(_SIX, per_trial=True, parallel=1, stub=_MID_STUB))
+_SKIPS_MID = {k: v - _SKIPS_BEFORE.get(k, 0)
+              for k, v in _evaluation.STAGE5_SHUTDOWN_SKIPS.items()
+              if v - _SKIPS_BEFORE.get(k, 0)}
+_FAIL_MID = {k: v - _FAIL_BEFORE.get(k, 0)
+             for k, v in _evaluation.PER_TRIAL_CALL_FAILURES.items()
+             if v - _FAIL_BEFORE.get(k, 0)}
+
+check("8b-j the flag was set during the FIRST wave call (non-degeneracy: a "
+      "scenario in which it was set before the wave began would measure "
+      "8b-e over again and say nothing about the queued calls)",
+      _MID_STUB.set_at, 1)
+check("8b-k EXACTLY ONE WAVE REQUEST WAS ISSUED, out of six. The one already "
+      "in flight cannot be interrupted; every queued one returns without "
+      "being sent",
+      (len([r for r in _MID_STUB.requests if not is_warmup(r)]),
+       len(_MID_STUB.warmup_requests())),
+      (1, 1))
+check("8b-l the five that were not sent are counted under the `wave:` phase",
+      (sorted(_SKIPS_MID),
+       sum(_SKIPS_MID.values())),
+      ([_evaluation.SHUTDOWN_SKIP_WAVE_KEY_PREFIX
+        + "Ctrl-C during the main batch pass"], 5))
+check("8b-m *** THE PATIENT FAILS RATHER THAN COMPLETING WITH A HOLE. *** "
+      "Isolating a shutdown to its trial would publish a SUCCESS carrying one "
+      "verdict and five not-evaluable entries -- and `_on_done` checkpoints a "
+      "success, so a resume would skip that patient forever",
+      (bool(at(_R_MID, "error")), at(_R_MID, "evaluations")),
+      (True, []))
+check("8b-n THE ROUND ALREADY PAID FOR IS STILL IN THE RECORD. The request "
+      "that was in flight was answered and billed, and a failure return that "
+      "omitted it would report a token total no provider produced -- the "
+      "'false TOTAL' shape `_account_unconsumed` exists for, reached from a "
+      "direction that used to be grouped-only",
+      (at(_R_MID, "llm_classifier_calls"),
+       at(_R_MID, "llm_classifier_input_tokens") > 0,
+       len([c for c in at(_R_MID, "llm_classifier_call_details") or []
+            if not c.get("warmup")])),
+      (2, True, 1))
+check("8b-o a request that was never issued is NOT counted as an abandoned "
+      "one. `abandoned:` means paid for and not read, and it is what a "
+      "transport-failure reader acts on; a declined call is neither, and is "
+      "already counted once at the moment it was declined",
+      [k for k in _FAIL_MID if k.startswith("abandoned:")], [])
+
+
+# ── the closed vocabulary, and the limit this pass did NOT close ───────────
+
+check("8b-p WARMUP_SOURCES is closed and holds exactly the three the floor "
+      "branches on, so a fourth member added without a branch falls through "
+      "to the `warmup` wording and is caught here",
+      (_evaluation.WARMUP_SOURCES,
+       len(set(_evaluation.WARMUP_SOURCES))),
+      ((_evaluation.WARMUP_SOURCE_WARMUP,
+        _evaluation.WARMUP_SOURCE_FALLBACK_WRITER,
+        _evaluation.WARMUP_SOURCE_SHUTDOWN), 3))
+check("8b-q ...and every member is named in the floor, by AST rather than by "
+      "grep, so a branch deleted while the constant survives fails here",
+      sorted({n.id for n in ast.walk(ast.parse(_EVAL_SRC))
+              if isinstance(n, ast.Name) and n.id in
+              {"WARMUP_SOURCE_WARMUP", "WARMUP_SOURCE_FALLBACK_WRITER",
+               "WARMUP_SOURCE_SHUTDOWN"}}),
+      ["WARMUP_SOURCE_FALLBACK_WRITER", "WARMUP_SOURCE_SHUTDOWN",
+       "WARMUP_SOURCE_WARMUP"])
+
+# THE LIMIT, MEASURED AND RECORDED RATHER THAN DISCOVERED LATER. The flag
+# bounds the per-trial WAVE and nothing else. Grouped mode issues one request
+# per chunk from the node's own thread, sequentially, and this pass does not
+# gate it -- a wider gate would change the failure mode of the grouped send
+# loop, which is a separate decision with its own blast radius. Asserted so the
+# gap is a stated property with a test behind it.
+_SKIPS_BEFORE = dict(_evaluation.STAGE5_SHUTDOWN_SKIPS)
+_evaluation.request_stage5_shutdown("SIGTERM (signal 15)")
+_R_GRP, _S_GRP = _with_clean_flag(
+    lambda: run_node(_SIX, per_trial=False))
+check("8b-r GROUPED MODE IS NOT GATED, and that is a stated limit rather than "
+      "an oversight: its calls are issued sequentially from the node's own "
+      "thread, and widening the gate would change the grouped send loop's "
+      "failure mode. A grouped run interrupted mid-call still finishes that "
+      "call, exactly as it did before this pass",
+      (len(_S_GRP.requests) > 0,
+       {k: v - _SKIPS_BEFORE.get(k, 0)
+        for k, v in _evaluation.STAGE5_SHUTDOWN_SKIPS.items()
+        if v - _SKIPS_BEFORE.get(k, 0)}),
+      (True, {}))
+
+
+# ===========================================================================
 # SECTION 9 -- THE CONTROLS
 # ===========================================================================
 #
@@ -2743,12 +2978,12 @@ control(
 control(
     "c3  a first TRIAL call doing the cache warmup's job is CAUGHT [2d/3a] -- "
     "the entanglement this pass exists to remove",
-    [("                _warmup_response = call_matching_model_warmup(\n"
-      "                    system_prompt, prompt_cache_key=_cache_key)",
-      "                _warmup_response = _issue(\n"
-      "                    _dispatch_pairs[0][0],\n"
-      "                    _prompts[_chunk_key(_dispatch_pairs[0][0])],\n"
-      "                    _cache_key)[1]")],
+    [("                    _warmup_response = call_matching_model_warmup(\n"
+      "                        system_prompt, prompt_cache_key=_cache_key)",
+      "                    _warmup_response = _issue(\n"
+      "                        _dispatch_pairs[0][0],\n"
+      "                        _prompts[_chunk_key(_dispatch_pairs[0][0])],\n"
+      "                        _cache_key)[1]")],
     lambda m: (lambda st: (len(st.warmup_requests()),
                            is_warmup(st.requests[0])))(
         run_node([trial(i) for i in range(4)], per_trial=True, parallel=4,
@@ -2819,7 +3054,7 @@ control(
 # --- c6: a failed call is not isolated --------------------------------------
 control(
     "c6  a per-trial call failure that ends the PATIENT is CAUGHT [5a]",
-    [("            if _per_trial_calls:\n"
+    [("            if _per_trial_calls and not isinstance(e, Stage5ShutdownRequested):\n"
       "                PER_TRIAL_CALL_FAILURES[type(e).__name__] += 1",
       "            if False:\n"
       "                PER_TRIAL_CALL_FAILURES[type(e).__name__] += 1")],
@@ -3013,9 +3248,9 @@ control(
     "c18 a warmup failure that still lets the wave go out is CAUGHT [3w(a)] "
     "-- N full-price requests against a cold prefix, reported as a clean "
     "patient",
-    [("                    _warmup_error = _wu_exc\n"
-      "                    pending.clear()",
-      "                    _warmup_error = None")],
+    [("                        _warmup_error = _wu_exc\n"
+      "                        pending.clear()",
+      "                        _warmup_error = None")],
     lambda m: (lambda r: (len(r[1].wave_requests()),
                           bool(at(r[0], "error"))))(
         run_node(_FOUR, per_trial=True, parallel=4, node=node_of(m),
@@ -3120,11 +3355,11 @@ control(
 control(
     "c24 a warmup routed apart from its own wave is CAUGHT [2d] -- the hint "
     "would send the writer and the readers to different machines",
-    [("                _warmup_response = call_matching_model_warmup(\n"
-      "                    system_prompt, prompt_cache_key=_cache_key)",
-      "                _warmup_response = call_matching_model_warmup(\n"
-      "                    system_prompt,\n"
-      "                    prompt_cache_key=(_cache_key or \"\") + \"-warmup\")")],
+    [("                    _warmup_response = call_matching_model_warmup(\n"
+      "                        system_prompt, prompt_cache_key=_cache_key)",
+      "                    _warmup_response = call_matching_model_warmup(\n"
+      "                        system_prompt,\n"
+      "                        prompt_cache_key=(_cache_key or \"\") + \"-warmup\")")],
     lambda m: (lambda st: len({r.get("prompt_cache_key")
                                for r in st.requests}))(
         run_node(_FOUR, per_trial=True, parallel=4, node=node_of(m))[1]),
@@ -3136,14 +3371,14 @@ control(
     "c25 a cache-key rejection that leaves the hint on the wave is CAUGHT "
     "[3w(o)] -- every fallback call would be refused for the parameter that "
     "was just refused, and a recoverable finding would fail the patient",
-    [("                    if _rejection == WARMUP_REJECTED_CACHE_KEY:\n"
-      "                        # DROPPED FOR THE WAVE TOO. The provider refused this\n"
-      "                        # parameter, so carrying it into the fallback's calls\n"
-      "                        # would refuse every one of them and turn a recoverable\n"
-      "                        # configuration finding into a failed patient.\n"
-      "                        _cache_key = None",
-      "                    if False:\n"
-      "                        _cache_key = None")],
+    [("                        if _rejection == WARMUP_REJECTED_CACHE_KEY:\n"
+      "                            # DROPPED FOR THE WAVE TOO. The provider refused this\n"
+      "                            # parameter, so carrying it into the fallback's calls\n"
+      "                            # would refuse every one of them and turn a recoverable\n"
+      "                            # configuration finding into a failed patient.\n"
+      "                            _cache_key = None",
+      "                        if False:\n"
+      "                            _cache_key = None")],
     lambda m: sorted(
         {r.get("prompt_cache_key") is not None
          for r in run_node(_FOUR, per_trial=True, parallel=4, node=node_of(m),
@@ -3453,6 +3688,104 @@ check("9b(j) ...and nothing was backfilled: a row written before the column "
       "existed would still read NULL. (Zero here because this scratch "
       "database had no such rows; the check is that the migration writes no "
       "default, which the DEFAULT-less ALTER guarantees)", _legacy, 0)
+
+
+
+# --- c32..c35: the shutdown flag ---------------------------------------------
+#
+# Each drives a COPY whose own module-level flag is set, so the shipped
+# module's flag is untouched and section 8B's readings above cannot be
+# disturbed by a control below them.
+
+def _shutdown_probe(module, *, before=False, trials=None, parallel=1):
+    """Drive `module`'s node with a shutdown asked for, and return the run.
+
+    `before=True` asks before the node is entered (nothing should be sent at
+    all); otherwise a `_ShutdownStub` asks during the first WAVE call, which is
+    deterministic at parallel=1 because the wave's pool then has one worker and
+    issues in dispatch order.
+    """
+    trials = trials if trials is not None else _SIX
+    stub = None
+    try:
+        if before:
+            module.request_stage5_shutdown("SIGTERM (signal 15)")
+        else:
+            stub = _ShutdownStub(module=module, after=1,
+                                 reason="Ctrl-C during the main batch pass")
+        result, stub = run_node(trials, per_trial=True, parallel=parallel,
+                                node=node_of(module), stub=stub)
+        return result, stub
+    finally:
+        module.clear_stage5_shutdown()
+
+
+control(
+    "c32 a wave worker that does not consult the flag is CAUGHT [8b-k] -- "
+    "every queued request goes out at full price after the operator asked the "
+    "run to stop, which is the whole drain this pass bounds",
+    [('            if _SHUTDOWN_REQUESTED:\n'
+      '                STAGE5_SHUTDOWN_SKIPS[\n'
+      '                    f"{SHUTDOWN_SKIP_WAVE_KEY_PREFIX}"\n'
+      '                    f"{_SHUTDOWN_REASON or \'unspecified\'}"] += 1\n'
+      '                return ("error", Stage5ShutdownRequested(\n'
+      '                    f"the request was not issued: {_SHUTDOWN_REASON}"))',
+      '            if False:\n'
+      '                pass')],
+    lambda m: (lambda r: (len(r[1].wave_requests()),
+                          bool(at(r[0], "error"))))(_shutdown_probe(m)),
+    (6, False),
+)
+
+control(
+    "c33 *** a send loop that ISOLATES a shutdown to its trial is CAUGHT "
+    "[8b-m]. *** The patient is published as a SUCCESS carrying one verdict "
+    "and five not-evaluable entries -- and `_on_done` checkpoints a success, "
+    "so a resume skips it forever and the cohort keeps a hole shaped like the "
+    "moment somebody pressed Ctrl-C",
+    [("            if _per_trial_calls and not isinstance(e, Stage5ShutdownRequested):",
+      "            if _per_trial_calls:")],
+    lambda m: (lambda r: (bool(at(r[0], "error")),
+                          len(at(r[0], "evaluations") or []),
+                          sorted({str(e.get("not_evaluable_reason"))
+                                  for e in (at(r[0], "evaluations") or [])})))(
+        _shutdown_probe(m)),
+    (False, 6, ["None", NOT_EVALUABLE_CALL_FAILED]),
+)
+
+control(
+    "c34 a node that skips the gate above the warmup is CAUGHT [8b-e] -- a "
+    "patient entered after the shutdown pays for one infrastructure request to "
+    "warm a prefix no trial request will ever use, and pays it again on every "
+    "one of MAX_LLM_CLASSIFIER_RETRIES re-entries",
+    [('            if _SHUTDOWN_REQUESTED:\n'
+      '                STAGE5_SHUTDOWN_SKIPS[\n'
+      '                    f"{SHUTDOWN_SKIP_WARMUP_KEY_PREFIX}"',
+      '            if False:\n'
+      '                STAGE5_SHUTDOWN_SKIPS[\n'
+      '                    f"{SHUTDOWN_SKIP_WARMUP_KEY_PREFIX}"')],
+    lambda m: (lambda r: (len(r[1].warmup_requests()),
+                          len(r[1].wave_requests())))(
+        _shutdown_probe(m, before=True)),
+    (1, 0),
+)
+
+control(
+    "c35 a fold that counts a DECLINED request as an ABANDONED one is CAUGHT "
+    "[8b-o] -- `abandoned:` means paid for and not read, and inflating it with "
+    "the consequences of an interrupt sends a reader after a transport fault "
+    "that never happened. It is also what proves `_account_unconsumed()` is "
+    "REACHED on this return: without the call there would be nothing to "
+    "miscount",
+    [("                if isinstance(_payload, Stage5ShutdownRequested):\n"
+      "                    continue",
+      "                if False:\n"
+      "                    continue")],
+    lambda m: (lambda r: sorted(
+        k for k in m.PER_TRIAL_CALL_FAILURES if k.startswith("abandoned:")))(
+        _shutdown_probe(m)),
+    ["abandoned:Stage5ShutdownRequested"],
+)
 
 
 # ===========================================================================

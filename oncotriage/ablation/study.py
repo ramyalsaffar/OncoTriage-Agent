@@ -518,7 +518,10 @@ def load_ablation_checkpoint(db_path=None, fingerprint=None) -> set:
         raise run_fingerprint.ResumeRefusal("\n".join(
             run_fingerprint.refusal_lines(
                 outcome, detail, f"the ablation checkpoint at {cp}",
-                _checkpoint_remediation(db_path))),
+                _checkpoint_remediation(db_path),
+                # The stored stamp, so a checkpoint written by a NEWER build is
+                # refused WITHOUT `--fresh-start` being presented as the fix.
+                recorded=data.get("fingerprint"))),
             outcome=outcome)
 
     try:

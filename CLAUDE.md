@@ -417,9 +417,51 @@ the same command.
 
 | gesture | needs | run row | exit | resample pass |
 |---|---|---|---|---|
-| `touch <checkpoint dir>/STOP` | a shared filesystem | **STOPPED** | 0 | never entered |
+| `touch <checkpoint dir>/STOP` | a shared filesystem | **STOPPED**, or FINISHED if the main pass had already covered the cohort | 0 | never entered |
 | Ctrl-C | a terminal | KILLED | 130 | never entered |
 | SIGTERM (`docker stop`, systemd) | a pid | KILLED | 143 | never entered |
+
+**A STOP THAT LANDS IN THE RESAMPLE PASS IS NOT A STOPPED RUN (the pre-migration
+pass).** `main()` read `STOP_SWITCH.requested` at four sites, which is a
+question about whether a sentinel was SEEN and not about whether the cohort was
+COVERED. Drive a 40-patient corpus to completion and write the sentinel while
+the resample pass is running and the switch latches -- but the main pass had
+already run every patient. The run was recorded STOPPED, whose entire meaning is
+"this campaign covers a PREFIX of the cohort, so no rate computed over it is a
+rate about the cohort", and the checkpoint was KEPT "because patients remain"
+with none remaining. `run_batch`'s second return member is now the honest
+answer -- `stop_unsubmitted == 0 and batch_cancelled == 0`, the only two ways a
+patient can be left unattempted -- and `main()` reads it. The stop is still
+ANNOUNCED either way; what changes is which of the two things it is reported as
+having cut short.
+
+**ONE RUN AT A TIME, PER CHECKPOINT DIRECTORY.** Nothing stopped two
+invocations from starting against one directory: both read the same resume state
+and both processed the SAME patients at one live Stage 5 call each, silently.
+`25- Batch Runner.py`'s guard takes an exclusive `flock` keyed on the checkpoint
+directory, held for the process's life and released by the KERNEL however it
+exits, and a second invocation exits **3** naming the holder's pid, host, user
+and start time having touched nothing. See THE RUN LOCK in
+`oncotriage/batch/runner.py` for why it is not a pid file, and why the key is
+the checkpoint directory rather than the code directory.
+
+**THE STALE-SENTINEL PREFLIGHT RUNS ABOVE `--fresh`.** It lived only inside
+`main()`, which is called after the guard has processed its flags -- so `--fresh`
+beside a stale sentinel deleted the checkpoint and THEN refused, printing
+"NOTHING HAS BEEN RUN AND NOTHING HAS BEEN BILLED" over a cohort the next run
+would re-bill in full. `--clear-stop` SATISFIES the preflight rather than being
+blocked by it: it is the resume gesture the refusal itself names, and the line
+is destructive/non-destructive, not "any flag".
+
+**A CHECKPOINT THAT COULD NOT BE WRITTEN IS COUNTED.** `save_checkpoint`'s and
+`append_result`'s `except OSError` printed and moved on, touching no counter --
+so a read-only checkpoint directory produced a run whose degradation block said
+CLEAN and whose closing line said the checkpoint had been kept. Both now count
+under `write:{Type}` (and `tmp_unlink:{Type}`) into the already-registered
+`CHECKPOINT_FAULTS` / `RESULTS_FILE_FAILURES`, so the run-end block and
+`run_metrics` get it for free, and every checkpoint verdict `main()` prints goes
+through `describe_checkpoint_state()`, which reports **STALE** or **ABSENT**
+rather than "kept".
 
 **Ctrl-C USED TO BE ABSORBED AND THE RUN CARRIED ON SPENDING.** Both pool
 handlers caught the `KeyboardInterrupt`, printed "Checkpoint saved. Safe to
@@ -467,7 +509,7 @@ python tests/test_registries_cancer_code_claims_audit_control.py   #  16; 14 pla
 python tests/test_config_snapshot_date_rot.py                      #  10; 6 subprocess runs, ~6 min
 python tests/test_package_invariants.py                            # 260/0/0 on macOS (was 247 before section 2f(iii)); 245/2/2 on Linux was measured at 247 and has not been re-measured there (was 234/6 there before commit ec2033a gave it a SKIP mechanism). No network, no keys, no corpus. NOT in CI — see below
 python tests/test_degraded_dependencies.py                         # 174 (was 172 in this note, and 170 before pass 20e; the 172 was never true of the file). Item 11a
-python tests/test_storage_query_layer.py                           # 427 (this line said 376 and was stale by 28 before the round-two pass, which added section 2d over `stage5_cache_effectiveness` and the three ledgers its seed needed. MEASURED 2026-08-23); item 38, temp SQLite only
+python tests/test_storage_query_layer.py                           # 434 (was 427; the pre-migration pass added section 8b-l over campaign_summary's patient/row split and the resample-bearing fragment its seed needed); item 38, temp SQLite only
 
 # The four added by pass 20f-1. Same shape, same directory, no network, no keys,
 # no spend, and none of them writes anything in the repository.
@@ -510,7 +552,7 @@ python tests/test_dashboard_reproducibility_tab.py --update-snapshot  # regenera
 # therefore not pinned to a streamlit version's element vocabulary -- see its
 # docstring for why a snapshot recorded on day one of a NEW tab would be the
 # "correct by definition" shape that file's own rule forbids. ~0.9 s.
-python tests/test_dashboard_run_health.py                          # 192
+python tests/test_dashboard_run_health.py                          # 196 (was 192; the pre-migration pass added 8f over the campaigns panel's patients/rows split)
 
 # The campaign pass. Same shape, same directory. It is the ONLY thing in this
 # project that renders oncotriage.dashboard.app:main() -- the ten-tab wiring
@@ -718,7 +760,7 @@ python tests/test_runner_crash_record_and_db_unification.py         #  65
 # than about scheduling -- the first version slept instead and was measured
 # FLAKY under bucket-A load. NOT in the collision matrix. It EXECS NOTHING: the
 # one control is a copy of the package in a temp directory. Bucket A, ~6 s.
-python tests/test_runner_sigterm_shutdown.py                        #  75 (was 55; the stop-switch pass rewrote section 3 for the new Ctrl-C contract and added the re-raise control)
+python tests/test_runner_sigterm_shutdown.py                        #  86 (was 75; the pre-migration pass added section 3b, which reads the Stage 5 shutdown flag FROM INSIDE A LIVE WORKER -- the only place the question can be asked -- with an uninterrupted arm as its non-degeneracy control)
 
 # The stop-switch pass. Same shape, same directory. No network, no keys, NO
 # SPEND, no live Qdrant, no model load, no corpus, no git history, no live
@@ -730,7 +772,19 @@ python tests/test_runner_sigterm_shutdown.py                        #  75 (was 5
 # unreachable and the money case cannot be measured), and a successful patient
 # makes the real save_checkpoint resolve the stamp over the wire. NOT in the
 # collision matrix. It EXECS NOTHING. Bucket A, ~14 s.
-python tests/test_runner_stop_switch.py                             # 122
+python tests/test_runner_stop_switch.py                             # 133 (was 122; the pre-migration pass reversed scenario C -- a stop that lands in the RESAMPLE pass is FINISHED, not STOPPED -- and added section 5b, its control)
+
+# The pre-migration pass. Same shape, same directory. No network, no keys, NO
+# SPEND, no live Qdrant, no model load, no corpus, no git history, no live
+# server -- process_patient, the BM25 index, the graph, the tracking module and
+# run_fingerprint.current are stand-ins and THE GRAPH IS NEVER INVOKED. It uses
+# REAL CONCURRENT SUBPROCESSES and a REAL SIGKILL on purpose: a lock released by
+# the kernel cannot be observed from inside the process that held it. NOT in the
+# collision matrix -- every database, checkpoint, sentinel and FHIR file is
+# inside a tempfile.mkdtemp it removes and asserts gone, and the two repository
+# files it reads (batch/runner.py, "25- Batch Runner.py") are sha256-compared at
+# the end. It EXECS NOTHING. Bucket A, ~18 s alone / ~30 s under bucket-A load.
+python tests/test_runner_preflight_and_state_faults.py              #  76
 
 # The CI-hygiene pair. Same shape, same directory. Neither imports anything
 # from the package -- their subjects are `.github/scripts/` and
@@ -789,7 +843,7 @@ python tests/test_agent_cross_encoder_sequence_limit.py             #  42
 # the suite's two writers and are sha256-compared at the end. It DOES exec:
 # twenty-four in-memory copies of agent/evaluation.py, one plant each, argued
 # at _EXEC_ALLOWLIST. Bucket A, ~4 s.
-python tests/test_agent_stage5_per_trial_calls.py                   # 255 (this line said 239 and was stale by 16; MEASURED 2026-08-23. ~10 s: section 3d parks two workers for a bounded grace on each of its two arms)
+python tests/test_agent_stage5_per_trial_calls.py                   # 276 (was 255; the pre-migration pass added section 8B over the Stage 5 shutdown flag and controls c32-c35. ~10 s: section 3d parks two workers for a bounded grace on each of its two arms)
 
 # The harness-budget pass. Same shape, same directory. No network, no keys, no
 # spend, NO LIVE SERVER and no live Qdrant -- it starts nothing and issues no
@@ -4615,7 +4669,7 @@ refuse every record already written. The stamp carries its own
 # is a different INPUT to a pure function or an attribute rebind inside
 # try/finally with the restore asserted BY IDENTITY -- so it needs no
 # _EXEC_ALLOWLIST entry. ~2 s.
-python tests/test_resume_configuration_fingerprint.py            # 446 (was 404; the call-mode pass added section 1c and drove the arm through all three shipped resume gates)
+python tests/test_resume_configuration_fingerprint.py            # 460 (was 446; the pre-migration pass drove the future-era stamp both directions)
 ```
 
 **TEST COUNTS.** `tests/test_agent_degraded_run_and_reporting.py` **118 → 118**
@@ -6729,6 +6783,131 @@ to a pass that can measure it. And an interrupt still discards the responses
 already resolved into `_prefetched` — nothing catches KeyboardInterrupt, which
 is correct, and writing a ledger from a signal handler is a separate decision.
 
+
+### Seven pre-migration findings (the pre-migration pass)
+
+**SEVEN FINDINGS FROM VERIFICATION ROUND THREE, EACH WITH A DRIVEN
+REPRODUCTION TURNED INTO A STANDING TEST.** No schema change, no migration, no
+billed call: `python fixture_replay.py` is **12/12 clean, exit 0, with no
+recapture**, and the production `inferences.db` sha256 is unchanged.
+
+**F1 -- THE RUN LOCK.** Argued at THE RUN LOCK in `oncotriage/batch/runner.py`
+and summarised in the stop-gesture block above. `tests/test_runner_preflight_and_state_faults.py`
+drives it with REAL CONCURRENT SUBPROCESSES: the first parks its pool, the
+second is refused with exit 3 having started NO patient, the first then
+completes normally, and a SIGKILLed holder is shown to leave the lock free for a
+successor -- the property a pid file cannot have.
+
+**F2 -- THE WRITE FAILURES ARE COUNTED.** Also summarised above. Driven against
+a checkpoint directory made read-only WHILE THE POOL IS PARKED, so every state
+file write fails: the run-end block is measured DEGRADED rather than CLEAN, and
+the closing line reads ABSENT rather than "Cleared for next fresh run."
+
+**F3 -- THE PREFLIGHT ABOVE THE DESTRUCTIVE FLAG.** Also summarised above.
+Driven end to end with the checkpoint sha256'd before and after the refusal.
+**AND THE FLAG ANNOUNCEMENTS MOVED TO `console.out`**: `print` goes to STDOUT,
+which Python block-buffers when it is not a tty, while every other line the run
+emits goes to STDERR flushed per line -- so in the ordinary
+`python "25- Batch Runner.py" --fresh > run.log 2>&1` those two lines surfaced at
+interpreter exit, BELOW the summary of the run they preceded. The same trap the
+SIGTERM handler already records having MEASURED.
+
+**F4 and F9 -- THE BOUNDED DRAIN, AND WHAT `cancel_futures=True` CANNOT DO.**
+The dispatch-hardening pass added `cancel_futures=True` to the Stage 5 wave's
+`finally` and called it the operator-interrupt fix. **IT IS UNREACHABLE FROM A
+REAL SIGNAL IN A BATCH RUN**, and that is a fact about CPython: signals are
+delivered to the MAIN thread, and the node executes on a WORKER thread of the
+batch pool. So the SystemExit lands in `future.result()`, the pool cancels
+QUEUED PATIENTS, and every in-flight patient then finishes its WHOLE wave while
+`shutdown(wait=True)` blocks. The note in `evaluation.py` is corrected to say
+so.
+
+`oncotriage/agent/evaluation.py` now carries a **module-level shutdown flag** --
+a plain bool and a reason, no lock, because a signal handler that acquires a
+lock the main thread may hold is how a shutdown path deadlocks. `_issue` reads
+it before each queued call; a **gate above the warmup** makes a patient entered
+after the request send NOTHING at all; and a shutdown is the ONE exception the
+send loop does not isolate to its trial, because `_on_done` CHECKPOINTS a
+success and a patient published with four verdicts and eleven not-evaluable
+would be skipped by every resume forever.
+
+**SET BY SIGTERM AND Ctrl-C, AND DELIBERATELY NOT BY THE STOP SENTINEL.** The
+brief asked for all three; STOP promises in-flight patients RUN TO COMPLETION
+and are written, and setting the flag there would break that AND COST MORE, not
+less -- the in-flight round is discarded, the patient fails, it is not
+checkpointed, and the resume re-bills the whole of it. Only the two gestures
+that are already abrupt and already record the run KILLED set it.
+`tests/test_runner_sigterm_shutdown.py` section 3b pins that STOP does not.
+
+**MEASURED, BOTH ARMS, against the real entry point under a real SIGTERM with
+twelve waves genuinely in flight** (stand-in client, no spend): with the flag,
+**0 further requests** and exit at 2.85 s; with `_issue`'s check removed, **156
+further requests** and exit at 4.71 s. In production the arithmetic is
+
+    rounds per patient  = ceil(MAX_TRIALS_FOR_EVALUATION / parallel) = ceil(15/4) = 4
+    without the flag    = 4 x MATCHING_REQUEST_TIMEOUT_SECONDS x (1 + OPENAI_SDK_MAX_RETRIES)
+                        = 4 x 300 x 2 = 2400 s = 40 minutes
+    with the flag       = 1 x 300 x 2 =  600 s = 10 minutes
+
+**TEN MINUTES STILL EXCEEDS `docker stop`'s TEN-SECOND DEFAULT**, so
+`docker-compose.yml` gives `fastapi` `stop_grace_period: 620s` with that
+arithmetic written beside it -- 600 for the call plus 20 for the crash record.
+It covers the GROUPED arm, which is what ships; the per-trial 2400 s is named
+there as what must be raised to before that flag is turned on behind an
+orchestrator, since the API has no shutdown gate of its own. The batch runner is
+not a compose service, and the note says an operator running it under systemd
+needs `TimeoutStopSec=620` for the same reason.
+
+**F5 -- RESAMPLE-STOP STATUS HONESTY.** Above, in the stop-gesture block.
+
+**F6 -- A PATIENT IS NOT A ROW.** `campaign_summary`'s `total_patients` was
+`SUM(COUNT(*))` over the fragments' inference rows under a docstring calling it
+"the campaign's real cohort size". It is wrong on EVERY real campaign: the
+resample pass writes a second row for each of `RESAMPLE_COUNT` (100)
+already-processed patients, so a 1,000-patient campaign reported 1,100 and a
+reviewer dividing a cost or a rate by it used a denominator 10% too large. It is
+`COUNT(DISTINCT patient_id)` **across the whole campaign** now, with
+`inference_rows` beside it -- and the DISTINCT is campaign-level rather than
+per-fragment-summed because a patient whose attempt ERRORED is not checkpointed,
+so the resume re-runs it and its two rows are in different fragments. The Run
+Health tab's campaigns panel carries both, because every money column there is
+summed over the ROWS.
+
+**F8 -- A STAMP FROM THE FUTURE IS THE OPPOSITE REMEDY.** Every
+`fingerprint_version` mismatch got one message and that message said to clear the
+artifact -- correct for an OLDER stamp and exactly wrong for a NEWER one, where
+the artifact is fine and THIS BUILD IS BEHIND IT. `compare()` has one branch on
+`recorded > FINGERPRINT_VERSION`; the outcome is still FP_VERSION (the fields
+are equally uncomparable and a sixth member of a closed vocabulary would be a
+change every consumer has to learn), and the DETAIL says NEWER, says nothing is
+wrong with the artifact, and names the remedy as checking out the code that
+wrote it. `refusal_lines` takes the stored stamp as an optional argument so it
+can print **DO NOT RUN THE COMMANDS BELOW** above the caller's own `--fresh` /
+`--fresh-start` remediation. The comparison is guarded -- `"4" > 3` is a
+TypeError raised out of the one function deciding whether a refusal is safe --
+and a `bool` is excluded on this project's usual footing. **It follows the
+storage layer's precedent**: `initialize_database` refuses to LOWER a
+`PRAGMA user_version` it finds ahead of its own. The difference is stated rather
+than glossed: that schema is strictly additive, so the older writer carries on;
+a fingerprint is a set of facts to be compared, so this still refuses.
+
+**F7 (the ablation study's controls) IS DELIBERATELY EXCLUDED from this pass and
+is its own item.**
+
+**A DEFECT IN THIS PASS'S OWN WORK, FOUND BY ITS OWN NEW TEST AND NOT BY
+READING.** The `with exclusive_run_lock():` reindent put the guard's tail at
+eight spaces when the `with` body is at twelve -- so `main()` ran OUTSIDE the
+lock, which was released before the first patient. Every lock check passed as a
+unit; the two-real-subprocesses scenario is what caught it, with `lsof` showing
+nobody holding the file while a run was live.
+
+**AND A PRE-EXISTING FLAKE WORTH RECORDING.**
+`tests/test_runner_stop_switch.py` and `tests/test_runner_sigterm_shutdown.py`
+run green alone and green in CI bucket A's pool, and FAIL when the two are run
+CONCURRENTLY BY THEMSELVES -- measured at HEAD in a `git worktree`, before any
+of this pass's edits, at 112/10 and a failing sigterm arm. Both drive 40-patient
+subprocesses with `MAX_WORKERS` threads each; the machine saturates and the
+signal lands after the corpus has run. Not caused here and not fixed here.
 
 ### The prompt cache has a reader, and per-trial mode was verified as a whole (the cache-reader pass)
 

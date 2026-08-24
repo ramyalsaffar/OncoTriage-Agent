@@ -1406,6 +1406,56 @@ check_true("8e  the panel says the per-run figures above are fragments, "
            "which is the sentence that keeps the run list from being misread",
            "fragments" in _joined(_camp, "info"))
 
+# --- A PATIENT IS NOT A ROW, ON THE PANEL AS WELL AS IN THE SQL ------------
+#
+# THE COST COLUMN IS SUMMED OVER ROWS. So a reader dividing `cost $` by
+# `patients` is computing a per-patient figure, and before the pre-migration
+# pass `patients` WAS the row count -- the two agreed, wrongly, and the answer
+# happened to be right. Now that `patients` is DISTINCT patients the two must
+# both be on the table, or the same division is silently too high by exactly
+# the resample pass.
+check_true("8f  the campaign table carries BOTH counts, so the denominator "
+           "that matches the cost column is on the page",
+           {"patients", "rows"} <= set(_camp_table.columns))
+check("8f  ...and they are EQUAL on a campaign with no repeats, which is what "
+      "makes their difference legible when there is one",
+      (at_(_camp_rows, _ROOT, {}).get("patients"),
+       at_(_camp_rows, _ROOT, {}).get("rows")),
+      (sum(_CAMP_PATIENTS[l] for l in ("CHAIN-1", "CHAIN-2", "CHAIN-3")),
+       sum(_CAMP_PATIENTS[l] for l in ("CHAIN-1", "CHAIN-2", "CHAIN-3"))))
+
+# ...and they DIVERGE once the campaign carries the two overlaps a real one
+# does: a resample row (same patient, same fragment) and a retried patient
+# (same patient, two fragments). Seeded onto a COPY so the checks above keep
+# reading the database they were written for.
+_REPEAT_DB = os.path.join(_TMP, "campaigns_repeat.db")
+shutil.copy2(_SCRATCH["campaigns"], _REPEAT_DB)
+_SCRATCH["campaigns_repeat"] = _REPEAT_DB
+_rep_conn = sqlite3.connect(_REPEAT_DB)
+_rep_conn.execute(
+    "INSERT INTO inferences (patient_id, timestamp, run_id, "
+    "estimated_cost_usd, error, age, sex) "
+    "VALUES ('CHAIN-1-0', '2026-08-20 11:00:00', ?, 0.1, '', 60, 'male')",
+    (_CAMP_IDS["CHAIN-1"],))                    # the resample pass
+_rep_conn.execute(
+    "INSERT INTO inferences (patient_id, timestamp, run_id, "
+    "estimated_cost_usd, error, age, sex) "
+    "VALUES ('CHAIN-1-1', '2026-08-20 12:00:00', ?, 0.1, '', 60, 'male')",
+    (_CAMP_IDS["CHAIN-3"],))                    # an errored patient, retried
+_rep_conn.commit()
+_rep_conn.close()
+_rep, _rep_paths, _rep_net = _render(_REPEAT_DB)
+_rep_table = _frame_with(_rep, "campaign", "run ids", "patients")
+_rep_rows = {int(r["campaign"]): r for _, r in _rep_table.iterrows()}
+check("8f  a resample row and a cross-fragment retry leave the PATIENT count "
+      "unchanged and move the ROW count -- which is the whole distinction, "
+      "and the panel shows both",
+      (at_(_rep_rows, _ROOT, {}).get("patients"),
+       at_(_rep_rows, _ROOT, {}).get("rows")),
+      (sum(_CAMP_PATIENTS[l] for l in ("CHAIN-1", "CHAIN-2", "CHAIN-3")),
+       sum(_CAMP_PATIENTS[l] for l in ("CHAIN-1", "CHAIN-2", "CHAIN-3")) + 2))
+check("8f  ...and the render raised nothing", _rep["exception"], [])
+
 # --- PLANTED DEFECTS ------------------------------------------------------
 
 # P9 -- the campaign totals report a fragment instead of the sum.

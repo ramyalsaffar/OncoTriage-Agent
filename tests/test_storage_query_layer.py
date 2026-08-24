@@ -3859,6 +3859,15 @@ _CAMPAIGN_RUNS = [
     # with what they assert.
     ("MODECRASH",  "KILLED",   0, "C", _GROUPED,   "2026-08-05T10:00:00", "2026-08-05T11:00:00"),
     ("MODERESUME", "FINISHED", 1, "C", _PER_TRIAL, "2026-08-05T12:00:00", "2026-08-05T13:00:00"),
+    # ── THE RESAMPLE-BEARING PAIR (the pre-migration pass) ─────────────────
+    #
+    # FINGERPRINT KEY "D", ITS OWN AND SHARED WITH NOTHING, and appended LAST
+    # so these two ids are the highest in the seed: no existing fragment can
+    # take either as a parent, and neither can take an existing one, so this
+    # shape is added without moving a single expectation above it. MODECRASH's
+    # note records what happens when that care is not taken.
+    ("RESAMP-1", "KILLED",   0, "D", _PER_TRIAL, "2026-08-06T10:00:00", "2026-08-06T11:00:00"),
+    ("RESAMP-2", "FINISHED", 1, "D", _PER_TRIAL, "2026-08-06T12:00:00", "2026-08-06T13:00:00"),
 ]
 # Which patients each fragment wrote. THE POINT OF THE WHOLE QUERY is that these
 # sum across a campaign, so the three CHAIN fragments deliberately carry
@@ -3877,6 +3886,26 @@ _CAMPAIGN_PATIENTS = {
     # with a wrong answer by coincidence.
     "MODECRASH":  [("M1-a", 0.30), ("M1-b", 0.30)],
     "MODERESUME": [("M2-a", 0.30)],
+    # ── A PATIENT IS NOT A ROW, AND THIS PAIR IS WHERE THEY DIVERGE ────────
+    #
+    # TWO REAL MECHANISMS, ONE INSIDE A FRAGMENT AND ONE ACROSS TWO, and the
+    # query has to survive both:
+    #
+    #   R-a appears TWICE IN RESAMP-1. That is the RESAMPLE PASS: it re-runs a
+    #       seeded subset of already-processed patients (RESAMPLE_COUNT is 100)
+    #       and each re-run writes ANOTHER inferences row. Every real campaign
+    #       this runner produces has ~100 of these.
+    #   R-c appears in RESAMP-1 AND in RESAMP-2. That is a patient whose first
+    #       attempt ERRORED: an errored patient is not checkpointed, so the
+    #       resume runs it again -- and the two rows are in DIFFERENT
+    #       fragments, which is why a per-run DISTINCT summed across fragments
+    #       is still wrong and the count has to be taken over the campaign.
+    #
+    # 6 rows, 4 patients, and per-run distinct summed would give 5 -- three
+    # different numbers, so no arithmetic accident can make the check below
+    # pass.
+    "RESAMP-1": [("R-a", 0.10), ("R-b", 0.10), ("R-c", 0.10), ("R-a", 0.10)],
+    "RESAMP-2": [("R-c", 0.10), ("R-d", 0.10)],
 }
 _CAMPAIGN_IDS = {}
 for _label, _status, _resumed, _fp, _arm, _started, _finished in _CAMPAIGN_RUNS:
@@ -4016,9 +4045,70 @@ check("8b-g: every run appears in exactly one campaign and none is lost -- "
       "the query is driven from `runs`, so the members must partition it",
       sum(_safe_int(r.runs) for r in _campaigns.itertuples()),
       len(_CAMPAIGN_RUNS))
-check("8b-g: ...so there are seven campaigns over nine runs -- the three CHAIN "
-      "fragments are one, and every other run is its own",
-      len(_campaigns), 7)
+check("8b-g: ...so there are eight campaigns over eleven runs -- the three "
+      "CHAIN fragments are one, the resample-bearing pair is one, and every "
+      "other run is its own",
+      len(_campaigns), 8)
+
+
+# --- A PATIENT IS NOT A ROW ------------------------------------------------
+#
+# THE DEFECT, NAMED: `total_patients` was `SUM(COUNT(*))` over the fragments'
+# inference rows, under a docstring calling it "the campaign's real cohort
+# size". It is not, and it is wrong on EVERY real campaign this runner
+# produces: the resample pass writes a second row for each of RESAMPLE_COUNT
+# (100) already-processed patients, so a 1,000-patient campaign reported 1,100
+# -- and a reviewer dividing a cost or a rate by it used a denominator 10% too
+# large, silently.
+#
+# THREE DIFFERENT NUMBERS ARE AVAILABLE HERE ON PURPOSE, so no arithmetic
+# accident can pass: 6 rows, 4 distinct patients across the campaign, and 5 if
+# the DISTINCT were taken per fragment and then summed (which is the plausible
+# wrong fix -- it survives the resample overlap inside a fragment and not the
+# retry overlap between two).
+_RES_ROOT = _CAMPAIGN_IDS["RESAMP-1"]
+_res = _camp_by_id.get(_RES_ROOT)
+_RES_ROWS = sum(len(_CAMPAIGN_PATIENTS[_l]) for _l in ("RESAMP-1", "RESAMP-2"))
+_RES_PATIENTS = len({_pid for _l in ("RESAMP-1", "RESAMP-2")
+                     for _pid, _ in _CAMPAIGN_PATIENTS[_l]})
+_RES_PER_RUN_DISTINCT = sum(
+    len({_pid for _pid, _ in _CAMPAIGN_PATIENTS[_l]})
+    for _l in ("RESAMP-1", "RESAMP-2"))
+check_true("8b-l: the seed really carries all three numbers apart -- rows, "
+           "distinct-across-the-campaign, and distinct-summed-per-fragment "
+           "(non-degeneracy: on a seed where they coincided every check below "
+           "would pass against any of the three implementations)",
+           len({_RES_ROWS, _RES_PATIENTS, _RES_PER_RUN_DISTINCT}) == 3)
+check("8b-l: the pair really is ONE campaign, so the counts below are about a "
+      "stitched chain rather than two independent rows",
+      None if _res is None else (_safe_int(_res.runs),
+                                 _safe_int(_res.stitched)), (2, 1))
+check("8b-l: *** total_patients is DISTINCT PATIENTS ACROSS THE CAMPAIGN. *** "
+      "Not rows, and not per-fragment distinct summed: R-a has two rows in one "
+      "fragment (the resample pass) and R-c has one row in EACH fragment (an "
+      "errored patient the resume re-ran)",
+      None if _res is None else _safe_int(_res.total_patients),
+      _RES_PATIENTS)
+check("8b-l: ...and inference_rows carries what it used to be called "
+      "total_patients, because every cost and count in this row is summed "
+      "over the ROWS and a reader needs the denominator that matches",
+      None if _res is None else _safe_int(_res.inference_rows), _RES_ROWS)
+check("8b-l: ...so the two columns DIFFER on this campaign, which is what "
+      "says the split is real rather than two names for one query",
+      None if _res is None
+      else _safe_int(_res.inference_rows) > _safe_int(_res.total_patients),
+      True)
+check("8b-l: ...and the cost is still summed over the ROWS -- a re-run patient "
+      "was billed twice and the campaign really did pay twice",
+      None if _res is None else round(float(_res.total_cost_usd), 4),
+      round(sum(c for _l in ("RESAMP-1", "RESAMP-2")
+                for _, c in _CAMPAIGN_PATIENTS[_l]), 4))
+check("8b-l: a campaign with NO repeats reports the two columns EQUAL, so the "
+      "split costs nothing on an ordinary chain and 8b-l above is a "
+      "measurement rather than a constant offset",
+      None if _chain is None else (_safe_int(_chain.total_patients),
+                                   _safe_int(_chain.inference_rows)),
+      (_EXPECTED_CHAIN_PATIENTS, _EXPECTED_CHAIN_PATIENTS))
 
 # --- THE ARM PAIR: IDENTICAL IN EVERY OTHER GATED COLUMN ------------------
 #
@@ -4127,7 +4217,7 @@ check("8b-i: ...with last_finished_at still the newest finish that EXISTS, "
 _camp_cur.execute("DELETE FROM runs WHERE id = ?", (_OPEN_RUN,))
 _camp_conn.commit()
 check("8b-i: ...and the probe row is removed",
-      len(queries.run(_camp_conn, "campaign_summary")), 7)
+      len(queries.run(_camp_conn, "campaign_summary")), 8)
 
 # --- THE STITCH PREDICATE IS GENERATED, NOT RETYPED -----------------------
 check("8b-j: the fingerprint match is built from the writer's own column "

@@ -210,6 +210,20 @@ def at(sequence, index, default="<absent>"):
         return default
 
 
+def _function_named(tree, name):
+    """The top-level (or nested) FunctionDef called `name`, or None.
+
+    DEFINED WITH THE HARNESS RATHER THAN BESIDE ITS FIRST USE, because two
+    controls in two sections now plant into run_batch by AST and a helper that
+    lives inside one of them is a NameError the first time the other runs
+    before it.
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    return None
+
+
 def drive_call(fn, *args, **kwargs):
     """Call into production code, converting a raise into a comparable value.
 
@@ -1317,21 +1331,199 @@ check("5c  EXACTLY THE IN-FLIGHT RESAMPLE PATIENTS RAN; the rest were "
 check("5c-b ...and the pass reports itself STOPPED rather than COMPLETE",
       ("RESAMPLE STOPPED:" in _C["out"], "RESAMPLE COMPLETE:" in _C["out"]),
       (True, False))
-check("5d  the run row is STOPPED",
-      sorted({row[1] for row in _C["runs"]}) or ["<no run row>"], ["STOPPED"])
+# ── WHAT A STOP THAT LANDED IN THE RESAMPLE PASS IS RECORDED AS ────────────
+#
+# THIS PAIR IS THE FIX AND IT REVERSES WHAT THIS FILE USED TO ASSERT. Until the
+# pre-migration pass main() read `STOP_SWITCH.requested` directly, so ANY stop
+# recorded the run STOPPED and KEPT the checkpoint -- including this one, where
+# the main pass had already covered every patient in the cohort. Two things
+# were then false in the artifact:
+#
+#   * `runs.status` said STOPPED, whose entire meaning is "this campaign covers
+#     a PREFIX of the cohort, so no rate computed over it is a rate about the
+#     cohort". This campaign covers all of it. `campaign_summary` and every
+#     reader of that column acted on the wrong one.
+#   * the checkpoint was KEPT "because patients remain", and none did -- so the
+#     next invocation loaded a checkpoint listing the whole cohort, found
+#     nothing pending, and printed a main pass of zero.
+#
+# The old comment here called keeping the checkpoint "the conservative
+# direction, and the only one whose failure mode is cheap". The first half was
+# true of the checkpoint alone; the second was not true of the STATUS, which is
+# read by things that cannot see this file.
+check("5d  the run row is FINISHED, NOT STOPPED. The stop cost the resample "
+      "pass and nothing else, and STOPPED means the campaign covers a PREFIX "
+      "of the cohort -- which this one does not",
+      sorted({row[1] for row in _C["runs"]}) or ["<no run row>"], ["FINISHED"])
+check("5d-b the tracking index agrees with the row. MLflow's vocabulary maps a "
+      "stop to KILLED, so a run indexed KILLED here would say the campaign was "
+      "cut short in the one place a reviewer looks first",
+      ("[stand-in] tracking.end_run FINISHED" in _C["out"],
+       "[stand-in] tracking.end_run KILLED" in _C["out"]),
+      (True, False))
 check("5e  exit 0, no traceback",
       (_C["exit"], "Traceback (most recent call last)" in _C["out"]),
       (0, False))
-# THE CONSERVATIVE HALF, STATED RATHER THAN GLOSSED. The main pass covered the
-# whole cohort here, so the checkpoint could defensibly have been cleared. It is
-# KEPT, because the guard is "was this run stopped" and not "which pass was
-# stopped" -- and the cost of the two mistakes is not symmetric: keeping a
-# checkpoint that could have gone makes the next run skip a main pass with
-# nothing pending, and clearing one that should have stayed re-bills a cohort.
-check("5f  the checkpoint is KEPT even though the main pass covered the "
-      "cohort -- the conservative direction, and the only one whose failure "
-      "mode is cheap",
-      "[Checkpoint] KEPT: the run was stopped" in _C["out"], True)
+check("5f  the checkpoint is CLEARED, because the cohort really was covered. "
+      "Keeping it left the next invocation loading a full checkpoint with "
+      "nothing pending",
+      ("[Checkpoint] Cleared for next fresh run." in _C["out"],
+       os.path.exists(os.path.join(_C["cp"],
+                                   "batch_runner_checkpoint.json"))),
+      (True, False))
+check("5f-b the stop is STILL ANNOUNCED, and the announcement says which of "
+      "the two things it cut short. Silence would be the other failure: an "
+      "operator wrote a file, the run obeyed it, and nothing said so",
+      ("STOP REQUESTED AFTER THE COHORT WAS COVERED." in _C["out"],
+       "RUN STOPPED AT THE OPERATOR'S REQUEST." in _C["out"],
+       "the RESAMPLE pass, and nothing else" in _C["out"]),
+      (True, False, True))
+# THE NON-DEGENERACY PAIR, AND IT IS THE WHOLE POINT OF THE FIX. Scenario A
+# stopped the MAIN pass, so its cohort really is a prefix -- and it must still
+# be STOPPED. A change that simply stopped ever writing STOPPED would satisfy
+# every check above and fail here.
+check("5f-c ...and scenario A, whose stop DID cut the cohort short, is still "
+      "recorded STOPPED. Without this the fix would be indistinguishable from "
+      "deleting the status",
+      (sorted({row[1] for row in _A["runs"]}) or ["<no run row>"],
+       "RUN STOPPED AT THE OPERATOR'S REQUEST." in _A["out"]),
+      (["STOPPED"], True))
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
+# 5B. THE CONTROL FOR SCENARIO C -- THE SWITCH READ INSTEAD OF THE COHORT
+# ===========================================================================
+#
+# 5d and 5f are claims that a status CHANGED, and a change means nothing
+# without the other arm. The pre-fix form is reconstructed in a COPY of the
+# package -- run_batch's returned `main_pass_complete` put back to
+# `not STOP_SWITCH.requested`, and nothing else touched -- and scenario C is
+# driven against it.
+#
+# THE PLANT IS STRUCTURAL, on section 7's precedent and for its reason: the
+# final `return` of run_batch is located by AST and its LINES are replaced, so
+# a return that has moved or changed shape is a named PLANT-FAILED rather than
+# a control that quietly tests the shipped tree against itself.
+
+print("\n=== 5b. the control: the switch read instead of the cohort ===")
+
+_C5_REPO = os.path.join(_TMP, "pkgcopy_c5")
+os.makedirs(_C5_REPO, exist_ok=True)
+shutil.copytree(os.path.join(_REPO, "oncotriage"),
+                os.path.join(_C5_REPO, "oncotriage"),
+                ignore=shutil.ignore_patterns("__pycache__"))
+_C5_RUNNER = os.path.join(_C5_REPO, "oncotriage", "batch", "runner.py")
+_c5_src = open(_C5_RUNNER, encoding="utf-8").read()
+
+
+def _final_return(fn):
+    """The last top-level `return` statement of `fn`, or None."""
+    if fn is None:
+        return None
+    tail = [s for s in fn.body if isinstance(s, ast.Return)]
+    return tail[-1] if tail else None
+
+
+def _assign_named(fn, name):
+    """The (single) assignment to `name` anywhere inside `fn`, or None."""
+    found = [n for n in ast.walk(fn) if isinstance(n, ast.Assign)
+             and any(getattr(t, "id", None) == name for t in n.targets)]
+    return found[0] if len(found) == 1 else None
+
+
+# ── THE STRUCTURAL HALF: run_batch's return asks about the COHORT ──────────
+#
+# Pinned separately from the plant below because the two say different things.
+# This says the returned boolean is computed from what the pass DID; the plant
+# says main() ACTS on it. Either one alone can be satisfied while the other has
+# regressed -- a return that is honest and discarded is exactly the state this
+# runner was in before the pre-migration pass.
+_c5_run_batch = _function_named(ast.parse(_c5_src), "run_batch")
+_c5_ret = _final_return(_c5_run_batch)
+_c5_ret_src = ast.unparse(_c5_ret) if _c5_ret is not None else "<no return>"
+check("5b-a run_batch's returned `main_pass_complete` is computed from what "
+      "the pass DID -- the patients it never submitted and the ones it "
+      "cancelled -- and NOT from whether a sentinel was seen. A stop that "
+      "arrives after the last patient completed cancels nothing and submits "
+      "nothing, and only these two counts say so",
+      ("stop_unsubmitted" in _c5_ret_src, "batch_cancelled" in _c5_ret_src,
+       "STOP_SWITCH" in _c5_ret_src),
+      (True, True, False))
+
+# ── THE PLANT: main() reads the SWITCH again ───────────────────────────────
+#
+# THIS IS THE PRE-FIX FORM EXACTLY, and the first version of this control was
+# not. Reverting run_batch's RETURN changes nothing here, because in this
+# scenario the stop arrives AFTER run_batch has returned -- the returned
+# boolean is True under either form. What was actually wrong before was that
+# main() never read it: all four consumers asked `STOP_SWITCH.requested`
+# directly, which is a question about whether a sentinel was seen and not about
+# whether the cohort was covered. The plant restores that single read.
+#
+# Recorded rather than quietly corrected, because it is this project's own
+# rule met as an event: a control that reports MISSED can mean the check is
+# weak OR that the revert never took effect, and those are not the same
+# finding. Here it was the second.
+_c5_main = _function_named(ast.parse(_c5_src), "main")
+_c5_assign = _assign_named(_c5_main, "_stopped_mid_cohort")
+check("5b-b main() derives `_stopped_mid_cohort` exactly once, from the "
+      "switch AND the returned completeness (non-degeneracy: the plant has a "
+      "target, and a tree where that assignment had moved or been duplicated "
+      "fails HERE rather than reporting an ineffective control)",
+      (_c5_assign is not None,
+       "_main_pass_complete" in (ast.unparse(_c5_assign.value)
+                                 if _c5_assign is not None else "")),
+      (True, True))
+
+if _c5_assign is None:
+    fail("5b-c the plant applied",
+         "PLANT-FAILED: main() has no single `_stopped_mid_cohort` "
+         "assignment, so 5d and 5f are unverified.")
+    _C5 = None
+else:
+    _c5_lines = _c5_src.splitlines(keepends=True)
+    _c5_new = "".join(
+        _c5_lines[:_c5_assign.lineno - 1]
+        + [" " * _c5_assign.col_offset
+           + "_stopped_mid_cohort = STOP_SWITCH.requested\n"]
+        + _c5_lines[_c5_assign.end_lineno:])
+    _c5_tree = ast.parse(_c5_new)
+    check("5b-c the reverted copy parses and its main() now reads the SWITCH "
+          "rather than the cohort",
+          ast.unparse(_assign_named(_function_named(_c5_tree, "main"),
+                                    "_stopped_mid_cohort")),
+          "_stopped_mid_cohort = STOP_SWITCH.requested")
+    open(_C5_RUNNER, "w", encoding="utf-8").write(_c5_new)
+
+    _C5 = drive(os.path.join(_TMP, "Cctl"), park="resample", action="stop",
+                repo=_C5_REPO)
+    print(f"        [info] control (switch): {len(_C5['main'])} main, "
+          f"{len(_C5['resample'])} resample started")
+
+    check("5b-d the stand-in hook installed in the control too, and the copy "
+          "is what imported",
+          _C5["hook"], True)
+    check("5b-e the control really was stopped in the resample pass, so 5b-f "
+          "is about the reverted read and not about a copy that never saw the "
+          "sentinel",
+          (_C5["saturated"], _C5["acted"],
+           len(_C5["main"]) == _C5["patients"]),
+          (True, True, True))
+    check("5b-f *** THE PRE-FIX FORM RECORDS A COVERED COHORT AS STOPPED. *** "
+          "That is the defect: a campaign that ran every patient is filed "
+          "under the status whose meaning is 'this covers a prefix'",
+          sorted({row[1] for row in _C5["runs"]}) or ["<no run row>"],
+          ["STOPPED"])
+    check("5b-g ...and KEEPS a checkpoint with nothing left in it to resume",
+          "[Checkpoint] KEPT: the run was stopped" in _C5["out"], True)
+    check("5b-h THE SHIPPED TREE DOES THE OPPOSITE ON BOTH, which is the fix "
+          "MEASURED rather than asserted",
+          (sorted({row[1] for row in _C["runs"]}),
+           "[Checkpoint] Cleared for next fresh run." in _C["out"]),
+          (["FINISHED"], True))
 
 
 #------------------------------------------------------------------------------
@@ -1429,13 +1621,6 @@ shutil.copytree(os.path.join(_REPO, "oncotriage"),
                 ignore=shutil.ignore_patterns("__pycache__"))
 _CTRL_RUNNER = os.path.join(_CTRL_REPO, "oncotriage", "batch", "runner.py")
 _ctrl_src = open(_CTRL_RUNNER, encoding="utf-8").read()
-
-
-def _function_named(tree, name):
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == name:
-            return node
-    return None
 
 
 def _ki_raise_lines(fn):
