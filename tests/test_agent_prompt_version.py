@@ -36,7 +36,21 @@ WHAT IT HOLDS
        lifted BY AST out of the one line in ``oncotriage/agent/evaluation.py``
        that supplies it.
     2. THE SNAPSHOT, ``tests/snapshots/prompt_version_digests.json``: the
-       version, the parameter list, and one sha256 per variant.
+       version, the parameter list, the snapshot date it was rendered under,
+       and one sha256 per variant.
+    2b. A PRECONDITION ON ``DATA_SNAPSHOT_DATE``, ASKED BEFORE ANY DIGEST IS
+       COMPARED AND BEFORE ANY REGENERATION IS WRITTEN. Every digest here is a
+       function of the template AND of that constant, which RULE 4 interpolates
+       -- and ``tests/test_config_snapshot_date_rot.py`` rewrites it in the
+       repository for about six minutes per run. A run inside that window
+       reported sixteen fabricated "you edited the template without bumping"
+       findings whose printed fix REGENERATES THE GOLDEN UNDER THE PROBE DATE,
+       going green and permanently wrong. The golden now records the date it was
+       rendered under and a disagreement is a REFUSAL (exit 2, nothing
+       compared, nothing written) naming both causes -- a serial run in flight,
+       or a deliberate move -- and naming no regeneration flag. Section 3b
+       carries the argument, including why this file STAYS bucket A rather than
+       joining the serial runner.
     3. TWO FAILURE MODES WITH DIFFERENT MESSAGES, because they have different
        fixes. A digest that moved while the version held is "you edited the
        template and did not bump"; a version that moved is "regenerate so the
@@ -65,18 +79,34 @@ the code does correct by definition.
 
 NO NETWORK, NO KEYS, NO SPEND, NO DATABASE, NO SUBPROCESS, NO FIXTURE, NO GIT,
 NO CORPUS. It renders one string per variant, hashes them, and reads one JSON
-file.
-Not in the collision matrix: it writes nothing in the repository except through
-the explicit ``--update-snapshot`` flag, and the two source files it reads are
-written by neither of the suite's two writers.
+file and three source files.
+NOT IN THE COLLISION MATRIX, and the derivation was re-run rather than carried
+forward when Section 6h added a third file to the read set. It writes nothing in
+the repository except through the explicit ``--update-snapshot`` flag, and all
+three files it READS -- ``oncotriage/agent/prompts.py``,
+``oncotriage/agent/evaluation.py`` and (by AST, for 6h-5's date list)
+``tests/test_config_snapshot_date_rot.py`` -- are written by neither of the
+suite's two writers. Note the asymmetry that Section 3b is about: this file is
+uninvolved in the two writers' EDITS and is still exposed to a third serial
+member through a RUNTIME CONSTANT, which is why the precondition exists and
+serialization does not.
 
 Run from terminal:
     python tests/test_agent_prompt_version.py
     python tests/test_agent_prompt_version.py --update-snapshot
+    python tests/test_agent_prompt_version.py --update-snapshot \
+        --accept-snapshot-date-change      # ONLY when DATA_SNAPSHOT_DATE moved
+                                           # deliberately; see Section 3b
 
 Exit codes:
     0 -- all assertions passed
     1 -- one or more failures
+    2 -- a PRECONDITION was not satisfied, so nothing was compared and nothing
+         was written. Distinct from 1 on `.github/scripts/trivyignore_
+         staleness.py`'s precedent, where "the comparison could not be made"
+         and "the comparison found a problem" are different instructions to a
+         human. It is NOT softened to 0: a guard that reported success while
+         comparing nothing is the defect this project exists to remove.
 """
 
 
@@ -112,6 +142,7 @@ import inspect
 import json
 import time
 
+from oncotriage import config as _config
 from oncotriage.agent import evaluation as _evaluation
 from oncotriage.agent import prompts as _prompts
 from oncotriage.agent import state as _state
@@ -181,6 +212,26 @@ _EVALUATION_PATH = os.path.abspath(_evaluation.__file__)
 _SNAPSHOT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "snapshots", "prompt_version_digests.json")
 _UPDATE_SNAPSHOT = "--update-snapshot" in sys.argv
+_ACCEPT_DATE_CHANGE = "--accept-snapshot-date-change" in sys.argv
+
+# THE SECOND INPUT EVERY DIGEST IN THIS FILE IS A FUNCTION OF.
+# ------------------------------------------------------------
+# RULE 4 of the template interpolates ``get_age_reference_date().isoformat()``,
+# which is a PURE FUNCTION of ``oncotriage.config.DATA_SNAPSHOT_DATE`` read at
+# CALL time. So a rendered prompt -- and therefore every sha256 below -- depends
+# on the template AND on that constant, and the golden file recorded only the
+# first of the two. See Section 3b for what that cost.
+#
+# THE RAW CONSTANT IS RECORDED, NOT THE PARSED REFERENCE DATE, and the choice is
+# argued rather than convenient. The reference date is a pure function of the
+# constant, so the constant is a STRICT SUPERSET: nothing can move the rendered
+# date without moving this string, while two spellings of one date would move
+# this string and produce a (true, harmless) refusal. It also cannot raise --
+# ``get_age_reference_date()`` raises on a malformed value, and a precondition
+# that can raise before it can report is not a precondition -- and it is the one
+# value ``tests/test_config_snapshot_date_rot.py`` actually rewrites, so the
+# collision is detected on the very characters that move.
+_LIVE_SNAPSHOT_DATE = str(getattr(_config, "DATA_SNAPSHOT_DATE", ""))
 
 print("=" * 78)
 print("STAGE 5 SYSTEM PROMPT VERSION GUARD")
@@ -188,6 +239,7 @@ print("=" * 78)
 print(f"Template:  {_PROMPTS_PATH}")
 print(f"Snapshot:  {_SNAPSHOT_PATH}")
 print(f"Version:   {PROMPT_VERSION}")
+print(f"Snapshot date: {_LIVE_SNAPSHOT_DATE}  (oncotriage.config.DATA_SNAPSHOT_DATE)")
 
 
 # ===========================================================================
@@ -416,9 +468,14 @@ print("=" * 78)
 # REORDER -- which changes no rendered byte and would therefore pass every
 # digest comparison -- still requires a deliberate regeneration. Section 1
 # already fails on an added or removed parameter; this covers the third case.
+#
+# ``data_snapshot_date`` IS THE FOURTH FIELD AND IT IS A PRECONDITION RATHER
+# THAN A COMPARISON -- it is never reported as a moved digest or a moved
+# version, because it is neither. Section 3b is what reads it.
 _LIVE_SNAPSHOT = {
     "prompt_version": PROMPT_VERSION,
     "render_parameters": list(_SIG_PARAMS),
+    "data_snapshot_date": _LIVE_SNAPSHOT_DATE,
     "digests": dict(sorted(_LIVE_DIGESTS.items())),
 }
 
@@ -433,6 +490,213 @@ def _serialize(snapshot: dict) -> str:
     return json.dumps(snapshot, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
 
 
+# THE GOLDEN ON DISK IS READ BEFORE ANYTHING IS WRITTEN, and the ordering is the
+# whole of Section 3b's protection rather than a tidy-up. ``--update-snapshot``
+# overwrites this file, so a precondition that consulted it AFTERWARDS would be
+# comparing the new bytes with themselves -- it would agree, always, and the
+# refusal below could never fire on the one invocation that can do damage.
+# Pinned structurally by 6h-6, which fails if a future edit moves the write
+# above the gate.
+_ON_DISK_SNAPSHOT = (json.loads(open(_SNAPSHOT_PATH, encoding="utf-8").read())
+                     if os.path.isfile(_SNAPSHOT_PATH) else None)
+
+
+# ===========================================================================
+# SECTION 3b -- THE PRECONDITION, AND WHY IT IS NOT A CHECK
+# ===========================================================================
+#
+# EVERY DIGEST IN THIS FILE IS A FUNCTION OF TWO INPUTS AND THE GOLDEN FILE
+# USED TO RECORD ONE. RULE 4 interpolates ``get_age_reference_date()``, a pure
+# function of ``oncotriage.config.DATA_SNAPSHOT_DATE``, so all sixteen digests
+# move when that constant moves -- with the template untouched and
+# PROMPT_VERSION correct.
+#
+# WHAT THAT COST, MEASURED RATHER THAN ARGUED. ``tests/test_config_snapshot_
+# date_rot.py`` is a serial member that rewrites that constant IN PLACE, in the
+# repository, for about six minutes per run. This file is bucket A. Running it
+# inside that window (a CI invocation, `make ci-a`, or a second terminal)
+# produced -- reproduced, not predicted -- ONE recorded failure carrying SIXTEEN
+# findings, every one of them reading "THE TEMPLATE WAS EDITED WITHOUT BUMPING
+# THE VERSION", and every one of them naming the regeneration flag as the fix.
+# Thirty-three occurrences of that flag in one run's output.
+#
+# THE PRINTED FIX WAS THE ACTUAL HAZARD, not the red. Following it regenerates
+# the golden file under the PROBE date; the rot test then restores config.py and
+# every subsequent run compares a correct template against a golden rendered at
+# 2031-07-04. It goes GREEN and stays permanently wrong, and the guard that
+# exists to catch an unbumped prompt edit is then blind to one -- because the
+# reference date it pinned can never occur again.
+#
+# SO THE ORDER IS THE FIX. This is ``run_fingerprint.compare()``'s rule adopted
+# verbatim: FP_UNRESOLVED is asked FIRST, "because comparing against an UNKNOWN
+# reports every field as changed and sends an operator to clear a perfectly good
+# checkpoint when the fault is an unreachable endpoint". Same shape here. The
+# configuration the golden was produced under is compared before anything
+# produced under it, and a disagreement is a REFUSAL -- exit 2, nothing
+# compared, nothing written -- rather than sixteen false findings.
+#
+# IT IS NOT A ``check()`` AND THAT IS DELIBERATE. A check records a failure and
+# the file carries on; carrying on is precisely what must not happen, because
+# every comparison below this line would then be a comparison between two
+# different configurations. A refusal that still printed the digest findings
+# would have buried its own diagnosis under the sixteen it exists to suppress.
+#
+# WHY THIS FILE DOES NOT JOIN ``tests/run_serial_tests.py``, decided rather
+# than defaulted. Serializing it against the rot test would remove the
+# collision outright -- and it would also remove this guard from CI, the way
+# ``tests/test_package_invariants.py`` is out of CI, because bucket B runs only
+# through `make serial-tests` and never on a runner. The whole value of this
+# guard is catching an unbumped prompt edit AT PR TIME. Its collision-matrix
+# membership is also DERIVED from writes and reads (CLAUDE.md's rule): it
+# writes nothing outside the explicit flag and the two files it reads are
+# written by neither of the suite's two writers -- its exposure was never a
+# source-file collision but a RUNTIME CONSTANT, which serialization is the
+# wrong instrument for. With the precondition in place the collision produces a
+# true refusal instead of a false red, so it STAYS BUCKET A.
+#
+# THE COST IS STATED: a bucket-A run inside the window still exits non-zero.
+# That is correct and is not softened to 0 -- nothing was verified, and a guard
+# that reported success while comparing nothing is the defect this project
+# exists to remove. What changes is that the exit is a named refusal whose
+# remediation is "wait for the serial run", not a fabricated finding whose
+# remediation destroys the reference.
+
+print("\n" + "=" * 78)
+print("SECTION 3b -- the precondition on DATA_SNAPSHOT_DATE")
+print("=" * 78)
+
+_PRECONDITION_MOVED = "snapshot-date-differs"
+_PRECONDITION_ABSENT = "snapshot-date-not-recorded"
+
+# THE ACKNOWLEDGEMENT FLAG'S NAME IS THE ONLY REMEDIATION THIS FILE PRINTS, and
+# the regeneration flag is deliberately NOT named anywhere on the refusal path.
+# The point is not secrecy -- the docstring names both -- it is that a refusal
+# whose output can be COPY-PASTED into a destructive command is the same defect
+# with better manners. Naming one half forces the reader into the file, where
+# the argument is. `bedrock_probe.py --i-understand-this-bills` and
+# `empty_database(db_path, flag)` are the same shape: the destructive path needs
+# an assertion about intent that a reflex cannot supply.
+_ACCEPT_FLAG = "--accept-snapshot-date-change"
+
+
+def snapshot_date_precondition(live_date, snapshot):
+    """``(outcome, message)`` when the golden cannot be compared, else ``None``.
+
+    A PURE FUNCTION OF ITS TWO ARGUMENTS, so Section 6h can drive every branch
+    with fabricated inputs -- including the exact dates the rot test sets. A
+    precondition written inline against the live values can only ever be
+    executed in the state where it passes, which is the shape this file's own
+    docstring calls a check that has stopped checking.
+
+    ``snapshot is None`` means there is no golden file at all. That is NOT a
+    precondition failure: there is nothing to compare and nothing to destroy,
+    and the missing file is reported by its own check below. A file that exists
+    without the field is different -- it is a golden of unknown provenance, and
+    regenerating over it is exactly the destructive act this guards.
+    """
+    if snapshot is None:
+        return None
+    recorded = snapshot.get("data_snapshot_date")
+    if recorded is None:
+        return (_PRECONDITION_ABSENT, (
+            f"the golden snapshot records no data_snapshot_date, so the "
+            f"configuration it was rendered under is unknown. Every digest in "
+            f"it is a function of oncotriage.config.DATA_SNAPSHOT_DATE, which "
+            f"currently reads {live_date!r}. This golden predates the "
+            f"precondition. Nothing was compared and nothing was written. "
+            f"Re-render it ONLY after confirming that oncotriage/config.py "
+            f"holds its committed date (`git diff -- oncotriage/config.py` is "
+            f"empty) and that no serial run is in progress, and only with "
+            f"{_ACCEPT_FLAG} supplied alongside the regeneration flag."))
+    if recorded != live_date:
+        return (_PRECONDITION_MOVED, (
+            f"the golden snapshot was rendered under "
+            f"DATA_SNAPSHOT_DATE={recorded!r}; oncotriage.config now reads "
+            f"{live_date!r}. Every digest here interpolates that date through "
+            f"RULE 4, so ALL of them differ for a reason that is not the "
+            f"template. Nothing was compared and nothing was written. TWO "
+            f"CAUSES, and they have opposite remedies. (1) A serial run is in "
+            f"progress: tests/test_config_snapshot_date_rot.py rewrites that "
+            f"constant in place for about six minutes and restores it. This is "
+            f"not a defect -- wait for `make serial-tests` to finish and "
+            f"re-run. (2) The constant moved deliberately, as it does whenever "
+            f"the corpus is regenerated. Then the golden has to be re-rendered "
+            f"under the new date, which requires {_ACCEPT_FLAG} supplied "
+            f"alongside the regeneration flag -- and MUST NOT be done while "
+            f"another process is rewriting the constant."))
+    return None
+
+
+def _refuse(outcome, message):
+    """Print the refusal and leave with exit 2. Never reached on a clean tree."""
+    print()
+    print("=" * 78)
+    print(f"REFUSED -- PRECONDITION NOT SATISFIED: {outcome}")
+    print("=" * 78)
+    print(f"  {message}")
+    print()
+    print("  THE GOLDEN SNAPSHOT WAS NOT COMPARED. This run establishes "
+          "nothing about")
+    print("  the Stage 5 system prompt. Only the checks above the precondition "
+          "ran.")
+    print()
+    # THE CANONICAL SUMMARY LINES ARE PRINTED HERE TOO, and that is for machine
+    # readers rather than for people. Every consumer of this suite -- the CI
+    # bucket runner, the revert harnesses, a person grepping -- reads
+    # `^Passed:`/`^Failed:`; a path that printed a differently-worded total was
+    # measured to make one of them report a DESIGNED refusal as "aborted with no
+    # summary", which is the diagnosis for a real defect and must not be
+    # produced by a working one. The exit code is what distinguishes a refusal
+    # from a failure.
+    print("=" * 78)
+    print("SUMMARY (PRECONDITION REFUSED -- nothing was compared)")
+    print("=" * 78)
+    print(f"Passed: {_RESULTS['passed']}")
+    print(f"Failed: {_RESULTS['failed']}")
+    print(f"Runtime: {time.time() - _T_START:.2f}s")
+    if _FAILURES:
+        print("\nFailures:")
+        for _one in _FAILURES:
+            print(f"  - {_one}")
+    raise SystemExit(2)
+
+
+# A FLAG THAT DOES NOTHING IS A MISUNDERSTANDING WORTH REPORTING. Alone, the
+# acknowledgement lifts the gate and lets the digest comparison run under a
+# date the golden was not rendered under -- which is the sixteen false findings
+# again, now requested. It is refused rather than ignored.
+if _ACCEPT_DATE_CHANGE and not _UPDATE_SNAPSHOT:
+    _refuse("acknowledgement-without-regeneration",
+            f"{_ACCEPT_FLAG} was supplied without a regeneration request. It "
+            f"exists only to authorise re-rendering the golden under a changed "
+            f"DATA_SNAPSHOT_DATE; on its own it would let the digest "
+            f"comparison run across two configurations, which is what it is "
+            f"there to prevent.")
+
+_PRECONDITION = snapshot_date_precondition(_LIVE_SNAPSHOT_DATE,
+                                           _ON_DISK_SNAPSHOT)
+
+if _PRECONDITION is not None and not (_UPDATE_SNAPSHOT and _ACCEPT_DATE_CHANGE):
+    _refuse(*_PRECONDITION)
+
+if _PRECONDITION is not None:
+    # ANNOUNCED, LOUDLY, AND BEFORE THE WRITE. The operator has asserted that
+    # the constant moved deliberately; the record of what they overwrote is the
+    # only thing that survives the overwrite.
+    print(f"  [{_ACCEPT_FLAG}] {_PRECONDITION[0]}: re-rendering the golden "
+          f"under DATA_SNAPSHOT_DATE={_LIVE_SNAPSHOT_DATE!r}, replacing a "
+          f"golden rendered under "
+          f"{(_ON_DISK_SNAPSHOT or {}).get('data_snapshot_date')!r}.")
+else:
+    print(f"  PASS  the golden snapshot was rendered under this "
+          f"DATA_SNAPSHOT_DATE ({_LIVE_SNAPSHOT_DATE})")
+    _RESULTS["passed"] += 1
+
+
+print("\n" + "=" * 78)
+print("SECTION 3 (cont.) -- the golden snapshot")
+print("=" * 78)
+
 if _UPDATE_SNAPSHOT:
     os.makedirs(os.path.dirname(_SNAPSHOT_PATH), exist_ok=True)
     with open(_SNAPSHOT_PATH, "w", encoding="utf-8") as _fh:
@@ -445,10 +709,12 @@ check("the snapshot file exists (regenerate with --update-snapshot)",
 if os.path.isfile(_SNAPSHOT_PATH):
     _SNAP = json.loads(open(_SNAPSHOT_PATH, encoding="utf-8").read())
 else:
-    _SNAP = {"prompt_version": None, "render_parameters": [], "digests": {}}
+    _SNAP = {"prompt_version": None, "render_parameters": [],
+             "data_snapshot_date": None, "digests": {}}
 
-check("the snapshot declares the three fields this guard reads",
-      sorted(_SNAP), ["digests", "prompt_version", "render_parameters"])
+check("the snapshot declares the four fields this guard reads",
+      sorted(_SNAP),
+      ["data_snapshot_date", "digests", "prompt_version", "render_parameters"])
 check("the snapshot is non-degenerate: it records more than one digest",
       len(_SNAP.get("digests") or {}) > 1, True)
 
@@ -1070,6 +1336,258 @@ check("6f  ...and that comparison is not a tautology: the file is non-empty "
 # swallowed by the guard that exists to stop a raise aborting the file.
 check("6f  cumulative: no render anywhere in this file raised",
       _RENDER_ERRORS, [])
+
+
+# ===========================================================================
+# SECTION 6h -- THE CONTROLS ON THE PRECONDITION
+# ===========================================================================
+#
+# The gate above is unreachable on a clean tree, which is exactly why it needs
+# controls: an assertion that has only ever been skipped is not evidence that it
+# can catch anything. Every branch is driven with fabricated inputs, and the
+# strongest of them drives it with THE ACTUAL DATES the rot test sets -- lifted
+# out of that file by AST, never retyped, so a rename there is a named failure
+# here rather than a control that quietly stops covering the collision.
+
+print("\n" + "=" * 78)
+print("SECTION 6h -- controls on the DATA_SNAPSHOT_DATE precondition")
+print("=" * 78)
+
+# --- 6h-1: the state this file is normally in -------------------------------
+check("6h-1 a golden recording this date is not a precondition failure",
+      snapshot_date_precondition(_LIVE_SNAPSHOT_DATE, _GOOD_SNAPSHOT), None)
+# THE EXPECTATION IS CONDITIONAL AND THE CONDITION IS ARGUED. On the ordinary
+# invocation -- no flags, which is every CI run and every bucket-A run -- this is
+# full strength: the live golden must record this date. On the acknowledged-
+# regeneration invocation a FAILED precondition is the reason that run exists,
+# so demanding None there would fail a legitimate command. The disjunct can only
+# be satisfied by two flags a human typed; nothing in CI can reach it.
+check("6h-1 ...and the live golden on disk is in that state, except on the "
+      "acknowledged-regeneration invocation (non-degeneracy: the whole section "
+      "is about a branch that must be unreachable on an ordinary run)",
+      _PRECONDITION is None or (_UPDATE_SNAPSHOT and _ACCEPT_DATE_CHANGE), True)
+
+# --- 6h-2: the collision, and what the message may NOT say ------------------
+#
+# THE OTHER DATE IS A SENTINEL, NOT A REAL PROBE VALUE, and that is a bug fix.
+# The first version hardcoded one of the rot test's dates, so this control
+# silently inverted -- reporting "not refused" -- in any process configured with
+# that same date, which is the collision window this section is about. Measured:
+# driving it at 2031-07-04 turned three passing checks into three failures about
+# nothing. A pre-corpus date can never be the configured value, and the
+# non-degeneracy line below is what says so rather than assuming it.
+_OTHER_DATE = "1970-01-01"
+check("6h-2 the sentinel date differs from the configured one (non-degeneracy: "
+      "equal dates would make the refusal below unreachable)",
+      _OTHER_DATE != _LIVE_SNAPSHOT_DATE, True)
+_MOVED_SNAP = dict(_GOOD_SNAPSHOT, data_snapshot_date=_OTHER_DATE)
+_p6h2 = snapshot_date_precondition(_LIVE_SNAPSHOT_DATE, _MOVED_SNAP)
+check("6h-2 a golden rendered under a different date is refused",
+      _p6h2[0] if _p6h2 else None, _PRECONDITION_MOVED)
+check("6h-2 ...and the message names BOTH dates",
+      all(d in (_p6h2[1] if _p6h2 else "")
+          for d in (_OTHER_DATE, _LIVE_SNAPSHOT_DATE)), True)
+check("6h-2 ...and names the serial member whose rewrite causes it",
+      "test_config_snapshot_date_rot.py" in (_p6h2[1] if _p6h2 else ""), True)
+# THE LOAD-BEARING NEGATIVE PROPERTY. The regeneration flag must not appear on
+# any refusal path, because that string is the destructive advice: following it
+# inside the rewrite window bakes a probe date into the golden and the guard
+# goes green-and-permanently-wrong.
+check("6h-2 ...and does NOT name the regeneration flag (the destructive fix)",
+      "--update-snapshot" in (_p6h2[1] if _p6h2 else ""), False)
+check("6h-2 ...and does not tell the reader to bump PROMPT_VERSION",
+      "bump PROMPT_VERSION" in (_p6h2[1] if _p6h2 else ""), False)
+
+# --- 6h-3: a golden of unknown provenance ----------------------------------
+_LEGACY_SNAP = {k: v for k, v in _GOOD_SNAPSHOT.items()
+                if k != "data_snapshot_date"}
+_p6h3 = snapshot_date_precondition(_LIVE_SNAPSHOT_DATE, _LEGACY_SNAP)
+check("6h-3 a golden with no recorded date is refused as unknown provenance, "
+      "not silently accepted",
+      _p6h3[0] if _p6h3 else None, _PRECONDITION_ABSENT)
+check("6h-3 ...and that refusal names no regeneration flag either",
+      "--update-snapshot" in (_p6h3[1] if _p6h3 else ""), False)
+check("6h-3 ...and the two refusals are distinct messages (non-degeneracy: one "
+      "message for two outcomes would make the outcome label decorative)",
+      (_p6h2 or (None, ""))[1] == (_p6h3 or (None, ""))[1], False)
+
+# --- 6h-4: no golden at all is not a precondition failure ------------------
+check("6h-4 an absent golden file is not a precondition failure (there is "
+      "nothing to compare and nothing to destroy)",
+      snapshot_date_precondition(_LIVE_SNAPSHOT_DATE, None), None)
+
+# --- 6h-5: THE DATES THE ROT TEST ACTUALLY SETS -----------------------------
+#
+# The one control that connects the fix to its cause mechanically. Every date in
+# that file's _SNAPSHOT_DATES must make this gate fire, or the collision this
+# section exists for is still live.
+
+def _rot_test_dates():
+    """``_SNAPSHOT_DATES`` out of tests/test_config_snapshot_date_rot.py, by AST.
+
+    THAT FILE CANNOT BE IMPORTED: its module body copies oncotriage/config.py
+    aside, rewrites it, and runs two suites as subprocesses -- importing it from
+    here would run all of that. So the literal is read, not executed. Returns
+    None when the shape is gone, which the caller reports rather than papering
+    over with a remembered list.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "test_config_snapshot_date_rot.py")
+    if not os.path.isfile(path):
+        return None
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign)
+                and any(getattr(t, "id", None) == "_SNAPSHOT_DATES"
+                        for t in node.targets)):
+            try:
+                value = ast.literal_eval(node.value)
+            except (ValueError, SyntaxError):
+                return None
+            if isinstance(value, (list, tuple)):
+                return [str(v) for v in value]
+    return None
+
+
+_ROT_DATES = _rot_test_dates()
+
+if _ROT_DATES is None:
+    fail("6h-5 tests/test_config_snapshot_date_rot.py's _SNAPSHOT_DATES was "
+         "located by AST",
+         "no `_SNAPSHOT_DATES = [...]` literal found. That file is what "
+         "rewrites DATA_SNAPSHOT_DATE in place; without its date list this "
+         "control cannot show the gate covers the collision it exists for.")
+else:
+    # EVERY OUTCOME IS STRINGIFIED BEFORE `sorted`, AND THAT IS A BUG FIX RATHER
+    # THAN A STYLE. The first version of these two checks sorted a set that can
+    # hold both `None` and an outcome string, and `sorted` raises TypeError on
+    # that mix -- so the file ABORTED with no summary in exactly one state: a
+    # process whose own DATA_SNAPSHOT_DATE is one of the rot test's probe dates,
+    # which is the collision window itself. Measured, not reasoned about: driving
+    # the acknowledged-regeneration path at 2031-07-04 produced
+    # "TypeError: '<' not supported between instances of 'str' and 'NoneType'"
+    # and zero recorded results. This project has shipped that abort shape ten
+    # times; `str()` makes the ordering total.
+    #
+    # THE "MUST FIRE" SET EXCLUDES THE CURRENTLY-CONFIGURED DATE, because the
+    # gate is a COMPARISON: a golden rendered under the date this process reads
+    # is correctly not refused, so demanding a refusal for it would be demanding
+    # a defect. The overlap is reported by the non-degeneracy check instead,
+    # which is where it belongs -- it says the control is weaker than it looks
+    # rather than pretending the gate is broken.
+    _ROT_OTHERS = [d for d in _ROT_DATES if d != _LIVE_SNAPSHOT_DATE]
+    check("6h-5 the rot test's date list is non-degenerate and none of its "
+          "dates is the one this process is configured with (if one were, the "
+          "gate could not fire for it and that arm of the control would be "
+          "vacuous)",
+          (len(_ROT_DATES) >= 2, _LIVE_SNAPSHOT_DATE in _ROT_DATES,
+           len(_ROT_OTHERS)),
+          (True, False, len(_ROT_DATES)))
+    check("6h-5 ...and a golden rendered under EVERY date that file sets is "
+          "refused by this gate",
+          sorted({str((snapshot_date_precondition(
+                      _LIVE_SNAPSHOT_DATE,
+                      dict(_GOOD_SNAPSHOT, data_snapshot_date=d)) or (None,))[0])
+                  for d in _ROT_OTHERS}) or ["<no date to test>"],
+          [_PRECONDITION_MOVED])
+    # AND THE OTHER DIRECTION, which is what says the gate is a comparison
+    # rather than a constant: a golden rendered under one of those dates, read
+    # by a process whose config ALSO reads it, is not refused. That is the state
+    # a run entirely inside the rewrite window would be in.
+    check("6h-5 ...while a process whose own config reads that same date is "
+          "NOT refused (the gate compares, it does not blacklist)",
+          sorted({str(snapshot_date_precondition(
+                      d, dict(_GOOD_SNAPSHOT, data_snapshot_date=d)))
+                  for d in _ROT_DATES}),
+          ["None"])
+
+# --- 6h-6: THE ORDERING, STRUCTURALLY --------------------------------------
+#
+# The gate protects the write, so it must precede it IN THIS FILE. Behaviourally
+# invisible: with the write first, every control above still passes and the
+# refusal still fires -- on a golden that has already been overwritten, i.e.
+# never. So it is pinned by line number, with a probe that both sites were found
+# (a walk that located neither would satisfy `<` for free).
+_SELF_TREE = ast.parse(open(os.path.abspath(__file__), encoding="utf-8").read())
+_GATE_LINES = [n.lineno for n in ast.walk(_SELF_TREE)
+               if isinstance(n, ast.Call)
+               and getattr(n.func, "id", None) == "snapshot_date_precondition"]
+_WRITE_LINES = [n.lineno for n in ast.walk(_SELF_TREE)
+                if isinstance(n, ast.Call)
+                and getattr(n.func, "id", None) == "open"
+                and len(n.args) >= 2
+                and isinstance(n.args[1], ast.Constant) and n.args[1].value == "w"]
+check("6h-6 the gate call and the golden's only write site were both located "
+       "(non-degeneracy for the comparison below)",
+      (len(_GATE_LINES) >= 1, len(_WRITE_LINES)), (True, 1))
+check("6h-6 ...and the live gate call precedes the write",
+      bool(_GATE_LINES) and bool(_WRITE_LINES)
+      and min(_GATE_LINES) < _WRITE_LINES[0], True)
+# ...AND THE READ IT DEPENDS ON ACTUALLY READ SOMETHING. Line order alone does
+# not say the gate has a subject: neutering the pre-write read to a literal None
+# leaves every check in this file passing on a clean tree, because a None
+# snapshot is documented as "no golden, nothing to compare". This is the check
+# that separates the two.
+check("6h-6 ...and the pre-write read returned the golden rather than None (a "
+      "gate whose subject is None is a gate that can never refuse)",
+      (os.path.isfile(_SNAPSHOT_PATH), _ON_DISK_SNAPSHOT is not None),
+      (True, True))
+
+# --- 6h-6b: THE GUARD EXPRESSION ITSELF ------------------------------------
+#
+# THE HARDEST THING IN THIS SECTION TO SEE BEHAVIOURALLY, and the reason is
+# structural: on a tree where the golden and the config agree -- which is every
+# tree this file is normally run on -- the refusal is UNREACHABLE, so weakening
+# its condition changes nothing observable. `if False:`, or dropping the
+# acknowledgement flag from the test so the regeneration flag alone suffices,
+# both leave 84 of 84 checks passing. They are caught here instead: the live
+# guard is located by the `_refuse(*_PRECONDITION)` call it contains, and its
+# test is required to name the outcome AND BOTH flags.
+_REFUSE_GUARDS = [
+    node for node in ast.walk(_SELF_TREE)
+    if isinstance(node, ast.If)
+    and any(isinstance(inner, ast.Call)
+            and getattr(inner.func, "id", None) == "_refuse"
+            and any(isinstance(a, ast.Starred) for a in inner.args)
+            for inner in ast.walk(node))
+]
+check("6h-6b the live refusal guard was located exactly once (non-degeneracy "
+      "for the check below)",
+      len(_REFUSE_GUARDS), 1)
+# NO BARE INDEX. `_REFUSE_GUARDS[0]` raises IndexError precisely when the guard
+# has been deleted -- the case this check exists to report -- which would abort
+# the file with a traceback where it owes a recorded failure. This file has
+# already had to fix that shape twice (_variant_id, _render); it is not adding a
+# third.
+_guard_names = (sorted({n.id for n in ast.walk(_REFUSE_GUARDS[0].test)
+                        if isinstance(n, ast.Name)})
+                if _REFUSE_GUARDS else ["<no guard found>"])
+check("6h-6b ...and its condition names the outcome and BOTH flags, so neither "
+      "`if False:` nor a single-flag bypass can survive",
+      _guard_names,
+      sorted(["_PRECONDITION", "_UPDATE_SNAPSHOT", "_ACCEPT_DATE_CHANGE"]))
+
+# --- 6h-7: the recorded field is the value the gate compares ---------------
+#
+# Two independent reads of one constant would let the golden record one date
+# while the gate compared another -- the two-copies shape, in a file whose
+# subject is exactly that. One name, read once.
+# `.get`, NOT A SUBSCRIPT. Dropping the field from the writer -- the exact
+# regression this check exists to report -- makes a subscript raise KeyError at
+# module level, so the run printed one traceback where it owed a summary and
+# eighty-odd results. MEASURED by planting that revert: it ABORTED. This project
+# has shipped that shape ten times; this file is not making it eleven.
+check("6h-7 the snapshot field carries the live constant verbatim",
+      (_LIVE_SNAPSHOT.get("data_snapshot_date", "<field absent from writer>"),
+       _LIVE_SNAPSHOT_DATE == str(_config.DATA_SNAPSHOT_DATE)),
+      (_LIVE_SNAPSHOT_DATE, True))
+check("6h-7 ...and it reaches the rendered text, so the precondition is about "
+      "something the digests actually depend on",
+      all(_LIVE_SNAPSHOT_DATE in _render(render_system_prompt, kw)
+          for kw in _matrix()), True)
+
+
+#------------------------------------------------------------------------------
 
 
 # ===========================================================================

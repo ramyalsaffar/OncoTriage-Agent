@@ -95,7 +95,7 @@ import sqlite3
 import threading
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -1209,6 +1209,8 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
 
     batch_success = 0
     batch_error = 0
+    # Cancelled != errored: see the CancelledError branch below.
+    batch_cancelled = 0
 
     # Keep the progress bar prominent
     console.out()
@@ -1229,9 +1231,32 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
 
     def _on_done(future, fhir_path):
 
-        nonlocal batch_success, batch_error
+        nonlocal batch_success, batch_error, batch_cancelled
         try:
             entry = future.result()
+        except CancelledError:
+            # A CANCELLED PATIENT WAS NEVER ATTEMPTED, AND IS NOT AN ERROR.
+            # `concurrent.futures.CancelledError` subclasses Exception (it is
+            # `futures.Error`, not asyncio's BaseException-derived one --
+            # MEASURED, because the two are different classes with the same
+            # name), so the generic handler below used to absorb it: an
+            # interrupt printed one "[CALLBACK ERROR] CancelledError:" line per
+            # queued patient and reported them all as failures. On a 22,000-
+            # patient corpus interrupted early that is 22,000 lines and a
+            # summary claiming 22,000 errors for work nobody ran.
+            #
+            # IT BECAME REACHABLE WHEN THE POOL STARTED CANCELLING. Before the
+            # executor lifecycle changed, the `with` form drained every queued
+            # future, so no future was ever cancelled and this branch would
+            # have been dead code -- which is why it is added in the same pass
+            # rather than earlier.
+            #
+            # The bar is still advanced: it is sized to the whole pass, and a
+            # cancelled patient that never advances it leaves the run looking
+            # stalled at the moment it is shutting down.
+            batch_cancelled += 1
+            progress.update(1)
+            return
         except MatchingModelMismatchError as e:
             # Counted and progressed exactly like any other failure -- the bar
             # must not stall during the drain -- but announced once, loudly,
@@ -1325,24 +1350,54 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
     # but-not-started tasks check before doing work. That mechanism belongs to
     # item 44 and is deliberately NOT built here — a second, competing
     # shutdown path would be worse than the honest gap.
+    # ── THE EXECUTOR IS NOT A CONTEXT MANAGER, AND THAT IS THE INTERRUPT FIX ──
+    #
+    # `with ThreadPoolExecutor(...) as executor:` calls `shutdown(wait=True)` --
+    # WITHOUT cancel_futures -- from `__exit__`, which runs BEFORE any `except`
+    # clause below it. Every future is submitted up front by the loop below, so
+    # `__exit__` DRAINS THE WHOLE REMAINING CORPUS at one live billed Stage 5
+    # call each, and only then is the `except KeyboardInterrupt` handler
+    # entered -- where its `cancel_futures=True` has nothing left to cancel.
+    # That handler's cancellation was DEAD CODE for as long as the `with` form
+    # stood, and the file's own note above (item 3) had already reasoned to the
+    # same line for the exception case.
+    #
+    # MEASURED, not argued: a KeyboardInterrupt raised on the main thread at
+    # `future.result()` with 2 workers and 20 queued tasks completed 20 OF 20
+    # under the `with` form and 2 OF 20 under this one. On a 22,000-patient run
+    # interrupted at patient 100 that is the difference between re-billing the
+    # remaining ~21,900 patients and paying for the handful already in flight.
+    #
+    # WHAT IS NOT CANCELLED, stated: a request already in flight. `wait=True`
+    # blocks for at most one patient's remaining work, which is correct -- those
+    # calls are already paid for and their rows and checkpoint entries are worth
+    # having. What changes is that QUEUED patients are no longer started; they
+    # are never checkpointed, so a resume runs them.
+    #
+    # THE `finally` SHUTDOWN IS WHAT MAKES THIS TOTAL. The `except` clause only
+    # covers KeyboardInterrupt; the shutdown has to happen on every exit path,
+    # including the SystemExit that "25- Batch Runner.py"'s SIGTERM handler
+    # raises and including an ordinary exception. On the NORMAL path every
+    # future has already completed by the time it runs, so `cancel_futures=True`
+    # cancels nothing and the behaviour is byte-identical to the `with` form.
+    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
     try:
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = []
-            for fhir_path in pending_files:
-                future = executor.submit(
-                    process_patient,
-                    fhir_path=fhir_path,
-                    graph=graph,
-                    is_resample=False,
-                    run_id=run_id,
-                    db_path=db_path,
-                )
-                future.add_done_callback(lambda f, fp=fhir_path: _on_done(f, fp))
-                futures.append(future)
+        futures = []
+        for fhir_path in pending_files:
+            future = executor.submit(
+                process_patient,
+                fhir_path=fhir_path,
+                graph=graph,
+                is_resample=False,
+                run_id=run_id,
+                db_path=db_path,
+            )
+            future.add_done_callback(lambda f, fp=fhir_path: _on_done(f, fp))
+            futures.append(future)
 
-            # Wait for all to complete (callbacks handle progress)
-            for future in futures:
-                future.result()
+        # Wait for all to complete (callbacks handle progress)
+        for future in futures:
+            future.result()
 
     except KeyboardInterrupt:
         console.out("\n[INTERRUPTED] Waiting for active threads to finish...")
@@ -1350,12 +1405,23 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
         console.out("[INTERRUPTED] Checkpoint saved. Safe to resume.")
 
     finally:
+        # SHUTDOWN FIRST, so no worker is still writing when the bar is
+        # detached -- which is the order the `with` form produced, since
+        # `__exit__` ran before this block. Idempotent: on the interrupt path
+        # the handler above has already shut it down and this is a no-op.
+        executor.shutdown(wait=True, cancel_futures=True)
         progress.close()
         console.detach_bar(_bar_token)
 
     console.out()
     console.out("=" * 80)
-    console.out(f"MAIN BATCH COMPLETE: {batch_success} success, {batch_error} errors")
+    # THE CANCELLED COUNT IS NAMED ONLY WHEN IT IS NON-ZERO, so a clean run's
+    # line is byte-identical to what it has always printed and an interrupted
+    # one cannot report work nobody ran as work that failed.
+    console.out(f"MAIN BATCH COMPLETE: {batch_success} success, "
+                f"{batch_error} errors"
+                + (f", {batch_cancelled} cancelled (never attempted)"
+                   if batch_cancelled else ""))
     console.out("=" * 80)
     console.out()
 
@@ -1420,6 +1486,10 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
 
     resample_success = 0
     resample_error = 0
+    # Cancelled != errored; see run_batch's CancelledError branch for the whole
+    # argument. Both callbacks needed it because they are two functions rather
+    # than a copy -- the same reason the drift branch had to be added to each.
+    resample_cancelled = 0
 
     progress = tqdm(total=actual_resample, desc="Resample", unit="patient")
 
@@ -1436,9 +1506,13 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
     _drift = _DriftAnnouncer()
 
     def _on_done(future):
-        nonlocal resample_success, resample_error
+        nonlocal resample_success, resample_error, resample_cancelled
         try:
             entry = future.result()
+        except CancelledError:
+            resample_cancelled += 1
+            progress.update(1)
+            return
         except MatchingModelMismatchError as e:
             resample_error += 1
             progress.update(1)
@@ -1473,23 +1547,27 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
     # but the pass does not stop early. The reasoning is written out once, at
     # the executor in run_batch(); this is the second instance of it, not a
     # different case.
+    # THE EXECUTOR LIFECYCLE IS run_batch's, for the reason written out there:
+    # the `with` form's __exit__ drains every queued future before any `except`
+    # clause is entered, which made the cancellation below dead code. Second
+    # instance of one fix, not a different case.
+    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
     try:
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = []
-            for fhir_path in resample_files:
-                future = executor.submit(
-                    process_patient,
-                    fhir_path=fhir_path,
-                    graph=graph,
-                    is_resample=True,
-                    run_id=run_id,
-                    db_path=db_path,
-                )
-                future.add_done_callback(lambda f: _on_done(f))
-                futures.append(future)
+        futures = []
+        for fhir_path in resample_files:
+            future = executor.submit(
+                process_patient,
+                fhir_path=fhir_path,
+                graph=graph,
+                is_resample=True,
+                run_id=run_id,
+                db_path=db_path,
+            )
+            future.add_done_callback(lambda f: _on_done(f))
+            futures.append(future)
 
-            for future in futures:
-                future.result()
+        for future in futures:
+            future.result()
 
     except KeyboardInterrupt:
         console.out("\n[INTERRUPTED] Waiting for active threads to finish...")
@@ -1497,12 +1575,16 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
         console.out("[INTERRUPTED] Resample interrupted. Results saved.")
 
     finally:
+        executor.shutdown(wait=True, cancel_futures=True)
         progress.close()
         console.detach_bar(_bar_token)
 
     console.out()
     console.out("=" * 80)
-    console.out(f"RESAMPLE COMPLETE: {resample_success} success, {resample_error} errors")
+    console.out(f"RESAMPLE COMPLETE: {resample_success} success, "
+                f"{resample_error} errors"
+                + (f", {resample_cancelled} cancelled (never attempted)"
+                   if resample_cancelled else ""))
 
 # ===========================================================================
 # SUMMARY REPORT

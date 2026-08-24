@@ -1,4 +1,5 @@
 {
+  "data_snapshot_date": "2026-08-03",
   "digests": {
     "mesh_filter_applied=False;mesh_filter_skip_reason='ablation_skipped';patient_record='<probe A: no patient record>'": "15fa6d77b8109759d4c5ba927cf261fc6a20ad058cb9c6c344c1890b797cfb1c",
     "mesh_filter_applied=False;mesh_filter_skip_reason='ablation_skipped';patient_record='Age: 61 | Sex: female\\nCancer Stage: 3'": "738b15ff10dc07856732ffbb06a1f00fdc73af5e7ccf3439ee3288c7f540f148",

@@ -211,10 +211,17 @@ BUCKETS = {
     "test_agent_prompt_version.py": (
         _A, None,
         "ran green in 0.74s wall (0.00s of checks) in a `git ls-files` checkout "
-        "with ONLY the skeleton: 41 passed, 0 failed, exit 0. It renders 16 "
-        "strings and reads one committed JSON file -- no network, no keys, no "
-        "spend, no database, no subprocess, no corpus, and NO GIT, which is the "
-        "point of it (a commit recedes; the reference is the golden snapshot)"),
+        "with ONLY the skeleton: 84 passed, 0 failed, exit 0 (this line read 41 "
+        "and was stale by 43; MEASURED 2026-08-23 after the snapshot-date "
+        "precondition pass). It renders 16 strings and reads one committed JSON "
+        "file plus three source files -- no network, no keys, no spend, no "
+        "database, no subprocess, no corpus, and NO GIT, which is the point of "
+        "it (a commit recedes; the reference is the golden snapshot). NOTE it "
+        "can also exit 2, a REFUSAL rather than a failure, when "
+        "DATA_SNAPSHOT_DATE differs from the one its golden was rendered under "
+        "-- which is what a run overlapping tests/test_config_snapshot_date_"
+        "rot.py's in-place rewrite now produces instead of sixteen fabricated "
+        "findings; see that file's Section 3b for why it stays in A"),
     "test_agent_remap_no_survivor.py": (
         _A, None,
         "ran green in 1.6s, 121 checks, against ONLY the directory skeleton, "
@@ -888,6 +895,27 @@ BUCKETS = {
         "the skeleton and the developer tree give the same number. Every "
         "database is inside a tempfile.mkdtemp it removes and asserts gone, "
         "and the two package files it reads are sha256-compared at the end"),
+    "test_runner_sigterm_shutdown.py": (
+        _A, None,
+        "ran green in 15.0s, 55 checks, against ONLY the directory skeleton: "
+        "what `docker stop` does to a batch run, driven with a REAL SIGTERM "
+        "against a REAL subprocess that IS `python \"25- Batch Runner.py\"`, so "
+        "the __main__ guard installing the handler is the shipped one; the four "
+        "stand-ins arrive through a usercustomize hook rather than runpy or exec, "
+        "which section 1c of test_package_invariants.py forbids. No network, no keys, NO SPEND, no live "
+        "Qdrant, no model load (ONCOTRIAGE_DEFER_LOCAL_MODELS is set above the "
+        "imports and in every subprocess environment), no corpus -- every FHIR "
+        "file is a two-key literal in a temp directory -- no git history and no "
+        "live server. process_patient is a stand-in that sleeps, so the graph "
+        "is never invoked and no billed call is reachable; main(), run_batch, "
+        "_on_done, flush_health, start_run_record, finalize_run_record and both "
+        "crash handlers are the real thing. IT USES SUBPROCESSES AND SIGNALS ON "
+        "PURPOSE -- a signal cannot be delivered to the process asserting about "
+        "it. NOT in the collision matrix: every database, checkpoint, FHIR file "
+        "and package copy is inside a tempfile.mkdtemp it removes and asserts "
+        "gone, and the two repository files it reads (batch/runner.py, "
+        "25- Batch Runner.py) are written by neither of the suite's two writers "
+        "and are sha256-compared at the end"),
     "test_runner_crash_record_and_db_unification.py": (
         _A, None,
         # DERIVED BY RUNNING against a skeleton provisioned by

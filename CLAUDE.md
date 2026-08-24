@@ -641,6 +641,26 @@ python tests/test_storage_schema_guards.py                          # 110 (this 
 # It EXECS NOTHING. Bucket A, ~11 s (two real thread pools per drive).
 python tests/test_runner_crash_record_and_db_unification.py         #  65
 
+# The SIGTERM pass. Same shape, same directory. No network, no keys, NO SPEND,
+# no live Qdrant, no model load, no corpus, no git history, no live server --
+# process_patient is a stand-in and THE GRAPH IS NEVER INVOKED. It DOES use
+# subprocesses and real signals, which is the point: a signal cannot be
+# delivered to the process asserting about it, and an in-process `raise
+# SystemExit` would test the test rather than the shipped handler. main(),
+# run_batch, _on_done, flush_health, start_run_record, finalize_run_record and
+# both crash handlers are the real thing: the subprocess IS
+# `python "25- Batch Runner.py"`, so the guard that installs the handler is the
+# shipped one. The four stand-ins arrive through a `usercustomize` hook rather
+# than runpy or exec, because test_package_invariants.py section 1c forbids
+# loading a module by location -- unconditionally, with no allowlist escape --
+# and it CAUGHT the first version of this file doing exactly that, inside a
+# string literal. Every worker PARKS on a
+# release file, so the started count is a statement about cancellation rather
+# than about scheduling -- the first version slept instead and was measured
+# FLAKY under bucket-A load. NOT in the collision matrix. It EXECS NOTHING: the
+# one control is a copy of the package in a temp directory. Bucket A, ~6 s.
+python tests/test_runner_sigterm_shutdown.py                        #  55
+
 # The CI-hygiene pair. Same shape, same directory. Neither imports anything
 # from the package -- their subjects are `.github/scripts/` and
 # `.dockerignore` -- so neither needs the corpus, a key, a database, a live
