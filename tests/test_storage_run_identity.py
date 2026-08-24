@@ -114,6 +114,7 @@ import sqlite3
 import tempfile
 from pathlib import Path
 
+from oncotriage import config
 from oncotriage import paths as _paths
 from oncotriage import run_fingerprint as _rf
 from oncotriage import tracking as _tracking
@@ -507,11 +508,26 @@ _STAMP_VALUES = {
     "llm_classifier_prompt_version": "9.9.9-test",
     "llm_classifier_renderer_digest": "d" * 64,
     "matching_model_configured": "test-model",
+    # A REAL MEMBER of config.MATCHING_CALL_MODES rather than a placeholder:
+    # this column is what campaign_summary stitches on and what a resume gate
+    # refuses across, and a value outside the vocabulary would exercise neither.
+    "matching_call_mode": "grouped",
     "qdrant_collection": "trial_criteria_test_0001",
     "collection_points": 12345,
     "data_snapshot_date": "2026-01-31",
 }
-_STAMP = {k: _STAMP_VALUES[k] for k in
+# A FIELD WITH NO LITERAL ABOVE GETS A GENERATED ONE RATHER THAN A KeyError, and
+# that is a repair rather than a convenience. The comment above this dict has
+# always claimed the keys come from the module so "a field added to the stamp
+# appears here automatically" -- and it did not: the VALUES were hand-written, so
+# the first field added to FINGERPRINT_FIELDS raised KeyError AT MODULE LEVEL and
+# took the whole file with it, reporting one traceback where it owed 134 results.
+# That is the abort shape this project has shipped ten times. The claim is true
+# now, and the fallback is REPORTED below rather than silent, because a
+# placeholder standing in for a field somebody meant to give a real value is
+# exactly what a generated default would otherwise hide.
+_STAMP_DEFAULTED = [k for k in _rf.FINGERPRINT_FIELDS if k not in _STAMP_VALUES]
+_STAMP = {k: _STAMP_VALUES.get(k, f"test-{k}") for k in
           ("fingerprint_version",) + _rf.FINGERPRINT_FIELDS}
 
 
@@ -539,9 +555,20 @@ check("RUN_FINGERPRINT_COLUMNS is exactly the stamp's keys, in order",
       list(_dl.RUN_FINGERPRINT_COLUMNS),
       ["fingerprint_version"] + list(_rf.FINGERPRINT_FIELDS))
 
-check("...and the stamp really has six gated fields (non-degenerate: a check "
-      "against an empty tuple would pass for free)",
-      len(_rf.FINGERPRINT_FIELDS), 6)
+check("...and the stamp really has seven gated fields (non-degenerate: a check "
+      "against an empty tuple would pass for free). SIX until the call-mode "
+      "pass gated `matching_call_mode`",
+      len(_rf.FINGERPRINT_FIELDS), 7)
+
+check("every gated field has a real literal in this file's stamp, so no check "
+      "below is exercising a generated placeholder",
+      _STAMP_DEFAULTED, [])
+
+check("`matching_call_mode` is gated, and its stamp value is a real member of "
+      "the pipeline's own two-member vocabulary rather than a placeholder",
+      ("matching_call_mode" in _rf.FINGERPRINT_FIELDS,
+       _STAMP["matching_call_mode"] in config.MATCHING_CALL_MODES),
+      (True, True))
 
 check("RUN_RECORD_TERMINAL_STATUSES equals tracking.RUN_STATUSES",
       tuple(_dl.RUN_RECORD_TERMINAL_STATUSES), tuple(_tracking.RUN_STATUSES))
@@ -560,10 +587,34 @@ check("RUN_RECORD_STATUSES is the terminal set plus RUNNING, and nothing else",
 # positionally against this tuple, so the ORDER is what matters -- base facts,
 # then the stamp, then the additions in dict order, which is the order ALTER
 # TABLE appends them in.
-check("RUN_COLUMNS is the four run facts, the stamp columns, then the additions",
-      list(_dl.RUN_COLUMNS),
-      ["started_at", "finished_at", "status", "invocation_source"] +
-      list(_dl.RUN_FINGERPRINT_COLUMNS) + list(_dl.RUN_COLUMN_ADDITIONS))
+#
+# ONE COLUMN CAN BE NAMED BY BOTH SOURCES AND MUST APPEAR ONCE.
+# `matching_call_mode` is a stamp field AND an additive column, for the two
+# orthogonal reasons argued at RUN_COLUMN_ADDITIONS, and a plain concatenation
+# names it twice -- which is `OperationalError: duplicate column name` at the
+# INSERT, on the first run of every campaign. The expectation is written out
+# here as "base, the stamp columns the additions do not also name, then the
+# additions" rather than by calling _dl._last_wins, because an expectation
+# computed by the function under test agrees with it by construction.
+_EXPECTED_RUN_COLUMNS = (
+    ["started_at", "finished_at", "status", "invocation_source"]
+    + [c for c in _dl.RUN_FINGERPRINT_COLUMNS
+       if c not in _dl.RUN_COLUMN_ADDITIONS]
+    + list(_dl.RUN_COLUMN_ADDITIONS))
+check("RUN_COLUMNS is the four run facts, the stamp columns, then the "
+      "additions -- with a column named by both appearing ONCE, where the "
+      "ALTER put it",
+      list(_dl.RUN_COLUMNS), _EXPECTED_RUN_COLUMNS)
+check("...and it names no column twice, which is what the INSERT would raise "
+      "on", len(_dl.RUN_COLUMNS), len(set(_dl.RUN_COLUMNS)))
+check("...and the de-duplication is really doing work here (non-degeneracy: "
+      "with no overlap the two rules give the same answer and the check above "
+      "cannot distinguish them)",
+      sorted(set(_dl.RUN_FINGERPRINT_COLUMNS) & set(_dl.RUN_COLUMN_ADDITIONS)),
+      ["matching_call_mode"])
+check("...and the overlapping column sits at the END, where ALTER TABLE "
+      "appends it, rather than at its stamp position",
+      _dl.RUN_COLUMNS[-1], "matching_call_mode")
 check("...and the additions really contribute (non-degeneracy: with an empty "
       "dict the line above is the pre-additions check wearing a new label)",
       len(_dl.RUN_COLUMN_ADDITIONS) > 0, True)

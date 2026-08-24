@@ -48,6 +48,17 @@ WHAT IS IN THE STAMP, AND WHY EACH FIELD IS THERE
                                     dated snapshot of the same alias; what was
                                     asked for is what a resume would ask for
                                     again.
+    matching_call_mode              HOW Stage 5 is called: one request carrying
+                                    several trials, or one request per trial.
+                                    The same judge answering the same trials in
+                                    two arms does not answer them the same way
+                                    -- a per-trial call sees one trial's
+                                    criteria in its whole context and cannot
+                                    omit a trial from a batch it was never sent
+                                    -- so the two arms are not commensurable
+                                    and their patients must not be summed.
+                                    Nothing else in this stamp moves with it:
+                                    the wire model is the same id in both.
     qdrant_collection               the RESOLVED backing collection, never the
                                     alias. The alias is a constant -- that is
                                     what an alias is for -- so a gate on it is a
@@ -151,8 +162,29 @@ log = get_logger(__name__)
 # CONSTANTS
 # ===========================================================================
 
-FINGERPRINT_VERSION = 2
+FINGERPRINT_VERSION = 3
 """Bumped when the FIELD SET changes, never when a field's value changes.
+
+    2 -> 3  added ``matching_call_mode``. EVERY ARTIFACT STAMPED AT 2 THEREFORE
+            ANSWERS FP_VERSION UNTIL AN OPERATOR CLEARS IT ONCE, for the reason
+            spelled out under 1 -> 2 below; the remediation is identical and is
+            printed on the refusal.
+
+            WHAT IT CLOSES, AND THE HARM IS THE SAME SHAPE THE MODULE EXISTS
+            FOR. ``config.matching_call_mode()`` decides whether Stage 5 sends
+            ONE request carrying several trials or one request PER TRIAL. That
+            is not a tuning knob with a marginal effect: it changes how many
+            billed calls a patient costs, what the model sees in one context,
+            which trials can be omitted from a response at all, and therefore
+            the verdicts. Yet NOT ONE gated field moved with it -- the flag is
+            a bool that no other field is a function of, and
+            ``matching_model_configured`` is the same wire id in both arms
+            because it is the same judge. So a grouped-mode checkpoint resumed
+            under per-trial mode answered FP_MATCH, skipped every patient the
+            grouped process had completed, ran the rest in the other arm, and
+            put both into one ``inferences`` table with nothing in it saying
+            so. Every mean, rate and per-patient cost computed over that
+            artifact is a number about two arms presented as one.
 
     1 -> 2  added ``llm_classifier_renderer_digest``. EVERY ARTIFACT STAMPED AT
             1 THEREFORE ANSWERS FP_VERSION UNTIL AN OPERATOR CLEARS IT ONCE.
@@ -351,6 +383,7 @@ FINGERPRINT_FIELDS = (
     "llm_classifier_prompt_version",
     "llm_classifier_renderer_digest",
     "matching_model_configured",
+    "matching_call_mode",
     "qdrant_collection",
     "collection_points",
     "data_snapshot_date",
@@ -607,6 +640,51 @@ def _wire_model() -> str:
         return UNKNOWN
 
 
+def _call_mode() -> str:
+    """``config.matching_call_mode()``, degraded to UNKNOWN rather than raised.
+
+    THROUGH THE ONE OWNER, NEVER THROUGH THE CONSTANT. ``matching_call_mode()``
+    is the single place ``MATCHING_PER_TRIAL_CALLS_ENABLED`` is turned into the
+    value this project records -- ``oncotriage/agent/evaluation.py`` decides
+    Stage 5's partition through it and ``oncotriage/storage/database_logger.py``
+    writes ``inferences.matching_call_mode`` from it, both by CALLING it rather
+    than reading the flag. A ``from oncotriage.config import
+    MATCHING_PER_TRIAL_CALLS_ENABLED`` here would BIND the value at import, so a
+    process that moved the flag afterwards (``bedrock_probe.py`` does; a test
+    does) would stamp the value this module was imported with rather than the
+    one the run used -- and a stamp that disagrees with the run it describes is
+    worse than no stamp. Reading ``config.MATCHING_PER_TRIAL_CALLS_ENABLED``
+    live would be no better in kind: it is a SECOND derivation of one fact, the
+    two-copies shape pass 20f-2 removed for the cross-encoder checkpoint, and
+    the day the owner grows a third mode this one would silently keep answering
+    with two.
+
+    NEVER RAISES, on ``_wire_model``'s footing directly above: this module's
+    contract is that ``current()`` never raises, and both consumers call it from
+    a ``main()`` that is about to spend money. The owner cannot raise today --
+    it is a conditional expression over a bool -- and that is exactly why the
+    guard is here rather than argued away: a function that cannot fail is a
+    function whose call site is free to stop checking, and the day it grows a
+    lookup, a validation or a third mode this would otherwise abort the run the
+    stamp exists to describe.
+
+    An UNKNOWN in a gated field makes the stamp UNRESOLVED, so ``compare()``
+    answers FP_UNRESOLVED -- "this run's own configuration did not establish"
+    -- which does NOT send an operator to clear a good checkpoint.
+    """
+    try:
+        return config.matching_call_mode()
+    except Exception as exc:                                   # noqa: BLE001
+        FINGERPRINT_DEGRADATIONS[
+            f"matching_call_mode:{type(exc).__name__}"] += 1
+        log.warning("the Stage 5 call mode did not resolve; the run "
+                    "fingerprint records it as unknown",
+                    event="fingerprint_call_mode_unresolved",
+                    error_type=type(exc).__name__, error_message=str(exc),
+                    degraded=True)
+        return UNKNOWN
+
+
 def current(refresh: bool = False) -> dict:
     """This run's configuration stamp. Resolved once per process, then cached.
 
@@ -653,6 +731,13 @@ def current(refresh: bool = False) -> dict:
                 # whose cost is that every v2-stamped artifact refuses once --
                 # recorded as a follow-up rather than taken silently.
                 "matching_model_configured": _wire_model(),
+                # HOW STAGE 5 IS CALLED, beside WHICH model it calls, because
+                # the two together are what a request is. This is the field
+                # that makes an arm of the per-trial campaign a configuration
+                # rather than an undeclared variable -- see FINGERPRINT_VERSION
+                # 2 -> 3 for what a resume across the two arms silently
+                # produced before it.
+                "matching_call_mode": _call_mode(),
                 "qdrant_collection": name,
                 "collection_points": points,
                 "data_snapshot_date": config.DATA_SNAPSHOT_DATE,
@@ -687,7 +772,8 @@ def summary(fingerprint: dict) -> str:
     digest = str(get("llm_classifier_renderer_digest", NOT_RECORDED))
     return (f"prompt {get('llm_classifier_prompt_version', NOT_RECORDED)} "
             f"(renderer {digest[:12]}), "
-            f"model {get('matching_model_configured', NOT_RECORDED)}, "
+            f"model {get('matching_model_configured', NOT_RECORDED)} "
+            f"({get('matching_call_mode', NOT_RECORDED)}), "
             f"collection {get('qdrant_collection', NOT_RECORDED)} "
             f"({get('collection_points', NOT_RECORDED)} points), "
             f"snapshot {get('data_snapshot_date', NOT_RECORDED)}")

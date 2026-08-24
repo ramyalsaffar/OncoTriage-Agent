@@ -125,6 +125,7 @@ import shutil
 import sqlite3
 import tempfile
 
+from oncotriage import config as _config
 from oncotriage.storage import database_logger as _dl
 from oncotriage.storage import queries as _q
 
@@ -695,8 +696,62 @@ check("3b-i ...and ANNOUNCES each, so the migration is not silent",
 check("3b-j ...and the existing row keeps NULL rather than being given a value "
       "nobody recorded -- a run that predates the column did not measure 0",
       sql_one(_pre_conn2, "SELECT resumed FROM runs"), (None,))
+check("3b-j-ii ...and so does EVERY added column, derived rather than named, "
+      "so the column added next era is covered without a second edit here",
+      {c: sql_one(_pre_conn2, f"SELECT {c} FROM runs")[0]
+       for c in _dl.RUN_COLUMN_ADDITIONS},
+      {c: None for c in _dl.RUN_COLUMN_ADDITIONS})
 check("3b-k ...and the era moved with the schema, in one open",
       user_version(_PRE_RUNS), _dl.SCHEMA_USER_VERSION)
+
+# THE ERA RECORD IS NOT DECORATION. `SCHEMA_USER_VERSION`'s own comment states
+# the rule "bump this in the same commit that changes the schema" and lists what
+# each era WAS -- and a number whose eras are not all written down answers
+# "which era is this file" with a number nobody can look up, which is the whole
+# thing the constant exists to prevent. A bump with no record is invisible to
+# every other check in this file, because they all read the number.
+_ERA_SRC = open(os.path.abspath(_dl.__file__), encoding="utf-8").read()
+_ERA_HEAD = _ERA_SRC.split("SCHEMA_USER_VERSION = ")[0]
+check("3b-m every era from 1 to the current one is named in the record above "
+      "the constant, so a bump cannot ship without saying what changed",
+      [n for n in range(1, _dl.SCHEMA_USER_VERSION + 1)
+       if f"# ERA {n}:" not in _ERA_HEAD], [])
+check("3b-n ...and no era ABOVE the current one is recorded, which is what a "
+      "record written for a bump that was then not taken would look like",
+      [n for n in range(_dl.SCHEMA_USER_VERSION + 1,
+                        _dl.SCHEMA_USER_VERSION + 4)
+       if f"# ERA {n}:" in _ERA_HEAD], [])
+check("3b-n ...(non-degeneracy: the search really can find an era line, so the "
+      "two checks above are not both passing over an empty haystack)",
+      f"# ERA {_dl.SCHEMA_USER_VERSION}:" in _ERA_HEAD, True)
+
+# THE ARM ROUND-TRIPS ITS OWN VOCABULARY. `resumed` below is checked as an
+# integer for the affinity reason; this column is TEXT and what matters about it
+# is that the value stored is a member of config.MATCHING_CALL_MODES, because
+# campaign_summary stitches on equality of it and a resume gate refuses across
+# it -- both of which compare the stored string.
+_MODE_DB = os.path.join(_TMP, "callmode.db")
+fresh_db(_MODE_DB)
+with quiet():
+    _m_ids = {m: guarded(_dl.start_run_record, "batch", db_path=_MODE_DB,
+                         fingerprint={"fingerprint_version": 1,
+                                      "matching_call_mode": m})
+              for m in _config.MATCHING_CALL_MODES}
+    _m_none = guarded(_dl.start_run_record, "batch", db_path=_MODE_DB,
+                      fingerprint=None)
+_mode_conn = sqlite3.connect(_MODE_DB)
+check("3b-o both members of the call-mode vocabulary round-trip verbatim",
+      {m: sql_one(_mode_conn, "SELECT matching_call_mode FROM runs WHERE id = ?",
+                  (_m_ids[m],))[0] for m in _config.MATCHING_CALL_MODES},
+      {m: m for m in _config.MATCHING_CALL_MODES})
+check("3b-p ...and a run with no stamp stores NULL, which is 'not recorded' "
+      "and must never read as 'grouped'",
+      sql_one(_mode_conn, "SELECT matching_call_mode FROM runs WHERE id = ?",
+              (_m_none,))[0], None)
+check("3b-q ...(non-degeneracy: the vocabulary really has two distinct members, "
+      "so the round trip above is not one value compared with itself)",
+      len(set(_config.MATCHING_CALL_MODES)), 2)
+_mode_conn.close()
 _pre_conn.close()
 _pre_conn2.close()
 

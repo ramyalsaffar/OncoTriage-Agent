@@ -1202,10 +1202,20 @@ check("no backfill statement exists anywhere in the writer",
 
 section("7. The resume gate sees a provider flip; the fixture records it")
 
-check("FINGERPRINT_VERSION is UNCHANGED at 2 -- no artifact refuses",
-      run_fingerprint.FINGERPRINT_VERSION, 2)
-check("...and the gated field list is unchanged in length", 
-      len(run_fingerprint.FINGERPRINT_FIELDS), 6)
+# THE BEDROCK PASS LEFT THIS AT 2 AND SAID SO. The call-mode pass took it to 3
+# BY GATING A NEW FIELD, which is what this constant is for -- so the claim
+# checked here is no longer "unchanged" but "at least what the Bedrock pass
+# needed, and never lowered". A LOWER value would mean a v2-stamped artifact
+# silently comparing field-by-field against a shape that no longer matches it,
+# which is the failure the version exists to prevent; a higher one is a later
+# pass gating a field, which is the mechanism working.
+check("FINGERPRINT_VERSION is at least the 2 this pass shipped, and was raised "
+      "by a field being GATED rather than by anything here",
+      run_fingerprint.FINGERPRINT_VERSION >= 2, True)
+check("...and the gated field list has not SHRUNK below the six this pass "
+      "relied on -- a field leaving the gate is what would make the provider "
+      "flip invisible again",
+      len(run_fingerprint.FINGERPRINT_FIELDS) >= 6, True)
 check("matching_model_configured is still a GATED field",
       "matching_model_configured" in run_fingerprint.FINGERPRINT_FIELDS, True)
 

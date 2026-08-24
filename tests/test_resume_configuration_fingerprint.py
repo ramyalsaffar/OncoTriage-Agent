@@ -519,8 +519,11 @@ check("...and it is NOT the UNKNOWN sentinel (non-degeneracy: an unreadable "
       "module answers UNKNOWN, and every check below would then be comparing "
       "one sentinel with another)",
       at(_now) == _fp.UNKNOWN, False)
-check("the stamp's version says this field set is version 2",
-      _fp.FINGERPRINT_VERSION, 2)
+check("the stamp's version says this field set is version 3. It was 2 until "
+      "`matching_call_mode` was gated; the bump is what makes every v2 "
+      "artifact answer FP_VERSION once rather than have its missing field "
+      "compared against a live value",
+      _fp.FINGERPRINT_VERSION, 3)
 
 # --- (b) the module set is DERIVED, not trusted ---------------------------
 # A static closure from the two render entry points over every module-level
@@ -955,6 +958,179 @@ check_true("...and both do call it (non-degeneracy for the check above, which "
 
 
 # ===========================================================================
+# SECTION 1c  matching_call_mode
+# ===========================================================================
+#
+# WHAT THIS FIELD CLOSES, and it is not a marginal one.
+# `config.matching_call_mode()` decides whether Stage 5 sends ONE request
+# carrying several trials or one request PER TRIAL. Before it was gated, NOT ONE
+# field of this stamp moved with it -- the flag is a bool nothing else is a
+# function of, and `matching_model_configured` is the same wire id in both arms
+# because it is the same judge. So a grouped-mode checkpoint resumed under
+# per-trial mode answered FP_MATCH, skipped every patient the grouped process
+# had completed, ran the rest in the other arm, and put both into one
+# `inferences` table with nothing in it saying so.
+#
+# THE VALUE COMES FROM THE ONE OWNER AND THAT IS ASSERTED BY BEHAVIOUR, not by
+# reading the source: the flag is moved on the config MODULE and the stamp is
+# required to follow it. A `from oncotriage.config import
+# MATCHING_PER_TRIAL_CALLS_ENABLED` in run_fingerprint would bind the value at
+# import and fail exactly this check, and a second copy of the flag-to-mode
+# mapping would fail it the day the mapping changed.
+
+print()
+print("=" * 70)
+print("SECTION 1c  matching_call_mode")
+print("=" * 70)
+
+check_true("it is a GATED field, not merely a recorded one -- which is what "
+           "makes a resume across the two arms a refusal rather than a note",
+           "matching_call_mode" in _fp.FINGERPRINT_FIELDS)
+
+_fp.clear_cache()
+_mode_now = stamp_now()
+check("current() carries it, and its value is a member of the pipeline's own "
+      "closed vocabulary rather than a free string",
+      at(_mode_now, "matching_call_mode") in _config.MATCHING_CALL_MODES, True)
+check("...and it agrees with the ONE owner, config.matching_call_mode()",
+      at(_mode_now, "matching_call_mode"), _config.matching_call_mode())
+check("...(non-degeneracy: the vocabulary really has two distinct members, so "
+      "the checks below can tell the arms apart)",
+      len(set(_config.MATCHING_CALL_MODES)), 2)
+check("no arm collides with this module's UNKNOWN sentinel. A mode literally "
+      "spelled 'unknown' would make a resolved stamp report itself unresolved, "
+      "so every gate would answer FP_UNRESOLVED and refuse every resume for a "
+      "configuration that was perfectly well established",
+      [m for m in _config.MATCHING_CALL_MODES if m == _fp.UNKNOWN], [])
+
+# --- THE STAMP FOLLOWS THE FLAG AT CALL TIME, IN BOTH DIRECTIONS ------------
+#
+# BOTH DIRECTIONS, because a function that ignored the flag and returned a
+# constant would satisfy a one-way check. The flag is restored in a `finally`
+# and the restore is asserted, on this project's standing rule for a module
+# attribute rebound by a test.
+_saved_flag = _config.MATCHING_PER_TRIAL_CALLS_ENABLED
+try:
+    _config.MATCHING_PER_TRIAL_CALLS_ENABLED = True
+    _fp.clear_cache()
+    _stamp_on = at(stamp_now(), "matching_call_mode")
+    _config.MATCHING_PER_TRIAL_CALLS_ENABLED = False
+    _fp.clear_cache()
+    _stamp_off = at(stamp_now(), "matching_call_mode")
+finally:
+    _config.MATCHING_PER_TRIAL_CALLS_ENABLED = _saved_flag
+    _fp.clear_cache()
+
+check("the stamp reads the flag LIVE off the config module, in both "
+      "directions -- so a from-import binding at run_fingerprint's own import, "
+      "or a hardcoded constant, fails here",
+      (_stamp_on, _stamp_off),
+      (_config.MATCHING_CALL_MODE_PER_TRIAL, _config.MATCHING_CALL_MODE_GROUPED))
+check("...and the flag was restored",
+      _config.MATCHING_PER_TRIAL_CALLS_ENABLED, _saved_flag)
+
+# --- THE REFUSAL, WHICH IS THE WHOLE POINT ---------------------------------
+def _mode_stamp(mode):
+    """A fully-resolved stamp differing from its sibling in the arm ALONE.
+
+    Keys DERIVED from FINGERPRINT_FIELDS, never enumerated, so the next gated
+    field cannot make this build an under-shaped stamp that reports
+    FP_UNRESOLVED for a reason that has nothing to do with the arm.
+    """
+    out = {f: f"offline-{f}" for f in _fp.FINGERPRINT_FIELDS}
+    out["fingerprint_version"] = _fp.FINGERPRINT_VERSION
+    out["matching_call_mode"] = mode
+    return out
+
+_GROUPED = _mode_stamp(_config.MATCHING_CALL_MODE_GROUPED)
+_PER_TRIAL = _mode_stamp(_config.MATCHING_CALL_MODE_PER_TRIAL)
+
+check("both probe stamps are fully resolved (non-degeneracy: an UNKNOWN in "
+      "either would make every comparison below FP_UNRESOLVED, which passes a "
+      "'not FP_MATCH' check for entirely the wrong reason)",
+      (_fp.is_resolved(_GROUPED), _fp.is_resolved(_PER_TRIAL)), (True, True))
+check("...and they differ in the ARM ALONE",
+      [f for f in _fp.FINGERPRINT_FIELDS if _GROUPED[f] != _PER_TRIAL[f]],
+      ["matching_call_mode"])
+
+_mode_outcome, _mode_detail = _fp.compare(_GROUPED, _PER_TRIAL)
+check("a grouped artifact against a per-trial run is FP_CHANGED -- NOT "
+      "FP_MATCH, which is what the five-field gate answered",
+      _mode_outcome, _fp.FP_CHANGED)
+check_true("...and the detail NAMES THE FIELD AND BOTH MODES, so an operator "
+           "reads what moved rather than being told something did",
+           "matching_call_mode" in _mode_detail
+           and repr(_config.MATCHING_CALL_MODE_GROUPED) in _mode_detail
+           and repr(_config.MATCHING_CALL_MODE_PER_TRIAL) in _mode_detail)
+check("...and the same arm on both sides still resumes, so the gate has not "
+      "simply been made to refuse everything",
+      _fp.compare(_GROUPED, _GROUPED)[0], _fp.FP_MATCH)
+check("...in the other direction too", _fp.compare(_PER_TRIAL, _GROUPED)[0],
+      _fp.FP_CHANGED)
+
+check_true("summary() names the arm, so the banner a consumer prints before "
+           "spending states which arm it is about to run",
+           str(_config.MATCHING_CALL_MODE_PER_TRIAL) in _fp.summary(_PER_TRIAL))
+check_true("...and disagrees with the other arm's banner (non-degeneracy: a "
+           "summary() that dropped the field would satisfy neither)",
+           _fp.summary(_PER_TRIAL) != _fp.summary(_GROUPED))
+
+# --- A v2 ARTIFACT ANSWERS FP_VERSION, NOT FP_CHANGED ----------------------
+#
+# The version bump's DESIGNED cost, asserted rather than assumed. A stamp
+# written before this field existed must not have its missing arm compared
+# against a live one and reported as a configuration change that may never have
+# happened -- a true refusal for a false reason.
+_v2 = {k: v for k, v in _GROUPED.items() if k != "matching_call_mode"}
+_v2["fingerprint_version"] = 2
+_v2_outcome, _v2_detail = _fp.compare(_v2, _PER_TRIAL)
+check("a v2 stamp answers FP_VERSION, before any field is compared",
+      _v2_outcome, _fp.FP_VERSION)
+check_true("...and the detail names both versions rather than the arm",
+           "2" in _v2_detail and str(_fp.FINGERPRINT_VERSION) in _v2_detail
+           and "matching_call_mode" not in _v2_detail)
+check_true("...and the refusal says the SHAPE changed and that clearing once "
+           "is the whole remediation, which is the one outcome whose cause may "
+           "be nothing at all",
+           any("stamp SHAPE" in line for line in
+               _fp.refusal_lines(_v2_outcome, _v2_detail, "an artifact",
+                                 ["fix"])))
+
+# --- IT DEGRADES RATHER THAN RAISING --------------------------------------
+#
+# `current()`'s contract is that it never raises: both consumers call it from a
+# main() that is about to spend money, and an exception out of the STAMP would
+# abort the run the stamp exists to describe. The owner cannot fail today, which
+# is exactly why the guard is checked rather than argued away.
+_saved_owner = _config.matching_call_mode
+_before_deg = _fp.FINGERPRINT_DEGRADATIONS.copy()
+try:
+    def _boom():
+        raise RuntimeError("the owner grew a lookup and it failed")
+    _config.matching_call_mode = _boom
+    _degraded_mode = drive(_fp._call_mode, default="<_call_mode raised>")
+finally:
+    _config.matching_call_mode = _saved_owner
+check("an owner that raises is recorded as UNKNOWN rather than escaping",
+      _degraded_mode, _fp.UNKNOWN)
+check("...and the owner was restored BY IDENTITY",
+      _config.matching_call_mode is _saved_owner, True)
+check("...and the reason was counted, keyed by field and exception type",
+      [k for k in _fp.FINGERPRINT_DEGRADATIONS
+       if k.startswith("matching_call_mode:")
+       and _fp.FINGERPRINT_DEGRADATIONS[k] > _before_deg.get(k, 0)],
+      ["matching_call_mode:RuntimeError"])
+check("...and an UNKNOWN arm makes the whole stamp unresolved, so compare() "
+      "answers FP_UNRESOLVED rather than reporting a configuration change",
+      _fp.compare(_GROUPED,
+                  dict(_PER_TRIAL, matching_call_mode=_fp.UNKNOWN))[0],
+      _fp.FP_UNRESOLVED)
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
 # SECTION 2  utils.preserve_corrupt_file
 # ===========================================================================
 
@@ -1093,10 +1269,32 @@ try:
     _CASES = (
         ("llm_classifier_prompt_version", "9.9.9", _fp.FP_CHANGED),
         ("matching_model_configured", "gpt-4o-2024-08-06", _fp.FP_CHANGED),
+        # THE ARM, DRIVEN THROUGH THE REAL load_checkpoint RATHER THAN THROUGH
+        # compare(). This is the concrete harm the field was gated for: a
+        # grouped-mode checkpoint resumed under per-trial mode used to skip
+        # every patient the grouped process had completed and run the rest in
+        # the other arm, into one inferences table, silently. The stored value
+        # is whichever arm this process is NOT in, so the case is a real
+        # mismatch on either setting of the flag.
+        ("matching_call_mode",
+         (_config.MATCHING_CALL_MODE_PER_TRIAL
+          if _config.matching_call_mode() == _config.MATCHING_CALL_MODE_GROUPED
+          else _config.MATCHING_CALL_MODE_GROUPED),
+         _fp.FP_CHANGED),
         ("qdrant_collection", "trial_criteria_20260101_000000", _fp.FP_CHANGED),
         ("collection_points", 1, _fp.FP_CHANGED),
         ("data_snapshot_date", "2019-05-05", _fp.FP_CHANGED),
     )
+    # EVERY GATED FIELD IS EITHER IN THIS TABLE OR HAS ITS OWN SECTION, and the
+    # round trip is closed here so a field gated in a later pass cannot be added
+    # to the stamp and left undriven through the real checkpoint gate -- which
+    # is what "the gate refuses on it" is actually worth.
+    check("the mismatch table plus the two fields with their own sections "
+          "covers every gated field",
+          sorted(set(_fp.FINGERPRINT_FIELDS)
+                 - {f for f, _, _ in _CASES}
+                 - {"llm_classifier_renderer_digest"}),
+          [])
     for _field, _value, _want in _CASES:
         _stale = read_json(_CK)
         _stale["fingerprint"][_field] = _value
@@ -1323,6 +1521,31 @@ check_true("...pointed at THIS database, not the production checkpoint",
 check("...and nothing was deleted", digest(_CK_A), _before)
 check("...and B is untouched by A's refusal",
       _study.load_ablation_checkpoint(db_path=_DB_B), set())
+
+# THE ARM, THROUGH THIS GATE TOO. The three consumers share one comparator, so
+# the mechanism is proved by the batch drive -- what this adds is that the
+# ABLATION entry point's own remediation and its own --db are named on an arm
+# refusal, which is the thing an operator acts on and the one part of a refusal
+# that is NOT shared. A study resumed across the arms would put grouped and
+# per-trial rows into one ablation_results.db, whose whole purpose is comparing
+# configurations.
+_stale = read_json(_CK_A)
+_stale["fingerprint"]["matching_call_mode"] = (
+    _config.MATCHING_CALL_MODE_PER_TRIAL
+    if _config.matching_call_mode() == _config.MATCHING_CALL_MODE_GROUPED
+    else _config.MATCHING_CALL_MODE_GROUPED)
+write_json(_CK_A, _stale)
+_before = digest(_CK_A)
+_type, _msg = raises(lambda: _study.load_ablation_checkpoint(db_path=_DB_A))
+check("a study checkpoint from a different STAGE 5 CALL MODE refuses", _type,
+      "ResumeRefusal")
+check_true("...naming the field and BOTH arms",
+           "matching_call_mode" in _msg
+           and repr(_config.MATCHING_CALL_MODE_GROUPED) in _msg
+           and repr(_config.MATCHING_CALL_MODE_PER_TRIAL) in _msg)
+check_true("...with this entry point's own remediation and its own --db",
+           "--fresh-start" in _msg and _DB_A in _msg)
+check("...and nothing was deleted", digest(_CK_A), _before)
 
 write_json(_CK_A, {"completed": [["full_pipeline", "p1"]], "count": 1})
 _type, _msg = raises(lambda: _study.load_ablation_checkpoint(db_path=_DB_A))
@@ -1603,8 +1826,30 @@ try:
     check("...and written nothing", digest(_MAN_PATH), _MAN_BEFORE)
     _COLLECTION["points"] = _points_was
 
+    # THE ARM, DRIVEN THROUGH THE REAL main(). The evaluation harness is the one
+    # consumer with an escape hatch, so both halves of requirement 5 are here:
+    # a mode change refuses by default, and --allow-environment-change admits it
+    # (that half is exercised by the override group below, whose OVERRIDABLE_
+    # OUTCOMES membership is what this case's FP_CHANGED outcome buys).
+    _arm_was = _config.MATCHING_PER_TRIAL_CALLS_ENABLED
+    _config.MATCHING_PER_TRIAL_CALLS_ENABLED = not _arm_was
+    _code = run_main(["--select", "3", "--output-dir", _OUT])
+    check("a run under a different STAGE 5 CALL MODE refuses -- the resume "
+          "that used to run two arms into one artifact", _code,
+          _rh.EXIT_PRECONDITION)
+    check("...and written nothing", digest(_MAN_PATH), _MAN_BEFORE)
+    check("...and the refusal is an OVERRIDABLE outcome, so the operator who "
+          "means it has --allow-environment-change and the one who does not "
+          "has a stop",
+          _rh.environment_gate(read_json(_MAN_PATH), _fp.current(refresh=True))[0]
+          in _rh.OVERRIDABLE_OUTCOMES, True)
+    _config.MATCHING_PER_TRIAL_CALLS_ENABLED = _arm_was
+    _fp.clear_cache()
+    check("...and the flag was restored",
+          _config.MATCHING_PER_TRIAL_CALLS_ENABLED, _arm_was)
+
     check("with everything restored the same command succeeds again "
-          "(non-degeneracy: the four refusals above are about the change, not "
+          "(non-degeneracy: the five refusals above are about the change, not "
           "about the directory)",
           run_main(["--select", "3", "--output-dir", _OUT, "--resume"]),
           _rh.EXIT_OK)

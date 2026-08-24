@@ -173,7 +173,20 @@ except ImportError:
 
 import pandas as pd
 
-from oncotriage.config import RRF_POOL_SIZE, TOP_K_CANDIDATES
+# THE CALL-MODE VOCABULARY IS IMPORTED AND NEVER RETYPED. Section 8b's arm pair
+# and section 8c's comparison both turn on these two strings being the ones the
+# writer stores, and a literal here would agree with a typo in the seed.
+#
+# IT DOES NOT PUT THIS FILE IN THE COLLISION MATRIX. That derivation turns on
+# WHICH config VALUES this file depends on -- `tests/test_config_snapshot_date_
+# rot.py` rewrites `oncotriage/config.py` in place and the value it rewrites is
+# `DATA_SNAPSHOT_DATE`. These two are untouched by that rewrite, exactly as
+# RRF_POOL_SIZE and TOP_K_CANDIDATES beside them are, and the module was already
+# imported.
+from oncotriage.config import (MATCHING_CALL_MODE_GROUPED,
+                               MATCHING_CALL_MODE_PER_TRIAL,
+                               MATCHING_CALL_MODES,
+                               RRF_POOL_SIZE, TOP_K_CANDIDATES)
 from oncotriage.storage import queries
 from oncotriage.storage import database_logger as dblog
 from oncotriage.storage.database_logger import initialize_database
@@ -798,6 +811,7 @@ _SEED_ROWS = [
         run_id=_DANGLING_RUN_ID,
         matching_model=_MODEL_A, llm_classifier_input_tokens=1000,
         llm_classifier_output_tokens=500, llm_classifier_reasoning_tokens=None,
+        matching_call_mode=MATCHING_CALL_MODE_GROUPED,
         estimated_cost_usd=_DANGLING_COST, medication_count=4,
         condition_count=3, total_time=9.0, age=55,
         candidates_retrieved=90, candidates_reranked=30,
@@ -809,6 +823,7 @@ _SEED_ROWS = [
     ("P-CONSISTENT-A", dict(
         matching_model=_MODEL_A, llm_classifier_input_tokens=10000,
         llm_classifier_output_tokens=5000, llm_classifier_reasoning_tokens=None,
+        matching_call_mode=MATCHING_CALL_MODE_GROUPED,
         estimated_cost_usd=0.075, medication_count=120, condition_count=10,
         total_time=130.0, age=61,
         candidates_retrieved=100, candidates_reranked=40,
@@ -827,6 +842,7 @@ _SEED_ROWS = [
     ("P-CONSISTENT-B", dict(
         matching_model=_MODEL_A, llm_classifier_input_tokens=20000,
         llm_classifier_output_tokens=4500, llm_classifier_reasoning_tokens=1200,
+        matching_call_mode=MATCHING_CALL_MODE_PER_TRIAL,
         estimated_cost_usd=0.095, age=72, sex="female", medication_count=60,
         candidates_retrieved=87, candidates_reranked=40,
         candidates_filtered=15, candidates_evaluated=15,
@@ -1037,19 +1053,34 @@ check("every column the seed writes exists in the real schema",
 # criterion remaps, row 2 is an entry the pipeline CONSTRUCTED (every column
 # NULL, which is the population the reader has to be able to select), and row 3
 # is an unreadable label that still ended eligible off its criteria.
+# THE OWNING PATIENT IS NAMED PER ROW rather than derived from the index. It was
+# `"P-CONSISTENT-A" if _i < 2 else "P-CONSISTENT-B"`, which is a rule that
+# silently reassigns every row after any insertion -- and the omission row below
+# has to hang off the GROUPED patient specifically, because an omission is a
+# trial sent inside a BATCH and not answered for, which per-trial mode cannot
+# produce by construction.
 _TRIAL_MATCH_ROWS = [
-    # nct, phase, eligible, score, ne_reason, v_source, v_label, v_type, remaps
-    ("NCT00000001", "Phase 2", "eligible", 0.91,
+    # patient, nct, phase, eligible, score, ne_reason, v_source, v_label,
+    # v_type, remaps
+    ("P-CONSISTENT-A", "NCT00000001", "Phase 2", "eligible", 0.91,
      None, "canonical", None, None, 0),
-    ("NCT00000002", "Phase 3", "not_eligible", 0.42,
+    ("P-CONSISTENT-A", "NCT00000002", "Phase 3", "not_eligible", 0.42,
      None, "normalized", "True", "bool", 2),
-    ("NCT00000003", "Phase 1", "not_evaluable", 0.55,
+    ("P-CONSISTENT-B", "NCT00000003", "Phase 1", "not_evaluable", 0.55,
      "truncation_floor", None, None, None, None),
-    ("NCT00000001", "Phase 2", "eligible", 0.88,
+    ("P-CONSISTENT-B", "NCT00000001", "Phase 2", "eligible", 0.88,
      None, "unrecognized", "'MAYBE'", "str", 0),
+    # THE OMISSION. Without it `call_mode_comparison`'s omission total is 0 on
+    # every arm and every check over it compares 0 with 0 -- the vacuous shape
+    # this project treats as no check at all. It is CONSTRUCTED by the pipeline,
+    # so its verdict_source is NULL, which is what `not_evaluable_reasons`'
+    # family CASE and its `never_had_a_model_label` column already assert about
+    # this class.
+    ("P-CONSISTENT-A", "NCT00000004", "Phase 2", "not_evaluable", 0.31,
+     "omitted_from_model_response", None, None, None, None),
 ]
 
-for _i, (_nct, _phase, _eligible, _score, _ne_reason, _v_source,
+for _i, (_owner, _nct, _phase, _eligible, _score, _ne_reason, _v_source,
          _v_label, _v_type, _remaps) in enumerate(_TRIAL_MATCH_ROWS):
     _cursor.execute(
         "INSERT INTO trial_matches (inference_id, nct_id, trial_title, "
@@ -1057,7 +1088,7 @@ for _i, (_nct, _phase, _eligible, _score, _ne_reason, _v_source,
         "assessment, criterion_details, not_evaluable_reason, verdict_source, "
         "verdict_original_label, verdict_original_type, criterion_remaps) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (_INFERENCE_IDS["P-CONSISTENT-A" if _i < 2 else "P-CONSISTENT-B"],
+        (_INFERENCE_IDS[_owner],
          _nct, f"Trial {_nct}", _phase, _i + 1, 3.5 - _i * 0.1, _score,
          _eligible, "because", '{"inclusion": [], "exclusion": []}',
          _ne_reason, _v_source, _v_label, _v_type, _remaps))
@@ -1106,23 +1137,37 @@ for _i, (_cat, _name, _value, _alert) in enumerate([
 # inference rows seeded above keep their NULL run_id, which is what every row
 # written before the run-identity pass has. `run_summary` must not invent a run
 # for them, and section 2b asserts it does not.
+# THE ARM EACH RUN WAS STAMPED WITH IS PART OF THE SEED, AND RUN-CLEAN'S IS
+# CHOSEN TO PRODUCE ALL THREE AGREEMENT STATES FROM ONE RUN. It is stamped
+# `grouped` and owns three patient rows: one written `grouped` (the stamp
+# matches), one written `per_trial` (the stamp DISAGREES, which is a run whose
+# flag moved mid-process and which nothing in this project could state before)
+# and one with no recorded arm at all. A seed in which the stamp and the rows
+# always agree cannot tell a query that compares them from one that reports the
+# stamp twice.
 _RUN_ROWS = [
-    # label, status, finished_at, invocation_source
-    ("RUN-CLEAN",    "FINISHED", "2026-08-20T11:04:00", "batch_runner"),
-    ("RUN-CRASHED",  "RUNNING",  None,                  "batch_runner"),
-    ("RUN-EMPTY",    "KILLED",   "2026-08-18T10:05:00", "batch_runner"),
-    ("RUN-DEGRADED", "FINISHED", "2026-08-17T11:00:00", "batch_runner"),
+    # label, status, finished_at, invocation_source, stamped arm
+    ("RUN-CLEAN",    "FINISHED", "2026-08-20T11:04:00", "batch_runner",
+     MATCHING_CALL_MODE_GROUPED),
+    ("RUN-CRASHED",  "RUNNING",  None,                  "batch_runner",
+     MATCHING_CALL_MODE_PER_TRIAL),
+    ("RUN-EMPTY",    "KILLED",   "2026-08-18T10:05:00", "batch_runner",
+     MATCHING_CALL_MODE_GROUPED),
+    # NO ARM AT ALL: the shape of every `runs` row written before era 4. It must
+    # read '(not recorded)' and never 'grouped'.
+    ("RUN-DEGRADED", "FINISHED", "2026-08-17T11:00:00", "batch_runner", None),
 ]
 _RUN_IDS = {}
-for _i, (_label, _status, _finished, _source) in enumerate(_RUN_ROWS):
+for _i, (_label, _status, _finished, _source, _arm) in enumerate(_RUN_ROWS):
     _cursor.execute(
         "INSERT INTO runs (started_at, finished_at, status, invocation_source, "
         "fingerprint_version, llm_classifier_prompt_version, "
         "llm_classifier_renderer_digest, matching_model_configured, "
-        "qdrant_collection, collection_points, data_snapshot_date) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "matching_call_mode, qdrant_collection, collection_points, "
+        "data_snapshot_date) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (f"2026-08-{20 - _i}T10:00:00", _finished, _status, _source,
-         2, "1.9.0", f"digest-{_i}", "gpt-5.6-terra",
+         2, "1.9.0", f"digest-{_i}", "gpt-5.6-terra", _arm,
          "trial_criteria_20260807_111807", 12067, "2026-02-26"))
     _RUN_IDS[_label] = _cursor.lastrowid
 
@@ -1183,7 +1228,8 @@ check("the seed wrote every inference row",
       _conn.execute("SELECT COUNT(*) FROM inferences").fetchone()[0],
       len(_SEED_ROWS))
 check("...and the trial_matches rows",
-      _conn.execute("SELECT COUNT(*) FROM trial_matches").fetchone()[0], 4)
+      _conn.execute("SELECT COUNT(*) FROM trial_matches").fetchone()[0],
+      len(_TRIAL_MATCH_ROWS))
 check("...and the drift_metrics rows",
       _conn.execute("SELECT COUNT(*) FROM drift_metrics").fetchone()[0], 3)
 check_true("the models the seed prices are all in PRICING_CONFIG "
@@ -1555,9 +1601,13 @@ check("...and lacks inferences.run_id too, which is the state a database "
 # stop describing this list the moment a column-only query joined it.
 check("a database with no run tables reports every run query as unavailable",
       sorted(queries.unavailable(_legacy_conn)),
-      ["campaign_summary", "dangling_run_references",
+      ["call_mode_comparison", "campaign_summary", "dangling_run_references",
        "run_attribution_coverage", "run_degradation_breakdown", "run_summary",
        "stage5_input_packing_pressure", "stage5_output_split_pressure"])
+check("...including the call-mode comparison, which is the one that would "
+      "otherwise die on `runs` AND on two additive columns -- and killing "
+      "report() on a legacy database is exactly the defect item 38 removed",
+      "call_mode_comparison" in queries.unavailable(_legacy_conn), True)
 # BOTH ABSENT TABLES AND THE ABSENT COLUMN, and the column is named even
 # though `runs` is missing too, because `inferences` IS present and its column
 # genuinely is not there. One action -- let a writer open the database -- fixes
@@ -3114,6 +3164,18 @@ check_true("the queries module says instead that report() completes",
 #   FPCRASH KILLED   fingerprint A                   its own campaign
 #   FPRESUME FINISHED resumed=1, fingerprint B       MUST NOT STITCH
 #   LEGACY  KILLED   resumed NULL, no fingerprint    its own campaign
+#   MODECRASH  KILLED   fingerprint A, arm grouped      its own campaign
+#   MODERESUME FINISHED resumed=1, fingerprint A,      MUST NOT STITCH
+#                       arm per_trial
+#
+# THE LAST PAIR IS THE ONE THE CALL-MODE PASS ADDED, and it is a sharper case
+# than FPCRASH/FPRESUME rather than a copy of it. Those two differ in EVERY
+# fingerprint column, so any half of the predicate would separate them; this
+# pair is IDENTICAL on all seven of the others and differs in the ARM ALONE. A
+# stitch predicate that did not include the new column would merge them into one
+# campaign and SUM a grouped fragment's cost and patients with a per-trial
+# fragment's -- two incommensurable arms presented as one number, which is
+# exactly what a campaign total exists to make impossible.
 #
 # The last one is the shape every `runs` row written before those columns
 # existed has, and it is here because null-safe equality (`IS`) makes two
@@ -3132,15 +3194,27 @@ with quiet():
 _camp_conn = sqlite3.connect(_CAMPAIGN_DB)
 _camp_cur = _camp_conn.cursor()
 
-# (label, status, resumed, fingerprint key, started_at, finished_at)
+# (label, status, resumed, fingerprint key, arm, started_at, finished_at)
+_GROUPED = MATCHING_CALL_MODE_GROUPED
+_PER_TRIAL = MATCHING_CALL_MODE_PER_TRIAL
 _CAMPAIGN_RUNS = [
-    ("CHAIN-1",  "KILLED",   0,    "A", "2026-08-01T10:00:00", "2026-08-01T11:00:00"),
-    ("CHAIN-2",  "KILLED",   1,    "A", "2026-08-01T12:00:00", "2026-08-01T13:00:00"),
-    ("CHAIN-3",  "FINISHED", 1,    "A", "2026-08-01T14:00:00", "2026-08-01T15:00:00"),
-    ("SOLO",     "FINISHED", 0,    "A", "2026-08-02T10:00:00", "2026-08-02T11:00:00"),
-    ("FPCRASH",  "KILLED",   0,    "A", "2026-08-03T10:00:00", "2026-08-03T11:00:00"),
-    ("FPRESUME", "FINISHED", 1,    "B", "2026-08-03T12:00:00", "2026-08-03T13:00:00"),
-    ("LEGACY",   "KILLED",   None, None, "2026-07-01T10:00:00", "2026-07-01T11:00:00"),
+    ("CHAIN-1",  "KILLED",   0,    "A", _GROUPED,   "2026-08-01T10:00:00", "2026-08-01T11:00:00"),
+    ("CHAIN-2",  "KILLED",   1,    "A", _GROUPED,   "2026-08-01T12:00:00", "2026-08-01T13:00:00"),
+    ("CHAIN-3",  "FINISHED", 1,    "A", _GROUPED,   "2026-08-01T14:00:00", "2026-08-01T15:00:00"),
+    ("SOLO",     "FINISHED", 0,    "A", _GROUPED,   "2026-08-02T10:00:00", "2026-08-02T11:00:00"),
+    ("FPCRASH",  "KILLED",   0,    "A", _GROUPED,   "2026-08-03T10:00:00", "2026-08-03T11:00:00"),
+    ("FPRESUME", "FINISHED", 1,    "B", _GROUPED,   "2026-08-03T12:00:00", "2026-08-03T13:00:00"),
+    ("LEGACY",   "KILLED",   None, None, None,      "2026-07-01T10:00:00", "2026-07-01T11:00:00"),
+    # FINGERPRINT KEY "C" AND NOT "A", DELIBERATELY. The pair has to differ from
+    # each other in the ARM ALONE -- which it does, both being "C" -- and it
+    # must not become a candidate PARENT for anything else in this seed. With
+    # "A" it did: MODECRASH is a KILLED grouped run with fingerprint A, so it
+    # became the nearest preceding qualifying run for the open-span probe below
+    # and quietly took that probe's campaign away from FPCRASH. Measured, not
+    # anticipated -- two 8b-i checks failed for a reason that had nothing to do
+    # with what they assert.
+    ("MODECRASH",  "KILLED",   0, "C", _GROUPED,   "2026-08-05T10:00:00", "2026-08-05T11:00:00"),
+    ("MODERESUME", "FINISHED", 1, "C", _PER_TRIAL, "2026-08-05T12:00:00", "2026-08-05T13:00:00"),
 ]
 # Which patients each fragment wrote. THE POINT OF THE WHOLE QUERY is that these
 # sum across a campaign, so the three CHAIN fragments deliberately carry
@@ -3153,9 +3227,15 @@ _CAMPAIGN_PATIENTS = {
     "SOLO":    [("S-a", 0.50)],
     "FPCRASH": [("F1-a", 0.10)],
     "FPRESUME": [("F2-a", 0.10)],
+    # DELIBERATELY DIFFERENT COUNTS AND COSTS. If the arm pair ever stitched,
+    # the merged campaign would report 3 patients and 0.90 -- numbers neither
+    # fragment produced -- so the check below can fail rather than agreeing
+    # with a wrong answer by coincidence.
+    "MODECRASH":  [("M1-a", 0.30), ("M1-b", 0.30)],
+    "MODERESUME": [("M2-a", 0.30)],
 }
 _CAMPAIGN_IDS = {}
-for _label, _status, _resumed, _fp, _started, _finished in _CAMPAIGN_RUNS:
+for _label, _status, _resumed, _fp, _arm, _started, _finished in _CAMPAIGN_RUNS:
     if _fp is None:
         _camp_cur.execute(
             "INSERT INTO runs (started_at, finished_at, status, "
@@ -3166,10 +3246,11 @@ for _label, _status, _resumed, _fp, _started, _finished in _CAMPAIGN_RUNS:
             "INSERT INTO runs (started_at, finished_at, status, "
             "invocation_source, resumed, fingerprint_version, "
             "llm_classifier_prompt_version, llm_classifier_renderer_digest, "
-            "matching_model_configured, qdrant_collection, collection_points, "
-            "data_snapshot_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "matching_model_configured, matching_call_mode, "
+            "qdrant_collection, collection_points, "
+            "data_snapshot_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (_started, _finished, _status, "batch_runner", _resumed, 2,
-             f"1.9.0-{_fp}", f"digest-{_fp}", "gpt-5.6-terra",
+             f"1.9.0-{_fp}", f"digest-{_fp}", "gpt-5.6-terra", _arm,
              f"trial_criteria_{_fp}", 12067, "2026-02-26"))
     _CAMPAIGN_IDS[_label] = _camp_cur.lastrowid
 for _label, _rows in _CAMPAIGN_PATIENTS.items():
@@ -3291,8 +3372,63 @@ check("8b-g: every run appears in exactly one campaign and none is lost -- "
       "the query is driven from `runs`, so the members must partition it",
       sum(_safe_int(r.runs) for r in _campaigns.itertuples()),
       len(_CAMPAIGN_RUNS))
-check("8b-g: ...so there are five campaigns over seven runs",
-      len(_campaigns), 5)
+check("8b-g: ...so there are seven campaigns over nine runs -- the three CHAIN "
+      "fragments are one, and every other run is its own",
+      len(_campaigns), 7)
+
+# --- THE ARM PAIR: IDENTICAL IN EVERY OTHER GATED COLUMN ------------------
+#
+# THE SHARPEST CASE IN THIS SECTION. FPCRASH/FPRESUME differ in every
+# fingerprint column, so any fragment of the predicate separates them. These two
+# differ in the ARM ALONE, so the ONLY thing that can keep them apart is the
+# call-mode column being in the stitch. Without it they merge, and the merged
+# campaign reports 3 patients and 0.90 -- a cost and a cohort neither arm
+# produced, summed across two arms that are not commensurable.
+def _run_col(run_id, column):
+    """One `runs` column of one row, as a scalar. Local because this file has no
+    sql_one helper and a section-local reader is clearer than a fourth
+    frame-shaped one."""
+    row = _camp_conn.execute(
+        f"SELECT {column} FROM runs WHERE id = ?", (run_id,)).fetchone()
+    return None if row is None else row[0]
+
+_MODE_CRASH = _camp_by_id.get(_CAMPAIGN_IDS["MODECRASH"])
+_MODE_RESUME = _camp_by_id.get(_CAMPAIGN_IDS["MODERESUME"])
+check("8b-g-arm: the seed really differs in the arm ALONE (non-degeneracy: if "
+      "any other fingerprint column differed, this pair would prove nothing "
+      "the FPCRASH/FPRESUME pair does not already prove)",
+      [c for c in dblog.RUN_FINGERPRINT_COLUMNS
+       if _run_col(_CAMPAIGN_IDS["MODECRASH"], c)
+       != _run_col(_CAMPAIGN_IDS["MODERESUME"], c)],
+      ["matching_call_mode"])
+check("8b-g-arm: ...and the resumed run really declares itself a resume, so "
+      "the stitch rule's first half is satisfied and only the arm is stopping "
+      "it",
+      _run_col(_CAMPAIGN_IDS["MODERESUME"], "resumed"), 1)
+check("8b-g-arm: a KILLED grouped run and a resumed PER-TRIAL run DO NOT "
+      "STITCH -- two campaigns, not one",
+      (None if _MODE_CRASH is None else _safe_int(_MODE_CRASH.runs),
+       None if _MODE_RESUME is None else _safe_int(_MODE_RESUME.runs)),
+      (1, 1))
+check("8b-g-arm: ...so their patients are NOT summed, which is the harm",
+      (None if _MODE_CRASH is None else _safe_int(_MODE_CRASH.total_patients),
+       None if _MODE_RESUME is None else _safe_int(_MODE_RESUME.total_patients)),
+      (2, 1))
+check("8b-g-arm: ...and neither is their cost",
+      (None if _MODE_CRASH is None else round(float(_MODE_CRASH.total_cost_usd), 2),
+       None if _MODE_RESUME is None else round(float(_MODE_RESUME.total_cost_usd), 2)),
+      (0.60, 0.30))
+check("8b-g-arm: ...and each campaign reports its OWN arm, so a reviewer can "
+      "attribute either total without opening a second query",
+      (None if _MODE_CRASH is None else _MODE_CRASH.matching_call_mode,
+       None if _MODE_RESUME is None else _MODE_RESUME.matching_call_mode),
+      (_GROUPED, _PER_TRIAL))
+check("8b-g-arm: ...(non-degeneracy: the two arms are distinct strings, so the "
+      "line above is not one value compared with itself)",
+      _GROUPED != _PER_TRIAL and len(set(MATCHING_CALL_MODES)) == 2, True)
+check("8b-g-arm: ...while the three CHAIN fragments, which agree on the arm, "
+      "still stitch -- the predicate was tightened, not broken",
+      None if _chain is None else _safe_int(_chain.runs), 3)
 check("8b-g: ...newest campaign first, which is what ORDER BY campaign_id "
       "DESC means and is the same ordering run_summary uses",
       list(_campaigns["campaign_id"]),
@@ -3311,14 +3447,23 @@ check("8b-h: the campaign carries the ROOT fragment's configuration, which "
 # whose final fragment has not finished would otherwise report the PREVIOUS
 # fragment's finish time as the end of the campaign, with nothing saying the
 # span is open. `unfinalized_runs` is what says it.
+# ITS ARM MATCHES FPCRASH'S DELIBERATELY. This probe exists to test the OPEN-SPAN
+# reporting, not the stitch predicate, so every fingerprint column has to agree
+# with the fragment it is meant to join -- and that now includes the arm.
+# MEASURED RATHER THAN ANTICIPATED: the first version of this insert kept the
+# pre-call-mode column list, so the probe carried a NULL arm against FPCRASH's
+# 'grouped', did not stitch, and three checks below failed for a reason that had
+# nothing to do with what they assert. That is the new column being sharp, and
+# it is why an arm is written here rather than left to default.
 _camp_cur.execute(
     "INSERT INTO runs (started_at, finished_at, status, invocation_source, "
     "resumed, fingerprint_version, llm_classifier_prompt_version, "
     "llm_classifier_renderer_digest, matching_model_configured, "
-    "qdrant_collection, collection_points, data_snapshot_date) "
+    "matching_call_mode, qdrant_collection, collection_points, "
+    "data_snapshot_date) "
     "VALUES (?, NULL, 'RUNNING', 'batch_runner', 1, 2, '1.9.0-A', "
-    "'digest-A', 'gpt-5.6-terra', 'trial_criteria_A', 12067, '2026-02-26')",
-    ("2026-08-04T10:00:00",))
+    "'digest-A', 'gpt-5.6-terra', ?, 'trial_criteria_A', 12067, '2026-02-26')",
+    ("2026-08-04T10:00:00", _GROUPED))
 _OPEN_RUN = _camp_cur.lastrowid
 _camp_conn.commit()
 _open_campaigns = queries.run(_camp_conn, "campaign_summary")
@@ -3338,7 +3483,7 @@ check("8b-i: ...with last_finished_at still the newest finish that EXISTS, "
 _camp_cur.execute("DELETE FROM runs WHERE id = ?", (_OPEN_RUN,))
 _camp_conn.commit()
 check("8b-i: ...and the probe row is removed",
-      len(queries.run(_camp_conn, "campaign_summary")), 5)
+      len(queries.run(_camp_conn, "campaign_summary")), 7)
 
 # --- THE STITCH PREDICATE IS GENERATED, NOT RETYPED -----------------------
 check("8b-j: the fingerprint match is built from the writer's own column "
@@ -3368,6 +3513,133 @@ check("8b-k: on the main seed -- four runs, none of them a resume -- every "
       [1] * len(_RUN_ROWS))
 
 _camp_conn.close()
+
+
+# ===========================================================================
+# SECTION 8c -- call_mode_comparison
+# ===========================================================================
+#
+# THE ONE QUERY A THREE-ARM CAMPAIGN ACTUALLY READS. `config.matching_call_mode()`
+# decides whether Stage 5 sends one request carrying several trials or one per
+# trial, which is the single largest lever on what a patient costs -- and until
+# era 4 no registered query named either the per-row column or the per-run one,
+# so no number in this database could be attributed to an arm.
+#
+# IT RUNS AGAINST THE MAIN SEED, which was extended to carry both arms rather
+# than given a scratch database of its own: the arms have to sit beside real
+# costs, real trial_matches children and a real dangling row, and section 8b's
+# reason for a separate database (it adds RUNS, which move forty neighbouring
+# expectations) does not apply to a query that adds none.
+
+print()
+print("=" * 78)
+print("SECTION 8c -- call_mode_comparison")
+print("=" * 78)
+
+_modes = _frame_or_raise("call_mode_comparison")
+_mode_rows = {(str(r.run_id), str(r.row_mode)): r for r in _modes.itertuples()}
+
+check("8c-a: the comparison is non-empty on the seed, which is the registry's "
+      "own contract for every query in it", len(_modes) > 0, True)
+
+# --- BOTH ARMS ARE PRESENT AND THE SEED CAN TELL THEM APART ----------------
+check("8c-b: both arms of the vocabulary appear as their own rows "
+      "(non-degeneracy: a seed carrying one arm cannot show that the GROUP BY "
+      "separates them)",
+      sorted({str(r.row_mode) for r in _modes.itertuples()}
+             & set(MATCHING_CALL_MODES)),
+      sorted(MATCHING_CALL_MODES))
+check("8c-c: ...and a row whose arm was never recorded is its own bucket, "
+      "labelled, rather than being counted as grouped",
+      "(not recorded)" in {str(r.row_mode) for r in _modes.itertuples()}, True)
+
+# --- THE THREE NUMBERS, AGAINST THE SEED RATHER THAN THE FRAME -------------
+#
+# EXPECTATIONS ARE WRITTEN FROM THE SEED, never read back out of the query under
+# test. P-CONSISTENT-B is the only per_trial row in RUN-CLEAN and its stored cost
+# is 0.095.
+_CLEAN = str(_RUN_IDS["RUN-CLEAN"])
+_per_trial_row = _mode_rows.get((_CLEAN, MATCHING_CALL_MODE_PER_TRIAL))
+check("8c-d: the per-trial arm of RUN-CLEAN is exactly the one patient seeded "
+      "into it", None if _per_trial_row is None else _safe_int(_per_trial_row.patients), 1)
+check("8c-e: ...with that patient's stored cost, not the run's total",
+      None if _per_trial_row is None else round(float(_per_trial_row.cost_usd), 3),
+      0.095)
+
+_grouped_row = _mode_rows.get((_CLEAN, MATCHING_CALL_MODE_GROUPED))
+check("8c-f: ...and the grouped arm of the SAME run is a SEPARATE row, so one "
+      "run's two arms are never averaged into one number",
+      None if _grouped_row is None else _safe_int(_grouped_row.patients), 1)
+check("8c-g: ...(non-degeneracy: the two arms of that one run really carry "
+      "different costs, so the split above is visible rather than incidental)",
+      (None if _grouped_row is None else round(float(_grouped_row.cost_usd), 3))
+      != (None if _per_trial_row is None else round(float(_per_trial_row.cost_usd), 3)),
+      True)
+
+# --- THE STAMP-VERSUS-ROWS READING ----------------------------------------
+_agreements = {str(r.mode_agreement) for r in _modes.itertuples()}
+check("8c-h: RUN-CLEAN is stamped `grouped` and holds a `per_trial` row, and "
+      "the query SAYS SO rather than reporting the stamp twice",
+      None if _per_trial_row is None else str(_per_trial_row.mode_agreement),
+      "STAMP DISAGREES WITH ROWS")
+check("8c-i: ...while the row that matches its run's stamp reads so",
+      None if _grouped_row is None else str(_grouped_row.mode_agreement),
+      "stamp matches rows")
+check("8c-j: ...and the dangling row is named as a MISSING RUN ROW rather than "
+      "as a missing column, which is a different fix",
+      "run row is missing" in _agreements, True)
+check("8c-k: ...(non-degeneracy: the agreement column really takes several "
+      "values on this seed, so the three checks above are not all reading one "
+      "constant)", len(_agreements) >= 3, True)
+
+# --- OMISSIONS ------------------------------------------------------------
+#
+# `omitted_trials` COUNTS ROWS FOUND, so its zero is only a measurement where
+# trials_recorded > 0. Both columns are checked together for that reason.
+_omission_reason_rows = _conn.execute(
+    "SELECT COUNT(*) FROM trial_matches WHERE not_evaluable_reason = ?",
+    (queries.CALL_MODE_OMISSION_REASON,)).fetchone()[0]
+check("8c-l-pre: the seed really carries an omission (non-degeneracy: with "
+      "none, every omission check below compares zero with zero)",
+      _omission_reason_rows > 0, True)
+check("8c-l: the omission total over every arm equals the number of "
+      "trial_matches rows carrying that reason -- nothing double-counted by "
+      "the join, nothing lost",
+      sum(_safe_int(r.omitted_trials) for r in _modes.itertuples()),
+      _omission_reason_rows)
+check("8c-m: ...and trials_recorded totals every trial_matches row, so a zero "
+      "omission count on a row with recorded trials is a MEASUREMENT and one "
+      "with none is not",
+      sum(_safe_int(r.trials_recorded) for r in _modes.itertuples()),
+      _conn.execute("SELECT COUNT(*) FROM trial_matches").fetchone()[0])
+check("8c-n: ...(non-degeneracy: the seed really contains trial_matches rows, "
+      "so the two sums above are not both zero)",
+      _conn.execute("SELECT COUNT(*) FROM trial_matches").fetchone()[0] > 0,
+      True)
+
+# --- THE OMISSION REASON IS THE PIPELINE'S OWN ----------------------------
+#
+# queries.py may not import the agent -- that is the edge pass 20c-2c removed --
+# so the string is restated there and this is what stops it drifting. A test may
+# import both because a test is in nobody's import graph.
+from oncotriage.agent.evaluation import NOT_EVALUABLE_MODEL_OMITTED  # noqa: E402
+check("8c-o: the restated omission reason is byte-identical to the constant "
+      "the pipeline writes -- a drift here would make the comparison report "
+      "zero omissions in every arm, forever, and look clean doing it",
+      queries.CALL_MODE_OMISSION_REASON, NOT_EVALUABLE_MODEL_OMITTED)
+
+# --- EVERY INFERENCE ROW IS ACCOUNTED FOR ---------------------------------
+check("8c-o-arm: the omission is attributed to the GROUPED arm, which is the "
+      "only arm that can produce one -- a per-trial request carrying one trial "
+      "either answers it or fails",
+      {str(r.row_mode): _safe_int(r.omitted_trials) for r in _modes.itertuples()
+       if _safe_int(r.omitted_trials) > 0},
+      {MATCHING_CALL_MODE_GROUPED: _omission_reason_rows})
+
+check("8c-p: the arms partition `inferences` -- no row is dropped by the LEFT "
+      "JOINs and none is counted twice",
+      sum(_safe_int(r.patients) for r in _modes.itertuples()),
+      _conn.execute("SELECT COUNT(*) FROM inferences").fetchone()[0])
 
 
 # ===========================================================================

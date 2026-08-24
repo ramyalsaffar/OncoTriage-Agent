@@ -968,6 +968,34 @@ minus FINISHED, and a strict subset of it by construction -- see the guard
 below. A FINISHED run has nothing left to resume, so gluing a later invocation
 onto one would turn a re-run into a continuation."""
 
+CALL_MODE_OMISSION_REASON = "omitted_from_model_response"
+"""`trial_matches.not_evaluable_reason` for a trial the model was SENT and did
+not answer for. The one omission measure the call-mode comparison reads.
+
+WRITTEN OUT RATHER THAN IMPORTED, and the layering is the reason rather than
+taste: the value's owner is
+``oncotriage/agent/evaluation.py:NOT_EVALUABLE_MODEL_OMITTED``, and a storage
+module importing the agent is the edge pass 20c-2c moved
+``_resolve_primary_cancer`` out of ``database_logger`` to remove. It is the same
+trade ``RUN_RECORD_TERMINAL_STATUSES`` makes one module over, with the same
+mitigation: a restated constant is a constant that can drift, so
+``tests/test_storage_query_layer.py`` imports both and requires them equal. A
+test may import both because a test is in nobody's import graph.
+
+WHY IT MATTERS TO THE CALL-MODE COMPARISON SPECIFICALLY. An omission is a trial
+the model was sent inside a batch and did not answer for -- so it is a failure
+mode that PER-TRIAL MODE CANNOT PRODUCE BY CONSTRUCTION: a request carrying one
+trial either answers it or fails. A per-trial arm reading zero here is therefore
+the expected result and not evidence the arm is better, and reading NON-zero
+there is a finding about the reconciliation rather than about the model. Both
+readings need the arm beside the number, which is what this query exists to put
+there.
+
+``not_evaluable_reasons`` next door still writes this string as one of four
+literals in a family CASE. It is deliberately not switched to this constant in
+the same commit: that query's rendered output is pinned, and a text change to a
+pinned query is a change to what a pin means."""
+
 CAMPAIGN_STAMP_COLUMN = "fingerprint_version"
 """The `runs` column whose presence says a configuration stamp was recorded.
 
@@ -1958,7 +1986,19 @@ QUERIES = (
         # table"; a database written between the run-identity pass and the
         # resumed column has one AND lacks the column, which is precisely the
         # distinction `requires` cannot draw and `requires_columns` exists for.
-        requires_columns=(("inferences", "run_id"), ("runs", "resumed")),
+        #
+        # `runs.matching_call_mode` IS THE THIRD, and it is here for `resumed`'s
+        # reason one era later: a database written between the resumed column
+        # and the call-mode one has a `runs` table AND lacks this column. It is
+        # PROJECTED rather than joined on, so its absence would give NULL rather
+        # than raising -- but `derive_requires_columns` reads the SQL and
+        # tests/test_storage_schema_guards.py section 1 compares the derivation
+        # against this declaration, so an additive column named anywhere in the
+        # SQL is declared here whether or not the query would survive without
+        # it. Declaring more than strictly necessary costs a skip on a database
+        # that could half-answer; not declaring it costs the derivation check.
+        requires_columns=(("inferences", "run_id"),
+                          ("runs", "matching_call_mode"), ("runs", "resumed")),
         notes=(
             "patients / errored / cost_usd are 0 for a run no inference row",
             "references -- that is a measured zero, because a LEFT JOIN with no",
@@ -2002,6 +2042,13 @@ QUERIES = (
         r.fingerprint_version,
         r.llm_classifier_prompt_version,
         r.llm_classifier_renderer_digest,
+        -- WHICH STAGE 5 ARM THIS RUN WAS STAMPED WITH. NULL is "not recorded"
+        -- and is NOT 'grouped'; see RUN_COLUMN_ADDITIONS. It sits with the
+        -- other stamp columns because it IS one -- a resume across two arms is
+        -- refused by the same gate a prompt bump is -- and it is projected here
+        -- rather than only in call_mode_comparison because a run row that does
+        -- not say which arm produced it is a row nothing can attribute.
+        r.matching_call_mode,
         r.matching_model_configured,
         r.qdrant_collection,
         r.collection_points,
@@ -2115,7 +2162,13 @@ QUERIES = (
         # than merely NULL. The declaration is checked against
         # derive_requires_columns by tests/test_storage_schema_guards.py
         # section 1, which is why it is written in ADDITIVE_COLUMNS key order.
-        requires_columns=(("inferences", "run_id"), ("runs", "resumed")),
+        # `runs.matching_call_mode` joins them at era 4, and here it really is
+        # a PREDICATE column and not merely a projected one: the stitch
+        # predicate is generated from RUN_FINGERPRINT_COLUMNS, so this column is
+        # named in the `edge` CTE's WHERE clause and its absence makes the SQL
+        # unparseable exactly as `resumed`'s does.
+        requires_columns=(("inferences", "run_id"),
+                          ("runs", "matching_call_mode"), ("runs", "resumed")),
         notes=(
             "One row per CAMPAIGN, not per run. A campaign that never crashed",
             "is a campaign of one, and `stitched` is 0 for it -- which is what",
@@ -2132,7 +2185,7 @@ QUERIES = (
             "span is open at that end. It is NOT defaulted to `now`.",
             "",
             "The fingerprint columns are the ROOT fragment's. Every member",
-            "matched its parent on all seven, transitively, so one campaign has",
+            "matched its parent on ALL of them, transitively, so one campaign has",
             "one configuration by construction -- that is the invariant the",
             "stitch enforces, and reporting it here is what lets a reviewer",
             "attribute the total without opening another query.",
@@ -2233,6 +2286,11 @@ SELECT s.campaign_id,
        head.llm_classifier_prompt_version,
        head.llm_classifier_renderer_digest,
        head.matching_model_configured,
+       -- THE ARM. A campaign is stitched only across fragments that agree on
+       -- it, so this is one value for the whole campaign by construction --
+       -- which is the point: a grouped fragment and a per-trial fragment are
+       -- two campaigns here, and their patients and costs are never summed.
+       head.matching_call_mode,
        head.qdrant_collection,
        head.collection_points,
        head.data_snapshot_date
@@ -2244,6 +2302,153 @@ SELECT s.campaign_id,
               AND pa.at_run = s.last_run_id
   JOIN runs head ON head.id = s.campaign_id
  ORDER BY s.campaign_id DESC
+""",
+    ),
+    # ── THE THREE-ARM COMPARISON: WHAT DID EACH CALL MODE COST ────────────
+    #
+    # `config.matching_call_mode()` decides whether Stage 5 sends ONE request
+    # carrying several trials or one request PER TRIAL. That is the single
+    # largest lever on what a patient costs, and until era 4 nothing could put a
+    # cost beside the arm that produced it: the mode reached
+    # `inferences.matching_call_mode` per row and `runs.matching_call_mode` per
+    # run, and no registered query named either. This is the query a campaign
+    # comparing the arms actually reads.
+    #
+    # IT GROUPS ON BOTH MODES, NOT ONE, AND THAT IS THE DESIGN RATHER THAN
+    # BELT-AND-BRACES. They are two different facts:
+    #
+    #   runs.matching_call_mode        what the run was STAMPED with, once, on
+    #                                  its main thread before its first patient.
+    #                                  This is the value `run_fingerprint` gates
+    #                                  a resume on and `campaign_summary`
+    #                                  stitches on.
+    #   inferences.matching_call_mode  what the writer read off
+    #                                  `config.matching_call_mode()` at the
+    #                                  moment each row was written.
+    #
+    # They agree on every ordinary run and CAN disagree, because the flag is a
+    # module attribute that a process may move -- `bedrock_probe.py` sets it, a
+    # test sets it. Grouping on the row mode alone would average two arms
+    # together under one run; grouping on the run mode alone would report the
+    # stamp and hide what was actually sent. Grouping on the pair makes a
+    # disagreement two rows with `mode_agreement` naming it, and costs nothing
+    # on a run where there is none.
+    #
+    # A ROW WITH NO RUN IS ITS OWN BUCKET AND IS NEVER DROPPED. `run_id IS NULL`
+    # means "not part of a recorded batch run" -- every API request is one, on
+    # purpose -- so a LEFT JOIN and a labelled bucket, on
+    # `run_attribution_coverage`'s ruling. An INNER JOIN here would silently
+    # exclude every API row from a cost comparison.
+    Query(
+        key='call_mode_comparison',
+        heading='=== STAGE 5 CALL MODE: COST, PATIENTS AND OMISSIONS PER ARM ===',
+        render='to_string',
+        blank_after=True,
+        # `runs` ALONE, and not RUN_TABLES: this query never reads
+        # `run_metrics`, so declaring it would skip the arm comparison on a
+        # database that can answer it -- `dangling_run_references`' ruling.
+        requires=("runs",),
+        # ADDITIVE_COLUMNS key order, then column order within a table, which is
+        # what derive_requires_columns produces and what
+        # tests/test_storage_schema_guards.py section 1 compares against.
+        # `inferences.matching_call_mode` is era 3 and `runs.matching_call_mode`
+        # is era 4, so a database can legitimately have one and not the other;
+        # both are declared because the SQL names both.
+        # `trial_matches.not_evaluable_reason` IS THE FOURTH AND IT WAS MISSED
+        # ON THE FIRST DRAFT -- derive_requires_columns reported it, reading did
+        # not. The omission CTE tests it, so on a database predating that column
+        # this query raises `no such column` and report() dies at it, which is
+        # precisely the defect item 38 removed and precisely what this field
+        # exists to prevent.
+        requires_columns=(("inferences", "matching_call_mode"),
+                          ("inferences", "run_id"),
+                          ("trial_matches", "not_evaluable_reason"),
+                          ("runs", "matching_call_mode")),
+        notes=(
+            "One row per (run, observed mode). A run whose flag never moved is",
+            "one row, and mode_agreement reads 'stamp matches rows'.",
+            "",
+            "`patients` COUNTS INFERENCE ROWS, which is run_summary's meaning of",
+            "the same column name: the batch runner's resample pass writes a",
+            "SECOND row for a re-run patient, so a run with a resample reports",
+            "more rows than distinct patients. Comparing arms on it is still",
+            "right -- the cost beside it is per row too.",
+            "",
+            "cost_usd IS A FLOOR WHERE rows_with_no_cost > 0. A NULL",
+            "estimated_cost_usd contributes 0 to the sum and 1 to that counter;",
+            "an arm compared on a floor is compared on a floor.",
+            "",
+            "omitted_trials COUNTS ROWS FOUND, so it is a measurement only",
+            "where trials_recorded > 0. A patient with no trial_matches rows",
+            "contributes 0 to both, and the two columns together say which.",
+            "",
+            "AN OMISSION IS A TRIAL SENT INSIDE A BATCH AND NOT ANSWERED FOR, so",
+            "per-trial mode cannot produce one by construction: a request",
+            "carrying one trial either answers it or fails. Zero in that arm is",
+            "the expected reading and not evidence that the arm is better.",
+            "",
+            "'(not recorded)' IS NOT 'grouped'. It is a row or a run written",
+            "before its column existed. Never fold the two together.",
+            "",
+            "mode_agreement 'STAMP DISAGREES WITH ROWS' is a run whose flag",
+            "moved mid-process. It is a finding, not a rounding error: the two",
+            "arms in that run are not commensurable and its totals are a mix.",
+            "'run row is missing' is a dangling run_id -- see",
+            "dangling_run_references, which names the ids.",
+            "",
+            "NOT CAPPED. There is one row per run per observed mode.",
+        ),
+        sql=f"""
+    WITH omissions AS (
+        SELECT tm.inference_id,
+               COUNT(*)                                     AS trials_recorded,
+               SUM(CASE WHEN tm.not_evaluable_reason
+                             = '{CALL_MODE_OMISSION_REASON}'
+                        THEN 1 ELSE 0 END)                  AS omitted_trials
+          FROM trial_matches tm
+         GROUP BY tm.inference_id
+    )
+    SELECT
+        COALESCE(CAST(i.run_id AS TEXT), '(no run)')        AS run_id,
+        COALESCE(r.invocation_source, '(no run)')           AS invocation_source,
+        COALESCE(r.matching_call_mode, '(not recorded)')    AS run_mode,
+        COALESCE(i.matching_call_mode, '(not recorded)')    AS row_mode,
+        CASE
+            WHEN i.run_id IS NULL                THEN 'no run to compare with'
+            -- THE DANGLING CASE, NAMED RATHER THAN FOLDED INTO THE ONE BELOW.
+            -- `run_id` names a `runs` row that is not in this database, which
+            -- the unenforced foreign key permits and `dangling_run_references`
+            -- reports. Left to fall through, it reads 'one side not recorded'
+            -- and sends a reader looking for a missing COLUMN when what is
+            -- missing is a ROW.
+            WHEN r.id IS NULL                    THEN 'run row is missing'
+            WHEN r.matching_call_mode IS NULL
+              OR i.matching_call_mode IS NULL    THEN 'one side not recorded'
+            WHEN r.matching_call_mode = i.matching_call_mode
+                                                 THEN 'stamp matches rows'
+            ELSE 'STAMP DISAGREES WITH ROWS'
+        END                                                 AS mode_agreement,
+        COUNT(*)                                            AS patients,
+        SUM(CASE WHEN i.error IS NOT NULL AND i.error != ''
+                 THEN 1 ELSE 0 END)                         AS errored,
+        ROUND(SUM(COALESCE(i.estimated_cost_usd, 0)), 4)    AS cost_usd,
+        SUM(CASE WHEN i.estimated_cost_usd IS NULL
+                 THEN 1 ELSE 0 END)                         AS rows_with_no_cost,
+        SUM(COALESCE(o.trials_recorded, 0))                 AS trials_recorded,
+        SUM(COALESCE(o.omitted_trials, 0))                  AS omitted_trials,
+        SUM(CASE WHEN COALESCE(o.omitted_trials, 0) > 0
+                 THEN 1 ELSE 0 END)                         AS patients_with_an_omission
+    FROM inferences i
+    LEFT JOIN runs r ON r.id = i.run_id
+    LEFT JOIN omissions o ON o.inference_id = i.id
+    GROUP BY i.run_id, r.matching_call_mode, i.matching_call_mode
+    -- ORDERED ON THE INTEGER `i.run_id`, NOT ON THE PROJECTED `run_id`. That
+    -- alias is `CAST(... AS TEXT)` so a bare `run_id` here would sort
+    -- lexically, putting run 10 before run 2 -- deterministic and wrong, which
+    -- is the worse of the two ways an ordering can be wrong. `i.run_id IS NULL`
+    -- ahead of it puts the no-run bucket last on both SQLite orderings rather
+    -- than relying on where NULLs happen to fall.
+    ORDER BY row_mode, i.run_id IS NULL, i.run_id
 """,
     ),
     # THE AUDIT SIDE OF AN UNENFORCED FOREIGN KEY.

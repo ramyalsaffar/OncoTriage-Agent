@@ -227,13 +227,20 @@ def resolve_inference_db_path(db_path=None):
 # where they started. It answers one question -- which era is this file -- for
 # a human, a support script, or a future tool that must refuse a database it
 # does not understand.
+# ERA 4: `runs.matching_call_mode`, added with RUN_COLUMN_ADDITIONS and its
+#        migration loop. It is the RUN-level twin of era 3's per-row column and
+#        it is not redundant with it: era 3 records what each patient row was
+#        produced under, and this records what the run was STAMPED with, which
+#        is the value `run_fingerprint` gates a resume on and the value
+#        `campaign_summary` stitches on. A disagreement between the two is a run
+#        whose flag moved mid-process, which nothing could state before.
 # ERA 3: `inferences.matching_call_mode`, added with INFERENCE_COLUMN_ADDITIONS
 #        and its migration loop. It records whether Stage 5 sent one trial per
 #        request or several, which llm_classifier_packing cannot state on its
 #        own once per-trial mode can bypass the packer.
 # ERA 2: `runs.resumed`, added with RUN_COLUMN_ADDITIONS and its migration loop.
 # ERA 1: the constant's own introduction -- the schema as it stood then.
-SCHEMA_USER_VERSION = 3
+SCHEMA_USER_VERSION = 4
 
 
 #------------------------------------------------------------------------------
@@ -964,8 +971,36 @@ INFERENCE_COLUMN_ADDITIONS = {
 # one argument. Two records of one fact that are computed twice are two records
 # that can disagree; oncotriage/batch/runner.py takes the boolean once and hands
 # it to both.
+#
+# `matching_call_mode` -- WHICH STAGE 5 ARM THIS RUN WAS STAMPED WITH. Exactly
+# `config.matching_call_mode()`'s two-member vocabulary, "grouped" or
+# "per_trial", written through RUN_FINGERPRINT_COLUMNS like every other stamp
+# field rather than by a reader of the flag. NULL on every row written before
+# this column existed, which is NOT "grouped": a run that ran in grouped mode is
+# a MEASURED grouped, and collapsing the two would make every historical row
+# assert an arm nobody recorded. `resumed`'s rule next door, and
+# `collection_points`' one column further.
+#
+# IT IS IN THIS DICT *AND* IN RUN_FINGERPRINT_COLUMNS, WHICH IS NOT A
+# DUPLICATION BUT TWO ORTHOGONAL FACTS ABOUT ONE COLUMN. This dict says WHEN the
+# column arrived, which is what migrates an existing database and what
+# oncotriage/storage/queries.py:ADDITIVE_COLUMNS reads so a query naming it can
+# declare `requires_columns` and be SKIPPED rather than killing report() on a
+# database that predates it. RUN_FINGERPRINT_COLUMNS says WHAT the column means,
+# which is what fills it at the INSERT and what generates the campaign stitch
+# predicate. Neither implies the other, and RUN_COLUMNS -- which is derived from
+# both -- is what has to know they can name the same column; see its own note.
+#
+# DELIBERATELY *NOT* ADDED TO THE `runs` CREATE TABLE. Leaving it out means a
+# FRESH database gets it from the same ALTER an existing one does, so both end
+# up with the identical physical column order. Putting it in the CREATE TABLE
+# would give a fresh database the column in the fingerprint block and a migrated
+# one the column at the end -- two real column orders for one declared schema,
+# which is the kind of difference that surfaces only in whichever tool reads a
+# row positionally.
 RUN_COLUMN_ADDITIONS = {
     "resumed": "INTEGER",
+    "matching_call_mode": "TEXT",
 }
 
 
@@ -1323,6 +1358,7 @@ RUN_FINGERPRINT_COLUMNS = (
     "llm_classifier_prompt_version",
     "llm_classifier_renderer_digest",
     "matching_model_configured",
+    "matching_call_mode",
     "qdrant_collection",
     "collection_points",
     "data_snapshot_date",
@@ -1390,9 +1426,36 @@ version") applied at the write. ``bool`` is excluded from the int test because
 plausible-looking lie.
 """
 
-RUN_COLUMNS = ("started_at", "finished_at", "status",
-               "invocation_source") + RUN_FINGERPRINT_COLUMNS \
-              + tuple(RUN_COLUMN_ADDITIONS)
+def _last_wins(*groups) -> tuple:
+    """The concatenation of ``groups`` with duplicates removed, LAST WINS.
+
+    One column can legitimately be named by two of the sources ``RUN_COLUMNS``
+    is built from -- ``matching_call_mode`` is a stamp field AND an additive
+    column, for the two orthogonal reasons argued at ``RUN_COLUMN_ADDITIONS`` --
+    and naming it twice in an INSERT's column list is an
+    ``OperationalError: duplicate column name``, at the write, on every run.
+
+    LAST WINS RATHER THAN FIRST, AND THAT IS WHAT KEEPS THE ORDER TRUE. A column
+    in the additions dict physically lands where ``ALTER TABLE`` appends it, at
+    the end -- so keeping the FIRST occurrence would put it at its stamp
+    position and make this tuple describe a column order no database has.
+    Keeping the last puts every additive column after every base one, which is
+    exactly the physical order of both a fresh database and a migrated one (see
+    ``RUN_COLUMN_ADDITIONS`` for why those two agree).
+
+    Deliberately not ``dict.fromkeys``, which keeps the first.
+    """
+    ordered = []
+    for name in (name for group in groups for name in group):
+        if name in ordered:
+            ordered.remove(name)
+        ordered.append(name)
+    return tuple(ordered)
+
+
+RUN_COLUMNS = _last_wins(("started_at", "finished_at", "status",
+                          "invocation_source"), RUN_FINGERPRINT_COLUMNS,
+                         tuple(RUN_COLUMN_ADDITIONS))
 """Every column ``start_run_record`` writes, in the CREATE TABLE's order.
 
 ONE DECLARATION. The INSERT's column list and its placeholder count are both
@@ -1409,6 +1472,13 @@ dict is written by this INSERT without a second edit here. The order matches the
 migration's: base columns in CREATE TABLE order, then additions in dict order,
 which is the order ALTER TABLE appends them in -- so the tuple describes the
 real column order of a migrated table rather than a plausible one.
+
+THAT ORDER IS WHY THE DE-DUPLICATION KEEPS THE LAST OCCURRENCE. A column named
+by BOTH ``RUN_FINGERPRINT_COLUMNS`` and ``RUN_COLUMN_ADDITIONS`` -- which
+``matching_call_mode`` is -- must appear once, and it must appear where the
+ALTER actually put it. See ``_last_wins`` directly above. Without the
+de-duplication the INSERT names that column twice and raises
+``duplicate column name`` on the first run of every campaign.
 
 A COLUMN IN THAT DICT MUST THEREFORE HAVE A KEY IN start_run_record's `values`,
 and a KeyError at the INSERT is what says it does not. That is the intended

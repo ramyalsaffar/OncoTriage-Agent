@@ -391,7 +391,24 @@ The rule this states: a constant belongs here IF AND ONLY IF nothing at the
 command line can override it. When a flag is added for one of these, the
 constant leaves this tuple in the same commit -- see the note at the ablation
 study's ``start_run``, which is where ``seed`` used to be passed as a caller
-parameter and no longer is."""
+parameter and no longer is.
+
+``MATCHING_PER_TRIAL_CALLS_ENABLED`` IS ALSO DELIBERATELY NOT HERE, AND FOR A
+DIFFERENT REASON THAN THE TWO DEFAULTS ABOVE -- so that nobody "fixes" this
+omission either. Which arm Stage 5 ran in IS logged, as
+``matching_call_mode`` in ``configuration_params`` below, and it is logged
+through ``config.matching_call_mode()``. That function is the ONE owner of the
+flag-to-value mapping: ``oncotriage/agent/evaluation.py`` decides Stage 5's
+partition by calling it, ``oncotriage/storage/database_logger.py`` writes
+``inferences.matching_call_mode`` from it, and
+``oncotriage/run_fingerprint.py`` gates a resume on it. Putting the raw bool in
+this tuple would put a SECOND derivation of that mapping in the tracking store
+-- every reader would have to map True to "per_trial" for itself -- which is
+the two-copies shape pass 20f-2 removed for the cross-encoder checkpoint, and
+the day the owner grows a third arm those readers would go on answering with
+two. This tuple's mechanism could not express it in any case: it is read
+through ``getattr(config, name)`` and logged verbatim, and the owner is a
+FUNCTION, so a member named for it would log a repr of a function object."""
 
 
 CALLER_PARAM_KEYS = frozenset({
@@ -610,6 +627,24 @@ def configuration_params(collection=None):
     """
     out = {name: getattr(config, name) for name in CONFIGURATION_PARAM_NAMES}
     out.update(_prompt_params())
+    # WHICH STAGE 5 ARM THIS RUN USED. Derived rather than enumerated, on
+    # `_prompt_params`' seam and for its reason: the enumeration above logs the
+    # value of a named CONSTANT, and this is the value of the one FUNCTION that
+    # owns the flag-to-arm mapping -- see the note at CONFIGURATION_PARAM_NAMES
+    # for why the raw bool does not belong in that tuple.
+    #
+    # CALLED HERE RATHER THAN BOUND AT IMPORT, which is the same rule
+    # `oncotriage/fixtures/capture.py` applies to MATCHING_PROVIDER: the flag is
+    # a module attribute a process may move, so a bound copy would index the run
+    # under the arm this module was imported with rather than the one it ran in.
+    # `configuration_params` is a function partly so that reads like this one
+    # happen at call time.
+    #
+    # THE KEY IS THE COLUMN'S NAME. `inferences.matching_call_mode`,
+    # `runs.matching_call_mode` and the `matching_call_mode` fingerprint field
+    # all spell it this way; a fourth spelling in the one index built for
+    # cross-run comparison would be the thing that makes the comparison manual.
+    out["matching_call_mode"] = config.matching_call_mode()
     if collection is None:
         collection, _warnings = qdrant_collection()
     out["qdrant_collection_resolved"] = collection

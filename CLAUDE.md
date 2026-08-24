@@ -408,7 +408,7 @@ python tests/test_registries_cancer_code_claims_audit_control.py   #  16; 14 pla
 python tests/test_config_snapshot_date_rot.py                      #  10; 6 subprocess runs, ~6 min
 python tests/test_package_invariants.py                            # 260/0/0 on macOS (was 247 before section 2f(iii)); 245/2/2 on Linux was measured at 247 and has not been re-measured there (was 234/6 there before commit ec2033a gave it a SKIP mechanism). No network, no keys, no corpus. NOT in CI — see below
 python tests/test_degraded_dependencies.py                         # 174 (was 172 in this note, and 170 before pass 20e; the 172 was never true of the file). Item 11a
-python tests/test_storage_query_layer.py                           # 349 (was 317; the campaign pass added section 8b over `campaign_summary`. MEASURED 2026-08-23); item 38, temp SQLite only
+python tests/test_storage_query_layer.py                           # 376 (was 349; the call-mode pass added section 8c over `call_mode_comparison`, the arm pair to section 8b's seed and an omission row to the trial_matches seed. MEASURED 2026-08-23); item 38, temp SQLite only
 
 # The four added by pass 20f-1. Same shape, same directory, no network, no keys,
 # no spend, and none of them writes anything in the repository.
@@ -564,7 +564,7 @@ python tests/test_agent_patient_hash_coverage.py                    #  69
 # matrix, and it execs nothing -- the missing-package control masks
 # sys.modules['mlflow'], which drives the SHIPPED function because the import is
 # deferred into it. ~1.4 s.
-python tests/test_tracking_mlflow_index.py                          #  99
+python tests/test_tracking_mlflow_index.py                          # 104 (was 99; the call-mode pass added the arm parameter and its both-directions drive)
 
 # The token-persistence pass's BEHAVIOURAL half -- the structural half is
 # Test 2 of tests/test_storage_inference_logging_contract.py, and neither
@@ -609,7 +609,7 @@ python tests/test_storage_run_metrics_flush.py                      # 123
 # neither of the suite's two writers. It EXECS NOTHING: every control is a
 # different INPUT to a pure function, a real failing condition created on disk,
 # or an ast walk over an in-memory copy. Bucket A, ~1.5 s.
-python tests/test_storage_run_identity.py                           # 134 (was 121; the `resumed` column added the additions-order check and its non-degeneracy probe)
+python tests/test_storage_run_identity.py                           # 139 (was 134; the call-mode pass added the RUN_COLUMNS de-duplication checks and repaired a stamp builder that ABORTED the file on a newly gated field)
 
 # The schema-guards pass. Same shape, same directory. No network, no keys, no
 # spend, no live Qdrant, no model load, no corpus, no git history, no live
@@ -624,7 +624,7 @@ python tests/test_storage_run_identity.py                           # 134 (was 1
 # control is a different INPUT to a pure function, a real database built into a
 # real failing shape, or a module constant rebound inside try/finally with the
 # restore asserted. Bucket A, ~1.6 s.
-python tests/test_storage_schema_guards.py                          # 101 (was 84; the crash-record pass added section 3b over the `runs` migration)
+python tests/test_storage_schema_guards.py                          # 110 (this line said 101 and was stale by 2 before the call-mode pass, which added the era-record staleness pin and the arm's round trip to section 3b; MEASURED 2026-08-23)
 
 # The crash-record / path-unification pass. Same shape, same directory. No
 # network, no keys, NO SPEND, no live Qdrant, no model load, no corpus, no git
@@ -4524,7 +4524,7 @@ refuse every record already written. The stamp carries its own
 # is a different INPUT to a pure function or an attribute rebind inside
 # try/finally with the restore asserted BY IDENTITY -- so it needs no
 # _EXEC_ALLOWLIST entry. ~2 s.
-python tests/test_resume_configuration_fingerprint.py            # 404 (was 331; the renderer-digest pass added section 1b)
+python tests/test_resume_configuration_fingerprint.py            # 446 (was 404; the call-mode pass added section 1c and drove the arm through all three shipped resume gates)
 ```
 
 **TEST COUNTS.** `tests/test_agent_degraded_run_and_reporting.py` **118 → 118**
@@ -5611,6 +5611,128 @@ took down were fixed, and the ten-tab render is what would report the next one.
 `classify_trial_score` is still called unguarded by nothing — all three call
 sites now test for absence first — but the underlying function still raises on a
 `None`, which is deliberate and is argued at `TRIAL_STATUS_NO_SCORE`.
+
+
+### The Stage 5 call mode is a provenance fact everywhere run identity lives (the call-mode pass)
+
+**`config.matching_call_mode()` DECIDED THE SINGLE LARGEST LEVER ON WHAT A
+PATIENT COSTS AND NO PROVENANCE MECHANISM COULD SEE IT.** Measured before
+anything was written: `FINGERPRINT_FIELDS` gated six facts and none was the
+arm; `runs` stored those six as columns and none was the arm;
+`campaign_summary` stitched on all seven stamp columns and none was the arm;
+`tracking.CONFIGURATION_PARAM_NAMES` had 32 members and none was the arm; and
+**zero of the fifty registered queries named `matching_call_mode`** even though
+`inferences.matching_call_mode` had been an additive column since era 3. Three
+consequences, and the first is the expensive one:
+
+- a **grouped-mode checkpoint resumed under per-trial mode answered FP_MATCH**,
+  skipped every patient the grouped process had completed, ran the rest in the
+  other arm and put both into one `inferences` table with nothing in it saying
+  so. Nothing else in the stamp moves with the flag -- it is a bool no other
+  gated field is a function of, and `matching_model_configured` is the same
+  wire id in both arms because it is the same judge;
+- **campaign stitching would have merged the two arms**, summing a grouped
+  fragment's cost and cohort with a per-trial fragment's;
+- and no number could be attributed to an arm at all, so the three-arm
+  comparison the flag exists for had nothing to read.
+
+**FINGERPRINT_VERSION IS 3 AND THE BUMP'S COST IS THE MECHANISM WORKING.**
+Every v2-stamped artifact answers FP_VERSION once -- the refusal already carries
+the clause saying a shape change is not necessarily a configuration change, and
+the remediation is the consumer's own (`--fresh`, `--fresh-start`, a new
+`--output-dir`).
+
+**REQUIREMENT 1's PROOF OBLIGATION WAS DISCHARGED BY RUNNING, NOT BY READING.**
+No fixture surface carries the fingerprint or the arm: **577,588 leaves across
+all twelve deterministic prefixes and all 15 environment keys of each, and zero
+carry `fingerprint`, `call_mode` or the per-trial flag under any spelling**;
+`oncotriage/fixtures/` contains no reference to `run_fingerprint` at all.
+`python fixture_replay.py` is **12/12 clean, exit 0, with no recapture and zero
+CONFIG MOVED lines**, and the twelve files' sha256 are byte-identical before and
+after.
+
+**WHAT WAS ADDED, AND ONE THING THAT DID NOT NEED TO BE.**
+
+| where | what |
+|---|---|
+| `run_fingerprint.FINGERPRINT_FIELDS` | `matching_call_mode`, resolved by `_call_mode()` -- `_wire_model()`'s shape, degrading to UNKNOWN and counting rather than raising |
+| `database_logger.RUN_FINGERPRINT_COLUMNS` | the same name, so `start_run_record` fills it and the round-trip test stays closed |
+| `database_logger.RUN_COLUMN_ADDITIONS` | `"matching_call_mode": "TEXT"`, which is what MIGRATES an existing database and what `ADDITIVE_COLUMNS` reads so a query naming it can be SKIPPED rather than killing `report()` |
+| `SCHEMA_USER_VERSION` | 3 -> 4, in the same commit, per the constant's own rule |
+| `queries.campaign_summary` | the column in the projection; the stitch predicate needed NO edit because it is generated from `RUN_FINGERPRINT_COLUMNS` |
+| `queries.run_summary` | the column in the projection, so a run row says which arm produced it |
+| `queries.call_mode_comparison` | **new**: cost, patients and omissions per (run, observed arm) |
+| `tracking.configuration_params` | `matching_call_mode`, through the `_prompt_params()` seam |
+| the three resume gates | **nothing** -- see below |
+
+**THE BATCH RUNNER ALREADY HAD THE GATE, AND THE BRIEF SAID IT MIGHT NOT.**
+`batch/runner.py:load_checkpoint` calls `run_fingerprint.compare(data.get
+("fingerprint"), current)` at the point the checkpoint is loaded and refuses on
+anything but FP_MATCH; `ablation/study.py:load_ablation_checkpoint` and
+`evaluation/run_harness.py:environment_gate` do the same. So gating the field is
+what makes all three refuse a mode mismatch, with the existing message naming
+the field AND both modes (`matching_call_mode: 'grouped' -> 'per_trial'`), and
+**no refusal code was added anywhere**. Driven both directions through all three
+shipped gates: mismatch refused with the state intact, match proceeds.
+**Only the evaluation harness has `--allow-environment-change`**, and
+FP_CHANGED is in its `OVERRIDABLE_OUTCOMES`, so the escape hatch covers the arm;
+the batch runner and the ablation study have no such flag and their remediation
+is `--fresh` / `--fresh-start`.
+
+**TWO PREMISES IN THE BRIEF WERE WRONG AND THE CODE'S OWN RULE WAS APPLIED
+INSTEAD.** `SCHEMA_USER_VERSION` was **3**, not 2 -- era 2 was `runs.resumed`
+and era 3 was `inferences.matching_call_mode` -- so the bump is 3 -> 4. And the
+arm could not join `CONFIGURATION_PARAM_NAMES`: that tuple is read through
+`getattr(config, name)` and logged verbatim, and the owner is a FUNCTION, so a
+member named for it would log a repr of a function object. Putting the raw
+`MATCHING_PER_TRIAL_CALLS_ENABLED` there instead would have put a SECOND
+derivation of the flag-to-arm mapping in a durable store -- the two-copies shape
+pass 20f-2 removed for the cross-encoder checkpoint -- so it goes through the
+derived seam `_prompt_params()` already established, and the tuple records why
+it is not a member.
+
+**`RUN_COLUMNS` HAD TO LEARN THAT ONE COLUMN CAN BE NAMED BY TWO SOURCES.**
+`matching_call_mode` is a stamp field AND an additive column, for two orthogonal
+reasons, and the plain concatenation named it twice -- `OperationalError:
+duplicate column name` at the INSERT, on the first run of every campaign.
+`_last_wins` de-duplicates keeping the LAST occurrence, which is not a detail:
+keeping the first would put the column at its stamp position and make the tuple
+describe a column order no database has. Measured rather than argued -- a fresh
+database and one migrated from era 3 now report the **identical** physical
+column order, which is also why the column is deliberately NOT in the `runs`
+CREATE TABLE.
+
+**THE DERIVATION CHECKER FOUND A DEFECT READING DID NOT.** The new query's first
+`requires_columns` declaration omitted `("trial_matches", "not_evaluable_reason")`,
+which its omission CTE tests -- so on a database predating that column it would
+have raised `no such column` and taken `report()` down with it, reinstating item
+38's defect exactly.
+
+**AND THE QUERY-LAYER SEED FOUND TWO MORE.** The 8b campaign probe row kept the
+pre-call-mode column list, so it carried a NULL arm against FPCRASH's `grouped`,
+did not stitch, and three checks failed for a reason unrelated to what they
+assert -- the new column being sharp. And the arm pair was first seeded with
+fingerprint key "A", which made MODECRASH the nearest preceding qualifying run
+for that probe and quietly took its campaign away from FPCRASH.
+
+**ONE PRE-EXISTING TEST DEFECT WAS REPAIRED RATHER THAN WORKED AROUND.**
+`tests/test_storage_run_identity.py` built its stamp from a hand-written VALUES
+dict under a comment claiming "a field added to the stamp appears here
+automatically". It did not: the first field added raised `KeyError` **at module
+level** and took the whole file with it, reporting one traceback where it owed
+134 results. **That is the abort shape this project has now shipped eleven
+times.** The claim is true now, the fallback is REPORTED rather than silent, and
+a field with no literal is named by a check instead of standing in as a
+placeholder.
+
+**WHAT WAS VERIFIED BY RUNNING.** `python fixture_replay.py` **12/12 clean,
+exit 0, no recapture**; CI bucket A **61/61**;
+`tests/test_package_invariants.py` **260/0/0**; every bucket B/C/E file on this
+machine green at its documented count; the production `inferences.db` sha256
+**unchanged** -- `ab1403e3...`, 90,185,728 bytes, before and after. **No money
+was spent and no migration was run against the production database**: the
+`runs.matching_call_mode` column appears there on the next run that opens it,
+which is what the additive mechanism is for.
 
 
 ### A SKIP IS NOT A PASS (commit `ec2033a`)

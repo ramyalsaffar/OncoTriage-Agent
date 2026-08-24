@@ -431,13 +431,40 @@ print("=" * 78)
 print("SECTION 2 -- the parameters")
 print("=" * 78)
 
+# THE DERIVED KEYS ARE ENUMERATED HERE ON PURPOSE, exactly as the constants are
+# NOT. `configuration_params` logs the tuple verbatim plus a small, closed set of
+# values that are not named constants -- the two prompt digests and their probe,
+# the resolved collection, and the Stage 5 ARM. Deriving this set from the
+# function under test would make it agree with whatever that function happens to
+# emit, which is the one thing check 2a exists to refuse: a value that reaches a
+# durable store without anybody declaring it should fail here.
+#
+# `matching_call_mode` IS ONE OF THEM AND IS NOT IN THE TUPLE, deliberately. Its
+# owner, `config.matching_call_mode()`, is a FUNCTION, and the tuple's mechanism
+# is `getattr(config, name)` logged verbatim -- so a member named for it would
+# log a repr of a function object. The raw bool
+# `MATCHING_PER_TRIAL_CALLS_ENABLED` is excluded for a stronger reason, argued at
+# the tuple: it would put a SECOND derivation of the flag-to-arm mapping in the
+# store, and every reader would then have to map True to "per_trial" for itself.
+_DERIVED_PARAM_KEYS = {"prompt_version", "prompt_digest_probe",
+                       "prompt_template_sha256_site_confirmed",
+                       "prompt_template_sha256_site_unconfirmed",
+                       "qdrant_collection_resolved",
+                       "matching_call_mode"}
+
 _EXPECTED_PARAM_KEYS = sorted(
     set(tracking.CONFIGURATION_PARAM_NAMES)
-    | {"prompt_version", "prompt_digest_probe",
-       "prompt_template_sha256_site_confirmed",
-       "prompt_template_sha256_site_unconfirmed",
-       "qdrant_collection_resolved"}
+    | _DERIVED_PARAM_KEYS
     | {"patient_count", "resample_count", "resample_seed"})
+
+check("2a-0 the arm is logged, and NOT through the constant enumeration -- "
+      "which cannot express it, and which would put a second copy of the "
+      "flag-to-arm mapping in the index if it could",
+      ("matching_call_mode" in _DERIVED_PARAM_KEYS,
+       "matching_call_mode" in tracking.CONFIGURATION_PARAM_NAMES,
+       "MATCHING_PER_TRIAL_CALLS_ENABLED"
+       in tracking.CONFIGURATION_PARAM_NAMES),
+      (True, False, False))
 
 check("2a  the logged key set is EXACTLY the enumeration plus the three "
       "caller keys this run passed -- nothing else reached the store",
@@ -459,6 +486,37 @@ check("2e  the resolved collection is the one the resolver returned, not the "
       (_RUN.data.params.get("qdrant_collection_resolved"),
        _RUN.data.params.get("qdrant_collection_resolved") != config.COLLECTION_NAME),
       (_STUB_COLLECTION, True))
+
+# --- THE ARM, WHICH IS THE ONE PARAMETER THAT IS NOT A CONSTANT -----------
+#
+# 2a says the KEY reached the store. These say the VALUE is the owner's, read at
+# CALL time -- which is what makes the index able to answer "which arm produced
+# this number". A bound copy taken at this module's import, or a second copy of
+# the flag-to-arm mapping, fails the both-directions check.
+check("2e-i  the arm logged is the ONE owner's answer, not a re-derivation",
+      _RUN.data.params.get("matching_call_mode"),
+      str(config.matching_call_mode()))
+check("2e-ii ...and it is a member of the closed vocabulary rather than a bool "
+      "or a repr of a function object",
+      _RUN.data.params.get("matching_call_mode") in
+      [str(m) for m in config.MATCHING_CALL_MODES], True)
+
+_saved_arm = config.MATCHING_PER_TRIAL_CALLS_ENABLED
+try:
+    config.MATCHING_PER_TRIAL_CALLS_ENABLED = True
+    _arm_on = drive(tracking.configuration_params, _STUB_COLLECTION)
+    config.MATCHING_PER_TRIAL_CALLS_ENABLED = False
+    _arm_off = drive(tracking.configuration_params, _STUB_COLLECTION)
+finally:
+    config.MATCHING_PER_TRIAL_CALLS_ENABLED = _saved_arm
+check("2e-iii the arm is read at CALL time and follows the flag in BOTH "
+      "directions -- a from-import binding at tracking's own import, or a "
+      "constant, fails here",
+      ((_arm_on or {}).get("matching_call_mode"),
+       (_arm_off or {}).get("matching_call_mode")),
+      (config.MATCHING_CALL_MODE_PER_TRIAL, config.MATCHING_CALL_MODE_GROUPED))
+check("2e-iv ...and the flag was restored",
+      config.MATCHING_PER_TRIAL_CALLS_ENABLED, _saved_arm)
 
 check("2f  the collection was resolved ONCE for the whole start_run, not once "
       "per reader (two live calls can disagree across an alias swap)",
