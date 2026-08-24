@@ -1388,8 +1388,55 @@ looking live forever. That argument is about the END of a run. This table
 records the START of one as well, so it needs the live value that tuple omits.
 """
 
-RUN_RECORD_TERMINAL_STATUSES = ("FINISHED", "FAILED", "KILLED")
-"""How a run ENDED. Value-identical to ``oncotriage/tracking.py:RUN_STATUSES``.
+RUN_RECORD_STATUS_STOPPED = "STOPPED"
+"""A run an operator asked to stop, which stopped cleanly between patients.
+
+NOT ``KILLED`` AND NOT ``FINISHED``, and it is a third value rather than a flag
+on either because it answers a question neither can. ``KILLED`` means the
+process did not get to the end -- an unhandled exception, a Ctrl-C, a SIGTERM --
+so its patients were abandoned mid-flight and the record may be short of what
+was billed. ``FINISHED`` means the campaign covered its cohort. A stopped run is
+neither: every patient it started completed and was written, and patients remain
+that it never began. An operator reading `runs` needs to tell "I asked for this"
+from "something went wrong", because only the second is worth investigating, and
+a reviewer needs to tell "this campaign covers the cohort" from "this campaign
+covers a prefix of it", because only the first supports a rate.
+
+THE SWITCH THAT PRODUCES IT is ``oncotriage/batch/runner.py:STOP_SWITCH`` -- a
+sentinel file in the checkpoint directory, polled between patients at the
+checkpoint's own cadence. See ``stop_switch_path()`` there.
+
+MLflow HAS NO SUCH STATUS, which is why this tuple stops being value-identical
+to ``tracking.RUN_STATUSES`` -- see ``RUN_RECORD_STATUSES_BEYOND_TRACKING``.
+"""
+
+RUN_RECORD_STATUSES_BEYOND_TRACKING = (RUN_RECORD_STATUS_STOPPED,)
+"""The terminal statuses this table has and ``oncotriage/tracking.py`` does not.
+
+A NAMED DIVERGENCE RATHER THAN AN UNDECLARED ONE. Before the stop switch these
+two vocabularies were value-identical and a test asserted exactly that, which is
+the right check for two restated copies of one fact. They are no longer one
+fact: MLflow's terminal vocabulary is FINISHED / FAILED / KILLED and this
+project does not get to widen it (``oncotriage/tracking.py:RUN_STATUSES`` says
+so, and ``oncotriage/batch/runner.py``'s crash handler already records the same
+kind of divergence for KILLED). So the relation is now
+
+    RUN_RECORD_TERMINAL_STATUSES == tracking.RUN_STATUSES
+                                    + RUN_RECORD_STATUSES_BEYOND_TRACKING
+
+and ``tests/test_storage_run_identity.py`` asserts THAT, in order. The
+difference matters: an equality check would have to be deleted to add a status,
+and a deleted check protects nothing, whereas this one still fails when a
+status is added to one side and named in neither.
+
+WHAT A CALLER DOES WITH IT: ``oncotriage/batch/runner.py`` maps STOPPED to
+MLflow's KILLED at ``tracking.end_run`` -- "run killed by user", which is
+literally what a stop switch is -- and records the mapping at the call site.
+"""
+
+RUN_RECORD_TERMINAL_STATUSES = (("FINISHED", "FAILED", "KILLED")
+                                + RUN_RECORD_STATUSES_BEYOND_TRACKING)
+"""How a run ENDED.
 
 RESTATED RATHER THAN IMPORTED, and the reason is layering, not taste:
 ``oncotriage.tracking`` imports ``oncotriage.agent.prompts``, so a
@@ -1399,8 +1446,13 @@ layer depend on the AGENT layer -- the edge pass 20c-2c moved
 
 A RESTATED CONSTANT IS A CONSTANT THAT CAN DRIFT, so the alignment is checked
 rather than promised: ``tests/test_storage_run_identity.py`` imports both and
-requires this tuple to equal ``tracking.RUN_STATUSES`` exactly. A test may
-import both because a test is not in the import graph either module ships.
+requires this tuple to equal ``tracking.RUN_STATUSES`` plus
+``RUN_RECORD_STATUSES_BEYOND_TRACKING``, in that order. A test may import both
+because a test is not in the import graph either module ships.
+
+THE FIRST THREE ARE WRITTEN OUT RATHER THAN DERIVED, deliberately: they are the
+restated copy, and deriving them from anything in this module would make the
+round-trip check agree with itself by construction.
 """
 
 RUN_RECORD_STATUSES = (RUN_RECORD_STATUS_RUNNING,) + RUN_RECORD_TERMINAL_STATUSES

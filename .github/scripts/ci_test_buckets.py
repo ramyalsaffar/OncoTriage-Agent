@@ -897,7 +897,7 @@ BUCKETS = {
         "and the two package files it reads are sha256-compared at the end"),
     "test_runner_sigterm_shutdown.py": (
         _A, None,
-        "ran green in 15.0s, 55 checks, against ONLY the directory skeleton: "
+        "ran green in 14.6s, 75 checks, against ONLY the directory skeleton: "
         "what `docker stop` does to a batch run, driven with a REAL SIGTERM "
         "against a REAL subprocess that IS `python \"25- Batch Runner.py\"`, so "
         "the __main__ guard installing the handler is the shipped one; the four "
@@ -916,6 +916,38 @@ BUCKETS = {
         "gone, and the two repository files it reads (batch/runner.py, "
         "25- Batch Runner.py) are written by neither of the suite's two writers "
         "and are sha256-compared at the end"),
+    "test_runner_stop_switch.py": (
+        _A, None,
+        # DERIVED BY RUNNING against a skeleton provisioned by
+        # provision_ci_paths.py, not from its imports.
+        "ran green in ~14s, 122 checks: the operator STOP sentinel and the "
+        "Ctrl-C leak it was built beside. The MECHANISM driven directly (one "
+        "owner for the path, a latching thread-safe poll, an empty file valid, "
+        "a note read and capped, an unreadable note counted WITHOUT losing the "
+        "stop, a poll that RAISES counted WITHOUT inventing one), then the "
+        "INTERACTION MATRIX driven END TO END against the REAL entry point in "
+        "REAL subprocesses -- STOP mid-batch, resume after it, STOP "
+        "mid-resample, Ctrl-C mid-batch, a stale sentinel at start, and "
+        "--clear-stop -- plus campaign stitching over the new STOPPED status "
+        "at the SQL level. No network, no keys, NO SPEND, no live Qdrant, no "
+        "model load (ONCOTRIAGE_DEFER_LOCAL_MODELS is set above the imports "
+        "and in every subprocess environment), no corpus -- every FHIR file is "
+        "a two-key literal in a temp directory -- no git history, no live "
+        "server. process_patient, the BM25 index, the graph, the tracking "
+        "module and run_fingerprint.current are stand-ins and THE GRAPH IS "
+        "NEVER INVOKED, so no billed call is reachable; main(), run_batch, "
+        "run_resample, _on_done, save_checkpoint, load_checkpoint, "
+        "flush_health, start_run_record, finalize_run_record, reconcile_writes "
+        "and both crash handlers are the real thing. IT USES A SUBPROCESS AND "
+        "A REAL SIGNAL for the Ctrl-C scenario, for the sigterm file's reason: "
+        "a signal cannot be delivered to the process asserting about it. NOT "
+        "in the collision matrix: every database, checkpoint, sentinel, FHIR "
+        "file and package copy is inside a tempfile.mkdtemp it removes and "
+        "asserts gone, and the two repository files it reads (batch/runner.py, "
+        "25- Batch Runner.py) are written by neither of the suite's two "
+        "writers and are sha256-compared at the end. IT EXECS NOTHING: the one "
+        "control is a COPY of the package in that temp directory, imported by "
+        "a subprocess whose PYTHONPATH points at it"),
     "test_runner_crash_record_and_db_unification.py": (
         _A, None,
         # DERIVED BY RUNNING against a skeleton provisioned by

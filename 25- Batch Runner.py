@@ -34,11 +34,37 @@ stop`, systemd and a bare `kill` used to run NOTHING here: no crash record, no
 health flush, no finalized run row, and every in-flight billed request abandoned
 unrecorded. It is now a SystemExit that main()'s own crash handler is already
 written for -- crash blocks, a KILLED run row, exit 143 -- and queued patients
-are cancelled rather than drained. SIGINT is untouched.
+are cancelled rather than drained.
+
+THREE WAYS TO STOP A RUN, AND THEY ARE DIFFERENT REQUESTS
+---------------------------------------------------------
+    touch <checkpoint dir>/STOP   the OPERATOR STOP SWITCH. Finishes the
+                                  patients already in flight, cancels the queue,
+                                  skips the resample pass, records the run
+                                  STOPPED and exits 0. Needs no terminal, no pid
+                                  and no signal, so it works under nohup,
+                                  systemd, a container or cron. The run's own
+                                  setup banner prints the absolute path.
+                                  Resume with --clear-stop.
+    Ctrl-C                        an interrupt. Same teardown, but the run is
+                                  recorded KILLED and the exit code is 130.
+                                  Needs a terminal.
+    SIGTERM                       an orchestrator saying "you have N seconds".
+                                  Recorded KILLED, exit 143, no traceback.
+
+Ctrl-C USED TO BE ABSORBED, and that is fixed in oncotriage/batch/runner.py
+rather than here: both pool handlers swallowed the KeyboardInterrupt and
+RETURNED NORMALLY, so an interrupted batch pass printed "Checkpoint saved. Safe
+to resume." and then ran the whole RESAMPLE pass at one live billed call per
+patient before finalizing the run FINISHED. They re-raise now. This file's job
+is only to turn the resulting KeyboardInterrupt into exit 130 without a
+traceback -- the SIGINT half of what the SIGTERM handler already does.
 
 Run from terminal:
     cd ".../03- Code"
     python "25- Batch Runner.py"
+    python "25- Batch Runner.py" --clear-stop      # resume after a STOP
+    python "25- Batch Runner.py" --fresh           # discard resume state (COSTS)
 """
 
 import os
@@ -70,8 +96,11 @@ except ImportError:
 
 from oncotriage.batch.runner import (
     clear_checkpoint,
+    clear_stop_switch,
+    describe_stop_switch_path,
     main,
     reconciliation_exit_code,
+    stop_switch_path,
 )
 
 
@@ -94,6 +123,20 @@ from oncotriage.batch.runner import (
 #        sys.exit(reconciliation_exit_code()) is never reached -- a shutdown the
 #        operator asked for is not a statement about database completeness. 128
 #        + SIGTERM, the shell convention. See the block above the guard.
+#
+#   130  Ctrl-C. 128 + SIGINT, same convention and the same reasoning, caught at
+#        the bottom of this guard so an operator-requested stop is not reported
+#        as a crash with a traceback. NEW: before the pool handlers re-raised,
+#        a Ctrl-C could not produce any exit code of its own at all.
+#
+# A RUN STOPPED BY THE `STOP` SENTINEL EXITS 0 AND HAS NO CODE OF ITS OWN, which
+# is deliberate. A stop is a clean end, so it falls through to the
+# reconciliation verdict -- which is 0 when every row this run produced is in
+# the database, and that is the whole meaning of "exits 0" here. The one case
+# where a stopped run does NOT exit 0 is a run that genuinely LOST rows, and
+# that must not be silenced by a shutdown the operator asked for: those two
+# findings are independent and the exit code reports the one this file's table
+# is about.
 #
 # There is no caller reading this file's exit code today -- the filename appears
 # only in prose -- which is what makes the change cheap now and expensive later.
@@ -143,16 +186,38 @@ from oncotriage.batch.runner import (
 # refuses to run anywhere but the main thread of the main interpreter, which is
 # another reason it belongs to an entry point rather than to a callable.
 #
-# WHY SystemExit AND NOT KeyboardInterrupt -- MEASURED, AND IT OVERTURNS THE
-# OBVIOUS CHOICE. `run_batch` and `run_resample` each carry their own
-# `except KeyboardInterrupt` that SWALLOWS the interrupt: they shut the pool
-# down, print "[INTERRUPTED] Checkpoint saved. Safe to resume." and then RETURN
-# NORMALLY. So converting SIGTERM to KeyboardInterrupt would have been absorbed
-# by the batch pass, the run would have carried on into the RESAMPLE pass at one
-# billed call per patient, and it would have finalized FINISHED -- an
-# interrupted campaign recorded as a completed one, which is the class of defect
-# this project exists to remove. Not a hypothetical: it is what those two
-# handlers do today, by construction.
+# WHY SystemExit AND NOT KeyboardInterrupt. THE ORIGINAL ARGUMENT HAS EXPIRED
+# AND IS KEPT AS THE RECORD OF WHY THIS IS A SystemExit; THE REASON IT STAYS ONE
+# IS BELOW IT.
+#
+# WHAT IT SAID, and it was measured and true at the time: `run_batch` and
+# `run_resample` each carried an `except KeyboardInterrupt` that SWALLOWED the
+# interrupt -- they shut the pool down, printed "[INTERRUPTED] Checkpoint saved.
+# Safe to resume." and RETURNED NORMALLY. So converting SIGTERM to
+# KeyboardInterrupt would have been absorbed by the batch pass, the run would
+# have carried on into the RESAMPLE pass at one billed call per patient, and it
+# would have finalized FINISHED.
+#
+# THAT DEFECT IS FIXED IN THE POOL HANDLERS THEMSELVES (the stop-switch pass):
+# both re-raise now, so a KeyboardInterrupt DOES reach main()'s crash handler.
+# The premise above is therefore no longer true of this tree, and this comment
+# says so rather than standing as a stale justification -- which is exactly the
+# shape a reader would otherwise trust.
+#
+# IT STAYS A SystemExit FOR THREE REASONS THAT ARE STILL TRUE, none of which is
+# the old one:
+#
+#   1. THE EXIT CODE. SystemExit carries its own, so SIGTERM exits 143 and
+#      Ctrl-C exits 130 -- the shell convention for each, and two different
+#      requests that a supervisor can tell apart. A SIGTERM converted to
+#      KeyboardInterrupt would exit 130 and claim to be a Ctrl-C.
+#   2. THE RE-ENTRANCY RESET. This handler restores SIG_DFL on entry so a
+#      second SIGTERM terminates immediately rather than raising through the
+#      half-written crash record. A KeyboardInterrupt path has no handler to
+#      reset, deliberately (see SIGINT below).
+#   3. NO TRACEBACK, WITHOUT A CATCH. SystemExit exits silently on its own;
+#      making Ctrl-C do the same needed the explicit `except KeyboardInterrupt`
+#      at the bottom of this guard.
 #
 # SystemExit is a BaseException that is NOT an Exception and NOT a
 # KeyboardInterrupt, so:
@@ -178,12 +243,35 @@ from oncotriage.batch.runner import (
 # exception-based interruption drained the entire remaining corpus at one live
 # billed call each before the process could exit.
 #
-# SIGINT IS NOT TOUCHED. Not "left equivalent" -- not touched: no handler is
-# installed for it, so Ctrl-C keeps CPython's default KeyboardInterrupt and the
-# two pool handlers keep absorbing it exactly as before. The two signals now
-# have DIFFERENT dispositions on purpose, because they are different requests: a
-# human at a terminal saying "stop, I will resume" versus an orchestrator saying
-# "you have N seconds before SIGKILL".
+# NO DISPOSITION IS INSTALLED FOR SIGINT, AND THAT IS STILL TRUE AND STILL
+# DELIBERATE -- but "the pool handlers keep absorbing it", which this note used
+# to say, IS NOT. They re-raise (the stop-switch pass), so Ctrl-C now stops the
+# run and is recorded KILLED, exactly as SIGTERM is.
+#
+# WHAT REMAINS UNTOUCHED IS THE DISPOSITION: `signal.signal` is never called for
+# SIGINT, so Ctrl-C keeps CPython's default and the KeyboardInterrupt lands
+# wherever the main thread is, rather than inside a handler that might be
+# holding a lock. The `try/except KeyboardInterrupt` at the bottom of this guard
+# runs AFTER main()'s crash handler has already written the record, so it
+# changes only what is printed and what is exited with. That distinction is
+# pinned by tests/test_runner_sigterm_shutdown.py check 1d, which asserts BOTH
+# that no signal.signal call targets SIGINT AND that exactly one
+# `except KeyboardInterrupt` exists in this guard.
+#
+# THE THREE REQUESTS STILL DIFFER, and the surviving differences are the exit
+# code and the disposition: a human at a terminal saying "stop, I will resume"
+# (130), an orchestrator saying "you have N seconds before SIGKILL" (143), and
+# an operator writing a file to say "stop cleanly and record it as STOPPED" (0)
+# -- which needs no signal at all and is the only one of the three that is not
+# a crash.
+#
+# WHAT A SECOND Ctrl-C DOES, stated because it is a real residual: SIGTERM's
+# handler resets its own disposition so the second signal terminates outright,
+# and SIGINT has no handler to do that. A second Ctrl-C arriving DURING main()'s
+# crash handler therefore raises through it and can leave the record
+# half-written -- the same outcome SIGTERM's note describes for its own second
+# signal, arrived at by a different route. Closing it would mean installing a
+# SIGINT disposition, which is the one thing this block is about not doing.
 #
 # WHAT IT CANNOT DO. SIGKILL is uncatchable, so a `docker stop` whose grace
 # period expires still leaves the NULL-finished_at shape -- correctly, and that
@@ -259,7 +347,37 @@ if __name__ == "__main__":
              "load_checkpoint() names when it refuses a checkpoint written by "
              "a different configuration -- and it re-bills the whole cohort, "
              "which is why it is a flag rather than a fallback.")
+    # --clear-stop IS THE RESUME GESTURE AFTER A STOP, AND IT IS A SEPARATE FLAG
+    # FROM --fresh ON PURPOSE. They are opposites: --fresh DISCARDS the resume
+    # state and re-bills the cohort, this discards a CONTROL FILE and costs
+    # nothing. An operator resuming a stopped campaign wants exactly this and
+    # must not be one keystroke from the other, which is also why the two have
+    # no combined form and why this one prints nothing alarming.
+    #
+    # It is a flag rather than the run deleting the sentinel itself: see
+    # assert_no_stale_stop_switch for why a self-clearing switch would let a
+    # restart loop honour a stop nobody asked for and report success each time.
+    _parser.add_argument(
+        "--clear-stop", action="store_true",
+        # THE PATH IS NOT INTERPOLATED HERE. stop_switch_path() reads
+        # paths.checkpoint_path, which resolves the sibling data tree by glob on
+        # first read and RAISES on a machine that does not have it -- so a
+        # resolved path in this string would make `--help` fail on exactly the
+        # checkout where somebody is reading it to find out what the flag does.
+        # The run banner prints the resolved path, where resolving it is already
+        # unavoidable.
+        help="Delete the operator stop sentinel (STOP, in the checkpoint "
+             "directory -- the run banner prints its absolute path) before "
+             "running. This is how a run that was STOPPED is resumed: the "
+             "sentinel is left in place by the run that honoured it, and a run "
+             "refuses to start while it is there. It discards no results and "
+             "re-bills nothing.")
     _args = _parser.parse_args()
+
+    if _args.clear_stop:
+        if not clear_stop_switch():
+            print(f"[--clear-stop] No stop sentinel at {stop_switch_path()}; "
+                  f"nothing to clear.")
 
     if _args.fresh:
         # Announced before it happens, not after: this is a destructive,
@@ -270,7 +388,40 @@ if __name__ == "__main__":
               "run again, at one live Stage 5 call each.")
         clear_checkpoint()
 
-    main()
+    # Ctrl-C EXITS 130 WITH NO TRACEBACK, AND THAT IS THIS GUARD'S JOB RATHER
+    # THAN main()'s -- --fresh's precedent and the SIGTERM handler's, for the
+    # same reason: a disposition belongs to an entry point, not to a callable an
+    # embedder may have its own shutdown contract for.
+    #
+    # WHY IT IS NEEDED AT ALL, AND IT IS NEW. Both pool handlers used to SWALLOW
+    # the KeyboardInterrupt -- see the note at run_batch's -- so a Ctrl-C
+    # returned normally, ran the resample pass at one billed call per patient
+    # and exited through sys.exit(reconciliation_exit_code()) below with the run
+    # recorded FINISHED. They re-raise now, so the interrupt travels through
+    # main()'s `except BaseException` (health flushed, both crash blocks
+    # printed, `runs` row KILLED, tracking run FAILED) and then out of main().
+    # Left uncaught it would reach CPython's default handler, which prints a
+    # traceback -- a report of a fault, for a shutdown the operator asked for.
+    # The SIGTERM handler already refuses to do that for the same reason and
+    # this is the SIGINT half of it.
+    #
+    # 128 + SIGINT = 130, the shell convention, and NOT the reconciliation
+    # verdict (0/1/2), which is a statement about database completeness and has
+    # nothing to say about an interrupt. Same argument as SIGTERM's 143.
+    #
+    # THE RECORD IS ALREADY WRITTEN BY THE TIME THIS RUNS. main()'s crash
+    # handler completed before the exception reached here, so nothing is lost by
+    # not re-raising: the row, the health flush and both console blocks are on
+    # disk and on the terminal.
+    _EXIT_SIGINT = 128 + int(signal.SIGINT)
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n[INTERRUPTED] Stopped by Ctrl-C. The run was recorded "
+              f"KILLED and the checkpoint is intact -- run again to resume. "
+              f"For a stop that records itself as STOPPED and needs no "
+              f"terminal, use: touch {describe_stop_switch_path()}")
+        sys.exit(_EXIT_SIGINT)
     sys.exit(reconciliation_exit_code())
 
 

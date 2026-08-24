@@ -334,6 +334,9 @@ uvicorn oncotriage.api.server:app --port 8000        # the same app, package rou
 python mcp_server.py                                 # MCP server on stdio (a client starts it; by hand it looks like a hang)
 streamlit run "21- Streamlit Dashboard.py"           # dashboard on :8501
 python "25- Batch Runner.py"                         # full-corpus run, no HTTP, checkpointed
+python "25- Batch Runner.py" --clear-stop            # delete the STOP sentinel, then run (resume after a stop)
+python "25- Batch Runner.py" --fresh                 # discard the checkpoint; RE-BILLS THE WHOLE COHORT
+touch "<checkpoint dir>/STOP"                        # STOP A RUNNING BATCH CLEANLY; the run banner prints the path
 python "15- Database Wipe All Tables.py"             # no-op unless Flag = True near its top
 python "16- Database Query.py"                       # ~40 read-only queries; runs to the end since item 38
 
@@ -386,6 +389,62 @@ docker compose logs -f fastapi
 # The MeSH lookups need no manual copy. See "DOCKER CLEAN BRING-UP.md" §5.
 ONCOTRIAGE_QDRANT_URL=http://localhost:6333 python "11- RAG Trial Indexer.py" --mode direct
 ```
+
+**STOPPING A RUNNING BATCH: THE `STOP` SENTINEL.** A file named **STOP** in the
+checkpoint directory (`08- Checkpoint/`, beside `batch_runner_checkpoint.json`;
+`oncotriage/batch/runner.py:stop_switch_path()` is the one owner, and the
+runner's own setup banner prints the absolute path on every run). It may be
+empty -- `touch` is the documented gesture -- or carry a note, which is logged
+and printed in the run's closing block. It is polled between patients, at the
+checkpoint's own cadence, in BOTH passes:
+
+* no further patient is STARTED; every queued one is cancelled before it can
+  issue a billed call;
+* patients already in flight run to completion and their rows are written;
+* the checkpoint is current, so a resume skips exactly what was done;
+* the RESAMPLE pass does not run at all;
+* the `runs` row is finalized **STOPPED** -- a fourth terminal status, neither
+  KILLED (the process died) nor FINISHED (the cohort was covered);
+* the summary and both console report blocks print, and the process exits 0.
+
+**THE SENTINEL IS NOT DELETED BY THE RUN THAT HONOURED IT, and the next run
+REFUSES to start while it is there.** A self-clearing switch would let a cron
+entry or a restart loop honour a stop nobody asked for that day and report
+success every time. Deleting it is the resume gesture; `--clear-stop` does it in
+the same command.
+
+**THREE WAYS TO STOP A RUN, AND THEY ARE DIFFERENT REQUESTS.**
+
+| gesture | needs | run row | exit | resample pass |
+|---|---|---|---|---|
+| `touch <checkpoint dir>/STOP` | a shared filesystem | **STOPPED** | 0 | never entered |
+| Ctrl-C | a terminal | KILLED | 130 | never entered |
+| SIGTERM (`docker stop`, systemd) | a pid | KILLED | 143 | never entered |
+
+**Ctrl-C USED TO BE ABSORBED AND THE RUN CARRIED ON SPENDING.** Both pool
+handlers caught the `KeyboardInterrupt`, printed "Checkpoint saved. Safe to
+resume." and **returned normally** -- so `main()` went straight into the
+RESAMPLE pass at one live billed Stage 5 call per patient (`RESAMPLE_COUNT` is
+100) and then finalized the run **FINISHED**, making an interrupted campaign
+indistinguishable from one that covered its cohort. Both handlers re-raise now.
+Measured, both arms, in `tests/test_runner_stop_switch.py` section 7: on that
+harness's 40-patient corpus the pre-fix form makes **12** further billed calls
+after the interrupt and records FINISHED, and the shipped form makes **0** and
+records KILLED. In production the pre-fix number is
+`min(RESAMPLE_COUNT, patients completed)`, so up to 100.
+
+**`STOPPED` IS A TERMINAL STATUS THIS TABLE HAS AND MLflow DOES NOT.**
+`RUN_RECORD_TERMINAL_STATUSES` is no longer value-identical to
+`tracking.RUN_STATUSES`; the divergence is DECLARED as
+`RUN_RECORD_STATUSES_BEYOND_TRACKING` and
+`tests/test_storage_run_identity.py` asserts the exact composition in order, so
+a status added to one side and named in neither still fails. `tracking.end_run`
+receives MLflow's **KILLED** for a stop -- its own "run killed by user", the
+closest true statement that three-member vocabulary can carry; passing
+"STOPPED" would be silently replaced by FAILED. `campaign_summary` treats a
+STOPPED-then-resumed chain exactly like a KILLED-then-resumed one, because
+`CAMPAIGN_RESUMABLE_STATUSES` gained the member and the SQL predicate is
+generated from it.
 
 ```bash
 # The eleven component tests (pass 20d-1). No quoting: the names have no spaces.
@@ -609,7 +668,7 @@ python tests/test_storage_run_metrics_flush.py                      # 123
 # neither of the suite's two writers. It EXECS NOTHING: every control is a
 # different INPUT to a pure function, a real failing condition created on disk,
 # or an ast walk over an in-memory copy. Bucket A, ~1.5 s.
-python tests/test_storage_run_identity.py                           # 139 (was 134; the call-mode pass added the RUN_COLUMNS de-duplication checks and repaired a stamp builder that ABORTED the file on a newly gated field)
+python tests/test_storage_run_identity.py                           # 142 (was 139; the stop-switch pass replaced the terminal-status EQUALITY check with the composition tracking.RUN_STATUSES + RUN_RECORD_STATUSES_BEYOND_TRACKING, which still fails on a status added to one side and named in neither)
 
 # The schema-guards pass. Same shape, same directory. No network, no keys, no
 # spend, no live Qdrant, no model load, no corpus, no git history, no live
@@ -659,7 +718,19 @@ python tests/test_runner_crash_record_and_db_unification.py         #  65
 # than about scheduling -- the first version slept instead and was measured
 # FLAKY under bucket-A load. NOT in the collision matrix. It EXECS NOTHING: the
 # one control is a copy of the package in a temp directory. Bucket A, ~6 s.
-python tests/test_runner_sigterm_shutdown.py                        #  55
+python tests/test_runner_sigterm_shutdown.py                        #  75 (was 55; the stop-switch pass rewrote section 3 for the new Ctrl-C contract and added the re-raise control)
+
+# The stop-switch pass. Same shape, same directory. No network, no keys, NO
+# SPEND, no live Qdrant, no model load, no corpus, no git history, no live
+# server -- process_patient, the BM25 index, the graph, the tracking module and
+# run_fingerprint.current are stand-ins and THE GRAPH IS NEVER INVOKED. It uses
+# a subprocess and a real SIGINT for one scenario, for the sigterm file's
+# reason. run_fingerprint.current is the stand-in that file does NOT have, and
+# it is forced: this file's patients SUCCEED (they must, or the resample pass is
+# unreachable and the money case cannot be measured), and a successful patient
+# makes the real save_checkpoint resolve the stamp over the wire. NOT in the
+# collision matrix. It EXECS NOTHING. Bucket A, ~14 s.
+python tests/test_runner_stop_switch.py                             # 122
 
 # The CI-hygiene pair. Same shape, same directory. Neither imports anything
 # from the package -- their subjects are `.github/scripts/` and

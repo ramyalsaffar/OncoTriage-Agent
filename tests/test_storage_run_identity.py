@@ -570,8 +570,46 @@ check("`matching_call_mode` is gated, and its stamp value is a real member of "
        _STAMP["matching_call_mode"] in config.MATCHING_CALL_MODES),
       (True, True))
 
-check("RUN_RECORD_TERMINAL_STATUSES equals tracking.RUN_STATUSES",
-      tuple(_dl.RUN_RECORD_TERMINAL_STATUSES), tuple(_tracking.RUN_STATUSES))
+# THE TWO VOCABULARIES ARE NO LONGER ONE FACT, AND THE CHECK SAYS SO IN THE
+# SHAPE THAT STILL FAILS. Until the operator stop switch they were value-
+# identical and this asserted exactly that, which is the right check for two
+# restated copies of one thing. `runs` now has a terminal status MLflow does not
+# -- STOPPED -- and MLflow's vocabulary is not this project's to widen
+# (tracking.RUN_STATUSES says so).
+#
+# THE WEAK VERSION OF THIS EDIT WOULD BE TO DELETE THE CHECK, or to relax it to
+# a superset test. Either would stop noticing the thing it was written for: a
+# status added to ONE side by accident. What is asserted instead is the exact
+# composition, IN ORDER --
+#
+#     RUN_RECORD_TERMINAL_STATUSES == tracking.RUN_STATUSES
+#                                     + RUN_RECORD_STATUSES_BEYOND_TRACKING
+#
+# -- so a new status still fails unless it is named on the side that owns it,
+# and the divergence is a declaration rather than a gap.
+check("RUN_RECORD_TERMINAL_STATUSES is tracking.RUN_STATUSES plus the "
+      "deliberately-declared extras, in that order",
+      tuple(_dl.RUN_RECORD_TERMINAL_STATUSES),
+      tuple(_tracking.RUN_STATUSES) + tuple(_dl.RUN_RECORD_STATUSES_BEYOND_TRACKING))
+
+check("...and the extras really are extra -- nothing in them is already a "
+      "tracking status, which would make the concatenation report a duplicate "
+      "as a divergence (non-degeneracy: without this the check above passes "
+      "for an extras tuple that repeats KILLED)",
+      sorted(set(_dl.RUN_RECORD_STATUSES_BEYOND_TRACKING)
+             & set(_tracking.RUN_STATUSES)), [])
+
+check("...and the extras tuple is NON-EMPTY, so the composition above is "
+      "actually exercising the concatenation rather than degenerating to the "
+      "equality it replaced",
+      len(_dl.RUN_RECORD_STATUSES_BEYOND_TRACKING) > 0, True)
+
+check("STOPPED is the declared extra, is terminal, and is NOT a tracking "
+      "status -- the three facts the batch runner's KILLED mapping rests on",
+      (_dl.RUN_RECORD_STATUS_STOPPED,
+       _dl.RUN_RECORD_STATUS_STOPPED in _dl.RUN_RECORD_TERMINAL_STATUSES,
+       _dl.RUN_RECORD_STATUS_STOPPED in _tracking.RUN_STATUSES),
+      ("STOPPED", True, False))
 
 check("...and RUNNING is deliberately NOT among them -- finalizing a run to "
       "'still going' is the one thing the end of a run must not do",

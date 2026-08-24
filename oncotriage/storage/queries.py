@@ -1010,11 +1010,26 @@ database answer the run questions" cannot disagree about the list."""
 #     by `oncotriage/batch/runner.py` and `oncotriage/ablation/study.py`; the API
 #     writes none, on purpose, so nothing it produces appears here at all.
 
-CAMPAIGN_RESUMABLE_STATUSES = ("KILLED", "FAILED")
+CAMPAIGN_RESUMABLE_STATUSES = ("KILLED", "FAILED", "STOPPED")
 """The statuses a resumed run may attach to. `RUN_RECORD_TERMINAL_STATUSES`
 minus FINISHED, and a strict subset of it by construction -- see the guard
 below. A FINISHED run has nothing left to resume, so gluing a later invocation
-onto one would turn a re-run into a continuation."""
+onto one would turn a re-run into a continuation.
+
+WRITTEN OUT RATHER THAN DERIVED as `[s for s in RUN_RECORD_TERMINAL_STATUSES if
+s != 'FINISHED']`, which was the obvious form and is the wrong one: a terminal
+status added tomorrow would silently become resumable without anybody deciding
+that it should be. Listing them makes the guard below a real check -- it fails
+on a member that is not a status at all -- and makes a new status a deliberate
+edit here.
+
+STOPPED IS RESUMABLE FOR THE SAME REASON KILLED IS, and more strongly. A stop is
+an operator saying "pause this campaign"; the checkpoint is intact by
+construction (the switch is polled at the checkpoint's own cadence, so every
+completed patient is in it), and the whole point of the switch is that the next
+invocation picks up where it left off. A stopped fragment that did NOT stitch
+would report the resumed half as a separate campaign covering a fraction of the
+cohort -- which is exactly the fragmentation this query exists to undo."""
 
 CALL_MODE_OMISSION_REASON = "omitted_from_model_response"
 """`trial_matches.not_evaluable_reason` for a trial the model was SENT and did

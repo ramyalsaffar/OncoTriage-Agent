@@ -36,6 +36,44 @@ Execution flow:
     5. Run resample pass on randomly selected already-processed patients
     6. Print final summary report
 
+STOPPING A RUN: THE `STOP` SENTINEL
+------------------------------------
+A file named **STOP** in the CHECKPOINT DIRECTORY -- the same directory that
+holds ``batch_runner_checkpoint.json`` and ``batch_runner_results.json``, and
+whose location ``stop_switch_path()`` is the one owner of. The runner prints the
+absolute path in its own setup banner on every run, so the log of a running
+campaign always says where to put it::
+
+    touch "<checkpoint dir>/STOP"
+
+The file may be empty -- ``touch`` is the documented gesture -- or may contain a
+note, which is recorded in the log and printed in the run's closing block. It is
+polled between patients, at the same point the checkpoint is written, in BOTH
+passes. When it is seen:
+
+    * no further patient is STARTED -- every queued one is cancelled before it
+      can issue a billed call, and unsubmitted ones are never submitted;
+    * patients already in flight run to completion and their rows are written;
+    * the checkpoint is current, so a resume skips exactly what was done;
+    * the RESAMPLE pass does not run at all;
+    * the ``runs`` row is finalized **STOPPED** -- a terminal status that is
+      neither KILLED (the process died) nor FINISHED (the cohort was covered);
+    * the summary and both console report blocks print, and the process exits 0.
+
+The sentinel is NOT deleted by the run that honoured it. That is deliberate: the
+next invocation REFUSES to start while it is there (``assert_no_stale_stop_switch``),
+because a switch that cleaned up after itself would let a cron entry or a restart
+loop honour a stop nobody asked for that day and report success every time.
+Deleting it is the resume gesture, and ``--clear-stop`` on the entry point does
+it in the same command.
+
+Ctrl-C IS A DIFFERENT REQUEST AND IS RECORDED DIFFERENTLY. Both pool handlers
+now RE-RAISE the ``KeyboardInterrupt`` after tearing the pool down and saving the
+checkpoint, so it reaches ``main()``'s crash handler: the run row is finalized
+KILLED, both crash blocks print, and the resample pass does not run. Before this
+they SWALLOWED it -- the run carried on into the resample pass at one billed call
+per patient and finalized FINISHED.
+
 Moved out of ``25- Batch Runner.py`` by item 20c, pass 3b. That file is now a
 thin entry point holding a ``__main__`` guard and one call.
 
@@ -539,6 +577,406 @@ def clear_all() -> None:
     clear_checkpoint()
     clear_results()
     console.out("[State] All batch runner state cleared. Ready for fresh run.")
+
+
+# ===========================================================================
+# THE OPERATOR STOP SWITCH
+# ===========================================================================
+#
+# WHAT IT IS FOR, AND WHY IT IS NOT A SIGNAL. A batch run is hours long and
+# costs one live Stage 5 call per patient, so "stop this cleanly, I will resume"
+# is an ordinary operational request. The two ways to make it before this
+# existed were both wrong:
+#
+#   * Ctrl-C -- which needs a terminal the process is attached to, so it is
+#     unavailable to anything running under nohup, screen, systemd, a
+#     container or a cron entry; and
+#   * SIGTERM -- which IS available to all of those and is deliberately an
+#     ABRUPT stop: it is what an orchestrator sends when it is about to SIGKILL,
+#     so it records the run KILLED, abandons in-flight billed requests mid-read,
+#     and returns 143.
+#
+# Neither expresses "finish what you started, write it all down, and stop
+# before the next patient". That is what this is: a file, so any user who can
+# write to the checkpoint directory can ask for it, from any machine that
+# shares the volume, with no pid to find and no signal to route.
+#
+# WHY A FILE AND NOT A DATABASE ROW OR A SOCKET. A row would put a poll on the
+# hot write path and require the switch to be reachable through whatever
+# ONCOTRIAGE_INFERENCES_DB currently resolves to -- so an operator would have
+# to know which database this run is writing to in order to stop it. A socket
+# is a port to allocate, a firewall to argue with and a second failure mode. A
+# file in a directory this runner already owns and already writes to needs
+# nothing that is not already true.
+#
+# WHY THE CHECKPOINT DIRECTORY SPECIFICALLY. It is the directory whose OTHER
+# two files are this run's resumable state, so an operator who has just been
+# told "safe to resume" is already looking at it; it is guaranteed writable,
+# because the run writes a checkpoint into it after every patient; and it is
+# per-deployment rather than per-repository, so a stop asked for on one host
+# does not stop a run on another that happens to share a checkout.
+
+STOP_FILENAME = "STOP"
+"""The sentinel filename. Upper case so it cannot be mistaken for state.
+
+The two files beside it in that directory are written BY the runner and read by
+it; this one is the only file in the project an operator is expected to CREATE
+by hand, and the name is shouted so that a directory listing says which is
+which.
+"""
+
+
+def stop_switch_path() -> Path:
+    """THE ONE OWNER of where the stop sentinel lives.
+
+    ``_checkpoint_path()``'s shape, deliberately, and for a sharper version of
+    its reason: an operator creates this file by hand, and every message that
+    tells them where to put it -- the run banner, the refusal, the stop
+    announcement, the entry point's ``--help`` -- has to name the SAME path. Two
+    expressions of it is an operator writing a file the runner never reads,
+    which looks exactly like a switch that does not work.
+
+    ``paths.checkpoint_path`` as a MODULE ATTRIBUTE, not a from-import: the
+    second form fires the lazy resolver at import and globs the sibling data
+    tree just to load this module.
+    """
+    return Path(paths.checkpoint_path) / STOP_FILENAME
+
+
+def describe_stop_switch_path() -> str:
+    """The sentinel's path as a string, or a description when it cannot resolve.
+
+    A RENDERER OVER ``stop_switch_path()``, NOT A SECOND EXPRESSION OF IT. The
+    path still has exactly one owner; this only decides what to PRINT when
+    asking the owner would raise.
+
+    IT EXISTS BECAUSE TWO OF ITS CALLERS ARE ON SHUTDOWN PATHS.
+    ``paths.checkpoint_path`` resolves the sibling data tree by glob on first
+    read and RAISES on a machine that does not have it -- so an interrupt that
+    arrived before anything had resolved a path would have had this message
+    raise INSIDE the handler that was trying to explain the interrupt,
+    replacing a clean exit with a traceback about globbing. An exception in an
+    exception handler on a shutdown path is the one place a helpful message
+    must not be able to fire from.
+
+    The banner and the refusal deliberately do NOT use this: they run before
+    anything has been spent, where a path that cannot resolve is a
+    configuration defect that should reach the operator as itself.
+    """
+    try:
+        return str(stop_switch_path())
+    except Exception as exc:                                    # noqa: BLE001
+        return (f"<the {STOP_FILENAME} file in the checkpoint directory; its "
+                f"path could not be resolved here: {type(exc).__name__}>")
+
+
+STOP_SWITCH_FAULTS = Counter()
+"""Stop-switch faults, keyed ``{phase}:{ExceptionType}``.
+
+Module-level, following ``CHECKPOINT_FAULTS`` and ``RESULTS_FILE_FAILURES``
+above rather than becoming a column: this is a property of the RUN's control
+files, and a patient row is the wrong place for it.
+
+Phases:
+    ``poll:``     the existence check itself raised. The switch is NOT tripped
+                  by one of these -- see ``_StopSwitch.poll``.
+    ``message:``  the file existed and its text could not be read. The switch IS
+                  tripped; only the note is lost.
+    ``preflight:`` the start-of-run check could not be made.
+"""
+
+degradation.register(
+    "STOP_SWITCH_FAULTS", STOP_SWITCH_FAULTS,
+    "the operator stop switch could not be read; a `poll:` key means the run "
+    "may have kept going through a stop request, a `message:` key means only "
+    "the operator's note was lost")
+
+
+STOP_MESSAGE_MAX_CHARS = 1000
+"""How much of the sentinel's text is kept.
+
+A CAP AND NOT A TRUNCATION BUG: the file is operator-written, so it can be
+anything -- an accidental `cat` of a log into it, a stray binary. The note is a
+courtesy for the run record and is not worth an unbounded read into a structured
+log field. What is kept is the first N characters and the fact that it was cut
+is stated in the same line.
+"""
+
+
+class StaleStopSwitch(RuntimeError):
+    """The stop sentinel was already present before the run began.
+
+    A ``RuntimeError`` subclass and deliberately not a ``ValueError`` or an
+    ``OSError``, on ``UnknownModelPricingError``'s and
+    ``IndexVerificationError``'s precedent: a stray ``except OSError`` around a
+    path check must not be able to eat a refusal.
+    """
+
+
+class _StopSwitch:
+    """Has an operator asked this run to stop? Latching, thread-safe, one object.
+
+    LATCHING IS THE WHOLE SEMANTICS. Once the sentinel has been seen, this
+    object answers True for the rest of the process whatever happens to the file
+    afterwards. Two reasons, and the second is the operational one:
+
+      1. the answer is acted on by CANCELLING QUEUED WORK, which is not
+         reversible -- so a switch that could un-trip would leave a run that had
+         thrown away half its cohort and then decided to carry on; and
+      2. deleting the sentinel is exactly what an operator does to make the NEXT
+         run start (the stale-switch refusal below is why), and they should be
+         able to do it while this run is still finishing its in-flight patients
+         rather than having to wait for the process to exit.
+
+    IT IS POLLED, NOT WATCHED. One ``os.path.exists`` per completed patient,
+    against a ~70-second median patient -- and it is skipped entirely once
+    tripped, so the steady-state cost is one stat call per patient and the
+    tripped-state cost is nothing. A filesystem watcher would need a thread, a
+    platform-specific backend and a story for network filesystems, to detect the
+    same event a few tens of seconds sooner than the thing that decides when the
+    next patient starts anyway: the completion of the current one.
+
+    THERE IS ONE INSTANCE AND main() RESETS IT. Module-level mutable state that
+    survives into the next run describes the wrong run -- ``clear_write_ledger``
+    and ``run_fingerprint.clear_cache`` are the two precedents at the top of
+    ``main()`` and this is the third, for the identical reason: a second
+    ``main()`` in one process (a test, an embedder looping) must not inherit the
+    first run's stop.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.requested = False
+        self.message = None
+        self.detected_in = None
+        self.path = None
+
+    def reset(self) -> None:
+        """Forget any stop seen by an earlier run in this process."""
+        with self._lock:
+            self.requested = False
+            self.message = None
+            self.detected_in = None
+            self.path = None
+
+    def poll(self, where: str = "run") -> bool:
+        """Is a stop requested? Reads the disk at most once per process.
+
+        Args:
+            where: which pass noticed, recorded for the console line and the
+                structured record. Free text, and it never reaches a durable
+                store -- the two callers pass literals.
+
+        Returns:
+            True once the sentinel has been seen, forever after.
+
+        A POLL THAT RAISES DOES NOT TRIP THE SWITCH, and that direction is
+        chosen rather than defaulted. ``os.path.exists`` already answers False
+        for every ordinary "not there" case, so a raise here is something else
+        entirely -- an unreadable directory, a filesystem gone -- and treating
+        that as a stop request would silently cancel a paid campaign because a
+        mount hiccuped. It is counted and the run continues; if the condition
+        persists the counter says so on the run's own report.
+        """
+        with self._lock:
+            if self.requested:
+                return True
+            try:
+                path = stop_switch_path()
+                present = path.exists()
+            except Exception as exc:                            # noqa: BLE001
+                STOP_SWITCH_FAULTS[f"poll:{type(exc).__name__}"] += 1
+                return False
+            if not present:
+                return False
+            self.requested = True
+            self.detected_in = where
+            self.path = str(path)
+            self.message = _read_stop_message(path)
+
+        # OUTSIDE THE LOCK, because console.out and log.warning both take locks
+        # of their own and this is called from MAX_WORKERS done-callbacks at
+        # once. Holding a lock across a write to a bar-aware writer is how a
+        # shutdown path deadlocks.
+        console.out()
+        console.out("=" * 80)
+        console.out(f"[STOP] Stop requested by {self.path}")
+        if self.message:
+            console.out(f"[STOP] Note from the operator: {self.message}")
+        console.out(f"[STOP] Noticed during the {where}. No further patient "
+                    f"will be STARTED; those already running will finish and "
+                    f"be written, the checkpoint is current, and the run will "
+                    f"be recorded STOPPED.")
+        console.out("=" * 80)
+        log.warning("an operator stop was requested",
+                    event="stop_switch_tripped", status="stopped",
+                    mode=where, reason=self.message or "<no note>")
+        return True
+
+
+def _read_stop_message(path) -> str:
+    """The operator's note, capped, or None. NEVER RAISES.
+
+    An unreadable sentinel is still a sentinel: the switch has already tripped
+    by the time this is called, and refusing to stop because a note could not be
+    decoded would be the worst available outcome. The failure is counted under
+    ``message:`` -- a phase key distinct from ``poll:`` precisely so an operator
+    can tell "the run may have missed a stop" from "the run stopped and lost the
+    note".
+    """
+    try:
+        # A BOUNDED READ, NOT A READ-THEN-TRUNCATE. `path.read_text()` would
+        # pull the WHOLE file into memory before the cap below could apply --
+        # so an operator who redirected a log into this file by accident, or
+        # pointed the checkpoint directory at something unexpected, would have
+        # the shutdown path allocate the lot. One extra character is read so
+        # "was it longer than the cap" is answerable without a second stat.
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            raw = handle.read(STOP_MESSAGE_MAX_CHARS + 1)
+    except Exception as exc:                                    # noqa: BLE001
+        STOP_SWITCH_FAULTS[f"message:{type(exc).__name__}"] += 1
+        return None
+    text = raw.strip()
+    if not text:
+        # AN EMPTY FILE IS FULLY VALID AND IS THE EXPECTED CASE. `touch STOP` is
+        # the documented gesture; None here means "no note", not "no stop".
+        # A file of nothing but whitespace lands here too, correctly.
+        return None
+    if len(raw) > STOP_MESSAGE_MAX_CHARS:
+        return (text[:STOP_MESSAGE_MAX_CHARS]
+                + f"... [truncated at {STOP_MESSAGE_MAX_CHARS} characters]")
+    return text
+
+
+STOP_SWITCH = _StopSwitch()
+"""The one instance. See ``_StopSwitch`` for why it is module-level and reset."""
+
+
+def clear_stop_switch() -> bool:
+    """Delete the sentinel. Returns whether there was one. Used by --clear-stop.
+
+    A SEPARATE FUNCTION FROM ``clear_checkpoint`` AND NOT FOLDED INTO
+    ``clear_all``, because the two clear opposite things: ``clear_all`` discards
+    a run's RESULTS and re-bills the cohort, and this discards a CONTROL FILE
+    and costs nothing. An operator who wants to resume after a stop wants
+    exactly this and must not be within one flag of the other.
+    """
+    path = stop_switch_path()
+    if not path.exists():
+        return False
+    path.unlink()
+    console.out(f"[STOP] Cleared {path}")
+    return True
+
+
+def assert_no_stale_stop_switch() -> None:
+    """Refuse to start while the sentinel is already there.
+
+    Raises:
+        StaleStopSwitch: it is present.
+
+    WHY THIS IS A REFUSAL AND NOT A NO-OP. Without it the switch is a trap that
+    fires once and then silently every time: the run that honoured it leaves the
+    file behind (deliberately -- see ``clear_stop_switch``), so the NEXT
+    invocation would trip on the first completed patient, cancel the rest, and
+    report a campaign that stopped for a reason nobody asked for that day. On a
+    cron entry or a restart loop that is a cohort that never advances while
+    every run reports success.
+
+    Stopping BEFORE the first patient rather than after one is what makes the
+    message actionable: nothing has been billed, nothing has been written, and
+    the fix is one ``rm``.
+
+    A CHECK THAT RAISES IS NOT COUNTED AS A STOP. If the existence test itself
+    fails the run proceeds -- ``_StopSwitch.poll``'s direction, for its reason --
+    with the failure counted under ``preflight:``.
+    """
+    try:
+        path = stop_switch_path()
+        present = path.exists()
+    except Exception as exc:                                    # noqa: BLE001
+        STOP_SWITCH_FAULTS[f"preflight:{type(exc).__name__}"] += 1
+        console.out(f"[STOP] WARNING: the stop switch could not be checked "
+                    f"({type(exc).__name__}: {exc}). Continuing.")
+        return
+    if not present:
+        return
+
+    note = _read_stop_message(path)
+    raise StaleStopSwitch("\n".join(
+        [f"REFUSED (stop switch present): {path}",
+         "    A stop sentinel is already in the checkpoint directory, so this "
+         "run would stop again at its first completed patient -- for a request "
+         "that was made before it started.",
+         f"    Note in the file: {note}" if note else
+         "    The file is empty, which is the ordinary `touch STOP` form.",
+         "    NOTHING HAS BEEN RUN AND NOTHING HAS BEEN BILLED.",
+         "    To run: delete it and start again.",
+         f"        rm {path}",
+         "        python \"25- Batch Runner.py\"",
+         "    or, in one command:",
+         "        python \"25- Batch Runner.py\" --clear-stop"]))
+
+
+def _start_patient_unless_stopped(**kwargs):
+    """The submitted callable. Refuses to begin work once the switch has tripped.
+
+    WHY THIS EXISTS WHEN ``_cancel_queued`` ALREADY DOES THE JOB. Cancellation
+    is a sweep, and a sweep has an edge: the switch latches inside a
+    done-callback on a worker thread, and the submit loop on the MAIN thread
+    polls once per patient -- so between the latch and the loop's next poll
+    exactly ONE more future can be submitted, and it is submitted AFTER the
+    sweep that would have cancelled it. A worker that picks it up in that
+    window starts a patient, and one live billed Stage 5 call, after the
+    operator asked the run to stop.
+
+    ONE PATIENT IS A SMALL BOUND AND IT IS NOT THE POINT. "No further patient
+    is started" is the contract this switch is documented by; a contract with
+    an unstated edge is the class of defect this project exists to remove, and
+    closing it costs one attribute read per patient.
+
+    ``STOP_SWITCH.requested`` AND NOT ``poll()``: a plain attribute read, so
+    this adds no filesystem call to the hot path. It cannot miss a stop that
+    matters either -- the value it reads is set by the sweep that is already
+    cancelling this future's siblings.
+
+    IT RAISES ``CancelledError`` RATHER THAN RETURNING A RESULT, because that
+    is what already means "this patient was never attempted" at BOTH consumers:
+    ``_on_done``'s own CancelledError branch counts it as cancelled rather than
+    as an error and advances the bar, and the drain loop tolerates it. A
+    returned entry would be appended to the results list and counted as a
+    patient that ran.
+    """
+    if STOP_SWITCH.requested:
+        raise CancelledError(
+            "the operator stop switch tripped before this patient started")
+    return process_patient(**kwargs)
+
+
+def _cancel_queued(futures) -> int:
+    """Cancel every future that has not started. Returns how many were cancelled.
+
+    ``Future.cancel()`` RETURNS FALSE FOR A RUNNING FUTURE and leaves it alone,
+    which is exactly the contract this needs: in-flight patients are already
+    paid for and their rows are worth having, so they finish. A cancelled future
+    never calls ``process_patient``, so it costs nothing -- which is what makes
+    "no further patient is started" a statement about MONEY and not only about
+    scheduling.
+
+    A SNAPSHOT OF THE LIST IS ITERATED, because this is called from a
+    done-callback on a worker thread while the submit loop on the main thread
+    may still be appending. A list being appended to is safe to iterate in
+    CPython, but "safe" there means "will not raise", not "will see every
+    element" -- and the submit loop stops on its own the moment the switch
+    trips, so anything it has not appended is never submitted at all.
+
+    A CANCELLED FUTURE STILL FIRES ITS DONE-CALLBACK, which is what advances the
+    progress bar and what routes it into ``_on_done``'s ``CancelledError``
+    branch -- counted as cancelled rather than as an error. That branch predates
+    this switch; it was added for the interrupt path and is reused here without
+    modification.
+    """
+    return sum(1 for future in list(futures) if future.cancel())
 
 
 # ===========================================================================
@@ -1229,9 +1667,28 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
     # see the class docstring.
     _drift = _DriftAnnouncer()
 
+    # THE FUTURES LIST IS BOUND BEFORE `_on_done` RATHER THAN AT THE SUBMIT
+    # LOOP, and that is required rather than tidy: `_on_done` closes over it to
+    # cancel the queue when the stop switch trips, and a name bound later in the
+    # enclosing scope would be an UnboundLocalError the first time a patient
+    # completed before the loop had run -- which is to say, never in testing and
+    # once in production.
+    futures = []
+
+    # THE STOP SWEEP HAPPENS ONCE, and this is what makes that true across
+    # MAX_WORKERS done-callbacks arriving at the same instant. The switch itself
+    # latches, so every worker after the first sees `requested` and would sweep
+    # again; a second sweep cancels nothing new (`Future.cancel()` on an
+    # already-cancelled future returns True without changing it) but would
+    # report the same count a second time, so the count would read as twice the
+    # work that was actually cancelled.
+    _stop_sweep_lock = threading.Lock()
+    stop_sweep_done = False
+
     def _on_done(future, fhir_path):
 
         nonlocal batch_success, batch_error, batch_cancelled
+        nonlocal stop_sweep_done
         try:
             entry = future.result()
         except CancelledError:
@@ -1294,6 +1751,34 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
         # per-call resolution here is the one that can split a run's health
         # record across two files WHILE IT IS BEING WRITTEN.
         flush_health(run_id, db_path=db_path)
+
+        # ── THE OPERATOR STOP SWITCH, AT THE CHECKPOINT'S OWN CADENCE ───────
+        #
+        # HERE, AND NOT INSIDE THE `status == "success"` BRANCH ABOVE. Hanging
+        # it off save_checkpoint() would leave a pass in which every patient
+        # errored unable to be stopped at all -- which is precisely the pass an
+        # operator most wants to stop, because it is burning a live Stage 5 call
+        # per patient and producing nothing. That is flush_health's argument,
+        # one line up, and it applies unchanged.
+        #
+        # AFTER the checkpoint and after the flush, so the state on disk is
+        # already current for the patient that just finished before the queue is
+        # torn down. The order is what makes "the checkpoint is current" true at
+        # the moment the stop is announced rather than one patient later.
+        if STOP_SWITCH.poll(where="main pass"):
+            with _stop_sweep_lock:
+                first = not stop_sweep_done
+                stop_sweep_done = True
+            if first:
+                # A PLAIN LOCAL, NOT A `nonlocal`. It is assigned and read
+                # inside this one callback; declaring it nonlocal would say it
+                # outlives the call, and a later reader would then be reading a
+                # count from whichever callback swept -- a number about a
+                # different moment.
+                stop_cancelled = _cancel_queued(futures)
+                console.out(f"[STOP] {stop_cancelled} queued patients "
+                            f"cancelled before they started (never billed, "
+                            f"never checkpointed -- a resume runs them).")
 
         progress.set_postfix(ok=batch_success, err=batch_error)
         
@@ -1381,11 +1866,27 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
     # future has already completed by the time it runs, so `cancel_futures=True`
     # cancels nothing and the behaviour is byte-identical to the `with` form.
     executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    stop_unsubmitted = 0
     try:
-        futures = []
-        for fhir_path in pending_files:
+        for index, fhir_path in enumerate(pending_files):
+            # THE SUBMIT LOOP HONOURS THE SWITCH TOO, and this is not
+            # redundant with the sweep in `_on_done`. Submission of a
+            # 22,000-patient corpus takes milliseconds, so in production the
+            # loop is long finished before any patient completes and this
+            # branch never fires. It fires on a SMALL corpus, or a slow
+            # filesystem, or a machine under load -- exactly the conditions a
+            # test runs under -- and without it a patient submitted after the
+            # sweep would be neither cancelled nor accounted for, and would run
+            # and bill after the stop was announced.
+            #
+            # `poll()` here is free once tripped and one stat call before that;
+            # the alternative, reading `STOP_SWITCH.requested` directly, would
+            # not notice a stop asked for BEFORE the first patient completes.
+            if STOP_SWITCH.poll(where="main pass submit"):
+                stop_unsubmitted = len(pending_files) - index
+                break
             future = executor.submit(
-                process_patient,
+                _start_patient_unless_stopped,
                 fhir_path=fhir_path,
                 graph=graph,
                 is_resample=False,
@@ -1395,14 +1896,93 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
             future.add_done_callback(lambda f, fp=fhir_path: _on_done(f, fp))
             futures.append(future)
 
+        if stop_unsubmitted:
+            # THE BAR IS RESIZED TO WHAT WILL ACTUALLY BE ACCOUNTED FOR.
+            # `_on_done` advances it once per future, cancelled ones included,
+            # and a patient that was never submitted has no future and no
+            # callback -- so a bar still sized to the whole pending set would
+            # stop short and read as a run that hung at the moment it was
+            # shutting down cleanly.
+            progress.total = len(futures)
+            progress.refresh()
+            console.out(f"[STOP] {stop_unsubmitted} patients were never "
+                        f"submitted.")
+
         # Wait for all to complete (callbacks handle progress)
         for future in futures:
-            future.result()
+            try:
+                future.result()
+            except CancelledError:
+                # A CANCELLED FUTURE IS NOT AN ERROR AND MUST NOT ESCAPE HERE.
+                # This is new with the stop switch and it is reachable ONLY on
+                # that path: the two signal paths cancel from inside an `except`
+                # clause, by which point this loop has already stopped running,
+                # so no cancelled future was ever handed to it before. The stop
+                # switch cancels while the loop is still draining, and an
+                # uncaught CancelledError here would leave run_batch by
+                # exception -- into main()'s `except BaseException`, which
+                # records the run KILLED. A clean operator stop would then be
+                # indistinguishable from a crash, which is the one thing the new
+                # status exists to distinguish.
+                #
+                # `_on_done` has already counted it (see its own CancelledError
+                # branch), so nothing is lost by continuing.
+                continue
 
     except KeyboardInterrupt:
+        # THE POOL IS TORN DOWN AND THE INTERRUPT IS RE-RAISED. It used to be
+        # SWALLOWED -- these three lines ran and the function RETURNED NORMALLY
+        # -- and the two consequences were both silent:
+        #
+        #   1. main() carried straight on into the RESAMPLE pass, at ONE LIVE
+        #      BILLED CALL PER PATIENT, immediately after printing that the run
+        #      had been interrupted. On the shipped RESAMPLE_COUNT of 100 that
+        #      is ~100 paid calls after the operator asked the run to stop.
+        #   2. main() then finalized the `runs` row FINISHED and closed the
+        #      tracking run FINISHED, so an interrupted campaign was indexed as
+        #      a completed one -- and every number computed over its rows was a
+        #      number about a cohort prefix, presented as a number about the
+        #      cohort.
+        #
+        # tests/test_runner_sigterm_shutdown.py section 3 pinned that divergence
+        # as an executable fact, and "25- Batch Runner.py"'s own SIGTERM note
+        # cites it as the reason SIGTERM had to be a SystemExit rather than a
+        # KeyboardInterrupt. Re-raising is what makes Ctrl-C reach main()'s
+        # `except BaseException`: the health record is flushed, both crash
+        # blocks print, the `runs` row is finalized KILLED and the tracking run
+        # FAILED.
+        #
+        # RESUME-SAFE, UNCHANGED. Every completed patient is already in the
+        # checkpoint -- save_checkpoint runs per patient, in `_on_done`, above
+        # this -- and a cancelled patient was never added to it. Nothing here
+        # deletes anything.
+        #
+        # THE MESSAGE STOPPED CLAIMING THE RUN CONTINUES. "Safe to resume" was
+        # true and "Checkpoint saved." was true; what the pair implied -- that
+        # this was a tidy pause the run would carry on from -- was not.
         console.out("\n[INTERRUPTED] Waiting for active threads to finish...")
         executor.shutdown(wait=True, cancel_futures=True)
-        console.out("[INTERRUPTED] Checkpoint saved. Safe to resume.")
+        console.out("[INTERRUPTED] Checkpoint saved: every completed patient "
+                    "is in it and a resume will skip them.")
+        # THE PASS TALLY IS PRINTED HERE BECAUSE RE-RAISING SKIPS THE SUMMARY
+        # LINE BELOW, and losing it would be an information regression bought
+        # by a correctness fix. The counts are final at this point: the
+        # shutdown above joined every worker, and a done-callback runs on the
+        # worker that completed the item (or, for a cancelled one, inside
+        # shutdown on this thread), so nothing can still be counting.
+        #
+        # The wording is the summary line's, deliberately, so an operator
+        # reading a scrolled-back log sees the same three numbers in the same
+        # shape whether the pass ended or was interrupted.
+        console.out(f"[INTERRUPTED] MAIN BATCH INTERRUPTED: {batch_success} "
+                    f"success, {batch_error} errors"
+                    + (f", {batch_cancelled} cancelled (never attempted)"
+                       if batch_cancelled else ""))
+        console.out("[INTERRUPTED] STOPPING THE RUN. The resample pass will "
+                    "NOT run and this run will be recorded KILLED. For a "
+                    "clean stop that records itself as STOPPED, use the stop "
+                    f"switch: touch {describe_stop_switch_path()}")
+        raise
 
     finally:
         # SHUTDOWN FIRST, so no worker is still writing when the bar is
@@ -1418,14 +1998,29 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
     # THE CANCELLED COUNT IS NAMED ONLY WHEN IT IS NON-ZERO, so a clean run's
     # line is byte-identical to what it has always printed and an interrupted
     # one cannot report work nobody ran as work that failed.
-    console.out(f"MAIN BATCH COMPLETE: {batch_success} success, "
-                f"{batch_error} errors"
+    console.out(("MAIN BATCH STOPPED: " if STOP_SWITCH.requested
+                 else "MAIN BATCH COMPLETE: ")
+                + f"{batch_success} success, {batch_error} errors"
                 + (f", {batch_cancelled} cancelled (never attempted)"
-                   if batch_cancelled else ""))
+                   if batch_cancelled else "")
+                + (f", {stop_unsubmitted} never submitted"
+                   if stop_unsubmitted else ""))
     console.out("=" * 80)
     console.out()
 
-    return completed_ids, True
+    # THE SECOND MEMBER IS `main_pass_complete` AND IT IS NOW HONEST. It was a
+    # literal `True` on every path, which was defensible while the only way out
+    # of this function was "every patient ran" or "the process died": a returned
+    # False had no producer. The stop switch is a third way out -- the function
+    # returns NORMALLY having deliberately not run part of the cohort -- so the
+    # literal would now be a false statement rather than an unreachable one.
+    #
+    # main() still discards it (`completed_ids, _ = run_batch(...)`), reading
+    # STOP_SWITCH directly because the RESAMPLE pass has to make the same
+    # decision and is not called from here. It is corrected anyway: a caller
+    # embedding this function reads the tuple, and a tuple that says a pass
+    # completed when it did not is the shape this whole item is about.
+    return completed_ids, not STOP_SWITCH.requested
 
 
 # ===========================================================================
@@ -1462,6 +2057,30 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
     console.out("=" * 80)
     console.out("RESAMPLE PASS")
     console.out("=" * 80)
+
+    # ── THE STOP SWITCH IS HONOURED BEFORE THE FIRST RESAMPLE CALL ─────────
+    #
+    # main() ALREADY SKIPS THIS PASS WHEN THE SWITCH HAS TRIPPED, so on the
+    # shipped path this branch is unreachable. It is here anyway, for two
+    # reasons that are about correctness rather than defence in depth:
+    #
+    #   1. THIS FUNCTION IS PUBLIC and is called directly by embedders and by
+    #      tests. A caller that reaches it after a stop must not pay
+    #      RESAMPLE_COUNT live Stage 5 calls because the guard lived in its
+    #      caller;
+    #   2. THE SWITCH CAN TRIP BETWEEN THE TWO PASSES. main()'s check runs
+    #      once, immediately after run_batch returns; an operator who writes
+    #      the file a second later would otherwise have their stop honoured
+    #      only after the whole resample pass had been billed.
+    #
+    # `poll()` and not `.requested`, so a stop asked for after run_batch
+    # finished is seen here rather than being missed for the life of the pass.
+    if STOP_SWITCH.poll(where="resample pass"):
+        console.out("Resample pass SKIPPED: an operator stop is in effect. "
+                    "No resample call was issued.")
+        console.out("=" * 80)
+        console.out()
+        return
 
     completed_files = [
         f for f in fhir_files
@@ -1505,8 +2124,18 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
     # despite that, rather than two hand-written messages drifting apart.
     _drift = _DriftAnnouncer()
 
+    # Bound before `_on_done` for the reason written at run_batch's: the
+    # callback closes over it to cancel the queue, and a name bound at the
+    # submit loop would be an UnboundLocalError on any patient that completed
+    # first.
+    futures = []
+
+    _stop_sweep_lock = threading.Lock()
+    stop_sweep_done = False
+
     def _on_done(future):
         nonlocal resample_success, resample_error, resample_cancelled
+        nonlocal stop_sweep_done
         try:
             entry = future.result()
         except CancelledError:
@@ -1539,6 +2168,20 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
         # db_path is forwarded here too; see run_batch's _on_done.
         flush_health(run_id, db_path=db_path)
 
+        # The same check, in the same position, as run_batch's -- the argument
+        # for both the placement and the once-only sweep is written out there.
+        # This pass writes no checkpoint (resample entries are supplemental), so
+        # "the checkpoint's cadence" here means the health flush's, which is the
+        # same per-completed-patient boundary.
+        if STOP_SWITCH.poll(where="resample pass"):
+            with _stop_sweep_lock:
+                first = not stop_sweep_done
+                stop_sweep_done = True
+            if first:
+                stop_cancelled = _cancel_queued(futures)
+                console.out(f"[STOP] {stop_cancelled} queued resample patients "
+                            f"cancelled before they started (never billed).")
+
         progress.set_postfix(ok=resample_success, err=resample_error)
         progress.update(1)
 
@@ -1552,11 +2195,15 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
     # clause is entered, which made the cancellation below dead code. Second
     # instance of one fix, not a different case.
     executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    stop_unsubmitted = 0
     try:
-        futures = []
-        for fhir_path in resample_files:
+        for index, fhir_path in enumerate(resample_files):
+            # run_batch's submit-loop guard, second instance, same argument.
+            if STOP_SWITCH.poll(where="resample pass submit"):
+                stop_unsubmitted = len(resample_files) - index
+                break
             future = executor.submit(
-                process_patient,
+                _start_patient_unless_stopped,
                 fhir_path=fhir_path,
                 graph=graph,
                 is_resample=True,
@@ -1566,13 +2213,35 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
             future.add_done_callback(lambda f: _on_done(f))
             futures.append(future)
 
+        if stop_unsubmitted:
+            progress.total = len(futures)
+            progress.refresh()
+            console.out(f"[STOP] {stop_unsubmitted} resample patients were "
+                        f"never submitted.")
+
         for future in futures:
-            future.result()
+            try:
+                future.result()
+            except CancelledError:
+                # run_batch's branch, second instance. The argument for why a
+                # cancelled future must not escape this loop is written there.
+                continue
 
     except KeyboardInterrupt:
+        # RE-RAISED, exactly as run_batch's is and for the reasons written out
+        # there. This handler's swallow was the cheaper of the two -- the
+        # resample pass is the last thing main() runs before its summary, so
+        # what it bought was a finalization of FINISHED on a run the operator
+        # had interrupted, rather than a further ~100 billed calls.
         console.out("\n[INTERRUPTED] Waiting for active threads to finish...")
         executor.shutdown(wait=True, cancel_futures=True)
-        console.out("[INTERRUPTED] Resample interrupted. Results saved.")
+        console.out(f"[INTERRUPTED] RESAMPLE INTERRUPTED: {resample_success} "
+                    f"success, {resample_error} errors"
+                    + (f", {resample_cancelled} cancelled (never attempted)"
+                       if resample_cancelled else ""))
+        console.out("[INTERRUPTED] Resample interrupted. Results already "
+                    "written are saved; the run will be recorded KILLED.")
+        raise
 
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
@@ -1581,10 +2250,13 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
 
     console.out()
     console.out("=" * 80)
-    console.out(f"RESAMPLE COMPLETE: {resample_success} success, "
-                f"{resample_error} errors"
+    console.out(("RESAMPLE STOPPED: " if STOP_SWITCH.requested
+                 else "RESAMPLE COMPLETE: ")
+                + f"{resample_success} success, {resample_error} errors"
                 + (f", {resample_cancelled} cancelled (never attempted)"
-                   if resample_cancelled else ""))
+                   if resample_cancelled else "")
+                + (f", {stop_unsubmitted} never submitted"
+                   if stop_unsubmitted else ""))
 
 # ===========================================================================
 # SUMMARY REPORT
@@ -2233,6 +2905,11 @@ def main():
     # the same reason: per-run state that survives into the next run is state
     # that describes the wrong run.
     run_fingerprint.clear_cache()
+    # THE THIRD PIECE OF PER-RUN MODULE STATE, cleared for the reason the two
+    # above it are: a stop honoured by an earlier main() in this process
+    # describes THAT run, and inheriting it would make the next one cancel its
+    # cohort at the first completed patient having been asked nothing.
+    STOP_SWITCH.reset()
 
     with CaffeinateSession("Batch Runner"):
 
@@ -2242,6 +2919,30 @@ def main():
         console.out("=" * 80)
         console.out(f"{Project_Name}: BATCH RUNNER")
         console.out("=" * 80)
+        console.out()
+
+        # ------------------------------------------------------------------
+        # 0. The stop switch: refuse a stale one, and say where it goes
+        # ------------------------------------------------------------------
+        # FIRST, BEFORE THE BM25 INDEX AND BEFORE THE GRAPH. A stale sentinel
+        # makes this run stop at its first completed patient, so the refusal is
+        # worth nothing spent -- and it is the cheapest refusal available: one
+        # stat call, before a client is opened, a model is loaded or a corpus is
+        # globbed. Putting it beside the CHECKPOINT refusal would have been the
+        # tidier home and would have cost the ~30 seconds of index build first.
+        try:
+            assert_no_stale_stop_switch()
+        except StaleStopSwitch as exc:
+            console.out()
+            console.out(str(exc))
+            raise SystemExit(1)
+
+        # THE PATH IS ANNOUNCED ON EVERY RUN, not only when it is used. An
+        # operator who needs to stop a run that is already going has no way to
+        # discover this file from the process -- there is no CLI to ask -- so it
+        # is printed where the run's own log will carry it.
+        console.out(f"[Setup] To stop this run cleanly between patients: "
+                    f"touch {stop_switch_path()}")
         console.out()
 
         # ------------------------------------------------------------------
@@ -2551,7 +3252,21 @@ def main():
             #    at all (a mid-loop crash exits the process before any return).
             #    Guard on completed_ids to skip gracefully if every patient errored.
             # ------------------------------------------------------------------
-            if completed_ids:
+            # THE STOP SWITCH IS CHECKED BEFORE THE RESAMPLE PASS, AND THIS
+            # IS THE MONEY. RESAMPLE_COUNT is 100, so a stop honoured only
+            # INSIDE run_resample would still pay for however many of those got
+            # scheduled before its first callback fired. Checking here means a
+            # stopped run issues exactly zero resample calls.
+            #
+            # `STOP_SWITCH.requested` and NOT `poll()`: run_batch has just
+            # returned, so if it stopped the switch is already latched, and a
+            # poll here would additionally trip on a sentinel written in the
+            # seconds since -- which run_resample's own entry gate handles,
+            # with its own message. One announcement per stop.
+            if STOP_SWITCH.requested:
+                console.out("[Resample] SKIPPED: an operator stop is in "
+                            "effect. Zero resample calls were issued.")
+            elif completed_ids:
                 run_resample(
                     fhir_files=fhir_files,
                     completed_ids=completed_ids,
@@ -2621,7 +3336,23 @@ def main():
             # ------------------------------------------------------------------
             main_results = [r for r in results_list if not r.get("is_resample")]
             main_errors = [r for r in main_results if r["status"] != "success"]
-            if not main_errors:
+            # THE STOP GUARD IS THE FIRST TEST AND ITS ABSENCE WOULD HAVE BEEN
+            # THE MOST EXPENSIVE DEFECT IN THIS ITEM. A stopped run's cancelled
+            # patients produce NO result entry at all -- `_on_done`'s
+            # CancelledError branch returns before `append_result` -- so
+            # `main_errors` is EMPTY on a stop in which every patient that ran
+            # succeeded. The old condition would therefore have read "no errors,
+            # clear the checkpoint", deleted the resume state for a cohort that
+            # was deliberately only half run, and re-billed every remaining
+            # patient on the next invocation, silently, at ~$0.15 each.
+            #
+            # An empty `main_errors` means "nothing that ran failed", which is
+            # not "everything ran". Only a run that was not stopped can conclude
+            # the second from the first.
+            if STOP_SWITCH.requested:
+                console.out("[Checkpoint] KEPT: the run was stopped, so "
+                            "patients remain. The next run resumes from it.")
+            elif not main_errors:
                 clear_checkpoint()
                 console.out("[Checkpoint] Cleared for next fresh run.")
             else:
@@ -2654,8 +3385,21 @@ def main():
                 tracking_metrics(results_list, total_wall_time,
                                  reconciliation=reconciliation,
                                  degradation_snapshot=degradation_snapshot))
+            # THE TRACKING STATUS IS MLflow's VOCABULARY, NOT THIS PROJECT'S,
+            # and a stop maps to KILLED there. MLflow's terminal set is
+            # FINISHED / FAILED / KILLED and its own definition of KILLED is
+            # "run killed by user", which is literally what a stop switch is --
+            # so this is the closest TRUE statement the index can carry, not a
+            # rounding. The divergence from `runs.status` (STOPPED) is stated
+            # rather than smoothed over, exactly as the crash handler below
+            # states its own KILLED-here / FAILED-there divergence.
+            #
+            # `end_run` replaces an unrecognised status with FAILED, so passing
+            # "STOPPED" straight through would have indexed every stopped
+            # campaign as a failure -- true of nothing, and worse than KILLED.
             tracking.end_run(
-                status="FINISHED" if not main_errors else "FAILED",
+                status=("KILLED" if STOP_SWITCH.requested
+                        else "FINISHED" if not main_errors else "FAILED"),
                 artifacts=[
                     # The results file, as it stands on disk after this run.
                     _results_path(),
@@ -2701,9 +3445,55 @@ def main():
             # which the NEXT run's degradation block reports -- this one has
             # already printed, exactly as the tracking calls above already
             # accept.
+            # THE STOP REPORT IS PRINTED **ABOVE** finalize_run_record, AND
+            # THE ORDER IS AN INVARIANT RATHER THAN A PREFERENCE. The finalize
+            # call is required to be the LAST statement of this `try` -- see the
+            # note on it, and `tests/test_storage_run_identity.py`, which pins
+            # exactly that and CAUGHT the first version of this block sitting
+            # below it. With console lines after the finalize, a formatting
+            # failure in any of them would raise into the crash handler and
+            # OVERWRITE a STOPPED row with KILLED: a clean operator stop
+            # recorded as a crash, by the code whose whole job is to say they
+            # are different.
+            #
+            # Printed first, a failure here leaves the row UNFINALIZED and the
+            # crash handler finalizes it KILLED -- which is then the truth: the
+            # run did die, in the reporting.
+            if STOP_SWITCH.requested:
+                console.out()
+                console.out("=" * 80)
+                console.out("RUN STOPPED AT THE OPERATOR'S REQUEST.")
+                console.out(f"  requested by   {STOP_SWITCH.path}")
+                if STOP_SWITCH.message:
+                    console.out(f"  note           {STOP_SWITCH.message}")
+                console.out(f"  noticed in     the {STOP_SWITCH.detected_in}")
+                console.out("  run row        STOPPED (not KILLED, not "
+                            "FINISHED)")
+                console.out("  checkpoint     kept; the next run resumes from "
+                            "it")
+                console.out("  TO RESUME      delete the sentinel and run "
+                            "again:")
+                console.out(f"      rm {STOP_SWITCH.path}")
+                console.out("      python \"25- Batch Runner.py\"")
+                console.out("=" * 80)
+
+            # STOPPED OUTRANKS BOTH, and the precedence is a decision. A run
+            # that was asked to stop AND had errored patients is recorded
+            # STOPPED, because the question `runs.status` answers is "how did
+            # this run END" and it ended because an operator asked it to; the
+            # errors are in `run_metrics`, in the summary above and in
+            # `inferences.status`, none of which this displaces. The other
+            # ordering would report a stopped campaign as FAILED and send
+            # somebody looking for a fault that is not there.
+            #
+            # It also cannot be conflated with FINISHED, which is the reading
+            # that matters most to a reviewer: a STOPPED row means the campaign
+            # covers a PREFIX of the cohort, so no rate computed over it is a
+            # rate about the cohort.
             finalize_run_record(
                 _run_record_id,
-                "FINISHED" if not main_errors else "FAILED",
+                ("STOPPED" if STOP_SWITCH.requested
+                 else "FINISHED" if not main_errors else "FAILED"),
                 db_path=_reconcile_db,
             )
 

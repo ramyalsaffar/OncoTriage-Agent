@@ -42,17 +42,29 @@ WHAT THIS FILE HOLDS
        finalized KILLED with a non-NULL ``finished_at``, ``run_metrics`` rows
        written by the crash-path flush, and queued patients CANCELLED rather
        than drained.
-    3. A REAL SIGINT, in the same harness, showing the Ctrl-C contract
-       unchanged: absorbed by the pool handler, "[INTERRUPTED]" printed, the
-       run carries on to its own end and is NOT recorded KILLED. THE
-       DIVERGENCE IS ASSERTED RATHER THAN GLOSSED -- the two signals now have
-       different dispositions on purpose, and this file is where that is
-       written down as an executable fact.
+    3. A REAL SIGINT, in the same harness. THIS SECTION USED TO PIN THE
+       OPPOSITE OF WHAT IT PINS NOW, and what it pinned was a defect: both
+       pool handlers CAUGHT the KeyboardInterrupt, printed "Checkpoint saved.
+       Safe to resume." and RETURNED NORMALLY, so main() carried on into the
+       RESAMPLE pass at one live billed Stage 5 call per patient and finalized
+       the run FINISHED. Ctrl-C now stops the run: the handlers re-raise, the
+       run row is KILLED, both crash blocks print, the resample pass does not
+       run, and the entry point exits 130 with no traceback.
     4. THE CONTROL FOR THE DRAIN FIX: the same scenario against a COPY of the
        package whose ``run_batch`` has the ``with`` form restored. It drains
        every queued patient; the shipped form does not. Without it, "queued
        patients were cancelled" would be a claim about a number nobody
        compared.
+    4b. THE CONTROL FOR THE RE-RAISE: a second copy with the `raise` deleted
+       from ``run_batch``'s KeyboardInterrupt handler, driven with the same
+       SIGINT. It records the interrupted run as ended normally and exits
+       through the reconciliation verdict; the shipped tree records KILLED and
+       exits 130.
+
+THE THIRD WAY TO STOP A RUN -- the operator STOP sentinel, which records the run
+STOPPED rather than KILLED -- is ``tests/test_runner_stop_switch.py``'s subject,
+not this file's. This file's SIGINT section names it only where an operator
+meeting an interrupt message needs to learn it exists.
 
 WHAT IT COSTS TO RUN
 --------------------
@@ -372,12 +384,54 @@ check("1d  ...and no KeyboardInterrupt is raised anywhere in the entry point",
             == "KeyboardInterrupt"
             or getattr(n.exc, "id", None) == "KeyboardInterrupt")], [])
 
+# TWO DERIVED EXIT CODES NOW, NOT ONE, AND THE SECOND IS SIGINT's. The pool
+# handlers used to SWALLOW KeyboardInterrupt, so Ctrl-C could not produce an
+# exit code of its own at all; they re-raise now, and this guard turns the
+# resulting interrupt into 128 + SIGINT with no traceback -- the SIGINT half of
+# what the SIGTERM handler already did.
+#
+# THE SIGNAL EACH ONE IS COMPUTED FROM IS PINNED, not just the count. A pair of
+# `128 + signal.SIGTERM` expressions would satisfy a bare count of two while
+# leaving Ctrl-C reporting a SIGTERM code, which is the confusion the two
+# codes exist to prevent.
 _exit_consts = [n for g in _GUARD for n in ast.walk(g)
                 if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Add)
                 and isinstance(n.left, ast.Constant) and n.left.value == 128]
-check("1d  the exit code is derived as 128 + SIGTERM rather than typed as a "
-      "literal 143 (the shell convention, computed from the signal)",
-      len(_exit_consts), 1)
+check("1d  both exit codes are derived as 128 + <signal> rather than typed as "
+      "literal 143/130 (the shell convention, computed from the signal)",
+      len(_exit_consts), 2)
+# THE SIGNAL IS READ OUT OF THE RIGHT OPERAND BY WALKING IT, not by reading an
+# attribute off it. Both sites are written `128 + int(signal.SIGx)`, so the
+# right operand is a Call and `n.right.attr` is absent -- the first version of
+# this check asked for that attribute, got two ast dumps, and failed against a
+# tree that is correct. A walk finds the signal name in either form.
+def _signal_names_in(node):
+    return sorted({sub.attr for sub in ast.walk(node)
+                   if isinstance(sub, ast.Attribute)
+                   and getattr(sub.value, "id", None) == "signal"})
+
+
+check("1d  ...and they are computed from SIGTERM and SIGINT respectively, so "
+      "neither reports the other's code",
+      sorted(name for n in _exit_consts for name in _signal_names_in(n.right)),
+      ["SIGINT", "SIGTERM"])
+check("1d  ...(non-degeneracy: the extractor really does find a signal name "
+      "in each operand rather than returning nothing twice)",
+      [len(_signal_names_in(n.right)) for n in _exit_consts], [1, 1])
+
+# THE SIGINT DISPOSITION IS A `try/except KeyboardInterrupt` AND NOT A HANDLER,
+# and that distinction is what 1d's "NO disposition is installed for SIGINT"
+# above still guarantees. Installing one would change WHERE the interrupt lands
+# (inside a handler, on the main thread, possibly mid-lock); catching it after
+# main() returns changes only what is printed and what is exited with, and it
+# runs after main()'s own crash handler has already written the record.
+_sigint_handlers = [n for g in _GUARD for n in ast.walk(g)
+                    if isinstance(n, ast.ExceptHandler)
+                    and getattr(n.type, "id", None) == "KeyboardInterrupt"]
+check("1d  the entry point catches KeyboardInterrupt exactly once, in the "
+      "guard, so a re-raised Ctrl-C does not reach CPython's default handler "
+      "and print a traceback for a shutdown the operator asked for",
+      len(_sigint_handlers), 1)
 
 # --- 1e: the handler is re-entrancy-safe ------------------------------------
 #
@@ -883,16 +937,37 @@ check("2b-4 ...and the handler said so in that line",
 
 
 # ===========================================================================
-# 3. A REAL SIGINT -- THE CONTRACT THAT DID NOT CHANGE
+# 3. A REAL SIGINT -- THE CONTRACT THAT CHANGED
 # ===========================================================================
 #
-# The two signals have DIFFERENT dispositions on purpose. Ctrl-C is a human
-# saying "stop, I will resume"; the pool absorbs it, says so, and the run
-# reaches its own end. SIGTERM is an orchestrator saying "you have N seconds",
-# and it stops the run. Asserting the divergence is what stops a future pass
-# "unifying" them by accident.
+# THIS SECTION USED TO PIN THE OPPOSITE, AND THE THING IT PINNED WAS A DEFECT.
+# It read: "the two signals have DIFFERENT dispositions on purpose ... the pool
+# absorbs it, says so, and the run reaches its own end", and check 3d asserted
+# that a Ctrl-C'd run was recorded FAILED rather than KILLED. That was an
+# accurate description of what the code did and it is what made the code's
+# behaviour indefensible:
+#
+#   * both pool handlers caught KeyboardInterrupt, tore the pool down, printed
+#     "[INTERRUPTED] Checkpoint saved. Safe to resume." and RETURNED NORMALLY;
+#   * so main() carried straight on into the RESAMPLE pass -- RESAMPLE_COUNT is
+#     100 -- at ONE LIVE BILLED Stage 5 CALL PER PATIENT, after the operator
+#     had asked the run to stop;
+#   * and then finalized the `runs` row and the tracking run as a completed
+#     campaign, so an interrupted run's rows were indistinguishable from a
+#     covered cohort's.
+#
+# "25- Batch Runner.py"'s own SIGTERM note cites this file's section 3 as the
+# measured reason SIGTERM had to be a SystemExit rather than a
+# KeyboardInterrupt. That reasoning was right about the code and the right fix
+# was the other one: make Ctrl-C stop the run too.
+#
+# THE DIVERGENCE THAT REMAINS IS SMALLER AND IS STILL PINNED. Both signals now
+# stop the run and record it KILLED; they differ in exit code (130 vs 143) and
+# in whether a disposition is installed (SIGINT keeps CPython's default -- see
+# 1d). The THIRD request, "stop cleanly and record it as STOPPED", is the
+# operator stop switch, and it is tests/test_runner_stop_switch.py's subject.
 
-print("\n=== 3. a real SIGINT, for comparison ===")
+print("\n=== 3. a real SIGINT: it now STOPS the run ===")
 
 _INT = drive("sigint", sig=signal.SIGINT)
 
@@ -901,16 +976,60 @@ check("3a  the pool was saturated, the signal was delivered, and the pool's "
       "own interrupt handler was provably entered",
       (_INT["saturated"], _INT["signalled"], _INT["handler_entered"]),
       (True, True, True))
-check("3b  the pool absorbed it and said so, exactly as before",
+check("3b  the pool still announces the teardown, unchanged",
       "[INTERRUPTED] Waiting for active threads to finish" in _INT["out"], True)
-check("3c  ...and reported the checkpoint safe to resume",
-      "[INTERRUPTED] Checkpoint saved. Safe to resume." in _INT["out"], True)
-check("3d  the run is NOT recorded KILLED -- Ctrl-C does not reach main()'s "
-      "crash handler, and this file is where that divergence from SIGTERM is "
-      "written down",
-      sorted({row[1] for row in _INT["runs"]}) or ["<no run row>"], ["FAILED"])
-check("3e  ...and the exit code is not the SIGTERM one",
-      _INT["exit"] == 128 + int(signal.SIGTERM), False)
+# THE OLD LINE IS ASSERTED ABSENT, not merely replaced. "Checkpoint saved. Safe
+# to resume." was true about the checkpoint and false about the run: what the
+# pair implied -- a tidy pause the run would carry on from -- is what the
+# operator acted on. A test that only checked for the new string would pass on a
+# tree that printed both.
+check("3c  the message that claimed the run continues is GONE",
+      "[INTERRUPTED] Checkpoint saved. Safe to resume." in _INT["out"], False)
+check("3c-b ...and is replaced by one that says the checkpoint is current AND "
+      "that the run is stopping",
+      ("[INTERRUPTED] Checkpoint saved: every completed patient is in it"
+       in _INT["out"],
+       "[INTERRUPTED] STOPPING THE RUN." in _INT["out"]),
+      (True, True))
+check("3c-c ...and it names the stop switch as the way to stop WITHOUT being "
+      "recorded KILLED, so an operator meeting this line learns the third "
+      "option exists",
+      "use the stop switch: touch" in _INT["out"], True)
+# --- THE CONTRACT CHANGE ITSELF ---------------------------------------------
+check("3d  THE RUN IS RECORDED KILLED. Ctrl-C now reaches main()'s crash "
+      "handler, which is what makes an interrupted campaign distinguishable "
+      "from a completed one in `runs`",
+      sorted({row[1] for row in _INT["runs"]}) or ["<no run row>"], ["KILLED"])
+check("3d-b ...and it is FINALIZED, not left at RUNNING with a NULL "
+      "finished_at -- that shape is reserved for a process that got to run no "
+      "handler at all",
+      [row[2] is not None for row in _INT["runs"]] or ["<no run row>"], [True])
+check("3d-c ...and BOTH crash blocks printed (census and degradation), which "
+      "on this path are the only record the census counters ever have -- the "
+      "same two blocks section 2e reads for SIGTERM",
+      (_INT["out"].count("CENSUS") >= 1,
+       _INT["out"].count("DEGRADATION") >= 1,
+       "[Run] Closed run" in _INT["out"]),
+      (True, True, True))
+# --- THE MONEY ---------------------------------------------------------------
+# THE RESAMPLE PASS IS WHAT THE OLD BEHAVIOUR PAID FOR. At the shipped
+# RESAMPLE_COUNT of 100 an interrupted run went on to make ~100 further live
+# Stage 5 calls. Asserting the pass never STARTS is the cost proof: the
+# stand-in's started-file is the ledger, and it is checked below too, but the
+# header is what says main() never entered the pass at all.
+check("3d-d THE RESAMPLE PASS NEVER RAN -- the single most expensive "
+      "consequence of the old swallow",
+      ("RESAMPLE PASS" in _INT["out"], "RESAMPLE COMPLETE" in _INT["out"]),
+      (False, False))
+check("3e  the exit code is 128 + SIGINT, the shell convention, and NOT the "
+      "SIGTERM one and NOT the reconciliation verdict",
+      (_INT["exit"], _INT["exit"] == 128 + int(signal.SIGTERM)),
+      (128 + int(signal.SIGINT), False))
+check("3e-b ...with NO traceback: an operator-requested stop is not a crash "
+      "report, which is the same ruling the SIGTERM handler already made",
+      "Traceback (most recent call last)" in _INT["out"], False)
+check("3e-c ...and the entry point said what happened and how to resume",
+      "[INTERRUPTED] Stopped by Ctrl-C." in _INT["out"], True)
 # THE DRAIN FIX APPLIES TO CTRL-C TOO, and that IS a change: the handler's own
 # `cancel_futures=True` finally bites. Nothing is lost by it -- a cancelled
 # patient is never checkpointed, so a resume runs it -- and the two printed
@@ -931,12 +1050,43 @@ check("3f  Ctrl-C also cancels queued patients now, which is what the pool "
 # summary claiming 22,000 errors for work nobody ran. The branch became
 # REACHABLE in this same pass -- before the pool cancelled, no future was ever
 # cancelled and the branch would have been dead code.
-check("3f-b ...and they are reported as cancelled rather than as errors, both "
-      "in the count and in the absence of per-patient error lines",
+# THE TALLY MOVED, AND THAT IS A CONSEQUENCE OF THE RE-RAISE WORTH PINNING.
+# run_batch's "MAIN BATCH COMPLETE: ..." line sits BELOW the try/finally, so
+# re-raising skips it -- and losing the three numbers would have been an
+# information regression bought by a correctness fix. The interrupt handler
+# prints them itself, in the summary line's own wording, BEFORE it re-raises.
+check("3f-b the cancelled patients are reported as cancelled rather than as "
+      "errors, both in the count and in the absence of per-patient error lines",
       (f", {_INT['patients'] - _STARTED_INT} cancelled (never attempted)"
        in _INT["out"],
        _INT["out"].count("[CALLBACK ERROR] CancelledError")),
       (True, 0))
+check("3f-c ...and the tally survives the re-raise, printed by the handler "
+      "rather than by the summary line the raise skips",
+      "[INTERRUPTED] MAIN BATCH INTERRUPTED:" in _INT["out"], True)
+check("3f-d ...and the normal-path summary line is correspondingly ABSENT, so "
+      "an interrupted pass cannot be read as a completed one",
+      "MAIN BATCH COMPLETE:" in _INT["out"], False)
+
+# --- THE COST PROOF, BY COUNTING WHAT THE STUB WAS ASKED TO DO --------------
+#
+# The stand-in appends one line per patient it is CALLED for, so this file is
+# the ledger of every would-be billed call. Under the old swallow it carried the
+# main pass's started patients AND ~RESAMPLE_COUNT more; under the fix it can
+# carry nothing beyond the main pass's, because run_resample is never entered.
+#
+# A CORPUS OF 40 AND RESAMPLE_COUNT OF 100 means the resample pass would have
+# re-run min(100, completed) patients -- but the stand-in returns status="error"
+# so NOTHING is ever completed here and the resample pass would have found no
+# candidates. THAT IS WHY THE HEADER CHECK ABOVE (3d-d) IS THE LOAD-BEARING ONE
+# and this is the corroboration rather than the proof: it says no call was made
+# after the ones the main pass had already started, which is the property the
+# started count already establishes. Stated plainly rather than dressed up as
+# more than it is; the STOP switch's own file drives a corpus that DOES complete
+# patients and therefore DOES reach a resample pass with candidates.
+check("3f-e no patient was started beyond the pool's own saturation -- so "
+      "nothing was called after the interrupt was raised",
+      _STARTED_INT, min(MAX_WORKERS, _INT["patients"]))
 
 
 #------------------------------------------------------------------------------
@@ -1040,6 +1190,122 @@ else:
                   "copy that failed to run",
                   (_CTRL["exit"], sorted({r[1] for r in _CTRL["runs"]})),
                   (128 + int(signal.SIGTERM), ["KILLED"]))
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
+# 4b. THE CONTROL FOR THE RE-RAISE -- THE OLD SWALLOW, SHOWN TO FAIL
+# ===========================================================================
+#
+# Section 3 asserts a CONTRACT CHANGE, and a contract change asserted without
+# its other arm is a description of whatever the code happens to do. The
+# pre-fix SWALLOW is reconstructed in a second copy of the package -- the
+# `raise` deleted from run_batch's `except KeyboardInterrupt` and from nowhere
+# else -- and the same SIGINT scenario is driven against it.
+#
+# THE PLANT IS STRUCTURAL, NOT TEXTUAL. `raise` is a bare keyword that appears
+# in several handlers in this module, so a string replace would either hit the
+# wrong one or need an anchor long enough to be its own maintenance problem.
+# The handler is located by AST inside run_batch's span, its trailing
+# `ast.Raise` is located by node, and that node's LINES are removed -- so the
+# plant cannot silently match nothing, and a `raise` that has moved out of the
+# handler is a PLANT-FAILED rather than a control that quietly tests the
+# shipped tree against itself.
+#
+# WHAT THIS CONTROL CAN AND CANNOT SHOW, stated rather than implied. The
+# stand-in returns status="error", so no patient is ever COMPLETED here and
+# main() skips the resample pass in BOTH arms ("no successfully completed
+# patients"). So this control proves the RECORD half of the defect -- an
+# interrupted campaign finalized as though it had ended normally -- and not the
+# SPEND half. The spend half needs a corpus that completes patients and
+# therefore reaches a resample pass with candidates, and that is driven in
+# tests/test_runner_stop_switch.py, which has exactly that harness.
+
+print("\n=== 4b. the control: without the re-raise, Ctrl-C is swallowed ===")
+
+_RR_REPO = os.path.join(_TMP, "pkgcopy_reraise")
+os.makedirs(_RR_REPO, exist_ok=True)
+shutil.copytree(os.path.join(_REPO, "oncotriage"),
+                os.path.join(_RR_REPO, "oncotriage"),
+                ignore=shutil.ignore_patterns("__pycache__"))
+
+_RR_RUNNER = os.path.join(_RR_REPO, "oncotriage", "batch", "runner.py")
+_rr_src = open(_RR_RUNNER, encoding="utf-8").read()
+_rr_fn = function_named(ast.parse(_rr_src), "run_batch")
+
+
+def _ki_raise_lines(fn):
+    """The line numbers of the bare `raise` closing run_batch's KI handler.
+
+    Returns an empty list when there is none, which is what makes a moved or
+    deleted `raise` a named PLANT-FAILED instead of a silent no-op.
+    """
+    if fn is None:
+        return []
+    out = []
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Try):
+            continue
+        for handler in node.handlers:
+            if getattr(handler.type, "id", None) != "KeyboardInterrupt":
+                continue
+            for stmt in handler.body:
+                if isinstance(stmt, ast.Raise) and stmt.exc is None:
+                    out.append((stmt.lineno, stmt.end_lineno))
+    return out
+
+
+_rr_targets = _ki_raise_lines(_rr_fn)
+check("4b-a run_batch's `except KeyboardInterrupt` closes with exactly one "
+      "bare `raise` (non-degeneracy: the plant below has a target, and a tree "
+      "where the re-raise had been removed would fail HERE rather than "
+      "reporting an ineffective control)",
+      len(_rr_targets), 1)
+
+if len(_rr_targets) != 1:
+    fail("4b-b the plant applied",
+         "PLANT-FAILED: run_batch's KeyboardInterrupt handler does not end in "
+         "a single bare `raise`, so the swallow control did not run and every "
+         "section 3 contract check is unverified.")
+else:
+    _rr_lines = _rr_src.splitlines(keepends=True)
+    _lo, _hi = _rr_targets[0]
+    _rr_new = "".join(_rr_lines[:_lo - 1] + _rr_lines[_hi:])
+    _rr_reverted_fn = function_named(ast.parse(_rr_new), "run_batch")
+    check("4b-b the reverted copy parses and run_batch's handler no longer "
+          "re-raises, while run_resample's is untouched",
+          (len(_ki_raise_lines(_rr_reverted_fn)),
+           len(_ki_raise_lines(function_named(ast.parse(_rr_new),
+                                              "run_resample")))),
+          (0, 1))
+    open(_RR_RUNNER, "w", encoding="utf-8").write(_rr_new)
+    _RR = drive("control-reraise", sig=signal.SIGINT, repo=_RR_REPO)
+    check("4b-c the stand-in hook installed in the control too",
+          _RR["hook"], True)
+    check("4b-d the control really was interrupted -- the pool handler ran, "
+          "so 4b-e/f are about the swallow and not about a copy that never "
+          "saw the signal",
+          ("[INTERRUPTED] Waiting for active threads to finish" in _RR["out"],
+           _RR["saturated"], _RR["handler_entered"]),
+          (True, True, True))
+    check("4b-e THE PRE-FIX FORM RECORDS THE INTERRUPTED RUN AS ENDED "
+          "NORMALLY -- FAILED here (every stand-in patient errors), never "
+          "KILLED. This is the defect: an interrupted campaign and a completed "
+          "one are the same row.",
+          sorted({r[1] for r in _RR["runs"]}) or ["<no run row>"], ["FAILED"])
+    check("4b-f ...and it prints the normal-path summary line and reaches the "
+          "reconciliation exit code rather than 128 + SIGINT",
+          ("MAIN BATCH COMPLETE:" in _RR["out"],
+           _RR["exit"] == 128 + int(signal.SIGINT)),
+          (True, False))
+    check("4b-g ...and the shipped tree does the opposite on all three, which "
+          "is the fix MEASURED rather than asserted",
+          (sorted({r[1] for r in _INT["runs"]}),
+           "MAIN BATCH COMPLETE:" in _INT["out"],
+           _INT["exit"] == 128 + int(signal.SIGINT)),
+          (["KILLED"], False, True))
 
 
 #------------------------------------------------------------------------------
