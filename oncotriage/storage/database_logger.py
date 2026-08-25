@@ -227,6 +227,16 @@ def resolve_inference_db_path(db_path=None):
 # where they started. It answers one question -- which era is this file -- for
 # a human, a support script, or a future tool that must refuse a database it
 # does not understand.
+# ERA 5: TWO COLUMNS IN ONE COMMIT, which is what an era is -- the number
+#        counts schema changes, not columns. `trial_matches.criteria_split`
+#        carries the indexer's own split method through onto every trial that
+#        reached Stage 5, so a campaign's exposure to the trials whose whole
+#        criteria block was sent as INCLUSION text becomes a query instead of
+#        an unanswerable question; the field existed only inside a Qdrant
+#        payload before. `runs.note` carries the operator's stop note, which
+#        was read, printed and then discarded, so a STOPPED row said nothing
+#        about why. Both are additive TEXT, both are NULL on every existing row,
+#        and neither is backfilled.
 # ERA 4: `runs.matching_call_mode`, added with RUN_COLUMN_ADDITIONS and its
 #        migration loop. It is the RUN-level twin of era 3's per-row column and
 #        it is not redundant with it: era 3 records what each patient row was
@@ -240,7 +250,7 @@ def resolve_inference_db_path(db_path=None):
 #        own once per-trial mode can bypass the packer.
 # ERA 2: `runs.resumed`, added with RUN_COLUMN_ADDITIONS and its migration loop.
 # ERA 1: the constant's own introduction -- the schema as it stood then.
-SCHEMA_USER_VERSION = 4
+SCHEMA_USER_VERSION = 5
 
 
 #------------------------------------------------------------------------------
@@ -1075,7 +1085,44 @@ INFERENCE_COLUMN_ADDITIONS = {
 RUN_COLUMN_ADDITIONS = {
     "resumed": "INTEGER",
     "matching_call_mode": "TEXT",
+    # THE OPERATOR'S OWN WORDS ABOUT WHY THIS RUN ENDED THE WAY IT DID.
+    #
+    # The stop sentinel may carry a note -- `touch` is the documented gesture
+    # and an empty file is the common case, but an operator who writes one into
+    # it is answering the question a reviewer asks first. That note was READ
+    # (control.read_stop_message), LOGGED and PRINTED in the run's closing
+    # block, and then died with the process: `runs.status` said STOPPED and
+    # nothing anywhere said why. A campaign covering a prefix of the cohort is
+    # exactly the row whose reason a reviewer needs, and the reason existed and
+    # was thrown away.
+    #
+    # NULL ON EVERY HISTORICAL ROW AND ON MOST NEW ONES, and that is a value
+    # rather than an absence to be explained: no note was left. It is written
+    # only by `finalize_run_record`, only when its caller passes one, and the
+    # only caller that does is the batch runner's stop path.
+    #
+    # CAPPED AT THE WRITE, by `RUN_NOTE_MAX_CHARS`, even though the one shipped
+    # source is already capped upstream at control.STOP_MESSAGE_MAX_CHARS. A
+    # writer that trusts its caller to have bounded a free-text field is a
+    # writer that puts an arbitrarily large blob in a durable table the first
+    # time a second caller appears; the two bounds are independent for that
+    # reason and neither is derived from the other.
+    #
+    # IT IS FREE TEXT AN OPERATOR TYPED, so it is deliberately NOT a loggable
+    # field and nothing branches on it. It is stored, and it is read by a human.
+    "note": "TEXT",
 }
+
+
+# The bound on `runs.note`. NOT in oncotriage/config.py, on
+# control.STOP_MESSAGE_MAX_CHARS's argument: that file's promise is that every
+# constant in it is a tunable an operator can change to change what a run does,
+# and this changes nothing about a run -- it bounds one column of one table so a
+# caller cannot put an unbounded blob in it. Larger than
+# control.STOP_MESSAGE_MAX_CHARS on purpose, so the shipped path is never
+# truncated twice and a second truncation marker in the column means a SECOND
+# caller with a larger note, which is a fact worth being able to see.
+RUN_NOTE_MAX_CHARS = 2000
 
 
 #------------------------------------------------------------------------------
@@ -1165,6 +1212,40 @@ TRIAL_MATCH_COLUMN_ADDITIONS = {
     # is what separates a checked row from an unchecked one, which is the whole
     # question this column answers.
     "hallucinated":            "INTEGER",
+    # HOW THE INDEXER SPLIT THIS TRIAL'S ELIGIBILITY TEXT, copied through from
+    # the trial's own `full_trial_json.criteria_split` -- one of
+    # oncotriage/retrieval/indexer.py's CRITERIA_SPLIT_* constants: "both",
+    # "inclusion_only", "exclusion_only", "unsplit" or "empty_criteria".
+    #
+    # WHAT IT IS FOR, AND IT IS A CAMPAIGN QUESTION RATHER THAN A ROW ONE. A
+    # trial recorded "unsplit" had its whole criteria block handed to Stage 5
+    # as INCLUSION text with the exclusion side EMPTY, so every exclusion
+    # criterion in it was presented to the model as something the patient must
+    # MEET. The admission pass cut that population from 746 trials to 213 and
+    # deliberately left the remainder, and nothing downstream could say how
+    # many of them a given campaign actually evaluated -- the field existed
+    # only inside a Qdrant payload, which no query and no stored row could
+    # reach. THIS COLUMN IS THAT MEASUREMENT and nothing more: it does not
+    # change the split, it does not gate anything, and no code branches on it.
+    #
+    # WRITTEN ON EVERY TRIAL THAT REACHED STAGE 5, model-answered or
+    # pipeline-constructed alike, which is where its NULL convention departs
+    # from `emission_index`'s two rows below. Those are facts about WHERE THE
+    # MODEL PUT an entry, so a constructed entry has none and NULL says so.
+    # This is a fact about the TRIAL, which is equally true whether the model
+    # answered for it or not -- so `_unevaluable_entry` stamps it too, and NULL
+    # here means only "the trial dict carried no such field": a row written
+    # before this column existed, a trial indexed before the admission pass
+    # added the field, or a result dict built outside the pipeline.
+    #
+    # PLAIN TEXT WITH NO CHECK CONSTRAINT, on `matching_provider`'s and
+    # `ecog_selection`'s footing: the vocabulary is owned by a module this one
+    # may not import (`retrieval` sits above `storage` in the import graph and
+    # importing it here would put a scraper in every batch run's import graph),
+    # so a constraint would be a second copy of that vocabulary with nothing
+    # failing when the two disagree. tests/test_storage_criteria_split_column.py
+    # is what pins them to each other instead.
+    "criteria_split":          "TEXT",
     # WHERE IN THE MODEL'S ANSWER THIS VERDICT STOOD. Both are stamped by
     # oncotriage/agent/evaluation.py on the parsed response, before any entry is
     # dropped and before the node's match_score sort, and they are the only
@@ -2665,6 +2746,14 @@ def start_run_record(invocation_source, db_path=None, fingerprint=None,
     #           would silently miss it.
     values["resumed"] = None if resumed is None else int(bool(resumed))
 
+    # NULL AT OPEN, AND ONLY finalize_run_record EVER FILLS IT. The value is a
+    # statement about how the run ENDED, which nothing here can know. It is set
+    # explicitly rather than left out because RUN_COLUMNS is derived from
+    # RUN_COLUMN_ADDITIONS and the guard immediately below requires every
+    # declared column to have a value -- see its own note for why that guard
+    # exists at all.
+    values["note"] = None
+
     # EVERY DECLARED COLUMN HAS A VALUE, CHECKED BEFORE THE INSERT.
     #
     # `RUN_COLUMNS` is derived from `RUN_COLUMN_ADDITIONS`, so adding an entry
@@ -2715,7 +2804,53 @@ def start_run_record(invocation_source, db_path=None, fingerprint=None,
     return run_id
 
 
-def finalize_run_record(run_id, status, db_path=None):
+def _coerce_run_note(note, run_id):
+    """The text to store in ``runs.note``, or ``None`` to leave the column alone.
+
+    NEVER RAISES and never coerces. A note that is not a string is REFUSED --
+    counted under ``finalize:bad_note:{type}`` and dropped -- rather than passed
+    through ``str()``: an exception object, a dict or a ``None`` rendered as
+    text all produce a plausible sentence in a column whose only reader is a
+    human who will believe it. Refusing loses a note that was never usable;
+    coercing invents one.
+
+    ``bool`` IS NOT A STRING and needs no special case here, unlike every
+    integer column in this module -- ``isinstance(True, str)`` is False, so the
+    ordinary type test already rejects it.
+
+    An empty or whitespace-only note is ``None``: a column holding ``""`` says
+    nothing that NULL does not, and distinguishing them would give a reader a
+    third state to interpret for no gain. The note is stripped for the same
+    reason ``control.read_stop_message`` strips its own -- a file written with
+    `echo` carries a trailing newline that is not content.
+
+    THE CAP NAMES ITSELF IN THE STORED TEXT. A note cut at
+    ``RUN_NOTE_MAX_CHARS`` with no marker is a note whose ending the reader
+    invents; the marker is the same shape ``control.read_stop_message`` uses
+    and it is deliberately INSIDE the cap-plus-marker string rather than
+    replacing content beyond it, so the stored value is always a prefix of what
+    the caller meant plus a statement that it is one.
+    """
+    if note is None:
+        return None
+    if not isinstance(note, str):
+        RUN_RECORD_FAILURES[f"finalize:bad_note:{type(note).__name__}"] += 1
+        log.warning("a run note that was not a string was refused rather than "
+                    "coerced; runs.note is left as it was",
+                    event="run_record_note_refused",
+                    inference_run_id=run_id,
+                    error_type=type(note).__name__)
+        return None
+    text = note.strip()
+    if not text:
+        return None
+    if len(text) > RUN_NOTE_MAX_CHARS:
+        return (text[:RUN_NOTE_MAX_CHARS]
+                + f"... [truncated at {RUN_NOTE_MAX_CHARS} characters]")
+    return text
+
+
+def finalize_run_record(run_id, status, db_path=None, note=None):
     """Stamp ``finished_at`` and ``status`` on a run row. NEVER RAISES.
 
     Args:
@@ -2734,6 +2869,26 @@ def finalize_run_record(run_id, status, db_path=None):
         db_path: the database the run row is in. Must resolve to the same file
                  ``start_run_record`` wrote to; ``None`` means the configured
                  production database.
+        note:    free text explaining how the run ended, or ``None``.
+
+                 ``None`` LEAVES THE COLUMN ALONE rather than writing NULL over
+                 it, and the difference is not academic: this function is public
+                 and nothing stops a caller finalizing twice, so an
+                 unconditional ``note = ?`` would let a second call with no note
+                 erase the first call's. The SET list is assembled from what was
+                 actually supplied.
+
+                 Anything that is not a string is REFUSED and counted rather
+                 than coerced -- ``str(exc)`` on an exception object, or
+                 ``str(None)`` giving the four characters "None", would put a
+                 plausible-looking sentence in a column a human reads and
+                 believes. An empty or whitespace-only note is treated as no
+                 note, because a column holding "" says nothing that NULL does
+                 not already say.
+
+                 Capped at ``RUN_NOTE_MAX_CHARS`` with the truncation NAMED in
+                 the stored text, on ``control.read_stop_message``'s footing: a
+                 silently cut note is a note whose ending a reader invents.
 
     Returns:
         True if exactly one row was updated. False on every failure, so a caller
@@ -2748,10 +2903,21 @@ def finalize_run_record(run_id, status, db_path=None):
     and ``RUN_RECORD_FAILURES``.
 
     "NEVER RAISES" MEANS WHAT IT MEANS EVERYWHERE ELSE IN THIS MODULE:
-    ``except Exception``, so ``KeyboardInterrupt`` and ``MemoryError`` -- which
-    are not ``Exception`` subclasses -- still escape, exactly as they escape
-    ``_write_inference_row``. A finalizer that swallowed a Ctrl-C would leave an
-    operator holding a key down against a process that will not stop.
+    ``except Exception``, so the three exceptions that are NOT ``Exception``
+    subclasses -- ``KeyboardInterrupt``, ``SystemExit`` and ``GeneratorExit`` --
+    still escape, exactly as they escape ``_write_inference_row``. A finalizer
+    that swallowed a Ctrl-C would leave an operator holding a key down against a
+    process that will not stop.
+
+    THIS SENTENCE NAMED ``MemoryError`` AND WAS WRONG.
+    ``issubclass(MemoryError, Exception)`` is True, so the handler below CATCHES
+    it: a finalize that runs out of memory is counted under
+    ``finalize:MemoryError`` and returns False like any other failure, and it
+    does NOT propagate. ``flush_run_metrics`` measured that and recorded it as a
+    finding against this docstring rather than editing a function it did not
+    otherwise touch; this is that finding closed. The correction matters because
+    a reader deciding whether a caller must handle an escaping MemoryError from
+    this line would have written a handler that can never run.
 
     THE ROW COUNT IS CHECKED. ``UPDATE ... WHERE id = ?`` against an id that is
     not there succeeds and updates nothing; SQLite reports no error for it. A
@@ -2787,13 +2953,25 @@ def finalize_run_record(run_id, status, db_path=None):
 
         db_path = resolve_inference_db_path(db_path)
 
+        # THE SET LIST IS ASSEMBLED, NOT BRANCHED ON. Two hand-written UPDATE
+        # strings would be two statements to keep in step; this is one, and the
+        # column list and the bind tuple are built side by side so they cannot
+        # disagree about their length the way a positional VALUES tuple can.
+        _assignments = ["finished_at = ?", "status = ?"]
+        _bind = [datetime.now().isoformat(), status]
+        _stored_note = _coerce_run_note(note, run_id)
+        if _stored_note is not None:
+            _assignments.append("note = ?")
+            _bind.append(_stored_note)
+        _bind.append(run_id)
+
         with _WRITE_LOCK:
             conn = _open_connection(db_path)
             try:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "UPDATE runs SET finished_at = ?, status = ? WHERE id = ?",
-                    (datetime.now().isoformat(), status, run_id))
+                    f"UPDATE runs SET {', '.join(_assignments)} WHERE id = ?",
+                    tuple(_bind))
                 updated = cursor.rowcount
                 conn.commit()
             finally:
@@ -2810,8 +2988,15 @@ def finalize_run_record(run_id, status, db_path=None):
             return False
 
         console.out(f"[Run] Closed run {run_id}: {status}")
+        # THE NOTE'S PRESENCE IS LOGGED AND ITS TEXT IS NOT. It is free text an
+        # operator typed at a terminal, so it belongs in the durable table a
+        # human reads and not in a correlation-keyed structured record -- the
+        # same line oncotriage/observability.py's field allowlist draws, drawn
+        # here at the call site because `count` is on that allowlist and a
+        # `note` field would not be.
         log.info("run record closed", event="run_record_closed",
-                 inference_run_id=run_id, status=status, db_path=str(db_path))
+                 inference_run_id=run_id, status=status, db_path=str(db_path),
+                 count=len(_stored_note) if _stored_note else 0)
         return True
 
     except Exception as exc:                                   # noqa: BLE001
@@ -2980,13 +3165,19 @@ def flush_run_metrics(run_id, totals, counters_registered, db_path=None):
     ``finalize_run_record``. A flush that swallowed a Ctrl-C would leave an
     operator holding a key down against a run that will not stop.
 
-    NOTE THE CORRECTION, because the sentence above is copied from
-    ``finalize_run_record``'s docstring and that one names ``MemoryError`` as a
-    thing that escapes. It does not: ``issubclass(MemoryError, Exception)`` is
-    True, so this handler catches it. Measured rather than repeated. The
-    neighbouring docstring is a REPORTED FINDING of this pass and is left as
-    written, because correcting a claim in a function this pass does not
-    otherwise touch is a separate edit.
+    NOTE THE CORRECTION. This sentence was copied from
+    ``finalize_run_record``'s docstring, which named ``MemoryError`` as a thing
+    that escapes. It does not: ``issubclass(MemoryError, Exception)`` is True,
+    so this handler catches it. Measured rather than repeated, and reported here
+    as a finding against four neighbouring docstrings rather than fixed, because
+    correcting a claim in functions this pass did not otherwise touch was a
+    separate edit.
+
+    THAT SEPARATE EDIT HAS SINCE HAPPENED and all four now name the three
+    ``BaseException``-only classes. This paragraph is kept as the record of
+    where the correction was first measured -- the finding was real, and the
+    sentence it corrected had been copied four times before anyone ran
+    ``issubclass``.
 
     PATH RESOLUTION IS INSIDE THE TRY, which is ``finalize_run_record``'s
     knowing deviation repeated here for its reason. Everywhere else in this
@@ -3258,10 +3449,18 @@ def log_inference(result: Dict, patient_data: Dict, db_path=None,
     # inside a finally block SWALLOWS any exception propagating out of the try
     # -- and one exception is meant to propagate from this function:
     # UnknownModelPricingError is raised above, so it never reaches here, but a
-    # KeyboardInterrupt or a MemoryError raised inside the write would be
+    # KeyboardInterrupt or a SystemExit raised inside the write would be
     # discarded by a `return` in the finally and the caller would be told the
     # write succeeded. It escapes the `with` above instead, releasing the lock
     # on the way, and this line is never reached.
+    #
+    # THIS COMMENT SAID "KeyboardInterrupt or a MemoryError" AND THE SECOND WAS
+    # WRONG. `issubclass(MemoryError, Exception)` is True, so the handlers
+    # inside _write_inference_row catch it and it never propagates to be
+    # discarded here. The three that are not Exception subclasses --
+    # KeyboardInterrupt, SystemExit, GeneratorExit -- are the ones this
+    # placement protects, and SystemExit is the one that actually reaches this
+    # module in production: it is what the entry point's SIGTERM handler raises.
     #
     # THE RETURN IS AN InferenceWriteResult, which IS db_path -- see that class
     # for why a str subclass rather than a tuple. `== db_path` and every other
@@ -3285,8 +3484,16 @@ def _write_inference_row_with_retry(result: Dict, patient_data: Dict, db_path,
 
     Returns a dict: ok, error, attempts, inference_id. RAISES NOTHING that
     ``_write_inference_row`` did not already raise, which is nothing except the
-    two that must escape (KeyboardInterrupt, MemoryError) -- so the contract
+    three that are not ``Exception`` subclasses and must escape
+    (``KeyboardInterrupt``, ``SystemExit``, ``GeneratorExit``) -- so the contract
     "a database fault does not kill the pipeline" is unchanged.
+
+    IT SAID "the two ... (KeyboardInterrupt, MemoryError)" AND MemoryError IS
+    NOT ONE OF THEM: ``issubclass(MemoryError, Exception)`` is True, so
+    ``_write_inference_row``'s handlers catch it, record it as a terminal (not
+    retryable) failure, and this function returns ``ok=False`` for it like any
+    other. A caller written against the old wording would have expected a
+    MemoryError to reach it and would never see one.
 
     Only the transient class is retried. ``_is_retryable`` is where that is
     decided and the block above it is why the migration race is excluded.
@@ -3366,10 +3573,17 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
     nothing at all, which is precisely the defect: the two handlers below print
     "non-critical" and the caller was told the same thing on both paths.
 
-    Raising is still confined to what raised before (nothing but
-    KeyboardInterrupt and MemoryError, which are not Exception subclasses and
-    are meant to escape), so the "a logging fault does not kill the pipeline"
-    contract is unchanged. The single caller,
+    Raising is still confined to what raised before -- nothing but the three
+    that are not ``Exception`` subclasses and are meant to escape:
+    ``KeyboardInterrupt``, ``SystemExit`` and ``GeneratorExit`` -- so the "a
+    logging fault does not kill the pipeline" contract is unchanged.
+
+    IT NAMED ``MemoryError`` AS ONE OF THEM AND THAT WAS WRONG.
+    ``issubclass(MemoryError, Exception)`` is True, so the two handlers below
+    catch it: an out-of-memory write is recorded as a terminal failure and the
+    outcome dict says so. What escapes is the BaseException-only set, and
+    ``SystemExit`` is the member that actually arrives here -- the batch
+    runner's SIGTERM handler raises it. The single caller,
     ``_write_inference_row_with_retry``, decides what to do with a failure.
 
     ONE CALL IS ONE TRANSACTION, which is what makes a retry safe. sqlite3's
@@ -3790,11 +4004,11 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                     trial_number, rerank_score, rerank_score_raw, mesh_boost, mesh_boost_tier,
                     match_score, eligible, assessment, criterion_details,
                     score_confirmed, score_denominator, criteria_not_applicable,
-                    hallucinated, emission_index, call_index,
+                    hallucinated, criteria_split, emission_index, call_index,
                     not_evaluable_reason, verdict_source,
                     verdict_original_label, verdict_original_type,
                     criterion_remaps
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 inference_id,
                 match.get("nct_id", ""),
@@ -3851,6 +4065,13 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 # 0 when Stage 5's out-of-set detector checked this row, NULL
                 # when it never ran. 1 is unreachable: see the migration note.
                 match.get("hallucinated"),
+                # NO DEFAULT, for the reason its column note gives: the value
+                # is copied through from the trial's own full_trial_json, so a
+                # missing key means the indexed trial carried no such field.
+                # A `, "unsplit"` or a `, ""` here would assert a split method
+                # for a trial nobody measured one for, which is exactly the
+                # reading this column exists to make possible.
+                match.get("criteria_split"),
                 # NO DEFAULT ON EITHER, which is the whole point. A pipeline-
                 # constructed entry carries an explicit None and an entry from a
                 # result dict built outside the pipeline carries no key at all;
@@ -3913,10 +4134,17 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
             conn.close()
 
     # RETURNED HERE, AFTER the finally and never inside it. A `return` inside a
-    # finally block swallows any exception propagating out of the try -- and two
-    # are meant to propagate (KeyboardInterrupt, MemoryError, neither an
-    # Exception subclass, so neither is caught above). Returning here leaves
+    # finally block swallows any exception propagating out of the try -- and
+    # three are meant to propagate: KeyboardInterrupt, SystemExit and
+    # GeneratorExit, the only exceptions that are not Exception subclasses and
+    # so the only ones the handlers above do not catch. Returning here leaves
     # them escaping exactly as they did before this pass.
+    #
+    # THE OLD WORDING SAID "two ... (KeyboardInterrupt, MemoryError)" AND WAS
+    # WRONG ABOUT THE SECOND. issubclass(MemoryError, Exception) is True, so an
+    # out-of-memory write is caught above and recorded as terminal. The
+    # placement is unchanged and is still correct; only the list of what it
+    # protects was.
     return outcome
 
 

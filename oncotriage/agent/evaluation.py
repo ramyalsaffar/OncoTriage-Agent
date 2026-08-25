@@ -1233,6 +1233,36 @@ class PerTrialParallelismError(RuntimeError):
     first request of the patient, where it costs nothing.
     """
 
+class PerTrialTrialCountError(RuntimeError):
+    """More trials reached per-trial Stage 5 than ``config`` permits per patient.
+
+    A ``RuntimeError`` SUBCLASS AND DELIBERATELY NOT A ``ValueError``, for
+    ``PerTrialParallelismError``'s reason immediately above: a stray
+    ``except ValueError`` around a Stage 5 call must not be able to eat it.
+
+    WHAT IT IS FOR. In per-trial mode the billed request count IS the number of
+    trials, and nothing downstream bounds it: the input packer is bypassed, the
+    reactive splitter's floor is one trial, and
+    ``MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS`` bounds how many are IN FLIGHT
+    rather than how many are SENT. A trial set that did not come through Stage
+    4's cost cap therefore costs N times the price with NOTHING RAISING -- every
+    request succeeds, every verdict is produced, and the only trace is the bill.
+    That is a failure this node cannot detect after the fact and can refuse
+    before it, so it refuses.
+
+    IT FIRES BEFORE THE WARMUP AND THEREFORE BEFORE ANY REQUEST, which is what
+    makes it free. ``assert_per_trial_provider_supported`` and the parallelism
+    bound are validated in the same place for the same reason.
+
+    IT IS NOT A CLAMP. Truncating the set to the ceiling would silently drop
+    trials a caller asked to have evaluated and publish a verdict list that is
+    a prefix of what was requested -- a partial answer wearing a complete one's
+    shape, which is the thing this pipeline's terminal nodes exist to avoid.
+    The caller's fix is to run the set through Stage 4, or to raise the cap
+    deliberately.
+    """
+
+
 # Finish reason the API returns when it stopped because it hit max_tokens.
 FINISH_REASON_LENGTH = "length"
 
@@ -2860,6 +2890,16 @@ def _unevaluable_entry(trial_obj: Dict, reason: str) -> Dict:
         "score_denominator": 0,
         "criteria_not_applicable": 0,
         "criteria": [],
+        # STAMPED HERE TOO, WHICH THE TWO PROVENANCE FIELDS BELOW ARE
+        # DELIBERATELY NOT. Those record where the MODEL put an entry, so a
+        # constructed one has no answer and None says so. This records how the
+        # INDEXER split the trial, which is equally true of a trial the model
+        # never answered for -- and a campaign counting its exposure to
+        # "unsplit" trials must count the ones that reached Stage 5 and came
+        # back unevaluable, since those are the trials whose criteria the model
+        # was handed. Omitting it here would under-report exactly the
+        # population most likely to be affected.
+        "criteria_split": trial.get("criteria_split"),
         # None, never 0: this entry was BUILT here and never stood in a model
         # response, so it has no emission position and no answering call. 0
         # would name the first entry of the first call, which is a real place
@@ -3788,6 +3828,32 @@ CLINICAL TRIALS:
             "MATCHING_PER_TRIAL_CALLS_ENABLED is True; it is "
             f"{_parallel_bound!r}. Use 1 for sequential "
             "per-trial calls, or set MATCHING_PER_TRIAL_CALLS_ENABLED = False.")
+    # THE TRIAL COUNT IS VALIDATED HERE, BESIDE THE OTHER TWO AND FOR THE SAME
+    # REASON: before the warmup, therefore before the first request of the
+    # patient, where a refusal costs nothing. In this mode the billed request
+    # count IS len(trials) and nothing below bounds it -- see
+    # PerTrialTrialCountError and config.MATCHING_MAX_TRIALS_PER_PATIENT.
+    #
+    # READ LIVE OFF `config` AND NOT THROUGH A from-IMPORT, exactly as the mode
+    # and the bound immediately above are, and for the reason written there: a
+    # constant that can move WITHIN a process (a probe, a test, an operator in a
+    # REPL) must not be reached through a name bound at import, or the guard and
+    # whatever else reads it would disagree about the same run.
+    #
+    # `>` AND NOT `>=`. Stage 4 emits AT MOST the cap, so a set of exactly the
+    # cap is the ordinary full-size patient and must pass.
+    if _per_trial_calls and len(trials) > config.MATCHING_MAX_TRIALS_PER_PATIENT:
+        raise PerTrialTrialCountError(
+            f"Stage 5 was handed {len(trials)} trials for one patient in "
+            f"per-trial call mode, and MATCHING_MAX_TRIALS_PER_PATIENT is "
+            f"{config.MATCHING_MAX_TRIALS_PER_PATIENT}. Per-trial mode issues "
+            f"one billed request per trial plus one warmup, so this would have "
+            f"cost {len(trials) + 1} requests for this patient and nothing "
+            f"below would have raised. A set larger than the ceiling did not "
+            f"come through node_rule_based_filter, which slices to "
+            f"MAX_TRIALS_FOR_EVALUATION -- run it through Stage 4, or raise "
+            f"MAX_TRIALS_FOR_EVALUATION deliberately (the ceiling is derived "
+            f"from it). No request was issued.")
 
     # ------------------------------------------------------------------
     # Packing: bound the INPUT before the output splitters see the batch
@@ -5891,6 +5957,19 @@ CLINICAL TRIALS:
             if trial_obj["trial"]["nct_id"] == nct_id:
                 eval_result["title"] = trial_obj["trial"].get("title", "No title")
                 eval_result["phase"] = trial_obj["trial"].get("phase", "N/A")
+                # HOW THE INDEXER SPLIT THIS TRIAL'S CRITERIA, carried the same
+                # way and for the same reason as the two above: it is a
+                # property of the trial that only the retrieval payload has,
+                # and the storage layer's insert reads it off `match`.
+                #
+                # NO DEFAULT, unlike title and phase. "No title" is a legible
+                # placeholder for a display string; there is no such value for
+                # a split method, and inventing one would put a measurement in
+                # the column for a trial nobody measured. None becomes NULL,
+                # which is what "this trial was indexed before the field
+                # existed" has to read as. See trial_matches.criteria_split.
+                eval_result["criteria_split"] = trial_obj["trial"].get(
+                    "criteria_split")
                 break
     
     # ── Inline parsing: normalize labels, consistency check, recompute score ──

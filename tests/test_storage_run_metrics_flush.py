@@ -1345,7 +1345,50 @@ for _fn_name in ("run_batch", "run_resample"):
     _all_calls = [n.lineno for n in ast.walk(_on_done)
                   if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
                   and n.func.id == "flush_health"]
-    check(f"{_fn_name}._on_done flushes exactly once", len(_all_calls), 1)
+    # THIS PINNED `len(_all_calls) == 1` AND THE PROPERTY IT NAMED WAS NEVER
+    # THE COUNT. The callback has THREE early returns above the tail flush --
+    # a cancelled future, a MatchingModelMismatchError, and anything else
+    # escaping the worker -- and a pass in which every patient took one of the
+    # two FAILING ones persisted nothing at all. Closing that adds a flush to
+    # each of those two handlers, so the count is 3 and the property is
+    # unchanged: every path on which the callback records an OUTCOME also
+    # records the health that outcome moved.
+    #
+    # DERIVED IN THREE PARTS RATHER THAN AS A NUMBER, so it survives the next
+    # handler without a retype and still fails if a flush moves into a branch:
+    # exactly ONE flush outside every handler (the tail, on the ordinary path),
+    # one in each of the two FAILING handlers, and NONE in the cancelled one --
+    # which is an argued exclusion (a cancelled patient was never attempted, so
+    # no counter moved, and flushing per queued patient at shutdown costs ~0.5
+    # ms each for a record that did not change) and not an omission.
+    _handler_flushes = {}
+    for _try in ast.walk(_on_done):
+        if not isinstance(_try, ast.Try):
+            continue
+        for _h in _try.handlers:
+            _name = ast.unparse(_h.type) if _h.type else "<bare>"
+            _handler_flushes[_name] = len(
+                [n for n in ast.walk(_h)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                 and n.func.id == "flush_health"])
+    _in_handlers = sum(_handler_flushes.values())
+
+    check(f"{_fn_name}._on_done flushes exactly once OUTSIDE every handler -- "
+          f"the tail flush on the ordinary path",
+          len(_all_calls) - _in_handlers, 1)
+    check(f"{_fn_name}._on_done's handler set is the three early returns "
+          f"(non-degeneracy: a walk that found none would make the line below "
+          f"pass for free)",
+          sorted(_handler_flushes),
+          ["CancelledError", "Exception", "MatchingModelMismatchError"])
+    check(f"{_fn_name}._on_done flushes in BOTH failing handlers, so a pass in "
+          f"which every patient died at future.result() still persists its "
+          f"health record",
+          (_handler_flushes.get("MatchingModelMismatchError"),
+           _handler_flushes.get("Exception")), (1, 1))
+    check(f"{_fn_name}._on_done does NOT flush in the CANCELLED handler, which "
+          f"is the argued exclusion",
+          _handler_flushes.get("CancelledError"), 0)
     check(f"{_fn_name}._on_done's flush is NOT inside any `if`, so an errored "
           f"patient is recorded too", _in_success, [])
     # CONTROL 10: the walk can see a call that IS inside an `if` -- so the

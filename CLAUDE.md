@@ -6395,16 +6395,31 @@ matrix (derived: the one repository file it reads,
 `oncotriage/agent/retrieval.py`, is written by neither of the suite's two
 writers).
 
-**THE DEPLOYED AIRFLOW DAG IS STALE AND WAS DELIBERATELY NOT REWRITTEN.**
-`{airflow_path}/dags/trial_refresh_weekly.py` is 14,480 bytes /
-`6e3c8fdaf44a…` and still carries the literal. The new text was proved valid
-without deploying it: generated into a temporary AIRFLOW_HOME and parsed by
-**Airflow 3.3.0's own `DagBag`** — `import_errors == {}`, `trial_refresh_weekly`
+**THE DEPLOYED AIRFLOW DAG WAS STALE AND THE REDEPLOY HAPPENED — CLOSED
+2026-08-20.** The alias-ownership pass proved the new text valid without
+deploying it: generated into a temporary AIRFLOW_HOME and parsed by **Airflow
+3.3.0's own `DagBag`** — `import_errors == {}`, `trial_refresh_weekly`
 registered, all three tasks (`scrape_and_save`, `rebuild_index`,
 `verify_index`), tags `['production','trialmatch']`, `NullTimetable`
 (`AIRFLOW_DAG_SCHEDULE = None`) — **15,049 bytes, sha256
 `32003ba494de1ef5…`**, a NEW sha256, which is pass 20f-3 item 8's acceptance
-criterion. Redeploying writes outside the repository and is one command:
+criterion. It then recorded the deployed file as still 14,480 bytes /
+`6e3c8fdaf44a…` and left the redeploy as a follow-up.
+
+**THAT FOLLOW-UP IS DONE AND THE NOTE WAS STALE IN THE WRONG DIRECTION** — it
+described the deployed file as carrying a defect that had already been removed
+from it, which is the reading that sends the next person to re-run a command
+that would change nothing. MEASURED 2026-08-25 on this machine, by reading the
+file rather than by re-running the generator:
+`{airflow_path}/dags/trial_refresh_weekly.py` is **15,049 bytes, sha256
+`32003ba494de1ef566534863cd107d736ec34b3e6d5b8f4efa6168d6c0213591`, mtime
+2026-08-20T21:43:35** — byte-identical to what the pass generated and verified,
+so the deployed DAG IS the DagBag-parsed one. The single remaining occurrence of
+`trial_criteria_` in it is on line 262, inside the COMMENT recording the fix
+("It used to read \"trial_criteria_\" + timestamp"); `staging_name` on line 269
+is `alias + "_" + timestamp`, which is the fix. The file lives outside the
+repository, so nothing in git records this and this paragraph is where it lands.
+The redeploy command, if the generator ever moves again, is unchanged:
 `rm "{airflow_path}/dags/trial_refresh_weekly.py" && python "23- Airflow DAG.py"`.
 
 **THREE STALE COUNTS IN THE RUN BLOCK WERE CORRECTED, EACH RE-MEASURED**:

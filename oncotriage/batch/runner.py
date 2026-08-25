@@ -1595,12 +1595,32 @@ def append_result(results_list: list, entry: dict) -> None:
 # and a knob whose other values silently reduce the fidelity of a crash record
 # is a way to lose the record.
 #
-# WHAT IT DOES NOT COVER, stated: _on_done's two early returns. A callback that
-# fails at future.result() -- a MatchingModelMismatchError, or any other
-# exception escaping the worker -- returns before this line, so a run in which
-# EVERY patient failed that way flushes nothing until main()'s final flush. That
-# final flush always runs, on the success path and on the crash path alike, so
-# nothing is lost; only the liveness of the record is.
+# THE TWO FAILING EARLY RETURNS ARE COVERED, AND ONE IS NOT. This note used to
+# record all three of _on_done's early returns as uncovered -- "only the
+# liveness of the record is [lost]" -- and that understated it, because the two
+# failing ones are exactly where the counters move. A campaign in which every
+# patient dies at future.result() (a MatchingModelMismatchError, or anything
+# else escaping the worker) can run for hours with an EMPTY health record while
+# REFUSALS_OBSERVED, MALFORMED_EVALUATION_ENTRIES and INFERENCE_WRITE_FAILURES
+# climb, and nothing outside the process can see any of it. That is the same
+# argument this block already makes against hanging the flush off
+# save_checkpoint(), one branch further out, and it applies unchanged: silence
+# looking like health, at precisely the moment it matters most. Both handlers
+# call this, after their counter and their console line.
+#
+# THE CancelledError BRANCH DELIBERATELY DOES NOT, and the reason is a cost
+# rather than a principle. A cancelled patient WAS NEVER ATTEMPTED: no counter
+# in the registry moved because of it, so its flush would write byte-identical
+# rows to the previous one. What it would add is one DELETE-plus-INSERT
+# transaction per QUEUED patient, serialized behind _WRITE_LOCK, at the one
+# moment the operator has asked the process to go away -- MEASURED on this
+# machine at 0.498 ms per flush, mean over 400, against a scratch database with
+# the run_id index present, so a 22,000-patient corpus interrupted at patient
+# 100 would spend ~10.9 seconds of shutdown re-writing a record that did not
+# change (and the two numbers above it agree: the health-persistence pass
+# measured 0.492 ms the same way). The
+# liveness that buys is bounded by the interval to main()'s final flush, which
+# on both the stop path and the crash path is the next few statements.
 
 
 def flush_health(run_id, snapshot=None, db_path=None) -> bool:
@@ -2077,11 +2097,13 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
             batch_error += 1
             progress.update(1)
             _drift.announce(e)
+            flush_health(run_id, db_path=db_path)
             return
         except Exception as e:
             batch_error += 1
             progress.update(1)
             console.out(f"  [CALLBACK ERROR] {type(e).__name__}: {e}")
+            flush_health(run_id, db_path=db_path)
             return
         
         append_result(results_list, entry)
@@ -2534,11 +2556,13 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
             resample_error += 1
             progress.update(1)
             _drift.announce(e)
+            flush_health(run_id, db_path=db_path)
             return
         except Exception as e:
             resample_error += 1
             progress.update(1)
             console.out(f"  [CALLBACK ERROR] {type(e).__name__}: {e}")
+            flush_health(run_id, db_path=db_path)
             return
 
         append_result(results_list, entry)
@@ -4025,10 +4049,32 @@ def main():
             # block above read the SAME name, which is what makes the promise
             # that block's own text makes ("run row FINISHED -- NOT STOPPED")
             # structural instead of a convention.
+            # THE OPERATOR'S NOTE, IF THERE IS ONE, ON THE ROW RATHER THAN
+            # ONLY ON THE TERMINAL. `STOP_SWITCH.message` is what
+            # `control.read_stop_message` read out of the sentinel; both
+            # console blocks above print it, and until this argument existed
+            # that was the only place it ever went. A campaign recorded STOPPED
+            # is precisely the row a reviewer asks "why" of, and the answer was
+            # being written to a terminal and discarded.
+            #
+            # WRITTEN ON BOTH STOP PATHS, NOT ONLY ON THE STOPPED ROW. A stop
+            # that landed after the cohort was covered leaves the row FINISHED
+            # -- see the block above for why -- and the note explaining why an
+            # operator asked is exactly as worth keeping there. So the test is
+            # `STOP_SWITCH.requested` and not `_stopped_mid_cohort`, and the
+            # column's meaning is "the operator's stop note, if any" rather
+            # than "why this run stopped". A reader asking which of the two
+            # happened reads `status`, which is what says it.
+            #
+            # None WHEN THE SENTINEL WAS EMPTY, which is the documented gesture
+            # (`touch`) and therefore the common case. finalize_run_record
+            # leaves the column alone for a None rather than writing NULL over
+            # it; see its `note` argument.
             finalize_run_record(
                 _run_record_id,
                 _terminal_status,
                 db_path=_reconcile_db,
+                note=(STOP_SWITCH.message if STOP_SWITCH.requested else None),
             )
 
             return results_list

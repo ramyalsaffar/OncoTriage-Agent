@@ -29,7 +29,15 @@ WHAT THIS FILE HOLDS
        ``OperationalError`` still propagates.
     6. The REAL production schema, read out of the live database's
        ``sqlite_master`` over a read-only URI rather than retyped here, wipes
-       to three empty tables.
+       to empty tables -- and the EXPECTED TABLE LIST comes out of that same
+       read rather than being retyped either, so the section does not go red
+       the first time a writer migrates the production file.
+    6b. THE CONTROL FOR THAT. A database created by the project's own
+       ``initialize_database`` -- which is what the production file becomes on
+       the next run that opens it -- is cloned the same way. The derived
+       comparison passes on it; the three names this section used to carry do
+       NOT. Without this the fix is a claim about a future state nothing in
+       the file reaches.
 
 NO NETWORK, NO KEYS, NO SPEND, AND NOTHING IN THE PROJECT TREE IS WRITTEN.
 Every database below lives in a temporary directory. The production
@@ -291,26 +299,50 @@ print("=" * 70)
 print("Section 6: the real production schema wipes")
 print("=" * 70)
 
+# THE NAME COMES OUT OF THE SAME ROW AS THE SQL, AND THAT IS THE WHOLE FIX.
+# The expected list was three names RETYPED here -- "drift_metrics",
+# "inferences", "trial_matches" -- while the clone is built from whatever
+# `sqlite_master` hands back. `initialize_database` creates FIVE tables
+# (`runs` and `run_metrics` joined at the run-identity and health-persistence
+# passes) and the production database has not been opened by a writer since,
+# so the two agreed only for as long as that stayed true. The first successful
+# campaign migrates the file, the clone gains two tables, and this section goes
+# red for a reason that is not a defect in the wipe -- the failure this file
+# exists to report -- while saying nothing about the wipe at all.
+#
+# Selecting `name` beside `sql` is one line from the read that was already
+# here, and it makes both sides of the comparison move together. What the check
+# then asserts is narrower than it was and is still worth asserting: that every
+# CREATE statement executed and produced a table under the name the production
+# database carries it under. It is NOT a tautology -- a statement that failed,
+# or one that created a table under another name, fails it -- but it is no
+# longer a statement about WHICH tables production has, and the non-degeneracy
+# line above is what keeps it from passing over an empty read.
 _production = _paths.inferences_path
 _schema = []
+_production_tables = []
 if os.path.exists(_production):
     _conn = sqlite3.connect(f"file:{_production}?mode=ro", uri=True)
     try:
-        _schema = [row[0] for row in _conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' "
-            "AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL")]
+        for _name, _sql in _conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL"):
+            _production_tables.append(_name)
+            _schema.append(_sql)
     finally:
         _conn.close()
 
 check("the production schema was read and is non-degenerate",
       len(_schema) >= 3, True)
+check("...and every statement read came with the name it creates",
+      len(_production_tables), len(_schema))
 
 if _schema:
     _clone = _db("production_shape.db", *_schema)
     _clone_tables = [t for t in _tables(_clone) if not t.startswith("sqlite_")]
-    check("the clone carries the production tables",
-          sorted(_clone_tables), sorted(["drift_metrics", "inferences",
-                                         "trial_matches"]))
+    check("the clone carries the production tables, derived from the same "
+          "sqlite_master read rather than retyped",
+          sorted(_clone_tables), sorted(_production_tables))
     _type6, _message6 = raises(lambda: empty_database(_clone, True))
     check("the production shape wipes without raising",
           (_type6, _message6), (None, ""))
@@ -322,6 +354,69 @@ if _schema:
 # read-only and never handed it to empty_database.
 check("the production database still exists and was never wiped by this file",
       os.path.exists(_production), True)
+
+
+# ===========================================================================
+# SECTION 6b: THE CONTROL FOR THE DERIVATION
+# ===========================================================================
+# Section 6 above compares the clone against the names the PRODUCTION file
+# happens to carry today, which is three. That is exactly the state the retyped
+# list agreed with, so on this machine the fix and the defect are
+# indistinguishable -- and a fix that cannot be told from what it replaced is
+# not evidence of anything.
+#
+# THE SHAPE THE PRODUCTION FILE BECOMES is built here instead, by the project's
+# own `initialize_database`, and put through the identical clone-and-compare.
+# The derived expectation holds on it; the three names section 6 used to carry
+# do not. The migration is additive and presence-driven, so this IS what the
+# next run that opens the production database leaves behind.
+#
+# It is a SCRATCH database in the temp directory. `initialize_database` takes
+# its path as an argument, and nothing here resolves the production one.
+
+from oncotriage.storage.database_logger import initialize_database  # noqa: E402
+
+_MIGRATED = os.path.join(_TMP, "migrated_shape.db")
+_stdout = sys.stdout
+try:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    initialize_database(_MIGRATED)
+finally:
+    sys.stdout.close()
+    sys.stdout = _stdout
+
+_conn = sqlite3.connect(f"file:{_MIGRATED}?mode=ro", uri=True)
+try:
+    _migrated_pairs = list(_conn.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type='table' "
+        "AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL"))
+finally:
+    _conn.close()
+
+_migrated_names = [n for n, _ in _migrated_pairs]
+_RETIRED_THREE = ["drift_metrics", "inferences", "trial_matches"]
+
+check("a migrated database carries MORE than the three names this section "
+      "used to retype (non-degeneracy: with three the control cannot "
+      "discriminate)",
+      len(_migrated_names) > len(_RETIRED_THREE), True)
+
+_migrated_clone = _db("migrated_clone.db", *[s for _, s in _migrated_pairs])
+_migrated_clone_tables = [t for t in _tables(_migrated_clone)
+                          if not t.startswith("sqlite_")]
+
+check("the DERIVED expectation holds against the migrated shape",
+      sorted(_migrated_clone_tables), sorted(_migrated_names))
+check("CONTROL: the RETYPED three-name expectation does NOT",
+      sorted(_migrated_clone_tables) == sorted(_RETIRED_THREE), False)
+
+_type6b, _message6b = raises(lambda: empty_database(_migrated_clone, True))
+check("the migrated shape wipes without raising", (_type6b, _message6b),
+      (None, ""))
+check("...and every table survives with zero rows",
+      sorted((t, _count(_migrated_clone, t))
+             for t in _migrated_clone_tables),
+      sorted((t, 0) for t in _migrated_clone_tables))
 
 
 shutil.rmtree(_TMP, ignore_errors=True)

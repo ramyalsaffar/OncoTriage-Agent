@@ -650,9 +650,24 @@ check("...and the de-duplication is really doing work here (non-degeneracy: "
       "cannot distinguish them)",
       sorted(set(_dl.RUN_FINGERPRINT_COLUMNS) & set(_dl.RUN_COLUMN_ADDITIONS)),
       ["matching_call_mode"])
-check("...and the overlapping column sits at the END, where ALTER TABLE "
-      "appends it, rather than at its stamp position",
-      _dl.RUN_COLUMNS[-1], "matching_call_mode")
+# DERIVED, NOT `RUN_COLUMNS[-1] == "matching_call_mode"`. That form pinned the
+# overlapping column to the LAST position, which is only where ALTER TABLE puts
+# it for as long as it is the last entry in RUN_COLUMN_ADDITIONS -- so the
+# first column added to that dict after it (era 5's `note`) made this check
+# fail while the property it names was still perfectly true. The property is
+# that the additions form the TAIL of the tuple in dict order, which is exactly
+# what puts a column named by BOTH sources where the ALTER put it rather than
+# at its stamp position; it holds for any number of additions.
+check("...and the additions form the TAIL of the tuple in dict order, so a "
+      "column named by both sources sits where ALTER TABLE appended it rather "
+      "than at its stamp position",
+      list(_dl.RUN_COLUMNS[-len(_dl.RUN_COLUMN_ADDITIONS):]),
+      list(_dl.RUN_COLUMN_ADDITIONS))
+check("...and the overlapping column really is inside that tail rather than "
+      "before it (non-degeneracy: the line above holds trivially if no "
+      "addition is also a stamp column)",
+      "matching_call_mode" in _dl.RUN_COLUMNS[-len(_dl.RUN_COLUMN_ADDITIONS):],
+      True)
 check("...and the additions really contribute (non-degeneracy: with an empty "
       "dict the line above is the pre-additions check wearing a new label)",
       len(_dl.RUN_COLUMN_ADDITIONS) > 0, True)

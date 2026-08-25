@@ -2094,6 +2094,42 @@ MATCHING_PER_TRIAL_CALLS_ENABLED = True
 MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS = 4
 
 
+# THE CEILING ON HOW MANY TRIALS ONE PATIENT MAY BE BILLED FOR.
+#
+# WHY A SECOND NAME FOR A NUMBER THAT ALREADY HAS ONE. It is DERIVED from
+# MAX_TRIALS_FOR_EVALUATION and is not a second copy of it -- the assignment is
+# the tie, so the two cannot drift and raising Stage 4's cap raises this
+# automatically, which is correct: this ceiling exists to catch a trial set that
+# BYPASSED that cap, not to second-guess its value. What the two names carry is
+# different. MAX_TRIALS_FOR_EVALUATION is Stage 4's cost cap and is applied with
+# a SLICE, in oncotriage/agent/filtering.py; it is a decision about which trials
+# are worth evaluating. This is Stage 5's REFUSAL ceiling, read in
+# oncotriage/agent/evaluation.py; it is a statement that a set larger than the
+# cap did not come through the stage that caps it, and the only safe thing to do
+# with it is to stop.
+#
+# WHAT IT CLOSES, AND ONLY THE PER-TRIAL ARM HAS IT. In per-trial mode the
+# request count IS len(trials): one billed call per trial, plus one warmup, all
+# dispatched before any of them is inspected. Nothing else in the pipeline
+# bounds that number -- the packer is bypassed, the reactive splitter's floor is
+# a single trial, and the parallelism bound limits how many are IN FLIGHT and
+# not how many are SENT. So a caller that reaches Stage 5 with an uncapped set
+# -- a direct graph.invoke with a seeded filtered_trials, a harness, or an edit
+# that drops filtering.py's slice -- pays N times the price and NOTHING RAISES:
+# every request succeeds, every verdict is produced, and the only trace is a
+# bill. The grouped arm is a different shape and is deliberately left alone:
+# its request count is bounded by MATCHING_MAX_INPUT_PACKED_CHUNKS whatever N
+# is, so it already has a request-count bound that this would duplicate. Its
+# INPUT tokens still scale with N; that is a real residual and it is named here
+# rather than half-closed.
+#
+# EQUALITY RATHER THAN HEADROOM. Stage 4 emits at most MAX_TRIALS_FOR_EVALUATION
+# trials, so `len(trials) > this` cannot fire for a set that came through it and
+# no margin is needed. A multiplier would be a magic number bounding nothing in
+# particular.
+MATCHING_MAX_TRIALS_PER_PATIENT = MAX_TRIALS_FOR_EVALUATION
+
+
 # ---------------------------------------------------------------------------
 # The per-trial cache warmup
 # ---------------------------------------------------------------------------

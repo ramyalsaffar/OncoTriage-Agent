@@ -982,6 +982,45 @@ BUCKETS = {
     "test_storage_wipe_all_tables.py": (
         _E, "the production inferences.db (it reads its real schema)",
         "'the production schema was read and is non-degenerate' failed"),
+
+    # ── The pre-campaign fixes pass ──────────────────────────────────────
+    "test_escape_contract_claims.py": (
+        _A, None,
+        "ran green in ~0.6s, 21 checks, against ONLY the directory skeleton: "
+        "it reads package source as TEXT and imports nothing whose docstrings "
+        "it scans, so it needs no corpus, no database and no keys. Every "
+        "claim in the package that something escapes `except Exception` is "
+        "checked against a set walked out of `builtins`, with the six "
+        "pre-correction sentences planted as controls."),
+    "test_storage_criteria_split_and_run_note.py": (
+        _A, None,
+        "ran green in ~1.5s, 53 checks, against ONLY the directory skeleton: "
+        "every database is a scratch file inside a tempfile.mkdtemp and "
+        "paths._RESOLVED is seeded so nothing can resolve to the production "
+        "tree. The two era-5 columns are round-tripped through the real "
+        "log_inference and the real finalize_run_record."),
+    "test_runner_health_flush_on_failure.py": (
+        _A, None,
+        "ran green in ~2s, 25 checks, against ONLY the directory skeleton: "
+        "process_patient and save_checkpoint are stand-ins and THE GRAPH IS "
+        "NEVER INVOKED, so no billed call is reachable; save_checkpoint is a "
+        "stand-in because the real one resolves run_fingerprint.current(), "
+        "which probes the index over the wire."),
+    "test_agent_per_trial_trial_cap.py": (
+        _A, None,
+        "ran green in ~2s, 30 checks, against ONLY the directory skeleton: "
+        "every response is a literal served by a stub installed through "
+        "oncotriage/agent/deps.py, and the refused arm issues zero requests, "
+        "which is the assertion."),
+    "test_fixture_replay_load_failures.py": (
+        _E, "the twelve characterization fixtures, which live outside the "
+            "repository and are not in git",
+        "fixture_root() resolves {main}/09- Testing/Characterization "
+        "Fixtures/ and the file copies real fixtures out of it; on a skeleton "
+        "'the production fixture directory has fixtures to copy' fails. It "
+        "needs NO network even so: every copied fixture is made unreadable, so "
+        "the real fixture_replay.py returns at 'No fixture could be loaded' "
+        "ABOVE the dependency-seam probe and the pinned-collection gate."),
     "test_storage_run_metrics_flush.py": (
         _A, None,
         "ran green in ~10s, 109 checks, against ONLY the directory skeleton: "

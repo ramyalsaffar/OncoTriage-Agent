@@ -930,9 +930,41 @@ def main() -> int:
     for path in fixture_paths:
         try:
             fixtures.append(load_fixture(path))
-        except (ValueError, json.JSONDecodeError) as exc:
+        # ── WHAT A FIXTURE FILE CAN FAIL AT, AND WHY OSError IS ONE OF THEM ──
+        #
+        # `load_fixture` does three things and each has its own failure class:
+        # it OPENS the file, it DECOMPRESSES it, and it checks the schema
+        # version it finds inside.
+        #
+        #   OSError     the open or the decompression. A fixture whose mode is
+        #               000, one on an unreadable volume, one truncated
+        #               mid-stream, one that is not gzip at all --
+        #               `gzip.BadGzipFile` and `EOFError` from a truncated
+        #               member both arrive as OSError subclasses, and
+        #               PermissionError and IsADirectoryError are OSErrors too.
+        #   ValueError  the version gate's own refusal, and the JSON parse.
+        #               `json.JSONDecodeError` IS a ValueError subclass, so it
+        #               no longer needs naming beside it -- and naming it
+        #               separately was what made the tuple look complete while
+        #               the whole OPEN half of the function was uncovered.
+        #
+        # IT WAS `(ValueError, json.JSONDecodeError)`, WHICH IS ONE CLASS
+        # WEARING TWO NAMES. So a single unreadable file in the fixture
+        # directory took the twelve-fixture gate down with a traceback, before
+        # any fixture was diffed and instead of the per-file `LOAD FAILED` line
+        # and exit 2 that the branch one line down already exists to produce --
+        # the loudest possible failure for the most housekeeping-shaped cause,
+        # and one that says nothing about whether the pipeline changed.
+        #
+        # THE TWO CODES STAY DIFFERENT, which is the point of routing this here
+        # rather than letting it escape: exit 1 means the pipeline no longer
+        # does what it did, and exit 2 means a file in the directory could not
+        # be read and NOTHING replayed differently. Those have different owners
+        # and different fixes; see the block at the end of this function.
+        except (OSError, ValueError) as exc:
             load_failures += 1
-            console.out(f"  LOAD FAILED  {os.path.basename(path)}: {exc}")
+            console.out(f"  LOAD FAILED  {os.path.basename(path)}: "
+                        f"{type(exc).__name__}: {exc}")
 
     if args.only:
         fixtures = [f for f in fixtures if f["fixture_id"] in args.only]
