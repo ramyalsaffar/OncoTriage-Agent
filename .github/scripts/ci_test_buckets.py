@@ -104,6 +104,72 @@ _A = "A"; _B = "B"; _C = "C"; _D = "D"; _E = "E"
 
 BUCKETS = {
     # ---- A: verified green with only the directory skeleton ---------------
+    "test_ablation_latest_run_selection.py": (
+        _A, None,
+        "ran green in 1.5s, 45 checks, against ONLY the directory skeleton: "
+        "which ablation_runs row is 'the latest' for its configuration, now "
+        "one owner (_LATEST_RUN_PER_CONFIG_SQL, MAX(id)) interpolated by both "
+        "generate_summary and _summary_status_warning. It REPRODUCES the two "
+        "ways the pre-fix MAX(run_timestamp) picked the wrong row -- an exact "
+        "tie selecting two rows and pooling their results, and a DST fall-back "
+        "where naive local time is not monotone -- and then shows both fixed. "
+        "No network, no keys, NO SPEND, no live Qdrant, no model load, no "
+        "corpus, no git history: nothing calls the pipeline at all and every "
+        "row is an INSERT of literals. It EXECS NOTHING -- every control is a "
+        "different SQL STRING handed to the same sqlite connection, which is "
+        "the natural control for a defect that IS a SQL string. NOT in the "
+        "collision matrix: every database is inside a tempfile.mkdtemp it "
+        "removes and asserts gone, paths._RESOLVED is seeded so even the "
+        "DEFAULT path cannot reach production, and the one repository file it "
+        "reads (oncotriage/ablation/study.py) is written by neither of the "
+        "suite's two writers and is sha256-compared at the end"),
+    "test_compose_shutdown_grace.py": (
+        _A, None,
+        "ran green in 0.7s, 17 checks, against ONLY the directory skeleton: "
+        "docker-compose.yml's stop_grace_period is >= "
+        "MATCHING_REQUEST_TIMEOUT_SECONDS x (1 + OPENAI_SDK_MAX_RETRIES) plus "
+        "a named, uncalibrated margin -- an INEQUALITY, never == 620, so a "
+        "legitimate timeout change moves it instead of failing it. It also "
+        "pins that the grace sits on the fastapi service and that the "
+        "per-trial arm's four-round worst case is a KNOWN, DOCUMENTED "
+        "shortfall rather than something this file quietly reports as fine. "
+        "NO DOCKER DAEMON: it starts no container and runs no compose command; "
+        "the YAML is read as TEXT and COMMENT-STRIPPED, on the Docker pass's "
+        "lesson that a file arguing about its own settings cannot be grepped "
+        "for them. No network, no keys, no spend, no live server, no live "
+        "Qdrant, no model load, no corpus, no database, no git history, no "
+        "subprocess, and it execs nothing. NOT in the collision matrix: it "
+        "writes nothing anywhere, and both files it reads (docker-compose.yml "
+        "and oncotriage/config.py) are sha256-compared in its section 5 -- "
+        "config.py IS written by tests/test_config_snapshot_date_rot.py, which "
+        "rewrites only the DATA_SNAPSHOT_DATE literal and touches no timeout "
+        "or retry constant"),
+    "test_serial_runner_lock.py": (
+        _A, None,
+        "ran green in 0.5s, 85 checks, against ONLY the directory skeleton: "
+        "tests/run_serial_tests.py's run lock, after the four hardenings "
+        "ported from oncotriage/batch/runner.py -- realpath keying, a 0700 "
+        "uid-keyed lock directory with O_NOFOLLOW and 0600, a UTC record with "
+        "an explicit marker, and a typed LockUnavailable refusal that is NOT "
+        "an OSError. IT IMPORTS NOTHING FROM oncotriage, which is its "
+        "subject's own recorded design. It DOES use REAL CONCURRENT "
+        "SUBPROCESSES and a REAL SYMLINKED CHECKOUT, because a lock held by "
+        "one process cannot be observed from inside it -- but it does NOT run "
+        "the real serial suite: it builds a throwaway checkout holding a "
+        "BYTE-IDENTICAL copy of the entry point (sha256-compared) beside five "
+        "one-line STUB scripts, so a BROKEN lock costs two stub runs rather "
+        "than two source rewrites. The holder PARKS ON A FILE rather than "
+        "sleeping, so the refusal is a statement about the lock and not about "
+        "this machine's scheduler. No network, no keys, no spend, no live "
+        "Qdrant, no model load, no corpus, no database, no git history. It "
+        "EXECS NOTHING: the module is loaded with spec_from_file_location, "
+        "which is an ordinary import of a NON-PACKAGE file this test names. "
+        "NOT in the collision matrix: everything it writes is inside a "
+        "tempfile.mkdtemp it removes and asserts gone (plus lock files under "
+        "this user's own 0700 lock directory, keyed on those temp paths and "
+        "cleaned up), and the one repository file it reads, "
+        "tests/run_serial_tests.py, is written by neither of the suite's two "
+        "writers and is sha256-compared at the end"),
     "test_agent_ablation_flag_passthrough.py": (
         _A, None, "ran green in 8.3s; registries and clients replaced through deps"),
     "test_agent_bedrock_adapter.py": (

@@ -1434,7 +1434,33 @@ MLflow's KILLED at ``tracking.end_run`` -- "run killed by user", which is
 literally what a stop switch is -- and records the mapping at the call site.
 """
 
-RUN_RECORD_TERMINAL_STATUSES = (("FINISHED", "FAILED", "KILLED")
+RUN_RECORD_STATUS_FINISHED = "FINISHED"
+"""The campaign ran to the end and covered its cohort.
+
+NAMED, LIKE ITS TWO NEIGHBOURS, BECAUSE IT HAS CALLERS. ``RUNNING`` and
+``STOPPED`` were named from the start and these three were not, so
+``oncotriage/batch/runner.py`` wrote them out as bare literals -- eight of them,
+in three places, deriving the SAME verdict twice under a comment arguing that
+the two derivations must not disagree. A value with a name can be imported; a
+literal can only be retyped.
+"""
+
+RUN_RECORD_STATUS_FAILED = "FAILED"
+"""The campaign ran to the end and some of its patients errored.
+
+NOT ``KILLED``: every patient was attempted. See ``RUN_RECORD_STATUS_KILLED``.
+"""
+
+RUN_RECORD_STATUS_KILLED = "KILLED"
+"""The process did not get to the end -- an unhandled exception, a Ctrl-C, a SIGTERM.
+
+Distinct from ``FAILED`` because only this one has patients that were never
+attempted, and distinct from ``STOPPED`` because nobody asked for it.
+"""
+
+RUN_RECORD_TERMINAL_STATUSES = ((RUN_RECORD_STATUS_FINISHED,
+                                 RUN_RECORD_STATUS_FAILED,
+                                 RUN_RECORD_STATUS_KILLED)
                                 + RUN_RECORD_STATUSES_BEYOND_TRACKING)
 """How a run ENDED.
 
@@ -1450,9 +1476,20 @@ requires this tuple to equal ``tracking.RUN_STATUSES`` plus
 ``RUN_RECORD_STATUSES_BEYOND_TRACKING``, in that order. A test may import both
 because a test is not in the import graph either module ships.
 
-THE FIRST THREE ARE WRITTEN OUT RATHER THAN DERIVED, deliberately: they are the
-restated copy, and deriving them from anything in this module would make the
-round-trip check agree with itself by construction.
+THE FIRST THREE ARE THIS MODULE'S OWN LITERALS AND ARE NOT READ OUT OF
+``oncotriage.tracking``, deliberately: they are the restated copy, and deriving
+them FROM THE MODULE THEY ARE CHECKED AGAINST would make the round-trip check
+agree with itself by construction.
+
+THEY ARE NOW REACHED THROUGH THREE NAMES RATHER THAN TYPED INTO THIS TUPLE, and
+that does NOT weaken the check, which is worth stating because an earlier
+version of this paragraph forbade "deriving them from anything in this module"
+and would have read as forbidding it. ``RUN_RECORD_STATUS_FINISHED`` and its two
+neighbours are literals declared HERE; the comparison is still this module's
+independent text against ``tracking.RUN_STATUSES``'s independent text, and it
+still fails if either moves. What changed is only that a CALLER can now name a
+status instead of retyping it -- which is what ``oncotriage/batch/runner.py``
+needed and did not have.
 """
 
 RUN_RECORD_STATUSES = (RUN_RECORD_STATUS_RUNNING,) + RUN_RECORD_TERMINAL_STATUSES

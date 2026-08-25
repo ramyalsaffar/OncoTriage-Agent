@@ -1191,14 +1191,185 @@ else:
               _finalize_is_last_before_return(_cmain) == "finalize_run_record",
               False)
 
-    _statuses = sorted({a.value for f in _finals for a in f.args
-                        if isinstance(a, ast.Constant)})
-    check("...and every status it can write is a TERMINAL one",
+    # EVERY STATUS main() CAN WRITE, RESOLVED THROUGH THE NAMES IT NOW USES.
+    #
+    # THIS CHECK USED TO READ `ast.Constant` ONLY, AND THAT STOPPED BEING
+    # ENOUGH -- which is the check working rather than the check breaking.
+    # runner.py wrote its four terminal statuses out as bare string literals in
+    # three places, two of which derived the SAME verdict independently; they
+    # are `RUN_RECORD_STATUS_*` imported from the storage layer now, so a
+    # Constant-only walk finds nothing and this section would have passed
+    # VACUOUSLY over a main() that writes no status at all.
+    #
+    # A NAME IS RESOLVED AGAINST THE STORAGE MODULE, NOT AGAINST A TABLE HERE.
+    # `getattr(_dl, name)` is what makes "every status it can write is a
+    # TERMINAL one" a statement about the vocabulary's OWNER; a local mapping
+    # would be a third copy of the thing this pass removed two copies of.
+    _LOCAL_STATUS_EXPRS = {"_terminal_status"}
+
+    def _status_values(call):
+        """The status strings this finalize call can write, or a marker."""
+        out = []
+        for a in call.args[1:2]:                       # the positional `status`
+            if isinstance(a, ast.Constant):
+                out.append(a.value)
+            elif isinstance(a, ast.Name):
+                if a.id in _LOCAL_STATUS_EXPRS:
+                    # A local computed from the constants; its own arms are
+                    # checked separately below.
+                    out.append(f"<local {a.id}>")
+                else:
+                    out.append(getattr(_dl, a.id, f"<unresolved {a.id}>"))
+        return out
+
+    _statuses = sorted({s for f in _finals for s in _status_values(f)}, key=str)
+    check("...and every status it can write is a TERMINAL one, or the local "
+          "computed from them",
           [s for s in _statuses
-           if s not in _dl.RUN_RECORD_TERMINAL_STATUSES], [])
+           if s not in _dl.RUN_RECORD_TERMINAL_STATUSES
+           and not str(s).startswith("<local ")], [])
     check("...including KILLED, which is the crash path's own verdict and is "
           "NOT the same finding as FAILED",
-          "KILLED" in _statuses, True)
+          _dl.RUN_RECORD_STATUS_KILLED in _statuses, True)
+
+    # NON-DEGENERACY: the walk must actually have found statuses. Without this,
+    # a resolver that returned nothing for everything satisfies the filter above
+    # -- an empty list has no non-terminal member.
+    check("...and the status walk is not empty (non-degeneracy)",
+          len(_statuses) >= 2, True)
+
+    # ------------------------------------------------------------------
+    # F7: THE CONSOLE LINE AND THE ROW READ THE SAME LOCAL
+    # ------------------------------------------------------------------
+    #
+    # THE DEFECT THIS PINS. main() derived the run's terminal status TWICE: once
+    # for `finalize_run_record`, and once -- sixty lines earlier -- for the
+    # console block that PRINTS what the row will say. That block's own text is
+    # the promise ("run row FINISHED -- NOT STOPPED, because STOPPED means the
+    # campaign covers a PREFIX of the cohort"), so a comment argued that the two
+    # must agree while the code kept them in step by hand.
+    #
+    # THEY AGREED ONLY BY COINCIDENCE OF THE GUARD. The console copy sits under
+    # `if STOP_SWITCH.requested and not _stopped_mid_cohort:`, which collapses
+    # the STOPPED arm -- so the shorter two-way expression there was correct
+    # because of WHERE IT SAT rather than because of what it computed, and any
+    # edit to either branch had to be made twice or the console would state a
+    # status the row does not carry.
+    #
+    # WHAT IS ASSERTED IS THE SHARED NAME, not the shape of either expression.
+    _term_assigns = [n for n in ast.walk(_MAIN)
+                     if isinstance(n, ast.Assign)
+                     and any(isinstance(t, ast.Name)
+                             and t.id == "_terminal_status" for t in n.targets)]
+    check("main() derives the terminal status exactly ONCE",
+          len(_term_assigns), 1)
+
+    _term_names = sorted({n.id for a in _term_assigns for n in ast.walk(a)
+                          if isinstance(n, ast.Name)
+                          and n.id.startswith("RUN_RECORD_STATUS_")})
+    check("...from the named constants, not from literals",
+          _term_names, ["RUN_RECORD_STATUS_FAILED",
+                        "RUN_RECORD_STATUS_FINISHED",
+                        "RUN_RECORD_STATUS_STOPPED"])
+
+    _row_reads = [f for f in _finals
+                  if any(isinstance(a, ast.Name) and a.id == "_terminal_status"
+                         for a in f.args)]
+    check("the run row is finalized with that local", len(_row_reads), 1)
+
+    # THE CONSOLE READS IT TOO. The call is located by the text it prints, so
+    # this fails if the line is deleted as well as if it goes back to computing
+    # its own answer.
+    def _console_calls_mentioning(fragment):
+        found = []
+        for call in [n for n in ast.walk(_MAIN) if isinstance(n, ast.Call)]:
+            fn = call.func
+            if isinstance(fn, ast.Attribute) and fn.attr == "out":
+                if fragment in ast.unparse(call):
+                    found.append(call)
+        return found
+
+    _row_line = _console_calls_mentioning("run row        ")
+    check("the console prints a `run row` line", len(_row_line) >= 1, True)
+    _reads_local = [c for c in _row_line
+                    if any(isinstance(n, ast.Name)
+                           and n.id == "_terminal_status" for n in ast.walk(c))]
+    check("...and one of them reads the SAME local the row does",
+          len(_reads_local), 1)
+
+    # NO SECOND DERIVATION ANYWHERE IN main(). This is the check that would have
+    # caught the original defect: the console copy was an IfExp over
+    # `main_errors` yielding literal statuses, and it was not the one assignment
+    # above.
+    def _literal_status_ifexps(fn):
+        return [n for n in ast.walk(fn)
+                if isinstance(n, ast.IfExp)
+                and any(isinstance(x, ast.Name) and x.id == "main_errors"
+                        for x in ast.walk(n.test))
+                and any(isinstance(x, ast.Constant)
+                        and x.value in _dl.RUN_RECORD_TERMINAL_STATUSES
+                        for x in ast.walk(n))]
+
+    check("main() contains no second, literal-valued derivation of the "
+          "terminal status", _literal_status_ifexps(_MAIN), [])
+
+    # CONTROL 5b: that walk must FIRE against a copy that has one. An `ast` walk
+    # over an in-memory copy; nothing is written and nothing is executed.
+    _C5B_OLD = "\n".join([
+        '                console.out("  run row        "',
+        "                            + _terminal_status",
+    ])
+    _C5B_NEW = "\n".join([
+        '                console.out("  run row        "',
+        '                            + ("FINISHED" if not main_errors '
+        'else "FAILED")',
+    ])
+    _c5b_src = _RUNNER_TXT.replace(_C5B_OLD, _C5B_NEW, 1)
+    if _c5b_src == _RUNNER_TXT:
+        fail("CONTROL 5b: the second-derivation plant matched something",
+             "the console `run row` anchor was not found in runner.py")
+    else:
+        _c5b_main = next(n for n in ast.parse(_c5b_src).body
+                         if isinstance(n, ast.FunctionDef) and n.name == "main")
+        check("CONTROL 5b: with the console line deriving its own answer "
+              "again, the check fires",
+              len(_literal_status_ifexps(_c5b_main)) >= 1, True)
+
+    # ------------------------------------------------------------------
+    # F7: THE MLflow TRANSLATION IS A DECLARED MAPPING, NOT A THIRD COPY
+    # ------------------------------------------------------------------
+    #
+    # `tracking.end_run`'s status was a THIRD independent derivation of the same
+    # three-way conditional, under a comment declaring a "divergence" from the
+    # row -- which made that divergence a property of two expressions that
+    # happened to differ in one arm rather than a mapping anybody had written
+    # down. It is `TRACKING_STATUS_FOR[_terminal_status]` now.
+    check("TRACKING_STATUS_FOR maps every terminal status and nothing else",
+          sorted(_runner.TRACKING_STATUS_FOR),
+          sorted(_dl.RUN_RECORD_TERMINAL_STATUSES))
+    check("...onto MLflow's vocabulary and nothing outside it",
+          [v for v in _runner.TRACKING_STATUS_FOR.values()
+           if v not in _tracking.RUN_STATUSES], [])
+    check("...with STOPPED -> KILLED, the one row that is not an identity",
+          _runner.TRACKING_STATUS_FOR[_dl.RUN_RECORD_STATUS_STOPPED], "KILLED")
+    check("...and it is NOT invertible, which is why the ROW and not the index "
+          "is the authority on how a campaign ended",
+          len(set(_runner.TRACKING_STATUS_FOR.values()))
+          < len(_runner.TRACKING_STATUS_FOR), True)
+
+    _end_run_calls = [n for n in ast.walk(_MAIN)
+                      if isinstance(n, ast.Call)
+                      and isinstance(n.func, ast.Attribute)
+                      and n.func.attr == "end_run"]
+    _translated = [c for c in _end_run_calls
+                   for kw in c.keywords
+                   if kw.arg == "status"
+                   and any(isinstance(n, ast.Subscript)
+                           and isinstance(n.value, ast.Name)
+                           and n.value.id == "TRACKING_STATUS_FOR"
+                           for n in ast.walk(kw.value))]
+    check("the success-path tracking status is TRANSLATED from the row's, not "
+          "re-derived", len(_translated), 1)
 
     # CONTROL 3: the forwarding check is not vacuous -- it must FAIL against a
     # copy with the keyword removed. An `ast` walk over an in-memory copy;
@@ -1228,20 +1399,28 @@ else:
     # finalizes are removed. Both, because there are two and the check asks
     # whether ANY handler finalizes -- a plant that removed one would leave the
     # property true and prove nothing.
+    # THE ANCHOR IS THE CALL AS IT IS NOW WRITTEN -- two lines, with the status
+    # as a NAMED CONSTANT rather than a literal. It was a one-line call with
+    # `"KILLED"` typed into it; when runner.py stopped writing bare literals
+    # this plant matched nothing and the control reported a working check as
+    # broken, which is exactly what the match-count assertion below exists to
+    # turn into a named failure instead of a silent one.
+    _KILL_CALL = "\n".join([
+        "            finalize_run_record(_run_record_id, "
+        "RUN_RECORD_STATUS_KILLED,",
+        "                                db_path=_reconcile_db)",
+    ])
     _planted2 = _txt.replace(
-        '            finalize_run_record(_run_record_id, "KILLED", '
-        'db_path=_reconcile_db)\n            tracking.end_run(status="FAILED")\n',
+        _KILL_CALL + '\n            tracking.end_run(status="FAILED")\n',
         '            tracking.end_run(status="FAILED")\n', 1)
     _planted2 = _planted2.replace(
-        '            finalize_run_record(_run_record_id, "KILLED", '
-        'db_path=_reconcile_db)\n            raise\n',
-        '            raise\n', 1)
+        _KILL_CALL + "\n            raise\n",
+        "            raise\n", 1)
     # THE PLANT ASSERTS ITS OWN MATCH COUNT. A plant that matched nothing
     # produces a "control" that agrees with the shipped code and reports a
     # working check as broken -- the failure mode this project has met before
     # and writes down each time.
-    _removed = _txt.count("finalize_run_record(_run_record_id, \"KILLED\"") \
-        - _planted2.count("finalize_run_record(_run_record_id, \"KILLED\"")
+    _removed = _txt.count(_KILL_CALL) - _planted2.count(_KILL_CALL)
     if _removed != 2:
         fail("CONTROL: the crash-path plant removed both handler calls",
              f"removed {_removed}, expected 2 -- an anchor was not found in "

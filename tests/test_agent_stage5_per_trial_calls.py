@@ -133,6 +133,7 @@ import json
 import re
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import time
@@ -383,7 +384,8 @@ class _Stub:
                  barrier_all=False, barrier_timeout=15.0, refuse_for=(),
                  bad_json_for=(), warmup_raise=None, warmup_model=None,
                  warmup_cached=None, warmup_prompt_tokens=None,
-                 truncate_for=(), interrupt_for=(), hold=None):
+                 truncate_for=(), interrupt_for=(), hold=None,
+                 model_for=None):
         self.requests = []          # arrival order
         self.events = []            # ("enter"|"exit", call_no, ticket)
         self.cached = cached
@@ -418,6 +420,12 @@ class _Stub:
         self.answer = answer or {}
         self.warmup_raise = warmup_raise
         self.warmup_model = warmup_model
+        # THE ANSWERING MODEL, PER TRIAL. `warmup_model` covers the warmup and
+        # nothing else, which separates "the wrong judge answered" from "a trial
+        # call went wrong" -- and leaves a third case uncovered: the wrong judge
+        # answering a trial call whose response the send loop never READS. That
+        # is section 5c's subject, and this is what lets it be driven.
+        self.model_for = dict(model_for or {})
         self.warmup_cached = warmup_cached
         self.warmup_prompt_tokens = warmup_prompt_tokens
         self.delay = delay
@@ -500,6 +508,10 @@ class _Stub:
             if set(ids) & self.refuse_for:
                 resp.choices[0].message.content = None
                 resp.choices[0].message.refusal = "I cannot help with that."
+            for _i in ids:
+                if _i in self.model_for:
+                    resp.model = self.model_for[_i]
+                    break
             return resp
         finally:
             with self._lock:
@@ -987,6 +999,150 @@ check("1m  ...non-degeneracy: the same walk finds the PROVIDER guard in both, "
        _guarded_functions(_rep_tree, "assert_provider_is_hookable")),
       (["install_recording_hooks"], ["install_replay_hooks"]))
 
+
+
+# ===========================================================================
+# SECTION 1c -- THE PARALLELISM BOUND IS VALIDATED AT IMPORT, NOT ONLY AT THE NODE
+# ===========================================================================
+#
+# THE DEFECT. The node tests `_parallel_bound < 1` and raises
+# `PerTrialParallelismError`, which is right and is not enough: a bare `<`
+# comparison is not a type check, and this number becomes
+# `ThreadPoolExecutor(max_workers=...)`. Every non-int the constant can
+# plausibly be mistyped as gets PAST that test, and each fails differently and
+# late:
+#
+#   * `True` -- `True < 1` is False, so the guard passes, and `max_workers=True`
+#     is `max_workers=1`. A campaign silently runs per-trial mode SEQUENTIALLY
+#     while every report says it ran at the configured concurrency. NOTHING
+#     RAISES, EVER. This is the one that matters.
+#   * `4.5` -- passes the guard, then `ThreadPoolExecutor` raises inside the
+#     node, per patient, AFTER the warmup has been issued and billed.
+#   * `"4"` -- `"4" < 1` raises `TypeError`, which is not
+#     `PerTrialParallelismError`: it leaves the node as an unrelated failure
+#     with no mention of the constant that caused it.
+#
+# `oncotriage/config.py` now carries the full isinstance / not-bool / >= 1
+# guard its warmup sibling already had, AT IMPORT AND UNCONDITIONALLY. The
+# node's own check STAYS -- the two ask different questions and both are kept:
+# this one asks "is this constant a usable integer at all", which is true or
+# false whether the mode is on or not; the node's asks "is this bound usable FOR
+# THE MODE ABOUT TO RUN" and names the mode, which is the operator's other way
+# out.
+#
+# IT IS DRIVEN IN A SUBPROCESS AGAINST A COPY, never by editing config.py in
+# place -- which is what keeps this file out of the collision matrix. The copy
+# is a package tree in a tempfile.mkdtemp() this section removes; the shipped
+# config.py is read and never written, and section 10 hashes it.
+
+section("SECTION 1c -- MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS is checked at import")
+
+_1c_TMP = tempfile.mkdtemp(prefix="per-trial-bound-")
+_1c_PKG_SRC = os.path.dirname(os.path.dirname(_EVALUATION_PATH))
+_1c_PKG = os.path.join(_1c_TMP, "oncotriage")
+shutil.copytree(_1c_PKG_SRC, _1c_PKG,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+_1c_CONFIG = os.path.join(_1c_PKG, "config.py")
+_1c_CONFIG_TEXT = open(_1c_CONFIG, encoding="utf-8").read()
+_1c_ANCHOR = "MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS = 4"
+
+
+def _import_config_with(value_literal):
+    """Import a COPY of config.py with the bound set to `value_literal`.
+
+    Returns ``("ok", <repr of the value config ended up with>)`` or
+    ``("raised", "<ExceptionType>: <message>")``.
+
+    A SUBPROCESS, because the guard runs AT IMPORT and this process has already
+    imported config -- re-importing it here would either be a no-op from
+    sys.modules or would leave a second, differently-configured copy behind for
+    every check after it.
+    """
+    if _1c_CONFIG_TEXT.count(_1c_ANCHOR) != 1:
+        return ("plant-failed",
+                f"the anchor appears {_1c_CONFIG_TEXT.count(_1c_ANCHOR)} times")
+    planted = _1c_CONFIG_TEXT.replace(
+        _1c_ANCHOR,
+        f"MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS = {value_literal}", 1)
+    open(_1c_CONFIG, "w", encoding="utf-8").write(planted)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _1c_TMP
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["ONCOTRIAGE_DEFER_LOCAL_MODELS"] = "1"
+    proc = subprocess.run(
+        [sys.executable, "-c",
+         "import os, sys\n"
+         "from oncotriage import config\n"
+         "assert os.path.realpath(config.__file__).startswith("
+         "  os.path.realpath(sys.argv[1])), config.__file__\n"
+         "print('OK', repr(config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS))",
+         _1c_TMP],
+        capture_output=True, text=True, env=env, cwd=_1c_TMP)
+    if proc.returncode == 0:
+        return ("ok", proc.stdout.strip().split(" ", 1)[-1])
+    tail = [ln for ln in proc.stderr.strip().splitlines() if ln.strip()]
+    return ("raised", tail[-1] if tail else "<no message>")
+
+
+# THE COPY IS WHAT IMPORTS -- asserted inside the subprocess above, and proved
+# here by importing it UNCHANGED first. Without this, every "raised" result
+# below could be a broken copy rather than the guard.
+_1c_baseline = _import_config_with("4")
+check("1c(a) the copied config imports unchanged and reports the shipped value "
+      "(non-degeneracy: the COPY is what runs)", _1c_baseline, ("ok", "4"))
+
+for _label, _literal, _want in (
+        ("1c(b) 0 is refused", "0", "0"),
+        ("1c(c) a negative is refused", "-1", "-1"),
+        ("1c(d) True is refused -- it would silently mean max_workers=1",
+         "True", "True"),
+        ("1c(e) a float is refused -- ThreadPoolExecutor would raise per "
+         "patient, after the warmup was billed", "4.5", "4.5"),
+        ("1c(f) a string is refused -- the node's `< 1` would raise TypeError, "
+         "naming nothing", "'4'", "'4'"),
+):
+    _kind, _detail = _import_config_with(_literal)
+    check(_label, _kind, "raised")
+    check(f"       ...naming the constant and the offending value",
+          ("MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS" in _detail,
+           _want in _detail), (True, True))
+    check("       ...as a RuntimeError, not an assert (python -O deletes those)",
+          _detail.split(":")[0].strip().endswith("RuntimeError"), True)
+
+# 1 IS LEGAL AND MEANS SEQUENTIAL. Without this the guard could be `> 1` and
+# every check above would still pass, while the documented way to turn the
+# scheduling off without turning the mode off would refuse at import.
+check("1c(g) 1 is ACCEPTED -- it is the documented sequential setting",
+      _import_config_with("1"), ("ok", "1"))
+
+# THE SHIPPED FILE IS RESTORED IN THE COPY AND THE TEMP TREE IS REMOVED.
+open(_1c_CONFIG, "w", encoding="utf-8").write(_1c_CONFIG_TEXT)
+shutil.rmtree(_1c_TMP, ignore_errors=True)
+check("1c(h) the temp package tree is gone", os.path.exists(_1c_TMP), False)
+
+# AND THE NODE'S OWN CHECK IS STILL THERE. The import guard does not replace it:
+# a caller that sets the attribute AFTER import -- which `run_node` in this very
+# file does -- bypasses the import guard entirely, so the node's check is the
+# only thing standing between that caller and a bad bound.
+_1c_node_src = ast.parse(_EVAL_SRC)
+_1c_raises = [n for n in ast.walk(_1c_node_src)
+              if isinstance(n, ast.Raise) and isinstance(n.exc, ast.Call)
+              and isinstance(n.exc.func, ast.Name)
+              and n.exc.func.id == "PerTrialParallelismError"]
+check("1c(i) the node still raises PerTrialParallelismError for a bad bound",
+      len(_1c_raises), 1)
+# `run_node` returns `(result, stub)` and its own `drive()` has already turned
+# the raise into an `_Absent`, so the result is UNPACKED rather than tested as
+# one -- a check written against the tuple would be False for every input and
+# would have reported this working guard as broken.
+_1c_after, _ = run_node([trial(0)], per_trial=True, parallel=0)
+check("1c(j) ...and it FIRES: setting the bound to 0 AFTER import is refused "
+      "by the node, naming the mode",
+      isinstance(_1c_after, _Absent)
+      and "PerTrialParallelismError" in str(_1c_after), True)
+
+
+#------------------------------------------------------------------------------
 
 
 # ===========================================================================
@@ -2271,6 +2427,207 @@ check("5b(k) an abandoned call that RAISED is counted under its own key and "
         for k in _after5b if _after5b.get(k, 0) != _before5b.get(k, 0)},
        at(_R5k2, "llm_classifier_input_tokens")),
       ({"abandoned:RuntimeError": 1}, 5000))
+
+
+# ===========================================================================
+# SECTION 5c -- THE ANSWERING-MODEL CHECK REACHES THE UNCONSUMED PATH
+# ===========================================================================
+#
+# THE DEFECT. `MatchingModelMismatchError` exists so that a campaign cannot be
+# run half on one judge and half on another: the model that ANSWERS is compared
+# against the one that was requested, at the first response that disagrees,
+# before any verdict from it reaches a result dict. There are THREE places a
+# response's `model` field is folded into `model_answered` -- the warmup, the
+# send loop, and `_account_unconsumed` -- and only the first two checked it.
+#
+# WHY THE THIRD MATTERED, WHICH IS NOT OBVIOUS FROM ITS NAME. Its own docstring
+# used to argue that repeating the check would be wrong: this runs on a path
+# that is already failing and already has a diagnosis. True of the DIAGNOSIS,
+# and it overlooked what the function WRITES. `model_answered` is returned as
+# `matching_model` by all four of the failure returns that call this, and
+# `log_inference` STORES it and `get_model_cost` PRICES it -- so an unchecked
+# echo folded here became the stored identity of the judge, on exactly the rows
+# a reviewer reads when something went wrong.
+#
+# WHY RAISING IS THE RIGHT PRECEDENCE. The failures that call this are
+# RECOVERABLE: a refusal, a parse failure and a non-list body all return to
+# `route_after_llm_classifier`, which re-enters the node up to
+# MAX_LLM_CLASSIFIER_RETRIES times. A model mismatch is NOT -- every retry after
+# it spends more money on a judge nobody chose. Replacing a retryable diagnosis
+# with the terminal one is an upgrade in severity, and the original diagnosis is
+# not destroyed: three of the four callers invoke this from inside an `except`,
+# so the refusal or the JSONDecodeError travels as `__context__`.
+
+section("SECTION 5c -- a mismatched judge on an UNCONSUMED response")
+
+_5c_TRIALS = [trial(i) for i in range(4)]
+_5c_FIRST = _5c_TRIALS[0]["trial"]["nct_id"]
+_5c_LAST = _5c_TRIALS[3]["trial"]["nct_id"]
+_5c_WRONG = "gpt-4o-2024-08-06"
+
+check("5c(a) the wrong model is genuinely a different string from the one "
+      "requested (non-degeneracy)",
+      _5c_WRONG == config.matching_wire_model(), False)
+
+# THE FIRST TRIAL REFUSES, so the send loop ends the node at chunk 0 and chunks
+# 1..3 are left in `_prefetched`, already paid for and unread. The LAST of them
+# carries the wrong model -- a response the send loop provably never reads.
+_R5c, _S5c = run_node(_5c_TRIALS, per_trial=True, parallel=4,
+                      stub=_Stub(refuse_for=[_5c_FIRST],
+                                 model_for={_5c_LAST: _5c_WRONG}))
+
+check("5c(b) the node raises MatchingModelMismatchError from the unconsumed "
+      "fold", isinstance(_R5c, _Absent)
+      and "MatchingModelMismatchError" in str(_R5c), True)
+check("5c(c) ...and the message names BOTH strings, so the decision can be "
+      "made from the traceback alone",
+      (config.matching_wire_model() in str(_R5c), _5c_WRONG in str(_R5c)),
+      (True, True))
+
+# THE RESPONSE REALLY WAS UNCONSUMED. Without this, 5c(b) would also pass if the
+# send loop had somehow read the mismatched call itself -- which is the case the
+# OTHER two fold sites already cover, and would leave this section testing them.
+check("5c(d) the mismatched trial's request was issued (so its response was "
+      "paid for)",
+      _5c_LAST in {i for ids in _S5c.ids_by_call() for i in ids}, True)
+check("5c(e) ...and the refusal was on a DIFFERENT, earlier trial, so the send "
+      "loop returned before reaching it",
+      _5c_FIRST != _5c_LAST, True)
+
+# THE ORIGINAL DIAGNOSIS SURVIVES AS __context__. This is the concrete answer to
+# the paragraph the fix replaced: the named failure is not lost, it is the
+# second exception in the same report.
+# `run_node` goes through `drive()`, which converts a raise into a value -- so
+# the exception OBJECT is not reachable through it. This one scenario calls the
+# node directly, and does its own override bookkeeping in a `finally`, because
+# what it needs to read is `__context__` and only the live exception has it.
+def _raise_through(trials, stub):
+    """Run the node with no `drive()` in the way. Returns the exception."""
+    saved = (config.MATCHING_PER_TRIAL_CALLS_ENABLED,
+             config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS)
+    deps.set_override(deps.OPENAI_CLIENT, stub)
+    try:
+        config.MATCHING_PER_TRIAL_CALLS_ENABLED = True
+        config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS = 4
+        node_llm_classifier_evaluation({
+            "patient_data": PATIENT, "filtered_trials": trials,
+            "llm_classifier_retries": 0, "mesh_filter_applied": True,
+            "mesh_filter_skip_reason": "applied", "stage_timings": {},
+        })
+        return None
+    except BaseException as exc:                               # noqa: BLE001
+        return exc
+    finally:
+        (config.MATCHING_PER_TRIAL_CALLS_ENABLED,
+         config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS) = saved
+        deps.clear_override(deps.OPENAI_CLIENT)
+
+
+_5c_exc = _raise_through(_5c_TRIALS,
+                         _Stub(refuse_for=[_5c_FIRST],
+                               model_for={_5c_LAST: _5c_WRONG}))
+check("5c(f) the raise really is MatchingModelMismatchError",
+      type(_5c_exc).__name__, MatchingModelMismatchError.__name__)
+
+# WHICH CALLERS CHAIN, MEASURED IN BOTH DIRECTIONS.
+#
+# THE FIRST VERSION OF THIS CHECK ASSERTED THAT THE REFUSAL PATH CHAINS, ON A
+# DOCSTRING THAT SAID "three of the four callers invoke this from inside an
+# `except`". BOTH WERE WRONG, and the test is what found it: the count is TWO of
+# four, and the refusal is not one of them. `_account_unconsumed` is called from
+# an `except` on the API-error and JSON-parse paths, and from an ordinary `if`
+# on the refusal and non-list paths -- where the response was well formed, no
+# exception is live, and there is nothing to chain.
+#
+# BOTH ARMS ARE ASSERTED so the asymmetry is a measurement rather than a claim,
+# and so that a future edit which moved a branch into or out of a handler fails
+# here instead of quietly changing what an operator sees in a traceback.
+check("5c(g) the refusal path does NOT chain -- it is an ordinary `if` over a "
+      "well-formed response, so the mismatch is the only exception",
+      _5c_exc is not None and _5c_exc.__context__ is None, True)
+
+_5c_exc_parse = _raise_through(_5c_TRIALS,
+                               _Stub(bad_json_for=[_5c_FIRST],
+                                     model_for={_5c_LAST: _5c_WRONG}))
+check("5c(h) the JSON-parse path raises the mismatch too",
+      type(_5c_exc_parse).__name__, MatchingModelMismatchError.__name__)
+check("5c(i) ...and THAT one chains: it is called from inside an `except`, so "
+      "the parse failure travels as __context__ and the traceback prints both",
+      (_5c_exc_parse is not None
+       and type(_5c_exc_parse.__context__).__name__), "JSONDecodeError")
+
+# AND THE COUNT ITSELF, READ OFF THE SHIPPED SOURCE. Without this, 5c(g)/(i)
+# describe two paths and say nothing about the other two.
+def _unconsumed_call_sites(tree):
+    sites = {n.lineno for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+             and n.func.id == "_account_unconsumed"}
+    handled = {n.lineno for h in ast.walk(tree)
+               if isinstance(h, ast.ExceptHandler)
+               for n in ast.walk(h)
+               if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+               and n.func.id == "_account_unconsumed"}
+    return len(sites), len(handled)
+
+
+_5c_total, _5c_handled = _unconsumed_call_sites(ast.parse(_EVAL_SRC))
+check("5c(j) _account_unconsumed has four call sites, and exactly two of them "
+      "are inside an `except` -- the number the docstring states",
+      (_5c_total, _5c_handled), (4, 2))
+
+# --- AND THE ORDINARY PATH IS UNMOVED --------------------------------------
+#
+# NON-DEGENERACY FOR THE WHOLE SECTION. Every assertion above is satisfied by a
+# node that raises on EVERY per-trial run. The identical scenario with the model
+# left correct must complete, so the raise is about the mismatch and not about
+# the shape of the run.
+_R5c_ok, _S5c_ok = run_node(_5c_TRIALS, per_trial=True, parallel=4,
+                            stub=_Stub(refuse_for=[_5c_FIRST]))
+check("5c(k) with every echo correct, the SAME scenario returns the refusal "
+      "return it always did (non-degeneracy)",
+      (isinstance(_R5c_ok, _Absent), bool(at(_R5c_ok, "llm_classifier_refusal"))),
+      (False, True))
+check("5c(l) ...and its ledger still carries every call that was billed",
+      len(at(_R5c_ok, "llm_classifier_call_details")), 5)
+
+# --- THE STRUCTURAL HALF ---------------------------------------------------
+#
+# A DRIVEN CHECK CANNOT SEE A FOURTH FOLD SITE ADDED TOMORROW. This walks the
+# shipped source and requires every assignment to `model_answered` to be guarded
+# by a comparison against `config.matching_wire_model()` in the same function.
+
+def _model_answered_writers(tree):
+    """Functions that assign `model_answered`, and whether each checks first."""
+    out = {}
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        writes = [n for n in ast.walk(fn)
+                  if isinstance(n, ast.Assign)
+                  and any(isinstance(t, ast.Name) and t.id == "model_answered"
+                          for t in n.targets)]
+        if not writes:
+            continue
+        raises = any(
+            isinstance(n, ast.Raise) and isinstance(n.exc, ast.Call)
+            and isinstance(n.exc.func, ast.Name)
+            and n.exc.func.id == "MatchingModelMismatchError"
+            for n in ast.walk(fn))
+        out[fn.name] = raises
+    return out
+
+
+_5c_writers = _model_answered_writers(ast.parse(_EVAL_SRC))
+check("5c(m) every function that assigns model_answered also raises "
+      "MatchingModelMismatchError",
+      sorted(n for n, ok in _5c_writers.items() if not ok), [])
+check("5c(n) ...and there are three of them, so the walk is not empty "
+      "(non-degeneracy)", len(_5c_writers) >= 3, True)
+check("5c(o) ...including _account_unconsumed, which is the one that did not",
+      "_account_unconsumed" in _5c_writers, True)
+
+
+#------------------------------------------------------------------------------
 
 
 # ===========================================================================

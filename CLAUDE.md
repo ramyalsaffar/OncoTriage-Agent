@@ -700,7 +700,7 @@ python tests/test_storage_provenance_persistence.py                 # 126
 # alternative implementation written out for comparison, or an ast walk over a
 # parsed source file. Bucket A, ~12 s (section 7 drives MAX_WORKERS threads
 # through the flush behind a barrier while another inserts counter keys).
-python tests/test_storage_run_metrics_flush.py                      # 123
+python tests/test_storage_run_metrics_flush.py                      # 124 (was 123; the duplicated-derivation pass had to stop locating the KILLED crash handler by searching ast.dump for the string 'KILLED' -- runner.py names the constant now -- and added the non-degeneracy probe that the handler was found at all)
 
 # The run-identity pass. Same shape, same directory. No network, no keys, no
 # spend, no live Qdrant, no model load, no corpus, no git history, and NOT in
@@ -710,7 +710,7 @@ python tests/test_storage_run_metrics_flush.py                      # 123
 # neither of the suite's two writers. It EXECS NOTHING: every control is a
 # different INPUT to a pure function, a real failing condition created on disk,
 # or an ast walk over an in-memory copy. Bucket A, ~1.5 s.
-python tests/test_storage_run_identity.py                           # 142 (was 139; the stop-switch pass replaced the terminal-status EQUALITY check with the composition tracking.RUN_STATUSES + RUN_RECORD_STATUSES_BEYOND_TRACKING, which still fails on a status added to one side and named in neither)
+python tests/test_storage_run_identity.py                           # 155 (was 142; the duplicated-derivation pass added F7's checks -- one derivation of the terminal status, read by BOTH the row and the console line, and the declared MLflow mapping -- and had to widen the status walk past ast.Constant, which would otherwise have passed VACUOUSLY over a main() that writes no status at all. Before that 139; the stop-switch pass replaced the terminal-status EQUALITY check with the composition tracking.RUN_STATUSES + RUN_RECORD_STATUSES_BEYOND_TRACKING, which still fails on a status added to one side and named in neither)
 
 # The schema-guards pass. Same shape, same directory. No network, no keys, no
 # spend, no live Qdrant, no model load, no corpus, no git history, no live
@@ -843,7 +843,7 @@ python tests/test_agent_cross_encoder_sequence_limit.py             #  42
 # the suite's two writers and are sha256-compared at the end. It DOES exec:
 # twenty-four in-memory copies of agent/evaluation.py, one plant each, argued
 # at _EXEC_ALLOWLIST. Bucket A, ~4 s.
-python tests/test_agent_stage5_per_trial_calls.py                   # 283 (was 276; the operator-control pass rewrote 8b-r from a pinned limit to the grouped gate's contract and added c36. Before that 255; the pre-migration pass added section 8B over the Stage 5 shutdown flag and controls c32-c35. ~10 s: section 3d parks two workers for a bounded grace on each of its two arms)
+python tests/test_agent_stage5_per_trial_calls.py                   # 318 (was 283; the duplicated-derivation pass added section 1c over the import-time parallelism guard and section 5c over the answering-model check on the UNCONSUMED fold path. Before that 276; the operator-control pass rewrote 8b-r from a pinned limit to the grouped gate's contract and added c36. Before that 255; the pre-migration pass added section 8B over the Stage 5 shutdown flag and controls c32-c35. ~10 s: section 3d parks two workers for a bounded grace on each of its two arms)
 
 # The harness-budget pass. Same shape, same directory. No network, no keys, no
 # spend, NO LIVE SERVER and no live Qdrant -- it starts nothing and issues no
@@ -7694,6 +7694,286 @@ with a `SCHEMA_VERSION` bump and a paid recapture — the reason this pass pins
 instead of guessing. Until it lands, **the twelve fixtures characterize the
 grouped arm and say so on their face**, and a per-trial campaign's Stage 5
 behaviour is covered by `tests/test_agent_stage5_per_trial_calls.py` alone.
+
+### One owner per verdict, and the serial runner's lock caught up (the duplicated-derivation pass)
+
+**EIGHT FINDINGS FROM VERIFICATION ROUND FOUR, PLUS A PORT.** Every one is a
+fact stated twice — a SQL predicate, a status expression, a number, a docstring
+argument — and in each case nothing failed when the two copies disagreed. **No
+billed call was made**: `python fixture_replay.py` is **12/12 clean, exit 0,
+with no recapture**, and the production `inferences.db` AND
+`ablation_results.db` sha256 are unchanged, as are all twelve fixture files.
+
+**F5 + F8 — "THE LATEST RUN PER CONFIG" HAD TWO COPIES AND BOTH WERE WRONG.**
+`generate_summary` (which averages that run's results) and
+`_summary_status_warning` (which reads its `status` and qualifies those
+averages) each carried
+
+    WHERE (config_name, run_timestamp) IN (
+        SELECT config_name, MAX(run_timestamp) FROM ablation_runs
+        GROUP BY config_name)
+
+`_LATEST_RUN_PER_CONFIG_SQL` is the one owner now, and it is **`MAX(id)`**.
+`run_timestamp` is `datetime.now().isoformat()` — NAIVE LOCAL TIME — and it
+fails two ways, both silent:
+
+* **AN EXACT TIE SELECTS MORE THAN ONE ROW.** `IN` matches every row carrying
+  the maximum, so two runs of one configuration sharing a timestamp both
+  qualify: the status reader prints that configuration TWICE, once per status,
+  and the summary's INNER JOIN admits BOTH runs' results and averages them
+  together — a mean over two runs presented as the latest run's. Driven: two
+  runs, one timestamp, results 10/10/10 and 0, **pre-fix n=4 and mean 7.5, a
+  number belonging to neither run**; fixed, n=1 and 0.0.
+* **LOCAL TIME IS NOT MONOTONE.** At a DST fall-back the wall clock repeats an
+  hour, so 01:45 EDT (earlier in real time) sorts ABOVE 01:15 EST (later), and
+  `MAX` picks the superseded run. Driven with exactly that pair: pre-fix the
+  summary reports the SUPERSEDED run's COMPLETE status and its numbers, so a
+  STOPPED run is never qualified at all.
+
+`id` is `INTEGER PRIMARY KEY AUTOINCREMENT`, so no tie is POSSIBLE and it is
+monotone in insert order — `queries.campaign_summary`'s own argument for reading
+run order off `runs.id` rather than `started_at`. **`run_timestamp` is not
+deleted**: it is still what an operator reads, it just no longer DECIDES
+anything.
+
+**F7 — THE RUN'S TERMINAL STATUS WAS DERIVED THREE TIMES IN ONE FUNCTION.**
+`oncotriage/batch/runner.py:main()` computed it for `finalize_run_record`, again
+sixty lines earlier for the console block that PRINTS what the row will say, and
+a third time for `tracking.end_run`. The console block's own text is the promise
+— "run row FINISHED — NOT STOPPED, because STOPPED means the campaign covers a
+PREFIX of the cohort" — so a comment argued the two must agree while the code
+kept them in step by hand.
+
+**THEY AGREED ONLY BY COINCIDENCE OF THE GUARD.** The console copy sits under
+`if STOP_SWITCH.requested and not _stopped_mid_cohort:`, which collapses the
+STOPPED arm — so the shorter two-way expression there was correct BECAUSE OF
+WHERE IT SAT rather than because of what it computed. `_terminal_status` is
+derived once, where `main_errors` is bound, and both readers name it.
+
+**THE THREE MISSING CONSTANTS WERE ADDED, AND THE DOCSTRING THAT FORBADE IT WAS
+RE-READ RATHER THAN OBEYED.** `RUN_RECORD_STATUS_RUNNING` and `_STOPPED` were
+named; FINISHED / FAILED / KILLED were literals typed into
+`RUN_RECORD_TERMINAL_STATUSES` under a paragraph saying they must be "written
+out rather than derived… deriving them from anything in this module would make
+the round-trip check agree with itself by construction". **The concern is real
+and it is about `tracking`, not about this module**: the check compares this
+tuple against `tracking.RUN_STATUSES`, so naming the three as literals HERE and
+building the tuple from them leaves the comparison between two modules'
+independent text. The paragraph says so now, and the three names exist because a
+caller cannot import a literal.
+
+**THE MLflow TRANSLATION IS A DECLARED MAPPING.** `TRACKING_STATUS_FOR` maps
+each `runs.status` onto MLflow's three-member vocabulary, with **STOPPED →
+KILLED the one row that is not an identity** — and a `RuntimeError` at import
+when its keys stop matching `RUN_RECORD_TERMINAL_STATUSES`, so a fifth status
+fails at load rather than reaching `end_run`, which substitutes FAILED for what
+it does not recognise and says nothing. It is **not invertible**, and that is
+recorded: two row statuses map onto KILLED, so the ROW and not the index is the
+authority on how a campaign ended.
+
+**ONE LITERAL IS DELIBERATELY LEFT AND MARKED.** The crash handler's
+`tracking.end_run(status="FAILED")` beside a row finalized KILLED is an ARGUED
+divergence, not a duplicate. Routing it through the mapping would give "KILLED"
+and silently change what a crashed campaign is indexed as, in a pass whose whole
+subject is removing UNINTENDED copies. The note beside it says so.
+
+**F11 — `MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS` IS VALIDATED AT IMPORT.** The
+node tested `_parallel_bound < 1`, which is not a type check, and this number
+becomes `ThreadPoolExecutor(max_workers=...)`. Every plausible mistyping gets
+past it: **`True` passes and means `max_workers=1`, so a campaign silently runs
+per-trial mode SEQUENTIALLY while every report says otherwise and nothing ever
+raises**; `4.5` passes and then raises inside the node, per patient, after the
+warmup has been billed; `"4"` raises `TypeError`, which is not
+`PerTrialParallelismError` and names nothing. `config.py` now carries the full
+isinstance / not-bool / `>= 1` guard its warmup sibling already had, at import
+and unconditionally. **The node's check stays** — the two ask different
+questions, and a caller that sets the attribute AFTER import (which `run_node`
+in the test suite does) bypasses the import guard entirely.
+
+**F14 — `_account_unconsumed` APPLIES THE ANSWERING-MODEL CHECK.** Three places
+fold a response's `model` into `model_answered`; the warmup and the send loop
+both compared it against `config.matching_wire_model()` first and this one did
+not. Its docstring argued that repeating the check would be wrong — true of the
+DIAGNOSIS, and it overlooked what the function WRITES: `model_answered` is
+returned as `matching_model` by all four failure returns that call it, and
+`log_inference` STORES it and `get_model_cost` PRICES it. So an unchecked echo
+folded from an abandoned response became the stored identity of the judge, **on
+exactly the rows a reviewer reads when something went wrong**.
+
+**RAISING IS THE RIGHT PRECEDENCE, AND THE SEVERITY ORDERING IS THE ARGUMENT.**
+The failures that call it are RECOVERABLE — a refusal, a parse failure and a
+non-list body all re-enter the node up to `MAX_LLM_CLASSIFIER_RETRIES` times —
+and a model mismatch is not: every retry after it spends more on a judge nobody
+chose.
+
+**THE CHAINING CLAIM WAS MEASURED AND THE FIRST DRAFT SAID THREE.** It is **two
+of four**: the API-error and JSON-parse branches call it from inside an
+`except`, so the original exception travels as `__context__`; the refusal and
+non-list branches are ordinary `if`s over a well-formed response and there is
+nothing to chain. Both arms are asserted, so the asymmetry cannot rot into a
+claim.
+
+**F9** — `study.py`'s console `Status: COMPLETE` reads `STUDY_STATUS_COMPLETE`,
+and the f-prefix went with it (it had no placeholder — pyflakes F541, which is
+exactly the smell: a formatted string that formats nothing).
+
+**F16 — `_create_run` RAISES, AND IT BORROWED THE WRONG ARGUMENT FOR WHY.**
+`RUN_RECORD_FAILURES`' docstring said it "runs BEFORE the configuration's first
+billed call, so a failure there costs nothing" — which is
+`start_run_record`'s argument, true of the batch runner (one row, once, before
+the first patient) and **FALSE HERE**: `_create_run` is called once per
+CONFIGURATION, so on configuration 3 of 7 two whole configurations of live Stage
+5 calls have already been billed. What makes raising affordable is the
+CHECKPOINT, not the position. Both docstrings say that now, and three claims in
+the first draft of the correction were re-measured and fixed before they shipped
+— the crash handler finalizes the run row **KILLED** (the STUDY is CRASHED),
+`open_run_id` is None at that point so nothing is left reading RUNNING, and
+`ablation_results` **declares** a foreign key that nothing enforces (no
+`PRAGMA foreign_keys` anywhere in the module).
+
+**F3 — THE COMPOSE GRACE ARITHMETIC IS PINNED.**
+`stop_grace_period: 620s` is `MATCHING_REQUEST_TIMEOUT_SECONDS × (1 +
+OPENAI_SDK_MAX_RETRIES) + margin`, and nothing checked it — both terms are
+config constants a later pass can move, and neither knows the YAML exists.
+`tests/test_compose_shutdown_grace.py` asserts the **INEQUALITY, never `== 620`**,
+so a legitimate timeout change moves it instead of failing it. The margin is
+`SHUTDOWN_MARGIN_SECONDS`, a named constant carrying the uncalibrated label, and
+it lives **in the test rather than in `config.py`** because nothing at runtime
+reads it and that file's standing rule is that every tunable in it has a reader.
+The per-trial arm's four-round worst case (2400s) is asserted to be a KNOWN,
+DOCUMENTED shortfall, so turning that mode on cannot inherit a grace period
+nobody re-derived.
+
+**THE PORT — `tests/run_serial_tests.py` GOT THE FOUR LOCK HARDENINGS.** That
+lock and `oncotriage/batch/runner.py`'s were the same shape and only one was
+hardened. The mechanism is identical — a name in a world-writable directory,
+derived from a path anybody can guess — and this one's blast radius is arguably
+worse: a batch overlap bills a cohort twice, a serial overlap leaves a
+deliberate defect in `cancer_code_registry.py` with both runs reporting success.
+
+1. **`realpath`, not `abspath`, as the key.** One checkout reached through two
+   names hashed to two digests, took two lock files, and BOTH RAN.
+2. **A 0700 uid-keyed lock directory, `O_NOFOLLOW`, 0600.** The lock file's name
+   is a SHA-256 of a path, so another user could pre-create it as a symlink and
+   the first run to start would `O_CREAT` through it and `ftruncate` the target
+   to zero.
+3. **A UTC record with an explicit `Z`,** because the holder's start time is read
+   by somebody deciding whether that run is stuck, often from a log written in
+   another region.
+4. **A typed `LockUnavailable` (a `RuntimeError`, converted at the acquisition
+   site) and a new exit code 4.** `_run_all()` runs INSIDE the `with`, so an
+   `except OSError` there would swallow every `OSError` the five subprocess
+   launches can raise and report it as a lock failure.
+
+**THEY ARE COPIED, NOT IMPORTED, AND THAT IS THAT FILE'S OWN RECORDED DESIGN:**
+it imports nothing from the project so that it still reports a missing test file
+rather than dying on an ImportError when the package is what is broken. The
+copy's cost is paid by `tests/test_serial_runner_lock.py`, which asserts the
+four properties THERE.
+
+```bash
+# The duplicated-derivation pass. Same shape, same directory. No network, no
+# keys, NO SPEND, no live Qdrant, no model load, no corpus, no git history.
+# None is in the collision matrix. Bucket A.
+python tests/test_ablation_latest_run_selection.py   #  45, ~1.5s. EXECS NOTHING:
+                                                     #  every control is a different
+                                                     #  SQL STRING on one connection
+python tests/test_compose_shutdown_grace.py          #  17, ~0.7s. NO DOCKER DAEMON
+python tests/test_serial_runner_lock.py              #  85, ~0.5s. REAL concurrent
+                                                     #  subprocesses and a REAL
+                                                     #  symlinked checkout
+```
+
+**`tests/test_serial_runner_lock.py` DOES NOT RUN THE REAL SERIAL SUITE**, and
+that is the design decision in it. It builds a throwaway checkout holding a
+**byte-identical** copy of the entry point (sha256-compared, so the lock under
+test is the shipped lock) beside five one-line STUB scripts at the five paths
+`SERIAL_TESTS` names — read off the module rather than retyped. The entry point
+is the real one and `_run_all` really launches subprocesses, but the payload is
+harmless, **so a BROKEN lock costs two stub runs rather than two source
+rewrites**. The holder PARKS ON A FILE rather than sleeping, so the refusal is a
+statement about the lock and not about this machine's scheduler.
+
+**TWENTY-EIGHT REVERTS, TWENTY-EIGHT CAUGHT**, each applied to a `copytree`'d
+copy with `PYTHONPATH` pointed at it, a realpath preflight asserting the COPY is
+what imports, `PYTHONDONTWRITEBYTECODE=1` set, and every plant asserting its own
+occurrence count so a plant that matched nothing is a named `PLANT-FAILED`
+rather than a working check reported as broken. **One of the twenty-eight is
+caught by an IMPORT-TIME `RuntimeError` rather than by a recorded failure** —
+deleting `TRACKING_STATUS_FOR`'s STOPPED row makes `runner.py` unimportable,
+naming both sets — which is that guard working as designed.
+
+**SIX PINNED CHECKS MOVED, AND EVERY ONE OF THEM WAS THE CHECK WORKING.**
+`tests/test_storage_run_identity.py` **142 → 155** (its status walk read
+`ast.Constant` only, so a Constant-only walk over the new named constants would
+have found nothing and passed VACUOUSLY; its CONTROL 4 plant anchored on the
+one-line literal call); `tests/test_storage_run_metrics_flush.py` **123 → 124**
+(it located the crash handler by searching `ast.dump` for the string
+`'KILLED'`); `tests/test_agent_stage5_per_trial_calls.py` **283 → 318**.
+`tests/test_package_invariants.py` is unchanged at **260/0/0**.
+
+**AND SECTION 1c CAUGHT THIS PASS'S OWN NEW TEST.** The first version of
+`tests/test_serial_runner_lock.py` reached its subject with
+`importlib.util.spec_from_file_location` and argued in its docstring that the
+by-location rule "is about `oncotriage` PACKAGE modules". **That reasoning was
+wrong and the check is unconditional, with no allowlist escape** —
+`tests/test_runner_sigterm_shutdown.py` records being caught by exactly the same
+check for exactly the same reason. It is an ordinary `import` with `tests/` on
+`sys.path` now, which is stronger anyway: one entry in `sys.modules` rather than
+a second copy with its own state. The `__main__` guard is asserted BEFORE the
+import, because without one the import would launch the nine-minute
+source-rewriting suite as a side effect of a test.
+
+**FIVE DEFECTS IN THIS PASS'S OWN TEST CODE WERE FOUND BY RUNNING, NOT BY
+READING**, and three of them are this project's recurring shapes:
+
+- **A CHECK THAT ABORTED.** `time.strptime` on a stamp whose FORMAT a defect had
+  changed — which is one of the two defects that section exists to catch — raised
+  while `check()`'s argument was being evaluated, and the run reported one
+  traceback where it owed a summary and thirty results. **The thirteenth time.**
+- **TWO CHECKS THAT COULD NOT DISCRIMINATE, both reported by the revert
+  harness as MISSED rather than by reading.** The record's `realpath` check
+  compared against `realpath(_CODE_DIR)` — but `os.getcwd()` already resolves
+  symlinks on this platform, so it was `x == x` and passed against a reverted
+  writer; it drives a genuinely unresolved path now. And the `lstat`-vs-`stat`
+  check had no case that separates them: a file is not a directory to both, and
+  a real directory's mode bits read the same to both. **Only a SYMLINK TO A GOOD
+  DIRECTORY separates them**, and that case is now the control.
+- **A SCAN THAT REPORTED ITS OWN ARGUMENT.** `4f` asserted the module contains
+  no `MAX(run_timestamp)` using `ast.unparse`, on the premise that it strips
+  docstrings. **It does not** — they are ordinary `Expr(Constant(str))`
+  statements — so the two occurrences it found were the owner's own prose
+  explaining the correction. The obvious stripper would not have fixed it either:
+  that docstring is an ATTRIBUTE docstring, a bare string FOLLOWING an
+  assignment, which a `body[0]`-only stripper leaves in place.
+- **A HARNESS THAT REPORTED FOUR WORKING CONTROLS AS MISSED.** The revert
+  harness parsed only `N passed, M failed`; two summary formats live in
+  `tests/` and the other reads `passed: N` / `failed: M`, in either case. A
+  parser that knows one family returns 0/0 for the other, which reads exactly
+  like an abort.
+
+**VERIFIED BY RUNNING.** CI bucket A **69/69**; `tests/run_serial_tests.py`
+**5/5** with `oncotriage/registries/cancer_code_registry.py` confirmed
+byte-unchanged and `oncotriage/config.py` confirmed to carry only this pass's
+own edit; `tests/test_package_invariants.py` **260/0/0**; every affected bucket
+E file at its documented count (`test_ablation_db_isolation` 72,
+`test_ablation_stop_and_lock` 142, `test_storage_write_durability` 100,
+`test_agent_patient_hash_coverage` 69); `python fixture_replay.py` **12/12
+clean, exit 0, with no recapture**; and the production `inferences.db`
+(`ab1403e3…`), `ablation_results.db` (`f2bc23c6…`) and all twelve fixture files
+byte-identical to the hashes taken before the pass began. **No money was spent
+and no migration was run.**
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+`lock_directory()` and `ensure_lock_directory()` now exist in THREE copies —
+`oncotriage/batch/runner.py`, `oncotriage/ablation/study.py` and
+`tests/run_serial_tests.py`. The consolidation is a recorded deferral, not an
+oversight: the third copy is forced by that file's no-project-imports rule, and
+the other two are a shared-module question of their own. What keeps them from
+drifting silently is that all three verify the SAME directory and each has a
+test asserting the properties in its own file; what separates the three locks is
+the FILE PREFIX — `oncotriage-batch-run-`, `oncotriage-ablation-run-` and
+`oncotriage-serial-tests-` — which is load-bearing and must stay distinct.
 
 ## Persistence and observability
 

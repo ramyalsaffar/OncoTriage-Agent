@@ -2021,10 +2021,12 @@ A finalizer that swallowed a Ctrl-C would leave an operator holding the key down
 against a process that will not stop.
 
 THERE IS NO `create:` KEY AND ITS ABSENCE IS NOT AN OMISSION. `_create_run`
-raises: it runs BEFORE the configuration's first billed call, so a failure there
-costs nothing and continuing would produce a whole configuration of results rows
-whose run_id points at no run. `oncotriage/storage/database_logger.py` draws the
-line in the same place and for the same reason.
+raises, and the argument for that is `_create_run`'s own -- read it there. It is
+NOT `start_run_record`'s "this runs before any spend", which is true of the
+batch runner (one row, opened once, before the first patient) and FALSE HERE:
+`_create_run` is called once per CONFIGURATION, inside the loop, so by
+configuration 3 of 7 two whole configurations of live Stage 5 calls have already
+been billed. What makes raising affordable is the CHECKPOINT, not the position.
 """
 
 
@@ -2053,11 +2055,55 @@ def report_run_record_failures(out=None) -> bool:
 
 
 def _create_run(config_name, config_description, sample_size, db_path=None):
-    """Insert a new ablation_runs row, return run_id.
+    """Insert a new ablation_runs row, return run_id. RAISES on failure.
 
     The row opens `RUNNING`. It is finalized by `_finalize_run`, and a row still
     reading RUNNING when a study is over is a configuration whose process had no
     chance to run a handler -- see `RUN_STATUSES`.
+
+    WHY THIS RAISES WHERE `_finalize_run` DOES NOT, AND WHY THE OBVIOUS REASON
+    IS THE WRONG ONE. `oncotriage/storage/database_logger.py:start_run_record`
+    raises on the argument that it runs BEFORE ANY SPEND: the batch runner opens
+    exactly one row, once, ahead of its first patient, so a failure there costs
+    a run that had not started. THAT ARGUMENT DOES NOT TRANSFER TO THIS
+    FUNCTION and was, until this was corrected, restated here as though it did.
+    This is called ONCE PER CONFIGURATION, from inside `main()`'s loop, so on
+    configuration 3 of 7 it runs with two whole configurations of live Stage 5
+    calls already billed. "A failure here costs nothing" is false of every call
+    but the first.
+
+    THE CASE IT IS ACTUALLY IN IS PER-CONFIGURATION AND RESUME-COVERED, and
+    that is what makes raising the right choice anyway:
+
+    * WHAT A RAISE COSTS IS THE REST OF THE STUDY, NOT THE MONEY ALREADY SPENT.
+      Every (config, patient) pair that completed is in the checkpoint, written
+      by `_on_done` as it completed. The raise reaches `main()`'s outer
+      `except BaseException`, which does NOT clear the checkpoint and does not
+      regenerate the summary -- Step 5 is outside the `try` for exactly that
+      reason -- so `--summary-only` still reads what ran and a resume re-runs
+      only what did not. Nothing is re-billed. That is the same protection
+      `main()` already relies on for a Ctrl-C.
+      `open_run_id` is None at this point (it is assigned from this function's
+      RETURN, and cleared when the previous configuration was finalized), so
+      that handler finalizes nothing and leaves no configuration reading
+      RUNNING that never opened.
+    * WHAT SWALLOWING WOULD COST IS UNBOUNDED AND UNRECOVERABLE. The
+      counterfactual is this function returning None on failure the way
+      `_finalize_run` returns False: the configuration's whole results set
+      would then be written with `run_id` NULL or 0, pointing at no run.
+      `ablation_results` DECLARES `FOREIGN KEY (run_id) REFERENCES
+      ablation_runs(id)` and nothing in this module issues
+      `PRAGMA foreign_keys = ON` -- SQLite leaves it off per connection -- so
+      the declaration refuses nothing and every row lands. `generate_summary`'s
+      INNER JOIN against `_LATEST_RUN_PER_CONFIG_SQL` then silently omits all
+      of them: a configuration that ran, cost money and produced rows would be
+      ABSENT from the table with nothing saying so, which is strictly worse
+      than a study that stopped and said why.
+
+    So the line is drawn in the same PLACE as `start_run_record`'s, for a
+    different reason, and the difference is written down because a reader who
+    borrows this function's disposition without its argument gets the wrong
+    answer for a caller that is not in a loop.
     """
     with _ablation_db_lock:
         conn = sqlite3.connect(str(ablation_db(db_path)))
@@ -2447,6 +2493,62 @@ def match_patient_ablation(patient_data, bm25_index, nct_ids, graph, ablation_fl
 # SUMMARY REPORTING
 # ===========================================================================
 
+_LATEST_RUN_PER_CONFIG_SQL = """
+            SELECT config_name, MAX(id) AS run_id
+            FROM ablation_runs
+            GROUP BY config_name
+"""
+"""WHICH ``ablation_runs`` ROW IS THE LATEST FOR ITS CONFIGURATION. ONE OWNER.
+
+TWO READERS INTERPOLATE THIS AND NEITHER RESTATES IT: ``generate_summary``,
+which joins its results and averages them, and ``_summary_status_warning``,
+which reads its ``status`` and qualifies those averages. They must select the
+SAME row or the qualification is about a run whose numbers are not on the
+table -- a warning naming a stopped configuration whose printed means came from
+a different, complete run, or worse, silence over a prefix. Before this they
+were two hand-written copies of one SELECT, which is the shape this project has
+removed for the alias family, the cross-encoder checkpoint and the BM25 model:
+nothing raises when two copies disagree.
+
+``MAX(id)``, NEVER ``MAX(run_timestamp)``, AND THAT IS THE CORRECTION RATHER
+THAN THE CONSOLIDATION. The previous form was
+
+    WHERE (config_name, run_timestamp) IN (
+        SELECT config_name, MAX(run_timestamp) FROM ablation_runs
+        GROUP BY config_name)
+
+and ``run_timestamp`` is ``datetime.now().isoformat()`` -- a NAIVE LOCAL time
+written by ``_create_run``. It fails in two ways, both silent:
+
+* EXACT TIES SELECT MORE THAN ONE ROW. ``IN`` matches every row carrying the
+  maximum, so two runs of one configuration sharing a timestamp both qualify.
+  ``_summary_status_warning`` then prints that configuration TWICE, once per
+  status, and ``generate_summary``'s INNER JOIN admits BOTH runs' results and
+  averages them together -- a mean over two runs presented as the latest run's.
+  isoformat() carries microseconds, so a tie needs two inserts inside one
+  microsecond; ``_create_run`` holds ``_ablation_db_lock`` across the insert,
+  which serialises them but does not make the clock advance, and a coarse clock
+  or a restored/copied row makes it ordinary rather than exotic.
+* LOCAL TIME IS NOT MONOTONE. At the DST fall-back the wall clock repeats an
+  hour, so a run started at 01:30 EDT and a later one started at 01:30 EST
+  write timestamps an hour APART IN THE WRONG DIRECTION: the earlier run wins
+  ``MAX``, and the summary reports a superseded run as the latest one. A study
+  that spans the boundary is not unusual -- seven configurations at one live
+  Stage 5 call per pair is hours.
+
+``id`` HAS NEITHER FAULT. It is ``INTEGER PRIMARY KEY AUTOINCREMENT``, so it is
+unique by construction (no tie is possible, and ``MAX`` therefore selects
+exactly one row per configuration) and monotone in INSERT order within one
+database, which is precisely the ordering "latest run" means. It is the same
+argument ``oncotriage/storage/queries.py:campaign_summary`` records for reading
+run order off ``runs.id`` rather than ``started_at``.
+
+``run_timestamp`` IS NOT DELETED AND IS STILL WHAT AN OPERATOR READS. It is the
+human-facing fact -- when did this run happen -- and it stays in the table and
+in the report. What changes is that it no longer DECIDES anything.
+"""
+
+
 def _summary_status_warning(conn) -> list:
     """Lines naming any configuration whose LATEST run was not COMPLETE.
 
@@ -2485,15 +2587,12 @@ def _summary_status_warning(conn) -> list:
     comparing it against `sample_size` can see it.
     """
     try:
-        rows = conn.execute("""
-            SELECT config_name, status
-            FROM ablation_runs
-            WHERE (config_name, run_timestamp) IN (
-                SELECT config_name, MAX(run_timestamp)
-                FROM ablation_runs
-                GROUP BY config_name
-            )
-            ORDER BY config_name
+        rows = conn.execute(f"""
+            SELECT r.config_name, r.status
+            FROM ablation_runs r
+            INNER JOIN ({_LATEST_RUN_PER_CONFIG_SQL}) latest
+                    ON r.id = latest.run_id
+            ORDER BY r.config_name
         """).fetchall()
     except sqlite3.Error as exc:                                # noqa: BLE001
         # A DATABASE THAT PREDATES THE COLUMN CANNOT ANSWER, and that is not a
@@ -2553,7 +2652,7 @@ def generate_summary(db_path=None):
 
     conn = sqlite3.connect(str(ablation_db(db_path)))
     try:
-        df = pd.read_sql_query("""
+        df = pd.read_sql_query(f"""
             SELECT
                 r.config_name,
                 COUNT(*)                                            AS n,
@@ -2589,16 +2688,9 @@ def generate_summary(db_path=None):
                       / NULLIF(SUM(r.eligible_count), 0), 5)        AS cost_per_eligible,
                 SUM(CASE WHEN r.error != '' THEN 1 ELSE 0 END)      AS errors
             FROM ablation_results r
-            INNER JOIN (
-                SELECT config_name, id AS max_run_id
-                FROM ablation_runs
-                WHERE (config_name, run_timestamp) IN (
-                    SELECT config_name, MAX(run_timestamp)
-                    FROM ablation_runs
-                    GROUP BY config_name
-                )
-            ) latest ON r.config_name = latest.config_name
-                     AND r.run_id    = latest.max_run_id
+            INNER JOIN ({_LATEST_RUN_PER_CONFIG_SQL}) latest
+                    ON r.config_name = latest.config_name
+                   AND r.run_id      = latest.run_id
             GROUP BY r.config_name
         """, conn)
     finally:
@@ -3730,7 +3822,15 @@ def main():
                 summary_df = generate_summary(db_path=db_path)
                 clear_ablation_checkpoint(db_path=db_path)
                 console.out(f"  Summary:         {ablation_summary_json(db_path)}")
-                console.out(f"  Status:          COMPLETE")
+                # THE CONSTANT, NOT THE LITERAL. This line and the
+                # `print_study_close(... STUDY_STATUS_COMPLETE)` call fifteen
+                # lines above report the SAME verdict about the SAME study, and
+                # a literal here is a second copy of it that no test and no
+                # reader can see disagree. (The f-prefix went with it: it had no
+                # placeholder, which is the pyflakes F541 that says exactly
+                # this -- a formatted string that formats nothing is a string
+                # somebody meant to interpolate into.)
+                console.out(f"  Status:          {STUDY_STATUS_COMPLETE}")
 
             # --- Step 6: Close the tracking run (the tracking pass) ---
             # THE CHILDREN ARE OPENED HERE, FROM THE SUMMARY, and not around each

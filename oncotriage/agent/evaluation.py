@@ -4804,12 +4804,65 @@ CLINICAL TRIALS:
         abandoned response. tests/test_agent_stage5_per_trial_calls.py section
         3 asserts that rather than leaving it as reasoning.
 
-        IT NEVER RAISES, AND THE MODEL CHECK IS DELIBERATELY NOT REPEATED HERE.
-        This runs on a path that is already failing and already has a
-        diagnosis; raising ``MatchingModelMismatchError`` from inside it would
-        replace a named failure with an unrelated one and lose the record it
-        was called to write. A mismatch on a CONSUMED call still raises, in the
-        loop, exactly as before.
+        THE ANSWERING-MODEL CHECK IS APPLIED HERE, AND AN EARLIER VERSION OF
+        THIS DOCSTRING ARGUED THE OPPOSITE. What it said was that this runs on
+        a path that is already failing and already has a diagnosis, so raising
+        ``MatchingModelMismatchError`` from inside it would replace a named
+        failure with an unrelated one. That is true of the DIAGNOSIS and it
+        overlooked what this function WRITES:
+
+            model_answered = getattr(_payload, "model", None) or model_answered
+
+        ``model_answered`` is returned as ``matching_model`` by all four of the
+        failure returns that call this, and ``log_inference`` stores it and
+        ``get_model_cost`` prices it. So an unchecked echo folded here became
+        the stored identity of the judge, on exactly the rows a reviewer reads
+        when something went wrong -- which is the misattribution
+        ``MatchingModelMismatchError`` exists to prevent, reached through the
+        one door that did not check. The other two fold sites (the warmup and
+        the send loop) both check before assigning; this was the third and did
+        not.
+
+        SO IT RAISES, AND THE SEVERITY ORDERING IS THE ARGUMENT. The failures
+        that call this are RECOVERABLE: a refusal, a parse failure and a
+        non-list body all return to ``route_after_llm_classifier``, which
+        re-enters this node up to ``MAX_LLM_CLASSIFIER_RETRIES`` times, and an
+        API error does the same. A model mismatch is NOT recoverable -- it is a
+        statement that the campaign is being run on a judge nobody chose, and
+        every retry after it spends more money on that judge. Replacing a
+        retryable diagnosis with the terminal one is therefore an upgrade in
+        severity and the correct precedence, not a lost record.
+
+        WHAT IS ACTUALLY LOST is the ledger rows for whatever remains
+        unfolded -- and that is inherent rather than a choice made here: the
+        raise leaves the node, so the ``return {...}`` that would have carried
+        ``call_details`` is never built, exactly as it is never built when the
+        send loop raises at its own check. The alternative -- fold everything
+        first, then raise -- buys nothing, because the list it would complete
+        is discarded by the same unwinding.
+
+        THE ORIGINAL DIAGNOSIS SURVIVES ON TWO OF THE FOUR PATHS, AND THE
+        COUNT IS MEASURED RATHER THAN ASSUMED -- an earlier draft of this
+        paragraph said three, and it was wrong. The API-error branch and the
+        JSON-parse branch call this from inside an ``except``, so the raise
+        carries that exception as its ``__context__`` and the traceback prints
+        BOTH under "During handling of the above exception, another exception
+        occurred". THE REFUSAL AND NON-LIST BRANCHES DO NOT: they are ordinary
+        ``if`` branches over a well-formed response, there is no live exception
+        to chain, and on those two the model mismatch is the only thing in the
+        traceback.
+
+        THAT IS STATED RATHER THAN SMOOTHED OVER, AND IT DOES NOT CHANGE THE
+        DECISION. What is lost on those two paths is a SENTENCE -- "the model
+        refused", "the model returned a JSON object rather than a list" -- about
+        a condition that was going to be RETRIED anyway. What is gained is that
+        the campaign stops before the next retry spends more money on a judge
+        nobody chose. `tests/test_agent_stage5_per_trial_calls.py` section 5c
+        asserts both arms, so the asymmetry cannot rot into a claim.
+
+        A ``None`` echo still does not raise, here as everywhere: it means the
+        response carried no model field (a stub, a pre-migration recording),
+        which is a different condition with its own NULL handling.
 
         ``unconsumed`` MARKS THE ROW because "no entry list was parsed" already
         has two meanings in this ledger -- the response was unusable, or the
@@ -4872,7 +4925,14 @@ CLINICAL TRIALS:
                 "entries_emitted": None,
                 "unconsumed": True,
             })
-            model_answered = getattr(_payload, "model", None) or model_answered
+            # THE ANSWERING-MODEL CHECK, APPLIED HERE AS IT IS AT THE OTHER
+            # TWO FOLD SITES. See the docstring for why this raises on a path
+            # that is already failing.
+            _returned = getattr(_payload, "model", None)
+            if _returned is not None and _returned != config.matching_wire_model():
+                raise MatchingModelMismatchError(
+                    config.matching_wire_model(), _returned)
+            model_answered = _returned or model_answered
             folded += 1
         # `or abandoned_errors` IS NOT REDUNDANT, and the disjunct that WOULD
         # have been is worth naming: an earlier draft tested `folded or

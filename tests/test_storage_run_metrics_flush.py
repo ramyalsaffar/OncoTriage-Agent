@@ -1175,13 +1175,44 @@ check("main() calls degradation.snapshot() exactly ONCE -- a second call is "
 
 # The crash-path flush must run BEFORE finalize_run_record, so the rows are
 # current at the moment the run is marked KILLED.
+#
+# THE HANDLER IS LOCATED BY WHAT ITS finalize CALL RESOLVES TO, IN EITHER
+# REFERENCE FORM. The first version searched `ast.dump(handler)` for the string
+# `'KILLED'`, which worked for exactly as long as runner.py wrote that status
+# out as a bare literal. When it started importing `RUN_RECORD_STATUS_KILLED`
+# from the storage layer -- the vocabulary's owner -- the substring vanished,
+# `_killed` stayed None, `_order` was empty, and this check FAILED against
+# correct code. That is this project's standing rule met again: a check that
+# names a symbol must cover every form the symbol can be reached by.
+#
+# It is also stricter than the substring was: `ast.dump` would have matched the
+# word anywhere in the handler, including inside an unrelated string.
+_KILLED = getattr(_dl, "RUN_RECORD_STATUS_KILLED", "KILLED")
+
+
+def _finalize_status_names(call):
+    """The status a finalize call writes, as Constant value or Name id."""
+    out = []
+    for a in call.args[1:2]:
+        if isinstance(a, ast.Constant):
+            out.append(a.value)
+        elif isinstance(a, ast.Name):
+            out.append(getattr(_dl, a.id, a.id))
+    return out
+
+
 _handlers = [h for h in ast.walk(_main)
              if isinstance(h, ast.ExceptHandler)] if _main else []
 _killed = None
 for _h in _handlers:
-    _src = ast.dump(_h)
-    if "'KILLED'" in _src or '"KILLED"' in _src:
-        _killed = _h
+    for _n in ast.walk(_h):
+        if (isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name)
+                and _n.func.id == "finalize_run_record"
+                and _KILLED in _finalize_status_names(_n)):
+            _killed = _h
+check("the KILLED crash handler was located (non-degeneracy: without this the "
+      "ordering check below compares two empty lists and passes for free)",
+      _killed is not None, True)
 _order = []
 if _killed is not None:
     for _n in ast.walk(_killed):

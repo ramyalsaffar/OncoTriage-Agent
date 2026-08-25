@@ -2128,6 +2128,54 @@ MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE = "."
 # one edit.
 MATCHING_PER_TRIAL_PROMPT_CACHE_KEY_ENABLED = True
 
+# THE SAME GUARD ITS WARMUP SIBLING BELOW ALREADY HAS, AND FOR A SHARPER
+# REASON: this number becomes `ThreadPoolExecutor(max_workers=...)`.
+#
+# `oncotriage/agent/evaluation.py` tests `_parallel_bound < 1` and raises
+# `PerTrialParallelismError`, which is right and is not enough, because a bare
+# `<` comparison is not a type check. Every non-int this constant can plausibly
+# be mistyped as gets PAST that test, and each fails differently and late:
+#
+#   * `True` -- `True < 1` is False, so the guard passes, and `max_workers=True`
+#     is `max_workers=1`. A campaign silently runs per-trial mode SEQUENTIALLY
+#     while every report says it ran at the configured concurrency. This is the
+#     dangerous one: nothing raises, ever.
+#   * `4.5` -- passes the guard, then `ThreadPoolExecutor` raises inside the
+#     node, per patient, after the warmup has already been issued and billed.
+#   * `"4"` -- `"4" < 1` raises `TypeError`, which is NOT
+#     `PerTrialParallelismError`: it escapes the node as an unrelated failure
+#     with no mention of the constant that caused it.
+#
+# AT IMPORT AND UNCONDITIONALLY, unlike the node's check, which is deliberately
+# reached only in per-trial mode. The two ask different questions and both are
+# kept: this one asks "is this constant a usable integer at all", which is a
+# fact about the declaration and is true or false whether the mode is on or
+# not; the node's asks "is this bound usable FOR THE MODE THAT IS ABOUT TO
+# RUN", and names the mode in its message because that is the operator's other
+# way out. Validating the type here means the mode can be turned on without
+# discovering a typo one live warmup per patient at a time.
+#
+# 0 AND NEGATIVES ARE REFUSED HERE TOO, not left to the node. They are a
+# configuration defect in either mode -- there is no reading of
+# `MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS = 0` that is a request for anything --
+# and refusing at load costs a process that has spent nothing. The node keeps
+# its own `< 1` test regardless: it is the one that names the mode, and a check
+# that exists only in the file it is checking is a check somebody deletes with
+# the import.
+#
+# A RuntimeError AND NOT AN `assert`, on this file's own standing rule, and
+# NOT `PerTrialParallelismError`: that class lives in
+# `oncotriage/agent/evaluation.py`, and `config` importing the agent is the
+# layering violation this project's rules forbid outright.
+if (not isinstance(MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS, int)
+        or isinstance(MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS, bool)
+        or MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS < 1):
+    raise RuntimeError(
+        "MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS must be an int >= 1 (1 means "
+        "sequential); it is "
+        f"{MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS!r}")
+
+
 # A ceiling below 1 is not a smaller request, it is a request for no answer at
 # all, and providers differ on whether that is a 400 or an empty completion. A
 # RuntimeError AND NOT AN `assert`, on this file's own standing rule: `python

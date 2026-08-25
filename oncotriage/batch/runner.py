@@ -175,6 +175,17 @@ from oncotriage.agent.evaluation import (
 from oncotriage.fhir.parser import parse_fhir_bundle
 from oncotriage.storage.database_logger import (
     RUN_METRICS_FLUSH_FAILURES,
+    # THE FOUR TERMINAL STATUSES BY NAME. `runs.status` is a CLOSED vocabulary
+    # owned by the storage layer, and this module writes every one of its
+    # terminal members. Written out as literals they were eight strings in
+    # three places -- and two of those places derived the SAME verdict
+    # independently, under a comment arguing that they must not disagree. See
+    # `_terminal_status` in main().
+    RUN_RECORD_STATUS_FAILED,
+    RUN_RECORD_STATUS_FINISHED,
+    RUN_RECORD_STATUS_KILLED,
+    RUN_RECORD_STATUS_STOPPED,
+    RUN_RECORD_TERMINAL_STATUSES,
     finalize_run_record,
     flush_run_metrics,
     log_inference,
@@ -742,6 +753,53 @@ def clear_all() -> None:
 # configurations in one process, or a test driving two passes, would be
 # refusing itself. A process-wide exclusion belongs to the process's entry
 # point.
+
+
+TRACKING_STATUS_FOR = {
+    RUN_RECORD_STATUS_FINISHED: "FINISHED",
+    RUN_RECORD_STATUS_FAILED:   "FAILED",
+    RUN_RECORD_STATUS_KILLED:   "KILLED",
+    # THE ONE ROW THAT IS NOT AN IDENTITY, AND THE WHOLE REASON THIS EXISTS.
+    RUN_RECORD_STATUS_STOPPED:  "KILLED",
+}
+"""How a `runs.status` verdict is stated in MLflow's three-member vocabulary.
+
+TWO VOCABULARIES, ONE VERDICT, AND THE TRANSLATION WRITTEN DOWN. `runs.status`
+has four terminal members and `oncotriage/tracking.py:RUN_STATUSES` has three;
+`RUN_RECORD_STATUSES_BEYOND_TRACKING` names the difference and this names what
+to do about it. Before this, `main()` derived the MLflow status from
+`_stopped_mid_cohort` and `main_errors` in a SEPARATE three-way conditional
+from the one that produced the row's status -- two expressions that had to stay
+in step by hand, under a comment declaring a "divergence" that was therefore
+not a mapping anybody could read.
+
+STOPPED -> KILLED IS THE CLOSEST TRUE STATEMENT, NOT A ROUNDING. MLflow's own
+definition of KILLED is "run killed by user", which is literally what a stop
+switch is. Passing "STOPPED" through unmapped would be worse than either:
+`tracking.end_run` REPLACES an unrecognised status with FAILED, so every
+stopped campaign would be indexed as a failure -- true of nothing.
+
+IT IS NOT INVERTIBLE AND MUST NOT BE READ AS IF IT WERE. Two distinct row
+statuses map onto KILLED, so an MLflow run reading KILLED is either a crash or
+a clean operator stop and only `runs.status` can say which. That is the cost of
+the narrower vocabulary and it is why the row, not the index, is the authority
+on how a campaign ended.
+"""
+
+if set(TRACKING_STATUS_FOR) != set(RUN_RECORD_TERMINAL_STATUSES):
+    # A `RuntimeError` AND NOT AN `assert`, on this project's standing rule:
+    # `python -O` deletes assert statements, and this is the only thing between
+    # a fifth terminal status and an unmapped verdict reaching `end_run`, which
+    # substitutes FAILED for what it does not recognise and says nothing.
+    #
+    # AT IMPORT, NOT AT THE CALL SITE. The call site is reached once, after a
+    # whole campaign has been billed; a KeyError there would replace the run's
+    # own closing report with a traceback about bookkeeping. At import it is a
+    # load failure with nothing spent.
+    raise RuntimeError(
+        "TRACKING_STATUS_FOR must map every RUN_RECORD_TERMINAL_STATUSES "
+        f"member and nothing else; it maps {sorted(TRACKING_STATUS_FOR)} "
+        f"against {sorted(RUN_RECORD_TERMINAL_STATUSES)}")
 
 
 EXIT_LOCKED = 3
@@ -3952,7 +4010,8 @@ def main():
             # and -- unlike the handler below -- it does not flush health
             # either, so the console is the ONLY record this failure can leave.
             print_crash_record(where="crash/tracking")
-            finalize_run_record(_run_record_id, "KILLED", db_path=_reconcile_db)
+            finalize_run_record(_run_record_id, RUN_RECORD_STATUS_KILLED,
+                                db_path=_reconcile_db)
             raise
 
         # THE RUN IS CLOSED ON EVERY EXIT PATH, and this try exists only for
@@ -4118,6 +4177,46 @@ def main():
             # ------------------------------------------------------------------
             main_results = [r for r in results_list if not r.get("is_resample")]
             main_errors = [r for r in main_results if r["status"] != "success"]
+
+            # HOW THIS RUN ENDED, DERIVED ONCE.
+            #
+            # IT USED TO BE DERIVED TWICE, and the second copy sat inside a
+            # console block whose own text argues that the row and the console
+            # must agree ("run row FINISHED -- NOT STOPPED, because ..."). Two
+            # copies of one three-way conditional, in one function, sixty lines
+            # apart, keeping a promise about each other by hand. They agreed
+            # only because the console copy is reached under
+            # `not _stopped_mid_cohort`, which collapses the STOPPED arm -- so
+            # the shorter expression there was correct BY COINCIDENCE OF ITS
+            # GUARD rather than by construction, and any future edit to either
+            # branch had to be made in both places or the console would state a
+            # status the row does not carry. `tests/test_storage_run_identity.py`
+            # pins that both now read this one name.
+            #
+            # STOPPED OUTRANKS BOTH, and the precedence is a decision. A run
+            # that was asked to stop AND had errored patients is recorded
+            # STOPPED, because the question `runs.status` answers is "how did
+            # this run END" and it ended because an operator asked it to; the
+            # errors are in `run_metrics`, in the summary and in
+            # `inferences.status`, none of which this displaces. The other
+            # ordering would report a stopped campaign as FAILED and send
+            # somebody looking for a fault that is not there.
+            #
+            # It also cannot be conflated with FINISHED, which is the reading
+            # that matters most to a reviewer: a STOPPED row means the campaign
+            # covers a PREFIX of the cohort, so no rate computed over it is a
+            # rate about the cohort.
+            #
+            # NAMED CONSTANTS RATHER THAN LITERALS: `runs.status` is a closed
+            # vocabulary owned by oncotriage/storage/database_logger.py, and
+            # `finalize_run_record` REFUSES a value outside it -- counting the
+            # refusal and leaving the row RUNNING. A typo in a literal here
+            # would therefore lose the campaign's verdict silently at the one
+            # line whose whole job is to record it.
+            _terminal_status = (
+                RUN_RECORD_STATUS_STOPPED if _stopped_mid_cohort
+                else RUN_RECORD_STATUS_FINISHED if not main_errors
+                else RUN_RECORD_STATUS_FAILED)
             # THE STOP GUARD IS THE FIRST TEST AND ITS ABSENCE WOULD HAVE BEEN
             # THE MOST EXPENSIVE DEFECT IN THIS ITEM. A stopped run's cancelled
             # patients produce NO result entry at all -- `_on_done`'s
@@ -4193,12 +4292,24 @@ def main():
             # "STOPPED" straight through would have indexed every stopped
             # campaign as a failure -- true of nothing, and worse than KILLED.
             tracking.end_run(
-                # `_stopped_mid_cohort` AND NOT `STOP_SWITCH.requested`. A stop
+                # TRANSLATED FROM `_terminal_status`, NOT RE-DERIVED FROM
+                # `_stopped_mid_cohort` AND `main_errors`. This used to be a
+                # THIRD independent copy of the same three-way conditional, so
+                # the "divergence" the comment above declares was a property of
+                # two expressions that happened to differ in one arm rather
+                # than a mapping anybody had written down. `TRACKING_STATUS_FOR`
+                # is that mapping, and its keys are checked at import against
+                # `RUN_RECORD_TERMINAL_STATUSES` -- so a fifth run status added
+                # to the storage vocabulary fails at load here instead of
+                # silently reaching `end_run`, which replaces what it does not
+                # recognise with FAILED.
+                #
+                # The boolean it ultimately rests on is still
+                # `_stopped_mid_cohort` AND NOT `STOP_SWITCH.requested`: a stop
                 # that only cut the resample pass short left a campaign that
                 # covered its cohort, and indexing it KILLED would tell every
-                # later reader the numbers cover a prefix. See the boolean.
-                status=("KILLED" if _stopped_mid_cohort
-                        else "FINISHED" if not main_errors else "FAILED"),
+                # later reader the numbers cover a prefix.
+                status=TRACKING_STATUS_FOR[_terminal_status],
                 artifacts=[
                     # The results file, as it stands on disk after this run.
                     _results_path(),
@@ -4277,7 +4388,7 @@ def main():
                 console.out("  what it cost   the RESAMPLE pass, and nothing "
                             "else")
                 console.out("  run row        "
-                            + ("FINISHED" if not main_errors else "FAILED")
+                            + _terminal_status
                             + " -- NOT STOPPED, because STOPPED means the "
                               "campaign covers a PREFIX of the cohort and this "
                               "one does not")
@@ -4307,23 +4418,16 @@ def main():
                 console.out("      python \"25- Batch Runner.py\"")
                 console.out("=" * 80)
 
-            # STOPPED OUTRANKS BOTH, and the precedence is a decision. A run
-            # that was asked to stop AND had errored patients is recorded
-            # STOPPED, because the question `runs.status` answers is "how did
-            # this run END" and it ended because an operator asked it to; the
-            # errors are in `run_metrics`, in the summary above and in
-            # `inferences.status`, none of which this displaces. The other
-            # ordering would report a stopped campaign as FAILED and send
-            # somebody looking for a fault that is not there.
-            #
-            # It also cannot be conflated with FINISHED, which is the reading
-            # that matters most to a reviewer: a STOPPED row means the campaign
-            # covers a PREFIX of the cohort, so no rate computed over it is a
-            # rate about the cohort.
+            # THE VERDICT IS `_terminal_status`, DERIVED ONCE where
+            # `main_errors` is bound -- the precedence argument (STOPPED
+            # outranks both) lives there, beside the expression, rather than
+            # here beside one of its two readers. This call and the console
+            # block above read the SAME name, which is what makes the promise
+            # that block's own text makes ("run row FINISHED -- NOT STOPPED")
+            # structural instead of a convention.
             finalize_run_record(
                 _run_record_id,
-                ("STOPPED" if _stopped_mid_cohort
-                 else "FINISHED" if not main_errors else "FAILED"),
+                _terminal_status,
                 db_path=_reconcile_db,
             )
 
@@ -4340,6 +4444,15 @@ def main():
             # tracking.end_run stays FAILED because MLflow's vocabulary is what
             # it is and this module does not get to widen it; the divergence is
             # stated rather than smoothed over.
+            #
+            # AND IT IS DELIBERATELY *NOT* `TRACKING_STATUS_FOR[KILLED]`, which
+            # would be "KILLED". This is the one place the row and the index
+            # are meant to disagree, so routing it through the mapping would
+            # silently change what a crashed campaign is indexed as, in a pass
+            # whose whole subject is removing UNINTENDED copies of a verdict.
+            # The mapping exists for the SUCCESS path, where the two derivations
+            # were meant to agree and were kept in step by hand. This literal is
+            # a decision; that one was a duplicate.
             #
             # THIS IS REACHABLE ONLY WHEN THE SUCCESS-PATH FINALIZE DID NOT
             # RUN, because that call is the LAST statement of the `try`. So the
@@ -4382,7 +4495,8 @@ def main():
             # It cannot raise and cannot displace the exception; see
             # print_crash_record. The `raise` below is still the original.
             print_crash_record(where="crash")
-            finalize_run_record(_run_record_id, "KILLED", db_path=_reconcile_db)
+            finalize_run_record(_run_record_id, RUN_RECORD_STATUS_KILLED,
+                                db_path=_reconcile_db)
             tracking.end_run(status="FAILED")
             raise
 
