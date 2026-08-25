@@ -1215,8 +1215,27 @@ BUCKETS = {
         "the gate, and five controls plus an AST pin on the call site keep the "
         "skip path from becoming the only path"),
     "test_storage_write_durability.py": (
-        _E, "the production inferences.db",
-        "'9c ...and it was readable, so that comparison is not None == None' failed"),
+        _A, None,
+        # RECLASSIFIED E -> A, and the string it replaces is kept above the new
+        # one because it is the whole argument: "'9c ...and it was readable, so
+        # that comparison is not None == None' failed". ONE probe -- and a
+        # hundred checks that need no network, no keys, no spend, no live
+        # Qdrant, no corpus and no git history were kept out of CI to preserve
+        # it. That probe is GATED now, on tests/test_dashboard_run_health.py's
+        # pattern; see section 9d of the file for the ruling and its nine
+        # controls. The 9c COMPARISON is never gated, so a run that CREATED a
+        # production database still fails here on a runner -- and the gate is
+        # keyed on os.path.exists rather than on the row count the probe
+        # asserts about, so the fault the probe catches cannot satisfy the gate.
+        "ran green in 4.6s, 111 checks -- 110 passed, 0 failed and 1 SKIPPED -- "
+        "against ONLY the directory skeleton, and 111/0/0 against the developer "
+        "tree: every database is a temp file, every result dict is a literal, "
+        "no graph is compiled and no model is called. Real contention is real "
+        "(a second connection takes a genuine BEGIN EXCLUSIVE), which is why it "
+        "is the slowest bucket-A member. Not in the collision matrix: it writes "
+        "only inside its temp directory and the two package files it READS -- "
+        "storage/database_logger.py and batch/runner.py -- are written by "
+        "neither of the suite's two writers and are sha256-compared at the end"),
 }
 
 

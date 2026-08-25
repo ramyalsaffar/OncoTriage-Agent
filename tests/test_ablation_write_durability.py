@@ -99,6 +99,7 @@ import time
 from pathlib import Path
 
 from oncotriage import config as _config
+from oncotriage import degradation as _degradation
 from oncotriage.ablation import analysis as _analysis
 from oncotriage.ablation import common as _common
 from oncotriage.ablation import study as _study
@@ -363,6 +364,118 @@ check("3c  ...after exactly ONE attempt -- the retry is for contention, and "
 check_true("3d  ...and the budget really is more than one, so 3c is a "
            "statement about the classifier rather than about the loop bound",
            int(_config.SQLITE_WRITE_MAX_ATTEMPTS) > 1)
+
+
+# ---------------------------------------------------------------------------
+# 3e-3k  WRITE_RETRY_OUTCOMES: the helper counts what it did
+# ---------------------------------------------------------------------------
+#
+# UNTIL THIS COUNTER, `run_with_write_retry` INCREMENTED NOTHING. It printed a
+# console line and emitted a log record, both of which are gone the moment the
+# terminal scrolls, and left no total -- so at the end of a study "we retried
+# four hundred times and lost nothing" and "there was no contention to survive"
+# produced the identical run-end report. Those two have opposite implications
+# for what the next increment of load costs.
+#
+# DRIVEN ON A SYNTHETIC OPERATION RATHER THAN ON REAL CONTENTION, deliberately.
+# 3a above cannot say how many attempts it took -- the busy timeout is 30 s, so
+# the first attempt usually wins on its own, which is exactly what makes it a
+# good test of "the write lands" and a useless one of "the retry fired". A
+# callable that raises a stated number of stated exceptions is a different
+# INPUT to a function of its argument, which is this suite's standard control
+# shape for a pure decision, and it makes the expected key and count exact.
+#
+# THE COUNTER IS READ AS A DELTA, never cleared: 3a and 3b above went through
+# the same helper in this same process, and a harness that zeroed a registered
+# counter would be destroying state it did not declare.
+
+
+def retry_delta(fn, subject="a probe write"):
+    """Run `fn` through the helper; return (outcome, delta of the counter).
+
+    `outcome` is `None` on a clean return, or ("<raised>", TypeName) -- so a
+    control whose subject is a RAISE is a comparable value rather than an
+    exception escaping while `check`'s argument is being evaluated. This suite
+    has shipped that abort thirteen times.
+    """
+    before = dict(_dl.WRITE_RETRY_OUTCOMES)
+    try:
+        _dl.run_with_write_retry(fn, subject)
+        outcome = None
+    except BaseException as exc:                                # noqa: BLE001
+        outcome = ("<raised>", type(exc).__name__)
+    after = dict(_dl.WRITE_RETRY_OUTCOMES)
+    delta = {k: after[k] - before.get(k, 0)
+             for k in after if after[k] - before.get(k, 0)}
+    return outcome, delta
+
+
+def flaky(n_failures, exc):
+    """A callable that raises `exc` `n_failures` times, then returns a marker."""
+    state = {"n": 0}
+
+    def _op():
+        state["n"] += 1
+        if state["n"] <= n_failures:
+            raise exc
+        return "wrote"
+
+    return _op
+
+
+_LOCKED = sqlite3.OperationalError("database is locked")
+check("3e  precondition: the classifier calls that error transient, so the "
+      "drives below exercise the retry rather than the terminal arm",
+      _dl._is_retryable(_LOCKED), True)
+
+_out, _delta = retry_delta(flaky(0, _LOCKED))
+check("3f  an UNCONTENDED write moves the counter not at all -- a `recovered:` "
+      "key for every clean write would make this a call census rather than a "
+      "record of contention, and every write in the project would move it",
+      (_out, _delta), (None, {}))
+
+_out, _delta = retry_delta(flaky(2, _LOCKED))
+check("3g  two contended attempts then a success: TWO `retried:` and exactly "
+      "ONE `recovered:`. Retries are counted per SLEEP and recovery per CALL, "
+      "which is what lets a reader divide one by the other",
+      (_out, _delta),
+      (None, {"retried:OperationalError": 2,
+              "recovered:OperationalError": 1}))
+
+_MAX = max(1, int(_config.SQLITE_WRITE_MAX_ATTEMPTS))
+_out, _delta = retry_delta(flaky(_MAX + 5, _LOCKED))
+check("3h  contention that outlives the budget: `exhausted:` once, "
+      "`retried:` for every sleep that did happen, and NO `recovered:`",
+      (_out, _delta),
+      (("<raised>", "OperationalError"),
+       {"retried:OperationalError": _MAX - 1,
+        "exhausted:OperationalError": 1}))
+check_true("3h  ...and the budget is more than one, so the retried count "
+           "above is not vacuously zero", _MAX > 1)
+
+_TERMINAL = sqlite3.OperationalError("no such table: nope")
+check("3i  precondition: the classifier refuses that one (non-degeneracy for "
+      "3j)", _dl._is_retryable(_TERMINAL), False)
+_out, _delta = retry_delta(flaky(9, _TERMINAL))
+check("3j  a TERMINAL error moves the counter NOT AT ALL -- nothing was "
+      "retried, so there is no retry outcome, and the caller's own `except` is "
+      "what counts the failure with the caller's own meaning. An `exhausted:` "
+      "key here would be a second, differently-scoped tally of one event",
+      (_out, _delta), (("<raised>", "OperationalError"), {}))
+
+check("3k  the keys are an outcome word and an exception CLASS name -- code "
+      "identifiers only. Never the `subject` string, which a caller is free to "
+      "interpolate a path or a patient id into, and never an exception "
+      "message",
+      sorted({k.split(":", 1)[1] for k in _dl.WRITE_RETRY_OUTCOMES}),
+      ["OperationalError"])
+check("3k  ...and the outcome words are exactly the closed three",
+      sorted({k.split(":", 1)[0] for k in _dl.WRITE_RETRY_OUTCOMES}),
+      ["exhausted", "recovered", "retried"])
+check("3k  ...and the counter is on the run-end degradation report, which is "
+      "the whole point of counting: a total nobody prints is the state this "
+      "counter was added to leave",
+      "WRITE_RETRY_OUTCOMES" in _degradation.registered_names(), True)
 
 
 #------------------------------------------------------------------------------

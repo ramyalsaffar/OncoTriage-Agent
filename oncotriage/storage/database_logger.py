@@ -2173,6 +2173,46 @@ with 0 of each is one where there was no contention to survive. Folding them
 together would make those two indistinguishable.
 """
 
+WRITE_RETRY_OUTCOMES = Counter()
+"""What ``run_with_write_retry`` did, keyed ``{outcome}:{ExceptionType}``.
+
+THE GENERIC HELPER'S COUNTER, AND IT IS NOT ``INFERENCE_WRITE_RETRIES``. That one
+belongs to ``_write_inference_row_with_retry``, which owns its own loop, its own
+outcome dict and its own failure counter. ``run_with_write_retry`` is the helper
+every OTHER write in the project retries through -- today the ablation study's
+three -- and until this counter existed it incremented nothing at all: it printed
+a console line, emitted a log record, and left no total. A study that retried
+four hundred times to lose nothing was indistinguishable, at the end of the run,
+from one that met no contention, and the two have opposite implications for what
+the next increment of load costs.
+
+THREE OUTCOMES, A CLOSED VOCABULARY, AND THE FIRST ONE ALONE IS NOT ENOUGH:
+
+``retried:{Type}``    one per retry SCHEDULED -- per sleep, not per call. The
+                      direct analogue of ``INFERENCE_WRITE_RETRIES``.
+``recovered:{Type}``  one per CALL that retried at least once and then returned.
+                      This is the key that makes "retried and lost nothing"
+                      sayable; ``retried:`` on its own is equally consistent with
+                      a call that retried and then gave up.
+``exhausted:{Type}``  one per CALL that ran out of ``SQLITE_WRITE_MAX_ATTEMPTS``
+                      while the error was still retryable, and re-raised.
+
+THERE IS DELIBERATELY NO ``terminal:`` KEY. An error ``_is_retryable`` refuses is
+not a retry outcome -- nothing was retried -- and the caller's own ``except`` is
+what counts it, with the caller's own semantics. A key here would be a second,
+differently-scoped tally of the same event in a report that already carries the
+caller's.
+
+WHAT IT DOES NOT DOUBLE-COUNT: ``exhausted:`` is not a lost row. This helper
+RAISES rather than swallowing (see its docstring), so whether the write is lost
+is the caller's finding and the caller's counter. ``exhausted:`` says the retry
+mechanism gave up; what that cost is recorded where the decision was made.
+
+THE KEYS ARE AN OUTCOME WORD AND AN EXCEPTION CLASS NAME -- both code
+identifiers, never the ``subject`` string and never an exception MESSAGE, which
+can carry a path.
+"""
+
 JOURNAL_MODE_DEGRADATIONS = Counter()
 """Databases whose journal mode is not what ``SQLITE_JOURNAL_MODE`` asked for.
 
@@ -2435,24 +2475,43 @@ def run_with_write_retry(operation, subject):
             on a retry, which is why it must own its connection: a connection
             whose transaction was rolled back by a contention error is not a
             connection to reuse.
-        subject: what is being written, for the console and log lines. Free text
-            and NOT a counter key -- nothing here increments a counter, for the
-            reason above.
+        subject: what is being written, for the console and log lines. FREE
+            TEXT AND STILL NOT A COUNTER KEY, and that is unchanged by
+            ``WRITE_RETRY_OUTCOMES`` below: the counter keys on the exception
+            CLASS, which is a code identifier, because a caller is free to
+            interpolate a path or an id into this string and a run-end report is
+            not the place to discover that it did.
 
     ONLY THE TRANSIENT CLASS IS RETRIED, through ``_is_retryable``, which is the
     same classifier the inference write uses and excludes `duplicate column
     name` for the reason argued above it: a retry broad enough to repair the
     migration race would silently repair the negative control that proves the
     write lock necessary.
+
+    EVERY OUTCOME IS COUNTED into ``WRITE_RETRY_OUTCOMES``; see that counter for
+    the three keys and for why there is no fourth. Counting is the ONLY thing
+    this function does that it did not do before -- the control line, the log
+    record, the classifier, the delay schedule and what is re-raised are all
+    unchanged, so no caller's behaviour moves.
     """
     max_attempts = max(1, int(SQLITE_WRITE_MAX_ATTEMPTS))
     attempts = 0
+    last_retryable_type = None
     while True:
         attempts += 1
         try:
-            return operation()
+            value = operation()
         except Exception as exc:                               # noqa: BLE001
             if not _is_retryable(exc) or attempts >= max_attempts:
+                # EXHAUSTION IS COUNTED AND A TERMINAL ERROR IS NOT. The two
+                # arms of this `if` are different findings: the first means the
+                # budget ran out while the error was still transient (more
+                # attempts, a longer timeout or fewer writers would have helped)
+                # and the second means retrying was never going to work. Only
+                # the first is a retry outcome; the second is the caller's
+                # failure to count, in its own counter, with its own meaning.
+                if _is_retryable(exc):
+                    WRITE_RETRY_OUTCOMES[f"exhausted:{type(exc).__name__}"] += 1
                 raise
             delay = SQLITE_WRITE_RETRY_BASE_DELAY * (2 ** (attempts - 1))
             console.out(f"  ↻ Retrying {subject} in {delay:.2f}s "
@@ -2464,7 +2523,19 @@ def run_with_write_retry(operation, subject):
                         delay_s=round(delay, 3),
                         error_type=type(exc).__name__,
                         error_message=str(exc))
+            WRITE_RETRY_OUTCOMES[f"retried:{type(exc).__name__}"] += 1
+            last_retryable_type = type(exc).__name__
             time.sleep(delay)
+        else:
+            # RECOVERY IS COUNTED ONLY WHEN SOMETHING WAS SURVIVED. `attempts
+            # == 1` is the ordinary uncontended write, and a `recovered:` key
+            # for it would make the counter a call census rather than a record
+            # of contention -- every write in the project would move it, and the
+            # run-end report exists to name what did NOT go to plan.
+            if attempts > 1 and last_retryable_type is not None:
+                WRITE_RETRY_OUTCOMES[
+                    f"recovered:{last_retryable_type}"] += 1
+            return value
 
 
 # ---------------------------------------------------------------------------

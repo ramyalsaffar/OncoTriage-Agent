@@ -124,6 +124,16 @@ dags/__pycache__/
 .DS_Store
 **/.DS_Store
 .DS_Store?
+
+# tests/run_serial_tests.py's pristine copies of the two files the suite
+# rewrites in place, and the same-directory temp file `atomic_copy` renames
+# from. Both live INSIDE `oncotriage/`, which `COPY . /app/` ships, and a run
+# killed by SIGKILL leaves a pristine copy behind DELIBERATELY -- it is what the
+# next invocation repairs from. `**/` for the reason argued at `**/__pycache__`
+# above: the bare pattern matches at the context root and these are two
+# directories down.
+**/*.serial-runner-pristine-*
+**/.serial-runner-tmp-*
 ._*
 .Spotlight-V100
 .Trashes

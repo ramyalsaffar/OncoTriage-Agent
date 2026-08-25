@@ -144,6 +144,7 @@ from tqdm import tqdm
 # and because this import is at module scope, that holds transitively without a
 # second `import fcntl` here to keep in step.
 from oncotriage import control
+from oncotriage import degradation
 from oncotriage import paths
 from oncotriage.ablation.common import (
     ABLATION_DB_FILENAME,
@@ -2633,7 +2634,8 @@ send them hunting a bug that is not there.
 
 
 def print_study_close(status, study_elapsed, run_success, run_error,
-                      run_cancelled, db_path=None, out=None) -> None:
+                      run_cancelled, db_path=None, out=None,
+                      degradation_snapshot=None, census_snapshot=None) -> None:
     """The study's closing block. ONE TEXT, TWO CALLERS.
 
     Called from the normal path and from the Ctrl-C handler, which re-raises
@@ -2652,11 +2654,53 @@ def print_study_close(status, study_elapsed, run_success, run_error,
     Ctrl-C path skipped that block entirely, so an interrupted study reported
     none of its degradations.
 
+    AND IT IS WHERE THE REGISTRY'S TWO BLOCKS ARE PRINTED, WHICH THIS STUDY
+    OWED AND DID NOT PAY. Every counter in `oncotriage/degradation.py`'s
+    registry and census is moved by a study exactly as it is moved by a batch
+    run -- the study drives the same six-stage graph, the same Stage 5, the same
+    writer -- and until this function printed them, an ablation study reported
+    NONE of them. A study that dropped a retrieval channel on every patient, or
+    kept every sex-specific trial because a sex would not parse, ended with a
+    summary table and nothing saying so; `oncotriage/batch/runner.py` has
+    printed both blocks at the end of every run since the counter-reader pass,
+    and the two programs owe a reader the same account.
+
+    THE THREE READERS BELOW ARE STILL THIS FILE'S OWN and are NOT duplicated by
+    the registry block. `degradation.py` excludes this module's counters by name
+    -- importing the study there would drag the graph, the fixtures and the
+    thread pool into every batch run's import graph -- so `CHECKPOINT_FAULTS`,
+    `STOP_SWITCH_FAULTS` and this module's `RUN_RECORD_FAILURES` are read here
+    and only here. The registry's `RUN_RECORD_FAILURES` is
+    `oncotriage/storage/database_logger.py`'s, a different object with a
+    different subject; the two are the pair `tests/test_degradation_counter_
+    readers.py` calls dual-owned, and printing both is the point rather than a
+    collision.
+
+    ONE SNAPSHOT PER BLOCK, TAKEN HERE. The batch runner takes its two in
+    `main()` because it has THREE consumers of the degradation one -- the
+    structured event, the `run_metrics` flush and the printed block -- and they
+    must describe one instant. This study has exactly one consumer of each, so
+    the snapshot is taken at that consumer: same guarantee, no parameter for a
+    caller to forget. `degradation_snapshot` / `census_snapshot` stay
+    INJECTABLE for the same reason `out` is -- a test needs to drive the block
+    against known counts, and a future flush here would hand in the snapshot it
+    persisted rather than taking a second one.
+
+    BOTH ARE TAKEN BEFORE ANYTHING IS PRINTED, and that ordering is not
+    cosmetic: emitting a line can itself move `EMIT_FAILURES`, so a snapshot
+    taken part-way down would describe a report that was already being written.
+
     `out` IS INJECTABLE on `report_checkpoint_faults`' precedent: `main()`
     cannot be driven without a live Qdrant and a live billed call per pair, so a
     reader nothing can exercise is how a reader comes to be wrong.
     """
     emit = console.out if out is None else out
+    # TAKEN BEFORE THE FIRST `emit`, for the reason in the docstring: a line
+    # this block writes can itself move EMIT_FAILURES.
+    if degradation_snapshot is None:
+        degradation_snapshot = degradation.snapshot()
+    if census_snapshot is None:
+        census_snapshot = degradation.census_snapshot()
     # AN UNRECOGNISED STATUS IS NAMED RATHER THAN FALLING THROUGH THE CHAIN
     # BELOW INTO SILENCE. Without this a status outside the closed vocabulary
     # -- a typo, a member added without a branch -- prints the whole block with
@@ -2694,6 +2738,16 @@ def print_study_close(status, study_elapsed, run_success, run_error,
              f"{sum(CHECKPOINT_WRITE_FAILURES.values())} write "
              f"degradation(s) {dict(CHECKPOINT_WRITE_FAILURES)} -- resume "
              f"state may be behind the rows already in the database")
+
+    # SEVERITY ASCENDING, VERDICT LAST -- `oncotriage/batch/runner.py`'s
+    # ordering, adopted rather than invented. The census is observations about
+    # what this study rendered and flagged; the registry block is the faults;
+    # this module's own three readers are faults too and sit beside them; the
+    # `Status:` line below is the verdict. A reader scanning UP from the bottom
+    # of a long log meets the conclusion, then the reasoning, then the
+    # background.
+    degradation.print_census_report(census_snapshot, out=emit)
+    degradation.print_report(degradation_snapshot, out=emit)
 
     report_checkpoint_faults(out=emit)
     report_stop_switch_faults(out=emit)

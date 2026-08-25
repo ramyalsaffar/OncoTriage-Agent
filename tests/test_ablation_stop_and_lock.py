@@ -68,6 +68,7 @@ Run from terminal:
 import ast
 import calendar
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -91,6 +92,7 @@ os.environ.setdefault("ONCOTRIAGE_DEFER_LOCAL_MODELS", "1")
 
 import oncotriage                                              # noqa: E402
 from oncotriage import control as _control               # noqa: E402
+from oncotriage import degradation as _degradation      # noqa: E402
 from oncotriage import paths as _paths                         # noqa: E402
 from oncotriage.ablation import study as _study                # noqa: E402
 # IMPORTED ONLY TO ASSERT THE TWO CLASSES ARE DISTINCT (check 3k-b). This file
@@ -1069,18 +1071,44 @@ check("5i  STUDY_STATUSES is closed and its members are distinct. It is a "
       (_study.STUDY_STATUSES, len(set(_study.STUDY_STATUSES))),
       (("COMPLETE", "STOPPED", "INTERRUPTED", "CRASHED"), 4))
 
-_lines = []
-drive(_study.print_study_close, "NOT-A-STATUS", 1.0, 1, 0, 0,
-      db_path=os.path.join(_TMP, "warn", "clean.db"), out=_lines.append)
+def close_block(status, **kwargs):
+    """Drive `print_study_close` and return every line it emitted.
+
+    THE SINK TAKES ZERO ARGUMENTS AND THAT IS THE WHOLE REASON THIS HELPER
+    EXISTS. `_lines.append` was passed directly, and `print_study_close` emits
+    a BLANK LINE -- `emit()`, no argument -- as its second statement, which
+    `list.append` refuses with a TypeError. `drive` caught it and returned a
+    marker, so `_lines` held at most the ONE line printed above that call and
+    checks 5k and 5l were asserting `"..." not in ""`: satisfied by a function
+    that printed nothing at all, forever. Measured, not reasoned about -- the
+    raise is at study.py's `emit()` and both checks passed against an empty
+    list. `console.out()` accepts zero arguments, so the sink must too.
+    """
+    lines = []
+    outcome = drive(_study.print_study_close, status, 1.0, 1, 0, 0,
+                    out=lambda *a: lines.append(a[0] if a else ""), **kwargs)
+    return lines, outcome
+
+
+_lines, _outcome = close_block("NOT-A-STATUS",
+                               db_path=os.path.join(_TMP, "warn", "clean.db"))
 _txt = "\n".join(_lines)
+check("5j  ...the block ran to the end rather than raising part-way (non-"
+      "degeneracy: every 'X not in the text' check below is satisfied by an "
+      "empty text, which is what a raise inside `emit` produces)",
+      _outcome, None)
+check("5j  ...and it emitted the whole block, not just the line above the "
+      "first blank `emit()` (non-degeneracy for the same reason)",
+      len(_lines) > 8, True)
 check("5j  ...and an unrecognised status is NAMED rather than falling through "
       "into silence. Without the guard the whole block prints with NO `Status:` "
       "line at all, which reads as a study that ended in a way nobody thought "
       "to describe",
       ("unrecognised study status" in _txt, "CRASHED" in _txt), (True, True))
-_lines = []
-drive(_study.print_study_close, _study.STUDY_STATUS_COMPLETE, 1.0, 1, 0, 0,
-      db_path=os.path.join(_TMP, "warn", "clean.db"), out=_lines.append)
+_lines, _outcome = close_block(_study.STUDY_STATUS_COMPLETE,
+                               db_path=os.path.join(_TMP, "warn", "clean.db"))
+check("5k  ...the recognised-status block also ran to the end (non-degeneracy "
+      "for 5k and 5l below)", (_outcome, len(_lines) > 8), (None, True))
 check("5k  ...and a RECOGNISED one is not (non-degeneracy: a guard that fired "
       "on everything would satisfy 5f for the wrong reason)",
       "unrecognised study status" in "\n".join(_lines), False)
@@ -1089,6 +1117,128 @@ check("5l  a CANCELLED count is named only when it is non-zero, so a clean "
       "study's block is byte-identical to what it has always printed and a "
       "stopped one cannot report pairs nobody ran as pairs that failed",
       ("Cancelled:" in "\n".join(_lines)), False)
+
+
+# --- the registry's two blocks, which this study owed and did not pay -------
+#
+# THE STUDY MOVES EVERY COUNTER A BATCH RUN MOVES -- same graph, same Stage 5,
+# same writer -- and reported NONE of them until `print_study_close` printed
+# these two. The checks below are driven against SEEDED counters rather than
+# against whatever this process happens to have moved, so they say the blocks
+# REPORT rather than that they were merely called.
+
+_CENSUS_HEAD = "RENDER AND MARKER CENSUS"
+_DEGRADE_HEAD = "DEGRADATION COUNTERS"
+
+_lines, _outcome = close_block(_study.STUDY_STATUS_COMPLETE,
+                               db_path=os.path.join(_TMP, "warn", "clean.db"))
+_txt = "\n".join(_lines)
+check("5m  the closing block prints the CENSUS block", _CENSUS_HEAD in _txt, True)
+check("5m  ...and the DEGRADATION block", _DEGRADE_HEAD in _txt, True)
+
+
+_ORDER_MARKS = (("counts", "Database:"), ("census", _CENSUS_HEAD),
+                ("degradation", _DEGRADE_HEAD), ("verdict", "Status:"))
+
+
+def block_order(text, marks=_ORDER_MARKS):
+    """The named blocks, in the order they appear in `text`.
+
+    A MISSING BLOCK IS A NAMED ABSENCE RATHER THAN A `-1` THAT SORTS FIRST.
+    `str.find` returns -1 for 'not there', and -1 sorts ABOVE every real index
+    -- so an ordering assertion written on raw `find` results reports a DELETED
+    block as the FIRST block, which is a pass for the wrong reason.
+    """
+    found = [(name, text.find(needle)) for name, needle in marks]
+    missing = [name for name, i in found if i < 0]
+    if missing:
+        return missing + ["<MISSING>"]
+    return [name for name, _ in sorted(found, key=lambda m: m[1])]
+
+
+# DRIVEN ON `STOPPED`, WHICH IS THE ONLY STATUS THIS FUNCTION PRINTS A
+# `Status:` LINE FOR. On COMPLETE that line is `main()`'s, printed after this
+# block returns, so a COMPLETE drive has no verdict marker to order against --
+# measured, and it is why the first version of this check reported the verdict
+# as MISSING.
+_ORDER_LINES, _ORDER_OUTCOME = close_block(
+    _study.STUDY_STATUS_STOPPED,
+    db_path=os.path.join(_TMP, "warn", "clean.db"))
+_ORDER_TXT = "\n".join(_ORDER_LINES)
+check("5m  ...and they are ordered severity-ascending with the verdict last, "
+      "which is oncotriage/batch/runner.py's ordering adopted rather than "
+      "invented: the counts, then observations, then faults, then Status",
+      block_order(_ORDER_TXT),
+      ["counts", "census", "degradation", "verdict"])
+check("5m  control: block_order names a MISSING block instead of sorting its "
+      "-1 to the front, so a deleted block cannot read as a correctly-ordered "
+      "one", block_order(_ORDER_TXT.replace(_DEGRADE_HEAD, "xxxxx")),
+      ["degradation", "<MISSING>"])
+check("5m  control: ...and it reports a REORDERED text as reordered rather "
+      "than accepting any permutation",
+      block_order(_ORDER_TXT, (("degradation", _DEGRADE_HEAD),
+                               ("census", _CENSUS_HEAD))),
+      ["census", "degradation"])
+
+# THE FIRING CONTROL. A block that printed its heading and nothing else would
+# satisfy every check above; these seed a real counter in each registry and
+# require the value AND its key to reach the text.
+# SAVED AND RESTORED, NOT `clear_all()`. That helper zeroes every registered
+# counter, which is state this section did not declare and other sections in
+# this process may have moved -- the rule `clear_census`'s own docstring states
+# one file over. Two keys are seeded and exactly those two are put back.
+_SEED_D = ("AGE_PARSE_FAILURES", "ValueError:'6 Months'")
+_SEED_C = ("PROCEDURE_RENDER_COUNTS", "dropped")
+_WAS_D = _degradation._REGISTRY[_SEED_D[0]][_SEED_D[1]]
+_WAS_C = _degradation._CENSUS[_SEED_C[0]][_SEED_C[1]]
+_degradation._REGISTRY[_SEED_D[0]][_SEED_D[1]] = 3
+_degradation._CENSUS[_SEED_C[0]][_SEED_C[1]] = 5
+try:
+    _lines, _outcome = close_block(
+        _study.STUDY_STATUS_COMPLETE,
+        db_path=os.path.join(_TMP, "warn", "clean.db"))
+    _txt = "\n".join(_lines)
+finally:
+    _degradation._REGISTRY[_SEED_D[0]][_SEED_D[1]] = _WAS_D
+    _degradation._CENSUS[_SEED_C[0]][_SEED_C[1]] = _WAS_C
+
+check("5n  a moved DEGRADATION counter reaches the study's closing block, by "
+      "name, key and count", ("AGE_PARSE_FAILURES" in _txt,
+                              "ValueError:'6 Months'" in _txt,
+                              "3  ValueError:'6 Months'" in _txt),
+      (True, True, True))
+check("5n  a moved CENSUS counter reaches it too, and is NOT reported as a "
+      "degradation", ("PROCEDURE_RENDER_COUNTS" in _txt,
+                      _txt.index("PROCEDURE_RENDER_COUNTS")
+                      < _txt.index("AGE_PARSE_FAILURES")),
+      (True, True))
+check("5n  control: the seeded keys were put back exactly as they were, so no "
+      "later check in this file inherits them (a seed left behind is a control "
+      "that changed its neighbours)",
+      (_degradation._REGISTRY[_SEED_D[0]][_SEED_D[1]],
+       _degradation._CENSUS[_SEED_C[0]][_SEED_C[1]]), (_WAS_D, _WAS_C))
+check("5n  control: ...and the restore is not vacuous -- the seed really did "
+      "differ from what was there", (_WAS_D, _WAS_C) != (3, 5), True)
+
+# STRUCTURAL, BECAUSE THE BEHAVIOURAL CHECKS ABOVE CANNOT SEE A SECOND
+# SNAPSHOT. Two `degradation.snapshot()` calls in one block would let the two
+# halves of one report describe different instants -- the defect the batch
+# runner's ONE SNAPSHOT comment exists to prevent -- and both would still print
+# everything these checks look for.
+with io.open(os.path.abspath(_study.__file__), encoding="utf-8") as _fh:
+    _CLOSE_SRC = ast.parse(_fh.read())
+_CLOSE_FN = next((n for n in ast.walk(_CLOSE_SRC)
+                  if isinstance(n, ast.FunctionDef)
+                  and n.name == "print_study_close"), None)
+check("5o  print_study_close was found (non-degeneracy for the two below)",
+      _CLOSE_FN is not None, True)
+_SNAP_CALLS = sorted(
+    n.func.attr for n in ast.walk(_CLOSE_FN or ast.Module(body=[], type_ignores=[]))
+    if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+    and n.func.attr in ("snapshot", "census_snapshot"))
+check("5o  ...and it takes exactly one snapshot of each registry, so the two "
+      "blocks and the study's own counters describe ONE instant",
+      _SNAP_CALLS, ["census_snapshot", "snapshot"])
 
 
 # ===========================================================================

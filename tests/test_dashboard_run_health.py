@@ -1533,11 +1533,18 @@ check("7c  the production database is byte-identical",
 # TWO SHAPES WERE AVAILABLE AND GATING WON.
 #
 #   reclassify to bucket E   the tests/test_storage_write_durability.py
-#                            precedent, whose entry is the IDENTICAL single
-#                            probe. Simpler, and it removes this whole file --
-#                            160 checks, the only standing coverage of the Run
-#                            Health tab and the four run loaders -- from CI to
-#                            preserve one probe.
+#                            precedent AS IT STOOD, whose entry was the
+#                            IDENTICAL single probe. Simpler, and it removes
+#                            this whole file -- 160 checks, the only standing
+#                            coverage of the Run Health tab and the four run
+#                            loaders -- from CI to preserve one probe.
+#                            THAT PRECEDENT HAS SINCE BEEN REVERSED, by the
+#                            pass that took this file's ruling and applied it
+#                            there: test_storage_write_durability.py gates its
+#                            probe and is bucket A, so neither file is out of
+#                            CI for one check any more. This paragraph is kept
+#                            as the argument, not as a description of that
+#                            file.
 #   gate the probe alone     keeps all of them, and loses one probe on a
 #                            machine where that probe HAS NO SUBJECT. When
 #                            there is no production database, "the comparison

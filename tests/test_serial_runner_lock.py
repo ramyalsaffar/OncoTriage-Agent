@@ -100,6 +100,7 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -224,6 +225,15 @@ if os.path.realpath(srt.__file__) != os.path.realpath(_RUNNER_PATH):
     raise SystemExit(
         f"[SerialLock] imported {srt.__file__!r}, wanted {_RUNNER_PATH!r}")
 
+_REPO_ROOT = os.path.dirname(_THIS_DIR)
+"""The repository root, derived from this file's own location.
+
+The same derivation the runner makes for `_CODE_DIR`, and NOT read off `srt`:
+section 1's pair checks are about whether the runner's declared table matches
+the tree, and taking the tree's location from the thing under test would make
+half of that comparison agree with itself by construction.
+"""
+
 _TMP = tempfile.mkdtemp(prefix="serial-lock-")
 
 
@@ -249,6 +259,83 @@ check("1b  the two lock exit codes are distinct -- 'wait' and 'fix your temp "
 check("1c  the directory mode is owner-only", oct(srt.LOCK_DIRECTORY_MODE),
       oct(0o700))
 check("1d  the file mode is owner-only", oct(srt.LOCK_FILE_MODE), oct(0o600))
+
+# --- the pristine-copy guard's surface, and its table checked pair by pair ---
+
+for _name in ("WRITER_OWNED_FILES", "BACKUP_MARKER", "EXIT_BACKUP_UNAVAILABLE",
+              "EXIT_SIGNALLED", "BackupUnavailable", "backup_path",
+              "backup_owner", "file_digest", "atomic_copy",
+              "find_pristine_backups", "repair_pristine_backups",
+              "repair_lines", "pristine_guard", "release_pristine_backups",
+              "release_lines", "backup_unavailable_lines",
+              "shutdown_signals_reach_cleanup", "_terminate_child",
+              "CHILD_SHUTDOWN_GRACE_SECONDS"):
+    check_true(f"1e  {_name} exists", hasattr(srt, _name))
+
+
+def writer_evidence(writer_rel, target_rel, code_dir=_REPO_ROOT):
+    """What the named writer's OWN SOURCE says about the target it rewrites.
+
+    Returns (names_the_target, writes_a_file, is_serial). By AST, so a mention
+    in a comment does not count and a mention in a DOCSTRING does -- string
+    constants are what a path expression is built from, and separating the two
+    would mean re-implementing the collision matrix's path resolution here.
+
+    THIS IS THE HALF OF `WRITER_OWNED_FILES` THAT CAN BE CHECKED. An entry
+    pointing at a file that moved, or at a test that stopped rewriting it, fails
+    here. A brand-new third writer that nobody declared does NOT, and the
+    runner's own docstring says so and says why -- a scan wide enough to catch
+    one flags nine files in this suite that write only into a temp directory.
+    """
+    path = os.path.join(code_dir, writer_rel)
+    if not os.path.isfile(path):
+        return (False, False, False)
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    names = any(isinstance(n, ast.Constant) and isinstance(n.value, str)
+                and target_rel in n.value for n in ast.walk(tree))
+    writes = False
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.Call):
+            continue
+        func = getattr(n.func, "id", "") or getattr(n.func, "attr", "")
+        if func == "open" and len(n.args) >= 2:
+            mode = n.args[1]
+            if isinstance(mode, ast.Constant) and isinstance(mode.value, str) \
+                    and ("w" in mode.value or "a" in mode.value):
+                writes = True
+        if func in ("copy2", "copyfile", "write_text", "write_bytes"):
+            writes = True
+    serial = writer_rel in {rel for rel, _why in srt.SERIAL_TESTS}
+    return (names, writes, serial)
+
+
+check("1f  WRITER_OWNED_FILES is not empty and every entry is a (file, "
+      "writer) pair (non-degeneracy: the loop below iterates nothing "
+      "otherwise)",
+      (len(srt.WRITER_OWNED_FILES) > 0,
+       all(len(e) == 2 for e in srt.WRITER_OWNED_FILES)), (True, True))
+for _target_rel, _writer_rel in srt.WRITER_OWNED_FILES:
+    check(f"1g  {_target_rel} really is there to be copied",
+          os.path.isfile(os.path.join(_REPO_ROOT, _target_rel)), True)
+    check(f"1g  ...and {_writer_rel} names it, writes a file, and is in "
+          f"SERIAL_TESTS", writer_evidence(_writer_rel, _target_rel),
+          (True, True, True))
+check("1h  control: writer_evidence reports a writer that does not name the "
+      "target, so 1g is a statement about the pair rather than about the file "
+      "existing", writer_evidence(srt.WRITER_OWNED_FILES[0][1],
+                                  "oncotriage/no_such_module.py")[0], False)
+check("1h  control: ...and a writer path that is not there at all",
+      writer_evidence("tests/no_such_test.py",
+                      srt.WRITER_OWNED_FILES[0][0]),
+      (False, False, False))
+check("1h  control: ...and a test in this suite that reads the package "
+      "without rewriting it is NOT in SERIAL_TESTS, so the third member "
+      "discriminates",
+      writer_evidence("tests/test_serial_runner_lock.py",
+                      srt.WRITER_OWNED_FILES[0][0])[2], False)
+check("1i  the copy's marker cannot make a copy look like a Python module -- "
+      "the package walk in tests/test_package_invariants.py is over `*.py`",
+      srt.backup_path("/x/config.py", 1).endswith(".py"), False)
 
 
 #------------------------------------------------------------------------------
@@ -613,6 +700,22 @@ for _i, _rel in enumerate(_names):
     _dest = os.path.join(_CHECKOUT, _rel)
     os.makedirs(os.path.dirname(_dest), exist_ok=True)
     open(_dest, "w").write(_PARKING_STUB if _i == 0 else _NOOP_STUB)
+
+# THE WRITER-OWNED FILES HAVE TO EXIST IN THE FAKE CHECKOUT TOO, and they are
+# derived from `WRITER_OWNED_FILES` rather than retyped for the same reason the
+# five test paths are: an entry added there must not leave this drive building
+# the wrong tree and failing the guard's preflight instead of the lock.
+# `pristine_guard` refuses to start a run it cannot take a copy for, so without
+# these the entry point would exit EXIT_BACKUP_UNAVAILABLE before ever reaching
+# the lock and section 7 would be measuring the wrong refusal.
+for _rel, _writer in srt.WRITER_OWNED_FILES:
+    _dest = os.path.join(_CHECKOUT, _rel)
+    os.makedirs(os.path.dirname(_dest), exist_ok=True)
+    open(_dest, "w").write(f"# stand-in for {_rel} in a throwaway checkout\n")
+check("7b  ...and the fake checkout carries every writer-owned file, so the "
+      "refusal measured below is the LOCK's and not the pristine guard's",
+      sorted(os.path.isfile(os.path.join(_CHECKOUT, r))
+             for r, _ in srt.WRITER_OWNED_FILES), [True] * len(srt.WRITER_OWNED_FILES))
 
 _LINKED = os.path.join(_TMP, "fake-checkout-link")
 os.symlink(_CHECKOUT, _LINKED)
@@ -1272,12 +1375,718 @@ check("9g  oncotriage/control.py is byte-unchanged: every plant above went "
 
 
 # ===========================================================================
-# 10.  ISOLATION
+# 10.  THE PRISTINE-COPY GUARD, DRIVEN WITH A REAL SIGKILL
+# ===========================================================================
+#
+# THE LOCK IS ABOUT TWO RUNS. THIS IS ABOUT ONE RUN DYING, which is a different
+# defect with the same consequence: `oncotriage/config.py` or
+# `cancer_code_registry.py` left holding a deliberately planted defect, silently,
+# with the only copy of what it replaced destroyed along with the temp directory
+# the dead test had put it in.
+#
+# EVERY ARM BELOW IS DRIVEN THROUGH THE SHIPPED ENTRY POINT AS A REAL
+# SUBPROCESS, WITH A REAL SIGNAL. A SIGKILL cannot be delivered to the process
+# asserting about it, and an in-process `raise SystemExit` would test the test
+# rather than the shipped handler -- the argument
+# `tests/test_runner_sigterm_shutdown.py` makes for its own subprocesses,
+# adopted here.
+#
+# THE PAYLOAD IS STUBS, on section 7's design and for its reason: the checkout
+# is a `tempfile.mkdtemp()` carrying a BYTE-IDENTICAL copy of the runner beside
+# stand-ins at every path `SERIAL_TESTS` and `WRITER_OWNED_FILES` name. So a
+# BROKEN guard costs a corrupted stand-in in a temp directory rather than a
+# corrupted `oncotriage/`.
+
+section("10. The pristine-copy guard, driven")
+
+_PRISTINE_TEXT = "# PRISTINE\nDATA_SNAPSHOT_DATE = '2026-08-04'\n"
+_PLANTED_TEXT = "# PLANTED BY A TEST THAT NEVER GOT TO RESTORE IT\nDATA_SNAPSHOT_DATE = '1999-01-01'\n"
+_PRISTINE_SHA = hashlib.sha256(_PRISTINE_TEXT.encode()).hexdigest()
+_PLANTED_SHA = hashlib.sha256(_PLANTED_TEXT.encode()).hexdigest()
+check("10a the two contents differ, so every comparison below discriminates "
+      "(non-degeneracy)", _PRISTINE_SHA != _PLANTED_SHA, True)
+
+# THE TARGET IS THE FIRST WRITER-OWNED FILE, read off the module rather than
+# named here: an entry reordered or renamed in WRITER_OWNED_FILES must not
+# leave this drive planting into a file the guard does not cover, which would
+# report the guard as broken when it is the drive that moved.
+_TARGET_REL = srt.WRITER_OWNED_FILES[0][0]
+
+
+def build_guard_checkout(root, first_stub):
+    """A throwaway checkout: the real runner, five stubs, the writer files.
+
+    Returns the path to the copied entry point. The copy is sha256-compared by
+    the caller, so what is driven is the shipped guard rather than a paraphrase
+    of it.
+    """
+    os.makedirs(os.path.join(root, "tests"), exist_ok=True)
+    entry = os.path.join(root, "tests", "run_serial_tests.py")
+    shutil.copy2(_RUNNER_PATH, entry)
+    for i, (rel, _why) in enumerate(srt.SERIAL_TESTS):
+        dest = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w") as fh:
+            fh.write(first_stub if i == 0 else _NOOP_STUB)
+    for rel, _writer in srt.WRITER_OWNED_FILES:
+        dest = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w") as fh:
+            fh.write(_PRISTINE_TEXT)
+    return entry
+
+
+def planting_stub(root, ready, release):
+    """A stub that CORRUPTS the writer-owned file, then parks on a file.
+
+    PARKS RATHER THAN SLEEPS, on section 7's measured lesson: a sleep makes the
+    assertion a statement about this machine's scheduler. While it is parked the
+    tree is provably corrupt and the runner is provably alive, which is the
+    exact instant every arm below needs.
+    """
+    target = os.path.join(root, _TARGET_REL)
+    return "\n".join([
+        "import os, sys, time",
+        f"open({target!r}, 'w').write({_PLANTED_TEXT!r})",
+        f"open({ready!r}, 'w').write(str(os.getpid()))",
+        "_deadline = time.time() + 90",
+        f"while not os.path.exists({release!r}) and time.time() < _deadline:",
+        "    time.sleep(0.02)",
+        "sys.exit(0)",
+    ])
+
+
+def restoring_stub(root, ready, release):
+    """A stub that corrupts, parks, and then restores -- an honest writer."""
+    target = os.path.join(root, _TARGET_REL)
+    return "\n".join([
+        "import os, sys, time",
+        f"open({target!r}, 'w').write({_PLANTED_TEXT!r})",
+        f"open({ready!r}, 'w').write(str(os.getpid()))",
+        "_deadline = time.time() + 90",
+        f"while not os.path.exists({release!r}) and time.time() < _deadline:",
+        "    time.sleep(0.02)",
+        f"open({target!r}, 'w').write({_PRISTINE_TEXT!r})",
+        "sys.exit(0)",
+    ])
+
+
+def wait_for(path, proc, timeout=90):
+    """Wait for `path` while `proc` is alive. Returns True if it appeared."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(path):
+            return True
+        if proc.poll() is not None:
+            return os.path.exists(path)
+        time.sleep(0.02)
+    return os.path.exists(path)
+
+
+def position(text, needle):
+    """Where `needle` starts in `text`, or a NAMED absence -- never a raise.
+
+    `str.index` RAISES, AND IT RAISES ON EXACTLY THE DEFECT THE ORDERING CHECK
+    BELOW EXISTS TO CATCH: a revert that stops the repair being announced makes
+    the announcement absent, and the ordering assertion built on `.index` then
+    dies while `check`'s argument is being evaluated -- one traceback where the
+    run owed a summary and a hundred and eighty results. MEASURED, not reasoned
+    about: the first version of this file did exactly that under two of its own
+    eight reverts. This project has shipped that abort shape thirteen times.
+    """
+    at = text.find(needle)
+    return at if at >= 0 else f"<absent: {needle[:32]!r}>"
+
+
+def pid_in(path):
+    """The pid a stub wrote into `path`, or a named absence -- never a raise.
+
+    Same argument as `position`: `int(open(path).read())` raises for a file that
+    is not there, which is what a revert that stops the run reaching its first
+    test produces.
+    """
+    try:
+        with open(path) as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def sha_of(path):
+    if not os.path.isfile(path):
+        return "absent"
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
+
+
+def copies_in(root):
+    """Every pristine copy sitting in `root`, as basenames, sorted."""
+    return sorted(os.path.basename(b)
+                  for b, _t, _p in srt.find_pristine_backups(root))
+
+
+_GUARD_ENV = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+_GUARD_LOGS = os.path.join(_TMP, "guard-logs")
+os.makedirs(_GUARD_LOGS, exist_ok=True)
+
+
+def start_runner(entry, tag):
+    """Launch the entry point with its output going to a FILE, not a pipe.
+
+    A PIPE IS A HANG WAITING TO HAPPEN HERE, and the revert matrix is what found
+    it rather than reading. Every arm below deliberately stops the runner while
+    a test subprocess is still alive, and that child INHERITS the pipe -- so
+    `communicate()` on the parent blocks until the ORPHAN exits, not until the
+    runner does. Under a revert that removes the signal handlers the orphan
+    holds it for its full park and the file does not finish in two minutes: a
+    hang, which reads exactly like an abort and reports neither a summary nor a
+    failure.
+
+    A file has no reader to block, so `wait()` returns the moment the runner is
+    gone and the output is read afterwards from disk.
+    """
+    path = os.path.join(_GUARD_LOGS, f"{tag}.log")
+    handle = open(path, "wb")
+    proc = subprocess.Popen([sys.executable, entry], stdout=handle,
+                            stderr=subprocess.STDOUT, env=_GUARD_ENV)
+    proc._oncotriage_log = path                       # noqa: SLF001 -- ours
+    proc._oncotriage_handle = handle                  # noqa: SLF001 -- ours
+    return proc
+
+
+def runner_output(proc):
+    """Everything the runner wrote, read off disk. Safe after a kill."""
+    try:
+        proc._oncotriage_handle.close()               # noqa: SLF001 -- ours
+    except OSError:
+        pass
+    try:
+        with open(proc._oncotriage_log, "rb") as fh:  # noqa: SLF001 -- ours
+            return fh.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+# --- 10b-10h  SIGKILL: nothing runs, and the NEXT invocation repairs --------
+#
+# SIGKILL IS THE ARM THAT MATTERS AND IT IS WHY THE COPY IS A FILE. No handler,
+# no `finally` and no context manager executes when the kernel removes the
+# process, so the in-process restore is unreachable BY CONSTRUCTION here. What
+# has to work instead is that the copy outlived the run and that the successor
+# finds it.
+
+_KILL_ROOT = os.path.join(_TMP, "guard-sigkill")
+_KILL_READY = os.path.join(_TMP, "guard-kill-ready")
+_KILL_RELEASE = os.path.join(_TMP, "guard-kill-release")
+_KILL_ENTRY = build_guard_checkout(
+    _KILL_ROOT, planting_stub(_KILL_ROOT, _KILL_READY, _KILL_RELEASE))
+_KILL_TARGET = os.path.join(_KILL_ROOT, _TARGET_REL)
+
+check("10b the driven entry point is BYTE-IDENTICAL to the shipped one, so "
+      "what is measured below is the shipped guard",
+      sha_of(_KILL_ENTRY), _RUNNER_SHA)
+
+_killed = start_runner(_KILL_ENTRY, "kill")
+_reached = wait_for(_KILL_READY, _killed)
+check("10c the run reached its first test and that test has corrupted the "
+      "tree (non-degeneracy: every assertion below is about a tree that is "
+      "really damaged)",
+      (_reached, sha_of(_KILL_TARGET)), (True, _PLANTED_SHA))
+# DERIVED FROM `WRITER_OWNED_FILES`, NOT WRITTEN OUT: the guard takes one copy
+# per declared file, so a hand-written list here would fail the day a third
+# writer is declared and would name the guard rather than itself.
+_EXPECTED_COPIES = sorted(
+    os.path.basename(srt.backup_path(os.path.join(_KILL_ROOT, rel),
+                                     _killed.pid))
+    for rel, _writer in srt.WRITER_OWNED_FILES)
+check("10d ...and the runner took a pristine copy of EVERY writer-owned file "
+      "BEFORE that test ran, each carrying its own pid",
+      copies_in(_KILL_ROOT), _EXPECTED_COPIES)
+check("10d ...and there is more than one of them, so 10d is not a statement "
+      "about a single-entry table (non-degeneracy)",
+      len(_EXPECTED_COPIES) > 1, True)
+
+_STUB_PID = pid_in(_KILL_READY)
+os.kill(_killed.pid, signal.SIGKILL)
+_killed.wait(timeout=60)
+if _STUB_PID is not None:
+    try:
+        os.kill(_STUB_PID, signal.SIGKILL)
+    except OSError:
+        pass
+check("10e a real SIGKILL leaves the tree CORRUPT and the copy in place -- no "
+      "handler, no `finally`, no context manager ran, which is the whole "
+      "reason the copy is a file beside its target rather than a temp "
+      "directory in a dead process",
+      (_killed.returncode, sha_of(_KILL_TARGET), copies_in(_KILL_ROOT)),
+      (-signal.SIGKILL, _PLANTED_SHA, _EXPECTED_COPIES))
+
+# THE SUCCESSOR. Its first test is a no-op, so the only thing that can change
+# the file is the repair.
+with open(os.path.join(_KILL_ROOT, srt.SERIAL_TESTS[0][0]), "w") as _fh:
+    _fh.write(_NOOP_STUB)
+_next = subprocess.run([sys.executable, _KILL_ENTRY], capture_output=True,
+                       text=True, env=_GUARD_ENV)
+check("10f the NEXT invocation repairs the tree, byte-identically",
+      (_next.returncode, sha_of(_KILL_TARGET)), (0, _PRISTINE_SHA))
+check("10g ...and it ANNOUNCES what it repaired, naming the file and the pid "
+      "of the run that left it",
+      ("A PREVIOUS RUN DID NOT REACH ITS CLEANUP" in _next.stdout,
+       _TARGET_REL in _next.stdout,
+       f"pid {_killed.pid}" in _next.stdout), (True, True, True))
+_AT_REPAIR = position(_next.stdout, "A PREVIOUS RUN DID NOT REACH ITS CLEANUP")
+_AT_RUN = position(_next.stdout, "SERIAL TEST RUN")
+check("10h ...BEFORE it runs anything -- a repair announced after the suite "
+      "has already read the tree it repaired is a report, not a repair",
+      (isinstance(_AT_REPAIR, int), isinstance(_AT_RUN, int),
+       _AT_REPAIR < _AT_RUN if isinstance(_AT_REPAIR, int)
+       and isinstance(_AT_RUN, int) else (_AT_REPAIR, _AT_RUN)),
+      (True, True, True))
+check("10i ...and the copy is gone, so the run after THIS one announces "
+      "nothing", copies_in(_KILL_ROOT), [])
+
+
+# --- 10j-10n  SIGTERM reaches the cleanup, in this process's own lifetime ---
+#
+# THE ARM SIGKILL CANNOT COVER. `docker stop`, systemd's stop and a bare `kill`
+# all send SIGTERM, whose CPython default terminates the process outright -- no
+# exception, no unwinding, no `finally`. Converting it to a SystemExit is what
+# puts the restore back on the path.
+
+_TERM_ROOT = os.path.join(_TMP, "guard-sigterm")
+_TERM_READY = os.path.join(_TMP, "guard-term-ready")
+_TERM_RELEASE = os.path.join(_TMP, "guard-term-release")
+_TERM_ENTRY = build_guard_checkout(
+    _TERM_ROOT, planting_stub(_TERM_ROOT, _TERM_READY, _TERM_RELEASE))
+_TERM_TARGET = os.path.join(_TERM_ROOT, _TARGET_REL)
+
+_termed = start_runner(_TERM_ENTRY, "term")
+_reached = wait_for(_TERM_READY, _termed)
+check("10j the SIGTERM arm reached a corrupt tree too (non-degeneracy)",
+      (_reached, sha_of(_TERM_TARGET)), (True, _PLANTED_SHA))
+
+os.kill(_termed.pid, signal.SIGTERM)
+_termed.wait(timeout=120)
+_term_out = runner_output(_termed)
+check("10k SIGTERM exits 143 rather than being absorbed or ignored",
+      _termed.returncode, srt.EXIT_SIGNALLED)
+check("10l ...and the tree is restored IN THIS RUN's own lifetime, without "
+      "waiting for a successor", sha_of(_TERM_TARGET), _PRISTINE_SHA)
+check("10m ...and the copy is removed, so the next run announces no repair",
+      copies_in(_TERM_ROOT), [])
+check("10n ...and the shutdown is announced on stderr, which is where it has "
+      "to be: Python block-buffers stdout when it is not a tty, so a line "
+      "written there can materialise at interpreter exit or not at all",
+      "Signal" in _term_out and "Restoring" in _term_out, True)
+
+
+# --- 10n2  THE CHILD IS STOPPED, WITH A BOUND, AND ASKED FIRST -------------
+#
+# TWO OBVIOUS CLAIMS ABOUT `_terminate_child` WERE WRITTEN AS CHECKS HERE AND
+# BOTH WERE FALSE. They are recorded because a check that cannot discriminate is
+# worse than no check: it passes, so it looks like it is working.
+#
+#   "without it the runner restores while a live writer is still planting"
+#       -- driven: a revert of `_run_one` to `subprocess.run` reported 182
+#          passed, 0 failed. `subprocess.run`'s own bare `except:` already
+#          calls `process.kill()`, so no orphan is produced either way.
+#   "SIGTERM first lets the child's `finally` run and restore its own file"
+#       -- driven: a stub whose `finally` writes a marker was sent SIGTERM
+#          through this function and the marker was NOT written. CPython does
+#          not convert SIGTERM into an exception; the default disposition
+#          terminates the process, so a plain Python child's `finally` does not
+#          run for it any more than for SIGKILL.
+#
+# WHAT IS LEFT IS SMALLER AND IS WHAT IS CHECKED: the child is not left running,
+# the wait is BOUNDED (`subprocess.run`'s is not), and it is ASKED before it is
+# shot -- which buys nothing for these five children and is the right thing for
+# a runner to send. THE PRISTINE COPY IS THE MECHANISM; this is hygiene.
+
+_GRACEFUL_ROOT = os.path.join(_TMP, "guard-graceful")
+_GRACEFUL_READY = os.path.join(_TMP, "guard-graceful-ready")
+_GRACEFUL_TARGET_ABS = os.path.join(_GRACEFUL_ROOT, _TARGET_REL)
+_GRACEFUL_STUB = "\n".join([
+    "import os, sys, time",
+    f"open({_GRACEFUL_TARGET_ABS!r}, 'w').write({_PLANTED_TEXT!r})",
+    f"open({_GRACEFUL_READY!r}, 'w').write(str(os.getpid()))",
+    "time.sleep(120)",
+])
+_GRACEFUL_ENTRY = build_guard_checkout(_GRACEFUL_ROOT, _GRACEFUL_STUB)
+
+_graceful = start_runner(_GRACEFUL_ENTRY, "graceful")
+_reached = wait_for(_GRACEFUL_READY, _graceful)
+_GRACEFUL_PID = pid_in(_GRACEFUL_READY)
+check("10n2 the graceful arm reached a corrupt tree with a writer that would "
+      "sleep for two minutes if nobody stopped it (non-degeneracy)",
+      (_reached, sha_of(_GRACEFUL_TARGET_ABS)), (True, _PLANTED_SHA))
+_t0 = time.time()
+os.kill(_graceful.pid, signal.SIGTERM)
+_graceful.wait(timeout=120)
+_ELAPSED = time.time() - _t0
+runner_output(_graceful)
+check("10n2 ...and the runner did not wait for that sleep. The bound is the "
+      "point: subprocess.run's cleanup is kill() then an UNBOUNDED wait(), so "
+      "a child stuck in uninterruptible I/O holds the runner, its lock and the "
+      "un-restored tree open with no deadline",
+      _ELAPSED < srt.CHILD_SHUTDOWN_GRACE_SECONDS, True)
+check("10n2 ...and the child is gone rather than merely quiet -- it had 118 "
+      "seconds of sleep left",
+      guarded(os.kill, _GRACEFUL_PID or -1, 0) is not None, True)
+check("10n2 ...and the tree is pristine and no copy of ours is left",
+      (sha_of(_GRACEFUL_TARGET_ABS), copies_in(_GRACEFUL_ROOT)),
+      (_PRISTINE_SHA, []))
+check("10n2 ...and the grace is bounded and finite, so a test that hangs "
+      "after being asked to stop cannot hold the tree open until an "
+      "orchestrator SIGKILLs the RUNNER -- the one shutdown the runner cannot "
+      "clean up after",
+      isinstance(srt.CHILD_SHUTDOWN_GRACE_SECONDS, (int, float))
+      and 0 < srt.CHILD_SHUTDOWN_GRACE_SECONDS < 300, True)
+
+# STRUCTURAL, BECAUSE NO BEHAVIOURAL CHECK ABOVE CAN SEE WHICH SIGNAL WAS SENT:
+# these five children die of either one without unwinding, so the tree looks the
+# same. SIGTERM-first is still what a runner should send -- it is catchable and
+# SIGKILL is not -- and a `terminate()` quietly replaced by a `kill()` would
+# leave every check above green.
+_TC = next((n for n in ast.walk(ast.parse(_RUNNER_TEXT))
+            if isinstance(n, ast.FunctionDef) and n.name == "_terminate_child"),
+           None)
+check("10n3 _terminate_child was found (non-degeneracy for the two below)",
+      _TC is not None, True)
+_TC_CALLS = [getattr(n.func, "attr", "") for n in
+             ast.walk(_TC or ast.Module(body=[], type_ignores=[]))
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
+check("10n3 ...and it asks with terminate() BEFORE it insists with kill()",
+      (_TC_CALLS.index("terminate") if "terminate" in _TC_CALLS else -1)
+      < (_TC_CALLS.index("kill") if "kill" in _TC_CALLS else -1)
+      and "terminate" in _TC_CALLS and "kill" in _TC_CALLS, True)
+check("10n3 ...and every wait it does is bounded -- an unbounded one is "
+      "exactly what subprocess.run's cleanup does",
+      all(any(k.arg == "timeout" for k in n.keywords)
+          for n in ast.walk(_TC or ast.Module(body=[], type_ignores=[]))
+          if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "wait"),
+      True)
+
+
+# --- 10o-10r  the ordinary path is unchanged and leaves nothing behind -------
+
+_OK_ROOT = os.path.join(_TMP, "guard-clean")
+_OK_READY = os.path.join(_TMP, "guard-ok-ready")
+_OK_RELEASE = os.path.join(_TMP, "guard-ok-release")
+_OK_ENTRY = build_guard_checkout(
+    _OK_ROOT, restoring_stub(_OK_ROOT, _OK_READY, _OK_RELEASE))
+_OK_TARGET = os.path.join(_OK_ROOT, _TARGET_REL)
+open(_OK_RELEASE, "w").close()          # never parks; runs straight through
+_ok = subprocess.run([sys.executable, _OK_ENTRY], capture_output=True,
+                     text=True, env=_GUARD_ENV)
+check("10o a run whose writers restore their own files exits 0 and leaves the "
+      "tree exactly as it found it",
+      (_ok.returncode, sha_of(_OK_TARGET)), (0, _PRISTINE_SHA))
+check("10p ...and leaves no pristine copy behind", copies_in(_OK_ROOT), [])
+check("10q ...and says NOTHING about repairs or about the tree, because a "
+      "line printed on every clean run is a line a reader learns to skip and "
+      "this one has to be read the once it appears",
+      ("A PREVIOUS RUN DID NOT REACH ITS CLEANUP" in _ok.stdout,
+       "THE TREE WAS NOT WHAT THIS RUN FOUND" in _ok.stdout), (False, False))
+
+# THE OTHER HALF OF 10q: a writer that does NOT restore is announced. On the
+# real suite both do and assert byte-identity, so this block appearing means one
+# of them did not -- and this guard is the only thing positioned to notice.
+_BAD_ROOT = os.path.join(_TMP, "guard-unrestored")
+_BAD_ENTRY = build_guard_checkout(
+    _BAD_ROOT, planting_stub(_BAD_ROOT, os.path.join(_TMP, "bad-ready"),
+                             os.path.join(_TMP, "bad-release")))
+open(os.path.join(_TMP, "bad-release"), "w").close()
+_BAD_TARGET = os.path.join(_BAD_ROOT, _TARGET_REL)
+_bad = subprocess.run([sys.executable, _BAD_ENTRY], capture_output=True,
+                      text=True, env=_GUARD_ENV)
+check("10r a writer that plants and does NOT restore is put back AND named",
+      (sha_of(_BAD_TARGET), "THE TREE WAS NOT WHAT THIS RUN FOUND" in _bad.stdout,
+       copies_in(_BAD_ROOT)), (_PRISTINE_SHA, True, []))
+
+
+# --- 10s-10u  a copy that cannot be taken refuses, having planted nothing ----
+
+_NOFILE_ROOT = os.path.join(_TMP, "guard-missing-target")
+_NOFILE_ENTRY = build_guard_checkout(
+    _NOFILE_ROOT, _NOOP_STUB.replace("import sys", "import sys, os"))
+os.remove(os.path.join(_NOFILE_ROOT, _TARGET_REL))
+_nofile = subprocess.run([sys.executable, _NOFILE_ENTRY], capture_output=True,
+                         text=True, env=_GUARD_ENV)
+check("10s a writer-owned file that is not there exits "
+      "EXIT_BACKUP_UNAVAILABLE rather than running the suite with nothing to "
+      "put the tree back from",
+      _nofile.returncode, srt.EXIT_BACKUP_UNAVAILABLE)
+check("10t ...and it is a different code from every other refusal, because "
+      "the remediation differs: 3 says wait, 4 says fix the temp directory, "
+      "and this says the tree cannot be made safe to plant into",
+      len({srt.EXIT_LOCKED, srt.EXIT_LOCK_UNAVAILABLE,
+           srt.EXIT_BACKUP_UNAVAILABLE}), 3)
+check("10u ...and NOTHING WAS RUN and no half-taken copy was left",
+      ("SERIAL TEST RUN" in _nofile.stdout, copies_in(_NOFILE_ROOT)),
+      (False, []))
+
+
+# --- 10v-10z  the pure pieces, driven as functions of their arguments -------
+
+check("10v a copy's name carries the target and the pid, and does NOT end in "
+      "`.py` -- a `config_pristine.py` beside `config.py` would join "
+      "test_package_invariants.py's package walk as a second module declaring "
+      "every constant in it",
+      (srt.backup_path("/x/config.py", 41).endswith(".py"),
+       srt.backup_path("/x/config.py", 41)),
+      (False, "/x/config.py" + srt.BACKUP_MARKER + "41"))
+check("10w the pid is read back out of the name, and a name that only "
+      "RESEMBLES one is not claimed -- the scan uses this as its membership "
+      "test, so a guess here restores a real module from somebody's notes",
+      (srt.backup_owner(srt.backup_path("/x/config.py", 41)),
+       srt.backup_owner("/x/config.py" + srt.BACKUP_MARKER + "notes"),
+       srt.backup_owner("/x/config.py")), (41, None, None))
+check("10x a non-reading is a NAMED marker rather than a digest, and "
+      "`_is_real_digest` refuses BOTH sentinels -- a predicate written against "
+      "'absent' alone would restore a target from a copy nothing could read",
+      (srt.file_digest(os.path.join(_TMP, "no-such-file")),
+       srt._is_real_digest("absent"),
+       srt._is_real_digest(srt.file_digest(_TMP)),
+       srt._is_real_digest(_PRISTINE_SHA)),
+      ("absent", False, False, True))
+check("10y an interrupted copy leaves NO third file: atomic_copy renames into "
+      "place, so a copy that exists is complete and a target is never seen "
+      "half-written",
+      guarded(lambda: srt.atomic_copy(os.path.join(_TMP, "no-such-file"),
+                                      os.path.join(_TMP, "dest"))) is not None
+      and sorted(n for n in os.listdir(_TMP)
+                 if n.startswith(".serial-runner-tmp-")), [])
+check("10z the announcement is silent when there was nothing to repair",
+      srt.repair_lines([]), [])
+
+# --- 10z2  A COPY THAT CANNOT BE READ IS NOT RESTORED FROM ------------------
+#
+# NEITHER REPAIR NOR RELEASE HAD A CONTROL FOR THIS GUARD AND THE REVERT MATRIX
+# IS WHAT FOUND IT: removing `_is_real_digest` from `release_pristine_backups`
+# reported 186 passed, 0 failed. The guard is the difference between "put the
+# file back from the copy" and "overwrite the file with a sentinel string",
+# which is the one outcome worse than having no copy at all.
+#
+# DRIVEN AS FUNCTIONS OF THEIR ARGUMENTS, which is this suite's control shape
+# for a pure decision -- the state is a mapping naming a copy that is not there,
+# and building one on disk would mean racing the very cleanup under test.
+
+_Z2 = os.path.join(_TMP, "guard-unreadable")
+os.makedirs(_Z2, exist_ok=True)
+_Z2_TARGET = os.path.join(_Z2, "target.py")
+with open(_Z2_TARGET, "w") as _fh:
+    _fh.write(_PRISTINE_TEXT)
+_Z2_MISSING = os.path.join(_Z2, "no-such-copy")
+_Z2_DIR = os.path.join(_Z2, "a-directory")
+os.makedirs(_Z2_DIR, exist_ok=True)
+
+for _label, _copy in (("absent", _Z2_MISSING), ("unreadable", _Z2_DIR)):
+    _rec = srt.release_pristine_backups({_Z2_TARGET: _copy})
+    check(f"10z2 release: a copy that is {_label} is REPORTED and NOT restored "
+          f"from -- the target keeps its content instead of being overwritten "
+          f"with a sentinel string",
+          ([r["action"] for r in _rec], sha_of(_Z2_TARGET)),
+          (["unreadable-backup"], _PRISTINE_SHA))
+    check(f"10z2 release: ...and the copy is not deleted either, because it is "
+          f"the only record of what the file used to be ({_label})",
+          any("backup_removed" in r for r in _rec), False)
+
+# THE REPAIR SIDE HAS THE SAME GUARD AND NEEDS THE SAME CONTROL. Its input is a
+# copy found on disk, so this one is built: an empty DIRECTORY at a name the
+# scan claims, which `file_digest` reads as `unreadable:` and `os.path.isfile`
+# would reject -- so the scan's own membership test is exercised too.
+_Z3 = os.path.join(_TMP, "guard-repair-unreadable")
+_Z3_TARGET_DIR = os.path.join(_Z3, os.path.dirname(_TARGET_REL))
+os.makedirs(_Z3_TARGET_DIR, exist_ok=True)
+_Z3_TARGET = os.path.join(_Z3, _TARGET_REL)
+with open(_Z3_TARGET, "w") as _fh:
+    _fh.write(_PLANTED_TEXT)
+_Z3_COPY = srt.backup_path(_Z3_TARGET, 424242)
+os.makedirs(_Z3_COPY, exist_ok=True)          # a DIRECTORY where a copy goes
+_z3_out = srt.repair_pristine_backups(_Z3, out=lambda _line: None)
+check("10z3 repair: the scan's membership test is `isfile`, so a DIRECTORY at "
+      "a copy's name is not claimed and the corrupt target is left alone "
+      "rather than restored from something unreadable",
+      (_z3_out, sha_of(_Z3_TARGET)), ([], _PLANTED_SHA))
+os.rmdir(_Z3_COPY)
+with open(_Z3_COPY, "w") as _fh:
+    _fh.write(_PRISTINE_TEXT)
+_z3_out = srt.repair_pristine_backups(_Z3, out=lambda _line: None)
+check("10z3 ...and a REAL copy at the same name is claimed and restored from "
+      "(non-degeneracy: without this, 10z3 above would be satisfied by a scan "
+      "that never claims anything)",
+      ([r["action"] for r in _z3_out], sha_of(_Z3_TARGET)),
+      (["restored"], _PRISTINE_SHA))
+
+
+# --- 10z4  THE RESTORE IS VERIFIED BEFORE THE ONLY COPY IS DELETED ----------
+#
+# THE REVERT MATRIX FOUND THIS ONE TOO: deleting the read-back check from
+# `repair_pristine_backups` reported 192 passed, 0 failed. It cannot be driven
+# by breaking the filesystem -- an unwritable target makes `atomic_copy` RAISE,
+# which is the `restore-failed` branch, a different one. The state this branch
+# exists for is a copy that lands and then does not read back, and the only
+# honest way to produce it is to make the READING lie.
+#
+# `file_digest` IS REBOUND INSIDE try/finally WITH THE RESTORE ASSERTED, which
+# is this suite's accepted control shape where the subject is not a function of
+# its argument. It is not a plant into a file: nothing on disk is edited and the
+# module's sha256 is compared at the end of this run like every other.
+
+_Z4 = os.path.join(_TMP, "guard-unverified")
+_Z4_TARGET_DIR = os.path.join(_Z4, os.path.dirname(_TARGET_REL))
+os.makedirs(_Z4_TARGET_DIR, exist_ok=True)
+_Z4_TARGET = os.path.join(_Z4, _TARGET_REL)
+with open(_Z4_TARGET, "w") as _fh:
+    _fh.write(_PLANTED_TEXT)
+_Z4_COPY = srt.backup_path(_Z4_TARGET, 515151)
+with open(_Z4_COPY, "w") as _fh:
+    _fh.write(_PRISTINE_TEXT)
+
+_REAL_DIGEST = srt.file_digest
+_Z4_SEEN = {"n": 0}
+
+
+def _lying_digest(path):
+    """Honest about the copy, and wrong about the target AFTER it is written.
+
+    The first reading of the target is what the repair compares to decide it has
+    work to do; the SECOND is the read-back. Only the second lies, so the repair
+    really does copy and really does then fail to confirm it.
+    """
+    if os.path.abspath(path) == os.path.abspath(_Z4_TARGET):
+        _Z4_SEEN["n"] += 1
+        if _Z4_SEEN["n"] >= 2:
+            return "0" * 64
+    return _REAL_DIGEST(path)
+
+
+try:
+    srt.file_digest = _lying_digest
+    _z4_out = srt.repair_pristine_backups(_Z4, out=lambda _line: None)
+finally:
+    srt.file_digest = _REAL_DIGEST
+check("10z4 the rebind was put back, so nothing after this line is running "
+      "against a lying reader", srt.file_digest is _REAL_DIGEST, True)
+check("10z4 ...and the reading really did lie, so the check below is about the "
+      "branch rather than about a no-op (non-degeneracy)",
+      _Z4_SEEN["n"] >= 2, True)
+check("10z4 a restore that does not read back is reported as UNVERIFIED and "
+      "the copy is NOT deleted -- it is the only record of what the file was, "
+      "and deleting it on a restore nobody confirmed destroys the evidence "
+      "along with the file",
+      ([r["action"] for r in _z4_out], os.path.isfile(_Z4_COPY)),
+      (["restore-unverified"], True))
+check("10z4 ...and the bytes really did land, so the copy is being kept "
+      "because of the READING rather than because nothing happened",
+      sha_of(_Z4_TARGET), _PRISTINE_SHA)
+
+
+# --- 10z5  THE TWO FAILURE BRANCHES, DRIVEN FOR REAL -----------------------
+#
+# Both are reachable on an ordinary machine and neither was exercised by
+# anything above: a guard that refuses AFTER taking some of its copies, and a
+# restore that cannot be written. They are driven by creating the condition on
+# disk rather than by patching, which is this suite's preference wherever the
+# condition is producible.
+
+_Z5 = os.path.join(_TMP, "guard-branches")
+for _rel, _w in srt.WRITER_OWNED_FILES:
+    os.makedirs(os.path.join(_Z5, os.path.dirname(_rel)), exist_ok=True)
+    with open(os.path.join(_Z5, _rel), "w") as _fh:
+        _fh.write(_PRISTINE_TEXT)
+
+# (a) HALF-TAKEN. The LAST declared target is removed, so the guard takes the
+#     earlier copies and then refuses. A copy from a run that never started is
+#     not evidence of anything, and the next invocation would "repair" from it
+#     and announce a repair that did not happen.
+_Z5_LAST = os.path.join(_Z5, srt.WRITER_OWNED_FILES[-1][0])
+os.remove(_Z5_LAST)
+_z5_raise = raised(lambda: srt.pristine_guard(_Z5, out=lambda _l: None).__enter__())
+check("10z5 a guard that refuses part-way leaves NO half-taken copy behind -- "
+      "one would be 'repaired' from by the next invocation, which would then "
+      "announce a repair that never happened",
+      (type(_z5_raise).__name__ if _z5_raise else None,
+       srt.find_pristine_backups(_Z5)),
+      ("BackupUnavailable", []))
+check("10z5 ...and the refusal names the file it could not copy",
+      os.path.basename(getattr(_z5_raise, "target", "")),
+      os.path.basename(srt.WRITER_OWNED_FILES[-1][0]))
+check("10z5 ...and there really was an EARLIER target whose copy had already "
+      "been taken, so (a) is not a statement about a one-entry table "
+      "(non-degeneracy)", len(srt.WRITER_OWNED_FILES) > 1, True)
+
+# (b) RESTORE-FAILED. The copy is fine and the target's directory is not
+#     writable, so `atomic_copy` raises. The copy must be KEPT: it is the only
+#     record of what the file was, and deleting it on a restore that did not
+#     happen destroys the evidence with the file.
+with open(_Z5_LAST, "w") as _fh:
+    _fh.write(_PRISTINE_TEXT)
+_Z5_FIRST = os.path.join(_Z5, srt.WRITER_OWNED_FILES[0][0])
+with open(_Z5_FIRST, "w") as _fh:
+    _fh.write(_PLANTED_TEXT)
+_Z5_COPY = srt.backup_path(_Z5_FIRST, 909090)
+with open(_Z5_COPY, "w") as _fh:
+    _fh.write(_PRISTINE_TEXT)
+_Z5_DIR = os.path.dirname(_Z5_FIRST)
+_Z5_MODE = os.stat(_Z5_DIR).st_mode
+os.chmod(_Z5_DIR, 0o500)
+try:
+    _z5_out = srt.repair_pristine_backups(_Z5, out=lambda _l: None)
+finally:
+    os.chmod(_Z5_DIR, _Z5_MODE)
+check("10z5 the directory mode was restored, so nothing after this line runs "
+      "against a read-only tree",
+      stat.S_IMODE(os.stat(_Z5_DIR).st_mode), stat.S_IMODE(_Z5_MODE))
+check("10z5 a restore that cannot be WRITTEN is reported as restore-failed, "
+      "the copy is KEPT and the target is left exactly as it was -- the copy "
+      "is the only record of what the file used to be",
+      ([r["action"] for r in _z5_out], os.path.isfile(_Z5_COPY),
+       sha_of(_Z5_FIRST)),
+      (["restore-failed"], True, _PLANTED_SHA))
+check("10z5 ...and the failure is NAMED rather than swallowed",
+      any("PermissionError" in r.get("error", "") for r in _z5_out), True)
+
+# (c) THE SAME BRANCH WITH A WRITABLE DIRECTORY, and it is the case that
+#     DISCRIMINATES. In (b) the copy survives partly for the wrong reason: the
+#     directory is read-only, so a buggy `os.unlink(backup)` on the failure path
+#     would fail too and be swallowed. Measured -- a revert that deletes the
+#     copy on restore-failed passed (b) and every other check in this file. Here
+#     the directory is writable and only the TARGET is unwritable (it is a
+#     non-empty DIRECTORY, so `os.replace` onto it raises for every user there
+#     is, which `chmod 000` does not: root bypasses that).
+_Z6 = os.path.join(_TMP, "guard-writable-failure")
+_Z6_DIR = os.path.join(_Z6, os.path.dirname(_TARGET_REL))
+os.makedirs(_Z6_DIR, exist_ok=True)
+_Z6_TARGET = os.path.join(_Z6, _TARGET_REL)
+os.makedirs(_Z6_TARGET, exist_ok=True)
+with open(os.path.join(_Z6_TARGET, "occupied"), "w") as _fh:
+    _fh.write("x")
+_Z6_COPY = srt.backup_path(_Z6_TARGET, 808080)
+with open(_Z6_COPY, "w") as _fh:
+    _fh.write(_PRISTINE_TEXT)
+_z6_out = srt.repair_pristine_backups(_Z6, out=lambda _l: None)
+check("10z5 (c) a restore that fails with the DIRECTORY writable still keeps "
+      "the copy -- the only case in which deleting it would have succeeded, "
+      "and therefore the only one that says the code does not try",
+      ([r["action"] for r in _z6_out], os.path.isfile(_Z6_COPY)),
+      (["restore-failed"], True))
+check("10z5 (c) ...and the copy's own directory really is writable, so a "
+      "delete would have worked (non-degeneracy: without this, (c) passes for "
+      "(b)'s reason)",
+      os.access(os.path.dirname(_Z6_COPY), os.W_OK), True)
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
+# 11.  ISOLATION
 # ===========================================================================
 
-section("10. Isolation")
+section("11. Isolation")
 
-check("10a tests/run_serial_tests.py is byte-unchanged",
+check("11a tests/run_serial_tests.py is byte-unchanged",
       hashlib.sha256(open(_RUNNER_PATH, "rb").read()).hexdigest(), _RUNNER_SHA)
 
 # EVERY LOCK FILE THIS TEST CREATED IS REMOVED. The lock is the flock on the
@@ -1289,11 +2098,11 @@ _ours = srt.lock_path(_CHECKOUT)
 for _p in (_ours,):
     if os.path.lexists(_p):
         os.remove(_p)
-check("10b the throwaway checkout's lock file is cleaned up",
+check("11b the throwaway checkout's lock file is cleaned up",
       os.path.lexists(_ours), False)
 
 shutil.rmtree(_TMP, ignore_errors=True)
-check("10c the temp tree is gone", os.path.exists(_TMP), False)
+check("11c the temp tree is gone", os.path.exists(_TMP), False)
 
 
 #------------------------------------------------------------------------------

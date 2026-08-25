@@ -346,6 +346,15 @@ _REGISTRY_SPEC = (
      "configuration reaches the adapter at all"),
     ("INFERENCE_WRITE_RETRIES", _database_logger.INFERENCE_WRITE_RETRIES,
      "a database write was retried and survived; contention, not loss"),
+    ("WRITE_RETRY_OUTCOMES", _database_logger.WRITE_RETRY_OUTCOMES,
+     "a write that went through run_with_write_retry -- the generic helper, "
+     "not log_inference's own loop -- met contention. Keyed "
+     "{outcome}:{ExceptionType}, and the outcome word is what makes it "
+     "readable: `recovered:` is contention SURVIVED and `exhausted:` is the "
+     "attempt budget running out while the error was still transient, which "
+     "the CALLER's own counter says what it cost. A run with `retried:` and "
+     "`recovered:` and no `exhausted:` lost nothing and is one increment of "
+     "load away from losing something"),
     ("INFERENCE_WRITE_FAILURES", _database_logger.INFERENCE_WRITE_FAILURES,
      "a database write was GIVEN UP ON -- the row is lost; the reconciliation "
      "block above is the authority on which"),

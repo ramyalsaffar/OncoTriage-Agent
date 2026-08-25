@@ -211,6 +211,26 @@ each of the five leaves its own tree in the state it found it, so a failure in
 one does not make the next meaningless. The process exits non-zero if any of
 them did.
 
+AND THE LOCK DOES NOTHING ABOUT ONE RUN BEING KILLED
+-----------------------------------------------------
+Both mechanisms above are about two runs. Neither is about one run dying, and
+that is a separate defect with the same consequence. The two source-mutating
+tests keep their pristine copy in a `tempfile.mkdtemp()` of their own and
+restore it in their own `finally` -- so a SIGTERM, a `docker stop`, a closed
+terminal or a SIGKILL that skips that `finally` leaves the tree holding a
+DELIBERATELY PLANTED DEFECT and destroys the only copy of what it replaced,
+because the temp directory's name existed nowhere but in the dead process.
+`tests/test_config_snapshot_date_rot.py` rewrites `DATA_SNAPSHOT_DATE`, and a
+checkout left in that state computes every patient's age against a fabricated
+reference date without a word.
+
+So this runner takes its OWN copy, one layer out, before the first test starts:
+a real file beside its target, carrying this run's pid in its name. See THE
+PRISTINE-COPY GUARD below. SIGTERM and SIGHUP are converted to a SystemExit so
+the restore is reached; SIGKILL is not catchable and never will be, which is
+exactly why the copy outlives the process and the NEXT invocation repairs from
+it, announcing what it put back, before it runs anything.
+
 Run from terminal:
     python tests/run_serial_tests.py          # all five, in order
     python tests/run_serial_tests.py --list   # print the order and exit
@@ -223,6 +243,10 @@ Exit codes:
     3 -- another run of this file already holds the lock  (pass 20f-3)
     4 -- the lock could not be OPENED at all: not "wait", but "fix the temp
          directory". Nothing has been run and nothing has been restored.
+    5 -- a PRISTINE COPY could not be taken, so there would be nothing to put
+         the tree back from. Nothing has been run and nothing has been planted.
+  143 -- SIGTERM or SIGHUP. The tree was restored from this run's pristine
+         copies on the way out; 128 + signal is the shell's own encoding.
 """
 
 import argparse
@@ -232,6 +256,8 @@ import getpass
 import hashlib
 import json
 import os
+import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -642,6 +668,592 @@ def lock_unavailable_lines(exc):
     return lines
 
 
+# ===========================================================================
+# THE PRISTINE-COPY GUARD  (the signal-safe restore)
+# ===========================================================================
+#
+# THE LOCK STOPS TWO RUNS OVERLAPPING. IT DOES NOTHING ABOUT ONE RUN DYING.
+#
+# Two of the five tests below rewrite a file in `oncotriage/` IN PLACE and
+# restore it from a copy they took at their own start. That copy lives in a
+# `tempfile.mkdtemp()` of the TEST's making and the restore is in the TEST's
+# `finally` -- so the whole mechanism is inside one subprocess, and a signal
+# that skips that `finally` leaves the tree holding a deliberately planted
+# defect AND destroys the only copy of what it replaced (the temp directory's
+# name is not written down anywhere). `tests/test_config_snapshot_date_rot.py`
+# rewrites `DATA_SNAPSHOT_DATE`; a checkout left in that state computes every
+# patient's age against a fabricated reference date, silently, and this project
+# has already paid once for a silently-reverted edit to that exact file.
+#
+# SO THE RUNNER TAKES ITS OWN COPY, ONE LAYER OUT. It is taken before the first
+# test starts, held for the whole run, and put back on the way out:
+#
+#     normal exit / a failing test   the `finally` in `pristine_guard`
+#     Ctrl-C                         the same `finally`; SIGINT is already a
+#                                    KeyboardInterrupt and already unwinds
+#     SIGTERM, SIGHUP                the same `finally`, because the handler
+#                                    installed below converts them to a
+#                                    SystemExit rather than letting CPython's
+#                                    default terminate the process outright
+#     SIGKILL, a panic, a power cut  NOTHING RUNS. See below.
+#
+# SIGKILL CANNOT BE CAUGHT. THAT IS NOT A GAP IN THIS DESIGN, IT IS THE REASON
+# THE DESIGN HAS A SECOND HALF. No handler, no `finally` and no context manager
+# executes when the kernel removes the process, so the in-process cleanup above
+# can only ever cover the signals that are deliverable. What covers the rest is
+# that the copy OUTLIVES THE PROCESS: it is a real file next to its target, its
+# name carries the pid of the run that took it, and the NEXT invocation repairs
+# from it before it runs anything. A guard whose only arm is a `finally` is a
+# guard that is absent exactly when the machine went down.
+#
+# WHY A SIBLING AND NOT A TEMP DIRECTORY. Two reasons, and the first is the one
+# that matters: a temp directory's name is chosen at run time and is gone with
+# the process, so a successor cannot find it -- which is precisely the defect
+# in the writers' own arrangement that this exists to cover. The second is that
+# a sibling is on the same filesystem as its target, so `os.replace` between
+# them is atomic; across filesystems it is not.
+#
+# EVERY WRITE HERE IS ATOMIC, BOTH DIRECTIONS. `shutil.copy2` is not: a copy
+# interrupted part-way leaves a TRUNCATED file, and a truncated *backup* later
+# restored over a good target is a worse outcome than having no backup at all.
+# Both directions therefore write to a temp name in the destination's own
+# directory and `os.replace` it into place, so a backup that EXISTS is complete
+# and a target is never observed half-written.
+#
+# THE ORDER INSIDE THE LOCK IS REPAIR, THEN BACKUP. Taking a copy of a
+# corrupted file would freeze the corruption into the very thing meant to undo
+# it, and every later run would then "repair" the tree back to the plant.
+
+WRITER_OWNED_FILES = (
+    ("oncotriage/registries/cancer_code_registry.py",
+     "tests/test_registries_cancer_code_claims_audit_control.py"),
+    ("oncotriage/config.py",
+     "tests/test_config_snapshot_date_rot.py"),
+)
+"""(file this suite rewrites in place, the test that rewrites it).
+
+THE SAME TWO THE MODULE DOCSTRING'S COLLISION MATRIX NAMES, and this is the
+first machine-readable form of that list. It is a DECLARATION rather than a
+derivation for the reason `_EXEC_ALLOWLIST` and the CI bucket table are: working
+it out would mean resolving every path expression in every test file through
+that file's own assignments, which is the collision matrix's derivation and not
+something to re-run on every invocation of a process launcher.
+
+WHAT KEEPS EACH ENTRY HONEST, and what does NOT.
+`tests/test_serial_runner_lock.py` section 1 checks each PAIR against the named
+writer's own source -- the writer exists, it is in SERIAL_TESTS, it names this
+target as a string constant, and it really writes -- so an entry pointing at a
+file that has moved, or at a test that has stopped rewriting it, FAILS.
+
+IT DOES NOT AND CANNOT SEE A BRAND-NEW THIRD WRITER, and that limit is measured
+rather than assumed: a cheap scan for "names a path under oncotriage/ AND calls
+a write" reports ELEVEN of this suite's files, of which NINE write only into a
+temp directory. An over-approximation that flags nine innocents is not a check,
+it is a reason nobody runs it. The completeness half stays where it already is
+-- the collision-matrix derivation in the module docstring above, re-done by
+hand when a writer is added -- and a new writer that is not declared here is
+simply not covered by the guard, which is the state every file was in before it.
+
+A THIRD ENTRY IS THE ONLY EDIT A NEW WRITER NEEDS. Everything below is a
+function of this tuple.
+"""
+
+BACKUP_MARKER = ".serial-runner-pristine-"
+"""What a pristine copy's filename carries, between the target's name and a pid.
+
+`oncotriage/config.py` -> `oncotriage/config.py.serial-runner-pristine-4213`.
+
+IT DOES NOT END IN `.py`, AND THAT IS LOAD-BEARING RATHER THAN INCIDENTAL. The
+copy sits inside the package, and `tests/test_package_invariants.py` walks the
+package for `*.py` -- section 1c re-parses every one of them, section 5 scans
+them for re-exports, check 2h reads them for name usage. A pristine copy of
+`config.py` named `config_pristine.py` would join that corpus as a second module
+declaring every constant in it. The suffix is what keeps it out.
+"""
+
+EXIT_BACKUP_UNAVAILABLE = 5
+"""The pristine copies could not be taken. NOTHING HAS BEEN RUN.
+
+A different instruction from every other code here. `3` says wait, `4` says fix
+the temp directory, `2` says a test file is missing -- and this says the tree
+itself could not be made safe to plant into: the package directory is read-only,
+the filesystem is full, or a declared target is not there. Running the suite
+anyway would mean running two tests that rewrite source with no copy to put back
+if either of them dies, which is the state this whole section exists to remove.
+"""
+
+
+class BackupUnavailable(RuntimeError):
+    """A pristine copy could not be taken. Carries the target and the cause.
+
+    A `RuntimeError` and deliberately not an `OSError`, on `LockUnavailable`'s
+    argument: `_run_all()` runs inside the same `with`, so an `except OSError`
+    around it would swallow every `OSError` the five subprocess launches can
+    raise and report it as a backup failure.
+    """
+
+    def __init__(self, target, cause):
+        self.target = target
+        self.cause = cause
+        self.errno = getattr(cause, "errno", None)
+        self.strerror = getattr(cause, "strerror", None) or str(cause)
+        super().__init__(f"{target}: {type(cause).__name__}: {cause}")
+
+
+def backup_path(target, pid=None):
+    """Where the pristine copy of `target` taken by `pid` lives."""
+    return f"{target}{BACKUP_MARKER}{os.getpid() if pid is None else pid}"
+
+
+def backup_owner(path):
+    """The pid in a pristine copy's name, or None if this is not one.
+
+    RETURNS None FOR A NAME IT CANNOT READ rather than guessing. The scan below
+    uses it as the membership test, so a file that merely resembles a backup --
+    someone's `config.py.serial-runner-pristine-notes` -- is left alone rather
+    than restored over the real module.
+    """
+    marker = path.rfind(BACKUP_MARKER)
+    if marker < 0:
+        return None
+    tail = path[marker + len(BACKUP_MARKER):]
+    return int(tail) if tail.isdigit() else None
+
+
+def file_digest(path):
+    """sha256 of a file, or a NAMED non-reading -- never a raise.
+
+    'absent'          the path is not there
+    'unreadable: X'   it is there and could not be read
+
+    A RAISE HERE WOULD ABORT THE RUN BEFORE ITS FIRST TEST. Every caller below
+    is on a repair or a shutdown path, which is where the file being unreadable
+    is most likely and least affordable.
+    """
+    if not os.path.exists(path):
+        return "absent"
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError as exc:
+        return f"unreadable: {type(exc).__name__}"
+
+
+def atomic_copy(src, dst):
+    """Copy `src` over `dst` so that `dst` is never observed half-written.
+
+    Writes a temp file in `dst`'s OWN directory and renames it into place.
+    `os.replace` is atomic within one filesystem and is not across them, which
+    is the second reason the pristine copy is a sibling of its target rather
+    than a file in the system temp directory.
+
+    The temp file is removed on any failure, so a run interrupted here leaves no
+    third file behind for the next scan to puzzle over.
+    """
+    directory = os.path.dirname(dst) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".serial-runner-tmp-", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            with open(src, "rb") as fh:
+                shutil.copyfileobj(fh, out)
+            out.flush()
+            os.fsync(out.fileno())
+        shutil.copystat(src, tmp)
+        os.replace(tmp, dst)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def find_pristine_backups(code_dir=_CODE_DIR):
+    """Every pristine copy present, as (backup, target, pid), sorted.
+
+    IT LOOKS ONLY BESIDE THE DECLARED TARGETS rather than walking the tree. A
+    pristine copy is a sibling by construction, so a walk would cost a full
+    traversal of the repository to find files that can only be in two places --
+    and would widen what this function is able to delete.
+    """
+    found = []
+    for relative, _writer in WRITER_OWNED_FILES:
+        target = os.path.join(code_dir, relative)
+        directory = os.path.dirname(target)
+        prefix = os.path.basename(target) + BACKUP_MARKER
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            continue
+        for name in names:
+            if not name.startswith(prefix):
+                continue
+            candidate = os.path.join(directory, name)
+            pid = backup_owner(candidate)
+            if pid is not None and os.path.isfile(candidate):
+                found.append((candidate, target, pid))
+    return sorted(found)
+
+
+def repair_pristine_backups(code_dir=_CODE_DIR, out=print):
+    """Restore from every pristine copy left behind, and say what was repaired.
+
+    CALLED WITH THE LOCK HELD, BEFORE ANYTHING ELSE, AND THAT IS WHAT MAKES THE
+    STALENESS TEST EXACT. A pristine copy is taken after the lock is acquired
+    and removed before it is released -- both inside the same `with` -- so a
+    copy that exists means some run took one and never reached its cleanup. That
+    run is therefore either dead or holding the lock, and we are holding the
+    lock. Every copy found here is stale, by construction.
+
+    IT DOES NOT DECIDE THIS BY ASKING WHETHER THE PID IS ALIVE, and the pid test
+    is the weaker of the two rather than a second opinion. A pid is reused: the
+    pid of a run SIGKILLed yesterday is very likely somebody else's process
+    today, and a liveness test would then read a genuinely stale copy as live
+    and REFUSE TO REPAIR IT -- leaving the planted defect in the tree, which is
+    the one outcome this function exists to prevent. The pid is recorded and
+    reported because it is what an operator correlates with a CI log; it decides
+    nothing.
+
+    A COPY WHOSE TARGET ALREADY MATCHES IT IS REMOVED AND NOT ANNOUNCED AS A
+    REPAIR. That is the ordinary shape of a run killed after its tests had
+    restored the tree themselves, and calling it a repair would teach a reader
+    that the announcement means the tree was damaged.
+
+    Returns one dict per copy found, whatever happened to it, so a caller can
+    assert on the outcome rather than on the text.
+    """
+    outcomes = []
+    for backup, target, pid in find_pristine_backups(code_dir):
+        record = {"backup": backup, "target": target, "pid": pid,
+                  "target_before": file_digest(target),
+                  "backup_digest": file_digest(backup)}
+        if not _is_real_digest(record["backup_digest"]):
+            # THE COPY ITSELF CANNOT BE READ. Restoring from it is not an
+            # option and neither is deleting it: it is the only evidence of
+            # what the target used to be. Reported and LEFT.
+            record["action"] = "unreadable-backup"
+            outcomes.append(record)
+            continue
+        if record["target_before"] == record["backup_digest"]:
+            record["action"] = "already-clean"
+        else:
+            try:
+                atomic_copy(backup, target)
+                record["action"] = "restored"
+            except OSError as exc:
+                record["action"] = "restore-failed"
+                record["error"] = f"{type(exc).__name__}: {exc}"
+                outcomes.append(record)
+                continue
+        record["target_after"] = file_digest(target)
+        if record["target_after"] != record["backup_digest"]:
+            # THE RESTORE IS VERIFIED BEFORE THE ONLY COPY IS DELETED. Without
+            # this, a copy that failed to land silently would be removed and the
+            # evidence with it.
+            record["action"] = "restore-unverified"
+            outcomes.append(record)
+            continue
+        try:
+            os.unlink(backup)
+            record["backup_removed"] = True
+        except OSError as exc:
+            record["backup_removed"] = False
+            record["error"] = f"{type(exc).__name__}: {exc}"
+        outcomes.append(record)
+
+    for line in repair_lines(outcomes, code_dir):
+        out(line)
+    return outcomes
+
+
+def repair_lines(outcomes, code_dir=_CODE_DIR):
+    """The announcement, as lines. One text, one caller -- and testable.
+
+    SILENT WHEN THERE WAS NOTHING TO REPAIR. A "nothing to repair" line on every
+    run is a line a reader learns to skip, and this one has to be read the once
+    it appears.
+    """
+    if not outcomes:
+        return []
+    restored = [o for o in outcomes if o["action"] == "restored"]
+    problems = [o for o in outcomes
+                if o["action"] not in ("restored", "already-clean")]
+    lines = ["[Serial] A PREVIOUS RUN DID NOT REACH ITS CLEANUP.",
+             "         Pristine copies were left in the tree, which means that "
+             "run was killed",
+             "         in a way no handler can catch (SIGKILL, a panic, a power "
+             "cut) -- or",
+             "         between planting and restoring. Repairing before "
+             "anything is run:"]
+    for outcome in outcomes:
+        lines.append(f"         {outcome['action']:<20s} "
+                     f"{os.path.relpath(outcome['target'], code_dir)}  "
+                     f"(left by pid {outcome['pid']})")
+        if outcome["action"] == "restored":
+            lines.append(f"             was {outcome['target_before'][:16]} "
+                         f"-> now {outcome['target_after'][:16]}")
+        if "error" in outcome:
+            lines.append(f"             {outcome['error']}")
+    lines.append("")
+    if restored:
+        lines.append(f"         {len(restored)} file(s) were NOT what the "
+                     f"killed run found and have been put back.")
+        lines.append("         Anything measured against this tree since that "
+                     "run died was measured")
+        lines.append("         against a planted defect.")
+    if problems:
+        lines.append(f"         {len(problems)} could NOT be repaired and are "
+                     f"named above. The copy is")
+        lines.append("         left in place; it is the only record of what "
+                     "the file used to be.")
+    lines.append("")
+    return lines
+
+
+@contextlib.contextmanager
+def pristine_guard(code_dir=_CODE_DIR, out=print):
+    """Hold a pristine copy of every writer-owned file for the block.
+
+    Yields the {target: backup} mapping. Raises `BackupUnavailable` before
+    entering the block if any copy could not be taken -- so the caller can exit
+    without having run a test, which is the whole point: two of the five plant
+    into source, and planting with no copy to put back is the state this guards.
+
+    THE `finally` RESTORES AND THEN REMOVES, IN THAT ORDER, AND VERIFIES IN
+    BETWEEN. The copy is the only record of what the file was, so it is deleted
+    only once the target has been read back and found to match it.
+
+    A TARGET THAT DIFFERS AT THE END IS ANNOUNCED. On a normal run it cannot:
+    both writers restore from their own copy and assert byte-identity. So a
+    difference here means one of them did not -- and this is the only thing in
+    the project positioned to notice.
+    """
+    taken = {}
+    try:
+        for relative, _writer in WRITER_OWNED_FILES:
+            target = os.path.join(code_dir, relative)
+            if not os.path.isfile(target):
+                raise BackupUnavailable(
+                    target, FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), target))
+            copy = backup_path(target)
+            try:
+                atomic_copy(target, copy)
+            except OSError as exc:
+                raise BackupUnavailable(target, exc) from exc
+            taken[target] = copy
+    except BaseException:
+        # NOTHING HALF-TAKEN IS LEFT BEHIND. A copy from a run that refused to
+        # start is not evidence of anything and would be "repaired" from by the
+        # next invocation, which would then announce a repair that did not
+        # happen.
+        for copy in taken.values():
+            try:
+                os.unlink(copy)
+            except OSError:
+                pass
+        raise
+    try:
+        yield taken
+    finally:
+        for line in release_lines(release_pristine_backups(taken), code_dir):
+            out(line)
+
+
+def release_pristine_backups(taken):
+    """Put every target back and drop the copies. Returns one record each.
+
+    IT DOES NOT RAISE FOR ANYTHING THE FILESYSTEM CAN DO, which is the claim
+    worth making rather than "never raises". It runs in a `finally`, on every
+    path including a SIGTERM, so an exception here would REPLACE whatever
+    brought us here -- including the exit code of a failing test. Every read
+    goes through `file_digest`, which turns an `OSError` into a named marker,
+    and every write is wrapped in `except OSError`. A `KeyboardInterrupt` or a
+    `MemoryError` still escapes, exactly as they escape
+    `oncotriage/storage/database_logger.py`'s writers and for the same reason:
+    a cleanup that swallowed a Ctrl-C would leave an operator holding a key down
+    against a process that will not stop.
+
+    AND A SECOND SIGNAL ARRIVING *DURING* THIS IS A REAL RESIDUAL, stated rather
+    than hidden. The handler is still installed while this runs -- it is removed
+    by the OUTER context manager, which exits after this one -- so a signal
+    landing mid-restore raises a SystemExit through it and the tree is left
+    half-put-back. That is what the copy surviving is for: it is still on disk,
+    so the next invocation repairs from it and says so.
+    """
+    records = []
+    for target, copy in sorted(taken.items()):
+        record = {"target": target, "backup": copy,
+                  "target_digest": file_digest(target),
+                  "backup_digest": file_digest(copy)}
+        record["differed"] = (record["target_digest"] != record["backup_digest"])
+        if not _is_real_digest(record["backup_digest"]):
+            record["action"] = "unreadable-backup"
+            records.append(record)
+            continue
+        if record["differed"]:
+            try:
+                atomic_copy(copy, target)
+                record["action"] = "restored"
+            except OSError as exc:
+                record["action"] = "restore-failed"
+                record["error"] = f"{type(exc).__name__}: {exc}"
+                records.append(record)
+                continue
+        else:
+            record["action"] = "unchanged"
+        record["target_after"] = file_digest(target)
+        if record["target_after"] != record["backup_digest"]:
+            record["action"] = "restore-unverified"
+            records.append(record)
+            continue
+        try:
+            os.unlink(copy)
+            record["backup_removed"] = True
+        except OSError as exc:
+            record["backup_removed"] = False
+            record["error"] = f"{type(exc).__name__}: {exc}"
+        records.append(record)
+    return records
+
+
+def release_lines(records, code_dir=_CODE_DIR):
+    """What the guard says on the way out. Silent on the ordinary path.
+
+    A run in which both writers restored their own files correctly has nothing
+    to report here, and saying so every time would bury the one run that has.
+    """
+    interesting = [r for r in records if r["action"] != "unchanged"]
+    if not interesting:
+        return []
+    lines = ["", "[Serial] THE TREE WAS NOT WHAT THIS RUN FOUND."]
+    for record in interesting:
+        lines.append(f"         {record['action']:<20s} "
+                     f"{os.path.relpath(record['target'], code_dir)}")
+        if "error" in record:
+            lines.append(f"             {record['error']}")
+    lines.extend([
+        "",
+        "         Both source-mutating tests restore from a copy taken at their "
+        "own start",
+        "         and assert the restore is byte-identical, so on a run that "
+        "finished this",
+        "         block does not appear. It appearing means one of them did "
+        "not get there --",
+        "         a killed subprocess, or a restore that failed and was not "
+        "noticed.",
+        "",
+    ])
+    return lines
+
+
+def backup_unavailable_lines(exc):
+    """The refusal, as the lines `main()` prints. One text, one caller."""
+    code = getattr(exc, "errno", None)
+    named = errno.errorcode.get(code, "?") if code is not None else "?"
+    return [
+        "[Serial] REFUSING TO RUN: a pristine copy could not be taken.",
+        f"         file:      {exc.target}",
+        f"         error:     errno {code} ({named}): {exc.strerror}",
+        "",
+        "         Two of these five tests rewrite that file IN PLACE and "
+        "restore it from",
+        "         a copy of their own. This runner keeps a SECOND copy, next to "
+        "the file,",
+        "         so that a run killed in a way no handler can catch (SIGKILL, "
+        "a panic) is",
+        "         repaired by the NEXT invocation instead of leaving a planted "
+        "defect in",
+        "         the tree. Without that copy there is nothing to repair from, "
+        "so the",
+        "         suite does not start.",
+        "",
+        "         Usual causes: the package directory is read-only, the "
+        "filesystem is",
+        "         full, or a file named in WRITER_OWNED_FILES has moved.",
+        "",
+        "         NOTHING HAS BEEN RUN AND NOTHING HAS BEEN PLANTED.",
+    ]
+
+
+def _is_real_digest(reading):
+    """True only for a real sha256 -- 64 lower-case hex characters.
+
+    ASKED INSTEAD OF `!= "absent"`, because `file_digest` has TWO sentinels: the
+    file is not there, and the file is there and could not be read. A predicate
+    written against the first alone would treat the second as a reading and
+    restore a target from a copy nothing could read.
+    """
+    return (isinstance(reading, str) and len(reading) == 64
+            and all(c in "0123456789abcdef" for c in reading))
+
+
+# ---------------------------------------------------------------------------
+# SIGTERM AND SIGHUP REACH THE CLEANUP; SIGINT ALREADY DID
+# ---------------------------------------------------------------------------
+# CPython's default disposition for SIGTERM and SIGHUP is to terminate the
+# process outright -- no exception, no unwinding, no `finally`. So without this,
+# `kill`, `docker stop`, systemd's stop, and closing the terminal on a run
+# started from it all skipped the restore above, and the tree was left holding
+# whichever test was mid-plant. SIGINT is different and is deliberately left
+# alone: CPython already raises KeyboardInterrupt for it, which unwinds through
+# every `finally` on its own, and installing a handler for it would replace a
+# well-understood disposition with one of ours for no gain.
+#
+# THE HANDLER DOES THREE THINGS AND THEN GETS OUT OF THE WAY. It restores the
+# default disposition first, so a second signal terminates outright rather than
+# arriving inside our own teardown; it writes one line with `os.write(2, ...)`
+# rather than `print`, because Python block-buffers stdout when it is not a tty
+# and a shutdown line that materialises at interpreter exit is not a shutdown
+# line; and it raises SystemExit, which is what unwinds the `with` blocks. That
+# is `25- Batch Runner.py`'s handler, in the same order, for the same reasons.
+
+EXIT_SIGNALLED = 143
+"""128 + SIGTERM. The conventional shell encoding, and the batch runner's."""
+
+_TERMINATING_SIGNALS = tuple(
+    s for s in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None))
+    if s is not None)
+
+
+@contextlib.contextmanager
+def shutdown_signals_reach_cleanup():
+    """Convert SIGTERM/SIGHUP into a SystemExit for the duration of the block.
+
+    Restores the previous dispositions on the way out, so importing this module
+    -- which `.github/scripts/ci_test_buckets.py` does, to read SERIAL_TESTS --
+    can never change what a signal does to somebody else's process.
+
+    `signal.signal` refuses to run outside the main thread of the main
+    interpreter and raises `ValueError` there. That is caught and the block runs
+    UNGUARDED rather than refusing: the caller is a test importing this module
+    off the main thread, the in-process cleanup is a convenience, and the repair
+    that actually matters is the next invocation's.
+    """
+    previous = {}
+
+    def _terminate(signum, _frame):
+        signal.signal(signum, signal.SIG_DFL)
+        os.write(2, (f"\n[Serial] Signal {signum} received. Restoring "
+                     f"oncotriage/ from the pristine copies this run took, "
+                     f"then exiting {EXIT_SIGNALLED}. Send it again to give up "
+                     f"on the restore.\n").encode("utf-8", "replace"))
+        raise SystemExit(EXIT_SIGNALLED)
+
+    try:
+        for signum in _TERMINATING_SIGNALS:
+            previous[signum] = signal.signal(signum, _terminate)
+    except ValueError:
+        pass
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            try:
+                signal.signal(signum, handler)
+            except ValueError:
+                pass
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Run the source-mutating tests serially, in order.")
@@ -667,9 +1279,27 @@ def main(argv=None):
     # the whole run rather than each subprocess, because the hazard is not two
     # tests overlapping -- it is one run's RESTORE landing inside another run's
     # backup window, which spans the gaps between tests too.
+    #
+    # THE THREE THINGS INSIDE IT ARE ORDERED AND THE ORDER IS ARGUED:
+    #
+    #   1. the signal handlers, OUTSIDE the lock, so that a SIGTERM arriving
+    #      while the lock is being taken is a SystemExit that unwinds rather
+    #      than a process that vanishes -- and so that the handlers are removed
+    #      by their own `finally` however this returns;
+    #   2. REPAIR, first thing inside the lock. A pristine copy left in the tree
+    #      is stale by construction once we hold the lock (see
+    #      `repair_pristine_backups`), and it must be acted on BEFORE step 3
+    #      takes a copy of the same file -- a copy of a corrupted file would
+    #      freeze the plant into the thing meant to undo it;
+    #   3. the guard, which takes this run's copies and puts them back in its
+    #      `finally`. `_run_all()` is inside it, so a failing test, a Ctrl-C and
+    #      a SIGTERM all reach the restore.
     try:
-        with exclusive_run_lock():
-            return _run_all()
+        with shutdown_signals_reach_cleanup():
+            with exclusive_run_lock():
+                repair_pristine_backups(_CODE_DIR)
+                with pristine_guard(_CODE_DIR):
+                    return _run_all()
     except AlreadyRunning as exc:
         for line in already_running_lines(exc):
             print(line)
@@ -678,6 +1308,99 @@ def main(argv=None):
         for line in lock_unavailable_lines(exc):
             print(line)
         return EXIT_LOCK_UNAVAILABLE
+    except BackupUnavailable as exc:
+        for line in backup_unavailable_lines(exc):
+            print(line)
+        return EXIT_BACKUP_UNAVAILABLE
+
+
+CHILD_SHUTDOWN_GRACE_SECONDS = 20.0
+"""How long a signalled test is given to run its own restore before SIGKILL.
+
+Each of the two writers restores from its own copy in a `finally` -- roughly a
+`shutil.copy2` of a 100 KB file -- so this is generous by orders of magnitude.
+It is not unbounded because the point of the whole section is that a shutdown
+completes: a test that hangs after being asked to stop must not hold the tree
+open until an orchestrator SIGKILLs the RUNNER, which is the one shutdown the
+runner cannot clean up after.
+"""
+
+
+def _terminate_child(proc):
+    """Ask `proc` to stop, then insist. Never raises.
+
+    WHAT THIS DOES *NOT* BUY, AND BOTH HALVES WERE MEASURED BECAUSE BOTH OF THE
+    OBVIOUS ARGUMENTS FOR IT TURNED OUT TO BE FALSE.
+
+    "Without this the guard would restore the tree while a live writer was still
+    planting into it." FALSE. That is true of the SIGNAL -- a SIGTERM sent to
+    this runner alone is not delivered to the child -- and false of
+    `subprocess.run`, which the caller used to use: its own bare `except:`
+    calls `process.kill()` and waits, so any exception out of the wait already
+    took the child with it. Driven: a revert of `_run_one` to `subprocess.run`
+    produced no orphan and the check written for one could not discriminate.
+
+    "SIGTERM first lets the child run its own `finally` and restore its own
+    file." ALSO FALSE for these five children. CPython does not convert SIGTERM
+    into an exception; its default disposition terminates the process outright,
+    so a plain Python script's `finally` does not run for it any more than it
+    does for SIGKILL. Driven: a stub whose `finally` writes a marker was sent
+    SIGTERM through this function and the marker was NOT written.
+
+    WHAT IT ACTUALLY BUYS, WHICH IS SMALLER AND IS WHY THE PRISTINE COPY IS THE
+    MECHANISM AND THIS IS NOT:
+
+      * A BOUNDED WAIT. `subprocess.run`'s cleanup is `kill()` then an
+        unbounded `wait()`. A child stuck in uninterruptible I/O would hold this
+        runner -- and its lock, and the un-restored tree -- open with no
+        deadline. `CHILD_SHUTDOWN_GRACE_SECONDS` bounds both phases.
+      * A CATCHABLE SIGNAL FIRST. SIGTERM is catchable and SIGKILL is not, so a
+        child that DOES install a handler gets its chance. None of the five
+        does today; that is a fact about them, not about what a runner should
+        send.
+      * A DIAGNOSTIC EXIT. The child dies of -15 rather than -9, and one of
+        those reads as "asked to stop".
+
+    Ctrl-C has none of this shape: SIGINT goes to the whole foreground process
+    group, so the child already gets it. This covers the case where it does not.
+    """
+    try:
+        proc.terminate()
+    except OSError:
+        return
+    try:
+        proc.wait(timeout=CHILD_SHUTDOWN_GRACE_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except OSError:
+        return
+    os.write(2, (f"\n[Serial] the test subprocess (pid {proc.pid}) did not "
+                 f"stop within {CHILD_SHUTDOWN_GRACE_SECONDS:.0f}s; killing it "
+                 f"and restoring from this run's pristine copies.\n"
+                 ).encode("utf-8", "replace"))
+    try:
+        proc.kill()
+        proc.wait(timeout=CHILD_SHUTDOWN_GRACE_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _run_one(name):
+    """Run one test as a subprocess and return its exit code.
+
+    `Popen` RATHER THAN `subprocess.run`, and the handle is what lets
+    `_terminate_child` ask before it insists and bound how long it waits. It is
+    NOT "otherwise the child survives" -- see `_terminate_child` for the two
+    obvious arguments for this function that were driven and found false, and
+    for the smaller thing it does buy.
+    """
+    proc = subprocess.Popen([sys.executable, name], cwd=_CODE_DIR)
+    try:
+        return proc.wait()
+    finally:
+        if proc.poll() is None:
+            _terminate_child(proc)
 
 
 def _run_all():
@@ -702,10 +1425,10 @@ def _run_all():
         # _code_dir from __file__ and reads the package relative to it; running
         # from elsewhere works, but keeping cwd here matches how they are
         # documented to be run and keeps any relative artifact in one place.
-        completed = subprocess.run([sys.executable, name], cwd=_CODE_DIR)
+        returncode = _run_one(name)
         elapsed = time.time() - start
-        outcomes.append((name, completed.returncode, elapsed))
-        verdict = "PASS" if completed.returncode == 0 else f"FAIL (exit {completed.returncode})"
+        outcomes.append((name, returncode, elapsed))
+        verdict = "PASS" if returncode == 0 else f"FAIL (exit {returncode})"
         print(f"[{i}/{len(SERIAL_TESTS)}] {name}: {verdict} in {elapsed:.1f}s")
 
     print()

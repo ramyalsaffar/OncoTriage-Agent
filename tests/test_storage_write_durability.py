@@ -134,8 +134,9 @@ from oncotriage.storage import database_logger as _dl
 # MINIMAL ASSERTION HARNESS
 # ===========================================================================
 
-_RESULTS = {"passed": 0, "failed": 0}
+_RESULTS = {"passed": 0, "failed": 0, "skipped": 0}
 _FAILURES = []
+_SKIPS = []
 
 
 def check(label: str, actual, expected) -> None:
@@ -158,6 +159,112 @@ def fail(label: str, detail: str) -> None:
     _FAILURES.append(f"{label}\n          {detail}")
     print(f"  FAIL  {label}")
     print(f"          {detail}")
+
+
+def skip(label: str, reason: str) -> None:
+    """Record coverage that could NOT be exercised in THIS environment.
+
+    A SKIP IS NOT A PASS AND IS NEVER COUNTED AS ONE. The mechanism and the
+    argument are this project's existing ones, adopted rather than invented:
+    ``tests/test_package_invariants.py``'s (the macOS-only ``caffeine`` guard),
+    ``tests/test_dockerignore_exclusions.py``'s (the untracked, self-ignored
+    virtualenv no hosted runner has) and ``tests/test_dashboard_run_health.py``'s
+    (this file's own probe, one file over). Its own counter, its own list, and a
+    summary line PRINTED EVEN AT ZERO -- a skip count that appears only when it
+    is non-zero is indistinguishable from a file that has no skip mechanism at
+    all. It does not touch the exit code: the thing skipped is not broken, it is
+    absent.
+    """
+    _RESULTS["skipped"] += 1
+    _SKIPS.append(f"{label}\n          {reason}")
+    print(f"  SKIP  {label}")
+    print(f"          {reason}")
+
+
+_PROBE_RUN = "run"
+_PROBE_SKIP = "skip"
+
+
+def production_probe_disposition(production_existed):
+    """Whether the production-database non-degeneracy probe has a subject.
+
+    THE GATE READS THE FILESYSTEM; THE PROBE READS THE ROW COUNT, AND THE TWO
+    READINGS BEING INDEPENDENT IS THE WHOLE DESIGN. The probe this gates asserts
+    that the BEFORE row count is not ``None``. A gate keyed on that same reading
+    would therefore be satisfied by exactly the fault the probe exists to catch
+    -- a count that comes back ``None`` for a database that is really there,
+    through a corrupt file, a wrong path or a reader that stopped reading -- and
+    the skip path would quietly become the only path. ``os.path.exists`` decides
+    whether the probe runs; the count decides what it reports.
+
+    Pure, so its controls are different ARGUMENTS rather than a file on disk.
+    """
+    return _PROBE_RUN if production_existed else _PROBE_SKIP
+
+
+def production_probe_verdict(rows_before):
+    """The ``(actual, expected)`` pair the probe hands to ``check``.
+
+    ONE implementation, driven by the live call site and by every control, so a
+    control cannot agree with a probe that has stopped checking.
+
+    A PRESENT-BUT-UNREADABLE DATABASE FAILS RATHER THAN SKIPPING, and that is
+    the safe direction: ``rows()`` answers ``None`` both for absent and for
+    unreadable, the gate above says RUN because the file exists, and the
+    comparison the probe qualifies would then be ``None == None`` -- which is
+    precisely the vacuous pass it is here to refuse.
+    """
+    return (rows_before is not None, True)
+
+
+def gate_call_sites(source_path):
+    """Every ``if`` whose ELSE branch calls ``skip()``, as the set of names its
+    TEST reads. AT ANY NESTING DEPTH, deliberately.
+
+    THE CONTROLS ON THE TWO PURE FUNCTIONS ABOVE CANNOT SEE A WRONG CALL SITE,
+    and that gap is why this exists. Rewriting the gate's ``if`` to read the row
+    count instead of the existence flag leaves both functions correct, leaves
+    every control green, and quietly turns the one state the probe exists to
+    catch into a SKIP.
+    """
+    tree = ast.parse(Path(source_path).read_text(encoding="utf-8"))
+    sites = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        calls_skip = any(
+            isinstance(inner, ast.Call) and getattr(inner.func, "id", "") == "skip"
+            for stmt in node.orelse for inner in ast.walk(stmt))
+        if calls_skip:
+            sites.append({n.id for n in ast.walk(node.test)
+                          if isinstance(n, ast.Name)})
+    return sites
+
+
+def skip_accounting_keys(source_path):
+    """Which ``_RESULTS`` counters ``skip()`` writes, read off this file by AST.
+
+    A SKIP THAT INCREMENTS ``passed`` IS THE FAILURE MODE THE WHOLE GATE EXISTS
+    TO AVOID -- coverage that could not run, reported as coverage that did. No
+    behavioural control can see it (the counter it corrupts is the counter every
+    other check moves), so it is pinned structurally.
+    """
+    tree = ast.parse(Path(source_path).read_text(encoding="utf-8"))
+    keys = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.FunctionDef) and node.name == "skip"):
+            continue
+        for inner in ast.walk(node):
+            target = None
+            if isinstance(inner, ast.AugAssign):
+                target = inner.target
+            elif isinstance(inner, ast.Assign) and len(inner.targets) == 1:
+                target = inner.targets[0]
+            if (isinstance(target, ast.Subscript)
+                    and getattr(target.value, "id", "") == "_RESULTS"
+                    and isinstance(target.slice, ast.Constant)):
+                keys.add(target.slice.value)
+    return sorted(keys)
 
 
 def guarded(fn, default=None):
@@ -271,6 +378,29 @@ _DL_PY = os.path.abspath(_dl.__file__)
 _RUNNER_PY = os.path.abspath(_runner.__file__)
 _DL_DIGEST_BEFORE = digest(_DL_PY)
 _RUNNER_DIGEST_BEFORE = digest(_RUNNER_PY)
+
+# ---------------------------------------------------------------------------
+# THE PRODUCTION DATABASE IS READ *BEFORE* ANYTHING RUNS, AND IT USED NOT TO BE
+# ---------------------------------------------------------------------------
+# Section 9c compares the production row count against a reading taken earlier.
+# Until this pass BOTH readings were taken in section 9 -- the "before" was
+# captured on the line above the comparison, after every driver in this file had
+# already run -- so the check was `rows(db) == rows(db)`, two reads of one
+# unchanged file microseconds apart. IT COULD NOT FAIL. A driver that wrote a
+# hundred rows into the production database would have been reported as a run
+# that touched nothing, which is exactly the "reported success, wrote nothing"
+# shape this whole file exists to remove, pointed the other way.
+#
+# Measured rather than argued: with the capture where it was, deliberately
+# inserting a row into the production database mid-file left 9c GREEN.
+#
+# THE EXISTENCE FLAG IS CAPTURED HERE TOO, and separately from the count. It is
+# what `production_probe_disposition` reads, and reading it at the same instant
+# as the count is what makes "the file was there and the count came back None"
+# a state the probe can report rather than a race between two readings.
+_PRODUCTION_DB = _paths.inferences_path
+_PRODUCTION_EXISTED_BEFORE = os.path.exists(_PRODUCTION_DB)
+_PRODUCTION_ROWS_BEFORE = rows(_PRODUCTION_DB)
 
 
 def result_dict(patient_id, **extra):
@@ -963,18 +1093,97 @@ check("9b  SQLITE_JOURNAL_MODE was restored on the module",
 check("9b  SQLITE_BUSY_TIMEOUT_SECONDS was restored on the module",
       _dl.SQLITE_BUSY_TIMEOUT_SECONDS, _config.SQLITE_BUSY_TIMEOUT_SECONDS)
 
-# THE PRODUCTION DATABASE. Read once, read-only, and asserted unchanged -- this
-# file drives the real writer, so "it only ever passed a scratch path" is worth
-# checking rather than assuming.
-_PRODUCTION_DB = _paths.inferences_path
-_PRODUCTION_ROWS = rows(_PRODUCTION_DB)
+# THE PRODUCTION DATABASE. The BEFORE reading was taken at module scope, above
+# every driver in this file; see the block beside it for what the old capture
+# point cost. This check is NEVER GATED -- a run that CREATED the production
+# database gives before=None, after=<n> and fails here on any machine,
+# including a CI runner that has no such file.
 check("9c  the production database was not written to by this run",
-      rows(_PRODUCTION_DB), _PRODUCTION_ROWS)
-check("9c  ...and it was readable, so that comparison is not None == None "
-      "(non-degeneracy)",
-      _PRODUCTION_ROWS is not None, True)
+      rows(_PRODUCTION_DB), _PRODUCTION_ROWS_BEFORE)
 check("9c  ...and no scratch path resolved to it",
       _PRODUCTION_DB.startswith(_TMP), False)
+
+# ---------------------------------------------------------------------------
+# THE NON-DEGENERACY PROBE IS GATED ON THE ENVIRONMENT, AND THE RULING IS HERE
+# ---------------------------------------------------------------------------
+# The probe below needs a READABLE production database and CI never has one:
+# `.github/scripts/provision_ci_paths.py` creates the PARENT of
+# `inferences_path` and deliberately not the file, and its own header calls
+# fabricating inputs "the exact defect this project's non-degeneracy rule exists
+# to catch". That provisioning decision is a ruling and is untouched.
+#
+# THIS ONE PROBE IS WHY THE WHOLE FILE WAS BUCKET E. Its table entry read
+# "'9c ...and it was readable, so that comparison is not None == None' failed"
+# -- one check, and a hundred others that need nothing at all were kept out of
+# CI to preserve it. `tests/test_dashboard_run_health.py` met the identical
+# choice and gated, naming THIS FILE as the alternative it was rejecting; the
+# precedent now runs the other way and both files gate.
+#
+# NOTHING THE PROBE ASSERTS IS WEAKENED. Where a production database exists it
+# runs unchanged, against the same reading, with the same expectation. Where
+# there is none, "the comparison above is not None == None" is not a weaker
+# question -- it is a question about a file that does not exist. That is what
+# `skip` means here, and what it must never be allowed to mean is "the check was
+# inconvenient".
+_STANDIN_DB = os.path.join(_TMP, "production-probe-standin.db")
+_standin = sqlite3.connect(_STANDIN_DB)
+_standin.execute("CREATE TABLE inferences (id INTEGER PRIMARY KEY)")
+_standin.execute("INSERT INTO inferences (id) VALUES (1)")
+_standin.commit()
+_standin.close()
+_STANDIN_ROWS = rows(_STANDIN_DB)
+
+check("9d  control: a readable database counts to a real number rather than "
+      "None (non-degeneracy: every control below would be vacuous otherwise)",
+      _STANDIN_ROWS, 1)
+check("9d  control: with no production database on disk the probe is SKIPPED",
+      production_probe_disposition(False), _PROBE_SKIP)
+check("9d  control: with a production database on disk the probe is RUN",
+      production_probe_disposition(os.path.exists(_STANDIN_DB)), _PROBE_RUN)
+check("9d  control: RUN plus an honest reading -- the probe passes",
+      production_probe_verdict(_STANDIN_ROWS) == (True, True), True)
+check("9d  control: RUN plus a present database read as None -- the probe "
+      "FIRES, so a non-reading cannot pass as a skip",
+      production_probe_verdict(None)[0] == production_probe_verdict(None)[1],
+      False)
+
+# A DIRECTORY, not a chmod: `chmod 000` is bypassed by root, so a control built
+# on it passes vacuously on any runner that runs as root. A read-only URI onto a
+# directory is refused for every user there is.
+check("9d  control: an existing path that cannot be READ counts to None rather "
+      "than raising (a raise here aborts the file before its last checks)",
+      guarded(lambda: rows(_TMP)), None)
+check("9d  control: ...and the gate would still say RUN for it, so a present-"
+      "but-unreadable production database FAILS rather than skipping",
+      production_probe_disposition(os.path.exists(_TMP)), _PROBE_RUN)
+
+_GATE_SITES = gate_call_sites(os.path.abspath(__file__))
+check("9d  control: skip() writes ONLY the skipped counter -- a skip that "
+      "incremented passed would report unavailable coverage as coverage",
+      skip_accounting_keys(os.path.abspath(__file__)), ["skipped"])
+check("9d  control: exactly one gated call site is present (non-degeneracy -- "
+      "a walk that matched nothing would satisfy the two below for free)",
+      len(_GATE_SITES), 1)
+check("9d  control: the gate is decided by the EXISTENCE reading",
+      "_PRODUCTION_EXISTED_BEFORE" in (_GATE_SITES[0] if _GATE_SITES else set()),
+      True)
+check("9d  control: ...and NOT by the row count the probe itself asserts on -- "
+      "a gate keyed on that reading is satisfied by the exact fault the probe "
+      "catches",
+      "_PRODUCTION_ROWS_BEFORE" in (_GATE_SITES[0] if _GATE_SITES else set()),
+      False)
+
+_PROBE_LABEL = ("9c  ...and it was readable, so that comparison is not "
+                "None == None (non-degeneracy)")
+if production_probe_disposition(_PRODUCTION_EXISTED_BEFORE) == _PROBE_RUN:
+    check(_PROBE_LABEL, *production_probe_verdict(_PRODUCTION_ROWS_BEFORE))
+else:
+    skip(_PROBE_LABEL,
+         f"no production database at {_PRODUCTION_DB}, so the comparison above "
+         f"had nothing to be exercised against. That comparison stayed LIVE and "
+         f"would still have caught this run creating one. Expected on a CI "
+         f"runner: provision_ci_paths.py creates the parent directory and "
+         f"deliberately not the file.")
 
 shutil.rmtree(_TMP, ignore_errors=True)
 
@@ -989,11 +1198,19 @@ print("SUMMARY")
 print("=" * 70)
 print(f"Passed: {_RESULTS['passed']}")
 print(f"Failed: {_RESULTS['failed']}")
+# PRINTED EVEN AT ZERO. A skip count that appears only when it is non-zero is
+# indistinguishable from a file that has no skip mechanism at all.
+print(f"Skipped: {_RESULTS['skipped']}")
 
 if _FAILURES:
     print("\nFailures:")
     for _f in _FAILURES:
         print(f"  - {_f}")
+
+if _SKIPS:
+    print("\nSkipped:")
+    for _sk in _SKIPS:
+        print(f"  - {_sk}")
 
 if __name__ == "__main__":
     sys.exit(1 if _RESULTS["failed"] else 0)

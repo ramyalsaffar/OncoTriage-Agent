@@ -690,7 +690,7 @@ python tests/test_agent_emission_provenance.py                      # 185 (was 1
 # nothing -- every control is driven through the real shipped module by creating
 # the failing condition for real (an exclusive lock from a second connection, an
 # unwritable path, a deleted row). ~4 s, most of it deliberate lock contention.
-python tests/test_storage_write_durability.py                       # 100 (was 99; the run-identity pass split section 5c's lock-site pin into the comparison and its own non-degeneracy probe when the expected number stopped being retyped there)
+python tests/test_storage_write_durability.py                       # 111 passed / 0 failed / 1 SKIPPED against ONLY the CI directory skeleton, and 111/0/0 against the developer tree. BUCKET E -> BUCKET A (the signal-safe-restore pass): its single production-database non-degeneracy probe was keeping a hundred checks that need nothing at all out of CI, and that probe is GATED now on tests/test_dashboard_run_health.py's pattern -- nine controls, an AST pin on the gate's call site, and the 9c COMPARISON never gated, so a run that CREATED a production database still fails on a runner. THE SAME PASS FIXED 9c, WHICH COULD NOT FAIL: its BEFORE reading was captured on the line above the comparison, after every driver had run, so it was rows(db) == rows(db) microseconds apart -- measured, a planted mid-run write left it GREEN. The capture is at module scope now and the same plant makes it FAIL. (was 100; the run-identity pass split section 5c's lock-site pin into the comparison and its own non-degeneracy probe when the expected number stopped being retyped there)
 
 # The reproducibility-hash pass. Same shape, same directory. No network, no
 # keys, no spend, no git history, not in the collision matrix, and it execs
@@ -7079,7 +7079,7 @@ in both directions.
 # process asserting about it and a lock held by one process cannot be observed
 # from inside it. NOT in the collision matrix. It EXECS NOTHING. Bucket A,
 # ~55 s.
-python tests/test_ablation_stop_and_lock.py                       # 143 (was 142; the consolidation pass corrected 3k-b's argument -- half of it dissolved when control.py stopped importing anything from the project -- and added 3k-b2, without which the class separation is equally satisfied by two COPIES of the class, which is what it was. Before that 107; the lock-hardening pass added the symlink-resolved key, the per-user lock directory, the substitution refusal, the UTC record, the stripped truncation guard and a symlinked second real invocation)
+python tests/test_ablation_stop_and_lock.py                       # 157 (was 143; the degradation-report pass added section 5m-5o over the registry's two blocks in the study's closing text and FIXED 5j-5l, which were VACUOUS: `_lines.append` was passed as the sink and `print_study_close` emits a bare `emit()`, which `list.append` refuses -- so `drive` caught the TypeError and 5k and 5l were asserting `"..." not in ""`, satisfied by a function that printed nothing at all. Before that 142; the consolidation pass corrected 3k-b's argument -- half of it dissolved when control.py stopped importing anything from the project -- and added 3k-b2, without which the class separation is equally satisfied by two COPIES of the class, which is what it was. Before that 107; the lock-hardening pass added the symlink-resolved key, the per-user lock directory, the substitution refusal, the UTC record, the stripped truncation guard and a symlinked second real invocation)
 ```
 
 **THE FOREGROUND-SIGNAL LESSON IS CLOSED IN CODE RATHER THAN BY A CONVENTION,
@@ -7986,12 +7986,41 @@ python tests/test_compose_shutdown_grace.py          #  21, ~0.7s. NO DOCKER DAE
                                                     #  landmine with the GROUPED arm's
                                                     #  own worst case, a vocabulary pin
                                                     #  and two controls)
-python tests/test_serial_runner_lock.py              # 119, ~0.6s. REAL concurrent
-                                                     #  subprocesses and a REAL
-                                                     #  symlinked checkout (was 85;
-                                                     #  the consolidation pass added
-                                                     #  section 9, which pins this
-                                                     #  file's COPY against
+python tests/test_ablation_write_durability.py        #  43, ~3s. No network, no
+                                                     #  keys, no spend; every
+                                                     #  database is a temp file and
+                                                     #  the contention is real (a
+                                                     #  second connection takes a
+                                                     #  genuine BEGIN EXCLUSIVE). Not
+                                                     #  in the collision matrix (was
+                                                     #  33; the signal-safe-restore
+                                                     #  pass added 3e-3k over
+                                                     #  WRITE_RETRY_OUTCOMES, driven
+                                                     #  on a callable that raises a
+                                                     #  stated number of stated
+                                                     #  exceptions -- 3a cannot say
+                                                     #  how many attempts it took,
+                                                     #  which is what makes it a good
+                                                     #  test of "the write lands" and
+                                                     #  a useless one of "the retry
+                                                     #  fired")
+python tests/test_serial_runner_lock.py              # 204, ~1.3s. REAL concurrent
+                                                     #  subprocesses, a REAL symlinked
+                                                     #  checkout, a REAL SIGKILL and a
+                                                     #  REAL SIGTERM (was 122; the
+                                                     #  signal-safe-restore pass added
+                                                     #  section 10 over the pristine-copy
+                                                     #  guard -- a run killed mid-plant,
+                                                     #  the successor's repair, the
+                                                     #  SIGTERM arm, the refusal, and
+                                                     #  the pure pieces -- with TWELVE
+                                                     #  planted reverts, twelve caught,
+                                                     #  FOUR of which found defects in
+                                                     #  the checks rather than in the
+                                                     #  code.
+                                                     #  Before that 85; the consolidation
+                                                     #  pass added section 9, which pins
+                                                     #  this file's COPY against
                                                      #  oncotriage/control.py by AST
                                                      #  with eleven planted controls)
 ```
@@ -8485,6 +8514,163 @@ tests/_control_harness.py
    `oncotriage.observability`, which is the one import it may not have; that is
    the price of the no-project-imports property and it is paid deliberately.
 
+
+### The suite survives its own death, and the study reports its health (the signal-safe-restore pass)
+
+**FOUR ITEMS. NO BILLED CALL WAS MADE**: `python fixture_replay.py` is **12/12
+clean, exit 0, with no recapture and zero CONFIG MOVED lines**, and the
+production `inferences.db` sha256 is unchanged.
+
+**1. `tests/run_serial_tests.py` KEEPS A PRISTINE COPY THAT OUTLIVES THE
+PROCESS.** The lock is about two runs; nothing was about ONE RUN DYING, and it
+is the same consequence. Both source-mutating tests keep their pristine copy in
+a `tempfile.mkdtemp()` of their own and restore it in their own `finally` -- so
+a SIGTERM, a `docker stop`, a closed terminal or a SIGKILL that skips that
+`finally` leaves `oncotriage/` holding a DELIBERATELY PLANTED DEFECT **and
+destroys the only copy of what it replaced**, because the temp directory's name
+existed nowhere but in the dead process. `tests/test_config_snapshot_date_rot.py`
+rewrites `DATA_SNAPSHOT_DATE`, and a checkout left in that state computes every
+patient's age against a fabricated reference date without a word. **This project
+has already paid once for a silently-reverted edit to that exact file.**
+
+**THE COPY IS A SIBLING WITH THE RUNNER'S PID IN ITS NAME**
+(`oncotriage/config.py.serial-runner-pristine-4213`), taken inside the lock and
+before the first test, and it has TWO arms:
+
+| gesture | what puts the tree back |
+|---|---|
+| a failing test, a clean exit, Ctrl-C | `pristine_guard`'s own `finally` |
+| SIGTERM, SIGHUP | the same `finally`, because `shutdown_signals_reach_cleanup` converts both to a SystemExit -- CPython's default for either terminates outright, no unwinding |
+| **SIGKILL, a panic, a power cut** | **NOTHING RUNS.** The NEXT invocation repairs from the copy, announcing what it put back, before it runs anything |
+
+**SIGKILL CANNOT BE CAUGHT AND THAT IS THE REASON THE DESIGN HAS A SECOND HALF,
+not a gap in it.** A guard whose only arm is a `finally` is absent exactly when
+the machine went down.
+
+**STALENESS IS DECIDED BY THE LOCK, NOT BY ASKING WHETHER THE PID IS ALIVE, and
+the pid test is the WEAKER of the two rather than a second opinion.** A copy is
+taken after the lock is acquired and removed before it is released, both inside
+one `with` -- so a copy that exists means some run never reached its cleanup,
+and that run is either dead or holding the lock, which we hold. Every copy found
+is stale by construction. A pid is REUSED: the pid of a run SIGKILLed yesterday
+is very likely somebody else's process today, and a liveness test would read a
+genuinely stale copy as live and REFUSE TO REPAIR IT, leaving the plant in the
+tree. The pid is recorded and reported because it is what an operator correlates
+with a CI log; it decides nothing.
+
+**REPAIR RUNS ABOVE THE BACKUP.** Taking a copy of a corrupted file would freeze
+the plant into the thing meant to undo it, and every later run would then
+"repair" the tree back to the defect.
+
+**EVERY WRITE IS ATOMIC, BOTH DIRECTIONS.** `shutil.copy2` is not: an
+interrupted copy leaves a TRUNCATED file, and a truncated *backup* later restored
+over a good target is worse than no backup at all. Both directions write a temp
+name in the destination's own directory and `os.replace` it, so a copy that
+EXISTS is complete. That is also the second reason the copy is a sibling --
+`os.replace` is atomic within one filesystem and is not across them.
+
+**THE COPY'S NAME DOES NOT END IN `.py`, AND THAT IS LOAD-BEARING.** It sits
+inside the package, which `tests/test_package_invariants.py` walks for `*.py` --
+section 1c re-parses every one, section 5 scans them for re-exports, check 2h
+reads them for name usage. A `config_pristine.py` beside `config.py` would join
+that corpus as a second module declaring every constant in it.
+
+**A COPY THAT CANNOT BE TAKEN IS A REFUSAL, EXIT 5**, on `empty_database
+(db_path, flag)`'s footing: planting into source with nothing to put it back
+from is the state this exists to remove. `143` is SIGTERM's, the shell's own
+encoding and the batch runner's.
+
+**TWO OBVIOUS ARGUMENTS FOR `_terminate_child` WERE DRIVEN AND BOTH ARE FALSE,
+and they are recorded because a check that cannot discriminate passes and
+therefore looks like it is working.** "Without it the runner restores while a
+live writer is still planting" -- FALSE: `subprocess.run`'s own bare `except:`
+already calls `process.kill()`, so a revert to it produced no orphan and the
+check written for one reported 182/0. "SIGTERM first lets the child's `finally`
+run" -- ALSO FALSE for these five children: CPython does not convert SIGTERM
+into an exception, so a plain Python script's `finally` does not run for it any
+more than for SIGKILL, measured with a marker-writing stub. **What survives is
+smaller and is what is checked**: the wait is BOUNDED (`subprocess.run`'s
+`kill()` then `wait()` is not), the signal is CATCHABLE first, and the child is
+not left running. THE PRISTINE COPY IS THE MECHANISM; that function is hygiene.
+
+**`WRITER_OWNED_FILES` IS DECLARED AND HALF-CHECKED, AND THE OTHER HALF IS
+NAMED RATHER THAN FAKED.** `tests/test_serial_runner_lock.py` section 1 checks
+each PAIR against the named writer's own source -- it exists, it is in
+`SERIAL_TESTS`, it names the target as a string constant, it really writes -- so
+an entry pointing at a moved file or a test that stopped rewriting it FAILS. It
+CANNOT see a brand-new third writer, and that limit is MEASURED: a cheap scan
+for "names a path under `oncotriage/` AND calls a write" reports ELEVEN files in
+this suite, NINE of which write only into a temp directory. An
+over-approximation that flags nine innocents is not a check.
+
+**2. THE ABLATION STUDY PRINTS THE REGISTRY'S TWO BLOCKS.** It drives the same
+six-stage graph, the same Stage 5 and the same writer as a batch run, so it
+moves every counter in `oncotriage/degradation.py`'s registry and census -- and
+reported NONE of them. A study that dropped a retrieval channel on every patient
+ended with a summary table and nothing saying so. `print_study_close` now prints
+the census and then the degradation block, above this module's own three
+readers, with the `Status:` line last: severity ascending, verdict last, which
+is `oncotriage/batch/runner.py`'s ordering adopted rather than invented. **ONE
+SNAPSHOT PER BLOCK, TAKEN AT THE CONSUMER**: the batch runner takes its two in
+`main()` because it has three consumers of the degradation one and they must
+describe one instant; this study has exactly one of each, so the snapshot is
+taken there -- same guarantee, no parameter to forget -- and both are taken
+BEFORE the first `emit`, because emitting a line can itself move `EMIT_FAILURES`.
+
+**3. `tests/test_storage_write_durability.py` IS BUCKET A, AND ITS 9c COULD NOT
+FAIL.** See the run-block entry above for both. The one-line summary: a hundred
+checks needing nothing at all were out of CI to preserve a single production-
+database probe, which is gated now; and the check that says the production
+database was not written to was comparing two readings taken microseconds apart
+at the END of the run, so a driver that wrote a hundred rows into it would have
+been reported as a run that touched nothing.
+
+**4. `run_with_write_retry` COUNTS WHAT IT DID.** It is the helper every write
+outside `log_inference` retries through -- today the ablation study's three --
+and it incremented nothing: a console line, a log record, and no total. A study
+that retried four hundred times to lose nothing and one that met no contention
+produced the identical run-end report, and those have opposite implications for
+what the next increment of load costs. `WRITE_RETRY_OUTCOMES` is keyed
+`{outcome}:{ExceptionType}` over a closed three: `retried:` per SLEEP,
+`recovered:` per CALL that retried and then returned, `exhausted:` per call that
+ran out of `SQLITE_WRITE_MAX_ATTEMPTS` while the error was still transient.
+**`retried:` alone is not enough** -- it is equally consistent with a call that
+retried and then gave up, which is why the outcome word is in the key.
+**THERE IS DELIBERATELY NO `terminal:` KEY**: an error `_is_retryable` refuses
+is not a retry outcome, nothing was retried, and the caller's own `except` is
+what counts it with the caller's own meaning.
+
+**WHAT WAS VERIFIED BY RUNNING.** CI bucket A **75 files, 0 failed, 0 not run**
+-- and it now INCLUDES `test_storage_write_durability.py`;
+`tests/test_package_invariants.py` **260/0/0**; `python fixture_replay.py`
+**12/12 clean, exit 0, no recapture**; `tests/run_serial_tests.py` **5/5 in 386s**, with
+both writer-owned files confirmed byte-identical afterwards, both pristine
+copies observed PRESENT mid-run and ZERO left at the end; the production
+`inferences.db` sha256 **unchanged** (`ab1403e3...`, 90,185,728 bytes) and
+`ablation_results.db` unchanged (`f2bc23c6...`). **Twelve reverts on item 1, twelve
+caught; three on item 3, three caught; one on item 4's arithmetic.** Counts
+moved: `test_serial_runner_lock.py` 122 -> **204**,
+`test_ablation_stop_and_lock.py` 143 -> **157**,
+`test_ablation_write_durability.py` 33 -> **43**, and
+`test_degradation_counter_readers.py` unchanged at **152**,
+`test_storage_write_durability.py` 100 -> **111**.
+
+**FIVE DEFECTS IN THIS PASS'S OWN WORK WERE FOUND BY RUNNING, NOT BY READING.**
+(i) Two reverts ABORTED the new test file -- `str.index` on an announcement a
+revert had removed, and `int(open(ready).read())` on a file a revert stopped
+producing, both raising while `check`'s argument was being evaluated. **The
+fourteenth time this project has shipped that shape.** (ii) A revert HUNG it:
+the guard section gave the runner a stdout PIPE, and a child that outlives the
+runner INHERITS it, so `communicate()` blocked on the ORPHAN rather than on the
+runner -- two minutes of nothing, which reads exactly like an abort. Every
+subprocess in that section writes to a FILE now. (iii) `_terminate_child`'s two
+justifications, above. (iv) FOUR guards had NO control and were only found by reverting them: the
+post-restore verification, the unreadable-copy refusal, the half-taken cleanup
+and the keep-the-copy-on-restore-failed branch each reported a full green when
+removed. The last of those needed a THIRD case to be measurable at all -- the
+obvious one drives the failure with the directory read-only, where a buggy
+`os.unlink(backup)` fails too and the copy survives for the wrong reason.
+(v) `tests/test_ablation_stop_and_lock.py`'s 5j-5l were vacuous, above.
 
 ## Persistence and observability
 

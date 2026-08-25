@@ -8,3 +8,10 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+
+# tests/run_serial_tests.py's pristine copies of the two files the suite
+# rewrites in place. Transient -- taken inside the run lock and removed on the
+# way out -- but a run killed by SIGKILL leaves one behind on purpose, so that
+# the next invocation can repair from it. Never committed.
+*.serial-runner-pristine-*
+.serial-runner-tmp-*
