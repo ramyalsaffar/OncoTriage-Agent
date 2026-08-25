@@ -2816,6 +2816,16 @@ SELECT s.campaign_id,
             "DID NOT PACK, which is a different sentence from low pressure and",
             "from a lost measurement alike.",
             "",
+            "NEITHER BUCKET IS THE END OF THE STORY ANY MORE, and that is what",
+            "changed under them. Both still mean exactly what they say about",
+            "THE PACKER -- and stage5_input_request_pressure answers the",
+            "question underneath, from a per-row scalar every Stage 5 return",
+            "carries: how close did the largest single request come to the",
+            "configured budget. Read the two together. A run whose inferences",
+            "are all bypassed reads unpacked here and reports real per-request",
+            "pressure there; a run whose inferences all failed reads unpacked",
+            "here and reports the pressure its plan carried there.",
+            "",
             "over_budget_chunks counts chunks that could not be made to fit by",
             "any amount of packing -- a single trial larger than the whole",
             "allowance. That is the guard FIRING, not approaching.",
@@ -2848,6 +2858,130 @@ SELECT s.campaign_id,
     LEFT JOIN json_each({_PACK_JSON_SQL}, '$.chunks') c
     GROUP BY run
     ORDER BY peak_pressure DESC, run
+""",
+    ),
+    # ── THE INPUT GUARD, PER ROW, ON EVERY ARM AND EVERY OUTCOME ──────────
+    #
+    # A SIBLING RATHER THAN MORE COLUMNS ON THE QUERY ABOVE, and its own notes
+    # are what settle that: "ONE ROW PER CHUNK feeds this, not one per
+    # patient". That query is an aggregate over the packer's chunk list, keyed
+    # on a JSON array, measured against the EFFECTIVE budget of each chunk's
+    # own inference. This one is an aggregate over INFERENCE ROWS, keyed on two
+    # scalar columns, measured against the CONFIGURED budget. Folding them
+    # together would produce rows whose counts mean two different things --
+    # `inferences` counted once per chunk in half the columns and once per
+    # patient in the other half -- which is the shape `campaign_summary` had to
+    # be repaired for one table over.
+    #
+    # GROUPED BY (run, ARM), which the query above is not and cannot be. The
+    # two call modes have genuinely different per-request input profiles by
+    # design: grouped packs several trials into one request up to the budget,
+    # per-trial sends prefix-plus-one and is affordable only because that
+    # prefix is cached. Averaging them into one pressure figure would describe
+    # neither. It is the same (run, arm) grouping `call_mode_comparison` and
+    # `stage5_cache_effectiveness` use, and through the same
+    # MODE_NOT_RECORDED_LABEL bucket, so a reader can put cost, cache hit rate
+    # and input pressure beside each other row for row.
+    Query(
+        key='stage5_input_request_pressure',
+        heading='=== STAGE 5: INPUT REQUEST PRESSURE, PER RUN AND ARM ===',
+        render='to_string',
+        blank_after=True,
+        # HAND-DECLARED, in ADDITIVE_COLUMNS key order then column order within
+        # a table, which is what derive_requires_columns produces and what
+        # tests/test_storage_schema_guards.py compares this against. Every one
+        # is an INFERENCE_COLUMN_ADDITIONS entry, so selecting it on a database
+        # a writer has not opened since era 6 raises `no such column` and takes
+        # report() down with it -- the defect item 38 removed from File 16.
+        # `error` is deliberately absent: it is a BASE column of `inferences`,
+        # present since the table was created, so it is not an additive
+        # requirement and declaring it would disagree with the derivation.
+        requires_columns=(
+            ("inferences", "llm_classifier_input_budget"),
+            ("inferences", "llm_classifier_input_tokens_estimated"),
+            ("inferences", "matching_call_mode"),
+            ("inferences", "run_id"),
+        ),
+        notes=(
+            "ONE ROW PER PATIENT, and the scalar is a MAXIMUM over that",
+            "patient's requests -- the largest single request Stage 5 planned",
+            "for them. MATCHING_INPUT_TOKEN_BUDGET is a budget on ONE request,",
+            "so the biggest request is the one that approaches it; a sum",
+            "across a patient's chunks would rise with the chunk count, which",
+            "is the packer working rather than pressure.",
+            "",
+            "THIS IS THE QUESTION stage5_input_packing_pressure ABOVE CANNOT",
+            "ANSWER FOR TWO WHOLE POPULATIONS, and both of them matter more",
+            "than the ones it can. That query reads llm_classifier_packing,",
+            "which Stage 5 publishes on its SUCCESS return only and which",
+            "per-trial mode fills with a bypass note and no numbers. So a",
+            "FAILED row had no input figure at all -- and a run that failed",
+            "because its input was enormous is the row most worth asking -- and",
+            "the SHIPPED call mode had none on its successful rows either.",
+            "",
+            "pressure is the estimate over llm_classifier_input_budget, the",
+            "CONFIGURED budget recorded on the row. Above 1.0 is real and is",
+            "not an error: the packer relaxes its budget when the chunk cap",
+            "binds, and a single trial larger than the whole allowance ships",
+            "anyway. The relaxation IS the pressure, so it is measured against",
+            "what was configured rather than against what the packer settled",
+            "for -- that figure stays in llm_classifier_packing, where it",
+            "describes the packer.",
+            "",
+            "budget_min and budget_max are both shown for the reason the",
+            "output query shows its thresholds twice: a campaign that spanned",
+            "a config change says so here rather than averaging across it.",
+            "",
+            "failed_inferences is how many of the rows behind these numbers",
+            "carry a recorded error -- which is a Stage 5 failure return in",
+            "the rows that have a scalar, and can be an UPSTREAM failure in",
+            "the rows that do not, since those never entered Stage 5 at all.",
+            "Read it beside unmeasured: failed AND measured is the population",
+            "this query was built for, and failed AND unmeasured is a run that",
+            "died before the judge. It is a BREAKDOWN, not an exclusion -- the",
+            "pressure figures are over every measured row of the group, which",
+            "is the whole point of measuring at plan time.",
+            "",
+            "unmeasured is rows that never entered Stage 5 (no candidates, or",
+            "a failure upstream of it) or that predate era 6. SQL aggregates",
+            "skip NULL, so a group reading unmeasured = inferences has no",
+            "pressure to report -- which is not the same as low pressure.",
+            "",
+            "THE PER-CALL FIGURES ARE NOT HERE and are not duplicated",
+            "anywhere: llm_classifier_call_details carries one row per request",
+            "issued, and stage5_cache_effectiveness reads it.",
+        ),
+        sql=f"""
+    SELECT
+        run,
+        arm,
+        COUNT(*)                                              AS inferences,
+        SUM(CASE WHEN estimate IS NULL THEN 1 ELSE 0 END)     AS unmeasured,
+        SUM(CASE WHEN failed THEN 1 ELSE 0 END)               AS failed_inferences,
+        MIN(budget)                                           AS budget_min,
+        MAX(budget)                                           AS budget_max,
+        MAX(estimate)                                         AS peak_request_tokens,
+        ROUND(MAX(estimate * 1.0 / budget), 4)                AS peak_pressure,
+        ROUND(AVG(estimate * 1.0 / budget), 4)                AS mean_pressure,
+        MIN(budget - estimate)                                AS min_headroom_tokens,
+        SUM(CASE WHEN estimate * 1.0 / budget >= 0.75
+                 THEN 1 ELSE 0 END)                           AS inferences_at_75pct,
+        SUM(CASE WHEN estimate * 1.0 / budget >= 0.90
+                 THEN 1 ELSE 0 END)                           AS inferences_at_90pct,
+        SUM(CASE WHEN estimate > budget THEN 1 ELSE 0 END)    AS inferences_over_budget
+    FROM (
+        SELECT
+            COALESCE(CAST(i.run_id AS TEXT), '{NO_RUN_LABEL}') AS run,
+            COALESCE(i.matching_call_mode,
+                     '{MODE_NOT_RECORDED_LABEL}')             AS arm,
+            i.llm_classifier_input_tokens_estimated           AS estimate,
+            i.llm_classifier_input_budget                     AS budget,
+            CASE WHEN i.error IS NOT NULL AND i.error <> ''
+                 THEN 1 ELSE 0 END                            AS failed
+        FROM inferences i
+    ) x
+    GROUP BY run, arm
+    ORDER BY peak_pressure DESC, run, arm
 """,
     ),
     Query(

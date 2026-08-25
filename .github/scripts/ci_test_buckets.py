@@ -358,6 +358,17 @@ BUCKETS = {
         "collision matrix. An _EXEC_ALLOWLIST member -- section 6 execs a "
         "copy with the packing branch disabled as the OTHER ARM of an "
         "equivalence proof, not only as a control"),
+    "test_agent_stage5_input_pressure_scalar.py": (
+        _A, None,
+        "ran green in 3s, 53 checks: the Stage 5 INPUT guard's per-row scalar "
+        "and its recorded budget, driven through the real node in BOTH call "
+        "modes on the success path, all four grouped failure returns, the "
+        "per-trial warmup floor and the wave floor, plus a real StateGraph "
+        "for the channel and a scratch SQLite for the round trip. Every "
+        "OpenAI client is a stand-in installed through oncotriage/agent/deps; "
+        "no network, no keys, NO SPEND, no live Qdrant, no model load, no "
+        "corpus, no git history, no subprocess. Not in the collision matrix: "
+        "it writes only inside a tempfile.mkdtemp it removes"),
     "test_agent_stage5_per_trial_calls.py": (
         _A, None,
         "ran green in 10.0s, 239 checks (this line read 139 and was stale "

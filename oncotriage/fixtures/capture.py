@@ -2367,6 +2367,21 @@ def build_environment_block() -> Dict:
             # difference that a one-line config edit caused.
             "MATCHING_REASONING_EFFORT": MATCHING_REASONING_EFFORT,
             "MATCHING_MAX_TOKENS": MATCHING_MAX_TOKENS,
+            # THE INPUT GUARD'S BUDGET, ON EXACTLY THE ARGUMENT ABOVE. Both of
+            # the OUTPUT guard's denominators are already here -- MATCHING_MAX_
+            # TOKENS and MATCHING_OUTPUT_SPLIT_FRACTION -- and the input side's
+            # was not, which is the same asymmetry era 6 closed in the stored
+            # row. It decides the PARTITION: move it and a batch that shipped
+            # as one request ships as three, which changes what the judge is
+            # shown per call and therefore the verdicts, and a replay would
+            # report that as an unexplained cross_encoder-and-Stage-5
+            # difference with no cause attached.
+            #
+            # FUTURE CAPTURES ONLY, on this block's standing doctrine: File
+            # 46's diff_tunables() iterates the keys the FIXTURE recorded, not
+            # the keys this dict declares, so the twelve fixtures on disk are
+            # unmoved and replay clean without recapture. Verified by running.
+            "MATCHING_INPUT_TOKEN_BUDGET": config.MATCHING_INPUT_TOKEN_BUDGET,
             # WHICH PROVIDER SERVED STAGE 5. On this dict's own doctrine: a
             # provider flip changes the endpoint, the request FORM (Responses
             # rather than Chat Completions), the wire model id and -- because

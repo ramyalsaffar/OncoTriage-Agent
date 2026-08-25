@@ -202,17 +202,27 @@ def _pipeline_provenance(state) -> Dict:
         # are different claims.
         "llm_classifier_truncation_splits": state.get("llm_classifier_truncation_splits", 0),
         "llm_classifier_output_tokens_estimated": state.get("llm_classifier_output_tokens_estimated"),
-        # THE TWO GUARD DENOMINATORS, on the estimate's route and not the
-        # truncation counters' -- no default, so a run that never entered
-        # Stage 5 stores NULL. A 0 here would assert a configured ceiling of
-        # zero, which is a claim about the configuration rather than about how
-        # far the run got. See TrialMatchState for what each one is the
-        # denominator of; the input guard needs no entry, because its budgets
-        # travel inside llm_classifier_packing below.
+        # THE FOUR GUARD FIGURES, on the estimate's route and not the
+        # truncation counters' -- no default on any of them, so a run that
+        # never entered Stage 5 stores NULL. A 0 here would assert a configured
+        # ceiling or budget of zero, which is a claim about the configuration
+        # rather than about how far the run got. See TrialMatchState for what
+        # each one is the denominator of.
+        #
+        # THE LAST CLAUSE OF THIS COMMENT USED TO READ "the input guard needs
+        # no entry, because its budgets travel inside llm_classifier_packing
+        # below", and that is the gap the input pair closes. That report is
+        # published on the SUCCESS return only and per-trial mode bypasses the
+        # packer that fills it, so the input guard was unmeasurable on every
+        # failed row and on every row of the shipped call mode.
         "llm_classifier_output_split_threshold":
             state.get("llm_classifier_output_split_threshold"),
         "llm_classifier_output_ceiling":
             state.get("llm_classifier_output_ceiling"),
+        "llm_classifier_input_tokens_estimated":
+            state.get("llm_classifier_input_tokens_estimated"),
+        "llm_classifier_input_budget":
+            state.get("llm_classifier_input_budget"),
         "not_evaluable_truncated": state.get("not_evaluable_truncated", 0),
         "llm_classifier_calls": state.get("llm_classifier_calls", 0),
 

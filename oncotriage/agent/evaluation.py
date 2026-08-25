@@ -3780,6 +3780,52 @@ CLINICAL TRIALS:
                           + estimate_prompt_tokens(
                               _user_prompt_for([], log_events=False)))
 
+    # ── EVERY TRIAL'S INPUT COST, PRICED ONCE, KEYED BY THE TRIAL OBJECT ───
+    #
+    # The same figure the packer prices with, from the same blocks, through the
+    # same one-line function -- so the patient-level input scalar published on
+    # every return below and the packer's per-chunk arithmetic cannot disagree
+    # about what a trial costs.
+    #
+    # PRICED HERE RATHER THAN READ BACK OFF `packing_report`, and that is the
+    # whole reason this map exists. The report's chunk list describes the
+    # partition the PACKER chose, and the packer is one of three partitioners:
+    # per-trial mode bypasses it entirely, packing-OFF never calls it, and the
+    # proactive splitter HALVES whatever it produced. A scalar read off the
+    # report would therefore be absent on two arms and stale on the third.
+    #
+    # KEYED BY `id(trial_obj)`, WHICH IS SAFE HERE AND IS NOT A SHORTCUT.
+    # Every partitioner in this node -- the packer, the per-trial branch and
+    # `_split_in_half` -- rebuilds LISTS out of the SAME trial dicts, so a
+    # chunk holds the identical objects `trials` holds, and `trials` keeps
+    # every one of them alive for the whole of this function: no address can
+    # be reused underneath the map. Keying on `nct_id` instead would look
+    # tidier and would be WRONG in one reachable case -- two entries in
+    # `trials` carrying the same id would collapse to one cost and under-price
+    # the chunk holding both. Keying positionally would reinstate exactly the
+    # parallel-list correspondence `pack_trials_by_input_tokens` consumes a zip
+    # to avoid: chunks carry no position.
+    _input_cost_by_trial = {id(_t): _trial_input_tokens(_b)
+                            for _t, _b in zip(trials, trial_blocks)}
+
+    def _chunk_input_estimate(chunk_) -> int:
+        """The estimated INPUT tokens of the one request that sends ``chunk_``.
+
+        The shared prefix charged in full plus every trial's own block, which
+        is what ``pack_trials_by_input_tokens`` charges a chunk and what
+        ``MATCHING_INPUT_TOKEN_BUDGET`` is a budget on.
+
+        ``.get(..., 0)`` RATHER THAN A SUBSCRIPT, deliberately. A trial that is
+        not in the map would be a correspondence defect, and the loud failure
+        this project prefers is the wrong trade on THIS path: the value is a
+        MEASUREMENT published beside the run, and a KeyError raised while
+        computing it would kill a patient whose evaluation is otherwise fine.
+        An under-count is visible as pressure that does not match the packer's
+        own chunk figures, which the two queries print side by side.
+        """
+        return fixed_input_tokens + sum(
+            _input_cost_by_trial.get(id(_t), 0) for _t in chunk_)
+
     # ------------------------------------------------------------------
     # Which call mode this patient runs in
     # ------------------------------------------------------------------
@@ -4001,6 +4047,86 @@ CLINICAL TRIALS:
         # available, the same as the whole batch used to. Packing only makes
         # truncation less likely: a smaller chunk produces a smaller response.
         pending = [(c, 0) for c in reversed(initial_chunks)]
+
+    # ── THE PATIENT-LEVEL INPUT PRESSURE SCALAR ───────────────────────────
+    #
+    # THE LARGEST SINGLE-REQUEST INPUT ESTIMATE among the requests this
+    # patient's dispatch was partitioned into, measured HERE -- after the
+    # packer, the per-trial branch and the proactive splitter have all had
+    # their say and before the first request goes out.
+    #
+    # WHY A MAXIMUM AND NOT A SUM. MATCHING_INPUT_TOKEN_BUDGET is a budget on
+    # ONE REQUEST: the packer fills chunks up to it, and per-trial mode's whole
+    # premise is that prefix plus one trial fits under it. So the number that
+    # answers "how close did this patient's input come to the budget" is the
+    # biggest request, and a sum over the chunks would answer a question the
+    # budget is not a budget on -- and would grow with the number of chunks,
+    # which is the packer WORKING.
+    #
+    # WHY PLAN TIME AND NOT ISSUE TIME. Every reactive split happens AFTER the
+    # chunk it halves was already sent at full size, so this maximum is also
+    # the maximum over the requests actually issued whenever the loop runs to
+    # the end -- and when it does NOT, the alternative is worse than imprecise.
+    # A figure defined over issued requests would report a smaller number for a
+    # patient whose first call raised than for the identical patient whose
+    # calls succeeded, so the pressure question would be answered by luck and
+    # failed rows would not be comparable with successful ones. That is exactly
+    # the comparison the column exists to make possible.
+    #
+    # THIS IS THE INPUT TWIN OF llm_classifier_output_tokens_estimated, on the
+    # same rule: it is measured before the first call, so it is as true of a
+    # run that failed as of one that answered, and it is carried out of every
+    # one of this node's returns for that reason.
+    #
+    # None WHEN THERE IS NO REQUEST TO ESTIMATE -- an empty batch, which the
+    # packer and the per-trial branch both partition into no chunks at all.
+    # 0 would assert a request carrying nothing, and the node has not planned
+    # one.
+    estimated_input = (max(_chunk_input_estimate(_c) for _c, _ in pending)
+                       if pending else None)
+    # THE CONFIGURED BUDGET, NOT THE EFFECTIVE ONE, AND IT IS RECORDED RATHER
+    # THAN RECOMPUTED LATER. A ratio against an unrecorded denominator is
+    # uninterpretable the moment the constant moves, which is the argument
+    # llm_classifier_output_split_threshold already carries one guard over.
+    #
+    # NOT DERIVABLE FROM WHAT WAS ALREADY STORED, which is why this is a column
+    # and not a read of one. llm_classifier_packing carries both budgets --
+    # but only on the SUCCESS return, and only when the packer ran: per-trial
+    # mode records budget_tokens = None because no packer selected one, and
+    # every failure return publishes no packing report at all. The two
+    # populations this pass exists to give a number to are precisely the two
+    # the packing JSON cannot answer for.
+    #
+    # THE CONFIGURED one because it is the only denominator that exists on all
+    # three arms and is comparable across rows. The packer's EFFECTIVE budget
+    # is a relaxation it performed, and measuring against it would report a
+    # relaxed run as comfortably inside its budget when the relaxation IS the
+    # pressure; a ratio above 1.0 against the configured budget is the honest
+    # reading of that run. The effective figure stays in llm_classifier_packing
+    # where it belongs and where it means something.
+    #
+    # READ THROUGH THE BOUND from-IMPORT, NOT THROUGH `config.`, and that is the
+    # ONE place this pair departs from `matching_call_mode()`'s precedent -- for
+    # a reason that constant has and this one does not. The packer is handed the
+    # SAME bound name thirty lines up, and the three packing_report literals
+    # record it as `budget_tokens_configured`. Reading the module attribute here
+    # would let a process that rebound `config.MATCHING_INPUT_TOKEN_BUDGET` pack
+    # against one number and RECORD another -- two values for one fact, in the
+    # row whose whole purpose is to be the denominator of the figure beside it.
+    # Whoever makes this budget movable within a process must move all four
+    # reads together.
+    #
+    # PAIRED WITH THE ESTIMATE, so the two are both-or-neither and `estimate IS
+    # NULL` is the ONE predicate that means "no measurement" everywhere. A
+    # budget recorded beside a NULL estimate would be a third state -- the node
+    # ran, planned no request, and was judged against a budget it never spent
+    # -- that no query distinguishes and that this column's own note denies.
+    # Nothing is lost by collapsing it: `llm_classifier_prompt_sha256` is
+    # non-NULL exactly when Stage 5 rendered, which is this schema's own
+    # separator between "the node ran and measured nothing" and "the node was
+    # never entered".
+    input_budget = (MATCHING_INPUT_TOKEN_BUDGET
+                    if estimated_input is not None else None)
 
     # ------------------------------------------------------------------
     # Evaluate, splitting reactively on finish_reason == "length"
@@ -5149,6 +5275,20 @@ CLINICAL TRIALS:
                 "evaluations": [],
                 "llm_classifier_retries": retry_count + 1,
                 "llm_classifier_truncation_splits": truncation_splits,
+                # ── THE INPUT GUARD'S ESTIMATE AND ITS DENOMINATOR ───────────
+                #
+                # The LARGEST single-request input estimate this patient's dispatch
+                # planned, and the configured per-request budget it is read against.
+                # Both are measured above the send loop, so they are as true of this
+                # run as of one that answered -- the argument the two OUTPUT
+                # denominators below already carry, applied to the guard that had no
+                # scalar at all. Before this, input pressure lived only inside
+                # llm_classifier_packing, which is published on the success return
+                # only and which per-trial mode fills with a bypass note and no
+                # numbers -- so "how close did the input come to the budget" had no
+                # answer for a failed row and none for the shipped call mode.
+                "llm_classifier_input_tokens_estimated": estimated_input,
+                "llm_classifier_input_budget": input_budget,
                 "llm_classifier_output_tokens_estimated": estimated_output,
                 # The two denominators the estimate above is read against,
                 # carried for its own reason: measured BEFORE the first call, so
@@ -5341,6 +5481,11 @@ CLINICAL TRIALS:
                 # The flag the router terminates on. Written only here.
                 "llm_classifier_refusal": _refusal[:_REFUSAL_PREVIEW_LEN],
                 "llm_classifier_truncation_splits": truncation_splits,
+                # The input guard's estimate and its denominator, on the same
+                # footing as the two output denominators below and measured on the
+                # same line of the node. Argued in full at the API-error return.
+                "llm_classifier_input_tokens_estimated": estimated_input,
+                "llm_classifier_input_budget": input_budget,
                 "llm_classifier_output_tokens_estimated": estimated_output,
                 # The two denominators the estimate above is read against,
                 # carried for its own reason: measured BEFORE the first call, so
@@ -5471,6 +5616,11 @@ CLINICAL TRIALS:
                 "evaluations": [],
                 "llm_classifier_retries": retry_count + 1,
                 "llm_classifier_truncation_splits": truncation_splits,
+                # The input guard's estimate and its denominator, on the same
+                # footing as the two output denominators below and measured on the
+                # same line of the node. Argued in full at the API-error return.
+                "llm_classifier_input_tokens_estimated": estimated_input,
+                "llm_classifier_input_budget": input_budget,
                 "llm_classifier_output_tokens_estimated": estimated_output,
                 # The two denominators the estimate above is read against,
                 # carried for its own reason: measured BEFORE the first call, so
@@ -5545,6 +5695,11 @@ CLINICAL TRIALS:
                 "evaluations": [],
                 "llm_classifier_retries": retry_count + 1,
                 "llm_classifier_truncation_splits": truncation_splits,
+                # The input guard's estimate and its denominator, on the same
+                # footing as the two output denominators below and measured on the
+                # same line of the node. Argued in full at the API-error return.
+                "llm_classifier_input_tokens_estimated": estimated_input,
+                "llm_classifier_input_budget": input_budget,
                 "llm_classifier_output_tokens_estimated": estimated_output,
                 # The two denominators the estimate above is read against,
                 # carried for its own reason: measured BEFORE the first call, so
@@ -5881,6 +6036,11 @@ CLINICAL TRIALS:
             "evaluations": [],
             "llm_classifier_retries": retry_count + 1,
             "llm_classifier_truncation_splits": truncation_splits,
+            # The input guard's estimate and its denominator, on the same
+            # footing as the two output denominators below and measured on the
+            # same line of the node. Argued in full at the API-error return.
+            "llm_classifier_input_tokens_estimated": estimated_input,
+            "llm_classifier_input_budget": input_budget,
             "llm_classifier_output_tokens_estimated": estimated_output,
             "llm_classifier_output_split_threshold": split_threshold,
             "llm_classifier_output_ceiling": MATCHING_MAX_TOKENS,
@@ -6754,6 +6914,11 @@ CLINICAL TRIALS:
         # spent because a response was cut off. Sharing one would have failed a
         # patient that hit a single parse error and then needed two splits.
         "llm_classifier_truncation_splits": truncation_splits,
+        # The input guard's estimate and its denominator, on the same
+        # footing as the two output denominators below and measured on the
+        # same line of the node. Argued in full at the API-error return.
+        "llm_classifier_input_tokens_estimated": estimated_input,
+        "llm_classifier_input_budget": input_budget,
         "llm_classifier_output_tokens_estimated": estimated_output,
         # ── What that estimate was judged against ──────────────────────
         #

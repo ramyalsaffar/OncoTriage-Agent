@@ -1580,15 +1580,32 @@ def _control_render_ratio(module):
 # THE ORIGINAL DEFECT, planted back. This is the only control in the project
 # that reaches the production render count, so it is driven through the real
 # node against the mutated module rather than against a function.
+#
+# THE PLANT IS AT THE PACKER'S PRICING EXPRESSION AND NOWHERE ELSE, and that
+# is a REPAIR rather than the original shape. It used to plant a second edit
+# reverting ``_trial_input_tokens`` to render its argument -- the pre-slice
+# signature, which took a trial object -- and that stopped producing a
+# coherent module when era 6 added the node's per-trial input-cost map. That
+# map calls ``_trial_input_tokens(block)`` with a BLOCK STRING, above the
+# packing branch, in ALL THREE ARMS; so the reverted body handed
+# ``_build_trials_text`` a string, the copy raised before the packer was
+# reached, and BOTH arms recorded one render. MEASURED, not predicted: the
+# control reported 1:1 and read as a check that had stopped catching its
+# defect, when what it had actually stopped doing was building one.
+#
+# Planting only at the packer reproduces the SAME OBSERVABLE -- one extra
+# render per trial, at pricing time, on the packing arm alone -- so the
+# expectation is still 3:2 and the sentence the control makes is unchanged.
+# It also makes the control STRICTLY BETTER SCOPED: it now isolates the
+# packer, where before it could have been satisfied by any caller of
+# ``_trial_input_tokens`` acquiring a render.
 control(
     "c17 a packer that RE-RENDERS every trial to price it is CAUGHT [5b]",
     _EVAL_SRC,
-    [("    return estimate_prompt_tokens(block)",
-      "    return estimate_prompt_tokens("
-      "_build_trials_text([block], log_events=False))"),
-     ("    priced = [(trial_obj, _trial_input_tokens(block))\n"
+    [("    priced = [(trial_obj, _trial_input_tokens(block))\n"
       "              for trial_obj, block in zip(trials, blocks)]",
-      "    priced = [(trial_obj, _trial_input_tokens(trial_obj))\n"
+      "    priced = [(trial_obj, estimate_prompt_tokens(\n"
+      "                   _build_trials_text([trial_obj], log_events=False)))\n"
       "              for trial_obj, block in zip(trials, blocks)]")],
     # THE COUNTERS ARE THE MUTATED MODULE'S, NOT THE SHIPPED ONE'S. exec'ing a
     # copy of evaluation.py gives it its own Counter objects, so reading the

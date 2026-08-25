@@ -228,6 +228,18 @@ def resolve_inference_db_path(db_path=None):
 # where they started. It answers one question -- which era is this file -- for
 # a human, a support script, or a future tool that must refuse a database it
 # does not understand.
+# ERA 6: `inferences.llm_classifier_input_tokens_estimated` and
+#        `inferences.llm_classifier_input_budget`, added together with
+#        INFERENCE_COLUMN_ADDITIONS -- one era, two columns, on era 5's
+#        precedent: the number counts schema changes, not columns, and a
+#        measurement without its recorded denominator is uninterpretable, so
+#        the pair is one change. They give the INPUT guard the per-row scalar
+#        the OUTPUT guard has had since its own era, and they close the two
+#        populations llm_classifier_packing cannot answer for: every Stage 5
+#        failure return (that report is published on the success return only)
+#        and every row of the shipped per-trial call mode (which bypasses the
+#        packer by design). Both additive INTEGER, both NULL on every existing
+#        row, neither backfilled.
 # ERA 5: TWO COLUMNS IN ONE COMMIT, which is what an era is -- the number
 #        counts schema changes, not columns. `trial_matches.criteria_split`
 #        carries the indexer's own split method through onto every trial that
@@ -251,7 +263,7 @@ def resolve_inference_db_path(db_path=None):
 #        own once per-trial mode can bypass the packer.
 # ERA 2: `runs.resumed`, added with RUN_COLUMN_ADDITIONS and its migration loop.
 # ERA 1: the constant's own introduction -- the schema as it stood then.
-SCHEMA_USER_VERSION = 5
+SCHEMA_USER_VERSION = 6
 
 
 #------------------------------------------------------------------------------
@@ -1035,6 +1047,72 @@ INFERENCE_COLUMN_ADDITIONS = {
     # meaningless; grouping by them is what such a campaign supports.
     "llm_classifier_output_split_threshold": "INTEGER",
     "llm_classifier_output_ceiling":         "INTEGER",
+
+    # --- The INPUT guard's estimate and its denominator (era 6) -------------
+    #
+    # THE INPUT SIDE HAD NO SCALAR AT ALL, and the two columns above are the
+    # design it is mirroring. Input pressure lived only inside
+    # llm_classifier_packing, and that report cannot answer for two whole
+    # populations:
+    #
+    #   * EVERY STAGE 5 FAILURE RETURN. The chunk list is a PLAN, and Stage 5
+    #     publishes it on the success return only -- deliberately, so a run
+    #     that died at its first call does not publish the whole plan as
+    #     though it had been sent. So a failed row's input size was NULL, and
+    #     a run that failed BECAUSE its input was enormous is exactly the row
+    #     worth asking the question of.
+    #   * EVERY ROW OF THE SHIPPED CALL MODE. Per-trial mode BYPASSES the
+    #     packer, so its report carries `enabled: False`, a `bypassed_by` note,
+    #     `budget_tokens: None` and an empty chunk list. That is honest -- the
+    #     packer really did not run -- and it leaves the mode whose entire cost
+    #     argument is per-request input size with no per-request input figure.
+    #
+    #   llm_classifier_input_tokens_estimated
+    #       The LARGEST SINGLE-REQUEST input estimate among the requests this
+    #       patient's Stage 5 dispatch was partitioned into: the shared prefix
+    #       (system message plus the user wrapper) charged in full, plus that
+    #       request's own rendered trial blocks, by the same
+    #       characters/CHARS_PER_TOKEN proxy the packer prices with.
+    #
+    #       A MAXIMUM, NOT A SUM, AND THAT IS THE COLUMN'S DEFINITION rather
+    #       than an implementation detail. MATCHING_INPUT_TOKEN_BUDGET is a
+    #       budget on ONE REQUEST, so the number that approaches it is the
+    #       biggest request; a sum across chunks would rise with the chunk
+    #       count, which is the packer working rather than pressure. In
+    #       per-trial mode it is the largest prefix-plus-one-trial call. THE
+    #       PER-CALL FIGURES ARE NOT DUPLICATED HERE: llm_classifier_call_
+    #       details already carries one row per request issued.
+    #
+    #       MEASURED AT PLAN TIME, above the send loop, which is what makes a
+    #       failed row comparable with a successful one. A figure defined over
+    #       requests actually ISSUED would report a smaller number for a
+    #       patient whose first call raised than for the same patient whose
+    #       calls succeeded. Reactive splits only ever HALVE a chunk that was
+    #       already sent at full size, so on a run that completes this is also
+    #       the maximum over what was issued.
+    #
+    #   llm_classifier_input_budget
+    #       MATCHING_INPUT_TOKEN_BUDGET as it stood for this run -- the
+    #       CONFIGURED per-request budget. NOT the packer's effective one: a
+    #       relaxation is itself pressure, and measuring against the relaxed
+    #       figure would report a relaxed run as comfortably inside its budget.
+    #       A ratio above 1.0 against this column is the honest reading of such
+    #       a run, and llm_classifier_packing keeps the effective budget for
+    #       the runs where a packer selected one.
+    #
+    #       IT IS A COLUMN RATHER THAN A DERIVATION, and that was checked
+    #       before it was added. The only stored copy of this number is
+    #       llm_classifier_packing's `budget_tokens_configured`, in a column
+    #       that is NULL on exactly the two populations above -- so deriving
+    #       from it would leave the new estimate without a denominator on every
+    #       row that needed one.
+    #
+    # NULL ON BOTH MEANS STAGE 5 WAS NEVER ENTERED (no candidates, an upstream
+    # failure) or the row predates era 6. It never means "this run had no
+    # input": every one of Stage 5's returns sits below the render and carries
+    # both, the four failure returns and the per-trial floor included.
+    "llm_classifier_input_tokens_estimated": "INTEGER",
+    "llm_classifier_input_budget":           "INTEGER",
     # --- Which provider served Stage 5 -------------------------------------
     #
     # "openai" or "bedrock", exactly -- config.MATCHING_PROVIDER's value, read
@@ -4363,10 +4441,12 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 llm_classifier_packed_chunks, llm_classifier_packing,
                 llm_classifier_output_split_threshold,
                 llm_classifier_output_ceiling,
+                llm_classifier_input_tokens_estimated,
+                llm_classifier_input_budget,
                 matching_provider, matching_call_mode,
                 verdict_normalizations, remapped_trials,
                 run_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             result["patient_id"],
             result["timestamp"],
@@ -4571,6 +4651,17 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
             # node was never entered -- or the row predates these columns.
             result.get("llm_classifier_output_split_threshold"),
             result.get("llm_classifier_output_ceiling"),
+            # ── The two INPUT guard figures ────────────────────────────
+            #
+            # THE SAME RULE, one guard over: plain `.get()` with no default,
+            # because both are measurements/configuration a run either recorded
+            # or did not. A 0 supplied here would assert a request carrying
+            # nothing and a configured budget of zero, and every pressure ratio
+            # built on the pair would be a division by zero. Stage 5 writes
+            # both on every one of its six returns, so a NULL pair means the
+            # node was never entered -- or the row predates era 6.
+            result.get("llm_classifier_input_tokens_estimated"),
+            result.get("llm_classifier_input_budget"),
             # FROM CONFIG, NOT FROM `result` -- see the column's note in
             # INFERENCE_COLUMN_ADDITIONS. Reading it here rather than off the
             # result dict is what makes it unconditional: every row this writer

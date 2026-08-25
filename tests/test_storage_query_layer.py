@@ -905,6 +905,12 @@ _SEED_ROWS = [
         llm_classifier_output_split_threshold=_THRESHOLD_NOW,
         llm_classifier_output_ceiling=_CEILING_NOW,
         llm_classifier_output_tokens_estimated=20625,
+        # THE INPUT SCALAR, era 6. The largest of this patient's two planned
+        # requests, against the budget in force. Written to AGREE with the
+        # packing blob above -- 19,600 is that blob's tightest chunk -- so the
+        # two pressure queries describe one run rather than two.
+        llm_classifier_input_tokens_estimated=19600,
+        llm_classifier_input_budget=20000,
         llm_classifier_call_details=_call_details_blob(9000, 7000))),
     # Consistent: 3 + 12 + 0 == 15. Same candidates_evaluated as the row above,
     # which is what satisfies `llm_classifier_efficiency_by_trial_count`'s HAVING >= 2,
@@ -922,6 +928,8 @@ _SEED_ROWS = [
         llm_classifier_output_split_threshold=_THRESHOLD_NOW,
         llm_classifier_output_ceiling=_CEILING_NOW,
         llm_classifier_output_tokens_estimated=16500,
+        llm_classifier_input_tokens_estimated=9000,
+        llm_classifier_input_budget=20000,
         llm_classifier_call_details=_call_details_blob(15900))),
     # THE BYPASSED ROW. Consistent (4 + 2 + 0 == 6), priced, per-trial arm --
     # ordinary in every respect except the one it is here for: its packer was
@@ -947,6 +955,15 @@ _SEED_ROWS = [
         llm_classifier_output_split_threshold=_THRESHOLD_NOW,
         llm_classifier_output_ceiling=_CEILING_NOW,
         llm_classifier_output_tokens_estimated=6600,
+        # THE ROW THE PACKING QUERY CANNOT MEASURE AND THIS ONE CAN. Its packer
+        # was bypassed, so it contributes no chunk and no budget there -- and
+        # its six requests each carried the shared prefix plus one trial, which
+        # is a real per-request input size and is what nearly reached the
+        # budget. 11,500 / 12,000 is deliberately the tightest reading in
+        # RUN-CLEAN's per-trial arm, so a query that dropped bypassed rows
+        # would lose the group's peak rather than merely a row.
+        llm_classifier_input_tokens_estimated=11500,
+        llm_classifier_input_budget=12000,
         llm_classifier_call_details=_call_details_blob(500, 500, 500,
                                                        500, 500, 500))),
     # THE ALL-NULL GROUP. Its own model, every token column and the stored cost
@@ -967,6 +984,10 @@ _SEED_ROWS = [
         llm_classifier_output_split_threshold=_THRESHOLD_NOW,
         llm_classifier_output_ceiling=_CEILING_NOW,
         llm_classifier_output_tokens_estimated=16500,
+        # THE LEGACY ROW FOR THE INPUT SCALAR TOO: the two era-6 columns are
+        # DELIBERATELY ABSENT here, so they insert NULL. That is a row written
+        # before era 6, and it is what makes `unmeasured` a live bucket rather
+        # than a column that is always 0.
         llm_classifier_call_details="[]")),
     # NULL model, no tokens. A no-candidates run.
     ("P-NOMODEL-CLEAN", dict(
@@ -999,6 +1020,15 @@ _SEED_ROWS = [
         llm_classifier_output_split_threshold=_THRESHOLD_OLD,
         llm_classifier_output_ceiling=_CEILING_OLD,
         llm_classifier_output_tokens_estimated=15000,
+        # MEASURED AGAINST THE CONFIGURED BUDGET, NOT THE RELAXED ONE. The
+        # packing query above reads this run at 23900/24000 = 0.9958, which is
+        # the packer comfortably inside the budget it RAISED ITSELF TO. Here
+        # the same chunk reads 23900/20000 = 1.195 against what was
+        # CONFIGURED, and the relaxation is exactly the pressure that ratio is
+        # reporting. The two numbers are both true and answer different
+        # questions; the seed carries both so the difference is visible.
+        llm_classifier_input_tokens_estimated=23900,
+        llm_classifier_input_budget=20000,
         llm_classifier_truncation_splits=1,
         llm_classifier_call_details=_call_details_blob(15900, 4000))),
     # One past the fusion-pool cap. Counts otherwise consistent, so this row can
@@ -1034,6 +1064,15 @@ _SEED_ROWS = [
         matching_model=_MODEL_A, llm_classifier_input_tokens=0, llm_classifier_output_tokens=0,
         llm_classifier_reasoning_tokens=None, estimated_cost_usd=0.0, age=70,
         error="Stage 5 timeout after 300s",
+        # THE FAILED ROW REPORTS REAL PRESSURE. Before era 6 it could not:
+        # llm_classifier_packing is published on Stage 5's SUCCESS return only,
+        # so a run that failed carried no input figure -- and a run that failed
+        # BECAUSE its input was enormous is the row most worth asking. 13,000
+        # against a 12,000 budget is above 1.0 on purpose: the packer relaxes
+        # its budget when the cap binds and a single oversized trial ships
+        # anyway, so pressure > 1 is a real reading and not a seed error.
+        llm_classifier_input_tokens_estimated=13000,
+        llm_classifier_input_budget=12000,
         candidates_retrieved=100, candidates_reranked=40,
         candidates_filtered=0, candidates_evaluated=0,
         eligible_matches=0, near_misses=0, not_evaluable_trials=0)),
@@ -1812,7 +1851,7 @@ check("a database with no run tables reports every run query as unavailable",
        "orphan_run_metrics",
        "run_attribution_coverage", "run_degradation_breakdown", "run_summary",
        "stage5_cache_effectiveness", "stage5_input_packing_pressure",
-       "stage5_output_split_pressure"])
+       "stage5_input_request_pressure", "stage5_output_split_pressure"])
 # `orphan_trial_matches` IS DELIBERATELY NOT ON THAT LIST, and its absence is
 # the check. It reads `trial_matches` and `inferences`, both of which every
 # database this project has ever written has, so it must stay AVAILABLE here --
@@ -2386,6 +2425,210 @@ check("...(non-degeneracy: that independent count is not zero, so the "
       "agreement above is between two real numbers)",
       isinstance(_ip_bypassed, (int, float)) and _ip_bypassed >= 1, True)
 
+# --- (c1) THE PER-ROW INPUT SCALAR, WHERE THE PACKER'S REPORT CANNOT GO -----
+#
+# `stage5_input_request_pressure` is the sibling of the query above, and the
+# rows it exists for are the ones that query names and cannot measure:
+# P-BYPASSED, whose packer did not run because per-trial mode partitioned the
+# batch instead, and P-ERROR, which failed and therefore published no packing
+# report at all. Both had NO input figure of any kind before era 6.
+#
+# EVERY EXPECTATION IS THE ARITHMETIC OF THE SEED LITERALS, never a value read
+# back out of the frame under test.
+_irp = {}
+try:
+    for _r in queries.run(_conn, "stage5_input_request_pressure").itertuples():
+        _irp[(str(_r.run), str(_r.arm))] = _r
+except Exception as _exc:                          # noqa: BLE001 - reported
+    print(f"  [query] stage5_input_request_pressure raised: "
+          f"{type(_exc).__name__}: {_exc}")
+
+
+def _arm(run_key, arm_key):
+    """One (run, arm) group, or a named absence. Never a KeyError in a check."""
+    return _irp.get((run_key, arm_key), _ABSENT_GROUP)
+
+
+check_true("the request-pressure frame is non-empty and separates the arms "
+           "within one run (non-degeneracy: a frame with one group per run "
+           "would satisfy most of what follows without grouping by arm at "
+           "all)",
+           len({_a for _r, _a in _irp if _r == _RUN_CLEAN}) >= 2)
+
+# RUN-CLEAN, GROUPED ARM: P-CONSISTENT-A alone, 19,600 against 20,000.
+check("the grouped arm reports the patient's LARGEST planned request over the "
+      "budget recorded on the row: 19600/20000",
+      (_num(_cell(_arm(_RUN_CLEAN, MATCHING_CALL_MODE_GROUPED), "inferences")),
+       _num(_cell(_arm(_RUN_CLEAN, MATCHING_CALL_MODE_GROUPED),
+                  "peak_pressure"), 4)),
+      (1, 0.98))
+check("...with headroom in tokens beside it, because a ratio alone cannot say "
+      "whether 0.98 was 400 tokens of slack or 40",
+      _num(_cell(_arm(_RUN_CLEAN, MATCHING_CALL_MODE_GROUPED),
+                 "min_headroom_tokens")), 400)
+
+# RUN-CLEAN, PER-TRIAL ARM: P-CONSISTENT-B (9,000/20,000) and P-BYPASSED
+# (11,500/12,000). THE BYPASSED ROW IS THE GROUP'S PEAK, which is the whole
+# point: a query that dropped it would lose the tightest reading in the arm.
+_PT = MATCHING_CALL_MODE_PER_TRIAL
+check("the per-trial arm is its own group, over the two per-trial patients",
+      _num(_cell(_arm(_RUN_CLEAN, _PT), "inferences")), 2)
+check("...and its peak comes from the BYPASSED row -- the row the packing "
+      "query above counts as having no pressure to report: 11500/12000",
+      _num(_cell(_arm(_RUN_CLEAN, _PT), "peak_pressure"), 4),
+      round(11500 / 12000, 4))
+check("...(non-degeneracy: the bypassed row's reading really is the tighter "
+      "of the two, so the peak is not the other patient's by coincidence)",
+      round(11500 / 12000, 4) > round(9000 / 20000, 4), True)
+check("...the mean averages the two PATIENTS, one scalar each, which is what "
+      "one-row-per-patient means",
+      _num(_cell(_arm(_RUN_CLEAN, _PT), "mean_pressure"), 4),
+      round((11500 / 12000 + 9000 / 20000) / 2, 4))
+check("...the tightest headroom is the bypassed row's 500 tokens",
+      _num(_cell(_arm(_RUN_CLEAN, _PT), "min_headroom_tokens")), 500)
+check("...the 90% bucket counts only the row that reached it, and the 75% "
+      "bucket is a SUPERSET of it rather than a disjoint band",
+      (_num(_cell(_arm(_RUN_CLEAN, _PT), "inferences_at_90pct")),
+       _num(_cell(_arm(_RUN_CLEAN, _PT), "inferences_at_75pct"))), (1, 1))
+check("...and neither per-trial row is over budget or failed",
+      (_num(_cell(_arm(_RUN_CLEAN, _PT), "inferences_over_budget")),
+       _num(_cell(_arm(_RUN_CLEAN, _PT), "failed_inferences"))), (0, 0))
+
+# THE TWO BUDGETS IN ONE ARM ARE SHOWN AS A RANGE, not averaged away.
+check("a group whose rows carry two different budgets reports both, so a "
+      "campaign that spanned a config change says so rather than averaging "
+      "across it",
+      (_num(_cell(_arm(_RUN_CLEAN, _PT), "budget_min")),
+       _num(_cell(_arm(_RUN_CLEAN, _PT), "budget_max"))), (12000, 20000))
+
+# THE LEGACY ROW. P-NULL-TOKENS carries neither era-6 column.
+check("a row written before era 6 is COUNTED as unmeasured rather than "
+      "dropped, and contributes no pressure reading",
+      (_num(_cell(_arm(_RUN_CLEAN, queries.MODE_NOT_RECORDED_LABEL),
+                  "inferences")),
+       _num(_cell(_arm(_RUN_CLEAN, queries.MODE_NOT_RECORDED_LABEL),
+                  "unmeasured"))),
+      (1, 1))
+check("...and its pressure columns are NULL rather than 0, which would assert "
+      "a measured floor",
+      [_is_null(_cell(_arm(_RUN_CLEAN, queries.MODE_NOT_RECORDED_LABEL), _c))
+       for _c in ("peak_pressure", "mean_pressure", "min_headroom_tokens",
+                  "budget_min", "peak_request_tokens")],
+      [True, True, True, True, True])
+
+# THE FAILED ROW. P-ERROR is in RUN-CRASHED beside P-NOMODEL-CLEAN, which has
+# no scalar at all -- so the group carries a measured failure and an unmeasured
+# row at once, and the two must not be confused.
+_CRASHED_ARM = (_RUN_CRASHED, queries.MODE_NOT_RECORDED_LABEL)
+check("A FAILED ROW REPORTS REAL PRESSURE, which is the whole of what era 6 "
+      "bought: 13000 against a 12000 budget, on a run that never got an "
+      "answer -- before this the row was NULL because the packing report is "
+      "published on the success return only",
+      (_num(_cell(_arm(*_CRASHED_ARM), "failed_inferences")),
+       _num(_cell(_arm(*_CRASHED_ARM), "peak_request_tokens")),
+       _num(_cell(_arm(*_CRASHED_ARM), "peak_pressure"), 4)),
+      (1, 13000, round(13000 / 12000, 4)))
+check("...and pressure ABOVE 1.0 is a real reading rather than a seed error: "
+      "the packer relaxes its budget when the cap binds and a single "
+      "oversized trial ships anyway, so the over-budget bucket fires",
+      _num(_cell(_arm(*_CRASHED_ARM), "inferences_over_budget")), 1)
+check("...with negative headroom stating how far over, in tokens",
+      _num(_cell(_arm(*_CRASHED_ARM), "min_headroom_tokens")), -1000)
+check("...and the unmeasured row beside it is counted separately, so 'failed' "
+      "and 'unmeasured' are two buckets and not one",
+      (_num(_cell(_arm(*_CRASHED_ARM), "inferences")),
+       _num(_cell(_arm(*_CRASHED_ARM), "unmeasured"))), (2, 1))
+
+# THE RELAXED RUN, MEASURED AGAINST WHAT WAS CONFIGURED.
+check("the SAME chunk the packing query reads at 23900/24000 = 0.9958 against "
+      "the budget the packer RAISED ITSELF TO reads 23900/20000 = 1.195 here "
+      "against what was CONFIGURED -- the relaxation IS the pressure, and "
+      "both numbers are true of the same run",
+      (_num(_grp(_ip, _RUN_DEGRADED).peak_pressure, 4),
+       _num(_cell(_arm(_RUN_DEGRADED, queries.MODE_NOT_RECORDED_LABEL),
+                  "peak_pressure"), 4)),
+      (round(23900 / 24000, 4), round(23900 / 20000, 4)))
+
+# THE GROUPS PARTITION THE TABLE. Without this every check above is satisfied
+# by a query that counted some rows twice or dropped some entirely.
+check("across every (run, arm) group, inferences totals the table exactly",
+      _addn(*[_num(_cell(_r, "inferences")) for _r in _irp.values()]),
+      _conn.execute("SELECT COUNT(*) FROM inferences").fetchone()[0])
+# THE INDEPENDENT COUNT GOES THROUGH `_scalar`, NOT A BARE `.execute`. It
+# names the era-6 column, so a defect that removes it from
+# INFERENCE_COLUMN_ADDITIONS -- which is exactly the revert these two checks
+# exist to catch -- makes a bare read raise `no such column` at module level:
+# one traceback where this section owes its failures and every section after
+# it. MEASURED, not predicted.
+def _scalar(sql):
+    """One scalar out of the seeded database, or a named absence."""
+    try:
+        return _conn.execute(sql).fetchone()[0]
+    except BaseException as exc:                    # noqa: BLE001 - reported
+        return f"<count failed: {type(exc).__name__}: {exc}>"
+
+
+_UNMEASURED_ROWS = _scalar("SELECT COUNT(*) FROM inferences WHERE "
+                           "llm_classifier_input_tokens_estimated IS NULL")
+_ALL_ROWS = _scalar("SELECT COUNT(*) FROM inferences")
+check("...and the unmeasured total is exactly the rows carrying no scalar, "
+      "counted independently of the query under test",
+      _addn(*[_num(_cell(_r, "unmeasured")) for _r in _irp.values()]),
+      _UNMEASURED_ROWS)
+check("...(non-degeneracy: that independent count is neither zero nor the "
+      "whole table, so the agreement above is between two real numbers)",
+      isinstance(_UNMEASURED_ROWS, int) and isinstance(_ALL_ROWS, int)
+      and 0 < _UNMEASURED_ROWS < _ALL_ROWS, True)
+
+# THE DECLARATION AND THE DERIVATION AGREE, and the column requirement really
+# fires: a database predating era 6 must report this query unavailable rather
+# than letting report() die on `no such column`.
+check("the hand declaration matches what derive_requires_columns reads out of "
+      "the SQL",
+      set(queries.derive_requires_columns(
+          queries.QUERIES_BY_KEY["stage5_input_request_pressure"].sql)),
+      set(queries.QUERIES_BY_KEY[
+          "stage5_input_request_pressure"].requires_columns))
+
+_ERA5_DB = os.path.join(_TMP_DIR, "pre_era6.db")
+with quiet():
+    initialize_database(_ERA5_DB)
+_era5_conn = sqlite3.connect(_ERA5_DB)
+for _drop in ("llm_classifier_input_tokens_estimated",
+              "llm_classifier_input_budget"):
+    # DROPPED ONLY IF PRESENT, on the sibling section's argument: a defect that
+    # removes them from INFERENCE_COLUMN_ADDITIONS is one this check exists to
+    # catch, and a bare DROP on an absent column raises at module level and
+    # takes the rest of the file with it.
+    if _drop in queries.table_columns(_era5_conn, "inferences"):
+        _era5_conn.execute(f"ALTER TABLE inferences DROP COLUMN {_drop}")
+_era5_conn.commit()
+check("both era-6 columns are created by initialize_database, which is what "
+      "makes them additive rather than a migration (non-degeneracy: the drops "
+      "above had something to drop)",
+      sorted(_c for _c in ("llm_classifier_input_budget",
+                           "llm_classifier_input_tokens_estimated")
+             if _c in queries.table_columns(_era5_conn, "inferences")), [])
+check("a pre-era-6 database reports the request-pressure query unavailable, "
+      "naming both columns, rather than raising inside report()",
+      queries.unavailable(_era5_conn).get("stage5_input_request_pressure"),
+      ("inferences.llm_classifier_input_budget",
+       "inferences.llm_classifier_input_tokens_estimated"))
+check("...and the PACKING query, which reads neither, is still answerable -- "
+      "the skip is surgical rather than blanket",
+      "stage5_input_packing_pressure" in queries.unavailable(_era5_conn),
+      False)
+check("run() on it raises MissingTableError rather than the raw sqlite error",
+      type(check_raises("  (pre-era-6)", queries.MissingTableError,
+                        queries.run, _era5_conn,
+                        "stage5_input_request_pressure")).__name__,
+      "MissingTableError")
+check_does_not_raise(
+    "report() on it reaches the end rather than dying at the new query",
+    queries.report, _era5_conn, out=lambda _line: None)
+_era5_conn.close()
+
+
 # --- (c2) THE THREE ARMS IN ONE DATABASE, AND THE WHOLE REGISTRY OVER IT ---
 #
 # WHY A SECOND DATABASE AND NOT MORE SEED ROWS. The three shapes below have to
@@ -2838,17 +3081,36 @@ check("...and the two runs disagree about the threshold, so the pair of "
       _num(_grp(_op, _RUN_CLEAN).split_threshold_min)
       != _num(_grp(_op, _RUN_DEGRADED).split_threshold_min), True)
 
-# --- (e) neither query is stored twice -------------------------------------
+# --- (e) nothing is stored twice, and the input ruling MOVED ---------------
 #
-# THE RULE THIS PASS WAS BUILT UNDER, made checkable. The input side derives
-# everything from llm_classifier_packing, so no input quantity may have acquired
-# a column of its own; the output side stores exactly two, and both are
-# denominators rather than measurements.
+# WHAT THIS CHECK USED TO PIN, AND WHY IT WAS RIGHT UNTIL IT WAS NOT. It read
+# "no INPUT pressure quantity was given a column: the packing blob is the one
+# home for the estimate and both budgets", and that was true of the run the
+# packer described. It was never true of the two runs it could not describe:
+# llm_classifier_packing is published on Stage 5's SUCCESS return only, and
+# per-trial mode bypasses the packer that fills it -- so a failed row and every
+# row of the shipped call mode had no input figure at all. Era 6 gives the
+# input guard the per-row scalar the output guard has had since its own era.
+#
+# WHAT REPLACES IT IS THE SAME RULE STATED EXACTLY: the input side may store a
+# SCALAR and its DENOMINATOR and nothing else. The per-chunk breakdown, the
+# packer's effective budget and its two degradation flags stay in the blob,
+# where they describe the packer -- so this still fails if a later pass starts
+# copying chunk-level packing facts into columns.
 _INF_COLS = set(dblog.INFERENCE_COLUMN_ADDITIONS)
-check("no INPUT pressure quantity was given a column: the packing blob is the "
-      "one home for the estimate and both budgets",
+check("the INPUT side stores exactly a scalar and its denominator -- era 6's "
+      "two columns and no more",
+      sorted(c for c in _INF_COLS if c.startswith("llm_classifier_input")),
+      ["llm_classifier_input_budget",
+       "llm_classifier_input_tokens_estimated"])
+check("...and no PER-CHUNK packing fact acquired a column of its own: the "
+      "chunk list, the effective budget and the two degradation flags stay in "
+      "llm_classifier_packing, which is the one place they describe",
       sorted(c for c in _INF_COLS
-             if "input" in c and ("budget" in c or "pressure" in c)), [])
+             if "chunk" in c and c != "llm_classifier_packed_chunks"), [])
+check("...(non-degeneracy: the scan really can see the era-6 columns, so the "
+      "two checks above are not both passing over an empty haystack)",
+      "llm_classifier_input_budget" in _INF_COLS, True)
 check("...and the output side added exactly the two denominators",
       sorted(c for c in _INF_COLS if "output_split_threshold" in c
              or "output_ceiling" in c),

@@ -454,11 +454,47 @@ class TrialMatchState(TypedDict):
     # node has no value for them and _pipeline_provenance() must be able to
     # report that as NULL rather than as a ceiling of zero.
     #
-    # THE INPUT GUARD HAS NO CHANNEL HERE and needs none: its estimate, its
-    # configured budget, its effective budget and its two degradation flags all
-    # travel inside llm_classifier_packing below.
     llm_classifier_output_split_threshold: Optional[int]
     llm_classifier_output_ceiling: Optional[int]
+    # ── THE INPUT GUARD'S OWN PAIR ────────────────────────────────────────
+    #
+    # THIS BLOCK USED TO SAY THE INPUT GUARD NEEDED NO CHANNEL, "because its
+    # estimate, its configured budget, its effective budget and its two
+    # degradation flags all travel inside llm_classifier_packing below". That
+    # was true of the SUCCESS return of a run that PACKED, and of nothing else.
+    # llm_classifier_packing is published on the success return only -- the
+    # chunk list is a plan, and a run that died at its first call must not
+    # publish the whole plan as though it had been sent -- so every Stage 5
+    # failure return carried no input figure at all. And per-trial mode
+    # BYPASSES the packer by design, filling that report with a bypass note,
+    # `budget_tokens: None` and an empty chunk list: the shipped call mode
+    # therefore reported no input pressure on its SUCCESSFUL rows either.
+    #
+    #   llm_classifier_input_tokens_estimated
+    #       The LARGEST SINGLE-REQUEST input estimate among the requests the
+    #       patient's dispatch was partitioned into -- the shared prefix
+    #       charged in full plus that request's own trial blocks, by the same
+    #       characters/CHARS_PER_TOKEN proxy the packer prices with. A MAXIMUM
+    #       and not a sum, because MATCHING_INPUT_TOKEN_BUDGET is a budget on
+    #       ONE REQUEST; a sum would grow with the chunk count, which is the
+    #       packer working rather than pressure. In per-trial mode that is the
+    #       largest prefix-plus-one-trial call, which is the figure that
+    #       actually approaches the per-call budget; the per-call figures
+    #       themselves are not duplicated here -- they are in
+    #       llm_classifier_call_details.
+    #   llm_classifier_input_budget
+    #       MATCHING_INPUT_TOKEN_BUDGET as it stood for this run: the
+    #       CONFIGURED per-request budget, never the packer's relaxed one. The
+    #       relaxation is itself pressure, so measuring against it would report
+    #       a relaxed run as comfortably inside its budget; the effective
+    #       figure stays in llm_classifier_packing, where it describes the
+    #       packer rather than the run.
+    #
+    # BOTH ARE Optional FOR THE PAIR ABOVE'S REASON AND NO OTHER: a run that
+    # never entered this node has no value for either, and _pipeline_provenance
+    # must be able to report that as NULL rather than as a budget of zero.
+    llm_classifier_input_tokens_estimated: Optional[int]
+    llm_classifier_input_budget: Optional[int]
     # Trials that entered Stage 5 and left it with no verdict because of
     # truncation (the floor, or the split budget). Distinct from
     # not_evaluable_trials, which counts trials the model assessed and could

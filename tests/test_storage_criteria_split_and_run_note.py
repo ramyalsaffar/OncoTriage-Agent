@@ -710,14 +710,28 @@ check("...and the era is at least 5, the number these two columns introduced",
 
 _dl_src = open(os.path.abspath(_dl.__file__), encoding="utf-8").read()
 _era_head = _dl_src.split("SCHEMA_USER_VERSION = ")[0]
-check("...and the era record names it, so the number is documented rather "
-      "than only incremented",
+check("...and the era record names the CURRENT era, so a bump is documented "
+      "rather than only incremented",
       f"# ERA {_dl.SCHEMA_USER_VERSION}:" in _era_head, True)
-check("...and that entry names both columns this era added",
-      ("criteria_split" in _era_head.split(f"# ERA {_dl.SCHEMA_USER_VERSION}:")[1]
-       .split("# ERA ")[0],
-       "runs.note" in _era_head.split(f"# ERA {_dl.SCHEMA_USER_VERSION}:")[1]
-       .split("# ERA ")[0]),
+
+# ── ERA 5 IS PINNED AS ERA 5, NOT AS "THE CURRENT ERA" ────────────────────
+#
+# THIS CHECK USED TO READ THE CURRENT ERA'S ENTRY AND REQUIRE IT TO NAME THESE
+# TWO COLUMNS, and it was a landmine: it holds only while nothing else is ever
+# added to the schema, so the NEXT legitimate bump -- era 6, which added the
+# two Stage 5 input-guard columns -- turned a correct change into a failure of
+# the file that owns criteria_split. That is this project's own named shape, a
+# test that fails on the change it exists to protect, and the repair is the
+# same one tests/test_fixture_call_mode_pin.py's check 1a needed: pin the FACT
+# (era 5 is where these two columns were introduced) rather than the moving
+# number. The check above still holds the current era to being documented.
+_ERA_5_ENTRY = _era_head.split("# ERA 5:")[1].split("# ERA ")[0] \
+    if "# ERA 5:" in _era_head else ""
+check("(non-degeneracy: era 5's own entry was found and is not empty, so the "
+      "two checks below are not passing over an empty haystack)",
+      len(_ERA_5_ENTRY.strip()) > 0, True)
+check("...and era 5's entry names both columns that era added",
+      ("criteria_split" in _ERA_5_ENTRY, "runs.note" in _ERA_5_ENTRY),
       (True, True))
 
 
