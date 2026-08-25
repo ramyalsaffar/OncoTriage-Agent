@@ -179,6 +179,7 @@ from oncotriage.storage.database_logger import (
     RUN_RECORD_STATUS_KILLED,
     RUN_RECORD_STATUS_STOPPED,
     RUN_RECORD_TERMINAL_STATUSES,
+    analyze_database,
     finalize_run_record,
     flush_run_metrics,
     log_inference,
@@ -3752,6 +3753,31 @@ def main():
             reconciliation = reconcile_writes(db_path=_reconcile_db,
                                               rows_before=rows_before)
             _publish_reconciliation(reconciliation)
+
+            # ── REFRESH THE PLANNER'S STATISTICS ────────────────────────────
+            #
+            # HERE, BESIDE THE RECONCILIATION, AND NOT AT run_batch's RETURN --
+            # which is where the brief for this put it, and the two are not
+            # equivalent. The resample pass writes a second row for each of
+            # RESAMPLE_COUNT patients AFTER run_batch returns, so an ANALYZE at
+            # that return would describe a table that is about to grow by up to
+            # a tenth. This line runs after every write this process makes and
+            # before the summary that reports them.
+            #
+            # ON THE SUCCESS PATH ONLY, and that is deliberate rather than an
+            # oversight of the crash handlers. A run that was killed or stopped
+            # has a table whose shape is a prefix of what the campaign intended;
+            # stale statistics on it cost a worse query plan, and the next run
+            # -- which is what an operator does after a stop -- refreshes them.
+            # Adding a second call to the crash path would run a write statement
+            # inside a handler whose whole job is to record what happened and
+            # get out.
+            #
+            # IT CANNOT RAISE and it cannot fail the run: see analyze_database.
+            # A failure lands in ANALYZE_FAILURES, which this run's own
+            # degradation block has not printed yet at this line, so the console
+            # report still names it.
+            analyze_database(db_path=_reconcile_db)
 
             # ONE SNAPSHOT, TWO CONSUMERS, exactly as the reconciliation above is
             # computed once and given to both the publisher and the printer. The

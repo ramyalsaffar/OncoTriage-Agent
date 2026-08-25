@@ -149,6 +149,26 @@ from oncotriage.ablation.common import (
     ABLATION_DB_FILENAME,
     ABLATION_SUMMARY_FILENAME,
     _require_writable_parent,
+    open_ablation_db_readonly,
+)
+# ── THE WRITE MACHINERY, BORROWED RATHER THAN REBUILT ──────────────────────
+#
+# This module writes its own database with the same shape of concurrency
+# `inferences.db` has -- a thread pool, a done-callback inserting a row per
+# completed patient -- and it had none of the hardening that one grew: a bare
+# `sqlite3.connect` on sqlite3's 5-second default timeout, the rollback journal,
+# and no retry at all. The three names below are the storage layer's policy,
+# reused so there is ONE definition of "how long do we wait", "which journal
+# mode", and "which errors are transient". A second copy of that policy here is
+# how the two halves of a rule drift apart while both look maintained.
+#
+# THE DIRECTION OF THE IMPORT IS FINE: `ablation` is a top-level consumer and
+# `storage` is below it -- `oncotriage/batch/runner.py` imports the same module
+# for the same reason. `storage` imports nothing from `ablation`.
+from oncotriage.storage.database_logger import (
+    apply_journal_mode,
+    open_connection,
+    run_with_write_retry,
 )
 from oncotriage.agent import deps
 from oncotriage.agent.evaluation import (
@@ -1522,7 +1542,21 @@ def init_ablation_db(db_path=None):
         db_path: Database to create the tables in. ``None`` means the
             production ``ablation_results.db`` -- see ``ablation_db()``.
     """
-    conn = sqlite3.connect(str(ablation_db(db_path)))
+    conn = open_connection(str(ablation_db(db_path)))
+
+    # THE JOURNAL MODE IS SET HERE AND NOWHERE ELSE, exactly as
+    # oncotriage/storage/database_logger.py sets it inside its own
+    # initialize_database, and for the same reason: it is a property of the
+    # FILE, so one successful application converts the database permanently and
+    # every later connection inherits it. This function is the only one in this
+    # module that runs before the pool exists, which is what makes it the right
+    # place.
+    #
+    # IT COUNTS INTO THE SAME JOURNAL_MODE_DEGRADATIONS the inference writer
+    # uses; the counter's meaning is "a database this process writes is not in
+    # the mode that was asked for", and which database is in the key.
+    apply_journal_mode(conn, str(ablation_db(db_path)))
+
     c = conn.cursor()
 
     c.execute("""
@@ -1668,6 +1702,44 @@ def init_ablation_db(db_path=None):
                 console.out("  criteria_not_applicable left at 0 for pre-migration "
                       "rows (not measured, not zero)")
 
+    # ── THE TWO ACCESS PATHS `ablation_results` IS ACTUALLY READ BY ─────────
+    #
+    # AFTER the column migrations, for the reason the inference indexes are:
+    # CREATE INDEX on a column that does not exist yet is an error, not a no-op.
+    # Both are IF NOT EXISTS, so re-opening an existing study database adds only
+    # what is missing.
+    #
+    #   run_id -- `oncotriage/ablation/analysis.py:load_ablation_data` JOINs
+    #     every result row to `ablation_runs` on it, and `generate_summary`'s
+    #     table joins the same way through _LATEST_RUN_PER_CONFIG_SQL. It is the
+    #     column the whole analysis side reads through.
+    #   (config_name, patient_id) -- COMPOSITE, and in that order, because the
+    #     question this table is asked is "did this configuration already do
+    #     this patient": the checkpoint's membership is exactly that pair, and
+    #     `generate_summary` groups by config_name alone, which the same index
+    #     serves as a leftmost prefix. The reverse order would serve neither.
+    #
+    # NO INDEX ON `patient_id` ALONE, and that is the same ruling the inference
+    # table's absent nct_id index records: every insert maintains every index,
+    # and a patient_id-only lookup is not a question anything here asks -- a
+    # patient always appears with a configuration. The composite's leftmost
+    # prefix is `config_name`, so a patient_id-only scan is NOT served by it;
+    # that is stated rather than glossed, and it is the cost of choosing this
+    # order.
+    #
+    # NOT MEASURED AT SCALE, and said plainly rather than borrowed from the
+    # inference measurement. A study is ABLATION_SAMPLE_SIZE patients times
+    # seven configurations -- hundreds of rows, not tens of thousands -- so
+    # neither index will be observable in a timing today. They are here because
+    # the JOIN and the pair lookup are the only two ways this table is read,
+    # because the write cost of an index on a table written once per patient
+    # per configuration is not measurable either, and because an index added
+    # when the table is small is an index that is already there when it is not.
+    c.execute("CREATE INDEX IF NOT EXISTS idx_ablation_results_run_id "
+              "ON ablation_results(run_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_ablation_results_config_patient "
+              "ON ablation_results(config_name, patient_id)")
+
     conn.commit()
     conn.close()
     console.out(f"Ablation database: {ablation_db(db_path)}")
@@ -1784,21 +1856,33 @@ def _create_run(config_name, config_description, sample_size, db_path=None):
     borrows this function's disposition without its argument gets the wrong
     answer for a caller that is not in a loop.
     """
+    def _insert():
+        # THE WHOLE WRITE, CONNECT INCLUDED, because run_with_write_retry calls
+        # this again from scratch on a retry: a connection whose transaction was
+        # rolled back by a contention error is not a connection to reuse.
+        conn = open_connection(str(ablation_db(db_path)))
+        try:
+            c = conn.cursor()
+            c.execute(
+                "INSERT INTO ablation_runs "
+                "(run_timestamp, config_name, config_description, sample_size, "
+                " status) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (datetime.now().isoformat(), config_name, config_description,
+                 sample_size, RUN_STATUS_RUNNING),
+            )
+            run_id = c.lastrowid
+            conn.commit()
+            return run_id
+        finally:
+            # IN A `finally`, WHICH IT WAS NOT. The old form closed the
+            # connection on the success path only, so a raise anywhere in the
+            # INSERT leaked it -- and this function RAISES by design (see the
+            # docstring), so the leak was on the path that is taken.
+            conn.close()
+
     with _ablation_db_lock:
-        conn = sqlite3.connect(str(ablation_db(db_path)))
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO ablation_runs "
-            "(run_timestamp, config_name, config_description, sample_size, "
-            " status) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (datetime.now().isoformat(), config_name, config_description,
-             sample_size, RUN_STATUS_RUNNING),
-        )
-        run_id = c.lastrowid
-        conn.commit()
-        conn.close()
-        return run_id
+        return run_with_write_retry(_insert, "the ablation run row")
 
 
 def _finalize_run(run_id, elapsed_seconds, status, db_path=None) -> bool:
@@ -1835,18 +1919,28 @@ def _finalize_run(run_id, elapsed_seconds, status, db_path=None) -> bool:
                     f"{RUN_STATUS_RUNNING}")
         return False
     try:
-        with _ablation_db_lock:
-            conn = sqlite3.connect(str(ablation_db(db_path)))
+        def _update():
+            conn = open_connection(str(ablation_db(db_path)))
             try:
                 cur = conn.execute(
                     "UPDATE ablation_runs "
                     "SET total_time_seconds = ?, status = ? WHERE id = ?",
                     (round(elapsed_seconds, 2), status, run_id),
                 )
-                updated = cur.rowcount
+                rowcount = cur.rowcount
                 conn.commit()
+                return rowcount
             finally:
                 conn.close()
+
+        with _ablation_db_lock:
+            # THE RETRY IS INSIDE THIS FUNCTION'S OWN `except Exception`, which
+            # is what keeps the "never raises" contract: run_with_write_retry
+            # re-raises what the last attempt raised, and that handler counts it
+            # into RUN_RECORD_FAILURES exactly as it counted a first-attempt
+            # failure before.
+            updated = run_with_write_retry(_update,
+                                           "the ablation run finalization")
     except Exception as exc:                                    # noqa: BLE001
         RUN_RECORD_FAILURES[f"finalize:{type(exc).__name__}"] += 1
         console.out(f"  [Run record] could not finalize run {run_id} as "
@@ -1920,8 +2014,14 @@ def log_ablation_result(run_id, config_name, patient_data, result,
     cost = get_model_cost(matching_model_used or MATCHING_MODEL,
                           input_tok, output_tok)
 
-    conn = None
-
+    # THE `conn = None` / `finally: if conn is not None: conn.close()` PAIR IS
+    # GONE, and it is not a dropped guarantee. The connection is opened and
+    # closed inside `_insert` now, in its own `finally`, which is where it has
+    # to be for a retry to get a fresh one -- and that is strictly tighter than
+    # what it replaces: the old `finally` closed the connection only if the
+    # `conn = sqlite3.connect(...)` line had been REACHED, so any raise in the
+    # ~80 lines of value derivation above it left nothing to close and any raise
+    # after it left the connection open for exactly as long as the handler took.
     with _ablation_db_lock:
         
         try:
@@ -2009,8 +2109,20 @@ def log_ablation_result(run_id, config_name, patient_data, result,
                 m.get("nct_id", "") for m in near_misses if m.get("nct_id")
             )
     
-            conn = sqlite3.connect(str(ablation_db(db_path)))
-            conn.execute("""
+            # ── THE ROW IS BUILT FIRST, THEN WRITTEN ────────────────────────
+            #
+            # The SQL and the value tuple are bound to locals so the write
+            # itself is a callable `run_with_write_retry` can invoke AGAIN --
+            # which is the whole requirement it places on its argument. Nothing
+            # in either literal moved: the SQL below is the text that was
+            # inside conn.execute(), and the tuple is the one that followed it.
+            #
+            # BUILDING THE TUPLE OUTSIDE THE RETRY IS DELIBERATE. Every element
+            # of it is a read of `result`, `timings` or a local computed above,
+            # and re-evaluating those on a retry would be re-deriving the row
+            # rather than re-writing it. One row, one derivation, up to
+            # SQLITE_WRITE_MAX_ATTEMPTS attempts at storing it.
+            _insert_sql = """
                 INSERT INTO ablation_results (
                     run_id, config_name, patient_id, cancer_group, primary_condition,
                     bm25_retrieved, vector_retrieved,
@@ -2041,7 +2153,8 @@ def log_ablation_result(run_id, config_name, patient_data, result,
                     ?, ?, ?, ?, ?, ?,
                     ?
                 )
-            """, (
+            """
+            _row = (
                 run_id,
                 config_name,
                 patient_data["patient_id"],
@@ -2092,15 +2205,23 @@ def log_ablation_result(run_id, config_name, patient_data, result,
                 # dict twice could price a row against one model and label it
                 # with another.
                 matching_model_used,
-            ))
-            conn.commit()
+            )
+
+            def _insert():
+                # THE CONNECT IS INSIDE, because a retry needs a fresh
+                # connection: one whose transaction was rolled back by a
+                # contention error is not one to reuse.
+                conn = open_connection(str(ablation_db(db_path)))
+                try:
+                    conn.execute(_insert_sql, _row)
+                    conn.commit()
+                finally:
+                    conn.close()
+
+            run_with_write_retry(_insert, "an ablation result row")
     
         except Exception as e:
             console.out(f"  WARNING: Failed to log result: {e}")
-    
-        finally:
-            if conn is not None:
-                conn.close()
 
 
 # ===========================================================================
@@ -2329,7 +2450,11 @@ def generate_summary(db_path=None):
         console.out("No ablation database found.")
         return None
 
-    conn = sqlite3.connect(str(ablation_db(db_path)))
+    # READ-ONLY: this is a reader and `ablation_db`'s own docstring has said so
+    # since it was written. The existence check three lines above is what an
+    # operator sees; this is what makes the open unable to CREATE the file if
+    # that check is ever passed or bypassed.
+    conn = open_ablation_db_readonly(db_path)
     try:
         df = pd.read_sql_query(f"""
             SELECT
@@ -2386,7 +2511,7 @@ def generate_summary(db_path=None):
     # study's own database for no reason while workers may still be writing it.
     # SO THE LINES ARE COMPUTED HERE AND PRINTED LATER: what crosses the report
     # is a list of strings, not a connection.
-    _status_conn = sqlite3.connect(str(ablation_db(db_path)))
+    _status_conn = open_ablation_db_readonly(db_path)
     try:
         _status_lines = _summary_status_warning(_status_conn)
     finally:

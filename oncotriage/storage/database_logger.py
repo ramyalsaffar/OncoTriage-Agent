@@ -98,6 +98,7 @@ from oncotriage.config import (
     PRICING_CONFIG,
     SQLITE_BUSY_TIMEOUT_SECONDS,
     SQLITE_JOURNAL_MODE,
+    SQLITE_PAGE_SIZE,
     SQLITE_WRITE_MAX_ATTEMPTS,
     SQLITE_WRITE_RETRY_BASE_DELAY,
 )
@@ -251,6 +252,183 @@ def resolve_inference_db_path(db_path=None):
 # ERA 2: `runs.resumed`, added with RUN_COLUMN_ADDITIONS and its migration loop.
 # ERA 1: the constant's own introduction -- the schema as it stood then.
 SCHEMA_USER_VERSION = 5
+
+
+#------------------------------------------------------------------------------
+
+
+# THE FILE'S IDENTITY, STAMPED BESIDE ITS ERA.
+#
+# SQLite carries a SECOND caller-owned 32-bit integer in the same header,
+# `PRAGMA application_id`, and it answers a question `user_version` cannot: not
+# "which era is this file" but "is this file OURS AT ALL". The two are read
+# together and neither is sufficient alone, because `user_version` is a bare
+# integer with no owner -- a database written by any other tool that uses the
+# field carries a number in it that means something else entirely, and reading
+# that as an oncotriage era is exactly the misreading the refusal below exists
+# to prevent.
+#
+# THE VALUE IS THE ASCII OF "ONC1" READ AS A BIG-ENDIAN 32-BIT INTEGER --
+# 0x4F4E4331 -- which is the convention SQLite's own magic.txt registry uses.
+# It fits in a signed 32-bit integer (1330529073 < 2147483647), which matters:
+# the field IS signed, and a value with the top bit set reads back negative.
+#
+# ZERO IS "UNSTAMPED", NOT "FOREIGN". That is SQLite's default, so it is what
+# every database this project wrote before this constant existed reports --
+# including the production file -- and it is also what a brand-new empty file
+# reports for the moments before the stamp lands. Both are ours; a foreign
+# application_id is a NON-ZERO value that is not this one.
+ONCOTRIAGE_APPLICATION_ID = 0x4F4E4331
+
+APPLICATION_ID_UNSTAMPED = 0
+"""What ``PRAGMA application_id`` reports on a file nobody has stamped.
+
+A NAMED CONSTANT rather than a bare ``0`` at the two comparisons that read it,
+because the number means "unstamped" and not "the application whose id is
+zero", and those two readings lead to opposite decisions."""
+
+
+class IncompatibleDatabaseError(RuntimeError):
+    """This code refuses to open the database at that path, and says why.
+
+    A ``RuntimeError`` subclass and deliberately NOT a ``sqlite3.Error`` or a
+    ``ValueError``, on ``UnknownModelPricingError``'s and ``MissingTableError``'s
+    precedent: every writer in this project wraps its database work in a broad
+    ``except sqlite3.Error`` whose whole purpose is that a logging fault does not
+    kill the pipeline, and a refusal that those handlers could swallow would be
+    reported as a non-critical logging failure and then IGNORED -- which is the
+    one outcome this refusal must not have.
+
+    THE TWO CASES IT CARRIES, and they have different remediations:
+
+      * A NEWER ERA. ``PRAGMA user_version`` is HIGHER than
+        ``SCHEMA_USER_VERSION``, i.e. this file was last migrated by a version of
+        this module that knows more than this one does. See the refusal for why
+        that stopped being tolerated.
+      * A FOREIGN FILE. ``PRAGMA application_id`` is non-zero and is not
+        ``ONCOTRIAGE_APPLICATION_ID``. Some other application created this file
+        and this code was about to CREATE FIVE TABLES IN IT.
+    """
+
+
+def assert_database_is_compatible(conn, db_path):
+    """Refuse ``conn``'s database if this code must not write to it.
+
+    Returns ``(application_id, user_version)`` -- both read once, so the caller
+    that goes on to stamp does not re-read them.
+
+    RUNS BEFORE ANYTHING MUTATES THE FILE, which is the whole design and not an
+    ordering preference. A refusal has to leave the file exactly as it found it,
+    and both of the things ``initialize_database`` does before its first CREATE
+    -- setting the page size and converting the journal to WAL -- write to the
+    header. So this is the first statement after the connect.
+
+    THE IDENTITY CHECK COMES FIRST, and that ordering is load-bearing: on a
+    foreign file the ``user_version`` integer belongs to somebody else's
+    numbering, so comparing it against ``SCHEMA_USER_VERSION`` produces a true
+    number and a false meaning. "This is not our database" has to be settled
+    before "which era of ours is it" can be asked at all.
+
+    WHY THE ERA CHECK REFUSES UPWARD AND NOT DOWNWARD.
+
+      DOWNWARD (an OLDER file, this code newer) is the ordinary case and is
+      permissive by design: the migrations here are additive and presence-driven
+      (``IF NOT EXISTS``, a ``PRAGMA table_info`` check before every ALTER), so
+      newer code opening an older file adds what is missing, stamps forward, and
+      every row already there is untouched. That is what the additive mechanism
+      is FOR, and refusing it would make every schema addition a manual
+      migration.
+
+      UPWARD (a NEWER file, this code older) is refused, and this REPLACES a
+      permissive branch that left the stamp alone and carried on. The argument
+      that branch made -- "this schema is strictly additive, so a file stamped 7
+      still HAS everything era 7 gave it" -- is a true statement about the eras
+      that EXIST and a promise about eras that do not exist yet, made by the code
+      that cannot see them. What it cannot survive: an era that adds a NOT NULL
+      column with a default, that renames one (this project has renamed columns
+      before -- the gpt4o rename moved nine of them), or that changes what a
+      value in an existing column MEANS. Older code meeting any of those writes
+      rows that are well-formed, that raise nothing, and that the newer readers
+      cannot interpret -- silent corruption of the one artifact every published
+      number is computed from, which is the exact class of defect this project
+      exists to remove. The cost of refusing is one loud message and one deliberate
+      operator action; the cost of tolerating is discovered later or never.
+
+    IT DOES NOT DECIDE ANYTHING ABOUT A FILE THAT IS NOT THERE. ``sqlite3``
+    creates an empty database on connect, and an empty database reports 0 and 0,
+    so a fresh file passes both checks and is stamped by the caller.
+    """
+    application_id = conn.execute("PRAGMA application_id").fetchone()[0]
+    user_version = conn.execute("PRAGMA user_version").fetchone()[0]
+
+    if (application_id != APPLICATION_ID_UNSTAMPED
+            and application_id != ONCOTRIAGE_APPLICATION_ID):
+        raise IncompatibleDatabaseError(
+            f"{db_path} is not an oncotriage database and this code was about "
+            f"to create tables in it.\n"
+            f"    PRAGMA application_id: {application_id} "
+            f"(0x{application_id & 0xFFFFFFFF:08X}); this project stamps "
+            f"{ONCOTRIAGE_APPLICATION_ID} "
+            f"(0x{ONCOTRIAGE_APPLICATION_ID:08X}).\n"
+            f"    Nothing has been written to it. The usual cause is a mistyped "
+            f"path or a stale ONCOTRIAGE_INFERENCES_DB pointing at some other "
+            f"tool's SQLite file; check the path and try again.")
+
+    if user_version > SCHEMA_USER_VERSION:
+        raise IncompatibleDatabaseError(
+            f"{db_path} was written by a NEWER version of oncotriage and this "
+            f"one refuses to write to it.\n"
+            f"    The file reports schema era {user_version}; this code is era "
+            f"{SCHEMA_USER_VERSION}.\n"
+            f"    Nothing has been written to it. Writing anyway would put rows "
+            f"in it that this code cannot describe -- a column era "
+            f"{SCHEMA_USER_VERSION} does not know about is left NULL by every "
+            f"row it writes, and a column whose MEANING moved is worse than "
+            f"that.\n"
+            f"    Either run the newer code against this file, or archive it "
+            f"and let this one build a fresh database:\n"
+            f"        mv {db_path!r} {db_path!r}.era{user_version}-archive")
+
+    return application_id, user_version
+
+
+# ---------------------------------------------------------------------------
+# STARTING A CAMPAIGN ON A FRESH DATABASE -- THE PROCEDURE, AND WHY
+# ---------------------------------------------------------------------------
+#
+# The migrations in this file are additive: a column added in era N appears on
+# an existing database as an ALTER, and every row written before it keeps NULL.
+# That is right for a database being carried forward, and it is the WRONG shape
+# for the file a campaign's published numbers are computed from, for three
+# reasons this schema cannot fix in place:
+#
+#   1. NULL IS AMBIGUOUS ACROSS AN ERA BOUNDARY. In a carried-forward file,
+#      `matching_call_mode IS NULL` means "written before era 3" for some rows
+#      and nothing at all for others, and no query can separate a campaign's
+#      rows from the ones that preceded it except by run attribution -- which
+#      itself is NULL on every row written before the run-identity pass.
+#   2. THE PAGE SIZE CANNOT BE CHANGED IN PLACE. SQLITE_PAGE_SIZE reaches a
+#      database only at creation; an existing file keeps 4096 until it is
+#      VACUUMed, and VACUUM rewrites the whole file.
+#   3. THE JOURNAL MODE CONVERTS ON FIRST OPEN, so a carried-forward file spends
+#      its history in whatever mode it was created in and only the tail of it in
+#      WAL.
+#
+# THE PROCEDURE, and it is two commands:
+#
+#     mv "02- Data/03- Inferences Storage/inferences.db" \
+#        "02- Data/03- Inferences Storage/inferences-2026-08-archive.db"
+#     # then start the campaign normally; the first write builds the new file
+#
+# The first write is `start_run_record`, which calls `initialize_database`, which
+# creates a file with ALL columns present from the first row, all five tables,
+# WAL from the first write, page_size SQLITE_PAGE_SIZE, both header stamps, and
+# every index. Nothing else has to be done and no migration is run.
+#
+# THE ARCHIVE IS MOVED, NOT DELETED, and the distinction is the whole point: it
+# is the only copy of every historical row, it is what a reader compares the new
+# campaign against, and it is still readable by every query in
+# `oncotriage/storage/queries.py` through `--db`.
 
 
 #------------------------------------------------------------------------------
@@ -1009,11 +1187,30 @@ INFERENCE_COLUMN_ADDITIONS = {
     # batch row from an API row written in the same minute, and has no way at
     # all to attribute a row to the configuration that produced it.
     #
-    # THE REFERENCE IS UNENFORCED. See the `runs` CREATE TABLE for the decision
-    # and the four reasons; the short version is that `PRAGMA foreign_keys` is
-    # per CONNECTION and this module opens only some of the connections that
-    # touch this file.
-    "run_id":                                "INTEGER",
+    # THE REFERENCE IS DECLARED AND UNENFORCED. See the `runs` CREATE TABLE for
+    # the decision and the four reasons; the short version is that
+    # `PRAGMA foreign_keys` is per CONNECTION and this module opens only some of
+    # the connections that touch this file.
+    #
+    # THE `REFERENCES` CLAUSE IS DOCUMENTATION AND IT IS WORTH THE CHARACTERS.
+    # It puts the relationship in `sqlite_master`, where every tool that reads a
+    # schema -- a diagram generator, a migration assistant, `.schema` at the
+    # sqlite3 prompt, the next person -- can see it, and it is what makes
+    # `PRAGMA foreign_keys = ON` a one-line experiment rather than a schema
+    # change. It changes NOTHING at run time while the pragma is off.
+    #
+    # IT IS LEGAL ON AN ALTER. SQLite permits ADD COLUMN with a REFERENCES
+    # clause provided the column's default is NULL, which this one's is; a NOT
+    # NULL default would be the case it refuses.
+    #
+    # IT REACHES ONLY DATABASES THAT DO NOT YET HAVE THE COLUMN. A file where
+    # `run_id` already exists keeps the declaration it was created with, because
+    # this migration is skipped for it and SQLite has no way to add a constraint
+    # to an existing column short of rebuilding the table. The production file
+    # has no `run_id` yet, so it gets the declared form; a database built since
+    # the run-identity pass keeps the undeclared one, and the two behave
+    # identically because neither is enforced.
+    "run_id":                                "INTEGER REFERENCES runs(id)",
 }
 
 
@@ -1987,6 +2184,22 @@ which is the silent-degradation shape this project exists to remove.
 """
 
 
+ANALYZE_FAILURES = Counter()
+"""Databases whose planner statistics could not be refreshed, by exception type.
+
+WHAT IT COSTS WHEN IT IS NON-ZERO, and it is deliberately small: `sqlite_stat1`
+is stale or absent, so SQLite plans the campaign queries from its built-in
+guesses instead of from measured selectivity. Every query still returns the
+right answer; some of them choose a worse index. That is why `analyze_database`
+counts rather than raising -- see its docstring for the position argument.
+
+IT IS ON THE RUN-END REPORT through oncotriage/degradation.py, which is the only
+reader. There is no key for "it was never called": ANALYZE runs once per batch
+run, at a point main() reaches on the success path only, and a run that died
+before it has a KILLED `runs` row saying so.
+"""
+
+
 class InferenceWriteResult(str):
     """The database path this call wrote to, plus whether the row landed.
 
@@ -2152,6 +2365,109 @@ def _apply_journal_mode(conn, db_path):
 
 
 # ---------------------------------------------------------------------------
+# THE THREE PIECES OTHER WRITERS IN THIS PROJECT REUSE
+# ---------------------------------------------------------------------------
+#
+# `oncotriage/ablation/study.py` writes its own database -- `ablation_results.db`
+# -- with the same shape of concurrency this module was hardened for: a thread
+# pool, a done-callback that inserts a row per completed patient, and a second
+# process that the ablation run lock refuses but cannot prevent from EXISTING
+# (an operator with two checkouts, a `--db` pointed at the same file). It had
+# none of the hardening: a bare `sqlite3.connect` with sqlite3's 5-second
+# default timeout, the rollback journal, and no retry.
+#
+# THE ALTERNATIVE WAS A SECOND POLICY AND THAT IS THE THING WORTH AVOIDING. Two
+# retry loops with two backoffs and two definitions of "transient" is how the
+# two halves of a rule drift apart while both look maintained -- the shape this
+# project removed for the BM25 sparse model, the cross-encoder checkpoint and
+# the latest-run-per-config SQL. So the policy has one owner: these three
+# functions, `_is_retryable` below them, and the four SQLITE_* constants in
+# oncotriage/config.py.
+#
+# WHAT IS DELIBERATELY NOT SHARED: `_write_inference_row_with_retry`. It is NOT
+# reimplemented on `run_with_write_retry` even though the loop is the same
+# shape, and the reason is that its contract is different in a way that matters
+# -- it RETURNS an outcome dict rather than raising, so that a lost row cannot
+# kill a pipeline that has already paid for the patient, and it logs
+# `patient_id` on every attempt. Rewriting it onto a generic helper would be a
+# refactor of the one write path whose behaviour under contention has been
+# measured, inside a pass that changes nothing about it. The duplication is one
+# loop and it is recorded here rather than left to be discovered.
+
+
+def open_connection(db_path):
+    """A connection carrying this project's busy timeout. See _open_connection.
+
+    THE PUBLIC NAME, for writers outside this module. It delegates rather than
+    calling ``sqlite3.connect`` itself because this module holds exactly one
+    connect site by design -- ``tests/test_storage_write_durability.py`` section
+    3c asserts by AST that every ``sqlite3.connect`` in this file is inside
+    ``_open_connection``, so that no connection anywhere can be opened without
+    the timeout.
+    """
+    return _open_connection(db_path)
+
+
+def apply_journal_mode(conn, db_path):
+    """Set and VERIFY the journal mode on db_path. See _apply_journal_mode.
+
+    The public name, for a writer that owns a different database and wants the
+    same guarantee. Counts into the same ``JOURNAL_MODE_DEGRADATIONS``, which is
+    correct: the counter's meaning is "a database this process writes is not in
+    the mode that was asked for", and which database is in the key.
+    """
+    return _apply_journal_mode(conn, db_path)
+
+
+def run_with_write_retry(operation, subject):
+    """Call ``operation()``, retrying only transient contention. Returns its value.
+
+    RAISES what the last attempt raised. That is the difference between this and
+    ``_write_inference_row_with_retry``, and it is the right contract HERE: every
+    caller already sits inside its own ``except Exception`` that counts the
+    failure into its own counter and decides what a lost row means for it, so a
+    helper that swallowed the exception would take that decision away from the
+    module that owns it.
+
+    Args:
+        operation: a zero-argument callable that does the whole write --
+            connect, statements, commit, close. It is called again from scratch
+            on a retry, which is why it must own its connection: a connection
+            whose transaction was rolled back by a contention error is not a
+            connection to reuse.
+        subject: what is being written, for the console and log lines. Free text
+            and NOT a counter key -- nothing here increments a counter, for the
+            reason above.
+
+    ONLY THE TRANSIENT CLASS IS RETRIED, through ``_is_retryable``, which is the
+    same classifier the inference write uses and excludes `duplicate column
+    name` for the reason argued above it: a retry broad enough to repair the
+    migration race would silently repair the negative control that proves the
+    write lock necessary.
+    """
+    max_attempts = max(1, int(SQLITE_WRITE_MAX_ATTEMPTS))
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            return operation()
+        except Exception as exc:                               # noqa: BLE001
+            if not _is_retryable(exc) or attempts >= max_attempts:
+                raise
+            delay = SQLITE_WRITE_RETRY_BASE_DELAY * (2 ** (attempts - 1))
+            console.out(f"  ↻ Retrying {subject} in {delay:.2f}s "
+                        f"(attempt {attempts + 1}/{max_attempts}): "
+                        f"{type(exc).__name__}: {exc}")
+            log.warning("a database write contended, retrying",
+                        event="write_retry", subject=str(subject),
+                        attempts=attempts, max_retries=max_attempts,
+                        delay_s=round(delay, 3),
+                        error_type=type(exc).__name__,
+                        error_message=str(exc))
+            time.sleep(delay)
+
+
+# ---------------------------------------------------------------------------
 # THE WRITE LOCK (pass 20c-3b)
 # ---------------------------------------------------------------------------
 #
@@ -2215,6 +2531,40 @@ def _apply_journal_mode(conn, db_path):
 _WRITE_LOCK = threading.RLock()
 
 
+def _ensure_index(cursor, index_name, table, columns):
+    """``CREATE INDEX IF NOT EXISTS`` -- but only if the columns are there.
+
+    WHY THE GUARD, and it is the same shape the ALTER loops in this function
+    already have. ``CREATE INDEX ... ON t(c)`` on a column ``t`` does not have
+    RAISES ``no such column``, and this function is on the WRITE PATH:
+    ``_ensure_database`` calls it before the first inference row of a run. A
+    raise there converts a database in an unexpected shape into a dead
+    pipeline, which contradicts this function's own contract -- "adds only what
+    is missing and destroys nothing".
+
+    IT IS NOT REACHABLE BY A DATABASE THIS PROJECT WROTE. Every column these
+    five indexes name is either in a base ``CREATE TABLE`` here or is added by
+    the migration loop that runs above them. What it is reachable by is a
+    hand-built one -- a test fabricating an older era, a stub, a file assembled
+    by a support script -- and the honest answer for those is the one the ALTER
+    loops give: do what can be done, and SAY what could not.
+
+    THE SKIP IS ANNOUNCED. A silent one is indistinguishable from an index that
+    was created, which is the difference between a fast query and a full scan
+    nobody is told about.
+    """
+    present = {row[1] for row in cursor.execute(f"PRAGMA table_info({table})")}
+    missing = [c for c in columns if c not in present]
+    if missing:
+        console.out(
+            f"Schema: index {index_name} NOT created -- {table} has no "
+            f"{', '.join(missing)}. Queries that would have used it will scan.")
+        return False
+    cursor.execute(f"CREATE INDEX IF NOT EXISTS {index_name} "
+                   f"ON {table}({', '.join(columns)})")
+    return True
+
+
 def initialize_database(db_path):
     """Create the five tables at db_path and apply the additive migrations.
 
@@ -2253,6 +2603,44 @@ def _initialize_database_locked(db_path):
     # is where the ALTER TABLE migrations run, and DDL takes an exclusive lock.
     conn = _open_connection(db_path)
 
+    # ── REFUSE BEFORE MUTATING ──────────────────────────────────────────────
+    #
+    # FIRST, ahead of the page size and ahead of the journal mode, because both
+    # of those WRITE THE FILE HEADER and a refusal has to leave the database
+    # exactly as it found it. The connect above creates an empty file if the
+    # path does not exist, which is unchanged behaviour and is what makes a
+    # fresh database possible at all; an empty file reports 0 and 0 and passes.
+    #
+    # It RAISES. This is the one thing in this function that is allowed to, and
+    # it is deliberate: every caller reaches here before its first billed call
+    # (start_run_record opens the run row; log_inference's _ensure_database runs
+    # on the first write), the fault is a configuration fault an operator fixes
+    # with one command, and continuing means writing rows nobody can read back.
+    _found_application_id, _found_version = assert_database_is_compatible(
+        conn, db_path)
+
+    # ── THE PAGE SIZE, AND IT MUST BE ISSUED HERE ───────────────────────────
+    #
+    # ABOVE _apply_journal_mode, NOT BELOW IT. Measured on sqlite 3.45.3 rather
+    # than read off the documentation: `PRAGMA page_size = 16384` issued AFTER
+    # `journal_mode = WAL` on a fresh database is SILENTLY IGNORED -- no error,
+    # no warning, the pragma reports success and the file keeps 4096. Issued
+    # before, it takes. That ordering is the entire reason this block is not
+    # three lines further down.
+    #
+    # ON AN EXISTING DATABASE IT IS INERT, also measured: a file that already
+    # has pages keeps its page size and reports no error. That is the designed
+    # outcome and NOT a degradation, which is why the mismatch below is
+    # reported and NOT counted -- an existing file keeping its page size is the
+    # normal, permanent state of every database this project has ever written,
+    # and a counter that is non-zero on every run of every campaign says
+    # nothing. Changing it needs a VACUUM (a full rewrite) or a fresh file; see
+    # the campaign-start procedure at ONCOTRIAGE_APPLICATION_ID.
+    #
+    # THE VALUE IS INTERPOLATED for the reason the user_version stamp is: a
+    # pragma takes no bound parameter. int() is what keeps that safe.
+    conn.execute(f"PRAGMA page_size = {int(SQLITE_PAGE_SIZE)}")
+
     # THE JOURNAL MODE IS SET HERE AND NOWHERE ELSE, because it is a property of
     # the FILE: one successful application converts the database permanently and
     # every later connection inherits it. Doing it on the insert path instead
@@ -2260,6 +2648,38 @@ def _initialize_database_locked(db_path):
     # CREATE statements so the schema work itself runs under the mode the
     # database will keep.
     _apply_journal_mode(conn, db_path)
+
+    # READ BACK, because a pragma that is ignored reports success. Reported at
+    # INFO with both numbers so a reader of the log can tell a fresh file (which
+    # got what was asked for) from a carried-forward one (which did not, and
+    # cannot).
+    _page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+    if _page_size != int(SQLITE_PAGE_SIZE):
+        log.info("sqlite page size left as the database had it",
+                 event="page_size_existing",
+                 page_size=_page_size,
+                 page_size_requested=int(SQLITE_PAGE_SIZE),
+                 db_path=str(db_path))
+    else:
+        log.info("sqlite page size applied", event="page_size",
+                 page_size=_page_size, db_path=str(db_path))
+
+    # ── STAMP THE IDENTITY ──────────────────────────────────────────────────
+    #
+    # Only when it is UNSTAMPED, so an already-stamped file's header is not
+    # rewritten on every open -- the checked value can only be ours or zero by
+    # this line, because assert_database_is_compatible refused everything else.
+    #
+    # IT IS STAMPED HERE AND THE ERA IS STAMPED AT THE BOTTOM, and the asymmetry
+    # is deliberate. The era says "this file HAS these columns" and so must be
+    # written only after they exist; the identity says "this file is ours" and is
+    # true the moment this code takes responsibility for it -- which is now,
+    # because the CREATE statements below are what make it ours.
+    if _found_application_id == APPLICATION_ID_UNSTAMPED:
+        conn.execute(
+            f"PRAGMA application_id = {int(ONCOTRIAGE_APPLICATION_ID)}")
+        log.info("sqlite application id stamped", event="application_id",
+                 db_path=str(db_path))
 
     # Create cursor
     cursor = conn.cursor()
@@ -2415,6 +2835,54 @@ CREATE TABLE IF NOT EXISTS inferences (
             cursor.execute(f"ALTER TABLE inferences ADD COLUMN {_column} {_sql_type}")
             console.out(f"Schema migration: added inferences.{_column}")
 
+    # ── THE THREE ACCESS PATHS `inferences` IS ACTUALLY READ BY ─────────────
+    #
+    # MEASURED, not assumed, on a fabricated database at the scale the campaign
+    # will reach -- 22,000 inference rows and 330,000 trial_matches children,
+    # sqlite 3.45.3, mean over 200/20/100 repetitions. Milliseconds per query,
+    # before and after all three:
+    #
+    #     lookup by patient_id      1.615  ->  0.012      (134x)
+    #     a one-month timestamp range 1.649 -> 1.061      (1.6x)
+    #     count by run_id           2.028  ->  0.015      (135x)
+    #     group by run_id + join    3.556  ->  0.778      (4.6x)
+    #     one patient's write       0.089  ->  0.086      (no measurable cost)
+    #
+    # THE WRITE COST IS THE HALF THAT DECIDES IT, and it is why the trial_matches
+    # nct_id index is NOT here while these three are: every insert maintains
+    # every index on the table, so an index that no read plan chooses is a pure
+    # tax. At one patient per ~68 seconds of pipeline, three more B-tree
+    # insertions per row is below the noise floor of the measurement above.
+    #
+    # WHY EACH ONE, by its reader rather than by its shape:
+    #
+    #   patient_id -- the dashboard's per-patient drill-down, the resample
+    #     pass's lookup, `pipeline_consistency`'s ordering and every "what
+    #     happened to this patient" question an operator asks. It is the only
+    #     column in this table a human types.
+    #   timestamp -- `oncotriage/monitoring/drift.py` selects a baseline window
+    #     and a comparison window by timestamp on every drift run, and the
+    #     dashboard's sidebar filters by date. The gain is the smallest of the
+    #     three (1.6x) because a one-month range over an evenly spread year
+    #     still touches a twelfth of the table; it is kept because the drift
+    #     windows are narrower than that in production and because the write
+    #     cost is zero either way.
+    #   run_id -- every campaign query joins on it (`run_summary`,
+    #     `run_attribution_coverage`, `dangling_run_references`,
+    #     `campaign_summary`, `call_mode_comparison`,
+    #     `stage5_cache_effectiveness`), and it is the column the run tables
+    #     were added to make askable.
+    #
+    # ALL THREE ARE `IF NOT EXISTS` and sit AFTER the column migrations, so a
+    # database arriving without `run_id` gets the column and then its index in
+    # one open. The order matters for exactly that one: CREATE INDEX on a
+    # column that does not exist yet is an error, not a no-op.
+    _ensure_index(cursor, "idx_inferences_patient_id", "inferences",
+                  ("patient_id",))
+    _ensure_index(cursor, "idx_inferences_timestamp", "inferences",
+                  ("timestamp",))
+    _ensure_index(cursor, "idx_inferences_run_id", "inferences", ("run_id",))
+
 
     # Trial matches table
     cursor.execute('''
@@ -2467,9 +2935,8 @@ CREATE TABLE IF NOT EXISTS trial_matches (
     # IT IS `IF NOT EXISTS` for the same idempotence reason every CREATE in this
     # function is, and it is placed AFTER the column migrations so a database
     # arriving with neither gets its columns and its index in one open.
-    cursor.execute(
-        "CREATE INDEX IF NOT EXISTS idx_trial_matches_inference_id "
-        "ON trial_matches(inference_id)")
+    _ensure_index(cursor, "idx_trial_matches_inference_id", "trial_matches",
+                  ("inference_id",))
 
 
     # Drift metrics table
@@ -2501,11 +2968,21 @@ CREATE TABLE IF NOT EXISTS drift_metrics (
     # tables' positions in `sqlite_master` exactly where they were -- which is
     # the order `empty_database` deletes in.
     #
-    # `run_id` IS UNENFORCED, for the four reasons written out at `runs`. Note
-    # the fourth applies here more strongly rather than less: every row this
-    # table holds is written by `flush_run_metrics`, which is handed the id the
-    # same process obtained from `start_run_record` minutes earlier, into the
-    # same file, under the same lock.
+    # `run_id` IS DECLARED AND UNENFORCED, for the four reasons written out at
+    # `runs`. Note the fourth applies here more strongly rather than less: every
+    # row this table holds is written by `flush_run_metrics`, which is handed the
+    # id the same process obtained from `start_run_record` minutes earlier, into
+    # the same file, under the same lock.
+    #
+    # THE `REFERENCES` CLAUSE REACHES ONLY A DATABASE THIS CREATE ACTUALLY RUNS
+    # ON -- i.e. one that does not have the table yet. `CREATE TABLE IF NOT
+    # EXISTS` is a no-op against an existing `run_metrics`, and SQLite cannot add
+    # a constraint to an existing column, so a database built between the
+    # health-persistence pass and this one keeps the undeclared form forever. The
+    # two behave identically at run time (nothing enforces either) and differ
+    # only in what `sqlite_master` tells a reader. `orphan_run_metrics` in
+    # oncotriage/storage/queries.py is the audit that finds the violations
+    # either way.
     #
     # `value` IS INTEGER, NOT REAL. `drift_metrics.metric_value` is REAL because
     # a KS statistic is; every value here is a `Counter` total or a count of
@@ -2541,7 +3018,7 @@ CREATE TABLE IF NOT EXISTS drift_metrics (
     cursor.execute('''
 CREATE TABLE IF NOT EXISTS run_metrics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id INTEGER NOT NULL,
+    run_id INTEGER NOT NULL REFERENCES runs(id),
     category TEXT NOT NULL,
     name TEXT NOT NULL,
     value INTEGER,
@@ -2549,9 +3026,8 @@ CREATE TABLE IF NOT EXISTS run_metrics (
 )
 ''')
 
-    cursor.execute(
-        "CREATE INDEX IF NOT EXISTS idx_run_metrics_run_id "
-        "ON run_metrics(run_id)")
+    _ensure_index(cursor, "idx_run_metrics_run_id", "run_metrics",
+                  ("run_id",))
 
 
     # ------------------------------------------------------------------
@@ -2583,20 +3059,30 @@ CREATE TABLE IF NOT EXISTS run_metrics (
     # The refusal is ANNOUNCED on the same channel every other thing this
     # function says goes to. A silent no-op here would be indistinguishable
     # from a stamp that worked.
-    _found_version = cursor.execute("PRAGMA user_version").fetchone()[0]
-    if _found_version > SCHEMA_USER_VERSION:
+    # RE-READ RATHER THAN REUSING THE VALUE THE REFUSAL ABOVE ALREADY HAS, and
+    # the difference is one window wide: this lock is per PROCESS, so a second
+    # process running newer code can have migrated and re-stamped the file
+    # between that read and this one. Reusing the earlier reading would then
+    # LOWER a stamp that had legitimately moved up. This branch is what remains
+    # of the old permissive one -- it is unreachable through the ordinary path,
+    # because assert_database_is_compatible refuses a higher era before any of
+    # the work above runs, and it is kept because that concurrent window is real
+    # and the DDL above has already been applied by the time it is reached.
+    _stamp_now = cursor.execute("PRAGMA user_version").fetchone()[0]
+    if _stamp_now > SCHEMA_USER_VERSION:
         console.out(
-            f"Schema stamp: LEFT AT {_found_version}, not lowered to "
-            f"{SCHEMA_USER_VERSION}. This database was last migrated by a "
-            f"NEWER version of oncotriage.storage.database_logger; this one "
-            f"has added only what it knows about. Nothing is wrong with the "
-            f"rows that are there."
+            f"Schema stamp: LEFT AT {_stamp_now}, not lowered to "
+            f"{SCHEMA_USER_VERSION}. It read {_found_version} when this open "
+            f"began, so another process migrated this database while these "
+            f"tables were being ensured. The additive work above is done and "
+            f"nothing is wrong with the rows that are there -- but this process "
+            f"should not go on writing to it; run the newer code."
         )
     else:
         cursor.execute(f"PRAGMA user_version = {int(SCHEMA_USER_VERSION)}")
-        if _found_version != SCHEMA_USER_VERSION:
+        if _stamp_now != SCHEMA_USER_VERSION:
             console.out(
-                f"Schema stamp: user_version {_found_version} -> "
+                f"Schema stamp: user_version {_stamp_now} -> "
                 f"{SCHEMA_USER_VERSION}"
             )
 
@@ -3023,7 +3509,13 @@ def _note_run_metric_shape(reason, detail):
     """Count a malformed-flush reason; announce it on the console ONCE.
 
     ``reason`` is a fixed identifier and goes into the counter. ``detail`` is
-    whatever the caller handed over that should not have been -- possibly the
+    whatever the caller handed over that should not have been -- and it is a
+    NAME rather than a value at three of the five call sites, which is why the
+    line below says "name or value" rather than the "value" it said when the
+    only caller was the mapping check. The distinction matters when reading the
+    line: `non_identifier_name`, `non_integer_value` and `value_out_of_range`
+    all report the counter's NAME, deliberately, because the value is the half
+    that could be unbounded -- possibly the
     third-party or clinical text this table exists to exclude -- so it reaches
     the CONSOLE, which is transient and unindexed, and nothing else. Not the
     counter, whose totals are written to the very table in question; not the
@@ -3045,13 +3537,21 @@ def _note_run_metric_shape(reason, detail):
     if first:
         console.out(
             f"⚠ run_metrics: a health flush was refused -- {reason}. "
-            f"Offending value (console only, deliberately not stored): "
-            f"{detail!r}\n"
+            f"Offending name or value (console only, deliberately not "
+            f"stored): {detail!r}\n"
             f"    flush_run_metrics() takes degradation.totals(), which is "
             f"{{counter name: int}}. degradation.snapshot() is the nested form "
             f"and its KEYS carry clinical and third-party text; it must not "
             f"reach a durable table. This will not be printed again this "
             f"process; RUN_METRICS_FLUSH_FAILURES keeps counting.")
+
+
+# The range SQLite's INTEGER column can hold: signed 64-bit, exactly. Named
+# rather than written as two literals at the comparison, because the pair is one
+# fact about the storage engine and a reader has to be able to see that the
+# bound is not this project's choice.
+_SQLITE_INT64_MIN = -(2 ** 63)
+_SQLITE_INT64_MAX = 2 ** 63 - 1
 
 
 def _run_metric_rows(totals, counters_registered):
@@ -3103,6 +3603,25 @@ def _run_metric_rows(totals, counters_registered):
             return None
         if isinstance(value, bool) or not isinstance(value, int):
             _note_run_metric_shape("non_integer_value", name)
+            return None
+        # AND IT HAS TO FIT IN THE COLUMN. A Python int is unbounded and
+        # SQLite's INTEGER is signed 64-bit, so a total outside that range is a
+        # value this column cannot hold. Left to the insert it raises
+        # OverflowError, which the flush's broad handler catches and counts as
+        # `flush:OverflowError` -- a key that names the exception and not the
+        # counter, so the one fact an operator needs (WHICH counter overflowed)
+        # is the one thing the record does not carry. Refused here instead, with
+        # the name, before the DELETE opens a transaction.
+        #
+        # UNREACHABLE BY ANY COUNTER THIS PROJECT INCREMENTS BY ONE -- 2**63 is
+        # more events than a campaign could produce in the age of the universe.
+        # It is here because `totals()` is a mapping this function's contract
+        # says it does not trust, and every other member of that contract is
+        # checked; a bound that is checked everywhere except at the top of the
+        # range is a bound an in-process caller can walk past with a synthesized
+        # value.
+        if not (_SQLITE_INT64_MIN <= value <= _SQLITE_INT64_MAX):
+            _note_run_metric_shape("value_out_of_range", name)
             return None
         rows.append((RUN_METRIC_CATEGORY_DEGRADATION, name, value))
 
@@ -3278,6 +3797,76 @@ def flush_run_metrics(run_id, totals, counters_registered, db_path=None):
                   event="run_metrics_flush_failed",
                   inference_run_id=run_id,
                   error_type=type(exc).__name__, error_message=str(exc))
+        return False
+
+
+def analyze_database(db_path=None):
+    """Refresh SQLite's planner statistics for db_path. NEVER RAISES.
+
+    Returns True if ANALYZE ran and committed, False on any failure.
+
+    WHAT IT ACTUALLY BUYS, stated as measured rather than as a general good.
+    Without `sqlite_stat1` SQLite plans from a built-in guess -- roughly ten
+    rows per distinct index value, for every index, whatever the data. On a
+    22,000-row `inferences` table the real numbers are nothing like that:
+
+        idx_inferences_patient_id   1 row per value
+        idx_inferences_timestamp    262 rows per value
+        idx_inferences_run_id       1100 rows per value
+
+    A query whose WHERE names both `run_id` and `timestamp` therefore has a
+    genuine choice, and without statistics the planner has no basis for it --
+    it will happily search the 1100-row index and filter, where the 262-row one
+    would have read a quarter as much. WITH statistics it chooses on the
+    measured numbers.
+
+    AND WHAT IT DOES NOT BUY, because the honest half is worth writing down: on
+    the four single-predicate queries the three new indexes were added for, it
+    changed nothing measurable (0.012 -> 0.011 ms, 1.061 -> 1.167, 0.015 ->
+    0.015, 0.778 -> 0.779). There is only one index that can serve those, so
+    there is no choice for statistics to inform. It earns its keep on plans with
+    a choice, and it costs 9 ms at 22,000 inferences and 330,000 trial_matches
+    -- measured, once per run, against a campaign measured in hours.
+
+    IT MAY NOT RAISE, on `flush_run_metrics`' and `finalize_run_record`'s
+    footing rather than by analogy: it runs at the END of a run, after every
+    patient has cost a live Stage 5 call, and the worst thing a stale statistics
+    table can do is make a later query choose a worse index. A campaign
+    destroyed at its last statement by an optimisation is the wrong trade in
+    every direction.
+
+    "NEVER RAISES" MEANS ``except Exception``, so what escapes is what is not an
+    ``Exception`` subclass -- ``KeyboardInterrupt``, ``SystemExit`` and
+    ``GeneratorExit`` -- exactly as it escapes ``_write_inference_row``,
+    ``finalize_run_record`` and ``flush_run_metrics``. An ANALYZE that swallowed
+    a Ctrl-C would leave an operator holding a key down against a run that has
+    already finished everything that mattered.
+
+    IT TAKES ``_WRITE_LOCK``. ANALYZE writes `sqlite_stat1`, so it is a write
+    statement in this module and the module's invariant is that every one of
+    them is issued under that lock. It does NOT go through
+    ``run_with_write_retry``: the retry exists so a row is not lost, and there
+    is no row here -- a contended ANALYZE is worth exactly one attempt and a
+    counter, because the next run's will do the same job.
+    """
+    try:
+        db_path = resolve_inference_db_path(db_path)
+        with _WRITE_LOCK:
+            conn = _open_connection(db_path)
+            try:
+                conn.execute("ANALYZE")
+                conn.commit()
+            finally:
+                conn.close()
+        log.info("sqlite planner statistics refreshed", event="analyze",
+                 db_path=str(db_path))
+        return True
+    except Exception as exc:                                   # noqa: BLE001
+        ANALYZE_FAILURES[type(exc).__name__] += 1
+        log.warning("sqlite planner statistics could not be refreshed; queries "
+                    "will be planned from SQLite's default guesses",
+                    event="analyze_failed",
+                    error_type=type(exc).__name__, error_message=str(exc))
         return False
 
 

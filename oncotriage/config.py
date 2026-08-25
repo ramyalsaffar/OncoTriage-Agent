@@ -2782,6 +2782,35 @@ MAX_WORKERS = 12
 # and it is why this is a tunable rather than a literal in the writer.
 SQLITE_JOURNAL_MODE = "WAL"
 
+# The page size a database this project CREATES is built with, in bytes.
+#
+# 16384 rather than SQLite's 4096 default. `inferences` is a wide row -- 60-odd
+# columns, several of them long TEXT (the rendered Stage 5 prompt, the call
+# ledger, the criterion blobs) -- so at 4096 a single row spills across an
+# overflow chain and every read of it is several page fetches. A larger page
+# holds the row inline, and it holds proportionally more index entries per page,
+# which is what the child-lookup index and the three added on `inferences` walk.
+#
+# TWO ORDERING FACTS DECIDE WHERE IT IS APPLIED, and both were MEASURED rather
+# than read off the documentation (see the comment at the pragma in
+# oncotriage/storage/database_logger.py):
+#
+#   1. IT MUST BE ISSUED BEFORE `journal_mode = WAL`. Issued after, it is
+#      SILENTLY IGNORED -- the pragma returns no error and the database keeps
+#      4096. Measured both orders on sqlite 3.45.3: page_size-then-WAL gives
+#      16384, WAL-then-page_size gives 4096.
+#   2. IT IS INERT ON A DATABASE THAT ALREADY HAS PAGES. That is the designed
+#      outcome, not a failure: changing an existing file's page size needs a
+#      full VACUUM, which rewrites the whole database, and this project's
+#      migrations are additive and never rewrite. So the production file keeps
+#      whatever it was created with until it is replaced -- which is what the
+#      fresh-campaign-database procedure is for.
+#
+# A TUNABLE RATHER THAN A LITERAL for the reason SQLITE_JOURNAL_MODE is one: an
+# operator on unusual storage may want the default back, and 4096 here restores
+# it exactly.
+SQLITE_PAGE_SIZE = 16384
+
 # Seconds a connection waits for a lock held by another connection before
 # raising "database is locked".
 #

@@ -1319,14 +1319,61 @@ for _label, _category, _name, _value in _RUN_METRIC_ROWS:
         "VALUES (?, ?, ?, ?, ?)",
         (_RUN_IDS[_label], _category, _name, _value, "2026-08-20T11:04:00"))
 
+# ── THE TWO ORPHANS (the database-completion pass) ─────────────────────────
+#
+# This schema declares three foreign keys and enforces none of them. A row on
+# the wrong side of each is therefore REACHABLE, and `orphan_trial_matches` and
+# `orphan_run_metrics` are the only things in the project that can report one --
+# so the seed has to contain one of each, or those two queries' non-empty case
+# ships exercised by nothing. `dangling_run_references`' P-DANGLING row above is
+# the same argument for the third.
+#
+# THEY ARE SEEDED AFTER `_TRIAL_MATCH_ROWS` AND `_RUN_METRIC_ROWS` RATHER THAN
+# IN THEM, which is the opposite of what P-DANGLING does, and the reason is that
+# the two lists are used for different things. `_SEED_ROWS` is ITERATED to
+# derive expectations -- per-model token sums, the consistency classification --
+# so a row outside it is a row those derivations cannot account for, which is
+# why P-DANGLING is in it. These two are never iterated for anything except the
+# row counts immediately below, which name them.
+#
+# THE OWNER IDS ARE FAR OUTSIDE ANYTHING AUTOINCREMENT WILL REACH in this file,
+# and both are asserted absent from their parent table after the seed.
+_ORPHAN_INFERENCE_ID = 888_888
+_ORPHAN_RUN_ID = 777_777
+
+_cursor.execute(
+    "INSERT INTO trial_matches (inference_id, nct_id, trial_title, "
+    "trial_phase, trial_number, rerank_score, match_score, eligible, "
+    "assessment, criterion_details) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    (_ORPHAN_INFERENCE_ID, "NCT09999999", "Trial NCT09999999", "Phase 1", 1,
+     1.0, 0.5, "eligible", "because",
+     '{"inclusion": [], "exclusion": []}'))
+
+_cursor.execute(
+    "INSERT INTO run_metrics (run_id, category, name, value, written_at) "
+    "VALUES (?, ?, ?, ?, ?)",
+    (_ORPHAN_RUN_ID, dblog.RUN_METRIC_CATEGORY_DEGRADATION,
+     "QDRANT_RETRIES", 9, "2026-08-20T11:05:00"))
+
 _conn.commit()
+
+if _conn.execute("SELECT COUNT(*) FROM inferences WHERE id = ?",
+                 (_ORPHAN_INFERENCE_ID,)).fetchone()[0]:
+    raise SystemExit("seed error: the orphan inference_id names a real row")
+if _conn.execute("SELECT COUNT(*) FROM runs WHERE id = ?",
+                 (_ORPHAN_RUN_ID,)).fetchone()[0]:
+    raise SystemExit("seed error: the orphan run_id names a real run row")
 
 check("the seed wrote every inference row",
       _conn.execute("SELECT COUNT(*) FROM inferences").fetchone()[0],
       len(_SEED_ROWS))
-check("...and the trial_matches rows",
+check("...and the trial_matches rows, plus the one orphan",
       _conn.execute("SELECT COUNT(*) FROM trial_matches").fetchone()[0],
-      len(_TRIAL_MATCH_ROWS))
+      len(_TRIAL_MATCH_ROWS) + 1)
+check("...and the run_metrics rows, plus the one orphan",
+      _conn.execute("SELECT COUNT(*) FROM run_metrics").fetchone()[0],
+      len(_RUN_METRIC_ROWS) + 1)
 check("...and the drift_metrics rows",
       _conn.execute("SELECT COUNT(*) FROM drift_metrics").fetchone()[0], 3)
 check_true("the models the seed prices are all in PRICING_CONFIG "
@@ -1660,6 +1707,60 @@ check("...and neither is a row whose run_id names a run that exists",
                              if isinstance(_col(_dangling, "run_id"), list)
                              else [])), [])
 
+# --- THE OTHER TWO UNENFORCED REFERENCES (the database-completion pass) -----
+#
+# Three foreign keys are declared and none is enforced, so a row on the wrong
+# side of each is reachable and something has to be able to FIND it. The audit
+# above is the one for `inferences.run_id`; these are the two for
+# `trial_matches.inference_id` and `run_metrics.run_id`.
+#
+# EACH IS CHECKED FOR WHAT IT FINDS **AND** FOR WHAT IT DOES NOT. An audit that
+# reported every row would satisfy "it found the orphan" exactly as well as one
+# that works, which is why the attached rows are asserted absent from it -- the
+# same pairing `dangling_run_references` carries two checks above.
+_orphan_tm = _frame("orphan_trial_matches")
+check("the trial audit lists exactly the orphaned inference_id",
+      _col(_orphan_tm, "inference_id"), [_ORPHAN_INFERENCE_ID])
+check("...with the row count attached, which is what says how much stored, "
+      "billed work is invisible to every other query in this registry",
+      _col(_orphan_tm, "trial_rows"), [1])
+check("...and its distinct trials, so an operator can tell one lost patient "
+      "from one lost verdict",
+      _col(_orphan_tm, "distinct_trials"), [1])
+check("...and it reports exactly one id -- so it picked up none of the "
+      "attached rows (non-degeneracy: the seed has several)",
+      len(_orphan_tm), 1)
+check_true("...and the seed really has attached rows for it to have ignored",
+           _conn.execute(
+               "SELECT COUNT(*) FROM trial_matches tm "
+               "JOIN inferences i ON i.id = tm.inference_id"
+           ).fetchone()[0] > 0)
+
+_orphan_rm = _frame("orphan_run_metrics")
+check("the health audit lists exactly the orphaned run_id",
+      _col(_orphan_rm, "run_id"), [_ORPHAN_RUN_ID])
+check("...with the row count attached",
+      _col(_orphan_rm, "metric_rows"), [1])
+check("...and it reports exactly one id, so it picked up none of the rows "
+      "belonging to the two real runs",
+      len(_orphan_rm), 1)
+check("...and none of the ids it reports is a run that exists",
+      sorted(_attributed_ids & set(_col(_orphan_rm, "run_id")
+                                   if isinstance(_col(_orphan_rm, "run_id"),
+                                                 list) else [])), [])
+
+# THE HARM, STATED AS A MEASUREMENT RATHER THAN AS PROSE. These two queries
+# exist because the orphaned rows are invisible to everything else, and the way
+# to say that is to ask something else and watch it not see them.
+_rm_breakdown = _frame("run_degradation_breakdown")
+check("the orphaned health row is ABSENT from run_degradation_breakdown, "
+      "which is driven FROM `runs` -- the invisibility orphan_run_metrics "
+      "exists to report",
+      _ORPHAN_RUN_ID in set(_col(_rm_breakdown, "run", cast=str)
+                            if isinstance(_col(_rm_breakdown, "run", cast=str),
+                                          list) else []),
+      False)
+
 # --- THE MISSING-TABLE GUARD ----------------------------------------------
 #
 # THE CHECK THAT KEEPS ITEM 38's PROPERTY. Without `requires`, these two queries
@@ -1677,6 +1778,15 @@ with quiet():
 _legacy_conn = sqlite3.connect(_LEGACY_DB)
 _legacy_conn.execute("DROP TABLE runs")
 _legacy_conn.execute("DROP TABLE run_metrics")
+# THE INDEX HAS TO GO FIRST, and the reason is a property of SQLite worth
+# knowing: `ALTER TABLE ... DROP COLUMN` REFUSES to drop a column an index
+# references -- "error in index idx_inferences_run_id after drop column: no such
+# column: run_id". That is the right behaviour in production (nothing there
+# drops a column, and an index is a reason a column cannot silently vanish) and
+# an obstacle only here, where a pre-migration shape is FABRICATED by removing
+# things. A real database written before the run-identity pass has neither the
+# column nor the index, which is exactly the state these two statements produce.
+_legacy_conn.execute("DROP INDEX IF EXISTS idx_inferences_run_id")
 _legacy_conn.execute("ALTER TABLE inferences DROP COLUMN run_id")
 _legacy_conn.commit()
 check("the legacy database really lacks the run tables (non-degeneracy: with "
@@ -1699,9 +1809,24 @@ check("...and lacks inferences.run_id too, which is the state a database "
 check("a database with no run tables reports every run query as unavailable",
       sorted(queries.unavailable(_legacy_conn)),
       ["call_mode_comparison", "campaign_summary", "dangling_run_references",
+       "orphan_run_metrics",
        "run_attribution_coverage", "run_degradation_breakdown", "run_summary",
        "stage5_cache_effectiveness", "stage5_input_packing_pressure",
        "stage5_output_split_pressure"])
+# `orphan_trial_matches` IS DELIBERATELY NOT ON THAT LIST, and its absence is
+# the check. It reads `trial_matches` and `inferences`, both of which every
+# database this project has ever written has, so it must stay AVAILABLE here --
+# a legacy database is exactly where an orphaned verdict is most likely to be,
+# and an audit that declared a requirement it does not have would refuse to look
+# at the one file most worth looking at. `dangling_run_references` declares
+# `runs` alone for the same reason.
+check("...and the trial-orphan audit is NOT unavailable, because it needs "
+      "nothing a legacy database lacks",
+      "orphan_trial_matches" in queries.unavailable(_legacy_conn), False)
+check("...and it still RUNS there and finds the seeded orphan is not in THIS "
+      "database (non-degeneracy: an audit that raised would satisfy the line "
+      "above by never being asked)",
+      len(queries.run(_legacy_conn, "orphan_trial_matches")), 0)
 check("...including the call-mode comparison, which is the one that would "
       "otherwise die on `runs` AND on two additive columns -- and killing "
       "report() on a legacy database is exactly the defect item 38 removed",
@@ -1792,6 +1917,9 @@ _COLUMN_DB = os.path.join(_TMP_DIR, "no_run_id.db")
 with quiet():
     initialize_database(_COLUMN_DB)
 _column_conn = sqlite3.connect(_COLUMN_DB)
+# THE INDEX FIRST, for the reason written at the legacy database above: SQLite
+# refuses to drop a column an index references.
+_column_conn.execute("DROP INDEX IF EXISTS idx_inferences_run_id")
 _column_conn.execute("ALTER TABLE inferences DROP COLUMN run_id")
 _column_conn.commit()
 
@@ -4353,11 +4481,29 @@ check("8c-l: the omission total over every arm equals the number of "
       "the join, nothing lost",
       sum(_safe_int(r.omitted_trials) for r in _modes.itertuples()),
       _omission_reason_rows)
-check("8c-m: ...and trials_recorded totals every trial_matches row, so a zero "
-      "omission count on a row with recorded trials is a MEASUREMENT and one "
-      "with none is not",
+# THE EXPECTATION IS "EVERY ATTACHED ROW", NOT "EVERY ROW", AND THE DIFFERENCE
+# IS A FINDING RATHER THAN AN ADJUSTMENT. This query reaches trial rows through
+# `inferences`, as every query in this registry that reads a verdict does, so
+# the seeded ORPHAN -- a trial_matches row whose inference_id names nothing --
+# is invisible to it. That is exactly the harm `orphan_trial_matches` was
+# registered to report: a stored, billed verdict that no number computed over
+# the campaign includes. Comparing against the raw COUNT(*) would make this
+# check fail for a reason that has nothing to do with what it asserts, and
+# "adjusting" it without saying so would hide the property.
+_attached_trial_rows = _conn.execute(
+    "SELECT COUNT(*) FROM trial_matches tm "
+    "JOIN inferences i ON i.id = tm.inference_id").fetchone()[0]
+check("8c-m: ...and trials_recorded totals every ATTACHED trial_matches row, "
+      "so a zero omission count on a row with recorded trials is a MEASUREMENT "
+      "and one with none is not",
       sum(_safe_int(r.trials_recorded) for r in _modes.itertuples()),
-      _conn.execute("SELECT COUNT(*) FROM trial_matches").fetchone()[0])
+      _attached_trial_rows)
+check("8c-m2: ...and the orphan is the whole of the difference, which is the "
+      "invisibility orphan_trial_matches exists to report (non-degeneracy: "
+      "with no orphan the two counts are equal and 8c-m says nothing about it)",
+      _conn.execute("SELECT COUNT(*) FROM trial_matches").fetchone()[0]
+      - _attached_trial_rows,
+      1)
 check("8c-n: ...(non-degeneracy: the seed really contains trial_matches rows, "
       "so the two sums above are not both zero)",
       _conn.execute("SELECT COUNT(*) FROM trial_matches").fetchone()[0] > 0,
@@ -4386,6 +4532,63 @@ check("8c-p: the arms partition `inferences` -- no row is dropped by the LEFT "
       "JOINs and none is counted twice",
       sum(_safe_int(r.patients) for r in _modes.itertuples()),
       _conn.execute("SELECT COUNT(*) FROM inferences").fetchone()[0])
+
+
+# ===========================================================================
+# SECTION 8d -- connect() IS READ-ONLY AND CREATES NOTHING
+# ===========================================================================
+#
+# THE DEFECT IT REMOVES, and it is a reporting defect rather than a database
+# one. `connect()` was a plain `sqlite3.connect(path)`, which CREATES an empty
+# database when the path does not exist. So a mistyped path, a stale
+# ONCOTRIAGE_INFERENCES_DB or a `--db` pointed one directory wrong did not fail:
+# it brought a database into existence, `report()` ran the whole registry
+# against it, and forty-odd queries printed empty frames and clean-audit
+# messages that are indistinguishable from a real report on a healthy pipeline.
+# The second reading is the one a person reaches for.
+#
+# THE PRECEDENT IS `oncotriage/dashboard/data.py:_readonly_connection`, which
+# had already made the same argument for the run loaders.
+
+print()
+print("=" * 78)
+print("SECTION 8d -- connect() is read-only")
+print("=" * 78)
+
+_ABSENT_DB = os.path.join(_TMP_DIR, "no_such_database.db")
+check_true("the fixture path really does not exist (non-degeneracy: on an "
+           "existing file every check below passes for the wrong reason)",
+           not os.path.exists(_ABSENT_DB))
+_ABSENT_RAISED = check_raises(
+    "8d-a: connect() on an absent path RAISES rather than creating a database",
+    queries.MissingDatabaseError, queries.connect, _ABSENT_DB)
+check("8d-b: ...and NOTHING was created at that path, which is the half a "
+      "typed exception alone does not give you",
+      os.path.exists(_ABSENT_DB), False)
+check_true("8d-c: ...and the message names the path, which "
+           "sqlite3.OperationalError's 'unable to open database file' does not",
+           _ABSENT_DB in str(_ABSENT_RAISED))
+check_true("8d-d: MissingDatabaseError is NOT a sqlite3.Error, so a caller's "
+           "broad `except sqlite3.Error` cannot swallow it and report an empty "
+           "result -- MissingTableError's ruling, same reason",
+           not issubclass(queries.MissingDatabaseError, sqlite3.Error))
+
+_RO_CONN = queries.connect(_DB_PATH)
+check_true("8d-e: connect() on a real database still READS (non-degeneracy: a "
+           "connection that refused everything would satisfy 8d-f too)",
+           _RO_CONN.execute("SELECT COUNT(*) FROM inferences").fetchone()[0] > 0)
+_WRITE_RAISED = check_raises(
+    "8d-f: ...and REFUSES to write, so the module's read-only contract is "
+    "enforced by SQLite rather than promised in a docstring",
+    sqlite3.OperationalError, _RO_CONN.execute,
+    "INSERT INTO inferences (patient_id, timestamp) VALUES ('X', 'Y')")
+check_true("8d-g: ...naming the reason", "readonly" in str(_WRITE_RAISED))
+_RO_CONN.close()
+
+_RO_ROWS_AFTER = _conn.execute(
+    "SELECT COUNT(*) FROM inferences").fetchone()[0]
+check("8d-h: ...and the refused write left the row count where it was",
+      _RO_ROWS_AFTER, len(_SEED_ROWS))
 
 
 # ===========================================================================

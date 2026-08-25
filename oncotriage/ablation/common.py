@@ -40,6 +40,7 @@ passing for the wrong reason.
 """
 
 import os
+import sqlite3
 import threading
 from pathlib import Path
 
@@ -229,6 +230,58 @@ def ablation_db(db_path=None) -> Path:
         if "ablation_db" not in _RESOLVED:
             _RESOLVED["ablation_db"] = Path(paths.result_ablation_path) / ABLATION_DB_FILENAME
         return _RESOLVED["ablation_db"]
+
+
+class MissingAblationDatabaseError(RuntimeError):
+    """There is no ablation database at that path, and no reader will make one.
+
+    A ``RuntimeError`` subclass and deliberately NOT a ``sqlite3.Error``, on
+    ``oncotriage.storage.queries.MissingDatabaseError``'s footing and for the
+    same reason: both readers here sit under callers with broad handlers, and a
+    refusal those could swallow would be reported as an empty study.
+    """
+
+
+def open_ablation_db_readonly(db_path=None):
+    """A READ-ONLY connection to the ablation database. The caller closes it.
+
+    THE ONE OWNER of "open the study database to read it", for both readers --
+    ``oncotriage/ablation/analysis.py``'s two loaders and
+    ``oncotriage/ablation/study.py``'s two summary readers. It is in this module
+    rather than in either of them for the reason this module exists: they both
+    need it, and ``analysis`` importing ``study`` would drag the thread pool,
+    the graph and the agent into a process that only wants to read a table.
+
+    WHY READ-ONLY. ``sqlite3.connect(path)`` CREATES an empty database when the
+    path does not exist, so `--db` pointed one directory wrong did not fail: it
+    brought a database into existence and the analysis then reported a study
+    with no rows, which is indistinguishable from a study that produced none.
+    `load_ablation_data` guarded against that with an ``exists()`` check and
+    ``load_error_data`` -- called immediately after it -- did not, so the guard
+    covered one of the two paths through the same file.
+
+    IT ALSO MAKES THE MODE MATCH ``ablation_db``'s OWN DOCSTRING, which has said
+    "READ ONLY from the analysis side" since it was written and had nothing
+    enforcing it.
+
+    The ``?`` escaping and the WAL limit are
+    ``oncotriage.storage.queries.connect``'s, documented there rather than
+    re-argued: a URI's query string starts at the first literal question mark,
+    and a WAL database whose ``-shm`` is missing cannot be opened read-only
+    inside a directory that is not writable.
+    """
+    resolved = ablation_db(db_path)
+    if not os.path.isfile(resolved):
+        raise MissingAblationDatabaseError(
+            f"No ablation database at {str(resolved)!r}.\n"
+            f"    Readers do not create one -- an empty database would report a "
+            f"study with no results, which reads exactly like a study that "
+            f"produced none.\n"
+            f"    Run the study first (python '26- Ablation Study.py'), or "
+            f"point --db at the file you meant.")
+    uri = ("file:" + os.path.abspath(str(resolved)).replace("?", "%3f")
+           + "?mode=ro")
+    return sqlite3.connect(uri, uri=True)
 
 
 #------------------------------------------------------------------------------

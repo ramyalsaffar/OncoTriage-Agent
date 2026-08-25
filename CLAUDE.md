@@ -435,6 +435,46 @@ patient can be left unattempted -- and `main()` reads it. The stop is still
 ANNOUNCED either way; what changes is which of the two things it is reported as
 having cut short.
 
+**STARTING A CAMPAIGN ON A FRESH DATABASE -- ARCHIVE, DO NOT DELETE, AND DO IT
+BEFORE THE FIRST BILLED CALL.** The migrations in
+`oncotriage/storage/database_logger.py` are additive, which is right for a
+database being carried forward and wrong for the file a campaign's published
+numbers are computed from. Three reasons that schema cannot fix in place: NULL
+is ambiguous across an era boundary (`matching_call_mode IS NULL` means "written
+before era 3" for some rows and nothing at all for others, and `run_id` is NULL
+on every row written before run tracking); `SQLITE_PAGE_SIZE` reaches a database
+only at CREATION, so an existing file keeps 4096 until it is VACUUMed; and the
+journal mode converts on first open, so a carried-forward file spent its history
+in whatever mode it was created in. The procedure is two commands and the second
+is the ordinary one:
+
+```bash
+mv "02- Data/03- Inferences Storage/inferences.db" \
+   "02- Data/03- Inferences Storage/inferences-2026-08-archive.db"
+python "25- Batch Runner.py"       # the first write builds the new file
+```
+
+The first write is `start_run_record`, which calls `initialize_database`, which
+creates a file with **all** columns present from the first row, all five tables,
+WAL from the first write, `page_size` = `SQLITE_PAGE_SIZE`, both header stamps
+(`user_version` = `SCHEMA_USER_VERSION`, `application_id` =
+`ONCOTRIAGE_APPLICATION_ID`) and every index. Nothing else has to be done and no
+migration is run. **The archive is MOVED, not deleted**: it is the only copy of
+every historical row and every query in `oncotriage/storage/queries.py` still
+reads it through `--db`.
+
+**AND A DATABASE FROM A NEWER SCHEMA ERA IS NOW REFUSED, LOUDLY, WITHOUT BEING
+TOUCHED.** `initialize_database` reads `PRAGMA application_id` and
+`PRAGMA user_version` as its FIRST statements -- above the page size and above
+the journal mode, both of which write the header -- and raises
+`IncompatibleDatabaseError` (a `RuntimeError` subclass, so a broad
+`except sqlite3.Error` cannot eat it) when the file is another application's, or
+when its era is HIGHER than this code's. It is permissive DOWNWARD, which is
+what the additive migration is for. This REPLACES a branch that left the stamp
+alone and carried on writing; that branch rested on "this schema is strictly
+additive", which is a true statement about the eras that EXIST and a promise
+about eras that do not, made by the code that cannot see them.
+
 **ONE RUN AT A TIME, PER CHECKPOINT DIRECTORY.** Nothing stopped two
 invocations from starting against one directory: both read the same resume state
 and both processed the SAME patients at one live Stage 5 call each, silently.

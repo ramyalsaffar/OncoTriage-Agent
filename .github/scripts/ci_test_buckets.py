@@ -104,6 +104,24 @@ _A = "A"; _B = "B"; _C = "C"; _D = "D"; _E = "E"
 
 BUCKETS = {
     # ---- A: verified green with only the directory skeleton ---------------
+    "test_ablation_write_durability.py": (
+        _A, None,
+        "ran green in 1.3s, 33 checks, against ONLY the directory skeleton: "
+        "the study database now writes through the storage layer's own "
+        "open_connection / apply_journal_mode / run_with_write_retry rather "
+        "than through six bare sqlite3.connect calls on sqlite3's 5-second "
+        "default, and its two readers open a mode=ro URI so a --db pointed one "
+        "directory wrong can no longer CREATE an empty database and report a "
+        "study with no results. The retry is driven against a REAL exclusive "
+        "lock taken by a second connection, not a patched exception. No "
+        "network, no keys, NO SPEND, no live Qdrant, no model load, no corpus, "
+        "no git history: no graph is compiled and every database is a scratch "
+        "file inside a tempfile.mkdtemp that is removed and asserted gone. It "
+        "EXECS NOTHING -- every control is a real failing condition created on "
+        "disk or a different INPUT to a pure function. NOT in the collision "
+        "matrix: it writes nothing in the repository, and the two files it "
+        "reads (ablation/study.py, ablation/analysis.py) are written by "
+        "neither of the suite's two writers and are sha256-compared at the end"),
     "test_ablation_latest_run_selection.py": (
         _A, None,
         "ran green in 1.5s, 45 checks, against ONLY the directory skeleton: "

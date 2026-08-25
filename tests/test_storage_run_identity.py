@@ -719,8 +719,32 @@ check("...and `runs` carries exactly RUN_COLUMNS plus its id",
 check("...and `inferences` carries run_id",
       "run_id" in columns_of(_FRESH, "inferences"), True)
 
-check("run_id is declared INTEGER in INFERENCE_COLUMN_ADDITIONS",
-      _dl.INFERENCE_COLUMN_ADDITIONS.get("run_id"), "INTEGER")
+# THE AFFINITY IS WHAT THIS PINS, and it is asked of the DECLARATION and of the
+# REAL SCHEMA separately, because the two can disagree. The declaration gained a
+# `REFERENCES runs(id)` clause in the database-completion pass -- documentation
+# for a constraint that is deliberately never enforced, which is why the
+# affinity below is unchanged by it. Pinning the whole string would make this
+# check about the constraint text; pinning the affinity keeps it about what the
+# column can HOLD, which is what every NULL-versus-0 rule in this file rests on.
+check("run_id is declared with INTEGER affinity in INFERENCE_COLUMN_ADDITIONS",
+      _dl.INFERENCE_COLUMN_ADDITIONS.get("run_id", "").split()[0], "INTEGER")
+check("...and its declaration carries the (unenforced) reference, so a reader "
+      "of the schema can see the relationship the four-reason ruling declines "
+      "to have SQLite police",
+      "REFERENCES runs(id)" in _dl.INFERENCE_COLUMN_ADDITIONS.get("run_id", ""),
+      True)
+_c_fk = sqlite3.connect(f"file:{_FRESH}?mode=ro", uri=True)
+check("...and SQLite recorded it: PRAGMA foreign_key_list names `runs` for "
+      "both inferences and run_metrics",
+      sorted({r[2] for r in
+              _c_fk.execute("PRAGMA foreign_key_list(inferences)")}
+             | {r[2] for r in
+                _c_fk.execute("PRAGMA foreign_key_list(run_metrics)")}),
+      ["runs"])
+check("...and it is STILL NOT ENFORCED, which is the ruling and not an "
+      "oversight -- see the four reasons at the `runs` CREATE TABLE",
+      _c_fk.execute("PRAGMA foreign_keys").fetchone()[0], 0)
+_c_fk.close()
 
 # The declared affinity of every runs column, read out of the real schema. This
 # is what section 4's NULL rule rests on: `collection_points` has INTEGER

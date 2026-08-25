@@ -541,6 +541,37 @@ LOGGABLE_FIELDS = frozenset({
     # decode line moved to DEBUG when this aggregate replaced it.
     "trials_affected",
 
+    # THE PAGE SIZE A DATABASE WAS BUILT WITH, and the one that was asked for
+    # -- two integers read straight off `PRAGMA page_size` and
+    # config.SQLITE_PAGE_SIZE. They are on this list because the pragma is
+    # SILENTLY IGNORED when it cannot take (an existing file, or an ordering
+    # mistake that put it below journal_mode=WAL), so the only way to know which
+    # happened is a record carrying both numbers. Pure storage geometry: neither
+    # can carry a patient, a trial or a diagnosis.
+    #
+    # THEY ARE HERE BECAUSE LEAVING THEM OFF WAS MEASURED, not because it was
+    # foreseen. The first version of the page-size record logged `page_size`
+    # without adding it, so the formatter dropped the field and counted a
+    # FIELD_DROP -- once per process, on every process that opens a database,
+    # which is a permanent non-zero entry in the run-end degradation block for a
+    # line that is working perfectly. Found by
+    # tests/test_degradation_counter_readers.py, whose "the block still reports
+    # the run as CLEAN" check is the only thing in the suite that would have.
+    "page_size", "page_size_requested",
+
+    # WHICH DATABASE WRITE CONTENDED -- a FIXED IDENTIFIER chosen at the calling
+    # site of database_logger.run_with_write_retry ("ablation_run_row",
+    # "ablation_result_row", ...), never interpolated data. The retry line is
+    # only actionable when the record says which write is contending: a run row
+    # written once per configuration and a result row written once per patient
+    # are different findings with different remedies, and the counters cannot
+    # tell them apart because that helper deliberately increments none. Same
+    # standing as `reason` below it, with the same rule: a caller that
+    # interpolates a patient id, a trial id or third-party text into it is
+    # putting clinical data in a durable stream, and the free-text half of a
+    # retry line belongs on the console, where run_with_write_retry also puts it.
+    "subject",
+
     # --- retrieval and filtering shape ------------------------------------
     "channel", "channels", "degraded", "expansion_path", "mesh_resolution",
     "mesh_path", "boost_path", "filter", "skip_reason", "reason",

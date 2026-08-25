@@ -57,7 +57,6 @@ precisely so a run could be isolated -- COULD NOT BE ANALYSED.
 """
 
 import json
-import sqlite3
 import sys
 
 import numpy as np
@@ -69,6 +68,7 @@ from oncotriage.ablation.common import (
     CONFIG_LABELS,
     CONFIG_ORDER,
     ablation_db,
+    open_ablation_db_readonly,
     output_dir,
 )
 from oncotriage.config import (
@@ -92,11 +92,18 @@ from oncotriage.observability import console
 
 def load_ablation_data(db_path=None) -> pd.DataFrame:
     """Load ablation_results table into a DataFrame."""
+    # THE exists() CHECK STAYS ABOVE THE OPEN, and it is not made redundant by
+    # the opener's own refusal. This one exits 1 with a message an operator of
+    # File 27 reads; the opener RAISES, which is right for a library function
+    # and wrong as the first thing a person sees from a command-line tool. What
+    # changed is that the open below can no longer CREATE the file when this
+    # check is somehow passed -- a race, a symlink, a caller reaching
+    # load_error_data directly.
     if not ablation_db(db_path).exists():
         console.out(f"ERROR: {ablation_db(db_path)} not found. Run File 26 first.")
         sys.exit(1)
 
-    conn = sqlite3.connect(str(ablation_db(db_path)))
+    conn = open_ablation_db_readonly(db_path)
     try:
         df = pd.read_sql_query("""
             SELECT r.*, runs.config_description
@@ -175,8 +182,16 @@ def load_ablation_data(db_path=None) -> pd.DataFrame:
 
 
 def load_error_data(db_path=None) -> pd.DataFrame:
-    """Load error rows separately for error rate analysis."""
-    conn = sqlite3.connect(str(ablation_db(db_path)))
+    """Load error rows separately for error rate analysis.
+
+    NO exists() GUARD OF ITS OWN, and it never had one -- it is called
+    immediately after ``load_ablation_data``, which exits when the file is
+    absent. That made the guard cover one of the two paths through this file,
+    which is exactly the shape that fails the day somebody calls this one first.
+    The read-only opener closes it: this cannot create a database whatever
+    reaches it.
+    """
+    conn = open_ablation_db_readonly(db_path)
     try:
         df = pd.read_sql_query("""
             SELECT config_name, patient_id, error

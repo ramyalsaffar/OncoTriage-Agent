@@ -134,6 +134,7 @@ registry is a tuple of strings. ``connect()`` is a function and ``report()``
 needs a connection handed to it.
 """
 
+import os
 import re
 import sqlite3
 from typing import Dict, List
@@ -2629,6 +2630,127 @@ SELECT s.campaign_id,
     ORDER BY inference_rows DESC, i.run_id
 """,
     ),
+    # ── THE OTHER TWO UNENFORCED REFERENCES, AUDITED THE SAME WAY ──────────
+    #
+    # This schema declares THREE foreign keys and enforces none of them:
+    # `trial_matches.inference_id -> inferences(id)`, which has been declared
+    # since the table was written; and `inferences.run_id -> runs(id)` and
+    # `run_metrics.run_id -> runs(id)`, which the database-completion pass
+    # declared. `dangling_run_references` above is the audit for the second.
+    # These two are the audits for the first and the third, and the rule they
+    # follow is the one that ruling created: a constraint that will not be
+    # ENFORCED is a constraint something else has to be able to FIND the
+    # violations of.
+    #
+    # WHY THEY ARE WORTH HAVING RATHER THAN THEORETICAL. Every one of them is
+    # reachable today, by a route this project has code for:
+    #
+    #   * "15- Database Wipe All Tables.py" DELETEs every table `sqlite_master`
+    #     reports, in catalogue order, with no cascade -- so an interrupted wipe
+    #     leaves children whose parents are gone. That is not hypothetical: the
+    #     wipe is one `Flag = True` away and it deletes parents FIRST.
+    #   * `oncotriage/evaluation/sampling.py` copies a SUBSET of `inferences`
+    #     into a second database along with the `trial_matches` and `runs` rows
+    #     they reference. A subset copy is precisely where a reference is left
+    #     hanging if the copy's membership rule and its child rule disagree.
+    #   * Two databases merged by hand, which is what an operator does with an
+    #     archived campaign file after the fresh-database procedure.
+    #
+    # WHAT AN ORPHANED CHILD COSTS, and it is different for the two:
+    #
+    #   * An orphaned `trial_matches` row is a VERDICT WITH NO PATIENT. Every
+    #     query in this registry that reads trial verdicts reaches them through
+    #     `inference_id`, so an orphan is invisible to all of them -- it is
+    #     billed work, stored, and excluded from every number computed over the
+    #     campaign. Nothing else here can report one.
+    #   * An orphaned `run_metrics` row is a DEGRADATION COUNT ATTRIBUTED TO NO
+    #     RUN. `run_summary` and `run_degradation_breakdown` are both driven
+    #     FROM `runs`, so an orphan is dropped by both and the events it counts
+    #     are silently absent from every health reading.
+    #
+    # `empty_or_to_string` WITH ITS OWN CLEAN MESSAGE, on
+    # `dangling_run_references`' argument: a clean audit must SAY it is clean,
+    # because silence cannot be told apart from an audit that did not run.
+    Query(
+        key='orphan_trial_matches',
+        heading='=== TRIAL ROWS WHOSE inference_id NAMES NO INFERENCE ===',
+        render='empty_or_to_string',
+        blank_after=True,
+        clean_message=(
+            "No orphaned trial_matches rows - every trial verdict names an "
+            "inference row that exists"
+        ),
+        # NO `requires` AND NO `requires_columns`. Both tables and both columns
+        # are in the original CREATE statements -- neither is additive -- so
+        # every database this project has ever written can answer this,
+        # including one written before `runs` existed. Declaring a requirement
+        # that is always satisfied would be a line that can only ever be wrong.
+        notes=(
+            "A row here is a real defect: a stored trial verdict that no query",
+            "in this registry can reach, because every one of them joins",
+            "through inference_id. It was billed for and it is excluded from",
+            "every number computed over the campaign.",
+            "",
+            "The foreign key is declared and deliberately unenforced -- the",
+            "four reasons are at the `runs` CREATE TABLE in",
+            "oncotriage/storage/database_logger.py -- so nothing prevented it.",
+        ),
+        sql="""
+    SELECT
+        tm.inference_id,
+        COUNT(*)                        AS trial_rows,
+        COUNT(DISTINCT tm.nct_id)       AS distinct_trials,
+        MIN(tm.id)                      AS first_row_id,
+        MAX(tm.id)                      AS last_row_id
+    FROM trial_matches tm
+    LEFT JOIN inferences i ON i.id = tm.inference_id
+    WHERE i.id IS NULL
+    GROUP BY tm.inference_id
+    ORDER BY trial_rows DESC, tm.inference_id
+""",
+    ),
+    Query(
+        key='orphan_run_metrics',
+        heading='=== HEALTH ROWS WHOSE run_id NAMES NO RUN ===',
+        render='empty_or_to_string',
+        blank_after=True,
+        clean_message=(
+            "No orphaned run_metrics rows - every health row names a run that "
+            "exists"
+        ),
+        # RUN_TABLES, because this reads BOTH of them. Unlike
+        # `dangling_run_references` -- which declares `runs` alone precisely so
+        # a damaged database can still be examined -- there is nothing to
+        # examine here without `run_metrics`: it is the table the orphans are
+        # IN. No `requires_columns`: `run_metrics.run_id` and `runs.id` are both
+        # in their CREATE statements.
+        requires=RUN_TABLES,
+        notes=(
+            "A row here is a real defect: a degradation count attributed to a",
+            "run that is not in this database. run_summary and",
+            "run_degradation_breakdown are both driven FROM `runs`, so these",
+            "rows are dropped by both and the events they count are absent",
+            "from every health reading.",
+            "",
+            "The clean case is the common one. A run row is written before its",
+            "first flush and finalized after its last, by the same process,",
+            "into the same file, under the same lock.",
+        ),
+        sql="""
+    SELECT
+        rm.run_id,
+        COUNT(*)                          AS metric_rows,
+        COUNT(DISTINCT rm.name)           AS distinct_counters,
+        COUNT(DISTINCT rm.category)       AS distinct_categories,
+        MIN(rm.written_at)                AS first_written_at,
+        MAX(rm.written_at)                AS last_written_at
+    FROM run_metrics rm
+    LEFT JOIN runs r ON r.id = rm.run_id
+    WHERE r.id IS NULL
+    GROUP BY rm.run_id
+    ORDER BY metric_rows DESC, rm.run_id
+""",
+    ),
     # ── Stage 5 split pressure (this pass) ─────────────────────────────────
     #
     # THESE TWO ARE THE WHOLE READER, AND THERE IS DELIBERATELY NO DASHBOARD
@@ -3051,14 +3173,84 @@ def resolve_query_db_path(db_path=None):
     return paths.inferences_path
 
 
-def connect(db_path=None):
-    """Open a read connection to the inference database.
+class MissingDatabaseError(RuntimeError):
+    """There is no database at that path, and this module will not create one.
 
-    Returns a plain ``sqlite3.Connection``. The caller closes it -- ``report()``
-    does not, because a caller that wants to ask a follow-up question after the
-    report should not have to reopen.
+    A ``RuntimeError`` subclass and deliberately NOT a ``sqlite3.Error``, on
+    ``MissingTableError``'s footing and for the same reason: a caller with a
+    broad ``except sqlite3.Error`` around its reads would swallow this and go on
+    to report an empty result, which is exactly the answer that must not be
+    produced for a path that does not exist.
+
+    It exists because the alternative diagnosis is useless. Opening a
+    ``mode=ro`` URI on an absent file raises
+    ``sqlite3.OperationalError: unable to open database file`` -- which does not
+    name the file, does not say whether the problem is the path or the
+    permissions, and is the same message a dozen other faults produce.
     """
-    return sqlite3.connect(resolve_query_db_path(db_path))
+
+
+def connect(db_path=None):
+    """Open a READ-ONLY connection to the inference database.
+
+    Returns a ``sqlite3.Connection`` opened through a ``file:...?mode=ro`` URI.
+    The caller closes it -- ``report()`` does not, because a caller that wants
+    to ask a follow-up question after the report should not have to reopen.
+
+    WHY READ-ONLY, AND WHAT IT REPLACES. This was a plain
+    ``sqlite3.connect(path)``, which CREATES an empty database when the path
+    does not exist. So a mistyped path, a stale ``ONCOTRIAGE_INFERENCES_DB`` or
+    a `--db` pointed one directory wrong did not fail: it brought a database
+    into existence, `report()` ran the whole registry against it, and forty-odd
+    queries printed empty frames and clean-audit messages that are
+    indistinguishable from a real report on a healthy pipeline. A reader has no
+    way to tell that from "the campaign produced nothing", and the second
+    reading is the one a person reaches for.
+
+    THE PRECEDENT IS ``oncotriage/dashboard/data.py:_readonly_connection``,
+    which is documented there for the same reason and which this deliberately
+    matches rather than re-argues -- including the ``?`` escaping, because a
+    literal question mark in a path would otherwise start the URI's query
+    string.
+
+    IT ALSO MAKES THE MODE MATCH THE CONTRACT. Every Query in this registry is a
+    SELECT and this module's docstring calls itself read-only; a connection that
+    could write was a promise nothing enforced.
+
+    THE FILE-EXISTS TEST IS SEPARATE FROM THE OPEN, and it is not redundant with
+    it: ``mode=ro`` on an absent path raises an OperationalError naming nothing,
+    while this raises ``MissingDatabaseError`` naming the path and how it was
+    chosen. The remaining ``OperationalError`` cases -- unreadable permissions,
+    a corrupt header, a WAL database whose ``-shm`` cannot be created in a
+    read-only directory -- are left to propagate as themselves, because each has
+    a different remedy and inventing one message for all of them would be worse
+    than sqlite's.
+
+    ONE KNOWN LIMIT, MEASURED. A WAL database whose ``-wal`` file is live and
+    whose ``-shm`` is absent CANNOT be opened read-only inside a directory that
+    is not writable -- SQLite needs to create the shared-memory index and cannot
+    (measured on sqlite 3.45.3: ``unable to open database file``). That is the
+    crashed-writer-plus-read-only-directory case; an ordinary writable data
+    directory recreates the ``-shm`` and reads fine, which was measured too. It
+    is stated here rather than worked around because the workaround --
+    ``immutable=1`` -- lies to SQLite about a file another process may be
+    writing.
+    """
+    resolved = resolve_query_db_path(db_path)
+    if not os.path.isfile(resolved):
+        raise MissingDatabaseError(
+            f"No database at {resolved!r}.\n"
+            f"    These queries are read-only and will not create one -- an "
+            f"empty database would answer every question in this registry with "
+            f"an empty frame, which reads exactly like a campaign that produced "
+            f"nothing.\n"
+            f"    The path came from " + ("the db_path argument."
+                                          if db_path is not None else
+                                          "oncotriage.paths.inferences_path "
+                                          "(override it with "
+                                          "ONCOTRIAGE_INFERENCES_DB)."))
+    uri = "file:" + os.path.abspath(resolved).replace("?", "%3f") + "?mode=ro"
+    return sqlite3.connect(uri, uri=True)
 
 
 #------------------------------------------------------------------------------

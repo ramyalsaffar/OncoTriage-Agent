@@ -5454,8 +5454,13 @@ else:
     # `_note_run_metric_shape` guards a SET and deliberately takes
     # `_ANNOUNCE_LOCK` instead, precisely so this number keeps counting one
     # thing.
-    check("the control actually removed the lock (all six sites)",
-          _payload.get("locks_stripped"), 6)
+    # 6 -> 7 AT THE DATABASE-COMPLETION PASS, which added analyze_database --
+    # ANALYZE writes `sqlite_stat1`, so it is a database statement in this
+    # module and the invariant covers it. It deliberately does NOT go through
+    # run_with_write_retry, which is a different question: the retry exists so a
+    # ROW is not lost and there is no row here.
+    check("the control actually removed the lock (all seven sites)",
+          _payload.get("locks_stripped"), 7)
 
     # SCENARIO A, reported honestly: the lock does NOT change this path.
     check("steady state, WITH the lock: every row lands",

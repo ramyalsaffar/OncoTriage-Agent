@@ -364,6 +364,12 @@ _REGISTRY_SPEC = (
     ("JOURNAL_MODE_DEGRADATIONS", _database_logger.JOURNAL_MODE_DEGRADATIONS,
      "the database is not in the journal mode SQLITE_JOURNAL_MODE asked for; "
      "keyed requested->actual"),
+    ("ANALYZE_FAILURES", _database_logger.ANALYZE_FAILURES,
+     "the run finished and SQLite's planner statistics could not be refreshed, "
+     "so `sqlite_stat1` is stale or absent and later queries against this "
+     "database are planned from built-in guesses rather than measured "
+     "selectivity. Every answer is still correct; some plans are worse. Keyed "
+     "by exception type, and the next run's ANALYZE repairs it"),
     ("FIELD_DROPS", _observability.FIELD_DROPS,
      "a log field was dropped for not being on LOGGABLE_FIELDS; the field "
      "NAME only, never its value"),

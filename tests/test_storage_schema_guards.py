@@ -126,6 +126,7 @@ import sqlite3
 import tempfile
 
 from oncotriage import config as _config
+from oncotriage import degradation as _degradation
 from oncotriage.storage import database_logger as _dl
 from oncotriage.storage import queries as _q
 
@@ -158,6 +159,31 @@ def check(label, actual, expected):
 
 def check_true(label, actual):
     check(label, bool(actual), True)
+
+
+def check_raises(label, exc_type, fn, *args, **kwargs):
+    """Require ``fn`` to raise ``exc_type``. RETURNS the exception, or a marker.
+
+    IT NEVER RE-RAISES AND IT NEVER RETURNS None. Both matter, and both are this
+    project's recorded lessons rather than preferences: a helper that let the
+    exception escape would abort the file at exactly the check that is testing
+    for it, and a helper that returned None on the "did not raise" path would
+    make every follow-up assertion on the MESSAGE fail with an AttributeError
+    instead of with the failure it owes. The marker is a string, so
+    ``str(...)``, ``in`` and every message check below work on both paths.
+    """
+    try:
+        fn(*args, **kwargs)
+    except exc_type as exc:
+        _RESULTS["passed"] += 1
+        print(f"  PASS  {label}")
+        return exc
+    except BaseException as exc:                       # noqa: BLE001 -- reported
+        fail(label, f"raised {type(exc).__name__} rather than "
+                    f"{exc_type.__name__}: {exc}")
+        return f"<raised {type(exc).__name__}: {exc}>"
+    fail(label, f"did not raise {exc_type.__name__}")
+    return f"<did not raise {exc_type.__name__}>"
 
 
 def fail(label, detail):
@@ -817,14 +843,32 @@ check("4a initialize_database creates the child-lookup index",
 check("4b ...beside the run_metrics index it was modelled on, so the precedent "
       "is still there",
       "idx_run_metrics_run_id" in _FRESH_INDEXES, True)
+# THE THREE ON `inferences`, ADDED BY THE DATABASE-COMPLETION PASS. Measured at
+# 22,000 inference rows and 330,000 children before they were added: lookup by
+# patient_id 1.615 -> 0.012 ms, count by run_id 2.028 -> 0.015 ms, a one-month
+# timestamp range 1.649 -> 1.061 ms, and one patient's write 0.089 -> 0.086 ms,
+# i.e. no measurable write cost. The numbers and the reader for each are at the
+# CREATE INDEX statements.
+check("4b-2 ...and the three access paths `inferences` is actually read by",
+      sorted(n for n in _FRESH_INDEXES if n.startswith("idx_inferences_")),
+      ["idx_inferences_patient_id", "idx_inferences_run_id",
+       "idx_inferences_timestamp"])
 # THE RULING, PINNED. An index on nct_id was MEASURED harmful (32% slower): the
 # queries that group by it read the whole table anyway, so the planner gains
 # nothing and every insert maintains a second B-tree. Pinned as an EXACT set so
 # adding one fails here with the reason attached, rather than being a silent
 # regression nobody re-measures.
+#
+# THE SET GREW BY THREE AND IT STAYS EXACT, which is this check working rather
+# than this check being in the way: an addition has to be made here, in the same
+# commit, beside the measurement that justifies it. What has NOT changed is the
+# nct_id ruling -- there is still no index on it, and the exactness of this list
+# is what says so.
 check("4c ...and NO index on nct_id, which is a measured ruling and not an "
       "oversight (32% slower; see the comment at the CREATE INDEX)",
-      _FRESH_INDEXES, ["idx_run_metrics_run_id", "idx_trial_matches_inference_id"])
+      _FRESH_INDEXES, ["idx_inferences_patient_id", "idx_inferences_run_id",
+                       "idx_inferences_timestamp", "idx_run_metrics_run_id",
+                       "idx_trial_matches_inference_id"])
 # Re-open the SAME database through the real initialize_database. Written as
 # two statements rather than one expression: the first version buried the
 # re-open inside a conditional whose evaluation ORDER was what made the check
@@ -954,26 +998,145 @@ check_true("5g ...and the transition is announced with both numbers",
 check("5h ...and the rebinding was restored, so no later check is reading a "
       "patched constant", _dl.SCHEMA_USER_VERSION, _ERA_AT_IMPORT)
 
-# NEVER LOWERED. The database is now at era N+1 and this code is era N. Because
-# this schema is strictly additive -- nothing here drops a column, a table or an
-# index -- the file still HAS everything era N+1 gave it. Writing N over the N+1
-# would replace a true statement with a false one.
-_LOWER_LOG = fresh_db(_STAMP)
-check("5i an older writer does NOT lower a newer file's stamp",
+# ── THE DOWNGRADE REFUSAL (the database-completion pass) ───────────────────
+#
+# THIS REPLACES A PERMISSIVE BRANCH AND THE ARGUMENT IS RECORDED HERE, WHERE THE
+# RETIRED CHECKS WERE. They asserted that an older writer meeting a NEWER file
+# left the stamp alone, said so out loud, and MIGRATED ANYWAY -- 5i, 5j and a
+# 5k that required every additive column to be present afterwards.
+#
+# That behaviour rested on "this schema is strictly additive, so a file stamped
+# N+1 still HAS everything N+1 gave it". True of the eras that EXIST; a promise
+# about eras that do not, made by the code that cannot see them. An era that
+# renames a column (this project has renamed nine), that adds one with a
+# non-NULL default, or that changes what a value in an existing column MEANS
+# leaves the older writer producing rows that raise nothing and that the newer
+# readers cannot interpret. So the direction is refused, and 5k's property --
+# "it still migrates what it knows about" -- is deliberately FALSE now: nothing
+# is written at all, which is what makes the refusal safe to act on.
+#
+# THE OTHER DIRECTION IS UNCHANGED AND 5f/5g above are what say so: a newer
+# writer meeting an OLDER file migrates it and stamps forward. That is what the
+# additive mechanism is for and refusing it would make every column addition a
+# manual migration.
+_STAMP_SHA_BEFORE = hashlib.sha256(open(_STAMP, "rb").read()).hexdigest()
+_LOWER_RAISED = check_raises(
+    "5i an older writer REFUSES a newer file rather than writing to it",
+    _dl.IncompatibleDatabaseError, fresh_db, _STAMP)
+_LOWER_MESSAGE = str(_LOWER_RAISED)
+check_true("5j ...naming BOTH eras, so an operator can tell which side is "
+           "behind",
+           str(_dl.SCHEMA_USER_VERSION + 1) in _LOWER_MESSAGE
+           and str(_dl.SCHEMA_USER_VERSION) in _LOWER_MESSAGE)
+check_true("5j-2 ...and naming the remediation, which is to archive the file "
+           "and let a fresh one be built -- a refusal an operator cannot act "
+           "on is a refusal they work around",
+           "archive" in _LOWER_MESSAGE.lower())
+# UNTOUCHED, BY BYTES. The stamp being unchanged is necessary and not
+# sufficient: the page size and the journal mode are both written to the header
+# BEFORE the first CREATE, so a refusal placed after either of them would leave
+# a file whose stamp is right and whose header this code had already rewritten.
+check("5k ...and the file is BYTE-IDENTICAL afterwards, which is what 'nothing "
+      "has been written to it' has to mean",
+      hashlib.sha256(open(_STAMP, "rb").read()).hexdigest(),
+      _STAMP_SHA_BEFORE)
+check("5k-2 ...including the stamp itself",
       user_version(_STAMP), _dl.SCHEMA_USER_VERSION + 1)
-check_true("5j ...and refuses out loud, naming both eras -- a silent no-op here "
-           "is indistinguishable from a stamp that worked",
-           "LEFT AT" in _LOWER_LOG
-           and str(_dl.SCHEMA_USER_VERSION + 1) in _LOWER_LOG)
-# AND IT STILL DID ITS JOB. Refusing the stamp must not mean refusing the
-# migration: the older writer still ensures everything it knows about.
-_LOWERED_CONN = sqlite3.connect(_STAMP)
-check("5k ...while still migrating what it knows about, so the refusal is "
-      "about the LABEL and not about the work",
-      frozenset(r[1] for r in
-                _LOWERED_CONN.execute("PRAGMA table_info(inferences)"))
-      >= frozenset(_dl.INFERENCE_COLUMN_ADDITIONS), True)
-_LOWERED_CONN.close()
+
+# ── AND THE IDENTITY REFUSAL BESIDE IT ─────────────────────────────────────
+#
+# A NON-ZERO application_id THAT IS NOT OURS is a database some other tool
+# created, and this code was about to create five tables in it. It is checked
+# BEFORE the era, because on a foreign file `user_version` is somebody else's
+# numbering -- comparing it against SCHEMA_USER_VERSION produces a true number
+# and a false meaning.
+_FOREIGN = os.path.join(_TMP, "foreign.db")
+_FOREIGN_CONN = sqlite3.connect(_FOREIGN)
+_FOREIGN_CONN.execute("PRAGMA application_id = 305419896")   # 0x12345678
+_FOREIGN_CONN.execute("CREATE TABLE somebody_elses (a)")
+_FOREIGN_CONN.commit()
+_FOREIGN_CONN.close()
+_FOREIGN_SHA = hashlib.sha256(open(_FOREIGN, "rb").read()).hexdigest()
+_FOREIGN_RAISED = check_raises(
+    "5l a database carrying another application's id is refused",
+    _dl.IncompatibleDatabaseError, fresh_db, _FOREIGN)
+check_true("5m ...naming both ids, so the diagnosis does not need a hex dump",
+           "305419896" in str(_FOREIGN_RAISED)
+           and str(_dl.ONCOTRIAGE_APPLICATION_ID) in str(_FOREIGN_RAISED))
+check("5n ...and it is byte-identical afterwards -- no tables created, no "
+      "header rewritten",
+      hashlib.sha256(open(_FOREIGN, "rb").read()).hexdigest(), _FOREIGN_SHA)
+
+# OURS AND UNSTAMPED IS NOT FOREIGN, which is the half that makes the check
+# usable at all: 0 is what SQLite writes into a file nobody stamped, so it is
+# what every database this project wrote before this pass reports -- the
+# production one included.
+# THE FIXTURE IS A REAL DATABASE WITH ITS IDENTITY CLEARED, not a stub with one
+# table in it, and that is the second thing this check had to learn. A stub
+# `inferences` table lacking `patient_id` makes `initialize_database` die at
+# `CREATE INDEX ... ON inferences(patient_id)` -- which is correct behaviour
+# (the index names a column of the base CREATE TABLE, so every real database has
+# it) and a fixture that has nothing to do with what this asserts. Clearing the
+# id off a real file is exactly the shape the production database is in today:
+# every table, every column, and `PRAGMA application_id` reading 0 because
+# nothing had ever stamped it.
+_OURS_UNSTAMPED = os.path.join(_TMP, "ours_unstamped.db")
+fresh_db(_OURS_UNSTAMPED)
+_OU_CONN = sqlite3.connect(_OURS_UNSTAMPED)
+_OU_CONN.execute("PRAGMA application_id = 0")
+_OU_CONN.commit()
+check("5o-pre the fixture really reads 0 (non-degeneracy: already stamped, 5o "
+      "would be asserting nothing)",
+      _OU_CONN.execute("PRAGMA application_id").fetchone()[0], 0)
+_OU_CONN.close()
+check("5o an UNSTAMPED database is ours, not foreign -- 0 is SQLite's default "
+      "and is what every file written before this pass reports, the production "
+      "one included",
+      isinstance(fresh_db(_OURS_UNSTAMPED), str), True)
+_OU_CONN = sqlite3.connect(_OURS_UNSTAMPED)
+check("5p ...and it is stamped with this project's id on the way through",
+      _OU_CONN.execute("PRAGMA application_id").fetchone()[0],
+      _dl.ONCOTRIAGE_APPLICATION_ID)
+_OU_CONN.close()
+
+# THE PAGE SIZE, AND THE ORDERING FACT THAT DECIDES WHERE IT IS ISSUED.
+# `PRAGMA page_size` after `journal_mode = WAL` is SILENTLY IGNORED, so a fresh
+# database getting the configured size is the only evidence that the pragma is
+# above the journal mode rather than below it.
+_PAGE_DB = os.path.join(_TMP, "pagesize.db")
+fresh_db(_PAGE_DB)
+_PAGE_CONN = sqlite3.connect(_PAGE_DB)
+check("5q a FRESH database is built with SQLITE_PAGE_SIZE, which it only can "
+      "be if the pragma is issued above journal_mode=WAL",
+      _PAGE_CONN.execute("PRAGMA page_size").fetchone()[0],
+      int(_config.SQLITE_PAGE_SIZE))
+check("5r ...and is in WAL, so the ordering did not cost the journal mode",
+      str(_PAGE_CONN.execute("PRAGMA journal_mode").fetchone()[0]).lower(),
+      str(_config.SQLITE_JOURNAL_MODE).lower())
+_PAGE_CONN.close()
+
+# AND IT IS INERT ON AN EXISTING FILE, which is the designed outcome and the
+# reason a mismatch is REPORTED rather than counted: every carried-forward
+# database in this project keeps the page size it was created with, permanently,
+# and a counter that is non-zero on every run of every campaign says nothing.
+_EXISTING_PAGE = os.path.join(_TMP, "existing_page.db")
+_EP_CONN = sqlite3.connect(_EXISTING_PAGE)
+_EP_CONN.execute("PRAGMA page_size = 4096")
+_EP_CONN.execute("CREATE TABLE seeded (a)")
+_EP_CONN.execute("INSERT INTO seeded VALUES (1)")
+_EP_CONN.commit()
+_EP_CONN.close()
+check_true("5s-pre the fabricated file really is at a DIFFERENT page size "
+           "(non-degeneracy: at the configured size 5s passes for free)",
+           4096 != int(_config.SQLITE_PAGE_SIZE))
+fresh_db(_EXISTING_PAGE)
+_EP_CONN = sqlite3.connect(_EXISTING_PAGE)
+check("5s an EXISTING database keeps its page size -- changing it needs a "
+      "VACUUM, and this module's migrations never rewrite a file",
+      _EP_CONN.execute("PRAGMA page_size").fetchone()[0], 4096)
+check("5t ...and its row survived, so 'inert' means inert and not 'rebuilt'",
+      _EP_CONN.execute("SELECT COUNT(*) FROM seeded").fetchone()[0], 1)
+_EP_CONN.close()
 
 # AN UNSTAMPED DATABASE READS 0, which is what makes 0 usable as "ask
 # table_info". Built by hand rather than by this module, because that is the
@@ -1020,6 +1183,104 @@ check("5o ...and after the last index creation, so it labels a file that has "
 # strictly OLDER than production, so it exercises the same path with no sibling
 # data tree, no read-only URI, and no possibility of touching a real file.
 
+# THE INDEX CREATION IS GUARDED ON THE COLUMN, AND THAT IS ON THE WRITE PATH.
+# `initialize_database` is called by `_ensure_database` before the first
+# inference row of a run, so a raise inside it turns a database in an unexpected
+# shape into a dead pipeline -- and `CREATE INDEX ... ON t(c)` raises when `t`
+# has no `c`. Unreachable by any database this project WROTE (every column named
+# is in a base CREATE TABLE or is added by the migration loop above the
+# indexes); reachable by a hand-built one, which is how it was FOUND: a
+# fabricated pre-migration `inferences` carrying only id and patient_id, in
+# tests/test_agent_emission_provenance.py, aborted that whole file. The
+# behaviour is the one the ALTER loops already have -- do what can be done, and
+# SAY what could not.
+_STUB = os.path.join(_TMP, "stub_shaped.db")
+_STUB_CONN = sqlite3.connect(_STUB)
+_STUB_CONN.executescript(
+    "CREATE TABLE inferences (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+    "patient_id TEXT);"
+    "CREATE TABLE trial_matches (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+    "inference_id INTEGER, nct_id TEXT);")
+_STUB_CONN.commit()
+_STUB_CONN.close()
+_STUB_LOG = fresh_db(_STUB)
+check("4e a table missing a column an index names does NOT abort "
+      "initialize_database -- it is on the write path, and a raise there is a "
+      "dead pipeline",
+      isinstance(_STUB_LOG, str), True)
+check_true("4f ...and the skip is ANNOUNCED, naming the index and the missing "
+           "column, because a silent one is indistinguishable from an index "
+           "that was created",
+           "idx_inferences_timestamp" in _STUB_LOG
+           and "timestamp" in _STUB_LOG)
+_STUB_CONN = sqlite3.connect(_STUB)
+check("4g ...and the index really was not created",
+      "idx_inferences_timestamp" in {r[0] for r in _STUB_CONN.execute(
+          "SELECT name FROM sqlite_master WHERE type='index'")}, False)
+check("4h ...while the ones whose columns ARE there were, so the guard skips "
+      "one index rather than giving up on all of them",
+      "idx_inferences_patient_id" in {r[0] for r in _STUB_CONN.execute(
+          "SELECT name FROM sqlite_master WHERE type='index'")}, True)
+_STUB_CONN.close()
+
+
+# ===========================================================================
+# 5b. THE PLANNER STATISTICS (the database-completion pass)
+# ===========================================================================
+#
+# WHAT IT IS FOR, in one sentence: without `sqlite_stat1` SQLite plans from a
+# built-in guess of roughly ten rows per distinct index value, for every index,
+# whatever the data -- so a query whose WHERE names two indexed columns has no
+# basis for choosing between them. The measured numbers on a 22,000-row
+# `inferences` table are 1 row per patient_id, 262 per timestamp and 1100 per
+# run_id, which is nothing like the guess and is the whole point.
+#
+# IT IS DRIVEN, NOT INSPECTED. `sqlite_stat1` existing is the observable, and it
+# is a table SQLite creates only when ANALYZE runs.
+
+print("\n=== 5b. ANALYZE and the planner statistics ===")
+
+_ANALYZE_DB = os.path.join(_TMP, "analyze.db")
+fresh_db(_ANALYZE_DB)
+_AN_CONN = sqlite3.connect(_ANALYZE_DB)
+for _i in range(50):
+    _AN_CONN.execute(
+        "INSERT INTO inferences (patient_id, timestamp) VALUES (?, ?)",
+        (f"P-{_i:04d}", f"2026-08-{1 + _i % 28:02d}T00:00:00"))
+_AN_CONN.commit()
+check("5b-a a database that has never been ANALYZEd has no sqlite_stat1 "
+      "(non-degeneracy: with one already there, 5b-b passes for free)",
+      _AN_CONN.execute("SELECT COUNT(*) FROM sqlite_master "
+                       "WHERE name='sqlite_stat1'").fetchone()[0], 0)
+_AN_CONN.close()
+
+check("5b-b analyze_database() reports success", _dl.analyze_database(_ANALYZE_DB), True)
+_AN_CONN = sqlite3.connect(_ANALYZE_DB)
+check("5b-c ...and sqlite_stat1 exists afterwards",
+      _AN_CONN.execute("SELECT COUNT(*) FROM sqlite_master "
+                       "WHERE name='sqlite_stat1'").fetchone()[0], 1)
+check_true("5b-d ...carrying a row for each of the indexes it can measure, so "
+           "the planner has real selectivity rather than its default guess",
+           _AN_CONN.execute("SELECT COUNT(*) FROM sqlite_stat1 "
+                            "WHERE tbl='inferences'").fetchone()[0] >= 1)
+_AN_CONN.close()
+
+# IT MAY NOT RAISE, on flush_run_metrics' footing: it runs at the END of a run,
+# after every patient has cost a live Stage 5 call, and the worst a stale
+# statistics table can do is make a later query choose a worse index.
+_ANALYZE_FAILURES_BEFORE = sum(_dl.ANALYZE_FAILURES.values())
+check("5b-e a path whose PARENT does not exist returns False rather than "
+      "raising -- the contract that keeps an optimisation from destroying the "
+      "campaign it is optimising",
+      _dl.analyze_database(os.path.join(_TMP, "no_such_dir", "x.db")), False)
+check_true("5b-f ...and the failure is COUNTED, so it reaches the run-end "
+           "degradation block instead of vanishing",
+           sum(_dl.ANALYZE_FAILURES.values()) > _ANALYZE_FAILURES_BEFORE)
+check("5b-g ...and the counter is on the degradation registry, which is what "
+      "gives it a reader at all",
+      "ANALYZE_FAILURES" in _degradation._REGISTRY, True)
+
+
 print("\n=== 6. report() against a pre-migration database ===")
 
 _OLD = os.path.join(_TMP, "pre_migration.db")
@@ -1030,6 +1291,17 @@ for _new, _old_name in _dl.RENAMED_INFERENCE_COLUMNS.items():
         continue          # dropped below; renaming first would lose the drop
     _OLD_CONN.execute(
         f"ALTER TABLE inferences RENAME COLUMN {_new} TO {_old_name}")
+# THE INDEXES ON ADDITIVE COLUMNS GO FIRST. SQLite refuses to drop a column an
+# index references, so a fabricator that removes columns has to remove the
+# indexes that name them -- which is also the shape a real pre-migration
+# database has, since the index was created in the same call as the column. It
+# is DERIVED from sqlite_master rather than a list of names, so an index added
+# on a future additive column does not silently reintroduce this failure.
+for _index_name, _index_sql in list(_OLD_CONN.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type='index' "
+        "AND tbl_name='inferences' AND sql IS NOT NULL")):
+    if any(_c in (_index_sql or "") for _c in _dl.INFERENCE_COLUMN_ADDITIONS):
+        _OLD_CONN.execute(f"DROP INDEX {_index_name}")
 for _column in _dl.INFERENCE_COLUMN_ADDITIONS:
     _OLD_CONN.execute(f"ALTER TABLE inferences DROP COLUMN {_column}")
 for _column in _dl.TRIAL_MATCH_COLUMN_ADDITIONS:

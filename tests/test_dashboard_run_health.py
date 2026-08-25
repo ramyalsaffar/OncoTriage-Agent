@@ -437,6 +437,11 @@ def _build(path, runs, patients, metrics, orphans, drop_tables=(),
         # measurably does not (its columns carry no run_id). A scenario that
         # dropped the tables and kept the column would be a shape no version of
         # this project has ever produced.
+        # THE INDEX FIRST: SQLite refuses to drop a column an index references,
+        # and `idx_inferences_run_id` names this one. A real database written
+        # before the run-identity pass has neither, so dropping both is what
+        # reproduces that shape rather than a workaround for it.
+        conn.execute("DROP INDEX IF EXISTS idx_inferences_run_id")
         conn.execute("ALTER TABLE inferences DROP COLUMN run_id")
     conn.commit()
     conn.close()
