@@ -4247,22 +4247,38 @@ _DECORATOR_INVENTORY = {
     # that silently damaged two nested docstrings in the run-identity pass.
     "oncotriage/retrieval/indexer.py::cleanup_failures_reported":
         ["contextlib.contextmanager"],
-    # The pre-migration pass's run lock. A context manager for the reason
-    # tests/run_serial_tests.py's is one, and this entry is what makes its LOSS
-    # visible: strip the decorator and `with exclusive_run_lock():` raises
-    # AttributeError on a generator, at the top of a batch run -- loudly, but
-    # only when somebody runs one. Here it fails in bucket A.
+    # THE LOCK MECHANISM ITSELF (the consolidation pass). The 0700 directory,
+    # the O_NOFOLLOW open, the non-blocking flock, the UTC record and the
+    # kernel release had THREE copies and a four-part security fix had to be
+    # applied to each by hand; this is the one owner. A context manager for the
+    # reason tests/run_serial_tests.py's is one, and this entry is what makes
+    # its LOSS visible: strip the decorator and every `with` on it raises
+    # AttributeError on a generator, at the top of a batch run or a paid study
+    # -- loudly, but only when somebody runs one. Here it fails in bucket A.
+    "oncotriage/control.py::hold_exclusive_lock":
+        ["contextlib.contextmanager"],
+    # The two programs keep a THIN wrapper each, and the wrapper keeps the
+    # decorator rather than returning control's context manager object. Both
+    # forms work with `with`; the decorated form is what keeps this entry's
+    # own argument true of the wrapper as well as of the mechanism, so a
+    # future edit that strips it here is caught here.
+    #
+    # WHAT EACH WRAPPER STILL DECIDES: its key (a checkpoint DIRECTORY for the
+    # batch runner, a study's checkpoint FILE for the ablation study, so a --db
+    # study and a production study lock independently exactly as they
+    # checkpoint independently), its two exception subclasses, and the field
+    # its holder record names.
     "oncotriage/batch/runner.py::exclusive_run_lock":
         ["contextlib.contextmanager"],
     # The operator-control pass gave the ABLATION STUDY a lock of its own, for
     # the reason the batch runner's has one and with a larger multiplier: a
     # study's unit is a (config, patient) PAIR, so two overlapping studies pay
-    # for the same patient once per configuration. A SEPARATE definition rather
-    # than an import of the runner's -- importing it would put the whole batch
-    # module in every study's import graph, and the two refusals are raised by
-    # different programs and remediated with different commands. This entry
-    # makes the DECORATOR's loss visible in bucket A rather than as an
-    # AttributeError on a generator at the top of a paid study.
+    # for the same patient once per configuration. It was a SEPARATE
+    # implementation until the consolidation pass, on an argument -- that
+    # importing the runner's would put the whole batch module in every study's
+    # import graph -- that oncotriage/control.py dissolves by importing nothing
+    # from the project. The two REFUSAL CLASSES stay distinct; the mechanism
+    # does not.
     "oncotriage/ablation/study.py::exclusive_run_lock":
         ["contextlib.contextmanager"],
     "oncotriage/retrieval/indexer.py::get_embeddings_batch._call": [

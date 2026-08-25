@@ -136,11 +136,27 @@ import threading
 import time
 
 import oncotriage
+from oncotriage import control as _control               # noqa: E402
 from oncotriage import paths as _paths
 from oncotriage.batch import runner as _runner
 from oncotriage.config import MAX_WORKERS, RESAMPLE_COUNT
 from oncotriage import degradation as _degradation
 from oncotriage.storage import database_logger as _dblog
+
+# tests/ ON sys.path SO THE SHARED HARNESS IMPORTS. There is no __init__.py in
+# tests/ -- deliberately, so the directory is not a package and nothing ships
+# it -- so a sibling import needs the directory itself on the path.
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+
+# THE SHARED OPERATOR-CONTROL HARNESS (the consolidation pass): the closed-port
+# URL, the deadline waiter and the ONE park protocol. THIS FILE'S ENCODING IS
+# THE ONE THAT SURVIVED -- a PHASE NAME with a "never" sentinel -- because it is
+# the general form and the other two files' booleans are its endpoints. What
+# changed here is only the variable's name: ONC_PARK_PHASE became ONC_PARK, so
+# the three harnesses stop reading two variables with three vocabularies.
+import _control_harness as _harness                            # noqa: E402
 
 # `oncotriage.storage.queries` IS IMPORTED IN SECTION 9, NOT HERE, AND THAT IS
 # A CORRECTION THE REVERT HARNESS FORCED. That module raises a RuntimeError AT
@@ -366,16 +382,16 @@ try:
 
     _runner.STOP_SWITCH.reset()
     with open(_stop_path, "w", encoding="utf-8") as _fh:
-        _fh.write("x" * (_runner.STOP_MESSAGE_MAX_CHARS + 500))
+        _fh.write("x" * (_control.STOP_MESSAGE_MAX_CHARS + 500))
     _long = drive_call(_runner.STOP_SWITCH.poll, where="main pass")
     check("1h  an over-long note is CAPPED and says so in the same string, "
           "rather than an unbounded operator-written value reaching a "
           "structured log field",
           (_long,
            len(_runner.STOP_SWITCH.message or "")
-           > _runner.STOP_MESSAGE_MAX_CHARS,
+           > _control.STOP_MESSAGE_MAX_CHARS,
            str(_runner.STOP_SWITCH.message or "").endswith(
-               f"... [truncated at {_runner.STOP_MESSAGE_MAX_CHARS} characters]"),
+               f"... [truncated at {_control.STOP_MESSAGE_MAX_CHARS} characters]"),
            str(_runner.STOP_SWITCH.message or "").startswith("x" * 50)),
           (True, True, True, True))
 
@@ -393,8 +409,8 @@ try:
           (_huge, len(_runner.STOP_SWITCH.message or ""),
            os.path.getsize(_stop_path) > 1_000_000),
           (True,
-           _runner.STOP_MESSAGE_MAX_CHARS
-           + len(f"... [truncated at {_runner.STOP_MESSAGE_MAX_CHARS} "
+           _control.STOP_MESSAGE_MAX_CHARS
+           + len(f"... [truncated at {_control.STOP_MESSAGE_MAX_CHARS} "
                  f"characters]"),
            True))
 
@@ -511,6 +527,35 @@ try:
            issubclass(_runner.StaleStopSwitch, ValueError)),
           (True, False, False))
 
+    # THIS SWITCH CANNOT BE ARMED, AND THAT IS A LOUD REFUSAL RATHER THAN AN
+    # INHERITED NO-OP (the consolidation pass). The shared base offers `arm`
+    # because the ablation study's sentinel location depends on --db; this one
+    # resolves its own path through `stop_switch_path()` every poll, so a bound
+    # path would be stored and never read. Before the consolidation this class
+    # had no `arm` at all and the call raised AttributeError at the call site,
+    # so inheriting the base's would have turned a loud failure into a caller
+    # believing the switch was watching a file it was not.
+    def _arm_outcome():
+        try:
+            _runner.STOP_SWITCH.arm(str(_stop_path))
+        except TypeError as exc:
+            return ("<raised>", "TypeError", "stop_switch_path" in str(exc))
+        except Exception as exc:                                # noqa: BLE001
+            return ("<raised>", type(exc).__name__, False)
+        return ("<accepted>", None, False)
+
+    check("1m-x the batch runner's stop switch REFUSES to be armed, naming the "
+          "owner that resolves its path instead. The shared base offers `arm` "
+          "for the ablation study, whose sentinel follows --db; inheriting it "
+          "here would store a path this subclass never reads and report "
+          "success -- a silent no-op where there used to be an AttributeError",
+          _arm_outcome(), ("<raised>", "TypeError", True))
+    check("1m-y ...and the refusal left the switch untripped and unbound, so "
+          "it is a refusal rather than a half-applied arm",
+          (_runner.STOP_SWITCH.requested,
+           getattr(_runner.STOP_SWITCH, "_armed_path", "<absent>")),
+          (False, None))
+
     # THE SHUTDOWN-PATH RENDERER. Two callers -- run_batch's interrupt message
     # and the entry point's -- run where a path that cannot resolve would raise
     # INSIDE the handler explaining the interrupt, turning a clean exit into a
@@ -548,17 +593,17 @@ try:
     # again -- after billing that patient -- for a request just withdrawn.
     check("1n  clear_stop_switch() removes it and reports that there WAS one",
           (drive_call(_runner.clear_stop_switch), os.path.exists(_stop_path)),
-          (_runner.STOP_CLEAR_REMOVED, False))
+          (_control.STOP_CLEAR_REMOVED, False))
     check("1n-b ...and reports ABSENT when there was nothing to clear, which "
           "is what lets the entry point say so rather than implying it deleted "
           "something",
-          drive_call(_runner.clear_stop_switch), _runner.STOP_CLEAR_ABSENT)
+          drive_call(_runner.clear_stop_switch), _control.STOP_CLEAR_ABSENT)
     check("1n-b-i the vocabulary is closed and its members are distinct, so a "
           "caller may branch on it exhaustively",
-          (_runner.STOP_CLEAR_OUTCOMES,
-           len(set(_runner.STOP_CLEAR_OUTCOMES))),
-          ((_runner.STOP_CLEAR_REMOVED, _runner.STOP_CLEAR_ABSENT,
-            _runner.STOP_CLEAR_FAILED), 3))
+          (_control.STOP_CLEAR_OUTCOMES,
+           len(set(_control.STOP_CLEAR_OUTCOMES))),
+          ((_control.STOP_CLEAR_REMOVED, _control.STOP_CLEAR_ABSENT,
+            _control.STOP_CLEAR_FAILED), 3))
 
     # ── A DIRECTORY THE RUN CAN READ AND CANNOT WRITE ──────────────────────
     #
@@ -596,7 +641,7 @@ try:
             check("1n-e clear_stop_switch() REPORTS the failure instead of "
                   "raising, so the operator gets a diagnosis rather than a "
                   "traceback printed instead of their run",
-                  _outcome, _runner.STOP_CLEAR_FAILED)
+                  _outcome, _control.STOP_CLEAR_FAILED)
             check("1n-f ...and the sentinel is still there, which is why the "
                   "outcome may not be reported as ABSENT",
                   os.path.exists(_ro_stop), True)
@@ -860,7 +905,7 @@ check("1t  the real process_patient was restored BY IDENTITY, and "
 # build_bm25_index_from_qdrant fails and main() exits before Stage 5 exists.
 #
 # THE PARKING IS PHASE-KEYED, and that is what makes three different scenarios
-# out of one harness. A worker parks only in the phase named by ONC_PARK_PHASE,
+# out of one harness. A worker parks only in the phase named by ONC_PARK,
 # so the main pass can be driven to completion before a stop is asked for in the
 # RESAMPLE pass. Parking rather than sleeping is the sigterm file's measured
 # lesson: a queued patient can only start once a running one returns, so while
@@ -869,6 +914,12 @@ check("1t  the real process_patient was restored BY IDENTITY, and "
 
 _HOOK = r"""
 import os, sys, threading, time
+
+# tests/ IS ON PYTHONPATH BESIDE THIS HOOK, so the shared harness is an ordinary
+# import. It imports nothing from the project, which is required rather than
+# tidy: this file runs at INTERPRETER STARTUP and an `oncotriage` import here
+# would change what the process under test had loaded before its own first line.
+import _control_harness as _h
 
 from oncotriage.batch import runner as R
 from oncotriage import paths as P
@@ -906,10 +957,7 @@ P._RESOLVED["inferences_path"] = os.environ["ONC_DB"]
 P._RESOLVED["checkpoint_path"] = os.environ["ONC_CP"] + os.sep
 
 _STARTED = os.environ["ONC_STARTED"]
-_READY = os.environ["ONC_READY"]
-_RELEASE = os.environ["ONC_RELEASE"]
-_PARK = os.environ["ONC_PARK_PHASE"]
-_CAP = float(os.environ["ONC_CAP"])
+_PARK = os.environ[_h.ENV_PARK]
 _lock = threading.Lock()
 
 
@@ -931,13 +979,13 @@ def _patient(fhir_path=None, graph=None, is_resample=False, run_id=None,
         with open(_STARTED, "a") as fh:
             fh.write(phase + "\t" + name + "\n")
         n = sum(1 for line in open(_STARTED) if line.startswith(_PARK + "\t"))
-    if _PARK != "none" and phase == _PARK:
-        if n == 1:
-            with open(_READY, "w") as fh:
-                fh.write("go")
-        _deadline = time.time() + _CAP
-        while not os.path.exists(_RELEASE) and time.time() < _deadline:
-            time.sleep(0.01)
+    # ONE PARK PROTOCOL, in tests/_control_harness.py. THIS harness is the one
+    # that needs the phase form: the batch runner has two passes and a stop must
+    # be measurable in each separately, so `park` compares the worker's phase
+    # against ONC_PARK and "none" means never. The arrival number counts only
+    # the PARKED phase's lines, so the ready file appears on the first worker of
+    # that phase rather than on the first worker of the run.
+    _h.park(phase, arrival=n)
 
     # THE REAL log_inference AND THE REAL LEDGER, AND THAT IS NOT DECORATION.
     # The reconciliation is the shipped exit code: with no write attempted at
@@ -1034,17 +1082,17 @@ def drive(root, *, park="none", action=None, args=(), repo=None, patients=40,
         "ONC_DB": db,
         "ONC_CP": cp,
         "ONC_STARTED": started,
-        "ONC_READY": ready,
-        "ONC_RELEASE": release,
-        "ONC_PARK_PHASE": park,
-        "ONC_CAP": "150",
         "ONC_HOOK_MARKER": hook_marker,
         "ONCOTRIAGE_DEFER_LOCAL_MODELS": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
-        "PYTHONPATH": os.pathsep.join([_HOOK_DIR, repo or _REPO]),
+        # The hook dir FIRST so `usercustomize` resolves to ours, then tests/
+        # so the hook's `import _control_harness` is ordinary, then the tree
+        # under test.
+        "PYTHONPATH": os.pathsep.join([_HOOK_DIR, _TESTS_DIR, repo or _REPO]),
         # THE NO-SPEND BACKSTOP that does not depend on the hook working.
-        "ONCOTRIAGE_QDRANT_URL": "http://127.0.0.1:1",
+        "ONCOTRIAGE_QDRANT_URL": _harness.CLOSED_PORT_URL,
     })
+    env.update(_harness.park_env(park, ready, release, cap=150))
     env.pop("PYTHONNOUSERSITE", None)
 
     def _count(phase):
@@ -1063,14 +1111,11 @@ def drive(root, *, park="none", action=None, args=(), repo=None, patients=40,
             return ""
 
     def _wait(predicate, seconds):
-        deadline = time.time() + seconds
-        while time.time() < deadline:
-            if predicate():
-                return True
-            if proc.poll() is not None:
-                return predicate()
-            time.sleep(0.02)
-        return predicate()
+        # THE SHARED WAITER, and `alive` is the half that is easy to forget: a
+        # wait for a marker a DEAD process was never going to write burns the
+        # whole timeout before answering. See _control_harness.wait_for.
+        return _harness.wait_for(predicate, seconds,
+                                 alive=lambda: proc.poll() is None)
 
     saturated = None
     acted = False
@@ -1097,8 +1142,8 @@ def drive(root, *, park="none", action=None, args=(), repo=None, patients=40,
                         acted = True
                         handler_entered = _wait(
                             lambda: _MARK_SIGINT in _log_text(), 30)
-            with open(release, "w", encoding="utf-8") as handle:
-                handle.write("go")
+            # THE SHARED RELEASE GESTURE. See tests/_control_harness.py.
+            _harness.release_park(release)
             if action == "stop":
                 handler_entered = _wait(
                     lambda: _MARK_STOP in _log_text(), 60)

@@ -116,8 +116,23 @@ import tempfile
 import time
 
 import oncotriage
+from oncotriage import control as _control               # noqa: E402
 from oncotriage import paths as _paths
 from oncotriage.batch import runner as _runner
+
+# tests/ ON sys.path SO THE SHARED HARNESS IMPORTS. There is no __init__.py in
+# tests/ -- deliberately, so the directory is not a package and nothing ships
+# it -- so a sibling import needs the directory itself on the path.
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+
+# THE SHARED OPERATOR-CONTROL HARNESS (the consolidation pass): the closed-port
+# URL, the deadline waiter and the ONE park protocol that replaced three
+# incompatible ONC_PARK encodings. Two of the three read the SAME variable with
+# different vocabularies -- "1"/"0" here and "yes"/"no" in the ablation file --
+# so a hook copied between them would have parked on "no".
+import _control_harness as _harness                            # noqa: E402
 
 
 #------------------------------------------------------------------------------
@@ -130,6 +145,18 @@ _RUNNER_PATH = os.path.abspath(_runner.__file__)
 _ENTRY_PATH = os.path.join(_REPO, "25- Batch Runner.py")
 
 _RUNNER_SRC = open(_RUNNER_PATH, encoding="utf-8").read()
+
+# THE LOCK MECHANISM MOVED TO oncotriage/control.py (the consolidation pass) AND
+# THE STRUCTURAL CHECKS BELOW MOVED WITH IT. They are about the same code -- the
+# 0700 directory, the O_NOFOLLOW open, the never-unlinked file -- which now has
+# ONE owner instead of three; asserting them against the runner's source would
+# be a walk that finds nothing and passes, which is the shape this file's own
+# non-degeneracy probes exist to catch. The runner's `exclusive_run_lock` is
+# still checked here for what it still decides: its key, its two exception
+# classes and the field its record names.
+_CONTROL_PATH = os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(_runner.__file__))), "control.py")
+_CONTROL_SRC = open(_CONTROL_PATH, encoding="utf-8").read()
 _ENTRY_SRC = open(_ENTRY_PATH, encoding="utf-8").read()
 _SHA_RUNNER_BEFORE = hashlib.sha256(_RUNNER_SRC.encode("utf-8")).hexdigest()
 _SHA_ENTRY_BEFORE = hashlib.sha256(_ENTRY_SRC.encode("utf-8")).hexdigest()
@@ -238,8 +265,8 @@ check("1b-b ...specifically in a PER-USER subdirectory of the system temp "
       "start would O_CREAT through it and ftruncate the target to zero. The "
       "sticky bit does not help: it stops one user DELETING another's file, "
       "not creating one at an unclaimed name",
-      (os.path.dirname(os.path.abspath(_PATH_A)), _runner.lock_directory()),
-      (_runner.lock_directory(),
+      (os.path.dirname(os.path.abspath(_PATH_A)), _control.lock_directory()),
+      (_control.lock_directory(),
        os.path.join(tempfile.gettempdir(), f"oncotriage-{os.getuid()}")))
 def _creating_calls(module_src, function_name):
     """The directory-creating calls in one top-level function, by name."""
@@ -260,13 +287,21 @@ check("1b-c ...and lock_directory() is PURE -- asking for the path creates "
       "refusal line, a test -- must not bring a directory into existence by "
       "asking. The second half is the non-degeneracy probe: without it a walk "
       "that found nothing anywhere would pass",
-      (_creating_calls(_RUNNER_SRC, "lock_directory"),
-       _creating_calls(_RUNNER_SRC, "ensure_lock_directory")),
+      (_creating_calls(_CONTROL_SRC, "lock_directory"),
+       _creating_calls(_CONTROL_SRC, "ensure_lock_directory")),
       ([], ["makedirs"]))
-check("1b-c2 ...and exclusive_run_lock DOES ensure it, or the first run on a "
-      "fresh machine would meet ENOENT rather than a lock",
-      _creating_calls(_RUNNER_SRC, "exclusive_run_lock"),
-      ["ensure_lock_directory"])
+check("1b-c2 ...and the acquisition DOES ensure it, or the first run on a "
+      "fresh machine would meet ENOENT rather than a lock. Two frames now: "
+      "the runner's exclusive_run_lock delegates to control's "
+      "hold_exclusive_lock, which is what calls it",
+      (sorted({getattr(c.func, "attr", getattr(c.func, "id", None))
+               for c in ast.walk(next(
+                   n for n in ast.walk(ast.parse(_RUNNER_SRC))
+                   if isinstance(n, ast.FunctionDef)
+                   and n.name == "exclusive_run_lock"))
+               if isinstance(c, ast.Call)} & {"hold_exclusive_lock"}),
+       _creating_calls(_CONTROL_SRC, "hold_exclusive_lock")),
+      (["hold_exclusive_lock"], ["ensure_lock_directory"]))
 check("1b-d ...and the directory is named by the UID rather than by the login "
       "name. getpass.getuser() reads LOGNAME/USER/LNAME/USERNAME before the "
       "password database, all four settable by the process asking -- so a "
@@ -274,9 +309,9 @@ check("1b-d ...and the directory is named by the UID rather than by the login "
       "whenever those differed between invocations (a cron entry beside an "
       "interactive shell), and two namespaces for one checkpoint directory is "
       "the double bill this lock exists to prevent",
-      (os.path.basename(_runner.lock_directory()),
+      (os.path.basename(_control.lock_directory()),
        os.environ.get("USER", "") in os.path.basename(
-           _runner.lock_directory()) and bool(os.environ.get("USER"))),
+           _control.lock_directory()) and bool(os.environ.get("USER"))),
       (f"oncotriage-{os.getuid()}", False))
 check("1c  a trailing separator does not make a different lock -- "
       "paths.checkpoint_path resolves WITH one and a caller may pass either",
@@ -348,8 +383,8 @@ check("1g  THE FILE IS NEVER DELETED, and that is the mechanism rather than "
       "a third still held the old one",
       os.path.exists(_PATH_A), True)
 _LOCK_FN = next(
-    (n for n in ast.walk(ast.parse(_RUNNER_SRC))
-     if isinstance(n, ast.FunctionDef) and n.name == "exclusive_run_lock"),
+    (n for n in ast.walk(ast.parse(_CONTROL_SRC))
+     if isinstance(n, ast.FunctionDef) and n.name == "hold_exclusive_lock"),
     None)
 check("1g-b ...and the lock function REMOVES NOTHING: no `remove`, `unlink`, "
       "`rmtree` or `replace` anywhere in its body, whatever the argument is "
@@ -391,7 +426,7 @@ check("1i  a record that could not be parsed is still REPORTED rather than "
 check("1j  EXIT_LOCKED does not collide with anything this entry point "
       "already returns: 0/1/2 are the reconciliation verdict, 130 is Ctrl-C "
       "and 143 is SIGTERM",
-      (_runner.EXIT_LOCKED, _runner.EXIT_LOCKED in (0, 1, 2, 130, 143)),
+      (_control.EXIT_LOCKED, _control.EXIT_LOCKED in (0, 1, 2, 130, 143)),
       (3, False))
 
 
@@ -409,6 +444,12 @@ check("1j  EXIT_LOCKED does not collide with anything this entry point "
 
 _HOOK = r"""
 import os, sys, threading, time
+
+# tests/ IS ON PYTHONPATH BESIDE THIS HOOK, so the shared harness is an ordinary
+# import. It imports nothing from the project, which is required rather than
+# tidy: this file runs at INTERPRETER STARTUP and an `oncotriage` import here
+# would change what the process under test had loaded before its own first line.
+import _control_harness as _h
 
 from oncotriage.batch import runner as R
 from oncotriage import paths as P
@@ -442,10 +483,6 @@ P._RESOLVED["inferences_path"] = os.environ["ONC_DB"]
 P._RESOLVED["checkpoint_path"] = os.environ["ONC_CP"] + os.sep
 
 _STARTED = os.environ["ONC_STARTED"]
-_READY = os.environ["ONC_READY"]
-_RELEASE = os.environ["ONC_RELEASE"]
-_PARK = os.environ["ONC_PARK"] == "1"
-_CAP = float(os.environ["ONC_CAP"])
 _lock = threading.Lock()
 
 
@@ -463,13 +500,12 @@ def _patient(fhir_path=None, graph=None, is_resample=False, run_id=None,
         with open(_STARTED, "a") as fh:
             fh.write(phase + "\t" + name + "\n")
         n = sum(1 for _ in open(_STARTED))
-    if _PARK:
-        if n == 1:
-            with open(_READY, "w") as fh:
-                fh.write("go")
-        _deadline = time.time() + _CAP
-        while not os.path.exists(_RELEASE) and time.time() < _deadline:
-            time.sleep(0.01)
+    # ONE PARK PROTOCOL, in tests/_control_harness.py. This harness has one
+    # phase and either parks every worker or none, so the parent passes
+    # PARK_ALL or PARK_NONE; the arrival number is what makes the ready file
+    # appear exactly once, on the FIRST worker, so the parent waits for
+    # saturation instead of sleeping.
+    _h.park(_h.PARK_ALL, arrival=n)
 
     _row = {"patient_id": name, "status": "success", "eligible_matches": [],
             "near_misses": [], "not_evaluable_trials": 0,
@@ -551,16 +587,19 @@ class Run:
             "ONC_CP": self.cp,
             "ONC_STARTED": self.started,
             "ONC_READY": self.ready,
-            "ONC_RELEASE": self.release,
-            "ONC_PARK": "1" if self.park else "0",
-            "ONC_CAP": "120",
             "ONC_HOOK_MARKER": self.marker,
             "ONCOTRIAGE_DEFER_LOCAL_MODELS": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
-            "PYTHONPATH": os.pathsep.join([_HOOK_DIR, _REPO]),
+            # The hook dir FIRST so `usercustomize` resolves to ours, then
+            # tests/ so the hook's `import _control_harness` is ordinary, then
+            # the tree under test.
+            "PYTHONPATH": os.pathsep.join([_HOOK_DIR, _TESTS_DIR, _REPO]),
             # THE NO-SPEND BACKSTOP that does not depend on the hook working.
-            "ONCOTRIAGE_QDRANT_URL": "http://127.0.0.1:1",
+            "ONCOTRIAGE_QDRANT_URL": _harness.CLOSED_PORT_URL,
         })
+        env.update(_harness.park_env(
+            _harness.PARK_ALL if self.park else _harness.PARK_NONE,
+            self.ready, self.release))
         env.pop("PYTHONNOUSERSITE", None)
         return env
 
@@ -573,21 +612,18 @@ class Run:
         return self
 
     def wait_for(self, predicate, seconds):
-        deadline = time.time() + seconds
-        while time.time() < deadline:
-            if predicate():
-                return True
-            if self.proc.poll() is not None:
-                return predicate()
-            time.sleep(0.02)
-        return predicate()
+        # THE SHARED WAITER, and `alive` is the half that is easy to forget: a
+        # wait for a marker a DEAD process was never going to write burns the
+        # whole timeout before answering. See _control_harness.wait_for.
+        return _harness.wait_for(predicate, seconds,
+                                 alive=lambda: self.proc.poll() is None)
 
     def wait_saturated(self, seconds=90):
         return self.wait_for(lambda: os.path.exists(self.ready), seconds)
 
     def let_go(self):
-        with open(self.release, "w", encoding="utf-8") as handle:
-            handle.write("go")
+        # THE SHARED RELEASE GESTURE. See tests/_control_harness.py.
+        _harness.release_park(self.release)
 
     def join(self, timeout=180):
         try:
@@ -695,7 +731,7 @@ check("3a-b the stand-in hook installed in the first run (non-degeneracy: an "
       os.path.exists(_FIRST.marker), True)
 check("3b  *** THE SECOND RUN IS REFUSED WITH EXIT 3. *** Not queued, not run "
       "later: refused, immediately, while the first still holds the lock",
-      _SECOND.exit, _runner.EXIT_LOCKED)
+      _SECOND.exit, _control.EXIT_LOCKED)
 check("3c  *** AND IT STARTED NO PATIENT. *** That is the whole finding in "
       "one number: before the lock, both runs processed the SAME patients at "
       "one live Stage 5 call each",
@@ -826,7 +862,7 @@ check("5f  *** AND A REAL RUN THROUGH THE SYMLINK IS REFUSED WITH EXIT 3 "
       "WHILE THE HOLDER IS LIVE. *** Driven as a second process against the "
       "first, which is the only form in which the flock is the thing being "
       "measured",
-      _VIA_LINK.exit, _runner.EXIT_LOCKED)
+      _VIA_LINK.exit, _control.EXIT_LOCKED)
 check("5f-b *** AND IT STARTED NO PATIENT. *** The cost proof: before this, "
       "both processes ran the same cohort at one live Stage 5 call each",
       len(_VIA_LINK.started_patients), 0)
@@ -1240,8 +1276,8 @@ check("8b  LockUnavailable is NOT an OSError, and that is the whole reason "
 check("8b-b ...and the two exit codes stay distinct: 3 means another copy is "
       "running, which a supervisor may wait out; 1 means the lock could not "
       "be opened, which waiting never fixes",
-      (_runner.EXIT_LOCKED, _runner.EXIT_LOCK_UNAVAILABLE,
-       _runner.EXIT_LOCKED == _runner.EXIT_LOCK_UNAVAILABLE),
+      (_control.EXIT_LOCKED, _runner.EXIT_LOCK_UNAVAILABLE,
+       _control.EXIT_LOCKED == _runner.EXIT_LOCK_UNAVAILABLE),
       (3, 1, False))
 
 # --- an unopenable directory, in process ----------------------------------
@@ -1269,7 +1305,7 @@ check("8c-b the diagnosis names the path, the errno NUMERICALLY AND "
       "billed",
       ("/tmp/x.lock" in _diag_text, "13" in _diag_text,
        "EACCES" in _diag_text,
-       _runner.lock_directory() in _diag_text,
+       _control.lock_directory() in _diag_text,
        "NOTHING HAS BEEN RUN AND NOTHING HAS BEEN BILLED" in _diag_text),
       (True, True, True, True, True))
 check("8c-c ...and it says in as many words that this is NOT 'another run "
@@ -1283,7 +1319,7 @@ check("8d  ensure_lock_directory REFUSES a lock directory that is group- or "
       "by anybody re-opens the substitution the per-user directory closes, "
       "and chmod-ing somebody else's directory is not this program's business",
       sorted({n.func.attr for n in ast.walk(next(
-          n for n in ast.walk(ast.parse(_RUNNER_SRC))
+          n for n in ast.walk(ast.parse(_CONTROL_SRC))
           if isinstance(n, ast.FunctionDef)
           and n.name == "ensure_lock_directory"))
           if isinstance(n, ast.Call) and getattr(n.func, "attr", None)
@@ -1368,16 +1404,16 @@ check("8g-c ...and the clock it is taken from is gmtime, asserted at the "
       "second half is the non-degeneracy probe, because a walk that found no "
       "strftime at all would otherwise report an empty set as clean",
       sorted({ast.unparse(a) for n in ast.walk(next(
-          x for x in ast.walk(ast.parse(_RUNNER_SRC))
+          x for x in ast.walk(ast.parse(_CONTROL_SRC))
           if isinstance(x, ast.FunctionDef)
-          and x.name == "exclusive_run_lock"))
+          and x.name == "hold_exclusive_lock"))
           if isinstance(n, ast.Call)
           and getattr(n.func, "attr", None) == "strftime"
           for a in n.args}),
       ["'%Y-%m-%dT%H:%M:%SZ'", "time.gmtime()"])
 
 # --- F13: the truncation guard tests the STRIPPED text --------------------
-_CAP = _runner.STOP_MESSAGE_MAX_CHARS
+_CAP = _control.STOP_MESSAGE_MAX_CHARS
 
 
 def _stop_note(content):
@@ -1437,7 +1473,7 @@ check("8h-g NEGATIVE CONTROL: the pre-fix predicate, evaluated here on the "
 # dropped, silently, in the closing block, which is the only place the note is
 # ever read. That is a worse defect than the one being fixed: over-reporting a
 # cut is noise, hiding one is a lost operator instruction.
-_PROBE = _runner.STOP_MESSAGE_TAIL_PROBE_CHARS
+_PROBE = _control.STOP_MESSAGE_TAIL_PROBE_CHARS
 _n_boundary = _stop_note("c" * _CAP + " " + "d" * 50)
 _n_ws_tail = _stop_note("e" * _CAP + " " * (_PROBE // 2))
 _n_ws_past = _stop_note("f" * _CAP + " " * (_PROBE + 50))

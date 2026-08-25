@@ -119,13 +119,16 @@ except ImportError:
     del _candidate, _how
 
 from oncotriage.agent.evaluation import request_stage5_shutdown
+# THE SHARED CONTROL VOCABULARY IS IMPORTED FROM ITS OWNER (the consolidation
+# pass), NOT RE-EXPORTED BY THE RUNNER. EXIT_LOCKED and the three STOP_CLEAR_*
+# outcomes are facts about the mechanism and are the same in every program that
+# has one; EXIT_LOCK_UNAVAILABLE is NOT, because its value is read off THIS
+# entry point's own exit vocabulary, so it stays with the runner.
+from oncotriage.control import EXIT_LOCKED, STOP_CLEAR_ABSENT, STOP_CLEAR_FAILED
 from oncotriage.batch.runner import (
     AlreadyRunning,
     EXIT_LOCK_UNAVAILABLE,
-    EXIT_LOCKED,
     LockUnavailable,
-    STOP_CLEAR_ABSENT,
-    STOP_CLEAR_FAILED,
     StaleStopSwitch,
     assert_no_stale_stop_switch,
     clear_checkpoint,

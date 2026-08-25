@@ -187,9 +187,24 @@ rewriting `oncotriage/` in place.
     THEY ARE COPIED, NOT IMPORTED, and that is this file's own recorded design:
     it imports NOTHING from the project so that it still reports a missing test
     file rather than dying on an ImportError when the package is what is broken.
-    The cost is that the two can drift, and that is paid for by
-    `tests/test_serial_runner_lock.py`, which asserts the four properties HERE
-    rather than assuming they came across.
+    That argument was RE-READ rather than inherited when the consolidation pass
+    moved the mechanism into `oncotriage/control.py`: half of it dissolved --
+    that module imports nothing from the project, so it drags no graph in -- and
+    half of it did not, because `import oncotriage.control` still executes
+    `oncotriage/__init__.py` and still needs the package on `sys.path`, which
+    this launcher deliberately does not arrange. Loading it by location is
+    closed too: `tests/test_package_invariants.py` section 1c forbids that
+    unconditionally.
+
+    THE COPY IS NO LONGER UNPINNED. `tests/test_serial_runner_lock.py` section
+    9 compares `lock_directory` and `ensure_lock_directory` against
+    `oncotriage/control.py`'s by AST and asserts the acquisition's mechanism
+    fact by fact, with nine planted controls. That comparison is why those two
+    functions carry a `-> str` annotation the rest of this file does not: it is
+    the ONE difference that had to go so the comparison could be equality
+    rather than equality-with-a-tolerance, and a tolerance is a place drift
+    hides. Sections 1-8 still assert the four hardenings HERE, because the
+    pin says the two AGREE and only those sections say what they agree ON.
 
 EVERY EXIT CODE IS REPORTED, and the run does not stop at the first failure --
 each of the five leaves its own tree in the state it found it, so a failure in
@@ -318,7 +333,7 @@ secret.
 """
 
 
-def lock_directory():
+def lock_directory() -> str:
     """Where this user's lock files live. PURE -- it creates nothing.
 
     `ensure_lock_directory()` is the one that creates. The split is the
@@ -364,7 +379,7 @@ def lock_directory():
     return os.path.join(tempfile.gettempdir(), f"oncotriage-{os.getuid()}")
 
 
-def ensure_lock_directory():
+def ensure_lock_directory() -> str:
     """Create the lock directory if absent, verify it, and return it.
 
     RAISES `OSError`. The only caller is `exclusive_run_lock`, which converts it

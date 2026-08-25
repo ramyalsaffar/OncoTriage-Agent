@@ -106,10 +106,14 @@ except ImportError:
     del _candidate, _how
 
 from oncotriage.agent.evaluation import request_stage5_shutdown
+# THE SHARED CONTROL VOCABULARY IS IMPORTED FROM ITS OWNER (the consolidation
+# pass), NOT RE-EXPORTED BY THE STUDY. EXIT_LOCKED is a fact about the
+# mechanism and is 3 in every program that has one; EXIT_LOCK_UNAVAILABLE is NOT,
+# because its value is read off THIS entry point's own exit vocabulary.
+from oncotriage.control import EXIT_LOCKED
 from oncotriage.ablation.study import (
     AlreadyRunning,
     EXIT_LOCK_UNAVAILABLE,
-    EXIT_LOCKED,
     LockUnavailable,
     exclusive_run_lock,
     lock_unavailable_lines,

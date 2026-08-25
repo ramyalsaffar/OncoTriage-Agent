@@ -153,6 +153,21 @@ import oncotriage
 from oncotriage.batch import runner as _runner
 from oncotriage.config import MAX_WORKERS
 
+# tests/ ON sys.path SO THE SHARED HARNESS IMPORTS. There is no __init__.py in
+# tests/ -- deliberately, so the directory is not a package and nothing ships
+# it -- so a sibling import needs the directory itself on the path.
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+
+# THE SHARED OPERATOR-CONTROL HARNESS (the consolidation pass): the closed-port
+# URL, the deadline waiter and the ONE park protocol that replaced three
+# incompatible ONC_PARK encodings. See its docstring for why each was worth
+# moving; the short version is that two of the three read the SAME variable
+# with different vocabularies, so a hook copied from one file into the other
+# would park on "no".
+import _control_harness as _harness                            # noqa: E402
+
 
 #------------------------------------------------------------------------------
 
@@ -544,6 +559,13 @@ if _handler_fn is not None:
 _HOOK = r"""
 import os, sys, threading, time
 
+# tests/ IS ON PYTHONPATH BESIDE THIS HOOK, so the shared harness is an
+# ordinary import. It imports nothing from the project, which is required
+# rather than tidy: this file runs at INTERPRETER STARTUP, before the entry
+# point under test has executed a line, and an `oncotriage` import here would
+# change what the process had already loaded before its own first statement.
+import _control_harness as _h
+
 # The repo is on PYTHONPATH beside this hook, so this import is an ordinary one.
 from oncotriage.batch import runner as R
 from oncotriage import paths as P
@@ -574,9 +596,6 @@ P._RESOLVED["inferences_path"] = os.environ["ONC_DB"]
 P._RESOLVED["checkpoint_path"] = os.environ["ONC_CP"] + os.sep
 
 _STARTED = os.environ["ONC_STARTED"]
-_READY = os.environ["ONC_READY"]
-_RELEASE = os.environ["ONC_RELEASE"]
-_CAP = float(os.environ["ONC_CAP"])
 _lock = threading.Lock()
 
 
@@ -601,12 +620,11 @@ def _patient(fhir_path=None, graph=None, is_resample=False, run_id=None,
         with open(_STARTED, "a") as fh:
             fh.write(name + "\n")
         n = sum(1 for _ in open(_STARTED))
-    if n == 1:
-        with open(_READY, "w") as fh:
-            fh.write("go")
-    _deadline = time.time() + _CAP
-    while not os.path.exists(_RELEASE) and time.time() < _deadline:
-        time.sleep(0.01)
+    # ONE PARK PROTOCOL, in tests/_control_harness.py. This harness has a single
+    # phase and parks every worker, so it asks for PARK_ALL; the arrival number
+    # is what makes the ready file appear exactly once, on the FIRST worker, so
+    # the parent waits for saturation instead of sleeping.
+    _h.park(_h.PARK_ALL, arrival=n)
     # ── WAS STAGE 5 TOLD TO STOP WHILE THIS WORKER WAS STILL ALIVE ────────
     #
     # THE ONLY MOMENT THE QUESTION CAN BE ASKED. This stand-in stands where
@@ -710,21 +728,20 @@ def drive(name, *, sig, repo=None, patients=40, timeout=180, double=False):
         "ONC_CP": cp,
         "ONC_STARTED": started,
         "ONC_SHUTDOWN_LOG": shutdown_log,
-        "ONC_READY": ready,
-        "ONC_RELEASE": release,
-        "ONC_CAP": "120",
         "ONC_HOOK_MARKER": hook_marker,
         "ONCOTRIAGE_DEFER_LOCAL_MODELS": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
-        # The hook dir FIRST so `usercustomize` resolves to ours, then the tree
-        # under test so the hook's own `from oncotriage...` import is ordinary.
-        "PYTHONPATH": os.pathsep.join([_HOOK_DIR, repo or _REPO]),
+        # The hook dir FIRST so `usercustomize` resolves to ours, then tests/
+        # so the hook's `import _control_harness` is ordinary, then the tree
+        # under test so its `from oncotriage...` imports are too.
+        "PYTHONPATH": os.pathsep.join([_HOOK_DIR, _TESTS_DIR, repo or _REPO]),
         # THE NO-SPEND BACKSTOP, and it does not depend on the hook working: a
         # closed port means an UNSTUBBED build_bm25_index_from_qdrant fails and
         # main() exits before Stage 5 exists. On the stubbed path this variable
         # is never read.
-        "ONCOTRIAGE_QDRANT_URL": "http://127.0.0.1:1",
+        "ONCOTRIAGE_QDRANT_URL": _harness.CLOSED_PORT_URL,
     })
+    env.update(_harness.park_env(_harness.PARK_ALL, ready, release))
     env.pop("PYTHONNOUSERSITE", None)
 
     def _count_started():
@@ -742,14 +759,11 @@ def drive(name, *, sig, repo=None, patients=40, timeout=180, double=False):
             return ""
 
     def _wait(predicate, seconds):
-        deadline = time.time() + seconds
-        while time.time() < deadline:
-            if predicate():
-                return True
-            if proc.poll() is not None:
-                return predicate()
-            time.sleep(0.02)
-        return predicate()
+        # THE SHARED WAITER, and `alive` is the half that is easy to forget: a
+        # wait for a marker a DEAD process was never going to write burns the
+        # whole timeout before answering. See _control_harness.wait_for.
+        return _harness.wait_for(predicate, seconds,
+                                 alive=lambda: proc.poll() is None)
 
     signalled = False
     handler_entered = None
@@ -790,9 +804,11 @@ def drive(name, *, sig, repo=None, patients=40, timeout=180, double=False):
                     # barrier rather than raced for.
                     proc.send_signal(sig)
                     _wait(lambda: proc.poll() is not None, 30)
-            # 5: release.
-            with open(release, "w", encoding="utf-8") as handle:
-                handle.write("go")
+            # 5: release. THE SHARED GESTURE, so no caller invents a second
+            # -- the parked child in tests/_control_harness.py:park() tests for
+            # this file's EXISTENCE, and a release written some other way that
+            # happened not to create it would hang every worker for the cap.
+            _harness.release_park(release)
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
@@ -1227,17 +1243,36 @@ check("3b-i ...and main() CLEARS it, so a second main() in one process does "
              if isinstance(n, ast.FunctionDef)
              and _calls_named(n, "clear_stage5_shutdown")),
       ["main"])
+# THE FOURTH FUNCTION MOVED (the consolidation pass) AND THE WALK MOVED WITH
+# IT. `cancel_queued` is `oncotriage/control.py`'s now, and `poll` is
+# `control.StopSwitch`'s -- so a walk over the runner alone would find two of
+# the four, report an empty list, and PASS while asserting nothing about the
+# two that moved. Both trees are walked; 3b-j2 is the non-degeneracy probe that
+# says all four were actually found, without which the whole check is again
+# satisfied by finding nothing.
+_SHUTDOWN_PINNED = ("poll", "_start_patient_unless_stopped",
+                    "assert_no_stale_stop_switch", "cancel_queued")
+_SHUTDOWN_TREES = (_RUNNER_TREE, ast.parse(open(
+    os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(_runner.__file__))), "control.py"),
+    encoding="utf-8").read()))
+_SHUTDOWN_FOUND = [n for _t in _SHUTDOWN_TREES for n in ast.walk(_t)
+                   if isinstance(n, ast.FunctionDef)
+                   and n.name in _SHUTDOWN_PINNED]
 check("3b-j the OPERATOR STOP SENTINEL deliberately does NOT set it. STOP "
       "promises in-flight patients run to completion, and truncating them "
       "would break that AND cost more -- their paid round is discarded and "
       "the resume re-bills the whole patient. Pinned so the third gesture "
       "cannot acquire the flag by a later edit that looks tidy",
-      [n.name for n in ast.walk(_RUNNER_TREE)
-       if isinstance(n, ast.FunctionDef)
-       and n.name in ("poll", "_start_patient_unless_stopped",
-                      "assert_no_stale_stop_switch", "_cancel_queued")
-       and _calls_named(n, "request_stage5_shutdown")],
+      [n.name for n in _SHUTDOWN_FOUND
+       if _calls_named(n, "request_stage5_shutdown")],
       [])
+check("3b-j2 ...and all four were actually found across the two modules, so "
+      "3b-j is not an empty walk. Two of them now live in "
+      "oncotriage/control.py, which imports NOTHING from the project -- so "
+      "for those two the property is structural rather than pinned: there is "
+      "no request_stage5_shutdown in scope to call",
+      sorted({n.name for n in _SHUTDOWN_FOUND}), sorted(_SHUTDOWN_PINNED))
 
 
 #------------------------------------------------------------------------------

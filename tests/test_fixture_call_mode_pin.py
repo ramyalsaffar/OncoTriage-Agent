@@ -112,6 +112,22 @@ except ImportError:
 from oncotriage import config
 from oncotriage.fixtures import capture as _capture
 
+# tests/ ON sys.path SO THE SHARED HARNESS IMPORTS. There is no __init__.py in
+# tests/ -- deliberately, so the directory is not a package and nothing ships it
+# -- so a sibling import needs the directory itself on the path. It is inserted
+# rather than appended for the reason the package bootstrap above inserts: a
+# same-named module further along the path would otherwise win.
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+
+# THE SHARED OPERATOR-CONTROL HARNESS (the consolidation pass): the closed-port
+# URL, the deadline waiter and the ONE park protocol that replaced three
+# incompatible ONC_PARK encodings. See its docstring for why each was worth
+# moving; the short version is that two of the three read the SAME variable
+# with different vocabularies.
+import _control_harness as _harness                            # noqa: E402
+
 
 # ===========================================================================
 # HARNESS
@@ -795,7 +811,7 @@ def _run_probe(module: str, flag: bool):
     # A CLOSED PORT, so a regression that started opening a client at import
     # fails here instead of reaching a real endpoint. Nothing in this probe
     # should contact Qdrant at all.
-    env["ONCOTRIAGE_QDRANT_URL"] = "http://127.0.0.1:1"
+    env["ONCOTRIAGE_QDRANT_URL"] = _harness.CLOSED_PORT_URL
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     source = _PROBE.format(code_dir=_CODE_DIR, flag=flag, module=module)
     proc = subprocess.run([sys.executable, "-c", source],

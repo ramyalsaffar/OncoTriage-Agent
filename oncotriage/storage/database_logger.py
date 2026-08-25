@@ -691,11 +691,26 @@ INFERENCE_COLUMN_ADDITIONS = {
     # across three calls is equally consistent with a cache that warms after
     # the first request and one that never warms at all, and those have
     # opposite implications for what packing costs. This is the per-call
-    # ledger, JSON, one object per request ISSUED in the order they were
-    # issued, each carrying call_index (1-based), depth, trials,
-    # prompt_tokens, completion_tokens, cached_tokens, reasoning_tokens,
-    # finish_reason and entries_emitted. trial_matches.call_index joins to it
-    # by equality.
+    # ledger, JSON, one object per request ISSUED, each carrying call_index
+    # (1-based), depth, trials, prompt_tokens, completion_tokens,
+    # cached_tokens, reasoning_tokens, finish_reason and entries_emitted.
+    # trial_matches.call_index joins to it by equality.
+    #
+    #   WHAT `call_index` ORDERS BY IS NOT THE SAME QUESTION IN BOTH ARMS, and
+    #   this used to say "in the order they were issued" flatly, which is true
+    #   of one of them. GROUPED mode issues one request, waits for it, counts
+    #   it and issues the next, so ISSUE order and ACCOUNTING order are one
+    #   sequence. PER-TRIAL mode submits every trial call to a thread pool up
+    #   front and then consumes the responses in the order the node ASKS for
+    #   them -- the pending LIFO's pop order, which is packing order -- so
+    #   call_index follows the ACCOUNTING order and the order the requests
+    #   actually reached the provider is the pool's and is not recorded
+    #   anywhere. It is deterministic in both arms, which is what the join to
+    #   trial_matches.call_index needs; what it is NOT, on the per-trial arm,
+    #   is a wire-order timeline. Reading two adjacent per-trial rows as "this
+    #   one went out before that one" is the misreading this paragraph exists
+    #   to prevent -- and it is the reading that matters, because whether the
+    #   cache warms is a question about what went out first.
     #
     #   details NULL = node_llm_classifier_evaluation was never entered. Stage 5
     #                  writes this key on EVERY one of its returns, including

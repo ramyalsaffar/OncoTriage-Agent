@@ -760,7 +760,7 @@ python tests/test_runner_crash_record_and_db_unification.py         #  65
 # than about scheduling -- the first version slept instead and was measured
 # FLAKY under bucket-A load. NOT in the collision matrix. It EXECS NOTHING: the
 # one control is a copy of the package in a temp directory. Bucket A, ~6 s.
-python tests/test_runner_sigterm_shutdown.py                        #  86 (was 75; the pre-migration pass added section 3b, which reads the Stage 5 shutdown flag FROM INSIDE A LIVE WORKER -- the only place the question can be asked -- with an uninterrupted arm as its non-degeneracy control)
+python tests/test_runner_sigterm_shutdown.py                        #  87 (was 86; the consolidation pass rewrote 3b-j's walk to cover BOTH modules -- `cancel_queued` moved to oncotriage/control.py, so a walk over the runner alone found two of four, reported an empty list and PASSED -- and added 3b-j2, its non-degeneracy probe. Before that 75; the pre-migration pass added section 3b, which reads the Stage 5 shutdown flag FROM INSIDE A LIVE WORKER -- the only place the question can be asked -- with an uninterrupted arm as its non-degeneracy control)
 
 # The stop-switch pass. Same shape, same directory. No network, no keys, NO
 # SPEND, no live Qdrant, no model load, no corpus, no git history, no live
@@ -772,7 +772,7 @@ python tests/test_runner_sigterm_shutdown.py                        #  86 (was 7
 # unreachable and the money case cannot be measured), and a successful patient
 # makes the real save_checkpoint resolve the stamp over the wire. NOT in the
 # collision matrix. It EXECS NOTHING. Bucket A, ~14 s.
-python tests/test_runner_stop_switch.py                             # 138 (was 133; the operator-control pass added the read-only-directory diagnosis and the three-member clear vocabulary. Before that 122; the pre-migration pass reversed scenario C -- a stop that lands in the RESAMPLE pass is FINISHED, not STOPPED -- and added section 5b, its control)
+python tests/test_runner_stop_switch.py                             # 140 (was 138; the consolidation pass added 1m-x/1m-y over the batch switch's REFUSAL to be armed -- the shared base offers `arm` for the study, and an inherited no-op would replace an AttributeError with a caller believing the switch watched a file it did not). Before that 133; the operator-control pass added the read-only-directory diagnosis and the three-member clear vocabulary. Before that 122; the pre-migration pass reversed scenario C -- a stop that lands in the RESAMPLE pass is FINISHED, not STOPPED -- and added section 5b, its control)
 
 # The pre-migration pass. Same shape, same directory. No network, no keys, NO
 # SPEND, no live Qdrant, no model load, no corpus, no git history, no live
@@ -784,7 +784,7 @@ python tests/test_runner_stop_switch.py                             # 138 (was 1
 # inside a tempfile.mkdtemp it removes and asserts gone, and the two repository
 # files it reads (batch/runner.py, "25- Batch Runner.py") are sha256-compared at
 # the end. It EXECS NOTHING. Bucket A, ~18 s alone / ~30 s under bucket-A load.
-python tests/test_runner_preflight_and_state_faults.py              # 116 (was 76; the lock-hardening pass added section 8 -- the symlink substitution, the unopenable lock, the UTC record and the stripped truncation guard -- and the symlinked two-process drive in section 5)
+python tests/test_runner_preflight_and_state_faults.py              # 116 (unchanged across the consolidation pass, which repointed five structural checks at oncotriage/control.py -- their subject moved and a walk over the runner would have found nothing and passed. Was 76; the lock-hardening pass added section 8 -- the symlink substitution, the unopenable lock, the UTC record and the stripped truncation guard -- and the symlinked two-process drive in section 5)
 
 # The CI-hygiene pair. Same shape, same directory. Neither imports anything
 # from the package -- their subjects are `.github/scripts/` and
@@ -883,7 +883,7 @@ python tests/test_evaluation_sample_naming.py                       #  72
 # collision matrix; it DOES read oncotriage/config.py, which
 # tests/test_config_snapshot_date_rot.py rewrites, so all three files it reads
 # are sha256-compared at the end. Bucket A, ~4.8 s.
-python tests/test_fixture_call_mode_pin.py                          #  82 (was 81; the default-flip pass found 1c's non-degeneracy probe pinned the LITERAL per_trial, which agrees with the default after the flip -- it pins the OPPOSITE arm, derived, and gained a cleared-pin check)
+python tests/test_fixture_call_mode_pin.py                          #  82 (unchanged across the consolidation pass, which moved its closed-port literal to tests/_control_harness.py. Was 81; the default-flip pass found 1c's non-degeneracy probe pinned the LITERAL per_trial, which agrees with the default after the flip -- it pins the OPPOSITE arm, derived, and gained a cleared-pin check)
 
 # The Bedrock-adapter pass. Same shape, same directory. NO AWS CALL AND NO
 # BILLED CALL OF ANY KIND -- every client is a stand-in installed through
@@ -7024,7 +7024,7 @@ in both directions.
 # process asserting about it and a lock held by one process cannot be observed
 # from inside it. NOT in the collision matrix. It EXECS NOTHING. Bucket A,
 # ~55 s.
-python tests/test_ablation_stop_and_lock.py                       # 142 (was 107; the lock-hardening pass added the symlink-resolved key, the per-user lock directory, the substitution refusal, the UTC record, the stripped truncation guard and a symlinked second real invocation)
+python tests/test_ablation_stop_and_lock.py                       # 143 (was 142; the consolidation pass corrected 3k-b's argument -- half of it dissolved when control.py stopped importing anything from the project -- and added 3k-b2, without which the class separation is equally satisfied by two COPIES of the class, which is what it was. Before that 107; the lock-hardening pass added the symlink-resolved key, the per-user lock directory, the substitution refusal, the UTC record, the stripped truncation guard and a symlinked second real invocation)
 ```
 
 **THE FOREGROUND-SIGNAL LESSON IS CLOSED IN CODE RATHER THAN BY A CONVENTION,
@@ -7931,9 +7931,14 @@ python tests/test_compose_shutdown_grace.py          #  21, ~0.7s. NO DOCKER DAE
                                                     #  landmine with the GROUPED arm's
                                                     #  own worst case, a vocabulary pin
                                                     #  and two controls)
-python tests/test_serial_runner_lock.py              #  85, ~0.5s. REAL concurrent
+python tests/test_serial_runner_lock.py              # 119, ~0.6s. REAL concurrent
                                                      #  subprocesses and a REAL
-                                                     #  symlinked checkout
+                                                     #  symlinked checkout (was 85;
+                                                     #  the consolidation pass added
+                                                     #  section 9, which pins this
+                                                     #  file's COPY against
+                                                     #  oncotriage/control.py by AST
+                                                     #  with eleven planted controls)
 ```
 
 **`tests/test_serial_runner_lock.py` DOES NOT RUN THE REAL SERIAL SUITE**, and
@@ -8238,6 +8243,192 @@ exist and simply start carrying the other member.
 7. **No process memo for a warmup rejection**, so every patient re-discovers it.
    Argued at the dispatch-hardening pass: a transient 400 memoized process-wide
    would disable the warmup for a whole campaign on one hiccup.
+
+
+### One owner for the run lock and the stop switch (the consolidation pass)
+
+**THREE COPIES OF A MECHANISM IS THREE PLACES TO FORGET A SECURITY FIX, AND
+THAT IS AN OBSERVATION RATHER THAN A PREDICTION.** The lock-hardening pass
+applied FOUR fixes — `realpath` rather than `abspath` as the key, a 0700
+uid-keyed directory with `O_NOFOLLOW` and 0600 on the file, a UTC record with an
+explicit marker, and a typed refusal rather than a bare `OSError` — and had to
+apply each of them THREE times, one file at a time, with nothing that would have
+failed had it stopped after two. The pass before it had applied the same fixes
+to ONE of the three and left the other two, which is how the divergence arose in
+the first place. **`oncotriage/control.py` is the one owner.** No behaviour
+change: `python fixture_replay.py` is **12/12 clean, exit 0, with no
+recapture**, and every operator-facing text is **byte-identical** (below).
+
+**WHAT IS SHARED AND WHAT IS NOT, DECIDED PER ITEM.** Shared: the lock
+directory and its three verification checks, the open/flock/record/release
+sequence, both refusal classes' payloads, the mechanical half of both refusal
+texts (the record loop, the symbolic errno, the `at:` line), the bounded stop
+note reader with its tail probe, the three-member clear vocabulary, the
+queued-work sweep, and the latching poll. **NOT shared, each a parameter or a
+subclass with its argument at the site that keeps it:**
+
+| kept per program | why |
+|---|---|
+| the lock file PREFIX (`oncotriage-batch-run-` / `-ablation-run-` / `-serial-tests-`) | all three locks live in ONE per-user directory, so the prefix is the only thing keeping them apart. A batch run and a study guard different things and must not refuse each other |
+| the KEY (a checkpoint DIRECTORY / a study's checkpoint FILE / a checkout) | a `--db` study locks independently exactly as it checkpoints independently |
+| `AlreadyRunning` / `LockUnavailable` | see below — the argument CHANGED and is restated rather than carried across |
+| `EXIT_LOCK_UNAVAILABLE` (1 / 1 / 4) | its value is read off the entry point's OWN exit vocabulary. `EXIT_LOCKED` IS shared, because all three agree on 3 and agree on why |
+| the refusal PROSE | a cohort billed twice, a configuration's sample split across two `ablation_runs` rows, and a restore writing back a planted tree are three consequences with three remediations |
+| the `STOP_SWITCH_FAULTS` counters | a batch fault and a study fault are different findings, and `oncotriage/degradation.py` cannot import a module that imports nothing back |
+
+**THE EXCEPTION-CLASS ARGUMENT EXPIRED IN HALF AND IS REWRITTEN RATHER THAN
+MOVED INTACT.** Both classes argued that a shared one would drag the whole batch
+module — its checkpoint, its ledger, its graph — into every study's import
+graph. **That is no longer true of anything**: `control` imports nothing from
+the project. What survives is that the refusals are raised by different
+programs, name different consequences and are remediated with different
+commands, and a caller holding more than one lock — this suite already has a
+test that drives two — must tell them apart by TYPE rather than by parsing a
+path out of a message. So they are **siblings under a shared base**: the
+mechanism has one owner, the refusals keep two identities, and
+`tests/test_ablation_stop_and_lock.py` gained **3k-b2**, without which the
+separation is equally satisfied by two COPIES of the class, which is what it
+was.
+
+**`tests/run_serial_tests.py` KEEPS ITS COPY, AND THE RULE WAS READ BEFORE THAT
+WAS DECIDED.** Its no-project-imports argument has two clauses. The first — an
+import of the batch runner would drag the graph into a process launcher — is
+dissolved by `control.py`. **The SECOND is not**: the rule exists so `python
+tests/run_serial_tests.py` still reports a missing test file rather than dying
+on an ImportError WHEN THE PACKAGE IS WHAT IS BROKEN, and `import
+oncotriage.control` executes `oncotriage/__init__.py` and needs the package on
+`sys.path`, which that launcher deliberately does not arrange. The by-location
+escape is closed too: `tests/test_package_invariants.py` section 1c forbids
+loading a module by location **unconditionally**, with no allowlist, and has
+already caught one test file doing exactly that.
+
+**SO THE COPY STOPS BEING UNPINNED.** `tests/test_serial_runner_lock.py`
+**section 9** (85 → **119** checks) compares it against `control.py` by AST:
+`lock_directory` byte-identical after `ast.unparse`; `ensure_lock_directory`
+identical with string CONSTANTS blanked, which tolerates the one declared
+difference (a noun in three messages) and nothing that decides anything — an
+`lstat` turned into a `stat`, a dropped uid check, a widened mode mask and a
+removed raise all survive the blanking and fail the comparison; both exception
+`__init__` bodies byte-identical; and the acquisition compared FACT BY FACT
+(open flags, flock flags, the five syscalls and their counts, the
+ftruncate-BELOW-flock ordering, the close in a `finally`, the `gmtime` stamp,
+the `realpath` key), because `control`'s is parameterized and this one is not.
+**Eleven planted controls, eleven fired**, every plant into an in-memory copy
+with the file hashed and compared at the end. Two functions in the launcher
+gained a `-> str` annotation, which is the ONE difference that had to go so the
+comparison could be equality rather than equality-with-a-tolerance.
+
+**THE REVERT MATRIX IS THE ACCEPTANCE CRITERION AND IT FOUND A GAP THIS
+CONSOLIDATION INHERITED.** Twenty-eight reverts, each into a `copytree`'d copy
+with `PYTHONPATH` pointed at it, a realpath preflight and
+`PYTHONDONTWRITEBYTECODE=1`; every plant asserts its own occurrence count, so a
+plant that matched nothing is a named PLANT-FAILED rather than a working check
+reported as weak. Twenty-six were caught. **Two were MISSED — `LOCK_DIRECTORY_MODE`
+widened to 0777 and `LOCK_FILE_MODE` to 0666 — and that is PRE-EXISTING rather
+than a regression:** measured against `git show HEAD:`, those values were pinned
+for the SERIAL RUNNER's copy alone, and the batch runner's and the study's each
+declared their own with no test anywhere asserting either. Section 9's **9d-j**
+closes it at the one owner, with **9f-10** and **9f-11** as its controls.
+Widening either is the substitution re-opened: a 0777 lock directory is one
+another user can claim a name in, and a 0666 lock file is one that can be
+rewritten under a holder that is still running.
+
+**TWO DEFECTS IN THIS PASS'S OWN WORK WERE FOUND BY RUNNING, NOT BY READING.**
+
+- **`console.out` WAS CAPTURED IN THE CONSTRUCTOR AND LATE BINDING WAS LOST.**
+  The first `StopSwitch` took `out=console.out` and `log_warning=log.warning` as
+  parameters; both subclasses had written `console.out(...)` INSIDE the poll, so
+  the module attribute was looked up AT CALL TIME. A probe that patched
+  `console.out` on the module captured **nothing** while the announcement went
+  to the real stream. They are `_emit` / `_warn` METHODS now, overridden per
+  program and resolving at call time.
+- **THE BATCH SWITCH INHERITED `arm()` AND WOULD HAVE SILENTLY DONE NOTHING.**
+  The base offers it because the study's sentinel follows `--db`; the runner
+  resolves its own path every poll, so a bound path would be stored and never
+  read. Before the consolidation this class had no `arm` at all, so the call
+  raised `AttributeError` at the call site — **a silent no-op replacing a loud
+  failure**, which is the exact shape this project removes. It raises
+  `TypeError` naming the owner, and `tests/test_runner_stop_switch.py` **1m-x /
+  1m-y** are the standing checks.
+
+**HOW "NO BEHAVIOUR CHANGE" WAS ESTABLISHED: BY RENDERING, NOT BY READING.** A
+probe imports `git archive HEAD`'s tree and the working tree in separate
+processes and renders every operator-facing text the pass touches — both
+refusals with a full holder record and with a garbage one, both unopenable-lock
+diagnoses, both stop announcements, the `--clear-stop` failure block against a
+genuinely read-only directory, and `_read_stop_message` across six edge cases
+(empty, whitespace-only, short, exactly-cap-plus-newline, oversize, and
+whitespace exactly at the boundary with content after it). **Identical, with
+temp paths normalised.** The first run of that probe is what found the
+late-binding defect above.
+
+**F10 — `tests/_control_harness.py`, AND THE PARK PROTOCOL WAS THE POINT.** No
+`test_` prefix, deliberately: every runner this project has selects on it, and a
+file of no checks would report "0 passed" and be counted as a file that ran. It
+owns `CLOSED_PORT_URL` (five copies of a magic string is five chances to typo
+one into a port something is LISTENING on), the deadline waiter — whose `alive`
+argument is the half that is easy to forget, since a wait for a marker a DEAD
+process was never going to write burns the whole timeout — and **one park
+protocol replacing three incompatible encodings**: `ONC_PARK` as `"1"`/`"0"`,
+`ONC_PARK` as `"yes"`/`"no"`, and `ONC_PARK_PHASE` as a phase name with
+`"none"`. **Two of them read the SAME variable with different vocabularies**, so
+a hook copied from one file into the other parks on `"no"` — truthy in one and
+"never park" in the other. The phase form survived because it is the general one
+and the two booleans are its endpoints. It imports nothing from the project,
+which is required rather than tidy: it is imported by `usercustomize.py`
+stand-ins that run at INTERPRETER STARTUP, and an `oncotriage` import there would
+change what the process under test had loaded before its own first line.
+
+**F12 — `STOP_MESSAGE_MAX_CHARS`, `STOP_MESSAGE_TAIL_PROBE_CHARS` AND
+`EXIT_LOCKED` LIVE IN `control.py` WITH A STATED EXCEPTION TO THE
+CONFIG-TUNABLES RULE.** That rule exists so an operator has one file to look in,
+and it comes with a matching promise — every constant there has a reader and
+therefore an effect. A bound on a SHUTDOWN-PATH allocation, a probe width and an
+exit code are properties of a mechanism, not settings of a pipeline; an operator
+changing any of them changes nothing about what a run does or costs. And moving
+them would make `oncotriage/config.py` an importer of this module, which is the
+one thing it may not have.
+
+**F15 — `llm_classifier_call_details`' `call_index` DOES NOT ORDER BY THE SAME
+THING IN BOTH ARMS**, and the column note said "in the order they were issued"
+flatly, which is true of one of them. GROUPED mode issues one request, waits,
+counts it and issues the next, so issue order and accounting order are one
+sequence. PER-TRIAL mode submits every trial call to a thread pool up front and
+consumes responses in the order the node ASKS for them — the pending LIFO's pop
+order, which is packing order — so `call_index` follows the ACCOUNTING order and
+the order the requests actually reached the provider is the pool's and is
+recorded nowhere. Deterministic in both arms, which is what the join to
+`trial_matches.call_index` needs; what it is NOT, on the shipped arm, is a
+wire-order timeline — **and that is the reading that matters, because whether
+the cache warms is a question about what went out first.**
+
+```bash
+# The shared harness the five operator-control test files import. NOT a test
+# and it has no `test_` prefix: every runner selects on that prefix and a file
+# of no checks would report "0 passed" and be counted as a file that ran.
+tests/_control_harness.py
+```
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **`lock_directory()` / `ensure_lock_directory()` still exist twice** — in
+   `oncotriage/control.py` and in `tests/run_serial_tests.py`. That is forced by
+   the launcher's own rule, argued above, and it is now PINNED rather than
+   merely duplicated. What the pin does NOT cover is the refusal prose and the
+   `lock_path` signature, which are declared divergences.
+2. **The stale-sentinel preflights are NOT consolidated.**
+   `assert_no_stale_stop_switch` and `assert_no_stale_ablation_stop_switch`
+   remain two functions. Their bodies are three lines of shared shape wrapped
+   around wholly different multi-line refusal text naming different commands, so
+   the shareable part is smaller than the parameter list it would need.
+3. **`report_stop_switch_faults` is the study's alone.** The batch runner reports
+   its counter through `oncotriage/degradation.py`'s registry instead, which is
+   a genuine asymmetry rather than a duplicate — the study's counters are
+   excluded from that registry by name.
+4. **The two `_emit` / `_warn` overrides are four identical lines in two
+   modules.** They cannot be shared without `control` importing
+   `oncotriage.observability`, which is the one import it may not have; that is
+   the price of the no-project-imports property and it is paid deliberately.
 
 
 ## Persistence and observability

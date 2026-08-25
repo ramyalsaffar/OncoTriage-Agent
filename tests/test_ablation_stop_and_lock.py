@@ -90,6 +90,7 @@ if _CODE_DIR not in sys.path:
 os.environ.setdefault("ONCOTRIAGE_DEFER_LOCAL_MODELS", "1")
 
 import oncotriage                                              # noqa: E402
+from oncotriage import control as _control               # noqa: E402
 from oncotriage import paths as _paths                         # noqa: E402
 from oncotriage.ablation import study as _study                # noqa: E402
 # IMPORTED ONLY TO ASSERT THE TWO CLASSES ARE DISTINCT (check 3k-b). This file
@@ -99,11 +100,38 @@ from oncotriage.batch.runner import (                          # noqa: E402
     LockUnavailable as _runner_LockUnavailable)
 from oncotriage.config import MAX_WORKERS                      # noqa: E402
 
+# tests/ ON sys.path SO THE SHARED HARNESS IMPORTS. There is no __init__.py in
+# tests/ -- deliberately, so the directory is not a package and nothing ships
+# it -- so a sibling import needs the directory itself on the path.
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+
+# THE SHARED OPERATOR-CONTROL HARNESS (the consolidation pass): the closed-port
+# URL, the deadline waiter and the ONE park protocol that replaced three
+# incompatible ONC_PARK encodings. This file read ONC_PARK as "yes"/"no" while
+# tests/test_runner_preflight_and_state_faults.py read the SAME variable as
+# "1"/"0" -- so a hook copied between them parked on "no", which is truthy in
+# one vocabulary and "never park" in the other.
+import _control_harness as _harness                            # noqa: E402
+
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(oncotriage.__file__)))
 _STUDY_PATH = os.path.abspath(_study.__file__)
 _ENTRY_PATH = os.path.join(_REPO, "26- Ablation Study.py")
 
 _STUDY_SRC = open(_STUDY_PATH, encoding="utf-8").read()
+
+# THE LOCK MECHANISM MOVED TO oncotriage/control.py (the consolidation pass) AND
+# THE STRUCTURAL CHECKS BELOW MOVED WITH IT. They are about the same code -- the
+# 0700 directory, the O_NOFOLLOW open, the UTC record -- which now has ONE owner
+# instead of three; asserting them against the study's source would be a walk
+# that finds nothing and passes, which is the shape this file's own
+# non-degeneracy probes exist to catch. What the study still decides -- its key,
+# its two exception classes, the field its record names, its sentinel's
+# derivation -- is still checked against _STUDY_SRC.
+_CONTROL_PATH = os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(_study.__file__))), "control.py")
+_CONTROL_SRC = open(_CONTROL_PATH, encoding="utf-8").read()
 _ENTRY_SRC = open(_ENTRY_PATH, encoding="utf-8").read()
 _SHA_STUDY_BEFORE = hashlib.sha256(_STUDY_SRC.encode("utf-8")).hexdigest()
 _SHA_ENTRY_BEFORE = hashlib.sha256(_ENTRY_SRC.encode("utf-8")).hexdigest()
@@ -257,13 +285,13 @@ try:
     # --- the note is CAPPED, and the read is bounded ------------------------
     _study.STOP_SWITCH.arm(_sentinel)
     with open(_sentinel, "w", encoding="utf-8") as _fh:
-        _fh.write("z" * (_study.STOP_MESSAGE_MAX_CHARS + 500))
+        _fh.write("z" * (_control.STOP_MESSAGE_MAX_CHARS + 500))
     drive(_study.STOP_SWITCH.poll)
     _msg = _study.STOP_SWITCH.message or ""
     check("1j  a long note is CAPPED and says so, so an accidental `cat` of a "
           "log into the sentinel cannot put an unbounded read on a shutdown "
           "path",
-          (len(_msg) > _study.STOP_MESSAGE_MAX_CHARS,
+          (len(_msg) > _control.STOP_MESSAGE_MAX_CHARS,
            "truncated" in _msg,
            _msg.startswith("z" * 50)),
           (True, True, True))
@@ -277,7 +305,7 @@ try:
     # writes) came back one character short with "... [truncated at 1000
     # characters]" welded on, in the study's closing block, saying a message
     # had been cut that had not.
-    _CAP_A = _study.STOP_MESSAGE_MAX_CHARS
+    _CAP_A = _control.STOP_MESSAGE_MAX_CHARS
     _note_faults_before = dict(_study.STOP_SWITCH_FAULTS)
 
     # OUTSIDE _STATE, DELIBERATELY. Check 1r asserts that directory is EMPTY
@@ -331,7 +359,7 @@ try:
     # whitespace strips to CAP and would be handed back as a WHOLE note while
     # everything after it was dropped -- silently, in the closing block, which
     # is the only place the note is ever read.
-    _PROBE_A = _study.STOP_MESSAGE_TAIL_PROBE_CHARS
+    _PROBE_A = _control.STOP_MESSAGE_TAIL_PROBE_CHARS
     _n_boundary = _note("c" * _CAP_A + " " + "d" * 50)
     _n_ws_tail = _note("e" * _CAP_A + " " * (_PROBE_A // 2))
     _n_ws_past = _note("f" * _CAP_A + " " * (_PROBE_A + 50))
@@ -409,16 +437,16 @@ try:
     check("1o  clear_ablation_stop_switch() removes it and reports that there "
           "WAS one",
           (drive(_study.clear_ablation_stop_switch), os.path.exists(_sentinel)),
-          (_study.STOP_CLEAR_REMOVED, False))
+          (_control.STOP_CLEAR_REMOVED, False))
     check("1p  ...and reports ABSENT when there was nothing to clear",
-          drive(_study.clear_ablation_stop_switch), _study.STOP_CLEAR_ABSENT)
+          drive(_study.clear_ablation_stop_switch), _control.STOP_CLEAR_ABSENT)
     check("1q  the vocabulary is CLOSED and its members are distinct, so a "
           "caller may branch on it exhaustively -- which is the whole reason it "
           "is not a bool: `False` would mean 'there was none' AND 'there is one "
           "and I could not remove it', and the second must refuse to run",
-          (_study.STOP_CLEAR_OUTCOMES, len(set(_study.STOP_CLEAR_OUTCOMES))),
-          ((_study.STOP_CLEAR_REMOVED, _study.STOP_CLEAR_ABSENT,
-            _study.STOP_CLEAR_FAILED), 3))
+          (_control.STOP_CLEAR_OUTCOMES, len(set(_control.STOP_CLEAR_OUTCOMES))),
+          ((_control.STOP_CLEAR_REMOVED, _control.STOP_CLEAR_ABSENT,
+            _control.STOP_CLEAR_FAILED), 3))
 
     check("1r  ...and clearing does NOT touch the checkpoint: clearing a "
           "control file and discarding resume state are opposite operations "
@@ -468,7 +496,7 @@ try:
         check("2b  it REPORTS the failure instead of raising, so an operator "
               "gets a diagnosis rather than a traceback printed INSTEAD of the "
               "study they asked for",
-              _outcome, _study.STOP_CLEAR_FAILED)
+              _outcome, _control.STOP_CLEAR_FAILED)
         check("2c  ...and the sentinel is still there, which is why the "
               "outcome may not be reported as ABSENT",
               os.path.exists(_ro_sentinel), True)
@@ -510,8 +538,8 @@ check("3a  the lock file lives OUTSIDE the state directory -- whose other "
       "of a guessable path, so another user could pre-create it as a symlink "
       "to something this user can write and the first study to start would "
       "O_CREAT through it and ftruncate the target to zero",
-      (os.path.dirname(_path_a), _study.lock_directory()),
-      (_study.lock_directory(),
+      (os.path.dirname(_path_a), _control.lock_directory()),
+      (_control.lock_directory(),
        os.path.join(tempfile.gettempdir(), f"oncotriage-{os.getuid()}")))
 check("3a-b ...and the directory is named by the UID rather than by the login "
       "name. getpass.getuser() reads LOGNAME/USER/LNAME/USERNAME before the "
@@ -520,7 +548,7 @@ check("3a-b ...and the directory is named by the UID rather than by the login "
       "whenever those differed between invocations (a cron entry beside an "
       "interactive shell), and two namespaces for one checkpoint is the double "
       "bill this lock exists to prevent",
-      os.path.basename(_study.lock_directory()),
+      os.path.basename(_control.lock_directory()),
       f"oncotriage-{os.getuid()}")
 check("3a-c ...and lock_directory() is PURE while ensure_lock_directory() is "
       "the one that creates, on the output_dir()/ensure_output_dir() split "
@@ -528,13 +556,13 @@ check("3a-c ...and lock_directory() is PURE while ensure_lock_directory() is "
       "probe: a walk that found nothing anywhere would otherwise pass",
       (sorted({getattr(c.func, "attr", getattr(c.func, "id", None))
                for c in ast.walk(next(
-                   n for n in ast.walk(ast.parse(_STUDY_SRC))
+                   n for n in ast.walk(ast.parse(_CONTROL_SRC))
                    if isinstance(n, ast.FunctionDef)
                    and n.name == "lock_directory"))
                if isinstance(c, ast.Call)} & {"makedirs", "mkdir"}),
        sorted({getattr(c.func, "attr", getattr(c.func, "id", None))
                for c in ast.walk(next(
-                   n for n in ast.walk(ast.parse(_STUDY_SRC))
+                   n for n in ast.walk(ast.parse(_CONTROL_SRC))
                    if isinstance(n, ast.FunctionDef)
                    and n.name == "ensure_lock_directory"))
                if isinstance(c, ast.Call)} & {"makedirs", "mkdir"})),
@@ -564,7 +592,7 @@ check("3c  ...and the FILENAME PREFIX differs from the batch runner's. With no "
 
 check("3d  EXIT_LOCKED is 3, which collides with nothing this entry point "
       "already returns (1 refusal, 2 argparse, 130 Ctrl-C, 143 SIGTERM)",
-      _study.EXIT_LOCKED, 3)
+      _control.EXIT_LOCKED, 3)
 
 # Held, then refused, in-process. The two-real-subprocesses drive is section 6.
 with _study.exclusive_run_lock(db_path=_DB_A) as _held_path:
@@ -650,9 +678,9 @@ check("3h-e ...and the clock it is taken from is gmtime, asserted at the "
       "source rather than inferred from a comparison this machine's timezone "
       "could make vacuous. `Z` is only honest because of that call",
       sorted({ast.unparse(a) for n in ast.walk(next(
-          x for x in ast.walk(ast.parse(_STUDY_SRC))
+          x for x in ast.walk(ast.parse(_CONTROL_SRC))
           if isinstance(x, ast.FunctionDef)
-          and x.name == "exclusive_run_lock"))
+          and x.name == "hold_exclusive_lock"))
           if isinstance(n, ast.Call)
           and getattr(n.func, "attr", None) == "strftime"
           for a in n.args}),
@@ -694,14 +722,31 @@ check("3k  LockUnavailable is NOT an OSError, and that is the whole reason "
        issubclass(_study.LockUnavailable, _study.AlreadyRunning)),
       (True, False, False))
 check("3k-b ...and it is a SEPARATE CLASS from the batch runner's of the same "
-      "name, on AlreadyRunning's footing: importing that one would put the "
-      "whole batch module into every study's import graph, and neither entry "
-      "point catches the other's",
+      "name. THE ARGUMENT FOR THAT CHANGED WHEN oncotriage/control.py WAS "
+      "WRITTEN and is restated rather than carried across unread: what this "
+      "used to say -- that a shared class would drag the whole batch module "
+      "into every study's import graph -- is no longer true of anything, "
+      "because control imports nothing from the project. What survives is "
+      "that the two refusals are raised by different programs, name different "
+      "consequences and are remediated with different commands, and a caller "
+      "holding both locks (this file is one) must tell them apart by TYPE "
+      "rather than by parsing a path out of a message",
       _study.LockUnavailable is _runner_LockUnavailable, False)
+check("3k-b2 ...and both are nevertheless siblings under ONE shared base, so "
+      "the mechanism has one owner while the refusals keep two identities. "
+      "Without this the separation above is equally satisfied by two copies "
+      "of the class, which is what it was",
+      (issubclass(_study.LockUnavailable, _control.LockUnavailable),
+       issubclass(_runner_LockUnavailable, _control.LockUnavailable),
+       issubclass(_study.AlreadyRunning, _control.AlreadyRunning),
+       # AND THE BASES DO NOT COLLAPSE THE DISTINCTION THEY EXIST UNDER:
+       # `except control.LockUnavailable` must not catch a HELD lock.
+       issubclass(_control.LockUnavailable, _control.AlreadyRunning)),
+      (True, True, True, False))
 check("3k-c ...and the two exit codes stay distinct: 3 means another study is "
       "running, which a supervisor may wait out; 1 means the lock could not "
       "be opened, which waiting never fixes",
-      (_study.EXIT_LOCKED, _study.EXIT_LOCK_UNAVAILABLE), (3, 1))
+      (_control.EXIT_LOCKED, _study.EXIT_LOCK_UNAVAILABLE), (3, 1))
 
 _RO = os.path.join(_SUB, "readonly")
 os.makedirs(_RO, exist_ok=True)
@@ -726,7 +771,7 @@ check("3l-b the diagnosis names the path, the errno NUMERICALLY AND "
       "the lock', because the two refusals are one sentence apart on a "
       "terminal and have opposite remediations",
       ("/tmp/x.lock" in _diag_text, "13" in _diag_text,
-       "EACCES" in _diag_text, _study.lock_directory() in _diag_text,
+       "EACCES" in _diag_text, _control.lock_directory() in _diag_text,
        "NOTHING HAS BEEN RUN AND NOTHING HAS BEEN BILLED" in _diag_text,
        "another study holds the lock" in _diag_text),
       (True, True, True, True, True, True))
@@ -1065,6 +1110,12 @@ section("6. the real entry point, driven")
 _HOOK = r'''
 import os, signal, sys, threading, time
 
+# tests/ IS ON PYTHONPATH BESIDE THIS HOOK, so the shared harness is an ordinary
+# import. It imports nothing from the project, which is required rather than
+# tidy: this file runs at INTERPRETER STARTUP and an `oncotriage` import here
+# would change what the process under test had loaded before its own first line.
+import _control_harness as _h
+
 from oncotriage.ablation import study as S
 from oncotriage import paths as P
 from oncotriage import run_fingerprint as F
@@ -1117,10 +1168,6 @@ P._RESOLVED["checkpoint_path"] = os.environ["ONC_STATE"] + os.sep
 P._RESOLVED["result_ablation_path"] = os.environ["ONC_STATE"] + os.sep
 
 _STARTED = os.environ["ONC_STARTED"]
-_READY = os.environ["ONC_READY"]
-_RELEASE = os.environ["ONC_RELEASE"]
-_PARK = os.environ["ONC_PARK"]
-_CAP = float(os.environ["ONC_CAP"])
 _lock = threading.Lock()
 
 
@@ -1150,13 +1197,13 @@ def _pipeline(patient_data, bm25_index, nct_ids, graph, ablation_flags):
         with open(_STARTED, "a") as fh:
             fh.write(name + "\n")
         n = sum(1 for _ in open(_STARTED))
-    if _PARK == "yes":
-        if n == 1:
-            with open(_READY, "w") as fh:
-                fh.write("go")
-        _deadline = time.time() + _CAP
-        while not os.path.exists(_RELEASE) and time.time() < _deadline:
-            time.sleep(0.01)
+    # ONE PARK PROTOCOL, in tests/_control_harness.py. This harness has one
+    # phase and either parks every worker or none, so the parent passes
+    # PARK_ALL or PARK_NONE; the arrival number is what makes the ready file
+    # appear exactly once, on the FIRST worker, so the parent waits for
+    # saturation instead of sleeping -- which the first version of one of these
+    # harnesses did and which was measured FLAKY under bucket-A load.
+    _h.park(_h.PARK_ALL, arrival=n)
     return {"matches": [], "near_misses": [], "not_evaluable": [],
             "stage_timings": {}, "primary_condition": "breast",
             "candidates_retrieved": 1, "candidates_reranked": 1,
@@ -1226,23 +1273,24 @@ def drive_entry(name, *, park=False, action=None, args=(), patients=6,
 
     env = dict(os.environ)
     env.update({
-        # The hook dir FIRST so `usercustomize` resolves to ours.
-        "PYTHONPATH": os.pathsep.join([_HOOK_DIR, _REPO]),
+        # The hook dir FIRST so `usercustomize` resolves to ours, then tests/
+        # so the hook's `import _control_harness` is ordinary, then the tree
+        # under test.
+        "PYTHONPATH": os.pathsep.join([_HOOK_DIR, _TESTS_DIR, _REPO]),
         "PYTHONDONTWRITEBYTECODE": "1",
         "ONCOTRIAGE_DEFER_LOCAL_MODELS": "1",
         # A CLOSED PORT: no billed call is reachable even if the hook fails.
-        "ONCOTRIAGE_QDRANT_URL": "http://127.0.0.1:1",
+        "ONCOTRIAGE_QDRANT_URL": _harness.CLOSED_PORT_URL,
         "ONC_REPO": _REPO,
         "ONC_STATE": st,
         "ONC_CORPUS": corpus,
         "ONC_STARTED": started,
-        "ONC_READY": ready,
-        "ONC_RELEASE": release,
-        "ONC_PARK": "yes" if park else "no",
-        "ONC_CAP": "90",
         "ONC_HOOK_MARKER": hook_marker,
         "ONC_SIGINT_MARKER": sigint_marker,
     })
+    env.update(_harness.park_env(
+        _harness.PARK_ALL if park else _harness.PARK_NONE,
+        ready, release, cap=90))
 
     def _log_text():
         try:
@@ -1252,14 +1300,11 @@ def drive_entry(name, *, park=False, action=None, args=(), patients=6,
             return ""
 
     def _wait(predicate, seconds):
-        deadline = time.time() + seconds
-        while time.time() < deadline:
-            if predicate():
-                return True
-            if proc.poll() is not None:
-                return predicate()
-            time.sleep(0.02)
-        return predicate()
+        # THE SHARED WAITER, and `alive` is the half that is easy to forget: a
+        # wait for a marker a DEAD process was never going to write burns the
+        # whole timeout before answering. See _control_harness.wait_for.
+        return _harness.wait_for(predicate, seconds,
+                                 alive=lambda: proc.poll() is None)
 
     cmd = [sys.executable, _ENTRY_PATH, "--sample-size", str(patients),
            "--configs", *configs, *args]
@@ -1305,8 +1350,8 @@ def drive_entry(name, *, park=False, action=None, args=(), patients=6,
                 return {"proc": proc, "root": root, "state": st,
                         "release": release, "log": log,
                         "hook": os.path.exists(hook_marker)}
-            with open(release, "w", encoding="utf-8") as fh:
-                fh.write("go")
+            # THE SHARED RELEASE GESTURE. See tests/_control_harness.py.
+            _harness.release_park(release)
             # THE MARKERS ARE WAITED FOR *AFTER* THE RELEASE, and the ordering
             # is a real defect the first version of this harness had. Both
             # shutdown handlers print only once the parked workers have
@@ -1619,8 +1664,7 @@ try:
 finally:
     # Release the parked holder and let it finish, so the lock is free and no
     # process outlives this file.
-    with open(_holder["release"], "w", encoding="utf-8") as _fh:
-        _fh.write("go")
+    _harness.release_park(_holder["release"])
     try:
         _holder["proc"].wait(timeout=120)
     except subprocess.TimeoutExpired:                           # pragma: no cover
