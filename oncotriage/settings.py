@@ -806,6 +806,122 @@ def resolve_bedrock_api_key():
 #------------------------------------------------------------------------------
 
 
+ENV_S3_STAGING_REGION = "ONCOTRIAGE_S3_STAGING_REGION"
+"""The AWS Region ``oncotriage/staging/`` stages to, overriding the config
+default.
+
+WHY THIS ONE IS DEPLOYMENT-VARYING AND THEREFORE OVERRIDABLE. A bucket's Region
+is fixed for its lifetime, so the staging preflight compares the resolved boto3
+session Region against the configured one and REFUSES a mismatch rather than
+creating a bucket on the wrong continent. That refusal is right and its only
+remedy was a SOURCE EDIT -- an operator whose account, data-residency rule or
+existing bucket lives outside ``us-east-1`` had to change a tracked file to run
+the tool at all, and a tracked file changed for one machine is a file that gets
+committed for every machine. This variable is that remedy.
+
+NOT A PATH, so it is resolved by its own function below rather than by
+``_from_env``: that helper runs every value through ``with_trailing_sep``, and
+``"us-east-1/"`` is not a Region. It is interpolated straight into a client
+configuration, so the separator would arrive as part of the Region name and the
+resulting failure would name a slash nowhere. SIXTH victim of that helper after
+ENV_AIRFLOW_PASSWORD, ENV_INFERENCES_DB, ENV_ALLOW_DEGRADED_REGISTRIES,
+ENV_LOG_LEVEL and ENV_BEDROCK_API_KEY.
+
+IT DOES NOT VERIFY THAT THE REGION EXISTS, and that is a stated limit rather
+than an omission. Nothing here can know AWS's Region list without a network
+call, and this module makes none. A Region that is well-formed and wrong is
+caught where it already was: the preflight's session comparison, which names
+both values and now names where each came from.
+"""
+
+ENV_BEDROCK_REGION = "ONCOTRIAGE_BEDROCK_REGION"
+"""The AWS Region in the Bedrock base URL, overriding the config default.
+
+Same argument as ENV_S3_STAGING_REGION and a different consequence: this one is
+interpolated into ``BEDROCK_BASE_URL_TEMPLATES``, so a wrong value produces a
+hostname that resolves nowhere and a config default forces every operator whose
+Bedrock quota is granted outside ``us-east-1`` to edit a tracked file before the
+Stage 5 judge can answer at all.
+
+NOT A PATH, and resolved by its own function for exactly the reason above: a
+trailing separator would land INSIDE a hostname
+(``bedrock-runtime.us-east-1/.amazonaws.com``), which is not a diagnosis
+anybody would read as a separator problem. Seventh victim of ``_from_env``.
+
+IT IS STILL NOT GATED BY THE RESUME FINGERPRINT, and making it settable does
+not change that -- it makes it easier to reach, which is the argument for
+saying so twice. Two runs against ``us.openai.gpt-5.6-terra`` in different
+Regions remain indistinguishable to ``oncotriage/run_fingerprint.py``. See the
+note at ``config.matching_wire_model()``; the follow-up it records is now one
+export away from being triggered by accident rather than by a source edit, and
+that raises its rank rather than changing its shape.
+"""
+
+
+def _resolve_region(var_name, fallback):
+    """Shared body for the two Region resolvers. Returns ``(region, source)``.
+
+    ONE BODY, TWO PUBLIC FUNCTIONS, and that is deliberate in both directions.
+    The two Regions are genuinely independent facts -- an operator can stage to
+    one Region and call Bedrock in another, and a single shared
+    ``ONCOTRIAGE_AWS_REGION`` would make that impossible to express -- so each
+    has its own variable, its own docstring and its own named resolver that a
+    caller and a grep can find. What they do NOT need is two copies of four
+    lines of stripping logic, which is the shape this project keeps removing.
+
+    ``source`` is the variable name when the environment decided the answer and
+    ``None`` when the caller's fallback applied. Callers RENDER that, so a
+    refusal about a Region says whether the expected value came from an export
+    or from ``oncotriage/config.py`` -- which are different edits.
+
+    EMPTY AND WHITESPACE-ONLY MEAN UNSET, on ``_from_env``'s own recorded
+    argument: ``export ONCOTRIAGE_BEDROCK_REGION=`` is a common way to clear a
+    variable, and honouring it literally would produce an empty Region and a
+    refusal about a value nobody typed.
+
+    IT NEVER RAISES, and that is a decision rather than an oversight. Both
+    callers resolve at MODULE SCOPE in ``oncotriage/config.py``, so a raise here
+    would make ``import oncotriage.config`` fail -- for every process in the
+    project, including every one that never touches S3 or Bedrock -- on a typo
+    in a variable that concerns two of them. ``resolve_qdrant_url`` raises on a
+    malformed value and can afford to because it is called lazily from
+    ``get_qdrant_client()``. Validation of the VALUE therefore stays where it
+    already is and where it is already lazy and provider-gated:
+    ``config.validate_matching_provider_config()`` for Bedrock, and the
+    preflight's session comparison for S3.
+    """
+    raw = os.environ.get(var_name)
+    if raw is not None and raw.strip() != "":
+        return raw.strip(), var_name
+    return fallback, None
+
+
+def resolve_s3_staging_region(fallback):
+    """Resolve the S3 staging Region. Returns ``(region, source)``.
+
+    ``fallback`` is supplied by the caller rather than stored here, on
+    ``resolve_code_path``'s precedent and for a second reason of its own:
+    CLAUDE.md tells an operator that every tunable lives in
+    ``oncotriage/config.py``, and the DEFAULT Region is a tunable. Storing it
+    here would put one of the two halves of that value in the module an
+    operator is told not to look in.
+
+    DELIBERATELY NOT ``_from_env`` -- see ENV_S3_STAGING_REGION.
+    """
+    return _resolve_region(ENV_S3_STAGING_REGION, fallback)
+
+
+def resolve_bedrock_region(fallback):
+    """Resolve the Bedrock Region. Returns ``(region, source)``.
+
+    DELIBERATELY NOT ``_from_env`` -- see ENV_BEDROCK_REGION.
+    """
+    return _resolve_region(ENV_BEDROCK_REGION, fallback)
+
+
+#------------------------------------------------------------------------------
+
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """

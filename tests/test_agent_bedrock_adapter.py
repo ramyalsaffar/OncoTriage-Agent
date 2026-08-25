@@ -246,6 +246,31 @@ _EVALUATION_SHA_BEFORE = hashlib.sha256(
 
 _TMP = tempfile.mkdtemp(prefix="oncotriage-bedrock-")
 
+# THE SHIPPED VALUES, CAPTURED AT IMPORT, BEFORE ANY `provider()` BLOCK.
+#
+# Section 9's job is "nothing leaked" -- every knob is back to what it was when
+# this file started. It used to ask that against LITERALS, which was fine while
+# every one of these was a literal in config.py and became a LANDMINE the day
+# BEDROCK_REGION stopped being one: it is resolved from
+# ONCOTRIAGE_BEDROCK_REGION with a config default, so an operator who has
+# exported that variable would have made this file fail on a check about
+# LEAKAGE, naming a constant rather than a defect. That is the shape
+# tests/test_fixture_call_mode_pin.py records about its own check 1a -- a test
+# that fails on the change it exists to protect is a landmine, not a tripwire.
+#
+# THE LITERAL CLAIM DID NOT DISAPPEAR, IT MOVED TO THE THING THAT IS STILL A
+# LITERAL: section 9 additionally pins BEDROCK_REGION_DEFAULT, which no
+# environment variable can move, so "the shipped default is us-east-1" is still
+# asserted and is now asserted about the constant that actually holds it.
+_SHIPPED_AT_IMPORT = {
+    name: getattr(config, name)
+    for name in ("MATCHING_PROVIDER", "BEDROCK_ENDPOINT", "BEDROCK_REGION",
+                 "BEDROCK_MATCHING_MODEL", "BEDROCK_SYSTEM_ROLE",
+                 "BEDROCK_SERVICE_TIER", "BEDROCK_STORE",
+                 "BEDROCK_PROMPT_CACHE_KEY", "BEDROCK_PROMPT_CACHE_MODE",
+                 "BEDROCK_SEND_SEED_IN_EXTRA_BODY")
+}
+
 
 # ===========================================================================
 # STAND-INS
@@ -1538,17 +1563,32 @@ section("9. Nothing leaked: config restored, files untouched, no client built")
 
 check("MATCHING_PROVIDER is back to the shipped value",
       config.MATCHING_PROVIDER, "openai")
-for _name, _expected in (("BEDROCK_ENDPOINT", "bedrock-runtime"),
-                         ("BEDROCK_REGION", "us-east-1"),
-                         ("BEDROCK_MATCHING_MODEL", "us.openai.gpt-5.6-terra"),
-                         ("BEDROCK_SYSTEM_ROLE", "developer"),
-                         ("BEDROCK_SERVICE_TIER", None),
-                         ("BEDROCK_STORE", False),
-                         ("BEDROCK_PROMPT_CACHE_KEY", None),
-                         ("BEDROCK_PROMPT_CACHE_MODE", None),
-                         ("BEDROCK_SEND_SEED_IN_EXTRA_BODY", False)):
+# COMPARED AGAINST THE IMPORT-TIME CAPTURE, NOT AGAINST LITERALS -- see
+# _SHIPPED_AT_IMPORT for why, and note that the capture is strictly the right
+# instrument for a LEAKAGE check even where the literal would still work: the
+# question is "is it back to what it was", and only the capture knows.
+for _name in sorted(_SHIPPED_AT_IMPORT):
+    if _name == "MATCHING_PROVIDER":
+        continue                       # asserted by name immediately above
     check(f"config.{_name} is back to its shipped value",
-          getattr(config, _name), _expected)
+          getattr(config, _name), _SHIPPED_AT_IMPORT[_name])
+
+# NON-DEGENERACY: the capture is a comparison against a value, and a capture
+# that had come back empty would make every check above pass for nothing.
+check("...and the capture it is compared against is the full knob set",
+      len(_SHIPPED_AT_IMPORT), 10)
+
+# THE LITERAL PIN, ON THE CONSTANT THAT IS STILL A LITERAL. This is what an
+# environment variable cannot move, so it says "the shipped default is
+# us-east-1" without becoming a landmine for an operator who has exported one.
+check("the shipped BEDROCK_REGION_DEFAULT is us-east-1",
+      config.BEDROCK_REGION_DEFAULT, "us-east-1")
+check("...and with no override set, that IS the resolved Region -- which is "
+      "what makes the capture above the SHIPPED configuration rather than "
+      "somebody's export",
+      (config.BEDROCK_REGION_SOURCE is None,
+       config.BEDROCK_REGION == config.BEDROCK_REGION_DEFAULT)
+      if config.BEDROCK_REGION_SOURCE is None else (True, True), (True, True))
 
 # ASKED THROUGH active_overrides(), NOT peek(). `peek` answers "what would this
 # key resolve to without building", which includes a legitimately CACHED value

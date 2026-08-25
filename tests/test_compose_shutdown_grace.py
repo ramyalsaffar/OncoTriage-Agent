@@ -55,6 +55,14 @@ WHAT THIS FILE DELIBERATELY DOES NOT DO.
   section 1's premise; the premise was false when it was written and the pin
   was a landmine that went red on the very flip it was watching for. See the
   argument at section 3.
+* IT DOES NOT PIN THE 2400 PROSE BY SEARCHING THE WHOLE FILE. Section 4 also
+  compares each arm's DERIVED worst case against the figure the compose comment
+  states for THAT ARM -- a gap the first version of this file left, because
+  section 3's inequality still passes while the prose is stale (a larger real
+  worst case still exceeds the grace period), so the only symptom of the rot is
+  an operator reading a number that is no longer true. The two figures coincide
+  today, so each is looked for in its OWN region of the comment; a whole-file
+  substring test for one would be satisfied by the other.
 * IT DOES NOT PARSE YAML WITH A YAML LIBRARY. `docker-compose.yml` is read as
   TEXT, on `tests/test_harness_endpoint_budget.py`'s precedent -- and for a
   second reason that file learned the hard way: this compose file ARGUES about
@@ -461,6 +469,121 @@ check_true(f"4b  ...and the grace period it produced ({_GRACE}s)",
            str(_GRACE) in _COMPOSE_TEXT)
 check_true("4c  ...and names MATCHING_REQUEST_TIMEOUT_SECONDS as the term",
            "MATCHING_REQUEST_TIMEOUT_SECONDS" in _COMPOSE_TEXT)
+
+# THE GAP 4a-4c LEFT, AND IT IS THE HALF THAT ROTS.
+#
+# 4a-4c pin the numbers the grace period IS derived from. The compose comment
+# also spells out the two numbers it is NOT sufficient for -- "worst case = 4 x
+# 600 = 2400 s" for per-trial and "4 further requests x 600 = 2400 s" for
+# grouped -- and NOTHING PINNED THOSE. Section 3 derives both worst cases from
+# the constants and asserts the two ANCHOR PHRASES are present, so it fails if
+# the derivations are deleted; it never compares the derived FIGURE against the
+# prose, so a change to `MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS` or to
+# `MATCHING_MAX_INPUT_PACKED_CHUNKS` moved the real worst case and left 2400
+# standing, correct-looking and wrong.
+#
+# THAT IS THE DANGEROUS DIRECTION. Section 3's inequality still passes when the
+# prose is stale -- a larger real worst case still exceeds the grace period --
+# so the only symptom of the rot is an operator reading a number that is no
+# longer true about the service they are about to `docker stop`.
+#
+# EACH FIGURE IS LOOKED FOR IN ITS OWN REGION OF THE COMMENT, not in the file
+# as a whole, and that is not fastidiousness: the two worst cases are the SAME
+# NUMBER today (2400), so a whole-file substring test for the per-trial figure
+# is satisfied by the GROUPED sentence and vice versa. Either check would then
+# pass while the arm it names had gone stale -- a check satisfied by the wrong
+# evidence, which this project treats as worse than no check because it fails
+# to fail. The regions are delimited by the two anchor phrases section 3
+# already pins, so a rename of either fails there rather than silently emptying
+# a region here.
+
+# THE ANCHORS ARE THE TWO SECTION HEADINGS, NOT THE TWO DERIVATION LINES, AND
+# THE FIRST DRAFT GOT THAT WRONG IN A WAY ONLY RUNNING IT REVEALED. It split on
+# "rounds per patient" and "chunks per patient" -- the phrases section 3
+# already pins -- on the assumption that each opens its own arm's paragraph.
+# It does not: the grouped paragraph opens with a TABLE whose first row is
+# "criteria chars/trial" and whose SECOND row is "chunks per patient", so the
+# split point sat two lines INSIDE the grouped derivation and the "per-trial"
+# region swallowed most of it. The control caught it on the first run, which is
+# the whole reason it is written as a two-directional phrase test rather than
+# as a number.
+#
+# THE HEADINGS ARE WHAT ACTUALLY SEPARATE THE TWO ARMS, and the two derivation
+# phrases are then required to be INSIDE the region they belong to -- which
+# ties these regions to the anchors section 3 pins, so neither set can be
+# renamed without a failure somewhere.
+
+_PT_HEADING = "THE SHIPPED ARM IS PER-TRIAL"
+_GR_HEADING = "THE RETAINED GROUPED ARM"
+_PT_ANCHOR = "rounds per patient"
+_GR_ANCHOR = "chunks per patient"
+
+
+def _region(text, start_anchor, end_anchor=None):
+    """The slice of `text` from `start_anchor` to `end_anchor`.
+
+    RETURNS "" WHEN EITHER ANCHOR IS ABSENT, and the end anchor is the half
+    that matters: returning the rest of the file when the end anchor is missing
+    would SILENTLY WIDEN the region to everything below it, which is precisely
+    the failure this scoping exists to prevent and would show up as a check
+    that still passes. An empty region fails instead.
+    """
+    start = text.find(start_anchor)
+    if start < 0:
+        return ""
+    rest = text[start:]
+    if end_anchor is None:
+        return rest
+    end = rest.find(end_anchor)
+    return "" if end < 0 else rest[:end]
+
+
+_PT_REGION = _region(_COMPOSE_TEXT, _PT_HEADING, _GR_HEADING)
+_GR_REGION = _region(_COMPOSE_TEXT, _GR_HEADING)
+
+check_true(f"4d  the PER-TRIAL worst case the constants give ({_PER_TRIAL_WORST}s) "
+           f"is the figure the compose file's per-trial derivation states, so "
+           f"moving MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS rots that prose "
+           f"loudly instead of leaving it correct-looking",
+           str(_PER_TRIAL_WORST) in _PT_REGION)
+
+check_true(f"4e  ...and the GROUPED worst case ({_GROUPED_WORST}s) is the "
+           f"figure its own derivation states, so "
+           f"MATCHING_MAX_INPUT_PACKED_CHUNKS cannot move without the same "
+           f"failure. The two figures coincide today, which is exactly why "
+           f"each is looked for in its own region",
+           str(_GROUPED_WORST) in _GR_REGION)
+
+check("4f  ...and each arm's derivation phrase -- the ones section 3 pins -- "
+      "falls inside its OWN region, which is what ties the two anchor sets "
+      "together and what the first draft of this split got wrong",
+      (_PT_ANCHOR in _PT_REGION, _PT_ANCHOR in _GR_REGION,
+       _GR_ANCHOR in _GR_REGION, _GR_ANCHOR in _PT_REGION),
+      (True, False, True, False))
+
+# CONTROLS. Without these, 4d and 4e pass for any compose file long enough to
+# contain the digits somewhere, and 4f passes for any two disjoint strings.
+check("4g  CONTROL: a missing START anchor yields an EMPTY region, so the "
+      "check fails rather than searching the whole file",
+      _region(_COMPOSE_TEXT, "no such heading in this file"), "")
+check("4g2 CONTROL: a missing END anchor does too -- the dangerous case, "
+      "because widening to the rest of the file would leave 4d passing on the "
+      "grouped sentence",
+      _region(_COMPOSE_TEXT, _PT_HEADING, "no such heading in this file"), "")
+check("4h  CONTROL: the GROUPED table's own phrase is absent from the "
+      "per-trial region, so 4d cannot be reading the grouped derivation",
+      ("criteria chars/trial" in _GR_REGION,
+       "criteria chars/trial" in _PT_REGION), (True, False))
+check("4h2 CONTROL: and the PER-TRIAL derivation's own phrase is absent from "
+      "the grouped region, so 4e cannot be reading the per-trial one",
+      ("ceil(" in _PT_REGION, "ceil(" in _GR_REGION), (True, False))
+check("4h3 CONTROL: a figure in NEITHER derivation is rejected by both, so "
+      "4d/4e are not satisfied by any digits at all",
+      ("999999" in _PT_REGION, "999999" in _GR_REGION), (False, False))
+check_true("4i  CONTROL: both regions are non-empty and each is a proper "
+           "SLICE of the file, not the file",
+           0 < len(_PT_REGION) < len(_COMPOSE_TEXT)
+           and 0 < len(_GR_REGION) < len(_COMPOSE_TEXT))
 
 
 #------------------------------------------------------------------------------

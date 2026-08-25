@@ -26,6 +26,7 @@ already carry; check 1b forbids deferring a PACKAGE import and exempts these.
 """
 
 from oncotriage import config
+from oncotriage import settings
 from oncotriage.observability import get_logger
 
 log = get_logger(__name__)
@@ -107,14 +108,41 @@ def preflight(session_factory=None):
             "user's access key, or export AWS_ACCESS_KEY_ID / "
             "AWS_SECRET_ACCESS_KEY. This tool never creates credentials.")
 
+    # NO WELL-FORMEDNESS GUARD ON THE CONFIGURED REGION HERE, and the asymmetry
+    # with config.validate_matching_provider_config() -- which DOES refuse a
+    # Region carrying whitespace or a '/' -- is argued rather than accidental.
+    # There, the Region is interpolated into a HOSTNAME, so a malformed value
+    # produces a URL whose failure names neither the character nor the
+    # variable. Here it is one side of an equality against the session's own
+    # region: a malformed value simply never matches, and the refusal below
+    # already prints BOTH values and where each came from, which is a better
+    # diagnosis than a shape check could give. Adding one would be a second
+    # place to keep a Region-syntax opinion.
     region = session.region_name
     if region != config.S3_STAGING_REGION:
+        # THE REFUSAL IS UNCHANGED AND ITS REMEDY IS NOT. It still compares the
+        # session's region against the configured one and still refuses -- a
+        # bucket's region is fixed for its lifetime, so a mismatch discovered
+        # afterwards is not discoverable at all. What is new is that the
+        # expected side can now come from ONCOTRIAGE_S3_STAGING_REGION, so the
+        # message names WHICH of the two decided it. Without that an operator
+        # who has exported the variable reads "config.S3_STAGING_REGION" and
+        # edits a tracked file that is not what answered -- and an export is
+        # the half that is invisible in a diff.
+        expected_from = (
+            f"{config.S3_STAGING_REGION_SOURCE}, an environment variable"
+            if config.S3_STAGING_REGION_SOURCE
+            else "config.S3_STAGING_REGION_DEFAULT, the shipped default")
         return PreflightResult(
             PREFLIGHT_WRONG_REGION,
             f"the session region is {region!r} and this project stages to "
-            f"{config.S3_STAGING_REGION!r} (config.S3_STAGING_REGION). A "
+            f"{config.S3_STAGING_REGION!r} (from {expected_from}). A "
             f"bucket's region is fixed for its lifetime, so this refuses "
-            f"rather than creating one on the wrong continent.",
+            f"rather than creating one on the wrong continent.\n"
+            f"  Point the session at {config.S3_STAGING_REGION!r} (`aws "
+            f"configure set region {config.S3_STAGING_REGION}`), or declare "
+            f"the intended region with "
+            f"`export {settings.ENV_S3_STAGING_REGION}={region}`.",
             region=region)
 
     try:

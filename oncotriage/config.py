@@ -1096,9 +1096,40 @@ disagree with it."""
 BEDROCK_ENDPOINT = BEDROCK_ENDPOINT_RUNTIME
 """Which of the two endpoints to call. Values: BEDROCK_BASE_URL_TEMPLATES keys."""
 
-BEDROCK_REGION = "us-east-1"
-"""The AWS Region in the base URL. NOT gated by the resume fingerprint -- see
-the note at `matching_wire_model()`."""
+BEDROCK_REGION_DEFAULT = "us-east-1"
+"""The AWS Region in the base URL, before ONCOTRIAGE_BEDROCK_REGION.
+
+THE DEFAULT LIVES HERE AND THE OVERRIDE LIVES IN THE ENVIRONMENT, which is the
+split the hardcoding audit asked for: a Region is deployment-varying -- Bedrock
+quota is granted per Region, and an operator whose grant is not in us-east-1
+had to edit this tracked file before the judge could answer a single request.
+A tracked file edited for one machine is a tracked file committed for every
+machine.
+
+NOT gated by the resume fingerprint -- see the note at `matching_wire_model()`,
+which now records that the follow-up is one export away from being triggered by
+accident rather than by a source edit."""
+
+BEDROCK_REGION, BEDROCK_REGION_SOURCE = settings.resolve_bedrock_region(
+    BEDROCK_REGION_DEFAULT)
+# The resolved Region and WHERE IT CAME FROM: the variable name, or None when
+# BEDROCK_REGION_DEFAULT applied. `validate_matching_provider_config()` renders
+# the source, so a refusal about a Region says whether the operator has an
+# export to fix or a constant to edit -- two different remedies that an
+# un-sourced value sends to the same page.
+#
+# RESOLVED AT IMPORT, NOT AT CALL TIME, and both halves of that are deliberate.
+# It is a module ATTRIBUTE because that is the seam every existing test uses:
+# tests/test_agent_bedrock_adapter.py's `provider()` context manager sets
+# `config.BEDROCK_REGION = ""` to drive the validator's empty-Region arm, and an
+# accessor function would take that seam away for a value nothing resolves
+# lazily anyway. Reading os.environ at import opens no client, loads no model,
+# touches no database and reads no file, so section 2 of
+# tests/test_package_invariants.py is unaffected -- verified by running it, not
+# by reading. The cost is that the override is process-global and is therefore
+# driven by SUBPROCESS in the standing test, on
+# tests/test_docker_qdrant_override_and_readiness.py's precedent for the Qdrant
+# override, which is the same shape for the same reason.
 
 BEDROCK_RUNTIME_PROFILE_PREFIXES = ("us.", "global.", "in.", "us-gov.")
 """Cross-Region inference profile prefixes accepted on `bedrock-runtime`.
@@ -1226,12 +1257,47 @@ def validate_matching_provider_config():
             f"{', '.join(sorted(BEDROCK_BASE_URL_TEMPLATES))}. Edit "
             f"BEDROCK_ENDPOINT in oncotriage/config.py.")
 
+    # THE REGION IS VALIDATED HERE RATHER THAN AT RESOLUTION, and that is where
+    # the settings resolver's "it never raises" argument is discharged. This
+    # check is LAZY (top of every Bedrock request) and PROVIDER-GATED (nothing
+    # above this line runs for an OpenAI run), so a malformed Region costs the
+    # operator one refusal naming the two places it could have come from
+    # instead of making `import oncotriage.config` fail for every process in
+    # the project.
+    #
+    # THE MESSAGE NAMES THE SOURCE because the remedies differ: an exported
+    # ONCOTRIAGE_BEDROCK_REGION is unset with `unset`, and a wrong
+    # BEDROCK_REGION_DEFAULT is a source edit. An un-sourced value sends both
+    # to the same page, and the export is the one that is invisible in a diff.
+    _region_origin = (f"{BEDROCK_REGION_SOURCE} (an environment variable)"
+                      if BEDROCK_REGION_SOURCE
+                      else "BEDROCK_REGION_DEFAULT in oncotriage/config.py")
+
     if not BEDROCK_REGION or not str(BEDROCK_REGION).strip():
         raise RuntimeError(
-            "BEDROCK_REGION is empty. It is interpolated into "
-            "BEDROCK_BASE_URL_TEMPLATES and an empty value produces a URL "
-            "that resolves nowhere. Edit BEDROCK_REGION in "
-            "oncotriage/config.py.")
+            f"BEDROCK_REGION is empty. It is interpolated into "
+            f"BEDROCK_BASE_URL_TEMPLATES and an empty value produces a URL "
+            f"that resolves nowhere. It was resolved from {_region_origin}.")
+
+    # WHITESPACE OR A SLASH INSIDE THE VALUE, and this guard exists because the
+    # override made a new failure reachable. A Region is interpolated into a
+    # HOSTNAME, so either character lands inside
+    # `bedrock-runtime.{region}.amazonaws.com` and produces a URL whose failure
+    # names neither the character nor the variable -- which is precisely the
+    # corruption `_from_env`'s trailing separator would have caused and the
+    # reason the resolver declines that helper. Refusing one shape of it while
+    # tolerating the other two would be inconsistent.
+    #
+    # IT DOES NOT CHECK THAT THE REGION EXISTS. Nothing here can, without a
+    # network call this module does not make. A well-formed wrong Region still
+    # arrives as a 4xx from the endpoint, which names the host.
+    if any(c.isspace() for c in str(BEDROCK_REGION)) or "/" in str(BEDROCK_REGION):
+        raise RuntimeError(
+            f"BEDROCK_REGION is {BEDROCK_REGION!r}, which carries whitespace "
+            f"or a '/'. It is interpolated into a HOSTNAME in "
+            f"BEDROCK_BASE_URL_TEMPLATES, so either lands inside the host and "
+            f"the resulting failure names neither. It was resolved from "
+            f"{_region_origin}.")
 
     if not BEDROCK_MATCHING_MODEL or not str(BEDROCK_MATCHING_MODEL).strip():
         raise RuntimeError(
@@ -2873,6 +2939,16 @@ COHORT_MANIFEST_FLUSH_EVERY = 100
 # historical record format and its strings are byte-identical for an unchanged
 # value, which is why the reason string keeps the word CAP even though the
 # identifier it once named now lives here under a different one.
+#
+# PROVENANCE OF THE NUMBER ITSELF: 1,000 IS THE OPERATOR-RULED CAMPAIGN SIZE.
+# It is a decision about how much money one campaign spends -- at the measured
+# $0.13-$0.17 per patient it is roughly $130-$170 of Stage 5 per full run --
+# and it is NOT derived from a power calculation, a coverage target or any
+# statistic. There is nothing outstanding to re-derive it against, and that is
+# what makes it different from the two sample sizes below: those two feed
+# significance tests whose resolving power depends on n, so they carry the
+# uncalibrated label and an instrument to re-derive them with. This one is the
+# ruling, and the honest thing a reader needs is to know that it is one.
 COHORT_CAP = 1000
 
 # Seed for the reproducible down-sample to COHORT_CAP patients.
@@ -2908,6 +2984,21 @@ COHORT_SELECTION_SEED = 42
 # IT IS DELIBERATELY ABSENT FROM tracking.CONFIGURATION_PARAM_NAMES. See the
 # argument written at that tuple: `--sample-size` overrides it, and logging a
 # default the run did not use is a false record.
+#
+# PROVENANCE OF THE NUMBER ITSELF: UNCALIBRATED, AND THE INSTRUMENT EXISTS.
+# 75 is a holding value. It was not solved for a target effect size, and the
+# project HAS the calculation that would solve for one -- the Power block that
+# `python "27- Ablation Analysis.py"` prints, which reports the smallest effect
+# this design resolves at the n it actually paired, at ABLATION_POWER_TARGET,
+# under both the loosest and the strictest BH thresholds in the family.
+#
+# RE-DERIVE IT AGAINST THAT BLOCK BEFORE PUBLISHING ANY ABLATION COMPARISON.
+# The reason this is not deferred quietly is that an n chosen by nobody has a
+# specific failure mode: the study runs, every configuration produces a mean,
+# the deltas are printed, and the ones that do not reach significance are
+# indistinguishable from effects that are genuinely absent. The MDE block is
+# what separates those two, and reading it AFTER the money is spent is reading
+# it too late to change n.
 ABLATION_SAMPLE_SIZE_DEFAULT = 75
 
 # Seed for the ablation study's stratified draw.
@@ -2937,6 +3028,23 @@ ABLATION_SEED = 42
 # overrides it. (The evaluation harness does not open a tracking run today; the
 # omission is stated so that adding one cannot quietly make this a false
 # record.)
+#
+# PROVENANCE OF THE NUMBER ITSELF: UNCALIBRATED, AND ITS INSTRUMENT IS NOT THE
+# ABLATION ONE. 10 is a holding value, chosen as a slice a human rater can
+# actually work through by hand rather than solved for anything. The ablation
+# study's MDE block does not apply to it: that solves a PAIRED test across
+# configurations over one cohort, and this slice feeds rating and Ragas, whose
+# statistic is an agreement RATE over patient-trial decisions -- a different
+# unit, a different n, and a different calculation.
+#
+# RE-DERIVE IT BEFORE PUBLISHING ANY RATE COMPUTED OVER THE SLICE, against the
+# precision that rate needs: an agreement figure over ten patients carries a
+# confidence interval wide enough to contain most of the values anyone would
+# argue about, and `oncotriage/evaluation/rater.py` already records the
+# neighbouring version of this warning in its own words -- that an agreement
+# figure at one n cannot be used to argue about a value at another. Nothing in
+# the project computes that interval today, which is exactly why the number
+# carries the label rather than a citation.
 EVALUATION_SELECTION_SIZE_DEFAULT = 10
 
 
@@ -3064,10 +3172,17 @@ ABLATION_BOOTSTRAP_SEED = 42
 #------------------------------------------------------------------------------
 # S3 STAGING
 #------------------------------------------------------------------------------
-# The four knobs the staging pass reads. They are here rather than beside the
-# code that reads them because this file is where CLAUDE.md tells an operator
-# every tunable lives, and because the two prices are the kind of number that
-# goes stale on a vendor's schedule rather than on this project's.
+# The knobs the staging pass reads: the region (with its default and its
+# resolved source), the scan prefix bound, and the two prices under S3_PRICING.
+# They are here rather than beside the code that reads them because this file
+# is where CLAUDE.md tells an operator every tunable lives, and because the two
+# prices are the kind of number that goes stale on a vendor's schedule rather
+# than on this project's.
+#
+# THIS COMMENT USED TO SAY "the four knobs" AND COUNTED THEM. A prose count of
+# a set that grows every pass is a guaranteed staleness site -- the exec-chain
+# note in CLAUDE.md went stale three times exactly that way -- so it names them
+# instead.
 
 
 # The target region. us-east-1, per the brief.
@@ -3078,7 +3193,28 @@ ABLATION_BOOTSTRAP_SEED = 42
 # happened to point -- and a bucket's region is fixed for its lifetime. The
 # staging preflight compares the resolved session region against this constant
 # and refuses a mismatch rather than creating a bucket in the wrong continent.
-S3_STAGING_REGION = "us-east-1"
+#
+# THE OVERRIDE IS THE REMEDY THAT REFUSAL DID NOT HAVE. Refusing is right and
+# it is a dead end when the only way past it is editing a tracked file: an
+# operator whose account, data-residency rule or existing bucket is outside
+# us-east-1 could not run the tool at all without a commit that then follows
+# every other machine. ONCOTRIAGE_S3_STAGING_REGION is that remedy, and the
+# refusal now names which of the two decided the expected value.
+#
+# THE OVERRIDE DOES NOT DISSOLVE THE REFUSAL -- it moves the comparison's
+# expected side, and the comparison still happens. Setting the variable to the
+# session's region is a DECLARATION that this is the intended region, which is
+# exactly what the check wants and is not the same as reading the ambient
+# configuration and agreeing with whatever it says.
+S3_STAGING_REGION_DEFAULT = "us-east-1"
+
+S3_STAGING_REGION, S3_STAGING_REGION_SOURCE = settings.resolve_s3_staging_region(
+    S3_STAGING_REGION_DEFAULT)
+# The resolved region and WHERE IT CAME FROM: the variable name, or None when
+# S3_STAGING_REGION_DEFAULT applied. `oncotriage/staging/s3_sync.py` renders
+# the source in its wrong-region refusal. Resolved at import for the reason
+# written at BEDROCK_REGION above, and driven by subprocess in the standing
+# test for the same reason.
 
 
 # How much of each file the secrets scan reads.
@@ -3092,20 +3228,43 @@ S3_STAGING_REGION = "us-east-1"
 S3_STAGING_SCAN_PREFIX_BYTES = 65536
 
 
-# S3 Standard storage, us-east-1, first 50 TB. USD per GB-month.
+# THE TWO S3 RATES AND THE DATE THEY WERE READ, ON PRICING_CONFIG'S SHAPE.
 #
-# QUOTED, NOT COMPUTED, and dated for the same reason PRICING_CONFIG carries a
-# `last_updated`: a cost estimate whose inputs nobody can date is a number
-# somebody trusts a year later. Read 2026-08-22 from the AWS S3 pricing page.
-S3_STANDARD_USD_PER_GB_MONTH = 0.023
-
-
-# PUT / COPY / POST / LIST requests, USD per 1,000. Same page, same date.
+# THEY WERE TWO BARE SCALARS AND A DATE IN A COMMENT, and the date being in a
+# comment is the whole defect: a cost estimate whose inputs nobody can date is
+# a number somebody trusts a year later, and a date no program can read is a
+# date no report can print. PRICING_CONFIG solved this for the model rates in
+# exactly this shape -- a `last_updated` FIELD beside the rates -- and
+# `manifest.render_report` now prints it beside the dollar figures, so the age
+# of the number is in front of the reader at the moment the decision is made
+# rather than in the source file they are not reading.
 #
-# Every object costs one PUT on the first sync. This is a ONE-TIME charge and
+# ONE DATE FOR BOTH RATES because both were read from the same page in one
+# sitting. If a future pass updates one rate and not the other, the honest move
+# is a per-rate date, not a stale shared one -- and the standing test's shape
+# check is what makes that a decision rather than an accident.
+#
+# QUOTED, NOT COMPUTED. AWS S3 pricing page, us-east-1, read 2026-08-22:
+#   standard_usd_per_gb_month  S3 Standard storage, first 50 TB, per GB-month
+#   put_usd_per_1000           PUT / COPY / POST / LIST, per 1,000 requests
+#
+# Every object costs one PUT on the first sync. That is a ONE-TIME charge and
 # the report labels it as such -- folding it into a monthly figure would report
-# a recurring cost that does not recur.
-S3_PUT_USD_PER_1000 = 0.005
+# a recurring cost that does not recur, which is why the two rates stay
+# separate here and are never summed downstream.
+S3_PRICING = {
+    "last_updated": "2026-08-22",
+    # THE REGION THE RATES WERE QUOTED FOR, which is not necessarily the region
+    # this run stages to now that S3_STAGING_REGION is overridable. S3 prices
+    # differ by region, so the two being able to disagree is a new fact and the
+    # report states it rather than pricing one region under another's name.
+    # Re-quoting the rates for a different region is a source edit with a new
+    # `last_updated`; this field is what makes the gap visible until somebody
+    # does.
+    "quoted_region": "us-east-1",
+    "standard_usd_per_gb_month": 0.023,
+    "put_usd_per_1000": 0.005,
+}
 
 
 #------------------------------------------------------------------------------

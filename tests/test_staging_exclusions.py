@@ -21,7 +21,10 @@ WHAT IT HOLDS
        file and STOPS excusing it the moment its content changes.
     5. The AWS preflight reaches every state with a stand-in session, and the
        ``--execute`` gate refuses.
-    6. The cost arithmetic keeps the one-time charge out of the monthly figure.
+    6. The cost arithmetic keeps the one-time charge out of the monthly
+       figure, the two rates carry a MACHINE-READABLE date on PRICING_CONFIG's
+       shape, the report prints that date beside the dollar figures, and the
+       cost heading names the CONFIGURED staging region rather than a literal.
     7. Non-degeneracy against the SHIPPED manifest: `05- Keys` is really
        excluded, and it is excluded as `secrets`.
 
@@ -75,9 +78,11 @@ except ImportError:
     del _candidate, _how
 
 import json
+import re as _re
 import shutil
 import tempfile
 
+from oncotriage import config as _config
 from oncotriage.staging import exclusions as _exc
 from oncotriage.staging import manifest as _man
 from oncotriage.staging import s3_sync as _sync
@@ -669,6 +674,149 @@ check("6d THE ONE-TIME CHARGE IS NOT FOLDED INTO THE MONTHLY FIGURE -- an "
       "put_usd_one_time" in _cost and "storage_usd_per_month" in _cost, True)
 check("6e an empty tree costs nothing and does not divide by zero",
       _man.estimate_cost(0, 0)["storage_usd_per_month"], 0.0)
+
+def _render_cost_lines(cost, staged_region=None):
+    """The cost block of a rendered report, as a list of lines.
+
+    A MINIMAL REPORT DICT, not a walk of a real tree: the subject here is the
+    six lines the cost block emits, and building 64 GB of fixture to reach them
+    would make the check about the walk instead. ``out`` is the injectable sink
+    ``render_report`` already carries.
+
+    ``staged_region`` drives the mismatch arm by rebinding the module constant
+    inside try/finally with the restore asserted, which is this project's
+    idiom for a value resolved at import: an environment variable set here
+    would reach nothing, because ``oncotriage.config`` has already resolved it.
+    """
+    lines = []
+    report = {
+        "root": "/fabricated", "staged_roots": ["x"], "file_count": 10_000,
+        "total_bytes": 100_000_000_000, "by_prefix": {}, "largest": [],
+        "excluded_hits": {}, "stale_rules": [], "walk_errors": [], "unruled": [],
+        "scan": {"files_scanned": 1, "bytes_read": 1, "findings": 0,
+                 "allowlisted": 0, "unreadable": 0, "clean": True},
+        "cost": cost,
+    }
+    original = _config.S3_STAGING_REGION
+    try:
+        if staged_region is not None:
+            _config.S3_STAGING_REGION = staged_region
+        _man.render_report(report, out=lines.append)
+    finally:
+        _config.S3_STAGING_REGION = original
+    start = next((i for i, ln in enumerate(lines)
+                  if ln.startswith("Estimated cost")), None)
+    if start is None:
+        return []
+    return lines[start:start + 8]
+
+
+# A cost dict with the date REMOVED, for the degraded arm. Built by deleting
+# the key rather than by passing None, because "the manifest never carried this
+# field" is the case `.get` exists for and `None` would also be produced by a
+# writer that carried it and set it to nothing.
+_rates_removed_cost = dict(_cost)
+del _rates_removed_cost["rates_last_updated"]
+
+# CAPTURED BEFORE ANY RENDER, so the restore check at the end of this section
+# compares against what was really in force rather than against a literal that
+# would agree with a rebind that never happened.
+_REGION_BEFORE_SECTION_6 = _config.S3_STAGING_REGION
+
+
+# ---- the rates carry their own date, on PRICING_CONFIG's shape -----------
+#
+# THE TWO RATES WERE BARE SCALARS AND THE DATE THEY WERE READ WAS A `#`
+# COMMENT. A comment is unreadable by any program, therefore unprintable by any
+# report, therefore invisible to the person deciding whether to spend money on
+# the strength of the two numbers -- and a rate with no visible age is a rate
+# that gets trusted a year later. PRICING_CONFIG had already solved this in
+# exactly this shape.
+
+check("6f config.S3_PRICING carries both rates AND a machine-readable date, "
+      "which is the whole reason it is a dict rather than two scalars",
+      sorted(k for k in _config.S3_PRICING
+             if k in ("last_updated", "standard_usd_per_gb_month",
+                      "put_usd_per_1000")),
+      ["last_updated", "put_usd_per_1000", "standard_usd_per_gb_month"])
+check("6g ...and the date is an ISO day, not free text, so a reader can "
+      "subtract it from today rather than parse a sentence",
+      bool(_re.fullmatch(r"\d{4}-\d{2}-\d{2}",
+                        str(_config.S3_PRICING["last_updated"]))), True)
+check("6h ...and both rates are positive numbers rather than strings, which "
+      "is what stops a quoted rate multiplying into a TypeError at the "
+      "moment the estimate is wanted",
+      all(isinstance(_config.S3_PRICING[k], (int, float))
+          and not isinstance(_config.S3_PRICING[k], bool)
+          and _config.S3_PRICING[k] > 0
+          for k in ("standard_usd_per_gb_month", "put_usd_per_1000")), True)
+check("6i THE DATE TRAVELS WITH THE FIGURES: estimate_cost carries it out, so "
+      "the renderer does not have to reach back into config for it",
+      _cost["rates_last_updated"], _config.S3_PRICING["last_updated"])
+check("6j ...and it is read with .get, so a manifest missing the date still "
+      "produces the FIGURES. Losing the age of a rate must not cost the "
+      "estimate; the two rates are subscripted precisely because a missing "
+      "RATE has no number to print and must fail loudly",
+      _rates_removed_cost.get("rates_last_updated"), None)
+check("6k ...and that degraded case still prices correctly",
+      round(_rates_removed_cost["storage_usd_per_month"], 4), round(2.3, 4))
+
+# ---- the report puts the date in front of the reader ---------------------
+_cost_lines = _render_cost_lines(_cost)
+check("6l THE RENDERED REPORT PRINTS THE DATE beside the dollar figures, "
+      "which is the point: the age of the number is at the decision moment "
+      "rather than in a source file nobody is reading",
+      any(str(_config.S3_PRICING["last_updated"]) in ln for ln in _cost_lines),
+      True)
+check("6m ...on a line that says where it came from, so the reader can go "
+      "and re-quote it",
+      any("config.S3_PRICING" in ln for ln in _cost_lines), True)
+check("6n ...and an UNDATED manifest says so in words rather than printing an "
+      "empty field or the word None",
+      any("UNDATED" in ln for ln in _render_cost_lines(_rates_removed_cost)),
+      True)
+check("6o CONTROL: the undated render still prints both dollar figures, so "
+      "6n is not satisfied by a renderer that gave up",
+      sum(1 for ln in _render_cost_lines(_rates_removed_cost)
+          if "$" in ln) >= 2, True)
+
+# ---- the heading names the CONFIGURED region, not a literal --------------
+#
+# It was the literal "us-east-1". Correct and unmaintained: the moment
+# ONCOTRIAGE_S3_STAGING_REGION could move the region, a hardcoded heading would
+# price one region under another region's name.
+check("6p the cost heading names the CONFIGURED staging region",
+      any(f"S3 Standard, {_config.S3_STAGING_REGION}" in ln
+          for ln in _cost_lines), True)
+check("6q ...and the rates declare which region they were QUOTED for, so the "
+      "heading naming a different one cannot read as a re-quote",
+      _config.S3_PRICING.get("quoted_region"), "us-east-1")
+check("6r ...and when the two differ the report SAYS the figures are "
+      "indicative, rather than pricing one region under another's name",
+      any("RATE CAVEAT" in ln
+          for ln in _render_cost_lines(_cost, staged_region="eu-west-1")),
+      True)
+check("6s CONTROL: and when they agree it does NOT, so 6r is a statement "
+      "about the mismatch and not about the renderer always warning",
+      any("RATE CAVEAT" in ln for ln in _cost_lines), False)
+
+check("6v THE MISMATCH IS A FIELD AND NOT ONLY PROSE: estimate_cost carries "
+      "the quoted region and the staged one out, so a machine consumer can "
+      "branch on it. queries.cost_complete is the precedent -- a reason that "
+      "lives in a note is a reason nothing can act on",
+      (_cost["rates_quoted_region"], _cost["staged_region"]),
+      (_config.S3_PRICING.get("quoted_region"), _config.S3_STAGING_REGION))
+check("6w CONTROL: and the two agree today, so 6r's caveat really is driven "
+      "by the rebind rather than by a standing mismatch",
+      _cost["rates_quoted_region"] == _cost["staged_region"], True)
+
+check("6t CONTROL: the mismatch arm's rebind was restored, so nothing after "
+      "this section reads a region this section installed",
+      _config.S3_STAGING_REGION, _REGION_BEFORE_SECTION_6)
+check("6u ...and the captured baseline is non-degenerate: a rebind that never "
+      "happened would satisfy 6t whatever it was set to",
+      bool(_REGION_BEFORE_SECTION_6)
+      and _REGION_BEFORE_SECTION_6 != "eu-west-1", True)
 
 
 print()

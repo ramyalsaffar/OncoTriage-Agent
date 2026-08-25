@@ -179,12 +179,35 @@ def estimate_cost(total_bytes, object_count):
     an operator comparing months would see the first one and budget from it.
     """
     gigabytes = total_bytes / _BYTES_PER_GB
+    rate_gb_month = config.S3_PRICING["standard_usd_per_gb_month"]
+    rate_put_per_1000 = config.S3_PRICING["put_usd_per_1000"]
     return {
         "gigabytes": gigabytes,
-        "storage_usd_per_month": gigabytes * config.S3_STANDARD_USD_PER_GB_MONTH,
-        "put_usd_one_time": (object_count / 1000.0) * config.S3_PUT_USD_PER_1000,
-        "rate_gb_month": config.S3_STANDARD_USD_PER_GB_MONTH,
-        "rate_put_per_1000": config.S3_PUT_USD_PER_1000,
+        "storage_usd_per_month": gigabytes * rate_gb_month,
+        "put_usd_one_time": (object_count / 1000.0) * rate_put_per_1000,
+        "rate_gb_month": rate_gb_month,
+        "rate_put_per_1000": rate_put_per_1000,
+        # THE DATE TRAVELS WITH THE RATES, and that is the point of the change
+        # that put them in a dict. It was a `#` comment in oncotriage/config.py
+        # -- unreadable by any program, therefore unprintable by any report,
+        # therefore invisible to the person deciding whether to spend money on
+        # the strength of these two numbers. A rate with no age is a rate that
+        # gets trusted a year later.
+        #
+        # READ WITH .get, NOT SUBSCRIPTED. The two rates are subscripted above
+        # because a missing rate must fail loudly -- there is no number to
+        # print. A missing DATE must not take the whole cost estimate down: the
+        # renderer says "undated" and the operator still gets the figures.
+        "rates_last_updated": config.S3_PRICING.get("last_updated"),
+        # THE REGION THE RATES WERE QUOTED FOR, carried out for the same reason
+        # the DATE is: `render_report` says in prose that the figures are
+        # indicative when it differs from the staged region, and prose is not a
+        # field. `queries.cost_complete` is the precedent -- a consumer that
+        # only sees the number cannot tell a priced figure from an indicative
+        # one, and the whole point of that column is that the reason was in a
+        # `note` and nothing could branch on it.
+        "rates_quoted_region": config.S3_PRICING.get("quoted_region"),
+        "staged_region": config.S3_STAGING_REGION,
     }
 
 
@@ -328,8 +351,31 @@ def render_report(report, out=None):
     emit(f"  VERDICT          : {'CLEAN' if scan['clean'] else 'REFUSED'}")
     emit("")
 
-    emit("Estimated cost -- S3 Standard, us-east-1")
+    # THE REGION IN THIS HEADING WAS THE LITERAL "us-east-1" and it is now the
+    # configured one. It was correct and unmaintained: the moment
+    # ONCOTRIAGE_S3_STAGING_REGION could move the region, a hardcoded heading
+    # would have priced one region under another region's name, which is the
+    # exact shape of report this project treats as worse than no report.
+    #
+    # THE RATES ARE STILL us-east-1's. Naming the configured region here is
+    # honest about WHAT IS BEING STAGED and would be dishonest about the RATES
+    # if it implied they had been re-read, so the line below says which region
+    # the prices were quoted for whenever the two differ.
+    emit(f"Estimated cost -- S3 Standard, {config.S3_STAGING_REGION}")
     emit("-" * 78)
+    # NO MULTI-LINE EXPRESSION INSIDE AN f-STRING. That is PEP 701 and needs
+    # Python 3.12; pyproject declares >=3.10 and the container runs 3.11, where
+    # it is a SyntaxError -- which would make importing this module fail rather
+    # than making one line render oddly.
+    _dated = cost.get("rates_last_updated")
+    _dated_text = _dated if _dated else "UNDATED (no last_updated field)"
+    emit(f"  rates read       : {_dated_text}  (config.S3_PRICING)")
+    _quoted_region = config.S3_PRICING.get("quoted_region")
+    if _quoted_region and _quoted_region != config.S3_STAGING_REGION:
+        emit(f"  RATE CAVEAT      : the two rates below were quoted for "
+             f"{_quoted_region} and this run stages to "
+             f"{config.S3_STAGING_REGION}. S3 prices differ by region, so "
+             f"these figures are indicative only.")
     emit(f"  storage          : ${cost['storage_usd_per_month']:,.2f} / month "
          f"({cost['gigabytes']:,.1f} GB @ ${cost['rate_gb_month']}/GB-month)")
     emit(f"  PUT requests     : ${cost['put_usd_one_time']:,.2f} ONE TIME "

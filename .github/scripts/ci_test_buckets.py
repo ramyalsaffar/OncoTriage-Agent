@@ -143,14 +143,18 @@ BUCKETS = {
         "suite's two writers and is sha256-compared at the end"),
     "test_compose_shutdown_grace.py": (
         _A, None,
-        "ran green in 0.7s, 17 checks, against ONLY the directory skeleton: "
+        "ran green in 0.8s, 30 checks, against ONLY the directory skeleton: "
         "docker-compose.yml's stop_grace_period is >= "
         "MATCHING_REQUEST_TIMEOUT_SECONDS x (1 + OPENAI_SDK_MAX_RETRIES) plus "
         "a named, uncalibrated margin -- an INEQUALITY, never == 620, so a "
         "legitimate timeout change moves it instead of failing it. It also "
         "pins that the grace sits on the fastapi service and that the "
         "per-trial arm's four-round worst case is a KNOWN, DOCUMENTED "
-        "shortfall rather than something this file quietly reports as fine. "
+        "shortfall rather than something this file quietly reports as fine, "
+        "and that BOTH arms' worst-case FIGURES in that comment agree with "
+        "the constants -- each looked for in its own region of the comment, "
+        "because the two figures coincide today and a whole-file substring "
+        "test for one is satisfied by the other. "
         "NO DOCKER DAEMON: it starts no container and runs no compose command; "
         "the YAML is read as TEXT and COMMENT-STRIPPED, on the Docker pass's "
         "lesson that a file arguing about its own settings cannot be grepped "
@@ -162,6 +166,34 @@ BUCKETS = {
         "config.py IS written by tests/test_config_snapshot_date_rot.py, which "
         "rewrites only the DATA_SNAPSHOT_DATE literal and touches no timeout "
         "or retry constant"),
+    "test_settings_region_overrides.py": (
+        _A, None,
+        "ran green in 9s, 59 checks, against ONLY the provisioned CI skeleton "
+        "(verified by running it under ONCOTRIAGE_MAIN_PATH pointed at a fresh "
+        "provision_ci_paths.py root, not assumed): the two deployment-varying "
+        "AWS Regions and their environment overrides -- "
+        "ONCOTRIAGE_S3_STAGING_REGION and ONCOTRIAGE_BEDROCK_REGION. Section 1 "
+        "drives every branch of both resolvers in-process with the environment "
+        "restored in a finally, and drives settings._from_env on the SAME "
+        "input to show the two DISAGREE, which is what turns 'deliberately not "
+        "_from_env' from a comment into a check. Sections 2 and 3 use FOUR "
+        "SUBPROCESSES, because config.py resolves both Regions at MODULE SCOPE "
+        "and the arm where the variable is SET is therefore unreachable in a "
+        "process that has already imported it -- "
+        "tests/test_docker_qdrant_override_and_readiness.py's situation "
+        "exactly, taking the same answer for the same reason. NO NETWORK AND "
+        "NO AWS SDK: the preflight probe runs on a stand-in session_factory "
+        "inside its subprocess and asserts boto3 never entered THAT process's "
+        "sys.modules; every subprocess is handed ONCOTRIAGE_QDRANT_URL pointed "
+        "at a closed port and ONCOTRIAGE_DEFER_LOCAL_MODELS=1. No keys, no "
+        "spend, no live Qdrant, no model load, no corpus, no database, no git "
+        "history, no live server, no Docker daemon. It EXECS NOTHING and loads "
+        "no module by location -- the subprocesses are `python -c` with the "
+        "code directory as cwd -- so it needs no _EXEC_ALLOWLIST entry. NOT in "
+        "the collision matrix: it writes NOTHING anywhere, not even a temp "
+        "directory, and the one repository file it reads, oncotriage/config.py, "
+        "IS rewritten in place by tests/test_config_snapshot_date_rot.py and is "
+        "therefore sha256-compared in its section 5"),
     "test_serial_runner_lock.py": (
         _A, None,
         "ran green in 0.5s, 85 checks, against ONLY the directory skeleton: "
@@ -192,7 +224,7 @@ BUCKETS = {
         _A, None, "ran green in 8.3s; registries and clients replaced through deps"),
     "test_agent_bedrock_adapter.py": (
         _A, None,
-        "ran green in 2.4s, 273 checks, against ONLY the directory skeleton: "
+        "ran green in 2.4s, 278 checks, against ONLY the directory skeleton: "
         "the Stage 5 Bedrock adapter behind config.MATCHING_PROVIDER, which "
         "ships OFF. Every client is a stand-in installed through "
         "oncotriage/agent/deps.py and every model response is a literal dict, "
@@ -777,7 +809,7 @@ BUCKETS = {
         _A, None, "ran green in 1.8s; temp SQLite only"),
     "test_staging_exclusions.py": (
         _A, None,
-        "ran green in 1.1s, 117 checks, against ONLY the provisioned CI "
+        "ran green in 1.2s, 139 checks, against ONLY the provisioned CI "
         "skeleton (verified by running it under ONCOTRIAGE_MAIN_PATH pointed "
         "at a fresh provision_ci_paths.py root, not assumed): the S3 staging "
         "exclusion rulings and the secrets refusal. NO NETWORK AND NO AWS SDK "

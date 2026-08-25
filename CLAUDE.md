@@ -1115,6 +1115,30 @@ dependencies (item 11a)" below.
 
 `ONCOTRIAGE_INFERENCES_DB` overrides `inferences_path` for **both** database writers (`resolve_inference_db_path`, `resolve_drift_db_path`) and is the only way to redirect a running FastAPI server; it is named in `oncotriage/settings.py` and does **not** go through `_from_env`. See the Tests paragraph above for what it is for and why the helper would corrupt it.
 
+
+`ONCOTRIAGE_S3_STAGING_REGION` and `ONCOTRIAGE_BEDROCK_REGION` move the two AWS
+Regions this project names — the one `oncotriage/staging/` stages to and the one
+interpolated into the Bedrock base URL. Both are named in
+`oncotriage/settings.py`, both have their own resolver, and neither goes through
+`_from_env`: that helper appends a separator, and `"us-east-1/"` is not a Region
+— it lands inside a HOSTNAME
+(`bedrock-runtime.us-east-1/.amazonaws.com`), which is a failure that names
+neither the slash nor the variable. **They are the sixth and seventh victims of
+that helper**, after `ENV_AIRFLOW_PASSWORD`, `ENV_INFERENCES_DB`,
+`ENV_ALLOW_DEGRADED_REGISTRIES`, `ENV_LOG_LEVEL` and `ENV_BEDROCK_API_KEY`.
+**The defaults stay in `oncotriage/config.py`** as `S3_STAGING_REGION_DEFAULT`
+and `BEDROCK_REGION_DEFAULT`, both still `us-east-1`, so nothing moves for
+anybody who sets nothing. **The resolvers never raise** — both are resolved at
+config's MODULE SCOPE, so a raise would make `import oncotriage.config` fail for
+every process in the project over a typo in a variable that concerns two of
+them; validation of the VALUE stays lazy and provider-gated in
+`config.validate_matching_provider_config()`, which now also refuses a Region
+carrying whitespace or a `/` and names WHICH of the two sources supplied it.
+The S3 preflight's wrong-region refusal is **unchanged in behaviour** — a
+session in another Region still refuses, because a bucket's Region is fixed for
+its lifetime — and gains a remedy that is not a source edit. See "The hardcoding
+audit record" below.
+
 **THE `../04- Keys/` MOUNT IS FIXED AND THIS PARAGRAPH USED TO SAY IT WAS NOT** — corrected during the Docker pass, which measured the compose file rather than re-reading this note. What was true: pass 20c-3c-2 found a **two-two split, not a stray line** — `fastapi` and `airflow-webserver` mounted `../04- Keys/.env`, which does not exist, so Docker created an empty *directory* at that host path and bind-mounted it as `/app/.env`, and `load_env_keys()` failed with `.env file not found` or an `IsADirectoryError` depending on how it was reached; `streamlit` and `airflow-scheduler` were correct. **Item 21 closed it**: all four (now five, with `airflow-dag-processor`) name `../05- Keys/.env`, and every one carries `create_host_path: false`, which turns a missing or misspelled credentials path from a silently-mounted empty directory into a failure at `up` that names the path. The only occurrences of `04- Keys` left in `docker-compose.yml` are the two comments recording the fix.
 
 **The `AIRFLOW__CORE__DAGS_FOLDER` line is NOT a defect, and pass 20c-3c-2 checked rather than repeated the claim.** `docker-compose.yml` lines 148 and 192 set it to `/app/airflow_home/dags`; `oncotriage/paths.py` line 291 sets the Docker-branch `airflow_path` to `/app/airflow_home/`; and `write_dag_file(dags_root)` writes to `Path(dags_root) / 'dags'`. Those are the same directory, and `AIRFLOW_HOME=/app/airflow_home` agrees with both. What IS true is that **nothing in the container ever runs File 23** — the webserver's command is `mkdir -p /app/airflow_home/dags && airflow db migrate && airflow api-server`, and the scheduler's is `sleep 30 && airflow scheduler`. So the DAG folder is created empty and the scheduler parses an empty directory forever. That is the real Docker-item defect in this area, and it is a missing generation step, not a path mismatch.
@@ -8882,6 +8906,265 @@ raise shown to fire with the thing absent **and** shown not to fire with it
 present, the dry run shown against a copy of a real cohort with a real run on an
 identical second copy as the control, and the pre-11a histology shape
 reconstructed in an AST copy so the structural check has something to fail on.
+
+### The hardcoding audit record (2026-08-25)
+
+**THIS SECTION EXISTS SO THE NEXT SWEEP BUILDS ON A RECORD RATHER THAN ON
+COMMIT ARCHAEOLOGY.** Two audits of hardcoded values have now run against this
+tree. Neither left a durable note, so the second one re-derived the first one's
+boundary from `git log` — which is exactly the cost this section removes.
+
+**A NAMING COLLISION, DISAMBIGUATED FIRST.** "The promotion pass" already names
+something else in this document — the Stage 4 histology/age/sex fixes and the
+two test files that committed their proof. The work below is **the August
+hardcoding-promotion pass**, and the two are unrelated.
+
+**WHAT THE FIRST AUDIT REMEDIATED — SEVEN COMMITS, 2026-08-20 to 2026-08-21.**
+Every one is the same shape: a literal with more than one site, or a literal
+whose owner was the wrong module, promoted to ONE owner in
+`oncotriage/config.py` and given a reader.
+
+| commit | what it promoted |
+|---|---|
+| `09436e0` | the RRF fusion constants — `RRF_K` and the four channel weights — to config ownership, the tracking enumeration and the fixture tunables record; **the two-stage equality became structural rather than asserted in a comment** |
+| `cf0a5b3` | the collection alias and its staging-family prefix under `config.COLLECTION_NAME` across the indexer and the generated DAG; fixed `cleanup_old_collections`' cross-family deletion |
+| `43c25d4` | the embedding-batch throughput knobs; unified `CHARS_PER_TOKEN` and the derived method strings with their owner; corrected an 8x-stale batch comment |
+| `875b441` | one config owner for the API port across the server and both harnesses; derived the harness POST budget from the server's own worst-case arithmetic |
+| `d421f22` | `COHORT_CAP`, `COHORT_SELECTION_SEED`, the ablation seeds and the harness selection default, with the false-record rule on `tracking.CONFIGURATION_PARAM_NAMES` |
+| `2a2a129` | the evaluation-sample output names, derived from the owning count rather than typed; parameterized and cache-keyed the default destination |
+| `2cc2033` | `CROSS_ENCODER_MAX_LENGTH`, paired with its checkpoint under config ownership, with a loud load-time consistency check |
+
+`3180145` (2026-08-22, "promote testing paths into the path tables") is the
+same shape one layer out — it removed two PRIVATE globs that invented
+`{root}/09- Testing` — and is recorded here as adjacent rather than as an
+eighth member, because its subject is `oncotriage/paths.py` rather than the
+tunables table. **THIS LIST WAS DERIVED FROM `git log`, NOT SUPPLIED**, and the
+derivation is stated so the next reader can disagree with the boundary rather
+than inherit it silently.
+
+**WHAT THE SECOND AUDIT FOUND: THE TREE IS LARGELY CLEAN, AND THAT IS THE
+FINDING.** A read-only sweep for surviving hardcoded values turned up no
+category-1 defect — no literal with two owners that can disagree, no value
+folded into a URL or a query that a config constant already names. What it left
+was a short list of items each of which is about a value being *unreachable* or
+*undated* rather than duplicated. Those are the pass recorded immediately below.
+
+**THE STANDING CATEGORY-2 RULINGS — VALUES THAT LOOK HARDCODED AND STAY.**
+Each has been argued at its own site and each will be found again by the next
+sweep, so they are listed here to be recognised rather than re-litigated:
+
+* **`FALLBACK_MAIN_PATH` in `oncotriage/settings.py`.** The one absolute path in
+  any tracked file, deliberate, argued in place, and reachable only when
+  `ONCOTRIAGE_MAIN_PATH` is unset. Promoting it to an environment variable is
+  what `ONCOTRIAGE_MAIN_PATH` already is; deleting the fallback would make every
+  invocation on the development machine need an export.
+* **The Spyder footers.** Every file carries a `#!/usr/bin/env python3` and a
+  creation-date docstring at the BOTTOM. They are generated, they are inert, and
+  rewriting them changes bytes in files whose sha256 several tests compare.
+* **`oncotriage/control.py`'s five bounds** — `EXIT_LOCKED = 3`,
+  `LOCK_DIRECTORY_MODE = 0o700`, `LOCK_FILE_MODE = 0o600`,
+  `STOP_MESSAGE_MAX_CHARS = 1000` and `STOP_MESSAGE_TAIL_PROBE_CHARS = 4096`.
+  They stay OUT of `oncotriage/config.py` on that file's own rule that every
+  tunable in it has a reader and therefore an effect: these are properties of a
+  mechanism, not settings of a pipeline, and an operator changing any of them
+  changes nothing about what a run does or costs. Moving them would also make
+  `config.py` an importer of `control.py`, which is the one edge that module may
+  not have — it imports nothing from the project, which is what lets a
+  `usercustomize` hook load it at interpreter startup.
+  `tests/test_serial_runner_lock.py` section 9 pins the two mode constants at
+  the one owner, and the serial runner's deliberate COPY of the lock machinery
+  is pinned against it by AST there.
+
+**AND THE ONE CATEGORY THE SWEEP DOES NOT COVER, stated so it is not mistaken
+for a clean result.** A grep-and-read sweep finds a literal that is WRITTEN
+twice. It cannot find a literal that is written once and is nonetheless the
+wrong owner, and it cannot find a number that is correct today and uncalibrated
+— which is what the three provenance sentences below are about.
+
+
+### Two Regions became settable, three numbers admitted they are uncalibrated (the region-and-provenance pass)
+
+Six items off the second audit. **No billed call, no schema change, no
+migration, and nothing on disk was written**: the twelve fixtures replay
+**12/12 clean, exit 0, with no recapture**, and the production `inferences.db`
+and `ablation_results.db` sha256 are unchanged.
+
+**1. THE TWO DEPLOYMENT-VARYING REGIONS HAVE OVERRIDES.**
+`ONCOTRIAGE_S3_STAGING_REGION` and `ONCOTRIAGE_BEDROCK_REGION`, documented in
+the environment-variable block above. The short argument: a refusal whose only
+remedy is a SOURCE EDIT is a dead end, and a tracked file edited for one machine
+is a tracked file committed for every machine. The S3 preflight still refuses a
+session in another Region — it must, because a bucket's Region is fixed for its
+lifetime — and what moved is the EXPECTED side of that comparison plus the
+remedy the message names.
+
+**THE REFUSALS NAME THE SOURCE, AND THAT IS THE HALF THAT IS EASY TO SKIP.** An
+exported variable is undone with `unset` and a wrong default is a source edit;
+an un-sourced value sends both to the same page, and **the export is the half
+that is invisible in a diff**. So `S3_STAGING_REGION_SOURCE` and
+`BEDROCK_REGION_SOURCE` are resolved beside the values and rendered into the two
+refusals — which is also what gives each of them a production reader.
+
+**A NEW GUARD, BECAUSE THE OVERRIDE MADE A NEW FAILURE REACHABLE.**
+`validate_matching_provider_config()` now refuses a Region carrying whitespace or
+a `/`. A Region is interpolated into a HOSTNAME, so either character lands
+inside `bedrock-runtime.{region}.amazonaws.com` and the resulting failure names
+neither — **which is precisely the corruption `_from_env`'s trailing separator
+would have caused and the reason both resolvers decline that helper**. Refusing
+one shape of it while tolerating the other two would be inconsistent. It does
+NOT check that the Region exists: nothing here can, without a network call this
+project does not make at configuration time, and inventing a Region list would
+refuse a Region AWS adds next quarter.
+
+**2. THREE NUMBERS CARRY THEIR PROVENANCE NOW.** `COHORT_CAP = 1000` is the
+**operator-ruled campaign size** — a decision about how much one campaign
+spends, roughly $130–$170 of Stage 5 at the measured per-patient cost, not
+derived from any statistic and with nothing outstanding to re-derive it against.
+`ABLATION_SAMPLE_SIZE_DEFAULT = 75` and `EVALUATION_SELECTION_SIZE_DEFAULT = 10`
+are **uncalibrated holding values**, and each now names the instrument that
+would calibrate it: the Power/MDE block `27- Ablation Analysis.py` prints for the
+first, and — explicitly NOT that block — a precision calculation on an agreement
+RATE for the second, which is a different unit over a different n and which
+nothing in the project computes today. **An n chosen by nobody has a specific
+failure mode**: the study runs, every configuration produces a mean, and the
+deltas that do not reach significance are indistinguishable from effects that
+are genuinely absent. Reading the MDE block after the money is spent is reading
+it too late to change n.
+
+**3. THE TWO S3 RATES CARRY A MACHINE-READABLE DATE.** `S3_PRICING` replaces
+`S3_STANDARD_USD_PER_GB_MONTH` and `S3_PUT_USD_PER_1000`, on `PRICING_CONFIG`'s
+shape — a `last_updated` FIELD beside the rates — and
+`manifest.render_report` prints it beside the dollar figures. **The date was a
+`#` comment**, which is unreadable by any program, therefore unprintable by any
+report, therefore invisible to the person deciding whether to spend money on the
+strength of those two numbers. The dict also carries `quoted_region`, because
+the region is now overridable and S3 prices differ by region: when the staged
+region and the quoted one disagree the report says the figures are indicative
+rather than pricing one region under another's name. **The cost heading's
+`us-east-1` was a literal and is now the configured region**, for the same
+reason. `estimate_cost` reads the two RATES by subscript and the DATE with
+`.get`: a missing rate has no number to print and must fail loudly, and losing
+the age of a rate must not cost the estimate.
+
+**4. TWO BOUNDS IN `secrets_scan.py` SAY WHAT THEY ARE NOT.** `sha256_file`'s
+1 MiB `chunk` is a READ BUFFER — every byte is hashed at any value of it — and
+`scan_files`' `progress_every` is a CONSOLE CADENCE. Neither decides anything
+about what the scanner sees. **`config.S3_STAGING_SCAN_PREFIX_BYTES` is the one
+argued bound in that file** and it is a security property with a stated limit.
+Conflating them is how a security bound gets tuned by somebody who thought they
+were adjusting a buffer.
+
+**5. THE COMPOSE GRACE PIN COVERED THE DERIVATION AND NOT THE SHORTFALL.**
+`tests/test_compose_shutdown_grace.py` pinned the numbers 620 IS derived from
+(4a–4c) and derived both arms' worst cases from the constants (section 3), but
+**never compared the derived FIGURE against the 2400 the compose comment
+states** — so moving `MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS` or
+`MATCHING_MAX_INPUT_PACKED_CHUNKS` left that prose standing, correct-looking and
+wrong, with section 3's INEQUALITY still passing (a larger real worst case still
+exceeds the grace period). Checks 4d–4i close it. **Each figure is looked for in
+its OWN region of the comment**, because the two worst cases are the same number
+today (2400) and a whole-file substring test for one is satisfied by the other —
+a check satisfied by the wrong evidence, which fails to fail. **17 → 30 checks.**
+
+**6. THIS SECTION AND THE ONE ABOVE IT ARE ITEM 6.**
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **`docker-compose.yml` does not pass either new variable into any
+   container.** That is CONSISTENT rather than a half-wiring — `s3_stage.py` is
+   not a compose service, `MATCHING_PROVIDER` ships `"openai"`, and the Bedrock
+   API key is not wired into compose either — so nothing in the container reads
+   a Region an operator could have set on the host. **It becomes a live gap the
+   day `MATCHING_PROVIDER` flips**, and the fix is one `environment:` line on
+   `fastapi` beside the credential's, not a change here.
+2. **`BEDROCK_ENDPOINT` and `BEDROCK_REGION` are still not gated by the resume
+   fingerprint.** Making the Region settable does not change that; it makes it
+   easier to reach, which raises the rank of the follow-up already recorded at
+   `config.matching_wire_model()` rather than changing its shape. Two runs
+   against `us.openai.gpt-5.6-terra` in different Regions remain
+   indistinguishable to a resume gate, and closing it is a seventh gated field
+   and a `FINGERPRINT_VERSION` bump.
+3. **The two S3 rates are still `us-east-1`'s at any staged region.**
+   `S3_PRICING["quoted_region"]` is what makes the gap visible — the report says
+   the figures are indicative and `estimate_cost` carries both regions out as
+   fields so a machine consumer can branch on it — and nothing RE-QUOTES them.
+   Doing so is a source edit with a new `last_updated`, per region, and is a
+   decision about how many regions this project intends to price.
+4. **`_module_constants` in `tests/test_package_invariants.py` check 2h does
+   not see a TUPLE-assigned module constant** — it collects `ast.Name` targets
+   and a tuple target is an `ast.Tuple` — so `S3_STAGING_REGION`,
+   `S3_STAGING_REGION_SOURCE`, `BEDROCK_REGION` and `BEDROCK_REGION_SOURCE` are
+   outside that scan. All four have production readers today; what is missing
+   is the check that would say so tomorrow. Found while writing this pass, not
+   introduced by it: the blind spot predates these four names.
+
+```bash
+# The region-and-provenance pass. Same shape, same directory. NO NETWORK AND NO
+# AWS SDK (the preflight probe runs on a stand-in session_factory inside its
+# subprocess and asserts boto3 never entered THAT process's sys.modules), no
+# keys, no spend, no live Qdrant, no model load, no corpus, no database, no git
+# history, no live server, no Docker daemon. It uses FOUR SUBPROCESSES, because
+# config.py resolves both Regions at MODULE SCOPE and the arm where the variable
+# is SET is unreachable in a process that has already imported it -- the same
+# answer tests/test_docker_qdrant_override_and_readiness.py takes for the same
+# reason. It EXECS NOTHING and loads no module by location. NOT in the collision
+# matrix: it writes NOTHING anywhere, not even a temp directory, and the one
+# repository file it reads (oncotriage/config.py) IS rewritten in place by
+# tests/test_config_snapshot_date_rot.py and is sha256-compared at the end.
+# Bucket A, ~9 s.
+python tests/test_settings_region_overrides.py                      #  59
+```
+
+`tests/test_staging_exclusions.py` is **139** (was 117; section 6 gained the
+`S3_PRICING` shape, the report's date line, the undated degradation, the region
+heading and the two machine-readable region fields, each with its own control),
+`tests/test_compose_shutdown_grace.py` is **30** (was 17), and
+`tests/test_agent_bedrock_adapter.py` is **278** (was 275).
+
+**THAT LAST ONE IS A LANDMINE THIS PASS CREATED AND THEN REMOVED, and it is
+recorded because the same shape will recur the next time a literal becomes
+settable.** That file's section 9 -- "nothing leaked" -- asked its question
+against LITERALS, including `config.BEDROCK_REGION == "us-east-1"`. Correct
+while that was a literal in `config.py`, and a landmine the moment it became
+resolved from an environment variable: an operator who had exported
+`ONCOTRIAGE_BEDROCK_REGION` would have met a failure about LEAKAGE naming a
+constant rather than a defect. **Measured both ways rather than reasoned about**
+-- with the export set, the pre-fix file reports 1 failure
+(`expected: us-east-1, actual: eu-west-1`) and the shipped one reports 278/0 in
+both arms. The restore comparison is against an IMPORT-TIME CAPTURE now, which
+is the right instrument for a leakage check anyway, and **the literal claim
+moved to the thing that is still a literal**: `BEDROCK_REGION_DEFAULT`, which no
+variable can move.
+
+**A DEFECT IN THIS PASS'S OWN WORK, FOUND BY RUNNING RATHER THAN BY READING,
+AND IT IS THE INSTRUCTIVE ONE.** The region split in check 4d–4f first used the
+two phrases section 3 already pins — `"rounds per patient"` and `"chunks per
+patient"` — on the assumption that each opens its own arm's paragraph. **It does
+not**: the grouped paragraph opens with a table whose FIRST row is
+`criteria chars/trial` and whose second is `chunks per patient`, so the split
+point sat two lines INSIDE the grouped derivation and the "per-trial" region
+swallowed most of it. The two-directional phrase control caught it on the first
+run, which is why the control is a phrase test rather than a number: every
+number in that comment appears in several of its paragraphs, so no number could
+have discriminated. The anchors are the two section HEADINGS now, and the two
+derivation phrases are required to fall inside the region they belong to — which
+ties the two anchor sets together so neither can be renamed silently.
+
+**AND A SECOND, IN THE SAME FILE'S FIRST DRAFT.** `_region()` returned the rest
+of the file when the END anchor was missing, which SILENTLY WIDENS the region to
+everything below it — precisely the failure the scoping exists to prevent, and
+one that shows up as a check that still passes. It returns `""` now, and check
+4g2 is the control.
+
+**A THIRD, CAUGHT BY READING AND WORTH RECORDING BECAUSE IT WOULD HAVE BROKEN
+THE CONTAINER AND NOT THIS MACHINE.** The first version of the cost report's
+date line put a MULTI-LINE conditional expression inside an f-string. That is
+PEP 701 and needs Python 3.12; `pyproject.toml` declares `>=3.10` and the image
+runs **3.11**, where it is a SyntaxError — so `import
+oncotriage.staging.manifest` would have failed there while parsing cleanly on
+the 3.13 development interpreter. All four touched modules were re-scanned by
+AST for that construct afterwards and none remains.
+
 
 ## Conventions
 

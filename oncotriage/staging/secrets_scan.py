@@ -313,7 +313,20 @@ def _meaning(table, name):
 
 
 def sha256_file(path, chunk=1 << 20):
-    """Full-content sha256. Used by the allowlist and by the spot verification."""
+    """Full-content sha256. Used by the allowlist and by the spot verification.
+
+    ``chunk`` (1 MiB) IS A READ BUFFER AND NOT A SCAN BOUND, and the two are
+    named apart here because they look alike and one of them is a security
+    property. ``config.S3_STAGING_SCAN_PREFIX_BYTES`` decides HOW MUCH OF A
+    FILE IS EXAMINED -- raise it and the scanner sees more, lower it and a
+    credential can hide past the bound -- which is why it is a tunable in
+    config.py with a stated limit beside it. This number decides only how many
+    bytes cross the read boundary at a time on the way to the SAME digest.
+    Every byte of the file is hashed at any value of it; changing it moves
+    memory against syscalls and nothing else, so it is a local default rather
+    than a knob an operator is invited to tune. 1 MiB is the ordinary value for
+    this idiom, chosen for that reason and calibrated against nothing.
+    """
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
         for block in iter(lambda: handle.read(chunk), b""):
@@ -380,6 +393,23 @@ def scan_files(entries, plan, prefix_bytes=None, progress_every=25000):
     ``entries`` is an iterable of ``(abspath, relpath)``. The caller decides
     what to do with a dirty result -- ``refuse_if_dirty`` is that decision, kept
     separate so a report can show the findings before anything raises.
+
+    ``progress_every`` (25,000) IS A CONSOLE CADENCE AND DECIDES NOTHING ABOUT
+    THE SCAN, which is the same distinction ``sha256_file``'s ``chunk`` draws
+    and worth drawing again because this file now carries three numbers that a
+    reader could mistake for one kind. Every entry handed in is scanned at any
+    value of it, ``None`` or ``0`` prints no progress at all, and the
+    ScanResult is identical either way. It exists so a run over ~200,000 files
+    is not a silent several-minute pause. Chosen so a full staged tree emits a
+    handful of lines rather than one or hundreds; calibrated against nothing,
+    and deliberately NOT a config tunable, because config.py's own rule is that
+    a tunable there has an effect and this one has no effect on any output the
+    project keeps.
+
+    THE ONE ARGUED BOUND IN THIS FILE IS ``config.S3_STAGING_SCAN_PREFIX_BYTES``
+    -- see ``scan_file``. That one is a security property with a stated limit;
+    these two are not, and conflating them is how a security bound gets tuned
+    by somebody who thought they were adjusting a buffer.
     """
     result = ScanResult()
 

@@ -267,7 +267,13 @@ def main(argv=None):
     del _key                       # never printed, never logged, never stored
     print(f"  endpoint  : {config.BEDROCK_ENDPOINT}")
     print(f"  base URL  : {base_url}                     [VERIFY (6)]")
-    print(f"  region    : {config.BEDROCK_REGION}")
+    # THE SOURCE, NOT ONLY THE VALUE. This is day one's first command, and the
+    # first thing an operator who has just exported ONCOTRIAGE_BEDROCK_REGION
+    # wants to know is whether the export took. Printing the value alone
+    # answers that only if they can remember what the default was.
+    _region_src = (config.BEDROCK_REGION_SOURCE
+                   or "BEDROCK_REGION_DEFAULT in oncotriage/config.py")
+    print(f"  region    : {config.BEDROCK_REGION}  (from {_region_src})")
     print(f"  model     : {config.matching_wire_model()}")
     print(f"  key source: {key_source}")
 
