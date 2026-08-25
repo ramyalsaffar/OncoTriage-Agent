@@ -931,9 +931,11 @@ inside, so two workers incrementing the same key can lose one of them --
 Every increment here happens in the send loop, after the merge, on the thread
 that owns the node.
 
-STAYS AT ZERO WHILE MATCHING_PER_TRIAL_CALLS_ENABLED IS False, because nothing
-in that configuration can reach the branch that increments it. Same shape as
-BEDROCK_ADAPTER_DEGRADATIONS under MATCHING_PROVIDER "openai".
+STAYS AT ZERO IN THE GROUPED ARM (MATCHING_PER_TRIAL_CALLS_ENABLED False),
+because nothing in that configuration can reach the branch that increments it.
+Per-trial is the SHIPPED default, so on an ordinary campaign this counter is
+live and a zero here is a measurement rather than a configuration artefact --
+which is the opposite of what this sentence said while grouped was the default.
 """
 
 
@@ -961,8 +963,10 @@ report.
 INCREMENTED ON THE NODE THREAD ONLY, and here that is true by construction
 rather than by discipline: the warmup is awaited before any executor exists.
 
-STAYS AT ZERO WHILE MATCHING_PER_TRIAL_CALLS_ENABLED IS False, because nothing
-in that configuration reaches the branch that increments it.
+STAYS AT ZERO IN THE GROUPED ARM (MATCHING_PER_TRIAL_CALLS_ENABLED False),
+because nothing in that configuration reaches the branch that increments it.
+Per-trial is the SHIPPED default, so on an ordinary campaign a zero here means
+the warmup did its job on every patient -- read it as a measurement.
 """
 
 # The prefix under which a warmup TRANSPORT failure is counted, as opposed to a
@@ -1178,7 +1182,14 @@ SHUTDOWN_SKIP_WARMUP_KEY_PREFIX = "warmup:"
 SHUTDOWN_SKIP_WAVE_KEY_PREFIX = "wave:"
 SHUTDOWN_SKIP_SEND_KEY_PREFIX = "send:"
 """A request the SEND LOOP declined to issue. The third phase, and the one that
-covers the arm that ships.
+covers the RETAINED GROUPED arm.
+
+THAT SENTENCE READ "the arm that ships" AND IS CORRECTED RATHER THAN DELETED.
+It was written while grouped was the default; per-trial is the shipped arm now,
+and the shipped arm's declines are counted under ``wave:``. This prefix still
+covers grouped exclusively and still covers the reactive splitter's post-
+dispatch chunks in per-trial mode, so nothing about the mechanism moved -- only
+which arm it is the primary record for.
 
 IT IS NOT ``wave:``. ``wave:`` is a per-trial worker declining a task that was
 already SUBMITTED to the wave's pool -- N of them at once, off the node thread.
@@ -3465,7 +3476,8 @@ def node_llm_classifier_evaluation(state: TrialMatchState) -> dict:
     a SINGLE call" -- has been false since input packing and is false twice
     over now:
 
-      * ``MATCHING_PER_TRIAL_CALLS_ENABLED`` (default False) makes it ONE
+      * ``MATCHING_PER_TRIAL_CALLS_ENABLED`` (default True -- the shipped
+        arm) makes it ONE
         request per trial, bypassing the packer, behind a dedicated cache
         warmup that is awaited alone -- no trial call is ever issued without a
         warm shared prefix ahead of it, and a warmup that cannot be
@@ -4716,9 +4728,9 @@ CLINICAL TRIALS:
 
         ── THE SHUTDOWN GATE, AND WHY IT IS HERE AND NOT AT THE LOOP TOP ──
 
-        THE GAP THIS CLOSES IS THE ARM THAT SHIPS. Until this existed the flag
-        bounded the per-trial WAVE and nothing else, and
-        ``MATCHING_PER_TRIAL_CALLS_ENABLED`` is False -- so a batch run stopped
+        THE GAP THIS CLOSED WAS THE ARM THAT SHIPPED AT THE TIME. Until this
+        existed the flag bounded the per-trial WAVE and nothing else, and
+        ``MATCHING_PER_TRIAL_CALLS_ENABLED`` was False -- so a batch run stopped
         by Ctrl-C or SIGTERM had its grouped patients carry on issuing every
         REMAINING chunk of the packer's plan, sequentially, each bounded only by
         ``MATCHING_REQUEST_TIMEOUT_SECONDS`` and the SDK's own retries. One

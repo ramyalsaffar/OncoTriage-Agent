@@ -449,36 +449,41 @@ services:
     # finalized `runs` row, which are database writes measured in
     # milliseconds. 620s is 600 + 20 of margin for those.
     #
-    # ONE IN-FLIGHT CALL IS WHAT 620s BUYS, AND THIS COMMENT USED TO CLAIM
-    # THAT WAS A WHOLE GROUPED PATIENT. IT IS NOT, AND THE CORRECTION IS
-    # MEASURED RATHER THAN REASONED. The old text read: "THIS COVERS THE
-    # GROUPED ARM, WHICH IS WHAT SHIPS (`MATCHING_PER_TRIAL_CALLS_ENABLED` is
-    # False): one request per patient, so one in-flight call."
+    # ONE IN-FLIGHT CALL IS WHAT 620s BUYS, AND THAT IS NOT A WHOLE PATIENT IN
+    # EITHER ARM. This comment has been wrong about that twice and the number
+    # has never been the thing that was wrong -- what changed each time is
+    # which arm the shortfall is the PRIMARY statement about.
     #
-    # GROUPED MODE IS ONE REQUEST PER *CHUNK*, NOT PER PATIENT. The packer
-    # splits a patient's trials against the input-token budget, so the number
-    # of sequential requests depends on how long the trials' eligibility text
-    # is. Driven through the real Stage 5 node with a stub client at
-    # MAX_TRIALS_FOR_EVALUATION = 15 (the operator-control pass; no billed
-    # call):
-    #
-    #     criteria chars/trial   1000  2000  4000  6000  8000  12000
-    #     chunks per patient        1     2     3     4     5      5
-    #
-    # So a `docker stop` on this service can SIGKILL it with up to FOUR
-    # further full-price requests still to be issued -- worst case
-    # 4 x 600 = 2400 s of drain against a 620 s grace period. The number is
-    # NOT raised here, because raising it to 2400 s to cover a case that
-    # should not exist is the wrong repair: THIS SERVICE HAS NO SHUTDOWN GATE,
-    # and giving it one is the fix. That is recorded as the follow-up it
-    # already was, now with the arithmetic that makes it concrete.
-    #
-    # THE PER-TRIAL ARM IS LARGER STILL and this value does not cover it
-    # either:
+    # THE SHIPPED ARM IS PER-TRIAL (`MATCHING_PER_TRIAL_CALLS_ENABLED` is
+    # True), AND IT IS THE PRIMARY STATEMENT:
     #
     #     rounds per patient = ceil(MAX_TRIALS_FOR_EVALUATION / parallel)
     #                        = ceil(15 / 4) = 4
     #     worst case         = 4 x 600 = 2400 s = 40 minutes
+    #
+    # So a `docker stop` on this service can SIGKILL it with up to THREE
+    # further full-price rounds still to be issued. 620 s does not cover that
+    # and IS NOT RAISED TO 2400 s, because raising it to cover a case that
+    # should not exist is the wrong repair: THIS SERVICE HAS NO SHUTDOWN GATE.
+    # Giving it one is the fix, and it is the recorded follow-up.
+    #
+    # THE RETAINED GROUPED ARM IS THE SAME NUMBER, WHICH IS WHY THE FLIP DID
+    # NOT MOVE THIS VALUE. Grouped mode is one request per *CHUNK*, not per
+    # patient: the packer splits a patient's trials against the input-token
+    # budget, so the number of sequential requests depends on how long the
+    # trials' eligibility text is. Driven through the real Stage 5 node with a
+    # stub client at MAX_TRIALS_FOR_EVALUATION = 15 (the operator-control
+    # pass; no billed call):
+    #
+    #     criteria chars/trial   1000  2000  4000  6000  8000  12000
+    #     chunks per patient        1     2     3     4     5      5
+    #
+    #     worst case         = 4 further requests x 600 = 2400 s
+    #
+    # SO THE SHORTFALL ON THIS SERVICE IS ARM-INDEPENDENT, and 620 s was never
+    # sufficient here in either arm. What makes 620 s the right number is the
+    # BATCH RUNNER's gate, below -- not the arm, and this comment used to
+    # imply otherwise.
     #
     # THE BATCH RUNNER IS THE ONE THAT IS COVERED, AND AS OF THE
     # OPERATOR-CONTROL PASS IT IS COVERED IN BOTH ARMS -- which is what this

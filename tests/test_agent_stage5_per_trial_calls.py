@@ -49,14 +49,37 @@ WHAT IT HOLDS
        ``cached_tokens`` reaches ``call_details`` per call and the patient total
        reaches ``llm_classifier_cached_input_tokens``, with absence carried as
        None rather than as 0.
-    8. OFF IS EXACT: with the switch off the node issues the identical requests,
-       field for field, that a copy of the module with the whole mechanism
-       compiled out issues -- and publishes an identical packing record and an
-       identical stored prompt.
+    8. THE RETAINED GROUPED ARM IS EXACT: with the switch explicitly off the
+       node issues the identical requests, field for field, that a copy of the
+       module with the whole mechanism compiled out issues -- and publishes an
+       identical packing record and an identical stored prompt. Per-trial is
+       the SHIPPED default, so this is no longer a statement about a dormant
+       branch: it is what makes the migration's comparison arm worth
+       measuring against.
     9. THE CONTROLS. Every assertion above is shown to FAIL when the thing it
        checks is broken. Every plant goes into an in-memory COPY of the module;
        the source file is hashed before any plant and compared at the end, with
        a non-degeneracy probe on the comparison itself.
+
+THE ARM IS ALWAYS SET EXPLICITLY, AND THAT IS THE FILE'S IDIOM
+--------------------------------------------------------------
+EVERY drive in this file goes through ``run_node``, which takes ``per_trial``
+as a REQUIRED-IN-PRACTICE keyword and writes ``config.MATCHING_PER_TRIAL_
+CALLS_ENABLED`` on the module for the duration of the call, restoring it in a
+``finally``. No section reads the shipped default to decide what it exercises.
+
+THAT IDIOM WAS NOT CHANGED WHEN THE DEFAULT FLIPPED TO PER-TRIAL, and the
+choice is deliberate rather than inertia. A file whose ON-arm sections read the
+default would (i) exercise NOTHING the day the default moved back for a
+comparison campaign, silently -- the arm sections would all become second
+copies of section 8 -- and (ii) make every assertion in it a statement about
+two things at once, so a failure could not distinguish "the mechanism broke"
+from "somebody moved the default". Explicit on both sides means this file
+measures the MECHANISM and check 1a alone measures the DECISION.
+
+THE ONE PLACE THE DEFAULT IS READ IS CHECK 1a, which is where the shipped
+decision is written down, plus check 10e's restore -- and 10e reads
+``_START_CONFIG``, captured at import, rather than a literal.
 
 WHAT IS DELIBERATELY NOT HERE
 -----------------------------
@@ -176,6 +199,15 @@ _BASELINE_HASHES = {
     p: hashlib.sha256(open(p, "rb").read()).hexdigest()
     for p in (_EVALUATION_PATH, _DB_LOGGER_PATH)
 }
+
+# CAPTURED FOR THE SAME REASON AND AT THE SAME MOMENT: the two config constants
+# this file writes, read once before anything writes either. Section 10's
+# restore check compares against THESE rather than against literals, so a
+# legitimate change to the shipped default -- which this file has now seen
+# once -- moves check 1a and nothing else. A literal in the restore check is a
+# second copy of a shipped default that fails while naming a restore.
+_START_CONFIG = (config.MATCHING_PER_TRIAL_CALLS_ENABLED,
+                 config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS)
 
 
 _RESULTS = {"passed": 0, "failed": 0}
@@ -695,8 +727,32 @@ _SIX = [trial(i) for i in range(6)]
 
 section("SECTION 1 -- the switch, the vocabulary, and who reads them")
 
-check("1a  the switch ships OFF -- this pass builds the arm and does not turn "
-      "it on", config.MATCHING_PER_TRIAL_CALLS_ENABLED, False)
+# THIS CHECK USED TO PIN THE SWITCH **OFF** and it is inverted rather than
+# deleted, because the property it holds is unchanged: the shipped default is a
+# DECISION and this file is where it is written down, so a flip that nobody
+# meant fails here with the arm named. It read "the switch ships OFF -- this
+# pass builds the arm and does not turn it on"; the arm was built, probed
+# against stubs, gated for shutdown, given a warmup with cache-or-nothing
+# semantics, and then turned on. Grouped is retained behind the same switch as
+# the migration's comparison arm and section 8 is what keeps it exact.
+check("1a  the switch ships ON -- per-trial is the pipeline's design and the "
+      "shipped arm; grouped is the retained comparison arm",
+      config.MATCHING_PER_TRIAL_CALLS_ENABLED, True)
+# DERIVED FROM THE CONSTANT, NOT RESTATED. 1a is the ONE place the shipped
+# decision is written down; a second literal here would fail twice for one
+# change and the second failure would name the owner rather than the decision.
+# What 1a-ii holds is the pair of facts 1a cannot: the owner AGREES with the
+# constant, and NO PIN is installed -- a pin left behind by an earlier import
+# (tests/test_agent_stage5_input_packing.py and six siblings install one) would
+# make every default-arm statement in this file describe something else, and it
+# would do it silently, because a pin is designed to be indistinguishable from
+# the default to every consumer.
+check("1a-ii ...and the owner agrees with it, with no pin installed in this "
+      "process",
+      (config.matching_call_mode(), config.matching_call_mode_pin()),
+      (config.MATCHING_CALL_MODE_PER_TRIAL
+       if config.MATCHING_PER_TRIAL_CALLS_ENABLED
+       else config.MATCHING_CALL_MODE_GROUPED, None))
 check("1b  the in-node parallel bound is a usable integer >= 1",
       (isinstance(config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS, int),
        not isinstance(config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS, bool),
@@ -721,8 +777,11 @@ check("1d  matching_call_mode() reads the flag LIVE off the module, in both "
       "directions (a bound name would answer the same both times)",
       (_mode_on, _mode_off),
       (config.MATCHING_CALL_MODE_PER_TRIAL, config.MATCHING_CALL_MODE_GROUPED))
+# DERIVED FROM THE SAVED VALUE, NOT FROM A LITERAL. A restore check written as
+# `== False` is a second copy of the shipped default, and it goes red on a flip
+# while naming a restore that worked perfectly.
 check("1d  ...and it was restored", config.MATCHING_PER_TRIAL_CALLS_ENABLED,
-      False)
+      _saved_mode)
 
 # THE SEAM ITSELF. Without this, every ON-arm assertion below could be
 # exercising the shipped default and reporting success.
@@ -2842,8 +2901,16 @@ check("7h  ...and a grouped run whose provider reports nothing is still NULL, "
 
 
 # ===========================================================================
-# SECTION 8 -- THE OFF SWITCH, AS BYTES
+# SECTION 8 -- THE RETAINED GROUPED ARM, AS BYTES
 # ===========================================================================
+#
+# THIS IS AN EXPLICIT-OFF SECTION AND ALWAYS WAS: every drive below passes
+# `per_trial=False` to `run_node`, so nothing here reads the shipped default
+# and the flip did not move a single assertion in it. What the flip changes is
+# what the section is FOR. It was "the off switch is exact"; it is now "the
+# comparison arm is exact", which is a stronger reason to keep it -- every
+# migration number is grouped-against-per-trial, and a grouped arm that had
+# drifted would make the comparison a measurement of the drift.
 #
 # THE REFERENCE IS A COPY OF THE MODULE WITH THE WHOLE MECHANISM COMPILED OUT,
 # not a description of what it used to do. Two substitutions, each asserted to
@@ -2858,7 +2925,7 @@ check("7h  ...and a grouped run whose provider reports nothing is still NULL, "
 # Without the second, section 8 would prove the branches inert and say nothing
 # about whether `_obtain` issues the same request the loop used to.
 
-section("SECTION 8 -- per-trial OFF is byte-equivalent to the pre-pass node")
+section("SECTION 8 -- the grouped arm is byte-equivalent to the pre-pass node")
 
 _NEEDLE_FLAG = """    _per_trial_calls = (config.matching_call_mode()
                         == MATCHING_CALL_MODE_PER_TRIAL)"""
@@ -3205,12 +3272,18 @@ check("8b-q ...and every member is named in the floor, by AST rather than by "
 # issued sequentially from the node's own thread, and widening the gate would
 # change the grouped send loop's failure mode."
 #
-# THE LIMIT WAS REAL AND IT COVERED THE ARM THAT SHIPS.
-# MATCHING_PER_TRIAL_CALLS_ENABLED is False, so every batch run stopped by
+# THE LIMIT WAS REAL AND IT COVERED THE ARM THAT SHIPPED AT THE TIME.
+# MATCHING_PER_TRIAL_CALLS_ENABLED was False, so every batch run stopped by
 # Ctrl-C or SIGTERM had its in-flight patients carry on issuing every REMAINING
 # chunk of the packer's plan at full price. One chunk is the common case and it
 # is not the bound: the proactive packer splits on the input budget and the
 # reactive splitter halves on a `length` finish.
+#
+# GROUPED IS THE RETAINED COMPARISON ARM NOW, WHICH MAKES THIS CHECK MORE
+# VALUABLE RATHER THAN LESS: a comparison arm whose stop semantics differed
+# from the shipped arm's would put an artefact of the SHUTDOWN into a
+# measurement of the PARTITION. The two arms answer a Ctrl-C identically, and
+# that is what these five checks hold.
 #
 # THE FAILURE MODE DID CHANGE, WHICH IS WHAT THE OLD NOTE WARNED ABOUT, AND IT
 # CHANGED TO THE ONE PER-TRIAL MODE ALREADY HAD. The raise is
@@ -3242,8 +3315,8 @@ check("8b-s ...and the decline is COUNTED under its own `send:` phase, which "
 check("8b-t ...and the patient FAILS rather than publishing a partial "
       "success. A grouped patient that returned `evaluations` for the chunks "
       "it had already sent would be checkpointed by _on_done and skipped by "
-      "every resume forever -- the c33 argument, reached from the arm that "
-      "ships",
+      "every resume forever -- the c33 argument, reached from the RETAINED "
+      "GROUPED arm",
       (bool(at(_R_GRP, "error")), at(_R_GRP, "evaluations")),
       (True, []))
 check("8b-u the three phase prefixes are CLOSED and partition the places a "
@@ -4207,12 +4280,15 @@ control(
 )
 
 
-# --- c36: the grouped send gate, which is the ARM THAT SHIPS ----------------
+# --- c36: the grouped send gate, in the RETAINED COMPARISON ARM -------------
 #
 # Until the operator-control pass the flag bounded the per-trial WAVE and
-# nothing else, and MATCHING_PER_TRIAL_CALLS_ENABLED is False -- so every
+# nothing else, and MATCHING_PER_TRIAL_CALLS_ENABLED was False -- so every
 # grouped patient in flight when an operator pressed Ctrl-C carried on issuing
-# every REMAINING chunk of the packer's plan at full price.
+# every REMAINING chunk of the packer's plan at full price. Grouped is no
+# longer the shipped arm; it is the arm every migration comparison is measured
+# against, so its stop semantics have to match the shipped arm's or the
+# comparison carries a shutdown artefact.
 #
 # THE PROBE REUSES `_ShutdownStub` AT after=1, which is deterministic in
 # grouped mode for a sharper reason than in per-trial mode: grouped chunks are
@@ -4286,22 +4362,33 @@ check("10d every dependency override this file installed was cleared",
       deps.is_resolved(deps.OPENAI_CLIENT)
       and deps.peek(deps.OPENAI_CLIENT) is not deps.UNSET
       and isinstance(deps.peek(deps.OPENAI_CLIENT), _Stub), False)
+# DERIVED FROM THE VALUES THIS FILE SAW AT IMPORT, never from literals: a
+# literal here is a third copy of the shipped defaults and turns any legitimate
+# change to either constant into a failure that names a restore rather than the
+# change. `_START_CONFIG` is captured beside the source hashes at the top of the
+# file, before anything writes either constant.
 check("10e the two config constants this file writes are back where they "
       "started",
       (config.MATCHING_PER_TRIAL_CALLS_ENABLED,
-       config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS), (False, 4))
+       config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS), _START_CONFIG)
+check("10f non-degeneracy: the captured start values are the real ones, not a "
+      "pair this file could have satisfied by writing nothing",
+      (isinstance(_START_CONFIG[0], bool),
+       isinstance(_START_CONFIG[1], int)
+       and not isinstance(_START_CONFIG[1], bool)
+       and _START_CONFIG[1] >= 1), (True, True))
 
 # THE MODULE COUNTER IS LEFT NON-ZERO ON PURPOSE AND IS SAID SO. It is a
 # process-lifetime counter, this file drove real failures through the real
 # branch, and zeroing it here would be the test tidying away the evidence that
 # its own controls fired.
 shutil.rmtree(_TMP, ignore_errors=True)
-check("10f the scratch directory every database went into is gone",
+check("10g the scratch directory every database went into is gone",
       os.path.exists(_TMP), False)
-check("10g ...and it was never anywhere near the production database",
+check("10h ...and it was never anywhere near the production database",
       os.path.abspath(_TMP) in os.path.abspath(
           _dl.resolve_inference_db_path(None)), False)
-check("10h the failure counter recorded this file's own planted failures, "
+check("10i the failure counter recorded this file's own planted failures, "
       "which is what says the increment path was really taken",
       sum(PER_TRIAL_CALL_FAILURES.values()) > 0, True)
 

@@ -155,6 +155,46 @@ from oncotriage import paths as _paths
 from oncotriage.agent import deps
 from oncotriage.agent import evaluation as _ev
 from oncotriage.storage import database_logger as _dl
+from oncotriage import config                            # noqa: E402
+
+
+# ===========================================================================
+# THIS FILE'S SUBJECT IS THE RETAINED GROUPED ARM, AND IT PINS IT
+# ===========================================================================
+#
+# WHAT THIS FILE MEASURES IS THE PACKER'S FOUR PERSISTED COLUMNS, and
+# llm_classifier_packed_chunks and llm_classifier_packing are NULL by design in per-trial mode, so the round trips here need the arm that produces them.
+#
+# PINNED THROUGH THE OWNER, NEVER BY WRITING THE CONSTANT.
+# `config.pin_matching_call_mode()` is what `oncotriage/config.py` built for
+# exactly this: a declaration a PROGRAM makes about itself, kept apart from
+# `MATCHING_PER_TRIAL_CALLS_ENABLED`, which says what the PROJECT is configured
+# to do. Assigning the constant here would be a second WRITER of a declared
+# configuration value -- the shape this project keeps removing -- and would
+# leave `config.MATCHING_PER_TRIAL_CALLS_ENABLED` read anywhere later in this
+# process saying the project is configured grouped when it is not. Every
+# consumer the node reaches -- Stage 5's partition,
+# `inferences.matching_call_mode`, the resume fingerprint, the tracking index
+# -- follows the owner, so one line redirects all of them consistently.
+#
+# BEFORE ANY DRIVE, AND ASSERTED TO HAVE TAKEN. A pin that did not take would
+# leave every check below silently measuring the other arm, which is not one
+# failure but every failure with a misleading message -- so it is a HARD GUARD
+# on this suite's own precedent for a wrong root, not a check().
+#
+# RELEASED BEFORE THE SUMMARY, not at interpreter exit. The pin is
+# process-global; these files are run one per process, but `pytest tests/`
+# imports them all into ONE process and a leaked grouped pin would make
+# `tests/test_agent_stage5_per_trial_calls.py`'s explicitly-per-trial sections
+# run grouped without a word.
+_CALL_MODE_PIN_PREVIOUS = config.pin_matching_call_mode(
+    config.MATCHING_CALL_MODE_GROUPED)
+if config.matching_call_mode() != config.MATCHING_CALL_MODE_GROUPED:
+    raise SystemExit(
+        "[CallMode] the grouped pin did not take: config.matching_call_mode() "
+        f"is {config.matching_call_mode()!r}. Everything below would measure "
+        "the wrong Stage 5 arm.")
+
 
 
 #------------------------------------------------------------------------------
@@ -980,6 +1020,30 @@ for _suffix in ("-wal", "-shm"):
 check("every database this file wrote is inside the scratch directory",
       sorted({os.path.commonpath([os.path.abspath(p), _TMP])
               for p in (_DB, _LEGACY, _FAILDB)}), [_TMP])
+# ---------------------------------------------------------------------------
+# RELEASE THE PROCESS-GLOBAL CALL-MODE PIN THIS FILE INSTALLED
+# ---------------------------------------------------------------------------
+#
+# ABOVE THE SUMMARY ON PURPOSE, so the outcome is COUNTED. Below it the release
+# would still decide the exit code while being absent from the number the
+# summary prints -- a run that reported "0 failed" and exited 1.
+#
+# THE PREVIOUS PIN IS RESTORED RATHER THAN CLEARED OUTRIGHT, on
+# `pin_matching_call_mode`'s own contract: it returns what it replaced so a
+# caller can put it back, and an outer harness that had pinned something is
+# entitled to keep it.
+config.clear_matching_call_mode_pin()
+if _CALL_MODE_PIN_PREVIOUS is not None:
+    config.pin_matching_call_mode(_CALL_MODE_PIN_PREVIOUS)
+if config.matching_call_mode_pin() != _CALL_MODE_PIN_PREVIOUS:
+    _RESULTS["failed"] += 1
+    print("  FAIL  the grouped call-mode pin this file installed was NOT "
+          "released -- a later file sharing this process would silently "
+          "measure the wrong Stage 5 arm")
+else:
+    _RESULTS["passed"] += 1
+    print("  PASS  the grouped call-mode pin this file installed was released")
+
 
 
 #------------------------------------------------------------------------------

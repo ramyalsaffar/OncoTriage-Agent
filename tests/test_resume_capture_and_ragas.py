@@ -436,6 +436,9 @@ class _Run(object):
         self.temp_bundles = []
         self.exit_code = None
         self.text = ""
+        # The process-global Stage 5 call-mode pin as it stood the instant
+        # main() returned, recorded before drive_main clears it. See 2a-pin.
+        self.pin_after_main = None
 
 
 def drive_main(root, argv_extra, environment=ENV_A):
@@ -554,12 +557,67 @@ def drive_main(root, argv_extra, environment=ENV_A):
         paths._RESOLVED.clear()
         paths._RESOLVED.update(saved_resolved)
         shutil.rmtree(fhir_dir, ignore_errors=True)
+        # THE PIN capture.main() INSTALLS IS PROCESS-GLOBAL AND IT DOES NOT
+        # CLEAR ITSELF. `pin_call_mode_for_fixture_process` pins Stage 5 to the
+        # grouped arm for the whole process -- correctly, because that is the
+        # only arm RecordingSink can order -- and `capture.main()`'s own
+        # docstring records that a test driving it inherits the pin and must
+        # clear it. This is that test.
+        #
+        # IT WAS INERT AND IS NOT ANY MORE. While the shipped default was
+        # grouped the pin agreed with the default and leaking it changed
+        # nothing observable. Per-trial is the shipped default now, so a leaked
+        # pin makes `config.matching_call_mode()` answer "grouped" for every
+        # check AFTER this function in this file and for every file sharing the
+        # process -- silently, because the pin's whole design is that
+        # consumers cannot tell it from the default. Clearing it in a
+        # `finally` puts it beside the two restores above, which is where a
+        # process-global this function installed belongs.
+        #
+        # THE PIN IS RECORDED BEFORE IT IS CLEARED so that 2z below can be a
+        # measurement: without it, "no pin is installed afterwards" is equally
+        # satisfied by a main() that never installed one, and the clear would
+        # be untested code guarding nothing.
+        run.pin_after_main = config.matching_call_mode_pin()
+        config.clear_matching_call_mode_pin()
     return run
 
 
 # --- 2a  a fresh directory: nothing is skipped -------------------------------
 ROOT_FRESH = tempfile.mkdtemp(prefix="resume_fresh_")
 fresh = drive_main(ROOT_FRESH, ["--resume"])
+
+# --- THE PROCESS-GLOBAL PIN capture.main() INSTALLS --------------------------
+#
+# `capture.main()` pins Stage 5 to the grouped arm for the whole process, prints
+# that it did, and does not clear it -- which is right for a real capture run
+# and is a leak inside a test process. Inert while the shipped default was
+# grouped; a silent redirection of every later reader now that per-trial is the
+# default, because the pin is designed to be indistinguishable from the default
+# to every consumer.
+#
+# TWO CHECKS, AND THE FIRST IS WHAT MAKES THE SECOND MEAN ANYTHING. A leaked
+# pin is invisible to any assertion about the harness's output, so the only
+# evidence that `drive_main`'s clear does anything is that there was something
+# to clear.
+check("2a-pin main() really DOES install the grouped process pin, so the "
+      "clear below is guarding a live leak rather than nothing "
+      "(non-degeneracy)",
+      fresh.pin_after_main == config.MATCHING_CALL_MODE_GROUPED,
+      fresh.pin_after_main)
+check("2a-pin ...and drive_main cleared it, so every check after this one -- "
+      "and every test sharing this process -- reads the configured arm rather "
+      "than the arm the fixture harness needs",
+      config.matching_call_mode_pin() is None,
+      config.matching_call_mode_pin())
+_EXPECT_UNPINNED = (config.MATCHING_CALL_MODE_PER_TRIAL
+                    if config.MATCHING_PER_TRIAL_CALLS_ENABLED
+                    else config.MATCHING_CALL_MODE_GROUPED)
+check("2a-pin ...and the owner is back on the CONFIGURED arm, which is the "
+      "observable consequence and the reason the leak matters. Derived from "
+      "the constant, never written out, so this holds in either arm",
+      config.matching_call_mode() == _EXPECT_UNPINNED,
+      f"{config.matching_call_mode()!r} != {_EXPECT_UNPINNED!r}")
 check("2a  a fresh directory captures every plan entry",
       sorted(fresh.captured) == sorted(ALL_IDS),
       sorted(set(ALL_IDS) ^ set(fresh.captured)))

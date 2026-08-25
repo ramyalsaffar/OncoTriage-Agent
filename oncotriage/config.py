@@ -1948,39 +1948,92 @@ MATCHING_MAX_INPUT_PACKED_CHUNKS = 5
 # scheduling below exists to give the cache a chance to warm before it is
 # leaned on.
 #
-# THIS PASS BUILDS THE ARM. IT DOES NOT DECIDE THE CAMPAIGN. Which mode a
-# published number is computed under is a measurement -- verdict agreement,
-# omission rate, cost per patient, all of them comparable only if both arms
-# exist -- and the switch below is what makes both arms runnable from one
-# build.
+# THIS IS THE PIPELINE'S DESIGN, AND IT SHIPS ON. Which mode a published
+# number is computed under is a decision, and it has been taken: per-trial is
+# the arm the pipeline runs, because it is the only one that removes the fault
+# by CONSTRUCTION rather than bounding it. Grouped is RETAINED, behind this
+# same switch, as the migration's documented comparison arm -- verdict
+# agreement, omission rate and cost per patient are comparable only if both
+# arms are runnable from one build, and they are.
 
 # Master switch, and it is a SWITCH rather than a threshold for the reason
-# MATCHING_INPUT_PACKING_ENABLED already gives about itself: the validation run
+# MATCHING_INPUT_PACKING_ENABLED already gives about itself: the migration
 # needs both arms, and "one call per trial" and "the packer happened to emit
 # one trial per chunk" are different facts that the provenance record has to be
 # able to state apart -- which is what inferences.matching_call_mode is for.
 #
-# OFF REPRODUCES TODAY'S BEHAVIOUR EXACTLY, and that is a stronger promise than
+# ═══════════════════════════════════════════════════════════════════════════
+#  NO PAID PER-TRIAL RUN BEFORE `python bedrock_probe.py`-STYLE PROBING OF
+#  THE WARMUP.  THE THREE-CALL PROBE IS THE MIGRATION WINDOW'S FIRST COMMAND.
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# TWO FACTS THIS ARM RESTS ON HAVE NEVER BEEN OBSERVED AGAINST THE LIVE
+# PROVIDER, and both fail in the expensive direction rather than the loud one:
+#
+#   1. WARMUP ACCEPTANCE. MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS is 1,
+#      and a reasoning model bills reasoning against that same ceiling. A
+#      provider that refuses the shape answers 400; evaluation.py classifies
+#      exactly that and falls back to the retired one-then-rest schedule per
+#      patient, so the campaign RUNS -- and pays one refused warmup and one
+#      serialised full-price cache writer for every patient, forever, with no
+#      process memo. Measured cost of that state at 1,000 patients: $0 in
+#      refused warmups (a 400 is refused before generation) and roughly 22
+#      minutes of added wall time at MAX_WORKERS = 12.
+#   2. PREFIX WARMING. The whole price argument is that the shared prefix is
+#      billed at the cached rate from the second request of a patient on. If
+#      the provider does not cache this prefix, per-trial mode costs
+#      MAX_TRIALS_FOR_EVALUATION times the grouped input price and NOTHING
+#      RAISES -- every request succeeds, every verdict is produced, and the
+#      only trace is `cached_tokens` reading 0 in
+#      inferences.llm_classifier_call_details.
+#
+# THE PROBE IS THREE CALLS AND IT ANSWERS BOTH: one warmup (does the 1-token
+# ceiling come back 200 or 400?), then two identical-prefix trial calls (does
+# call 3 report cached_tokens > 0?). Read the answer out of the usage block,
+# not out of the wall clock. Until it has been run, per-trial mode is a
+# configuration nobody has seen serve a request.
+#
+# ON (the shipped arm), the packer is BYPASSED rather than reconfigured:
+# initial_chunks becomes one single-trial chunk per trial and
+# llm_classifier_packing records enabled=False with bypassed_by naming this
+# mode. Setting MATCHING_INPUT_TOKEN_BUDGET to 1 would produce nearly the same
+# partition and would be the wrong mechanism -- it would report a packer that
+# ran, and it would still group two trials whenever one trial alone exceeded
+# the budget.
+#
+# OFF REPRODUCES THE GROUPED ARM EXACTLY, and that is a stronger promise than
 # "equivalently": with this False the node takes the identical branch it took
 # before this constant existed, issues the identical requests field for field,
-# spawns no thread, and creates no executor.
-# tests/test_agent_stage5_per_trial_calls.py section 6 compares the two arms
-# request by request against a copy of the module with the per-trial branch
-# compiled out, and section 7's control shows that comparison failing.
-#
-# ON, the packer is BYPASSED rather than reconfigured: initial_chunks becomes
-# one single-trial chunk per trial and llm_classifier_packing records
-# enabled=False with bypassed_by naming this mode. Setting
-# MATCHING_INPUT_TOKEN_BUDGET to 1 would produce nearly the same partition and
-# would be the wrong mechanism -- it would report a packer that ran, and it
-# would still group two trials whenever one trial alone exceeded the budget.
+# spawns no thread, and creates no executor. THAT PROMISE IS WHAT MAKES THE
+# COMPARISON ARM WORTH ANYTHING -- a grouped number measured today has to be
+# comparable with every grouped number this pipeline has ever produced, and
+# with the twelve characterization fixtures, which record the grouped arm.
+# tests/test_agent_stage5_per_trial_calls.py section 8 compares an explicitly-
+# OFF run request by request against a copy of the module with the per-trial
+# branch compiled out, and its own check 8h shows that comparison SEPARATING
+# the two arms, so 8c is a measurement rather than a tautology. Note the
+# section numbers: this comment said "section 6 ... section 7's control" and
+# was stale by two before the flip, which is why it now names a check as well.
 #
 # THE OUTPUT SPLITTERS STAY ARMED. A single trial can still overflow the output
 # ceiling, and when it does the reactive splitter finds len(chunk) == 1 and
 # records NOT_EVALUABLE_TRUNCATION_FLOOR -- which is the correct, already-built
 # handling. Nothing about that machinery is disabled by this switch; it simply
 # has no halving left to do.
-MATCHING_PER_TRIAL_CALLS_ENABLED = False
+#
+# THE FIXTURE GATE DOES NOT FOLLOW THIS FLAG, BY DESIGN.
+# `python fixture_replay.py` and `python fixture_capture.py` PIN themselves to
+# the grouped arm for their own process and print that they did -- see
+# oncotriage/fixtures/capture.py:pin_call_mode_for_fixture_process. So the free
+# twelve-fixture replay gate survives this flip and keeps characterizing the
+# GROUPED arm. PER-TRIAL FIXTURES ARE THE STANDING MIGRATION ITEM: RecordingSink
+# numbers Stage 5 recordings by ARRIVAL, so a per-trial capture's
+# "deterministic" prefix would be ordered by the thread scheduler. Closing it
+# needs a trial-stable ordering for the chat_completions bucket plus a paid
+# re-capture of all twelve -- a fixture-FORMAT change with a SCHEMA_VERSION
+# bump. Until then the shipped arm's Stage 5 behaviour is covered by
+# tests/test_agent_stage5_per_trial_calls.py alone.
+MATCHING_PER_TRIAL_CALLS_ENABLED = True
 
 # How many per-trial requests of ONE patient may be in flight at once, AFTER
 # the warmup call has completed. Read only when the switch above is True.

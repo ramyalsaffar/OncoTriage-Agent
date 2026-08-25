@@ -120,6 +120,47 @@ from oncotriage.storage.database_logger import (
     log_inference,
     resolve_inference_db_path,
 )
+from oncotriage import config                            # noqa: E402
+
+
+# ===========================================================================
+# THIS FILE'S SUBJECT IS THE RETAINED GROUPED ARM, AND IT PINS IT
+# ===========================================================================
+#
+# WHAT THIS FILE MEASURES IS THE ONE SYSTEM PROMPT RENDERED ABOVE THE SPLIT LOOP, and
+# the field measures the fixed prefix's own share and the counting is written against a known number of renders per patient. Per-trial mode adds
+# a warmup request carrying the identical system message, so the render arithmetic here is a grouped-arm statement.
+#
+# PINNED THROUGH THE OWNER, NEVER BY WRITING THE CONSTANT.
+# `config.pin_matching_call_mode()` is what `oncotriage/config.py` built for
+# exactly this: a declaration a PROGRAM makes about itself, kept apart from
+# `MATCHING_PER_TRIAL_CALLS_ENABLED`, which says what the PROJECT is configured
+# to do. Assigning the constant here would be a second WRITER of a declared
+# configuration value -- the shape this project keeps removing -- and would
+# leave `config.MATCHING_PER_TRIAL_CALLS_ENABLED` read anywhere later in this
+# process saying the project is configured grouped when it is not. Every
+# consumer the node reaches -- Stage 5's partition,
+# `inferences.matching_call_mode`, the resume fingerprint, the tracking index
+# -- follows the owner, so one line redirects all of them consistently.
+#
+# BEFORE ANY DRIVE, AND ASSERTED TO HAVE TAKEN. A pin that did not take would
+# leave every check below silently measuring the other arm, which is not one
+# failure but every failure with a misleading message -- so it is a HARD GUARD
+# on this suite's own precedent for a wrong root, not a check().
+#
+# RELEASED BEFORE THE SUMMARY, not at interpreter exit. The pin is
+# process-global; these files are run one per process, but `pytest tests/`
+# imports them all into ONE process and a leaked grouped pin would make
+# `tests/test_agent_stage5_per_trial_calls.py`'s explicitly-per-trial sections
+# run grouped without a word.
+_CALL_MODE_PIN_PREVIOUS = config.pin_matching_call_mode(
+    config.MATCHING_CALL_MODE_GROUPED)
+if config.matching_call_mode() != config.MATCHING_CALL_MODE_GROUPED:
+    raise SystemExit(
+        "[CallMode] the grouped pin did not take: config.matching_call_mode() "
+        f"is {config.matching_call_mode()!r}. Everything below would measure "
+        "the wrong Stage 5 arm.")
+
 
 # The one name under test, spelled once.
 KEY = "llm_classifier_patient_record_tokens"
@@ -843,6 +884,30 @@ deps.clear_override(deps.OPENAI_CLIENT)
 check("the OpenAI override this file installed was cleared",
       deps.is_resolved(deps.OPENAI_CLIENT)
       and deps.peek(deps.OPENAI_CLIENT) is not None, False)
+# ---------------------------------------------------------------------------
+# RELEASE THE PROCESS-GLOBAL CALL-MODE PIN THIS FILE INSTALLED
+# ---------------------------------------------------------------------------
+#
+# ABOVE THE SUMMARY ON PURPOSE, so the outcome is COUNTED. Below it the release
+# would still decide the exit code while being absent from the number the
+# summary prints -- a run that reported "0 failed" and exited 1.
+#
+# THE PREVIOUS PIN IS RESTORED RATHER THAN CLEARED OUTRIGHT, on
+# `pin_matching_call_mode`'s own contract: it returns what it replaced so a
+# caller can put it back, and an outer harness that had pinned something is
+# entitled to keep it.
+config.clear_matching_call_mode_pin()
+if _CALL_MODE_PIN_PREVIOUS is not None:
+    config.pin_matching_call_mode(_CALL_MODE_PIN_PREVIOUS)
+if config.matching_call_mode_pin() != _CALL_MODE_PIN_PREVIOUS:
+    _RESULTS["failed"] += 1
+    print("  FAIL  the grouped call-mode pin this file installed was NOT "
+          "released -- a later file sharing this process would silently "
+          "measure the wrong Stage 5 arm")
+else:
+    _RESULTS["passed"] += 1
+    print("  PASS  the grouped call-mode pin this file installed was released")
+
 
 
 # ===========================================================================

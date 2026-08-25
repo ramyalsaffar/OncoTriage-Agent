@@ -306,9 +306,10 @@ _REGISTRY_SPEC = (
      "which is recorded as not evaluable while the rest of the patient "
      "completed; keyed by exception type. A patient whose calls ALL failed is "
      "NOT here -- it returns the API-error result and is covered by "
-     "MAX_LLM_CLASSIFIER_RETRIES instead. STAYS AT ZERO WHILE "
-     "MATCHING_PER_TRIAL_CALLS_ENABLED IS False, because nothing in that "
-     "configuration reaches the branch that increments it"),
+     "MAX_LLM_CLASSIFIER_RETRIES instead. LIVE ON AN ORDINARY CAMPAIGN, "
+     "because per-trial is the SHIPPED arm; it stays at zero only in the "
+     "retained GROUPED arm (MATCHING_PER_TRIAL_CALLS_ENABLED False), where "
+     "nothing reaches the branch that increments it"),
     ("PER_TRIAL_WARMUP_DEGRADATIONS",
      _agent_evaluation.PER_TRIAL_WARMUP_DEGRADATIONS,
      "the Stage 5 PER-TRIAL cache warmup did not do its job. A "
@@ -319,8 +320,9 @@ _REGISTRY_SPEC = (
      "MATCHING_PER_TRIAL_PROMPT_CACHE_KEY_ENABLED. A `failed:{Type}` key means "
      "the cache could not be established at all, NO trial call was issued and "
      "the patient was failed deliberately so that MAX_LLM_CLASSIFIER_RETRIES "
-     "and the batch checkpoint see it. STAYS AT ZERO WHILE "
-     "MATCHING_PER_TRIAL_CALLS_ENABLED IS False"),
+     "and the batch checkpoint see it. LIVE ON AN ORDINARY CAMPAIGN, because "
+     "per-trial is the SHIPPED arm; it stays at zero only in the retained "
+     "GROUPED arm (MATCHING_PER_TRIAL_CALLS_ENABLED False)"),
     ("STAGE5_SHUTDOWN_SKIPS", _agent_evaluation.STAGE5_SHUTDOWN_SKIPS,
      "Stage 5 requests that were NOT issued because an operator asked the run "
      "to stop -- SIGTERM or Ctrl-C, never the STOP sentinel, which promises "

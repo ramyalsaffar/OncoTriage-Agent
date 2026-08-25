@@ -591,7 +591,7 @@ python tests/test_docker_qdrant_override_and_readiness.py           # 122
 # collision matrix. It DOES exec -- one in-memory copy of
 # oncotriage/fixtures/capture.py with the --resume gate reverted to "the file
 # exists, skip it", argued at _EXEC_ALLOWLIST. Bucket A, ~6 s.
-python tests/test_resume_capture_and_ragas.py                       # 207
+python tests/test_resume_capture_and_ragas.py                       # 210 (was 207; the default-flip pass clears capture.main()'s process-global call-mode pin in drive_main's finally and added the three 2a-pin checks that make the clear a measurement)
 
 # The MCP pass. Same shape, same directory. No keys and NO SPEND -- the judging
 # is stubbed through oncotriage/agent/deps.py. It is NOT offline: sections 4, 5
@@ -634,7 +634,7 @@ python tests/test_extraction_stage_non_oncology_guard.py            #  80
 # spend -- every model response is a literal served by a stub installed through
 # oncotriage/agent/deps.py -- no git history, no corpus, and NOT in the
 # collision matrix. ~25 s.
-python tests/test_agent_trial_verdict_normalization.py              # 165 (this line said 161 and was stale by 4; MEASURED 2026-08-21)
+python tests/test_agent_trial_verdict_normalization.py              # 166 (was 165; the default-flip pass PINS this file to the retained GROUPED arm -- every scenario counts what ONE response did, and a per-trial stub serving N calls produces N of everything -- and counts the pin's release. Before that 165; this line said 161 and was stale by 4; MEASURED 2026-08-21)
 
 # The emission-provenance pass. Same shape, same directory. No network, no keys,
 # no spend, no git history, no corpus, and NOT in the collision matrix -- every
@@ -643,7 +643,7 @@ python tests/test_agent_trial_verdict_normalization.py              # 165 (this 
 # compared at the end, and every database write goes to a scratch file in a temp
 # directory that is asserted to differ from the production path, and removed at
 # the end. ~1 s.
-python tests/test_agent_emission_provenance.py                      # 184 (this line said 162 and was stale by 22; MEASURED 2026-08-21)
+python tests/test_agent_emission_provenance.py                      # 185 (was 184; the default-flip pass PINS this file to the retained GROUPED arm -- its subject is the packer's per-CALL provenance, which per-trial mode bypasses -- and counts the pin's release. Before that 184; this line said 162 and was stale by 22; MEASURED 2026-08-21)
 
 # The write-durability pass. Same shape, same directory. No network, no keys,
 # no spend, no git history, no corpus, NOT in the collision matrix, and it execs
@@ -677,7 +677,7 @@ python tests/test_tracking_mlflow_index.py                          # 104 (was 9
 # sha256-compared at the end). It DOES exec -- five controls plant into
 # in-memory copies of database_logger.py and evaluation.py, argued at
 # _EXEC_ALLOWLIST. Bucket A, <1 s against only the CI skeleton.
-python tests/test_storage_packing_and_cache_columns.py              # 124
+python tests/test_storage_packing_and_cache_columns.py              # 125 (was 124; the default-flip pass PINS this file to the retained GROUPED arm -- llm_classifier_packed_chunks and llm_classifier_packing are NULL by design in per-trial mode -- and counts the pin's release)
 
 # The provenance-persistence pass. Same shape, same directory. No network, no
 # keys, no spend, no live Qdrant, no model load, no corpus, no git history, and
@@ -825,10 +825,13 @@ python tests/test_agent_rrf_config_ownership.py                     #  31
 # removed. ~1.1 s.
 python tests/test_agent_cross_encoder_sequence_limit.py             #  42
 
-# The per-trial-call pass, extended by the cache-warmup pass. Same shape, same
-# directory. Stage 5 can send ONE billed call per patient-trial pair, and
-# MATCHING_PER_TRIAL_CALLS_ENABLED ships False -- this pass builds the arm and
-# the campaign decision between modes is a later MEASUREMENT. No network, no
+# The per-trial-call pass, extended by the cache-warmup pass and turned ON by
+# the default-flip pass. Same shape, same directory. Stage 5 sends ONE billed
+# call per patient-trial pair, and MATCHING_PER_TRIAL_CALLS_ENABLED now ships
+# **True** -- that is the pipeline's design, ruled by the operator; grouped is
+# retained behind the same switch as the migration's comparison arm. THE ARM IS
+# ALWAYS SET EXPLICITLY IN THIS FILE and the flip moved no assertion in it
+# except check 1a, which is where the shipped decision is written down. No network, no
 # keys, NO SPEND (every response is a literal served by a stub installed
 # through oncotriage.agent.deps), no subprocess, no fixture, no git history, no
 # corpus, no model, no live server.
@@ -843,7 +846,7 @@ python tests/test_agent_cross_encoder_sequence_limit.py             #  42
 # the suite's two writers and are sha256-compared at the end. It DOES exec:
 # twenty-four in-memory copies of agent/evaluation.py, one plant each, argued
 # at _EXEC_ALLOWLIST. Bucket A, ~4 s.
-python tests/test_agent_stage5_per_trial_calls.py                   # 318 (was 283; the duplicated-derivation pass added section 1c over the import-time parallelism guard and section 5c over the answering-model check on the UNCONSUMED fold path. Before that 276; the operator-control pass rewrote 8b-r from a pinned limit to the grouped gate's contract and added c36. Before that 255; the pre-migration pass added section 8B over the Stage 5 shutdown flag and controls c32-c35. ~10 s: section 3d parks two workers for a bounded grace on each of its two arms)
+python tests/test_agent_stage5_per_trial_calls.py                   # 320 (was 318; the default-flip pass inverted 1a, added 1a-ii over the unpinned owner, derived 10e's restore from a value captured at import rather than a literal, and added 10f's non-degeneracy probe on that capture. Before that 283; the duplicated-derivation pass added section 1c over the import-time parallelism guard and section 5c over the answering-model check on the UNCONSUMED fold path. Before that 276; the operator-control pass rewrote 8b-r from a pinned limit to the grouped gate's contract and added c36. Before that 255; the pre-migration pass added section 8B over the Stage 5 shutdown flag and controls c32-c35. ~10 s: section 3d parks two workers for a bounded grace on each of its two arms)
 
 # The harness-budget pass. Same shape, same directory. No network, no keys, no
 # spend, NO LIVE SERVER and no live Qdrant -- it starts nothing and issues no
@@ -880,7 +883,7 @@ python tests/test_evaluation_sample_naming.py                       #  72
 # collision matrix; it DOES read oncotriage/config.py, which
 # tests/test_config_snapshot_date_rot.py rewrites, so all three files it reads
 # are sha256-compared at the end. Bucket A, ~4.8 s.
-python tests/test_fixture_call_mode_pin.py                          #  81
+python tests/test_fixture_call_mode_pin.py                          #  82 (was 81; the default-flip pass found 1c's non-degeneracy probe pinned the LITERAL per_trial, which agrees with the default after the flip -- it pins the OPPOSITE arm, derived, and gained a cleared-pin check)
 
 # The Bedrock-adapter pass. Same shape, same directory. NO AWS CALL AND NO
 # BILLED CALL OF ANY KIND -- every client is a stand-in installed through
@@ -900,6 +903,41 @@ python tests/test_agent_bedrock_adapter.py                          # 275 (was 2
 python bedrock_probe.py                                  # prints the refusal, exit 2
 python bedrock_probe.py --i-understand-this-bills        # COSTS MONEY: 2 live calls
 python bedrock_probe.py --i-understand-this-bills --probe-seed   # + 1 more
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  GO-LIVE, PER-TRIAL: NO PAID RUN BEFORE THE THREE-CALL PROBE.
+#  MATCHING_PER_TRIAL_CALLS_ENABLED SHIPS **True** AND TWO OF ITS PREMISES
+#  HAVE NEVER BEEN OBSERVED AGAINST THE LIVE PROVIDER.
+# ═══════════════════════════════════════════════════════════════════════════
+#  The probe is THREE CALLS and answers both, out of the USAGE BLOCK and never
+#  the wall clock. It is the migration window's FIRST command, on
+#  bedrock_probe.py's footing -- a deliberate, flagged, tiny spend that settles
+#  a configuration question before a campaign's worth of money rests on it:
+#
+#    1. WARMUP ACCEPTANCE -- does MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS
+#       = 1 come back 200 or 400? A reasoning model bills reasoning against
+#       that ceiling. A 400 does NOT stop the campaign: evaluation.py
+#       classifies it and falls back to the retired one-then-rest schedule PER
+#       PATIENT, with no process memo -- $0 in refused warmups (a 400 is
+#       refused before generation) and ~22 minutes added over 1,000 patients
+#       at MAX_WORKERS = 12.
+#    2. PREFIX WARMING -- after two identical-prefix trial calls, does call 3
+#       report cached_tokens > 0? If the provider does not cache this prefix,
+#       per-trial costs MAX_TRIALS_FOR_EVALUATION x the grouped input price and
+#       NOTHING RAISES: every request succeeds, every verdict is produced, and
+#       the only trace is cached_tokens reading 0 in
+#       inferences.llm_classifier_call_details.
+#
+#  AND THE FIXTURE GATE DOES NOT COVER THE SHIPPED ARM. fixture_capture.py and
+#  fixture_replay.py PIN themselves to grouped and print that they did, so the
+#  twelve fixtures characterize the GROUPED arm. PER-TRIAL FIXTURES ARE THE
+#  STANDING MIGRATION ITEM -- RecordingSink numbers Stage 5 recordings by
+#  ARRIVAL, so a per-trial capture's 'deterministic' prefix would be ordered by
+#  the thread scheduler; closing it needs a trial-stable ordering for the
+#  chat_completions bucket plus a paid recapture of all twelve, a fixture-
+#  FORMAT change with a SCHEMA_VERSION bump. Until then the shipped arm's
+#  Stage 5 behaviour is covered by
+#  tests/test_agent_stage5_per_trial_calls.py alone.
 
 # Fixture state, CURRENT rather than as of any pass below: SCHEMA_VERSION
 # is 8, the twelve recordings on disk are v8, and `python fixture_replay.py`
@@ -1051,7 +1089,7 @@ dependencies (item 11a)" below.
 4. **`node_rule_based_filter`** — MeSH site relevance, cancer stage ordinal, histology, age, sex + a **two-knob quality gate** and cost cap (`MAX_TRIALS_FOR_EVALUATION = 15`). Both knobs must pass: `QUALITY_THRESHOLD_PERCENTILE = 25` of the **unboosted fused** score within the pool, and `MEDCPT_SCORE_FLOOR` on `medcpt_score_max`. A trial with no MedCPT score is not dropped by the floor — absence of a score is not a low score. Each knob reports its own count (`quality_dropped_percentile` / `quality_dropped_floor` / `quality_dropped_floor_only`); they **overlap**, so they do not sum to `quality_dropped`.
 
 **`RERANK_SCORE_THRESHOLD` IS DELETED AND THE REASON IS THE POINT.** It was `-10`, a floor on the *fused RRF* score, under a comment describing MedCPT's `-25 .. +10` range — true of the code it was written for, false of the code it sat above. A fused RRF value runs about **0.01 .. 0.06** and is a function of pool size and query count, not of quality (a trial ranked first by all three queries scores ~0.050 however good it is). The gate took `max(percentile, floor)`, so the floor could never be selected — **not rarely, never** — and the relative percentile was doing 100% of the filtering, cutting one trial from a patient whose four survivors were all excellent. `MEDCPT_SCORE_FLOOR` is measured, not chosen: `python measure_medcpt_scores.py` (thin entry point over `oncotriage/evaluation/medcpt_calibration.py`) runs Stages 1–3 only over a seeded 10-breast/10-colon/10-lung sample and reports the distribution plus what the floor would drop *that the percentile does not*. Re-run it after an index rebuild, a rerank-query change, or a cross-encoder checkpoint change.
-5. **`node_llm_classifier_evaluation`** — one `MATCHING_MODEL` call producing per-criterion verdicts; JSON-parse failures loop back up to `MAX_LLM_CLASSIFIER_RETRIES = 3`. **As of `PROMPT_VERSION` 1.5.0 the STORED `assessment` of an `eligible` or `not_eligible` trial is composed from that trial's own criterion / patient_value / status rows** — so it cannot assert anything the arrays do not carry — **and the model's own prose is kept beside it as `assessment_draft`, in memory only, with no database column**; a `not_evaluable` trial's arrays are empty by contract, so it keeps the model's text unchanged.
+5. **`node_llm_classifier_evaluation`** — `MATCHING_MODEL` calls producing per-criterion verdicts; JSON-parse failures loop back up to `MAX_LLM_CLASSIFIER_RETRIES = 3`. **HOW MANY CALLS IS THE SHIPPED ARM'S DEFINING FACT AND `MATCHING_PER_TRIAL_CALLS_ENABLED` DECIDES IT.** `True` (the default) is ONE call per patient-trial pair behind a dedicated cache warmup that is awaited alone — the packer is bypassed — and `False` is the retained comparison arm, where the input packer emits between one and `MATCHING_MAX_INPUT_PACKED_CHUNKS` calls per patient. `config.matching_call_mode()` is the ONE owner of that answer; every consumer (Stage 5's partition, `inferences.matching_call_mode`, the resume fingerprint, the tracking index) calls it rather than reading the constant. **The sentence that stood here — "one `MATCHING_MODEL` call" — had been false since input packing and was false twice over after the flip.** **As of `PROMPT_VERSION` 1.5.0 the STORED `assessment` of an `eligible` or `not_eligible` trial is composed from that trial's own criterion / patient_value / status rows** — so it cannot assert anything the arrays do not carry — **and the model's own prose is kept beside it as `assessment_draft`, in memory only, with no database column**; a `not_evaluable` trial's arrays are empty by contract, so it keeps the model's text unchanged.
 6. **`node_finalize`** — splits eligible/not_eligible, normalizes labels.
 
 Nodes 1–3 are in `agent/retrieval.py`, node 4 in `agent/filtering.py`, node 5 in `agent/evaluation.py`, node 6 and the other two terminal nodes in `agent/terminal.py`.
@@ -7490,6 +7528,15 @@ counterfactual below.
 `MATCHING_PER_TRIAL_CALLS_ENABLED` is still `False`. What changed is the
 semantics of the harness's answer.
 
+> **CURRENT STATE, 2026-08-24 — that sentence describes the tree as this pass
+> left it and is kept as written.** The default HAS since moved:
+> `MATCHING_PER_TRIAL_CALLS_ENABLED` is **True**, per-trial is the shipped arm,
+> and grouped is the retained comparison arm. This pass's whole point was that
+> the gate would survive that flip, and it did — `python fixture_replay.py` is
+> **12/12 clean, exit 0, with no recapture** under the new default, with the
+> pin line printed. See "The default call mode is per-trial (the default-flip
+> pass)" below.
+
 **THE PIN GOES THROUGH THE ONE OWNER, WHICH IS THE WHOLE DESIGN.**
 `oncotriage/config.py` gained a private `_MATCHING_CALL_MODE_PIN` and three
 functions beside `matching_call_mode()`: `pin_matching_call_mode(mode)`
@@ -7878,7 +7925,12 @@ four properties THERE.
 python tests/test_ablation_latest_run_selection.py   #  45, ~1.5s. EXECS NOTHING:
                                                      #  every control is a different
                                                      #  SQL STRING on one connection
-python tests/test_compose_shutdown_grace.py          #  17, ~0.7s. NO DOCKER DAEMON
+python tests/test_compose_shutdown_grace.py          #  21, ~0.7s. NO DOCKER DAEMON
+                                                    #  (was 17; the default-flip pass
+                                                    #  replaced section 3's arm-OFF
+                                                    #  landmine with the GROUPED arm's
+                                                    #  own worst case, a vocabulary pin
+                                                    #  and two controls)
 python tests/test_serial_runner_lock.py              #  85, ~0.5s. REAL concurrent
                                                      #  subprocesses and a REAL
                                                      #  symlinked checkout
@@ -7974,6 +8026,219 @@ drifting silently is that all three verify the SAME directory and each has a
 test asserting the properties in its own file; what separates the three locks is
 the FILE PREFIX — `oncotriage-batch-run-`, `oncotriage-ablation-run-` and
 `oncotriage-serial-tests-` — which is load-bearing and must stay distinct.
+
+### The default call mode is per-trial (the default-flip pass)
+
+**`MATCHING_PER_TRIAL_CALLS_ENABLED` IS `True`. THAT IS THE PIPELINE'S DESIGN,
+RULED BY THE OPERATOR, NOT A MEASUREMENT THIS PASS TOOK.** Per-trial is the only
+arm that removes cross-trial reasoning contamination by CONSTRUCTION rather than
+bounding it — the input-packing block's own record is that "reasoning
+demonstrably leaks between trials inside one prompt, which is the thing
+constraint C4 asks the model not to do and cannot enforce", and a ~12K token
+budget bounds how big a shared prompt gets without stopping two trials sharing
+one. **Grouped is RETAINED behind the same switch as the migration's documented
+comparison arm**, and section 8 of
+`tests/test_agent_stage5_per_trial_calls.py` is what keeps it exact.
+
+**NO BILLED CALL WAS MADE.** `python fixture_replay.py` is **12/12 clean, exit
+0, with no recapture** UNDER THE NEW DEFAULT, the production `inferences.db`
+sha256 is unchanged (`ab1403e3…`, 90,185,728 bytes), and no migration was run.
+
+**═══ NO PAID PER-TRIAL RUN BEFORE THE THREE-CALL PROBE. IT IS THE MIGRATION
+WINDOW'S FIRST COMMAND. ═══** Two facts this arm rests on have never been
+observed against the live provider, and both fail in the expensive direction
+rather than the loud one:
+
+| | what has never been seen | what happens if it is false |
+|---|---|---|
+| **warmup acceptance** | that `MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS = 1` comes back 200 rather than 400 | the campaign RUNS. `evaluation.py` classifies the 400 and falls back to the retired one-then-rest schedule PER PATIENT, with no process memo — measured at 1,000 patients: **$0** in refused warmups (a 400 is refused before generation) and roughly **22 minutes** of added wall time at `MAX_WORKERS = 12` |
+| **prefix warming** | that call 3 reports `cached_tokens > 0` after two identical-prefix requests | per-trial costs `MAX_TRIALS_FOR_EVALUATION` × the grouped input price and **NOTHING RAISES** — every request succeeds, every verdict is produced, and the only trace is `cached_tokens` reading 0 in `inferences.llm_classifier_call_details` |
+
+The probe is **three calls**: one warmup, then two identical-prefix trial calls.
+Read the answer out of the **usage block**, never the wall clock. It is the
+`bedrock_probe.py` shape — a deliberate, flagged, tiny spend that answers a
+configuration question before a campaign's worth of money rests on it — and
+until it has been run, per-trial mode is a configuration nobody has seen serve a
+request.
+
+**PER-TRIAL FIXTURES ARE THE STANDING MIGRATION ITEM, AND THE GATE SURVIVED THE
+FLIP BY PIN RATHER THAN BY LUCK.** `fixture_capture.py` and `fixture_replay.py`
+call `capture.pin_call_mode_for_fixture_process()` as the first statement of
+their `main()`, pinning Stage 5 to grouped for their own process and PRINTING
+that they did — the call-mode-pin pass built exactly this, and the flip is what
+it was built for. Measured: the replay log's fourth line reads
+`Stage 5 call mode: PINNED to 'grouped' for this process by fixture_replay.py`.
+So **the twelve fixtures characterize the GROUPED arm and say so on their face**,
+and the shipped arm's Stage 5 behaviour is covered by
+`tests/test_agent_stage5_per_trial_calls.py` alone. Closing it needs a
+trial-stable ordering for `RecordingSink`'s `chat_completions` bucket (it numbers
+by ARRIVAL, so a per-trial capture's "deterministic" prefix would be ordered by
+the thread scheduler) plus a paid recapture of all twelve — a fixture-FORMAT
+change with a `SCHEMA_VERSION` bump.
+
+**THE FLIP FOUND TWO LANDMINES AND BOTH WERE THE SAME SHAPE: A TEST THAT FAILS
+ON THE CHANGE IT EXISTS TO PROTECT.** Neither was a defect in the pipeline;
+both were assertions written as a second copy of the shipped default.
+
+- **`tests/test_compose_shutdown_grace.py` check 3c** read
+  `MATCHING_PER_TRIAL_CALLS_ENABLED == False` under the comment "which is the
+  premise under which section 1 is sufficient", and its own section header said
+  "IF THE MODE EVER SHIPS ON, THIS SECTION MUST BE REVISITED RATHER THAN
+  PASSING". **The premise was false when it was written.** Section 1's
+  sufficiency rests on the BATCH RUNNER's Stage 5 shutdown gate, which bounds
+  the drain to one in-flight request in BOTH arms (the operator-control pass
+  gated the grouped send loop too) — not on the arm. On the `fastapi` service,
+  which has no gate of any kind, the worst case is **2400 s in BOTH arms**: 4
+  rounds × 600 per-trial, and `MATCHING_MAX_INPUT_PACKED_CHUNKS - 1` = 4 further
+  chunks × 600 grouped. **So the shortfall was never a property of the arm and
+  the flip did not move the number.** Section 3 is arm-INDEPENDENT now: both
+  worst cases derived from the constants, both required to exceed the grace
+  period, both derivations required to be present in the compose file, plus a
+  vocabulary pin (3e) so a third call mode cannot inherit a grace period nobody
+  re-derived, and two controls. **17 → 21.**
+- **`tests/test_fixture_call_mode_pin.py` check 1c's non-degeneracy probe**
+  pinned the LITERAL `per_trial` and then asserted the pin and the constant
+  DISAGREED. After the flip, pinning per-trial pins what is already in force,
+  the two agree, and the probe goes red naming a mechanism that works perfectly.
+  It pins `_OTHER_ARM` — derived as the opposite of the configured one — so the
+  disagreement holds in either arm by construction. **81 → 82.** That file's own
+  docstring already recorded this lesson about its check 1a; the probe five
+  lines below it had the identical defect.
+
+**THE FLIP'S LARGEST FINDING WAS NOT IN THE BRIEF: SEVEN TEST FILES DROVE THE
+STAGE 5 NODE WITHOUT SETTING THE ARM, AND EVERY ONE OF THEM SILENTLY CHANGED
+SUBJECT.** CI bucket A went 69/0 to **69/7** on the flip alone. None is a defect
+in the pipeline — the per-trial behaviour each of them met is correct — and none
+could have been found by reading, because the arm was never mentioned in any of
+them:
+
+| file | what it measures | what per-trial did to it |
+|---|---|---|
+| `test_agent_stage5_input_packing.py` | the INPUT packer | per-trial BYPASSES the packer outright; every assertion was about a mechanism that did not run |
+| `test_agent_emission_provenance.py` | `emission_index` restarting per CALL, `call_index` following the billed call | needs a packer that produced several chunks; per-trial chunks are singletons |
+| `test_agent_out_of_set_detector.py` | cross-chunk reconciliation | "an id belonging to another chunk" requires more than one chunk |
+| `test_agent_state_channel_coverage.py` | the packer's three provenance channels | `llm_classifier_packed_chunks` / `llm_classifier_packing` are NULL by design in per-trial |
+| `test_storage_packing_and_cache_columns.py` | those channels' four persisted columns | same |
+| `test_agent_patient_record_tokens.py` | the ONE system prompt rendered above the split loop | per-trial adds a warmup carrying the identical system message, so the render arithmetic moves |
+| `test_agent_trial_verdict_normalization.py` | one response per patient | a stub serving the same body to N trial calls produces N of everything: a malformed-entry count of 1 becomes N. **Correct behaviour**, and not what the checks measure |
+
+**THEY PIN THE GROUPED ARM THROUGH `config.pin_matching_call_mode()`, NEVER BY
+WRITING THE CONSTANT**, and that is the same argument the fixture harness
+already makes about itself. Assigning `MATCHING_PER_TRIAL_CALLS_ENABLED` would
+be a second WRITER of a declared configuration value — the shape this project
+keeps removing — and would leave that constant, read anywhere later in the
+process, saying the project is configured grouped when it is not. The pin says
+what the PROCESS is forced to do and `matching_call_mode_pin()` reports it;
+every consumer the node reaches follows the owner, so one line redirects Stage
+5's partition, `inferences.matching_call_mode`, the resume fingerprint and the
+tracking index consistently.
+
+**IT IS A HARD GUARD, NOT A `check()`.** A pin that did not take leaves every
+assertion below silently measuring the other arm — not one failure but every
+failure with a misleading message, which is the case this suite already reserves
+`SystemExit` for (a wrong project root). **Demonstrated: the pin removed in a
+copy of each of the seven, all seven abort on stderr naming the arm they found.**
+
+**AND IT IS RELEASED BEFORE THE SUMMARY, WHICH THE FIRST VERSION GOT WRONG IN
+THREE OF THE SEVEN.** The release is process-global state and `pytest tests/`
+imports every module into ONE process, where a leaked grouped pin would make
+`tests/test_agent_stage5_per_trial_calls.py`'s explicitly-per-trial sections run
+grouped without a word — and would fail its check 1a-ii. The first placement put
+the release BELOW the results line in the three files whose summary is
+`print("\n" + "=" * 75)` / `RESULTS:` / `print("=" * 75)`, because the anchor
+matched the CLOSING banner: the outcome still decided the exit code while being
+absent from the number the summary printed. **A run that reports "0 failed" and
+exits 1** — caught by comparing every count against a pristine `git worktree` at
+HEAD rather than against the numbers in this file. It is above the summary now
+and all seven moved by exactly +1. **Control: the restore skipped in a copy, the
+release check fires in all three tried.**
+
+**WHAT THIS COSTS, STATED RATHER THAN GLOSSED.** The shipped arm's behaviour on
+those seven subjects is NOT covered by them any more, and two of the seven are
+genuine gaps rather than mechanisms that do not exist in per-trial mode: the
+per-CALL multiplicity of the normalizer's counters (`MALFORMED_EVALUATION_
+ENTRIES` and friends counting once per response, N responses per patient), and
+the render arithmetic with a warmup in it. Both are named in the files' own pin
+blocks. `tests/test_agent_stage5_per_trial_calls.py` covers the partition, the
+dispatch, the warmup, the isolation, the floor and the out-of-set semantics at
+chunk size one; it does not cover those two.
+
+**THE PROCESS-GLOBAL PIN LEAK IS CLOSED, AND IT STOPPED BEING INERT ON THE DAY
+OF THE FLIP.** `capture.main()` installs a process-global pin and does not clear
+it — correct for a real capture run, and its own docstring records that a test
+driving it inherits the pin. `tests/test_resume_capture_and_ragas.py` drives it
+**three times**. While grouped was the default the pin agreed with the default
+and the leak changed nothing observable; now a leaked pin makes
+`config.matching_call_mode()` answer "grouped" for every check after it and for
+every file sharing the process — **silently, because the pin's whole design is
+that consumers cannot tell it from the default**. `drive_main`'s `finally`
+clears it, beside the two restores already there. Three checks make that a
+measurement rather than untested code: the pin state is RECORDED before it is
+cleared, so "no pin afterwards" cannot be satisfied by a `main()` that never
+installed one. **207 → 210.**
+
+**THE PER-TRIAL TEST FILE'S IDIOM WAS NOT CHANGED, AND THAT IS THE DECISION
+RATHER THAN INERTIA.** Every drive goes through `run_node`, which writes the
+flag explicitly and restores it in a `finally`; no section reads the shipped
+default to decide what it exercises. Making the ON-arm sections read the default
+would (i) exercise NOTHING the day the default moved back for a comparison
+campaign — every arm section would silently become a second copy of section 8 —
+and (ii) make each assertion a statement about two things at once, so a failure
+could not distinguish "the mechanism broke" from "somebody moved the default".
+**Explicit on both sides means the file measures the MECHANISM and check 1a
+alone measures the DECISION.** What moved: 1a inverted (with the retired text
+kept as the record), 1a-ii added over the unpinned owner, and 10e's restore
+derived from `_START_CONFIG` — captured at import — rather than the literal
+`(False, 4)`, with 10f as its non-degeneracy probe. **318 → 320.**
+
+**ONE STALE CROSS-REFERENCE WAS FOUND AND CORRECTED WHILE REWRITING THE
+CONSTANT'S BLOCK.** It pointed at "section 6 … and section 7's control" of the
+per-trial test for the OFF-exactness proof; those are sections **8** and check
+**8h**. Stale by two, and it is now written as a section AND a check so the next
+renumber is visible.
+
+**WHAT DID NOT MOVE, CHECKED RATHER THAN ASSUMED.** `docker-compose.yml`'s
+`stop_grace_period: 620s` — the shortfall is arm-independent, so the flip
+changes which arm the comment states FIRST and not the number. The three
+resume gates (`batch/runner.py`, `ablation/study.py`,
+`evaluation/run_harness.py`) already gate `matching_call_mode` as a fingerprint
+field, so a grouped-mode checkpoint resumed under the new default refuses by
+name with no edit — that was the call-mode pass's work and this pass only
+inherits it. `FINGERPRINT_VERSION` is unchanged at **3** (verified): the flip
+changes a VALUE the stamp already carries, not the stamp's shape, so no
+v3-stamped artifact refuses for a SHAPE reason — it refuses, correctly, for a
+CHANGED-FIELD reason if it was written in the other arm.
+`SCHEMA_USER_VERSION` is unchanged at **4** for the same reason — `inferences.matching_call_mode` and `runs.matching_call_mode` already
+exist and simply start carrying the other member.
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **Two of the seven pinned files have a REAL per-trial coverage gap**, named
+   above and in their own pin blocks: the per-CALL multiplicity of the Stage 5
+   normalizer's counters, and the fixed-prefix render arithmetic with a warmup
+   in it. Neither is covered by
+   `tests/test_agent_stage5_per_trial_calls.py`.
+2. **`GET /pipeline/info` does not report the call mode.** Its stage-5 line
+   interpolates `MATCHING_MODEL` and says nothing about how many requests that
+   model gets, so an operator asking the API which pipeline it is running cannot
+   see the arm. Adding it is a contract change to a served response and belongs
+   to a pass that can measure it.
+3. **The three-call probe has not been run** — it costs money and this pass made
+   none. Nothing in the tree can turn per-trial mode's two live assumptions into
+   measurements without it.
+4. **Per-trial fixtures** (above). The shipped arm has no characterization gate.
+5. **`MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS = 4` is still uncalibrated** and is
+   still labelled one: it was derived from an ESTIMATED ~15 s single-trial
+   latency. `inferences.llm_classifier_call_details` is the measurement it is
+   missing, and it exists only after a real per-trial run.
+6. **No shutdown gate on the `fastapi` service.** 620 s covers one in-flight
+   request; a whole patient is 2400 s in either arm. The repair is a gate, not a
+   bigger number, and it is now the shipped arm's problem as well as the
+   retained one's.
+7. **No process memo for a warmup rejection**, so every patient re-discovers it.
+   Argued at the dispatch-hardening pass: a transient 400 memoized process-wide
+   would disable the warmup for a whole campaign on one hiccup.
+
 
 ## Persistence and observability
 

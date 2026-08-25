@@ -39,14 +39,22 @@ WHAT THIS FILE DELIBERATELY DOES NOT DO.
   somebody legitimately raises a timeout, and names nothing about why. The
   assertion is the INEQUALITY, so the file passes for any grace period that
   covers the budget and fails for every one that does not.
-* IT DOES NOT COVER THE PER-TRIAL ARM, AND SAYS SO. Per-trial mode issues
+* IT DOES NOT COVER A WHOLE PATIENT IN EITHER ARM ON THIS SERVICE, AND SAYS
+  SO. Per-trial mode -- the SHIPPED arm -- issues
   `ceil(MAX_TRIALS_FOR_EVALUATION / MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS)`
-  rounds, so its worst case is four times this one -- 2400s against a 620s
-  grace. That is a KNOWN, DOCUMENTED shortfall recorded in the compose file
-  itself, and the repair is a shutdown gate on the API service rather than a
-  bigger number. Section 3 asserts the shortfall EXISTS and is documented,
-  so that turning the mode on cannot quietly inherit a grace period nobody
-  re-derived.
+  rounds, so its worst case is four times this one: 2400s against a 620s
+  grace. The RETAINED GROUPED arm reaches the same 2400s by a different route,
+  `MATCHING_MAX_INPUT_PACKED_CHUNKS - 1` further sequential chunks. That is a
+  KNOWN, DOCUMENTED shortfall recorded in the compose file itself, and the
+  repair is a shutdown gate on the API service rather than a bigger number.
+  Section 3 asserts the shortfall EXISTS IN BOTH ARMS and is documented, so
+  that neither arm can quietly inherit a grace period nobody re-derived.
+
+  SECTION 1 IS SUFFICIENT BECAUSE OF THE BATCH RUNNER'S GATE, NOT BECAUSE OF
+  THE ARM. Section 3 used to end by pinning the arm OFF and calling that
+  section 1's premise; the premise was false when it was written and the pin
+  was a landmine that went red on the very flip it was watching for. See the
+  argument at section 3.
 * IT DOES NOT PARSE YAML WITH A YAML LIBRARY. `docker-compose.yml` is read as
   TEXT, on `tests/test_harness_endpoint_budget.py`'s precedent -- and for a
   second reason that file learned the hard way: this compose file ARGUES about
@@ -337,33 +345,101 @@ check_true("2b  the service scanner found the stack's services "
 
 
 # ===========================================================================
-# 3.  THE PER-TRIAL SHORTFALL IS KNOWN, DOCUMENTED, AND STILL TRUE
+# 3.  THE SHORTFALL ON THIS SERVICE IS ARM-INDEPENDENT, KNOWN, AND DOCUMENTED
 # ===========================================================================
 #
-# This grace period does NOT cover per-trial mode, and that is a recorded
-# decision rather than an oversight: the repair is a shutdown gate on this
-# service, not a bigger number. What must not happen is the mode being turned on
-# while this file quietly reports "the grace period is fine".
+# This grace period does NOT cover a whole patient in EITHER arm, and that is a
+# recorded decision rather than an oversight: the repair is a shutdown gate on
+# this service, not a bigger number. What must not happen is an arm being turned
+# on while this file quietly reports "the grace period is fine".
+#
+# THIS SECTION USED TO END WITH A LANDMINE AND THE FLIP IS WHY IT DOES NOT.
+# The retired check 3c read `MATCHING_PER_TRIAL_CALLS_ENABLED == False` under a
+# comment saying "which is the premise under which section 1 is sufficient".
+# Two things were wrong with it and only one was the value:
+#
+#   * IT WAS A TEST THAT FAILS ON THE CHANGE IT EXISTS TO PROTECT. The moment
+#     per-trial shipped as the default -- the thing the check was watching for
+#     -- it went red, naming a constant rather than a defect. A test that fails
+#     on the flip is a landmine, not a tripwire; `tests/test_fixture_call_mode_
+#     pin.py` records that exact lesson about its own check 1a.
+#   * THE PREMISE WAS FALSE WHEN IT WAS WRITTEN. Section 1's sufficiency does
+#     not rest on the arm at all. It rests on the BATCH RUNNER's Stage 5
+#     shutdown gate, which bounds the drain to ONE in-flight request in BOTH
+#     arms (the operator-control pass gated the grouped send loop too). On the
+#     `fastapi` service, which has no gate of any kind, the worst case is
+#     2400 s in BOTH arms -- 4 rounds x 600 per-trial, 4 further chunks x 600
+#     grouped -- so the shortfall never was a property of the arm.
+#
+# WHAT REPLACES IT IS ARM-INDEPENDENT AND CANNOT BE DEFEATED BY A FLIP IN
+# EITHER DIRECTION: both arms' worst cases are derived from the constants, both
+# are required to exceed the grace period, and both derivations are required to
+# be present in the compose file. Flip the default back for a comparison run
+# and every check below still holds and still means the same thing.
 
-section("3. The per-trial arm is NOT covered, and the file says so")
+section("3. NEITHER arm is covered on this service, and the file says so")
 
 _ROUNDS = -(-config.MAX_TRIALS_FOR_EVALUATION
             // config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS)   # ceil
 _PER_TRIAL_WORST = _ROUNDS * _BUDGET
+
+# GROUPED: the INPUT packer emits at most MATCHING_MAX_INPUT_PACKED_CHUNKS
+# sequential requests for one patient. A SIGKILL after the first leaves the rest
+# unissued, so the drain is the chunks that FOLLOW the in-flight one.
+#
+# THIS IS A FLOOR AND IS USED AS ONE. The input packer is not the only thing
+# that can add a request to a grouped patient: the OUTPUT pre-splitter splits a
+# batch whose output estimate is too large, and the REACTIVE splitter halves a
+# chunk whose response came back at `length`, up to MAX_TRUNCATION_SPLITS. A
+# floor is the right instrument here because the assertion is an INEQUALITY in
+# the direction the floor already settles -- if the smallest honest worst case
+# already exceeds the grace period, so does the real one. Deriving the true
+# maximum would mean modelling three interacting splitters for a number that
+# changes no verdict.
+_GROUPED_FURTHER = config.MATCHING_MAX_INPUT_PACKED_CHUNKS - 1
+_GROUPED_WORST = _GROUPED_FURTHER * _BUDGET
 
 check_true(f"3a  per-trial mode's worst case ({_PER_TRIAL_WORST}s over "
            f"{_ROUNDS} rounds) EXCEEDS the grace period ({_GRACE}s) -- so the "
            f"shortfall this file declines to fix is still real",
            _GRACE is not None and _PER_TRIAL_WORST > _GRACE)
 
-check_true("3b  ...and the compose file documents it, so an operator meets the "
-           "arithmetic rather than discovering it",
+check_true(f"3b  the RETAINED GROUPED arm's worst case ({_GROUPED_WORST}s over "
+           f"{_GROUPED_FURTHER} further chunks, a FLOOR -- the two output "
+           f"splitters can add more) EXCEEDS it too, so the shortfall is a "
+           f"property of this service having no shutdown gate, NOT of which "
+           f"arm is configured",
+           _GRACE is not None and _GROUPED_WORST > _GRACE)
+
+# NON-DEGENERACY. Both worst cases are products, and a zero in either factor
+# would make 3a or 3b fail rather than pass -- but a factor of one would make
+# them pass for a reason that is not the one claimed.
+check_true("3c  both worst cases are genuinely multi-request (a single-request "
+           "worst case would make 3a/3b statements about the budget alone)",
+           _ROUNDS > 1 and _GROUPED_FURTHER > 1)
+
+check_true("3d  ...and the compose file documents BOTH derivations, so an "
+           "operator meets the arithmetic for whichever arm is configured "
+           "rather than discovering it",
            "rounds per patient" in _COMPOSE_TEXT
+           and "chunks per patient" in _COMPOSE_TEXT
            and "SHUTDOWN GATE" in _COMPOSE_TEXT.upper())
 
-# IF THE MODE EVER SHIPS ON, THIS SECTION MUST BE REVISITED RATHER THAN PASSING.
-check("3c  the per-trial arm is OFF, which is the premise under which section "
-      "1 is sufficient", config.MATCHING_PER_TRIAL_CALLS_ENABLED, False)
+# THE ONE ARM-DEPENDENT THING WORTH PINNING: the configured arm must be one
+# this file has arithmetic for. A third mode added to the vocabulary without a
+# worst case derived here would otherwise inherit a grace period nobody
+# re-derived -- which is what the retired check was reaching for.
+check("3e  the configured arm is one of the two this section derives a worst "
+      "case for, so a new mode cannot quietly inherit this grace period",
+      (config.matching_call_mode() in config.MATCHING_CALL_MODES,
+       len(config.MATCHING_CALL_MODES)), (True, 2))
+
+# CONTROL: 3a and 3b can fail. Without this they pass for any grace period
+# large enough, including one that genuinely covered a whole patient.
+check("3f  CONTROL: a grace period at the per-trial worst case does NOT "
+      "report a shortfall", _PER_TRIAL_WORST > _PER_TRIAL_WORST, False)
+check("3g  CONTROL: nor does one at the grouped worst case",
+      _GROUPED_WORST > _GROUPED_WORST, False)
 
 
 #------------------------------------------------------------------------------

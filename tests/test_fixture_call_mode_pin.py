@@ -344,9 +344,21 @@ check("1b  ...and the state was restored",
 
 # THE PIN DOES NOT WRITE THE CONSTANT. This is property (1) of the docstring,
 # measured behaviourally; section 4b measures it structurally.
+#
+# THE PINNED MODE IS THE OPPOSITE OF THE CONFIGURED ONE, DERIVED, NEVER
+# WRITTEN OUT -- and this is the second landmine of that shape the default flip
+# found. The pin used to be the literal `_PER_TRIAL`, which made the
+# non-degeneracy probe below ("the two disagreed") true only while the shipped
+# default was grouped: the moment per-trial became the default, pinning
+# per-trial pinned what was already in force, the two AGREED, and the probe
+# went red naming a mechanism that works perfectly. Pinning `_OTHER_ARM` makes
+# the disagreement hold in either arm by construction, which is what the probe
+# was always reaching for.
+_OTHER_ARM = (_GROUPED if config.MATCHING_PER_TRIAL_CALLS_ENABLED
+              else _PER_TRIAL)
 _before_const = config.MATCHING_PER_TRIAL_CALLS_ENABLED
 try:
-    config.pin_matching_call_mode(_PER_TRIAL)
+    config.pin_matching_call_mode(_OTHER_ARM)
     _const_during = config.MATCHING_PER_TRIAL_CALLS_ENABLED
     _mode_during = config.matching_call_mode()
 finally:
@@ -354,10 +366,13 @@ finally:
 check("1c  pinning does not touch MATCHING_PER_TRIAL_CALLS_ENABLED, so the "
       "constant still says what the project is CONFIGURED to do while the "
       "owner says what this process will DO",
-      (_const_during, _mode_during), (_before_const, _PER_TRIAL))
-check("1c  ...non-degeneracy: the two disagreed, so the check above is a "
-      "measurement rather than two readings of one value",
-      _const_during == (_mode_during == _PER_TRIAL), False)
+      (_const_during, _mode_during), (_before_const, _OTHER_ARM))
+check("1c  ...non-degeneracy: the pinned arm is NOT the configured one, so "
+      "the check above is a measurement rather than two readings of one value",
+      (_OTHER_ARM == config.matching_call_mode(),
+       _mode_during == config.matching_call_mode()), (False, False))
+check("1c  ...and the pin really was cleared, so nothing below inherits it",
+      config.matching_call_mode_pin(), None)
 
 check("1d  pin_matching_call_mode returns the PREVIOUS pin, so a caller can "
       "restore it",
