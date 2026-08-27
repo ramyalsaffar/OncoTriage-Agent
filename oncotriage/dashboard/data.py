@@ -145,19 +145,36 @@ Nothing is wrong with the rows that ARE there."""
 RUN_TRACKING_PARTIAL = "partial"
 """``availability`` when the run schema is there in pieces.
 
-Either one run table without the other, or both tables without
-``inferences.run_id``. Not producible by ``initialize_database``, which creates
-all three in one call, so it means the database was edited by something else.
-Kept apart from ``absent`` because the remedy differs: absent is fixed by
-running the pipeline, partial wants a person.
+TWO CAUSES, AND THEY ARE NOT THE SAME FINDING. The tab names both because the
+remedy differs and this loader cannot always tell them apart:
 
-THE COLUMN CASE IS IN HERE RATHER THAN IN ``present`` FOR A MEASURED REASON.
-``run_summary`` and ``run_attribution_coverage`` both JOIN on
-``inferences.run_id``, so with the tables present and the column gone they are
-refused by ``queries.unavailable`` -- and this loader reporting ``present``
-would send the tab down its normal path, where two empty frames would render as
-"the run tables hold no rows". That is a statement about a pipeline that has not
-run, made about a database whose queries could not be asked."""
+    AN ERA GAP. Every missing item is a COLUMN. ``runs.matching_call_mode`` and
+    ``runs.resumed`` are ADDITIVE -- ``initialize_database`` adds them through
+    ``RUN_COLUMN_ADDITIONS`` -- so a database last written between the
+    run-identity pass and the call-mode pass has both run tables and lacks the
+    column, which is an ordinary, blameless state whose remedy is exactly
+    ``absent``'s: let a writer open the file.
+
+    A SHAPE THE PIPELINE CANNOT PRODUCE. One run TABLE without the other.
+    ``initialize_database`` creates both in one call, so this one wants a
+    person.
+
+THAT SECOND SENTENCE USED TO BE THE WHOLE DOCSTRING, and it was a false
+statement about the first case: it told an operator with a perfectly ordinary
+era-3 database that something had edited it. The era-3 case was not reachable
+when it was written -- ``matching_call_mode`` did not exist -- and it became
+reachable without anything here noticing, which is why the requirement is now
+DERIVED from the queries' own declarations rather than hand-listed.
+
+WHY THE COLUMN CASE IS NOT ``present``, MEASURED RATHER THAN ARGUED. With the
+tables present and an additive column gone, ``queries.missing_requirements``
+refuses the queries that name it and ``queries.run`` raises ``MissingTableError``
+-- so this loader reporting ``present`` sends the tab down its normal path,
+where ``_load_run_query`` catches the raise, calls ``st.error`` and hands back
+an empty frame, and the tab then prints "the run tables are present and hold no
+rows". That is a statement about a pipeline that has not run, made about a
+database whose queries could not be asked, printed underneath the error that
+says so."""
 
 RUN_TRACKING_PRESENT = "present"
 """``availability`` when both run tables are there. Says nothing about rows."""
@@ -177,6 +194,60 @@ RUN_TRACKING_STATES = (RUN_TRACKING_NO_DATABASE, RUN_TRACKING_ABSENT,
 ``oncotriage.storage.queries.RUN_HEALTH_STATES``' footing: the tab branches on it
 exhaustively and an unlisted value would fall through every branch and render
 nothing."""
+
+# ===========================================================================
+# WHICH QUERIES THE RUN HEALTH TAB ASKS -- ONE OWNER PER KEY
+# ===========================================================================
+#
+# THE AVAILABILITY LOADER DERIVES ITS REQUIREMENTS FROM THESE, and that is the
+# whole of the era-3 fix. It used to hand-name ONE column, ``inferences.run_id``,
+# because that was the only additive column the run queries touched on the day
+# it was written. ``runs.resumed`` and then ``runs.matching_call_mode`` arrived
+# afterwards, each declared on ``queries.run_summary`` and
+# ``queries.campaign_summary`` -- and nothing here noticed either time. A
+# database written between the run-identity pass and the call-mode pass
+# therefore reported ``present`` and produced a query error inside the tab.
+#
+# A HAND-WRITTEN COLUMN LIST HERE WOULD BE A SECOND DECLARATION OF A FACT THE
+# Query RECORDS ALREADY CARRY, and it would go stale the same way on the next
+# additive column. ``queries.missing_requirements`` is the one owner of "can
+# this database answer this query", it is what ``report()`` and
+# ``queries.run`` already use, and it applies the rule this loader would
+# otherwise have to repeat -- a column on an absent table is reported ONCE, as
+# the table, because naming both tells an operator to add a column to a table
+# that is not there.
+#
+# THE KEYS ARE NAMED CONSTANTS RATHER THAN LITERALS AT THE FOUR LOADERS,
+# because the derivation and the loaders must ask about the SAME four queries.
+# Two copies of that list is how a fifth run query joins the tab without
+# joining its availability check.
+RUN_SUMMARY_QUERY = "run_summary"
+RUN_DEGRADATION_QUERY = "run_degradation_breakdown"
+RUN_CAMPAIGN_QUERY = "campaign_summary"
+RUN_ATTRIBUTION_QUERY = "run_attribution_coverage"
+
+RUN_TAB_QUERY_KEYS = (RUN_SUMMARY_QUERY, RUN_DEGRADATION_QUERY,
+                      RUN_CAMPAIGN_QUERY, RUN_ATTRIBUTION_QUERY)
+"""Every registered query the Run Health tab runs. CLOSED.
+
+A key here that the registry does not carry raises at IMPORT (below) rather
+than at the first render, where it would arrive as a caught exception and an
+empty frame -- which is the shape this whole section exists to remove."""
+
+# A RuntimeError AT IMPORT, NOT AN ``assert``: ``python -O`` deletes asserts,
+# and this project's other import-time vocabulary guards (RESUME_SKIP_STATUSES,
+# TRACKING_STATUS_FOR) are written the same way for the same reason.
+_unknown_run_keys = tuple(k for k in RUN_TAB_QUERY_KEYS
+                          if k not in queries.QUERIES_BY_KEY)
+if _unknown_run_keys:                                    # pragma: no cover
+    raise RuntimeError(
+        f"RUN_TAB_QUERY_KEYS names {_unknown_run_keys}, which "
+        f"oncotriage.storage.queries does not register. The Run Health tab "
+        f"would fail at render time with a caught exception and an empty "
+        f"frame; failing here names the key instead."
+    )
+del _unknown_run_keys
+
 
 
 def _readonly_connection():
@@ -229,20 +300,33 @@ def load_run_tracking_availability():
 
         present = queries.available_tables(conn)
         found = sorted(t for t in queries.RUN_TABLES if t in present)
-        missing = sorted(t for t in queries.RUN_TABLES if t not in present)
 
-        # The COLUMN, asked through the query layer's own helper so this module
-        # does not carry a second PRAGMA that can disagree with the one the
-        # `requires_columns` guard reads.
+        # WHAT THE TAB'S OWN QUERIES CANNOT BE ASKED, DERIVED FROM THEIR OWN
+        # DECLARATIONS. `present` is passed so the whole registry sweep costs
+        # one `available_tables` call, and so a query declaring neither
+        # requirement is answered without touching the database at all.
+        #
+        # THE UNION IS ORDER-PRESERVING AND DE-DUPLICATED. All four queries
+        # declare `inferences.run_id`, and reporting it four times would turn
+        # the tab's one-line "missing:" list into a wall.
+        missing = []
+        for _key in RUN_TAB_QUERY_KEYS:
+            for _absent in queries.missing_requirements(conn, _key,
+                                                        present=present):
+                if _absent not in missing:
+                    missing.append(_absent)
+        missing.sort()
+
+        # KEPT AS A FIELD OF ITS OWN even though `missing` now carries it: it
+        # is the one requirement the tab's own selection-attribution caption
+        # asks about directly, and it is a plain boolean rather than a name to
+        # search a list for.
         has_run_id = "run_id" in queries.table_columns(conn, "inferences")
 
         if not found:
             availability = RUN_TRACKING_ABSENT
         elif missing:
             availability = RUN_TRACKING_PARTIAL
-        elif not has_run_id:
-            availability = RUN_TRACKING_PARTIAL
-            missing = ["inferences.run_id"]
         else:
             availability = RUN_TRACKING_PRESENT
 
@@ -287,7 +371,7 @@ def _load_run_query(key):
 @st.cache_data(ttl=60)
 def load_run_summary_data():
     """One row per run. Cached for 60 seconds. See ``queries.run_summary``."""
-    return _load_run_query("run_summary")
+    return _load_run_query(RUN_SUMMARY_QUERY)
 
 
 @st.cache_data(ttl=60)
@@ -296,7 +380,7 @@ def load_run_degradation_data():
 
     Cached for 60 seconds. See ``queries.run_degradation_breakdown``.
     """
-    return _load_run_query("run_degradation_breakdown")
+    return _load_run_query(RUN_DEGRADATION_QUERY)
 
 
 @st.cache_data(ttl=60)
@@ -314,7 +398,7 @@ def load_run_campaign_data():
     is a defect in the query, not a fact about the database: the query is driven
     from `runs`, so every run is in exactly one campaign.
     """
-    return _load_run_query("campaign_summary")
+    return _load_run_query(RUN_CAMPAIGN_QUERY)
 
 
 @st.cache_data(ttl=60)
@@ -324,7 +408,7 @@ def load_run_attribution_data():
     See ``queries.run_attribution_coverage``. This is what the tab renders the
     "no run_id" population from -- a stated count, never a silent exclusion.
     """
-    return _load_run_query("run_attribution_coverage")
+    return _load_run_query(RUN_ATTRIBUTION_QUERY)
 
 
 

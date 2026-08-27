@@ -637,7 +637,7 @@ python tests/test_api_call_mode_and_db_health.py                    # 151/0/0 on
 # of its argument -- including a control MODULE written to that temp directory
 # and PARSED, never imported -- an ast walk, or a registry entry removed inside
 # try/finally with the restore asserted. Bucket A, ~3 s.
-python tests/test_degradation_counter_readers.py                    # 152 (was 138; the operator-control pass added the two new dual-owned counters and replaced the adjacency pin on report_checkpoint_faults with a transitive call-graph walk)
+python tests/test_degradation_counter_readers.py                    # 154 (was 152; the API-shutdown-gate pass added SHUTDOWN_GATE_DEGRADATIONS to _READER_EXEMPTIONS on oncotriage/mcp/server.py's TOOL_FAILURES precedent -- a long-lived SERVER has no run end, and degradation.py binds counter OBJECTS, so registering it would put FastAPI in every batch run's import graph. Before that 138; the operator-control pass added the two new dual-owned counters and replaced the adjacency pin on report_checkpoint_faults with a transitive call-graph walk)
 
 # The Docker pass. Same shape, same directory. No network, no keys, no spend,
 # and no Docker daemon: every Qdrant client is a stand-in and section 1's
@@ -8022,12 +8022,40 @@ four properties THERE.
 python tests/test_ablation_latest_run_selection.py   #  45, ~1.5s. EXECS NOTHING:
                                                      #  every control is a different
                                                      #  SQL STRING on one connection
-python tests/test_compose_shutdown_grace.py          #  21, ~0.7s. NO DOCKER DAEMON
-                                                    #  (was 17; the default-flip pass
+python tests/test_compose_shutdown_grace.py          #  43, ~0.8s. NO DOCKER DAEMON
+                                                    #  (was 30; the API-shutdown-gate
+                                                    #  pass rewrote section 3 from
+                                                    #  "the shortfall is real" to "the
+                                                    #  GATE is the premise" and pins
+                                                    #  it by AST over api/server.py,
+                                                    #  with seven controls. Before
+                                                    #  that 17; the default-flip pass
                                                     #  replaced section 3's arm-OFF
                                                     #  landmine with the GROUPED arm's
                                                     #  own worst case, a vocabulary pin
                                                     #  and two controls)
+python tests/test_api_shutdown_gate.py                #  77, ~2s. NO BILLED CALL,
+                                                     #  no network, no keys, no live
+                                                     #  server, no live Qdrant, no
+                                                     #  model load, no corpus, no git
+                                                     #  history, no Docker daemon.
+                                                     #  The SIGNAL half is installed
+                                                     #  for real and INVOKED through
+                                                     #  signal.getsignal over a
+                                                     #  RECORDING previous handler, so
+                                                     #  the chain is COUNTED rather
+                                                     #  than inferred from a process
+                                                     #  dying; a real signal is
+                                                     #  deliberately not delivered,
+                                                     #  because the chain reaches
+                                                     #  SIG_DFL in a bare process. The
+                                                     #  LIFESPAN half is driven with
+                                                     #  TestClient as a context
+                                                     #  manager. Section 3 drives the
+                                                     #  REAL Stage 5 node against a
+                                                     #  counting stub on either side
+                                                     #  of the flag. EXECS NOTHING.
+                                                     #  Not in the collision matrix.
 python tests/test_ablation_write_durability.py        #  43, ~3s. No network, no
                                                      #  keys, no spend; every
                                                      #  database is a temp file and
@@ -8713,6 +8741,250 @@ removed. The last of those needed a THIRD case to be measurable at all -- the
 obvious one drives the failure with the directory read-only, where a buggy
 `os.unlink(backup)` fails too and the copy survives for the wrong reason.
 (v) `tests/test_ablation_stop_and_lock.py`'s 5j-5l were vacuous, above.
+
+### The API bounds what a `docker stop` spends (the API-shutdown-gate pass)
+
+**`oncotriage/api/server.py` WAS THE LAST STAGE 5 CALLER WITH NO SHUTDOWN
+GATE.** `25- Batch Runner.py` and `26- Ablation Study.py` both ask Stage 5 to
+stop issuing requests the moment a SIGTERM arrives; this service asked nothing,
+so a `docker stop` could SIGKILL it with up to three further full-price rounds
+still to be issued -- **2400 s of billable work against a 620 s grace period, in
+either arm**. `docker-compose.yml` recorded it as a known, unfixed shortfall and
+named the repair; this is that repair.
+
+**NO BILLED CALL WAS MADE.** `python fixture_replay.py` is **12/12 clean, exit
+0, with no recapture**, `tests/test_package_invariants.py` is unchanged at
+**260/0/0**, and the production `inferences.db` (`ab1403e3…`, 90,185,728 bytes)
+and `ablation_results.db` (`f2bc23c6…`) are byte-unchanged.
+
+**THE BRIEF ASKED FOR A LIFESPAN SHUTDOWN HOOK AND A LIFESPAN HOOK ALONE BUYS
+NOTHING. THAT IS A FACT ABOUT uvicorn AND IT WAS MEASURED RATHER THAN
+REASONED.** Read `Server.shutdown()` in uvicorn 0.40:
+
+```
+for server in self.servers: server.close()          # stop accepting
+for connection in ...: connection.shutdown()
+await asyncio.wait_for(self._wait_tasks_to_complete(), ...)   # <-- the drain
+if not self.force_exit:
+    await self.lifespan.shutdown()                  # <-- only then
+```
+
+`_wait_tasks_to_complete()` spins while `server_state.tasks` is non-empty, and
+an in-flight `POST /match` IS one of those tasks. **So the lifespan shutdown
+event is delivered AFTER the drain it was meant to bound** -- and under
+`force_exit` (a second Ctrl-C) it is never delivered at all.
+
+**DRIVEN, BOTH ARMS, AGAINST A REAL uvicorn WITH A REAL SIGTERM AND A REQUEST
+GENUINELY IN FLIGHT** (a stand-in graph, no billed call; the request polls the
+flag and records when it flipped):
+
+| arm | SIGTERM at | flag flipped | request ended | flag at end |
+|---|---|---|---|---|
+| **signal gate (shipped)** | 1.505 s | **1.517 s — mid-request** | 3.522 s | **true** |
+| lifespan hook only (the brief's design) | 1.505 s | **never** | 16.44 s | **false** |
+
+The second row is the whole argument: the in-flight request polled for twelve
+seconds and never saw the flag, and the shutdown line printed *after* it
+finished. **A lifespan-only implementation would have shipped a gate that
+cannot gate anything, and every test written against it would have passed.**
+
+**SO THE LOAD-BEARING HALF IS A SIGNAL HANDLER, CHAINED.** It is installed in
+the lifespan STARTUP -- above the graph compile, so a SIGTERM arriving during a
+slow bring-up is already gated -- and **chaining is mandatory rather than
+polite**: uvicorn installs `Server.handle_exit` in `capture_signals()`, which
+wraps `serve()`, so the lifespan startup runs inside it and
+`signal.getsignal(SIGTERM)` is uvicorn's handler at the moment we look.
+Replacing it without calling it would set the flag and leave the server running
+forever -- trading a bounded drain for a container that has to be SIGKILLed.
+`_chain_to` reproduces **every** disposition `getsignal` can return, and the two
+that are not callables are the ones a naive `previous(signum, frame)` crashes
+on: `SIG_IGN` is reproduced by doing nothing, and **`SIG_DFL` restores the
+default and re-raises**, because doing nothing there converts a fatal signal
+into a no-op. `None` -- a handler installed from C -- makes the gate **decline
+to arm and count it**, rather than replace a working shutdown with one that
+cannot chain.
+
+**THE LIFESPAN HOOK IS KEPT AND IS NOT DECORATION.** It covers every shutdown
+that arrives WITHOUT a signal: a host setting `Server.should_exit`,
+`install_signal_handlers=False`, and -- the case that makes any of this drivable
+in-process -- `starlette.testclient.TestClient`, which runs the application on
+an anyio portal THREAD where `signal.signal` raises `ValueError` and no signal
+gate can be installed at all. **Measured, not assumed:** the test asserts the
+portal really is a non-main thread, so "and this is why the lifespan half
+exists" is a measurement rather than a claim about somebody else's
+implementation.
+
+**WHICH HALF FIRED IS PRINTED RATHER THAN INFERRED.** The reason recorded with
+the FIRST request wins, so a reason naming a signal says the handler ran and the
+drain was bounded, and a reason naming the lifespan says it did not. An operator
+reading a bill needs that difference and cannot recover it from anything else.
+
+**IT IS SIGNAL-SAFE, and that decided the implementation rather than its
+placement**, on `25- Batch Runner.py`'s footing: `request_stage5_shutdown`
+assigns two module globals and takes no lock, and the announcement is
+`os.write(2, ...)` rather than a `print` or a log call. **`os` is back in this
+module for that one reader**, and the paragraph recording why pass 20f-1 removed
+it is kept beside the one recording why it returned.
+
+**THE FLAG IS CLEARED AT STARTUP**, on `oncotriage/batch/runner.py:main()`'s
+footing. The cost of not clearing is sharper here than a wrong description: a
+second application lifespan in one process would inherit the first one's
+shutdown and **every request it served would fail with no call issued**.
+
+**`SHUTDOWN_GATE_DEGRADATIONS` IS THE TWENTY-THIRD COUNTER AND IT IS EXEMPTED
+RATHER THAN REGISTERED**, on `oncotriage/mcp/server.py`'s `TOOL_FAILURES`
+precedent and for its reason -- a long-lived server has no run end for a run-end
+report to attach to -- plus one this module adds: `oncotriage/degradation.py`
+binds the counter OBJECTS of the modules it names, so registering this one would
+put FastAPI, slowapi and pydantic into **every batch run's import graph**.
+`shutdown_gate_report_lines()` is the reader and the STARTUP banner prints it,
+so an operator learns at bring-up that the gate is not armed rather than from a
+bill after a `docker stop`. **It always prints a line, even when armed**:
+silence and "armed" would otherwise look identical.
+
+**THE COMPOSE ARITHMETIC, BOTH NUMBERS.** `stop_grace_period` **did not move**,
+and that is the point -- the gate brought the worst case down to the number 620
+was always derived from:
+
+```
+BEFORE the gate   4 rounds      x 600 = 2400 s   (per-trial)
+                  4 further chunks x 600 = 2400 s (retained grouped)
+AFTER  the gate   1 in-flight round x 600 = 600 s, + 20 margin = 620 s
+```
+
+**CONCURRENT REQUESTS DO NOT MULTIPLY IT**, and that is the one API-specific
+term the batch runner does not have: this service can hold several patients at
+once, each on its own thread of the event loop's pool, but their in-flight
+rounds run CONCURRENTLY, so the wall time is one round rather than one per
+request.
+
+**`tests/test_compose_shutdown_grace.py` SECTION 3 WAS INVERTED, 30 → 43.** It
+asserted the shortfall as a live, unfixed fact; it now pins the **premise** --
+by AST over `oncotriage/api/server.py`, that the gate is armed in the lifespan
+STARTUP and asked for again at shutdown -- and keeps both ungated worst cases as
+the record of what the gate removed. **A grace period whose sufficiency rests on
+a mechanism nothing checks is a number nobody derived**, which is the retired
+check 3c's mistake pointed the other way. Seven controls, including one that a
+`lifespan` with no yield and one that unparseable source report both halves
+missing rather than aborting.
+
+**THE AVAILABILITY LOADER'S REQUIREMENT IS DERIVED NOW, AND THAT IS THE ACTUAL
+FIX RATHER THAN ONE MORE COLUMN NAME.**
+`oncotriage/dashboard/data.py:load_run_tracking_availability` hand-named ONE
+column, `inferences.run_id`, because that was the only additive column the run
+queries touched the day it was written. **`runs.resumed` and then
+`runs.matching_call_mode` arrived afterwards, each declared on
+`queries.run_summary` and `queries.campaign_summary`, and nothing there noticed
+either time.** So an era-3 database -- both run tables, `inferences.run_id`
+present, `runs.matching_call_mode` absent -- reported `present`, the tab went
+down its normal path, `_load_run_query` caught the `MissingTableError`, called
+`st.error`, handed back an empty frame, and the tab printed **"the run tables
+are present and hold no rows" underneath the error saying they could not be
+asked.**
+
+It asks `queries.missing_requirements` for each of the tab's four query keys and
+unions the answers. That helper is the ONE owner of "can this database answer
+this query", it is what `report()` and `queries.run` already use, and it applies
+the rule the loader would otherwise repeat -- **a column on an absent table is
+reported ONCE, as the table**, because naming both tells an operator to add a
+column to a table that is not there. The four keys are **named constants**
+(`RUN_SUMMARY_QUERY` and its three siblings, closed as `RUN_TAB_QUERY_KEYS`)
+read by both the loaders and the derivation, with a **`RuntimeError` at import**
+on an unregistered key: two copies of that list is how a fifth run query joins
+the tab without joining its availability check. Measured: era-4 `present`
+missing `[]`; era-3 `partial` missing `['runs.matching_call_mode']`; era-2
+`partial` missing `['runs.resumed']` -- **the era-2 case covered without
+anybody having listed it, which is what "derived" buys.**
+
+**`RUN_TRACKING_PARTIAL` MEANT SOMETHING FALSE AND THE TAB SAID IT OUT LOUD.**
+Its docstring and the tab's warning both asserted flatly that the shape "was not
+produced by the pipeline and a person should look at it" -- **a false accusation
+against a perfectly ordinary database written before an additive column
+existed.** PARTIAL now names TWO causes and the tab branches on which it is: an
+**era gap** (every missing item is a COLUMN; `RUN_COLUMN_ADDITIONS` is additive,
+so the next writer adds them and nothing is wrong with the rows already there)
+and **a shape the pipeline cannot produce** (one run TABLE without the other).
+A fifth vocabulary member was rejected: the state set is closed and consumed by
+a tab that branches exhaustively, and this is a rendering decision inside an
+existing state.
+
+**FILE 18's `/health` CHECK: THE BRIEF'S PREMISE WAS WRONG AND THE REAL GAP IS
+ONE FIELD OVER.** "Test 1 currently prints the JSON; a 503 passes silently" has
+not been true since pass 20g -- `_json_or_report` returns `None` on any non-200
+and the caller records a failure. What **could** pass silently is a **200 whose
+body says `unhealthy`**: `/health` sets its code from `healthy` and then reports
+that same verdict in the body, so the two disagreeing is a defect in the handler
+rather than a fact about its dependencies, and the body was printed and never
+read. Test 1 now records three distinct failures -- the status code (**named**,
+so the summary distinguishes an endpoint that refused from one that answered
+something unparseable), the body's `status`, and `pipeline_ready`, which a 200
+requires and which was the field that reported true while the server was
+unusable.
+
+**`tests/test_api_shutdown_gate.py` -- 77 checks, bucket A, ~2 s**, verified
+against ONLY the CI directory skeleton. **FIFTEEN REVERTS, FIFTEEN CAUGHT**,
+each planted into a `copytree`'d copy with a realpath preflight asserting the
+COPY is what imports, and **every one produced a summary rather than an abort**.
+
+**THE REVERT HARNESS'S OWN PREFLIGHT CAUGHT THE FALSE GREEN BEFORE IT COULD
+HAPPEN, TWICE.** `PYTHONPATH` alone does not win: the first attempt imported the
+REAL tree because `python -c` puts the working directory at `sys.path[0]`, and
+the second because setuptools' editable install installs a **MetaPathFinder**,
+which takes precedence over `sys.path` entirely. A `sitecustomize.py` in the
+copy strips it. Without the preflight every control would have reported MISSED
+against checks that work -- pass 20f-1's lesson met again, one mechanism over.
+
+**TWO DEFECTS IN THIS PASS'S OWN TEST CODE WERE FOUND BY RUNNING, NOT BY
+READING.** Check 3b compared `result["error"] is None` on the success path;
+**Stage 5 writes the EMPTY STRING there**, not None and not absent, so a working
+node was reported as a failing one -- the failure was in the check. And the
+first stub returned a FIXED response body naming a trial the chunk did not
+carry, which the out-of-set detector reconciled into a completed patient
+carrying an `error`: **a defect in the stub reported as a defect in the
+pipeline.** The stub answers the trials it was asked about now.
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **AN IN-FLIGHT REQUEST STILL RETURNS HTTP 200** carrying a result whose
+   `error` names the shutdown. That is the payload-level "fail honestly" the
+   Stage 5 gate already gives; changing the STATUS CODE to 503 for that case is
+   a contract change to a served response and belongs to a pass that can measure
+   what a client does with it.
+2. **A SIGNAL ARRIVING BEFORE THE LIFESPAN STARTUP IS NOT GATED.** uvicorn's own
+   handler is installed before `serve()`, so the server still stops; the flag
+   simply is not set. The window is the import plus the graph compile.
+3. **`--workers N` WAS NOT DRIVEN.** Each worker is its own process with its own
+   module state, so each arms its own gate, and the supervisor forwards the
+   signal -- reasoned about, not measured.
+4. **THE 20-SECOND MARGIN IS STILL UNCALIBRATED** and still labelled one. It is
+   now the margin for a shutdown path that runs in the API as well as the batch
+   runner, and neither has been timed under load.
+5. **`GET /pipeline/info` DOES NOT REPORT THE GATE**, so an operator asking the
+   API what it will do on a `docker stop` cannot see it over HTTP. Adding it is a
+   contract change to a served response.
+6. **A STARTUP THAT RAISES LEAVES THE HANDLER INSTALLED**, argued at the code:
+   the statements after the `yield` do not run, and it is not wrapped in a
+   `try`/`finally` because uvicorn's `capture_signals()` restores the
+   pre-uvicorn disposition in ITS `finally` whatever happens here, and a failed
+   startup produces a process that is about to exit. The reachable case is an
+   embedding host that catches the error and carries on.
+7. **`--workers N` WAS NOT DRIVEN** (see above), and neither was a real
+   `docker stop` against the container -- the probe is a real uvicorn and a
+   real SIGTERM in this process, which is the same mechanism one layer in.
+
+**VERIFIED BY RUNNING.** `python fixture_replay.py` **12/12 clean, exit 0, no
+recapture**; CI bucket A **79 files, 0 failed, 0 not run**;
+`tests/test_package_invariants.py` **260/0/0**; `tests/run_serial_tests.py`
+**5/5 in 404 s**, with `oncotriage/config.py` and
+`oncotriage/registries/cancer_code_registry.py` confirmed byte-identical
+afterwards; `tests/test_dashboard_run_health.py` **196**,
+`tests/test_dashboard_app_integration.py` **110**,
+`tests/test_storage_query_layer.py` **487**,
+`tests/test_storage_schema_guards.py` **135** -- none moved;
+`tests/test_degradation_counter_readers.py` **154** (was 152);
+`tests/test_compose_shutdown_grace.py` **43** (was 30); and the production
+`inferences.db` (`ab1403e3…`, 90,185,728 bytes) and `ablation_results.db`
+(`f2bc23c6…`) byte-unchanged. **No money was spent and no migration was run.**
 
 ## Persistence and observability
 

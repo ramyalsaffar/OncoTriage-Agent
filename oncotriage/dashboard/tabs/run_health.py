@@ -382,17 +382,48 @@ def _render_unavailable(availability, df):
             f"is wrong with the rows that are already there.**"
         )
     elif state == RUN_TRACKING_PARTIAL:
+        # TWO CAUSES, AND THE MESSAGE MUST NOT ASSERT THE SECOND ONE FOR THE
+        # FIRST. This branch used to say flatly that the shape "was not
+        # produced by the pipeline and a person should look at it", which is
+        # a false accusation against a perfectly ordinary database written
+        # before an additive column existed. Every missing item being a COLUMN
+        # is exactly the era-gap case: `RUN_COLUMN_ADDITIONS` and
+        # `INFERENCE_COLUMN_ADDITIONS` are additive, so the next writer to open
+        # the file adds them and nothing is wrong with the rows already there.
+        # A missing TABLE beside a present one is the other case, and it is the
+        # one `initialize_database` genuinely cannot produce.
+        _era_gap = bool(availability["missing"]) and all(
+            "." in item for item in availability["missing"])
+        if _era_gap:
+            # NOT AN f-STRING: it interpolates nothing, and a formatted
+            # string that formats nothing is the smell the ablation pass had
+            # to correct once already (pyflakes F541).
+            _cause = (
+                "Every missing item is a COLUMN, and the columns this schema "
+                "gained are **additive** — `initialize_database` adds them "
+                "through `RUN_COLUMN_ADDITIONS` / "
+                "`INFERENCE_COLUMN_ADDITIONS`. So this is an **era gap**: "
+                "the database was last written by an earlier version of this "
+                "project, **the next writer to open it adds them, and nothing "
+                "is wrong with the rows that are already there.**"
+            )
+        else:
+            _cause = (
+                f"`initialize_database` creates "
+                f"{', '.join('`' + t + '`' for t in RUN_TABLES)} **and** "
+                f"`inferences.run_id` in one call, so a run table present "
+                f"without the other was not produced by the pipeline and a "
+                f"person should look at it."
+            )
         st.warning(
             f"⚠️ This database has the run schema in pieces "
             f"(present: {', '.join('`' + t + '`' for t in availability['tables'])}; "
-            f"missing: {missing}). `initialize_database` creates "
-            f"{', '.join('`' + t + '`' for t in RUN_TABLES)} **and** "
-            f"`inferences.run_id` in one call, so this shape was not produced "
-            f"by the pipeline and a person should look at it. Nothing is "
-            f"rendered below rather than a partial answer: two of the three run "
-            f"queries join on `inferences.run_id`, so with it absent they "
-            f"cannot be asked at all — which is not the same as their coming "
-            f"back with no rows."
+            f"missing: {missing}). {_cause} Nothing is rendered below rather "
+            f"than a partial answer: the run queries **declare** what they "
+            f"need, so with any of it absent they cannot be asked at all — "
+            f"which is not the same as their coming back with no rows, and "
+            f"rendering them the same way is the defect this state exists to "
+            f"prevent."
         )
     elif state == RUN_TRACKING_NO_DATABASE:
         st.error(

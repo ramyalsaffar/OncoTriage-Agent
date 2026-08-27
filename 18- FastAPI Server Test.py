@@ -514,9 +514,49 @@ def main():
         r = requests.get(f"{BASE_URL}/health", timeout=GET_TIMEOUT)
         health = _json_or_report(r)
         if health is None:
-            failures.append("Test 1: GET /health")
+            # THE STATUS CODE IS ALREADY ASSERTED, AND IT IS ASSERTED HERE.
+            # `_json_or_report` returns None on any non-200 -- so a 503, which
+            # is what /health answers while a dependency is missing, has failed
+            # this test since pass 20g rather than printing a body and moving
+            # on. The code is NAMED in the failure now, because "Test 1: GET
+            # /health" in the summary did not say whether the endpoint refused
+            # or answered something unparseable, and those send an operator to
+            # different places.
+            failures.append(f"Test 1: GET /health (HTTP {r.status_code}, "
+                            f"expected 200)")
         else:
             print(json.dumps(health, indent=2))
+
+            # WHAT A STATUS-CODE-ONLY CHECK STILL LETS THROUGH, and it is the
+            # half that could pass silently: /health decides its code from
+            # `healthy` and then reports that same verdict in the BODY, so a
+            # 200 whose body says "unhealthy" means the two halves of one
+            # handler disagree. That is a defect in the server, not a fact
+            # about its dependencies, and nothing here could see it -- the body
+            # was printed and never read.
+            #
+            # THE ASSERTION IS THE AGREEMENT, not the value. A server that is
+            # genuinely not ready answers 503 and is caught above; this only
+            # fires on a 200, where "healthy" is the only body the handler can
+            # legitimately produce.
+            if health.get("status") != "healthy":
+                failures.append(
+                    f"Test 1: GET /health returned 200 with "
+                    f"status={health.get('status')!r} -- the handler sets the "
+                    f"code from the same verdict it reports in the body, so "
+                    f"these disagreeing is a defect in the server")
+
+            # `pipeline_ready` IS A SEPARATE FIELD AND A WEAKER CLAIM (the
+            # graph compiled), and it is checked separately for that reason: it
+            # was the field that reported true while the server was unusable,
+            # which is why `serving_ready` was added beside it. A 200 requires
+            # BOTH, so a 200 with this false is again the handler disagreeing
+            # with itself.
+            if health.get("pipeline_ready") is not True:
+                failures.append(
+                    f"Test 1: GET /health returned 200 with "
+                    f"pipeline_ready={health.get('pipeline_ready')!r} -- a 200 "
+                    f"requires the graph to have compiled")
 
         # ------------------------------------------------------------------
         # Test 2: Pipeline Info

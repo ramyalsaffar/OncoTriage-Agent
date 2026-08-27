@@ -55,6 +55,22 @@ it. The change reaches BOTH endpoints because the helper is shared, which is why
 it was worth making at all: the endpoint that never had a file was paying for
 one.
 
+``os`` IS BACK, WITH A DIFFERENT READER, and the paragraph above is kept as the
+record of why it left. The Stage 5 shutdown gate's signal handler announces
+itself with ``os.write(2, ...)`` rather than a ``print`` or a log call, for the
+signal-safety reason ``25- Batch Runner.py``'s handler already argues: a handler
+that acquires a lock the main thread may hold is how a shutdown path deadlocks.
+``tempfile`` did not come back, and no request touches the filesystem.
+
+A SIGTERM BOUNDS WHAT STAGE 5 SPENDS
+------------------------------------
+This service was the last Stage 5 caller with no shutdown gate. The lifespan
+handler arms a SIGNAL gate at startup and asks Stage 5 to stop at shutdown, so
+`docker stop` costs one in-flight round rather than up to four. THE SIGNAL HALF
+IS THE LOAD-BEARING ONE AND A LIFESPAN HOOK ALONE WOULD NOT HAVE WORKED -- see
+THE STAGE 5 SHUTDOWN GATE below, which reads uvicorn's shutdown ordering rather
+than assuming it.
+
 THE ONE BEHAVIOUR CHANGE
 ------------------------
 ``log_inference`` is now serialized. This module calls it from
@@ -71,8 +87,11 @@ cost, which is a lost row reported as a success.
 
 import asyncio
 import json
+import os
+import signal
 import time
 import traceback
+from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Dict, Optional
@@ -86,6 +105,12 @@ from slowapi.util import get_remote_address
 from oncotriage import __version__
 from oncotriage import config as _config
 from oncotriage.agent.deps import get_qdrant_client
+from oncotriage.agent.evaluation import (
+    clear_stage5_shutdown,
+    request_stage5_shutdown,
+    stage5_shutdown_reason,
+    stage5_shutdown_requested,
+)
 from oncotriage.agent.graph import build_matching_graph, match_patient_to_trials
 from oncotriage.agent.readiness import (
     INDEX_POPULATED,
@@ -140,6 +165,285 @@ graph      = None
 
 
 # ===========================================================================
+# THE STAGE 5 SHUTDOWN GATE, AND WHY A LIFESPAN HOOK ALONE CANNOT BE IT
+# ===========================================================================
+#
+# THIS SERVICE WAS THE LAST CALLER WITHOUT A GATE. `25- Batch Runner.py` and
+# `26- Ablation Study.py` both ask Stage 5 to stop issuing requests the instant
+# a SIGTERM arrives, so an in-flight patient bounds its drain at ONE in-flight
+# round instead of finishing its whole wave. This module had nothing, and
+# `docker-compose.yml`'s own arithmetic block says what that costs: a `docker
+# stop` on `fastapi` could SIGKILL it with up to three further full-price
+# rounds still to be issued -- 2400 s of billable work against a 620 s grace,
+# arm-independent (per-trial reaches it in four rounds, grouped in four further
+# packed chunks).
+#
+# THE OBVIOUS IMPLEMENTATION IS A LIFESPAN SHUTDOWN HOOK AND IT DOES NOT WORK
+# ON ITS OWN. Read uvicorn 0.40's `Server.shutdown()` rather than reasoning
+# about it:
+#
+#     for server in self.servers: server.close()      # stop accepting
+#     for connection in ...: connection.shutdown()
+#     await asyncio.wait_for(self._wait_tasks_to_complete(), ...)   # <-- HERE
+#     if not self.force_exit:
+#         await self.lifespan.shutdown()              # <-- ONLY THEN
+#
+# `_wait_tasks_to_complete()` spins while `self.server_state.tasks` is
+# non-empty, and an in-flight `POST /match` IS one of those tasks. So the
+# lifespan shutdown event is delivered AFTER the drain this gate exists to
+# bound -- it would fire once the last 2400-second patient had finished, which
+# is exactly too late to have saved anything. Worse: if the operator sends a
+# second SIGINT, `force_exit` is set and the lifespan shutdown NEVER RUNS AT
+# ALL.
+#
+# SO THE LOAD-BEARING HALF IS A SIGNAL HANDLER, chained onto whatever is
+# already installed, exactly as the batch runner's is -- the flag has to be set
+# in the handler frame, at the moment the signal is delivered, because that is
+# the only point that precedes the drain.
+#
+# THE LIFESPAN HOOK IS KEPT AND IS NOT DECORATION. It covers every shutdown
+# that arrives WITHOUT a signal, which is a real set rather than a hypothetical
+# one: an embedding host setting `Server.should_exit`, `uvicorn.Server.serve()`
+# run with `install_signal_handlers=False`, and -- the case that makes this
+# testable at all -- `starlette.testclient.TestClient`, which runs the
+# application on an anyio portal THREAD, where `signal.signal` raises
+# `ValueError` and no signal gate can be installed. Two halves, two windows,
+# neither redundant.
+#
+# CHAINING IS MANDATORY, NOT POLITE. uvicorn installs `Server.handle_exit` for
+# SIGINT/SIGTERM in `capture_signals()`, which wraps `serve()` -- so the
+# lifespan STARTUP runs inside it and `signal.getsignal(SIGTERM)` is uvicorn's
+# handler at the moment we look. Replacing it without calling it would set our
+# flag and then leave the server running forever, which trades a bounded drain
+# for a container that never stops at all. Every branch of the previous
+# disposition is reproduced below, including the two that are not callables.
+#
+# IT IS SIGNAL-SAFE, and that decided the implementation rather than its
+# placement, on `25- Batch Runner.py`'s footing: `request_stage5_shutdown`
+# assigns two module globals and takes no lock, and the announcement is
+# `os.write(2, ...)` rather than a `print` or a logging call, because a handler
+# that acquires a lock the main thread may already hold is how a shutdown path
+# deadlocks.
+SHUTDOWN_GATE_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+"""The signals this module chains a Stage 5 gate onto. CLOSED.
+
+The two `uvicorn.server.HANDLED_SIGNALS` names on POSIX, and deliberately not
+`SIGBREAK`: this project's container and its documented entry point are POSIX,
+`signal.SIGBREAK` does not exist on this platform, and naming a signal that
+cannot be looked up would make importing this module raise on the machine it is
+meant to run on."""
+
+
+SHUTDOWN_GATE_DEGRADATIONS = Counter()
+"""The signal gate could NOT be installed, or could not be chained cleanly.
+
+Keyed by what happened, never by a value:
+
+    ``not_main_thread``      ``signal.signal`` refused -- the application is
+                             not running on the main thread. The TestClient's
+                             ordinary state, and an embedding host's. The
+                             LIFESPAN half still covers it.
+    ``install:{Type}``       any other refusal from ``signal.signal``.
+    ``unchainable:{signame}`` the previous disposition was ``None`` -- a
+                             handler installed from C that Python cannot call
+                             -- so the gate declined to install rather than
+                             swallow it.
+
+READ BY THIS FILE AND BY NOTHING ELSE, which is why it is exempted in
+``tests/test_degradation_counter_readers.py`` rather than registered in
+``oncotriage/degradation.py`` -- on ``oncotriage/mcp/server.py``'s
+``TOOL_FAILURES`` precedent, and for its reason: a long-lived server has no run
+end for a run-end report to attach to. ``shutdown_gate_report_lines()`` is the
+reader; the startup banner prints it, so an operator sees at BRING-UP that the
+gate is not armed rather than discovering it from a bill after a `docker stop`.
+
+IT ALSO CANNOT BE REGISTERED. ``oncotriage/degradation.py`` binds the counter
+objects of the modules it names, and naming this one would put FastAPI,
+slowapi and pydantic into every batch run's import graph."""
+
+
+# The dispositions this module replaced, so the lifespan shutdown can put them
+# back. Keyed by signal number. EMPTY when the gate is not armed, which is what
+# `shutdown_gate_armed()` reports.
+_PREVIOUS_SIGNAL_HANDLERS = {}
+
+
+def shutdown_gate_armed() -> bool:
+    """Is the signal half of the gate installed right now? A plain read."""
+    return bool(_PREVIOUS_SIGNAL_HANDLERS)
+
+
+def shutdown_gate_report_lines():
+    """Console lines describing the gate. The reader of the counter above.
+
+    Always returns at least one line, so a bring-up log says which of the two
+    halves is covering this process rather than being silent about a gate
+    nobody armed. Silence and "armed" would otherwise look identical.
+    """
+    lines = []
+    if shutdown_gate_armed():
+        _names = ", ".join(sorted(s.name for s in _PREVIOUS_SIGNAL_HANDLERS))
+        lines.append(f"[Startup]   OK   Stage 5 shutdown gate armed on {_names}")
+    else:
+        lines.append(
+            "[Startup]   WARN Stage 5 shutdown gate NOT armed on any signal. "
+            "A SIGTERM will not bound this process's in-flight Stage 5 drain; "
+            "only a shutdown that runs the lifespan handler will.")
+    for key, count in sorted(SHUTDOWN_GATE_DEGRADATIONS.items()):
+        lines.append(f"[Startup]        shutdown-gate degradation {key}: {count}")
+    return lines
+
+
+def _chain_to(previous, signum, frame) -> None:
+    """Re-deliver ``signum`` to whatever handled it before this module did.
+
+    Every disposition ``signal.getsignal`` can return is handled, and the two
+    that are not callables are the ones a naive ``previous(signum, frame)``
+    would crash on:
+
+        a callable   uvicorn's ``Server.handle_exit`` in the deployed case --
+                     called directly, which is what keeps `docker stop`
+                     working.
+        SIG_IGN      the signal was being ignored, so ignoring it is the
+                     faithful reproduction. Nothing to do.
+        SIG_DFL      restore the default and re-raise, so a SIGTERM still
+                     terminates the process the way it would have. Doing
+                     nothing here would convert a fatal signal into a no-op,
+                     which is the failure mode "chaining is mandatory" names.
+        None         the handler was installed outside Python and cannot be
+                     called from it. UNREACHABLE from the install path, which
+                     refuses to arm in that case and counts it -- kept here so
+                     this function is total rather than relying on its one
+                     caller's guard.
+    """
+    if callable(previous):
+        previous(signum, frame)
+        return
+    if previous == signal.SIG_IGN or previous is None:
+        return
+    # SIG_DFL, and anything else this platform can hand back.
+    signal.signal(signum, signal.SIG_DFL)
+    signal.raise_signal(signum)
+
+
+def _install_shutdown_signal_gate() -> None:
+    """Chain a Stage 5 shutdown request onto SIGINT and SIGTERM.
+
+    Idempotent: a second call with the gate already armed does nothing, so a
+    lifespan that runs twice in one process cannot capture its OWN handler as
+    "the previous one" and build a chain that calls itself.
+    """
+    if _PREVIOUS_SIGNAL_HANDLERS:
+        return
+
+    for _sig in SHUTDOWN_GATE_SIGNALS:
+        try:
+            previous = signal.getsignal(_sig)
+        except (ValueError, OSError) as exc:          # pragma: no cover
+            SHUTDOWN_GATE_DEGRADATIONS[f"install:{type(exc).__name__}"] += 1
+            continue
+
+        if previous is None:
+            # A handler Python cannot call. Installing over it would REPLACE a
+            # working shutdown with one that cannot chain, so the gate declines
+            # -- a bounded drain is not worth a server that will not stop.
+            SHUTDOWN_GATE_DEGRADATIONS[f"unchainable:{_sig.name}"] += 1
+            continue
+
+        def _gate(signum, frame, _previous=previous):
+            # DEFAULT-ARGUMENT BINDING, not a closure over `previous`: the loop
+            # rebinds that name, so a closure would leave BOTH handlers
+            # chaining to whichever disposition the loop saw last.
+            request_stage5_shutdown(
+                f"{signal.Signals(signum).name} (signal {signum}) at the API")
+            os.write(2, (
+                f"\n[{signal.Signals(signum).name}] Shutdown requested "
+                f"(signal {signum}). Stage 5 will issue no further request; "
+                f"calls already in flight finish and their patients fail "
+                f"honestly.\n").encode("utf-8", "replace"))
+            _chain_to(_previous, signum, frame)
+
+        try:
+            signal.signal(_sig, _gate)
+        except ValueError as exc:
+            # THE DOCUMENTED NON-MAIN-THREAD REFUSAL, and the ordinary state
+            # under a TestClient. Recorded rather than swallowed; the lifespan
+            # half still covers this process.
+            #
+            # IT RETURNS RATHER THAN CONTINUING, because the cause is
+            # THREAD-WIDE: `signal.signal` refuses every signal off the main
+            # thread, so trying the next one buys a second identical refusal
+            # and a second log line saying the same thing.
+            #
+            # AND IT UNWINDS WHAT IT INSTALLED FIRST. The first draft cleared
+            # the dict and returned -- which, if a LATER signal had failed
+            # after an earlier one succeeded, would have left a live handler
+            # installed with the disposition it replaced FORGOTTEN, so
+            # `_remove_shutdown_signal_gate` could never put it back. That is
+            # unreachable for THIS cause and reachable for the `OSError` one
+            # below, and a partial state nobody can undo is not worth leaving
+            # to depend on which exception arrived.
+            SHUTDOWN_GATE_DEGRADATIONS["not_main_thread"] += 1
+            log.warning("the Stage 5 shutdown signal gate could not be "
+                        "installed; a signal will not bound this process's "
+                        "in-flight Stage 5 drain",
+                        event="shutdown_gate_not_installed",
+                        reason="not_main_thread", degraded=True,
+                        error_type=type(exc).__name__, error_message=str(exc))
+            _remove_shutdown_signal_gate()
+            return
+        except OSError as exc:                        # pragma: no cover
+            # PER-SIGNAL, so it CONTINUES: a platform refusing one signal says
+            # nothing about the next, and a gate armed on SIGTERM alone still
+            # bounds a `docker stop`. `shutdown_gate_report_lines()` names
+            # WHICH signals are armed, so a partial arm is reported as one
+            # rather than read as a whole one.
+            SHUTDOWN_GATE_DEGRADATIONS[f"install:{type(exc).__name__}"] += 1
+            log.warning("the Stage 5 shutdown signal gate could not be "
+                        "installed", event="shutdown_gate_not_installed",
+                        reason=f"install:{type(exc).__name__}", degraded=True,
+                        error_type=type(exc).__name__, error_message=str(exc))
+            continue
+
+        _PREVIOUS_SIGNAL_HANDLERS[_sig] = (previous, _gate)
+
+
+def _remove_shutdown_signal_gate() -> None:
+    """Put back the dispositions this module replaced, if they are still ours.
+
+    DEFINED BELOW ITS FIRST CALLER AND THAT IS FINE: the call is inside a
+    function body, resolved at call time against the module globals, and this
+    name is bound before any of them runs.
+
+    ONLY IF THEY ARE STILL OURS. uvicorn's own ``capture_signals()`` restores
+    the pre-uvicorn handler in its ``finally``, which runs after this, so in the
+    deployed case this is a courtesy. It matters for a host that outlives the
+    application -- a test process, an embedder starting a second app -- where
+    leaving a handler behind that references this module's flag would make a
+    later, unrelated SIGTERM set it.
+    """
+    for _sig, (previous, installed) in list(_PREVIOUS_SIGNAL_HANDLERS.items()):
+        try:
+            # BY IDENTITY, never by ``__name__``: several modules in one
+            # process may define a nested handler called ``_gate``, and
+            # restoring over somebody else's would be worse than leaving ours
+            # in place.
+            if signal.getsignal(_sig) is installed:
+                signal.signal(_sig, previous)
+        except (ValueError, OSError) as exc:
+            # THE ENTRY IS KEPT WHEN THE RESTORE FAILS, and that is the
+            # difference between this dictionary describing the process and
+            # merely describing an intention. A failed restore means the gate's
+            # handler is STILL LIVE and its predecessor is still needed, so
+            # popping the entry would throw away the only record of what to put
+            # back -- and would make ``shutdown_gate_armed()`` answer False
+            # about a process that has this module's handler installed.
+            SHUTDOWN_GATE_DEGRADATIONS[f"restore:{type(exc).__name__}"] += 1
+            continue
+        _PREVIOUS_SIGNAL_HANDLERS.pop(_sig, None)
+
+
+# ===========================================================================
 # LIFESPAN (startup / shutdown)
 # ===========================================================================
 
@@ -151,6 +455,40 @@ async def lifespan(_app):
     console.out("\n" + "="*60)
     console.out(f"{Project_Name} — Starting...")
     console.out("="*60 + "\n")
+
+    # ── THE STAGE 5 SHUTDOWN GATE ────────────────────────────────────────
+    # ARMED BEFORE THE GRAPH IS COMPILED, so a SIGTERM arriving during a slow
+    # startup is already gated. Compiling the graph is the longest thing this
+    # handler does, and an operator restarting a stack does not wait for it.
+    #
+    # THE FLAG IS CLEARED FIRST, on `oncotriage/batch/runner.py:main()`'s
+    # footing -- it clears the same flag beside `clear_write_ledger()` and
+    # `run_fingerprint.clear_cache()`, because module state that survives into
+    # the next run describes the wrong run. Here the cost of NOT clearing is
+    # sharper than a wrong description: a second application lifespan in one
+    # process (a test, an embedder) would inherit the first one's shutdown and
+    # every request it served would fail with no call having been issued.
+    #
+    # IT IS SAFE IN THE DEPLOYED CASE because a uvicorn process runs the
+    # startup half of the lifespan exactly once and never re-enters it after a
+    # shutdown; nothing else in an API process shares this flag.
+    #
+    # A STARTUP THAT RAISES BELOW THIS LINE LEAVES THE HANDLER INSTALLED, and
+    # that is a stated limit rather than an oversight. The statements after the
+    # `yield` do not run when the body never reaches it, so `build_matching_
+    # graph()` raising would leave this module's handler in place with nothing
+    # to remove it. It is NOT wrapped in a `try`/`finally` for two reasons, in
+    # order of weight: uvicorn's own `capture_signals()` restores the
+    # pre-uvicorn disposition in ITS `finally` whatever happens here, so the
+    # deployed case is covered by the host; and the process a failed startup
+    # produces is one that is about to exit anyway. The reachable case is an
+    # embedding host that catches the startup error and carries on -- there,
+    # `_install_shutdown_signal_gate()` is idempotent and
+    # `_remove_shutdown_signal_gate()` is public.
+    clear_stage5_shutdown()
+    _install_shutdown_signal_gate()
+    for _line in shutdown_gate_report_lines():
+        console.out(_line)
 
     console.out("[Startup] Compiling LangGraph pipeline...")
     graph = build_matching_graph()
@@ -193,7 +531,31 @@ async def lifespan(_app):
 
     yield
 
+    # ── SHUTDOWN ─────────────────────────────────────────────────────────
+    # THE SECOND HALF OF THE GATE, AND IT IS NOT THE LOAD-BEARING ONE. See
+    # THE STAGE 5 SHUTDOWN GATE above for why: uvicorn delivers this event
+    # AFTER `_wait_tasks_to_complete()`, so on the signal path the flag was
+    # already set in the handler frame and this call is the idempotent
+    # no-op `request_stage5_shutdown` is documented to be. What it covers is
+    # every shutdown that arrives WITHOUT a signal -- a host setting
+    # `Server.should_exit`, `install_signal_handlers=False`, and the
+    # TestClient, which runs on a portal thread where no signal gate can be
+    # installed at all.
+    #
+    # WHICH HALF ACTUALLY FIRED IS PRINTED rather than inferred. The reason
+    # recorded with the FIRST request wins, so a reason naming a signal says
+    # the handler ran and a reason naming this handler says it did not --
+    # which is the difference between a drain that was bounded and one that
+    # was not, and an operator reading a bill needs it.
+    _already = stage5_shutdown_requested()
+    request_stage5_shutdown("the API lifespan shutdown event")
     console.out("\n[Shutdown] Server stopping...")
+    console.out(f"[Shutdown] Stage 5 shutdown requested: "
+                f"{stage5_shutdown_reason()!r} "
+                f"({'signal gate' if _already else 'lifespan handler'}; "
+                f"no further Stage 5 request will be issued).")
+
+    _remove_shutdown_signal_gate()
 
 
 # ===========================================================================

@@ -449,23 +449,25 @@ services:
     # finalized `runs` row, which are database writes measured in
     # milliseconds. 620s is 600 + 20 of margin for those.
     #
-    # ONE IN-FLIGHT CALL IS WHAT 620s BUYS, AND THAT IS NOT A WHOLE PATIENT IN
-    # EITHER ARM. This comment has been wrong about that twice and the number
-    # has never been the thing that was wrong -- what changed each time is
-    # which arm the shortfall is the PRIMARY statement about.
+    # ONE IN-FLIGHT CALL IS WHAT 620s BUYS, AND SINCE THIS SERVICE GAINED A
+    # SHUTDOWN GATE THAT IS ALSO WHAT A `docker stop` ON IT COSTS. Two numbers
+    # follow: what the drain WAS with no gate, and what it IS with one. The
+    # value 620 did not move, and that is the point -- the gate brought the
+    # worst case down to the number this grace period was always derived from.
+    #
+    # ===================== BEFORE THE GATE (the shortfall) ==================
+    # This comment recorded a KNOWN, UNFIXED shortfall here, arm-independent,
+    # and it was right. It is kept as the record of what the gate removed.
     #
     # THE SHIPPED ARM IS PER-TRIAL (`MATCHING_PER_TRIAL_CALLS_ENABLED` is
-    # True), AND IT IS THE PRIMARY STATEMENT:
+    # True):
     #
     #     rounds per patient = ceil(MAX_TRIALS_FOR_EVALUATION / parallel)
     #                        = ceil(15 / 4) = 4
     #     worst case         = 4 x 600 = 2400 s = 40 minutes
     #
-    # So a `docker stop` on this service can SIGKILL it with up to THREE
-    # further full-price rounds still to be issued. 620 s does not cover that
-    # and IS NOT RAISED TO 2400 s, because raising it to cover a case that
-    # should not exist is the wrong repair: THIS SERVICE HAS NO SHUTDOWN GATE.
-    # Giving it one is the fix, and it is the recorded follow-up.
+    # So a `docker stop` on this service could SIGKILL it with up to THREE
+    # further full-price rounds still to be issued.
     #
     # THE RETAINED GROUPED ARM IS THE SAME NUMBER, WHICH IS WHY THE FLIP DID
     # NOT MOVE THIS VALUE. Grouped mode is one request per *CHUNK*, not per
@@ -480,15 +482,37 @@ services:
     #
     #     worst case         = 4 further requests x 600 = 2400 s
     #
-    # SO THE SHORTFALL ON THIS SERVICE IS ARM-INDEPENDENT, and 620 s was never
-    # sufficient here in either arm. What makes 620 s the right number is the
-    # BATCH RUNNER's gate, below -- not the arm, and this comment used to
-    # imply otherwise.
+    # SO THE SHORTFALL WAS ARM-INDEPENDENT, and 620 s was never sufficient for
+    # an UNGATED patient in either arm. Raising it to 2400 s was rejected then
+    # and is still the wrong repair: the fix is a gate, and this service now
+    # has one.
     #
-    # THE BATCH RUNNER IS THE ONE THAT IS COVERED, AND AS OF THE
-    # OPERATOR-CONTROL PASS IT IS COVERED IN BOTH ARMS -- which is what this
-    # comment already claimed and what was, until that pass, true only of
-    # per-trial mode. Its SIGTERM handler asks Stage 5 to stop issuing
+    # ====================== AFTER THE GATE (what is true) ===================
+    # `oncotriage/api/server.py` arms a Stage 5 shutdown gate in its lifespan
+    # STARTUP -- a SIGNAL handler chained onto uvicorn's own -- so a SIGTERM
+    # sets the flag in the handler frame, and Stage 5 issues no further
+    # request in EITHER arm. What is left to wait for is the round already in
+    # the air:
+    #
+    #     worst case = 1 in-flight round x 600 = 600 s, + 20 margin = 620 s
+    #
+    # CONCURRENT REQUESTS DO NOT MULTIPLY IT. Unlike the batch runner, this
+    # service can hold several patients at once -- each on its own thread of
+    # the event loop's pool -- but their in-flight rounds run CONCURRENTLY, so
+    # the wall time is still one round rather than one per request.
+    #
+    # A LIFESPAN SHUTDOWN HOOK ALONE WOULD HAVE BOUGHT NOTHING, and that is
+    # measured rather than argued: uvicorn's `Server.shutdown()` awaits
+    # `_wait_tasks_to_complete()` BEFORE it delivers the lifespan shutdown
+    # event, so a hook there fires after the drain it was meant to bound --
+    # and not at all under `force_exit`. Driven against a real uvicorn with a
+    # real SIGTERM and a request genuinely in flight: with the signal gate the
+    # flag flipped 0.012 s after the signal, mid-request; with the lifespan
+    # hook alone the in-flight request never saw it at all.
+    #
+    # THE BATCH RUNNER IS COVERED TOO, AND AS OF THE OPERATOR-CONTROL PASS IT
+    # IS COVERED IN BOTH ARMS -- which is what this comment already claimed and
+    # what was, until that pass, true only of per-trial mode. Its SIGTERM handler asks Stage 5 to stop issuing
     # requests; the flag gated the per-trial WAVE and nothing else, so a
     # grouped patient carried on sending every remaining chunk. Measured, both
     # arms, at 15 trials of 8000 characters: 4 further requests before the gate

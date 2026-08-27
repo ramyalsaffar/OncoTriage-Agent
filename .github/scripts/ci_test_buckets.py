@@ -141,6 +141,34 @@ BUCKETS = {
         "DEFAULT path cannot reach production, and the one repository file it "
         "reads (oncotriage/ablation/study.py) is written by neither of the "
         "suite's two writers and is sha256-compared at the end"),
+    "test_api_shutdown_gate.py": (
+        _A, None,
+        "ran green in 2.1s, 77 checks, against ONLY the directory skeleton: "
+        "the API's Stage 5 shutdown gate, which is TWO mechanisms and is "
+        "tested as two. The SIGNAL half is installed for real with "
+        "signal.signal and then INVOKED through signal.getsignal, with a "
+        "RECORDING handler installed underneath it first so the chain is "
+        "COUNTED rather than inferred from a process dying -- a real signal is "
+        "deliberately not delivered, because the chain reaches SIG_DFL in a "
+        "bare process and would terminate the run instead of measuring it. The "
+        "LIFESPAN half is driven with fastapi.testclient.TestClient as a "
+        "context manager, starlette's own way to run a lifespan, and the file "
+        "ASSERTS that the portal really is a non-main thread -- which is the "
+        "measured reason the lifespan half has to exist at all. Section 3 "
+        "drives the REAL Stage 5 node against a counting stub installed "
+        "through oncotriage/agent/deps.py on either side of the flag, so the "
+        "link 'the flag the API sets is the one the node reads' is measured "
+        "rather than assumed. NO BILLED CALL, no network, no keys, no live "
+        "server, no live Qdrant, no model load, no corpus, no git history, no "
+        "Docker daemon: build_matching_graph and both readiness probes are "
+        "stand-ins installed on the module and restored, so create_app()'s "
+        "lifespan opens no client. It EXECS NOTHING and loads no module by "
+        "location. NOT in the collision matrix: every database is inside a "
+        "tempfile.mkdtemp it removes and asserts gone, paths._RESOLVED is "
+        "seeded and restored, and the two repository files it reads "
+        "(oncotriage/api/server.py, '18- FastAPI Server Test.py') are written "
+        "by neither of the suite's two writers and are sha256-compared at the "
+        "end"),
     "test_compose_shutdown_grace.py": (
         _A, None,
         "ran green in 0.8s, 30 checks, against ONLY the directory skeleton: "

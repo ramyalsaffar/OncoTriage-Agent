@@ -357,6 +357,17 @@ _READER_EXEMPTIONS = {
     # for a run-end report to attach to. tool_failure_summary() is its reader.
     "TOOL_FAILURES": ("oncotriage/mcp/server.py", "oncotriage/mcp/server.py",
                       "server, not a run"),
+    # --- oncotriage/api/server.py: a long-lived SERVER, the TOOL_FAILURES
+    # case one module over. There is no run end for a run-end report to attach
+    # to, and it cannot be registered either: oncotriage/degradation.py binds
+    # the counter OBJECTS of the modules it names, so naming this one would put
+    # FastAPI, slowapi and pydantic into every batch run's import graph.
+    # shutdown_gate_report_lines() is the reader, and the STARTUP banner prints
+    # it -- so an operator learns at bring-up that the Stage 5 shutdown gate is
+    # not armed, rather than from a bill after a `docker stop`.
+    "SHUTDOWN_GATE_DEGRADATIONS": ("oncotriage/api/server.py",
+                                   "oncotriage/api/server.py",
+                                   "server, not a run"),
     # --- mcp_server.py: an ENTRY POINT, outside the package, and the one
     # counter the root-level half of the scan finds. It cannot be registered:
     # oncotriage/degradation.py is a package module and cannot import a

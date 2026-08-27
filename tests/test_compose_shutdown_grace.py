@@ -39,21 +39,29 @@ WHAT THIS FILE DELIBERATELY DOES NOT DO.
   somebody legitimately raises a timeout, and names nothing about why. The
   assertion is the INEQUALITY, so the file passes for any grace period that
   covers the budget and fails for every one that does not.
-* IT DOES NOT COVER A WHOLE PATIENT IN EITHER ARM ON THIS SERVICE, AND SAYS
-  SO. Per-trial mode -- the SHIPPED arm -- issues
-  `ceil(MAX_TRIALS_FOR_EVALUATION / MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS)`
-  rounds, so its worst case is four times this one: 2400s against a 620s
-  grace. The RETAINED GROUPED arm reaches the same 2400s by a different route,
-  `MATCHING_MAX_INPUT_PACKED_CHUNKS - 1` further sequential chunks. That is a
-  KNOWN, DOCUMENTED shortfall recorded in the compose file itself, and the
-  repair is a shutdown gate on the API service rather than a bigger number.
-  Section 3 asserts the shortfall EXISTS IN BOTH ARMS and is documented, so
-  that neither arm can quietly inherit a grace period nobody re-derived.
+* IT DOES NOT ASSERT THAT ONE REQUEST BUDGET IS ENOUGH ON ITS OWN. It is
+  enough only because BOTH Stage 5 callers this grace period can reach have a
+  shutdown gate: the batch runner's (since the operator-control pass, both
+  arms) and -- since the API shutdown-gate pass -- this service's own. Without
+  a gate the drain is a whole PATIENT rather than a whole REQUEST: per-trial
+  mode issues `ceil(MAX_TRIALS_FOR_EVALUATION /
+  MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS)` rounds and the retained grouped arm
+  reaches the same figure by a different route,
+  `MATCHING_MAX_INPUT_PACKED_CHUNKS - 1` further sequential chunks -- 2400s
+  against a 620s grace, in both arms.
 
-  SECTION 1 IS SUFFICIENT BECAUSE OF THE BATCH RUNNER'S GATE, NOT BECAUSE OF
-  THE ARM. Section 3 used to end by pinning the arm OFF and calling that
-  section 1's premise; the premise was false when it was written and the pin
-  was a landmine that went red on the very flip it was watching for. See the
+  SO SECTION 3 PINS THE PREMISE RATHER THAN THE SHORTFALL. It still derives
+  both UNGATED worst cases from the constants -- they are what the gate
+  removed, and the compose file states them -- and it additionally asserts, by
+  AST over `oncotriage/api/server.py`, that the gate is armed in the lifespan
+  STARTUP and asked for again at shutdown. A grace period whose sufficiency
+  rests on a mechanism nothing checks is a number nobody derived, which is the
+  failure this whole file exists to prevent.
+
+  SECTION 1 IS SUFFICIENT BECAUSE OF THOSE GATES, NOT BECAUSE OF THE ARM.
+  Section 3 used to end by pinning the arm OFF and calling that section 1's
+  premise; the premise was false when it was written and the pin was a
+  landmine that went red on the very flip it was watching for. See the
   argument at section 3.
 * IT DOES NOT PIN THE 2400 PROSE BY SEARCHING THE WHOLE FILE. Section 4 also
   compares each arm's DERIVED worst case against the figure the compose comment
@@ -75,16 +83,23 @@ QDRANT, NO MODEL LOAD, NO CORPUS, NO DATABASE, NO GIT HISTORY, NO SUBPROCESS.
 It starts no container and runs no compose command. IT EXECS NOTHING and it
 WRITES NOTHING ANYWHERE -- every plant is an in-memory string. NOT in
 `tests/run_serial_tests.py`'s collision matrix, derived rather than asserted: it
-writes no file, and of the two repository files it READS, `docker-compose.yml`
-is written by neither of the suite's two writers and `oncotriage/config.py` IS
-written by `tests/test_config_snapshot_date_rot.py` -- which rewrites only the
+writes no file, and of the THREE repository files it READS,
+`docker-compose.yml` and `oncotriage/api/server.py` are written by neither of
+the suite's two writers and `oncotriage/config.py` IS written by
+`tests/test_config_snapshot_date_rot.py` -- which rewrites only the
 `DATA_SNAPSHOT_DATE` literal and restores it byte-identically, touching no
-timeout and no retry constant. Both are sha256-compared in section 5 so an
+timeout and no retry constant. All three are sha256-compared in section 5 so an
 interleaved run is visible rather than silent.
+
+IT DOES NOT IMPORT THE API MODULE. `oncotriage/api/server.py` is read as TEXT
+and `ast`-parsed, on the same footing as the compose file: importing it would
+pull FastAPI, slowapi and pydantic into a test whose only other import is
+`oncotriage.config`, for a question that is entirely structural.
 
     python tests/test_compose_shutdown_grace.py
 """
 
+import ast
 import hashlib
 import os
 import re
@@ -217,6 +232,70 @@ if not os.path.isfile(_COMPOSE):
 _COMPOSE_TEXT = open(_COMPOSE, encoding="utf-8").read()
 _COMPOSE_SHA_BEFORE = hashlib.sha256(_COMPOSE_TEXT.encode("utf-8")).hexdigest()
 _CONFIG_SHA_BEFORE = hashlib.sha256(open(_CONFIG_PY, "rb").read()).hexdigest()
+
+# THE API MODULE, AS TEXT. Section 3 asks a structural question of it -- is the
+# gate this grace period's arithmetic depends on actually armed -- and reading
+# it rather than importing it keeps FastAPI out of this test's import graph.
+_SERVER_PY = os.path.join(_CODE_DIR, "oncotriage", "api", "server.py")
+if not os.path.isfile(_SERVER_PY):
+    raise SystemExit(f"[Compose] api/server.py not found at {_SERVER_PY}")
+_SERVER_TEXT = open(_SERVER_PY, encoding="utf-8").read()
+_SERVER_SHA_BEFORE = hashlib.sha256(
+    _SERVER_TEXT.encode("utf-8")).hexdigest()
+
+
+def calls_named(node, name):
+    """Does `node` contain a call to `name`, in either reference form?
+
+    Covers the bare name (`request_stage5_shutdown(...)`) and the attribute
+    form (`signal.signal(...)`), because a check that knows one of the two
+    silently passes over the other -- this project's recorded lesson about
+    reference forms, applied to a walk rather than to a trap.
+    """
+    for sub in ast.walk(node):
+        if not isinstance(sub, ast.Call):
+            continue
+        func = sub.func
+        if isinstance(func, ast.Name) and func.id == name:
+            return True
+        if isinstance(func, ast.Attribute) and func.attr == name:
+            return True
+    return False
+
+
+def lifespan_halves(source):
+    """`(startup, shutdown)` -- the statements each side of the lifespan yield.
+
+    Returns `(None, None)` when the function or its yield cannot be found, so a
+    rename fails the checks below by name rather than passing over an empty
+    walk. The yield is located at ANY depth inside the function body, because
+    an `async with` or a `try` around it is an ordinary refactor that must not
+    silently empty both halves.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return (None, None)
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+            continue
+        if node.name != "lifespan":
+            continue
+        yields = [n for n in ast.walk(node) if isinstance(n, ast.Yield)]
+        if not yields:
+            return (None, None)
+        cut = max(y.lineno for y in yields)
+        before = [n for n in node.body if getattr(n, "end_lineno", 0) <= cut]
+        after = [n for n in node.body if getattr(n, "lineno", 0) > cut]
+        return (before, after)
+    return (None, None)
+
+
+def any_call(stmts, name):
+    """Is `name` called anywhere in `stmts`? False for a missing half."""
+    if not stmts:
+        return False
+    return any(calls_named(st, name) for st in stmts)
 
 
 def strip_comments(text):
@@ -353,13 +432,23 @@ check_true("2b  the service scanner found the stack's services "
 
 
 # ===========================================================================
-# 3.  THE SHORTFALL ON THIS SERVICE IS ARM-INDEPENDENT, KNOWN, AND DOCUMENTED
+# 3.  THE GATE IS THE PREMISE, AND THE UNGATED WORST CASES ARE WHAT IT REMOVED
 # ===========================================================================
 #
-# This grace period does NOT cover a whole patient in EITHER arm, and that is a
-# recorded decision rather than an oversight: the repair is a shutdown gate on
-# this service, not a bigger number. What must not happen is an arm being turned
-# on while this file quietly reports "the grace period is fine".
+# ONE REQUEST BUDGET IS ENOUGH ONLY BECAUSE STAGE 5 STOPS ISSUING REQUESTS.
+# Without a gate the drain on this service is a whole PATIENT -- 2400 s in
+# either arm, derived below -- and 620 s would be a number that covers a
+# fraction of it. This section used to assert that shortfall as a live, unfixed
+# fact; the API shutdown-gate pass fixed it, so what is asserted now is the
+# MECHANISM the arithmetic depends on, plus the two figures it removed.
+#
+# WHY THE PREMISE IS PINNED HERE RATHER THAN LEFT TO THE BEHAVIOURAL TEST.
+# `tests/test_api_shutdown_gate.py` drives the gate and is where its behaviour
+# lives. This file owns the NUMBER, and a number whose sufficiency rests on a
+# mechanism nothing checks from here is a number nobody derived -- the retired
+# check 3c's mistake, pointed the other way. Two checks, one structural
+# question: is the gate armed before the server can be signalled, and is it
+# asked for again on the path a signal never reaches.
 #
 # THIS SECTION USED TO END WITH A LANDMINE AND THE FLIP IS WHY IT DOES NOT.
 # The retired check 3c read `MATCHING_PER_TRIAL_CALLS_ENABLED == False` under a
@@ -385,7 +474,7 @@ check_true("2b  the service scanner found the stack's services "
 # be present in the compose file. Flip the default back for a comparison run
 # and every check below still holds and still means the same thing.
 
-section("3. NEITHER arm is covered on this service, and the file says so")
+section("3. The gate is the premise; the ungated worst cases are documented")
 
 _ROUNDS = -(-config.MAX_TRIALS_FOR_EVALUATION
             // config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS)   # ceil
@@ -407,16 +496,17 @@ _PER_TRIAL_WORST = _ROUNDS * _BUDGET
 _GROUPED_FURTHER = config.MATCHING_MAX_INPUT_PACKED_CHUNKS - 1
 _GROUPED_WORST = _GROUPED_FURTHER * _BUDGET
 
-check_true(f"3a  per-trial mode's worst case ({_PER_TRIAL_WORST}s over "
-           f"{_ROUNDS} rounds) EXCEEDS the grace period ({_GRACE}s) -- so the "
-           f"shortfall this file declines to fix is still real",
+check_true(f"3a  per-trial mode's UNGATED worst case ({_PER_TRIAL_WORST}s over "
+           f"{_ROUNDS} rounds) EXCEEDS the grace period ({_GRACE}s) -- which "
+           f"is what the gate removed, and why one is required rather than a "
+           f"bigger number",
            _GRACE is not None and _PER_TRIAL_WORST > _GRACE)
 
-check_true(f"3b  the RETAINED GROUPED arm's worst case ({_GROUPED_WORST}s over "
-           f"{_GROUPED_FURTHER} further chunks, a FLOOR -- the two output "
-           f"splitters can add more) EXCEEDS it too, so the shortfall is a "
-           f"property of this service having no shutdown gate, NOT of which "
-           f"arm is configured",
+check_true(f"3b  the RETAINED GROUPED arm's UNGATED worst case "
+           f"({_GROUPED_WORST}s over {_GROUPED_FURTHER} further chunks, a "
+           f"FLOOR -- the two output splitters can add more) EXCEEDS it too, "
+           f"so the shortfall was a property of this service having no "
+           f"shutdown gate, NOT of which arm is configured",
            _GRACE is not None and _GROUPED_WORST > _GRACE)
 
 # NON-DEGENERACY. Both worst cases are products, and a zero in either factor
@@ -448,6 +538,80 @@ check("3f  CONTROL: a grace period at the per-trial worst case does NOT "
       "report a shortfall", _PER_TRIAL_WORST > _PER_TRIAL_WORST, False)
 check("3g  CONTROL: nor does one at the grouped worst case",
       _GROUPED_WORST > _GROUPED_WORST, False)
+
+
+# --- THE GATE ITSELF, BY AST OVER oncotriage/api/server.py -----------------
+#
+# THE GATED WORST CASE IS ONE IN-FLIGHT ROUND, which is `_BUDGET` -- exactly
+# what section 1 already requires the grace period to cover. So there is no
+# separate inequality to assert here; what there is, is the premise.
+
+_STARTUP, _SHUTDOWN = lifespan_halves(_SERVER_TEXT)
+
+check_true("3h  the API's lifespan was found and has both halves "
+           "(non-degeneracy: a rename would otherwise empty both walks and "
+           "make every check below pass over nothing)",
+           bool(_STARTUP) and bool(_SHUTDOWN))
+
+check("3i  the SIGNAL half of the gate is armed in the lifespan STARTUP, "
+      "which is the only point that precedes a request's own drain",
+      any_call(_STARTUP, "_install_shutdown_signal_gate"), True)
+
+check("3j  ...and Stage 5 is asked to stop at the lifespan SHUTDOWN too, "
+      "which covers every stop that arrives without a signal",
+      any_call(_SHUTDOWN, "request_stage5_shutdown"), True)
+
+check("3k  the gate covers SIGTERM, which is what `docker stop` sends, and "
+      "SIGINT, which is what a terminal sends",
+      guarded(lambda: sorted(
+          n.attr for n in ast.walk(ast.parse(_SERVER_TEXT))
+          if isinstance(n, ast.Attribute) and n.attr in ("SIGTERM", "SIGINT")
+          and isinstance(n.value, ast.Name) and n.value.id == "signal")),
+      ["SIGINT", "SIGTERM"])
+
+check("3l  the installer really installs a handler and really asks for the "
+      "shutdown from inside it (non-degeneracy: 3i is satisfied by a call to "
+      "a function that does nothing)",
+      guarded(lambda: [
+          (calls_named(fn, "signal") and
+           calls_named(fn, "request_stage5_shutdown") and
+           calls_named(fn, "_chain_to"))
+          for fn in ast.walk(ast.parse(_SERVER_TEXT))
+          if isinstance(fn, ast.FunctionDef)
+          and fn.name == "_install_shutdown_signal_gate"]),
+      [True])
+
+# CONTROLS. Each removes the thing the check above asserts, from an in-memory
+# COPY of the source, and requires the same derivation to flip. Nothing is
+# written and nothing is exec'd -- the plant is a different STRING handed to
+# the same parser, which is the natural control for a walk over a parse tree.
+_NO_INSTALL = _SERVER_TEXT.replace("    _install_shutdown_signal_gate()\n",
+                                   "    pass\n", 1)
+check("3m  CONTROL: the plant that removes the install took (non-degeneracy: "
+      "a plant that matched nothing reports a working check as broken)",
+      _NO_INSTALL != _SERVER_TEXT, True)
+check("3n  CONTROL: with the install removed, 3i FAILS",
+      any_call(lifespan_halves(_NO_INSTALL)[0],
+               "_install_shutdown_signal_gate"), False)
+
+_NO_REQUEST = _SERVER_TEXT.replace(
+    'request_stage5_shutdown("the API lifespan shutdown event")',
+    'pass', 1)
+check("3o  CONTROL: the plant that removes the shutdown request took",
+      _NO_REQUEST != _SERVER_TEXT, True)
+check("3p  CONTROL: with it removed, 3j FAILS",
+      any_call(lifespan_halves(_NO_REQUEST)[1], "request_stage5_shutdown"),
+      False)
+
+check("3q  CONTROL: a source with no `lifespan` at all reports both halves "
+      "missing rather than raising",
+      lifespan_halves("x = 1"), (None, None))
+check("3r  CONTROL: a `lifespan` with no yield does too -- the shape that "
+      "would otherwise put every statement in the startup half",
+      lifespan_halves("async def lifespan(a):\n    pass\n"), (None, None))
+check("3s  CONTROL: unparseable source reports both halves missing rather "
+      "than aborting the run",
+      lifespan_halves("def ("), (None, None))
 
 
 #------------------------------------------------------------------------------
@@ -601,6 +765,10 @@ check("5a  docker-compose.yml is byte-unchanged",
 check("5b  oncotriage/config.py is byte-unchanged",
       hashlib.sha256(open(_CONFIG_PY, "rb").read()).hexdigest(),
       _CONFIG_SHA_BEFORE)
+check("5c  oncotriage/api/server.py is byte-unchanged -- every plant above "
+      "was an in-memory string",
+      hashlib.sha256(open(_SERVER_PY, "rb").read()).hexdigest(),
+      _SERVER_SHA_BEFORE)
 
 
 #------------------------------------------------------------------------------
