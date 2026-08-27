@@ -43,6 +43,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from oncotriage.dashboard import call_mode
 from oncotriage.dashboard.data import (
     RUN_TRACKING_ABSENT,
     RUN_TRACKING_NO_DATABASE,
@@ -172,6 +173,17 @@ def _build_run_table(summary):
             "degradation events": optional_int_text(row.degradation_events),
             "prompt": as_text(row.llm_classifier_prompt_version, "—"),
             "model": as_text(row.matching_model_configured, "—"),
+            # WHICH STAGE 5 ARM, and it belongs beside `model` rather than in
+            # the cost columns because it is a CONFIGURATION fact about the run
+            # -- one of the seven fingerprint columns `runs` stores -- not a
+            # measurement of it. It is also what makes the `cost $` and
+            # `patients` columns on this row comparable with another row's: a
+            # per-trial run sends one billed request per patient-trial pair
+            # behind a cache warmup and a grouped run sends one per packed
+            # chunk, so two runs that disagree here have costs that are not the
+            # same measurement. `runs.matching_call_mode` is era 4, so "—" here
+            # means the run predates it and NOT that the arm was grouped.
+            "call mode": call_mode.bucket_of(row.matching_call_mode),
             "collection": as_text(row.qdrant_collection, "—"),
         })
     return pd.DataFrame(rows)
@@ -283,6 +295,14 @@ def _build_campaign_table(campaigns):
             "source": as_text(row.invocation_source, "—"),
             "prompt": as_text(row.llm_classifier_prompt_version, "—"),
             "model": as_text(row.matching_model_configured, "—"),
+            # ONE VALUE FOR THE WHOLE CAMPAIGN BY CONSTRUCTION, and that is not
+            # an assumption made here: `campaign_summary` stitches a resume onto
+            # its predecessor only when EVERY fingerprint column matches, and
+            # the arm is one of them. So a grouped fragment and a per-trial
+            # fragment are two campaigns and their patients and costs are never
+            # summed -- which is exactly why this column can be rendered as a
+            # scalar rather than as a mix.
+            "call mode": call_mode.bucket_of(row.matching_call_mode),
             "collection": as_text(row.qdrant_collection, "—"),
         })
     return pd.DataFrame(rows)

@@ -345,8 +345,17 @@ NOT_READY = "not_ready"
 running and can report WHY; it cannot serve a match request."""
 
 
-def serving_readiness() -> dict:
-    """Can this process answer POST /match? Returns a report, raises nothing.
+def serving_readiness(extra_checks=()) -> dict:
+    """Can this process answer POST /match? Returns a report.
+
+    IT RAISES NOTHING ABOUT A DEPENDENCY -- every probe failure below is caught
+    and RECORDED, which is the whole contract: an unready server that answers
+    /health with the reason is strictly more diagnosable than one that dies at
+    startup and leaves only a log. What it DOES raise on is a malformed
+    ``extra_checks`` member, and that is a different kind of fault: a caller
+    passing a check without ``ok`` is a programming error at the call site, not
+    a dependency that is missing, and folding it in silently would let a
+    readiness report be decided by a value nobody set.
 
     Two required dependencies, checked in the order the pipeline would meet
     them:
@@ -370,6 +379,29 @@ def serving_readiness() -> dict:
          as NOT ready here -- unlike at request time -- because a startup probe
          can afford to demand proof, and a container that cannot reach its own
          vector database has nothing to offer a client.
+
+    ``extra_checks`` FOLDS IN A CALLER'S OWN PROBES, appended after the two
+    above and decided by the SAME rule. It exists because a required dependency
+    of the serving path lives BELOW this module in the import order and cannot
+    be reached from here: ``oncotriage/storage/database_logger.py`` owns the
+    schema-era refusal that decides whether a served request's row can be
+    stored, and ``oncotriage/agent/retrieval.py`` imports this module -- so an
+    import of the storage layer here would put the whole of it into the AGENT's
+    import graph. Pass 20c-2c moved ``_resolve_primary_cancer`` out of that file
+    to remove exactly that coupling in the other direction.
+
+    WHY A PARAMETER AND NOT A SECOND STATUS DERIVATION AT THE CALL SITE. The
+    caller could probe the database itself and AND the two verdicts together --
+    and then ``status = READY if all(...)`` would be written in two places, and
+    a third caller with a third policy would write it a third time. This is the
+    duplicated-derivation defect this project keeps removing; one owner for the
+    rule, any number of contributed checks.
+
+    EVERY MEMBER IS VALIDATED AND A BAD ONE RAISES. A check missing ``ok`` would
+    make ``all(...)`` raise ``KeyError`` from inside a function whose contract is
+    that it raises nothing, and a check whose ``ok`` is a truthy STRING would
+    read as ready forever. ``ok`` must be a real ``bool``: this is a readiness
+    verdict, and ``"no"`` is truthy.
 
     Returns:
         ``{"status": READY|NOT_READY, "checks": [ {name, ok, detail}, ... ]}``.
@@ -433,6 +465,30 @@ def serving_readiness() -> dict:
                        f"oncotriage/agent/readiness.py for why the per-request "
                        f"gate does not."),
         })
+
+    # --- 3. whatever the caller contributed --------------------------------
+    # Appended LAST because the docstring above promises the checks are in the
+    # order the pipeline meets them, and everything a caller can contribute
+    # here happens after a match has been produced -- the inference write is
+    # the last thing POST /match does.
+    for extra in extra_checks:
+        if not isinstance(extra, dict):
+            raise TypeError(
+                f"serving_readiness(extra_checks=...) takes check dicts; got "
+                f"{type(extra).__name__}.")
+        missing = [k for k in ("name", "ok", "detail") if k not in extra]
+        if missing:
+            raise ValueError(
+                f"a contributed readiness check is missing {missing}; a check "
+                f"without 'ok' would make this report raise while deciding "
+                f"whether the server is ready.")
+        if not isinstance(extra["ok"], bool):
+            raise TypeError(
+                f"a contributed readiness check's 'ok' must be a bool; "
+                f"{extra['name']!r} carries {extra['ok']!r}. A truthy "
+                f"non-bool would read as ready forever.")
+        checks.append({"name": extra["name"], "ok": extra["ok"],
+                       "detail": extra["detail"]})
 
     status = READY if all(c["ok"] for c in checks) else NOT_READY
     return {"status": status, "checks": checks}

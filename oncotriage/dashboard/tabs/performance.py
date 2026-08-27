@@ -10,6 +10,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from oncotriage.config import MAX_TRIALS_FOR_EVALUATION
+from oncotriage.dashboard import call_mode
 from oncotriage.dashboard.data import load_trial_matches_data
 from oncotriage.dashboard.nullsafe import is_absent
 from oncotriage.dashboard.tiers import (MATCH_TIER_COLORS, TRIAL_STATUS_NO_SCORE,
@@ -545,18 +546,34 @@ def render_performance_tab(df):
     # Slowest Patients Table
     st.subheader("Slowest Patients (Top 10)")
     
-    slowest = df.nlargest(10, 'total_time')[
-        ['patient_id', 'age', 'sex', 'condition_count', 'medication_count',
-         'candidates_evaluated', 'total_time', 'llm_classifier_evaluation_time',
-         'llm_classifier_output_tokens']
-    ].copy()
-    
+    # THE CALL MODE COLUMN IS HERE BECAUSE TWO OF THIS TABLE'S COLUMNS ARE
+    # DECIDED BY IT. `{_judge} Time (s)` and `Output Tokens` are per-patient
+    # figures whose magnitude follows the arm -- per-trial issues one billed
+    # request per patient-trial pair behind a warmup, grouped one per packed
+    # chunk -- so a reader comparing row 1 with row 7 in a table holding both
+    # arms is comparing two different measurements.
+    #
+    # THIS TABLE IS NOT AN AGGREGATE, so it is not split and carries no mixed-
+    # mode warning: every row stands for itself, and naming the arm ON the row
+    # is the whole repair. Splitting a top-10-by-latency listing by mode would
+    # turn one ranking into two and answer a question nobody asked.
+    _slow_cols = ['patient_id', 'age', 'sex', 'condition_count',
+                  'medication_count', 'candidates_evaluated', 'total_time',
+                  'llm_classifier_evaluation_time',
+                  'llm_classifier_output_tokens']
+    _slow_names = ['Patient ID', 'Age', 'Sex', 'Conditions', 'Medications',
+                   'Trials Evaluated', 'Total Time (s)', f'{_judge} Time (s)',
+                   'Output Tokens']
+
+    slowest = df.nlargest(10, 'total_time').copy()
+    # ANNOTATE BEFORE SLICING, and from a COPY: `annotate` derives the display
+    # bucket through the same mapping every other panel groups by, including
+    # the column-absent case, so a database predating era 3 renders the
+    # not-recorded bucket here rather than raising a KeyError.
+    slowest = call_mode.annotate(slowest)[_slow_cols + ['call_mode_label']]
     slowest.insert(0, 'Rank', range(1, len(slowest) + 1))
-    
-    slowest.columns = [
-        'Rank', 'Patient ID', 'Age', 'Sex', 'Conditions', 'Medications',
-        'Trials Evaluated', 'Total Time (s)', f'{_judge} Time (s)', 'Output Tokens'
-    ]
+
+    slowest.columns = ['Rank'] + _slow_names + ['Call Mode']
     
     slowest['Total Time (s)'] = slowest['Total Time (s)'].round(1)
     slowest[f'{_judge} Time (s)'] = slowest[f'{_judge} Time (s)'].round(1)

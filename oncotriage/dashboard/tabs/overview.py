@@ -7,6 +7,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+from oncotriage.dashboard import call_mode
 from oncotriage.dashboard.data import load_trial_matches_data
 from oncotriage.dashboard.tiers import MATCH_TIER_COLORS, PATIENT_OUTCOME_FULL
 
@@ -46,11 +47,26 @@ def render_overview_tab(df):
         )
     
     with col2:
+        # THE ONLY MODE-DEPENDENT FIGURE ON THIS TAB, and it is a per-patient
+        # MEAN. Per-trial mode sends one billed request per patient-trial pair
+        # plus a cache warmup; grouped sends one per packed chunk. Averaged
+        # across a table holding both, this metric is a midpoint no patient in
+        # either arm resembles -- and it is the headline cost figure of the
+        # dashboard, so a reader who never opens the Cost & Tokens tab sees only
+        # this one. The Cost & Tokens tab is where the unblended table lives;
+        # this metric's job is to say when its own number is blended.
+        _mix = call_mode.describe(df)
         st.metric(
-            "Avg Cost/Patient",
+            "Avg Cost/Patient" + ("  ⚠" if _mix["is_mixed"] else ""),
             f"${avg_cost:.4f}",
-            help="Average API cost per patient inference"
-        )
+            help="Average API cost per patient inference." + (
+                f" BLENDED ACROSS STAGE 5 CALL MODES"
+                f"{call_mode.label_suffix(_mix)} — the two arms cost different "
+                f"amounts per patient, so this mean is over two populations. "
+                f"The Cost & Tokens tab breaks it out per mode."
+                if _mix["is_mixed"]
+                else (f" All rows are {_mix['sole_bucket']}."
+                      if _mix["sole_bucket"] else "")))
     
     with col3:
         st.metric(

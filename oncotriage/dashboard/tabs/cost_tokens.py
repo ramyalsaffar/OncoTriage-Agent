@@ -50,6 +50,7 @@ import streamlit as st
 
 from oncotriage.storage import queries
 from oncotriage.utils import UnknownModelPricingError
+from oncotriage.dashboard import call_mode
 from oncotriage.dashboard.tiers import MATCH_TIERS, MATCH_TIER_COLORS
 
 
@@ -63,6 +64,11 @@ def render_cost_tokens_tab(df):
     # Exclude failed inferences (API errors) from cost analysis
     df = df[df['error'].fillna('') == ''].copy()
     
+    # WHICH STAGE 5 ARM PRODUCED THESE ROWS. Read once, at the top, because
+    # every panel below is qualified by it and two readings of one frame that
+    # disagreed would be worse than one that is wrong.
+    _mix = call_mode.describe(df)
+
     col1, col2, col3, col4 = st.columns(4)
     
     total_cost = df['estimated_cost_usd'].sum()
@@ -70,17 +76,88 @@ def render_cost_tokens_tab(df):
     median_cost = df['estimated_cost_usd'].median()
     projected_1000 = avg_cost * 1000
     
+    # THE TOTAL IS NOT QUALIFIED BY THE MODE AND THE OTHER THREE ARE, and the
+    # asymmetry is the point rather than an inconsistency. A SUM of dollars
+    # actually spent is correct however the rows were produced -- money is
+    # money, and the sum answers "what did this selection cost". The other
+    # three are PER-PATIENT statistics, and a mean, a median or a projection
+    # taken across two arms is a statistic over two populations: per-trial
+    # sends one billed request per patient-trial pair plus a warmup, grouped
+    # sends one per packed chunk, so the same column carries figures that are
+    # not the same measurement. The 1000-patient projection is the sharpest
+    # case -- it is the number an operator budgets a campaign from, and a
+    # blended average projects a cohort nobody will ever run.
+    _q = call_mode.label_suffix(_mix) if _mix["is_mixed"] else ""
+    # ON ONE ARM THE HELP NAMES THE ARM RATHER THAN SAYING NOTHING, which is
+    # what the token metrics further down already do. A blank qualifier there
+    # would leave the two halves of this tab making different promises about
+    # the same frame: "these figures are per-trial" beside "these figures are
+    # about something".
+    _arm = (f" All rows are {_mix['sole_bucket']}."
+            if _mix["sole_bucket"] and not _mix["is_mixed"] else "")
+
     with col1:
-        st.metric("Total Cost", f"${total_cost:.2f}", help="Total API cost for all inferences")
+        st.metric("Total Cost", f"${total_cost:.2f}",
+                  help="Total API cost for all inferences in this selection. "
+                       "A sum of dollars actually spent, so it is correct "
+                       "whichever Stage 5 arm produced the rows.")
     
     with col2:
-        st.metric("Average Cost", f"${avg_cost:.4f}", help="Average cost per patient inference")
+        st.metric("Average Cost" + ("  ⚠" if _mix["is_mixed"] else ""),
+                  f"${avg_cost:.4f}",
+                  help="Average cost per patient inference." + (
+                      f" BLENDED ACROSS CALL MODES{_q} — see the per-mode "
+                      f"table below." if _mix["is_mixed"] else _arm))
     
     with col3:
-        st.metric("Median Cost", f"${median_cost:.4f}", help="Median cost per patient")
+        st.metric("Median Cost" + ("  ⚠" if _mix["is_mixed"] else ""),
+                  f"${median_cost:.4f}",
+                  help="Median cost per patient." + (
+                      f" BLENDED ACROSS CALL MODES{_q}." if _mix["is_mixed"]
+                      else _arm))
     
     with col4:
-        st.metric("Projected (1000)", f"${projected_1000:.2f}", help="Estimated cost for 1000 patients")
+        st.metric("Projected (1000)" + ("  ⚠" if _mix["is_mixed"] else ""),
+                  f"${projected_1000:.2f}",
+                  help="Estimated cost for 1000 patients, from the average to "
+                       "its left." + (
+                      " BLENDED ACROSS CALL MODES — this projects a cohort "
+                      "that is part per-trial and part grouped, which is not a "
+                      "cohort anybody will run. Use the per-mode table below."
+                      if _mix["is_mixed"] else _arm))
+
+    st.caption(call_mode.caption(_mix, "per-patient average, median and projection"))
+
+    # THE PER-MODE TABLE RENDERS ONLY WHEN THE MIX MAKES IT A FINDING. On a
+    # single-arm selection -- which is every ordinary campaign -- it would be
+    # one row restating the metrics above it, so the caption alone says which
+    # arm they belong to and the table is skipped. That is the `skip_if_empty`
+    # render mode item 38 added to the query layer, applied to a panel.
+    if _mix["is_mixed"]:
+        # NULL IS NOT ZERO IN THIS TABLE EITHER. A group whose every
+        # estimated_cost_usd is NULL has a mean of nan, and rounding that
+        # renders the string "NaN" in a money column -- which reads as a
+        # computed figure. `_money` returns None instead, so the cell is empty
+        # and "nothing was recorded" is distinguishable from "$0.00 was spent",
+        # which is the distinction item 38 had to restore to this tab's totals.
+        def _money(value, digits=6):
+            return None if pd.isna(value) else round(float(value), digits)
+
+        _per_mode = []
+        for _bucket, _sub in call_mode.split(df):
+            _sub_avg = _sub['estimated_cost_usd'].mean()
+            _per_mode.append({
+                "call mode": _bucket,
+                "patients": int(len(_sub)),
+                "total $": _money(_sub['estimated_cost_usd'].sum(), 4),
+                "avg $/patient": _money(_sub_avg),
+                "median $/patient": _money(_sub['estimated_cost_usd'].median()),
+                "projected $/1000": (None if pd.isna(_sub_avg)
+                                     else round(float(_sub_avg) * 1000, 2)),
+            })
+        st.markdown("**Cost per call mode** — the figures above, unblended:")
+        st.dataframe(pd.DataFrame(_per_mode), use_container_width=True,
+                     hide_index=True)
     
     st.markdown("---")
     st.subheader("Cost Breakdown by Model")
@@ -359,7 +436,13 @@ def render_cost_tokens_tab(df):
         ))
         fig_tpt.update_layout(
             barmode='stack',
-            title='Avg Tokens per Trial by Match Tier',
+            # THE MIX IS IN THE TITLE RATHER THAN A FOURTH AND FIFTH TRACE.
+            # Splitting this chart by mode doubles its traces and makes the
+            # tier comparison -- which is its subject -- harder to read, for a
+            # distinction the reader can act on by filtering. Stating the mix
+            # is the other half of the rule and is what this panel takes.
+            title='Avg Tokens per Trial by Match Tier'
+                  + call_mode.label_suffix(_mix),
             yaxis_title='Tokens per Trial',
             height=350,
             margin=dict(l=20, r=20, t=40, b=20),
@@ -372,23 +455,150 @@ def render_cost_tokens_tab(df):
         df_efficiency = df[df['candidates_evaluated'] > 0].copy()
         df_efficiency['tokens_per_trial'] = (df_efficiency['llm_classifier_input_tokens'] + df_efficiency['llm_classifier_output_tokens']) / df_efficiency['candidates_evaluated']
         
-        fig_efficiency = px.histogram(df_efficiency, x='tokens_per_trial', nbins=30, labels={'tokens_per_trial': 'Tokens/Trial'}, template='plotly_white', title='Token Efficiency (Total per Trial)')
-        fig_efficiency.add_vline(x=df_efficiency['tokens_per_trial'].median(), line_dash="dash", line_color="red", annotation_text=f"Median: {df_efficiency['tokens_per_trial'].median():.0f}")
-        fig_efficiency.update_layout(height=350, margin=dict(l=20, r=20, t=40, b=20), showlegend=False)
+        # THIS ONE IS SPLIT RATHER THAN LABELLED, because a histogram is the
+        # one shape where the split IS the reading: two arms produce two
+        # distributions an order of magnitude apart, and blended into one set
+        # of bins they render as a single bimodal smear whose median line sits
+        # between two humps and describes neither. Colouring by mode costs one
+        # argument and turns the same panel into the comparison.
+        _eff = call_mode.annotate(df_efficiency)
+        fig_efficiency = px.histogram(
+            _eff, x='tokens_per_trial', nbins=30,
+            color=('call_mode_label' if _mix["is_mixed"] else None),
+            labels={'tokens_per_trial': 'Tokens/Trial',
+                    'call_mode_label': 'Call mode'},
+            template='plotly_white',
+            title='Token Efficiency (Total per Trial)'
+                  + call_mode.label_suffix(_mix))
+        # THE MEDIAN LINE IS DROPPED ON A MIXED SELECTION rather than drawn
+        # across two distributions. A single median over a bimodal mixture is
+        # a number that describes neither hump, annotated in a way that reads
+        # as if it described the chart.
+        if not _mix["is_mixed"]:
+            fig_efficiency.add_vline(
+                x=df_efficiency['tokens_per_trial'].median(),
+                line_dash="dash", line_color="red",
+                annotation_text=f"Median: {df_efficiency['tokens_per_trial'].median():.0f}")
+        fig_efficiency.update_layout(height=350, margin=dict(l=20, r=20, t=40, b=20),
+                                     showlegend=bool(_mix["is_mixed"]))
         st.plotly_chart(fig_efficiency, use_container_width=True)
     
-    col1, col2, col3 = st.columns(3)
-    
+    # THE THREE TOKEN AVERAGES ARE THE PANEL THIS PASS EXISTS FOR. Every one of
+    # them is a per-patient mean over a column whose magnitude is decided by the
+    # call mode, and until now all three were blended with nothing on screen
+    # saying so. "Avg Input Tokens" over a half-and-half table is roughly the
+    # midpoint of a grouped patient's ~4 prompt renderings and a per-trial
+    # patient's ~16 -- a number no patient in either arm resembles.
+    #
+    # ON A SINGLE-ARM SELECTION they are rendered exactly as they were, with the
+    # arm named in the help text. A warning on every panel of an ordinary
+    # campaign is a warning an operator learns to scroll past.
+    col1, col2, col3, col4 = st.columns(4)
+
+    _mode_note = ("  ⚠" if _mix["is_mixed"] else "")
+    _mode_help = (f" BLENDED ACROSS CALL MODES{call_mode.label_suffix(_mix)} — "
+                  f"see the per-mode table below."
+                  if _mix["is_mixed"]
+                  else (f" Selection is all {_mix['sole_bucket']}."
+                        if _mix["sole_bucket"] else ""))
+
     with col1:
-        st.metric("Avg Input Tokens", f"{df['llm_classifier_input_tokens'].mean():,.0f}", help="Average GPT-4o input tokens per patient (prompt + criteria + patient data)")
+        st.metric("Avg Input Tokens" + _mode_note,
+                  f"{df['llm_classifier_input_tokens'].mean():,.0f}",
+                  help="Average Stage 5 input tokens per patient (prompt + "
+                       "criteria + patient data), summed over every request "
+                       "the patient's Stage 5 issued." + _mode_help)
     with col2:
-        st.metric("Avg Output Tokens", f"{df['llm_classifier_output_tokens'].mean():,.0f}", help="Average GPT-4o output tokens per patient (eligibility assessments)")
+        st.metric("Avg Output Tokens" + _mode_note,
+                  f"{df['llm_classifier_output_tokens'].mean():,.0f}",
+                  help="Average Stage 5 output tokens per patient (eligibility "
+                       "assessments, plus any reasoning tokens, which are a "
+                       "subset billed at the output rate)." + _mode_help)
     with col3:
-        st.metric("Avg Tokens/Trial", f"{df_efficiency['tokens_per_trial'].mean():.0f}" if len(df_efficiency) > 0 else "N/A", help="Average total tokens consumed per trial evaluation")
-    
+        st.metric("Avg Tokens/Trial" + _mode_note,
+                  f"{df_efficiency['tokens_per_trial'].mean():.0f}"
+                  if len(df_efficiency) > 0 else "N/A",
+                  help="Average total tokens per trial evaluated." + _mode_help)
+    with col4:
+        # HOW MANY BILLED REQUESTS A PATIENT ACTUALLY COST, which is the single
+        # figure that separates the two arms and which this tab has never shown.
+        # It is read from `llm_classifier_calls` -- the column Stage 5 writes on
+        # EVERY return -- and never inferred from the mode, because a patient
+        # whose warmup was refused falls back to a different schedule and a
+        # patient that never reached Stage 5 issued none.
+        #
+        # NULL IS NOT ZERO HERE. A NULL means Stage 5 never reported; 0 means it
+        # ran and issued nothing. `.mean()` skips NULLs by default, which is the
+        # right arithmetic, and the count of rows it skipped is stated below
+        # rather than folded in as zeros.
+        _calls = (df['llm_classifier_calls']
+                  if 'llm_classifier_calls' in df.columns else None)
+        _calls_mean = _calls.mean() if _calls is not None else None
+        st.metric("Avg Stage 5 Calls" + _mode_note,
+                  "N/A" if _calls_mean is None or pd.isna(_calls_mean)
+                  else f"{_calls_mean:,.1f}",
+                  help="Average billed Stage 5 requests per patient, from "
+                       "`llm_classifier_calls`. In per-trial mode this is one "
+                       "cache warmup plus one request per evaluated trial; in "
+                       "grouped mode it is one per packed chunk." + _mode_help)
+
+    # THE PER-MODE TOKEN TABLE, on the same skip_if_empty footing as the cost
+    # one above: it renders only when there is a mix to unblend.
+    if _mix["is_mixed"]:
+        def _tok(value):
+            return None if pd.isna(value) else round(float(value), 0)
+
+        _tok_rows = []
+        for _bucket, _sub in call_mode.split(df):
+            _sub_eff = _sub[_sub['candidates_evaluated'] > 0]
+            _sub_calls = (_sub['llm_classifier_calls']
+                          if 'llm_classifier_calls' in _sub.columns else None)
+            _tok_rows.append({
+                "call mode": _bucket,
+                "patients": int(len(_sub)),
+                # Same rule as the cost table above: an all-NULL token column
+                # means "no count was ever recorded", which is not 0 tokens.
+                "avg input tok": _tok(_sub['llm_classifier_input_tokens'].mean()),
+                "avg output tok": _tok(_sub['llm_classifier_output_tokens'].mean()),
+                "avg tok/trial": _tok((
+                    (_sub_eff['llm_classifier_input_tokens']
+                     + _sub_eff['llm_classifier_output_tokens'])
+                    / _sub_eff['candidates_evaluated']).mean())
+                if len(_sub_eff) else None,
+                "avg Stage 5 calls": (round(float(_sub_calls.mean()), 2)
+                                      if _sub_calls is not None
+                                      and not pd.isna(_sub_calls.mean())
+                                      else None),
+            })
+        st.markdown("**Token usage per call mode** — the figures above, unblended:")
+        st.dataframe(pd.DataFrame(_tok_rows), use_container_width=True,
+                     hide_index=True)
+
+    # HOW MANY ROWS COULD NOT ANSWER THE CALL-COUNT QUESTION AT ALL, said out
+    # loud rather than absorbed into the mean. `llm_classifier_calls` is NULL on
+    # a row written before that column existed, and a mean over the remainder
+    # that did not say how many rows it skipped is a mean whose denominator the
+    # reader cannot see.
+    if 'llm_classifier_calls' in df.columns:
+        _no_calls = int(df['llm_classifier_calls'].isna().sum())
+        if _no_calls:
+            st.caption(
+                f"{_no_calls:,} of {len(df):,} rows record no Stage 5 call "
+                f"count (`llm_classifier_calls` is NULL — written before that "
+                f"column existed, or Stage 5 never reported). They are excluded "
+                f"from the call average, not counted as zero.")
+    else:
+        st.caption(
+            "This database has no `llm_classifier_calls` column, so the "
+            "billed-request count per patient cannot be reported. It is added "
+            "by the next run that opens the file.")
+
     st.caption(
         "Patient Complexity = condition count + medication count. "
-        "Token usage scales primarily with the number of trials evaluated, not patient complexity. "
+        "Token usage scales primarily with the number of trials evaluated, not "
+        "patient complexity — and, since the per-trial arm shipped, with the "
+        "Stage 5 call mode, which decides how many times the shared prompt "
+        "prefix is sent. "
         "Tokens/Trial reflects full criterion-level evaluation — all criteria are evaluated and returned "
         "for both eligible and not-eligible trials to enable auditability and post-hoc analysis."
     )
@@ -477,7 +687,12 @@ def render_cost_tokens_tab(df):
             )
 
         fig_unit.update_layout(
-            title='Cost Efficiency: Per Patient vs Per Match',
+            # BOTH PANELS IN THIS ROW AVERAGE COST PER PATIENT WITHIN A TIER,
+            # so both carry the mix. Splitting them by mode as well as by tier
+            # would give a dumbbell with two dots per arm per tier, which is
+            # unreadable for a distinction the caption below states in words.
+            title='Cost Efficiency: Per Patient vs Per Match'
+                  + call_mode.label_suffix(_mix),
             xaxis_title='Cost (USD)',
             height=380,
             margin=dict(l=100, r=20, t=45, b=40),
@@ -509,7 +724,8 @@ def render_cost_tokens_tab(df):
 
         fig_dist.update_layout(
             barmode='overlay',
-            title='Cost Distribution by Match Tier',
+            title='Cost Distribution by Match Tier'
+                  + call_mode.label_suffix(_mix),
             xaxis_title='Cost ($)',
             yaxis_title='Patient Count',
             height=380,
@@ -518,6 +734,9 @@ def render_cost_tokens_tab(df):
             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
         )
         st.plotly_chart(fig_dist, use_container_width=True)
+
+    if _mix["is_mixed"]:
+        st.caption(call_mode.caption(_mix, "per-tier cost average"))
 
     st.caption(
         "**Left:** Colored circles show average cost per patient by tier. Black diamonds show cost per eligible match. "

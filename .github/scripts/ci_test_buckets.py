@@ -533,6 +533,34 @@ BUCKETS = {
         "modules -- are written by neither of the suite's two writers and are "
         "sha256-compared at the end. It EXECS NOTHING: every plant is a COPY "
         "written to the temp directory and imported from there"),
+    "test_api_call_mode_and_db_health.py": (
+        _A, None,
+        # MEASURED BOTH WAYS RATHER THAN GUESSED, which is what this field
+        # asks for: 142 passed / 0 failed / 1 SKIPPED against ONLY the
+        # directory skeleton, and 143/0/0 against the developer tree. The one
+        # skip is section 9c's non-degeneracy probe on the production
+        # inferences.db, which a runner does not have; the COMPARISON it
+        # qualifies is NOT gated, so a run that CREATED a production database
+        # still fails there. That gating shape is
+        # tests/test_storage_write_durability.py's, adopted for its reason.
+        "ran green in 13s against ONLY the directory skeleton (150 passed, 0 "
+        "failed, 1 skipped) and 151/0/0 against the developer tree: the Stage "
+        "5 call mode on the operator surfaces, and the serving-database "
+        "refusal at GET /health. No network, no keys, NO SPEND (the API "
+        "sections install a stub Qdrant client and a stub MeSH filter through "
+        "oncotriage/agent/deps.py and the graph is compiled but never invoked; "
+        "the dashboard sections touch no client at all), no live Qdrant, no "
+        "model load, no corpus, no git history, no live server, no Docker "
+        "daemon. Every database is built by the project's own "
+        "initialize_database() inside a tempfile.mkdtemp it removes and "
+        "asserts gone, and paths._RESOLVED is repointed and restored, so the "
+        "production database is never opened. NOT in the collision matrix: it "
+        "writes nothing in the repository, and the eight package files it "
+        "reads are written by neither of the suite's two writers and are "
+        "sha256-compared at the end. It EXECS NOTHING and loads no module by "
+        "location -- every plant is a copy written to the temp tree and "
+        "imported from there -- so it needs no _EXEC_ALLOWLIST entry.",
+    ),
     "test_dashboard_run_health.py": (
         _A, None,
         # RE-READ OFF A REAL RUN (this pass), and the string it replaces was

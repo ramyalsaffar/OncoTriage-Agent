@@ -834,9 +834,16 @@ try:
           sorted(_INFO_JSON),
           ["architecture", "config", "not_for_clinical_use", "stages",
            "trials_indexed", "trials_indexed_note", "version"])
-    check("2g  ...and its config sub-block is untouched",
+    # THE `call_mode` BLOCK IS THE ONE ADDITION SINCE THIS PIN WAS WRITTEN, and
+    # it is added to the expectation rather than the pin being loosened: the
+    # pin's whole job is that a field arrives on purpose. Which Stage 5 arm the
+    # process is running was absent from the endpoint that describes the
+    # pipeline while it was the single largest lever on what a patient costs.
+    # Its own SHAPE is pinned by tests/test_api_call_mode_and_db_health.py,
+    # which is where the block's meaning is tested; here it is one key.
+    check("2g  ...and its config sub-block is the old nine plus call_mode",
           sorted(_INFO_JSON["config"]),
-          ["collection_name", "embedding_model", "matching_model",
+          ["call_mode", "collection_name", "embedding_model", "matching_model",
            "max_llm_classifier_retries", "max_trials_for_evaluation",
            "medcpt_score_floor", "qdrant_endpoint",
            "quality_threshold_percentile", "top_k_candidates"])

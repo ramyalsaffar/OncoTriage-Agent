@@ -52,6 +52,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from oncotriage.dashboard import call_mode
 from oncotriage.dashboard.data import load_trial_matches_data
 from oncotriage.dashboard.nullsafe import (
     ABSENT_TEXT,
@@ -666,6 +667,152 @@ def render_patient_explorer_tab(df):
                  "billed at the output rate and never shown to the reader. "
                  "'n/a' means this response reported no reasoning breakdown.",
         )
+
+    # =======================================================================
+    # HOW STAGE 5 SPENT THAT, REQUEST BY REQUEST
+    # =======================================================================
+    # THE THREE TOKEN TILES ABOVE ARE PATIENT TOTALS AND SAY NOTHING ABOUT HOW
+    # MANY REQUESTS PRODUCED THEM. Since the per-trial arm shipped that is the
+    # difference between one packed request and sixteen -- one cache warmup plus
+    # one per evaluated trial -- and the totals look the same either way.
+    #
+    # WHY THIS IS THE RIGHT PLACE FOR A PER-CALL BREAKDOWN AND AN AGGREGATE TAB
+    # IS NOT. A ledger belongs to ONE patient: `call_index` numbers the requests
+    # of a single Stage 5 invocation, so ledgers from two patients cannot be
+    # concatenated into anything meaningful. This tab renders exactly one row.
+    #
+    # EVERY FIGURE HERE IS READ FROM THE LEDGER, NEVER DIVIDED OUT OF A TOTAL.
+    # `input_tokens / llm_classifier_calls` is wrong for a per-trial row and has
+    # no symptom: one of those calls is the WARMUP, which carries the whole
+    # shared prefix against a one-token output ceiling, so it drags the "average
+    # call" toward a number no evaluation request resembles. It is wrong for a
+    # grouped row too, whose chunks are not equal sized.
+    st.markdown("---")
+    st.subheader("Stage 5 Requests")
+
+    _row_mode = patient_df.get(call_mode.MODE_COLUMN)
+    _row_mode_label = call_mode.bucket_of(_row_mode)
+    _ledger = call_mode.ledger(patient_df.get('llm_classifier_call_details'))
+
+    lcol1, lcol2, lcol3 = st.columns(3)
+    with lcol1:
+        st.metric("Call Mode", _row_mode_label,
+                  help="Which Stage 5 arm produced this row, from "
+                       "`inferences.matching_call_mode`. Read from the ROW, "
+                       "never from the configured default — a row written "
+                       "before the arm flipped keeps the arm that produced it.")
+    with lcol2:
+        st.metric("Billed Requests",
+                  optional_int_text(patient_df.get('llm_classifier_calls')),
+                  help="`llm_classifier_calls` — every request Stage 5 issued "
+                       "for this patient, warmup included. NULL (—) means the "
+                       "row predates the column, which is not zero.")
+    with lcol3:
+        # THE WARMUP IS COUNTED SEPARATELY AND NAMED INFRASTRUCTURE, because it
+        # evaluates no trial: it exists to write the shared prompt prefix into
+        # the provider's cache so the requests behind it bill at the cached
+        # rate. Folding it into "evaluation calls" would overstate the work by
+        # one request per patient and understate the cost of the cache-or-
+        # nothing rule that makes the arm affordable.
+        st.metric("…of which warmup",
+                  str(_ledger["warmup_calls"])
+                  if _ledger["state"] == call_mode.LEDGER_ROWS
+                  else "—",
+                  help="Cache warmups are INFRASTRUCTURE, not evaluations: a "
+                       "warmup sends the shared prefix with a one-token output "
+                       "ceiling so the trial requests behind it bill at the "
+                       "cached input rate. It evaluates no trial.")
+
+    if _ledger["state"] == call_mode.LEDGER_ABSENT:
+        # NULL AND [] ARE DIFFERENT ANSWERS and the storage layer says so at the
+        # column: NULL means the node was never entered, [] means it ran and no
+        # request produced a usage object. Rendering both as "no calls" would
+        # report a stage that never ran as one that made no request.
+        st.info(
+            "No per-request ledger for this patient. "
+            "`llm_classifier_call_details` is NULL, which means Stage 5 was "
+            "never entered — the pipeline ended at an earlier node, or this row "
+            "predates the column. It does NOT mean zero requests were made.")
+    elif _ledger["state"] == call_mode.LEDGER_EMPTY:
+        st.warning(
+            "Stage 5 ran and recorded an EMPTY ledger: no request produced a "
+            "usage object, so the first one raised before it could be counted. "
+            "The patient's token totals above are a floor.")
+    elif _ledger["state"] == call_mode.LEDGER_UNREADABLE:
+        st.error(
+            "`llm_classifier_call_details` on this row is not a JSON list of "
+            "objects and cannot be rendered. Nothing is inferred from it.")
+    else:
+        _ledger_rows = []
+        for _entry in _ledger["rows"]:
+            _ledger_rows.append({
+                "#": _entry.get("call_index"),
+                "kind": _entry["_kind"],
+                "trials": _entry.get("trials"),
+                "depth": _entry.get("depth"),
+                "prompt tok": _entry.get("prompt_tokens"),
+                "cached tok": _entry.get("cached_tokens"),
+                "completion tok": _entry.get("completion_tokens"),
+                "reasoning tok": _entry.get("reasoning_tokens"),
+                "finish": _entry.get("finish_reason"),
+                "entries emitted": _entry.get("entries_emitted"),
+            })
+        st.dataframe(pd.DataFrame(_ledger_rows), use_container_width=True,
+                     hide_index=True)
+
+        # CACHED TOKENS: NULL AND 0 ARE DIFFERENT ANSWERS, one more time. NULL
+        # is "this response reported no `prompt_tokens_details.cached_tokens`
+        # field at all"; 0 is "it reported, and the provider cached nothing".
+        # Only the second is evidence that the prefix is not being reused, and
+        # averaging the two together would make a silent provider look like a
+        # cold cache. The wave rate therefore EXCLUDES both the warmup (which
+        # WRITES the prefix and correctly reports 0) and every silent call.
+        _wave = [r for r in _ledger["rows"] if r["_kind"] != call_mode.WARMUP_KIND]
+        _reporting = [r for r in _wave if r.get("cached_tokens") is not None]
+        _silent = len(_wave) - len(_reporting)
+        # int() ON A LEDGER VALUE CAN RAISE, and a raise here is a raise
+        # INSIDE THE RENDER: `oncotriage/dashboard/app.py` calls this tab with
+        # no handler, so one malformed entry would take all ten tabs down for
+        # every reader. The ledger is JSON written by Stage 5 and is normally
+        # numeric, but this function's whole contract is that it survives a
+        # payload it did not write -- `ledger()` above already refuses a member
+        # that is not an object, and this is the same rule one level in.
+        # A value that is not a number is skipped from BOTH sides of the ratio,
+        # which is the treatment a silent `cached_tokens` already gets.
+        def _num(value):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        _pairs = [(_num(r.get("prompt_tokens")), _num(r.get("cached_tokens")))
+                  for r in _reporting]
+        _pairs = [(p_, c_) for p_, c_ in _pairs
+                  if p_ is not None and c_ is not None]
+        _unreadable = len(_reporting) - len(_pairs)
+        _reporting = _pairs
+        if _reporting:
+            _prompt = sum(p_ for p_, _c in _reporting)
+            _cached = sum(c_ for _p, c_ in _reporting)
+            _rate = (_cached / _prompt * 100) if _prompt else 0.0
+            st.caption(
+                f"**Prefix cache, evaluation requests only:** "
+                f"{_cached:,} of {_prompt:,} prompt tokens billed as cached "
+                f"({_rate:.1f}%) across {len(_reporting)} reporting request(s). "
+                f"The warmup is excluded — it WRITES the prefix, so its own 0% "
+                f"is the healthy reading."
+                + (f" {_silent} request(s) reported no cached-token field at "
+                   f"all and are excluded from both sides of that ratio; a "
+                   f"silent provider is not a cold cache."
+                   if _silent else "")
+                + (f" {_unreadable} request(s) carried a non-numeric token "
+                   f"figure and are excluded too."
+                   if _unreadable else ""))
+        elif _wave:
+            st.caption(
+                f"None of this patient's {len(_wave)} evaluation request(s) "
+                f"reported a cached-token figure, so no cache hit rate can be "
+                f"computed. That is not a hit rate of zero.")
 
     _error = patient_df.get('error')
     if not is_absent(_error) and str(_error) != '':

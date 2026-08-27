@@ -609,6 +609,24 @@ python tests/test_dashboard_run_health.py                          # 196 (was 19
 # end. It EXECS NOTHING: every plant is a COPY in that temp directory. ~2 s.
 python tests/test_dashboard_app_integration.py                     # 110 (this line said 155 and was stale by 12 before the campaign pass, which added section 8 over the campaigns panel and its two plants; MEASURED 2026-08-23)
 
+# The call-mode-labelling pass. Same shape, same directory. No network, no
+# keys, NO SPEND -- the API sections install a stub Qdrant client and a stub
+# MeSH filter through oncotriage/agent/deps.py and the graph is compiled but
+# NEVER INVOKED; the dashboard sections touch no client at all. No live Qdrant,
+# no model load, no corpus, no git history, no live server, no Docker daemon.
+# NOT in the collision matrix: every database is built by the project's own
+# initialize_database() inside a tempfile.mkdtemp it removes and asserts gone,
+# paths._RESOLVED is repointed and restored, and the eight package files it
+# reads are written by neither of the suite's two writers and are
+# sha256-compared at the end. It EXECS NOTHING and loads no module by location
+# -- every plant is a COPY written to the temp tree and imported from there --
+# so it needs no _EXEC_ALLOWLIST entry. Its ONE skip is section 9c's
+# non-degeneracy probe on the production inferences.db, which a runner does not
+# have; the COMPARISON it qualifies is NOT gated, so a run that CREATED a
+# production database still fails there (test_storage_write_durability.py's
+# gating shape, adopted for its reason). Bucket A, ~12 s.
+python tests/test_api_call_mode_and_db_health.py                    # 151/0/0 on the developer tree; 150 passed / 0 failed / 1 SKIPPED against ONLY the CI directory skeleton
+
 # The counter-reader pass. Same shape, same directory. No network, no keys, no
 # spend, no live Qdrant, no model load, no corpus, no git history, and NOT in
 # the collision matrix -- it writes nothing outside a tempfile.mkdtemp it

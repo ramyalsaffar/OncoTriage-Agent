@@ -5581,14 +5581,21 @@ _DASH_FILES = sorted(
 # the one owner of "render a cell that may be NULL", which exists because
 # tabs/run_health.py and tabs/patient_explorer.py would otherwise carry two
 # copies of the same four readers and could disagree about whether an absent
-# count renders as an em dash or as 0. The number moves whenever a module joins,
+# count renders as an em dash or as 0. EIGHTEEN AFTER THE CALL-MODE-LABELLING
+# PASS added call_mode.py, on the identical argument one column over: five tabs
+# ask "which Stage 5 arm produced these rows, and is that safe to average", and
+# five copies of the NULL / column-absent / unrecognised-value rules would
+# disagree about which bucket a row falls in -- while the query layer's
+# MODE_NOT_RECORDED_LABEL, which this module imports rather than retypes, is the
+# name File 16's arm table already uses for the same bucket.
+# The number moves whenever a module joins,
 # and it is a NON-DEGENERACY PROBE rather than a claim about the right number of
 # modules -- its job is to say the walk below found files at all, so a scan that
 # silently covered nothing cannot report "[] mutations" and pass.
-check("the dashboard has the seventeen modules the conversion, run-reader and "
-      "campaign passes created (non-degeneracy: a scan over an empty file list "
-      "proves nothing)",
-      len(_DASH_FILES), 17)
+check("the dashboard has the eighteen modules the conversion, run-reader, "
+      "campaign and call-mode-labelling passes created (non-degeneracy: a scan "
+      "over an empty file list proves nothing)",
+      len(_DASH_FILES), 18)
 
 _TIER_NAMES = ("MATCH_TIERS", "MATCH_TIER_COLORS")
 check("nothing in the dashboard mutates MATCH_TIERS or MATCH_TIER_COLORS, "

@@ -85,6 +85,7 @@ import os
 import sqlite3
 import threading
 import time
+import urllib.parse
 from collections import Counter
 from datetime import datetime
 from typing import Dict
@@ -402,6 +403,170 @@ def assert_database_is_compatible(conn, db_path):
             f"        mv {db_path!r} {db_path!r}.era{user_version}-archive")
 
     return application_id, user_version
+
+
+# ---------------------------------------------------------------------------
+# THE SERVING-DATABASE READINESS PROBE
+# ---------------------------------------------------------------------------
+
+SERVING_DATABASE_CHECK = "inference_database"
+"""The name this probe's check carries in a readiness report. Written once
+because ``oncotriage/api/server.py`` folds the check into
+``serving_readiness()`` and a test asserts on the name; two spellings of one
+check name is a test that passes against a report that names something else."""
+
+
+def probe_serving_database(db_path=None):
+    """Can this process WRITE the inference database? A check dict, never a raise.
+
+    Returns ``{"name": SERVING_DATABASE_CHECK, "ok": bool, "detail": str}`` --
+    the shape ``oncotriage/agent/readiness.py`` builds its report from.
+
+    ===================================================================
+    WHY THIS EXISTS: A REFUSED DATABASE IS INVISIBLE AT EVERY OTHER SURFACE
+    ===================================================================
+
+    ``assert_database_is_compatible`` refuses a file written by a NEWER schema
+    era, and that refusal is correct. What happens next is not.
+    ``_write_inference_row``'s handler catches ``Exception`` -- deliberately, so
+    a logging fault cannot kill a paid pipeline result -- and
+    ``IncompatibleDatabaseError`` is a ``RuntimeError``, so it is caught there
+    like any other. The write returns ``ok=False``.
+
+    MEASURED, not reasoned about: with a newer-era file in place,
+    ``POST /match`` runs the whole pipeline, makes its billed Stage 5 calls,
+    returns **HTTP 200 with a complete, correct body**, and stores nothing. The
+    client cannot tell. ``GET /health`` probed the MeSH lookups and the trial
+    index and knew nothing about the database, so it stayed **green**. The only
+    trace anywhere is one ERROR line per request in the server log.
+
+    So the failure mode is not "the server is down" -- which an operator would
+    notice -- but "the server bills for every request and keeps no record",
+    which nothing on any surface reports. That is what this probe is for, and it
+    is why the answer belongs at ``/health``: a `curl -f` healthcheck is the one
+    thing watching a container that nobody is reading the logs of.
+
+    ===================================================================
+    IT LIVES IN THE STORAGE LAYER AND IS COMPOSED BY THE CALLER
+    ===================================================================
+
+    The obvious home is inside ``serving_readiness()``. It cannot go there:
+    ``oncotriage/agent/retrieval.py`` imports ``agent.readiness``, so a
+    storage import inside that module puts the whole storage layer -- and every
+    module it pulls in -- into the AGENT's import graph. Pass 20c-2c moved
+    ``_resolve_primary_cancer`` OUT of this file precisely to remove that
+    coupling in the other direction; adding it back pointing the other way is
+    the same edge. ``oncotriage/api/server.py`` already imports both and is
+    where the two are joined.
+
+    ===================================================================
+    IT MUST NOT CREATE THE FILE IT IS ASKED ABOUT
+    ===================================================================
+
+    ``sqlite3.connect`` CREATES a missing database. A probe that answered "the
+    file is fine" by bringing it into existence would be File 41's
+    guard-that-creates-its-own-evidence defect, and on a container whose data
+    volume failed to mount it would silently establish an empty database at the
+    mount point. So an absent file is answered from ``os.path.exists`` and never
+    opened, and an existing one is opened through a ``mode=ro`` URI.
+
+    AN ABSENT FILE IS ``ok=True`` and that is deliberate: a fresh deployment has
+    no inference database until its first write, and the first write creates a
+    correct one. Reporting it NOT ready would make every clean bring-up
+    unhealthy until somebody sent a request.
+
+    A FILE THAT CANNOT BE READ IS ``ok=False``. Unlike the index probe's
+    ``unverifiable`` state -- where "cannot tell" is a network question -- a
+    local database this process cannot open read-only is one it certainly cannot
+    write, so there is no third state to be careful about.
+    """
+    try:
+        resolved = resolve_inference_db_path(db_path)
+    except Exception as exc:
+        # resolve_inferences_db() RAISES on a configured path whose parent
+        # directory is absent -- a configuration defect, and exactly the kind
+        # this endpoint exists to name. It must arrive as a check, not as a 500
+        # from the health endpoint.
+        return {
+            "name": SERVING_DATABASE_CHECK,
+            "ok": False,
+            "detail": (f"the inference database path could not be resolved: "
+                       f"{type(exc).__name__}: {exc}"),
+        }
+
+    if not os.path.exists(resolved):
+        # AN ABSENT FILE IS ONLY ``ok`` IF ITS PARENT CAN HOLD IT. This branch
+        # said "the first write will create it" unconditionally in its first
+        # draft, which is the claim it cannot make from the file alone:
+        # sqlite3 creates a missing FILE and refuses a missing DIRECTORY, so an
+        # absent parent -- a container whose data volume failed to mount, a
+        # mistyped ONCOTRIAGE_INFERENCES_DB -- reported ready and then lost
+        # every row, which is the exact failure this probe exists to name.
+        _parent = os.path.dirname(resolved) or "."
+        if not os.path.isdir(_parent):
+            return {
+                "name": SERVING_DATABASE_CHECK,
+                "ok": False,
+                "detail": (f"{resolved} does not exist and its directory "
+                           f"{_parent} is not there either, so the first write "
+                           f"cannot create it. The usual causes are a data "
+                           f"volume that failed to mount and a mistyped "
+                           f"ONCOTRIAGE_INFERENCES_DB."),
+            }
+        if not os.access(_parent, os.W_OK):
+            return {
+                "name": SERVING_DATABASE_CHECK,
+                "ok": False,
+                "detail": (f"{resolved} does not exist and its directory "
+                           f"{_parent} is not writable by this process, so the "
+                           f"first write cannot create it."),
+            }
+        return {
+            "name": SERVING_DATABASE_CHECK,
+            "ok": True,
+            "detail": (f"{resolved} does not exist yet; the first write will "
+                       f"create it in {_parent} at schema era "
+                       f"{SCHEMA_USER_VERSION}."),
+        }
+
+    conn = None
+    try:
+        # read_only=True is a mode=ro URI, so nothing is created and nothing
+        # is written -- and it goes through _open_connection so this module's
+        # "every connection carries the busy timeout" invariant holds. A
+        # read-only connection can still answer both PRAGMAs.
+        conn = _open_connection(resolved, read_only=True)
+        assert_database_is_compatible(conn, resolved)
+    except IncompatibleDatabaseError as exc:
+        # THE MESSAGE IS CARRIED VERBATIM rather than summarised, on the
+        # precedent readiness.py already set for DegradedDependencyError: it
+        # already names the file, both eras and the archive command, and a
+        # second wording here is a second thing to keep in step.
+        return {"name": SERVING_DATABASE_CHECK, "ok": False, "detail": str(exc)}
+    except Exception as exc:
+        return {
+            "name": SERVING_DATABASE_CHECK,
+            "ok": False,
+            "detail": (f"{resolved} could not be opened read-only: "
+                       f"{type(exc).__name__}: {exc}. A database this process "
+                       f"cannot read is one it cannot write."),
+        }
+    else:
+        return {
+            "name": SERVING_DATABASE_CHECK,
+            "ok": True,
+            "detail": f"{resolved} is writable at schema era {SCHEMA_USER_VERSION}.",
+        }
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                # A close that fails leaks one descriptor and says nothing
+                # about readiness. Reporting NOT ready over it would make a
+                # healthy server unhealthy for a reason the operator cannot act
+                # on.
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -2419,7 +2584,7 @@ def _is_retryable(exc):
     return any(marker in message for marker in _RETRYABLE_MESSAGE_MARKERS)
 
 
-def _open_connection(db_path):
+def _open_connection(db_path, read_only=False):
     """``sqlite3.connect`` with this project's busy timeout applied.
 
     THE TIMEOUT IS PER CONNECTION, so it has to be set on every one of them --
@@ -2432,7 +2597,33 @@ def _open_connection(db_path):
     MILLISECONDS as an integer. Mixing those up gives a 30-millisecond timeout
     that looks like a 30-second one, so the config constant is in seconds and
     the conversion happens in exactly one place, below.
+
+    ``read_only=True`` OPENS THROUGH A ``mode=ro`` URI, and it exists so that
+    ``probe_serving_database`` can ask a question about a database without
+    being the reason it exists. A plain ``sqlite3.connect`` CREATES a missing
+    file, so a probe that used one would answer "this database is fine" by
+    bringing it into existence -- File 41's guard-that-creates-its-own-evidence
+    defect, and on a container whose data volume failed to mount it would
+    establish an empty database at the mount point.
+
+    IT IS A PARAMETER HERE RATHER THAN A SECOND ``sqlite3.connect`` AT THE
+    PROBE, and that is not tidiness: this module's invariant is that EVERY
+    connection it opens carries the busy timeout, and
+    ``tests/test_storage_write_durability.py`` section 3c enforces it by
+    requiring every ``sqlite3.connect`` in this file to be inside this
+    function. The first draft of the probe opened its own and 3c FAILED --
+    which is the check working. A read-only connection can still meet a locked
+    database, so it wants the timeout for the same reason every other one does.
+
+    THE URI FORM ESCAPES THE PATH. A path containing ``?`` or ``#`` would
+    otherwise be read as carrying URI query or fragment syntax, and this
+    project's own project root contains characters (``C.V..V``) that make that
+    worth doing properly rather than by f-string.
     """
+    if read_only:
+        return sqlite3.connect(
+            "file:" + urllib.parse.quote(db_path) + "?mode=ro",
+            uri=True, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)
     return sqlite3.connect(db_path, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)
 
 

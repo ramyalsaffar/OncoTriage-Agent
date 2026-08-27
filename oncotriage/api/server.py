@@ -84,6 +84,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from oncotriage import __version__
+from oncotriage import config as _config
 from oncotriage.agent.deps import get_qdrant_client
 from oncotriage.agent.graph import build_matching_graph, match_patient_to_trials
 from oncotriage.agent.readiness import (
@@ -98,18 +99,28 @@ from oncotriage.config import (
     CROSS_ENCODER_MODEL,
     EMBEDDING_MODEL,
     ENABLE_RATE_LIMITING,
+    MATCHING_CALL_MODE_GROUPED,
+    MATCHING_CALL_MODE_PER_TRIAL,
     MATCHING_MODEL,
+    MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS,
+    MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS,
     MAX_LLM_CLASSIFIER_RETRIES,
     MAX_TRIALS_FOR_EVALUATION,
     MEDCPT_SCORE_FLOOR,
+    OPENAI_SDK_MAX_RETRIES,
     Project_Name,
     QUALITY_THRESHOLD_PERCENTILE,
     RATE_LIMIT,
     TOP_K_CANDIDATES,
+    matching_call_mode,
+    matching_call_mode_pin,
     qdrant_endpoint_sources,
 )
 from oncotriage.fhir.parser import parse_fhir_bundle
-from oncotriage.storage.database_logger import log_inference
+from oncotriage.storage.database_logger import (
+    log_inference,
+    probe_serving_database,
+)
 from oncotriage.utils import deduplicate_by_display
 from oncotriage.observability import console, get_logger
 
@@ -161,7 +172,12 @@ async def lifespan(_app):
     # It is re-run per request by /health (see there), so populating the missing
     # dependency makes the stack go green on its own without a restart.
     console.out("[Startup] Checking serving readiness...")
-    report = serving_readiness()
+    # THE SAME COMPOSITION AS /health, and it has to be: a startup banner that
+    # probed two dependencies while /health probed three would print OK for a
+    # server /health is about to call unhealthy, and an operator reading the
+    # bring-up log would look for the third fault everywhere except the place
+    # the log told them was fine.
+    report = serving_readiness(extra_checks=[probe_serving_database()])
     for _check in report["checks"]:
         console.out(f"[Startup]   {'OK  ' if _check['ok'] else 'FAIL'} "
               f"{_check['name']}: {_check['detail']}")
@@ -459,7 +475,34 @@ def create_app():
         answer, because it was the field that reported true while the server was
         unusable.
         """
-        report = serving_readiness()
+        # THE THIRD CHECK IS THE INFERENCE DATABASE, and it closes a hole in
+        # which nothing anywhere reported a fault.
+        #
+        # MEASURED: point this server at a database written by a NEWER schema
+        # era and every POST /match runs the whole pipeline, makes its billed
+        # Stage 5 calls, returns HTTP 200 with a complete and correct body, and
+        # stores nothing. `assert_database_is_compatible` refuses the file
+        # correctly; `_write_inference_row`'s handler catches the refusal like
+        # any other logging fault -- which is right, a paid result must not be
+        # discarded over a write -- and hands back `ok=False`. Before this,
+        # /health probed the MeSH lookups and the index, knew nothing about the
+        # database, and stayed GREEN while the server billed for every request
+        # and kept no record of any of them.
+        #
+        # The same is true of a data volume that failed to mount and of a
+        # mistyped ONCOTRIAGE_INFERENCES_DB; the probe names all three.
+        #
+        # THE PROBE IS COMPOSED HERE RATHER THAN CALLED FROM INSIDE
+        # serving_readiness(), because `oncotriage/agent/retrieval.py` imports
+        # that module and a storage import inside it would put the storage
+        # layer into the AGENT's import graph -- the coupling pass 20c-2c moved
+        # `_resolve_primary_cancer` out of the storage layer to remove. This
+        # file already imports both.
+        #
+        # IT IS RE-PROBED PER REQUEST like the other two, so archiving the
+        # newer-era file makes the stack go green on its own with no restart.
+        # The cost is one PRAGMA read on a local file per probe interval.
+        report = serving_readiness(extra_checks=[probe_serving_database()])
         healthy = report["status"] == READY and graph is not None
 
         if not healthy:
@@ -631,7 +674,82 @@ def create_app():
                 "medcpt_score_floor": MEDCPT_SCORE_FLOOR,
                 "quality_threshold_percentile": QUALITY_THRESHOLD_PERCENTILE,
                 "max_trials_for_evaluation": MAX_TRIALS_FOR_EVALUATION,
-                "max_llm_classifier_retries": MAX_LLM_CLASSIFIER_RETRIES
+                "max_llm_classifier_retries": MAX_LLM_CLASSIFIER_RETRIES,
+                # ===========================================================
+                # WHICH STAGE 5 ARM, AND THE CONSTANTS THAT GOVERN IT
+                # ===========================================================
+                #
+                # THE SINGLE LARGEST LEVER ON WHAT A PATIENT COSTS WAS ABSENT
+                # FROM THE ONE ENDPOINT THAT DESCRIBES THE PIPELINE. Per-trial
+                # mode sends one billed request per patient-trial pair behind a
+                # cache warmup -- up to MAX_TRIALS_FOR_EVALUATION + 1 requests
+                # where grouped sends between one and
+                # MATCHING_MAX_INPUT_PACKED_CHUNKS -- and a program integrating
+                # against this server could read every other field here, and
+                # `max_trials_for_evaluation` beside it, without being able to
+                # tell which arm produces the numbers it is about to be billed
+                # for.
+                #
+                # A NESTED BLOCK, NOT FIVE FLAT KEYS, on `qdrant_endpoint`'s
+                # precedent one field up: three of these are meaningless in
+                # grouped mode, and flattened among the always-applicable
+                # tunables they would read as though they always applied.
+                #
+                # THE DEFAULT AND WHAT IS IN FORCE ARE BOTH REPORTED, AND THEY
+                # CAN DIFFER. `config.matching_call_mode()` resolves pin-then-
+                # constant, and a pin is process-global: fixture_capture.py and
+                # fixture_replay.py install one, and so does a test. A response
+                # reporting only the constant would describe a process that is
+                # doing something else, which is precisely the class of defect
+                # the `architecture` and stage-5 strings above were fixed for.
+                # `pin` is None in every ordinary serving process and names the
+                # override when there is one.
+                #
+                # DERIVED, NEVER RETYPED. `configured_default` is computed from
+                # MATCHING_PER_TRIAL_CALLS_ENABLED through the same two-member
+                # vocabulary `config.matching_call_mode()` uses, so this
+                # endpoint cannot disagree with what the pipeline does or with
+                # what `inferences.matching_call_mode` stores.
+                "call_mode": {
+                    # READ OFF THE MODULE AT CALL TIME, NOT THROUGH THE
+                    # FROM-IMPORT BINDING ABOVE. A `from X import NAME` binds
+                    # the VALUE at import, and `create_app()` runs at import --
+                    # so a process that later rebinds
+                    # `config.MATCHING_PER_TRIAL_CALLS_ENABLED` on the module
+                    # would get a response reporting a default that disagrees
+                    # with `in_force` below, with `pin` null and therefore
+                    # nothing to explain the disagreement. That is not
+                    # hypothetical: tests/test_agent_stage5_per_trial_calls.py
+                    # and tests/test_agent_per_trial_trial_cap.py both do it.
+                    #
+                    # It is the patch-point lesson this project has now paid
+                    # for twice -- the Bedrock pass's `matching_provider`
+                    # (a from-import that reached nothing when the flag moved)
+                    # and tests/test_agent_rrf_config_ownership.py's whole
+                    # subject. `matching_call_mode()` already resolves live, so
+                    # reading the default any other way is what lets the two
+                    # halves of one field disagree.
+                    "configured_default": (
+                        MATCHING_CALL_MODE_PER_TRIAL
+                        if _config.MATCHING_PER_TRIAL_CALLS_ENABLED
+                        else MATCHING_CALL_MODE_GROUPED),
+                    "in_force": matching_call_mode(),
+                    "pin": matching_call_mode_pin(),
+                    "per_trial_max_parallel_calls":
+                        MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS,
+                    "per_trial_warmup_max_output_tokens":
+                        MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS,
+                    # THERE IS NO DEDICATED WARMUP RETRY BUDGET AND THE FIELD
+                    # SAYS SO RATHER THAN BEING OMITTED. A reader looking for
+                    # one and not finding a key cannot tell "this endpoint does
+                    # not report it" from "there isn't one"; an explicit null
+                    # settles it. The warmup's coverage is the two budgets that
+                    # already exist: the SDK's transport retries below, and
+                    # `max_llm_classifier_retries` one level up, which re-enters
+                    # the whole node through route_after_llm_classifier.
+                    "per_trial_warmup_dedicated_retries": None,
+                    "per_trial_warmup_sdk_max_retries": OPENAI_SDK_MAX_RETRIES,
+                },
             },
             "trials_indexed": trials_indexed,
             "trials_indexed_note": trials_indexed_note,
