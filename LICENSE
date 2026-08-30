@@ -1,0 +1,104 @@
+OncoTriage Agent — Terms of Use
+
+Copyright (c) 2026 Ramy Alsaffar. All rights reserved.
+
+THIS IS NOT AN OPEN SOURCE LICENCE, and it is not an open source licence
+wearing another name. It confers none of the freedoms of the Open Source
+Definition, it is not approved by the Open Source Initiative, and it does not
+correspond to any identifier on the SPDX License List. It is a grant of
+permission to READ this repository, and a reservation of everything else.
+
+
+1. WHAT YOU MAY DO WITHOUT ASKING
+
+   1.1  You may view and read this repository and its contents — the source
+        code, the documentation, the configuration, and the data files.
+
+   1.2  You may clone or download the repository and keep a local copy for the
+        sole purpose of reading, studying, evaluating, or reviewing it. This
+        permission covers the copying that reading a git repository requires
+        and nothing beyond it.
+
+   1.3  You may quote short excerpts in commentary, review, teaching, or
+        academic discussion, and you may cite the work, provided the excerpt
+        or citation attributes the work to this repository and to the
+        copyright holder named above. CITATION.cff in this repository gives
+        the citation.
+
+
+2. WHAT REQUIRES PRIOR WRITTEN PERMISSION
+
+   Everything else. Without limiting the generality of that sentence, you may
+   not do any of the following without the prior written permission of the
+   copyright holder:
+
+   2.1  reproduce, publish, or distribute this work or any part of it, beyond
+        the local copy permitted by clause 1.2;
+
+   2.2  modify, adapt, port, translate, or create derivative works from it;
+
+   2.3  sublicense, sell, rent, lease, or otherwise transfer it, or offer it
+        as or within a hosted or managed service;
+
+   2.4  use it, or any part of it, in any product, service, dataset, model, or
+        research output, whether commercial or non-commercial, and whether or
+        not the result is distributed;
+
+   2.5  use it, or any part of it, to train, fine-tune, distil, evaluate, or
+        ground any machine learning model.
+
+   Prior written permission means an explicit written grant from the copyright
+   holder that names what is permitted. Silence is not permission. Nothing is
+   implied by this repository being publicly readable, and nothing is implied
+   by the absence of a technical measure preventing any of the above.
+
+   To request permission, open an issue on the repository named in
+   CITATION.cff, or contact the copyright holder through that repository.
+
+
+3. NO WARRANTY, AND NO CLINICAL USE
+
+   THIS WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE, ACCURACY, AND NONINFRINGEMENT. IN NO
+   EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR
+   OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE,
+   ARISING FROM, OUT OF, OR IN CONNECTION WITH THIS WORK OR ANY USE OR OTHER
+   DEALING IN IT.
+
+   In the words this project already uses for its own output:
+
+        NOT FOR CLINICAL USE — research demonstration on synthetic data;
+        unvalidated automated output, not medical advice.
+
+
+4. THIRD-PARTY COMPONENTS
+
+   4.1  This repository declares, but does not distribute, third-party
+        dependencies. Each is governed by its own licence, granted by its own
+        author, and nothing in this file grants or restricts any right in
+        them. The dependency list is in pyproject.toml.
+
+   4.2  The files under docker/mesh-core/ are derived from the National
+        Library of Medicine's MeSH descriptor data, which the NLM places in
+        the public domain. They are not covered by this file. Their provenance
+        is recorded in docker/mesh-core/PROVENANCE.md.
+
+   4.3  Where any third-party term conflicts with this file, the third-party
+        term governs that third-party component.
+
+
+5. TERM
+
+   Permission under clause 1 continues until the copyright holder withdraws
+   it, and ends automatically on any breach of clause 2. A grant made under
+   clause 2 is governed by its own terms and is not affected by this clause.
+
+
+6. RESERVATION
+
+   No right is granted by implication, estoppel, or otherwise. Any right not
+   expressly granted in clause 1 is reserved to the copyright holder.
+
+
+#------------------------------------------------------------------------------

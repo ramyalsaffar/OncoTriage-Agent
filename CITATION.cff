@@ -1,0 +1,47 @@
+# Citation metadata for OncoTriage Agent, in Citation File Format 1.2.0.
+# GitHub parses this file and renders the "Cite this repository" control from
+# it; a file that fails schema validation renders nothing at all and says
+# nothing about why, so validate after editing:
+#
+#     pip install cffconvert && cffconvert --validate -i CITATION.cff
+#
+# WHY THERE IS NO `license:` KEY. That key takes an SPDX identifier and only an
+# SPDX identifier -- the CFF 1.2.0 schema enumerates 459 of them and admits no
+# `LicenseRef-` form and no all-rights-reserved entry, so this project's terms
+# cannot be named there. `license-url` is the field the schema provides for
+# exactly that case ("only for non-standard licenses not included in the SPDX
+# License List") and it points at LICENSE, which is the authority.
+#
+# WHAT IS DELIBERATELY ABSENT, so nobody adds it back by guessing: there is no
+# `doi:` and no `preferred-citation:` because no DOI has been minted and no
+# paper exists; no `date-released:` because this version carries no release tag
+# to date; and no author `email:` or `orcid:` because no tracked file in this
+# repository records either, and a citation file is not the place to invent
+# one.
+
+cff-version: 1.2.0
+title: OncoTriage Agent
+message: >-
+  If you reference this software, please cite it as below. Reuse requires the
+  prior written permission of the copyright holder; see LICENSE.
+type: software
+authors:
+  - family-names: Alsaffar
+    given-names: Ramy
+version: "2.0.0"
+repository-code: "https://github.com/ramyalsaffar/03--Code"
+abstract: >-
+  OncoTriage Agent matches oncology patients, represented as Synthea FHIR
+  bundles, to recruiting ClinicalTrials.gov trials. It runs a six-stage
+  LangGraph pipeline over hybrid BM25 and dense-vector retrieval on Qdrant,
+  with a large language model performing criterion-level eligibility
+  evaluation. It is a research and engineering demonstration on synthetic
+  patient data and is not for clinical use.
+keywords:
+  - clinical trials
+  - oncology
+  - patient matching
+  - retrieval-augmented generation
+  - LangGraph
+  - FHIR
+license-url: "https://github.com/ramyalsaffar/03--Code/blob/main/LICENSE"
