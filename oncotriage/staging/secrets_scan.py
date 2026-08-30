@@ -162,11 +162,19 @@ _CONTENT_DETECTORS = (
 #       (`ci-placeholder-not-a-real-key`), with `ONCOTRIAGE_AIRFLOW_PASSWORD`
 #       at 27 and `ONCOTRIAGE_BEDROCK_API_KEY` at 26 behind it. Twelve
 #       distinct captures, none between 29 and the offender.
-#   56  `docker-compose.yml`'s hardcoded `AIRFLOW__WEBSERVER__SECRET_KEY`
-#       value: letters, underscores and hyphens, NO DIGIT, so the pre-cap
-#       exemption matched it exactly and the scanner called the file clean.
-#       That was measured, not predicted -- `scan_bytes` over the real file
-#       returned zero findings.
+#   56  the length of the value that FORCED this cap: `docker-compose.yml`'s
+#       hardcoded `AIRFLOW__WEBSERVER__SECRET_KEY`, letters, underscores and
+#       hyphens, NO DIGIT, so the pre-cap exemption matched it exactly and the
+#       scanner called the file clean. That was measured, not predicted --
+#       `scan_bytes` over the real file returned zero findings.
+#
+#       THAT LITERAL IS GONE. The compose file sources both Airflow secrets
+#       from the environment now (`${...:?}`), so `scan_bytes` over it returns
+#       zero findings again -- for the opposite reason, and this window is
+#       still the one that was measured. The 56 is kept as the provenance of
+#       the ceiling, not as a claim about the tree today: the number that set
+#       this bound has to survive the defect being fixed, or the next reader
+#       has an unexplained constant.
 #
 # So the safe window is [44, 55] and this constant sits inside it with five
 # characters of headroom over the longest name the project writes and eight
@@ -210,12 +218,18 @@ def _is_program_identifier(value):
     argued. This function's first version accepted a false negative it
     described as "about a 3% chance" for a 20-character base62 token -- true of
     a 20-character token and false as a general claim, because that probability
-    is (52/62)^L and it is a statement about LENGTH. The tree contains the
-    counterexample: `docker-compose.yml` sets `AIRFLOW__WEBSERVER__SECRET_KEY`
+    is (52/62)^L and it is a statement about LENGTH. The tree contained the
+    counterexample: `docker-compose.yml` SET `AIRFLOW__WEBSERVER__SECRET_KEY`
     to a 56-character literal of letters, underscores and hyphens with no
     digit. The detector matched it, this function exempted it, and
     ``scan_bytes`` over the real file returned zero findings -- a hardcoded
     signing key in a file the scanner called clean.
+
+    PAST TENSE ON PURPOSE. That literal was removed once this cap made it
+    visible; the compose file interpolates both Airflow secrets from the
+    environment now. The counterexample is what the bound was measured
+    against, and it stays written down here for that reason -- a bound whose
+    reason has been deleted is a bound the next pass widens back.
 
     WHAT THE BOUND COSTS AND BUYS. The exemption still admits a digitless token
     at the cap, where (52/62)^L has fallen from 3% at twenty characters to

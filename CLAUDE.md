@@ -382,8 +382,17 @@ python "09- MeSH Cancer Site Relevance Filter.py"    # rebuild the MeSH C04 + UM
 python "13- LangGraph Agent.py"                      # no-op unless RUN_TEST_ON_EXECUTE = True; COSTS MONEY
 
 # Docker (all six services)
+# TWO VARIABLES MUST BE SET FIRST OR EVERY COMPOSE SUBCOMMAND EXITS 1 NAMING
+# THEM -- ONCOTRIAGE_AIRFLOW_SECRET_KEY and ONCOTRIAGE_AIRFLOW_FERNET_KEY. Put
+# them in "03- Code/.env" (which is what compose reads for ${...}; it does NOT
+# read "../05- Keys/.env"), or export them, or pass --env-file. The three
+# routes and their costs are argued at x-airflow-environment in
+# docker-compose.yml. `down` and `logs` need them too, not just `up`.
 make up                                              # build + up -d; `make build` alone builds
 docker compose logs -f fastapi
+# The Airflow login is user `admin` with a GENERATED 16-character password, not
+# `admin`/`admin` -- that pair never worked:
+docker compose exec airflow-webserver cat /app/airflow_home/simple_auth_manager_passwords.json.generated
 # A clean `docker compose down -v` + `up` leaves the API deliberately UNHEALTHY:
 # its Qdrant volume is gone and an empty index raises rather than answering.
 # The MeSH lookups need no manual copy. See "DOCKER CLEAN BRING-UP.md" §5.
@@ -9466,6 +9475,16 @@ detector -- now refuses to exempt any capture longer than
 `_IDENTIFIER_EXEMPTION_MAX_LENGTH`, whatever its shape.** No other detector, no
 other file. `docker-compose.yml` is deliberately NOT fixed here.
 
+> **CURRENT STATE, 2026-08-30 — the last sentence describes the tree as this
+> pass left it and is kept as written.** `docker-compose.yml` HAS since been
+> fixed: both Airflow secrets are interpolated from the environment with
+> `${...:?}`, `scan_bytes` over that file returns `[]` again, and
+> `python s3_stage.py` reports **1** finding rather than 2. The BEFORE/AFTER
+> table below, and the two `[]` rows for the Fernet key and the user list,
+> stay as measured on that date. See "The compose file holds no secret (the
+> compose-secrets pass)" below for what replaced them, and for why the
+> `SIMPLE_AUTH_MANAGER_USERS` row was never a credential in the first place.
+
 **THE DEFECT WAS CERTAIN, NOT PROBABILISTIC, AND THE OLD DOCSTRING SAID
 OTHERWISE.** That function exempted anything matching `[A-Za-z_][A-Za-z_\-]*`
 with no digit, and accepted the residual as "about a 3% chance" for a
@@ -9676,6 +9695,189 @@ The scan walks to any depth now, and its negative control plants a
 package *three* deep — because a control planted at the top level
 would have fired against the old scan too and proved nothing about
 what changed.
+
+### The compose file holds no secret (the compose-secrets pass)
+
+**`docker-compose.yml` WAS THE LAST BLOCKER TO THIS REPOSITORY GOING PUBLIC,
+AND ONE OF THE THREE VALUES IT WAS BLOCKED ON WAS NEVER A CREDENTIAL.** The
+identifier-cap pass made the file's hardcoded Airflow signing key visible to
+this project's own secrets scanner and deliberately left it standing; this pass
+removes it. **`python s3_stage.py` goes from 2 findings to 1**, the survivor
+being `tests/test_tracking_mlflow_index.py`'s synthetic `_SENTINEL`, which is
+pre-existing and untouched. `scan_bytes(docker-compose.yml)` returns `[]`, for
+the opposite reason it used to.
+
+**WHAT THE THREE VALUES ACTUALLY WERE, measured against Airflow 3.3.0 rather
+than read off the comment above them.**
+
+| the line | what the file said it was | what it is |
+|---|---|---|
+| `AIRFLOW__WEBSERVER__SECRET_KEY` -- a 56-character literal of letters, underscores and hyphens, no digit, ending in the words "change in production" | "a literal secret key" | correct, **and the variable name was deprecated**: Airflow 3.3.0 has no `[webserver]` section. It still reached `[api] secret_key` through deprecated-option forwarding, warning on every start |
+| `AIRFLOW__CORE__FERNET_KEY: ""` | "an empty Fernet key" | correct, **and worse than unconfigured**: `airflow db migrate` GENERATES a key into `{AIRFLOW_HOME}/airflow.cfg` when none is set, and an environment variable beats airflow.cfg -- so the empty string was switching OFF encryption Airflow had already configured for itself |
+| `AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: admin:admin` | "a hardcoded admin password" | **wrong. It is a `username:ROLE` list**, it is byte-identical to Airflow's own default, and it contains no password |
+
+**THE VALUE IS DESCRIBED AND NOT QUOTED, AND THAT IS THIS PASS'S OWN FIRST
+DEFECT -- TWICE.** The first draft reproduced the 56-character literal verbatim
+in TWO places: the table above, and the compose file's own comment explaining
+the removal. That is not removing a secret, it is moving it. **Only one of the
+two was caught by the scanner**, and the difference is punctuation rather than
+design: in CLAUDE.md the literal sat inside a markdown table cell that put a
+`:` between the keyword and the value, matching `credential_assignment`; in the
+compose comment the next character after `secret` was `_`, so the detector
+never fired. A whole-tracked-tree sweep reported `CLAUDE.md /
+credential_assignment` and said nothing about `docker-compose.yml`. **The
+second occurrence was found by grepping for the literal, not by the scanner** --
+so a clean scan is not the same as a clean tree, and the check that closed it
+is `git grep` for the value returning nothing.
+`oncotriage/staging/secrets_scan.py` and `tests/test_staging_exclusions.py` had
+already settled on describing the value rather than reproducing it; both new
+sites now match them, and no tracked file contains it.
+
+**AND THE LITERAL IS STILL IN GIT HISTORY.** Removing it from HEAD does not
+remove it from any commit that carried it, so the value must be treated as
+compromised and never reused -- which is what it always was, since the repo is
+about to be public. Nothing here rewrites history; that is a separate decision
+with its own blast radius.
+
+**THE HEADER'S OWN CORRECTION WAS THE DEFECT.** It read
+`Airflow: http://localhost:8080 (admin / admin)` above a note explaining that
+the original wording ("admin / check api-server logs for password")
+"contradicted the file itself ... so the api-server generates no password and
+there is nothing in its log to look for". **Both halves are false, and the
+ORIGINAL was right.** `SimpleAuthManager.init()` writes a random 16-character
+password per user into
+`{AIRFLOW_HOME}/simple_auth_manager_passwords.json.generated` and prints it once
+-- driven directly with exactly this configuration, and confirmed on the
+project's own pre-existing `airflow-db` volume, which has carried that file
+since 2026-08-07. **The decisive measurement is the negative control**: against
+the running stack, `POST /auth/token` with the generated password returns
+**201**, and with `admin`/`admin` returns **401**. The pair the header
+advertised has never worked.
+
+**SO THE USER LIST STAYS A LITERAL, AND `airflow_manager`'s TIER 4 NEEDED
+NOTHING.** `oncotriage/orchestration/airflow_manager.py` reads that generated
+file as the fourth of its four password tiers; driven against the live
+container, `_get_password(airflow_home=...)` reports `password-file`, the
+password authenticates (201), and `check_dag_status` lists
+`trial_refresh_weekly` and its three tasks. The line is KEPT rather than
+deleted -- deleting it changes nothing today, and written down it stops an
+upstream change to Airflow's default silently changing who can log in.
+
+**`${VAR:?message}`, AND THE COLON IS THE MECHANISM.** Compose's behaviour for
+an unset variable with no default is to WARN and substitute the empty string,
+exit 0 -- the silent-weak-value case. Four forms, measured against Compose
+v5.4.0:
+
+| form | state | result |
+|---|---|---|
+| `${VAR}` | unset | warning, substitutes `""`, **exit 0** |
+| `${VAR?msg}` | empty | substitutes `""`, **exit 0** |
+| `${VAR:?msg}` | unset | error naming VAR and msg, **exit 1** |
+| `${VAR:?msg}` | empty | error naming VAR and msg, **exit 1** |
+
+The `?` form without the colon treats an empty value as supplied, and empty is
+exactly the weak default being removed, so only `:?` will do. Driven as a real
+`docker compose up -d` with both unset: **exit 1, eight error lines naming both
+variables, and ZERO containers created.**
+
+**THE FILE COMPOSE READS IS NOT THE FILE THE APPLICATION READS, AND THIS WAS
+PROVED RATHER THAN ASSUMED.** This project bind-mounts `../05- Keys/.env` to
+`/app/.env` and `paths.load_env_keys()` opens it at runtime. **Compose never
+touches it.** Compose interpolates `${...}` from its own environment plus a
+`.env` in the PROJECT DIRECTORY -- `03- Code/.env`, beside the compose file.
+Measured in a fabricated layout carrying both files: a variable defined only in
+`../05- Keys/.env` interpolates to nothing, one in `03- Code/.env`
+interpolates, and a shell export beats the file. Conflating the two is the trap
+this item exists around.
+
+**THREE ROUTES FOR AN OPERATOR, AND THE THIRD EXISTS BECAUSE OF `s3_stage.py`.**
+`03- Code/.env` is persistent and costs a staging refusal -- **measured, 1
+finding becomes 3** (the `dotenv_file` filename detector and a content hit), and
+the exclusion manifest is not this pass's to edit. A shell export costs nothing
+on disk and must be repeated per shell, **including for `docker compose down`**
+-- interpolation runs for every subcommand, so a stack started from a shell that
+had the variables cannot be stopped from one that does not.
+`--env-file "../05- Keys/airflow-compose.env"` is persistent AND outside the
+staged tree, because `05- Keys/` is already excluded; it costs the flag on every
+command. A symlink from `03- Code/.env` into `05- Keys/` does **not** buy the
+third: the walk still meets a readable file at that path.
+
+**AND THERE IS DELIBERATELY NO `.env.example`.** It was written, and then
+deleted: `scan_filename(".env.example")` returns `['dotenv_file']`, so a tracked
+template adds a permanent third finding that only a manifest entry could clear
+-- and a name chosen to slip past that detector would be a dotenv template
+disguised from this project's own scanner. The compose file carries the
+instructions instead.
+
+**INTRODUCING A FERNET KEY BREAKS NO EXISTING DATA, AND THE HAZARD IS ROTATION
+-- WHOSE FAILURE MODE IS SILENT.** `is_encrypted` is a per-ROW column, so a row
+written under `_NullFernet` carries `is_encrypted = 0` and `get_password()`
+returns it verbatim without consulting any key. Driven end to end against a real
+Airflow 3.3.0 sqlite metadata database:
+
+| step | result |
+|---|---|
+| store a connection under `FERNET_KEY=""` | `password` column plaintext, `is_encrypted` 0 |
+| read it back under a NEW real key | **reads fine**, still plaintext, still 0 |
+| add a connection under that key | `gAAAAAB...`, `is_encrypted` 1 |
+| read THAT one under a DIFFERENT key | **"Connection not found."** -- an absence, not a decryption error |
+
+**Nothing had to be migrated**: the project's generated DAG defines no
+Connection and no Variable, and the live `airflow-db` volume was inspected and
+holds **0 connections, 0 variables, 0 encrypted rows**. That stops being true
+the first time somebody adds one, which is why the compose comment says to keep
+the key.
+
+**THE SIGNING KEY IS REQUIRED RATHER THAN OMITTED, and that was measured too.**
+Airflow's default for `[api] secret_key` is the template `{SECRET_KEY}`, which
+resolves to `b64encode(os.urandom(16))` -- **a new random value per process**;
+two invocations against one AIRFLOW_HOME with no `airflow.cfg` produced two
+different keys. It is persisted once `airflow db migrate` has written a cfg, so
+the container would in practice get a stable key out of the volume -- but one
+that dies with `down -v`, is shared with nobody and cannot be rotated. The
+variable is renamed to `AIRFLOW__API__SECRET_KEY` in the same edit; measured
+inside the running container, `[api] secret_key` carries the supplied value,
+`AIRFLOW__WEBSERVER__SECRET_KEY` is absent from the environment, and the
+api-server log carries **zero** "has been moved to" lines.
+
+**VERIFIED BY RUNNING.** A real `make up` from the existing volumes: **all six
+services healthy** (`qdrant`, `fastapi`, `streamlit`, `airflow-webserver`,
+`airflow-dag-processor`, `airflow-scheduler`), `GET /health` 200, `/docs` 200,
+`:8501` 200, `:6333/healthz` 200, and Airflow's own `/api/v2/monitor/health`
+reporting metadatabase, scheduler and dag_processor all healthy. Inside the
+container `get_fernet().is_encrypted` is **True** for the first time. Neither
+compose variable name appears anywhere under `/app`, and `/app/.env` is still
+the `05- Keys` bind mount -- nothing was baked into the image, which
+`.dockerignore` already guaranteed with `.env` and `.env.*`.
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **`03- Code/.env` is not in the exclusion manifest**, so an operator using
+   route (a) meets a staging refusal naming their own file. The manifest was
+   out of scope for this pass. It is the top follow-up: one `excluded` entry
+   for `03- Code/.env` with the reason, which is strictly safer than an
+   allowlist row because a `.env` should never upload whatever its contents.
+2. **No test pins any of this.** The compose file's secret-freedom is asserted
+   by nothing -- `tests/test_staging_exclusions.py` deliberately does not read
+   the real file, and its 4j block was written that way precisely so it would
+   not go red on this fix. A check that `scan_bytes(docker-compose.yml) == []`
+   and that both Airflow secrets are `${...:?}`-shaped is cheap and belongs in
+   `tests/test_docker_qdrant_override_and_readiness.py`, which already parses
+   the compose file.
+3. **`AIRFLOW__CORE__EXECUTOR: SequentialExecutor` is silently overridden.**
+   Airflow 3.3.0 emits `FutureWarning: The 'executor' setting in [core] has the
+   old default value of 'SequentialExecutor'. This value has been changed to
+   'LocalExecutor' in the running config` -- observed in the running container.
+   The compose file configures one executor and the stack runs another. Found
+   while measuring this item; not this item's to fix.
+4. **`oncotriage/orchestration/airflow_setup.py` writes
+   `simple_auth_manager_users` into a `[simple_auth_manager]` section**, and in
+   Airflow 3 the option lives in `[core]`. It is a user:role list rather than a
+   credential, so it is not a secrets defect, but it is a setting that reaches
+   nothing. Local (non-container) path only.
+5. **`docker compose config` prints the resolved secret**, as it printed the
+   hardcoded one before. Inherent to compose; worth knowing before pasting that
+   output anywhere.
 
 ### Every counter has a production reader (the counter-reader pass)
 

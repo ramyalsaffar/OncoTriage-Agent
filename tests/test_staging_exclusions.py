@@ -463,17 +463,21 @@ check("4j the noise case is the one that matters: a predicate written as "
 
 # ---- the exemption is BOUNDED BY LENGTH ---------------------------------
 # The exemption used to be unbounded, and this project's own
-# `docker-compose.yml` is the counterexample: `AIRFLOW__WEBSERVER__SECRET_KEY`
-# is set to a 56-character literal of letters, underscores and hyphens with no
+# `docker-compose.yml` WAS the counterexample: `AIRFLOW__WEBSERVER__SECRET_KEY`
+# was set to a 56-character literal of letters, underscores and hyphens with no
 # digit, so the detector matched it, the validator exempted it, and
 # `scan_bytes` over the real file returned ZERO findings. A hardcoded signing
 # key in a file the scanner called clean.
 #
-# THE REAL FILE IS DELIBERATELY NOT ASSERTED ON HERE. It is a known defect
-# scheduled to be fixed, and a check reading "the shipped compose file has
-# exactly one finding" would go red on the day somebody fixes it -- a test that
-# fails on the change it exists to protect. What is pinned instead is the
-# PREDICATE and the window its constant sits in, which stay true afterwards.
+# THE REAL FILE IS DELIBERATELY NOT ASSERTED ON HERE, AND THAT DECISION PAID.
+# When this section was written the compose file was a known defect scheduled
+# to be fixed, and a check reading "the shipped compose file has exactly one
+# finding" would have gone red on the day somebody fixed it -- a test that
+# fails on the change it exists to protect. Somebody did fix it: both Airflow
+# secrets are interpolated from the environment now and `scan_bytes` over that
+# file returns nothing again. Not one check below moved. What is pinned is the
+# PREDICATE and the window its constant sits in, and 56 survives here as the
+# provenance of the ceiling rather than as a claim about the tree today.
 _CAP = getattr(_scan, "_IDENTIFIER_EXEMPTION_MAX_LENGTH", None)
 check("4j-a the exemption carries a length cap (if this fails, every check below "
       "is measuring an unbounded exemption)", _CAP is not None, True)
@@ -534,7 +538,7 @@ check("4j-f the cap sits inside the measured window [44, 55]: 44 clears the "
 _LONG_SECRET_LINE = (_shape(b"AIRFLOW__WEBSERVER__SECRET", b"_KEY: ")
                      + _identifier_of_length(56))
 check("4j-g END TO END: a 56-character digitless value assigned to a SECRET_KEY "
-      "is REPORTED -- this is docker-compose.yml's exact shape, and before the "
+      "is REPORTED -- this was docker-compose.yml's exact shape, and before the "
       "cap the scanner returned nothing for it",
       sorted({h[0] for h in _scan.scan_bytes(_LONG_SECRET_LINE)}),
       ["credential_assignment"])
