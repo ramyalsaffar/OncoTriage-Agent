@@ -461,6 +461,89 @@ check("4j the noise case is the one that matters: a predicate written as "
       "unrecognisable blob through",
       _scan._is_program_identifier(b"+++===///"), False)
 
+# ---- the exemption is BOUNDED BY LENGTH ---------------------------------
+# The exemption used to be unbounded, and this project's own
+# `docker-compose.yml` is the counterexample: `AIRFLOW__WEBSERVER__SECRET_KEY`
+# is set to a 56-character literal of letters, underscores and hyphens with no
+# digit, so the detector matched it, the validator exempted it, and
+# `scan_bytes` over the real file returned ZERO findings. A hardcoded signing
+# key in a file the scanner called clean.
+#
+# THE REAL FILE IS DELIBERATELY NOT ASSERTED ON HERE. It is a known defect
+# scheduled to be fixed, and a check reading "the shipped compose file has
+# exactly one finding" would go red on the day somebody fixes it -- a test that
+# fails on the change it exists to protect. What is pinned instead is the
+# PREDICATE and the window its constant sits in, which stay true afterwards.
+_CAP = getattr(_scan, "_IDENTIFIER_EXEMPTION_MAX_LENGTH", None)
+check("4j-a the exemption carries a length cap (if this fails, every check below "
+      "is measuring an unbounded exemption)", _CAP is not None, True)
+
+# THE FALLBACK IS 56 -- THE OFFENDER'S LENGTH -- AND NOT 0. With the constant
+# deleted the boundary checks below still have to say something TRUE: at a
+# fallback of 0 they end up asking whether a ONE-CHARACTER value is exempt,
+# which fails for a reason that has nothing to do with the cap while the label
+# claims otherwise. Measured, not reasoned: the first version used `_CAP or 0`
+# and the revert harness reported 4j-e firing on `b"p"`. At 56 the same revert
+# fires 4j-e on a 57-character value, which is what the label says it tests.
+_CAP_OR_OFFENDER = _CAP if _CAP is not None else 56
+
+
+def _identifier_of_length(n):
+    """A digitless, identifier-shaped byte string of exactly ``n`` characters.
+
+    Derived from the cap rather than typed, so the boundary cases below move
+    with the constant instead of rotting against it. The stem carries no digit
+    and no detector keyword, so the fragments are inert in this source.
+    """
+    stem = b"placeholder_configuration_value_for_the_signing_"
+    return (stem * (n // len(stem) + 1))[:n]
+
+
+# THE FLOOR. Two values, and the second is the one that actually binds.
+check("4j-b the longest value this detector has ever CAPTURED in this tree "
+      "(29 chars) is still exempt -- FIRES IF THE CAP IS LOWERED PAST IT",
+      _scan._is_program_identifier(b"ci-placeholder-not-a-real-key"), True)
+
+_LONGEST_NAME = "MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS"   # 43 chars
+check("4j-b-i non-degeneracy: that 43-character name is still a real constant of "
+      "this project, so the floor it sets has not rotted away",
+      hasattr(_config, _LONGEST_NAME), True)
+check("4j-c ...and the longest DIGITLESS IDENTIFIER in the whole tree (43 chars, "
+      "zero identifiers reach 44) is still exempt. This is the binding floor: "
+      "a cap of 40 would pass 4j-b and fail here, and six identifiers in this "
+      "tree are 41 characters or longer",
+      _scan._is_program_identifier(_LONGEST_NAME.encode()), True)
+
+# THE CEILING, and the control that fires if the cap is removed outright.
+check("4j-d a capture exactly AT the cap is still exempt",
+      _scan._is_program_identifier(
+          _identifier_of_length(_CAP_OR_OFFENDER)), True)
+check("4j-e ...and one character OVER it is NOT, whatever its shape -- FIRES IF "
+      "THE CAP IS REMOVED",
+      _scan._is_program_identifier(
+          _identifier_of_length(_CAP_OR_OFFENDER + 1)), False)
+
+check("4j-f the cap sits inside the measured window [44, 55]: 44 clears the "
+      "longest digitless identifier in the tree (43) and 55 is the last value "
+      "that still reports the 56-character offender",
+      44 <= (_CAP if _CAP is not None else -1) <= 55, True)
+
+# END TO END, through the detector rather than the validator. Split at a point
+# inside the detector's own keyword so neither fragment matches in this source
+# -- the same technique _SHAPES uses, and 4b-control is what proves it worked.
+_LONG_SECRET_LINE = (_shape(b"AIRFLOW__WEBSERVER__SECRET", b"_KEY: ")
+                     + _identifier_of_length(56))
+check("4j-g END TO END: a 56-character digitless value assigned to a SECRET_KEY "
+      "is REPORTED -- this is docker-compose.yml's exact shape, and before the "
+      "cap the scanner returned nothing for it",
+      sorted({h[0] for h in _scan.scan_bytes(_LONG_SECRET_LINE)}),
+      ["credential_assignment"])
+_NAME_SECRET_LINE = (_shape(b"AIRFLOW__WEBSERVER__SECRET", b"_KEY: ")
+                     + b"get_openai_api_key")
+check("...while the same assignment carrying a program NAME is still silent, "
+      "which is what stops this becoming a cap that reports everything",
+      _scan.scan_bytes(_NAME_SECRET_LINE), [])
+
 # ---- findings carry no secret material ----------------------------------
 _leak_dir = os.path.join(_TMP, "leak")
 os.makedirs(_leak_dir, exist_ok=True)

@@ -145,6 +145,43 @@ _CONTENT_DETECTORS = (
 )
 
 
+# The length above which the identifier exemption below STOPS APPLYING. See
+# ``_is_program_identifier``; the constant is here rather than inside it so the
+# bound is visible beside the detector table it moderates.
+#
+# MEASURED ACROSS THIS REPOSITORY, NOT CHOSEN. Three numbers set it, and the
+# window between the first two is where it sits:
+#
+#   43  the longest DIGITLESS identifier anywhere in the tree
+#       (`MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS`, and
+#       `MATCHING_PER_TRIAL_PROMPT_CACHE_KEY_ENABLED` beside it). Zero
+#       identifiers reach 44. The exemption must clear this or it starts
+#       reporting the project's own constant names as credentials.
+#   29  the longest value the detector has ever actually CAPTURED and this
+#       function has exempted, over all 285 files
+#       (`ci-placeholder-not-a-real-key`), with `ONCOTRIAGE_AIRFLOW_PASSWORD`
+#       at 27 and `ONCOTRIAGE_BEDROCK_API_KEY` at 26 behind it. Twelve
+#       distinct captures, none between 29 and the offender.
+#   56  `docker-compose.yml`'s hardcoded `AIRFLOW__WEBSERVER__SECRET_KEY`
+#       value: letters, underscores and hyphens, NO DIGIT, so the pre-cap
+#       exemption matched it exactly and the scanner called the file clean.
+#       That was measured, not predicted -- `scan_bytes` over the real file
+#       returned zero findings.
+#
+# So the safe window is [44, 55] and this constant sits inside it with five
+# characters of headroom over the longest name the project writes and eight
+# below the offender. 40 -- the obvious round number -- would have been WRONG:
+# six digitless identifiers in this tree are 41 characters or longer.
+#
+# WHICH WAY TO ERR, argued rather than assumed. A cap set too LOW reports a
+# real identifier: the staging run refuses, an operator adds one allowlist row,
+# and nothing leaves the machine. A cap set too HIGH exempts a real credential
+# and it uploads. The two costs are not comparable, so the constant sits as
+# close to its measured floor as the headroom argument allows rather than being
+# centred in the window.
+_IDENTIFIER_EXEMPTION_MAX_LENGTH = 48
+
+
 def _is_program_identifier(value):
     """True when a captured value is a NAME rather than a secret.
 
@@ -164,15 +201,39 @@ def _is_program_identifier(value):
     "letters, underscores and hyphens only, no digit anywhere" describes every
     identifier a programmer writes and no token any provider issues.
 
-    THE FALSE-NEGATIVE THIS BUYS, stated rather than hidden: a real credential
-    that happens to contain no digit at all now passes this detector. For a
-    20-character base62 token that is about a 3% chance. It is acceptable here
-    and only here, because this is the LAST and lowest-precision of nine
-    detectors -- the eight above it match on issued prefixes (sk-, eyJ, AKIA,
-    ghp_, xox, AIza, hf_, PEM) and none of them consults this function. This
-    detector exists to catch a provider nobody has heard of, and it still does
-    so for any token carrying a digit.
+    THE RULE IS BOUNDED BY LENGTH, and it did not used to be. A capture longer
+    than ``_IDENTIFIER_EXEMPTION_MAX_LENGTH`` is never exempt, whatever its
+    shape. Everything at or below it is judged on character class exactly as
+    before.
+
+    WHY THE UNBOUNDED FORM WAS WRONG, measured in this repository rather than
+    argued. This function's first version accepted a false negative it
+    described as "about a 3% chance" for a 20-character base62 token -- true of
+    a 20-character token and false as a general claim, because that probability
+    is (52/62)^L and it is a statement about LENGTH. The tree contains the
+    counterexample: `docker-compose.yml` sets `AIRFLOW__WEBSERVER__SECRET_KEY`
+    to a 56-character literal of letters, underscores and hyphens with no
+    digit. The detector matched it, this function exempted it, and
+    ``scan_bytes`` over the real file returned zero findings -- a hardcoded
+    signing key in a file the scanner called clean.
+
+    WHAT THE BOUND COSTS AND BUYS. The exemption still admits a digitless token
+    at the cap, where (52/62)^L has fallen from 3% at twenty characters to
+    about 0.02%; above the cap it admits none at all. The bound is not what
+    makes this detector safe -- it is the LAST and lowest-precision of nine,
+    and the eight above it match on issued prefixes (sk-, eyJ, AKIA, ghp_, xox,
+    AIza, hf_, PEM) and none of them consults this function. What the bound
+    does is stop the exemption growing without limit into exactly the region
+    where a name stops being plausible and a secret starts.
     """
+    # THE LENGTH TEST COMES FIRST, and it is a separate statement rather than a
+    # clause of the return so that a reader sees TWO independent reasons a
+    # value can fail to be exempt. It is also the cheap one -- it rejects
+    # without running a regex over a long capture -- and it is the one that is
+    # true regardless of shape, which is the whole point: above the cap there
+    # is no shape that earns an exemption.
+    if len(value) > _IDENTIFIER_EXEMPTION_MAX_LENGTH:
+        return False
     # THE LEADING UNDERSCORE IS LOAD-BEARING and the first draft of this line
     # omitted it, so `_password_from_stdin` -- a private helper in
     # "24- Airflow Manager.py", and about as clearly a name as anything gets --

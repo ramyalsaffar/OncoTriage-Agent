@@ -9405,9 +9405,11 @@ a check satisfied by the wrong evidence, which fails to fail. **17 → 30 checks
 python tests/test_settings_region_overrides.py                      #  59
 ```
 
-`tests/test_staging_exclusions.py` is **139** (was 117; section 6 gained the
-`S3_PRICING` shape, the report's date line, the undated degradation, the region
-heading and the two machine-readable region fields, each with its own control),
+`tests/test_staging_exclusions.py` is **148** (was 139; the identifier-cap pass
+added section 4j-a..4j-g -- see "The identifier exemption is bounded by length"
+below. Before that 117; section 6 gained the `S3_PRICING` shape, the report's
+date line, the undated degradation, the region heading and the two
+machine-readable region fields, each with its own control),
 `tests/test_compose_shutdown_grace.py` is **30** (was 17), and
 `tests/test_agent_bedrock_adapter.py` is **278** (was 275).
 
@@ -9455,6 +9457,116 @@ oncotriage.staging.manifest` would have failed there while parsing cleanly on
 the 3.13 development interpreter. All four touched modules were re-scanned by
 AST for that construct afterwards and none remains.
 
+
+### The identifier exemption is bounded by length (the identifier-cap pass)
+
+**ONE PREDICATE CHANGED. `oncotriage/staging/secrets_scan.py`'s
+`_is_program_identifier` -- the value validator for the `credential_assignment`
+detector -- now refuses to exempt any capture longer than
+`_IDENTIFIER_EXEMPTION_MAX_LENGTH`, whatever its shape.** No other detector, no
+other file. `docker-compose.yml` is deliberately NOT fixed here.
+
+**THE DEFECT WAS CERTAIN, NOT PROBABILISTIC, AND THE OLD DOCSTRING SAID
+OTHERWISE.** That function exempted anything matching `[A-Za-z_][A-Za-z_\-]*`
+with no digit, and accepted the residual as "about a 3% chance" for a
+20-character base62 token. The figure is right for twenty characters and wrong
+as a general claim, because it is `(52/62)^L` -- a statement about LENGTH.
+`docker-compose.yml` sets `AIRFLOW__WEBSERVER__SECRET_KEY` to a **56-character**
+literal of letters, underscores and hyphens with **no digit**, so the detector
+matched, the validator exempted, and **`scan_bytes` over the real file returned
+zero findings**. Measured before anything was edited, and again after.
+
+| | BEFORE | AFTER |
+|---|---|---|
+| `scan_bytes(docker-compose.yml)` | `[]` | `credential_assignment`, byte 17072, 68 chars, line 299 |
+| the four calibration identifiers | all exempt | **all still exempt** |
+| `AIRFLOW__CORE__FERNET_KEY: ""` | `[]` | `[]` |
+| `SIMPLE_AUTH_MANAGER_USERS: admin:admin` | `[]` | `[]` |
+| `scan_filename("docker-compose.yml")` | `[]` | `[]` |
+
+**THE CONSTANT IS 48 AND THE WINDOW IS [44, 55], NOT (29, 56] -- and the
+difference is the whole point of measuring rather than choosing.** The brief for
+this pass proposed the window `(29, 56]` from the four false positives the
+docstring names (18, 20, 26, 29 characters). Two measurements over the real tree
+moved the floor:
+
+* **the actual capture population is twelve, not four.** Running the detector
+  over all 285 files and asking which captures the validator exempts gives
+  twelve distinct values -- `ONCOTRIAGE_AIRFLOW_PASSWORD` (27),
+  `ONCOTRIAGE_QDRANT_API_KEY` (25), `resolve_api_key`, `_get_password` and the
+  rest -- topping out at **29** (`ci-placeholder-not-a-real-key`), plus the
+  56-character offender and nothing in between;
+* **the longest DIGITLESS IDENTIFIER in the repository is 43**
+  (`MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS`, with
+  `MATCHING_PER_TRIAL_PROMPT_CACHE_KEY_ENABLED` beside it), and **six are 41 or
+  longer**. Zero reach 44. Those names are not captures today, but a cap below
+  them is a cap that reports this project's own constants the first time one
+  lands next to a credential keyword.
+
+**So 40 -- the obvious round number, and the one the brief's window admits --
+would have been WRONG**, and the standing suite now fails on it: `4j-c` and
+`4j-f` both fire at 40, measured against a copied tree.
+
+**WHICH WAY TO ERR IS ARGUED RATHER THAN SPLIT.** A cap too LOW reports a real
+identifier: the staging run refuses, an operator adds one allowlist row, nothing
+leaves the machine. A cap too HIGH exempts a real credential and it uploads. The
+costs are not comparable, so 48 sits five characters above its measured floor
+rather than centred in the window.
+
+**THE STAGING PATH IS BLOCKED, AND IT ALREADY WAS -- WHICH IS NOT WHAT THIS PASS
+SET OUT TO CONFIRM.** `python s3_stage.py` exits **1** with `VERDICT: REFUSED`
+and **two** findings: `docker-compose.yml` (new, this pass) and
+`tests/test_tracking_mlflow_index.py`'s synthetic `_SENTINEL`
+(`openai_anthropic_key`, 32 chars, PRE-EXISTING). Driving the pre-change module
+from a scratch copy shows the second finding fires before this pass too, so the
+honest statement is that this change adds the REAL finding to a refusal that was
+already standing on a synthetic one. **Nothing uploads until both are ruled on**
+-- the compose file by fixing it, the sentinel by an allowlist row or an
+exclusion. Neither is this pass's to do.
+
+**`tests/test_staging_exclusions.py` 139 -> 148**, section `4j-a`..`4j-g`, sited
+in the value-validator block it extends. **THE REAL COMPOSE FILE IS DELIBERATELY
+NOT ASSERTED ON**: it is a known defect scheduled to be fixed, and a check
+reading "the shipped compose file has exactly one finding" would go red the day
+somebody fixes it -- a test that fails on the change it exists to protect. What
+is pinned is the PREDICATE and the window, which stay true afterwards. The
+boundary values are DERIVED from the constant (`_identifier_of_length(_CAP)`,
+`_CAP + 1`) so they move with it instead of rotting against it.
+
+**FIVE REVERTS, FIVE CAUGHT**, each into a copied tree with `PYTHONPATH` pointed
+at it, a realpath preflight asserting the COPY is what imports,
+`PYTHONDONTWRITEBYTECODE=1`, and both shipped files sha256-identical afterwards.
+None aborted:
+
+| revert | fires |
+|---|---|
+| the cap deleted outright | 4j-a, 4j-e, 4j-f, 4j-g |
+| cap lowered to 28 (past the 29-char capture) | **4i**, 4j-b, 4j-c, 4j-f |
+| cap lowered to 40 | 4j-c, 4j-f |
+| cap raised to 56 (offender exempt again) | 4j-f, 4j-g |
+| `>` weakened to `>=` | 4j-d |
+
+**TWO DEFECTS IN THIS PASS'S OWN WORK WERE FOUND BY RUNNING, NOT BY READING.**
+(i) The new checks were first labelled `4p`..`4v`, which **collide with seven
+existing checks** in the same section -- a failure reported as "4t" would have
+been ambiguous, and this file's whole convention is that a label locates a
+check. Renumbered to `4j-*` on the file's own `4b-control` precedent, with a
+duplicate-label scan over all 103 labelled checks as the guard. (ii) `4j-d` and
+`4j-e` fell back to `_CAP or 0` when the constant is absent, so the cap-removed
+revert made `4j-e` ask whether a **one-character** value is exempt -- it fired,
+but for a reason its own label denies. The fallback is the offender's length
+(56) now, and the same revert fires it on a 57-character value.
+
+**Every new fragment in the test file is assembled with `_shape()`**, because
+`4b-control` scans that file with the scanner it tests and requires zero hits --
+and a 56-character digitless value beside a `SECRET_KEY` keyword is, as of this
+pass, exactly a hit. Verified by running: `4b-control` still passes.
+
+**VERIFIED BY RUNNING.** `tests/test_staging_exclusions.py` **148/0**;
+`tests/test_package_invariants.py` **260/0/0** (unchanged -- the new constant is
+read, so check 2h is satisfied); CI bucket A **79 files, 0 failed, 0 not run**;
+`python s3_stage.py` exits 1 as above. Exactly two files changed. Across the
+whole repository **exactly one capture changed status**, and it is the offender.
 
 ## Conventions
 
