@@ -12,6 +12,57 @@ Qdrant.
 - [`DOCKER CLEAN BRING-UP.md`](DOCKER%20CLEAN%20BRING-UP.md) — what a
   `docker compose down -v` + `up` gives you, and what it does not.
 
+## Secrets: two layers, and only one of them is a guarantee
+
+**Install the local hook — one command, in a fresh clone:**
+
+```bash
+make hooks                      # == git config core.hooksPath .githooks
+```
+
+`.git/hooks` is not tracked, so a hook copied in there exists on one machine and
+nobody can review it. `core.hooksPath` points git at the tracked
+[`.githooks/`](.githooks/) directory instead, so the hook ships with the clone
+and this one command arms it. It **replaces** the hook directory rather than
+adding to it — any other hook you keep in `.git/hooks` stops running while it is
+set.
+
+The hook scans **staged content only** and takes about **1.0 s** (measured, with
+gitleaks installed; without it the gate says so in capitals and runs one engine).
+It is **convenience, not protection**: `git commit --no-verify` walks past it,
+and a contributor who never runs `make hooks` never has it.
+
+**The guarantee is the `secret-scan` job** in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml). It runs
+[`.github/scripts/secret_scan_gate.py`](.github/scripts/secret_scan_gate.py)
+over **every object in the git object database** — reachable or not — with two
+engines: gitleaks 8.30.1 (~170 provider rules) and this project's own
+[`oncotriage/staging/secrets_scan.py`](oncotriage/staging/secrets_scan.py)
+(nine content detectors *and* a filename layer). ~18 s, 128.89 MB on this
+repository.
+
+The range is the object database and not a commit range, because a commit range
+cannot be defended — measured, in a clone of this repository:
+
+| | gitleaks git, `--all --full-history` | this gate, object range |
+|---|---|---|
+| a secret in an **evil merge** (content in neither parent) | 202 commits scanned, **no leaks found, exit 0** | **exit 1**, 4 findings, both engines |
+| a secret committed and then `git rm`'d | working-tree scan says **clean** | **exit 1**, the blob is still clonable |
+| a secret left **unreachable** by a force-push | `rev-list --objects --all` **misses it** | **exit 1**, `--batch-all-objects` finds it |
+
+Run it yourself against this checkout:
+
+```bash
+make secret-scan                # the same gate, ~18 s
+```
+
+Accepted findings live in
+[`.github/scan-accepted-fingerprints.txt`](.github/scan-accepted-fingerprints.txt),
+one per finding, keyed on the **blob oid** so an entry survives a rebase and can
+never suppress different content. **Green does not mean clean**: 21 are accepted
+today and twelve of them are a real Airflow signing key that is still in this
+repository's history. Read the file.
+
 ## What CI covers, and what it does not
 
 The badge above reports [`.github/workflows/ci.yml`](.github/workflows/ci.yml).

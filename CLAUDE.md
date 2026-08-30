@@ -1013,6 +1013,23 @@ python bedrock_probe.py --i-understand-this-bills --probe-seed   # + 1 more
 # were true when written and are kept as written, per the rule that a
 # past-tense account keeps its wording.
 
+
+# The secret-gate pass. Same shape, same directory. No network, no keys, NO
+# SPEND, no live Qdrant, no model load, no corpus, no database, no Docker
+# daemon, no live server. It needs `git`, which every runner has. Its subject is
+# .github/scripts/secret_scan_gate.py and .githooks/pre-commit, both DRIVEN AS
+# SUBPROCESSES (the hook through a real `git commit`), so the EXIT CODE is what
+# is asserted -- 0/1/2/3 are four different instructions to a human and an
+# in-process call produces none of them. Every planted secret is ASSEMBLED at
+# run time from a prefix and an index arithmetic; section 8 scans this file with
+# the scanner it tests and greps every tracked file for each value it can
+# generate, and it CAUGHT ITS OWN AUTHOR (the first draft carried AWS's
+# documented example key as a literal). The gitleaks half is SKIPPED, counted
+# and printed when the binary is absent -- which is the state of the `tests` job
+# on a hosted runner. NOT in the collision matrix. It EXECS NOTHING. Bucket A,
+# ~22 s with gitleaks / ~16 s without.
+python tests/test_secret_scan_gate.py                               #  87 with gitleaks; 81 passed / 0 failed / 3 SKIPPED without it
+
 pip install -e .                                         # makes `oncotriage` importable anywhere
 ```
 
@@ -9878,6 +9895,210 @@ the `05- Keys` bind mount -- nothing was baked into the image, which
 5. **`docker compose config` prints the resolved secret**, as it printed the
    hardcoded one before. Inherent to compose; worth knowing before pasting that
    output anywhere.
+
+### A credential cannot enter this repository unnoticed (the secret-gate pass)
+
+**TWO LAYERS, AND ONLY ONE OF THEM IS A GUARANTEE.** `.githooks/pre-commit` is
+convenience — bypassable with `--no-verify`, and absent until somebody runs
+`make hooks`. The `secret-scan` job in `.github/workflows/ci.yml` is the gate.
+Both run **one script over different ranges**, so a hook that passes is a true
+preview of CI rather than a second opinion. **No billed call, no schema change,
+no migration**; the production `inferences.db` sha256 is unchanged.
+
+**THE BRIEF ASKED FOR A PUSH-RANGE OR DIFF SCAN AND THAT IS PROVABLY WRONG FOR
+THE REQUIREMENT IT STATES.** Measured, in a clone of this repository at 202
+commits, with a shape-faithful AWS key id and Hugging Face token committed as an
+**evil merge** — content in NEITHER parent, which `git log -p` prints no diff
+for:
+
+| | verdict |
+|---|---|
+| `gitleaks git --log-opts="--all --full-history"` — the job this repository already shipped | **202 commits scanned, "no leaks found", exit 0** |
+| `secret_scan_gate.py --range objects` | **exit 1**, 4 findings, both engines, naming the file |
+
+A push-range scan is strictly weaker than the full-history scan that already
+misses this, so **no range narrower than the object database can be defended**.
+The object walk also has no "before", which is what makes it immune to a
+force-push moving one.
+
+**AND THE BRIEF'S TWO COST FIGURES WERE THE WRONG WAY ROUND.** Measured here:
+`gitleaks git` full history reads **15.08 MB in 1.2 s**; the object walk reads
+**128.89 MB in ~18 s**. The log scan reads DIFFS — added lines only — while this
+reads every version of every file in full, so the object walk is ~8.5x MORE
+bytes, not less. Eighteen seconds once per push is the price of a range with no
+hole in it.
+
+**THE RANGE IS `--batch-all-objects`, NOT `rev-list --objects --all`, AND THE
+DIFFERENCE WAS MEASURED TWICE.** (i) After a `reset --hard` — the local half of
+a force-push — the abandoned blob is **unreachable from every ref and still in
+the object database and still `git cat-file`-able**; a reachable-only walk
+reports NOT FOUND and this gate reports it. (ii) `rev-list --objects --all`
+lists a blob under exactly **one** path, whichever it reaches first: a blob
+committed at `a.txt`, `dup1.txt` and `.env` is listed once, so whether the
+FILENAME layer ever sees `.env` would be decided by traversal order. Basenames
+are therefore taken from **every tree object**, which finds all three.
+
+**BLOBS ARE READ WHOLE, NOT TO `config.S3_STAGING_SCAN_PREFIX_BYTES`.** That
+64 KiB bound is a stated LIMIT of the staging scanner, and applying it here
+would open a hole this repository is measurably inside: **63,977,491 of the
+128,894,276 bytes in this object database — 49.6% — lie beyond 64 KiB of their
+blob.** Half the history would be unscanned.
+
+**TWO ENGINES, AND THIS REPOSITORY IS THE COUNTEREXAMPLE TO EACH DIRECTION.**
+Over the same 128.89 MB: **this project's scanner finds 15 findings gitleaks
+finds ZERO of** — twelve historical `docker-compose.yml` blobs carrying the
+56-character digitless Airflow signing key (it clears no entropy floor gitleaks
+has) and three blobs of a test file carrying a synthetic `sk-` sentinel (no
+gitleaks rule matches it; its `openai-api-key` requires the literal infix
+`T3BlbkFJ`). gitleaks finds 6, all of them the two false positives
+`.gitleaksignore` already argues about. Both engines' findings are normalised
+onto **one** fingerprint and gated by **one** accepted table, so neither gets a
+second invisible gate of its own.
+
+**THE FINGERPRINT IS THE BLOB OID, WHICH IS STRICTLY BETTER THAN
+`.gitleaksignore`'S COMMIT KEY.** `<blob-oid>:<engine>:<detector>:<locator>`.
+A blob oid is the sha1 of the CONTENT, so an entry survives a rebase, a
+filter-branch and a rename — the cost `.gitleaksignore`'s own header records for
+its form — and **can never suppress different content**. Parsed with
+`split(":", 3)`, because the locator is a BASENAME for a filename finding and a
+basename may legally contain a colon.
+
+**`.gitleaksignore` IS UNCHANGED AND HONOURED, AND IT IS NOT LOAD-BEARING AT
+THIS PIN — MEASURED, AGAINST THE BRIEF'S OWN CLAIM.** The full-history scan
+reports **zero findings with the file and zero without it**. The cause is
+isolated: the same gitleaks v8.30.1, the same blob of
+`oncotriage/storage/queries.py` — `gitleaks git` over the commit that ADDED the
+line reports **0**, `gitleaks dir` over that exact blob reports **1**
+(`generic-api-key`, line 505). **git mode under-reports against dir mode on
+identical content**, which is a second, independent reason it is not the
+guarantee. The file is kept: a rule tightening upstream can be reverted
+upstream, and the entries are argued.
+
+**GREEN DOES NOT MEAN CLEAN, AND THE SUMMARY SAYS SO IN WORDS.** 21 accepted in
+three argued blocks, printed grouped by reason on every clean run. **Twelve of
+them are a REAL credential still in this repository's history** — the Airflow
+signing key — accepted because removing it means rewriting pushed history, which
+is a decision with its own blast radius and is not made by a scanner. It is
+treated as compromised. **A stale accepted entry is exit 2** on
+`audit_gate.py`'s precedent; **a scan that could not run is exit 3**, because
+"I could not look" is not "I looked and it was clean".
+
+**THE ACCEPTED TABLE IS NOT CALLED `secret-scan-accepted.txt`, AND THAT WAS
+FOUND BY RUNNING THE GATE OVER A CLONE CONTAINING IT.** The FILENAME layer
+matches `(^|[._\-])secrets?([._\-]|$)`, so the table was a finding of its own —
+and the only fingerprint that could suppress it is keyed on that file's own blob
+oid, **which changes every time an entry is added**. The suppression file would
+have had to suppress itself and would have gone stale on every edit. Same shape
+`.gitleaksignore`'s header records through CONTENT, arrived at through the NAME.
+It is `.github/scan-accepted-fingerprints.txt`, which is the more accurate name
+anyway: it holds fingerprints and it holds no secret.
+
+**THE HOOK USES `core.hooksPath`, NOT `.git/hooks`, AND NOT THE `pre-commit`
+FRAMEWORK.** `.git/hooks` is not tracked, so a hook copied there exists on one
+machine and nobody can review it. `core.hooksPath` points git at a TRACKED
+directory: `make hooks` is the one command, it is idempotent, and every clone
+already has the file. The framework is the other tracked option and would add a
+dependency and a managed virtualenv to a project whose `pyproject.toml` is
+deliberately the ONE dependency list. **The cost is stated rather than
+discovered**: `core.hooksPath` REPLACES the hook directory, so any other hook in
+`.git/hooks` stops running while it is set. **Measured runtime: ~1.0 s** on
+staged content with both engines.
+
+**THE CI JOB INSTALLS FOUR PACKAGES, DERIVED RATHER THAN LISTED.** The gate uses
+two PURE functions, but they live in a module that imports `oncotriage.config`
+at module scope, and config imports three third-party packages there — so
+importing the pure functions costs those imports and, without them, the gate
+exits 3. **Measured by AST**: the closure reaches exactly four third-party tops
+— `dotenv`, `httpx`, `openai`, `qdrant_client` — and no torch, transformers,
+streamlit or langgraph. `--print-requirements` is their one owner and the
+workflow installs from it; **section 10 of the standing test re-derives the
+closure by AST** and fails when a new module-scope import appears in that chain,
+so the install list cannot silently start installing too little. Verified in a
+**bare venv**: `--print-requirements` works with nothing installed, the gate
+without them exits **3** naming the missing module, and with them the exact CI
+command is green in 19.1 s against a 131 MB environment.
+
+**gitleaks IS INSTALLED FROM THE RELEASE TARBALL, PINNED BY sha256** rather than
+pulled as `zricethezav/gitleaks:v8.30.1`. A docker tag is a name somebody can
+move; this repository's Dockerfile already takes the opposite position by
+pinning base images by digest. **One binary for both steps**, because a rule
+renamed between two gitleaks builds changes every fingerprint it emits and this
+repository now has two accepted tables keyed on rule names.
+
+**SEVEN CONTROLS, ALL DRIVEN, ALL FIRING.** In a clone of this repository: the
+baseline is clean; the hook REFUSES a staged plant and **creates no commit**;
+`--no-verify` walks past it; the object gate then FAILS on the same content;
+`git rm` + commit leaves a **working-tree scan reporting CLEAN while the gate
+still fails**; the evil merge fails the gate and passes the log scan; the
+force-push residue is unreachable, still present and still found; and expiring
+the object returns the gate to **exit 0 with all 21 accepted entries still
+matched**.
+
+**THE PLANTS ARE SHAPE-FAITHFUL BECAUSE PLACEHOLDERS DO NOT WORK, AND THE
+BRIEF'S CLAIM ABOUT THAT WAS HALF RIGHT.** Measured on all four:
+
+| value | project scanner | gitleaks |
+|---|---|---|
+| `AKIA` + `FAKE`×4 | `aws_access_key_id` | nothing |
+| `sk-` + `FAKE`×8 | `openai_anthropic_key` | nothing |
+| `hf_` + `FAKE`×8 | `huggingface_token` | nothing |
+| AWS's own documented example key | `aws_access_key_id` | nothing |
+
+gitleaks carries an entropy floor on all three rules (3, 3, 2) and an explicit
+`.+EXAMPLE$` allowlist on the AWS one; this project's nine detectors carry
+neither, deliberately — they are a REFUSAL layer that errs toward stopping a
+run, which is exactly why they caught the digitless Airflow key. So a
+placeholder control exercises ONE engine while looking like it exercised two.
+The three shapes were **read out of gitleaks v8.30.1's own
+`config/gitleaks.toml`**, not guessed: AWS is base32 (`[A-Z2-7]`, no 0/1/8/9),
+OpenAI needs the `T3BlbkFJ` infix at offset 23 and one of two exact lengths, and
+the HF rule is `hf_` plus exactly 34 LETTERS.
+
+**NOT ONE SECRET-SHAPED LITERAL IS IN A TRACKED FILE, AND THE GUARD CAUGHT ITS
+OWN AUTHOR.** Every plant is assembled at run time from a prefix, an alphabet
+and an index arithmetic. Section 8 of the standing test scans this file with the
+scanner it tests **and greps every tracked file for each of the fifteen values
+it can generate** — and its first draft carried AWS's documented example key as
+a literal in check 1k, which 8a failed on. That is the rule this project already
+paid for once, when the 56-character Airflow key was reproduced into two
+documentation files while being removed from the code and only one of the two
+was caught, because of a punctuation accident. **Verified at the end: 276 tracked
+and new paths through both layers of the scanner, and the only finding anywhere
+is the pre-existing sentinel in `tests/test_tracking_mlflow_index.py`**, which is
+Block 2 of the accepted table.
+
+**VERIFIED BY RUNNING.** CI bucket A **80 files, 0 failed, 0 not run** in 93.9 s;
+`tests/test_package_invariants.py` **260/0/0**;
+`.github/scripts/ci_test_buckets.py --check` consistent at 99 files;
+`.github/scripts/static_checks.py` compiles 246 files;
+`tests/test_trivyignore_staleness.py` **181**,
+`tests/test_dockerignore_exclusions.py` **36**,
+`tests/test_staging_exclusions.py` **148** — none moved. The `tests` and `image`
+jobs are **structurally byte-identical** to HEAD (same JSON digest of each job),
+and every top-level workflow key is unchanged.
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **The Airflow signing key is still in history.** Accepted, not removed. It
+   must be treated as compromised and never reused. Removing it is a history
+   rewrite whose blast radius includes every `.gitleaksignore` commit
+   fingerprint and several tests that lift controls out of `git show`.
+2. **`tests/test_tracking_mlflow_index.py`'s `sk-` sentinel is a literal**, so
+   any edit to that file changes its blob and needs a new accepted fingerprint.
+   The fix is to assemble it at run time, exactly as
+   `tests/test_secret_scan_gate.py` does; that is a change to a test whose own
+   verification is out of this pass's scope.
+3. **`.gitleaksignore`'s two entries are dead at this pin** and nothing fails
+   because of it. A staleness check for that file would be red today, so it is
+   reported rather than added.
+4. **GitHub serves unreachable commits by SHA.** A secret force-pushed away is
+   still retrievable from GitHub even though a fresh clone will not carry it, so
+   no CI-side scan of a fresh clone can see it. The remedy is rotation and
+   GitHub support, not a scanner.
+5. **The `tests` job does not install gitleaks**, so the standing test's
+   two-engine half SKIPS there. It runs fully on a developer machine and the
+   guarantee itself is enforced in the `secret-scan` job with
+   `--require-gitleaks`.
 
 ### Every counter has a production reader (the counter-reader pass)
 

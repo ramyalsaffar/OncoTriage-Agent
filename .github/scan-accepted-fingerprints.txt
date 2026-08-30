@@ -1,0 +1,184 @@
+# secret scan — accepted findings, by blob fingerprint
+######################################################
+#
+# THE FILENAME IS DELIBERATE AND WAS FORCED BY THIS GATE FINDING IT. The obvious
+# name, `secret-scan-accepted.txt`, is reported by the project scanner's
+# FILENAME layer — `(^|[._\-])secrets?([._\-]|$)`, "a filename naming a secret"
+# — so the table was a finding of its own the first time the gate ran over a
+# clone containing it. The only fingerprint that could suppress that is keyed on
+# this file's own blob oid, which changes every time an entry is added, so the
+# suppression would have gone stale on every edit. `.gitleaksignore`'s header
+# records the same shape arrived at through CONTENT (its first draft quoted the
+# line it suppressed and produced a finding about itself); this one came through
+# the NAME. The name it has now is the more accurate one in any case: this file
+# holds fingerprints, and it holds no secret.
+#
+# ONE ENTRY PER FINDING, BY BLOB FINGERPRINT. A fingerprint is
+# `<blob-oid>:<engine>:<detector>:<locator>` and it suppresses exactly one match
+# by one detector at one offset of one blob. Nothing else.
+#
+# THE KEY IS THE BLOB OID, WHICH IS BETTER THAN `.gitleaksignore`'S COMMIT KEY
+# AND WORSE IN ONE STATED WAY. Better: a blob oid is the sha1 of the CONTENT, so
+# an entry survives a rebase, a filter-branch and a rename, and it can never
+# suppress DIFFERENT content — a changed byte is a different oid and the entry
+# stops matching. `.gitleaksignore`'s own header records the opposite cost for
+# its `commit:path:rule:line` form. Worse: an oid says nothing about WHICH
+# commit introduced the blob, so every entry below names that separately, in
+# prose, from `git log --find-object`.
+#
+# DESCRIBE, NEVER REPRODUCE. `.gitleaksignore` learned this the expensive way:
+# its first draft quoted the line it was suppressing, which put the same string
+# into the suppression file and produced a second finding — at
+# `.gitleaksignore:28`, which is now an accepted finding of its own, twice over
+# (once for gitleaks, and the historical blob is in this file's table below).
+# A suppression file that quotes what it suppresses will suppress itself into
+# existence.
+#
+# DELIBERATELY NOT AVAILABLE, and each for the same reason — every one of them
+# would suppress findings nobody has looked at, including ones that do not exist
+# yet:
+#
+#   * no path pattern. A path is not content; the same path holds a new blob
+#     tomorrow.
+#   * no detector-level or rule-level disable. `credential_assignment` is the
+#     detector most likely to catch a provider this project has never heard of,
+#     and `generic-api-key` is gitleaks' equivalent.
+#   * no oid-level wildcard. A blob accepted for one detector at one offset is
+#     not accepted for a second detector that starts firing on it.
+#
+# ADDING AN ENTRY IS NOT A FIX. Two of the three blocks below are FALSE
+# POSITIVES and one is a REAL CREDENTIAL that is still in this repository's
+# history and is not removed by being written down here. Read the block.
+#
+# To re-derive this list after a deliberate history change:
+#     python .github/scripts/secret_scan_gate.py --emit-accepted
+# It PRINTS; it never writes this file. Every line still has to be looked at and
+# given a reason, which is the whole point.
+
+
+# ===========================================================================
+# BLOCK 1 — A REAL CREDENTIAL, STILL IN HISTORY. NOT A FALSE POSITIVE.
+# ===========================================================================
+#
+# Twelve historical blobs of `docker-compose.yml`, each carrying a hardcoded
+# value for the Airflow web signing key under a variable spelled
+# `AIRFLOW__WEBSERVER__SECRET_KEY`. Two syntactic shapes across the twelve: the
+# older environment-LIST form (`- NAME=<value>`, two blobs, 56-character value)
+# and the later mapping form (`NAME: <value>`, ten blobs, the capture one longer
+# because it takes the leading space). The value itself is described and not
+# quoted, per the rule above: fifty-six characters of letters, underscores and
+# hyphens with NO DIGIT ANYWHERE, ending in words that ask the reader to change
+# it in production.
+#
+# HOW IT SURVIVED A SCANNER FOR SO LONG, and it is the reason this project's own
+# detector has a length cap. `_is_program_identifier` in
+# oncotriage/staging/secrets_scan.py exempts a captured value that looks like a
+# NAME — letters, underscores, hyphens, no digit — because fifteen of the first
+# seventeen findings this scanner ever produced were exactly that. Unbounded,
+# that exemption matched this value exactly, and `scan_bytes` over the real
+# compose file returned ZERO findings: a hardcoded signing key in a file the
+# scanner called clean. `_IDENTIFIER_EXEMPTION_MAX_LENGTH = 48` is what made it
+# visible, and this value at 56 is the measurement that set the ceiling.
+#
+# gitleaks reports NONE of these twelve, on any of its ~170 rules, in either
+# `git` or `dir` mode. A digitless letters-and-punctuation string clears no
+# entropy floor it has. That asymmetry is why this gate runs two engines.
+#
+# WHAT WAS DONE, AND WHAT WAS NOT. HEAD no longer carries it: the compose file
+# sources both Airflow secrets from the environment (`${...:?}`), so the working
+# tree is clean. The literal remains in every commit that carried it and is
+# therefore in every clone. It is treated as COMPROMISED and must never be
+# reused — which is the honest state, because a signing key that has been in a
+# repository about to be made public is spent whatever anybody writes here.
+#
+# WHY IT IS ACCEPTED RATHER THAN REMOVED. Removing it means rewriting pushed
+# history: every SHA below it changes, every `.gitleaksignore` fingerprint keyed
+# on a commit stops matching, and several tests in this suite derive a revision
+# and lift negative controls out of `git show`. That is a decision with its own
+# blast radius and its own review, and it is not made by a scanner.
+#
+# REMOVAL CONDITION: these twelve entries go when history is rewritten, and the
+# gate FAILS WITH EXIT 2 if they are left behind afterwards — a stale accepted
+# entry is re-read by the next person as a live constraint.
+#
+# Introduced across the compose file's life; `git log --find-object=<oid>` names
+# the commit for any one of them.
+002f75e72280051454310d1d7e32d55a54a5aa71:oncotriage:credential_assignment:16591
+238480f723636b9132e0803c4ab4bde4edb10039:oncotriage:credential_assignment:11868
+27dee4ad60ac87b46b8eb7ddd7091837d8e13c77:oncotriage:credential_assignment:17072
+298bf50b0248fb976f17ef5905bfb937c189b6c2:oncotriage:credential_assignment:4902
+3e0ccd14961a50320f3a1d6c72e941cc4340c51f:oncotriage:credential_assignment:17072
+40934abbe56622629a3755a7cdbca135354d5b7e:oncotriage:credential_assignment:15759
+5aa8da463d05a8344a533568f2560140070a6827:oncotriage:credential_assignment:17072
+66020eb00d042f5eaae21be6f019136ba0707bfb:oncotriage:credential_assignment:17072
+878b4de7180f924c8ce4366f7c8c156f4ced29a4:oncotriage:credential_assignment:11794
+a0fd6ee36630304d983bac7a35f1a2937c147b2b:oncotriage:credential_assignment:4745
+d0a03064eba35f1a06d10ec9ee532ecbead6b273:oncotriage:credential_assignment:17072
+e946b984e4410aa72ea9ec3c2de442c1f5831c23:oncotriage:credential_assignment:11794
+
+# ===========================================================================
+# BLOCK 2 — A SYNTHETIC SENTINEL IN A TEST. NOT A CREDENTIAL.
+# ===========================================================================
+#
+# Three historical blobs of `tests/test_tracking_mlflow_index.py`, each
+# assigning a module-level constant whose name says what it is — a SENTINEL —
+# to a 32-character string beginning `sk-`. That test seeds a fake API key into
+# the environment and then requires the MLflow parameter enumeration to carry it
+# in no key and no value; the string has to LOOK like a key or the assertion is
+# vacuous, which is this project's standing rule about degenerate checks.
+#
+# It matches this project's `openai_anthropic_key` detector, which asks only for
+# `sk-` followed by twenty or more identifier characters. It matches NO gitleaks
+# rule: gitleaks' `openai-api-key` requires the literal infix `T3BlbkFJ` and one
+# of two exact lengths, neither of which a fabricated sentinel has.
+#
+# It is usable against no service. `python s3_stage.py` has refused on it since
+# before this gate existed, which is where it was first written down.
+#
+# REMOVAL CONDITION: these three go when history is rewritten, or when the
+# sentinel is changed to a shape no detector matches — for which the honest
+# instrument is the staging exclusion manifest rather than a shape chosen to
+# slip past a scanner.
+30b65d019735cb0002941f876b51e28f5b4b00e3:oncotriage:openai_anthropic_key:18436
+5698d07120cc8eb1ff473b60019697d23c5844ec:oncotriage:openai_anthropic_key:21703
+e5932da50468c43e944c296ab71b468a91e2d193:oncotriage:openai_anthropic_key:18436
+
+# ===========================================================================
+# BLOCK 3 — A QUERY REGISTRY KEY. NOT A CREDENTIAL. ALREADY ARGUED IN
+#           `.gitleaksignore`, HERE UNDER THE OTHER FINGERPRINT FORM.
+# ===========================================================================
+#
+# Six blobs: five historical versions of `oncotriage/storage/queries.py` and one
+# historical version of `.gitleaksignore` itself. In each, gitleaks'
+# `generic-api-key` rule fires on the first keyword argument of a `Query(...)`
+# record — an argument literally named `key`, whose value is the report's
+# identifier: a long lower-case snake_case metric name made of English words
+# joined by underscores, ~31 characters, which clears the rule's entropy
+# threshold on length alone. The same construction appears ~40 times in that
+# file; these are the versions where one of them crossed the threshold.
+#
+# THE SIXTH IS `.gitleaksignore`'S OWN FIRST DRAFT, and it is the reason the
+# "describe, never reproduce" rule at the top of this file is written down
+# twice. That draft quoted the offending line in order to explain it, which put
+# the same string into the suppression file and produced a second finding at
+# line 28 of it. The comment was rewritten to describe rather than quote; the
+# old blob is still reachable, so the historical copy is still matched.
+#
+# `.gitleaksignore` ALREADY CARRIES BOTH OF THESE, keyed `commit:path:rule:line`
+# — which is the form `gitleaks git` emits and the form that stops matching
+# after a rebase. This gate scans blobs, so it sees the same two causes under
+# five and one blob oids respectively, and it needs its own entries. The two
+# files are not redundant: `.gitleaksignore` governs the commit-attribution
+# scan in the workflow, this table governs the object scan.
+#
+# Nothing at any of these lines is secret, rotatable, or usable against any
+# service. The whole file is read-only report SQL.
+#
+# REMOVAL CONDITION: these six go when history is rewritten, or if the query
+# registry's key naming ever changes such that no key clears the entropy floor.
+3bf20365b992ede199abbcc5453d38f405e7c96f:gitleaks:generic-api-key:505
+4390002fcdf67c4751fdadb775069c0cd682b430:gitleaks:generic-api-key:826
+a7df3706d896e35a12e8dcb31267801e160a848d:gitleaks:generic-api-key:826
+e6fba799a5245c086aa283479dec9b65904da2d3:gitleaks:generic-api-key:827
+f0fd7d247fd48d11e004223802f240f70ca2cd0e:gitleaks:generic-api-key:28
+f40048a7d859eab0a54a1202557182c857653757:gitleaks:generic-api-key:685

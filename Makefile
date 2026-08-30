@@ -33,7 +33,7 @@ PYTHON ?= python
 ONCOTRIAGE_APP_VERSION := $(shell $(PYTHON) docker/app_version.py)
 export ONCOTRIAGE_APP_VERSION
 
-.PHONY: help serial-tests serial-tests-list install version build up down
+.PHONY: help serial-tests serial-tests-list install version build up down hooks secret-scan
 
 help:
 	@echo "Targets:"
@@ -44,6 +44,8 @@ help:
 	@echo "  make build              docker compose build, with the version label derived"
 	@echo "  make up                 build, then docker compose up -d"
 	@echo "  make down               docker compose down (volumes survive; add -v yourself)"
+	@echo "  make hooks              arm the pre-commit secret scan (git config core.hooksPath)"
+	@echo "  make secret-scan        run the CI secret gate locally, over the whole object DB"
 
 serial-tests:
 	$(PYTHON) tests/run_serial_tests.py
@@ -67,6 +69,32 @@ build:
 
 up: build
 	docker compose up -d
+
+# ONE COMMAND, BECAUSE .git/hooks IS NOT TRACKED AND A HOOK NOBODY INSTALLS IS
+# NOT A HOOK. `core.hooksPath` points git at the TRACKED .githooks/ directory,
+# so the hook itself is reviewed like any other file and every clone already has
+# it; this target is only the local config line that arms it. It is idempotent.
+#
+# IT REPLACES THE HOOK DIRECTORY RATHER THAN ADDING TO IT — any other hook in
+# .git/hooks stops running while this is set. That cost is stated here and again
+# at the top of .githooks/pre-commit rather than being discovered.
+#
+# THE HOOK IS CONVENIENCE, NOT PROTECTION: `git commit --no-verify` walks past
+# it and a contributor who never runs this target never has it. The guarantee is
+# the `secret-scan` job in .github/workflows/ci.yml.
+hooks:
+	git config core.hooksPath .githooks
+	@echo "core.hooksPath = $$(git config core.hooksPath)"
+	@echo "pre-commit secret scan armed. It is bypassable with --no-verify;"
+	@echo "the gate that is not is .github/workflows/ci.yml's secret-scan job."
+
+# THE SAME GATE CI RUNS, AGAINST THIS CHECKOUT'S OBJECT DATABASE. ~18 s on this
+# repository. Deliberately NOT --require-gitleaks: on a developer machine
+# gitleaks may not be installed, and the gate prints in capitals that it ran one
+# engine rather than two. CI passes that flag, so the two-engine guarantee is
+# enforced exactly where it is enforceable.
+secret-scan:
+	$(PYTHON) .github/scripts/secret_scan_gate.py --range objects
 
 # NO `-v` HERE, EVER, and not for symmetry with `up`. `down -v` destroys the
 # inference database, the Airflow metadata database with its generated password,

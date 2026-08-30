@@ -182,6 +182,14 @@ tests/
 # and the same trap avoided: `.github/` is a directory prefix, not a `*` pattern
 # that would have to cross a `/`.
 .github/
+
+# The tracked git-hooks directory, for the same reason and one line further.
+# `core.hooksPath .githooks` is a DEVELOPER-MACHINE config; the image runs no
+# git command and commits nothing, so the hook is build-time-irrelevant and
+# every edit to it would otherwise invalidate the source layer. It is 4 KB, so
+# this is about layer churn rather than size -- the same argument the line
+# above makes for the workflow.
+.githooks/
 test_*.py
 *_test.py
 .pytest_cache/

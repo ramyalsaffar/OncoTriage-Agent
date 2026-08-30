@@ -1,0 +1,83 @@
+#!/bin/sh
+# Pre-commit secret scan — CONVENIENCE, NOT PROTECTION
+#####################################################
+#
+# THIS HOOK IS NOT THE GUARANTEE AND MUST NOT BE READ AS ONE. It is bypassed by
+# `git commit --no-verify`, it does not exist until somebody runs the install
+# command below, and a contributor who never runs that command never sees it.
+# The guarantee is the `secret-scan` job in .github/workflows/ci.yml, which runs
+# on a machine nobody being scanned controls. This hook exists so a mistake
+# costs five seconds at the keyboard instead of a red build and a rewritten
+# branch.
+#
+# WHY core.hooksPath AND NOT .git/hooks
+# -------------------------------------
+# `.git/hooks` is NOT TRACKED. A hook copied in there is invisible to git, is
+# not carried by a clone, and drifts silently the moment anybody edits their
+# copy — so the naive install is a hook that exists on exactly one machine and
+# that nobody can review. `core.hooksPath` points git at a TRACKED directory, so
+# this file is in the repository, is reviewed like any other file, and every
+# clone already has it. The one command that arms it is:
+#
+#     git config core.hooksPath .githooks          # or: make hooks
+#
+# WHY NOT THE `pre-commit` FRAMEWORK. It is the other tracked option and it
+# would work, at the cost of a new dependency (`pip install pre-commit`, plus a
+# managed virtualenv per hook) in a project whose pyproject.toml is deliberately
+# the ONE dependency list. This route adds no dependency and no lock file.
+#
+# WHAT IT COSTS, STATED. `core.hooksPath` REPLACES the hook directory — it does
+# not add to it. Any other hook a developer has in `.git/hooks` stops running
+# while this is set. `.githooks/` therefore holds every hook this project wants
+# and nothing else; if you need a personal hook, add it here or unset the
+# config, and know which one you chose.
+#
+# WHAT IT SCANS. Staged content only — the blobs this commit would introduce,
+# read out of the index rather than off the working tree, because the two differ
+# whenever somebody has `git add`ed one version and edited another. Deletions
+# are not scanned: removing a file introduces no content, and scanning the
+# pre-image would refuse the commit that takes a secret OUT of the tree.
+#
+# WHAT IT DOES NOT SCAN. History. That is the CI gate's range, and it is 128 MB
+# and ~18 seconds on this repository — the wrong price for every commit.
+#
+# A HOOK THAT CANNOT RUN REFUSES. If python3 is missing the commit is blocked
+# rather than allowed, on this project's standing rule that "I could not look"
+# and "I looked and it was clean" are different statements and only one of them
+# licenses a commit. Same reason the gate itself exits 3 rather than 0 when it
+# cannot run.
+
+set -u
+
+root=$(git rev-parse --show-toplevel 2>/dev/null) || {
+    echo "pre-commit: not inside a git work tree; refusing." >&2
+    exit 1
+}
+
+gate="$root/.github/scripts/secret_scan_gate.py"
+[ -f "$gate" ] || {
+    echo "pre-commit: $gate is missing; refusing rather than passing." >&2
+    exit 1
+}
+
+python=$(command -v python3 || command -v python) || {
+    echo "pre-commit: no python3 on PATH; refusing rather than passing." >&2
+    echo "            'could not look' is not 'looked and it was clean'." >&2
+    exit 1
+}
+
+# The gate runs both engines when gitleaks is on PATH and PRINTS THAT IT DID
+# NOT when it is not, which is the honest reading for a developer machine where
+# gitleaks may well be absent. It is deliberately not --require-gitleaks here:
+# refusing every commit on a machine without an optional third-party binary is
+# how a hook gets uninstalled. CI passes --require-gitleaks, so the two-engine
+# guarantee is kept exactly where it is enforceable.
+"$python" "$gate" --repo "$root" --range staged || {
+    status=$?
+    echo >&2
+    echo "pre-commit: SECRET SCAN REFUSED THIS COMMIT (gate exit $status)." >&2
+    echo "            Nothing was committed. Fix the finding, or add the" >&2
+    echo "            fingerprint to .github/scan-accepted-fingerprints.txt with a" >&2
+    echo "            reason — DESCRIBE the value, never reproduce it." >&2
+    exit "$status"
+}

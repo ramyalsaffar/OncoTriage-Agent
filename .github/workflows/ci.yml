@@ -66,8 +66,19 @@
 #              appearing — the staleness check pip-audit's gate already had,
 #              which matters most for the BASE-LAG entries, whose whole point is
 #              that they expire.
-#   gitleaks   fails on any finding not fingerprinted in `.gitleaksignore`,
-#              which holds exactly one entry, argued.
+#   secrets    TWO ENGINES over ONE range — every object in the git object
+#              database, reachable or not. gitleaks 8.30.1 (~170 provider
+#              rules) and this project's own oncotriage/staging/secrets_scan.py
+#              (nine content detectors AND a filename layer). Every finding is
+#              normalised onto <blob-oid>:<engine>:<detector>:<locator> and
+#              gated by one accepted table,
+#              .github/scan-accepted-fingerprints.txt,
+#              which holds 21 entries in three argued blocks. A stale accepted
+#              entry fails the build; so does a scan that could not run.
+#              `.gitleaksignore` is unchanged and still read by the
+#              commit-attribution scan; MEASURED at this gitleaks pin, its two
+#              entries currently suppress nothing — the full-history scan
+#              reports zero findings with the file and zero without it.
 #
 # EVERY ACCEPTED ENTRY IS ONE ID WITH ONE REASON. There is no rule-level,
 # package-level or path-level suppression anywhere in this pipeline, so a NEW
@@ -544,40 +555,174 @@ jobs:
             --report "$RUNNER_TEMP/trivy-reports/trivy-full.json"
 
   # =========================================================================
-  # SECRET SCAN — the full history, not the working tree
+  # SECRET SCAN — the object database, by two engines
   # =========================================================================
+  #
+  # THE GATE IS THE OBJECT SCAN. The commit-attribution scan below it is kept,
+  # and is NOT the guarantee — both halves of that were measured rather than
+  # assumed, in a clone of this repository:
+  #
+  #   AN EVIL MERGE IS INVISIBLE TO A LOG SCAN. A merge commit may carry content
+  #   that is in NEITHER parent, and `git log -p` prints no diff for a merge, so
+  #   nothing built on `git log` ever sees it. Driven, with a shape-faithful AWS
+  #   key id and Hugging Face token committed that way into a clone of this
+  #   repository at 202 commits:
+  #
+  #       gitleaks git --log-opts="--all --full-history"
+  #           -> "202 commits scanned", "no leaks found", EXIT 0
+  #       secret_scan_gate.py --range objects
+  #           -> EXIT 1, 4 findings, both engines, naming the file
+  #
+  #   A push-range or `before..after` scan is strictly weaker than the
+  #   full-history scan that already misses this, so no narrower range can be
+  #   defended. The object walk has no "before", which is also what makes it
+  #   immune to a force-push moving one.
+  #
+  #   AND git MODE UNDER-REPORTS AGAINST dir MODE ON IDENTICAL CONTENT. The same
+  #   gitleaks v8.30.1, the same blob of oncotriage/storage/queries.py:
+  #
+  #       gitleaks git --log-opts="-1 <the commit that ADDED the line>"  -> 0
+  #       gitleaks dir <that exact blob, extracted>                      -> 1
+  #                                                                (generic-api-key, line 505)
+  #
+  #   Which is why `.gitleaksignore`'s two entries currently suppress NOTHING:
+  #   measured, the full-history scan reports zero findings WITH the file and
+  #   zero WITHOUT it. The file is honoured, unchanged and kept — a rule
+  #   tightening upstream can be reverted upstream, and the entries are argued —
+  #   but it is not load-bearing at this pin, and the object scan carries the
+  #   same two causes under blob fingerprints in
+  #   .github/scan-accepted-fingerprints.txt.
+  #
+  # WHAT IT COSTS, MEASURED ON THIS REPOSITORY (200 commits, 2,862 objects):
+  #       gitleaks git, full history         15.08 MB    ~1.4 s
+  #       the object gate, both engines     128.89 MB   ~18   s
+  # The object walk reads ~8.5x more because a log scan reads DIFFS and this
+  # reads every version of every file in full. Eighteen seconds once per push is
+  # the price of a range with no hole in it.
   secret-scan:
-    name: secret scan (full git history)
+    name: secret scan (object database, two engines)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Check out with full history
         uses: actions/checkout@v5
         with:
-          # REQUIRED. The working tree is one commit; a credential removed in a
-          # later commit is still in the objects and still clonable.
+          # REQUIRED, AND FOR A SHARPER REASON THAN BEFORE. The working tree is
+          # one commit; a credential removed in a later commit is still in the
+          # objects and still clonable — which is not an argument, it is
+          # control 4 of the standing test: after `git rm` + commit, a
+          # working-tree scan reports CLEAN while the gate still fails.
           fetch-depth: 0
 
-      - name: Name the scanner and version
-        # So an empty result is attributable to a specific scanner build rather
-        # than to "nothing ran".
-        run: docker run --rm zricethezav/gitleaks:v8.30.1 version
+      - name: Set up Python 3.11 (the container's version)
+        # The gate script is stdlib-only, but it imports this project's own
+        # scanner out of the checkout, and that module is written against the
+        # interpreter the image pins.
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
 
-      - name: gitleaks — every commit on every ref
-        # `--log-opts` is what makes this a history scan: --all covers every
-        # ref, --full-history stops git simplifying merge history away.
-        # --redact keeps any hit out of a public log; the fingerprint is enough
-        # to locate it.
+      - name: Install gitleaks 8.30.1, pinned by sha256
+        # THE RELEASE TARBALL, VERIFIED, RATHER THAN `docker run ...:v8.30.1`.
+        # A docker tag is mutable — `v8.30.1` is a name somebody can move — and
+        # this repository's Dockerfile already takes the opposite position by
+        # pinning its base images by digest. A checksum is that same guarantee
+        # for a binary.
+        #
+        # ONE BINARY FOR BOTH STEPS BELOW, and that is not tidiness: a rule
+        # renamed between two gitleaks builds changes every fingerprint it
+        # emits, and the two accepted tables in this repository are keyed on
+        # rule names. Two builds in one job could disagree with each other.
+        env:
+          GITLEAKS_SHA256: '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb'
+        #
+        # NOTHING IS WRITTEN INTO THE CHECKOUT. This job has no
+        # working-directory, so it runs AT the checkout, and the archive holds
+        # a top-level README.md and LICENSE beside the binary -- extracting it
+        # here without naming a member would overwrite this repository's own
+        # README. It is done in RUNNER_TEMP instead, which is the same rule the
+        # `tests` job states for its serial-precondition report: a stray file
+        # dropped into the checkout by a harness is the kind of thing that turns
+        # into a mystery failure. VERIFIED: the linux_x64 archive is
+        # `LICENSE README.md gitleaks`, and `gitleaks` is a statically linked
+        # x86-64 ELF.
         run: |
-          docker run --rm -v "$PWD":/repo -w /repo \
-            zricethezav/gitleaks:v8.30.1 git \
-              --log-opts="--all --full-history" \
-              --report-format=sarif \
-              --report-path=/repo/gitleaks.sarif \
-              --redact \
-              --exit-code 1 \
-              --verbose
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -sSfL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum --check --strict
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          rm -f gitleaks gitleaks.tar.gz
+          gitleaks version
+
+      - name: Install what the project's scanner needs to import
+        # NOT `make install`. The gate uses two PURE functions out of
+        # oncotriage/staging/secrets_scan.py, but that module imports
+        # oncotriage.config at MODULE SCOPE and config imports three
+        # third-party packages there — so the pure functions cost those
+        # imports, and without them the gate exits 3 rather than passing.
+        #
+        # MEASURED BY AST: the module-scope closure of that module reaches four
+        # third-party tops and no more — dotenv, httpx, openai, qdrant_client.
+        # No torch, no transformers, no streamlit, no langgraph, so this is
+        # seconds rather than the ~3.9 GB the `tests` job pays for.
+        #
+        # THE LIST IS NOT WRITTEN OUT HERE. `--print-requirements` is its one
+        # owner, and section 10 of tests/test_secret_scan_gate.py re-derives the
+        # closure by AST and fails when a new module-scope import appears in
+        # that chain — so this step cannot silently start installing too little.
+        run: |
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet \
+            $(python .github/scripts/secret_scan_gate.py --print-requirements)
+
+      - name: THE GATE — both engines over the whole object database
+        # `--require-gitleaks` so a missing binary is EXIT 3 and a red build,
+        # never a quiet single-engine pass. The two engines do not subsume each
+        # other and this repository is the counterexample to each direction:
+        #
+        #   the project scanner finds 15 findings in this history that gitleaks
+        #   finds ZERO of — twelve historical docker-compose.yml blobs carrying
+        #   a 56-character digitless Airflow signing key, which clears no
+        #   entropy floor gitleaks has, and three blobs of a test file carrying
+        #   a synthetic `sk-` sentinel that matches no gitleaks rule (its
+        #   openai-api-key rule requires the literal infix `T3BlbkFJ`);
+        #
+        #   gitleaks carries ~170 provider rules the nine detectors in
+        #   oncotriage/staging/secrets_scan.py have never heard of.
+        #
+        # Every finding is normalised onto <blob-oid>:<engine>:<detector>:
+        # <locator> and gated by ONE accepted table, so neither engine gets a
+        # second invisible gate of its own.
+        #
+        # EXIT 2 IS A STALE ACCEPTED ENTRY and it fails the build, on the
+        # precedent audit_gate.py and trivyignore_staleness.py both set. EXIT 3
+        # is "the scan could not run", which is not a pass.
+        run: python .github/scripts/secret_scan_gate.py --range objects --require-gitleaks
+
+      - name: Attribution scan — gitleaks over every commit on every ref
+        # KEPT, DEMOTED, AND NOT THE GUARANTEE. Read the block at the top of
+        # this job for what it provably cannot see. What it CAN do and the
+        # object scan cannot is name the commit, the author and the date for a
+        # finding — a blob oid says what the content is and nothing about who
+        # introduced it — so it stays as the attribution aid and as the one
+        # thing that reads `.gitleaksignore` in the form those entries are
+        # written in.
+        #
+        # `always()`: a red gate above is exactly when the attribution is most
+        # wanted. Its own failure still fails the job.
+        if: always()
+        run: |
+          gitleaks git \
+            --log-opts="--all --full-history" \
+            --report-format=sarif \
+            --report-path=gitleaks.sarif \
+            --redact \
+            --exit-code 1 \
+            --verbose
 
       - name: Upload the report
         if: always()
