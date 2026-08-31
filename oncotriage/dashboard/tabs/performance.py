@@ -21,6 +21,15 @@ from oncotriage.dashboard.tiers import (MATCH_TIER_COLORS, TRIAL_STATUS_NO_SCORE
 # is a second copy to drift, and the two disagreeing about what "unavailable"
 # means is precisely the failure that would make this panel worse than nothing.
 # Importing it costs no filesystem work: drift.py resolves its paths lazily.
+from oncotriage.constants import (
+    ECOG_SELECTION_ALL_AFTER_REFERENCE,
+    ECOG_SELECTION_ALL_BEFORE_PRIMARY_DIAGNOSIS,
+    ECOG_SELECTION_MOST_RECENT,
+    ECOG_SELECTION_NONE_RECORDED,
+    ECOG_SELECTION_UNDATED_AMBIGUOUS,
+    ECOG_SELECTION_UNDATED_SINGLE,
+    ECOG_SELECTION_VALUES,
+)
 from oncotriage.monitoring.drift import (
     ECOG_UNAVAILABLE_RATE_THRESHOLD,
     ecog_unavailable_rate,
@@ -197,20 +206,53 @@ def _render_ecog_availability(df):
     # what an operator does next. 'all_after_reference_date' points at
     # DATA_SNAPSHOT_DATE; 'none_recorded' points at the cohort;
     # 'undated_ambiguous' points at the bundles.
+    #
+    # KEYED OFF oncotriage.constants, NOT OFF RETYPED STRINGS, and that is a
+    # correction rather than a style choice. This table used to carry
+    # "most_recent_on_or_before_reference" -- no trailing `_date` -- while
+    # oncotriage/fhir/parser.py has always written
+    # "most_recent_on_or_before_reference_date". So THE SINGLE MOST COMMON PATH
+    # IN THE PIPELINE rendered as "unrecognised path -- not one of the five this
+    # pipeline writes", on every dashboard, for every corpus, and nothing
+    # failed: the fallback message is the only place a wrong key surfaces, and
+    # it reads like a data problem rather than like a typo here. A constant
+    # cannot drift from itself, which is why the fix is the import and not a
+    # corrected literal.
     _PATH_MEANING = {
-        "most_recent_on_or_before_reference":
+        ECOG_SELECTION_MOST_RECENT:
             "usable — the most recent observation dated on or before the "
             "reference date",
-        "undated_single":
+        ECOG_SELECTION_UNDATED_SINGLE:
             "usable — one undated observation, taken as the patient's",
-        "none_recorded":
+        ECOG_SELECTION_NONE_RECORDED:
             "no ECOG observation existed for this patient at all",
-        "all_after_reference_date":
+        ECOG_SELECTION_ALL_AFTER_REFERENCE:
             "UNUSABLE — every observation is dated AFTER "
             "DATA_SNAPSHOT_DATE. Check the snapshot date against the corpus.",
-        "undated_ambiguous":
+        ECOG_SELECTION_UNDATED_AMBIGUOUS:
             "UNUSABLE — several undated observations and no way to order them",
+        ECOG_SELECTION_ALL_BEFORE_PRIMARY_DIAGNOSIS:
+            "UNUSABLE — every observation predates the patient's primary "
+            "cancer diagnosis, so none of them describes the patient WITH the "
+            "disease. Not a snapshot-date problem and not a staleness one: an "
+            "old post-diagnosis score is still kept.",
     }
+
+    # THE TABLE MUST COVER THE WHOLE VOCABULARY, or a member added to
+    # oncotriage/constants.py renders under the "unrecognised path" message that
+    # exists for a producer defect. Checked here rather than left to a test
+    # because this panel is what an operator reads, and a missing explanation is
+    # worse than a loud one: it says the pipeline wrote something it should not
+    # have when in fact this file simply has not been told about it.
+    _unexplained = [v for v in ECOG_SELECTION_VALUES if v not in _PATH_MEANING]
+    if _unexplained:
+        st.warning(
+            "This panel has no explanation for "
+            f"{', '.join(_unexplained)} — a selection path was added to "
+            "`oncotriage/constants.py` and not to `_PATH_MEANING` in "
+            "`oncotriage/dashboard/tabs/performance.py`. The breakdown below "
+            "is still complete; only the explanations are missing."
+        )
 
     counts = df['ecog_selection'].value_counts(dropna=False)
     total = int(counts.sum())

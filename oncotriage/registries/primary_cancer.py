@@ -48,36 +48,42 @@ global used to raise NameError.
 
 from typing import Dict, List, Optional
 
+from oncotriage.constants import UNKNOWN_DATE
 from oncotriage.registries.cancer_code_registry import load_registry
 
 
 #------------------------------------------------------------------------------
 
 
-def _resolve_primary_cancer(conditions: List[Dict]) -> Optional[str]:
+def _resolve_primary_cancer_condition(conditions: List[Dict]) -> Optional[Dict]:
     """
-    Identify the primary cancer condition from a patient's condition list.
+    Identify the primary cancer CONDITION -- the whole dict, not a projection.
 
-    Mirrors the exact logic used by node_query_expansion (13- LangGraph Agent.py,
-    lines 460-471) so the database always records the same primary diagnosis
-    that drove the pipeline's query expansion and trial matching.
+    THIS IS THE ONE DERIVATION. ``_resolve_primary_cancer`` below is
+    ``.get("display")`` of what this returns and ``primary_cancer_onset_date``
+    is ``.get("onset_date")`` of it, so the diagnosis the database records, the
+    diagnosis the query expansion ran on and the diagnosis an ECOG observation
+    is dated against cannot be three different conditions. The resolution order
+    is unchanged from the display-only version this function was extracted from
+    -- filter, classify, tiebreak -- and every step is still the registry's.
 
     Resolution order:
       1. Filter out refuted/entered-in-error conditions (verification_status)
       2. Filter to primary cancer conditions via CancerCodeRegistry (3-layer detection)
       3. Tiebreak: confirmed > unconfirmed, active > remission, most recent onset
-      4. Return display text of the winning condition
+      4. Return the winning condition
 
     Fallback: if no cancer condition is found (edge case for non-cancer patients
-    that somehow entered the pipeline), returns the first condition's display.
-    If the condition list is empty, returns None.
+    that somehow entered the pipeline), returns the first valid condition -- the
+    same fallback the display-only version has always taken, kept so the two
+    cannot disagree about a non-cancer patient either. If the condition list is
+    empty, returns None.
 
     The registry comes from load_registry(), the module's own thread-safe cached
-    accessor. It used to be read as a bare _CANCER_REGISTRY out of the shared
-    exec namespace, where "13- LangGraph Agent.py" assigns it at line 64 -- a
-    layering violation that also meant this function raised NameError in any
-    chain that loaded 14 without 13. load_registry() returns the same singleton
-    File 13's own assignment gets, so a chain loading both is unaffected.
+    accessor, NOT from oncotriage.agent.deps: a stub installed for an agent test
+    must not change which condition the parser dates an ECOG observation
+    against. Same argument oncotriage/fhir/clean.py makes about the deletion
+    path, one consumer over.
     """
     if not conditions:
         return None
@@ -104,11 +110,62 @@ def _resolve_primary_cancer(conditions: List[Dict]) -> Optional[str]:
 
     # Step 3: Tiebreak and return
     if cancer_conditions:
-        primary = sorted(cancer_conditions, key=cancer_registry.sort_key)[0]
-        return primary.get("display")
+        return sorted(cancer_conditions, key=cancer_registry.sort_key)[0]
 
     # Fallback: no cancer found, return first valid condition
-    return valid[0].get("display") if valid else None
+    return valid[0] if valid else None
+
+
+def _resolve_primary_cancer(conditions: List[Dict]) -> Optional[str]:
+    """
+    Identify the primary cancer condition from a patient's condition list.
+
+    Mirrors the exact logic used by node_query_expansion (13- LangGraph Agent.py,
+    lines 460-471) so the database always records the same primary diagnosis
+    that drove the pipeline's query expansion and trial matching.
+
+    A PROJECTION OF ``_resolve_primary_cancer_condition`` since the ECOG
+    pre-diagnosis pass, which needed the winning condition's onset date and
+    could not get it from a display string. The resolution order and every
+    fallback are that function's and are unchanged; this returns the display
+    text of whatever it picked.
+
+    Fallback: if no cancer condition is found (edge case for non-cancer patients
+    that somehow entered the pipeline), returns the first condition's display.
+    If the condition list is empty, returns None.
+    """
+    primary = _resolve_primary_cancer_condition(conditions)
+    return primary.get("display") if primary is not None else None
+
+
+def primary_cancer_onset_date(conditions: List[Dict]) -> Optional[str]:
+    """
+    Onset date of the primary cancer condition, as the parser wrote it.
+
+    Returns the RAW string (``onsetDateTime``, or the ``onsetPeriod`` fallback
+    ``oncotriage/fhir/parser.py:_parse_condition`` applies), or None when there
+    is no primary condition or it carries no onset. It does NOT parse: the
+    caller does, with ``oncotriage.utils.parse_partial_date``, which is this
+    project's one date parser and the same one the caller uses on the other side
+    of every comparison it makes. A second parser here would be a second
+    convention with nothing failing when the two disagreed about a partial date.
+
+    ``UNKNOWN_DATE`` IS NORMALISED TO None, and that is the point of the
+    function rather than a courtesy. The parser writes the string "unknown" into
+    ``onset_date`` when a Condition carries no onset at all, and "unknown" sorts
+    lexically ABOVE every ISO date -- so a caller that took it as a date would
+    read the least-known diagnosis in the corpus as the most recent one. That is
+    the ``ecog_date`` trap ``oncotriage/storage/database_logger.py`` argues out
+    at length, met one field over. The rule this function enforces is the one
+    that column settled on: IT IS A DATE OR IT IS None.
+    """
+    primary = _resolve_primary_cancer_condition(conditions)
+    if primary is None:
+        return None
+    onset = primary.get("onset_date")
+    if not onset or onset == UNKNOWN_DATE:
+        return None
+    return onset
 
 
 #------------------------------------------------------------------------------

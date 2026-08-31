@@ -419,15 +419,32 @@ def z_score_drift(baseline: np.ndarray, current: np.ndarray) -> Dict:
 # drift_metrics.notes, so the diagnosis is stored with the alert rather than
 # only printed: whoever reads the row later needs to know what to check, and
 # the number on its own does not say.
+# THE SECOND CAUSE IS NAMED BECAUSE THE RATE STOPPED HAVING ONE. Until the ECOG
+# pre-diagnosis pass, an unusable observation meant a date-handling problem and
+# the only date that could cause it was the snapshot -- so a message that named
+# DATA_SNAPSHOT_DATE and nothing else was a complete diagnosis. It is not any
+# more: 'all_before_primary_diagnosis' rows are unusable for a CORRECTNESS
+# reason, with a snapshot date that is perfectly correct, and an operator sent
+# to check DATA_SNAPSHOT_DATE would find nothing wrong and have nowhere to go
+# next. The message now names the breakdown as the discriminator rather than
+# asserting one cause; the rate itself is right either way, because those
+# patients' ECOG criteria really are not evaluable.
 ECOG_UNAVAILABLE_DIAGNOSIS = (
-    "Patients had an ECOG observation on file that could not be used. A rate "
+    "Patients had an ECOG observation on file that could not be used. TWO "
+    "different causes produce this, and the selection-path breakdown on the "
+    "dashboard's Performance tab (or a GROUP BY ecog_selection) is what "
+    "separates them. (1) A rate "
     "near 1.0 means DATA_SNAPSHOT_DATE (oncotriage/config.py) and the patient "
     "corpus "
     "disagree -- the corpus was regenerated with observations dated after the "
     "snapshot, so every one resolves to 'all_after_reference_date' and every "
     "ECOG criterion becomes not_evaluable. Check DATA_SNAPSHOT_DATE against the "
     "generated_at/observation dates in the corpus run manifest, then re-run "
-    "the affected inferences."
+    "the affected inferences. (2) 'all_before_primary_diagnosis' rows are NOT a "
+    "date-handling fault: the observation is well-formed and inside the "
+    "snapshot, and it was refused because it predates the patient's own cancer "
+    "diagnosis. Nothing needs re-running for those; the corpus genuinely "
+    "carries no post-diagnosis performance status for them."
 )
 
 
@@ -460,6 +477,23 @@ def ecog_unavailable_rate(df: pd.DataFrame) -> Dict:
         which is a property of the source data, not a failure of this pipeline.
         A corpus where nobody has an ECOG scores 0.0 here, correctly: there is
         no reference-date mismatch to report.
+
+    THE NUMERATOR IS DERIVED, NOT ENUMERATED, and that is what made it survive
+    the pre-diagnosis pass with no edit. It is "reported, not 'none_recorded',
+    no value" -- so a selection path added to
+    ``oncotriage.constants.ECOG_SELECTION_VALUES`` joins it by construction the
+    moment the parser starts writing it, which is correct: every such path means
+    an observation existed and no grade came out of it, which is what this rate
+    measures. 'all_before_primary_diagnosis' joined that way.
+
+    WHAT THAT COSTS, stated because the alert TEXT is narrower than the metric:
+    the notes above name a reference-date mismatch as the cause, and a corpus
+    whose ECOGs mostly predate their diagnoses would raise the same alert for a
+    different reason. The METRIC is right either way -- those patients' ECOG
+    criteria really are not evaluable -- and the selection-path breakdown in
+    ``oncotriage/dashboard/tabs/performance.py`` is what separates the causes.
+    A per-path threshold would be a second alert with a second baseline and is
+    recorded as a follow-up rather than guessed at here.
 
     Args:
         df: Inference rows for the window being assessed.

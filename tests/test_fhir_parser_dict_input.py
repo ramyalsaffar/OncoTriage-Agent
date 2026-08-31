@@ -424,8 +424,11 @@ for _node in _server_tree.body:
             _module_imports.add(_alias.asname or _alias.name)
 
 check("the source was read (non-degeneracy)", len(_server_src) > 5000, True)
-check("the server module imports neither os nor tempfile",
-      sorted(_module_imports & {"os", "tempfile"}), [])
+# `tempfile` STAYS BANNED OUTRIGHT: the module has no use for it that is not
+# the deleted bridge, so its absence IS the property.
+check("the server module does not import tempfile",
+      sorted(_module_imports & {"tempfile"}), [])
+
 check("...json is still imported, because /match/file decodes an upload",
       "json" in _module_imports, True)
 
@@ -463,6 +466,24 @@ def _filesystem_calls(node):
                 if alias.name in _FILESYSTEM_NAMES:
                     found.add(alias.name)
     return sorted(found)
+
+
+# `os` USED TO BE BANNED WITH IT AND THAT CHECK WAS STALE, which is why it is
+# rewritten here rather than deleted or relaxed. The API-shutdown-gate pass
+# re-added `import os` for ONE reader -- `os.write(2, ...)` in the SIGTERM
+# handler, which must be async-signal-safe and therefore cannot be a `print` or
+# a log call -- and did not update this file, so bucket A shipped red. Banning
+# an import is a PROXY for "no temp-file round trip"; the property itself is
+# that no filesystem call is reached anywhere in the module, and that is what is
+# asserted now. It is strictly stronger: it fails on `os.unlink`, `os.remove`
+# and `mkstemp` however they were imported, which the import ban could not see
+# once any module-level `os` was legitimate.
+check("...and `os`, which it does import, reaches no filesystem call anywhere "
+      "in the module -- the property the import ban stood in for",
+      _filesystem_calls(_server_tree), [])
+check("...non-degeneracy: the module really does import os, so the check above "
+      "is about a live name rather than an absent one",
+      "os" in _module_imports, True)
 
 
 if _helper is not None:

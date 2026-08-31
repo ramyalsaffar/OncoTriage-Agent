@@ -99,6 +99,10 @@ import json
 import random
 
 from oncotriage.agent import patient as _patient_mod
+from oncotriage.constants import (
+    ECOG_SELECTION_ALL_BEFORE_PRIMARY_DIAGNOSIS,
+    ECOG_SELECTION_MOST_RECENT,
+)
 from oncotriage.agent.patient import compute_patient_hash as H
 from oncotriage.extraction.stage import extract_patient_stage
 from oncotriage.fhir.parser import parse_fhir_bundle
@@ -190,9 +194,19 @@ METASTASIS = {"code": "21907-1", "display": "Distant metastases.clinical [Class]
               "value": "cM1", "unit": None,
               "date": "2001-02-02T00:00:00-08:00", "metastasis_category": "M"}
 
+# `selection` carries the REAL spelling, imported rather than retyped. The
+# literal here used to read "most_recent_on_or_before_reference" -- no trailing
+# `_date` -- which the parser has never written; harmless in this file, because
+# every check on it moves the hash by CHANGING the string rather than by
+# matching it, and instructive because the same truncation in
+# oncotriage/dashboard/tabs/performance.py was NOT harmless and shipped.
 ECOG = {"value": 1, "date": "2020-02-02", "observations_found": 1,
-        "selection": "most_recent_on_or_before_reference",
-        "value_shape": "valueInteger"}
+        "selection": ECOG_SELECTION_MOST_RECENT,
+        "value_shape": "valueInteger",
+        # The anchor the pre-diagnosis refusal was measured against. Recorded on
+        # every patient beside `reference_date`, and deliberately NOT hashed --
+        # see check 3d-i.
+        "primary_diagnosis_date": "2019-05-26T13:15:53-07:00"}
 
 
 def with_(**fields):
@@ -371,6 +385,27 @@ check("3c  cancer_stage_observations.stage_code is NOT hashed -- a second "
 
 # The standing exclusion this file inherits rather than introduces. Recorded
 # here because it is the precedent every exclusion above cites.
+# ADDED BY THE ECOG PRE-DIAGNOSIS PASS, on this file's own rule that every
+# sub-field is shown to move the hash or shown not to. The anchor is a fact
+# about WHY a value was published or refused, not a fact about the patient: two
+# runs whose ECOG value, date, count and selection agree rendered the same
+# prompt text, so hashing the anchor would move a hash the prompt cannot see --
+# `value_shape`'s argument, one field over. It IS reachable: a patient whose
+# diagnosis is re-dated and whose ECOG is refused as a result changes
+# `selection`, which IS hashed, so the outcome is never invisible.
+check("3d-i  ecog.primary_diagnosis_date is NOT hashed -- the anchor explains a "
+      "refusal; the refusal itself rides in `selection`, which is hashed",
+      guarded(lambda: H(with_(ecog_performance_status=ECOG))
+              == H(with_(ecog_performance_status=edit(
+                  ECOG, primary_diagnosis_date="1999-01-01T00:00:00-08:00")))),
+      True)
+check("3d-ii  non-degeneracy: `selection` on the same dict IS hashed, so 3d-i "
+      "is not passing because the whole ECOG block stopped contributing",
+      guarded(lambda: H(with_(ecog_performance_status=ECOG))
+              == H(with_(ecog_performance_status=edit(
+                  ECOG, selection=ECOG_SELECTION_ALL_BEFORE_PRIMARY_DIAGNOSIS)))),
+      False)
+
 check("3d  ecog.value_shape is still NOT hashed -- normalising a corpus from "
       "valueQuantity to valueInteger must not move a hash whose prompt text is "
       "identical",

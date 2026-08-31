@@ -549,7 +549,7 @@ python tests/test_agent_ablation_flag_passthrough.py               #  39
 python tests/test_storage_inference_logging_contract.py            # 101 (was 79 when this line was written, then 98; the token-persistence pass added Test 2's three scoping/spread checks)
 python tests/test_agent_retrieval_observability.py                 # 103
 python tests/test_fhir_birth_date_and_demographics.py              # 172
-python tests/test_fhir_ecog_surfacing.py                           # 108 (this line said 105, and the file has not reported that since the ECOG-surfacing checks were extended; MEASURED 2026-08-20); needs 04-'s scratch corpus
+python tests/test_fhir_ecog_surfacing.py                           # 113 (was 108; the pre-diagnosis ECOG pass made section 7's present-but-unusable assertion name the FAMILY rather than one member -- the scratch corpus's only unusable path is now all_before_primary_diagnosis and all_after_reference_date occurs zero times there, so the old one-member check was about to fail for a reason unrelated to what it tests. This line said 105, and the file has not reported that since the ECOG-surfacing checks were extended; MEASURED 2026-08-20); needs 04-'s scratch corpus
 python tests/test_storage_ecog_logging.py                          # 155 (this line said 104 and was stale by 51; MEASURED 2026-08-20). Needs 04-'s scratch corpus too
 python tests/test_monitoring_ecog_availability_drift.py            # 111 (was 112; see pass 20e)
 
@@ -565,7 +565,7 @@ python tests/test_storage_query_layer.py                           # 434 (was 42
 # no spend, and none of them writes anything in the repository.
 python tests/test_paths_glob_determinism.py                        #  25
 python tests/test_storage_wipe_all_tables.py                       #  22
-python tests/test_fhir_parser_dict_input.py                        #  29
+python tests/test_fhir_parser_dict_input.py                        #  31 (was 28 passed / 1 FAILED on a developer tree -- bucket E, so CI never ran it. The API-shutdown-gate pass re-added `import os` to oncotriage/api/server.py for its async-signal-safe os.write(2, ...) and left this file asserting the server imports neither os nor tempfile. The import ban was a PROXY for 'no temp-file round trip'; the pre-diagnosis ECOG pass replaced it with the property itself -- no filesystem call is reached anywhere in the module -- which is strictly stronger and survives)
 python tests/test_ablation_db_isolation.py                         #  72 (was 43; pass 20f-3 added section 5b for the --db parent guard and the checkpoint)
 
 # The portability pass. Same shape, same directory. No network, no keys, no
@@ -647,7 +647,7 @@ python tests/test_api_call_mode_and_db_health.py                    # 151/0/0 on
 # of its argument -- including a control MODULE written to that temp directory
 # and PARSED, never imported -- an ast walk, or a registry entry removed inside
 # try/finally with the restore asserted. Bucket A, ~3 s.
-python tests/test_degradation_counter_readers.py                    # 155 (was 154; the de-identification pass added DEID_CENSUS to the census registry -- a capped age is the stage working -- and derived the "All N census counters are zero" number from the registry instead of the literal 4 it had gone stale as. Before that 152; the API-shutdown-gate pass added SHUTDOWN_GATE_DEGRADATIONS to _READER_EXEMPTIONS on oncotriage/mcp/server.py's TOOL_FAILURES precedent -- a long-lived SERVER has no run end, and degradation.py binds counter OBJECTS, so registering it would put FastAPI in every batch run's import graph. Before that 138; the operator-control pass added the two new dual-owned counters and replaced the adjacency pin on report_checkpoint_faults with a transitive call-graph walk)
+python tests/test_degradation_counter_readers.py                    # 157 (was 155; the pre-diagnosis ECOG pass added ECOG_ANCHOR_COUNTS to _READER_EXEMPTIONS on the parser's other four counters' footing -- a census read by load_all_patients(), whose own pass has an end where oncotriage/degradation.py's does not -- and the table drives its own follow-up checks. Before that 154; the de-identification pass added DEID_CENSUS to the census registry -- a capped age is the stage working -- and derived the "All N census counters are zero" number from the registry instead of the literal 4 it had gone stale as. Before that 152; the API-shutdown-gate pass added SHUTDOWN_GATE_DEGRADATIONS to _READER_EXEMPTIONS on oncotriage/mcp/server.py's TOOL_FAILURES precedent -- a long-lived SERVER has no run end, and degradation.py binds counter OBJECTS, so registering it would put FastAPI in every batch run's import graph. Before that 138; the operator-control pass added the two new dual-owned counters and replaced the adjacency pin on report_checkpoint_faults with a transitive call-graph walk)
 
 # The Docker pass. Same shape, same directory. No network, no keys, no spend,
 # and no Docker daemon: every Qdrant client is a stand-in and section 1's
@@ -726,7 +726,7 @@ python tests/test_storage_write_durability.py                       # 111 passed
 # is the natural control for a pure function of its argument. It DOES need the
 # corpus (sections 4 and 7 parse real bundles read-only) and says so as a
 # recorded failure rather than a silent skip. ~2 min, almost all of it parsing.
-python tests/test_agent_patient_hash_coverage.py                    #  69
+python tests/test_agent_patient_hash_coverage.py                    #  71 (was 69; the pre-diagnosis ECOG pass added 3d-i over the new ecog.primary_diagnosis_date sub-field -- NOT hashed, because it explains a refusal whose outcome already rides in `selection`, which is -- and 3d-ii, its non-degeneracy twin)
 
 # The tracking pass. Same shape, same directory. No network, no keys, no spend,
 # no live Qdrant, no corpus, no git history required, not in the collision
@@ -9734,6 +9734,293 @@ seam fails, which makes it look like it is working.** Counts are unchanged
 4. **`GET /match` and `inferences` are unchanged**: `result["patient_id"]` is
    the DB join key and the API's own contract. Nothing model-facing reads them,
    which is why they are out of scope rather than overlooked.
+
+### An ECOG that predates the diagnosis is refused (the pre-diagnosis ECOG pass)
+
+**ONE MEASURED CHANGE, AND WHAT IT IS NOT MATTERS AS MUCH AS WHAT IT IS.** An
+ECOG performance status recorded BEFORE the primary cancer was diagnosed
+describes a person who did not yet have the disease, and it is wrong in the
+FLATTERING direction -- a pre-diagnosis reading is systematically better than
+the post-diagnosis one, so it makes an unwell patient look eligible for a gate
+(`ECOG 0-1`, `ECOG 0-2`) that decides nearly every interventional oncology
+trial. **A general STALENESS floor was measured and REJECTED** -- it demoted 96%
+of the scored corpus and recovered nothing -- so an old POST-diagnosis score is
+kept and there is no age-based cutoff anywhere in this change.
+`tests/test_ecog_pre_diagnosis_suppression.py` check 2k pins a 27-year-old
+post-diagnosis reading as KEPT, which is what fails if anyone widens it.
+
+**MEASURED, THE WHOLE CORPUS, THROUGH THE SHIPPED CODE: 23 PATIENTS OF 1,000.**
+Scored patients go 698 -> **675**; `ECOG_SELECTION_COUNTS` reads
+`{'all_before_primary_diagnosis': 23, 'most_recent_on_or_before_reference_date':
+675, 'none_recorded': 302}`. The gaps are not marginal: `1997-11-29` offered as
+the performance status of a colon cancer diagnosed `2025-04-09`, `1993-11-14`
+against `2025-03-16`, `1982-09-19` against `2007-03-11`; the 23 gaps run
+**1.46 to 31.33 years, median 8.87**. **Exactly 23 hashes
+move and 977 do not**, driven before-and-after over all 1,000 bundles, and the
+23 are the same patient ids the pre-implementation measurement named. The
+`ecog_date` column's own comment already recorded the underlying fact -- "the
+median selected observation is roughly 17.7 years old, so a performance status
+that gates nearly every trial is routinely being read off a reading older than
+the disease".
+
+**IT IS A SELECTION-TIME REFUSAL, NOT A RENDER-TIME ONE**, and that follows from
+where the record is read. `inferences.ecog_value` / `ecog_selection` /
+`ecog_date` are written from `patient_data['ecog_performance_status']` through
+`_pipeline_provenance`, so a render-time suppression would leave the STORED row
+asserting a grade the prompt did not carry. The refused observation lands in the
+**present-but-unusable** family under its own selection value,
+`all_before_primary_diagnosis`, and never in `none_recorded`: "this patient has
+no ECOG on file" and "this patient's only ECOG predates their cancer" send an
+operator to two different places, and `observations_found` still counts what was
+on the bundle.
+
+**ONLY THE WINNER IS TESTED, AND THAT IS EXACT RATHER THAN APPROXIMATE.** The
+observation handed to the predicate is the MOST RECENT of the eligible pool, so
+if it predates the diagnosis every other eligible observation does too --
+there is no case where refusing the winner leaves a usable runner-up behind. The
+observations the reference-date partition already excluded are later still, or
+undated and unordered. Both directions are driven (checks 2n / 2o).
+
+**THE ANCHOR IS THE ONE DERIVATION, AND GETTING IT MEANT SPLITTING A
+PROJECTION.** `registries/primary_cancer.py` now holds
+`_resolve_primary_cancer_condition()` -- filter, classify, tiebreak, return the
+CONDITION -- with `_resolve_primary_cancer()` as `.get("display")` of it and the
+new `primary_cancer_onset_date()` as `.get("onset_date")`. So the diagnosis
+`inferences.primary_condition` records, the diagnosis Stage 1 expands on and the
+diagnosis an ECOG is dated against cannot be three different conditions.
+`UNKNOWN_DATE` is normalised to `None` there rather than carried: "unknown"
+sorts lexically ABOVE every ISO date, so a caller taking it as a date reads the
+least-known diagnosis in the corpus as the most recent one -- the `ecog_date`
+trap one field over.
+
+**THE ANCHOR IS RESOLVED FROM THE FILTERED, DEDUPLICATED CONDITION LIST**, which
+is the one thing no unit test can see and which check 3g drives: a **refuted**
+diagnosis does not anchor anything, because the resolution happens at the end of
+`parse_fhir_bundle` where the refuted/entered-in-error filter has already run.
+Resolved from the raw resource sweep it would refuse an ECOG against a diagnosis
+no other part of the pipeline believes in.
+
+**WHAT IT COSTS, STATED RATHER THAN DISCOVERED: `parse_fhir_bundle` NOW BUILDS
+THE CANCER REGISTRY.** The parser's import list goes from `constants`, `utils`
+to `constants`, `utils`, `registries.primary_cancer`. Importing it is still
+free -- `import icd10` is deferred inside `_build_icd10_cancer_sets()` and
+`tests/test_package_invariants.py` is unchanged at **260/0/0** -- but CALLING it
+resolves the registry once per process. `icd10-cm==0.0.5` is a declared
+dependency and every full-pipeline consumer built that registry a stage later
+anyway; what is new is that a process which ONLY parses bundles needs it too,
+and that a missing `icd10` raises at the parser rather than three modules
+downstream. Item 11a's deliberate loud failure, reached one module earlier.
+
+**BOTH DATES MUST RESOLVE TO DAY PRECISION OR NOTHING IS REFUSED.**
+`parse_partial_date()` anchors a coarser date to the MIDDLE of its range, so a
+year-only onset of "2019" resolves to 2019-07-15 and comparing against it would
+refuse an observation from the first half of that year on the strength of an
+anchor the record does not contain -- refusing a score that may well be
+post-diagnosis, which is the direction this guard must never fail in. **The
+stated limit**: an obviously pre-diagnosis reading is also kept when the onset is
+coarse. That is a MISS in the safe direction, it fires **zero times** on this
+corpus (every primary onset and every ECOG date is day-precision), and closing
+it means deriving each precision's earliest-possible date and comparing bounds
+-- a second date convention beside `parse_partial_date`'s mid-range anchor, and
+a recorded follow-up rather than untested machinery.
+
+**`ECOG_ANCHOR_COUNTS` IS WHAT MAKES THAT LIMIT COUNTABLE INSTEAD OF SILENT.**
+One key per patient that reached the check, so the total is exactly the
+population where a refusal was possible: `compared`, `no_primary_onset`,
+`onset_precision:{p}`, `observation_precision:{p}`. A key other than `compared`
+means the guard was ASKED FOR and could not run -- those patients keep a score
+that may predate their own diagnosis and nothing else in the record would say
+the question had been asked and abandoned. It reads **`{'compared': 698}`** on
+the corpus. The suppressed/kept split is deliberately NOT repeated here: it
+already lives in `ECOG_SELECTION_COUNTS`. `load_all_patients()` prints it, which
+is the reader that puts it on `tests/test_degradation_counter_readers.py`'s
+parser exemption on the same footing as the other four (**155 -> 157**).
+
+**THE VOCABULARY MOVED TO `oncotriage/constants.py`, AND THE DRIFT IT PREVENTS
+HAD ALREADY HAPPENED.** `oncotriage/dashboard/tabs/performance.py` keyed its
+explanation table on `"most_recent_on_or_before_reference"` -- **no trailing
+`_date`** -- while the parser has always written
+`"most_recent_on_or_before_reference_date"`. So **the single most common path in
+the whole pipeline rendered as "unrecognised path -- not one of the five this
+pipeline writes", on every dashboard, for every corpus, and nothing failed**:
+the fallback message is the only place a wrong key surfaces and it reads like a
+data problem rather than like a typo. `ECOG_SELECTION_VALUES` is the closed
+six-member set now, `ECOG_SELECTION_USABLE` the two that publish a grade, and
+the dashboard keys its table off the NAMES -- a constant cannot drift from
+itself, which is why the fix is the import and not a corrected literal.
+`constants.py` is the right home for the same reason `SYSTEM_KEY_ABSENT` is: the
+four consumers sit in subpackages that may not import each other (`storage` may
+not import `fhir`; a dashboard tab importing the FHIR parser to read six strings
+would drag a parser into a Streamlit rerun), and that module imports nothing at
+all. Two truncated spellings survive in test SEEDS
+(`tests/test_storage_query_layer.py`, `tests/test_clinical_use_framing.py`) and
+are provably inert -- **no registered query names `ecog_selection` at all** --
+and are reported rather than swept.
+
+**THE DRIFT METRIC NEEDED NO EDIT AND THE ALERT TEXT DID.** The numerator is
+DERIVED -- "reported, not `none_recorded`, no value" -- so the new path joined it
+by construction, which is correct: an observation existed and no grade came out
+of it. Driven: a corpus of suppressed rows reads 1.0, a half-and-half corpus
+0.5. What was NOT right was the stored diagnosis: `ECOG_UNAVAILABLE_DIAGNOSIS`
+named `DATA_SNAPSHOT_DATE` as THE cause, so an operator meeting the alert for
+the new reason would check the snapshot, find nothing wrong and have nowhere to
+go. It names both causes now and points at the selection-path breakdown as the
+discriminator.
+
+**THE RENDERED LINE NAMES THE CUTOFF THAT ACTUALLY REFUSED.** A pre-diagnosis
+observation is well-formed and INSIDE the snapshot, so printing "reference date
+2026-08-03" beside it would point a reader at a fault that is not there:
+
+    - ECOG performance status: not available (1 observation(s) on file, none
+      usable: all_before_primary_diagnosis; every observation predates the
+      primary cancer diagnosis dated 2019-05-26)
+
+The anchor is READ OFF THE RECORD, never re-derived -- a second derivation in
+the renderer could state a diagnosis date the refusal was not measured against,
+and check 5k pins that the renderer calls no primary-cancer resolver of its own.
+The other unusable paths still name the reference date (check 5g).
+
+**THE RECORD CARRIES `primary_diagnosis_date` ON EVERY PATIENT**, on
+`reference_date`'s precedent -- the dict records the cutoffs it applied, so a
+reader can CHECK the refusal rather than take it -- and it is deliberately **not
+hashed**: it explains a refusal, and the refusal itself rides in `selection`,
+which is. `tests/test_agent_patient_hash_coverage.py` gains 3d-i and its
+non-degeneracy twin 3d-ii (**69 -> 71**).
+
+**WHAT A SUPPRESSED PATIENT'S STAGE 5 RECORD ACTUALLY LOSES, diffed on a real
+bundle: TWO lines.** The ECOG line, and the `Patient:` pseudonym -- which is
+DERIVED from `compute_patient_hash`, so a hash that moved moves it. That is the
+documented coupling in `oncotriage/deid.py` working, not a second change. **215
+non-suppressed corpus patients render byte-identical summaries.**
+
+**THIS IS AN INPUT CHANGE AND THE FIXTURES ARE NOT RE-CAPTURED.** Measured
+against a `git worktree` at HEAD rather than assumed, twice, deterministically:
+the baseline is **1/12 clean** -- the de-identification pass already invalidated
+eleven and did not recapture, so the "CURRENT STATE, 2026-08-20 ... 12/12 clean"
+note further up this file is itself stale. This change takes it to **0/12**:
+
+| | |
+|---|---|
+| `normal_2` (patient `23cfa371`, ECOG 2 of 2013-03-14 against a 2019-05-26 breast cancer) | **the one genuinely suppressed fixture** -- gains 7 differing fields: the whole ECOG block plus `terminal.degradation.ecog_selection` / `ecog_value` |
+| six other RECORDED fixtures | gain exactly ONE field, `patient_data.ecog_performance_status.primary_diagnosis_date` |
+| `mcode_genomic_variant`, `mesh_fallback_siteless_code`, `no_candidates_pediatric_age` | **FATAL**, not DIFFERS -- the derivation gate compares the rebuilt `patient_data` against the recorded one and the added key makes them differ. Its message ("the recipe, the donor bundle or the parser changed") is TRUE: the parser changed |
+
+**THE COST OF THE NEW KEY IS STATED PLAINLY: it widens fixture invalidation from
+one file to twelve, and turns three constructed fixtures from a listed diff into
+an abort until the recapture.** It was taken anyway, because `--resume` skips on
+prompt version / model / collection name / digest and cannot see a `patient_data`
+change at all -- so a full recapture was already owed either way -- and because
+a refusal that cannot be audited from the record it is written into is worse
+than one fixture's worth of diagnostic value in the interim.
+
+**AN EXISTING TEST WAS ONE CORPUS AWAY FROM FAILING FOR THE WRONG REASON, and
+this pass found it by running rather than by reading.**
+`tests/test_fhir_ecog_surfacing.py` section 7 asserted
+`_unusable_real[0]["selection"] == "all_after_reference_date"` -- one member,
+against whichever bundle sorted first -- on the premise that the reference date
+is the only thing that can make a present observation unusable. On the scratch
+corpus that premise is now false in the strongest possible way: the ONLY
+unusable path there is `all_before_primary_diagnosis` (4 patients) and
+`all_after_reference_date` occurs **zero** times. The check asserts the FAMILY
+now -- a present-but-unusable patient names a path from the closed unusable set,
+derived from the vocabulary rather than listed -- and PRINTS which paths the
+corpus produced. **108 -> 113.**
+
+**AND A STALE ASSERTION IN A THIRD FILE WAS FIXED RATHER THAN LEFT.**
+`tests/test_fhir_parser_dict_input.py` asserted "the server module imports
+neither os nor tempfile"; the API-shutdown-gate pass re-added `import os` for
+one reader (`os.write(2, ...)` in the SIGTERM handler, which must be
+async-signal-safe) and did not update it, so that file has been failing 28/1 on
+a developer tree. It is bucket **E**, so CI never ran it and nothing went red.
+Banning the import was a PROXY for "no temp-file round trip"; the property
+itself is that no filesystem call is reached anywhere in the module, which is
+what is asserted now -- strictly stronger, since it fails on `os.unlink`,
+`os.remove` or `mkstemp` however they were imported. Driven both ways: the
+shipped tree reports `[]`, a copy with one planted `os.unlink` reports
+`['unlink']`. **28 passed / 1 failed -> 31 / 0.**
+
+```bash
+# The pre-diagnosis ECOG pass. Same shape, same directory. No network, no keys,
+# NO SPEND, no live Qdrant, no model load, no corpus, no database, no git
+# history, no live server -- every bundle is a literal dict handed to
+# parse_fhir_bundle. It DOES build the cancer registry (`import icd10`), which
+# is not incidental: that is the dependency this change adds to the parser, and
+# a test of the change that avoided it would be avoiding the thing under test.
+# It writes NOTHING anywhere, not even a temp directory, and it EXECS NOTHING
+# and loads no module by location -- the one plant is an attribute rebind
+# inside try/finally with the restore asserted BY IDENTITY, which is the
+# natural control for a module-global lookup and needs no _EXEC_ALLOWLIST
+# entry. NOT in the collision matrix: the three repository files it reads
+# (fhir/parser.py, agent/patient.py, dashboard/tabs/performance.py) are written
+# by neither of the suite's two writers and are sha256-compared at the end.
+# Bucket A, ~2.5 s (MEASURED against ONLY the provisioned CI skeleton).
+python tests/test_ecog_pre_diagnosis_suppression.py                 #  94
+```
+
+**A DEFECT IN THIS PASS'S OWN CODE WAS FOUND BY RE-READING IT AFTER IT WAS
+GREEN, AND MEASURED RATHER THAN REASONED ABOUT.** The first version of the
+predicate took the OBSERVATION and re-parsed its date -- while the caller's
+partition, four lines above, had already run `parse_partial_date()` over that
+exact field. That function INCREMENTS `PARTIAL_DATE_DEGRADATIONS` on an
+out-of-range component, so one bad ECOG date was recorded **twice**: driven,
+`"2019-02-30"` scored `out_of_range:day = 1` through a bare parse and **`= 2`**
+through the selection function. It is exactly the double-count the comment
+inside that partition loop already forbids, arrived at from the other side, and
+the comment I had written on the second call asserted the opposite. The
+predicate takes `(observation_date, observation_precision, anchor)` now -- the
+pair the partition already computed, carried with the winner -- so it parses
+only the ANCHOR, which is a Condition field the ECOG partition never touched.
+Check 1k is the measurement and 1k-i is its non-degeneracy probe, without which
+it would be comparing two empty dicts.
+
+**THE PLANT IS AN INVERTED PREDICATE AND THE CONTROL COMES FIRST.** Section 8
+rebinds `parser._ecog_predates_primary_diagnosis` to a copy whose comparison is
+the wrong way round -- and NOTHING ELSE, so the checks say which change they
+caught -- then drives the REAL selection function, the REAL parser and the REAL
+renderer. The pre-diagnosis reading is published, the post-diagnosis one is
+refused, and the rendered record prints the grade the ruling forbids. The
+CONTROL runs above it and requires the shipped predicate to give the clean
+answer on the identical inputs; without it a probe that disagreed with
+everything would report the plant as caught while measuring nothing. The seam is
+then asserted (the rebind really reached the caller) and the restore is compared
+**by identity**, not by equality, which any callable of the same name would
+satisfy.
+
+**VERIFIED BY RUNNING.** `tests/test_package_invariants.py` **260/0/0**,
+unchanged; CI bucket A green; `tests/test_fhir_ecog_surfacing.py` **113**,
+`tests/test_storage_ecog_logging.py` **155**,
+`tests/test_monitoring_ecog_availability_drift.py` **111**,
+`tests/test_agent_patient_hash_coverage.py` **71**,
+`tests/test_fhir_birth_date_and_demographics.py` **172**,
+`tests/test_registries_cancer_codes_and_stage_extraction.py` **136**,
+`tests/test_degradation_counter_readers.py` **157**,
+`tests/test_fhir_parser_dict_input.py` **31**; the dashboard panel rendered
+through `AppTest` with the new value present (all six paths explained, the
+unavailable rate 28% over a 23-suppressed / 5-after-reference / 60-scored
+frame); `load_all_patients` driven to show the new counter line. **No money was
+spent, no migration was run, no fixture was re-captured and the production
+`inferences.db` was never opened.**
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **The twelve fixtures are stale and 0/12 replay clean.** Eleven were already
+   stale before this pass. The recapture is one paid `python fixture_capture.py`
+   run and is the standing item.
+2. **A coarse onset date disables the guard for that patient** (above). The
+   bounds refinement is the follow-up; `ECOG_ANCHOR_COUNTS` is what makes the
+   population countable if it ever becomes non-zero.
+3. **A pre-diagnosis SCREENING ECOG is refused with everything else.** The
+   ruling is "strictly before the onset", and an ECOG taken two weeks before a
+   diagnosis is arguably the baseline a trial screens against. It fires zero
+   times on this corpus -- MEASURED, the 23 gaps run **1.46 to 31.33 years,
+   median 8.87** -- and admitting a window is a clinical decision with its own
+   measurement, not a parser one.
+4. **The metastatic/recurrence case is not modelled.** The anchor is the PRIMARY
+   diagnosis, so an ECOG taken after the primary and before a much later
+   metastatic recurrence is kept, which is right for this ruling and is not the
+   same question as "does this score describe the patient's CURRENT disease".
+5. **Two truncated `ecog_selection` spellings survive in test seeds** and are
+   provably inert (no registered query names the column). Reported, not swept.
 
 ### The identifier exemption is bounded by length (the identifier-cap pass)
 

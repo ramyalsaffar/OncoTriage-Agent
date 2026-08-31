@@ -109,6 +109,11 @@ from oncotriage.agent import patient as _agent_patient
 from oncotriage.agent.patient import _create_patient_summary, compute_patient_hash
 from oncotriage.config import DATA_SNAPSHOT_DATE
 from oncotriage.fhir import parser as _fhir_parser
+from oncotriage.constants import (
+    ECOG_SELECTION_NONE_RECORDED,
+    ECOG_SELECTION_USABLE,
+    ECOG_SELECTION_VALUES,
+)
 from oncotriage.fhir.parser import (
     ECOG_SELECTION_COUNTS,
     ECOG_VALUE_SHAPE_COUNTS,
@@ -135,6 +140,15 @@ from dateutil.relativedelta import relativedelta
 # Scratch corpus written by '04- FHIR Generate Data.py --output-dir ...'.
 # Resolved from data_patient_path, never written as an absolute path.
 _SCRATCH_FHIR_DIR = data_patient_path + "scratch_ecog/fhir/"
+
+# DERIVED, not listed: "present but unusable" is everything in the closed
+# vocabulary that is neither a usable path nor the no-observation path, so a
+# member added to oncotriage/constants.py joins it without an edit here. A
+# retyped list is what let oncotriage/dashboard/tabs/performance.py's own copy
+# of this vocabulary drift by a trailing "_date" and go unnoticed.
+_UNUSABLE_SELECTIONS = tuple(v for v in ECOG_SELECTION_VALUES
+                             if v not in ECOG_SELECTION_USABLE
+                             and v != ECOG_SELECTION_NONE_RECORDED)
 
 
 # ===========================================================================
@@ -642,19 +656,46 @@ else:
     # When the corpus is generated ON the snapshot date -- the normal case
     # after a regeneration -- nothing postdates it, _unusable_real is empty,
     # and the else branch reports that rather than asserting on nothing.
+    #
+    # THE ASSERTION IS ON THE FAMILY, NOT ON ONE MEMBER, and that is a
+    # correction the ECOG pre-diagnosis pass had to make rather than a
+    # loosening. It read `_ustatus["selection"] == "all_after_reference_date"`
+    # against `_unusable_real[0]` -- whichever bundle sorted first -- on the
+    # premise that the reference date is the only thing that can make a present
+    # observation unusable. It is not: an observation that predates the
+    # patient's own primary cancer diagnosis is refused too, and on the
+    # 1,000-patient corpus 23 patients take that path. So the old check was one
+    # scratch corpus away from failing for a reason that has nothing to do with
+    # what it is about. It now asserts the property it always meant -- a
+    # present-but-unusable patient names a path from the closed unusable set,
+    # never `none_recorded` -- and PRINTS which paths this corpus produced, so a
+    # corpus that stops exercising one is visible rather than silent.
     if _unusable_real:
+        _unusable_paths = sorted({_s["selection"] for _, _, _s in _unusable_real})
+        print(f"  unusable paths in this corpus: {_unusable_paths}")
+        check("every present-but-unusable patient names a path from the "
+              "unusable set",
+              [p for p in _unusable_paths
+               if p not in _UNUSABLE_SELECTIONS], [])
+        check("...and none of them is reported as 'none_recorded'",
+              ECOG_SELECTION_NONE_RECORDED in _unusable_paths, False)
+        check("every present-but-unusable patient keeps value None",
+              [s["value"] for _, _, s in _unusable_real if s["value"] is not None],
+              [])
+        check("...and carries a non-zero observation count, which is what "
+              "separates them from the unscored",
+              [s["observations_found"] for _, _, s in _unusable_real
+               if not s["observations_found"]], [])
         _uname, _upatient, _ustatus = _unusable_real[0]
-        check("real present-but-unusable patient names the reason",
-              _ustatus["selection"], "all_after_reference_date")
-        check("real present-but-unusable patient keeps value None",
-              _ustatus["value"], None)
         check("and its summary does not say 'not recorded'",
               "not recorded" in _performance_status_section(
                   _create_patient_summary(_upatient)),
               False)
     else:
-        print("  NOTE  no scratch observation postdates the reference date; "
-              "the after-reference path is covered synthetically in section 3 only")
+        print("  NOTE  no scratch observation is unusable; the after-reference "
+              "path is covered synthetically in section 3 and the "
+              "pre-diagnosis path in "
+              "tests/test_ecog_pre_diagnosis_suppression.py")
 
     # Hashes must actually differ across real patients with different scores.
     _by_value = {}

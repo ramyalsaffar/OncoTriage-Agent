@@ -92,11 +92,18 @@ from typing import Dict, FrozenSet, List, Optional, Tuple
 from dateutil.relativedelta import relativedelta
 
 from oncotriage.constants import (
+    ECOG_SELECTION_ALL_AFTER_REFERENCE,
+    ECOG_SELECTION_ALL_BEFORE_PRIMARY_DIAGNOSIS,
+    ECOG_SELECTION_MOST_RECENT,
+    ECOG_SELECTION_NONE_RECORDED,
+    ECOG_SELECTION_UNDATED_AMBIGUOUS,
+    ECOG_SELECTION_UNDATED_SINGLE,
     LOINC_AJCC_CLINICAL_M,
     SYSTEM_KEY_ABSENT,
     SYSTEM_KEY_UNRECOGNIZED,
     UNKNOWN_DATE,
 )
+from oncotriage.registries.primary_cancer import primary_cancer_onset_date
 from oncotriage.utils import (
     deduplicate_by_display,
     get_age_reference_date,
@@ -548,8 +555,26 @@ def parse_fhir_bundle(bundle_or_path) -> Dict:
 
     # Set for every patient, not only for the ones that have a score, so the
     # field's absence never has to be distinguished from a value of None.
+    #
+    # THE ANCHOR IS RESOLVED HERE AND NOWHERE ELSE, and it is resolved AFTER the
+    # condition list has been filtered and deduplicated -- which is what makes
+    # it the same condition `_resolve_primary_cancer` will name in
+    # `inferences.primary_condition` and the same one Stage 1 expands on. A
+    # second derivation over the raw resource sweep could pick a refuted or a
+    # duplicate condition and date an ECOG against a diagnosis no other part of
+    # the pipeline believes in.
+    #
+    # WHAT IT COSTS, stated rather than discovered: this is the first call in
+    # this module that reaches the cancer registry, so `parse_fhir_bundle` now
+    # builds it -- one cached singleton per process, `import icd10` on first
+    # construction. `icd10-cm` is a declared dependency, and every full-pipeline
+    # consumer of this parser already built the registry a stage later. What is
+    # new is that a process which ONLY parses bundles now needs it too, and that
+    # a missing `icd10` raises here rather than three modules downstream --
+    # item 11a's deliberate loud failure, reached one module earlier.
     patient_data['ecog_performance_status'] = _select_ecog_performance_status(
-        ecog_observations
+        ecog_observations,
+        primary_cancer_onset_date(patient_data['conditions']),
     )
 
     return patient_data
@@ -985,6 +1010,30 @@ _ECOG_MAX_GRADE: int = 5
 ECOG_VALUE_SHAPE_COUNTS = Counter()
 ECOG_SELECTION_COUNTS = Counter()
 
+# Whether the pre-diagnosis check could be MADE, per patient who had a usable
+# ECOG to test. One key per patient, so the total is exactly the number of
+# patients that reached the check:
+#
+#   compared                    both dates resolved to day precision and the
+#                               comparison ran. Whether it SUPPRESSED is in
+#                               ECOG_SELECTION_COUNTS, which is where the
+#                               outcome already lives -- repeating it here
+#                               would be a second copy of one number.
+#   no_primary_onset            no primary condition resolved, or the one that
+#                               did carries no onset. The observation is KEPT.
+#   onset_precision:{p}         the primary onset parsed to something coarser
+#                               than a day ('year', 'month', 'unparseable').
+#   observation_precision:{p}   the selected observation's own date did. The
+#                               `undated_single` path lands here by
+#                               construction: it selects an observation with
+#                               no date at all.
+#
+# A NON-ZERO REFUSAL KEY MEANS THE GUARD DID NOT RUN FOR THOSE PATIENTS, which
+# is the fact that would otherwise be invisible: they keep an ECOG that may
+# predate their diagnosis and nothing in the record says the question was
+# asked and abandoned. It reads {'compared': 698} on the 1,000-patient corpus.
+ECOG_ANCHOR_COUNTS = Counter()
+
 
 def _parse_ecog_observation(obs_resource: Dict) -> Dict:
     """
@@ -1080,7 +1129,85 @@ def _parse_ecog_observation(obs_resource: Dict) -> Dict:
     }
 
 
-def _select_ecog_performance_status(ecog_observations: List[Dict]) -> Dict:
+# The precision parse_partial_date() reports when it resolved a whole date.
+# Anything coarser is anchored to a MID-RANGE day (PARTIAL_DATE_ANCHOR_*), which
+# is the right choice for an age and the wrong one for a strict ordering: "2019"
+# resolves to 2019-07-15, so an observation on 2019-03-01 would read as
+# pre-diagnosis against a diagnosis that may have been in January.
+_DAY_PRECISION: str = "day"
+
+
+def _ecog_predates_primary_diagnosis(observation_date,
+                                     observation_precision: str,
+                                     primary_diagnosis_date: Optional[str]) -> Tuple[bool, str]:
+    """
+    Whether this ECOG observation was recorded BEFORE the primary cancer was
+    diagnosed. Returns ``(suppress, anchor_outcome)``.
+
+    IT TAKES THE ALREADY-PARSED OBSERVATION DATE, never the observation, and
+    that is a correctness requirement rather than a convenience. The caller's
+    partition has already run ``parse_partial_date()`` over that exact field,
+    and that function INCREMENTS ``PARTIAL_DATE_DEGRADATIONS`` on an
+    out-of-range component -- so a second call here would count one bad date
+    twice. Measured, before it was fixed: an ECOG dated "2019-02-30" recorded
+    ``out_of_range:day`` ONCE through a bare parse and TWICE through the
+    selection function. That is the double-count the comment inside the
+    partition loop already forbids, met from the other side.
+
+    ``anchor_outcome`` is the key counted into ECOG_ANCHOR_COUNTS and is
+    returned rather than counted here so this stays a pure function of its two
+    arguments -- which is what lets every case be driven as a different INPUT
+    rather than through a patched module.
+
+    THE RULE IS STRICTLY BEFORE. An ECOG recorded ON the diagnosis date is the
+    baseline performance status a trial screens against and is kept; only a
+    reading that predates the diagnosis describes a person who did not yet have
+    the disease.
+
+    IT ONLY EVER HAS TO TEST THE WINNER, and that is a property of the caller
+    rather than an approximation. The observation handed here is the MOST RECENT
+    of the eligible pool, so if it predates the diagnosis every other eligible
+    observation does too -- there is no case where suppressing the winner leaves
+    a usable runner-up behind. The observations the partition already excluded
+    are later still (after the reference date) or unordered (undated).
+
+    BOTH DATES MUST RESOLVE TO DAY PRECISION OR NOTHING IS SUPPRESSED, and the
+    reason is the fail-safe direction rather than tidiness. parse_partial_date()
+    anchors a coarser date to the MIDDLE of its range, so comparing a year-only
+    onset would suppress an observation from the first half of the diagnosis
+    year on the strength of an anchor the record does not contain -- suppressing
+    a score that may well be post-diagnosis, which is the direction this guard
+    must never fail in. A coarser date on either side is counted and the
+    observation is KEPT, which is the same answer a missing anchor gets.
+
+    THE STATED LIMIT: an obviously pre-diagnosis reading is also kept when the
+    onset is coarse -- an ECOG in 1995 against an onset of "2019" is not
+    suppressed. That is a MISS in the safe direction. Closing it means deriving
+    the earliest date each precision could stand for and comparing bounds, which
+    is a second date convention beside parse_partial_date()'s mid-range anchor;
+    it is a recorded follow-up rather than untested machinery, and
+    ECOG_ANCHOR_COUNTS is what makes the population it would serve countable.
+    Measured on the 1,000-patient corpus: every primary onset and every ECOG
+    date resolves to day precision, so the branch fires zero times today.
+    """
+    if not primary_diagnosis_date:
+        return False, "no_primary_onset"
+
+    # The ANCHOR is parsed here and only here: it is a Condition field, so the
+    # ECOG partition never touched it and there is nothing to double-count.
+    onset_date, onset_precision = parse_partial_date(primary_diagnosis_date)
+    if onset_date is None or onset_precision != _DAY_PRECISION:
+        return False, f"onset_precision:{onset_precision}"
+
+    if observation_date is None or observation_precision != _DAY_PRECISION:
+        return False, f"observation_precision:{observation_precision}"
+
+    return observation_date < onset_date, "compared"
+
+
+def _select_ecog_performance_status(
+        ecog_observations: List[Dict],
+        primary_diagnosis_date: Optional[str] = None) -> Dict:
     """
     Reduce a patient's ECOG observations to the one score the pipeline uses.
 
@@ -1096,6 +1223,30 @@ def _select_ecog_performance_status(ecog_observations: List[Dict]) -> Dict:
     events the snapshot has not reached. Undated observations cannot be ordered,
     so a lone one is used and several are refused rather than picked between.
 
+    AND AN OBSERVATION THAT PREDATES THE PRIMARY CANCER DIAGNOSIS IS REFUSED
+    LAST, after the winner has been chosen, because it is the winner that has to
+    be tested -- see _ecog_predates_primary_diagnosis() for why testing it alone
+    is exact rather than approximate. Such a reading is well-formed and inside
+    the snapshot; what is wrong with it is that it describes the patient BEFORE
+    they had the disease, and it is wrong in the flattering direction. It lands
+    in the present-but-unusable family under its own selection value, never in
+    'none_recorded' and never silently: 'this patient has no ECOG on file' and
+    'this patient's only ECOG predates their cancer' send an operator to two
+    different places.
+
+    Args:
+        ecog_observations: every ECOG observation on the bundle, parsed.
+        primary_diagnosis_date: the onset date of the primary cancer condition,
+            as ``oncotriage.registries.primary_cancer.primary_cancer_onset_date``
+            returns it -- the ONE derivation the database, the query expansion
+            and this function all share. DEFAULTS TO None, which means "no
+            anchor was supplied" and therefore "suppress nothing": the fail-safe
+            direction, and what keeps every existing single-argument caller
+            testing exactly the reference-date partition it was written for.
+            ``parse_fhir_bundle`` always supplies it, and
+            ``tests/test_ecog_pre_diagnosis_suppression.py`` pins that call site
+            by AST so the default cannot become the production path by omission.
+
     Returns:
         dict, ALWAYS present on the patient even when nothing was found:
 
@@ -1110,8 +1261,19 @@ def _select_ecog_performance_status(ecog_observations: List[Dict]) -> Dict:
           observations_on_or_before_reference  int
           observations_after_reference         int
           observations_undated                 int
-          selection    str -- which path produced (or failed to produce) value
+          selection    str -- which path produced (or failed to produce) value.
+                       One of oncotriage.constants.ECOG_SELECTION_VALUES; the
+                       vocabulary lives there rather than here because storage,
+                       monitoring and the dashboard all branch on it and none of
+                       them may import this module.
           reference_date str -- the cutoff actually applied, ISO
+          primary_diagnosis_date str | None -- the diagnosis anchor actually
+                       applied, on reference_date's precedent: the dict records
+                       the cutoffs it used, so a reader can check the refusal
+                       rather than take it. None means no anchor was available,
+                       which `selection` disambiguates from "an anchor was
+                       available and nothing was suppressed" exactly as it
+                       disambiguates the three meanings of `value is None`.
     """
     reference_date = get_age_reference_date()
 
@@ -1124,8 +1286,9 @@ def _select_ecog_performance_status(ecog_observations: List[Dict]) -> Dict:
         'observations_on_or_before_reference': 0,
         'observations_after_reference':        0,
         'observations_undated':                0,
-        'selection':      'none_recorded',
+        'selection':      ECOG_SELECTION_NONE_RECORDED,
         'reference_date': reference_date.isoformat(),
+        'primary_diagnosis_date': primary_diagnosis_date,
     }
 
     if not ecog_observations:
@@ -1139,33 +1302,56 @@ def _select_ecog_performance_status(ecog_observations: List[Dict]) -> Dict:
     on_or_before = []
     undated = []
     for index, obs in enumerate(ecog_observations):
-        # Parsed once per observation. parse_partial_date() also increments
-        # PARTIAL_DATE_DEGRADATIONS on an out-of-range component, so calling it
-        # twice on the same field would double-count a real data-quality signal.
-        obs_date, _precision = parse_partial_date(obs.get('date'))
+        # PARSED ONCE PER OBSERVATION, and the RESULT IS CARRIED rather than
+        # recomputed. parse_partial_date() increments PARTIAL_DATE_DEGRADATIONS
+        # on an out-of-range component, so calling it twice on the same field
+        # would double-count a real data-quality signal -- which is why the
+        # pre-diagnosis check below takes this pair as arguments instead of
+        # taking the observation and parsing it again.
+        obs_date, precision = parse_partial_date(obs.get('date'))
         if obs_date is None:
-            undated.append(obs)
+            undated.append((obs, precision))
             continue
         if obs_date > reference_date:
             status['observations_after_reference'] += 1
             continue
         status['observations_on_or_before_reference'] += 1
-        on_or_before.append(((obs_date, str(obs.get('date') or ''), index), obs))
+        on_or_before.append(((obs_date, str(obs.get('date') or ''), index),
+                             obs, obs_date, precision))
 
     status['observations_undated'] = len(undated)
 
+    # chosen_date / chosen_precision travel with the winner so the refusal
+    # below needs no second parse; see the loop above for why that matters.
+    chosen_date = None
+    chosen_precision = None
     if on_or_before:
-        chosen = sorted(on_or_before, key=lambda pair: pair[0])[-1][1]
-        status['selection'] = 'most_recent_on_or_before_reference_date'
+        _, chosen, chosen_date, chosen_precision = sorted(
+            on_or_before, key=lambda entry: entry[0])[-1]
+        status['selection'] = ECOG_SELECTION_MOST_RECENT
     elif len(undated) == 1 and not status['observations_after_reference']:
-        chosen = undated[0]
-        status['selection'] = 'undated_single'
+        chosen, chosen_precision = undated[0]
+        status['selection'] = ECOG_SELECTION_UNDATED_SINGLE
     elif undated:
         chosen = None
-        status['selection'] = 'undated_ambiguous'
+        status['selection'] = ECOG_SELECTION_UNDATED_AMBIGUOUS
     else:
         chosen = None
-        status['selection'] = 'all_after_reference_date'
+        status['selection'] = ECOG_SELECTION_ALL_AFTER_REFERENCE
+
+    # The pre-diagnosis refusal, applied to the WINNER and only when there is
+    # one. A patient with nothing usable already has a selection naming why, and
+    # asking this question of them would count an anchor outcome for a
+    # comparison that never happened -- so ECOG_ANCHOR_COUNTS totals exactly the
+    # patients that reached the check rather than the patients that were parsed.
+    if chosen is not None:
+        suppress, anchor_outcome = _ecog_predates_primary_diagnosis(
+            chosen_date, chosen_precision, primary_diagnosis_date
+        )
+        ECOG_ANCHOR_COUNTS[anchor_outcome] += 1
+        if suppress:
+            chosen = None
+            status['selection'] = ECOG_SELECTION_ALL_BEFORE_PRIMARY_DIAGNOSIS
 
     if chosen is not None:
         status['value']       = chosen['value']
@@ -1563,6 +1749,7 @@ def load_all_patients(patients_dir: str) -> List[Dict]:
     DEMOGRAPHIC_SOURCE_COUNTS.clear()
     ECOG_VALUE_SHAPE_COUNTS.clear()
     ECOG_SELECTION_COUNTS.clear()
+    ECOG_ANCHOR_COUNTS.clear()
 
     for idx, fhir_file in enumerate(patient_files, 1):
         if idx % 100 == 0 or idx == len(patient_files):
@@ -1602,6 +1789,14 @@ def load_all_patients(patients_dir: str) -> List[Dict]:
     console.out(f"  ECOG scored patients: {scored}/{len(patients)}")
     console.out(f"  ECOG value shapes:    {dict(sorted(ECOG_VALUE_SHAPE_COUNTS.items()))}")
     console.out(f"  ECOG selection paths: {dict(sorted(ECOG_SELECTION_COUNTS.items()))}")
+
+    # THE READER FOR ECOG_ANCHOR_COUNTS, and the reason that counter may be
+    # exempt from oncotriage/degradation.py's registry on the same footing as
+    # the four above it. Printed unconditionally: a key other than 'compared'
+    # means the pre-diagnosis guard was ASKED FOR and could not run for that
+    # many patients, which is exactly the state that is otherwise invisible --
+    # those patients keep a score that may predate their own diagnosis.
+    console.out(f"  ECOG anchor outcomes: {dict(sorted(ECOG_ANCHOR_COUNTS.items()))}")
 
     return patients
 

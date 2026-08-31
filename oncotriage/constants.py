@@ -187,6 +187,92 @@ LOINC_AJCC_CLINICAL_M = "21907-1"
 #------------------------------------------------------------------------------
 
 
+# The ECOG selection vocabulary
+#------------------------------
+#
+# Which path `oncotriage/fhir/parser.py:_select_ecog_performance_status()` took
+# to produce (or to refuse to produce) a patient's performance status. It is
+# written into `patient_data['ecog_performance_status']['selection']`, tallied
+# in `ECOG_SELECTION_COUNTS`, stored per row in `inferences.ecog_selection`,
+# rendered by `oncotriage/agent/patient.py`, broken down by the dashboard's
+# performance tab, and it is what separates the three states `ecog_value IS
+# NULL` collapses into.
+#
+# IT LIVES HERE BECAUSE ITS CONSUMERS SIT IN FOUR SUBPACKAGES THAT MAY NOT
+# IMPORT EACH OTHER. `storage` may not import `fhir`; `dashboard` importing the
+# FHIR parser to read four strings would be the wrong direction and would drag
+# a parser into a Streamlit rerun. This module imports nothing at all, so all
+# four can share one spelling. Same argument SYSTEM_KEY_ABSENT carries above,
+# and the same argument `database_logger.py` writes out beside `criteria_split`
+# for why that column has no CHECK constraint.
+#
+# AND THE DRIFT IT PREVENTS HAD ALREADY HAPPENED. Before this block existed the
+# parser wrote 'most_recent_on_or_before_reference_date' while
+# `oncotriage/dashboard/tabs/performance.py` keyed its explanation table on
+# 'most_recent_on_or_before_reference' -- no trailing `_date`. So the single
+# most common path in the whole pipeline rendered as "unrecognised path -- not
+# one of the five this pipeline writes", on every dashboard, for every corpus,
+# and nothing failed. `tests/test_storage_query_layer.py` seeded the same
+# truncated spelling. A literal in two places with no failure when they
+# disagree is the shape this project keeps removing; the fix is one owner, not
+# one corrected copy.
+
+# USABLE -- `value` carries a real grade.
+ECOG_SELECTION_MOST_RECENT = "most_recent_on_or_before_reference_date"
+ECOG_SELECTION_UNDATED_SINGLE = "undated_single"
+
+# NOTHING WAS ON FILE. `observations_found` is 0. Distinct from every member
+# below, which all mean "an observation existed and could not be used".
+ECOG_SELECTION_NONE_RECORDED = "none_recorded"
+
+# PRESENT BUT UNUSABLE. `value` is None and `observations_found` >= 1.
+ECOG_SELECTION_ALL_AFTER_REFERENCE = "all_after_reference_date"
+ECOG_SELECTION_UNDATED_AMBIGUOUS = "undated_ambiguous"
+
+# PRESENT BUT UNUSABLE -- and unlike the two above, the observation is
+# well-formed and inside the snapshot. It describes a person who did not yet
+# have the disease.
+#
+# An ECOG measured before the primary cancer was diagnosed is a performance
+# status for the patient's PRE-CANCER life. Rendering it as "this patient's
+# ECOG" is a false statement to the model, and it is false in the direction
+# that matters: a pre-diagnosis reading is systematically better than the
+# post-diagnosis one, so it makes an unwell patient look eligible. Measured on
+# the 1,000-patient corpus: 23 patients, gaps of up to 28 years, one of them an
+# ECOG 1 recorded in 1997 offered as the performance status of a colon cancer
+# diagnosed in 2025.
+#
+# THIS IS NOT A STALENESS FLOOR AND MUST NOT BE WIDENED INTO ONE. A general
+# "too old to trust" cutoff was measured and REJECTED: it demoted 96% of the
+# scored corpus and recovered nothing. An old POST-diagnosis score still
+# describes the right person with the right disease and is kept.
+ECOG_SELECTION_ALL_BEFORE_PRIMARY_DIAGNOSIS = "all_before_primary_diagnosis"
+
+# THE CLOSED SET, IN THE ORDER A BREAKDOWN SHOULD READ: the two usable paths,
+# then absence, then the three present-but-unusable ones. A consumer may branch
+# on it exhaustively; anything outside it is a defect in the producer, not a
+# sixth case to guess at.
+ECOG_SELECTION_VALUES = (
+    ECOG_SELECTION_MOST_RECENT,
+    ECOG_SELECTION_UNDATED_SINGLE,
+    ECOG_SELECTION_NONE_RECORDED,
+    ECOG_SELECTION_ALL_AFTER_REFERENCE,
+    ECOG_SELECTION_UNDATED_AMBIGUOUS,
+    ECOG_SELECTION_ALL_BEFORE_PRIMARY_DIAGNOSIS,
+)
+
+# The two that mean "a grade was produced". Everything else means it was not,
+# which is the partition `ecog_unavailable_rate` and the dashboard both need
+# and which neither should have to re-derive from a list of negatives.
+ECOG_SELECTION_USABLE = (
+    ECOG_SELECTION_MOST_RECENT,
+    ECOG_SELECTION_UNDATED_SINGLE,
+)
+
+
+#------------------------------------------------------------------------------
+
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """

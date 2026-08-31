@@ -781,10 +781,31 @@ INFERENCE_COLUMN_ADDITIONS = {
     #                                   is known about this patient's ECOG.
     #   ecog_selection = 'none_recorded'  the patient genuinely carried no ECOG
     #                                   observation. ecog_observations_found = 0.
-    #   ecog_selection = 'all_after_reference_date'
-    #                   or 'undated_ambiguous'
+    #   ecog_selection = 'all_after_reference_date',
+    #                   'undated_ambiguous'
+    #                   or 'all_before_primary_diagnosis'
     #                                   observations exist but none was usable.
     #                                   ecog_observations_found >= 1 says how many.
+    #                                   The third of those is the one that is NOT
+    #                                   a date-handling problem: the observation
+    #                                   is well-formed and inside the snapshot,
+    #                                   and it was refused because it predates
+    #                                   the patient's primary cancer diagnosis --
+    #                                   a performance status for a person who did
+    #                                   not yet have the disease. A query that
+    #                                   lumps it with the other two will read a
+    #                                   correctness refusal as a snapshot-date
+    #                                   fault.
+    #
+    # THE VOCABULARY IS oncotriage.constants.ECOG_SELECTION_VALUES AND THIS
+    # COLUMN HAS NO CHECK CONSTRAINT, on `matching_provider`'s and
+    # `criteria_split`'s footing. `storage` may not import `fhir`, and the
+    # producer is `oncotriage/fhir/parser.py`; a constraint written out here
+    # would be a second copy of that vocabulary with nothing failing when the
+    # two disagree. The names moved to `oncotriage.constants` for exactly that
+    # reason -- it imports nothing, so the producer, this reader, the dashboard
+    # and the drift metric can share one spelling -- and this comment is prose
+    # about them rather than a second declaration of them.
     #
     # So: absence is `ecog_selection = 'none_recorded'`, NEVER
     # `ecog_value IS NULL`. And a score of 0 is a real, fully-active patient --
@@ -811,8 +832,21 @@ INFERENCE_COLUMN_ADDITIONS = {
     #   ecog_selection = 'none_recorded'
     #                   or 'all_after_reference_date'
     #                   or 'undated_ambiguous'
+    #                   or 'all_before_primary_diagnosis'
     #                                   no observation was used, so there is no
     #                                   date to report. ecog_value is NULL too.
+    #                                   The last of the four is the one where an
+    #                                   observation existed, was well-formed AND
+    #                                   was dated: its date is deliberately not
+    #                                   reported, because this column means "how
+    #                                   old is the score being used" and there is
+    #                                   no score being used. The date it would
+    #                                   have carried is on the patient record as
+    #                                   ecog_performance_status['date'] until the
+    #                                   refusal drops it, and the anchor it lost
+    #                                   to is primary_diagnosis_date beside it --
+    #                                   neither is a column, because neither is a
+    #                                   fact about a score this row published.
     #   ecog_selection = 'undated_single'
     #                                   AN OBSERVATION WAS USED AND HAD NO DATE.
     #                                   ecog_value is a real score; ecog_date is

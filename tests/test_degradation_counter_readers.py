@@ -354,6 +354,14 @@ _READER_EXEMPTIONS = {
                                 "oncotriage/fhir/parser.py", "census"),
     "ECOG_SELECTION_COUNTS": ("oncotriage/fhir/parser.py",
                               "oncotriage/fhir/parser.py", "census"),
+    # Added by the ECOG pre-diagnosis pass. Same footing as the four above:
+    # load_all_patients() prints it at the end of its own pass, and this module
+    # has an end of its own where oncotriage/degradation.py's does not. It is
+    # NOT a degradation -- 'compared' is the guard working -- but a key other
+    # than 'compared' means the guard was asked for and could not run, which is
+    # what the printed line exists to make visible.
+    "ECOG_ANCHOR_COUNTS": ("oncotriage/fhir/parser.py",
+                           "oncotriage/fhir/parser.py", "census"),
     # --- oncotriage/mcp/server.py: a long-lived SERVER, so there is no run end
     # for a run-end report to attach to. tool_failure_summary() is its reader.
     "TOOL_FAILURES": ("oncotriage/mcp/server.py", "oncotriage/mcp/server.py",

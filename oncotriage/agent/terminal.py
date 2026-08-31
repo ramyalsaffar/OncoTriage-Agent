@@ -443,10 +443,13 @@ def _pipeline_provenance(state) -> Dict:
         # "all_after_reference_date" would match systematically worse with
         # nothing in the row to say why.
         #
-        # ecog_value is None both for a patient with no observation and for one
-        # whose only observation postdates the snapshot. ecog_selection is what
-        # separates them, and ecog_observations_found is what makes the second
-        # case countable. Never read absence off ecog_value alone.
+        # ecog_value is None for a patient with no observation, for one whose
+        # only observation postdates the snapshot, AND for one whose only
+        # observation predates their own cancer diagnosis -- three different
+        # facts with three different remedies. ecog_selection is what separates
+        # them (oncotriage.constants.ECOG_SELECTION_VALUES is the closed set),
+        # and ecog_observations_found is what makes the last two countable.
+        # Never read absence off ecog_value alone.
         "ecog_value": _ecog.get("value"),
         "ecog_selection": _ecog.get("selection"),
         "ecog_observations_found": _ecog.get("observations_found"),

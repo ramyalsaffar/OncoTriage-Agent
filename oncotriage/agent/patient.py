@@ -35,6 +35,7 @@ from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 from dateutil.relativedelta import relativedelta
 
 from oncotriage.agent import deps
+from oncotriage.constants import ECOG_SELECTION_ALL_BEFORE_PRIMARY_DIAGNOSIS
 from oncotriage.deid import DeidentifiedRecord, deidentify
 from oncotriage.agent.state import GENOMIC_VARIANT_LOINC, _VARIANT_TEXT_PATTERN
 from oncotriage.config import MAX_VARIANT_TERMS, STALE_LAB_AGE_DAYS
@@ -1873,10 +1874,27 @@ def render_patient_record(record: DeidentifiedRecord) -> str:
                           f"{ecog.get('reference_date')} snapshot")
         summary += f"- ECOG performance status: {ecog_value} ({'; '.join(detail)})\n"
     elif ecog.get("observations_found"):
+        # THE QUALIFIER NAMES THE CUTOFF THAT ACTUALLY REFUSED, which is not
+        # always the snapshot. A pre-diagnosis observation is well-formed and
+        # inside the snapshot -- the reference date had nothing to do with
+        # refusing it -- so printing "reference date ..." beside that path
+        # would point a reader at DATA_SNAPSHOT_DATE for a fault that is not
+        # there. The diagnosis anchor is read off the record rather than
+        # re-derived: `oncotriage/fhir/parser.py` already resolved it through
+        # `registries.primary_cancer`, and resolving it a second time here
+        # would be the second derivation the single-vocabulary rule forbids --
+        # this renderer could then state a diagnosis date the suppression was
+        # not measured against.
+        if ecog.get("selection") == ECOG_SELECTION_ALL_BEFORE_PRIMARY_DIAGNOSIS:
+            qualifier = (f"every observation predates the primary cancer "
+                         f"diagnosis dated "
+                         f"{(ecog.get('primary_diagnosis_date') or 'unknown')[:10]}")
+        else:
+            qualifier = f"reference date {ecog.get('reference_date')}"
         summary += (
             f"- ECOG performance status: not available "
             f"({ecog.get('observations_found')} observation(s) on file, none usable: "
-            f"{ecog.get('selection')}; reference date {ecog.get('reference_date')})\n"
+            f"{ecog.get('selection')}; {qualifier})\n"
         )
     else:
         summary += "- ECOG performance status: not recorded\n"

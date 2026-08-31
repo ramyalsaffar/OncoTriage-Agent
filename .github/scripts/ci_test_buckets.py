@@ -764,6 +764,28 @@ BUCKETS = {
         _A, None, "ran green in 2.8s; every fixture is a literal dict"),
     "test_extraction_stage_non_oncology_guard.py": (
         _A, None, "ran green in 2.6s; no corpus, no git"),
+    "test_ecog_pre_diagnosis_suppression.py": (
+        _A, None,
+        "ran green in 2.5s, 94 checks, against ONLY the provisioned CI "
+        "skeleton (MEASURED with ONCOTRIAGE_MAIN_PATH pointed at a "
+        "provision_ci_paths.py root, not assumed): an ECOG performance status "
+        "recorded BEFORE the primary cancer diagnosis is refused, and the "
+        "refusal is visible in the selection vocabulary, the render, the drift "
+        "metric and the dashboard breakdown. No network, no keys, NO SPEND, no "
+        "live Qdrant, no model load, no corpus, no database, no git history, "
+        "no live server -- every bundle is a literal dict handed to "
+        "parse_fhir_bundle. It DOES build the cancer registry (`import icd10` "
+        "on first construction), which is not incidental: that is the "
+        "dependency this change adds to the parser, and a test of the change "
+        "that avoided it would be avoiding the thing under test. It writes "
+        "NOTHING anywhere, not even a temp directory, and it EXECS NOTHING "
+        "and loads no module by location -- the one plant is an attribute "
+        "rebind inside try/finally with the restore asserted BY IDENTITY, "
+        "which is the natural control for a module-global lookup and needs no "
+        "_EXEC_ALLOWLIST entry. NOT in the collision matrix: the three "
+        "repository files it reads (fhir/parser.py, agent/patient.py, "
+        "dashboard/tabs/performance.py) are written by neither of the suite's "
+        "two writers and are sha256-compared at the end"),
     "test_fhir_birth_date_and_demographics.py": (
         _A, None, "ran green in 2.3s"),
     "test_fixture_call_mode_pin.py": (
