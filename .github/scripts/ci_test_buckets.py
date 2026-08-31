@@ -284,6 +284,30 @@ BUCKETS = {
         "writers and is sha256-compared at the end"),
     "test_agent_ablation_flag_passthrough.py": (
         _A, None, "ran green in 8.3s; registries and clients replaced through deps"),
+    "test_agent_bedrock_anthropic_adapter.py": (
+        _A, None,
+        "ran green in 0.9s, 261 checks, against ONLY the directory skeleton: "
+        "the SECOND Stage 5 Bedrock adapter -- Claude Sonnet 4.6 over the "
+        "CONVERSE API, behind config.MATCHING_PROVIDER == 'bedrock_anthropic', "
+        "which ships OFF. Every client is a stand-in installed through "
+        "oncotriage/agent/deps.py and every response is a literal dict, so no "
+        "network, no keys, no spend, no live Qdrant and no model load "
+        "(ONCOTRIAGE_DEFER_LOCAL_MODELS is set above the imports). NO boto3 "
+        "EITHER, and that is asserted rather than assumed: the request builder "
+        "and the response translator import no AWS library, section 1c "
+        "requires boto3 and botocore to be absent from sys.modules, and the "
+        "file was written on a machine where boto3 is not installed. No "
+        "corpus, no git history and no database -- the eleven controls are "
+        "in-memory copies of oncotriage/agent/bedrock_anthropic_adapter.py, "
+        "argued at _EXEC_ALLOWLIST in tests/test_package_invariants.py, "
+        "because the module has no prior revision for `git show` to serve. It "
+        "writes NOTHING anywhere, not even a temp directory, and the three "
+        "repository files it reads (bedrock_anthropic_adapter.py, "
+        "evaluation.py, config.py) are sha256-compared at the end -- the last "
+        "IS rewritten by tests/test_config_snapshot_date_rot.py, so an "
+        "interleaved serial run is visible rather than silent, which is why "
+        "the comparison is there and why the file is still NOT in the "
+        "collision matrix (it corrupts nobody)"),
     "test_agent_bedrock_adapter.py": (
         _A, None,
         "ran green in 2.4s, 278 checks, against ONLY the directory skeleton: "

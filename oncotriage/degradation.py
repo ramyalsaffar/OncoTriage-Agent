@@ -101,6 +101,7 @@ from collections import Counter
 from typing import Dict, List, Optional
 
 from oncotriage.agent import bedrock_adapter as _bedrock_adapter
+from oncotriage.agent import bedrock_anthropic_adapter as _bedrock_anthropic_adapter
 from oncotriage.agent import deps as _agent_deps
 from oncotriage.agent import evaluation as _agent_evaluation
 from oncotriage.agent import filtering as _agent_filtering
@@ -343,6 +344,21 @@ _REGISTRY_SPEC = (
      "error class the taxonomy does not name. Every key is a VERIFY-AT-GO-LIVE "
      "item in oncotriage/agent/bedrock_adapter.py that did not hold. STAYS AT "
      "ZERO WHILE MATCHING_PROVIDER IS 'openai', because nothing in that "
+     "configuration reaches the adapter at all"),
+    ("BEDROCK_ANTHROPIC_DEGRADATIONS",
+     _bedrock_anthropic_adapter.BEDROCK_ANTHROPIC_DEGRADATIONS,
+     "Stage 5 ran on Amazon Bedrock's CONVERSE API (Claude) and something was "
+     "not what the adapter was built against. A SECOND COUNTER BESIDE "
+     "BEDROCK_ADAPTER_DEGRADATIONS rather than a shared one, because the two "
+     "Bedrock branches degrade in ways that are not comparable and a shared "
+     "total could not say which had degraded: only this one can fail to "
+     "express a reasoning effort, and only this one can fail to obtain a model "
+     "echo -- which is the key to read first, because while it is non-zero "
+     "inferences.matching_model records the model that was REQUESTED rather "
+     "than one that answered, and MatchingModelMismatchError cannot fire. "
+     "Every key is a VERIFY-AT-GO-LIVE item in "
+     "oncotriage/agent/bedrock_anthropic_adapter.py that did not hold. STAYS "
+     "AT ZERO WHILE MATCHING_PROVIDER IS 'openai', because nothing in that "
      "configuration reaches the adapter at all"),
     ("INFERENCE_WRITE_RETRIES", _database_logger.INFERENCE_WRITE_RETRIES,
      "a database write was retried and survived; contention, not loss"),

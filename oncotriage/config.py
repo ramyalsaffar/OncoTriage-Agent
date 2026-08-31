@@ -584,6 +584,7 @@ AIRFLOW_DAG_SCHEDULE = None
 _KEYS_CACHE = None
 _OPENAI_CLIENT_CACHE = None
 _BEDROCK_CLIENT_CACHE = None
+_BEDROCK_ANTHROPIC_CLIENT_CACHE = None
 _QDRANT_CLIENT_CACHE = None
 _SDK_DEFAULT_TIMEOUT_CACHE = None
 _MATCHING_REQUEST_TIMEOUT_CACHE = None
@@ -1042,12 +1043,39 @@ MATCHING_SEED = 42
 
 MATCHING_PROVIDER_OPENAI = "openai"
 MATCHING_PROVIDER_BEDROCK = "bedrock"
+MATCHING_PROVIDER_BEDROCK_ANTHROPIC = "bedrock_anthropic"
 
-MATCHING_PROVIDERS = (MATCHING_PROVIDER_OPENAI, MATCHING_PROVIDER_BEDROCK)
+MATCHING_PROVIDERS = (MATCHING_PROVIDER_OPENAI,
+                      MATCHING_PROVIDER_BEDROCK,
+                      MATCHING_PROVIDER_BEDROCK_ANTHROPIC)
 """The closed vocabulary. `deps.OVERRIDE_KEYS`' shape and for the same reason:
 a provider name nobody recognises must raise rather than being read as "not
 bedrock, so openai" -- a typo that silently keeps billing the incumbent while
-an operator believes they have migrated is the failure this tuple prevents."""
+an operator believes they have migrated is the failure this tuple prevents.
+
+THREE MEMBERS, AND THE THIRD IS A THIRD PROVIDER RATHER THAN A MODE OF THE
+SECOND. `bedrock` and `bedrock_anthropic` are both Amazon Bedrock and are
+billed on one AWS account, which is exactly the argument for making them one
+member with a sub-selector -- and it is the wrong axis. What differs between
+them is the CLIENT LIBRARY (the OpenAI SDK against a base URL, versus boto3),
+the credential chain, the request shape, the response shape, the error classes,
+the degradation vocabulary and the model. A sub-selector would leave every
+consumer that today asks "is this bedrock?" answering yes for a configuration
+its code cannot serve -- `get_bedrock_client()` would build an OpenAI-SDK
+client for a boto3 branch -- and it would introduce combinations
+(`MATCHING_PROVIDER="openai"` with a Bedrock API selected) that are nonsense
+and would each need their own refusal. A third member of one closed tuple keeps
+the "a typo fails loudly" property with no new mechanism and no new state
+space."""
+
+# THERE IS DELIBERATELY NO `MATCHING_PROVIDERS_BEDROCK` SUBSET TUPLE. One was
+# written and then removed: nothing in the pipeline asks "is this provider
+# served by Bedrock" -- every consumer asks a sharper question ("is it THIS
+# branch", "is it openai") and answers it against the members above. A tuple
+# whose only reader was the test asserting it existed is the dead declaration
+# `tests/test_package_invariants.py` check 2h exists to report, and the shape
+# pass 20f-2 deleted BATCH_SIZE and EXPANSION_TEMPERATURE for. Write it when a
+# second site needs it, not before.
 
 MATCHING_PROVIDER = MATCHING_PROVIDER_OPENAI
 """Which provider Stage 5 calls. THE FLAG. Values: MATCHING_PROVIDERS."""
@@ -1226,6 +1254,303 @@ it, RECORD the drop (bedrock_adapter.BEDROCK_ADAPTER_DEGRADATIONS carries
 the go-live probe settle it."""
 
 
+# --- The Bedrock Anthropic branch: Claude Sonnet 4.6 over Converse ---------
+#
+# A SECOND BEDROCK BRANCH WITH ITS OWN KNOBS, and none of the BEDROCK_* names
+# above reach it. That is deliberate rather than duplicative: every one of them
+# describes the OpenAI-compatible Responses API (a base URL, a system ROLE, a
+# `store` flag, an extra_body seed escape hatch), and Converse has none of
+# those concepts. Sharing a constant between the two would mean one edit
+# changing two request shapes in ways nobody could reason about.
+#
+# WHY CONVERSE AND NOT THE ANTHROPIC MESSAGES API: the Claude Sonnet 4.6 model
+# card (read 2026-08-30) marks the `bedrock-mantle` endpoint NOT SUPPORTED for
+# this model, and on `bedrock-runtime` marks Messages, Responses and Chat
+# Completions all NOT SUPPORTED, leaving Converse and Invoke. Independently,
+# `structured-output.html` marks the Messages API "No" for structured outputs
+# with a 400. The full argument, and why Converse beat Invoke, is at the top of
+# `oncotriage/agent/bedrock_anthropic_adapter.py`.
+#
+# THERE IS NO BASE-URL TABLE HERE, and its absence is the point: boto3 resolves
+# the `bedrock-runtime` endpoint for a Region itself. The Responses branch
+# needs BEDROCK_BASE_URL_TEMPLATES because the OpenAI SDK must be told a URL;
+# this one would be inventing a string the AWS SDK already knows.
+
+BEDROCK_ANTHROPIC_PROFILE_PREFIXES = ("us.", "eu.", "au.", "jp.", "global.")
+"""Inference-profile prefixes the Claude Sonnet 4.6 model card publishes.
+
+A SEPARATE TUPLE FROM `BEDROCK_RUNTIME_PROFILE_PREFIXES`, and the two genuinely
+differ: that one is GPT-5.6 Terra's ("us.", "global.", "in.", "us-gov."), read
+off Terra's own card, and this one is Sonnet 4.6's -- whose Programmatic Access
+table publishes `us.` / `eu.` / `au.` / `jp.` geo ids and one `global.` id and
+no others. Merging them into a union would let each model be named with the
+other's prefix and refused by the service instead of by this file."""
+
+BEDROCK_ANTHROPIC_MATCHING_MODEL = "us.anthropic.claude-sonnet-4-6"
+"""The model id SENT when MATCHING_PROVIDER is "bedrock_anthropic".
+
+`us.` IS THE GEOGRAPHIC PROFILE AND IS CHOSEN OVER THE ~10%-CHEAPER `global.`
+FOR THE REASON `BEDROCK_MATCHING_MODEL` ALREADY RECORDS: it routes within the
+US geography, which is a data-residency property rather than a performance one,
+and this project has already made that trade once. Nothing here silently flips
+a residency decision to make a pricing table cleaner.
+
+THE BARE `anthropic.claude-sonnet-4-6` IS NOT USABLE ON MOST REGIONS, WHICH IS
+WHY THE VALIDATOR REFUSES IT. The model card's regional table marks In-Region
+inference "not supported" in us-east-1 -- this project's default Region -- and
+in every US, APAC, Middle East and African Region it lists; the ONLY Region
+where In-Region is supported is eu-west-2 (London). So on the shipped
+configuration the bare id is a 400 waiting to happen.
+
+PRICING: whichever value is set here is the key `get_model_cost()` looks up,
+because `inferences.matching_model` records the model that answered. See
+PRICING_CONFIG, and read A6 in the adapter's VERIFY-AT-GO-LIVE list before
+trusting the geo rows -- they are INFERRED, not measured."""
+
+BEDROCK_ANTHROPIC_CONNECT_TIMEOUT_SECONDS = 5.0
+"""Connect-phase budget for the boto3 client, in seconds.
+
+FIVE RATHER THAN botocore's OWN DEFAULT OF 60, and rather than reading the
+OpenAI SDK's default the way `_structured_timeout()` does. The argument is
+`_structured_timeout`'s, restated for a different SDK: "a host that cannot be
+reached should fail in seconds; nothing about this pipeline justifies waiting
+longer to learn that". It is written as a number here rather than borrowed from
+`get_sdk_default_connect_timeout_seconds()` because that function builds a
+throwaway OpenAI client to read it -- which resolves OpenAI credentials, on a
+branch that has nothing to do with OpenAI."""
+
+BEDROCK_ANTHROPIC_CACHE_TTLS = (None, "5m", "1h")
+BEDROCK_ANTHROPIC_CACHE_TTL = "5m"
+"""`cachePoint.ttl` on the system breakpoint. None omits the breakpoint entirely.
+
+5m RATHER THAN 1h, ON THE VENDOR'S OWN ADVICE. `prompt-caching.html`: "If you
+have prompts that are used at a regular cadence (i.e., system prompts that are
+used more frequently than every 5 minutes), continue to use the 5-minute cache,
+since this will continue to be refreshed at no additional charge." A per-trial
+wave issues all of its calls at once behind one warmup, so 5m covers it, and 1h
+pays a higher write rate ($6.00/1M against $3.75/1M, AWS Marketplace, read
+2026-08-30) for headroom nothing uses.
+
+THE MINIMUM PREFIX IS 1,024 TOKENS for this model (prompt-caching.html's
+explicit-caching table). A checkpoint placed before that is not an error --
+"your inference still succeeds, but your prefix isn't cached" -- which is
+exactly the silent no-op A2 exists to catch.
+
+None IS A REAL OPTION rather than a placeholder: implicit caching is on for
+Anthropic models on Bedrock whatever this says, so omitting the breakpoint
+falls back to best-effort prefix reuse rather than to no caching at all."""
+
+BEDROCK_ANTHROPIC_THINKING_MODES = (None, "disabled", "adaptive")
+BEDROCK_ANTHROPIC_THINKING = "disabled"
+"""`thinking.type`, sent through `additionalModelRequestFields`. None omits it.
+
+THIS IS WHERE MATCHING_REASONING_EFFORT GOES TO DIE, AND THE SUBSTITUTION IS
+DECLARED HERE RATHER THAN COMPUTED. The two vocabularies do not overlap:
+OpenAI's is none|minimal|low|medium|high and this project is calibrated at
+'none'; Anthropic's controls are `thinking` (adaptive or disabled) and `effort`
+(low|medium|high|max). 'none' is a member of neither, so it is dropped and
+counted (see the adapter) and this constant states what is sent instead.
+
+"disabled" is the honest translation of "spend no tokens on reasoning" and is
+accepted by Sonnet 4.6. It is NOT a claim that the two produce the same
+verdicts: config's note on MATCHING_REASONING_EFFORT records a measured 69.1%
+agreement behind the 'none' choice ON ANOTHER MODEL, and nothing carries that
+across. Read A4 before a campaign."""
+
+BEDROCK_ANTHROPIC_EFFORTS = (None, "low", "medium", "high", "max")
+BEDROCK_ANTHROPIC_EFFORT = None
+"""`outputConfig.effort`. None OMITS the field, which is the model's default.
+
+None BY DEFAULT because effort governs how deeply the model thinks and
+BEDROCK_ANTHROPIC_THINKING ships "disabled" -- so a value here would be a knob
+turned on a mechanism that is off. Set them together or not at all."""
+
+BEDROCK_ANTHROPIC_SERVICE_TIERS_ALLOWED = (None, "default")
+BEDROCK_ANTHROPIC_SERVICE_TIER = None
+"""`serviceTier.type`. None means OMIT the field, which is Standard.
+
+SONNET 4.6 SUPPORTS STANDARD AND RESERVED ONLY. Its model card's Service Tiers
+table marks Priority and Flex not supported, and says Reserved "is set at the
+account level rather than per request (contact your AWS account team to
+enable)". So the only two values that can be correct in a REQUEST are omission
+and "default", and boto3's own enum members `priority` / `flex` / `reserved`
+are refused here rather than sent and 400'd -- or, worse for `reserved`,
+accepted as a per-request value for something that is not one."""
+
+BEDROCK_ANTHROPIC_REQUEST_MODEL_ECHO = True
+"""Whether to ask Converse for the underlying model's `model` field.
+
+TRUE, AND IT COSTS NOTHING TO ASK. Converse's response carries no `model`, so
+`MatchingModelMismatchError` -- the check that says WHICH judge answered --
+has nothing to compare on this branch. `additionalModelResponseFieldPaths`
+lifts a named field out of the underlying model response, and the API reference
+says a valid pointer naming a field the model response does not carry "is
+ignored by Converse". So this is free if unsupported and a genuine attestation
+if it works. Whether it works is the adapter's VERIFY-AT-GO-LIVE (A3).
+
+A KNOB RATHER THAN A LITERAL because the reference also says an INVALID pointer
+is a 400: if `/model` is ever refused outright, one edit turns it off rather
+than a source change under time pressure."""
+
+BEDROCK_ANTHROPIC_SCHEMA_DESCRIPTION = None
+"""Optional `outputConfig.textFormat.structure.jsonSchema.description`.
+
+None OMITS IT, and that is the shipped choice. The field is documented as
+optional and nothing in Stage 5 has ever sent a schema description; adding one
+would put text in front of the judge that the prompt did not put there, which
+is a prompt change wearing the costume of a plumbing field. It exists as a knob
+only so that a probe finding the field REQUIRED is one edit rather than a
+source change."""
+
+
+def _validate_bedrock_region(interpolated_into):
+    """Refuse a Region that cannot produce a working endpoint. One owner.
+
+    TWO CALLERS, TWO CONSEQUENCES, ONE CHECK. The Responses branch interpolates
+    the Region into `BEDROCK_BASE_URL_TEMPLATES` by hand; the Converse branch
+    hands it to `boto3.client(region_name=...)` and botocore builds the
+    endpoint. The FAILURE is the same in both -- a hostname with a hole in it
+    -- and only the sentence naming where it lands differs, which is why that
+    clause is the argument and the rest is shared. Two copies of this would be
+    two places to forget the whitespace guard.
+
+    THE REGION IS VALIDATED HERE RATHER THAN AT RESOLUTION, and that is where
+    the settings resolver's "it never raises" argument is discharged. This
+    check is LAZY (top of every Bedrock request) and PROVIDER-GATED (nothing
+    reaches it on an OpenAI run), so a malformed Region costs the operator one
+    refusal naming the two places it could have come from instead of making
+    `import oncotriage.config` fail for every process in the project.
+
+    THE MESSAGE NAMES THE SOURCE because the remedies differ: an exported
+    ONCOTRIAGE_BEDROCK_REGION is unset with `unset`, and a wrong
+    BEDROCK_REGION_DEFAULT is a source edit. An un-sourced value sends both to
+    the same page, and the export is the one that is invisible in a diff.
+
+    IT DOES NOT CHECK THAT THE REGION EXISTS. Nothing here can, without a
+    network call this module does not make. A well-formed wrong Region still
+    arrives as a 4xx from the endpoint, which names the host.
+
+    Raises:
+        RuntimeError: naming BEDROCK_REGION, the offending value and the source.
+    """
+    _region_origin = (f"{BEDROCK_REGION_SOURCE} (an environment variable)"
+                      if BEDROCK_REGION_SOURCE
+                      else "BEDROCK_REGION_DEFAULT in oncotriage/config.py")
+
+    if not BEDROCK_REGION or not str(BEDROCK_REGION).strip():
+        raise RuntimeError(
+            f"BEDROCK_REGION is empty. It reaches {interpolated_into} and an "
+            f"empty value produces an endpoint that resolves nowhere. It was "
+            f"resolved from {_region_origin}.")
+
+    # WHITESPACE OR A SLASH INSIDE THE VALUE, and this guard exists because the
+    # override made a new failure reachable. A Region lands inside a HOSTNAME,
+    # so either character produces a URL whose failure names neither the
+    # character nor the variable -- which is precisely the corruption
+    # `_from_env`'s trailing separator would have caused and the reason the
+    # resolver declines that helper. Refusing one shape of it while tolerating
+    # the other two would be inconsistent.
+    if any(c.isspace() for c in str(BEDROCK_REGION)) or "/" in str(BEDROCK_REGION):
+        raise RuntimeError(
+            f"BEDROCK_REGION is {BEDROCK_REGION!r}, which carries whitespace "
+            f"or a '/'. It lands inside a HOSTNAME by way of "
+            f"{interpolated_into}, so the resulting failure names neither. It "
+            f"was resolved from {_region_origin}.")
+
+
+def _validate_bedrock_anthropic_config():
+    """Refuse a Converse-branch configuration that cannot work.
+
+    Split out of `validate_matching_provider_config()` rather than inlined as a
+    fourth arm of one long function, because the two Bedrock branches share
+    exactly one check -- the Region -- and interleaving the rest would produce
+    a function in which every `if` had to be read twice to find out which
+    provider it belonged to.
+
+    Raises:
+        RuntimeError: naming the constant to edit and the documented rule it
+            violates, on this file's standing footing.
+    """
+    _validate_bedrock_region("boto3.client(region_name=...)")
+
+    if not BEDROCK_ANTHROPIC_MATCHING_MODEL or not str(
+            BEDROCK_ANTHROPIC_MATCHING_MODEL).strip():
+        raise RuntimeError(
+            "BEDROCK_ANTHROPIC_MATCHING_MODEL is empty. Edit it in "
+            "oncotriage/config.py.")
+
+    if not any(BEDROCK_ANTHROPIC_MATCHING_MODEL.startswith(p)
+               for p in BEDROCK_ANTHROPIC_PROFILE_PREFIXES):
+        raise RuntimeError(
+            f"BEDROCK_ANTHROPIC_MATCHING_MODEL is "
+            f"{BEDROCK_ANTHROPIC_MATCHING_MODEL!r}, which names no inference "
+            f"profile. Claude Sonnet 4.6's model card marks In-Region "
+            f"inference NOT SUPPORTED in every Region this project is likely "
+            f"to run in -- including us-east-1, the default -- so a bare model "
+            f"id would be refused by the service. Prefix it with one of "
+            f"{', '.join(BEDROCK_ANTHROPIC_PROFILE_PREFIXES)} (for example "
+            f"'us.{BEDROCK_ANTHROPIC_MATCHING_MODEL}'). The one Region where "
+            f"the bare id is correct is eu-west-2; if that is genuinely where "
+            f"this runs, widen BEDROCK_ANTHROPIC_PROFILE_PREFIXES with the "
+            f"measurement written beside it.")
+
+    # AN UNPRICED MODEL IS REFUSED HERE RATHER THAN AFTER THE CALL, and this
+    # check exists because the standing test found the hole rather than because
+    # anybody predicted it: BEDROCK_ANTHROPIC_PROFILE_PREFIXES is read off the
+    # model card and has five members, and a pricing table missing one of them
+    # would have let a `jp.`-prefixed configuration pass validation, issue a
+    # live billed Stage 5 call, and only then raise UnknownModelPricingError
+    # from inside the writer -- after the money was spent and with no row to
+    # show for it. `get_model_cost()`'s refusal is the right one and it is in
+    # the wrong PLACE for a value that is known before anything is sent.
+    #
+    # IT READS PRICING_CONFIG DIRECTLY RATHER THAN CALLING get_model_cost(),
+    # which lives in oncotriage/utils.py -- and `oncotriage.config` must never
+    # import `oncotriage.utils`. That is the cycle
+    # tests/test_package_invariants.py fails on. The table is in this file, so
+    # the membership question needs no import at all.
+    if BEDROCK_ANTHROPIC_MATCHING_MODEL not in PRICING_CONFIG["models"]:
+        raise RuntimeError(
+            f"BEDROCK_ANTHROPIC_MATCHING_MODEL is "
+            f"{BEDROCK_ANTHROPIC_MATCHING_MODEL!r}, which has no row in "
+            f"PRICING_CONFIG. get_model_cost() RAISES on an unpriced model by "
+            f"design, so this configuration would spend a live Stage 5 call "
+            f"and then fail to write the row it paid for. Add a row for it in "
+            f"oncotriage/config.py -- and read VERIFY-AT-GO-LIVE (A6) first: "
+            f"only the 'global.' row is measured, the rest are inferred at a "
+            f"+10% geo premium.")
+
+    if BEDROCK_ANTHROPIC_CACHE_TTL not in BEDROCK_ANTHROPIC_CACHE_TTLS:
+        raise RuntimeError(
+            f"BEDROCK_ANTHROPIC_CACHE_TTL is {BEDROCK_ANTHROPIC_CACHE_TTL!r}. "
+            f"Accepted: {BEDROCK_ANTHROPIC_CACHE_TTLS} (None omits the cache "
+            f"breakpoint). Edit it in oncotriage/config.py.")
+
+    if BEDROCK_ANTHROPIC_THINKING not in BEDROCK_ANTHROPIC_THINKING_MODES:
+        raise RuntimeError(
+            f"BEDROCK_ANTHROPIC_THINKING is {BEDROCK_ANTHROPIC_THINKING!r}. "
+            f"Accepted: {BEDROCK_ANTHROPIC_THINKING_MODES} (None omits the "
+            f"object). NOTE that MATCHING_REASONING_EFFORT is NOT this "
+            f"vocabulary and is not expressible here -- see the constant's "
+            f"note. Edit it in oncotriage/config.py.")
+
+    if BEDROCK_ANTHROPIC_EFFORT not in BEDROCK_ANTHROPIC_EFFORTS:
+        raise RuntimeError(
+            f"BEDROCK_ANTHROPIC_EFFORT is {BEDROCK_ANTHROPIC_EFFORT!r}. "
+            f"Accepted: {BEDROCK_ANTHROPIC_EFFORTS} (None omits the field). "
+            f"Edit it in oncotriage/config.py.")
+
+    if BEDROCK_ANTHROPIC_SERVICE_TIER not in BEDROCK_ANTHROPIC_SERVICE_TIERS_ALLOWED:
+        raise RuntimeError(
+            f"BEDROCK_ANTHROPIC_SERVICE_TIER is "
+            f"{BEDROCK_ANTHROPIC_SERVICE_TIER!r}. Claude Sonnet 4.6 supports "
+            f"Standard and Reserved only, and Reserved is an ACCOUNT-level "
+            f"setting rather than a per-request one -- its model card says so "
+            f"-- so the only correct per-request values are "
+            f"{BEDROCK_ANTHROPIC_SERVICE_TIERS_ALLOWED} (None omits the field, "
+            f"which IS Standard). Edit it in oncotriage/config.py.")
+
+
 def validate_matching_provider_config():
     """Refuse a provider configuration that cannot work, naming the constant.
 
@@ -1248,6 +1573,10 @@ def validate_matching_provider_config():
             f"{', '.join(MATCHING_PROVIDERS)}. Edit MATCHING_PROVIDER in "
             f"oncotriage/config.py.")
 
+    if MATCHING_PROVIDER == MATCHING_PROVIDER_BEDROCK_ANTHROPIC:
+        _validate_bedrock_anthropic_config()
+        return
+
     if MATCHING_PROVIDER != MATCHING_PROVIDER_BEDROCK:
         return
 
@@ -1257,47 +1586,7 @@ def validate_matching_provider_config():
             f"{', '.join(sorted(BEDROCK_BASE_URL_TEMPLATES))}. Edit "
             f"BEDROCK_ENDPOINT in oncotriage/config.py.")
 
-    # THE REGION IS VALIDATED HERE RATHER THAN AT RESOLUTION, and that is where
-    # the settings resolver's "it never raises" argument is discharged. This
-    # check is LAZY (top of every Bedrock request) and PROVIDER-GATED (nothing
-    # above this line runs for an OpenAI run), so a malformed Region costs the
-    # operator one refusal naming the two places it could have come from
-    # instead of making `import oncotriage.config` fail for every process in
-    # the project.
-    #
-    # THE MESSAGE NAMES THE SOURCE because the remedies differ: an exported
-    # ONCOTRIAGE_BEDROCK_REGION is unset with `unset`, and a wrong
-    # BEDROCK_REGION_DEFAULT is a source edit. An un-sourced value sends both
-    # to the same page, and the export is the one that is invisible in a diff.
-    _region_origin = (f"{BEDROCK_REGION_SOURCE} (an environment variable)"
-                      if BEDROCK_REGION_SOURCE
-                      else "BEDROCK_REGION_DEFAULT in oncotriage/config.py")
-
-    if not BEDROCK_REGION or not str(BEDROCK_REGION).strip():
-        raise RuntimeError(
-            f"BEDROCK_REGION is empty. It is interpolated into "
-            f"BEDROCK_BASE_URL_TEMPLATES and an empty value produces a URL "
-            f"that resolves nowhere. It was resolved from {_region_origin}.")
-
-    # WHITESPACE OR A SLASH INSIDE THE VALUE, and this guard exists because the
-    # override made a new failure reachable. A Region is interpolated into a
-    # HOSTNAME, so either character lands inside
-    # `bedrock-runtime.{region}.amazonaws.com` and produces a URL whose failure
-    # names neither the character nor the variable -- which is precisely the
-    # corruption `_from_env`'s trailing separator would have caused and the
-    # reason the resolver declines that helper. Refusing one shape of it while
-    # tolerating the other two would be inconsistent.
-    #
-    # IT DOES NOT CHECK THAT THE REGION EXISTS. Nothing here can, without a
-    # network call this module does not make. A well-formed wrong Region still
-    # arrives as a 4xx from the endpoint, which names the host.
-    if any(c.isspace() for c in str(BEDROCK_REGION)) or "/" in str(BEDROCK_REGION):
-        raise RuntimeError(
-            f"BEDROCK_REGION is {BEDROCK_REGION!r}, which carries whitespace "
-            f"or a '/'. It is interpolated into a HOSTNAME in "
-            f"BEDROCK_BASE_URL_TEMPLATES, so either lands inside the host and "
-            f"the resulting failure names neither. It was resolved from "
-            f"{_region_origin}.")
+    _validate_bedrock_region("BEDROCK_BASE_URL_TEMPLATES")
 
     if not BEDROCK_MATCHING_MODEL or not str(BEDROCK_MATCHING_MODEL).strip():
         raise RuntimeError(
@@ -1369,6 +1658,8 @@ def matching_wire_model():
     """
     if MATCHING_PROVIDER == MATCHING_PROVIDER_BEDROCK:
         return BEDROCK_MATCHING_MODEL
+    if MATCHING_PROVIDER == MATCHING_PROVIDER_BEDROCK_ANTHROPIC:
+        return BEDROCK_ANTHROPIC_MATCHING_MODEL
     if MATCHING_PROVIDER == MATCHING_PROVIDER_OPENAI:
         return MATCHING_MODEL
     validate_matching_provider_config()          # raises, naming the constant
@@ -1462,6 +1753,135 @@ def get_bedrock_client() -> OpenAI:
                                        max_retries=OPENAI_SDK_MAX_RETRIES,
                                        timeout=get_matching_request_timeout())
     return _BEDROCK_CLIENT_CACHE
+
+def get_bedrock_anthropic_client():
+    """The one boto3 ``bedrock-runtime`` client this process uses. Cached.
+
+    `get_bedrock_client()`'s precedent in every respect that matters, with
+    three differences that are forced by the SDK rather than chosen.
+
+    **boto3 IS IMPORTED INSIDE THIS FUNCTION**, the same third-party-in-a-
+    function-body exemption `import icd10` and `import torch` carry, and the
+    same one `oncotriage/staging/s3_sync.py` already uses for boto3 so that the
+    half of that tool which runs today works with boto3 absent. Hoisting it
+    would make `import oncotriage.config` -- which every entry point in the
+    project does -- require boto3, and `tests/test_package_invariants.py`
+    section 2 would have a new module-scope third-party import to account for.
+
+    **THE TIMEOUT IS A `botocore.config.Config`, NOT AN httpx.Timeout.**
+    `get_matching_request_timeout()` returns an httpx object that means nothing
+    to botocore, so the two phases are passed as numbers:
+
+      connect_timeout  BEDROCK_ANTHROPIC_CONNECT_TIMEOUT_SECONDS (5.0),
+                       replacing botocore's own default of 60.
+      read_timeout     MATCHING_REQUEST_TIMEOUT_SECONDS (300), the SAME
+                       measured budget the OpenAI path uses, so a Stage 5 call
+                       is bounded identically on either provider.
+
+    **`max_attempts` IS `OPENAI_SDK_MAX_RETRIES + 1`, AND THE +1 IS THE WHOLE
+    POINT.** botocore counts TOTAL attempts; the OpenAI SDK counts RETRIES
+    after the first. Passing the retry count straight through would silently
+    halve the transport budget -- or, read the other way, passing it as-is to a
+    library that meant the other thing is how a budget doubles. `"standard"`
+    mode is named explicitly because botocore's default (`legacy`) retries a
+    narrower error set and is documented as deprecated.
+
+    NOT RESETTABLE, and not resolved at import. Constructing it opens no
+    socket.
+
+    Raises:
+        RuntimeError: when the provider flag is not this branch; when boto3 is
+            absent; or when a credential is set that boto3 cannot see.
+    """
+    global _BEDROCK_ANTHROPIC_CLIENT_CACHE
+    if _BEDROCK_ANTHROPIC_CLIENT_CACHE is None:
+        # REFUSES WHILE THE FLAG IS OFF, on `get_bedrock_client()`'s argument:
+        # "no Bedrock client is constructed and no Bedrock credential is
+        # resolved" is otherwise a property of the CALL GRAPH, true today and
+        # untrue the moment anything else reaches this function. Here it is a
+        # property of the function, so no future caller can break it silently.
+        if MATCHING_PROVIDER != MATCHING_PROVIDER_BEDROCK_ANTHROPIC:
+            raise RuntimeError(
+                f"get_bedrock_anthropic_client() was called while "
+                f"MATCHING_PROVIDER is {MATCHING_PROVIDER!r}. Building this "
+                f"client resolves AWS credentials and opens a second "
+                f"endpoint, and nothing in the pipeline should reach it unless "
+                f"Stage 5 is configured to use it. Set MATCHING_PROVIDER to "
+                f"{MATCHING_PROVIDER_BEDROCK_ANTHROPIC!r} in "
+                f"oncotriage/config.py, or install a stand-in through "
+                f"oncotriage.agent.deps.set_override("
+                f"deps.BEDROCK_ANTHROPIC_CLIENT, ...) if this is a test.")
+        validate_matching_provider_config()
+
+        try:
+            import boto3
+            from botocore.config import Config as _BotoConfig
+        except ImportError as exc:
+            raise RuntimeError(
+                f"MATCHING_PROVIDER is "
+                f"{MATCHING_PROVIDER_BEDROCK_ANTHROPIC!r}, which reaches "
+                f"Bedrock through the Converse API and therefore needs boto3. "
+                f"It is declared in pyproject.toml and is not importable here: "
+                f"{exc}. Run `pip install -e .` from 03- Code/.") from exc
+
+        _assert_bedrock_anthropic_credential_is_visible()
+
+        console.out(f"🔐 Bedrock Converse region: {BEDROCK_REGION}")
+        _BEDROCK_ANTHROPIC_CLIENT_CACHE = boto3.client(
+            "bedrock-runtime",
+            region_name=BEDROCK_REGION,
+            config=_BotoConfig(
+                connect_timeout=BEDROCK_ANTHROPIC_CONNECT_TIMEOUT_SECONDS,
+                read_timeout=MATCHING_REQUEST_TIMEOUT_SECONDS,
+                retries={"max_attempts": OPENAI_SDK_MAX_RETRIES + 1,
+                         "mode": "standard"},
+            ),
+        )
+    return _BEDROCK_ANTHROPIC_CLIENT_CACHE
+
+
+def _assert_bedrock_anthropic_credential_is_visible():
+    """Refuse a credential boto3 cannot see, rather than ignoring it.
+
+    **boto3 DOES NOT READ `ONCOTRIAGE_BEDROCK_API_KEY`.** It reads AWS's own
+    `AWS_BEARER_TOKEN_BEDROCK` -- the model card's own getting-started sample
+    sets exactly that variable and then constructs a `bedrock-runtime` client
+    -- plus the ordinary SigV4 chain (profiles, instance roles, SSO).
+    `settings.resolve_bedrock_api_key()` exists so this project's own name WINS
+    over AWS's on the Responses branch, where the key is handed to the OpenAI
+    SDK by hand. Here there is no hand to hand it to.
+
+    THE THREE OPTIONS WERE: mutate `os.environ` so boto3 finds it, which is a
+    process-wide side effect this file has no business having and which some
+    botocore versions read lazily at signing time; silently ignore the
+    project's variable, which is the silently-ignored-credential failure this
+    project removes on sight; or REFUSE and name the one-line fix. The third is
+    what ships.
+
+    IT DOES NOT VERIFY THAT ANY CREDENTIAL EXISTS. boto3's chain has half a
+    dozen sources -- a profile, an instance role, SSO, a container role -- and
+    a check that demanded an environment variable would refuse a perfectly
+    ordinary IAM deployment. What it refuses is the ONE state that is
+    unambiguously a mistake: this project's variable set, AWS's not.
+
+    Raises:
+        RuntimeError: naming both variables and the one-line fix.
+    """
+    key, source = settings.resolve_bedrock_api_key()
+    if key is not None and source == settings.ENV_BEDROCK_API_KEY:
+        import os as _os
+        if not _os.environ.get(settings.ENV_AWS_BEARER_TOKEN_BEDROCK):
+            raise RuntimeError(
+                f"{settings.ENV_BEDROCK_API_KEY} is set but "
+                f"{settings.ENV_AWS_BEARER_TOKEN_BEDROCK} is not, and this "
+                f"provider reaches Bedrock through boto3, which reads only the "
+                f"second. Continuing would ignore the key you set and fall "
+                f"through to whatever else is in the AWS credential chain -- "
+                f"possibly a different account.\n"
+                f"  Fix: export {settings.ENV_AWS_BEARER_TOKEN_BEDROCK} with "
+                f"the same value, or unset {settings.ENV_BEDROCK_API_KEY} if "
+                f"you meant to use the ordinary AWS credential chain.")
+
 
 # Wall-clock ceiling on ONE Stage 5 request, in seconds.
 #
@@ -2650,6 +3070,78 @@ PRICING_CONFIG = {
         "global.openai.gpt-5.6-terra": {
             "input": 2.00,
             "output": 12.00
+        },
+        # ---- Claude Sonnet 4.6, served by Amazon Bedrock Converse ---------
+        #      (MATCHING_PROVIDER = "bedrock_anthropic")
+        #
+        # THE WIRE MODEL ID IS THE PRICING KEY, exactly as for the three rows
+        # above: `inferences.matching_model` records the model this branch
+        # reports, `get_model_cost()` is called with that value, and an id
+        # absent from this table raises UnknownModelPricingError before a row
+        # is written.
+        #
+        # READ THIS BEFORE TRUSTING A COST ON THIS BRANCH: ONE ROW IS MEASURED
+        # AND THE OTHERS ARE INFERRED, and they are labelled individually
+        # rather than as a block.
+        #
+        # MEASURED, 2026-08-30, from the AWS Marketplace listing the Claude
+        # Sonnet 4.6 model card names as its own product (prod-ffvjxvh4ltq64),
+        # per 1M tokens, all dimensions published as GLOBAL:
+        #
+        #     Input                $3.00      Response            $15.00
+        #     Cache read           $0.30      Cache write (5m)     $3.75
+        #     Cache write (1h)     $6.00      Batch in/out   $1.50 / $7.50
+        #
+        # NOT MODELLED, for the same reason as every row above: get_model_cost()
+        # takes an {input, output} pair with no cached term, so a run with
+        # prompt caching on prices its cached input at the FULL input rate.
+        # That makes estimated_cost_usd an OVER-estimate rather than a wrong
+        # number, which is the safe direction, and it stops being exact. It
+        # matters more on this branch than on any other, because the per-trial
+        # design's whole affordability rests on the cache: at $0.30 against
+        # $3.00 the modelled figure can be ~10x the billed one for the cached
+        # portion. Closing it means a third pricing term and is a change to a
+        # 29-call-site signature.
+        #
+        # INFERRED, NOT MEASURED -- the geo and In-Region rows below. That
+        # listing publishes Global dimensions only. The +10% premium is carried
+        # over from the pattern this project already recorded for GPT-5.6 Terra
+        # (geo $2.20/$13.20 against global $2.00/$12.00 on a $2.00/$12.00 base)
+        # and is corroborated only by secondary sources. It is here rather than
+        # absent because an absent row makes get_model_cost() raise and the
+        # branch unable to write a row at all; it is labelled because a number
+        # nobody measured must not read like one somebody did. VERIFY-AT-GO-LIVE
+        # (A6) is the item that settles it against a console bill.
+        #
+        # bedrock-runtime, global cross-Region profile. MEASURED.
+        "global.anthropic.claude-sonnet-4-6": {
+            "input": 3.00,
+            "output": 15.00
+        },
+        # bedrock-runtime, US geographic profile. THE SHIPPED DEFAULT. INFERRED.
+        "us.anthropic.claude-sonnet-4-6": {
+            "input": 3.30,
+            "output": 16.50
+        },
+        # bedrock-runtime, EU geographic profile. INFERRED.
+        "eu.anthropic.claude-sonnet-4-6": {
+            "input": 3.30,
+            "output": 16.50
+        },
+        # bedrock-runtime, AU geographic profile. INFERRED.
+        "au.anthropic.claude-sonnet-4-6": {
+            "input": 3.30,
+            "output": 16.50
+        },
+        # bedrock-runtime, JP geographic profile. INFERRED.
+        "jp.anthropic.claude-sonnet-4-6": {
+            "input": 3.30,
+            "output": 16.50
+        },
+        # bedrock-runtime, In-Region. Reachable in eu-west-2 alone. INFERRED.
+        "anthropic.claude-sonnet-4-6": {
+            "input": 3.30,
+            "output": 16.50
         },
         "gpt-4o-2024-08-06": {
             "input": 2.50,

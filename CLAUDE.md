@@ -159,7 +159,8 @@ Verified rather than assumed. It is the same object as
 | `oncotriage/agent/retrieval.py` | Stages 1–3 + `build_bm25_index_from_qdrant` | `agent.{deps,models,mesh_expansion,patient,state,text}`, `config`, `registries.mesh`, `utils` |
 | `oncotriage/agent/filtering.py` | Stage 4 | `agent.{deps,retrieval,state}`, `config`, `extraction.*` |
 | `oncotriage/agent/evaluation.py` | Stage 5 | `agent.{bedrock_adapter,deps,patient,state}`, `config`, `utils` |
-| `oncotriage/agent/bedrock_adapter.py` | Stage 5's Amazon Bedrock translation, behind `config.MATCHING_PROVIDER` (OFF) — the Responses-API request, the ChatCompletion-shaped reply, the error taxonomy, the VERIFY-AT-GO-LIVE list | `config`, `agent.{deps,response_schema}`, `observability` |
+| `oncotriage/agent/bedrock_adapter.py` | Stage 5's Amazon Bedrock translation for **GPT-5.6 Terra**, behind `config.MATCHING_PROVIDER == "bedrock"` (OFF) — the Responses-API request, the ChatCompletion-shaped reply, the error taxonomy, the numbered VERIFY-AT-GO-LIVE list | `config`, `agent.{deps,response_schema}`, `observability` |
+| `oncotriage/agent/bedrock_anthropic_adapter.py` | Stage 5's Amazon Bedrock translation for **Claude Sonnet 4.6**, behind `config.MATCHING_PROVIDER == "bedrock_anthropic"` (OFF) — the **Converse** request (a `cachePoint`, a schema serialized to a STRING), the ChatCompletion-shaped reply (the disjoint usage counts summed back), the botocore error taxonomy, the lettered A1..A10 list. **Shares no code with the module above**: different client library, credential chain, request shape, response shape and error classes. boto3 is imported inside the two functions that need it | `config`, `agent.{deps,response_schema}`, `observability` |
 | `oncotriage/agent/terminal.py` | the three terminal nodes + `_pipeline_provenance` | `agent.state`, `registries.primary_cancer`, `utils` |
 | `oncotriage/agent/graph.py` | `build_matching_graph`, `match_patient_to_trials` | every stage module |
 | `oncotriage/agent/display.py` | console rendering | `config` |
@@ -962,7 +963,23 @@ python tests/test_fixture_call_mode_pin.py                          #  82 (uncha
 # copies of oncotriage/agent/bedrock_adapter.py, one mapping broken in each,
 # argued at _EXEC_ALLOWLIST (the module is new, so `git show` has no revision
 # carrying a version with one mapping missing). ~2 s.
-python tests/test_agent_bedrock_adapter.py                          # 275 (was 273; the cache-warmup pass added the `**` expansion pin)
+python tests/test_agent_bedrock_adapter.py                          # 281 (was 275; the Converse pass moved two pins -- the provider tuple 2 -> 3 members and call_matching_model's return count 2 -> 3 -- and re-asserted what each protected in a stronger form. Before that 273; the cache-warmup pass added the `**` expansion pin)
+
+# The Converse pass: the SECOND Bedrock branch, Claude Sonnet 4.6. Same shape,
+# same directory. NO AWS CALL AND NO BILLED CALL OF ANY KIND -- every client is
+# a stand-in installed through oncotriage/agent/deps.py and every response is a
+# literal dict. No network, no keys, no spend, no live Qdrant, no model load, no
+# corpus, no git history, no database -- and NO boto3, which is asserted rather
+# than assumed (the request builder and the response translator import no AWS
+# library, and section 1c requires boto3 and botocore to be absent from
+# sys.modules). It writes NOTHING anywhere, not even a temp directory. NOT in
+# the collision matrix -- but it DOES read oncotriage/config.py, which
+# tests/test_config_snapshot_date_rot.py rewrites in place, so all three files
+# it reads are sha256-compared at the end and an interleaved serial run is
+# visible rather than silent. It DOES exec: ten in-memory copies of
+# oncotriage/agent/bedrock_anthropic_adapter.py, one plant each, argued at
+# _EXEC_ALLOWLIST. Bucket A, ~0.8 s.
+python tests/test_agent_bedrock_anthropic_adapter.py                # 261
 
 # The Bedrock go-live probe. NOT a test, NOT in tests/, NOT in any bucket, and
 # it REFUSES to do anything without its flag (exit 2, nothing called, nothing
@@ -970,6 +987,14 @@ python tests/test_agent_bedrock_adapter.py                          # 275 (was 2
 python bedrock_probe.py                                  # prints the refusal, exit 2
 python bedrock_probe.py --i-understand-this-bills        # COSTS MONEY: 2 live calls
 python bedrock_probe.py --i-understand-this-bills --probe-seed   # + 1 more
+# The SECOND Bedrock branch (Claude Sonnet 4.6 over Converse). A DIFFERENT
+# lettered list -- A1..A10 at the top of
+# oncotriage/agent/bedrock_anthropic_adapter.py -- because both lists have an
+# item about structured output and they are about different APIs. NOT RUN YET:
+# every A-item is documentation until it is.
+python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic
+python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic \
+    --probe-truncation                                   # + 1 more, settles A7
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  GO-LIVE, PER-TRIAL: NO PAID RUN BEFORE THE THREE-CALL PROBE.
@@ -1201,6 +1226,18 @@ audit record" below.
 6. **`node_finalize`** — splits eligible/not_eligible, normalizes labels.
 
 Nodes 1–3 are in `agent/retrieval.py`, node 4 in `agent/filtering.py`, node 5 in `agent/evaluation.py`, node 6 and the other two terminal nodes in `agent/terminal.py`.
+
+**STAGE 5 HAS THREE PROVIDER ARMS AND ONLY ONE OF THEM RUNS.**
+`config.MATCHING_PROVIDER` is a closed three-member vocabulary and
+`evaluation.call_matching_model` dispatches on it: `"openai"` (the shipped
+default — Chat Completions, unchanged), `"bedrock"` (the Responses API, GPT-5.6
+Terra) and `"bedrock_anthropic"` (Converse, Claude Sonnet 4.6). The two Bedrock
+arms are separate providers rather than modes of one because they share no
+client library, credential chain, request shape, response shape or error class.
+**An unrecognised name RAISES rather than falling through to OpenAI**, which is
+the silent-wrong-provider failure that tuple exists to prevent. With the flag at
+its default the OpenAI request is byte-identical to the one that shipped before
+either adapter existed — proved against `git show HEAD:` rather than asserted.
 
 Conditional edges route to `node_no_candidates` when a stage empties the pool, and any exception lands in `node_error_handler`, which still emits a well-formed result. `match_patient_to_trials(patient_data, graph)` is the public entry point; it stamps `qdrant_collection` and `patient_data_hash` onto the result. **Pass 20e removed the shim's wrapper around it** — the legacy-rebinding guard could only ever see rebindings in the shim's own namespace, and there is no such namespace now; `oncotriage/agent/deps.py` records why it needs no replacement.
 
@@ -9712,6 +9749,227 @@ The scan walks to any depth now, and its negative control plants a
 package *three* deep — because a control planted at the top level
 would have fired against the old scan too and proved nothing about
 what changed.
+
+### Stage 5 has a second Bedrock branch: Claude Sonnet 4.6 over Converse (the Converse pass)
+
+**THE BRIEF'S PREMISE WAS FALSE AND THE DOCUMENTATION SETTLES IT TWICE.** It
+asked for an Anthropic branch and said "Converse and the Anthropic Messages API
+are both candidates on bedrock-runtime". The Messages API is not a candidate for
+this model at all. Read 2026-08-30:
+
+* the **Claude Sonnet 4.6 model card** (`model-card-anthropic-claude-sonnet-4-6.html`)
+  marks `bedrock-mantle` NOT SUPPORTED for this model outright, and on
+  `bedrock-runtime` its API table reads Messages **no**, Responses **no**, Chat
+  Completions **no**, Converse **yes**, Invoke **yes**;
+* **`structured-output.html`**'s supported-API table names the Messages API and
+  marks it **No**: "The output_config.format parameter is rejected with a 400
+  error. To use structured outputs with Anthropic Claude models, send the
+  request through the Converse API or the InvokeModel API on the bedrock-runtime
+  endpoint."
+
+**SO THE REAL CHOICE WAS CONVERSE versus InvokeModel, AND THE BRIEF'S DECIDING
+CRITERION DOES NOT DISCRIMINATE.** Prompt caching is expressible on both --
+`prompt-caching.html` documents `cachePoint` for Converse and `cache_control` for
+InvokeModel and lists Sonnet 4.6 for both at 1,024 minimum tokens, 4 checkpoints,
+5m/1h TTLs, `system`/`messages`/`tools`. Converse won on four secondary
+arguments, each recorded at the module: **botocore validates the request shape
+locally** (`ParamValidationError` before a signed request leaves the machine,
+which is `validate_matching_provider_config()`'s own rule extended to the body,
+where `invoke_model(body=json.dumps(...))` sends an opaque blob); the cache
+counters are **modeled fields of the API** rather than of a vendor-versioned
+body; `stopReason` is a **closed nine-member vocabulary** that distinguishes a
+truncation from a `malformed_model_output`; and `outputConfig.effort` is
+first-class.
+
+**NOTHING RUNS AND THAT IS MEASURED THREE WAYS.** `MATCHING_PROVIDER` is
+`"openai"`. The OpenAI kwargs the shipped `call_matching_model` sends were
+compared against the kwargs the function at `git show HEAD:` sends -- lifted by
+AST and exec'd into the same globals, never retyped -- and the two dicts are
+**IDENTICAL**, timeout included (the same cached object). `python
+fixture_replay.py` is **12/12 clean, exit 0, with no recapture**. And boto3 is
+**not imported** by importing the package, importing the adapter, or driving the
+OpenAI path -- asserted, and free to assert because it is not installed on this
+machine at all.
+
+| | |
+|---|---|
+| new module | `oncotriage/agent/bedrock_anthropic_adapter.py` -- the Converse translation, the error taxonomy, the A1..A10 go-live list |
+| new provider | `MATCHING_PROVIDER_BEDROCK_ANTHROPIC = "bedrock_anthropic"`, a **third member** of the closed tuple |
+| new deps key | `BEDROCK_ANTHROPIC_CLIENT` -- a third key, because the two Bedrock keys hold objects of different TYPES (`openai.OpenAI` with `.responses.create` vs a botocore client with `.converse`) |
+| new counter | `BEDROCK_ANTHROPIC_DEGRADATIONS`, the 33rd in `oncotriage/degradation.py` |
+| new test | `tests/test_agent_bedrock_anthropic_adapter.py` -- **261 checks, bucket A, ~0.9 s** measured against ONLY the CI skeleton |
+
+**A THIRD MEMBER RATHER THAN A SUB-SELECTOR ON `"bedrock"`.** Both are Amazon
+Bedrock on one bill, which is the argument FOR one member -- and it is the wrong
+axis. What differs is the client library, the credential chain, the request
+shape, the response shape, the error classes, the degradation vocabulary and the
+model. A sub-selector leaves every consumer that asks "is this bedrock?"
+answering yes for a configuration its code cannot serve (`get_bedrock_client()`
+would build an OpenAI-SDK client for a boto3 branch) and creates nonsense
+combinations that each need their own refusal. A third member keeps "a typo
+fails loudly" with no new mechanism and no new state space.
+
+**THE MAPPING'S TWO NON-RENAMES, WHICH ARE WHERE THE RISK IS.**
+
+* **THE SCHEMA TRAVELS AS A SERIALIZED STRING.** Converse's
+  `outputConfig.textFormat.structure.jsonSchema.schema` is a **String** -- both
+  `structured-output.html`'s example and boto3's own request syntax say so --
+  while the InvokeModel form is an object. It is `json.dumps`'d from the SAME
+  object `build_response_format()` produces, unwrapped rather than rebuilt.
+  **`strict` HAS NO TARGET FIELD**: on Converse the field IS the constrained
+  decode (`strict` there belongs to `toolSpec`), so it is not forwarded and
+  `_text_format_param` **RAISES** if the chat form ever returns `strict: False`
+  -- because the Converse path would otherwise go on constraining a decode the
+  caller had just asked not to constrain.
+* **THE USAGE COUNTS ARE DISJOINT AND MUST BE SUMMED BACK.**
+  `prompt-caching.html`, verbatim: "the `inputTokens` field represents only the
+  non-cached input tokens ... `total input tokens = inputTokens +
+  cacheReadInputTokens + cacheWriteInputTokens`". OpenAI's `prompt_tokens`
+  INCLUDES cached tokens. **A direct rename would under-report Stage 5's input
+  tokens by exactly the cached amount on every cache hit and under-price the
+  run** -- silently, in the direction that flatters the migration. On the
+  canonical fixture that is 1,080 reported against 19,000 sent: a 94%
+  under-count. Nothing in the brief mentions it. It is plant P1 in the standing
+  test.
+
+**WHAT CANNOT BE EXPRESSED IS DROPPED, COUNTED AND LOGGED, on the
+`seed_not_expressible` pattern.** `seed` has no Converse field and no
+`extra_body` escape hatch (an unknown key in a modeled boto3 call is a local
+`ParamValidationError`, so there is nothing for a probe to discover -- unlike
+`BEDROCK_SEND_SEED_IN_EXTRA_BODY` on the Responses branch).
+`MATCHING_REASONING_EFFORT` is dropped too and the reason is a vocabulary
+mismatch rather than a missing field: OpenAI's is `none|minimal|low|medium|high`
+and this project is calibrated at `'none'`; Anthropic's are `thinking`
+(adaptive/disabled) and `effort` (low|medium|high|max), and `'none'` is a member
+of neither. What is SENT instead is `BEDROCK_ANTHROPIC_THINKING` (default
+`"disabled"`), **declared rather than computed**, and both halves of the
+substitution are in the log line. **THIS IS A DIFFERENT JUDGE.** The 69.1%
+agreement measurement behind the `'none'` choice was taken on another model and
+nothing carries it across.
+
+**CONVERSE RETURNS NO MODEL ECHO, SO `MatchingModelMismatchError` CANNOT FIRE
+ON THIS BRANCH.** The response shape declares `additionalModelResponseFields`,
+`metrics`, `output`, `performanceConfig`, `serviceTier`, `stopReason`, `trace`
+and `usage`, and no `model`. Three things are done: the echo is **asked for**
+(`additionalModelResponseFieldPaths=["/model"]`, which the API reference says is
+ignored when the field is absent, so it is free if unsupported and a real
+attestation if it works -- A3); when it does not arrive the REQUESTED id is used
+**and the substitution is counted** under `model_echo_unavailable`, reaching the
+run-end report; and pricing is unaffected, because Bedrock bills for the id the
+request named. **`inferences.matching_model` on a `bedrock_anthropic` row is
+therefore what was requested rather than what answered, unless that counter is
+zero.** The alternative -- passing the requested id through silently -- would
+make the mismatch check compare a value with itself.
+
+**A DEFECT STAGE 5 HAD ALREADY REMOVED WAS ABOUT TO BE REINTRODUCED, AND IT WAS
+FOUND BY READING WHAT THE CONSUMER DOES WITH THE FIELD.** Converse has no
+refusal content block, so the first version of this adapter left
+`message.refusal` permanently None. Stage 5's refusal route --
+`REFUSAL_ERROR_PREFIX` in `evaluation.py` -- exists precisely to stop a decline
+being read as a parse failure and RETRIED, and its own block records the cost it
+removed: "three billed calls and a record that names the wrong fault". With
+`refusal` never set, every `guardrail_intervened` or `content_filtered` reply
+would have arrived as empty content, failed the parse, and been re-sent twice
+more to a guardrail that blocks deterministically. **The fact IS expressible on
+Converse -- it arrives in `stopReason` rather than in a content part -- so it is
+mapped**, from `_STOP_REASON_REFUSALS` alone, with the raw stop reason named in
+the text so `inferences.error` gets back to the API fact. Nothing else sets it,
+which is what Stage 5's own extractor reads as "not refused". It is plant P11.
+
+**`store` HAS NO ANALOGUE AND NEEDS NONE.** The Converse API reference states
+its own contract: "Amazon Bedrock doesn't store any text, images, or documents
+that you provide as content." The Responses branch's `store=False` exists
+because that API's vendor default retains the request for 30 days.
+
+**THE SHIPPED SCHEMA IS INSIDE BEDROCK'S SUBSET, MEASURED NOT ASSUMED.** That
+page forbids recursive schemas, external `$ref`, numerical constraints, string
+constraints and any `additionalProperties` other than `false`. A walk over
+`build_response_schema()` finds **none** of them -- it uses only object, array,
+string, number, string `enum`, `required` and `additionalProperties: false`. The
+walk is re-derived in section 2 with two poisoned controls, so a schema edit that
+introduced one fails there rather than as a 400 mid-campaign.
+
+**THE PRICING IS PART MEASURED AND PART INFERRED, AND THE ROWS SAY WHICH.**
+`global.anthropic.claude-sonnet-4-6` is **MEASURED** from the AWS Marketplace
+listing the model card names (prod-ffvjxvh4ltq64, read 2026-08-30): $3.00 in /
+$15.00 out / $0.30 cache read / $3.75 cache write (5m) / $6.00 (1h) per 1M. The
+`us.` / `eu.` / `au.` / `jp.` / In-Region rows are **INFERRED** at +10%, carried
+over from the GPT-5.6 Terra pattern, because that listing publishes Global
+dimensions only. The shipped default is `us.` -- the geo profile -- on the
+project's own recorded residency argument, not the cheaper `global.`; nothing
+here flips a residency decision to make a pricing table cleaner. **A6 settles it
+against a console bill.**
+
+**THE STANDING TEST FOUND A DEFECT IN THIS PASS'S OWN WORK THAT READING DID
+NOT.** `BEDROCK_ANTHROPIC_PROFILE_PREFIXES` has five members off the model card;
+the first pricing table had three rows. So a `jp.`-prefixed configuration would
+have passed validation, spent a live Stage 5 call, and only then raised
+`UnknownModelPricingError` from inside the writer -- after the money, with no row
+to show for it. Two rows closed the gap and a **new local refusal** closed the
+class: `validate_matching_provider_config()` now reads `PRICING_CONFIG` directly
+(never `get_model_cost`, which lives in `utils` and would be the forbidden
+cycle) and refuses an unpriced model before anything is sent. **The Responses
+branch has the same hole and it is NOT closed here** -- its three ids are all
+priced today, so the check would change nothing, and widening a branch this pass
+was told not to alter is scope creep. Recorded as a follow-up.
+
+**ELEVEN PLANTED DEFECTS, ELEVEN CAUGHT**, each a one-token edit to an in-memory copy
+(argued at `_EXEC_ALLOWLIST`; `git show` can supply none of them, because the
+module has no prior revision), each paired with a control requiring the SHIPPED
+module to give the clean answer -- without which a probe that always disagreed
+would report every plant as caught while measuring nothing.
+
+**TWO PINS MOVED IN `tests/test_agent_bedrock_adapter.py` AND BOTH ARE THE CHECK
+WORKING**: the provider tuple 2 -> 3 members, and `call_matching_model`'s return
+count 2 -> 3. What each protected is re-asserted in stronger form -- the
+vocabulary is still pinned by exact composition AND order, and the OpenAI return
+is now pinned as the LAST statement of the function and unguarded, which is what
+"the default path is unchanged" actually means. That file is **281** (was 275).
+
+**A CONSTANT THIS PASS ADDED WAS THEN DELETED.** `MATCHING_PROVIDERS_BEDROCK`
+had no production reader -- only the test asserting it existed -- which is the
+dead declaration check 2h reports and the shape pass 20f-2 deleted `BATCH_SIZE`
+for. The argument for writing it when a second site needs it is left at the site.
+
+**VERIFIED BY RUNNING.** `tests/test_agent_bedrock_anthropic_adapter.py`
+**261/0**; `tests/test_agent_bedrock_adapter.py` **281/0**;
+`tests/test_package_invariants.py` **260/0/0**, unchanged -- so import purity
+holds, no never-read name was introduced and the new `_EXEC_ALLOWLIST` entry is
+accepted; CI bucket A **81 files, 0 failed, 0 not run**;
+`.github/scripts/ci_test_buckets.py --check` consistent at **100 files**;
+`static_checks.py` compiles 248; `python fixture_replay.py` **12/12 clean, exit
+0, no recapture**; the production `inferences.db` sha256 **unchanged**
+(`ab1403e3...`). **No money was spent, no AWS call of any kind was made, and no
+migration was run.**
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **THE PROBE HAS NOT BEEN RUN.** `bedrock_probe.py --provider
+   bedrock_anthropic` is extended and gated behind `--i-understand-this-bills`;
+   this pass spent nothing. Every A1..A10 item is documentation until it runs.
+   A1 (is the schema accepted AND enforced) and A2 (does the cache warm, and
+   does the disjointness formula hold against a real response) are ranked first
+   and second because the first makes the branch useless and the second costs
+   money silently.
+2. **PER-TRIAL MODE IS REFUSED ON THIS PROVIDER**, as it is on the Responses
+   branch: `assert_per_trial_provider_supported()` admits OpenAI alone, so the
+   cache-or-nothing warmup is not built here. Grouped mode is what this branch
+   serves. **That is a real gap for a Claude branch specifically**, because
+   `cachePoint` with a 1,024-token minimum is exactly the mechanism a per-trial
+   wave needs.
+3. **THE FIXTURE HARNESSES REFUSE THIS PROVIDER ALREADY AND THAT IS INHERITED,
+   NOT BUILT.** `capture.assert_provider_is_hookable()` admits OpenAI alone, so
+   a capture or replay under `bedrock_anthropic` refuses by name rather than
+   billing for calls no proxy wraps. There are no Converse fixtures.
+4. **`BEDROCK_REGION` IS STILL NOT GATED BY THE RESUME FINGERPRINT.** Two runs
+   against `us.anthropic.claude-sonnet-4-6` in different Regions are
+   indistinguishable to the resume gate. Same follow-up the Responses branch
+   already carries; a third provider raises its rank.
+5. **`anthropic` IS AN UNDECLARED DEPENDENCY, found while working and not
+   introduced here.** `oncotriage/evaluation/rater.py` imports it (deferred, at
+   line 1952) and `pyproject.toml` declares it nowhere. Unrelated to this branch
+   -- which uses boto3, declared -- and worth a line in the next packaging pass.
+6. **THE INFERRED PRICING ROWS.** See A6.
 
 ### The compose file holds no secret (the compose-secrets pass)
 

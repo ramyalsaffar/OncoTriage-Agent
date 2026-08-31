@@ -41,6 +41,30 @@ WHAT IT ANSWERS, in the order the adapter's VERIFY-AT-GO-LIVE list numbers them
   (8)    the cost, priced from PRICING_CONFIG's Bedrock rows.
   (10)   store=false is accepted.
 
+TWO BRANCHES, ONE PROBE, AND `--provider` SELECTS. Everything above describes
+the DEFAULT branch, `--provider bedrock`: the OpenAI-compatible Responses API
+serving GPT-5.6 Terra. `--provider bedrock_anthropic` probes the CONVERSE API
+serving Claude Sonnet 4.6 instead, and answers a different, lettered list --
+A1..A10 at the top of `oncotriage/agent/bedrock_anthropic_adapter.py`. They are
+lettered rather than numbered so that a report naming "(3)" and one naming
+"(A1)" cannot be confused, because both are about structured output and they
+are about different APIs.
+
+    python bedrock_probe.py --i-understand-this-bills \
+        --provider bedrock_anthropic
+
+The two branches share the refusal gate, the summary and the schema validator
+and nothing below that. In ranked order the Converse branch answers: A1 whether
+the Stage 5 schema is accepted AND enforced (the only failure that makes the
+branch useless rather than degraded, and the one whose dangerous outcome is
+silent non-enforcement); A2 whether the prompt cache warms and whether the
+disjoint-usage arithmetic holds against a real response (the failure that costs
+money silently); A3 whether a model echo can be recovered at all, which decides
+whether MatchingModelMismatchError is live on that branch; then A4/A5 thinking
+and effort, A6 cost against rows that are partly INFERRED, A7 the truncation
+stop reason (only under --probe-truncation, one extra billed call), and A8 the
+service tier.
+
 IT FORCES THE PROVIDER IN ITS OWN PROCESS, and says so. `config.MATCHING_
 PROVIDER` stays "openai" in the file; this script sets it on the module for the
 duration of its own run so the adapter builds a Bedrock request. Nothing is
@@ -59,6 +83,7 @@ import argparse
 import json
 import os
 import sys
+import time
 
 
 try:
@@ -213,9 +238,28 @@ def main(argv=None):
         CONFIRM_FLAG, dest="confirmed", action="store_true",
         help="Required. Without it nothing is called and the exit code is 2.")
     parser.add_argument(
+        "--provider", default="bedrock",
+        choices=["bedrock", "bedrock_anthropic"],
+        help="Which Bedrock branch to probe. 'bedrock' is the OpenAI-compatible "
+             "Responses API (GPT-5.6 Terra) and is the default because it is "
+             "the branch this file was written for. 'bedrock_anthropic' is the "
+             "Converse API (Claude Sonnet 4.6) and answers the A1..A10 list in "
+             "oncotriage/agent/bedrock_anthropic_adapter.py. "
+             "THE CHOICES ARE SPELT OUT RATHER THAN READ OFF "
+             "config.MATCHING_PROVIDERS, because that tuple contains 'openai' "
+             "and this file cannot probe a provider it has no adapter for -- "
+             "argparse refusing an unprobeable name is better than main() "
+             "discovering it three sections in.")
+    parser.add_argument(
         "--probe-seed", action="store_true",
         help="Issue ONE EXTRA billed call with MATCHING_SEED smuggled through "
              "extra_body, to settle VERIFY-AT-GO-LIVE (4).")
+    parser.add_argument(
+        "--probe-truncation", action="store_true",
+        help="bedrock_anthropic only: issue ONE EXTRA billed call at "
+             "maxTokens=16 to settle A7 -- whether a real truncation reports "
+             "stopReason 'max_tokens', which is the single string that arms "
+             "Stage 5's reactive split.")
     parser.add_argument(
         "--calls", type=int, default=2,
         help="How many identical calls to issue (default 2; the second is what "
@@ -232,6 +276,13 @@ def main(argv=None):
     if args.calls < 1:
         print("REFUSED: --calls must be at least 1.")
         return 2
+
+    # THE DISPATCH SITS ABOVE EVERY LINE OF THE RESPONSES PROBE, so that branch
+    # is byte-identical to the one that shipped: same imports, same order, same
+    # checks. A probe that had been restructured to accommodate a second
+    # provider would no longer be evidence about the first.
+    if args.provider == "bedrock_anthropic":
+        return _probe_bedrock_anthropic(args)
 
     from oncotriage import config
     from oncotriage.agent import bedrock_adapter
@@ -434,6 +485,259 @@ def main(argv=None):
           "is stronger and is above: that no seed is on the wire at all.")
     print("  Anything else appearing here is a translation the adapter had to "
           "INTERPRET, and each key is a numbered VERIFY-AT-GO-LIVE item.")
+
+    return _summary()
+
+
+def _probe_bedrock_anthropic(args):
+    """The Converse branch: A1..A10 in oncotriage/agent/bedrock_anthropic_adapter.py.
+
+    A SEPARATE FUNCTION RATHER THAN BRANCHES THREADED THROUGH THE RESPONSES
+    PROBE. The two share the refusal gate, the summary and the schema
+    validator, and share NOTHING below that: different client, different
+    request builder, different response shape, different usage field names,
+    different questions. Interleaving them would produce a function in which
+    every check had to be read twice to find out which API it was about.
+
+    THE ORDER IS THE RANKING. A1 (structured output) first because it is the
+    only failure that makes the branch useless rather than degraded; A2 (the
+    cache) second because it is the failure that costs money silently.
+    """
+    from oncotriage import config
+    from oncotriage.agent import bedrock_anthropic_adapter as adapter
+    from oncotriage.agent import deps
+    from oncotriage.agent.response_schema import (
+        EVALUATIONS_KEY, RESPONSE_SCHEMA_NAME, build_response_schema)
+    from oncotriage.utils import get_model_cost
+
+    section("PROVIDER — forced for this process only")
+    print(f"  config.MATCHING_PROVIDER in the file: "
+          f"{config.MATCHING_PROVIDER!r}")
+    config.MATCHING_PROVIDER = config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC
+    print(f"  forced to {config.MATCHING_PROVIDER!r} for this process. "
+          f"Nothing on disk changed.")
+
+    try:
+        config.validate_matching_provider_config()
+    except RuntimeError as exc:
+        print(f"\n  REFUSED before any call: {exc}")
+        return 1
+
+    _region_src = (config.BEDROCK_REGION_SOURCE
+                   or "BEDROCK_REGION_DEFAULT in oncotriage/config.py")
+    print(f"  API       : Converse (bedrock-runtime), through boto3")
+    print(f"  region    : {config.BEDROCK_REGION}  (from {_region_src})")
+    print(f"  model     : {config.matching_wire_model()}")
+    print(f"  thinking  : {config.BEDROCK_ANTHROPIC_THINKING!r}   "
+          f"effort: {config.BEDROCK_ANTHROPIC_EFFORT!r}        [A4] [A5]")
+    print(f"  cache ttl : {config.BEDROCK_ANTHROPIC_CACHE_TTL!r}"
+          f"                              [A2]")
+
+    section("REQUEST — exactly what Stage 5 would send")
+    try:
+        kwargs = adapter.build_converse_request(PROBE_SYSTEM, PROBE_USER)
+    except Exception as exc:                           # noqa: BLE001
+        print(f"\n  REFUSED before any call: {type(exc).__name__}: {exc}")
+        print("  Nothing was called. Nothing was billed.")
+        return 1
+
+    _schema_str = kwargs["outputConfig"]["textFormat"]["structure"]["jsonSchema"]["schema"]
+    printable = json.loads(json.dumps(kwargs))
+    printable["outputConfig"]["textFormat"]["structure"]["jsonSchema"]["schema"] = (
+        f"<{len(_schema_str)} chars of serialized JSON; printed in full below>")
+    dump("converse() kwargs", printable)
+    check("the request names the configured wire model",
+          kwargs["modelId"], config.matching_wire_model())
+    check("the schema travels as a STRING, which is what Converse's "
+          "jsonSchema.schema member is", isinstance(_schema_str, str), True)
+    check("no seed reaches the wire — Converse has no such field",
+          "seed" in json.dumps(kwargs), False)
+    check_true("a cachePoint follows the system text",
+               any("cachePoint" in b for b in kwargs["system"]))
+    print(f"\n  serialized schema, in full:\n    {_schema_str}")
+
+    client = deps.get_bedrock_anthropic_client()
+    schema = build_response_schema()
+
+    raw_responses = []
+    elapsed = []
+    section(f"CALLS — {args.calls} identical, live and billed")
+    for i in range(args.calls):
+        print(f"\n  --- call {i + 1} of {args.calls} ---")
+        _t0 = time.monotonic()
+        try:
+            raw = client.converse(**kwargs)
+        except Exception as exc:                       # noqa: BLE001
+            category = adapter.classify_error(exc)
+            print(f"  RAISED  {type(exc).__name__} [{category}]")
+            print(f"          {exc}")
+            print("\n  The adapter's A1..A10 list names what to edit for each "
+                  "category. A ValidationException naming outputConfig is A1; "
+                  "one naming additionalModelRequestFields is A4.")
+            _RESULTS["failed"] += 1
+            _FAILURES.append(f"call {i + 1} raised {type(exc).__name__} "
+                             f"[{category}]: {exc}")
+            return _summary()
+        elapsed.append(time.monotonic() - _t0)
+        raw_responses.append(raw)
+        print(f"  request id : "
+              f"{(raw.get('ResponseMetadata') or {}).get('RequestId')}")
+        print(f"  stopReason : {raw.get('stopReason')}")
+        print(f"  elapsed    : {elapsed[-1]:.1f}s")
+        dump("usage (A2: read every field name here)", raw.get("usage"))
+
+    first = raw_responses[0]
+
+    # ---- A1 -------------------------------------------------------------
+    section("(A1) STRUCTURED OUTPUT — accepted, and actually enforced")
+    print(f"  first-call latency {elapsed[0]:.1f}s against a read budget of "
+          f"{config.MATCHING_REQUEST_TIMEOUT_SECONDS}s.          [A1] [A10]")
+    print("  A FIRST-EVER SCHEMA COMPILES THE GRAMMAR, which AWS documents as "
+          "taking 'up to a few minutes'. A slow first call and a fast second "
+          "is that, not a slow model.")
+    if len(elapsed) > 1:
+        print(f"  second call {elapsed[1]:.1f}s.")
+    check_true("the call carrying outputConfig.textFormat was ACCEPTED", True)
+
+    translated = adapter.translate_response(first)
+    text = (translated.choices[0].message.content or "").strip()
+    print(f"\n  translated finish_reason: "
+          f"{translated.choices[0].finish_reason}")
+    try:
+        parsed = json.loads(text)
+    except Exception as exc:                           # noqa: BLE001
+        check(f"the output parses as JSON ({exc})", False, True)
+        parsed = None
+
+    if parsed is not None:
+        problems = validate_against_schema(parsed, schema)
+        check("the output CONFORMS to the real Stage 5 schema "
+              f"(violations: {problems[:3]}). IF THIS FAILS, THE SCHEMA WAS "
+              "ACCEPTED AND SILENTLY NOT ENFORCED, which is the dangerous "
+              "outcome", problems, [])
+        check_true(f"...and carries the {EVALUATIONS_KEY!r} array",
+                   isinstance(parsed.get(EVALUATIONS_KEY), list))
+    print(f"  (the schema was sent under the name {RESPONSE_SCHEMA_NAME!r}; "
+          f"Converse echoes no format back, so conformance above is the only "
+          f"evidence that it was enforced)")
+
+    # ---- A2 -------------------------------------------------------------
+    section("(A2) PROMPT CACHE — and the disjoint-usage arithmetic")
+    reads = []
+    for i, raw in enumerate(raw_responses):
+        u = raw.get("usage") or {}
+        reads.append(u.get("cacheReadInputTokens"))
+        derived = adapter._usage_block(u)
+        print(f"  call {i + 1}: inputTokens={u.get('inputTokens')} "
+              f"cacheRead={u.get('cacheReadInputTokens')} "
+              f"cacheWrite={u.get('cacheWriteInputTokens')} "
+              f"-> prompt_tokens={derived['prompt_tokens']}")
+    check_true("call 1 reported a cacheReadInputTokens field at all "
+               "(None means the field name moved — the whole cached-token "
+               "column would then store NULL and nothing would raise)",
+               reads and reads[0] is not None)
+    if len(reads) > 1:
+        if reads[0] is not None and reads[1] is not None and reads[1] > reads[0]:
+            print("  the cache WARMED between the two calls.")
+        else:
+            print("  the cache did NOT warm. EXPECTED HERE: the minimum "
+                  "cacheable prefix for this model is 1,024 tokens and this "
+                  "probe's system prompt is deliberately tiny, so a zero is "
+                  "NOT evidence against caching in Stage 5, whose prefix is "
+                  "~20k tokens. Re-read with a real prompt before concluding "
+                  "anything — and note AWS's own wording: a checkpoint below "
+                  "the minimum still SUCCEEDS, it just does not cache.")
+
+    # ---- A3 -------------------------------------------------------------
+    section("(A3) MODEL ECHO — does /model come back at all")
+    dump("additionalModelResponseFields", first.get("additionalModelResponseFields"))
+    _model, _echoed = adapter._model_echo(first)
+    if _echoed:
+        print(f"  AN ECHO ARRIVED: {_model!r}. MatchingModelMismatchError is "
+              f"LIVE on this branch — record that.")
+        check("the echo equals the configured wire model",
+              _model, config.matching_wire_model())
+    else:
+        print(f"  NO ECHO. inferences.matching_model will record the REQUESTED "
+              f"id ({_model!r}) and the adapter counts "
+              f"'model_echo_unavailable' once per run. That is the state the "
+              f"module ships in and it is not a failure of this probe.")
+
+    # ---- A4 / A5 / A7 / A8 ----------------------------------------------
+    section("(A4)(A5) THINKING AND EFFORT were accepted")
+    check_true(f"the call carrying thinking="
+               f"{config.BEDROCK_ANTHROPIC_THINKING!r} was accepted", True)
+    if config.BEDROCK_ANTHROPIC_EFFORT is None:
+        print("  outputConfig.effort was OMITTED (the shipped default). Set "
+              "config.BEDROCK_ANTHROPIC_EFFORT and re-run to settle A5.")
+    else:
+        check_true(f"...and effort={config.BEDROCK_ANTHROPIC_EFFORT!r}", True)
+
+    section("(A8) serviceTier was OMITTED, which is Standard")
+    check("no serviceTier on the wire", "serviceTier" in kwargs,
+          config.BEDROCK_ANTHROPIC_SERVICE_TIER is not None)
+
+    section("(A7) STOP REASON — what a normal completion reports")
+    print(f"  stopReason on call 1: {first.get('stopReason')!r} -> "
+          f"finish_reason {translated.choices[0].finish_reason!r}")
+    print("  THE TRUNCATION SPLIT IS ARMED BY 'max_tokens' AND NOTHING ELSE. "
+          "Re-run with --probe-truncation to see what a real truncation "
+          "reports; a value other than 'max_tokens' there means the split "
+          "never fires and Stage 5 burns its parse-retry budget instead.")
+
+    if args.probe_truncation:
+        section("(A7) TRUNCATION — one EXTRA billed call at maxTokens=16")
+        truncated = json.loads(json.dumps(kwargs))
+        truncated["inferenceConfig"]["maxTokens"] = 16
+        try:
+            t_raw = client.converse(**truncated)
+            print(f"  stopReason: {t_raw.get('stopReason')!r}")
+            check("a deliberate truncation reports 'max_tokens', which is what "
+                  "arms the split", t_raw.get("stopReason"), "max_tokens")
+        except Exception as exc:                       # noqa: BLE001
+            print(f"  RAISED ({type(exc).__name__}: {exc})")
+            print("  A maxTokens below the model's minimum is itself a "
+                  "possibility; this does not settle A7 either way.")
+
+    # ---- A6 -------------------------------------------------------------
+    section("(A6) COST — priced from PRICING_CONFIG's Sonnet 4.6 rows")
+    total_in = total_out = 0
+    for raw in raw_responses:
+        d = adapter._usage_block(raw.get("usage"))
+        total_in += d["prompt_tokens"]
+        total_out += d["completion_tokens"]
+    model_key = config.matching_wire_model()
+    try:
+        cost = get_model_cost(model_key, total_in, total_out)
+        print(f"  {len(raw_responses)} call(s): {total_in} input + "
+              f"{total_out} output tokens (input INCLUDES cached, per the "
+              f"disjointness formula)")
+        print(f"  priced against {model_key!r}: ${cost:.6f}")
+        if not model_key.startswith("global."):
+            print("  *** THIS ROW IS INFERRED, NOT MEASURED. *** The AWS "
+                  "Marketplace listing publishes GLOBAL dimensions only; the "
+                  "+10% geo premium is carried over from the GPT-5.6 Terra "
+                  "pattern. RECONCILE AGAINST THE CONSOLE BILL before any "
+                  "campaign number rests on it.")
+        print("  CACHED INPUT IS NOT DISCOUNTED IN THIS FIGURE — "
+              "PRICING_CONFIG has no cached term, so a cache hit makes this an "
+              "OVER-estimate. At $0.30 against $3.00 that gap is ~10x on the "
+              "cached portion, which matters more here than on any other "
+              "branch because the per-trial design depends on the cache.")
+    except Exception as exc:                           # noqa: BLE001
+        check(f"the model is priced in PRICING_CONFIG ({exc})", False, True)
+
+    section("DEGRADATIONS RECORDED BY THE ADAPTER")
+    recorded = dict(adapter.BEDROCK_ANTHROPIC_DEGRADATIONS)
+    print(f"  {recorded or 'none'}")
+    print("  'model_echo_unavailable' HERE IS EXPECTED unless A3 came back "
+          "positive — translate_response() records it, and this probe calls "
+          "that. The other keys are NOT expected: this probe builds the "
+          "request with the adapter's own builder and issues it directly, so "
+          "it never enters call_matching_model_bedrock_anthropic, which is "
+          "where the once-per-process seed and effort bumps live. A real "
+          "Stage 5 run records those on its first call; what the probe checks "
+          "instead is stronger and is above — that no seed is on the wire.")
 
     return _summary()
 

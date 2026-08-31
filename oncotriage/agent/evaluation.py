@@ -43,6 +43,7 @@ from typing import Dict, FrozenSet, List, Optional, Tuple
 
 from oncotriage import config
 from oncotriage.agent import bedrock_adapter
+from oncotriage.agent import bedrock_anthropic_adapter
 from oncotriage.agent import deps
 from oncotriage.agent.patient import _create_patient_summary
 from oncotriage.agent.prompts import (
@@ -380,9 +381,11 @@ class MatchingModelMismatchError(RuntimeError):
         # while leaving the wire id untouched -- so the run would raise again,
         # identically, having also broken the pricing key.
         self.provider = config.MATCHING_PROVIDER
-        constant = ("BEDROCK_MATCHING_MODEL"
-                    if self.provider == config.MATCHING_PROVIDER_BEDROCK
-                    else "MATCHING_MODEL")
+        constant = {
+            config.MATCHING_PROVIDER_BEDROCK: "BEDROCK_MATCHING_MODEL",
+            config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC:
+                "BEDROCK_ANTHROPIC_MATCHING_MODEL",
+        }.get(self.provider, "MATCHING_MODEL")
         super().__init__(
             f"Stage 5 requested model {requested!r} but the API answered as "
             f"{returned!r} (provider: {self.provider}). The configured model "
@@ -549,6 +552,18 @@ def call_matching_model(system_prompt: str, user_prompt: str, *,
     _provider = config.MATCHING_PROVIDER
     if _provider == config.MATCHING_PROVIDER_BEDROCK:
         return bedrock_adapter.call_matching_model_bedrock(
+            system_prompt, user_prompt)
+    # THE SECOND BEDROCK BRANCH, and it is a THIRD arm rather than a mode of
+    # the one above: Claude Sonnet 4.6 is not served by the OpenAI-compatible
+    # Responses API on either Bedrock endpoint (its model card marks Messages,
+    # Responses and Chat Completions all unsupported), so this reaches Converse
+    # through boto3. `prompt_cache_key` is deliberately not forwarded here for
+    # the reason recorded above for the other Bedrock arm -- the adapter owns
+    # that request's caching, through a `cachePoint` block rather than a
+    # routing hint -- and per-trial mode is refused on any non-OpenAI provider
+    # before this line is reached.
+    if _provider == config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC:
+        return bedrock_anthropic_adapter.call_matching_model_bedrock_anthropic(
             system_prompt, user_prompt)
     if _provider != config.MATCHING_PROVIDER_OPENAI:
         config.validate_matching_provider_config()   # raises, naming the constant

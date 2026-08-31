@@ -110,6 +110,14 @@ WHAT IS OVERRIDABLE, and why each one is on the list
                        embeds through OpenAI -- so one key could not redirect
                        the judge without also redirecting the embeddings.
                        Unreachable with the flag at its default.
+    BEDROCK_ANTHROPIC_CLIENT
+                       Stage 5's Converse call when MATCHING_PROVIDER is
+                       "bedrock_anthropic". A THIRD key rather than a reuse of
+                       BEDROCK_CLIENT because the two hold objects of different
+                       TYPES -- an openai.OpenAI and a botocore client -- so
+                       one installed where the other was expected fails inside
+                       the call rather than at the seam. Unreachable with the
+                       flag at its default.
     QDRANT_CLIENT      every retrieval query and both scroll paths.
     BM25_QUERY_MODEL   the FastEmbed sparse query encoder. As of pass 3a its
                        default is NOT built here — it comes from
@@ -203,6 +211,7 @@ log = get_logger(__name__)
 
 OPENAI_CLIENT = "openai_client"
 BEDROCK_CLIENT = "bedrock_client"
+BEDROCK_ANTHROPIC_CLIENT = "bedrock_anthropic_client"
 QDRANT_CLIENT = "qdrant_client"
 BM25_QUERY_MODEL = "bm25_query_model"
 MEDCPT_TOKENIZER = "medcpt_tokenizer"
@@ -215,6 +224,7 @@ MESH_FILTER = "mesh_filter"
 OVERRIDE_KEYS = (
     OPENAI_CLIENT,
     BEDROCK_CLIENT,
+    BEDROCK_ANTHROPIC_CLIENT,
     QDRANT_CLIENT,
     BM25_QUERY_MODEL,
     MEDCPT_TOKENIZER,
@@ -946,6 +956,26 @@ def get_bedrock_client():
     credential is resolved.
     """
     return _resolve(BEDROCK_CLIENT, config.get_bedrock_client)
+
+
+def get_bedrock_anthropic_client():
+    """The boto3 Bedrock client Stage 5 uses when the provider is bedrock_anthropic.
+
+    A THIRD CLIENT KEY RATHER THAN A REUSE OF `BEDROCK_CLIENT`, and the reason
+    is not tidiness: the two hold objects of DIFFERENT TYPES with different
+    method surfaces -- an `openai.OpenAI` with `.responses.create`, and a
+    botocore client with `.converse` -- so a harness that installed one where
+    the other was expected would fail with an AttributeError from inside the
+    call rather than at the seam. Sharing the key would also make the identity
+    assertions both fixture harnesses make unable to say WHICH Bedrock branch
+    they had gripped.
+
+    NOT REACHED AT ALL WITH THE FLAG OFF. `oncotriage/agent/evaluation.py`
+    dispatches on `config.MATCHING_PROVIDER` above the call, so under the
+    default no factory here runs, no client is constructed, no AWS credential
+    is resolved and boto3 is not imported.
+    """
+    return _resolve(BEDROCK_ANTHROPIC_CLIENT, config.get_bedrock_anthropic_client)
 
 
 def get_qdrant_client():

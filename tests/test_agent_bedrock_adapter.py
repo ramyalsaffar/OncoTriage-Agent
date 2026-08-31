@@ -463,8 +463,20 @@ check("the OpenAI call still reads its client from deps.get_openai_client()",
 # The dispatch is ABOVE the return, so the return is reached unchanged.
 _returns = [n for n in ast.walk(_call_fn) if isinstance(n, ast.Return)] \
     if _call_fn else []
-check("call_matching_model has exactly two returns: the Bedrock branch and "
-      "the unchanged OpenAI one", len(_returns), 2)
+# THREE RATHER THAN TWO SINCE THE CONVERSE BRANCH LANDED, and this pin moving
+# is the check working: it exists so that a return added anywhere in this
+# function is REMARKED ON rather than absorbed. What it protects is unchanged
+# and is asserted separately below -- that the OpenAI return is the LAST
+# statement and is unguarded, so every provider arm sits above it and the
+# default path is reached exactly as it always was.
+check("call_matching_model has exactly three returns: the two Bedrock "
+      "branches and the unchanged OpenAI one", len(_returns), 3)
+check("...and the LAST statement of the function is still the unconditional "
+      "OpenAI return, which is what 'the default path is unchanged' means",
+      isinstance(_call_fn.body[-1], ast.Return) if _call_fn else False, True)
+check("...naming the OpenAI client, with no provider guard around it",
+      "deps.get_openai_client()" in ast.unparse(_call_fn.body[-1])
+      if _call_fn else False, True)
 
 # --- 1c. Behavioural: drive the real function ------------------------------
 
@@ -771,9 +783,24 @@ with provider(config.MATCHING_PROVIDER_BEDROCK):
     check("the SHIPPED Bedrock configuration is itself valid",
           drive(config.validate_matching_provider_config), None)
 
-check("the provider vocabulary is closed and has exactly two members",
+# THIS PIN MOVED FROM TWO MEMBERS TO THREE, AND THE MOVE IS THE CHECK WORKING.
+# A second Bedrock branch was added -- `bedrock_anthropic`, the Converse API
+# serving Claude Sonnet 4.6, which is a THIRD provider rather than a mode of
+# the second because it uses a different client library, credential chain,
+# request shape and error classes. The argument is at MATCHING_PROVIDERS in
+# oncotriage/config.py. What this file still asserts is what it always
+# asserted: the vocabulary is CLOSED and its exact composition is pinned, so a
+# fourth member cannot arrive unremarked.
+#
+# THE ORDER IS PINNED TOO, and that is not decoration: `MATCHING_PROVIDERS` is
+# rendered into every refusal this file drives, so a reordering changes an
+# operator-facing message.
+check("the provider vocabulary is closed and has exactly three members",
       config.MATCHING_PROVIDERS,
-      (config.MATCHING_PROVIDER_OPENAI, config.MATCHING_PROVIDER_BEDROCK))
+      (config.MATCHING_PROVIDER_OPENAI, config.MATCHING_PROVIDER_BEDROCK,
+       config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC))
+check("...and THIS file's subject is still the Responses branch alone",
+      config.MATCHING_PROVIDER_BEDROCK, "bedrock")
 check("the endpoint vocabulary IS the URL table's keys, so the two cannot "
       "disagree", sorted(config.BEDROCK_BASE_URL_TEMPLATES),
       ["bedrock-mantle", "bedrock-runtime"])

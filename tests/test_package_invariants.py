@@ -1189,6 +1189,26 @@ _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    # end, and a plant that matched nothing raises rather than
                    # producing a control that quietly agrees with the code.
                    "tests/test_agent_bedrock_adapter.py",
+                   # ELEVEN execs, of in-memory copies of
+                   # oncotriage/agent/bedrock_anthropic_adapter.py with one
+                   # one-token edit each: the disjoint usage sum reverted to a
+                   # rename, the schema sent as an object rather than a string,
+                   # the cache breakpoint dropped, max_tokens mapped to stop,
+                   # the missing model echo substituted silently, the strict
+                   # guard removed, an absent cache reading zero-filled,
+                   # tool_use folded into the mapping table, the dropped seed
+                   # uncounted, the model echo never requested, and a
+                   # guardrail block no longer setting a refusal. `git show`
+                   # can supply NONE of them for the reason the entry above
+                   # gives for its sibling: the module has no prior revision at
+                   # all, so every plant is an edit INSIDE a function body to
+                   # code that exists at HEAD and nowhere else. The copies are
+                   # exec'd into a real ModuleType, the shipped file is sha256'd
+                   # before the first plant and compared at the end alongside
+                   # evaluation.py and config.py, and a plant that matched
+                   # nothing raises rather than producing a control that
+                   # quietly agrees with the code.
+                   "tests/test_agent_bedrock_anthropic_adapter.py",
                    # ONE exec, of an in-memory copy of fixtures/capture.py with
                    # `--resume`'s gate reverted to "the file exists, skip it" --
                    # the defect the gate was written to prevent, and the only
