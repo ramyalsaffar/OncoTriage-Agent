@@ -236,6 +236,19 @@ def labs_of(text):
                    "\nMetastasis & Nodal Status:")
 
 
+def stage_line(text):
+    """The rendered Cancer Stage line, or a NAMED absence.
+
+    Never `[...][0]`: a defect that removes the section makes an index raise
+    inside check()'s argument list, which reports one traceback where it owes a
+    summary.
+    """
+    hits = [ln for ln in text.splitlines() if ln.startswith("Cancer Stage:")]
+    if len(hits) == 1:
+        return hits[0]
+    return f"<{len(hits)} Cancer Stage lines>"
+
+
 def line_for(text, needle):
     """The one rendered line containing ``needle``, or a named absence."""
     hits = [ln for ln in text.splitlines() if needle in ln]
@@ -830,9 +843,16 @@ for _label, _needle, _expected in (
 # not now: that block would differ, and lumping it in would either fail for the
 # right reason under a misleading name or, once someone "fixed" it by deleting
 # the block, stop covering demographics and stage at all.
+#
+# CANCER STAGE MOVED OUT OF THIS GROUP. It was in it, correctly, for as long as
+# that section rendered no date -- and it is dated now for the two tiers backed
+# by a staging Observation. What is still true, and is the check below rather
+# than a member of this loop, is that _p7 carries NO stage at all, so its
+# section renders one sentence and no date. The dated arm has its own fixture
+# and its own pin further down; leaving the old member here would have kept a
+# byte-identity check that passes vacuously under a claim that is false.
 for _name, _head, _next in (
     ("allergies",    "\nAllergies:\n",    "\nProcedures:"),
-    ("cancer stage", "\n\nCancer Stage:", "\n\nConditions:"),
 ):
     check(f"{_name}: the section was found and is non-empty",
           len(section(_after7, _head, _next)) > len(_head) + 4, True)
@@ -848,9 +868,13 @@ check("allergies: and it really does carry an onset_date the renderer never "
 check("demographics: byte-identical",
       _after7.split("\n\nPerformance Status:")[0],
       _bare7.split("\n\nPerformance Status:")[0])
-check("cancer stage: byte-identical",
+check("cancer stage: byte-identical for a patient with NO stage, which is "
+      "what this fixture is -- there is no date to suppress",
       section(_after7, "\n\nCancer Stage:", "\n\nConditions:"),
       section(_bare7, "\n\nCancer Stage:", "\n\nConditions:"))
+check("...and the reason really is that the fixture has no stage, rather than "
+      "a renderer that ignores one",
+      stage_line(_after7), "Cancer Stage: not recorded in this record")
 check("the Tier C count line carries no date and no interval",
       line_for(_after7, "Other conditions"),
       "- Other conditions (1): Dental caries (disorder)")
@@ -890,14 +914,75 @@ check("the mixed patient rendered all four condition shapes",
 # from a guessed literal is the defect this project keeps re-finding; this one
 # matches the ISO shape the renderer actually emits.
 _ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
-_DATE_BEARING = [ln for ln in _after7.splitlines()
-                 if ln.startswith("- ") and _ISO_DATE.search(ln)]
+
+
+def date_bearing(text):
+    """Every rendered line carrying an ISO date.
+
+    THE `- ` PREFIX WAS DROPPED FROM THIS FILTER, and that is not a widening for
+    its own sake. It restricted the sweep to LIST ITEMS, which was every dated
+    line in the summary until the Cancer Stage section gained a staging date --
+    a named line, not a bullet. A structural check whose corpus silently covers
+    less than it claims does not fail; it reports fewer findings, which reads
+    exactly like a clean render. Nothing else in this summary carries an ISO
+    date outside a list item, so the count below is unchanged for _p7.
+    """
+    return [ln for ln in text.splitlines() if _ISO_DATE.search(ln)]
+
+
+_DATE_BEARING = date_bearing(_after7)
 check("the sweep found every dated section's line, so an empty or short result "
       "is not why this passes",
       len(_DATE_BEARING), 8)
+check("...and the wider filter finds exactly what the `- ` prefix used to, for "
+      "this fixture, so the widening changed the corpus and not the count",
+      _DATE_BEARING, [ln for ln in _after7.splitlines()
+                      if ln.startswith("- ") and _ISO_DATE.search(ln)])
 check("every date-bearing line also states an interval",
       [ln for ln in _DATE_BEARING
        if BEFORE_REFERENCE_PHRASE not in ln and " old)" not in ln], [])
+
+# THE DATED STAGE SECTION, WHICH _p7 CANNOT CARRY. _p7 has no stage at all --
+# deliberately, it is the fixture for the undated branch -- so the staging date
+# needs a patient of its own. It is _p7 with one stage-group Observation added
+# and nothing else changed, so every other line is the one pinned above.
+_p7_staged = dict(_p7)
+_p7_staged["cancer_stage_observations"] = [
+    {"stage_display": "Stage IIIA (qualifier value)",
+     "date": days_before(214), "loinc": "21908-9"}]
+_after7s = drive(_create_patient_summary, _p7_staged)
+_bare7s = render_bare(_p7_staged)
+
+check("cancer stage: the staging date and its interval, on one line",
+      stage_line(_after7s),
+      f"Cancer Stage: Stage III (from a recorded stage group observation; "
+      f"staged {_ECOG_DATE}, {event('214 days')})")
+check("...and the sweep sees it, which the `- ` filter could not",
+      len(date_bearing(_after7s)), 9)
+check("every date-bearing line of the STAGED render states an interval too",
+      [ln for ln in date_bearing(_after7s)
+       if BEFORE_REFERENCE_PHRASE not in ln and " old)" not in ln], [])
+check("cancer stage: NOT byte-identical with the temporal doors shut, which is "
+      "what says the interval is this renderer's and not the record's",
+      section(_after7s, "\n\nCancer Stage:", "\n\nConditions:")
+      == section(_bare7s, "\n\nCancer Stage:", "\n\nConditions:"), False)
+# EXACTLY TWO LINES MOVE, and the second one is the point rather than noise.
+# The stage line is the one this section is about; the `Patient:` pseudonym is
+# derived from compute_patient_hash, which hashes the stage observation -- so
+# adding one to a fixture MUST move it. (What must not move it, and does not,
+# is rendering a date the hash already covered: measured across all 1,000
+# corpus bundles, zero hashes and zero pseudonyms moved when this line gained
+# its date.)
+_moved = [(a, b) for a, b in zip(_after7.splitlines(), _after7s.splitlines())
+          if a != b]
+check("adding the stage moved exactly two lines",
+      [a.split(":")[0] for a, _b in _moved], ["Patient", "Cancer Stage"])
+check("...and the two renders have the same number of lines, so the zip above "
+      "is comparing like with like",
+      len(_after7.splitlines()), len(_after7s.splitlines()))
+check("...the pseudonym moved because the HASH covers the stage observation",
+      drive(compute_patient_hash, _p7) != drive(compute_patient_hash, _p7_staged),
+      True)
 
 
 #------------------------------------------------------------------------------

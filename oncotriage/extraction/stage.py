@@ -22,7 +22,7 @@ that drift make the rule silently never fire. Argued at the constant.)
 
 import re
 from collections import Counter
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 from oncotriage.constants import LOINC_AJCC_CLINICAL_M
 from oncotriage.extraction.negation import _is_negated
@@ -592,11 +592,19 @@ M_CATEGORY_UNREADABLE: Dict[str, int] = Counter()
 _M_KEY_MAX_LEN: int = 60
 
 
-def _stage_from_m_category(
+def _m_category_stage_with_date(
     cancer_metastasis_observations: Optional[List[Dict]],
-) -> Optional[int]:
+) -> Tuple[Optional[int], Optional[str]]:
     """
-    Stage IV if any AJCC clinical M observation reports M1, else None.
+    Stage IV if any AJCC clinical M observation reports M1, else None — and the
+    DATE of the observation that said so.
+
+    THE ONE IMPLEMENTATION OF THIS TIER. ``_stage_from_m_category`` below is a
+    thin delegate over it, the same shape ``extract_patient_stage`` is over
+    ``extract_patient_stage_with_source``: the ordinal-only reading of the rule
+    is a legitimate question, and answering it from a second walk of the list
+    would be two implementations of "does this axis say metastatic" that
+    nothing would notice disagreeing.
 
     Reads LOINC 21907-1 ONLY, selected by code. The other three codes in
     parser.py's _METASTASIS_LOINCS travel in the same list and must not be read
@@ -605,7 +613,22 @@ def _stage_from_m_category(
     COUNTS on the N axis. Keying on the ``metastasis_category == "M"`` field
     instead of the code would pull 44667-4 in.
 
-    Returns 4 or None. None means "this axis says nothing", never "stage 0".
+    Returns ``(4, date)`` or ``(None, None)``. None means "this axis says
+    nothing", never "stage 0". ``date`` is the RAW ``date`` field of the
+    answering observation, exactly as the record carries it, and is None when
+    that observation carries none — an observation with no date is an ordinary
+    record, not a degradation, and inventing one from a sibling observation is
+    the defect this return exists to make impossible.
+
+    THE DATE IS THE ANSWERING OBSERVATION'S, AND THE ANSWERING OBSERVATION IS
+    THE FIRST cM1 IN LIST ORDER — a stated limit rather than a claim. Unlike
+    the stage-group tier above, this one does not sort: its rule is "any cM1
+    anywhere answers", argued at the tier, because AJCC does not de-stage a
+    patient who has had distant metastasis. So a record carrying two cM1
+    observations reports the date of whichever the parser listed first, which
+    is not necessarily the most recent. What must never happen — and is what
+    this return prevents — is reporting a date belonging to an observation that
+    did NOT produce the ordinal.
     """
     for obs in cancer_metastasis_observations or []:
         if (obs.get("code") or "").strip() != LOINC_AJCC_CLINICAL_M:
@@ -620,9 +643,28 @@ def _stage_from_m_category(
             continue
 
         if match.group("category") == "1":
-            return _STAGE_MAX_ORDINAL
+            return _STAGE_MAX_ORDINAL, obs.get("date")
 
-    return None
+    return None, None
+
+
+def _stage_from_m_category(
+    cancer_metastasis_observations: Optional[List[Dict]],
+) -> Optional[int]:
+    """The ordinal this tier implies, with the answering observation's date
+    dropped. See ``_m_category_stage_with_date`` for the rule and the reasoning.
+
+    A THIN DELEGATE, and deliberately not a second walk of the list: the M rule
+    lives in exactly one function, so "the ordinal" and "the ordinal and its
+    date" cannot come apart. It is kept as a name because the ordinal alone is
+    the question ``tests/test_extraction_stage_m_category.py`` asks of this
+    tier — forty of its checks compare this call against 4 or None, and reading
+    the ordinal out of a tuple in every one of them would obscure the mapping
+    that file exists to pin.
+
+    Returns 4 or None. None means "this axis says nothing", never "stage 0".
+    """
+    return _m_category_stage_with_date(cancer_metastasis_observations)[0]
 
 
 def _m_key_text(raw) -> str:
@@ -660,6 +702,74 @@ STAGE_SOURCES: Tuple[str, ...] = (
     STAGE_SOURCE_CONDITION_DISPLAY,
     STAGE_SOURCE_METASTATIC_KEYWORD,
 )
+
+# WHICH TIERS ARE BACKED BY AN OBSERVATION, and therefore by a DATE.
+#
+# The two structured tiers read Observations, each of which carries the date it
+# was recorded on; the two condition-display tiers read a diagnosis NAME, which
+# carries no staging date at all. A Condition does have an onset_date, and it is
+# NOT a staging date -- it is when the diagnosis began -- so a tier that fell
+# back to it would be stating the diagnosis date as the date the patient was
+# staged, which is a different clinical fact and a wrong answer to "staged
+# within the last six months".
+#
+# THIS IS WHAT THE RENDERER BRANCHES ON, deliberately, rather than on "is the
+# date None". Those two differ in the case that matters: a stage-group
+# observation carrying no date is an observation-backed stage whose date is
+# missing, and a stage from diagnosis text is a stage that has no date to be
+# missing. Branching on the date would collapse them into one rendering and
+# make "no date here" a fallback accident rather than a statement.
+#
+# A closed, argued subset -- not the whole vocabulary and not empty -- and the
+# guard below says so, because a set that had silently grown to cover every
+# tier would make the branch unconditional and a set that had emptied would
+# delete the date from every line while every check about the undated tiers
+# still passed.
+STAGE_SOURCES_OBSERVATION_BACKED: Tuple[str, ...] = (
+    STAGE_SOURCE_STAGE_GROUP,
+    STAGE_SOURCE_M_CATEGORY,
+)
+
+if not (set(STAGE_SOURCES_OBSERVATION_BACKED) < set(STAGE_SOURCES)):
+    raise RuntimeError(
+        "STAGE_SOURCES_OBSERVATION_BACKED must be a non-empty PROPER subset of "
+        f"STAGE_SOURCES: {sorted(STAGE_SOURCES_OBSERVATION_BACKED)} vs "
+        f"{sorted(STAGE_SOURCES)}"
+    )
+
+
+class PatientStage(NamedTuple):
+    """What ``extract_patient_stage_with_source`` answers: the ordinal, the tier
+    that produced it, and — when that tier read an Observation — that
+    Observation's own date.
+
+    A NamedTuple rather than a bare 3-tuple, and the reason is the third member.
+    ``source`` and ``observation_date`` are both ``Optional[str]``, so a caller
+    unpacking them positionally in the wrong order gets two plausible strings
+    and a summary that states a date as a provenance; read by name they cannot
+    be confused. It is still a tuple, so ``== (None, None, None)`` works and a
+    caller may unpack it.
+
+    Attributes:
+        ordinal:          0-4, or None when no tier answered. None -> Stage 4's
+                          stage filter keeps every trial.
+        source:           the STAGE_SOURCES member naming the answering tier,
+                          None exactly when ``ordinal`` is None.
+        observation_date: the RAW ``date`` of the Observation that produced the
+                          ordinal, exactly as the record carries it — never
+                          normalised, never re-derived from a sibling record,
+                          and never the newest date on the bundle. It is None
+                          whenever ``source`` is not in
+                          STAGE_SOURCES_OBSERVATION_BACKED (those tiers read a
+                          diagnosis name and have no staging date), and also
+                          when the answering Observation simply carries no date.
+                          Those two are told apart by ``source``, which is why
+                          the renderer branches on that and not on this.
+    """
+
+    ordinal: Optional[int]
+    source: Optional[str]
+    observation_date: Optional[str]
 
 # The clinical numeral for each ordinal, which is what trial criteria text is
 # written in ("Stage IV or recurrent disease", "Stage IB-IIIA"). A fact about
@@ -706,19 +816,18 @@ def extract_patient_stage(
 
     Returns ordinal 0-4 or None.  None -> stage filter keeps all trials.
     """
-    ordinal, _source = extract_patient_stage_with_source(
+    return extract_patient_stage_with_source(
         conditions,
         cancer_stage_observations,
         cancer_metastasis_observations,
-    )
-    return ordinal
+    ).ordinal
 
 
 def extract_patient_stage_with_source(
     conditions: List[Dict],
     cancer_stage_observations: Optional[List[Dict]] = None,
     cancer_metastasis_observations: Optional[List[Dict]] = None,
-) -> Tuple[Optional[int], Optional[str]]:
+) -> PatientStage:
     """
     Extract patient's cancer stage ordinal (0–4) from FHIR data.
 
@@ -754,16 +863,29 @@ def extract_patient_stage_with_source(
     takes the stage group, which is what the tier order means, and the
     disagreement is a data finding for whoever owns the record.
 
-    Returns ``(ordinal, source)``. ``ordinal`` is 0–4 or None; None → stage
+    Returns a ``PatientStage``. ``ordinal`` is 0–4 or None; None → stage
     filter keeps all trials. ``source`` is the STAGE_SOURCES member naming the
     tier that answered, and is None exactly when the ordinal is None — no tier
-    answered, so there is no provenance to state.
+    answered, so there is no provenance to state. ``observation_date`` is the
+    raw date of the Observation that produced the ordinal, or None; see the
+    class for what each of its two None cases means.
 
-    THE SOURCE IS REPORTED, NOT DECIDED HERE. Nothing in this function branches
-    on it and no tier's logic or order changed when it was added; each tier
-    already knew which one it was, and that fact was simply being dropped on
-    the way out. What consumes it is the Stage 5 prompt, which states the
-    evidence class beside the stage.
+    THE DATE BELONGS TO THE ANSWERING OBSERVATION AND TO NOTHING ELSE. Each
+    tier returns the date of the record IT read, at the line it answers on, so
+    there is no place in this function where a date can be attached to an
+    ordinal a different record produced. The tempting wrong version — "the most
+    recent staging observation's date" — is wrong for two reachable records at
+    once: for a patient whose newest stage-group observation has an unreadable
+    display and whose stage came from an older one, and for a patient whose
+    stage came from the M tier while an unparseable stage-group observation
+    sits above it. Both render a plausible date that no tier measured.
+
+    THE SOURCE AND THE DATE ARE REPORTED, NOT DECIDED HERE. Nothing in this
+    function branches on either and no tier's logic or order changed when they
+    were added; each tier already knew which one it was and which record it had
+    read, and both facts were simply being dropped on the way out. What
+    consumes them is the Stage 5 prompt, which states the evidence class and,
+    for an observation-backed tier, when the staging was recorded.
     """
     # Tier 0: mCODE TNM stage group Observations — structured, highest priority
     if cancer_stage_observations:
@@ -780,16 +902,25 @@ def extract_patient_stage_with_source(
             if m:
                 ordinal = _STAGE_ORDINAL.get(m.group(1).lower())
                 if ordinal is not None:
-                    return ordinal, STAGE_SOURCE_STAGE_GROUP
+                    # THE DATE OF `obs`, THE ONE THAT ANSWERED -- not
+                    # sorted_obs[0]'s and not the newest date on the bundle.
+                    # The loop reaches here only after skipping every more
+                    # recent observation whose display did not parse, so those
+                    # two are different values whenever a restaged patient
+                    # carries an unreadable later record.
+                    return PatientStage(ordinal, STAGE_SOURCE_STAGE_GROUP,
+                                        obs.get('date'))
             # Fallback: "metastatic" in display
             if 'metastatic' in display.lower() and 'non-metastatic' not in display.lower():
-                return 4, STAGE_SOURCE_STAGE_GROUP
+                return PatientStage(4, STAGE_SOURCE_STAGE_GROUP, obs.get('date'))
 
     # Tier 1: AJCC clinical M category Observation — structured, and the one
     # TNM axis that determines a stage group on its own.
-    m_category_stage = _stage_from_m_category(cancer_metastasis_observations)
+    m_category_stage, m_category_date = _m_category_stage_with_date(
+        cancer_metastasis_observations)
     if m_category_stage is not None:
-        return m_category_stage, STAGE_SOURCE_M_CATEGORY
+        return PatientStage(m_category_stage, STAGE_SOURCE_M_CATEGORY,
+                            m_category_date)
 
     # Tier 2: Condition display text regex (covers all cancer types, all SNOMED displays)
     #
@@ -820,7 +951,14 @@ def extract_patient_stage_with_source(
                 continue
             ordinal = _STAGE_ORDINAL.get(m.group(1).lower())
             if ordinal is not None:
-                return ordinal, STAGE_SOURCE_CONDITION_DISPLAY
+                # NO DATE, and it is a decision rather than an omission. A
+                # Condition carries onset_date -- when the DIAGNOSIS began --
+                # and this tier read the diagnosis NAME, so there is no date on
+                # which anybody staged anything. Reporting the onset here would
+                # answer "staged within the last six months" with the date the
+                # cancer started.
+                return PatientStage(ordinal, STAGE_SOURCE_CONDITION_DISPLAY,
+                                    None)
 
     # Tier 3: Metastatic keyword in Condition display
     #
@@ -848,9 +986,10 @@ def extract_patient_stage_with_source(
     for cond in conditions:
         display = (cond.get("display") or "").lower()
         if "metastatic" in display and "non-metastatic" not in display:
-            return 4, STAGE_SOURCE_METASTATIC_KEYWORD
+            # No date, for the reason at the tier above.
+            return PatientStage(4, STAGE_SOURCE_METASTATIC_KEYWORD, None)
 
-    return None, None
+    return PatientStage(None, None, None)
 
 
 def is_stage_mismatch(patient_stage: Optional[int], trial: Dict) -> bool:

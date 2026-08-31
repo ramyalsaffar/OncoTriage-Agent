@@ -78,6 +78,7 @@ from oncotriage.constants import LOINC_AJCC_CLINICAL_M
 from oncotriage.extraction import stage as _stage_module
 from oncotriage.extraction.stage import (
     M_CATEGORY_UNREADABLE,
+    _m_category_stage_with_date,
     _stage_from_m_category,
     extract_patient_stage,
     is_stage_mismatch,
@@ -370,6 +371,72 @@ check("...and in the other order",
 check("two cM0s and nothing else is still None",
       _stage_from_m_category([met_obs(_CM0_DISPLAY), met_obs(_CM0_DISPLAY)]),
       None)
+
+
+# ===========================================================================
+# TEST 1b — THE ANSWERING OBSERVATION'S DATE
+# ===========================================================================
+
+print("\n" + "=" * 70)
+print("TEST 1b: the date reported is the date of the cM1 that answered")
+print("=" * 70)
+
+# WHY THIS TIER HAS TO REPORT A DATE AT ALL. The Stage 5 prompt states WHEN the
+# staging was recorded beside the stage, so a restaging criterion is answerable
+# and a decades-old staging is visible as one. The renderer prints what this
+# function hands it, so "which observation's date" is decided here.
+check("a positive cM1 reports its own date beside the ordinal",
+      _m_category_stage_with_date([met_obs(_CM1_DISPLAY, date="2020-02-02")]),
+      (4, "2020-02-02"))
+check("no cM1 reports no date either -- never a sibling observation's",
+      _m_category_stage_with_date([met_obs(_CM0_DISPLAY, date="2024-01-01")]),
+      (None, None))
+check("an empty list likewise", _m_category_stage_with_date([]), (None, None))
+check("an observation with no date at all reports None rather than inventing "
+      "one -- an undated record is an ordinary record",
+      _m_category_stage_with_date([{"code": LOINC_AJCC_CLINICAL_M,
+                                    "value": _CM1_DISPLAY}]),
+      (4, None))
+
+# THE ANSWERING ONE, NOT THE FIRST ONE AND NOT THE NEWEST ONE. Ignored codes and
+# unreadable values sit above the cM1 here, so a date taken off list position 0
+# would be a date belonging to a record that produced nothing.
+_MIXED = [met_obs("cM1", code="44667-4", category="M"),   # wrong LOINC
+          met_obs("no category recorded", date="2026-01-01"),
+          met_obs(_CM1_DISPLAY, date="2011-11-11")]
+M_CATEGORY_UNREADABLE.clear()
+check("the date comes off the observation that answered, not the first in the "
+      "list", _m_category_stage_with_date(_MIXED), (4, "2011-11-11"))
+check("...and the two candidate dates really do differ, or the check above "
+      "proves nothing",
+      _MIXED[1]["date"] != _MIXED[2]["date"], True)
+M_CATEGORY_UNREADABLE.clear()
+
+# A STATED LIMIT RATHER THAN A CLAIM. This tier does not sort -- "any cM1
+# anywhere answers", argued at the function -- so a record carrying two cM1s
+# reports the date of whichever the parser listed first, which need not be the
+# most recent. What must never happen is a date belonging to an observation
+# that produced NO ordinal, which is what the checks above pin.
+check("with two cM1s, the FIRST in list order answers and its date is reported",
+      _m_category_stage_with_date([met_obs(_CM1_DISPLAY, date="2020-01-01"),
+                                   met_obs(_CM1_DISPLAY, date="2024-01-01")]),
+      (4, "2020-01-01"))
+
+# ONE IMPLEMENTATION, TWO READINGS. The ordinal-only delegate must be exactly
+# the first member of the richer form for every input above, or the two have
+# come apart and the summary can state a stage the filter did not act on.
+for _label, _obs in (
+        ("positive", [met_obs(_CM1_DISPLAY, date="2020-02-02")]),
+        ("negative", [met_obs(_CM0_DISPLAY)]),
+        ("empty", []),
+        ("none", None),
+        ("mixed", _MIXED)):
+    M_CATEGORY_UNREADABLE.clear()
+    _rich = _m_category_stage_with_date(_obs)
+    M_CATEGORY_UNREADABLE.clear()
+    check(f"[{_label}] the delegate is the richer form's ordinal",
+          _stage_from_m_category(_obs), _rich[0])
+M_CATEGORY_UNREADABLE.clear()
 
 
 # ===========================================================================
@@ -688,16 +755,21 @@ print("=" * 70)
 print("Each plant goes into an in-memory COPY of the module; the file on disk")
 print("is hashed before and after and asserted byte-identical.")
 
-# The needle is the SHIPPED text of the tier, and it moved when the extractor
-# started reporting which tier answered: the return carries STAGE_SOURCE_M_
-# CATEGORY beside the ordinal now. Updated rather than loosened -- an exact
-# needle is what makes `_plant` able to say "plant target absent" instead of
-# silently planting nothing, and both controls below reported exactly that when
-# this line went stale.
+# The needle is the SHIPPED text of the tier, and it has moved TWICE. First
+# when the extractor started reporting which tier answered (the return carries
+# STAGE_SOURCE_M_CATEGORY beside the ordinal), and again when it started
+# reporting the DATE of the observation that answered -- so the call is to
+# `_m_category_stage_with_date`, which is now the one implementation of this
+# rule, and the return is a PatientStage. Updated rather than loosened, both
+# times: an exact needle is what makes `_plant` able to say "plant target
+# absent" instead of silently planting nothing, and both controls below
+# reported exactly that on each occasion this line went stale.
 _TIER_CALL = (
-    "    m_category_stage = _stage_from_m_category(cancer_metastasis_observations)\n"
+    "    m_category_stage, m_category_date = _m_category_stage_with_date(\n"
+    "        cancer_metastasis_observations)\n"
     "    if m_category_stage is not None:\n"
-    "        return m_category_stage, STAGE_SOURCE_M_CATEGORY\n")
+    "        return PatientStage(m_category_stage, STAGE_SOURCE_M_CATEGORY,\n"
+    "                            m_category_date)\n")
 
 _MATCH_LINE = '        if match.group("category") == "1":'
 
@@ -740,6 +812,42 @@ _control("CONTROL: keying on category 'M' instead of the LOINC admits 44667-4",
          [(_CODE_GUARD, '        if obs.get("metastasis_category") != "M":')],
          lambda m: m._stage_from_m_category(
              [met_obs("cM1", code="44667-4", category="M")]), 4)
+
+# 4b. THE DATE TAKEN OFF THE WRONG OBSERVATION. The plausible wrong version of
+#     the return this tier gained: the list's first entry rather than the one
+#     that answered. On _MIXED that is an ignored 44667-4 record with no date;
+#     on a record where it DOES have one, it is a date no tier measured.
+_DATE_RETURN = "            return _STAGE_MAX_ORDINAL, obs.get(\"date\")"
+_control("CONTROL: taking the date off the first observation instead of the "
+         "answering one reports a date no tier measured",
+         _STAGE_SRC,
+         [(_DATE_RETURN,
+           "            return _STAGE_MAX_ORDINAL, "
+           "(cancer_metastasis_observations or [{}])[0].get(\"date\")")],
+         lambda m: m._m_category_stage_with_date(
+             [met_obs("no category recorded", date="2026-01-01"),
+              met_obs(_CM1_DISPLAY, date="2011-11-11")])[1],
+         "2026-01-01")
+_control("CONTROL: ...and the SHIPPED module reports the answering one, so "
+         "that plant is what moves it",
+         _STAGE_SRC, [],
+         lambda m: m._m_category_stage_with_date(
+             [met_obs("no category recorded", date="2026-01-01"),
+              met_obs(_CM1_DISPLAY, date="2011-11-11")])[1],
+         "2011-11-11")
+
+# 4c. THE DELEGATE RE-IMPLEMENTED rather than delegating -- two walks of the
+#     list, which is the disagreement the split exists to prevent. Planted as a
+#     body that ignores the date-bearing form entirely and answers on the wrong
+#     category, so the two readings of one rule come apart.
+_control("CONTROL: a delegate with its own body can disagree with the form it "
+         "is supposed to be a reading of",
+         _STAGE_SRC,
+         [("    return _m_category_stage_with_date(cancer_metastasis_observations)[0]",
+           "    return None")],
+         lambda m: (m._stage_from_m_category([met_obs(_CM1_DISPLAY)]),
+                    m._m_category_stage_with_date([met_obs(_CM1_DISPLAY)])[0]),
+         (None, 4))
 
 # 5. The unreadable counter removed -- a silent skip.
 _COUNT_LINE = "            M_CATEGORY_UNREADABLE[_m_key_text(text)] += 1"

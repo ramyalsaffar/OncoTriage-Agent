@@ -692,7 +692,7 @@ python tests/test_agent_age_units_and_sex_filter.py                 # 112
 # The AJCC M-category pass. Same shape, same directory. No network, no keys, no
 # spend, no git history, no corpus -- every fixture in it is a literal dict --
 # and NOT in the collision matrix. ~2 s.
-python tests/test_extraction_stage_m_category.py                    # 119
+python tests/test_extraction_stage_m_category.py                    # 134 (was 119; the staging-date pass added Test 1b -- the date of the cM1 that ANSWERED, never a sibling's -- and three controls)
 
 # The CKD / non-oncology guard pass. Same shape, same conditions, same
 # directory, also not in the collision matrix. ~2 s.
@@ -11238,6 +11238,183 @@ DECLARED — the serial run caught it, which is that pin working);
 production `inferences.db` sha256 **unchanged** — `ab1403e3…`. **No money was
 spent, no schema changed and no migration was run.** Re-running the audit that
 found the nine now reports **zero**.
+
+### The Cancer Stage line states when the patient was staged (the staging-date pass)
+
+**ONE MEASURED CHANGE.** The parser has carried the staging Observation's date
+since mCODE support existed and the Stage 5 record has never printed it, so a
+restaging criterion -- "restaged within the last 6 months", "documented
+progression since last staging" -- was unanswerable from a record the pipeline
+had already read, and a decades-old staging read exactly like a current one.
+The line now carries that date and the elapsed interval every other dated
+section carries. **NO BILLED CALL, no schema change, no migration, no
+recapture**; the production `inferences.db` was never opened.
+
+**MEASURED OVER ALL 1,000 CORPUS BUNDLES, BEFORE AND AFTER, THROUGH A `git
+worktree` AT HEAD rather than through a re-derivation:**
+
+| | |
+|---|---|
+| summaries changed | **295**, every one of them a `stage_group_observation` patient |
+| summaries byte-identical | **705** = 688 with no stage + 16 `condition_display` + 1 `metastatic_keyword` |
+| changed summaries whose STAGE LINE did not change | **0** |
+| stage lines changed whose SUMMARY did not change | **0** |
+| ordinals moved / sources moved | **0 / 0** -- so **Stage 4's filter is untouched**, which is the strongest form of that claim: the ordinal is the only thing it reads |
+| `patient_data_hash` moved | **0** |
+| pseudonyms moved | **0** |
+| `TEMPORAL_RENDER_COUNTS` delta | **none** -- all 295 dates resolved and none postdates the snapshot |
+
+**THE HASH CLAIM WAS VERIFIED FROM SOURCE BEFORE IT WAS RELIED ON, and it holds
+for BOTH dated tiers.** `compute_patient_hash`'s `stage_obs` entry emits
+`stage_display|date|loinc` and its `met` entry emits
+`display|value|unit|date|metastasis_category`, so the date this line renders was
+already hashed. The pseudonym is a function of that hash, so it cannot move
+either. Both are measured at 0/1000 rather than argued.
+
+**THE DATE BELONGS TO THE OBSERVATION THAT PRODUCED THE ORDINAL, AND THAT IS THE
+WHOLE DESIGN.** `extract_patient_stage_with_source` returns a `PatientStage`
+NamedTuple -- `ordinal`, `source`, `observation_date` -- and each tier attaches
+the date of the record IT read, at the line it answers on. There is no place in
+the function where a date can be attached to an ordinal a different record
+produced. The plausible wrong version, "the most recent staging observation's
+date", is wrong for two reachable records at once: a patient whose newest
+stage-group observation has a display the regex cannot read and whose stage
+came from an older one, and a patient whose stage came from the M tier while an
+unparseable stage-group observation sits above it. **Both are planted in
+`tests/test_agent_summary_cancer_stage.py` section 8 and both are caught, each
+beside a CLEAN control driving the unmutated module through the identical
+harness.**
+
+**A NAMED TUPLE RATHER THAN A BARE 3-TUPLE**, because the second and third
+members are both `Optional[str]`: a caller unpacking them the wrong way round
+gets two plausible strings and a summary that states a date as a provenance.
+It is still a tuple, so `== (None, None, None)` works.
+
+**THE BRANCH IS ON THE TIER, NOT ON THE DATE.** `STAGE_SOURCES_OBSERVATION_
+BACKED` is a closed, argued, non-empty PROPER subset of `STAGE_SOURCES` --
+guarded at import, because a set grown to cover every tier makes the branch
+unconditional and an emptied one deletes the clause from every line. The two
+tests differ in the case that matters: an observation-backed stage whose
+Observation carries no date is a stage whose date is MISSING, and a stage read
+out of diagnosis text has no staging date to be missing. Branching on the date
+collapses them, which is the fallback accident rather than a decision;
+`_stage_date_clause` states the first as `staging date not recorded`. Planted
+and caught.
+
+**A CONDITION'S `onset_date` IS NOT A STAGING DATE**, and the two
+diagnosis-text tiers return None deliberately rather than reaching for it: it
+is when the DIAGNOSIS began, so a tier that fell back to it would answer
+"staged within the last six months" with the date the cancer started. Both
+fixtures in the test carry an onset and neither line mentions it. A control
+plants the leak into the extractor and catches it there -- **and asserts that
+the RENDER is still clean under it**, which is the defence in depth the
+source-based branch buys, measured rather than assumed.
+
+**FOUR RENDERED STATES, ALL DRIVEN:**
+
+    Cancer Stage: Stage III (from a recorded stage group observation; staged 2024-01-01, 2 years before reference date)
+    Cancer Stage: Stage III (from a recorded stage group observation; staged 2030-01-01)          <- present, cannot anchor an interval; COUNTED
+    Cancer Stage: Stage III (from a recorded stage group observation; staging date not recorded)  <- observation-backed, undated
+    Cancer Stage: Stage II (from diagnosis text)                                                  <- byte-identical to before this pass
+
+**`TEMPORAL_KEY_STAGE_DATE` IS THIS LINE'S OWN KEY**, on the one-prefix-per-
+rendered-field rule: an unreadable staging date and an unreadable ECOG date are
+different data problems with different owners. An ORDINARY date moves no
+counter, which is asserted -- a usable date is not a degradation.
+
+**THE INTERVAL IS CAPPED AT THE RECORD'S OWN PRECISION, AND THE CORPUS CANNOT
+EXERCISE THAT.** All 295 stage-group dates are day-precise, so the year- and
+month-precision arms are driven with CONSTRUCTED records and that is stated
+rather than hidden. The corpus DOES exercise the fine end: **6 patients were
+staged within 365 days** and render exact day counts (38, 98, 223, 230, 243 and
+344 days), which is the grade a restaging window is written in.
+
+**AND THE STALENESS THE RULING PREDICTED IS LARGER THAN IT SAID.** Across the
+295: **median 6,872 days -- 18.8 years -- minimum 38 days, maximum 97 years**;
+15 within two years, 40 within five. The line the model used to be handed said
+"Stage I (from a recorded stage group observation)" for a staging recorded in
+1928.
+
+**THE M TIER IS THE ANSWERING TIER FOR ZERO CORPUS PATIENTS**, consistent with
+the record already in this file: all five cM1 patients also carry an agreeing
+stage GROUP, so the tier above answers first. Its date path is therefore covered
+by literals only, in `tests/test_extraction_stage_m_category.py` Test 1b and
+`tests/test_agent_summary_cancer_stage.py` section 7.
+
+**`_m_category_stage_with_date` IS THE ONE IMPLEMENTATION OF THE M RULE and
+`_stage_from_m_category` IS A THIN DELEGATE OVER IT** -- the same shape
+`extract_patient_stage` already has over `extract_patient_stage_with_source`,
+and for the same reason: two walks of that list is a disagreement nothing would
+notice. The delegate is kept because forty checks in
+`tests/test_extraction_stage_m_category.py` compare it against 4 or None, and
+reading an ordinal out of a tuple in every one of them would obscure the mapping
+that file exists to pin. **It has no production caller, which is stated rather
+than hidden**, and a control plants a delegate with its own body and shows the
+two readings coming apart.
+
+**`FINGERPRINT_VERSION` IS UNCHANGED AT 3 AND `PROMPT_VERSION` AT 1.9.0.** The
+stamp's SHAPE did not move, so no v3 artifact refuses for a shape reason;
+`llm_classifier_renderer_digest` DID move -- `43f24b3b…` -> `1b1ca3a4…`, with
+`renderer_module_digests()` showing exactly `agent/patient.py` and
+`extraction/stage.py` changed and the other four byte-identical -- so a resume
+across this pass answers **FP_CHANGED naming that field**, which is correct: the
+renderer genuinely changed. `PROMPT_VERSION` identifies the TEMPLATE, and the
+template did not move; the renderer digest is the mechanical half that covers
+exactly this, which is the de-identification pass's ruling applied again.
+
+**THIS IS AN INPUT CHANGE AND NOTHING WAS RECAPTURED. ELEVEN OF THE TWELVE
+FIXTURES ARE AFFECTED** -- every one whose patient's stage comes from a
+stage-group observation, measured by resolving each fixture's stored
+`patient_id` against the corpus: `ablation_bm25_only`,
+`ablation_no_cross_encoder`, `ablation_vector_only`,
+`llm_classifier_parse_retry_constructed`, `mcode_genomic_variant`,
+`mesh_fallback_siteless_code`, `no_candidates_pediatric_age`, `normal_1`,
+`normal_2`, `normal_3`, `truncation_split`. **`unknown_stage` is unaffected**:
+it has no stage, so it renders the absence line unchanged. They were already
+stale before this pass -- the de-identification pass took the replay to 1/12 and
+the pre-diagnosis ECOG pass to 0/12 -- so what this adds is one more field
+family to the standing recapture, not a new one.
+
+**TEST COUNTS.** `tests/test_agent_summary_cancer_stage.py` **56 -> 113**
+(section 7, the date; six new controls, all firing, plus their clean arms),
+`tests/test_extraction_stage_m_category.py` **119 -> 134** (Test 1b and three
+controls), `tests/test_agent_summary_temporal_tagging.py` **216 -> 224**. Every
+other file reports exactly what it reported before.
+
+**AND TWO PRE-EXISTING TESTS SAID SOMETHING THAT STOPPED BEING TRUE.**
+`tests/test_extraction_stage_m_category.py`'s tier plant anchor went stale and
+REPORTED `plant target absent` rather than silently planting nothing, which is
+that file's own mechanism working for the second time. And
+`tests/test_agent_summary_temporal_tagging.py` listed "cancer stage" among "the
+dateless sections" and swept for dated lines with a `startswith("- ")` filter --
+correct while every dated line was a bullet, and blind to a NAMED line the
+moment one gained a date. **A structural check whose corpus silently covers less
+does not fail; it reports fewer findings, which reads exactly like a clean
+render.** The filter is gone, the count is pinned in both directions, the stage
+member moved out of that group with the reason written down, and a staged
+variant of that file's mixed patient now pins the whole line and is required to
+DIFFER with the temporal doors shut.
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **The stage-group tier sorts LEXICALLY on a raw ISO datetime string**
+   (`o.get('date') or '0000-00-00'`), and every corpus date carries a UTC
+   offset. Two observations recorded at the same instant in different offsets
+   sort by their local text rather than by their instant. Pre-existing and
+   unchanged here -- it decides which observation answers, which this pass did
+   not touch -- but it is now VISIBLE, because the date it picked is printed.
+2. **An undated stage-group observation sorts as the OLDEST** under that same
+   key, so it can only answer when nothing else parses. That is a choice
+   nothing states; it is stated here.
+3. **`staging date not recorded` fires ZERO times on this corpus.** Every one of
+   the 295 observation-backed patients carries a date, so that branch is covered
+   by constructed records only.
+4. **The precision cap likewise** -- the corpus is 100% day-precise.
+5. **`_stage_from_m_category` has no production caller.** It is one reading of a
+   rule with one implementation, kept for the test surface; deleting it is a
+   decision about that file's forty checks.
+6. **The M tier's date is the FIRST cM1 in list order**, not the most recent,
+   because the tier does not sort. Stated at the function and pinned by a check.
 
 Data and keys live outside this folder. Never write an
 absolute path. The one exception already exists and is

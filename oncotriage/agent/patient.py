@@ -46,6 +46,7 @@ from oncotriage.extraction.stage import (
     STAGE_SOURCE_METASTATIC_KEYWORD,
     STAGE_SOURCE_STAGE_GROUP,
     STAGE_SOURCES,
+    STAGE_SOURCES_OBSERVATION_BACKED,
     extract_patient_stage_with_source,
 )
 from oncotriage.utils import (
@@ -1073,6 +1074,28 @@ BEFORE_REFERENCE_PHRASE = "before reference date"
 # read as time since resolution.
 ONSET_CLAUSE_PREFIX = "onset"
 
+# What the Cancer Stage line's date is anchored TO, for the same reason. That
+# line already carries a parenthetical -- the tier that produced the ordinal --
+# so a bare date appended to it would be a second fact in one bracket with
+# nothing saying which of the two it belongs to. "staged 2019-05-26" says the
+# date is when the staging was recorded, which is the fact a restaging-recency
+# criterion ("staged within the last 6 months") is asking for.
+STAGE_DATE_CLAUSE_PREFIX = "staged"
+
+# What that clause says when an observation-backed tier answered and the
+# Observation it read carries no date at all.
+#
+# IT IS A STATEMENT, NOT AN OMISSION, and that is the distinction the whole
+# section is built on. Rendering nothing here would make an observation-backed
+# stage whose date is missing look exactly like a stage read out of diagnosis
+# text, which has no staging date to be missing -- and a model asked "was this
+# patient staged in the last six months" can answer not_evaluable from a stated
+# absence and can only guess from silence. It reuses the surrounding section's
+# own wording ("not recorded in this record") rather than the dated sections'
+# "date unknown", because it is a clause inside a sentence rather than a field
+# standing where a date would be.
+STAGE_DATE_UNKNOWN_CLAUSE = "staging date not recorded"
+
 # The three sub-unit floors. Each says "shorter than the unit I am allowed to
 # speak in" and none of them is a zero: "0 years" reads as "at the same time",
 # which is not what a completed count of zero means.
@@ -1112,6 +1135,7 @@ TEMPORAL_KEY_PROCEDURE_DATE = "procedure_date"
 TEMPORAL_KEY_MEDICATION_START = "medication_start"
 TEMPORAL_KEY_MEDICATION_END = "medication_end"
 TEMPORAL_KEY_ECOG_DATE = "ecog_date"
+TEMPORAL_KEY_STAGE_DATE = "stage_date"
 TEMPORAL_KEY_METASTASIS_DATE = "metastasis_date"
 TEMPORAL_KEY_BIOMARKER_DATE = "biomarker_date"
 TEMPORAL_KEY_VARIANT_DATE = "variant_date"
@@ -1310,6 +1334,40 @@ def _onset_clause(onset_raw, reference) -> str:
     """
     clause = _event_clause(onset_raw, reference, TEMPORAL_KEY_CONDITION_ONSET)
     return f"{ONSET_CLAUSE_PREFIX} {clause}" if clause else ""
+
+
+def _stage_date_clause(date_raw, reference) -> str:
+    """"staged 2019-05-26, 7 years before reference date" -- the staging date
+    clause for an OBSERVATION-BACKED tier, in every state that date can be in.
+
+    Called only when the answering tier is in STAGE_SOURCES_OBSERVATION_BACKED;
+    a tier that read a diagnosis name has no staging date and its line is
+    rendered without this clause at all. That branch is the CALLER's, on the
+    source, and deliberately not this function's on the date -- see the block
+    at STAGE_SOURCES_OBSERVATION_BACKED for why the two are not the same test.
+
+    Three states, and each is a different fact:
+
+        staged 2019-05-26, 7 years before reference date
+            the ordinary case: the record's own date, with the interval the
+            other dated sections state, through the same _dated_suffix.
+        staged 2019-05-26
+            a date that is present and cannot anchor an interval -- unreadable,
+            or later than the run's reference date, both of which
+            _resolve_temporal_date counts under TEMPORAL_KEY_STAGE_DATE. The
+            raw date is still stated, exactly as every other dated section
+            states it when its suffix comes back empty.
+        staging date not recorded
+            the Observation carries no date. Not a degradation and not counted:
+            an undated record is an ordinary record.
+
+    THE DATE IS PRINTED AS THE RECORD CARRIES IT, sliced to ten characters like
+    every other date on this summary, and never reformatted or re-derived.
+    """
+    if not date_raw or date_raw == "unknown":
+        return STAGE_DATE_UNKNOWN_CLAUSE
+    return (f"{STAGE_DATE_CLAUSE_PREFIX} {date_raw[:10]}"
+            + _dated_suffix(date_raw, reference, TEMPORAL_KEY_STAGE_DATE))
 
 
 def _not_active_marker(onset_raw, reference) -> str:
@@ -1723,7 +1781,9 @@ def render_patient_record(record: DeidentifiedRecord) -> str:
       Performance Status: ECOG (LOINC 89247-1), or an explicit statement that
                           none is recorded. Never defaults to 0.
       Cancer Stage      : the ordinal Stage 4's filter acted on, rendered as
-                          the AJCC numeral with the tier that produced it, or
+                          the AJCC numeral with the tier that produced it and,
+                          for the two tiers backed by an Observation, that
+                          Observation's own date and its elapsed interval; or
                           an explicit statement that none is recorded. Never
                           treats stage 0 as absent.
       Conditions        : relevance-filtered into three tiers:
@@ -1765,13 +1825,18 @@ def render_patient_record(record: DeidentifiedRecord) -> str:
                           survives as a census key).
       Metastasis, Biomarkers, mCODE variants
                           each observation's date.
+      Cancer Stage        the date of the staging Observation that produced the
+                          rendered ordinal, for the two tiers that read one.
+                          The two condition-display tiers read a diagnosis NAME
+                          and render no date -- a Condition's onset_date is
+                          when the DIAGNOSIS began, which is not when anybody
+                          staged the patient.
 
     Sections that render NO date gain nothing, because there is nothing to
     anchor an interval to: Demographics (whose age is already an interval),
-    Cancer Stage (the tier is rendered, the observation date is not), Allergies
-    (the parser carries onset_date and this renderer has never printed it), and
-    the Tier C condition / background medication summary lines, which are names
-    only.
+    Allergies (the parser carries onset_date and this renderer has never
+    printed it), and the Tier C condition / background medication summary
+    lines, which are names only.
 
     See the block comment at _NOT_ACTIVE_CLINICAL_STATUSES for what is
     deliberately left untouched and why, and _elapsed_phrase for why the
@@ -1927,14 +1992,35 @@ def render_patient_record(record: DeidentifiedRecord) -> str:
     # to not_evaluable from a stated absence, whereas silence leaves it to
     # infer a stage from the diagnosis text — which is the weakest of the four
     # tiers, applied without any of the guards the extractor applies.
-    stage_ordinal, stage_source = extract_patient_stage_with_source(
+    #
+    # WHEN, FOR THE TIERS THAT HAVE A WHEN. The parser has always carried the
+    # staging Observation's date and this line has never stated it, so a
+    # restaging criterion -- "restaged within the last 6 months", "documented
+    # progression since last staging" -- was unanswerable from a record the
+    # pipeline had already read, and a years-old staging read as a current one.
+    # The date comes back from the SAME call the ordinal does, attached by the
+    # tier that answered, so the line cannot state a date belonging to an
+    # Observation that produced no ordinal.
+    #
+    # THE BRANCH IS ON THE TIER, NOT ON THE DATE, and that is the deliberate
+    # half. Two tiers read a diagnosis NAME and have no staging date at all;
+    # their line is byte-identical to what it was before this clause existed,
+    # because there is nothing true to add to it. See
+    # STAGE_SOURCES_OBSERVATION_BACKED for why "the date is None" is the wrong
+    # test -- an observation-backed stage whose Observation carries no date is
+    # a different fact, and _stage_date_clause states it.
+    stage = extract_patient_stage_with_source(
         conditions,
         cancer_stage_observations=record.fields.get('cancer_stage_observations') or [],
         cancer_metastasis_observations=record.fields.get('cancer_metastasis_observations') or [],
     )
-    if stage_ordinal is not None:
-        summary += (f"\n\nCancer Stage: {STAGE_NUMERALS[stage_ordinal]} "
-                    f"({_STAGE_SOURCE_PHRASES[stage_source]})\n")
+    if stage.ordinal is not None:
+        stage_detail = [_STAGE_SOURCE_PHRASES[stage.source]]
+        if stage.source in STAGE_SOURCES_OBSERVATION_BACKED:
+            stage_detail.append(
+                _stage_date_clause(stage.observation_date, reference_date))
+        summary += (f"\n\nCancer Stage: {STAGE_NUMERALS[stage.ordinal]} "
+                    f"({'; '.join(stage_detail)})\n")
     else:
         summary += "\n\nCancer Stage: not recorded in this record\n"
 
