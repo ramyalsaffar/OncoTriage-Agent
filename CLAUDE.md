@@ -852,7 +852,7 @@ python tests/test_runner_stop_switch.py                             # 140 (was 1
 # inside a tempfile.mkdtemp it removes and asserts gone, and the two repository
 # files it reads (batch/runner.py, "25- Batch Runner.py") are sha256-compared at
 # the end. It EXECS NOTHING. Bucket A, ~18 s alone / ~30 s under bucket-A load.
-python tests/test_runner_preflight_and_state_faults.py              # 116 (unchanged across the consolidation pass, which repointed five structural checks at oncotriage/control.py -- their subject moved and a walk over the runner would have found nothing and passed. Was 76; the lock-hardening pass added section 8 -- the symlink substitution, the unopenable lock, the UTC record and the stripped truncation guard -- and the symlinked two-process drive in section 5)
+python tests/test_runner_preflight_and_state_faults.py              # 120 (was 116; the CI-green pass rewrote 1e-e's non-degeneracy probe, which asserted realpath != abspath and so was a statement about macOS's /var -> /private/var rather than about the code -- it FAILED on every hosted Linux runner while its subject matched. It CONSTRUCTS the symlink now, on tests/test_serial_runner_lock.py section 2's pattern. Before that 116, unchanged across the consolidation pass, which repointed five structural checks at oncotriage/control.py -- their subject moved and a walk over the runner would have found nothing and passed. Was 76; the lock-hardening pass added section 8 -- the symlink substitution, the unopenable lock, the UTC record and the stripped truncation guard -- and the symlinked two-process drive in section 5)
 
 # The CI-hygiene pair. Same shape, same directory. Neither imports anything
 # from the package -- their subjects are `.github/scripts/` and
@@ -1063,7 +1063,13 @@ python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic \
 # and printed when the binary is absent -- which is the state of the `tests` job
 # on a hosted runner. NOT in the collision matrix. It EXECS NOTHING. Bucket A,
 # ~22 s with gitleaks / ~16 s without.
-python tests/test_secret_scan_gate.py                               #  87 with gitleaks; 81 passed / 0 failed / 3 SKIPPED without it
+python tests/test_secret_scan_gate.py                               #  92 with gitleaks; 86 passed / 0 failed / 3 SKIPPED without it
+#   (was 87/81; the CI-green pass added 2a-0 and 2c-b..2c-e over the oid
+#   validation parse_fingerprint gained. Check 4f used to fail on a hosted
+#   x86_64 runner ONLY: it harvests --emit-accepted through that parser from
+#   stdout AND stderr, and onnxruntime writes a colon-rich device-discovery
+#   warning to stderr on that hardware, which a colon count alone read as a
+#   fingerprint. The new checks fail on revert with no environment needed.)
 
 pip install -e .                                         # makes `oncotriage` importable anywhere
 ```
