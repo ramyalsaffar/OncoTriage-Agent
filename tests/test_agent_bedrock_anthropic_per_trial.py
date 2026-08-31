@@ -555,8 +555,25 @@ class _OpenAIRecorder:
 _rec = _OpenAIRecorder()
 _saved = deps.set_overrides({deps.OPENAI_CLIENT: _rec})
 try:
+    # THE LABEL IS SHORT ON PURPOSE AND IT IS NOT A CREDENTIAL. This kwarg is
+    # the prompt-cache ROUTING HINT: it asks the provider to send requests
+    # sharing a prefix to one machine, and production derives its value from
+    # the system prompt's digest behind a project prefix. Nothing authenticates
+    # with it, and no check below reads the value -- only that the kwarg was
+    # forwarded at all, which is what the kwargs comparison asserts.
+    #
+    # MEASURED, NOT PREFERRED. Written inline as a longer descriptive string it
+    # trips gitleaks' generic-api-key rule, which fires on a value of ten or
+    # more characters with enough entropy when a credential word precedes the
+    # assignment. That is a false positive on a routing label, and it FAILED
+    # THE SECRET GATE: that gate reads every blob in the object database and
+    # has no way to know a fabricated value is fabricated. A value under ten
+    # characters cannot reach the rule's length floor at all, which is a
+    # sturdier answer than sitting a fraction under an entropy threshold. The
+    # sibling per-trial suite already passes a short label here for the reason
+    # this comment now records.
     drive(_evaluation.call_matching_model_warmup, "SYSTEM",
-          prompt_cache_key="oncotriage-stage5-abc")
+          prompt_cache_key="probe")
 finally:
     deps.restore_overrides(_saved)
 

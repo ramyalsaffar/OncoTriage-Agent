@@ -97,7 +97,7 @@ GHSA-6v7p-g79w-8964    # HIGH  msgpack 1.1.2 vendored in pip      fixed 1.2.1
 #
 # A FIFTH CLASS, and the only TEMPORARY one in this file. Every entry above is
 # blocked by a constraint that needs a DECISION to lift — a pin cap, a model
-# risk, an upstream re-vendoring. These four are blocked only by the calendar,
+# risk, an upstream re-vendoring. These five are blocked only by the calendar,
 # and they are not a surprise: they are the alarm the Dockerfile's two FROM
 # lines are designed to raise. The gate is `--ignore-unfixed`, so it fires
 # precisely when Debian ships a fix, and a pinned digest cannot receive one.
@@ -123,12 +123,38 @@ GHSA-6v7p-g79w-8964    # HIGH  msgpack 1.1.2 vendored in pip      fixed 1.2.1
 # takes whatever Debian published this morning makes two builds of one commit
 # differ, which is the property the digest pin exists to provide.
 #
-# REMOVAL CONDITION, mechanical rather than a judgement call. When Docker Hub
-# publishes a python:3.11-slim whose util-linux is >= 2.41.5-0+deb13u1:
+# REMOVAL CONDITION FOR (a), mechanical rather than a judgement call. When
+# Docker Hub publishes a python:3.11-slim whose util-linux is
+# >= 2.41.5-0+deb13u1:
 #     1. re-pin BOTH FROM lines to that digest, in one commit;
 #     2. run `docker run --rm <image> python --version` and confirm 3.11.x,
 #        which the Dockerfile demands after ANY digest change;
-#     3. DELETE ALL FOUR LINES BELOW, and this block with them.
+#     3. DELETE ALL FOUR util-linux LINES BELOW. NOT this whole block: (b)
+#        below is a separate package with a separate condition, and taking it
+#        out with them would drop a live acceptance.
+#
+# *** THAT CONDITION IS NOW MET, AND IT WAS MEASURED RATHER THAN ASSUMED. ***
+# MEASURED 2026-08-31 on linux/amd64 -- the arch CI scans -- by exporting the
+# image and reading /var/lib/dpkg/status, the same method the paragraph above
+# used:
+#
+#     python:3.11-slim  ->  sha256:1042b61448fef4ba92d16a8c7eb4996d027568ce64792a7877fd88511e0af7c6
+#         util-linux 2.41.5-0+deb13u1   <- FIXED, the DSA-6442-1 upload
+#         openssl    3.5.6-1~deb13u2    <- still short of (b)'s fix
+#
+# THE FOUR LINES ARE NOT STALE AND THE GATE IS NOT LYING: the digest this image
+# is PINNED to still carries 2.41-5, so all four ids are still present in the
+# report and the staleness check still matches them. What has changed is that
+# there is now somewhere to take the fix FROM, which is the one thing this
+# block said was missing.
+#
+# THE RE-PIN IS NOT DONE HERE, and the reason is stated rather than left to be
+# inferred. It does not clear (b) -- the newest published base carries the same
+# openssl -- so it removes no entry this pass had to add, and it CHANGES WHAT
+# SHIPS: a digest move needs a rebuild and a full re-scan on linux/amd64 to
+# show it introduces no new fixable HIGH, and the machine this was measured on
+# builds arm64. A digest bump verified on one arch and pushed for another is
+# the guess this project's Dockerfile header already records paying for once.
 # They are accepted findings with an expiry, not suppressions. Nothing else in
 # this file has a removal condition that can be checked by a script; this one
 # can, and leaving it here after the digest moves is the failure mode.
@@ -150,7 +176,37 @@ GHSA-6v7p-g79w-8964    # HIGH  msgpack 1.1.2 vendored in pip      fixed 1.2.1
 # login, mount, util-linux — which is 36 gate rows from four ids. They are
 # listed by id and not by package, per this file's rule: a NEW util-linux CVE
 # must still fail the gate.
+# (a) util-linux -- fix published, pinned base predates it
 CVE-2026-53612   # HIGH   fixed 2.41.5-0+deb13u1   accepted 2026-08-20
 CVE-2026-53613   # HIGH   fixed 2.41.5-0+deb13u1   accepted 2026-08-20
 CVE-2026-53614   # HIGH   fixed 2.41.5-0+deb13u1   accepted 2026-08-20
 CVE-2026-53615   # HIGH   fixed 2.41.5-0+deb13u1   accepted 2026-08-20
+
+# (b) openssl -- NO published base image carries the fix, measured
+#
+# Three binary packages from the openssl source -- libssl3t64, openssl,
+# openssl-provider-legacy -- so one id is three gate rows. Listed by id and not
+# by package, per this file's rule: a NEW openssl CVE must still fail the gate.
+#
+# THE CONSTRAINT, MEASURED 2026-08-31 on linux/amd64 by reading
+# /var/lib/dpkg/status out of each image:
+#
+#     Debian fixed openssl in 3.5.7-1~deb13u2.
+#
+#     pinned base      python:3.11-slim@sha256:94c50be2...  ->  3.5.6-1~deb13u2
+#     NEWEST PUBLISHED                   @sha256:1042b614...  ->  3.5.6-1~deb13u2
+#
+# So unlike (a) there is nowhere to take this fix from at all: re-pinning to the
+# newest published digest leaves this id exactly where it is. `apt-get upgrade`
+# is the only other way in and it stays reverted, for the reason argued at
+# STAGE 2 of the Dockerfile -- it destroys the reproducibility the digest pin
+# exists to provide.
+#
+# WHY THIS APPEARED NOW AND NOT AT THE LAST CURATION: the gate is
+# `--ignore-unfixed`, so a CVE becomes gate-visible on the day Debian ships its
+# fix, not on the day it is published. Nothing in this repository changed.
+#
+# REMOVAL CONDITION FOR (b): when Docker Hub publishes a python:3.11-slim whose
+# openssl is >= 3.5.7-1~deb13u2, re-pin both FROM lines, confirm 3.11.x, and
+# delete this line and this sub-block.
+CVE-2026-14456   # HIGH   fixed 3.5.7-1~deb13u2   accepted 2026-08-31

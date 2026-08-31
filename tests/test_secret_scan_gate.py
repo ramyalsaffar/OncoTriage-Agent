@@ -392,18 +392,63 @@ section("2  THE FINGERPRINT FORMAT AND THE ACCEPTED TABLE")
 sys.path.insert(0, os.path.dirname(_GATE))
 import secret_scan_gate as _gate_module                                # noqa: E402
 
+# THE SAMPLE OID IS SHAPE-FAITHFUL, WHICH IS SECTION 1'S RULE ONE LAYER OVER.
+# These three checks read `"abc"` as the oid until the parser began validating
+# it, and `"abc"` is a placeholder in exactly the sense section 1 rejects: it
+# exercised the split while standing in for a value the census can never
+# produce. Derived rather than typed, so it is forty lowercase hex characters
+# by construction and cannot drift into a literal somebody shortens.
+_SAMPLE_OID = hashlib.sha1(b"a sample git blob name").hexdigest()
+
+check("2a-0 the sample oid is a git object name: forty lowercase hex, so 2a-2c "
+      "exercise the parser on a value the census could really emit",
+      (len(_SAMPLE_OID), set(_SAMPLE_OID) <= set("0123456789abcdef")),
+      (40, True))
 check("2a a fingerprint splits into exactly four fields",
-      _gate_module.parse_fingerprint("abc:oncotriage:detector:123"),
-      ("abc", "oncotriage", "detector", "123"))
+      _gate_module.parse_fingerprint(
+          _SAMPLE_OID + ":oncotriage:detector:123"),
+      (_SAMPLE_OID, "oncotriage", "detector", "123"))
 # THE LOCATOR MAY CONTAIN COLONS. It is a BASENAME for a filename finding, and a
 # basename may legally contain one. Splitting on every colon would silently
 # truncate such an entry into one that matches nothing -- a suppression that
 # stops suppressing without saying so.
 check("2b ...and a locator carrying colons survives whole",
-      _gate_module.parse_fingerprint("abc:gitleaks:rule:odd:name:1")[3],
+      _gate_module.parse_fingerprint(
+          _SAMPLE_OID + ":gitleaks:rule:odd:name:1")[3],
       "odd:name:1")
 check("2c a line with too few fields is not a fingerprint",
-      _gate_module.parse_fingerprint("abc:oncotriage:detector"), None)
+      _gate_module.parse_fingerprint(
+          _SAMPLE_OID + ":oncotriage:detector"), None)
+
+# THE COLON COUNT ALONE IS NOT ENOUGH, AND THAT IS A REGRESSION THIS SUITE
+# WATCHED FAIL. Before the oid was validated, `parse_fingerprint` answered "yes"
+# for any line carrying three colons. Check 4f harvests --emit-accepted through
+# this function, and that harvest reads stdout AND stderr together because 3g
+# requires the planted values to be absent from BOTH. On a hosted x86_64 runner
+# the gate subprocess emits an onnxruntime device-discovery warning to stderr --
+# qdrant_client -> fastembed -> onnxruntime, on that hardware only -- and the
+# warning carries three colons before its first space. It was harvested as a
+# fingerprint, written into the table under test, and reported STALE, so 4f
+# failed on Linux while the gate it tests was correct. The line below is that
+# warning, verbatim from the failing run.
+_RUNNER_STDERR_NOISE = (
+    "2026-08-31 02:07:33.857699191 [W:onnxruntime:Default, "
+    "device_discovery.cc:146 GetPciBusId] Skipping pci_bus_id")
+check("2c-b the runner's onnxruntime stderr warning carries three colons, so "
+      "a colon count alone would harvest it (non-degeneracy: without this the "
+      "next two checks could pass against a line nothing would have matched)",
+      len(_RUNNER_STDERR_NOISE.split(":", 3)), 4)
+check("2c-c ...and it is NOT a fingerprint, because its first field is not a "
+      "git object name",
+      _gate_module.parse_fingerprint(_RUNNER_STDERR_NOISE), None)
+check("2c-d an oid of the right shape but the wrong length is refused too -- "
+      "a truncated paste is the likelier mistake than a log line",
+      _gate_module.parse_fingerprint(
+          _SAMPLE_OID[:39] + ":oncotriage:detector:0"), None)
+check("2c-e ...and an UPPERCASE oid is refused, because git emits lowercase "
+      "and an entry that differs from the finding by case matches nothing",
+      _gate_module.parse_fingerprint(
+          _SAMPLE_OID.upper() + ":oncotriage:detector:0"), None)
 
 _shipped = _gate_module.read_accepted(_ACCEPTED)
 check_true("2d the shipped accepted table parses", isinstance(_shipped, dict))

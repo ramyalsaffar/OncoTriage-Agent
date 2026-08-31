@@ -356,15 +356,55 @@ with _runner.exclusive_run_lock(checkpoint_dir=_L1) as _keyed_path:
           (_keyed_path,
            _keyed.get("checkpoint_dir") if isinstance(_keyed, dict) else None),
           (_PATH_A, os.path.realpath(_L1)))
-    check("1e-e ...and it names the RESOLVED path, matching the KEY. The lock "
-          "is keyed on the realpath, so a record naming the unresolved one "
-          "could show an operator a different string from the one the refused "
-          "run hashed -- two names for the one thing the refusal is about. "
-          "Non-degenerate on this machine: macOS puts the temp tree under "
-          "/var, which is a link to /private/var",
-          (_keyed.get("checkpoint_dir") if isinstance(_keyed, dict) else None,
-           os.path.realpath(_L1) != os.path.abspath(_L1)),
-          (os.path.realpath(_L1), True))
+
+# 1e-e's NON-DEGENERACY IS CONSTRUCTED, NOT INHERITED FROM THE PLATFORM.
+#
+# It used to be `os.path.realpath(_L1) != os.path.abspath(_L1)`, asserted True,
+# under a note reading "non-degenerate on this machine: macOS puts the temp tree
+# under /var, which is a link to /private/var". That is a statement about the
+# DEVELOPMENT MACHINE'S filesystem, not about the code: Linux puts the temp tree
+# at /tmp, which is a real directory, so the probe read False and the check
+# FAILED on every hosted runner -- while its actual subject, the first member of
+# the tuple, matched. A green macOS run and a red Linux one, over code that was
+# correct in both.
+#
+# The repair is the one tests/test_serial_runner_lock.py section 2 already
+# takes: MAKE the symlink and drive the lock through it. That is strictly
+# stronger than what it replaces, because it exercises a genuinely unresolved
+# path instead of hoping the operating system supplies one -- and the probe is
+# then true by construction everywhere.
+_L1_LINK = os.path.join(_TMP, "lockdir-a-link")
+if not os.path.lexists(_L1_LINK):
+    os.symlink(_L1, _L1_LINK)
+
+check("1e-e0 the link and the directory are DIFFERENT strings, and abspath -- "
+      "which is what the pre-fix key used -- does NOT collapse them "
+      "(non-degeneracy, by construction rather than by platform)",
+      (_L1_LINK != _L1, os.path.abspath(_L1_LINK) != os.path.abspath(_L1)),
+      (True, True))
+check("1e-e1 ...while realpath DOES collapse them, so this is one directory "
+      "under two names rather than two directories",
+      os.path.realpath(_L1_LINK), os.path.realpath(_L1))
+
+with _runner.exclusive_run_lock(checkpoint_dir=_L1_LINK) as _linked_path:
+    _linked = drive_call(
+        lambda: json.load(open(_linked_path, encoding="utf-8")))
+    check("1e-e ...and reached through the SYMLINK it locks the SAME file and "
+          "the record names the RESOLVED path, matching the KEY. The lock is "
+          "keyed on the realpath, so a record naming the unresolved one could "
+          "show an operator a different string from the one the refused run "
+          "hashed -- two names for the one thing the refusal is about",
+          (_linked_path,
+           _linked.get("checkpoint_dir") if isinstance(_linked, dict) else None),
+          (_PATH_A, os.path.realpath(_L1)))
+    check("1e-e2 ...and that is not the string it was GIVEN, which is what "
+          "makes 1e-e a statement about resolution rather than an echo",
+          _linked.get("checkpoint_dir") if isinstance(_linked, dict) else None,
+          os.path.realpath(_L1_LINK))
+    check("1e-e3 ...non-degeneracy: the string it was given really does differ "
+          "from the one recorded, on this platform as on any other",
+          (_linked.get("checkpoint_dir")
+           if isinstance(_linked, dict) else None) != _L1_LINK, True)
 
 def _reacquire(path):
     """Take and release the lock, reporting whether it was free."""

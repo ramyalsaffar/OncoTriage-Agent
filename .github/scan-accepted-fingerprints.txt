@@ -182,3 +182,34 @@ a7df3706d896e35a12e8dcb31267801e160a848d:gitleaks:generic-api-key:826
 e6fba799a5245c086aa283479dec9b65904da2d3:gitleaks:generic-api-key:827
 f0fd7d247fd48d11e004223802f240f70ca2cd0e:gitleaks:generic-api-key:28
 f40048a7d859eab0a54a1202557182c857653757:gitleaks:generic-api-key:685
+
+# ===========================================================================
+# BLOCK 4 — A PROMPT-CACHE ROUTING LABEL IN A TEST. NOT A CREDENTIAL.
+# ===========================================================================
+#
+# One blob: the version of `tests/test_agent_bedrock_anthropic_per_trial.py`
+# introduced by the Converse per-trial pass. gitleaks' `generic-api-key` rule
+# fires on the keyword argument that carries the prompt-cache ROUTING HINT — an
+# argument whose name ends in `key`, whose value in that revision was a
+# fabricated label of about twenty characters. The rule needs ten characters
+# and an entropy floor; a descriptive hyphenated label clears both.
+#
+# IT AUTHENTICATES NOTHING. The parameter asks a provider to send requests
+# sharing a prompt prefix to one machine so the cache is hit; it is derived in
+# production from the system prompt's digest, it is not issued by anybody, it
+# grants no access, and there is nothing to rotate. The test never reads the
+# value — only that the argument was forwarded at all.
+#
+# THE SOURCE IS ALREADY FIXED, WHICH IS WHY THIS IS ONE ENTRY AND NOT A
+# RECURRING ONE. The label in the working tree is now under ten characters, so
+# it cannot reach that rule's length floor and no NEW blob of this file trips
+# it. Only the blob already pushed to a public history is matched here, and a
+# blob is immutable — so unlike an entry that suppresses a live literal, this
+# one cannot go stale on the next edit to the file, and editing the file does
+# not require adding another. That recurrence is the defect this project
+# already records for the synthetic sentinel in BLOCK 2, which is still a
+# literal.
+#
+# REMOVAL CONDITION: this goes when history is rewritten. Nothing else removes
+# it, because nothing else removes the blob.
+fd805105894372541a44ce1da35b8f385ff67355:gitleaks:generic-api-key:559

@@ -118,6 +118,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -154,6 +155,18 @@ GITLEAKS_VERSION = "8.30.1"
 # gitleaks reports a finding it cannot attribute to a line as line 0; nothing
 # else uses this. Kept named so the fingerprint format has no bare literal.
 _NO_LINE = 0
+
+# A FINGERPRINT'S FIRST FIELD IS A BLOB OID AND NOTHING ELSE.
+#
+# Forty lowercase hex characters, which is git's SHA-1 object name. That length
+# is not a preference here: `basenames_by_oid` parses the binary tree format
+# with `body[nul + 1:nul + 21]`, twenty RAW bytes, so this whole file already
+# only works against a SHA-1 repository. Accepting a 64-character SHA-256 name
+# here and nowhere else would be a half-wiring -- the parser would admit an
+# entry the census can never produce, and the table would report it stale
+# forever. Refusing it is the loud failure, and both move together on the day
+# this file learns SHA-256.
+_OID_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 # WHAT MUST BE INSTALLED FOR THIS GATE TO IMPORT THE PROJECT'S SCANNER
@@ -428,16 +441,52 @@ class Finding:
 
 
 def parse_fingerprint(text):
-    """Split on the FIRST three colons only.
+    """Split on the FIRST three colons only, and require the OID to be one.
 
     The locator is a byte offset or a line number for a content finding and a
     BASENAME for a filename finding, and a basename may legally contain a colon
     on every filesystem this runs on. Splitting on every colon would silently
     truncate such an entry into one that matches nothing, which is a suppression
     that stops suppressing without saying so.
+
+    THE OID IS VALIDATED AND THE COLON COUNT ALONE IS NOT ENOUGH, which was
+    found by running rather than by reading. Without the `_OID_RE` test this
+    function answers "yes, a fingerprint" for ANY line carrying three colons,
+    and two consumers read it:
+
+      * `read_accepted` raises on a line this rejects. That refusal is the only
+        validation the accepted table has, so with the colon count alone a
+        mistyped entry -- a pasted log line, a truncated oid, a note somebody
+        wrote with a timestamp in it -- became a live table ENTRY that matches
+        nothing, and the gate then reported it as STALE. A table whose
+        malformed lines arrive as staleness sends an operator to delete a real
+        exemption to quiet a typo.
+
+      * tests/test_secret_scan_gate.py harvests `--emit-accepted` output
+        through it, and that harvest reads stdout AND stderr together (on
+        purpose: check 3g requires the planted values to appear in NEITHER
+        stream). On a hosted x86_64 runner, importing this project's scanner
+        pulls qdrant_client -> fastembed -> onnxruntime, which writes a
+        device-discovery warning to stderr:
+
+            2026-08-31 02:07:33.857 [W:onnxruntime:Default, dev.cc:146 ...] ...
+
+        Three colons before the first space. The colon count alone harvested it
+        as a fingerprint, wrote it into the accepted table under test, and the
+        verify run reported it stale -- so check 4f failed on Linux while the
+        gate it tests was working correctly. The machine emitting that warning
+        is the only reason it was not seen on the development machine.
+
+    A fingerprint is `<oid>:<engine>:<detector>:<locator>` and the first field
+    is a git object name, so that is what is checked. The other three are
+    deliberately NOT constrained: an engine or a detector renamed upstream must
+    arrive as a STALE entry naming itself, which is the signal the staleness
+    check exists to give, and not as a parse failure that names the table.
     """
     parts = text.split(":", 3)
     if len(parts) != 4:
+        return None
+    if not _OID_RE.match(parts[0]):
         return None
     return tuple(parts)
 
@@ -590,7 +639,9 @@ def read_accepted(path):
             if parse_fingerprint(stripped) is None:
                 raise ScanUnavailable(
                     f"{path}: not a fingerprint "
-                    f"(<oid>:<engine>:<detector>:<locator>): {stripped}")
+                    f"(<oid>:<engine>:<detector>:<locator>, where <oid> is the "
+                    f"40 lowercase hex characters of a git blob name): "
+                    f"{stripped}")
             accepted[stripped] = " ".join(comment) or "(no reason recorded)"
     return accepted
 

@@ -10489,8 +10489,10 @@ identical content**, which is a second, independent reason it is not the
 guarantee. The file is kept: a rule tightening upstream can be reverted
 upstream, and the entries are argued.
 
-**GREEN DOES NOT MEAN CLEAN, AND THE SUMMARY SAYS SO IN WORDS.** 21 accepted in
-three argued blocks, printed grouped by reason on every clean run. **Twelve of
+**GREEN DOES NOT MEAN CLEAN, AND THE SUMMARY SAYS SO IN WORDS.** 22 accepted in
+four argued blocks, printed grouped by reason on every clean run (it was 21 in
+three until the CI-green pass added BLOCK 4, a prompt-cache routing label in a
+test whose blob is already in public history). **Twelve of
 them are a REAL credential still in this repository's history** — the Airflow
 signing key — accepted because removing it means rewriting pushed history, which
 is a decision with its own blast radius and is not made by a scanner. It is

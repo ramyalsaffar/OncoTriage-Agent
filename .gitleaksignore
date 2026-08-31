@@ -68,3 +68,33 @@
 # THE LESSON IS THE POINT: a suppression file that quotes what it suppresses
 # will suppress itself into existence. Describe, do not reproduce.
 5df6901b24b797ac0e2d22d9de41889f1e9e489d:.gitleaksignore:generic-api-key:28
+
+# tests/test_agent_bedrock_anthropic_per_trial.py:559 at commit 9a3fdb8 —
+# A PROMPT-CACHE ROUTING LABEL. NOT A CREDENTIAL.
+#
+# DESCRIBED, NOT QUOTED, per the lesson recorded above.
+#
+# What is at that line: the keyword argument that carries Stage 5's prompt-cache
+# ROUTING HINT into the warmup call. It asks a provider to send requests sharing
+# a prompt prefix to one machine so the cache is hit. Production derives its
+# value from the system prompt's digest behind a project prefix; the value in
+# that revision was a fabricated label of about twenty characters written for a
+# test. It authenticates nothing, it is issued by nobody, it grants no access,
+# and there is nothing to rotate. The test never reads the value — only that the
+# argument was forwarded at all.
+#
+# gitleaks' generic-api-key rule fires because the argument NAME ends in `key`
+# and the value cleared both the rule's ten-character floor and its entropy
+# threshold (measured 3.59 against a threshold of 3.5).
+#
+# THE SOURCE IS ALREADY FIXED, so this is one entry and not a recurring one. The
+# label at HEAD is under ten characters and cannot reach that rule's length
+# floor, which was measured against this gitleaks pin rather than assumed. Only
+# the commit already pushed to a public history is matched here.
+#
+# THE SAME CAUSE HAS A SECOND ENTRY, in .github/scan-accepted-fingerprints.txt
+# BLOCK 4, keyed on the BLOB oid instead of the commit. That is not redundancy:
+# this file governs the commit-attribution scan and that table governs the
+# object scan, and the two fingerprint forms are not interchangeable — this one
+# stops matching after a rebase, that one survives it.
+9a3fdb88eb6b6c4ed1b42d9400d9ea738d189bff:tests/test_agent_bedrock_anthropic_per_trial.py:generic-api-key:559

@@ -73,7 +73,7 @@
 #              normalised onto <blob-oid>:<engine>:<detector>:<locator> and
 #              gated by one accepted table,
 #              .github/scan-accepted-fingerprints.txt,
-#              which holds 21 entries in three argued blocks. A stale accepted
+#              which holds 22 entries in four argued blocks. A stale accepted
 #              entry fails the build; so does a scan that could not run.
 #              `.gitleaksignore` is unchanged and still read by the
 #              commit-attribution scan; MEASURED at this gitleaks pin, its two
@@ -376,6 +376,45 @@ jobs:
 
       - name: Show the derived version
         run: make version
+
+      - name: Mint throwaway Airflow secrets for compose interpolation
+        # COMPOSE INTERPOLATES THE WHOLE FILE BEFORE IT BUILDS ANYTHING. The two
+        # `${...:?}` guards in `x-airflow-environment` are therefore evaluated
+        # even though `make build` starts no service, and without them EVERY
+        # compose subcommand exits 1. That is what this job did:
+        #
+        #     error while interpolating x-airflow-environment.AIRFLOW__API__SECRET_KEY:
+        #     required variable ONCOTRIAGE_AIRFLOW_SECRET_KEY is missing a value
+        #     make: *** [Makefile:67: build] Error 1
+        #
+        # and the two scan steps below then failed on the image that was never
+        # built -- three annotations, one cause.
+        #
+        # THE GUARDS ARE NOT WEAKENED TO SUIT CI, and that is the decision here.
+        # `${VAR:-default}` would substitute silently, which is precisely the
+        # empty-signing-key case those guards were added to refuse; a CI
+        # convenience is not a reason to hand an operator a stack that starts
+        # with a weak secret and says nothing.
+        #
+        # THE VALUES CANNOT REACH THE IMAGE, so a fresh pair per run introduces
+        # no nondeterminism. `fastapi` is the only service carrying a `build:`
+        # section and its only `args:` entry is APP_VERSION; these two are
+        # `environment:`, read by a container at RUN time, and nothing in this
+        # job runs one. The built image is byte-identical whatever they are.
+        #
+        # MINTED, NOT WRITTEN DOWN. A literal here would be a credential-shaped
+        # string in a public repository -- the exact thing the compose file
+        # stopped carrying when these guards were added -- and it would be the
+        # value an operator copies. Fresh per run, never echoed, never used to
+        # start anything. The shape is real rather than a placeholder: 32 random
+        # bytes in url-safe base64 is exactly what `Fernet.generate_key()`
+        # constructs, written with the standard library so this step does not
+        # need `cryptography` installed.
+        run: |
+          mint() { python -c "import base64,os;print(base64.urlsafe_b64encode(os.urandom(32)).decode())"; }
+          echo "ONCOTRIAGE_AIRFLOW_SECRET_KEY=$(mint)" >> "$GITHUB_ENV"
+          echo "ONCOTRIAGE_AIRFLOW_FERNET_KEY=$(mint)" >> "$GITHUB_ENV"
+          echo "minted both; values are not printed and never leave this job"
 
       - name: Build (make build)
         # NOT `docker compose build`. A bare compose build fails by design: the
