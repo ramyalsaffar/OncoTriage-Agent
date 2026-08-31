@@ -131,8 +131,8 @@ python .github/scripts/provision_ci_paths.py --root ..
 ONCOTRIAGE_MAIN_PATH=.. python .github/scripts/ci_test_buckets.py --run A
 ```
 
-Run verbatim from an empty directory on macOS with Python 3.13: install about
-40 seconds, `--run A` reports **80 ran, 0 failed, 0 not run**.
+Run verbatim from an empty directory on macOS with Python 3.13, `--run A`
+reports **80 ran, 0 failed, 0 not run**.
 
 Why those two virtualenv flags. Four of the test files inject a stand-in
 through `usercustomize`, which Python imports only when user-site imports are
