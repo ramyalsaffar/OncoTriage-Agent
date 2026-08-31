@@ -261,6 +261,26 @@ def main(argv=None):
              "stopReason 'max_tokens', which is the single string that arms "
              "Stage 5's reactive split.")
     parser.add_argument(
+        "--probe-per-trial", action="store_true",
+        help="bedrock_anthropic only: issue THREE EXTRA billed calls -- one "
+             "warmup-shaped and two trial-shaped over the SAME system prefix "
+             "-- to settle A11 (is `maxTokens = 1` with the structured-output "
+             "block dropped accepted at all) and A12 (does the warmup's write "
+             "get reported, and do the two calls behind it read it). THE "
+             "MEASUREMENT COMES OUT OF THE USAGE BLOCK, never the wall clock. "
+             "THIS IS THE MIGRATION WINDOW'S FIRST COMMAND for per-trial mode "
+             "on this provider: without it, both premises the mode's "
+             "affordability rests on are documentation.")
+    parser.add_argument(
+        "--per-trial-prefix-file",
+        help="bedrock_anthropic only, with --probe-per-trial: read the system "
+             "prefix from this file instead of using the probe's tiny built-in "
+             "one. THE BUILT-IN PREFIX IS BELOW BEDROCK'S 1,024-TOKEN CACHE "
+             "MINIMUM, so a zero cache write with it is the documented "
+             "behaviour of a short prefix and says nothing about Stage 5. "
+             "Render a real one and point this at it before drawing any "
+             "conclusion about A12.")
+    parser.add_argument(
         "--calls", type=int, default=2,
         help="How many identical calls to issue (default 2; the second is what "
              "proves the prompt cache warms). Minimum 1.")
@@ -698,6 +718,145 @@ def _probe_bedrock_anthropic(args):
             print(f"  RAISED ({type(exc).__name__}: {exc})")
             print("  A maxTokens below the model's minimum is itself a "
                   "possibility; this does not settle A7 either way.")
+
+    if args.probe_per_trial:
+        section("(A11)(A12) PER-TRIAL — the warmup, then two reads of it")
+        print("  THREE EXTRA BILLED CALLS. The measurement is the USAGE BLOCK "
+              "and never the wall clock: a fast second call proves nothing "
+              "about caching, and a slow one disproves nothing.")
+        print("  THE PREFIX HERE IS THIS PROBE'S, WHICH IS TINY. Bedrock's "
+              "minimum cacheable prefix for this model is 1,024 tokens and "
+              "PROBE_SYSTEM is far below it, so a zero WRITE below is the "
+              "documented behaviour of a short prefix and NOT evidence about "
+              "Stage 5, whose real system prompt measures 8,115-10,464 tokens "
+              "on the twelve characterization fixtures. Re-run with "
+              "--per-trial-prefix-file pointed at a real rendered prompt "
+              "before concluding anything about the cache.")
+
+        _pt_system = PROBE_SYSTEM
+        if args.per_trial_prefix_file:
+            try:
+                _pt_system = open(args.per_trial_prefix_file,
+                                  encoding="utf-8").read()
+            except OSError as exc:
+                print(f"\n  REFUSED: could not read "
+                      f"{args.per_trial_prefix_file!r}: {exc}")
+                print("  Nothing extra was called. Nothing extra was billed.")
+                return _summary()
+            print(f"  prefix from {args.per_trial_prefix_file!r}: "
+                  f"{len(_pt_system)} chars "
+                  f"(~{len(_pt_system) // config.CHARS_PER_TOKEN} tokens at "
+                  f"CHARS_PER_TOKEN; the 1,024 floor needs "
+                  f"~{1024 * config.CHARS_PER_TOKEN} chars)")
+
+        warm_kwargs = adapter.build_converse_request(
+            _pt_system, config.MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE,
+            warmup=True)
+        trial_kwargs = adapter.build_converse_request(_pt_system, PROBE_USER)
+
+        # THE ONE THING THIS CAN CHECK FOR FREE, AND IT IS THE ONE THAT MATTERS
+        # MOST: the two requests must carry a BYTE-IDENTICAL system block, or
+        # the warmup warms a prefix the wave does not share and every read
+        # below is zero for a reason no AWS page could explain.
+        check("the warmup and the trial call carry a byte-identical system "
+              "block, which is the prefix itself",
+              json.dumps(warm_kwargs["system"], sort_keys=True),
+              json.dumps(trial_kwargs["system"], sort_keys=True))
+        check("the warmup asks for the configured minimal ceiling",
+              warm_kwargs["inferenceConfig"]["maxTokens"],
+              config.MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS)
+        check("the warmup carries outputConfig only when configured to",
+              "outputConfig" in warm_kwargs,
+              bool(config.BEDROCK_ANTHROPIC_WARMUP_SEND_OUTPUT_CONFIG))
+
+        pt_usages = []
+        for label, kw in (("warmup", warm_kwargs),
+                          ("trial 1", trial_kwargs),
+                          ("trial 2", trial_kwargs)):
+            print(f"\n  --- {label} ---")
+            _t0 = time.monotonic()
+            try:
+                raw = client.converse(**kw)
+            except Exception as exc:                   # noqa: BLE001
+                category = adapter.classify_error(exc)
+                print(f"  RAISED  {type(exc).__name__} [{category}]")
+                print(f"          {exc}")
+                if label == "warmup":
+                    print("\n  THIS IS (A11). If the message names maxTokens, "
+                          "the shipped code CLASSIFIES it -- "
+                          "evaluation.classify_warmup_rejection carries "
+                          "Converse's spelling -- and a real run degrades to "
+                          "the one-then-rest schedule rather than failing. "
+                          "Raise MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS "
+                          "to whatever it names.")
+                _RESULTS["failed"] += 1
+                _FAILURES.append(f"{label} raised {type(exc).__name__} "
+                                 f"[{category}]: {exc}")
+                break
+            u = raw.get("usage") or {}
+            pt_usages.append((label, u))
+            print(f"  elapsed {time.monotonic() - _t0:.1f}s   "
+                  f"stopReason {raw.get('stopReason')!r}")
+            dump("usage", u)
+            _cd = u.get("cacheDetails")
+            if _cd is not None:
+                print(f"  cacheDetails: {_cd}   <- the TTL the write actually "
+                      f"used; compare against "
+                      f"BEDROCK_ANTHROPIC_CACHE_TTL="
+                      f"{config.BEDROCK_ANTHROPIC_CACHE_TTL!r}")
+
+        if pt_usages:
+            check_true("(A11) the warmup's request shape was ACCEPTED",
+                       pt_usages[0][0] == "warmup")
+
+        if len(pt_usages) == 3:
+            _w = pt_usages[0][1]
+            _wrote = _w.get("cacheWriteInputTokens")
+            _warm_read = _w.get("cacheReadInputTokens")
+            print("\n  --- (A12) the reading the shipped code makes ---")
+            print(f"  warmup: write={_wrote!r} read={_warm_read!r}")
+            check_true(
+                "(A12) the warmup reported a cacheWriteInputTokens FIELD at "
+                "all. None means the field name moved, and the shipped code "
+                "reads that as 'not_reported' and FAILS THE PATIENT -- which "
+                "is cache-or-nothing working, and is a campaign that does not "
+                "start",
+                _wrote is not None)
+            if _wrote or _warm_read:
+                print("  the warmup left the prefix WARM "
+                      f"({'wrote' if _wrote else 'already_warm'}). "
+                      "classify_cache_write() would let the wave go out.")
+            else:
+                print("  THE WARMUP CACHED NOTHING. On this probe's tiny "
+                      "prefix that is EXPECTED and documented; on a real "
+                      "Stage 5 prefix it would stop the campaign. Re-run "
+                      "with --per-trial-prefix-file before concluding.")
+            for label, u in pt_usages[1:]:
+                _r = u.get("cacheReadInputTokens")
+                _in = u.get("inputTokens")
+                print(f"  {label}: cacheRead={_r!r} nonCachedInput={_in!r} "
+                      f"-> derived prompt_tokens="
+                      f"{adapter._usage_block(u)['prompt_tokens']}")
+                if _r:
+                    check_true(f"(A12) {label} READ the shared prefix", True)
+                else:
+                    print(f"    {label} did not read the cache. If the warmup "
+                          f"DID write, the two requests do not share a "
+                          f"byte-identical prefix and that is a defect in "
+                          f"build_converse_request, not in the account.")
+            # THE DISJOINTNESS FORMULA, CHECKED AGAINST A REAL RESPONSE RATHER
+            # THAN AGAINST A DOCSTRING. Converse's totalTokens is not
+            # documented as including the cache terms, so this compares the
+            # adapter's derived prompt_tokens against the vendor's own stated
+            # sum instead.
+            for label, u in pt_usages:
+                _derived = adapter._usage_block(u)["prompt_tokens"]
+                _stated = ((u.get("inputTokens") or 0)
+                           + (u.get("cacheReadInputTokens") or 0)
+                           + (u.get("cacheWriteInputTokens") or 0))
+                check(f"({label}) the adapter's prompt_tokens equals AWS's own "
+                      f"formula inputTokens + cacheRead + cacheWrite",
+                      _derived, _stated)
 
     # ---- A6 -------------------------------------------------------------
     section("(A6) COST — priced from PRICING_CONFIG's Sonnet 4.6 rows")

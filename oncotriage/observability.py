@@ -599,6 +599,25 @@ LOGGABLE_FIELDS = frozenset({
     "model", "tokens_in", "tokens_out", "tokens_estimated", "tokens_actual",
     "finish_reason", "retry", "max_retries", "truncations", "cost_usd",
     "tokens_reasoning", "estimate_ratio", "calls",
+    # THE TWO CACHE COUNTS, AND THEY ARE WHAT SAYS WHETHER PER-TRIAL MODE'S
+    # COST PREMISE HELD. `tokens_cached_read` is the provider's own
+    # `cacheReadInputTokens` (OpenAI: `prompt_tokens_details.cached_tokens`)
+    # and `tokens_cached_write` is Converse's `cacheWriteInputTokens`, which
+    # OpenAI's Chat Completions usage does not report at all. Both are
+    # CARDINALITIES over the SAME system prompt this pipeline composed -- a
+    # token count cannot carry a patient, a trial or a diagnosis, exactly as
+    # `tokens_in` beside them cannot. They are fields rather than message text
+    # because 6c of tests/test_observability_logging.py forbids interpolating
+    # data into a message, and because "the cache did not warm" is only
+    # actionable when the record says by how much: 0 read against 19,000
+    # written is a first call, and 0 against 0 is a prefix that was never
+    # cacheable.
+    "tokens_cached_read", "tokens_cached_write",
+    # WHETHER THIS LINE IS ABOUT THE INFRASTRUCTURE REQUEST OR A BILLED TRIAL
+    # CALL. A bool, on `parallel`'s argument: it is the one thing a reader
+    # comparing two Stage 5 failure lines has to group by, and correlating it
+    # from timestamps is the alternative.
+    "warmup",
     # Stage 5's validators, as counts. What was remapped, corrected or excluded
     # -- never WHICH criterion, because a criterion label plus a verdict is a
     # clinical statement about this patient.

@@ -324,6 +324,23 @@ _REGISTRY_SPEC = (
      "and the batch checkpoint see it. LIVE ON AN ORDINARY CAMPAIGN, because "
      "per-trial is the SHIPPED arm; it stays at zero only in the retained "
      "GROUPED arm (MATCHING_PER_TRIAL_CALLS_ENABLED False)"),
+    ("PER_TRIAL_CACHE_READ_MISSES",
+     _agent_evaluation.PER_TRIAL_CACHE_READ_MISSES,
+     "a Stage 5 PER-TRIAL wave call reported NO cache read, so it paid the "
+     "full input rate for a shared prefix the mode exists to have discounted "
+     "-- roughly ten times the cached rate on Claude Sonnet 4.6. The call "
+     "SUCCEEDED and its verdict is kept: this names a broken COST premise, not "
+     "a broken judgement, which is why it is counted rather than retried. A "
+     "`reported_zero` key means the provider answered and said nothing was "
+     "reused (check the prefix minimum, the cachePoint, and whether the "
+     "warmup's system block is byte-identical to the wave's); `not_reported` "
+     "means the response carried no cache fields at all, which is an API "
+     "question rather than a prompt one. GATED ON THE PROVIDER: only "
+     "MATCHING_PROVIDER values in "
+     "evaluation.PER_TRIAL_CACHE_CONFIRMING_PROVIDERS can report a cache "
+     "WRITE, so on OpenAI this stays at zero as a configuration artefact "
+     "rather than as a measurement -- read it beside "
+     "inferences.matching_provider"),
     ("STAGE5_SHUTDOWN_SKIPS", _agent_evaluation.STAGE5_SHUTDOWN_SKIPS,
      "Stage 5 requests that were NOT issued because an operator asked the run "
      "to stop -- SIGTERM or Ctrl-C, never the STOP sentinel, which promises "

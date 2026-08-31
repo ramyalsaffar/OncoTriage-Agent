@@ -995,6 +995,16 @@ python bedrock_probe.py --i-understand-this-bills --probe-seed   # + 1 more
 python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic
 python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic \
     --probe-truncation                                   # + 1 more, settles A7
+# PER-TRIAL ON THE CONVERSE BRANCH -- three more calls, settling A11 (is the
+# warmup's `maxTokens = 1` shape accepted) and A12 (does the warmup's write get
+# reported, and do the calls behind it read it). READ THE ANSWER OUT OF THE
+# USAGE BLOCK, never the wall clock. The built-in prefix is BELOW Bedrock's
+# 1,024-token cache floor, so point --per-trial-prefix-file at a real rendered
+# system prompt before drawing any conclusion about the cache.
+python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic \
+    --probe-per-trial                                    # + 3 more
+python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic \
+    --probe-per-trial --per-trial-prefix-file <a real rendered system prompt>
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  GO-LIVE, PER-TRIAL: NO PAID RUN BEFORE THE THREE-CALL PROBE.
@@ -9951,12 +9961,12 @@ migration was run.**
    does the disjointness formula hold against a real response) are ranked first
    and second because the first makes the branch useless and the second costs
    money silently.
-2. **PER-TRIAL MODE IS REFUSED ON THIS PROVIDER**, as it is on the Responses
-   branch: `assert_per_trial_provider_supported()` admits OpenAI alone, so the
-   cache-or-nothing warmup is not built here. Grouped mode is what this branch
-   serves. **That is a real gap for a Claude branch specifically**, because
-   `cachePoint` with a 1,024-token minimum is exactly the mechanism a per-trial
-   wave needs.
+2. ~~**PER-TRIAL MODE IS REFUSED ON THIS PROVIDER**~~ -- **CLOSED. See "Per-trial
+   mode reaches the Converse branch" below.** The gap this named was real and
+   the reason it gave was right: `cachePoint` with a 1,024-token minimum is
+   exactly the mechanism a per-trial wave needs. It is built, and the write is
+   CONFIRMED out of `usage.cacheWriteInputTokens` rather than assumed. The
+   Responses branch is still refused, deliberately.
 3. **THE FIXTURE HARNESSES REFUSE THIS PROVIDER ALREADY AND THAT IS INHERITED,
    NOT BUILT.** `capture.assert_provider_is_hookable()` admits OpenAI alone, so
    a capture or replay under `bedrock_anthropic` refuses by name rather than
@@ -9970,6 +9980,253 @@ migration was run.**
    line 1952) and `pyproject.toml` declares it nowhere. Unrelated to this branch
    -- which uses boto3, declared -- and worth a line in the next packaging pass.
 6. **THE INFERRED PRICING ROWS.** See A6.
+
+### Per-trial mode reaches the Converse branch, and cache-or-nothing stops being an assumption (the Converse per-trial pass)
+
+**THE BRANCH THAT SHIPPED REFUSED THE ARM THE CAMPAIGN RUNS.**
+`MATCHING_PER_TRIAL_CALLS_ENABLED` is **True** and per-trial is the pipeline's
+binding design; `assert_per_trial_provider_supported()` admitted OpenAI alone,
+so `bedrock_anthropic` could only ever run GROUPED. A paid go-live probe would
+have validated a mode the campaign does not use. **NO AWS CALL AND NO BILLED
+CALL OF ANY KIND WAS MADE**, `MATCHING_PROVIDER` still ships `"openai"`, and
+the OpenAI request is **byte-identical to the one `git show HEAD:` builds** --
+`call_matching_model` with and without a cache key, and
+`call_matching_model_warmup`, all three compared by driving the HEAD functions
+exec'd into the live module's globals rather than by reading them. The twelve
+fixtures replay **12/12 clean, exit 0, no recapture**, and their sha256 set and
+the production `inferences.db` (`ab1403e3…`) are unchanged.
+
+**WHAT AWS ACTUALLY SAYS, READ 2026-08-30 AND CITED PER FACT.** Every answer
+below is from `prompt-caching.html`, `API_runtime_Converse.html`,
+`API_runtime_OutputConfig.html` or `feature-retry-behavior.html`. None of it is
+inferred from the Responses branch.
+
+| question | answer |
+|---|---|
+| where a `cachePoint` may go | `system`, `messages`, `tools`. **This module places exactly one, at the end of `system`** -- the vendor's own advice: "place stable content (tools, system) before variable content (messages), and place cache checkpoints after the stable content" |
+| how many | **4** per request for Claude Sonnet 4.6 |
+| minimum prefix | **1,024 tokens** -- and evaluated against the **cumulative** tokens across tools+system+messages, not per section |
+| **below the minimum** | **"your inference still succeeds, but your prefix isn't cached."** No error. No warning. Every wave call at the full input rate, and the only trace is a zero in a usage field |
+| TTL | 5m (default) / 1h, and **"resets with each successful cache hit"** |
+| confirmable? | **Yes, and AWS instructs it**: "Support for prompt caching doesn't guarantee a cache hit for any request. Check the cache usage fields in the model response." The fields are `usage.cacheReadInputTokens`, `cacheWriteInputTokens` and `cacheDetails` |
+
+**WHAT THE TTL RESET MEANS FOR THE WARMUP, STATED AS THE CONSTRAINT IT
+ACTUALLY IS.** It is NOT "the whole wave must finish inside 5 minutes" -- it is
+that no GAP between two consecutive prefix-sharing requests may exceed the TTL.
+The wave submits every request to the pool up front, so the largest gap is a
+small multiple of one call's latency at any bound above 1, and at a bound of 1
+it is exactly one call's latency. `MATCHING_REQUEST_TIMEOUT_SECONDS` is 300, so
+a single call running to its full read budget sits inside the 5-minute window
+with nothing to spare -- **the one arithmetic collision worth knowing about**,
+and why `BEDROCK_ANTHROPIC_CACHE_TTL` accepts `"1h"`. Nothing depends on
+wall-clock scheduling: the warmup is AWAITED, so the write always precedes the
+reads.
+
+**AND THE SHORT-PATIENT-RECORD QUESTION HAS A MEASURED ANSWER: THE FLOOR IS
+UNREACHABLE FOR THIS PIPELINE.** `render_system_prompt` emits **21,142
+characters of instructions -- ~5,285 tokens -- before a single character of
+patient record**, five times the 1,024 floor, and the twelve fixtures' real
+Stage 5 system prompts measure **8,115 to 10,464 tokens**, eight times the
+floor at the smallest. A short record moves the total by the record; the
+instructions alone clear it. `tests/test_agent_bedrock_anthropic_per_trial.py`
+section 8 re-derives that from the LIVE renderer, so a prompt shortened past
+the floor fails there rather than as a campaign that quietly stopped caching.
+
+**CACHE-OR-NOTHING IS NOW ENFORCED ON THIS PROVIDER AND ASSUMED ON THE OTHER,
+AND THE ASYMMETRY IS AN API FACT RATHER THAN A CHOICE.** Converse reports a
+WRITE count; OpenAI's Chat Completions usage reports only a READ. So on OpenAI
+a healthy first warmup and a warmup that cached nothing are the same response,
+there is nothing to confirm against, and enabling the check there would fail
+every patient of the SHIPPED arm -- an outage, not a conservative default.
+`PER_TRIAL_CACHE_CONFIRMING_PROVIDERS` is where that is decided and argued, and
+`tests/test_agent_bedrock_anthropic_per_trial.py` section 6 drives the real
+node on the real OpenAI arm to prove the gate holds.
+
+| outcome | what it means | what happens |
+|---|---|---|
+| `wrote` | `cacheWriteInputTokens > 0` | the wave goes out |
+| `already_warm` | a read with no write -- a retry, a resumed or resampled patient, the same patient inside the TTL | **the wave goes out.** The prefix IS warm, which is what the wave needs. A naive `write > 0` test fails every retried patient in the campaign, and that is plant P4 |
+| `reported_zero` | both present, both zero -- **the provider answered and the answer is no** | ZERO trial calls. The patient fails cleanly and the checkpoint resumes it |
+| `not_reported` | neither field present | ZERO trial calls, counted under its OWN key -- a reported zero sends an operator to the prefix and an absent field sends them to the API |
+
+**BOTH WRITERS ARE COVERED, AND THE SECOND IS THE ONE A NAIVE IMPLEMENTATION
+MISSES.** When the provider refuses the warmup's SHAPE the schedule degrades to
+one-then-rest and the first REAL trial call becomes the writer. It carries the
+same `cachePoint` and reports the same fields, so `_confirm_cache_write` takes
+the writer as an argument and the fallback obeys the identical rule -- plant P6.
+A writer that answered and cached nothing has its verdict WITHHELD and the
+patient failed, because publishing one verdict and N-1 not-evaluable trials
+COMPLETES the patient and `_on_done` checkpoints a completed patient: the c33
+lesson, reached from a new direction. Its response is still FILED, so
+`_account_unconsumed` folds the tokens it was billed rather than losing them.
+
+**A WAVE CALL THAT MISSED THE CACHE SURFACES AND IS NOT FATAL.**
+`PER_TRIAL_CACHE_READ_MISSES` is the 34th counter in
+`oncotriage/degradation.py`'s registry. The call was issued, answered and
+BILLED, so the finding is a broken COST premise rather than a broken
+JUDGEMENT -- discarding it would spend the money twice and lose an answer
+nobody doubts. Plant P7 absorbs it; plant P8's checks are the opposite mistake,
+"surface" read as "fail the patient".
+
+**A PRE-EXISTING BUG WAS FOUND AND FIXED, AND IT WOULD HAVE MADE THE FALLBACK
+UNREACHABLE ON THIS BRANCH.** `classify_warmup_rejection` reads an HTTP status
+through `_http_status_of`, which looked at `exc.status_code` and
+`exc.response.status_code`. **A botocore `ClientError` carries neither**: its
+`.response` is a plain dict and the status lives at
+`["ResponseMetadata"]["HTTPStatusCode"]`, so `getattr(dict, "status_code")` is
+None and the function returned None for EVERY Converse error. A provider
+refusing the warmup's `maxTokens` would have been read as a transport failure
+and **failed the patient**, once per patient, for the whole campaign, instead
+of degrading with a named counter. Fixed, with Converse's `maxTokens` spelling
+added to the parameter-name list, and driven both directions in section 5a.
+
+**THE PARALLEL BOUND IS CONFIGURATION AND IT IS THIS PROVIDER'S OWN.**
+`BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS` (None = follow the shared bound)
+overrides `MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS`, reconciled in one place by
+`config.per_trial_parallel_bound()`. A bound derived from an estimated OpenAI
+latency is not a bound for an AWS account whose Amazon Bedrock
+requests-per-minute quota is applied below the default, and editing the shared
+constant would silently re-pace the SHIPPED arm to suit a provider it does not
+use. It is HONOURED, measured with a barrier rather than a clock -- a
+dispatcher running sequentially cannot satisfy a barrier of 2, and section 9's
+bound-of-1 arm is the control that breaks it.
+
+**WHAT HAPPENS WHEN THE LIMIT IS HIT, IN TWO STAGES.** Converse answers
+`ThrottlingException` / HTTP 429; botocore's `standard` mode classifies that as
+a THROTTLING error and retries with a **1,000 ms base delay, exponential
+backoff, full jitter, capped at 20 s**, honouring `x-amz-retry-after`, up to
+`config.bedrock_anthropic_max_attempts()` TOTAL attempts (default
+`OPENAI_SDK_MAX_RETRIES + 1` = **2**, so one retry). Past that: a trial call is
+recorded `per_trial_call_failed` and the patient completes without it; the
+WARMUP fails the patient cleanly and the checkpoint resumes it. **AND THERE IS
+A SECOND FLOOR THAT A BIGGER RETRY BUDGET CANNOT REACH** -- standard mode's
+retry QUOTA, a 500-token bucket charged 5 per throttling retry, where "when the
+available tokens are exhausted, the SDK returns the error without retrying".
+Sustained throttling above ~32% drains it and retries stop entirely. So the
+remedy for SUSTAINED 429s is a smaller `BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS`,
+and for BURSTY ones a larger `BEDROCK_ANTHROPIC_MAX_ATTEMPTS`;
+`BEDROCK_ANTHROPIC_RETRY_MODE` offers AWS's own documented answer for a
+throttled account (`"adaptive"`, which adds a client-side rate limiter) and is
+NOT the default, because the same page says adaptive "can delay or block the
+INITIAL request" and "is not recommended as a general default".
+
+**A DOCUMENTATION DEFECT IN CODE THIS PASS DID NOT WRITE.** `_output_config`
+claimed boto3's request syntax is
+`outputConfig={'textFormat': {...}, 'effort': 'string'}`.
+`API_runtime_OutputConfig.html` declares **exactly one member, `textFormat`,
+and no `effort`**. `BEDROCK_ANTHROPIC_EFFORT` defaults to None so nothing is
+sent today and no behaviour rests on it; an operator who sets it gets a
+botocore `ParamValidationError` before a signed request leaves the machine,
+which is the local-validation property the Converse choice was made for. The
+claim is corrected in place and (A5) is the item that settles where the field
+really lives.
+
+**FOUR NEW GO-LIVE ITEMS, A11..A14, RANKED.** (A11) is the warmup's request
+shape -- `maxTokens = 1` with the structured-output block dropped -- ranked
+first because a warmup that cannot be issued makes the mode unavailable.
+(A12) is the write-and-read pair, ranked second because it is the failure that
+costs money silently, and it is now the one the shipped code REFUSES rather
+than absorbs. (A13) records that `get_model_cost()` has no cached term, so a
+cache hit makes every stored `estimated_cost_usd` on this branch an
+OVER-estimate -- deliberate, in the safe direction, and a pricing-schema
+decision rather than a go-live blocker. (A14) is the throttling response.
+
+**THE WARMUP DROPS `outputConfig` AND THAT IS ARGUED FROM THE CACHED CHAIN
+RATHER THAN FROM TASTE.** Converse processes checkpoints `tools -> system ->
+messages` and `outputConfig` is in none of them, so dropping it cannot change
+the prefix -- a stronger statement than the OpenAI warmup can make about
+`response_format`, which carries a VERIFY-AT-GO-LIVE for exactly that reason.
+What it costs is stated: `structured-output.html` warns a first-time schema
+"compiles the grammar, which may take up to a few minutes", and with the warmup
+not carrying the schema the WAVE pays that compile, N requests at once.
+`BEDROCK_ANTHROPIC_WARMUP_SEND_OUTPUT_CONFIG` turns it back on in one edit once
+(A1)'s timing says whether it is real.
+
+**THE PROBE IS EXTENDED AND WAS NOT RUN.** `--probe-per-trial` issues three
+extra billed calls -- one warmup-shaped, two trial-shaped over the same
+prefix -- and reads the answer out of the USAGE BLOCK, never the wall clock. It
+also checks for free, before spending anything, that the two requests carry a
+byte-identical `system` block. **`--per-trial-prefix-file` exists because the
+probe's own built-in prefix is BELOW the 1,024-token floor**, so a zero cache
+write with it is the documented behaviour of a short prefix and says nothing
+about Stage 5; the probe says so on screen rather than letting a reader draw
+the wrong conclusion.
+
+**TWO DEFECTS IN THIS PASS'S OWN TEST CODE WERE FOUND BY RUNNING, NOT BY
+READING.** A stray no-op plant raised at module level and took eleven checks
+with it -- **the abort shape this project has now shipped fifteen times** -- so
+`planted()` converts a plant that matched nothing into a recorded
+`PLANT-FAILED` failure and a named absence, and the run still goes red while
+every other plant still reports. And three counter assertions read
+`dict(counter)` OUTSIDE the `counters_zeroed()` block that restores it, so they
+compared `{}` against `{}` and would have passed for a node that recorded
+nothing; the snapshots are taken inside now.
+
+**ONE PINNED EXPECTATION MOVED AND IT IS THE CHECK WORKING.**
+`tests/test_agent_stage5_per_trial_calls.py` 5c(j) pinned `_account_unconsumed`
+at four call sites; the floor is the fifth, added because the fallback-writer
+withholding made a paid-but-unread response reachable there. **The number that
+5c(j) is really about did not move**: the fifth site is an ordinary statement
+rather than a handler, so "exactly two chain their original diagnosis" is as
+true as it was. Both the pin and the docstring it pins say so.
+
+```bash
+# The Converse per-trial pass. Same shape, same directory. NO AWS CALL AND NO
+# BILLED CALL OF ANY KIND -- the Converse client is a stand-in installed
+# through oncotriage/agent/deps.py and every response is a literal dict. No
+# network, no keys, no spend, no live Qdrant, NO MODEL LOAD
+# (ONCOTRIAGE_DEFER_LOCAL_MODELS above the imports; torch and transformers
+# asserted absent at the end), no corpus, no git history, no database, no live
+# server -- and NO boto3, asserted rather than assumed. It DRIVES THE REAL
+# STAGE 5 NODE end to end, warmup and wave, through the real adapter. It DOES
+# read the LIVE prompt renderer, in section 8 only, to re-derive the
+# measurement that Bedrock's 1,024-token cache floor is unreachable for this
+# pipeline. It writes NOTHING anywhere, not even a temp directory. NOT in the
+# collision matrix -- but it DOES read oncotriage/config.py, which
+# tests/test_config_snapshot_date_rot.py rewrites in place, so all FOUR files
+# it reads are sha256-compared at the end (the fourth is batch/runner.py, read
+# as TEXT and PARSED in section 4e so that "a resume can pick this patient up"
+# is a measurement against the runner's own checkpoint predicate rather than a
+# sentence). It DOES exec: nine in-memory copies
+# (evaluation.py, bedrock_anthropic_adapter.py and config.py), one plant each,
+# argued at _EXEC_ALLOWLIST. Bucket A, ~6 s.
+python tests/test_agent_bedrock_anthropic_per_trial.py              # 196
+
+# The per-trial go-live probe for the Converse branch. NOT RUN by this pass.
+python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic \
+    --probe-per-trial                                    # + 3 more calls, A11 + A12
+python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic \
+    --probe-per-trial --per-trial-prefix-file <a real rendered system prompt>
+#   ^ THE BUILT-IN PREFIX IS BELOW THE 1,024-TOKEN FLOOR. A zero cache write
+#     with it is documented behaviour and says nothing about Stage 5.
+```
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **THE PROBE HAS NOT BEEN RUN.** Every A-item on this branch, old and new, is
+   documentation until it is. (A11) and (A12) are the two that decide whether
+   per-trial mode is usable here at all.
+2. **THE CACHED READ IS NOT PRICED.** `get_model_cost()` takes an
+   {input, output} pair; a cache hit therefore makes `estimated_cost_usd` on
+   this branch an over-estimate by the gap between $3.00 and $0.30 per 1M on
+   the cached portion, which on a per-trial patient is most of the input.
+   Closing it re-bases every historical row and is its own pass. (A13).
+3. **THE RESPONSES BRANCH STILL REFUSES PER-TRIAL MODE**, deliberately and
+   untouched by this pass: that endpoint owns its own caching controls and its
+   warmup would be a third request shape with a third set of unknowns.
+4. **THERE ARE NO CONVERSE FIXTURES.** `capture.assert_provider_is_hookable()`
+   admits OpenAI alone, so a capture or replay under this provider refuses by
+   name rather than billing for calls no proxy wraps. The twelve fixtures
+   characterize the OpenAI GROUPED arm and this branch has no characterization
+   gate of its own.
+5. **`AWS_NEW_RETRIES_2026` IS NOT SET.** AWS's retry-behavior page documents
+   the numbers quoted above as requiring that opt-in, "without this setting,
+   your SDK uses pre-2026 retry behavior, which differs in backoff timing,
+   retry quota costs, and service-specific defaults". It is an environment
+   decision and is recorded rather than made on anyone's behalf.
+6. **`BEDROCK_REGION` IS STILL NOT GATED BY THE RESUME FINGERPRINT.** Two runs
+   against the same profile id in different Regions remain indistinguishable to
+   a resume gate. Unchanged by this pass and now one provider more reachable.
 
 ### The compose file holds no secret (the compose-secrets pass)
 

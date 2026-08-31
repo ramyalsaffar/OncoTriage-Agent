@@ -284,6 +284,25 @@ BUCKETS = {
         "writers and is sha256-compared at the end"),
     "test_agent_ablation_flag_passthrough.py": (
         _A, None, "ran green in 8.3s; registries and clients replaced through deps"),
+    "test_agent_bedrock_anthropic_per_trial.py": (
+        _A, None,
+        "ran green in 6s, 196 checks, against ONLY the directory skeleton: "
+        "PER-TRIAL Stage 5 on the CONVERSE branch -- the cache warmup, the "
+        "write confirmation that makes cache-or-nothing enforceable rather "
+        "than assumed, the wave's read check, and the provider-scoped "
+        "parallel bound. It drives the REAL node end to end against a Converse "
+        "stand-in installed through oncotriage/agent/deps.py, so no network, "
+        "no keys, no spend, no live Qdrant and no model load "
+        "(ONCOTRIAGE_DEFER_LOCAL_MODELS is set above the imports; torch and "
+        "transformers are asserted absent at the end). NO boto3 EITHER, "
+        "asserted rather than assumed. It DOES read the live prompt renderer, "
+        "in section 8 only, to re-derive the measurement that Bedrock's "
+        "1,024-token cache floor is unreachable for this pipeline -- no "
+        "corpus, no git history, no database, and nothing written anywhere. "
+        "Not in the collision matrix: the four repository files it reads are "
+        "sha256-compared at the end, and config.py -- which "
+        "tests/test_config_snapshot_date_rot.py rewrites in place -- is one of "
+        "them, so an interleaved serial run is visible rather than silent"),
     "test_agent_bedrock_anthropic_adapter.py": (
         _A, None,
         "ran green in 0.9s, 261 checks, against ONLY the directory skeleton: "

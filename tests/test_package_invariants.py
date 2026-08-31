@@ -1209,6 +1209,24 @@ _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    # nothing raises rather than producing a control that
                    # quietly agrees with the code.
                    "tests/test_agent_bedrock_anthropic_adapter.py",
+                   # Plants into in-memory copies of agent/evaluation.py,
+                   # agent/bedrock_anthropic_adapter.py AND config.py -- the
+                   # per-trial half of the Converse branch: the cache warmup,
+                   # the write confirmation that makes cache-or-nothing
+                   # CHECKABLE on that provider, and the provider-scoped
+                   # parallel bound. `git show` cannot supply one of these
+                   # controls: every mechanism is new at HEAD, and each plant
+                   # is a one-token edit INSIDE a function body -- the
+                   # breakpoint moved off `system`, the prefix drifted by one
+                   # character, the confirmation deleted while everything
+                   # around it stays correct -- which is a state no commit
+                   # ever had. The config plant is the same shape one module
+                   # over: it reverts `per_trial_parallel_bound()`'s provider
+                   # arm alone, which no revision carries either. Nothing on
+                   # disk is touched: all three files are sha256-compared at
+                   # the end, and a plant that matched nothing is a recorded
+                   # PLANT-FAILED rather than an abort.
+                   "tests/test_agent_bedrock_anthropic_per_trial.py",
                    # ONE exec, of an in-memory copy of fixtures/capture.py with
                    # `--resume`'s gate reverted to "the file exists, skip it" --
                    # the defect the gate was written to prevent, and the only

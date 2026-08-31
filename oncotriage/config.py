@@ -1402,6 +1402,168 @@ is a prompt change wearing the costume of a plumbing field. It exists as a knob
 only so that a probe finding the field REQUIRED is one edit rather than a
 source change."""
 
+# ---------------------------------------------------------------------------
+# Per-trial mode on the Converse branch
+# ---------------------------------------------------------------------------
+#
+# ALL FOUR DEFAULT TO "WHAT THE SHIPPED PATH ALREADY DOES", so importing this
+# file changes nothing for anybody until an operator sets one.
+
+BEDROCK_ANTHROPIC_WARMUP_SEND_OUTPUT_CONFIG = False
+"""Whether the per-trial cache warmup carries `outputConfig`.
+
+FALSE, AND THE ARGUMENT IS THE CACHED CHAIN RATHER THAN TASTE. Converse's cache
+checkpoints are processed `tools` -> `system` -> `messages`
+(`prompt-caching.html`, read 2026-08-30), and `outputConfig` is in NONE of
+those three -- so dropping the structured-output block from the warmup cannot
+change the prefix the warmup writes. That is a stronger statement than the
+OpenAI warmup can make about `response_format`, which is why that one carries a
+VERIFY-AT-GO-LIVE and this one carries a citation.
+
+WHAT IT COSTS, STATED RATHER THAN GLOSSED. `structured-output.html` warns that
+a first-time schema "compiles the grammar, which may take up to a few minutes".
+With the warmup not carrying the schema, the WAVE pays that compile -- and the
+wave is N requests dispatched at once, so a first-ever schema version could
+meet N simultaneous cold compiles rather than one. Set this True if the probe's
+(A1) timing says the compile is real and expensive; it is one edit, and it is a
+knob rather than a decision precisely because nothing here can settle it.
+
+THE REASON IT IS NOT True BY DEFAULT: every constraint the warmup drops is one
+fewer reason for a provider to refuse its request SHAPE and degrade the whole
+schedule -- the argument `call_matching_model_warmup` already makes -- and a
+json_schema demand against `maxTokens = 1` is a plausible thing to be refused."""
+
+BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS = None
+"""Per-trial parallelism for THIS provider, or None to follow the shared bound.
+
+WHY A SECOND NAME FOR A NUMBER THAT ALREADY HAS ONE.
+`MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS` is derived from an estimated OpenAI
+single-trial latency and is bounded, in the end, by an OpenAI account's
+requests-per-minute allowance. Neither fact is a fact about an AWS account. A
+Bedrock account has its own Amazon Bedrock service quotas, per Region and per
+model, and this project has one whose requests-per-minute allowance is
+currently applied far below the default with an increase requested and pending.
+One number cannot be right for both, and the alternative -- editing the shared
+constant -- would silently re-pace the SHIPPED OpenAI arm to suit a provider it
+does not use.
+
+None MEANS FOLLOW THE SHARED BOUND, so nothing moves until this is set, and
+`config.per_trial_parallel_bound()` is the ONE place the two are reconciled.
+
+WHAT HAPPENS WHEN THE QUOTA IS HIT, AND IT IS NOT SILENT. Converse answers
+`ThrottlingException` with HTTP 429 (`API_runtime_Converse.html`, read
+2026-08-30). botocore's `standard` retry mode classifies that as a THROTTLING
+error and retries it with a 1,000 ms base delay, exponential backoff and full
+jitter, capped at 20 s, honouring any `x-amz-retry-after` header
+(`feature-retry-behavior.html`, read 2026-08-30) -- so a burst that clips the
+limit degrades to a slower campaign rather than to failed patients, up to
+`bedrock_anthropic_max_attempts()` TOTAL attempts. Past that the exception
+reaches the node: on a TRIAL call the trial is recorded `per_trial_call_failed`
+and the patient completes without it; on the WARMUP the patient fails cleanly
+and the batch checkpoint resumes it, which is cache-or-nothing working.
+
+AND THERE IS A SECOND, LESS OBVIOUS FLOOR. Standard mode also carries a retry
+QUOTA -- a 500-token bucket charged 5 tokens per throttling retry, refunded on
+success -- and "when the available tokens are exhausted, the SDK returns the
+error without retrying". Sustained throttling above roughly 32% of requests
+drains it, and at that point retries stop entirely and patients start failing
+fast. On a quota-restricted account that is the mechanism to expect, and the
+remedy is a SMALLER value here rather than a larger retry budget.
+
+SET IT TO 1 FOR SEQUENTIAL, which is the honest way to turn the scheduling off
+without turning the mode off. 0 or a negative value is refused at import."""
+
+BEDROCK_ANTHROPIC_MAX_ATTEMPTS = None
+"""botocore's TOTAL attempt budget, or None to follow the OpenAI derivation.
+
+None RESOLVES TO `OPENAI_SDK_MAX_RETRIES + 1`, which is what shipped and which
+is 2 -- one initial request and ONE retry. The +1 is not arithmetic decoration:
+botocore counts TOTAL attempts where the OpenAI SDK counts retries after the
+first, and passing one library's number to the other is how a transport budget
+silently halves or doubles.
+
+WHY IT IS SEPARABLE HERE AND NOWHERE ELSE. Two on a healthy endpoint is
+generous. On an account whose requests-per-minute allowance is applied far
+below the default it is one retry, with at most one second of jittered backoff,
+against a limit that is being hit systematically -- and the retry quota above
+means raising this cannot compensate for a parallel bound set too wide. Raise
+it when the probe's throttling behaviour says the 429s are BURSTY (a bigger
+budget rides them out) and lower the parallel bound when they are SUSTAINED.
+
+MUST BE >= 1: botocore's own documentation is that "a max attempts value of 3
+means the SDK makes one initial request and up to two retries. Set max attempts
+to 1 to disable retries entirely"."""
+
+BEDROCK_ANTHROPIC_RETRY_MODES = ("standard", "adaptive", "legacy")
+BEDROCK_ANTHROPIC_RETRY_MODE = "standard"
+"""botocore's retry mode for the Converse client.
+
+"standard" IS WHAT SHIPPED, promoted from a literal in the client builder
+because a value that decides how a throttled campaign behaves is a tunable and
+this file's rule is that tunables live here.
+
+"adaptive" IS THE DOCUMENTED ANSWER FOR A THROTTLED ACCOUNT AND IS NOT THE
+DEFAULT. AWS describes exactly this workload -- "your client targets a single
+resource ... and you expect frequent throttling responses. This is common in
+automated workflows, batch processors, or AI workloads that call a single API
+operation at high volume" -- and adaptive mode adds a client-side rate limiter
+that slows the run down BEFORE the service rejects it. It is not the default
+for the reason AWS gives on the same page: adaptive mode "can delay or block
+the INITIAL request", so a campaign's wall time becomes a function of a
+limiter's internal state rather than of this pipeline's own arithmetic, and
+"adaptive mode is not recommended as a general default". Switch to it
+deliberately, after the probe, and expect the campaign to take longer.
+
+"legacy" is offered only because botocore offers it; AWS documents it as
+backward-compatibility only and its retryable error set is not standardized.
+
+ONE THING NEITHER MODE SETTLES, AND IT IS NAMED RATHER THAN ASSUMED: AWS's
+retry-behavior page opens by saying the behaviour it documents "requires opting
+in until it becomes the default behavior. Set `AWS_NEW_RETRIES_2026=true` in
+your environment. Without this setting, your SDK uses pre-2026 retry behavior,
+which differs in backoff timing, retry quota costs, and service-specific
+defaults." This project does not set that variable, so the numbers quoted at
+`BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS` describe the OPTED-IN behaviour and the
+installed botocore may be doing something slightly different. It is an
+environment decision rather than a code one, which is why it is recorded here
+instead of being set on anyone's behalf."""
+
+
+def per_trial_parallel_bound():
+    """How many Stage 5 trial calls may be in flight for one patient. ONE OWNER.
+
+    Resolves the provider override, then the shared bound. A FUNCTION rather
+    than a constant on `matching_call_mode()`'s footing: the values it reads can
+    move WITHIN a process -- a probe sets one, a test sets the other -- and a
+    consumer that read a module constant through a from-import would move
+    nothing.
+
+    THE PROVIDER GATE IS INSIDE, NOT AT THE CALL SITE, which is what makes the
+    override impossible to forget. `oncotriage/agent/evaluation.py` calls this
+    once and gets the right number for whichever provider is configured.
+
+    Returns:
+        int: >= 1. Validated at import for both constants, so this cannot
+        return a value `ThreadPoolExecutor` would refuse.
+    """
+    if (MATCHING_PROVIDER == MATCHING_PROVIDER_BEDROCK_ANTHROPIC
+            and BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS is not None):
+        return BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS
+    return MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS
+
+
+def bedrock_anthropic_max_attempts():
+    """botocore's `retries.max_attempts` for the Converse client. ONE OWNER.
+
+    The override, or the OpenAI derivation. See both constants; the +1 is the
+    retries-versus-attempts conversion and is the whole reason this is a
+    function rather than a subtraction repeated at the client builder.
+    """
+    if BEDROCK_ANTHROPIC_MAX_ATTEMPTS is not None:
+        return BEDROCK_ANTHROPIC_MAX_ATTEMPTS
+    return OPENAI_SDK_MAX_RETRIES + 1
+
+
 
 def _validate_bedrock_region(interpolated_into):
     """Refuse a Region that cannot produce a working endpoint. One owner.
@@ -1549,6 +1711,24 @@ def _validate_bedrock_anthropic_config():
             f"-- so the only correct per-request values are "
             f"{BEDROCK_ANTHROPIC_SERVICE_TIERS_ALLOWED} (None omits the field, "
             f"which IS Standard). Edit it in oncotriage/config.py.")
+
+    if BEDROCK_ANTHROPIC_RETRY_MODE not in BEDROCK_ANTHROPIC_RETRY_MODES:
+        raise RuntimeError(
+            f"BEDROCK_ANTHROPIC_RETRY_MODE is "
+            f"{BEDROCK_ANTHROPIC_RETRY_MODE!r}. botocore accepts "
+            f"{BEDROCK_ANTHROPIC_RETRY_MODES}; anything else raises inside the "
+            f"client constructor, which is AFTER this branch has been "
+            f"selected and is a worse place to learn it. 'adaptive' is the "
+            f"documented answer for an account that is being throttled; read "
+            f"the constant before switching. Edit it in oncotriage/config.py.")
+
+    if not isinstance(BEDROCK_ANTHROPIC_WARMUP_SEND_OUTPUT_CONFIG, bool):
+        raise RuntimeError(
+            f"BEDROCK_ANTHROPIC_WARMUP_SEND_OUTPUT_CONFIG is "
+            f"{BEDROCK_ANTHROPIC_WARMUP_SEND_OUTPUT_CONFIG!r}; it must be a "
+            f"bool. It decides whether the per-trial cache warmup carries the "
+            f"structured-output block, and a truthy non-bool would make that "
+            f"decision by accident. Edit it in oncotriage/config.py.")
 
 
 def validate_matching_provider_config():
@@ -1833,8 +2013,18 @@ def get_bedrock_anthropic_client():
             config=_BotoConfig(
                 connect_timeout=BEDROCK_ANTHROPIC_CONNECT_TIMEOUT_SECONDS,
                 read_timeout=MATCHING_REQUEST_TIMEOUT_SECONDS,
-                retries={"max_attempts": OPENAI_SDK_MAX_RETRIES + 1,
-                         "mode": "standard"},
+                # BOTH READ THROUGH THEIR OWN OWNERS rather than written out
+                # here. `bedrock_anthropic_max_attempts()` carries the
+                # retries-versus-attempts conversion, and the mode is a knob
+                # because "adaptive" is AWS's own documented answer for an
+                # account whose requests-per-minute allowance is being hit --
+                # see BEDROCK_ANTHROPIC_RETRY_MODE for why it is not the
+                # default. This client is built ONCE per process and cached, so
+                # both values are read at that moment and a later edit does not
+                # move them; that is the same contract every other field on
+                # this constructor already has.
+                retries={"max_attempts": bedrock_anthropic_max_attempts(),
+                         "mode": BEDROCK_ANTHROPIC_RETRY_MODE},
             ),
         )
     return _BEDROCK_ANTHROPIC_CLIENT_CACHE
@@ -2767,6 +2957,40 @@ if not MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE:
     raise RuntimeError(
         "MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE must be a non-empty string; "
         f"it is {MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE!r}")
+
+# THE SAME TRIPLE, FOR THE TWO CONVERSE-BRANCH OVERRIDES, AND FOR THE SAME
+# REASON THE BLOCK ABOVE GIVES: one becomes `ThreadPoolExecutor(max_workers=)`
+# and the other becomes botocore's `retries.max_attempts`, and a bare `< 1`
+# comparison is not a type check. `True` would pass one and mean "sequential"
+# while every report said otherwise; `2.5` would pass and raise inside the node
+# or inside botocore, per patient, after money had been spent.
+#
+# UNCONDITIONAL, NOT PROVIDER-GATED. These run at import on every machine
+# whatever MATCHING_PROVIDER says, because a value that is not a number is a
+# typo rather than a configuration choice, and the file that names the typo is
+# worth more than the microsecond. `None` is the documented "follow the shared
+# value" and is checked first.
+if BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS is not None and (
+        not isinstance(BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS, int)
+        or isinstance(BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS, bool)
+        or BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS < 1):
+    raise RuntimeError(
+        "BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS must be None (follow "
+        "MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS) or an int >= 1 (1 means "
+        "sequential). `True` is refused explicitly: it is an int to Python, it "
+        "would mean max_workers=1, and a campaign would run per-trial mode "
+        f"sequentially while every report said otherwise. It is "
+        f"{BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS!r}")
+
+if BEDROCK_ANTHROPIC_MAX_ATTEMPTS is not None and (
+        not isinstance(BEDROCK_ANTHROPIC_MAX_ATTEMPTS, int)
+        or isinstance(BEDROCK_ANTHROPIC_MAX_ATTEMPTS, bool)
+        or BEDROCK_ANTHROPIC_MAX_ATTEMPTS < 1):
+    raise RuntimeError(
+        "BEDROCK_ANTHROPIC_MAX_ATTEMPTS must be None (follow "
+        "OPENAI_SDK_MAX_RETRIES + 1) or an int >= 1. It is botocore's TOTAL "
+        "attempt count, not a retry count -- 1 disables retries entirely -- "
+        f"and it is {BEDROCK_ANTHROPIC_MAX_ATTEMPTS!r}")
 
 
 # ---------------------------------------------------------------------------

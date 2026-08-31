@@ -428,6 +428,123 @@ and takes the same return whatever this says.
   ConnectTimeoutError           --  the endpoint was unreachable.
   ReadTimeoutError              --  the read budget fired.
 
+PER-TRIAL MODE ON THIS BRANCH
+-----------------------------
+Sources read 2026-08-30 and named by page. This is the branch's second half:
+the mapping above says what ONE Stage 5 request looks like, and this says what
+happens when there are N+1 of them for one patient.
+
+**WHAT PER-TRIAL MODE IS.** ``config.matching_call_mode()`` is ``per_trial`` by
+default. Stage 5 sends ONE request per patient-trial pair, all of them sharing a
+byte-identical system message -- the instructions plus the whole patient record
+-- and the mode is only affordable because that prefix is billed at the cached
+rate from the second request on. A dedicated WARMUP writes the prefix and is
+awaited alone; the wave then goes out behind it, bounded by
+``config.per_trial_parallel_bound()``. If the prefix cannot be established the
+patient fails cleanly so the batch checkpoint resumes it. There is no uncached
+fallback anywhere.
+
+**WHERE THE BREAKPOINT GOES, AND HOW MANY ARE PERMITTED.**
+``prompt-caching.html``'s explicit-caching table gives Claude Sonnet 4.6:
+minimum **1,024 tokens** per checkpoint, **4** checkpoints per request, TTLs
+**5 minutes and 1 hour**, and the fields that accept a checkpoint as
+``system``, ``messages`` and ``tools``. This module places **exactly one**, at
+the end of ``system``, which is the end of the stable prefix. The page's own
+guidance is the argument: "Cache checkpoints are processed in this order: tools
+-> system -> messages ... For best cache hit rates, place stable content
+(tools, system) before variable content (messages), and place cache checkpoints
+after the stable content." A second checkpoint inside ``messages`` would cache
+the per-trial text, which is different on every call by construction -- a cache
+WRITE per call at a premium rate with no read to follow it.
+
+  Note the same page's less obvious sentence, which is why one checkpoint is
+  enough: "The minimum cache size is evaluated against the cumulative tokens
+  across all three sections combined, not each section individually." Stage 5
+  sends no ``toolConfig``, so the cumulative prefix IS the system block.
+
+**BELOW THE MINIMUM NOTHING RAISES, AND THAT IS THE WHOLE REASON THE WRITE IS
+CONFIRMED RATHER THAN ASSUMED.** Verbatim: "You can only create a cache
+checkpoint if your total prompt prefix meets the minimum number of tokens ... If
+you add a cache checkpoint before meeting the minimum number of tokens, your
+inference still succeeds, but your prefix isn't cached." So a short prefix is a
+SILENT non-cache: every request succeeds, every verdict is produced, and the
+only trace is a zero in a usage field. On a 15-trial patient that is fifteen
+requests at the full input rate against a design that budgeted for one.
+
+  **WHAT IT MEANS FOR A SHORT PATIENT RECORD: NOTHING, AND THAT IS MEASURED.**
+  ``render_system_prompt`` emits 21,142 characters of INSTRUCTIONS before a
+  single character of patient record -- ~5,285 tokens at
+  ``config.CHARS_PER_TOKEN``, five times the 1,024 floor -- and the twelve
+  characterization fixtures' real Stage 5 system prompts measure 8,115 to
+  10,464 tokens, eight times the floor at the smallest. A short record moves
+  the total by the record; the instructions alone clear the minimum. The floor
+  is therefore unreachable for this pipeline as it stands, and
+  ``tests/test_agent_bedrock_anthropic_per_trial.py`` section 6 re-derives that
+  from the live prompt renderer so a prompt shortened by 80% fails there rather
+  than as a campaign that quietly stopped caching.
+
+**THE TTL RESETS ON EVERY HIT, WHICH IS WHAT THE WARMUP-TO-WAVE TIMING NEEDS.**
+"The cache has a Time To Live (TTL), which resets with each successful cache
+hit. During this period, the context in the cache is preserved. If no cache
+hits occur within the TTL window, your cache expires." So the constraint is not
+"the whole wave must finish within 5 minutes" -- it is that no GAP between two
+consecutive requests sharing the prefix may exceed the TTL. The wave submits
+every request to a pool up front, so the largest gap is a small multiple of one
+call's latency at any parallel bound above 1, and at a bound of 1 it is exactly
+one call's latency. ``MATCHING_REQUEST_TIMEOUT_SECONDS`` is 300, so a single
+call that runs to its full read budget is inside the 5-minute window with
+nothing to spare; that is the one arithmetic collision worth knowing about, and
+it is why ``BEDROCK_ANTHROPIC_CACHE_TTL`` accepts ``"1h"``. Nothing here
+depends on wall-clock scheduling: the warmup is AWAITED before the wave is
+submitted, so the write always precedes the reads.
+
+**A CACHE READ IS CONFIRMABLE, AND AWS SAYS TO CONFIRM IT.** "Support for
+prompt caching doesn't guarantee a cache hit for any request. Check the cache
+usage fields in the model response to determine whether tokens were read from
+or written to cache." The fields are modeled members of ``usage``
+(``API_runtime_Converse.html``): ``cacheReadInputTokens``,
+``cacheWriteInputTokens`` and ``cacheDetails`` (a list of
+``{inputTokens, ttl}`` describing what was written and under which TTL).
+``translate_response`` carries the first two into
+``usage.prompt_tokens_details`` as ``cached_tokens`` and ``cache_write_tokens``,
+which is where ``oncotriage/agent/evaluation.py`` reads them:
+
+  the WRITER   confirmed by ``classify_cache_write``. ``cacheWriteInputTokens
+               > 0`` is ``wrote``; ``cacheReadInputTokens > 0`` with no write is
+               ``already_warm`` (a retry, a resumed patient, or the same
+               patient inside the TTL -- the prefix IS warm, which is what the
+               wave needs); both present and zero is ``reported_zero``; neither
+               present is ``not_reported``. The last two FAIL THE PATIENT.
+  a WAVE CALL  ``cached_tokens`` must be non-zero. A miss is counted in
+               ``PER_TRIAL_CACHE_READ_MISSES`` and logged, and the verdict is
+               KEPT -- the call was answered and billed, so the finding is a
+               broken cost premise rather than a broken judgement.
+
+**WHEN A FIELD IS ABSENT, THE ANSWER IS "UNCONFIRMED" AND NOT "FINE".** Absent
+and zero are separate members of that vocabulary on this project's standing
+NULL-versus-0 rule, because their remedies differ: a reported zero sends an
+operator to the prefix, and an absent field sends them to the API. Both stop
+the wave.
+
+**THE PARALLEL BOUND IS CONFIGURATION AND IT IS THIS PROVIDER'S OWN.**
+``config.BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS`` overrides
+``MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS`` when this provider is selected, and
+``config.per_trial_parallel_bound()`` is the one place the two are reconciled.
+Both constants argue their own case; the short version is that a bound derived
+from an OpenAI latency estimate is not a bound for an AWS account whose Amazon
+Bedrock requests-per-minute quota is applied below the default. WHEN THE LIMIT
+IS HIT: Converse answers ``ThrottlingException`` / HTTP 429, botocore's standard
+mode retries it with a 1,000 ms base delay, exponential backoff and full
+jitter, capped at 20 s and honouring ``x-amz-retry-after``, up to
+``config.bedrock_anthropic_max_attempts()`` TOTAL attempts. Past that the
+exception reaches the node: on a trial call the trial is
+``per_trial_call_failed`` and the patient completes without it; on the WARMUP
+the patient fails cleanly and resumes. And there is a second floor -- standard
+mode's retry QUOTA, a 500-token bucket charged 5 per throttling retry, which
+"when the available tokens are exhausted" stops retrying altogether. Sustained
+throttling drains it, and the remedy for that is a smaller bound rather than a
+bigger retry budget.
+
 VERIFY-AT-GO-LIVE
 -----------------
 Every line above is documentation that only a live call can confirm. These
@@ -512,6 +629,66 @@ did not run it.
 
 (A10) FIRST-CALL LATENCY AND THE READ BUDGET. See (A1). The probe times every
       call and prints it beside MATCHING_REQUEST_TIMEOUT_SECONDS.
+
+(A11) THE WARMUP'S REQUEST SHAPE IS ACCEPTED -- `maxTokens = 1` WITH THE
+      STRUCTURED-OUTPUT BLOCK DROPPED. Anthropic requires `max_tokens >= 1`, and
+      with `BEDROCK_ANTHROPIC_THINKING = "disabled"` no reasoning bills against
+      that ceiling, so this is EXPECTED to pass -- unlike the OpenAI branch,
+      where a reasoning model may refuse a value that small. It is still probed,
+      because "expected" is what this whole list exists to convert into
+      "observed".
+      PROBE (`--probe-per-trial`): one warmup-shaped call.
+      IF IT 400s NAMING maxTokens: `evaluation.classify_warmup_rejection`
+      classifies it -- its parameter list carries Converse's `maxTokens`
+      spelling -- and the patient degrades to the one-then-rest schedule with a
+      named counter rather than failing. Raise
+      MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS to whatever the message names.
+      **RANKED FIRST AMONG THE PER-TRIAL ITEMS**, because a warmup that cannot
+      be issued makes the mode unavailable on this provider.
+
+(A12) THE WARMUP'S WRITE IS REPORTED, AND THE WAVE READS IT. Three calls: the
+      warmup, then two identical-prefix trial-shaped calls.
+      MUST HOLD: call 1 reports `cacheWriteInputTokens > 0` (or
+      `cacheReadInputTokens > 0`, which means the prefix was already warm from
+      an earlier probe run inside the TTL); calls 2 and 3 report
+      `cacheReadInputTokens > 0`.
+      IF THE WRITE IS ZERO ON A ~20k-TOKEN PREFIX: something other than the
+      1,024-token minimum is wrong -- the `cachePoint` was rejected silently,
+      or this model's explicit caching is not enabled for the account. Nothing
+      here can distinguish those; the console's own cache metrics can.
+      IF THE WRITE IS REPORTED AND THE READS ARE NOT: the two requests do not
+      share a byte-identical prefix. That is a defect in this module, not in
+      the account, and `build_converse_request`'s `warmup` arm is where it
+      would be.
+      **RANKED SECOND: it is the failure that costs money silently**, and it is
+      the one the shipped code now REFUSES rather than absorbs -- so getting it
+      wrong stops a campaign rather than quietly overcharging it.
+
+(A13) THE CACHED READ IS PRICED, AND TODAY IT IS NOT. `get_model_cost()` takes
+      an {input, output} pair and has no cached term, so a cache hit makes
+      every stored `estimated_cost_usd` on this branch an OVER-estimate by the
+      difference between $3.00 and $0.30 per 1M on the cached portion -- which
+      on a per-trial patient is most of the input. THAT IS DELIBERATE AND IS
+      NOT A DEFECT TO FIX IN A HURRY: PRICING_CONFIG's shape is shared with
+      every historical row, and introducing a cached term re-bases the whole
+      series. The probe prints both the priced figure and the cached token
+      totals so the gap is a number rather than a caveat.
+      IT IS RANKED THIRD because it costs accuracy in the SAFE direction -- the
+      recorded spend is higher than the real one -- and closing it is a
+      pricing-schema decision rather than a go-live blocker.
+
+(A14) THE THROTTLING RESPONSE. Not a call this probe makes on purpose: it is
+      what a real campaign meets when the account's requests-per-minute quota
+      binds. WHAT TO READ: whether the 429s are BURSTY (raise
+      BEDROCK_ANTHROPIC_MAX_ATTEMPTS and ride them out) or SUSTAINED (lower
+      BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS; botocore's retry quota drains under
+      sustained throttling and stops retrying altogether, so a bigger budget
+      does nothing). AWS's `feature-retry-behavior.html` also documents that
+      the behaviour it describes "requires opting in until it becomes the
+      default behavior. Set `AWS_NEW_RETRIES_2026=true` in your environment" --
+      this project does not set it, so the installed botocore may be using
+      pre-2026 backoff timing and quota costs. That is an environment decision
+      and is recorded rather than made here.
 
 NOTHING IN THIS MODULE RUNS AT IMPORT. No client, no credential, no socket, no
 file, and boto3 is imported inside the two functions that need it -- the same
@@ -689,18 +866,44 @@ def _text_format_param() -> Dict:
     return {"type": "json_schema", "structure": {"jsonSchema": json_schema}}
 
 
-def _output_config() -> Dict:
-    """``outputConfig``: the structured-output format, plus effort when set.
+def _output_config(include_text_format: bool = True) -> Optional[Dict]:
+    """``outputConfig``, or None to omit the field entirely.
 
-    ONE OBJECT CARRIES BOTH, which is boto3's own request syntax
-    (``outputConfig={'textFormat': {...}, 'effort': 'string'}``). ``effort`` is
-    OMITTED rather than sent as None when unset: omission is what "the model's
-    default" means, and ``None`` is a value botocore would serialize.
+    ``effort`` IS OMITTED rather than sent as None when unset: omission is what
+    "the model's default" means, and ``None`` is a value botocore would
+    serialize.
+
+    **``effort`` IS NOT IN THE API REFERENCE AND THAT IS RECORDED RATHER THAN
+    QUIETLY CARRIED.** This function was written claiming boto3's request
+    syntax reads ``outputConfig={'textFormat': {...}, 'effort': 'string'}``.
+    ``API_runtime_OutputConfig.html`` (re-read 2026-08-30) declares exactly ONE
+    member -- ``textFormat``, Required: No -- and no ``effort``. The shipped
+    default is ``BEDROCK_ANTHROPIC_EFFORT = None``, so nothing is sent today
+    and no behaviour rests on the discrepancy; an operator who sets it will get
+    a botocore ``ParamValidationError`` BEFORE a signed request leaves the
+    machine, which is the local-validation property the Converse choice was
+    made for. (A5) is the item that settles where the field really lives.
+
+    Args:
+        include_text_format: False drops the structured-output block, which is
+            what the per-trial cache WARMUP does. See
+            ``BEDROCK_ANTHROPIC_WARMUP_SEND_OUTPUT_CONFIG`` for why that cannot
+            change the cached prefix -- Converse's checkpoint chain is
+            ``tools`` -> ``system`` -> ``messages`` and ``outputConfig`` is in
+            none of them.
+
+    Returns:
+        The block, or None when it would be empty. **None RATHER THAN ``{}``**
+        on this module's standing rule that an omitted field and a field set to
+        nothing are different requests -- reachable exactly when a warmup drops
+        the schema and no effort is configured, which is the shipped default.
     """
-    out: Dict = {"textFormat": _text_format_param()}
+    out: Dict = {}
+    if include_text_format:
+        out["textFormat"] = _text_format_param()
     if config.BEDROCK_ANTHROPIC_EFFORT is not None:
         out["effort"] = config.BEDROCK_ANTHROPIC_EFFORT
-    return out
+    return out or None
 
 
 def _additional_model_request_fields() -> Optional[Dict]:
@@ -717,8 +920,31 @@ def _additional_model_request_fields() -> Optional[Dict]:
     return {"thinking": {"type": config.BEDROCK_ANTHROPIC_THINKING}}
 
 
-def build_converse_request(system_prompt: str, user_prompt: str) -> Dict:
+def build_converse_request(system_prompt: str, user_prompt: str, *,
+                           warmup: bool = False) -> Dict:
     """The complete kwargs for ``client.converse(**kwargs)``. PURE.
+
+    ONE BUILDER FOR BOTH REQUESTS, AND THAT IS THE WHOLE POINT OF THE KEYWORD.
+    Per-trial mode's cache warmup and its trial calls must carry a
+    BYTE-IDENTICAL ``system`` block -- that block IS the cached prefix, and the
+    ``cachePoint`` that follows it is what makes the prefix cacheable. Two
+    builders would be two places for that block to drift, and the drift's only
+    symptom is ``cacheReadInputTokens`` reading 0 on every wave call while
+    every request succeeds. So the warmup is this function with two fields
+    changed, and the system block is shared BY CONSTRUCTION rather than by a
+    test that has to notice.
+
+    Args:
+        warmup: build the cache-writing request instead of a trial request.
+            Two differences and no others, both AFTER the cached prefix:
+            ``inferenceConfig.maxTokens`` becomes
+            ``config.MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS``, and
+            ``outputConfig``'s structured-output block is dropped unless
+            ``config.BEDROCK_ANTHROPIC_WARMUP_SEND_OUTPUT_CONFIG``. The caller
+            passes ``config.MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE`` as
+            ``user_prompt``; it is not read from config here, because a pure
+            builder that reached for a different user message than the one it
+            was handed would make the request untestable from its arguments.
 
     Pure and separate from the call on purpose: it is what
     ``tests/test_agent_bedrock_anthropic_adapter.py`` compares field by field
@@ -749,9 +975,26 @@ def build_converse_request(system_prompt: str, user_prompt: str) -> Dict:
         "messages": [
             {"role": "user", "content": [{"text": user_prompt}]},
         ],
-        "inferenceConfig": {"maxTokens": config.MATCHING_MAX_TOKENS},
-        "outputConfig": _output_config(),
+        # THE WARMUP ASKS FOR THE SMALLEST ANSWER THE PROVIDER PERMITS. With
+        # `BEDROCK_ANTHROPIC_THINKING = "disabled"` no reasoning bills against
+        # this ceiling, so 1 is safe here in a way it may not be on a reasoning
+        # model -- and a 400 that names the field is still classified as a
+        # request-SHAPE refusal by `evaluation.classify_warmup_rejection`,
+        # whose parameter-name list carries Converse's `maxTokens` spelling for
+        # exactly this call.
+        "inferenceConfig": {
+            "maxTokens": (config.MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS
+                          if warmup else config.MATCHING_MAX_TOKENS)},
     }
+
+    # OMITTED WHEN EMPTY rather than sent as `{}` or None -- see
+    # `_output_config`. Reachable only on a warmup that drops the schema with
+    # no effort configured, which is the shipped default.
+    output_config = _output_config(
+        include_text_format=(
+            not warmup or config.BEDROCK_ANTHROPIC_WARMUP_SEND_OUTPUT_CONFIG))
+    if output_config is not None:
+        kwargs["outputConfig"] = output_config
 
     extra = _additional_model_request_fields()
     if extra is not None:
@@ -1289,6 +1532,85 @@ def call_matching_model_bedrock_anthropic(system_prompt: str, user_prompt: str):
 
     _warn_dropped_parameters_once()
 
+    return _issue_converse(kwargs)
+
+
+def call_matching_model_bedrock_anthropic_warmup(system_prompt: str):
+    """Write the shared prefix into Bedrock's cache. Evaluates nothing.
+
+    THE CONVERSE HALF OF PER-TRIAL MODE'S CACHE-OR-NOTHING RULE. Its counterpart
+    is ``evaluation.call_matching_model_warmup``, which owns the OpenAI half and
+    dispatches here; everything about WHY a dedicated warmup exists is argued
+    there and is not restated.
+
+    WHAT IS DIFFERENT ON THIS PROVIDER, AND IT IS THE PART WORTH KNOWING.
+    OpenAI's prefix caching is AUTOMATIC and its Chat Completions usage block
+    reports only a cache READ count -- so the OpenAI warmup can never confirm
+    that it wrote anything, and the mode ships unconfirmed there. Converse's
+    caching is EXPLICIT: this request carries a ``cachePoint`` at the end of the
+    system block, and ``usage.cacheWriteInputTokens`` says how many tokens were
+    written. AWS says to read it rather than assume it -- "Support for prompt
+    caching doesn't guarantee a cache hit for any request. Check the cache usage
+    fields in the model response to determine whether tokens were read from or
+    written to cache" (``prompt-caching.html``, read 2026-08-30). The reading is
+    made by ``evaluation.classify_cache_write``, on the node thread, on the
+    ChatCompletion this returns; a warmup that cannot be confirmed fails the
+    patient rather than releasing a wave against a prefix nothing wrote.
+
+    THE PREFIX MINIMUM IS 1,024 TOKENS AND IT IS UNREACHABLE FOR THIS PIPELINE,
+    which is measured rather than argued. The same page: "You can only create a
+    cache checkpoint if your total prompt prefix meets the minimum number of
+    tokens ... If you add a cache checkpoint before meeting the minimum number
+    of tokens, your inference still succeeds, but your prefix isn't cached." So
+    a short prefix is a SILENT non-cache -- no error, no warning, full input
+    price on every wave call -- which is exactly the failure mode the write
+    confirmation above turns into a named refusal. It cannot arise here:
+    ``render_system_prompt`` emits ~5,285 tokens of INSTRUCTIONS before a single
+    character of patient record (21,142 characters at ``CHARS_PER_TOKEN``), and
+    the twelve characterization fixtures' real Stage 5 system prompts run 8,115
+    to 10,464 tokens -- eight times the minimum at the smallest. A "short
+    patient record" moves the number by the record, not by the instructions, and
+    the instructions alone are 5x the floor.
+    ``tests/test_agent_bedrock_anthropic_per_trial.py`` section 6 re-derives
+    that measurement so a prompt shrunk by 80% fails there rather than as a
+    campaign that silently stopped caching.
+
+    Returns:
+        ChatCompletion: translated exactly as a trial call's reply is. The
+        content is NOT parsed by anybody -- the ceiling is one token, so it will
+        stop at ``max_tokens`` and translate to ``finish_reason="length"``,
+        which is the intended outcome and not a truncation the reactive splitter
+        ever sees.
+
+    Raises:
+        Whatever the client raises. The caller owns error handling, exactly as
+        it does for ``call_matching_model_bedrock_anthropic``.
+    """
+    kwargs = build_converse_request(
+        system_prompt, config.MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE,
+        warmup=True)
+
+    # AFTER THE BUILD, on the trial call's argument: building validates the
+    # provider configuration, and a run about to be refused for naming an
+    # unsupported service tier should not first be told about the dropped seed.
+    _warn_dropped_parameters_once()
+
+    return _issue_converse(kwargs, warmup=True)
+
+
+def _issue_converse(kwargs: Dict, *, warmup: bool = False):
+    """Send one Converse request and translate the reply. ONE OWNER.
+
+    The trial call and the warmup differ in the KWARGS they were built with and
+    in nothing below this line: same client seam, same error log, same
+    translation. Two copies of this would be two places to forget the
+    ``classify_error`` line, and the failure log is the only record that exists
+    when the caller re-raises.
+
+    ``warmup`` reaches the log line and nothing else, so an operator reading a
+    failure can tell an infrastructure request from a billed trial without
+    correlating timestamps.
+    """
     try:
         raw = deps.get_bedrock_anthropic_client().converse(**kwargs)
     except Exception as exc:
@@ -1298,7 +1620,8 @@ def call_matching_model_bedrock_anthropic(system_prompt: str, user_prompt: str):
                   reason=classify_error(exc),
                   error_type=type(exc).__name__,
                   error_message=str(exc),
-                  provider=config.MATCHING_PROVIDER)
+                  provider=config.MATCHING_PROVIDER,
+                  warmup=warmup)
         raise
 
     return translate_response(raw)

@@ -633,8 +633,64 @@ class PerTrialProviderUnsupportedError(RuntimeError):
             f"MATCHING_PROVIDER={provider!r}. Set "
             "MATCHING_PER_TRIAL_CALLS_ENABLED = False to run this provider in "
             "grouped mode, which is fully supported, or set MATCHING_PROVIDER "
-            f"to {config.MATCHING_PROVIDER_OPENAI!r}.")
+            f"to one of "
+            f"{', '.join(repr(p) for p in PER_TRIAL_SUPPORTED_PROVIDERS)}.")
         self.provider = provider
+
+
+PER_TRIAL_SUPPORTED_PROVIDERS = (config.MATCHING_PROVIDER_OPENAI,
+                                 config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC)
+"""The providers whose per-trial cache warmup is BUILT. Closed.
+
+A TUPLE RATHER THAN A ``!=`` COMPARISON, and the difference is that a tuple can
+GROW without the refusal's shape changing. It grew once already: this read
+``!= MATCHING_PROVIDER_OPENAI`` while the Converse warmup did not exist.
+
+``MATCHING_PROVIDER_BEDROCK`` -- the Responses branch, GPT-5.6 Terra -- is
+DELIBERATELY ABSENT and that is not an oversight. That endpoint owns its own
+caching controls (``BEDROCK_PROMPT_CACHE_MODE``, ``BEDROCK_PROMPT_CACHE_KEY``)
+and its warmup would be a third request shape with a third set of unknowns; a
+mode that has never run does not need a third untested path. It runs GROUPED,
+which is fully supported, and the refusal says so."""
+
+PER_TRIAL_CACHE_CONFIRMING_PROVIDERS = (
+    config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC,)
+"""The providers on which a cache WRITE can be confirmed from the response.
+
+CACHE-OR-NOTHING IS ENFORCED HERE AND ASSUMED EVERYWHERE ELSE, and that
+asymmetry is a fact about the APIs rather than a choice.
+
+  Converse   reports ``usage.cacheWriteInputTokens`` AND
+             ``usage.cacheReadInputTokens`` (``API_runtime_Converse.html``,
+             read 2026-08-30), and AWS instructs a caller to read them:
+             "Support for prompt caching doesn't guarantee a cache hit for any
+             request. Check the cache usage fields in the model response to
+             determine whether tokens were read from or written to cache"
+             (``prompt-caching.html``, same date). So the rule is CHECKABLE and
+             is checked.
+  OpenAI     Chat Completions reports ``prompt_tokens_details.cached_tokens``
+             -- a READ count -- and NO write count. A warmup that wrote a fresh
+             prefix reports 0 cached, which is indistinguishable from a warmup
+             that cached nothing at all. There is nothing to confirm against,
+             so per-trial mode ships UNCONFIRMED on that provider and this
+             sentence is where a reader learns it. Its evidence stays what it
+             has always been: ``cached_tokens`` per call in
+             ``inferences.llm_classifier_call_details``, read after the fact.
+
+WHY IT IS NOT SIMPLY ENABLED EVERYWHERE. On OpenAI the check could only ever
+fail, so enabling it would fail every patient of the SHIPPED arm. That is not a
+conservative default, it is an outage."""
+
+
+def per_trial_cache_is_confirmable() -> bool:
+    """Is a cache write confirmable from this provider's response? ONE OWNER.
+
+    READ THROUGH ``config`` AT CALL TIME, never through a bound name, on
+    ``matching_call_mode()``'s footing: the provider can move within a process
+    (a probe forces it; this project's own tests force it) and a from-import
+    would move nothing.
+    """
+    return config.MATCHING_PROVIDER in PER_TRIAL_CACHE_CONFIRMING_PROVIDERS
 
 
 def assert_per_trial_provider_supported() -> None:
@@ -653,7 +709,7 @@ def assert_per_trial_provider_supported() -> None:
     provider it did not select.
     """
     _provider = config.MATCHING_PROVIDER
-    if _provider != config.MATCHING_PROVIDER_OPENAI:
+    if _provider not in PER_TRIAL_SUPPORTED_PROVIDERS:
         raise PerTrialProviderUnsupportedError(_provider)
 
 
@@ -691,8 +747,11 @@ WARMUP_REJECTIONS = (WARMUP_REJECTED_MINIMAL_OUTPUT, WARMUP_REJECTED_CACHE_KEY)
 # it `max_output_tokens` while the Chat Completions request calls it
 # `max_completion_tokens`, and the bare `max_tokens` because a provider
 # rejecting the value often names the legacy field in its message.
+# `maxTokens` is Converse's spelling and is lower-cased before the match like
+# every other member, so it also covers the bare `max_tokens` an Anthropic
+# validation message may quote instead.
 _WARMUP_OUTPUT_PARAM_NAMES = ("max_completion_tokens", "max_output_tokens",
-                              "max_tokens")
+                              "max_tokens", "maxtokens")
 _WARMUP_CACHE_PARAM_NAME = "prompt_cache_key"
 
 
@@ -705,9 +764,22 @@ def _http_status_of(exc: BaseException) -> Optional[int]:
     object. Neither is asserted to exist: this runs on a failure path and must
     not raise a second, unrelated exception while classifying the first.
     """
+    _response = getattr(exc, "response", None)
+    # THE THIRD PLACE IS BOTOCORE'S AND IT WAS MISSING, which made this
+    # function return None for EVERY error the Converse branch can raise. A
+    # botocore ``ClientError`` carries a plain dict at ``.response``, so
+    # ``getattr(dict, "status_code")`` is None and the second candidate above
+    # never fires -- and with the status unread, ``classify_warmup_rejection``
+    # answered "not a shape refusal" for every 400 on that branch. A provider
+    # refusing the warmup's ``maxTokens`` would have been read as a transport
+    # failure and FAILED THE PATIENT instead of degrading to the one-then-rest
+    # schedule, once per patient, for the whole campaign.
+    _metadata = (_response.get("ResponseMetadata")
+                 if isinstance(_response, dict) else None)
     for _candidate in (getattr(exc, "status_code", None),
-                       getattr(getattr(exc, "response", None), "status_code",
-                               None)):
+                       getattr(_response, "status_code", None),
+                       (_metadata.get("HTTPStatusCode")
+                        if isinstance(_metadata, dict) else None)):
         if isinstance(_candidate, int) and not isinstance(_candidate, bool):
             return _candidate
     return None
@@ -808,23 +880,37 @@ def call_matching_model_warmup(system_prompt: str, *,
             "MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE must be a non-empty "
             f"string; it is {_user!r}")
 
-    # ── THE ADAPTER SEAM, LEFT EXPLICIT AND UNBUILT ───────────────────────
+    # ── THE ADAPTER SEAM ──────────────────────────────────────────────────
     #
     # NOT a silent fall-through to the OpenAI client, which would send this
     # patient's record to the incumbent provider while the operator believed
     # they had migrated -- the failure `call_matching_model`'s own
-    # unrecognised-provider branch exists to refuse.
-    #
-    # The Responses API's warmup is not this request with two fields renamed.
-    # Amazon Bedrock serves OpenAI models on that surface and owns its own
-    # caching controls (BEDROCK_PROMPT_CACHE_MODE, BEDROCK_PROMPT_CACHE_KEY),
-    # and a future Anthropic branch warms its cache the other documented way
-    # entirely: a placeholder user message with an explicit `cache_control`
-    # breakpoint on the system block, because that provider's caching is
-    # explicit rather than automatic. Building either from documentation alone
-    # is how a mode that has never run acquires a second untested path; both
-    # belong to the pass that runs the go-live probe against them.
+    # unrecognised-provider branch exists to refuse. The gate is above the
+    # dispatch so an unsupported provider is named rather than reaching a
+    # client it did not select.
     assert_per_trial_provider_supported()
+
+    # THE CONVERSE BRANCH BUILDS ITS OWN WARMUP AND THIS IS NOT THIS REQUEST
+    # WITH TWO FIELDS RENAMED. Anthropic's caching on Bedrock is EXPLICIT
+    # rather than automatic: the warmup carries a `cachePoint` at the end of
+    # the system block and `usage.cacheWriteInputTokens` reports what it wrote,
+    # which is what makes cache-or-nothing checkable there and not here. The
+    # adapter owns the whole request shape, including the ceiling and the
+    # dropped structured-output block, so nothing about it is decided twice.
+    #
+    # `prompt_cache_key` IS DELIBERATELY NOT FORWARDED. It is a parameter of
+    # `chat.completions.create` and Converse has no such field; the routing it
+    # asks for is not expressible there. `per_trial_prompt_cache_key` returns
+    # None on this provider so the caller never has one to forward, and this
+    # branch is the second half of that statement.
+    if config.MATCHING_PROVIDER == config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC:
+        return (bedrock_anthropic_adapter
+                .call_matching_model_bedrock_anthropic_warmup(system_prompt))
+
+    # The Responses API's warmup is still unbuilt, and the gate above is what
+    # refuses it: that endpoint owns its own caching controls
+    # (BEDROCK_PROMPT_CACHE_MODE, BEDROCK_PROMPT_CACHE_KEY) and its warmup
+    # would be a third request shape with a third set of unknowns.
 
     _extra_kwargs = {}
     if prompt_cache_key is not None:
@@ -866,6 +952,18 @@ def per_trial_prompt_cache_key(system_prompt_sha256: str) -> Optional[str]:
     through and ``call_matching_model``'s expansion stays empty.
     """
     if not config.MATCHING_PER_TRIAL_PROMPT_CACHE_KEY_ENABLED:
+        return None
+    # AND None ON A PROVIDER THAT HAS NO SUCH PARAMETER, which is the second
+    # condition and is not a duplicate of the first. `prompt_cache_key` is a
+    # declared parameter of `chat.completions.create`; Converse's request shape
+    # has no field for a routing hint at all, and an unknown key in a modeled
+    # boto3 call is a local ParamValidationError rather than something the
+    # service might tolerate. Returning None here rather than computing a value
+    # nobody forwards means the "hint is switched off" path -- already handled
+    # at every call site, including the WARMUP_REJECTED_CACHE_KEY arm that
+    # drops it mid-patient -- is the one this provider takes, instead of a
+    # second, silently-ignored one.
+    if config.MATCHING_PROVIDER != config.MATCHING_PROVIDER_OPENAI:
         return None
     return f"oncotriage-stage5-{system_prompt_sha256}"
 
@@ -1036,6 +1134,171 @@ WARMUP_SOURCE_SHUTDOWN = "operator_shutdown"
 # `warmup` wording.
 WARMUP_SOURCES = (WARMUP_SOURCE_WARMUP, WARMUP_SOURCE_FALLBACK_WRITER,
                   WARMUP_SOURCE_SHUTDOWN)
+
+
+# ---------------------------------------------------------------------------
+# CACHE-OR-NOTHING, ENFORCED: was the shared prefix actually written?
+# ---------------------------------------------------------------------------
+#
+# THE RULE THIS ENFORCES IS ALREADY WRITTEN DOWN ABOVE. What was missing is the
+# MEASUREMENT: the schedule guaranteed that a warmup RETURNED before any trial
+# call was issued, and nothing anywhere asked whether the request that returned
+# had cached anything. On a provider that reports it, those are different
+# questions with the same happy path and opposite bills.
+#
+# WHY IT MATTERS MORE ON CONVERSE THAN ANYWHERE ELSE, and the reason is a
+# documented SILENT failure rather than a hypothetical. Bedrock's explicit
+# caching has a per-model minimum prefix -- 1,024 tokens for Claude Sonnet 4.6
+# -- and `prompt-caching.html` (read 2026-08-30) says what happens below it:
+# "If you add a cache checkpoint before meeting the minimum number of tokens,
+# your inference still succeeds, but your prefix isn't cached." No error, no
+# warning, no field missing. Every wave call then pays the FULL input rate for
+# a prefix the whole mode exists to have discounted, at 10x the cached rate,
+# and the only trace is a zero in a column nobody reads until the invoice
+# arrives. The same page tells a caller what to do about it: "Support for
+# prompt caching doesn't guarantee a cache hit for any request. Check the cache
+# usage fields in the model response to determine whether tokens were read from
+# or written to cache."
+#
+# SO THE WRITER IS CHECKED, AND "THE WRITER" IS WHICHEVER REQUEST WROTE. On the
+# shipped schedule that is the dedicated warmup. When a provider refuses the
+# warmup's SHAPE the schedule degrades to one-then-rest and the writer is the
+# first REAL trial call -- which carries the same `cachePoint` and reports the
+# same fields, so the same check covers it and the fallback obeys the rule too.
+
+CACHE_WRITE_WROTE = "wrote"
+# ^ `cacheWriteInputTokens > 0`. This request created the cache entry. The
+#   ordinary first-patient outcome, and the one the warmup exists to produce.
+CACHE_WRITE_ALREADY_WARM = "already_warm"
+# ^ `cacheReadInputTokens > 0` with no write. The prefix was ALREADY cached and
+#   this request read it: a retry after a parse failure, a resumed patient, a
+#   resample row, or simply the same patient inside the TTL. THE PREFIX IS WARM,
+#   WHICH IS THE THING THE WAVE NEEDS, so this is a pass and not a near-miss.
+#   Treating it as a failure would fail every retried patient in the campaign.
+CACHE_WRITE_REPORTED_NOTHING = "reported_zero"
+# ^ Both fields present, both zero. THE PROVIDER ANSWERED THE QUESTION AND THE
+#   ANSWER IS NO. Documented causes, in the order worth checking: the prefix is
+#   below the model's 1,024-token minimum; the `cachePoint` was omitted
+#   (BEDROCK_ANTHROPIC_CACHE_TTL is None); the prefix is not byte-identical
+#   between the warmup and the wave. All three are configuration, and all three
+#   are fixed by an edit rather than by a retry.
+CACHE_WRITE_NOT_REPORTED = "not_reported"
+# ^ NEITHER field present. A DIFFERENT FINDING from a reported zero, and this
+#   project's NULL-versus-0 rule is why they are separate members rather than
+#   one "unconfirmed": absent means the response said nothing about caching --
+#   a renamed field, a model that stopped reporting, a stand-in client -- and
+#   the remedy is to look at the API, not at the prompt. Folding the two would
+#   send an operator to shorten a prefix that is fine.
+
+CACHE_WRITE_OUTCOMES = (CACHE_WRITE_WROTE, CACHE_WRITE_ALREADY_WARM,
+                        CACHE_WRITE_REPORTED_NOTHING,
+                        CACHE_WRITE_NOT_REPORTED)
+"""Closed. A fifth member added without a branch fails a check rather than
+falling through to whichever arm `in` happens to reach."""
+
+CACHE_WRITE_CONFIRMED = (CACHE_WRITE_WROTE, CACHE_WRITE_ALREADY_WARM)
+"""The two outcomes that let the wave go out. Declared as a SET rather than
+tested as `!= REPORTED_NOTHING and != NOT_REPORTED`, because a fifth outcome
+would then default to CONFIRMED -- the failure direction that spends money."""
+
+# The counter prefix for a writer whose cache could not be confirmed. It joins
+# PER_TRIAL_WARMUP_DEGRADATIONS rather than a counter of its own: that counter's
+# subject is exactly "the warmup did not do its job", the outcome is the one its
+# `failed:` family already produces (the patient fails, the checkpoint resumes
+# it), and it is already registered in oncotriage/degradation.py. What is new is
+# the DIAGNOSIS, which the key carries.
+WARMUP_CACHE_UNCONFIRMED_KEY_PREFIX = "cache_unconfirmed:"
+
+
+PER_TRIAL_CACHE_READ_MISSES = Counter()
+"""A per-trial WAVE call that reported no cache read, keyed by why.
+
+SURFACED, NOT ABSORBED, AND NOT FATAL -- and the middle clause is the whole
+design. A wave call that reports `cacheReadInputTokens = 0` has ALREADY BEEN
+ISSUED, ANSWERED AND BILLED, and its verdict is as valid as any other; throwing
+it away would spend the money twice and lose a judgement that is not in doubt.
+What is in doubt is the COST PREMISE, and that is a fact about the run rather
+than about the trial. So the call's result is kept, the miss is counted here,
+and the run-end degradation report is where an operator meets it.
+
+IT IS A DEGRADATION AND NOT A CENSUS, which is why it is in
+`oncotriage/degradation.py`'s `_REGISTRY_SPEC` rather than its `_CENSUS_SPEC`:
+a wave call that missed the cache is a call the design promised would cost a
+tenth of what it did.
+
+TWO KEYS, AND THEY ARE THE TWO A READER HAS TO SEPARATE:
+
+  * ``reported_zero``  -- the field was present and said 0. The prefix was not
+    reused. On a run whose warmup was CONFIRMED, this is the cache expiring or
+    the routing scattering the wave across machines; on a run whose warmup only
+    ever reports this, the prefix is not cacheable at all.
+  * ``not_reported``   -- no field at all, so nothing is known. Same
+    NULL-versus-0 argument as CACHE_WRITE_NOT_REPORTED one screen up.
+
+STAYS AT ZERO ON EVERY PROVIDER BUT ONE, and that is stated rather than left to
+be discovered: the check is gated on PER_TRIAL_CACHE_CONFIRMING_PROVIDERS, so
+an OpenAI campaign contributes nothing here and a zero on that provider is a
+configuration artefact rather than a measurement. Read it beside
+`inferences.matching_provider`.
+
+MODULE-LEVEL AND INCREMENTED ON THE NODE THREAD ONLY, on
+PER_TRIAL_CALL_FAILURES' footing in both respects.
+"""
+
+
+def _cache_counts(response) -> Tuple[Optional[int], Optional[int]]:
+    """``(read, write)`` off a translated ChatCompletion, or None for absent.
+
+    READ OFF THE TRANSLATED RESPONSE RATHER THAN THE RAW CONVERSE REPLY, which
+    is what lets one reading serve both writers and every provider. The adapter
+    already carries Converse's two counts into
+    ``usage.prompt_tokens_details`` -- ``cacheReadInputTokens`` as the standard
+    ``cached_tokens`` and ``cacheWriteInputTokens`` as an extra
+    ``cache_write_tokens`` the OpenAI SDK's model tolerates (measured: the
+    field survives ``model_validate`` and is readable as an attribute).
+
+    EVERY READ IS A ``getattr`` WITH A DEFAULT AND NONE OF THEM MAY RAISE. This
+    runs on the success path of every per-trial call, and a stand-in client, a
+    replayed fixture and a pre-field recording all legitimately carry less than
+    a live reply does. A bool is excluded from the int test on this project's
+    standing footing: ``isinstance(True, int)`` is True, and a cached count of
+    1 that was really a flag is a number nobody measured.
+    """
+    _details = getattr(getattr(response, "usage", None),
+                       "prompt_tokens_details", None)
+    out = []
+    for _name in ("cached_tokens", "cache_write_tokens"):
+        _value = getattr(_details, _name, None)
+        out.append(_value if isinstance(_value, int)
+                   and not isinstance(_value, bool) else None)
+    return out[0], out[1]
+
+
+def classify_cache_write(response) -> str:
+    """Did this request leave the shared prefix warm? One of CACHE_WRITE_OUTCOMES.
+
+    PURE, AND THAT IS WHAT MAKES IT TESTABLE WITHOUT A NETWORK CALL: it takes a
+    response and returns a string, bumps no counter and logs nothing. The
+    caller owns the policy, because the policy differs -- a writer that cannot
+    be confirmed fails the patient, and a wave call that cannot be confirmed is
+    counted and kept.
+
+    THE ORDER OF THE TWO POSITIVE TESTS IS NOT ARBITRARY. A write is checked
+    first because a request that wrote is the outcome the warmup exists to
+    produce; a read with no write is the ALREADY-WARM case. A response
+    reporting both non-zero -- a partial hit, which Bedrock's simplified cache
+    management can produce when a longer prefix matched only in part -- is
+    reported as ``wrote``, which is the stronger of the two true statements
+    about it and the one whose remedy list is empty.
+    """
+    read, write = _cache_counts(response)
+    if write:
+        return CACHE_WRITE_WROTE
+    if read:
+        return CACHE_WRITE_ALREADY_WARM
+    if read is None and write is None:
+        return CACHE_WRITE_NOT_REPORTED
+    return CACHE_WRITE_REPORTED_NOTHING
 
 
 # ---------------------------------------------------------------------------
@@ -1230,6 +1493,57 @@ fourth gate added without a member here fails
 ``tests/test_agent_stage5_per_trial_calls.py`` rather than arriving in an
 operator's report as an unclassified key.
 """
+
+
+class PerTrialCacheUnconfirmedError(RuntimeError):
+    """The request that was supposed to warm the shared prefix did not.
+
+    CACHE-OR-NOTHING, ENFORCED RATHER THAN ASSUMED. The schedule guarantees a
+    writer RETURNED before any trial call is issued; this is raised when the
+    provider's own usage block says that writer cached NOTHING -- which
+    `prompt-caching.html` (read 2026-08-30) documents as a SILENT outcome:
+    "If you add a cache checkpoint before meeting the minimum number of tokens,
+    your inference still succeeds, but your prefix isn't cached."
+
+    IT IS NEVER RAISED THROUGH A CALL STACK. It is CONSTRUCTED and assigned to
+    the node's `_warmup_error`, which is the same mechanism a warmup transport
+    failure and an operator shutdown already use: the zero-success floor turns
+    it into the API-error result, the retry router re-enters the node, and the
+    batch checkpoint resumes the patient. A second failure shape would be a
+    second thing for every consumer to agree about, for an event that means
+    what the first one means -- no wave was issued, and this patient is not
+    done.
+
+    A ``RuntimeError`` subclass on this file's standing footing: a stray
+    ``except ValueError`` around a Stage 5 call must not be able to eat it.
+
+    IT CARRIES THE OUTCOME, not just the fact, because the two unconfirmed
+    outcomes have different remedies. ``reported_zero`` sends an operator to
+    the prefix, the cachePoint and the byte-identity of the system block;
+    ``not_reported`` sends them to the API, because the response said nothing
+    about caching at all.
+    """
+
+    def __init__(self, outcome, source):
+        super().__init__(
+            f"the Stage 5 shared prefix was not cached: the {source} request "
+            f"returned and its usage block reports {outcome!r}. No trial call "
+            f"was issued -- per-trial mode is only affordable when the prefix "
+            f"is billed at the cached rate, and a wave against a cold prefix "
+            f"costs MAX_TRIALS_FOR_EVALUATION times the full input price with "
+            f"nothing raising. "
+            + ("Check the prompt-cache minimum for this model (1,024 tokens "
+               "for Claude Sonnet 4.6), that BEDROCK_ANTHROPIC_CACHE_TTL is "
+               "not None, and that the warmup's system block is byte-identical "
+               "to the wave's."
+               if outcome == CACHE_WRITE_REPORTED_NOTHING else
+               "The response carried NO cache usage fields at all, which is an "
+               "API question rather than a prompt one: check that this "
+               "provider still reports cacheReadInputTokens / "
+               "cacheWriteInputTokens, and that a stand-in client is not "
+               "installed."))
+        self.outcome = outcome
+        self.source = source
 
 
 class PerTrialParallelismError(RuntimeError):
@@ -3876,7 +4190,13 @@ CLINICAL TRIALS:
     # patient's partition and its dispatch are decided from one reading.
     _per_trial_calls = (config.matching_call_mode()
                         == MATCHING_CALL_MODE_PER_TRIAL)
-    _parallel_bound = config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS
+    # READ THROUGH THE OWNER, NOT OFF THE CONSTANT. `per_trial_parallel_bound()`
+    # resolves the PROVIDER override before the shared bound, which is what
+    # lets an account whose requests-per-minute allowance is applied far below
+    # the default be paced without re-pacing the arm that does not use it. It
+    # is a function for `matching_call_mode()`'s reason: both values can move
+    # within a process, and a from-import would move neither.
+    _parallel_bound = config.per_trial_parallel_bound()
     # THE PROVIDER IS VALIDATED HERE FOR THE SAME REASON THE BOUND IS: before
     # the first request of the patient, where a refusal costs nothing and names
     # the constant. Per-trial mode's cache warmup is built for the OpenAI
@@ -4652,6 +4972,58 @@ CLINICAL TRIALS:
                 "warmup": True,
             })
 
+        def _confirm_cache_write(response_, source_) -> bool:
+            """Did the prefix get warmed? Sets `_warmup_error` if it did not.
+
+            THE ONE OWNER, TWO WRITERS. The dedicated warmup and the fallback
+            schedule's held-back first trial call are the only two requests
+            that can be a cache WRITER, and both go through this -- so the
+            fallback obeys cache-or-nothing on exactly the same evidence rather
+            than on a second reading somebody has to keep in step.
+
+            RETURNS TRUE ON A PROVIDER THAT CANNOT ANSWER, and that is a
+            capability check rather than a failure. OpenAI's Chat Completions
+            usage reports a cache READ count and no WRITE count, so on that
+            provider `classify_cache_write` could only ever say
+            `reported_zero` for a perfectly healthy first warmup -- enabling
+            the check there would fail every patient of the SHIPPED arm.
+            `per_trial_cache_is_confirmable()` is where that is decided and
+            `PER_TRIAL_CACHE_CONFIRMING_PROVIDERS` is where it is argued.
+
+            THE COUNTER KEY CARRIES BOTH FACTS -- the outcome and which writer
+            produced it -- because "the dedicated warmup reported zero" and
+            "the fallback's trial call reported zero" have the same remedy and
+            very different implications for how much was already spent.
+            """
+            nonlocal _warmup_error, _warmup_error_source
+            if not per_trial_cache_is_confirmable():
+                return True
+            _outcome = classify_cache_write(response_)
+            if _outcome in CACHE_WRITE_CONFIRMED:
+                return True
+            PER_TRIAL_WARMUP_DEGRADATIONS[
+                f"{WARMUP_CACHE_UNCONFIRMED_KEY_PREFIX}{source_}:"
+                f"{_outcome}"] += 1
+            _warmup_error = PerTrialCacheUnconfirmedError(_outcome, source_)
+            _warmup_error_source = source_
+            _read, _write = _cache_counts(response_)
+            log.error(
+                "the Stage 5 shared prefix was NOT cached; no trial call is "
+                "issued and the patient is failed so the retry budget and the "
+                "checkpoint see it, rather than sending the whole wave at the "
+                "full input rate", stage=5, status="error",
+                event="per_trial_cache_write_unconfirmed",
+                retry=retry_count + 1, count=len(_dispatch_pairs),
+                reason=_outcome, provider=config.MATCHING_PROVIDER,
+                warmup=(source_ == WARMUP_SOURCE_WARMUP),
+                # BOTH COUNTS, BECAUSE A ZERO ALONE IS AMBIGUOUS. 0 read
+                # against 19,000 written is a healthy first call and never
+                # reaches this line; 0 against 0 is a prefix that was not
+                # cacheable; both absent is an API that said nothing.
+                tokens_cached_read=_read, tokens_cached_write=_write,
+                degraded=True)
+            return False
+
         _prefetched = {}
         if _dispatch_pairs:
             # ── The warmup ────────────────────────────────────────────────
@@ -4758,12 +5130,30 @@ CLINICAL TRIALS:
                     # makes `_account_unconsumed()` below provably unaffected by
                     # the warmup: it folds what is left in `_prefetched`, and the
                     # warmup never enters it.
+                    # ACCOUNTED FIRST, CONFIRMED SECOND, AND THE ORDER IS
+                    # THE POINT. This request was issued and billed whatever
+                    # its usage block says, so its tokens belong in the record
+                    # before anything decides what to do about them --
+                    # `_billed_so_far()` is what the floor below returns, and a
+                    # warmup whose cache could not be confirmed must still show
+                    # up as the one billed call it was.
                     _account_warmup(_warmup_response)
-                    log.info("Stage 5 warmed the shared prefix before dispatching "
-                             "the per-trial wave", stage=5,
-                             event="per_trial_warmup",
-                             count=len(_dispatch_pairs),
-                             parallel=min(_parallel_bound, len(_dispatch_pairs)))
+                    _confirm_cache_write(_warmup_response,
+                                         WARMUP_SOURCE_WARMUP)
+                    if _warmup_error is not None:
+                        # `pending` IS CLEARED for the transport failure's
+                        # reason: `_obtain`'s live-call path is real, and a
+                        # send loop left with chunks would issue every one of
+                        # them against exactly the cold prefix this check
+                        # exists to refuse.
+                        pending.clear()
+                    else:
+                        log.info("Stage 5 warmed the shared prefix before "
+                                 "dispatching the per-trial wave", stage=5,
+                                 event="per_trial_warmup",
+                                 count=len(_dispatch_pairs),
+                                 parallel=min(_parallel_bound,
+                                              len(_dispatch_pairs)))
 
             if _warmup_error is None:
                 if _hold_first:
@@ -4825,6 +5215,32 @@ CLINICAL TRIALS:
                             error_type=type(_writer[1]).__name__,
                             error_message=str(_writer[1]),
                             count=len(_dispatch_pairs) - 1, degraded=True)
+                    elif not _confirm_cache_write(
+                            _writer[1], WARMUP_SOURCE_FALLBACK_WRITER):
+                        # THE WRITER ANSWERED AND CACHED NOTHING. The wave is
+                        # stopped for the reason the transport-failure arm
+                        # above stops it, and the patient fails -- because the
+                        # alternative is to publish ONE verdict and N-1
+                        # not-evaluable trials, which COMPLETES the patient,
+                        # and `_on_done` checkpoints a completed patient. A
+                        # resume would then skip it forever with most of its
+                        # cohort never judged. That is the c33 lesson, reached
+                        # from a new direction.
+                        #
+                        # IT IS FILED ANYWAY, WHICH THE ERROR ARM DELIBERATELY
+                        # DOES NOT DO, and the difference is what the two
+                        # states mean. A writer that RAISED was read here and
+                        # is the reason the patient is failing, so filing it
+                        # would have `_account_unconsumed` report one request
+                        # as two findings. This writer SUCCEEDED and was
+                        # BILLED: it is a paid response nobody consumed, which
+                        # is exactly what `unconsumed` means, and the floor
+                        # below folds `_prefetched` so its tokens and its
+                        # ledger row survive rather than vanishing.
+                        _prefetched[_chunk_key(_first)] = (_writer
+                                                           + (_first_depth,))
+                        pending.clear()
+                        _rest = []
                     else:
                         _prefetched[_chunk_key(_first)] = (_writer
                                                            + (_first_depth,))
@@ -5060,9 +5476,10 @@ CLINICAL TRIALS:
         first, then raise -- buys nothing, because the list it would complete
         is discarded by the same unwinding.
 
-        THE ORIGINAL DIAGNOSIS SURVIVES ON TWO OF THE FOUR PATHS, AND THE
+        THE ORIGINAL DIAGNOSIS SURVIVES ON TWO OF THE FIVE PATHS, AND THE
         COUNT IS MEASURED RATHER THAN ASSUMED -- an earlier draft of this
-        paragraph said three, and it was wrong. The API-error branch and the
+        paragraph said three, and it was wrong; it then said FOUR, and the
+        cache-confirmation pass added the fifth. The API-error branch and the
         JSON-parse branch call this from inside an ``except``, so the raise
         carries that exception as its ``__context__`` and the traceback prints
         BOTH under "During handling of the above exception, another exception
@@ -5070,6 +5487,19 @@ CLINICAL TRIALS:
         ``if`` branches over a well-formed response, there is no live exception
         to chain, and on those two the model mismatch is the only thing in the
         traceback.
+
+        THE FIFTH IS THE ZERO-SUCCESS FLOOR, AND IT IS NOT INSIDE AN ``except``
+        EITHER. It was added when the cache-write confirmation made a new state
+        reachable: a fallback writer that SUCCEEDED, was billed, and was then
+        withheld from the send loop because its write could not be confirmed.
+        That response is paid for and unread, which is exactly what this
+        function is for -- and the floor is the only place it can be folded,
+        because the floor is where that path returns. On every OTHER path that
+        reaches the floor this call folds nothing: a dedicated-warmup failure
+        files nothing into ``_prefetched``, a fallback-writer RAISE
+        deliberately files nothing, and the every-call-failed arm has had
+        ``_prefetched`` drained by the send loop. So it is a no-op on all of
+        them, which is what makes adding it safe rather than merely correct.
 
         THAT IS STATED RATHER THAN SMOOTHED OVER, AND IT DOES NOT CHANGE THE
         DECISION. What is lost on those two paths is a SENTENCE -- "the model
@@ -5371,6 +5801,52 @@ CLINICAL TRIALS:
         if _cached is not None:
             cached_input_tokens += _cached
             cached_input_reported = True
+
+        # ── DID THIS WAVE CALL ACTUALLY READ THE CACHE? ───────────────────
+        #
+        # SURFACED, NOT ABSORBED, AND DELIBERATELY NOT FATAL. The whole
+        # affordability of per-trial mode is that every call after the writer
+        # reads the shared prefix at the cached rate -- roughly a tenth of the
+        # full input price on Claude Sonnet 4.6 -- and AWS is explicit that the
+        # discount is not guaranteed and must be READ: "Support for prompt
+        # caching doesn't guarantee a cache hit for any request. Check the
+        # cache usage fields in the model response" (prompt-caching.html, read
+        # 2026-08-30). A miss here is a broken COST premise, not a broken
+        # judgement: the call was issued, answered and billed, and its verdict
+        # is as good as any other. Discarding it would spend the money twice
+        # and lose a judgement nobody doubts, so it is COUNTED and KEPT.
+        #
+        # ON THE NODE THREAD, which is where every increment in this loop
+        # already happens -- `Counter[k] += 1` is a load-add-store the
+        # interpreter may switch threads inside, and the wave's workers do no
+        # accounting at all.
+        #
+        # WARNING ONCE PER CALL RATHER THAN ONCE PER PATIENT, because the two
+        # are different findings: a single miss inside a wave is the cache
+        # expiring or the routing scattering, and fifteen misses in fifteen
+        # calls is a prefix that was never cacheable. The counter separates
+        # them by magnitude and the log line names the patient through the
+        # correlation ID.
+        #
+        # GATED THE SAME WAY THE WRITER'S CHECK IS. On a provider that reports
+        # no write count the writer was never confirmed either, so a read miss
+        # here would be an unexplained warning on the SHIPPED arm rather than a
+        # finding -- see PER_TRIAL_CACHE_CONFIRMING_PROVIDERS. The evidence on
+        # that provider stays what it has always been: `cached_tokens` per call
+        # in inferences.llm_classifier_call_details.
+        if _per_trial_calls and per_trial_cache_is_confirmable() and not _cached:
+            _miss = (CACHE_WRITE_NOT_REPORTED if _cached is None
+                     else CACHE_WRITE_REPORTED_NOTHING)
+            PER_TRIAL_CACHE_READ_MISSES[_miss] += 1
+            log.warning(
+                "a Stage 5 per-trial call reported no cache read, so it paid "
+                "the full input rate for a prefix the mode exists to have "
+                "discounted; the call SUCCEEDED and its verdict is kept",
+                stage=5, event="per_trial_cache_read_missed",
+                reason=_miss, provider=config.MATCHING_PROVIDER,
+                index=calls_made, count=len(chunk),
+                tokens_cached_read=_cached,
+                tokens_in=response.usage.prompt_tokens, degraded=True)
 
         # The model that ANSWERED, checked against the one requested BEFORE its
         # verdicts are parsed or accumulated. Placed here rather than at logging
@@ -5995,13 +6471,33 @@ CLINICAL TRIALS:
     if _per_trial_calls and not per_trial_succeeded and (
             _warmup_error is not None or per_trial_failed_calls):
         elapsed = time.time() - start
+        # FOLD ANY PAID-BUT-UNREAD RESPONSE BEFORE `_billed_so_far()` IS READ.
+        # A NO-OP ON EVERY PATH THAT REACHED THIS FLOOR BEFORE THE CACHE
+        # CONFIRMATION EXISTED -- a dedicated-warmup failure files nothing, a
+        # fallback-writer RAISE deliberately files nothing, and the
+        # every-call-failed arm has had `_prefetched` drained by the send loop
+        # -- and load-bearing on the one path that is new: a fallback writer
+        # that SUCCEEDED, was billed, and was then withheld from the send loop
+        # because its cache write could not be confirmed. Without this its
+        # tokens and its ledger row would vanish, and the failed row would
+        # report one fewer billed call than the provider charged for.
+        _account_unconsumed()
         if _warmup_error is not None:
             # THE TWO WRITERS GET TWO SENTENCES AND ONE RETURN. What differs is
             # only how many requests reached the provider before the wave was
             # stopped -- none for the dedicated warmup, one for the fallback's
             # held-back trial call -- and that is a fact an operator reading a
             # failed row acts on, so it is not rounded off into a shared phrase.
-            if _warmup_error_source == WARMUP_SOURCE_SHUTDOWN:
+            if isinstance(_warmup_error, PerTrialCacheUnconfirmedError):
+                # ASKED FIRST, AND ABOUT THE EXCEPTION RATHER THAN THE SOURCE,
+                # because an unconfirmed write can come from EITHER writer and
+                # is orthogonal to which one. Reading it through the source
+                # would tell an operator whose fallback writer answered
+                # perfectly well that it "failed", and send them to look for a
+                # transport fault that did not happen.
+                _what = ("the shared prefix was not cached, so the wave was "
+                         "not issued")
+            elif _warmup_error_source == WARMUP_SOURCE_SHUTDOWN:
                 # NOT A FAILURE OF ANYTHING, and the sentence says so. Reading
                 # "the shared prefix could not be warmed" on a row an operator
                 # produced by pressing Ctrl-C sends them looking for an

@@ -2630,9 +2630,17 @@ def _unconsumed_call_sites(tree):
 
 
 _5c_total, _5c_handled = _unconsumed_call_sites(ast.parse(_EVAL_SRC))
-check("5c(j) _account_unconsumed has four call sites, and exactly two of them "
-      "are inside an `except` -- the number the docstring states",
-      (_5c_total, _5c_handled), (4, 2))
+# FIVE, NOT FOUR, SINCE THE CACHE-CONFIRMATION PASS -- and the SECOND number
+# is the one this check is really about and it did not move. The fifth site is
+# the zero-success FLOOR, which folds a fallback writer that succeeded, was
+# billed, and was then withheld from the send loop because its cache write
+# could not be confirmed; it is an ordinary statement rather than a handler, so
+# "exactly two chain their original diagnosis" is as true as it was. The count
+# is pinned EXACTLY rather than as a floor: a sixth site appearing without an
+# argument in the docstring is precisely what this is for.
+check("5c(j) _account_unconsumed has five call sites, and exactly two of them "
+      "are inside an `except` -- the numbers the docstring states",
+      (_5c_total, _5c_handled), (5, 2))
 
 # --- AND THE ORDINARY PATH IS UNMOVED --------------------------------------
 #
