@@ -1250,7 +1250,11 @@ check("the rendered instructions are the real ones, not an empty or "
 
 # AND THE FULL PREFIX A REAL PATIENT PRODUCES, through the same renderer the
 # node uses, so this measures the prefix the cachePoint would actually follow.
-_summary = drive(_evaluation._create_patient_summary, PATIENT)
+# THE PAIR THE NODE CALLS, not the text-only wrapper. Stage 5 resolves
+# `build_patient_record` -- the de-identification stage and then the render --
+# because it needs the record as well as the text, so reading the wrapper off
+# `_evaluation` would be reading a name that module no longer binds.
+_summary = drive(lambda: _evaluation.build_patient_record(PATIENT)[1])
 _full_prefix = drive(_prompts.render_system_prompt, True, "applied", _summary)
 _full_tokens = len(_full_prefix) // config.CHARS_PER_TOKEN
 check(f"a whole rendered prefix for this file's patient is "

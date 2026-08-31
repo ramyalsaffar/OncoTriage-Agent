@@ -109,6 +109,7 @@ from oncotriage.agent import patient as _agent_patient
 from oncotriage.agent import readiness as _agent_readiness
 from oncotriage.extraction import stage as _extraction_stage
 from oncotriage.observability import console, get_logger
+from oncotriage import deid as _deid
 from oncotriage import observability as _observability
 from oncotriage import utils as _utils
 from oncotriage.registries import cancer_code_registry as _cancer_code_registry
@@ -263,6 +264,15 @@ _REGISTRY_SPEC = (
      "against that half; a genuine mismatch raises rather than counting, and "
      "the shipped MedCPT tokenizer reports undeclared_placeholder on every "
      "load"),
+    ("DEID_REFUSALS", _deid.DEID_REFUSALS,
+     "a rendered patient record carried a direct identifier and the prompt "
+     "was NOT sent; keyed by deid.IDENTIFIER_CLASSES and never by the matched "
+     "value. EVERY KEY HERE IS A PATIENT THIS RUN DID NOT EVALUATE, so a "
+     "non-zero total means the cohort a rate was computed over is smaller "
+     "than the cohort that was attempted -- and it is the one counter in this "
+     "block whose most likely cause is a FALSE POSITIVE (a personal name that "
+     "is also a clinical word), which oncotriage/deid.py argues is the "
+     "fail-safe direction"),
     ("QDRANT_RETRIES", _utils.QDRANT_RETRIES,
      "a Qdrant call failed and was retried; the run survived it, keyed by "
      "the function that was retried"),
@@ -660,6 +670,12 @@ _CENSUS_SPEC = (
      "outran DATA_SNAPSHOT_DATE), plus the 'lab_stale' census key, which its "
      "declaration argues is NOT a degradation; the mixture is why the whole "
      "counter is here rather than in the block above"),
+    ("DEID_CENSUS", _deid.DEID_CENSUS,
+     "what the de-identification stage DID rather than what it refused: "
+     "'age_capped' counts the patients whose age exceeded deid.AGE_CAP_YEARS "
+     "and rendered as deid.AGE_CAP_LABEL instead of a number. NOT a "
+     "degradation -- a capped age is the stage working -- which is why it is "
+     "here and DEID_REFUSALS is not"),
     ("TEMPORAL_CONFLICT_RESOLVED_MARKERS",
      _agent_evaluation.TEMPORAL_CONFLICT_RESOLVED_MARKERS,
      "which resolved-state markers fired across the run; a member at zero is "

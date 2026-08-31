@@ -647,7 +647,7 @@ python tests/test_api_call_mode_and_db_health.py                    # 151/0/0 on
 # of its argument -- including a control MODULE written to that temp directory
 # and PARSED, never imported -- an ast walk, or a registry entry removed inside
 # try/finally with the restore asserted. Bucket A, ~3 s.
-python tests/test_degradation_counter_readers.py                    # 154 (was 152; the API-shutdown-gate pass added SHUTDOWN_GATE_DEGRADATIONS to _READER_EXEMPTIONS on oncotriage/mcp/server.py's TOOL_FAILURES precedent -- a long-lived SERVER has no run end, and degradation.py binds counter OBJECTS, so registering it would put FastAPI in every batch run's import graph. Before that 138; the operator-control pass added the two new dual-owned counters and replaced the adjacency pin on report_checkpoint_faults with a transitive call-graph walk)
+python tests/test_degradation_counter_readers.py                    # 155 (was 154; the de-identification pass added DEID_CENSUS to the census registry -- a capped age is the stage working -- and derived the "All N census counters are zero" number from the registry instead of the literal 4 it had gone stale as. Before that 152; the API-shutdown-gate pass added SHUTDOWN_GATE_DEGRADATIONS to _READER_EXEMPTIONS on oncotriage/mcp/server.py's TOOL_FAILURES precedent -- a long-lived SERVER has no run end, and degradation.py binds counter OBJECTS, so registering it would put FastAPI in every batch run's import graph. Before that 138; the operator-control pass added the two new dual-owned counters and replaced the adjacency pin on report_checkpoint_faults with a transitive call-graph walk)
 
 # The Docker pass. Same shape, same directory. No network, no keys, no spend,
 # and no Docker daemon: every Qdrant client is a stand-in and section 1's
@@ -9536,6 +9536,204 @@ oncotriage.staging.manifest` would have failed there while parsing cleanly on
 the 3.13 development interpreter. All four touched modules were re-scanned by
 AST for that construct afterwards and none remains.
 
+
+### No direct identifier reaches the model (the de-identification pass)
+
+**THE FINDING THAT SHAPED THE PASS: THE RENDERED RECORD ALREADY CARRIED NO
+DIRECT IDENTIFIER, AND THE PARSER IS WHY.** Measured before anything was
+written, over all 1,000 corpus bundles at a four-character floor -- every
+bundle harvested for names, address lines, city, postal code, geolocation,
+telephone, MRN, SSN, driver's licence, passport and every untyped
+``identifier[]`` entry (2,610 on one bundle), every rendered summary scanned
+for all of them: **ZERO HITS**. `_parse_demographics` reads ``birthDate``,
+``gender`` and the two US Core extensions and NOTHING ELSE, and no other
+per-resource parser reads a name or an address, so the whole of it is dropped
+before ``patient_data`` exists. **So this pass's job is NARROWER than creating
+that property -- it is GUARANTEEING it**, and that is worth saying plainly
+because a reader who believes `oncotriage/deid.py` is what stops names reaching
+the model will not understand what actually does.
+
+**ONE DIRECT IDENTIFIER DID SURVIVE PARSING**: ``patient_id``, the FHIR
+``Patient.id``, which on this corpus is byte-identical to the Medical Record
+Number in ``identifier[]``. The renderer never printed it. It is not in
+``deid.RENDERED_FIELDS``, so it cannot be.
+
+**THE RULING IMPLEMENTED IS A LIMITED DATA SET WITH PSEUDONYMIZATION, NOT SAFE
+HARBOR.** Full dates stay -- every elapsed interval, window and precision
+behaviour of `PROMPT_VERSION` 1.8.0/1.9.0 is untouched, because Safe Harbor's
+year-only dates would destroy machinery that is validated. Ages stay exact to
+89 and render as ``deid.AGE_CAP_LABEL`` above it. **STRICTER THAN AN LDS ON ONE
+AXIS AND THAT IS THE OPERATOR'S RULING**: 45 CFR 164.514(e)(2) permits city and
+ZIP in an LDS; the ruling forbids everything below state, so both are treated
+as identifiers here. ``address.state`` is not -- and could not usefully be:
+``CA`` is two characters and is the prefix of the tumour marker ``CA 19-9``.
+
+| module | holds |
+|---|---|
+| `oncotriage/deid.py` | the stage. `RENDERED_FIELDS`, `DEMOGRAPHIC_FIELDS`, `AGE_CAP_YEARS`, the pseudonym, `harvest_identifiers`, the five shape rules, `scan_for_identifiers`, `assert_no_identifiers`, `DEID_REFUSALS`, `DEID_CENSUS`. **IMPORTS NOTHING FROM THE PROJECT** |
+
+**THE ARCHITECTURE IS THE GUARANTEE, NOT A RULE ABOUT WHAT TO PRINT.**
+`_create_patient_summary` used to BE the renderer and take
+``parse_fhir_bundle``'s output whole, so "no identifier is printed" was a
+property of which keys 650 lines happened to read. It is a three-line wrapper
+now over ``build_patient_record`` = the stage then ``render_patient_record``,
+and **the renderer's parameter is a ``DeidentifiedRecord``** whose ``fields``
+carry exactly ``RENDERED_FIELDS`` and whose demographics carry exactly the four
+the renderer prints. ``patient_id`` is not a key of it, so no line can print
+it; an eleventh key raises rather than yielding ``None``. The rename was
+mechanical -- 11 `patient_data[...]`/`.get(...)` became `record.fields...`, one
+comment left as prose -- and nothing else in the body moved.
+
+**THE PSEUDONYM IS DERIVED FROM THE CLINICAL HASH, NOT FROM ``patient_id``, AND
+THE REASON IS A MEASUREMENT.** ``patient_id`` is on almost every log line this
+pipeline emits, so ``sha256(patient_id)`` would be re-identifiable by anyone
+holding the logs and the prompts -- two artifacts that land in the same
+observability store. ``patient_data_hash`` is **never logged** (checked across
+the package: it appears only as an ``inferences`` column), so a token derived
+from it is recoverable only by someone holding that database. **The mapping
+therefore already exists in the one place the ruling allows and needs no schema
+change**: ``inferences`` carries both columns and
+`deid.pseudonym_for_identity` is the one function relating them. It is
+domain-separated so the prompt's token is not the database's hash -- otherwise
+any row carrying both would BE the mapping.
+
+**IT IS RENDERED, AND ITS MARGINAL DISCLOSURE IS ZERO.** The token is a
+function of the clinical record, and the whole of that record is already in the
+same prompt below the line. Anyone who can act on it already holds everything
+it was derived from. **Stated rather than glossed:** under 45 CFR 164.514(c) a
+re-identification code must not be "derived from or related to information
+about the individual", so this one would NOT satisfy Safe Harbor's coding
+condition; it is offered under the LDS shape the ruling chose.
+
+**CLINICAL FREE TEXT IS NOT SCRUBBED, AND THAT IS A DECISION.** A redactor
+cannot tell a city called Ontario from a condition display, or a family name
+from a syndrome eponym, and editing clinical text deletes evidence silently --
+the failure `_classify_procedure_relevance` already argues is worse than the
+tokens it saves. So structured fields are guaranteed BY CONSTRUCTION and free
+text BY ENFORCEMENT: **Stage 5 scans the RENDERED text and refuses to send.**
+
+**THE GUARD IS THREE LAYERS AND THE PRODUCTION PATH HAS TWO OF THEM.** An exact
+scan over the identifiers derivable from ``patient_data``; five provenance-free
+shape rules (SSN, phone, email, URL, UUID); and `harvest_identifiers(bundle)`
+when a caller has the source. **THE THIRD IS THE STATED GAP**: the graph holds
+only the parsed record by the time Stage 5 runs, so a name that reached an
+observation display is caught only where a bundle is passed. Threading the
+bundle means `TrialMatchState`, `build_initial_state`, both fixture harnesses,
+the ablation study and the MCP server, which is a bigger change than this one.
+
+**THE REFUSAL SPENDS THE RETRY BUDGET IMMEDIATELY**, unlike every other failure
+return in that node. The condition is DETERMINISTIC -- the same record renders
+the same text and the scan finds the same value -- so three attempts buy only
+`RETRY_BASE_DELAY`'s backoff sleeps delaying a batch for a verdict that cannot
+change. `assert_per_trial_provider_supported`'s argument, one node over. The
+patient is recorded as an error, so it is NOT checkpointed and a resume
+re-attempts it. **Nothing is billed and no prompt is built**: the guard runs
+above `_neutralize_fence_markers` and `render_system_prompt`, which matters
+because the prompt is also STORED.
+
+**THE COST IS STATED RATHER THAN DISCOVERED.** A false positive fails a patient
+who would otherwise be matched. On real data a patient named Hunter makes
+``Hunter syndrome`` a hit and word boundaries do not help -- it IS a whole
+word. Synthea's names carry digit suffixes so it is invisible here and would
+not be on a hospital extract. `DEID_REFUSALS`' registry entry says so, and it
+is the one counter in that block whose most likely cause is a false positive.
+
+**WHAT WAS MEASURED BY RUNNING, ALL 1,000 PATIENTS, BEFORE AND AFTER:**
+
+| | |
+|---|---|
+| guard hits against the FULL bundle inventory | **0** |
+| shape rules fired on real clinical text | **0** |
+| ages capped | **313** (age range 20-99; 20 patients are exactly 89) |
+| byte-identical after removing the added `Patient:` line | **687** -- every patient at or under the cap |
+| the other 313, with the exact age put back | **313/313 byte-identical** -- so the only difference for the capped population is the age field |
+| distinct pseudonyms | **1000 of 1000** |
+| FHIR files on disk | **byte-unchanged** |
+
+**ELEVEN OF TWELVE FIXTURES ARE INVALIDATED AND WERE NOT RE-CAPTURED.** This is
+an input change, so the prompt bytes move. `python fixture_replay.py` reports
+**1/12 clean, exit 1**, and the one clean fixture is
+`no_candidates_pediatric_age`, which reaches `node_no_candidates` and never
+renders a prompt. **Only three field families moved and all three are prompt
+HASHES** -- `stage5.llm_classifier_prompt_sha256`,
+`stage5.llm_classifier_combined_prompt_sha256` and
+`stage5.request_sha256_by_call[N]`. **No verdict, score, criterion or
+eligibility field moved.** The recapture happens once, after the whole input
+batch lands.
+
+**`FINGERPRINT_VERSION` IS UNCHANGED AT 3 AND THE DIGEST MOVED.** `deid.py` is
+in `RENDERER_MODULES`, so a v3-stamped artifact answers **FP_CHANGED** naming
+`llm_classifier_renderer_digest` -- which is correct: the renderer genuinely
+changed. The stamp's SHAPE did not, so no FP_VERSION refusal and no consumer
+edit. **`PROMPT_VERSION` is unchanged at 1.9.0** by that file's own rule: the
+TEMPLATE text did not move, only the record interpolated into it, and the
+renderer digest is the mechanical half that covers exactly that.
+
+```bash
+# The de-identification pass. Same shape, same directory. No network, no keys,
+# NO SPEND -- the OpenAI client is a stub that COUNTS AND RAISES, so a guard
+# that failed to fire would make a call and the call itself is the failure --
+# no live Qdrant, NO MODEL LOAD (ONCOTRIAGE_DEFER_LOCAL_MODELS above the
+# imports; torch and transformers asserted absent), no database, no git
+# history, no live server. The three registries the renderer resolves are
+# STUBS installed through oncotriage/agent/deps.py and cleared in a finally
+# whose restore is asserted, which is what lets it run against a checkout with
+# no MeSH lookups and no ICD-10 release. Its ONE corpus section SKIPS on a
+# runner rather than failing (tests/test_storage_write_durability.py's gating
+# shape). It EXECS NOTHING and writes NOTHING anywhere, not even a temp
+# directory; the three repository files it reads are sha256-compared at the
+# end. Every identifier-shaped fixture value is ASSEMBLED at run time and
+# section 11 scans this file with the scanner it tests. Bucket A, ~6 s.
+python tests/test_deid_stage_and_guard.py                           # 137
+```
+
+**FIFTEEN PLANTED REVERTS, FOURTEEN CAUGHT, AND THE FIFTEENTH IS A FINDING
+ABOUT THIS PASS'S OWN CODE RATHER THAN A GAP.** Removing `_cap_age`'s
+`isinstance(age, bool)` exclusion changes NO outcome at the current cap --
+`True` is 1 and `False` is 0, both below 89, so with or without it the answer
+is `(value, False)`. The guard is KEPT as a type contract at the one place an
+age is typed, and both its docstring and the check's label were rewritten to
+say that rather than to claim a live branch. **A guard that cannot change an
+outcome must not be described as one.**
+
+**AND THE HARNESS FOUND A REAL WEAKNESS IN THIS PASS'S OWN TEST.** The check
+that the evaluation harness runs the guard was `"assert_no_identifiers" in
+_harness_src` -- satisfied by the MODULE DOCSTRING that argues for the guard
+and by the IMPORT LINE, so deleting the CALL left it green. **The third time
+this project has met "a file that argues about its own settings cannot be
+grepped for them."** It walks for a real `ast.Call` inside `build_record` now,
+with a non-degeneracy probe that the function was found at all.
+
+**THREE EXISTING TESTS HAD STRUCTURAL CHECKS POINTED AT THE OLD RENDERER AND
+ALL THREE WERE RETARGETED RATHER THAN RELAXED.**
+`tests/test_agent_summary_temporal_tagging.py`'s vocabulary probe parsed
+`_create_patient_summary` -- a three-line wrapper now -- and reported the walk
+as broken, which is the OPPOSITE of what a non-degeneracy control exists to
+say; `tests/test_agent_summary_cancer_stage.py`'s plant anchor carried
+`patient_data.get(...)`; and `tests/test_agent_stage5_input_packing.py`'s
+fence-neutralization control rebound `evaluation._create_patient_summary`,
+which the node no longer resolves -- so the hostile text never reached a prompt
+and c13 reported the neutralizer as broken. **A control that patches the wrong
+seam fails, which makes it look like it is working.** Counts are unchanged
+(216, 56, 116); only outcomes moved.
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **`oncotriage/mcp/server.py` HANDS A MODEL THE RECORD NUMBER, ON THREE
+   SURFACES, AND THIS PASS DID NOT FIX IT.** `_patient_summary` reports
+   `patient_id` and the UNCAPPED exact age; `parse_fhir_bundle_tool` returns
+   the WHOLE parsed record under `patient_data`, `birth_date` included; and
+   `match_patient_tool` returns `result`, which carries `patient_id`. The
+   consumer of an MCP tool result IS a model. It is left because the fix is a
+   contract change to three tool responses whose test needs a live Qdrant for
+   sections 4-6, and shipping an unverified change to a serving surface is
+   worse than reporting a measured one. **Top-ranked follow-up.**
+2. **The bundle inventory does not reach the production guard** (above).
+3. **No fixture covers the de-identified render**, because the twelve are
+   stale until the batch's recapture.
+4. **`GET /match` and `inferences` are unchanged**: `result["patient_id"]` is
+   the DB join key and the API's own contract. Nothing model-facing reads them,
+   which is why they are out of scope rather than overlooked.
 
 ### The identifier exemption is bounded by length (the identifier-cap pass)
 

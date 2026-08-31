@@ -168,6 +168,7 @@ from oncotriage.agent.patient import (
     TEMPORAL_KEY_VARIANT_DATE,
     TEMPORAL_RENDER_COUNTS,
     _create_patient_summary,
+    render_patient_record,
     _elapsed_phrase,
     _event_clause,
     _lab_age_suffix,
@@ -960,11 +961,18 @@ for _fn in (_create_patient_summary, _not_active_marker, _lab_age_suffix,
           f"this passes", len(_called) > 0, True)
     check(f"{_fn.__name__}: calls no clock", sorted(_called & _CLOCK_CALLS), [])
 
+# RETARGETED AT `render_patient_record`. `_create_patient_summary` is a
+# three-line wrapper now -- the de-identification stage and then the render --
+# and the reference-date call lives in the renderer it delegates to. Left
+# pointed at the wrapper this probe found an empty vocabulary and reported the
+# walk as broken, which is the OPPOSITE of what it exists to say: it is the
+# non-degeneracy control for the seven `calls no clock` checks above it, and a
+# non-degeneracy control that fails for the wrong reason is worse than none.
 check("the walk's vocabulary is real: it does find get_age_reference_date "
       "where the renderer calls it",
       "get_age_reference_date" in {
           n.func.id for n in ast.walk(
-              ast.parse(inspect.getsource(_create_patient_summary).lstrip()))
+              ast.parse(inspect.getsource(render_patient_record).lstrip()))
           if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}, True)
 
 

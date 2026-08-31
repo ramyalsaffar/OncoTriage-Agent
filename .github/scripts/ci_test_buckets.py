@@ -1040,6 +1040,30 @@ BUCKETS = {
     "test_registries_cancer_code_claims_audit_control.py": (
         _B, "UMLS MRCONSO*.RRF (it runs the audit above as its baseline)",
         "'File 42 exited 1 with NO defect planted, so a non-zero exit proves nothing'"),
+    "test_deid_stage_and_guard.py": (
+        _A, None,
+        "ran green in 6s, 135 checks / 0 failed / 0 skipped, against the "
+        "developer tree, and its ONE corpus-dependent section SKIPS on a "
+        "runner rather than failing -- tests/test_storage_write_durability.py's "
+        "gating shape, adopted for its reason: a hundred fabricated-input "
+        "checks that need nothing at all must not sit out of CI to preserve "
+        "one probe. The de-identification stage, the age cap, the pseudonym "
+        "and the guard. No network, no keys, NO SPEND -- the OpenAI client is "
+        "a stub that COUNTS AND RAISES, so a guard that failed to fire would "
+        "make a call and the call itself is the failure -- no live Qdrant, no "
+        "model load (ONCOTRIAGE_DEFER_LOCAL_MODELS above the imports; torch "
+        "and transformers asserted absent), no database, no git history, no "
+        "live server. The three registries the renderer resolves are STUBS "
+        "installed through oncotriage/agent/deps.py and cleared in a finally "
+        "whose restore is asserted, which is what lets it run against a "
+        "checkout with no MeSH lookups and no ICD-10 release. It EXECS "
+        "NOTHING and loads no module by location. NOT in the collision "
+        "matrix: it writes nothing anywhere, not even a temp directory, and "
+        "the three repository files it reads are written by neither of the "
+        "suite's two writers and are sha256-compared at the end. Every "
+        "identifier-shaped fixture value is ASSEMBLED at run time from a "
+        "prefix and an arithmetic, and section 11 scans this file with the "
+        "scanner it tests to prove it"),
     "test_degradation_counter_readers.py": (
         _A, None,
         "ran green in 3s, 138 checks, against ONLY the directory skeleton: "

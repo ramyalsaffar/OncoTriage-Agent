@@ -226,6 +226,7 @@ RENDERER_MODULES = (
     "agent/patient.py",
     "agent/prompts.py",
     "constants.py",
+    "deid.py",
     "extraction/stage.py",
     "utils.py",
 )
@@ -253,6 +254,15 @@ closure and fails if it reaches a module that is in neither tuple -- so a
 helper moved to a new module cannot silently escape the digest, which is the
 one rot a hand-written module list is prone to.
 
+    deid.py               the de-identification stage. It decides WHICH
+                          fields exist to be rendered (``RENDERED_FIELDS``,
+                          ``DEMOGRAPHIC_FIELDS``), how an age over
+                          ``AGE_CAP_YEARS`` is written, and how the
+                          ``Patient:`` line's pseudonym is derived -- three
+                          things that move rendered characters. Its exclusion
+                          would be the same silent under-coverage this tuple's
+                          granularity argument rejects, one module further
+                          out.
     agent/patient.py      ``_create_patient_summary`` and every helper that
                           shapes a character of it -- the three relevance
                           classifiers, the nine temporal helpers, the lab unit

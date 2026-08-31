@@ -45,7 +45,8 @@ from oncotriage import config
 from oncotriage.agent import bedrock_adapter
 from oncotriage.agent import bedrock_anthropic_adapter
 from oncotriage.agent import deps
-from oncotriage.agent.patient import _create_patient_summary
+from oncotriage.agent.patient import build_patient_record
+from oncotriage.deid import IdentifierLeakError, assert_no_identifiers
 from oncotriage.agent.prompts import (
     PROMPT_VERSION,
     prompt_sha256,
@@ -3890,8 +3891,91 @@ def node_llm_classifier_evaluation(state: TrialMatchState) -> dict:
                  delay_s=delay)
         time.sleep(delay)
 
-    # Build patient summary
-    patient_summary = _create_patient_summary(patient_data)
+    # ── De-identify, render, and PROVE the render carries no identifier ───
+    #
+    # THE PROMPT BOUNDARY, and the enforcement point. `build_patient_record`
+    # runs oncotriage/deid.py's stage and then the renderer, so the text below
+    # is built from a record that carries exactly deid.RENDERED_FIELDS --
+    # `patient_id`, the one direct identifier that survives parsing, is not a
+    # key of it and no line can print it.
+    #
+    # THAT IS A GUARANTEE ABOUT THE STRUCTURED FIELDS AND NOT ABOUT FREE TEXT.
+    # Condition displays, medication names and observation values are
+    # third-party text this project does not author, and an identifier can
+    # appear inside one. deid.py argues at length why they are not scrubbed --
+    # a redactor cannot tell a city from a condition name and would delete
+    # clinical evidence silently -- so the answer is to SCAN THE RENDERED TEXT
+    # and refuse.
+    #
+    # BEFORE ANY MODEL CALL, AND BEFORE THE PROMPT EXISTS. The scan runs on the
+    # summary, above `_neutralize_fence_markers` and `render_system_prompt`, so
+    # a record that carries an identifier never reaches a prompt string at all
+    # -- which matters because the prompt is also STORED, in
+    # `inferences.llm_classifier_prompt`.
+    deid_record, patient_summary = build_patient_record(patient_data)
+    try:
+        _deid_skipped = assert_no_identifiers(patient_summary, deid_record)
+    except IdentifierLeakError as leak:
+        # FAIL CLEAN, AND WITH THE RETRY BUDGET ALREADY SPENT. Every other
+        # failure return in this node hands the router `retry_count + 1` so a
+        # transport fault gets another attempt; this one hands it
+        # MAX_LLM_CLASSIFIER_RETRIES, which routes straight to the error
+        # handler. The condition is DETERMINISTIC -- the same parsed record
+        # renders the same text and the same scan finds the same value -- so a
+        # retry is guaranteed to fail identically, and the only thing three
+        # attempts would buy is RETRY_BASE_DELAY's backoff sleeps delaying a
+        # batch for a verdict that cannot change. It is
+        # `assert_per_trial_provider_supported`'s argument, one node over: a
+        # configuration or data defect must not arrive as three identical
+        # failed patients.
+        #
+        # NOTHING WAS BILLED AND NOTHING WAS SENT, so every token figure here
+        # is a measured zero rather than an invented one, and `_billed_so_far`
+        # is deliberately not called -- it is not defined yet at this point in
+        # the node, which is itself the proof that no call preceded this.
+        #
+        # THE PATIENT IS RECORDED AS AN ERROR, so `oncotriage/batch/runner.py`
+        # does NOT checkpoint it and a resume re-attempts it. That is what
+        # "resumable" means here: the run does not silently skip the patient,
+        # and it will refuse again until somebody looks at the record.
+        elapsed = time.time() - start
+        error_msg = (f"Stage 5 de-identification guard (attempt "
+                     f"{retry_count + 1}): {leak}")
+        log.error("the rendered patient record carried a direct identifier; "
+                  "the prompt was NOT sent and the patient was failed",
+                  stage=5, status="error", node="llm_classifier_evaluation",
+                  event="deid_guard_refusal",
+                  # THE CLASS, NEVER THE VALUE. `reason` is the allowlisted
+                  # low-cardinality "which of a closed set" field this node
+                  # already logs a warmup rejection under, and
+                  # deid.IDENTIFIER_CLASSES is exactly such a set. The matched
+                  # text is not logged, here or anywhere: a structured log is
+                  # more durable than the prompt this refusal prevented.
+                  reason=",".join(sorted({f.identifier_class
+                                          for f in leak.findings})),
+                  count=len(leak.findings),
+                  error_type=type(leak).__name__)
+        return {
+            "evaluations": [],
+            "llm_classifier_retries": MAX_LLM_CLASSIFIER_RETRIES,
+            "llm_classifier_calls": 0,
+            "llm_classifier_input_tokens": 0,
+            "llm_classifier_output_tokens": 0,
+            "llm_classifier_raw_response": "",
+            "error": error_msg,
+            "llm_classifier_prompt_version": PROMPT_VERSION,
+            "stage_timings": {**state.get("stage_timings", {}),
+                              "llm_classifier_evaluation":
+                                  round(prior_llm_classifier_time + elapsed, 3)},
+        }
+    if _deid_skipped:
+        # THE GUARD'S OWN BLIND SPOT, REPORTED RATHER THAN INFERRED. A
+        # harvested value below deid._MIN_EXACT_MATCH_CHARS was not looked for,
+        # and a scan that silently declined to look for part of its inventory
+        # reads exactly like a clean one.
+        log.info("the de-identification scan skipped short identifier values",
+                 stage=5, node="llm_classifier_evaluation",
+                 event="deid_scan_skipped_short", count=_deid_skipped)
 
     # The trials are rendered by _build_trials_text, per chunk, in
     # _user_prompt_for below. Only eligibility criteria are sent: title,

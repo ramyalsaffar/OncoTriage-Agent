@@ -794,8 +794,15 @@ _PARSER_MODULE = os.path.abspath(_fhir_parser.__file__)
 # satisfies.
 _PATIENT_MODULE = os.path.abspath(_agent_patient.__file__)
 
+# RETARGETED AGAIN BY THE DE-IDENTIFICATION PASS. `_create_patient_summary` is
+# a three-line wrapper now -- the de-identification stage and then the render --
+# and the ECOG section it is checked for lives in `render_patient_record`, which
+# is what it delegates to. Left pointed at the wrapper the non-degeneracy check
+# below FAILED, which is the check doing its job: it exists precisely because
+# the two assertions under it are "this string is ABSENT", and a three-line
+# body satisfies both for the wrong reason.
 _PROVEN_PATH = (
-    (_PATIENT_MODULE, "_create_patient_summary"),
+    (_PATIENT_MODULE, "render_patient_record"),
     (_PATIENT_MODULE, "compute_patient_hash"),
     (_PARSER_MODULE,  "_parse_ecog_observation"),
     (_PARSER_MODULE,  "_select_ecog_performance_status"),

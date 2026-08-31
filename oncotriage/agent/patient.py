@@ -35,6 +35,7 @@ from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 from dateutil.relativedelta import relativedelta
 
 from oncotriage.agent import deps
+from oncotriage.deid import DeidentifiedRecord, deidentify
 from oncotriage.agent.state import GENOMIC_VARIANT_LOINC, _VARIANT_TEXT_PATTERN
 from oncotriage.config import MAX_VARIANT_TERMS, STALE_LAB_AGE_DAYS
 from oncotriage.extraction.stage import (
@@ -1639,9 +1640,82 @@ if set(_STAGE_SOURCE_PHRASES) != set(STAGE_SOURCES):
     )
 
 
+def build_patient_record(
+    patient_data: Dict,
+    source_bundle: Optional[Dict] = None,
+) -> Tuple[DeidentifiedRecord, str]:
+    """THE STAGE AND THE RENDER, in the one order they may happen in.
+
+    Parsed record -> de-identified record -> rendered text. The pair is
+    returned because Stage 5 needs BOTH: the text goes into the prompt and the
+    record carries the identifier inventory ``deid.assert_no_identifiers``
+    scans that text against. A caller that took only the text would have to
+    rebuild the record to run the guard, and two builds of one patient is two
+    things that can disagree.
+
+    Args:
+        patient_data: ``parse_fhir_bundle``'s output. READ, NEVER MUTATED --
+            ``compute_patient_hash`` must keep reading exactly the record it
+            read before this stage existed, and it does: the hash is computed
+            from ``patient_data`` and never from the de-identified copy.
+        source_bundle: the decoded FHIR bundle, when the caller has one. It
+            widens the guard's inventory from "what the parser kept" to "what
+            the source carried". Optional because the graph holds only the
+            parsed record by the time Stage 5 runs; see oncotriage/deid.py's
+            three layers and the gap it names.
+
+    THE IDENTITY IS COMPUTED HERE, not inside ``deidentify``. That function
+    imports nothing from this project -- it is on the render path, and
+    ``run_fingerprint.RENDERER_MODULES`` hashes that path's transitive closure
+    -- so it cannot call ``compute_patient_hash``, which lives in this module,
+    which imports it. Passing the identity in is what keeps the edge one-way.
+
+    The cost is one extra ``compute_patient_hash`` per patient per render,
+    measured at 1.96 ms on the largest bundle in the corpus (3,660
+    observations) against a per-patient pipeline time of about 68 seconds.
+    """
+    identity = compute_patient_hash(patient_data)
+    record = deidentify(patient_data, identity=identity,
+                        source_bundle=source_bundle)
+    return record, render_patient_record(record)
+
+
 def _create_patient_summary(patient_data: Dict) -> str:
+    """The rendered patient record. Signature and return unchanged.
+
+    KEPT AS THE ENTRY POINT EVERY OTHER CALLER USES -- the evaluation harness
+    and ten test files call it with a parsed dict -- so the de-identification
+    stage is not something a caller can forget to run. It is not possible to
+    reach the renderer with a raw parsed record any more: ``render_patient_record``
+    takes a ``DeidentifiedRecord``, and the only thing that builds one is
+    ``deid.deidentify``.
+
+    What it CANNOT do is hand back the identifier inventory, so a caller that
+    wants the guard calls ``build_patient_record`` instead. Stage 5 does.
+    """
+    return build_patient_record(patient_data)[1]
+
+
+def render_patient_record(record: DeidentifiedRecord) -> str:
     """
     Create compact patient summary for GPT-4o criterion-level evaluation.
+
+    ITS INPUT IS A DE-IDENTIFIED RECORD AND THAT IS THE GUARANTEE. This
+    function used to take ``parse_fhir_bundle``'s output whole, so "no direct
+    identifier is printed" was a property of which keys these 650 lines
+    happened to read -- true, measured across all 1,000 corpus patients, and
+    one edit away from stopping being true. It now takes a
+    ``deid.DeidentifiedRecord``, whose ``fields`` carry exactly
+    ``deid.RENDERED_FIELDS`` and whose demographics carry exactly
+    ``deid.DEMOGRAPHIC_FIELDS``. ``patient_id`` -- the one direct identifier
+    that survives parsing -- is not a key of it, so no line here can print it,
+    and reaching for an eleventh key raises rather than yielding ``None``.
+
+    THE SECTIONS BELOW ARE OTHERWISE UNCHANGED, character for character. Every
+    ``patient_data[...]`` became ``record.fields[...]``; nothing else in the
+    body moved, and the only rendered difference for a patient at or under
+    ``deid.AGE_CAP_YEARS`` is the ``Patient:`` line this pass adds above the
+    demographics.
 
     Sections:
       Demographics      : age, sex, race, ethnicity
@@ -1724,16 +1798,36 @@ def _create_patient_summary(patient_data: Dict) -> str:
     # is a configuration defect and belongs at the caller.
     reference_date = get_age_reference_date()
 
-    demographics = patient_data["demographics"]
-    conditions   = patient_data["conditions"]
-    medications  = patient_data["medications"]
-    observations = patient_data.get("observations") or []
-    procedures   = patient_data.get("procedures") or []
-    allergies    = patient_data.get("allergies") or []
-    ecog         = patient_data.get("ecog_performance_status") or {}
+    demographics = record.fields["demographics"]
+    conditions   = record.fields["conditions"]
+    medications  = record.fields["medications"]
+    observations = record.fields.get("observations") or []
+    procedures   = record.fields.get("procedures") or []
+    allergies    = record.fields.get("allergies") or []
+    ecog         = record.fields.get("ecog_performance_status") or {}
+
+    # ── Identity ──────────────────────────────────────────────────────────
+    # THE PSEUDONYM, AND NOTHING ELSE. This record used to be rendered with no
+    # identity line at all, which is the most private thing it could have done
+    # and also left a per-trial wave of requests carrying a record no reader of
+    # a stored prompt could tie to anything.
+    #
+    # ITS MARGINAL DISCLOSURE IS ZERO, and that is the argument for printing it
+    # rather than a tolerance. The token is a function of
+    # ``compute_patient_hash(patient_data)``, which is a function of the
+    # clinical record -- and the whole of that record is already in this same
+    # prompt, below this line. Anyone who can act on the pseudonym already
+    # holds everything it was derived from. It is not derived from
+    # ``patient_id`` and cannot be inverted to one without the local database;
+    # oncotriage/deid.py argues both.
+    #
+    # PT-unidentified is a real, expected value: a caller rendering a
+    # hand-built record has no clinical hash to derive from. It says "this
+    # record carries no identity", never "this is patient X".
+    summary = f"Patient: {record.pseudonym}\n\n"
 
     # ── Demographics ──────────────────────────────────────────────────────
-    summary = (
+    summary += (
         f"Age: {demographics.get('age', 'unknown')} | "
         f"Sex: {demographics.get('sex', 'unknown')} | "
         f"Race: {demographics.get('race', 'unknown')} | "
@@ -1817,8 +1911,8 @@ def _create_patient_summary(patient_data: Dict) -> str:
     # tiers, applied without any of the guards the extractor applies.
     stage_ordinal, stage_source = extract_patient_stage_with_source(
         conditions,
-        cancer_stage_observations=patient_data.get('cancer_stage_observations') or [],
-        cancer_metastasis_observations=patient_data.get('cancer_metastasis_observations') or [],
+        cancer_stage_observations=record.fields.get('cancer_stage_observations') or [],
+        cancer_metastasis_observations=record.fields.get('cancer_metastasis_observations') or [],
     )
     if stage_ordinal is not None:
         summary += (f"\n\nCancer Stage: {STAGE_NUMERALS[stage_ordinal]} "
@@ -2232,7 +2326,7 @@ def _create_patient_summary(patient_data: Dict) -> str:
     # deduplicated/filtered by OncologyLabRegistry. Rendered first since
     # they are structured and higher-fidelity than keyword-matched obs.
     mcode_variants = lab_registry.filter_relevant_genomic_variants(
-        patient_data.get('cancer_genomic_variants') or []
+        record.fields.get('cancer_genomic_variants') or []
     )
     mcode_lines = []
     for v in mcode_variants:
@@ -2257,7 +2351,7 @@ def _create_patient_summary(patient_data: Dict) -> str:
     # "N0-N1 only" is an N question, and the display text alone
     # ("Lymph nodes with micrometastases [#] ...") does not say which axis it
     # is on unless the reader already knows the LOINC.
-    metastasis_obs = patient_data.get("cancer_metastasis_observations") or []
+    metastasis_obs = record.fields.get("cancer_metastasis_observations") or []
     summary += "\nMetastasis & Nodal Status:\n"
     if metastasis_obs:
         for obs in metastasis_obs:

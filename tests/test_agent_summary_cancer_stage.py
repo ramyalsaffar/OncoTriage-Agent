@@ -528,11 +528,18 @@ print("the file on disk is hashed before and after and asserted byte-identical."
 _IS_NOT_NONE = "    if stage_ordinal is not None:"
 _ABSENCE_BRANCH = ('        summary += "\\n\\nCancer Stage: not recorded in '
                    'this record\\n"')
+# RETARGETED WITH THE RENDERER'S PARAMETER. `_create_patient_summary` used to
+# BE the renderer and take the parsed record whole; it is a wrapper now, and
+# `render_patient_record` takes a deid.DeidentifiedRecord -- so these two reads
+# are `record.fields.get(...)`. THE ANCHOR IS RE-DERIVED FROM THE SHIPPED
+# SOURCE rather than retyped a second time, because a plant that no longer
+# matches reports MISSED against a check that works, which is the shape this
+# project has already paid for once.
 _EXTRACTOR_CALL = (
     "    stage_ordinal, stage_source = extract_patient_stage_with_source(\n"
     "        conditions,\n"
-    "        cancer_stage_observations=patient_data.get('cancer_stage_observations') or [],\n"
-    "        cancer_metastasis_observations=patient_data.get('cancer_metastasis_observations') or [],\n"
+    "        cancer_stage_observations=record.fields.get('cancer_stage_observations') or [],\n"
+    "        cancer_metastasis_observations=record.fields.get('cancer_metastasis_observations') or [],\n"
     "    )")
 
 # 1. THE TRUTHINESS TRAP -- the defect section 2 exists to catch, and the one

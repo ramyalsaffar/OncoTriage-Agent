@@ -95,6 +95,7 @@ from oncotriage import paths
 from oncotriage.ablation import study as _study
 from oncotriage.agent import evaluation as _evaluation
 from oncotriage.agent import patient as _patient
+from oncotriage import deid as _deid
 from oncotriage.batch import runner as _runner
 from oncotriage.retrieval import indexer as _indexer
 from oncotriage.storage import database_logger as _dl
@@ -1028,13 +1029,18 @@ print("\n" + "=" * 74)
 print("7. the census counters have a reader, and it is not the degradation one")
 print("=" * 74)
 
-check("the census registry holds exactly the four counters the degradation "
-      "registry excludes for moving on correct behaviour",
+check("the census registry holds exactly the five counters the degradation "
+      "registry excludes for moving on correct behaviour. DEID_CENSUS is the "
+      "fifth: a capped age is oncotriage/deid.py's stage working, not a fault, "
+      "so it is here and DEID_REFUSALS -- which counts patients that were NOT "
+      "evaluated -- is in the degradation block instead",
       sorted(degradation.census_names()),
-      ["PROCEDURE_RENDER_COUNTS", "TEMPORAL_CONFLICT_ACTIVE_MARKERS",
+      ["DEID_CENSUS", "PROCEDURE_RENDER_COUNTS",
+       "TEMPORAL_CONFLICT_ACTIVE_MARKERS",
        "TEMPORAL_CONFLICT_RESOLVED_MARKERS", "TEMPORAL_RENDER_COUNTS"])
 
-for _name, _obj in (("PROCEDURE_RENDER_COUNTS", _patient.PROCEDURE_RENDER_COUNTS),
+for _name, _obj in (("DEID_CENSUS", _deid.DEID_CENSUS),
+                    ("PROCEDURE_RENDER_COUNTS", _patient.PROCEDURE_RENDER_COUNTS),
                     ("TEMPORAL_RENDER_COUNTS", _patient.TEMPORAL_RENDER_COUNTS),
                     ("TEMPORAL_CONFLICT_RESOLVED_MARKERS",
                      _evaluation.TEMPORAL_CONFLICT_RESOLVED_MARKERS),
@@ -1050,8 +1056,12 @@ try:
     _empty = degradation.census_snapshot()
     check("a zero census snapshots to nothing", _empty, {})
     _empty_text = "\n".join(degradation.census_report_lines(_empty))
+    # DERIVED FROM THE REGISTRY, NOT RETYPED. The number was the literal 4 and
+    # went stale the first time a census counter was added, which is the shape
+    # this file exists to catch one layer up.
     check_true("...and the block SAYS SO rather than printing nothing",
-               "All 4 census counters are zero" in _empty_text)
+               f"All {len(degradation.census_names())} census counters are "
+               f"zero" in _empty_text)
     # A CENSUS HAS NO VERDICT TO GIVE. The degradation block's zero case says
     # "CLEAN"; this one must not, because zero here on a run that matched
     # patients is itself a finding.

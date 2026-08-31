@@ -32,7 +32,13 @@ One JSON per patient plus a manifest, all under ``--output-dir``:
                       and the priced cost. A rating produced against one prompt
                       version is not evidence about another.
   patient_summary     the EXACT text Stage 5 was shown, via
-                      ``_create_patient_summary``. An LLM rater judging whether
+                      ``build_patient_record`` -- the de-identification stage
+                      and the renderer, in that order, which is the pair Stage
+                      5 calls. It is scanned by
+                      ``deid.assert_no_identifiers`` before it is stored, and
+                      a hit leaves this field null with the reason in
+                      ``problems`` rather than writing an identifier into a
+                      persisted artifact. An LLM rater judging whether
                       a criterion decision follows from the patient record has
                       to see the record the decider saw, not a re-derivation of
                       it.
@@ -48,7 +54,7 @@ One JSON per patient plus a manifest, all under ``--output-dir``:
                       the unit both evaluators are sized in.
 
 BOTH RENDERERS ARE IMPORTED, NEVER REIMPLEMENTED. ``_build_trials_text`` and
-``_create_patient_summary`` are the functions Stage 5 itself calls. A local copy
+``build_patient_record`` are the functions Stage 5 itself calls. A local copy
 would agree with the pipeline on the day it was written and drift silently
 afterwards, and the whole value of this artifact is that the text in it is the
 text the model saw. Both are deliberately criteria-only on the trial side: the
@@ -117,7 +123,8 @@ from oncotriage import paths
 from oncotriage.agent import readiness
 from oncotriage.agent.evaluation import _build_trials_text
 from oncotriage.agent.graph import build_initial_state, build_matching_graph
-from oncotriage.agent.patient import _create_patient_summary, compute_patient_hash
+from oncotriage.agent.patient import build_patient_record, compute_patient_hash
+from oncotriage.deid import assert_no_identifiers
 from oncotriage.agent.prompts import PROMPT_VERSION
 from oncotriage.agent.state import EXPANSION_PATH_FALLBACK
 from oncotriage.config import (
@@ -761,8 +768,26 @@ def build_record(row: Dict,
     summary_text = None
     summary_error = None
     try:
-        summary_text = _create_patient_summary(patient_data)
+        # THE SAME STAGE AND THE SAME GUARD STAGE 5 RUNS, for the same reason
+        # one file down: this text is PERSISTED, into a record an LLM rater
+        # then reads, so it is an artifact with a longer life than the prompt.
+        #
+        # IT IS NOT REDUNDANT WITH STAGE 5's. A run that ended at
+        # node_no_candidates never entered Stage 5, so its guard never ran, and
+        # this is the only thing standing between that patient's record and the
+        # rater. On a run that DID reach Stage 5 the scan is a repeat and finds
+        # nothing, which costs one pass over the text.
+        #
+        # A LEAK HERE IS RECORDED, NOT RAISED, and that is this function's own
+        # rule rather than a weakening of the guard: everything here happens
+        # AFTER the billed call, so there is nothing left to refuse. The
+        # existing handler catches IdentifierLeakError like any other, leaves
+        # `summary_text` None -- so the identifier is not written to the record
+        # -- and names the failure in `problems`.
+        _deid_record, summary_text = build_patient_record(patient_data)
+        assert_no_identifiers(summary_text, _deid_record)
     except Exception as exc:                         # noqa: BLE001 -- recorded
+        summary_text = None
         summary_error = f"{type(exc).__name__}: {exc}"
         problems.append(f"patient summary: {summary_error}")
 
