@@ -654,6 +654,68 @@ check("3g  Section 5 counts the trials in the user message, not the batch",
 check("3h  ...and no batch-wide count survives anywhere in the template",
       re.search(r"Evaluate ALL \d+ trials", _SYS), None)
 
+# THE TEMPLATE'S OWN SHARE OF THE PACKING BUDGET, PINNED -- AND THE COUPLING IT
+# MAKES VISIBLE HAS BEEN UNMEASURED SINCE 1.6.0 PUT THE RECORD IN HERE.
+#
+# `fixed_input_tokens` is charged to EVERY chunk (the docstring of
+# pack_trials_by_input_tokens says why: the model reads one prompt, so a budget
+# that ignored half of it would not be a budget). The system message is most of
+# that figure. So every paragraph added to the template comes out of the trial
+# budget of every grouped request, for every patient, forever -- and a patient
+# sitting within the addition's width of a chunk boundary silently gains a whole
+# extra billed request.
+#
+# THAT IS NOT HYPOTHETICAL AND THE NUMBER IS ON THE RECORD. PROMPT_VERSION
+# 1.10.0 added 514 characters -- 128 estimated tokens, 1.07% of the budget --
+# and REPARTITIONED SIX of the eleven characterization fixtures that carry a
+# Stage 5 exchange, measured by packing each fixture's own recorded trial blocks
+# under both templates:
+#
+#     3 gained a whole chunk   llm_classifier_parse_retry_constructed 2 -> 3,
+#                              mesh_fallback_siteless_code 4 -> 5, normal_3 1 -> 2
+#     3 kept the count and     normal_1, normal_2, truncation_split
+#       moved the boundaries
+#     5 identical
+#
+# 55% of that sample repartitioned on a 1% change, because a trial block is
+# large relative to what is left of the budget once this template and a patient
+# record are paid for. THE SECOND ROW MATTERS AS MUCH AS THE FIRST and is the
+# one a call-count check would miss: the same number of requests carrying
+# different trials is a different set of judgements, which is why the fixture
+# replay reports normal_1 at 54 differing fields with no extra call at all.
+# 1.7.0, 1.8.0 and 1.9.0 each added text and none of them measured any of this.
+#
+# WHAT THE PIN IS FOR, AND WHY IT IS EXACT. It fails on any template edit, which
+# is the same discipline PROMPT_VERSION already carries and is the point: the
+# packing cost of a prompt change should be a number a human consented to, in
+# the same commit as the version bump, rather than a call-count change nobody
+# notices until a bill. The fix on failure is to read the new number, decide it
+# is acceptable, and record it here.
+#
+# IT DOES NOT BOUND PRODUCTION TODAY, and saying so is not softening it.
+# MATCHING_PER_TRIAL_CALLS_ENABLED ships True and the per-trial branch BYPASSES
+# the packer outright (oncotriage/agent/evaluation.py, the `if _per_trial_calls`
+# arm), so the shipped arm's request count is MAX_TRIALS_FOR_EVALUATION whatever
+# this number is. The exposure is the retained GROUPED comparison arm -- which
+# is exactly the arm the twelve fixtures pin, and the arm any grouped-vs-
+# per-trial cost comparison is computed over.
+_TEMPLATE_ONLY_TOKENS = {
+    True:  estimate_prompt_tokens(render_system_prompt(True, "unrecorded", "")),
+    False: estimate_prompt_tokens(render_system_prompt(False, "unrecorded", "")),
+}
+check("3i  the template's own fixed cost, per chunk, per variant -- pinned so "
+      "a prompt edit's packing cost is consented to rather than discovered",
+      _TEMPLATE_ONLY_TOKENS, {True: 5414, False: 5534})
+check("3j  ...and that is the share of MATCHING_INPUT_TOKEN_BUDGET the "
+      "template spends before one byte of patient record or trial text",
+      {k: round(100.0 * t / config.MATCHING_INPUT_TOKEN_BUDGET, 1)
+       for k, t in _TEMPLATE_ONLY_TOKENS.items()},
+      {True: 45.1, False: 46.1})
+check("3k  non-degeneracy: the unconfirmed variant really is the dearer of the "
+      "two, so the pin above is over two different numbers rather than one "
+      "measured twice",
+      _TEMPLATE_ONLY_TOKENS[False] > _TEMPLATE_ONLY_TOKENS[True], True)
+
 # THE USER MESSAGE. _user_prompt_for is a closure and cannot be imported; its
 # BYTES are pinned by tests/test_agent_user_message_snapshot.py. What is checked
 # here is the property that file cannot state on its own -- that the two halves

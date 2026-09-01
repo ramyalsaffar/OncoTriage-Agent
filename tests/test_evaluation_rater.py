@@ -993,17 +993,36 @@ check("7d  ...and the rubric still carries RULE 4's reference date, surfaced "
 # by a lift that had stopped working; the pair pins the boundary itself.
 _R19_IN = ("Quote the record's stated interval for that event verbatim in "
            "patient_value")
-_R19_OUT = ("For any time-window criterion: the record's stated interval, "
-            "quoted verbatim, decides it.")
-check("7d' non-degeneracy: both 1.9.0 sentences ARE in the rendered prompt, so "
-      "the two checks below are about the span boundary rather than about a "
-      "template that lost them",
-      (_R19_IN in _ONE, _R19_OUT in _ONE), (True, True))
+# 1.10.0 REWROTE THIS SENTENCE AND THE STALE LITERAL WOULD HAVE PASSED FOR THE
+# WRONG REASON. `_R19_OUT in _RUBRIC` is False for a sentence the template no
+# longer contains at all, so the "does NOT reach the rubric" check below would
+# have stayed green over a reminder that had been deleted outright. What catches
+# that is the non-degeneracy check under it -- both sentences must be in the
+# RENDERED prompt first -- and it is the reason that check exists.
+_R19_OUT = ("For any time-window criterion: an ONGOING condition or medication "
+            "is inside the window whatever its interval says; otherwise the "
+            "record's stated interval, quoted verbatim, decides it.")
+# 1.10.0's OTHER edit, the RULE 4 gate. It rides INSIDE `evaluation_rules`, like
+# 1.9.0's branch and for a sharper reason: a rater still holding 1.9.0's rule
+# would score a "violated" written on a 29-year-old ACTIVE condition as a defect
+# of the classifier, and disagree for rubric mismatch rather than for decision
+# quality -- which is the confound this harness exists to remove.
+_R110_IN = ("is present NOW and therefore present within any window reaching "
+            "the reference date, whatever its interval")
+check("7d' non-degeneracy: all three pinned sentences ARE in the rendered "
+      "prompt, so the checks below are about the span boundary rather than "
+      "about a template that lost them",
+      (_R19_IN in _ONE, _R19_OUT in _ONE, _R110_IN in _ONE),
+      (True, True, True))
 check("7d' 1.9.0's RULE 4 branch DOES reach the lifted rubric, so the rater "
       "judges time windows under the classifier's own rule",
       _R19_IN in _RUBRIC, True)
 check("7d' ...and its FINAL REMINDER line does NOT, on 1.7.0's precedent",
       _R19_OUT in _RUBRIC, False)
+check("7d'' 1.10.0's ongoing gate DOES reach the lifted rubric, so the rater "
+      "judges an ongoing event inside the window exactly as the classifier is "
+      "told to",
+      _R110_IN in _RUBRIC, True)
 # WHICH span carries it, sliced per span rather than searched in the assembled
 # rubric: "somewhere in the rubric" would also be satisfied by a boundary that
 # had drifted and swept the branch into a neighbour, which would ship the rater a
@@ -1013,6 +1032,11 @@ _R19_SPANS = [n for n, (s, e) in _SPAN_BY_NAME.items()
 check("7d' ...and the branch lands in `evaluation_rules` specifically, not in "
       "some other span that drifted over it",
       _R19_SPANS, ["evaluation_rules"])
+_R110_SPANS = [n for n, (s, e) in _SPAN_BY_NAME.items()
+               if _R110_IN in str(drive(R._slice_span, _ONE, s, e, n))]
+check("7d'' ...and so does 1.10.0's gate, in the same span and not a neighbour "
+      "that drifted over it",
+      _R110_SPANS, ["evaluation_rules"])
 
 check("7e  the meta digests one sha per span, keyed by the span names",
       sorted(_META.get("span_sha256") or {}),

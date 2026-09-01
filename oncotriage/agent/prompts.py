@@ -355,7 +355,98 @@ from oncotriage.utils import get_age_reference_date
 # REMINDER lines; every rubric span marker, so oncotriage/evaluation/rater.py
 # slices unchanged. The fixture SCHEMA_VERSION is untouched -- this is a prompt
 # edit, not a recording-format edit -- and no model call was made in this pass.
-PROMPT_VERSION = "1.9.0"
+#
+# 1.10.0 RULED THAT AN ONGOING EVENT IS INSIDE EVERY LOOKBACK WINDOW, AND THAT
+# IS A CORRECTION RATHER THAN A CLARIFICATION. 1.9.0's branch was not silent on
+# the case: it said the stated interval DECIDES the window, and the FINAL
+# REMINDER said so again in the last line the model reads. Every interval this
+# record prints is anchored to an ONSET or a START -- 1.8.0's own paragraph five
+# lines above says so and says the record carries no end date for a condition at
+# all -- so on a patient whose diabetes is marked `active` with `onset 29 years
+# before reference date`, the shipped rule instructed the model to compare 29
+# years against "within the last 12 months" and answer OUTSIDE. The condition
+# began before the window opened and never resolved; it is present throughout
+# the window. The prompt implied the wrong answer and stated it twice.
+#
+# WHAT THE RULING IS. A criterion with a lookback window asks whether the
+# patient HAD the thing during the window. An event the record marks ongoing was
+# present during it whatever its onset, so it falls inside: inclusion -> "met",
+# exclusion -> "violated". This is also the standing fail-safe direction. A
+# "not_violated" written over an ongoing excluded condition passes the patient
+# silently into `eligible`, where nothing downstream can see that the criterion's
+# own subject is documented and current; a "violated" puts the trial in the
+# near-miss list a human reads. False keep beats false drop, and flagged beats
+# silent, in that order.
+#
+# ONE PRINCIPLE, TWO FAMILIES, AND THE MEDICATION HALF WAS ALREADY HALF-ANSWERED.
+# Conditions render `active | 1997 | onset 29 years before reference date` and
+# medications render `status: active | (start: 2001-01-01, 25 years before
+# reference date)`; the shape is identical -- an old anchor date, no end, and a
+# status word saying it is still running. RULE 2 already says an active
+# medication is "current therapy", which is the right answer and is not an
+# instruction about a WINDOW, and the branch below is where a window is decided.
+# So the rule is written once, over both families, keyed on the status word each
+# renders. Two phrasings would be two things to keep in step.
+#
+# THE ONGOING TEST IS FIRST, AND THAT IS THE 1.7.0/1.9.0 FINDING APPLIED AGAIN.
+# Placed after the interval comparison it would be an exception a model reading
+# in order never reaches, because the first line already produced an answer. It
+# is a gate, in RULE 1's shape.
+#
+# WHAT IS DELIBERATELY NOT ONGOING. `unknown`, `unconfirmed`, and a condition
+# with no status at all fall to the OTHERWISE line and are decided by the
+# interval exactly as before. The GLOBAL INVARIANT has zero exceptions and
+# absence of a status is not evidence that a condition is running -- reading it
+# as ongoing would manufacture a disqualification out of missing data, which is
+# the same fabrication as a wrong rewrite pointing the other way. Note the one
+# place the record cannot make that distinction for the model and does not
+# pretend to: oncotriage/agent/patient.py renders `status: active` for a
+# medication whose parsed status is `unknown`, which is RULE 2's own collapse and
+# predates this bump.
+#
+# THE CONVERSE IS "UNCHANGED", NOT "JUDGED BY ITS SPAN", AND THE DIFFERENCE IS A
+# FACT ABOUT THE RECORD. A resolved condition has no rendered end date -- the
+# parser extracts none -- so its span is not knowable and a rule telling the
+# model to intersect it with a window would ask for arithmetic over a date the
+# record does not carry, which is the fabrication 1.8.0's "It is never a
+# resolution date" exists to forbid. A completed medication DOES render an end
+# date, and RULE 2 already sends the model to it. So the OTHERWISE line says only
+# that the two lines below it govern, and adds no new claim in either family.
+#
+# THE FINAL REMINDER HAD TO MOVE WITH IT, and this is the one part of the edit
+# that is not optional. "For any time-window criterion: the record's stated
+# interval, quoted verbatim, decides it" is false of an ongoing event under the
+# new rule, and it sits in the last thing the model reads -- the placement 1.7.0
+# MEASURED the model acting on. Shipping the RULE 4 gate under a reminder that
+# still contradicts it would leave the contradiction at the point of action and
+# nowhere else. The line now states the ongoing case first and the interval case
+# after it, in RULE 4's own order.
+#
+# MIDDLE NUMBER. A time-window verdict this template previously produced is now
+# the opposite verdict. That is meaning, twice over.
+#
+# TWO AUDIENCES, exactly as 1.9.0 records. The RULE 4 gate rides inside the
+# `evaluation_rules` span (oncotriage/evaluation/rater.py:_RUBRIC_SPANS), so the
+# independent rater judges an ongoing event under the classifier's own rule --
+# which is required rather than tidy, since a rater holding 1.9.0's rule would
+# score this classifier's "violated" on a 29-year-old active condition as a
+# defect, and disagree for rubric mismatch rather than for decision quality. The
+# FINAL REMINDER lies OUTSIDE every lifted span and the rater does not receive
+# it, on 1.7.0's precedent.
+#
+# WHAT DID NOT MOVE: the JSON template's field set, field order and example
+# values; the section order; every section heading and marker line; the response
+# schema; Section 2's two variants and the branch that selects them; the fenced
+# patient-record block; the GLOBAL INVARIANT and the disqualification proof
+# requirement; RULE 4's reference date, its 1.8.0 paragraph, its past-tense
+# branch and its active/current branch; RULE 2; C8, which defers to RULE 4 by
+# name for exactly this question; 1.7.0's Section 5 check and both of its FINAL
+# REMINDER lines; 1.9.0's quote-into-patient_value sentence and its coarseness
+# fallback, both carried through verbatim; every rubric span marker, so
+# oncotriage/evaluation/rater.py slices unchanged. The fixture SCHEMA_VERSION is
+# untouched -- this is a prompt edit, not a recording-format edit -- and no model
+# call was made in this pass.
+PROMPT_VERSION = "1.10.0"
 
 
 def prompt_sha256(rendered_text: str) -> str:
@@ -628,7 +719,8 @@ ELAPSED TIME IS STATED FOR YOU. Wherever the patient record prints a date, it al
     Where a date is absent, unreadable, or later than the reference date, no interval is printed. Absence of an interval is not evidence of anything; the GLOBAL INVARIANT governs.
 
 If the criterion contains a time window:
-    Quote the record's stated interval for that event verbatim in patient_value, and classify by comparing that interval to the window. Never compute an interval the record already states.
+    FIRST, is the event ONGOING? A condition whose status is active, recurrence or relapse, or a medication whose status is active, is present NOW and therefore present within any window reaching the reference date, whatever its interval: the interval dates its onset or start, never its end. Quote that status beside the interval; inclusion -> "met", exclusion -> "violated".
+    OTHERWISE the event is not marked ongoing. Quote the record's stated interval for that event verbatim in patient_value, and classify by comparing that interval to the window. Never compute an interval the record already states.
     If no interval is stated, or the stated one is too coarse to decide this window: quote the raw date instead; if the date cannot decide the window either, classification = "not_evaluable".
 
 If the criterion uses past-tense wording ("history of", "prior", "previous"):
@@ -770,7 +862,7 @@ A trial can ONLY be classified "not_eligible" if you can quote explicit patient 
 
 Evidence that a condition is RESOLVED, inactive or in remission does not contradict a criterion requiring an active or current one. Under RULE 4 that criterion is "not_evaluable" (inclusion) or "not_violated" (exclusion), never a disqualifier.
 
-For any time-window criterion: the record's stated interval, quoted verbatim, decides it. Never your own arithmetic.
+For any time-window criterion: an ONGOING condition or medication is inside the window whatever its interval says; otherwise the record's stated interval, quoted verbatim, decides it. Never your own arithmetic.
 
 A trial is never "not_eligible" because another trial in this message was. Each verdict is reached from that trial's own criteria alone (C4).
 """

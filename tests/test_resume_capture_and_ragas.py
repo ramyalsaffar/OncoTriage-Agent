@@ -199,7 +199,25 @@ ENV_A = {
     "data_snapshot_date": "2026-01-01",
     "tunables": {},
 }
-PROMPT_A = "1.9.0"
+# THE LIVE VERSION, NOT A LITERAL, AND THE FILE'S OWN DESIGN ALREADY SAID SO.
+# make_fixture's docstring records that the SCHEMA version defaults to the live
+# one "so load_fixture's gate passes"; the PROMPT version was a hardcoded
+# "1.9.0" standing for the same idea, and PROMPT_VERSION 1.10.0 made every one
+# of the 22 checks below fail -- not because the resume gate broke but because
+# the gate CORRECTLY reported every synthetic fixture as stale against a version
+# this file had frozen. What is under test here is the gate's LOGIC, and a
+# version bump must cost that nothing: sections 1e and 2 supply an explicitly
+# OLDER version where a mismatch is the subject, which is what makes those
+# checks about the comparison rather than about which string is current.
+PROMPT_A = cap.PROMPT_VERSION
+# One version that is definitively not the live one, for the mismatch arms.
+# DERIVED so it can never collide with PROMPT_A, which a literal can when the
+# live version is bumped backwards or to the same string.
+PROMPT_OLD = "0.0.1-not-the-live-version"
+if PROMPT_OLD == PROMPT_A:                       # not `assert`: -O deletes those
+    raise RuntimeError(
+        "the stale-version stand-in equals the live PROMPT_VERSION, so every "
+        "mismatch arm below would silently become a no-op that passes")
 
 
 def make_fixture(fixture_id, environment=ENV_A, prompt_version=PROMPT_A,
@@ -281,12 +299,12 @@ skip, outcome, detail = cap.resume_decision("torn", ENV_A, ROOT1, PROMPT_A)
 check("1d  a TRUNCATED fixture is CAPTURED and does not raise",
       skip is False and outcome == cap.RESUME_UNREADABLE, (skip, outcome))
 
-cap.write_fixture(make_fixture("old_prompt", prompt_version="1.8.0"), ROOT1)
+cap.write_fixture(make_fixture("old_prompt", prompt_version=PROMPT_OLD), ROOT1)
 skip, outcome, detail = cap.resume_decision("old_prompt", ENV_A, ROOT1, PROMPT_A)
 check("1e  a different PROMPT VERSION is CAPTURED",
       skip is False and outcome == cap.RESUME_PROMPT_VERSION, (skip, outcome))
-check("1e  ...naming both versions", "'1.8.0'" in detail and "'1.9.0'" in detail,
-      detail)
+check("1e  ...naming both versions",
+      f"{PROMPT_OLD!r}" in detail and f"{PROMPT_A!r}" in detail, detail)
 
 cap.write_fixture(make_fixture("old_model", model="gpt-4o-2024-08-06"), ROOT1)
 skip, outcome, detail = cap.resume_decision("old_model", ENV_A, ROOT1, PROMPT_A)
@@ -707,7 +725,7 @@ ROOT_REDERIVE = tempfile.mkdtemp(prefix="resume_rederive_")
 for fid in ALL_IDS:
     cap.write_fixture(make_fixture(fid), ROOT_REDERIVE)
 cap.write_fixture(make_fixture("mesh_fallback_siteless_code",
-                               prompt_version="1.8.0",
+                               prompt_version=PROMPT_OLD,
                                donor_bundle=DONOR_NAMES[3]), ROOT_REDERIVE)
 red = drive_main(ROOT_REDERIVE, ["--resume"])
 check("2e  a STALE derived fixture is re-derived",
@@ -722,14 +740,14 @@ check("2e  ...and its temporary bundle is removed",
 ROOT_ONLY = tempfile.mkdtemp(prefix="resume_only_")
 for fid in ALL_IDS:
     cap.write_fixture(make_fixture(fid), ROOT_ONLY)
-cap.write_fixture(make_fixture("normal_2", prompt_version="1.8.0"), ROOT_ONLY)
+cap.write_fixture(make_fixture("normal_2", prompt_version=PROMPT_OLD), ROOT_ONLY)
 onlyrun = drive_main(ROOT_ONLY, ["--resume", "--only", "normal_3"])
 check("2f  --only normal_3 with normal_3 CURRENT captures nothing",
       onlyrun.captured == [], onlyrun.captured)
 check("2f  ...and asks the gate about NOTHING that --only excluded",
       [l for l in onlyrun.text.splitlines() if "[Resume]" in l]
       == ["  [Resume] SKIP     normal_3                               "
-          "current (prompt 1.9.0, model gpt-5.6-terra, collection "
+          f"current (prompt {PROMPT_A}, model gpt-5.6-terra, collection "
           "trial_criteria_20260807_111807, digest 12067pts/12067ncts/"
           "aaaaaaaaaaaa)"],
       [l for l in onlyrun.text.splitlines() if "[Resume]" in l])
@@ -812,7 +830,7 @@ for root in (ROOT_D1, ROOT_D2):
 # ROOT_D2's no_candidates is STALE, so it is rebuilt from memory rather than
 # skipped -- the arm this comparison is against.
 cap.write_fixture(
-    make_fixture("no_candidates_pediatric_age", prompt_version="1.8.0",
+    make_fixture("no_candidates_pediatric_age", prompt_version=PROMPT_OLD,
                  derivation={"recipe": cap.RECIPE_NO_CANDIDATES,
                              "donor_bundle": DONOR_NAMES[0],
                              "donor_patient_id": "x", "params": {}}),

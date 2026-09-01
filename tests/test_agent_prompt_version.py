@@ -926,7 +926,7 @@ print("=" * 78)
 # it, so it agrees with a careless regeneration by construction; a literal here
 # is a second place a human has to consent to a bump. It is the only line in
 # this file a future bump must edit, and that is the cost being paid on purpose.
-check("PROMPT_VERSION reads 1.9.0", PROMPT_VERSION, "1.9.0")
+check("PROMPT_VERSION reads 1.10.0", PROMPT_VERSION, "1.10.0")
 
 # 1.8.0 IS PINNED HERE TOO, AND ITS ADDITION IS INSIDE A DIFFERENT SECTION.
 # Section 5b's scan below is about the pinned sentences and where they landed;
@@ -956,18 +956,30 @@ _SUPERSEDED_TIME_WINDOW = (
     "use the elapsed time the record states beside it",     # 1.8.0, first line
     "If event end date is unknown:",                        # 1.8.0, second line
     "If event end date is known:",                          # pre-1.8.0 and 1.8.0
+    # 1.9.0's FINAL REMINDER sentence, superseded by 1.10.0. It is pinned ABSENT
+    # for the reason the three above are: a template carrying BOTH it and
+    # 1.10.0's replacement would satisfy every presence check and would tell the
+    # model, in one section, that the interval decides a window unconditionally
+    # AND that an ongoing event is inside it whatever the interval says. That is
+    # not a hypothetical shape -- it is what a merge resolved the wrong way
+    # produces -- and it is the ONE contradiction this bump exists to remove, so
+    # leaving it unpinned would let the bump ship without its own point.
+    "For any time-window criterion: the record's stated interval",
 )
 check("every superseded time-window clause is gone from every variant",
       sorted({n for t in _180_RENDERS for n in _SUPERSEDED_TIME_WINDOW
               if n in t}), [])
-check("...and that scan can report one: 1.8.0's own branch text pasted back "
+check("...and that scan can report one: every superseded clause pasted back "
       "into a rendered copy is found",
       sorted({n for n in _SUPERSEDED_TIME_WINDOW
               if n in _180_RENDERS[0]
               + "\n    If event end date is known: use the elapsed time the "
                 "record states beside it, or calculate it if none is stated."
               + "\n    If event end date is unknown: classification = "
-                '"not_evaluable"'}),
+                '"not_evaluable"'
+              + "\nFor any time-window criterion: the record's stated "
+                "interval, quoted verbatim, decides it. Never your own "
+                "arithmetic."}),
       sorted(_SUPERSEDED_TIME_WINDOW))
 
 # The sentences a bump added BECAUSE OF WHERE THEY SIT, and the section each must
@@ -999,8 +1011,26 @@ _REINFORCEMENT = (
     # tests/test_evaluation_rater.py section 7d is where it is asserted.
     ("Quote the record's stated interval for that event verbatim in "
      "patient_value", "SECTION 3 -- CRITERION EVALUATION ORDER"),
-    ("For any time-window criterion: the record's stated interval, quoted "
-     "verbatim, decides it.", "FINAL REMINDER"),
+    # 1.10.0 -- the ongoing gate. TWO ENTRIES FOR ONE RULING, and they are the
+    # same asymmetry 1.7.0 and 1.9.0 already carry: the first is the DECISION
+    # POINT and rides inside the span oncotriage/evaluation/rater.py lifts, so
+    # the rater judges an ongoing event under the classifier's own rule; the
+    # second is the last line the model reads and lies outside every span. The
+    # second one is NOT decoration here -- 1.9.0's reminder said the interval
+    # decides a window FULL STOP, which the ruling makes false of an ongoing
+    # event, so a gate shipped under the old reminder would leave a direct
+    # contradiction at the one placement 1.7.0 MEASURED the model acting on.
+    # THE NEEDLE CARRIES THE DIRECTION, and the first draft's did not. It read
+    # "FIRST, is the event ONGOING?" -- a QUESTION, which is true of a template
+    # answering it either way, so the inverted-rule plant below kept that
+    # opening, reversed the answer, and was reported CLEAN. A ruling whose whole
+    # content is a direction has to be pinned by a clause that states it.
+    ("is present NOW and therefore present within any window reaching the "
+     "reference date, whatever its interval",
+     "SECTION 3 -- CRITERION EVALUATION ORDER"),
+    ("For any time-window criterion: an ONGOING condition or medication is "
+     "inside the window whatever its interval says; otherwise the record's "
+     "stated interval, quoted verbatim, decides it.", "FINAL REMINDER"),
 )
 
 # A needle this file invented, which the template must NOT contain. Without it
@@ -1135,6 +1165,67 @@ check("...and a needle in the wrong section is reported as misplaced, not as "
       sorted(f.split(" is under ")[1] for f in _reinforcement_findings(_HOISTED)
              if " is under " in f),
       sorted(f"'APPENDED', expected {e!r}" for _, e in _REINFORCEMENT))
+
+# --- 1.10.0: THE INVERTED RULE, PLANTED, AND THE CLEAN CONTROL FIRST --------
+#
+# Every check above asks whether a sentence is PRESENT and WHERE. That is
+# necessary and it is not sufficient for a ruling whose whole content is a
+# DIRECTION: "an ongoing event is inside the window" and "an ongoing event is
+# outside the window" are both one sentence under RULE 4's heading, and a
+# presence-and-placement scan cannot tell them apart if the wording is changed
+# to match. So the direction is pinned twice -- the shipped sentence pinned
+# present above, and its inversion pinned ABSENT here -- and the plant is the
+# inversion actually spliced into a rendered copy.
+#
+# A STRING TRANSFORMATION, NOT AN EXEC. The subject is the rendered text, the
+# checking machinery is _reinforcement_findings, and both are already here; an
+# exec'd copy of prompts.py would need an _EXEC_ALLOWLIST entry to establish
+# nothing this cannot. Nothing on disk is written.
+#
+# THE CLEAN CONTROL RUNS FIRST. Without it, "the plant is reported" is equally
+# satisfied by a scan that reports everything handed to it.
+_INVERTED_ONGOING = (
+    "    FIRST, is the event ONGOING? A condition whose status is active, "
+    "recurrence or relapse, or a medication whose status is active, is dated "
+    "by its onset or its start, so an interval that falls outside the window "
+    "places the event OUTSIDE it whatever its status says."
+)
+
+check("1.10.0 CLEAN CONTROL: the shipped render reports no reinforcement "
+      "finding at all, so a reported finding below is the plant rather than "
+      "the scan",
+      sorted({f for t in _ALL_RENDERS.values()
+              for f in _reinforcement_findings(t)}), [])
+check("1.10.0 CLEAN CONTROL: the inverted sentence is NOT in any shipped "
+      "variant",
+      sorted({_INVERTED_ONGOING.strip() in t for t in _ALL_RENDERS.values()}),
+      [False])
+
+_ONGOING_NEEDLE = ("is present NOW and therefore present within any window "
+                   "reaching the reference date, whatever its interval")
+_ONGOING_LINE = [ln for ln in _ONE_RENDER.split("\n") if _ONGOING_NEEDLE in ln]
+check("1.10.0 non-degeneracy: the ongoing gate occupies exactly one line of "
+      "the rendered template, so the splice below replaces it rather than "
+      "appending beside it",
+      len(_ONGOING_LINE), 1)
+
+_PLANTED = (_ONE_RENDER.replace(_ONGOING_LINE[0], _INVERTED_ONGOING)
+            if len(_ONGOING_LINE) == 1 else _ONE_RENDER)
+
+check("1.10.0 PLANT: a rendered copy whose ongoing gate has been inverted to "
+      '"outside the window" is REPORTED, and reported as the gate going '
+      "missing rather than as anything else",
+      _reinforcement_findings(_PLANTED),
+      [f"{_ONGOING_NEEDLE[:40]!r} occurs 0 times, expected 1"])
+check("1.10.0 PLANT: ...and the inverted sentence really is in the copy the "
+      "check above was handed (a splice that matched nothing would report the "
+      "needle missing for the wrong reason)",
+      _INVERTED_ONGOING.strip() in _PLANTED, True)
+check("1.10.0 PLANT: ...and the splice moved exactly one line, so nothing "
+      "else in the copy was disturbed",
+      (len(_PLANTED.split("\n")), _PLANTED == _ONE_RENDER),
+      (len(_ONE_RENDER.split("\n")), False))
+
 
 
 # ===========================================================================

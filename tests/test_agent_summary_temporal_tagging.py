@@ -1495,7 +1495,7 @@ check("the hash names none of the rendering machinery",
 
 print("\n12. PROMPT_VERSION and the RULE 4 wording move together")
 
-check("PROMPT_VERSION reads 1.9.0", PROMPT_VERSION, "1.9.0")
+check("PROMPT_VERSION reads 1.10.0", PROMPT_VERSION, "1.10.0")
 
 _RENDERED_PROMPT = drive(render_system_prompt, True, "applied",
                          "<probe: no patient record>")
@@ -1589,6 +1589,224 @@ check("...and each of those shapes is reachable from the shipped helpers",
        drive(_lab_age_suffix, days_before(731), _REFERENCE)],
       ["onset 29 years before reference date", "33 days before reference date",
        ", 2 years old"])
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
+# SECTION 12b -- 1.10.0: THE RECORD MAKES THE ONGOING RULING DERIVABLE
+# ===========================================================================
+#
+# THE RULING. A criterion with a lookback window ("no X in the last 12 months")
+# treats an ONGOING condition or medication as INSIDE the window regardless of
+# when it started. Something that began before the window opened and never ended
+# was present throughout it, and a criterion excluding recent X plainly cares
+# about a patient who still has X. It is also the standing fail-safe direction:
+# "not_violated" on an ongoing excluded condition passes the patient silently
+# into `eligible`, where nothing downstream can see that the criterion's own
+# subject is documented and current, while "violated" puts the trial in the
+# near-miss list a human reads.
+#
+# WHY THIS SECTION IS HERE RATHER THAN IN tests/test_agent_prompt_version.py.
+# That file owns the version-versus-digest guard and pins the sentence by
+# content and by place; it renders no patient record and therefore cannot say
+# whether the record gives the model the two facts the sentence keys on. This
+# file owns the render. What is asserted below is the JOIN: for each of the four
+# cases, the exact rendered line, the exact clause of the rule that applies to
+# it, and the two of them together making one verdict derivable and the other
+# unreachable.
+#
+# THE PROMPT IMPLIED THE WRONG ANSWER BEFORE THIS BUMP, and that is what makes
+# it a correction. 1.9.0 said the stated interval DECIDES a window, and every
+# interval this renderer prints is anchored to an ONSET or a START -- so on the
+# `active` line below, whose onset is decades old, the shipped rule instructed
+# the model to answer OUTSIDE. Section 12 above pins that the superseded wording
+# is gone; this section pins that the record supports the wording that replaced
+# it.
+#
+# NO MODEL IS CALLED AND NONE IS SIMULATED. A check here cannot assert what a
+# model concludes. What it CAN assert -- and what the failure this bump repairs
+# actually was -- is that both premises are on the page: the status word the
+# rule keys on, and the interval the rule tells the model to read as not
+# deciding. A rule keyed on a word the record never prints would be unreachable
+# instructions, which is the shape "every example interval the prompt quotes is
+# a shape the renderer emits" already guards one field over.
+
+print("\n12b. 1.10.0 -- the ongoing ruling is derivable from the rendered record")
+
+# The two clauses of the rule, AS LITERALS -- and the three count-exactly-once
+# checks under them are what stop that being self-agreement. A literal compared
+# only against itself proves nothing; a literal required to occur exactly once
+# in the SHIPPED render fails the moment the template moves under it, which is
+# the same arrangement tests/test_agent_prompt_version.py's _REINFORCEMENT uses
+# and for the same reason. The line-level pin below is derived FROM the render,
+# because that one has to carry text this file has not enumerated.
+_ONGOING_CLAUSE = ("is present NOW and therefore present within any window "
+                   "reaching the reference date, whatever its interval")
+_OTHERWISE_CLAUSE = "OTHERWISE the event is not marked ongoing."
+_ONGOING_LINE = line_for(_RENDERED_PROMPT, _ONGOING_CLAUSE)
+
+check("12b  the ongoing clause is in the rendered prompt exactly once",
+      _RENDERED_PROMPT.count(_ONGOING_CLAUSE), 1)
+check("12b  ...and so is the clause that sends everything else to the interval",
+      _RENDERED_PROMPT.count(_OTHERWISE_CLAUSE), 1)
+check("12b  ...and the FINAL REMINDER states the ongoing case FIRST, which is "
+      "the placement 1.7.0 measured the model acting on",
+      _RENDERED_PROMPT.count(
+          "For any time-window criterion: an ONGOING condition or medication is "
+          "inside the window whatever its interval says; otherwise"), 1)
+
+# ---- CONDITIONS: the two directions, on one patient shape -----------------
+#
+# ONE onset for both arms, so the only thing that differs between them is the
+# status word -- which is precisely the fact the rule keys on. An arm whose
+# onset also moved would be a test of two changes at once.
+_ONGOING_ONSET = "1997-06-15"
+_ONGOING_YEARS = completed_years(datetime.date(1997, 6, 15), _REFERENCE)
+
+_ACTIVE_LINE = line_for(
+    drive(_create_patient_summary, _patient("ongoing-active", [
+        _condition("Diabetes mellitus type 2 (disorder)", "active",
+                   _ONGOING_ONSET)])),
+    "Diabetes mellitus")
+_RESOLVED_LINE = line_for(
+    drive(_create_patient_summary, _patient("ongoing-resolved", [
+        _condition("Diabetes mellitus type 2 (disorder)", "resolved",
+                   _ONGOING_ONSET)])),
+    "Diabetes mellitus")
+
+check("12b  a decades-old ACTIVE condition renders its status AND its onset "
+      "interval, which are the two facts the ongoing clause keys on",
+      _ACTIVE_LINE,
+      f"- Diabetes mellitus type 2 (disorder) | active | 1997 | "
+      f"{onset(f'{_ONGOING_YEARS} years')} | [comorbidity]")
+check("12b  non-degeneracy: the onset really is far outside a 12-month window, "
+      "so the ruling is doing work on this line rather than agreeing with the "
+      "arithmetic",
+      _ONGOING_YEARS >= 12, True)
+check("12b  ...so the verdict is derivable: the line carries a status the "
+      "ongoing clause names, and the clause says an interval does not place it "
+      "outside",
+      (" | active | " in _ACTIVE_LINE,
+       "active, recurrence or relapse" in _RENDERED_PROMPT,
+       BEFORE_REFERENCE_PHRASE in _ACTIVE_LINE), (True, True, True))
+
+# THE CONVERSE. A resolved condition renders the "not active" marker, which is
+# named verbatim in the OTHERWISE clause, so it falls to the interval comparison
+# 1.9.0 already governs and this bump changes nothing about it.
+check("12b  the CONVERSE: the same condition marked resolved renders the "
+      "not-active marker, which the OTHERWISE clause names, so it is decided "
+      "by the interval exactly as before",
+      _RESOLVED_LINE,
+      f"- Diabetes mellitus type 2 (disorder) | resolved | 1997 | "
+      f"{NOT_ACTIVE_PHRASE}; {onset(f'{_ONGOING_YEARS} years')} | [comorbidity]")
+# THE OTHERWISE ARM IS THE COMPLEMENT, NOT AN ENUMERATION, AND THAT IS STRONGER
+# RATHER THAN VAGUER. A listed set of non-ongoing statuses would have to name
+# `resolved`, `inactive`, `remission`, `completed`, `stopped`, `cancelled`,
+# `unconfirmed` and "no status at all" -- eight members, one of which is an
+# absence -- and would silently stop covering a status the parser learns
+# tomorrow. Defined as "not marked ongoing", every one of them reaches that arm
+# by construction. What has to be checked is therefore the OTHER side: that the
+# ongoing clause names ONLY the three statuses that mean current, so nothing the
+# resolved line renders can match it.
+check("12b  ...and none of the words a NOT-current line renders is named on "
+      "the ongoing rule's own line, so the two arms cannot both fire on one "
+      "condition",
+      [w for w in (NOT_ACTIVE_PHRASE, "resolved", "inactive", "remission",
+                   "completed", "stopped", "cancelled", "unconfirmed")
+       if w in _ONGOING_LINE], [])
+check("12b  ...and that line names exactly the three condition statuses the "
+      "parser treats as current, so the complement is the whole of the rest",
+      sorted(w for w in ("active", "recurrence", "relapse", "remission",
+                         "inactive", "resolved", "unknown")
+             if w in _ONGOING_LINE),
+      ["active", "recurrence", "relapse"])
+
+# WHAT MUST NOT BE ONGOING. `unknown` and `unconfirmed` are absence of a status,
+# not evidence of one -- reading them as ongoing would manufacture a
+# disqualification out of missing data, which the GLOBAL INVARIANT forbids with
+# zero exceptions. The renderer suppresses `unknown` from the status slot
+# entirely, so the line carries no ongoing word for the clause to match.
+_UNKNOWN_LINE = line_for(
+    drive(_create_patient_summary, _patient("ongoing-unknown", [
+        _condition("Diabetes mellitus type 2 (disorder)", "unknown",
+                   _ONGOING_ONSET)])),
+    "Diabetes mellitus")
+check("12b  an `unknown` status renders NO ongoing word, so the ongoing clause "
+      "cannot fire on it and the GLOBAL INVARIANT keeps its zero exceptions",
+      [w for w in ("active", "recurrence", "relapse") if w in _UNKNOWN_LINE], [])
+
+# ---- MEDICATIONS: the same shape, and one principle covers both ------------
+#
+# THE RULING APPLIES HERE TOO, AND THE RECORD IS WHY. An active medication with
+# an old start and no end renders the identical shape -- a status word saying it
+# is still running beside an interval anchored to a date long before any washout
+# window. RULE 2 already calls such a medication "current therapy", which is the
+# right reading and is NOT an instruction about a WINDOW; the branch under test
+# is where a window is decided, so the rule is written once over both families
+# rather than twice.
+_OLD_MED_START = "2001-03-09"
+_MED_YEARS = completed_years(datetime.date(2001, 3, 9), _REFERENCE)
+_med_patient = _patient(
+    "ongoing-med",
+    [_condition("Malignant neoplasm of breast (disorder)", "active",
+                "2020-01-01")],
+    medications=[{"display": "Carboplatin 10 MG/ML Injectable Solution",
+                  "status": "active", "start_date": _OLD_MED_START},
+                 {"display": "Cisplatin 50 MG Injection", "status": "completed",
+                  "start_date": _OLD_MED_START, "end_date": "2003-05-04"}])
+_MED_TEXT = drive(_create_patient_summary, _med_patient)
+_ACTIVE_MED_LINE = line_for(_MED_TEXT, "Carboplatin")
+_DONE_MED_LINE = line_for(_MED_TEXT, "Cisplatin")
+
+check("12b  an ACTIVE medication with an old start and NO end renders the same "
+      "shape a condition does: a running status beside an onset-anchored "
+      "interval",
+      _ACTIVE_MED_LINE,
+      f"- Carboplatin 10 MG/ML Injectable Solution | status: active | "
+      f"start: {_OLD_MED_START} ({_MED_YEARS} years "
+      f"{BEFORE_REFERENCE_PHRASE})")
+check("12b  non-degeneracy: that start really is outside a 6-month washout, so "
+      "the ruling decides this line rather than agreeing with the arithmetic",
+      _MED_YEARS >= 1, True)
+# NO `or` HERE, AND THE FIRST DRAFT HAD ONE. It read `X in _ONGOING_CLAUSE or X
+# in _RENDERED_PROMPT`, which is satisfied by the second disjunct for any phrase
+# anywhere in a 21,000-character prompt -- so it would have passed over a rule
+# that named conditions and forgot medications entirely, which is the ONE thing
+# this check exists to say cannot happen. The subject is the ongoing rule's own
+# LINE, taken from the render.
+check("12b  ...and the ongoing rule's own line names the medication family by "
+      "the word the record actually prints, so ONE rule covers both families "
+      "rather than two phrasings that can drift",
+      ("a medication whose status is active" in _ONGOING_LINE,
+       "A condition whose status is active, recurrence or relapse"
+       in _ONGOING_LINE,
+       "status: active" in _ACTIVE_MED_LINE), (True, True, True))
+check("12b  non-degeneracy: that line was found in the render at all, so the "
+      "check above is reading a line rather than a named absence",
+      _ONGOING_CLAUSE in _ONGOING_LINE, True)
+
+check("12b  the CONVERSE for medications: a completed one renders an END date "
+      "with its own interval, which is the span RULE 2 already sends the model "
+      "to and which the OTHERWISE clause leaves untouched",
+      ("status: completed" in _DONE_MED_LINE,
+       "end: 2003-05-04" in _DONE_MED_LINE,
+       "not marked ongoing" in _OTHERWISE_CLAUSE), (True, True, True))
+
+# THE ASYMMETRY BETWEEN THE TWO FAMILIES IS A FACT ABOUT THE RECORD AND IS WHY
+# THE OTHERWISE CLAUSE SAYS "UNCHANGED" RATHER THAN "JUDGED BY ITS SPAN". A
+# completed medication has a rendered end date, so its span is knowable; a
+# resolved condition has none -- the parser extracts no abatement -- so a rule
+# telling the model to intersect its span with a window would be asking for
+# arithmetic over a date the record does not carry. 1.8.0's "It is never a
+# resolution date" is the standing statement of that, and this is what says the
+# renderer still behaves that way.
+check("12b  a resolved condition renders NO end date, which is why the "
+      "converse is 'decided by the interval, unchanged' and not 'judged by its "
+      "span'",
+      ("end:" in _RESOLVED_LINE, "It is never a resolution date."
+       in _RENDERED_PROMPT), (False, True))
 
 
 #------------------------------------------------------------------------------
