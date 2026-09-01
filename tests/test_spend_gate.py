@@ -461,11 +461,24 @@ check("1i-i non-degeneracy: there are three of them, so 1i is not comparing "
       "two empty tuples",
       len(spend.SPEND_SKIP_KEY_PREFIXES), 3)
 
+# THIS PIN MOVED FROM TWO MEMBERS TO THREE AT THE SPEND-COVERAGE PASS, AND IT
+# IS THE CHECK WORKING RATHER THAN A NUMBER RETYPED. `rater_state` is a THIRD
+# seed source and not a reuse of `campaign_rows`: that one names a sum over
+# `inferences.estimated_cost_usd` walked over the `runs` chain, and this one
+# names a running total `oncotriage/evaluation/rater.py` writes into its own
+# state file after each batch is collected -- different store, different
+# arithmetic, different price table. The pin stays EXACT, which is what makes
+# a fourth member added without an argument fail here.
 check("1j  SEED_SOURCES is closed and `fresh` is a VALUE rather than an "
       "absence: 'this campaign has no prior spend' and 'nobody asked' are "
       "different statements",
       spend.SEED_SOURCES,
-      (spend.SEED_SOURCE_NONE, spend.SEED_SOURCE_CAMPAIGN))
+      (spend.SEED_SOURCE_NONE, spend.SEED_SOURCE_CAMPAIGN,
+       spend.SEED_SOURCE_RATER_STATE))
+check("1j-i ...and every member is a distinct non-empty string, so the tuple "
+      "cannot grow a member that reads as one already there",
+      (len(set(spend.SEED_SOURCES)), all(spend.SEED_SOURCES)),
+      (len(spend.SEED_SOURCES), True))
 
 check("1k  RUN_STOP_REASONS is closed and has no duplicate -- a duplicated "
       "member would make a GROUP BY over runs.stop_reason report two "

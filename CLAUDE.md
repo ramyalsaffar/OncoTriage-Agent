@@ -931,9 +931,27 @@ python tests/test_agent_cross_encoder_sequence_limit.py             #  42
 # agent/evaluation.py, one plant each, argued at _EXEC_ALLOWLIST. Bucket A,
 # ~1.6 s (MEASURED; the first version was 21.6 s because its own harness
 # deadlocked and a timeout hid it -- see the pass's own findings).
-python tests/test_spend_gate.py                                     # 151
+python tests/test_spend_gate.py                                     # 152 (was 151; the spend-coverage pass moved 1j's SEED_SOURCES pin from two members to three -- `rater_state` is a third seed source, not a reuse of `campaign_rows` -- and added 1j-i, its distinctness probe. The pin stays EXACT, which is what makes a fourth member added without an argument fail there)
 
-python tests/test_agent_stage5_per_trial_calls.py                   # 320 (was 318; the default-flip pass inverted 1a, added 1a-ii over the unpinned owner, derived 10e's restore from a value captured at import rather than a literal, and added 10f's non-degeneracy probe on that capture. Before that 283; the duplicated-derivation pass added section 1c over the import-time parallelism guard and section 5c over the answering-model check on the UNCONSUMED fold path. Before that 276; the operator-control pass rewrote 8b-r from a pinned limit to the grouped gate's contract and added c36. Before that 255; the pre-migration pass added section 8B over the Stage 5 shutdown flag and controls c32-c35. ~10 s: section 3d parks two workers for a bounded grace on each of its two arms)
+# The spend-coverage pass. Same shape, same directory. No network, no keys, NO
+# SPEND -- every provider client is a stand-in, the ablation study's
+# match_patient_ablation is a stand-in that CHARGES the ledger and issues no
+# request, and the graph is never invoked. NO MODEL LOAD
+# (ONCOTRIAGE_DEFER_LOCAL_MODELS above the imports; torch and transformers
+# asserted absent at the end), no live Qdrant, no corpus, no git history, no
+# live server, no Docker daemon. It DRIVES the REAL ablation `main()` to its
+# cap and back, the REAL rater `submit_batches`, the REAL FastAPI endpoints
+# through starlette's TestClient and the REAL MCP tool. NOT in the collision
+# matrix: every database, checkpoint and plant lives inside a
+# tempfile.mkdtemp it removes and asserts gone, paths._RESOLVED is seeded so
+# nothing can resolve to the production tree, and the five repository files it
+# reads (spend.py, ablation/study.py, evaluation/rater.py,
+# evaluation/ragas_harness.py, config.py) are sha256-compared at the end. It
+# EXECS NOTHING and loads no module by location -- the plant is a COPY written
+# into the temp tree and PARSED, never imported. Bucket A, ~6 s.
+python tests/test_spend_coverage.py                                 # 161
+
+python tests/test_agent_stage5_per_trial_calls.py                   # 321 (this line said 320 and was stale by one; MEASURED 2026-09-01 against HEAD in a git worktree as well as against the working tree, so the correction is about the note rather than about any change. Was 318; the default-flip pass inverted 1a, added 1a-ii over the unpinned owner, derived 10e's restore from a value captured at import rather than a literal, and added 10f's non-degeneracy probe on that capture. Before that 283; the duplicated-derivation pass added section 1c over the import-time parallelism guard and section 5c over the answering-model check on the UNCONSUMED fold path. Before that 276; the operator-control pass rewrote 8b-r from a pinned limit to the grouped gate's contract and added c36. Before that 255; the pre-migration pass added section 8B over the Stage 5 shutdown flag and controls c32-c35. ~10 s: section 3d parks two workers for a bounded grace on each of its two arms)
 
 # The harness-budget pass. Same shape, same directory. No network, no keys, no
 # spend, NO LIVE SERVER and no live Qdrant -- it starts nothing and issues no
@@ -7219,7 +7237,7 @@ in both directions.
 # process asserting about it and a lock held by one process cannot be observed
 # from inside it. NOT in the collision matrix. It EXECS NOTHING. Bucket A,
 # ~55 s.
-python tests/test_ablation_stop_and_lock.py                       # 157 (was 143; the degradation-report pass added section 5m-5o over the registry's two blocks in the study's closing text and FIXED 5j-5l, which were VACUOUS: `_lines.append` was passed as the sink and `print_study_close` emits a bare `emit()`, which `list.append` refuses -- so `drive` caught the TypeError and 5k and 5l were asserting `"..." not in ""`, satisfied by a function that printed nothing at all. Before that 142; the consolidation pass corrected 3k-b's argument -- half of it dissolved when control.py stopped importing anything from the project -- and added 3k-b2, without which the class separation is equally satisfied by two COPIES of the class, which is what it was. Before that 107; the lock-hardening pass added the symlink-resolved key, the per-user lock directory, the substitution refusal, the UTC record, the stripped truncation guard and a symlinked second real invocation)
+python tests/test_ablation_stop_and_lock.py                       # 160 (was 157; the spend-coverage pass FIXED 4g's migration fixture, which dropped `status` alone and so described a database carrying `stop_reason` and NOT `status` -- a shape no era of this schema has ever had -- and added 4g-i..4g-iii over the era that DOES exist. Before that 143; the degradation-report pass added section 5m-5o over the registry's two blocks in the study's closing text and FIXED 5j-5l, which were VACUOUS: `_lines.append` was passed as the sink and `print_study_close` emits a bare `emit()`, which `list.append` refuses -- so `drive` caught the TypeError and 5k and 5l were asserting `"..." not in ""`, satisfied by a function that printed nothing at all. Before that 142; the consolidation pass corrected 3k-b's argument -- half of it dissolved when control.py stopped importing anything from the project -- and added 3k-b2, without which the class separation is equally satisfied by two COPIES of the class, which is what it was. Before that 107; the lock-hardening pass added the symlink-resolved key, the per-user lock directory, the substitution refusal, the UTC record, the stripped truncation guard and a symlinked second real invocation)
 ```
 
 **THE FOREGROUND-SIGNAL LESSON IS CLOSED IN CODE RATHER THAN BY A CONVENTION,
@@ -9083,6 +9101,261 @@ afterwards; `tests/test_dashboard_run_health.py` **196**,
 `tests/test_compose_shutdown_grace.py` **43** (was 30); and the production
 `inferences.db` (`ab1403e3…`, 90,185,728 bytes) and `ablation_results.db`
 (`f2bc23c6…`) byte-unchanged. **No money was spent and no migration was run.**
+
+### Every billed path runs under the cap now (the spend-coverage pass)
+
+**THE GATE COVERED ONE DOOR OF A BUILDING WITH FOUR, AND THE PASS THAT BUILT IT
+SAID SO IN ITS OWN "WHAT IS NOT DONE" LIST.** `config.SPEND_CAP_USD`'s block
+read "the gate instruments Stage 5, which is the batch runner's spend and
+nothing else"; `oncotriage/spend.py`'s docstring said the rater and ragas "are
+NOT instrumented". Both were true, and the consequence was that a program whose
+operator-ruled shape is *campaign then judge* could spend the cap twice with
+nothing anywhere able to notice. **NO BILLED CALL WAS MADE**: the production
+`inferences.db` (`ab1403e3...`) and `ablation_results.db` (`f2bc23c6...`) are
+byte-unchanged, the twelve fixture files are byte-unchanged, and
+`python fixture_replay.py`'s differing-field set is **IDENTICAL to HEAD's --
+69 fields, compared line for line against a `git worktree`** (the 0/12 is the
+standing recapture item the de-identification and pre-diagnosis-ECOG passes
+left; this pass adds nothing to it).
+
+**THE MAP IS DERIVED, NOT DECLARED, AND THAT IS WHAT MAKES THE CLAIM
+CHECKABLE.** `spend.BILLED_SITES` names every site in the repository that
+touches a billed provider endpoint -- fifteen of them -- with one of three
+dispositions and a written argument each, and
+`tests/test_spend_coverage.py` section 1 walks every `.py` in the tree and
+requires the derived set to equal the declared one EXACTLY, in both directions.
+
+| disposition | sites | what it means |
+|---|---|---|
+| `gated_upstream` | Stage 5's two entry points and the two Bedrock adapters behind them | a NAMED caller gates it, and gating it twice would decline one request against one ledger for one reason. The gate stays in the dispatcher, or a fourth provider arrives ungated |
+| `gated_here` | `agent/models.py::get_embedding`, `evaluation/rater.py::submit_batches`, `ragas_harness.py::build_judge`, `::build_embeddings` | the function itself calls `spend.require_budget` before the request. **These four are what this pass added** |
+| `exempt` | the indexer's embed batch, the validator's diagnostic embedding, `bedrock_probe.py` (three sites) and the rater's free `count_tokens` | not gated, on purpose. Each argument is in the table AND is PRINTED by `report_lines()` on every run |
+
+**THE SCAN IS ON ATTRIBUTE ACCESS AND NOT ON CALLS, and that is not
+fastidiousness -- it is the only rule that can see the ragas harness.** That
+module captures `real_create = client.messages.create` and calls it later
+through the reference, so a call-shaped scan reports a file that spends real
+money on two vendors as touching no billed endpoint at all. **That is measured
+rather than hypothetical: it is what the first version of this derivation
+reported.** You cannot bill without naming one of these attributes; you can
+bill without a call node a scanner recognises. Both plants are driven -- an
+ordinary ungated call site and a captured reference -- with the clean control
+first.
+
+**HOLE 3 WAS THE INTERESTING ONE, BECAUSE THE SHIPPED GATE WAS WRONG FOR A
+SERVER IN BOTH DIRECTIONS AT ONCE.** `oncotriage/api/server.py` and
+`mcp_server.py` charge the same ledger the batch runner does and write no
+`runs` row, so nothing seeded that ledger and nothing reset it:
+
+  * **unbounded before the cap** -- one process may serve for months, and until
+    it has spent a whole campaign's budget by itself there is no brake at all;
+  * **wrong refusals after it** -- the total only grows, so the request after
+    the cap is declined and so is every request for the life of the process,
+    for money a campaign somewhere else was budgeted. The remedy an operator
+    reaches for is a restart, which empties the ledger and hands the process a
+    fresh unbounded budget: **the brake off exactly when it was working.**
+
+`spend.SPEND_POLICIES` is the fix: a closed two-member vocabulary, exactly one
+in force per process. `campaign` compares a MONOTONE total against
+`SPEND_CAP_USD`; `serving_window` compares a ROLLING window
+(`SERVING_SPEND_WINDOW_SECONDS`, one hour) against `SERVING_SPEND_CAP_USD`
+($25). It is bounded, it SELF-HEALS with no restart and no operator, and it
+cannot be defeated by a restart loop -- restarting empties the window, which is
+what waiting would have done anyway. **Driven both ways on one ledger**: under
+`campaign` a process past its cap declines for ever; under `serving_window` the
+same process recovers on its own.
+
+**THE LATCH IS DERIVED FROM THE POLICY AND NOT PASSED, and that is the other
+half of the same defect.** `spend.latch_on_limit()` is False under the window
+policy, because a latch there would make the recovery unreachable -- `SPEND_STOP`
+never un-trips. It is derived rather than parameterised because a parameter is
+a thing a call site can get wrong and there are five of them across four
+modules; a serving surface gets the right behaviour by installing its policy,
+which is the one thing it must do anyway. **`evaluation._spend_gate` asks it
+too**, so Stage 5 is correct inside a server as well as inside a batch run.
+**The CEILING latches under both policies** and that asymmetry is deliberate: a
+cap is a threshold a healthy run can cross, a ceiling is a defect report, and a
+defect does not heal as a window rolls.
+
+**WHAT AN OPERATOR AND A CLIENT SEE, DRIVEN THROUGH THE REAL ENDPOINTS RATHER
+THAN READ.** `POST /match` answers **503** with a computed `Retry-After`, and
+the gate is the FIRST statement of the shared helper -- above the validation and
+above the parse -- so a declined request costs the server nothing at all,
+measured by a pipeline stand-in that records zero invocations. **503 and not
+429**, because 429 says the CLIENT sent too many (which is what `RATE_LIMIT`
+already answers) while a budget is a server-side resource temporarily
+exhausted for everyone. `Retry-After` is DERIVED from the events actually in
+the window -- the instant the offending charge ages out -- so a server one
+request over its budget says "come back in seconds" rather than "in an hour",
+and it is OMITTED rather than faked when the condition will not clear. The MCP
+server answers with a payload carrying **no `result` key** -- `_index_
+unavailable_result`'s argument, verbatim: a model reading an empty result
+beside a caveat summarises the caveat away.
+
+**`/health` REPORTS THE BUDGET AND DELIBERATELY DOES NOT DECIDE `healthy`, and
+the obvious version is actively harmful.** docker-compose probes it with
+`curl -f`; an unhealthy container is RESTARTED; a restart empties the rolling
+window. Folding a budget stop into `healthy` would make the health check the
+mechanism that defeats the brake, on a loop, and the only symptom would be a
+server that restarts every hour and never declines anything. Driven: 200 in
+both arms, with `spend.declining` True in one and False in the other.
+
+**HOLE 2 IS THE JUDGE, AND THE PRICING STAYS WITH THE PATH WHILE THE LIMIT
+STAYS IN `spend.py`.** `SpendLedger.charge_usd(usd, source)` takes an
+ALREADY-PRICED amount, because `config.PRICING_CONFIG` holds none of the
+Anthropic Batches rates, none of the 50% batch discount and no cache-tier
+multipliers -- so `rater.charge_batch_to_ledger` hands over what
+`rater.price_usage` produced, and `UsageTally._charge` hands over what
+`judge_pricing`/`embedding_pricing` produced. That split is what lets one cap
+govern four paths priced four ways.
+
+**THE DISJOINT COUNTS ARE PINNED SO NOBODY SUMS THEM.** Anthropic reports
+`input_tokens` as the NON-CACHED input only, with the cache read and the two
+cache-creation figures beside it -- the shape
+`bedrock_anthropic_adapter.py` had to sum BACK for Converse, because OpenAI's
+`prompt_tokens` INCLUDES its cached portion. Here they must NOT be summed: each
+tier has its own rate and a cache read costs a tenth of an uncached token. The
+arithmetic is pinned term by term, with the wrong version -- what a reader who
+knew only the OpenAI shape would write -- shown to give a different number.
+
+**THE RATER IS GATED PER CHUNK AND EXITS 3.** `submit_batches` asks the gate
+immediately before each `batches.create`, so the overshoot is ONE BATCH rather
+than all of them, and a retry pass submitted after the primary batches have
+been collected and charged is declined on a ledger that knows what they cost.
+The overshoot bound is stated rather than glossed: the Batches API puts the
+gate and the charge further apart than Stage 5 does, and the smallest unit this
+gate can decline is a whole chunk. `SpendLimitReached` is deliberately NOT a
+`RaterRefusal` -- a refusal means "the configuration is wrong, fix it", this
+means "the money is gone and everything already submitted is still
+retrievable" -- so it exits **3**, distinct from 1 and 2. A session seeds from
+`rater_state.json`'s running total, so `--resume` continues under the REMAINDER.
+
+**RAGAS IS GATED AT THE ONE POINT IT CAN BE, AND THE LIMIT IS NAMED.** The gate
+sits above the `await` in the `recording_create` closure each builder installs,
+so a raise means NO REQUEST IS ISSUED -- which is verified. What is NOT verified
+is what ragas does with the exception, because this harness is not exercised
+here; both outcomes are SAFE, since every later ask meets the same gate.
+
+**HOLE 1 IS THE ABLATION STUDY, AND IT IS THE BATCH RUNNER'S FIVE CONTROLS
+ADAPTED RATHER THAN COPIED.** The ledger and the latch join the per-run module
+state `main()` clears; the ledger is SEEDED from `ablation_spend_before(db)` --
+this database's own rows, which is the study's campaign, because pass 20f-3
+made the checkpoint follow `--db` so "what this database holds" and "what a
+resume will skip" are the same set by construction; `spend.SPEND_STOP.poll` is
+read at all three sites the operator switch is read at; `_run_pair_unless_
+stopped` reads the latch as a plain attribute, closing the sweep's one-pair
+edge; and `ablation_runs.stop_reason` records WHY.
+
+**A COLUMN AND NOT TWO MORE STATUSES**, which is
+`database_logger.RUN_STOP_REASONS`' ruling adopted rather than re-argued: a
+spend stop's answer to "how did this end" is byte-identical to an operator
+stop's, and two more members would be two more things `RUN_STATUSES_PARTIAL`,
+`_summary_status_warning` and the stop-and-lock test must learn, all answering
+identically for all three. `_stop_reason_now()` is the ONE derivation and the
+OPERATOR OUTRANKS THE BUDGET, because reporting a budget when a person had
+already asked for the stop sends that person to `SPEND_CAP_USD` to explain a
+stop they caused. **A COVERED configuration stores no reason even when a latch
+is set** -- a stop that arrived while every pair was in flight cut nothing
+short -- and the CRASH path stores none either, because KILLED means the process
+did not get to the end and attributing that to a budget would be false.
+
+**DRIVEN, NOT READ: the real `main()`, to its cap and back.** With the sample
+larger than `MAX_WORKERS` (so there IS queued work when the latch trips) the
+study stops, records `('full_pipeline', 'STOPPED', 'spend_cap')`, opens no row
+for the configuration it never started, and a resume under a raised cap runs
+**exactly** the pairs the stopped run did not -- 40 of 40, no pair twice, no
+duplicate row. A cap crossed by the LAST pair leaves the configuration
+**COMPLETE with a NULL reason**, which is the batch runner's scenario C applied
+here.
+
+**SIXTEEN REVERTS, SIXTEEN CAUGHT**, each into a `copytree`'d copy with a
+`sitecustomize` that strips the editable install's MetaPathFinder (which
+otherwise beats `PYTHONPATH`), a realpath preflight asserting the COPY is what
+imports, and `PYTHONDONTWRITEBYTECODE=1`. **TWO WERE MISSED ON THE FIRST RUN AND
+BOTH WERE REAL GAPS IN THE CHECKS RATHER THAN WEAK REVERTS**, which is the whole
+argument for running the matrix:
+
+  * **the study's ledger seed could be deleted with every check still green.**
+    The seed was exercised by CALLING `ablation_spend_before` directly, which
+    proves the reader works and not that `main()` consults it -- and that is
+    exactly the gap that would let a resumed study get a fresh budget every
+    time. It is measured through its EFFECT now: a database already holding
+    more than the cap must make the next study bill NOTHING, with the
+    no-history clean control beside it.
+  * **the per-pair guard likewise**, because the scenario's queued futures were
+    cancelled by the sweep and the edge it closes never occurred. It is driven
+    directly now.
+
+**FOUR DEFECTS IN THIS PASS'S OWN WORK WERE FOUND BY RUNNING, NOT BY READING.**
+
+  * **`UsageTally._charge` subscripted `rates["output"]`, and
+    `embedding_pricing` returns no such key** -- an embedding produces no
+    completion. The `KeyError` was swallowed by that method's own handler into
+    a counted fault, so **every ragas embedding charge was silently dropped
+    while the run reported a pricing fault a reader would have blamed on the
+    price table**. Caught by check 7a, which requires the harness's own cost
+    figure and the shared ledger to agree to the cent.
+  * **`/health` read `config` where the module binds `_config`** -- a
+    `NameError` that turned the endpoint an operator asks FIRST into a 500.
+    Caught by driving it rather than by reading it.
+  * **check 8k-ii shipped as `len({one item}) == 1`**, a tautology, found by
+    re-reading the file after it was green.
+  * **the closing-block probe passed `list.append` as the sink**, which
+    `print_study_close`'s bare `emit()` refuses -- the exact vacuity
+    `tests/test_ablation_stop_and_lock.py` had to fix in its own 5j-5l, met
+    again. It is a function with a default now, with a non-degeneracy check
+    that the sink collects anything at all.
+
+**AND THE EXISTING SUITE CAUGHT THREE THINGS, every one of them the check
+working.** `tests/test_spend_gate.py` 1j (SEED_SOURCES gained a third member --
+the pin stays EXACT); `tests/test_clinical_use_framing.py` 5d (the MCP server
+gained a SIXTH result payload and it carries the framing -- the pin stays EXACT,
+because only an exact count fails when a seventh is added without it); and
+`tests/test_ablation_stop_and_lock.py` 4g, whose migration fixture **dropped
+`status` alone and so described a database carrying `stop_reason` and NOT
+`status` -- a shape no era of this schema has ever had.** The fixture drops both
+now, and 4g-i..4g-iii check the era that DOES exist on disk: `status` present,
+`stop_reason` absent, which is every ablation database written between the
+operator-control pass and this one.
+
+**WHAT WAS VERIFIED BY RUNNING.** `tests/test_spend_coverage.py` **161/0**;
+CI bucket A **89 files, 0 failed, 0 not run**;
+`tests/test_package_invariants.py` **260/0/0**; `tests/run_serial_tests.py`
+**5/5 in 404 s**, with `oncotriage/config.py` confirmed to carry only this
+pass's own edit and `oncotriage/registries/cancer_code_registry.py` confirmed
+byte-unchanged; `python fixture_replay.py`'s differing-field set identical to
+HEAD's; and both production databases and all twelve fixture files
+byte-unchanged. **No money was spent and no migration was run against a
+production database**: `ablation_runs.stop_reason` appears on the next study
+that opens the file, which is what the additive mechanism is for.
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **THE CAP DOES NOT NET ACROSS PROCESSES.** A campaign seeds from the `runs`
+   chain and a rater session from its own state file, so each resumes under its
+   remainder -- but the judge's spend is not counted against the campaign's,
+   because no shared store exists that both write. Closing it means a
+   cross-process ledger, which is a persistence design of its own.
+2. **RAGAS HAS NO SEED.** `--resume` there re-scores from a partial journal
+   which records SCORES rather than spend, so the cap binds within one ragas
+   invocation and not across a resumed pair of them. Inventing a total from the
+   journal's row count would be an estimate deciding a budget.
+3. **WHAT RAGAS DOES WITH A REFUSAL IS NOT VERIFIED** (above). Only that no
+   request is issued.
+4. **`SERVING_SPEND_CAP_USD = 25.00` IS A RULING, NOT A MEASUREMENT**, and is
+   labelled one. It admits ~60 patients/hour at the cache-absent price and ~139
+   with the cache working; nobody has measured this project's real serving
+   load, and the banner prints the number on every start so it cannot be
+   inherited silently.
+5. **THE INDEX BUILD HAS NO BRAKE OF ITS OWN.** It is exempt with an argument,
+   and the brake it actually needs is a corpus-size refusal rather than a
+   dollar cap.
+6. **`/pipeline/info` DOES NOT REPORT THE POLICY OR THE WINDOW**, so an
+   operator asking the API what it will refuse cannot see it there. `/health`
+   carries it; widening `/pipeline/info` is a second contract change.
+7. **THE RATER'S EXIT 3 HAS NO CALLER TODAY.** It is a contract change stated
+   as one, on File 19's precedent.
+
 
 ## Persistence and observability
 

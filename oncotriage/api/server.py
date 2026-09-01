@@ -111,6 +111,7 @@ from oncotriage.agent.evaluation import (
     stage5_shutdown_reason,
     stage5_shutdown_requested,
 )
+from oncotriage import spend
 from oncotriage.agent.graph import build_matching_graph, match_patient_to_trials
 from oncotriage.agent.readiness import (
     INDEX_POPULATED,
@@ -490,6 +491,32 @@ async def lifespan(_app):
     for _line in shutdown_gate_report_lines():
         console.out(_line)
 
+    # ── THE SPEND POLICY ─────────────────────────────────────────────────
+    #
+    # A SERVER MUST NOT RUN UNDER THE CAMPAIGN CAP, AND UNTIL THIS LINE IT
+    # DID. `oncotriage/spend.py`'s ledger is charged by Stage 5 and by Stage
+    # 2's dense channel whoever the caller is, and this process writes no
+    # `runs` row -- so nothing seeded that ledger, nothing reset it, and
+    # `config.SPEND_CAP_USD` compared against a MONOTONE total gave this server
+    # no brake at all until it had spent a whole campaign's budget by itself,
+    # and then declined every request it would ever serve. The remedy an
+    # operator reaches for is a restart, which empties the ledger and hands the
+    # process a fresh unbounded budget: the brake off exactly when it worked.
+    # `spend.SPEND_POLICIES` carries the full argument.
+    #
+    # THE LEDGER IS RESET WITH IT, on the same footing as the shutdown flag
+    # above: a second application lifespan in one process (a test, an embedder)
+    # would otherwise inherit the first one's window and decline requests for
+    # money this server did not spend.
+    #
+    # ARMED BEFORE THE GRAPH IS COMPILED for the shutdown gate's reason: the
+    # first request can arrive the instant startup completes, and a policy
+    # installed after it would serve that request under the wrong limit.
+    spend.SPEND_LEDGER.reset()
+    spend.SPEND_STOP.reset()
+    spend.set_policy(spend.SPEND_POLICY_WINDOW, "oncotriage.api.server")
+    console.out(spend.describe_serving_cap())
+
     console.out("[Startup] Compiling LangGraph pipeline...")
     graph = build_matching_graph()
 
@@ -612,6 +639,75 @@ class MatchResponse(BaseModel):
 # HELPER
 # ===========================================================================
 
+BUDGET_DECLINED_STATUS = 503
+"""The status a request declined for budget answers with.
+
+**503 AND NOT 429, AND THE DISTINCTION IS ABOUT WHOSE FAULT IT IS.** 429 means
+the CLIENT has sent too many requests and is the shape a per-client rate limit
+takes -- which this server already has, at `RATE_LIMIT`, and which is a
+different mechanism with a different remedy (that client backs off). A budget is
+a SERVER-side resource that is temporarily exhausted for everyone; a
+well-behaved client that sent one request meets it. 503 says "I cannot serve
+this now, try later", which is exactly true, is what `Retry-After` is defined
+against, and is the same code `/health` already uses for a dependency this
+server is missing.
+
+IT IS A NAMED CONSTANT because two endpoints answer with it and a test asserts
+on it; a literal in three places is the drift this project removes elsewhere by
+giving a thing one name.
+"""
+
+
+def _serving_cap_or_none():
+    """The serving cap for the health body, or None when it cannot be read.
+
+    ``/health`` MUST NOT RAISE OVER A MISCONFIGURED CAP. It is the endpoint an
+    operator asks FIRST when something is wrong, and a 500 here would remove
+    the report about every OTHER dependency in order to complain about one
+    constant -- `/pipeline/info` routing its trial count through the index
+    probe for the identical reason. A cap that cannot be read reads as `null`,
+    beside `declining`, which is False in that state because `cap_exceeded()`
+    swallows the same error and declines nothing.
+    """
+    try:
+        return spend.serving_spend_cap()
+    except spend.SpendCapConfigurationError:
+        return None
+
+
+def _budget_declined(exc):
+    """Turn a ``spend.SpendLimitReached`` into the HTTP answer. Pure.
+
+    ``Retry-After`` IS COMPUTED, NOT GUESSED. `spend.seconds_until_under_cap()`
+    derives the instant the rolling window falls back under its cap from the
+    events actually in it, so a server one request over its budget tells a
+    client to come back in seconds rather than in an hour. It is OMITTED rather
+    than faked when the answer is unknown -- the call-ceiling limit does not
+    heal with time, and a `Retry-After` on a condition that will not clear is
+    worse than none.
+
+    THE HEADER IS AN INTEGER STRING OF SECONDS, which is one of the two forms
+    RFC 9110 defines and the one every client library parses.
+
+    THE DETAIL NAMES THE LIMIT AND NOT THE BALANCE. `exc` carries the spend and
+    the cap in its message; this deliberately does not forward them, because a
+    served response is a public surface and how much this deployment has spent
+    is not the requesting client's business. The operator reads the figures in
+    the log line `require_budget` already wrote and in `GET /health`.
+    """
+    headers = {}
+    _wait = spend.seconds_until_under_cap()
+    if _wait is not None:
+        headers["Retry-After"] = str(max(1, int(_wait)))
+    return HTTPException(
+        status_code=BUDGET_DECLINED_STATUS,
+        detail=("This server has reached its spend limit and is not issuing "
+                "billed requests. NO MATCHING WAS PERFORMED -- this is not a "
+                "finding of zero eligible trials. The limit is a rolling "
+                "window and clears on its own; retry later."),
+        headers=headers or None)
+
+
 def _run_matching_pipeline(fhir_bundle_dict):
     """
     Shared pipeline: FHIR bundle dict → MatchResponse.
@@ -619,6 +715,28 @@ def _run_matching_pipeline(fhir_bundle_dict):
     """
 
     start_time = time.time()
+
+    # ── THE SPEND GATE, ABOVE EVERYTHING ─────────────────────────────────
+    #
+    # FIRST, BEFORE THE VALIDATION AND BEFORE THE PARSE, so a declined request
+    # costs this server nothing at all -- not a bundle parse, not a Qdrant
+    # round trip, not a thread of the event loop's pool held for a minute.
+    #
+    # IT IS A SEPARATE GATE FROM STAGE 5's AND BOTH ARE NEEDED. Stage 5's
+    # declines the individual billed call and fails the patient HONESTLY, which
+    # is right for a batch run: the row is written and the checkpoint resumes
+    # it. That shape is wrong for a request -- the client gets HTTP 200 and a
+    # result whose `error` field names a budget, which no HTTP client branches
+    # on -- so this turns the same fact into a status code, and Stage 5's
+    # remains as the backstop for a window that fills while a request is
+    # already in flight.
+    #
+    # IT DOES NOT LATCH. `require_budget` derives that from the policy, and
+    # this process installed `serving_window` in its lifespan: the quantity
+    # falls as the window rolls, so the NEXT request asks the ledger again
+    # rather than meeting a latch set minutes ago. See `spend.SPEND_POLICIES`.
+    spend.require_budget(spend.SPEND_SOURCE_STAGE5,
+                         "a served /match request")
 
     # ── FHIR structure validation ──────────────────────────────────────
     if not isinstance(fhir_bundle_dict, dict):
@@ -870,11 +988,43 @@ def create_app():
         if not healthy:
             response.status_code = 503
 
+        # ── THE BUDGET IS REPORTED AND DELIBERATELY DOES NOT DECIDE
+        #    `healthy` ────────────────────────────────────────────────────
+        #
+        # THE OBVIOUS VERSION IS ACTIVELY HARMFUL AND THAT IS WHY THIS IS A
+        # SEPARATE FIELD. docker-compose.yml probes this endpoint with
+        # `curl -f`, so folding a budget stop into `healthy` would make the
+        # container UNHEALTHY, and an unhealthy container is RESTARTED -- which
+        # empties the rolling window and hands the process a fresh budget. The
+        # health check would become the mechanism that defeats the brake, on a
+        # loop, and the only symptom would be a server that restarts every hour
+        # and never declines anything.
+        #
+        # SO A BUDGET STOP IS A TEMPORARY, SELF-HEALING, PER-REQUEST condition
+        # answered at `/match` with a 503 and a `Retry-After`, and this
+        # endpoint's job is to let an operator SEE it. The three checks above
+        # are the opposite kind of fact -- a missing dependency does not heal
+        # and a restart is a reasonable response to it.
+        _spend_over = spend.cap_exceeded()
         return {
             "status": "healthy" if healthy else "unhealthy",
             "pipeline_ready": graph is not None,
             "serving_ready": report["status"],
             "checks": report["checks"],
+            "spend": {
+                "policy": spend.policy(),
+                # ROUNDED TO CENTS, on the response's own footing rather than
+                # the ledger's: this is a served field and six decimal places
+                # of a rolling window is precision nobody can act on.
+                "window_usd": round(spend.SPEND_LEDGER.window_spend(), 4),
+                "window_seconds": getattr(
+                    _config, "SERVING_SPEND_WINDOW_SECONDS", None),
+                "cap_usd": _serving_cap_or_none(),
+                "declining": _spend_over,
+                "retry_after_seconds": (
+                    None if not _spend_over
+                    else spend.seconds_until_under_cap()),
+            },
             "timestamp": datetime.now().isoformat()
         }
 
@@ -1146,6 +1296,8 @@ def create_app():
         try:
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(None, _run_matching_pipeline, body.fhir_bundle)
+        except spend.SpendLimitReached as e:
+            raise _budget_declined(e)
         except HTTPException:
             raise
         except Exception as e:
@@ -1172,6 +1324,8 @@ def create_app():
             return await loop.run_in_executor(None, _run_matching_pipeline, bundle)
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON file.")
+        except spend.SpendLimitReached as e:
+            raise _budget_declined(e)
         except HTTPException:
             raise
         except Exception as e:

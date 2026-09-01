@@ -1468,6 +1468,28 @@ BUCKETS = {
         "and are sha256-compared at the end. It DOES exec: six in-memory "
         "copies of agent/evaluation.py, one plant each, argued at "
         "_EXEC_ALLOWLIST."),
+    "test_spend_coverage.py": (
+        _A, None,
+        "ran green in ~35s, 154 checks: the spend gate's COVERAGE, which is "
+        "the question test_spend_gate.py cannot ask -- every billed call site "
+        "in the repository is DERIVED from source and required to match "
+        "spend.BILLED_SITES exactly, in both directions, with an ungated "
+        "billing site planted into a copy of the tree and caught. No network, "
+        "no keys, NO SPEND -- every provider client is a stand-in, the "
+        "ablation study's match_patient_ablation is a stand-in that charges "
+        "the ledger and issues no request, and the graph is never invoked. NO "
+        "MODEL LOAD (ONCOTRIAGE_DEFER_LOCAL_MODELS is set above the imports "
+        "and section 11 asserts torch and transformers never entered "
+        "sys.modules), no live Qdrant, no corpus, no git history, no live "
+        "server, no Docker daemon. It DRIVES the REAL ablation main() to its "
+        "cap and back, the REAL rater submit_batches, the REAL FastAPI "
+        "endpoints through TestClient and the REAL MCP tool. NOT in the "
+        "collision matrix: every database, checkpoint and plant lives inside "
+        "a tempfile.mkdtemp it removes and asserts gone, paths._RESOLVED is "
+        "seeded so nothing can resolve to the production tree, and the five "
+        "repository files it reads are sha256-compared at the end. It EXECS "
+        "NOTHING and loads no module by location -- the plant is a COPY in "
+        "the temp tree that is PARSED, never imported."),
     "test_storage_run_identity.py": (
         _A, None,
         # RE-READ OFF A REAL RUN (this pass). The string it replaces was wrong

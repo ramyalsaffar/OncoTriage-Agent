@@ -3653,11 +3653,31 @@ claude-sonnet-4-6's $3.00/$15.00 with the flat 50% batch discount. The row above
 assumes 25,000 input and 5,000 output tokens per patient; at 40,000/8,000 it is
 $12.00. Either way it is under 10% of the program and it moves no decision here.
 
-**AND THE JUDGE PASS IS NOT COVERED BY THIS GATE.** The gate instruments Stage
-5, which is the batch runner's spend and nothing else. `rater_run.py` and
-`ragas_run.py` bill through their own harnesses, do not write
-`inferences.estimated_cost_usd`, and are not gated. That is stated rather than
-implied: an operator reading "$300 cap" must not believe it bounds the judge.
+**THE JUDGE PASS IS COVERED, AND THIS PARAGRAPH ONCE SAID THE OPPOSITE.** It
+read: "the gate instruments Stage 5, which is the batch runner's spend and
+nothing else. `rater_run.py` and `ragas_run.py` bill through their own
+harnesses, do not write `inferences.estimated_cost_usd`, and are not gated."
+Every clause was true when it was written and the LAST one was the hole: a
+budget that covers one door of a building with four is not a budget. The
+spend-coverage pass closed it. Four billed paths now charge one ledger and are
+declined by one cap -- Stage 5, Stage 2's dense query embedding, the
+independent rater and the ragas harness -- each PRICED BY ITS OWN TABLE at its
+own call site and LIMITED here. `spend.SPEND_SOURCES` enumerates them and
+`spend.BILLED_SITES` maps every billed call site in the repository to `gated
+here` / `gated upstream` / `exempt, and here is why`.
+
+WHAT IT STILL DOES NOT BOUND, and it is named rather than implied: an index
+build, the index validator's one diagnostic embedding, `bedrock_probe.py`'s
+deliberate flagged spend, and the rater's free `count_tokens` call. Each is
+argued at `spend.BILLED_SITES` and PRINTED by `spend.report_lines()` on every
+run, so a reader handed "$300 cap" is told in the same block what it does not
+reach.
+
+AND IT BINDS WITHIN ONE PROCESS. A campaign's ledger is seeded from the `runs`
+chain and a rater session's from its own state file, so each RESUMES under its
+remainder -- but the two are separate processes with no shared store, so the
+judge's spend is not netted against the campaign's. That is a real gap and the
+only honest place to record it is here.
 
 UNSET SEMANTICS, AND THE CHOICE IS ARGUED RATHER THAN DEFAULTED. `None` here
 means NO CAP. That is the shape a silently-unlimited default would take, and
@@ -3698,6 +3718,67 @@ unstated edge is a promise nobody can rely on.
     AT THE PATIENT. Charging only where the node folds its accumulators would
     make the bound MAX_WORKERS whole patients (~$5), because per-trial mode
     dispatches a patient's entire wave before the node reads any of it.
+"""
+
+SERVING_SPEND_CAP_USD = 25.00
+"""The rolling-window budget a LONG-LIVED SERVING PROCESS runs under, in USD.
+
+**A CAMPAIGN CAP CANNOT BOUND A SERVER AND THE SHIPPED GATE PROVED IT IN BOTH
+DIRECTIONS.** `oncotriage/api/server.py` and `mcp_server.py` charge the same
+ledger `25- Batch Runner.py` does, and neither writes a `runs` row -- so
+nothing seeds the ledger, nothing resets it, and `SPEND_CAP_USD` compared
+against a monotone total gives a server no brake at all until it has spent a
+whole campaign's budget by itself, and then declines every request it will ever
+serve. The remedy an operator reaches for is a restart, which empties the
+ledger and hands the process a fresh unbounded budget -- the brake is off
+exactly when it was working. See `spend.SPEND_POLICIES`.
+
+So a server is bounded by a RATE: at most this many dollars inside any
+`SERVING_SPEND_WINDOW_SECONDS`. It is bounded (a runaway request loop stops
+within one window's spend), it self-heals (a server recovers on its own as the
+window rolls, with no restart and no operator), and it cannot be defeated by a
+restart loop, because restarting empties the window -- which is what waiting
+would have done anyway.
+
+WHERE 25.00 COMES FROM, and it is a RULING rather than a derivation, stated as
+one. The measured cost of one served patient is $0.179 with the prompt cache
+working and $0.411 without it (the derivation is at SPEND_CAP_USD). So this
+window admits roughly
+
+    $25 / $0.411  =  60 patients per hour   worst case
+    $25 / $0.179  = 139 patients per hour   cache working
+
+which is far above any demonstration load this project has ever served and far
+below a runaway: a defect issuing requests as fast as the event loop's pool can
+dispatch them is stopped inside one window. It is deliberately NOT derived from
+an expected request rate, because nobody has measured one -- an operator
+serving real traffic must set it from their own, and the banner prints it on
+every start so the number cannot be inherited silently.
+
+None here means NO SERVING CAP, reachable only by an explicit edit that
+`spend.describe_serving_cap()` prints on the startup banner of every server that
+takes it -- `SPEND_CAP_USD`'s unset semantics, for its reason.
+"""
+
+SERVING_SPEND_WINDOW_SECONDS = 3600.0
+"""The width of the rolling window `SERVING_SPEND_CAP_USD` is measured over.
+
+ONE HOUR, AND THE TWO FAILURE MODES OF THE OBVIOUS ALTERNATIVES ARE WHY. A
+window much SHORTER than one served patient's latency (a patient is ~78s of
+Stage 5 today) would let a handful of concurrent requests fill it, so a server
+would decline for normal load; a window much LONGER approaches the monotone
+total this design exists to escape -- a 24-hour window on a server that spent
+its budget at 09:00 declines until 09:00 tomorrow, which an operator
+experiences as the broken shape rather than the self-healing one.
+
+MEASURED IN SECONDS, AND THE CLOCK IS `time.monotonic`: an NTP step or a DST
+change must neither empty the window (a free budget) nor fill it (refusals for
+money nobody spent). See `spend.SpendLedger._commit`.
+
+ITS SECOND JOB IS TO BOUND MEMORY. `spend.SpendLedger` keeps one small tuple
+per charge and prunes against this value on every write, so a server that runs
+for months holds one window's worth of events rather than one process
+lifetime's.
 """
 
 SPEND_CAP_ENFORCED = True

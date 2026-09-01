@@ -46,7 +46,7 @@ import statistics
 import sys
 import time
 
-from oncotriage import config, paths
+from oncotriage import config, paths, spend
 from oncotriage.observability import console, get_logger
 
 log = get_logger(__name__)
@@ -894,25 +894,91 @@ class UsageTally(object):
     pool over these calls would need a lock here.
     """
 
-    def __init__(self):
+    def __init__(self, judge_model=None, embedding_model=None):
         self.judge_calls = 0
         self.judge_input_tokens = 0
         self.judge_output_tokens = 0
         self.embedding_calls = 0
         self.embedding_tokens = 0
+        # THE TWO MODEL IDS, SO THIS TALLY CAN PRICE AS IT RECORDS. They
+        # default to None and a None model is a counted fault rather than a
+        # guess -- a construction site that does not supply them still records
+        # tokens exactly as it always did, and `cost()` is unchanged because it
+        # is handed the ids by its caller.
+        self.judge_model = judge_model
+        self.embedding_model = embedding_model
 
     def record_judge(self, usage):
         self.judge_calls += 1
         if usage is None:
             return
-        self.judge_input_tokens += getattr(usage, "input_tokens", 0) or 0
-        self.judge_output_tokens += getattr(usage, "output_tokens", 0) or 0
+        _in = getattr(usage, "input_tokens", 0) or 0
+        _out = getattr(usage, "output_tokens", 0) or 0
+        self.judge_input_tokens += _in
+        self.judge_output_tokens += _out
+        self._charge(judge_pricing, self.judge_model, _in, _out,
+                     spend.SPEND_SOURCE_RAGAS_JUDGE)
 
     def record_embedding(self, usage):
         self.embedding_calls += 1
         if usage is None:
             return
-        self.embedding_tokens += getattr(usage, "total_tokens", 0) or 0
+        _tok = getattr(usage, "total_tokens", 0) or 0
+        self.embedding_tokens += _tok
+        # `total_tokens` AND NOT `prompt_tokens`, matching `cost()` exactly one
+        # method down: an embedding produces no completion, so for THIS vendor
+        # and THIS endpoint the two are equal and `cost()` has always priced the
+        # total at the input rate. Reading a different field here would make the
+        # ledger and this harness's own reported figure disagree about the same
+        # response.
+        self._charge(embedding_pricing, self.embedding_model, _tok, 0,
+                     spend.SPEND_SOURCE_RAGAS_EMBEDDING)
+
+    def _charge(self, pricing, model, input_tokens, output_tokens, source):
+        """Add one response's measured cost to the shared run ledger.
+
+        **THE PRICING STAYS WITH THE PATH.** ``config.RAGAS_PRICING`` is this
+        harness's table and ``judge_pricing`` / ``embedding_pricing`` are its
+        one owner, so this hands ``oncotriage/spend.py`` a number they produced
+        rather than a token count it would have to price against a table that
+        does not hold these models. ``charge_batch_to_ledger`` in
+        ``oncotriage/evaluation/rater.py`` is the identical seam for the
+        identical reason.
+
+        NEVER RAISES. It runs after a response has arrived and been paid for;
+        a pricing defect that propagated out of here would abort a metric whose
+        answer is already bought. Everything that can go wrong is counted into
+        ``spend.SPEND_LEDGER_FAULTS``, whose non-zero total says the cap is
+        being enforced against a number lower than the truth.
+
+        THE MODEL IDS ARE THE ONES THIS TALLY WAS CONSTRUCTED WITH, not ones
+        read off the responses. Ragas' ``InstructorLLM`` throws the raw
+        response away -- which is the reason this class exists at all -- so
+        there is no echoed id to prefer, and ``cost()`` has always priced
+        against the configured ids for the same reason.
+        """
+        if model is None:
+            spend.SPEND_LEDGER_FAULTS[f"ragas_unpriced:{source}:no_model"] += 1
+            return
+        try:
+            rates = pricing(model)
+            # `.get("output", 0.0)` AND NOT `rates["output"]`, and the reason
+            # is a real defect this file's own test caught rather than a
+            # defensive habit: `embedding_pricing` returns `{"input", ...}`
+            # and NO `"output"` key, because an embedding produces no
+            # completion. Subscripting it raised `KeyError`, which this
+            # method's own handler swallowed into a counted fault -- so every
+            # ragas embedding charge was silently dropped while the run
+            # reported a fault the reader would have blamed on pricing. The
+            # default is 0.0 because that is what `cost()` has always used for
+            # this vendor: `embedding_tokens * embed["input"]`, no output term.
+            usd = (input_tokens * rates["input"]
+                   + output_tokens * rates.get("output", 0.0))
+        except Exception as exc:                                # noqa: BLE001
+            spend.SPEND_LEDGER_FAULTS[
+                f"ragas_unpriced:{type(exc).__name__}"] += 1
+            return
+        spend.SPEND_LEDGER.charge_usd(usd, source)
 
     def cost(self, judge_model, embedding_model):
         judge = judge_pricing(judge_model)
@@ -1025,6 +1091,24 @@ def build_judge(model, temperature, max_tokens, tally, max_retries):
     real_create = client.messages.create
 
     async def recording_create(*args, **kwargs):
+        # ── THE SPEND GATE, IMMEDIATELY BEFORE THE REQUEST ────────────────
+        #
+        # THE SEAM IS ALREADY HERE, WHICH IS WHY THE GATE CAN BE. This wrapper
+        # exists so the reported cost is MEASURED rather than modelled; it is
+        # also the one point in this harness where a judge request can be
+        # declined, because ragas owns the loop that issues them.
+        #
+        # WHAT IS VERIFIED AND WHAT IS NOT, STATED. It is verified that a
+        # raise here means NO REQUEST IS ISSUED and NO MONEY IS SPENT -- that
+        # follows from the position, above `await real_create`. It is NOT
+        # verified what ragas does with the exception: it may abort the run, it
+        # may mark the sample failed and continue asking for more. Both are
+        # SAFE, because every later ask meets this same gate and is declined
+        # too, so the worst case is a run that reports a wall of failed samples
+        # having spent nothing further. This harness is not exercised here and
+        # that limit is named rather than papered over.
+        spend.require_budget(spend.SPEND_SOURCE_RAGAS_JUDGE,
+                             "the ragas judge")
         response = await real_create(*args, **kwargs)
         tally.record_judge(getattr(response, "usage", None))
         return response
@@ -1068,6 +1152,9 @@ def build_embeddings(model, tally):
     real_create = client.embeddings.create
 
     async def recording_create(*args, **kwargs):
+        # The judge's gate, on the other vendor. See `build_judge`.
+        spend.require_budget(spend.SPEND_SOURCE_RAGAS_EMBEDDING,
+                             "the ragas embedder")
         response = await real_create(*args, **kwargs)
         tally.record_embedding(getattr(response, "usage", None))
         return response
@@ -2786,7 +2873,28 @@ def main(argv=None):
 
         import ragas
 
-        tally = UsageTally()
+        # THE TWO MODEL IDS ARE THE ONES `cost()` IS HANDED FIFTY LINES
+        # BELOW, so the running charge and the reported total price the same
+        # responses against the same rates.
+        tally = UsageTally(judge_model=args.judge_model,
+                           embedding_model=args.embedding_model)
+        # ── THE SPEND GATE ────────────────────────────────────────────────
+        #
+        # ONE RESET AND ONE BANNER, before the first billed call. The ledger is
+        # process-global and this is a one-shot command, so it starts fresh;
+        # what it must NOT do is inherit a total from an earlier main() in the
+        # same interpreter.
+        #
+        # THERE IS NO SEED. Unlike the rater, `--resume` here re-scores from a
+        # partial journal rather than resuming a submitted batch, and the
+        # journal records SCORES rather than spend -- so there is no persisted
+        # total to inherit, and inventing one from the journal's row count
+        # would be an estimate deciding a budget. The consequence is stated:
+        # `config.SPEND_CAP_USD` binds within one ragas invocation and not
+        # across a resumed pair of them.
+        spend.SPEND_LEDGER.reset()
+        spend.SPEND_STOP.reset()
+        console.out(spend.describe_cap())
         llm = build_judge(args.judge_model, args.temperature, args.max_tokens,
                           tally, args.max_retries)
         # No embedder is CONSTRUCTED unless a selected metric needs one, so a
@@ -2831,6 +2939,12 @@ def main(argv=None):
 
     summary = summarize(scores, run, active)
     cost = tally.cost(args.judge_model, args.embedding_model)
+    # THE SPEND BLOCK. `tally.cost` above is this harness's own report of what
+    # it spent; this is the shared ledger's, and printing both is deliberate --
+    # they are computed from the same responses through the same rates, so if
+    # they ever disagree one of the two has stopped seeing a call.
+    for _line in spend.report_lines():
+        console.out(_line)
 
     write_json(results_path, build_results(scores, run, active))
     write_json(manifest_path,

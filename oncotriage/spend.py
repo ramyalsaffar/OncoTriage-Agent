@@ -43,11 +43,17 @@ WHAT IT STILL CANNOT SEE, stated rather than glossed:
     response arrived reports none at all. Neither is visible to any Python in
     this process, and inventing a figure from prompt length would put a number
     in a measurement column that no provider ever reported.
-  * anything billed outside Stage 5. Embeddings at index time
-    (``retrieval/indexer.py``), the independent rater
-    (``evaluation/rater.py``, a different vendor and a different price table)
-    and the ragas harness are NOT instrumented. This gate is the batch runner's,
-    and ``config.SPEND_CAP_USD`` says so.
+  * the four ungated sites named in ``BILLED_SITES``, each with the argument
+    for leaving it out and each PRINTED by ``report_lines()`` on every run.
+    **THIS BULLET USED TO SAY SOMETHING MUCH LARGER AND THE CORRECTION IS THE
+    SPEND-COVERAGE PASS.** It read: "anything billed outside Stage 5.
+    Embeddings at index time, the independent rater and the ragas harness are
+    NOT instrumented. This gate is the batch runner's." All four billed paths
+    are instrumented now -- ``SPEND_SOURCES`` enumerates them -- and what is
+    left out is an index build, a validator's diagnostic, a flagged probe and a
+    free endpoint.
+  * spend in ANOTHER PROCESS. A campaign and a judge run separately, seed from
+    separate stores, and no shared ledger exists for them to net against.
   * a run whose prior fragments are unpriceable. See ``LedgerSeed`` below: a
     seeded baseline is a FLOOR when any prior row carried a NULL cost, and it
     says so rather than pretending otherwise.
@@ -99,7 +105,8 @@ imports.
 """
 
 import threading
-from collections import Counter
+import time
+from collections import Counter, deque
 from typing import NamedTuple, Optional
 
 from oncotriage import config
@@ -116,8 +123,23 @@ log = get_logger(__name__)
 SPEND_GATE_SKIPS = Counter()
 """Billed requests NOT issued because a spend limit was reached.
 
-Keyed ``{phase}:{limit}`` -- the phase is one of ``SPEND_SKIP_KEY_PREFIXES``
-and the limit is one of ``SPEND_LIMITS``.
+Keyed ``{phase}:{limit}``, where the limit is one of ``SPEND_LIMITS`` and the
+phase names WHERE the request would have gone out:
+
+  * Stage 5 keys by a ``SPEND_SKIP_KEY_PREFIXES`` member, because that node has
+    three billed call sites and which one declined decides what the patient
+    got: a ``warmup:`` skip means the patient sent nothing at all, a ``wave:``
+    skip means some trials were judged and some were not.
+  * every other billed path keys by its ``SPEND_SOURCES`` member, because each
+    of them has exactly one call site and the useful distinction there is the
+    PATH -- an operator reading ``rater_batch:spend_cap`` beside
+    ``wave:spend_cap`` is being told which of the program's two spends the
+    budget stopped.
+
+The two key spaces are disjoint by construction (a Stage 5 prefix ends in a
+colon and is not a ``SPEND_SOURCES`` member) and ``tests/test_spend_coverage.py``
+requires them to stay so, because a key that could be read as either would make
+this counter uninterpretable in exactly the report it exists for.
 
 MONEY NOT SPENT, RECORDED ANYWAY, on ``STAGE5_SHUTDOWN_SKIPS``' footing: every
 other counter in the degradation registry names something that went wrong, and
@@ -215,13 +237,149 @@ operator's report as an unclassified key.
 SEED_SOURCE_NONE = "fresh"
 SEED_SOURCE_CAMPAIGN = "campaign_rows"
 
-SEED_SOURCES = (SEED_SOURCE_NONE, SEED_SOURCE_CAMPAIGN)
+SEED_SOURCE_RATER_STATE = "rater_state"
+"""A rater invocation resuming a batch session, seeded from its own state file.
+
+IT IS A THIRD MEMBER RATHER THAN A REUSE OF ``campaign_rows``. That one names a
+sum over ``inferences.estimated_cost_usd`` walked over the ``runs`` chain; this
+one names a running total the rater writes into ``rater_state.json`` after each
+batch is collected. Different store, different arithmetic, different price
+table -- and an operator reading a resumed judge's banner is entitled to know
+which of the two answered.
+"""
+
+SEED_SOURCES = (SEED_SOURCE_NONE, SEED_SOURCE_CAMPAIGN,
+                SEED_SOURCE_RATER_STATE)
 """Where a ledger's starting balance came from. CLOSED.
 
 ``fresh`` is a run that is resuming nothing, and it is a VALUE rather than an
 absence: "this campaign has no prior spend" and "nobody asked" are different
 statements, and only the first supports a remaining-budget figure.
 """
+
+
+# ===========================================================================
+# WHERE THE MONEY WENT
+# ===========================================================================
+
+SPEND_SOURCE_STAGE5 = "stage5"
+SPEND_SOURCE_EMBEDDING = "query_embedding"
+SPEND_SOURCE_RATER = "rater_batch"
+SPEND_SOURCE_RAGAS_JUDGE = "ragas_judge"
+SPEND_SOURCE_RAGAS_EMBEDDING = "ragas_embedding"
+
+SPEND_SOURCES = (SPEND_SOURCE_STAGE5, SPEND_SOURCE_EMBEDDING,
+                 SPEND_SOURCE_RATER, SPEND_SOURCE_RAGAS_JUDGE,
+                 SPEND_SOURCE_RAGAS_EMBEDDING)
+"""Every billed path this ledger is charged from. CLOSED, and a caller may
+branch on it exhaustively.
+
+**THIS TUPLE IS THE ANSWER TO "WHAT DOES THE CAP COVER".** Until the
+spend-coverage pass it had one member in all but name: the gate instrumented
+Stage 5 and the module docstring said so, while three other billed paths --
+Stage 2's dense query embedding, the independent rater, and the ragas harness
+-- spent money the cap could not see. A budget that covers one door of a
+building with four is not a budget.
+
+WHAT IS **NOT** HERE IS AS LOAD-BEARING AS WHAT IS, and it is not an oversight:
+see ``BILLED_SITE_EXEMPTIONS``, where every ungated billed call site in this
+repository is named with the argument for leaving it out, and
+``report_lines()``, which PRINTS them on every run so an operator reading a cap
+figure knows exactly what it does not bound.
+
+THE MEMBERS ARE PATHS, NOT VENDORS. ``rater_batch`` and ``ragas_judge`` both
+reach Anthropic and are separate because they are separate *decisions* an
+operator makes and separate money they can choose not to spend; ``stage5`` and
+``query_embedding`` both reach OpenAI in the same process for the same patient
+and are separate because one of them is 99.9% of the bill and the reader needs
+to see that rather than infer it.
+"""
+
+
+# ===========================================================================
+# WHICH LIMIT THIS PROCESS IS UNDER
+# ===========================================================================
+
+SPEND_POLICY_CAMPAIGN = "campaign"
+SPEND_POLICY_WINDOW = "serving_window"
+
+SPEND_POLICIES = (SPEND_POLICY_CAMPAIGN, SPEND_POLICY_WINDOW)
+"""How this process's spend is bounded. CLOSED. Exactly one is in force.
+
+**A CAMPAIGN CAP IS THE WRONG SHAPE FOR A SERVER, IN BOTH DIRECTIONS, AND THE
+SHIPPED GATE HAD IT WRONG FOR EXACTLY THAT REASON.** ``campaign`` compares a
+MONOTONE total against a fixed budget, which is right for a batch run -- it has
+a beginning, an end, a cohort and a ``runs`` row, and when the money is gone
+the right answer is to stop and let an operator decide. Apply the same rule to
+``oncotriage/api/server.py`` or ``mcp_server.py`` and BOTH failure modes are
+live at once:
+
+  * **unbounded before the cap.** A server writes no ``runs`` row, so nothing
+    seeds its ledger and nothing resets it; it is one process that may serve
+    for months, and until it has spent the whole campaign budget by itself
+    there is no brake at all.
+  * **wrong refusals after it.** The total only grows, so the request AFTER the
+    cap is reached is declined, and so is every request for the life of the
+    process -- for money a campaign somewhere else was budgeted. The remedy an
+    operator would reach for is a restart, which resets the ledger and hands
+    the process a fresh unbounded budget: the brake is off exactly when it was
+    working.
+
+``serving_window`` is the shape that fits: a ROLLING window
+(``config.SERVING_SPEND_WINDOW_SECONDS``) against
+``config.SERVING_SPEND_CAP_USD``. It is bounded (a runaway loop is stopped
+within one window's spend), it self-heals (the window rolls, so a server
+recovers with no restart and no operator), and it cannot be defeated by a
+restart loop -- restarting empties the window, which is exactly what waiting
+would have done anyway.
+
+IT IS PROCESS-GLOBAL AND THAT IS CORRECT RATHER THAN CONVENIENT. A process is a
+batch runner, or an ablation study, or a server; it is never two. The policy is
+installed once, by the entry point that knows which it is, and
+``policy_source()`` reports who installed it so a banner can say so.
+"""
+
+_POLICY_LOCK = threading.Lock()
+_POLICY = [SPEND_POLICY_CAMPAIGN, "default"]
+
+
+def set_policy(name: str, source: str = "caller") -> str:
+    """Install the limit shape this process runs under. Returns the previous.
+
+    RAISES on an unrecognised name rather than defaulting, on
+    ``deps.set_override``'s footing: a policy nobody recognises would silently
+    fall back to whichever branch the dispatch tests last, and the two branches
+    bound completely different quantities.
+    """
+    if name not in SPEND_POLICIES:
+        raise SpendCapConfigurationError(
+            f"{name!r} is not a spend policy. The closed vocabulary is "
+            f"{SPEND_POLICIES!r}. A policy that is not recognised cannot be "
+            f"read as 'the default' -- the two policies bound different "
+            f"quantities against different caps.")
+    with _POLICY_LOCK:
+        previous = _POLICY[0]
+        _POLICY[0] = name
+        _POLICY[1] = source
+    return previous
+
+
+def policy() -> str:
+    """The limit shape in force. ONE OWNER; every consumer asks this."""
+    return _POLICY[0]
+
+
+def policy_source() -> str:
+    """Who installed the policy in force. Diagnostic; free text."""
+    return _POLICY[1]
+
+
+def reset_policy() -> None:
+    """Back to the campaign default. For a process that installed one and is
+    done with it -- a test, an embedder that shut its server down."""
+    with _POLICY_LOCK:
+        _POLICY[0] = SPEND_POLICY_CAMPAIGN
+        _POLICY[1] = "default"
 
 
 # ===========================================================================
@@ -272,10 +430,23 @@ class SpendLedger:
         self._measured = 0.0
         self._calls = 0
         self._seed = LedgerSeed()
+        self._by_source = Counter()
+        self._calls_by_source = Counter()
+        # THE ROLLING WINDOW. One entry per charge, `(monotonic, usd)`, pruned
+        # on every write and every read so a server that runs for months holds
+        # one window's worth and not one process lifetime's.
+        #
+        # `time.monotonic` AND NOT `time.time`: an NTP step or a DST-driven
+        # wall-clock change must not empty this window (which hands a server a
+        # free budget) or fill it (which declines requests for money nobody
+        # spent). The window is a DURATION, and monotonic is the clock that
+        # measures durations.
+        self._events = deque()
 
     # -- accumulation ------------------------------------------------------
 
-    def charge(self, model, prompt_tokens, completion_tokens) -> float:
+    def charge(self, model, prompt_tokens, completion_tokens,
+               source: str = SPEND_SOURCE_STAGE5) -> float:
         """Add one response's measured cost. Returns what was added.
 
         NEVER RAISES. It is called immediately after a billed response arrives,
@@ -315,21 +486,148 @@ class SpendLedger:
             SPEND_LEDGER_FAULTS[
                 f"bad_usage:{type(prompt_tokens).__name__}/"
                 f"{type(completion_tokens).__name__}"] += 1
-            with self._lock:
-                self._calls += 1
+            self._commit(0.0, source)
             return 0.0
         try:
             cost = get_model_cost(model or config.matching_wire_model(),
                                   _in, _out)
         except UnknownModelPricingError:
             SPEND_LEDGER_FAULTS[f"unpriced_model:{model}"] += 1
-            with self._lock:
-                self._calls += 1
+            self._commit(0.0, source)
             return 0.0
+        self._commit(cost, source)
+        return cost
+
+    def charge_usd(self, usd, source: str) -> float:
+        """Add one ALREADY-PRICED amount. Returns what was added. NEVER RAISES.
+
+        THE SEAM FOR A VENDOR THIS MODULE CANNOT PRICE. ``charge()`` values a
+        response against ``config.PRICING_CONFIG``, which is the OpenAI /
+        Bedrock table and holds none of the Anthropic Batches rates, none of the
+        batch discount and no cache-tier multipliers. The rater already owns
+        that arithmetic in ONE function -- ``rater.price_usage``, over
+        ``config.RATER_PRICING`` -- so this takes the number that function
+        produced rather than growing a second copy of a price table it would
+        have to be kept in step with. The ``CROSS_ENCODER_MODEL`` argument,
+        applied to money.
+
+        **THE PRICING STAYS WITH THE PATH AND THE LIMIT STAYS HERE.** That
+        split is what lets one cap govern four billed paths priced four ways.
+
+        Args:
+            usd: a non-negative float. Anything else is a fault, counted and
+                dropped -- a ledger that accepted a string or a negative would
+                make the cap enforce against a number nobody measured, in the
+                one direction a spend gate must not fail in silently.
+            source: a ``SPEND_SOURCES`` member. An unrecognised source is
+                CHARGED ANYWAY and counted as a fault: refusing the money
+                because its label is unknown would understate the bill, which
+                is worse than an unfamiliar key in a report.
+        """
+        if isinstance(usd, bool) or not isinstance(usd, (int, float)):
+            SPEND_LEDGER_FAULTS[f"bad_amount:{type(usd).__name__}"] += 1
+            self._commit(0.0, source)
+            return 0.0
+        if usd != usd or usd in (float("inf"), float("-inf")):
+            # NaN AND THE INFINITIES, EXPLICITLY. `float('nan') < 0` is False,
+            # so a NaN would pass the sign test below and then poison every
+            # later comparison the cap is decided by -- `total >= cap` is False
+            # for a NaN total, which is a gate that has silently turned itself
+            # off. `inf` fails the other way and would decline every request
+            # for ever.
+            SPEND_LEDGER_FAULTS[f"bad_amount:{usd!r}"] += 1
+            self._commit(0.0, source)
+            return 0.0
+        if usd < 0:
+            SPEND_LEDGER_FAULTS[f"bad_amount:negative"] += 1
+            self._commit(0.0, source)
+            return 0.0
+        self._commit(float(usd), source)
+        return float(usd)
+
+    def _commit(self, cost: float, source: str) -> None:
+        """The ONE write. Every charge lands here; nothing else touches state.
+
+        ONE OWNER SO THE TOTAL, THE WINDOW AND THE PER-SOURCE BREAKDOWN CANNOT
+        DISAGREE. Two writers would be two chances for a path to move one and
+        not the others, and the failure would be a report whose columns do not
+        add up while the cap enforces against whichever one the dispatch reads.
+
+        A ZERO-COST CHARGE STILL APPENDS AN EVENT AND STILL COUNTS A CALL. Both
+        are deliberate: the call count is the denominator
+        ``SPEND_LEDGER_FAULTS`` is read against, and a zero in the window is
+        harmless while a missing one would make the pruning arithmetic depend on
+        whether a response happened to be priceable.
+        """
+        now = time.monotonic()
         with self._lock:
             self._measured += cost
             self._calls += 1
-        return cost
+            self._by_source[source] += cost
+            self._calls_by_source[source] += 1
+            self._events.append((now, cost))
+            self._prune(now)
+
+    def _prune(self, now: float) -> None:
+        """Drop events older than the widest window anyone can ask about.
+
+        CALLED WITH ``self._lock`` HELD. The horizon is read from configuration
+        on every call rather than captured once, because
+        ``SERVING_SPEND_WINDOW_SECONDS`` can move within a process (a test sets
+        it) and a deque pruned against a stale horizon would answer a widened
+        window with events it had already thrown away -- a window that silently
+        reports less than it covers, which is the under-enforcing direction.
+
+        AN UNREADABLE HORIZON PRUNES NOTHING. Growing is the safe failure here:
+        a window that holds too much over-reports and therefore over-enforces,
+        and the memory it costs is bounded by the run, while a window pruned to
+        nothing is a brake that has been removed by a typo.
+        """
+        horizon = getattr(config, "SERVING_SPEND_WINDOW_SECONDS", None)
+        if isinstance(horizon, bool) or not isinstance(horizon, (int, float)):
+            return
+        if horizon <= 0:
+            return
+        cut = now - float(horizon)
+        while self._events and self._events[0][0] < cut:
+            self._events.popleft()
+
+    def window_spend(self, seconds=None) -> float:
+        """What this process has been billed within the last ``seconds``.
+
+        ``None`` asks ``config.SERVING_SPEND_WINDOW_SECONDS``. Prunes first, so
+        the number is current rather than as-of the last charge -- which matters
+        for exactly the case the window exists for: a server that has been idle
+        long enough for its window to empty must be able to serve again WITHOUT
+        a request having to arrive to trigger the pruning.
+        """
+        if seconds is None:
+            seconds = getattr(config, "SERVING_SPEND_WINDOW_SECONDS", None)
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+            return self._measured
+        if seconds <= 0:
+            return 0.0
+        now = time.monotonic()
+        cut = now - float(seconds)
+        with self._lock:
+            self._prune(now)
+            return sum(cost for stamp, cost in self._events if stamp >= cut)
+
+    def by_source(self) -> dict:
+        """``{source: usd}``, a copy. The reader for "where did it go".
+
+        ``dict(Counter)`` UNDER THE LOCK, not a live view: the caller iterates
+        it while worker threads are still charging, and a Counter mutated during
+        iteration raises ``RuntimeError`` -- the defect ``degradation.snapshot``
+        had to fix once already, met here before it could happen a second time.
+        """
+        with self._lock:
+            return dict(self._by_source)
+
+    def calls_by_source(self) -> dict:
+        """``{source: n}``, a copy. The denominator for the line above."""
+        with self._lock:
+            return dict(self._calls_by_source)
 
     def seed(self, seed: LedgerSeed) -> None:
         """Install a resumed campaign's prior spend. Called once, from ``main()``.
@@ -347,6 +645,9 @@ class SpendLedger:
             self._measured = 0.0
             self._calls = 0
             self._seed = LedgerSeed()
+            self._by_source.clear()
+            self._calls_by_source.clear()
+            self._events.clear()
 
     # -- reading -----------------------------------------------------------
 
@@ -443,8 +744,58 @@ def spend_cap() -> Optional[float]:
     return float(cap)
 
 
+def serving_spend_cap() -> Optional[float]:
+    """The rolling-window cap a SERVING process runs under, or None. ONE OWNER.
+
+    ``spend_cap()``'s validation, applied to the other constant and for the same
+    reasons -- a negative is not "unlimited" and a string is not a budget. It is
+    a separate function rather than a parameter because the two caps mean
+    different things and are read by different processes: this one bounds a RATE
+    over ``config.SERVING_SPEND_WINDOW_SECONDS`` and that one bounds a CAMPAIGN
+    total, and sharing a resolver would make a message about one able to name
+    the other.
+    """
+    cap = getattr(config, "SERVING_SPEND_CAP_USD", None)
+    if cap is None:
+        return None
+    if isinstance(cap, bool) or not isinstance(cap, (int, float)):
+        raise SpendCapConfigurationError(
+            f"config.SERVING_SPEND_CAP_USD must be a number of US dollars or "
+            f"None for no cap; it is {cap!r} ({type(cap).__name__}).")
+    if cap < 0:
+        raise SpendCapConfigurationError(
+            f"config.SERVING_SPEND_CAP_USD is {cap!r}. A negative cap is not "
+            f"'unlimited'; set it to None if that is what you mean.")
+    return float(cap)
+
+
+def active_cap() -> Optional[float]:
+    """The cap the policy in force is enforced against, or None. May raise."""
+    if policy() == SPEND_POLICY_WINDOW:
+        return serving_spend_cap()
+    return spend_cap()
+
+
+def active_spend() -> float:
+    """The quantity the policy in force compares against ``active_cap()``.
+
+    THE TWO POLICIES MEASURE DIFFERENT QUANTITIES AND THIS IS WHERE THAT LIVES.
+    Campaign: the seeded baseline plus everything this process has been billed,
+    monotone. Window: only what was billed inside the last
+    ``SERVING_SPEND_WINDOW_SECONDS``, which can go DOWN -- and going down is the
+    whole point, because it is what lets a server recover on its own.
+    """
+    if policy() == SPEND_POLICY_WINDOW:
+        return SPEND_LEDGER.window_spend()
+    return SPEND_LEDGER.total
+
+
 def cap_exceeded() -> bool:
-    """Has this campaign spent its budget? A cheap read; never raises.
+    """Has this process spent its budget under the policy in force?
+
+    A cheap read; never raises. See ``SPEND_POLICIES`` for why "its budget" is
+    two different questions and why a server may not be asked the batch
+    runner's.
 
     THE HOT-PATH QUESTION. It is called before every billed request and from
     ``_start_patient_unless_stopped`` once per patient, so it does one float
@@ -464,12 +815,12 @@ def cap_exceeded() -> bool:
     if not config.SPEND_CAP_ENFORCED:
         return False
     try:
-        cap = spend_cap()
+        cap = active_cap()
     except SpendCapConfigurationError:
         return False
     if cap is None:
         return False
-    return SPEND_LEDGER.total >= cap
+    return active_spend() >= cap
 
 
 def remaining() -> Optional[float]:
@@ -479,12 +830,329 @@ def remaining() -> Optional[float]:
     overshoot rather than a zero that hides it.
     """
     try:
-        cap = spend_cap()
+        cap = active_cap()
     except SpendCapConfigurationError:
         return None
     if cap is None:
         return None
-    return cap - SPEND_LEDGER.total
+    return cap - active_spend()
+
+
+class SpendLimitReached(RuntimeError):
+    """A billed request was NOT issued because a spend limit was reached.
+
+    THE NON-STAGE-5 PATHS' EQUIVALENT OF ``Stage5SpendStopped``, and it is a
+    separate class rather than a shared one for a layering reason and a
+    semantic one. ``oncotriage/agent/evaluation.py`` may not be imported by
+    ``oncotriage/evaluation/rater.py`` (a different vendor, a different
+    program, and it would drag the whole graph into a judge that never touches
+    it), and Stage 5's class is a ``Stage5ShutdownRequested`` subclass
+    precisely so the node's two shutdown-aware branches cover it -- semantics a
+    rater has no analogue for.
+
+    A ``RuntimeError`` subclass and deliberately NOT a ``ValueError``, on
+    ``UnknownModelPricingError``'s precedent: a stray ``except ValueError``
+    around a request must not be able to eat a refusal about money.
+
+    ``limit`` AND ``source`` ARE ATTRIBUTES, not just words in the message,
+    because two callers branch on them -- the API turns one into an HTTP status
+    and the MCP server into a payload shape -- and parsing a reason out of an
+    exception's text is how those two would drift apart from this one.
+    """
+
+    def __init__(self, message, limit=SPEND_LIMIT_CAP, source=None):
+        super().__init__(message)
+        self.limit = limit
+        self.source = source
+
+
+def seconds_until_under_cap() -> Optional[float]:
+    """How long until the rolling window falls back under its cap. Seconds.
+
+    ``None`` when the question does not apply -- no cap, enforcement off, the
+    campaign policy (whose total never falls), or already under budget.
+
+    **THIS IS WHAT MAKES A REFUSAL ACTIONABLE RATHER THAN JUST HONEST.** A
+    server declining for budget is a TEMPORARY condition that heals with no
+    operator, and the client's question is "when". Answering with the window
+    width would be a bound rather than an answer, and on a server one request
+    over its budget it is wrong by nearly the whole hour.
+
+    HOW IT IS DERIVED. The events are ordered oldest first, so dropping a
+    prefix of them is exactly what the passage of time will do. The smallest
+    prefix whose removal brings the remainder under the cap identifies the last
+    event that has to age out; that event leaves the window
+    ``SERVING_SPEND_WINDOW_SECONDS`` after it was charged, and the answer is
+    how far away that instant is.
+
+    IT ROUNDS UP AND ADDS A SECOND. Returning the exact instant would have a
+    client retry at the moment the comparison flips, where a float and a
+    ``>=`` decide; one second is the difference between an answer and a race.
+
+    IT IS A LOWER BOUND ON THE WAIT AND NOT A PROMISE, because other requests
+    are being served meanwhile and each adds to the window. That is inherent to
+    a shared budget and is why the caller sends it as ``Retry-After``, which
+    HTTP defines as a hint, rather than as a guarantee.
+    """
+    if not config.SPEND_CAP_ENFORCED or policy() != SPEND_POLICY_WINDOW:
+        return None
+    try:
+        cap = serving_spend_cap()
+    except SpendCapConfigurationError:
+        return None
+    if cap is None:
+        return None
+    width = getattr(config, "SERVING_SPEND_WINDOW_SECONDS", None)
+    if isinstance(width, bool) or not isinstance(width, (int, float)) \
+            or width <= 0:
+        return None
+    now = time.monotonic()
+    cut = now - float(width)
+    with SPEND_LEDGER._lock:                        # noqa: SLF001
+        # THE PRIVATE LOCK AND THE PRIVATE DEQUE, deliberately: this is the one
+        # question that cannot be answered from the public readers, because it
+        # needs the events IN ORDER rather than their sum. Adding a public
+        # accessor that hands the deque out would let a caller iterate it while
+        # workers append, which is the `RuntimeError` `by_source()` takes the
+        # lock to avoid. The coupling is inside one module and is stated here.
+        events = [(t, c) for t, c in SPEND_LEDGER._events if t >= cut]
+    total = sum(c for _t, c in events)
+    if total < cap:
+        return None
+    for stamp, cost in events:
+        total -= cost
+        if total < cap:
+            return max(0.0, (stamp + float(width)) - now) + 1.0
+    # EVERY EVENT AGED OUT AND THE WINDOW IS STILL AT OR OVER THE CAP, which
+    # means the cap is zero or negative -- a legitimate rehearsal of the
+    # unbilled path, and there is no instant at which it heals.
+    return None
+
+
+def latch_on_limit() -> bool:
+    """Should reaching a limit LATCH the run stop? Derived from the policy.
+
+    **THE LATCH IS A PROPERTY OF THE POLICY AND NOT A CHOICE EACH CALL SITE
+    MAKES.** Under ``campaign`` the answer is acted on by cancelling queued
+    work, the quantity only grows, and un-tripping is meaningless -- so it
+    latches, which is what makes the announcement happen once instead of once
+    per worker. Under ``serving_window`` the quantity can go DOWN, and that is
+    the whole design: a latched server would decline for ever having once been
+    briefly over its rate, which is the "wrong refusals" half of the defect
+    ``SPEND_POLICIES`` describes, reintroduced through the back door.
+
+    IT IS DERIVED RATHER THAN PASSED because a parameter is a thing a call site
+    can get wrong, and there are five of them across four modules. A serving
+    surface gets the right behaviour by installing its policy, which is the one
+    thing it must do anyway.
+    """
+    return policy() != SPEND_POLICY_WINDOW
+
+
+def require_budget(source: str, where: str, *, latch=None) -> None:
+    """Raise ``SpendLimitReached`` if the policy in force says stop. Else return.
+
+    **THE PRE-CALL GATE FOR EVERY BILLED PATH THAT IS NOT STAGE 5.** Stage 5 has
+    ``evaluation._spend_gate``, which returns rather than raises because one of
+    its three call sites runs on a worker thread and must hand its outcome back
+    as a tagged pair. Nothing else in this project has that constraint, so
+    everything else raises -- which is what makes the gate impossible to forget
+    to check.
+
+    Args:
+        source: a ``SPEND_SOURCES`` member, for the counter key.
+        where: free text naming the call site, for the log line.
+        latch: whether to LATCH ``SPEND_STOP``. ``None`` -- the default and
+            what every production call site passes -- asks
+            ``latch_on_limit()``, which derives it from the policy in force and
+            is where that decision is argued. An explicit ``True``/``False``
+            forces it, and exists for a test that needs to drive one half
+            against the other policy.
+    """
+    if not cap_exceeded():
+        return
+    SPEND_GATE_SKIPS[f"{source}:{SPEND_LIMIT_CAP}"] += 1
+    if latch_on_limit() if latch is None else latch:
+        SPEND_STOP.poll(where=where)
+    try:
+        cap = active_cap()
+    except SpendCapConfigurationError:
+        cap = None
+    spent = active_spend()
+    log.warning("a billed request was not issued because a spend limit was "
+                "reached", status="stopped", event="spend_limit_declined",
+                phase=source, reason=SPEND_LIMIT_CAP, mode=where,
+                cost_usd=round(spent, 6),
+                threshold=(round(cap, 6) if cap is not None else None),
+                degraded=True)
+    raise SpendLimitReached(
+        f"the request was not issued: this process has spent "
+        f"${spent:.2f} against a {policy()} limit of "
+        f"{'no cap' if cap is None else f'${cap:.2f}'}",
+        limit=SPEND_LIMIT_CAP, source=source)
+
+
+# ===========================================================================
+# WHAT THE CAP DOES NOT COVER
+# ===========================================================================
+
+DISPOSITION_GATED_HERE = "gated_here"
+DISPOSITION_GATED_UPSTREAM = "gated_upstream"
+DISPOSITION_EXEMPT = "exempt"
+
+BILLED_SITE_DISPOSITIONS = (DISPOSITION_GATED_HERE, DISPOSITION_GATED_UPSTREAM,
+                            DISPOSITION_EXEMPT)
+"""How a billed call site stands with respect to the cap. CLOSED.
+
+  ``gated_here``      the function itself calls ``require_budget`` before the
+                      request, in its own body or in a closure inside it.
+  ``gated_upstream``  a named caller gates it. The site is reached only through
+                      that caller, so gating it twice would decline the same
+                      request against the same ledger for the same reason.
+  ``exempt``          not gated, on purpose, with the argument beside it.
+"""
+
+BILLED_SITES = {
+    # ── STAGE 5 ───────────────────────────────────────────────────────────
+    "oncotriage/agent/evaluation.py::call_matching_model": (
+        DISPOSITION_GATED_UPSTREAM,
+        "oncotriage/agent/evaluation.py::_spend_gate",
+        "The Stage 5 node brackets all three of its billed call sites -- the "
+        "gate immediately before the request and the charge immediately "
+        "after -- which is what bounds the overshoot at the requests in "
+        "flight rather than at a whole patient's wave. Gating inside this "
+        "function as well would decline the same request twice and would "
+        "break the counter's phase keys, which name WHICH of the three sites "
+        "declined."),
+    "oncotriage/agent/evaluation.py::call_matching_model_warmup": (
+        DISPOSITION_GATED_UPSTREAM,
+        "oncotriage/agent/evaluation.py::_spend_gate",
+        "The per-trial cache writer, gated at the `warmup:` phase. See the "
+        "entry above."),
+    "oncotriage/agent/bedrock_adapter.py::call_matching_model_bedrock": (
+        DISPOSITION_GATED_UPSTREAM,
+        "oncotriage/agent/evaluation.py::call_matching_model",
+        "The Responses-API arm of Stage 5. `call_matching_model` DISPATCHES "
+        "on `config.MATCHING_PROVIDER` and this is one of the three branches, "
+        "so it is behind the same gate by construction -- and the gate must "
+        "stay in the dispatcher rather than in each branch, or a fourth "
+        "provider would arrive ungated with nothing saying so."),
+    "oncotriage/agent/bedrock_anthropic_adapter.py::_issue_converse": (
+        DISPOSITION_GATED_UPSTREAM,
+        "oncotriage/agent/evaluation.py::call_matching_model",
+        "The Converse arm of Stage 5. See the entry above."),
+
+    # ── GATED IN THEIR OWN BODY ───────────────────────────────────────────
+    "oncotriage/agent/models.py::get_embedding": (
+        DISPOSITION_GATED_HERE, None,
+        "Stage 2's dense retrieval channel: one billed call per patient, in "
+        "the same process and the same pipeline as Stage 5, and invisible to "
+        "the cap until the spend-coverage pass. It is cents against Stage "
+        "5's hundreds of dollars, which is an argument about how much a hole "
+        "leaks rather than about whether it is one."),
+    "oncotriage/evaluation/rater.py::submit_batches": (
+        DISPOSITION_GATED_HERE, None,
+        "The independent judge, priced from `config.RATER_PRICING` and "
+        "charged through `rater.charge_batch_to_ledger`. Gated PER CHUNK "
+        "rather than once before the loop, so the overshoot is one batch."),
+    "oncotriage/evaluation/ragas_harness.py::build_judge": (
+        DISPOSITION_GATED_HERE, None,
+        "The ragas judge. The gate is inside the `recording_create` closure "
+        "this function installs, which is the one point where a request this "
+        "harness does not own the loop for can be declined."),
+    "oncotriage/evaluation/ragas_harness.py::build_embeddings": (
+        DISPOSITION_GATED_HERE, None,
+        "The ragas embedder. See the entry above."),
+
+    # ── EXEMPT, EACH ARGUED ───────────────────────────────────────────────
+    "oncotriage/retrieval/indexer.py::get_embeddings_batch::_call": (
+        DISPOSITION_EXEMPT, None,
+        "AN INDEX BUILD IS NOT A CAMPAIGN. `11- RAG Trial Indexer.py` is a "
+        "separate operator command with a separate decision behind it; its "
+        "cost is bounded by the corpus rather than by a cohort, and it runs "
+        "in a process that opens no `runs` row and resumes no chain. Gating "
+        "it on the campaign cap would let a campaign that spent its budget "
+        "refuse the index rebuild a NEXT campaign needs -- and the money is "
+        "in the wrong order of magnitude for that trade: 14,324 trials of "
+        "text-embedding-3-small is cents. The brake an index build needs is a "
+        "different one, and inventing it here would be a second budget nobody "
+        "asked for."),
+    "oncotriage/retrieval/index_validator.py::stage2_retrieval_tests": (
+        DISPOSITION_EXEMPT, None,
+        "A DIAGNOSTIC MUST NOT BE DISABLED BY THE THING IT DIAGNOSES. One "
+        "embedding call inside `12- RAG Trial Indexer Validator.py`, whose "
+        "job is to answer whether the index is healthy -- and a campaign that "
+        "has just stopped on its cap is exactly when an operator runs it. "
+        "`deps.peek` / `resolution_state` were added under this rule."),
+    "oncotriage/evaluation/rater.py::calibrate_chars_per_token": (
+        DISPOSITION_EXEMPT, None,
+        "NOT A BILLED CALL. `/v1/messages/count_tokens` is free -- stated on "
+        "the function and the reason it exists at all. It is named here "
+        "rather than left out because it is an Anthropic API call inside a "
+        "module this pass gated, so a reader auditing the gate WILL find it "
+        "and is owed the answer in the same place as the others."),
+    "oncotriage/fixtures/replay.py::main": (
+        DISPOSITION_EXEMPT, None,
+        "THE OPENAI TRIPWIRE, AND IT IS THE OPPOSITE OF A BILLED CALL. The "
+        "replay harness calls `chat.completions.create` on a stand-in that "
+        "RAISES, twice, as a negative control -- once through the shadowed "
+        "path and once unshadowed -- and refuses to replay unless both do. "
+        "Gating it would make a spend limit able to disable the check that "
+        "proves no fixture replay reaches a live endpoint."),
+    "bedrock_probe.py::main": (
+        DISPOSITION_EXEMPT, None,
+        "THE DELIBERATE FLAGGED SPEND. It refuses to do anything without "
+        "`--i-understand-this-bills` (exit 2, nothing called, nothing "
+        "billed), it is two to three calls, and its entire purpose is to bill "
+        "them in order to settle a configuration question before a campaign's "
+        "worth of money rests on it. A cap that could refuse the probe would "
+        "refuse the measurement that tells an operator what the cap should "
+        "be."),
+    "bedrock_probe.py::_probe_bedrock_anthropic": (
+        DISPOSITION_EXEMPT, None,
+        "The Converse branch of the probe. See the entry above."),
+    "bedrock_probe.py::_probe_throttle_ceiling::_one": (
+        DISPOSITION_EXEMPT, None,
+        "The probe's throttling measurement. See `bedrock_probe.py::main`."),
+}
+"""Every site in this repository that touches a billed provider endpoint, with
+its disposition and the argument for it. CLOSED, and derived-against.
+
+**AN EXEMPTION WITHOUT A PINNED ARGUMENT IS THE NEXT HOLE WAITING TO BE
+FOUND.** Four of the sites below were, until the spend-coverage pass, simply
+absent from everyone's mental model of what the cap covered -- which is how
+"the gate instruments Stage 5" became "the project has a spend gate" in every
+later reading of it. `tests/test_spend_coverage.py` DERIVES the site list from
+source, by walking every `.py` in the repository for an ATTRIBUTE ACCESS of a
+billed endpoint name at any nesting depth, and requires the result to equal
+this dict's keys EXACTLY, in both directions -- so a new billed path fails, and
+an entry whose site no longer exists fails too, and the table cannot rot into a
+permission slip.
+
+**THE SCAN IS ON ATTRIBUTE ACCESS AND NOT ON CALLS, and that is not
+fastidiousness: it is the only rule that catches
+`oncotriage/evaluation/ragas_harness.py`.** That module captures
+`real_create = client.messages.create` and calls it later through the
+reference, so a call-shaped scan reports the file as touching no billed
+endpoint at all -- which is exactly what the first version of this derivation
+reported, about a module that spends real money on two vendors. You cannot bill
+without naming one of these attributes; you can bill without a call node the
+scanner recognises.
+
+WHAT IT STILL CANNOT SEE, stated: an endpoint reached by `getattr(client,
+"converse")`, and any billed API this project does not yet use. Both are named
+in the test so the limit travels with the check.
+"""
+
+BILLED_SITE_EXEMPTIONS = {
+    site: why for site, (disposition, _gate, why) in BILLED_SITES.items()
+    if disposition == DISPOSITION_EXEMPT
+}
+"""The ungated subset, DERIVED from the table above rather than listed beside
+it. ``report_lines()`` prints the keys on every run: an operator reading
+``cap $300.00`` is entitled to know, in the same block, the places that figure
+does not bound -- which is the difference between a budget and a number.
+"""
 
 
 # ===========================================================================
@@ -780,6 +1448,37 @@ def describe_cap() -> str:
     return f"[Spend] Cap ${cap:.2f} per campaign."
 
 
+def describe_serving_cap() -> str:
+    """One line for a SERVING process's startup banner.
+
+    A SEPARATE FUNCTION FROM ``describe_cap()`` BECAUSE IT DESCRIBES A
+    DIFFERENT QUANTITY, and a server that printed "Cap $300.00 per campaign"
+    would be announcing a bound it does not run under. It prints on every start,
+    uncapped included, for ``describe_cap()``'s reason: the dangerous state must
+    not be the quiet one.
+    """
+    try:
+        cap = serving_spend_cap()
+    except SpendCapConfigurationError as exc:
+        return f"[Spend] REFUSING TO READ THE SERVING CAP: {exc}"
+    window = getattr(config, "SERVING_SPEND_WINDOW_SECONDS", None)
+    if cap is None:
+        return ("[Spend] NO SERVING SPEND CAP IS SET "
+                "(config.SERVING_SPEND_CAP_USD is None). This server may spend "
+                "without limit.")
+    minutes = (f"{float(window) / 60.0:.0f} min"
+               if isinstance(window, (int, float))
+               and not isinstance(window, bool) and window > 0
+               else "an unreadable window")
+    if not config.SPEND_CAP_ENFORCED:
+        return (f"[Spend] Serving cap ${cap:.2f} per {minutes} -- MEASURED "
+                f"ONLY. config.SPEND_CAP_ENFORCED is False, so nothing will be "
+                f"declined.")
+    return (f"[Spend] Serving cap ${cap:.2f} per rolling {minutes}. Requests "
+            f"are declined while the window is over budget and resume on their "
+            f"own as it rolls -- no restart, no operator.")
+
+
 def describe_seed(seed: LedgerSeed) -> str:
     """One line for the run banner about what a resume inherited."""
     if seed.source == SEED_SOURCE_NONE or seed.runs == 0:
@@ -801,6 +1500,8 @@ def report_lines() -> list:
     block's argument, applied to the one number an operator asks for first.
     """
     lines = ["SPEND", "-" * 60]
+    lines.append(f"  policy              {policy()}  "
+                 f"(installed by {policy_source()})")
     seed = SPEND_LEDGER.seeded
     # THREE STATES, NOT TWO, AND THEY ARE DECIDED BEFORE ANYTHING IS PRINTED.
     # A cap that could not be READ is not a cap that is ABSENT, and the first
@@ -810,7 +1511,10 @@ def report_lines() -> list:
     # different claims about the same value.
     cap, cap_error = None, None
     try:
-        cap = spend_cap()
+        # active_cap(), NOT spend_cap(): identical under the campaign policy
+        # this block was written for, and correct for a serving process, which
+        # would otherwise print the campaign cap it does not run under.
+        cap = active_cap()
     except SpendCapConfigurationError as exc:
         cap_error = exc
     lines.append(f"  this process        ${SPEND_LEDGER.measured:.4f} "
@@ -820,6 +1524,17 @@ def report_lines() -> list:
                      f"over {seed.rows} row(s) from {seed.runs} prior run(s)"
                      + ("  <- A FLOOR, NOT A TOTAL" if seed.is_floor else ""))
     lines.append(f"  campaign total      ${SPEND_LEDGER.total:.4f}")
+    # WHERE IT WENT. Printed only when more than one path spent, because on a
+    # batch run every dollar is Stage 5's and a one-row breakdown under a total
+    # it equals is noise -- but the moment a second path contributes, a reader
+    # asked to act on the total needs to know which of the program's spends
+    # moved it.
+    _by = {k: v for k, v in SPEND_LEDGER.by_source().items() if v}
+    if len(_by) > 1:
+        _calls_by = SPEND_LEDGER.calls_by_source()
+        for _src in sorted(_by, key=lambda k: (-_by[k], k)):
+            lines.append(f"    {_src:<18}${_by[_src]:.4f}  over "
+                         f"{_calls_by.get(_src, 0)} charge(s)")
     if cap_error is not None:
         lines.append(f"  cap                 UNREADABLE: {cap_error}")
     elif cap is None:
@@ -832,6 +1547,15 @@ def report_lines() -> list:
     if SPEND_LEDGER_FAULTS:
         lines.append(f"  UNPRICED RESPONSES  {sum(SPEND_LEDGER_FAULTS.values())}"
                      f"  <- the total above is LOWER than the truth")
+    # WHAT THE FIGURE ABOVE DOES NOT BOUND. UNCONDITIONAL, on describe_cap()'s
+    # argument: a reader handed a cap is owed, in the same block, the places it
+    # does not reach. Naming them only when one of them ran would make the
+    # silence read as coverage.
+    lines.append(f"  NOT COVERED BY THE CAP -- {len(BILLED_SITE_EXEMPTIONS)} "
+                 f"billed-looking site(s), each argued at "
+                 f"spend.BILLED_SITE_EXEMPTIONS:")
+    for _site in sorted(BILLED_SITE_EXEMPTIONS):
+        lines.append(f"    {_site}")
     return lines
 
 

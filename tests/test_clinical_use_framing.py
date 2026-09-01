@@ -1011,15 +1011,22 @@ check("5a  it still imports BOTH framing names",
 _MCP_NAMES = [node.id for node in ast.walk(ast.parse(_MCP_SOURCE))
               if isinstance(node, ast.Name)
               and node.id.startswith("NOT_FOR_CLINICAL_USE")]
-check("5b  the LONG one is read on the result payloads — five sites, unchanged "
-      "by this pass",
-      _MCP_NAMES.count("NOT_FOR_CLINICAL_USE") >= 5, True)
+check("5b  the LONG one is read on the result payloads — six sites",
+      _MCP_NAMES.count("NOT_FOR_CLINICAL_USE") >= 6, True)
 check("5c  the SHORT one is read on the tool descriptions",
       _MCP_NAMES.count("NOT_FOR_CLINICAL_USE_SHORT") >= 3, True)
+# THIS COUNT MOVED FROM FIVE TO SIX AT THE SPEND-COVERAGE PASS AND IT IS THE
+# CHECK WORKING. `oncotriage/mcp/server.py` gained a SIXTH result payload --
+# `_budget_unavailable_result`, the refusal a billed tool returns when the
+# spend limit is reached -- and it carries the framing like every other one.
+# THE PIN STAYS EXACT rather than becoming `>= 5`: the property is that EVERY
+# payload this server can return carries the field, and only an exact count
+# fails when a seventh is added without it. A relaxed bound would pass over
+# exactly the defect it exists to catch.
 check("5d  and it spells the field the same way this pass spells it, so the "
       "two surfaces answer one fact with one key",
       _dict_value_bindings(_MCP_SOURCE, "not_for_clinical_use"),
-      ["NOT_FOR_CLINICAL_USE"] * 5)
+      ["NOT_FOR_CLINICAL_USE"] * 6)
 
 
 #------------------------------------------------------------------------------

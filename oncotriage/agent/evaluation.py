@@ -1511,7 +1511,20 @@ def _spend_gate(phase, counter, *, where, count=None):
     """
     if spend.cap_exceeded():
         spend.SPEND_GATE_SKIPS[f"{phase}{spend.SPEND_LIMIT_CAP}"] += 1
-        spend.SPEND_STOP.poll(where=where)
+        # THE LATCH IS ASKED FOR RATHER THAN TAKEN, and that one condition is
+        # what makes this node correct inside a SERVER as well as inside a
+        # batch run. `spend.latch_on_limit()` is False under the rolling-window
+        # policy `oncotriage/api/server.py` and `mcp_server.py` install: the
+        # window can go DOWN, so a latch here would make one over-budget minute
+        # decline every request for the life of the process -- the exact
+        # "wrong refusals" half of the defect the window policy exists to
+        # remove, reached through Stage 5 instead of through the surface.
+        #
+        # THE REFUSAL ITSELF IS UNCONDITIONAL. This request is still not
+        # issued, under either policy; what the policy decides is whether the
+        # NEXT one is refused by a latch or by asking the ledger again.
+        if spend.latch_on_limit():
+            spend.SPEND_STOP.poll(where=where)
         log.warning("a Stage 5 request was not issued because the campaign "
                     "has reached its spend cap", stage=5, status="stopped",
                     event="stage5_spend_cap_declined", phase=phase,
@@ -1536,6 +1549,12 @@ def _spend_gate(phase, counter, *, where, count=None):
         if _first:
             spend.SPEND_CEILING_TRIPS[
                 f"{counter.call_mode}:{counter.ceiling}"] += 1
+        # THE CEILING LATCHES UNDER BOTH POLICIES AND THAT ASYMMETRY IS
+        # DELIBERATE. A cap is a threshold a healthy run can cross; a ceiling
+        # is a DEFECT REPORT -- one invocation asked for more billed calls than
+        # its configuration can produce -- and a defect does not heal as a
+        # window rolls. A server that hit it will hit it again on the next
+        # request, so continuing burns money on a fault that is already known.
         spend.SPEND_STOP.trip(spend.SPEND_LIMIT_CALL_CEILING, where)
         log.error("a Stage 5 invocation asked for more billed calls than its "
                   "configuration can produce; the request was not issued",

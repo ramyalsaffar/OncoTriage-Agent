@@ -85,7 +85,7 @@ import re
 import time
 from collections import Counter, OrderedDict
 
-from oncotriage import config, paths
+from oncotriage import config, paths, spend
 from oncotriage.agent.prompts import PROMPT_VERSION, render_system_prompt
 from oncotriage.observability import console, get_logger
 
@@ -1694,6 +1694,100 @@ CHARS_PER_TOKEN_FALLBACK = 4.0
 ASSUMED_OUTPUT_TOKENS = 110   # a four-key object with a one-sentence rationale
 
 
+def charge_batch_to_ledger(model, usage_totals):
+    """Charge one collected batch's MEASURED cost to the run ledger.
+
+    Returns what was added, in US dollars.
+
+    **THE PRICING STAYS HERE AND THE LIMIT STAYS IN ``oncotriage/spend.py``**,
+    which is what lets one cap govern four billed paths priced four ways. That
+    module values a response against ``config.PRICING_CONFIG``, which is the
+    OpenAI / Bedrock table: it holds none of the Anthropic Batches rates, none
+    of the 50% batch discount and none of the cache-tier multipliers. So this
+    hands it a number ``price_usage`` has already produced -- the ONE owner of
+    this vendor's arithmetic -- rather than growing a second price table that
+    would have to be kept in step with the first.
+
+    THE COUNTS ARE DISJOINT AND ``price_usage`` ALREADY TREATS THEM SO, which
+    is the one thing a caller of this function has to know and the one thing
+    that would be silently wrong if it were assumed. Anthropic's usage block
+    reports ``input_tokens`` as the NON-CACHED input only, with
+    ``cache_read_input_tokens`` and the two ``cache_creation`` figures beside
+    it -- exactly the shape ``oncotriage/agent/bedrock_anthropic_adapter.py``
+    had to sum back for Converse, because OpenAI's ``prompt_tokens`` INCLUDES
+    its cached portion and a rename between the two under-reports by the whole
+    cached amount. ``price_usage`` does NOT sum them: it prices each at its own
+    rate, which is both correct and necessary, because a cache read costs a
+    tenth of an uncached token and a 5m write costs a quarter more. So there is
+    no summing to do here, and this paragraph exists so that nobody adds one.
+
+    NEVER RAISES, on ``SpendLedger.charge``'s footing: it runs after a batch
+    has been collected, and a pricing defect that discarded the collection
+    would throw away results already paid for.
+    """
+    try:
+        usd = price_usage(model, usage_totals)
+    except Exception as exc:                                    # noqa: BLE001
+        spend.SPEND_LEDGER_FAULTS[
+            f"rater_unpriced:{type(exc).__name__}"] += 1
+        console.out(f"  [Spend] could not price this batch "
+                    f"({type(exc).__name__}: {exc}); the campaign total is "
+                    f"LOWER than the truth by whatever it cost")
+        return 0.0
+    return spend.SPEND_LEDGER.charge_usd(usd, spend.SPEND_SOURCE_RATER)
+
+
+STATE_SPEND_KEY = "spend_usd"
+"""Where a rater session records what it has spent, inside its state file.
+
+**THIS IS THE RATER'S CAMPAIGN CHAIN AND IT IS ITS OWN, NOT THE BATCH
+RUNNER'S.** ``oncotriage/storage/database_logger.py:campaign_spend_before``
+walks the ``runs`` table backwards over identical fingerprint columns; a rater
+session has no ``runs`` row, writes no ``inferences``, and its own resume
+gesture is ``--resume <batch id>`` against a state file that already persists
+across invocations. So the state file IS the chain, and the running total goes
+in it.
+
+IT IS WRITTEN AFTER EACH BATCH IS COLLECTED rather than once at the end,
+because the case it exists for is the interrupted one: a session that submitted
+three batches, collected two and was killed must resume knowing what those two
+cost. A total written only by the manifest at the end covers exactly the case
+that did not need covering.
+
+**WHAT IT DOES NOT DO, STATED PLAINLY: it does not net the judge's spend
+against the batch runner's.** They are separate processes with separate
+ledgers, and no shared store exists that both could read -- the rater writes
+none of the columns ``campaign_spend_before`` sums. So ``config.SPEND_CAP_USD``
+binds WITHIN one rater session (across its resumes) and WITHIN one campaign,
+and not across the two. That is a real gap; it is named here and in
+``spend.SPEND_SOURCES`` rather than left for somebody to discover from a bill.
+"""
+
+
+def rater_spend_before(state):
+    """What this rater session already spent, as a ``spend.LedgerSeed``.
+
+    NEVER RAISES. It runs before the first billed call of a session, where an
+    absent key, a hand-edited file and a fresh state are all ordinary -- and a
+    judge refusing to start because its own history could not be read would be
+    a brake stopping a run it has nothing to say about. An unreadable history
+    yields a FRESH seed, which is the over-spending direction, and that is the
+    same direction ``LedgerSeed``'s floor already fails in.
+    """
+    if not isinstance(state, dict):
+        return spend.LedgerSeed()
+    usd = state.get(STATE_SPEND_KEY)
+    if isinstance(usd, bool) or not isinstance(usd, (int, float)):
+        return spend.LedgerSeed()
+    if usd != usd or usd < 0:            # NaN and negatives, explicitly.
+        return spend.LedgerSeed()
+    batches = state.get("batches")
+    return spend.LedgerSeed(
+        usd=float(usd), rows=0, unpriced=0,
+        runs=len(batches) if isinstance(batches, list) else 0,
+        source=spend.SEED_SOURCE_RATER_STATE)
+
+
 def estimate_tokens(index, run, chars_per_token, cache_ttl,
                     assumed_output_tokens=ASSUMED_OUTPUT_TOKENS):
     """Two bounds on the bill, because caching makes a single number a lie.
@@ -2263,6 +2357,32 @@ def submit_batches(client, chunks, state, state_path, tag):
     """Create one batch per chunk, recording each id BEFORE polling starts."""
     ids = []
     for i, chunk in enumerate(chunks):
+        # ── THE SPEND GATE, IMMEDIATELY BEFORE THE MONEY IS COMMITTED ─────
+        #
+        # THE BATCHES API PUTS THE GATE AND THE CHARGE FURTHER APART THAN
+        # STAGE 5 DOES, AND THAT DISTANCE IS THE OVERSHOOT BOUND. One
+        # `batches.create` commits up to MAX_REQUESTS_PER_BATCH requests at
+        # once and reports no usage until `collect_results` reads them back, so
+        # the smallest unit this gate can decline is a whole chunk. Stage 5's
+        # bound is "the requests in flight"; this one's is "one batch", and it
+        # is stated rather than glossed because it is the number an operator
+        # needs when choosing a cap.
+        #
+        # PER CHUNK RATHER THAN ONCE BEFORE THE LOOP, which is what makes the
+        # bound one batch instead of all of them: a retry pass submitted after
+        # the primary batches have been collected and charged is declined on a
+        # ledger that already knows what the primary cost.
+        #
+        # IT RAISES INTO main()'s `except RaterRefusal` ... IT DOES NOT.
+        # `SpendLimitReached` is deliberately NOT a `RaterRefusal`: a refusal
+        # is this module's own contract for "I will not do this", exits 1, and
+        # its handler prints a message shaped for a configuration defect. A
+        # budget stop is a different event with a different remedy, and
+        # main()'s own handler names it. The batch ids already created are
+        # written to the state file before this point on every iteration, so a
+        # stop here loses nothing: `--resume` collects them.
+        spend.require_budget(spend.SPEND_SOURCE_RATER,
+                             f"the rater's {tag} batch {i + 1}/{len(chunks)}")
         batch = client.messages.batches.create(requests=chunk)
         ids.append(batch.id)
         state.setdefault("batches", []).append(
@@ -3796,6 +3916,21 @@ def main(argv=None):
         console.out(f"REFUSED: {exc}")
         log.error("rater.refused", stage="state", reason=exc.code)
         return 1
+    # ── THE SPEND GATE ────────────────────────────────────────────────────
+    #
+    # SEEDED FROM THIS SESSION'S OWN STATE FILE, so `--resume` continues under
+    # the remaining budget rather than under a fresh one. Both lines print
+    # unconditionally, including on a first submit and an uncapped run, on
+    # `spend.describe_cap()`'s argument: the dangerous state must not be the
+    # quiet one.
+    #
+    # AFTER the state is read and BEFORE anything is submitted. Reading it
+    # earlier would seed from a file `require_state_subset` may be about to
+    # refuse; reading it later would be after the first batch is created.
+    spend.SPEND_LEDGER.seed(rater_spend_before(state))
+    console.out(spend.describe_cap())
+    console.out(spend.describe_seed(spend.SPEND_LEDGER.seeded))
+
     state.update({"run_dir": run.run_dir, "model": args.model,
                   "mode": index.mode,
                   "custom_id_form": index.form,
@@ -3825,6 +3960,49 @@ def main(argv=None):
                                         for (a, st), n in sorted(cells.items())))
                 console.out(f"    patients: "
                             f"{len({index.by_custom_id[r['custom_id']].patient_id for r in index.requests})}")
+            console.out("")
+            # ── THE PREFLIGHT, BEFORE THE FIRST BATCH ─────────────────
+            #
+            # THE MEASURED GATE INSIDE `submit_batches` STOPS A SESSION THAT
+            # HAS ALREADY SPENT ITS BUDGET; THIS STOPS ONE THAT PLAINLY CANNOT
+            # FINISH. They are different questions and only this one can be
+            # asked before any money moves -- which is the whole point:
+            # `_require_writable_parent`'s rule, that a configuration defect
+            # must reach the operator before the spend rather than after it.
+            #
+            # IT COMPARES THE NO-CACHE (UPPER) ESTIMATE, NOT THE CACHED ONE.
+            # Whether the prefix caches is a property of the provider on the
+            # day, and a preflight that assumed the discount would let a
+            # session start that the cap cannot cover -- refusing a run that
+            # would have fitted costs one flag, and admitting one that cannot
+            # costs the whole cap.
+            #
+            # IT WARNS, IT DOES NOT REFUSE. An estimate is not a measurement,
+            # this project's standing line -- and the measured gate is right
+            # behind it, batch by batch, so a session that starts and cannot
+            # finish is stopped where the money actually runs out and keeps
+            # every batch it did complete. Refusing here on a number nobody
+            # measured would be the estimate deciding.
+            _remaining = spend.remaining()
+            if _remaining is not None and plan is not None:
+                _upper = plan["no_cache_usd"]
+                console.out("")
+                console.out(f"  budget remaining   ${_remaining:>8.2f}   "
+                            f"(campaign cap ${config.SPEND_CAP_USD}, this "
+                            f"session has spent "
+                            f"${spend.SPEND_LEDGER.total:.2f})")
+                if _upper > _remaining:
+                    console.out(f"  *** THE UPPER-BOUND ESTIMATE "
+                                f"(${_upper:.2f}) EXCEEDS THE REMAINING "
+                                f"BUDGET. ***")
+                    console.out(f"      This session will be STOPPED partway "
+                                f"by the spend gate, batch by batch. Every "
+                                f"batch")
+                    console.out(f"      it completes is kept and resumable. "
+                                f"Raise config.SPEND_CAP_USD, or narrow the "
+                                f"run with")
+                    console.out(f"      --limit / --include-keys, if you want "
+                                f"it to finish in one session.")
             console.out("")
             console.out("  SUBMITTING. Batch ids are printed as they are "
                         "created and written to")
@@ -3865,6 +4043,16 @@ def main(argv=None):
                 usage[k] += v
             usage_by_cid.update(got["usage_by_cid"])
             stop_reasons.update(got["stop_reasons"])
+            # CHARGED PER BATCH, NOT ONCE AT THE END. The retry pass below
+            # submits through the same gate, so the primary batches' measured
+            # cost has to be in the ledger before it asks -- otherwise a
+            # session that spent its whole budget on the primary batches would
+            # be allowed to submit a retry batch on a ledger reading zero.
+            # Persisted with it, so an interrupted session resumes knowing it.
+            _spent = charge_batch_to_ledger(args.model, got["usage"])
+            state[STATE_SPEND_KEY] = round(
+                float(state.get(STATE_SPEND_KEY) or 0.0) + _spent, 6)
+            write_state(state_path, state)
 
         for cid in set(index.by_custom_id) - set(rated) - set(unrated):
             unrated[cid] = {"reason": "no_result",
@@ -3907,10 +4095,35 @@ def main(argv=None):
                     usage[k] += v
                 usage_by_cid.update(got["usage_by_cid"])
                 stop_reasons.update(got["stop_reasons"])
+                _spent = charge_batch_to_ledger(args.model, got["usage"])
+                state[STATE_SPEND_KEY] = round(
+                    float(state.get(STATE_SPEND_KEY) or 0.0) + _spent, 6)
+                write_state(state_path, state)
         elif retryable:
             console.out(f"  {len(retryable)} retryable failure(s) left "
                         f"unrated (--no-retry).")
 
+    except spend.SpendLimitReached as exc:
+        # A BUDGET STOP IS NOT A `RaterRefusal` AND IS NOT HANDLED AS ONE.
+        # A refusal is this module's contract for "the configuration is wrong,
+        # fix it and run again"; this says "the money is gone, and everything
+        # already submitted is still retrievable". The remedies are opposite,
+        # so the two must not print the same word.
+        #
+        # THE EXIT CODE IS 3, distinct from 1 (refused) and 2 (nothing to do),
+        # so a wrapper can tell "stopped on budget" from "would not start" --
+        # `oncotriage/control.py`'s EXIT_LOCKED argument, applied to money.
+        console.out("")
+        console.out(f"STOPPED ON BUDGET: {exc}")
+        console.out(f"  Nothing already submitted is lost: results stay "
+                    f"retrievable for 29 days.")
+        console.out(f"  Batch ids are in {state_path}; resume with "
+                    f"--resume <id> once the cap is raised.")
+        for _line in spend.report_lines():
+            console.out(f"  {_line}")
+        log.warning("rater.stopped_on_budget", stage="submit",
+                    reason=exc.limit)
+        return 3
     except RaterRefusal as exc:
         console.out(f"REFUSED: {exc}")
         log.error("rater.refused", stage="submit", reason=exc.code)

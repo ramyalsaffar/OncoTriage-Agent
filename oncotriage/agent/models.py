@@ -27,6 +27,7 @@ the default, and every caller inside the agent uses ``score_pairs``.
 from typing import List
 
 from oncotriage import config
+from oncotriage import spend
 from oncotriage.agent import deps
 
 
@@ -168,6 +169,31 @@ def get_embedding(text: str) -> List[float]:
     it comes from the call's SHAPE rather than from a measurement, because no
     embedding latency has ever been measured here.
     """
+    # ── THE SPEND GATE ────────────────────────────────────────────────────
+    #
+    # STAGE 2's DENSE CHANNEL IS A BILLED CALL, ONCE PER PATIENT, AND UNTIL THE
+    # SPEND-COVERAGE PASS IT WAS INVISIBLE TO THE CAP. The gate instrumented
+    # Stage 5 and the module docstring said so; this call sits in the same
+    # process, in the same pipeline, on the same patient, and spent money the
+    # budget could not see.
+    #
+    # IT IS CENTS AND IT IS GATED ANYWAY. text-embedding-3-small is $0.02 per
+    # million input tokens and a query is a few dozen, so this path is four
+    # orders of magnitude below Stage 5's -- which is an argument about how
+    # much a hole leaks, not about whether it is one. The rule this pass is
+    # built on is that a billed path is gated or is argued at
+    # `spend.BILLED_SITE_EXEMPTIONS`, and "too small to matter" is not an
+    # argument a future edit to `EMBEDDING_MODEL` or to the query builder
+    # cannot invalidate without anybody re-reading it.
+    #
+    # IT RAISES, AND STAGE 2 ALREADY HANDLES THAT CORRECTLY. Each retrieval
+    # channel is wrapped in its own `except Exception`, so a refusal here
+    # degrades to BM25-only with `CHANNEL_*` recording the loss -- the same
+    # accounting an unreachable endpoint produces. That is the right shape: a
+    # patient whose budget ran out mid-run gets a recorded degradation rather
+    # than a silent full-price dense search.
+    spend.require_budget(spend.SPEND_SOURCE_EMBEDDING,
+                         "Stage 2's dense retrieval channel")
     response = deps.get_openai_client().embeddings.create(
         model=config.EMBEDDING_MODEL,
         input=text,
@@ -181,6 +207,25 @@ def get_embedding(text: str) -> List[float]:
         # File 03.
         timeout=config.get_embedding_request_timeout(),
     )
+    # ── THE CHARGE, IMMEDIATELY AFTER THE RESPONSE ────────────────────────
+    #
+    # `usage.completion_tokens` DOES NOT EXIST ON AN EMBEDDING RESPONSE and is
+    # passed as a literal 0 rather than read with a getattr default. The two
+    # spellings price identically today; they differ the day the SDK grows the
+    # field, when a getattr would silently start billing output tokens for a
+    # call that produces none. The embeddings usage block is
+    # `{prompt_tokens, total_tokens}` -- `total_tokens` is deliberately NOT
+    # used, because it is the SUM and `get_model_cost` would then charge the
+    # input rate against a figure that already includes it.
+    #
+    # THE MODEL IS THE ECHOED ONE, falling back to the configured id, which is
+    # `_charge_spend`'s rule one module over: the provider bills what it
+    # answered with.
+    _usage = getattr(response, "usage", None)
+    spend.SPEND_LEDGER.charge(
+        getattr(response, "model", None) or config.EMBEDDING_MODEL,
+        getattr(_usage, "prompt_tokens", None), 0,
+        source=spend.SPEND_SOURCE_EMBEDDING)
     return response.data[0].embedding
 
 

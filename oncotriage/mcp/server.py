@@ -150,6 +150,7 @@ from collections import Counter
 from typing import Any
 
 from oncotriage import __version__
+from oncotriage import spend
 from oncotriage.agent.graph import build_matching_graph, match_patient_to_trials
 from oncotriage.agent.readiness import (
     INDEX_ABSENT,
@@ -301,6 +302,63 @@ def _index_unavailable_result(tool, verdict) -> dict:
             f"finding of zero matching trials, it is the absence of an index to "
             f"search. " + _INDEX_GUIDANCE[verdict["state"]]),
     }
+
+
+def _budget_unavailable_result(tool, exc) -> dict:
+    """The result a tool returns instead of an answer when the budget is spent.
+
+    THE SHAPE IS ``_index_unavailable_result``'s, FOR ITS EXACT ARGUMENT.
+    There is no ``matches`` key, no ``result`` key, no ``trial`` key and no
+    count -- not an empty list, not a zero. A model reading a payload that
+    carried ``"matches": []`` beside a warning would have a plausible answer
+    sitting next to a caveat, and models summarise caveats away. "The pipeline
+    was not run" and "the pipeline found nothing" must not be the same payload,
+    whether the cause is an empty index or an empty budget.
+
+    ``retry_after_seconds`` IS THE ONE FIELD THAT IS NOT IN THE INDEX VERSION,
+    and it is here because the two conditions differ in exactly that way: an
+    absent index needs an operator, and this clears itself as the rolling
+    window rolls. It is ``None`` when the wait cannot be derived -- the
+    call-ceiling limit does not heal with time, and a number there would tell a
+    caller to wait for something that will not happen.
+    """
+    return {
+        "not_for_clinical_use": NOT_FOR_CLINICAL_USE,
+        "status": "spend_limit_reached",
+        "tool": tool,
+        "limit": getattr(exc, "limit", None),
+        "retry_after_seconds": spend.seconds_until_under_cap(),
+        "message": (
+            "This server has reached its spend limit, so this tool cannot "
+            "answer. NO RESULT IS BEING REPORTED -- this is not a finding of "
+            "zero matching trials, it is a refusal to issue the billed "
+            "requests that would produce one. The limit is a rolling window "
+            "and clears on its own; try again later."),
+    }
+
+
+def _require_budget(tool):
+    """``None`` when a billed tool may proceed, else the result it must return.
+
+    POLICY, WRITTEN HERE BECAUSE THIS IS THE CALL SITE THAT APPLIES IT --
+    ``_require_index``'s shape, one concern over. ``spend.require_budget``
+    RAISES, which is right for the four callers that want an exception; this
+    server answers in payloads, so the raise is caught once, here, and turned
+    into one.
+
+    IT DOES NOT LATCH, and it does not have to say so: ``require_budget``
+    derives that from the policy, and ``main()`` installs ``serving_window``
+    for the reason ``spend.SPEND_POLICIES`` gives. A latch here would make one
+    over-budget minute refuse every tool call for the life of the client
+    session.
+    """
+    try:
+        spend.require_budget(spend.SPEND_SOURCE_STAGE5,
+                             f"the MCP {tool} tool")
+    except spend.SpendLimitReached as exc:
+        _log(f"{tool}: refusing, {exc}")
+        return _budget_unavailable_result(tool, exc)
+    return None
 
 
 def _require_index(tool):
@@ -533,6 +591,21 @@ def match_patient_tool(bundle_path: str) -> dict[str, Any]:
     if unavailable is not None:
         return unavailable
 
+    # THE BUDGET GATE IS BELOW THE INDEX GATE AND ABOVE THE PARSE. Below,
+    # because an unusable index is a fault an operator must fix while a spent
+    # budget clears itself, and a caller shown the second when the first is
+    # also true would fix nothing and come back to the same refusal. Above the
+    # parse, for `_require_index`'s own stated reason: everything past this
+    # line is on the way to a billed call.
+    #
+    # `lookup_trial` AND `parse_fhir_bundle` ARE DELIBERATELY NOT GATED. Both
+    # are free -- one is a Qdrant scroll and one is a file read -- and refusing
+    # a free diagnostic because a billed one ran out of money is the rule
+    # `spend.BILLED_SITE_EXEMPTIONS` states for the index validator, met here.
+    over_budget = _require_budget("match_patient")
+    if over_budget is not None:
+        return over_budget
+
     patient_data = _parse_bundle(path)
 
     graph = get_graph()
@@ -686,6 +759,27 @@ def main():
     would skip that guard, which is why it has no ``__main__`` block of its own
     -- the documented invocation is ``python -m oncotriage.mcp``.
     """
+    # ── THE SPEND POLICY ─────────────────────────────────────────────────
+    #
+    # A LONG-LIVED SERVER RUNS UNDER A ROLLING WINDOW AND NOT THE CAMPAIGN CAP.
+    # This process writes no `runs` row, so nothing seeded its ledger and
+    # nothing resets it: under the campaign policy it had no brake at all until
+    # it had spent a whole campaign's budget by itself, and then refused every
+    # tool call for the life of the client session. `spend.SPEND_POLICIES`
+    # carries the argument; `oncotriage/api/server.py` installs the same policy
+    # in its lifespan for the same reason.
+    #
+    # THE LEDGER IS RESET WITH IT, so a second `main()` in one interpreter (a
+    # test) does not inherit the first one's window.
+    #
+    # THE BANNER GOES TO STDERR like every other line this module writes:
+    # stdout is the JSON-RPC stream and one stray byte ends the session.
+    # `_log` is the one writer that knows that.
+    spend.SPEND_LEDGER.reset()
+    spend.SPEND_STOP.reset()
+    spend.set_policy(spend.SPEND_POLICY_WINDOW, "oncotriage.mcp.server")
+    _log(spend.describe_serving_cap())
+
     server = build_server()
     _log(f"serving {len(TOOL_SPECS)} tools on stdio: "
          f"{', '.join(name for name, _f, _d in TOOL_SPECS)}")

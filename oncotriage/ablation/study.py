@@ -191,6 +191,7 @@ from oncotriage.utils import (
     resolve_qdrant_collection,
 )
 from oncotriage import run_fingerprint
+from oncotriage import spend
 from oncotriage import tracking
 from oncotriage.observability import console, correlation_scope, get_logger
 
@@ -1229,6 +1230,39 @@ class _PairCancelled(RuntimeError):
     """
 
 
+def _stop_reason_now():
+    """Why a configuration was cut short, or None. A ``RUN_STOP_REASONS`` member.
+
+    ONE DERIVATION, READ WHEREVER THE ANSWER IS NEEDED, so the reason stored in
+    ``ablation_runs.stop_reason`` and the reason an operator is shown cannot
+    disagree. It reads the two latches rather than taking an argument, for the
+    same reason ``oncotriage/batch/runner.py`` derives its own once and hands
+    the value to both readers: a caller that passed the wrong one would produce
+    a row that is internally consistent and false.
+
+    THE OPERATOR OUTRANKS THE BUDGET, AND THE ORDER IS A DECISION. Both latches
+    can be set -- a study that reached its cap and whose operator then wrote the
+    sentinel, or the reverse -- and only one word fits in the column. An
+    operator stop is a request a person made and can point to; a spend stop is
+    a threshold the run crossed. Reporting the second when a person had already
+    asked for the first sends that person to ``config.SPEND_CAP_USD`` to explain
+    a stop they themselves caused. ``oncotriage/batch/runner.py`` resolves the
+    identical ambiguity the identical way.
+    """
+    if STOP_SWITCH.requested:
+        return RUN_STOP_REASON_OPERATOR
+    if not spend.SPEND_STOP.requested:
+        return None
+    # THE LATCH'S OWN `limit` IS READ RATHER THAN RE-DERIVED. It records which
+    # of the two spend limits fired at the moment it fired; asking the ledger
+    # again here would answer about NOW, and a run that tripped the call
+    # ceiling and then also crossed the cap would be recorded as a budget
+    # event -- which sends an operator to raise a cap over a pipeline defect.
+    if spend.SPEND_STOP.limit == spend.SPEND_LIMIT_CALL_CEILING:
+        return RUN_STOP_REASON_CALL_CEILING
+    return RUN_STOP_REASON_SPEND_CAP
+
+
 def _run_pair_unless_stopped(_process, **kwargs):
     """The submitted callable. Refuses to begin work once the switch has tripped.
 
@@ -1252,6 +1286,21 @@ def _run_pair_unless_stopped(_process, **kwargs):
     if STOP_SWITCH.requested:
         raise _PairCancelled(
             "the operator stop switch tripped before this pair started")
+    # THE SPEND LATCH IS READ HERE FOR THE IDENTICAL REASON AND WITH THE
+    # IDENTICAL SHAPE. `spend.SPEND_STOP.requested` is a plain attribute read,
+    # not `poll()`, so this adds one boolean to the hot path -- and it closes
+    # the same one-pair edge: the spend latch is set inside `_on_done` on a
+    # worker thread, and a pair submitted between that and the submit loop's
+    # next poll would otherwise start and issue a live billed Stage 5 call
+    # after the budget was gone.
+    #
+    # IT IS A SEPARATE MESSAGE, NOT A SHARED ONE. `_PairCancelled` is counted
+    # into `run_cancelled` either way, but the string reaches the operator's
+    # console and "the operator stop switch tripped" is false of a study
+    # nobody touched.
+    if spend.SPEND_STOP.requested:
+        raise _PairCancelled(
+            "a spend limit was reached before this pair started")
     return _process(**kwargs)
 
 
@@ -1535,6 +1584,34 @@ other fails `tests/test_ablation_stop_and_lock.py` rather than silently being
 treated as complete.
 """
 
+RUN_STOP_REASON_OPERATOR = "operator"
+RUN_STOP_REASON_SPEND_CAP = "spend_cap"
+RUN_STOP_REASON_CALL_CEILING = "call_ceiling"
+
+RUN_STOP_REASONS = (RUN_STOP_REASON_OPERATOR, RUN_STOP_REASON_SPEND_CAP,
+                    RUN_STOP_REASON_CALL_CEILING)
+"""Why a configuration was cut short, stored in `ablation_runs.stop_reason`.
+CLOSED, and NULL is the fourth reading rather than a fourth member.
+
+**A COLUMN AND NOT TWO MORE STATUSES**, which is the ruling
+`oncotriage/storage/database_logger.py:RUN_STOP_REASONS` already made for the
+`runs` table, adopted here rather than re-argued: `status` answers HOW a
+configuration ended, and a spend stop's answer is byte-identical to an
+operator stop's -- every pair it started finished and was written, pairs remain
+it never began, the checkpoint is intact, a resume continues. Two more members
+would be two more things `RUN_STATUSES_PARTIAL`, `_summary_status_warning` and
+`tests/test_ablation_stop_and_lock.py` must learn, all of which would answer
+identically for all three.
+
+NULL MEANS ONE OF TWO THINGS AND BOTH ARE HONEST: the row predates this column,
+or the configuration was not cut short at all. A reader separates them with
+`status`, which is what it is for -- a COMPLETE row with a NULL stop_reason ran
+its whole sample, and a STOPPED row with a NULL stop_reason was written before
+the column existed. There is deliberately no `not_stopped` member: it would be
+a value asserting the absence of an event, on every COMPLETE row ever written,
+to save a reader one column.
+"""
+
 
 def init_ablation_db(db_path=None):
     """Create ablation database tables (idempotent).
@@ -1592,6 +1669,14 @@ def init_ablation_db(db_path=None):
         console.out("  Existing rows left NULL (not measured, not COMPLETE): "
                     "a study that was interrupted before this column existed "
                     "is exactly the row a reader must not be told finished")
+
+    # `stop_reason` IS ADDITIVE FOR `status`'s REASONS, WORD FOR WORD, and it
+    # is a SECOND migration rather than a second name in the same `if`: a
+    # database migrated by the pass that added `status` has that column and not
+    # this one, so testing for either would leave one of them un-added.
+    if "stop_reason" not in _run_columns:
+        c.execute("ALTER TABLE ablation_runs ADD COLUMN stop_reason TEXT")
+        console.out("Schema migration: added ablation_runs.stop_reason")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS ablation_results (
@@ -1886,7 +1971,72 @@ def _create_run(config_name, config_description, sample_size, db_path=None):
         return run_with_write_retry(_insert, "the ablation run row")
 
 
-def _finalize_run(run_id, elapsed_seconds, status, db_path=None) -> bool:
+def ablation_spend_before(db_path=None):
+    """What prior studies against THIS database already spent. Never raises.
+
+    Returns a ``spend.LedgerSeed``.
+
+    **THIS IS THE STUDY'S CAMPAIGN, AND THE DATABASE IS WHAT DEFINES IT.** The
+    batch runner walks the ``runs`` chain backwards over identical fingerprint
+    columns because several PROCESSES contribute to one campaign there. A study
+    has no such chain and needs none: pass 20f-3 made the checkpoint follow
+    ``--db``, so "the work this database already holds" and "the work this
+    resume will skip" are the same set by construction -- which is exactly the
+    quantity a resumed study's budget must not be charged for again, and
+    exactly the quantity it must not be handed for free.
+
+    IT SUMS EVERY ROW RATHER THAN THE CHECKPOINTED ONES. A row exists because a
+    pair was run and BILLED; the checkpoint is a record of what was written,
+    and the two can differ by a pair whose write failed. Summing the rows counts
+    money that was spent, which is the question; summing the checkpoint would
+    count money that was spent AND recorded, which is a smaller number and the
+    under-enforcing direction.
+
+    A NULL COST MAKES THE ANSWER A FLOOR and ``LedgerSeed.is_floor`` says so --
+    ``estimated_cost_usd`` is ``REAL DEFAULT 0``, so a row written before
+    pricing existed reads 0 and is indistinguishable from a pair that genuinely
+    cost nothing. That ambiguity is inherited from the column's own DEFAULT and
+    is reported rather than papered over: the NULL count below is exact, and the
+    zeros are not separable.
+
+    NEVER RAISES. It runs before the first billed call of the study, where a
+    fresh database, an absent table and an unreadable file are all ordinary --
+    and a study refusing to start because its own resume history could not be
+    read would be a brake stopping a run it has nothing to say about. An
+    unreadable history yields a FRESH seed, which is the OVER-spending
+    direction, and that is stated rather than hidden: it is the same direction
+    `LedgerSeed`'s floor already fails in, and the alternative -- refusing --
+    turns a missing file into a stopped campaign.
+    """
+    try:
+        conn = open_connection(str(ablation_db(db_path)))
+    except Exception:                                           # noqa: BLE001
+        return spend.LedgerSeed()
+    try:
+        names = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if "ablation_results" not in names:
+            return spend.LedgerSeed()
+        row = conn.execute(
+            "SELECT COALESCE(SUM(estimated_cost_usd), 0.0), COUNT(*), "
+            "       SUM(CASE WHEN estimated_cost_usd IS NULL THEN 1 ELSE 0 END)"
+            "  FROM ablation_results").fetchone()
+        runs = conn.execute(
+            "SELECT COUNT(*) FROM ablation_runs").fetchone()[0] \
+            if "ablation_runs" in names else 0
+    except Exception:                                           # noqa: BLE001
+        return spend.LedgerSeed()
+    finally:
+        conn.close()
+    if not row or not row[1]:
+        return spend.LedgerSeed()
+    return spend.LedgerSeed(usd=float(row[0] or 0.0), rows=int(row[1]),
+                            unpriced=int(row[2] or 0), runs=int(runs or 0),
+                            source=spend.SEED_SOURCE_CAMPAIGN)
+
+
+def _finalize_run(run_id, elapsed_seconds, status, db_path=None,
+                  stop_reason=None) -> bool:
     """Record how long the configuration took and how it ended. Never raises.
 
     Args:
@@ -1906,6 +2056,15 @@ def _finalize_run(run_id, elapsed_seconds, status, db_path=None) -> bool:
     the write-durability pass removed from `log_inference`, and this is the same
     check for the same reason.
 
+    Args (continued):
+        stop_reason: a `RUN_STOP_REASONS` member, or None. **An unrecognised
+            reason is REFUSED AND COUNTED, and the row is finalized with a NULL
+            reason rather than with the unrecognised one** -- the column exists
+            to be grouped on, and a value outside the closed vocabulary is a
+            bucket no `GROUP BY` consumer knows about. The STATUS is still
+            written, because how a configuration ended is the more important of
+            the two facts and must not be lost to a defect in the second.
+
     AN UNRECOGNISED STATUS IS REFUSED RATHER THAN STORED. A typo would put a
     value outside the closed vocabulary into a column readers branch on, and
     silently -- so it is counted and the write is skipped, leaving the row
@@ -1919,14 +2078,21 @@ def _finalize_run(run_id, elapsed_seconds, status, db_path=None) -> bool:
                     f"{status!r} for run {run_id}; the row stays "
                     f"{RUN_STATUS_RUNNING}")
         return False
+    if stop_reason is not None and stop_reason not in RUN_STOP_REASONS:
+        RUN_RECORD_FAILURES[f"finalize:UnknownStopReason({stop_reason!r})"] += 1
+        console.out(f"  [Run record] refusing to store an unrecognised stop "
+                    f"reason {stop_reason!r} for run {run_id}; the row keeps a "
+                    f"NULL reason and the status is still written")
+        stop_reason = None
     try:
         def _update():
             conn = open_connection(str(ablation_db(db_path)))
             try:
                 cur = conn.execute(
                     "UPDATE ablation_runs "
-                    "SET total_time_seconds = ?, status = ? WHERE id = ?",
-                    (round(elapsed_seconds, 2), status, run_id),
+                    "SET total_time_seconds = ?, status = ?, stop_reason = ? "
+                    "WHERE id = ?",
+                    (round(elapsed_seconds, 2), status, stop_reason, run_id),
                 )
                 rowcount = cur.rowcount
                 conn.commit()
@@ -2753,7 +2919,49 @@ def print_study_close(status, study_elapsed, run_success, run_error,
     report_stop_switch_faults(out=emit)
     report_run_record_failures(out=emit)
 
-    if status == STUDY_STATUS_STOPPED:
+    # THE SPEND BLOCK, ON EVERY PATH INCLUDING THE CRASH ONE. It is what an
+    # operator asks first about a study that stopped, and `spend.report_lines`
+    # always emits -- a study that spent nothing still prints, because silence
+    # would be indistinguishable from a ledger that was never wired up.
+    emit()
+    for _line in spend.report_lines():
+        emit(f"  {_line}")
+    emit()
+
+    if status == STUDY_STATUS_STOPPED and spend.SPEND_STOP.requested \
+            and not STOP_SWITCH.requested:
+        # A BUDGET STOP AND AN OPERATOR STOP END A STUDY THE SAME WAY AND ARE
+        # REMEDIATED DIFFERENTLY, so they get different blocks. Telling an
+        # operator who wrote no sentinel to `rm` one -- and printing a path
+        # that does not exist -- is the wrong-remediation defect
+        # `describe_checkpoint_state` exists to remove, met here through the
+        # other switch.
+        emit("  Status:          STOPPED (a spend limit was reached)")
+        emit(f"                   limit:    {spend.SPEND_STOP.limit}")
+        emit(f"                   noticed:  {spend.SPEND_STOP.detected_in}")
+        emit("                   NO SENTINEL WAS WRITTEN, so there is nothing "
+             "to delete and")
+        emit("                   --clear-stop has nothing to clear.")
+        if spend.SPEND_STOP.limit == spend.SPEND_LIMIT_CALL_CEILING:
+            emit("                   THIS IS A DEFECT REPORT, NOT A BUDGET "
+                 "EVENT: one Stage 5")
+            emit("                   invocation asked for more billed calls "
+                 "than its")
+            emit("                   configuration can produce. Raising the "
+                 "cap will not help.")
+        else:
+            emit("                   To continue: raise config.SPEND_CAP_USD "
+                 "and run again --")
+            emit("                   this database's rows are counted, so the "
+                 "resume starts")
+            emit("                   from what was already spent rather than "
+                 "from zero.")
+        emit("                   NO SUMMARY WAS GENERATED and the checkpoint "
+             "was KEPT: this study")
+        emit("                   covers a PREFIX of its configurations, so no "
+             "mean over it is a")
+        emit("                   mean over the sample.")
+    elif status == STUDY_STATUS_STOPPED:
         emit("  Status:          STOPPED (an operator asked for it)")
         emit(f"                   sentinel: "
              f"{describe_ablation_stop_switch_path(db_path)}")
@@ -2995,6 +3203,14 @@ def main():
     # cohort of errors for a Ctrl-C somebody pressed in an earlier run.
     STOP_SWITCH.reset()
     clear_stage5_shutdown()
+    # THE FOURTH AND FIFTH PIECES, for the reason the three above are cleared.
+    # A ledger inherited from an earlier main() in this process would charge
+    # this study for money another one spent, and once the two together crossed
+    # the cap this study would refuse to start over spend it did not make; the
+    # latch goes with it, or a stop from the earlier study would cancel every
+    # pair of this one before a request was issued.
+    spend.SPEND_LEDGER.reset()
+    spend.SPEND_STOP.reset()
 
 
     with CaffeinateSession("Ablation Study"):
@@ -3023,6 +3239,21 @@ def main():
                     f"{describe_ablation_stop_switch_path(db_path)}")
         console.out( "                   (stops cleanly between pairs; the "
                      "checkpoint stays current and a resume skips what ran)")
+
+        # ── THE SPEND GATE ────────────────────────────────────────────────
+        #
+        # SEEDED FROM THIS DATABASE'S OWN HISTORY, which is what makes the cap
+        # a budget for the STUDY rather than for one invocation of it. Without
+        # it a study stopped on its cap and resumed would get a fresh $300
+        # every time, which is the per-invocation failure `LedgerSeed` exists
+        # to remove one program over.
+        #
+        # BOTH LINES PRINT UNCONDITIONALLY, including on a fresh study and an
+        # uncapped one, on `describe_cap()`'s argument: the dangerous state
+        # must not be the quiet one.
+        console.out(spend.describe_cap())
+        spend.SPEND_LEDGER.seed(ablation_spend_before(db_path))
+        console.out(spend.describe_seed(spend.SPEND_LEDGER.seeded))
 
         console.out("\n[Step 1] Building BM25 index...")
         bm25_index, nct_ids = build_bm25_index_from_qdrant()
@@ -3314,7 +3545,8 @@ def main():
                     # configurations for generate_summary to average over. A
                     # `_create_run` row with no results is the shape
                     # `_summary_status_warning` then has to explain.
-                    if STOP_SWITCH.poll(where="between configurations"):
+                    if (STOP_SWITCH.poll(where="between configurations")
+                        | spend.SPEND_STOP.poll(where="between configurations")):
                         _unstarted = total_configs - config_idx + 1
                         study_covered = False
                         console.out(f"[STOP] {_unstarted} "
@@ -3431,7 +3663,8 @@ def main():
                         # returns False for a running future and leaves it alone,
                         # which is the contract wanted: pairs in flight are
                         # already paid for and their rows are worth having.
-                        if STOP_SWITCH.poll(where="during a configuration"):
+                        if (STOP_SWITCH.poll(where="during a configuration")
+                            | spend.SPEND_STOP.poll(where="during a configuration")):
                             _n = control.cancel_queued(_futures)
                             if _n:
                                 console.out(f"[STOP] {_n} queued (config, "
@@ -3483,7 +3716,8 @@ def main():
                             # pair submitted after the sweep would be neither
                             # cancelled nor accounted for, and would run and
                             # bill after the stop was announced.
-                            if STOP_SWITCH.poll(where="while submitting"):
+                            if (STOP_SWITCH.poll(where="while submitting")
+                                | spend.SPEND_STOP.poll(where="the submit loop")):
                                 pairs_unsubmitted = (len(pending_patients)
                                                      - _index)
                                 break
@@ -3552,8 +3786,23 @@ def main():
                         study_covered = False
                     _config_status = (RUN_STATUS_COMPLETE if _config_covered
                                       else RUN_STATUS_STOPPED)
+                    # ONE DERIVATION, READ BY THE ROW AND BY NOTHING ELSE THAT
+                    # RE-DERIVES IT. `_stop_reason_now()` reads the two latches
+                    # rather than being told, which is what keeps the reason
+                    # stored and the reason announced one reading -- the
+                    # duplicated-derivation pass's rule for `runs.status`,
+                    # applied to the column beside it.
+                    #
+                    # A COVERED CONFIGURATION STORES NO REASON EVEN IF A LATCH
+                    # IS SET. A stop that arrived while every pair was already
+                    # in flight cut NOTHING short: the configuration ran its
+                    # whole sample, `_config_covered` says so, and a reason
+                    # beside a COMPLETE status would assert a prefix that does
+                    # not exist. Same argument the status itself is made on.
                     _finalize_run(run_id, config_elapsed, _config_status,
-                                  db_path=db_path)
+                                  db_path=db_path,
+                                  stop_reason=(None if _config_covered
+                                               else _stop_reason_now()))
                     open_run_id = None
                     console.out(f"\n  Config '{config_name}' "
                                 f"{'done' if _config_covered else 'stopped'}"
@@ -3787,6 +4036,12 @@ def main():
             # brought us here reaches the operator rather than being replaced
             # by a failure in the code that was trying to explain it.
             if open_run_id is not None:
+                # NO `stop_reason` ON THE CRASH PATH, AND THAT IS THE POINT
+                # OF THE COLUMN. KILLED means the process did not get to the
+                # end; a spend latch that happened to be set when a SIGTERM
+                # arrived did not cause this, and storing it would attribute a
+                # crash to a budget. The two facts are separable and the row
+                # keeps them separate.
                 _finalize_run(open_run_id, time.time() - study_start,
                               RUN_STATUS_KILLED, db_path=db_path)
                 open_run_id = None

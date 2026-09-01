@@ -817,9 +817,20 @@ finally:
     _conn.close()
 check("4c  a FRESH database carries the column", "status" in _cols_fresh, True)
 
-# A PRE-MIGRATION database, built by DROPPING the column from a real one rather
-# than by retyping the old CREATE TABLE -- which would be a second declaration
-# that can disagree with the shipped one.
+# A PRE-MIGRATION database, built by DROPPING the columns from a real one
+# rather than by retyping the old CREATE TABLE -- which would be a second
+# declaration that can disagree with the shipped one.
+#
+# *** BOTH ADDITIVE COLUMNS ARE DROPPED, AND THE SPEND-COVERAGE PASS IS WHY.
+# *** This fixture used to drop `status` alone, which described a database
+# carrying `stop_reason` and NOT `status` -- a shape no era of this schema has
+# ever had, because `stop_reason` was added AFTER `status`. Migrating it
+# appended `status` last and 4g reported a column-order mismatch that was an
+# artefact of the fixture rather than a property of the code. The era before
+# `status` is also the era before `stop_reason`, and that is what this builds.
+# The era that DOES exist -- `status` present, `stop_reason` absent -- is
+# checked separately at 4g-i, because it is the shape every database written
+# before this pass actually has.
 _old_db = os.path.join(_MIG, "old.db")
 shutil.copy2(_fresh_db, _old_db)
 _conn = sqlite3.connect(_old_db)
@@ -827,6 +838,7 @@ try:
     _conn.execute("INSERT INTO ablation_runs (run_timestamp, config_name, "
                   "config_description, sample_size, status) "
                   "VALUES ('2026-01-01', 'full_pipeline', 'd', 10, 'COMPLETE')")
+    _conn.execute("ALTER TABLE ablation_runs DROP COLUMN stop_reason")
     _conn.execute("ALTER TABLE ablation_runs DROP COLUMN status")
     _conn.commit()
     _cols_old = [r[1] for r in _conn.execute("PRAGMA table_info(ablation_runs)")]
@@ -854,6 +866,38 @@ check("4g  ...and a fresh database and a migrated one end up with the "
       "indistinguishable to every reader and is why `status` is named ONLY in "
       "the migration and not also in the CREATE TABLE",
       _cols_mig, _cols_fresh)
+
+# THE ERA THAT ACTUALLY EXISTS ON DISK TODAY: `status` present because the
+# operator-control pass added it, `stop_reason` absent because the
+# spend-coverage pass had not run yet. Every ablation database written between
+# those two passes has exactly this shape, so it is the migration that matters
+# in production and it converges on the same column order.
+_era_db = os.path.join(_MIG, "status_only.db")
+shutil.copy2(_fresh_db, _era_db)
+_conn = sqlite3.connect(_era_db)
+try:
+    _conn.execute("ALTER TABLE ablation_runs DROP COLUMN stop_reason")
+    _conn.commit()
+    _cols_era_before = [r[1] for r in
+                        _conn.execute("PRAGMA table_info(ablation_runs)")]
+finally:
+    _conn.close()
+check("4g-i non-degeneracy: that shape really lacks stop_reason and really "
+      "has status", ("stop_reason" in _cols_era_before,
+                     "status" in _cols_era_before), (False, True))
+_study.init_ablation_db(db_path=_era_db)
+_conn = sqlite3.connect(_era_db)
+try:
+    _cols_era = [r[1] for r in _conn.execute("PRAGMA table_info(ablation_runs)")]
+    _era_rows = _conn.execute("SELECT stop_reason FROM ablation_runs").fetchall()
+finally:
+    _conn.close()
+check("4g-ii *** a database from the status-only era migrates to the same "
+      "physical column order as a fresh one ***", _cols_era, _cols_fresh)
+check("4g-iii ...and its historical rows carry a NULL reason, which is the "
+      "honest value for a row written before the column existed -- NOT a "
+      "member asserting that nothing cut the run short",
+      [r[0] for r in _era_rows], [None] * len(_era_rows))
 
 # --- _finalize_run's contract ----------------------------------------------
 _fin_db = os.path.join(_MIG, "fin.db")
